@@ -1,0 +1,472 @@
+package dev.gaius.tools;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.zip.ZipFile;
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.Opcodes;
+import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.FieldInsnNode;
+import org.objectweb.asm.tree.InsnList;
+import org.objectweb.asm.tree.InsnNode;
+import org.objectweb.asm.tree.IntInsnNode;
+import org.objectweb.asm.tree.LdcInsnNode;
+import org.objectweb.asm.tree.MethodInsnNode;
+import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.TypeInsnNode;
+
+/** Removes Netty's native-memory and desktop-platform bootstrap paths. */
+public final class NettyBrowserPatcher {
+    private static final String PLATFORM =
+            "io/netty/util/internal/PlatformDependent.class";
+    private static final String BUFFER = "io/netty/buffer/ByteBufUtil.class";
+
+    private NettyBrowserPatcher() {
+    }
+
+    public static void main(String[] args) throws IOException {
+        Path commonRoot = Path.of(args[3]);
+        Path bufferRoot = Path.of(args[4]);
+        Path transportRoot = Path.of(args[5]);
+        patchPlatform(Path.of(args[0]),
+                commonRoot.resolve("io/netty/util/internal/PlatformDependent.class"));
+        patchNetUtil(Path.of(args[0]),
+                commonRoot.resolve("io/netty/util/NetUtil.class"),
+                commonRoot.resolve("io/netty/util/NetUtilInitializations.class"));
+        patchEmptyArrays(Path.of(args[0]),
+                commonRoot.resolve("io/netty/util/internal/EmptyArrays.class"));
+        patchBuffer(Path.of(args[1]),
+                bufferRoot.resolve("io/netty/buffer/ByteBufUtil.class"));
+        patchReferenceCountedBuffer(Path.of(args[1]),
+                bufferRoot.resolve("io/netty/buffer/AbstractReferenceCountedByteBuf.class"));
+        patchChannelInitializer(Path.of(args[2]),
+                transportRoot.resolve("io/netty/channel/ChannelInitializer.class"));
+    }
+
+    private static void patchPlatform(Path jar, Path output) throws IOException {
+        ClassNode node = read(jar, PLATFORM);
+        replace(node, "<clinit>", "()V", platformInitializer());
+        replaceConstant(node, "initializeVarHandle", "()Z", Opcodes.ICONST_0, Opcodes.IRETURN);
+        replaceConstant(node, "byteArrayBaseOffset", "()J", Opcodes.LCONST_0, Opcodes.LRETURN);
+        replaceConstant(node, "hasDirectBufferNoCleanerConstructor", "()Z",
+                Opcodes.ICONST_0, Opcodes.IRETURN);
+        replaceAllocateArray(node);
+        for (String name : new String[] {
+                "isAndroid", "isWindows", "isOsx", "maybeSuperUser", "isVirtualThread",
+                "hasUnsafe", "isUnaligned", "directBufferPreferred",
+                "canReliabilyFreeDirectBuffers", "hasVarHandle", "useDirectBufferNoCleaner",
+                "isJfrEnabled"
+        }) {
+            MethodNode method = findByName(node, name);
+            replaceConstant(method, Opcodes.ICONST_0, Opcodes.IRETURN);
+        }
+        replaceConstant(find(node, "isExplicitNoPreferDirect", "()Z"),
+                Opcodes.ICONST_1, Opcodes.IRETURN);
+        replaceConstant(find(node, "canEnableTcpNoDelayByDefault", "()Z"),
+                Opcodes.ICONST_1, Opcodes.IRETURN);
+        replaceInt(find(node, "javaVersion", "()I"), 21);
+        replaceInt(find(node, "bitMode", "()I"), 32);
+        replaceInt(find(node, "addressSize", "()I"), 4);
+        replaceLong(find(node, "usedDirectMemory", "()J"), -1L);
+        replaceFieldGetter(find(node, "getUnsafeUnavailabilityCause", "()Ljava/lang/Throwable;"),
+                "UNSAFE_UNAVAILABILITY_CAUSE", "Ljava/lang/Throwable;", Opcodes.ARETURN);
+        replaceFieldGetter(find(node, "maxDirectMemory", "()J"),
+                "MAX_DIRECT_MEMORY", "J", Opcodes.LRETURN);
+        replaceFieldGetter(find(node, "tmpdir", "()Ljava/io/File;"),
+                "TMPDIR", "Ljava/io/File;", Opcodes.ARETURN);
+        replaceFieldGetter(find(node, "normalizedArch", "()Ljava/lang/String;"),
+                "NORMALIZED_ARCH", "Ljava/lang/String;", Opcodes.ARETURN);
+        replaceFieldGetter(find(node, "normalizedOs", "()Ljava/lang/String;"),
+                "NORMALIZED_OS", "Ljava/lang/String;", Opcodes.ARETURN);
+        replaceFieldGetter(find(node, "normalizedLinuxClassifiers", "()Ljava/util/Set;"),
+                "LINUX_OS_CLASSIFIERS", "Ljava/util/Set;", Opcodes.ARETURN);
+        replaceNew(find(node, "newLongCounter", "()Lio/netty/util/internal/LongCounter;"),
+                "io/netty/util/internal/BrowserLongCounter");
+        replaceNoop(find(node, "freeDirectBuffer", "(Ljava/nio/ByteBuffer;)V"));
+        replaceThrowException(find(node, "throwException", "(Ljava/lang/Throwable;)V"));
+        replaceLong(find(node, "directBufferAddress", "(Ljava/nio/ByteBuffer;)J"), 0L);
+        replaceArrayStore(find(node, "putInt", "([BII)V"),
+                "putInt", "([BII)V");
+        replaceArrayStore(find(node, "putLong", "([BIJ)V"),
+                "putLong", "([BIJ)V");
+        for (MethodNode method : node.methods) {
+            if (method.name.equals("newMpscQueue")
+                    || method.name.equals("newSpscQueue")
+                    || method.name.equals("newFixedMpscQueue")
+                    || method.name.equals("newFixedMpscUnpaddedQueue")
+                    || method.name.equals("newFixedMpmcQueue")) {
+                replaceNew(method, "java/util/concurrent/ConcurrentLinkedQueue");
+            }
+        }
+        write(node, output);
+    }
+
+    private static void patchNetUtil(Path jar, Path netUtilOutput, Path initializationsOutput)
+            throws IOException {
+        ClassNode netUtil = read(jar, "io/netty/util/NetUtil.class");
+        MethodNode sysctl = find(netUtil, "sysctlGetInt",
+                "(Ljava/lang/String;)Ljava/lang/Integer;");
+        InsnList noSysctl = new InsnList();
+        noSysctl.add(new InsnNode(Opcodes.ACONST_NULL));
+        noSysctl.add(new InsnNode(Opcodes.ARETURN));
+        replace(sysctl, noSysctl);
+        write(netUtil, netUtilOutput);
+
+        ClassNode initializations = read(jar, "io/netty/util/NetUtilInitializations.class");
+        MethodNode interfaces = find(initializations, "networkInterfaces",
+                "()Ljava/util/Collection;");
+        InsnList empty = new InsnList();
+        empty.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "java/util/Collections", "emptyList", "()Ljava/util/List;", false));
+        empty.add(new InsnNode(Opcodes.ARETURN));
+        replace(interfaces, empty);
+
+        MethodNode loopback = find(initializations, "determineLoopback",
+                "(Ljava/util/Collection;Ljava/net/Inet4Address;Ljava/net/Inet6Address;)"
+                        + "Lio/netty/util/NetUtilInitializations$NetworkIfaceAndInetAddress;");
+        InsnList fallback = new InsnList();
+        fallback.add(new TypeInsnNode(Opcodes.NEW,
+                "io/netty/util/NetUtilInitializations$NetworkIfaceAndInetAddress"));
+        fallback.add(new InsnNode(Opcodes.DUP));
+        fallback.add(new InsnNode(Opcodes.ACONST_NULL));
+        fallback.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 1));
+        fallback.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                "io/netty/util/NetUtilInitializations$NetworkIfaceAndInetAddress",
+                "<init>",
+                "(Ljava/net/NetworkInterface;Ljava/net/InetAddress;)V",
+                false));
+        fallback.add(new InsnNode(Opcodes.ARETURN));
+        replace(loopback, fallback);
+        write(initializations, initializationsOutput);
+    }
+
+    private static void patchChannelInitializer(Path jar, Path output) throws IOException {
+        ClassNode node = read(jar, "io/netty/channel/ChannelInitializer.class");
+        MethodNode constructor = find(node, "<init>", "()V");
+        InsnList code = new InsnList();
+        code.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(Opcodes.INVOKESPECIAL,
+                "io/netty/channel/ChannelInboundHandlerAdapter", "<init>", "()V", false));
+        code.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+        putNew(code, "java/util/concurrent/ConcurrentHashMap");
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "java/util/Collections", "newSetFromMap",
+                "(Ljava/util/Map;)Ljava/util/Set;", false));
+        code.add(new FieldInsnNode(Opcodes.PUTFIELD,
+                "io/netty/channel/ChannelInitializer", "initMap", "Ljava/util/Set;"));
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(constructor, code);
+        write(node, output);
+    }
+
+    private static void patchEmptyArrays(Path jar, Path output) throws IOException {
+        ClassNode node = read(jar, "io/netty/util/internal/EmptyArrays.class");
+        MethodNode initializer = find(node, "<clinit>", "()V");
+        for (var instruction = initializer.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof TypeInsnNode type
+                    && type.getOpcode() == Opcodes.ANEWARRAY
+                    && type.desc.equals("javax/security/cert/X509Certificate")) {
+                initializer.instructions.set(type, new InsnNode(Opcodes.ACONST_NULL));
+                break;
+            }
+        }
+        write(node, output);
+    }
+
+    private static void patchReferenceCountedBuffer(Path jar, Path output) throws IOException {
+        ClassNode node = read(jar, "io/netty/buffer/AbstractReferenceCountedByteBuf.class");
+        String owner = "io/netty/buffer/AbstractReferenceCountedByteBuf";
+        InsnList code = new InsnList();
+        code.add(new LdcInsnNode(org.objectweb.asm.Type.getObjectType(owner)));
+        code.add(new LdcInsnNode("refCnt"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "java/util/concurrent/atomic/AtomicIntegerFieldUpdater",
+                "newUpdater",
+                "(Ljava/lang/Class;Ljava/lang/String;)"
+                        + "Ljava/util/concurrent/atomic/AtomicIntegerFieldUpdater;",
+                false));
+        code.add(new FieldInsnNode(
+                Opcodes.PUTSTATIC, owner, "AIF_UPDATER",
+                "Ljava/util/concurrent/atomic/AtomicIntegerFieldUpdater;"));
+        code.add(new InsnNode(Opcodes.LCONST_0));
+        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, "REFCNT_FIELD_OFFSET", "J"));
+        code.add(new InsnNode(Opcodes.ACONST_NULL));
+        code.add(new FieldInsnNode(
+                Opcodes.PUTSTATIC, owner, "REFCNT_FIELD_VH", "Ljava/lang/Object;"));
+        putNew(code, owner + "$1");
+        code.add(new FieldInsnNode(
+                Opcodes.PUTSTATIC, owner, "updater",
+                "Lio/netty/util/internal/ReferenceCountUpdater;"));
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(node, "<clinit>", "()V", code);
+        write(node, output);
+    }
+
+    private static void patchBuffer(Path jar, Path output) throws IOException {
+        ClassNode node = read(jar, BUFFER);
+        InsnList code = new InsnList();
+        putBoolean(code, "io/netty/buffer/ByteBufUtil", "$assertionsDisabled", true);
+        code.add(new LdcInsnNode(org.objectweb.asm.Type.getObjectType("io/netty/buffer/ByteBufUtil")));
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "io/netty/util/internal/logging/InternalLoggerFactory", "getInstance",
+                "(Ljava/lang/Class;)Lio/netty/util/internal/logging/InternalLogger;", false));
+        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, "io/netty/buffer/ByteBufUtil", "logger",
+                "Lio/netty/util/internal/logging/InternalLogger;"));
+        putNew(code, "io/netty/buffer/ByteBufUtil$1");
+        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, "io/netty/buffer/ByteBufUtil", "BYTE_ARRAYS",
+                "Lio/netty/util/concurrent/FastThreadLocal;"));
+        putInt(code, "io/netty/buffer/ByteBufUtil", "MAX_BYTES_PER_CHAR_UTF8", 3);
+        code.add(new FieldInsnNode(Opcodes.GETSTATIC,
+                "io/netty/buffer/UnpooledByteBufAllocator", "DEFAULT",
+                "Lio/netty/buffer/UnpooledByteBufAllocator;"));
+        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, "io/netty/buffer/ByteBufUtil",
+                "DEFAULT_ALLOCATOR", "Lio/netty/buffer/ByteBufAllocator;"));
+        putInt(code, "io/netty/buffer/ByteBufUtil", "THREAD_LOCAL_BUFFER_SIZE", 0);
+        putInt(code, "io/netty/buffer/ByteBufUtil", "MAX_CHAR_BUFFER_SIZE", 16384);
+        putNew(code, "io/netty/buffer/ByteBufUtil$2");
+        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, "io/netty/buffer/ByteBufUtil",
+                "FIND_NON_ASCII", "Lio/netty/util/ByteProcessor;"));
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(node, "<clinit>", "()V", code);
+        write(node, output);
+    }
+
+    private static InsnList platformInitializer() {
+        String owner = "io/netty/util/internal/PlatformDependent";
+        InsnList code = new InsnList();
+        putBoolean(code, owner, "$assertionsDisabled", true);
+        code.add(new LdcInsnNode(org.objectweb.asm.Type.getObjectType(owner)));
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "io/netty/util/internal/logging/InternalLoggerFactory", "getInstance",
+                "(Ljava/lang/Class;)Lio/netty/util/internal/logging/InternalLogger;", false));
+        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, "logger",
+                "Lio/netty/util/internal/logging/InternalLogger;"));
+        putBoolean(code, owner, "CAN_ENABLE_TCP_NODELAY_BY_DEFAULT", true);
+        putNewString(code, "java/lang/UnsupportedOperationException",
+                "Native memory is unavailable in the browser");
+        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, "UNSAFE_UNAVAILABILITY_CAUSE",
+                "Ljava/lang/Throwable;"));
+        putLong(code, owner, "MAX_DIRECT_MEMORY", 2147483647L);
+        putLong(code, owner, "BYTE_ARRAY_BASE_OFFSET", 0L);
+        putNewString(code, "java/io/File", ".");
+        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, "TMPDIR", "Ljava/io/File;"));
+        putInt(code, owner, "BIT_MODE", 32);
+        putString(code, owner, "NORMALIZED_ARCH", "wasm32");
+        putString(code, owner, "NORMALIZED_OS", "browser");
+        putBoolean(code, owner, "IS_WINDOWS", false);
+        putBoolean(code, owner, "IS_OSX", false);
+        putBoolean(code, owner, "IS_J9_JVM", false);
+        putBoolean(code, owner, "IS_IVKVM_DOT_NET", false);
+        putInt(code, owner, "ADDRESS_SIZE", 4);
+        putBoolean(code, owner, "BIG_ENDIAN_NATIVE_ORDER", false);
+        putNew(code, "io/netty/util/internal/PlatformDependent$1");
+        code.add(new InsnNode(Opcodes.DUP));
+        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, "NOOP",
+                "Lio/netty/util/internal/Cleaner;"));
+        code.add(new InsnNode(Opcodes.DUP));
+        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, "DIRECT_CLEANER",
+                "Lio/netty/util/internal/Cleaner;"));
+        code.add(new InsnNode(Opcodes.DUP));
+        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, "LEGACY_CLEANER",
+                "Lio/netty/util/internal/Cleaner;"));
+        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, "CLEANER",
+                "Lio/netty/util/internal/Cleaner;"));
+        putBoolean(code, owner, "USE_DIRECT_BUFFER_NO_CLEANER", false);
+        code.add(new InsnNode(Opcodes.ACONST_NULL));
+        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, "DIRECT_MEMORY_COUNTER",
+                "Ljava/util/concurrent/atomic/AtomicLong;"));
+        putLong(code, owner, "DIRECT_MEMORY_LIMIT", 2147483647L);
+        putBoolean(code, owner, "HAS_ALLOCATE_UNINIT_ARRAY", false);
+        putBoolean(code, owner, "MAYBE_SUPER_USER", false);
+        putBoolean(code, owner, "EXPLICIT_NO_PREFER_DIRECT", true);
+        putBoolean(code, owner, "DIRECT_BUFFER_PREFERRED", false);
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "java/util/Collections", "emptySet",
+                "()Ljava/util/Set;", false));
+        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, "LINUX_OS_CLASSIFIERS",
+                "Ljava/util/Set;"));
+        putBoolean(code, owner, "JFR", false);
+        putBoolean(code, owner, "VAR_HANDLE", false);
+        code.add(new InsnNode(Opcodes.RETURN));
+        return code;
+    }
+
+    private static void replaceAllocateArray(ClassNode node) {
+        MethodNode method = find(node, "allocateUninitializedArray", "(I)[B");
+        InsnList code = new InsnList();
+        code.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ILOAD, 0));
+        code.add(new IntInsnNode(Opcodes.NEWARRAY, Opcodes.T_BYTE));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(method, code);
+    }
+
+    private static void replaceNew(MethodNode method, String type) {
+        InsnList code = new InsnList();
+        putNew(code, type);
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(method, code);
+    }
+
+    private static void replaceNoop(MethodNode method) {
+        InsnList code = new InsnList();
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(method, code);
+    }
+
+    private static void replaceThrowException(MethodNode method) {
+        InsnList code = new InsnList();
+        code.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new InsnNode(Opcodes.ATHROW));
+        replace(method, code);
+    }
+
+    private static void replaceArrayStore(MethodNode method, String name, String desc) {
+        InsnList code = new InsnList();
+        org.objectweb.asm.Type[] arguments = org.objectweb.asm.Type.getArgumentTypes(desc);
+        int local = 0;
+        for (org.objectweb.asm.Type argument : arguments) {
+            code.add(new org.objectweb.asm.tree.VarInsnNode(
+                    argument.getOpcode(Opcodes.ILOAD), local));
+            local += argument.getSize();
+        }
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "io/netty/util/internal/BrowserPlatformSupport", name, desc, false));
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(method, code);
+    }
+
+    private static void replaceInt(MethodNode method, int value) {
+        InsnList code = new InsnList();
+        pushInt(code, value);
+        code.add(new InsnNode(Opcodes.IRETURN));
+        replace(method, code);
+    }
+
+    private static void replaceLong(MethodNode method, long value) {
+        InsnList code = new InsnList();
+        code.add(new LdcInsnNode(value));
+        code.add(new InsnNode(Opcodes.LRETURN));
+        replace(method, code);
+    }
+
+    private static void replaceConstant(ClassNode node, String name, String desc,
+            int constant, int returnOpcode) {
+        replaceConstant(find(node, name, desc), constant, returnOpcode);
+    }
+
+    private static void replaceConstant(MethodNode method, int constant, int returnOpcode) {
+        InsnList code = new InsnList();
+        code.add(new InsnNode(constant));
+        code.add(new InsnNode(returnOpcode));
+        replace(method, code);
+    }
+
+    private static void replaceFieldGetter(MethodNode method, String field, String desc,
+            int returnOpcode) {
+        InsnList code = new InsnList();
+        code.add(new FieldInsnNode(Opcodes.GETSTATIC,
+                "io/netty/util/internal/PlatformDependent", field, desc));
+        code.add(new InsnNode(returnOpcode));
+        replace(method, code);
+    }
+
+    private static void putInt(InsnList code, String owner, String field, int value) {
+        pushInt(code, value);
+        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, field, "I"));
+    }
+
+    private static void putBoolean(InsnList code, String owner, String field, boolean value) {
+        code.add(new InsnNode(value ? Opcodes.ICONST_1 : Opcodes.ICONST_0));
+        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, field, "Z"));
+    }
+
+    private static void putLong(InsnList code, String owner, String field, long value) {
+        code.add(new LdcInsnNode(value));
+        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, field, "J"));
+    }
+
+    private static void putString(InsnList code, String owner, String field, String value) {
+        code.add(new LdcInsnNode(value));
+        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, field, "Ljava/lang/String;"));
+    }
+
+    private static void putNewString(InsnList code, String type, String value) {
+        code.add(new TypeInsnNode(Opcodes.NEW, type));
+        code.add(new InsnNode(Opcodes.DUP));
+        code.add(new LdcInsnNode(value));
+        code.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, type, "<init>",
+                "(Ljava/lang/String;)V", false));
+    }
+
+    private static void putNew(InsnList code, String type) {
+        code.add(new TypeInsnNode(Opcodes.NEW, type));
+        code.add(new InsnNode(Opcodes.DUP));
+        code.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, type, "<init>", "()V", false));
+    }
+
+    private static void pushInt(InsnList code, int value) {
+        if (value >= -1 && value <= 5) {
+            code.add(new InsnNode(Opcodes.ICONST_0 + value));
+        } else if (value >= Byte.MIN_VALUE && value <= Byte.MAX_VALUE) {
+            code.add(new IntInsnNode(Opcodes.BIPUSH, value));
+        } else if (value >= Short.MIN_VALUE && value <= Short.MAX_VALUE) {
+            code.add(new IntInsnNode(Opcodes.SIPUSH, value));
+        } else {
+            code.add(new LdcInsnNode(value));
+        }
+    }
+
+    private static ClassNode read(Path jar, String entry) throws IOException {
+        byte[] input;
+        try (ZipFile zip = new ZipFile(jar.toFile())) {
+            var jarEntry = zip.getEntry(entry);
+            if (jarEntry == null) {
+                throw new IllegalStateException(entry + " was not found in " + jar);
+            }
+            try (var stream = zip.getInputStream(jarEntry)) {
+                input = stream.readAllBytes();
+            }
+        }
+        ClassNode node = new ClassNode();
+        new ClassReader(input).accept(node, 0);
+        return node;
+    }
+
+    private static MethodNode find(ClassNode node, String name, String desc) {
+        return node.methods.stream()
+                .filter(method -> method.name.equals(name) && method.desc.equals(desc))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(name + desc + " was not found"));
+    }
+
+    private static MethodNode findByName(ClassNode node, String name) {
+        return node.methods.stream()
+                .filter(method -> method.name.equals(name))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(name + " was not found"));
+    }
+
+    private static void replace(ClassNode node, String name, String desc, InsnList code) {
+        replace(find(node, name, desc), code);
+    }
+
+    private static void replace(MethodNode method, InsnList code) {
+        method.instructions = code;
+        method.tryCatchBlocks.clear();
+        method.localVariables = null;
+        method.maxStack = 8;
+        method.maxLocals = Math.max(method.maxLocals, 4);
+    }
+
+    private static void write(ClassNode node, Path output) throws IOException {
+        ClassWriter writer = new ClassWriter(0);
+        node.accept(writer);
+        Files.createDirectories(output.getParent());
+        Files.write(output, writer.toByteArray());
+    }
+}

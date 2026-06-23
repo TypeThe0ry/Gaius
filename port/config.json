@@ -1,0 +1,8 @@
+{
+  "minecraftVersion": "1.21.11",
+  "protocolVersion": 774,
+  "javaVersion": 21,
+  "teaVMVersion": "0.15.0",
+  "autoRenamingToolVersion": "2.0.18",
+  "mavenVersion": "3.9.11"
+}

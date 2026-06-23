@@ -1,0 +1,19 @@
+# Never commit locally acquired Minecraft artifacts.
+*.jar
+client.txt
+assets/
+libraries/
+versions/
+port/work/
+port/target/
+
+# Local build and editor output.
+build/
+dist/
+node_modules/
+.pnpm-store/
+.DS_Store
+*.log
+*.tsbuildinfo
+__pycache__/
+*.pyc
