@@ -85,6 +85,35 @@ public class TInetAddress implements Serializable {
         return address.length == 4 && (address[0] & 255) == 127;
     }
 
+    public boolean isMulticastAddress() {
+        if (address.length == 4) {
+            int first = address[0] & 255;
+            return first >= 224 && first <= 239;
+        }
+        return address.length == 16 && (address[0] & 255) == 255;
+    }
+
+    public boolean isLinkLocalAddress() {
+        if (address.length == 4) {
+            return (address[0] & 255) == 169 && (address[1] & 255) == 254;
+        }
+        return address.length == 16
+                && (address[0] & 255) == 254
+                && ((address[1] & 255) & 192) == 128;
+    }
+
+    public boolean isSiteLocalAddress() {
+        if (address.length == 4) {
+            int first = address[0] & 255;
+            int second = address[1] & 255;
+            return first == 10
+                    || first == 172 && second >= 16 && second <= 31
+                    || first == 192 && second == 168;
+        }
+        return address.length == 16
+                && ((address[0] & 255) & 254) == 252;
+    }
+
     @Override
     public String toString() {
         return hostName + "/" + getHostAddress();

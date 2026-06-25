@@ -18,4 +18,12 @@ public final class TInet6Address extends TInetAddress {
             throws TUnknownHostException {
         return getByAddress(host, address, 0);
     }
+
+    public TNetworkInterface getScopedInterface() {
+        return null;
+    }
+
+    public int getScopeId() {
+        return 0;
+    }
 }

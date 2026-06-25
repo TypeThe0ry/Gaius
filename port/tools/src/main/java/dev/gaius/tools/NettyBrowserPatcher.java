@@ -12,6 +12,8 @@ import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.IntInsnNode;
+import org.objectweb.asm.tree.JumpInsnNode;
+import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
@@ -32,17 +34,25 @@ public final class NettyBrowserPatcher {
         Path transportRoot = Path.of(args[5]);
         patchPlatform(Path.of(args[0]),
                 commonRoot.resolve("io/netty/util/internal/PlatformDependent.class"));
+        patchPlatform0(Path.of(args[0]),
+                commonRoot.resolve("io/netty/util/internal/PlatformDependent0.class"));
         patchNetUtil(Path.of(args[0]),
                 commonRoot.resolve("io/netty/util/NetUtil.class"),
                 commonRoot.resolve("io/netty/util/NetUtilInitializations.class"));
         patchEmptyArrays(Path.of(args[0]),
                 commonRoot.resolve("io/netty/util/internal/EmptyArrays.class"));
+        patchResourceLeakDetector(Path.of(args[0]),
+                commonRoot.resolve("io/netty/util/ResourceLeakDetector.class"));
         patchBuffer(Path.of(args[1]),
                 bufferRoot.resolve("io/netty/buffer/ByteBufUtil.class"));
         patchReferenceCountedBuffer(Path.of(args[1]),
                 bufferRoot.resolve("io/netty/buffer/AbstractReferenceCountedByteBuf.class"));
+        patchUnpooledAllocator(Path.of(args[1]),
+                bufferRoot.resolve("io/netty/buffer/UnpooledByteBufAllocator.class"));
         patchChannelInitializer(Path.of(args[2]),
                 transportRoot.resolve("io/netty/channel/ChannelInitializer.class"));
+        patchReflectiveChannelFactory(Path.of(args[2]),
+                transportRoot.resolve("io/netty/channel/ReflectiveChannelFactory.class"));
     }
 
     private static void patchPlatform(Path jar, Path output) throws IOException {
@@ -100,6 +110,74 @@ public final class NettyBrowserPatcher {
                 replaceNew(method, "java/util/concurrent/ConcurrentLinkedQueue");
             }
         }
+        write(node, output);
+    }
+
+    private static void patchPlatform0(Path jar, Path output) throws IOException {
+        ClassNode node = read(jar, "io/netty/util/internal/PlatformDependent0.class");
+        String owner = "io/netty/util/internal/PlatformDependent0";
+        InsnList code = new InsnList();
+        code.add(new LdcInsnNode(org.objectweb.asm.Type.getObjectType(owner)));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "io/netty/util/internal/logging/InternalLoggerFactory",
+                "getInstance",
+                "(Ljava/lang/Class;)Lio/netty/util/internal/logging/InternalLogger;",
+                false));
+        code.add(new FieldInsnNode(
+                Opcodes.PUTSTATIC, owner, "logger",
+                "Lio/netty/util/internal/logging/InternalLogger;"));
+        putLong(code, owner, "ADDRESS_FIELD_OFFSET", -1L);
+        putLong(code, owner, "BYTE_ARRAY_BASE_OFFSET", 0L);
+        putLong(code, owner, "INT_ARRAY_BASE_OFFSET", 0L);
+        putLong(code, owner, "INT_ARRAY_INDEX_SCALE", 4L);
+        putLong(code, owner, "LONG_ARRAY_BASE_OFFSET", 0L);
+        putLong(code, owner, "LONG_ARRAY_INDEX_SCALE", 8L);
+        putBoolean(code, owner, "IS_ANDROID", false);
+        putInt(code, owner, "JAVA_VERSION", 21);
+        putNewString(code, "java/lang/UnsupportedOperationException",
+                "Unsafe is unavailable in the browser");
+        code.add(new FieldInsnNode(
+                Opcodes.PUTSTATIC, owner, "UNSAFE_UNAVAILABILITY_CAUSE",
+                "Ljava/lang/Throwable;"));
+        putBoolean(code, owner, "RUNNING_IN_NATIVE_IMAGE", false);
+        putBoolean(code, owner, "IS_EXPLICIT_TRY_REFLECTION_SET_ACCESSIBLE", false);
+        putInt(code, owner, "HASH_CODE_ASCII_SEED", -1028477387);
+        putInt(code, owner, "HASH_CODE_C1", -862048943);
+        putInt(code, owner, "HASH_CODE_C2", 461845907);
+        putBoolean(code, owner, "UNALIGNED", false);
+        putLong(code, owner, "BITS_MAX_DIRECT_MEMORY", -1L);
+        putBoolean(code, owner, "$assertionsDisabled", true);
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(node, "<clinit>", "()V", code);
+
+        replaceConstant(find(node, "hasUnsafe", "()Z"),
+                Opcodes.ICONST_0, Opcodes.IRETURN);
+        replaceConstant(find(node, "isUnaligned", "()Z"),
+                Opcodes.ICONST_0, Opcodes.IRETURN);
+        replaceConstant(find(node, "hasDirectBufferNoCleanerConstructor", "()Z"),
+                Opcodes.ICONST_0, Opcodes.IRETURN);
+        replaceConstant(find(node, "hasAllocateArrayMethod", "()Z"),
+                Opcodes.ICONST_0, Opcodes.IRETURN);
+        replaceConstant(find(node, "hasAlignSliceMethod", "()Z"),
+                Opcodes.ICONST_0, Opcodes.IRETURN);
+        replaceConstant(find(node, "hasOffsetSliceMethod", "()Z"),
+                Opcodes.ICONST_0, Opcodes.IRETURN);
+        replaceConstant(find(node, "isVirtualThread", "(Ljava/lang/Thread;)Z"),
+                Opcodes.ICONST_0, Opcodes.IRETURN);
+        replaceAllocateArray(node);
+        replaceThrowException(find(node, "throwException", "(Ljava/lang/Throwable;)V"));
+        replaceLong(find(node, "directBufferAddress", "(Ljava/nio/ByteBuffer;)J"), 0L);
+        replaceLong(find(node, "objectFieldOffset", "(Ljava/lang/reflect/Field;)J"), -1L);
+        replaceNoop(find(node, "putObject", "(Ljava/lang/Object;JLjava/lang/Object;)V"));
+        replaceNoop(find(node, "copyMemory", "(JJJ)V"));
+        replaceNoop(find(node, "copyMemoryWithSafePointPolling", "(JJJ)V"));
+        replaceNoop(find(node, "copyMemory",
+                "(Ljava/lang/Object;JLjava/lang/Object;JJ)V"));
+        replaceNoop(find(node, "copyMemoryWithSafePointPolling",
+                "(Ljava/lang/Object;JLjava/lang/Object;JJ)V"));
+        replaceNoop(find(node, "setMemory", "(JJB)V"));
+        replaceNoop(find(node, "setMemory", "(Ljava/lang/Object;JJB)V"));
         write(node, output);
     }
 
@@ -162,6 +240,157 @@ public final class NettyBrowserPatcher {
         write(node, output);
     }
 
+    private static void patchReflectiveChannelFactory(Path jar, Path output) throws IOException {
+        String owner = "io/netty/channel/ReflectiveChannelFactory";
+        ClassNode node = read(jar, owner + ".class");
+        boolean hasClazzField = node.fields.stream().anyMatch(field -> field.name.equals("clazz"));
+        if (!hasClazzField) {
+            node.fields.add(new org.objectweb.asm.tree.FieldNode(
+                    Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL,
+                    "clazz",
+                    "Ljava/lang/Class;",
+                    null,
+                    null));
+        }
+
+        MethodNode constructor = find(node, "<init>", "(Ljava/lang/Class;)V");
+        LabelNode notLocalServer = new LabelNode();
+        LabelNode notLocalChannel = new LabelNode();
+        InsnList init = new InsnList();
+        init.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+        init.add(new MethodInsnNode(Opcodes.INVOKESPECIAL,
+                "java/lang/Object", "<init>", "()V", false));
+        init.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 1));
+        init.add(new LdcInsnNode("clazz"));
+        init.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "io/netty/util/internal/ObjectUtil",
+                "checkNotNull",
+                "(Ljava/lang/Object;Ljava/lang/String;)Ljava/lang/Object;",
+                false));
+        init.add(new InsnNode(Opcodes.POP));
+        init.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+        init.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 1));
+        init.add(new FieldInsnNode(Opcodes.PUTFIELD, owner, "clazz", "Ljava/lang/Class;"));
+
+        init.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 1));
+        init.add(new LdcInsnNode(org.objectweb.asm.Type.getObjectType(
+                "io/netty/channel/local/LocalServerChannel")));
+        init.add(new JumpInsnNode(Opcodes.IF_ACMPNE, notLocalServer));
+        init.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+        init.add(new InsnNode(Opcodes.ACONST_NULL));
+        init.add(new FieldInsnNode(Opcodes.PUTFIELD, owner, "constructor",
+                "Ljava/lang/reflect/Constructor;"));
+        init.add(new InsnNode(Opcodes.RETURN));
+        init.add(notLocalServer);
+
+        init.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 1));
+        init.add(new LdcInsnNode(org.objectweb.asm.Type.getObjectType(
+                "io/netty/channel/local/LocalChannel")));
+        init.add(new JumpInsnNode(Opcodes.IF_ACMPNE, notLocalChannel));
+        init.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+        init.add(new InsnNode(Opcodes.ACONST_NULL));
+        init.add(new FieldInsnNode(Opcodes.PUTFIELD, owner, "constructor",
+                "Ljava/lang/reflect/Constructor;"));
+        init.add(new InsnNode(Opcodes.RETURN));
+        init.add(notLocalChannel);
+
+        init.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+        init.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 1));
+        init.add(new InsnNode(Opcodes.ICONST_0));
+        init.add(new TypeInsnNode(Opcodes.ANEWARRAY, "java/lang/Class"));
+        init.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                "java/lang/Class",
+                "getConstructor",
+                "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;",
+                false));
+        init.add(new FieldInsnNode(Opcodes.PUTFIELD, owner, "constructor",
+                "Ljava/lang/reflect/Constructor;"));
+        init.add(new InsnNode(Opcodes.RETURN));
+        replace(constructor, init);
+
+        MethodNode newChannel = find(node, "newChannel", "()Lio/netty/channel/Channel;");
+        LabelNode notNewLocalServer = new LabelNode();
+        LabelNode notNewLocalChannel = new LabelNode();
+        InsnList create = new InsnList();
+        create.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+        create.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "clazz", "Ljava/lang/Class;"));
+        create.add(new LdcInsnNode(org.objectweb.asm.Type.getObjectType(
+                "io/netty/channel/local/LocalServerChannel")));
+        create.add(new JumpInsnNode(Opcodes.IF_ACMPNE, notNewLocalServer));
+        putNew(create, "io/netty/channel/local/LocalServerChannel");
+        create.add(new InsnNode(Opcodes.ARETURN));
+        create.add(notNewLocalServer);
+
+        create.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+        create.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "clazz", "Ljava/lang/Class;"));
+        create.add(new LdcInsnNode(org.objectweb.asm.Type.getObjectType(
+                "io/netty/channel/local/LocalChannel")));
+        create.add(new JumpInsnNode(Opcodes.IF_ACMPNE, notNewLocalChannel));
+        putNew(create, "io/netty/channel/local/LocalChannel");
+        create.add(new InsnNode(Opcodes.ARETURN));
+        create.add(notNewLocalChannel);
+
+        create.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+        create.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "constructor",
+                "Ljava/lang/reflect/Constructor;"));
+        create.add(new InsnNode(Opcodes.ICONST_0));
+        create.add(new TypeInsnNode(Opcodes.ANEWARRAY, "java/lang/Object"));
+        create.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                "java/lang/reflect/Constructor",
+                "newInstance",
+                "([Ljava/lang/Object;)Ljava/lang/Object;",
+                false));
+        create.add(new TypeInsnNode(Opcodes.CHECKCAST, "io/netty/channel/Channel"));
+        create.add(new InsnNode(Opcodes.ARETURN));
+        replace(newChannel, create);
+
+        MethodNode toString = find(node, "toString", "()Ljava/lang/String;");
+        InsnList text = new InsnList();
+        text.add(new TypeInsnNode(Opcodes.NEW, "java/lang/StringBuilder"));
+        text.add(new InsnNode(Opcodes.DUP));
+        text.add(new MethodInsnNode(Opcodes.INVOKESPECIAL,
+                "java/lang/StringBuilder", "<init>", "()V", false));
+        text.add(new LdcInsnNode(org.objectweb.asm.Type.getObjectType(owner)));
+        text.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "io/netty/util/internal/StringUtil",
+                "simpleClassName",
+                "(Ljava/lang/Class;)Ljava/lang/String;",
+                false));
+        text.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                "java/lang/StringBuilder", "append",
+                "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+                false));
+        text.add(new IntInsnNode(Opcodes.BIPUSH, 40));
+        text.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                "java/lang/StringBuilder", "append",
+                "(C)Ljava/lang/StringBuilder;",
+                false));
+        text.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+        text.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "clazz", "Ljava/lang/Class;"));
+        text.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "io/netty/util/internal/StringUtil",
+                "simpleClassName",
+                "(Ljava/lang/Class;)Ljava/lang/String;",
+                false));
+        text.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                "java/lang/StringBuilder", "append",
+                "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+                false));
+        text.add(new LdcInsnNode(".class)"));
+        text.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                "java/lang/StringBuilder", "append",
+                "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+                false));
+        text.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                "java/lang/StringBuilder", "toString",
+                "()Ljava/lang/String;",
+                false));
+        text.add(new InsnNode(Opcodes.ARETURN));
+        replace(toString, text);
+
+        write(node, output);
+    }
+
     private static void patchEmptyArrays(Path jar, Path output) throws IOException {
         ClassNode node = read(jar, "io/netty/util/internal/EmptyArrays.class");
         MethodNode initializer = find(node, "<clinit>", "()V");
@@ -175,6 +404,43 @@ public final class NettyBrowserPatcher {
                 break;
             }
         }
+        write(node, output);
+    }
+
+    private static void patchResourceLeakDetector(Path jar, Path output) throws IOException {
+        String owner = "io/netty/util/ResourceLeakDetector";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode constructor = find(node, "<init>", "(Ljava/lang/String;IJ)V");
+        InsnList code = new InsnList();
+        code.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false));
+        for (String field : new String[] {"allLeaks", "reportedLeaks"}) {
+            code.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+            putNew(code, "java/util/concurrent/ConcurrentHashMap");
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "java/util/Collections",
+                    "newSetFromMap",
+                    "(Ljava/util/Map;)Ljava/util/Set;",
+                    false));
+            code.add(new FieldInsnNode(
+                    Opcodes.PUTFIELD, owner, field, "Ljava/util/Set;"));
+        }
+        code.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+        putNew(code, "java/lang/ref/ReferenceQueue");
+        code.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, "refQueue", "Ljava/lang/ref/ReferenceQueue;"));
+        code.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, "resourceType", "Ljava/lang/String;"));
+        code.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ILOAD, 2));
+        code.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, "samplingInterval", "I"));
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(constructor, code);
         write(node, output);
     }
 
@@ -208,6 +474,31 @@ public final class NettyBrowserPatcher {
         write(node, output);
     }
 
+    private static void patchUnpooledAllocator(Path jar, Path output) throws IOException {
+        String owner = "io/netty/buffer/UnpooledByteBufAllocator";
+        ClassNode node = read(jar, owner + ".class");
+        for (String methodName : new String[] {"newHeapBuffer", "newDirectBuffer"}) {
+            MethodNode method = find(node, methodName, "(II)Lio/netty/buffer/ByteBuf;");
+            InsnList code = new InsnList();
+            code.add(new TypeInsnNode(
+                    Opcodes.NEW,
+                    owner + "$InstrumentedUnpooledHeapByteBuf"));
+            code.add(new InsnNode(Opcodes.DUP));
+            code.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+            code.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ILOAD, 1));
+            code.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ILOAD, 2));
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKESPECIAL,
+                    owner + "$InstrumentedUnpooledHeapByteBuf",
+                    "<init>",
+                    "(Lio/netty/buffer/UnpooledByteBufAllocator;II)V",
+                    false));
+            code.add(new InsnNode(Opcodes.ARETURN));
+            replace(method, code);
+        }
+        write(node, output);
+    }
+
     private static void patchBuffer(Path jar, Path output) throws IOException {
         ClassNode node = read(jar, BUFFER);
         InsnList code = new InsnList();
@@ -234,7 +525,34 @@ public final class NettyBrowserPatcher {
                 "FIND_NON_ASCII", "Lio/netty/util/ByteProcessor;"));
         code.add(new InsnNode(Opcodes.RETURN));
         replace(node, "<clinit>", "()V", code);
+        replaceAsciiStringConstructor(node);
         write(node, output);
+    }
+
+    private static void replaceAsciiStringConstructor(ClassNode node) {
+        MethodNode decode = find(node, "decodeString",
+                "(Lio/netty/buffer/ByteBuf;IILjava/nio/charset/Charset;)Ljava/lang/String;");
+        for (var instruction = decode.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.owner.equals("java/lang/String")
+                    && call.name.equals("<init>")
+                    && call.desc.equals("([BIII)V")) {
+                var count = call.getPrevious();
+                var offset = count == null ? null : count.getPrevious();
+                var hibyte = offset == null ? null : offset.getPrevious();
+                if (hibyte == null || hibyte.getOpcode() != Opcodes.ICONST_0) {
+                    throw new IllegalStateException("Unexpected ASCII String constructor shape");
+                }
+                decode.instructions.remove(hibyte);
+                decode.instructions.insertBefore(call,
+                        new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 3));
+                call.desc = "([BIILjava/nio/charset/Charset;)V";
+                return;
+            }
+        }
+        throw new IllegalStateException("ASCII String constructor was not found");
     }
 
     private static InsnList platformInitializer() {

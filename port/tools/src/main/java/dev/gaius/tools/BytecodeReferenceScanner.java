@@ -40,12 +40,14 @@ public final class BytecodeReferenceScanner {
                             instruction = instruction.getNext()) {
                         if (instruction instanceof MethodInsnNode call && matches(call.owner, args)) {
                             counts.merge(
-                                    "M " + call.owner + "." + call.name + call.desc,
+                                    "M " + call.owner + "." + call.name + call.desc
+                                            + " <- " + node.name + "." + method.name + method.desc,
                                     1,
                                     Integer::sum);
                         } else if (instruction instanceof FieldInsnNode field && matches(field.owner, args)) {
                             counts.merge(
-                                    "F " + field.owner + "." + field.name + ":" + field.desc,
+                                    "F " + field.owner + "." + field.name + ":" + field.desc
+                                            + " <- " + node.name + "." + method.name + method.desc,
                                     1,
                                     Integer::sum);
                         }

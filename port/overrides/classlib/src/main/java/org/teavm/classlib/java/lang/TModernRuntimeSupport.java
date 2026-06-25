@@ -1,6 +1,7 @@
 package org.teavm.classlib.java.lang;
 
 import com.ibm.icu.lang.UCharacter;
+import java.time.Duration;
 import org.teavm.classlib.java.util.TCollections;
 import org.teavm.classlib.java.util.TMap;
 import org.teavm.classlib.java.lang.reflect.TType;
@@ -76,6 +77,14 @@ public final class TModernRuntimeSupport {
 
     public static long threadId(TThread thread) {
         return thread.getId();
+    }
+
+    public static TThread$State threadState(TThread thread) {
+        return thread.isAlive() ? TThread$State.RUNNABLE : TThread$State.TERMINATED;
+    }
+
+    public static void sleep(Duration duration) throws TInterruptedException {
+        TThread.sleep(duration.toMillis());
     }
 
     public static TType genericSuperclass(TClass<?> type) {

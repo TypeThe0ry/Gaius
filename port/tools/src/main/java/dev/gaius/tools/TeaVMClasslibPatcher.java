@@ -69,7 +69,8 @@ public final class TeaVMClasslibPatcher {
                                 + "[Lorg/teavm/classlib/java/lang/reflect/TType;"),
                 constantNull("getSigners", "()[Ljava/lang/Object;"),
                 constantNull("getResource",
-                        "(Ljava/lang/String;)Lorg/teavm/classlib/java/net/TURL;")
+                        "(Ljava/lang/String;)Lorg/teavm/classlib/java/net/TURL;"),
+                constantFalseInstance("desiredAssertionStatus", "()Z")
         });
         patches.put("org/teavm/classlib/java/lang/TPackage", new MethodSpec[] {
                 constantNull("getSpecificationVersion", "()Ljava/lang/String;"),
@@ -100,6 +101,15 @@ public final class TeaVMClasslibPatcher {
                         "org/teavm/classlib/java/lang/TModernRuntimeSupport",
                         "threadId",
                         "(Lorg/teavm/classlib/java/lang/TThread;)J"),
+                instanceDelegate("getState",
+                        "()Lorg/teavm/classlib/java/lang/TThread$State;",
+                        "org/teavm/classlib/java/lang/TModernRuntimeSupport",
+                        "threadState",
+                        "(Lorg/teavm/classlib/java/lang/TThread;)"
+                                + "Lorg/teavm/classlib/java/lang/TThread$State;"),
+                staticDelegate("sleep", "(Ljava/time/Duration;)V",
+                        "org/teavm/classlib/java/lang/TModernRuntimeSupport",
+                        "sleep"),
                 threadGroupConstructor()
         });
         patches.put("org/teavm/classlib/java/lang/TClassLoader", new MethodSpec[] {
@@ -190,13 +200,41 @@ public final class TeaVMClasslibPatcher {
                         "(Lorg/teavm/classlib/java/util/TSortedMap;)"
                                 + "Lorg/teavm/classlib/java/util/TSortedMap;",
                         "org/teavm/classlib/java/util/TCollectionsModernSupport",
-                        "unmodifiableSortedMap")
+                        "unmodifiableSortedMap"),
+                staticDelegate("unmodifiableSequencedSet",
+                        "(Ljava/util/SequencedSet;)Ljava/util/SequencedSet;",
+                        "org/teavm/classlib/java/util/TCollectionsModernSupport",
+                        "unmodifiableSequencedSet")
         });
         patches.put("org/teavm/classlib/java/util/TSpliterators", new MethodSpec[] {
                 staticDelegate("emptySpliterator",
                         "()Lorg/teavm/classlib/java/util/TSpliterator;",
                         "org/teavm/classlib/java/util/TCollectionsModernSupport",
-                        "emptySpliterator")
+                        "emptySpliterator"),
+                staticDelegate("iterator",
+                        "(Lorg/teavm/classlib/java/util/TSpliterator;)"
+                                + "Ljava/util/Iterator;",
+                        "org/teavm/classlib/java/util/TSpliteratorsModernSupport",
+                        "iterator"),
+                staticDelegate("iterator",
+                        "(Lorg/teavm/classlib/java/util/TSpliterator$OfInt;)"
+                                + "Ljava/util/PrimitiveIterator$OfInt;",
+                        "org/teavm/classlib/java/util/TSpliteratorsModernSupport",
+                        "iterator"),
+                staticDelegate("spliterator",
+                        "([DIII)Lorg/teavm/classlib/java/util/TSpliterator$OfDouble;",
+                        "org/teavm/classlib/java/util/TSpliteratorsModernSupport",
+                        "spliterator")
+        });
+        patches.put("org/teavm/classlib/java/util/TBase64", new MethodSpec[] {
+                staticDelegate("getMimeEncoder",
+                        "(I[B)Lorg/teavm/classlib/java/util/TBase64$Encoder;",
+                        "org/teavm/classlib/java/util/TBase64ModernSupport",
+                        "getMimeEncoder"),
+                staticDelegate("getMimeDecoder",
+                        "()Lorg/teavm/classlib/java/util/TBase64$Decoder;",
+                        "org/teavm/classlib/java/util/TBase64",
+                        "getDecoder")
         });
         patches.put("org/teavm/classlib/java/io/TBufferedReader", new MethodSpec[] {
                 instanceDelegate("transferTo",
@@ -270,6 +308,16 @@ public final class TeaVMClasslibPatcher {
                         "org/teavm/classlib/java/util/stream/TPrimitiveStreamSupport",
                         "longStream")
         });
+        patches.put("org/teavm/classlib/java/util/zip/TInflater", new MethodSpec[] {
+                instanceDelegate("setInput", "(Ljava/nio/ByteBuffer;)V",
+                        "org/teavm/classlib/java/util/zip/TZipModernSupport",
+                        "setInput",
+                        "(Lorg/teavm/classlib/java/util/zip/TInflater;Ljava/nio/ByteBuffer;)V"),
+                instanceDelegate("inflate", "(Ljava/nio/ByteBuffer;)I",
+                        "org/teavm/classlib/java/util/zip/TZipModernSupport",
+                        "inflate",
+                        "(Lorg/teavm/classlib/java/util/zip/TInflater;Ljava/nio/ByteBuffer;)I")
+        });
 
         for (Map.Entry<String, MethodSpec[]> patch : patches.entrySet()) {
             patchClass(jar, root, patch.getKey(), patch.getValue());
@@ -289,7 +337,10 @@ public final class TeaVMClasslibPatcher {
         for (MethodSpec spec : methods) {
             boolean exists = node.methods.stream()
                     .anyMatch(method -> method.name.equals(spec.name) && method.desc.equals(spec.desc));
-            if (!exists) {
+            if (exists && spec.name.equals("desiredAssertionStatus") && spec.desc.equals("()Z")) {
+                node.methods.removeIf(method -> method.name.equals(spec.name) && method.desc.equals(spec.desc));
+                node.methods.add(spec.create());
+            } else if (!exists) {
                 node.methods.add(spec.create());
             }
         }

@@ -1,5 +1,7 @@
 package org.teavm.classlib.java.util;
 
+import java.util.SequencedSet;
+
 public final class TCollectionsModernSupport {
     private TCollectionsModernSupport() {
     }
@@ -14,5 +16,9 @@ public final class TCollectionsModernSupport {
 
     public static <E> TSpliterator<E> emptySpliterator() {
         return TSpliterators.spliterator(new Object[0], 0);
+    }
+
+    public static <E> SequencedSet<E> unmodifiableSequencedSet(SequencedSet<E> set) {
+        return set;
     }
 }

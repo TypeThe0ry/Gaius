@@ -25,9 +25,21 @@ while IFS= read -r source; do
   sources+=("$source")
 done < <(find "$source_root" -type f -name '*.java' -print | sort)
 for source in \
+  "$root/port/src/main/java/org/teavm/classlib/java/net/TAuthenticator.java" \
+  "$root/port/src/main/java/org/teavm/classlib/java/net/TIDN.java" \
+  "$root/port/src/main/java/org/teavm/classlib/java/net/TInet4Address.java" \
+  "$root/port/src/main/java/org/teavm/classlib/java/net/TInet6Address.java" \
+  "$root/port/src/main/java/org/teavm/classlib/java/net/TInetAddress.java" \
+  "$root/port/src/main/java/org/teavm/classlib/java/net/TInetSocketAddress.java" \
+  "$root/port/src/main/java/org/teavm/classlib/java/net/TNetworkInterface.java" \
+  "$root/port/src/main/java/org/teavm/classlib/java/net/TPasswordAuthentication.java" \
+  "$root/port/src/main/java/org/teavm/classlib/java/net/TProxy.java" \
+  "$root/port/src/main/java/org/teavm/classlib/java/net/TSocketAddress.java" \
+  "$root/port/src/main/java/org/teavm/classlib/java/net/TUnknownHostException.java" \
   "$root/port/src/main/java/org/teavm/classlib/java/nio/channels/TChannels.java" \
   "$root/port/src/main/java/org/teavm/classlib/java/nio/channels/TFileChannel.java" \
-  "$root/port/src/main/java/org/teavm/classlib/java/nio/channels/TFileLock.java"; do
+  "$root/port/src/main/java/org/teavm/classlib/java/nio/channels/TFileLock.java" \
+  "$root/port/src/main/java/org/teavm/classlib/java/util/concurrent/locks/TLockSupport.java"; do
   sources+=("$source")
 done
 if [[ "${#sources[@]}" -eq 0 ]]; then
@@ -111,6 +123,13 @@ build_library_overlay \
   "$root/port/overrides/libraries/joml/src/main/java" \
   "$overlay_work/libraries/$joml_path"
 
+jopt_simple_path="net/sf/jopt-simple/jopt-simple/5.0.4/jopt-simple-5.0.4.jar"
+build_library_overlay \
+  jopt-simple \
+  "$work/libraries/$jopt_simple_path" \
+  "$root/port/overrides/libraries/jopt-simple/src/main/java" \
+  "$overlay_work/libraries/$jopt_simple_path"
+
 lwjgl_path="org/lwjgl/lwjgl/3.3.3/lwjgl-3.3.3.jar"
 build_library_overlay \
   lwjgl \
@@ -131,6 +150,17 @@ javac --release 21 -proc:none \
   -classpath "$asm_jar:$asm_tree_jar" \
   -d "$tool_classes" \
   "$root/port/tools/src/main/java/dev/gaius/tools/"*.java
+teavm_core="$HOME/.m2/repository/org/teavm/teavm-core/$teavm_version/teavm-core-$teavm_version.jar"
+teavm_core_output="$overlay_work/teavm-core-$teavm_version-gaius.jar"
+teavm_core_patches="$overlay_work/teavm-core-patches"
+mkdir -p "$teavm_core_patches"
+find "$teavm_core_patches" -type f -delete
+cp "$teavm_core" "$teavm_core_output"
+java -classpath "$tool_classes:$asm_jar:$asm_tree_jar:$teavm_core" \
+  dev.gaius.tools.TeaVMCoreBrowserPatcher \
+  "$teavm_core_output" \
+  "$teavm_core_patches/org/teavm/backend/javascript/intrinsics/reflection/ClassInfoGenerator.class"
+jar --update --file "$teavm_core_output" -C "$teavm_core_patches" .
 text2speech_patch_classes="$overlay_work/library-patches/text2speech"
 mkdir -p "$(dirname "$text2speech_output")" "$text2speech_patch_classes"
 find "$text2speech_patch_classes" -type f -delete
@@ -166,15 +196,22 @@ guava_output="$overlay_work/libraries/$guava_path"
 guava_patch_classes="$overlay_work/library-patches/guava"
 mkdir -p "$(dirname "$guava_output")" "$guava_patch_classes"
 find "$guava_patch_classes" -type f -delete
-cp "$work/libraries/$guava_path" "$guava_output"
+build_library_overlay \
+  guava \
+  "$work/libraries/$guava_path" \
+  "$root/port/overrides/libraries/guava/src/main/java" \
+  "$guava_output"
 java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
   dev.gaius.tools.GuavaFutureStatePatcher \
   "$guava_output" \
   "$guava_patch_classes/com/google/common/util/concurrent/AbstractFutureState.class"
+java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
+  dev.gaius.tools.AbstractSpliteratorBrowserPatcher \
+  "$guava_output" \
+  "$guava_patch_classes"
 jar --update \
   --file "$guava_output" \
-  -C "$guava_patch_classes" \
-  com/google/common/util/concurrent/AbstractFutureState.class
+  -C "$guava_patch_classes" .
 
 netty_common_path="io/netty/netty-common/4.2.7.Final/netty-common-4.2.7.Final.jar"
 netty_common_output="$overlay_work/libraries/$netty_common_path"
@@ -229,6 +266,29 @@ jar --update \
   --file "$netty_transport_output" \
   -C "$netty_transport_patch_classes" .
 
+commons_io_path="commons-io/commons-io/2.20.0/commons-io-2.20.0.jar"
+commons_compress_path="org/apache/commons/commons-compress/1.28.0/commons-compress-1.28.0.jar"
+commons_io_output="$overlay_work/libraries/$commons_io_path"
+commons_compress_output="$overlay_work/libraries/$commons_compress_path"
+commons_io_patches="$overlay_work/library-patches/commons-io"
+commons_compress_patches="$overlay_work/library-patches/commons-compress"
+mkdir -p \
+  "$(dirname "$commons_io_output")" \
+  "$(dirname "$commons_compress_output")" \
+  "$commons_io_patches" \
+  "$commons_compress_patches"
+find "$commons_io_patches" "$commons_compress_patches" -type f -delete
+cp "$work/libraries/$commons_io_path" "$commons_io_output"
+cp "$work/libraries/$commons_compress_path" "$commons_compress_output"
+java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
+  dev.gaius.tools.CommonsBrowserPatcher \
+  "$commons_io_output" \
+  "$commons_compress_output" \
+  "$commons_io_patches" \
+  "$commons_compress_patches"
+jar --update --file "$commons_io_output" -C "$commons_io_patches" .
+jar --update --file "$commons_compress_output" -C "$commons_compress_patches" .
+
 icu_path="com/ibm/icu/icu4j/77.1/icu4j-77.1.jar"
 icu_output="$overlay_work/libraries/$icu_path"
 icu_patch_classes="$overlay_work/library-patches/icu"
@@ -250,8 +310,20 @@ java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
   dev.gaius.tools.LwjglMemoryPatcher \
   "$overlay_work/libraries/$lwjgl_path" \
   "$lwjgl_patch_classes"
+jar --update \
+  --file "$overlay_work/libraries/$lwjgl_path" \
+  -C "$lwjgl_patch_classes" .
+find "$lwjgl_patch_classes" -type f -delete
 java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
   dev.gaius.tools.LwjglUnsafeAccessPatcher \
+  "$overlay_work/libraries/$lwjgl_path" \
+  "$lwjgl_patch_classes"
+jar --update \
+  --file "$overlay_work/libraries/$lwjgl_path" \
+  -C "$lwjgl_patch_classes" .
+find "$lwjgl_patch_classes" -type f -delete
+java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
+  dev.gaius.tools.NativeMethodFallbackPatcher \
   "$overlay_work/libraries/$lwjgl_path" \
   "$lwjgl_patch_classes"
 jar --update \
@@ -270,6 +342,10 @@ java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
   dev.gaius.tools.LwjglGlfwBrowserPatcher \
   "$overlay_work/libraries/$glfw_path" \
   "$glfw_patches"
+jar --update \
+  --file "$overlay_work/libraries/$glfw_path" \
+  -C "$glfw_patches" .
+find "$glfw_patches" -type f -delete
 java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
   dev.gaius.tools.LwjglUnsafeAccessPatcher \
   "$overlay_work/libraries/$glfw_path" \
@@ -290,6 +366,10 @@ java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
   dev.gaius.tools.LwjglOpenGLBrowserPatcher \
   "$overlay_work/libraries/$opengl_path" \
   "$opengl_patches"
+jar --update \
+  --file "$overlay_work/libraries/$opengl_path" \
+  -C "$opengl_patches" .
+find "$opengl_patches" -type f -delete
 java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
   dev.gaius.tools.LwjglUnsafeAccessPatcher \
   "$overlay_work/libraries/$opengl_path" \
@@ -297,8 +377,16 @@ java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
 jar --update \
   --file "$overlay_work/libraries/$opengl_path" \
   -C "$opengl_patches" .
+find "$opengl_patches" -type f -delete
+java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
+  dev.gaius.tools.NativeMethodFallbackPatcher \
+  "$overlay_work/libraries/$opengl_path" \
+  "$opengl_patches"
+jar --update \
+  --file "$overlay_work/libraries/$opengl_path" \
+  -C "$opengl_patches" .
 
-for lwjgl_module in lwjgl-freetype lwjgl-stb; do
+for lwjgl_module in lwjgl-freetype; do
   module_path="org/lwjgl/$lwjgl_module/3.3.3/$lwjgl_module-3.3.3.jar"
   module_output="$overlay_work/libraries/$module_path"
   module_patches="$overlay_work/library-patches/$lwjgl_module"
@@ -310,7 +398,58 @@ for lwjgl_module in lwjgl-freetype lwjgl-stb; do
     "$module_output" \
     "$module_patches"
   jar --update --file "$module_output" -C "$module_patches" .
+  find "$module_patches" -type f -delete
+  java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
+    dev.gaius.tools.NativeMethodFallbackPatcher \
+    "$module_output" \
+    "$module_patches"
+  jar --update --file "$module_output" -C "$module_patches" .
 done
+
+stb_path="org/lwjgl/lwjgl-stb/3.3.3/lwjgl-stb-3.3.3.jar"
+build_library_overlay \
+  lwjgl-stb \
+  "$work/libraries/$stb_path" \
+  "$root/port/overrides/libraries/lwjgl-stb/src/main/java" \
+  "$overlay_work/libraries/$stb_path"
+stb_patches="$overlay_work/library-patches/lwjgl-stb"
+find "$stb_patches" -type f -delete
+java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
+  dev.gaius.tools.LwjglUnsafeAccessPatcher \
+  "$overlay_work/libraries/$stb_path" \
+  "$stb_patches"
+jar --update --file "$overlay_work/libraries/$stb_path" -C "$stb_patches" .
+find "$stb_patches" -type f -delete
+java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
+  dev.gaius.tools.NativeMethodFallbackPatcher \
+  "$overlay_work/libraries/$stb_path" \
+  "$stb_patches"
+jar --update --file "$overlay_work/libraries/$stb_path" -C "$stb_patches" .
+
+for lwjgl_module in lwjgl-openal lwjgl-tinyfd; do
+  module_path="org/lwjgl/$lwjgl_module/3.3.3/$lwjgl_module-3.3.3.jar"
+  module_output="$overlay_work/libraries/$module_path"
+  module_patches="$overlay_work/library-patches/$lwjgl_module"
+  mkdir -p "$(dirname "$module_output")" "$module_patches"
+  find "$module_patches" -type f -delete
+  cp "$work/libraries/$module_path" "$module_output"
+  java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
+    dev.gaius.tools.NativeMethodFallbackPatcher \
+    "$module_output" \
+    "$module_patches"
+  jar --update --file "$module_output" -C "$module_patches" .
+done
+
+jtracy_native_patches="$overlay_work/library-patches/jtracy-native"
+mkdir -p "$jtracy_native_patches"
+find "$jtracy_native_patches" -type f -delete
+java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
+  dev.gaius.tools.NativeMethodFallbackPatcher \
+  "$overlay_work/libraries/$jtracy_path" \
+  "$jtracy_native_patches"
+jar --update \
+  --file "$overlay_work/libraries/$jtracy_path" \
+  -C "$jtracy_native_patches" .
 
 client_output="$overlay_work/client-named-$version-gaius.jar"
 client_patch_classes="$overlay_work/client-patches"
@@ -329,6 +468,10 @@ javac --release 21 -proc:none \
   -d "$client_override_classes" \
   "${client_override_sources[@]}"
 jar --update --file "$client_output" -C "$client_override_classes" .
+java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
+  dev.gaius.tools.AbstractSpliteratorBrowserPatcher \
+  "$client_output" \
+  "$client_patch_classes"
 java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
   dev.gaius.tools.MinecraftClientPatcher \
   "$client_output" \

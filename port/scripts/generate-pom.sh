@@ -142,6 +142,9 @@ EOF
       <resource>
         <directory>$root/port/src/main/resources</directory>
       </resource>
+      <resource>
+        <directory>$root/port/target/generated-resources</directory>
+      </resource>
     </resources>
     <directory>$root/port/target/maven</directory>
     <plugins>
@@ -158,6 +161,15 @@ EOF
         <groupId>org.teavm</groupId>
         <artifactId>teavm-maven-plugin</artifactId>
         <version>\${teavm.version}</version>
+        <dependencies>
+          <dependency>
+            <groupId>dev.gaius.teavm</groupId>
+            <artifactId>teavm-core-browser-patch</artifactId>
+            <version>0.1.0</version>
+            <scope>system</scope>
+            <systemPath>$root/port/work/overlays/teavm-core-$teavm_version-gaius.jar</systemPath>
+          </dependency>
+        </dependencies>
         <executions>
           <execution>
             <id>compile-minecraft-client</id>

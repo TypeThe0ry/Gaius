@@ -12,6 +12,7 @@ import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.IntInsnNode;
 import org.objectweb.asm.tree.FieldInsnNode;
+import org.objectweb.asm.tree.FieldNode;
 import org.objectweb.asm.tree.TypeInsnNode;
 import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.VarInsnNode;
@@ -54,6 +55,8 @@ public final class MinecraftClientPatcher {
         patchLanServerPinger(args[0], root.resolve(
                 "net/minecraft/client/server/LanServerPinger.class"));
         patchHttpUtil(args[0], root.resolve("net/minecraft/util/HttpUtil.class"));
+        patchUtilJarFileSystem(args[0], root.resolve("net/minecraft/util/Util.class"));
+        patchResourceKeyRegistryRoot(args[0], root.resolve("net/minecraft/resources/ResourceKey.class"));
         patchLanServerDetector(args[0], root.resolve(
                 "net/minecraft/client/server/LanServerDetection$LanServerDetector.class"));
         patchPackWatcher(args[0], root.resolve(
@@ -62,7 +65,825 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/server/chase/ChaseServer.class"));
         patchOpenUri(args[0], root.resolve("net/minecraft/util/Util$OS.class"));
         patchRealmsNetwork(args[0], root);
+        patchReflectivePatternArray(args[0], root.resolve(
+                "net/minecraft/world/level/block/state/pattern/BlockPatternBuilder.class"));
+        patchChunkPosSpliterator(args[0], root.resolve(
+                "net/minecraft/world/level/ChunkPos$2.class"));
+        patchDetectedVersion(args[0], root.resolve("net/minecraft/DetectedVersion.class"));
+        patchSingleplayerCrypto(args[0], root);
+        patchSingleplayerLogin(args[0], root.resolve(
+                "net/minecraft/server/network/ServerLoginPacketListenerImpl.class"));
+        patchChatSigning(args[0], root);
+        patchMultiplayerExecutor(args[0], root.resolve(
+                "net/minecraft/client/gui/screens/multiplayer/"
+                        + "ServerSelectionList$OnlineServerEntry.class"));
+        patchClientShutdownWatchdog(args[0], root.resolve(
+                "com/mojang/blaze3d/platform/ClientShutdownWatchdog.class"));
+        patchAccountProfileKeys(args[0], root.resolve(
+                "net/minecraft/client/multiplayer/AccountProfileKeyPairManager.class"));
+        patchCreateWorldScreenBrowserDefaults(args[0], root.resolve(
+                "net/minecraft/client/gui/screens/worldselection/CreateWorldScreen.class"));
+        patchBrowserAudio(args[0], root.resolve(
+                "com/mojang/blaze3d/audio/Library.class"));
+        patchGlslPreprocessor(args[0], root.resolve(
+                "com/mojang/blaze3d/preprocessor/GlslPreprocessor.class"));
+        patchGlDevice(args[0], root.resolve(
+                "com/mojang/blaze3d/opengl/GlDevice.class"));
+        patchGlStateManagerTextureBinding(args[0], root.resolve(
+                "com/mojang/blaze3d/opengl/GlStateManager.class"));
+        patchGlCommandEncoder(args[0], root.resolve(
+                "com/mojang/blaze3d/opengl/GlCommandEncoder.class"));
+        patchWorldUnloadTelemetry(args[0], root.resolve(
+                "net/minecraft/client/telemetry/events/WorldUnloadEvent.class"));
         generateSoundApiStubs(root);
+        generateCryptoApiStubs(root);
+        generateUnsafeStub(root);
+    }
+
+    private static void patchCreateWorldScreenBrowserDefaults(String jar, Path output)
+            throws IOException {
+        ClassNode node = read(jar,
+                "net/minecraft/client/gui/screens/worldselection/CreateWorldScreen.class");
+        boolean patchedPreset = false;
+        boolean patchedOptions = false;
+        boolean patchedDimensions = false;
+        for (MethodNode method : node.methods) {
+            if (method.name.equals("openFresh")
+                    && method.desc.equals("(Lnet/minecraft/client/Minecraft;Ljava/lang/Runnable;"
+                            + "Lnet/minecraft/client/gui/screens/worldselection/CreateWorldCallback;)V")) {
+                for (var instruction = method.instructions.getFirst();
+                        instruction != null;
+                        instruction = instruction.getNext()) {
+                    if (instruction instanceof FieldInsnNode field
+                            && field.owner.equals("net/minecraft/world/level/levelgen/presets/WorldPresets")
+                            && field.name.equals("NORMAL")
+                            && field.desc.equals("Lnet/minecraft/resources/ResourceKey;")) {
+                        field.name = "FLAT";
+                        patchedPreset = true;
+                    }
+                }
+            } else if (method.name.equals("lambda$openFresh$4")
+                    && method.desc.equals("(Lnet/minecraft/server/WorldLoader$DataLoadContext;)"
+                            + "Lnet/minecraft/world/level/levelgen/WorldGenSettings;")) {
+                for (var instruction = method.instructions.getFirst();
+                        instruction != null;
+                        instruction = instruction.getNext()) {
+                    if (instruction instanceof MethodInsnNode call
+                            && call.owner.equals("net/minecraft/world/level/levelgen/WorldOptions")
+                            && call.name.equals("defaultWithRandomSeed")
+                            && call.desc.equals("()Lnet/minecraft/world/level/levelgen/WorldOptions;")) {
+                        call.name = "testWorldWithRandomSeed";
+                        patchedOptions = true;
+                    } else if (instruction instanceof MethodInsnNode call
+                            && call.owner.equals("net/minecraft/world/level/levelgen/presets/WorldPresets")
+                            && call.name.equals("createNormalWorldDimensions")
+                            && call.desc.equals("(Lnet/minecraft/core/HolderLookup$Provider;)"
+                                    + "Lnet/minecraft/world/level/levelgen/WorldDimensions;")) {
+                        call.name = "createFlatWorldDimensions";
+                        patchedDimensions = true;
+                    }
+                }
+            }
+        }
+        if (!patchedPreset || !patchedOptions || !patchedDimensions) {
+            throw new IllegalStateException("CreateWorldScreen browser default world patch points were not found");
+        }
+        write(node, output);
+    }
+
+    private static void patchGlDevice(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "com/mojang/blaze3d/opengl/GlDevice.class");
+        String owner = "com/mojang/blaze3d/opengl/GlDevice";
+        boolean found = false;
+        for (MethodNode method : node.methods) {
+            if (method.name.equals("<clinit>") && method.desc.equals("()V")) {
+                InsnList code = new InsnList();
+                code.add(new InsnNode(Opcodes.ICONST_0));
+                code.add(new FieldInsnNode(
+                        Opcodes.PUTSTATIC,
+                        owner,
+                        "USE_GL_ARB_vertex_attrib_binding",
+                        "Z"));
+                for (var instruction = method.instructions.getFirst();
+                        instruction != null;
+                        instruction = instruction.getNext()) {
+                    if (instruction.getOpcode() == Opcodes.RETURN) {
+                        method.instructions.insertBefore(instruction, code);
+                        method.maxStack = Math.max(method.maxStack, 1);
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!found) {
+            throw new IllegalStateException("GlDevice capability patch point was not found");
+        }
+        write(node, output);
+    }
+
+    private static void patchGlStateManagerTextureBinding(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "com/mojang/blaze3d/opengl/GlStateManager.class");
+        String owner = "com/mojang/blaze3d/opengl/GlStateManager";
+        boolean patchedBindTexture = false;
+        boolean patchedActiveTexture = false;
+        for (MethodNode method : node.methods) {
+            if (method.name.equals("_bindTexture") && method.desc.equals("(I)V")) {
+                InsnList code = new InsnList();
+                code.add(new LdcInsnNode(33984));
+                code.add(new FieldInsnNode(
+                        Opcodes.GETSTATIC,
+                        owner,
+                        "activeTexture",
+                        "I"));
+                code.add(new InsnNode(Opcodes.IADD));
+                code.add(new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "org/lwjgl/opengl/GL13",
+                        "glActiveTexture",
+                        "(I)V",
+                        false));
+                code.add(new IntInsnNode(Opcodes.SIPUSH, 3553));
+                code.add(new VarInsnNode(Opcodes.ILOAD, 0));
+                code.add(new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "org/lwjgl/opengl/GL11",
+                        "glBindTexture",
+                        "(II)V",
+                        false));
+                insertAfterFirstRenderThreadAssert(method, code);
+                method.maxStack = Math.max(method.maxStack, 2);
+                patchedBindTexture = true;
+            } else if (method.name.equals("_activeTexture") && method.desc.equals("(I)V")) {
+                InsnList code = new InsnList();
+                code.add(new VarInsnNode(Opcodes.ILOAD, 0));
+                code.add(new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "org/lwjgl/opengl/GL13",
+                        "glActiveTexture",
+                        "(I)V",
+                        false));
+                insertAfterFirstRenderThreadAssert(method, code);
+                method.maxStack = Math.max(method.maxStack, 1);
+                patchedActiveTexture = true;
+            }
+        }
+        if (!patchedBindTexture || !patchedActiveTexture) {
+            throw new IllegalStateException("GlStateManager texture binding patch points were not found");
+        }
+        writeComputeFrames(node, output);
+    }
+
+    private static void insertAfterFirstRenderThreadAssert(MethodNode method, InsnList code) {
+        for (var instruction = method.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction.getOpcode() == Opcodes.INVOKESTATIC
+                    && instruction instanceof MethodInsnNode call
+                    && call.owner.equals("com/mojang/blaze3d/systems/RenderSystem")
+                    && call.name.equals("assertOnRenderThread")
+                    && call.desc.equals("()V")) {
+                method.instructions.insert(instruction, code);
+                return;
+            }
+        }
+        throw new IllegalStateException("RenderSystem.assertOnRenderThread patch point was not found in "
+                + method.name + method.desc);
+    }
+
+    private static void patchGlCommandEncoder(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "com/mojang/blaze3d/opengl/GlCommandEncoder.class");
+        String owner = "com/mojang/blaze3d/opengl/GlCommandEncoder";
+        String pass = "com/mojang/blaze3d/opengl/GlRenderPass";
+        String renderSystem = "com/mojang/blaze3d/systems/RenderSystem";
+        String slice = "Lcom/mojang/blaze3d/buffers/GpuBufferSlice;";
+        String buffer = "Lcom/mojang/blaze3d/buffers/GpuBuffer;";
+
+        MethodNode helper = new MethodNode(
+                Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_SYNTHETIC,
+                "gaius$bindDefaultUniforms",
+                "(L" + pass + ";)V",
+                null,
+                null);
+        bindDefaultSlice(helper, renderSystem, pass, "getProjectionMatrixBuffer", "Projection", slice);
+        bindDefaultSlice(helper, renderSystem, pass, "getShaderFog", "Fog", slice);
+        helper.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                renderSystem,
+                "getGlobalSettingsUniform",
+                "()" + buffer,
+                false));
+        helper.instructions.add(new VarInsnNode(Opcodes.ASTORE, 1));
+        org.objectweb.asm.tree.LabelNode noGlobals = new org.objectweb.asm.tree.LabelNode();
+        helper.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        helper.instructions.add(new org.objectweb.asm.tree.JumpInsnNode(Opcodes.IFNULL, noGlobals));
+        helper.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        helper.instructions.add(new LdcInsnNode("Globals"));
+        helper.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        helper.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                pass,
+                "setUniform",
+                "(Ljava/lang/String;" + buffer + ")V",
+                false));
+        helper.instructions.add(noGlobals);
+        bindDefaultSlice(helper, renderSystem, pass, "getShaderLights", "Lighting", slice);
+        helper.instructions.add(new InsnNode(Opcodes.RETURN));
+        helper.maxStack = 3;
+        helper.maxLocals = 2;
+        node.methods.add(helper);
+
+        MethodNode trySetup = find(
+                node,
+                "trySetup",
+                "(Lcom/mojang/blaze3d/opengl/GlRenderPass;Ljava/util/Collection;)Z");
+        InsnList call = new InsnList();
+        call.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        call.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                owner,
+                "gaius$bindDefaultUniforms",
+                "(L" + pass + ";)V",
+                false));
+        trySetup.instructions.insert(call);
+        trySetup.maxStack = Math.max(trySetup.maxStack, 3);
+        writeComputeFrames(node, output);
+    }
+
+    private static void bindDefaultSlice(
+            MethodNode method, String renderSystem, String pass,
+            String getter, String uniformName, String sliceDescriptor) {
+        method.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                renderSystem,
+                getter,
+                "()" + sliceDescriptor,
+                false));
+        method.instructions.add(new VarInsnNode(Opcodes.ASTORE, 1));
+        org.objectweb.asm.tree.LabelNode missing = new org.objectweb.asm.tree.LabelNode();
+        method.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        method.instructions.add(new org.objectweb.asm.tree.JumpInsnNode(Opcodes.IFNULL, missing));
+        method.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        method.instructions.add(new LdcInsnNode(uniformName));
+        method.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        method.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                pass,
+                "setUniform",
+                "(Ljava/lang/String;" + sliceDescriptor + ")V",
+                false));
+        method.instructions.add(missing);
+    }
+
+    private static void patchGlslPreprocessor(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "com/mojang/blaze3d/preprocessor/GlslPreprocessor.class");
+        MethodNode clinit = find(node, "<clinit>", "()V");
+        boolean changed = false;
+        for (var instruction = clinit.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (!(instruction instanceof LdcInsnNode ldc) || !(ldc.cst instanceof String text)) {
+                continue;
+            }
+            String replacement = switch (text) {
+                case "(#(?:/\\*(?:[^*]|\\*+[^*/])*\\*+/|\\h)*moj_import(?:/\\*(?:[^*]|\\*+[^*/])*\\*+/|\\h)*(?:\"(.*)\"|<(.*)>))" ->
+                        "(#(?:/\\*(?:[^*]|\\*+[^*/])*\\*+/|[ \\t\\f])*moj_import(?:/\\*(?:[^*]|\\*+[^*/])*\\*+/|[ \\t\\f])*(?:\"(.*)\"|<(.*)>))";
+                case "(#(?:/\\*(?:[^*]|\\*+[^*/])*\\*+/|\\h)*version(?:/\\*(?:[^*]|\\*+[^*/])*\\*+/|\\h)*(\\d+))\\b" ->
+                        "(#(?:/\\*(?:[^*]|\\*+[^*/])*\\*+/|[ \\t\\f])*version(?:/\\*(?:[^*]|\\*+[^*/])*\\*+/|[ \\t\\f])*(\\d+))\\b";
+                case "(?:^|\\v)(?:\\s|/\\*(?:[^*]|\\*+[^*/])*\\*+/(//[^\\v]*))*\\z" ->
+                        null;
+                case "(?:^|\\v)(?:\\s|/\\*(?:[^*]|\\*+[^*/])*\\*+/|(//[^\\v]*))*\\z" ->
+                        "(?:^|\\n)(?:\\s|/\\*(?:[^*]|\\*+[^*/])*\\*+/|(//[^\\n]*))*$";
+                default -> null;
+            };
+            if (replacement != null) {
+                ldc.cst = replacement;
+                changed = true;
+            }
+        }
+        if (!changed) {
+            throw new IllegalStateException("GlslPreprocessor regex constants were not found");
+        }
+        write(node, output);
+    }
+
+    private static void patchBrowserAudio(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "com/mojang/blaze3d/audio/Library.class");
+        String owner = "com/mojang/blaze3d/audio/Library";
+        String poolDescriptor = "Lcom/mojang/blaze3d/audio/Library$ChannelPool;";
+
+        MethodNode init = find(node, "init", "(Ljava/lang/String;Z)V");
+        InsnList initCode = new InsnList();
+        initCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        initCode.add(new FieldInsnNode(
+                Opcodes.GETSTATIC, owner, "EMPTY", poolDescriptor));
+        initCode.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, "staticChannels", poolDescriptor));
+        initCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        initCode.add(new FieldInsnNode(
+                Opcodes.GETSTATIC, owner, "EMPTY", poolDescriptor));
+        initCode.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, "streamingChannels", poolDescriptor));
+        initCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        initCode.add(new InsnNode(Opcodes.LCONST_0));
+        initCode.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, "currentDevice", "J"));
+        initCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        initCode.add(new InsnNode(Opcodes.LCONST_0));
+        initCode.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, "context", "J"));
+        initCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        initCode.add(new InsnNode(Opcodes.ICONST_0));
+        initCode.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, "supportsDisconnections", "Z"));
+        initCode.add(new InsnNode(Opcodes.RETURN));
+        replace(init, initCode, 3, 3);
+
+        MethodNode getDefaultDeviceName = find(
+                node, "getDefaultDeviceName", "()Ljava/lang/String;");
+        InsnList nullString = new InsnList();
+        nullString.add(new InsnNode(Opcodes.ACONST_NULL));
+        nullString.add(new InsnNode(Opcodes.ARETURN));
+        replace(getDefaultDeviceName, nullString, 1, 0);
+
+        MethodNode getCurrentDeviceName = find(
+                node, "getCurrentDeviceName", "()Ljava/lang/String;");
+        InsnList currentName = new InsnList();
+        currentName.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        currentName.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "defaultDeviceName", "Ljava/lang/String;"));
+        currentName.add(new InsnNode(Opcodes.ARETURN));
+        replace(getCurrentDeviceName, currentName, 1, 1);
+
+        MethodNode hasDefaultDeviceChanged = find(
+                node, "hasDefaultDeviceChanged", "()Z");
+        InsnList falseResult = new InsnList();
+        falseResult.add(new InsnNode(Opcodes.ICONST_0));
+        falseResult.add(new InsnNode(Opcodes.IRETURN));
+        replace(hasDefaultDeviceChanged, falseResult, 1, 1);
+
+        MethodNode getAvailableSoundDevices = find(
+                node, "getAvailableSoundDevices", "()Ljava/util/List;");
+        InsnList emptyList = new InsnList();
+        emptyList.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "java/util/Collections",
+                "emptyList",
+                "()Ljava/util/List;",
+                false));
+        emptyList.add(new InsnNode(Opcodes.ARETURN));
+        replace(getAvailableSoundDevices, emptyList, 1, 1);
+
+        MethodNode isCurrentDeviceDisconnected = find(
+                node, "isCurrentDeviceDisconnected", "()Z");
+        InsnList connected = new InsnList();
+        connected.add(new InsnNode(Opcodes.ICONST_0));
+        connected.add(new InsnNode(Opcodes.IRETURN));
+        replace(isCurrentDeviceDisconnected, connected, 1, 1);
+
+        MethodNode cleanup = find(node, "cleanup", "()V");
+        InsnList cleanupCode = new InsnList();
+        cleanupCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        cleanupCode.add(new FieldInsnNode(
+                Opcodes.GETSTATIC, owner, "EMPTY", poolDescriptor));
+        cleanupCode.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, "staticChannels", poolDescriptor));
+        cleanupCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        cleanupCode.add(new FieldInsnNode(
+                Opcodes.GETSTATIC, owner, "EMPTY", poolDescriptor));
+        cleanupCode.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, "streamingChannels", poolDescriptor));
+        cleanupCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        cleanupCode.add(new InsnNode(Opcodes.LCONST_0));
+        cleanupCode.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, "currentDevice", "J"));
+        cleanupCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        cleanupCode.add(new InsnNode(Opcodes.LCONST_0));
+        cleanupCode.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, "context", "J"));
+        cleanupCode.add(new InsnNode(Opcodes.RETURN));
+        replace(cleanup, cleanupCode, 3, 1);
+
+        write(node, output);
+    }
+
+    private static void patchClientShutdownWatchdog(String jar, Path output) throws IOException {
+        ClassNode node = read(
+                jar, "com/mojang/blaze3d/platform/ClientShutdownWatchdog.class");
+        MethodNode start = find(
+                node, "startShutdownWatchdog", "(Ljava/io/File;J)V");
+        InsnList code = new InsnList();
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(start, code, 0, 3);
+        write(node, output);
+    }
+
+    private static void patchAccountProfileKeys(String jar, Path output) throws IOException {
+        ClassNode node = read(
+                jar, "net/minecraft/client/multiplayer/AccountProfileKeyPairManager.class");
+        MethodNode prepare = find(
+                node, "prepareKeyPair", "()Ljava/util/concurrent/CompletableFuture;");
+        InsnList code = new InsnList();
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "java/util/Optional",
+                "empty",
+                "()Ljava/util/Optional;",
+                false));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "java/util/concurrent/CompletableFuture",
+                "completedFuture",
+                "(Ljava/lang/Object;)Ljava/util/concurrent/CompletableFuture;",
+                false));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(prepare, code, 1, 1);
+        write(node, output);
+    }
+
+    private static void patchResourceKeyRegistryRoot(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/resources/ResourceKey.class");
+        MethodNode createRegistryKey = find(
+                node,
+                "createRegistryKey",
+                "(Lnet/minecraft/resources/Identifier;)Lnet/minecraft/resources/ResourceKey;");
+        InsnList code = new InsnList();
+        code.add(new LdcInsnNode("root"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "net/minecraft/resources/Identifier",
+                "withDefaultNamespace",
+                "(Ljava/lang/String;)Lnet/minecraft/resources/Identifier;",
+                false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "net/minecraft/resources/ResourceKey",
+                "create",
+                "(Lnet/minecraft/resources/Identifier;Lnet/minecraft/resources/Identifier;)"
+                        + "Lnet/minecraft/resources/ResourceKey;",
+                false));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(createRegistryKey, code, 2, 1);
+
+        MethodNode clinit = find(node, "<clinit>", "()V");
+        InsnList init = new InsnList();
+        init.add(new TypeInsnNode(Opcodes.NEW, "java/util/concurrent/ConcurrentHashMap"));
+        init.add(new InsnNode(Opcodes.DUP));
+        init.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                "java/util/concurrent/ConcurrentHashMap",
+                "<init>",
+                "()V",
+                false));
+        init.add(new FieldInsnNode(
+                Opcodes.PUTSTATIC,
+                "net/minecraft/resources/ResourceKey",
+                "VALUES",
+                "Ljava/util/concurrent/ConcurrentMap;"));
+        init.add(new InsnNode(Opcodes.RETURN));
+        replace(clinit, init, 2, 0);
+        write(node, output);
+    }
+
+    private static void patchSingleplayerCrypto(String jar, Path root) throws IOException {
+        ClassNode crypt = read(jar, "net/minecraft/util/Crypt.class");
+        MethodNode generate = find(crypt, "generateKeyPair", "()Ljava/security/KeyPair;");
+        InsnList unavailable = new InsnList();
+        unavailable.add(new InsnNode(Opcodes.ACONST_NULL));
+        unavailable.add(new InsnNode(Opcodes.ARETURN));
+        replace(generate, unavailable, 1, 0);
+        replaceNull(crypt, "generateSecretKey", "()Ljavax/crypto/SecretKey;");
+        replaceEmptyBytes(crypt, "digestData",
+                "(Ljava/lang/String;Ljava/security/PublicKey;Ljavax/crypto/SecretKey;)[B");
+        replaceNull(crypt, "decryptByteToSecretKey",
+                "(Ljava/security/PrivateKey;[B)Ljavax/crypto/SecretKey;");
+        replaceSecondByteArray(crypt, "encryptUsingKey", "(Ljava/security/Key;[B)[B");
+        replaceSecondByteArray(crypt, "decryptUsingKey", "(Ljava/security/Key;[B)[B");
+        replaceNull(crypt, "getCipher", "(ILjava/security/Key;)Ljavax/crypto/Cipher;");
+        for (String methodName : new String[] {"byteToPrivateKey", "byteToPublicKey"}) {
+            MethodNode parser = crypt.methods.stream()
+                    .filter(method -> method.name.equals(methodName)
+                            && method.desc.startsWith("([B)Ljava/security/"))
+                    .findFirst()
+                    .orElseThrow();
+            InsnList noKey = new InsnList();
+            noKey.add(new InsnNode(Opcodes.ACONST_NULL));
+            noKey.add(new InsnNode(Opcodes.ARETURN));
+            replace(parser, noKey, 1, 1);
+        }
+        write(crypt, root.resolve("net/minecraft/util/Crypt.class"));
+
+        ClassNode data = read(
+                jar, "net/minecraft/world/entity/player/ProfilePublicKey$Data.class");
+        MethodNode equals = find(data, "equals", "(Ljava/lang/Object;)Z");
+        InsnList identity = new InsnList();
+        identity.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        identity.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        org.objectweb.asm.tree.LabelNode different = new org.objectweb.asm.tree.LabelNode();
+        identity.add(new org.objectweb.asm.tree.JumpInsnNode(Opcodes.IF_ACMPNE, different));
+        identity.add(new InsnNode(Opcodes.ICONST_1));
+        identity.add(new InsnNode(Opcodes.IRETURN));
+        identity.add(different);
+        identity.add(new InsnNode(Opcodes.ICONST_0));
+        identity.add(new InsnNode(Opcodes.IRETURN));
+        replace(equals, identity, 2, 2);
+        write(data, root.resolve(
+                "net/minecraft/world/entity/player/ProfilePublicKey$Data.class"));
+    }
+
+    private static void patchSingleplayerLogin(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/server/network/ServerLoginPacketListenerImpl.class");
+        MethodNode hello = find(node, "handleHello",
+                "(Lnet/minecraft/network/protocol/login/ServerboundHelloPacket;)V");
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/network/protocol/login/ServerboundHelloPacket",
+                "name",
+                "()Ljava/lang/String;",
+                false));
+        code.add(new FieldInsnNode(
+                Opcodes.PUTFIELD,
+                "net/minecraft/server/network/ServerLoginPacketListenerImpl",
+                "requestedUsername",
+                "Ljava/lang/String;"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/server/network/ServerLoginPacketListenerImpl",
+                "requestedUsername",
+                "Ljava/lang/String;"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "net/minecraft/core/UUIDUtil",
+                "createOfflineProfile",
+                "(Ljava/lang/String;)Lcom/mojang/authlib/GameProfile;",
+                false));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/server/network/ServerLoginPacketListenerImpl",
+                "startClientVerification",
+                "(Lcom/mojang/authlib/GameProfile;)V",
+                false));
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(hello, code, 3, 2);
+        write(node, output);
+    }
+
+    private static void patchChatSigning(String jar, Path root) throws IOException {
+        ClassNode validator = read(jar, "net/minecraft/util/SignatureValidator.class");
+        replaceStaticFieldReturn(
+                validator,
+                "from",
+                "(Ljava/security/PublicKey;Ljava/lang/String;)Lnet/minecraft/util/SignatureValidator;",
+                "net/minecraft/util/SignatureValidator",
+                "NO_VALIDATION",
+                "Lnet/minecraft/util/SignatureValidator;");
+        replaceStaticFieldReturn(
+                validator,
+                "from",
+                "(Lcom/mojang/authlib/yggdrasil/ServicesKeySet;"
+                        + "Lcom/mojang/authlib/yggdrasil/ServicesKeyType;)"
+                        + "Lnet/minecraft/util/SignatureValidator;",
+                "net/minecraft/util/SignatureValidator",
+                "NO_VALIDATION",
+                "Lnet/minecraft/util/SignatureValidator;");
+        write(validator, root.resolve("net/minecraft/util/SignatureValidator.class"));
+
+        ClassNode signer = read(jar, "net/minecraft/util/Signer.class");
+        replaceNull(signer, "from",
+                "(Ljava/security/PrivateKey;Ljava/lang/String;)Lnet/minecraft/util/Signer;");
+        write(signer, root.resolve("net/minecraft/util/Signer.class"));
+
+        ClassNode chain = read(jar, "net/minecraft/network/chat/SignedMessageChain.class");
+        replaceStaticFieldReturn(
+                chain,
+                "encoder",
+                "(Lnet/minecraft/util/Signer;)Lnet/minecraft/network/chat/SignedMessageChain$Encoder;",
+                "net/minecraft/network/chat/SignedMessageChain$Encoder",
+                "UNSIGNED",
+                "Lnet/minecraft/network/chat/SignedMessageChain$Encoder;");
+        write(chain, root.resolve("net/minecraft/network/chat/SignedMessageChain.class"));
+    }
+
+    private static void patchWorldUnloadTelemetry(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/client/telemetry/events/WorldUnloadEvent.class");
+        MethodNode method = find(node, "getTimeInSecondsSinceLoad", "(Ljava/time/Instant;)I");
+        InsnList code = new InsnList();
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new InsnNode(Opcodes.IRETURN));
+        replace(method, code, 1, 2);
+        write(node, output);
+    }
+
+    private static void patchMultiplayerExecutor(String jar, Path output) throws IOException {
+        ClassNode node = read(jar,
+                "net/minecraft/client/gui/screens/multiplayer/"
+                        + "ServerSelectionList$OnlineServerEntry.class");
+        MethodNode render = node.methods.stream()
+                .filter(method -> method.name.equals("renderContent"))
+                .findFirst()
+                .orElseThrow();
+        boolean fieldRemoved = false;
+        boolean submitReplaced = false;
+        for (var instruction = render.instructions.getFirst();
+                instruction != null;) {
+            var next = instruction.getNext();
+            if (instruction instanceof FieldInsnNode field
+                    && field.getOpcode() == Opcodes.GETSTATIC
+                    && field.owner.equals(
+                            "net/minecraft/client/gui/screens/multiplayer/ServerSelectionList")
+                    && field.name.equals("THREAD_POOL")) {
+                render.instructions.remove(field);
+                fieldRemoved = true;
+            } else if (instruction instanceof MethodInsnNode call
+                    && call.owner.equals("java/util/concurrent/ThreadPoolExecutor")
+                    && call.name.equals("submit")
+                    && call.desc.equals(
+                            "(Ljava/lang/Runnable;)Ljava/util/concurrent/Future;")) {
+                MethodInsnNode run = new MethodInsnNode(
+                        Opcodes.INVOKEINTERFACE,
+                        "java/lang/Runnable",
+                        "run",
+                        "()V",
+                        true);
+                render.instructions.set(call, run);
+                if (run.getNext() instanceof InsnNode pop
+                        && pop.getOpcode() == Opcodes.POP) {
+                    render.instructions.remove(pop);
+                }
+                submitReplaced = true;
+            }
+            instruction = next;
+        }
+        if (!fieldRemoved || !submitReplaced) {
+            throw new IllegalStateException("Multiplayer executor call was not found");
+        }
+        write(node, output);
+    }
+
+    private static void patchReflectivePatternArray(String jar, Path output) throws IOException {
+        ClassNode node = read(jar,
+                "net/minecraft/world/level/block/state/pattern/BlockPatternBuilder.class");
+        boolean found = false;
+        for (MethodNode method : node.methods) {
+            for (var instruction = method.instructions.getFirst();
+                    instruction != null;
+                    instruction = instruction.getNext()) {
+                if (instruction instanceof MethodInsnNode call
+                        && call.owner.equals("java/lang/reflect/Array")
+                        && call.name.equals("newInstance")
+                        && call.desc.equals("(Ljava/lang/Class;[I)Ljava/lang/Object;")) {
+                    call.owner = "dev/gaius/browser/BrowserArrays";
+                    found = true;
+                }
+            }
+        }
+        if (!found) {
+            throw new IllegalStateException("BlockPatternBuilder reflective array call not found");
+        }
+        write(node, output);
+    }
+
+    private static void patchChunkPosSpliterator(String jar, Path output) throws IOException {
+        String owner = "net/minecraft/world/level/ChunkPos$2";
+        ClassNode node = read(jar, owner + ".class");
+        node.superName = "java/lang/Object";
+        if (!node.interfaces.contains("java/util/Spliterator")) {
+            node.interfaces.add("java/util/Spliterator");
+        }
+        node.fields.add(new FieldNode(
+                Opcodes.ACC_PRIVATE, "browserRemaining", "J", null, null));
+        node.fields.add(new FieldNode(
+                Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL,
+                "browserCharacteristics", "I", null, null));
+
+        MethodNode constructor = find(node, "<init>",
+                "(JILnet/minecraft/world/level/ChunkPos;"
+                        + "Lnet/minecraft/world/level/ChunkPos;II)V");
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false));
+        putField(code, owner, "val$from", "Lnet/minecraft/world/level/ChunkPos;",
+                Opcodes.ALOAD, 4);
+        putField(code, owner, "val$to", "Lnet/minecraft/world/level/ChunkPos;",
+                Opcodes.ALOAD, 5);
+        putField(code, owner, "val$zDiff", "I", Opcodes.ILOAD, 6);
+        putField(code, owner, "val$xDiff", "I", Opcodes.ILOAD, 7);
+        putField(code, owner, "browserRemaining", "J", Opcodes.LLOAD, 1);
+        putField(code, owner, "browserCharacteristics", "I", Opcodes.ILOAD, 3);
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(constructor, code, 3, 8);
+
+        MethodNode split = new MethodNode(
+                Opcodes.ACC_PUBLIC,
+                "trySplit",
+                "()Ljava/util/Spliterator;",
+                null,
+                null);
+        split.instructions.add(new InsnNode(Opcodes.ACONST_NULL));
+        split.instructions.add(new InsnNode(Opcodes.ARETURN));
+        split.maxStack = 1;
+        split.maxLocals = 1;
+        node.methods.add(split);
+
+        MethodNode size = new MethodNode(
+                Opcodes.ACC_PUBLIC, "estimateSize", "()J", null, null);
+        size.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        size.instructions.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "browserRemaining", "J"));
+        size.instructions.add(new InsnNode(Opcodes.LRETURN));
+        size.maxStack = 2;
+        size.maxLocals = 1;
+        node.methods.add(size);
+
+        MethodNode characteristics = new MethodNode(
+                Opcodes.ACC_PUBLIC, "characteristics", "()I", null, null);
+        characteristics.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        characteristics.instructions.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "browserCharacteristics", "I"));
+        characteristics.instructions.add(new InsnNode(Opcodes.IRETURN));
+        characteristics.maxStack = 1;
+        characteristics.maxLocals = 1;
+        node.methods.add(characteristics);
+        write(node, output);
+    }
+
+    private static void patchDetectedVersion(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/DetectedVersion.class");
+        MethodNode detect = find(
+                node, "tryDetectVersion", "()Lnet/minecraft/WorldVersion;");
+        InsnList code = new InsnList();
+        code.add(new LdcInsnNode("1.21.11"));
+        code.add(new LdcInsnNode("1.21.11"));
+        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "net/minecraft/DetectedVersion",
+                "createBuiltIn",
+                "(Ljava/lang/String;Ljava/lang/String;Z)Lnet/minecraft/WorldVersion;",
+                false));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(detect, code, 3, 0);
+        write(node, output);
+    }
+
+    private static void patchUtilJarFileSystem(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/util/Util.class");
+        MethodNode clinit = find(node, "<clinit>", "()V");
+        var start = clinit.instructions.getFirst();
+        while (start != null) {
+            if (start instanceof MethodInsnNode call
+                    && call.owner.equals("java/nio/file/spi/FileSystemProvider")
+                    && call.name.equals("installedProviders")
+                    && call.desc.equals("()Ljava/util/List;")) {
+                break;
+            }
+            start = start.getNext();
+        }
+        if (start == null) {
+            throw new IllegalStateException("Util jar provider lookup was not found");
+        }
+
+        var end = start;
+        while (end != null) {
+            if (end instanceof FieldInsnNode field
+                    && field.getOpcode() == Opcodes.PUTSTATIC
+                    && field.owner.equals("net/minecraft/util/Util")
+                    && field.name.equals("ZIP_FILE_SYSTEM_PROVIDER")) {
+                break;
+            }
+            end = end.getNext();
+        }
+        if (end == null) {
+            throw new IllegalStateException("Util ZIP_FILE_SYSTEM_PROVIDER write was not found");
+        }
+
+        InsnList code = new InsnList();
+        code.add(new InsnNode(Opcodes.ACONST_NULL));
+        code.add(new FieldInsnNode(
+                Opcodes.PUTSTATIC,
+                "net/minecraft/util/Util",
+                "ZIP_FILE_SYSTEM_PROVIDER",
+                "Ljava/nio/file/spi/FileSystemProvider;"));
+        clinit.instructions.insertBefore(start, code);
+
+        var current = start;
+        while (current != null) {
+            var next = current.getNext();
+            clinit.instructions.remove(current);
+            if (current == end) {
+                break;
+            }
+            current = next;
+        }
+        replace(clinit, clinit.instructions, clinit.maxStack, clinit.maxLocals);
+        write(node, output);
     }
 
     private static void patchNativeModuleLister(String jar, Path output) throws IOException {
@@ -364,6 +1185,7 @@ public final class MinecraftClientPatcher {
     private static void patchMinecraft(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/Minecraft.class");
         boolean found = false;
+        boolean stateHooked = false;
         for (MethodNode method : node.methods) {
             if (method.name.equals("lambda$fillUptime$40")
                     && method.desc.equals("()Ljava/lang/String;")) {
@@ -372,10 +1194,60 @@ public final class MinecraftClientPatcher {
                 code.add(new InsnNode(Opcodes.ARETURN));
                 replace(method, code, 1, 0);
                 found = true;
+            } else if (method.name.equals("runTick") && method.desc.equals("(Z)V")) {
+                InsnList code = new InsnList();
+                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                code.add(new FieldInsnNode(
+                        Opcodes.GETFIELD,
+                        "net/minecraft/client/Minecraft",
+                        "screen",
+                        "Lnet/minecraft/client/gui/screens/Screen;"));
+                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                code.add(new FieldInsnNode(
+                        Opcodes.GETFIELD,
+                        "net/minecraft/client/Minecraft",
+                        "overlay",
+                        "Lnet/minecraft/client/gui/screens/Overlay;"));
+                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                code.add(new FieldInsnNode(
+                        Opcodes.GETFIELD,
+                        "net/minecraft/client/Minecraft",
+                        "level",
+                        "Lnet/minecraft/client/multiplayer/ClientLevel;"));
+                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                code.add(new FieldInsnNode(
+                        Opcodes.GETFIELD,
+                        "net/minecraft/client/Minecraft",
+                        "noRender",
+                        "Z"));
+                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                code.add(new FieldInsnNode(
+                        Opcodes.GETFIELD,
+                        "net/minecraft/client/Minecraft",
+                        "running",
+                        "Z"));
+                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                code.add(new FieldInsnNode(
+                        Opcodes.GETFIELD,
+                        "net/minecraft/client/Minecraft",
+                        "pause",
+                        "Z"));
+                code.add(new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "org/lwjgl/opengl/BrowserOpenGL",
+                        "reportMinecraftState",
+                        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;ZZZ)V",
+                        false));
+                method.instructions.insert(code);
+                method.maxStack = Math.max(method.maxStack, 6);
+                stateHooked = true;
             }
         }
         if (!found) {
             throw new IllegalStateException("Minecraft uptime lambda was not found");
+        }
+        if (!stateHooked) {
+            throw new IllegalStateException("Minecraft runTick hook point was not found");
         }
         write(node, output);
     }
@@ -420,15 +1292,129 @@ public final class MinecraftClientPatcher {
 
     private static void patchMinecraftServer(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "net/minecraft/server/MinecraftServer.class");
+        String owner = "net/minecraft/server/MinecraftServer";
+        boolean patchedPrepareLevels = false;
+        boolean patchedRunServerReady = false;
         for (MethodNode method : node.methods) {
             if (method.name.equals("dumpThreads")
                     && method.desc.equals("(Ljava/nio/file/Path;)V")) {
                 InsnList code = new InsnList();
                 code.add(new InsnNode(Opcodes.RETURN));
                 replace(method, code, 0, 2);
+            } else if (method.name.equals("prepareLevels") && method.desc.equals("()V")) {
+                InsnList code = new InsnList();
+                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                code.add(new FieldInsnNode(
+                        Opcodes.GETFIELD,
+                        owner,
+                        "levelLoadListener",
+                        "Lnet/minecraft/server/level/progress/LevelLoadListener;"));
+                code.add(new FieldInsnNode(
+                        Opcodes.GETSTATIC,
+                        "net/minecraft/server/level/progress/LevelLoadListener$Stage",
+                        "LOAD_INITIAL_CHUNKS",
+                        "Lnet/minecraft/server/level/progress/LevelLoadListener$Stage;"));
+                code.add(new InsnNode(Opcodes.ICONST_0));
+                code.add(new MethodInsnNode(
+                        Opcodes.INVOKEINTERFACE,
+                        "net/minecraft/server/level/progress/LevelLoadListener",
+                        "start",
+                        "(Lnet/minecraft/server/level/progress/LevelLoadListener$Stage;I)V",
+                        true));
+                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                code.add(new FieldInsnNode(
+                        Opcodes.GETFIELD,
+                        owner,
+                        "levelLoadListener",
+                        "Lnet/minecraft/server/level/progress/LevelLoadListener;"));
+                code.add(new FieldInsnNode(
+                        Opcodes.GETSTATIC,
+                        "net/minecraft/server/level/progress/LevelLoadListener$Stage",
+                        "LOAD_INITIAL_CHUNKS",
+                        "Lnet/minecraft/server/level/progress/LevelLoadListener$Stage;"));
+                code.add(new MethodInsnNode(
+                        Opcodes.INVOKEINTERFACE,
+                        "net/minecraft/server/level/progress/LevelLoadListener",
+                        "finish",
+                        "(Lnet/minecraft/server/level/progress/LevelLoadListener$Stage;)V",
+                        true));
+                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                code.add(new FieldInsnNode(
+                        Opcodes.GETFIELD,
+                        owner,
+                        "levelLoadListener",
+                        "Lnet/minecraft/server/level/progress/LevelLoadListener;"));
+                code.add(new FieldInsnNode(
+                        Opcodes.GETSTATIC,
+                        "net/minecraft/server/level/progress/LevelLoadListener$Stage",
+                        "LOAD_PLAYER_CHUNKS",
+                        "Lnet/minecraft/server/level/progress/LevelLoadListener$Stage;"));
+                code.add(new InsnNode(Opcodes.ICONST_0));
+                code.add(new MethodInsnNode(
+                        Opcodes.INVOKEINTERFACE,
+                        "net/minecraft/server/level/progress/LevelLoadListener",
+                        "start",
+                        "(Lnet/minecraft/server/level/progress/LevelLoadListener$Stage;I)V",
+                        true));
+                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                code.add(new FieldInsnNode(
+                        Opcodes.GETFIELD,
+                        owner,
+                        "levelLoadListener",
+                        "Lnet/minecraft/server/level/progress/LevelLoadListener;"));
+                code.add(new FieldInsnNode(
+                        Opcodes.GETSTATIC,
+                        "net/minecraft/server/level/progress/LevelLoadListener$Stage",
+                        "LOAD_PLAYER_CHUNKS",
+                        "Lnet/minecraft/server/level/progress/LevelLoadListener$Stage;"));
+                code.add(new MethodInsnNode(
+                        Opcodes.INVOKEINTERFACE,
+                        "net/minecraft/server/level/progress/LevelLoadListener",
+                        "finish",
+                        "(Lnet/minecraft/server/level/progress/LevelLoadListener$Stage;)V",
+                        true));
+                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                code.add(new MethodInsnNode(
+                        Opcodes.INVOKEVIRTUAL,
+                        owner,
+                        "updateMobSpawningFlags",
+                        "()V",
+                        false));
+                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                code.add(new MethodInsnNode(
+                        Opcodes.INVOKEVIRTUAL,
+                        owner,
+                        "updateEffectiveRespawnData",
+                        "()V",
+                        false));
+                code.add(new InsnNode(Opcodes.RETURN));
+                replace(method, code, 3, 1);
+                patchedPrepareLevels = true;
+            } else if (method.name.equals("runServer") && method.desc.equals("()V")) {
+                for (var instruction = method.instructions.getFirst();
+                        instruction != null;
+                        instruction = instruction.getNext()) {
+                    if (instruction.getOpcode() == Opcodes.IFEQ) {
+                        InsnList code = new InsnList();
+                        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                        code.add(new InsnNode(Opcodes.ICONST_1));
+                        code.add(new FieldInsnNode(
+                                Opcodes.PUTFIELD,
+                                owner,
+                                "isReady",
+                                "Z"));
+                        method.instructions.insert(instruction, code);
+                        method.maxStack = Math.max(method.maxStack, 2);
+                        patchedRunServerReady = true;
+                        break;
+                    }
+                }
             }
         }
-        write(node, output);
+        if (!patchedPrepareLevels || !patchedRunServerReady) {
+            throw new IllegalStateException("MinecraftServer browser patch points were not found");
+        }
+        writeComputeFrames(node, output);
     }
 
     private static void patchChaseClient(String jar, Path output) throws IOException {
@@ -621,7 +1607,48 @@ public final class MinecraftClientPatcher {
 
         ClassNode upload = read(jar, "com/mojang/realmsclient/client/FileUpload.class");
         for (MethodNode method : upload.methods) {
-            if (method.name.equals("startUpload")) {
+            if (method.name.equals("<init>")) {
+                String owner = "com/mojang/realmsclient/client/FileUpload";
+                InsnList code = new InsnList();
+                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                code.add(new MethodInsnNode(
+                        Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false));
+                putField(code, owner, "file", "Ljava/io/File;", Opcodes.ALOAD, 1);
+                putField(code, owner, "realmId", "J", Opcodes.LLOAD, 2);
+                putField(code, owner, "slotId", "I", Opcodes.ILOAD, 4);
+                putField(code, owner, "uploadInfo",
+                        "Lcom/mojang/realmsclient/dto/UploadInfo;", Opcodes.ALOAD, 5);
+                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                code.add(new VarInsnNode(Opcodes.ALOAD, 6));
+                code.add(new MethodInsnNode(
+                        Opcodes.INVOKEVIRTUAL,
+                        "net/minecraft/client/User",
+                        "getSessionId",
+                        "()Ljava/lang/String;",
+                        false));
+                code.add(new FieldInsnNode(
+                        Opcodes.PUTFIELD, owner, "sessionId", "Ljava/lang/String;"));
+                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                code.add(new VarInsnNode(Opcodes.ALOAD, 6));
+                code.add(new MethodInsnNode(
+                        Opcodes.INVOKEVIRTUAL,
+                        "net/minecraft/client/User",
+                        "getName",
+                        "()Ljava/lang/String;",
+                        false));
+                code.add(new FieldInsnNode(
+                        Opcodes.PUTFIELD, owner, "username", "Ljava/lang/String;"));
+                putField(code, owner, "clientVersion", "Ljava/lang/String;", Opcodes.ALOAD, 7);
+                putField(code, owner, "worldVersion", "Ljava/lang/String;", Opcodes.ALOAD, 8);
+                putField(code, owner, "uploadStatus",
+                        "Lcom/mojang/realmsclient/client/UploadStatus;", Opcodes.ALOAD, 9);
+                code.add(new InsnNode(Opcodes.RETURN));
+                replace(method, code, 3, method.maxLocals);
+            } else if (method.name.equals("close")) {
+                InsnList code = new InsnList();
+                code.add(new InsnNode(Opcodes.RETURN));
+                replace(method, code, 0, method.maxLocals);
+            } else if (method.name.equals("startUpload")) {
                 InsnList code = new InsnList();
                 code.add(new TypeInsnNode(Opcodes.NEW, "java/lang/UnsupportedOperationException"));
                 code.add(new InsnNode(Opcodes.DUP));
@@ -760,12 +1787,244 @@ public final class MinecraftClientPatcher {
         writeBytes(root.resolve("javax/sound/sampled/AudioFormat.class"), format.toByteArray());
     }
 
+    private static void generateUnsafeStub(Path root) throws IOException {
+        ClassWriter unsafe = new ClassWriter(0);
+        unsafe.visit(Opcodes.V17, Opcodes.ACC_PUBLIC | Opcodes.ACC_FINAL | Opcodes.ACC_SUPER,
+                "sun/misc/Unsafe", null, "java/lang/Object", null);
+        var constructor = unsafe.visitMethod(Opcodes.ACC_PRIVATE, "<init>", "()V", null, null);
+        constructor.visitCode();
+        constructor.visitVarInsn(Opcodes.ALOAD, 0);
+        constructor.visitMethodInsn(
+                Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false);
+        constructor.visitInsn(Opcodes.RETURN);
+        constructor.visitMaxs(1, 1);
+        constructor.visitEnd();
+        unsafe.visitEnd();
+        writeBytes(root.resolve("sun/misc/Unsafe.class"), unsafe.toByteArray());
+    }
+
+    private static void generateCryptoApiStubs(Path root) throws IOException {
+        ClassWriter secretKey = new ClassWriter(0);
+        secretKey.visit(Opcodes.V17,
+                Opcodes.ACC_PUBLIC | Opcodes.ACC_ABSTRACT | Opcodes.ACC_INTERFACE,
+                "javax/crypto/SecretKey", null, "java/lang/Object",
+                new String[] {"java/security/Key"});
+        secretKey.visitEnd();
+        writeBytes(root.resolve("javax/crypto/SecretKey.class"), secretKey.toByteArray());
+
+        ClassWriter cipher = new ClassWriter(0);
+        cipher.visit(Opcodes.V17, Opcodes.ACC_PUBLIC | Opcodes.ACC_SUPER,
+                "javax/crypto/Cipher", null, "java/lang/Object", null);
+        for (String field : new String[] {"ENCRYPT_MODE", "DECRYPT_MODE", "WRAP_MODE", "UNWRAP_MODE"}) {
+            cipher.visitField(
+                    Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC | Opcodes.ACC_FINAL,
+                    field, "I", null, switch (field) {
+                        case "ENCRYPT_MODE" -> 1;
+                        case "DECRYPT_MODE" -> 2;
+                        case "WRAP_MODE" -> 3;
+                        default -> 4;
+                    }).visitEnd();
+        }
+        simpleConstructor(cipher, "javax/crypto/Cipher", Opcodes.ACC_PUBLIC, "()V");
+        var getInstance = cipher.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+                "getInstance", "(Ljava/lang/String;)Ljavax/crypto/Cipher;", null, null);
+        getInstance.visitCode();
+        getInstance.visitTypeInsn(Opcodes.NEW, "javax/crypto/Cipher");
+        getInstance.visitInsn(Opcodes.DUP);
+        getInstance.visitMethodInsn(
+                Opcodes.INVOKESPECIAL, "javax/crypto/Cipher", "<init>", "()V", false);
+        getInstance.visitInsn(Opcodes.ARETURN);
+        getInstance.visitMaxs(2, 1);
+        getInstance.visitEnd();
+        emptyMethod(cipher, "init", "(ILjava/security/Key;)V", 3);
+        emptyMethod(cipher, "init",
+                "(ILjava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V", 4);
+        var doFinal = cipher.visitMethod(
+                Opcodes.ACC_PUBLIC, "doFinal", "([B)[B", null, null);
+        doFinal.visitCode();
+        doFinal.visitVarInsn(Opcodes.ALOAD, 1);
+        doFinal.visitInsn(Opcodes.ARETURN);
+        doFinal.visitMaxs(1, 2);
+        doFinal.visitEnd();
+        cipher.visitEnd();
+        writeBytes(root.resolve("javax/crypto/Cipher.class"), cipher.toByteArray());
+
+        ClassWriter keyGenerator = new ClassWriter(0);
+        keyGenerator.visit(Opcodes.V17, Opcodes.ACC_PUBLIC | Opcodes.ACC_SUPER,
+                "javax/crypto/KeyGenerator", null, "java/lang/Object", null);
+        keyGenerator.visitField(Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL,
+                "algorithm", "Ljava/lang/String;", null, null).visitEnd();
+        var kgConstructor = keyGenerator.visitMethod(
+                Opcodes.ACC_PUBLIC, "<init>", "(Ljava/lang/String;)V", null, null);
+        kgConstructor.visitCode();
+        kgConstructor.visitVarInsn(Opcodes.ALOAD, 0);
+        kgConstructor.visitMethodInsn(
+                Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false);
+        kgConstructor.visitVarInsn(Opcodes.ALOAD, 0);
+        kgConstructor.visitVarInsn(Opcodes.ALOAD, 1);
+        kgConstructor.visitFieldInsn(
+                Opcodes.PUTFIELD, "javax/crypto/KeyGenerator",
+                "algorithm", "Ljava/lang/String;");
+        kgConstructor.visitInsn(Opcodes.RETURN);
+        kgConstructor.visitMaxs(2, 2);
+        kgConstructor.visitEnd();
+        var kgGetInstance = keyGenerator.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+                "getInstance", "(Ljava/lang/String;)Ljavax/crypto/KeyGenerator;", null, null);
+        kgGetInstance.visitCode();
+        kgGetInstance.visitTypeInsn(Opcodes.NEW, "javax/crypto/KeyGenerator");
+        kgGetInstance.visitInsn(Opcodes.DUP);
+        kgGetInstance.visitVarInsn(Opcodes.ALOAD, 0);
+        kgGetInstance.visitMethodInsn(
+                Opcodes.INVOKESPECIAL,
+                "javax/crypto/KeyGenerator",
+                "<init>",
+                "(Ljava/lang/String;)V",
+                false);
+        kgGetInstance.visitInsn(Opcodes.ARETURN);
+        kgGetInstance.visitMaxs(3, 1);
+        kgGetInstance.visitEnd();
+        emptyMethod(keyGenerator, "init", "(I)V", 2);
+        var generateKey = keyGenerator.visitMethod(
+                Opcodes.ACC_PUBLIC, "generateKey", "()Ljavax/crypto/SecretKey;", null, null);
+        generateKey.visitCode();
+        generateKey.visitTypeInsn(Opcodes.NEW, "javax/crypto/spec/SecretKeySpec");
+        generateKey.visitInsn(Opcodes.DUP);
+        generateKey.visitIntInsn(Opcodes.BIPUSH, 16);
+        generateKey.visitIntInsn(Opcodes.NEWARRAY, Opcodes.T_BYTE);
+        generateKey.visitVarInsn(Opcodes.ALOAD, 0);
+        generateKey.visitFieldInsn(
+                Opcodes.GETFIELD, "javax/crypto/KeyGenerator",
+                "algorithm", "Ljava/lang/String;");
+        generateKey.visitMethodInsn(
+                Opcodes.INVOKESPECIAL,
+                "javax/crypto/spec/SecretKeySpec",
+                "<init>",
+                "([BLjava/lang/String;)V",
+                false);
+        generateKey.visitInsn(Opcodes.ARETURN);
+        generateKey.visitMaxs(4, 1);
+        generateKey.visitEnd();
+        keyGenerator.visitEnd();
+        writeBytes(root.resolve("javax/crypto/KeyGenerator.class"), keyGenerator.toByteArray());
+
+        generateSecretKeySpecStub(root);
+        generateIvParameterSpecStub(root);
+    }
+
+    private static void generateSecretKeySpecStub(Path root) throws IOException {
+        ClassWriter spec = new ClassWriter(0);
+        String owner = "javax/crypto/spec/SecretKeySpec";
+        spec.visit(Opcodes.V17, Opcodes.ACC_PUBLIC | Opcodes.ACC_SUPER,
+                owner, null, "java/lang/Object", new String[] {"javax/crypto/SecretKey"});
+        spec.visitField(Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL, "key", "[B", null, null).visitEnd();
+        spec.visitField(Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL,
+                "algorithm", "Ljava/lang/String;", null, null).visitEnd();
+        var constructor = spec.visitMethod(
+                Opcodes.ACC_PUBLIC, "<init>", "([BLjava/lang/String;)V", null, null);
+        constructor.visitCode();
+        constructor.visitVarInsn(Opcodes.ALOAD, 0);
+        constructor.visitMethodInsn(
+                Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false);
+        putConstructorField(constructor, owner, "key", "[B", Opcodes.ALOAD, 1);
+        putConstructorField(constructor, owner, "algorithm", "Ljava/lang/String;", Opcodes.ALOAD, 2);
+        constructor.visitInsn(Opcodes.RETURN);
+        constructor.visitMaxs(2, 3);
+        constructor.visitEnd();
+        var rangedConstructor = spec.visitMethod(
+                Opcodes.ACC_PUBLIC, "<init>", "([BIILjava/lang/String;)V", null, null);
+        rangedConstructor.visitCode();
+        rangedConstructor.visitVarInsn(Opcodes.ALOAD, 0);
+        rangedConstructor.visitVarInsn(Opcodes.ALOAD, 1);
+        rangedConstructor.visitVarInsn(Opcodes.ALOAD, 4);
+        rangedConstructor.visitMethodInsn(
+                Opcodes.INVOKESPECIAL, owner, "<init>", "([BLjava/lang/String;)V", false);
+        rangedConstructor.visitInsn(Opcodes.RETURN);
+        rangedConstructor.visitMaxs(3, 5);
+        rangedConstructor.visitEnd();
+        getter(spec, owner, "getAlgorithm", "()Ljava/lang/String;",
+                "algorithm", "Ljava/lang/String;", Opcodes.ARETURN);
+        constantStringMethod(spec, "getFormat", "RAW");
+        getter(spec, owner, "getEncoded", "()[B", "key", "[B", Opcodes.ARETURN);
+        spec.visitEnd();
+        writeBytes(root.resolve("javax/crypto/spec/SecretKeySpec.class"), spec.toByteArray());
+    }
+
+    private static void generateIvParameterSpecStub(Path root) throws IOException {
+        ClassWriter spec = new ClassWriter(0);
+        String owner = "javax/crypto/spec/IvParameterSpec";
+        spec.visit(Opcodes.V17, Opcodes.ACC_PUBLIC | Opcodes.ACC_SUPER,
+                owner, null, "java/lang/Object",
+                new String[] {"java/security/spec/AlgorithmParameterSpec"});
+        spec.visitField(Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL, "iv", "[B", null, null).visitEnd();
+        var constructor = spec.visitMethod(Opcodes.ACC_PUBLIC, "<init>", "([B)V", null, null);
+        constructor.visitCode();
+        constructor.visitVarInsn(Opcodes.ALOAD, 0);
+        constructor.visitMethodInsn(
+                Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false);
+        putConstructorField(constructor, owner, "iv", "[B", Opcodes.ALOAD, 1);
+        constructor.visitInsn(Opcodes.RETURN);
+        constructor.visitMaxs(2, 2);
+        constructor.visitEnd();
+        var rangedConstructor = spec.visitMethod(
+                Opcodes.ACC_PUBLIC, "<init>", "([BII)V", null, null);
+        rangedConstructor.visitCode();
+        rangedConstructor.visitVarInsn(Opcodes.ALOAD, 0);
+        rangedConstructor.visitVarInsn(Opcodes.ALOAD, 1);
+        rangedConstructor.visitMethodInsn(
+                Opcodes.INVOKESPECIAL, owner, "<init>", "([B)V", false);
+        rangedConstructor.visitInsn(Opcodes.RETURN);
+        rangedConstructor.visitMaxs(2, 4);
+        rangedConstructor.visitEnd();
+        getter(spec, owner, "getIV", "()[B", "iv", "[B", Opcodes.ARETURN);
+        spec.visitEnd();
+        writeBytes(root.resolve("javax/crypto/spec/IvParameterSpec.class"), spec.toByteArray());
+    }
+
     private static void putConstructorField(
             org.objectweb.asm.MethodVisitor method, String owner,
             String field, String descriptor, int loadOpcode, int local) {
         method.visitVarInsn(Opcodes.ALOAD, 0);
         method.visitVarInsn(loadOpcode, local);
         method.visitFieldInsn(Opcodes.PUTFIELD, owner, field, descriptor);
+    }
+
+    private static void simpleConstructor(
+            ClassWriter writer, String owner, int access, String descriptor) {
+        var method = writer.visitMethod(access, "<init>", descriptor, null, null);
+        method.visitCode();
+        method.visitVarInsn(Opcodes.ALOAD, 0);
+        method.visitMethodInsn(
+                Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false);
+        method.visitInsn(Opcodes.RETURN);
+        method.visitMaxs(1, 1);
+        method.visitEnd();
+    }
+
+    private static void emptyMethod(
+            ClassWriter writer, String name, String descriptor, int maxLocals) {
+        var method = writer.visitMethod(Opcodes.ACC_PUBLIC, name, descriptor, null, null);
+        method.visitCode();
+        method.visitInsn(Opcodes.RETURN);
+        method.visitMaxs(0, maxLocals);
+        method.visitEnd();
+    }
+
+    private static void constantStringMethod(ClassWriter writer, String name, String value) {
+        var method = writer.visitMethod(
+                Opcodes.ACC_PUBLIC, name, "()Ljava/lang/String;", null, null);
+        method.visitCode();
+        method.visitLdcInsn(value);
+        method.visitInsn(Opcodes.ARETURN);
+        method.visitMaxs(1, 1);
+        method.visitEnd();
+    }
+
+    private static void putField(
+            InsnList code, String owner, String field, String descriptor,
+            int loadOpcode, int local) {
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new VarInsnNode(loadOpcode, local));
+        code.add(new FieldInsnNode(Opcodes.PUTFIELD, owner, field, descriptor));
     }
 
     private static void getter(
@@ -785,6 +2044,38 @@ public final class MinecraftClientPatcher {
         Files.write(output, bytes);
     }
 
+    private static void replaceNull(ClassNode node, String name, String descriptor) {
+        InsnList code = new InsnList();
+        code.add(new InsnNode(Opcodes.ACONST_NULL));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(find(node, name, descriptor), code, 1, Type.getArgumentsAndReturnSizes(descriptor) >> 2);
+    }
+
+    private static void replaceEmptyBytes(ClassNode node, String name, String descriptor) {
+        InsnList code = new InsnList();
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new IntInsnNode(Opcodes.NEWARRAY, Opcodes.T_BYTE));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(find(node, name, descriptor), code, 1, Type.getArgumentsAndReturnSizes(descriptor) >> 2);
+    }
+
+    private static void replaceSecondByteArray(ClassNode node, String name, String descriptor) {
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(find(node, name, descriptor), code, 1, Type.getArgumentsAndReturnSizes(descriptor) >> 2);
+    }
+
+    private static void replaceStaticFieldReturn(
+            ClassNode node, String name, String descriptor,
+            String owner, String field, String fieldDescriptor) {
+        InsnList code = new InsnList();
+        code.add(new FieldInsnNode(Opcodes.GETSTATIC, owner, field, fieldDescriptor));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(find(node, name, descriptor), code, 1,
+                Type.getArgumentsAndReturnSizes(descriptor) >> 2);
+    }
+
     private static void replace(MethodNode method, InsnList code, int maxStack, int maxLocals) {
         method.instructions = code;
         method.tryCatchBlocks.clear();
@@ -793,6 +2084,14 @@ public final class MinecraftClientPatcher {
         }
         method.maxStack = maxStack;
         method.maxLocals = maxLocals;
+    }
+
+    private static MethodNode find(ClassNode node, String name, String descriptor) {
+        return node.methods.stream()
+                .filter(method -> method.name.equals(name) && method.desc.equals(descriptor))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(
+                        node.name + "." + name + descriptor + " was not found"));
     }
 
     private static ClassNode read(String jarPath, String entryName) throws IOException {
@@ -809,6 +2108,18 @@ public final class MinecraftClientPatcher {
 
     private static void write(ClassNode node, Path output) throws IOException {
         ClassWriter writer = new ClassWriter(0);
+        node.accept(writer);
+        Files.createDirectories(output.getParent());
+        Files.write(output, writer.toByteArray());
+    }
+
+    private static void writeComputeFrames(ClassNode node, Path output) throws IOException {
+        ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+            @Override
+            protected String getCommonSuperClass(String type1, String type2) {
+                return "java/lang/Object";
+            }
+        };
         node.accept(writer);
         Files.createDirectories(output.getParent());
         Files.write(output, writer.toByteArray());
