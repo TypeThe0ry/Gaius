@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gaius 单人模式启动器</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #111827; color: #e5e7eb; }
+    main { width: min(720px, calc(100% - 32px)); padding: 32px; border: 1px solid #374151; border-radius: 16px; background: #1f2937; box-shadow: 0 20px 60px #0008; }
+    h1 { margin-top: 0; }
+    p { line-height: 1.6; }
+    a.button { display: inline-block; margin-top: 16px; padding: 12px 18px; border-radius: 10px; background: #16a34a; color: white; text-decoration: none; font-weight: 700; }
+    code { background: #111827; padding: 2px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Gaius 单人模式</h1>
+    <p>
+      当前可运行的单人模式来自仓库根目录保留的 <code>eag26-single(2).html</code>
+      单文件 TeaVM/WebGPU 构建。请从仓库根目录启动静态服务器，然后点击下面的按钮。
+    </p>
+    <p><code>python3 -m http.server 8080</code></p>
+    <a class="button" href="../../eag26-single(2).html?localserver" rel="noopener">启动单人模式</a>
+  </main>
+</body>
+</html>
