@@ -41,18 +41,34 @@ public final class NettyBrowserPatcher {
                 commonRoot.resolve("io/netty/util/NetUtilInitializations.class"));
         patchEmptyArrays(Path.of(args[0]),
                 commonRoot.resolve("io/netty/util/internal/EmptyArrays.class"));
+        patchMacAddressUtil(Path.of(args[0]),
+                commonRoot.resolve("io/netty/util/internal/MacAddressUtil.class"));
         patchResourceLeakDetector(Path.of(args[0]),
                 commonRoot.resolve("io/netty/util/ResourceLeakDetector.class"));
+        patchRecycler(Path.of(args[0]),
+                commonRoot.resolve("io/netty/util/Recycler.class"));
         patchBuffer(Path.of(args[1]),
                 bufferRoot.resolve("io/netty/buffer/ByteBufUtil.class"));
+        patchAbstractByteBufAllocator(Path.of(args[1]),
+                bufferRoot.resolve("io/netty/buffer/AbstractByteBufAllocator.class"));
         patchReferenceCountedBuffer(Path.of(args[1]),
                 bufferRoot.resolve("io/netty/buffer/AbstractReferenceCountedByteBuf.class"));
         patchUnpooledAllocator(Path.of(args[1]),
                 bufferRoot.resolve("io/netty/buffer/UnpooledByteBufAllocator.class"));
+        patchLeakAwareAllocator(Path.of(args[1]),
+                "io/netty/buffer/PooledByteBufAllocator",
+                bufferRoot.resolve("io/netty/buffer/PooledByteBufAllocator.class"));
+        patchLeakAwareAllocator(Path.of(args[1]),
+                "io/netty/buffer/AdaptiveByteBufAllocator",
+                bufferRoot.resolve("io/netty/buffer/AdaptiveByteBufAllocator.class"));
         patchChannelInitializer(Path.of(args[2]),
                 transportRoot.resolve("io/netty/channel/ChannelInitializer.class"));
         patchReflectiveChannelFactory(Path.of(args[2]),
                 transportRoot.resolve("io/netty/channel/ReflectiveChannelFactory.class"));
+        patchDefaultChannelId(Path.of(args[2]),
+                transportRoot.resolve("io/netty/channel/DefaultChannelId.class"));
+        patchChannelHandlerMask(Path.of(args[2]),
+                transportRoot.resolve("io/netty/channel/ChannelHandlerMask.class"));
     }
 
     private static void patchPlatform(Path jar, Path output) throws IOException {
@@ -391,6 +407,86 @@ public final class NettyBrowserPatcher {
         write(node, output);
     }
 
+    private static void patchDefaultChannelId(Path jar, Path output) throws IOException {
+        String owner = "io/netty/channel/DefaultChannelId";
+        ClassNode node = read(jar, owner + ".class");
+        replaceInt(find(node, "defaultProcessId", "()I"), 1);
+        MethodNode method = find(node, "newInstance", "()Lio/netty/channel/DefaultChannelId;");
+        InsnList code = new InsnList();
+        code.add(new TypeInsnNode(Opcodes.NEW, owner));
+        code.add(new InsnNode(Opcodes.DUP));
+        putByteArray(code, new byte[] {0x47, 0x41, 0x49, 0x55, 0x53, 0x00, 0x00, 0x01});
+        code.add(new FieldInsnNode(Opcodes.GETSTATIC, owner, "PROCESS_ID", "I"));
+        code.add(new FieldInsnNode(Opcodes.GETSTATIC, owner, "nextSequence",
+                "Ljava/util/concurrent/atomic/AtomicInteger;"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/concurrent/atomic/AtomicInteger",
+                "getAndIncrement",
+                "()I",
+                false));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC, "java/lang/System", "nanoTime", "()J", false));
+        code.add(new FieldInsnNode(Opcodes.GETSTATIC, owner, "nextSequence",
+                "Ljava/util/concurrent/atomic/AtomicInteger;"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/concurrent/atomic/AtomicInteger",
+                "getAndIncrement",
+                "()I",
+                false));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "<init>",
+                "([BIIJI)V",
+                false));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(method, code);
+        write(node, output);
+    }
+
+    private static void patchMacAddressUtil(Path jar, Path output) throws IOException {
+        ClassNode node = read(jar, "io/netty/util/internal/MacAddressUtil.class");
+        MethodNode method = find(node, "defaultMachineId", "()[B");
+        InsnList code = new InsnList();
+        putByteArray(code, new byte[] {0x47, 0x41, 0x49, 0x55, 0x53, 0x00, 0x00, 0x01});
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(method, code);
+        write(node, output);
+    }
+
+    private static void patchRecycler(Path jar, Path output) throws IOException {
+        String owner = "io/netty/util/Recycler";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode method = find(node, "get", "()Ljava/lang/Object;");
+        InsnList code = new InsnList();
+        code.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETSTATIC,
+                owner,
+                "NOOP_HANDLE",
+                "Lio/netty/util/Recycler$EnhancedHandle;"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                owner,
+                "newObject",
+                "(Lio/netty/util/Recycler$Handle;)Ljava/lang/Object;",
+                false));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(method, code);
+        replaceConstant(find(node, "threadLocalSize", "()I"), Opcodes.ICONST_0, Opcodes.IRETURN);
+        write(node, output);
+    }
+
+    private static void patchChannelHandlerMask(Path jar, Path output) throws IOException {
+        ClassNode node = read(jar, "io/netty/channel/ChannelHandlerMask.class");
+        replaceConstant(find(node, "isSkippable",
+                "(Ljava/lang/Class;Ljava/lang/String;[Ljava/lang/Class;)Z"),
+                Opcodes.ICONST_0, Opcodes.IRETURN);
+        write(node, output);
+    }
+
     private static void patchEmptyArrays(Path jar, Path output) throws IOException {
         ClassNode node = read(jar, "io/netty/util/internal/EmptyArrays.class");
         MethodNode initializer = find(node, "<clinit>", "()V");
@@ -410,6 +506,7 @@ public final class NettyBrowserPatcher {
     private static void patchResourceLeakDetector(Path jar, Path output) throws IOException {
         String owner = "io/netty/util/ResourceLeakDetector";
         ClassNode node = read(jar, owner + ".class");
+        replaceNoop(find(node, "addExclusions", "(Ljava/lang/Class;[Ljava/lang/String;)V"));
         MethodNode constructor = find(node, "<init>", "(Ljava/lang/String;IJ)V");
         InsnList code = new InsnList();
         code.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
@@ -495,6 +592,61 @@ public final class NettyBrowserPatcher {
                     false));
             code.add(new InsnNode(Opcodes.ARETURN));
             replace(method, code);
+        }
+        replaceCompositeBuffer(find(node, "compositeHeapBuffer",
+                "(I)Lio/netty/buffer/CompositeByteBuf;"), false);
+        replaceCompositeBuffer(find(node, "compositeDirectBuffer",
+                "(I)Lio/netty/buffer/CompositeByteBuf;"), true);
+        write(node, output);
+    }
+
+    private static void replaceCompositeBuffer(MethodNode method, boolean direct) {
+        InsnList code = new InsnList();
+        code.add(new TypeInsnNode(Opcodes.NEW, "io/netty/buffer/CompositeByteBuf"));
+        code.add(new InsnNode(Opcodes.DUP));
+        code.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new InsnNode(direct ? Opcodes.ICONST_1 : Opcodes.ICONST_0));
+        code.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ILOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                "io/netty/buffer/CompositeByteBuf",
+                "<init>",
+                "(Lio/netty/buffer/ByteBufAllocator;ZI)V",
+                false));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(method, code);
+    }
+
+    private static void patchAbstractByteBufAllocator(Path jar, Path output) throws IOException {
+        ClassNode node = read(jar, "io/netty/buffer/AbstractByteBufAllocator.class");
+        replaceCompositeBuffer(find(node, "compositeHeapBuffer",
+                "(I)Lio/netty/buffer/CompositeByteBuf;"), false);
+        replaceCompositeBuffer(find(node, "compositeDirectBuffer",
+                "(I)Lio/netty/buffer/CompositeByteBuf;"), true);
+        for (String desc : new String[] {
+                "(Lio/netty/buffer/ByteBuf;)Lio/netty/buffer/ByteBuf;",
+                "(Lio/netty/buffer/CompositeByteBuf;)Lio/netty/buffer/CompositeByteBuf;"
+        }) {
+            MethodNode method = find(node, "toLeakAwareBuffer", desc);
+            node.methods.remove(method);
+        }
+        write(node, output);
+    }
+
+    private static void patchLeakAwareAllocator(Path jar, String owner, Path output)
+            throws IOException {
+        ClassNode node = read(jar, owner + ".class");
+        for (MethodNode method : node.methods) {
+            for (var instruction = method.instructions.getFirst();
+                    instruction != null;) {
+                var next = instruction.getNext();
+                if (instruction instanceof MethodInsnNode call
+                        && call.getOpcode() == Opcodes.INVOKESTATIC
+                        && call.name.equals("toLeakAwareBuffer")) {
+                    method.instructions.remove(instruction);
+                }
+                instruction = next;
+            }
         }
         write(node, output);
     }
@@ -725,6 +877,17 @@ public final class NettyBrowserPatcher {
         code.add(new TypeInsnNode(Opcodes.NEW, type));
         code.add(new InsnNode(Opcodes.DUP));
         code.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, type, "<init>", "()V", false));
+    }
+
+    private static void putByteArray(InsnList code, byte[] values) {
+        pushInt(code, values.length);
+        code.add(new IntInsnNode(Opcodes.NEWARRAY, Opcodes.T_BYTE));
+        for (int i = 0; i < values.length; i++) {
+            code.add(new InsnNode(Opcodes.DUP));
+            pushInt(code, i);
+            pushInt(code, values[i]);
+            code.add(new InsnNode(Opcodes.BASTORE));
+        }
     }
 
     private static void pushInt(InsnList code, int value) {

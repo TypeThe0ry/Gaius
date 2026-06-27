@@ -13,6 +13,8 @@ import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.IntInsnNode;
 import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.FieldNode;
+import org.objectweb.asm.tree.JumpInsnNode;
+import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.TypeInsnNode;
 import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.VarInsnNode;
@@ -33,6 +35,10 @@ public final class MinecraftClientPatcher {
                 args[0], root.resolve("net/minecraft/util/profiling/jfr/JvmProfiler.class"));
         patchEventLoopGroupHolder(
                 args[0], root.resolve("net/minecraft/server/network/EventLoopGroupHolder.class"));
+        patchNetworkEncoderMatchers(args[0], root);
+        patchClassTreeIdRegistry(args[0], root.resolve("net/minecraft/util/ClassTreeIdRegistry.class"));
+        patchSynchedEntityDataClassInitialization(
+                args[0], root.resolve("net/minecraft/network/syncher/SynchedEntityData.class"));
         patchGlx(args[0], root.resolve("com/mojang/blaze3d/platform/GLX.class"));
         patchTracyZoneFiller(
                 args[0], root.resolve("net/minecraft/util/profiling/TracyZoneFiller.class"));
@@ -89,10 +95,16 @@ public final class MinecraftClientPatcher {
                 "com/mojang/blaze3d/preprocessor/GlslPreprocessor.class"));
         patchGlDevice(args[0], root.resolve(
                 "com/mojang/blaze3d/opengl/GlDevice.class"));
+        patchGlConstWebGLTextureFormats(args[0], root.resolve(
+                "com/mojang/blaze3d/opengl/GlConst.class"));
+        patchTextureFormatWebGLColorAspect(args[0], root.resolve(
+                "com/mojang/blaze3d/textures/TextureFormat.class"));
         patchGlStateManagerTextureBinding(args[0], root.resolve(
                 "com/mojang/blaze3d/opengl/GlStateManager.class"));
         patchGlCommandEncoder(args[0], root.resolve(
                 "com/mojang/blaze3d/opengl/GlCommandEncoder.class"));
+        patchClientPacketListenerLoadingDiagnostics(args[0], root.resolve(
+                "net/minecraft/client/multiplayer/ClientPacketListener.class"));
         patchWorldUnloadTelemetry(args[0], root.resolve(
                 "net/minecraft/client/telemetry/events/WorldUnloadEvent.class"));
         generateSoundApiStubs(root);
@@ -151,6 +163,401 @@ public final class MinecraftClientPatcher {
         write(node, output);
     }
 
+    private static void patchSynchedEntityDataClassInitialization(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/network/syncher/SynchedEntityData.class");
+        MethodNode defineId = find(node, "defineId",
+                "(Ljava/lang/Class;Lnet/minecraft/network/syncher/EntityDataSerializer;)"
+                        + "Lnet/minecraft/network/syncher/EntityDataAccessor;");
+        boolean patched = false;
+        for (var instruction = defineId.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof FieldInsnNode field
+                    && field.getOpcode() == Opcodes.GETSTATIC
+                    && field.owner.equals("net/minecraft/network/syncher/SynchedEntityData")
+                    && field.name.equals("ID_REGISTRY")
+                    && field.desc.equals("Lnet/minecraft/util/ClassTreeIdRegistry;")) {
+                InsnList code = new InsnList();
+                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                code.add(new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "net/minecraft/network/syncher/SynchedEntityData",
+                        "gaius$initializeSynchedDataSuperclasses",
+                        "(Ljava/lang/Class;)V",
+                        false));
+                defineId.instructions.insertBefore(instruction, code);
+                patched = true;
+                break;
+            }
+        }
+        if (!patched) {
+            throw new IllegalStateException("SynchedEntityData.defineId registry patch point was not found");
+        }
+        addInitializeSynchedDataSuperclassesHelper(node);
+        writeComputeFrames(node, output);
+    }
+
+    private static void addInitializeSynchedDataSuperclassesHelper(ClassNode node) {
+        node.methods.removeIf(method -> method.name.equals("gaius$initializeSynchedDataSuperclasses")
+                && method.desc.equals("(Ljava/lang/Class;)V"));
+        MethodNode method = new MethodNode(
+                Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_SYNTHETIC,
+                "gaius$initializeSynchedDataSuperclasses",
+                "(Ljava/lang/Class;)V",
+                null,
+                null);
+        InsnList code = method.instructions;
+        LabelNode done = new LabelNode();
+
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/lang/Class",
+                "getSuperclass",
+                "()Ljava/lang/Class;",
+                false));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 1));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new JumpInsnNode(Opcodes.IFNULL, done));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new LdcInsnNode(Type.getObjectType("java/lang/Object")));
+        code.add(new JumpInsnNode(Opcodes.IF_ACMPEQ, done));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "net/minecraft/network/syncher/SynchedEntityData",
+                "gaius$initializeSynchedDataSuperclasses",
+                "(Ljava/lang/Class;)V",
+                false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/lang/Class",
+                "initialize",
+                "()V",
+                false));
+        code.add(done);
+        code.add(new InsnNode(Opcodes.RETURN));
+        method.maxStack = 2;
+        method.maxLocals = 2;
+        node.methods.add(method);
+    }
+
+    private static void patchClassTreeIdRegistry(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/util/ClassTreeIdRegistry.class");
+        MethodNode method = find(node, "getLastIdFor", "(Ljava/lang/Class;)I");
+        InsnList code = new InsnList();
+        LabelNode scanAssignable = new LabelNode();
+        LabelNode superclassLoop = new LabelNode();
+        LabelNode scanLoop = new LabelNode();
+        LabelNode returnBest = new LabelNode();
+        LabelNode superclassNameLookup = new LabelNode();
+
+        // int exact = classToLastIdCache.getInt(clazz);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/util/ClassTreeIdRegistry",
+                "classToLastIdCache",
+                "Lit/unimi/dsi/fastutil/objects/Object2IntMap;"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "it/unimi/dsi/fastutil/objects/Object2IntMap",
+                "getInt",
+                "(Ljava/lang/Object;)I",
+                true));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 2));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        code.add(new InsnNode(Opcodes.ICONST_M1));
+        code.add(new JumpInsnNode(Opcodes.IF_ICMPEQ, superclassLoop));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        code.add(new InsnNode(Opcodes.IRETURN));
+
+        // Keep vanilla behavior first: walk Class.getSuperclass().
+        code.add(superclassLoop);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 3));
+        LabelNode superclassNext = new LabelNode();
+        code.add(superclassNext);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/lang/Class",
+                "getSuperclass",
+                "()Ljava/lang/Class;",
+                false));
+        code.add(new InsnNode(Opcodes.DUP));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 3));
+        code.add(new JumpInsnNode(Opcodes.IFNULL, scanAssignable));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        code.add(new LdcInsnNode(Type.getObjectType("java/lang/Object")));
+        code.add(new JumpInsnNode(Opcodes.IF_ACMPEQ, scanAssignable));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/util/ClassTreeIdRegistry",
+                "classToLastIdCache",
+                "Lit/unimi/dsi/fastutil/objects/Object2IntMap;"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "it/unimi/dsi/fastutil/objects/Object2IntMap",
+                "getInt",
+                "(Ljava/lang/Object;)I",
+                true));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 4));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 4));
+        code.add(new InsnNode(Opcodes.ICONST_M1));
+        code.add(new JumpInsnNode(Opcodes.IF_ICMPEQ, superclassNameLookup));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 4));
+        code.add(new InsnNode(Opcodes.IRETURN));
+        code.add(superclassNameLookup);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                "net/minecraft/util/ClassTreeIdRegistry",
+                "gaius$getCachedIdByName",
+                "(Ljava/lang/Class;)I",
+                false));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 4));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 4));
+        code.add(new InsnNode(Opcodes.ICONST_M1));
+        code.add(new JumpInsnNode(Opcodes.IF_ICMPEQ, superclassNext));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 4));
+        code.add(new InsnNode(Opcodes.IRETURN));
+
+        // Browser fallback: Class objects produced by getSuperclass() can miss
+        // map identity matches after TeaVM translation. Scan known registered
+        // classes and use assignability to find the deepest inherited data id.
+        code.add(scanAssignable);
+        code.add(new InsnNode(Opcodes.ICONST_M1));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 4));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/util/ClassTreeIdRegistry",
+                "classToLastIdCache",
+                "Lit/unimi/dsi/fastutil/objects/Object2IntMap;"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "it/unimi/dsi/fastutil/objects/Object2IntMap",
+                "object2IntEntrySet",
+                "()Lit/unimi/dsi/fastutil/objects/ObjectSet;",
+                true));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/lang/Iterable",
+                "iterator",
+                "()Ljava/util/Iterator;",
+                true));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 5));
+        code.add(scanLoop);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Iterator",
+                "hasNext",
+                "()Z",
+                true));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, returnBest));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Iterator",
+                "next",
+                "()Ljava/lang/Object;",
+                true));
+        code.add(new TypeInsnNode(
+                Opcodes.CHECKCAST,
+                "it/unimi/dsi/fastutil/objects/Object2IntMap$Entry"));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 6));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 6));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Map$Entry",
+                "getKey",
+                "()Ljava/lang/Object;",
+                true));
+        code.add(new TypeInsnNode(Opcodes.CHECKCAST, "java/lang/Class"));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 7));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 7));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new JumpInsnNode(Opcodes.IF_ACMPEQ, scanLoop));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 7));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/lang/Class",
+                "isAssignableFrom",
+                "(Ljava/lang/Class;)Z",
+                false));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, scanLoop));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 6));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "it/unimi/dsi/fastutil/objects/Object2IntMap$Entry",
+                "getIntValue",
+                "()I",
+                true));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 8));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 8));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 4));
+        code.add(new JumpInsnNode(Opcodes.IF_ICMPLE, scanLoop));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 8));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 4));
+        code.add(new JumpInsnNode(Opcodes.GOTO, scanLoop));
+        code.add(returnBest);
+        code.add(new VarInsnNode(Opcodes.ILOAD, 4));
+        code.add(new InsnNode(Opcodes.IRETURN));
+
+        replace(method, code, 4, 9);
+        addCachedIdByNameHelper(node);
+        writeComputeFrames(node, output);
+    }
+
+    private static void addCachedIdByNameHelper(ClassNode node) {
+        node.methods.removeIf(method -> method.name.equals("gaius$getCachedIdByName")
+                && method.desc.equals("(Ljava/lang/Class;)I"));
+        MethodNode method = new MethodNode(
+                Opcodes.ACC_PRIVATE | Opcodes.ACC_SYNTHETIC,
+                "gaius$getCachedIdByName",
+                "(Ljava/lang/Class;)I",
+                null,
+                null);
+        InsnList code = method.instructions;
+        LabelNode loop = new LabelNode();
+        LabelNode missing = new LabelNode();
+
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/lang/Class",
+                "getName",
+                "()Ljava/lang/String;",
+                false));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 2));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/util/ClassTreeIdRegistry",
+                "classToLastIdCache",
+                "Lit/unimi/dsi/fastutil/objects/Object2IntMap;"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "it/unimi/dsi/fastutil/objects/Object2IntMap",
+                "object2IntEntrySet",
+                "()Lit/unimi/dsi/fastutil/objects/ObjectSet;",
+                true));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/lang/Iterable",
+                "iterator",
+                "()Ljava/util/Iterator;",
+                true));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 3));
+        code.add(loop);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Iterator",
+                "hasNext",
+                "()Z",
+                true));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, missing));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Iterator",
+                "next",
+                "()Ljava/lang/Object;",
+                true));
+        code.add(new TypeInsnNode(
+                Opcodes.CHECKCAST,
+                "it/unimi/dsi/fastutil/objects/Object2IntMap$Entry"));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 4));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Map$Entry",
+                "getKey",
+                "()Ljava/lang/Object;",
+                true));
+        code.add(new TypeInsnNode(Opcodes.CHECKCAST, "java/lang/Class"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/lang/Class",
+                "getName",
+                "()Ljava/lang/String;",
+                false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/lang/String",
+                "equals",
+                "(Ljava/lang/Object;)Z",
+                false));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, loop));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "it/unimi/dsi/fastutil/objects/Object2IntMap$Entry",
+                "getIntValue",
+                "()I",
+                true));
+        code.add(new InsnNode(Opcodes.IRETURN));
+        code.add(missing);
+        code.add(new InsnNode(Opcodes.ICONST_M1));
+        code.add(new InsnNode(Opcodes.IRETURN));
+        method.maxStack = 2;
+        method.maxLocals = 5;
+        node.methods.add(method);
+    }
+
+    private static void patchNetworkEncoderMatchers(String jar, Path root) throws IOException {
+        patchAcceptOutboundMessage(jar,
+                root.resolve("net/minecraft/network/PacketEncoder.class"),
+                "net/minecraft/network/PacketEncoder",
+                "net/minecraft/network/protocol/Packet");
+        patchAcceptOutboundMessage(jar,
+                root.resolve("net/minecraft/network/PacketBundleUnpacker.class"),
+                "net/minecraft/network/PacketBundleUnpacker",
+                "net/minecraft/network/protocol/Packet");
+        patchAcceptOutboundMessage(jar,
+                root.resolve("net/minecraft/network/Varint21LengthFieldPrepender.class"),
+                "net/minecraft/network/Varint21LengthFieldPrepender",
+                "io/netty/buffer/ByteBuf");
+        patchAcceptOutboundMessage(jar,
+                root.resolve("net/minecraft/network/CipherEncoder.class"),
+                "net/minecraft/network/CipherEncoder",
+                "io/netty/buffer/ByteBuf");
+        patchAcceptOutboundMessage(jar,
+                root.resolve("net/minecraft/network/CompressionEncoder.class"),
+                "net/minecraft/network/CompressionEncoder",
+                "io/netty/buffer/ByteBuf");
+    }
+
+    private static void patchAcceptOutboundMessage(
+            String jar, Path output, String owner, String acceptedInternalName) throws IOException {
+        ClassNode node = read(jar, owner + ".class");
+        node.methods.removeIf(method -> method.name.equals("acceptOutboundMessage")
+                && method.desc.equals("(Ljava/lang/Object;)Z"));
+        MethodNode method = new MethodNode(
+                Opcodes.ACC_PUBLIC,
+                "acceptOutboundMessage",
+                "(Ljava/lang/Object;)Z",
+                null,
+                null);
+        method.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        method.instructions.add(new TypeInsnNode(Opcodes.INSTANCEOF, acceptedInternalName));
+        method.instructions.add(new InsnNode(Opcodes.IRETURN));
+        method.maxStack = 1;
+        method.maxLocals = 2;
+        node.methods.add(method);
+        write(node, output);
+    }
+
     private static void patchGlDevice(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "com/mojang/blaze3d/opengl/GlDevice.class");
         String owner = "com/mojang/blaze3d/opengl/GlDevice";
@@ -180,6 +587,50 @@ public final class MinecraftClientPatcher {
             throw new IllegalStateException("GlDevice capability patch point was not found");
         }
         write(node, output);
+    }
+
+    private static void patchGlConstWebGLTextureFormats(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "com/mojang/blaze3d/opengl/GlConst.class");
+        MethodNode method = find(node, "toGlInternalId",
+                "(Lcom/mojang/blaze3d/textures/TextureFormat;)I");
+        boolean patched = false;
+        for (var instruction = method.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof LdcInsnNode ldc
+                    && Integer.valueOf(33329).equals(ldc.cst)) {
+                // RED8I is GL_R8I on desktop. WebGL rejects sampling an integer
+                // texture through Minecraft's ordinary sampler2D pipelines, so
+                // normalize it to GL_R8 for the browser build.
+                ldc.cst = 33321;
+                patched = true;
+            }
+        }
+        if (!patched) {
+            throw new IllegalStateException("GlConst RED8I internal format patch point was not found");
+        }
+        write(node, output);
+    }
+
+    private static void patchTextureFormatWebGLColorAspect(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "com/mojang/blaze3d/textures/TextureFormat.class");
+        MethodNode method = find(node, "hasColorAspect", "()Z");
+        InsnList code = new InsnList();
+        LabelNode depth = new LabelNode();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETSTATIC,
+                "com/mojang/blaze3d/textures/TextureFormat",
+                "DEPTH32",
+                "Lcom/mojang/blaze3d/textures/TextureFormat;"));
+        code.add(new JumpInsnNode(Opcodes.IF_ACMPEQ, depth));
+        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(new InsnNode(Opcodes.IRETURN));
+        code.add(depth);
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new InsnNode(Opcodes.IRETURN));
+        replace(method, code, 2, 1);
+        writeComputeFrames(node, output);
     }
 
     private static void patchGlStateManagerTextureBinding(String jar, Path output) throws IOException {
@@ -1252,6 +1703,90 @@ public final class MinecraftClientPatcher {
         write(node, output);
     }
 
+    private static void patchClientPacketListenerLoadingDiagnostics(String jar, Path output)
+            throws IOException {
+        ClassNode node = read(jar, "net/minecraft/client/multiplayer/ClientPacketListener.class");
+        boolean handleLoginHooked = false;
+        boolean startWaitingHooked = false;
+        boolean levelChunkHooked = false;
+        boolean batchStartHooked = false;
+        boolean batchFinishedHooked = false;
+        boolean tickClientLoadHooked = false;
+        boolean loadingPacketsHooked = false;
+        boolean notifyPlayerLoadedHooked = false;
+
+        for (MethodNode method : node.methods) {
+            if (method.name.equals("handleLogin")
+                    && method.desc.equals("(Lnet/minecraft/network/protocol/game/ClientboundLoginPacket;)V")) {
+                method.instructions.insert(minecraftEvent("client.handleLogin"));
+                method.maxStack = Math.max(method.maxStack, 1);
+                handleLoginHooked = true;
+            } else if (method.name.equals("startWaitingForNewLevel")
+                    && method.desc.equals("(Lnet/minecraft/client/player/LocalPlayer;"
+                            + "Lnet/minecraft/client/multiplayer/ClientLevel;"
+                            + "Lnet/minecraft/client/gui/screens/LevelLoadingScreen$Reason;)V")) {
+                method.instructions.insert(minecraftEvent("client.startWaitingForNewLevel"));
+                method.maxStack = Math.max(method.maxStack, 1);
+                startWaitingHooked = true;
+            } else if (method.name.equals("handleLevelChunkWithLight")
+                    && method.desc.equals("(Lnet/minecraft/network/protocol/game/"
+                            + "ClientboundLevelChunkWithLightPacket;)V")) {
+                method.instructions.insert(minecraftEvent("client.handleLevelChunkWithLight"));
+                method.maxStack = Math.max(method.maxStack, 1);
+                levelChunkHooked = true;
+            } else if (method.name.equals("handleChunkBatchStart")
+                    && method.desc.equals("(Lnet/minecraft/network/protocol/game/"
+                            + "ClientboundChunkBatchStartPacket;)V")) {
+                method.instructions.insert(minecraftEvent("client.handleChunkBatchStart"));
+                method.maxStack = Math.max(method.maxStack, 1);
+                batchStartHooked = true;
+            } else if (method.name.equals("handleChunkBatchFinished")
+                    && method.desc.equals("(Lnet/minecraft/network/protocol/game/"
+                            + "ClientboundChunkBatchFinishedPacket;)V")) {
+                method.instructions.insert(minecraftEvent("client.handleChunkBatchFinished"));
+                method.maxStack = Math.max(method.maxStack, 1);
+                batchFinishedHooked = true;
+            } else if (method.name.equals("notifyPlayerLoaded")
+                    && method.desc.equals("()V")) {
+                method.instructions.insert(minecraftEvent("client.notifyPlayerLoaded"));
+                method.maxStack = Math.max(method.maxStack, 1);
+                notifyPlayerLoadedHooked = true;
+            }
+
+            for (var instruction = method.instructions.getFirst();
+                    instruction != null;
+                    instruction = instruction.getNext()) {
+                if (instruction instanceof MethodInsnNode call
+                        && call.owner.equals("net/minecraft/client/multiplayer/LevelLoadTracker")
+                        && call.name.equals("tickClientLoad")
+                        && call.desc.equals("()V")) {
+                    method.instructions.insertBefore(call, minecraftEvent("client.tickClientLoad"));
+                    method.maxStack = Math.max(method.maxStack, 2);
+                    tickClientLoadHooked = true;
+                } else if (instruction instanceof MethodInsnNode call
+                        && call.owner.equals("net/minecraft/client/multiplayer/LevelLoadTracker")
+                        && call.name.equals("loadingPacketsReceived")
+                        && call.desc.equals("()V")) {
+                    method.instructions.insertBefore(call, minecraftEvent("client.loadingPacketsReceived"));
+                    method.maxStack = Math.max(method.maxStack, 2);
+                    loadingPacketsHooked = true;
+                }
+            }
+        }
+
+        if (!handleLoginHooked
+                || !startWaitingHooked
+                || !levelChunkHooked
+                || !batchStartHooked
+                || !batchFinishedHooked
+                || !tickClientLoadHooked
+                || !loadingPacketsHooked
+                || !notifyPlayerLoadedHooked) {
+            throw new IllegalStateException("ClientPacketListener loading diagnostic patch points were not found");
+        }
+        write(node, output);
+    }
+
     private static void patchFreeTypeUtil(String jar, Path output) throws IOException {
         ClassNode node = read(jar,
                 "net/minecraft/client/gui/font/providers/FreeTypeUtil.class");
@@ -1799,6 +2334,7 @@ public final class MinecraftClientPatcher {
         constructor.visitInsn(Opcodes.RETURN);
         constructor.visitMaxs(1, 1);
         constructor.visitEnd();
+        emptyMethod(unsafe, "putByte", "(Ljava/lang/Object;JB)V", 5);
         unsafe.visitEnd();
         writeBytes(root.resolve("sun/misc/Unsafe.class"), unsafe.toByteArray());
     }
@@ -1846,6 +2382,49 @@ public final class MinecraftClientPatcher {
         doFinal.visitInsn(Opcodes.ARETURN);
         doFinal.visitMaxs(1, 2);
         doFinal.visitEnd();
+        var getOutputSize = cipher.visitMethod(
+                Opcodes.ACC_PUBLIC, "getOutputSize", "(I)I", null, null);
+        getOutputSize.visitCode();
+        getOutputSize.visitVarInsn(Opcodes.ILOAD, 1);
+        getOutputSize.visitInsn(Opcodes.IRETURN);
+        getOutputSize.visitMaxs(1, 2);
+        getOutputSize.visitEnd();
+        var update = cipher.visitMethod(
+                Opcodes.ACC_PUBLIC, "update", "([BII[B)I", null, null);
+        update.visitCode();
+        update.visitVarInsn(Opcodes.ALOAD, 1);
+        update.visitVarInsn(Opcodes.ILOAD, 2);
+        update.visitVarInsn(Opcodes.ALOAD, 4);
+        update.visitInsn(Opcodes.ICONST_0);
+        update.visitVarInsn(Opcodes.ILOAD, 3);
+        update.visitMethodInsn(
+                Opcodes.INVOKESTATIC,
+                "java/lang/System",
+                "arraycopy",
+                "(Ljava/lang/Object;ILjava/lang/Object;II)V",
+                false);
+        update.visitVarInsn(Opcodes.ILOAD, 3);
+        update.visitInsn(Opcodes.IRETURN);
+        update.visitMaxs(5, 5);
+        update.visitEnd();
+        var updateWithOffset = cipher.visitMethod(
+                Opcodes.ACC_PUBLIC, "update", "([BII[BI)I", null, null);
+        updateWithOffset.visitCode();
+        updateWithOffset.visitVarInsn(Opcodes.ALOAD, 1);
+        updateWithOffset.visitVarInsn(Opcodes.ILOAD, 2);
+        updateWithOffset.visitVarInsn(Opcodes.ALOAD, 4);
+        updateWithOffset.visitVarInsn(Opcodes.ILOAD, 5);
+        updateWithOffset.visitVarInsn(Opcodes.ILOAD, 3);
+        updateWithOffset.visitMethodInsn(
+                Opcodes.INVOKESTATIC,
+                "java/lang/System",
+                "arraycopy",
+                "(Ljava/lang/Object;ILjava/lang/Object;II)V",
+                false);
+        updateWithOffset.visitVarInsn(Opcodes.ILOAD, 3);
+        updateWithOffset.visitInsn(Opcodes.IRETURN);
+        updateWithOffset.visitMaxs(5, 6);
+        updateWithOffset.visitEnd();
         cipher.visitEnd();
         writeBytes(root.resolve("javax/crypto/Cipher.class"), cipher.toByteArray());
 
@@ -2025,6 +2604,18 @@ public final class MinecraftClientPatcher {
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new VarInsnNode(loadOpcode, local));
         code.add(new FieldInsnNode(Opcodes.PUTFIELD, owner, field, descriptor));
+    }
+
+    private static InsnList minecraftEvent(String event) {
+        InsnList code = new InsnList();
+        code.add(new LdcInsnNode(event));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/opengl/BrowserOpenGL",
+                "reportMinecraftEvent",
+                "(Ljava/lang/String;)V",
+                false));
+        return code;
     }
 
     private static void getter(

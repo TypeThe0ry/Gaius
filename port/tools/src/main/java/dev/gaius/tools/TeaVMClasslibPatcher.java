@@ -11,10 +11,15 @@ import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
+import org.objectweb.asm.tree.IntInsnNode;
+import org.objectweb.asm.tree.JumpInsnNode;
+import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.TypeInsnNode;
 import org.objectweb.asm.tree.VarInsnNode;
 
 /** Adds modern JDK methods missing from TeaVM 0.15's class library. */
@@ -322,18 +327,141 @@ public final class TeaVMClasslibPatcher {
         for (Map.Entry<String, MethodSpec[]> patch : patches.entrySet()) {
             patchClass(jar, root, patch.getKey(), patch.getValue());
         }
+        patchThrowableGetSuppressed(jar, root);
+    }
+
+    private static void patchThrowableGetSuppressed(String jarPath, Path root) throws IOException {
+        String className = "org/teavm/classlib/java/lang/TThrowable";
+        ClassNode node = readClass(jarPath, className);
+        MethodNode method = node.methods.stream()
+                .filter(candidate -> candidate.name.equals("getSuppressed0")
+                        && candidate.desc.equals("()[Lorg/teavm/classlib/java/lang/TThrowable;"))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("TThrowable.getSuppressed0 was not found"));
+
+        LabelNode notNull = new LabelNode();
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                className,
+                "suppressed",
+                "[Lorg/teavm/classlib/java/lang/TThrowable;"));
+        code.add(new InsnNode(Opcodes.DUP));
+        code.add(new JumpInsnNode(Opcodes.IFNONNULL, notNull));
+        code.add(new InsnNode(Opcodes.POP));
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new TypeInsnNode(Opcodes.ANEWARRAY, className));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        code.add(notNull);
+        code.add(new InsnNode(Opcodes.DUP));
+        code.add(new InsnNode(Opcodes.ARRAYLENGTH));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/teavm/classlib/java/util/TArrays",
+                "copyOf",
+                "([Ljava/lang/Object;I)[Ljava/lang/Object;",
+                false));
+        code.add(new TypeInsnNode(
+                Opcodes.CHECKCAST,
+                "[Lorg/teavm/classlib/java/lang/TThrowable;"));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        method.instructions = code;
+        method.tryCatchBlocks.clear();
+        method.localVariables = null;
+        method.maxStack = 2;
+        method.maxLocals = 1;
+
+        patchThrowableAddSuppressed(node, className);
+        writeClass(root, className, node);
+    }
+
+    private static void patchThrowableAddSuppressed(ClassNode node, String className) {
+        MethodNode method = node.methods.stream()
+                .filter(candidate -> candidate.name.equals("addSuppressed")
+                        && candidate.desc.equals("(Lorg/teavm/classlib/java/lang/TThrowable;)V"))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("TThrowable.addSuppressed was not found"));
+        LabelNode enabled = new LabelNode();
+        LabelNode hasSuppressed = new LabelNode();
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, className, "suppressionEnabled", "Z"));
+        code.add(new JumpInsnNode(Opcodes.IFNE, enabled));
+        code.add(new InsnNode(Opcodes.RETURN));
+        code.add(enabled);
+
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                className,
+                "suppressed",
+                "[Lorg/teavm/classlib/java/lang/TThrowable;"));
+        code.add(new JumpInsnNode(Opcodes.IFNONNULL, hasSuppressed));
+
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(new TypeInsnNode(Opcodes.ANEWARRAY, className));
+        code.add(new InsnNode(Opcodes.DUP));
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new InsnNode(Opcodes.AASTORE));
+        code.add(new FieldInsnNode(
+                Opcodes.PUTFIELD,
+                className,
+                "suppressed",
+                "[Lorg/teavm/classlib/java/lang/TThrowable;"));
+        code.add(new InsnNode(Opcodes.RETURN));
+
+        code.add(hasSuppressed);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                className,
+                "suppressed",
+                "[Lorg/teavm/classlib/java/lang/TThrowable;"));
+        code.add(new InsnNode(Opcodes.DUP));
+        code.add(new InsnNode(Opcodes.ARRAYLENGTH));
+        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(new InsnNode(Opcodes.IADD));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/teavm/classlib/java/util/TArrays",
+                "copyOf",
+                "([Ljava/lang/Object;I)[Ljava/lang/Object;",
+                false));
+        code.add(new TypeInsnNode(
+                Opcodes.CHECKCAST,
+                "[Lorg/teavm/classlib/java/lang/TThrowable;"));
+        code.add(new FieldInsnNode(
+                Opcodes.PUTFIELD,
+                className,
+                "suppressed",
+                "[Lorg/teavm/classlib/java/lang/TThrowable;"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                className,
+                "suppressed",
+                "[Lorg/teavm/classlib/java/lang/TThrowable;"));
+        code.add(new InsnNode(Opcodes.DUP));
+        code.add(new InsnNode(Opcodes.ARRAYLENGTH));
+        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(new InsnNode(Opcodes.ISUB));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new InsnNode(Opcodes.AASTORE));
+        code.add(new InsnNode(Opcodes.RETURN));
+        method.instructions = code;
+        method.tryCatchBlocks.clear();
+        method.localVariables = null;
+        method.maxStack = 5;
+        method.maxLocals = 2;
     }
 
     private static void patchClass(
             String jarPath, Path root, String className, MethodSpec[] methods) throws IOException {
-        byte[] input;
-        try (ZipFile jar = new ZipFile(jarPath)) {
-            try (var stream = jar.getInputStream(jar.getEntry(className + ".class"))) {
-                input = stream.readAllBytes();
-            }
-        }
-        ClassNode node = new ClassNode();
-        new ClassReader(input).accept(node, 0);
+        ClassNode node = readClass(jarPath, className);
         for (MethodSpec spec : methods) {
             boolean exists = node.methods.stream()
                     .anyMatch(method -> method.name.equals(spec.name) && method.desc.equals(spec.desc));
@@ -344,6 +472,22 @@ public final class TeaVMClasslibPatcher {
                 node.methods.add(spec.create());
             }
         }
+        writeClass(root, className, node);
+    }
+
+    private static ClassNode readClass(String jarPath, String className) throws IOException {
+        byte[] input;
+        try (ZipFile jar = new ZipFile(jarPath)) {
+            try (var stream = jar.getInputStream(jar.getEntry(className + ".class"))) {
+                input = stream.readAllBytes();
+            }
+        }
+        ClassNode node = new ClassNode();
+        new ClassReader(input).accept(node, 0);
+        return node;
+    }
+
+    private static void writeClass(Path root, String className, ClassNode node) throws IOException {
         ClassWriter writer = new ClassWriter(0);
         node.accept(writer);
         Path output = root.resolve(className + ".class");
