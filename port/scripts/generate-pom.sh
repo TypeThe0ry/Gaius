@@ -13,6 +13,31 @@ main_class="${GAIUS_MAIN_CLASS:-net.minecraft.client.main.Main}"
 target_directory="${GAIUS_TARGET_DIRECTORY:-$root/port/web/dist}"
 target_file="${GAIUS_TARGET_FILE:-classes.js}"
 patched_classlib="$root/port/work/overlays/teavm-classlib-$teavm_version-gaius.jar"
+optimization_level="${GAIUS_TEA_OPTIMIZATION_LEVEL:-SIMPLE}"
+source_maps_generated="${GAIUS_SOURCE_MAPS:-true}"
+debug_information_generated="${GAIUS_DEBUG_INFO:-true}"
+minifying="${GAIUS_MINIFYING:-false}"
+short_file_names="${GAIUS_SHORT_FILE_NAMES:-false}"
+assertions_removed="${GAIUS_ASSERTIONS_REMOVED:-false}"
+
+case "$optimization_level" in
+  SIMPLE|ADVANCED|FULL) ;;
+  *)
+    echo "Invalid GAIUS_TEA_OPTIMIZATION_LEVEL: $optimization_level (expected SIMPLE, ADVANCED, or FULL)" >&2
+    exit 1
+    ;;
+esac
+
+for boolean_name in source_maps_generated debug_information_generated minifying short_file_names assertions_removed; do
+  boolean_value="${!boolean_name}"
+  case "$boolean_value" in
+    true|false) ;;
+    *)
+      echo "Invalid boolean value for $boolean_name: $boolean_value (expected true or false)" >&2
+      exit 1
+      ;;
+  esac
+done
 
 if [[ ! -f "$metadata" || ! -f "$client" || ! -f "$patched_classlib" ]]; then
   echo "Run fetch-version.sh and remap-client.sh first" >&2
@@ -181,9 +206,12 @@ EOF
               <mainClass>$main_class</mainClass>
               <targetDirectory>$target_directory</targetDirectory>
               <targetFileName>$target_file</targetFileName>
-              <optimizationLevel>SIMPLE</optimizationLevel>
-              <sourceMapsGenerated>true</sourceMapsGenerated>
-              <debugInformationGenerated>true</debugInformationGenerated>
+              <optimizationLevel>$optimization_level</optimizationLevel>
+              <sourceMapsGenerated>$source_maps_generated</sourceMapsGenerated>
+              <debugInformationGenerated>$debug_information_generated</debugInformationGenerated>
+              <minifying>$minifying</minifying>
+              <shortFileNames>$short_file_names</shortFileNames>
+              <assertionsRemoved>$assertions_removed</assertionsRemoved>
               <stopOnErrors>true</stopOnErrors>
               <maxTopLevelNames>10000</maxTopLevelNames>
             </configuration>

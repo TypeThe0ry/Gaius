@@ -51,6 +51,7 @@ classpath="$upstream"
 for artifact in teavm-interop teavm-jso teavm-jso-apis teavm-core; do
   classpath="$classpath:$HOME/.m2/repository/org/teavm/$artifact/$teavm_version/$artifact-$teavm_version.jar"
 done
+classpath="$classpath:$HOME/.m2/repository/com/jcraft/jzlib/1.1.3/jzlib-1.1.3.jar"
 classpath="$classpath:$(cat "$work/classpath.txt")"
 
 javac --release 21 -proc:none -classpath "$classpath" -d "$classes" "${sources[@]}"
@@ -329,6 +330,14 @@ java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
 jar --update \
   --file "$overlay_work/libraries/$lwjgl_path" \
   -C "$lwjgl_patch_classes" .
+find "$lwjgl_patch_classes" -type f -delete
+java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
+  dev.gaius.tools.LwjglAPIUtilBrowserPatcher \
+  "$overlay_work/libraries/$lwjgl_path" \
+  "$lwjgl_patch_classes"
+jar --update \
+  --file "$overlay_work/libraries/$lwjgl_path" \
+  -C "$lwjgl_patch_classes" .
 
 glfw_path="org/lwjgl/lwjgl-glfw/3.3.3/lwjgl-glfw-3.3.3.jar"
 build_library_overlay \
@@ -426,7 +435,27 @@ java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
   "$stb_patches"
 jar --update --file "$overlay_work/libraries/$stb_path" -C "$stb_patches" .
 
-for lwjgl_module in lwjgl-openal lwjgl-tinyfd; do
+openal_path="org/lwjgl/lwjgl-openal/3.3.3/lwjgl-openal-3.3.3.jar"
+build_library_overlay \
+  lwjgl-openal \
+  "$work/libraries/$openal_path" \
+  "$root/port/overrides/libraries/lwjgl-openal/src/main/java" \
+  "$overlay_work/libraries/$openal_path"
+openal_patches="$overlay_work/library-patches/lwjgl-openal"
+find "$openal_patches" -type f -delete
+java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
+  dev.gaius.tools.LwjglOpenALBrowserPatcher \
+  "$overlay_work/libraries/$openal_path" \
+  "$openal_patches"
+jar --update --file "$overlay_work/libraries/$openal_path" -C "$openal_patches" .
+find "$openal_patches" -type f -delete
+java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
+  dev.gaius.tools.NativeMethodFallbackPatcher \
+  "$overlay_work/libraries/$openal_path" \
+  "$openal_patches"
+jar --update --file "$overlay_work/libraries/$openal_path" -C "$openal_patches" .
+
+for lwjgl_module in lwjgl-tinyfd; do
   module_path="org/lwjgl/$lwjgl_module/3.3.3/$lwjgl_module-3.3.3.jar"
   module_output="$overlay_work/libraries/$module_path"
   module_patches="$overlay_work/library-patches/$lwjgl_module"

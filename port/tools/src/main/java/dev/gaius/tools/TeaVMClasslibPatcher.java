@@ -10,6 +10,7 @@ import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
+import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.InsnList;
@@ -328,6 +329,202 @@ public final class TeaVMClasslibPatcher {
             patchClass(jar, root, patch.getKey(), patch.getValue());
         }
         patchThrowableGetSuppressed(jar, root);
+        patchDefaultFileSystemProviderOutputStream(jar, root);
+    }
+
+    private static void patchDefaultFileSystemProviderOutputStream(String jarPath, Path root) throws IOException {
+        String className = "org/teavm/classlib/java/nio/file/impl/TDefaultFileSystemProvider";
+        String defaultPathClass = "org/teavm/classlib/java/nio/file/impl/TDefaultPath";
+        ClassNode node = readClass(jarPath, className);
+        MethodNode method = node.methods.stream()
+                .filter(candidate -> candidate.name.equals("newOutputStream")
+                        && candidate.desc.equals("(Lorg/teavm/classlib/java/nio/file/TPath;"
+                                + "[Lorg/teavm/classlib/java/nio/file/TOpenOption;)Ljava/io/OutputStream;"))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(
+                        "TDefaultFileSystemProvider.newOutputStream was not found"));
+
+        int defaultPathLocal = -1;
+        for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+            if (insn instanceof TypeInsnNode typeInsn
+                    && typeInsn.getOpcode() == Opcodes.CHECKCAST
+                    && typeInsn.desc.equals(defaultPathClass)) {
+                AbstractInsnNode next = insn.getNext();
+                while (next != null && next.getOpcode() < 0) {
+                    next = next.getNext();
+                }
+                if (next instanceof VarInsnNode varInsn && varInsn.getOpcode() == Opcodes.ASTORE) {
+                    defaultPathLocal = varInsn.var;
+                    break;
+                }
+            }
+        }
+        if (defaultPathLocal < 0) {
+            throw new IllegalStateException(
+                    "TDefaultFileSystemProvider.newOutputStream defaultPath local was not found");
+        }
+
+        boolean patched = false;
+        for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+            if (!(insn instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKESPECIAL
+                    || !call.owner.equals("org/teavm/classlib/java/io/TFileOutputStream")
+                    || !call.name.equals("<init>")
+                    || !call.desc.equals("(Lorg/teavm/runtime/fs/VirtualFileAccessor;)V")) {
+                continue;
+            }
+            AbstractInsnNode accessorLoad = call.getPrevious();
+            while (accessorLoad != null && accessorLoad.getOpcode() < 0) {
+                accessorLoad = accessorLoad.getPrevious();
+            }
+            if (!(accessorLoad instanceof VarInsnNode varInsn) || varInsn.getOpcode() != Opcodes.ALOAD) {
+                throw new IllegalStateException(
+                        "TDefaultFileSystemProvider.newOutputStream TFileOutputStream accessor load was not found");
+            }
+            InsnList pathLoad = new InsnList();
+            pathLoad.add(new VarInsnNode(Opcodes.ALOAD, defaultPathLocal));
+            pathLoad.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    defaultPathClass,
+                    "pathString",
+                    "Ljava/lang/String;"));
+            method.instructions.insertBefore(accessorLoad, pathLoad);
+            call.desc = "(Ljava/lang/String;Lorg/teavm/runtime/fs/VirtualFileAccessor;)V";
+            method.maxStack = Math.max(method.maxStack, 5);
+            patched = true;
+        }
+        if (!patched) {
+            throw new IllegalStateException(
+                    "TDefaultFileSystemProvider.newOutputStream TFileOutputStream constructor call was not found");
+        }
+        patchDefaultFileSystemProviderDelete(node, defaultPathClass);
+        patchDefaultFileSystemProviderCopy(node, defaultPathClass);
+        patchDefaultFileSystemProviderMove(node, defaultPathClass);
+        writeClass(root, className, node);
+    }
+
+    private static void patchDefaultFileSystemProviderDelete(ClassNode node, String defaultPathClass) {
+        MethodNode method = node.methods.stream()
+                .filter(candidate -> candidate.name.equals("delete")
+                        && candidate.desc.equals("(Lorg/teavm/classlib/java/nio/file/TPath;)V"))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("TDefaultFileSystemProvider.delete was not found"));
+        AbstractInsnNode lastReturn = null;
+        for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+            if (insn.getOpcode() == Opcodes.RETURN) {
+                lastReturn = insn;
+            }
+        }
+        if (lastReturn == null) {
+            throw new IllegalStateException("TDefaultFileSystemProvider.delete success return was not found");
+        }
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                defaultPathClass,
+                "pathString",
+                "Ljava/lang/String;"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserFilePersistence",
+                "syncDelete",
+                "(Ljava/lang/String;)V",
+                false));
+        method.instructions.insertBefore(lastReturn, code);
+        method.maxStack = Math.max(method.maxStack, 5);
+    }
+
+    private static void patchDefaultFileSystemProviderCopy(ClassNode node, String defaultPathClass) {
+        MethodNode method = node.methods.stream()
+                .filter(candidate -> candidate.name.equals("copy")
+                        && candidate.desc.equals("(Lorg/teavm/classlib/java/nio/file/TPath;"
+                                + "Lorg/teavm/classlib/java/nio/file/TPath;"
+                                + "[Lorg/teavm/classlib/java/nio/file/TCopyOption;)V"))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("TDefaultFileSystemProvider.copy was not found"));
+        AbstractInsnNode lastReturn = null;
+        for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+            if (insn.getOpcode() == Opcodes.RETURN) {
+                lastReturn = insn;
+            }
+        }
+        if (lastReturn == null) {
+            throw new IllegalStateException("TDefaultFileSystemProvider.copy success return was not found");
+        }
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 6));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                defaultPathClass,
+                "pathString",
+                "Ljava/lang/String;"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserFilePersistence",
+                "syncFile",
+                "(Ljava/lang/String;)Z",
+                false));
+        code.add(new InsnNode(Opcodes.POP));
+        method.instructions.insertBefore(lastReturn, code);
+        method.maxStack = Math.max(method.maxStack, 5);
+    }
+
+    private static void patchDefaultFileSystemProviderMove(ClassNode node, String defaultPathClass) {
+        MethodNode method = node.methods.stream()
+                .filter(candidate -> candidate.name.equals("move")
+                        && candidate.desc.equals("(Lorg/teavm/classlib/java/nio/file/TPath;"
+                                + "Lorg/teavm/classlib/java/nio/file/TPath;"
+                                + "[Lorg/teavm/classlib/java/nio/file/TCopyOption;)V"))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("TDefaultFileSystemProvider.move was not found"));
+        boolean patched = false;
+        for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+            if (!(insn instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKEINTERFACE
+                    || !call.owner.equals("org/teavm/runtime/fs/VirtualFile")
+                    || !call.name.equals("adopt")
+                    || !call.desc.equals("(Lorg/teavm/runtime/fs/VirtualFile;Ljava/lang/String;)Z")) {
+                continue;
+            }
+            AbstractInsnNode pop = nextOpcodeInsn(call);
+            if (pop == null || pop.getOpcode() != Opcodes.POP) {
+                throw new IllegalStateException("TDefaultFileSystemProvider.move adopt POP was not found");
+            }
+            InsnList code = new InsnList();
+            code.add(new VarInsnNode(Opcodes.ALOAD, 5));
+            code.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    defaultPathClass,
+                    "pathString",
+                    "Ljava/lang/String;"));
+            code.add(new VarInsnNode(Opcodes.ALOAD, 6));
+            code.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    defaultPathClass,
+                    "pathString",
+                    "Ljava/lang/String;"));
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "dev/gaius/browser/BrowserFilePersistence",
+                    "syncMove",
+                    "(Ljava/lang/String;Ljava/lang/String;)V",
+                    false));
+            method.instructions.insert(pop, code);
+            method.maxStack = Math.max(method.maxStack, 5);
+            patched = true;
+        }
+        if (!patched) {
+            throw new IllegalStateException("TDefaultFileSystemProvider.move adopt call was not found");
+        }
+    }
+
+    private static AbstractInsnNode nextOpcodeInsn(AbstractInsnNode insn) {
+        AbstractInsnNode next = insn.getNext();
+        while (next != null && next.getOpcode() < 0) {
+            next = next.getNext();
+        }
+        return next;
     }
 
     private static void patchThrowableGetSuppressed(String jarPath, Path root) throws IOException {

@@ -142,6 +142,8 @@ public final class LwjglGlfwBrowserPatcher {
         add(result, "glfwGetInputMode", "(JI)I", "getInputMode");
         add(result, "glfwSetInputMode", "(JII)V", "setInputMode");
         add(result, "glfwRawMouseMotionSupported", "()Z", "rawMouseMotionSupported");
+        add(result, "glfwGetKeyName", "(II)Ljava/lang/String;", "getKeyName");
+        add(result, "glfwGetKeyScancode", "(I)I", "getKeyScancode");
         add(result, "glfwGetKey", "(JI)I", "getKey");
         add(result, "glfwGetMouseButton", "(JI)I", "getMouseButton");
         add(result, "glfwGetCursorPos", "(J[D[D)V", "getCursorPos");

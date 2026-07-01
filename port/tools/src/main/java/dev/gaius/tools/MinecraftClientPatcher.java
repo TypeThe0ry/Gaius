@@ -7,12 +7,14 @@ import java.util.zip.ZipFile;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.Opcodes;
+import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.IntInsnNode;
 import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.FieldNode;
+import org.objectweb.asm.tree.IincInsnNode;
 import org.objectweb.asm.tree.JumpInsnNode;
 import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.TypeInsnNode;
@@ -49,6 +51,7 @@ public final class MinecraftClientPatcher {
         patchMemoryDebug(args[0], root.resolve(
                 "net/minecraft/client/gui/components/debug/"
                         + "DebugEntryMemory$AllocationRateCalculator.class"));
+        patchMainBrowserStorageMount(args[0], root.resolve("net/minecraft/client/main/Main.class"));
         patchMinecraft(args[0], root.resolve("net/minecraft/client/Minecraft.class"));
         patchFreeTypeUtil(args[0], root.resolve(
                 "net/minecraft/client/gui/font/providers/FreeTypeUtil.class"));
@@ -56,6 +59,12 @@ public final class MinecraftClientPatcher {
                 "com/mojang/blaze3d/platform/DebugMemoryUntracker.class"));
         patchMinecraftServer(args[0], root.resolve(
                 "net/minecraft/server/MinecraftServer.class"));
+        patchIntegratedServerBrowserDistances(args[0], root.resolve(
+                "net/minecraft/client/server/IntegratedServer.class"));
+        patchPlayerListBrowserDistances(args[0], root.resolve(
+                "net/minecraft/server/players/PlayerList.class"));
+        patchServerLevelBrowserSafeDefaults(args[0], root.resolve(
+                "net/minecraft/server/level/ServerLevel.class"));
         patchChaseClient(args[0], root.resolve(
                 "net/minecraft/server/chase/ChaseClient.class"));
         patchLanServerPinger(args[0], root.resolve(
@@ -63,6 +72,12 @@ public final class MinecraftClientPatcher {
         patchHttpUtil(args[0], root.resolve("net/minecraft/util/HttpUtil.class"));
         patchUtilJarFileSystem(args[0], root.resolve("net/minecraft/util/Util.class"));
         patchResourceKeyRegistryRoot(args[0], root.resolve("net/minecraft/resources/ResourceKey.class"));
+        patchVanillaPackResourcesBuilder(args[0], root.resolve(
+                "net/minecraft/server/packs/VanillaPackResourcesBuilder.class"));
+        patchIndexedAssetSourceBrowserNoop(args[0], root.resolve(
+                "net/minecraft/client/resources/IndexedAssetSource.class"));
+        patchLocalTimeItemModelProperty(args[0], root.resolve(
+                "net/minecraft/client/renderer/item/properties/select/LocalTime.class"));
         patchLanServerDetector(args[0], root.resolve(
                 "net/minecraft/client/server/LanServerDetection$LanServerDetector.class"));
         patchPackWatcher(args[0], root.resolve(
@@ -89,8 +104,14 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/client/multiplayer/AccountProfileKeyPairManager.class"));
         patchCreateWorldScreenBrowserDefaults(args[0], root.resolve(
                 "net/minecraft/client/gui/screens/worldselection/CreateWorldScreen.class"));
+        patchWorldSelectionListTelemetry(args[0], root.resolve(
+                "net/minecraft/client/gui/screens/worldselection/WorldSelectionList.class"));
         patchBrowserAudio(args[0], root.resolve(
                 "com/mojang/blaze3d/audio/Library.class"));
+        patchBrowserAudioListener(args[0], root.resolve(
+                "com/mojang/blaze3d/audio/Listener.class"));
+        patchSoundEngineBrowserSilent(args[0], root.resolve(
+                "net/minecraft/client/sounds/SoundEngine.class"));
         patchGlslPreprocessor(args[0], root.resolve(
                 "com/mojang/blaze3d/preprocessor/GlslPreprocessor.class"));
         patchGlDevice(args[0], root.resolve(
@@ -103,6 +124,16 @@ public final class MinecraftClientPatcher {
                 "com/mojang/blaze3d/opengl/GlStateManager.class"));
         patchGlCommandEncoder(args[0], root.resolve(
                 "com/mojang/blaze3d/opengl/GlCommandEncoder.class"));
+        patchGameRendererBrowserAutoScreenshot(args[0], root.resolve(
+                "net/minecraft/client/renderer/GameRenderer.class"));
+        patchParticleGroupBrowserTickSafety(args[0], root.resolve(
+                "net/minecraft/client/particle/ParticleGroup.class"));
+        patchClientLevelBrowserBlockBreakEffects(args[0], root.resolve(
+                "net/minecraft/client/multiplayer/ClientLevel.class"));
+        patchLevelRendererBrowserBlockBreakProgress(args[0], root.resolve(
+                "net/minecraft/client/renderer/LevelRenderer.class"));
+        patchFaceBakeryBrowserFloatTolerance(args[0], root.resolve(
+                "net/minecraft/client/renderer/block/model/FaceBakery.class"));
         patchClientPacketListenerLoadingDiagnostics(args[0], root.resolve(
                 "net/minecraft/client/multiplayer/ClientPacketListener.class"));
         patchWorldUnloadTelemetry(args[0], root.resolve(
@@ -110,6 +141,103 @@ public final class MinecraftClientPatcher {
         generateSoundApiStubs(root);
         generateCryptoApiStubs(root);
         generateUnsafeStub(root);
+    }
+
+    private static void patchMainBrowserStorageMount(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/client/main/Main.class");
+        MethodNode main = find(node, "main", "([Ljava/lang/String;)V");
+        main.instructions.insert(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserFilePersistence",
+                "mount",
+                "()V",
+                false));
+        write(node, output);
+    }
+
+    private static void patchFaceBakeryBrowserFloatTolerance(String jar, Path output)
+            throws IOException {
+        ClassNode node = read(jar, "net/minecraft/client/renderer/block/model/FaceBakery.class");
+        MethodNode method = find(node, "findVertex", "([Lorg/joml/Vector3fc;IFFF)I");
+
+        InsnList code = new InsnList();
+        LabelNode loop = new LabelNode();
+        LabelNode next = new LabelNode();
+        LabelNode end = new LabelNode();
+
+        // Vanilla compares the baked winding vertex coordinates with exact fcmpl checks.
+        // In the TeaVM/WebGL path tiny float differences can appear during model baking,
+        // which turns valid quads into "Can't find vertex to swap" warnings and stalls
+        // startup. Keep the same search order, but accept a tight browser-safe epsilon.
+        code.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 5));
+
+        code.add(loop);
+        code.add(new VarInsnNode(Opcodes.ILOAD, 5));
+        code.add(new InsnNode(Opcodes.ICONST_4));
+        code.add(new JumpInsnNode(Opcodes.IF_ICMPGE, end));
+
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 5));
+        code.add(new InsnNode(Opcodes.AALOAD));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 6));
+
+        addFloatAbsGreaterThanEpsilonJump(code, 2, "x", next);
+        addFloatAbsGreaterThanEpsilonJump(code, 3, "y", next);
+        addFloatAbsGreaterThanEpsilonJump(code, 4, "z", next);
+
+        code.add(new VarInsnNode(Opcodes.ILOAD, 5));
+        code.add(new InsnNode(Opcodes.IRETURN));
+
+        code.add(next);
+        code.add(new IincInsnNode(5, 1));
+        code.add(new JumpInsnNode(Opcodes.GOTO, loop));
+
+        code.add(end);
+        code.add(new InsnNode(Opcodes.ICONST_M1));
+        code.add(new InsnNode(Opcodes.IRETURN));
+
+        replace(method, code, 4, 7);
+        write(node, output);
+    }
+
+    private static void addFloatAbsGreaterThanEpsilonJump(
+            InsnList code, int expectedLocal, String accessor, LabelNode jumpTarget) {
+        code.add(new VarInsnNode(Opcodes.FLOAD, expectedLocal));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 6));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "org/joml/Vector3fc",
+                accessor,
+                "()F",
+                true));
+        code.add(new InsnNode(Opcodes.FSUB));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "java/lang/Math",
+                "abs",
+                "(F)F",
+                false));
+        code.add(new LdcInsnNode(Float.valueOf(1.0E-4f)));
+        code.add(new InsnNode(Opcodes.FCMPG));
+        code.add(new JumpInsnNode(Opcodes.IFGT, jumpTarget));
+    }
+
+    private static void patchWorldSelectionListTelemetry(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/client/gui/screens/worldselection/WorldSelectionList.class");
+        MethodNode renderWidget = find(node, "renderWidget",
+                "(Lnet/minecraft/client/gui/GuiGraphics;IIF)V");
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/opengl/BrowserOpenGL",
+                "reportWorldSelectionList",
+                "(Ljava/lang/Object;)V",
+                false));
+        renderWidget.instructions.insert(code);
+        renderWidget.maxStack = Math.max(renderWidget.maxStack, 1);
+        write(node, output);
     }
 
     private static void patchCreateWorldScreenBrowserDefaults(String jar, Path output)
@@ -561,7 +689,7 @@ public final class MinecraftClientPatcher {
     private static void patchGlDevice(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "com/mojang/blaze3d/opengl/GlDevice.class");
         String owner = "com/mojang/blaze3d/opengl/GlDevice";
-        boolean found = false;
+        boolean patchedCapability = false;
         for (MethodNode method : node.methods) {
             if (method.name.equals("<clinit>") && method.desc.equals("()V")) {
                 InsnList code = new InsnList();
@@ -577,13 +705,31 @@ public final class MinecraftClientPatcher {
                     if (instruction.getOpcode() == Opcodes.RETURN) {
                         method.instructions.insertBefore(instruction, code);
                         method.maxStack = Math.max(method.maxStack, 1);
-                        found = true;
+                        patchedCapability = true;
                         break;
                     }
                 }
             }
         }
-        if (!found) {
+        MethodNode maxTextureSize = find(node, "getMaxSupportedTextureSize", "()I");
+        InsnList code = new InsnList();
+        code.add(new IntInsnNode(Opcodes.SIPUSH, 3379));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "com/mojang/blaze3d/opengl/GlStateManager",
+                "_getInteger",
+                "(I)I",
+                false));
+        code.add(new IntInsnNode(Opcodes.SIPUSH, 1024));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "java/lang/Math",
+                "max",
+                "(II)I",
+                false));
+        code.add(new InsnNode(Opcodes.IRETURN));
+        replace(maxTextureSize, code, 2, 0);
+        if (!patchedCapability) {
             throw new IllegalStateException("GlDevice capability patch point was not found");
         }
         write(node, output);
@@ -918,6 +1064,79 @@ public final class MinecraftClientPatcher {
         write(node, output);
     }
 
+    private static void patchBrowserAudioListener(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "com/mojang/blaze3d/audio/Listener.class");
+        String owner = "com/mojang/blaze3d/audio/Listener";
+        MethodNode setTransform = find(
+                node,
+                "setTransform",
+                "(Lcom/mojang/blaze3d/audio/ListenerTransform;)V");
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new FieldInsnNode(
+                Opcodes.PUTFIELD,
+                owner,
+                "transform",
+                "Lcom/mojang/blaze3d/audio/ListenerTransform;"));
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(setTransform, code, 2, 2);
+        write(node, output);
+    }
+
+    private static void patchSoundEngineBrowserSilent(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/client/sounds/SoundEngine.class");
+        String owner = "net/minecraft/client/sounds/SoundEngine";
+        MethodNode loadLibrary = find(node, "loadLibrary", "()V");
+
+        LabelNode done = new LabelNode();
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "loaded", "Z"));
+        code.add(new JumpInsnNode(Opcodes.IFNE, done));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                "library",
+                "Lcom/mojang/blaze3d/audio/Library;"));
+        code.add(new InsnNode(Opcodes.ACONST_NULL));
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "com/mojang/blaze3d/audio/Library",
+                "init",
+                "(Ljava/lang/String;Z)V",
+                false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                "preloadQueue",
+                "Ljava/util/List;"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/List",
+                "clear",
+                "()V",
+                true));
+        code.add(new LdcInsnNode("browser.sound.silent"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/opengl/BrowserOpenGL",
+                "reportMinecraftEvent",
+                "(Ljava/lang/String;)V",
+                false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(new FieldInsnNode(Opcodes.PUTFIELD, owner, "loaded", "Z"));
+        code.add(done);
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(loadLibrary, code, 3, 1);
+
+        write(node, output);
+    }
+
     private static void patchClientShutdownWatchdog(String jar, Path output) throws IOException {
         ClassNode node = read(
                 jar, "com/mojang/blaze3d/platform/ClientShutdownWatchdog.class");
@@ -1128,6 +1347,239 @@ public final class MinecraftClientPatcher {
         code.add(new InsnNode(Opcodes.ICONST_0));
         code.add(new InsnNode(Opcodes.IRETURN));
         replace(method, code, 1, 2);
+        write(node, output);
+    }
+
+    private static void patchGameRendererBrowserAutoScreenshot(String jar, Path output)
+            throws IOException {
+        ClassNode node = read(jar, "net/minecraft/client/renderer/GameRenderer.class");
+        MethodNode method = find(node, "tryTakeScreenshotIfNeeded", "()V");
+        InsnList code = new InsnList();
+        LabelNode done = new LabelNode();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/GameRenderer",
+                "hasWorldScreenshot",
+                "Z"));
+        code.add(new JumpInsnNode(Opcodes.IFNE, done));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(new FieldInsnNode(
+                Opcodes.PUTFIELD,
+                "net/minecraft/client/renderer/GameRenderer",
+                "hasWorldScreenshot",
+                "Z"));
+        code.add(new LdcInsnNode("browser.autoWorldScreenshot.disabled"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/opengl/BrowserOpenGL",
+                "reportMinecraftEvent",
+                "(Ljava/lang/String;)V",
+                false));
+        code.add(done);
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(method, code, 2, 1);
+        write(node, output);
+    }
+
+    private static void patchParticleGroupBrowserTickSafety(String jar, Path output)
+            throws IOException {
+        ClassNode node = read(jar, "net/minecraft/client/particle/ParticleGroup.class");
+        MethodNode method = find(node, "tickParticle",
+                "(Lnet/minecraft/client/particle/Particle;)V");
+        LabelNode start = new LabelNode();
+        LabelNode end = new LabelNode();
+        LabelNode handler = new LabelNode();
+        LabelNode done = new LabelNode();
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new JumpInsnNode(Opcodes.IFNULL, done));
+        code.add(start);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/particle/Particle",
+                "tick",
+                "()V",
+                false));
+        code.add(end);
+        code.add(new JumpInsnNode(Opcodes.GOTO, done));
+        code.add(handler);
+        code.add(new VarInsnNode(Opcodes.ASTORE, 2));
+        code.add(new LdcInsnNode("particle.tick"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/opengl/BrowserOpenGL",
+                "reportMinecraftThrowable",
+                "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+                false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new JumpInsnNode(Opcodes.IFNULL, done));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/particle/Particle",
+                "remove",
+                "()V",
+                false));
+        code.add(done);
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(method, code, 2, 3);
+        method.tryCatchBlocks.add(new org.objectweb.asm.tree.TryCatchBlockNode(
+                start, end, handler, "java/lang/Throwable"));
+        patchParticleGroupTickParticlesLoop(node);
+        patchParticleGroupAddNullGuard(node);
+        writeComputeFrames(node, output);
+    }
+
+    private static void patchParticleGroupTickParticlesLoop(ClassNode node) {
+        MethodNode method = find(node, "tickParticles", "()V");
+        InsnList code = new InsnList();
+        LabelNode loop = new LabelNode();
+        LabelNode tick = new LabelNode();
+        LabelNode alive = new LabelNode();
+        LabelNode done = new LabelNode();
+
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/particle/ParticleGroup",
+                "particles",
+                "Ljava/util/Queue;"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Queue",
+                "isEmpty",
+                "()Z",
+                true));
+        code.add(new JumpInsnNode(Opcodes.IFNE, done));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/particle/ParticleGroup",
+                "particles",
+                "Ljava/util/Queue;"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Queue",
+                "iterator",
+                "()Ljava/util/Iterator;",
+                true));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 1));
+        code.add(loop);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Iterator",
+                "hasNext",
+                "()Z",
+                true));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, done));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Iterator",
+                "next",
+                "()Ljava/lang/Object;",
+                true));
+        code.add(new TypeInsnNode(
+                Opcodes.CHECKCAST,
+                "net/minecraft/client/particle/Particle"));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 2));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new JumpInsnNode(Opcodes.IFNONNULL, tick));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Iterator",
+                "remove",
+                "()V",
+                true));
+        code.add(new JumpInsnNode(Opcodes.GOTO, loop));
+        code.add(tick);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/particle/ParticleGroup",
+                "tickParticle",
+                "(Lnet/minecraft/client/particle/Particle;)V",
+                false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/particle/Particle",
+                "isAlive",
+                "()Z",
+                false));
+        code.add(new JumpInsnNode(Opcodes.IFNE, alive));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Iterator",
+                "remove",
+                "()V",
+                true));
+        code.add(alive);
+        code.add(new JumpInsnNode(Opcodes.GOTO, loop));
+        code.add(done);
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(method, code, 2, 3);
+    }
+
+    private static void patchParticleGroupAddNullGuard(ClassNode node) {
+        MethodNode method = find(node, "add",
+                "(Lnet/minecraft/client/particle/Particle;)V");
+        InsnList code = new InsnList();
+        LabelNode done = new LabelNode();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new JumpInsnNode(Opcodes.IFNULL, done));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/particle/ParticleGroup",
+                "particles",
+                "Ljava/util/Queue;"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Queue",
+                "add",
+                "(Ljava/lang/Object;)Z",
+                true));
+        code.add(new InsnNode(Opcodes.POP));
+        code.add(done);
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(method, code, 2, 2);
+    }
+
+    private static void patchClientLevelBrowserBlockBreakEffects(String jar, Path output)
+            throws IOException {
+        ClassNode node = read(jar, "net/minecraft/client/multiplayer/ClientLevel.class");
+        MethodNode addDestroyBlockEffect = find(node, "addDestroyBlockEffect",
+                "(Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/level/block/state/BlockState;)V");
+        InsnList addDestroyCode = new InsnList();
+        addDestroyCode.add(new InsnNode(Opcodes.RETURN));
+        replace(addDestroyBlockEffect, addDestroyCode, 1, 3);
+
+        MethodNode destroyBlockProgress = find(node, "destroyBlockProgress",
+                "(ILnet/minecraft/core/BlockPos;I)V");
+        InsnList destroyProgressCode = new InsnList();
+        destroyProgressCode.add(new InsnNode(Opcodes.RETURN));
+        replace(destroyBlockProgress, destroyProgressCode, 1, 4);
+        write(node, output);
+    }
+
+    private static void patchLevelRendererBrowserBlockBreakProgress(String jar, Path output)
+            throws IOException {
+        ClassNode node = read(jar, "net/minecraft/client/renderer/LevelRenderer.class");
+        MethodNode method = find(node, "destroyBlockProgress",
+                "(ILnet/minecraft/core/BlockPos;I)V");
+        InsnList code = new InsnList();
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(method, code, 1, 4);
         write(node, output);
     }
 
@@ -1637,8 +2089,11 @@ public final class MinecraftClientPatcher {
         ClassNode node = read(jar, "net/minecraft/client/Minecraft.class");
         boolean found = false;
         boolean stateHooked = false;
+        boolean throwableHooked = false;
         for (MethodNode method : node.methods) {
-            if (method.name.equals("lambda$fillUptime$40")
+            if (method.name.equals("run") && method.desc.equals("()V")) {
+                throwableHooked = hookMinecraftRunCatchDiagnostics(method);
+            } else if (method.name.equals("lambda$fillUptime$40")
                     && method.desc.equals("()Ljava/lang/String;")) {
                 InsnList code = new InsnList();
                 code.add(new LdcInsnNode("Browser runtime"));
@@ -1669,6 +2124,24 @@ public final class MinecraftClientPatcher {
                 code.add(new FieldInsnNode(
                         Opcodes.GETFIELD,
                         "net/minecraft/client/Minecraft",
+                        "player",
+                        "Lnet/minecraft/client/player/LocalPlayer;"));
+                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                code.add(new FieldInsnNode(
+                        Opcodes.GETFIELD,
+                        "net/minecraft/client/Minecraft",
+                        "gameMode",
+                        "Lnet/minecraft/client/multiplayer/MultiPlayerGameMode;"));
+                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                code.add(new FieldInsnNode(
+                        Opcodes.GETFIELD,
+                        "net/minecraft/client/Minecraft",
+                        "hitResult",
+                        "Lnet/minecraft/world/phys/HitResult;"));
+                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                code.add(new FieldInsnNode(
+                        Opcodes.GETFIELD,
+                        "net/minecraft/client/Minecraft",
                         "noRender",
                         "Z"));
                 code.add(new VarInsnNode(Opcodes.ALOAD, 0));
@@ -1687,10 +2160,11 @@ public final class MinecraftClientPatcher {
                         Opcodes.INVOKESTATIC,
                         "org/lwjgl/opengl/BrowserOpenGL",
                         "reportMinecraftState",
-                        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;ZZZ)V",
+                        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;"
+                                + "Ljava/lang/Object;Ljava/lang/Object;ZZZ)V",
                         false));
                 method.instructions.insert(code);
-                method.maxStack = Math.max(method.maxStack, 6);
+                method.maxStack = Math.max(method.maxStack, 9);
                 stateHooked = true;
             }
         }
@@ -1700,16 +2174,61 @@ public final class MinecraftClientPatcher {
         if (!stateHooked) {
             throw new IllegalStateException("Minecraft runTick hook point was not found");
         }
+        if (!throwableHooked) {
+            throw new IllegalStateException("Minecraft run throwable diagnostic hook point was not found");
+        }
         write(node, output);
+    }
+
+    private static boolean hookMinecraftRunCatchDiagnostics(MethodNode method) {
+        boolean reportedHooked = false;
+        boolean unreportedHooked = false;
+        for (var block : method.tryCatchBlocks) {
+            String phase;
+            if ("net/minecraft/ReportedException".equals(block.type)) {
+                phase = "run.reported";
+            } else if ("java/lang/Throwable".equals(block.type)) {
+                phase = "run.unreported";
+            } else {
+                continue;
+            }
+            var instruction = block.handler.getNext();
+            while (instruction != null && instruction.getOpcode() < 0) {
+                instruction = instruction.getNext();
+            }
+            if (!(instruction instanceof VarInsnNode store)
+                    || store.getOpcode() != Opcodes.ASTORE) {
+                continue;
+            }
+            InsnList code = new InsnList();
+            code.add(new LdcInsnNode(phase));
+            code.add(new VarInsnNode(Opcodes.ALOAD, store.var));
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "org/lwjgl/opengl/BrowserOpenGL",
+                    "reportMinecraftThrowable",
+                    "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+                    false));
+            method.instructions.insert(instruction, code);
+            method.maxStack = Math.max(method.maxStack, 2);
+            if ("run.reported".equals(phase)) {
+                reportedHooked = true;
+            } else {
+                unreportedHooked = true;
+            }
+        }
+        return reportedHooked && unreportedHooked;
     }
 
     private static void patchClientPacketListenerLoadingDiagnostics(String jar, Path output)
             throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/multiplayer/ClientPacketListener.class");
         boolean handleLoginHooked = false;
+        boolean handleLoginDifficultyHooked = false;
         boolean startWaitingHooked = false;
         boolean levelChunkHooked = false;
         boolean batchStartHooked = false;
+        boolean batchStartLoadingPacketsHooked = false;
         boolean batchFinishedHooked = false;
         boolean tickClientLoadHooked = false;
         boolean loadingPacketsHooked = false;
@@ -1721,6 +2240,18 @@ public final class MinecraftClientPatcher {
                 method.instructions.insert(minecraftEvent("client.handleLogin"));
                 method.maxStack = Math.max(method.maxStack, 1);
                 handleLoginHooked = true;
+                for (var instruction = method.instructions.getFirst();
+                        instruction != null;
+                        instruction = instruction.getNext()) {
+                    if (instruction instanceof FieldInsnNode field
+                            && field.getOpcode() == Opcodes.GETSTATIC
+                            && field.owner.equals("net/minecraft/world/Difficulty")
+                            && field.name.equals("NORMAL")
+                            && field.desc.equals("Lnet/minecraft/world/Difficulty;")) {
+                        field.name = "PEACEFUL";
+                        handleLoginDifficultyHooked = true;
+                    }
+                }
             } else if (method.name.equals("startWaitingForNewLevel")
                     && method.desc.equals("(Lnet/minecraft/client/player/LocalPlayer;"
                             + "Lnet/minecraft/client/multiplayer/ClientLevel;"
@@ -1737,9 +2268,13 @@ public final class MinecraftClientPatcher {
             } else if (method.name.equals("handleChunkBatchStart")
                     && method.desc.equals("(Lnet/minecraft/network/protocol/game/"
                             + "ClientboundChunkBatchStartPacket;)V")) {
-                method.instructions.insert(minecraftEvent("client.handleChunkBatchStart"));
-                method.maxStack = Math.max(method.maxStack, 1);
+                InsnList code = new InsnList();
+                code.add(minecraftEvent("client.handleChunkBatchStart"));
+                code.add(notifyLoadingPacketsReceived("client.loadingPacketsReceived.chunkBatchStart"));
+                method.instructions.insert(code);
+                method.maxStack = Math.max(method.maxStack, 2);
                 batchStartHooked = true;
+                batchStartLoadingPacketsHooked = true;
             } else if (method.name.equals("handleChunkBatchFinished")
                     && method.desc.equals("(Lnet/minecraft/network/protocol/game/"
                             + "ClientboundChunkBatchFinishedPacket;)V")) {
@@ -1775,9 +2310,11 @@ public final class MinecraftClientPatcher {
         }
 
         if (!handleLoginHooked
+                || !handleLoginDifficultyHooked
                 || !startWaitingHooked
                 || !levelChunkHooked
                 || !batchStartHooked
+                || !batchStartLoadingPacketsHooked
                 || !batchFinishedHooked
                 || !tickClientLoadHooked
                 || !loadingPacketsHooked
@@ -1785,6 +2322,98 @@ public final class MinecraftClientPatcher {
             throw new IllegalStateException("ClientPacketListener loading diagnostic patch points were not found");
         }
         write(node, output);
+    }
+
+    private static void patchServerLevelBrowserSafeDefaults(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/server/level/ServerLevel.class");
+        MethodNode method = find(node, "isSpawningMonsters", "()Z");
+        InsnList code = new InsnList();
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new InsnNode(Opcodes.IRETURN));
+        replace(method, code, 1, 1);
+        write(node, output);
+    }
+
+    private static void patchIntegratedServerBrowserDistances(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/client/server/IntegratedServer.class");
+        MethodNode method = find(node, "tickServer", "(Ljava/util/function/BooleanSupplier;)V");
+        int patched = 0;
+        for (var instruction = method.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("java/lang/Math")
+                    && call.name.equals("max")
+                    && call.desc.equals("(II)I")) {
+                InsnList clamp = new InsnList();
+                clamp.add(new InsnNode(Opcodes.ICONST_2));
+                clamp.add(new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "java/lang/Math",
+                        "min",
+                        "(II)I",
+                        false));
+                method.instructions.insert(instruction, clamp);
+                patched++;
+                if (patched == 2) {
+                    break;
+                }
+            }
+        }
+        if (patched != 2) {
+            throw new IllegalStateException("IntegratedServer distance clamp patch points were not found");
+        }
+        method.maxStack = Math.max(method.maxStack, 2);
+        write(node, output);
+    }
+
+    private static void patchPlayerListBrowserDistances(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/server/players/PlayerList.class");
+        patchPlayerListDistanceGetter(node, "getViewDistance", "viewDistance");
+        patchPlayerListDistanceGetter(node, "getSimulationDistance", "simulationDistance");
+        patchPlayerListDistanceSetter(node, "setViewDistance");
+        patchPlayerListDistanceSetter(node, "setSimulationDistance");
+        writeComputeFrames(node, output);
+    }
+
+    private static void patchPlayerListDistanceGetter(ClassNode node, String methodName, String fieldName) {
+        MethodNode method = find(node, methodName, "()I");
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, node.name, fieldName, "I"));
+        code.add(distanceClamp());
+        code.add(new InsnNode(Opcodes.IRETURN));
+        replace(method, code, 2, 1);
+    }
+
+    private static void patchPlayerListDistanceSetter(ClassNode node, String methodName) {
+        MethodNode method = find(node, methodName, "(I)V");
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        code.add(distanceClamp());
+        code.add(new VarInsnNode(Opcodes.ISTORE, 1));
+        method.instructions.insert(code);
+        method.maxStack = Math.max(method.maxStack, 2);
+    }
+
+    private static InsnList distanceClamp() {
+        InsnList code = new InsnList();
+        code.add(new InsnNode(Opcodes.ICONST_2));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "java/lang/Math",
+                "min",
+                "(II)I",
+                false));
+        code.add(new InsnNode(Opcodes.ICONST_2));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "java/lang/Math",
+                "max",
+                "(II)I",
+                false));
+        return code;
     }
 
     private static void patchFreeTypeUtil(String jar, Path output) throws IOException {
@@ -1803,6 +2432,177 @@ public final class MinecraftClientPatcher {
             throw new IllegalStateException("FreeTypeUtil.destroy was not found");
         }
         write(node, output);
+    }
+
+    private static void patchVanillaPackResourcesBuilder(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/server/packs/VanillaPackResourcesBuilder.class");
+        MethodNode method = find(node, "lambda$static$1", "()Lcom/google/common/collect/ImmutableMap;");
+        InsnList code = new InsnList();
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "com/google/common/collect/ImmutableMap",
+                "of",
+                "()Lcom/google/common/collect/ImmutableMap;",
+                false));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(method, code, 1, 0);
+        write(node, output);
+    }
+
+    private static void patchIndexedAssetSourceBrowserNoop(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/client/resources/IndexedAssetSource.class");
+        MethodNode method = find(node, "createIndexFs",
+                "(Ljava/nio/file/Path;Ljava/lang/String;)Ljava/nio/file/Path;");
+        InsnList code = new InsnList();
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "net/minecraft/server/packs/linkfs/LinkFileSystem",
+                "builder",
+                "()Lnet/minecraft/server/packs/linkfs/LinkFileSystem$Builder;",
+                false));
+        code.add(new LdcInsnNode("browser-assets"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/server/packs/linkfs/LinkFileSystem$Builder",
+                "build",
+                "(Ljava/lang/String;)Ljava/nio/file/FileSystem;",
+                false));
+        code.add(new LdcInsnNode("/"));
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new TypeInsnNode(Opcodes.ANEWARRAY, "java/lang/String"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/nio/file/FileSystem",
+                "getPath",
+                "(Ljava/lang/String;[Ljava/lang/String;)Ljava/nio/file/Path;",
+                false));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(method, code, 3, 2);
+        write(node, output);
+    }
+
+    private static void patchLocalTimeItemModelProperty(String jar, Path output) throws IOException {
+        String owner = "net/minecraft/client/renderer/item/properties/select/LocalTime";
+        String data = "net/minecraft/client/renderer/item/properties/select/LocalTime$Data";
+        ClassNode node = read(jar, owner + ".class");
+
+        MethodNode create = find(node, "create",
+                "(L" + data + ";)Lcom/mojang/serialization/DataResult;");
+        InsnList createCode = new InsnList();
+        createCode.add(new TypeInsnNode(Opcodes.NEW, owner));
+        createCode.add(new InsnNode(Opcodes.DUP));
+        createCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        createCode.add(new InsnNode(Opcodes.ACONST_NULL));
+        createCode.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "<init>",
+                "(L" + data + ";Lcom/ibm/icu/text/DateFormat;)V",
+                false));
+        createCode.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "com/mojang/serialization/DataResult",
+                "success",
+                "(Ljava/lang/Object;)Lcom/mojang/serialization/DataResult;",
+                true));
+        createCode.add(new InsnNode(Opcodes.ARETURN));
+        replace(create, createCode, 4, 1);
+
+        MethodNode update = find(node, "update", "()Ljava/lang/String;");
+        InsnList updateCode = new InsnList();
+        LabelNode monthDay = new LabelNode();
+
+        updateCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        updateCode.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "data", "L" + data + ";"));
+        updateCode.add(new FieldInsnNode(Opcodes.GETFIELD, data, "format", "Ljava/lang/String;"));
+        updateCode.add(new LdcInsnNode("MM-dd"));
+        updateCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/lang/String",
+                "equals",
+                "(Ljava/lang/Object;)Z",
+                false));
+        updateCode.add(new JumpInsnNode(Opcodes.IFNE, monthDay));
+        updateCode.add(new LdcInsnNode(""));
+        updateCode.add(new InsnNode(Opcodes.ARETURN));
+
+        updateCode.add(monthDay);
+        updateCode.add(new TypeInsnNode(Opcodes.NEW, "java/util/Date"));
+        updateCode.add(new InsnNode(Opcodes.DUP));
+        updateCode.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                "java/util/Date",
+                "<init>",
+                "()V",
+                false));
+        updateCode.add(new VarInsnNode(Opcodes.ASTORE, 1));
+        updateCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        updateCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/Date",
+                "getMonth",
+                "()I",
+                false));
+        updateCode.add(new InsnNode(Opcodes.ICONST_1));
+        updateCode.add(new InsnNode(Opcodes.IADD));
+        updateCode.add(new VarInsnNode(Opcodes.ISTORE, 2));
+        updateCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        updateCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/Date",
+                "getDate",
+                "()I",
+                false));
+        updateCode.add(new VarInsnNode(Opcodes.ISTORE, 3));
+        updateCode.add(new TypeInsnNode(Opcodes.NEW, "java/lang/StringBuilder"));
+        updateCode.add(new InsnNode(Opcodes.DUP));
+        updateCode.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                "java/lang/StringBuilder",
+                "<init>",
+                "()V",
+                false));
+        addAppendTwoDigit(updateCode, 2);
+        updateCode.add(new LdcInsnNode("-"));
+        updateCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/lang/StringBuilder",
+                "append",
+                "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+                false));
+        addAppendTwoDigit(updateCode, 3);
+        updateCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/lang/StringBuilder",
+                "toString",
+                "()Ljava/lang/String;",
+                false));
+        updateCode.add(new InsnNode(Opcodes.ARETURN));
+        replace(update, updateCode, 4, 4);
+
+        write(node, output);
+    }
+
+    private static void addAppendTwoDigit(InsnList code, int local) {
+        LabelNode noZero = new LabelNode();
+        code.add(new VarInsnNode(Opcodes.ILOAD, local));
+        code.add(new IntInsnNode(Opcodes.BIPUSH, 10));
+        code.add(new JumpInsnNode(Opcodes.IF_ICMPGE, noZero));
+        code.add(new LdcInsnNode("0"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/lang/StringBuilder",
+                "append",
+                "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+                false));
+        code.add(noZero);
+        code.add(new VarInsnNode(Opcodes.ILOAD, local));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/lang/StringBuilder",
+                "append",
+                "(I)Ljava/lang/StringBuilder;",
+                false));
     }
 
     private static void patchDebugMemoryUntracker(String jar, Path output) throws IOException {
@@ -1830,6 +2630,8 @@ public final class MinecraftClientPatcher {
         String owner = "net/minecraft/server/MinecraftServer";
         boolean patchedPrepareLevels = false;
         boolean patchedRunServerReady = false;
+        boolean patchedRunServerStopDiagnostics = false;
+        boolean patchedRunServerBrowserCatchupReset = false;
         for (MethodNode method : node.methods) {
             if (method.name.equals("dumpThreads")
                     && method.desc.equals("(Ljava/nio/file/Path;)V")) {
@@ -1944,12 +2746,119 @@ public final class MinecraftClientPatcher {
                         break;
                     }
                 }
+                patchedRunServerStopDiagnostics = hookMinecraftServerStopDiagnostics(method);
+                patchedRunServerBrowserCatchupReset = patchMinecraftServerBrowserCatchupReset(method, owner);
             }
         }
-        if (!patchedPrepareLevels || !patchedRunServerReady) {
+        if (!patchedPrepareLevels
+                || !patchedRunServerReady
+                || !patchedRunServerStopDiagnostics
+                || !patchedRunServerBrowserCatchupReset) {
             throw new IllegalStateException("MinecraftServer browser patch points were not found");
         }
         writeComputeFrames(node, output);
+    }
+
+    private static boolean patchMinecraftServerBrowserCatchupReset(MethodNode method, String owner) {
+        for (var instruction = method.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (!(instruction instanceof LdcInsnNode constant)
+                    || !"Can't keep up! Is the server overloaded? Running {}ms or {} ticks behind"
+                            .equals(constant.cst)) {
+                continue;
+            }
+            var loggerLoad = previousOpcode(instruction);
+            if (!(loggerLoad instanceof FieldInsnNode logger)
+                    || logger.getOpcode() != Opcodes.GETSTATIC
+                    || !"Lorg/slf4j/Logger;".equals(logger.desc)) {
+                continue;
+            }
+            AbstractInsnNode end = null;
+            for (var candidate = instruction.getNext(); candidate != null; candidate = candidate.getNext()) {
+                if (candidate instanceof FieldInsnNode field
+                        && field.getOpcode() == Opcodes.PUTFIELD
+                        && field.owner.equals(owner)
+                        && field.name.equals("lastOverloadWarningNanos")
+                        && field.desc.equals("J")) {
+                    end = field;
+                    break;
+                }
+            }
+            if (end == null) {
+                continue;
+            }
+
+            LabelNode afterVanillaCatchup = new LabelNode();
+            method.instructions.insert(end, afterVanillaCatchup);
+
+            InsnList code = new InsnList();
+            code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "net/minecraft/util/Util",
+                    "getNanos",
+                    "()J",
+                    false));
+            code.add(new FieldInsnNode(
+                    Opcodes.PUTFIELD,
+                    owner,
+                    "nextTickTimeNanos",
+                    "J"));
+            code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            code.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    owner,
+                    "nextTickTimeNanos",
+                    "J"));
+            code.add(new FieldInsnNode(
+                    Opcodes.PUTFIELD,
+                    owner,
+                    "lastOverloadWarningNanos",
+                    "J"));
+            code.add(new JumpInsnNode(Opcodes.GOTO, afterVanillaCatchup));
+            method.instructions.insertBefore(loggerLoad, code);
+            method.maxStack = Math.max(method.maxStack, 4);
+            return true;
+        }
+        return false;
+    }
+
+    private static boolean hookMinecraftServerStopDiagnostics(MethodNode method) {
+        int hooked = 0;
+        for (var instruction = method.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (!(instruction instanceof LdcInsnNode constant)
+                    || !"Exception stopping the server".equals(constant.cst)) {
+                continue;
+            }
+            var throwableLoad = nextOpcode(instruction);
+            if (!(throwableLoad instanceof VarInsnNode load)
+                    || load.getOpcode() != Opcodes.ALOAD) {
+                continue;
+            }
+            var loggerLoad = previousOpcode(instruction);
+            if (!(loggerLoad instanceof FieldInsnNode field)
+                    || field.getOpcode() != Opcodes.GETSTATIC
+                    || !"Lorg/slf4j/Logger;".equals(field.desc)) {
+                continue;
+            }
+            InsnList code = new InsnList();
+            code.add(new LdcInsnNode("server.stop"));
+            code.add(new VarInsnNode(Opcodes.ALOAD, load.var));
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "org/lwjgl/opengl/BrowserOpenGL",
+                    "reportMinecraftThrowable",
+                    "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+                    false));
+            method.instructions.insertBefore(loggerLoad, code);
+            method.maxStack = Math.max(method.maxStack, 2);
+            hooked++;
+        }
+        return hooked >= 1;
     }
 
     private static void patchChaseClient(String jar, Path output) throws IOException {
@@ -2618,6 +3527,33 @@ public final class MinecraftClientPatcher {
         return code;
     }
 
+    private static InsnList notifyLoadingPacketsReceived(String event) {
+        InsnList code = new InsnList();
+        LabelNode done = new LabelNode();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/multiplayer/ClientPacketListener",
+                "levelLoadTracker",
+                "Lnet/minecraft/client/multiplayer/LevelLoadTracker;"));
+        code.add(new JumpInsnNode(Opcodes.IFNULL, done));
+        code.add(minecraftEvent(event));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/multiplayer/ClientPacketListener",
+                "levelLoadTracker",
+                "Lnet/minecraft/client/multiplayer/LevelLoadTracker;"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/multiplayer/LevelLoadTracker",
+                "loadingPacketsReceived",
+                "()V",
+                false));
+        code.add(done);
+        return code;
+    }
+
     private static void getter(
             ClassWriter writer, String owner, String name, String descriptor,
             String field, String fieldDescriptor, int returnOpcode) {
@@ -2683,6 +3619,22 @@ public final class MinecraftClientPatcher {
                 .findFirst()
                 .orElseThrow(() -> new IllegalStateException(
                         node.name + "." + name + descriptor + " was not found"));
+    }
+
+    private static AbstractInsnNode nextOpcode(AbstractInsnNode instruction) {
+        AbstractInsnNode cursor = instruction.getNext();
+        while (cursor != null && cursor.getOpcode() < 0) {
+            cursor = cursor.getNext();
+        }
+        return cursor;
+    }
+
+    private static AbstractInsnNode previousOpcode(AbstractInsnNode instruction) {
+        AbstractInsnNode cursor = instruction.getPrevious();
+        while (cursor != null && cursor.getOpcode() < 0) {
+            cursor = cursor.getPrevious();
+        }
+        return cursor;
     }
 
     private static ClassNode read(String jarPath, String entryName) throws IOException {

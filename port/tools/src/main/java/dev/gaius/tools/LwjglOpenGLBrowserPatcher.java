@@ -74,6 +74,8 @@ public final class LwjglOpenGLBrowserPatcher {
         add(methods, "GL11", "glDepthMask", "(Z)V", "depthMask");
         add(methods, "GL11", "glDrawArrays", "(III)V", "drawArrays");
         add(methods, "GL11", "glDrawElements", "(IIIJ)V", "drawElements");
+        add(methods, "GL11C", "glDrawArrays", "(III)V", "drawArrays");
+        add(methods, "GL11C", "glDrawElements", "(IIIJ)V", "drawElements");
         add(methods, "GL11", "glGetError", "()I", "getError");
         add(methods, "GL11", "glGetInteger", "(I)I", "getInteger");
         add(methods, "GL11", "glGetFloat", "(I)F", "getFloat");
@@ -199,6 +201,10 @@ public final class LwjglOpenGLBrowserPatcher {
         add(methods, "GL20C", "glVertexAttribPointer", "(IIIZIJ)V", "vertexAttribPointer");
         add(methods, "GL30", "glVertexAttribIPointer", "(IIIIJ)V", "vertexAttribIPointer");
         add(methods, "GL30C", "glVertexAttribIPointer", "(IIIIJ)V", "vertexAttribIPointer");
+        add(methods, "ARBVertexAttribBinding", "glBindVertexBuffer", "(IIJI)V", "bindVertexBuffer");
+        add(methods, "ARBVertexAttribBinding", "glVertexAttribBinding", "(II)V", "vertexAttribBinding");
+        add(methods, "ARBVertexAttribBinding", "glVertexAttribFormat", "(IIIZI)V", "vertexAttribFormat");
+        add(methods, "ARBVertexAttribBinding", "glVertexAttribIFormat", "(IIII)V", "vertexAttribIFormat");
         add(methods, "GL33", "glVertexAttribDivisor", "(II)V", "vertexAttribDivisor");
         add(methods, "GL33C", "glVertexAttribDivisor", "(II)V", "vertexAttribDivisor");
         add(methods, "ARBInstancedArrays", "glVertexAttribDivisorARB", "(II)V", "vertexAttribDivisor");
@@ -235,6 +241,10 @@ public final class LwjglOpenGLBrowserPatcher {
         add(methods, "GL31C", "glCopyBufferSubData", "(IIJJJ)V", "copyBufferSubData");
         add(methods, "GL31", "glDrawArraysInstanced", "(IIII)V", "drawArraysInstanced");
         add(methods, "GL31", "glDrawElementsInstanced", "(IIIJI)V", "drawElementsInstanced");
+        add(methods, "GL31C", "glDrawArraysInstanced", "(IIII)V", "drawArraysInstanced");
+        add(methods, "GL31C", "glDrawElementsInstanced", "(IIIJI)V", "drawElementsInstanced");
+        add(methods, "GL31", "glTexBuffer", "(III)V", "texBuffer");
+        add(methods, "GL31C", "glTexBuffer", "(III)V", "texBuffer");
         add(methods, "GL32", "glDrawElementsBaseVertex", "(IIIJI)V", "drawElementsBaseVertex");
         add(methods, "GL32C", "glDrawElementsBaseVertex", "(IIIJI)V", "drawElementsBaseVertex");
         add(methods, "GL32", "glDrawElementsInstancedBaseVertex", "(IIIJII)V", "drawElementsInstancedBaseVertex");
@@ -261,7 +271,6 @@ public final class LwjglOpenGLBrowserPatcher {
         noop(methods, "GL11", "glDrawBuffer", "(I)V");
         noop(methods, "GL11", "glGetTexLevelParameteri", "(III)I");
         noop(methods, "GL11", "glReadPixels", "(IIIIIIJ)V");
-        noop(methods, "GL31", "glTexBuffer", "(III)V");
         noop(methods, "GL32C", "glBeginQuery", "(II)V");
         noop(methods, "GL32C", "glDeleteQueries", "(I)V");
         noop(methods, "GL32C", "glEndQuery", "(I)V");
@@ -291,10 +300,6 @@ public final class LwjglOpenGLBrowserPatcher {
         noop(methods, "ARBDirectStateAccess", "glNamedBufferSubData", "(IJLjava/nio/ByteBuffer;)V");
         noop(methods, "ARBDirectStateAccess", "glNamedFramebufferTexture", "(IIII)V");
         noop(methods, "ARBDirectStateAccess", "glUnmapNamedBuffer", "(I)Z");
-        noop(methods, "ARBVertexAttribBinding", "glBindVertexBuffer", "(IIJI)V");
-        noop(methods, "ARBVertexAttribBinding", "glVertexAttribBinding", "(II)V");
-        noop(methods, "ARBVertexAttribBinding", "glVertexAttribFormat", "(IIIZI)V");
-        noop(methods, "ARBVertexAttribBinding", "glVertexAttribIFormat", "(IIII)V");
         noop(methods, "EXTDebugLabel", "glLabelObjectEXT", "(IILjava/lang/CharSequence;)V");
         noop(methods, "KHRDebug", "glDebugMessageCallback", "(Lorg/lwjgl/opengl/GLDebugMessageCallbackI;J)V");
         noop(methods, "KHRDebug", "glDebugMessageControl", "(III[IZ)V");

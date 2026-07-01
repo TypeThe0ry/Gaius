@@ -4,6 +4,7 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Set;
+import dev.gaius.browser.BrowserFilePersistence;
 import org.teavm.classlib.java.io.TFile;
 import org.teavm.classlib.java.nio.TByteBuffer;
 import org.teavm.classlib.java.nio.file.TOpenOption;
@@ -23,11 +24,14 @@ import org.teavm.runtime.fs.VirtualFileSystemProvider;
  */
 public class TFileChannel implements TSeekableByteChannel {
     private final VirtualFileAccessor accessor;
+    private final String path;
     private final boolean readable;
     private final boolean writable;
     private boolean open = true;
+    private boolean dirty;
 
-    private TFileChannel(VirtualFileAccessor accessor, boolean readable, boolean writable) {
+    private TFileChannel(String path, VirtualFileAccessor accessor, boolean readable, boolean writable) {
+        this.path = path;
         this.accessor = accessor;
         this.readable = readable;
         this.writable = writable;
@@ -53,6 +57,7 @@ public class TFileChannel implements TSeekableByteChannel {
                 || options.contains(TStandardOpenOption.CREATE_NEW);
         boolean truncate = options.contains(TStandardOpenOption.TRUNCATE_EXISTING);
 
+        BrowserFilePersistence.mount();
         TFile file = new TFile(path.toString());
         if (!file.exists() && create) {
             TFile parent = file.getParentFile();
@@ -76,7 +81,7 @@ public class TFileChannel implements TSeekableByteChannel {
         if (append) {
             accessor.seek(accessor.size());
         }
-        return new TFileChannel(accessor, read, write);
+        return new TFileChannel(file.getAbsolutePath(), accessor, read, write);
     }
 
     @Override
@@ -134,6 +139,7 @@ public class TFileChannel implements TSeekableByteChannel {
         byte[] bytes = new byte[count];
         source.get(bytes);
         accessor.write(bytes, 0, count);
+        dirty = true;
         return count;
     }
 
@@ -192,12 +198,14 @@ public class TFileChannel implements TSeekableByteChannel {
         if (accessor.tell() > target) {
             accessor.seek(target);
         }
+        dirty = true;
         return this;
     }
 
     public void force(boolean metadata) throws IOException {
         ensureOpen();
         accessor.flush();
+        persistIfDirty();
     }
 
     public long transferTo(long position, long count, TWritableByteChannel target)
@@ -265,9 +273,34 @@ public class TFileChannel implements TSeekableByteChannel {
     public void close() throws IOException {
         if (open) {
             accessor.flush();
+            persistIfDirty();
             accessor.close();
             open = false;
         }
+    }
+
+    private void persistIfDirty() throws IOException {
+        if (!writable || !dirty) {
+            return;
+        }
+        int oldPosition = accessor.tell();
+        int size = accessor.size();
+        byte[] bytes = new byte[size];
+        accessor.seek(0);
+        int offset = 0;
+        while (offset < size) {
+            int read = accessor.read(bytes, offset, size - offset);
+            if (read <= 0) {
+                break;
+            }
+            offset += read;
+        }
+        accessor.seek(oldPosition);
+        if (offset < size) {
+            bytes = Arrays.copyOf(bytes, offset);
+        }
+        BrowserFilePersistence.persist(path, bytes);
+        dirty = false;
     }
 
     private void ensureOpen() throws TClosedChannelException {

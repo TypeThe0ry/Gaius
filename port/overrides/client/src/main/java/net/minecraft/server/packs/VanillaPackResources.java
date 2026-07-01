@@ -114,22 +114,29 @@ public class VanillaPackResources implements PackResources {
 
     private static IoSupplier<InputStream> openClasspathResource(String resource) {
         return () -> {
-            InputStream input = VanillaPackResources.class.getClassLoader()
-                    .getResourceAsStream(resource);
+            InputStream input = openResourceStream(resource);
             if (input == null) {
                 throw new IOException("Missing embedded vanilla resource: " + resource);
             }
-            return input;
+            return new ByteArrayInputStream(input.readAllBytes());
         };
     }
 
     private static boolean exists(String resource) {
-        try (InputStream input = VanillaPackResources.class.getClassLoader()
-                .getResourceAsStream(resource)) {
+        try (InputStream input = openResourceStream(resource)) {
             return input != null;
         } catch (IOException e) {
             return false;
         }
+    }
+
+    private static InputStream openResourceStream(String resource) {
+        String normalized = resource.startsWith("/") ? resource.substring(1) : resource;
+        InputStream input = VanillaPackResources.class.getResourceAsStream("/" + normalized);
+        if (input != null) {
+            return input;
+        }
+        return VanillaPackResources.class.getClassLoader().getResourceAsStream(normalized);
     }
 
     private static String[] loadResourceList() {
