@@ -15,6 +15,21 @@ Minecraft client with Java 21 semantics, WebGPU, WGSL shaders, an integrated
 server, IndexedDB storage, and a Rust noise WebAssembly helper. It is a compiled
 artifact, not a reproducible source tree.
 
+
+## Run single-player now
+
+The reproducible 1.21.11 TeaVM build is still blocked on downloading Mojang and
+Maven inputs in some environments, but the repository includes the audited
+`eag26-single(2).html` reference build. To run its single-player mode locally:
+
+```sh
+./port/scripts/serve-singleplayer.sh
+```
+
+Then open `http://127.0.0.1:8080/port/web/singleplayer/` in a desktop browser
+with WebGPU support. The launcher opens the checked-in single-file build with
+`?localserver` so world simulation runs in-page when workers cannot be used.
+
 ## Start here
 
 ```sh
