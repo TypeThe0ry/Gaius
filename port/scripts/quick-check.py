@@ -31,6 +31,8 @@ CLIENT_PATCHER = PORT / "tools" / "src" / "main" / "java" / "dev" / "gaius" / "t
 VANILLA_PACK_RESOURCES = PORT / "overrides" / "client" / "src" / "main" / "java" / "net" / "minecraft" / "server" / "packs" / "VanillaPackResources.java"
 BROWSER_FILE_PERSISTENCE = PORT / "overrides" / "classlib" / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserFilePersistence.java"
 BROWSER_GUI_ITEM_CACHE = PORT / "overrides" / "client" / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserGuiItemCache.java"
+WASM_HOTPATH_C = PORT / "wasm" / "hotpath" / "gaius_hotpath.c"
+BUILD_WASM_HOTPATH = PORT / "scripts" / "build-wasm-hotpath.sh"
 GENERATE_POM = PORT / "scripts" / "generate-pom.sh"
 BUILD_RELEASE = PORT / "scripts" / "build-teavm-release.sh"
 COMPRESS_DIST = PORT / "scripts" / "compress-dist.sh"
@@ -219,6 +221,8 @@ def check_source_patches() -> None:
     vanilla_pack_resources = VANILLA_PACK_RESOURCES.read_text(errors="replace") if VANILLA_PACK_RESOURCES.exists() else ""
     browser_file_persistence = BROWSER_FILE_PERSISTENCE.read_text(errors="replace") if BROWSER_FILE_PERSISTENCE.exists() else ""
     browser_gui_item_cache = BROWSER_GUI_ITEM_CACHE.read_text(errors="replace") if BROWSER_GUI_ITEM_CACHE.exists() else ""
+    wasm_hotpath_c = WASM_HOTPATH_C.read_text(errors="replace") if WASM_HOTPATH_C.exists() else ""
+    build_wasm_hotpath = BUILD_WASM_HOTPATH.read_text(errors="replace") if BUILD_WASM_HOTPATH.exists() else ""
     generate_pom = GENERATE_POM.read_text(errors="replace") if GENERATE_POM.exists() else ""
     build_release = BUILD_RELEASE.read_text(errors="replace") if BUILD_RELEASE.exists() else ""
     compress_dist = COMPRESS_DIST.read_text(errors="replace") if COMPRESS_DIST.exists() else ""
@@ -285,6 +289,29 @@ def check_source_patches() -> None:
             and "shiftedIndexCache" in text
             and "baseVertexIndexDraws" in text
             and "window.__gaiusGL.drawElementsWithBaseVertex(mode,count,type,offset,1,baseVertex);" in text,
+        ),
+        (
+            "BrowserOpenGL can use Wasm hot-path for baseVertex index shifting",
+            "window.__gaiusWasmHotpath" in text
+            and "wasmHotpath.shiftIndices" in text
+            and "wasmHotpath.repackInterleaved" in text
+            and "baseVertexIndexWasm" in text
+            and "alignedAttribWasm" in text
+            and "baseVertexIndexJsFallback" in text
+            and "baseVertexIndexWasmFallback" in text,
+        ),
+        (
+            "Wasm hot-path module exports batch index shifting helpers",
+            "gaius_shift_indices" in wasm_hotpath_c
+            and "gaius_repack_interleaved" in wasm_hotpath_c
+            and "gaius_shift_indices_input_ptr" in wasm_hotpath_c
+            and "gaius_shift_indices_output_ptr" in wasm_hotpath_c
+            and "gaius_repack_source_ptr" in wasm_hotpath_c
+            and "gaius_repack_layouts_ptr" in wasm_hotpath_c
+            and "MAX_INDICES" in wasm_hotpath_c
+            and "MAX_REPACK_LAYOUTS" in wasm_hotpath_c
+            and "GL_UNSIGNED_SHORT" in wasm_hotpath_c
+            and "GL_UNSIGNED_INT" in wasm_hotpath_c,
         ),
         (
             "BrowserOpenGL repairs shader integer/float attribute binding mismatches",
@@ -509,7 +536,18 @@ def check_source_patches() -> None:
             and "false" in build_release
             and "GAIUS_MINIFYING" in build_release
             and "true" in build_release
+            and "build-wasm-hotpath.sh" in build_release
+            and "GAIUS_SKIP_WASM_HOTPATH" in build_release
             and "compress-dist.sh" in build_release,
+        ),
+        (
+            "Wasm hot-path build emits dist wasm without requiring TeaVM",
+            "--target=wasm32" in build_wasm_hotpath
+            and "-Wl,--no-entry" in build_wasm_hotpath
+            and "-Wl,--export-memory" in build_wasm_hotpath
+            and "gaius-hotpath.wasm" in build_wasm_hotpath
+            and "gaius_shift_indices" in build_wasm_hotpath
+            and "gaius_repack_interleaved" in build_wasm_hotpath,
         ),
         (
             "Dist assets can be precompressed for faster browser loading",
@@ -538,6 +576,11 @@ def check_source_patches() -> None:
             and "__gaiusMaxDpr" in index_html
             and '|| 0.35' in index_html
             and "maybeDegradeResolutionForFps" in index_html
+            and "__gaiusWasmHotpath" in index_html
+            and "gaius-hotpath.wasm" in index_html
+            and "WebAssembly.instantiate" in index_html
+            and "shiftIndices" in index_html
+            and "repackInterleaved" in index_html
             and "if (!inWorld) return" not in index_html
             and "storage-options-preflight" in index_html
             and "__gaiusFsDelete" in index_html

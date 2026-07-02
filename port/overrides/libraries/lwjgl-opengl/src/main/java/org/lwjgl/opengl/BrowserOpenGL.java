@@ -375,19 +375,49 @@ public final class BrowserOpenGL {
                       cursor=layoutOffset+layoutBytes;
                     }
                     var alignedStride=this.align(cursor,4);
-                    var repacked=new Uint8Array(vertexCount*alignedStride);
-                    for (var vertex=0; vertex<vertexCount; vertex++) {
-                      for (var layoutIndex=0; layoutIndex<layouts.length; layoutIndex++) {
-                        var layout=layouts[layoutIndex];
-                        var copyPointer=layout.pointer;
-                        var copyComponentBytes=layout.componentBytes;
-                        var copySourceStride=copyPointer.stride
-                          ? (copyPointer.stride|0)
-                          : ((copyPointer.size|0)*copyComponentBytes);
-                        var sourceOffset=vertex*copySourceStride+Number(copyPointer.offset);
-                        var targetOffset=vertex*alignedStride+layout.offset;
-                        repacked.set(source.subarray(sourceOffset,sourceOffset+layout.bytes),targetOffset);
+                    var repacked=null;
+                    var wasmHotpath=window.__gaiusWasmHotpath;
+                    if (wasmHotpath && wasmHotpath.ready && wasmHotpath.repackInterleaved) {
+                      var wasmLayouts=[];
+                      for (var wasmLayoutIndex=0; wasmLayoutIndex<layouts.length; wasmLayoutIndex++) {
+                        var wasmLayout=layouts[wasmLayoutIndex];
+                        var wasmPointer=wasmLayout.pointer;
+                        var wasmSourceStride=wasmPointer.stride
+                          ? (wasmPointer.stride|0)
+                          : ((wasmPointer.size|0)*wasmLayout.componentBytes);
+                        wasmLayouts.push({
+                          sourceOffset:Number(wasmPointer.offset)|0,
+                          sourceStride:wasmSourceStride|0,
+                          bytes:wasmLayout.bytes|0,
+                          targetOffset:wasmLayout.offset|0
+                        });
                       }
+                      repacked=wasmHotpath.repackInterleaved(source, vertexCount|0, alignedStride|0, wasmLayouts);
+                      if (repacked) {
+                        stats.alignedAttribWasm=(stats.alignedAttribWasm||0)+1;
+                        stats.alignedAttribWasmBytes=(stats.alignedAttribWasmBytes||0)+repacked.byteLength;
+                      } else {
+                        stats.alignedAttribWasmFallback=(stats.alignedAttribWasmFallback||0)+1;
+                      }
+                    } else if (wasmHotpath && wasmHotpath.error) {
+                      stats.alignedAttribWasmUnavailable=(stats.alignedAttribWasmUnavailable||0)+1;
+                    }
+                    if (!repacked) {
+                      repacked=new Uint8Array(vertexCount*alignedStride);
+                      for (var vertex=0; vertex<vertexCount; vertex++) {
+                        for (var layoutIndex=0; layoutIndex<layouts.length; layoutIndex++) {
+                          var layout=layouts[layoutIndex];
+                          var copyPointer=layout.pointer;
+                          var copyComponentBytes=layout.componentBytes;
+                          var copySourceStride=copyPointer.stride
+                            ? (copyPointer.stride|0)
+                            : ((copyPointer.size|0)*copyComponentBytes);
+                          var sourceOffset=vertex*copySourceStride+Number(copyPointer.offset);
+                          var targetOffset=vertex*alignedStride+layout.offset;
+                          repacked.set(source.subarray(sourceOffset,sourceOffset+layout.bytes),targetOffset);
+                        }
+                      }
+                      stats.alignedAttribJsFallback=(stats.alignedAttribJsFallback||0)+1;
                     }
                     var buffer=gl.createBuffer();
                     gl.bindBuffer(gl.ARRAY_BUFFER,buffer);
@@ -602,37 +632,56 @@ public final class BrowserOpenGL {
                 }
                 let maxIndex=0;
                 let minIndex=2147483647;
-                const byteOffset=source.byteOffset + start;
-                let values;
-                if ((type|0) === 0x1401) {
-                  values=new Uint8Array(source.buffer,byteOffset,length);
-                } else if ((type|0) === 0x1403) {
-                  values=new Uint16Array(source.buffer,byteOffset,length);
-                } else {
-                  values=new Uint32Array(source.buffer,byteOffset,length);
-                }
-                for (let i=0;i<length;i++) {
-                  const shifted=Number(values[i]) + base;
-                  if (shifted < 0 || shifted > 4294967295) {
-                    stats.baseVertexIndexOutOfRange=(stats.baseVertexIndexOutOfRange||0)+1;
-                    return null;
-                  }
-                  if (shifted > maxIndex) maxIndex=shifted;
-                  if (shifted < minIndex) minIndex=shifted;
-                }
                 let outputType=type|0;
                 let output;
-                if (maxIndex <= 255 && (type|0) === 0x1401) {
-                  output=new Uint8Array(length);
-                } else if (maxIndex <= 65535 && (type|0) !== 0x1405) {
-                  outputType=0x1403;
-                  output=new Uint16Array(length);
-                } else {
-                  outputType=0x1405;
-                  output=new Uint32Array(length);
+                const wasmHotpath=window.__gaiusWasmHotpath;
+                if (wasmHotpath && wasmHotpath.ready && wasmHotpath.shiftIndices) {
+                  const shifted=wasmHotpath.shiftIndices(type|0, source, start, length, base);
+                  if (shifted && shifted.output) {
+                    outputType=shifted.type|0;
+                    output=shifted.output;
+                    minIndex=shifted.min>>>0;
+                    maxIndex=shifted.max>>>0;
+                    stats.baseVertexIndexWasm=(stats.baseVertexIndexWasm||0)+1;
+                    stats.baseVertexIndexWasmBytes=(stats.baseVertexIndexWasmBytes||0)+(shifted.bytes|0);
+                  } else {
+                    stats.baseVertexIndexWasmFallback=(stats.baseVertexIndexWasmFallback||0)+1;
+                  }
+                } else if (wasmHotpath && wasmHotpath.error) {
+                  stats.baseVertexIndexWasmUnavailable=(stats.baseVertexIndexWasmUnavailable||0)+1;
                 }
-                for (let i=0;i<length;i++) {
-                  output[i]=Number(values[i]) + base;
+                if (!output) {
+                  const byteOffset=source.byteOffset + start;
+                  let values;
+                  if ((type|0) === 0x1401) {
+                    values=new Uint8Array(source.buffer,byteOffset,length);
+                  } else if ((type|0) === 0x1403) {
+                    values=new Uint16Array(source.buffer,byteOffset,length);
+                  } else {
+                    values=new Uint32Array(source.buffer,byteOffset,length);
+                  }
+                  for (let i=0;i<length;i++) {
+                    const shifted=Number(values[i]) + base;
+                    if (shifted < 0 || shifted > 4294967295) {
+                      stats.baseVertexIndexOutOfRange=(stats.baseVertexIndexOutOfRange||0)+1;
+                      return null;
+                    }
+                    if (shifted > maxIndex) maxIndex=shifted;
+                    if (shifted < minIndex) minIndex=shifted;
+                  }
+                  if (maxIndex <= 255 && (type|0) === 0x1401) {
+                    output=new Uint8Array(length);
+                  } else if (maxIndex <= 65535 && (type|0) !== 0x1405) {
+                    outputType=0x1403;
+                    output=new Uint16Array(length);
+                  } else {
+                    outputType=0x1405;
+                    output=new Uint32Array(length);
+                  }
+                  for (let i=0;i<length;i++) {
+                    output[i]=Number(values[i]) + base;
+                  }
+                  stats.baseVertexIndexJsFallback=(stats.baseVertexIndexJsFallback||0)+1;
                 }
                 const buffer=gl.createBuffer();
                 gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,buffer);

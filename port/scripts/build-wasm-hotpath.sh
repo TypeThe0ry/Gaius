@@ -21,17 +21,25 @@ clang \
   -fno-builtin \
   -Wl,--no-entry \
   -Wl,--export-memory \
-  -Wl,--initial-memory=16777216 \
-  -Wl,--max-memory=16777216 \
+  -Wl,--initial-memory=67108864 \
+  -Wl,--max-memory=67108864 \
   -Wl,--export=gaius_hotpath_version \
   -Wl,--export=gaius_shift_indices_capacity \
   -Wl,--export=gaius_shift_indices_input_ptr \
   -Wl,--export=gaius_shift_indices_output_ptr \
+  -Wl,--export=gaius_repack_source_ptr \
+  -Wl,--export=gaius_repack_output_ptr \
+  -Wl,--export=gaius_repack_layouts_ptr \
+  -Wl,--export=gaius_repack_source_capacity \
+  -Wl,--export=gaius_repack_output_capacity \
+  -Wl,--export=gaius_repack_layout_capacity \
   -Wl,--export=gaius_shift_indices \
   -Wl,--export=gaius_shift_indices_last_type \
   -Wl,--export=gaius_shift_indices_last_bytes \
   -Wl,--export=gaius_shift_indices_last_min \
   -Wl,--export=gaius_shift_indices_last_max \
+  -Wl,--export=gaius_repack_interleaved \
+  -Wl,--export=gaius_repack_last_bytes \
   -Wl,--strip-all \
   "$source_file" \
   -o "$output"

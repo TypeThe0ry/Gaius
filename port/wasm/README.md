@@ -18,6 +18,8 @@ Current module:
 - `hotpath/gaius_hotpath.c`
   - `gaius_shift_indices(...)`: shifts WebGL element indices for
     `drawElementsBaseVertex` fallback in bulk.
+  - `gaius_repack_interleaved(...)`: repacks misaligned/interleaved vertex
+    attributes into a browser-safe aligned buffer in bulk.
 
 Build:
 
