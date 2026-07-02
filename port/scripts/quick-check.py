@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -28,10 +29,13 @@ GLFW_BRIDGE = PORT / "overrides" / "libraries" / "lwjgl-glfw" / "src" / "main" /
 GLFW_PATCHER = PORT / "tools" / "src" / "main" / "java" / "dev" / "gaius" / "tools" / "LwjglGlfwBrowserPatcher.java"
 CLIENT_PATCHER = PORT / "tools" / "src" / "main" / "java" / "dev" / "gaius" / "tools" / "MinecraftClientPatcher.java"
 VANILLA_PACK_RESOURCES = PORT / "overrides" / "client" / "src" / "main" / "java" / "net" / "minecraft" / "server" / "packs" / "VanillaPackResources.java"
+BROWSER_FILE_PERSISTENCE = PORT / "overrides" / "classlib" / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserFilePersistence.java"
+BROWSER_GUI_ITEM_CACHE = PORT / "overrides" / "client" / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserGuiItemCache.java"
 GENERATE_POM = PORT / "scripts" / "generate-pom.sh"
 BUILD_RELEASE = PORT / "scripts" / "build-teavm-release.sh"
 COMPRESS_DIST = PORT / "scripts" / "compress-dist.sh"
 SERVE_DIST = PORT / "scripts" / "serve-dist.py"
+INDEX_HTML = PORT / "web" / "dist" / "index.html"
 
 
 def rel(path: Path) -> str:
@@ -49,6 +53,13 @@ def fmt_time(path: Path) -> str:
 
 def latest(pattern: str) -> Path | None:
     paths = [Path(p) for p in glob.glob(str(pattern))]
+    return max(paths, key=lambda p: p.stat().st_mtime) if paths else None
+
+
+def latest_any(*patterns: Path) -> Path | None:
+    paths: list[Path] = []
+    for pattern in patterns:
+        paths.extend(Path(p) for p in glob.glob(str(pattern)))
     return max(paths, key=lambda p: p.stat().st_mtime) if paths else None
 
 
@@ -72,6 +83,16 @@ def run_javap(classpath: Path, class_name: str) -> str:
         )
     except Exception as exc:  # noqa: BLE001
         return f"javap failed: {exc}"
+
+
+def read_zip_entry_latin1(path: Path, entry: str) -> str:
+    if not path.exists():
+        return ""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            return archive.read(entry).decode("latin1", errors="ignore")
+    except Exception:
+        return ""
 
 
 def method_section(text: str, header: str) -> str:
@@ -110,8 +131,20 @@ def check_build_timeline() -> None:
     section("Build timeline")
     classes_js = DIST / "classes.js"
     classes_map = DIST / "classes.js.map"
-    latest_full = latest(TARGET / "build-teavm*.log")
+    latest_full = latest_any(
+        TARGET / "build-teavm*.log",
+        TARGET / "build-*wrapper.log",
+    )
     latest_overlay = latest(TARGET / "build-overlays*.log")
+    browser_opengl_class = (
+        OVERLAYS
+        / "library-classes"
+        / "lwjgl-opengl"
+        / "org"
+        / "lwjgl"
+        / "opengl"
+        / "BrowserOpenGL.class"
+    )
     print(f"classes.js: {fmt_time(classes_js)} size={classes_js.stat().st_size if classes_js.exists() else 0}")
     print(f"classes.js.map: {fmt_time(classes_map)} size={classes_map.stat().st_size if classes_map.exists() else 0}")
     print(f"latest full build: {rel(latest_full) if latest_full else 'missing'} {fmt_time(latest_full) if latest_full else ''}")
@@ -121,7 +154,11 @@ def check_build_timeline() -> None:
         print("WARNING: overlay patches are newer than classes.js; full TeaVM output is stale.")
     if latest_full and classes_js.exists() and latest_full.stat().st_mtime > classes_js.stat().st_mtime + 60:
         print("WARNING: latest full build log is newer than classes.js by more than 60s.")
-    if latest_overlay and OPENGL_BRIDGE.exists() and OPENGL_BRIDGE.stat().st_mtime > latest_overlay.stat().st_mtime:
+    if (
+        browser_opengl_class.exists()
+        and OPENGL_BRIDGE.exists()
+        and OPENGL_BRIDGE.stat().st_mtime > browser_opengl_class.stat().st_mtime
+    ):
         print("WARNING: BrowserOpenGL.java is newer than overlay classes; run overlay build before full TeaVM.")
 
 
@@ -180,10 +217,13 @@ def check_source_patches() -> None:
     glfw_patcher = GLFW_PATCHER.read_text(errors="replace") if GLFW_PATCHER.exists() else ""
     client_patcher = CLIENT_PATCHER.read_text(errors="replace") if CLIENT_PATCHER.exists() else ""
     vanilla_pack_resources = VANILLA_PACK_RESOURCES.read_text(errors="replace") if VANILLA_PACK_RESOURCES.exists() else ""
+    browser_file_persistence = BROWSER_FILE_PERSISTENCE.read_text(errors="replace") if BROWSER_FILE_PERSISTENCE.exists() else ""
+    browser_gui_item_cache = BROWSER_GUI_ITEM_CACHE.read_text(errors="replace") if BROWSER_GUI_ITEM_CACHE.exists() else ""
     generate_pom = GENERATE_POM.read_text(errors="replace") if GENERATE_POM.exists() else ""
     build_release = BUILD_RELEASE.read_text(errors="replace") if BUILD_RELEASE.exists() else ""
     compress_dist = COMPRESS_DIST.read_text(errors="replace") if COMPRESS_DIST.exists() else ""
     serve_dist = SERVE_DIST.read_text(errors="replace") if SERVE_DIST.exists() else ""
+    index_html = INDEX_HTML.read_text(errors="replace") if INDEX_HTML.exists() else ""
     tex_sub_start = text.find("public static void texSubImage2D(")
     tex_sub_end = text.find("@JSBody(script = \"\"\"", tex_sub_start)
     tex_sub_section = text[tex_sub_start:tex_sub_end] if tex_sub_start >= 0 and tex_sub_end > tex_sub_start else text
@@ -239,12 +279,46 @@ def check_source_patches() -> None:
             and 'noop(methods, "ARBVertexAttribBinding", "glVertexAttribFormat", "(IIIZI)V")' not in patcher,
         ),
         (
-            "BrowserOpenGL emulates drawElementsBaseVertex when browser extension is absent",
+            "BrowserOpenGL avoids slow per-draw baseVertex attrib rebinding when possible",
             "drawElementsWithBaseVertex" in text
-            and "withBaseVertexAttribs" in text
-            and "bindAttribPointerAtOffset" in text
-            and "baseVertexFallbackDraws" in text
+            and "cacheShiftedIndexBuffer" in text
+            and "shiftedIndexCache" in text
+            and "baseVertexIndexDraws" in text
             and "window.__gaiusGL.drawElementsWithBaseVertex(mode,count,type,offset,1,baseVertex);" in text,
+        ),
+        (
+            "BrowserOpenGL repairs shader integer/float attribute binding mismatches",
+            "programAttribs" in text
+            and "refreshProgramAttribs" in text
+            and "ensureProgramAttribTypes" in text
+            and "attribTypeRepairs" in text
+            and "gl.getActiveAttrib" in text
+            and "vertexAttribIPointer" in text,
+        ),
+        (
+            "BrowserOpenGL exposes draw-call throughput telemetry",
+            "recordDrawCall" in text
+            and "drawCallsPerSecond" in text
+            and "drawWindowCalls" in text,
+        ),
+        (
+            "BrowserOpenGL exposes texture upload diagnostics for broken item/atlas triage",
+            "recordTextureUpload" in text
+            and "recordTextureError" in text
+            and "textureUploadRecent" in text
+            and "textureUploadErrors" in text
+            and "textureInfo" in text,
+        ),
+        (
+            "BrowserOpenGL exposes screen widget telemetry for fast UI automation",
+            "describeScreenWidgets" in text
+            and "screenWidgetsJson" in text
+            and "screenWidgets" in text
+            and "AbstractWidget" in text
+            and "GuiEventListener" in text
+            and "widget.getMessage()" in text
+            and "widget.getX()" in text
+            and "widget.getY()" in text,
         ),
         (
             "BrowserGlfw provides GLFW key names for printable keys",
@@ -252,6 +326,22 @@ def check_source_patches() -> None:
             and "GLFW.GLFW_KEY_A && value <= GLFW.GLFW_KEY_Z" in glfw_text
             and "GLFW.GLFW_KEY_KP_ADD" in glfw_text
             and "default -> null" in glfw_text,
+        ),
+        (
+            "BrowserGlfw defaults to performance-safe DPR and disables slow preserveDrawingBuffer",
+            "__gaiusResolvePixelRatio" in glfw_text
+            and "__gaiusApplyCanvasResolution" in glfw_text
+            and "__gaiusMaxDpr" in glfw_text
+            and "Math.min(devicePixelRatio||1,1)" in glfw_text
+            and "preserveDrawingBuffer" in glfw_text
+            and "get('preserveDrawingBuffer') === '1'" in glfw_text,
+        ),
+        (
+            "BrowserGlfw records game FPS from swapBuffers",
+            "public static native void swapBuffers(long window)" in glfw_text
+            and "gameFps" in glfw_text
+            and "gameFrames" in glfw_text
+            and "gameLastSampleAt" in glfw_text,
         ),
         (
             "GLFW patcher delegates key name/scancode lookups",
@@ -266,11 +356,44 @@ def check_source_patches() -> None:
             and "1.0E-4f" in client_patcher,
         ),
         (
-            "Minecraft patcher clamps browser singleplayer distances to 2",
+            "Minecraft patcher caches non-animated GUI item render states in browser",
+            "patchGuiGraphicsBrowserItemCache" in client_patcher
+            and "BrowserGuiItemCache" in client_patcher
+            and "guiState" in client_patcher
+            and "TrackingItemStackRenderState" in client_patcher
+            and "ItemModelResolver" in client_patcher
+            and "updateForTopItem" in client_patcher
+            and "MAX_ENTRIES" in browser_gui_item_cache
+            and "hashItemAndComponents" in browser_gui_item_cache
+            and "isAnimated" in browser_gui_item_cache,
+        ),
+        (
+            "Minecraft patcher skips expensive level rendering while browser screens are open",
+            "patchGameRendererBrowserAutoScreenshot" in client_patcher
+            and "renderLevel" in client_patcher
+            and "net/minecraft/client/gui/screens/Screen" in client_patcher
+            and "Opcodes.IFNULL" in client_patcher
+            and "skipLevelWhenScreenOpen" in client_patcher,
+        ),
+        (
+            "Minecraft patcher uses static browser menu backgrounds for FPS",
+            "patchScreenBrowserFastMenus" in client_patcher
+            and "patchTitleScreenBrowserFastMenus" in client_patcher
+            and "patchAbstractButtonBrowserFastSprite" in client_patcher
+            and "renderPanorama" in client_patcher
+            and "renderMenuBackground" in client_patcher
+            and "realmsNotificationsEnabled" in client_patcher
+            and "GuiGraphics" in client_patcher
+            and "fill" in client_patcher
+            and "PanoramaRenderer.render" not in client_patcher[client_patcher.find("patchScreenBrowserFastMenus"):client_patcher.find("patchTitleScreenBrowserFastMenus")],
+        ),
+        (
+            "Minecraft patcher forces browser singleplayer distances to 1",
             "patchIntegratedServerBrowserDistances" in distance_section
             and "private static InsnList distanceClamp()" in distance_section
-            and "Opcodes.ICONST_4" not in distance_section
-            and distance_section.count("Opcodes.ICONST_2") >= 3,
+            and "IntegratedServer distance override patch points" in distance_section
+            and "Opcodes.POP" in distance_section
+            and "Opcodes.ICONST_1" in distance_section,
         ),
         (
             "Minecraft patcher resets browser server tick catchup",
@@ -281,6 +404,18 @@ def check_source_patches() -> None:
             and "net/minecraft/util/Util" in server_catchup_section,
         ),
         (
+            "Minecraft patcher uses browser fast initial spawn for normal worlds",
+            "replaceInitialSpawnForBrowser" in client_patcher
+            and "server.browserFastInitialSpawn" in client_patcher
+            and "Climate$Sampler" in client_patcher
+            and "findSpawnPosition" in client_patcher
+            and "Heightmap$Types" in client_patcher
+            and "WORLD_SURFACE" in client_patcher
+            and "PlayerSpawnFinder" in client_patcher
+            and "BlockPos.ZERO" not in client_patcher[client_patcher.find("replaceInitialSpawnForBrowser"):client_patcher.find("private static boolean patchMinecraftServerBrowserCatchupReset")]
+            and "sipush        128" not in client_patcher[client_patcher.find("replaceInitialSpawnForBrowser"):client_patcher.find("private static boolean patchMinecraftServerBrowserCatchupReset")],
+        ),
+        (
             "Minecraft patcher disables desktop asset index probing in browser",
             "patchVanillaPackResourcesBuilder" in client_patcher
             and "patchIndexedAssetSourceBrowserNoop" in client_patcher
@@ -288,10 +423,58 @@ def check_source_patches() -> None:
             and "ImmutableMap" in client_patcher,
         ),
         (
+            "CreateWorldScreen keeps normal world generation and enables commands by default",
+            "foundNormalPreset" in client_patcher
+            and "foundDefaultOptions" in client_patcher
+            and "foundNormalDimensions" in client_patcher
+            and "patchedAllowCommands" in client_patcher
+            and "patchedInitialAllowCommands" in client_patcher
+            and "setAllowCommands" in client_patcher
+            and 'field.name = "FLAT"' not in client_patcher
+            and 'call.name = "testWorldWithRandomSeed"' not in client_patcher
+            and 'call.name = "createFlatWorldDimensions"' not in client_patcher,
+        ),
+        (
+            "LevelLoadTracker has browser timeout escape for missing loading packets",
+            "patchLevelLoadTrackerBrowserTimeout" in client_patcher
+            and "Timed out while waiting for initial level loading packets in the browser" in client_patcher
+            and "LevelLoadTracker$WaitingForServer" in client_patcher
+            and "constant.cst = 5L" in client_patcher,
+        ),
+        (
+            "FramerateLimitTracker disables browser AFK/menu throttling",
+            "patchFramerateLimitTrackerBrowserNoThrottle" in client_patcher
+            and "FramerateLimitTracker$FramerateThrottleReason" in client_patcher
+            and '"getThrottleReason"' in client_patcher
+            and '"NONE"' in client_patcher,
+        ),
+        (
             "VanillaPackResources wraps embedded streams as byte arrays",
             "new ByteArrayInputStream(input.readAllBytes())" in vanilla_pack_resources
             and "openResourceStream" in vanilla_pack_resources
             and 'getResourceAsStream("/" + normalized)' in vanilla_pack_resources,
+        ),
+        (
+            "Browser storage seeds/enforces browser performance client options",
+            "DEFAULT_BROWSER_OPTIONS" in browser_file_persistence
+            and "BROWSER_PERFORMANCE_OPTIONS" in browser_file_persistence
+            and "seedDefaultOptions" in browser_file_persistence
+            and "enforcePerformanceOptions" in browser_file_persistence
+            and "renderDistance:1" in browser_file_persistence
+            and "simulationDistance:1" in browser_file_persistence
+            and "maxFps:260" in browser_file_persistence
+            and 'graphicsPreset:\\"fast\\"' in browser_file_persistence
+            and 'renderClouds:\\"false\\"' in browser_file_persistence
+            and "menuBackgroundBlurriness:0" in browser_file_persistence
+            and "panoramaSpeed:0.0" in browser_file_persistence
+            and "screenEffectScale:0.0" in browser_file_persistence
+            and "maxAnisotropyBit:0" in browser_file_persistence
+            and "textureFiltering:0" in browser_file_persistence
+            and "particles:2" in browser_file_persistence
+            and "storage-restore-crashed" in browser_file_persistence
+            and "writeDefaultOptions" in browser_file_persistence
+            and "catch (Throwable exception)" in browser_file_persistence
+            and "existing != null && existing.isFile()" in browser_file_persistence,
         ),
         (
             "Minecraft patcher replaces ICU LocalTime item model path in browser",
@@ -343,6 +526,25 @@ def check_source_patches() -> None:
             and '("gzip", ".gz")' in serve_dist
             and "Cross-Origin-Embedder-Policy" in serve_dist,
         ),
+        (
+            "Browser boot UI has progress and does not disable chat/commands",
+            "boot-progress-bar" in index_html
+            and "__gaiusSetBootProgress" in index_html
+            and "__gaiusFps" in index_html
+            and "perf-hud" in index_html
+            and "targetFps" in index_html
+            and "Game FPS" in index_html
+            and "RAF FPS" in index_html
+            and "__gaiusMaxDpr" in index_html
+            and '|| 0.35' in index_html
+            and "maybeDegradeResolutionForFps" in index_html
+            and "if (!inWorld) return" not in index_html
+            and "storage-options-preflight" in index_html
+            and "__gaiusFsDelete" in index_html
+            and "removed persisted browser options" in index_html
+            and "超过 30 秒没有进度变化" in index_html
+            and '"--disableChat"' not in index_html,
+        ),
     ]
     for name, ok in checks:
         print(f"{'OK' if ok else 'FAIL'} {name}")
@@ -354,6 +556,7 @@ def check_overlay_bytecode() -> None:
     netty_common_cp = OVERLAYS / "library-patches" / "netty-common"
     netty_cp = OVERLAYS / "library-patches" / "netty-transport"
     classlib_cp = OVERLAYS / "classlib-patches"
+    classlib_classes_cp = OVERLAYS / "classlib-classes"
     lwjgl_opengl_cp = OVERLAYS / "library-classes" / "lwjgl-opengl"
     lwjgl_opengl_patch_cp = OVERLAYS / "library-patches" / "lwjgl-opengl"
     lwjgl_glfw_cp = OVERLAYS / "libraries" / "org" / "lwjgl" / "lwjgl-glfw" / "3.3.3" / "lwjgl-glfw-3.3.3.jar"
@@ -367,15 +570,51 @@ def check_overlay_bytecode() -> None:
     class_tree_id_registry = run_javap(client_cp, "net.minecraft.util.ClassTreeIdRegistry")
     synched_entity_data = run_javap(client_cp, "net.minecraft.network.syncher.SynchedEntityData")
     integrated_server = run_javap(client_cp, "net.minecraft.client.server.IntegratedServer")
+    screen = run_javap(client_cp, "net.minecraft.client.gui.screens.Screen")
+    title_screen = run_javap(client_cp, "net.minecraft.client.gui.screens.TitleScreen")
+    abstract_button = run_javap(client_cp, "net.minecraft.client.gui.components.AbstractButton")
+    gui_graphics = run_javap(client_cp, "net.minecraft.client.gui.GuiGraphics")
+    browser_gui_item_cache = run_javap(client_cp, "dev.gaius.browser.BrowserGuiItemCache")
+    game_renderer = run_javap(client_cp, "net.minecraft.client.renderer.GameRenderer")
     minecraft_server = run_javap(client_cp, "net.minecraft.server.MinecraftServer")
     gl_device = run_javap(client_cp, "com.mojang.blaze3d.opengl.GlDevice")
     vanilla_pack_builder = run_javap(client_cp, "net.minecraft.server.packs.VanillaPackResourcesBuilder")
     indexed_asset_source = run_javap(client_cp, "net.minecraft.client.resources.IndexedAssetSource")
     vanilla_pack_resources = run_javap(client_cp, "net.minecraft.server.packs.VanillaPackResources")
     local_time = run_javap(client_cp, "net.minecraft.client.renderer.item.properties.select.LocalTime")
+    create_world_screen = run_javap(client_cp, "net.minecraft.client.gui.screens.worldselection.CreateWorldScreen")
+    level_load_tracker = run_javap(client_cp, "net.minecraft.client.multiplayer.LevelLoadTracker")
+    waiting_for_server = run_javap(
+        client_cp,
+        "net.minecraft.client.multiplayer.LevelLoadTracker$WaitingForServer",
+    )
+    framerate_tracker = run_javap(client_cp, "com.mojang.blaze3d.platform.FramerateLimitTracker")
     player_list = run_javap(client_cp, "net.minecraft.server.players.PlayerList")
     integrated_tick = method_section(integrated_server, "public void tickServer(java.util.function.BooleanSupplier);")
+    gui_render_item = method_section(
+        gui_graphics,
+        "private void renderItem(net.minecraft.world.entity.LivingEntity, net.minecraft.world.level.Level, net.minecraft.world.item.ItemStack, int, int, int);",
+    )
+    screen_render_panorama = method_section(
+        screen,
+        "protected void renderPanorama(net.minecraft.client.gui.GuiGraphics, float);",
+    )
+    screen_render_menu_background = method_section(
+        screen,
+        "protected void renderMenuBackground(net.minecraft.client.gui.GuiGraphics, int, int, int, int);",
+    )
+    title_realms_enabled = method_section(title_screen, "private boolean realmsNotificationsEnabled();")
+    abstract_button_sprite = method_section(
+        abstract_button,
+        "protected final void renderDefaultSprite(net.minecraft.client.gui.GuiGraphics);",
+    )
+    game_render_level = method_section(game_renderer, "public void renderLevel(net.minecraft.client.DeltaTracker);")
+    game_render_level_head = game_render_level[:1000]
     minecraft_run_server = method_section(minecraft_server, "protected void runServer();")
+    minecraft_initial_spawn = method_section(
+        minecraft_server,
+        "private static void setInitialSpawn(net.minecraft.server.level.ServerLevel, net.minecraft.world.level.storage.ServerLevelData, boolean, boolean, net.minecraft.server.level.progress.LevelLoadListener);",
+    )
     gl_device_max_texture = method_section(gl_device, "private static int getMaxSupportedTextureSize();")
     overload_at = minecraft_run_server.find("Field OVERLOADED_WARNING_INTERVAL_NANOS:J")
     overload_window = (
@@ -394,6 +633,27 @@ def check_overlay_bytecode() -> None:
         "private static com.mojang.serialization.DataResult<net.minecraft.client.renderer.item.properties.select.LocalTime> create(net.minecraft.client.renderer.item.properties.select.LocalTime$Data);",
     )
     local_time_update = method_section(local_time, "private java.lang.String update();")
+    create_world_fresh = method_section(
+        create_world_screen,
+        "private static net.minecraft.world.level.levelgen.WorldGenSettings lambda$openFresh$4(net.minecraft.server.WorldLoader$DataLoadContext);",
+    )
+    create_world_constructor = method_section(
+        create_world_screen,
+        "private net.minecraft.client.gui.screens.worldselection.CreateWorldScreen(net.minecraft.client.Minecraft, java.lang.Runnable, net.minecraft.client.gui.screens.worldselection.WorldCreationContext, java.util.Optional<net.minecraft.resources.ResourceKey<net.minecraft.world.level.levelgen.presets.WorldPreset>>, java.util.OptionalLong, net.minecraft.client.gui.screens.worldselection.CreateWorldCallback);",
+    )
+    create_world_settings = method_section(
+        create_world_screen,
+        "private net.minecraft.world.level.LevelSettings createLevelSettings(boolean);",
+    )
+    level_load_tracker_clinit = method_section(level_load_tracker, "static {};")
+    waiting_for_server_tick = method_section(
+        waiting_for_server,
+        "public net.minecraft.client.multiplayer.LevelLoadTracker$ClientState tick();",
+    )
+    framerate_reason = method_section(
+        framerate_tracker,
+        "public com.mojang.blaze3d.platform.FramerateLimitTracker$FramerateThrottleReason getThrottleReason();",
+    )
     indexed_create_fs = method_section(
         indexed_asset_source,
         "public static java.nio.file.Path createIndexFs(java.nio.file.Path, java.lang.String);",
@@ -406,11 +666,18 @@ def check_overlay_bytecode() -> None:
     channel_handler_mask = run_javap(netty_cp, "io.netty.channel.ChannelHandlerMask")
     throwable = run_javap(classlib_cp, "org.teavm.classlib.java.lang.TThrowable")
     browser_opengl = run_javap(lwjgl_opengl_cp, "org.lwjgl.opengl.BrowserOpenGL")
+    browser_file_persistence_class = run_javap(classlib_classes_cp, "dev.gaius.browser.BrowserFilePersistence")
     browser_opengl_constants = (
         browser_opengl_class.read_bytes().decode("latin1", errors="ignore")
         if browser_opengl_class.exists()
         else ""
     )
+    browser_file_persistence_constants = (
+        (classlib_classes_cp / "dev" / "gaius" / "browser" / "BrowserFilePersistence.class").read_bytes().decode("latin1", errors="ignore")
+        if (classlib_classes_cp / "dev" / "gaius" / "browser" / "BrowserFilePersistence.class").exists()
+        else ""
+    )
+    browser_glfw_constants = read_zip_entry_latin1(lwjgl_glfw_cp, "org/lwjgl/glfw/BrowserGlfw.class")
     arb_vertex_attrib = run_javap(lwjgl_opengl_patch_cp, "org.lwjgl.opengl.ARBVertexAttribBinding")
     browser_glfw = run_javap(lwjgl_glfw_cp, "org.lwjgl.glfw.BrowserGlfw")
     glfw = run_javap(lwjgl_glfw_cp, "org.lwjgl.glfw.GLFW")
@@ -540,10 +807,39 @@ def check_overlay_bytecode() -> None:
             and "bytesPerPixel" in browser_opengl,
         ),
         (
-            "BrowserOpenGL compiled overlay preserves baseVertex without extension",
+            "BrowserOpenGL compiled overlay caches shifted indices for baseVertex fallback",
             "drawElementsWithBaseVertex" in browser_opengl_constants
-            and "withBaseVertexAttribs" in browser_opengl_constants
-            and "baseVertexFallbackDraws" in browser_opengl_constants,
+            and "cacheShiftedIndexBuffer" in browser_opengl_constants
+            and "shiftedIndexCache" in browser_opengl_constants
+            and "baseVertexIndexDraws" in browser_opengl_constants,
+        ),
+        (
+            "BrowserOpenGL compiled overlay repairs shader attribute type mismatches",
+            "programAttribs" in browser_opengl_constants
+            and "refreshProgramAttribs" in browser_opengl_constants
+            and "ensureProgramAttribTypes" in browser_opengl_constants
+            and "attribTypeRepairs" in browser_opengl_constants,
+        ),
+        (
+            "BrowserOpenGL compiled overlay exposes draw-call throughput telemetry",
+            "recordDrawCall" in browser_opengl_constants
+            and "drawCallsPerSecond" in browser_opengl_constants,
+        ),
+        (
+            "BrowserOpenGL compiled overlay exposes texture upload diagnostics",
+            "recordTextureUpload" in browser_opengl_constants
+            and "recordTextureError" in browser_opengl_constants
+            and "textureUploadRecent" in browser_opengl_constants
+            and "textureUploadErrors" in browser_opengl_constants,
+        ),
+        (
+            "BrowserOpenGL compiled overlay exposes screen widget telemetry",
+            "describeScreenWidgets" in browser_opengl
+            and "screenWidgetsJson" in browser_opengl_constants
+            and "screenWidgets" in browser_opengl_constants
+            and "screenTitle" in browser_opengl_constants
+            and "screenSize" in browser_opengl_constants
+            and "getMessage" in browser_opengl,
         ),
         (
             "ARBVertexAttribBinding overlay delegates GUI vertex layout calls to BrowserOpenGL",
@@ -563,6 +859,20 @@ def check_overlay_bytecode() -> None:
             and "aconst_null" in browser_glfw,
         ),
         (
+            "BrowserGlfw compiled overlay clamps browser DPR and gates preserveDrawingBuffer",
+            "__gaiusResolvePixelRatio" in browser_glfw_constants
+            and "__gaiusApplyCanvasResolution" in browser_glfw_constants
+            and "__gaiusMaxDpr" in browser_glfw_constants
+            and "preserveDrawingBuffer" in browser_glfw_constants,
+        ),
+        (
+            "BrowserGlfw compiled overlay records game FPS from swapBuffers",
+            "swapBuffers(long);" in browser_glfw
+            and "gameFps" in browser_glfw_constants
+            and "gameFrames" in browser_glfw_constants
+            and "gameLastSampleAt" in browser_glfw_constants,
+        ),
+        (
             "GLFW compiled overlay delegates glfwGetKeyName/getKeyScancode to BrowserGlfw",
             "public static java.lang.String glfwGetKeyName(int, int);" in glfw
             and "BrowserGlfw.getKeyName" in glfw
@@ -576,22 +886,52 @@ def check_overlay_bytecode() -> None:
             and "float 1.0E-4f" in face_bakery,
         ),
         (
-            "IntegratedServer clamps browser distances to 2",
-            "public void tickServer(java.util.function.BooleanSupplier);" in integrated_tick
-            and "iconst_4" not in integrated_tick
-            and integrated_tick.count("iconst_2") >= 2
-            and integrated_tick.count("java/lang/Math.min:(II)I") >= 2,
+            "GuiGraphics.renderItem uses browser GUI item state cache",
+            "dev/gaius/browser/BrowserGuiItemCache.guiState" in gui_render_item
+            and "ItemModelResolver.updateForTopItem" not in gui_render_item
+            and "net/minecraft/client/renderer/item/TrackingItemStackRenderState" in gui_render_item
+            and "hashItemAndComponents" in browser_gui_item_cache
+            and "ItemStackRenderState.isAnimated:()Z" in browser_gui_item_cache,
         ),
         (
-            "PlayerList distance getters clamp browser distances to 2",
+            "Screen browser menus use static fill instead of dynamic panorama textures",
+            "net/minecraft/client/gui/GuiGraphics.fill:(IIIII)V" in screen_render_panorama
+            and "PanoramaRenderer.render" not in screen_render_panorama
+            and "net/minecraft/client/gui/GuiGraphics.fill:(IIIII)V" in screen_render_menu_background
+            and "renderMenuBackgroundTexture" not in screen_render_menu_background
+            and "iconst_0" in title_realms_enabled
+            and "ireturn" in title_realms_enabled,
+        ),
+        (
+            "AbstractButton browser background uses fill instead of GUI sprite blits",
+            "net/minecraft/client/gui/GuiGraphics.fill:(IIIII)V" in abstract_button_sprite
+            and "blitSprite" not in abstract_button_sprite
+            and "WidgetSprites.get" not in abstract_button_sprite,
+        ),
+        (
+            "GameRenderer.renderLevel skips world render behind browser screens",
+            "Field net/minecraft/client/Minecraft.screen:Lnet/minecraft/client/gui/screens/Screen;" in game_render_level_head
+            and "ifnull" in game_render_level_head
+            and "return" in game_render_level_head
+            and game_render_level_head.find("Field net/minecraft/client/Minecraft.screen") < game_render_level_head.find("InterfaceMethod net/minecraft/client/DeltaTracker.getGameTimeDeltaPartialTick"),
+        ),
+        (
+            "IntegratedServer forces browser distances to 1",
+            "public void tickServer(java.util.function.BooleanSupplier);" in integrated_tick
+            and "iconst_4" not in integrated_tick
+            and integrated_tick.count("iconst_1") >= 2
+            and "pop" in integrated_tick,
+        ),
+        (
+            "PlayerList distance getters force browser distances to 1",
             "public int getViewDistance();" in player_view_distance
             and "public int getSimulationDistance();" in player_sim_distance
             and "iconst_4" not in player_view_distance
             and "iconst_4" not in player_sim_distance
-            and "java/lang/Math.min:(II)I" in player_view_distance
-            and "java/lang/Math.max:(II)I" in player_view_distance
-            and "java/lang/Math.min:(II)I" in player_sim_distance
-            and "java/lang/Math.max:(II)I" in player_sim_distance,
+            and "iconst_1" in player_view_distance
+            and "pop" in player_view_distance
+            and "iconst_1" in player_sim_distance
+            and "pop" in player_sim_distance,
         ),
         (
             "MinecraftServer resets browser tick catchup before overload warning",
@@ -601,6 +941,16 @@ def check_overlay_bytecode() -> None:
             and "Field lastOverloadWarningNanos:J" in overload_window
             and "goto" in overload_window
             and "Can't keep up! Is the server overloaded?" not in minecraft_run_server,
+        ),
+        (
+            "MinecraftServer uses browser fast initial spawn path",
+            "server.browserFastInitialSpawn" in minecraft_initial_spawn
+            and "PlayerSpawnFinder.getSpawnPosInChunk" in minecraft_initial_spawn
+            and "Climate$Sampler.findSpawnPosition" in minecraft_initial_spawn
+            and "Heightmap$Types.WORLD_SURFACE" in minecraft_initial_spawn
+            and "bipush        11" not in minecraft_initial_spawn
+            and "BlockPos.ZERO" not in minecraft_initial_spawn
+            and "sipush        128" not in minecraft_initial_spawn,
         ),
         (
             "VanillaPackResourcesBuilder skips desktop classpath root probing",
@@ -622,12 +972,53 @@ def check_overlay_bytecode() -> None:
             and "java/io/InputStream.readAllBytes:()[B" in vanilla_pack_resources,
         ),
         (
+            "BrowserFilePersistence compiled overlay enforces browser performance options",
+            "seedDefaultOptions" in browser_file_persistence_class
+            and "enforcePerformanceOptions" in browser_file_persistence_class
+            and "storage-default-options" in browser_file_persistence_constants
+            and "renderDistance:1" in browser_file_persistence_constants
+            and "simulationDistance:1" in browser_file_persistence_constants
+            and "maxFps:260" in browser_file_persistence_constants
+            and 'graphicsPreset:"fast"' in browser_file_persistence_constants
+            and 'renderClouds:"false"' in browser_file_persistence_constants
+            and "menuBackgroundBlurriness:0" in browser_file_persistence_constants
+            and "panoramaSpeed:0.0" in browser_file_persistence_constants
+            and "screenEffectScale:0.0" in browser_file_persistence_constants
+            and "maxAnisotropyBit:0" in browser_file_persistence_constants
+            and "textureFiltering:0" in browser_file_persistence_constants
+            and "browser low settings after migration failure" in browser_file_persistence_constants,
+        ),
+        (
             "LocalTime item model property avoids ICU formatter path in browser",
             "com/mojang/serialization/DataResult.success:(Ljava/lang/Object;)Lcom/mojang/serialization/DataResult;" in local_time_create
             and "com/ibm/icu/text/SimpleDateFormat" not in local_time_create
             and "java/util/Date.getMonth:()I" in local_time_update
             and "java/util/Date.getDate:()I" in local_time_update
             and "java/lang/StringBuilder.append:(I)Ljava/lang/StringBuilder;" in local_time_update,
+        ),
+        (
+            "CreateWorldScreen compiled overlay defaults to normal dimensions and commands enabled",
+            "WorldOptions.defaultWithRandomSeed" in create_world_fresh
+            and "WorldPresets.createNormalWorldDimensions" in create_world_fresh
+            and "WorldOptions.testWorldWithRandomSeed" not in create_world_fresh
+            and "WorldPresets.createFlatWorldDimensions" not in create_world_fresh
+            and "WorldCreationUiState.setAllowCommands:(Z)V" in create_world_constructor
+            and "iconst_1" in create_world_constructor
+            and "WorldCreationUiState.isAllowCommands" not in create_world_settings
+            and "iconst_1" in create_world_settings,
+        ),
+        (
+            "LevelLoadTracker compiled overlay times out missing loading packets quickly",
+            "ldc2_w        #156                // long 5l" in level_load_tracker_clinit
+            and "Timed out while waiting for initial level loading packets in the browser" in waiting_for_server_tick
+            and "loadingPacketsReceived" in waiting_for_server_tick,
+        ),
+        (
+            "FramerateLimitTracker compiled overlay returns NONE throttle reason in browser",
+            "FramerateLimitTracker$FramerateThrottleReason.NONE" in framerate_reason
+            and "areturn" in framerate_reason
+            and "isIconified" not in framerate_reason
+            and "InactivityFpsLimit" not in framerate_reason,
         ),
     ]
     for name, ok in checks:

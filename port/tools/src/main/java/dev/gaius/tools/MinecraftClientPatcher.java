@@ -42,6 +42,8 @@ public final class MinecraftClientPatcher {
         patchSynchedEntityDataClassInitialization(
                 args[0], root.resolve("net/minecraft/network/syncher/SynchedEntityData.class"));
         patchGlx(args[0], root.resolve("com/mojang/blaze3d/platform/GLX.class"));
+        patchFramerateLimitTrackerBrowserNoThrottle(args[0], root.resolve(
+                "com/mojang/blaze3d/platform/FramerateLimitTracker.class"));
         patchTracyZoneFiller(
                 args[0], root.resolve("net/minecraft/util/profiling/TracyZoneFiller.class"));
         patchMacosUtil(
@@ -53,6 +55,8 @@ public final class MinecraftClientPatcher {
                         + "DebugEntryMemory$AllocationRateCalculator.class"));
         patchMainBrowserStorageMount(args[0], root.resolve("net/minecraft/client/main/Main.class"));
         patchMinecraft(args[0], root.resolve("net/minecraft/client/Minecraft.class"));
+        patchGuiGraphicsBrowserItemCache(args[0], root.resolve(
+                "net/minecraft/client/gui/GuiGraphics.class"));
         patchFreeTypeUtil(args[0], root.resolve(
                 "net/minecraft/client/gui/font/providers/FreeTypeUtil.class"));
         patchDebugMemoryUntracker(args[0], root.resolve(
@@ -102,6 +106,12 @@ public final class MinecraftClientPatcher {
                 "com/mojang/blaze3d/platform/ClientShutdownWatchdog.class"));
         patchAccountProfileKeys(args[0], root.resolve(
                 "net/minecraft/client/multiplayer/AccountProfileKeyPairManager.class"));
+        patchScreenBrowserFastMenus(args[0], root.resolve(
+                "net/minecraft/client/gui/screens/Screen.class"));
+        patchTitleScreenBrowserFastMenus(args[0], root.resolve(
+                "net/minecraft/client/gui/screens/TitleScreen.class"));
+        patchAbstractButtonBrowserFastSprite(args[0], root.resolve(
+                "net/minecraft/client/gui/components/AbstractButton.class"));
         patchCreateWorldScreenBrowserDefaults(args[0], root.resolve(
                 "net/minecraft/client/gui/screens/worldselection/CreateWorldScreen.class"));
         patchWorldSelectionListTelemetry(args[0], root.resolve(
@@ -134,6 +144,7 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/client/renderer/LevelRenderer.class"));
         patchFaceBakeryBrowserFloatTolerance(args[0], root.resolve(
                 "net/minecraft/client/renderer/block/model/FaceBakery.class"));
+        patchLevelLoadTrackerBrowserTimeout(args[0], root);
         patchClientPacketListenerLoadingDiagnostics(args[0], root.resolve(
                 "net/minecraft/client/multiplayer/ClientPacketListener.class"));
         patchWorldUnloadTelemetry(args[0], root.resolve(
@@ -152,6 +163,24 @@ public final class MinecraftClientPatcher {
                 "mount",
                 "()V",
                 false));
+        write(node, output);
+    }
+
+    private static void patchFramerateLimitTrackerBrowserNoThrottle(String jar, Path output)
+            throws IOException {
+        ClassNode node = read(jar, "com/mojang/blaze3d/platform/FramerateLimitTracker.class");
+        MethodNode method = find(
+                node,
+                "getThrottleReason",
+                "()Lcom/mojang/blaze3d/platform/FramerateLimitTracker$FramerateThrottleReason;");
+        InsnList code = new InsnList();
+        code.add(new FieldInsnNode(
+                Opcodes.GETSTATIC,
+                "com/mojang/blaze3d/platform/FramerateLimitTracker$FramerateThrottleReason",
+                "NONE",
+                "Lcom/mojang/blaze3d/platform/FramerateLimitTracker$FramerateThrottleReason;"));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(method, code, 1, 1);
         write(node, output);
     }
 
@@ -244,9 +273,11 @@ public final class MinecraftClientPatcher {
             throws IOException {
         ClassNode node = read(jar,
                 "net/minecraft/client/gui/screens/worldselection/CreateWorldScreen.class");
-        boolean patchedPreset = false;
-        boolean patchedOptions = false;
-        boolean patchedDimensions = false;
+        boolean foundNormalPreset = false;
+        boolean foundDefaultOptions = false;
+        boolean foundNormalDimensions = false;
+        boolean patchedAllowCommands = false;
+        boolean patchedInitialAllowCommands = false;
         for (MethodNode method : node.methods) {
             if (method.name.equals("openFresh")
                     && method.desc.equals("(Lnet/minecraft/client/Minecraft;Ljava/lang/Runnable;"
@@ -258,8 +289,7 @@ public final class MinecraftClientPatcher {
                             && field.owner.equals("net/minecraft/world/level/levelgen/presets/WorldPresets")
                             && field.name.equals("NORMAL")
                             && field.desc.equals("Lnet/minecraft/resources/ResourceKey;")) {
-                        field.name = "FLAT";
-                        patchedPreset = true;
+                        foundNormalPreset = true;
                     }
                 }
             } else if (method.name.equals("lambda$openFresh$4")
@@ -272,20 +302,73 @@ public final class MinecraftClientPatcher {
                             && call.owner.equals("net/minecraft/world/level/levelgen/WorldOptions")
                             && call.name.equals("defaultWithRandomSeed")
                             && call.desc.equals("()Lnet/minecraft/world/level/levelgen/WorldOptions;")) {
-                        call.name = "testWorldWithRandomSeed";
-                        patchedOptions = true;
+                        foundDefaultOptions = true;
                     } else if (instruction instanceof MethodInsnNode call
                             && call.owner.equals("net/minecraft/world/level/levelgen/presets/WorldPresets")
                             && call.name.equals("createNormalWorldDimensions")
                             && call.desc.equals("(Lnet/minecraft/core/HolderLookup$Provider;)"
                                     + "Lnet/minecraft/world/level/levelgen/WorldDimensions;")) {
-                        call.name = "createFlatWorldDimensions";
-                        patchedDimensions = true;
+                        foundNormalDimensions = true;
+                    }
+                }
+            } else if (method.name.equals("createLevelSettings")
+                    && method.desc.equals("(Z)Lnet/minecraft/world/level/LevelSettings;")) {
+                for (var instruction = method.instructions.getFirst();
+                        instruction != null;
+                        instruction = instruction.getNext()) {
+                    if (instruction instanceof MethodInsnNode call
+                            && call.owner.equals("net/minecraft/client/gui/screens/worldselection/WorldCreationUiState")
+                            && call.name.equals("isAllowCommands")
+                            && call.desc.equals("()Z")) {
+                        InsnList replacement = new InsnList();
+                        replacement.add(new InsnNode(Opcodes.POP));
+                        replacement.add(new InsnNode(Opcodes.ICONST_1));
+                        method.instructions.insertBefore(call, replacement);
+                        method.instructions.remove(call);
+                        patchedAllowCommands = true;
+                        break;
+                    }
+                }
+            } else if (method.name.equals("<init>")
+                    && method.desc.equals("(Lnet/minecraft/client/Minecraft;Ljava/lang/Runnable;"
+                            + "Lnet/minecraft/client/gui/screens/worldselection/WorldCreationContext;"
+                            + "Ljava/util/Optional;Ljava/util/OptionalLong;"
+                            + "Lnet/minecraft/client/gui/screens/worldselection/CreateWorldCallback;)V")) {
+                for (var instruction = method.instructions.getFirst();
+                        instruction != null;
+                        instruction = instruction.getNext()) {
+                    if (instruction instanceof FieldInsnNode field
+                            && field.getOpcode() == Opcodes.PUTFIELD
+                            && field.owner.equals("net/minecraft/client/gui/screens/worldselection/CreateWorldScreen")
+                            && field.name.equals("uiState")
+                            && field.desc.equals("Lnet/minecraft/client/gui/screens/worldselection/WorldCreationUiState;")) {
+                        InsnList enableCommands = new InsnList();
+                        enableCommands.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                        enableCommands.add(new FieldInsnNode(
+                                Opcodes.GETFIELD,
+                                "net/minecraft/client/gui/screens/worldselection/CreateWorldScreen",
+                                "uiState",
+                                "Lnet/minecraft/client/gui/screens/worldselection/WorldCreationUiState;"));
+                        enableCommands.add(new InsnNode(Opcodes.ICONST_1));
+                        enableCommands.add(new MethodInsnNode(
+                                Opcodes.INVOKEVIRTUAL,
+                                "net/minecraft/client/gui/screens/worldselection/WorldCreationUiState",
+                                "setAllowCommands",
+                                "(Z)V",
+                                false));
+                        method.instructions.insert(field, enableCommands);
+                        method.maxStack = Math.max(method.maxStack, 3);
+                        patchedInitialAllowCommands = true;
+                        break;
                     }
                 }
             }
         }
-        if (!patchedPreset || !patchedOptions || !patchedDimensions) {
+        if (!foundNormalPreset
+                || !foundDefaultOptions
+                || !foundNormalDimensions
+                || !patchedAllowCommands
+                || !patchedInitialAllowCommands) {
             throw new IllegalStateException("CreateWorldScreen browser default world patch points were not found");
         }
         write(node, output);
@@ -322,6 +405,202 @@ public final class MinecraftClientPatcher {
             throw new IllegalStateException("SynchedEntityData.defineId registry patch point was not found");
         }
         addInitializeSynchedDataSuperclassesHelper(node);
+        writeComputeFrames(node, output);
+    }
+
+    private static void patchScreenBrowserFastMenus(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/client/gui/screens/Screen.class");
+
+        MethodNode panorama = find(node, "renderPanorama",
+                "(Lnet/minecraft/client/gui/GuiGraphics;F)V");
+        InsnList panoramaCode = new InsnList();
+        panoramaCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        panoramaCode.add(new InsnNode(Opcodes.ICONST_0));
+        panoramaCode.add(new InsnNode(Opcodes.ICONST_0));
+        panoramaCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        panoramaCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/gui/screens/Screen",
+                "width",
+                "I"));
+        panoramaCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        panoramaCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/gui/screens/Screen",
+                "height",
+                "I"));
+        panoramaCode.add(new LdcInsnNode(0xFF101820));
+        panoramaCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/gui/GuiGraphics",
+                "fill",
+                "(IIIII)V",
+                false));
+        panoramaCode.add(new InsnNode(Opcodes.RETURN));
+        replace(panorama, panoramaCode, 6, 3);
+
+        MethodNode menuBackground = find(node, "renderMenuBackground",
+                "(Lnet/minecraft/client/gui/GuiGraphics;IIII)V");
+        InsnList menuCode = new InsnList();
+        menuCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        menuCode.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        menuCode.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        menuCode.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        menuCode.add(new VarInsnNode(Opcodes.ILOAD, 4));
+        menuCode.add(new InsnNode(Opcodes.IADD));
+        menuCode.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        menuCode.add(new VarInsnNode(Opcodes.ILOAD, 5));
+        menuCode.add(new InsnNode(Opcodes.IADD));
+        menuCode.add(new LdcInsnNode(0xC0101820));
+        menuCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/gui/GuiGraphics",
+                "fill",
+                "(IIIII)V",
+                false));
+        menuCode.add(new InsnNode(Opcodes.RETURN));
+        replace(menuBackground, menuCode, 6, 6);
+
+        write(node, output);
+    }
+
+    private static void patchTitleScreenBrowserFastMenus(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/client/gui/screens/TitleScreen.class");
+        MethodNode realms = find(node, "realmsNotificationsEnabled", "()Z");
+        InsnList code = new InsnList();
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new InsnNode(Opcodes.IRETURN));
+        replace(realms, code, 1, 1);
+        write(node, output);
+    }
+
+    private static void patchAbstractButtonBrowserFastSprite(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/client/gui/components/AbstractButton.class");
+        MethodNode method = find(node, "renderDefaultSprite",
+                "(Lnet/minecraft/client/gui/GuiGraphics;)V");
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/gui/components/AbstractButton",
+                "getX",
+                "()I",
+                false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/gui/components/AbstractButton",
+                "getY",
+                "()I",
+                false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/gui/components/AbstractButton",
+                "getX",
+                "()I",
+                false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/gui/components/AbstractButton",
+                "getWidth",
+                "()I",
+                false));
+        code.add(new InsnNode(Opcodes.IADD));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/gui/components/AbstractButton",
+                "getY",
+                "()I",
+                false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/gui/components/AbstractButton",
+                "getHeight",
+                "()I",
+                false));
+        code.add(new InsnNode(Opcodes.IADD));
+        code.add(new LdcInsnNode(0xD02A3440));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/gui/GuiGraphics",
+                "fill",
+                "(IIIII)V",
+                false));
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(method, code, 6, 2);
+        write(node, output);
+    }
+
+    private static void patchGuiGraphicsBrowserItemCache(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/client/gui/GuiGraphics.class");
+        MethodNode method = find(node, "renderItem",
+                "(Lnet/minecraft/world/entity/LivingEntity;Lnet/minecraft/world/level/Level;"
+                        + "Lnet/minecraft/world/item/ItemStack;III)V");
+        AbstractInsnNode start = null;
+        AbstractInsnNode end = null;
+        for (var instruction = method.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (start == null
+                    && instruction instanceof TypeInsnNode type
+                    && type.getOpcode() == Opcodes.NEW
+                    && type.desc.equals("net/minecraft/client/renderer/item/TrackingItemStackRenderState")) {
+                start = instruction;
+            }
+            if (start != null
+                    && instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                    && call.owner.equals("net/minecraft/client/renderer/item/ItemModelResolver")
+                    && call.name.equals("updateForTopItem")
+                    && call.desc.equals("(Lnet/minecraft/client/renderer/item/ItemStackRenderState;"
+                            + "Lnet/minecraft/world/item/ItemStack;"
+                            + "Lnet/minecraft/world/item/ItemDisplayContext;"
+                            + "Lnet/minecraft/world/level/Level;"
+                            + "Lnet/minecraft/world/entity/ItemOwner;I)V")) {
+                end = instruction;
+                break;
+            }
+        }
+        if (start == null || end == null) {
+            throw new IllegalStateException("GuiGraphics browser item cache patch points were not found");
+        }
+
+        InsnList replacement = new InsnList();
+        replacement.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        replacement.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/gui/GuiGraphics",
+                "minecraft",
+                "Lnet/minecraft/client/Minecraft;"));
+        replacement.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        replacement.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        replacement.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        replacement.add(new VarInsnNode(Opcodes.ILOAD, 6));
+        replacement.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserGuiItemCache",
+                "guiState",
+                "(Lnet/minecraft/client/Minecraft;Lnet/minecraft/world/item/ItemStack;"
+                        + "Lnet/minecraft/world/level/Level;Lnet/minecraft/world/entity/LivingEntity;I)"
+                        + "Lnet/minecraft/client/renderer/item/TrackingItemStackRenderState;",
+                false));
+        replacement.add(new VarInsnNode(Opcodes.ASTORE, 7));
+
+        method.instructions.insertBefore(start, replacement);
+        for (var instruction = start; instruction != null;) {
+            var next = instruction.getNext();
+            method.instructions.remove(instruction);
+            if (instruction == end) {
+                break;
+            }
+            instruction = next;
+        }
+        method.maxStack = Math.max(method.maxStack, 6);
         writeComputeFrames(node, output);
     }
 
@@ -1353,6 +1632,27 @@ public final class MinecraftClientPatcher {
     private static void patchGameRendererBrowserAutoScreenshot(String jar, Path output)
             throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/renderer/GameRenderer.class");
+        MethodNode renderLevel = find(node, "renderLevel",
+                "(Lnet/minecraft/client/DeltaTracker;)V");
+        InsnList skipLevelWhenScreenOpen = new InsnList();
+        LabelNode noScreen = new LabelNode();
+        skipLevelWhenScreenOpen.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        skipLevelWhenScreenOpen.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/GameRenderer",
+                "minecraft",
+                "Lnet/minecraft/client/Minecraft;"));
+        skipLevelWhenScreenOpen.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/Minecraft",
+                "screen",
+                "Lnet/minecraft/client/gui/screens/Screen;"));
+        skipLevelWhenScreenOpen.add(new JumpInsnNode(Opcodes.IFNULL, noScreen));
+        skipLevelWhenScreenOpen.add(new InsnNode(Opcodes.RETURN));
+        skipLevelWhenScreenOpen.add(noScreen);
+        renderLevel.instructions.insert(skipLevelWhenScreenOpen);
+        renderLevel.maxStack = Math.max(renderLevel.maxStack, 1);
+
         MethodNode method = find(node, "tryTakeScreenshotIfNeeded", "()V");
         InsnList code = new InsnList();
         LabelNode done = new LabelNode();
@@ -1380,7 +1680,7 @@ public final class MinecraftClientPatcher {
         code.add(done);
         code.add(new InsnNode(Opcodes.RETURN));
         replace(method, code, 2, 1);
-        write(node, output);
+        writeComputeFrames(node, output);
     }
 
     private static void patchParticleGroupBrowserTickSafety(String jar, Path output)
@@ -2324,6 +2624,92 @@ public final class MinecraftClientPatcher {
         write(node, output);
     }
 
+    private static void patchLevelLoadTrackerBrowserTimeout(String jar, Path root) throws IOException {
+        ClassNode tracker = read(jar, "net/minecraft/client/multiplayer/LevelLoadTracker.class");
+        boolean patchedClientWaitTimeout = false;
+        for (MethodNode method : tracker.methods) {
+            if (!method.name.equals("<clinit>")) {
+                continue;
+            }
+            for (var instruction = method.instructions.getFirst();
+                    instruction != null;
+                    instruction = instruction.getNext()) {
+                if (instruction instanceof LdcInsnNode constant
+                        && constant.cst instanceof Long value
+                        && value == 30L) {
+                    constant.cst = 5L;
+                    patchedClientWaitTimeout = true;
+                    break;
+                }
+            }
+        }
+        if (!patchedClientWaitTimeout) {
+            throw new IllegalStateException("LevelLoadTracker timeout patch point was not found");
+        }
+        write(tracker, root.resolve("net/minecraft/client/multiplayer/LevelLoadTracker.class"));
+
+        ClassNode waiting = read(jar, "net/minecraft/client/multiplayer/LevelLoadTracker$WaitingForServer.class");
+        MethodNode tick = null;
+        for (MethodNode method : waiting.methods) {
+            if (method.name.equals("tick")
+                    && method.desc.equals("()Lnet/minecraft/client/multiplayer/LevelLoadTracker$ClientState;")) {
+                tick = method;
+                break;
+            }
+        }
+        if (tick == null) {
+            tick = new MethodNode(
+                    Opcodes.ACC_PUBLIC,
+                    "tick",
+                    "()Lnet/minecraft/client/multiplayer/LevelLoadTracker$ClientState;",
+                    null,
+                    null);
+            waiting.methods.add(tick);
+        }
+        LabelNode notTimedOut = new LabelNode();
+        InsnList code = new InsnList();
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "net/minecraft/util/Util",
+                "getMillis",
+                "()J",
+                false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/multiplayer/LevelLoadTracker$WaitingForServer",
+                "timeoutAfter",
+                "J"));
+        code.add(new InsnNode(Opcodes.LCMP));
+        code.add(new JumpInsnNode(Opcodes.IFLE, notTimedOut));
+        code.add(new FieldInsnNode(
+                Opcodes.GETSTATIC,
+                "net/minecraft/client/multiplayer/LevelLoadTracker",
+                "LOGGER",
+                "Lorg/slf4j/Logger;"));
+        code.add(new LdcInsnNode(
+                "Timed out while waiting for initial level loading packets in the browser, continuing anyway"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "org/slf4j/Logger",
+                "warn",
+                "(Ljava/lang/String;)V",
+                true));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/multiplayer/LevelLoadTracker$WaitingForServer",
+                "loadingPacketsReceived",
+                "()Lnet/minecraft/client/multiplayer/LevelLoadTracker$ClientState;",
+                false));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        code.add(notTimedOut);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(tick, code, 4, 1);
+        write(waiting, root.resolve("net/minecraft/client/multiplayer/LevelLoadTracker$WaitingForServer.class"));
+    }
+
     private static void patchServerLevelBrowserSafeDefaults(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "net/minecraft/server/level/ServerLevel.class");
         MethodNode method = find(node, "isSpawningMonsters", "()Z");
@@ -2337,32 +2723,34 @@ public final class MinecraftClientPatcher {
     private static void patchIntegratedServerBrowserDistances(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/server/IntegratedServer.class");
         MethodNode method = find(node, "tickServer", "(Ljava/util/function/BooleanSupplier;)V");
-        int patched = 0;
+        boolean afterServerTick = false;
+        int patchedStores = 0;
         for (var instruction = method.instructions.getFirst();
                 instruction != null;
                 instruction = instruction.getNext()) {
             if (instruction instanceof MethodInsnNode call
-                    && call.getOpcode() == Opcodes.INVOKESTATIC
-                    && call.owner.equals("java/lang/Math")
-                    && call.name.equals("max")
-                    && call.desc.equals("(II)I")) {
-                InsnList clamp = new InsnList();
-                clamp.add(new InsnNode(Opcodes.ICONST_2));
-                clamp.add(new MethodInsnNode(
-                        Opcodes.INVOKESTATIC,
-                        "java/lang/Math",
-                        "min",
-                        "(II)I",
-                        false));
-                method.instructions.insert(instruction, clamp);
-                patched++;
-                if (patched == 2) {
+                    && call.getOpcode() == Opcodes.INVOKESPECIAL
+                    && call.owner.equals("net/minecraft/server/MinecraftServer")
+                    && call.name.equals("tickServer")
+                    && call.desc.equals("(Ljava/util/function/BooleanSupplier;)V")) {
+                afterServerTick = true;
+                continue;
+            }
+            if (afterServerTick
+                    && instruction instanceof VarInsnNode store
+                    && store.getOpcode() == Opcodes.ISTORE) {
+                InsnList override = new InsnList();
+                override.add(new InsnNode(Opcodes.POP));
+                override.add(new InsnNode(Opcodes.ICONST_1));
+                method.instructions.insertBefore(instruction, override);
+                patchedStores++;
+                if (patchedStores == 2) {
                     break;
                 }
             }
         }
-        if (patched != 2) {
-            throw new IllegalStateException("IntegratedServer distance clamp patch points were not found");
+        if (patchedStores != 2) {
+            throw new IllegalStateException("IntegratedServer distance override patch points were not found");
         }
         method.maxStack = Math.max(method.maxStack, 2);
         write(node, output);
@@ -2399,20 +2787,8 @@ public final class MinecraftClientPatcher {
 
     private static InsnList distanceClamp() {
         InsnList code = new InsnList();
-        code.add(new InsnNode(Opcodes.ICONST_2));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKESTATIC,
-                "java/lang/Math",
-                "min",
-                "(II)I",
-                false));
-        code.add(new InsnNode(Opcodes.ICONST_2));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKESTATIC,
-                "java/lang/Math",
-                "max",
-                "(II)I",
-                false));
+        code.add(new InsnNode(Opcodes.POP));
+        code.add(new InsnNode(Opcodes.ICONST_1));
         return code;
     }
 
@@ -2629,6 +3005,7 @@ public final class MinecraftClientPatcher {
         ClassNode node = read(jar, "net/minecraft/server/MinecraftServer.class");
         String owner = "net/minecraft/server/MinecraftServer";
         boolean patchedPrepareLevels = false;
+        boolean patchedInitialSpawn = false;
         boolean patchedRunServerReady = false;
         boolean patchedRunServerStopDiagnostics = false;
         boolean patchedRunServerBrowserCatchupReset = false;
@@ -2727,6 +3104,12 @@ public final class MinecraftClientPatcher {
                 code.add(new InsnNode(Opcodes.RETURN));
                 replace(method, code, 3, 1);
                 patchedPrepareLevels = true;
+            } else if (method.name.equals("setInitialSpawn")
+                    && method.desc.equals("(Lnet/minecraft/server/level/ServerLevel;"
+                            + "Lnet/minecraft/world/level/storage/ServerLevelData;"
+                            + "ZZLnet/minecraft/server/level/progress/LevelLoadListener;)V")) {
+                replaceInitialSpawnForBrowser(method);
+                patchedInitialSpawn = true;
             } else if (method.name.equals("runServer") && method.desc.equals("()V")) {
                 for (var instruction = method.instructions.getFirst();
                         instruction != null;
@@ -2751,12 +3134,171 @@ public final class MinecraftClientPatcher {
             }
         }
         if (!patchedPrepareLevels
+                || !patchedInitialSpawn
                 || !patchedRunServerReady
                 || !patchedRunServerStopDiagnostics
                 || !patchedRunServerBrowserCatchupReset) {
             throw new IllegalStateException("MinecraftServer browser patch points were not found");
         }
         writeComputeFrames(node, output);
+    }
+
+    private static void replaceInitialSpawnForBrowser(MethodNode method) {
+        InsnList code = new InsnList();
+        LabelNode foundSpawn = new LabelNode();
+
+        code.add(minecraftEvent("server.browserFastInitialSpawn"));
+
+        code.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        code.add(new FieldInsnNode(
+                Opcodes.GETSTATIC,
+                "net/minecraft/server/level/progress/LevelLoadListener$Stage",
+                "PREPARE_GLOBAL_SPAWN",
+                "Lnet/minecraft/server/level/progress/LevelLoadListener$Stage;"));
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "net/minecraft/server/level/progress/LevelLoadListener",
+                "start",
+                "(Lnet/minecraft/server/level/progress/LevelLoadListener$Stage;I)V",
+                true));
+
+        code.add(new TypeInsnNode(Opcodes.NEW, "net/minecraft/world/level/ChunkPos"));
+        code.add(new InsnNode(Opcodes.DUP));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/server/level/ServerLevel",
+                "getChunkSource",
+                "()Lnet/minecraft/server/level/ServerChunkCache;",
+                false));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/server/level/ServerChunkCache",
+                "randomState",
+                "()Lnet/minecraft/world/level/levelgen/RandomState;",
+                false));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/world/level/levelgen/RandomState",
+                "sampler",
+                "()Lnet/minecraft/world/level/biome/Climate$Sampler;",
+                false));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/world/level/biome/Climate$Sampler",
+                "findSpawnPosition",
+                "()Lnet/minecraft/core/BlockPos;",
+                false));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                "net/minecraft/world/level/ChunkPos",
+                "<init>",
+                "(Lnet/minecraft/core/BlockPos;)V",
+                false));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 5));
+
+        code.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/server/level/ServerLevel",
+                "dimension",
+                "()Lnet/minecraft/resources/ResourceKey;",
+                false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "net/minecraft/server/level/progress/LevelLoadListener",
+                "updateFocus",
+                "(Lnet/minecraft/resources/ResourceKey;Lnet/minecraft/world/level/ChunkPos;)V",
+                true));
+
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "net/minecraft/server/level/PlayerSpawnFinder",
+                "getSpawnPosInChunk",
+                "(Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/world/level/ChunkPos;)"
+                        + "Lnet/minecraft/core/BlockPos;",
+                false));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 6));
+
+        code.add(new VarInsnNode(Opcodes.ALOAD, 6));
+        code.add(new JumpInsnNode(Opcodes.IFNONNULL, foundSpawn));
+        code.add(minecraftEvent("server.browserFastInitialSpawnFallback"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETSTATIC,
+                "net/minecraft/world/level/levelgen/Heightmap$Types",
+                "WORLD_SURFACE",
+                "Lnet/minecraft/world/level/levelgen/Heightmap$Types;"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/world/level/ChunkPos",
+                "getWorldPosition",
+                "()Lnet/minecraft/core/BlockPos;",
+                false));
+        code.add(new IntInsnNode(Opcodes.BIPUSH, 8));
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new IntInsnNode(Opcodes.BIPUSH, 8));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/core/BlockPos",
+                "offset",
+                "(III)Lnet/minecraft/core/BlockPos;",
+                false));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/server/level/ServerLevel",
+                "getHeightmapPos",
+                "(Lnet/minecraft/world/level/levelgen/Heightmap$Types;"
+                        + "Lnet/minecraft/core/BlockPos;)Lnet/minecraft/core/BlockPos;",
+                false));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 6));
+        code.add(foundSpawn);
+
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/server/level/ServerLevel",
+                "dimension",
+                "()Lnet/minecraft/resources/ResourceKey;",
+                false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 6));
+        code.add(new InsnNode(Opcodes.FCONST_0));
+        code.add(new InsnNode(Opcodes.FCONST_0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "net/minecraft/world/level/storage/LevelData$RespawnData",
+                "of",
+                "(Lnet/minecraft/resources/ResourceKey;Lnet/minecraft/core/BlockPos;FF)"
+                        + "Lnet/minecraft/world/level/storage/LevelData$RespawnData;",
+                false));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "net/minecraft/world/level/storage/ServerLevelData",
+                "setSpawn",
+                "(Lnet/minecraft/world/level/storage/LevelData$RespawnData;)V",
+                true));
+
+        code.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        code.add(new FieldInsnNode(
+                Opcodes.GETSTATIC,
+                "net/minecraft/server/level/progress/LevelLoadListener$Stage",
+                "PREPARE_GLOBAL_SPAWN",
+                "Lnet/minecraft/server/level/progress/LevelLoadListener$Stage;"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "net/minecraft/server/level/progress/LevelLoadListener",
+                "finish",
+                "(Lnet/minecraft/server/level/progress/LevelLoadListener$Stage;)V",
+                true));
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(method, code, 7, 7);
     }
 
     private static boolean patchMinecraftServerBrowserCatchupReset(MethodNode method, String owner) {

@@ -4,6 +4,8 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import org.teavm.jso.JSBody;
 import org.teavm.runtime.fs.VirtualFile;
 import org.teavm.runtime.fs.VirtualFileAccessor;
@@ -20,6 +22,77 @@ import org.teavm.runtime.fs.VirtualFileSystemProvider;
  */
 public final class BrowserFilePersistence {
     private static final String PREFIX = "gaius.fs.v1:";
+    private static final String OPTIONS_PATH = "/gaius/options.txt";
+    private static final String DEFAULT_BROWSER_OPTIONS = String.join("\n",
+            "autoJump:false",
+            "operatorItemsTab:true",
+            "renderDistance:1",
+            "simulationDistance:1",
+            "entityDistanceScaling:0.5",
+            "maxFps:260",
+            "graphicsPreset:\"fast\"",
+            "renderClouds:\"false\"",
+            "cloudRange:32",
+            "ao:false",
+            "cutoutLeaves:false",
+            "vignette:false",
+            "improvedTransparency:false",
+            "weatherRadius:0",
+            "chunkSectionFadeInTime:0.0",
+            "prioritizeChunkUpdates:0",
+            "mipmapLevels:0",
+            "maxAnisotropyBit:0",
+            "textureFiltering:0",
+            "biomeBlendRadius:0",
+            "particles:2",
+            "enableVsync:false",
+            "entityShadows:false",
+            "bobView:false",
+            "menuBackgroundBlurriness:0",
+            "panoramaSpeed:0.0",
+            "screenEffectScale:0.0",
+            "fovEffectScale:0.0",
+            "darknessEffectScale:0.0",
+            "pauseOnLostFocus:false",
+            "darkMojangStudiosBackground:false",
+            "hideSplashTexts:true",
+            "showAutosaveIndicator:false",
+            "skipMultiplayerWarning:true") + "\n";
+    private static final Map<String, String> BROWSER_PERFORMANCE_OPTIONS = Map.ofEntries(
+            Map.entry("autoJump", "false"),
+            Map.entry("operatorItemsTab", "true"),
+            Map.entry("renderDistance", "1"),
+            Map.entry("simulationDistance", "1"),
+            Map.entry("entityDistanceScaling", "0.5"),
+            Map.entry("maxFps", "260"),
+            Map.entry("graphicsPreset", "\"fast\""),
+            Map.entry("renderClouds", "\"false\""),
+            Map.entry("cloudRange", "32"),
+            Map.entry("ao", "false"),
+            Map.entry("cutoutLeaves", "false"),
+            Map.entry("vignette", "false"),
+            Map.entry("improvedTransparency", "false"),
+            Map.entry("weatherRadius", "0"),
+            Map.entry("chunkSectionFadeInTime", "0.0"),
+            Map.entry("prioritizeChunkUpdates", "0"),
+            Map.entry("mipmapLevels", "0"),
+            Map.entry("maxAnisotropyBit", "0"),
+            Map.entry("textureFiltering", "0"),
+            Map.entry("biomeBlendRadius", "0"),
+            Map.entry("particles", "2"),
+            Map.entry("enableVsync", "false"),
+            Map.entry("entityShadows", "false"),
+            Map.entry("bobView", "false"),
+            Map.entry("menuBackgroundBlurriness", "0"),
+            Map.entry("panoramaSpeed", "0.0"),
+            Map.entry("screenEffectScale", "0.0"),
+            Map.entry("fovEffectScale", "0.0"),
+            Map.entry("darknessEffectScale", "0.0"),
+            Map.entry("pauseOnLostFocus", "false"),
+            Map.entry("darkMojangStudiosBackground", "false"),
+            Map.entry("hideSplashTexts", "true"),
+            Map.entry("showAutosaveIndicator", "false"),
+            Map.entry("skipMultiplayerWarning", "true"));
     private static boolean mounted;
 
     private BrowserFilePersistence() {
@@ -33,10 +106,15 @@ public final class BrowserFilePersistence {
         String[] paths = storedPaths(PREFIX);
         int restored = 0;
         for (String path : paths) {
-            if (restore(path)) {
-                restored++;
+            try {
+                if (restore(path)) {
+                    restored++;
+                }
+            } catch (Throwable exception) {
+                report("storage-restore-crashed", normalize(path) + ": " + describe(exception));
             }
         }
+        seedDefaultOptions();
         report("storage-mounted", restored + " files");
         report("storage-backend", backendName());
     }
@@ -154,20 +232,127 @@ public final class BrowserFilePersistence {
                 || normalized.endsWith("/optionsshaders.txt");
     }
 
+    private static void seedDefaultOptions() {
+        try {
+            VirtualFileSystem fileSystem = VirtualFileSystemProvider.getInstance();
+            VirtualFile existing = fileSystem.getFile(OPTIONS_PATH);
+            if (existing != null && existing.isFile()) {
+                enforcePerformanceOptions(existing);
+                return;
+            }
+            writeDefaultOptions("browser low settings");
+        } catch (Throwable exception) {
+            report("storage-default-options-failed", describe(exception));
+        }
+    }
+
+    private static void enforcePerformanceOptions(VirtualFile file) {
+        try {
+            VirtualFileAccessor accessor = file.createAccessor(true, false, false);
+            if (accessor == null) {
+                report("storage-options-performance-failed", "open failed");
+                return;
+            }
+            byte[] bytes;
+            try {
+                int size = accessor.size();
+                bytes = new byte[size];
+                accessor.seek(0);
+                int offset = 0;
+                while (offset < size) {
+                    int read = accessor.read(bytes, offset, size - offset);
+                    if (read <= 0) {
+                        break;
+                    }
+                    offset += read;
+                }
+                if (offset < size) {
+                    bytes = Arrays.copyOf(bytes, offset);
+                }
+            } finally {
+                accessor.close();
+            }
+
+            String original = new String(bytes, StandardCharsets.UTF_8);
+            String normalized = upsertOptions(original, BROWSER_PERFORMANCE_OPTIONS);
+            if (!normalized.equals(original)) {
+                byte[] updated = normalized.getBytes(StandardCharsets.UTF_8);
+                writeVirtualFile(OPTIONS_PATH, updated);
+                persist(OPTIONS_PATH, updated);
+                report("storage-options-performance", "browser 120fps profile");
+            }
+        } catch (Throwable exception) {
+            report("storage-options-performance-failed", describe(exception));
+            try {
+                writeDefaultOptions("browser low settings after migration failure");
+            } catch (Throwable fallback) {
+                report("storage-default-options-failed", describe(fallback));
+            }
+        }
+    }
+
+    private static void writeDefaultOptions(String detail) throws IOException {
+        byte[] bytes = DEFAULT_BROWSER_OPTIONS.getBytes(StandardCharsets.UTF_8);
+        writeVirtualFile(OPTIONS_PATH, bytes);
+        persist(OPTIONS_PATH, bytes);
+        report("storage-default-options", detail);
+    }
+
+    private static String describe(Throwable exception) {
+        if (exception == null) {
+            return "unknown";
+        }
+        String message = exception.getMessage();
+        String name = exception.getClass().getName();
+        return message == null || message.isEmpty() ? name : name + ": " + message;
+    }
+
+    private static String upsertOptions(String content, Map<String, String> forced) {
+        LinkedHashMap<String, String> options = new LinkedHashMap<>();
+        if (content != null && !content.isEmpty()) {
+            String[] lines = content.split("\\R", -1);
+            for (String line : lines) {
+                if (line == null || line.isEmpty()) {
+                    continue;
+                }
+                int colon = line.indexOf(':');
+                if (colon <= 0) {
+                    continue;
+                }
+                options.put(line.substring(0, colon), line.substring(colon + 1));
+            }
+        }
+        for (Map.Entry<String, String> entry : forced.entrySet()) {
+            options.put(entry.getKey(), entry.getValue());
+        }
+        StringBuilder result = new StringBuilder(Math.max(256, options.size() * 24));
+        for (Map.Entry<String, String> entry : options.entrySet()) {
+            result.append(entry.getKey()).append(':').append(entry.getValue()).append('\n');
+        }
+        return result.toString();
+    }
+
     private static void writeVirtualFile(String path, byte[] bytes) throws IOException {
         VirtualFileSystem fileSystem = VirtualFileSystemProvider.getInstance();
         ensureParentDirectories(fileSystem, path);
         String parentPath = parent(path);
         String name = name(path);
         VirtualFile parent = fileSystem.getFile(parentPath);
+        if (parent == null || !parent.isDirectory()) {
+            throw new IOException("Could not open parent directory " + parentPath);
+        }
         VirtualFile file = fileSystem.getFile(path);
-        if (!file.isFile() && !parent.createFile(name)) {
+        if ((file == null || !file.isFile()) && !parent.createFile(name)) {
             file = fileSystem.getFile(path);
-            if (!file.isFile()) {
+            if (file == null || !file.isFile()) {
                 throw new IOException("Could not create " + path);
             }
         }
-        VirtualFileAccessor accessor = fileSystem.getFile(path).createAccessor(false, true, false);
+        file = fileSystem.getFile(path);
+        if (file == null || !file.isFile()) {
+            throw new IOException("Could not open " + path);
+        }
+        VirtualFileAccessor accessor = file.createAccessor(false, true, false);
         if (accessor == null) {
             throw new IOException("Could not open " + path);
         }
@@ -185,7 +370,7 @@ public final class BrowserFilePersistence {
         ensureParentDirectories(fileSystem, parentPath);
         VirtualFile parent = fileSystem.getFile(parent(parentPath));
         VirtualFile directory = fileSystem.getFile(parentPath);
-        if (!directory.isDirectory()) {
+        if ((directory == null || !directory.isDirectory()) && parent != null && parent.isDirectory()) {
             parent.createDirectory(name(parentPath));
         }
     }
