@@ -57,6 +57,7 @@ public final class MinecraftClientPatcher {
         patchMinecraft(args[0], root.resolve("net/minecraft/client/Minecraft.class"));
         patchGuiGraphicsBrowserItemCache(args[0], root.resolve(
                 "net/minecraft/client/gui/GuiGraphics.class"));
+        patchGuiRenderTelemetry(args[0], root);
         patchFreeTypeUtil(args[0], root.resolve(
                 "net/minecraft/client/gui/font/providers/FreeTypeUtil.class"));
         patchDebugMemoryUntracker(args[0], root.resolve(
@@ -142,6 +143,8 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/client/multiplayer/ClientLevel.class"));
         patchLevelRendererBrowserBlockBreakProgress(args[0], root.resolve(
                 "net/minecraft/client/renderer/LevelRenderer.class"));
+        patchSectionRenderDispatcherBrowserThrottles(args[0], root.resolve(
+                "net/minecraft/client/renderer/chunk/SectionRenderDispatcher.class"));
         patchFaceBakeryBrowserFloatTolerance(args[0], root.resolve(
                 "net/minecraft/client/renderer/block/model/FaceBakery.class"));
         patchLevelLoadTrackerBrowserTimeout(args[0], root);
@@ -602,6 +605,147 @@ public final class MinecraftClientPatcher {
         }
         method.maxStack = Math.max(method.maxStack, 6);
         writeComputeFrames(node, output);
+    }
+
+    private static void patchGuiRenderTelemetry(String jar, Path root) throws IOException {
+        patchGuiRenderStateTelemetry(jar, root.resolve(
+                "net/minecraft/client/gui/render/state/GuiRenderState.class"));
+        patchGuiRendererTelemetry(jar, root.resolve(
+                "net/minecraft/client/gui/render/GuiRenderer.class"));
+    }
+
+    private static void patchGuiRenderStateTelemetry(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/client/gui/render/state/GuiRenderState.class");
+        insertGuiSubmitTelemetry(find(node, "submitItem",
+                "(Lnet/minecraft/client/gui/render/state/GuiItemRenderState;)V"), "item");
+        insertGuiSubmitTelemetry(find(node, "submitText",
+                "(Lnet/minecraft/client/gui/render/state/GuiTextRenderState;)V"), "text");
+        insertGuiSubmitTelemetry(find(node, "submitPicturesInPictureState",
+                "(Lnet/minecraft/client/gui/render/state/pip/PictureInPictureRenderState;)V"), "pip");
+        insertGuiSubmitTelemetry(find(node, "submitGuiElement",
+                "(Lnet/minecraft/client/gui/render/state/GuiElementRenderState;)V"), "element");
+        insertAtStart(find(node, "submitBlitToCurrentLayer",
+                "(Lnet/minecraft/client/gui/render/state/BlitRenderState;)V"),
+                reportGuiSubmitCode("blitLayer"));
+        insertAtStart(find(node, "submitGlyphToCurrentLayer",
+                "(Lnet/minecraft/client/gui/render/state/GuiElementRenderState;)V"),
+                reportGuiSubmitCode("glyphLayer"));
+        writeComputeFrames(node, output);
+    }
+
+    private static void insertGuiSubmitTelemetry(MethodNode method, String type) {
+        for (var instruction = method.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof JumpInsnNode jump
+                    && jump.getOpcode() == Opcodes.IFNE) {
+                method.instructions.insert(jump.label, reportGuiSubmitCode(type));
+                return;
+            }
+        }
+        throw new IllegalStateException("GuiRenderState submit success branch not found: " + method.name);
+    }
+
+    private static InsnList reportGuiSubmitCode(String type) {
+        InsnList code = new InsnList();
+        code.add(new LdcInsnNode(type));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/opengl/BrowserOpenGL",
+                "reportGuiSubmit",
+                "(Ljava/lang/String;)V",
+                false));
+        return code;
+    }
+
+    private static void patchGuiRendererTelemetry(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/client/gui/render/GuiRenderer.class");
+
+        MethodNode render = find(node, "render", "(Lcom/mojang/blaze3d/buffers/GpuBufferSlice;)V");
+        insertAtStart(render, staticCall("reportGuiRenderStart", "()V"));
+
+        MethodNode draw = find(node, "draw", "(Lcom/mojang/blaze3d/buffers/GpuBufferSlice;)V");
+        InsnList drawPlan = new InsnList();
+        drawPlan.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        drawPlan.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/gui/render/GuiRenderer",
+                "draws",
+                "Ljava/util/List;"));
+        drawPlan.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/List",
+                "size",
+                "()I",
+                true));
+        drawPlan.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        drawPlan.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/gui/render/GuiRenderer",
+                "meshesToDraw",
+                "Ljava/util/List;"));
+        drawPlan.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/List",
+                "size",
+                "()I",
+                true));
+        drawPlan.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        drawPlan.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/gui/render/GuiRenderer",
+                "firstDrawIndexAfterBlur",
+                "I"));
+        drawPlan.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/opengl/BrowserOpenGL",
+                "reportGuiDrawPlan",
+                "(III)V",
+                false));
+        insertAtStart(draw, drawPlan);
+
+        MethodNode executeDraw = find(node, "executeDraw",
+                "(Lnet/minecraft/client/gui/render/GuiRenderer$Draw;"
+                        + "Lcom/mojang/blaze3d/systems/RenderPass;"
+                        + "Lcom/mojang/blaze3d/buffers/GpuBuffer;"
+                        + "Lcom/mojang/blaze3d/vertex/VertexFormat$IndexType;)V");
+        InsnList drawCall = new InsnList();
+        drawCall.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        drawCall.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/gui/render/GuiRenderer$Draw",
+                "indexCount",
+                "I"));
+        drawCall.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        drawCall.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/gui/render/GuiRenderer$Draw",
+                "baseVertex",
+                "I"));
+        drawCall.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/opengl/BrowserOpenGL",
+                "reportGuiDrawCall",
+                "(II)V",
+                false));
+        insertAtStart(executeDraw, drawCall);
+
+        writeComputeFrames(node, output);
+    }
+
+    private static InsnList staticCall(String name, String desc) {
+        InsnList code = new InsnList();
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/opengl/BrowserOpenGL",
+                name,
+                desc,
+                false));
+        return code;
+    }
+
+    private static void insertAtStart(MethodNode method, InsnList code) {
+        method.instructions.insert(code);
     }
 
     private static void addInitializeSynchedDataSuperclassesHelper(ClassNode node) {
@@ -1632,26 +1776,6 @@ public final class MinecraftClientPatcher {
     private static void patchGameRendererBrowserAutoScreenshot(String jar, Path output)
             throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/renderer/GameRenderer.class");
-        MethodNode renderLevel = find(node, "renderLevel",
-                "(Lnet/minecraft/client/DeltaTracker;)V");
-        InsnList skipLevelWhenScreenOpen = new InsnList();
-        LabelNode noScreen = new LabelNode();
-        skipLevelWhenScreenOpen.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        skipLevelWhenScreenOpen.add(new FieldInsnNode(
-                Opcodes.GETFIELD,
-                "net/minecraft/client/renderer/GameRenderer",
-                "minecraft",
-                "Lnet/minecraft/client/Minecraft;"));
-        skipLevelWhenScreenOpen.add(new FieldInsnNode(
-                Opcodes.GETFIELD,
-                "net/minecraft/client/Minecraft",
-                "screen",
-                "Lnet/minecraft/client/gui/screens/Screen;"));
-        skipLevelWhenScreenOpen.add(new JumpInsnNode(Opcodes.IFNULL, noScreen));
-        skipLevelWhenScreenOpen.add(new InsnNode(Opcodes.RETURN));
-        skipLevelWhenScreenOpen.add(noScreen);
-        renderLevel.instructions.insert(skipLevelWhenScreenOpen);
-        renderLevel.maxStack = Math.max(renderLevel.maxStack, 1);
 
         MethodNode method = find(node, "tryTakeScreenshotIfNeeded", "()V");
         InsnList code = new InsnList();
@@ -1880,7 +2004,175 @@ public final class MinecraftClientPatcher {
         InsnList code = new InsnList();
         code.add(new InsnNode(Opcodes.RETURN));
         replace(method, code, 1, 4);
-        write(node, output);
+        patchLevelRendererBrowserSectionCompileThrottle(node);
+        writeComputeFrames(node, output);
+    }
+
+    private static void patchLevelRendererBrowserSectionCompileThrottle(ClassNode node) {
+        MethodNode method = find(
+                node,
+                "compileSections",
+                "(Lnet/minecraft/client/Camera;)V");
+        boolean disabledSyncCompile = false;
+        boolean throttledAsyncSchedule = false;
+
+        for (var instruction = method.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof MethodInsnNode syncCall
+                    && syncCall.owner.equals("net/minecraft/client/renderer/chunk/SectionRenderDispatcher")
+                    && syncCall.name.equals("rebuildSectionSync")
+                    && syncCall.desc.equals("(Lnet/minecraft/client/renderer/chunk/SectionRenderDispatcher$RenderSection;"
+                            + "Lnet/minecraft/client/renderer/chunk/RenderRegionCache;)V")) {
+                AbstractInsnNode cursor = syncCall;
+                while ((cursor = previousOpcode(cursor)) != null) {
+                    if (cursor instanceof JumpInsnNode jump && jump.getOpcode() == Opcodes.IFEQ) {
+                        AbstractInsnNode condition = previousOpcode(jump);
+                        if (condition instanceof VarInsnNode load
+                                && load.getOpcode() == Opcodes.ILOAD) {
+                            method.instructions.set(load, new InsnNode(Opcodes.ICONST_0));
+                            disabledSyncCompile = true;
+                            break;
+                        }
+                    }
+                }
+                if (!disabledSyncCompile) {
+                    throw new IllegalStateException(
+                            "LevelRenderer.compileSections sync rebuild branch patch point was not found");
+                }
+                continue;
+            }
+
+            if (instruction instanceof MethodInsnNode addCall
+                    && addCall.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && addCall.owner.equals("java/util/List")
+                    && addCall.name.equals("add")
+                    && addCall.desc.equals("(Ljava/lang/Object;)Z")) {
+                AbstractInsnNode loadSection = previousOpcode(addCall);
+                AbstractInsnNode loadList = previousOpcode(loadSection);
+                if (!(loadSection instanceof VarInsnNode sectionLoad)
+                        || sectionLoad.getOpcode() != Opcodes.ALOAD
+                        || !(loadList instanceof VarInsnNode listLoad)
+                        || listLoad.getOpcode() != Opcodes.ALOAD) {
+                    continue;
+                }
+                AbstractInsnNode pop = nextOpcode(addCall);
+                if (!(pop instanceof InsnNode) || pop.getOpcode() != Opcodes.POP) {
+                    throw new IllegalStateException(
+                            "LevelRenderer.compileSections List.add POP patch point was not found");
+                }
+                LabelNode allowAdd = new LabelNode();
+                LabelNode afterAdd = new LabelNode();
+                InsnList guard = new InsnList();
+                guard.add(new VarInsnNode(Opcodes.ALOAD, listLoad.var));
+                guard.add(new MethodInsnNode(
+                        Opcodes.INVOKEINTERFACE,
+                        "java/util/List",
+                        "size",
+                        "()I",
+                        true));
+                guard.add(new InsnNode(Opcodes.ICONST_1));
+                guard.add(new JumpInsnNode(Opcodes.IF_ICMPLT, allowAdd));
+                guard.add(new JumpInsnNode(Opcodes.GOTO, afterAdd));
+                guard.add(allowAdd);
+                method.instructions.insertBefore(loadList, guard);
+                method.instructions.insert(pop, afterAdd);
+                throttledAsyncSchedule = true;
+                break;
+            }
+
+        }
+
+        if (!disabledSyncCompile || !throttledAsyncSchedule) {
+            throw new IllegalStateException(
+                    "LevelRenderer browser section compile throttle patch points were not found");
+        }
+        method.maxStack = Math.max(method.maxStack, 3);
+    }
+
+    private static void patchSectionRenderDispatcherBrowserThrottles(String jar, Path output)
+            throws IOException {
+        ClassNode node = read(
+                jar,
+                "net/minecraft/client/renderer/chunk/SectionRenderDispatcher.class");
+        MethodNode method = find(node, "uploadAllPendingUploads", "()V");
+        InsnList code = new InsnList();
+        LabelNode uploadLoop = new LabelNode();
+        LabelNode uploadDone = new LabelNode();
+        LabelNode closeLoop = new LabelNode();
+        LabelNode closeDone = new LabelNode();
+
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 1));
+        code.add(uploadLoop);
+        code.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(new JumpInsnNode(Opcodes.IF_ICMPGE, uploadDone));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/chunk/SectionRenderDispatcher",
+                "toUpload",
+                "Ljava/util/Queue;"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Queue",
+                "poll",
+                "()Ljava/lang/Object;",
+                true));
+        code.add(new TypeInsnNode(Opcodes.CHECKCAST, "java/lang/Runnable"));
+        code.add(new InsnNode(Opcodes.DUP));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 2));
+        code.add(new JumpInsnNode(Opcodes.IFNULL, uploadDone));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/lang/Runnable",
+                "run",
+                "()V",
+                true));
+        code.add(new IincInsnNode(1, 1));
+        code.add(new JumpInsnNode(Opcodes.GOTO, uploadLoop));
+
+        code.add(uploadDone);
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 3));
+        code.add(closeLoop);
+        code.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(new JumpInsnNode(Opcodes.IF_ICMPGE, closeDone));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/chunk/SectionRenderDispatcher",
+                "toClose",
+                "Ljava/util/Queue;"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Queue",
+                "poll",
+                "()Ljava/lang/Object;",
+                true));
+        code.add(new TypeInsnNode(
+                Opcodes.CHECKCAST,
+                "net/minecraft/client/renderer/chunk/SectionMesh"));
+        code.add(new InsnNode(Opcodes.DUP));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 4));
+        code.add(new JumpInsnNode(Opcodes.IFNULL, closeDone));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "net/minecraft/client/renderer/chunk/SectionMesh",
+                "close",
+                "()V",
+                true));
+        code.add(new IincInsnNode(3, 1));
+        code.add(new JumpInsnNode(Opcodes.GOTO, closeLoop));
+        code.add(closeDone);
+        code.add(new InsnNode(Opcodes.RETURN));
+
+        replace(method, code, 3, 5);
+        writeComputeFrames(node, output);
     }
 
     private static void patchMultiplayerExecutor(String jar, Path output) throws IOException {
@@ -2708,6 +3000,17 @@ public final class MinecraftClientPatcher {
         code.add(new InsnNode(Opcodes.ARETURN));
         replace(tick, code, 4, 1);
         write(waiting, root.resolve("net/minecraft/client/multiplayer/LevelLoadTracker$WaitingForServer.class"));
+
+        ClassNode waitingForPlayerChunk = read(
+                jar,
+                "net/minecraft/client/multiplayer/LevelLoadTracker$WaitingForPlayerChunk.class");
+        MethodNode isReady = find(waitingForPlayerChunk, "isReady", "()Z");
+        InsnList readyCode = new InsnList();
+        readyCode.add(new InsnNode(Opcodes.ICONST_1));
+        readyCode.add(new InsnNode(Opcodes.IRETURN));
+        replace(isReady, readyCode, 1, 1);
+        write(waitingForPlayerChunk,
+                root.resolve("net/minecraft/client/multiplayer/LevelLoadTracker$WaitingForPlayerChunk.class"));
     }
 
     private static void patchServerLevelBrowserSafeDefaults(String jar, Path output) throws IOException {

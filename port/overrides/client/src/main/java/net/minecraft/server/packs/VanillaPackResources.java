@@ -6,6 +6,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -32,6 +33,7 @@ public class VanillaPackResources implements PackResources {
     private final BuiltInMetadata metadata;
     private final Set<String> namespaces;
     private final String[] resources;
+    private final Set<String> resourceSet;
 
     VanillaPackResources(
             PackLocationInfo location,
@@ -43,6 +45,7 @@ public class VanillaPackResources implements PackResources {
         this.metadata = metadata;
         this.namespaces = namespaces;
         this.resources = loadResourceList();
+        this.resourceSet = new HashSet<>(List.of(this.resources));
     }
 
     @Override
@@ -51,7 +54,7 @@ public class VanillaPackResources implements PackResources {
             return null;
         }
         String resource = String.join("/", path);
-        return supplierIfPresent(resource);
+        return rootSupplierIfPresent(resource);
     }
 
     public void listRawPaths(PackType type, Identifier id, java.util.function.Consumer<Path> output) {
@@ -105,8 +108,15 @@ public class VanillaPackResources implements PackResources {
                 .map(supplier -> new Resource(this, supplier));
     }
 
-    private static IoSupplier<InputStream> supplierIfPresent(String resource) {
+    private IoSupplier<InputStream> supplierIfPresent(String resource) {
         if (!exists(resource)) {
+            return null;
+        }
+        return openClasspathResource(resource);
+    }
+
+    private IoSupplier<InputStream> rootSupplierIfPresent(String resource) {
+        if (!exists(resource) && !existsOnClasspath(resource)) {
             return null;
         }
         return openClasspathResource(resource);
@@ -122,7 +132,11 @@ public class VanillaPackResources implements PackResources {
         };
     }
 
-    private static boolean exists(String resource) {
+    private boolean exists(String resource) {
+        return resourceSet.contains(resource);
+    }
+
+    private static boolean existsOnClasspath(String resource) {
         try (InputStream input = openResourceStream(resource)) {
             return input != null;
         } catch (IOException e) {

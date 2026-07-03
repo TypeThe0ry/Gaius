@@ -11,6 +11,21 @@ if ! command -v clang >/dev/null 2>&1; then
   exit 1
 fi
 
+wasm_ld="${GAIUS_WASM_LD:-}"
+if [[ -z "$wasm_ld" ]]; then
+  wasm_ld="$(command -v wasm-ld || true)"
+fi
+if [[ -z "$wasm_ld" && "$(command -v ld.lld || true)" != "" ]]; then
+  wasm_ld="$(command -v ld.lld)"
+fi
+if [[ -z "$wasm_ld" ]]; then
+  echo "wasm-ld/ld.lld is required to link the Gaius Wasm hot-path module." >&2
+  echo "Install LLVM/lld or set GAIUS_WASM_LD=/path/to/wasm-ld, then rerun this script." >&2
+  exit 1
+fi
+
+export PATH="$(dirname "$wasm_ld"):$PATH"
+
 mkdir -p "$dist"
 
 clang \

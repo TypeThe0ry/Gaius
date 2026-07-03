@@ -2,7 +2,11 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
-"$root/port/scripts/build-overlays.sh" >/dev/null
+if [[ "${GAIUS_SKIP_OVERLAY_BUILD:-false}" != "true" ]]; then
+  "$root/port/scripts/build-overlays.sh" >/dev/null
+else
+  echo "Skipping overlay rebuild because GAIUS_SKIP_OVERLAY_BUILD=true"
+fi
 version="$(jq -er '.minecraftVersion' "$root/port/config.json")"
 resource_list_dir="$root/port/target/generated-resources/dev/gaius/browser"
 resource_list="$resource_list_dir/minecraft-resources.txt"
@@ -42,6 +46,11 @@ set -e
 
 if [[ "$analysis_status" -ne 0 ]]; then
   echo "TeaVM analysis did not complete; canonical gap report was preserved" >&2
+fi
+
+if [[ "$build_status" -eq 0 ]]; then
+  "$root/port/scripts/postprocess-teavm-js.py" \
+    "$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}"
 fi
 
 exit "$build_status"

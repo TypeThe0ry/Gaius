@@ -30,6 +30,7 @@ typedef struct {
 
 __attribute__((aligned(16))) static u8 index_input[MAX_INDICES * 4];
 __attribute__((aligned(16))) static u8 index_output[MAX_INDICES * 4];
+__attribute__((aligned(16))) static u32 index_scratch[MAX_INDICES];
 __attribute__((aligned(16))) static u8 repack_source[MAX_REPACK_SOURCE_BYTES];
 __attribute__((aligned(16))) static u8 repack_output[MAX_REPACK_OUTPUT_BYTES];
 __attribute__((aligned(16))) static RepackLayout repack_layouts[MAX_REPACK_LAYOUTS];
@@ -42,7 +43,7 @@ static u32 last_repack_bytes;
 
 __attribute__((used, visibility("default")))
 u32 gaius_hotpath_version(void) {
-    return 1;
+    return 2;
 }
 
 __attribute__((used, visibility("default")))
@@ -125,6 +126,49 @@ static u32 read_index(u32 type, u32 index) {
     return ((u32 *)index_input)[index];
 }
 
+static void copy_bytes(u8 *target, const u8 *source, u32 count) {
+    switch (count) {
+        case 1:
+            target[0] = source[0];
+            return;
+        case 2:
+            target[0] = source[0];
+            target[1] = source[1];
+            return;
+        case 3:
+            target[0] = source[0];
+            target[1] = source[1];
+            target[2] = source[2];
+            return;
+        case 4:
+            target[0] = source[0];
+            target[1] = source[1];
+            target[2] = source[2];
+            target[3] = source[3];
+            return;
+        case 8:
+            for (u32 i = 0; i < 8; i++) {
+                target[i] = source[i];
+            }
+            return;
+        case 12:
+            for (u32 i = 0; i < 12; i++) {
+                target[i] = source[i];
+            }
+            return;
+        case 16:
+            for (u32 i = 0; i < 16; i++) {
+                target[i] = source[i];
+            }
+            return;
+        default:
+            for (u32 i = 0; i < count; i++) {
+                target[i] = source[i];
+            }
+            return;
+    }
+}
+
 __attribute__((used, visibility("default")))
 i32 gaius_shift_indices(u32 type, u32 count, i32 base_vertex) {
     if (count == 0 || count > MAX_INDICES) {
@@ -142,6 +186,7 @@ i32 gaius_shift_indices(u32 type, u32 count, i32 base_vertex) {
             return 0;
         }
         u32 value = (u32)shifted;
+        index_scratch[i] = value;
         if (value < min_index) {
             min_index = value;
         }
@@ -160,19 +205,19 @@ i32 gaius_shift_indices(u32 type, u32 count, i32 base_vertex) {
     if (output_type == GL_UNSIGNED_BYTE) {
         u8 *out = (u8 *)index_output;
         for (u32 i = 0; i < count; i++) {
-            out[i] = (u8)(read_index(type, i) + (u32)base_vertex);
+            out[i] = (u8)index_scratch[i];
         }
         last_output_bytes = count;
     } else if (output_type == GL_UNSIGNED_SHORT) {
         u16 *out = (u16 *)index_output;
         for (u32 i = 0; i < count; i++) {
-            out[i] = (u16)(read_index(type, i) + (u32)base_vertex);
+            out[i] = (u16)index_scratch[i];
         }
         last_output_bytes = count * 2u;
     } else {
         u32 *out = (u32 *)index_output;
         for (u32 i = 0; i < count; i++) {
-            out[i] = read_index(type, i) + (u32)base_vertex;
+            out[i] = index_scratch[i];
         }
         last_output_bytes = count * 4u;
     }
@@ -209,9 +254,10 @@ i32 gaius_repack_interleaved(u32 source_bytes, u32 vertex_count, u32 layout_coun
                     || target_offset + layout.bytes > output_bytes) {
                 return 0;
             }
-            for (u32 byte_index = 0; byte_index < layout.bytes; byte_index++) {
-                repack_output[target_offset + byte_index] = repack_source[source_offset + byte_index];
-            }
+            copy_bytes(
+                    repack_output + (u32)target_offset,
+                    repack_source + (u32)source_offset,
+                    layout.bytes);
         }
     }
 

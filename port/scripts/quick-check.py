@@ -25,6 +25,7 @@ DIST = PORT / "web" / "dist"
 OVERLAYS = PORT / "work" / "overlays"
 OPENGL_BRIDGE = PORT / "overrides" / "libraries" / "lwjgl-opengl" / "src" / "main" / "java" / "org" / "lwjgl" / "opengl" / "BrowserOpenGL.java"
 OPENGL_PATCHER = PORT / "tools" / "src" / "main" / "java" / "dev" / "gaius" / "tools" / "LwjglOpenGLBrowserPatcher.java"
+LWJGL_BROWSER_MEMORY = PORT / "overrides" / "libraries" / "lwjgl" / "src" / "main" / "java" / "org" / "lwjgl" / "system" / "BrowserMemory.java"
 GLFW_BRIDGE = PORT / "overrides" / "libraries" / "lwjgl-glfw" / "src" / "main" / "java" / "org" / "lwjgl" / "glfw" / "BrowserGlfw.java"
 GLFW_PATCHER = PORT / "tools" / "src" / "main" / "java" / "dev" / "gaius" / "tools" / "LwjglGlfwBrowserPatcher.java"
 CLIENT_PATCHER = PORT / "tools" / "src" / "main" / "java" / "dev" / "gaius" / "tools" / "MinecraftClientPatcher.java"
@@ -34,10 +35,12 @@ BROWSER_GUI_ITEM_CACHE = PORT / "overrides" / "client" / "src" / "main" / "java"
 WASM_HOTPATH_C = PORT / "wasm" / "hotpath" / "gaius_hotpath.c"
 BUILD_WASM_HOTPATH = PORT / "scripts" / "build-wasm-hotpath.sh"
 GENERATE_POM = PORT / "scripts" / "generate-pom.sh"
+BUILD_TEAVM = PORT / "scripts" / "build-teavm.sh"
 BUILD_RELEASE = PORT / "scripts" / "build-teavm-release.sh"
 COMPRESS_DIST = PORT / "scripts" / "compress-dist.sh"
 SERVE_DIST = PORT / "scripts" / "serve-dist.py"
 INDEX_HTML = PORT / "web" / "dist" / "index.html"
+POSTPROCESS_TEAVM_JS = PORT / "scripts" / "postprocess-teavm-js.py"
 
 
 def rel(path: Path) -> str:
@@ -135,6 +138,7 @@ def check_build_timeline() -> None:
     classes_map = DIST / "classes.js.map"
     latest_full = latest_any(
         TARGET / "build-teavm*.log",
+        TARGET / "build-release*.log",
         TARGET / "build-*wrapper.log",
     )
     latest_overlay = latest(TARGET / "build-overlays*.log")
@@ -215,6 +219,7 @@ def check_source_patches() -> None:
     section("Source patch checks")
     text = OPENGL_BRIDGE.read_text(errors="replace") if OPENGL_BRIDGE.exists() else ""
     patcher = OPENGL_PATCHER.read_text(errors="replace") if OPENGL_PATCHER.exists() else ""
+    browser_memory = LWJGL_BROWSER_MEMORY.read_text(errors="replace") if LWJGL_BROWSER_MEMORY.exists() else ""
     glfw_text = GLFW_BRIDGE.read_text(errors="replace") if GLFW_BRIDGE.exists() else ""
     glfw_patcher = GLFW_PATCHER.read_text(errors="replace") if GLFW_PATCHER.exists() else ""
     client_patcher = CLIENT_PATCHER.read_text(errors="replace") if CLIENT_PATCHER.exists() else ""
@@ -224,10 +229,12 @@ def check_source_patches() -> None:
     wasm_hotpath_c = WASM_HOTPATH_C.read_text(errors="replace") if WASM_HOTPATH_C.exists() else ""
     build_wasm_hotpath = BUILD_WASM_HOTPATH.read_text(errors="replace") if BUILD_WASM_HOTPATH.exists() else ""
     generate_pom = GENERATE_POM.read_text(errors="replace") if GENERATE_POM.exists() else ""
+    build_teavm = BUILD_TEAVM.read_text(errors="replace") if BUILD_TEAVM.exists() else ""
     build_release = BUILD_RELEASE.read_text(errors="replace") if BUILD_RELEASE.exists() else ""
     compress_dist = COMPRESS_DIST.read_text(errors="replace") if COMPRESS_DIST.exists() else ""
     serve_dist = SERVE_DIST.read_text(errors="replace") if SERVE_DIST.exists() else ""
     index_html = INDEX_HTML.read_text(errors="replace") if INDEX_HTML.exists() else ""
+    postprocess_teavm_js = POSTPROCESS_TEAVM_JS.read_text(errors="replace") if POSTPROCESS_TEAVM_JS.exists() else ""
     tex_sub_start = text.find("public static void texSubImage2D(")
     tex_sub_end = text.find("@JSBody(script = \"\"\"", tex_sub_start)
     tex_sub_section = text[tex_sub_start:tex_sub_end] if tex_sub_start >= 0 and tex_sub_end > tex_sub_start else text
@@ -301,6 +308,54 @@ def check_source_patches() -> None:
             and "baseVertexIndexWasmFallback" in text,
         ),
         (
+            "BrowserOpenGL caches VAO attribute validation instead of rescanning every draw",
+            "attribVersion" in text
+            and "misalignedAttribs" in text
+            and "missingEnabledAttribs" in text
+            and "alignedAttribFastSkips" in text
+            and "attribTypeFastSkips" in text
+            and "programAttribGlobalVersion" in text
+            and "vao.missingEnabledAttribs.forEach" in text,
+        ),
+        (
+            "BrowserOpenGL limits CPU shadow buffer copies for performance",
+            "bufferShadowTotalBytes" in text
+            and "maxSingleBufferShadowBytes" in text
+            and "maxTotalBufferShadowBytes" in text
+            and "trimBufferShadows" in text
+            and "deleteBufferShadow" in text
+            and "bufferShadowSkippedEmpty" in text
+            and "bufferShadowSkippedLarge" in text,
+        ),
+        (
+            "BrowserOpenGL skips redundant WebGL state calls in hot paths",
+            "drawSampleCounter" in text
+            and "knownCaps" in text
+            and "enabledCaps" in text
+            and "viewportKey" in text
+            and "scissorKey" in text
+            and "state.currentProgram|0" in text
+            and "state.currentVaoId|0" in text,
+        ),
+        (
+            "BrowserOpenGL repairs stale colorMask before drawing to the default framebuffer",
+            "colorMask:[true,true,true,true]" in text
+            and "ensureColorWritesForFramebuffer" in text
+            and "ensureDefaultFramebufferColorWrites" in text
+            and "defaultFramebufferColorMaskRepairs" in text
+            and "state.colorMask=[!!red,!!green,!!blue,!!alpha]" in text,
+        ),
+        (
+            "BrowserOpenGL uses bulk buffer reads instead of per-byte MemoryUtil loops",
+            "copy.get(data)" in text
+            and "bytes.get(data)" in text
+            and "floats.get(data)" in text
+            and "ints.get(data)" in text
+            and "MemoryUtil.memGetByte(address + i)" not in text
+            and "MemoryUtil.memGetFloat(address + (long) i * 4L)" not in text
+            and "MemoryUtil.memGetInt(address + (long) i * 4L)" not in text,
+        ),
+        (
             "Wasm hot-path module exports batch index shifting helpers",
             "gaius_shift_indices" in wasm_hotpath_c
             and "gaius_repack_interleaved" in wasm_hotpath_c
@@ -308,6 +363,8 @@ def check_source_patches() -> None:
             and "gaius_shift_indices_output_ptr" in wasm_hotpath_c
             and "gaius_repack_source_ptr" in wasm_hotpath_c
             and "gaius_repack_layouts_ptr" in wasm_hotpath_c
+            and "index_scratch" in wasm_hotpath_c
+            and "copy_bytes" in wasm_hotpath_c
             and "MAX_INDICES" in wasm_hotpath_c
             and "MAX_REPACK_LAYOUTS" in wasm_hotpath_c
             and "GL_UNSIGNED_SHORT" in wasm_hotpath_c
@@ -321,6 +378,17 @@ def check_source_patches() -> None:
             and "attribTypeRepairs" in text
             and "gl.getActiveAttrib" in text
             and "vertexAttribIPointer" in text,
+        ),
+        (
+            "BrowserOpenGL limits attrib repack to current shader and restores direct pointers",
+            "activeAttribLocations" in text
+            and "attribIsActive" in text
+            and "restoreDirectAttribPointers" in text
+            and "activeAttribLazyRefresh" in text
+            and "programAttribLazyRefresh" in text
+            and "directAttribRestores" in text
+            and "alignedAttribProgram" in text
+            and "alignedAttribGlobalVersion" in text,
         ),
         (
             "BrowserOpenGL exposes draw-call throughput telemetry",
@@ -348,6 +416,38 @@ def check_source_patches() -> None:
             and "widget.getY()" in text,
         ),
         (
+            "BrowserOpenGL disables cull face only around GUI draw calls",
+            "guiDrawsRemaining" in text
+            and "guiCullFaceWasEnabled" in text
+            and "guiCullFaceDisabled" in text
+            and "gl.disable(gl.CULL_FACE)" in text
+            and "gl.enable(gl.CULL_FACE)" in text,
+        ),
+        (
+            "BrowserOpenGL can sample GUI vertex/index state behind diag=gui",
+            "sampleGuiDraw" in text
+            and "guiVertexSampleRecent" in text
+            and "indexSample" in text
+            and "sampleVertexAttrib" in text,
+        ),
+        (
+            "BrowserOpenGL maps WebGL buffers into registered MemoryUtil memory",
+            "MemoryUtil.memAlloc((int) length)" in text
+            and "MemoryUtil.memFree(mapped.buffer)" in text,
+        ),
+        (
+            "BrowserMemory preserves mapped ByteBuffer addresses through memSlice",
+            "public static long register(ByteBuffer bytes)" in browser_memory
+            and "registerDerived(result, buffer, offset)" in browser_memory
+            and "remember(result, base + Integer.toUnsignedLong(byteOffset))" in browser_memory,
+        ),
+        (
+            "BrowserMemory frees mapped buffers without scanning the whole address table",
+            "REGION_BUFFERS" in browser_memory
+            and "private static void remember(Buffer buffer, long address)" in browser_memory
+            and "REGION_BUFFERS.remove(id)" in browser_memory,
+        ),
+        (
             "BrowserGlfw provides GLFW key names for printable keys",
             "public static String getKeyName(int key, int scancode)" in glfw_text
             and "GLFW.GLFW_KEY_A && value <= GLFW.GLFW_KEY_Z" in glfw_text
@@ -359,7 +459,11 @@ def check_source_patches() -> None:
             "__gaiusResolvePixelRatio" in glfw_text
             and "__gaiusApplyCanvasResolution" in glfw_text
             and "__gaiusMaxDpr" in glfw_text
-            and "Math.min(devicePixelRatio||1,1)" in glfw_text
+            and "__gaiusMinDpr" in glfw_text
+            and "__gaiusMenuMinDpr" in glfw_text
+            and "__gaiusWorldMinDpr" in glfw_text
+            and "const inWorld = !!(minecraftState && minecraftState.level)" in glfw_text
+            and "clamp(Math.min(raw, maxDpr), minDpr, 3.0)" in glfw_text
             and "preserveDrawingBuffer" in glfw_text
             and "get('preserveDrawingBuffer') === '1'" in glfw_text,
         ),
@@ -369,6 +473,35 @@ def check_source_patches() -> None:
             and "gameFps" in glfw_text
             and "gameFrames" in glfw_text
             and "gameLastSampleAt" in glfw_text,
+        ),
+        (
+            "BrowserGlfw yields during waitEventsTimeout instead of busy-spinning FPS waits",
+            "public static void waitEventsTimeout(double timeout)" in glfw_text
+            and "sleepForBrowserMillis" in glfw_text
+            and "Thread.sleep(millis)" in glfw_text
+            and "Math.ceil(timeout * 1000.0)" in glfw_text,
+        ),
+        (
+            "BrowserGlfw primes cursor callbacks so the first menu click is not swallowed",
+            "callback.invoke(WINDOW, cursorX, cursorY)" in glfw_text
+            and "updateCursorFromMouseEvent" in glfw_text
+            and "pushMouseMove([4,0,0,0,0,p[0],p[1]])" in glfw_text,
+        ),
+        (
+            "BrowserGlfw automatically warms up first GUI input on a harmless corner click",
+            "maybeQueueInputWarmup()" in glfw_text
+            and "__gaiusInputWarmupDone" in glfw_text
+            and "minecraftState.screen" in glfw_text
+            and "events.push([4,0,0,0,0,1,1])" in glfw_text,
+        ),
+        (
+            "BrowserGlfw coalesces mousemove events and avoids Array.shift in pollEvents",
+            "__gaiusGlfwEventHead" in glfw_text
+            and "__gaiusGlfwPendingMouseMove" in glfw_text
+            and "const pushMouseMove = event =>" in glfw_text
+            and "events[pending] = event" in glfw_text
+            and "events.splice(0,head)" in glfw_text
+            and "window.__gaiusGlfwEvents.shift()" not in glfw_text,
         ),
         (
             "GLFW patcher delegates key name/scancode lookups",
@@ -391,16 +524,27 @@ def check_source_patches() -> None:
             and "ItemModelResolver" in client_patcher
             and "updateForTopItem" in client_patcher
             and "MAX_ENTRIES" in browser_gui_item_cache
+            and "IdentityHashMap<ItemStack, StackKey>" in browser_gui_item_cache
+            and "guiKey" in browser_gui_item_cache
             and "hashItemAndComponents" in browser_gui_item_cache
             and "isAnimated" in browser_gui_item_cache,
         ),
         (
-            "Minecraft patcher skips expensive level rendering while browser screens are open",
+            "Minecraft patcher keeps GameRenderer.renderLevel active for GUI/screen rendering",
             "patchGameRendererBrowserAutoScreenshot" in client_patcher
-            and "renderLevel" in client_patcher
-            and "net/minecraft/client/gui/screens/Screen" in client_patcher
-            and "Opcodes.IFNULL" in client_patcher
-            and "skipLevelWhenScreenOpen" in client_patcher,
+            and "skipLevelWhenScreenOpen" not in client_patcher,
+        ),
+        (
+            "Minecraft patcher throttles browser section compile/upload work per frame",
+            "patchLevelRendererBrowserSectionCompileThrottle" in client_patcher
+            and "LevelRenderer browser section compile throttle patch points" in client_patcher
+            and "patchSectionRenderDispatcherBrowserThrottles" in client_patcher
+            and "uploadAllPendingUploads" in client_patcher
+            and "rebuildSectionSync" in client_patcher
+            and "IF_ICMPLT" in client_patcher
+            and "java/util/List" in client_patcher
+            and "java/util/Queue" in client_patcher
+            and "SectionMesh" in client_patcher,
         ),
         (
             "Minecraft patcher uses static browser menu backgrounds for FPS",
@@ -466,6 +610,8 @@ def check_source_patches() -> None:
             "patchLevelLoadTrackerBrowserTimeout" in client_patcher
             and "Timed out while waiting for initial level loading packets in the browser" in client_patcher
             and "LevelLoadTracker$WaitingForServer" in client_patcher
+            and "LevelLoadTracker$WaitingForPlayerChunk" in client_patcher
+            and 'find(waitingForPlayerChunk, "isReady", "()Z")' in client_patcher
             and "constant.cst = 5L" in client_patcher,
         ),
         (
@@ -482,20 +628,27 @@ def check_source_patches() -> None:
             and 'getResourceAsStream("/" + normalized)' in vanilla_pack_resources,
         ),
         (
+            "VanillaPackResources uses resource-list set for fast asset existence checks",
+            "resourceSet" in vanilla_pack_resources
+            and "new HashSet<>(List.of(this.resources))" in vanilla_pack_resources
+            and "rootSupplierIfPresent" in vanilla_pack_resources
+            and "existsOnClasspath" in vanilla_pack_resources,
+        ),
+        (
             "Browser storage seeds/enforces browser performance client options",
             "DEFAULT_BROWSER_OPTIONS" in browser_file_persistence
             and "BROWSER_PERFORMANCE_OPTIONS" in browser_file_persistence
             and "seedDefaultOptions" in browser_file_persistence
             and "enforcePerformanceOptions" in browser_file_persistence
-            and "renderDistance:1" in browser_file_persistence
-            and "simulationDistance:1" in browser_file_persistence
-            and "maxFps:260" in browser_file_persistence
+            and "renderDistance:2" in browser_file_persistence
+            and "simulationDistance:5" in browser_file_persistence
+            and "maxFps:120" in browser_file_persistence
             and 'graphicsPreset:\\"fast\\"' in browser_file_persistence
             and 'renderClouds:\\"false\\"' in browser_file_persistence
             and "menuBackgroundBlurriness:0" in browser_file_persistence
             and "panoramaSpeed:0.0" in browser_file_persistence
             and "screenEffectScale:0.0" in browser_file_persistence
-            and "maxAnisotropyBit:0" in browser_file_persistence
+            and "maxAnisotropyBit:1" in browser_file_persistence
             and "textureFiltering:0" in browser_file_persistence
             and "particles:2" in browser_file_persistence
             and "storage-restore-crashed" in browser_file_persistence
@@ -541,6 +694,18 @@ def check_source_patches() -> None:
             and "compress-dist.sh" in build_release,
         ),
         (
+            "TeaVM build can skip overlay rebuild after a verified overlay-only pass",
+            "GAIUS_SKIP_OVERLAY_BUILD" in build_teavm
+            and 'Skipping overlay rebuild because GAIUS_SKIP_OVERLAY_BUILD=true' in build_teavm
+            and "build-overlays.sh" in build_teavm,
+        ),
+        (
+            "TeaVM JS postprocess patches NaN-safe long conversion",
+            "postprocess-teavm-js.py" in build_teavm
+            and "Number.isFinite" in postprocess_teavm_js
+            and "9223372036854775807" in postprocess_teavm_js,
+        ),
+        (
             "Wasm hot-path build emits dist wasm without requiring TeaVM",
             "--target=wasm32" in build_wasm_hotpath
             and "-Wl,--no-entry" in build_wasm_hotpath
@@ -571,10 +736,15 @@ def check_source_patches() -> None:
             and "__gaiusFps" in index_html
             and "perf-hud" in index_html
             and "targetFps" in index_html
-            and "Game FPS" in index_html
-            and "RAF FPS" in index_html
+            and "Display FPS" in index_html
+            and "Game loop" in index_html
             and "__gaiusMaxDpr" in index_html
-            and '|| 0.35' in index_html
+            and "__gaiusMinDpr" in index_html
+            and "__gaiusMenuMinDpr" in index_html
+            and "__gaiusWorldMinDpr" in index_html
+            and "if (!inWorld && minecraftState && minecraftState.screen) return;" in index_html
+            and "singleShadowMB" in index_html
+            and "totalShadowMB" in index_html
             and "maybeDegradeResolutionForFps" in index_html
             and "__gaiusWasmHotpath" in index_html
             and "gaius-hotpath.wasm" in index_html
@@ -600,6 +770,7 @@ def check_overlay_bytecode() -> None:
     netty_cp = OVERLAYS / "library-patches" / "netty-transport"
     classlib_cp = OVERLAYS / "classlib-patches"
     classlib_classes_cp = OVERLAYS / "classlib-classes"
+    lwjgl_cp = OVERLAYS / "library-classes" / "lwjgl"
     lwjgl_opengl_cp = OVERLAYS / "library-classes" / "lwjgl-opengl"
     lwjgl_opengl_patch_cp = OVERLAYS / "library-patches" / "lwjgl-opengl"
     lwjgl_glfw_cp = OVERLAYS / "libraries" / "org" / "lwjgl" / "lwjgl-glfw" / "3.3.3" / "lwjgl-glfw-3.3.3.jar"
@@ -619,6 +790,11 @@ def check_overlay_bytecode() -> None:
     gui_graphics = run_javap(client_cp, "net.minecraft.client.gui.GuiGraphics")
     browser_gui_item_cache = run_javap(client_cp, "dev.gaius.browser.BrowserGuiItemCache")
     game_renderer = run_javap(client_cp, "net.minecraft.client.renderer.GameRenderer")
+    level_renderer = run_javap(client_cp, "net.minecraft.client.renderer.LevelRenderer")
+    section_render_dispatcher = run_javap(
+        client_cp,
+        "net.minecraft.client.renderer.chunk.SectionRenderDispatcher",
+    )
     minecraft_server = run_javap(client_cp, "net.minecraft.server.MinecraftServer")
     gl_device = run_javap(client_cp, "com.mojang.blaze3d.opengl.GlDevice")
     vanilla_pack_builder = run_javap(client_cp, "net.minecraft.server.packs.VanillaPackResourcesBuilder")
@@ -630,6 +806,10 @@ def check_overlay_bytecode() -> None:
     waiting_for_server = run_javap(
         client_cp,
         "net.minecraft.client.multiplayer.LevelLoadTracker$WaitingForServer",
+    )
+    waiting_for_player_chunk = run_javap(
+        client_cp,
+        "net.minecraft.client.multiplayer.LevelLoadTracker$WaitingForPlayerChunk",
     )
     framerate_tracker = run_javap(client_cp, "com.mojang.blaze3d.platform.FramerateLimitTracker")
     player_list = run_javap(client_cp, "net.minecraft.server.players.PlayerList")
@@ -653,6 +833,14 @@ def check_overlay_bytecode() -> None:
     )
     game_render_level = method_section(game_renderer, "public void renderLevel(net.minecraft.client.DeltaTracker);")
     game_render_level_head = game_render_level[:1000]
+    level_compile_sections = method_section(
+        level_renderer,
+        "private void compileSections(net.minecraft.client.Camera);",
+    )
+    section_uploads = method_section(
+        section_render_dispatcher,
+        "public void uploadAllPendingUploads();",
+    )
     minecraft_run_server = method_section(minecraft_server, "protected void runServer();")
     minecraft_initial_spawn = method_section(
         minecraft_server,
@@ -708,6 +896,7 @@ def check_overlay_bytecode() -> None:
     default_channel_id = run_javap(netty_cp, "io.netty.channel.DefaultChannelId")
     channel_handler_mask = run_javap(netty_cp, "io.netty.channel.ChannelHandlerMask")
     throwable = run_javap(classlib_cp, "org.teavm.classlib.java.lang.TThrowable")
+    browser_memory = run_javap(lwjgl_cp, "org.lwjgl.system.BrowserMemory")
     browser_opengl = run_javap(lwjgl_opengl_cp, "org.lwjgl.opengl.BrowserOpenGL")
     browser_file_persistence_class = run_javap(classlib_classes_cp, "dev.gaius.browser.BrowserFilePersistence")
     browser_opengl_constants = (
@@ -864,6 +1053,15 @@ def check_overlay_bytecode() -> None:
             and "attribTypeRepairs" in browser_opengl_constants,
         ),
         (
+            "BrowserOpenGL compiled overlay limits attrib repack to active shader inputs",
+            "activeAttribLocations" in browser_opengl_constants
+            and "restoreDirectAttribPointers" in browser_opengl_constants
+            and "activeAttribLazyRefresh" in browser_opengl_constants
+            and "programAttribLazyRefresh" in browser_opengl_constants
+            and "directAttribRestores" in browser_opengl_constants
+            and "alignedAttribProgram" in browser_opengl_constants,
+        ),
+        (
             "BrowserOpenGL compiled overlay exposes draw-call throughput telemetry",
             "recordDrawCall" in browser_opengl_constants
             and "drawCallsPerSecond" in browser_opengl_constants,
@@ -883,6 +1081,36 @@ def check_overlay_bytecode() -> None:
             and "screenTitle" in browser_opengl_constants
             and "screenSize" in browser_opengl_constants
             and "getMessage" in browser_opengl,
+        ),
+        (
+            "BrowserOpenGL compiled overlay disables cull face around GUI draw calls",
+            "guiDrawsRemaining" in browser_opengl_constants
+            and "guiCullFaceWasEnabled" in browser_opengl_constants
+            and "guiCullFaceDisabled" in browser_opengl_constants
+            and "gl.disable(gl.CULL_FACE)" in browser_opengl_constants
+            and "gl.enable(gl.CULL_FACE)" in browser_opengl_constants,
+        ),
+        (
+            "BrowserOpenGL compiled overlay can sample GUI vertex/index state behind diag=gui",
+            "sampleGuiDraw" in browser_opengl_constants
+            and "guiVertexSampleRecent" in browser_opengl_constants
+            and "indexSample" in browser_opengl_constants
+            and "sampleVertexAttrib" in browser_opengl_constants,
+        ),
+        (
+            "BrowserOpenGL compiled overlay maps WebGL buffers into registered MemoryUtil memory",
+            "org/lwjgl/system/MemoryUtil.memAlloc" in browser_opengl
+            and "org/lwjgl/system/MemoryUtil.memFree" in browser_opengl,
+        ),
+        (
+            "BrowserMemory compiled overlay preserves mapped ByteBuffer addresses through memSlice",
+            "public static long register(java.nio.ByteBuffer);" in browser_memory
+            and "private static void registerDerived(java.nio.Buffer, java.nio.Buffer, int);" in browser_memory,
+        ),
+        (
+            "BrowserMemory compiled overlay frees mapped buffers without scanning the whole address table",
+            "REGION_BUFFERS" in browser_memory
+            and "remember" in browser_memory,
         ),
         (
             "ARBVertexAttribBinding overlay delegates GUI vertex layout calls to BrowserOpenGL",
@@ -914,6 +1142,22 @@ def check_overlay_bytecode() -> None:
             and "gameFps" in browser_glfw_constants
             and "gameFrames" in browser_glfw_constants
             and "gameLastSampleAt" in browser_glfw_constants,
+        ),
+        (
+            "BrowserGlfw compiled overlay yields during waitEventsTimeout",
+            "public static void waitEventsTimeout(double);" in browser_glfw
+            and "sleepForBrowserMillis" in browser_glfw
+            and "java/lang/Thread.sleep:(J)V" in browser_glfw,
+        ),
+        (
+            "BrowserGlfw compiled overlay primes cursor callbacks",
+            "setCursorPosCallback" in browser_glfw
+            and "GLFWCursorPosCallbackI.invoke:(JDD)V" in browser_glfw,
+        ),
+        (
+            "BrowserGlfw compiled overlay warms up first GUI input",
+            "maybeQueueInputWarmup" in browser_glfw
+            and "__gaiusInputWarmupDone" in browser_glfw_constants,
         ),
         (
             "GLFW compiled overlay delegates glfwGetKeyName/getKeyScancode to BrowserGlfw",
@@ -952,11 +1196,34 @@ def check_overlay_bytecode() -> None:
             and "WidgetSprites.get" not in abstract_button_sprite,
         ),
         (
-            "GameRenderer.renderLevel skips world render behind browser screens",
-            "Field net/minecraft/client/Minecraft.screen:Lnet/minecraft/client/gui/screens/Screen;" in game_render_level_head
-            and "ifnull" in game_render_level_head
-            and "return" in game_render_level_head
-            and game_render_level_head.find("Field net/minecraft/client/Minecraft.screen") < game_render_level_head.find("InterfaceMethod net/minecraft/client/DeltaTracker.getGameTimeDeltaPartialTick"),
+            "GameRenderer.renderLevel remains active when GUI screens are open",
+            not (
+                "Field net/minecraft/client/Minecraft.screen:Lnet/minecraft/client/gui/screens/Screen;" in game_render_level_head
+                and "ifnull" in game_render_level_head
+                and "return" in game_render_level_head
+                and game_render_level_head.find("Field net/minecraft/client/Minecraft.screen") < game_render_level_head.find("InterfaceMethod net/minecraft/client/DeltaTracker.getGameTimeDeltaPartialTick")
+            ),
+        ),
+        (
+            "LevelRenderer compiled overlay throttles section scheduling and guards sync rebuild off",
+            "private void compileSections(net.minecraft.client.Camera);" in level_compile_sections
+            and "List.size" in level_compile_sections
+            and "if_icmplt" in level_compile_sections
+            and "List.add" in level_compile_sections
+            and "rebuildSectionAsync" in level_compile_sections
+            and "compileSectionSynchronously" in level_compile_sections
+            and "rebuildSectionSync" in level_compile_sections
+            and "iconst_0" in level_compile_sections
+            and level_compile_sections.find("iconst_0") < level_compile_sections.find("compileSectionSynchronously"),
+        ),
+        (
+            "SectionRenderDispatcher compiled overlay limits per-frame uploads",
+            "public void uploadAllPendingUploads();" in section_uploads
+            and section_uploads.count("Queue.poll") >= 2
+            and "Runnable.run" in section_uploads
+            and "SectionMesh.close" in section_uploads
+            and "if_icmpge" in section_uploads
+            and "goto" in section_uploads,
         ),
         (
             "IntegratedServer forces browser distances to 1",
@@ -1019,15 +1286,15 @@ def check_overlay_bytecode() -> None:
             "seedDefaultOptions" in browser_file_persistence_class
             and "enforcePerformanceOptions" in browser_file_persistence_class
             and "storage-default-options" in browser_file_persistence_constants
-            and "renderDistance:1" in browser_file_persistence_constants
-            and "simulationDistance:1" in browser_file_persistence_constants
-            and "maxFps:260" in browser_file_persistence_constants
+            and "renderDistance:2" in browser_file_persistence_constants
+            and "simulationDistance:5" in browser_file_persistence_constants
+            and "maxFps:120" in browser_file_persistence_constants
             and 'graphicsPreset:"fast"' in browser_file_persistence_constants
             and 'renderClouds:"false"' in browser_file_persistence_constants
             and "menuBackgroundBlurriness:0" in browser_file_persistence_constants
             and "panoramaSpeed:0.0" in browser_file_persistence_constants
             and "screenEffectScale:0.0" in browser_file_persistence_constants
-            and "maxAnisotropyBit:0" in browser_file_persistence_constants
+            and "maxAnisotropyBit:1" in browser_file_persistence_constants
             and "textureFiltering:0" in browser_file_persistence_constants
             and "browser low settings after migration failure" in browser_file_persistence_constants,
         ),
@@ -1055,6 +1322,16 @@ def check_overlay_bytecode() -> None:
             "ldc2_w        #156                // long 5l" in level_load_tracker_clinit
             and "Timed out while waiting for initial level loading packets in the browser" in waiting_for_server_tick
             and "loadingPacketsReceived" in waiting_for_server_tick,
+        ),
+        (
+            "LevelLoadTracker compiled overlay does not wait for hidden-screen section compilation",
+            "private boolean isReady();" in waiting_for_player_chunk
+            and "iconst_1" in method_section(waiting_for_player_chunk, "private boolean isReady();")
+            and "ireturn" in method_section(waiting_for_player_chunk, "private boolean isReady();")
+            and "isSectionCompiledAndVisible" not in method_section(
+                waiting_for_player_chunk,
+                "private boolean isReady();",
+            ),
         ),
         (
             "FramerateLimitTracker compiled overlay returns NONE throttle reason in browser",
