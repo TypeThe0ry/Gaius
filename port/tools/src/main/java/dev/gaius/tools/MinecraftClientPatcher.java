@@ -58,6 +58,8 @@ public final class MinecraftClientPatcher {
         patchGuiGraphicsBrowserItemCache(args[0], root.resolve(
                 "net/minecraft/client/gui/GuiGraphics.class"));
         patchGuiRenderTelemetry(args[0], root);
+        patchDynamicUniformsBrowserInitialCapacity(args[0], root.resolve(
+                "net/minecraft/client/renderer/DynamicUniforms.class"));
         patchFreeTypeUtil(args[0], root.resolve(
                 "net/minecraft/client/gui/font/providers/FreeTypeUtil.class"));
         patchDebugMemoryUntracker(args[0], root.resolve(
@@ -68,6 +70,8 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/client/server/IntegratedServer.class"));
         patchPlayerListBrowserDistances(args[0], root.resolve(
                 "net/minecraft/server/players/PlayerList.class"));
+        patchPersistentEntityUuidBrowserRecovery(args[0], root.resolve(
+                "net/minecraft/world/level/entity/PersistentEntitySectionManager.class"));
         patchServerLevelBrowserSafeDefaults(args[0], root.resolve(
                 "net/minecraft/server/level/ServerLevel.class"));
         patchChaseClient(args[0], root.resolve(
@@ -603,7 +607,103 @@ public final class MinecraftClientPatcher {
             }
             instruction = next;
         }
+        replaceGuiItemRenderStateDebugName(method);
         method.maxStack = Math.max(method.maxStack, 6);
+        writeComputeFrames(node, output);
+    }
+
+    private static void replaceGuiItemRenderStateDebugName(MethodNode method) {
+        int replacements = 0;
+        for (var instruction = method.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (!(instruction instanceof MethodInsnNode toStringCall)
+                    || !toStringCall.owner.equals("net/minecraft/network/chat/Component")
+                    || !toStringCall.name.equals("toString")
+                    || !toStringCall.desc.equals("()Ljava/lang/String;")) {
+                continue;
+            }
+            AbstractInsnNode getNameInstruction = previousRealInstruction(toStringCall);
+            AbstractInsnNode getItemInstruction = previousRealInstruction(getNameInstruction);
+            AbstractInsnNode stackLoadInstruction = previousRealInstruction(getItemInstruction);
+            if (!(getNameInstruction instanceof MethodInsnNode getNameCall)
+                    || !getNameCall.owner.equals("net/minecraft/world/item/Item")
+                    || !getNameCall.name.equals("getName")
+                    || !getNameCall.desc.equals("()Lnet/minecraft/network/chat/Component;")
+                    || !(getItemInstruction instanceof MethodInsnNode getItemCall)
+                    || !getItemCall.owner.equals("net/minecraft/world/item/ItemStack")
+                    || !getItemCall.name.equals("getItem")
+                    || !getItemCall.desc.equals("()Lnet/minecraft/world/item/Item;")
+                    || !(stackLoadInstruction instanceof VarInsnNode stackLoad)
+                    || stackLoad.getOpcode() != Opcodes.ALOAD
+                    || stackLoad.var != 3) {
+                continue;
+            }
+
+            method.instructions.insertBefore(stackLoadInstruction, new LdcInsnNode("browser:item"));
+            for (var remove = stackLoadInstruction; remove != null;) {
+                var next = remove.getNext();
+                method.instructions.remove(remove);
+                if (remove == toStringCall) {
+                    break;
+                }
+                remove = next;
+            }
+            replacements++;
+            break;
+        }
+        if (replacements != 1) {
+            throw new IllegalStateException("Expected one GUI item debug-name replacement, got " + replacements);
+        }
+    }
+
+    private static AbstractInsnNode previousRealInstruction(AbstractInsnNode instruction) {
+        if (instruction == null) {
+            return null;
+        }
+        var previous = instruction.getPrevious();
+        while (previous != null && previous.getOpcode() < 0) {
+            previous = previous.getPrevious();
+        }
+        return previous;
+    }
+
+    private static void patchDynamicUniformsBrowserInitialCapacity(String jar, Path output)
+            throws IOException {
+        ClassNode node = read(jar, "net/minecraft/client/renderer/DynamicUniforms.class");
+        MethodNode constructor = find(node, "<init>", "()V");
+        int[] browserCapacities = {128, 128};
+        int storageConstructors = 0;
+        for (var instruction = constructor.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKESPECIAL
+                    || !call.owner.equals("net/minecraft/client/renderer/DynamicUniformStorage")
+                    || !call.name.equals("<init>")
+                    || !call.desc.equals("(Ljava/lang/String;II)V")) {
+                continue;
+            }
+            if (storageConstructors >= browserCapacities.length) {
+                throw new IllegalStateException(
+                        "Unexpected extra DynamicUniformStorage constructor in DynamicUniforms");
+            }
+            AbstractInsnNode capacity = previousRealInstruction(call);
+            if (capacity == null || capacity.getOpcode() != Opcodes.ICONST_2) {
+                throw new IllegalStateException(
+                        "DynamicUniforms initial capacity instruction was not iconst_2 before constructor "
+                                + storageConstructors);
+            }
+            constructor.instructions.set(
+                    capacity,
+                    new IntInsnNode(Opcodes.SIPUSH, browserCapacities[storageConstructors]));
+            storageConstructors++;
+        }
+        if (storageConstructors != browserCapacities.length) {
+            throw new IllegalStateException(
+                    "Expected 2 DynamicUniformStorage constructors in DynamicUniforms, got "
+                            + storageConstructors);
+        }
         writeComputeFrames(node, output);
     }
 
@@ -3044,7 +3144,7 @@ public final class MinecraftClientPatcher {
                     && store.getOpcode() == Opcodes.ISTORE) {
                 InsnList override = new InsnList();
                 override.add(new InsnNode(Opcodes.POP));
-                override.add(new InsnNode(Opcodes.ICONST_1));
+                override.add(browserDistanceConstant(patchedStores == 0 ? 4 : 5));
                 method.instructions.insertBefore(instruction, override);
                 patchedStores++;
                 if (patchedStores == 2) {
@@ -3061,38 +3161,157 @@ public final class MinecraftClientPatcher {
 
     private static void patchPlayerListBrowserDistances(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "net/minecraft/server/players/PlayerList.class");
-        patchPlayerListDistanceGetter(node, "getViewDistance", "viewDistance");
-        patchPlayerListDistanceGetter(node, "getSimulationDistance", "simulationDistance");
-        patchPlayerListDistanceSetter(node, "setViewDistance");
-        patchPlayerListDistanceSetter(node, "setSimulationDistance");
+        patchPlayerListDistanceGetter(node, "getViewDistance", "viewDistance", 4);
+        patchPlayerListDistanceGetter(node, "getSimulationDistance", "simulationDistance", 5);
+        patchPlayerListDistanceSetter(node, "setViewDistance", 4);
+        patchPlayerListDistanceSetter(node, "setSimulationDistance", 5);
         writeComputeFrames(node, output);
     }
 
-    private static void patchPlayerListDistanceGetter(ClassNode node, String methodName, String fieldName) {
+    private static void patchPersistentEntityUuidBrowserRecovery(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/world/level/entity/PersistentEntitySectionManager.class");
+        MethodNode method = find(node, "addEntityUuid",
+                "(Lnet/minecraft/world/level/entity/EntityAccess;)Z");
+        LabelNode duplicate = new LabelNode();
+        LabelNode retryLoop = new LabelNode();
+        LabelNode retryNext = new LabelNode();
+        LabelNode warn = new LabelNode();
+        LabelNode recovered = new LabelNode();
+
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                node.name,
+                "knownUuids",
+                "Ljava/util/Set;"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "net/minecraft/world/level/entity/EntityAccess",
+                "getUUID",
+                "()Ljava/util/UUID;",
+                true));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Set",
+                "add",
+                "(Ljava/lang/Object;)Z",
+                true));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, duplicate));
+        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(new InsnNode(Opcodes.IRETURN));
+
+        code.add(duplicate);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new TypeInsnNode(Opcodes.INSTANCEOF, "net/minecraft/world/entity/Entity"));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, warn));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new TypeInsnNode(Opcodes.CHECKCAST, "net/minecraft/world/entity/Entity"));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 2));
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 3));
+
+        code.add(retryLoop);
+        code.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        code.add(new IntInsnNode(Opcodes.BIPUSH, 8));
+        code.add(new JumpInsnNode(Opcodes.IF_ICMPGE, warn));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "net/minecraft/util/Mth",
+                "createInsecureUUID",
+                "()Ljava/util/UUID;",
+                false));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/world/entity/Entity",
+                "setUUID",
+                "(Ljava/util/UUID;)V",
+                false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                node.name,
+                "knownUuids",
+                "Ljava/util/Set;"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "net/minecraft/world/level/entity/EntityAccess",
+                "getUUID",
+                "()Ljava/util/UUID;",
+                true));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Set",
+                "add",
+                "(Ljava/lang/Object;)Z",
+                true));
+        code.add(new JumpInsnNode(Opcodes.IFNE, recovered));
+        code.add(retryNext);
+        code.add(new IincInsnNode(3, 1));
+        code.add(new JumpInsnNode(Opcodes.GOTO, retryLoop));
+
+        code.add(recovered);
+        code.add(minecraftEvent("server.entityUuidRecovered"));
+        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(new InsnNode(Opcodes.IRETURN));
+
+        code.add(warn);
+        code.add(new FieldInsnNode(
+                Opcodes.GETSTATIC,
+                node.name,
+                "LOGGER",
+                "Lorg/slf4j/Logger;"));
+        code.add(new LdcInsnNode("UUID of added entity already exists: {}"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "org/slf4j/Logger",
+                "warn",
+                "(Ljava/lang/String;Ljava/lang/Object;)V",
+                true));
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new InsnNode(Opcodes.IRETURN));
+
+        replace(method, code, 3, 4);
+        writeComputeFrames(node, output);
+    }
+
+    private static void patchPlayerListDistanceGetter(ClassNode node, String methodName, String fieldName, int browserDistance) {
         MethodNode method = find(node, methodName, "()I");
         InsnList code = new InsnList();
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new FieldInsnNode(Opcodes.GETFIELD, node.name, fieldName, "I"));
-        code.add(distanceClamp());
+        code.add(fixedBrowserDistance(browserDistance));
         code.add(new InsnNode(Opcodes.IRETURN));
         replace(method, code, 2, 1);
     }
 
-    private static void patchPlayerListDistanceSetter(ClassNode node, String methodName) {
+    private static void patchPlayerListDistanceSetter(ClassNode node, String methodName, int browserDistance) {
         MethodNode method = find(node, methodName, "(I)V");
         InsnList code = new InsnList();
         code.add(new VarInsnNode(Opcodes.ILOAD, 1));
-        code.add(distanceClamp());
+        code.add(fixedBrowserDistance(browserDistance));
         code.add(new VarInsnNode(Opcodes.ISTORE, 1));
         method.instructions.insert(code);
         method.maxStack = Math.max(method.maxStack, 2);
     }
 
-    private static InsnList distanceClamp() {
+    private static InsnList fixedBrowserDistance(int browserDistance) {
         InsnList code = new InsnList();
         code.add(new InsnNode(Opcodes.POP));
-        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(browserDistanceConstant(browserDistance));
         return code;
+    }
+
+    private static AbstractInsnNode browserDistanceConstant(int browserDistance) {
+        return switch (browserDistance) {
+            case 4 -> new InsnNode(Opcodes.ICONST_4);
+            case 5 -> new InsnNode(Opcodes.ICONST_5);
+            default -> throw new IllegalArgumentException("Unsupported browser distance: " + browserDistance);
+        };
     }
 
     private static void patchFreeTypeUtil(String jar, Path output) throws IOException {

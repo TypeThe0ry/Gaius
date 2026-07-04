@@ -9,17 +9,37 @@ if (files.length === 0) {
 
 function load(file) {
   const root = JSON.parse(readFileSync(file, 'utf8'));
-  return root.state || root;
+  if (root.state) return root.state;
+  const snapshots = Array.isArray(root.interactionSnapshots) ? root.interactionSnapshots : [];
+  const snapshot = snapshots.findLast(item => item && (item.minecraftState || item.glStatsLite || item.glStats));
+  if (snapshot) {
+    return {
+      minecraftState: snapshot.minecraftState || {
+        screen: snapshot.screen ?? null,
+        level: snapshot.level ?? null,
+        overlay: snapshot.overlay ?? null,
+        player: snapshot.player ?? null,
+      },
+      minecraftCounters: snapshot.minecraftCounters || null,
+      glStats: snapshot.glStats || snapshot.glStatsLite || null,
+      fps: snapshot.fps || null,
+      canvases: snapshot.canvases || null,
+      centerPixel: snapshot.centerPixel || null,
+    };
+  }
+  return root;
 }
 
 function level0(info) {
+  if (Number.isFinite(info?.width) && Number.isFinite(info?.height)) return info;
   return info?.levels?.['0'] || info?.levels?.[0] || null;
 }
 
 function textureSummary(state) {
   const info = state.glStats?.textureInfo || {};
   const counts = new Map();
-  for (const value of Object.values(info)) {
+  const values = Array.isArray(info) ? info : Object.values(info);
+  for (const value of values) {
     const l0 = level0(value);
     if (!l0) continue;
     const key = `${l0.width}x${l0.height}`;
@@ -168,6 +188,15 @@ for (const file of files) {
     screen: state.minecraftState?.screen ?? null,
     level: state.minecraftState?.level ?? null,
     overlay: state.minecraftState?.overlay ?? null,
+    fps: state.fps ?? null,
+    gui: state.minecraftCounters
+      ? {
+          submits: state.minecraftCounters.guiLastSubmits ?? null,
+          drawCalls: state.minecraftCounters.guiLastDrawCalls ?? null,
+          drawIndices: state.minecraftCounters.guiLastDrawIndices ?? null,
+          baseVertexDraws: state.minecraftCounters.guiLastBaseVertexNonZero ?? null,
+        }
+      : null,
     centerPixel: state.centerPixel ?? null,
     defaultFramebuffer: state.defaultFramebufferStats
       ? {
@@ -180,8 +209,11 @@ for (const file of files) {
       ? {
           drawArrays: state.glStats.drawArrays,
           drawElements: state.glStats.drawElements,
+          drawCallsPerSecond: state.glStats.drawCallsPerSecond,
           blitFramebuffer: state.glStats.blitFramebuffer,
           lastError: state.glStats.lastError,
+          textureUploads: state.glStats.textureUploads,
+          textureUploadErrors: state.glStats.textureUploadErrors ?? null,
         }
       : null,
     textureSizeTop: textureSummary(state),

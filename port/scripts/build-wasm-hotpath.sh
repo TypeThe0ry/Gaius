@@ -19,9 +19,9 @@ if [[ -z "$wasm_ld" && "$(command -v ld.lld || true)" != "" ]]; then
   wasm_ld="$(command -v ld.lld)"
 fi
 if [[ -z "$wasm_ld" ]]; then
-  echo "wasm-ld/ld.lld is required to link the Gaius Wasm hot-path module." >&2
-  echo "Install LLVM/lld or set GAIUS_WASM_LD=/path/to/wasm-ld, then rerun this script." >&2
-  exit 1
+  echo "wasm-ld/ld.lld was not found; generating the Gaius Wasm hot-path module directly." >&2
+  python3 "$root/port/scripts/generate-wasm-hotpath.py" -o "$output"
+  exit 0
 fi
 
 export PATH="$(dirname "$wasm_ld"):$PATH"

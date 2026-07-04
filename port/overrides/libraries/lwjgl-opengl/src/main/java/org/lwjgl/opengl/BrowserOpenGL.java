@@ -49,10 +49,10 @@ public final class BrowserOpenGL {
                 bufferSizes:new Map(),bufferBytes:new Map(),bufferVersions:new Map(),boundBuffers:new Map(),
                 bufferShadowTouch:new Map(),bufferShadowClock:0,bufferShadowTotalBytes:0,
                 activeTextureUnit:0,textureBindings:new Map(),textureBufferInfo:new Map(),
-                textureInfo:new Map(),
+                textureInfo:new Map(),framebufferColorTextures:new Map(),
                 framebufferBindings:{draw:0,read:0},
                 colorMask:[true,true,true,true],
-                guiDrawDiagnostics:false,guiDrawsRemaining:0,
+                guiDrawDiagnostics:false,guiDrawsRemaining:0,guiCullFaceBatchActive:false,
                 enabledCaps:new Set(),knownCaps:new Set(),
                 currentProgram:0,programAttribs:new Map(),programVersion:0,
                 currentVaoId:0,vaoEmu:new Map(),alignedAttribCache:new Map(),shiftedIndexCache:new Map()};
@@ -118,6 +118,7 @@ public final class BrowserOpenGL {
                   directAttribVersion:-1,
                   directAttribProgram:-1,
                   directAttribGlobalVersion:-1,
+                  directAttribDirty:false,
                   programAttribProgram:-1,
                   programAttribVersion:-1,
                   programAttribGlobalVersion:-1
@@ -160,6 +161,17 @@ public final class BrowserOpenGL {
                 } else {
                   vao.misalignedAttribs.delete(idx);
                 }
+              };
+              window.__gaiusGL.sameAttribPointer=function(a,b) {
+                return !!a && !!b
+                  && (a.index|0)===(b.index|0)
+                  && (a.size|0)===(b.size|0)
+                  && (a.type|0)===(b.type|0)
+                  && !!a.normalized===!!b.normalized
+                  && (a.stride|0)===(b.stride|0)
+                  && Number(a.offset)===Number(b.offset)
+                  && !!a.integer===!!b.integer
+                  && (a.buffer|0)===(b.buffer|0);
               };
               window.__gaiusGL.isIntegerAttribType=function(type) {
                 switch (type|0) {
@@ -452,6 +464,62 @@ public final class BrowserOpenGL {
                   || this.textureBindings.get(unit + ':35882')
                   || 0)|0;
               };
+              window.__gaiusGL.invalidateGuiItemAtlasBlitCache=function() {};
+              window.__gaiusGL.findFramebufferColorTextureId=function(framebuffer) {
+                const mapped=this.framebufferColorTextures.get(framebuffer|0);
+                if (mapped) return mapped|0;
+                const gl=window.__gaiusWebGL;
+                const drawObject=this.framebuffers.get(framebuffer|0);
+                if (!drawObject) return 0;
+                const previousRead=this.framebufferBindings.read|0;
+                const previousDraw=this.framebufferBindings.draw|0;
+                let targetTextureId=0;
+                try {
+                  gl.bindFramebuffer(gl.FRAMEBUFFER,drawObject);
+                  const colorObject=gl.getFramebufferAttachmentParameter(
+                    gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.FRAMEBUFFER_ATTACHMENT_OBJECT_NAME);
+                  const textureIterator=this.textures.entries();
+                  for (let nextTexture=textureIterator.next(); !nextTexture.done; nextTexture=textureIterator.next()) {
+                    const pair=nextTexture.value;
+                    const id=pair[0];
+                    const texture=pair[1];
+                    if (texture===colorObject) {
+                      targetTextureId=Number(id)|0;
+                      break;
+                    }
+                  }
+                } catch (ignored) {
+                  targetTextureId=0;
+                } finally {
+                  gl.bindFramebuffer(gl.READ_FRAMEBUFFER,previousRead===0?null:this.framebuffers.get(previousRead));
+                  gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER,previousDraw===0?null:this.framebuffers.get(previousDraw));
+                }
+                return targetTextureId|0;
+              };
+              window.__gaiusGL.isGuiItemOffscreen512Target=function() {
+                const drawFramebuffer=this.framebufferBindings.draw|0;
+                if (!drawFramebuffer) return false;
+                const targetTextureId=this.findFramebufferColorTextureId(drawFramebuffer);
+                const targetInfo=targetTextureId ? this.textureInfo.get(targetTextureId) : null;
+                return !!(targetInfo && (targetInfo.width|0)===512 && (targetInfo.height|0)===512);
+              };
+              window.__gaiusGL.withGuiItemOffscreenScissorRepair=function(draw) {
+                const gl=window.__gaiusWebGL;
+                const repair=this.enabledCaps && this.enabledCaps.has(gl.SCISSOR_TEST)
+                  && this.isGuiItemOffscreen512Target();
+                if (!repair) {
+                  draw();
+                  return;
+                }
+                var stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+                stats.offscreen512ScissorRepairs=(stats.offscreen512ScissorRepairs||0)+1;
+                gl.disable(gl.SCISSOR_TEST);
+                try {
+                  draw();
+                } finally {
+                  gl.enable(gl.SCISSOR_TEST);
+                }
+              };
               window.__gaiusGL.recordTextureUpload=function(kind,target,level,x,y,width,height,internalFormat,format,type,pixels) {
                 var stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
                 const texture=this.boundTextureId(target);
@@ -480,9 +548,11 @@ public final class BrowserOpenGL {
                 if (texture) {
                   const previous=this.textureInfo.get(texture) || {};
                   const merged=Object.assign({},previous,entry);
+                  merged.version=((previous.version||0)+1)|0;
                   if (width>0) merged.width=width|0;
                   if (height>0) merged.height=height|0;
                   this.textureInfo.set(texture,merged);
+                  this.invalidateGuiItemAtlasBlitCache(texture,'upload');
                   stats.textureInfo=Array.from(this.textureInfo.entries()).slice(-64).map(function(pair) {
                     return Object.assign({texture:pair[0]|0},pair[1]);
                   });
@@ -688,12 +758,23 @@ public final class BrowserOpenGL {
                   integer:!!format.integer,
                   buffer:vertexBuffer.buffer|0
                 };
-                vao.attribPointers.set(index,pointer);
                 const componentBytes=this.componentBytes(format.type);
                 const aligned=(offset % componentBytes)===0 && (stride===0 || (stride % componentBytes)===0);
+                const previousPointer=vao.attribPointers.get(index);
+                const previousMisaligned=vao.misalignedAttribs && vao.misalignedAttribs.has(index);
+                const previousPresence=vao.attribHasBuffer.has(index);
+                const samePointer=this.sameAttribPointer(previousPointer,pointer);
+                vao.attribPointers.set(index,pointer);
                 this.setAttribBufferPresence(vao,index,true);
                 this.setAttribMisaligned(vao,index,!aligned);
-                this.bumpVaoAttribVersion(vao);
+                if (previousPresence && (!samePointer || previousMisaligned!==!aligned)) {
+                  this.bumpVaoAttribVersion(vao);
+                } else if (previousPresence && samePointer && previousMisaligned===!aligned && aligned) {
+                  var stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+                  stats.attribPointerFastSkips=(stats.attribPointerFastSkips||0)+1;
+                  gl.bindBuffer(gl.ARRAY_BUFFER,previous);
+                  return;
+                }
                 if (aligned) {
                   if (format.integer) {
                     gl.vertexAttribIPointer(index,format.size|0,format.type|0,stride,offset);
@@ -744,6 +825,18 @@ public final class BrowserOpenGL {
                 const version=vao.attribVersion||0;
                 const program=this.currentProgram|0;
                 const globalVersion=this.programVersion||0;
+                if (!vao.directAttribDirty) {
+                  if ((vao.directAttribVersion|0)!==version
+                      || (vao.directAttribProgram|0)!==program
+                      || (vao.directAttribGlobalVersion|0)!==globalVersion) {
+                    vao.directAttribVersion=version;
+                    vao.directAttribProgram=program;
+                    vao.directAttribGlobalVersion=globalVersion;
+                    var cleanStats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+                    cleanStats.directAttribCleanSkips=(cleanStats.directAttribCleanSkips||0)+1;
+                  }
+                  return 0;
+                }
                 if ((vao.directAttribVersion|0)===version
                     && (vao.directAttribProgram|0)===program
                     && (vao.directAttribGlobalVersion|0)===globalVersion) {
@@ -758,7 +851,7 @@ public final class BrowserOpenGL {
                   if (vao.misalignedAttribs && vao.misalignedAttribs.has(index)) return;
                   const pointer=vao.attribPointers.get(index);
                   if (!pointer || !pointer.buffer || !vao.attribHasBuffer.has(index)) return;
-                  if (state.bindAttribPointerAtOffset(pointer,Number(pointer.offset))) {
+                  if (state.bindAttribPointerAtOffset(pointer,Number(pointer.offset),true)) {
                     restored++;
                   }
                 };
@@ -771,6 +864,7 @@ public final class BrowserOpenGL {
                 vao.directAttribVersion=version;
                 vao.directAttribProgram=program;
                 vao.directAttribGlobalVersion=globalVersion;
+                vao.directAttribDirty=false;
                 if (restored) {
                   var stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
                   stats.directAttribRestores=(stats.directAttribRestores||0)+1;
@@ -784,10 +878,17 @@ public final class BrowserOpenGL {
                 var version=vao.attribVersion||0;
                 var program=this.currentProgram|0;
                 var globalVersion=this.programVersion||0;
-                var active=this.activeAttribLocations();
                 var state=this;
                 var stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
                 var activeMisaligned=false;
+                if (!vao.misalignedAttribs || !vao.misalignedAttribs.size) {
+                  this.restoreDirectAttribPointers(null);
+                  vao.alignedAttribVersion=version;
+                  vao.alignedAttribProgram=program;
+                  vao.alignedAttribGlobalVersion=globalVersion;
+                  return 0;
+                }
+                var active=this.activeAttribLocations();
                 if (vao.misalignedAttribs && vao.misalignedAttribs.size) {
                   vao.misalignedAttribs.forEach(function(attrib) {
                     if (state.attribIsActive(active,attrib|0) && vao.enabledAttribs.has(attrib|0)) {
@@ -965,6 +1066,7 @@ public final class BrowserOpenGL {
                   vao.directAttribVersion=-1;
                   vao.directAttribProgram=-1;
                   vao.directAttribGlobalVersion=-1;
+                  vao.directAttribDirty=true;
                   stats.alignedAttribDraws=(stats.alignedAttribDraws||0)+1;
                   stats.alignedAttribPointers=(stats.alignedAttribPointers||0)+aligned;
                 }
@@ -988,16 +1090,18 @@ public final class BrowserOpenGL {
                 }
                 return this.baseVertexExtension || null;
               };
-              window.__gaiusGL.bindAttribPointerAtOffset=function(pointer, offset) {
+              window.__gaiusGL.bindAttribPointerAtOffset=function(pointer, offset, preserveDirectCache) {
                 const gl=window.__gaiusWebGL;
                 const vao=this.getVaoEmu();
                 const bufferObject=this.buffers.get(pointer.buffer|0);
                 if (!bufferObject) {
                   return false;
                 }
-                vao.directAttribVersion=-1;
-                vao.directAttribProgram=-1;
-                vao.directAttribGlobalVersion=-1;
+                if (!preserveDirectCache) {
+                  vao.directAttribVersion=-1;
+                  vao.directAttribProgram=-1;
+                  vao.directAttribGlobalVersion=-1;
+                }
                 gl.bindBuffer(gl.ARRAY_BUFFER,bufferObject);
                 if (pointer.integer) {
                   gl.vertexAttribIPointer(
@@ -1076,7 +1180,7 @@ public final class BrowserOpenGL {
                   }
                   const oldInteger=!!pointer.integer;
                   pointer.integer=expected;
-                  if (this.bindAttribPointerAtOffset(pointer,Number(pointer.offset))) {
+                  if (this.bindAttribPointerAtOffset(pointer,Number(pointer.offset),false)) {
                     repaired++;
                     var stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
                     stats.attribTypeRepairs=(stats.attribTypeRepairs||0)+1;
@@ -1121,8 +1225,9 @@ public final class BrowserOpenGL {
                       stats.baseVertexBadOffset=(stats.baseVertexBadOffset||0)+1;
                       return;
                     }
-                    if (this.bindAttribPointerAtOffset(pointer,shiftedOffset)) {
+                    if (this.bindAttribPointerAtOffset(pointer,shiftedOffset,false)) {
                       shiftedAttribPointers.push(pointer);
+                      vao.directAttribDirty=true;
                     } else {
                       stats.baseVertexMissingBuffer=(stats.baseVertexMissingBuffer||0)+1;
                     }
@@ -1137,7 +1242,16 @@ public final class BrowserOpenGL {
                   for (var i=0;i<shiftedAttribPointers.length;i++) {
                     this.bindAttribPointerAtOffset(
                       shiftedAttribPointers[i],
-                      Number(shiftedAttribPointers[i].offset));
+                      Number(shiftedAttribPointers[i].offset),
+                      true);
+                  }
+                  if (shiftedAttribPointers.length) {
+                    vao.directAttribVersion=vao.attribVersion||0;
+                    vao.directAttribProgram=this.currentProgram|0;
+                    vao.directAttribGlobalVersion=this.programVersion||0;
+                    vao.directAttribDirty=false;
+                    stats.baseVertexDirectRestores=(stats.baseVertexDirectRestores||0)+1;
+                    stats.baseVertexDirectRestorePointers=(stats.baseVertexDirectRestorePointers||0)+shiftedAttribPointers.length;
                   }
                   gl.bindBuffer(gl.ARRAY_BUFFER,previousArray);
                 }
@@ -1301,14 +1415,17 @@ public final class BrowserOpenGL {
               window.__gaiusGL.withValidAttribs=function(draw) {
                 const gl=window.__gaiusWebGL;
                 const vao=this.getVaoEmu();
-                const disabled=[];
-                vao.missingEnabledAttribs.forEach(function(attrib) {
-                  const index=attrib|0;
-                  gl.disableVertexAttribArray(index);
-                  disabled.push(index);
-                });
+                let disabled=null;
+                if (vao.missingEnabledAttribs && vao.missingEnabledAttribs.size) {
+                  disabled=[];
+                  vao.missingEnabledAttribs.forEach(function(attrib) {
+                    const index=attrib|0;
+                    gl.disableVertexAttribArray(index);
+                    disabled.push(index);
+                  });
+                }
                 var stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
-                if (disabled.length) {
+                if (disabled && disabled.length) {
                   stats.attribGuardDraws=(stats.attribGuardDraws||0)+1;
                   stats.attribGuardDisabled=(stats.attribGuardDisabled||0)+disabled.length;
                   stats.attribGuardLast=disabled.slice(0,16);
@@ -1316,12 +1433,15 @@ public final class BrowserOpenGL {
                 this.ensureProgramAttribTypes();
                 this.ensureAlignedAttribs();
                 const guiDraw=(this.guiDrawsRemaining|0)>0;
-                const guiCullFaceWasEnabled=guiDraw && this.enabledCaps.has(gl.CULL_FACE);
+                const beginGuiCullFaceBatch=guiDraw
+                  && this.enabledCaps.has(gl.CULL_FACE)
+                  && !this.guiCullFaceBatchActive;
                 try {
                   this.ensureDefaultFramebufferColorWrites();
-                  if (guiCullFaceWasEnabled) {
+                  if (beginGuiCullFaceBatch) {
                     gl.disable(gl.CULL_FACE);
-                    stats.guiCullFaceDisabled=(stats.guiCullFaceDisabled||0)+1;
+                    this.guiCullFaceBatchActive=true;
+                    stats.guiCullFaceBatchDisables=(stats.guiCullFaceBatchDisables||0)+1;
                   }
                   this.recordDrawCall();
                   const guiDrawDiag=!!this.guiDrawDiagnostics && guiDraw;
@@ -1331,14 +1451,18 @@ public final class BrowserOpenGL {
                     this.recordGuiDrawState(guiDrawState, gl.getError()|0);
                   }
                 } finally {
-                  if (guiCullFaceWasEnabled) {
-                    gl.enable(gl.CULL_FACE);
-                  }
                   if (guiDraw && (this.guiDrawsRemaining|0)>0) {
                     this.guiDrawsRemaining=Math.max(0,(this.guiDrawsRemaining|0)-1);
+                    if ((this.guiDrawsRemaining|0)===0 && this.guiCullFaceBatchActive) {
+                      gl.enable(gl.CULL_FACE);
+                      this.guiCullFaceBatchActive=false;
+                      stats.guiCullFaceBatchRestores=(stats.guiCullFaceBatchRestores||0)+1;
+                    }
                   }
-                  for (var i=0;i<disabled.length;i++) {
-                    gl.enableVertexAttribArray(disabled[i]);
+                  if (disabled) {
+                    for (var i=0;i<disabled.length;i++) {
+                      gl.enableVertexAttribArray(disabled[i]);
+                    }
                   }
                 }
               };
@@ -1385,7 +1509,17 @@ public final class BrowserOpenGL {
     @JSBody(params = {"depth"}, script = "window.__gaiusWebGL.clearDepth(depth);")
     public static native void clearDepth(double depth);
 
-    @JSBody(params = {"mask"}, script = "window.__gaiusWebGL.clear(mask);")
+    @JSBody(params = {"mask"}, script = """
+            const gl=window.__gaiusWebGL,state=window.__gaiusGL;
+            if (state && ((mask|0) & gl.COLOR_BUFFER_BIT)) {
+              const framebuffer=state.framebufferBindings.draw|0;
+              if (framebuffer) {
+                const texture=state.findFramebufferColorTextureId(framebuffer);
+                if (texture) state.invalidateGuiItemAtlasBlitCache(texture,'clear');
+              }
+            }
+            gl.clear(mask);
+            """)
     public static native void clear(int mask);
 
     @JSBody(params = {"red", "green", "blue", "alpha"}, script = """
@@ -1403,21 +1537,34 @@ public final class BrowserOpenGL {
 
     @JSBody(params = {"mode", "first", "count"}, script = """
             const gl=window.__gaiusWebGL;
-            window.__gaiusGL.withValidAttribs(function() {
-              gl.drawArrays(mode,first,count);
+            window.__gaiusGL.withGuiItemOffscreenScissorRepair(function() {
+              window.__gaiusGL.withValidAttribs(function() {
+                gl.drawArrays(mode,first,count);
+              });
             });
             """)
     public static native void drawArrays(int mode, int first, int count);
 
     @JSBody(params = {"mode", "count", "type", "offset"}, script = """
             const gl=window.__gaiusWebGL;
-            window.__gaiusGL.withValidAttribs(function() {
-              gl.drawElements(mode,count,type,Number(offset));
+            window.__gaiusGL.withGuiItemOffscreenScissorRepair(function() {
+              window.__gaiusGL.withValidAttribs(function() {
+                gl.drawElements(mode,count,type,Number(offset));
+              });
             });
             """)
     public static native void drawElements(int mode, int count, int type, long offset);
 
-    @JSBody(script = "return window.__gaiusWebGL.getError()|0;")
+    @JSBody(script = """
+            if (window.__gaiusReadWebGLErrors===undefined) {
+              try {
+                window.__gaiusReadWebGLErrors=new URLSearchParams(location.search).get('glErrors')==='1';
+              } catch (ignored) {
+                window.__gaiusReadWebGLErrors=false;
+              }
+            }
+            return window.__gaiusReadWebGLErrors ? (window.__gaiusWebGL.getError()|0) : 0;
+            """)
     public static native int getError();
 
     @JSBody(params = {"parameter"}, script = """
@@ -1529,7 +1676,10 @@ public final class BrowserOpenGL {
 
     @JSBody(params = {"texture"}, script = """
             const state=window.__gaiusGL, object=state.textures.get(texture);
-            if (object) window.__gaiusWebGL.deleteTexture(object); state.textures.delete(texture);
+            if (object) window.__gaiusWebGL.deleteTexture(object);
+            state.invalidateGuiItemAtlasBlitCache(texture,'delete');
+            state.textureInfo.delete(texture);
+            state.textures.delete(texture);
             """)
     public static native void deleteTexture(int texture);
 
@@ -2342,6 +2492,17 @@ public final class BrowserOpenGL {
 
     @JSBody(params = {"index"}, script = """
             const state=window.__gaiusGL,vao=state.getVaoEmu(),idx=index|0;
+            if (vao.enabledAttribs.has(idx)) {
+              const hasBuffer=vao.attribHasBuffer.has(idx);
+              if (!hasBuffer) {
+                vao.missingEnabledAttribs.add(idx);
+              } else {
+                vao.missingEnabledAttribs.delete(idx);
+              }
+              var stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+              stats.enableAttribFastSkips=(stats.enableAttribFastSkips||0)+1;
+              return;
+            }
             vao.enabledAttribs.add(idx);
             if (!vao.attribHasBuffer.has(idx)) {
               vao.missingEnabledAttribs.add(idx);
@@ -2355,6 +2516,15 @@ public final class BrowserOpenGL {
 
     @JSBody(params = {"index"}, script = """
             const state=window.__gaiusGL,vao=state.getVaoEmu(),idx=index|0;
+            if (!vao.enabledAttribs.has(idx)) {
+              if (vao.missingEnabledAttribs.delete(idx)) {
+                state.bumpVaoAttribVersion(vao);
+              } else {
+                var stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+                stats.disableAttribFastSkips=(stats.disableAttribFastSkips||0)+1;
+              }
+              return;
+            }
             vao.enabledAttribs.delete(idx);
             vao.missingEnabledAttribs.delete(idx);
             state.bumpVaoAttribVersion(vao);
@@ -2366,7 +2536,7 @@ public final class BrowserOpenGL {
             const gl=window.__gaiusWebGL,state=window.__gaiusGL,vao=state.getVaoEmu();
             const idx=index|0;
             const buffer=state.boundBuffers.get(gl.ARRAY_BUFFER)|0;
-            vao.attribPointers.set(idx,{
+            const pointer={
               index:idx,
               size:size|0,
               type:type|0,
@@ -2375,19 +2545,32 @@ public final class BrowserOpenGL {
               offset:Number(offset),
               integer:false,
               buffer:buffer|0
-            });
+            };
             const componentBytes=state.componentBytes(type);
             const numericOffset=Number(offset);
             const numericStride=stride|0;
             const aligned=(numericOffset % componentBytes)===0
               && (numericStride===0 || (numericStride % componentBytes)===0);
+            const previousPointer=vao.attribPointers.get(idx);
+            const previousMisaligned=vao.misalignedAttribs && vao.misalignedAttribs.has(idx);
+            const previousPresence=vao.attribHasBuffer.has(idx);
+            const samePointer=state.sameAttribPointer(previousPointer,pointer);
+            vao.attribPointers.set(idx,pointer);
             state.setAttribBufferPresence(vao,idx,!!buffer);
             state.setAttribMisaligned(vao,idx,!aligned);
-            state.bumpVaoAttribVersion(vao);
+            if (!previousPresence && !buffer) {
+              // setAttribBufferPresence already left the missing-buffer state unchanged.
+            } else if (!samePointer || previousMisaligned!==!aligned || previousPresence!==!!buffer) {
+              if (previousPresence===!!buffer) state.bumpVaoAttribVersion(vao);
+            } else {
+              var stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+              stats.attribPointerFastSkips=(stats.attribPointerFastSkips||0)+1;
+              if (aligned) return;
+            }
             if (aligned) {
               gl.vertexAttribPointer(index,size,type,normalized,stride,numericOffset);
             } else {
-              const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+              var stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
               stats.alignedAttribDeferredPointers=(stats.alignedAttribDeferredPointers||0)+1;
             }
             """)
@@ -2398,7 +2581,7 @@ public final class BrowserOpenGL {
             const gl=window.__gaiusWebGL,state=window.__gaiusGL,vao=state.getVaoEmu();
             const idx=index|0;
             const buffer=state.boundBuffers.get(gl.ARRAY_BUFFER)|0;
-            vao.attribPointers.set(idx,{
+            const pointer={
               index:idx,
               size:size|0,
               type:type|0,
@@ -2407,19 +2590,32 @@ public final class BrowserOpenGL {
               offset:Number(offset),
               integer:true,
               buffer:buffer|0
-            });
+            };
             const componentBytes=state.componentBytes(type);
             const numericOffset=Number(offset);
             const numericStride=stride|0;
             const aligned=(numericOffset % componentBytes)===0
               && (numericStride===0 || (numericStride % componentBytes)===0);
+            const previousPointer=vao.attribPointers.get(idx);
+            const previousMisaligned=vao.misalignedAttribs && vao.misalignedAttribs.has(idx);
+            const previousPresence=vao.attribHasBuffer.has(idx);
+            const samePointer=state.sameAttribPointer(previousPointer,pointer);
+            vao.attribPointers.set(idx,pointer);
             state.setAttribBufferPresence(vao,idx,!!buffer);
             state.setAttribMisaligned(vao,idx,!aligned);
-            state.bumpVaoAttribVersion(vao);
+            if (!previousPresence && !buffer) {
+              // setAttribBufferPresence already left the missing-buffer state unchanged.
+            } else if (!samePointer || previousMisaligned!==!aligned || previousPresence!==!!buffer) {
+              if (previousPresence===!!buffer) state.bumpVaoAttribVersion(vao);
+            } else {
+              var stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+              stats.attribPointerFastSkips=(stats.attribPointerFastSkips||0)+1;
+              if (aligned) return;
+            }
             if (aligned) {
               gl.vertexAttribIPointer(index,size,type,stride,numericOffset);
             } else {
-              const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+              var stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
               stats.alignedAttribDeferredPointers=(stats.alignedAttribDeferredPointers||0)+1;
             }
             """)
@@ -2542,8 +2738,21 @@ public final class BrowserOpenGL {
     public static native void bindFramebuffer(int target, int framebuffer);
 
     @JSBody(params = {"target", "attachment", "textureTarget", "texture", "level"}, script = """
-            window.__gaiusWebGL.framebufferTexture2D(
-              target,attachment,textureTarget,texture===0?null:window.__gaiusGL.textures.get(texture),level);
+            const gl=window.__gaiusWebGL,state=window.__gaiusGL;
+            gl.framebufferTexture2D(
+              target,attachment,textureTarget,texture===0?null:state.textures.get(texture),level);
+            if ((attachment|0)===gl.COLOR_ATTACHMENT0) {
+              let framebuffer=0;
+              if (target===gl.FRAMEBUFFER || target===gl.DRAW_FRAMEBUFFER) {
+                framebuffer=state.framebufferBindings.draw|0;
+              } else if (target===gl.READ_FRAMEBUFFER) {
+                framebuffer=state.framebufferBindings.read|0;
+              }
+              if (framebuffer) {
+                if (texture) state.framebufferColorTextures.set(framebuffer,texture|0);
+                else state.framebufferColorTextures.delete(framebuffer);
+              }
+            }
             """)
     public static native void framebufferTexture2D(
             int target, int attachment, int textureTarget, int texture, int level);
@@ -2555,6 +2764,10 @@ public final class BrowserOpenGL {
             gl.bindFramebuffer(gl.FRAMEBUFFER,framebuffer===0?null:state.framebuffers.get(framebuffer));
             gl.framebufferTexture2D(
               gl.FRAMEBUFFER,attachment,gl.TEXTURE_2D,texture===0?null:state.textures.get(texture),level);
+            if ((attachment|0)===gl.COLOR_ATTACHMENT0 && (framebuffer|0)!==0) {
+              if (texture) state.framebufferColorTextures.set(framebuffer|0,texture|0);
+              else state.framebufferColorTextures.delete(framebuffer|0);
+            }
             gl.bindFramebuffer(gl.READ_FRAMEBUFFER,previousRead===0?null:state.framebuffers.get(previousRead));
             gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER,previousDraw===0?null:state.framebuffers.get(previousDraw));
             """)
@@ -2576,6 +2789,7 @@ public final class BrowserOpenGL {
     @JSBody(params = {"framebuffer"}, script = """
             const state=window.__gaiusGL, object=state.framebuffers.get(framebuffer);
             if (object) window.__gaiusWebGL.deleteFramebuffer(object); state.framebuffers.delete(framebuffer);
+            state.framebufferColorTextures.delete(framebuffer|0);
             if (state.framebufferBindings.draw===framebuffer) state.framebufferBindings.draw=0;
             if (state.framebufferBindings.read===framebuffer) state.framebufferBindings.read=0;
             """)
@@ -2619,32 +2833,40 @@ public final class BrowserOpenGL {
 
     @JSBody(params = {"mode", "first", "count", "instances"}, script = """
             const gl=window.__gaiusWebGL;
-            window.__gaiusGL.withValidAttribs(function() {
-              gl.drawArraysInstanced(mode,first,count,instances);
+            window.__gaiusGL.withGuiItemOffscreenScissorRepair(function() {
+              window.__gaiusGL.withValidAttribs(function() {
+                gl.drawArraysInstanced(mode,first,count,instances);
+              });
             });
             """)
     public static native void drawArraysInstanced(int mode, int first, int count, int instances);
 
     @JSBody(params = {"mode", "count", "type", "offset", "instances"}, script = """
             const gl=window.__gaiusWebGL;
-            window.__gaiusGL.withValidAttribs(function() {
-              gl.drawElementsInstanced(mode,count,type,Number(offset),instances);
+            window.__gaiusGL.withGuiItemOffscreenScissorRepair(function() {
+              window.__gaiusGL.withValidAttribs(function() {
+                gl.drawElementsInstanced(mode,count,type,Number(offset),instances);
+              });
             });
             """)
     public static native void drawElementsInstanced(
             int mode, int count, int type, long offset, int instances);
 
     @JSBody(params = {"mode", "count", "type", "offset", "baseVertex"}, script = """
-            window.__gaiusGL.withValidAttribs(function() {
-              window.__gaiusGL.drawElementsWithBaseVertex(mode,count,type,offset,1,baseVertex);
+            window.__gaiusGL.withGuiItemOffscreenScissorRepair(function() {
+              window.__gaiusGL.withValidAttribs(function() {
+                window.__gaiusGL.drawElementsWithBaseVertex(mode,count,type,offset,1,baseVertex);
+              });
             });
             """)
     public static native void drawElementsBaseVertex(
             int mode, int count, int type, long offset, int baseVertex);
 
     @JSBody(params = {"mode", "count", "type", "offset", "instances", "baseVertex"}, script = """
-            window.__gaiusGL.withValidAttribs(function() {
-              window.__gaiusGL.drawElementsWithBaseVertex(mode,count,type,offset,instances,baseVertex);
+            window.__gaiusGL.withGuiItemOffscreenScissorRepair(function() {
+              window.__gaiusGL.withValidAttribs(function() {
+                window.__gaiusGL.drawElementsWithBaseVertex(mode,count,type,offset,instances,baseVertex);
+              });
             });
             """)
     public static native void drawElementsInstancedBaseVertex(
@@ -3242,6 +3464,12 @@ public final class BrowserOpenGL {
             };
             const state = window.__gaiusGL;
             if (state) {
+              if (state.guiCullFaceBatchActive && state.enabledCaps && state.enabledCaps.has(window.__gaiusWebGL.CULL_FACE)) {
+                window.__gaiusWebGL.enable(window.__gaiusWebGL.CULL_FACE);
+                state.guiCullFaceBatchActive = false;
+                var stats = window.__gaiusGLStats || (window.__gaiusGLStats = {});
+                stats.guiCullFaceBatchForcedRestores = (stats.guiCullFaceBatchForcedRestores || 0) + 1;
+              }
               let enabled = false;
               try {
                 const params = new URLSearchParams(window.location.search || '');
