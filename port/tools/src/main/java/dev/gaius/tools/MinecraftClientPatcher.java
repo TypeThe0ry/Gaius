@@ -41,6 +41,8 @@ public final class MinecraftClientPatcher {
         patchClassTreeIdRegistry(args[0], root.resolve("net/minecraft/util/ClassTreeIdRegistry.class"));
         patchSynchedEntityDataClassInitialization(
                 args[0], root.resolve("net/minecraft/network/syncher/SynchedEntityData.class"));
+        patchEntityBrowserUuidUsesGlobalRandom(args[0], root.resolve(
+                "net/minecraft/world/entity/Entity.class"));
         patchGlx(args[0], root.resolve("com/mojang/blaze3d/platform/GLX.class"));
         patchFramerateLimitTrackerBrowserNoThrottle(args[0], root.resolve(
                 "com/mojang/blaze3d/platform/FramerateLimitTracker.class"));
@@ -412,6 +414,45 @@ public final class MinecraftClientPatcher {
             throw new IllegalStateException("SynchedEntityData.defineId registry patch point was not found");
         }
         addInitializeSynchedDataSuperclassesHelper(node);
+        writeComputeFrames(node, output);
+    }
+
+    private static void patchEntityBrowserUuidUsesGlobalRandom(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/world/entity/Entity.class");
+        MethodNode constructor = find(node, "<init>",
+                "(Lnet/minecraft/world/entity/EntityType;Lnet/minecraft/world/level/Level;)V");
+        int replacements = 0;
+        for (var instruction = constructor.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKESTATIC
+                    || !call.owner.equals("net/minecraft/util/Mth")
+                    || !call.name.equals("createInsecureUUID")
+                    || !call.desc.equals("(Lnet/minecraft/util/RandomSource;)Ljava/util/UUID;")) {
+                continue;
+            }
+            AbstractInsnNode randomField = previousRealInstruction(call);
+            AbstractInsnNode randomOwner = previousRealInstruction(randomField);
+            if (!(randomField instanceof FieldInsnNode field)
+                    || field.getOpcode() != Opcodes.GETFIELD
+                    || !field.owner.equals("net/minecraft/world/entity/Entity")
+                    || !field.name.equals("random")
+                    || !field.desc.equals("Lnet/minecraft/util/RandomSource;")
+                    || !(randomOwner instanceof VarInsnNode ownerLoad)
+                    || ownerLoad.getOpcode() != Opcodes.ALOAD
+                    || ownerLoad.var != 0) {
+                throw new IllegalStateException("Entity UUID random source patch point changed");
+            }
+            constructor.instructions.remove(randomOwner);
+            constructor.instructions.remove(randomField);
+            call.desc = "()Ljava/util/UUID;";
+            replacements++;
+        }
+        if (replacements != 1) {
+            throw new IllegalStateException(
+                    "Expected one Entity constructor UUID random replacement, got " + replacements);
+        }
         writeComputeFrames(node, output);
     }
 

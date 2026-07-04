@@ -644,6 +644,15 @@ def check_source_patches() -> None:
             and "1.0E-4f" in client_patcher,
         ),
         (
+            "Minecraft patcher makes Entity constructor UUIDs use global browser random source",
+            "patchEntityBrowserUuidUsesGlobalRandom" in client_patcher
+            and "net/minecraft/world/entity/Entity.class" in client_patcher
+            and "createInsecureUUID" in client_patcher
+            and "(Lnet/minecraft/util/RandomSource;)Ljava/util/UUID;" in client_patcher
+            and "()Ljava/util/UUID;" in client_patcher
+            and "Entity UUID random source patch point changed" in client_patcher,
+        ),
+        (
             "Minecraft patcher routes GUI item state creation through browser safety hook",
             "patchGuiGraphicsBrowserItemCache" in client_patcher
             and "BrowserGuiItemCache" in client_patcher
@@ -985,6 +994,7 @@ def check_overlay_bytecode() -> None:
     compression_encoder = run_javap(client_cp, "net.minecraft.network.CompressionEncoder")
     class_tree_id_registry = run_javap(client_cp, "net.minecraft.util.ClassTreeIdRegistry")
     synched_entity_data = run_javap(client_cp, "net.minecraft.network.syncher.SynchedEntityData")
+    entity = run_javap(client_cp, "net.minecraft.world.entity.Entity")
     integrated_server = run_javap(client_cp, "net.minecraft.client.server.IntegratedServer")
     screen = run_javap(client_cp, "net.minecraft.client.gui.screens.Screen")
     title_screen = run_javap(client_cp, "net.minecraft.client.gui.screens.TitleScreen")
@@ -1051,6 +1061,10 @@ def check_overlay_bytecode() -> None:
     section_uploads = method_section(
         section_render_dispatcher,
         "public void uploadAllPendingUploads();",
+    )
+    entity_constructor = method_section(
+        entity,
+        "public net.minecraft.world.entity.Entity(net.minecraft.world.entity.EntityType<?>, net.minecraft.world.level.Level);",
     )
     minecraft_run_server = method_section(minecraft_server, "protected void runServer();")
     minecraft_initial_spawn = method_section(
@@ -1213,6 +1227,12 @@ def check_overlay_bytecode() -> None:
             "SynchedEntityData.defineId initializes superclass chain",
             "gaius$initializeSynchedDataSuperclasses" in synched_entity_data
             and "java/lang/Class.initialize" in synched_entity_data,
+        ),
+        (
+            "Entity constructor uses global browser UUID random source",
+            "public net.minecraft.world.entity.Entity(net.minecraft.world.entity.EntityType<?>, net.minecraft.world.level.Level);" in entity_constructor
+            and "net/minecraft/util/Mth.createInsecureUUID:()Ljava/util/UUID;" in entity_constructor
+            and "net/minecraft/util/Mth.createInsecureUUID:(Lnet/minecraft/util/RandomSource;)Ljava/util/UUID;" not in entity_constructor,
         ),
         (
             "GlConst RED8I internal format is WebGL-safe R8",
