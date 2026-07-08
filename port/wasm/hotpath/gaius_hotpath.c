@@ -18,7 +18,9 @@ enum {
     MAX_INDICES = 1024 * 1024,
     MAX_REPACK_SOURCE_BYTES = 16 * 1024 * 1024,
     MAX_REPACK_OUTPUT_BYTES = 16 * 1024 * 1024,
-    MAX_REPACK_LAYOUTS = 64
+    MAX_REPACK_LAYOUTS = 64,
+    MAX_BIT_STORAGE_VALUES = 1024 * 1024,
+    MAX_BIT_STORAGE_LONGS = MAX_BIT_STORAGE_VALUES / 2
 };
 
 typedef struct {
@@ -34,16 +36,19 @@ __attribute__((aligned(16))) static u32 index_scratch[MAX_INDICES];
 __attribute__((aligned(16))) static u8 repack_source[MAX_REPACK_SOURCE_BYTES];
 __attribute__((aligned(16))) static u8 repack_output[MAX_REPACK_OUTPUT_BYTES];
 __attribute__((aligned(16))) static RepackLayout repack_layouts[MAX_REPACK_LAYOUTS];
+__attribute__((aligned(16))) static u64 bit_storage_input[MAX_BIT_STORAGE_LONGS];
+__attribute__((aligned(16))) static i32 bit_storage_output[MAX_BIT_STORAGE_VALUES];
 
 static u32 last_output_type;
 static u32 last_output_bytes;
 static u32 last_min_index;
 static u32 last_max_index;
 static u32 last_repack_bytes;
+static u32 last_bit_storage_values;
 
 __attribute__((used, visibility("default")))
 u32 gaius_hotpath_version(void) {
-    return 2;
+    return 3;
 }
 
 __attribute__((used, visibility("default")))
@@ -92,6 +97,26 @@ u32 gaius_repack_layout_capacity(void) {
 }
 
 __attribute__((used, visibility("default")))
+u32 gaius_unpack_bit_storage_input_ptr(void) {
+    return (u32)(unsigned long)bit_storage_input;
+}
+
+__attribute__((used, visibility("default")))
+u32 gaius_unpack_bit_storage_output_ptr(void) {
+    return (u32)(unsigned long)bit_storage_output;
+}
+
+__attribute__((used, visibility("default")))
+u32 gaius_unpack_bit_storage_value_capacity(void) {
+    return MAX_BIT_STORAGE_VALUES;
+}
+
+__attribute__((used, visibility("default")))
+u32 gaius_unpack_bit_storage_long_capacity(void) {
+    return MAX_BIT_STORAGE_LONGS;
+}
+
+__attribute__((used, visibility("default")))
 u32 gaius_shift_indices_last_type(void) {
     return last_output_type;
 }
@@ -114,6 +139,11 @@ u32 gaius_shift_indices_last_max(void) {
 __attribute__((used, visibility("default")))
 u32 gaius_repack_last_bytes(void) {
     return last_repack_bytes;
+}
+
+__attribute__((used, visibility("default")))
+u32 gaius_unpack_bit_storage_last_values(void) {
+    return last_bit_storage_values;
 }
 
 static u32 read_index(u32 type, u32 index) {
@@ -262,5 +292,44 @@ i32 gaius_repack_interleaved(u32 source_bytes, u32 vertex_count, u32 layout_coun
     }
 
     last_repack_bytes = output_bytes;
+    return 1;
+}
+
+__attribute__((used, visibility("default")))
+i32 gaius_unpack_bit_storage(u32 size, u32 bits, u32 values_per_long) {
+    if (size == 0 || size > MAX_BIT_STORAGE_VALUES
+            || bits == 0 || bits > 32
+            || values_per_long == 0
+            || values_per_long != (64u / bits)) {
+        return 0;
+    }
+
+    u32 long_count = (size + values_per_long - 1u) / values_per_long;
+    if (long_count == 0 || long_count > MAX_BIT_STORAGE_LONGS) {
+        return 0;
+    }
+
+    u64 mask = (1ull << bits) - 1ull;
+    u32 out = 0;
+    u32 full_cells = size / values_per_long;
+    for (u32 cell = 0; cell < full_cells; cell++) {
+        u64 value = bit_storage_input[cell];
+        for (u32 i = 0; i < values_per_long; i++) {
+            bit_storage_output[out + i] = (i32)(value & mask);
+            value >>= bits;
+        }
+        out += values_per_long;
+    }
+
+    u32 remaining = size - out;
+    if (remaining > 0) {
+        u64 value = bit_storage_input[full_cells];
+        for (u32 i = 0; i < remaining; i++) {
+            bit_storage_output[out + i] = (i32)(value & mask);
+            value >>= bits;
+        }
+    }
+
+    last_bit_storage_values = size;
     return 1;
 }

@@ -12,7 +12,7 @@ resource_list_dir="$root/port/target/generated-resources/dev/gaius/browser"
 resource_list="$resource_list_dir/minecraft-resources.txt"
 mkdir -p "$resource_list_dir"
 jar tf "$root/port/work/overlays/client-named-$version-gaius.jar" |
-  awk '(index($0, "assets/") == 1 || index($0, "data/") == 1) && substr($0, length($0), 1) != "/" { print }' >"$resource_list"
+  awk '(index($0, "assets/") == 1 || index($0, "data/") == 1 || $0 == "pack.png") && substr($0, length($0), 1) != "/" { print }' >"$resource_list"
 jar tf "$root/port/work/overlays/libraries/com/ibm/icu/icu4j/77.1/icu4j-77.1.jar" |
   awk 'index($0, "com/ibm/icu/impl/data/icudata/") == 1 && substr($0, length($0), 1) != "/" { print }' >>"$resource_list"
 sort -u -o "$resource_list" "$resource_list"

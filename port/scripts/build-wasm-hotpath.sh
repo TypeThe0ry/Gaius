@@ -48,6 +48,10 @@ clang \
   -Wl,--export=gaius_repack_source_capacity \
   -Wl,--export=gaius_repack_output_capacity \
   -Wl,--export=gaius_repack_layout_capacity \
+  -Wl,--export=gaius_unpack_bit_storage_input_ptr \
+  -Wl,--export=gaius_unpack_bit_storage_output_ptr \
+  -Wl,--export=gaius_unpack_bit_storage_value_capacity \
+  -Wl,--export=gaius_unpack_bit_storage_long_capacity \
   -Wl,--export=gaius_shift_indices \
   -Wl,--export=gaius_shift_indices_last_type \
   -Wl,--export=gaius_shift_indices_last_bytes \
@@ -55,6 +59,8 @@ clang \
   -Wl,--export=gaius_shift_indices_last_max \
   -Wl,--export=gaius_repack_interleaved \
   -Wl,--export=gaius_repack_last_bytes \
+  -Wl,--export=gaius_unpack_bit_storage \
+  -Wl,--export=gaius_unpack_bit_storage_last_values \
   -Wl,--strip-all \
   "$source_file" \
   -o "$output"

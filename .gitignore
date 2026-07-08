@@ -6,6 +6,10 @@ libraries/
 versions/
 port/work/
 port/target/
+!port/overrides/libraries/
+port/overrides/libraries/*
+!port/overrides/libraries/lwjgl-openal/
+!port/overrides/libraries/lwjgl-openal/**
 
 # Local build and editor output.
 build/

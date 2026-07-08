@@ -6,6 +6,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -28,12 +29,14 @@ import net.minecraft.server.packs.resources.ResourceProvider;
  */
 public class VanillaPackResources implements PackResources {
     private static final String RESOURCE_LIST = "dev/gaius/browser/minecraft-resources.txt";
+    private static final String FALLBACK_PACK_ICON = "assets/minecraft/textures/misc/unknown_pack.png";
 
     private final PackLocationInfo location;
     private final BuiltInMetadata metadata;
     private final Set<String> namespaces;
     private final String[] resources;
     private final Set<String> resourceSet;
+    private final Map<String, ListedResource[]> listedResourceCache = new HashMap<>();
 
     VanillaPackResources(
             PackLocationInfo location,
@@ -64,8 +67,21 @@ public class VanillaPackResources implements PackResources {
     @Override
     public void listResources(
             PackType type, String namespace, String path, PackResources.ResourceOutput output) {
+        ListedResource[] listedResources = listedResources(type, namespace, path);
+        for (ListedResource resource : listedResources) {
+            output.accept(resource.id, openClasspathResource(resource.resource));
+        }
+    }
+
+    private ListedResource[] listedResources(PackType type, String namespace, String path) {
+        String key = type.getDirectory() + "\n" + namespace + "\n" + path;
+        ListedResource[] cached = listedResourceCache.get(key);
+        if (cached != null) {
+            return cached;
+        }
         String root = type.getDirectory() + "/" + namespace + "/";
         String prefix = root + (path.isEmpty() ? "" : path + "/");
+        List<ListedResource> listedResources = new ArrayList<>();
         for (String resource : resources) {
             if (!resource.startsWith(prefix)) {
                 continue;
@@ -73,9 +89,12 @@ public class VanillaPackResources implements PackResources {
             String relative = resource.substring(root.length());
             Identifier id = Identifier.tryBuild(namespace, relative);
             if (id != null) {
-                output.accept(id, openClasspathResource(resource));
+                listedResources.add(new ListedResource(id, resource));
             }
         }
+        cached = listedResources.toArray(ListedResource[]::new);
+        listedResourceCache.put(key, cached);
+        return cached;
     }
 
     @Override
@@ -117,6 +136,9 @@ public class VanillaPackResources implements PackResources {
 
     private IoSupplier<InputStream> rootSupplierIfPresent(String resource) {
         if (!exists(resource) && !existsOnClasspath(resource)) {
+            if ("pack.png".equals(resource)) {
+                return supplierIfPresent(FALLBACK_PACK_ICON);
+            }
             return null;
         }
         return openClasspathResource(resource);
@@ -171,6 +193,16 @@ public class VanillaPackResources implements PackResources {
             return resources.toArray(String[]::new);
         } catch (IOException e) {
             return new String[0];
+        }
+    }
+
+    private static final class ListedResource {
+        private final Identifier id;
+        private final String resource;
+
+        private ListedResource(Identifier id, String resource) {
+            this.id = id;
+            this.resource = resource;
         }
     }
 }

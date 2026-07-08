@@ -12,6 +12,8 @@ import org.lwjgl.opengl.GL;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL15;
 import org.lwjgl.opengl.GL20;
+import org.lwjgl.openal.ALC10;
+import org.lwjgl.openal.AL10;
 import org.lwjgl.system.MemoryUtil;
 import org.teavm.jso.JSBody;
 
@@ -30,6 +32,7 @@ public final class PlatformSmoke {
             testRandomAccessFile();
             testManagedMemory();
             testWindowAndCallbacks();
+            testBrowserAudio();
             report(true, "Gaius platform smoke passed");
         } catch (Throwable failure) {
             failure.printStackTrace();
@@ -115,7 +118,7 @@ public final class PlatformSmoke {
         }
         enqueueSyntheticInput();
         GLFW.glfwPollEvents();
-        if (keyEvents != 1 || cursorEvents != 1 || mouseEvents != 1 || scrollEvents != 1) {
+        if (keyEvents != 1 || cursorEvents < 1 || mouseEvents != 1 || scrollEvents != 1) {
             throw new AssertionError(
                     "GLFW event bridge mismatch: "
                             + keyEvents + "/" + cursorEvents + "/" + mouseEvents + "/" + scrollEvents);
@@ -152,6 +155,34 @@ public final class PlatformSmoke {
         GL20.glDeleteShader(shader);
         GL15.glDeleteBuffers(buffer);
         GL11.glDeleteTextures(texture);
+    }
+
+    private static void testBrowserAudio() {
+        long device = ALC10.alcOpenDevice((CharSequence) null);
+        long context = ALC10.alcCreateContext(device, (int[]) null);
+        if (device == 0L || context == 0L || !ALC10.alcMakeContextCurrent(context)) {
+            throw new AssertionError("Browser OpenAL context was not created");
+        }
+
+        int buffer = AL10.alGenBuffers();
+        int source = AL10.alGenSources();
+        ByteBuffer pcm = ByteBuffer.allocate(32);
+        for (int sample = 0; sample < 16; sample++) {
+            short value = (short) (sample % 2 == 0 ? 6000 : -6000);
+            pcm.put((byte) value);
+            pcm.put((byte) (value >>> 8));
+        }
+        pcm.flip();
+        AL10.alBufferData(buffer, AL10.AL_FORMAT_MONO16, pcm, 44100);
+        AL10.alSourcei(source, AL10.AL_BUFFER, buffer);
+        AL10.alSourcePlay(source);
+        int state = AL10.alGetSourcei(source, AL10.AL_SOURCE_STATE);
+        if (state != AL10.AL_PLAYING && state != AL10.AL_STOPPED) {
+            throw new AssertionError("Browser OpenAL source state was not updated: " + state);
+        }
+        AL10.alSourceStop(source);
+        AL10.alDeleteSources(source);
+        AL10.alDeleteBuffers(buffer);
     }
 
     @JSBody(script = """

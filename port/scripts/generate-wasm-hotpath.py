@@ -20,6 +20,8 @@ MAX_INDICES = 1024 * 1024
 MAX_REPACK_SOURCE_BYTES = 16 * 1024 * 1024
 MAX_REPACK_OUTPUT_BYTES = 16 * 1024 * 1024
 MAX_REPACK_LAYOUTS = 64
+MAX_BIT_STORAGE_VALUES = 1024 * 1024
+MAX_BIT_STORAGE_LONGS = MAX_BIT_STORAGE_VALUES // 2
 
 INPUT_PTR = 0
 OUTPUT_PTR = MAX_INDICES * 4
@@ -27,6 +29,8 @@ SCRATCH_PTR = OUTPUT_PTR + MAX_INDICES * 4
 REPACK_SOURCE_PTR = SCRATCH_PTR + MAX_INDICES * 4
 REPACK_OUTPUT_PTR = REPACK_SOURCE_PTR + MAX_REPACK_SOURCE_BYTES
 REPACK_LAYOUTS_PTR = REPACK_OUTPUT_PTR + MAX_REPACK_OUTPUT_BYTES
+BIT_STORAGE_INPUT_PTR = REPACK_LAYOUTS_PTR + MAX_REPACK_LAYOUTS * 16
+BIT_STORAGE_OUTPUT_PTR = BIT_STORAGE_INPUT_PTR + MAX_BIT_STORAGE_LONGS * 8
 MEMORY_PAGES = 1024
 
 I32 = 0x7F
@@ -85,6 +89,12 @@ def i32_const(value: int) -> bytes:
     if value > 0x7FFFFFFF:
         value -= 0x100000000
     return instr(0x41, sleb(value))
+
+
+def i64_const(value: int) -> bytes:
+    if value > 0x7FFFFFFFFFFFFFFF:
+        value -= 0x10000000000000000
+    return instr(0x42, sleb(value))
 
 
 def local_get(index: int) -> bytes:
@@ -356,6 +366,98 @@ def repack_body() -> bytes:
     return func_body([(11, I32), (2, I64)], bytes(b))
 
 
+def unpack_bit_storage_body() -> bytes:
+    # params: size=0,bits=1,valuesPerLong=2
+    # i32 locals: longCount=3,out=4,fullCells=5,cell=6,i=7,remaining=8
+    # i64 locals: value=9,mask=10
+    b = bytearray()
+    b += if_return_zero(local_get(0) + bytes([0x45]))
+    b += if_return_zero(local_get(0) + i32_const(MAX_BIT_STORAGE_VALUES) + bytes([0x4B]))
+    b += if_return_zero(local_get(1) + bytes([0x45]))
+    b += if_return_zero(local_get(1) + i32_const(32) + bytes([0x4B]))
+    b += if_return_zero(local_get(2) + bytes([0x45]))
+    b += if_return_zero(
+        local_get(2)
+        + i32_const(64)
+        + local_get(1)
+        + bytes([0x6E, 0x47])
+    )
+
+    b += (
+        local_get(0)
+        + local_get(2)
+        + bytes([0x6A])
+        + i32_const(1)
+        + bytes([0x6B])
+        + local_get(2)
+        + bytes([0x6E])
+        + local_set(3)
+    )
+    b += if_return_zero(local_get(3) + bytes([0x45]))
+    b += if_return_zero(local_get(3) + i32_const(MAX_BIT_STORAGE_LONGS) + bytes([0x4B]))
+
+    b += i64_const(1) + local_get(1) + bytes([0xAD, 0x86]) + i64_const(1) + bytes([0x7D]) + local_set(10)
+    b += i32_const(0) + local_set(4)
+    b += local_get(0) + local_get(2) + bytes([0x6E]) + local_set(5)
+
+    # Full cells.
+    b += i32_const(0) + local_set(6)
+    b += bytes([0x02, EMPTY, 0x03, EMPTY])
+    b += local_get(6) + local_get(5) + bytes([0x4F, 0x0D]) + uleb(1)
+    b += (
+        i32_const(BIT_STORAGE_INPUT_PTR)
+        + local_get(6) + i32_const(8) + bytes([0x6C, 0x6A])
+        + mem(0x29, 3, 0)
+        + local_set(9)
+    )
+    b += i32_const(0) + local_set(7)
+    b += bytes([0x02, EMPTY, 0x03, EMPTY])
+    b += local_get(7) + local_get(2) + bytes([0x4F, 0x0D]) + uleb(1)
+    b += (
+        i32_const(BIT_STORAGE_OUTPUT_PTR)
+        + local_get(4) + local_get(7) + bytes([0x6A])
+        + i32_const(4) + bytes([0x6C, 0x6A])
+        + local_get(9) + local_get(10) + bytes([0x83, 0xA7])
+        + mem(0x36, 2, 0)
+    )
+    b += local_get(9) + local_get(1) + bytes([0xAD, 0x88]) + local_set(9)
+    b += local_get(7) + i32_const(1) + bytes([0x6A]) + local_set(7)
+    b += bytes([0x0C]) + uleb(0)
+    b += bytes([0x0B, 0x0B])
+    b += local_get(4) + local_get(2) + bytes([0x6A]) + local_set(4)
+    b += local_get(6) + i32_const(1) + bytes([0x6A]) + local_set(6)
+    b += bytes([0x0C]) + uleb(0)
+    b += bytes([0x0B, 0x0B])
+
+    # Tail cell.
+    b += local_get(0) + local_get(4) + bytes([0x6B]) + local_set(8)
+    b += local_get(8) + bytes([0x04, EMPTY])
+    b += (
+        i32_const(BIT_STORAGE_INPUT_PTR)
+        + local_get(5) + i32_const(8) + bytes([0x6C, 0x6A])
+        + mem(0x29, 3, 0)
+        + local_set(9)
+    )
+    b += i32_const(0) + local_set(7)
+    b += bytes([0x02, EMPTY, 0x03, EMPTY])
+    b += local_get(7) + local_get(8) + bytes([0x4F, 0x0D]) + uleb(1)
+    b += (
+        i32_const(BIT_STORAGE_OUTPUT_PTR)
+        + local_get(4) + local_get(7) + bytes([0x6A])
+        + i32_const(4) + bytes([0x6C, 0x6A])
+        + local_get(9) + local_get(10) + bytes([0x83, 0xA7])
+        + mem(0x36, 2, 0)
+    )
+    b += local_get(9) + local_get(1) + bytes([0xAD, 0x88]) + local_set(9)
+    b += local_get(7) + i32_const(1) + bytes([0x6A]) + local_set(7)
+    b += bytes([0x0C]) + uleb(0)
+    b += bytes([0x0B, 0x0B, 0x0B])
+
+    b += local_get(0) + global_set(5)
+    b += ret_i32(1)
+    return func_body([(6, I32), (2, I64)], bytes(b))
+
+
 def make_module() -> bytes:
     module = bytearray(b"\x00asm\x01\x00\x00\x00")
 
@@ -366,14 +468,14 @@ def make_module() -> bytes:
     ]
     module += section(1, vec(type_entries))
 
-    function_types = [0] * 15 + [1] + [2]
+    function_types = [0] * 20 + [1] + [2] + [1]
     module += section(3, vec([uleb(t) for t in function_types]))
 
     # memory: min/max 1024 pages = 64 MiB.
     module += section(5, vec([b"\x01" + uleb(MEMORY_PAGES) + uleb(MEMORY_PAGES)]))
 
     global_entries = []
-    for _ in range(5):
+    for _ in range(6):
         global_entries.append(bytes([I32, 0x01]) + i32_const(0) + bytes([0x0B]))
     module += section(6, vec(global_entries))
 
@@ -389,20 +491,26 @@ def make_module() -> bytes:
         "gaius_repack_source_capacity",
         "gaius_repack_output_capacity",
         "gaius_repack_layout_capacity",
+        "gaius_unpack_bit_storage_input_ptr",
+        "gaius_unpack_bit_storage_output_ptr",
+        "gaius_unpack_bit_storage_value_capacity",
+        "gaius_unpack_bit_storage_long_capacity",
         "gaius_shift_indices_last_type",
         "gaius_shift_indices_last_bytes",
         "gaius_shift_indices_last_min",
         "gaius_shift_indices_last_max",
         "gaius_repack_last_bytes",
+        "gaius_unpack_bit_storage_last_values",
         "gaius_shift_indices",
         "gaius_repack_interleaved",
+        "gaius_unpack_bit_storage",
     ]
     for index, export_name in enumerate(export_names):
         exports.append(name(export_name) + b"\x00" + uleb(index))
     module += section(7, vec(exports))
 
     bodies = [
-        const_func(2),
+        const_func(3),
         const_func(MAX_INDICES),
         const_func(INPUT_PTR),
         const_func(OUTPUT_PTR),
@@ -412,13 +520,19 @@ def make_module() -> bytes:
         const_func(MAX_REPACK_SOURCE_BYTES),
         const_func(MAX_REPACK_OUTPUT_BYTES),
         const_func(MAX_REPACK_LAYOUTS),
+        const_func(BIT_STORAGE_INPUT_PTR),
+        const_func(BIT_STORAGE_OUTPUT_PTR),
+        const_func(MAX_BIT_STORAGE_VALUES),
+        const_func(MAX_BIT_STORAGE_LONGS),
         global_getter(0),
         global_getter(1),
         global_getter(2),
         global_getter(3),
         global_getter(4),
+        global_getter(5),
         shift_indices_body(),
         repack_body(),
+        unpack_bit_storage_body(),
     ]
     module += section(10, vec(bodies))
     return bytes(module)
