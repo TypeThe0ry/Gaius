@@ -10,6 +10,8 @@ port/target/
 port/overrides/libraries/*
 !port/overrides/libraries/lwjgl-openal/
 !port/overrides/libraries/lwjgl-openal/**
+!port/overrides/libraries/lwjgl-stb/
+!port/overrides/libraries/lwjgl-stb/**
 
 # Local build and editor output.
 build/

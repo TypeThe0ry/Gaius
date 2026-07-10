@@ -1979,6 +1979,8 @@ public final class MinecraftClientPatcher {
         LabelNode afterWorld = new LabelNode();
         method.instructions.insertBefore(profilerPop.getNext(), afterWorld);
 
+        method.instructions.insertBefore(renderLevelThis, closeLevelLoadingScreenBeforeWorldRender());
+
         InsnList throttle = new InsnList();
         throttle.add(new VarInsnNode(Opcodes.ALOAD, 0));
         throttle.add(new FieldInsnNode(
@@ -2008,6 +2010,65 @@ public final class MinecraftClientPatcher {
         throttle.add(new JumpInsnNode(Opcodes.GOTO, afterWorld));
         throttle.add(continueWorld);
         method.instructions.insertBefore(renderLevelThis, throttle);
+    }
+
+    private static InsnList closeLevelLoadingScreenBeforeWorldRender() {
+        InsnList code = new InsnList();
+        LabelNode done = new LabelNode();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/GameRenderer",
+                "minecraft",
+                "Lnet/minecraft/client/Minecraft;"));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/Minecraft",
+                "screen",
+                "Lnet/minecraft/client/gui/screens/Screen;"));
+        code.add(new TypeInsnNode(
+                Opcodes.INSTANCEOF,
+                "net/minecraft/client/gui/screens/LevelLoadingScreen"));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, done));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/GameRenderer",
+                "minecraft",
+                "Lnet/minecraft/client/Minecraft;"));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/Minecraft",
+                "level",
+                "Lnet/minecraft/client/multiplayer/ClientLevel;"));
+        code.add(new JumpInsnNode(Opcodes.IFNULL, done));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/GameRenderer",
+                "minecraft",
+                "Lnet/minecraft/client/Minecraft;"));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/Minecraft",
+                "player",
+                "Lnet/minecraft/client/player/LocalPlayer;"));
+        code.add(new JumpInsnNode(Opcodes.IFNULL, done));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/GameRenderer",
+                "minecraft",
+                "Lnet/minecraft/client/Minecraft;"));
+        code.add(new InsnNode(Opcodes.ACONST_NULL));
+        code.add(new FieldInsnNode(
+                Opcodes.PUTFIELD,
+                "net/minecraft/client/Minecraft",
+                "screen",
+                "Lnet/minecraft/client/gui/screens/Screen;"));
+        code.add(minecraftEvent("client.levelReady.closeLoadingScreenFromWorldRender"));
+        code.add(done);
+        return code;
     }
 
     private static void patchParticleGroupBrowserTickSafety(String jar, Path output)
@@ -2906,6 +2967,7 @@ public final class MinecraftClientPatcher {
         boolean found = false;
         boolean stateHooked = false;
         boolean throwableHooked = false;
+        boolean forcedPacketHooked = false;
         for (MethodNode method : node.methods) {
             if (method.name.equals("run") && method.desc.equals("()V")) {
                 throwableHooked = hookMinecraftRunCatchDiagnostics(method);
@@ -2917,71 +2979,17 @@ public final class MinecraftClientPatcher {
                 replace(method, code, 1, 0);
                 found = true;
             } else if (method.name.equals("runTick") && method.desc.equals("(Z)V")) {
-                InsnList code = new InsnList();
-                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-                code.add(new FieldInsnNode(
-                        Opcodes.GETFIELD,
-                        "net/minecraft/client/Minecraft",
-                        "screen",
-                        "Lnet/minecraft/client/gui/screens/Screen;"));
-                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-                code.add(new FieldInsnNode(
-                        Opcodes.GETFIELD,
-                        "net/minecraft/client/Minecraft",
-                        "overlay",
-                        "Lnet/minecraft/client/gui/screens/Overlay;"));
-                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-                code.add(new FieldInsnNode(
-                        Opcodes.GETFIELD,
-                        "net/minecraft/client/Minecraft",
-                        "level",
-                        "Lnet/minecraft/client/multiplayer/ClientLevel;"));
-                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-                code.add(new FieldInsnNode(
-                        Opcodes.GETFIELD,
-                        "net/minecraft/client/Minecraft",
-                        "player",
-                        "Lnet/minecraft/client/player/LocalPlayer;"));
-                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-                code.add(new FieldInsnNode(
-                        Opcodes.GETFIELD,
-                        "net/minecraft/client/Minecraft",
-                        "gameMode",
-                        "Lnet/minecraft/client/multiplayer/MultiPlayerGameMode;"));
-                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-                code.add(new FieldInsnNode(
-                        Opcodes.GETFIELD,
-                        "net/minecraft/client/Minecraft",
-                        "hitResult",
-                        "Lnet/minecraft/world/phys/HitResult;"));
-                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-                code.add(new FieldInsnNode(
-                        Opcodes.GETFIELD,
-                        "net/minecraft/client/Minecraft",
-                        "noRender",
-                        "Z"));
-                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-                code.add(new FieldInsnNode(
-                        Opcodes.GETFIELD,
-                        "net/minecraft/client/Minecraft",
-                        "running",
-                        "Z"));
-                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-                code.add(new FieldInsnNode(
-                        Opcodes.GETFIELD,
-                        "net/minecraft/client/Minecraft",
-                        "pause",
-                        "Z"));
-                code.add(new MethodInsnNode(
-                        Opcodes.INVOKESTATIC,
-                        "org/lwjgl/opengl/BrowserOpenGL",
-                        "reportMinecraftState",
-                        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;"
-                                + "Ljava/lang/Object;Ljava/lang/Object;ZZZ)V",
-                        false));
-                method.instructions.insert(code);
+                method.instructions.insert(processQueuedPacketsDuringForcedTick());
+                forcedPacketHooked = true;
+                for (var instruction = method.instructions.getFirst();
+                        instruction != null;
+                        instruction = instruction.getNext()) {
+                    if (instruction.getOpcode() == Opcodes.RETURN) {
+                        method.instructions.insertBefore(instruction, minecraftStateReport());
+                        stateHooked = true;
+                    }
+                }
                 method.maxStack = Math.max(method.maxStack, 9);
-                stateHooked = true;
             }
         }
         if (!found) {
@@ -2990,10 +2998,108 @@ public final class MinecraftClientPatcher {
         if (!stateHooked) {
             throw new IllegalStateException("Minecraft runTick hook point was not found");
         }
+        if (!forcedPacketHooked) {
+            throw new IllegalStateException("Minecraft forced tick packet queue hook point was not found");
+        }
         if (!throwableHooked) {
             throw new IllegalStateException("Minecraft run throwable diagnostic hook point was not found");
         }
         write(node, output);
+    }
+
+    private static InsnList processQueuedPacketsDuringForcedTick() {
+        InsnList code = new InsnList();
+        LabelNode done = new LabelNode();
+        code.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        code.add(new JumpInsnNode(Opcodes.IFNE, done));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/Minecraft",
+                "packetProcessor",
+                "Lnet/minecraft/network/PacketProcessor;"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/network/PacketProcessor",
+                "processQueuedPackets",
+                "()V",
+                false));
+        code.add(minecraftEvent("client.processQueuedPacketsForcedTick"));
+        code.add(done);
+        return code;
+    }
+
+    private static InsnList minecraftStateReport() {
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/Minecraft",
+                "screen",
+                "Lnet/minecraft/client/gui/screens/Screen;"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/Minecraft",
+                "overlay",
+                "Lnet/minecraft/client/gui/screens/Overlay;"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/Minecraft",
+                "level",
+                "Lnet/minecraft/client/multiplayer/ClientLevel;"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/opengl/BrowserOpenGL",
+                "fallbackClientLevel",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/Minecraft",
+                "player",
+                "Lnet/minecraft/client/player/LocalPlayer;"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/Minecraft",
+                "gameMode",
+                "Lnet/minecraft/client/multiplayer/MultiPlayerGameMode;"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/Minecraft",
+                "hitResult",
+                "Lnet/minecraft/world/phys/HitResult;"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/Minecraft",
+                "noRender",
+                "Z"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/Minecraft",
+                "running",
+                "Z"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/Minecraft",
+                "pause",
+                "Z"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/opengl/BrowserOpenGL",
+                "reportMinecraftState",
+                "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;"
+                        + "Ljava/lang/Object;Ljava/lang/Object;ZZZ)V",
+                false));
+        return code;
     }
 
     private static boolean hookMinecraftRunCatchDiagnostics(MethodNode method) {
@@ -3049,6 +3155,8 @@ public final class MinecraftClientPatcher {
         boolean tickClientLoadHooked = false;
         boolean loadingPacketsHooked = false;
         boolean notifyPlayerLoadedHooked = false;
+        boolean levelReadyFallbackHooked = false;
+        boolean closeLoadingScreenHooked = false;
 
         for (MethodNode method : node.methods) {
             if (method.name.equals("handleLogin")
@@ -3116,6 +3224,37 @@ public final class MinecraftClientPatcher {
                     tickClientLoadHooked = true;
                 } else if (instruction instanceof MethodInsnNode call
                         && call.owner.equals("net/minecraft/client/multiplayer/LevelLoadTracker")
+                        && call.name.equals("isLevelReady")
+                        && call.desc.equals("()Z")) {
+                    AbstractInsnNode next = nextOpcode(call);
+                    if (!(next instanceof JumpInsnNode jump) || jump.getOpcode() != Opcodes.IFEQ) {
+                        throw new IllegalStateException("ClientPacketListener level-ready branch shape changed");
+                    }
+                    LabelNode ready = new LabelNode();
+                    InsnList code = new InsnList();
+                    code.add(new JumpInsnNode(Opcodes.IFNE, ready));
+                    code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                    code.add(new FieldInsnNode(
+                            Opcodes.GETFIELD,
+                            "net/minecraft/client/multiplayer/ClientPacketListener",
+                            "level",
+                            "Lnet/minecraft/client/multiplayer/ClientLevel;"));
+                    code.add(new JumpInsnNode(Opcodes.IFNULL, jump.label));
+                    code.add(minecraftEvent("client.levelReady.playerPresentFallback"));
+                    code.add(ready);
+                    method.instructions.insert(call, code);
+                    method.instructions.remove(jump);
+                    method.maxStack = Math.max(method.maxStack, 2);
+                    levelReadyFallbackHooked = true;
+                } else if (instruction instanceof MethodInsnNode call
+                        && call.owner.equals("net/minecraft/client/multiplayer/ClientPacketListener")
+                        && call.name.equals("notifyPlayerLoaded")
+                        && call.desc.equals("()V")) {
+                    method.instructions.insert(call, closeLevelLoadingScreenIfPresent());
+                    method.maxStack = Math.max(method.maxStack, 2);
+                    closeLoadingScreenHooked = true;
+                } else if (instruction instanceof MethodInsnNode call
+                        && call.owner.equals("net/minecraft/client/multiplayer/LevelLoadTracker")
                         && call.name.equals("loadingPacketsReceived")
                         && call.desc.equals("()V")) {
                     method.instructions.insertBefore(call, minecraftEvent("client.loadingPacketsReceived"));
@@ -3134,7 +3273,9 @@ public final class MinecraftClientPatcher {
                 || !batchFinishedHooked
                 || !tickClientLoadHooked
                 || !loadingPacketsHooked
-                || !notifyPlayerLoadedHooked) {
+                || !notifyPlayerLoadedHooked
+                || !levelReadyFallbackHooked
+                || !closeLoadingScreenHooked) {
             throw new IllegalStateException("ClientPacketListener loading diagnostic patch points were not found");
         }
         write(node, output);
@@ -3162,6 +3303,89 @@ public final class MinecraftClientPatcher {
         if (!patchedClientWaitTimeout) {
             throw new IllegalStateException("LevelLoadTracker timeout patch point was not found");
         }
+        MethodNode isLevelReady = find(tracker, "isLevelReady", "()Z");
+        LabelNode notClientReady = new LabelNode();
+        LabelNode notPlayerChunk = new LabelNode();
+        LabelNode notServerWait = new LabelNode();
+        InsnList levelReadyCode = new InsnList();
+        levelReadyCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        levelReadyCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/multiplayer/LevelLoadTracker",
+                "clientState",
+                "Lnet/minecraft/client/multiplayer/LevelLoadTracker$ClientState;"));
+        levelReadyCode.add(new VarInsnNode(Opcodes.ASTORE, 1));
+        levelReadyCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        levelReadyCode.add(new TypeInsnNode(
+                Opcodes.INSTANCEOF,
+                "net/minecraft/client/multiplayer/LevelLoadTracker$ClientLevelReady"));
+        levelReadyCode.add(new JumpInsnNode(Opcodes.IFEQ, notClientReady));
+        levelReadyCode.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "net/minecraft/util/Util",
+                "getMillis",
+                "()J",
+                false));
+        levelReadyCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        levelReadyCode.add(new TypeInsnNode(
+                Opcodes.CHECKCAST,
+                "net/minecraft/client/multiplayer/LevelLoadTracker$ClientLevelReady"));
+        levelReadyCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/multiplayer/LevelLoadTracker$ClientLevelReady",
+                "readyAt",
+                "()J",
+                false));
+        levelReadyCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        levelReadyCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/multiplayer/LevelLoadTracker",
+                "closeDelayMs",
+                "J"));
+        levelReadyCode.add(new InsnNode(Opcodes.LADD));
+        levelReadyCode.add(new InsnNode(Opcodes.LCMP));
+        levelReadyCode.add(new JumpInsnNode(Opcodes.IFLT, notServerWait));
+        levelReadyCode.add(new InsnNode(Opcodes.ICONST_1));
+        levelReadyCode.add(new InsnNode(Opcodes.IRETURN));
+        levelReadyCode.add(notClientReady);
+        levelReadyCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        levelReadyCode.add(new TypeInsnNode(
+                Opcodes.INSTANCEOF,
+                "net/minecraft/client/multiplayer/LevelLoadTracker$WaitingForPlayerChunk"));
+        levelReadyCode.add(new JumpInsnNode(Opcodes.IFEQ, notPlayerChunk));
+        levelReadyCode.add(new InsnNode(Opcodes.ICONST_1));
+        levelReadyCode.add(new InsnNode(Opcodes.IRETURN));
+        levelReadyCode.add(notPlayerChunk);
+        levelReadyCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        levelReadyCode.add(new TypeInsnNode(
+                Opcodes.INSTANCEOF,
+                "net/minecraft/client/multiplayer/LevelLoadTracker$WaitingForServer"));
+        levelReadyCode.add(new JumpInsnNode(Opcodes.IFEQ, notServerWait));
+        levelReadyCode.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "net/minecraft/util/Util",
+                "getMillis",
+                "()J",
+                false));
+        levelReadyCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        levelReadyCode.add(new TypeInsnNode(
+                Opcodes.CHECKCAST,
+                "net/minecraft/client/multiplayer/LevelLoadTracker$WaitingForServer"));
+        levelReadyCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/multiplayer/LevelLoadTracker$WaitingForServer",
+                "timeoutAfter",
+                "()J",
+                false));
+        levelReadyCode.add(new InsnNode(Opcodes.LCMP));
+        levelReadyCode.add(new JumpInsnNode(Opcodes.IFLT, notServerWait));
+        levelReadyCode.add(minecraftEvent("client.levelReady.timeoutFallback"));
+        levelReadyCode.add(new InsnNode(Opcodes.ICONST_1));
+        levelReadyCode.add(new InsnNode(Opcodes.IRETURN));
+        levelReadyCode.add(notServerWait);
+        levelReadyCode.add(new InsnNode(Opcodes.ICONST_0));
+        levelReadyCode.add(new InsnNode(Opcodes.IRETURN));
+        replace(isLevelReady, levelReadyCode, 6, 2);
         write(tracker, root.resolve("net/minecraft/client/multiplayer/LevelLoadTracker.class"));
 
         ClassNode waiting = read(jar, "net/minecraft/client/multiplayer/LevelLoadTracker$WaitingForServer.class");
@@ -3268,7 +3492,7 @@ public final class MinecraftClientPatcher {
                     && store.getOpcode() == Opcodes.ISTORE) {
                 InsnList override = new InsnList();
                 override.add(new InsnNode(Opcodes.POP));
-                override.add(browserDistanceConstant(patchedStores == 0 ? 4 : 5));
+                override.add(browserDistanceConstant(2));
                 method.instructions.insertBefore(instruction, override);
                 patchedStores++;
                 if (patchedStores == 2) {
@@ -3285,10 +3509,10 @@ public final class MinecraftClientPatcher {
 
     private static void patchPlayerListBrowserDistances(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "net/minecraft/server/players/PlayerList.class");
-        patchPlayerListDistanceGetter(node, "getViewDistance", "viewDistance", 4);
-        patchPlayerListDistanceGetter(node, "getSimulationDistance", "simulationDistance", 5);
-        patchPlayerListDistanceSetter(node, "setViewDistance", 4);
-        patchPlayerListDistanceSetter(node, "setSimulationDistance", 5);
+        patchPlayerListDistanceGetter(node, "getViewDistance", "viewDistance", 2);
+        patchPlayerListDistanceGetter(node, "getSimulationDistance", "simulationDistance", 2);
+        patchPlayerListDistanceSetter(node, "setViewDistance", 2);
+        patchPlayerListDistanceSetter(node, "setSimulationDistance", 2);
         writeComputeFrames(node, output);
     }
 
@@ -3804,6 +4028,7 @@ public final class MinecraftClientPatcher {
 
     private static AbstractInsnNode browserDistanceConstant(int browserDistance) {
         return switch (browserDistance) {
+            case 2 -> new InsnNode(Opcodes.ICONST_2);
             case 4 -> new InsnNode(Opcodes.ICONST_4);
             case 5 -> new InsnNode(Opcodes.ICONST_5);
             default -> throw new IllegalArgumentException("Unsupported browser distance: " + browserDistance);
@@ -5110,6 +5335,41 @@ public final class MinecraftClientPatcher {
                 "loadingPacketsReceived",
                 "()V",
                 false));
+        code.add(done);
+        return code;
+    }
+
+    private static InsnList closeLevelLoadingScreenIfPresent() {
+        InsnList code = new InsnList();
+        LabelNode done = new LabelNode();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/multiplayer/ClientPacketListener",
+                "minecraft",
+                "Lnet/minecraft/client/Minecraft;"));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/Minecraft",
+                "screen",
+                "Lnet/minecraft/client/gui/screens/Screen;"));
+        code.add(new TypeInsnNode(
+                Opcodes.INSTANCEOF,
+                "net/minecraft/client/gui/screens/LevelLoadingScreen"));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, done));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/multiplayer/ClientPacketListener",
+                "minecraft",
+                "Lnet/minecraft/client/Minecraft;"));
+        code.add(new InsnNode(Opcodes.ACONST_NULL));
+        code.add(new FieldInsnNode(
+                Opcodes.PUTFIELD,
+                "net/minecraft/client/Minecraft",
+                "screen",
+                "Lnet/minecraft/client/gui/screens/Screen;"));
+        code.add(minecraftEvent("client.levelReady.closeLoadingScreen"));
         code.add(done);
         return code;
     }

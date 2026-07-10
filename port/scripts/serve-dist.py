@@ -15,6 +15,7 @@ import os
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 
 class PrecompressedHandler(SimpleHTTPRequestHandler):
@@ -59,10 +60,22 @@ class PrecompressedHandler(SimpleHTTPRequestHandler):
     def end_headers(self):  # noqa: N802 - inherited API name
         self.send_header("Cross-Origin-Opener-Policy", "same-origin")
         self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
-        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-        self.send_header("Pragma", "no-cache")
-        self.send_header("Expires", "0")
+        cache_control = self.cache_control()
+        self.send_header("Cache-Control", cache_control)
+        if "no-store" in cache_control:
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
         super().end_headers()
+
+    def cache_control(self) -> str:
+        parsed = urlsplit(self.path)
+        name = os.path.basename(parsed.path)
+        query = parse_qs(parsed.query)
+        if name == "classes.js" and query.get("v"):
+            return "public, max-age=31536000, immutable"
+        if name == "classes.js":
+            return "public, max-age=0, must-revalidate"
+        return "no-store, no-cache, must-revalidate, max-age=0"
 
 
 def main() -> None:

@@ -28,6 +28,7 @@ OPENGL_BRIDGE = PORT / "overrides" / "libraries" / "lwjgl-opengl" / "src" / "mai
 OPENGL_PATCHER = PORT / "tools" / "src" / "main" / "java" / "dev" / "gaius" / "tools" / "LwjglOpenGLBrowserPatcher.java"
 OPENAL_BRIDGE = PORT / "overrides" / "libraries" / "lwjgl-openal" / "src" / "main" / "java" / "org" / "lwjgl" / "openal" / "BrowserOpenAL.java"
 OPENAL_PATCHER = PORT / "tools" / "src" / "main" / "java" / "dev" / "gaius" / "tools" / "LwjglOpenALBrowserPatcher.java"
+STB_IMAGE = PORT / "overrides" / "libraries" / "lwjgl-stb" / "src" / "main" / "java" / "org" / "lwjgl" / "stb" / "STBImage.java"
 LWJGL_BROWSER_MEMORY = PORT / "overrides" / "libraries" / "lwjgl" / "src" / "main" / "java" / "org" / "lwjgl" / "system" / "BrowserMemory.java"
 GLFW_BRIDGE = PORT / "overrides" / "libraries" / "lwjgl-glfw" / "src" / "main" / "java" / "org" / "lwjgl" / "glfw" / "BrowserGlfw.java"
 GLFW_PATCHER = PORT / "tools" / "src" / "main" / "java" / "dev" / "gaius" / "tools" / "LwjglGlfwBrowserPatcher.java"
@@ -48,7 +49,9 @@ SERVE_DIST = PORT / "scripts" / "serve-dist.py"
 INDEX_HTML = PORT / "web" / "dist" / "index.html"
 HOTPATH_WASM = PORT / "web" / "dist" / "gaius-hotpath.wasm"
 GENERATED_RESOURCE_LIST = TARGET / "generated-resources" / "dev" / "gaius" / "browser" / "minecraft-resources.txt"
+GENERATED_SOUNDS_JSON = TARGET / "generated-resources" / "assets" / "minecraft" / "sounds.json"
 POSTPROCESS_TEAVM_JS = PORT / "scripts" / "postprocess-teavm-js.py"
+POSTPROCESS_INDEX_HTML = PORT / "scripts" / "postprocess-index-html.py"
 FAILURES: list[str] = []
 
 
@@ -289,6 +292,7 @@ def check_source_patches() -> None:
     patcher = OPENGL_PATCHER.read_text(errors="replace") if OPENGL_PATCHER.exists() else ""
     openal_bridge = OPENAL_BRIDGE.read_text(errors="replace") if OPENAL_BRIDGE.exists() else ""
     openal_patcher = OPENAL_PATCHER.read_text(errors="replace") if OPENAL_PATCHER.exists() else ""
+    stb_image = STB_IMAGE.read_text(errors="replace") if STB_IMAGE.exists() else ""
     browser_memory = LWJGL_BROWSER_MEMORY.read_text(errors="replace") if LWJGL_BROWSER_MEMORY.exists() else ""
     glfw_text = GLFW_BRIDGE.read_text(errors="replace") if GLFW_BRIDGE.exists() else ""
     glfw_patcher = GLFW_PATCHER.read_text(errors="replace") if GLFW_PATCHER.exists() else ""
@@ -308,7 +312,9 @@ def check_source_patches() -> None:
     serve_dist = SERVE_DIST.read_text(errors="replace") if SERVE_DIST.exists() else ""
     index_html = INDEX_HTML.read_text(errors="replace") if INDEX_HTML.exists() else ""
     generated_resource_list = GENERATED_RESOURCE_LIST.read_text(errors="replace") if GENERATED_RESOURCE_LIST.exists() else ""
+    generated_sounds = load_json(GENERATED_SOUNDS_JSON) if GENERATED_SOUNDS_JSON.exists() else {}
     postprocess_teavm_js = POSTPROCESS_TEAVM_JS.read_text(errors="replace") if POSTPROCESS_TEAVM_JS.exists() else ""
+    postprocess_index_html = POSTPROCESS_INDEX_HTML.read_text(errors="replace") if POSTPROCESS_INDEX_HTML.exists() else ""
     tex_sub_start = text.find("public static void texSubImage2D(")
     tex_sub_end = text.find("@JSBody(script = \"\"\"", tex_sub_start)
     tex_sub_section = text[tex_sub_start:tex_sub_end] if tex_sub_start >= 0 and tex_sub_end > tex_sub_start else text
@@ -325,6 +331,20 @@ def check_source_patches() -> None:
         client_patcher[server_catchup_start:server_catchup_end]
         if server_catchup_start >= 0 and server_catchup_end > server_catchup_start
         else client_patcher
+    )
+    run_tick_state_start = client_patcher.find('} else if (method.name.equals("runTick") && method.desc.equals("(Z)V")) {')
+    run_tick_state_end = client_patcher.find("        }\n        if (!found)", run_tick_state_start)
+    run_tick_state_section = (
+        client_patcher[run_tick_state_start:run_tick_state_end]
+        if run_tick_state_start >= 0 and run_tick_state_end > run_tick_state_start
+        else ""
+    )
+    palette_decode_start = stb_image.find("case 3 -> {")
+    palette_decode_end = stb_image.find("case 4 -> {", palette_decode_start)
+    palette_decode_section = (
+        stb_image[palette_decode_start:palette_decode_end]
+        if palette_decode_start >= 0 and palette_decode_end > palette_decode_start
+        else ""
     )
     checks = [
         (
@@ -353,6 +373,12 @@ def check_source_patches() -> None:
             "gl.pixelStorei(gl.UNPACK_ROW_LENGTH,0)" not in tex_sub_section
             and "gl.pixelStorei(gl.UNPACK_SKIP_ROWS,0)" not in tex_sub_section
             and "gl.pixelStorei(gl.UNPACK_SKIP_PIXELS,0)" not in tex_sub_section,
+        ),
+        (
+            "STBImage advances 8-bit palette PNG indices for block/item textures",
+            "int index = readSample(data, bits, bitDepth, source);" in palette_decode_section
+            and "if (bitDepth >= 8)" in palette_decode_section
+            and "source += bitDepth / 8;" in palette_decode_section,
         ),
         (
             "LWJGL patcher delegates ARB vertex-attrib-binding instead of no-oping GUI layout calls",
@@ -582,6 +608,21 @@ def check_source_patches() -> None:
             and "widget.getMessage()" in text
             and "widget.getX()" in text
             and "widget.getY()" in text,
+        ),
+        (
+            "BrowserOpenGL falls back to ClientPacketListener level for state telemetry",
+            "fallbackClientLevel" in text
+            and "typedMinecraft.getConnection()" in text
+            and "connection.getLevel()" in text
+            and "ClientPacketListener" in text,
+        ),
+        (
+            "BrowserOpenGL reports Minecraft state with safe browser class names",
+            '"net.minecraft.client.multiplayer.ClientLevel"' in text
+            and '"net.minecraft.client.player.LocalPlayer"' in text
+            and '"<class-name-unavailable>"' in text
+            and "value.getClass().getName()" in text
+            and "catch (Throwable ignored)" in text,
         ),
         (
             "BrowserOpenGL throttles inventory-screen world background rendering",
@@ -893,6 +934,15 @@ def check_source_patches() -> None:
             and "GameRenderer world profiler pop was not found" in client_patcher,
         ),
         (
+            "Minecraft patcher closes stale loading screen once world render is active",
+            "closeLevelLoadingScreenBeforeWorldRender" in client_patcher
+            and "client.levelReady.closeLoadingScreenFromWorldRender" in client_patcher
+            and "net/minecraft/client/gui/screens/LevelLoadingScreen" in client_patcher
+            and "net/minecraft/client/Minecraft" in client_patcher
+            and '"player"' in client_patcher
+            and '"level"' in client_patcher,
+        ),
+        (
             "Minecraft patcher throttles browser section compile/upload work per frame",
             "patchLevelRendererBrowserSectionCompileThrottle" in client_patcher
             and "LevelRenderer browser section compile throttle patch points" in client_patcher
@@ -924,16 +974,30 @@ def check_source_patches() -> None:
             and "PanoramaRenderer.render" not in client_patcher[client_patcher.find("patchScreenBrowserFastMenus"):client_patcher.find("patchTitleScreenBrowserFastMenus")],
         ),
         (
-            "Minecraft patcher forces browser singleplayer distances to 4/5",
+            "Minecraft patcher reports browser state after runTick mutations",
+            "private static InsnList minecraftStateReport()" in client_patcher
+            and "method.instructions.insertBefore(instruction, minecraftStateReport())" in run_tick_state_section
+            and "instruction.getOpcode() == Opcodes.RETURN" in run_tick_state_section
+            and "method.instructions.insert(code)" not in run_tick_state_section,
+        ),
+        (
+            "Minecraft patcher processes queued packets during browser forced ticks",
+            "private static InsnList processQueuedPacketsDuringForcedTick()" in client_patcher
+            and "client.processQueuedPacketsForcedTick" in client_patcher
+            and "net/minecraft/network/PacketProcessor" in client_patcher
+            and "processQueuedPackets" in client_patcher
+            and "Minecraft forced tick packet queue hook point was not found" in client_patcher,
+        ),
+        (
+            "Minecraft patcher forces browser singleplayer distances to 2/2",
             "patchIntegratedServerBrowserDistances" in distance_section
             and "private static InsnList fixedBrowserDistance(int browserDistance)" in distance_section
-            and "browserDistanceConstant(patchedStores == 0 ? 4 : 5)" in distance_section
-            and "patchPlayerListDistanceGetter(node, \"getViewDistance\", \"viewDistance\", 4)" in distance_section
-            and "patchPlayerListDistanceGetter(node, \"getSimulationDistance\", \"simulationDistance\", 5)" in distance_section
+            and "browserDistanceConstant(2)" in distance_section
+            and "patchPlayerListDistanceGetter(node, \"getViewDistance\", \"viewDistance\", 2)" in distance_section
+            and "patchPlayerListDistanceGetter(node, \"getSimulationDistance\", \"simulationDistance\", 2)" in distance_section
             and "IntegratedServer distance override patch points" in distance_section
             and "Opcodes.POP" in distance_section
-            and "Opcodes.ICONST_4" in distance_section
-            and "Opcodes.ICONST_5" in distance_section,
+            and "Opcodes.ICONST_2" in distance_section,
         ),
         (
             "Minecraft patcher writes browser region files without deflate compression",
@@ -1001,6 +1065,13 @@ def check_source_patches() -> None:
             and "Timed out while waiting for initial level loading packets in the browser" in client_patcher
             and "LevelLoadTracker$WaitingForServer" in client_patcher
             and "LevelLoadTracker$WaitingForPlayerChunk" in client_patcher
+            and 'find(tracker, "isLevelReady", "()Z")' in client_patcher
+            and "client.levelReady.timeoutFallback" in client_patcher
+            and "client.levelReady.playerPresentFallback" in client_patcher
+            and "client.levelReady.closeLoadingScreen" in client_patcher
+            and "closeLevelLoadingScreenIfPresent" in client_patcher
+            and "ClientPacketListener level-ready branch shape changed" in client_patcher
+            and '"timeoutAfter"' in client_patcher
             and 'find(waitingForPlayerChunk, "isReady", "()Z")' in client_patcher
             and "constant.cst = 5L" in client_patcher,
         ),
@@ -1050,9 +1121,44 @@ def check_source_patches() -> None:
             and "data/minecraft/datapacks/minecart_improvements/pack.mcmeta" in generated_resource_list,
         ),
         (
+            "Generated browser resource list contains filtered sound metadata and playable UI/grass sounds",
+            "assets/minecraft/sounds.json" in generated_resource_list
+            and "assets/minecraft/sounds/random/click.ogg" in generated_resource_list
+            and "assets/minecraft/sounds/random/click_stereo.ogg" in generated_resource_list
+            and "assets/minecraft/sounds/random/wood_click.ogg" in generated_resource_list
+            and "assets/minecraft/sounds/random/levelup.ogg" in generated_resource_list
+            and "assets/minecraft/sounds/random/orb.ogg" in generated_resource_list
+            and "assets/minecraft/sounds/ui/toast/in.ogg" in generated_resource_list
+            and "assets/minecraft/sounds/ui/toast/out.ogg" in generated_resource_list
+            and "assets/minecraft/sounds/ui/toast/challenge_complete.ogg" in generated_resource_list
+            and "assets/minecraft/sounds/dig/grass1.ogg" in generated_resource_list
+            and "assets/minecraft/sounds/step/grass1.ogg" in generated_resource_list,
+        ),
+        (
+            "Generated browser sounds.json only advertises copied browser sounds",
+            isinstance(generated_sounds, dict)
+            and bool(generated_sounds)
+            and "ui.button.click" in generated_sounds
+            and "ui.toast.in" in generated_sounds
+            and "block.grass.step" in generated_sounds
+            and "music.overworld.forest" not in generated_sounds
+            and "ambient.basalt_deltas.additions" not in generated_sounds,
+        ),
+        (
             "TeaVM resource list includes vanilla root pack icon",
             '$0 == "pack.png"' in build_teavm
             and "minecraft-resources.txt" in build_teavm,
+        ),
+        (
+            "TeaVM build maps and filters selected asset-index sounds into browser resources",
+            "browser_sound_assets" in build_teavm
+            and "assetIndex.id" in build_teavm
+            and "assets/%s" in build_teavm
+            and "minecraft/sounds/random/click_stereo.ogg" in build_teavm
+            and "minecraft/sounds/ui/toast/in.ogg" in build_teavm
+            and "minecraft/sounds/step/grass1.ogg" in build_teavm
+            and "Filtered browser sounds.json" in build_teavm
+            and "Mapped browser sound assets" in build_teavm,
         ),
         (
             "Browser storage seeds/enforces browser performance client options",
@@ -1060,7 +1166,7 @@ def check_source_patches() -> None:
             and "BROWSER_PERFORMANCE_OPTIONS" in browser_file_persistence
             and "seedDefaultOptions" in browser_file_persistence
             and "enforcePerformanceOptions" in browser_file_persistence
-            and "renderDistance:4" in browser_file_persistence
+            and "renderDistance:2" in browser_file_persistence
             and "simulationDistance:5" in browser_file_persistence
             and "entityDistanceScaling:0.5" in browser_file_persistence
             and "maxFps:120" in browser_file_persistence
@@ -1127,6 +1233,15 @@ def check_source_patches() -> None:
             and "9223372036854775807" in postprocess_teavm_js,
         ),
         (
+            "TeaVM build postprocesses ignored launcher HTML for Chrome startup",
+            "postprocess-index-html.py" in build_teavm
+            and "fallbackBuildToken" in postprocess_index_html
+            and "fresh" in postprocess_index_html
+            and "__gaiusBootTimings" in postprocess_index_html
+            and "waitForPaint" in postprocess_index_html
+            and 'rel="icon"' in postprocess_index_html,
+        ),
+        (
             "Wasm hot-path build emits dist wasm without requiring TeaVM",
             "--target=wasm32" in build_wasm_hotpath
             and "-Wl,--no-entry" in build_wasm_hotpath
@@ -1170,7 +1285,20 @@ def check_source_patches() -> None:
             and '("br", ".br")' in serve_dist
             and '("gzip", ".gz")' in serve_dist
             and "Cross-Origin-Embedder-Policy" in serve_dist
-            and "no-store, no-cache, must-revalidate" in serve_dist,
+            and "max-age=31536000, immutable" in serve_dist
+            and "parse_qs" in serve_dist,
+        ),
+        (
+            "Browser boot keeps classes.js cache stable unless fresh=1 is requested",
+            'const fallbackBuildToken = "' in index_html
+            and 'urlParams.get("fresh") === "1"' in index_html
+            and 'urlParams.get("cache") === "0"' in index_html
+            and 'buildToken += "-fresh-" + Date.now()' in index_html
+            and "__gaiusBootTimings" in index_html
+            and "bootTimings.classesLoaded" in index_html
+            and "function waitForPaint()" in index_html
+            and "bootTimings.beforeClassesPaint" in index_html
+            and 'requestedBuildToken + "-fresh-" + Date.now()' not in index_html,
         ),
         (
             "Browser boot UI has progress and does not disable chat/commands",
@@ -1193,7 +1321,6 @@ def check_source_patches() -> None:
             and 'Number(urlParams.get("menuMinDpr"))' in index_html
             and 'Number(urlParams.get("worldMinDpr"))' in index_html
             and 'Number(urlParams.get("maxDpr"))' in index_html
-            and 'requestedBuildToken + "-fresh-" + Date.now()' in index_html
             and "Number.isFinite(fps.gameFps) && fps.gameFps > 0 ? fps.gameFps : fps.rafFps" in index_html
             and "LevelLoadingScreen" in index_html
             and "ProgressScreen" in index_html
@@ -1296,6 +1423,7 @@ def check_overlay_bytecode() -> None:
     vanilla_pack_resources = run_javap(client_cp, "net.minecraft.server.packs.VanillaPackResources")
     region_file_version = run_javap(client_cp, "net.minecraft.world.level.chunk.storage.RegionFileVersion")
     local_time = run_javap(client_cp, "net.minecraft.client.renderer.item.properties.select.LocalTime")
+    minecraft = run_javap(client_cp, "net.minecraft.client.Minecraft")
     create_world_screen = run_javap(client_cp, "net.minecraft.client.gui.screens.worldselection.CreateWorldScreen")
     dynamic_uniforms = run_javap(client_cp, "net.minecraft.client.renderer.DynamicUniforms")
     level_load_tracker = run_javap(client_cp, "net.minecraft.client.multiplayer.LevelLoadTracker")
@@ -1307,6 +1435,8 @@ def check_overlay_bytecode() -> None:
         client_cp,
         "net.minecraft.client.multiplayer.LevelLoadTracker$WaitingForPlayerChunk",
     )
+    client_packet_listener = run_javap(client_cp, "net.minecraft.client.multiplayer.ClientPacketListener")
+    minecraft_run_tick = method_section(minecraft, "private void runTick(boolean);")
     framerate_tracker = run_javap(client_cp, "com.mojang.blaze3d.platform.FramerateLimitTracker")
     player_list = run_javap(client_cp, "net.minecraft.server.players.PlayerList")
     simple_bit_storage = run_javap(client_cp, "net.minecraft.util.SimpleBitStorage")
@@ -1436,10 +1566,15 @@ def check_overlay_bytecode() -> None:
         "private net.minecraft.world.level.LevelSettings createLevelSettings(boolean);",
     )
     level_load_tracker_clinit = method_section(level_load_tracker, "static {};")
+    level_load_tracker_is_ready = method_section(
+        level_load_tracker,
+        "public boolean isLevelReady();",
+    )
     waiting_for_server_tick = method_section(
         waiting_for_server,
         "public net.minecraft.client.multiplayer.LevelLoadTracker$ClientState tick();",
     )
+    client_packet_tick = method_section(client_packet_listener, "public void tick();")
     framerate_reason = method_section(
         framerate_tracker,
         "public com.mojang.blaze3d.platform.FramerateLimitTracker$FramerateThrottleReason getThrottleReason();",
@@ -1795,6 +1930,19 @@ def check_overlay_bytecode() -> None:
             and "getMessage" in browser_opengl,
         ),
         (
+            "BrowserOpenGL compiled overlay falls back to connection level for state telemetry",
+            "fallbackClientLevel" in browser_opengl
+            and "Minecraft.getConnection" in browser_opengl
+            and "ClientPacketListener.getLevel" in browser_opengl,
+        ),
+        (
+            "BrowserOpenGL compiled overlay reports Minecraft state with safe class names",
+            "net.minecraft.client.multiplayer.ClientLevel" in browser_opengl_constants
+            and "net.minecraft.client.player.LocalPlayer" in browser_opengl_constants
+            and "<class-name-unavailable>" in browser_opengl_constants
+            and "java/lang/Object.getClass" in browser_opengl,
+        ),
+        (
             "BrowserOpenGL compiled overlay throttles inventory-screen world background rendering",
             "shouldSkipWorldRenderForScreen" in browser_opengl
             and "inventoryWorldRenderFrame" in browser_opengl
@@ -2018,6 +2166,13 @@ def check_overlay_bytecode() -> None:
             and "iconst_2" not in dynamic_uniforms_constructor,
         ),
         (
+            "Minecraft compiled overlay processes queued packets during forced ticks",
+            "PacketProcessor.processQueuedPackets" in minecraft_run_tick
+            and "client.processQueuedPacketsForcedTick" in minecraft_run_tick
+            and minecraft_run_tick.find("ifne")
+                < minecraft_run_tick.find("PacketProcessor.processQueuedPackets"),
+        ),
+        (
             "Screen browser menus use static fill instead of dynamic panorama textures",
             "net/minecraft/client/gui/GuiGraphics.fill:(IIIII)V" in screen_render_panorama
             and "PanoramaRenderer.render" not in screen_render_panorama
@@ -2037,6 +2192,14 @@ def check_overlay_bytecode() -> None:
             "BrowserOpenGL.shouldSkipWorldRenderForScreen" in game_renderer
             and "InterfaceMethod net/minecraft/util/profiling/ProfilerFiller.pop:()V" in game_renderer
             and "Method renderLevel:(Lnet/minecraft/client/DeltaTracker;)V" in game_renderer
+            and "Field net/minecraft/client/Minecraft.screen:Lnet/minecraft/client/gui/screens/Screen;" in game_renderer,
+        ),
+        (
+            "GameRenderer closes stale loading screen before active world render",
+            "client.levelReady.closeLoadingScreenFromWorldRender" in game_renderer
+            and "LevelLoadingScreen" in game_renderer
+            and "Field net/minecraft/client/Minecraft.level:Lnet/minecraft/client/multiplayer/ClientLevel;" in game_renderer
+            and "Field net/minecraft/client/Minecraft.player:Lnet/minecraft/client/player/LocalPlayer;" in game_renderer
             and "Field net/minecraft/client/Minecraft.screen:Lnet/minecraft/client/gui/screens/Screen;" in game_renderer,
         ),
         (
@@ -2067,19 +2230,18 @@ def check_overlay_bytecode() -> None:
             and "goto" in section_uploads,
         ),
         (
-            "IntegratedServer forces browser distances to 4/5",
+            "IntegratedServer forces browser distances to 2/2",
             "public void tickServer(java.util.function.BooleanSupplier);" in integrated_tick
-            and "iconst_4" in integrated_tick
-            and "iconst_5" in integrated_tick
+            and "iconst_2" in integrated_tick
             and "pop" in integrated_tick,
         ),
         (
-            "PlayerList distance getters force browser distances to 4/5",
+            "PlayerList distance getters force browser distances to 2/2",
             "public int getViewDistance();" in player_view_distance
             and "public int getSimulationDistance();" in player_sim_distance
-            and "iconst_4" in player_view_distance
+            and "iconst_2" in player_view_distance
             and "pop" in player_view_distance
-            and "iconst_5" in player_sim_distance
+            and "iconst_2" in player_sim_distance
             and "pop" in player_sim_distance,
         ),
         (
@@ -2157,7 +2319,7 @@ def check_overlay_bytecode() -> None:
             "seedDefaultOptions" in browser_file_persistence_class
             and "enforcePerformanceOptions" in browser_file_persistence_class
             and "storage-default-options" in browser_file_persistence_constants
-            and "renderDistance:4" in browser_file_persistence_constants
+            and "renderDistance:2" in browser_file_persistence_constants
             and "simulationDistance:5" in browser_file_persistence_constants
             and "entityDistanceScaling:0.5" in browser_file_persistence_constants
             and "maxFps:120" in browser_file_persistence_constants
@@ -2194,6 +2356,21 @@ def check_overlay_bytecode() -> None:
             "ldc2_w        #156                // long 5l" in level_load_tracker_clinit
             and "Timed out while waiting for initial level loading packets in the browser" in waiting_for_server_tick
             and "loadingPacketsReceived" in waiting_for_server_tick,
+        ),
+        (
+            "LevelLoadTracker compiled overlay lets loading screen close on browser timeout",
+            "LevelLoadTracker$WaitingForServer" in level_load_tracker_is_ready
+            and "LevelLoadTracker$WaitingForPlayerChunk" in level_load_tracker_is_ready
+            and "timeoutAfter" in level_load_tracker_is_ready
+            and "client.levelReady.timeoutFallback" in level_load_tracker_is_ready,
+        ),
+        (
+            "ClientPacketListener compiled overlay exits loading when level exists",
+            "client.levelReady.playerPresentFallback" in client_packet_tick
+            and "client.levelReady.closeLoadingScreen" in client_packet_tick
+            and "Minecraft.screen" in client_packet_tick
+            and "LevelLoadingScreen" in client_packet_tick
+            and "notifyPlayerLoaded" in client_packet_tick,
         ),
         (
             "LevelLoadTracker compiled overlay does not wait for hidden-screen section compilation",

@@ -7,6 +7,7 @@ version="$(jq -er '.minecraftVersion' "$config")"
 work="$root/port/work/$version"
 metadata="$work/version.json"
 libraries="$work/libraries"
+assets="$work/assets"
 
 mkdir -p "$work" "$libraries"
 
@@ -70,9 +71,52 @@ find "$libraries" -type f -name '*.jar' -print | sort |
 
 unzip -p "$work/client-obfuscated.jar" version.json >"$work/client-version.json"
 
+asset_index_id="$(jq -er '.assetIndex.id // .assets' "$metadata")"
+asset_index_url="$(jq -er '.assetIndex.url' "$metadata")"
+asset_index_sha1="$(jq -er '.assetIndex.sha1' "$metadata")"
+asset_index="$assets/indexes/$asset_index_id.json"
+
+echo "Fetching browser sound asset index $asset_index_id"
+download_verified "$asset_index_url" "$asset_index_sha1" "$asset_index"
+
+echo "Fetching browser smoke/UI sound assets"
+browser_sound_metadata_assets=(
+  "minecraft/sounds.json"
+)
+browser_sound_assets=(
+  "minecraft/sounds/random/click.ogg"
+  "minecraft/sounds/random/click_stereo.ogg"
+  "minecraft/sounds/random/wood_click.ogg"
+  "minecraft/sounds/random/levelup.ogg"
+  "minecraft/sounds/random/orb.ogg"
+  "minecraft/sounds/ui/toast/in.ogg"
+  "minecraft/sounds/ui/toast/out.ogg"
+  "minecraft/sounds/ui/toast/challenge_complete.ogg"
+  "minecraft/sounds/ui/stonecutter/cut1.ogg"
+  "minecraft/sounds/ui/stonecutter/cut2.ogg"
+  "minecraft/sounds/dig/grass1.ogg"
+  "minecraft/sounds/dig/grass2.ogg"
+  "minecraft/sounds/dig/grass3.ogg"
+  "minecraft/sounds/dig/grass4.ogg"
+  "minecraft/sounds/step/grass1.ogg"
+  "minecraft/sounds/step/grass2.ogg"
+  "minecraft/sounds/step/grass3.ogg"
+  "minecraft/sounds/step/grass4.ogg"
+  "minecraft/sounds/step/grass5.ogg"
+  "minecraft/sounds/step/grass6.ogg"
+)
+for logical_path in "${browser_sound_metadata_assets[@]}" "${browser_sound_assets[@]}"; do
+  hash="$(jq -er --arg path "$logical_path" '.objects[$path].hash' "$asset_index")"
+  download_verified \
+    "https://resources.download.minecraft.net/${hash:0:2}/$hash" \
+    "$hash" \
+    "$assets/objects/${hash:0:2}/$hash"
+done
+
 echo "Fetched and verified:"
 echo "  client:   $work/client-obfuscated.jar"
 echo "  mappings: $work/client-mappings.txt"
 echo "  libraries: $(find "$libraries" -type f -name '*.jar' | wc -l | tr -d ' ')"
+echo "  browser sound assets: ${#browser_sound_assets[@]} playable, ${#browser_sound_metadata_assets[@]} metadata"
 jq '{id, protocol_version, world_version, java_version, pack_version}' \
   "$work/client-version.json"

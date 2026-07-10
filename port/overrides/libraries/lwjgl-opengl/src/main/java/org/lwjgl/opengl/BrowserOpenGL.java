@@ -8,13 +8,16 @@ import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.components.AbstractWidget;
 import net.minecraft.client.gui.components.events.GuiEventListener;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.screens.worldselection.WorldSelectionList;
 import net.minecraft.client.gui.screens.worldselection.WorldSelectionList.WorldListEntry;
+import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.multiplayer.MultiPlayerGameMode;
+import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.player.Inventory;
@@ -3564,6 +3567,25 @@ public final class BrowserOpenGL {
                 noRender, running, pause);
     }
 
+    public static Object fallbackClientLevel(Object minecraft, Object level) {
+        if (level != null) {
+            return level;
+        }
+        if (!(minecraft instanceof Minecraft typedMinecraft)) {
+            return null;
+        }
+        try {
+            ClientPacketListener connection = typedMinecraft.getConnection();
+            if (connection == null) {
+                return null;
+            }
+            ClientLevel connectionLevel = connection.getLevel();
+            return connectionLevel == null ? null : connectionLevel;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
     private static String describeScreenWidgets(Screen screen) {
         StringBuilder builder = new StringBuilder(2048);
         builder.append('[');
@@ -4052,7 +4074,27 @@ public final class BrowserOpenGL {
     private static native void reportMinecraftEventJs(String event, String detail);
 
     private static String className(Object value) {
-        return value == null ? null : value.getClass().getName();
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof ClientLevel) {
+            return "net.minecraft.client.multiplayer.ClientLevel";
+        }
+        if (value instanceof LocalPlayer) {
+            return "net.minecraft.client.player.LocalPlayer";
+        }
+        if (value instanceof MultiPlayerGameMode) {
+            return "net.minecraft.client.multiplayer.MultiPlayerGameMode";
+        }
+        try {
+            return value.getClass().getName();
+        } catch (Throwable ignored) {
+            try {
+                return String.valueOf(value);
+            } catch (Throwable ignoredAgain) {
+                return "<class-name-unavailable>";
+            }
+        }
     }
 
     private static Int8Array bytes(ByteBuffer buffer) {

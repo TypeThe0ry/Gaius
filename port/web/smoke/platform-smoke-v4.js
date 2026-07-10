@@ -23199,20 +23199,20 @@ dgb_BrowserFilePersistence__clinit_ = () => {
     var$4[17] = ju_Map_entry($rt_s(497), $rt_s(498));
     var$4[18] = ju_Map_entry($rt_s(499), $rt_s(225));
     var$4[19] = ju_Map_entry($rt_s(500), $rt_s(225));
-    var$4[20] = ju_Map_entry($rt_s(501), $rt_s(502));
-    var$4[21] = ju_Map_entry($rt_s(503), $rt_s(235));
-    var$4[22] = ju_Map_entry($rt_s(504), $rt_s(235));
-    var$4[23] = ju_Map_entry($rt_s(505), $rt_s(235));
-    var$4[24] = ju_Map_entry($rt_s(506), $rt_s(225));
-    var$4[25] = ju_Map_entry($rt_s(507), $rt_s(494));
-    var$4[26] = ju_Map_entry($rt_s(508), $rt_s(494));
-    var$4[27] = ju_Map_entry($rt_s(509), $rt_s(494));
-    var$4[28] = ju_Map_entry($rt_s(510), $rt_s(494));
-    var$4[29] = ju_Map_entry($rt_s(511), $rt_s(235));
-    var$4[30] = ju_Map_entry($rt_s(512), $rt_s(235));
-    var$4[31] = ju_Map_entry($rt_s(513), $rt_s(234));
-    var$4[32] = ju_Map_entry($rt_s(514), $rt_s(235));
-    var$4[33] = ju_Map_entry($rt_s(515), $rt_s(234));
+    var$4[20] = ju_Map_entry($rt_s(501), $rt_s(476));
+    var$4[21] = ju_Map_entry($rt_s(502), $rt_s(235));
+    var$4[22] = ju_Map_entry($rt_s(503), $rt_s(235));
+    var$4[23] = ju_Map_entry($rt_s(504), $rt_s(235));
+    var$4[24] = ju_Map_entry($rt_s(505), $rt_s(225));
+    var$4[25] = ju_Map_entry($rt_s(506), $rt_s(494));
+    var$4[26] = ju_Map_entry($rt_s(507), $rt_s(494));
+    var$4[27] = ju_Map_entry($rt_s(508), $rt_s(494));
+    var$4[28] = ju_Map_entry($rt_s(509), $rt_s(494));
+    var$4[29] = ju_Map_entry($rt_s(510), $rt_s(235));
+    var$4[30] = ju_Map_entry($rt_s(511), $rt_s(235));
+    var$4[31] = ju_Map_entry($rt_s(512), $rt_s(234));
+    var$4[32] = ju_Map_entry($rt_s(513), $rt_s(235));
+    var$4[33] = ju_Map_entry($rt_s(514), $rt_s(234));
     dgb_BrowserFilePersistence_BROWSER_PERFORMANCE_OPTIONS = ju_Map_ofEntries(var$3);
 },
 dgb_BrowserFilePersistence_storedPaths$js_body$_19 = var$1 => {
@@ -23299,7 +23299,7 @@ function ju_DuplicateFormatFlagsException() {
 let ju_DuplicateFormatFlagsException__init_ = ($this, $flags) => {
     let var$2;
     var$2 = jl_StringBuilder__init_();
-    jl_StringBuilder_append(jl_StringBuilder_append(var$2, $rt_s(516)), $flags);
+    jl_StringBuilder_append(jl_StringBuilder_append(var$2, $rt_s(515)), $flags);
     ju_IllegalFormatException__init_($this, jl_StringBuilder_toString(var$2));
     $this.$flags3 = $flags;
 },
@@ -23422,7 +23422,7 @@ function ju_MissingFormatWidthException() {
 let ju_MissingFormatWidthException__init_0 = ($this, $formatSpecifier) => {
     let var$2;
     var$2 = jl_StringBuilder__init_();
-    jl_StringBuilder_append(jl_StringBuilder_append(var$2, $rt_s(517)), $formatSpecifier);
+    jl_StringBuilder_append(jl_StringBuilder_append(var$2, $rt_s(516)), $formatSpecifier);
     ju_IllegalFormatException__init_($this, jl_StringBuilder_toString(var$2));
     $this.$formatSpecifier = $formatSpecifier;
 },
@@ -23515,9 +23515,9 @@ ol_Version$BuildType__init_ = (var_0, var_1, var_2) => {
 },
 ol_Version$BuildType__clinit_ = () => {
     let var$1, var$2;
-    ol_Version$BuildType_ALPHA = ol_Version$BuildType__init_($rt_s(518), 0, $rt_s(519));
-    ol_Version$BuildType_BETA = ol_Version$BuildType__init_($rt_s(520), 1, $rt_s(521));
-    ol_Version$BuildType_STABLE = ol_Version$BuildType__init_($rt_s(522), 2, $rt_s(19));
+    ol_Version$BuildType_ALPHA = ol_Version$BuildType__init_($rt_s(517), 0, $rt_s(518));
+    ol_Version$BuildType_BETA = ol_Version$BuildType__init_($rt_s(519), 1, $rt_s(520));
+    ol_Version$BuildType_STABLE = ol_Version$BuildType__init_($rt_s(521), 2, $rt_s(19));
     var$1 = $rt_createArray(ol_Version$BuildType, 3);
     var$2 = var$1.data;
     var$2[0] = ol_Version$BuildType_ALPHA;
@@ -23805,7 +23805,7 @@ jm_Multiplication_powerOf10 = $exp => {
         return (jm_Multiplication_bigFivePows.data[1].$pow0($intExp)).$shiftLeft1($intExp);
     $byteArraySize = Long_add(Long_fromInt(1), Long_fromNumber(Long_toNumber($exp) / 2.4082399653118496));
     if (Long_gt($byteArraySize, Long_fromInt(1000000)))
-        $rt_throw(jl_ArithmeticException__init_($rt_s(523)));
+        $rt_throw(jl_ArithmeticException__init_($rt_s(522)));
     if (Long_le($exp, Long_fromInt(2147483647)))
         return (jm_Multiplication_bigFivePows.data[1].$pow0($intExp)).$shiftLeft1($intExp);
     $powerOfFive = jm_Multiplication_bigFivePows.data[1].$pow0(2147483647);
@@ -23944,7 +23944,7 @@ otrfm_VirtualFileImpl_createFile = ($this, $fileName) => {
     let $inMemory;
     $inMemory = $this.$findInMemory();
     if ($inMemory === null)
-        $rt_throw(ji_IOException__init_1($rt_s(524)));
+        $rt_throw(ji_IOException__init_1($rt_s(523)));
     return $inMemory.$createFile0($fileName) === null ? 0 : 1;
 },
 otrfm_VirtualFileImpl_createDirectory = ($this, $fileName) => {
@@ -24443,7 +24443,7 @@ ji_File_createNewFile = $this => {
     var$2 = new ji_IOException;
     var$3 = $this.$getPath1();
     var$4 = jl_StringBuilder__init_();
-    jl_StringBuilder_append(jl_StringBuilder_append(jl_StringBuilder_append(var$4, $rt_s(369)), var$3), $rt_s(525));
+    jl_StringBuilder_append(jl_StringBuilder_append(jl_StringBuilder_append(var$4, $rt_s(369)), var$3), $rt_s(524));
     ji_IOException__init_(var$2, jl_StringBuilder_toString(var$4));
     $rt_throw(var$2);
 },
@@ -24643,7 +24643,7 @@ ju_Formatter$FormatWriter_formatValue = ($this, $specifier) => {
     a: {
         switch ($specifier) {
             case 37:
-                $this.$out.$append24($rt_s(526));
+                $this.$out.$append24($rt_s(525));
                 break a;
             case 66:
                 break;
@@ -24723,8 +24723,8 @@ ju_Formatter$FormatWriter_formatFloat = ($this, $specifier, $upperCase) => {
     $format.$setMinimumFractionDigits($this.$precision0);
     $format.$setGroupingUsed(!($this.$flags & 64) ? 0 : 1);
     if ($this.$flags & 128) {
-        $format.$setNegativePrefix($rt_s(527));
-        $format.$setNegativeSuffix($rt_s(528));
+        $format.$setNegativePrefix($rt_s(526));
+        $format.$setNegativeSuffix($rt_s(527));
     }
     if ($this.$flags & 8)
         $format.$setPositivePrefix($rt_s(271));
@@ -24750,9 +24750,9 @@ ju_Formatter$FormatWriter_predictDecimalSize = ($this, $negative, $format) => {
 },
 ju_Formatter$FormatWriter_verifyFloatFlags = $this => {
     if ($this.$flags & 8 && $this.$flags & 16)
-        $rt_throw(ju_IllegalFormatFlagsException__init_($rt_s(529)));
+        $rt_throw(ju_IllegalFormatFlagsException__init_($rt_s(528)));
     if ($this.$flags & 32 && $this.$flags & 1)
-        $rt_throw(ju_IllegalFormatFlagsException__init_($rt_s(530)));
+        $rt_throw(ju_IllegalFormatFlagsException__init_($rt_s(529)));
     if ($this.$flags & 1 && $this.$width0 < 0)
         $rt_throw(ju_MissingFormatWidthException__init_(jl_String_substring($this.$format8, $this.$formatSpecifierStart, $this.$index1)));
 },
@@ -24895,7 +24895,7 @@ ju_Formatter$FormatWriter_formatRadixInt = ($this, $specifier, $radixLog2, $uppe
     }
     $sb = jl_StringBuilder__init_();
     if ($this.$flags & 4) {
-        $prefix = $radixLog2 != 4 ? $rt_s(225) : $rt_s(531);
+        $prefix = $radixLog2 != 4 ? $rt_s(225) : $rt_s(530);
         var$8 = jl_StringBuilder__init_();
         jl_StringBuilder_append(jl_StringBuilder_append(var$8, $prefix), $str);
         $str = jl_StringBuilder_toString(var$8);
@@ -24916,9 +24916,9 @@ ju_Formatter$FormatWriter_formatRadixInt = ($this, $specifier, $radixLog2, $uppe
 },
 ju_Formatter$FormatWriter_verifyIntFlags = $this => {
     if ($this.$flags & 8 && $this.$flags & 16)
-        $rt_throw(ju_IllegalFormatFlagsException__init_($rt_s(529)));
+        $rt_throw(ju_IllegalFormatFlagsException__init_($rt_s(528)));
     if ($this.$flags & 32 && $this.$flags & 1)
-        $rt_throw(ju_IllegalFormatFlagsException__init_($rt_s(530)));
+        $rt_throw(ju_IllegalFormatFlagsException__init_($rt_s(529)));
     if ($this.$precision0 >= 0)
         $rt_throw(ju_IllegalFormatPrecisionException__init_0($this.$precision0));
     if ($this.$flags & 1 && $this.$width0 < 0)
@@ -24948,7 +24948,7 @@ ju_Formatter$FormatWriter_verifyFlags = ($this, $conversion, $mask) => {
 ju_Formatter$FormatWriter_flagsToString = ($this, $flags) => {
     let $flagIndex;
     $flagIndex = jl_Integer_numberOfTrailingZeros($flags);
-    return jl_String_valueOf(jl_String_charAt($rt_s(532), $flagIndex));
+    return jl_String_valueOf(jl_String_charAt($rt_s(531), $flagIndex));
 },
 ju_Formatter$FormatWriter_mayBeAppendSpaces = ($this, $str) => {
     let $diff, $sb, $i;
@@ -25232,9 +25232,9 @@ dgb_PlatformSmoke_main = $args => {
 dgb_PlatformSmoke_testRandomAccessFile = () => {
     let $path, $expected, var$3, var$4, $channel, var$6, var$7, var$8, var$9, $read, $index, $$je;
     dgb_PlatformSmoke_$callClinit();
-    $path = jnf_Path_of($rt_s(533), $rt_createArray(jl_String, 0));
+    $path = jnf_Path_of($rt_s(532), $rt_createArray(jl_String, 0));
     jnc_StandardCharsets_$callClinit();
-    $expected = jl_String_getBytes($rt_s(534), jnc_StandardCharsets_UTF_8);
+    $expected = jl_String_getBytes($rt_s(533), jnc_StandardCharsets_UTF_8);
     var$3 = $rt_createArray(jnf_OpenOption, 4);
     var$4 = var$3.data;
     jnf_StandardOpenOption_$callClinit();
@@ -25255,7 +25255,7 @@ dgb_PlatformSmoke_testRandomAccessFile = () => {
                 var$8 = new jl_AssertionError;
                 var$6 = $channel.$size0();
                 var$9 = jl_StringBuilder__init_();
-                jl_StringBuilder_append2(jl_StringBuilder_append(var$9, $rt_s(535)), var$6);
+                jl_StringBuilder_append2(jl_StringBuilder_append(var$9, $rt_s(534)), var$6);
                 jl_AssertionError__init_(var$8, jl_StringBuilder_toString(var$9));
                 $rt_throw(var$8);
             }
@@ -25309,7 +25309,7 @@ dgb_PlatformSmoke_testRandomAccessFile = () => {
         try {
             var$8 = new jl_AssertionError;
             var$9 = jl_StringBuilder__init_();
-            jl_StringBuilder_append0(jl_StringBuilder_append(var$9, $rt_s(536)), $index);
+            jl_StringBuilder_append0(jl_StringBuilder_append(var$9, $rt_s(535)), $index);
             jl_AssertionError__init_(var$8, jl_StringBuilder_toString(var$9));
             $rt_throw(var$8);
         } catch ($$e) {
@@ -25361,7 +25361,7 @@ dgb_PlatformSmoke_testManagedMemory = () => {
             return;
         }
         try {
-            $rt_throw(jl_AssertionError__init_0($rt_s(537)));
+            $rt_throw(jl_AssertionError__init_0($rt_s(536)));
         } catch ($$e) {
             $$je = $rt_wrapException($$e);
             var$3 = $$je;
@@ -25378,10 +25378,10 @@ dgb_PlatformSmoke_testWindowAndCallbacks = () => {
     $callback = olg_GLFWErrorCallback_create(dgb_PlatformSmoke$testWindowAndCallbacks$lambda$_4_0__init_0());
     olg_GLFW_glfwSetErrorCallback($callback);
     if (!olg_GLFW_glfwInit())
-        $rt_throw(jl_AssertionError__init_0($rt_s(538)));
-    $window = olg_GLFW_glfwCreateWindow(960, 540, $rt_s(539), Long_ZERO, Long_ZERO);
+        $rt_throw(jl_AssertionError__init_0($rt_s(537)));
+    $window = olg_GLFW_glfwCreateWindow(960, 540, $rt_s(538), Long_ZERO, Long_ZERO);
     if (Long_eq($window, Long_ZERO))
-        $rt_throw(jl_AssertionError__init_0($rt_s(540)));
+        $rt_throw(jl_AssertionError__init_0($rt_s(539)));
     olg_GLFW_glfwSetKeyCallback($window, dgb_PlatformSmoke$testWindowAndCallbacks$lambda$_4_1__init_0());
     olg_GLFW_glfwSetCursorPosCallback($window, dgb_PlatformSmoke$testWindowAndCallbacks$lambda$_4_2__init_0());
     olg_GLFW_glfwSetMouseButtonCallback($window, dgb_PlatformSmoke$testWindowAndCallbacks$lambda$_4_3__init_0());
@@ -25406,13 +25406,13 @@ dgb_PlatformSmoke_testWindowAndCallbacks = () => {
             var$10 = dgb_PlatformSmoke_mouseEvents;
             var$11 = dgb_PlatformSmoke_scrollEvents;
             var$12 = jl_StringBuilder__init_();
-            jl_StringBuilder_append0(jl_StringBuilder_append1(jl_StringBuilder_append0(jl_StringBuilder_append1(jl_StringBuilder_append0(jl_StringBuilder_append1(jl_StringBuilder_append0(jl_StringBuilder_append(var$12, $rt_s(541)), var$8), 47), var$9), 47), var$10), 47), var$11);
+            jl_StringBuilder_append0(jl_StringBuilder_append1(jl_StringBuilder_append0(jl_StringBuilder_append1(jl_StringBuilder_append0(jl_StringBuilder_append1(jl_StringBuilder_append0(jl_StringBuilder_append(var$12, $rt_s(540)), var$8), 47), var$9), 47), var$10), 47), var$11);
             jl_AssertionError__init_(var$7, jl_StringBuilder_toString(var$12));
             $rt_throw(var$7);
         }
-        $rt_throw(jl_AssertionError__init_0($rt_s(542)));
+        $rt_throw(jl_AssertionError__init_0($rt_s(541)));
     }
-    $rt_throw(jl_AssertionError__init_0($rt_s(543)));
+    $rt_throw(jl_AssertionError__init_0($rt_s(542)));
 },
 dgb_PlatformSmoke_testWebGlRenderingSurface = () => {
     let $texture, $buffer, var$3, var$4, $shader, var$6, var$7;
@@ -25429,7 +25429,7 @@ dgb_PlatformSmoke_testWebGlRenderingSurface = () => {
     var$4 = jn_ByteBuffer_wrap(var$3);
     olo_GL15_glBufferData(34962, var$4, 35044);
     $shader = olo_GL20_glCreateShader(35633);
-    olo_GL20_glShaderSource($shader, $rt_s(544));
+    olo_GL20_glShaderSource($shader, $rt_s(543));
     olo_GL20_glCompileShader($shader);
     if (olo_GL20_glGetShaderi($shader, 35713)) {
         olo_GL20_glDeleteShader($shader);
@@ -25440,7 +25440,7 @@ dgb_PlatformSmoke_testWebGlRenderingSurface = () => {
     var$4 = new jl_AssertionError;
     var$6 = olo_GL20_glGetShaderInfoLog0($shader);
     var$7 = jl_StringBuilder__init_();
-    jl_StringBuilder_append(jl_StringBuilder_append(var$7, $rt_s(545)), var$6);
+    jl_StringBuilder_append(jl_StringBuilder_append(var$7, $rt_s(544)), var$6);
     jl_AssertionError__init_(var$4, jl_StringBuilder_toString(var$7));
     $rt_throw(var$4);
 },
@@ -25468,7 +25468,7 @@ dgb_PlatformSmoke_testBrowserAudio = () => {
         if ($state != 4114 && $state != 4116) {
             var$9 = new jl_AssertionError;
             var$10 = jl_StringBuilder__init_();
-            jl_StringBuilder_append0(jl_StringBuilder_append(var$10, $rt_s(546)), $state);
+            jl_StringBuilder_append0(jl_StringBuilder_append(var$10, $rt_s(545)), $state);
             jl_AssertionError__init_(var$9, jl_StringBuilder_toString(var$10));
             $rt_throw(var$9);
         }
@@ -25477,7 +25477,7 @@ dgb_PlatformSmoke_testBrowserAudio = () => {
         olo_AL10_alDeleteBuffers($buffer);
         return;
     }
-    $rt_throw(jl_AssertionError__init_0($rt_s(547)));
+    $rt_throw(jl_AssertionError__init_0($rt_s(546)));
 },
 dgb_PlatformSmoke_lambda$testWindowAndCallbacks$4 = ($handle, $x, $y) => {
     dgb_PlatformSmoke_$callClinit();
@@ -25845,14 +25845,14 @@ jm_RoundingMode_$values = () => {
     return var$1;
 },
 jm_RoundingMode__clinit_ = () => {
-    jm_RoundingMode_UP = jm_RoundingMode__init_($rt_s(548), 0, 0);
-    jm_RoundingMode_DOWN = jm_RoundingMode__init_($rt_s(549), 1, 1);
-    jm_RoundingMode_CEILING = jm_RoundingMode__init_($rt_s(550), 2, 2);
-    jm_RoundingMode_FLOOR = jm_RoundingMode__init_($rt_s(551), 3, 3);
-    jm_RoundingMode_HALF_UP = jm_RoundingMode__init_($rt_s(552), 4, 4);
-    jm_RoundingMode_HALF_DOWN = jm_RoundingMode__init_($rt_s(553), 5, 5);
-    jm_RoundingMode_HALF_EVEN = jm_RoundingMode__init_($rt_s(554), 6, 6);
-    jm_RoundingMode_UNNECESSARY = jm_RoundingMode__init_($rt_s(555), 7, 7);
+    jm_RoundingMode_UP = jm_RoundingMode__init_($rt_s(547), 0, 0);
+    jm_RoundingMode_DOWN = jm_RoundingMode__init_($rt_s(548), 1, 1);
+    jm_RoundingMode_CEILING = jm_RoundingMode__init_($rt_s(549), 2, 2);
+    jm_RoundingMode_FLOOR = jm_RoundingMode__init_($rt_s(550), 3, 3);
+    jm_RoundingMode_HALF_UP = jm_RoundingMode__init_($rt_s(551), 4, 4);
+    jm_RoundingMode_HALF_DOWN = jm_RoundingMode__init_($rt_s(552), 5, 5);
+    jm_RoundingMode_HALF_EVEN = jm_RoundingMode__init_($rt_s(553), 6, 6);
+    jm_RoundingMode_UNNECESSARY = jm_RoundingMode__init_($rt_s(554), 7, 7);
     jm_RoundingMode_$VALUES = jm_RoundingMode_$values();
 };
 function ju_IdentityHashMap() {
@@ -26113,16 +26113,16 @@ jnf_StandardOpenOption_$values = () => {
     return var$1;
 },
 jnf_StandardOpenOption__clinit_ = () => {
-    jnf_StandardOpenOption_READ = jnf_StandardOpenOption__init_($rt_s(556), 0);
-    jnf_StandardOpenOption_WRITE = jnf_StandardOpenOption__init_($rt_s(557), 1);
-    jnf_StandardOpenOption_APPEND = jnf_StandardOpenOption__init_($rt_s(558), 2);
-    jnf_StandardOpenOption_TRUNCATE_EXISTING = jnf_StandardOpenOption__init_($rt_s(559), 3);
-    jnf_StandardOpenOption_CREATE = jnf_StandardOpenOption__init_($rt_s(560), 4);
-    jnf_StandardOpenOption_CREATE_NEW = jnf_StandardOpenOption__init_($rt_s(561), 5);
-    jnf_StandardOpenOption_DELETE_ON_CLOSE = jnf_StandardOpenOption__init_($rt_s(562), 6);
-    jnf_StandardOpenOption_SPARSE = jnf_StandardOpenOption__init_($rt_s(563), 7);
-    jnf_StandardOpenOption_SYNC = jnf_StandardOpenOption__init_($rt_s(564), 8);
-    jnf_StandardOpenOption_DSYNC = jnf_StandardOpenOption__init_($rt_s(565), 9);
+    jnf_StandardOpenOption_READ = jnf_StandardOpenOption__init_($rt_s(555), 0);
+    jnf_StandardOpenOption_WRITE = jnf_StandardOpenOption__init_($rt_s(556), 1);
+    jnf_StandardOpenOption_APPEND = jnf_StandardOpenOption__init_($rt_s(557), 2);
+    jnf_StandardOpenOption_TRUNCATE_EXISTING = jnf_StandardOpenOption__init_($rt_s(558), 3);
+    jnf_StandardOpenOption_CREATE = jnf_StandardOpenOption__init_($rt_s(559), 4);
+    jnf_StandardOpenOption_CREATE_NEW = jnf_StandardOpenOption__init_($rt_s(560), 5);
+    jnf_StandardOpenOption_DELETE_ON_CLOSE = jnf_StandardOpenOption__init_($rt_s(561), 6);
+    jnf_StandardOpenOption_SPARSE = jnf_StandardOpenOption__init_($rt_s(562), 7);
+    jnf_StandardOpenOption_SYNC = jnf_StandardOpenOption__init_($rt_s(563), 8);
+    jnf_StandardOpenOption_DSYNC = jnf_StandardOpenOption__init_($rt_s(564), 9);
     jnf_StandardOpenOption_$VALUES = jnf_StandardOpenOption_$values();
 },
 ju_Base64 = $rt_classWithoutFields(),
@@ -26345,80 +26345,80 @@ ols_Configuration__clinit_ = () => {
     let var$1;
     var$1 = new ols_Configuration;
     ols_Configuration$StateInit_$callClinit();
-    ols_Configuration__init_0(var$1, $rt_s(566), ols_Configuration$StateInit_STRING);
+    ols_Configuration__init_0(var$1, $rt_s(565), ols_Configuration$StateInit_STRING);
     ols_Configuration_LIBRARY_PATH = var$1;
-    ols_Configuration_BUNDLED_LIBRARY_NAME_MAPPER = ols_Configuration__init_($rt_s(567), ols_Configuration$StateInit_STRING);
-    ols_Configuration_BUNDLED_LIBRARY_PATH_MAPPER = ols_Configuration__init_($rt_s(568), ols_Configuration$StateInit_STRING);
-    ols_Configuration_SHARED_LIBRARY_EXTRACT_DIRECTORY = ols_Configuration__init_($rt_s(569), ols_Configuration$StateInit_STRING);
-    ols_Configuration_SHARED_LIBRARY_EXTRACT_PATH = ols_Configuration__init_($rt_s(570), ols_Configuration$StateInit_STRING);
-    ols_Configuration_SHARED_LIBRARY_EXTRACT_FORCE = ols_Configuration__init_($rt_s(571), ols_Configuration$StateInit_BOOLEAN);
-    ols_Configuration_EMULATE_SYSTEM_LOADLIBRARY = ols_Configuration__init_($rt_s(572), ols_Configuration$StateInit_BOOLEAN);
-    ols_Configuration_LIBRARY_NAME = ols_Configuration__init_($rt_s(573), ols_Configuration$StateInit_STRING);
-    ols_Configuration_MEMORY_ALLOCATOR = ols_Configuration__init_($rt_s(574), ols_Configuration$StateInit_STRING);
-    ols_Configuration_STACK_SIZE = ols_Configuration__init_($rt_s(575), ols_Configuration$StateInit_INT);
-    ols_Configuration_ARRAY_TLC_SIZE = ols_Configuration__init_($rt_s(576), ols_Configuration$StateInit_INT);
-    ols_Configuration_JNI_NATIVE_INTERFACE_FUNCTION_COUNT = ols_Configuration__init_($rt_s(577), ols_Configuration$StateInit_INT);
-    ols_Configuration_DISABLE_CHECKS = ols_Configuration__init_($rt_s(578), ols_Configuration$StateInit_BOOLEAN);
-    ols_Configuration_DISABLE_FUNCTION_CHECKS = ols_Configuration__init_($rt_s(579), ols_Configuration$StateInit_BOOLEAN);
-    ols_Configuration_DEBUG = ols_Configuration__init_($rt_s(580), ols_Configuration$StateInit_BOOLEAN);
-    ols_Configuration_DEBUG_LOADER = ols_Configuration__init_($rt_s(581), ols_Configuration$StateInit_BOOLEAN);
-    ols_Configuration_DEBUG_STREAM = ols_Configuration__init_($rt_s(582), ols_Configuration$StateInit_STRING);
-    ols_Configuration_DEBUG_MEMORY_ALLOCATOR = ols_Configuration__init_($rt_s(583), ols_Configuration$StateInit_BOOLEAN);
-    ols_Configuration_DEBUG_MEMORY_ALLOCATOR_INTERNAL = ols_Configuration__init_($rt_s(584), ols_Configuration$StateInit_BOOLEAN);
-    ols_Configuration_DEBUG_MEMORY_ALLOCATOR_FAST = ols_Configuration__init_($rt_s(585), ols_Configuration$StateInit_BOOLEAN);
-    ols_Configuration_DEBUG_STACK = ols_Configuration__init_($rt_s(586), ols_Configuration$StateInit_BOOLEAN);
-    ols_Configuration_DEBUG_FUNCTIONS = ols_Configuration__init_($rt_s(587), ols_Configuration$StateInit_BOOLEAN);
-    ols_Configuration_ASSIMP_LIBRARY_NAME = ols_Configuration__init_($rt_s(588), ols_Configuration$StateInit_STRING);
-    ols_Configuration_ASSIMP_DRACO_LIBRARY_NAME = ols_Configuration__init_($rt_s(589), ols_Configuration$StateInit_STRING);
-    ols_Configuration_BGFX_LIBRARY_NAME = ols_Configuration__init_($rt_s(590), ols_Configuration$StateInit_STRING);
-    ols_Configuration_CUDA_LIBRARY_NAME = ols_Configuration__init_($rt_s(591), ols_Configuration$StateInit_STRING);
-    ols_Configuration_CUDA_TOOLKIT_VERSION = ols_Configuration__init_($rt_s(592), ols_Configuration$StateInit_STRING);
-    ols_Configuration_CUDA_TOOLKIT_PATH = ols_Configuration__init_($rt_s(593), ols_Configuration$StateInit_STRING);
-    ols_Configuration_CUDA_NVRTC_LIBRARY_NAME = ols_Configuration__init_($rt_s(594), ols_Configuration$StateInit_STRING);
-    ols_Configuration_CUDA_NVRTC_BUILTINS_LIBRARY_NAME = ols_Configuration__init_($rt_s(595), ols_Configuration$StateInit_STRING);
-    ols_Configuration_CUDA_API_PER_THREAD_DEFAULT_STREAM = ols_Configuration__init_($rt_s(596), ols_Configuration$StateInit_BOOLEAN);
-    ols_Configuration_EGL_EXPLICIT_INIT = ols_Configuration__init_($rt_s(597), ols_Configuration$StateInit_BOOLEAN);
-    ols_Configuration_EGL_LIBRARY_NAME = ols_Configuration__init_($rt_s(598), ols_Configuration$StateInit_STRING);
-    ols_Configuration_EGL_EXTENSION_FILTER = ols_Configuration__init_($rt_s(599), ols_Configuration$StateInit_STRING);
-    ols_Configuration_FMOD_LIBRARY_NAME = ols_Configuration__init_($rt_s(600), ols_Configuration$StateInit_STRING);
-    ols_Configuration_FMOD_STUDIO_LIBRARY_NAME = ols_Configuration__init_($rt_s(601), ols_Configuration$StateInit_STRING);
-    ols_Configuration_FMOD_FSBANK_LIBRARY_NAME = ols_Configuration__init_($rt_s(602), ols_Configuration$StateInit_STRING);
-    ols_Configuration_FREETYPE_LIBRARY_NAME = ols_Configuration__init_($rt_s(603), ols_Configuration$StateInit_STRING);
-    ols_Configuration_GLFW_LIBRARY_NAME = ols_Configuration__init_($rt_s(604), ols_Configuration$StateInit_STRING);
-    ols_Configuration_GLFW_CHECK_THREAD0 = ols_Configuration__init_($rt_s(605), ols_Configuration$StateInit_BOOLEAN);
-    ols_Configuration_HARFBUZZ_LIBRARY_NAME = ols_Configuration__init_($rt_s(606), ols_Configuration$StateInit_STRING);
-    ols_Configuration_HWLOC_LIBRARY_NAME = ols_Configuration__init_($rt_s(607), ols_Configuration$StateInit_STRING);
-    ols_Configuration_JAWT_LIBRARY_NAME = ols_Configuration__init_($rt_s(608), ols_Configuration$StateInit_STRING);
-    ols_Configuration_JEMALLOC_LIBRARY_NAME = ols_Configuration__init_($rt_s(609), ols_Configuration$StateInit_STRING);
-    ols_Configuration_KTX_LIBRARY_NAME = ols_Configuration__init_($rt_s(610), ols_Configuration$StateInit_STRING);
-    ols_Configuration_LLVM_LIBRARY_NAME = ols_Configuration__init_($rt_s(611), ols_Configuration$StateInit_STRING);
-    ols_Configuration_LLVM_CLANG_LIBRARY_NAME = ols_Configuration__init_($rt_s(612), ols_Configuration$StateInit_STRING);
-    ols_Configuration_LLVM_LTO_LIBRARY_NAME = ols_Configuration__init_($rt_s(613), ols_Configuration$StateInit_STRING);
-    ols_Configuration_NFD_LINUX_PORTAL = ols_Configuration__init_($rt_s(614), ols_Configuration$StateInit_BOOLEAN);
-    ols_Configuration_ODBC_LIBRARY_NAME = ols_Configuration__init_($rt_s(615), ols_Configuration$StateInit_STRING);
-    ols_Configuration_OPENAL_EXPLICIT_INIT = ols_Configuration__init_($rt_s(616), ols_Configuration$StateInit_BOOLEAN);
-    ols_Configuration_OPENAL_LIBRARY_NAME = ols_Configuration__init_($rt_s(617), ols_Configuration$StateInit_STRING);
-    ols_Configuration_OPENAL_EXTENSION_FILTER = ols_Configuration__init_($rt_s(618), ols_Configuration$StateInit_STRING);
-    ols_Configuration_OPENCL_EXPLICIT_INIT = ols_Configuration__init_($rt_s(619), ols_Configuration$StateInit_BOOLEAN);
-    ols_Configuration_OPENCL_LIBRARY_NAME = ols_Configuration__init_($rt_s(620), ols_Configuration$StateInit_STRING);
-    ols_Configuration_OPENCL_EXTENSION_FILTER = ols_Configuration__init_($rt_s(621), ols_Configuration$StateInit_STRING);
-    ols_Configuration_OPENGL_EXPLICIT_INIT = ols_Configuration__init_($rt_s(622), ols_Configuration$StateInit_BOOLEAN);
-    ols_Configuration_OPENGL_LIBRARY_NAME = ols_Configuration__init_($rt_s(623), ols_Configuration$StateInit_STRING);
-    ols_Configuration_OPENGL_MAXVERSION = ols_Configuration__init_($rt_s(624), ols_Configuration$StateInit_STRING);
-    ols_Configuration_OPENGL_EXTENSION_FILTER = ols_Configuration__init_($rt_s(625), ols_Configuration$StateInit_STRING);
-    ols_Configuration_OPENGLES_EXPLICIT_INIT = ols_Configuration__init_($rt_s(626), ols_Configuration$StateInit_BOOLEAN);
-    ols_Configuration_OPENGLES_LIBRARY_NAME = ols_Configuration__init_($rt_s(627), ols_Configuration$StateInit_STRING);
-    ols_Configuration_OPENGLES_MAXVERSION = ols_Configuration__init_($rt_s(628), ols_Configuration$StateInit_STRING);
-    ols_Configuration_OPENGLES_EXTENSION_FILTER = ols_Configuration__init_($rt_s(629), ols_Configuration$StateInit_STRING);
-    ols_Configuration_OPENGLES_CONTEXT_API = ols_Configuration__init_($rt_s(630), ols_Configuration$StateInit_STRING);
-    ols_Configuration_OPENVR_LIBRARY_NAME = ols_Configuration__init_($rt_s(631), ols_Configuration$StateInit_STRING);
-    ols_Configuration_OPENXR_EXPLICIT_INIT = ols_Configuration__init_($rt_s(632), ols_Configuration$StateInit_BOOLEAN);
-    ols_Configuration_OPENXR_LIBRARY_NAME = ols_Configuration__init_($rt_s(633), ols_Configuration$StateInit_STRING);
-    ols_Configuration_OPUS_LIBRARY_NAME = ols_Configuration__init_($rt_s(634), ols_Configuration$StateInit_STRING);
-    ols_Configuration_SHADERC_LIBRARY_NAME = ols_Configuration__init_($rt_s(635), ols_Configuration$StateInit_STRING);
-    ols_Configuration_SPVC_LIBRARY_NAME = ols_Configuration__init_($rt_s(636), ols_Configuration$StateInit_STRING);
-    ols_Configuration_VULKAN_EXPLICIT_INIT = ols_Configuration__init_($rt_s(637), ols_Configuration$StateInit_BOOLEAN);
-    ols_Configuration_VULKAN_LIBRARY_NAME = ols_Configuration__init_($rt_s(638), ols_Configuration$StateInit_STRING);
+    ols_Configuration_BUNDLED_LIBRARY_NAME_MAPPER = ols_Configuration__init_($rt_s(566), ols_Configuration$StateInit_STRING);
+    ols_Configuration_BUNDLED_LIBRARY_PATH_MAPPER = ols_Configuration__init_($rt_s(567), ols_Configuration$StateInit_STRING);
+    ols_Configuration_SHARED_LIBRARY_EXTRACT_DIRECTORY = ols_Configuration__init_($rt_s(568), ols_Configuration$StateInit_STRING);
+    ols_Configuration_SHARED_LIBRARY_EXTRACT_PATH = ols_Configuration__init_($rt_s(569), ols_Configuration$StateInit_STRING);
+    ols_Configuration_SHARED_LIBRARY_EXTRACT_FORCE = ols_Configuration__init_($rt_s(570), ols_Configuration$StateInit_BOOLEAN);
+    ols_Configuration_EMULATE_SYSTEM_LOADLIBRARY = ols_Configuration__init_($rt_s(571), ols_Configuration$StateInit_BOOLEAN);
+    ols_Configuration_LIBRARY_NAME = ols_Configuration__init_($rt_s(572), ols_Configuration$StateInit_STRING);
+    ols_Configuration_MEMORY_ALLOCATOR = ols_Configuration__init_($rt_s(573), ols_Configuration$StateInit_STRING);
+    ols_Configuration_STACK_SIZE = ols_Configuration__init_($rt_s(574), ols_Configuration$StateInit_INT);
+    ols_Configuration_ARRAY_TLC_SIZE = ols_Configuration__init_($rt_s(575), ols_Configuration$StateInit_INT);
+    ols_Configuration_JNI_NATIVE_INTERFACE_FUNCTION_COUNT = ols_Configuration__init_($rt_s(576), ols_Configuration$StateInit_INT);
+    ols_Configuration_DISABLE_CHECKS = ols_Configuration__init_($rt_s(577), ols_Configuration$StateInit_BOOLEAN);
+    ols_Configuration_DISABLE_FUNCTION_CHECKS = ols_Configuration__init_($rt_s(578), ols_Configuration$StateInit_BOOLEAN);
+    ols_Configuration_DEBUG = ols_Configuration__init_($rt_s(579), ols_Configuration$StateInit_BOOLEAN);
+    ols_Configuration_DEBUG_LOADER = ols_Configuration__init_($rt_s(580), ols_Configuration$StateInit_BOOLEAN);
+    ols_Configuration_DEBUG_STREAM = ols_Configuration__init_($rt_s(581), ols_Configuration$StateInit_STRING);
+    ols_Configuration_DEBUG_MEMORY_ALLOCATOR = ols_Configuration__init_($rt_s(582), ols_Configuration$StateInit_BOOLEAN);
+    ols_Configuration_DEBUG_MEMORY_ALLOCATOR_INTERNAL = ols_Configuration__init_($rt_s(583), ols_Configuration$StateInit_BOOLEAN);
+    ols_Configuration_DEBUG_MEMORY_ALLOCATOR_FAST = ols_Configuration__init_($rt_s(584), ols_Configuration$StateInit_BOOLEAN);
+    ols_Configuration_DEBUG_STACK = ols_Configuration__init_($rt_s(585), ols_Configuration$StateInit_BOOLEAN);
+    ols_Configuration_DEBUG_FUNCTIONS = ols_Configuration__init_($rt_s(586), ols_Configuration$StateInit_BOOLEAN);
+    ols_Configuration_ASSIMP_LIBRARY_NAME = ols_Configuration__init_($rt_s(587), ols_Configuration$StateInit_STRING);
+    ols_Configuration_ASSIMP_DRACO_LIBRARY_NAME = ols_Configuration__init_($rt_s(588), ols_Configuration$StateInit_STRING);
+    ols_Configuration_BGFX_LIBRARY_NAME = ols_Configuration__init_($rt_s(589), ols_Configuration$StateInit_STRING);
+    ols_Configuration_CUDA_LIBRARY_NAME = ols_Configuration__init_($rt_s(590), ols_Configuration$StateInit_STRING);
+    ols_Configuration_CUDA_TOOLKIT_VERSION = ols_Configuration__init_($rt_s(591), ols_Configuration$StateInit_STRING);
+    ols_Configuration_CUDA_TOOLKIT_PATH = ols_Configuration__init_($rt_s(592), ols_Configuration$StateInit_STRING);
+    ols_Configuration_CUDA_NVRTC_LIBRARY_NAME = ols_Configuration__init_($rt_s(593), ols_Configuration$StateInit_STRING);
+    ols_Configuration_CUDA_NVRTC_BUILTINS_LIBRARY_NAME = ols_Configuration__init_($rt_s(594), ols_Configuration$StateInit_STRING);
+    ols_Configuration_CUDA_API_PER_THREAD_DEFAULT_STREAM = ols_Configuration__init_($rt_s(595), ols_Configuration$StateInit_BOOLEAN);
+    ols_Configuration_EGL_EXPLICIT_INIT = ols_Configuration__init_($rt_s(596), ols_Configuration$StateInit_BOOLEAN);
+    ols_Configuration_EGL_LIBRARY_NAME = ols_Configuration__init_($rt_s(597), ols_Configuration$StateInit_STRING);
+    ols_Configuration_EGL_EXTENSION_FILTER = ols_Configuration__init_($rt_s(598), ols_Configuration$StateInit_STRING);
+    ols_Configuration_FMOD_LIBRARY_NAME = ols_Configuration__init_($rt_s(599), ols_Configuration$StateInit_STRING);
+    ols_Configuration_FMOD_STUDIO_LIBRARY_NAME = ols_Configuration__init_($rt_s(600), ols_Configuration$StateInit_STRING);
+    ols_Configuration_FMOD_FSBANK_LIBRARY_NAME = ols_Configuration__init_($rt_s(601), ols_Configuration$StateInit_STRING);
+    ols_Configuration_FREETYPE_LIBRARY_NAME = ols_Configuration__init_($rt_s(602), ols_Configuration$StateInit_STRING);
+    ols_Configuration_GLFW_LIBRARY_NAME = ols_Configuration__init_($rt_s(603), ols_Configuration$StateInit_STRING);
+    ols_Configuration_GLFW_CHECK_THREAD0 = ols_Configuration__init_($rt_s(604), ols_Configuration$StateInit_BOOLEAN);
+    ols_Configuration_HARFBUZZ_LIBRARY_NAME = ols_Configuration__init_($rt_s(605), ols_Configuration$StateInit_STRING);
+    ols_Configuration_HWLOC_LIBRARY_NAME = ols_Configuration__init_($rt_s(606), ols_Configuration$StateInit_STRING);
+    ols_Configuration_JAWT_LIBRARY_NAME = ols_Configuration__init_($rt_s(607), ols_Configuration$StateInit_STRING);
+    ols_Configuration_JEMALLOC_LIBRARY_NAME = ols_Configuration__init_($rt_s(608), ols_Configuration$StateInit_STRING);
+    ols_Configuration_KTX_LIBRARY_NAME = ols_Configuration__init_($rt_s(609), ols_Configuration$StateInit_STRING);
+    ols_Configuration_LLVM_LIBRARY_NAME = ols_Configuration__init_($rt_s(610), ols_Configuration$StateInit_STRING);
+    ols_Configuration_LLVM_CLANG_LIBRARY_NAME = ols_Configuration__init_($rt_s(611), ols_Configuration$StateInit_STRING);
+    ols_Configuration_LLVM_LTO_LIBRARY_NAME = ols_Configuration__init_($rt_s(612), ols_Configuration$StateInit_STRING);
+    ols_Configuration_NFD_LINUX_PORTAL = ols_Configuration__init_($rt_s(613), ols_Configuration$StateInit_BOOLEAN);
+    ols_Configuration_ODBC_LIBRARY_NAME = ols_Configuration__init_($rt_s(614), ols_Configuration$StateInit_STRING);
+    ols_Configuration_OPENAL_EXPLICIT_INIT = ols_Configuration__init_($rt_s(615), ols_Configuration$StateInit_BOOLEAN);
+    ols_Configuration_OPENAL_LIBRARY_NAME = ols_Configuration__init_($rt_s(616), ols_Configuration$StateInit_STRING);
+    ols_Configuration_OPENAL_EXTENSION_FILTER = ols_Configuration__init_($rt_s(617), ols_Configuration$StateInit_STRING);
+    ols_Configuration_OPENCL_EXPLICIT_INIT = ols_Configuration__init_($rt_s(618), ols_Configuration$StateInit_BOOLEAN);
+    ols_Configuration_OPENCL_LIBRARY_NAME = ols_Configuration__init_($rt_s(619), ols_Configuration$StateInit_STRING);
+    ols_Configuration_OPENCL_EXTENSION_FILTER = ols_Configuration__init_($rt_s(620), ols_Configuration$StateInit_STRING);
+    ols_Configuration_OPENGL_EXPLICIT_INIT = ols_Configuration__init_($rt_s(621), ols_Configuration$StateInit_BOOLEAN);
+    ols_Configuration_OPENGL_LIBRARY_NAME = ols_Configuration__init_($rt_s(622), ols_Configuration$StateInit_STRING);
+    ols_Configuration_OPENGL_MAXVERSION = ols_Configuration__init_($rt_s(623), ols_Configuration$StateInit_STRING);
+    ols_Configuration_OPENGL_EXTENSION_FILTER = ols_Configuration__init_($rt_s(624), ols_Configuration$StateInit_STRING);
+    ols_Configuration_OPENGLES_EXPLICIT_INIT = ols_Configuration__init_($rt_s(625), ols_Configuration$StateInit_BOOLEAN);
+    ols_Configuration_OPENGLES_LIBRARY_NAME = ols_Configuration__init_($rt_s(626), ols_Configuration$StateInit_STRING);
+    ols_Configuration_OPENGLES_MAXVERSION = ols_Configuration__init_($rt_s(627), ols_Configuration$StateInit_STRING);
+    ols_Configuration_OPENGLES_EXTENSION_FILTER = ols_Configuration__init_($rt_s(628), ols_Configuration$StateInit_STRING);
+    ols_Configuration_OPENGLES_CONTEXT_API = ols_Configuration__init_($rt_s(629), ols_Configuration$StateInit_STRING);
+    ols_Configuration_OPENVR_LIBRARY_NAME = ols_Configuration__init_($rt_s(630), ols_Configuration$StateInit_STRING);
+    ols_Configuration_OPENXR_EXPLICIT_INIT = ols_Configuration__init_($rt_s(631), ols_Configuration$StateInit_BOOLEAN);
+    ols_Configuration_OPENXR_LIBRARY_NAME = ols_Configuration__init_($rt_s(632), ols_Configuration$StateInit_STRING);
+    ols_Configuration_OPUS_LIBRARY_NAME = ols_Configuration__init_($rt_s(633), ols_Configuration$StateInit_STRING);
+    ols_Configuration_SHADERC_LIBRARY_NAME = ols_Configuration__init_($rt_s(634), ols_Configuration$StateInit_STRING);
+    ols_Configuration_SPVC_LIBRARY_NAME = ols_Configuration__init_($rt_s(635), ols_Configuration$StateInit_STRING);
+    ols_Configuration_VULKAN_EXPLICIT_INIT = ols_Configuration__init_($rt_s(636), ols_Configuration$StateInit_BOOLEAN);
+    ols_Configuration_VULKAN_LIBRARY_NAME = ols_Configuration__init_($rt_s(637), ols_Configuration$StateInit_STRING);
 },
 jt_DecimalFormat$MinusField = $rt_classWithoutFields(),
 jt_DecimalFormat$MinusField__init_ = $this => {
@@ -27422,7 +27422,7 @@ jur_Lexer_movePointer = $this => {
                                         if ($nonCap > 57)
                                             break a;
                                         if ($nameBuilder === null) {
-                                            var$8 = jur_PatternSyntaxException__init_($rt_s(639), $this.$toString(), $this.$index0);
+                                            var$8 = jur_PatternSyntaxException__init_($rt_s(638), $this.$toString(), $this.$index0);
                                             $rt_throw(var$8);
                                         }
                                         $nameBuilder.$append0($nonCap);
@@ -27513,7 +27513,7 @@ jur_Lexer_parseCharClassName = $this => {
         if ($this.$pattern0.data[$this.$index0] != 123) {
             var$2 = jl_String__init_0($this.$pattern0, jur_Lexer_nextIndex($this), 1);
             var$3 = jl_StringBuilder__init_();
-            jl_StringBuilder_append(jl_StringBuilder_append(var$3, $rt_s(640)), var$2);
+            jl_StringBuilder_append(jl_StringBuilder_append(var$3, $rt_s(639)), var$2);
             return jl_StringBuilder_toString(var$3);
         }
         jur_Lexer_nextIndex($this);
@@ -27534,15 +27534,15 @@ jur_Lexer_parseCharClassName = $this => {
     $res = $sb.$toString();
     if (jl_String_length($res) == 1) {
         var$2 = jl_StringBuilder__init_();
-        jl_StringBuilder_append(jl_StringBuilder_append(var$2, $rt_s(640)), $res);
+        jl_StringBuilder_append(jl_StringBuilder_append(var$2, $rt_s(639)), $res);
         return jl_StringBuilder_toString(var$2);
     }
     b: {
         c: {
             if (jl_String_length($res) > 3) {
-                if (jl_String_startsWith($res, $rt_s(640)))
+                if (jl_String_startsWith($res, $rt_s(639)))
                     break c;
-                if (jl_String_startsWith($res, $rt_s(641)))
+                if (jl_String_startsWith($res, $rt_s(640)))
                     break c;
             }
             break b;
@@ -27878,7 +27878,7 @@ function ju_IllegalFormatFlagsException() {
 let ju_IllegalFormatFlagsException__init_0 = ($this, $flags) => {
     let var$2;
     var$2 = jl_StringBuilder__init_();
-    jl_StringBuilder_append(jl_StringBuilder_append(var$2, $rt_s(642)), $flags);
+    jl_StringBuilder_append(jl_StringBuilder_append(var$2, $rt_s(641)), $flags);
     ju_IllegalFormatException__init_($this, jl_StringBuilder_toString(var$2));
     $this.$flags5 = $flags;
 },
@@ -28579,10 +28579,10 @@ $rt_stringPool(["Can\'t enter monitor from another thread synchronously", "[LWJG
 "#version 330", "#version 300 es\nprecision highp float;\nprecision highp int;\n", "#version 150", "uv / 256.0", "vec2(uv) / 256.0", "texCoord2 = UV2;", "texCoord2 = vec2(UV2);", "floor(texCoord.x * 16) / 15", "floor(texCoord.x * 16.0) / 15.0", "floor(texCoord.y * 16) / 15", "floor(texCoord.y * 16.0) / 15.0", "Position + (ChunkPosition - CameraBlockPos) + CameraOffset", "Position + vec3(ChunkPosition - CameraBlockPos) + CameraOffset", "1.0f / TextureSize", "vec2(1.0) / vec2(TextureSize)", "1.0 / TextureSize",
 "vec3(cellX, 0, cellZ)", "vec3(float(cellX), 0.0, float(cellZ))", "linear_fog_value(vertexDistance, 0, FogCloudsEnd)", "linear_fog_value(vertexDistance, 0.0, FogCloudsEnd)", "uniform isamplerBuffer CloudFaces;", "uniform highp isampler2D CloudFaces;", "texelFetch(CloudFaces, index).r", "texelFetch(CloudFaces, ivec2(index % 4096, index / 4096), 0).r", "texelFetch(CloudFaces, index + 1).r", "texelFetch(CloudFaces, ivec2((index + 1) % 4096, (index + 1) / 4096), 0).r", "texelFetch(CloudFaces, index + 2).r", "texelFetch(CloudFaces, ivec2((index + 2) % 4096, (index + 2) / 4096), 0).r",
 "textureLod(Sprite, texCoord0, MipMapLevel)", "textureLod(Sprite, texCoord0, float(MipMapLevel))", "textureLod(CurrentSprite, texCoord0, MipMapLevel)", "textureLod(CurrentSprite, texCoord0, float(MipMapLevel))", "textureLod(NextSprite, texCoord0, MipMapLevel)", "textureLod(NextSprite, texCoord0, float(MipMapLevel))", "(gl_VertexID >> 3) / 1000.0", "float(gl_VertexID >> 3) / 1000.0", "Either src or dest is null", "21", "TeaVM", "file.separator", "\\", "path.separator", ":", ";", "line.separator", "java.io.tmpdir",
-"user.home", "/tmp", " files", "gaius.fs.v1:", " bytes=", "/saves/", "/options.txt", "/servers.dat", "/optionsof.txt", "/optionsshaders.txt", "/gaius/options.txt", "browser low settings", "browser low settings after migration failure", "unknown", "\\R", "Could not create ", "Could not open ", "Could not open parent directory ", "autoJump:false", "operatorItemsTab:true", "renderDistance:4", "simulationDistance:5", "entityDistanceScaling:0.5", "maxFps:120", "graphicsPreset:\"fast\"", "renderClouds:\"false\"",
+"user.home", "/tmp", " files", "gaius.fs.v1:", " bytes=", "/saves/", "/options.txt", "/servers.dat", "/optionsof.txt", "/optionsshaders.txt", "/gaius/options.txt", "browser low settings", "browser low settings after migration failure", "unknown", "\\R", "Could not create ", "Could not open ", "Could not open parent directory ", "autoJump:false", "operatorItemsTab:true", "renderDistance:2", "simulationDistance:5", "entityDistanceScaling:0.5", "maxFps:120", "graphicsPreset:\"fast\"", "renderClouds:\"false\"",
 "cloudRange:32", "ao:false", "cutoutLeaves:false", "vignette:false", "improvedTransparency:false", "weatherRadius:0", "chunkSectionFadeInTime:0.0", "prioritizeChunkUpdates:0", "mipmapLevels:0", "maxAnisotropyBit:1", "textureFiltering:0", "biomeBlendRadius:0", "particles:2", "enableVsync:false", "entityShadows:false", "bobView:false", "menuBackgroundBlurriness:0", "panoramaSpeed:0.0", "screenEffectScale:0.0", "fovEffectScale:0.0", "darknessEffectScale:0.0", "pauseOnLostFocus:false", "darkMojangStudiosBackground:false",
-"hideSplashTexts:true", "showAutosaveIndicator:false", "skipMultiplayerWarning:true", "autoJump", "operatorItemsTab", "renderDistance", "4", "simulationDistance", "5", "entityDistanceScaling", "0.5", "maxFps", "120", "graphicsPreset", "\"fast\"", "renderClouds", "\"false\"", "cloudRange", "ao", "cutoutLeaves", "vignette", "improvedTransparency", "weatherRadius", "chunkSectionFadeInTime", "0.0", "prioritizeChunkUpdates", "mipmapLevels", "maxAnisotropyBit", "1", "textureFiltering", "biomeBlendRadius", "particles",
-"2", "enableVsync", "entityShadows", "bobView", "menuBackgroundBlurriness", "panoramaSpeed", "screenEffectScale", "fovEffectScale", "darknessEffectScale", "pauseOnLostFocus", "darkMojangStudiosBackground", "hideSplashTexts", "showAutosaveIndicator", "skipMultiplayerWarning", "Duplicate format flags: ", "Missing format with for specifier ", "ALPHA", "a", "BETA", "b", "STABLE", "power of ten too big", "Directory does not exist", " since parent directory does not exist", "%", "(", ")", "+ ", "0-", "0x", "--#+ 0,(<",
+"hideSplashTexts:true", "showAutosaveIndicator:false", "skipMultiplayerWarning:true", "autoJump", "operatorItemsTab", "renderDistance", "2", "simulationDistance", "5", "entityDistanceScaling", "0.5", "maxFps", "120", "graphicsPreset", "\"fast\"", "renderClouds", "\"false\"", "cloudRange", "ao", "cutoutLeaves", "vignette", "improvedTransparency", "weatherRadius", "chunkSectionFadeInTime", "0.0", "prioritizeChunkUpdates", "mipmapLevels", "maxAnisotropyBit", "1", "textureFiltering", "biomeBlendRadius", "particles",
+"enableVsync", "entityShadows", "bobView", "menuBackgroundBlurriness", "panoramaSpeed", "screenEffectScale", "fovEffectScale", "darknessEffectScale", "pauseOnLostFocus", "darkMojangStudiosBackground", "hideSplashTexts", "showAutosaveIndicator", "skipMultiplayerWarning", "Duplicate format flags: ", "Missing format with for specifier ", "ALPHA", "a", "BETA", "b", "STABLE", "power of ten too big", "Directory does not exist", " since parent directory does not exist", "%", "(", ")", "+ ", "0-", "0x", "--#+ 0,(<",
 "/gaius-smoke/region-test.mca", "official-1.21.11", "FileChannel size mismatch: ", "FileChannel data mismatch at ", "Managed LWJGL memory mismatch", "GLFW browser initialization failed", "Gaius 1.21.11 platform smoke", "Browser window was not created", "GLFW event bridge mismatch: ", "Browser framebuffer is invalid", "Browser video mode is invalid", "#version 300 es\nvoid main(){gl_Position=vec4(0.0,0.0,0.0,1.0);}", "WebGL shader compile failed: ", "Browser OpenAL source state was not updated: ", "Browser OpenAL context was not created",
 "UP", "DOWN", "CEILING", "FLOOR", "HALF_UP", "HALF_DOWN", "HALF_EVEN", "UNNECESSARY", "READ", "WRITE", "APPEND", "TRUNCATE_EXISTING", "CREATE", "CREATE_NEW", "DELETE_ON_CLOSE", "SPARSE", "SYNC", "DSYNC", "org.lwjgl.librarypath", "org.lwjgl.system.bundledLibrary.nameMapper", "org.lwjgl.system.bundledLibrary.pathMapper", "org.lwjgl.system.SharedLibraryExtractDirectory", "org.lwjgl.system.SharedLibraryExtractPath", "org.lwjgl.system.SharedLibraryExtractForce", "org.lwjgl.system.EmulateSystemLoadLibrary", "org.lwjgl.libname",
 "org.lwjgl.system.allocator", "org.lwjgl.system.stackSize", "org.lwjgl.system.arrayTLCSize", "org.lwjgl.system.JNINativeInterfaceSize", "org.lwjgl.util.NoChecks", "org.lwjgl.util.NoFunctionChecks", "org.lwjgl.util.Debug", "org.lwjgl.util.DebugLoader", "org.lwjgl.util.DebugStream", "org.lwjgl.util.DebugAllocator", "org.lwjgl.util.DebugAllocator.internal", "org.lwjgl.util.DebugAllocator.fast", "org.lwjgl.util.DebugStack", "org.lwjgl.util.DebugFunctions", "org.lwjgl.assimp.libname", "org.lwjgl.assimp.draco.libname",

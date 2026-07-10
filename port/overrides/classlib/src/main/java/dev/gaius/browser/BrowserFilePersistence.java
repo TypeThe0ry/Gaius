@@ -26,7 +26,7 @@ public final class BrowserFilePersistence {
     private static final String DEFAULT_BROWSER_OPTIONS = String.join("\n",
             "autoJump:false",
             "operatorItemsTab:true",
-            "renderDistance:4",
+            "renderDistance:2",
             "simulationDistance:5",
             "entityDistanceScaling:0.5",
             "maxFps:120",
@@ -61,7 +61,7 @@ public final class BrowserFilePersistence {
     private static final Map<String, String> BROWSER_PERFORMANCE_OPTIONS = Map.ofEntries(
             Map.entry("autoJump", "false"),
             Map.entry("operatorItemsTab", "true"),
-            Map.entry("renderDistance", "4"),
+            Map.entry("renderDistance", "2"),
             Map.entry("simulationDistance", "5"),
             Map.entry("entityDistanceScaling", "0.5"),
             Map.entry("maxFps", "120"),
