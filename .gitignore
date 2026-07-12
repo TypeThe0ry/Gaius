@@ -14,8 +14,6 @@ port/overrides/libraries/*
 !port/overrides/libraries/lwjgl-stb/**
 
 # Local build and editor output.
-build/
-dist/
 node_modules/
 .pnpm-store/
 .DS_Store
