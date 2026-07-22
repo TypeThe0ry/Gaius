@@ -39,7 +39,10 @@ download_verified() {
 
   mkdir -p "$(dirname "$output")"
   local temporary="$output.part"
-  curl -fL --retry 3 --retry-delay 1 -o "$temporary" "$url"
+  if ! curl -fsSL --http1.1 --retry 5 --retry-delay 1 -o "$temporary" "$url"; then
+    rm -f "$temporary"
+    return 1
+  fi
   local actual_sha1
   actual_sha1="$(shasum -a 1 "$temporary" | awk '{print $1}')"
   if [[ "$actual_sha1" != "$expected_sha1" ]]; then
@@ -79,39 +82,60 @@ asset_index="$assets/indexes/$asset_index_id.json"
 echo "Fetching browser sound asset index $asset_index_id"
 download_verified "$asset_index_url" "$asset_index_sha1" "$asset_index"
 
-echo "Fetching browser smoke/UI sound assets"
+echo "Fetching browser gameplay sound assets"
 browser_sound_metadata_assets=(
   "minecraft/sounds.json"
 )
 browser_sound_assets=(
-  "minecraft/sounds/random/click.ogg"
-  "minecraft/sounds/random/click_stereo.ogg"
-  "minecraft/sounds/random/wood_click.ogg"
-  "minecraft/sounds/random/levelup.ogg"
-  "minecraft/sounds/random/orb.ogg"
   "minecraft/sounds/ui/toast/in.ogg"
   "minecraft/sounds/ui/toast/out.ogg"
   "minecraft/sounds/ui/toast/challenge_complete.ogg"
   "minecraft/sounds/ui/stonecutter/cut1.ogg"
   "minecraft/sounds/ui/stonecutter/cut2.ogg"
-  "minecraft/sounds/dig/grass1.ogg"
-  "minecraft/sounds/dig/grass2.ogg"
-  "minecraft/sounds/dig/grass3.ogg"
-  "minecraft/sounds/dig/grass4.ogg"
-  "minecraft/sounds/step/grass1.ogg"
-  "minecraft/sounds/step/grass2.ogg"
-  "minecraft/sounds/step/grass3.ogg"
-  "minecraft/sounds/step/grass4.ogg"
-  "minecraft/sounds/step/grass5.ogg"
-  "minecraft/sounds/step/grass6.ogg"
 )
-for logical_path in "${browser_sound_metadata_assets[@]}" "${browser_sound_assets[@]}"; do
+while IFS= read -r logical_path; do
+  browser_sound_assets+=("$logical_path")
+done < <(
+  jq -r '
+    .objects
+    | keys[]
+    | select(
+        endswith(".ogg")
+        and (
+          startswith("minecraft/sounds/block/")
+          or startswith("minecraft/sounds/random/")
+          or startswith("minecraft/sounds/dig/")
+          or startswith("minecraft/sounds/step/")
+          or startswith("minecraft/sounds/mob/")
+          or startswith("minecraft/sounds/entity/")
+          or startswith("minecraft/sounds/item/")
+          or startswith("minecraft/sounds/damage/")
+          or startswith("minecraft/sounds/liquid/")
+          or startswith("minecraft/sounds/fire/")
+          or startswith("minecraft/sounds/portal/")
+          or startswith("minecraft/sounds/minecart/")
+          or startswith("minecraft/sounds/enchant/")
+          or startswith("minecraft/sounds/fireworks/")
+          or startswith("minecraft/sounds/event/")
+          or startswith("minecraft/sounds/note/")
+          or startswith("minecraft/sounds/tile/")
+        )
+      )
+  ' "$asset_index"
+)
+download_sound_asset() {
+  local logical_path="$1"
+  local hash
   hash="$(jq -er --arg path "$logical_path" '.objects[$path].hash' "$asset_index")"
   download_verified \
     "https://resources.download.minecraft.net/${hash:0:2}/$hash" \
     "$hash" \
     "$assets/objects/${hash:0:2}/$hash"
-done
+}
+export asset_index assets
+export -f download_verified download_sound_asset
+printf '%s\n' "${browser_sound_metadata_assets[@]}" "${browser_sound_assets[@]}" |
+  xargs -n 1 -P "${GAIUS_FETCH_PARALLEL:-16}" bash -c 'download_sound_asset "$0"'
 
 echo "Fetched and verified:"
 echo "  client:   $work/client-obfuscated.jar"

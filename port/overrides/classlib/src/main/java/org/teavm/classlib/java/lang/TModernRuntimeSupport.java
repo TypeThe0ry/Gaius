@@ -5,6 +5,7 @@ import java.time.Duration;
 import org.teavm.classlib.java.util.TCollections;
 import org.teavm.classlib.java.util.TMap;
 import org.teavm.classlib.java.lang.reflect.TType;
+import org.teavm.jso.JSBody;
 
 public final class TModernRuntimeSupport {
     private TModernRuntimeSupport() {
@@ -54,13 +55,15 @@ public final class TModernRuntimeSupport {
         return result;
     }
 
-    public static float fma(float left, float right, float addend) {
-        return (float) ((double) left * right + addend);
-    }
+    @JSBody(
+            params = {"left", "right", "addend"},
+            script = "return Math.fround(left * right + addend);")
+    public static native float fma(float left, float right, float addend);
 
-    public static double fma(double left, double right, double addend) {
-        return left * right + addend;
-    }
+    @JSBody(
+            params = {"left", "right", "addend"},
+            script = "return left * right + addend;")
+    public static native double fma(double left, double right, double addend);
 
     public static long maxMemory(TRuntime runtime) {
         // Conservative heap budget used by vanilla render-buffer sizing.

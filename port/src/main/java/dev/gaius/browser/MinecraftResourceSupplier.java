@@ -27,9 +27,12 @@ public final class MinecraftResourceSupplier implements ResourceSupplier {
                 return FALLBACK_RESOURCES.clone();
             }
             String text = new String(input.readAllBytes(), StandardCharsets.UTF_8);
-            return Arrays.stream((RESOURCE_LIST.substring(1) + "\n" + text).split("\\R"))
+            String requiredResources = String.join("\n", FALLBACK_RESOURCES);
+            return Arrays.stream((RESOURCE_LIST.substring(1)
+                            + "\n" + requiredResources + "\n" + text).split("\\R"))
                     .map(String::trim)
                     .filter(line -> !line.isEmpty())
+                    .distinct()
                     .toArray(String[]::new);
         } catch (IOException ignored) {
             return FALLBACK_RESOURCES.clone();

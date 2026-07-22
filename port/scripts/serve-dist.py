@@ -19,6 +19,13 @@ from urllib.parse import parse_qs, urlsplit
 
 
 class PrecompressedHandler(SimpleHTTPRequestHandler):
+    def log_message(self, format, *args):  # noqa: A002 - inherited API name
+        try:
+            super().log_message(format, *args)
+        except (AttributeError, BrokenPipeError, OSError, ValueError):
+            # A detached terminal must not turn a live static server into empty HTTP replies.
+            pass
+
     def handle(self):  # noqa: D401 - inherited API hook
         try:
             super().handle()
@@ -71,9 +78,14 @@ class PrecompressedHandler(SimpleHTTPRequestHandler):
         parsed = urlsplit(self.path)
         name = os.path.basename(parsed.path)
         query = parse_qs(parsed.query)
-        if name == "classes.js" and query.get("v"):
+        versioned_assets = {
+            "classes.js",
+            "singleplayer-server.js",
+            "singleplayer-server-worker.js",
+        }
+        if name in versioned_assets and query.get("v"):
             return "public, max-age=31536000, immutable"
-        if name == "classes.js":
+        if name in versioned_assets:
             return "public, max-age=0, must-revalidate"
         return "no-store, no-cache, must-revalidate, max-age=0"
 

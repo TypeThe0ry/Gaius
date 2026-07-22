@@ -173,6 +173,21 @@ java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
 jar --update \
   --file "$text2speech_output" \
   -C "$text2speech_patch_classes" com/mojang/text2speech/Narrator.class
+
+authlib_path="com/mojang/authlib/7.0.61/authlib-7.0.61.jar"
+authlib_output="$overlay_work/libraries/$authlib_path"
+authlib_patch_classes="$overlay_work/library-patches/authlib"
+mkdir -p "$(dirname "$authlib_output")" "$authlib_patch_classes"
+find "$authlib_patch_classes" -type f -delete
+cp "$work/libraries/$authlib_path" "$authlib_output"
+java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
+  dev.gaius.tools.AuthlibBrowserPatcher \
+  "$authlib_output" \
+  "$authlib_patch_classes/com/mojang/authlib/minecraft/client/MinecraftClient.class"
+jar --update \
+  --file "$authlib_output" \
+  -C "$authlib_patch_classes" com/mojang/authlib/minecraft/client/MinecraftClient.class
+
 classlib_patch_classes="$overlay_work/classlib-patches"
 mkdir -p "$classlib_patch_classes"
 find "$classlib_patch_classes" -type f -delete
@@ -188,9 +203,14 @@ java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
   dev.gaius.tools.JomlMemUtilPatcher \
   "$overlay_work/libraries/$joml_path" \
   "$joml_patch_classes/org/joml/MemUtil.class"
+java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
+  dev.gaius.tools.JomlMathPatcher \
+  "$overlay_work/libraries/$joml_path" \
+  "$joml_patch_classes/org/joml/Math.class"
 jar --update \
   --file "$overlay_work/libraries/$joml_path" \
-  -C "$joml_patch_classes" org/joml/MemUtil.class
+  -C "$joml_patch_classes" org/joml/MemUtil.class \
+  -C "$joml_patch_classes" org/joml/Math.class
 
 guava_path="com/google/guava/guava/33.5.0-jre/guava-33.5.0-jre.jar"
 guava_output="$overlay_work/libraries/$guava_path"
@@ -248,7 +268,11 @@ netty_transport_output="$overlay_work/libraries/$netty_transport_path"
 netty_transport_patch_classes="$overlay_work/library-patches/netty-transport"
 mkdir -p "$(dirname "$netty_transport_output")" "$netty_transport_patch_classes"
 find "$netty_transport_patch_classes" -type f -delete
-cp "$work/libraries/$netty_transport_path" "$netty_transport_output"
+build_library_overlay \
+  netty-transport \
+  "$work/libraries/$netty_transport_path" \
+  "$root/port/overrides/libraries/netty-transport/src/main/java" \
+  "$netty_transport_output"
 java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
   dev.gaius.tools.NettyBrowserPatcher \
   "$netty_common_output" \

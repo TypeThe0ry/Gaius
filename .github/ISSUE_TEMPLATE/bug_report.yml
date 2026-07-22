@@ -1,0 +1,61 @@
+name: Bug report
+description: Report a reproducible Gaius client, worker, rendering, audio, or bridge problem.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include account data, access tokens, private server addresses, or bridge URLs with credentials.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Single-player
+        - Multiplayer bridge
+        - Optional Paper plugin
+        - Rendering or materials
+        - Audio
+        - Input or UI
+        - Build or tooling
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      placeholder: Describe the smallest sequence that triggers the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: input
+    id: chrome
+    attributes:
+      label: Chrome version
+      placeholder: "for example, 150.0.7871.125"
+    validations:
+      required: true
+  - type: input
+    id: operating_system
+    attributes:
+      label: Operating system
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs, screenshot, or profiling evidence
+      description: Remove sensitive data before attaching logs.

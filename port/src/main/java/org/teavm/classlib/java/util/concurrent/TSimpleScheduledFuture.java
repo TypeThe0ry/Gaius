@@ -1,10 +1,43 @@
 package org.teavm.classlib.java.util.concurrent;
 
+import org.teavm.platform.Platform;
+
 final class TSimpleScheduledFuture<V> extends TCompletableFuture<V>
         implements TScheduledFuture<V> {
+    private long deadlineMillis;
+    private int scheduleId = -1;
+
+    void setDeadlineMillis(long deadlineMillis) {
+        this.deadlineMillis = deadlineMillis;
+    }
+
+    void setScheduleId(int scheduleId) {
+        this.scheduleId = scheduleId;
+    }
+
+    void clearScheduleId() {
+        scheduleId = -1;
+    }
+
+    long remainingMillis() {
+        return Math.max(0L, deadlineMillis - System.currentTimeMillis());
+    }
+
     @Override
     public long getDelay(TTimeUnit unit) {
-        return 0;
+        return unit.convert(remainingMillis(), TTimeUnit.MILLISECONDS);
+    }
+
+    @Override
+    public boolean cancel(boolean mayInterruptIfRunning) {
+        if (!super.cancel(mayInterruptIfRunning)) {
+            return false;
+        }
+        if (scheduleId >= 0) {
+            Platform.killSchedule(scheduleId);
+            scheduleId = -1;
+        }
+        return true;
     }
 
     @Override

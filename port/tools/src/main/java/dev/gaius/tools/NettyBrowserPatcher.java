@@ -63,6 +63,10 @@ public final class NettyBrowserPatcher {
                 bufferRoot.resolve("io/netty/buffer/AdaptiveByteBufAllocator.class"));
         patchChannelInitializer(Path.of(args[2]),
                 transportRoot.resolve("io/netty/channel/ChannelInitializer.class"));
+        patchAbstractChannelUnsafe(Path.of(args[2]),
+                transportRoot.resolve("io/netty/channel/AbstractChannel$AbstractUnsafe.class"));
+        patchBootstrap(Path.of(args[2]),
+                transportRoot.resolve("io/netty/bootstrap/Bootstrap.class"));
         patchReflectiveChannelFactory(Path.of(args[2]),
                 transportRoot.resolve("io/netty/channel/ReflectiveChannelFactory.class"));
         patchDefaultChannelId(Path.of(args[2]),
@@ -256,6 +260,89 @@ public final class NettyBrowserPatcher {
         write(node, output);
     }
 
+    private static void patchAbstractChannelUnsafe(Path jar, Path output) throws IOException {
+        ClassNode node = read(jar, "io/netty/channel/AbstractChannel$AbstractUnsafe.class");
+        MethodNode register = find(node, "register",
+                "(Lio/netty/channel/EventLoop;Lio/netty/channel/ChannelPromise;)V");
+        InsnList selectEventLoop = new InsnList();
+        selectEventLoop.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+        selectEventLoop.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "io/netty/channel/AbstractChannel$AbstractUnsafe",
+                "this$0",
+                "Lio/netty/channel/AbstractChannel;"));
+        selectEventLoop.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 1));
+        selectEventLoop.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "io/netty/channel/browser/BrowserWebSocketChannel",
+                "eventLoopFor",
+                "(Lio/netty/channel/Channel;Lio/netty/channel/EventLoop;)"
+                        + "Lio/netty/channel/EventLoop;",
+                false));
+        selectEventLoop.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ASTORE, 1));
+        register.instructions.insert(selectEventLoop);
+        boolean replaced = false;
+        for (org.objectweb.asm.tree.AbstractInsnNode instruction
+                : register.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals("io/netty/channel/EventLoop")
+                    && call.name.equals("inEventLoop")
+                    && call.desc.equals("()Z")) {
+                register.instructions.insertBefore(call, new org.objectweb.asm.tree.VarInsnNode(
+                        Opcodes.ALOAD, 0));
+                register.instructions.insertBefore(call, new FieldInsnNode(
+                        Opcodes.GETFIELD,
+                        "io/netty/channel/AbstractChannel$AbstractUnsafe",
+                        "this$0",
+                        "Lio/netty/channel/AbstractChannel;"));
+                register.instructions.set(call, new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "io/netty/channel/browser/BrowserWebSocketChannel",
+                        "shouldRegisterInline",
+                        "(Lio/netty/channel/EventLoop;Lio/netty/channel/Channel;)Z",
+                        false));
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) {
+            throw new IllegalStateException("AbstractChannel.AbstractUnsafe.register event-loop check was not found");
+        }
+        write(node, output);
+    }
+
+    private static void patchBootstrap(Path jar, Path output) throws IOException {
+        ClassNode node = read(jar, "io/netty/bootstrap/Bootstrap.class");
+        MethodNode connect = find(node, "doConnect",
+                "(Ljava/net/SocketAddress;Ljava/net/SocketAddress;"
+                        + "Lio/netty/channel/ChannelPromise;)V");
+        LabelNode useEventLoop = new LabelNode();
+        InsnList inline = new InsnList();
+        inline.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 2));
+        inline.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "io/netty/channel/ChannelPromise",
+                "channel",
+                "()Lio/netty/channel/Channel;",
+                true));
+        inline.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+        inline.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 1));
+        inline.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 2));
+        inline.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "io/netty/channel/browser/BrowserWebSocketChannel",
+                "connectInline",
+                "(Lio/netty/channel/Channel;Ljava/net/SocketAddress;"
+                        + "Ljava/net/SocketAddress;Lio/netty/channel/ChannelPromise;)Z",
+                false));
+        inline.add(new JumpInsnNode(Opcodes.IFEQ, useEventLoop));
+        inline.add(new InsnNode(Opcodes.RETURN));
+        inline.add(useEventLoop);
+        connect.instructions.insert(inline);
+        write(node, output);
+    }
+
     private static void patchReflectiveChannelFactory(Path jar, Path output) throws IOException {
         String owner = "io/netty/channel/ReflectiveChannelFactory";
         ClassNode node = read(jar, owner + ".class");
@@ -270,6 +357,7 @@ public final class NettyBrowserPatcher {
         }
 
         MethodNode constructor = find(node, "<init>", "(Ljava/lang/Class;)V");
+        LabelNode notBrowserChannel = new LabelNode();
         LabelNode notLocalServer = new LabelNode();
         LabelNode notLocalChannel = new LabelNode();
         InsnList init = new InsnList();
@@ -287,6 +375,17 @@ public final class NettyBrowserPatcher {
         init.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
         init.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 1));
         init.add(new FieldInsnNode(Opcodes.PUTFIELD, owner, "clazz", "Ljava/lang/Class;"));
+
+        init.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 1));
+        init.add(new LdcInsnNode(org.objectweb.asm.Type.getObjectType(
+                "io/netty/channel/browser/BrowserWebSocketChannel")));
+        init.add(new JumpInsnNode(Opcodes.IF_ACMPNE, notBrowserChannel));
+        init.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+        init.add(new InsnNode(Opcodes.ACONST_NULL));
+        init.add(new FieldInsnNode(Opcodes.PUTFIELD, owner, "constructor",
+                "Ljava/lang/reflect/Constructor;"));
+        init.add(new InsnNode(Opcodes.RETURN));
+        init.add(notBrowserChannel);
 
         init.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 1));
         init.add(new LdcInsnNode(org.objectweb.asm.Type.getObjectType(
@@ -325,9 +424,19 @@ public final class NettyBrowserPatcher {
         replace(constructor, init);
 
         MethodNode newChannel = find(node, "newChannel", "()Lio/netty/channel/Channel;");
+        LabelNode notNewBrowserChannel = new LabelNode();
         LabelNode notNewLocalServer = new LabelNode();
         LabelNode notNewLocalChannel = new LabelNode();
         InsnList create = new InsnList();
+        create.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+        create.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "clazz", "Ljava/lang/Class;"));
+        create.add(new LdcInsnNode(org.objectweb.asm.Type.getObjectType(
+                "io/netty/channel/browser/BrowserWebSocketChannel")));
+        create.add(new JumpInsnNode(Opcodes.IF_ACMPNE, notNewBrowserChannel));
+        putNew(create, "io/netty/channel/browser/BrowserWebSocketChannel");
+        create.add(new InsnNode(Opcodes.ARETURN));
+        create.add(notNewBrowserChannel);
+
         create.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
         create.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "clazz", "Ljava/lang/Class;"));
         create.add(new LdcInsnNode(org.objectweb.asm.Type.getObjectType(

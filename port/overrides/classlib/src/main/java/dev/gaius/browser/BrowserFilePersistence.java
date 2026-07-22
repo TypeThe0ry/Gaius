@@ -4,8 +4,6 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Base64;
-import java.util.LinkedHashMap;
-import java.util.Map;
 import org.teavm.jso.JSBody;
 import org.teavm.runtime.fs.VirtualFile;
 import org.teavm.runtime.fs.VirtualFileAccessor;
@@ -16,7 +14,7 @@ import org.teavm.runtime.fs.VirtualFileSystemProvider;
  *
  * <p>The Java side must stay synchronous because it sits behind {@code java.io}
  * and {@code java.nio}. The page preloads IndexedDB into
- * {@code window.__gaiusPersistentFiles} before invoking Minecraft, then these
+ * {@code globalThis.__gaiusPersistentFiles} before invoking Minecraft, then these
  * methods synchronously read/write that mirror and enqueue durable IndexedDB
  * writes from JavaScript.</p>
  */
@@ -26,8 +24,8 @@ public final class BrowserFilePersistence {
     private static final String DEFAULT_BROWSER_OPTIONS = String.join("\n",
             "autoJump:false",
             "operatorItemsTab:true",
-            "renderDistance:2",
-            "simulationDistance:5",
+            "renderDistance:6",
+            "simulationDistance:4",
             "entityDistanceScaling:0.5",
             "maxFps:120",
             "graphicsPreset:\"fast\"",
@@ -58,41 +56,6 @@ public final class BrowserFilePersistence {
             "hideSplashTexts:true",
             "showAutosaveIndicator:false",
             "skipMultiplayerWarning:true") + "\n";
-    private static final Map<String, String> BROWSER_PERFORMANCE_OPTIONS = Map.ofEntries(
-            Map.entry("autoJump", "false"),
-            Map.entry("operatorItemsTab", "true"),
-            Map.entry("renderDistance", "2"),
-            Map.entry("simulationDistance", "5"),
-            Map.entry("entityDistanceScaling", "0.5"),
-            Map.entry("maxFps", "120"),
-            Map.entry("graphicsPreset", "\"fast\""),
-            Map.entry("renderClouds", "\"false\""),
-            Map.entry("cloudRange", "32"),
-            Map.entry("ao", "false"),
-            Map.entry("cutoutLeaves", "false"),
-            Map.entry("vignette", "false"),
-            Map.entry("improvedTransparency", "false"),
-            Map.entry("weatherRadius", "0"),
-            Map.entry("chunkSectionFadeInTime", "0.0"),
-            Map.entry("prioritizeChunkUpdates", "0"),
-            Map.entry("mipmapLevels", "0"),
-            Map.entry("maxAnisotropyBit", "1"),
-            Map.entry("textureFiltering", "0"),
-            Map.entry("biomeBlendRadius", "0"),
-            Map.entry("particles", "2"),
-            Map.entry("enableVsync", "false"),
-            Map.entry("entityShadows", "false"),
-            Map.entry("bobView", "false"),
-            Map.entry("menuBackgroundBlurriness", "0"),
-            Map.entry("panoramaSpeed", "0.0"),
-            Map.entry("screenEffectScale", "0.0"),
-            Map.entry("fovEffectScale", "0.0"),
-            Map.entry("darknessEffectScale", "0.0"),
-            Map.entry("pauseOnLostFocus", "false"),
-            Map.entry("darkMojangStudiosBackground", "false"),
-            Map.entry("hideSplashTexts", "true"),
-            Map.entry("showAutosaveIndicator", "false"),
-            Map.entry("skipMultiplayerWarning", "true"));
     private static boolean mounted;
 
     private BrowserFilePersistence() {
@@ -228,6 +191,7 @@ public final class BrowserFilePersistence {
         return normalized.contains("/saves/")
                 || normalized.endsWith("/options.txt")
                 || normalized.endsWith("/servers.dat")
+                || normalized.endsWith("/servers.dat_old")
                 || normalized.endsWith("/optionsof.txt")
                 || normalized.endsWith("/optionsshaders.txt");
     }
@@ -237,57 +201,11 @@ public final class BrowserFilePersistence {
             VirtualFileSystem fileSystem = VirtualFileSystemProvider.getInstance();
             VirtualFile existing = fileSystem.getFile(OPTIONS_PATH);
             if (existing != null && existing.isFile()) {
-                enforcePerformanceOptions(existing);
                 return;
             }
-            writeDefaultOptions("browser low settings");
+            writeDefaultOptions("browser defaults");
         } catch (Throwable exception) {
             report("storage-default-options-failed", describe(exception));
-        }
-    }
-
-    private static void enforcePerformanceOptions(VirtualFile file) {
-        try {
-            VirtualFileAccessor accessor = file.createAccessor(true, false, false);
-            if (accessor == null) {
-                report("storage-options-performance-failed", "open failed");
-                return;
-            }
-            byte[] bytes;
-            try {
-                int size = accessor.size();
-                bytes = new byte[size];
-                accessor.seek(0);
-                int offset = 0;
-                while (offset < size) {
-                    int read = accessor.read(bytes, offset, size - offset);
-                    if (read <= 0) {
-                        break;
-                    }
-                    offset += read;
-                }
-                if (offset < size) {
-                    bytes = Arrays.copyOf(bytes, offset);
-                }
-            } finally {
-                accessor.close();
-            }
-
-            String original = new String(bytes, StandardCharsets.UTF_8);
-            String normalized = upsertOptions(original, BROWSER_PERFORMANCE_OPTIONS);
-            if (!normalized.equals(original)) {
-                byte[] updated = normalized.getBytes(StandardCharsets.UTF_8);
-                writeVirtualFile(OPTIONS_PATH, updated);
-                persist(OPTIONS_PATH, updated);
-                report("storage-options-performance", "browser 120fps profile");
-            }
-        } catch (Throwable exception) {
-            report("storage-options-performance-failed", describe(exception));
-            try {
-                writeDefaultOptions("browser low settings after migration failure");
-            } catch (Throwable fallback) {
-                report("storage-default-options-failed", describe(fallback));
-            }
         }
     }
 
@@ -305,31 +223,6 @@ public final class BrowserFilePersistence {
         String message = exception.getMessage();
         String name = exception.getClass().getName();
         return message == null || message.isEmpty() ? name : name + ": " + message;
-    }
-
-    private static String upsertOptions(String content, Map<String, String> forced) {
-        LinkedHashMap<String, String> options = new LinkedHashMap<>();
-        if (content != null && !content.isEmpty()) {
-            String[] lines = content.split("\\R", -1);
-            for (String line : lines) {
-                if (line == null || line.isEmpty()) {
-                    continue;
-                }
-                int colon = line.indexOf(':');
-                if (colon <= 0) {
-                    continue;
-                }
-                options.put(line.substring(0, colon), line.substring(colon + 1));
-            }
-        }
-        for (Map.Entry<String, String> entry : forced.entrySet()) {
-            options.put(entry.getKey(), entry.getValue());
-        }
-        StringBuilder result = new StringBuilder(Math.max(256, options.size() * 24));
-        for (Map.Entry<String, String> entry : options.entrySet()) {
-            result.append(entry.getKey()).append(':').append(entry.getValue()).append('\n');
-        }
-        return result.toString();
     }
 
     private static void writeVirtualFile(String path, byte[] bytes) throws IOException {
@@ -397,10 +290,10 @@ public final class BrowserFilePersistence {
 
     @JSBody(params = {"prefix"}, script = """
             try {
-              var files=window.__gaiusPersistentFiles;
+              var files=globalThis.__gaiusPersistentFiles;
               if (files) return Object.keys(files);
               var result=[];
-              var storage=window.localStorage;
+              var storage=globalThis.localStorage;
               if (!storage) return result;
               for (var i=0;i<storage.length;i++) {
                 var key=storage.key(i);
@@ -416,12 +309,12 @@ public final class BrowserFilePersistence {
     @JSBody(params = {"key"}, script = """
             try {
               var prefix='gaius.fs.v1:';
-              var files=window.__gaiusPersistentFiles;
+              var files=globalThis.__gaiusPersistentFiles;
               if (files && key && key.indexOf(prefix)===0) {
                 var path=key.substring(prefix.length);
                 return Object.prototype.hasOwnProperty.call(files,path) ? files[path] : null;
               }
-              return window.localStorage ? window.localStorage.getItem(key) : null;
+              return globalThis.localStorage ? globalThis.localStorage.getItem(key) : null;
             } catch (e) {
               return null;
             }
@@ -431,11 +324,11 @@ public final class BrowserFilePersistence {
     @JSBody(params = {"key", "value"}, script = """
             try {
               var prefix='gaius.fs.v1:';
-              if (key && key.indexOf(prefix)===0 && window.__gaiusFsPut) {
-                return !!window.__gaiusFsPut(key.substring(prefix.length), value);
+              if (key && key.indexOf(prefix)===0 && globalThis.__gaiusFsPut) {
+                return !!globalThis.__gaiusFsPut(key.substring(prefix.length), value);
               }
-              if (!window.localStorage) return false;
-              window.localStorage.setItem(key,value);
+              if (!globalThis.localStorage) return false;
+              globalThis.localStorage.setItem(key,value);
               return true;
             } catch (e) {
               return false;
@@ -446,20 +339,20 @@ public final class BrowserFilePersistence {
     @JSBody(params = {"key"}, script = """
             try {
               var prefix='gaius.fs.v1:';
-              if (key && key.indexOf(prefix)===0 && window.__gaiusFsDelete) {
-                window.__gaiusFsDelete(key.substring(prefix.length));
+              if (key && key.indexOf(prefix)===0 && globalThis.__gaiusFsDelete) {
+                globalThis.__gaiusFsDelete(key.substring(prefix.length));
                 return;
               }
-              if (window.localStorage) window.localStorage.removeItem(key);
+              if (globalThis.localStorage) globalThis.localStorage.removeItem(key);
             } catch (e) {}
             """)
     private static native void removeItem(String key);
 
     @JSBody(script = """
-            if (window.__gaiusFsBackend) return String(window.__gaiusFsBackend);
-            if (window.__gaiusPersistentFiles) return 'memory';
+            if (globalThis.__gaiusFsBackend) return String(globalThis.__gaiusFsBackend);
+            if (globalThis.__gaiusPersistentFiles) return 'memory';
             try {
-              return window.localStorage ? 'localStorage' : 'none';
+              return globalThis.localStorage ? 'localStorage' : 'none';
             } catch (e) {
               return 'none';
             }
@@ -468,10 +361,10 @@ public final class BrowserFilePersistence {
 
     @JSBody(params = {"event", "detail"}, script = """
             try {
-              var counters=window.__gaiusMinecraftCounters || (window.__gaiusMinecraftCounters={});
+              var counters=globalThis.__gaiusMinecraftCounters || (globalThis.__gaiusMinecraftCounters={});
               var key='storage:'+event+':'+detail;
               counters[key]=(counters[key]||0)+1;
-              var events=window.__gaiusMinecraftEvents || (window.__gaiusMinecraftEvents=[]);
+              var events=globalThis.__gaiusMinecraftEvents || (globalThis.__gaiusMinecraftEvents=[]);
               events.push({event:'storage:'+event,detail:detail,count:counters[key],at:Date.now()});
               if (events.length>500) events.splice(0,events.length-500);
             } catch (e) {}

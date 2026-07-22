@@ -80,6 +80,31 @@ bootstrap target is not a fake game screen: it is the real
 `net.minecraft.client.main.Main`, stopped only by explicit unsupported platform
 calls so each missing subsystem can be replaced in order.
 
+## Runtime architecture
+
+The release client is served from `port/web/dist/`. Single-player launches the
+official server entry point in `singleplayer-server-worker.js`; the client and
+server communicate through a paired `MessageChannel`, while IndexedDB persists
+world data between Worker sessions.
+
+`build-teavm-release.sh` also writes a self-contained `Gaius.html`. The portable
+file reconstructs the compressed client and Wasm as browser-local Blob URLs and
+passes the compressed official server payload into its Worker. Single-player
+therefore remains frontend-only and works without a hosted Gaius service.
+
+External Java servers remain unmodified. `apps/bridge/dist/main.js` is a raw,
+backpressured WebSocket-to-TCP tunnel with SRV resolution and constrained HTTP
+proxies for Mojang authentication, skins, Realms, and resource packs. The
+online-mode smoke starts an official plugin-free `server.jar`, performs the
+RSA/AES session handshake against a controlled session fixture, and requires
+PLAY plus real chunk packets before passing.
+
+Remote connection order is: optional same-host Paper plugin, configured relay
+nodes, then the default relay. Every status ping or join is an isolated,
+short-lived tunnel. The browser accepts repeated `bridge` query parameters,
+`globalThis.__gaiusBridgeUrls`, or the `gaius.bridgeNodes` local-storage JSON
+array, allowing relay capacity to be contributed independently of the client.
+
 ## Reference artifact
 
 The root `eag26-single(2).html` proves that a more advanced 26.1.2 platform layer

@@ -4,6 +4,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import org.teavm.classlib.java.lang.TRunnable;
+import org.teavm.platform.Platform;
 
 public class TScheduledThreadPoolExecutor extends TAbstractExecutorService
         implements TScheduledExecutorService {
@@ -43,15 +44,58 @@ public class TScheduledThreadPoolExecutor extends TAbstractExecutorService
     @Override
     public <V> TScheduledFuture<V> schedule(
             TCallable<V> callable, long delay, TTimeUnit unit) {
+        if (shutdown) {
+            throw new IllegalStateException("executor is shut down");
+        }
         TSimpleScheduledFuture<V> future = new TSimpleScheduledFuture<>();
-        execute(() -> {
-            try {
-                future.complete(callable.call());
-            } catch (Throwable failure) {
-                future.completeExceptionally(failure);
-            }
-        });
+        long delayMillis = unit.toMillis(Math.max(0L, delay));
+        if (delay > 0L && delayMillis == 0L) {
+            delayMillis = 1L;
+        }
+        long now = System.currentTimeMillis();
+        long deadline = delayMillis > Long.MAX_VALUE - now
+                ? Long.MAX_VALUE
+                : now + delayMillis;
+        future.setDeadlineMillis(deadline);
+        scheduleChunk(future, callable, delayMillis);
         return future;
+    }
+
+    private <V> void scheduleChunk(
+            TSimpleScheduledFuture<V> future,
+            TCallable<V> callable,
+            long remainingMillis) {
+        if (remainingMillis <= 0L) {
+            runScheduled(future, callable);
+            return;
+        }
+        int chunkMillis = (int) Math.min(remainingMillis, Integer.MAX_VALUE);
+        int scheduleId = Platform.schedule(() -> {
+            future.clearScheduleId();
+            if (future.isCancelled()) {
+                return;
+            }
+            long remaining = future.remainingMillis();
+            if (remaining > 0L) {
+                scheduleChunk(future, callable, remaining);
+            } else {
+                runScheduled(future, callable);
+            }
+        }, chunkMillis);
+        future.setScheduleId(scheduleId);
+    }
+
+    private <V> void runScheduled(
+            TSimpleScheduledFuture<V> future,
+            TCallable<V> callable) {
+        if (future.isCancelled()) {
+            return;
+        }
+        try {
+            future.complete(callable.call());
+        } catch (Throwable failure) {
+            future.completeExceptionally(failure);
+        }
     }
 
     @Override

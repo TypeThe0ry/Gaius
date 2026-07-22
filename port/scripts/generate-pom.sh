@@ -12,6 +12,8 @@ output="${GAIUS_POM:-$root/port/target/generated-pom.xml}"
 main_class="${GAIUS_MAIN_CLASS:-net.minecraft.client.main.Main}"
 target_directory="${GAIUS_TARGET_DIRECTORY:-$root/port/web/dist}"
 target_file="${GAIUS_TARGET_FILE:-classes.js}"
+maven_directory="${GAIUS_MAVEN_DIRECTORY:-$root/port/target/maven}"
+resource_directory="${GAIUS_RESOURCE_DIRECTORY:-$root/port/target/generated-resources}"
 patched_classlib="$root/port/work/overlays/teavm-classlib-$teavm_version-gaius.jar"
 optimization_level="${GAIUS_TEA_OPTIMIZATION_LEVEL:-SIMPLE}"
 source_maps_generated="${GAIUS_SOURCE_MAPS:-true}"
@@ -19,6 +21,13 @@ debug_information_generated="${GAIUS_DEBUG_INFO:-true}"
 minifying="${GAIUS_MINIFYING:-false}"
 short_file_names="${GAIUS_SHORT_FILE_NAMES:-false}"
 assertions_removed="${GAIUS_ASSERTIONS_REMOVED:-false}"
+excluded_library_prefixes="${GAIUS_EXCLUDED_LIBRARY_PREFIXES:-}"
+if [[ -n "$excluded_library_prefixes" ]]; then
+  IFS=',' read -r -a excluded_library_prefix_list <<<"$excluded_library_prefixes"
+else
+  # macOS Bash 3 treats expansion of an empty array as an unbound variable under set -u.
+  excluded_library_prefix_list=("")
+fi
 
 case "$optimization_level" in
   SIMPLE|ADVANCED|FULL) ;;
@@ -46,7 +55,7 @@ if [[ ! -f "$metadata" || ! -f "$client" || ! -f "$patched_classlib" ]]; then
 fi
 
 mkdir -p "$(dirname "$output")" "$root/port/src/main/java" \
-  "$root/port/web/dist"
+  "$target_directory" "$maven_directory"
 
 {
   cat <<EOF
@@ -144,6 +153,11 @@ EOF
       | .downloads.artifact.path
     ' "$metadata" |
       while IFS= read -r path; do
+        for excluded_prefix in "${excluded_library_prefix_list[@]}"; do
+          if [[ -n "$excluded_prefix" && "$path" == "$excluded_prefix"* ]]; then
+            continue 2
+          fi
+        done
         if [[ "$path" == ca/weblite/java-objc-bridge/* ||
               "$path" == net/java/dev/jna/jna/* ||
               "$path" == net/java/dev/jna/jna-platform/* ]]; then
@@ -168,10 +182,10 @@ EOF
         <directory>$root/port/src/main/resources</directory>
       </resource>
       <resource>
-        <directory>$root/port/target/generated-resources</directory>
+        <directory>$resource_directory</directory>
       </resource>
     </resources>
-    <directory>$root/port/target/maven</directory>
+    <directory>$maven_directory</directory>
     <plugins>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>

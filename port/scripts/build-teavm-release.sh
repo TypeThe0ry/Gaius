@@ -14,6 +14,13 @@ rm -f "$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}.map" \
   "$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}.teavmdbg"
 
 "$root/port/scripts/build-teavm.sh"
+if [[ "${GAIUS_SKIP_SERVER_WORKER:-false}" != "true" ]]; then
+  GAIUS_SKIP_OVERLAY_BUILD=true GAIUS_SKIP_COMPRESSION=true \
+    "$root/port/scripts/build-teavm-server-worker.sh"
+fi
+"$root/port/scripts/postprocess-index-html.py" \
+  "$root/port/web/dist/index.html" \
+  "$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}"
 if [[ "${GAIUS_SKIP_WASM_HOTPATH:-false}" != "true" ]]; then
   if ! "$root/port/scripts/build-wasm-hotpath.sh"; then
     if [[ "${GAIUS_REQUIRE_WASM_HOTPATH:-false}" == "true" ]]; then
@@ -25,3 +32,5 @@ fi
 rm -f "$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}.map" \
   "$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}.teavmdbg"
 "$root/port/scripts/compress-dist.sh"
+"$root/port/scripts/build-portable-html.py"
+GAIUS_COMPRESS_FILES=Gaius.html "$root/port/scripts/compress-dist.sh"

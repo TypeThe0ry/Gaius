@@ -56,7 +56,30 @@ public class TFileOutputStream extends OutputStream {
         if (accessor == null) {
             throw new FileNotFoundException();
         }
+        if (!append) {
+            try {
+                truncateIfRequested(accessor, true);
+            } catch (IOException exception) {
+                try {
+                    accessor.close();
+                } catch (IOException ignored) {
+                    // Preserve the truncation failure as the useful cause.
+                }
+                accessor = null;
+                FileNotFoundException failure =
+                        new FileNotFoundException("Could not truncate file");
+                failure.initCause(exception);
+                throw failure;
+            }
+        }
         path = file.getAbsolutePath();
+    }
+
+    public static void truncateIfRequested(VirtualFileAccessor accessor, boolean truncate) throws IOException {
+        if (truncate) {
+            accessor.resize(0);
+            accessor.seek(0);
+        }
     }
 
     public TFileOutputStream(VirtualFileAccessor accessor) {

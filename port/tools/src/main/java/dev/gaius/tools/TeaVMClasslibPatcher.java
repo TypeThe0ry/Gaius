@@ -330,6 +330,7 @@ public final class TeaVMClasslibPatcher {
         }
         patchThrowableGetSuppressed(jar, root);
         patchDefaultFileSystemProviderOutputStream(jar, root);
+        patchZipFileRawInflaterPadding(jar, root);
     }
 
     private static void patchDefaultFileSystemProviderOutputStream(String jarPath, Path root) throws IOException {
@@ -364,6 +365,21 @@ public final class TeaVMClasslibPatcher {
                     "TDefaultFileSystemProvider.newOutputStream defaultPath local was not found");
         }
 
+        int truncateLocal = 6;
+        boolean truncateLocalUsed = false;
+        for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+            if (insn instanceof VarInsnNode varInsn
+                    && varInsn.getOpcode() == Opcodes.ILOAD
+                    && varInsn.var == truncateLocal) {
+                truncateLocalUsed = true;
+                break;
+            }
+        }
+        if (!truncateLocalUsed) {
+            throw new IllegalStateException(
+                    "TDefaultFileSystemProvider.newOutputStream truncate local was not found");
+        }
+
         boolean patched = false;
         for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
             if (!(insn instanceof MethodInsnNode call)
@@ -381,6 +397,26 @@ public final class TeaVMClasslibPatcher {
                 throw new IllegalStateException(
                         "TDefaultFileSystemProvider.newOutputStream TFileOutputStream accessor load was not found");
             }
+            AbstractInsnNode duplicate = previousExecutable(accessorLoad);
+            AbstractInsnNode streamAllocation = previousExecutable(duplicate);
+            if (duplicate == null
+                    || duplicate.getOpcode() != Opcodes.DUP
+                    || !(streamAllocation instanceof TypeInsnNode allocation)
+                    || allocation.getOpcode() != Opcodes.NEW
+                    || !allocation.desc.equals("org/teavm/classlib/java/io/TFileOutputStream")) {
+                throw new IllegalStateException(
+                        "TDefaultFileSystemProvider.newOutputStream TFileOutputStream allocation was not found");
+            }
+            InsnList truncateCall = new InsnList();
+            truncateCall.add(new VarInsnNode(Opcodes.ALOAD, varInsn.var));
+            truncateCall.add(new VarInsnNode(Opcodes.ILOAD, truncateLocal));
+            truncateCall.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "org/teavm/classlib/java/io/TFileOutputStream",
+                    "truncateIfRequested",
+                    "(Lorg/teavm/runtime/fs/VirtualFileAccessor;Z)V",
+                    false));
+            method.instructions.insertBefore(streamAllocation, truncateCall);
             InsnList pathLoad = new InsnList();
             pathLoad.add(new VarInsnNode(Opcodes.ALOAD, defaultPathLocal));
             pathLoad.add(new FieldInsnNode(
@@ -400,6 +436,65 @@ public final class TeaVMClasslibPatcher {
         patchDefaultFileSystemProviderDelete(node, defaultPathClass);
         patchDefaultFileSystemProviderCopy(node, defaultPathClass);
         patchDefaultFileSystemProviderMove(node, defaultPathClass);
+        writeClass(root, className, node);
+    }
+
+    private static AbstractInsnNode previousExecutable(AbstractInsnNode insn) {
+        AbstractInsnNode previous = insn == null ? null : insn.getPrevious();
+        while (previous != null && previous.getOpcode() < 0) {
+            previous = previous.getPrevious();
+        }
+        return previous;
+    }
+
+    private static AbstractInsnNode nextExecutable(AbstractInsnNode insn) {
+        AbstractInsnNode next = insn == null ? null : insn.getNext();
+        while (next != null && next.getOpcode() < 0) {
+            next = next.getNext();
+        }
+        return next;
+    }
+
+    private static void patchZipFileRawInflaterPadding(String jarPath, Path root) throws IOException {
+        String className = "org/teavm/classlib/java/util/zip/TZipFile";
+        String streamClass = className + "$RAFStream";
+        ClassNode node = readClass(jarPath, className);
+        MethodNode method = node.methods.stream()
+                .filter(candidate -> candidate.name.equals("getInputStream")
+                        && candidate.desc.equals("(Lorg/teavm/classlib/java/util/zip/TZipEntry;)"
+                                + "Ljava/io/InputStream;"))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("TZipFile.getInputStream was not found"));
+
+        boolean patched = false;
+        for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+            if (!(insn instanceof TypeInsnNode allocation)
+                    || allocation.getOpcode() != Opcodes.NEW
+                    || !allocation.desc.equals(className + "$ZipInflaterInputStream")) {
+                continue;
+            }
+            AbstractInsnNode duplicate = nextExecutable(allocation);
+            AbstractInsnNode streamLoad = nextExecutable(duplicate);
+            if (duplicate == null
+                    || duplicate.getOpcode() != Opcodes.DUP
+                    || !(streamLoad instanceof VarInsnNode varInsn)
+                    || varInsn.getOpcode() != Opcodes.ALOAD) {
+                throw new IllegalStateException("TZipFile.getInputStream RAFStream load was not found");
+            }
+            InsnList padding = new InsnList();
+            padding.add(new VarInsnNode(Opcodes.ALOAD, varInsn.var));
+            padding.add(new VarInsnNode(Opcodes.ALOAD, varInsn.var));
+            padding.add(new FieldInsnNode(Opcodes.GETFIELD, streamClass, "mLength", "J"));
+            padding.add(new InsnNode(Opcodes.LCONST_1));
+            padding.add(new InsnNode(Opcodes.LADD));
+            padding.add(new FieldInsnNode(Opcodes.PUTFIELD, streamClass, "mLength", "J"));
+            method.instructions.insertBefore(allocation, padding);
+            method.maxStack = Math.max(method.maxStack, 5);
+            patched = true;
+        }
+        if (!patched) {
+            throw new IllegalStateException("TZipFile.getInputStream raw inflater allocation was not found");
+        }
         writeClass(root, className, node);
     }
 

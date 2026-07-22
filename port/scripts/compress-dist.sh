@@ -10,13 +10,25 @@ if [[ ! -d "$dist" ]]; then
 fi
 
 shopt -s nullglob
-files=(
-  "$dist"/*.js
-  "$dist"/*.html
-  "$dist"/*.css
-  "$dist"/*.json
-  "$dist"/*.wasm
-)
+if [[ -n "${GAIUS_COMPRESS_FILES:-}" ]]; then
+  IFS=: read -r -a requested_files <<<"$GAIUS_COMPRESS_FILES"
+  files=()
+  for requested_file in "${requested_files[@]}"; do
+    if [[ "$requested_file" == */* || ! -f "$dist/$requested_file" ]]; then
+      echo "Missing or invalid dist asset: $requested_file" >&2
+      exit 1
+    fi
+    files+=("$dist/$requested_file")
+  done
+else
+  files=(
+    "$dist"/*.js
+    "$dist"/*.html
+    "$dist"/*.css
+    "$dist"/*.json
+    "$dist"/*.wasm
+  )
+fi
 
 if [[ "${#files[@]}" -eq 0 ]]; then
   echo "No compressible dist assets found in $dist" >&2

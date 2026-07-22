@@ -1,0 +1,16 @@
+* text=auto eol=lf
+
+*.java text
+*.py text
+*.sh text eol=lf
+*.js text
+*.mjs text
+*.json text
+*.md text
+*.xml text
+*.yml text
+*.yaml text
+
+*.gz binary
+*.jar binary
+*.wasm binary

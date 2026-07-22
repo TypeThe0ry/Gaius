@@ -20,35 +20,55 @@ jar tf "$root/port/work/overlays/libraries/com/ibm/icu/icu4j/77.1/icu4j-77.1.jar
 rm -rf "$generated_assets/minecraft/sounds" "$generated_assets/minecraft/sounds.json"
 asset_index_id="$(jq -er '.assetIndex.id // .assets' "$work/version.json" 2>/dev/null || true)"
 asset_index="$work/assets/indexes/$asset_index_id.json"
-browser_sound_assets=(
-  "minecraft/sounds/random/click.ogg"
-  "minecraft/sounds/random/click_stereo.ogg"
-  "minecraft/sounds/random/wood_click.ogg"
-  "minecraft/sounds/random/levelup.ogg"
-  "minecraft/sounds/random/orb.ogg"
-  "minecraft/sounds/ui/toast/in.ogg"
-  "minecraft/sounds/ui/toast/out.ogg"
-  "minecraft/sounds/ui/toast/challenge_complete.ogg"
-  "minecraft/sounds/ui/stonecutter/cut1.ogg"
-  "minecraft/sounds/ui/stonecutter/cut2.ogg"
-  "minecraft/sounds/dig/grass1.ogg"
-  "minecraft/sounds/dig/grass2.ogg"
-  "minecraft/sounds/dig/grass3.ogg"
-  "minecraft/sounds/dig/grass4.ogg"
-  "minecraft/sounds/step/grass1.ogg"
-  "minecraft/sounds/step/grass2.ogg"
-  "minecraft/sounds/step/grass3.ogg"
-  "minecraft/sounds/step/grass4.ogg"
-  "minecraft/sounds/step/grass5.ogg"
-  "minecraft/sounds/step/grass6.ogg"
-)
 copied_sound_assets=0
 if [[ -n "$asset_index_id" && -f "$asset_index" ]]; then
+  browser_sound_manifest="$root/port/target/browser-sound-assets.tsv"
+  jq -r '
+    .objects
+    | to_entries[]
+    | select(
+        .key as $path
+        | ($path == "minecraft/sounds/ui/toast/in.ogg")
+          or ($path == "minecraft/sounds/ui/toast/out.ogg")
+          or ($path == "minecraft/sounds/ui/toast/challenge_complete.ogg")
+          or ($path == "minecraft/sounds/ui/stonecutter/cut1.ogg")
+          or ($path == "minecraft/sounds/ui/stonecutter/cut2.ogg")
+          or (
+            ($path | endswith(".ogg"))
+            and (
+              ($path | startswith("minecraft/sounds/block/"))
+              or ($path | startswith("minecraft/sounds/random/"))
+              or ($path | startswith("minecraft/sounds/dig/"))
+              or ($path | startswith("minecraft/sounds/step/"))
+              or ($path | startswith("minecraft/sounds/mob/"))
+              or ($path | startswith("minecraft/sounds/entity/"))
+              or ($path | startswith("minecraft/sounds/item/"))
+              or ($path | startswith("minecraft/sounds/damage/"))
+              or ($path | startswith("minecraft/sounds/liquid/"))
+              or ($path | startswith("minecraft/sounds/fire/"))
+              or ($path | startswith("minecraft/sounds/portal/"))
+              or ($path | startswith("minecraft/sounds/minecart/"))
+              or ($path | startswith("minecraft/sounds/enchant/"))
+              or ($path | startswith("minecraft/sounds/fireworks/"))
+              or ($path | startswith("minecraft/sounds/event/"))
+              or ($path | startswith("minecraft/sounds/note/"))
+              or ($path | startswith("minecraft/sounds/tile/"))
+            )
+          )
+      )
+    | [.key, .value.hash]
+    | @tsv
+  ' "$asset_index" >"$browser_sound_manifest"
+  awk -F '\t' -v root="$generated_assets/" '
+    {
+      path = $1
+      sub("/[^/]+$", "", path)
+      print root path
+    }
+  ' "$browser_sound_manifest" | sort -u | xargs mkdir -p
   browser_sound_names=()
-  for logical_path in "${browser_sound_assets[@]}"; do
-    hash="$(jq -r --arg path "$logical_path" '.objects[$path].hash // ""' "$asset_index")"
-    if [[ -z "$hash" ]]; then
-      echo "WARNING: browser sound asset not listed in asset index: $logical_path" >&2
+  while IFS=$'\t' read -r logical_path hash; do
+    if [[ -z "$logical_path" || -z "$hash" ]]; then
       continue
     fi
     source="$work/assets/objects/${hash:0:2}/$hash"
@@ -57,13 +77,12 @@ if [[ -n "$asset_index_id" && -f "$asset_index" ]]; then
       continue
     fi
     target="$generated_assets/$logical_path"
-    mkdir -p "$(dirname "$target")"
     cp "$source" "$target"
     printf 'assets/%s\n' "$logical_path" >>"$resource_list"
     sound_name="${logical_path#minecraft/sounds/}"
     browser_sound_names+=("${sound_name%.ogg}")
     copied_sound_assets=$((copied_sound_assets + 1))
-  done
+  done <"$browser_sound_manifest"
   sounds_json_hash="$(jq -r '.objects["minecraft/sounds.json"].hash // ""' "$asset_index")"
   if [[ -n "$sounds_json_hash" ]]; then
     sounds_json_source="$work/assets/objects/${sounds_json_hash:0:2}/$sounds_json_hash"

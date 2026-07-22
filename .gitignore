@@ -1,23 +1,52 @@
-# Never commit locally acquired Minecraft artifacts.
+# Mojang-owned inputs acquired locally by the port scripts.
 *.jar
 client.txt
 assets/
 libraries/
 versions/
 port/work/
+
+# Rebuildable TeaVM, Maven, and browser artifacts. Publish these through a
+# release or deployment job instead of committing them to Git.
 port/target/
+port/web/dist/
+port/web/smoke/platform-smoke*.js
+port/web/smoke/platform-smoke*.js.map
+port/web/smoke/platform-smoke*.js.teavmdbg
+apps/server-plugin/target/
+
+# Keep browser platform-overlay source visible while ignoring any other local
+# copied library trees.
 !port/overrides/libraries/
 port/overrides/libraries/*
 !port/overrides/libraries/lwjgl-openal/
 !port/overrides/libraries/lwjgl-openal/**
+!port/overrides/libraries/lwjgl-glfw/
+!port/overrides/libraries/lwjgl-glfw/**
 !port/overrides/libraries/lwjgl-stb/
 !port/overrides/libraries/lwjgl-stb/**
+!port/overrides/libraries/netty-transport/
+!port/overrides/libraries/netty-transport/**
 
-# Local build and editor output.
+# Local dependencies, environment files, coverage, and editor state.
 node_modules/
 .pnpm-store/
+.npm/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
 .DS_Store
+.idea/
+.vscode/
+*.iml
 *.log
 *.tsbuildinfo
+coverage/
+.coverage
+.pytest_cache/
+.ruff_cache/
 __pycache__/
-*.pyc
+*.py[cod]
