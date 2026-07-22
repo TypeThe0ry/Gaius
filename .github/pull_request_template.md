@@ -23,5 +23,5 @@ Paste the exact command and concise result here.
 
 ## Artifact Policy
 
-- [ ] No fetched Minecraft inputs, secrets, `target/`, or generated TeaVM bundles are included.
-- [ ] Required browser or plugin packages are attached through CI or a release, not committed to source.
+- [ ] No fetched Minecraft inputs, secrets, `target/`, or local world data are included.
+- [ ] Browser release changes are rebuilt, stored only in the approved LFS paths, and pass `./tools/check-lfs.sh`.

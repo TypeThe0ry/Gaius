@@ -68,8 +68,9 @@ for rendering, input, audio, or loading changes. Keep unrelated formatting and
 generated artifacts out of the diff.
 
 Browser package changes belong with their source commit through Git LFS. Verify
-them with `git lfs ls-files` before opening a pull request. CI artifacts and
-GitHub Releases remain useful mirrors, but are not the only copy.
+them with `./tools/check-lfs.sh` before opening a pull request. CI artifacts and
+GitHub Releases remain useful mirrors, but are not the only copy. Do not move
+the generated browser release to a separate repository.
 
 ## Reporting Bugs
 

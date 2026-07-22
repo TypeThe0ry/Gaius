@@ -57,6 +57,7 @@ Run these checks before opening a pull request:
 git diff --check
 git status --short
 git lfs ls-files
+./tools/check-lfs.sh
 git rev-list --objects origin/main..HEAD \
   | git cat-file --batch-check='%(objecttype) %(objectsize) %(rest)' \
   | awk '$1 == "blob" && $2 > 100000000 { print }'

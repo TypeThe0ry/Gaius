@@ -27,10 +27,14 @@ browser and server you intend to use.
 
 ## Distribution Boundary
 
-The repository deliberately excludes Mojang client JARs, mappings, libraries,
-and assets. Fetch upstream inputs locally with the supplied scripts. Generated
-browser bundles are also excluded from source control and should be published
-as release assets or deployment artifacts, not committed to Git.
+Gaius is one repository: the browser port source, multiplayer bridge, optional
+server plugin, and downloadable browser release share the same commit. Large
+files under `port/web/dist/` and the generated platform smoke bundles are kept
+in this repository through Git LFS. Git stores small pointer objects while Git
+LFS transfers the corresponding release payloads.
+
+The repository still excludes Mojang client JARs, mappings, libraries, assets,
+and local worlds. Fetch those upstream inputs locally with the supplied scripts.
 
 Do not redistribute generated game assets or client artifacts unless you have
 the rights to do so. See [the release guide](docs/releasing.md) before creating
@@ -123,6 +127,7 @@ building a release:
 ```sh
 git lfs install
 git lfs pull
+./tools/check-lfs.sh
 ```
 
 ## Further Reading
