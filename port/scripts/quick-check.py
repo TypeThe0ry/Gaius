@@ -742,15 +742,15 @@ def check_source_patches() -> None:
             "patchSimpleBitStorageBrowserUnpack" in client_patcher
             and "net/minecraft/util/SimpleBitStorage.class" in client_patcher
             and "dev/gaius/browser/BrowserBitStorage" in client_patcher
-            and "([J[IIIJI)Z" in client_patcher
-            and "([JIIIJ)I" in client_patcher
-            and "([JIIIIJ)I" in client_patcher
+            and "([J[IIII)Z" in client_patcher
+            and "([JIII)I" in client_patcher
+            and "([JIIII)I" in client_patcher
             and "public static native boolean unpack" in browser_bit_storage
             and browser_bit_storage.count("@JSByRef long[] packed") == 3
             and "@JSByRef int[] output" in browser_bit_storage
             and "public static native int get(" in browser_bit_storage
             and "public static native int getAndSet(" in browser_bit_storage
-            and "long mask" in browser_bit_storage
+            and "long mask" not in browser_bit_storage
             and "__gaiusBitStorageMasks" not in browser_bit_storage
             and "__gaiusBitStorageWords" in browser_bit_storage
             and "new Uint32Array(source.buffer, source.byteOffset, source.length * 2)" in browser_bit_storage
@@ -771,7 +771,7 @@ def check_source_patches() -> None:
             and '"browserData"' in client_patcher
             and '"browserValuesPerLong"' in client_patcher
             and '"browserBits"' in client_patcher
-            and '"browserMask"' in client_patcher
+            and '"browserMask"' not in client_patcher
             and '"dev/gaius/browser/BrowserBitStorage"' in client_patcher
             and 'find(node, "getFirstAvailable", "(I)I")' in client_patcher
             and 'new String[] {"getFirstAvailable", "getHighestTaken"}' in client_patcher
@@ -1214,6 +1214,11 @@ def check_source_patches() -> None:
             and "const inboundResumeBytes = 8 * 1024 * 1024" in netty_browser_channel
             and "const maximumWebSocketBufferedBytes = 4 * 1024 * 1024" in netty_browser_channel
             and "const maximumOutboundQueueBytes = 16 * 1024 * 1024" in netty_browser_channel
+            and "const maximumLocalBatchBytes = 16 * 1024" in netty_browser_channel
+            and "function requestFlush(entry)" in netty_browser_channel
+            and "entry.localFlushScheduled" in netty_browser_channel
+            and "state.stats.localBatches++" in netty_browser_channel
+            and "state.stats.peakLocalBatchBytes" in netty_browser_channel
             and "setInboundPaused(entry, true)" in netty_browser_channel
             and "setInboundPaused(entry, false)" in netty_browser_channel
             and "{type: 'flow', paused: !!paused}" in netty_browser_channel
@@ -2263,10 +2268,10 @@ def check_source_patches() -> None:
         ),
         (
             "Server Worker yields outside the synchronous worldgen tick graph",
-            "YIELD_CHECKS_PER_TICK = 30" in browser_worldgen_scheduler
+            "YIELD_CHECKS_PER_TICK = 8" in browser_worldgen_scheduler
             and browser_worldgen_scheduler.count("Thread.yield()") == 1
-            and "runServer before processPacketsAndTick" in browser_worldgen_scheduler
-            and "worldgen descendants" in browser_worldgen_scheduler
+            and "Eight event-loop turns" in browser_worldgen_scheduler
+            and "same Fiber" in browser_worldgen_scheduler
             and "public static void checkpoint()" in browser_worldgen_scheduler
             and "public static void pulse()" in browser_worldgen_scheduler,
         ),
@@ -4405,22 +4410,22 @@ def check_overlay_bytecode() -> None:
         (
             "SimpleBitStorage scalar access uses direct browser BigInt64Array operations",
             "dev/gaius/browser/BrowserBitStorage.get" in simple_bit_storage_get
-            and "([JIIIJ)I" in simple_bit_storage_get
-            and "Field mask:J" in simple_bit_storage_get
+            and "([JIII)I" in simple_bit_storage_get
+            and "Field mask:J" not in simple_bit_storage_get
             and "Long_" not in simple_bit_storage_get
             and "dev/gaius/browser/BrowserBitStorage.getAndSet" in simple_bit_storage_get_and_set
-            and "([JIIIIJ)I" in simple_bit_storage_get_and_set
-            and "Field mask:J" in simple_bit_storage_get_and_set
+            and "([JIIII)I" in simple_bit_storage_get_and_set
+            and "Field mask:J" not in simple_bit_storage_get_and_set
             and "Long_" not in simple_bit_storage_get_and_set
             and "dev/gaius/browser/BrowserBitStorage.getAndSet" in simple_bit_storage_set
-            and "([JIIIIJ)I" in simple_bit_storage_set
-            and "Field mask:J" in simple_bit_storage_set
+            and "([JIIII)I" in simple_bit_storage_set
+            and "Field mask:J" not in simple_bit_storage_set
             and "Long_" not in simple_bit_storage_set,
         ),
         (
             "SimpleBitStorage.unpack calls browser bit-storage hot path before vanilla loop",
             "dev/gaius/browser/BrowserBitStorage.unpack" in simple_bit_storage_unpack
-            and "([J[IIIJI)Z" in simple_bit_storage_unpack
+            and "([J[IIII)Z" in simple_bit_storage_unpack
             and "return" in simple_bit_storage_unpack
             and "public static native boolean unpack" in browser_bit_storage_class,
         ),
@@ -4430,13 +4435,13 @@ def check_overlay_bytecode() -> None:
             and "Field browserData:[J" in heightmap_constructor
             and "Field browserValuesPerLong:I" in heightmap_constructor
             and "Field browserBits:I" in heightmap_constructor
-            and "Field browserMask:J" in heightmap_constructor
+            and "Field browserMask:J" not in heightmap_constructor
             and "ChunkAccess.getMinY" in heightmap_constructor
             and all(
                 "Field browserMinY:I" in section
                 and "Field browserData:[J" in section
                 and "dev/gaius/browser/BrowserBitStorage.get" in section
-                and "([JIIIJ)I" in section
+                and "([JIII)I" in section
                 and "ChunkAccess.getMinY" not in section
                 and "SimpleBitStorage.get" not in section
                 for section in (
@@ -4448,7 +4453,7 @@ def check_overlay_bytecode() -> None:
             and "Field browserMinY:I" in heightmap_set_height
             and "Field browserData:[J" in heightmap_set_height
             and "dev/gaius/browser/BrowserBitStorage.getAndSet" in heightmap_set_height
-            and "([JIIIIJ)I" in heightmap_set_height
+            and "([JIIII)I" in heightmap_set_height
             and "ChunkAccess.getMinY" not in heightmap_set_height
             and "SimpleBitStorage.set" not in heightmap_set_height,
         ),

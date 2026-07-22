@@ -8,7 +8,7 @@ public final class BrowserBitStorage {
     private BrowserBitStorage() {
     }
 
-    @JSBody(params = {"packed", "index", "valuesPerLong", "bits", "mask"}, script = """
+    @JSBody(params = {"packed", "index", "valuesPerLong", "bits"}, script = """
             const source = packed && packed.data ? packed.data : packed;
             const bitCount = bits | 0;
             const perLong = valuesPerLong | 0;
@@ -34,7 +34,7 @@ public final class BrowserBitStorage {
               const wordIndex = cell * 2;
               const low = words[wordIndex] >>> 0;
               const high = words[wordIndex + 1] >>> 0;
-              const numericMask = bitCount === 32 ? 0xFFFFFFFF : Math.pow(2, bitCount) - 1;
+              const numericMask = 0xFFFFFFFF >>> (32 - bitCount);
               let value;
               if (offset < 32) {
                 value = low >>> offset;
@@ -47,12 +47,13 @@ public final class BrowserBitStorage {
               return (value & numericMask) | 0;
             }
             const shift = BigInt(offset);
-            return Number((source[cell] >> shift) & mask) | 0;
+            const bigMask = (BigInt(1) << BigInt(bitCount)) - BigInt(1);
+            return Number((source[cell] >> shift) & bigMask) | 0;
             """)
     public static native int get(
-            @JSByRef long[] packed, int index, int valuesPerLong, int bits, long mask);
+            @JSByRef long[] packed, int index, int valuesPerLong, int bits);
 
-    @JSBody(params = {"packed", "index", "value", "valuesPerLong", "bits", "mask"}, script = """
+    @JSBody(params = {"packed", "index", "value", "valuesPerLong", "bits"}, script = """
             const source = packed && packed.data ? packed.data : packed;
             const bitCount = bits | 0;
             const perLong = valuesPerLong | 0;
@@ -76,7 +77,7 @@ public final class BrowserBitStorage {
             }
             if (words) {
               const wordIndex = cell * 2;
-              const numericMask = bitCount === 32 ? 0xFFFFFFFF : Math.pow(2, bitCount) - 1;
+              const numericMask = 0xFFFFFFFF >>> (32 - bitCount);
               const low = words[wordIndex] >>> 0;
               const high = words[wordIndex + 1] >>> 0;
               let previous;
@@ -115,10 +116,11 @@ public final class BrowserBitStorage {
               return (previous & numericMask) | 0;
             }
             const shift = BigInt(offset);
+            const bigMask = (BigInt(1) << BigInt(bitCount)) - BigInt(1);
             const previousWord = source[cell];
-            const previous = Number((previousWord >> shift) & mask) | 0;
-            const bigShiftedMask = mask << shift;
-            const bigReplacement = (BigInt(value | 0) & mask) << shift;
+            const previous = Number((previousWord >> shift) & bigMask) | 0;
+            const bigShiftedMask = bigMask << shift;
+            const bigReplacement = (BigInt(value | 0) & bigMask) << shift;
             source[cell] = BigInt.asIntN(64, (previousWord & ~bigShiftedMask) | bigReplacement);
             return previous;
             """)
@@ -127,10 +129,9 @@ public final class BrowserBitStorage {
             int index,
             int value,
             int valuesPerLong,
-            int bits,
-            long mask);
+            int bits);
 
-    @JSBody(params = {"packed", "output", "size", "bits", "mask", "valuesPerLong"}, script = """
+    @JSBody(params = {"packed", "output", "size", "bits", "valuesPerLong"}, script = """
             try {
               var source = packed && packed.data ? packed.data : packed;
               var target = output && output.data ? output.data : output;
@@ -150,9 +151,7 @@ public final class BrowserBitStorage {
 
               var counters = globalThis.__gaiusMinecraftCounters || (globalThis.__gaiusMinecraftCounters = {});
               counters.bitStorageJsUnpack = (counters.bitStorageJsUnpack || 0) + 1;
-              var bitMask = typeof mask === "bigint"
-                ? BigInt.asIntN(64, mask)
-                : BigInt.asIntN(64, (BigInt(1) << BigInt(bitCount)) - BigInt(1));
+              var bitMask = BigInt.asIntN(64, (BigInt(1) << BigInt(bitCount)) - BigInt(1));
               var out = 0;
               var fullCells = Math.floor(valueCount / perLong);
               for (var cell = 0; cell < fullCells; cell++) {
@@ -187,6 +186,5 @@ public final class BrowserBitStorage {
             @JSByRef int[] output,
             int size,
             int bits,
-            long mask,
             int valuesPerLong);
 }

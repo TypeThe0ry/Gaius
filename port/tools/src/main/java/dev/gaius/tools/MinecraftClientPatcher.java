@@ -6400,16 +6400,14 @@ public final class MinecraftClientPatcher {
         getCode.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "valuesPerLong", "I"));
         getCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
         getCode.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "bits", "I"));
-        getCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        getCode.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "mask", "J"));
         getCode.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 "dev/gaius/browser/BrowserBitStorage",
                 "get",
-                "([JIIIJ)I",
+                "([JIII)I",
                 false));
         getCode.add(new InsnNode(Opcodes.IRETURN));
-        replace(get, getCode, 6, 2);
+        replace(get, getCode, 4, 2);
 
         MethodNode getAndSet = find(node, "getAndSet", "(II)I");
         InsnList getAndSetCode = new InsnList();
@@ -6421,16 +6419,14 @@ public final class MinecraftClientPatcher {
         getAndSetCode.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "valuesPerLong", "I"));
         getAndSetCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
         getAndSetCode.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "bits", "I"));
-        getAndSetCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        getAndSetCode.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "mask", "J"));
         getAndSetCode.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 "dev/gaius/browser/BrowserBitStorage",
                 "getAndSet",
-                "([JIIIIJ)I",
+                "([JIIII)I",
                 false));
         getAndSetCode.add(new InsnNode(Opcodes.IRETURN));
-        replace(getAndSet, getAndSetCode, 7, 3);
+        replace(getAndSet, getAndSetCode, 5, 3);
 
         MethodNode set = find(node, "set", "(II)V");
         InsnList setCode = new InsnList();
@@ -6442,17 +6438,15 @@ public final class MinecraftClientPatcher {
         setCode.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "valuesPerLong", "I"));
         setCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
         setCode.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "bits", "I"));
-        setCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        setCode.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "mask", "J"));
         setCode.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 "dev/gaius/browser/BrowserBitStorage",
                 "getAndSet",
-                "([JIIIIJ)I",
+                "([JIIII)I",
                 false));
         setCode.add(new InsnNode(Opcodes.POP));
         setCode.add(new InsnNode(Opcodes.RETURN));
-        replace(set, setCode, 7, 3);
+        replace(set, setCode, 5, 3);
 
         MethodNode method = find(node, "unpack", "([I)V");
         LabelNode fallback = new LabelNode();
@@ -6465,20 +6459,18 @@ public final class MinecraftClientPatcher {
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "bits", "I"));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "mask", "J"));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "valuesPerLong", "I"));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 "dev/gaius/browser/BrowserBitStorage",
                 "unpack",
-                "([J[IIIJI)Z",
+                "([J[IIII)Z",
                 false));
         code.add(new JumpInsnNode(Opcodes.IFEQ, fallback));
         code.add(new InsnNode(Opcodes.RETURN));
         code.add(fallback);
         method.instructions.insert(code);
-        method.maxStack = Math.max(method.maxStack, 7);
+        method.maxStack = Math.max(method.maxStack, 5);
         writeComputeFrames(node, output);
     }
 
@@ -6993,13 +6985,6 @@ public final class MinecraftClientPatcher {
                 "I",
                 null,
                 null));
-        node.fields.add(new FieldNode(
-                Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL,
-                "browserMask",
-                "J",
-                null,
-                null));
-
         MethodNode constructor = find(
                 node,
                 "<init>",
@@ -7040,14 +7025,6 @@ public final class MinecraftClientPatcher {
                 initialize.add(new InsnNode(Opcodes.IDIV));
                 initialize.add(new FieldInsnNode(
                         Opcodes.PUTFIELD, owner, "browserValuesPerLong", "I"));
-                initialize.add(new VarInsnNode(Opcodes.ALOAD, 0));
-                initialize.add(new InsnNode(Opcodes.LCONST_1));
-                initialize.add(new VarInsnNode(Opcodes.ILOAD, 3));
-                initialize.add(new InsnNode(Opcodes.LSHL));
-                initialize.add(new InsnNode(Opcodes.LCONST_1));
-                initialize.add(new InsnNode(Opcodes.LSUB));
-                initialize.add(new FieldInsnNode(
-                        Opcodes.PUTFIELD, owner, "browserMask", "J"));
                 constructor.instructions.insertBefore(instruction, initialize);
                 initialized++;
             }
@@ -7070,21 +7047,18 @@ public final class MinecraftClientPatcher {
         indexedGetCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
         indexedGetCode.add(new FieldInsnNode(
                 Opcodes.GETFIELD, owner, "browserBits", "I"));
-        indexedGetCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        indexedGetCode.add(new FieldInsnNode(
-                Opcodes.GETFIELD, owner, "browserMask", "J"));
         indexedGetCode.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 "dev/gaius/browser/BrowserBitStorage",
                 "get",
-                "([JIIIJ)I",
+                "([JIII)I",
                 false));
         indexedGetCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
         indexedGetCode.add(new FieldInsnNode(
                 Opcodes.GETFIELD, owner, "browserMinY", "I"));
         indexedGetCode.add(new InsnNode(Opcodes.IADD));
         indexedGetCode.add(new InsnNode(Opcodes.IRETURN));
-        replace(indexedGet, indexedGetCode, 6, 2);
+        replace(indexedGet, indexedGetCode, 4, 2);
 
         for (String name : new String[] {"getFirstAvailable", "getHighestTaken"}) {
             MethodNode method = find(node, name, "(II)I");
@@ -7103,14 +7077,11 @@ public final class MinecraftClientPatcher {
             code.add(new VarInsnNode(Opcodes.ALOAD, 0));
             code.add(new FieldInsnNode(
                     Opcodes.GETFIELD, owner, "browserBits", "I"));
-            code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-            code.add(new FieldInsnNode(
-                    Opcodes.GETFIELD, owner, "browserMask", "J"));
             code.add(new MethodInsnNode(
                     Opcodes.INVOKESTATIC,
                     "dev/gaius/browser/BrowserBitStorage",
                     "get",
-                    "([JIIIJ)I",
+                    "([JIII)I",
                     false));
             code.add(new VarInsnNode(Opcodes.ALOAD, 0));
             code.add(new FieldInsnNode(
@@ -7121,7 +7092,7 @@ public final class MinecraftClientPatcher {
                 code.add(new InsnNode(Opcodes.ISUB));
             }
             code.add(new InsnNode(Opcodes.IRETURN));
-            replace(method, code, 6, 3);
+            replace(method, code, 4, 3);
         }
 
         MethodNode setHeight = find(node, "setHeight", "(III)V");
@@ -7145,18 +7116,15 @@ public final class MinecraftClientPatcher {
         setCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
         setCode.add(new FieldInsnNode(
                 Opcodes.GETFIELD, owner, "browserBits", "I"));
-        setCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        setCode.add(new FieldInsnNode(
-                Opcodes.GETFIELD, owner, "browserMask", "J"));
         setCode.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 "dev/gaius/browser/BrowserBitStorage",
                 "getAndSet",
-                "([JIIIIJ)I",
+                "([JIIII)I",
                 false));
         setCode.add(new InsnNode(Opcodes.POP));
         setCode.add(new InsnNode(Opcodes.RETURN));
-        replace(setHeight, setCode, 7, 4);
+        replace(setHeight, setCode, 5, 4);
         writeComputeFrames(node, output);
     }
 

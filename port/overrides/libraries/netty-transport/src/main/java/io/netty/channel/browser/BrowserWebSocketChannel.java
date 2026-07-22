@@ -340,6 +340,9 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 peakInboundQueuedBytes: 0,
                 flowPauses: 0,
                 flowResumes: 0,
+                localBatches: 0,
+                localBatchBytes: 0,
+                peakLocalBatchBytes: 0,
                 pumpCalls: 0,
                 pumpChunks: 0,
                 pumpBytes: 0,
@@ -350,6 +353,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 errors: 0
               }
             };
+            const maximumLocalBatchBytes = 16 * 1024;
             const maximumInboundQueueBytes = 64 * 1024 * 1024;
             const inboundPauseBytes = 24 * 1024 * 1024;
             const inboundResumeBytes = 8 * 1024 * 1024;
@@ -495,9 +499,72 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 setInboundPaused(entry, true);
               }
             }
+            function requestFlush(entry) {
+              if (!entry.localPort) {
+                flush(entry);
+                return;
+              }
+              if (entry.outboundHead >= entry.outbound.length) return;
+              if (entry.localFlushScheduled || entry.closed || entry.remotePaused) return;
+              entry.localFlushScheduled = true;
+              const run = function() {
+                entry.localFlushScheduled = false;
+                flush(entry);
+              };
+              if (typeof queueMicrotask === 'function') queueMicrotask(run);
+              else Promise.resolve().then(run);
+            }
             function flush(entry) {
               if (!entry.connected || entry.remotePaused) return;
               if (!entry.localPort && (!entry.ws || entry.ws.readyState !== WebSocket.OPEN)) return;
+              if (entry.localPort) {
+                if (entry.outboundHead >= entry.outbound.length) return;
+                const start = entry.outboundHead;
+                let end = start;
+                let batchBytes = 0;
+                while (end < entry.outbound.length) {
+                  const nextBytes = entry.outbound[end].byteLength;
+                  if (batchBytes > 0 && batchBytes + nextBytes > maximumLocalBatchBytes) break;
+                  batchBytes += nextBytes;
+                  end++;
+                  if (batchBytes >= maximumLocalBatchBytes) break;
+                }
+                let batch;
+                if (end === start + 1) {
+                  batch = entry.outbound[start];
+                } else {
+                  batch = new Uint8Array(batchBytes);
+                  let offset = 0;
+                  for (let index = start; index < end; index++) {
+                    batch.set(entry.outbound[index], offset);
+                    offset += entry.outbound[index].byteLength;
+                  }
+                }
+                entry.outboundHead = end;
+                entry.queuedBytes -= batchBytes;
+                state.stats.queuedBytes = Math.max(0, state.stats.queuedBytes - batchBytes);
+                try {
+                  entry.localPort.postMessage(batch.buffer, [batch.buffer]);
+                  state.stats.sentFrames++;
+                  state.stats.sentBytes += batchBytes;
+                  state.stats.localBatches++;
+                  state.stats.localBatchBytes += batchBytes;
+                  state.stats.peakLocalBatchBytes = Math.max(
+                    state.stats.peakLocalBatchBytes,
+                    batchBytes
+                  );
+                } catch (error) {
+                  fail(entry, error && (error.message || error));
+                  return;
+                }
+                if (entry.outboundHead >= entry.outbound.length) {
+                  entry.outbound = [];
+                  entry.outboundHead = 0;
+                } else {
+                  requestFlush(entry);
+                }
+                return;
+              }
               while (entry.outboundHead < entry.outbound.length) {
                 if (entry.ws && entry.ws.bufferedAmount >= maximumWebSocketBufferedBytes) return;
                 const bytes = entry.outbound[entry.outboundHead++];
@@ -505,11 +572,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 entry.queuedBytes -= byteLength;
                 state.stats.queuedBytes = Math.max(0, state.stats.queuedBytes - byteLength);
                 try {
-                  if (entry.localPort) {
-                    entry.localPort.postMessage(bytes.buffer, [bytes.buffer]);
-                  } else {
-                    entry.ws.send(bytes);
-                  }
+                  entry.ws.send(bytes);
                   state.stats.sentFrames++;
                   state.stats.sentBytes += byteLength;
                 } catch (error) {
@@ -570,7 +633,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                       entry.connected = true;
                       if (candidate.direct) state.stats.directConnected++;
                       state.stats.connected++;
-                      flush(entry);
+                      requestFlush(entry);
                     }
                   } catch (ignored) {}
                   return;
@@ -630,6 +693,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 errors: [],
                 closed: false,
                 flowPaused: false,
+                localFlushScheduled: false,
                 queuedBytes: 0,
                 candidates: [],
                 candidateIndex: 0,
@@ -675,7 +739,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                       !ArrayBuffer.isView(message)) {
                     if (message.type === 'flow' && typeof message.paused === 'boolean') {
                       entry.remotePaused = message.paused;
-                      if (!entry.remotePaused) flush(entry);
+                      if (!entry.remotePaused) requestFlush(entry);
                     } else if (message.type === 'close') {
                       entry.closed = true;
                     }
@@ -689,7 +753,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                   fail(entry, 'Local server MessagePort decode failed');
                 };
                 if (typeof localPort.start === 'function') localPort.start();
-                flush(entry);
+                requestFlush(entry);
                 return;
               }
               const directUrl = directPluginUrl(entry.host);
@@ -712,13 +776,13 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 fail(entry, 'Browser bridge outbound queue exceeded 16 MiB');
                 return false;
               }
-              flush(entry);
+              requestFlush(entry);
               return !entry.closed;
             };
             state.pollInbound = function(id) {
               const entry = state.channels.get(id|0);
               if (!entry) return null;
-              flush(entry);
+              requestFlush(entry);
               if (entry.inboundHead >= entry.inbound.length) return null;
               const chunk = entry.inbound[entry.inboundHead++];
               entry.inboundBytes = Math.max(0, entry.inboundBytes - chunk.byteLength);
