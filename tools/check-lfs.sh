@@ -29,7 +29,11 @@ done
 
 while IFS= read -r -d '' path; do
   [[ -f "$path" ]] || continue
-  size=$(stat -f '%z' "$path" 2>/dev/null || stat -c '%s' "$path")
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    size=$(stat -f '%z' "$path")
+  else
+    size=$(stat -c '%s' "$path")
+  fi
   (( size >= MAX_GIT_BLOB_BYTES )) || continue
 
   filter=$(git check-attr filter -- "$path" | awk '{print $3}')
