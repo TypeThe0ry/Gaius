@@ -6,13 +6,11 @@ libraries/
 versions/
 port/work/
 
-# Rebuildable TeaVM, Maven, and browser artifacts. Publish these through a
-# release or deployment job instead of committing them to Git.
+# Rebuildable Maven data and diagnostic output. The checked-in browser release
+# under port/web/dist and platform smoke bundles use Git LFS; do not ignore
+# them, because a source commit and its runnable browser package are released
+# together.
 port/target/
-port/web/dist/
-port/web/smoke/platform-smoke*.js
-port/web/smoke/platform-smoke*.js.map
-port/web/smoke/platform-smoke*.js.teavmdbg
 apps/server-plugin/target/
 
 # Keep browser platform-overlay source visible while ignoring any other local

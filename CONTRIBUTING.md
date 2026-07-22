@@ -25,11 +25,12 @@ with at least 32 GiB of physical memory for reliable full-release builds.
 - Put class replacements in `port/overrides/` and bytecode transforms in
   `port/tools/`.
 - Keep browser launcher and Worker bootstrap source under `port/web/`; never
-  hand-edit the generated contents of `port/web/dist/`.
+  hand-edit the generated contents of `port/web/dist/`. Rebuild them and stage
+  the result through Git LFS when intentionally updating the browser release.
 - Keep bridge code under `apps/bridge/` and the optional Paper plugin under
   `apps/server-plugin/`.
 - Do not add Minecraft JARs, assets, libraries, mappings, local worlds, bridge
-  secrets, `port/target/`, Maven `target/`, or generated TeaVM bundles to Git.
+  secrets, `port/target/`, or Maven `target/` directories to Git.
 
 The small checked-in `packages/*/dist/` modules are part of the current source
 layout. Do not replace or delete them merely because their directory is named
@@ -66,8 +67,9 @@ and the exact commands you ran. Include a screenshot or concise runtime result
 for rendering, input, audio, or loading changes. Keep unrelated formatting and
 generated artifacts out of the diff.
 
-If a change requires a generated browser package, attach it to a release or CI
-artifact. Do not commit the package to the source branch.
+Browser package changes belong with their source commit through Git LFS. Verify
+them with `git lfs ls-files` before opening a pull request. CI artifacts and
+GitHub Releases remain useful mirrors, but are not the only copy.
 
 ## Reporting Bugs
 

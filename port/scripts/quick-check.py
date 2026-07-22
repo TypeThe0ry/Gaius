@@ -1945,6 +1945,14 @@ def check_source_patches() -> None:
             and "gameLastSampleAt" in glfw_text,
         ),
         (
+            "BrowserGlfw provides opt-in swapBuffers frame-time telemetry",
+            "__gaiusFrameTelemetry" in glfw_text
+            and "telemetry.enabled" in glfw_text
+            and "new Uint32Array(4001)" in glfw_text
+            and "longestFrameMillis" in glfw_text
+            and "totalFrameMillis" in glfw_text,
+        ),
+        (
             "BrowserGlfw reserves the final timer millisecond for deadline precision",
             "public static void waitEventsTimeout(double timeout)" in glfw_text
             and "sleepForBrowserMillis" in glfw_text

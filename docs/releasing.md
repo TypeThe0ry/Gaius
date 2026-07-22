@@ -1,14 +1,15 @@
 # Releasing Gaius
 
-Gaius has two separate deliverables:
+Gaius keeps source and the runnable browser release in the same repository.
+Large browser bundles are tracked through Git LFS, which keeps GitHub's normal
+Git object store free of files above its 100 MiB limit.
 
-- Source code and reproducible build scripts belong in Git.
-- Browser bundles, portable HTML files, plugin JARs, and smoke-build output are
-  generated artifacts. Deliver them through a GitHub Release, a CI artifact,
-  or a static deployment, not through a source commit.
+Before cloning or updating a release checkout, run:
 
-This separation matters because generated TeaVM files can exceed GitHub's
-100 MiB single-file limit and make normal pushes fail.
+```sh
+git lfs install
+git lfs pull
+```
 
 ## Build and Verify
 
@@ -28,7 +29,8 @@ through at least one chunk boundary, and confirm sound and visual rendering.
 
 ## Publish Artifacts
 
-Use a versioned GitHub Release or CI workflow to upload the artifacts below:
+The following files are versioned in Git LFS and can also be mirrored to a
+GitHub Release or static host:
 
 | Artifact | Use |
 | --- | --- |
@@ -44,21 +46,21 @@ artifacts.
 
 ## Keep Git Pushable
 
-`.gitignore` prevents new generated artifacts from being added, but it cannot
-remove a large file that already exists in an ancestor commit. If a local branch
-contains an oversized generated blob, create a clean branch from the remote
-base and replay only source changes, or perform an explicitly reviewed history
-rewrite. Do not force-push `main` as a cleanup shortcut.
+`.gitattributes` routes release files through Git LFS. It cannot repair a large
+ordinary Git blob that already exists in a branch ancestor. Start from the
+clean LFS-backed mainline for new work; do not force-push `main` as a cleanup
+shortcut.
 
 Run these checks before opening a pull request:
 
 ```sh
 git diff --check
 git status --short
+git lfs ls-files
 git rev-list --objects origin/main..HEAD \
   | git cat-file --batch-check='%(objecttype) %(objectsize) %(rest)' \
   | awk '$1 == "blob" && $2 > 100000000 { print }'
 ```
 
-The final command must produce no output for a branch that will be pushed to
-GitHub without Git LFS.
+The final command must produce no output: every oversized release file should
+be an LFS pointer in Git, visible through the preceding `git lfs ls-files`.

@@ -14,3 +14,11 @@
 *.gz binary
 *.jar binary
 *.wasm binary
+
+# The checked-in browser release is one coherent deliverable. Keep it in this
+# repository through Git LFS so source and a downloadable build share a commit
+# without placing large blobs in ordinary Git history.
+port/web/dist/** filter=lfs diff=lfs merge=lfs -text
+port/web/smoke/platform-smoke*.js filter=lfs diff=lfs merge=lfs -text
+port/web/smoke/platform-smoke*.js.map filter=lfs diff=lfs merge=lfs -text
+port/web/smoke/platform-smoke*.js.teavmdbg filter=lfs diff=lfs merge=lfs -text

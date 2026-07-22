@@ -116,9 +116,14 @@ it is not a requirement for normal Java-server compatibility. See
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. In
 particular, do not commit fetched Minecraft inputs, `port/target/`, Maven
-`target/` directories, or generated TeaVM bundles. Keep source, tests, and
-regression evidence in the change; publish browser packages through releases
-or deployment artifacts.
+`target/` directories, or local caches. The browser package is intentionally
+kept with its source through Git LFS, so install Git LFS before cloning or
+building a release:
+
+```sh
+git lfs install
+git lfs pull
+```
 
 ## Further Reading
 

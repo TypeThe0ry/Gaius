@@ -402,12 +402,34 @@ public final class BrowserGlfw {
 
     @JSBody(script = """
             const fps=window.__gaiusFps || (window.__gaiusFps={});
+            const telemetry=window.__gaiusFrameTelemetry;
+            let now;
+            if (telemetry && telemetry.enabled) {
+              now=(typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+              const previous=telemetry.lastFrameAt;
+              if (Number.isFinite(previous) && previous > 0) {
+                const frameElapsed=Math.max(0, now-previous);
+                const bucket=Math.min(4000, Math.floor(frameElapsed*4));
+                let histogram=telemetry.histogram;
+                if (!histogram || histogram.length !== 4001) {
+                  histogram=new Uint32Array(4001);
+                  telemetry.histogram=histogram;
+                }
+                histogram[bucket]=histogram[bucket]+1;
+                telemetry.frameCount=(telemetry.frameCount||0)+1;
+                telemetry.totalFrameMillis=(telemetry.totalFrameMillis||0)+frameElapsed;
+                telemetry.longestFrameMillis=Math.max(telemetry.longestFrameMillis||0, frameElapsed);
+              }
+              telemetry.lastFrameAt=now;
+            }
             fps.gameFrames=(fps.gameFrames||0)+1;
             fps.gameSampleCounter=((fps.gameSampleCounter||0)+1)&15;
             if (fps.gameSampleCounter !== 0 && fps.gameLastSampleAt) {
               return;
             }
-            const now=(typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+            if (now === undefined) {
+              now=(typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+            }
             if (!fps.gameLastSampleAt) fps.gameLastSampleAt=now;
             const elapsed=now-fps.gameLastSampleAt;
             if (elapsed >= 1000) {
