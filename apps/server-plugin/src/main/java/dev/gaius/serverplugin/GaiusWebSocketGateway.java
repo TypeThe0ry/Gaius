@@ -31,6 +31,7 @@ final class GaiusWebSocketGateway extends WebSocketServer {
     private final int connectTimeoutMillis;
     private final int maximumConnections;
     private final int maximumFrameBytes;
+    private final boolean proxyKeepAlives;
     private final byte[] accessToken;
     private final List<String> allowedOrigins;
     private final Logger logger;
@@ -43,6 +44,7 @@ final class GaiusWebSocketGateway extends WebSocketServer {
             int connectTimeoutMillis,
             int maximumConnections,
             int maximumFrameBytes,
+            boolean proxyKeepAlives,
             String accessToken,
             List<String> allowedOrigins,
             Logger logger) {
@@ -52,6 +54,7 @@ final class GaiusWebSocketGateway extends WebSocketServer {
         this.connectTimeoutMillis = connectTimeoutMillis;
         this.maximumConnections = maximumConnections;
         this.maximumFrameBytes = maximumFrameBytes;
+        this.proxyKeepAlives = proxyKeepAlives;
         this.accessToken = accessToken.getBytes(StandardCharsets.UTF_8);
         this.allowedOrigins = allowedOrigins == null || allowedOrigins.isEmpty()
                 ? List.of("*")
@@ -251,6 +254,10 @@ final class GaiusWebSocketGateway extends WebSocketServer {
                 if (length < 0) {
                     return;
                 }
+                if (proxyKeepAlives && isVanillaKeepAlive(buffer, length)) {
+                    write(copyOf(buffer, length));
+                    continue;
+                }
                 while (webSocket.hasBufferedData() && !closed.get()) {
                     sleepBriefly();
                 }
@@ -290,6 +297,16 @@ final class GaiusWebSocketGateway extends WebSocketServer {
                 Thread.currentThread().interrupt();
                 throw new IOException("Gaius relay thread interrupted", exception);
             }
+        }
+
+        private static boolean isVanillaKeepAlive(byte[] bytes, int length) {
+            return length == 11 && bytes[0] == 0x0a && bytes[1] == 0x00 && bytes[2] == 0x04;
+        }
+
+        private static byte[] copyOf(byte[] bytes, int length) {
+            byte[] copy = new byte[length];
+            System.arraycopy(bytes, 0, copy, 0, length);
+            return copy;
         }
 
         private void close() {

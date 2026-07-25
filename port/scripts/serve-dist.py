@@ -44,6 +44,13 @@ class PrecompressedHandler(SimpleHTTPRequestHandler):
             compressed_path = path + suffix
             if not os.path.isfile(compressed_path):
                 continue
+            # Do not let an interrupted release build serve an older client payload.
+            # gzip commonly preserves the source timestamp. Filesystem timestamp
+            # conversion can make that sidecar appear a few nanoseconds older
+            # than its source even when it was built from it, so only reject a
+            # sidecar that is materially older.
+            if os.path.getmtime(compressed_path) + 1.0 < os.path.getmtime(path):
+                continue
 
             file_handle = open(compressed_path, "rb")
             stat = os.fstat(file_handle.fileno())

@@ -6,6 +6,7 @@ import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.DefaultEventLoopGroup;
 import io.netty.channel.browser.BrowserWebSocketChannel;
+import com.google.gson.JsonParser;
 import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.URL;
@@ -24,6 +25,7 @@ import java.util.zip.Deflater;
 import java.util.zip.Inflater;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
+import java.util.zip.ZipInputStream;
 import java.util.zip.ZipOutputStream;
 import javax.crypto.Cipher;
 import javax.crypto.SecretKey;
@@ -31,7 +33,9 @@ import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import javax.sound.sampled.AudioFormat;
 import net.minecraft.client.sounds.JOrbisAudioStream;
+import net.minecraft.client.renderer.block.model.TextureSlots;
 import net.minecraft.core.BlockPos;
+import net.minecraft.resources.Identifier;
 import net.minecraft.util.Mth;
 import net.minecraft.util.SimpleBitStorage;
 import net.minecraft.util.LinearCongruentialGenerator;
@@ -74,8 +78,16 @@ public final class PlatformSmoke {
             testRandomAccessFile();
             smokeStage = "browser ZIP pack";
             testBrowserZipPack();
+            smokeStage = "browser atlas overlay compatibility";
+            testBrowserAtlasOverlayCompatibility();
+            smokeStage = "browser atlas resource fallback";
+            testBrowserAtlasResourceFallback();
+            smokeStage = "resource-pack texture slots";
+            testSpriteTextureSlotCompatibility();
             smokeStage = "network compression";
             testNetworkCompression();
+            smokeStage = "network packed longs";
+            testNetworkPackedLongs();
             smokeStage = "improved noise";
             testImprovedNoiseHotPath();
             smokeStage = "Perlin wrap";
@@ -104,6 +116,8 @@ public final class PlatformSmoke {
             testWindowAndCallbacks();
             smokeStage = "browser audio";
             testBrowserAudio();
+            smokeStage = "Unicode font fallback";
+            testUnicodeFontFallbackAssets();
             smokeStage = "browser crypto";
             testBrowserCrypto();
             smokeStage = "HTTP proxy";
@@ -224,6 +238,58 @@ public final class PlatformSmoke {
         }
     }
 
+    private static void testSpriteTextureSlotCompatibility() {
+        TextureSlots.Data slots = TextureSlots.parseTextureMap(JsonParser.parseString("""
+                {"base":"minecraft:block/stone","particle":{"sprite":"minecraft:block/dirt","force_translucent":true}}
+                """).getAsJsonObject());
+        if (slots.values().size() != 2
+                || !slots.values().containsKey("base")
+                || !slots.values().containsKey("particle")) {
+            throw new AssertionError("Browser texture-slot sprite compatibility failed");
+        }
+    }
+
+    private static void testBrowserAtlasOverlayCompatibility() throws Exception {
+        Path path = Path.of("/gaius-smoke/atlas-overlay-pack.zip");
+        String metadata = """
+                {"pack":{"pack_format":88,"description":"Gaius smoke"},"overlays":{"entries":[
+                  {"directory":"safe_future","formats":[88,88]},
+                  {"directory":"unsafe_future","formats":[88,88]}
+                ]}}
+                """;
+        try (ZipOutputStream output = new ZipOutputStream(Files.newOutputStream(path))) {
+            writeZipEntry(output, "pack.mcmeta", metadata.getBytes(StandardCharsets.UTF_8));
+            writeZipEntry(output, "safe_future/assets/minecraft/atlases/items.json",
+                    "{\"sources\":[]}".getBytes(StandardCharsets.UTF_8));
+            writeZipEntry(output, "unsafe_future/assets/minecraft/shaders/core/entity.fsh",
+                    "#version 150".getBytes(StandardCharsets.UTF_8));
+        }
+        List<String> selected = BrowserPackOverlayCompat.mergeSafeAtlasOverlays(
+                path.toFile(), List.of("already_selected"));
+        if (!selected.equals(List.of("already_selected", "safe_future"))) {
+            throw new AssertionError("Browser atlas overlay selection was unsafe: " + selected);
+        }
+    }
+
+    private static void testBrowserAtlasResourceFallback() {
+        Identifier expected = Identifier.withDefaultNamespace("entity/trident");
+        Identifier fallback = BrowserAtlasResourceFallback.vanillaEntityFallback(
+                Identifier.fromNamespaceAndPath("elitefantasy", "entity/trident"));
+        if (!expected.equals(fallback)
+                || BrowserAtlasResourceFallback.vanillaEntityFallback(
+                        Identifier.fromNamespaceAndPath("elitefantasy", "item/trident")) != null
+                || BrowserAtlasResourceFallback.vanillaEntityFallback(expected) != null) {
+            throw new AssertionError("Browser atlas resource fallback widened beyond entity textures");
+        }
+    }
+
+    private static void writeZipEntry(ZipOutputStream output, String name, byte[] contents)
+            throws Exception {
+        output.putNextEntry(new ZipEntry(name));
+        output.write(contents);
+        output.closeEntry();
+    }
+
     private static void testNetworkCompression() throws Exception {
         Deflater deflater = new Deflater();
         Inflater inflater = new Inflater();
@@ -267,6 +333,18 @@ public final class PlatformSmoke {
         } finally {
             deflater.end();
             inflater.end();
+        }
+    }
+
+    private static void testNetworkPackedLongs() {
+        long[] expected = {0L, 1L, -1L, 0x0123456789ABCDEFL, Long.MIN_VALUE, Long.MAX_VALUE};
+        var buffer = Unpooled.buffer(expected.length * Long.BYTES);
+        for (long value : expected) {
+            buffer.writeLong(value);
+        }
+        long[] actual = BrowserLongArrayCodec.readFixedSizeLongArray(buffer, new long[expected.length]);
+        if (!Arrays.equals(expected, actual) || buffer.isReadable()) {
+            throw new AssertionError("Browser packed-long network decode changed packet bytes");
         }
     }
 
@@ -1004,6 +1082,37 @@ public final class PlatformSmoke {
             throw new AssertionError("WebGL shader compile failed: " + GL20.glGetShaderInfoLog(shader));
         }
         GL20.glDeleteShader(shader);
+
+        int modelEngineVertexShader = GL20.glCreateShader(GL20.GL_VERTEX_SHADER);
+        GL20.glShaderSource(
+                modelEngineVertexShader,
+                "#version 330\n"
+                        + "#define SKINRES 64\n"
+                        + "#define SPACING 1024.0\n"
+                        + "in vec2 UV0;\n"
+                        + "void main(){int partId=1;vec2 uv=UV0 * SKINRES;"
+                        + "float y=SPACING * (partId + 1);gl_Position=vec4(uv,y,1.0);}");
+        GL20.glCompileShader(modelEngineVertexShader);
+        if (GL20.glGetShaderi(modelEngineVertexShader, GL20.GL_COMPILE_STATUS) == 0) {
+            throw new AssertionError(
+                    "WebGL ModelEngine vertex shader compatibility failed: "
+                            + GL20.glGetShaderInfoLog(modelEngineVertexShader));
+        }
+        GL20.glDeleteShader(modelEngineVertexShader);
+
+        int modelEngineFragmentShader = GL20.glCreateShader(GL20.GL_FRAGMENT_SHADER);
+        GL20.glShaderSource(
+                modelEngineFragmentShader,
+                "#version 330\n"
+                        + "out vec4 fragColor;\n"
+                        + "void main(){float fade=0.5;fragColor=vec4(1 - fade);}");
+        GL20.glCompileShader(modelEngineFragmentShader);
+        if (GL20.glGetShaderi(modelEngineFragmentShader, GL20.GL_COMPILE_STATUS) == 0) {
+            throw new AssertionError(
+                    "WebGL ModelEngine fragment shader compatibility failed: "
+                            + GL20.glGetShaderInfoLog(modelEngineFragmentShader));
+        }
+        GL20.glDeleteShader(modelEngineFragmentShader);
         GL15.glDeleteBuffers(buffer);
         GL11.glDeleteTextures(texture);
     }
@@ -1072,6 +1181,40 @@ public final class PlatformSmoke {
         }
     }
 
+    private static void testUnicodeFontFallbackAssets() throws Exception {
+        String definitionResource = "assets/minecraft/font/include/unifont.json";
+        String zipResource = "assets/minecraft/font/unifont.zip";
+        try (InputStream definition = PlatformSmoke.class.getClassLoader()
+                .getResourceAsStream(definitionResource)) {
+            if (definition == null) {
+                throw new AssertionError("Unicode font definition was not packaged: " + definitionResource);
+            }
+            String json = new String(definition.readAllBytes(), StandardCharsets.UTF_8);
+            if (!json.contains("\"type\": \"unihex\"")
+                    || !json.contains("minecraft:font/unifont.zip")) {
+                throw new AssertionError("Unicode font definition does not reference the bundled unihex fallback");
+            }
+        }
+
+        try (InputStream encoded = PlatformSmoke.class.getClassLoader().getResourceAsStream(zipResource)) {
+            if (encoded == null) {
+                throw new AssertionError("Unicode font archive was not packaged: " + zipResource);
+            }
+            boolean foundHexFile = false;
+            try (ZipInputStream zip = new ZipInputStream(encoded)) {
+                for (ZipEntry entry; (entry = zip.getNextEntry()) != null; zip.closeEntry()) {
+                    if (!entry.isDirectory() && entry.getName().endsWith(".hex")) {
+                        foundHexFile = true;
+                        break;
+                    }
+                }
+            }
+            if (!foundHexFile) {
+                throw new AssertionError("Unicode font archive has no unihex glyph data");
+            }
+        }
+    }
+
     private static void testBrowserNetwork() {
         DefaultEventLoopGroup group = new DefaultEventLoopGroup(1);
         ChannelFuture connected = new Bootstrap()
@@ -1082,6 +1225,11 @@ public final class PlatformSmoke {
         if (!connected.isDone() || !connected.isSuccess()) {
             throw new AssertionError("Browser Netty connect future did not complete inline");
         }
+
+        if (!runLocalNetworkFrameSmoke()) {
+            throw new AssertionError("Browser local Netty bridge frame smoke did not start");
+        }
+
         connected.channel().writeAndFlush(Unpooled.wrappedBuffer(new byte[] {
                 0x10, 0x00, (byte) 0x86, 0x06, 0x09,
                 '1', '2', '7', '.', '0', '.', '0', '.', '1',
@@ -1235,15 +1383,63 @@ public final class PlatformSmoke {
     private static native boolean networkBytesQueuedOrSent();
 
     @JSBody(script = """
+            const sessionId = '0123456789abcdef0123456789abcdef';
+            const channel = new MessageChannel();
+            const ports = window.__gaiusLocalServerPorts ||
+              (window.__gaiusLocalServerPorts = new Map());
+            ports.set(sessionId, channel.port1);
+            const smoke = window.__gaiusLocalNetworkSmoke = {frames: 0, bytes: 0};
+            channel.port2.onmessage = function(event) {
+              const message = event.data;
+              if (!(message instanceof ArrayBuffer) && !ArrayBuffer.isView(message)) return;
+              const bytes = message instanceof ArrayBuffer
+                ? new Uint8Array(message)
+                : new Uint8Array(message.buffer, message.byteOffset || 0, message.byteLength || 0);
+              smoke.frames++;
+              smoke.bytes += bytes.byteLength;
+              const copy = new Uint8Array(bytes.byteLength);
+              copy.set(bytes);
+              channel.port2.postMessage(copy.buffer, [copy.buffer]);
+            };
+            if (typeof channel.port2.start === 'function') channel.port2.start();
+            const bridge = window.__gaiusNettyBridge;
+            if (!bridge) return false;
+            const socketId = 0x6A1A5;
+            bridge.open(socketId, 'client-' + sessionId + '.gaius-local', 25565);
+            return bridge.send(socketId, new Uint8Array([0x01])) &&
+              bridge.send(socketId, new Uint8Array([0x02, 0x03])) &&
+              bridge.send(socketId, new Uint8Array([0x04, 0x05, 0x06]));
+            """)
+    private static native boolean runLocalNetworkFrameSmoke();
+
+    @JSBody(script = """
             setTimeout(function() {
               const stats = window.__gaiusNetworkStats;
-              if (stats && (stats.sentBytes|0) >= 19 && (stats.receivedBytes|0) > 0) return;
+              const local = window.__gaiusLocalNetworkSmoke;
               const output = document.getElementById('status');
+              if (!local || (local.frames|0) !== 1 || (local.bytes|0) !== 6 ||
+                  !stats || (stats.localFlushes|0) < 1 ||
+                  (stats.localFlushFrames|0) !== 3 ||
+                  (stats.peakLocalFlushFrames|0) < 3 ||
+                  (stats.localReceivedFrames|0) !== 1 ||
+                  (stats.localReceivedBytes|0) !== 6) {
+                if (output) {
+                  output.textContent = 'Browser Netty local batching failed';
+                  output.dataset.success = 'false';
+                }
+                console.error('Browser Netty local batching failed', local || null, stats || null);
+                return;
+              }
+              // The platform smoke has no configured external relay. Verify that the
+              // direct/relay bridge encoded the outbound frame, but do not require a
+              // localhost relay process to echo it back.
+              const remoteSent = (stats.sentBytes|0) - (stats.localFlushBytes|0);
+              if (remoteSent >= 19 || (stats.queuedBytes|0) >= 19) return;
               if (output) {
-                output.textContent = 'Browser Netty bridge round-trip failed';
+                output.textContent = 'Browser Netty bridge frame was not queued';
                 output.dataset.success = 'false';
               }
-              console.error('Browser Netty bridge round-trip failed', stats || null);
+              console.error('Browser Netty bridge frame was not queued', stats || null);
             }, 2000);
             """)
     private static native void scheduleNetworkRoundTripCheck();

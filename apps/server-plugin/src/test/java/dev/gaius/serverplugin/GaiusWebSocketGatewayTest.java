@@ -41,6 +41,7 @@ final class GaiusWebSocketGatewayTest {
                     2000,
                     4,
                     1024,
+                    true,
                     "test-token",
                     List.of("https://play.example"),
                     Logger.getLogger("GaiusWebSocketGatewayTest"));

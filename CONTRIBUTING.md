@@ -55,8 +55,9 @@ For the Paper plugin:
 (cd apps/server-plugin && ../../port/mvnw test)
 ```
 
-For bridge changes, run the focused smoke script documented in
-`apps/bridge/README.md`. A passing static check does not replace a Chrome
+For RelayNode changes, run `cd apps/bridge && npm run smoke`; it verifies the
+manifest, required token, TCP forwarding, flow control, and local-tunnel
+pairing. A passing static check does not replace a Chrome
 runtime check: enter a local world and verify input, terrain rendering, sound,
 and a short movement through chunk boundaries.
 

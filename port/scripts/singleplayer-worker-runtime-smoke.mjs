@@ -122,6 +122,13 @@ if (isMainThread) {
     clearTimeout(timeout);
     finish(1);
   });
+  worker.on("exit", (code) => {
+    if (!finished) {
+      events.push({type: "worker-exited-early", code, ...protocol.snapshot()});
+      clearTimeout(timeout);
+      finish(code === 0 ? 1 : code);
+    }
+  });
   worker.postMessage({
     type: "start",
     worldId: "gaius-node-runtime-smoke",

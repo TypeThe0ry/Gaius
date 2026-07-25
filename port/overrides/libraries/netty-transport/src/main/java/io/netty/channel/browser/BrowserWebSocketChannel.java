@@ -24,7 +24,8 @@ import org.teavm.jso.typedarrays.Int8Array;
 public final class BrowserWebSocketChannel extends AbstractChannel {
     private static final ChannelMetadata METADATA = new ChannelMetadata(false);
     private static final int INITIAL_CHANNEL_CAPACITY = 16;
-    private static final int MAX_CHUNKS_PER_PUMP = 128;
+    // Client packets run inline on the browser event loop. A TCP burst must not monopolize it.
+    private static final int MAX_CHUNKS_PER_PUMP = 1;
     private static final int MAX_BYTES_PER_PUMP = 2 * 1024 * 1024;
     private static final double MAX_MILLIS_PER_PUMP = 4.0;
     private static final EventLoop INLINE_EVENT_LOOP = new BrowserInlineEventLoop();
@@ -36,6 +37,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
     private final int socketId;
     private boolean open = true;
     private boolean active;
+    private boolean pumping;
     private SocketAddress localAddress;
     private SocketAddress remoteAddress;
 
@@ -204,50 +206,58 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
     }
 
     private void pump() {
-        if (!open) {
+        if (!open || pumping) {
             return;
         }
-        String error = pollError(socketId);
-        if (error != null) {
-            pipeline().fireExceptionCaught(new ChannelException(error));
-            close();
-            return;
-        }
+        pumping = true;
+        try {
+            String error = pollError(socketId);
+            if (error != null) {
+                pipeline().fireExceptionCaught(new ChannelException(error));
+                close();
+                return;
+            }
 
-        ChannelPipeline pipeline = pipeline();
-        double pumpStarted = monotonicMillis();
-        int chunks = 0;
-        int bytesPumped = 0;
-        while (chunks < MAX_CHUNKS_PER_PUMP && bytesPumped < MAX_BYTES_PER_PUMP) {
-            if (chunks > 0 && monotonicMillis() - pumpStarted >= MAX_MILLIS_PER_PUMP) {
-                break;
+            ChannelPipeline pipeline = pipeline();
+            double pumpStarted = monotonicMillis();
+            int chunks = 0;
+            int bytesPumped = 0;
+            while (chunks < MAX_CHUNKS_PER_PUMP && bytesPumped < MAX_BYTES_PER_PUMP) {
+                if (chunks > 0 && monotonicMillis() - pumpStarted >= MAX_MILLIS_PER_PUMP) {
+                    break;
+                }
+                Int8Array data = pollInbound(socketId);
+                if (data == null) {
+                    break;
+                }
+                byte[] bytes = data.copyToJavaArray();
+                if (bytes.length > 0) {
+                    pipeline.fireChannelRead(Unpooled.wrappedBuffer(bytes));
+                    chunks++;
+                    bytesPumped += bytes.length;
+                }
             }
-            Int8Array data = pollInbound(socketId);
-            if (data == null) {
-                break;
+            if (chunks > 0) {
+                pipeline.fireChannelReadComplete();
+                recordPump(
+                        socketId,
+                        chunks,
+                        bytesPumped,
+                        Math.max(0.0, monotonicMillis() - pumpStarted));
             }
-            byte[] bytes = data.copyToJavaArray();
-            if (bytes.length > 0) {
-                pipeline.fireChannelRead(Unpooled.wrappedBuffer(bytes));
-                chunks++;
-                bytesPumped += bytes.length;
-            }
-        }
-        if (chunks > 0) {
-            pipeline.fireChannelReadComplete();
-            recordPump(
-                    socketId,
-                    chunks,
-                    bytesPumped,
-                    Math.max(0.0, monotonicMillis() - pumpStarted));
-        }
 
-        error = pollError(socketId);
-        if (error != null) {
-            pipeline.fireExceptionCaught(new ChannelException(error));
-            close();
-        } else if (isSocketClosed(socketId)) {
-            close();
+            error = pollError(socketId);
+            if (error != null) {
+                pipeline.fireExceptionCaught(new ChannelException(error));
+                close();
+            // WebSocket close is allowed to race with its final binary messages. Keep draining
+            // those packets so a server's login/respawn tail is not discarded before the client
+            // can emit the protocol acknowledgements it requires.
+            } else if (isSocketClosed(socketId) && !hasPendingInbound(socketId)) {
+                close();
+            }
+        } finally {
+            pumping = false;
         }
     }
 
@@ -262,13 +272,38 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
         if (remote instanceof InetSocketAddress address) {
             String host = address.getHostString();
             if (host != null && !host.isEmpty()) {
-                return host;
+                return normalizeRemoteHost(host, address.getPort());
             }
             if (address.getAddress() != null) {
                 return address.getAddress().getHostAddress();
             }
         }
         throw new ChannelException("Unsupported browser remote address: " + remote);
+    }
+
+    /**
+     * Minecraft's browser-side address parsing can retain the typed port in an unresolved
+     * InetSocketAddress host string. RelayNode receives the port separately, so remove only a
+     * matching suffix and preserve ordinary IPv6 literals.
+     */
+    private static String normalizeRemoteHost(String host, int port) {
+        String value = host.trim();
+        if (value.startsWith("[")) {
+            int closingBracket = value.indexOf(']');
+            if (closingBracket > 1) {
+                String remainder = value.substring(closingBracket + 1);
+                if (remainder.isEmpty() || remainder.equals(":" + port)) {
+                    return value.substring(1, closingBracket);
+                }
+            }
+            return value;
+        }
+        int firstColon = value.indexOf(':');
+        if (firstColon > 0 && firstColon == value.lastIndexOf(':')
+                && value.substring(firstColon + 1).equals(Integer.toString(port))) {
+            return value.substring(0, firstColon);
+        }
+        return value;
     }
 
     private static int port(SocketAddress remote) {
@@ -329,6 +364,9 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 directConnected: 0,
                 relayAttempts: 0,
                 relayFailovers: 0,
+                relayNodeSuccesses: 0,
+                relayNodeFailures: 0,
+                relayNodes: Object.create(null),
                 connected: 0,
                 closed: 0,
                 sentFrames: 0,
@@ -340,9 +378,13 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 peakInboundQueuedBytes: 0,
                 flowPauses: 0,
                 flowResumes: 0,
-                localBatches: 0,
-                localBatchBytes: 0,
-                peakLocalBatchBytes: 0,
+                localFlushes: 0,
+                localFlushFrames: 0,
+                localFlushBytes: 0,
+                localReceivedFrames: 0,
+                localReceivedBytes: 0,
+                peakLocalFlushFrames: 0,
+                peakLocalFlushBytes: 0,
                 pumpCalls: 0,
                 pumpChunks: 0,
                 pumpBytes: 0,
@@ -353,12 +395,14 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 errors: 0
               }
             };
-            const maximumLocalBatchBytes = 16 * 1024;
             const maximumInboundQueueBytes = 64 * 1024 * 1024;
             const inboundPauseBytes = 24 * 1024 * 1024;
             const inboundResumeBytes = 8 * 1024 * 1024;
             const maximumWebSocketBufferedBytes = 4 * 1024 * 1024;
             const maximumOutboundQueueBytes = 16 * 1024 * 1024;
+            // MessagePort has TCP-stream semantics here, so adjacent Netty writes can share one
+            // transferable buffer. Bound batches to retain low input latency and fair delivery.
+            const maximumLocalBatchBytes = 16 * 1024;
             function authorityHost(value) {
               const host = String(value || '127.0.0.1');
               return host.includes(':') && !(host.startsWith('[') && host.endsWith(']'))
@@ -376,9 +420,51 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               const port = globalThis.__gaiusBridgePort || '8080';
               return scheme + '://' + host + ':' + port + '/tunnel';
             }
+            function normalizeRelayUrl(value) {
+              try {
+                const parsed = new URL(String(value || '').trim(), location.href);
+                if (parsed.protocol === 'http:') parsed.protocol = 'ws:';
+                if (parsed.protocol === 'https:') parsed.protocol = 'wss:';
+                if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') return null;
+                if (parsed.pathname === '' || parsed.pathname === '/' ||
+                    parsed.pathname === '/health' || parsed.pathname === '/relay-node/v1') {
+                  parsed.pathname = '/tunnel';
+                }
+                parsed.hash = '';
+                parsed.search = '';
+                return parsed.href;
+              } catch (ignored) {
+                return null;
+              }
+            }
+            function relayNodeCandidate(value) {
+              const object = value && typeof value === 'object' && !Array.isArray(value)
+                ? value
+                : null;
+              if (object && object.enabled === false) return null;
+              const url = normalizeRelayUrl(object ? (object.url || object.endpoint) : value);
+              if (!url) return null;
+              const rawPriority = object ? Number(object.priority) : 0;
+              const priority = Number.isFinite(rawPriority)
+                ? Math.max(-10000, Math.min(10000, Math.floor(rawPriority)))
+                : 0;
+              const rawToken = object && object.token;
+              const token = typeof rawToken === 'string' && rawToken.length > 0
+                ? rawToken
+                : undefined;
+              const rawName = object && object.name;
+              const name = typeof rawName === 'string' && rawName.trim()
+                ? rawName.trim().slice(0, 80)
+                : url;
+              return {url: url, token: token, priority: priority, name: name, direct: false};
+            }
             function bridgeUrls() {
               const params = new URLSearchParams(location.search || '');
               const candidates = params.getAll('bridge');
+              const relayAliases = params.getAll('relay');
+              for (let index = 0; index < relayAliases.length; index++) {
+                candidates.push(relayAliases[index]);
+              }
               const configured = globalThis.__gaiusBridgeUrls;
               if (Array.isArray(configured)) {
                 for (let index = 0; index < configured.length; index++) {
@@ -400,11 +486,12 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               const unique = [];
               const seen = new Set();
               for (let index = 0; index < candidates.length; index++) {
-                const value = String(candidates[index] || '').trim();
-                if (!value || seen.has(value)) continue;
-                seen.add(value);
-                unique.push({url: value, direct: false});
+                const candidate = relayNodeCandidate(candidates[index]);
+                if (!candidate || seen.has(candidate.url)) continue;
+                seen.add(candidate.url);
+                unique.push(candidate);
               }
+              unique.sort(function(left, right) { return right.priority - left.priority; });
               return unique;
             }
             function directPluginUrl(host) {
@@ -421,10 +508,56 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
               return scheme + '://' + authorityHost(host) + ':' + port + '/tunnel';
             }
-            function bridgeToken() {
+            function bridgeToken(candidate) {
+              if (candidate && typeof candidate.token === 'string' && candidate.token.length > 0) {
+                return candidate.token;
+              }
               const params = new URLSearchParams(location.search || '');
-              const token = params.get('bridgeToken') || globalThis.__gaiusBridgeToken;
+              const token = params.get('bridgeToken') || params.get('relayToken') ||
+                globalThis.__gaiusBridgeToken;
               return token && String(token).length ? String(token) : undefined;
+            }
+            function relayNodeRecord(candidate) {
+              if (!candidate || candidate.direct) return null;
+              const nodes = state.stats.relayNodes;
+              let record = nodes[candidate.url];
+              if (!record) {
+                record = {
+                  name: candidate.name,
+                  priority: candidate.priority,
+                  attempts: 0,
+                  successes: 0,
+                  failures: 0,
+                  lastAttemptAt: 0,
+                  lastSuccessAt: 0,
+                  lastFailureAt: 0,
+                  lastError: null
+                };
+                nodes[candidate.url] = record;
+              }
+              return record;
+            }
+            function recordRelayNodeAttempt(candidate) {
+              const record = relayNodeRecord(candidate);
+              if (!record) return;
+              record.attempts++;
+              record.lastAttemptAt = Date.now();
+            }
+            function recordRelayNodeSuccess(candidate) {
+              const record = relayNodeRecord(candidate);
+              if (!record) return;
+              record.successes++;
+              record.lastSuccessAt = Date.now();
+              record.lastError = null;
+              state.stats.relayNodeSuccesses++;
+            }
+            function recordRelayNodeFailure(candidate, message) {
+              const record = relayNodeRecord(candidate);
+              if (!record) return;
+              record.failures++;
+              record.lastFailureAt = Date.now();
+              record.lastError = String(message || 'RelayNode connection failed').slice(0, 240);
+              state.stats.relayNodeFailures++;
             }
             function localSession(host) {
               const match = /^(?:client|server)-([a-f0-9]{32})\\.gaius-local$/.exec(host);
@@ -495,8 +628,15 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               );
               state.stats.receivedFrames++;
               state.stats.receivedBytes += copy.byteLength;
+              if (entry.localPort) {
+                state.stats.localReceivedFrames++;
+                state.stats.localReceivedBytes += copy.byteLength;
+              }
               if (entry.inboundBytes >= inboundPauseBytes) {
                 setInboundPaused(entry, true);
+              }
+              if (typeof state.inboundPump === 'function') {
+                state.inboundPump();
               }
             }
             function requestFlush(entry) {
@@ -504,66 +644,34 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 flush(entry);
                 return;
               }
-              if (entry.outboundHead >= entry.outbound.length) return;
-              if (entry.localFlushScheduled || entry.closed || entry.remotePaused) return;
+              if (entry.localFlushScheduled) return;
               entry.localFlushScheduled = true;
-              const run = function() {
+              queueMicrotask(function() {
                 entry.localFlushScheduled = false;
                 flush(entry);
-              };
-              if (typeof queueMicrotask === 'function') queueMicrotask(run);
-              else Promise.resolve().then(run);
+              });
             }
             function flush(entry) {
               if (!entry.connected || entry.remotePaused) return;
               if (!entry.localPort && (!entry.ws || entry.ws.readyState !== WebSocket.OPEN)) return;
-              if (entry.localPort) {
-                if (entry.outboundHead >= entry.outbound.length) return;
-                const start = entry.outboundHead;
-                let end = start;
-                let batchBytes = 0;
-                while (end < entry.outbound.length) {
-                  const nextBytes = entry.outbound[end].byteLength;
-                  if (batchBytes > 0 && batchBytes + nextBytes > maximumLocalBatchBytes) break;
-                  batchBytes += nextBytes;
-                  end++;
-                  if (batchBytes >= maximumLocalBatchBytes) break;
+              let localFlushFrames = 0;
+              let localFlushBytes = 0;
+              let localFlushBatches = 0;
+              let localBatchParts = [];
+              let localBatchBytes = 0;
+              function flushLocalBatch() {
+                if (localBatchBytes === 0) return;
+                const batch = new Uint8Array(localBatchBytes);
+                let offset = 0;
+                for (let partIndex = 0; partIndex < localBatchParts.length; partIndex++) {
+                  const part = localBatchParts[partIndex];
+                  batch.set(part, offset);
+                  offset += part.byteLength;
                 }
-                let batch;
-                if (end === start + 1) {
-                  batch = entry.outbound[start];
-                } else {
-                  batch = new Uint8Array(batchBytes);
-                  let offset = 0;
-                  for (let index = start; index < end; index++) {
-                    batch.set(entry.outbound[index], offset);
-                    offset += entry.outbound[index].byteLength;
-                  }
-                }
-                entry.outboundHead = end;
-                entry.queuedBytes -= batchBytes;
-                state.stats.queuedBytes = Math.max(0, state.stats.queuedBytes - batchBytes);
-                try {
-                  entry.localPort.postMessage(batch.buffer, [batch.buffer]);
-                  state.stats.sentFrames++;
-                  state.stats.sentBytes += batchBytes;
-                  state.stats.localBatches++;
-                  state.stats.localBatchBytes += batchBytes;
-                  state.stats.peakLocalBatchBytes = Math.max(
-                    state.stats.peakLocalBatchBytes,
-                    batchBytes
-                  );
-                } catch (error) {
-                  fail(entry, error && (error.message || error));
-                  return;
-                }
-                if (entry.outboundHead >= entry.outbound.length) {
-                  entry.outbound = [];
-                  entry.outboundHead = 0;
-                } else {
-                  requestFlush(entry);
-                }
-                return;
+                entry.localPort.postMessage(batch.buffer, [batch.buffer]);
+                localFlushBatches++;
+                localBatchParts = [];
+                localBatchBytes = 0;
               }
               while (entry.outboundHead < entry.outbound.length) {
                 if (entry.ws && entry.ws.bufferedAmount >= maximumWebSocketBufferedBytes) return;
@@ -572,13 +680,43 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 entry.queuedBytes -= byteLength;
                 state.stats.queuedBytes = Math.max(0, state.stats.queuedBytes - byteLength);
                 try {
-                  entry.ws.send(bytes);
+                  if (entry.localPort) {
+                    if (localBatchBytes > 0 &&
+                        localBatchBytes + byteLength > maximumLocalBatchBytes) {
+                      flushLocalBatch();
+                    }
+                    localBatchParts.push(bytes);
+                    localBatchBytes += byteLength;
+                    localFlushFrames++;
+                    localFlushBytes += byteLength;
+                  } else {
+                    entry.ws.send(bytes);
+                  }
                   state.stats.sentFrames++;
                   state.stats.sentBytes += byteLength;
                 } catch (error) {
                   fail(entry, error && (error.message || error));
                   return;
                 }
+              }
+              try {
+                flushLocalBatch();
+              } catch (error) {
+                fail(entry, error && (error.message || error));
+                return;
+              }
+              if (localFlushFrames > 0) {
+                state.stats.localFlushes += localFlushBatches;
+                state.stats.localFlushFrames += localFlushFrames;
+                state.stats.localFlushBytes += localFlushBytes;
+                state.stats.peakLocalFlushFrames = Math.max(
+                  state.stats.peakLocalFlushFrames,
+                  localFlushFrames
+                );
+                state.stats.peakLocalFlushBytes = Math.max(
+                  state.stats.peakLocalFlushBytes,
+                  localFlushBytes
+                );
               }
               entry.outbound = [];
               entry.outboundHead = 0;
@@ -591,13 +729,19 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               }
               const candidate = entry.candidates[entry.candidateIndex++];
               if (candidate.direct) state.stats.directAttempts++;
-              else state.stats.relayAttempts++;
+              else {
+                state.stats.relayAttempts++;
+                recordRelayNodeAttempt(candidate);
+              }
               const generation = ++entry.webSocketGeneration;
               let ws;
               try {
                 ws = new WebSocket(candidate.url);
               } catch (error) {
-                if (!candidate.direct) state.stats.relayFailovers++;
+                if (!candidate.direct) {
+                  state.stats.relayFailovers++;
+                  recordRelayNodeFailure(candidate, error && (error.message || error));
+                }
                 openRemoteCandidate(entry);
                 return;
               }
@@ -609,13 +753,16 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                   return;
                 }
                 try { ws.close(); } catch (ignored) {}
-                if (!candidate.direct) state.stats.relayFailovers++;
+                if (!candidate.direct) {
+                  state.stats.relayFailovers++;
+                  recordRelayNodeFailure(candidate, 'RelayNode tunnel connection timed out');
+                }
                 openRemoteCandidate(entry);
               }, candidate.direct ? 800 : 8000);
               ws.onopen = function() {
                 if (generation !== entry.webSocketGeneration || entry.closed) return;
                 const control = {type: 'connect', host: entry.host, port: entry.port};
-                const token = bridgeToken();
+                const token = bridgeToken(candidate);
                 if (token !== undefined) control.token = token;
                 try {
                   ws.send(JSON.stringify(control));
@@ -632,6 +779,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                       clearTimeout(candidateTimeout);
                       entry.connected = true;
                       if (candidate.direct) state.stats.directConnected++;
+                      else recordRelayNodeSuccess(candidate);
                       state.stats.connected++;
                       requestFlush(entry);
                     }
@@ -657,7 +805,13 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 clearTimeout(candidateTimeout);
                 if (generation !== entry.webSocketGeneration || entry.closed) return;
                 if (!entry.connected) {
-                  if (!candidate.direct) state.stats.relayFailovers++;
+                  if (!candidate.direct) {
+                    state.stats.relayFailovers++;
+                    recordRelayNodeFailure(
+                      candidate,
+                      'RelayNode closed before tunnel connected: ' + (event && event.code || 0)
+                    );
+                  }
                   openRemoteCandidate(entry);
                   return;
                 }
@@ -685,6 +839,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 localPort: null,
                 connected: false,
                 remotePaused: false,
+                localFlushScheduled: false,
                 inbound: [],
                 inboundHead: 0,
                 inboundBytes: 0,
@@ -693,7 +848,6 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 errors: [],
                 closed: false,
                 flowPaused: false,
-                localFlushScheduled: false,
                 queuedBytes: 0,
                 candidates: [],
                 candidateIndex: 0,
@@ -845,6 +999,10 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               const entry = state.channels.get(id|0);
               return !entry || !!entry.closed;
             };
+            state.hasPendingInbound = function(id) {
+              const entry = state.channels.get(id|0);
+              return !!entry && entry.inboundHead < entry.inbound.length;
+            };
             state.failLocalSession = function(sessionId, message) {
               sessionId = String(sessionId || '');
               state.channels.forEach(function(entry) {
@@ -887,6 +1045,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             return !!globalThis.__gaiusNettyBridge.closed(id);
             """)
     private static native boolean isSocketClosed(int id);
+
+    @JSBody(params = {"id"}, script = """
+            return !!globalThis.__gaiusNettyBridge.hasPendingInbound(id);
+            """)
+    private static native boolean hasPendingInbound(int id);
 
     @JSBody(script = """
             return typeof performance !== 'undefined' && performance.now

@@ -9,6 +9,7 @@ import java.util.Set;
 import org.jspecify.annotations.Nullable;
 import org.lwjgl.opengl.ARBVertexAttribBinding;
 import org.lwjgl.opengl.GLCapabilities;
+import org.lwjgl.opengl.GL30;
 
 public abstract class VertexArrayCache {
    public static VertexArrayCache create(final GLCapabilities capabilities, final GlDebugLabel debugLabels, final Set<String> enabledExtensions) {
@@ -23,10 +24,15 @@ public abstract class VertexArrayCache {
    public abstract void bindVertexArray(final VertexFormat format, final @Nullable GlBuffer vertexBuffer);
 
    private static class Emulated extends VertexArrayCache {
-      private static final int MAX_CACHED_WEBGL_VAOS = 512;
+      private static final int MAX_CACHED_WEBGL_VAOS = 2048;
+      private static final int HOT_CACHE_SIZE = 8192;
+      private static final int HOT_CACHE_MASK = HOT_CACHE_SIZE - 1;
       private final LinkedHashMap<VertexArrayCache.VertexArrayKey, VertexArrayCache.VertexArray> cache =
          new LinkedHashMap<>(64, 0.75F, true);
-      private final Map<VertexFormat, VertexArrayCache.VertexArray> overflowCache = new LinkedHashMap<>();
+      private final VertexArrayCache.VertexArrayKey lookupKey = new VertexArrayCache.VertexArrayKey();
+      private final VertexFormat[] hotFormats = new VertexFormat[HOT_CACHE_SIZE];
+      private final VertexArrayCache.VertexArray[] hotVertexArrays = new VertexArrayCache.VertexArray[HOT_CACHE_SIZE];
+      private final byte[] hotAccessCounts = new byte[HOT_CACHE_SIZE];
       private final GlDebugLabel debugLabels;
 
       public Emulated(final GlDebugLabel debugLabels) {
@@ -35,51 +41,81 @@ public abstract class VertexArrayCache {
 
       @Override
       public void bindVertexArray(final VertexFormat format, final @Nullable GlBuffer vertexBuffer) {
-         VertexArrayCache.VertexArrayKey key = new VertexArrayCache.VertexArrayKey(format, vertexBuffer == null ? 0 : vertexBuffer.handle);
-         VertexArrayCache.VertexArray vertexArray = this.cache.get(key);
-         if (vertexArray != null) {
-            GlStateManager._glBindVertexArray(vertexArray.id);
+         int bufferHandle = vertexBuffer == null ? 0 : vertexBuffer.handle;
+         int hotIndex = hotIndex(bufferHandle);
+         VertexArrayCache.VertexArray vertexArray = this.hotVertexArrays[hotIndex];
+         if (vertexArray != null
+            && this.hotFormats[hotIndex] == format
+            && vertexArray.cacheKey != null
+            && vertexArray.cacheKey.bufferHandle == bufferHandle) {
+            int accessCount = (this.hotAccessCounts[hotIndex] & 255) + 1;
+            this.hotAccessCounts[hotIndex] = (byte)accessCount;
+            if ((accessCount & 63) == 0) {
+               this.cache.get(vertexArray.cacheKey);
+            }
+
+            GL30.glBindVertexArray(vertexArray.id);
             vertexArray.lastVertexBuffer = vertexBuffer;
             return;
          }
 
-         if (this.cache.size() >= MAX_CACHED_WEBGL_VAOS) {
-            this.bindOverflowVertexArray(format, vertexBuffer);
+         vertexArray = this.cache.get(this.lookupKey.set(format, bufferHandle));
+         if (vertexArray != null) {
+            this.cacheHot(hotIndex, format, vertexArray);
+            GL30.glBindVertexArray(vertexArray.id);
+            vertexArray.lastVertexBuffer = vertexBuffer;
             return;
+         }
+
+         VertexArrayCache.VertexArray evicted = null;
+         if (this.cache.size() >= MAX_CACHED_WEBGL_VAOS) {
+            var iterator = this.cache.entrySet().iterator();
+            if (iterator.hasNext()) {
+               evicted = iterator.next().getValue();
+               iterator.remove();
+            }
          }
 
          int id = GlStateManager._glGenVertexArrays();
          vertexArray = new VertexArrayCache.VertexArray(id, format, vertexBuffer);
          this.debugLabels.applyLabel(vertexArray);
-         GlStateManager._glBindVertexArray(vertexArray.id);
+         GL30.glBindVertexArray(vertexArray.id);
          if (vertexBuffer != null) {
             GlStateManager._glBindBuffer(34962, vertexBuffer.handle);
             setupCombinedAttributes(format, true);
          }
 
-         this.cache.put(key, vertexArray);
+         VertexArrayCache.VertexArrayKey cacheKey = new VertexArrayCache.VertexArrayKey(format, bufferHandle);
+         vertexArray.cacheKey = cacheKey;
+         this.cache.put(cacheKey, vertexArray);
+         this.cacheHot(hotIndex, format, vertexArray);
+         if (evicted != null) {
+            this.clearHot(evicted);
+            GL30.glDeleteVertexArrays(evicted.id);
+         }
       }
 
-      private void bindOverflowVertexArray(final VertexFormat format, final @Nullable GlBuffer vertexBuffer) {
-         VertexArrayCache.VertexArray vertexArray = this.overflowCache.get(format);
-         if (vertexArray == null) {
-            int id = GlStateManager._glGenVertexArrays();
-            GlStateManager._glBindVertexArray(id);
-            if (vertexBuffer != null) {
-               GlStateManager._glBindBuffer(34962, vertexBuffer.handle);
-               setupCombinedAttributes(format, true);
-            }
+      private static int hotIndex(final int bufferHandle) {
+         int hash = bufferHandle * -1640531527;
+         return (hash ^ hash >>> 16) & HOT_CACHE_MASK;
+      }
 
-            vertexArray = new VertexArrayCache.VertexArray(id, format, vertexBuffer);
-            this.debugLabels.applyLabel(vertexArray);
-            this.overflowCache.put(format, vertexArray);
-         } else {
-            GlStateManager._glBindVertexArray(vertexArray.id);
-            if (vertexBuffer != null && vertexArray.lastVertexBuffer != vertexBuffer) {
-               GlStateManager._glBindBuffer(34962, vertexBuffer.handle);
-               vertexArray.lastVertexBuffer = vertexBuffer;
-               setupCombinedAttributes(format, false);
-            }
+      private void cacheHot(final int hotIndex, final VertexFormat format, final VertexArrayCache.VertexArray vertexArray) {
+         this.hotFormats[hotIndex] = format;
+         this.hotVertexArrays[hotIndex] = vertexArray;
+         this.hotAccessCounts[hotIndex] = 0;
+      }
+
+      private void clearHot(final VertexArrayCache.VertexArray vertexArray) {
+         if (vertexArray.cacheKey == null) {
+            return;
+         }
+
+         int hotIndex = hotIndex(vertexArray.cacheKey.bufferHandle);
+         if (this.hotVertexArrays[hotIndex] == vertexArray) {
+            this.hotFormats[hotIndex] = null;
+            this.hotVertexArrays[hotIndex] = null;
+            this.hotAccessCounts[hotIndex] = 0;
          }
       }
 
@@ -124,7 +160,7 @@ public abstract class VertexArrayCache {
       public void bindVertexArray(final VertexFormat format, final @Nullable GlBuffer vertexBuffer) {
          VertexArrayCache.VertexArray vertexArray = this.cache.get(format);
          if (vertexArray != null) {
-            GlStateManager._glBindVertexArray(vertexArray.id);
+            GL30.glBindVertexArray(vertexArray.id);
             if (vertexBuffer != null && vertexArray.lastVertexBuffer != vertexBuffer) {
                if (this.needsMesaWorkaround && vertexArray.lastVertexBuffer != null && vertexArray.lastVertexBuffer.handle == vertexBuffer.handle) {
                   ARBVertexAttribBinding.glBindVertexBuffer(0, 0, 0L, 0);
@@ -135,7 +171,7 @@ public abstract class VertexArrayCache {
             }
          } else {
             int id = GlStateManager._glGenVertexArrays();
-            GlStateManager._glBindVertexArray(id);
+            GL30.glBindVertexArray(id);
             if (vertexBuffer != null) {
                List<VertexFormatElement> elements = format.getElements();
 
@@ -167,18 +203,53 @@ public abstract class VertexArrayCache {
    }
 
    private static boolean shouldNormalize(final VertexFormatElement element) {
-      return element.usage() == VertexFormatElement.Usage.COLOR
-         || element.usage() == VertexFormatElement.Usage.UV
-         || element.usage() == VertexFormatElement.Usage.GENERIC;
+      return element.usage() == VertexFormatElement.Usage.NORMAL
+         || element.usage() == VertexFormatElement.Usage.COLOR;
    }
 
-   private record VertexArrayKey(VertexFormat format, int bufferHandle) {
+   private static final class VertexArrayKey {
+      private VertexFormat format;
+      private int bufferHandle;
+      private int hashCode;
+
+      private VertexArrayKey() {
+      }
+
+      private VertexArrayKey(final VertexFormat format, final int bufferHandle) {
+         this.set(format, bufferHandle);
+      }
+
+      private VertexArrayKey set(final VertexFormat format, final int bufferHandle) {
+         this.format = format;
+         this.bufferHandle = bufferHandle;
+         this.hashCode = 31 * format.hashCode() + Integer.hashCode(bufferHandle);
+         return this;
+      }
+
+      @Override
+      public boolean equals(final Object object) {
+         if (this == object) {
+            return true;
+         }
+
+         if (!(object instanceof VertexArrayCache.VertexArrayKey other) || this.bufferHandle != other.bufferHandle) {
+            return false;
+         }
+
+         return this.format == other.format || this.format != null && this.format.equals(other.format);
+      }
+
+      @Override
+      public int hashCode() {
+         return this.hashCode;
+      }
    }
 
    public static class VertexArray {
       final int id;
       final VertexFormat format;
       @Nullable GlBuffer lastVertexBuffer;
+      VertexArrayCache.VertexArrayKey cacheKey;
 
       private VertexArray(final int id, final VertexFormat format, final @Nullable GlBuffer lastVertexBuffer) {
          this.id = id;

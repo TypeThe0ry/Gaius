@@ -61,19 +61,6 @@ def patch_index(index: Path, classes_js: Path) -> bool:
         "      if (fps.lastDprChangeAt && nowMs - fps.lastDprChangeAt < 8000) {\n",
     )
     text = text.replace(
-        "    requestAnimationFrame(function gaiusFpsTick(now) {\n"
-        "      const fps = window.__gaiusFps;\n"
-        "      fps.frames++;\n"
-        "      const elapsed = now - fps.lastSampleAt;\n"
-        "      if (elapsed >= 1000) {\n"
-        "        fps.rafFps = Math.round((fps.frames * 1000 / elapsed) * 10) / 10;\n"
-        "        fps.fps = Number.isFinite(fps.rafFps) && fps.rafFps > 0 ? fps.rafFps : fps.gameFps;\n"
-        "        fps.frames = 0;\n"
-        "        fps.lastSampleAt = now;\n"
-        "        maybeDegradeResolutionForFps();\n"
-        "      }\n"
-        "      requestAnimationFrame(gaiusFpsTick);\n"
-        "    });\n",
         "    setInterval(function gaiusFpsSample() {\n"
         "      const fps = window.__gaiusFps;\n"
         "      const measured = Number.isFinite(fps.gameFps) && fps.gameFps > 0\n"
@@ -83,6 +70,97 @@ def patch_index(index: Path, classes_js: Path) -> bool:
         "      fps.lastSampleAt = performance.now();\n"
         "      maybeDegradeResolutionForFps();\n"
         "    }, 1000);\n",
+        "    requestAnimationFrame(function gaiusFpsTick(now) {\n"
+        "      const fps = window.__gaiusFps;\n"
+        "      const inWorld = !!window.__gaiusMinecraftState?.level;\n"
+        "      if (inWorld && !fps.rafMetricsWorldEnteredAt) {\n"
+        "        fps.rafMetricsWorldEnteredAt = now;\n"
+        "        fps.rafFrameTimes = [];\n"
+        "        fps.rafLastFrameAt = 0;\n"
+        "        fps.rafLongestFrameMs = 0;\n"
+        "      } else if (!inWorld) {\n"
+        "        fps.rafMetricsWorldEnteredAt = 0;\n"
+        "      }\n"
+        "      const previousFrameAt = fps.rafLastFrameAt;\n"
+        "      if (Number.isFinite(previousFrameAt) && previousFrameAt > 0) {\n"
+        "        const frameMs = now - previousFrameAt;\n"
+        "        if (frameMs > 0 && frameMs <= 1000 && fps.rafMetricsWorldEnteredAt) {\n"
+        "          const samples = fps.rafFrameTimes || (fps.rafFrameTimes = []);\n"
+        "          samples.push(frameMs);\n"
+        "          if (samples.length > 2048) samples.splice(0, samples.length - 2048);\n"
+        "          fps.rafLongestFrameMs = Math.max(fps.rafLongestFrameMs || 0, frameMs);\n"
+        "        }\n"
+        "      }\n"
+        "      fps.rafLastFrameAt = now;\n"
+        "      fps.frames++;\n"
+        "      const elapsed = now - fps.lastSampleAt;\n"
+        "      if (elapsed >= 1000) {\n"
+        "        fps.rafFps = Math.round((fps.frames * 1000 / elapsed) * 10) / 10;\n"
+        "        const samples = fps.rafFrameTimes || [];\n"
+        "        if (samples.length > 0) {\n"
+        "          const ordered = samples.slice().sort((left, right) => left - right);\n"
+        "          const totalMs = ordered.reduce((sum, value) => sum + value, 0);\n"
+        "          const onePercentIndex = Math.min(ordered.length - 1, Math.ceil(ordered.length * 0.99) - 1);\n"
+        "          fps.rafAverageFps = Math.round((ordered.length * 1000 / totalMs) * 10) / 10;\n"
+        "          fps.rafOnePercentLow = Math.round((1000 / ordered[onePercentIndex]) * 10) / 10;\n"
+        "        }\n"
+        "        fps.fps = fps.rafFps;\n"
+        "        fps.frames = 0;\n"
+        "        fps.lastSampleAt = now;\n"
+        "        maybeDegradeResolutionForFps();\n"
+        "      }\n"
+        "      requestAnimationFrame(gaiusFpsTick);\n"
+        "    });\n",
+    )
+    text = text.replace(
+        "      const measured = Number.isFinite(fps.gameFps) && fps.gameFps > 0 ? fps.gameFps : fps.rafFps;\n",
+        "      const measured = Number.isFinite(fps.rafFps) && fps.rafFps > 0 ? fps.rafFps : 0;\n",
+    )
+    text = text.replace(
+        "      const shownFps = Number.isFinite(fps.gameFps) && fps.gameFps > 0 ? fps.gameFps : fps.rafFps;\n",
+        "      const shownFps = Number.isFinite(fps.rafFps) && fps.rafFps > 0 ? fps.rafFps : 0;\n",
+    )
+    text = text.replace(
+        "      const fps = window.__gaiusFps;\n"
+        "      fps.frames++;\n"
+        "      const elapsed = now - fps.lastSampleAt;\n",
+        "      const fps = window.__gaiusFps;\n"
+        "      const inWorld = !!window.__gaiusMinecraftState?.level;\n"
+        "      if (inWorld && !fps.rafMetricsWorldEnteredAt) {\n"
+        "        fps.rafMetricsWorldEnteredAt = now;\n"
+        "        fps.rafFrameTimes = [];\n"
+        "        fps.rafLastFrameAt = 0;\n"
+        "        fps.rafLongestFrameMs = 0;\n"
+        "      } else if (!inWorld) {\n"
+        "        fps.rafMetricsWorldEnteredAt = 0;\n"
+        "      }\n"
+        "      const previousFrameAt = fps.rafLastFrameAt;\n"
+        "      if (Number.isFinite(previousFrameAt) && previousFrameAt > 0) {\n"
+        "        const frameMs = now - previousFrameAt;\n"
+        "        if (frameMs > 0 && frameMs <= 1000 && fps.rafMetricsWorldEnteredAt) {\n"
+        "          const samples = fps.rafFrameTimes || (fps.rafFrameTimes = []);\n"
+        "          samples.push(frameMs);\n"
+        "          if (samples.length > 2048) samples.splice(0, samples.length - 2048);\n"
+        "          fps.rafLongestFrameMs = Math.max(fps.rafLongestFrameMs || 0, frameMs);\n"
+        "        }\n"
+        "      }\n"
+        "      fps.rafLastFrameAt = now;\n"
+        "      fps.frames++;\n"
+        "      const elapsed = now - fps.lastSampleAt;\n",
+    )
+    text = text.replace(
+        "        fps.rafFps = Math.round((fps.frames * 1000 / elapsed) * 10) / 10;\n"
+        "        fps.fps = fps.rafFps;\n",
+        "        fps.rafFps = Math.round((fps.frames * 1000 / elapsed) * 10) / 10;\n"
+        "        const samples = fps.rafFrameTimes || [];\n"
+        "        if (samples.length > 0) {\n"
+        "          const ordered = samples.slice().sort((left, right) => left - right);\n"
+        "          const totalMs = ordered.reduce((sum, value) => sum + value, 0);\n"
+        "          const onePercentIndex = Math.min(ordered.length - 1, Math.ceil(ordered.length * 0.99) - 1);\n"
+        "          fps.rafAverageFps = Math.round((ordered.length * 1000 / totalMs) * 10) / 10;\n"
+        "          fps.rafOnePercentLow = Math.round((1000 / ordered[onePercentIndex]) * 10) / 10;\n"
+        "        }\n"
+        "        fps.fps = fps.rafFps;\n",
     )
     text = text.replace(
         "      const lowTarget = Math.max(45, Math.min(targetFps * 0.55, targetFps - 50));\n"
@@ -394,6 +472,10 @@ def patch_index(index: Path, classes_js: Path) -> bool:
         '        "singleplayer-server.js?v=" + encodeURIComponent(singleplayerBuildToken),\n'
         '        location.href\n'
         '      ).href;\n'
+        '      window.__gaiusSingleplayerServerGzipUrl = new URL(\n'
+        '        "singleplayer-server.js.gz?v=" + encodeURIComponent(singleplayerBuildToken),\n'
+        '        location.href\n'
+        '      ).href;\n'
     )
     text, singleplayer_count = re.subn(
         r'      const singleplayerBuildToken = "[^"]+" \+\n'
@@ -407,7 +489,11 @@ def patch_index(index: Path, classes_js: Path) -> bool:
         r'      window\.__gaiusSingleplayerServerUrl = new URL\(\n'
         r'        "singleplayer-server\.js\?v=" \+ encodeURIComponent\(singleplayerBuildToken\),\n'
         r'        location\.href\n'
-        r'      \)\.href;\n',
+        r'      \)\.href;\n'
+        r'(?:      window\.__gaiusSingleplayerServerGzipUrl = new URL\(\n'
+        r'        "singleplayer-server\.js\.gz\?v=" \+ encodeURIComponent\(singleplayerBuildToken\),\n'
+        r'        location\.href\n'
+        r'      \)\.href;\n)?',
         singleplayer_build_block,
         text,
         count=1,
@@ -427,6 +513,59 @@ def patch_index(index: Path, classes_js: Path) -> bool:
             "      await window.__gaiusFsReady;\n"
             "      bootTimings.fsReady = performance.now();\n",
             "fs ready timing",
+        )
+
+    # Do not hydrate region files into the title-screen filesystem. World
+    # metadata remains available for the world picker; the selected world's
+    # complete data is loaded by the dedicated integrated-server Worker.
+    if "function isClientBootstrapPath(path)" not in text:
+        text = replace_required(
+            text,
+            "      function openDatabase() {\n",
+            "      function isClientBootstrapPath(path) {\n"
+            "        path = normalize(path);\n"
+            "        const savesRoot = \"/gaius/saves/\";\n"
+            "        if (!path.startsWith(savesRoot)) return true;\n"
+            "        const worldSeparator = path.indexOf(\"/\", savesRoot.length);\n"
+            "        if (worldSeparator < 0 || worldSeparator + 1 >= path.length) return false;\n"
+            "        const relative = path.slice(worldSeparator + 1);\n"
+            "        return relative === \"level.dat\" || relative === \"level.dat_old\" ||\n"
+            "          relative === \"icon.png\";\n"
+            "      }\n\n"
+            "      function openDatabase() {\n",
+            "client IndexedDB bootstrap filter",
+        )
+        text = replace_required(
+            text,
+            '            if (value && typeof value.path === "string" && typeof value.value === "string") {\n'
+            '              files[normalize(value.path)] = value.value;\n'
+            "            }\n",
+            '            if (value && typeof value.path === "string" && typeof value.value === "string") {\n'
+            '              const path = normalize(value.path);\n'
+            '              if (isClientBootstrapPath(path)) files[path] = value.value;\n'
+            "            }\n",
+            "client IndexedDB read filter",
+        )
+        text = replace_required(
+            text,
+            "              files[path] = value;\n"
+            "              migrated++;\n",
+            "              if (isClientBootstrapPath(path)) files[path] = value;\n"
+            "              migrated++;\n",
+            "client IndexedDB migration filter",
+        )
+        text = replace_required(
+            text,
+            '              if (typeof value === "string") {\n'
+            '                files[normalize(key.substring(prefix.length))] = value;\n'
+            "                restored++;\n"
+            "              }\n",
+            '              if (typeof value === "string") {\n'
+            '                const path = normalize(key.substring(prefix.length));\n'
+            '                if (isClientBootstrapPath(path)) files[path] = value;\n'
+            "                restored++;\n"
+            "              }\n",
+            "client localStorage fallback filter",
         )
 
     if "bootTimings.beforeClassesPaint" not in text:
@@ -478,7 +617,7 @@ def patch_index(index: Path, classes_js: Path) -> bool:
     )
 
     session_block = '''    function createGaiusProxyUrl(target, kind) {
-      const configured = urlParams.get("bridge") || window.__gaiusBridgeUrl;
+      const configured = urlParams.get("bridge") || urlParams.get("relay") || window.__gaiusBridgeUrl;
       let bridge;
       if (configured && String(configured).trim()) {
         bridge = new URL(String(configured).trim(), location.href);
@@ -501,7 +640,7 @@ def patch_index(index: Path, classes_js: Path) -> bool:
       bridge.hash = "";
       bridge.search = "";
       bridge.searchParams.set("url", String(target));
-      const token = urlParams.get("bridgeToken") || window.__gaiusBridgeToken;
+      const token = urlParams.get("bridgeToken") || urlParams.get("relayToken") || window.__gaiusBridgeToken;
       if (token && String(token).length) bridge.searchParams.set("token", String(token));
       return bridge.href;
     }

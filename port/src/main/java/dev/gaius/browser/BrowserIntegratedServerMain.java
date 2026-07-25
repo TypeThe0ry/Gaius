@@ -1,5 +1,6 @@
 package dev.gaius.browser;
 
+import com.mojang.datafixers.DataFixer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -146,6 +147,18 @@ public final class BrowserIntegratedServerMain {
 
     public static boolean isWorkerServer() {
         return isWorkerRuntime();
+    }
+
+    public static DataFixer dataFixer() {
+        return isWorkerRuntime()
+                ? BrowserLazyDataFixer.instance()
+                : net.minecraft.util.datafix.DataFixers.getDataFixer();
+    }
+
+    static void reportRuntimeEvent(String event, String detail) {
+        if (isWorkerRuntime()) {
+            report(event, detail);
+        }
     }
 
     /** Vanilla's minimum of two forces 25 chunks before a browser player can enter. */

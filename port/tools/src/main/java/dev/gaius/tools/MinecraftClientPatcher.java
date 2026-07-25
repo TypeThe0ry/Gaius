@@ -61,6 +61,18 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/client/multiplayer/resolver/ResolvedServerAddress$1.class"));
         patchConnectionBrowserWebSocket(args[0], root.resolve(
                 "net/minecraft/network/Connection.class"));
+        patchClientPacketUtilsBrowserInline(args[0], root.resolve(
+                "net/minecraft/network/protocol/PacketUtils.class"));
+        patchPacketProcessorBrowserSlice(args[0], root.resolve(
+                "net/minecraft/network/PacketProcessor.class"));
+        patchClientKeepAliveBrowser(args[0], root.resolve(
+                "net/minecraft/client/multiplayer/ClientCommonPacketListenerImpl.class"));
+        patchResourceReloadProfiling(args[0], root.resolve(
+                "net/minecraft/server/packs/resources/SimpleReloadInstance.class"));
+        patchResourceReloadTaskLabels(
+                args[0],
+                root.resolve("net/minecraft/client/resources/model/ModelManager.class"),
+                root.resolve("net/minecraft/client/gui/font/FontManager.class"));
         patchNetworkEncoderMatchers(args[0], root);
         patchClassTreeIdRegistry(args[0], root.resolve("net/minecraft/util/ClassTreeIdRegistry.class"));
         patchSynchedEntityDataClassInitialization(
@@ -149,6 +161,8 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/world/level/chunk/LevelChunkSection.class"));
         patchChunkGenerationTaskBrowserYield(args[0], root.resolve(
                 "net/minecraft/server/level/ChunkGenerationTask.class"));
+        patchFriendlyByteBufBrowserLongArray(args[0], root.resolve(
+                "net/minecraft/network/FriendlyByteBuf.class"));
         patchSimpleBitStorageBrowserUnpack(args[0], root.resolve(
                 "net/minecraft/util/SimpleBitStorage.class"));
         patchProtoChunkBrowserHeightmapCache(args[0], root.resolve(
@@ -178,6 +192,10 @@ public final class MinecraftClientPatcher {
         patchResourceKeyRegistryRoot(args[0], root.resolve("net/minecraft/resources/ResourceKey.class"));
         patchVanillaPackResourcesBuilder(args[0], root.resolve(
                 "net/minecraft/server/packs/VanillaPackResourcesBuilder.class"));
+        patchFilePackResourcesBrowserAtlasOverlays(args[0], root.resolve(
+                "net/minecraft/server/packs/FilePackResources$FileResourcesSupplier.class"));
+        patchSingleFileBrowserAtlasFallback(args[0], root.resolve(
+                "net/minecraft/client/renderer/texture/atlas/sources/SingleFile.class"));
         patchIndexedAssetSourceBrowserNoop(args[0], root.resolve(
                 "net/minecraft/client/resources/IndexedAssetSource.class"));
         patchLocalTimeItemModelProperty(args[0], root.resolve(
@@ -230,6 +248,8 @@ public final class MinecraftClientPatcher {
                 "com/mojang/blaze3d/textures/TextureFormat.class"));
         patchGlStateManagerTextureBinding(args[0], root.resolve(
                 "com/mojang/blaze3d/opengl/GlStateManager.class"));
+        patchGlRenderPipelineDrawMetadata(args[0], root.resolve(
+                "com/mojang/blaze3d/opengl/GlRenderPipeline.class"));
         patchGlCommandEncoder(args[0], root.resolve(
                 "com/mojang/blaze3d/opengl/GlCommandEncoder.class"));
         patchGameRendererBrowserAutoScreenshot(args[0], root.resolve(
@@ -242,6 +262,8 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/client/multiplayer/MultiPlayerGameMode.class"));
         patchLevelRendererBrowserBlockBreakProgress(args[0], root.resolve(
                 "net/minecraft/client/renderer/LevelRenderer.class"));
+        patchEntityRenderDispatcherBrowserNullEntityGuard(args[0], root.resolve(
+                "net/minecraft/client/renderer/entity/EntityRenderDispatcher.class"));
         patchRenderSectionRegionBrowserDirectSectionCoordinates(args[0], root.resolve(
                 "net/minecraft/client/renderer/chunk/RenderSectionRegion.class"));
         patchSectionCompilerBrowserDirectRelativeCoordinates(args[0], root.resolve(
@@ -1686,6 +1708,82 @@ public final class MinecraftClientPatcher {
                 + method.name + method.desc);
     }
 
+    private static void patchGlRenderPipelineDrawMetadata(String jar, Path output) throws IOException {
+        String owner = "com/mojang/blaze3d/opengl/GlRenderPipeline";
+        String pipeline = "com/mojang/blaze3d/pipeline/RenderPipeline";
+        String vertexFormat = "com/mojang/blaze3d/vertex/VertexFormat";
+        String mode = "com/mojang/blaze3d/vertex/VertexFormat$Mode";
+        ClassNode node = read(jar, owner + ".class");
+        node.fields.add(new FieldNode(
+                Opcodes.ACC_FINAL | Opcodes.ACC_SYNTHETIC,
+                "gaius$vertexFormat",
+                "L" + vertexFormat + ";",
+                null,
+                null));
+        node.fields.add(new FieldNode(
+                Opcodes.ACC_FINAL | Opcodes.ACC_SYNTHETIC,
+                "gaius$drawMode",
+                "I",
+                null,
+                null));
+
+        MethodNode constructor = find(
+                node,
+                "<init>",
+                "(L" + pipeline + ";Lcom/mojang/blaze3d/opengl/GlProgram;)V");
+        AbstractInsnNode constructorReturn = null;
+        for (AbstractInsnNode instruction = constructor.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction.getOpcode() == Opcodes.RETURN) {
+                if (constructorReturn != null) {
+                    throw new IllegalStateException("GlRenderPipeline constructor has multiple returns");
+                }
+                constructorReturn = instruction;
+            }
+        }
+        if (constructorReturn == null) {
+            throw new IllegalStateException("GlRenderPipeline constructor return was not found");
+        }
+
+        InsnList initialize = new InsnList();
+        initialize.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        initialize.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        initialize.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                pipeline,
+                "getVertexFormat",
+                "()L" + vertexFormat + ";",
+                false));
+        initialize.add(new FieldInsnNode(
+                Opcodes.PUTFIELD,
+                owner,
+                "gaius$vertexFormat",
+                "L" + vertexFormat + ";"));
+        initialize.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        initialize.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        initialize.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                pipeline,
+                "getVertexFormatMode",
+                "()L" + mode + ";",
+                false));
+        initialize.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "com/mojang/blaze3d/opengl/GlConst",
+                "toGl",
+                "(L" + mode + ";)I",
+                false));
+        initialize.add(new FieldInsnNode(
+                Opcodes.PUTFIELD,
+                owner,
+                "gaius$drawMode",
+                "I"));
+        constructor.instructions.insertBefore(constructorReturn, initialize);
+        constructor.maxStack = Math.max(constructor.maxStack, 2);
+        writeComputeFrames(node, output);
+    }
+
     private static void patchGlCommandEncoder(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "com/mojang/blaze3d/opengl/GlCommandEncoder.class");
         String owner = "com/mojang/blaze3d/opengl/GlCommandEncoder";
@@ -1754,14 +1852,6 @@ public final class MinecraftClientPatcher {
             drawFromBuffers.localVariables.clear();
         }
         InsnList draw = drawFromBuffers.instructions;
-        draw.add(new VarInsnNode(Opcodes.ALOAD, 6));
-        draw.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL,
-                "com/mojang/blaze3d/opengl/GlRenderPipeline",
-                "info",
-                "()Lcom/mojang/blaze3d/pipeline/RenderPipeline;",
-                false));
-        draw.add(new VarInsnNode(Opcodes.ASTORE, 8));
         draw.add(new VarInsnNode(Opcodes.ALOAD, 0));
         draw.add(new FieldInsnNode(
                 Opcodes.GETFIELD,
@@ -1774,13 +1864,12 @@ public final class MinecraftClientPatcher {
                 "vertexArrayCache",
                 "()Lcom/mojang/blaze3d/opengl/VertexArrayCache;",
                 false));
-        draw.add(new VarInsnNode(Opcodes.ALOAD, 8));
-        draw.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL,
-                "com/mojang/blaze3d/pipeline/RenderPipeline",
-                "getVertexFormat",
-                "()Lcom/mojang/blaze3d/vertex/VertexFormat;",
-                false));
+        draw.add(new VarInsnNode(Opcodes.ALOAD, 6));
+        draw.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "com/mojang/blaze3d/opengl/GlRenderPipeline",
+                "gaius$vertexFormat",
+                "Lcom/mojang/blaze3d/vertex/VertexFormat;"));
         draw.add(new VarInsnNode(Opcodes.ALOAD, 1));
         draw.add(new FieldInsnNode(
                 Opcodes.GETFIELD,
@@ -1799,28 +1888,22 @@ public final class MinecraftClientPatcher {
                 "(Lcom/mojang/blaze3d/vertex/VertexFormat;"
                         + "Lcom/mojang/blaze3d/opengl/GlBuffer;)V",
                 false));
-        draw.add(new VarInsnNode(Opcodes.ALOAD, 8));
-        draw.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL,
-                "com/mojang/blaze3d/pipeline/RenderPipeline",
-                "getVertexFormatMode",
-                "()Lcom/mojang/blaze3d/vertex/VertexFormat$Mode;",
-                false));
-        draw.add(new MethodInsnNode(
-                Opcodes.INVOKESTATIC,
-                "com/mojang/blaze3d/opengl/GlConst",
-                "toGl",
-                "(Lcom/mojang/blaze3d/vertex/VertexFormat$Mode;)I",
-                false));
+        draw.add(new VarInsnNode(Opcodes.ALOAD, 6));
+        draw.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "com/mojang/blaze3d/opengl/GlRenderPipeline",
+                "gaius$drawMode",
+                "I"));
         draw.add(new VarInsnNode(Opcodes.ISTORE, 9));
         draw.add(new InsnNode(Opcodes.ICONST_0));
         draw.add(new VarInsnNode(Opcodes.ISTORE, 10));
         draw.add(new InsnNode(Opcodes.ICONST_0));
         draw.add(new VarInsnNode(Opcodes.ISTORE, 11));
+        draw.add(new InsnNode(Opcodes.ICONST_0));
+        draw.add(new VarInsnNode(Opcodes.ISTORE, 12));
         LabelNode nonIndexed = new LabelNode();
         draw.add(new VarInsnNode(Opcodes.ALOAD, 5));
         draw.add(new JumpInsnNode(Opcodes.IFNULL, nonIndexed));
-        draw.add(new LdcInsnNode(34963));
         draw.add(new VarInsnNode(Opcodes.ALOAD, 1));
         draw.add(new FieldInsnNode(
                 Opcodes.GETFIELD,
@@ -1835,20 +1918,7 @@ public final class MinecraftClientPatcher {
                 "com/mojang/blaze3d/opengl/GlBuffer",
                 "handle",
                 "I"));
-        draw.add(new MethodInsnNode(
-                Opcodes.INVOKESTATIC,
-                "org/lwjgl/opengl/BrowserOpenGL",
-                "bindBuffer",
-                "(II)V",
-                false));
-        draw.add(new VarInsnNode(Opcodes.ALOAD, 5));
-        draw.add(new MethodInsnNode(
-                Opcodes.INVOKESTATIC,
-                "com/mojang/blaze3d/opengl/GlConst",
-                "toGl",
-                "(Lcom/mojang/blaze3d/vertex/VertexFormat$IndexType;)I",
-                false));
-        draw.add(new VarInsnNode(Opcodes.ISTORE, 10));
+        draw.add(new VarInsnNode(Opcodes.ISTORE, 12));
         draw.add(new VarInsnNode(Opcodes.ALOAD, 5));
         draw.add(new FieldInsnNode(
                 Opcodes.GETFIELD,
@@ -1856,6 +1926,10 @@ public final class MinecraftClientPatcher {
                 "bytes",
                 "I"));
         draw.add(new VarInsnNode(Opcodes.ISTORE, 11));
+        draw.add(new IntInsnNode(Opcodes.SIPUSH, 5121));
+        draw.add(new VarInsnNode(Opcodes.ILOAD, 11));
+        draw.add(new InsnNode(Opcodes.IADD));
+        draw.add(new VarInsnNode(Opcodes.ISTORE, 10));
         draw.add(nonIndexed);
         draw.add(new VarInsnNode(Opcodes.ILOAD, 9));
         draw.add(new VarInsnNode(Opcodes.ILOAD, 2));
@@ -1864,15 +1938,16 @@ public final class MinecraftClientPatcher {
         draw.add(new VarInsnNode(Opcodes.ILOAD, 10));
         draw.add(new VarInsnNode(Opcodes.ILOAD, 11));
         draw.add(new VarInsnNode(Opcodes.ILOAD, 7));
+        draw.add(new VarInsnNode(Opcodes.ILOAD, 12));
         draw.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 "org/lwjgl/opengl/BrowserOpenGL",
                 "drawFromBuffers",
-                "(IIIIIII)V",
+                "(IIIIIIII)V",
                 false));
         draw.add(new InsnNode(Opcodes.RETURN));
-        drawFromBuffers.maxStack = 7;
-        drawFromBuffers.maxLocals = 12;
+        drawFromBuffers.maxStack = 8;
+        drawFromBuffers.maxLocals = 13;
         writeComputeFrames(node, output);
     }
 
@@ -2806,9 +2881,127 @@ public final class MinecraftClientPatcher {
     private static void patchLevelRendererBrowserBlockBreakProgress(String jar, Path output)
             throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/renderer/LevelRenderer.class");
+        patchLevelRendererBrowserPrepareChunkRenders(node);
         patchLevelRendererBrowserSectionCompileThrottle(node);
         patchLevelRendererBrowserBlockOutlineOpacity(node);
         writeComputeFrames(node, output);
+    }
+
+    private static void patchEntityRenderDispatcherBrowserNullEntityGuard(String jar, Path output)
+            throws IOException {
+        ClassNode node = read(jar,
+                "net/minecraft/client/renderer/entity/EntityRenderDispatcher.class");
+        MethodNode method = find(node, "shouldRender",
+                "(Lnet/minecraft/world/entity/Entity;"
+                        + "Lnet/minecraft/client/renderer/culling/Frustum;DDD)Z");
+        LabelNode render = new LabelNode();
+        InsnList guard = new InsnList();
+        guard.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        guard.add(new JumpInsnNode(Opcodes.IFNONNULL, render));
+        guard.add(new InsnNode(Opcodes.ICONST_0));
+        guard.add(new InsnNode(Opcodes.IRETURN));
+        guard.add(render);
+        method.instructions.insert(guard);
+        writeComputeFrames(node, output);
+    }
+
+    private static void patchLevelRendererBrowserPrepareChunkRenders(ClassNode node) {
+        MethodNode method = find(
+                node,
+                "prepareChunkRenders",
+                "(Lorg/joml/Matrix4fc;DDD)"
+                        + "Lnet/minecraft/client/renderer/chunk/ChunkSectionsToRender;");
+        MethodInsnNode millisCall = null;
+        MethodInsnNode[] layerValuesCalls = new MethodInsnNode[2];
+        int layerValuesCallCount = 0;
+        TypeInsnNode matrixCopy = null;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction instanceof TypeInsnNode allocation
+                    && allocation.getOpcode() == Opcodes.NEW
+                    && allocation.desc.equals("org/joml/Matrix4f")) {
+                if (matrixCopy != null) {
+                    throw new IllegalStateException(
+                            "LevelRenderer.prepareChunkRenders has multiple matrix copies");
+                }
+                matrixCopy = allocation;
+                continue;
+            }
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKESTATIC) {
+                continue;
+            }
+            if (call.owner.equals("net/minecraft/util/Util")
+                    && call.name.equals("getMillis")
+                    && call.desc.equals("()J")) {
+                if (millisCall != null) {
+                    throw new IllegalStateException(
+                            "LevelRenderer.prepareChunkRenders has multiple clock reads");
+                }
+                millisCall = call;
+                continue;
+            }
+            if (call.owner.equals("net/minecraft/client/renderer/chunk/ChunkSectionLayer")
+                    && call.name.equals("values")
+                    && call.desc.equals("()[Lnet/minecraft/client/renderer/chunk/ChunkSectionLayer;")) {
+                if (layerValuesCallCount >= layerValuesCalls.length) {
+                    throw new IllegalStateException(
+                            "LevelRenderer.prepareChunkRenders has extra render-layer reads");
+                }
+                layerValuesCalls[layerValuesCallCount++] = call;
+            }
+        }
+        if (millisCall == null
+                || layerValuesCallCount != layerValuesCalls.length
+                || matrixCopy == null) {
+            throw new IllegalStateException(
+                    "LevelRenderer.prepareChunkRenders browser hot-path patch points were not found");
+        }
+
+        AbstractInsnNode matrixDup = nextOpcode(matrixCopy);
+        AbstractInsnNode matrixLoad = nextOpcode(matrixDup);
+        AbstractInsnNode matrixConstructor = nextOpcode(matrixLoad);
+        if (!(matrixDup instanceof InsnNode)
+                || matrixDup.getOpcode() != Opcodes.DUP
+                || !(matrixLoad instanceof VarInsnNode load)
+                || load.getOpcode() != Opcodes.ALOAD
+                || load.var != 1
+                || !(matrixConstructor instanceof MethodInsnNode constructor)
+                || constructor.getOpcode() != Opcodes.INVOKESPECIAL
+                || !constructor.owner.equals("org/joml/Matrix4f")
+                || !constructor.name.equals("<init>")
+                || !constructor.desc.equals("(Lorg/joml/Matrix4fc;)V")) {
+            throw new IllegalStateException(
+                    "LevelRenderer.prepareChunkRenders matrix copy shape changed");
+        }
+        method.instructions.set(matrixCopy, new VarInsnNode(Opcodes.ALOAD, 1));
+        method.instructions.remove(matrixDup);
+        method.instructions.remove(matrixLoad);
+        method.instructions.remove(matrixConstructor);
+
+        int frameLayersLocal = method.maxLocals;
+        int frameMillisLocal = frameLayersLocal + 1;
+        method.maxLocals += 3;
+        InsnList frameState = new InsnList();
+        frameState.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserChunkSectionLayers",
+                "values",
+                "()[Lnet/minecraft/client/renderer/chunk/ChunkSectionLayer;",
+                false));
+        frameState.add(new VarInsnNode(Opcodes.ASTORE, frameLayersLocal));
+        frameState.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "net/minecraft/util/Util",
+                "getMillis",
+                "()J",
+                false));
+        frameState.add(new VarInsnNode(Opcodes.LSTORE, frameMillisLocal));
+        method.instructions.insert(frameState);
+        method.instructions.set(millisCall, new VarInsnNode(Opcodes.LLOAD, frameMillisLocal));
+        for (MethodInsnNode layerValuesCall : layerValuesCalls) {
+            method.instructions.set(
+                    layerValuesCall, new VarInsnNode(Opcodes.ALOAD, frameLayersLocal));
+        }
     }
 
     private static void patchRenderSectionRegionBrowserDirectSectionCoordinates(
@@ -3526,8 +3719,8 @@ public final class MinecraftClientPatcher {
         code.add(new VarInsnNode(Opcodes.ALOAD, 3));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
-                "net/minecraft/util/datafix/DataFixers",
-                "getDataFixer",
+                "dev/gaius/browser/BrowserIntegratedServerMain",
+                "dataFixer",
                 "()Lcom/mojang/datafixers/DataFixer;",
                 false));
         code.add(new VarInsnNode(Opcodes.ALOAD, 4));
@@ -4333,7 +4526,7 @@ public final class MinecraftClientPatcher {
         boolean found = false;
         boolean stateHooked = false;
         boolean throwableHooked = false;
-        boolean forcedPacketHooked = false;
+        boolean browserChannelPumpHooked = false;
         boolean singleplayerWorkerHooked = false;
         boolean singleplayerWorkerStopHooked = false;
         for (MethodNode method : node.methods) {
@@ -4348,10 +4541,15 @@ public final class MinecraftClientPatcher {
                 found = true;
             } else if (method.name.equals("runTick") && method.desc.equals("(Z)V")) {
                 InsnList browserPackets = new InsnList();
+                browserPackets.add(new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "dev/gaius/browser/BrowserClientNetwork",
+                        "install",
+                        "()V",
+                        false));
                 browserPackets.add(pumpBrowserChannels());
-                browserPackets.add(processQueuedPacketsDuringForcedTick());
                 method.instructions.insert(browserPackets);
-                forcedPacketHooked = true;
+                browserChannelPumpHooked = true;
                 for (var instruction = method.instructions.getFirst();
                         instruction != null;
                         instruction = instruction.getNext()) {
@@ -4403,8 +4601,8 @@ public final class MinecraftClientPatcher {
         if (!stateHooked) {
             throw new IllegalStateException("Minecraft runTick hook point was not found");
         }
-        if (!forcedPacketHooked) {
-            throw new IllegalStateException("Minecraft forced tick packet queue hook point was not found");
+        if (!browserChannelPumpHooked) {
+            throw new IllegalStateException("Minecraft browser channel pump hook point was not found");
         }
         if (!throwableHooked) {
             throw new IllegalStateException("Minecraft run throwable diagnostic hook point was not found");
@@ -4671,28 +4869,6 @@ public final class MinecraftClientPatcher {
         writeComputeFrames(node, output);
     }
 
-    private static InsnList processQueuedPacketsDuringForcedTick() {
-        InsnList code = new InsnList();
-        LabelNode done = new LabelNode();
-        code.add(new VarInsnNode(Opcodes.ILOAD, 1));
-        code.add(new JumpInsnNode(Opcodes.IFNE, done));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new FieldInsnNode(
-                Opcodes.GETFIELD,
-                "net/minecraft/client/Minecraft",
-                "packetProcessor",
-                "Lnet/minecraft/network/PacketProcessor;"));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL,
-                "net/minecraft/network/PacketProcessor",
-                "processQueuedPackets",
-                "()V",
-                false));
-        code.add(minecraftEvent("client.processQueuedPacketsForcedTick"));
-        code.add(done);
-        return code;
-    }
-
     private static MethodInsnNode pumpBrowserChannels() {
         return new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
@@ -4822,6 +4998,429 @@ public final class MinecraftClientPatcher {
             }
         }
         return reportedHooked && unreportedHooked;
+    }
+
+    /**
+     * Resource-pack reloads can keep the browser renderer frozen long enough for vanilla's
+     * deferred configuration keepalive queue to miss every listener tick. Browser transport
+     * callbacks already run on the page event loop, so reply immediately instead of waiting
+     * for RenderSystem's desktop poll-events gate.
+     */
+    private static void patchClientKeepAliveBrowser(String jar, Path output) throws IOException {
+        ClassNode node = read(jar,
+                "net/minecraft/client/multiplayer/ClientCommonPacketListenerImpl.class");
+        MethodNode predicate = find(node, "lambda$handleKeepAlive$1", "()Z");
+        if (predicate == null) {
+            throw new IOException("ClientCommonPacketListenerImpl keepalive predicate was not found");
+        }
+        InsnList code = new InsnList();
+        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(new InsnNode(Opcodes.IRETURN));
+        replace(predicate, code, 1, 0);
+        writeComputeFrames(node, output);
+    }
+
+    /**
+     * Browser WebSocket callbacks already share the client page's event loop. Treating them as
+     * foreign Java threads makes configuration packets requeue forever while a resource reload
+     * owns the normal client tick. Restrict the inline path to the configuration listener; game
+     * packets stay queued so terrain handling is sliced by the client tick.
+     */
+    private static void patchClientPacketUtilsBrowserInline(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/network/protocol/PacketUtils.class");
+        MethodNode method = find(node, "ensureRunningOnSameThread",
+                "(Lnet/minecraft/network/protocol/Packet;Lnet/minecraft/network/PacketListener;"
+                        + "Lnet/minecraft/network/PacketProcessor;)V");
+        if (method == null) {
+            throw new IOException("PacketUtils client packet scheduler patch point was not found");
+        }
+        LabelNode vanillaScheduling = new LabelNode();
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new TypeInsnNode(Opcodes.INSTANCEOF,
+                "net/minecraft/client/multiplayer/ClientConfigurationPacketListenerImpl"));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, vanillaScheduling));
+        code.add(new InsnNode(Opcodes.RETURN));
+        code.add(vanillaScheduling);
+        method.instructions.insert(code);
+        method.maxStack = Math.max(method.maxStack, 1);
+        writeComputeFrames(node, output);
+    }
+
+    /** Handles at most one queued packet per browser turn so chunk listeners cannot monopolize it. */
+    private static void patchPacketProcessorBrowserSlice(String jar, Path output) throws IOException {
+        String owner = "net/minecraft/network/PacketProcessor";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode method = find(node, "processQueuedPackets", "()V");
+        if (method == null) {
+            throw new IOException("PacketProcessor browser slice patch point was not found");
+        }
+        LabelNode done = new LabelNode();
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "closed", "Z"));
+        code.add(new JumpInsnNode(Opcodes.IFNE, done));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "packetsToBeHandled", "Ljava/util/Queue;"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE, "java/util/Queue", "poll", "()Ljava/lang/Object;", true));
+        code.add(new TypeInsnNode(
+                Opcodes.CHECKCAST, "net/minecraft/network/PacketProcessor$ListenerAndPacket"));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 1));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new JumpInsnNode(Opcodes.IFNULL, done));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/network/PacketProcessor$ListenerAndPacket",
+                "handle",
+                "()V",
+                false));
+        code.add(done);
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(method, code, 2, 2);
+        writeComputeFrames(node, output);
+    }
+
+    /** Adds diagnostics around each vanilla resource reload listener without reordering it. */
+    private static void patchResourceReloadProfiling(String jar, Path output) throws IOException {
+        ClassNode node = read(jar,
+                "net/minecraft/server/packs/resources/SimpleReloadInstance.class");
+        MethodNode method = find(node, "prepareTasks",
+                "(Ljava/util/concurrent/Executor;Ljava/util/concurrent/Executor;"
+                        + "Lnet/minecraft/server/packs/resources/ResourceManager;Ljava/util/List;"
+                        + "Lnet/minecraft/server/packs/resources/SimpleReloadInstance$StateFactory;"
+                        + "Ljava/util/concurrent/CompletableFuture;)Ljava/util/concurrent/CompletableFuture;");
+        if (method == null) {
+            throw new IOException("SimpleReloadInstance prepareTasks patch point was not found");
+        }
+        boolean wrapped = false;
+        int listenerLocal = -1;
+        for (AbstractInsnNode instruction = method.instructions.getFirst(); instruction != null;
+                instruction = instruction.getNext()) {
+            if (!(instruction instanceof TypeInsnNode cast)
+                    || cast.getOpcode() != Opcodes.CHECKCAST
+                    || !cast.desc.equals("net/minecraft/server/packs/resources/PreparableReloadListener")) {
+                continue;
+            }
+            AbstractInsnNode next = instruction.getNext();
+            while (next != null && next.getOpcode() < 0) {
+                next = next.getNext();
+            }
+            if (!(next instanceof VarInsnNode store) || store.getOpcode() != Opcodes.ASTORE) {
+                continue;
+            }
+            InsnList code = new InsnList();
+            code.add(new VarInsnNode(Opcodes.ALOAD, store.var));
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "dev/gaius/browser/BrowserResourceReloadProfiler",
+                    "wrap",
+                    "(Lnet/minecraft/server/packs/resources/PreparableReloadListener;)"
+                            + "Lnet/minecraft/server/packs/resources/PreparableReloadListener;",
+                    false));
+            code.add(new VarInsnNode(Opcodes.ASTORE, store.var));
+            method.instructions.insert(store, code);
+            listenerLocal = store.var;
+            wrapped = true;
+            break;
+        }
+        if (!wrapped) {
+            throw new IOException("SimpleReloadInstance listener iteration patch point was not found");
+        }
+        boolean barrierUnwrapped = false;
+        for (AbstractInsnNode instruction = method.instructions.getFirst(); instruction != null;
+                instruction = instruction.getNext()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || !call.owner.equals("net/minecraft/server/packs/resources/SimpleReloadInstance")
+                    || !call.name.equals("createBarrierForListener")) {
+                continue;
+            }
+            AbstractInsnNode listenerLoad = instruction.getPrevious();
+            while (listenerLoad != null) {
+                if (listenerLoad instanceof VarInsnNode load
+                        && load.getOpcode() == Opcodes.ALOAD
+                        && load.var == listenerLocal) {
+                    break;
+                }
+                listenerLoad = listenerLoad.getPrevious();
+            }
+            if (listenerLoad == null) {
+                continue;
+            }
+            method.instructions.insert(listenerLoad, new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "dev/gaius/browser/BrowserResourceReloadProfiler",
+                    "unwrap",
+                    "(Lnet/minecraft/server/packs/resources/PreparableReloadListener;)"
+                            + "Lnet/minecraft/server/packs/resources/PreparableReloadListener;",
+                    false));
+            barrierUnwrapped = true;
+            break;
+        }
+        if (!barrierUnwrapped) {
+            throw new IOException("SimpleReloadInstance barrier listener patch point was not found");
+        }
+        method.maxStack = Math.max(method.maxStack, 1);
+        writeComputeFrames(node, output);
+    }
+
+    /** Labels the handful of large vanilla continuations that dominate custom resource-pack stalls. */
+    private static void patchResourceReloadTaskLabels(String jar, Path modelOutput, Path fontOutput)
+            throws IOException {
+        ClassNode modelManager = read(jar, "net/minecraft/client/resources/model/ModelManager.class");
+        MethodNode modelReload = find(modelManager, "reload", "(Lnet/minecraft/server/packs/resources/"
+                + "PreparableReloadListener$SharedState;Ljava/util/concurrent/Executor;"
+                + "Lnet/minecraft/server/packs/resources/PreparableReloadListener$PreparationBarrier;"
+                + "Ljava/util/concurrent/Executor;)Ljava/util/concurrent/CompletableFuture;");
+        if (modelReload == null) {
+            throw new IOException("ModelManager reload task label patch point was not found");
+        }
+        String[] modelLabels = {
+                "ModelManager.specialBlockModels",
+                "ModelManager.discoverModelDependencies",
+                "ModelManager.buildModelGroups",
+        };
+        int modelContinuation = 0;
+        for (AbstractInsnNode instruction = modelReload.instructions.getFirst(); instruction != null;
+                instruction = instruction.getNext()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || !call.owner.equals("java/util/concurrent/CompletableFuture")
+                    || !call.name.equals("thenApplyAsync")) {
+                continue;
+            }
+            if (modelContinuation >= modelLabels.length) {
+                throw new IOException("ModelManager has unexpected async continuation count");
+            }
+            modelReload.instructions.insertBefore(call, reloadTaskLabel(modelLabels[modelContinuation++]));
+        }
+        if (modelContinuation != modelLabels.length) {
+            throw new IOException("ModelManager async continuation patch point was not found");
+        }
+        patchModelManagerBrowserDependencyScheduler(modelReload);
+        patchModelManagerBrowserDependencyResult(nodeMethod(modelManager, "lambda$reload$4"));
+        writeComputeFrames(modelManager, modelOutput);
+
+        ClassNode fontManager = read(jar, "net/minecraft/client/gui/font/FontManager.class");
+        MethodNode fontReload = find(fontManager, "reload", "(Lnet/minecraft/server/packs/resources/"
+                + "PreparableReloadListener$SharedState;Ljava/util/concurrent/Executor;"
+                + "Lnet/minecraft/server/packs/resources/PreparableReloadListener$PreparationBarrier;"
+                + "Ljava/util/concurrent/Executor;)Ljava/util/concurrent/CompletableFuture;");
+        if (fontReload == null) {
+            throw new IOException("FontManager reload task label patch point was not found");
+        }
+        int fontApply = 0;
+        for (AbstractInsnNode instruction = fontReload.instructions.getFirst(); instruction != null;
+                instruction = instruction.getNext()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || !call.owner.equals("java/util/concurrent/CompletableFuture")
+                    || !call.name.equals("thenAcceptAsync")) {
+                continue;
+            }
+            fontReload.instructions.insertBefore(call, reloadTaskLabel("FontManager.apply"));
+            fontApply++;
+        }
+        if (fontApply != 1) {
+            throw new IOException("FontManager apply task label patch point was not found");
+        }
+        patchFontManagerApplySections(fontManager);
+        writeComputeFrames(fontManager, fontOutput);
+    }
+
+    /** Records the four synchronous phases of FontManager.apply without changing their order. */
+    private static void patchFontManagerApplySections(ClassNode node) throws IOException {
+        MethodNode apply = find(node, "apply", "(Lnet/minecraft/client/gui/font/FontManager$Preparation;"
+                + "Lnet/minecraft/util/profiling/ProfilerFiller;)V");
+        if (apply == null) {
+            throw new IOException("FontManager apply section patch point was not found");
+        }
+        String[] names = {
+                "FontManager.apply.closeFontSets",
+                "FontManager.apply.closeProviders",
+                "FontManager.apply.createFontSets",
+                "FontManager.apply.bindAtlasProviders",
+        };
+        int section = 0;
+        for (AbstractInsnNode instruction = apply.instructions.getFirst(); instruction != null;
+                instruction = instruction.getNext()) {
+            if (!(instruction instanceof MethodInsnNode call)) {
+                continue;
+            }
+            boolean match = (call.owner.equals("java/util/Collection") && call.name.equals("forEach"))
+                    || (call.owner.equals("java/util/List") && call.name.equals("forEach"))
+                    || (call.owner.equals("java/util/Map") && call.name.equals("forEach"))
+                    || (call.owner.equals("net/minecraft/client/resources/model/AtlasManager")
+                            && call.name.equals("forEach"));
+            if (!match) {
+                continue;
+            }
+            if (section >= names.length) {
+                throw new IOException("FontManager apply has unexpected synchronous sections");
+            }
+            String name = names[section++];
+            apply.instructions.insertBefore(call, reloadSectionEvent("sectionStarted", name));
+            apply.instructions.insert(call, reloadSectionEvent("sectionCompleted", name));
+        }
+        if (section != names.length) {
+            throw new IOException("FontManager apply synchronous section patch points were not found");
+        }
+    }
+
+    private static InsnList reloadTaskLabel(String label) {
+        InsnList code = new InsnList();
+        code.add(new LdcInsnNode(label));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserResourceReloadProfiler",
+                "label",
+                "(Ljava/util/concurrent/Executor;Ljava/lang/String;)Ljava/util/concurrent/Executor;",
+                false));
+        return code;
+    }
+
+    private static InsnList reloadSectionEvent(String method, String name) {
+        InsnList code = new InsnList();
+        code.add(new LdcInsnNode(name));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserResourceReloadProfiler",
+                method,
+                "(Ljava/lang/String;)V",
+                false));
+        return code;
+    }
+
+    /** Replaces vanilla's one-turn dependency discovery continuation with a frame-budgeted stage. */
+    private static void patchModelManagerBrowserDependencyScheduler(MethodNode reload)
+            throws IOException {
+        MethodInsnNode continuation = null;
+        for (AbstractInsnNode instruction = reload.instructions.getFirst(); instruction != null;
+                instruction = instruction.getNext()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || !call.owner.equals("java/util/concurrent/CompletableFuture")
+                    || !call.name.equals("thenApplyAsync")) {
+                continue;
+            }
+            AbstractInsnNode previous = call.getPrevious();
+            while (previous != null && previous.getOpcode() < 0) {
+                previous = previous.getPrevious();
+            }
+            if (!(previous instanceof MethodInsnNode label)
+                    || !label.owner.equals("dev/gaius/browser/BrowserResourceReloadProfiler")
+                    || !label.name.equals("label")) {
+                continue;
+            }
+            AbstractInsnNode labelText = label.getPrevious();
+            while (labelText != null && labelText.getOpcode() < 0) {
+                labelText = labelText.getPrevious();
+            }
+            if (labelText instanceof LdcInsnNode text
+                    && "ModelManager.discoverModelDependencies".equals(text.cst)) {
+                continuation = call;
+                break;
+            }
+        }
+        if (continuation == null) {
+            throw new IOException("ModelManager dependency continuation patch point was not found");
+        }
+        AbstractInsnNode factory = continuation.getPrevious();
+        while (factory != null) {
+            if (factory instanceof org.objectweb.asm.tree.InvokeDynamicInsnNode) {
+                break;
+            }
+            factory = factory.getPrevious();
+        }
+        if (!(factory instanceof org.objectweb.asm.tree.InvokeDynamicInsnNode)) {
+            throw new IOException("ModelManager dependency continuation lambda was not found");
+        }
+        AbstractInsnNode thirdFuture = previousOpcode(factory);
+        AbstractInsnNode secondFuture = previousOpcode(thirdFuture);
+        AbstractInsnNode firstFuture = previousOpcode(secondFuture);
+        if (!(firstFuture instanceof VarInsnNode first && first.getOpcode() == Opcodes.ALOAD && first.var == 8)
+                || !(secondFuture instanceof VarInsnNode second && second.getOpcode() == Opcodes.ALOAD && second.var == 9)
+                || !(thirdFuture instanceof VarInsnNode third && third.getOpcode() == Opcodes.ALOAD && third.var == 10)) {
+            throw new IOException("ModelManager dependency continuation captures changed");
+        }
+        InsnList replacement = new InsnList();
+        replacement.add(new VarInsnNode(Opcodes.ALOAD, 8));
+        replacement.add(new VarInsnNode(Opcodes.ALOAD, 9));
+        replacement.add(new VarInsnNode(Opcodes.ALOAD, 10));
+        replacement.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        replacement.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "net/minecraft/client/resources/model/BrowserModelDependencyScheduler",
+                "continuation",
+                "(Ljava/util/concurrent/CompletableFuture;Ljava/util/concurrent/CompletableFuture;"
+                        + "Ljava/util/concurrent/CompletableFuture;Ljava/util/concurrent/Executor;)"
+                        + "Ljava/util/function/Function;",
+                false));
+        reload.instructions.insertBefore(firstFuture, replacement);
+        reload.instructions.remove(firstFuture);
+        reload.instructions.remove(secondFuture);
+        reload.instructions.remove(thirdFuture);
+        reload.instructions.remove(factory);
+        continuation.name = "thenComposeAsync";
+    }
+
+    /** Constructs the private ResolvedModels record inside ModelManager after frame-sliced discovery. */
+    private static void patchModelManagerBrowserDependencyResult(MethodNode reloadState) throws IOException {
+        if (reloadState == null) {
+            throw new IOException("ModelManager reload result continuation was not found");
+        }
+        TypeInsnNode resolvedModelsCast = null;
+        for (AbstractInsnNode instruction = reloadState.instructions.getFirst(); instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof TypeInsnNode cast
+                    && cast.getOpcode() == Opcodes.CHECKCAST
+                    && cast.desc.equals("net/minecraft/client/resources/model/ModelManager$ResolvedModels")) {
+                resolvedModelsCast = cast;
+                break;
+            }
+        }
+        if (resolvedModelsCast == null) {
+            throw new IOException("ModelManager resolved-model result cast was not found");
+        }
+        AbstractInsnNode store = nextOpcode(resolvedModelsCast);
+        if (!(store instanceof VarInsnNode resultStore) || resultStore.getOpcode() != Opcodes.ASTORE) {
+            throw new IOException("ModelManager resolved-model result storage changed");
+        }
+        resolvedModelsCast.desc = "net/minecraft/client/resources/model/ModelDiscovery";
+        InsnList constructResolvedModels = new InsnList();
+        constructResolvedModels.add(new TypeInsnNode(
+                Opcodes.NEW, "net/minecraft/client/resources/model/ModelManager$ResolvedModels"));
+        constructResolvedModels.add(new InsnNode(Opcodes.DUP));
+        constructResolvedModels.add(new VarInsnNode(Opcodes.ALOAD, resultStore.var));
+        constructResolvedModels.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/resources/model/ModelDiscovery",
+                "missingModel",
+                "()Lnet/minecraft/client/resources/model/ResolvedModel;",
+                false));
+        constructResolvedModels.add(new VarInsnNode(Opcodes.ALOAD, resultStore.var));
+        constructResolvedModels.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/resources/model/ModelDiscovery",
+                "resolve",
+                "()Ljava/util/Map;",
+                false));
+        constructResolvedModels.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                "net/minecraft/client/resources/model/ModelManager$ResolvedModels",
+                "<init>",
+                "(Lnet/minecraft/client/resources/model/ResolvedModel;Ljava/util/Map;)V",
+                false));
+        constructResolvedModels.add(new VarInsnNode(Opcodes.ASTORE, resultStore.var));
+        reloadState.instructions.insert(store, constructResolvedModels);
+    }
+
+    private static MethodNode nodeMethod(ClassNode node, String name) {
+        for (MethodNode method : node.methods) {
+            if (method.name.equals(name)) {
+                return method;
+            }
+        }
+        return null;
     }
 
     private static void patchClientPacketListenerLoadingDiagnostics(String jar, Path output)
@@ -6474,6 +7073,25 @@ public final class MinecraftClientPatcher {
         writeComputeFrames(node, output);
     }
 
+    private static void patchFriendlyByteBufBrowserLongArray(String jar, Path output)
+            throws IOException {
+        ClassNode node = read(jar, "net/minecraft/network/FriendlyByteBuf.class");
+        MethodNode method = find(node, "readFixedSizeLongArray",
+                "(Lio/netty/buffer/ByteBuf;[J)[J");
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserLongArrayCodec",
+                "readFixedSizeLongArray",
+                "(Lio/netty/buffer/ByteBuf;[J)[J",
+                false));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(method, code, 2, 2);
+        write(node, output);
+    }
+
     private static void patchProtoChunkBrowserHeightmapCache(String jar, Path output)
             throws IOException {
         String owner = "net/minecraft/world/level/chunk/ProtoChunk";
@@ -7676,6 +8294,84 @@ public final class MinecraftClientPatcher {
                 false));
         code.add(new InsnNode(Opcodes.ARETURN));
         replace(method, code, 1, 0);
+        write(node, output);
+    }
+
+    private static void patchFilePackResourcesBrowserAtlasOverlays(String jar, Path output)
+            throws IOException {
+        ClassNode node = read(jar,
+                "net/minecraft/server/packs/FilePackResources$FileResourcesSupplier.class");
+        MethodNode openFull = find(node, "openFull",
+                "(Lnet/minecraft/server/packs/PackLocationInfo;"
+                        + "Lnet/minecraft/server/packs/repository/Pack$Metadata;)"
+                        + "Lnet/minecraft/server/packs/PackResources;");
+        boolean patched = false;
+        for (AbstractInsnNode instruction = openFull.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKEVIRTUAL
+                    || !call.owner.equals("net/minecraft/server/packs/repository/Pack$Metadata")
+                    || !call.name.equals("overlays")
+                    || !call.desc.equals("()Ljava/util/List;")) {
+                continue;
+            }
+            AbstractInsnNode store = nextOpcode(instruction);
+            if (!(store instanceof VarInsnNode variable) || variable.getOpcode() != Opcodes.ASTORE) {
+                throw new IllegalStateException("File pack overlay list was not stored after lookup");
+            }
+            InsnList compatibility = new InsnList();
+            compatibility.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            compatibility.add(new FieldInsnNode(
+                    Opcodes.GETFIELD, node.name, "content", "Ljava/io/File;"));
+            compatibility.add(new VarInsnNode(Opcodes.ALOAD, variable.var));
+            compatibility.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "dev/gaius/browser/BrowserPackOverlayCompat",
+                    "mergeSafeAtlasOverlays",
+                    "(Ljava/io/File;Ljava/util/List;)Ljava/util/List;",
+                    false));
+            compatibility.add(new VarInsnNode(Opcodes.ASTORE, variable.var));
+            openFull.instructions.insert(store, compatibility);
+            patched = true;
+            break;
+        }
+        if (!patched) {
+            throw new IllegalStateException("File pack overlay metadata lookup was not found");
+        }
+        openFull.maxStack = Math.max(openFull.maxStack, 2);
+        write(node, output);
+    }
+
+    private static void patchSingleFileBrowserAtlasFallback(String jar, Path output)
+            throws IOException {
+        ClassNode node = read(jar,
+                "net/minecraft/client/renderer/texture/atlas/sources/SingleFile.class");
+        MethodNode run = find(node, "run",
+                "(Lnet/minecraft/server/packs/resources/ResourceManager;"
+                        + "Lnet/minecraft/client/renderer/texture/atlas/SpriteSource$Output;)V");
+        boolean patched = false;
+        for (AbstractInsnNode instruction = run.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || !call.owner.equals("net/minecraft/server/packs/resources/ResourceManager")
+                    || !call.name.equals("getResource")
+                    || !call.desc.equals("(Lnet/minecraft/resources/Identifier;)Ljava/util/Optional;")) {
+                continue;
+            }
+            call.setOpcode(Opcodes.INVOKESTATIC);
+            call.owner = "dev/gaius/browser/BrowserAtlasResourceFallback";
+            call.name = "getResource";
+            call.desc = "(Lnet/minecraft/server/packs/resources/ResourceManager;"
+                    + "Lnet/minecraft/resources/Identifier;)Ljava/util/Optional;";
+            call.itf = false;
+            patched = true;
+            break;
+        }
+        if (!patched) {
+            throw new IllegalStateException("SingleFile atlas resource lookup was not found");
+        }
         write(node, output);
     }
 

@@ -186,7 +186,10 @@ java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
   "$authlib_patch_classes/com/mojang/authlib/minecraft/client/MinecraftClient.class"
 jar --update \
   --file "$authlib_output" \
-  -C "$authlib_patch_classes" com/mojang/authlib/minecraft/client/MinecraftClient.class
+  -C "$authlib_patch_classes" com/mojang/authlib/minecraft/client/MinecraftClient.class \
+  -C "$authlib_patch_classes" com/mojang/authlib/minecraft/MinecraftProfileTexture.class \
+  -C "$authlib_patch_classes" com/mojang/authlib/yggdrasil/response/MinecraftTexturesPayload.class \
+  -C "$authlib_patch_classes" com/mojang/authlib/yggdrasil/YggdrasilMinecraftSessionService.class
 
 classlib_patch_classes="$overlay_work/classlib-patches"
 mkdir -p "$classlib_patch_classes"
@@ -510,6 +513,13 @@ client_override_classes="$overlay_work/client-override-classes"
 mkdir -p "$client_patch_classes"
 find "$client_patch_classes" -type f -delete
 cp "$work/client-named.jar" "$client_output"
+# TeaVM resolves the client overlay before generated browser resources. Keep the
+# complete vanilla asset set, but remove only the two generated Unicode font
+# definitions so build-teavm.sh can replace their stale JAR stubs without
+# dropping core files such as en_us.json from the browser resource table.
+zip -q -d "$client_output" \
+  assets/minecraft/font/include/unifont.json \
+  assets/minecraft/font/include/unifont_pua.json >/dev/null 2>&1 || true
 mkdir -p "$client_override_classes"
 find "$client_override_classes" -type f -delete
 client_override_sources=()

@@ -212,6 +212,8 @@ public final class LwjglOpenGLBrowserPatcher {
         add(methods, "GL20C", "glScissor", "(IIII)V", "scissor");
         add(methods, "GL30", "glGenVertexArrays", "()I", "genVertexArray");
         add(methods, "GL30", "glBindVertexArray", "(I)V", "bindVertexArray");
+        add(methods, "GL30", "glDeleteVertexArrays", "(I)V", "deleteVertexArray");
+        add(methods, "GL30C", "glDeleteVertexArrays", "(I)V", "deleteVertexArray");
         add(methods, "GL30", "glGenFramebuffers", "()I", "genFramebuffer");
         add(methods, "GL30", "glBindFramebuffer", "(II)V", "bindFramebuffer");
         add(methods, "GL30", "glFramebufferTexture2D", "(IIIII)V", "framebufferTexture2D");

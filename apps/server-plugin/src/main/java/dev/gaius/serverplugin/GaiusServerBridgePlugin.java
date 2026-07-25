@@ -16,6 +16,7 @@ public final class GaiusServerBridgePlugin extends JavaPlugin {
         int connectTimeoutMillis = getConfig().getInt("connect-timeout-millis", 5000);
         int maximumConnections = getConfig().getInt("maximum-connections", 256);
         int maximumFrameBytes = getConfig().getInt("maximum-frame-bytes", 16 * 1024 * 1024);
+        boolean proxyKeepAlives = getConfig().getBoolean("proxy-keepalives", true);
         String accessToken = getConfig().getString("access-token", "");
         List<String> allowedOrigins = getConfig().getStringList("allowed-origins");
 
@@ -29,6 +30,7 @@ public final class GaiusServerBridgePlugin extends JavaPlugin {
                 Math.max(250, connectTimeoutMillis),
                 Math.max(1, maximumConnections),
                 Math.max(1024, maximumFrameBytes),
+                proxyKeepAlives,
                 accessToken == null ? "" : accessToken,
                 allowedOrigins,
                 getLogger());

@@ -86,6 +86,13 @@ echo "Fetching browser gameplay sound assets"
 browser_sound_metadata_assets=(
   "minecraft/sounds.json"
 )
+browser_font_assets=(
+  "minecraft/font/include/unifont.json"
+  "minecraft/font/include/unifont_pua.json"
+  "minecraft/font/unifont.zip"
+  "minecraft/font/unifont_jp.zip"
+  "minecraft/font/unifont_pua.zip"
+)
 browser_sound_assets=(
   "minecraft/sounds/ui/toast/in.ogg"
   "minecraft/sounds/ui/toast/out.ogg"
@@ -123,7 +130,7 @@ done < <(
       )
   ' "$asset_index"
 )
-download_sound_asset() {
+download_browser_asset() {
   local logical_path="$1"
   local hash
   hash="$(jq -er --arg path "$logical_path" '.objects[$path].hash' "$asset_index")"
@@ -133,14 +140,15 @@ download_sound_asset() {
     "$assets/objects/${hash:0:2}/$hash"
 }
 export asset_index assets
-export -f download_verified download_sound_asset
-printf '%s\n' "${browser_sound_metadata_assets[@]}" "${browser_sound_assets[@]}" |
-  xargs -n 1 -P "${GAIUS_FETCH_PARALLEL:-16}" bash -c 'download_sound_asset "$0"'
+export -f download_verified download_browser_asset
+printf '%s\n' "${browser_sound_metadata_assets[@]}" "${browser_sound_assets[@]}" "${browser_font_assets[@]}" |
+  xargs -n 1 -P "${GAIUS_FETCH_PARALLEL:-16}" bash -c 'download_browser_asset "$0"'
 
 echo "Fetched and verified:"
 echo "  client:   $work/client-obfuscated.jar"
 echo "  mappings: $work/client-mappings.txt"
 echo "  libraries: $(find "$libraries" -type f -name '*.jar' | wc -l | tr -d ' ')"
 echo "  browser sound assets: ${#browser_sound_assets[@]} playable, ${#browser_sound_metadata_assets[@]} metadata"
+echo "  browser Unicode font assets: ${#browser_font_assets[@]}"
 jq '{id, protocol_version, world_version, java_version, pack_version}' \
   "$work/client-version.json"

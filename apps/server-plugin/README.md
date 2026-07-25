@@ -20,3 +20,8 @@ browser page is served over HTTPS. Set `access-token` and restrict
 Configure the browser launcher with the plugin endpoint as its Bridge URL. The
 wire protocol is identical to `apps/bridge/dist/main.js`, so the browser can
 fall back to an external relay when the plugin is absent.
+
+`proxy-keepalives` is enabled by default. It replies only to the exact
+unencrypted 1.21 keepalive frame while the browser is busy applying a server
+resource pack, preventing a local Paper backend from timing out the tunnel.
+All other frames remain transparent; set it to `false` to disable this behavior.

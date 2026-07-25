@@ -401,6 +401,7 @@ public final class BrowserGlfw {
     }
 
     @JSBody(script = """
+            const hidden=document.visibilityState!=='visible';
             const fps=window.__gaiusFps || (window.__gaiusFps={});
             const telemetry=window.__gaiusFrameTelemetry;
             let now;
@@ -425,7 +426,10 @@ public final class BrowserGlfw {
             fps.gameFrames=(fps.gameFrames||0)+1;
             fps.gameSampleCounter=((fps.gameSampleCounter||0)+1)&15;
             if (fps.gameSampleCounter !== 0 && fps.gameLastSampleAt) {
-              return;
+              if (hidden) {
+                window.__gaiusBackgroundFrameThrottles=(window.__gaiusBackgroundFrameThrottles||0)+1;
+              }
+              return hidden;
             }
             if (now === undefined) {
               now=(typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
@@ -437,11 +441,17 @@ public final class BrowserGlfw {
               fps.gameFrames=0;
               fps.gameLastSampleAt=now;
             }
+            if (hidden) {
+              window.__gaiusBackgroundFrameThrottles=(window.__gaiusBackgroundFrameThrottles||0)+1;
+            }
+            return hidden;
             """)
-    private static native void swapBuffersJs();
+    private static native boolean swapBuffersJs();
 
     public static void swapBuffers(long window) {
-        swapBuffersJs();
+        if (swapBuffersJs()) {
+            sleepForBrowserMillis(50L);
+        }
     }
 
     public static void swapInterval(int interval) {

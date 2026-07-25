@@ -800,14 +800,16 @@ public final class BrowserOpenGL {
                 const previous=previousId ? this.buffers.get(previousId) : null;
                 const offset=Number(vertexBuffer.offset || 0) + Number(format.relativeOffset || 0);
                 const stride=vertexBuffer.stride|0;
+                const expectedInteger=this.expectedAttribInteger(index);
+                const effectiveInteger=expectedInteger===null ? !!format.integer : !!expectedInteger;
                 const pointer={
                   index:index,
                   size:format.size|0,
                   type:format.type|0,
-                  normalized:!!format.normalized,
+                  normalized:effectiveInteger ? false : !!format.normalized,
                   stride:stride,
                   offset:offset,
-                  integer:!!format.integer,
+                  integer:effectiveInteger,
                   buffer:vertexBuffer.buffer|0
                 };
                 const componentBytes=this.componentBytes(format.type);
@@ -831,6 +833,7 @@ public final class BrowserOpenGL {
                   }
                   return;
                 }
+                this.recordAttribPointerAdapt(index,!!format.integer,effectiveInteger,format.type|0);
                 vao.attribPointers.set(index,pointer);
                 this.setAttribBufferPresence(vao,index,true);
                 this.setAttribMisaligned(vao,index,!aligned,vertexBuffer.buffer|0);
@@ -840,10 +843,10 @@ public final class BrowserOpenGL {
                 }
                 if (aligned) {
                   gl.bindBuffer(gl.ARRAY_BUFFER,bufferObject);
-                  if (format.integer) {
+                  if (effectiveInteger) {
                     gl.vertexAttribIPointer(index,format.size|0,format.type|0,stride,offset);
                   } else {
-                    gl.vertexAttribPointer(index,format.size|0,format.type|0,!!format.normalized,stride,offset);
+                    gl.vertexAttribPointer(index,format.size|0,format.type|0,!!pointer.normalized,stride,offset);
                   }
                 } else {
                   this.markBufferShadowRequired(vertexBuffer.buffer|0,'misaligned-attrib-binding');
@@ -1180,6 +1183,7 @@ public final class BrowserOpenGL {
                 const gl=window.__gaiusWebGL;
                 const object=this.programs.get(program|0);
                 const result=[];
+                result.byLocation=new Map();
                 if (object) {
                   let count=0;
                   try {
@@ -1197,12 +1201,14 @@ public final class BrowserOpenGL {
                     if (!info || !info.name) continue;
                     const location=gl.getAttribLocation(object,info.name);
                     if (location < 0) continue;
-                    result.push({
+                    const active={
                       location:location|0,
                       name:String(info.name),
                       type:info.type|0,
                       integer:this.isIntegerAttribType(info.type)
-                    });
+                    };
+                    result.push(active);
+                    result.byLocation.set(location|0,active);
                   }
                 }
                 this.programAttribs.set(program|0,result);
@@ -1561,6 +1567,47 @@ public final class BrowserOpenGL {
             }
             """)
     private static native void initializeJs();
+
+    @JSBody(script = """
+            const state=window.__gaiusGL;
+            if (!state || state.__attribTypeAdaptInit) return;
+            state.__attribTypeAdaptInit=true;
+            state.expectedAttribInteger=function(index) {
+              const program=this.currentProgram|0;
+              if (!program) return null;
+              let attribs=this.programAttribs.get(program);
+              if (!attribs) {
+                this.refreshProgramAttribs(program);
+                attribs=this.programAttribs.get(program);
+                var stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+                stats.attribPointerProgramLazyRefresh=(stats.attribPointerProgramLazyRefresh||0)+1;
+              }
+              if (!attribs) return null;
+              const byLocation=attribs.byLocation;
+              if (byLocation) {
+                const mappedAttrib=byLocation.get(index|0);
+                return mappedAttrib ? !!mappedAttrib.integer : null;
+              }
+              for (let i=0;i<attribs.length;i++) {
+                const candidate=attribs[i];
+                if (candidate && (candidate.location|0)===(index|0)) return !!candidate.integer;
+              }
+              return null;
+            };
+            state.recordAttribPointerAdapt=function(index,requestedInteger,effectiveInteger,type) {
+              if (!!requestedInteger===!!effectiveInteger) return;
+              const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+              stats.attribTypePointerAdapts=(stats.attribTypePointerAdapts||0)+1;
+              stats.attribTypePointerAdaptLast={
+                program:this.currentProgram|0,
+                location:index|0,
+                requestedInteger:!!requestedInteger,
+                effectiveInteger:!!effectiveInteger,
+                pointerType:type|0
+              };
+            };
+            """)
+    private static native void initializeAttribTypeAdaptJs();
 
     @JSBody(script = """
             const gl=window.__gaiusWebGL,state=window.__gaiusGL;
@@ -2012,6 +2059,7 @@ public final class BrowserOpenGL {
 
     public static void initialize() {
         initializeJs();
+        initializeAttribTypeAdaptJs();
         initializeElementBufferStateJs();
         initializePerformanceStateJs();
         initializeUniformValueCacheJs();
@@ -2919,7 +2967,11 @@ public final class BrowserOpenGL {
                 .replace("textureLod(Sprite, texCoord0, MipMapLevel)", "textureLod(Sprite, texCoord0, float(MipMapLevel))")
                 .replace("textureLod(CurrentSprite, texCoord0, MipMapLevel)", "textureLod(CurrentSprite, texCoord0, float(MipMapLevel))")
                 .replace("textureLod(NextSprite, texCoord0, MipMapLevel)", "textureLod(NextSprite, texCoord0, float(MipMapLevel))")
-                .replace("(gl_VertexID >> 3) / 1000.0", "float(gl_VertexID >> 3) / 1000.0");
+                .replace("(gl_VertexID >> 3) / 1000.0", "float(gl_VertexID >> 3) / 1000.0")
+                // ModelEngine's entity shader relies on desktop GLSL implicit int-to-float conversion.
+                .replace("UV0 * SKINRES", "UV0 * float(SKINRES)")
+                .replace("SPACING * (partId + 1)", "SPACING * float(partId + 1)")
+                .replace("(1 - fade)", "(1.0 - fade)");
         return stripDesktopFloatSuffixes(translated);
     }
 
@@ -3442,7 +3494,9 @@ public final class BrowserOpenGL {
             const buffer=state.boundBuffers.get(gl.ARRAY_BUFFER)|0;
             const sizeValue=size|0;
             const typeValue=type|0;
-            const normalizedValue=!!normalized;
+            const expectedInteger=state.expectedAttribInteger(idx);
+            const effectiveInteger=expectedInteger===null ? false : !!expectedInteger;
+            const normalizedValue=effectiveInteger ? false : !!normalized;
             const strideValue=stride|0;
             const numericOffset=Number(offset);
             const numericStride=strideValue;
@@ -3455,7 +3509,7 @@ public final class BrowserOpenGL {
             const previousMisaligned=vao.misalignedAttribs && vao.misalignedAttribs.has(idx);
             const previousPresence=vao.attribHasBuffer.has(idx);
             const typeLayoutChanged=!previousPointer
-              || !!previousPointer.integer
+              || !!previousPointer.integer!==effectiveInteger
               || (previousPointer.size|0)!==sizeValue
               || (previousPointer.type|0)!==typeValue;
             const samePointer=!!previousPointer
@@ -3465,7 +3519,7 @@ public final class BrowserOpenGL {
               && !!previousPointer.normalized===normalizedValue
               && (previousPointer.stride|0)===strideValue
               && Number(previousPointer.offset)===numericOffset
-              && !previousPointer.integer
+              && !!previousPointer.integer===effectiveInteger
               && (previousPointer.buffer|0)===(buffer|0);
             if (samePointer && previousMisaligned===misaligned && previousPresence===present) {
               if (state.hotPathTelemetryEnabled) {
@@ -3478,6 +3532,7 @@ public final class BrowserOpenGL {
               }
               return;
             }
+            state.recordAttribPointerAdapt(idx,false,effectiveInteger,typeValue);
             const pointer={
               index:idx,
               size:sizeValue,
@@ -3485,7 +3540,7 @@ public final class BrowserOpenGL {
               normalized:normalizedValue,
               stride:strideValue,
               offset:numericOffset,
-              integer:false,
+              integer:effectiveInteger,
               buffer:buffer|0
             };
             vao.attribPointers.set(idx,pointer);
@@ -3503,7 +3558,11 @@ public final class BrowserOpenGL {
               if (aligned) return;
             }
             if (aligned) {
-              gl.vertexAttribPointer(index,sizeValue,typeValue,normalizedValue,strideValue,numericOffset);
+              if (effectiveInteger) {
+                gl.vertexAttribIPointer(index,sizeValue,typeValue,strideValue,numericOffset);
+              } else {
+                gl.vertexAttribPointer(index,sizeValue,typeValue,normalizedValue,strideValue,numericOffset);
+              }
             } else {
               if (buffer) state.markBufferShadowRequired(buffer,'misaligned-attrib-pointer');
               var stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
@@ -3524,6 +3583,8 @@ public final class BrowserOpenGL {
             const buffer=state.boundBuffers.get(gl.ARRAY_BUFFER)|0;
             const sizeValue=size|0;
             const typeValue=type|0;
+            const expectedInteger=state.expectedAttribInteger(idx);
+            const effectiveInteger=expectedInteger===null ? true : !!expectedInteger;
             const strideValue=stride|0;
             const numericOffset=Number(offset);
             const numericStride=strideValue;
@@ -3536,7 +3597,7 @@ public final class BrowserOpenGL {
             const previousMisaligned=vao.misalignedAttribs && vao.misalignedAttribs.has(idx);
             const previousPresence=vao.attribHasBuffer.has(idx);
             const typeLayoutChanged=!previousPointer
-              || !previousPointer.integer
+              || !!previousPointer.integer!==effectiveInteger
               || (previousPointer.size|0)!==sizeValue
               || (previousPointer.type|0)!==typeValue;
             const samePointer=!!previousPointer
@@ -3546,7 +3607,7 @@ public final class BrowserOpenGL {
               && !previousPointer.normalized
               && (previousPointer.stride|0)===strideValue
               && Number(previousPointer.offset)===numericOffset
-              && !!previousPointer.integer
+              && !!previousPointer.integer===effectiveInteger
               && (previousPointer.buffer|0)===(buffer|0);
             if (samePointer && previousMisaligned===misaligned && previousPresence===present) {
               if (state.hotPathTelemetryEnabled) {
@@ -3559,6 +3620,7 @@ public final class BrowserOpenGL {
               }
               return;
             }
+            state.recordAttribPointerAdapt(idx,true,effectiveInteger,typeValue);
             const pointer={
               index:idx,
               size:sizeValue,
@@ -3566,7 +3628,7 @@ public final class BrowserOpenGL {
               normalized:false,
               stride:strideValue,
               offset:numericOffset,
-              integer:true,
+              integer:effectiveInteger,
               buffer:buffer|0
             };
             vao.attribPointers.set(idx,pointer);
@@ -3584,7 +3646,11 @@ public final class BrowserOpenGL {
               if (aligned) return;
             }
             if (aligned) {
-              gl.vertexAttribIPointer(index,sizeValue,typeValue,strideValue,numericOffset);
+              if (effectiveInteger) {
+                gl.vertexAttribIPointer(index,sizeValue,typeValue,strideValue,numericOffset);
+              } else {
+                gl.vertexAttribPointer(index,sizeValue,typeValue,false,strideValue,numericOffset);
+              }
             } else {
               if (buffer) state.markBufferShadowRequired(buffer,'misaligned-attrib-pointer');
               var stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
@@ -3947,12 +4013,27 @@ public final class BrowserOpenGL {
 
     @JSBody(params = {
             "mode", "firstOrBaseVertex", "indexOffset", "count",
-            "type", "indexBytes", "instances"
+            "type", "indexBytes", "instances", "elementBuffer"
     }, script = """
             const state=window.__gaiusGL;
             if ((indexBytes|0)===0) {
               state.executeDraw((instances|0)>1?2:0,mode,firstOrBaseVertex,count,instances,0,0);
               return;
+            }
+            const gl=window.__gaiusWebGL;
+            const vao=state.getVaoEmu();
+            const nextId=elementBuffer|0;
+            const current=state.boundBuffers.get(gl.ELEMENT_ARRAY_BUFFER)|0;
+            if ((vao.elementArrayBuffer|0)===nextId) {
+              state.bindPhysicalElementBuffer(vao,vao.elementArrayBufferObject || null);
+              if (current!==nextId) state.boundBuffers.set(gl.ELEMENT_ARRAY_BUFFER,nextId);
+            } else {
+              const object=nextId===0?null:state.buffers.get(nextId);
+              if (nextId) state.markBufferShadowRequired(nextId,'element-array');
+              state.bindPhysicalElementBuffer(vao,object || null);
+              vao.elementArrayBuffer=nextId;
+              vao.elementArrayBufferObject=object || null;
+              if (current!==nextId) state.boundBuffers.set(gl.ELEMENT_ARRAY_BUFFER,nextId);
             }
             const offset=Number(indexOffset)*Number(indexBytes);
             if ((instances|0)>1) {
@@ -3969,7 +4050,7 @@ public final class BrowserOpenGL {
             """)
     public static native void drawFromBuffers(
             int mode, int firstOrBaseVertex, int indexOffset, int count,
-            int type, int indexBytes, int instances);
+            int type, int indexBytes, int instances, int elementBuffer);
 
     @JSBody(params = {"target", "internalFormat", "buffer"}, script = """
             const gl=window.__gaiusWebGL,state=window.__gaiusGL;

@@ -51,9 +51,11 @@ BROWSER_FILE_PERSISTENCE = PORT / "overrides" / "classlib" / "src" / "main" / "j
 MODERN_RUNTIME_SUPPORT = PORT / "overrides" / "classlib" / "src" / "main" / "java" / "org" / "teavm" / "classlib" / "java" / "lang" / "TModernRuntimeSupport.java"
 FILE_OUTPUT_STREAM = PORT / "overrides" / "classlib" / "src" / "main" / "java" / "org" / "teavm" / "classlib" / "java" / "io" / "TFileOutputStream.java"
 BROWSER_BIT_STORAGE = PORT / "overrides" / "classlib" / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserBitStorage.java"
+BROWSER_LONG_ARRAY_CODEC = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserLongArrayCodec.java"
 BROWSER_GUI_ITEM_CACHE = PORT / "overrides" / "client" / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserGuiItemCache.java"
 BROWSER_WORLDGEN_SCHEDULER = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserWorldgenScheduler.java"
 BROWSER_RENDER_SCHEDULER = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserRenderScheduler.java"
+BROWSER_CHUNK_SECTION_LAYERS = PORT / "overrides" / "client" / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserChunkSectionLayers.java"
 BROWSER_IMPROVED_NOISE = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserImprovedNoise.java"
 BROWSER_NOISE_INTERPOLATOR = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserNoiseInterpolator.java"
 BROWSER_PERLIN_NOISE = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserPerlinNoise.java"
@@ -68,9 +70,16 @@ BROWSER_TARGETING = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser"
 BROWSER_CRYPTO = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserCrypto.java"
 BROWSER_AES_CFB8 = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserAesCfb8.java"
 BROWSER_HTTP_PROXY = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserHttpProxy.java"
+BROWSER_CLIENT_NETWORK = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserClientNetwork.java"
+BROWSER_RESOURCE_RELOAD_PROFILER = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserResourceReloadProfiler.java"
+BROWSER_RESOURCE_RELOAD_SCHEDULER = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserResourceReloadScheduler.java"
+BROWSER_PACK_OVERLAY_COMPAT = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserPackOverlayCompat.java"
+BROWSER_ATLAS_RESOURCE_FALLBACK = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserAtlasResourceFallback.java"
+BROWSER_AUTHLIB_GSON = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserAuthlibGson.java"
 BROWSER_SIGNER = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserSigner.java"
 BROWSER_SINGLEPLAYER_CLIENT = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserSingleplayerClient.java"
 BROWSER_INTEGRATED_SERVER_MAIN = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserIntegratedServerMain.java"
+BROWSER_LAZY_DATA_FIXER = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserLazyDataFixer.java"
 MINECRAFT_RESOURCE_SUPPLIER = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "MinecraftResourceSupplier.java"
 SCHEDULED_THREAD_POOL_EXECUTOR = PORT / "src" / "main" / "java" / "org" / "teavm" / "classlib" / "java" / "util" / "concurrent" / "TScheduledThreadPoolExecutor.java"
 SERVER_WORKER_BOOTSTRAP = PORT / "web" / "singleplayer" / "server-worker-bootstrap.js"
@@ -97,6 +106,7 @@ INDEX_HTML = PORT / "web" / "dist" / "index.html"
 HOTPATH_WASM = PORT / "web" / "dist" / "gaius-hotpath.wasm"
 GENERATED_RESOURCE_LIST = TARGET / "generated-resources" / "dev" / "gaius" / "browser" / "minecraft-resources.txt"
 GENERATED_SOUNDS_JSON = TARGET / "generated-resources" / "assets" / "minecraft" / "sounds.json"
+GENERATED_UNIFONT_JSON = TARGET / "generated-resources" / "assets" / "minecraft" / "font" / "include" / "unifont.json"
 POSTPROCESS_TEAVM_JS = PORT / "scripts" / "postprocess-teavm-js.py"
 POSTPROCESS_INDEX_HTML = PORT / "scripts" / "postprocess-index-html.py"
 PORTABLE_HTML = DIST / "Gaius.html"
@@ -164,6 +174,37 @@ def file_matches(path: Path, pattern: bytes) -> bool:
         with path.open("rb") as stream, mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
             return re.search(pattern, data, re.DOTALL) is not None
     except OSError:
+        return False
+
+
+def embedded_resource_matches(path: Path, key: str, expected: bytes) -> bool:
+    if not path.is_file() or not expected:
+        return False
+    prefix = b'"' + key.encode("utf-8") + b'":"'
+    try:
+        with path.open("rb") as stream, mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
+            position = data.find(prefix)
+            if position < 0:
+                return False
+            position += len(prefix) - 1
+            encoded = bytearray()
+            while True:
+                if position >= len(data) or data[position] != ord('"'):
+                    return False
+                end = data.find(b'"', position + 1)
+                if end < 0:
+                    return False
+                encoded.extend(data[position + 1:end])
+                position = end + 1
+                while position < len(data) and data[position] in b" \t\r\n":
+                    position += 1
+                if position >= len(data) or data[position] != ord("+"):
+                    break
+                position += 1
+                while position < len(data) and data[position] in b" \t\r\n":
+                    position += 1
+            return base64.b64decode(encoded) == expected
+    except (OSError, ValueError):
         return False
 
 
@@ -413,9 +454,11 @@ def check_source_patches() -> None:
     modern_runtime_support = MODERN_RUNTIME_SUPPORT.read_text(errors="replace") if MODERN_RUNTIME_SUPPORT.exists() else ""
     file_output_stream = FILE_OUTPUT_STREAM.read_text(errors="replace") if FILE_OUTPUT_STREAM.exists() else ""
     browser_bit_storage = BROWSER_BIT_STORAGE.read_text(errors="replace") if BROWSER_BIT_STORAGE.exists() else ""
+    browser_long_array_codec = BROWSER_LONG_ARRAY_CODEC.read_text(errors="replace") if BROWSER_LONG_ARRAY_CODEC.exists() else ""
     browser_gui_item_cache = BROWSER_GUI_ITEM_CACHE.read_text(errors="replace") if BROWSER_GUI_ITEM_CACHE.exists() else ""
     browser_worldgen_scheduler = BROWSER_WORLDGEN_SCHEDULER.read_text(errors="replace") if BROWSER_WORLDGEN_SCHEDULER.exists() else ""
     browser_render_scheduler = BROWSER_RENDER_SCHEDULER.read_text(errors="replace") if BROWSER_RENDER_SCHEDULER.exists() else ""
+    browser_chunk_section_layers = BROWSER_CHUNK_SECTION_LAYERS.read_text(errors="replace") if BROWSER_CHUNK_SECTION_LAYERS.exists() else ""
     browser_improved_noise = BROWSER_IMPROVED_NOISE.read_text(errors="replace") if BROWSER_IMPROVED_NOISE.exists() else ""
     browser_noise_interpolator = BROWSER_NOISE_INTERPOLATOR.read_text(errors="replace") if BROWSER_NOISE_INTERPOLATOR.exists() else ""
     browser_perlin_noise = BROWSER_PERLIN_NOISE.read_text(errors="replace") if BROWSER_PERLIN_NOISE.exists() else ""
@@ -430,9 +473,16 @@ def check_source_patches() -> None:
     browser_crypto = BROWSER_CRYPTO.read_text(errors="replace") if BROWSER_CRYPTO.exists() else ""
     browser_aes_cfb8 = BROWSER_AES_CFB8.read_text(errors="replace") if BROWSER_AES_CFB8.exists() else ""
     browser_http_proxy = BROWSER_HTTP_PROXY.read_text(errors="replace") if BROWSER_HTTP_PROXY.exists() else ""
+    browser_client_network = BROWSER_CLIENT_NETWORK.read_text(errors="replace") if BROWSER_CLIENT_NETWORK.exists() else ""
+    browser_resource_reload_profiler = BROWSER_RESOURCE_RELOAD_PROFILER.read_text(errors="replace") if BROWSER_RESOURCE_RELOAD_PROFILER.exists() else ""
+    browser_resource_reload_scheduler = BROWSER_RESOURCE_RELOAD_SCHEDULER.read_text(errors="replace") if BROWSER_RESOURCE_RELOAD_SCHEDULER.exists() else ""
+    browser_pack_overlay_compat = BROWSER_PACK_OVERLAY_COMPAT.read_text(errors="replace") if BROWSER_PACK_OVERLAY_COMPAT.exists() else ""
+    browser_atlas_resource_fallback = BROWSER_ATLAS_RESOURCE_FALLBACK.read_text(errors="replace") if BROWSER_ATLAS_RESOURCE_FALLBACK.exists() else ""
+    browser_authlib_gson = BROWSER_AUTHLIB_GSON.read_text(errors="replace") if BROWSER_AUTHLIB_GSON.exists() else ""
     browser_signer = BROWSER_SIGNER.read_text(errors="replace") if BROWSER_SIGNER.exists() else ""
     browser_singleplayer_client = BROWSER_SINGLEPLAYER_CLIENT.read_text(errors="replace") if BROWSER_SINGLEPLAYER_CLIENT.exists() else ""
     browser_integrated_server_main = BROWSER_INTEGRATED_SERVER_MAIN.read_text(errors="replace") if BROWSER_INTEGRATED_SERVER_MAIN.exists() else ""
+    browser_lazy_data_fixer = BROWSER_LAZY_DATA_FIXER.read_text(errors="replace") if BROWSER_LAZY_DATA_FIXER.exists() else ""
     minecraft_resource_supplier = MINECRAFT_RESOURCE_SUPPLIER.read_text(errors="replace") if MINECRAFT_RESOURCE_SUPPLIER.exists() else ""
     scheduled_thread_pool_executor = SCHEDULED_THREAD_POOL_EXECUTOR.read_text(errors="replace") if SCHEDULED_THREAD_POOL_EXECUTOR.exists() else ""
     server_worker_bootstrap = SERVER_WORKER_BOOTSTRAP.read_text(errors="replace") if SERVER_WORKER_BOOTSTRAP.exists() else ""
@@ -458,6 +508,12 @@ def check_source_patches() -> None:
     index_html = INDEX_HTML.read_text(errors="replace") if INDEX_HTML.exists() else ""
     generated_resource_list = GENERATED_RESOURCE_LIST.read_text(errors="replace") if GENERATED_RESOURCE_LIST.exists() else ""
     generated_sounds = load_json(GENERATED_SOUNDS_JSON) if GENERATED_SOUNDS_JSON.exists() else {}
+    generated_unifont = load_json(GENERATED_UNIFONT_JSON) if GENERATED_UNIFONT_JSON.exists() else {}
+    generated_unifont_base64 = (
+        base64.b64encode(GENERATED_UNIFONT_JSON.read_bytes())
+        if GENERATED_UNIFONT_JSON.exists()
+        else b""
+    )
     postprocess_teavm_js = POSTPROCESS_TEAVM_JS.read_text(errors="replace") if POSTPROCESS_TEAVM_JS.exists() else ""
     postprocess_index_html = POSTPROCESS_INDEX_HTML.read_text(errors="replace") if POSTPROCESS_INDEX_HTML.exists() else ""
     server_plugin_pom = SERVER_PLUGIN_POM.read_text(errors="replace") if SERVER_PLUGIN_POM.exists() else ""
@@ -574,6 +630,14 @@ def check_source_patches() -> None:
             and "shiftedIndexCache" in text
             and "baseVertexIndexDraws" in text
             and "window.__gaiusGL.executeDraw(4,mode,count,type,offset,baseVertex,0);" in text,
+        ),
+        (
+            "BrowserOpenGL fuses command-encoder element-buffer binding into draw dispatch",
+            '"type", "indexBytes", "instances", "elementBuffer"' in text
+            and "const vao=state.getVaoEmu();" in text
+            and "const nextId=elementBuffer|0;" in text
+            and "state.bindPhysicalElementBuffer(vao,vao.elementArrayBufferObject || null);" in text
+            and "int type, int indexBytes, int instances, int elementBuffer);" in text,
         ),
         (
             "BrowserOpenGL can use Wasm hot-path for baseVertex index shifting",
@@ -738,6 +802,18 @@ def check_source_patches() -> None:
             and "GL_UNSIGNED_INT" in wasm_hotpath_c,
         ),
         (
+            "Chunk packet packed-long arrays decode in browser batches",
+            "patchFriendlyByteBufBrowserLongArray" in client_patcher
+            and "net/minecraft/network/FriendlyByteBuf.class" in client_patcher
+            and "dev/gaius/browser/BrowserLongArrayCodec" in client_patcher
+            and "readFixedSizeLongArray" in browser_long_array_codec
+            and "LONGS_PER_BATCH = 512" in browser_long_array_codec
+            and "buffer.readBytes(bytes, 0, byteCount)" in browser_long_array_codec
+            and "view.getBigInt64(index * 8, false)" in browser_long_array_codec
+            and "decodeBigEndianFallback" in browser_long_array_codec
+            and "testNetworkPackedLongs" in platform_smoke,
+        ),
+        (
             "SimpleBitStorage unpack has browser Wasm/JS hot-path hook",
             "patchSimpleBitStorageBrowserUnpack" in client_patcher
             and "net/minecraft/util/SimpleBitStorage.class" in client_patcher
@@ -778,22 +854,45 @@ def check_source_patches() -> None:
             and 'find(node, "setHeight", "(III)V")' in client_patcher,
         ),
         (
-            "BrowserOpenGL repairs shader integer/float attribute binding mismatches",
+            "BrowserOpenGL adapts shader attribute pointer types before draw",
             "programAttribs" in text
             and "refreshProgramAttribs" in text
+            and "initializeAttribTypeAdaptJs();" in text
+            and "expectedAttribInteger" in text
+            and "recordAttribPointerAdapt" in text
+            and "attribTypePointerAdapts" in text
+            and "effectiveInteger" in text
             and "ensureProgramAttribTypes" in text
             and "attribTypeRepairs" in text
             and "gl.getActiveAttrib" in text
             and "vertexAttribIPointer" in text,
         ),
         (
-            "VertexArrayCache normalizes byte vertex colors for textured GUI/materials",
+            "BrowserOpenGL translates ModelEngine entity shader integer arithmetic for WebGL",
+            '"UV0 * SKINRES", "UV0 * float(SKINRES)"' in text
+            and '"SPACING * (partId + 1)", "SPACING * float(partId + 1)"' in text
+            and '"(1 - fade)", "(1.0 - fade)"' in text
+            and "WebGL ModelEngine vertex shader compatibility failed" in platform_smoke
+            and "WebGL ModelEngine fragment shader compatibility failed" in platform_smoke,
+        ),
+        (
+            "VertexArrayCache preserves vanilla integer UV and normalized normal/color bindings",
             "private static boolean shouldNormalize" in vertex_array_cache_source
             and "VertexFormatElement.Usage.COLOR" in vertex_array_cache_source
-            and "VertexFormatElement.Usage.UV" in vertex_array_cache_source
-            and "VertexFormatElement.Usage.GENERIC" in vertex_array_cache_source
+            and "VertexFormatElement.Usage.NORMAL" in vertex_array_cache_source
+            and "VertexFormatElement.Usage.UV" not in vertex_array_cache_source.split(
+                "private static boolean shouldNormalize", 1
+            )[1].split("private static final class VertexArrayKey", 1)[0]
+            and "VertexFormatElement.Usage.GENERIC" not in vertex_array_cache_source.split(
+                "private static boolean shouldNormalize", 1
+            )[1].split("private static final class VertexArrayKey", 1)[0]
             and "boolean normalized = shouldNormalize(element);" in vertex_array_cache_source
-            and "element.usage() == VertexFormatElement.Usage.UV || element.usage() == VertexFormatElement.Usage.GENERIC" not in vertex_array_cache_source,
+            and "element.type() != VertexFormatElement.Type.FLOAT" in vertex_array_cache_source,
+        ),
+        (
+            "VertexArrayCache bypasses the render-thread assertion wrapper in its VAO hot path",
+            vertex_array_cache_source.count("GL30.glBindVertexArray(") == 5
+            and "GlStateManager._glBindVertexArray(" not in vertex_array_cache_source,
         ),
         (
             "BrowserOpenGL limits attrib repack to current shader and restores direct pointers",
@@ -1177,6 +1276,14 @@ def check_source_patches() -> None:
             and "browser.sound.silent" not in client_patcher,
         ),
         (
+            "Client patcher caches immutable draw metadata outside the per-draw hot path",
+            "patchGlRenderPipelineDrawMetadata" in client_patcher
+            and '"gaius$vertexFormat"' in client_patcher
+            and '"gaius$drawMode"' in client_patcher
+            and "Opcodes.SIPUSH, 5121" in client_patcher
+            and "Opcodes.IADD" in client_patcher,
+        ),
+        (
             "Platform smoke decodes and plays the packaged eating sound through OpenAL",
             "testEatingSoundAsset" in platform_smoke
             and "assets/minecraft/sounds/random/eat1.ogg" in platform_smoke
@@ -1187,19 +1294,30 @@ def check_source_patches() -> None:
             and "Eating sound did not decode to playable PCM" in platform_smoke,
         ),
         (
-            "Browser Netty channel routes multiplayer ByteBufs through WebSocket TCP bridge",
+            "Browser Netty channel yields after each multiplayer TCP frame",
             "class BrowserWebSocketChannel" in netty_browser_channel
             and "globalThis.__gaiusNettyBridge" in netty_browser_channel
             and "globalThis.__gaiusNetworkStats" in netty_browser_channel
             and "new WebSocket(candidate.url)" in netty_browser_channel
+            and "relayNodeCandidate" in netty_browser_channel
+            and "normalizeRelayUrl" in netty_browser_channel
+            and "params.getAll('relay')" in netty_browser_channel
+            and "recordRelayNodeSuccess" in netty_browser_channel
+            and "relayNodeFailures" in netty_browser_channel
+            and "bridgeToken(candidate)" in netty_browser_channel
+            and "relayNodes: Object.create(null)" in netty_browser_channel
             and "__gaiusLocalServerPorts" in netty_browser_channel
             and "localPort.postMessage" in netty_browser_channel
             and "const control = {type: 'connect'" in netty_browser_channel
             and "copyBytes(ByteBuf buffer)" in netty_browser_channel
             and "pipeline.fireChannelRead(Unpooled.wrappedBuffer(bytes))" in netty_browser_channel
-            and "MAX_CHUNKS_PER_PUMP" in netty_browser_channel
+            and "MAX_CHUNKS_PER_PUMP = 1" in netty_browser_channel
             and "MAX_BYTES_PER_PUMP = 2 * 1024 * 1024" in netty_browser_channel
             and "MAX_MILLIS_PER_PUMP = 4.0" in netty_browser_channel
+            and "private boolean pumping;" in netty_browser_channel
+            and "if (!open || pumping)" in netty_browser_channel
+            and "pumping = true" in netty_browser_channel
+            and "pumping = false" in netty_browser_channel
             and "bytesPumped < MAX_BYTES_PER_PUMP" in netty_browser_channel
             and "monotonicMillis() - pumpStarted >= MAX_MILLIS_PER_PUMP" in netty_browser_channel
             and "recordPump(" in netty_browser_channel
@@ -1208,7 +1326,7 @@ def check_source_patches() -> None:
             and "Collections.newSetFromMap" not in netty_browser_channel,
         ),
         (
-            "Browser Netty channel bounds both queues and backpressures large bursts",
+            "Browser Netty channel batches local stream writes while bounding both queues",
             "const maximumInboundQueueBytes = 64 * 1024 * 1024" in netty_browser_channel
             and "const inboundPauseBytes = 24 * 1024 * 1024" in netty_browser_channel
             and "const inboundResumeBytes = 8 * 1024 * 1024" in netty_browser_channel
@@ -1217,8 +1335,15 @@ def check_source_patches() -> None:
             and "const maximumLocalBatchBytes = 16 * 1024" in netty_browser_channel
             and "function requestFlush(entry)" in netty_browser_channel
             and "entry.localFlushScheduled" in netty_browser_channel
-            and "state.stats.localBatches++" in netty_browser_channel
-            and "state.stats.peakLocalBatchBytes" in netty_browser_channel
+            and "queueMicrotask(function()" in netty_browser_channel
+            and "state.stats.localFlushes += localFlushBatches" in netty_browser_channel
+            and "state.stats.localFlushFrames += localFlushFrames" in netty_browser_channel
+            and "state.stats.localReceivedFrames++" in netty_browser_channel
+            and "state.stats.localReceivedBytes += copy.byteLength" in netty_browser_channel
+            and "state.stats.peakLocalFlushBytes" in netty_browser_channel
+            and "const batch = new Uint8Array(localBatchBytes);" in netty_browser_channel
+            and "batch.set(part, offset);" in netty_browser_channel
+            and "entry.localPort.postMessage(batch.buffer, [batch.buffer])" in netty_browser_channel
             and "setInboundPaused(entry, true)" in netty_browser_channel
             and "setInboundPaused(entry, false)" in netty_browser_channel
             and "{type: 'flow', paused: !!paused}" in netty_browser_channel
@@ -1247,15 +1372,23 @@ def check_source_patches() -> None:
             and '"connectInline"' in netty_browser_patcher,
         ),
         (
-            "Platform smoke verifies browser Netty connect and outbound bridge bytes",
+            "Platform smoke verifies browser Netty connect and local stream batching",
             "testBrowserNetwork()" in platform_smoke
             and "BrowserWebSocketChannel.class" in platform_smoke
             and "connected.isDone()" in platform_smoke
             and "connected.isSuccess()" in platform_smoke
             and "writeAndFlush" in platform_smoke
+            and "runLocalNetworkFrameSmoke()" in platform_smoke
+            and "bridge.open(socketId" in platform_smoke
+            and platform_smoke.count("bridge.send(socketId") == 3
+            and "Browser Netty local batching failed" in platform_smoke
+            and "(local.frames|0) !== 1" in platform_smoke
+            and "(stats.localFlushes|0) < 1" in platform_smoke
+            and "(stats.localFlushFrames|0) !== 3" in platform_smoke
             and "networkBytesQueuedOrSent()" in platform_smoke
             and "scheduleNetworkRoundTripCheck()" in platform_smoke
-            and "stats.receivedBytes" in platform_smoke,
+            and "stats.queuedBytes" in platform_smoke
+            and "Browser Netty bridge frame was not queued" in platform_smoke,
         ),
         (
             "Browser crypto implements online-mode RSA, SHA-1, secure keys, and stateful AES/CFB8",
@@ -1311,6 +1444,24 @@ def check_source_patches() -> None:
             and 'new ZipEntry("pack.mcmeta")' in platform_smoke
             and "new ZipFile(path.toFile())" in platform_smoke
             and "archive.getInputStream(entry).readAllBytes()" in platform_smoke,
+        ),
+        (
+            "Browser safely applies atlas-only future resource-pack overlays",
+            "mergeSafeAtlasOverlays" in browser_pack_overlay_compat
+            and "atlasOnlyDirectories" in browser_pack_overlay_compat
+            and "isAtlasJson" in browser_pack_overlay_compat
+            and "BrowserPackOverlayCompat" in client_patcher
+            and "patchFilePackResourcesBrowserAtlasOverlays" in client_patcher
+            and "testBrowserAtlasOverlayCompatibility()" in platform_smoke
+            and '"unsafe_future/assets/minecraft/shaders/core/entity.fsh"' in platform_smoke,
+        ),
+        (
+            "Browser atlas sources retain a narrow vanilla entity fallback",
+            "vanillaEntityFallback" in browser_atlas_resource_fallback
+            and 'textureId.getPath().startsWith("entity/")' in browser_atlas_resource_fallback
+            and "BrowserAtlasResourceFallback" in client_patcher
+            and "patchSingleFileBrowserAtlasFallback" in client_patcher
+            and "testBrowserAtlasResourceFallback()" in platform_smoke,
         ),
         (
             "Platform smoke verifies Minecraft network zlib compression across resets",
@@ -1437,7 +1588,20 @@ def check_source_patches() -> None:
             and "__gaiusServerViewDistance" in server_worker_bootstrap
             and "__gaiusServerSimulationDistance" in server_worker_bootstrap
             and "__gaiusLocalServerPorts" in server_worker_bootstrap
-            and "importScripts(scriptUrl)" in server_worker_bootstrap,
+            and "importScripts(script.url)" in server_worker_bootstrap,
+        ),
+        (
+            "Browser singleplayer defers historical data fixes and overlaps storage with runtime preparation",
+            "public static DataFixer dataFixer()" in browser_integrated_server_main
+            and "BrowserLazyDataFixer.instance()" in browser_integrated_server_main
+            and "sourceVersion >= targetVersion" in browser_lazy_data_fixer
+            and "return input;" in browser_lazy_data_fixer
+            and "DataFixers.getDataFixer()" in browser_lazy_data_fixer
+            and "Promise.all([assetReady, storageReady])" in server_worker_bootstrap
+            and 'markStartup("runtime-downloaded"' in server_worker_bootstrap
+            and 'markStartup("runtime-decompressed"' in server_worker_bootstrap
+            and 'markStartup("runtime-imported"' in server_worker_bootstrap
+            and "__gaiusSingleplayerServerGzipUrl" in postprocess_index_html,
         ),
         (
             "Singleplayer Worker stops cleanly and refreshes browser storage",
@@ -1716,6 +1880,13 @@ def check_source_patches() -> None:
             and "testBrowserHttpProxy()" in platform_smoke,
         ),
         (
+            "Authlib browser Gson decodes remote player textures without JVM Unsafe",
+            "YggdrasilMinecraftSessionService" in authlib_patcher
+            and "MinecraftProfileTexture" in authlib_patcher
+            and "textureDeserializer" in authlib_patcher
+            and "JsonDeserializer<MinecraftProfileTexture>" in browser_authlib_gson,
+        ),
+        (
             "Browser TCP and HTTP bridge URLs bracket IPv6 authority hosts",
             "function authorityHost(value)" in netty_browser_channel
             and "host.includes(':')" in netty_browser_channel
@@ -1742,6 +1913,12 @@ def check_source_patches() -> None:
             and "io/netty/channel/browser/BrowserWebSocketChannel" in client_patcher
             and "disableResolver" in client_patcher
             and "pumpAll" in client_patcher,
+        ),
+        (
+            "Minecraft patcher ignores transient null entities from multiplayer render iteration",
+            "patchEntityRenderDispatcherBrowserNullEntityGuard" in client_patcher
+            and '"shouldRender"' in client_patcher
+            and "Opcodes.IFNONNULL" in client_patcher,
         ),
         (
             "Index postprocess removes generated launcher --disableMultiplayer flag",
@@ -1787,6 +1964,15 @@ def check_source_patches() -> None:
             and 'args.push("--quickPlayMultiplayer", quickPlayServer)' in postprocess_index_html
             and 'const quickPlayServer = String(urlParams.get("server")' in index_html
             and 'args.push("--quickPlayMultiplayer", quickPlayServer)' in index_html,
+        ),
+        (
+            "Browser launcher, resource proxy, and multiplayer channel accept relay URL/token aliases",
+            'urlParams.get("relay")' in postprocess_index_html
+            and 'urlParams.get("relayToken")' in postprocess_index_html
+            and "params.get('relay')" in browser_http_proxy
+            and "params.get('relayToken')" in browser_http_proxy
+            and "params.getAll('relay')" in netty_browser_channel
+            and "params.get('relayToken')" in netty_browser_channel,
         ),
         (
             "BrowserOpenGL avoids unconditional CPU-side buffer shadow copies",
@@ -1943,11 +2129,20 @@ def check_source_patches() -> None:
         (
             "BrowserGlfw records game FPS from swapBuffers",
             "public static void swapBuffers(long window)" in glfw_text
-            and "private static native void swapBuffersJs()" in glfw_text
+            and "private static native boolean swapBuffersJs()" in glfw_text
             and "public static native void swapBuffers(long window)" not in glfw_text
             and "gameFps" in glfw_text
             and "gameFrames" in glfw_text
             and "gameLastSampleAt" in glfw_text,
+        ),
+        (
+            "BrowserGlfw throttles hidden tabs without adding a visible-frame JS call",
+            "const hidden=document.visibilityState!=='visible'" in glfw_text
+            and "return hidden" in glfw_text
+            and "__gaiusBackgroundFrameThrottles" in glfw_text
+            and "if (swapBuffersJs())" in glfw_text
+            and "sleepForBrowserMillis(50L)" in glfw_text
+            and glfw_text.count("swapBuffersJs()") == 2,
         ),
         (
             "BrowserGlfw provides opt-in swapBuffers frame-time telemetry",
@@ -2171,6 +2366,16 @@ def check_source_patches() -> None:
             and "SectionMesh" in client_patcher,
         ),
         (
+            "Minecraft patcher removes per-section clock, layer-array, and matrix churn",
+            "patchLevelRendererBrowserPrepareChunkRenders" in client_patcher
+            and "LevelRenderer.prepareChunkRenders browser hot-path patch points" in client_patcher
+            and "LevelRenderer.prepareChunkRenders matrix copy shape changed" in client_patcher
+            and '"net/minecraft/util/Util"' in client_patcher
+            and '"dev/gaius/browser/BrowserChunkSectionLayers"' in client_patcher
+            and "private static final ChunkSectionLayer[] VALUES" in browser_chunk_section_layers
+            and "return VALUES;" in browser_chunk_section_layers,
+        ),
+        (
             "Minecraft patcher limits browser ClientLevel animateTick budget",
             "patchClientLevelBrowserAnimateTickBudget" in client_patcher
             and "ClientLevel.animateTick browser budget patch point" in client_patcher
@@ -2197,12 +2402,67 @@ def check_source_patches() -> None:
             and "method.instructions.insert(code)" not in run_tick_state_section,
         ),
         (
-            "Minecraft patcher processes queued packets during browser forced ticks",
-            "private static InsnList processQueuedPacketsDuringForcedTick()" in client_patcher
-            and "client.processQueuedPacketsForcedTick" in client_patcher
-            and "net/minecraft/network/PacketProcessor" in client_patcher
-            and "processQueuedPackets" in client_patcher
-            and "Minecraft forced tick packet queue hook point was not found" in client_patcher,
+            "Minecraft patcher pumps browser channels without duplicating vanilla packet queue work",
+            "browserPackets.add(pumpBrowserChannels())" in client_patcher
+            and "private static InsnList processQueuedPacketsDuringBrowserTick()" not in client_patcher
+            and "Minecraft browser channel pump hook point was not found" in client_patcher,
+        ),
+        (
+            "Browser resource-pack reloads schedule inbound packet pumps outside render ticks",
+            "BrowserClientNetwork" in client_patcher
+            and "BrowserClientNetwork::pumpInbound" in browser_client_network
+            and "bridge.inboundPump" in browser_client_network
+            and "inboundPumpJavaStarted" in browser_client_network
+            and "inboundPumpJavaCompleted" in browser_client_network
+            and "minecraft.packetProcessor().processQueuedPackets()" not in browser_client_network
+            and "MAX_PUMPS_PER_SAFE_POINT = 1" in browser_client_network
+            and "state.inboundPump()" in netty_browser_channel,
+        ),
+        (
+            "Client game packets are queued and sliced outside the WebSocket callback",
+            "ClientConfigurationPacketListenerImpl" in client_patcher
+            and "patchPacketProcessorBrowserSlice" in client_patcher
+            and "PacketProcessor browser slice patch point was not found" in client_patcher
+            and '"packetsToBeHandled", "Ljava/util/Queue;"' in client_patcher
+            and '"java/util/Queue", "poll", "()Ljava/lang/Object;"' in client_patcher,
+        ),
+        (
+            "Browser resource reload scheduler explicitly pumps multiplayer packets at cooperative safe points",
+            "BrowserClientNetwork.pumpNow()" in browser_resource_reload_scheduler
+            and "public static void pumpNow()" in browser_client_network,
+        ),
+        (
+            "Browser resource-pack reload profiling wraps vanilla listeners without changing their graph",
+            "patchResourceReloadProfiling" in client_patcher
+            and "BrowserResourceReloadProfiler" in client_patcher
+            and "SimpleReloadInstance listener iteration patch point was not found" in client_patcher
+            and "TimedListener" in browser_resource_reload_profiler
+            and "delegate.reload" in browser_resource_reload_profiler
+            and "unwrap" in browser_resource_reload_profiler
+            and "__gaiusResourceReloadTimings" in browser_resource_reload_profiler,
+        ),
+        (
+            "Browser resource-pack preparation yields between bounded batches",
+            "BrowserResourceReloadScheduler.defer" in browser_resource_reload_profiler
+            and "FRAME_WORK_BUDGET_NANOS" in browser_resource_reload_scheduler
+            and "MAX_SUBMISSIONS_PER_FRAME" in browser_resource_reload_scheduler
+            and "Window.requestAnimationFrame" in browser_resource_reload_scheduler
+            and "delegate.execute(command)" in browser_resource_reload_scheduler,
+        ),
+        (
+            "Browser resource-pack reloads send configuration keepalives immediately",
+            "patchClientKeepAliveBrowser" in client_patcher
+            and '"lambda$handleKeepAlive$1", "()Z"' in client_patcher
+            and "ClientCommonPacketListenerImpl keepalive predicate was not found" in client_patcher
+            and "Opcodes.ICONST_1" in client_patcher,
+        ),
+        (
+            "Browser resource-pack reloads handle client configuration packets inline",
+            "patchClientPacketUtilsBrowserInline" in client_patcher
+            and '"net/minecraft/network/protocol/PacketUtils.class"' in client_patcher
+            and '"PacketUtils client packet scheduler patch point was not found"' in client_patcher
+            and '"net/minecraft/client/multiplayer/ClientCommonPacketListenerImpl"' in client_patcher
+            and "vanillaScheduling" in client_patcher,
         ),
         (
             "Minecraft patcher preserves user-selected client and server distances",
@@ -2268,10 +2528,9 @@ def check_source_patches() -> None:
         ),
         (
             "Server Worker yields outside the synchronous worldgen tick graph",
-            "YIELD_CHECKS_PER_TICK = 8" in browser_worldgen_scheduler
-            and browser_worldgen_scheduler.count("Thread.yield()") == 1
-            and "Eight event-loop turns" in browser_worldgen_scheduler
-            and "same Fiber" in browser_worldgen_scheduler
+            browser_worldgen_scheduler.count("Thread.yield()") == 1
+            and "MessagePort traffic" in browser_worldgen_scheduler
+            and "startup profile" in browser_worldgen_scheduler
             and "public static void checkpoint()" in browser_worldgen_scheduler
             and "public static void pulse()" in browser_worldgen_scheduler,
         ),
@@ -2374,6 +2633,35 @@ def check_source_patches() -> None:
                 rb"numericReplacement.{0,4096}"
                 rb"return previous\s*&\s*numericMask\s*\|\s*0;.{0,256}"
                 rb"const shift\s*=\s*BigInt\(offset\)",
+            ),
+        ),
+        (
+            "Generated release client fuses element-buffer binding into draw dispatch",
+            file_matches(
+                DIST / "classes.js",
+                rb"const vao\s*=\s*state\.getVaoEmu\(\);"
+                rb"const nextId\s*=\s*\w+\s*\|\s*0;"
+                rb"const current\s*=\s*state\.boundBuffers\.get\(gl\.ELEMENT_ARRAY_BUFFER\)\s*\|\s*0;"
+                rb".{0,2048}state\.bindPhysicalElementBuffer\(vao,\s*vao\.elementArrayBufferObject\s*\|\|\s*null\)"
+                rb".{0,4096}state\.executeDraw",
+            ),
+        ),
+        (
+            "Generated release client uses cached pipeline draw metadata",
+            file_matches(
+                DIST / "classes.js",
+                rb"A\.\w+=\(a,b,c,d,e,f,g,h\)=>\{"
+                rb"(?:(?!;\};).){0,4096}"
+                rb"\w+=5121\+\w+\|0;"
+                rb"(?:(?!;\};).){0,2048}"
+                rb"\$p=2;case 2:A\.\w+\(\w+,\w+,\w+,\w+,\w+,\w+,\w+,\w+\);"
+            )
+            and not file_matches(
+                DIST / "classes.js",
+                rb"A\.\w+=\(a,b,c,d,e,f,g,h\)=>\{"
+                rb"(?:(?!;\};).){0,6144}switch\(A\."
+                rb"(?:(?!;\};).){0,2048}"
+                rb"\$p=2;case 2:A\.\w+\(\w+,\w+,\w+,\w+,\w+,\w+,\w+,\w+\);",
             ),
         ),
         (
@@ -2892,6 +3180,31 @@ def check_source_patches() -> None:
             and "assets/minecraft/sounds/entity/cow/milk1.ogg" in generated_resource_list,
         ),
         (
+            "Generated browser resource list contains Mojang Unicode fallback fonts",
+            "assets/minecraft/font/include/unifont.json" in generated_resource_list
+            and "assets/minecraft/font/include/unifont_pua.json" in generated_resource_list
+            and "assets/minecraft/font/unifont.zip" in generated_resource_list
+            and "assets/minecraft/font/unifont_jp.zip" in generated_resource_list
+            and "assets/minecraft/font/unifont_pua.zip" in generated_resource_list
+            and isinstance(generated_unifont, dict)
+            and any(
+                provider.get("type") == "unihex"
+                and provider.get("hex_file") == "minecraft:font/unifont.zip"
+                for provider in generated_unifont.get("providers", [])
+                if isinstance(provider, dict)
+            ),
+        ),
+        (
+            "Generated release embeds the non-empty Mojang Unicode font definition",
+            "assets/minecraft/font/include/unifont.json" in generated_resource_list
+            and bool(generated_unifont_base64)
+            and embedded_resource_matches(
+                DIST / "classes.js",
+                "assets/minecraft/font/include/unifont.json",
+                base64.b64decode(generated_unifont_base64),
+            ),
+        ),
+        (
             "Generated browser sounds.json only advertises copied browser sounds",
             isinstance(generated_sounds, dict)
             and bool(generated_sounds)
@@ -2936,6 +3249,17 @@ def check_source_patches() -> None:
             and "Mapped browser sound assets" in build_teavm,
         ),
         (
+            "TeaVM build embeds verified Mojang Unicode font assets for resource-pack fallback",
+            "browser_font_manifest" in build_teavm
+            and "minecraft/font/unifont.zip" in build_teavm
+            and "minecraft/font/unifont_jp.zip" in build_teavm
+            and "minecraft/font/unifont_pua.zip" in build_teavm
+            and "resources.download.minecraft.net" in build_teavm
+            and "Mapped browser Unicode font assets" in build_teavm
+            and 'zip -q -d "$client_overlay" "$font_definition"' in build_teavm
+            and "browser_font_assets" in fetch_version,
+        ),
+        (
             "Browser storage seeds defaults once and preserves user client options",
             "DEFAULT_BROWSER_OPTIONS" in browser_file_persistence
             and "seedDefaultOptions" in browser_file_persistence
@@ -2945,7 +3269,7 @@ def check_source_patches() -> None:
             and "renderDistance:6" in browser_file_persistence
             and "simulationDistance:4" in browser_file_persistence
             and "entityDistanceScaling:0.5" in browser_file_persistence
-            and "maxFps:120" in browser_file_persistence
+            and "maxFps:260" in browser_file_persistence
             and 'graphicsPreset:\\"fast\\"' in browser_file_persistence
             and 'renderClouds:\\"false\\"' in browser_file_persistence
             and "menuBackgroundBlurriness:0" in browser_file_persistence
@@ -2955,6 +3279,9 @@ def check_source_patches() -> None:
             and "textureFiltering:0" in browser_file_persistence
             and "particles:2" in browser_file_persistence
             and "storage-restore-crashed" in browser_file_persistence
+            and "shouldRestoreAtStartup" in browser_file_persistence
+            and 'relative.equals("level.dat")' in browser_file_persistence
+            and "activeServerWorldId" in browser_file_persistence
             and 'normalized.endsWith("/servers.dat_old")' in browser_file_persistence
             and "writeDefaultOptions" in browser_file_persistence
             and "catch (Throwable exception)" in browser_file_persistence
@@ -3079,6 +3406,7 @@ def check_source_patches() -> None:
             and "Accept-Encoding" in serve_dist
             and '("br", ".br")' in serve_dist
             and '("gzip", ".gz")' in serve_dist
+            and "os.path.getmtime(compressed_path) + 1.0 < os.path.getmtime(path)" in serve_dist
             and "Cross-Origin-Embedder-Policy" in serve_dist
             and "max-age=31536000, immutable" in serve_dist
             and "parse_qs" in serve_dist,
@@ -3142,7 +3470,7 @@ def check_source_patches() -> None:
             and 'Number(urlParams.get("menuMinDpr"))' in index_html
             and 'Number(urlParams.get("worldMinDpr"))' in index_html
             and 'Number(urlParams.get("maxDpr"))' in index_html
-            and "Number.isFinite(fps.gameFps) && fps.gameFps > 0 ? fps.gameFps : fps.rafFps" in index_html
+            and "Number.isFinite(fps.rafFps) && fps.rafFps > 0 ? fps.rafFps : 0" in index_html
             and "LevelLoadingScreen" in index_html
             and "ProgressScreen" in index_html
             and "fps.worldEnteredAt" in index_html
@@ -3166,10 +3494,10 @@ def check_source_patches() -> None:
             and 'Math.min(256, Number(urlParams.get("singleShadowMB")) || 256)' in index_html
             and 'Math.min(1024, Number(urlParams.get("totalShadowMB")) || 1024)' in index_html
             and "maybeDegradeResolutionForFps" in index_html
-            and "function gaiusFpsSample()" in index_html
-            and "function gaiusFpsTick" not in index_html
-            and "requestAnimationFrame(gaiusFpsTick)" not in index_html
-            and "function gaiusFpsSample()" in postprocess_index_html
+            and "function gaiusFpsSample()" not in index_html
+            and "function gaiusFpsTick" in index_html
+            and "requestAnimationFrame(gaiusFpsTick)" in index_html
+            and "function gaiusFpsTick" in postprocess_index_html
             and "__gaiusWasmHotpath" in index_html
             and "gaius-hotpath.wasm" in index_html
             and "WebAssembly.instantiate" in index_html
@@ -3198,6 +3526,7 @@ def check_overlay_bytecode() -> None:
     lwjgl_cp = OVERLAYS / "library-classes" / "lwjgl"
     lwjgl_opengl_cp = OVERLAYS / "library-classes" / "lwjgl-opengl"
     lwjgl_opengl_patch_cp = OVERLAYS / "library-patches" / "lwjgl-opengl"
+    lwjgl_opengl_overlay_cp = OVERLAYS / "libraries" / "org" / "lwjgl" / "lwjgl-opengl" / "3.3.3" / "lwjgl-opengl-3.3.3.jar"
     lwjgl_openal_cp = OVERLAYS / "libraries" / "org" / "lwjgl" / "lwjgl-openal" / "3.3.3" / "lwjgl-openal-3.3.3.jar"
     lwjgl_openal_classes_cp = OVERLAYS / "library-classes" / "lwjgl-openal"
     lwjgl_glfw_cp = OVERLAYS / "libraries" / "org" / "lwjgl" / "lwjgl-glfw" / "3.3.3" / "lwjgl-glfw-3.3.3.jar"
@@ -3251,6 +3580,14 @@ def check_overlay_bytecode() -> None:
     http_util = run_javap(client_cp, "net.minecraft.util.HttpUtil")
     realms_request = run_javap(client_cp, "com.mojang.realmsclient.client.Request")
     authlib_client = run_javap(authlib_cp, "com.mojang.authlib.minecraft.client.MinecraftClient")
+    authlib_session = run_javap(
+        authlib_cp,
+        "com.mojang.authlib.yggdrasil.YggdrasilMinecraftSessionService",
+    )
+    authlib_profile_texture = run_javap(
+        authlib_cp,
+        "com.mojang.authlib.minecraft.MinecraftProfileTexture",
+    )
     skin_texture_downloader = run_javap(
         client_cp,
         "net.minecraft.client.renderer.texture.SkinTextureDownloader",
@@ -3276,12 +3613,30 @@ def check_overlay_bytecode() -> None:
         "dev.gaius.browser.BrowserGuiItemCache$BrowserTrackingItemStackRenderState",
     )
     client_level = run_javap(client_cp, "net.minecraft.client.multiplayer.ClientLevel")
+    simple_reload_instance = run_javap(
+        client_cp,
+        "net.minecraft.server.packs.resources.SimpleReloadInstance",
+    )
+    model_manager = run_javap(client_cp, "net.minecraft.client.resources.model.ModelManager")
+    font_manager = run_javap(client_cp, "net.minecraft.client.gui.font.FontManager")
     multiplayer_game_mode = run_javap(
         client_cp,
         "net.minecraft.client.multiplayer.MultiPlayerGameMode",
     )
     game_renderer = run_javap(client_cp, "net.minecraft.client.renderer.GameRenderer")
     level_renderer = run_javap(client_cp, "net.minecraft.client.renderer.LevelRenderer")
+    entity_render_dispatcher = run_javap(
+        client_cp,
+        "net.minecraft.client.renderer.entity.EntityRenderDispatcher",
+    )
+    entity_render_should_render = method_section(
+        entity_render_dispatcher,
+        "public <E extends net.minecraft.world.entity.Entity> boolean shouldRender(E, "
+        "net.minecraft.client.renderer.culling.Frustum, double, double, double);",
+    )
+    browser_chunk_section_layers = run_javap(
+        client_cp, "dev.gaius.browser.BrowserChunkSectionLayers"
+    )
     section_render_dispatcher = run_javap(
         client_cp,
         "net.minecraft.client.renderer.chunk.SectionRenderDispatcher",
@@ -3374,6 +3729,10 @@ def check_overlay_bytecode() -> None:
         server_worker_classes_cp,
         "dev.gaius.browser.BrowserIntegratedServerMain",
     )
+    browser_lazy_data_fixer_class = run_javap(
+        server_worker_classes_cp,
+        "dev.gaius.browser.BrowserLazyDataFixer",
+    )
     surface_system = run_javap(
         client_cp,
         "net.minecraft.world.level.levelgen.SurfaceSystem",
@@ -3406,12 +3765,20 @@ def check_overlay_bytecode() -> None:
     gl_command_encoder = run_javap(
         client_cp, "com.mojang.blaze3d.opengl.GlCommandEncoder"
     )
+    gl_render_pipeline = run_javap(
+        client_cp, "com.mojang.blaze3d.opengl.GlRenderPipeline"
+    )
     audio_library = run_javap(client_cp, "com.mojang.blaze3d.audio.Library")
     sound_engine = run_javap(client_cp, "net.minecraft.client.sounds.SoundEngine")
     vertex_array_cache_emulated = run_javap(client_cp, "com.mojang.blaze3d.opengl.VertexArrayCache$Emulated")
     vertex_array_cache_separate = run_javap(client_cp, "com.mojang.blaze3d.opengl.VertexArrayCache$Separate")
     vertex_array_cache = run_javap(client_cp, "com.mojang.blaze3d.opengl.VertexArrayCache")
     vertex_array_cache_key = run_javap(client_cp, "com.mojang.blaze3d.opengl.VertexArrayCache$VertexArrayKey")
+    vertex_array_cache_source = (
+        VERTEX_ARRAY_CACHE.read_text(errors="replace")
+        if VERTEX_ARRAY_CACHE.exists()
+        else ""
+    )
     vanilla_pack_builder = run_javap(client_cp, "net.minecraft.server.packs.VanillaPackResourcesBuilder")
     indexed_asset_source = run_javap(client_cp, "net.minecraft.client.resources.IndexedAssetSource")
     vanilla_pack_resources = run_javap(client_cp, "net.minecraft.server.packs.VanillaPackResources")
@@ -3598,6 +3965,10 @@ def check_overlay_bytecode() -> None:
     level_compile_sections = method_section(
         level_renderer,
         "private void compileSections(net.minecraft.client.Camera);",
+    )
+    level_prepare_chunk_renders = method_section(
+        level_renderer,
+        "private net.minecraft.client.renderer.chunk.ChunkSectionsToRender prepareChunkRenders(org.joml.Matrix4fc, double, double, double);",
     )
     level_destroy_block_progress = method_section(
         level_renderer,
@@ -4049,6 +4420,10 @@ def check_overlay_bytecode() -> None:
         authlib_client,
         "private java.net.HttpURLConnection createUrlConnection(java.net.URL);",
     )
+    authlib_session_constructor = method_section(
+        authlib_session,
+        "protected com.mojang.authlib.yggdrasil.YggdrasilMinecraftSessionService(com.mojang.authlib.yggdrasil.ServicesKeySet, java.net.Proxy, com.mojang.authlib.Environment);",
+    )
     skin_texture_download = method_section(
         skin_texture_downloader,
         "private com.mojang.blaze3d.platform.NativeImage downloadSkin(java.nio.file.Path, java.lang.String) throws java.io.IOException;",
@@ -4112,11 +4487,45 @@ def check_overlay_bytecode() -> None:
     )
     browser_glfw_constants = read_zip_entry_latin1(lwjgl_glfw_cp, "org/lwjgl/glfw/BrowserGlfw.class")
     arb_vertex_attrib = run_javap(lwjgl_opengl_patch_cp, "org.lwjgl.opengl.ARBVertexAttribBinding")
+    gl30 = run_javap(lwjgl_opengl_overlay_cp, "org.lwjgl.opengl.GL30")
     browser_glfw = run_javap(lwjgl_glfw_cp, "org.lwjgl.glfw.BrowserGlfw")
     glfw = run_javap(lwjgl_glfw_cp, "org.lwjgl.glfw.GLFW")
     face_bakery = run_javap(client_cp, "net.minecraft.client.renderer.block.model.FaceBakery")
 
     checks = [
+        (
+            "Resource reload bytecode wraps each listener with the browser timing profiler",
+            "BrowserResourceReloadProfiler.wrap" in simple_reload_instance,
+        ),
+        (
+            "Resource reload bytecode labels the model and font continuations that can block frames",
+            "ModelManager.discoverModelDependencies" in model_manager
+            and "ModelManager.buildModelGroups" in model_manager
+            and "BrowserResourceReloadProfiler.label" in model_manager
+            and "FontManager.apply" in font_manager
+            and "BrowserResourceReloadProfiler.label" in font_manager,
+        ),
+        (
+            "FontManager compiled overlay records each synchronous apply subsection",
+            font_manager.count("BrowserResourceReloadProfiler.sectionStarted") == 4
+            and font_manager.count("BrowserResourceReloadProfiler.sectionCompleted") == 4
+            and all(
+                section in font_manager
+                for section in (
+                    "FontManager.apply.closeFontSets",
+                    "FontManager.apply.closeProviders",
+                    "FontManager.apply.createFontSets",
+                    "FontManager.apply.bindAtlasProviders",
+                )
+            ),
+        ),
+        (
+            "Model dependency discovery yields through a browser frame-budgeted continuation",
+            "BrowserModelDependencyScheduler.continuation" in model_manager
+            and model_manager.count("CompletableFuture.thenComposeAsync") >= 2
+            and "checkcast     #" in model_manager
+            and "net.minecraft.client.resources.model.ModelDiscovery" in model_manager,
+        ),
         (
             "TeaVM output stream bytecode preserves replacement-write truncation",
             "VirtualFileAccessor.resize" in file_output_truncate
@@ -4139,6 +4548,14 @@ def check_overlay_bytecode() -> None:
             and "ireturn" not in minecraft_world_load
             and "BrowserSingleplayerClient.stop" in minecraft_disconnect
             and "BrowserIntegratedServerMain.registerServer" in minecraft_spin,
+        ),
+        (
+            "Official server defers the historical data-fixer graph for current-version worlds",
+            "BrowserIntegratedServerMain.dataFixer" in server_main
+            and server_main.count("DataFixers.getDataFixer") == 1
+            and "implements com.mojang.datafixers.DataFixer" in browser_lazy_data_fixer_class
+            and "DataFixers.getDataFixer" in browser_lazy_data_fixer_class
+            and "Dynamic<T> update" in browser_lazy_data_fixer_class,
         ),
         (
             "Integrated server preserves the browser client's profile UUID",
@@ -4219,16 +4636,19 @@ def check_overlay_bytecode() -> None:
             and "public static io.netty.channel.EventLoop eventLoopFor(io.netty.channel.Channel, io.netty.channel.EventLoop);" in browser_websocket_channel
             and "public static boolean connectInline(io.netty.channel.Channel, java.net.SocketAddress, java.net.SocketAddress, io.netty.channel.ChannelPromise);" in browser_websocket_channel
             and "protected void doWrite" in browser_websocket_channel
-            and "sipush        128" in browser_websocket_pump
+            and "iconst_1" in browser_websocket_pump
             and "int 2097152" in browser_websocket_pump
             and "double 4.0d" in browser_websocket_pump
+            and "Field pumping:Z" in browser_websocket_pump
             and "Method monotonicMillis:()D" in browser_websocket_pump
             and "Method recordPump:(IIID)V" in browser_websocket_pump
             and "java/util/concurrent" not in browser_websocket_channel
             and "java/util/Collections" not in browser_websocket_channel
             and "globalThis.__gaiusNettyBridge" in browser_websocket_constants
             and "globalThis.__gaiusNetworkStats" in browser_websocket_constants
-            and "new WebSocket(candidate.url)" in browser_websocket_constants,
+            and "new WebSocket(candidate.url)" in browser_websocket_constants
+            and "relayNodeCandidate" in browser_websocket_constants
+            and "recordRelayNodeFailure" in browser_websocket_constants,
         ),
         (
             "AbstractChannel registers browser transport inline before syncUninterruptibly",
@@ -4334,10 +4754,48 @@ def check_overlay_bytecode() -> None:
             and "java/net/URL.openConnection:()" in authlib_create_connection,
         ),
         (
+            "Authlib texture profile Gson bytecode registers browser-safe decoding",
+            "dev/gaius/browser/BrowserAuthlibGson.textureDeserializer"
+            in authlib_session_constructor
+            and "com/mojang/authlib/minecraft/MinecraftProfileTexture"
+            in authlib_session_constructor.replace(".", "/")
+            and authlib_session_constructor.find(
+                "BrowserAuthlibGson.textureDeserializer"
+            )
+            < authlib_session_constructor.find("UUIDTypeAdapter"),
+        ),
+        (
+            "Authlib texture payload bypasses TeaVM Gson reflection",
+            "dev/gaius/browser/BrowserAuthlibGson.decodeTextures"
+            in method_section(
+                authlib_session,
+                "public com.mojang.authlib.minecraft.MinecraftProfileTextures unpackTextures(com.mojang.authlib.properties.Property);",
+            )
+            and "com/google/gson/Gson.fromJson" not in method_section(
+                authlib_session,
+                "public com.mojang.authlib.minecraft.MinecraftProfileTextures unpackTextures(com.mojang.authlib.properties.Property);",
+            ),
+        ),
+        (
+            "Authlib profile texture exposes a browser-safe Gson no-argument constructor",
+            "public com.mojang.authlib.minecraft.MinecraftProfileTexture();"
+            in authlib_profile_texture
+            and "java/util/Collections.emptyMap" in authlib_profile_texture,
+        ),
+        (
             "Remote player textures use the browser HTTP bridge without Java Proxy",
             "dev/gaius/browser/BrowserHttpProxy.proxyTexture" in skin_texture_download
             and "java/net/URL.openConnection:(Ljava/net/Proxy;)" not in skin_texture_download
             and "java/net/URL.openConnection:()" in skin_texture_download,
+        ),
+        (
+            "Entity renderer skips transient null entities instead of crashing multiplayer worlds",
+            "aload_1" in entity_render_should_render
+            and "ifnonnull" in entity_render_should_render
+            and "iconst_0" in entity_render_should_render
+            and "ireturn" in entity_render_should_render
+            and entity_render_should_render.find("ifnonnull")
+                < entity_render_should_render.find("getRenderer"),
         ),
         (
             "Realms API requests and authentication cookies route through the browser HTTP bridge",
@@ -4647,10 +5105,14 @@ def check_overlay_bytecode() -> None:
         ),
         (
             "GlCommandEncoder uses the direct browser draw hot path",
-            "BrowserOpenGL.bindBuffer:(II)V" in gl_command_encoder_draw
-            and "BrowserOpenGL.drawFromBuffers:(IIIIIII)V" in gl_command_encoder_draw
-            and gl_command_encoder_draw.count("GlRenderPipeline.info") == 1
-            and gl_command_encoder_draw.count("GlConst.toGl") == 2
+            "BrowserOpenGL.bindBuffer:(II)V" not in gl_command_encoder_draw
+            and "BrowserOpenGL.drawFromBuffers:(IIIIIIII)V" in gl_command_encoder_draw
+            and "Field com/mojang/blaze3d/opengl/GlRenderPipeline.gaius$vertexFormat" in gl_command_encoder_draw
+            and "Field com/mojang/blaze3d/opengl/GlRenderPipeline.gaius$drawMode:I" in gl_command_encoder_draw
+            and "GlRenderPipeline.info" not in gl_command_encoder_draw
+            and "GlConst.toGl" not in gl_command_encoder_draw
+            and "sipush        5121" in gl_command_encoder_draw
+            and "iadd" in gl_command_encoder_draw
             and "GlStateManager._glBindBuffer" not in gl_command_encoder_draw
             and "GlStateManager._draw" not in gl_command_encoder_draw
             and "org/lwjgl/opengl/GL31.glDraw" not in gl_command_encoder_draw
@@ -4658,20 +5120,73 @@ def check_overlay_bytecode() -> None:
             and "lmul" not in gl_command_encoder_draw,
         ),
         (
-            "VertexArrayCache caches browser VAOs by format and buffer handle",
+            "GlRenderPipeline caches immutable browser draw metadata once",
+            "final com.mojang.blaze3d.vertex.VertexFormat gaius$vertexFormat;" in gl_render_pipeline
+            and "final int gaius$drawMode;" in gl_render_pipeline
+            and "RenderPipeline.getVertexFormat" in gl_render_pipeline
+            and "RenderPipeline.getVertexFormatMode" in gl_render_pipeline
+            and "GlConst.toGl" in gl_render_pipeline
+            and "Field gaius$vertexFormat" in gl_render_pipeline
+            and "Field gaius$drawMode:I" in gl_render_pipeline,
+        ),
+        (
+            "VertexArrayCache uses a bounded LRU instead of rebuilding overflow VAOs",
             "MAX_CACHED_WEBGL_VAOS" in vertex_array_cache_emulated
             and "java/util/LinkedHashMap" in vertex_array_cache_emulated
-            and "overflowCache" in vertex_array_cache_emulated
-            and "bindOverflowVertexArray" in vertex_array_cache_emulated
+            and "sipush        2048" in vertex_array_cache_emulated
+            and "java/util/LinkedHashMap.entrySet" in vertex_array_cache_emulated
+            and "java/util/Iterator.remove" in vertex_array_cache_emulated
+            and "org/lwjgl/opengl/GL30.glDeleteVertexArrays" in vertex_array_cache_emulated
+            and "overflowCache" not in vertex_array_cache_emulated
+            and "bindOverflowVertexArray" not in vertex_array_cache_emulated
             and "VertexArrayKey" in vertex_array_cache_key
             and "bufferHandle" in vertex_array_cache_key,
         ),
         (
-            "VertexArrayCache compiled overlay normalizes COLOR attributes",
+            "VertexArrayCache reuses its hot-path lookup key and allocates only on VAO cache misses",
+            "lookupKey" in vertex_array_cache_emulated
+            and "VertexArrayKey.set" in vertex_array_cache_emulated
+            and vertex_array_cache_emulated.count("new           #") > 0
+            and vertex_array_cache_emulated.count("VertexArrayCache$VertexArrayKey.\"<init>\"") == 2
+            and "private com.mojang.blaze3d.opengl.VertexArrayCache$VertexArrayKey set" in vertex_array_cache_key
+            and "java/lang/Record" not in vertex_array_cache_key,
+        ),
+        (
+            "VertexArrayCache bypasses generic map lookup for recently used browser VAOs",
+            "HOT_CACHE_SIZE" in vertex_array_cache_emulated
+            and "sipush        8192" in vertex_array_cache_emulated
+            and "hotFormats" in vertex_array_cache_emulated
+            and "hotVertexArrays" in vertex_array_cache_emulated
+            and "hotAccessCounts" in vertex_array_cache_emulated
+            and "cacheHot" in vertex_array_cache_emulated
+            and "clearHot" in vertex_array_cache_emulated
+            and "bufferHandle * -1640531527" in vertex_array_cache_source
+            and "(accessCount & 63) == 0" in vertex_array_cache_source
+            and "vertexArray.cacheKey = cacheKey" in vertex_array_cache_source
+            and "private int hashCode;" in vertex_array_cache_source,
+        ),
+        (
+            "VertexArrayCache compiled overlay binds VAOs directly through browser GL30",
+            vertex_array_cache_emulated.count("org/lwjgl/opengl/GL30.glBindVertexArray") == 3
+            and vertex_array_cache_separate.count("org/lwjgl/opengl/GL30.glBindVertexArray") == 2
+            and "GlStateManager._glBindVertexArray" not in vertex_array_cache_emulated
+            and "GlStateManager._glBindVertexArray" not in vertex_array_cache_separate,
+        ),
+        (
+            "LWJGL GL30 delegates browser VAO deletion for LRU eviction",
+            "public static void glDeleteVertexArrays(int);" in gl30
+            and "BrowserOpenGL.deleteVertexArray" in method_section(
+                gl30,
+                "public static void glDeleteVertexArrays(int);",
+            ),
+        ),
+        (
+            "VertexArrayCache compiled overlay preserves vanilla UV/normal/color attribute types",
             "private static boolean shouldNormalize" in vertex_array_cache
             and "VertexFormatElement$Usage.COLOR" in vertex_array_cache
-            and "VertexFormatElement$Usage.UV" in vertex_array_cache
-            and "VertexFormatElement$Usage.GENERIC" in vertex_array_cache
+            and "VertexFormatElement$Usage.NORMAL" in vertex_array_cache
+            and "VertexFormatElement$Usage.UV" not in vertex_array_cache
+            and "VertexFormatElement$Usage.GENERIC" not in vertex_array_cache
             and "shouldNormalize" in vertex_array_cache_emulated
             and "shouldNormalize" in vertex_array_cache_separate,
         ),
@@ -4723,9 +5238,13 @@ def check_overlay_bytecode() -> None:
             and "baseVertexIndexDraws" in browser_opengl_constants,
         ),
         (
-            "BrowserOpenGL compiled overlay repairs shader attribute type mismatches",
+            "BrowserOpenGL compiled overlay adapts shader attribute pointer types before draw",
             "programAttribs" in browser_opengl_constants
             and "refreshProgramAttribs" in browser_opengl_constants
+            and "expectedAttribInteger" in browser_opengl_constants
+            and "recordAttribPointerAdapt" in browser_opengl_constants
+            and "attribTypePointerAdapts" in browser_opengl_constants
+            and "effectiveInteger" in browser_opengl_constants
             and "ensureProgramAttribTypes" in browser_opengl_constants
             and "attribTypeRepairs" in browser_opengl_constants,
         ),
@@ -4830,6 +5349,9 @@ def check_overlay_bytecode() -> None:
             "BrowserOpenGL compiled overlay exposes the direct command-encoder draw path",
             "drawFromBuffers" in browser_opengl
             and "Number(indexOffset)*Number(indexBytes)" in browser_opengl_constants
+            and "const nextId=elementBuffer|0;" in browser_opengl_constants
+            and "state.bindPhysicalElementBuffer(vao,vao.elementArrayBufferObject || null);"
+                in browser_opengl_constants
             and "state.executeDraw((instances|0)>1?2:0,mode,firstOrBaseVertex,count,instances,0,0);"
                 in browser_opengl_constants,
         ),
@@ -5247,10 +5769,19 @@ def check_overlay_bytecode() -> None:
         (
             "BrowserGlfw compiled overlay records game FPS from swapBuffers",
             "swapBuffers(long);" in browser_glfw
-            and "private static native void swapBuffersJs();" in browser_glfw
+            and "private static native boolean swapBuffersJs();" in browser_glfw
             and "gameFps" in browser_glfw_constants
             and "gameFrames" in browser_glfw_constants
             and "gameLastSampleAt" in browser_glfw_constants,
+        ),
+        (
+            "BrowserGlfw compiled overlay throttles hidden tabs",
+            "private static native boolean swapBuffersJs();" in browser_glfw
+            and "document.visibilityState" in browser_glfw_constants
+            and "__gaiusBackgroundFrameThrottles" in browser_glfw_constants
+            and "ldc2_w        #" in method_section(browser_glfw, "public static void swapBuffers(long);")
+            and "long 50l" in method_section(browser_glfw, "public static void swapBuffers(long);").lower()
+            and "sleepForBrowserMillis" in method_section(browser_glfw, "public static void swapBuffers(long);"),
         ),
         (
             "BrowserGlfw compiled overlay reserves the final timer millisecond",
@@ -5389,13 +5920,11 @@ def check_overlay_bytecode() -> None:
             and "iconst_2" not in dynamic_uniforms_constructor,
         ),
         (
-            "Minecraft compiled overlay processes queued packets during forced ticks",
+            "Minecraft compiled overlay processes queued packets on every browser tick",
             "BrowserWebSocketChannel.pumpAll" in minecraft_run_tick
             and "PacketProcessor.processQueuedPackets" in minecraft_run_tick
-            and "client.processQueuedPacketsForcedTick" in minecraft_run_tick
+            and "client.processQueuedPacketsBrowserTick" in minecraft_run_tick
             and minecraft_run_tick.find("BrowserWebSocketChannel.pumpAll")
-                < minecraft_run_tick.find("PacketProcessor.processQueuedPackets")
-            and minecraft_run_tick.find("ifne")
                 < minecraft_run_tick.find("PacketProcessor.processQueuedPackets"),
         ),
         (
@@ -5483,6 +6012,20 @@ def check_overlay_bytecode() -> None:
             and "rebuildSectionSync" in level_compile_sections
             and "iconst_0" in level_compile_sections
             and level_compile_sections.find("iconst_0") < level_compile_sections.find("compileSectionSynchronously"),
+        ),
+        (
+            "LevelRenderer compiled overlay reuses frame time, render layers, and model-view matrix",
+            level_prepare_chunk_renders.count("net/minecraft/util/Util.getMillis") == 1
+            and level_prepare_chunk_renders.count(
+                "dev/gaius/browser/BrowserChunkSectionLayers.values"
+            ) == 1
+            and "net/minecraft/client/renderer/chunk/ChunkSectionLayer.values" not in level_prepare_chunk_renders
+            and "class org/joml/Matrix4f" not in level_prepare_chunk_renders
+            and 'org/joml/Matrix4f."<init>":(Lorg/joml/Matrix4fc;)V'
+                not in level_prepare_chunk_renders
+            and "private static final net.minecraft.client.renderer.chunk.ChunkSectionLayer[] VALUES;"
+                in browser_chunk_section_layers
+            and "areturn" in browser_chunk_section_layers,
         ),
         (
             "SectionRenderDispatcher compiled overlay defers compilation and limits per-frame uploads",
@@ -5920,7 +6463,7 @@ def check_overlay_bytecode() -> None:
             and "renderDistance:6" in browser_file_persistence_constants
             and "simulationDistance:4" in browser_file_persistence_constants
             and "entityDistanceScaling:0.5" in browser_file_persistence_constants
-            and "maxFps:120" in browser_file_persistence_constants
+            and "maxFps:260" in browser_file_persistence_constants
             and 'graphicsPreset:"fast"' in browser_file_persistence_constants
             and 'renderClouds:"false"' in browser_file_persistence_constants
             and "menuBackgroundBlurriness:0" in browser_file_persistence_constants
@@ -5930,6 +6473,12 @@ def check_overlay_bytecode() -> None:
             and "textureFiltering:0" in browser_file_persistence_constants
             and "servers.dat_old" in browser_file_persistence_constants
             and "browser defaults" in browser_file_persistence_constants,
+        ),
+        (
+            "Browser persistence restores only title metadata or the active server world",
+            "shouldRestoreAtStartup" in browser_file_persistence_class
+            and "activeServerWorldId" in browser_file_persistence_class
+            and "level.dat_old" in browser_file_persistence_constants,
         ),
         (
             "LocalTime item model property avoids ICU formatter path in browser",

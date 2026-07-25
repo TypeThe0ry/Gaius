@@ -15,6 +15,22 @@ let runtimeStarted = false;
 let stopRequested = false;
 let stopping = false;
 
+function monotonicMillis() {
+  return typeof performance !== "undefined" && performance.now
+    ? performance.now()
+    : Date.now();
+}
+
+function markStartup(phase, startedAt) {
+  const elapsedMillis = Math.max(0, monotonicMillis() - startedAt);
+  postMessage({
+    type: "startup-timing",
+    phase,
+    elapsedMillis,
+    at: Date.now(),
+  });
+}
+
 root.onmessage = async (event) => {
   const message = event.data;
   if (message && message.type === "stop") {
@@ -26,6 +42,8 @@ root.onmessage = async (event) => {
   }
   root.onmessage = handleControlMessage;
   try {
+    const startupStarted = monotonicMillis();
+    markStartup("start-received", startupStarted);
     const port = message.port || (event.ports && event.ports[0]);
     if (!(port instanceof MessagePort)) {
       throw new Error("Singleplayer worker did not receive its MessagePort");
@@ -40,46 +58,31 @@ root.onmessage = async (event) => {
       [root.__gaiusServerSessionId, port],
     ]);
 
-    await installPersistentFileSystem();
+    const storageStarted = monotonicMillis();
+    const storageReady = installPersistentFileSystem().then(() => {
+      markStartup("storage-ready", storageStarted);
+    });
+    const assetReady = prepareServerScript(message, startupStarted);
+    const [script] = await Promise.all([assetReady, storageReady]);
     postMessage({
       type: "storage-ready",
       detail: Object.keys(files).length + " files",
     });
 
-    let scriptUrl;
-    let temporaryScriptUrl;
-    if (message.serverScriptGzipUrl) {
-      if (typeof DecompressionStream !== "function") {
-        throw new Error("This browser cannot decompress the portable singleplayer server");
-      }
-      const response = await fetch(String(message.serverScriptGzipUrl));
-      if (!response.ok) {
-        throw new Error("Portable singleplayer server asset could not be loaded");
-      }
-      const decompressed = response.body.pipeThrough(new DecompressionStream("gzip"));
-      const scriptBlob = await new Response(decompressed).blob();
-      temporaryScriptUrl = URL.createObjectURL(new Blob(
-        [scriptBlob],
-        {type: "text/javascript"},
-      ));
-      scriptUrl = temporaryScriptUrl;
-    } else if (message.serverScriptUrl) {
-      scriptUrl = String(message.serverScriptUrl);
-    } else {
-      const resolved = new URL("singleplayer-server.js", location.href);
-      resolved.search = location.search;
-      scriptUrl = resolved.href;
-    }
-    importScripts(scriptUrl);
-    if (temporaryScriptUrl) {
-      URL.revokeObjectURL(temporaryScriptUrl);
+    const importStarted = monotonicMillis();
+    importScripts(script.url);
+    markStartup("runtime-imported", importStarted);
+    if (script.temporaryUrl) {
+      URL.revokeObjectURL(script.temporaryUrl);
     }
     if (typeof main !== "function") {
       throw new Error("Singleplayer TeaVM output did not expose main(args)");
     }
     postMessage({type: "runtime-ready", detail: root.__gaiusServerWorldId});
+    markStartup("runtime-ready", startupStarted);
     main([]);
     runtimeStarted = true;
+    markStartup("main-returned", startupStarted);
     if (stopRequested) {
       void stopServer();
     }
@@ -91,6 +94,33 @@ root.onmessage = async (event) => {
     throw error;
   }
 };
+
+async function prepareServerScript(message, startupStarted) {
+  if (message.serverScriptGzipUrl) {
+    if (typeof DecompressionStream !== "function") {
+      throw new Error("This browser cannot decompress the portable singleplayer server");
+    }
+    const response = await fetch(String(message.serverScriptGzipUrl));
+    if (!response.ok || !response.body) {
+      throw new Error("Portable singleplayer server asset could not be loaded");
+    }
+    markStartup("runtime-downloaded", startupStarted);
+    const decompressed = response.body.pipeThrough(new DecompressionStream("gzip"));
+    const scriptBlob = await new Response(decompressed).blob();
+    const temporaryUrl = URL.createObjectURL(new Blob(
+      [scriptBlob],
+      {type: "text/javascript"},
+    ));
+    markStartup("runtime-decompressed", startupStarted);
+    return {url: temporaryUrl, temporaryUrl};
+  }
+  if (message.serverScriptUrl) {
+    return {url: String(message.serverScriptUrl), temporaryUrl: null};
+  }
+  const resolved = new URL("singleplayer-server.js", location.href);
+  resolved.search = location.search;
+  return {url: resolved.href, temporaryUrl: null};
+}
 
 function handleControlMessage(event) {
   const message = event.data;
@@ -144,7 +174,7 @@ async function stopServer() {
 
 async function installPersistentFileSystem() {
   database = await openDatabase();
-  await readAllFiles();
+  await readWorldFiles(root.__gaiusServerWorldId);
   root.__gaiusFsBackend = "indexeddb-worker";
   root.__gaiusFsPut = (path, value) => {
     path = normalize(path);
@@ -179,7 +209,8 @@ function openDatabase() {
   });
 }
 
-function readAllFiles() {
+function readWorldFiles(worldId) {
+  const worldPrefix = "/gaius/saves/" + String(worldId || "") + "/";
   return new Promise((resolve, reject) => {
     const transaction = database.transaction(storeName, "readonly");
     const request = transaction.objectStore(storeName).openCursor();
@@ -191,7 +222,10 @@ function readAllFiles() {
       }
       const value = cursor.value;
       if (value && typeof value.path === "string" && typeof value.value === "string") {
-        files[normalize(value.path)] = value.value;
+        const path = normalize(value.path);
+        if (path.startsWith(worldPrefix)) {
+          files[path] = value.value;
+        }
       }
       cursor.continue();
     };

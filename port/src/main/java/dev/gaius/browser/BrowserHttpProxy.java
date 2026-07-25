@@ -69,7 +69,8 @@ public final class BrowserHttpProxy {
 
     @JSBody(params = {"target", "kind"}, script = """
             const params = new URLSearchParams(location.search || '');
-            const configured = params.get('bridge') || globalThis.__gaiusBridgeUrl;
+            const configured = params.get('bridge') || params.get('relay') ||
+              globalThis.__gaiusBridgeUrl;
             let bridge;
             if (configured && String(configured).trim()) {
               bridge = new URL(String(configured).trim(), location.href);
@@ -94,7 +95,8 @@ public final class BrowserHttpProxy {
             bridge.hash = '';
             bridge.search = '';
             bridge.searchParams.set('url', String(target));
-            const token = params.get('bridgeToken') || globalThis.__gaiusBridgeToken;
+            const token = params.get('bridgeToken') || params.get('relayToken') ||
+              globalThis.__gaiusBridgeToken;
             if (token && String(token).length) bridge.searchParams.set('token', String(token));
             return bridge.href;
             """)

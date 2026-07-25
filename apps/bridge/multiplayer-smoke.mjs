@@ -13,9 +13,11 @@ import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { deflateSync, inflateSync } from "node:zlib";
 import { WebSocket } from "./node_modules/ws/wrapper.mjs";
+import { parseConnectRequest } from "./dist/policy.js";
 
 const host = "127.0.0.1";
 const origin = "http://127.0.0.1:8781";
+const bridgeToken = "relay-smoke-token";
 const directory = fileURLToPath(new URL(".", import.meta.url));
 const minecraftHost = process.env.GAIUS_SMOKE_MINECRAFT_HOST;
 const minecraftPort = Number(process.env.GAIUS_SMOKE_MINECRAFT_PORT ?? "25565");
@@ -24,6 +26,7 @@ const minecraftAccessToken = process.env.GAIUS_SMOKE_ACCESS_TOKEN ?? "gaius-smok
 const minecraftProfileId = process.env.GAIUS_SMOKE_PROFILE_ID ??
         "00000000000040008000000000000002";
 const minecraftUsername = process.env.GAIUS_SMOKE_USERNAME ?? "GaiusSmoke";
+testConnectRequestNormalization();
 const bridgePort = await reservePort();
 const fixture = createServer();
 await new Promise((resolve, reject) => {
@@ -34,10 +37,25 @@ const fixturePort = fixture.address().port;
 
 let fixtureSocket;
 let echoEnabled = true;
+let proxiedKeepAlives = 0;
+let proxiedPlayKeepAlives = 0;
+let proxiedPlayTicks = 0;
 fixture.on("connection", (socket) => {
     fixtureSocket = socket;
     socket.setNoDelay(true);
     socket.on("data", (chunk) => {
+        if (isVanillaKeepAlive(chunk)) {
+            proxiedKeepAlives++;
+            return;
+        }
+        if (isPlayKeepAlive(chunk)) {
+            proxiedPlayKeepAlives++;
+            return;
+        }
+        if (isClientTickEnd(chunk)) {
+            proxiedPlayTicks++;
+            return;
+        }
         if (echoEnabled) {
             socket.write(chunk);
         }
@@ -52,6 +70,7 @@ const bridge = spawn(process.execPath, ["dist/main.js"], {
         GAIUS_BRIDGE_PORT: String(bridgePort),
         GAIUS_ALLOWED_ORIGINS: origin,
         GAIUS_ALLOWED_HOSTS: [host, minecraftHost].filter(Boolean).join(","),
+        GAIUS_BRIDGE_TOKEN: bridgeToken,
         GAIUS_IDLE_TIMEOUT_MS: "60000",
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -70,8 +89,23 @@ bridge.stderr.on("data", (chunk) => {
 let webSocket;
 try {
     await waitFor(
-            () => bridgeOutput.includes("Gaius bridge listening"),
-            "bridge startup");
+            () => bridgeOutput.includes("Gaius RelayNode listening"),
+            "RelayNode startup");
+
+    const manifestResponse = await fetch(`http://${host}:${bridgePort}/relay-node/v1`, {
+        headers: {origin},
+    });
+    if (!manifestResponse.ok) {
+        throw new Error(`RelayNode manifest returned ${manifestResponse.status}`);
+    }
+    const manifest = await manifestResponse.json();
+    if (manifest.kind !== "gaius-relay-node" || manifest.protocolVersion !== 1 ||
+            manifest.tunnelPath !== "/tunnel" || manifest.availableConnections < 1 ||
+            !manifest.requiresToken || !manifest.capabilities.includes("flow-control") ||
+            !manifest.capabilities.includes("keepalive-proxy")) {
+        throw new Error("RelayNode manifest did not describe the tunnel capability");
+    }
+    await testRejectedTunnel(bridgePort, fixturePort);
 
     webSocket = new WebSocket(`ws://${host}:${bridgePort}/tunnel`, {
         headers: { origin },
@@ -104,17 +138,34 @@ try {
         type: "connect",
         host,
         port: fixturePort,
+        token: bridgeToken,
     }));
     await waitFor(
             () => controls.some((message) => message.type === "connected"),
             "TCP tunnel connection");
     await waitFor(() => fixtureSocket !== undefined, "fixture connection");
 
+    const healthResponse = await fetch(`http://${host}:${bridgePort}/health`, {
+        headers: {origin},
+    });
+    const health = await healthResponse.json();
+    if (!healthResponse.ok || health.activeConnections < 1 ||
+            health.availableConnections !== health.maximumConnections - health.activeConnections) {
+        throw new Error("RelayNode health did not report the active tunnel");
+    }
+
     const upload = patternedBuffer(4 * 1024 * 1024, 0x31);
     webSocket.send(upload);
     await waitFor(() => echoedBytes === upload.byteLength, "4 MiB tunnel echo");
     if (!Buffer.concat(echoed, echoedBytes).equals(upload)) {
         throw new Error("Tunnel echo bytes did not match the upload");
+    }
+
+    const keepAlive = Buffer.from("0a00040000000000000001", "hex");
+    fixtureSocket.write(keepAlive);
+    await waitFor(() => proxiedKeepAlives === 1, "proxied vanilla keepalive");
+    if (echoedBytes !== upload.byteLength) {
+        throw new Error("RelayNode forwarded a proxied keepalive to the browser");
     }
 
     echoEnabled = false;
@@ -153,14 +204,16 @@ try {
     fixtureSocket.destroy();
     fixtureSocket = undefined;
 
-    const localTunnel = await testLocalTunnelPair(bridgePort);
+    await testFramedPlayKeepAlive(bridgePort, fixturePort);
+
+    const localTunnel = await testLocalTunnelPair(bridgePort, bridgeToken);
     const minecraftLogin = minecraftHost
             ? await testMinecraftLogin(bridgePort, minecraftHost, minecraftPort, {
                 sessionUrl: minecraftSessionUrl,
                 accessToken: minecraftAccessToken,
                 profileId: minecraftProfileId,
                 username: minecraftUsername,
-            })
+            }, bridgeToken)
             : undefined;
     console.log(JSON.stringify({
         ok: true,
@@ -169,6 +222,11 @@ try {
         resumedBytes: floodedBytes,
         sha256: actualHash,
         localTunnel,
+        relayNode: {
+            name: manifest.name,
+            availableConnections: health.availableConnections,
+            requiresToken: manifest.requiresToken,
+        },
         ...(minecraftLogin === undefined ? {} : { minecraftLogin }),
     }));
 }
@@ -203,12 +261,106 @@ async function waitFor(predicate, label, timeoutMs = 10000) {
     }
 }
 
+async function testRejectedTunnel(bridgePort, fixturePort) {
+    const socket = new WebSocket(`ws://${host}:${bridgePort}/tunnel`, {
+        headers: { origin },
+    });
+    await once(socket, "open");
+    socket.send(JSON.stringify({ type: "connect", host, port: fixturePort }));
+    const [code] = await once(socket, "close");
+    if (code !== 1008) {
+        throw new Error(`RelayNode accepted a tunnel without its required token (${code})`);
+    }
+}
+
+function testConnectRequestNormalization() {
+    const cases = [
+        { host: "example.test:25565", port: 25565, expected: "example.test" },
+        { host: "127.0.0.1:25566", port: 25566, expected: "127.0.0.1" },
+        { host: "[2001:db8::7]:25565", port: 25565, expected: "2001:db8::7" },
+        { host: "2001:db8::7", port: 25565, expected: "2001:db8::7" },
+    ];
+    for (const sample of cases) {
+        const parsed = parseConnectRequest(JSON.stringify({
+            type: "connect",
+            host: sample.host,
+            port: sample.port,
+        }));
+        if (parsed.host !== sample.expected) {
+            throw new Error(`RelayNode did not normalize ${sample.host}`);
+        }
+    }
+    for (const sample of [
+        { host: "example.test:25566", port: 25565 },
+        { host: "[2001:db8::7]:25566", port: 25565 },
+    ]) {
+        let rejected = false;
+        try {
+            parseConnectRequest(JSON.stringify({ type: "connect", ...sample }));
+        } catch {
+            rejected = true;
+        }
+        if (!rejected) {
+            throw new Error(`RelayNode accepted a mismatched address port: ${sample.host}`);
+        }
+    }
+}
+
 function patternedBuffer(length, seed) {
     const bytes = Buffer.allocUnsafe(length);
     for (let index = 0; index < bytes.length; index++) {
         bytes[index] = (index * 31 + (index >>> 7) + seed) & 0xff;
     }
     return bytes;
+}
+
+function isVanillaKeepAlive(chunk) {
+    return chunk.byteLength === 11 && chunk[0] === 0x0a &&
+        chunk[1] === 0x00 && chunk[2] === 0x04;
+}
+
+function isPlayKeepAlive(chunk) {
+    return chunk.byteLength === 11 && chunk[0] === 0x0a &&
+        chunk[1] === 0x00 && chunk[2] === 0x1b;
+}
+
+function isClientTickEnd(chunk) {
+    return chunk.byteLength === 3 && chunk[0] === 0x02 &&
+        chunk[1] === 0x00 && chunk[2] === 0x0c;
+}
+
+async function testFramedPlayKeepAlive(bridgePort, fixturePort) {
+    const socket = new WebSocket(`ws://${host}:${bridgePort}/tunnel`, {
+        headers: { origin },
+    });
+    await once(socket, "open");
+    const controls = [];
+    socket.on("message", (data, binary) => {
+        if (!binary) {
+            controls.push(JSON.parse(data.toString("utf8")));
+        }
+    });
+    socket.send(JSON.stringify({ type: "connect", host, port: fixturePort, token: bridgeToken }));
+    await waitFor(
+            () => controls.some((message) => message.type === "connected"),
+            "framed tunnel connection");
+    await waitFor(() => fixtureSocket !== undefined, "framed fixture connection");
+
+    socket.send(Buffer.from("1000860609656c6c616e2e746f7063dd02", "hex"));
+    socket.send(Buffer.from("020003", "hex"));
+    socket.send(Buffer.from("020003", "hex"));
+    socket.send(Buffer.from("02000c", "hex"));
+    await waitFor(() => proxiedPlayTicks >= 3, "proxied observed play ticks at vanilla cadence");
+    const playKeepAlive = Buffer.from("0a002b0000000000000002", "hex");
+    // Packet boundaries are independent from TCP chunks, so split this frame.
+    fixtureSocket.write(playKeepAlive.subarray(0, 4));
+    await delay(5);
+    fixtureSocket.write(playKeepAlive.subarray(4));
+    await waitFor(() => proxiedPlayKeepAlives === 1, "proxied framed play keepalive");
+    socket.close();
+    await once(socket, "close");
+    fixtureSocket.destroy();
+    fixtureSocket = undefined;
 }
 
 async function writePatterned(socket, length, hash) {
@@ -222,7 +374,7 @@ async function writePatterned(socket, length, hash) {
     }
 }
 
-async function testMinecraftLogin(bridgePort, serverHost, serverPort, session) {
+async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, token) {
     const socket = new WebSocket(`ws://${host}:${bridgePort}/tunnel`, {
         headers: { origin },
     });
@@ -421,7 +573,7 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session) {
         decipher = createDecipheriv("aes-128-cfb8", secret, secret);
     }
 
-    socket.send(JSON.stringify({ type: "connect", host: serverHost, port: serverPort }));
+    socket.send(JSON.stringify({ type: "connect", host: serverHost, port: serverPort, token }));
     await waitFor(() => {
         if (protocolFailure !== undefined) throw protocolFailure;
         return controls.some((message) => message.type === "connected");
@@ -482,7 +634,7 @@ function minecraftServerHash(serverId, secret, publicKey) {
     return value.toString(16);
 }
 
-async function testLocalTunnelPair(bridgePort) {
+async function testLocalTunnelPair(bridgePort, token) {
     const sessionId = "0123456789abcdef0123456789abcdef";
     const client = new WebSocket(`ws://${host}:${bridgePort}/tunnel`, {
         headers: { origin },
@@ -523,11 +675,13 @@ async function testLocalTunnelPair(bridgePort) {
         type: "connect",
         host: `client-${sessionId}.gaius-local`,
         port: 25565,
+        token,
     }));
     server.send(JSON.stringify({
         type: "connect",
         host: `server-${sessionId}.gaius-local`,
         port: 25565,
+        token,
     }));
     await waitFor(
             () => clientControls.some((message) => message.type === "connected") &&

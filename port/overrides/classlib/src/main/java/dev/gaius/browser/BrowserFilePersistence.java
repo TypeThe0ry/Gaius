@@ -27,7 +27,9 @@ public final class BrowserFilePersistence {
             "renderDistance:6",
             "simulationDistance:4",
             "entityDistanceScaling:0.5",
-            "maxFps:120",
+            // Vanilla represents the display setting "Unlimited" as 260. Existing
+            // browser profiles keep their chosen value; this only affects new ones.
+            "maxFps:260",
             "graphicsPreset:\"fast\"",
             "renderClouds:\"false\"",
             "cloudRange:32",
@@ -69,6 +71,9 @@ public final class BrowserFilePersistence {
         String[] paths = storedPaths(PREFIX);
         int restored = 0;
         for (String path : paths) {
+            if (!shouldRestoreAtStartup(path)) {
+                continue;
+            }
             try {
                 if (restore(path)) {
                     restored++;
@@ -194,6 +199,30 @@ public final class BrowserFilePersistence {
                 || normalized.endsWith("/servers.dat_old")
                 || normalized.endsWith("/optionsof.txt")
                 || normalized.endsWith("/optionsshaders.txt");
+    }
+
+    /**
+     * The title client only needs world summaries, while a server Worker only
+     * needs the world it was launched for. Restoring every region file here
+     * turns a large saved world into a long synchronous browser task.
+     */
+    private static boolean shouldRestoreAtStartup(String path) {
+        String normalized = normalize(path);
+        String activeWorld = activeServerWorldId();
+        if (activeWorld != null && !activeWorld.isEmpty()) {
+            return normalized.startsWith("/gaius/saves/" + activeWorld + "/");
+        }
+        if (!normalized.startsWith("/gaius/saves/")) {
+            return true;
+        }
+        int worldEnd = normalized.indexOf('/', "/gaius/saves/".length());
+        if (worldEnd < 0 || worldEnd + 1 >= normalized.length()) {
+            return false;
+        }
+        String relative = normalized.substring(worldEnd + 1);
+        return relative.equals("level.dat")
+                || relative.equals("level.dat_old")
+                || relative.equals("icon.png");
     }
 
     private static void seedDefaultOptions() {
@@ -358,6 +387,17 @@ public final class BrowserFilePersistence {
             }
             """)
     private static native String backendName();
+
+    @JSBody(script = """
+            try {
+              return globalThis.__gaiusServerWorldId == null
+                ? null
+                : String(globalThis.__gaiusServerWorldId);
+            } catch (e) {
+              return null;
+            }
+            """)
+    private static native String activeServerWorldId();
 
     @JSBody(params = {"event", "detail"}, script = """
             try {

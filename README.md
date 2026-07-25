@@ -46,7 +46,7 @@ a public download.
 | --- | --- |
 | `port/` | TeaVM port, Java overlays, bytecode patchers, build scripts, browser launcher |
 | `port/web/dist/` | Generated browser client, Worker, Wasm, and portable HTML output |
-| `apps/bridge/` | Optional backpressured WebSocket-to-TCP relay for Java multiplayer |
+| `apps/bridge/` | Self-hostable RelayNode: discovered, token-protected WebSocket-to-TCP relay for Java multiplayer |
 | `apps/server-plugin/` | Optional Paper plugin that supplies the relay endpoint next to a server |
 | `packages/` | Checked-in browser protocol and local-world support modules |
 | `docs/` | Feasibility, platform-gap, audit, and release documentation |
@@ -60,7 +60,7 @@ Chrome client <-> MessageChannel <-> integrated-server Worker <-> IndexedDB
 Multiplayer traffic needs a bridge:
 
 ```text
-Chrome client <-> WebSocket bridge or optional Paper plugin <-> Java server TCP
+Chrome client <-> RelayNode WebSocket or optional Paper plugin <-> Java server TCP
 ```
 
 ## Quick Start
@@ -101,15 +101,20 @@ confirm rendered terrain, sound, input, and the block-selection outline.
 
 ## Multiplayer Bridge
 
-Start the local bridge when testing an ordinary Java server:
+Start a local RelayNode when testing an ordinary Java server:
 
 ```sh
-node apps/bridge/dist/main.js
+cd apps/bridge
+npm start
 ```
 
-Configure public relay nodes with repeated `bridge` query parameters or
-`gaius.bridgeNodes` local storage. A relay operator must restrict destinations,
-origins, connection counts, and access tokens. See
+Each RelayNode exposes `/relay-node/v1` and `/health`, while `/tunnel` remains
+the binary Minecraft transport. Configure public relay nodes with repeated
+`bridge` query parameters or `gaius.bridgeNodes` local storage; node objects
+support `url`, `token`, and `priority`, so the browser tries higher-priority
+nodes first and falls back before the Minecraft connection is made. A
+relay operator must restrict destinations, origins, connection counts, and
+access tokens. See
 [apps/bridge/README.md](apps/bridge/README.md).
 
 The optional Paper plugin removes the external relay hop for a server operator;

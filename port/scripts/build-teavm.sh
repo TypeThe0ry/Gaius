@@ -17,10 +17,12 @@ jar tf "$root/port/work/overlays/client-named-$version-gaius.jar" |
   awk '(index($0, "assets/") == 1 || index($0, "data/") == 1 || $0 == "pack.png") && substr($0, length($0), 1) != "/" { print }' >"$resource_list"
 jar tf "$root/port/work/overlays/libraries/com/ibm/icu/icu4j/77.1/icu4j-77.1.jar" |
   awk 'index($0, "com/ibm/icu/impl/data/icudata/") == 1 && substr($0, length($0), 1) != "/" { print }' >>"$resource_list"
-rm -rf "$generated_assets/minecraft/sounds" "$generated_assets/minecraft/sounds.json"
+rm -rf "$generated_assets/minecraft/sounds" "$generated_assets/minecraft/sounds.json" \
+  "$generated_assets/minecraft/font"
 asset_index_id="$(jq -er '.assetIndex.id // .assets' "$work/version.json" 2>/dev/null || true)"
 asset_index="$work/assets/indexes/$asset_index_id.json"
 copied_sound_assets=0
+copied_font_assets=0
 if [[ -n "$asset_index_id" && -f "$asset_index" ]]; then
   browser_sound_manifest="$root/port/target/browser-sound-assets.tsv"
   jq -r '
@@ -83,6 +85,59 @@ if [[ -n "$asset_index_id" && -f "$asset_index" ]]; then
     browser_sound_names+=("${sound_name%.ogg}")
     copied_sound_assets=$((copied_sound_assets + 1))
   done <"$browser_sound_manifest"
+
+  # Mojang ships the Unicode fallback as indexed assets rather than client-jar
+  # entries. Embed it so browser resource packs can safely override default.json.
+  browser_font_manifest="$root/port/target/browser-font-assets.tsv"
+  jq -r '
+    .objects
+    | to_entries[]
+    | select(
+        .key == "minecraft/font/include/unifont.json"
+        or .key == "minecraft/font/include/unifont_pua.json"
+        or .key == "minecraft/font/unifont.zip"
+        or .key == "minecraft/font/unifont_jp.zip"
+        or .key == "minecraft/font/unifont_pua.zip"
+      )
+    | [.key, .value.hash]
+    | @tsv
+  ' "$asset_index" >"$browser_font_manifest"
+  while IFS=$'\t' read -r logical_path hash; do
+    if [[ -z "$logical_path" || -z "$hash" ]]; then
+      continue
+    fi
+    source="$work/assets/objects/${hash:0:2}/$hash"
+    if [[ ! -f "$source" ]] || [[ "$(shasum -a 1 "$source" | awk '{print $1}')" != "$hash" ]]; then
+      mkdir -p "$(dirname "$source")"
+      temporary="$source.part"
+      curl -fsSL --http1.1 --retry 5 --retry-delay 1 \
+        -o "$temporary" "https://resources.download.minecraft.net/${hash:0:2}/$hash"
+      if [[ "$(shasum -a 1 "$temporary" | awk '{print $1}')" != "$hash" ]]; then
+        rm -f "$temporary"
+        echo "SHA-1 mismatch for browser Unicode font asset $logical_path" >&2
+        exit 1
+      fi
+      mv "$temporary" "$source"
+    fi
+    target="$generated_assets/$logical_path"
+    mkdir -p "$(dirname "$target")"
+    cp "$source" "$target"
+    printf 'assets/%s\n' "$logical_path" >>"$resource_list"
+    copied_font_assets=$((copied_font_assets + 1))
+  done <"$browser_font_manifest"
+
+  # TeaVM resolves duplicate resources from the client overlay JAR before the
+  # generated-resource directory. Replace the empty JAR stub so the embedded
+  # runtime definition actually reaches the browser instead of merely appearing
+  # in minecraft-resources.txt.
+  client_overlay="$root/port/work/overlays/client-named-$version-gaius.jar"
+  for font_definition in \
+    assets/minecraft/font/include/unifont.json \
+    assets/minecraft/font/include/unifont_pua.json; do
+    zip -q -d "$client_overlay" "$font_definition" >/dev/null 2>&1 || true
+    (cd "$(dirname "$generated_assets")" && jar uf "$client_overlay" "$font_definition")
+  done
+
   sounds_json_hash="$(jq -r '.objects["minecraft/sounds.json"].hash // ""' "$asset_index")"
   if [[ -n "$sounds_json_hash" ]]; then
     sounds_json_source="$work/assets/objects/${sounds_json_hash:0:2}/$sounds_json_hash"
@@ -125,6 +180,7 @@ fi
 sort -u -o "$resource_list" "$resource_list"
 echo "Generated browser resource list: $(wc -l <"$resource_list" | tr -d ' ') entries"
 echo "Mapped browser sound assets: $copied_sound_assets"
+echo "Mapped browser Unicode font assets: $copied_font_assets"
 pom="$("$root/port/scripts/generate-pom.sh")"
 log="$root/port/target/teavm-build.log"
 
