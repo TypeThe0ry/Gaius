@@ -4579,6 +4579,7 @@ public final class MinecraftClientPatcher {
         boolean browserChannelPumpHooked = false;
         boolean singleplayerWorkerHooked = false;
         boolean singleplayerWorkerStopHooked = false;
+        boolean browserCrashHooked = false;
         for (MethodNode method : node.methods) {
             if (method.name.equals("run") && method.desc.equals("()V")) {
                 throwableHooked = hookMinecraftRunCatchDiagnostics(method);
@@ -4649,6 +4650,23 @@ public final class MinecraftClientPatcher {
                         "()V",
                         false));
                 singleplayerWorkerStopHooked = true;
+            } else if (method.name.equals("crash")
+                    && method.desc.equals(
+                            "(Lnet/minecraft/client/Minecraft;Ljava/io/File;"
+                                    + "Lnet/minecraft/CrashReport;)V")) {
+                InsnList code = new InsnList();
+                code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+                code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+                code.add(new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "net/minecraft/client/Minecraft",
+                        "saveReport",
+                        "(Ljava/io/File;Lnet/minecraft/CrashReport;)I",
+                        false));
+                code.add(new InsnNode(Opcodes.POP));
+                code.add(new InsnNode(Opcodes.RETURN));
+                replace(method, code, 2, 3);
+                browserCrashHooked = true;
             }
         }
         if (!found) {
@@ -4668,6 +4686,9 @@ public final class MinecraftClientPatcher {
         }
         if (!singleplayerWorkerStopHooked) {
             throw new IllegalStateException("Minecraft singleplayer worker stop hook point was not found");
+        }
+        if (!browserCrashHooked) {
+            throw new IllegalStateException("Minecraft browser crash hook point was not found");
         }
         write(node, output);
     }
