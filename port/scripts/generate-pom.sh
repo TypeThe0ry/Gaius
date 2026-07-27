@@ -2,6 +2,15 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
+
+maven_path() {
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -m "$1"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
 config="$root/port/config.json"
 version="$(jq -er '.minecraftVersion' "$config")"
 teavm_version="$(jq -er '.teaVMVersion' "$config")"
@@ -22,6 +31,15 @@ minifying="${GAIUS_MINIFYING:-false}"
 short_file_names="${GAIUS_SHORT_FILE_NAMES:-false}"
 assertions_removed="${GAIUS_ASSERTIONS_REMOVED:-false}"
 excluded_library_prefixes="${GAIUS_EXCLUDED_LIBRARY_PREFIXES:-}"
+
+maven_patched_classlib="$(maven_path "$patched_classlib")"
+maven_client="$(maven_path "$client")"
+maven_target_directory="$(maven_path "$target_directory")"
+maven_maven_directory="$(maven_path "$maven_directory")"
+maven_resource_directory="$(maven_path "$resource_directory")"
+maven_source_directory="$(maven_path "$root/port/src/main/java")"
+maven_source_resources="$(maven_path "$root/port/src/main/resources")"
+maven_teavm_core_patch="$(maven_path "$root/port/work/overlays/teavm-core-$teavm_version-gaius.jar")"
 if [[ -n "$excluded_library_prefixes" ]]; then
   IFS=',' read -r -a excluded_library_prefix_list <<<"$excluded_library_prefixes"
 else
@@ -95,7 +113,7 @@ mkdir -p "$(dirname "$output")" "$root/port/src/main/java" \
       <artifactId>teavm-classlib-overlay</artifactId>
       <version>\${teavm.version}</version>
       <scope>system</scope>
-      <systemPath>$patched_classlib</systemPath>
+      <systemPath>$maven_patched_classlib</systemPath>
     </dependency>
     <dependency>
       <groupId>org.teavm</groupId>
@@ -132,7 +150,7 @@ mkdir -p "$(dirname "$output")" "$root/port/src/main/java" \
       <artifactId>client-named</artifactId>
       <version>$version</version>
       <scope>system</scope>
-      <systemPath>$client</systemPath>
+      <systemPath>$maven_client</systemPath>
     </dependency>
 EOF
 
@@ -147,11 +165,12 @@ EOF
     printf '    </dependency>\n'
     index=$((index + 1))
   done < <(
-    jq -r '
-      .libraries[]
-      | select((.name | split(":") | length) == 3)
-      | .downloads.artifact.path
-    ' "$metadata" |
+      jq -r '
+        .libraries[]
+        | select((.name | split(":") | length) == 3)
+        | .downloads.artifact.path
+      ' "$metadata" |
+      tr -d '\r' |
       while IFS= read -r path; do
         for excluded_prefix in "${excluded_library_prefix_list[@]}"; do
           if [[ -n "$excluded_prefix" && "$path" == "$excluded_prefix"* ]]; then
@@ -165,9 +184,9 @@ EOF
         fi
         patched="$root/port/work/overlays/libraries/$path"
         if [[ -f "$patched" ]]; then
-          printf '%s\n' "$patched"
-        else
-          printf '%s\n' "$work/libraries/$path"
+        printf '%s\n' "$(maven_path "$patched")"
+      else
+          printf '%s\n' "$(maven_path "$work/libraries/$path")"
         fi
       done
   )
@@ -176,16 +195,16 @@ EOF
   </dependencies>
 
   <build>
-    <sourceDirectory>$root/port/src/main/java</sourceDirectory>
+    <sourceDirectory>$maven_source_directory</sourceDirectory>
     <resources>
       <resource>
-        <directory>$root/port/src/main/resources</directory>
+        <directory>$maven_source_resources</directory>
       </resource>
       <resource>
-        <directory>$resource_directory</directory>
+        <directory>$maven_resource_directory</directory>
       </resource>
     </resources>
-    <directory>$maven_directory</directory>
+    <directory>$maven_maven_directory</directory>
     <plugins>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
@@ -206,7 +225,7 @@ EOF
             <artifactId>teavm-core-browser-patch</artifactId>
             <version>0.1.0</version>
             <scope>system</scope>
-            <systemPath>$root/port/work/overlays/teavm-core-$teavm_version-gaius.jar</systemPath>
+            <systemPath>$maven_teavm_core_patch</systemPath>
           </dependency>
         </dependencies>
         <executions>
@@ -218,7 +237,7 @@ EOF
             </goals>
             <configuration>
               <mainClass>$main_class</mainClass>
-              <targetDirectory>$target_directory</targetDirectory>
+              <targetDirectory>$maven_target_directory</targetDirectory>
               <targetFileName>$target_file</targetFileName>
               <optimizationLevel>$optimization_level</optimizationLevel>
               <sourceMapsGenerated>$source_maps_generated</sourceMapsGenerated>

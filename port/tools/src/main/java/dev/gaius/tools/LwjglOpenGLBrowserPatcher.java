@@ -64,6 +64,8 @@ public final class LwjglOpenGLBrowserPatcher {
 
     private static Map<String, String> delegates() {
         Map<String, String> methods = new HashMap<>();
+        add(methods, "GL", "setCapabilities", "(Lorg/lwjgl/opengl/GLCapabilities;)V", "setCapabilities");
+        add(methods, "GL", "getCapabilities", "()Lorg/lwjgl/opengl/GLCapabilities;", "getCapabilities");
         add(methods, "GL11", "glEnable", "(I)V", "enable");
         add(methods, "GL11", "glDisable", "(I)V", "disable");
         add(methods, "GL11", "glClearColor", "(FFFF)V", "clearColor");

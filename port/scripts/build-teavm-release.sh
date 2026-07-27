@@ -13,12 +13,33 @@ export GAIUS_ASSERTIONS_REMOVED="${GAIUS_ASSERTIONS_REMOVED:-true}"
 rm -f "$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}.map" \
   "$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}.teavmdbg"
 
-"$root/port/scripts/build-teavm.sh"
+if [[ "${GAIUS_SKIP_CLIENT_BUILD:-false}" == "true" ]]; then
+  client_js="$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}"
+  if [[ ! -s "$client_js" ]]; then
+    echo "Cannot resume release: client JavaScript is missing at $client_js" >&2
+    exit 1
+  fi
+  echo "Reusing successfully compiled client JavaScript: $client_js"
+  "$root/port/scripts/run-python.sh" \
+    "$root/port/scripts/analyze-teavm-log.py" \
+    "$root/port/target/teavm-build.log" \
+    "$root/port/target/teavm-gap.json" \
+    "$root/port/target/teavm-gap.md"
+  "$root/port/scripts/run-python.sh" \
+    "$root/port/scripts/postprocess-teavm-js.py" "$client_js"
+  "$root/port/scripts/run-python.sh" \
+    "$root/port/scripts/postprocess-index-html.py" \
+    "$root/port/web/dist/index.html" \
+    "$client_js"
+else
+  "$root/port/scripts/build-teavm.sh"
+fi
 if [[ "${GAIUS_SKIP_SERVER_WORKER:-false}" != "true" ]]; then
   GAIUS_SKIP_OVERLAY_BUILD=true GAIUS_SKIP_COMPRESSION=true \
     "$root/port/scripts/build-teavm-server-worker.sh"
 fi
-"$root/port/scripts/postprocess-index-html.py" \
+"$root/port/scripts/run-python.sh" \
+  "$root/port/scripts/postprocess-index-html.py" \
   "$root/port/web/dist/index.html" \
   "$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}"
 if [[ "${GAIUS_SKIP_WASM_HOTPATH:-false}" != "true" ]]; then
@@ -32,5 +53,6 @@ fi
 rm -f "$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}.map" \
   "$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}.teavmdbg"
 "$root/port/scripts/compress-dist.sh"
-"$root/port/scripts/build-portable-html.py"
+"$root/port/scripts/run-python.sh" \
+  "$root/port/scripts/build-portable-html.py"
 GAIUS_COMPRESS_FILES=Gaius.html "$root/port/scripts/compress-dist.sh"

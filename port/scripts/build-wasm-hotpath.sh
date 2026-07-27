@@ -6,9 +6,16 @@ source_file="$root/port/wasm/hotpath/gaius_hotpath.c"
 dist="${GAIUS_DIST_DIRECTORY:-$root/port/web/dist}"
 output="$dist/gaius-hotpath.wasm"
 
+generate_directly() {
+  echo "Generating the Gaius Wasm hot-path module directly." >&2
+  "$root/port/scripts/run-python.sh" \
+    "$root/port/scripts/generate-wasm-hotpath.py" -o "$output"
+}
+
 if ! command -v clang >/dev/null 2>&1; then
-  echo "clang is required to build the Gaius Wasm hot-path module" >&2
-  exit 1
+  echo "clang was not found; using the deterministic Wasm generator." >&2
+  generate_directly
+  exit 0
 fi
 
 wasm_ld="${GAIUS_WASM_LD:-}"
@@ -19,8 +26,8 @@ if [[ -z "$wasm_ld" && "$(command -v ld.lld || true)" != "" ]]; then
   wasm_ld="$(command -v ld.lld)"
 fi
 if [[ -z "$wasm_ld" ]]; then
-  echo "wasm-ld/ld.lld was not found; generating the Gaius Wasm hot-path module directly." >&2
-  python3 "$root/port/scripts/generate-wasm-hotpath.py" -o "$output"
+  echo "wasm-ld/ld.lld was not found; using the deterministic Wasm generator." >&2
+  generate_directly
   exit 0
 fi
 

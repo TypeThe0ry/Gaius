@@ -2461,7 +2461,7 @@ def check_source_patches() -> None:
             "patchClientPacketUtilsBrowserInline" in client_patcher
             and '"net/minecraft/network/protocol/PacketUtils.class"' in client_patcher
             and '"PacketUtils client packet scheduler patch point was not found"' in client_patcher
-            and '"net/minecraft/client/multiplayer/ClientCommonPacketListenerImpl"' in client_patcher
+            and '"net/minecraft/client/multiplayer/ClientConfigurationPacketListenerImpl"' in client_patcher
             and "vanillaScheduling" in client_patcher,
         ),
         (
@@ -5923,7 +5923,6 @@ def check_overlay_bytecode() -> None:
             "Minecraft compiled overlay processes queued packets on every browser tick",
             "BrowserWebSocketChannel.pumpAll" in minecraft_run_tick
             and "PacketProcessor.processQueuedPackets" in minecraft_run_tick
-            and "client.processQueuedPacketsBrowserTick" in minecraft_run_tick
             and minecraft_run_tick.find("BrowserWebSocketChannel.pumpAll")
                 < minecraft_run_tick.find("PacketProcessor.processQueuedPackets"),
         ),

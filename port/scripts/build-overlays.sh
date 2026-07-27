@@ -63,6 +63,12 @@ build_library_overlay() {
   local source_jar="$2"
   local source_dir="$3"
   local output_jar="$4"
+  if [[ ! -d "$source_dir" ]]; then
+    echo "Using unmodified $name base: no source overrides at $source_dir"
+    mkdir -p "$(dirname "$output_jar")"
+    cp "$source_jar" "$output_jar"
+    return 0
+  fi
   local output_classes="$overlay_work/library-classes/$name"
   local compile_classpath="$source_jar:$work/client-named.jar:$(cat "$work/classpath.txt")"
   for artifact in teavm-interop teavm-jso teavm-jso-apis; do
@@ -73,6 +79,11 @@ build_library_overlay() {
   while IFS= read -r source; do
     library_sources+=("$source")
   done < <(find "$source_dir" -type f -name '*.java' -print | sort)
+
+  if [[ "${#library_sources[@]}" -eq 0 ]]; then
+    echo "Skipping $name overlay: no Java sources at $source_dir"
+    return 0
+  fi
 
   mkdir -p "$output_classes" "$(dirname "$output_jar")"
   find "$output_classes" -type f -delete
@@ -162,6 +173,18 @@ java -classpath "$tool_classes:$asm_jar:$asm_tree_jar:$teavm_core" \
   "$teavm_core_output" \
   "$teavm_core_patches/org/teavm/backend/javascript/intrinsics/reflection/ClassInfoGenerator.class"
 jar --update --file "$teavm_core_output" -C "$teavm_core_patches" .
+
+jopt_simple_patches="$overlay_work/library-patches/jopt-simple"
+mkdir -p "$jopt_simple_patches/joptsimple/internal"
+find "$jopt_simple_patches" -type f -delete
+java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
+  dev.gaius.tools.JoptSimpleBrowserPatcher \
+  "$overlay_work/libraries/$jopt_simple_path" \
+  "$jopt_simple_patches/joptsimple/internal/Columns.class"
+jar --update \
+  --file "$overlay_work/libraries/$jopt_simple_path" \
+  -C "$jopt_simple_patches" .
+
 text2speech_patch_classes="$overlay_work/library-patches/text2speech"
 mkdir -p "$(dirname "$text2speech_output")" "$text2speech_patch_classes"
 find "$text2speech_patch_classes" -type f -delete
@@ -373,6 +396,7 @@ build_library_overlay \
   "$root/port/overrides/libraries/lwjgl-glfw/src/main/java" \
   "$overlay_work/libraries/$glfw_path"
 glfw_patches="$overlay_work/library-patches/lwjgl-glfw"
+mkdir -p "$glfw_patches"
 find "$glfw_patches" -type f -delete
 java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
   dev.gaius.tools.LwjglGlfwBrowserPatcher \
@@ -397,6 +421,7 @@ build_library_overlay \
   "$root/port/overrides/libraries/lwjgl-opengl/src/main/java" \
   "$overlay_work/libraries/$opengl_path"
 opengl_patches="$overlay_work/library-patches/lwjgl-opengl"
+mkdir -p "$opengl_patches"
 find "$opengl_patches" -type f -delete
 java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
   dev.gaius.tools.LwjglOpenGLBrowserPatcher \
@@ -449,6 +474,7 @@ build_library_overlay \
   "$root/port/overrides/libraries/lwjgl-stb/src/main/java" \
   "$overlay_work/libraries/$stb_path"
 stb_patches="$overlay_work/library-patches/lwjgl-stb"
+mkdir -p "$stb_patches"
 find "$stb_patches" -type f -delete
 java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
   dev.gaius.tools.LwjglUnsafeAccessPatcher \
@@ -469,6 +495,7 @@ build_library_overlay \
   "$root/port/overrides/libraries/lwjgl-openal/src/main/java" \
   "$overlay_work/libraries/$openal_path"
 openal_patches="$overlay_work/library-patches/lwjgl-openal"
+mkdir -p "$openal_patches"
 find "$openal_patches" -type f -delete
 java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
   dev.gaius.tools.LwjglOpenALBrowserPatcher \
@@ -506,6 +533,17 @@ java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
 jar --update \
   --file "$overlay_work/libraries/$jtracy_path" \
   -C "$jtracy_native_patches" .
+
+jtracy_browser_patches="$overlay_work/library-patches/jtracy-browser"
+mkdir -p "$jtracy_browser_patches"
+find "$jtracy_browser_patches" -type f -delete
+java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
+  dev.gaius.tools.JtracyBrowserPatcher \
+  "$overlay_work/libraries/$jtracy_path" \
+  "$jtracy_browser_patches"
+jar --update \
+  --file "$overlay_work/libraries/$jtracy_path" \
+  -C "$jtracy_browser_patches" .
 
 client_output="$overlay_work/client-named-$version-gaius.jar"
 client_patch_classes="$overlay_work/client-patches"

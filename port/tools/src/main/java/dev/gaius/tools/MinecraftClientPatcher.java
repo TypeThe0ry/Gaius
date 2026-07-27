@@ -80,12 +80,17 @@ public final class MinecraftClientPatcher {
         patchEntityBrowserUuidUsesGlobalRandom(args[0], root.resolve(
                 "net/minecraft/world/entity/Entity.class"));
         patchGlx(args[0], root.resolve("com/mojang/blaze3d/platform/GLX.class"));
+        patchGlDebugBrowserNoCallback(args[0], root.resolve(
+                "com/mojang/blaze3d/opengl/GlDebug.class"));
         patchRenderSystemBrowserDeadlineCompensation(args[0], root.resolve(
                 "com/mojang/blaze3d/systems/RenderSystem.class"));
         patchFramerateLimitTrackerBrowserNoThrottle(args[0], root.resolve(
                 "com/mojang/blaze3d/platform/FramerateLimitTracker.class"));
         patchTracyZoneFiller(
                 args[0], root.resolve("net/minecraft/util/profiling/TracyZoneFiller.class"));
+        patchBlockableEventLoopBrowser(args[0], root.resolve(
+                "net/minecraft/util/thread/BlockableEventLoop.class"));
+        patchTracingExecutorBrowser(args[0], root.resolve("net/minecraft/TracingExecutor.class"));
         patchMacosUtil(
                 args[0], root.resolve("com/mojang/blaze3d/platform/MacosUtil.class"));
         patchInputConstants(
@@ -189,6 +194,7 @@ public final class MinecraftClientPatcher {
         patchSkinTextureDownloader(args[0], root.resolve(
                 "net/minecraft/client/renderer/texture/SkinTextureDownloader.class"));
         patchUtilJarFileSystem(args[0], root.resolve("net/minecraft/util/Util.class"));
+        patchUtilRunNamedBrowserOutput(root.resolve("net/minecraft/util/Util.class"));
         patchResourceKeyRegistryRoot(args[0], root.resolve("net/minecraft/resources/ResourceKey.class"));
         patchVanillaPackResourcesBuilder(args[0], root.resolve(
                 "net/minecraft/server/packs/VanillaPackResourcesBuilder.class"));
@@ -349,6 +355,19 @@ public final class MinecraftClientPatcher {
     private static void patchMainBrowserStorageMount(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/main/Main.class");
         MethodNode main = find(node, "main", "([Ljava/lang/String;)V");
+        for (AbstractInsnNode instruction = main.instructions.getFirst(); instruction != null;
+                instruction = instruction.getNext()) {
+            if (!(instruction instanceof MethodInsnNode call)) {
+                continue;
+            }
+            if (call.owner.equals("com/mojang/blaze3d/TracyBootstrap")
+                    && call.name.equals("setup") && call.desc.equals("()V")) {
+                main.instructions.set(call, new InsnNode(Opcodes.NOP));
+            } else if (call.owner.equals("com/mojang/jtracy/TracyClient")
+                    && call.name.equals("reportAppInfo") && call.desc.equals("(Ljava/lang/String;)V")) {
+                main.instructions.set(call, new InsnNode(Opcodes.POP));
+            }
+        }
         main.instructions.insert(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 "dev/gaius/browser/BrowserFilePersistence",
@@ -4359,40 +4378,50 @@ public final class MinecraftClientPatcher {
         write(node, output);
     }
 
+    private static void patchGlDebugBrowserNoCallback(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "com/mojang/blaze3d/opengl/GlDebug.class");
+        MethodNode method = find(
+                node,
+                "enableDebugCallback",
+                "(IZLjava/util/Set;)Lcom/mojang/blaze3d/opengl/GlDebug;");
+        InsnList code = new InsnList();
+        code.add(new InsnNode(Opcodes.ACONST_NULL));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(method, code, 1, 3);
+        write(node, output);
+    }
+
+    private static void patchBlockableEventLoopBrowser(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/util/thread/BlockableEventLoop.class");
+        MethodNode method = find(node, "doRunTask", "(Ljava/lang/Runnable;)V");
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(Opcodes.INVOKEINTERFACE, "java/lang/Runnable", "run", "()V", true));
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(method, code, 1, 2);
+        writeComputeFrames(node, output);
+    }
+
+    private static void patchUtilRunNamedBrowserOutput(Path output) throws IOException {
+        ClassNode node = new ClassNode();
+        new ClassReader(Files.readAllBytes(output)).accept(node, 0);
+        MethodNode method = find(node, "runNamed", "(Ljava/lang/Runnable;Ljava/lang/String;)V");
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(Opcodes.INVOKEINTERFACE, "java/lang/Runnable", "run", "()V", true));
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(method, code, 1, 2);
+        writeComputeFrames(node, output);
+    }
+
     private static void patchTracyZoneFiller(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "net/minecraft/util/profiling/TracyZoneFiller.class");
         boolean pushFound = false;
         for (MethodNode method : node.methods) {
             if (method.name.equals("push") && method.desc.equals("(Ljava/lang/String;)V")) {
                 InsnList code = new InsnList();
-                code.add(new VarInsnNode(Opcodes.ALOAD, 1));
-                code.add(new LdcInsnNode(""));
-                code.add(new LdcInsnNode(""));
-                code.add(new InsnNode(Opcodes.ICONST_0));
-                code.add(new MethodInsnNode(
-                        Opcodes.INVOKESTATIC,
-                        "com/mojang/jtracy/TracyClient",
-                        "beginZone",
-                        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)"
-                                + "Lcom/mojang/jtracy/Zone;",
-                        false));
-                code.add(new VarInsnNode(Opcodes.ASTORE, 2));
-                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-                code.add(new FieldInsnNode(
-                        Opcodes.GETFIELD,
-                        "net/minecraft/util/profiling/TracyZoneFiller",
-                        "activeZones",
-                        "Ljava/util/List;"));
-                code.add(new VarInsnNode(Opcodes.ALOAD, 2));
-                code.add(new MethodInsnNode(
-                        Opcodes.INVOKEINTERFACE,
-                        "java/util/List",
-                        "add",
-                        "(Ljava/lang/Object;)Z",
-                        true));
-                code.add(new InsnNode(Opcodes.POP));
                 code.add(new InsnNode(Opcodes.RETURN));
-                replace(method, code, 4, 3);
+                replace(method, code, 0, 2);
                 pushFound = true;
             } else if (method.name.equals("<clinit>")) {
                 InsnList code = new InsnList();
@@ -4420,6 +4449,27 @@ public final class MinecraftClientPatcher {
         if (!pushFound) {
             throw new IllegalStateException("TracyZoneFiller.push was not found");
         }
+        write(node, output);
+    }
+
+    /** Removes Tracy's StackWalker/native loader path from browser executors. */
+    private static void patchTracingExecutorBrowser(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/TracingExecutor.class");
+        MethodNode wrap = find(node, "wrapUnnamed", "(Ljava/lang/Runnable;)Ljava/lang/Runnable;");
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(wrap, code, 1, 1);
+        MethodNode forName = find(node, "forName", "(Ljava/lang/String;)Ljava/util/concurrent/Executor;");
+        InsnList directExecutor = new InsnList();
+        directExecutor.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        directExecutor.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/TracingExecutor",
+                "service",
+                "Ljava/util/concurrent/ExecutorService;"));
+        directExecutor.add(new InsnNode(Opcodes.ARETURN));
+        replace(forName, directExecutor, 1, 2);
         write(node, output);
     }
 
@@ -4559,6 +4609,12 @@ public final class MinecraftClientPatcher {
                     }
                 }
                 method.maxStack = Math.max(method.maxStack, 9);
+            } else if (method.name.equals("debugClientMetricsStart")
+                    && method.desc.equals("(Ljava/util/function/Consumer;)Z")) {
+                InsnList code = new InsnList();
+                code.add(new InsnNode(Opcodes.ICONST_0));
+                code.add(new InsnNode(Opcodes.IRETURN));
+                replace(method, code, 1, 2);
             } else if (method.name.equals("doWorldLoad")
                     && method.desc.equals(
                             "(Lnet/minecraft/world/level/storage/LevelStorageSource$LevelStorageAccess;"
@@ -8564,6 +8620,7 @@ public final class MinecraftClientPatcher {
         boolean patchedSpinRegistration = false;
         boolean patchedSaveBeforeWorldInitialization = false;
         boolean patchedBrowserPacketPump = false;
+        boolean patchedBrowserMetricsRecorder = false;
         for (MethodNode method : node.methods) {
             if (method.name.equals("spin")
                     && method.desc.equals("(Ljava/util/function/Function;)"
@@ -8715,6 +8772,37 @@ public final class MinecraftClientPatcher {
                 method.instructions.insert(browserPackets);
                 method.maxStack = Math.max(method.maxStack, 1);
                 patchedBrowserPacketPump = true;
+            } else if (method.name.equals("createProfiler")
+                    && method.desc.equals("()Lnet/minecraft/util/profiling/ProfilerFiller;")) {
+                // ServerMetricsSamplersProvider probes OSHI/JNA for desktop CPU and hardware
+                // metrics. It is neither available nor useful in an in-browser integrated server.
+                InsnList code = new InsnList();
+                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                code.add(new FieldInsnNode(
+                        Opcodes.GETSTATIC,
+                        "net/minecraft/util/profiling/metrics/profiling/InactiveMetricsRecorder",
+                        "INSTANCE",
+                        "Lnet/minecraft/util/profiling/metrics/profiling/MetricsRecorder;"));
+                code.add(new FieldInsnNode(
+                        Opcodes.PUTFIELD,
+                        owner,
+                        "metricsRecorder",
+                        "Lnet/minecraft/util/profiling/metrics/profiling/MetricsRecorder;"));
+                code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                code.add(new FieldInsnNode(
+                        Opcodes.GETFIELD,
+                        owner,
+                        "metricsRecorder",
+                        "Lnet/minecraft/util/profiling/metrics/profiling/MetricsRecorder;"));
+                code.add(new MethodInsnNode(
+                        Opcodes.INVOKEINTERFACE,
+                        "net/minecraft/util/profiling/metrics/profiling/MetricsRecorder",
+                        "getProfiler",
+                        "()Lnet/minecraft/util/profiling/ProfilerFiller;",
+                        true));
+                code.add(new InsnNode(Opcodes.ARETURN));
+                replace(method, code, 1, 1);
+                patchedBrowserMetricsRecorder = true;
             } else if (method.name.equals("runServer") && method.desc.equals("()V")) {
                 for (var instruction = method.instructions.getFirst();
                         instruction != null;
@@ -8762,7 +8850,8 @@ public final class MinecraftClientPatcher {
                 || !patchedRunServerBrowserCatchupReset
                 || !patchedSpinRegistration
                 || !patchedSaveBeforeWorldInitialization
-                || !patchedBrowserPacketPump) {
+                || !patchedBrowserPacketPump
+                || !patchedBrowserMetricsRecorder) {
             throw new IllegalStateException("MinecraftServer browser patch points were not found");
         }
         writeComputeFrames(node, output);

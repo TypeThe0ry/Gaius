@@ -81,7 +81,40 @@ public final class NativeMethodFallbackPatcher {
             method.maxLocals = 0;
             return true;
         }
+        if (owner.equals("org/lwjgl/system/ThreadLocalUtil")
+                && method.name.equals("getThreadJNIEnv")
+                && method.desc.equals("()J")) {
+            replaceWithBrowserMemory(method, "threadJniEnv");
+            return true;
+        }
+        if (owner.equals("org/lwjgl/system/ThreadLocalUtil")
+                && method.name.equals("nsetupEnvData")
+                && method.desc.equals("(I)J")) {
+            replaceWithBrowserMemory(method, "setupThreadEnv");
+            return true;
+        }
         return false;
+    }
+
+    private static void replaceWithBrowserMemory(MethodNode method, String target) {
+        InsnList code = new InsnList();
+        int local = 0;
+        for (Type argument : Type.getArgumentTypes(method.desc)) {
+            code.add(new VarInsnNode(argument.getOpcode(Opcodes.ILOAD), local));
+            local += argument.getSize();
+        }
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/system/BrowserMemory",
+                target,
+                method.desc,
+                false));
+        code.add(new InsnNode(
+                Type.getReturnType(method.desc).getOpcode(Opcodes.IRETURN)));
+        method.instructions = code;
+        method.tryCatchBlocks.clear();
+        method.maxStack = Math.max(2, local);
+        method.maxLocals = local;
     }
 
     private static boolean replaceMemoryCall(String owner, MethodNode method) {

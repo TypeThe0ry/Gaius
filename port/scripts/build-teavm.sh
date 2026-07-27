@@ -2,12 +2,23 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
+version="$(jq -er '.minecraftVersion' "$root/port/config.json")"
 if [[ "${GAIUS_SKIP_OVERLAY_BUILD:-false}" != "true" ]]; then
   "$root/port/scripts/build-overlays.sh" >/dev/null
+  gson_type_token_patches="$root/port/target/gson-type-token-client-patches"
+  mkdir -p "$gson_type_token_patches"
+  find "$gson_type_token_patches" -type f -delete
+  java -classpath \
+    "$root/port/work/overlays/tool-classes:$HOME/.m2/repository/org/ow2/asm/asm/9.8/asm-9.8.jar:$HOME/.m2/repository/org/ow2/asm/asm-tree/9.8/asm-tree-9.8.jar" \
+    dev.gaius.tools.GsonTypeTokenClientPatcher \
+    "$root/port/work/overlays/client-named-$version-gaius.jar" \
+    "$gson_type_token_patches"
+  jar --update \
+    --file "$root/port/work/overlays/client-named-$version-gaius.jar" \
+    -C "$gson_type_token_patches" .
 else
   echo "Skipping overlay rebuild because GAIUS_SKIP_OVERLAY_BUILD=true"
 fi
-version="$(jq -er '.minecraftVersion' "$root/port/config.json")"
 work="$root/port/work/$version"
 resource_list_dir="$root/port/target/generated-resources/dev/gaius/browser"
 resource_list="$resource_list_dir/minecraft-resources.txt"
@@ -19,7 +30,7 @@ jar tf "$root/port/work/overlays/libraries/com/ibm/icu/icu4j/77.1/icu4j-77.1.jar
   awk 'index($0, "com/ibm/icu/impl/data/icudata/") == 1 && substr($0, length($0), 1) != "/" { print }' >>"$resource_list"
 rm -rf "$generated_assets/minecraft/sounds" "$generated_assets/minecraft/sounds.json" \
   "$generated_assets/minecraft/font"
-asset_index_id="$(jq -er '.assetIndex.id // .assets' "$work/version.json" 2>/dev/null || true)"
+asset_index_id="$(jq -er '.assetIndex.id // .assets' "$work/version.json" 2>/dev/null | tr -d '\r\n' || true)"
 asset_index="$work/assets/indexes/$asset_index_id.json"
 copied_sound_assets=0
 copied_font_assets=0
@@ -60,7 +71,7 @@ if [[ -n "$asset_index_id" && -f "$asset_index" ]]; then
       )
     | [.key, .value.hash]
     | @tsv
-  ' "$asset_index" >"$browser_sound_manifest"
+  ' "$asset_index" | tr -d '\r' >"$browser_sound_manifest"
   awk -F '\t' -v root="$generated_assets/" '
     {
       path = $1
@@ -101,18 +112,18 @@ if [[ -n "$asset_index_id" && -f "$asset_index" ]]; then
       )
     | [.key, .value.hash]
     | @tsv
-  ' "$asset_index" >"$browser_font_manifest"
+  ' "$asset_index" | tr -d '\r' >"$browser_font_manifest"
   while IFS=$'\t' read -r logical_path hash; do
     if [[ -z "$logical_path" || -z "$hash" ]]; then
       continue
     fi
     source="$work/assets/objects/${hash:0:2}/$hash"
-    if [[ ! -f "$source" ]] || [[ "$(shasum -a 1 "$source" | awk '{print $1}')" != "$hash" ]]; then
+    if [[ ! -f "$source" ]] || [[ "$(shasum -a 1 "$source" | awk '{print $1}' | tr -d '\r\n')" != "$hash" ]]; then
       mkdir -p "$(dirname "$source")"
       temporary="$source.part"
       curl -fsSL --http1.1 --retry 5 --retry-delay 1 \
         -o "$temporary" "https://resources.download.minecraft.net/${hash:0:2}/$hash"
-      if [[ "$(shasum -a 1 "$temporary" | awk '{print $1}')" != "$hash" ]]; then
+      if [[ "$(shasum -a 1 "$temporary" | awk '{print $1}' | tr -d '\r\n')" != "$hash" ]]; then
         rm -f "$temporary"
         echo "SHA-1 mismatch for browser Unicode font asset $logical_path" >&2
         exit 1
@@ -138,14 +149,15 @@ if [[ -n "$asset_index_id" && -f "$asset_index" ]]; then
     (cd "$(dirname "$generated_assets")" && jar uf "$client_overlay" "$font_definition")
   done
 
-  sounds_json_hash="$(jq -r '.objects["minecraft/sounds.json"].hash // ""' "$asset_index")"
+  sounds_json_hash="$(jq -r '.objects["minecraft/sounds.json"].hash // ""' "$asset_index" | tr -d '\r\n')"
   if [[ -n "$sounds_json_hash" ]]; then
     sounds_json_source="$work/assets/objects/${sounds_json_hash:0:2}/$sounds_json_hash"
     if [[ -f "$sounds_json_source" ]]; then
       sounds_json_target="$generated_assets/minecraft/sounds.json"
-      allowed_sounds_json="$(printf '%s\n' "${browser_sound_names[@]}" | jq -R . | jq -s .)"
+      allowed_sounds_json="$root/port/target/browser-sound-names.json"
+      printf '%s\n' "${browser_sound_names[@]}" | jq -R . | jq -s . >"$allowed_sounds_json"
       mkdir -p "$(dirname "$sounds_json_target")"
-      jq --argjson allowed "$allowed_sounds_json" '
+      jq --slurpfile allowed "$allowed_sounds_json" '
         def sound_name:
           (if type == "string" then . else (.name // "") end)
           | sub("^minecraft:"; "")
@@ -154,7 +166,7 @@ if [[ -n "$asset_index_id" && -f "$asset_index" ]]; then
         def playable_file:
           . as $entry
           | ((if ($entry | type) == "object" then ($entry.type // "file") else "file" end) == "file")
-          and (($allowed | index($entry | sound_name)) != null);
+          and (($allowed[0] | index($entry | sound_name)) != null);
         with_entries(
           .value |= (
             if type == "object" and (.sounds | type) == "array" then
@@ -201,7 +213,8 @@ set -e
 tail -n 160 "$log" || true
 
 set +e
-"$root/port/scripts/analyze-teavm-log.py" \
+"$root/port/scripts/run-python.sh" \
+  "$root/port/scripts/analyze-teavm-log.py" \
   "$log" \
   "$root/port/target/teavm-gap.json" \
   "$root/port/target/teavm-gap.md"
@@ -213,12 +226,18 @@ if [[ "$analysis_status" -ne 0 ]]; then
 fi
 
 if [[ "$build_status" -eq 0 ]]; then
-  target_js="$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}"
-  "$root/port/scripts/postprocess-teavm-js.py" "$target_js"
-  "$root/port/scripts/postprocess-index-html.py" \
-    "$root/port/web/dist/index.html" \
+  target_directory="${GAIUS_TARGET_DIRECTORY:-$root/port/web/dist}"
+  target_js="$target_directory/${GAIUS_TARGET_FILE:-classes.js}"
+  "$root/port/scripts/run-python.sh" \
+    "$root/port/scripts/postprocess-teavm-js.py" "$target_js"
+  "$root/port/scripts/run-python.sh" \
+    "$root/port/scripts/postprocess-index-html.py" \
+    "$target_directory/index.html" \
     "$target_js"
-  "$root/port/scripts/compress-dist.sh" >/dev/null
+  if [[ "$target_directory" == "$root/port/web/dist" \
+        && "${GAIUS_SKIP_COMPRESSION:-false}" != "true" ]]; then
+    "$root/port/scripts/compress-dist.sh" >/dev/null
+  fi
 fi
 
 exit "$build_status"

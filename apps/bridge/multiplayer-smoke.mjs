@@ -89,21 +89,21 @@ bridge.stderr.on("data", (chunk) => {
 let webSocket;
 try {
     await waitFor(
-            () => bridgeOutput.includes("Gaius RelayNode listening"),
-            "RelayNode startup");
+            () => bridgeOutput.includes("Gaius translator node listening"),
+            "translator node startup");
 
     const manifestResponse = await fetch(`http://${host}:${bridgePort}/relay-node/v1`, {
         headers: {origin},
     });
     if (!manifestResponse.ok) {
-        throw new Error(`RelayNode manifest returned ${manifestResponse.status}`);
+        throw new Error(`Translator node manifest returned ${manifestResponse.status}`);
     }
     const manifest = await manifestResponse.json();
     if (manifest.kind !== "gaius-relay-node" || manifest.protocolVersion !== 1 ||
             manifest.tunnelPath !== "/tunnel" || manifest.availableConnections < 1 ||
             !manifest.requiresToken || !manifest.capabilities.includes("flow-control") ||
             !manifest.capabilities.includes("keepalive-proxy")) {
-        throw new Error("RelayNode manifest did not describe the tunnel capability");
+        throw new Error("Translator node manifest did not describe the tunnel capability");
     }
     await testRejectedTunnel(bridgePort, fixturePort);
 
@@ -151,7 +151,7 @@ try {
     const health = await healthResponse.json();
     if (!healthResponse.ok || health.activeConnections < 1 ||
             health.availableConnections !== health.maximumConnections - health.activeConnections) {
-        throw new Error("RelayNode health did not report the active tunnel");
+        throw new Error("Translator node health did not report the active tunnel");
     }
 
     const upload = patternedBuffer(4 * 1024 * 1024, 0x31);
@@ -165,7 +165,7 @@ try {
     fixtureSocket.write(keepAlive);
     await waitFor(() => proxiedKeepAlives === 1, "proxied vanilla keepalive");
     if (echoedBytes !== upload.byteLength) {
-        throw new Error("RelayNode forwarded a proxied keepalive to the browser");
+        throw new Error("Translator node forwarded a proxied keepalive to the browser");
     }
 
     echoEnabled = false;
@@ -269,7 +269,7 @@ async function testRejectedTunnel(bridgePort, fixturePort) {
     socket.send(JSON.stringify({ type: "connect", host, port: fixturePort }));
     const [code] = await once(socket, "close");
     if (code !== 1008) {
-        throw new Error(`RelayNode accepted a tunnel without its required token (${code})`);
+        throw new Error(`Translator node accepted a tunnel without its required token (${code})`);
     }
 }
 
@@ -287,7 +287,7 @@ function testConnectRequestNormalization() {
             port: sample.port,
         }));
         if (parsed.host !== sample.expected) {
-            throw new Error(`RelayNode did not normalize ${sample.host}`);
+            throw new Error(`Translator node did not normalize ${sample.host}`);
         }
     }
     for (const sample of [
@@ -301,7 +301,7 @@ function testConnectRequestNormalization() {
             rejected = true;
         }
         if (!rejected) {
-            throw new Error(`RelayNode accepted a mismatched address port: ${sample.host}`);
+            throw new Error(`Translator node accepted a mismatched address port: ${sample.host}`);
         }
     }
 }

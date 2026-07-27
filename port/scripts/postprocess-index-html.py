@@ -824,6 +824,59 @@ def patch_index(index: Path, classes_js: Path) -> bool:
             "online session resolution",
         )
 
+    if "window.__gaiusBootError = error;" not in text:
+        text = replace_required(
+            text,
+            "    })().catch(error => {\n"
+            "      setStatus(\"error\", [\n",
+            "    })().catch(error => {\n"
+            "      window.__gaiusBootError = error;\n"
+            "      setStatus(\"error\", [\n",
+            "boot error diagnostics",
+        )
+
+    if "window.__gaiusBootErrorDetails" not in text:
+        text = replace_required(
+            text,
+            "      window.__gaiusBootError = error;\n"
+            "      setStatus(\"error\", [\n",
+            "      window.__gaiusBootError = error;\n"
+            "      const bootErrorDetails = [];\n"
+            "      const primitiveFields = value => Object.fromEntries(\n"
+            "        Object.getOwnPropertyNames(value).slice(0, 80).flatMap(key => {\n"
+            "          const field = value[key];\n"
+            "          return field == null || [\"string\", \"number\", \"boolean\", \"bigint\"].includes(typeof field)\n"
+            "            ? [[key, String(field)]] : [];\n"
+            "        })\n"
+            "      );\n"
+            "      for (const symbol of Object.getOwnPropertySymbols(error || {})) {\n"
+            "        const javaError = error[symbol];\n"
+            "        if (!javaError || typeof javaError !== \"object\") continue;\n"
+            "        bootErrorDetails.push(\"Java fields: \" + JSON.stringify(primitiveFields(javaError)));\n"
+            "        const constructor = javaError.constructor;\n"
+            "        for (const metadataSymbol of Object.getOwnPropertySymbols(constructor || {})) {\n"
+            "          const metadata = constructor[metadataSymbol];\n"
+            "          if (metadata && typeof metadata === \"object\") {\n"
+            "            const fields = primitiveFields(metadata);\n"
+            "            if (Object.keys(fields).length) bootErrorDetails.push(\"Java class: \" + JSON.stringify(fields));\n"
+            "          }\n"
+            "        }\n"
+            "      }\n"
+            "      window.__gaiusBootErrorDetails = bootErrorDetails;\n"
+            "      setStatus(\"error\", [\n",
+            "boot Java exception diagnostics",
+        )
+
+        text = replace_required(
+            text,
+            "        error && error.stack ? error.stack : String(error)\n"
+            "      ].join(\"\\n\"));\n",
+            "        error && error.stack ? error.stack : String(error),\n"
+            "        ...bootErrorDetails\n"
+            "      ].join(\"\\n\"));\n",
+            "boot Java exception diagnostic display",
+        )
+
     if text != original:
         index.write_text(text, encoding="utf-8")
         return True

@@ -34,6 +34,7 @@ import org.lwjgl.system.MemoryUtil;
 
 /** WebGL2 implementation used by patched LWJGL OpenGL entry points. */
 public final class BrowserOpenGL {
+    private static GLCapabilities capabilities;
     private static final Map<Integer, MappedBuffer> MAPPED_BUFFERS = new HashMap<>();
     private static final ThreadLocal<UniformScratch> UNIFORM_SCRATCH =
             ThreadLocal.withInitial(UniformScratch::new);
@@ -45,6 +46,19 @@ public final class BrowserOpenGL {
     private static String inventoryWorldRenderScreen;
 
     private BrowserOpenGL() {
+    }
+
+    /** Stores the capabilities for the browser's single WebGL context. */
+    public static void setCapabilities(GLCapabilities value) {
+        capabilities = value;
+    }
+
+    /** Returns the capabilities for the browser's single WebGL context. */
+    public static GLCapabilities getCapabilities() {
+        if (capabilities == null) {
+            throw new IllegalStateException("There is no WebGL context current in the browser.");
+        }
+        return capabilities;
     }
 
     @JSBody(script = """

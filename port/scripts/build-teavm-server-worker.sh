@@ -61,7 +61,8 @@ set -e
 tail -n 160 "$log" || true
 
 set +e
-"$root/port/scripts/analyze-teavm-log.py" \
+"$root/port/scripts/run-python.sh" \
+  "$root/port/scripts/analyze-teavm-log.py" \
   "$log" \
   "$server_target/teavm-gap.json" \
   "$server_target/teavm-gap.md"
@@ -72,7 +73,8 @@ if [[ "$analysis_status" -ne 0 ]]; then
 fi
 
 if [[ "$build_status" -eq 0 ]]; then
-  "$root/port/scripts/postprocess-teavm-js.py" "$dist/singleplayer-server.js"
+  "$root/port/scripts/run-python.sh" \
+    "$root/port/scripts/postprocess-teavm-js.py" "$dist/singleplayer-server.js"
   if [[ "${GAIUS_SKIP_COMPRESSION:-false}" != "true" ]]; then
     GAIUS_COMPRESS_FILES="singleplayer-server.js:singleplayer-server-worker.js" \
       "$root/port/scripts/compress-dist.sh" >/dev/null

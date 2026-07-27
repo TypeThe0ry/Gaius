@@ -23,8 +23,8 @@ download_from_metadata() {
   local key="$1"
   local output="$2"
   local url sha1
-  url="$(jq -er --arg key "$key" '.downloads[$key].url' "$metadata")"
-  sha1="$(jq -er --arg key "$key" '.downloads[$key].sha1' "$metadata")"
+  url="$(jq -er --arg key "$key" '.downloads[$key].url' "$metadata" | tr -d '\r\n')"
+  sha1="$(jq -er --arg key "$key" '.downloads[$key].sha1' "$metadata" | tr -d '\r\n')"
   download_verified "$url" "$sha1" "$output"
 }
 
@@ -32,8 +32,9 @@ download_verified() {
   local url="$1"
   local expected_sha1="$2"
   local output="$3"
+  expected_sha1="$(printf '%s' "$expected_sha1" | tr -d '\r\n')"
   if [[ -f "$output" ]] &&
-    [[ "$(shasum -a 1 "$output" | awk '{print $1}')" == "$expected_sha1" ]]; then
+    [[ "$(shasum -a 1 "$output" | awk '{print $1}' | tr -d '\r\n')" == "$expected_sha1" ]]; then
     return
   fi
 
@@ -44,7 +45,9 @@ download_verified() {
     return 1
   fi
   local actual_sha1
-  actual_sha1="$(shasum -a 1 "$temporary" | awk '{print $1}')"
+  # Git Bash on Windows can emit CRLF while jq/curl output is LF-only. Normalize
+  # both sides before comparing so an identical digest is not rejected.
+  actual_sha1="$(shasum -a 1 "$temporary" | awk '{print $1}' | tr -d '\r\n')"
   if [[ "$actual_sha1" != "$expected_sha1" ]]; then
     echo "SHA-1 mismatch for $url" >&2
     echo "expected: $expected_sha1" >&2
@@ -74,9 +77,9 @@ find "$libraries" -type f -name '*.jar' -print | sort |
 
 unzip -p "$work/client-obfuscated.jar" version.json >"$work/client-version.json"
 
-asset_index_id="$(jq -er '.assetIndex.id // .assets' "$metadata")"
-asset_index_url="$(jq -er '.assetIndex.url' "$metadata")"
-asset_index_sha1="$(jq -er '.assetIndex.sha1' "$metadata")"
+asset_index_id="$(jq -er '.assetIndex.id // .assets' "$metadata" | tr -d '\r\n')"
+asset_index_url="$(jq -er '.assetIndex.url' "$metadata" | tr -d '\r\n')"
+asset_index_sha1="$(jq -er '.assetIndex.sha1' "$metadata" | tr -d '\r\n')"
 asset_index="$assets/indexes/$asset_index_id.json"
 
 echo "Fetching browser sound asset index $asset_index_id"
@@ -128,12 +131,12 @@ done < <(
           or startswith("minecraft/sounds/tile/")
         )
       )
-  ' "$asset_index"
+  ' "$asset_index" | tr -d '\r'
 )
 download_browser_asset() {
   local logical_path="$1"
   local hash
-  hash="$(jq -er --arg path "$logical_path" '.objects[$path].hash' "$asset_index")"
+  hash="$(jq -er --arg path "$logical_path" '.objects[$path].hash' "$asset_index" | tr -d '\r\n')"
   download_verified \
     "https://resources.download.minecraft.net/${hash:0:2}/$hash" \
     "$hash" \
