@@ -22,7 +22,11 @@ fi
 work="$root/port/work/$version"
 resource_list_dir="$root/port/target/generated-resources/dev/gaius/browser"
 resource_list="$resource_list_dir/minecraft-resources.txt"
+embedded_resource_list="$resource_list_dir/minecraft-embedded-resources.txt"
+generated_resources="$root/port/target/generated-resources"
 generated_assets="$root/port/target/generated-resources/assets"
+target_directory="${GAIUS_TARGET_DIRECTORY:-$root/port/web/dist}"
+vanilla_asset_pack="$target_directory/vanilla-assets.pack.gz"
 mkdir -p "$resource_list_dir"
 jar tf "$root/port/work/overlays/client-named-$version-gaius.jar" |
   awk '(index($0, "assets/") == 1 || index($0, "data/") == 1 || $0 == "pack.png") && substr($0, length($0), 1) != "/" { print }' >"$resource_list"
@@ -190,7 +194,22 @@ else
   echo "WARNING: asset index not found at $asset_index; run port/scripts/fetch-version.sh to enable browser game sounds" >&2
 fi
 sort -u -o "$resource_list" "$resource_list"
+awk '
+  index($0, "assets/") != 1 && index($0, "data/") != 1 && $0 != "pack.png" { print; next }
+  $0 == "assets/minecraft/lang/deprecated.json" { print; next }
+  $0 == "assets/minecraft/lang/en_us.json" { print; next }
+  $0 == "assets/minecraft/font/include/unifont.json" { print; next }
+  $0 == "assets/minecraft/font/unifont.zip" { print; next }
+  $0 == "assets/minecraft/sounds/random/eat1.ogg" { print; next }
+' "$resource_list" | sort -u >"$embedded_resource_list"
+"$root/port/scripts/run-python.sh" \
+  "$root/port/scripts/build-vanilla-assets-pack.py" \
+  "$resource_list" \
+  "$root/port/work/overlays/client-named-$version-gaius.jar" \
+  "$generated_resources" \
+  "$vanilla_asset_pack"
 echo "Generated browser resource list: $(wc -l <"$resource_list" | tr -d ' ') entries"
+echo "Embedded TeaVM resource subset: $(wc -l <"$embedded_resource_list" | tr -d ' ') entries"
 echo "Mapped browser sound assets: $copied_sound_assets"
 echo "Mapped browser Unicode font assets: $copied_font_assets"
 pom="$("$root/port/scripts/generate-pom.sh")"
@@ -226,7 +245,6 @@ if [[ "$analysis_status" -ne 0 ]]; then
 fi
 
 if [[ "$build_status" -eq 0 ]]; then
-  target_directory="${GAIUS_TARGET_DIRECTORY:-$root/port/web/dist}"
   target_js="$target_directory/${GAIUS_TARGET_FILE:-classes.js}"
   "$root/port/scripts/run-python.sh" \
     "$root/port/scripts/postprocess-teavm-js.py" "$target_js"

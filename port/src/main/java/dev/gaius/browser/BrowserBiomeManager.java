@@ -8,12 +8,15 @@ public final class BrowserBiomeManager {
     }
 
     @JSBody(params = {"seed", "shiftedX", "shiftedY", "shiftedZ"}, script = """
-            const multiplier = BigInt("6364136223846793005");
-            const increment = BigInt("1442695040888963407");
-            const next = (value, salt) => BigInt.asIntN(
-              64, value * (value * multiplier + increment) + salt);
-            const fiddle = value =>
-              (Number((value >> BigInt(24)) & BigInt(1023)) / 1024.0 - 0.5) * 0.9;
+            const constants = globalThis.__gaiusBiomeManagerConstants
+              || (globalThis.__gaiusBiomeManagerConstants = {
+                multiplier: BigInt("6364136223846793005"),
+                increment: BigInt("1442695040888963407"),
+                shift: BigInt(24),
+                mask: BigInt(1023)
+              });
+            const multiplier = constants.multiplier;
+            const increment = constants.increment;
 
             const baseX = (shiftedX | 0) >> 2;
             const baseY = (shiftedY | 0) >> 2;
@@ -37,17 +40,28 @@ public final class BrowserBiomeManager {
               const quartX = highX ? quartX1 : quartX0;
               const quartY = highY ? quartY1 : quartY0;
               const quartZ = highZ ? quartZ1 : quartZ0;
-              let value = next(seed, quartX);
-              value = next(value, quartY);
-              value = next(value, quartZ);
-              value = next(value, quartX);
-              value = next(value, quartY);
-              value = next(value, quartZ);
-              const distanceX = (highX ? fractionX - 1.0 : fractionX) + fiddle(value);
-              value = next(value, seed);
-              const distanceY = (highY ? fractionY - 1.0 : fractionY) + fiddle(value);
-              value = next(value, seed);
-              const distanceZ = (highZ ? fractionZ - 1.0 : fractionZ) + fiddle(value);
+              let value = BigInt.asIntN(
+                64, seed * (seed * multiplier + increment) + quartX);
+              value = BigInt.asIntN(
+                64, value * (value * multiplier + increment) + quartY);
+              value = BigInt.asIntN(
+                64, value * (value * multiplier + increment) + quartZ);
+              value = BigInt.asIntN(
+                64, value * (value * multiplier + increment) + quartX);
+              value = BigInt.asIntN(
+                64, value * (value * multiplier + increment) + quartY);
+              value = BigInt.asIntN(
+                64, value * (value * multiplier + increment) + quartZ);
+              const distanceX = (highX ? fractionX - 1.0 : fractionX)
+                + (Number((value >> constants.shift) & constants.mask) / 1024.0 - 0.5) * 0.9;
+              value = BigInt.asIntN(
+                64, value * (value * multiplier + increment) + seed);
+              const distanceY = (highY ? fractionY - 1.0 : fractionY)
+                + (Number((value >> constants.shift) & constants.mask) / 1024.0 - 0.5) * 0.9;
+              value = BigInt.asIntN(
+                64, value * (value * multiplier + increment) + seed);
+              const distanceZ = (highZ ? fractionZ - 1.0 : fractionZ)
+                + (Number((value >> constants.shift) & constants.mask) / 1024.0 - 0.5) * 0.9;
               const distance = distanceZ * distanceZ
                 + distanceY * distanceY + distanceX * distanceX;
               if (nearestDistance > distance) {

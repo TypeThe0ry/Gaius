@@ -89,6 +89,7 @@ class PrecompressedHandler(SimpleHTTPRequestHandler):
             "classes.js",
             "singleplayer-server.js",
             "singleplayer-server-worker.js",
+            "vanilla-assets.pack.gz",
         }
         if name in versioned_assets and query.get("v"):
             return "public, max-age=31536000, immutable"

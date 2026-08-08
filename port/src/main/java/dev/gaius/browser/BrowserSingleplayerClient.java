@@ -69,6 +69,11 @@ public final class BrowserSingleplayerClient {
         requestWorkerStop();
     }
 
+    /** Treats an active Worker-hosted world like vanilla singleplayer in menu navigation. */
+    public static boolean isLocalSession(Minecraft minecraft) {
+        return minecraft != null && (minecraft.isLocalServer() || hasActiveWorker());
+    }
+
     /** Applies changed video settings to an active Worker-hosted singleplayer server. */
     public static void syncDistances(Minecraft minecraft) {
         if (minecraft == null || minecraft.options == null) {
@@ -347,6 +352,17 @@ public final class BrowserSingleplayerClient {
 
     @JSBody(params = {"active"}, script = "globalThis.__gaiusSingleplayerHandoff = !!active;")
     private static native void setClientHandoff(boolean active);
+
+    @JSBody(script = """
+            const workers = globalThis.__gaiusSingleplayerWorkers;
+            if (!workers || typeof workers.values !== 'function') return false;
+            let active = false;
+            workers.forEach(function(worker) {
+              if (worker && !worker.__gaiusTerminal) active = true;
+            });
+            return active;
+            """)
+    private static native boolean hasActiveWorker();
 
     @JSBody(script = """
             if (globalThis.__gaiusSingleplayerHandoff) return;

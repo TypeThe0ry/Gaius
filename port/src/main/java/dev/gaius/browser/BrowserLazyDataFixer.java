@@ -4,6 +4,8 @@ import com.mojang.datafixers.DSL;
 import com.mojang.datafixers.DataFixer;
 import com.mojang.datafixers.schemas.Schema;
 import com.mojang.serialization.Dynamic;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import net.minecraft.util.datafix.DataFixers;
 
 /** Defers the expensive historical data-fixer graph until an older save actually needs it. */
@@ -17,6 +19,11 @@ public final class BrowserLazyDataFixer implements DataFixer {
 
     public static DataFixer instance() {
         return INSTANCE;
+    }
+
+    /** Current-version browser saves do not need the eager historical schema warmup. */
+    public static CompletableFuture<?> skipEagerOptimization(Set<?> ignoredTypes) {
+        return CompletableFuture.completedFuture(null);
     }
 
     @Override

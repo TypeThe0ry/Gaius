@@ -2,7 +2,11 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
-"$root/port/scripts/build-overlays.sh" >/dev/null
+if [[ "${GAIUS_SKIP_OVERLAY_BUILD:-false}" != "true" ]]; then
+  "$root/port/scripts/build-overlays.sh" >/dev/null
+else
+  echo "Skipping overlay rebuild because GAIUS_SKIP_OVERLAY_BUILD=true"
+fi
 
 pom="$(
   GAIUS_MAIN_CLASS=dev.gaius.browser.PlatformSmoke \

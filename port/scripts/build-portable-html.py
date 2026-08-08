@@ -28,18 +28,27 @@ def build(dist: Path, output: Path) -> None:
     classes = base64_chunks(require(dist / "classes.js.gz"))
     server = base64_chunks(require(dist / "singleplayer-server.js.gz"))
     wasm = base64_chunks(require(dist / "gaius-hotpath.wasm.gz"))
+    vanilla = base64_chunks(require(dist / "vanilla-assets.pack.gz"))
     worker = require(dist / "singleplayer-server-worker.js").read_text(encoding="utf-8")
+    relay_registry = json.loads(require(dist / "relay-nodes.json").read_text(encoding="utf-8"))
+    if (relay_registry.get("kind") != "gaius-relay-registry"
+            or relay_registry.get("protocolVersion") != 1
+            or not isinstance(relay_registry.get("nodes"), list)):
+        raise RuntimeError("portable relay-nodes.json is incompatible")
+    relay_nodes = relay_registry["nodes"][:64]
 
     payload = json.dumps(
-        {"classes": classes, "server": server, "wasm": wasm},
+        {"classes": classes, "server": server, "wasm": wasm, "vanilla": vanilla},
         ensure_ascii=True,
         separators=(",", ":"),
     )
     worker_source = json.dumps(worker, ensure_ascii=True)
+    relay_nodes_source = json.dumps(relay_nodes, ensure_ascii=True, separators=(",", ":"))
     bootstrap = f'''  <script data-gaius-portable="1">
     (() => {{
       const embedded = {payload};
       const workerSource = {worker_source};
+      const embeddedRelayNodes = {relay_nodes_source};
 
       async function compressedBlob(chunks) {{
         const parts = new Array(chunks.length);
@@ -69,10 +78,17 @@ def build(dist: Path, output: Path) -> None:
         return new Blob([decompressed], {{type: mimeType}});
       }}
 
+      const configuredRelayNodes = Array.isArray(window.__gaiusBridgeUrls)
+        ? window.__gaiusBridgeUrls
+        : (window.__gaiusBridgeUrls ? [window.__gaiusBridgeUrls] : []);
+      window.__gaiusBridgeUrls = embeddedRelayNodes.concat(configuredRelayNodes);
       window.__gaiusPortableBuild = true;
+      window.__gaiusVanillaAssetsCompressedPromise = compressedBlob(embedded.vanilla);
       window.__gaiusPortableAssetsReady = (async () => {{
-        const classesBlob = await decompress(embedded.classes, "text/javascript");
-        const wasmBlob = await decompress(embedded.wasm, "application/wasm");
+        const [classesBlob, wasmBlob] = await Promise.all([
+          decompress(embedded.classes, "text/javascript"),
+          decompress(embedded.wasm, "application/wasm"),
+        ]);
         window.__gaiusClassesUrl = URL.createObjectURL(classesBlob);
         window.__gaiusHotpathWasmUrl = URL.createObjectURL(wasmBlob);
         window.__gaiusSingleplayerWorkerUrl = URL.createObjectURL(new Blob(

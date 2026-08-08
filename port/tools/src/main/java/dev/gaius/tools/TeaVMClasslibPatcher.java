@@ -18,6 +18,7 @@ import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.IntInsnNode;
 import org.objectweb.asm.tree.JumpInsnNode;
 import org.objectweb.asm.tree.LabelNode;
+import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.TypeInsnNode;
@@ -495,6 +496,98 @@ public final class TeaVMClasslibPatcher {
         if (!patched) {
             throw new IllegalStateException("TZipFile.getInputStream raw inflater allocation was not found");
         }
+
+        // ZIP permits the local-header name to differ from the central-directory name. TeaVM
+        // used the central entry's nameLen when finding the compressed bytes, which shifted the
+        // stream for server packs that intentionally use a shorter local name.
+        MethodInsnNode rafConstructor = null;
+        VarInsnNode streamStore = null;
+        for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+            if (!(insn instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKESPECIAL
+                    || !call.owner.equals(streamClass)
+                    || !call.name.equals("<init>")
+                    || !call.desc.equals("(Ljava/io/RandomAccessFile;J)V")) {
+                continue;
+            }
+            LdcInsnNode offsetConstant = null;
+            boolean streamAllocationFound = false;
+            for (AbstractInsnNode cursor = previousExecutable(call);
+                    cursor != null;
+                    cursor = previousExecutable(cursor)) {
+                if (cursor instanceof LdcInsnNode constant
+                        && constant.cst instanceof Long value
+                        && value == 28L) {
+                    offsetConstant = constant;
+                }
+                if (cursor instanceof TypeInsnNode allocation
+                        && allocation.getOpcode() == Opcodes.NEW
+                        && allocation.desc.equals(streamClass)) {
+                    streamAllocationFound = true;
+                    break;
+                }
+            }
+            if (!streamAllocationFound || offsetConstant == null) {
+                continue;
+            }
+            AbstractInsnNode stored = nextExecutable(call);
+            if (!(stored instanceof VarInsnNode candidate)
+                    || candidate.getOpcode() != Opcodes.ASTORE) {
+                throw new IllegalStateException("TZipFile.getInputStream RAFStream store was not found");
+            }
+            offsetConstant.cst = 26L;
+            rafConstructor = call;
+            streamStore = candidate;
+            break;
+        }
+        if (rafConstructor == null || streamStore == null) {
+            throw new IllegalStateException("TZipFile.getInputStream local-header offset was not found");
+        }
+
+        int localNameLength = method.maxLocals++;
+        InsnList readLocalNameLength = new InsnList();
+        readLocalNameLength.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        readLocalNameLength.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                className,
+                "ler",
+                "Lorg/teavm/classlib/java/util/zip/TZipEntry$LittleEndianReader;"));
+        readLocalNameLength.add(new VarInsnNode(Opcodes.ALOAD, streamStore.var));
+        readLocalNameLength.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "org/teavm/classlib/java/util/zip/TZipEntry$LittleEndianReader",
+                "readShortLE",
+                "(Ljava/io/InputStream;)I",
+                false));
+        readLocalNameLength.add(new VarInsnNode(Opcodes.ISTORE, localNameLength));
+        method.instructions.insert(streamStore, readLocalNameLength);
+
+        boolean localNameApplied = false;
+        for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+            if (!(insn instanceof FieldInsnNode field)
+                    || field.getOpcode() != Opcodes.GETFIELD
+                    || !field.owner.equals("org/teavm/classlib/java/util/zip/TZipEntry")
+                    || !field.name.equals("nameLen")
+                    || !field.desc.equals("I")) {
+                continue;
+            }
+            AbstractInsnNode entryLoad = previousExecutable(field);
+            if (!(entryLoad instanceof VarInsnNode load)
+                    || load.getOpcode() != Opcodes.ALOAD
+                    || load.var != 1) {
+                throw new IllegalStateException("TZipFile.getInputStream central nameLen load was not found");
+            }
+            method.instructions.insertBefore(entryLoad,
+                    new VarInsnNode(Opcodes.ILOAD, localNameLength));
+            method.instructions.remove(field);
+            method.instructions.remove(entryLoad);
+            localNameApplied = true;
+            break;
+        }
+        if (!localNameApplied) {
+            throw new IllegalStateException("TZipFile.getInputStream local nameLen replacement was not found");
+        }
+        method.maxStack = Math.max(method.maxStack, 5);
         writeClass(root, className, node);
     }
 

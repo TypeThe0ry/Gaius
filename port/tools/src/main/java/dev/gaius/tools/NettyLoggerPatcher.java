@@ -13,7 +13,7 @@ import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.MethodNode;
 
-/** Selects Netty's browser logger without probing desktop logging frameworks. */
+/** Selects Netty's SLF4J adapter without probing desktop logging frameworks. */
 public final class NettyLoggerPatcher {
     private static final String ENTRY =
             "io/netty/util/internal/logging/InternalLoggerFactory.class";
@@ -38,7 +38,7 @@ public final class NettyLoggerPatcher {
                 InsnList code = new InsnList();
                 code.add(new FieldInsnNode(
                         Opcodes.GETSTATIC,
-                        "io/netty/util/internal/logging/BrowserInternalLoggerFactory",
+                        "io/netty/util/internal/logging/Slf4JLoggerFactory",
                         "INSTANCE",
                         "Lio/netty/util/internal/logging/InternalLoggerFactory;"));
                 code.add(new InsnNode(Opcodes.ARETURN));

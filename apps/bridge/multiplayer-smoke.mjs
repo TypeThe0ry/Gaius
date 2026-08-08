@@ -8,6 +8,7 @@ import {
     randomBytes,
 } from "node:crypto";
 import { createServer } from "node:net";
+import { createServer as createHttpServer } from "node:http";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
@@ -26,6 +27,15 @@ const minecraftAccessToken = process.env.GAIUS_SMOKE_ACCESS_TOKEN ?? "gaius-smok
 const minecraftProfileId = process.env.GAIUS_SMOKE_PROFILE_ID ??
         "00000000000040008000000000000002";
 const minecraftUsername = process.env.GAIUS_SMOKE_USERNAME ?? "GaiusSmoke";
+const minecraftPlaySoakMs = Math.max(
+        0,
+        Number.parseInt(process.env.GAIUS_SMOKE_PLAY_SOAK_MS ?? "0", 10) || 0);
+const acceptServerPrompts =
+        process.env.GAIUS_SMOKE_ACCEPT_SERVER_PROMPTS === "1" ||
+        process.env.GAIUS_SMOKE_ACCEPT_DIALOGS === "1";
+const requestedDialogAction = process.env.GAIUS_SMOKE_DIALOG_ACTION_ID;
+const dialogInputValues = parseDialogInputValues(
+        process.env.GAIUS_SMOKE_DIALOG_INPUTS_JSON);
 testConnectRequestNormalization();
 const bridgePort = await reservePort();
 const fixture = createServer();
@@ -34,6 +44,56 @@ await new Promise((resolve, reject) => {
     fixture.listen(0, host, resolve);
 });
 const fixturePort = fixture.address().port;
+const resourcePackPayload = Buffer.alloc(20 * 1024 * 1024);
+for (let index = 0; index < resourcePackPayload.byteLength; index++) {
+    resourcePackPayload[index] = index & 0xff;
+}
+const resourcePackHash = createHash("sha1").update(resourcePackPayload).digest("hex");
+let resourcePackAttempts = 0;
+let slowResourcePackAttempts = 0;
+let slowResourcePackClosed = false;
+const resourcePackFixture = createHttpServer((request, response) => {
+    const requestUrl = new URL(request.url ?? "/", `http://${host}`);
+    if (requestUrl.pathname === "/slow-resource-pack.zip") {
+        slowResourcePackAttempts++;
+        response.writeHead(200, {
+            "content-type": "application/zip",
+            "content-length": String(resourcePackPayload.byteLength),
+        });
+        let offset = 0;
+        const interval = setInterval(() => {
+            if (response.destroyed || offset >= resourcePackPayload.byteLength) {
+                clearInterval(interval);
+                if (!response.destroyed) response.end();
+                return;
+            }
+            const next = Math.min(offset + 64 * 1024, resourcePackPayload.byteLength);
+            response.write(resourcePackPayload.subarray(offset, next));
+            offset = next;
+        }, 25);
+        response.once("close", () => {
+            clearInterval(interval);
+            slowResourcePackClosed = true;
+        });
+        return;
+    }
+    resourcePackAttempts++;
+    response.writeHead(200, {
+        "content-type": "application/zip",
+        "content-length": String(resourcePackPayload.byteLength),
+    });
+    if (resourcePackAttempts < 3) {
+        response.write(resourcePackPayload.subarray(0, 1024 * 1024));
+        response.destroy();
+        return;
+    }
+    response.end(resourcePackPayload);
+});
+await new Promise((resolve, reject) => {
+    resourcePackFixture.once("error", reject);
+    resourcePackFixture.listen(0, host, resolve);
+});
+const resourcePackFixturePort = resourcePackFixture.address().port;
 
 let fixtureSocket;
 let echoEnabled = true;
@@ -70,6 +130,7 @@ const bridge = spawn(process.execPath, ["dist/main.js"], {
         GAIUS_BRIDGE_PORT: String(bridgePort),
         GAIUS_ALLOWED_ORIGINS: origin,
         GAIUS_ALLOWED_HOSTS: [host, minecraftHost].filter(Boolean).join(","),
+        GAIUS_ALLOWED_RESOURCE_PACK_HOSTS: [host, "localhost"].join(","),
         GAIUS_BRIDGE_TOKEN: bridgeToken,
         GAIUS_IDLE_TIMEOUT_MS: "60000",
     },
@@ -92,6 +153,61 @@ try {
             () => bridgeOutput.includes("Gaius translator node listening"),
             "translator node startup");
 
+    const resourcePackProxyUrl = new URL(
+            `http://${host}:${bridgePort}/proxy/resource-pack`);
+    resourcePackProxyUrl.searchParams.set(
+            "url", `http://${host}:${resourcePackFixturePort}/resource-pack.zip`);
+    resourcePackProxyUrl.searchParams.set("token", bridgeToken);
+    const resourcePackResponse = await fetch(resourcePackProxyUrl, {
+        headers: {origin},
+    });
+    const resourcePackBytes = Buffer.from(await resourcePackResponse.arrayBuffer());
+    const proxiedResourcePackHash = createHash("sha1")
+            .update(resourcePackBytes).digest("hex");
+    if (!resourcePackResponse.ok || resourcePackAttempts !== 3 ||
+            resourcePackBytes.byteLength !== resourcePackPayload.byteLength ||
+            resourcePackResponse.headers.get("content-length") !==
+                String(resourcePackPayload.byteLength) ||
+            proxiedResourcePackHash !== resourcePackHash) {
+        throw new Error("Translator node did not retry and preserve an interrupted resource pack");
+    }
+    const cachedResourcePackResponse = await fetch(resourcePackProxyUrl, {
+        headers: {origin},
+    });
+    const cachedResourcePackBytes = Buffer.from(
+            await cachedResourcePackResponse.arrayBuffer());
+    if (!cachedResourcePackResponse.ok || resourcePackAttempts !== 3 ||
+            cachedResourcePackBytes.byteLength !== resourcePackPayload.byteLength ||
+            createHash("sha1").update(cachedResourcePackBytes).digest("hex") !==
+                resourcePackHash) {
+        throw new Error("Translator node did not reuse its verified resource-pack cache");
+    }
+
+    const slowResourcePackProxyUrl = new URL(resourcePackProxyUrl);
+    slowResourcePackProxyUrl.searchParams.set(
+            "url", `http://${host}:${resourcePackFixturePort}/slow-resource-pack.zip`);
+    const slowAbort = new AbortController();
+    const slowRequest = fetch(slowResourcePackProxyUrl, {
+        headers: {origin},
+        signal: slowAbort.signal,
+    });
+    await waitFor(() => slowResourcePackAttempts === 1,
+            "slow resource-pack request");
+    slowAbort.abort();
+    let slowRequestAborted = false;
+    try {
+        await slowRequest;
+    }
+    catch (error) {
+        slowRequestAborted = error?.name === "AbortError";
+    }
+    await waitFor(() => slowResourcePackClosed,
+            "aborted upstream resource-pack close");
+    await delay(750);
+    if (!slowRequestAborted || slowResourcePackAttempts !== 1) {
+        throw new Error("Translator node retried a resource pack after its browser disconnected");
+    }
+
     const manifestResponse = await fetch(`http://${host}:${bridgePort}/relay-node/v1`, {
         headers: {origin},
     });
@@ -101,9 +217,32 @@ try {
     const manifest = await manifestResponse.json();
     if (manifest.kind !== "gaius-relay-node" || manifest.protocolVersion !== 1 ||
             manifest.tunnelPath !== "/tunnel" || manifest.availableConnections < 1 ||
+            manifest.targetConnectTimeoutMs < 100 ||
             !manifest.requiresToken || !manifest.capabilities.includes("flow-control") ||
-            !manifest.capabilities.includes("keepalive-proxy")) {
+            !manifest.capabilities.includes("ephemeral-tunnel-lease") ||
+            manifest.tunnelLease?.scope !== "websocket" ||
+            manifest.tunnelLease?.protocolStreamsShared !== false ||
+            manifest.tunnelLease?.releasedOn !== "websocket-close" ||
+            !manifest.capabilities.includes("keepalive-proxy") ||
+            !manifest.capabilities.includes("configuration-reentry") ||
+            !manifest.capabilities.includes("target-affinity") ||
+            manifest.targetAffinityMs < 1000 ||
+            !manifest.capabilities.includes("resource-pack-proxy") ||
+            !manifest.capabilities.includes("resource-pack-cache") ||
+            manifest.resourcePackCache?.entries !== 1 ||
+            manifest.resourcePackCache?.bytes !== resourcePackPayload.byteLength) {
         throw new Error("Translator node manifest did not describe the tunnel capability");
+    }
+    const deniedTargetResponse = await fetchTargetManifest(
+            bridgePort, fixturePort, undefined);
+    if (deniedTargetResponse.status !== 403) {
+        throw new Error("Translator node exposed target affinity without its token");
+    }
+    const targetBefore = await (await fetchTargetManifest(
+            bridgePort, fixturePort, bridgeToken)).json();
+    if (targetBefore.target?.activeConnections !== 0 ||
+            targetBefore.target?.recentlyReachable !== false) {
+        throw new Error("Translator node reported an unused target as reachable");
     }
     await testRejectedTunnel(bridgePort, fixturePort);
 
@@ -144,6 +283,14 @@ try {
             () => controls.some((message) => message.type === "connected"),
             "TCP tunnel connection");
     await waitFor(() => fixtureSocket !== undefined, "fixture connection");
+
+    const targetActive = await (await fetchTargetManifest(
+            bridgePort, fixturePort, bridgeToken)).json();
+    if (targetActive.target?.activeConnections !== 1 ||
+            targetActive.target?.recentlyReachable !== true ||
+            targetActive.target?.totalConnections !== 1) {
+        throw new Error("Translator node did not publish active target affinity");
+    }
 
     const healthResponse = await fetch(`http://${host}:${bridgePort}/health`, {
         headers: {origin},
@@ -204,6 +351,15 @@ try {
     fixtureSocket.destroy();
     fixtureSocket = undefined;
 
+    const targetRecent = await (await fetchTargetManifest(
+            bridgePort, fixturePort, bridgeToken)).json();
+    if (targetRecent.target?.activeConnections !== 0 ||
+            targetRecent.target?.recentlyReachable !== true ||
+            targetRecent.target?.totalConnections !== 1) {
+        throw new Error("Translator node did not retain recent target affinity after close");
+    }
+
+    const sharedTargetLifecycle = await testSharedTargetLifecycle(bridgePort, bridgeToken);
     await testFramedPlayKeepAlive(bridgePort, fixturePort);
 
     const localTunnel = await testLocalTunnelPair(bridgePort, bridgeToken);
@@ -221,11 +377,22 @@ try {
         pausedBytes: 0,
         resumedBytes: floodedBytes,
         sha256: actualHash,
+        resourcePack: {
+            bytes: resourcePackBytes.byteLength,
+            sha1: proxiedResourcePackHash,
+            upstreamAttempts: resourcePackAttempts,
+            cached: true,
+            abortedUpstreamAttempts: slowResourcePackAttempts,
+        },
         localTunnel,
+        sharedTargetLifecycle,
         relayNode: {
             name: manifest.name,
             availableConnections: health.availableConnections,
             requiresToken: manifest.requiresToken,
+            targetAffinityMs: manifest.targetAffinityMs,
+            targetActiveConnections: targetActive.target.activeConnections,
+            targetRecentlyReachable: targetRecent.target.recentlyReachable,
         },
         ...(minecraftLogin === undefined ? {} : { minecraftLogin }),
     }));
@@ -234,6 +401,7 @@ finally {
     webSocket?.close();
     fixtureSocket?.destroy();
     await new Promise((resolve) => fixture.close(resolve));
+    await new Promise((resolve) => resourcePackFixture.close(resolve));
     bridge.kill("SIGTERM");
     if (bridge.exitCode === null) {
         await once(bridge, "exit");
@@ -251,11 +419,139 @@ async function reservePort() {
     return port;
 }
 
-async function waitFor(predicate, label, timeoutMs = 10000) {
+function fetchTargetManifest(bridgePort, targetPort, token) {
+    const url = new URL(`http://${host}:${bridgePort}/relay-node/v1`);
+    url.searchParams.set("host", host);
+    url.searchParams.set("port", String(targetPort));
+    const headers = {origin};
+    if (token !== undefined) {
+        headers.authorization = `Bearer ${token}`;
+    }
+    return fetch(url, {headers});
+}
+
+async function testSharedTargetLifecycle(bridgePort, token) {
+    const targetSockets = new Set();
+    const target = createServer((socket) => {
+        targetSockets.add(socket);
+        socket.setNoDelay(true);
+        socket.on("data", (chunk) => socket.write(chunk));
+        socket.once("close", () => targetSockets.delete(socket));
+    });
+    await new Promise((resolve, reject) => {
+        target.once("error", reject);
+        target.listen(0, host, resolve);
+    });
+    const targetPort = target.address().port;
+    const clients = [];
+    try {
+        for (let index = 0; index < 2; index++) {
+            const socket = new WebSocket(`ws://${host}:${bridgePort}/tunnel`, {
+                headers: {origin},
+            });
+            const controls = [];
+            const inbound = [];
+            let inboundBytes = 0;
+            socket.on("message", (data, binary) => {
+                if (binary) {
+                    const copy = Buffer.from(data);
+                    inbound.push(copy);
+                    inboundBytes += copy.byteLength;
+                }
+                else {
+                    controls.push(JSON.parse(data.toString("utf8")));
+                }
+            });
+            clients.push({socket, controls, inbound, inboundBytes: () => inboundBytes});
+        }
+        await Promise.all(clients.map(({socket}) => once(socket, "open")));
+        for (const {socket} of clients) {
+            socket.send(JSON.stringify({type: "connect", host, port: targetPort, token}));
+        }
+        await waitFor(() => clients.every(({controls}) =>
+                controls.some((message) => message.type === "connected")),
+        "two independent target tunnels");
+        await waitFor(() => targetSockets.size === 2, "two independent target TCP sockets");
+
+        const active = await waitForTargetRoute(
+                bridgePort, targetPort, token, 2, "two active target leases");
+        if (active.totalConnections !== 2 || active.recentlyReachable !== true) {
+            throw new Error("Translator node did not publish the shared target route");
+        }
+
+        const payloads = [
+            Buffer.from("gaius-player-one", "utf8"),
+            Buffer.from("gaius-player-two", "utf8"),
+        ];
+        for (let index = 0; index < clients.length; index++) {
+            clients[index].socket.send(payloads[index]);
+        }
+        await waitFor(() => clients.every((client, index) =>
+                client.inboundBytes() === payloads[index].byteLength),
+        "isolated per-player echo streams");
+        for (let index = 0; index < clients.length; index++) {
+            if (!Buffer.concat(clients[index].inbound).equals(payloads[index])) {
+                throw new Error("Shared RelayNode mixed two players' TCP streams");
+            }
+        }
+
+        clients[0].socket.close();
+        await once(clients[0].socket, "close");
+        await waitFor(() => targetSockets.size === 1, "first target tunnel release");
+        await waitForTargetRoute(
+                bridgePort, targetPort, token, 1, "one remaining target lease");
+
+        clients[1].socket.close();
+        await once(clients[1].socket, "close");
+        await waitFor(() => targetSockets.size === 0, "last target tunnel release");
+        const released = await waitForTargetRoute(
+                bridgePort, targetPort, token, 0, "all target leases released");
+        if (released.totalConnections !== 2 || released.recentlyReachable !== true) {
+            throw new Error("Translator node lost bounded target affinity after releasing tunnels");
+        }
+        return {
+            players: clients.length,
+            independentTcpSockets: 2,
+            activeAfterFirstExit: 1,
+            activeAfterLastExit: released.activeConnections,
+            recentlyReachableAfterLastExit: released.recentlyReachable,
+        };
+    }
+    finally {
+        for (const {socket} of clients) {
+            if (socket.readyState === WebSocket.OPEN ||
+                    socket.readyState === WebSocket.CONNECTING) {
+                socket.close();
+            }
+        }
+        for (const socket of targetSockets) socket.destroy();
+        await new Promise((resolve) => target.close(resolve));
+    }
+}
+
+async function waitForTargetRoute(bridgePort, targetPort, token, activeConnections, label) {
+    const deadline = Date.now() + 10000;
+    let lastTarget;
+    while (Date.now() < deadline) {
+        const response = await fetchTargetManifest(bridgePort, targetPort, token);
+        if (!response.ok) {
+            throw new Error(`Target manifest returned ${response.status} while waiting for ${label}`);
+        }
+        lastTarget = (await response.json()).target;
+        if (lastTarget?.activeConnections === activeConnections) return lastTarget;
+        await delay(10);
+    }
+    throw new Error(`Timed out waiting for ${label}: ${JSON.stringify(lastTarget)}`);
+}
+
+async function waitFor(predicate, label, timeoutMs = 10000, diagnostics) {
     const deadline = Date.now() + timeoutMs;
     while (!predicate()) {
         if (Date.now() >= deadline) {
-            throw new Error(`Timed out waiting for ${label}`);
+            const detail = diagnostics === undefined
+                    ? ""
+                    : `: ${JSON.stringify(diagnostics())}`;
+            throw new Error(`Timed out waiting for ${label}${detail}`);
         }
         await delay(10);
     }
@@ -335,9 +631,13 @@ async function testFramedPlayKeepAlive(bridgePort, fixturePort) {
     });
     await once(socket, "open");
     const controls = [];
+    const serverFrames = [];
     socket.on("message", (data, binary) => {
         if (!binary) {
             controls.push(JSON.parse(data.toString("utf8")));
+        }
+        else {
+            serverFrames.push(Buffer.from(data));
         }
     });
     socket.send(JSON.stringify({ type: "connect", host, port: fixturePort, token: bridgeToken }));
@@ -347,8 +647,10 @@ async function testFramedPlayKeepAlive(bridgePort, fixturePort) {
     await waitFor(() => fixtureSocket !== undefined, "framed fixture connection");
 
     socket.send(Buffer.from("1000860609656c6c616e2e746f7063dd02", "hex"));
-    socket.send(Buffer.from("020003", "hex"));
-    socket.send(Buffer.from("020003", "hex"));
+    const splitClientFrames = Buffer.from("020003020003", "hex");
+    socket.send(splitClientFrames.subarray(0, 4));
+    socket.send(splitClientFrames.subarray(4));
+    await waitFor(() => proxiedPlayTicks >= 1, "synthetic initial play tick");
     socket.send(Buffer.from("02000c", "hex"));
     await waitFor(() => proxiedPlayTicks >= 3, "proxied observed play ticks at vanilla cadence");
     const playKeepAlive = Buffer.from("0a002b0000000000000002", "hex");
@@ -357,6 +659,35 @@ async function testFramedPlayKeepAlive(bridgePort, fixturePort) {
     await delay(5);
     fixtureSocket.write(playKeepAlive.subarray(4));
     await waitFor(() => proxiedPlayKeepAlives === 1, "proxied framed play keepalive");
+
+    const startConfiguration = Buffer.from("020074", "hex");
+    fixtureSocket.write(startConfiguration);
+    await waitFor(
+            () => serverFrames.some((frame) => frame.equals(startConfiguration)),
+            "forwarded PLAY to CONFIGURATION transition");
+    const ticksAtConfigurationStart = proxiedPlayTicks;
+    await delay(200);
+    if (proxiedPlayTicks !== ticksAtConfigurationStart) {
+        throw new Error("Translator node injected PLAY ticks while reconfiguration was pending");
+    }
+
+    socket.send(Buffer.from("02000f", "hex"));
+    await delay(20);
+    const configurationKeepAlive = Buffer.from("0a00040000000000000003", "hex");
+    fixtureSocket.write(configurationKeepAlive);
+    await waitFor(() => proxiedKeepAlives === 2, "proxied reconfiguration keepalive");
+    const ticksDuringConfiguration = proxiedPlayTicks;
+    await delay(200);
+    if (proxiedPlayTicks !== ticksDuringConfiguration) {
+        throw new Error("Translator node injected PLAY ticks during CONFIGURATION");
+    }
+
+    socket.send(Buffer.from("020003", "hex"));
+    await waitFor(
+            () => proxiedPlayTicks > ticksDuringConfiguration,
+            "re-armed play ticks after reconfiguration");
+    fixtureSocket.write(playKeepAlive);
+    await waitFor(() => proxiedPlayKeepAlives === 2, "proxied play keepalive after reconfiguration");
     socket.close();
     await once(socket, "close");
     fixtureSocket.destroy();
@@ -391,14 +722,35 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
     let loginFinished = false;
     let configurationPackets = 0;
     let configurationFinished = false;
+    let configurationCycles = 0;
+    let reconfigurationRequests = 0;
     let knownPackRequests = 0;
+    let showDialogPackets = 0;
+    let showDialogPayload;
+    let showDialogAccepts = 0;
+    const showDialogActions = [];
+    const showDialogSummaries = [];
+    const acceptedDialogActions = new Set();
+    let codeOfConductRequests = 0;
+    let codeOfConductAccepts = 0;
+    let resourcePackPushes = 0;
+    const resourcePackTargets = [];
     let playPackets = 0;
     let playLoginPackets = 0;
     let chunkPackets = 0;
     let playerLoadedSent = false;
     let protocolFailure;
+    let expectedClose = false;
+    const packetCounts = { login: {}, configuration: {}, play: {} };
+    const recentPackets = [];
     socket.on("error", (error) => {
         protocolFailure = error;
+    });
+    socket.on("close", (code, reason) => {
+        if (!expectedClose && protocolFailure === undefined) {
+            protocolFailure = new Error(
+                    `Minecraft tunnel closed (${code}): ${reason.toString("utf8")}`);
+        }
     });
     socket.on("message", (data, binary) => {
         try {
@@ -442,6 +794,15 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
                     throw new Error("Minecraft frame omitted its packet id");
                 }
                 const payload = packet.subarray(packetId.bytesRead);
+                const observedPhase = phase;
+                const phaseCounts = packetCounts[observedPhase];
+                phaseCounts[packetId.value] = (phaseCounts[packetId.value] ?? 0) + 1;
+                recentPackets.push({
+                    phase: observedPhase,
+                    id: packetId.value,
+                    bytes: payload.byteLength,
+                });
+                if (recentPackets.length > 24) recentPackets.shift();
                 if (phase === "login" && packetId.value === 0) {
                     throw new Error("Minecraft server rejected the smoke login");
                 }
@@ -477,8 +838,81 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
                         knownPackRequests++;
                         sendMinecraftPacket(7, encodeVarInt(0));
                     }
+                    else if (packetId.value === 9) {
+                        if (payload.byteLength < 16) {
+                            throw new Error("Resource-pack push omitted its UUID");
+                        }
+                        resourcePackPushes++;
+                        const packId = payload.subarray(0, 16);
+                        const packUrl = decodeString(payload, 16);
+                        const packHash = decodeString(payload, packUrl.nextOffset);
+                        if (packHash.nextOffset >= payload.byteLength) {
+                            throw new Error("Resource-pack push omitted its required flag");
+                        }
+                        let target = "<invalid>";
+                        try {
+                            const parsed = new URL(packUrl.value);
+                            target = parsed.origin + parsed.pathname;
+                        }
+                        catch {
+                            // The client still needs to report INVALID_URL for malformed targets.
+                        }
+                        resourcePackTargets.push({
+                            target,
+                            hash: packHash.value,
+                            required: payload[packHash.nextOffset] !== 0,
+                        });
+                        // This protocol smoke verifies the transport and configuration
+                        // handshake. Browser resource downloading is covered separately.
+                        for (const action of [3, 4, 0]) {
+                            sendMinecraftPacket(6, Buffer.concat([packId, encodeVarInt(action)]));
+                        }
+                    }
+                    else if (packetId.value === 18) {
+                        showDialogPackets++;
+                        showDialogPayload ??= payload.toString("base64");
+                        const dialog = decodeNetworkNbt(payload);
+                        if (process.env.GAIUS_SMOKE_DUMP_DIALOG === "1") {
+                            console.error(JSON.stringify(dialog, null, 2));
+                        }
+                        const prompt = inspectServerDialog(dialog);
+                        showDialogSummaries.push(prompt.summary);
+                        showDialogActions.push(...prompt.actionIds);
+                        if (!acceptServerPrompts) {
+                            throw new Error(
+                                    `Minecraft server requires an interactive dialog (${prompt.summary}); ` +
+                                    "rerun with GAIUS_SMOKE_ACCEPT_SERVER_PROMPTS=1 to model an explicit click");
+                        }
+                        const actionId = selectDialogAction(prompt.actionIds);
+                        if (acceptedDialogActions.has(actionId)) {
+                            throw new Error(`Minecraft server repeated dialog action ${actionId}`);
+                        }
+                        const inputValues = resolveDialogInputValues(prompt.inputs);
+                        sendMinecraftPacket(8, encodeCustomClickAction(actionId, inputValues));
+                        acceptedDialogActions.add(actionId);
+                        showDialogAccepts++;
+                    }
+                    else if (packetId.value === 19) {
+                        const codeOfConduct = decodeString(payload, 0);
+                        if (codeOfConduct.nextOffset !== payload.byteLength ||
+                                codeOfConduct.value.length === 0) {
+                            throw new Error("Code of Conduct packet was malformed");
+                        }
+                        if (++codeOfConductRequests !== 1) {
+                            throw new Error("Minecraft server sent duplicate Code of Conduct");
+                        }
+                        if (!acceptServerPrompts) {
+                            throw new Error(
+                                    "Minecraft server requires Code of Conduct acceptance; rerun with " +
+                                    "GAIUS_SMOKE_ACCEPT_SERVER_PROMPTS=1 to model explicit acceptance");
+                        }
+                        // This models the explicit acceptance performed by the vanilla UI.
+                        sendMinecraftPacket(9, Buffer.alloc(0));
+                        codeOfConductAccepts++;
+                    }
                     else if (packetId.value === 3) {
                         configurationFinished = true;
+                        configurationCycles++;
                         phase = "play";
                         sendMinecraftPacket(3, Buffer.alloc(0));
                     }
@@ -510,6 +944,14 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
                     else if (packetId.value === 44) {
                         chunkPackets++;
                     }
+                    else if (packetId.value === 116) {
+                        if (payload.byteLength !== 0) {
+                            throw new Error("PLAY start-configuration packet was not payloadless");
+                        }
+                        reconfigurationRequests++;
+                        sendMinecraftPacket(15, Buffer.alloc(0));
+                        phase = "configuration";
+                    }
                 }
             }
         }
@@ -521,6 +963,37 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
     function sendMinecraftPacket(id, payload) {
         const encoded = encodePacket(id, payload, compressionThreshold);
         socket.send(cipher === undefined ? encoded : cipher.update(encoded));
+    }
+
+    function loginDiagnostics() {
+        return {
+            phase,
+            encryptionRequest,
+            sessionJoin,
+            compressionThreshold: compressionThreshold ?? null,
+            loginFinished,
+            configurationPackets,
+            configurationFinished,
+            configurationCycles,
+            reconfigurationRequests,
+            knownPackRequests,
+            showDialogPackets,
+            showDialogPayload,
+            showDialogAccepts,
+            showDialogActions,
+            showDialogSummaries,
+            codeOfConductRequests,
+            codeOfConductAccepts,
+            resourcePackPushes,
+            resourcePackTargets,
+            playPackets,
+            playLoginPackets,
+            chunkPackets,
+            bufferedBytes: buffered.byteLength,
+            packetCounts,
+            recentPackets,
+            controls: controls.slice(-3),
+        };
     }
 
     async function answerEncryptionRequest(payload) {
@@ -577,7 +1050,7 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
     await waitFor(() => {
         if (protocolFailure !== undefined) throw protocolFailure;
         return controls.some((message) => message.type === "connected");
-    }, "Minecraft TCP connection");
+    }, "Minecraft TCP connection", 10000, loginDiagnostics);
 
     const handshake = Buffer.concat([
         encodeVarInt(774),
@@ -594,12 +1067,21 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
     await waitFor(() => {
         if (protocolFailure !== undefined) throw protocolFailure;
         return loginFinished;
-    }, "Minecraft Login Finished");
+    }, "Minecraft Login Finished", 10000, loginDiagnostics);
     await waitFor(() => {
         if (protocolFailure !== undefined) throw protocolFailure;
         return configurationFinished && playLoginPackets > 0 && chunkPackets > 0;
-    }, "Minecraft PLAY login and chunk data", 30000);
+    }, "Minecraft PLAY login and chunk data", 30000, loginDiagnostics);
+    if (minecraftPlaySoakMs > 0) {
+        const soakDeadline = Date.now() + minecraftPlaySoakMs;
+        await waitFor(() => {
+            if (protocolFailure !== undefined) throw protocolFailure;
+            return Date.now() >= soakDeadline && phase === "play";
+        }, "Minecraft PLAY soak and any reconfiguration", minecraftPlaySoakMs + 30000,
+        loginDiagnostics);
+    }
 
+    expectedClose = true;
     socket.close();
     await once(socket, "close");
     return {
@@ -610,10 +1092,21 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
         loginFinished,
         configurationPackets,
         configurationFinished,
+        configurationCycles,
+        reconfigurationRequests,
         knownPackRequests,
+        showDialogPackets,
+        showDialogAccepts,
+        showDialogActions,
+        showDialogSummaries,
+        codeOfConductRequests,
+        codeOfConductAccepts,
+        resourcePackPushes,
+        resourcePackTargets,
         playPackets,
         playLoginPackets,
         chunkPackets,
+        playSoakMs: minecraftPlaySoakMs,
     };
 }
 
@@ -751,6 +1244,335 @@ function decodeByteArray(bytes, offset) {
         throw new Error("Minecraft byte array exceeded its packet");
     }
     return { value: bytes.subarray(start, end), nextOffset: end };
+}
+
+function decodeNetworkNbt(bytes) {
+    const input = Buffer.from(bytes);
+    let offset = 0;
+    const maximumDepth = 32;
+    const maximumCollectionLength = 65_536;
+
+    function requireBytes(length, label) {
+        if (length < 0 || offset + length > input.byteLength) {
+            throw new Error(`Network NBT ${label} exceeded its packet`);
+        }
+    }
+
+    function readUnsignedByte(label) {
+        requireBytes(1, label);
+        return input[offset++];
+    }
+
+    function readLength(label) {
+        requireBytes(4, label);
+        const length = input.readInt32BE(offset);
+        offset += 4;
+        if (length < 0 || length > maximumCollectionLength) {
+            throw new Error(`Network NBT ${label} had invalid length ${length}`);
+        }
+        return length;
+    }
+
+    function readString(label) {
+        requireBytes(2, `${label} length`);
+        const length = input.readUInt16BE(offset);
+        offset += 2;
+        requireBytes(length, label);
+        const value = input.toString("utf8", offset, offset + length);
+        offset += length;
+        return value;
+    }
+
+    function readPayload(type, depth) {
+        if (depth > maximumDepth) {
+            throw new Error("Network NBT exceeded its maximum nesting depth");
+        }
+        switch (type) {
+            case 0:
+                return null;
+            case 1:
+                requireBytes(1, "byte");
+                return input.readInt8(offset++);
+            case 2: {
+                requireBytes(2, "short");
+                const value = input.readInt16BE(offset);
+                offset += 2;
+                return value;
+            }
+            case 3: {
+                requireBytes(4, "int");
+                const value = input.readInt32BE(offset);
+                offset += 4;
+                return value;
+            }
+            case 4: {
+                requireBytes(8, "long");
+                const value = input.readBigInt64BE(offset).toString();
+                offset += 8;
+                return value;
+            }
+            case 5: {
+                requireBytes(4, "float");
+                const value = input.readFloatBE(offset);
+                offset += 4;
+                return value;
+            }
+            case 6: {
+                requireBytes(8, "double");
+                const value = input.readDoubleBE(offset);
+                offset += 8;
+                return value;
+            }
+            case 7: {
+                const length = readLength("byte array");
+                requireBytes(length, "byte array");
+                const value = input.subarray(offset, offset + length);
+                offset += length;
+                return value;
+            }
+            case 8:
+                return readString("string");
+            case 9: {
+                const childType = readUnsignedByte("list type");
+                const length = readLength("list");
+                if (childType === 0 && length !== 0) {
+                    throw new Error("Network NBT used END as a non-empty list type");
+                }
+                return Array.from({ length }, () => readPayload(childType, depth + 1));
+            }
+            case 10: {
+                const value = {};
+                while (true) {
+                    const childType = readUnsignedByte("compound type");
+                    if (childType === 0) return value;
+                    const name = readString("compound key");
+                    if (Object.hasOwn(value, name)) {
+                        throw new Error(`Network NBT repeated compound key ${name}`);
+                    }
+                    value[name] = readPayload(childType, depth + 1);
+                }
+            }
+            case 11: {
+                const length = readLength("int array");
+                requireBytes(length * 4, "int array");
+                return Array.from({ length }, () => {
+                    const value = input.readInt32BE(offset);
+                    offset += 4;
+                    return value;
+                });
+            }
+            case 12: {
+                const length = readLength("long array");
+                requireBytes(length * 8, "long array");
+                return Array.from({ length }, () => {
+                    const value = input.readBigInt64BE(offset).toString();
+                    offset += 8;
+                    return value;
+                });
+            }
+            default:
+                throw new Error(`Network NBT used unknown tag type ${type}`);
+        }
+    }
+
+    const rootType = readUnsignedByte("root type");
+    const value = readPayload(rootType, 0);
+    if (offset !== input.byteLength) {
+        throw new Error(`Network NBT left ${input.byteLength - offset} unread bytes`);
+    }
+    return value;
+}
+
+function inspectServerDialog(dialog) {
+    const actionRoots = findNamedArrays(dialog, "actions");
+    const inputRoots = findNamedArrays(dialog, "inputs");
+    const actionIds = uniqueStrings(actionRoots.flatMap((root) =>
+        collectNbtObjects(root)
+                .filter((value) => value.type === "minecraft:dynamic/custom")
+                .map((value) => value.id)
+                .filter((value) => typeof value === "string")));
+    const inputs = inputRoots.flatMap((root) => collectNbtObjects(root))
+            .filter((value) => typeof value.key === "string" &&
+                    typeof value.type === "string");
+    const inputDefinitions = [];
+    const inputKeys = new Set();
+    for (const input of inputs) {
+        if (inputKeys.has(input.key)) continue;
+        inputKeys.add(input.key);
+        inputDefinitions.push({
+            key: input.key,
+            type: input.type,
+            maxLength: Number.isInteger(input.max_length) ? input.max_length : undefined,
+        });
+    }
+    const booleanInputKeys = inputDefinitions
+            .filter((value) => value.type === "minecraft:boolean")
+            .map((value) => value.key);
+    const title = summarizeNbtValue(findFirstNamedValue(dialog, "title"));
+    return {
+        actionIds,
+        inputs: inputDefinitions,
+        booleanInputKeys,
+        summary: `title=${title}; actions=${actionIds.join(",") || "none"}; ` +
+                `inputs=${inputDefinitions.map((input) => `${input.key}:${input.type}`).join(",") || "none"}`,
+    };
+}
+
+function findNamedArrays(value, name, output = []) {
+    if (Array.isArray(value)) {
+        for (const child of value) findNamedArrays(child, name, output);
+    }
+    else if (value !== null && typeof value === "object" && !Buffer.isBuffer(value)) {
+        for (const [key, child] of Object.entries(value)) {
+            if (key === name && Array.isArray(child)) output.push(child);
+            findNamedArrays(child, name, output);
+        }
+    }
+    return output;
+}
+
+function collectNbtObjects(value, output = []) {
+    if (Array.isArray(value)) {
+        for (const child of value) collectNbtObjects(child, output);
+    }
+    else if (value !== null && typeof value === "object" && !Buffer.isBuffer(value)) {
+        output.push(value);
+        for (const child of Object.values(value)) collectNbtObjects(child, output);
+    }
+    return output;
+}
+
+function findFirstNamedValue(value, name) {
+    if (Array.isArray(value)) {
+        for (const child of value) {
+            const found = findFirstNamedValue(child, name);
+            if (found !== undefined) return found;
+        }
+    }
+    else if (value !== null && typeof value === "object" && !Buffer.isBuffer(value)) {
+        if (Object.hasOwn(value, name)) return value[name];
+        for (const child of Object.values(value)) {
+            const found = findFirstNamedValue(child, name);
+            if (found !== undefined) return found;
+        }
+    }
+    return undefined;
+}
+
+function summarizeNbtValue(value) {
+    if (value === undefined) return "<untitled>";
+    const encoded = typeof value === "string" ? value : JSON.stringify(value);
+    return encoded.length <= 160 ? encoded : encoded.slice(0, 157) + "...";
+}
+
+function uniqueStrings(values) {
+    return [...new Set(values)];
+}
+
+function selectDialogAction(actionIds) {
+    if (requestedDialogAction !== undefined) {
+        if (!actionIds.includes(requestedDialogAction)) {
+            throw new Error(
+                    `Requested dialog action ${requestedDialogAction} was not offered by the server`);
+        }
+        return requestedDialogAction;
+    }
+    if (actionIds.length !== 1) {
+        throw new Error(
+                `Smoke requires exactly one dynamic dialog action, received ${actionIds.length}; ` +
+                "set GAIUS_SMOKE_DIALOG_ACTION_ID when the intended action is known");
+    }
+    return actionIds[0];
+}
+
+function parseDialogInputValues(encoded) {
+    if (encoded === undefined) return {};
+    let parsed;
+    try {
+        parsed = JSON.parse(encoded);
+    }
+    catch (error) {
+        throw new Error(`GAIUS_SMOKE_DIALOG_INPUTS_JSON is invalid JSON: ${error.message}`);
+    }
+    if (parsed === null || Array.isArray(parsed) || typeof parsed !== "object") {
+        throw new Error("GAIUS_SMOKE_DIALOG_INPUTS_JSON must be a JSON object");
+    }
+    for (const [key, value] of Object.entries(parsed)) {
+        if (typeof value !== "string" && typeof value !== "boolean") {
+            throw new Error(`Dialog input ${key} must be a string or boolean`);
+        }
+    }
+    return parsed;
+}
+
+function resolveDialogInputValues(inputs) {
+    const values = {};
+    for (const input of inputs) {
+        if (input.type === "minecraft:boolean") {
+            const supplied = dialogInputValues[input.key];
+            if (supplied !== undefined && typeof supplied !== "boolean") {
+                throw new Error(`Dialog boolean input ${input.key} requires a JSON boolean`);
+            }
+            values[input.key] = supplied ?? true;
+        }
+        else if (input.type === "minecraft:text") {
+            const supplied = dialogInputValues[input.key];
+            if (typeof supplied !== "string") {
+                throw new Error(
+                        `Dialog text input ${input.key} requires a value in ` +
+                        "GAIUS_SMOKE_DIALOG_INPUTS_JSON");
+            }
+            if (/[^\x20-\x7e]/.test(supplied)) {
+                throw new Error(`Dialog text input ${input.key} must use printable ASCII in smoke`);
+            }
+            if (input.maxLength !== undefined && supplied.length > input.maxLength) {
+                throw new Error(
+                        `Dialog text input ${input.key} exceeds max_length ${input.maxLength}`);
+            }
+            values[input.key] = supplied;
+        }
+        else {
+            throw new Error(`Smoke cannot safely fill ${input.key}:${input.type}`);
+        }
+    }
+    return values;
+}
+
+function encodeCustomClickAction(actionId, values) {
+    if (!/^[a-z0-9_.-]+:[a-z0-9/._-]+$/.test(actionId)) {
+        throw new Error(`Server dialog supplied invalid action identifier ${actionId}`);
+    }
+    const nbt = encodeDialogCompound(values);
+    return Buffer.concat([encodeString(actionId), encodeVarInt(nbt.byteLength), nbt]);
+}
+
+function encodeDialogCompound(values) {
+    const parts = [Buffer.from([10])];
+    for (const [name, value] of Object.entries(values)) {
+        const key = Buffer.from(name, "utf8");
+        if (key.byteLength === 0 || key.byteLength > 65_535 || /[^\x20-\x7e]/.test(name)) {
+            throw new Error(`Server dialog supplied unsafe boolean input key ${name}`);
+        }
+        const keyLength = Buffer.allocUnsafe(2);
+        keyLength.writeUInt16BE(key.byteLength);
+        if (typeof value === "boolean") {
+            parts.push(Buffer.from([1]), keyLength, key, Buffer.from([value ? 1 : 0]));
+        }
+        else if (typeof value === "string") {
+            const text = Buffer.from(value, "utf8");
+            if (text.byteLength > 65_535) {
+                throw new Error(`Dialog text input ${name} exceeds the NBT string limit`);
+            }
+            const textLength = Buffer.allocUnsafe(2);
+            textLength.writeUInt16BE(text.byteLength);
+            parts.push(Buffer.from([8]), keyLength, key, textLength, text);
+        }
+        else {
+            throw new Error(`Dialog input ${name} has an unsupported value type`);
+        }
+    }
+    parts.push(Buffer.from([0]));
+    return Buffer.concat(parts);
 }
 
 function encodeClientInformation() {

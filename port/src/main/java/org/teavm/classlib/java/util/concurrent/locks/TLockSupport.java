@@ -1,14 +1,28 @@
 package org.teavm.classlib.java.util.concurrent.locks;
 
+import java.util.IdentityHashMap;
+
 public final class TLockSupport {
+    private static final IdentityHashMap<Thread, Boolean> permits = new IdentityHashMap<>();
+    private static final IdentityHashMap<Thread, Boolean> parkedThreads = new IdentityHashMap<>();
+
     private TLockSupport() {
     }
 
     public static void unpark(Thread thread) {
+        if (thread == null) {
+            return;
+        }
+        permits.put(thread, Boolean.TRUE);
+        if (parkedThreads.containsKey(thread)) {
+            thread.interrupt();
+        }
     }
 
     public static void park(Object blocker) {
-        Thread.yield();
+        if (!takePermit(Thread.currentThread())) {
+            Thread.yield();
+        }
     }
 
     public static void parkNanos(Object blocker, long nanos) {
@@ -32,7 +46,9 @@ public final class TLockSupport {
     }
 
     public static void park() {
-        Thread.yield();
+        if (!takePermit(Thread.currentThread())) {
+            Thread.yield();
+        }
     }
 
     public static void parkNanos(long nanos) {
@@ -58,10 +74,23 @@ public final class TLockSupport {
     }
 
     private static void sleepMillis(long millis) {
+        Thread thread = Thread.currentThread();
+        if (takePermit(thread)) {
+            return;
+        }
+        parkedThreads.put(thread, Boolean.TRUE);
         try {
             Thread.sleep(Math.max(1, Math.min(millis, Integer.MAX_VALUE)));
         } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+            if (!takePermit(thread)) {
+                thread.interrupt();
+            }
+        } finally {
+            parkedThreads.remove(thread);
         }
+    }
+
+    private static boolean takePermit(Thread thread) {
+        return permits.remove(thread) != null;
     }
 }

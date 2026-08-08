@@ -21,6 +21,7 @@ import java.security.PublicKey;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
+import java.util.Map;
 import java.util.zip.Deflater;
 import java.util.zip.Inflater;
 import java.util.zip.ZipEntry;
@@ -78,6 +79,8 @@ public final class PlatformSmoke {
             testRandomAccessFile();
             smokeStage = "browser ZIP pack";
             testBrowserZipPack();
+            smokeStage = "multiplayer cold-pack recovery policy";
+            testMultiplayerRecoveryPolicy();
             smokeStage = "browser atlas overlay compatibility";
             testBrowserAtlasOverlayCompatibility();
             smokeStage = "browser atlas resource fallback";
@@ -108,6 +111,10 @@ public final class PlatformSmoke {
             testBitStorageHotPath();
             smokeStage = "climate distance";
             testClimateDistanceHotPath();
+            smokeStage = "density transforms";
+            testDensityTransformersHotPath();
+            smokeStage = "surface biome supplier";
+            testSurfaceBiomeSupplier();
             smokeStage = "floating point fma";
             testFloatingPointFma();
             smokeStage = "managed memory";
@@ -231,11 +238,96 @@ public final class PlatformSmoke {
                 throw new AssertionError("Browser server-pack ZIP could not be read");
             }
         }
+        rewriteLocalZipEntryName(path, archiveBytes, endOfCentralDirectory, "pack.png");
+        try (ZipFile archive = new ZipFile(path.toFile())) {
+            smokeStage = "browser ZIP mismatched local-name entry lookup";
+            ZipEntry entry = archive.getEntry("pack.mcmeta");
+            if (entry == null || !Arrays.equals(metadata, archive.getInputStream(entry).readAllBytes())) {
+                throw new AssertionError("Browser server-pack ZIP ignored the local-header name length");
+            }
+        }
         byte[] shorter = "short".getBytes(StandardCharsets.UTF_8);
         Files.write(path, shorter);
         if (!Arrays.equals(Files.readAllBytes(path), shorter)) {
             throw new AssertionError("Browser output stream did not truncate an existing file");
         }
+    }
+
+    private static void testMultiplayerRecoveryPolicy() {
+        if (!BrowserMultiplayerRecovery.isTransientTimeoutReason(
+                "You were kicked from spawn: Internal Exception: "
+                        + "io.netty.handler.timeout.ReadTimeoutException")) {
+            throw new AssertionError("ReadTimeoutException was not recoverable");
+        }
+        if (!BrowserMultiplayerRecovery.isTransientTimeoutReason("Connection timed out")) {
+            throw new AssertionError("Network timeout was not recoverable");
+        }
+        if (BrowserMultiplayerRecovery.isTransientTimeoutReason("Login timed out")) {
+            throw new AssertionError("Login timeout must not auto-reconnect");
+        }
+        if (BrowserMultiplayerRecovery.isTransientTimeoutReason(
+                "You were kicked from spawn: \u7ed9\u60a8\u767b\u5f55\u7684\u65f6\u95f4\u5df2\u7ecf\u8fc7\u4e86")) {
+            throw new AssertionError("Server login deadline must not auto-reconnect");
+        }
+        if (BrowserMultiplayerRecovery.isTransientTimeoutReason("You are banned")) {
+            throw new AssertionError("Server policy disconnect must not auto-reconnect");
+        }
+        if (!BrowserMultiplayerRecovery.isRemoteServerAddress("ellan.top")
+                || BrowserMultiplayerRecovery.isRemoteServerAddress(
+                        "client-0123456789abcdef0123456789abcdef.gaius-local:25565")) {
+            throw new AssertionError("Singleplayer MessagePort address entered multiplayer recovery");
+        }
+    }
+
+    private static void rewriteLocalZipEntryName(
+            Path path, byte[] archive, int endOfCentralDirectory, String replacementName) throws Exception {
+        if (readIntLE(archive, 0) != 0x04034b50) {
+            throw new AssertionError("Browser server-pack ZIP local header was missing");
+        }
+        int originalNameLength = readUnsignedShortLE(archive, 26);
+        byte[] replacement = replacementName.getBytes(StandardCharsets.UTF_8);
+        if (replacement.length >= originalNameLength) {
+            throw new AssertionError("Browser server-pack ZIP smoke replacement name must be shorter");
+        }
+        int removed = originalNameLength - replacement.length;
+        byte[] rewritten = new byte[archive.length - removed];
+        System.arraycopy(archive, 0, rewritten, 0, 30);
+        writeShortLE(rewritten, 26, replacement.length);
+        System.arraycopy(replacement, 0, rewritten, 30, replacement.length);
+        System.arraycopy(
+                archive,
+                30 + originalNameLength,
+                rewritten,
+                30 + replacement.length,
+                archive.length - 30 - originalNameLength);
+
+        int rewrittenEndOfCentralDirectory = endOfCentralDirectory - removed;
+        int centralDirectoryOffset = readIntLE(archive, endOfCentralDirectory + 16);
+        writeIntLE(rewritten, rewrittenEndOfCentralDirectory + 16, centralDirectoryOffset - removed);
+        Files.write(path, rewritten);
+    }
+
+    private static int readUnsignedShortLE(byte[] bytes, int offset) {
+        return (bytes[offset] & 0xff) | ((bytes[offset + 1] & 0xff) << 8);
+    }
+
+    private static int readIntLE(byte[] bytes, int offset) {
+        return (bytes[offset] & 0xff)
+                | ((bytes[offset + 1] & 0xff) << 8)
+                | ((bytes[offset + 2] & 0xff) << 16)
+                | ((bytes[offset + 3] & 0xff) << 24);
+    }
+
+    private static void writeShortLE(byte[] bytes, int offset, int value) {
+        bytes[offset] = (byte) value;
+        bytes[offset + 1] = (byte) (value >>> 8);
+    }
+
+    private static void writeIntLE(byte[] bytes, int offset, int value) {
+        bytes[offset] = (byte) value;
+        bytes[offset + 1] = (byte) (value >>> 8);
+        bytes[offset + 2] = (byte) (value >>> 16);
+        bytes[offset + 3] = (byte) (value >>> 24);
     }
 
     private static void testSpriteTextureSlotCompatibility() {
@@ -872,6 +964,84 @@ public final class PlatformSmoke {
         }
     }
 
+    private static void testDensityTransformersHotPath() {
+        double[] values = {
+                Double.NaN, Double.NEGATIVE_INFINITY, -2.0, -1.0, -0.0,
+                0.0, 0.25, 1.0, 2.0, Double.POSITIVE_INFINITY
+        };
+        for (double value : values) {
+            assertSameDouble(
+                    BrowserDensityFunctions.clamp(value, -1.0, 1.0),
+                    Mth.clamp(value, -1.0, 1.0),
+                    "clamp");
+            assertSameDouble(
+                    BrowserDensityFunctions.transformMulOrAdd(value, 0, 0.25),
+                    value * 0.25,
+                    "multiply");
+            assertSameDouble(
+                    BrowserDensityFunctions.transformMulOrAdd(value, 1, 0.25),
+                    value + 0.25,
+                    "add");
+            for (int type = 0; type <= 6; type++) {
+                double expected = switch (type) {
+                    case 0 -> Math.abs(value);
+                    case 1 -> value * value;
+                    case 2 -> value * value * value;
+                    case 3 -> value > 0.0 ? value : value * 0.5;
+                    case 4 -> value > 0.0 ? value : value * 0.25;
+                    case 5 -> 1.0 / value;
+                    case 6 -> {
+                        double clamped = Mth.clamp(value, -1.0, 1.0);
+                        yield clamped / 2.0 - clamped * clamped * clamped / 24.0;
+                    }
+                    default -> throw new AssertionError("Unreachable mapped density type");
+                };
+                assertSameDouble(
+                        BrowserDensityFunctions.transformMapped(value, type),
+                        expected,
+                        "mapped " + type);
+            }
+        }
+    }
+
+    private static void testSurfaceBiomeSupplier() {
+        int[] calls = {0};
+        int[] coordinates = new int[3];
+        BrowserSurfaceBiomeSupplier supplier = new BrowserSurfaceBiomeSupplier(
+                pos -> {
+                    calls[0]++;
+                    coordinates[0] = pos.getX();
+                    coordinates[1] = pos.getY();
+                    coordinates[2] = pos.getZ();
+                    return null;
+                },
+                new BlockPos.MutableBlockPos());
+        supplier.reset(3, 4, 5);
+        supplier.get();
+        supplier.get();
+        if (calls[0] != 1
+                || coordinates[0] != 3
+                || coordinates[1] != 4
+                || coordinates[2] != 5) {
+            throw new AssertionError("Browser surface biome supplier did not cache its lookup");
+        }
+        supplier.reset(-7, 8, 9);
+        supplier.get();
+        if (calls[0] != 2
+                || coordinates[0] != -7
+                || coordinates[1] != 8
+                || coordinates[2] != 9) {
+            throw new AssertionError("Browser surface biome supplier did not reset coordinates");
+        }
+    }
+
+    private static void assertSameDouble(double actual, double expected, String label) {
+        if (Double.doubleToLongBits(actual) != Double.doubleToLongBits(expected)) {
+            throw new AssertionError(
+                    "Browser density " + label + " changed: " + actual + " != " + expected);
+        }
+    }
+
     private static void testBiomeNearestCornerHotPath() {
         long state = 0x243F6A8885A308D3L;
         for (int index = 0; index < 512; index++) {
@@ -1340,6 +1510,14 @@ public final class PlatformSmoke {
         if (!realms.contains("/proxy/realms?")
                 || !realms.contains("pc.realms.minecraft.net")) {
             throw new AssertionError("Browser Realms proxy URL is invalid");
+        }
+        Map<String, String> headers = BrowserHttpProxy.browserSafeHeaders(Map.of(
+                "User-Agent", "Minecraft Java/1.21.11",
+                "Host", "packs.example.invalid",
+                "X-Minecraft-Version", "1.21.11"));
+        if (headers.containsKey("User-Agent") || headers.containsKey("Host")
+                || !"1.21.11".equals(headers.get("X-Minecraft-Version"))) {
+            throw new AssertionError("Browser HTTP forbidden-header filtering is invalid");
         }
     }
 

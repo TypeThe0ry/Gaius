@@ -449,9 +449,11 @@ public final class BrowserGlfw {
     private static native boolean swapBuffersJs();
 
     public static void swapBuffers(long window) {
-        if (swapBuffersJs()) {
-            sleepForBrowserMillis(50L);
-        }
+        boolean hidden = swapBuffersJs();
+        // TeaVM's Thread.yield() only suspends after a long time slice. Yield on
+        // every presented frame so an unlimited game loop cannot starve Chrome's
+        // paint, input, audio, and MessagePort tasks for roughly 100 ms at a time.
+        sleepForBrowserMillis(hidden ? 50L : 1L);
     }
 
     public static void swapInterval(int interval) {

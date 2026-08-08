@@ -15,8 +15,11 @@ rm -f "$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}.map" \
 
 if [[ "${GAIUS_SKIP_CLIENT_BUILD:-false}" == "true" ]]; then
   client_js="$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}"
-  if [[ ! -s "$client_js" ]]; then
-    echo "Cannot resume release: client JavaScript is missing at $client_js" >&2
+  vanilla_asset_pack="$root/port/web/dist/vanilla-assets.pack.gz"
+  if [[ ! -s "$client_js" || ! -s "$vanilla_asset_pack" ]]; then
+    echo "Cannot resume release: client JavaScript or vanilla asset pack is missing" >&2
+    echo "Client: $client_js" >&2
+    echo "Assets: $vanilla_asset_pack" >&2
     exit 1
   fi
   echo "Reusing successfully compiled client JavaScript: $client_js"
@@ -37,6 +40,15 @@ fi
 if [[ "${GAIUS_SKIP_SERVER_WORKER:-false}" != "true" ]]; then
   GAIUS_SKIP_OVERLAY_BUILD=true GAIUS_SKIP_COMPRESSION=true \
     "$root/port/scripts/build-teavm-server-worker.sh"
+else
+  server_js="$root/port/web/dist/singleplayer-server.js"
+  if [[ ! -s "$server_js" ]]; then
+    echo "Cannot resume release: server Worker JavaScript is missing at $server_js" >&2
+    exit 1
+  fi
+  cp "$root/port/web/singleplayer/server-worker-bootstrap.js" \
+    "$root/port/web/dist/singleplayer-server-worker.js"
+  echo "Reusing successfully compiled server Worker JavaScript: $server_js"
 fi
 "$root/port/scripts/run-python.sh" \
   "$root/port/scripts/postprocess-index-html.py" \
@@ -52,6 +64,7 @@ if [[ "${GAIUS_SKIP_WASM_HOTPATH:-false}" != "true" ]]; then
 fi
 rm -f "$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}.map" \
   "$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}.teavmdbg"
+cp "$root/relay-nodes.json" "$root/port/web/dist/relay-nodes.json"
 "$root/port/scripts/compress-dist.sh"
 "$root/port/scripts/run-python.sh" \
   "$root/port/scripts/build-portable-html.py"

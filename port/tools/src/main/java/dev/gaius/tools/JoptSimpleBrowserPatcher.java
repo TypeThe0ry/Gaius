@@ -36,6 +36,8 @@ public final class JoptSimpleBrowserPatcher {
         ClassNode node = new ClassNode();
         new ClassReader(input).accept(node, 0);
         boolean found = false;
+        boolean browserPiecesFound = false;
+        boolean browserWrapFound = false;
         for (MethodNode method : node.methods) {
             if (method.name.equals("piecesOfEmbeddedLine")
                     && method.desc.equals("(Ljava/lang/String;I)Ljava/util/List;")) {
@@ -54,9 +56,18 @@ public final class JoptSimpleBrowserPatcher {
                 method.maxStack = 1;
                 method.maxLocals = 3;
                 found = true;
+            } else if (method.name.equals("piecesOf")
+                    && method.desc.equals("(Ljava/lang/String;I)Ljava/util/List;")
+                    && (method.access & Opcodes.ACC_STATIC) != 0) {
+                browserPiecesFound = true;
+            } else if (method.name.equals("wrapLine")
+                    && method.desc.equals("(Ljava/lang/String;ILjava/util/List;)V")
+                    && (method.access & Opcodes.ACC_STATIC) != 0) {
+                browserWrapFound = true;
             }
         }
-        if (!found) {
+        boolean alreadyPatched = browserPiecesFound && browserWrapFound;
+        if (!found && !alreadyPatched) {
             throw new IllegalStateException("Columns.piecesOfEmbeddedLine was not found");
         }
 
@@ -65,7 +76,9 @@ public final class JoptSimpleBrowserPatcher {
         Path output = Path.of(args[1]);
         Files.createDirectories(output.getParent());
         Files.write(output, writer.toByteArray());
-        System.out.println("Patched jopt-simple browser line wrapping");
+        System.out.println(alreadyPatched
+                ? "Verified jopt-simple browser line wrapping"
+                : "Patched jopt-simple browser line wrapping");
         JoptSimpleReflectionPatcher.main(new String[] {
                 args[0], output.resolveSibling("Reflection.class").toString()
         });

@@ -95,15 +95,36 @@ therefore remains frontend-only and works without a hosted Gaius service.
 External Java servers remain unmodified. `apps/bridge/dist/main.js` is a raw,
 backpressured WebSocket-to-TCP tunnel with SRV resolution and constrained HTTP
 proxies for Mojang authentication, skins, Realms, and resource packs. The
+resource-pack proxy retries interrupted upstream bodies before exposing a
+response to Chrome, publishes the verified byte length, cancels orphaned
+downloads, and keeps a bounded short-lived disk cache for repeated joins;
+Mojang's
+`blockedservers` request is proxied as well, so it does not depend on cross-origin
+access from the page. The
 online-mode smoke starts an official plugin-free `server.jar`, performs the
 RSA/AES session handshake against a controlled session fixture, and requires
 PLAY plus real chunk packets before passing.
 
-Remote connection order is: optional same-host Paper plugin, configured relay
-nodes, then the default relay. Every status ping or join is an isolated,
-short-lived tunnel. The browser accepts repeated `bridge` query parameters,
+RelayNode discovery also negotiates the node's per-target TCP timeout. The
+browser keeps the WebSocket alive long enough for an SRV target to time out and
+fall back to the entered host without leaving an orphaned TCP attempt when the
+player cancels.
+
+Remote connection order is: optional same-host Paper plugin, then configured
+and default RelayNodes ranked for the requested normalized `host:port` by
+active target affinity, recent reachability, free capacity, and configured
+priority. Every status ping or join remains an isolated, short-lived TCP
+tunnel. The browser accepts repeated `bridge` query parameters,
 `globalThis.__gaiusBridgeUrls`, or the `gaius.bridgeNodes` local-storage JSON
-array, allowing relay capacity to be contributed independently of the client.
+array, allowing already-deployed relay capacity to be contributed independently
+of the client. Short discovery caches avoid repeating an unavailable plugin
+probe and RelayNode manifest fetch between a status ping and its join; they do
+not share the underlying protocol stream.
+
+For unencrypted 1.21.11 traffic, RelayNode also tracks server-initiated
+`PLAY -> CONFIGURATION -> PLAY` cycles. Synthetic browser-stall ticks are
+disabled throughout reconfiguration, preventing stale PLAY packets from being
+sent into the configuration protocol after a plugin changes server state.
 
 ## Reference artifact
 

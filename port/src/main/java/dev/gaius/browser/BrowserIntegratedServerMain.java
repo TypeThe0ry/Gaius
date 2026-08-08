@@ -1,13 +1,16 @@
 package dev.gaius.browser;
 
 import com.mojang.datafixers.DataFixer;
+import io.netty.channel.browser.BrowserWebSocketChannel;
+import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.net.InetSocketAddress;
+import java.util.concurrent.locks.LockSupport;
 import net.minecraft.server.Main;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.players.PlayerList;
 import org.teavm.jso.JSBody;
 import org.teavm.jso.JSExport;
 
@@ -15,17 +18,23 @@ import org.teavm.jso.JSExport;
 public final class BrowserIntegratedServerMain {
     private static final int INITIAL_VIEW_DISTANCE = 1;
     private static final int INITIAL_SIMULATION_DISTANCE = 1;
+    private static final long DISTANCE_RAMP_INTERVAL_MILLIS = 750L;
     private static MinecraftServer server;
+    private static Thread serverThread;
+    private static boolean serverThreadExited = true;
     private static int configuredViewDistance = 6;
     private static int configuredSimulationDistance = 4;
     private static int activeViewDistance = INITIAL_VIEW_DISTANCE;
     private static int activeSimulationDistance = INITIAL_SIMULATION_DISTANCE;
     private static boolean configuredDistancesActive;
+    private static boolean distanceAdvancePending;
+    private static long nextDistanceAdvanceAtMillis;
+    private static boolean urgentPacketPumpActive;
 
     private static String serverProperties() {
         int viewDistance = clampDistance(workerViewDistance(), 6);
         int simulationDistance = clampDistance(workerSimulationDistance(), 4);
-        return String.join("\n",
+        String properties = String.join("\n",
             "allow-flight=true",
             "enable-command-block=true",
             "enable-query=false",
@@ -49,6 +58,12 @@ public final class BrowserIntegratedServerMain {
             "spawn-protection=0",
             "sync-chunk-writes=false",
             "view-distance=" + viewDistance) + "\n";
+        String seed = workerSeed();
+        if (seed != null && !seed.isEmpty() && seed.length() <= 128
+                && seed.indexOf('\n') < 0 && seed.indexOf('\r') < 0) {
+            properties += "level-seed=" + seed + "\n";
+        }
+        return properties;
     }
 
     private BrowserIntegratedServerMain() {
@@ -69,13 +84,33 @@ public final class BrowserIntegratedServerMain {
             return;
         }
         server = minecraftServer;
+        serverThread = minecraftServer.getRunningThread();
+        serverThreadExited = false;
         configuredViewDistance = clampDistance(workerViewDistance(), 6);
         configuredSimulationDistance = clampDistance(workerSimulationDistance(), 4);
         activeViewDistance = INITIAL_VIEW_DISTANCE;
         activeSimulationDistance = INITIAL_SIMULATION_DISTANCE;
         configuredDistancesActive = false;
+        distanceAdvancePending = false;
+        nextDistanceAdvanceAtMillis = 0L;
+        urgentPacketPumpActive = false;
+        configurePlayerList(minecraftServer.getPlayerList());
         setIntegratedServerDistances(workerViewDistance(), workerSimulationDistance());
+        BrowserStartupScheduler.complete();
         report("server-created", workerWorldId());
+    }
+
+    /** Applies local-only permissions after DedicatedServer has created its player list. */
+    public static void configurePlayerList(PlayerList playerList) {
+        if (!isWorkerRuntime() || playerList == null) {
+            return;
+        }
+        // The Worker uses the dedicated-server implementation, so vanilla cannot
+        // recognize the browser player as its integrated-server owner. This
+        // isolated server accepts one local player only.
+        playerList.setAllowCommandsForAllPlayers(true);
+        applyActiveDistances();
+        report("local-player-list-ready", "commands=true");
     }
 
     @JSExport
@@ -87,6 +122,9 @@ public final class BrowserIntegratedServerMain {
             activeSimulationDistance = Math.min(
                     activeSimulationDistance,
                     configuredSimulationDistance);
+            if (distancesFullyApplied()) {
+                distanceAdvancePending = false;
+            }
         }
         applyActiveDistances();
     }
@@ -117,19 +155,53 @@ public final class BrowserIntegratedServerMain {
         }
     }
 
-    /** Restores the user's distances after the client confirms its first chunk batch. */
-    public static void activateConfiguredDistances() {
-        if (!isWorkerRuntime() || configuredDistancesActive) {
+    /**
+     * Advances one distance ring after the client has consumed the preceding chunk batch.
+     * This keeps unexplored-area generation behind the browser client's real packet throughput.
+     */
+    public static void acknowledgeChunkBatch() {
+        if (!isWorkerRuntime()) {
             return;
         }
-        configuredDistancesActive = true;
-        activeViewDistance = Math.min(configuredViewDistance, INITIAL_VIEW_DISTANCE + 1);
-        activeSimulationDistance = INITIAL_SIMULATION_DISTANCE;
-        applyActiveDistances();
+        if (!configuredDistancesActive) {
+            configuredDistancesActive = true;
+            activeViewDistance = Math.min(configuredViewDistance, INITIAL_VIEW_DISTANCE + 1);
+            activeSimulationDistance = INITIAL_SIMULATION_DISTANCE;
+            nextDistanceAdvanceAtMillis = System.currentTimeMillis()
+                    + DISTANCE_RAMP_INTERVAL_MILLIS;
+            distanceAdvancePending = false;
+            applyActiveDistances();
+            return;
+        }
+        if (distancesFullyApplied()) {
+            distanceAdvancePending = false;
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now < nextDistanceAdvanceAtMillis) {
+            distanceAdvancePending = true;
+            return;
+        }
+        distanceAdvancePending = false;
+        advanceConfiguredDistances();
+        nextDistanceAdvanceAtMillis = now + DISTANCE_RAMP_INTERVAL_MILLIS;
     }
 
-    /** Adds one distance ring only after the preceding server tick has completed. */
-    public static void advanceConfiguredDistances() {
+    /** Applies a deferred distance ring only after the preceding ring has had CPU time. */
+    public static void tickIntegratedServerDistances() {
+        if (!isWorkerRuntime() || !distanceAdvancePending || distancesFullyApplied()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now < nextDistanceAdvanceAtMillis) {
+            return;
+        }
+        distanceAdvancePending = false;
+        advanceConfiguredDistances();
+        nextDistanceAdvanceAtMillis = now + DISTANCE_RAMP_INTERVAL_MILLIS;
+    }
+
+    private static void advanceConfiguredDistances() {
         if (!isWorkerRuntime() || !configuredDistancesActive) {
             return;
         }
@@ -145,8 +217,44 @@ public final class BrowserIntegratedServerMain {
         applyActiveDistances();
     }
 
+    private static boolean distancesFullyApplied() {
+        return activeViewDistance >= configuredViewDistance
+                && activeSimulationDistance >= configuredSimulationDistance;
+    }
+
     public static boolean isWorkerServer() {
         return isWorkerRuntime();
+    }
+
+    /** Processes browser actions between synchronous worldgen slices on the server thread. */
+    public static void pumpUrgentPackets() {
+        MinecraftServer current = server;
+        if (!isWorkerRuntime() || current == null || urgentPacketPumpActive) {
+            return;
+        }
+        urgentPacketPumpActive = true;
+        try {
+            BrowserWebSocketChannel.pumpAll();
+            current.packetProcessor().processQueuedPackets();
+        } finally {
+            urgentPacketPumpActive = false;
+        }
+    }
+
+    /** Keeps player input moving while the server thread waits on asynchronous chunk futures. */
+    public static void pumpUrgentPacketsIfPending() {
+        if (isWorkerRuntime() && BrowserWebSocketChannel.hasPendingInput()) {
+            pumpUrgentPackets();
+        }
+    }
+
+    /** Wakes the parked server thread without executing packet handlers from JavaScript. */
+    @JSExport
+    public static void signalIntegratedServerNetworkInput() {
+        Thread currentServerThread = serverThread;
+        if (currentServerThread != null) {
+            LockSupport.unpark(currentServerThread);
+        }
     }
 
     public static DataFixer dataFixer() {
@@ -204,7 +312,16 @@ public final class BrowserIntegratedServerMain {
     @JSExport
     public static boolean isIntegratedServerStopped() {
         MinecraftServer current = server;
-        return current == null || current.isStopped();
+        return current == null || serverThreadExited;
+    }
+
+    /** Called after MinecraftServer.runServer has completed all save and exit work. */
+    public static void markIntegratedServerStopped(MinecraftServer minecraftServer) {
+        if (server == minecraftServer) {
+            serverThreadExited = true;
+            serverThread = null;
+            report("server-thread-exited", workerWorldId());
+        }
     }
 
     public static void main(String[] args) {
@@ -330,6 +447,9 @@ public final class BrowserIntegratedServerMain {
 
     @JSBody(script = "return String(globalThis.__gaiusServerSessionId || '');")
     private static native String workerSessionId();
+
+    @JSBody(script = "return String(globalThis.__gaiusServerSeed || '');")
+    private static native String workerSeed();
 
     @JSBody(script = "return Number(globalThis.__gaiusServerViewDistance || 6) | 0;")
     private static native int workerViewDistance();

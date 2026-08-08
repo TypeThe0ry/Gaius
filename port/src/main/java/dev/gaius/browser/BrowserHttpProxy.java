@@ -3,6 +3,9 @@ package dev.gaius.browser;
 import java.net.HttpURLConnection;
 import java.net.MalformedURLException;
 import java.net.URL;
+import java.util.LinkedHashMap;
+import java.util.Locale;
+import java.util.Map;
 import org.teavm.jso.JSBody;
 
 /** Routes browser-only HTTP calls through the same trusted bridge as Minecraft TCP. */
@@ -16,6 +19,22 @@ public final class BrowserHttpProxy {
 
     public static URL proxyAuthentication(URL target) {
         return proxy(target, "auth");
+    }
+
+    /** Removes headers that XMLHttpRequest cannot legally set in a browser. */
+    public static Map<String, String> browserSafeHeaders(Map<String, String> headers) {
+        if (headers == null || headers.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, String> filtered = new LinkedHashMap<>();
+        for (Map.Entry<String, String> entry : headers.entrySet()) {
+            String name = entry.getKey();
+            String value = entry.getValue();
+            if (name != null && value != null && !isForbiddenBrowserHeader(name)) {
+                filtered.put(name, value);
+            }
+        }
+        return filtered;
     }
 
     public static String proxyTexture(String target) {
@@ -52,6 +71,21 @@ public final class BrowserHttpProxy {
 
     private static boolean containsHeaderBreak(String value) {
         return value.indexOf('\r') >= 0 || value.indexOf('\n') >= 0;
+    }
+
+    private static boolean isForbiddenBrowserHeader(String name) {
+        String lower = name.toLowerCase(Locale.ROOT);
+        if (lower.startsWith("proxy-") || lower.startsWith("sec-")) {
+            return true;
+        }
+        return switch (lower) {
+            case "accept-charset", "accept-encoding", "access-control-request-headers",
+                    "access-control-request-method", "connection", "content-length",
+                    "cookie", "cookie2", "date", "dnt", "expect", "host",
+                    "keep-alive", "origin", "permissions-policy", "referer", "te",
+                    "trailer", "transfer-encoding", "upgrade", "user-agent", "via" -> true;
+            default -> false;
+        };
     }
 
     private static URL proxy(URL target, String kind) {

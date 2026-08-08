@@ -17,15 +17,16 @@ import net.minecraft.server.packs.metadata.MetadataSectionType;
 import net.minecraft.server.packs.resources.IoSupplier;
 import net.minecraft.server.packs.resources.Resource;
 import net.minecraft.server.packs.resources.ResourceProvider;
+import org.teavm.jso.JSBody;
+import org.teavm.jso.JSByRef;
 
 /**
  * Browser resource-pack implementation for the official vanilla pack.
  *
  * <p>The desktop implementation resolves vanilla assets through jar/file-system
  * paths. In TeaVM those paths do not exist, while the actual 1.21.11 resources
- * are embedded as classpath resources by {@code MinecraftResourceSupplier}. This
- * class keeps the public Minecraft pack contract and redirects resource lookup
- * to the embedded classpath resource table.</p>
+ * are loaded into a validated browser-side binary pack before TeaVM starts. A
+ * narrow classpath fallback remains for direct language access and smoke builds.</p>
  */
 public class VanillaPackResources implements PackResources {
     private static final String RESOURCE_LIST = "dev/gaius/browser/minecraft-resources.txt";
@@ -82,9 +83,11 @@ public class VanillaPackResources implements PackResources {
         String root = type.getDirectory() + "/" + namespace + "/";
         String prefix = root + (path.isEmpty() ? "" : path + "/");
         List<ListedResource> listedResources = new ArrayList<>();
-        for (String resource : resources) {
+        int start = lowerBound(resources, prefix);
+        for (int index = start; index < resources.length; index++) {
+            String resource = resources[index];
             if (!resource.startsWith(prefix)) {
-                continue;
+                break;
             }
             String relative = resource.substring(root.length());
             Identifier id = Identifier.tryBuild(namespace, relative);
@@ -95,6 +98,20 @@ public class VanillaPackResources implements PackResources {
         cached = listedResources.toArray(ListedResource[]::new);
         listedResourceCache.put(key, cached);
         return cached;
+    }
+
+    private static int lowerBound(String[] values, String target) {
+        int low = 0;
+        int high = values.length;
+        while (low < high) {
+            int middle = (low + high) >>> 1;
+            if (values[middle].compareTo(target) < 0) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        return low;
     }
 
     @Override
@@ -146,9 +163,13 @@ public class VanillaPackResources implements PackResources {
 
     private static IoSupplier<InputStream> openClasspathResource(String resource) {
         return () -> {
+            byte[] external = readExternalResource(resource);
+            if (external != null) {
+                return new ByteArrayInputStream(external);
+            }
             InputStream input = openResourceStream(resource);
             if (input == null) {
-                throw new IOException("Missing embedded vanilla resource: " + resource);
+                throw new IOException("Missing browser vanilla resource: " + resource);
             }
             return new ByteArrayInputStream(input.readAllBytes());
         };
@@ -159,6 +180,9 @@ public class VanillaPackResources implements PackResources {
     }
 
     private static boolean existsOnClasspath(String resource) {
+        if (externalResourceLength(resource) >= 0) {
+            return true;
+        }
         try (InputStream input = openResourceStream(resource)) {
             return input != null;
         } catch (IOException e) {
@@ -168,12 +192,44 @@ public class VanillaPackResources implements PackResources {
 
     private static InputStream openResourceStream(String resource) {
         String normalized = resource.startsWith("/") ? resource.substring(1) : resource;
-        InputStream input = VanillaPackResources.class.getResourceAsStream("/" + normalized);
-        if (input != null) {
-            return input;
-        }
         return VanillaPackResources.class.getClassLoader().getResourceAsStream(normalized);
     }
+
+    private static byte[] readExternalResource(String resource) {
+        int length = externalResourceLength(resource);
+        if (length < 0) {
+            return null;
+        }
+        byte[] output = new byte[length];
+        return copyExternalResource(resource, output) ? output : null;
+    }
+
+    @JSBody(params = "resource", script = """
+            const root = globalThis.__gaiusVanillaAssets;
+            if (!root || !root.bytes || !root.index) return -1;
+            if (!Object.prototype.hasOwnProperty.call(root.index, resource)) return -1;
+            const range = root.index[resource];
+            return Array.isArray(range) && range.length === 2 ? range[1] | 0 : -1;
+            """)
+    private static native int externalResourceLength(String resource);
+
+    @JSBody(params = {"resource", "output"}, script = """
+            const root = globalThis.__gaiusVanillaAssets;
+            if (!root || !root.bytes || !root.index) return false;
+            if (!Object.prototype.hasOwnProperty.call(root.index, resource)) return false;
+            const range = root.index[resource];
+            if (!Array.isArray(range) || range.length !== 2) return false;
+            const offset = range[0] | 0;
+            const length = range[1] | 0;
+            const target = output && output.data ? output.data : output;
+            if (!target || target.length !== length || offset < 0 || length < 0) return false;
+            const start = root.dataOffset + offset;
+            const end = start + length;
+            if (start < root.dataOffset || end > root.bytes.length) return false;
+            target.set(root.bytes.subarray(start, end));
+            return true;
+            """)
+    private static native boolean copyExternalResource(String resource, @JSByRef byte[] output);
 
     private static String[] loadResourceList() {
         try (InputStream input = VanillaPackResources.class.getClassLoader()

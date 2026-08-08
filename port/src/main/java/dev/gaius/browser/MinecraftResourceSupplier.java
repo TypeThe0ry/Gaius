@@ -15,6 +15,8 @@ import org.teavm.classlib.ResourceSupplierContext;
  */
 public final class MinecraftResourceSupplier implements ResourceSupplier {
     private static final String RESOURCE_LIST = "/dev/gaius/browser/minecraft-resources.txt";
+    private static final String EMBEDDED_RESOURCE_LIST =
+            "/dev/gaius/browser/minecraft-embedded-resources.txt";
     private static final String[] FALLBACK_RESOURCES = {
             "assets/minecraft/lang/deprecated.json",
             "assets/minecraft/lang/en_us.json"
@@ -22,11 +24,14 @@ public final class MinecraftResourceSupplier implements ResourceSupplier {
 
     @Override
     public String[] supplyResources(ResourceSupplierContext context) {
-        try (InputStream input = MinecraftResourceSupplier.class.getResourceAsStream(RESOURCE_LIST)) {
-            if (input == null) {
-                return FALLBACK_RESOURCES.clone();
-            }
-            String text = new String(input.readAllBytes(), StandardCharsets.UTF_8);
+        String text = readResourceList(EMBEDDED_RESOURCE_LIST);
+        if (text == null) {
+            text = readResourceList(RESOURCE_LIST);
+        }
+        if (text == null) {
+            return FALLBACK_RESOURCES.clone();
+        }
+        try {
             String requiredResources = String.join("\n", FALLBACK_RESOURCES);
             return Arrays.stream((RESOURCE_LIST.substring(1)
                             + "\n" + requiredResources + "\n" + text).split("\\R"))
@@ -34,8 +39,16 @@ public final class MinecraftResourceSupplier implements ResourceSupplier {
                     .filter(line -> !line.isEmpty())
                     .distinct()
                     .toArray(String[]::new);
-        } catch (IOException ignored) {
+        } catch (RuntimeException ignored) {
             return FALLBACK_RESOURCES.clone();
+        }
+    }
+
+    private static String readResourceList(String resource) {
+        try (InputStream input = MinecraftResourceSupplier.class.getResourceAsStream(resource)) {
+            return input == null ? null : new String(input.readAllBytes(), StandardCharsets.UTF_8);
+        } catch (IOException ignored) {
+            return null;
         }
     }
 }

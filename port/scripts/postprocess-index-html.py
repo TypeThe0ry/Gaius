@@ -37,6 +37,7 @@ def content_token(*paths: Path) -> str:
 
 def patch_index(index: Path, classes_js: Path) -> bool:
     build_token = content_token(classes_js)
+    vanilla_assets_token = content_token(index.parent / "vanilla-assets.pack.gz")
     singleplayer_token = content_token(
         index.parent / "singleplayer-server-worker.js",
         index.parent / "singleplayer-server.js",
@@ -44,9 +45,141 @@ def patch_index(index: Path, classes_js: Path) -> bool:
     text = index.read_text(encoding="utf-8")
     original = text
 
+    vanilla_assets_loader = '''    const vanillaAssetsToken = "__VANILLA_ASSETS_TOKEN__";
+    function hasGaiusVanillaAssetsMagic(bytes) {
+      const magic = "GAIUSVP1";
+      if (!(bytes instanceof Uint8Array) || bytes.length < 12) return false;
+      for (let index = 0; index < magic.length; index++) {
+        if (bytes[index] !== magic.charCodeAt(index)) return false;
+      }
+      return true;
+    }
+
+    async function gunzipGaiusVanillaAssets(bytes) {
+      if (hasGaiusVanillaAssetsMagic(bytes)) return bytes;
+      if (typeof DecompressionStream !== "function") {
+        throw new Error("This browser cannot decompress the Gaius vanilla asset pack");
+      }
+      const stream = new Blob([bytes])
+        .stream()
+        .pipeThrough(new DecompressionStream("gzip"));
+      const unpacked = new Uint8Array(await new Response(stream).arrayBuffer());
+      if (!hasGaiusVanillaAssetsMagic(unpacked)) {
+        throw new Error("The Gaius vanilla asset pack has an invalid header");
+      }
+      return unpacked;
+    }
+
+    async function decodeGaiusVanillaAssets(source) {
+      const compressed = source instanceof Uint8Array
+        ? source
+        : new Uint8Array(await source.arrayBuffer());
+      const bytes = await gunzipGaiusVanillaAssets(compressed);
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const indexLength = view.getUint32(8, true);
+      const indexStart = 12;
+      const dataOffset = indexStart + indexLength;
+      if (indexLength <= 0 || dataOffset > bytes.length) {
+        throw new Error("The Gaius vanilla asset index is truncated");
+      }
+      let index;
+      try {
+        index = JSON.parse(new TextDecoder().decode(bytes.subarray(indexStart, dataOffset)));
+      } catch (error) {
+        throw new Error("The Gaius vanilla asset index is invalid: " + String(error));
+      }
+      if (!index || typeof index !== "object" || Array.isArray(index)) {
+        throw new Error("The Gaius vanilla asset index is not an object");
+      }
+      const payloadLength = bytes.length - dataOffset;
+      let resourceCount = 0;
+      for (const name in index) {
+        if (!Object.prototype.hasOwnProperty.call(index, name)) continue;
+        const range = index[name];
+        if (!Array.isArray(range) || range.length !== 2 ||
+            !Number.isSafeInteger(range[0]) || !Number.isSafeInteger(range[1]) ||
+            range[0] < 0 || range[1] < 0 || range[0] + range[1] > payloadLength) {
+          throw new Error("The Gaius vanilla asset range is invalid: " + name);
+        }
+        resourceCount++;
+      }
+      if (resourceCount < 1000) {
+        throw new Error("The Gaius vanilla asset pack is incomplete");
+      }
+      const root = {bytes, index, dataOffset, resourceCount};
+      window.__gaiusVanillaAssets = root;
+      bootTimings.vanillaAssetsDecoded = performance.now();
+      return root;
+    }
+
+    async function loadGaiusVanillaAssets() {
+      bootTimings.vanillaAssetsRequestStart = performance.now();
+      const portableSource = window.__gaiusVanillaAssetsCompressedPromise;
+      if (portableSource) {
+        return decodeGaiusVanillaAssets(await portableSource);
+      }
+      const source = new URL(
+        urlParams.get("vanillaAssets") || "vanilla-assets.pack.gz",
+        location.href
+      );
+      const version = urlParams.get("fresh") === "1" || urlParams.get("cache") === "0"
+        ? vanillaAssetsToken + "-fresh-" + Date.now()
+        : vanillaAssetsToken;
+      source.searchParams.set("v", version);
+      const response = await fetch(source, {cache: "force-cache"});
+      if (!response.ok) {
+        throw new Error("Could not load the Gaius vanilla asset pack: HTTP " + response.status);
+      }
+      return decodeGaiusVanillaAssets(await response.blob());
+    }
+
+    window.__gaiusDecodeVanillaAssets = decodeGaiusVanillaAssets;
+    window.__gaiusVanillaAssetsReady = window.__gaiusVanillaAssetsReady ||
+      loadGaiusVanillaAssets();
+    window.__gaiusVanillaAssetsReady.catch(() => {});
+'''.replace("__VANILLA_ASSETS_TOKEN__", vanilla_assets_token)
+
+    if "function decodeGaiusVanillaAssets(source)" not in text:
+        text = replace_required(
+            text,
+            "    const urlParams = new URLSearchParams(location.search);\n",
+            "    const urlParams = new URLSearchParams(location.search);\n"
+            + vanilla_assets_loader,
+            "vanilla asset pack loader",
+        )
+    else:
+        text, token_count = re.subn(
+            r'    const vanillaAssetsToken = "[^"]+";',
+            f'    const vanillaAssetsToken = "{vanilla_assets_token}";',
+            text,
+            count=1,
+        )
+        if token_count != 1:
+            raise RuntimeError("index.html patch point was not found: vanilla asset token")
+
+    text = text.replace('<html lang="zh-CN">', '<html lang="en">', 1)
+    text = text.replace(
+        '<title>Gaius Minecraft 1.21.11</title>',
+        '<title>Gaius Client 1.21.11</title>',
+        1,
+    )
+
     text = text.replace(
         '    const showPerfHud = urlParams.get("hud") !== "0";\n',
         '    const showPerfHud = urlParams.get("hud") === "1";\n',
+    )
+    if 'const showLauncherDetails = urlParams.get("debug") === "1" || showPerfHud;' not in text:
+        text = replace_required(
+            text,
+            '    const showPerfHud = urlParams.get("hud") === "1";\n',
+            '    const showPerfHud = urlParams.get("hud") === "1";\n'
+            '    const showLauncherDetails = urlParams.get("debug") === "1" || showPerfHud;\n',
+            "launcher detail visibility",
+        )
+    text = text.replace(
+        '<pre id="status" data-state="running">',
+        '<pre id="status" data-state="running" hidden>',
+        1,
     )
     text = text.replace(
         "    const defaultMaxDpr = Math.min(1.5, rawDevicePixelRatio);\n",
@@ -197,16 +330,16 @@ def patch_index(index: Path, classes_js: Path) -> bool:
             "portable Wasm asset URL",
         )
 
-    if "Minecraft-style boot screen" not in text:
+    if 'id="boot-screen"' not in text:
         text = replace_required(
             text,
             "  </style>\n",
-            "    /* Minecraft-style boot screen */\n"
+            "    /* Gaius boot screen */\n"
             "    #boot-screen {\n"
             "      position: fixed;\n"
             "      inset: 0;\n"
             "      z-index: 10;\n"
-            "      background: #ef323d;\n"
+            "      background: #101511;\n"
             "      pointer-events: none;\n"
             "    }\n"
             "\n"
@@ -218,10 +351,11 @@ def patch_index(index: Path, classes_js: Path) -> bool:
             "      transform: translate(-50%, -50%);\n"
             "      color: #fff;\n"
             "      text-align: center;\n"
-            "      font: 900 72px/0.72 Arial, Helvetica, sans-serif;\n"
+            "      font: 900 72px/0.82 Arial, Helvetica, sans-serif;\n"
             "      letter-spacing: 0;\n"
-            "      text-shadow: 0 4px 0 rgba(0, 0, 0, 0.16);\n"
+            "      text-shadow: 0 4px 0 rgba(0, 0, 0, 0.28);\n"
             "      pointer-events: none;\n"
+            "      animation: gaius-logo-enter 420ms ease-out both;\n"
             "    }\n"
             "\n"
             "    #boot-brand span {\n"
@@ -249,7 +383,7 @@ def patch_index(index: Path, classes_js: Path) -> bool:
             "\n"
             "    #boot-progress-bar {\n"
             "      min-width: 2px;\n"
-            "      background: #fff;\n"
+            "      background: #54d68b;\n"
             "      transition: width 160ms linear;\n"
             "    }\n"
             "\n"
@@ -291,16 +425,21 @@ def patch_index(index: Path, classes_js: Path) -> bool:
             "    @media (max-width: 600px) {\n"
             "      #boot-brand { font-size: 44px; }\n"
             "    }\n"
+            "\n"
+            "    @keyframes gaius-logo-enter {\n"
+            "      from { opacity: 0; transform: translate(-50%, -46%) scale(0.96); }\n"
+            "      to { opacity: 1; transform: translate(-50%, -50%) scale(1); }\n"
+            "    }\n"
             "  </style>\n",
-            "Minecraft-style boot screen CSS",
+            "Gaius boot screen CSS",
         )
         text = replace_required(
             text,
             '  <canvas id="mc-canvas" tabindex="0"></canvas>\n',
             '  <canvas id="mc-canvas" tabindex="0"></canvas>\n'
             '  <div id="boot-screen" aria-hidden="true"></div>\n'
-            '  <div id="boot-brand" aria-hidden="true">MOJANG<span>STUDIOS</span></div>\n',
-            "Minecraft-style boot screen markup",
+            '  <div id="boot-brand" aria-hidden="true">GAIUS<span>CLIENT</span></div>\n',
+            "Gaius boot screen markup",
         )
         text = replace_required(
             text,
@@ -308,7 +447,7 @@ def patch_index(index: Path, classes_js: Path) -> bool:
             '    const statusBox = document.getElementById("status");\n'
             '    const bootScreen = document.getElementById("boot-screen");\n'
             '    const bootBrand = document.getElementById("boot-brand");\n',
-            "Minecraft-style boot screen elements",
+            "Gaius boot screen elements",
         )
         text = replace_required(
             text,
@@ -316,7 +455,362 @@ def patch_index(index: Path, classes_js: Path) -> bool:
             "      statusBox.hidden = true;\n"
             "      if (bootScreen) bootScreen.hidden = true;\n"
             "      if (bootBrand) bootBrand.hidden = true;\n",
-            "Minecraft-style boot screen cleanup",
+            "Gaius boot screen cleanup",
+        )
+
+    text = text.replace("/* Minecraft-style boot screen */", "/* Gaius boot screen */", 1)
+    text = text.replace("      background: #ef323d;\n", "      background: #101511;\n", 1)
+    text = text.replace(
+        "      font: 900 clamp(42px, 8vw, 92px)/0.72 Arial, Helvetica, sans-serif;\n",
+        "      font: 900 72px/0.82 Arial, Helvetica, sans-serif;\n",
+        1,
+    )
+    text = text.replace(
+        "      font: 900 72px/0.72 Arial, Helvetica, sans-serif;\n",
+        "      font: 900 72px/0.82 Arial, Helvetica, sans-serif;\n",
+        1,
+    )
+    text = text.replace(
+        "      text-shadow: 0 4px 0 rgba(0, 0, 0, 0.16);\n",
+        "      text-shadow: 0 4px 0 rgba(0, 0, 0, 0.28);\n"
+        "      animation: gaius-logo-enter 420ms ease-out both;\n",
+        1,
+    )
+    text = text.replace(
+        '  <div id="boot-brand" aria-hidden="true">MOJANG<span>STUDIOS</span></div>',
+        '  <div id="boot-brand" aria-hidden="true">GAIUS<span>CLIENT</span></div>',
+        1,
+    )
+    text = text.replace(
+        "      background: linear-gradient(90deg, #38bdf8, #22c55e);\n",
+        "      background: #54d68b;\n",
+        1,
+    )
+    text = text.replace("      background: #fff;\n", "      background: #54d68b;\n", 1)
+    if "@keyframes gaius-logo-enter" not in text:
+        text = replace_required(
+            text,
+            "  </style>\n",
+            "    @keyframes gaius-logo-enter {\n"
+            "      from { opacity: 0; transform: translate(-50%, -46%) scale(0.96); }\n"
+            "      to { opacity: 1; transform: translate(-50%, -50%) scale(1); }\n"
+            "    }\n"
+            "\n"
+            "    @media (max-width: 600px) {\n"
+            "      #boot-brand { font-size: 44px; }\n"
+            "    }\n"
+            "  </style>\n",
+            "Gaius boot animation",
+        )
+
+    # Minecraft's own early loading screens include the Mojang Studios splash.
+    # Keep the Gaius shell above those transient screens and only reveal the
+    # canvas once a real menu or world is ready.
+    boot_screen_pattern = re.compile(
+        r'(?P<indent>[ \t]+)if \(state && state\.screen\) \{\n'
+        r'(?P=indent)  const screen = String\(state\.screen\)\.split\("\."\)\.pop\(\);\n'
+        r'(?P=indent)  setBootProgress\(100, "Minecraft screen ready: " \+ screen\);\n'
+        r'(?P=indent)  hideBootOverlay\(\);\n'
+        r'(?P=indent)  return;\n'
+        r'(?P=indent)\}'
+    )
+    boot_screen_replacement = (
+        r'\g<indent>if (state && (state.overlay || state.screen)) {\n'
+        r'\g<indent>  const overlay = state.overlay ? String(state.overlay).split(".").pop() : "";\n'
+        r'\g<indent>  const screen = state.screen ? String(state.screen).split(".").pop() : "";\n'
+        r'\g<indent>  const keepGaiusBootVisible = [\n'
+        r'\g<indent>    "GenericMessageScreen",\n'
+        r'\g<indent>    "ProgressScreen",\n'
+        r'\g<indent>    "LevelLoadingScreen",\n'
+        r'\g<indent>    "ReceivingLevelScreen"\n'
+        r'\g<indent>  ].includes(screen) || overlay === "LoadingOverlay";\n'
+        r'\g<indent>  if (keepGaiusBootVisible) {\n'
+        r'\g<indent>    setBootProgress(Math.max(bootProgressValue, 92), "Loading game resources...");\n'
+        r'\g<indent>    return;\n'
+        r'\g<indent>  }\n'
+        r'\g<indent>  if (screen) {\n'
+        r'\g<indent>    setBootProgress(100, "Client screen ready: " + screen);\n'
+        r'\g<indent>    hideBootOverlay();\n'
+        r'\g<indent>    return;\n'
+        r'\g<indent>  }\n'
+        r'\g<indent>}'
+    )
+    if "const keepGaiusBootVisible = [" not in text:
+        text, boot_screen_count = boot_screen_pattern.subn(
+            boot_screen_replacement,
+            text,
+            count=1,
+        )
+        if boot_screen_count != 1:
+            raise RuntimeError("index.html patch point was not found: Gaius boot screen lifetime")
+
+    if "function showBootOverlay(label)" not in text:
+        text = replace_required(
+            text,
+            "    function hideBootOverlay() {\n",
+            "    function showBootOverlay(label) {\n"
+            "      const restarting = !!(bootScreen && bootScreen.hidden);\n"
+            "      if (restarting) {\n"
+            "        bootProgressValue = 8;\n"
+            "        bootLastProgressAt = performance.now();\n"
+            "        bootWarnedStall = false;\n"
+            "        if (bootProgressBar) bootProgressBar.style.width = \"8%\";\n"
+            "      }\n"
+            "      if (bootScreen) bootScreen.hidden = false;\n"
+            "      if (bootBrand) bootBrand.hidden = false;\n"
+            "      if (profileGate) profileGate.hidden = true;\n"
+            "      if (bootProgress) bootProgress.hidden = false;\n"
+            "      if (bootProgressText) bootProgressText.hidden = false;\n"
+            "      statusBox.hidden = !showLauncherDetails;\n"
+            "      statusBox.dataset.state = \"running\";\n"
+            "      statusBox.textContent = label || \"Loading...\";\n"
+            "    }\n"
+            "\n"
+            "    window.__gaiusShowBootOverlay = showBootOverlay;\n"
+            "\n"
+            "    function hideBootOverlay() {\n",
+            "reusable Gaius loading overlay",
+        )
+
+    text = text.replace(
+        "      statusBox.hidden = false;\n"
+        "      statusBox.dataset.state = \"running\";\n"
+        "      statusBox.textContent = label || \"Loading...\";\n",
+        "      statusBox.hidden = !showLauncherDetails;\n"
+        "      statusBox.dataset.state = \"running\";\n"
+        "      statusBox.textContent = label || \"Loading...\";\n",
+        1,
+    )
+    text = text.replace(
+        "      statusBox.hidden = false;\n"
+        "      statusBox.dataset.state = state;\n"
+        "      statusBox.textContent = message;\n",
+        "      statusBox.hidden = state !== \"error\" && !showLauncherDetails;\n"
+        "      statusBox.dataset.state = state;\n"
+        "      statusBox.textContent = message;\n",
+        1,
+    )
+    text = text.replace(
+        '      if (statusBox.dataset.state !== "running" || statusBox.hidden) return;\n',
+        '      if (statusBox.dataset.state !== "running") return;\n',
+        1,
+    )
+
+    if "showBootOverlay(loadingLabel);" not in text:
+        loading_screen_pattern = re.compile(
+            r'(?P<indent>[ \t]+)if \(keepGaiusBootVisible\) \{\n'
+            r'(?P=indent)  setBootProgress\(Math\.max\(bootProgressValue, 92\), '
+            r'"Loading game resources\.\.\."\);\n'
+        )
+        loading_screen_replacement = (
+            r'\g<indent>if (keepGaiusBootVisible) {\n'
+            r'\g<indent>  const loadingLabel = screen === "ReceivingLevelScreen"\n'
+            r'\g<indent>    ? "Connecting to world..."\n'
+            r'\g<indent>    : (screen === "LevelLoadingScreen"\n'
+            r'\g<indent>      ? "Loading world..."\n'
+            r'\g<indent>      : "Loading game resources...");\n'
+            r'\g<indent>  showBootOverlay(loadingLabel);\n'
+            r'\g<indent>  setBootProgress(Math.max(bootProgressValue, 35), loadingLabel);\n'
+        )
+        text, loading_screen_count = loading_screen_pattern.subn(
+            loading_screen_replacement,
+            text,
+            count=1,
+        )
+        if loading_screen_count != 1:
+            raise RuntimeError(
+                "index.html patch point was not found: reopen Gaius loading overlay"
+            )
+
+    if 'id="profile-gate"' not in text:
+        profile_css = '''
+    #profile-gate {
+      position: fixed;
+      inset: 0;
+      z-index: 14;
+      display: grid;
+      place-items: center;
+      box-sizing: border-box;
+      padding: 32px 24px;
+      background: #101511;
+      color: #f4f7f5;
+    }
+
+    #profile-gate[hidden] {
+      display: none;
+    }
+
+    #profile-form {
+      width: min(380px, 100%);
+      margin: 0;
+    }
+
+    #profile-title {
+      margin: 0 0 34px;
+      font: 900 54px/1 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+      text-align: center;
+    }
+
+    #profile-form label {
+      display: block;
+      margin-bottom: 8px;
+      color: #d6ddd8;
+      font: 600 13px/1.2 Arial, Helvetica, sans-serif;
+    }
+
+    #profile-name {
+      width: 100%;
+      height: 46px;
+      box-sizing: border-box;
+      padding: 0 12px;
+      border: 2px solid #66756c;
+      border-radius: 4px;
+      outline: none;
+      background: #171d19;
+      color: #fff;
+      font: 18px/1 Arial, Helvetica, sans-serif;
+    }
+
+    #profile-name:focus {
+      border-color: #54d68b;
+    }
+
+    #profile-submit {
+      width: 100%;
+      height: 46px;
+      margin-top: 14px;
+      border: 0;
+      border-radius: 4px;
+      background: #54d68b;
+      color: #08100b;
+      font: 700 15px/1 Arial, Helvetica, sans-serif;
+      cursor: pointer;
+    }
+
+    #profile-submit:hover,
+    #profile-submit:focus-visible {
+      background: #72e7a2;
+      outline: 2px solid #fff;
+      outline-offset: 2px;
+    }
+
+    #profile-error {
+      min-height: 18px;
+      margin: 8px 0 0;
+      color: #ff9b9b;
+      font: 12px/1.4 Arial, Helvetica, sans-serif;
+    }
+
+    #profile-legal {
+      margin: 24px 0 0;
+      color: #9eaaa2;
+      font: 11px/1.45 Arial, Helvetica, sans-serif;
+      text-align: center;
+    }
+'''
+        text = replace_required(
+            text,
+            "  </style>\n",
+            profile_css + "  </style>\n",
+            "player-name gate CSS",
+        )
+        text = replace_required(
+            text,
+            '  <div id="boot-brand" aria-hidden="true">GAIUS<span>CLIENT</span></div>\n',
+            '  <div id="boot-brand" aria-hidden="true">GAIUS<span>CLIENT</span></div>\n'
+            '  <div id="profile-gate" hidden>\n'
+            '    <form id="profile-form" novalidate>\n'
+            '      <h1 id="profile-title">GAIUS</h1>\n'
+            '      <label for="profile-name">Player name</label>\n'
+            '      <input id="profile-name" name="username" type="text" maxlength="16" '
+            'pattern="[A-Za-z0-9_]{1,16}" autocomplete="username" spellcheck="false">\n'
+            '      <button id="profile-submit" type="submit">Play</button>\n'
+            '      <p id="profile-error" role="alert"></p>\n'
+            '      <p id="profile-legal">Gaius is an independent project and is not affiliated '
+            'with Mojang Studios or Microsoft.</p>\n'
+            '    </form>\n'
+            '  </div>\n',
+            "player-name gate markup",
+        )
+
+    if 'const profileGate = document.getElementById("profile-gate");' not in text:
+        text = replace_required(
+            text,
+            '    const bootBrand = document.getElementById("boot-brand");\n',
+            '    const bootBrand = document.getElementById("boot-brand");\n'
+            '    const profileGate = document.getElementById("profile-gate");\n'
+            '    const profileForm = document.getElementById("profile-form");\n'
+            '    const profileName = document.getElementById("profile-name");\n'
+            '    const profileError = document.getElementById("profile-error");\n',
+            "player-name gate elements",
+        )
+
+    if 'id="profile-switch"' not in text:
+        profile_switch_css = '''
+    #profile-switch {
+      position: fixed;
+      left: 16px;
+      top: 16px;
+      z-index: 9;
+      min-height: 36px;
+      box-sizing: border-box;
+      padding: 0 14px;
+      border: 1px solid #7b8980;
+      border-radius: 4px;
+      background: rgba(16, 21, 17, 0.94);
+      color: #f4f7f5;
+      font: 600 13px/1 Arial, Helvetica, sans-serif;
+      cursor: pointer;
+    }
+
+    #profile-switch[hidden] {
+      display: none;
+    }
+
+    #profile-switch:hover,
+    #profile-switch:focus-visible {
+      border-color: #54d68b;
+      background: #1b241e;
+      outline: 2px solid #fff;
+      outline-offset: 2px;
+    }
+
+    #profile-switch:disabled {
+      cursor: wait;
+      opacity: 0.65;
+    }
+'''
+        text = replace_required(
+            text,
+            "  </style>\n",
+            profile_switch_css + "  </style>\n",
+            "player-name switch CSS",
+        )
+        text = replace_required(
+            text,
+            '  <pre id="status" data-state="running" hidden>',
+            '  <button id="profile-switch" type="button" hidden>'
+            'Change player name</button>\n'
+            '  <pre id="status" data-state="running" hidden>',
+            "player-name switch button",
+        )
+
+    if 'const profileSwitch = document.getElementById("profile-switch");' not in text:
+        text = replace_required(
+            text,
+            '    const profileError = document.getElementById("profile-error");\n',
+            '    const profileError = document.getElementById("profile-error");\n'
+            '    const profileSwitch = document.getElementById("profile-switch");\n',
+            "player-name switch element",
+        )
+    if "if (profileGate) profileGate.hidden = true;" not in text:
+        text = replace_required(
+            text,
+            "      if (bootBrand) bootBrand.hidden = true;\n",
+            "      if (bootBrand) bootBrand.hidden = true;\n"
+            "      if (profileGate) profileGate.hidden = true;\n",
+            "player-name gate cleanup",
         )
 
     # Existing options are user data. Older launchers deleted options.txt during
@@ -406,6 +900,101 @@ def patch_index(index: Path, classes_js: Path) -> bool:
             "\n"
             "    (async () => {\n",
             "paint yield helper",
+        )
+
+    if "async function acquireGaiusRuntimeLease()" not in text:
+        text = replace_required(
+            text,
+            "    function waitForPaint() {\n"
+            "      return new Promise(resolve => {\n"
+            "        requestAnimationFrame(() => setTimeout(resolve, 0));\n"
+            "      });\n"
+            "    }\n"
+            "\n"
+            "    (async () => {\n",
+            "    function waitForPaint() {\n"
+            "      return new Promise(resolve => {\n"
+            "        requestAnimationFrame(() => setTimeout(resolve, 0));\n"
+            "      });\n"
+            "    }\n"
+            "\n"
+            "    async function acquireGaiusRuntimeLease() {\n"
+            "      if (window.__gaiusRuntimeLeaseHeld || urlParams.get(\"allowMultipleTabs\") === \"1\") {\n"
+            "        return true;\n"
+            "      }\n"
+            "      const lockName = \"gaius-client-runtime-v1\";\n"
+            "      if (navigator.locks && typeof navigator.locks.request === \"function\") {\n"
+            "        const acquired = await new Promise(resolve => {\n"
+            "          let settled = false;\n"
+            "          const finish = value => {\n"
+            "            if (settled) return;\n"
+            "            settled = true;\n"
+            "            resolve(value);\n"
+            "          };\n"
+            "          try {\n"
+            "            navigator.locks.request(lockName, {mode: \"exclusive\", ifAvailable: true}, lock => {\n"
+            "              if (!lock) {\n"
+            "                finish(false);\n"
+            "                return;\n"
+            "              }\n"
+            "              window.__gaiusRuntimeLeaseHeld = true;\n"
+            "              finish(true);\n"
+            "              return new Promise(release => {\n"
+            "                window.__gaiusReleaseRuntimeLease = release;\n"
+            "              });\n"
+            "            }).catch(error => {\n"
+            "              console.warn(\"Web Locks runtime lease is unavailable\", error);\n"
+            "              finish(null);\n"
+            "            });\n"
+            "          } catch (error) {\n"
+            "            console.warn(\"Web Locks runtime lease failed\", error);\n"
+            "            finish(null);\n"
+            "          }\n"
+            "        });\n"
+            "        if (acquired !== null) return acquired;\n"
+            "      }\n"
+            "\n"
+            "      const leaseKey = \"gaius.runtimeLease.v1\";\n"
+            "      const leaseId = (crypto.randomUUID ? crypto.randomUUID() :\n"
+            "        Date.now().toString(36) + Math.random().toString(36).slice(2));\n"
+            "      const readLease = () => {\n"
+            "        try {\n"
+            "          return JSON.parse(localStorage.getItem(leaseKey) || \"null\");\n"
+            "        } catch (error) {\n"
+            "          return null;\n"
+            "        }\n"
+            "      };\n"
+            "      const writeLease = () => {\n"
+            "        localStorage.setItem(leaseKey, JSON.stringify({id: leaseId, at: Date.now()}));\n"
+            "      };\n"
+            "      try {\n"
+            "        const current = readLease();\n"
+            "        if (current && current.id !== leaseId && Date.now() - Number(current.at || 0) < 10000) {\n"
+            "          return false;\n"
+            "        }\n"
+            "        writeLease();\n"
+            "        await new Promise(resolve => setTimeout(resolve, 80));\n"
+            "        const claimed = readLease();\n"
+            "        if (!claimed || claimed.id !== leaseId) return false;\n"
+            "        const heartbeat = setInterval(writeLease, 3000);\n"
+            "        const release = () => {\n"
+            "          clearInterval(heartbeat);\n"
+            "          const owned = readLease();\n"
+            "          if (owned && owned.id === leaseId) localStorage.removeItem(leaseKey);\n"
+            "        };\n"
+            "        addEventListener(\"pagehide\", release, {once: true});\n"
+            "        addEventListener(\"beforeunload\", release, {once: true});\n"
+            "        window.__gaiusReleaseRuntimeLease = release;\n"
+            "        window.__gaiusRuntimeLeaseHeld = true;\n"
+            "        return true;\n"
+            "      } catch (error) {\n"
+            "        console.warn(\"Cross-tab runtime lease is unavailable\", error);\n"
+            "        return true;\n"
+            "      }\n"
+            "    }\n"
+            "\n"
+            "    (async () => {\n",
+            "single active Gaius runtime lease",
         )
 
     stable_build_block = (
@@ -568,6 +1157,399 @@ def patch_index(index: Path, classes_js: Path) -> bool:
             "client localStorage fallback filter",
         )
 
+    if "function copyPersistentBytes(value)" not in text:
+        text = replace_required(
+            text,
+            "      function openDatabase() {\n",
+            "      function copyPersistentBytes(value) {\n"
+            "        if (value instanceof Uint8Array) return value.slice();\n"
+            "        if (value instanceof ArrayBuffer) return new Uint8Array(value.slice(0));\n"
+            "        if (ArrayBuffer.isView(value)) {\n"
+            "          return new Uint8Array(value.buffer, value.byteOffset, value.byteLength).slice();\n"
+            "        }\n"
+            "        return null;\n"
+            "      }\n\n"
+            "      function isDownloadedPackBinaryPath(path) {\n"
+            "        path = normalize(path);\n"
+            "        return path.startsWith(\"/gaius/downloads/\") && !path.endsWith(\"/log.json\");\n"
+            "      }\n\n"
+            "      function persistentValueByteLength(value) {\n"
+            "        if (typeof value === \"string\") {\n"
+            "          const padding = value.endsWith(\"==\") ? 2 : (value.endsWith(\"=\") ? 1 : 0);\n"
+            "          return Math.max(0, Math.floor(value.length * 3 / 4) - padding);\n"
+            "        }\n"
+            "        if (value instanceof ArrayBuffer) return value.byteLength;\n"
+            "        if (ArrayBuffer.isView(value)) return value.byteLength;\n"
+            "        return 0;\n"
+            "      }\n\n"
+            "      function openDatabase() {\n",
+            "binary IndexedDB persistence helpers",
+        )
+
+    text = replace_required(
+        text,
+        '''      function openDatabase() {
+        return new Promise((resolve, reject) => {
+          if (!("indexedDB" in window)) {
+            reject(new Error("IndexedDB is not available"));
+            return;
+          }
+          const request = indexedDB.open(dbName, 1);
+          request.onupgradeneeded = () => {
+            const database = request.result;
+            if (!database.objectStoreNames.contains(storeName)) {
+              database.createObjectStore(storeName, { keyPath: "path" });
+            }
+          };
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error || new Error("IndexedDB open failed"));
+          request.onblocked = () => reject(new Error("IndexedDB open blocked"));
+        });
+      }
+''',
+        '''      function openDatabase() {
+        return new Promise((resolve, reject) => {
+          if (!("indexedDB" in window)) {
+            reject(new Error("IndexedDB is not available"));
+            return;
+          }
+          let settled = false;
+          const timeout = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            reject(new Error("IndexedDB open timed out"));
+          }, 8000);
+          const fail = error => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
+            reject(error);
+          };
+          const request = indexedDB.open(dbName, 1);
+          request.onupgradeneeded = () => {
+            const database = request.result;
+            if (!database.objectStoreNames.contains(storeName)) {
+              database.createObjectStore(storeName, { keyPath: "path" });
+            }
+          };
+          request.onsuccess = () => {
+            const database = request.result;
+            if (settled) {
+              database.close();
+              return;
+            }
+            settled = true;
+            clearTimeout(timeout);
+            resolve(database);
+          };
+          request.onerror = () => fail(request.error || new Error("IndexedDB open failed"));
+          request.onblocked = () => fail(new Error("IndexedDB open blocked"));
+        });
+      }
+''',
+        "bounded IndexedDB open",
+    )
+
+    legacy_indexeddb_bootstrap = '''      async function readIndexedDbFiles(database) {
+        const transaction = database.transaction(storeName, "readonly");
+        const store = transaction.objectStore(storeName);
+        await new Promise((resolve, reject) => {
+          const request = store.openCursor();
+          request.onsuccess = () => {
+            const cursor = request.result;
+            if (!cursor) {
+              resolve();
+              return;
+            }
+            const value = cursor.value;
+            if (value && typeof value.path === "string" && typeof value.value === "string") {
+              const path = normalize(value.path);
+              if (isClientBootstrapPath(path)) files[path] = value.value;
+            }
+            cursor.continue();
+          };
+          request.onerror = () => reject(request.error || new Error("IndexedDB cursor failed"));
+        });
+      }
+'''
+    value_cursor_indexeddb_bootstrap = '''      async function readIndexedDbFiles(database) {
+        const transaction = database.transaction(storeName, "readonly");
+        const store = transaction.objectStore(storeName);
+        const downloadedPacks = [];
+        await new Promise((resolve, reject) => {
+          const request = store.openCursor();
+          request.onsuccess = () => {
+            const cursor = request.result;
+            if (!cursor) {
+              resolve();
+              return;
+            }
+            const value = cursor.value;
+            if (value && typeof value.path === "string") {
+              const path = normalize(value.path);
+              const storedValue = value.value;
+              const supported = typeof storedValue === "string" ||
+                storedValue instanceof ArrayBuffer || ArrayBuffer.isView(storedValue);
+              if (supported && isClientBootstrapPath(path)) {
+                if (isDownloadedPackBinaryPath(path)) {
+                  downloadedPacks.push({
+                    path,
+                    value: storedValue,
+                    updatedAt: Number(value.updatedAt) || 0
+                  });
+                } else {
+                  const bytes = copyPersistentBytes(storedValue);
+                  files[path] = bytes === null ? storedValue : bytes;
+                }
+              }
+            }
+            cursor.continue();
+          };
+          request.onerror = () => reject(request.error || new Error("IndexedDB cursor failed"));
+        });
+
+        downloadedPacks.sort((left, right) => right.updatedAt - left.updatedAt ||
+          left.path.localeCompare(right.path));
+        const maximumDownloadedPacks = 4;
+        const maximumDownloadedPackBytes = 256 * 1024 * 1024;
+        const evicted = [];
+        let kept = 0;
+        let keptBytes = 0;
+        for (const entry of downloadedPacks) {
+          const byteLength = persistentValueByteLength(entry.value);
+          const withinBudget = kept < maximumDownloadedPacks &&
+            (kept === 0 || keptBytes + byteLength <= maximumDownloadedPackBytes);
+          if (withinBudget) {
+            const bytes = copyPersistentBytes(entry.value);
+            files[entry.path] = bytes === null ? entry.value : bytes;
+            kept++;
+            keptBytes += byteLength;
+          } else {
+            evicted.push(entry.path);
+          }
+        }
+        if (evicted.length > 0) {
+          const cleanup = database.transaction(storeName, "readwrite");
+          const cleanupStore = cleanup.objectStore(storeName);
+          for (const path of evicted) cleanupStore.delete(path);
+          await transactionDone(cleanup);
+          report("storage-download-cache-pruned", evicted.length + " files");
+        }
+      }
+'''
+    key_cursor_indexeddb_bootstrap = '''      async function readIndexedDbFiles(database) {
+        const transaction = database.transaction(storeName, "readonly");
+        const store = transaction.objectStore(storeName);
+        const downloadedPacks = [];
+        let scannedKeys = 0;
+        let hydratedRecords = 0;
+        await new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            reject(new Error("IndexedDB bootstrap timed out"));
+            try {
+              transaction.abort();
+            } catch (error) {
+              // The transaction may have completed between the timer and abort.
+            }
+          }, 8000);
+          transaction.oncomplete = () => {
+            clearTimeout(timeout);
+            resolve();
+          };
+          transaction.onerror = () => {
+            clearTimeout(timeout);
+            reject(transaction.error || new Error("IndexedDB bootstrap transaction failed"));
+          };
+          transaction.onabort = () => {
+            clearTimeout(timeout);
+            reject(transaction.error || new Error("IndexedDB bootstrap transaction aborted"));
+          };
+          const request = store.openKeyCursor();
+          request.onsuccess = () => {
+            const cursor = request.result;
+            if (!cursor) return;
+            scannedKeys++;
+            const primaryKey = cursor.primaryKey;
+            const path = normalize(primaryKey);
+            if (isClientBootstrapPath(path)) {
+              const read = store.get(primaryKey);
+              read.onsuccess = () => {
+                const value = read.result;
+                if (value && typeof value.path === "string") {
+                  const storedValue = value.value;
+                  const supported = typeof storedValue === "string" ||
+                    storedValue instanceof ArrayBuffer || ArrayBuffer.isView(storedValue);
+                  if (supported) {
+                    hydratedRecords++;
+                    if (isDownloadedPackBinaryPath(path)) {
+                      downloadedPacks.push({
+                        path,
+                        value: storedValue,
+                        updatedAt: Number(value.updatedAt) || 0
+                      });
+                    } else {
+                      const bytes = copyPersistentBytes(storedValue);
+                      files[path] = bytes === null ? storedValue : bytes;
+                    }
+                  }
+                }
+              };
+            }
+            cursor.continue();
+          };
+          request.onerror = () => reject(
+            request.error || new Error("IndexedDB key cursor failed"));
+        });
+        report("storage-key-scan", scannedKeys + " keys, hydrated=" + hydratedRecords);
+
+        downloadedPacks.sort((left, right) => right.updatedAt - left.updatedAt ||
+          left.path.localeCompare(right.path));
+        const maximumDownloadedPacks = 4;
+        const maximumDownloadedPackBytes = 256 * 1024 * 1024;
+        const evicted = [];
+        let kept = 0;
+        let keptBytes = 0;
+        for (const entry of downloadedPacks) {
+          const byteLength = persistentValueByteLength(entry.value);
+          const withinBudget = kept < maximumDownloadedPacks &&
+            (kept === 0 || keptBytes + byteLength <= maximumDownloadedPackBytes);
+          if (withinBudget) {
+            const bytes = copyPersistentBytes(entry.value);
+            files[entry.path] = bytes === null ? entry.value : bytes;
+            kept++;
+            keptBytes += byteLength;
+          } else {
+            evicted.push(entry.path);
+          }
+        }
+        if (evicted.length > 0) {
+          const cleanup = database.transaction(storeName, "readwrite");
+          const cleanupStore = cleanup.objectStore(storeName);
+          for (const path of evicted) cleanupStore.delete(path);
+          await transactionDone(cleanup);
+          report("storage-download-cache-pruned", evicted.length + " files");
+        }
+      }
+'''
+    untimed_key_cursor_indexeddb_bootstrap = key_cursor_indexeddb_bootstrap.replace(
+        '''          const timeout = setTimeout(() => {
+            reject(new Error("IndexedDB bootstrap timed out"));
+            try {
+              transaction.abort();
+            } catch (error) {
+              // The transaction may have completed between the timer and abort.
+            }
+          }, 8000);
+          transaction.oncomplete = () => {
+            clearTimeout(timeout);
+            resolve();
+          };
+          transaction.onerror = () => {
+            clearTimeout(timeout);
+            reject(transaction.error || new Error("IndexedDB bootstrap transaction failed"));
+          };
+          transaction.onabort = () => {
+            clearTimeout(timeout);
+            reject(transaction.error || new Error("IndexedDB bootstrap transaction aborted"));
+          };
+''',
+        '''          transaction.oncomplete = () => resolve();
+          transaction.onerror = () => reject(
+            transaction.error || new Error("IndexedDB bootstrap transaction failed"));
+          transaction.onabort = () => reject(
+            transaction.error || new Error("IndexedDB bootstrap transaction aborted"));
+''',
+        1,
+    )
+    if value_cursor_indexeddb_bootstrap in text:
+        text = text.replace(
+            value_cursor_indexeddb_bootstrap,
+            key_cursor_indexeddb_bootstrap,
+            1,
+        )
+    elif untimed_key_cursor_indexeddb_bootstrap in text:
+        text = text.replace(
+            untimed_key_cursor_indexeddb_bootstrap,
+            key_cursor_indexeddb_bootstrap,
+            1,
+        )
+    else:
+        text = replace_required(
+            text,
+            legacy_indexeddb_bootstrap,
+            key_cursor_indexeddb_bootstrap,
+            "key-only IndexedDB bootstrap",
+        )
+
+    text = replace_required(
+        text,
+        '''        } catch (error) {
+          const restored = loadLocalStorageFallback();
+          window.__gaiusFsBackend = "localStorage";
+          report("storage-indexeddb-unavailable", (error && error.message ? error.message : String(error)) + ", fallbackFiles=" + restored);
+        }
+''',
+        '''        } catch (error) {
+          if (db) {
+            try {
+              db.close();
+            } catch (closeError) {
+              // The failed transaction may already have closed the database.
+            }
+            db = null;
+          }
+          const restored = loadLocalStorageFallback();
+          window.__gaiusFsBackend = "localStorage";
+          report("storage-indexeddb-unavailable", (error && error.message ? error.message : String(error)) + ", fallbackFiles=" + restored);
+        }
+''',
+        "IndexedDB startup fallback closes unusable database",
+    )
+
+    text = replace_required(
+        text,
+        '''      async function putIndexedDbFile(path, value) {
+        const transaction = db.transaction(storeName, "readwrite");
+        transaction.objectStore(storeName).put({ path: normalize(path), value: String(value || "") });
+        await transactionDone(transaction);
+      }
+''',
+        '''      async function putIndexedDbFile(path, value) {
+        const transaction = db.transaction(storeName, "readwrite");
+        const bytes = copyPersistentBytes(value);
+        const storedValue = bytes === null ? String(value || "") : bytes;
+        transaction.objectStore(storeName).put({
+          path: normalize(path),
+          value: storedValue,
+          updatedAt: Date.now()
+        });
+        await transactionDone(transaction);
+      }
+''',
+        "binary IndexedDB writer",
+    )
+
+    if "window.__gaiusFsPutBytes = function(path, value)" not in text:
+        text = replace_required(
+            text,
+            '''      window.__gaiusFsDelete = function(path) {
+''',
+            '''      window.__gaiusFsPutBytes = function(path, value) {
+        path = normalize(path);
+        const bytes = copyPersistentBytes(value);
+        if (bytes === null || !db) return false;
+        files[path] = bytes;
+        pending = pending.then(() => putIndexedDbFile(path, bytes)).catch(error => {
+          report("storage-indexeddb-write-error", path + ": " + (error && error.message ? error.message : String(error)));
+        });
+        return true;
+      };
+
+      window.__gaiusFsDelete = function(path) {
+''',
+            "binary IndexedDB browser writer",
+        )
+
     if "bootTimings.beforeClassesPaint" not in text:
         text = replace_required(
             text,
@@ -592,6 +1574,19 @@ def patch_index(index: Path, classes_js: Path) -> bool:
             "        (\"classes.js?v=\" + encodeURIComponent(buildToken));\n"
             "      await loadScript(classesUrl);\n",
             "portable TeaVM client asset URL",
+        )
+
+    if "bootTimings.vanillaAssetsReady" not in text:
+        text = replace_required(
+            text,
+            "      await (window.__gaiusPortableAssetsReady || Promise.resolve());\n"
+            "      const classesUrl = window.__gaiusClassesUrl ||\n",
+            "      await (window.__gaiusPortableAssetsReady || Promise.resolve());\n"
+            "      setBootProgress(Math.max(bootProgressValue, 30), \"Loading game assets...\");\n"
+            "      await window.__gaiusVanillaAssetsReady;\n"
+            "      bootTimings.vanillaAssetsReady = performance.now();\n"
+            "      const classesUrl = window.__gaiusClassesUrl ||\n",
+            "vanilla assets before TeaVM client",
         )
 
     if "bootTimings.mainStart" not in text:
@@ -669,6 +1664,85 @@ def patch_index(index: Path, classes_js: Path) -> bool:
       return {username, uuid};
     }
 
+    function requestGaiusPlayerName(initialName) {
+      if (!profileGate || !profileForm || !profileName || !profileError) {
+        throw new Error("The Gaius player-name screen is unavailable");
+      }
+      profileName.value = String(initialName || "").trim();
+      profileError.textContent = "";
+      profileGate.hidden = false;
+      if (bootBrand) bootBrand.hidden = true;
+      if (bootProgress) bootProgress.hidden = true;
+      if (bootProgressText) bootProgressText.hidden = true;
+      statusBox.hidden = true;
+      return new Promise(resolve => {
+        const submit = event => {
+          event.preventDefault();
+          const username = profileName.value.trim();
+          if (!/^[A-Za-z0-9_]{1,16}$/.test(username)) {
+            profileError.textContent = "Use 1-16 letters, numbers, or underscores.";
+            profileName.focus();
+            return;
+          }
+          profileForm.removeEventListener("submit", submit);
+          try {
+            localStorage.setItem("gaius.playerName", username);
+          } catch (error) {
+            console.warn("Could not remember the Gaius player name", error);
+          }
+          profileGate.hidden = true;
+          if (bootBrand) bootBrand.hidden = false;
+          if (bootProgress) bootProgress.hidden = false;
+          if (bootProgressText) bootProgressText.hidden = false;
+          statusBox.hidden = !showLauncherDetails;
+          setBootProgress(Math.max(bootProgressValue, 3), "Preparing the browser runtime...");
+          resolve(username);
+        };
+        profileForm.addEventListener("submit", submit);
+        requestAnimationFrame(() => {
+          profileName.focus();
+          profileName.select();
+        });
+      });
+    }
+
+    function changeGaiusPlayerName() {
+      if (profileSwitch) profileSwitch.disabled = true;
+      try {
+        sessionStorage.removeItem("gaius.session");
+      } catch (error) {
+        console.warn("Could not clear the current Gaius session", error);
+      }
+      window.__gaiusSession = {};
+      const next = new URL(location.href);
+      for (const key of ["username", "uuid", "accessToken", "xuid", "clientId"]) {
+        next.searchParams.delete(key);
+      }
+      try {
+        if (typeof window.__gaiusReleaseRuntimeLease === "function") {
+          window.__gaiusReleaseRuntimeLease();
+        }
+      } finally {
+        location.replace(next.href);
+      }
+    }
+
+    function updateGaiusProfileSwitch() {
+      if (!profileSwitch) return;
+      const state = window.__gaiusMinecraftState;
+      const screen = state && state.screen
+        ? String(state.screen).split(".").pop()
+        : "";
+      profileSwitch.hidden = !profileGate || !profileGate.hidden || screen !== "TitleScreen";
+    }
+
+    if (profileSwitch) {
+      profileSwitch.addEventListener("click", changeGaiusPlayerName);
+      setInterval(updateGaiusProfileSwitch, 250);
+      updateGaiusProfileSwitch();
+    }
+    window.__gaiusChangePlayerName = changeGaiusPlayerName;
+
     async function buildGaiusSessionArgs() {
       let stored = {};
       try {
@@ -692,12 +1766,12 @@ def patch_index(index: Path, classes_js: Path) -> bool:
       }
       const accessToken = String(session.accessToken || "").trim();
       const online = accessToken.length > 0 && accessToken !== "0";
-      let username = String(session.username || (online ? "" : "BrowserPlayer")).trim();
+      let username = String(session.username || "").trim();
       let uuid = String(session.uuid || (online ? "" : "00000000000040008000000000000001"))
         .replace(/-/g, "")
         .toLowerCase();
       if (username && !/^[A-Za-z0-9_]{1,16}$/.test(username)) {
-        throw new Error("Online session username must be 1-16 Minecraft name characters");
+        throw new Error("Player name must use 1-16 letters, numbers, or underscores");
       }
       if (uuid && !/^[0-9a-f]{32}$/.test(uuid)) {
         throw new Error("Online session UUID must contain 32 hexadecimal digits");
@@ -710,8 +1784,20 @@ def patch_index(index: Path, classes_js: Path) -> bool:
         session.uuid = uuid;
         sessionStorage.setItem("gaius.session", JSON.stringify(session));
       }
+      if (!online && !username) {
+        let rememberedName = "";
+        try {
+          rememberedName = localStorage.getItem("gaius.playerName") || "";
+        } catch (error) {
+          console.warn("Could not read the remembered Gaius player name", error);
+        }
+        username = await requestGaiusPlayerName(rememberedName);
+        session.username = username;
+        session.uuid = uuid;
+        sessionStorage.setItem("gaius.session", JSON.stringify(session));
+      }
       if (!/^[A-Za-z0-9_]{1,16}$/.test(username)) {
-        throw new Error("Online session username must be 1-16 Minecraft name characters");
+        throw new Error("Player name must use 1-16 letters, numbers, or underscores");
       }
       if (!/^[0-9a-f]{32}$/.test(uuid)) {
         throw new Error("Online session UUID must contain 32 hexadecimal digits");
@@ -752,30 +1838,41 @@ def patch_index(index: Path, classes_js: Path) -> bool:
       scrubbed.searchParams.delete("accessToken");
       history.replaceState(history.state, "", scrubbed.pathname + scrubbed.search + scrubbed.hash);
     }'''
-    if "async function buildGaiusSessionArgs()" not in text:
-        if "function buildGaiusSessionArgs()" in text:
-            text, count = re.subn(
-                r'    function buildGaiusSessionArgs\(\) \{.*?'
-                r'    if \(urlParams\.has\("accessToken"\)\) \{\n'
-                r'      const scrubbed = new URL\(location\.href\);\n'
-                r'      scrubbed\.searchParams\.delete\("accessToken"\);\n'
-                r'      history\.replaceState\(history\.state, "", scrubbed\.pathname \+ scrubbed\.search \+ scrubbed\.hash\);\n'
-                r'    \}',
-                session_block,
-                text,
-                count=1,
-                flags=re.DOTALL,
-            )
-        else:
-            text, count = re.subn(
-                r'    window\.__gaiusDefaultArgs = \[\n.*?\n    \];',
-                session_block,
-                text,
-                count=1,
-                flags=re.DOTALL,
-            )
-        if count == 0:
-            raise RuntimeError("index.html patch point was not found: browser session arguments")
+    if "function createGaiusProxyUrl(target, kind)" in text:
+        text, count = re.subn(
+            r'    function createGaiusProxyUrl\(target, kind\) \{.*?'
+            r'    if \(urlParams\.has\("accessToken"\)\) \{\n'
+            r'      const scrubbed = new URL\(location\.href\);\n'
+            r'      scrubbed\.searchParams\.delete\("accessToken"\);\n'
+            r'      history\.replaceState\(history\.state, "", scrubbed\.pathname \+ scrubbed\.search \+ scrubbed\.hash\);\n'
+            r'    \}',
+            lambda _match: session_block,
+            text,
+            count=1,
+            flags=re.DOTALL,
+        )
+    else:
+        text, count = re.subn(
+            r'    window\.__gaiusDefaultArgs = \[\n.*?\n    \];',
+            lambda _match: session_block,
+            text,
+            count=1,
+            flags=re.DOTALL,
+        )
+    if count == 0:
+        raise RuntimeError("index.html patch point was not found: browser session arguments")
+
+    # Keep previously postprocessed launchers current when relay aliases are added later.
+    text = text.replace(
+        'const configured = urlParams.get("bridge") || window.__gaiusBridgeUrl;',
+        'const configured = urlParams.get("bridge") || urlParams.get("relay") || window.__gaiusBridgeUrl;',
+        1,
+    )
+    text = text.replace(
+        'const token = urlParams.get("bridgeToken") || window.__gaiusBridgeToken;',
+        'const token = urlParams.get("bridgeToken") || urlParams.get("relayToken") || window.__gaiusBridgeToken;',
+        1,
+    )
 
     if "window.__gaiusDefaultArgsPromise.catch(() => {});" not in text:
         text = replace_required(
@@ -822,6 +1919,18 @@ def patch_index(index: Path, classes_js: Path) -> bool:
             "      );\n"
             "      bootTimings.sessionReady = performance.now();\n",
             "online session resolution",
+        )
+
+    if "bootTimings.runtimeLeaseReady" not in text:
+        text = replace_required(
+            text,
+            "      bootTimings.sessionReady = performance.now();\n",
+            "      bootTimings.sessionReady = performance.now();\n"
+            "      if (!await acquireGaiusRuntimeLease()) {\n"
+            "        throw new Error(\"Gaius is already running in another tab. Close that tab, then reload this page.\");\n"
+            "      }\n"
+            "      bootTimings.runtimeLeaseReady = performance.now();\n",
+            "single active Gaius runtime acquisition",
         )
 
     if "window.__gaiusBootError = error;" not in text:
@@ -876,6 +1985,38 @@ def patch_index(index: Path, classes_js: Path) -> bool:
             "      ].join(\"\\n\"));\n",
             "boot Java exception diagnostic display",
         )
+
+    english_launcher_text = {
+        "正在启动官方 Minecraft Java Edition 1.21.11 TeaVM 客户端…":
+            "Starting Gaius Client 1.21.11...",
+        "0% 初始化…": "0% Initializing...",
+        'let bootProgressLabel = "初始化…";':
+            'let bootProgressLabel = "Initializing...";',
+        "初始化浏览器运行环境…": "Preparing the browser runtime...",
+        "已进入世界": "World ready",
+        "Minecraft 界面已加载：": "Minecraft screen ready: ",
+        "检测到启动阶段超过 30 秒没有进度变化；浏览器仍在运行，但可能卡在资源加载、世界生成或主线程长任务中。":
+            "Startup has made no visible progress for 30 seconds. The browser is still running, "
+            "but resource loading, world generation, or a long main-thread task may be stalled.",
+        "浏览器运行时错误：": "Browser runtime error:",
+        "浏览器 Promise 未处理异常：": "Unhandled browser promise rejection:",
+        "无法加载 ": "Could not load ",
+        "正在加载浏览器持久化存储 IndexedDB…":
+            "Loading persistent browser storage...",
+        "加载浏览器持久化存储…": "Loading browser storage...",
+        "浏览器存储已就绪（": "Browser storage is ready (",
+        "），正在加载 classes.js…": "); loading classes.js...",
+        "加载 1.21.11 TeaVM 主程序…": "Loading the 1.21.11 client runtime...",
+        "TeaVM 产物未暴露 main(args)，无法启动。":
+            "The TeaVM build did not expose main(args).",
+        "已加载 classes.js，调用 net.minecraft.client.main.Main.main(args)…":
+            "classes.js loaded; calling net.minecraft.client.main.Main.main(args)...",
+        "启动 Minecraft 客户端…": "Starting Gaius Client...",
+        "等待 Minecraft 首帧/主界面…": "Waiting for the first client frame...",
+        "启动 Minecraft TeaVM 客户端失败：": "Gaius Client failed to start:",
+    }
+    for source, replacement in english_launcher_text.items():
+        text = text.replace(source, replacement)
 
     if text != original:
         index.write_text(text, encoding="utf-8")

@@ -41,9 +41,15 @@ public final class JoptSimpleReflectionPatcher {
 
         ClassNode node = new ClassNode();
         new ClassReader(input).accept(node, 0);
-        boolean found = false;
+        boolean alreadyPatched = node.methods.stream().anyMatch(method ->
+                method.name.equals("converter")
+                        && method.desc.equals(
+                                "(Ljava/lang/Class;Ljoptsimple/internal/Reflection$Parser;)"
+                                        + "Ljoptsimple/ValueConverter;"));
+        boolean found = alreadyPatched;
         for (MethodNode method : node.methods) {
-            if (method.name.equals("findConverter")
+            if (!alreadyPatched
+                    && method.name.equals("findConverter")
                     && method.desc.equals("(Ljava/lang/Class;)Ljoptsimple/ValueConverter;")) {
                 LabelNode checkInteger = new LabelNode();
                 LabelNode vanilla = new LabelNode();
@@ -92,6 +98,8 @@ public final class JoptSimpleReflectionPatcher {
         Path output = Path.of(args[1]);
         Files.createDirectories(output.getParent());
         Files.write(output, writer.toByteArray());
-        System.out.println("Patched jopt-simple File conversion for browser use");
+        System.out.println(alreadyPatched
+                ? "Verified jopt-simple browser value conversion"
+                : "Patched jopt-simple File conversion for browser use");
     }
 }

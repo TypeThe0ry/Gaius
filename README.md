@@ -109,12 +109,22 @@ npm start
 ```
 
 Each RelayNode exposes `/relay-node/v1` and `/health`, while `/tunnel` remains
-the binary Minecraft transport. Configure public relay nodes with repeated
-`bridge` query parameters or `gaius.bridgeNodes` local storage; node objects
-support `url`, `token`, and `priority`, so the browser tries higher-priority
-nodes first and falls back before the Minecraft connection is made. A
-relay operator must restrict destinations, origins, connection counts, and
-access tokens. See
+the binary Minecraft transport. Public nodes are discovered from the curated
+[`relay-nodes.json`](relay-nodes.json), an online build's same-origin registry,
+an embedded portable-HTML snapshot, or a bounded live lease registry referenced
+by the curated file. RelayNodes can renew short leases with the registry process
+included in `apps/bridge`; crashed nodes disappear automatically. Repeated
+`relayRegistry`, `bridge`, and
+`relay` query parameters and the `gaius.relayRegistries`/`gaius.bridgeNodes`
+local-storage entries remain available for private deployments. The browser
+tries the same-host server plugin first, queries discovered nodes for
+target-specific active/recent affinity, then selects by capacity and priority.
+Affinity reuses a node, never
+another player's TCP protocol stream: every status ping and join receives an
+isolated tunnel. Public listeners block private TCP targets by default, including
+DNS names that resolve privately. A relay operator must still restrict origins,
+connection counts, rate limits and abuse. See
+[the public-node guide](docs/relay-nodes.md) and
 [apps/bridge/README.md](apps/bridge/README.md).
 
 The optional Paper plugin removes the external relay hop for a server operator;

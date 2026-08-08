@@ -6,10 +6,12 @@ if (typeof Error === "function" && (!Error.stackTraceLimit || Error.stackTraceLi
 }
 const dbName = "gaius-fs-v1";
 const storeName = "files";
+const defaultWorldgenSliceMillis = 40;
 const files = root.__gaiusPersistentFiles = Object.create(null);
 let database;
 let pendingWrites = Promise.resolve();
 const pendingChanges = new Map();
+const pendingMigrations = new Map();
 let flushTimer;
 let runtimeStarted = false;
 let stopRequested = false;
@@ -19,6 +21,13 @@ function monotonicMillis() {
   return typeof performance !== "undefined" && performance.now
     ? performance.now()
     : Date.now();
+}
+
+function clampWorldgenSlice(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 4 && parsed <= 50
+    ? parsed
+    : fallback;
 }
 
 function markStartup(phase, startedAt) {
@@ -50,8 +59,15 @@ root.onmessage = async (event) => {
     }
     root.__gaiusServerSessionId = String(message.sessionId || "");
     root.__gaiusServerWorldId = String(message.worldId || "");
+    root.__gaiusServerSeed = String(message.seed || "");
     root.__gaiusServerViewDistance = clampDistance(message.renderDistance, 6);
     root.__gaiusServerSimulationDistance = clampDistance(message.simulationDistance, 4);
+    const requestedWorldgenSlice = message.worldgenSliceMillis ??
+      root.__gaiusWorldgenSliceMillis;
+    root.__gaiusWorldgenSliceMillis = clampWorldgenSlice(
+      requestedWorldgenSlice,
+      defaultWorldgenSliceMillis,
+    );
     root.__gaiusBridgeUrl = message.bridgeUrl || undefined;
     root.__gaiusBridgeToken = message.bridgeToken || undefined;
     root.__gaiusLocalServerPorts = new Map([
@@ -78,11 +94,16 @@ root.onmessage = async (event) => {
     if (typeof main !== "function") {
       throw new Error("Singleplayer TeaVM output did not expose main(args)");
     }
+    root.__gaiusIntegratedServerNetworkSignal =
+      typeof signalIntegratedServerNetworkInput === "function"
+        ? signalIntegratedServerNetworkInput
+        : undefined;
     postMessage({type: "runtime-ready", detail: root.__gaiusServerWorldId});
     markStartup("runtime-ready", startupStarted);
     main([]);
     runtimeStarted = true;
-    markStartup("main-returned", startupStarted);
+    // TeaVM returns here on the first cooperative suspension while Java main continues.
+    markStartup("main-dispatched", startupStarted);
     if (stopRequested) {
       void stopServer();
     }
@@ -164,9 +185,17 @@ async function stopServer() {
       !isIntegratedServerStopped() && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
+  queuePendingMigrations();
   await flushPendingChanges();
   if (database) {
     database.close();
+  }
+  root.__gaiusIntegratedServerNetworkSignal = undefined;
+  if (root.__gaiusChunkPriorityStats) {
+    postMessage({
+      type: "chunk-priority-stats",
+      ...root.__gaiusChunkPriorityStats,
+    });
   }
   postMessage({type: "stopped", detail: root.__gaiusServerWorldId});
   setTimeout(() => close(), 0);
@@ -184,9 +213,21 @@ async function installPersistentFileSystem() {
     scheduleFlush();
     return true;
   };
+  root.__gaiusFsPutBytes = (path, value) => {
+    path = normalize(path);
+    const bytes = toUint8Array(value);
+    if (!bytes) return false;
+    const copy = bytes.slice();
+    files[path] = copy;
+    pendingMigrations.delete(path);
+    pendingChanges.set(path, copy);
+    scheduleFlush(250);
+    return true;
+  };
   root.__gaiusFsDelete = (path) => {
     path = normalize(path);
     delete files[path];
+    pendingMigrations.delete(path);
     pendingChanges.set(path, null);
     scheduleFlush();
     return true;
@@ -209,11 +250,15 @@ function openDatabase() {
   });
 }
 
-function readWorldFiles(worldId) {
+async function readWorldFiles(worldId) {
   const worldPrefix = "/gaius/saves/" + String(worldId || "") + "/";
-  return new Promise((resolve, reject) => {
+  const stored = [];
+  await new Promise((resolve, reject) => {
     const transaction = database.transaction(storeName, "readonly");
-    const request = transaction.objectStore(storeName).openCursor();
+    const range = typeof IDBKeyRange !== "undefined"
+      ? IDBKeyRange.bound(worldPrefix, worldPrefix + "\uffff")
+      : undefined;
+    const request = transaction.objectStore(storeName).openCursor(range);
     request.onsuccess = () => {
       const cursor = request.result;
       if (!cursor) {
@@ -221,26 +266,35 @@ function readWorldFiles(worldId) {
         return;
       }
       const value = cursor.value;
-      if (value && typeof value.path === "string" && typeof value.value === "string") {
+      if (value && typeof value.path === "string") {
         const path = normalize(value.path);
         if (path.startsWith(worldPrefix)) {
-          files[path] = value.value;
+          stored.push({path, value: value.value});
         }
       }
       cursor.continue();
     };
     request.onerror = () => reject(request.error || new Error("IndexedDB cursor failed"));
   });
+  for (const entry of stored) {
+    const value = await decodeStoredValue(entry.path, entry.value);
+    if (value === undefined) continue;
+    files[entry.path] = value;
+    if (isRegionPath(entry.path) && typeof entry.value === "string") {
+      // Migrate legacy Base64 regions on the next normal flush/clean shutdown.
+      pendingMigrations.set(entry.path, value);
+    }
+  }
 }
 
-function scheduleFlush() {
+function scheduleFlush(delay = 25) {
   if (flushTimer !== undefined) {
     return;
   }
   flushTimer = setTimeout(() => {
     flushTimer = undefined;
     void flushPendingChanges();
-  }, 25);
+  }, delay);
 }
 
 function flushPendingChanges() {
@@ -263,17 +317,86 @@ function flushPendingChanges() {
   return pendingWrites;
 }
 
-function writeBatch(changes) {
+function queuePendingMigrations() {
+  for (const [path, value] of pendingMigrations) {
+    if (!pendingChanges.has(path)) pendingChanges.set(path, value);
+  }
+  pendingMigrations.clear();
+}
+
+async function writeBatch(changes) {
+  const prepared = [];
+  for (const [path, value] of changes) {
+    prepared.push([path, await encodeStoredValue(path, value)]);
+  }
   const transaction = database.transaction(storeName, "readwrite");
   const store = transaction.objectStore(storeName);
-  for (const [path, value] of changes) {
+  for (const [path, value] of prepared) {
     if (value === null) {
       store.delete(path);
     } else {
       store.put({path, value});
     }
   }
-  return transactionDone(transaction);
+  await transactionDone(transaction);
+}
+
+function isRegionPath(path) {
+  return String(path || "").endsWith(".mca");
+}
+
+function toUint8Array(value) {
+  if (value instanceof Uint8Array) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  if (value instanceof ArrayBuffer) {
+    return new Uint8Array(value);
+  }
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  return null;
+}
+
+function decodeBase64(value) {
+  if (typeof Uint8Array.fromBase64 === "function") {
+    return Uint8Array.fromBase64(value);
+  }
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+async function decodeStoredValue(path, value) {
+  if (isRegionPath(path) && typeof value === "string") {
+    return decodeBase64(value);
+  }
+  if (value && value.encoding === "gzip") {
+    const compressed = toUint8Array(value.bytes);
+    if (!compressed || typeof DecompressionStream !== "function") {
+      throw new Error("Compressed region storage is unavailable");
+    }
+    const stream = new Blob([compressed]).stream()
+      .pipeThrough(new DecompressionStream("gzip"));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  }
+  return value;
+}
+
+async function encodeStoredValue(path, value) {
+  const bytes = toUint8Array(value);
+  if (!isRegionPath(path) || !bytes || typeof CompressionStream !== "function") {
+    return value;
+  }
+  const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream("gzip"));
+  const compressed = new Uint8Array(await new Response(stream).arrayBuffer());
+  if (compressed.byteLength >= bytes.byteLength) {
+    return bytes.slice();
+  }
+  return {encoding: "gzip", bytes: compressed};
 }
 
 function transactionDone(transaction) {

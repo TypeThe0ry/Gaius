@@ -21,7 +21,18 @@ public final class BrowserResourceReloadProfiler {
 
     /** Attaches a stable name to a known reload continuation for browser timing diagnostics. */
     public static Executor label(Executor delegate, String taskKind) {
+        if (!detailedProfilingEnabled()) {
+            return delegate;
+        }
         return command -> delegate.execute(new LabeledTask(taskKind, command));
+    }
+
+    /** Adds the atlas identity to every task submitted while that atlas is loading. */
+    public static Executor labelAtlas(Executor delegate, Object atlasEntry) {
+        if (!detailedProfilingEnabled()) {
+            return delegate;
+        }
+        return label(delegate, "AtlasManager.load " + String.valueOf(atlasEntry));
     }
 
     /** Marks a synchronous subsection inside a reload continuation for browser diagnostics. */
@@ -79,16 +90,22 @@ public final class BrowserResourceReloadProfiler {
         private final double reloadStartedAt;
         private final String phase;
         private final Executor delegate;
+        private final boolean profileTasks;
 
         private TimedExecutor(String listener, double reloadStartedAt, String phase, Executor delegate) {
             this.listener = listener;
             this.reloadStartedAt = reloadStartedAt;
             this.phase = phase;
             this.delegate = delegate;
+            profileTasks = detailedProfilingEnabled();
         }
 
         @Override
         public void execute(Runnable command) {
+            if (!profileTasks) {
+                delegate.execute(command);
+                return;
+            }
             String taskKind = command instanceof LabeledTask labeled
                     ? labeled.taskKind
                     : command.getClass().getName();
@@ -123,6 +140,17 @@ public final class BrowserResourceReloadProfiler {
             """)
     private static native double now();
 
+    @JSBody(script = """
+            if (globalThis.__gaiusProfileResourceReloadTasks === true) return true;
+            try {
+              return typeof location !== 'undefined' &&
+                new URLSearchParams(location.search).get('diag') === 'reload';
+            } catch (ignored) {
+              return false;
+            }
+            """)
+    private static native boolean detailedProfilingEnabled();
+
     @JSBody(params = {"name", "startedAt"}, script = """
             const list = globalThis.__gaiusResourceReloadTimings ||
               (globalThis.__gaiusResourceReloadTimings = []);
@@ -141,7 +169,21 @@ public final class BrowserResourceReloadProfiler {
                 entry.endedAt = end;
                 entry.durationMs = Math.max(0, end - entry.startedAt);
                 entry.failed = !!failed;
+                if (diagnosticsEnabled()) {
+                  console.info('[Gaius reload] listener=' + entry.name +
+                    ' durationMs=' + entry.durationMs.toFixed(1) +
+                    ' failed=' + entry.failed);
+                }
                 break;
+              }
+            }
+
+            function diagnosticsEnabled() {
+              try {
+                return typeof location !== 'undefined' &&
+                  new URLSearchParams(location.search).get('diag') === 'reload';
+              } catch (ignored) {
+                return false;
               }
             }
             """)
@@ -173,7 +215,21 @@ public final class BrowserResourceReloadProfiler {
                 bucket.maxMs = elapsed;
                 bucket.slowestTaskKind = kind;
               }
+              if (elapsed >= 50 && diagnosticsEnabled()) {
+                console.warn('[Gaius reload] task listener=' + entry.name +
+                  ' phase=' + String(phase) + ' kind=' + kind +
+                  ' durationMs=' + elapsed.toFixed(1));
+              }
               break;
+            }
+
+            function diagnosticsEnabled() {
+              try {
+                return typeof location !== 'undefined' &&
+                  new URLSearchParams(location.search).get('diag') === 'reload';
+              } catch (ignored) {
+                return false;
+              }
             }
             """)
     private static native void recordTask(
@@ -202,6 +258,13 @@ public final class BrowserResourceReloadProfiler {
             const elapsed = Math.max(0, (+endedAt || 0) - startedAt);
             list.push({name: key, startedAt: startedAt, endedAt: +endedAt || 0, durationMs: elapsed});
             if (list.length > 256) list.splice(0, list.length - 256);
+            try {
+              if (elapsed >= 50 && typeof location !== 'undefined' &&
+                  new URLSearchParams(location.search).get('diag') === 'reload') {
+                console.warn('[Gaius reload] section=' + key +
+                  ' durationMs=' + elapsed.toFixed(1));
+              }
+            } catch (ignored) {}
             """)
     private static native void recordSectionEnd(String name, double endedAt);
 }

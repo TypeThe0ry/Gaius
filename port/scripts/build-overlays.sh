@@ -214,6 +214,20 @@ jar --update \
   -C "$authlib_patch_classes" com/mojang/authlib/yggdrasil/response/MinecraftTexturesPayload.class \
   -C "$authlib_patch_classes" com/mojang/authlib/yggdrasil/YggdrasilMinecraftSessionService.class
 
+patchy_path="com/mojang/patchy/2.2.10/patchy-2.2.10.jar"
+patchy_output="$overlay_work/libraries/$patchy_path"
+patchy_patch_classes="$overlay_work/library-patches/patchy"
+mkdir -p "$(dirname "$patchy_output")" "$patchy_patch_classes"
+find "$patchy_patch_classes" -type f -delete
+cp "$work/libraries/$patchy_path" "$patchy_output"
+java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
+  dev.gaius.tools.PatchyBrowserPatcher \
+  "$patchy_output" \
+  "$patchy_patch_classes/com/mojang/patchy/MojangBlockListSupplier.class"
+jar --update \
+  --file "$patchy_output" \
+  -C "$patchy_patch_classes" com/mojang/patchy/MojangBlockListSupplier.class
+
 classlib_patch_classes="$overlay_work/classlib-patches"
 mkdir -p "$classlib_patch_classes"
 find "$classlib_patch_classes" -type f -delete
@@ -564,8 +578,12 @@ client_override_sources=()
 while IFS= read -r source; do
   client_override_sources+=("$source")
 done < <(find "$root/port/overrides/client/src/main/java" -type f -name '*.java' -print | sort)
+client_override_classpath="$work/client-named.jar:$(cat "$work/classpath.txt")"
+for artifact in teavm-interop teavm-jso teavm-jso-apis; do
+  client_override_classpath="$client_override_classpath:$HOME/.m2/repository/org/teavm/$artifact/$teavm_version/$artifact-$teavm_version.jar"
+done
 javac --release 21 -proc:none \
-  -classpath "$work/client-named.jar:$(cat "$work/classpath.txt")" \
+  -classpath "$client_override_classpath" \
   -d "$client_override_classes" \
   "${client_override_sources[@]}"
 jar --update --file "$client_output" -C "$client_override_classes" .

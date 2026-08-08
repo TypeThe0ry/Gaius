@@ -22,3 +22,6 @@ jobs:
 
       - name: Verify repository and LFS boundaries
         run: ./tools/check-lfs.sh
+
+      - name: Validate public RelayNode registry
+        run: node tools/check-relay-registry.mjs
