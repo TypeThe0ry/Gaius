@@ -4,6 +4,8 @@ client.txt
 assets/
 libraries/
 versions/
+!port/versions/
+!port/versions/*.json
 port/work/
 
 # Rebuildable Maven data and diagnostic output. The checked-in browser release

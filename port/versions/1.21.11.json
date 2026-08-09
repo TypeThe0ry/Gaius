@@ -1,0 +1,27 @@
+{
+  "id": "1.21.11",
+  "releaseType": "release",
+  "protocolVersion": 774,
+  "worldVersion": 4671,
+  "javaVersion": 21,
+  "classFileVersion": 65,
+  "clientDistribution": "obfuscated-with-mappings",
+  "packVersions": {
+    "resource": {
+      "major": 75,
+      "minor": 0
+    },
+    "data": {
+      "major": 94,
+      "minor": 1
+    }
+  },
+  "official": {
+    "releaseTime": "2025-12-09T12:23:30+00:00",
+    "clientSha1": "ba2df812c2d12e0219c489c4cd9a5e1f0760f5bd",
+    "clientMappingsSha1": "031a68bebf55d824f66d6573d8c752f0e1bf232a",
+    "serverSha1": "64bb6d763bed0a9f1d632ec347938594144943ed",
+    "assetIndexId": "29",
+    "assetIndexSha1": "1a41d0c5bd1794fda2b74afb32c628743ef3a7fb"
+  }
+}

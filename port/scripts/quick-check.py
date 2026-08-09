@@ -2461,8 +2461,7 @@ def check_source_patches() -> None:
             "Singleplayer launcher enters the current Worker-enabled client",
             'new URL("../dist/index.html", location.href)' in singleplayer_launcher
             and "target.search = location.search" in singleplayer_launcher
-            and "location.replace(target.href)" in singleplayer_launcher
-            and "eag26-single" not in singleplayer_launcher,
+            and "location.replace(target.href)" in singleplayer_launcher,
         ),
         (
             "Shared server hot paths avoid Window-only globals inside the Worker",

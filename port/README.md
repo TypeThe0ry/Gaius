@@ -125,10 +125,3 @@ For unencrypted 1.21.11 traffic, RelayNode also tracks server-initiated
 `PLAY -> CONFIGURATION -> PLAY` cycles. Synthetic browser-stall ticks are
 disabled throughout reconfiguration, preventing stale PLAY packets from being
 sent into the configuration protocol after a plugin changes server state.
-
-## Reference artifact
-
-The root `eag26-single(2).html` proves that a more advanced 26.1.2 platform layer
-exists. It cannot be treated as source code. If its corresponding Java, Python,
-Rust, and build files become available, they should be imported as a reference
-implementation after checking provenance and redistribution terms.

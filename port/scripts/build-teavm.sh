@@ -2,7 +2,9 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
-version="$(jq -er '.minecraftVersion' "$root/port/config.json")"
+source "$root/port/scripts/version-profile.sh"
+gaius_load_version_profile "$root"
+version="$GAIUS_MINECRAFT_VERSION"
 if [[ "${GAIUS_SKIP_OVERLAY_BUILD:-false}" != "true" ]]; then
   "$root/port/scripts/build-overlays.sh" >/dev/null
   gson_type_token_patches="$root/port/target/gson-type-token-client-patches"
@@ -215,7 +217,7 @@ echo "Mapped browser Unicode font assets: $copied_font_assets"
 pom="$("$root/port/scripts/generate-pom.sh")"
 log="$root/port/target/teavm-build.log"
 
-echo "Compiling the official Minecraft 1.21.11 client with TeaVM"
+echo "Compiling the official Minecraft $version client with TeaVM"
 echo "POM: $pom"
 echo "Log: $log"
 

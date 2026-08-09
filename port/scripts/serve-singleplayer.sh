@@ -10,7 +10,7 @@ Gaius single-player launcher
 Open this URL in a WebGPU-capable desktop browser:
   http://127.0.0.1:$port/port/web/singleplayer/
 
-The launcher links to the checked-in eag26 single-file build with ?localserver.
+The launcher redirects to the checked-in Gaius browser distribution.
 Press Ctrl-C to stop the server.
 MSG
 

@@ -300,4 +300,3 @@ Gaius 是独立软件。本仓库本身不授予重新分发 Mojang/Microsoft �
 - [RelayNode 注册表指南](docs/relay-nodes.md)
 - [性能目标](docs/performance-targets.md)
 - [平台差距说明](docs/teavm-platform-gap.md)
-- [EAG 26 审计](docs/eag26-audit.md)

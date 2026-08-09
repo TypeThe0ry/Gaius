@@ -12,7 +12,9 @@ maven_path() {
 }
 
 config="$root/port/config.json"
-version="$(jq -er '.minecraftVersion' "$config")"
+source "$root/port/scripts/version-profile.sh"
+gaius_load_version_profile "$root"
+version="$GAIUS_MINECRAFT_VERSION"
 teavm_version="$(jq -er '.teaVMVersion' "$config")"
 work="$root/port/work/$version"
 metadata="$work/version.json"
@@ -83,7 +85,7 @@ mkdir -p "$(dirname "$output")" "$root/port/src/main/java" \
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
   <groupId>dev.gaius</groupId>
-  <artifactId>minecraft-1.21.11-browser</artifactId>
+  <artifactId>minecraft-$version-browser</artifactId>
   <version>0.1.0-SNAPSHOT</version>
 
   <properties>

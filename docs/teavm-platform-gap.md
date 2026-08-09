@@ -11,8 +11,9 @@ The official Minecraft Java Edition 1.21.11 client has been:
 4. analyzed to the end of TeaVM's reachable call graph without an out-of-memory
    failure.
 
-The remapped input contains 10,291 classes and Java 21 class files. This is not
-an older Eaglercraft client or a rewritten game implementation.
+The remapped input contains 10,291 classes and Java 21 class files. The
+official client bytecode remains the game implementation rather than being
+replaced with a rewritten game.
 
 ## First blocking layer
 
@@ -31,31 +32,6 @@ missing browser/JDK compatibility surfaces. The largest groups are:
 
 Run `./port/scripts/build-teavm.sh` to regenerate the exact occurrence counts
 and first reachable call sites in `port/target/teavm-gap.md`.
-
-## Public Eagler TeaVM fork result
-
-`Eaglercraft-TeaVM-Fork/eagler-teavm` branch `eagler-r3` was inspected at
-commit `c0bac887ae63dba929ca546f07394eca3bd09b80`. Its class library includes
-basic concurrent collections and atomics, but does not provide the modern
-surfaces above. Substituting that fork alone therefore cannot compile the
-official 1.21.11 client.
-
-## Evidence from the uploaded eag26 artifact
-
-`eag26-single(2).html` contains TeaVM runtime metadata for modern classes such
-as `CompletableFuture`, `ReentrantLock`, `AtomicIntegerArray`, `StackWalker`,
-`FileChannel`, and `MessageDigest`. It also contains explicit browser fallback
-messages including:
-
-- Unsafe is unavailable under TeaVM;
-- dynamic proxies are unavailable under TeaVM;
-- NIO selectors are unavailable pending WebSocket transport;
-- JCA key materialization is unsupported in the browser runtime.
-
-This proves the artifact was compiled with an additional compatibility and
-replacement layer that is not present in the public `eagler-r3` class library.
-The single-file HTML does not contain Java source paths or source maps, so that
-layer cannot be reliably reconstructed as source from the artifact alone.
 
 ## Required implementation direction
 

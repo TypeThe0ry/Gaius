@@ -346,4 +346,3 @@ For project-level licensing and attribution review, see the
 - [RelayNode registry guide](docs/relay-nodes.md)
 - [Performance targets](docs/performance-targets.md)
 - [Platform-gap notes](docs/teavm-platform-gap.md)
-- [EAG 26 audit](docs/eag26-audit.md)

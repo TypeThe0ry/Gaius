@@ -3,7 +3,9 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 config="$root/port/config.json"
-version="$(jq -er '.minecraftVersion' "$config")"
+source "$root/port/scripts/version-profile.sh"
+gaius_load_version_profile "$root"
+version="$GAIUS_MINECRAFT_VERSION"
 teavm_version="$(jq -er '.teaVMVersion' "$config")"
 work="$root/port/work/$version"
 overlay_work="$root/port/work/overlays"
