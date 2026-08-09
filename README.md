@@ -1,5 +1,7 @@
 # Gaius Client
 
+**English** | [简体中文](README.zh-CN.md)
+
 Gaius Client `0.0.1` is an experimental browser port of Minecraft Java
 Edition `1.21.11`. It uses the original Java client path with TeaVM and
 browser-specific platform overlays. It is not a TypeScript recreation of
@@ -83,33 +85,113 @@ browser security policy will behave the same as an HTTP origin.
 - Git LFS tracking for the generated browser release and smoke bundles, so the
   source and runnable release stay in one repository.
 
-## Multiplayer Routing
+## Multiplayer Routing and RelayNode
 
-The browser cannot open a raw TCP connection to an arbitrary Minecraft server.
-When a player enters a server address, Gaius uses this order:
+A browser cannot open the raw TCP socket required by a Minecraft Java server.
+Gaius therefore carries each Minecraft byte stream over WebSocket to either an
+optional server plugin or a long-running RelayNode. The RelayNode opens the TCP
+side of that same stream.
 
-1. Probe the optional same-host Gaius/Paper plugin.
-2. If it is unavailable, discover configured or public RelayNodes from the
-   curated [`relay-nodes.json`](relay-nodes.json) registry and related registry
-   entries.
-3. Ask eligible nodes about reachability and target affinity, then create an
-   isolated temporary WebSocket-to-TCP tunnel for that player.
-4. Close that player's tunnel when they leave. A long-running RelayNode may
-   continue serving other players; the player's TCP session is not shared.
+```mermaid
+flowchart LR
+    C["Gaius in Chrome"]
+    P["Optional Gaius server plugin<br/>WSS endpoint"]
+    G["relay-nodes.json<br/>or live registry"]
+    R["Long-running RelayNode<br/>HTTPS and WSS"]
+    S["Minecraft Java server<br/>TCP"]
 
-The RelayNode can translate browser WebSocket traffic to a public Java server,
-but it cannot bypass the destination server's version, authentication,
-allow-list, proxy, firewall, resource-pack, or online-mode requirements. A
-public node must be able to resolve and reach the target, and no arbitrary
-server is guaranteed to work. Relay operators are responsible for TLS, origin
-policy, destination restrictions, capacity, rate limits, abuse handling, and
-privacy. See the [RelayNode guide](docs/relay-nodes.md) and
-[`apps/bridge/README.md`](apps/bridge/README.md).
+    C -. "probe first" .-> P
+    P --> S
+    C -->|"discover and preflight"| G
+    G -->|"eligible nodes"| C
+    C -->|"one WebSocket per ping or session"| R
+    R -->|"one isolated TCP connection"| S
+```
 
-The optional Paper plugin is installed beside a Java server and can remove the
+### Selection and Handshake
+
+When a player enters a normal Java server address such as
+`play.example.net`, Gaius performs the following steps automatically:
+
+1. Normalize the entered host and port, while retaining the original host for
+   the Minecraft handshake.
+2. Probe the optional same-host Gaius/Paper plugin endpoint. A working plugin
+   provides the shortest route and removes the external RelayNode hop.
+3. If the plugin is absent, read configured and public nodes from the embedded
+   registry snapshot, the curated [`relay-nodes.json`](relay-nodes.json), and
+   any configured live registries. Discovery is bounded and duplicate or cyclic
+   entries are ignored.
+4. Query each candidate's `/relay-node/v1?host=...&port=...` manifest. Gaius
+   ranks nodes using an existing active route to the target, recent
+   reachability, available capacity, and configured priority.
+5. Open `wss://<relay>/tunnel` and send a small `connect` control message with
+   the requested host and port. The RelayNode checks the browser Origin, access
+   token when configured, destination policy, capacity, DNS, and public-network
+   restrictions.
+6. Resolve Minecraft SRV records when applicable, open the target TCP socket,
+   and return `connecting` followed by `connected` with target attestation.
+   Binary WebSocket frames then carry the Minecraft stream in both directions.
+
+If one node cannot reach the target, the client advances to the next eligible
+node. A successful status ping creates short-lived target affinity so the
+subsequent Join action can prefer the same RelayNode without reusing the ping's
+network stream.
+
+### What the Relay Translates
+
+RelayNode is a transport bridge between browser WebSocket frames and a Java
+server TCP stream. It is not a general Minecraft protocol-version translator:
+the client and destination server must still agree on a compatible protocol.
+Most game bytes are forwarded unchanged. Encrypted online-mode traffic remains
+opaque to the RelayNode. For supported unencrypted `1.21.11` flows, narrowly
+scoped keepalive, configuration-reentry, and resource-pack proxy behavior can
+prevent browser reload stalls without turning the node into a game server.
+
+Every server-list status ping, login attempt, reconnect, and player session has
+its own WebSocket and its own TCP socket. Multiple players may select the same
+RelayNode, but their protocol streams are never shared or multiplexed into one
+Minecraft connection.
+
+### Service and Tunnel Lifetime
+
+The RelayNode process is the always-on service. It should run behind an HTTPS
+and WSS reverse proxy and use an operating-system or container restart policy.
+The target-specific tunnel is temporary:
+
+1. Opening a status ping or Join action acquires one WebSocket-scoped tunnel
+   lease and one TCP connection.
+2. Closing the browser channel, leaving the server, failing the connection, or
+   losing the WebSocket immediately cancels the TCP dial or destroys the TCP
+   socket.
+3. After the last player leaves, the RelayNode remains online. Only bounded,
+   expiring reachability metadata may remain for future node selection.
+
+Consequently, `activeConnections: 0` on `/health` means the node is ready but
+currently idle. It does not mean the RelayNode service is stopped. Keeping a
+single permanent TCP connection to a Minecraft target would be incorrect
+because every player connection has independent handshake, authentication,
+compression, encryption, configuration, and play state.
+
+### Security and Compatibility Boundaries
+
+The downloadable `file://` client sends `Origin: null`; a public node must list
+`null` in `GAIUS_ALLOWED_ORIGINS` if it intends to serve portable clients.
+Hosted clients should use explicit HTTPS origins. Public RelayNodes should deny
+private, loopback, link-local, and otherwise restricted destination addresses,
+even when their public host policy accepts arbitrary Minecraft domains.
+
+A RelayNode cannot bypass the destination server's version, authentication,
+allow-list, proxy, firewall, resource-pack, or online-mode requirements. The
+node must be able to resolve and reach the target, and no arbitrary server is
+guaranteed to work. Traffic passes through the selected operator's machine, so
+operators are responsible for TLS, origin and destination policy, capacity,
+rate limits, abuse handling, traffic accounting, logs, and privacy.
+
+The optional Paper plugin is installed beside a Java server and removes the
 external RelayNode hop for that server. It is not required for the normal
-RelayNode route. See the
-[`apps/server-plugin/README.md`](apps/server-plugin/README.md).
+RelayNode route. See the [RelayNode registry guide](docs/relay-nodes.md),
+[`apps/bridge/README.md`](apps/bridge/README.md), and the
+[`apps/server-plugin/README.md`](apps/server-plugin/README.md) plugin guide.
 
 ## Single-Player Architecture
 
