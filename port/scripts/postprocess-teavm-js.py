@@ -14,14 +14,17 @@ semantically closer to Java and prevents those fatal browser exceptions.
 
 from __future__ import annotations
 
+import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 
 LONG_MAX = "9223372036854775807"
 LONG_MIN = "-9223372036854775808"
 PATCH_MARKER = "/*gaius-java-finite-long-cast*/"
+INTEGRATED_SERVER_PUMP_MARKER = "/*gaius-integrated-server-input-coroutine*/"
 
 TO_LONG_PATTERN = re.compile(
     r"(?P<arg>[A-Za-z_$][A-Za-z0-9_$]*)\s*=>\s*"
@@ -38,6 +41,16 @@ SAFE_TO_LONG_PATTERN = re.compile(
     r"\(\s*(?P=arg)\s*!==\s*(?P=arg)\s*\?\s*BigInt\(\s*0\s*\)"
 )
 
+INTEGRATED_SERVER_EXPORT_PATTERN = re.compile(
+    r"(?P<exports>[A-Za-z_$][A-Za-z0-9_$]*)"
+    r"\.pumpIntegratedServerNetworkInput\s*=\s*"
+    r"(?P<function>[A-Za-z_$][A-Za-z0-9_$]*)\s*;"
+)
+
+RUNTIME_THREAD_START_PATTERN = re.compile(
+    r"(?P<runtime>[A-Za-z_$][A-Za-z0-9_$]*)\.\$rt_startThread\s*="
+)
+
 
 def patched_to_long(match: re.Match[str]) -> str:
     arg = match.group("arg")
@@ -48,6 +61,99 @@ def patched_to_long(match: re.Match[str]) -> str:
         f"({arg}>0?BigInt(\"{LONG_MAX}\"):BigInt(\"{LONG_MIN}\")))"
         f":BigInt({arg}>=0?Math.floor({arg}):Math.ceil({arg})))"
     )
+
+
+def integrated_server_pump_shim(exports: str, runtime: str) -> str:
+    return f"""
+{INTEGRATED_SERVER_PUMP_MARKER}
+let $gaiusIntegratedServerPumpRunning = false;
+let $gaiusIntegratedServerPumpPending = false;
+const $gaiusScheduleIntegratedServerPump = typeof queueMicrotask === 'function'
+    ? queueMicrotask
+    : callback => Promise.resolve().then(callback);
+{exports}.__gaiusStartIntegratedServerPump = () => {{
+    const stats = globalThis.__gaiusNetworkStats;
+    if (stats) {{
+        stats.integratedServerPumpRequests =
+            (stats.integratedServerPumpRequests || 0) + 1;
+    }}
+    if ($gaiusIntegratedServerPumpRunning) {{
+        $gaiusIntegratedServerPumpPending = true;
+        if (stats) {{
+            stats.integratedServerPumpCoalesced =
+                (stats.integratedServerPumpCoalesced || 0) + 1;
+        }}
+        return;
+    }}
+    const run = () => {{
+        $gaiusIntegratedServerPumpPending = false;
+        $gaiusIntegratedServerPumpRunning = true;
+        if (stats) {{
+            stats.integratedServerPumpStarts =
+                (stats.integratedServerPumpStarts || 0) + 1;
+        }}
+        try {{
+            {runtime}.$rt_startThread(
+                () => {exports}.pumpIntegratedServerNetworkInput(),
+                result => {{
+                    $gaiusIntegratedServerPumpRunning = false;
+                    if (result instanceof Error) {{
+                        globalThis.__gaiusIntegratedServerPumpError =
+                            String(result.stack || result);
+                        if (stats) {{
+                            stats.integratedServerPumpFailures =
+                                (stats.integratedServerPumpFailures || 0) + 1;
+                        }}
+                    }}
+                    if ($gaiusIntegratedServerPumpPending) {{
+                        $gaiusScheduleIntegratedServerPump(run);
+                    }}
+                }}
+            );
+        }} catch (error) {{
+            $gaiusIntegratedServerPumpRunning = false;
+            globalThis.__gaiusIntegratedServerPumpError =
+                String(error && (error.stack || error) || error);
+            if (stats) {{
+                stats.integratedServerPumpFailures =
+                    (stats.integratedServerPumpFailures || 0) + 1;
+            }}
+        }}
+    }};
+    run();
+}};
+"""
+
+
+def write_text_atomically(target: Path, text: str) -> None:
+    """Replace target only after the complete postprocessed file is durable."""
+    temporary_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_name = temporary.name
+            temporary.write(text)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, target)
+        temporary_name = None
+        directory_fd = os.open(target.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
 
 
 def find_anchored(
@@ -79,33 +185,56 @@ def main(argv: list[str]) -> int:
 
     target = Path(argv[1])
     text = target.read_text(encoding="utf-8")
-    if PATCH_MARKER in text or find_anchored(
+    patched = text
+    messages: list[str] = []
+
+    if PATCH_MARKER in patched or find_anchored(
         SAFE_TO_LONG_PATTERN,
-        text,
+        patched,
         "Number.isFinite",
     ) is not None:
-        print(f"TeaVM JS already contains finite-safe long conversion: {target}")
-        return 0
-
-    match = find_anchored(TO_LONG_PATTERN, text, "BigInt.asIntN")
-
-    count = 1 if match is not None else 0
-    patched = (
-        text[:match.start()] + patched_to_long(match) + text[match.end():]
-        if match is not None
-        else text
-    )
-
-    if count == 0:
-        print(
-            f"TeaVM JS long conversion helper was not found in {target}; "
-            "the generated runtime shape may have changed.",
-            file=sys.stderr,
+        messages.append(f"TeaVM JS already contains finite-safe long conversion: {target}")
+    else:
+        match = find_anchored(TO_LONG_PATTERN, patched, "BigInt.asIntN")
+        if match is None:
+            print(
+                f"TeaVM JS long conversion helper was not found in {target}; "
+                "the generated runtime shape may have changed.",
+                file=sys.stderr,
+            )
+            return 1
+        patched = patched[:match.start()] + patched_to_long(match) + patched[match.end():]
+        messages.append(
+            f"Patched TeaVM JS finite-safe long conversion in {target} (1 occurrence)."
         )
-        return 1
 
-    target.write_text(patched, encoding="utf-8")
-    print(f"Patched TeaVM JS finite-safe long conversion in {target} ({count} occurrence).")
+    worker_export = INTEGRATED_SERVER_EXPORT_PATTERN.search(patched)
+    if worker_export is not None:
+        if INTEGRATED_SERVER_PUMP_MARKER in patched:
+            messages.append(
+                f"TeaVM server Worker already contains coroutine input pump: {target}"
+            )
+        else:
+            runtime = RUNTIME_THREAD_START_PATTERN.search(patched)
+            if runtime is None:
+                print(
+                    f"TeaVM native thread starter was not found in {target}; "
+                    "the generated runtime shape may have changed.",
+                    file=sys.stderr,
+                )
+                return 1
+            insert_at = worker_export.end()
+            shim = integrated_server_pump_shim(
+                worker_export.group("exports"),
+                runtime.group("runtime"),
+            )
+            patched = patched[:insert_at] + shim + patched[insert_at:]
+            messages.append(f"Injected TeaVM server Worker coroutine input pump in {target}.")
+
+    if patched != text:
+        write_text_atomically(target, patched)
+    for message in messages:
+        print(message)
     return 0
 
 

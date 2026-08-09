@@ -74,6 +74,9 @@ or private-target-enabled nodes. `GAIUS_REGISTRY_ALLOW_PRIVATE_NODES=1` and
 trusted private container network. Public RelayNodes should bind publicly with
 `GAIUS_ALLOW_PRIVATE_TARGETS=0`; wildcard destination policy then reaches
 arbitrary public Minecraft servers without exposing private network services.
+Normal RelayNode SIGINT/SIGTERM shutdown sends an authenticated `DELETE` for its
+lease before closing. A crash cannot do that, so the registry still expires
+unrenewed entries by TTL.
 
 The registry does not make an offline or private Java server reachable. The
 selected RelayNode must be able to resolve and connect to the entered host, and

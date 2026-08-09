@@ -16,20 +16,40 @@ rm -f "$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}.map" \
 if [[ "${GAIUS_SKIP_CLIENT_BUILD:-false}" == "true" ]]; then
   client_js="$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}"
   vanilla_asset_pack="$root/port/web/dist/vanilla-assets.pack.gz"
+  expected_client_sha256="${GAIUS_RESUME_CLIENT_SHA256:-}"
   if [[ ! -s "$client_js" || ! -s "$vanilla_asset_pack" ]]; then
     echo "Cannot resume release: client JavaScript or vanilla asset pack is missing" >&2
     echo "Client: $client_js" >&2
     echo "Assets: $vanilla_asset_pack" >&2
     exit 1
   fi
+  if [[ -z "$expected_client_sha256" ]]; then
+    echo "Cannot resume release: GAIUS_RESUME_CLIENT_SHA256 is required" >&2
+    exit 1
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual_client_sha256="$(sha256sum "$client_js" | awk '{print $1}')"
+  else
+    actual_client_sha256="$(shasum -a 256 "$client_js" | awk '{print $1}')"
+  fi
+  if [[ "$actual_client_sha256" != "$expected_client_sha256" ]]; then
+    echo "Cannot resume release: client JavaScript SHA-256 does not match" >&2
+    exit 1
+  fi
+  grep -Fq '[INFO] BUILD SUCCESS' "$root/port/target/teavm-build.log" \
+    || { echo "Cannot resume release: TeaVM log has no BUILD SUCCESS" >&2; exit 1; }
+  grep -aFq 'gaius-java-finite-long-cast' "$client_js" \
+    || { echo "Cannot resume release: finite-long postprocess marker is missing" >&2; exit 1; }
+  grep -aFq 'target-attestation' "$client_js" \
+    || { echo "Cannot resume release: Relay target-attestation guard is missing" >&2; exit 1; }
+  node --check "$client_js"
+  gzip -t "$vanilla_asset_pack"
   echo "Reusing successfully compiled client JavaScript: $client_js"
   "$root/port/scripts/run-python.sh" \
     "$root/port/scripts/analyze-teavm-log.py" \
     "$root/port/target/teavm-build.log" \
     "$root/port/target/teavm-gap.json" \
     "$root/port/target/teavm-gap.md"
-  "$root/port/scripts/run-python.sh" \
-    "$root/port/scripts/postprocess-teavm-js.py" "$client_js"
   "$root/port/scripts/run-python.sh" \
     "$root/port/scripts/postprocess-index-html.py" \
     "$root/port/web/dist/index.html" \
@@ -65,7 +85,7 @@ fi
 rm -f "$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}.map" \
   "$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}.teavmdbg"
 cp "$root/relay-nodes.json" "$root/port/web/dist/relay-nodes.json"
-"$root/port/scripts/compress-dist.sh"
+GAIUS_COMPRESS_EXCLUDE=Gaius.html "$root/port/scripts/compress-dist.sh"
 "$root/port/scripts/run-python.sh" \
   "$root/port/scripts/build-portable-html.py"
 GAIUS_COMPRESS_FILES=Gaius.html "$root/port/scripts/compress-dist.sh"

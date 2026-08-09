@@ -48,7 +48,7 @@ if [[ "${#sources[@]}" -eq 0 ]]; then
 fi
 
 classpath="$upstream"
-for artifact in teavm-interop teavm-jso teavm-jso-apis teavm-core; do
+for artifact in teavm-interop teavm-jso teavm-jso-apis teavm-core teavm-platform; do
   classpath="$classpath:$HOME/.m2/repository/org/teavm/$artifact/$teavm_version/$artifact-$teavm_version.jar"
 done
 classpath="$classpath:$HOME/.m2/repository/com/jcraft/jzlib/1.1.3/jzlib-1.1.3.jar"

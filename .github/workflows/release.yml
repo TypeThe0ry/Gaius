@@ -1,0 +1,102 @@
+name: Publish Gaius release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to publish, for example v0.0.1"
+        required: true
+        default: v0.0.1
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-gaius-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out requested tag with Git LFS
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          lfs: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/bridge/package-lock.json
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: maven
+
+      - name: Validate tag, metadata, LFS, and RelayNode registry
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          test "$RELEASE_TAG" = "v$version" || {
+            echo "error: requested tag $RELEASE_TAG does not equal v$version" >&2
+            exit 1
+          }
+          git lfs install --local
+          ./tools/check-lfs.sh
+          node tools/check-release-metadata.mjs
+          node tools/check-relay-registry.mjs
+
+      - name: Install RelayNode dependencies and run smoke tests
+        run: |
+          npm ci --prefix apps/bridge
+          npm run smoke --prefix apps/bridge
+
+      - name: Build Paper plugin
+        run: ./port/mvnw -B -ntp -f apps/server-plugin/pom.xml clean package
+
+      - name: Stage release assets and checksums
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          plugin="apps/server-plugin/target/gaius-server-plugin-${version}.jar"
+          test -s port/web/dist/Gaius.html
+          test -s "$plugin"
+          rm -rf release-assets
+          mkdir -p release-assets
+          cp port/web/dist/Gaius.html release-assets/Gaius.html
+          cp "$plugin" "release-assets/gaius-server-plugin-${version}.jar"
+          (cd release-assets && sha256sum Gaius.html "gaius-server-plugin-${version}.jar" > SHA256SUMS)
+          printf 'Release %s\n\nPortable Gaius Client 1.21.11 build and optional Paper plugin.\n\nThis is independent software and is not affiliated with Mojang Studios or Microsoft. Review the repository licensing and attribution notes before redistribution.\n' "$RELEASE_TAG" > release-notes.md
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              release-assets/Gaius.html \
+              release-assets/gaius-server-plugin-"$(tr -d '[:space:]' < VERSION)".jar \
+              release-assets/SHA256SUMS \
+              --clobber
+          else
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "Gaius Client 1.21.11 $RELEASE_TAG" \
+              --notes-file release-notes.md \
+              release-assets/Gaius.html \
+              release-assets/gaius-server-plugin-"$(tr -d '[:space:]' < VERSION)".jar \
+              release-assets/SHA256SUMS
+          fi

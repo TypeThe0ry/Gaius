@@ -401,6 +401,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 peakRelayTargetLeases: 0,
                 relayNodeSuccesses: 0,
                 relayNodeFailures: 0,
+                relayTargetAttestationFailures: 0,
                 relayNodes: Object.create(null),
                 connected: 0,
                 closed: 0,
@@ -903,6 +904,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 Number(values.targetActiveConnections)
               ) ? Math.max(0, Number(values.targetActiveConnections)) : 0;
               candidate.targetRecentlyReachable = !!values.targetRecentlyReachable;
+              candidate.targetAttestation = !!values.targetAttestation;
               const record = relayNodeRecord(candidate);
               if (record) {
                 record.lastPreflightAt = Date.now();
@@ -911,6 +913,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 record.targetAffinityMs = candidate.targetAffinityMs;
                 record.targetActiveConnections = candidate.targetActiveConnections;
                 record.targetRecentlyReachable = candidate.targetRecentlyReachable;
+                record.targetAttestation = candidate.targetAttestation;
                 record.lastPreflightError = null;
               }
             }
@@ -995,7 +998,9 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                     Number.isFinite(Number(target.activeConnections))
                     ? Math.max(0, Number(target.activeConnections))
                     : 0,
-                  targetRecentlyReachable: !!(target && target.recentlyReachable)
+                  targetRecentlyReachable: !!(target && target.recentlyReachable),
+                  targetAttestation: Array.isArray(manifest.capabilities) &&
+                    manifest.capabilities.includes('target-attestation')
                 };
                 applyRelayPreflight(candidate, values);
                 state.relayPreflightCache.delete(cacheKey);
@@ -1067,7 +1072,8 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                   targetConnectTimeoutMs: null,
                   targetAffinityMs: null,
                   targetActiveConnections: 0,
-                  targetRecentlyReachable: false
+                  targetRecentlyReachable: false,
+                  targetAttestation: false
                 };
                 nodes[candidate.url] = record;
               }
@@ -1102,6 +1108,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 ? Math.max(100, Math.min(60000, configured))
                 : 10000;
               return Math.max(15000, Math.min(65000, perTarget * 2 + 5000));
+            }
+            function directPluginTunnelConnectTimeout(candidate) {
+              const configured = Number(candidate && candidate.targetConnectTimeoutMs);
+              if (!Number.isFinite(configured)) return 800;
+              return Math.max(1000, Math.min(61000, configured + 1000));
             }
             function localSession(host) {
               const match = /^(?:client|server)-([a-f0-9]{32})\\.gaius-local$/.exec(host);
@@ -1180,9 +1191,13 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               if (entry.inboundBytes >= inboundPauseBytes) {
                 setInboundPaused(entry, true);
               }
+              const integratedServerPump =
+                globalThis.__gaiusStartIntegratedServerPump;
               const integratedServerSignal =
                 globalThis.__gaiusIntegratedServerNetworkSignal;
-              if (typeof integratedServerSignal === 'function') {
+              if (typeof integratedServerPump === 'function') {
+                integratedServerPump();
+              } else if (typeof integratedServerSignal === 'function') {
                 integratedServerSignal();
               }
               if (typeof state.inboundPump === 'function') {
@@ -1369,22 +1384,43 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 if (typeof event.data === 'string') {
                   try {
                     const message = JSON.parse(event.data);
-                    if (message && message.type === 'connecting' && !candidate.direct) {
+                    if (message && message.type === 'connecting') {
                       const advertisedTimeout = Number(message.targetConnectTimeoutMs);
                       if (Number.isFinite(advertisedTimeout)) {
                         candidate.targetConnectTimeoutMs = Math.max(
                           100,
                           Math.min(60000, advertisedTimeout)
                         );
-                        const record = relayNodeRecord(candidate);
+                        const record = candidate.direct ? null : relayNodeRecord(candidate);
                         if (record) {
                           record.targetConnectTimeoutMs = candidate.targetConnectTimeoutMs;
                         }
                       }
-                      armCandidateTimeout(relayTunnelConnectTimeout(candidate));
+                      armCandidateTimeout(candidate.direct
+                        ? directPluginTunnelConnectTimeout(candidate)
+                        : relayTunnelConnectTimeout(candidate));
                       return;
                     }
                     if (message && message.type === 'connected') {
+                      const attestationPresent = typeof message.host === 'string' &&
+                        Number.isInteger(Number(message.port));
+                      const attestationMatches = attestationPresent &&
+                        normalizedTargetKey(message.host, Number(message.port)) === entry.targetKey;
+                      if ((!candidate.direct && !attestationPresent) ||
+                          (attestationPresent && !attestationMatches)) {
+                        clearTimeout(candidateTimeout);
+                        state.stats.relayTargetAttestationFailures++;
+                        try { ws.close(1008, 'RelayNode target attestation mismatch'); }
+                        catch (ignored) {}
+                        if (candidate.direct) {
+                          rememberDirectPluginUnavailable(entry, candidate);
+                        } else {
+                          state.stats.relayFailovers++;
+                          recordRelayNodeFailure(candidate, 'RelayNode target attestation mismatch');
+                        }
+                        openRemoteCandidate(entry);
+                        return;
+                      }
                       clearTimeout(candidateTimeout);
                       entry.connected = true;
                       if (candidate.direct) {

@@ -11,7 +11,7 @@ Build with Java 21:
 ../../port/mvnw -f pom.xml package
 ```
 
-Copy `target/gaius-server-plugin-0.1.0-SNAPSHOT.jar` into the Paper server's
+Copy `target/gaius-server-plugin-0.0.1.jar` into the Paper server's
 `plugins/` directory. The default WebSocket endpoint is
 `ws://server.example:8081/tunnel`. Use a TLS reverse proxy and `wss://` when the
 browser page is served over HTTPS. Set `access-token` and restrict
@@ -20,6 +20,13 @@ browser page is served over HTTPS. Set `access-token` and restrict
 Configure the browser launcher with the plugin endpoint as its Bridge URL. The
 wire protocol is identical to `apps/bridge/dist/main.js`, so the browser can
 fall back to an external relay when the plugin is absent.
+
+After accepting a `connect` control message, the plugin immediately returns a
+`connecting` message with `targetConnectTimeoutMs`. This lets the browser keep
+the direct route alive for the configured TCP budget without making an absent
+plugin delay RelayNode fallback. Closing the browser WebSocket also closes a
+TCP socket that is still connecting, so a failed direct probe cannot leave a
+background connection attempt behind.
 
 `proxy-keepalives` is enabled by default. It replies only to the exact
 unencrypted 1.21 keepalive frame while the browser is busy applying a server

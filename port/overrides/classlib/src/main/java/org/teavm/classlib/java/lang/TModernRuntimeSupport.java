@@ -5,7 +5,11 @@ import java.time.Duration;
 import org.teavm.classlib.java.util.TCollections;
 import org.teavm.classlib.java.util.TMap;
 import org.teavm.classlib.java.lang.reflect.TType;
+import org.teavm.interop.Async;
+import org.teavm.interop.AsyncCallback;
 import org.teavm.jso.JSBody;
+import org.teavm.platform.Platform;
+import org.teavm.platform.PlatformRunnable;
 
 public final class TModernRuntimeSupport {
     private TModernRuntimeSupport() {
@@ -88,6 +92,27 @@ public final class TModernRuntimeSupport {
 
     public static void sleep(Duration duration) throws TInterruptedException {
         TThread.sleep(duration.toMillis());
+    }
+
+    /**
+     * Suspends only the current TeaVM continuation without installing a Thread interrupt handler.
+     * Browser world generation can have several continuations sharing one emulated Java thread;
+     * using TThread.sleep there lets an unrelated wake-up cancel the wrong continuation.
+     */
+    @Async
+    public static native void yieldToEventLoop(int delayMillis);
+
+    private static void yieldToEventLoop(int delayMillis, AsyncCallback<Void> callback) {
+        TThread thread = TThread.currentThread();
+        PlatformRunnable resume = () -> {
+            TThread.setCurrentThread(thread);
+            callback.complete(null);
+        };
+        if (delayMillis > 0) {
+            Platform.schedule(resume, delayMillis);
+        } else {
+            Platform.postpone(resume);
+        }
     }
 
     public static TType genericSuperclass(TClass<?> type) {

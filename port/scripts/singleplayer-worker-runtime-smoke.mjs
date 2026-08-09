@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import {createHash} from "node:crypto";
 import {Session as InspectorSession} from "node:inspector";
+import {performance} from "node:perf_hooks";
 import vm from "node:vm";
 import {inflateSync} from "node:zlib";
 import {fileURLToPath, pathToFileURL} from "node:url";
@@ -15,6 +16,7 @@ import {
 
 const rootDirectory = fileURLToPath(new URL("../../", import.meta.url));
 const bootstrapPath = rootDirectory + "port/web/dist/singleplayer-server-worker.js";
+const itemEntityTypeId = 71;
 
 if (isMainThread) {
   const smokeStartedAt = Date.now();
@@ -31,6 +33,9 @@ if (isMainThread) {
   const blockDropTimeoutMs = Number(
     process.env.GAIUS_SMOKE_BLOCK_DROP_TIMEOUT_MS || "5000",
   );
+  const blockReboundWindowMs = Number(
+    process.env.GAIUS_SMOKE_BLOCK_REBOUND_WINDOW_MS || "1000",
+  );
   const blockActionHoldMs = Number(
     process.env.GAIUS_SMOKE_BLOCK_ACTION_HOLD_MS ||
       (requireBlockDrop ? "750" : "8000"),
@@ -44,6 +49,11 @@ if (isMainThread) {
   const maximumGameplayStallMs = Number(
     process.env.GAIUS_SMOKE_MAX_GAMEPLAY_STALL_MS || "500",
   );
+  const distanceRampIntervalMillis = process.env.GAIUS_SMOKE_DISTANCE_RAMP_MS === undefined
+    ? undefined
+    : Number(process.env.GAIUS_SMOKE_DISTANCE_RAMP_MS);
+  const targetRenderDistance = Number(process.env.GAIUS_SMOKE_RENDER_DISTANCE || "7");
+  const targetSimulationDistance = Number(process.env.GAIUS_SMOKE_SIMULATION_DISTANCE || "3");
   const cpuProfilePhase = process.env.GAIUS_SMOKE_CPU_PROFILE_PHASE || "";
   const cpuProfilePath = process.env.GAIUS_SMOKE_CPU_PROFILE_PATH ||
     (rootDirectory + "port/target/singleplayer-worker-" +
@@ -53,6 +63,9 @@ if (isMainThread) {
   }
   if (!Number.isFinite(blockDropTimeoutMs) || blockDropTimeoutMs <= 0) {
     throw new Error("GAIUS_SMOKE_BLOCK_DROP_TIMEOUT_MS must be a positive number");
+  }
+  if (!Number.isFinite(blockReboundWindowMs) || blockReboundWindowMs <= 0) {
+    throw new Error("GAIUS_SMOKE_BLOCK_REBOUND_WINDOW_MS must be a positive number");
   }
   if (!Number.isFinite(roamTimeoutMs) || roamTimeoutMs <= 0) {
     throw new Error("GAIUS_SMOKE_ROAM_TIMEOUT_MS must be a positive number");
@@ -69,14 +82,41 @@ if (isMainThread) {
   if (!Number.isFinite(chunkBatchDesiredRate) || chunkBatchDesiredRate <= 0) {
     throw new Error("GAIUS_SMOKE_CHUNK_BATCH_DESIRED_RATE must be a positive number");
   }
+  if (distanceRampIntervalMillis !== undefined &&
+      (!Number.isFinite(distanceRampIntervalMillis) ||
+        distanceRampIntervalMillis < 100 || distanceRampIntervalMillis > 2000)) {
+    throw new Error("GAIUS_SMOKE_DISTANCE_RAMP_MS must be between 100 and 2000");
+  }
+  if (!Number.isInteger(targetRenderDistance) || targetRenderDistance < 2 ||
+      targetRenderDistance > 32 || !Number.isInteger(targetSimulationDistance) ||
+      targetSimulationDistance < 2 || targetSimulationDistance > 32) {
+    throw new Error("Smoke render and simulation distances must be integers between 2 and 32");
+  }
+  const configuredDistanceRampIntervalMillis = distanceRampIntervalMillis === undefined
+    ? 750
+    : Math.round(distanceRampIntervalMillis);
   const worker = new Worker(new URL(import.meta.url), {workerData: {runtime: true}});
   const {port1, port2} = new MessageChannel();
   const sessionId = "0123456789abcdef0123456789abcdef";
   const profileId = "00000000000040008000000000000002";
-  const expectedStagedDistances = "1/1->7/3";
-  const expectedDistanceRamp = ["2/1", "3/2", "4/3", "5/3", "6/3"];
-  const expectedDistances = "7/3";
+  const expectedStagedDistances = `1/1->${targetRenderDistance}/${targetSimulationDistance}`;
+  const expectedTransitions = [];
+  let expectedViewDistance = Math.min(targetRenderDistance, 2);
+  let expectedSimulationDistance = 1;
+  expectedTransitions.push(`${expectedViewDistance}/${expectedSimulationDistance}`);
+  while (expectedViewDistance < targetRenderDistance ||
+      expectedSimulationDistance < targetSimulationDistance) {
+    expectedViewDistance = Math.min(targetRenderDistance, expectedViewDistance + 1);
+    expectedSimulationDistance = Math.min(
+      targetSimulationDistance,
+      expectedSimulationDistance + 1,
+    );
+    expectedTransitions.push(`${expectedViewDistance}/${expectedSimulationDistance}`);
+  }
+  const expectedDistances = expectedTransitions.at(-1);
+  const expectedDistanceRamp = expectedTransitions.slice(0, -1);
   const distanceRamp = [];
+  const distanceTransitionTimeline = [];
   const protocol = createProtocolClient(port2, sessionId, profileId, {
     skipMining,
     roamSteps,
@@ -85,6 +125,7 @@ if (isMainThread) {
     roamSpectator,
     requireBlockDrop,
     blockDropTimeoutMs,
+    blockReboundWindowMs,
     blockActionHoldMs,
     chunkBatchAckDelayMs,
     chunkBatchDesiredRate,
@@ -215,10 +256,16 @@ if (isMainThread) {
       detail: error.stack || String(error),
       chunkPriorityStats: latestChunkPriorityStats,
       networkStats: latestNetworkStats,
+      distanceRampIntervalMillis: configuredDistanceRampIntervalMillis,
       ...protocol.snapshot(),
     });
+    const profileWasActive = cpuProfileActive;
+    if (profileWasActive) {
+      worker.postMessage({type: "node-cpu-profile-stop"});
+      cpuProfileActive = false;
+    }
     clearTimeout(timeout);
-    setTimeout(() => finish(1), 2000);
+    setTimeout(() => finish(1), profileWasActive ? 5000 : 2000);
   });
   worker.on("message", (message) => {
     if (message && message.type === "node-event-loop-pong") {
@@ -255,6 +302,11 @@ if (isMainThread) {
     if (message && message.type === "node-console-error") {
       clearTimeout(timeout);
       finish(1);
+    } else if (message && (message.type === "network-pump-error" ||
+        message.type === "network-pump-schedule-error" ||
+        message.type === "chunk-batch-ack-without-send")) {
+      clearTimeout(timeout);
+      finish(1);
     } else if (message && message.type === "node-cpu-profile-written") {
       cpuProfileWritten = true;
     } else if (message && message.type === "node-idb-put" && message.path.endsWith(".mca")) {
@@ -266,8 +318,8 @@ if (isMainThread) {
       setTimeout(() => {
         worker.postMessage({
           type: "distances",
-          renderDistance: 7,
-          simulationDistance: 3,
+          renderDistance: targetRenderDistance,
+          simulationDistance: targetSimulationDistance,
         });
       }, 1000);
     } else if (message && message.type === "server-distances-staged" &&
@@ -278,11 +330,59 @@ if (isMainThread) {
     } else if (message && message.type === "server-distances-ramping") {
       workerPhase = "distance-" + message.detail;
       distanceRamp.push(message.detail);
+      distanceTransitionTimeline.push({
+        detail: message.detail,
+        receivedAt: Date.now(),
+        receivedAtMs: performance.now(),
+        ackCountAtTransition: protocol.chunkBatchAckCount,
+        chunkPacketCountAtTransition: protocol.chunkPackets,
+      });
     } else if (message && message.type === "server-distances" &&
         message.detail === expectedDistances && !configuredDistanceReady) {
       workerPhase = "distance-" + message.detail;
+      distanceTransitionTimeline.push({
+        detail: message.detail,
+        receivedAt: Date.now(),
+        receivedAtMs: performance.now(),
+        ackCountAtTransition: protocol.chunkBatchAckCount,
+        chunkPacketCountAtTransition: protocol.chunkPackets,
+      });
       if (JSON.stringify(distanceRamp) !== JSON.stringify(expectedDistanceRamp)) {
         events.push({type: "distance-ramp-mismatch", expected: expectedDistanceRamp, actual: distanceRamp});
+        clearTimeout(timeout);
+        finish(1);
+        return;
+      }
+      const actualTransitions = distanceTransitionTimeline.map((entry) => entry.detail);
+      const configuredInterval = configuredDistanceRampIntervalMillis;
+      const ackCausal = distanceTransitionTimeline.every((entry, index) =>
+        entry.ackCountAtTransition > (index === 0
+          ? 0
+          : distanceTransitionTimeline[index - 1].ackCountAtTransition) &&
+        protocol.chunkBatchAckTimeline[entry.ackCountAtTransition - 1]?.sentAtMs <=
+          entry.receivedAtMs);
+      const intervalValid = distanceTransitionTimeline.every((entry, index) =>
+        index === 0 || entry.receivedAtMs - distanceTransitionTimeline[index - 1].receivedAtMs >=
+          configuredInterval - 50);
+      const ringBackpressureValid = distanceTransitionTimeline.every((entry) => {
+        const nextViewDistance = Number(String(entry.detail).split("/", 1)[0]);
+        if (nextViewDistance <= 2) return entry.chunkPacketCountAtTransition >= 1;
+        const previousDiameter = (nextViewDistance - 1) * 2 - 1;
+        return entry.chunkPacketCountAtTransition >= previousDiameter * previousDiameter;
+      });
+      if (JSON.stringify(actualTransitions) !== JSON.stringify(expectedTransitions) ||
+          !ackCausal || !intervalValid || !ringBackpressureValid) {
+        events.push({
+          type: "distance-ramp-causality-mismatch",
+          expectedTransitions,
+          actualTransitions,
+          configuredInterval,
+          ackCausal,
+          intervalValid,
+          ringBackpressureValid,
+          distanceTransitionTimeline,
+          chunkBatchAckTimeline: protocol.chunkBatchAckTimeline,
+        });
         clearTimeout(timeout);
         finish(1);
         return;
@@ -294,6 +394,8 @@ if (isMainThread) {
         distanceSyncReady && (stopAtFirstChunk || configuredDistanceReady)) {
       events.push({
         type: "protocol-final",
+        distanceRampIntervalMillis: configuredDistanceRampIntervalMillis,
+        distanceTransitionTimeline: distanceTransitionTimeline.slice(),
         ...protocol.snapshot(),
         chunkPriorityStats: latestChunkPriorityStats,
         networkStats: latestNetworkStats,
@@ -327,6 +429,17 @@ if (isMainThread) {
           type: "worldgen-event-loop-stall",
           maximumGameplayStallMs,
           gameplayLatency,
+        });
+        clearTimeout(timeout);
+        finish(1);
+        return;
+      }
+      if (!latestNetworkStats || latestNetworkStats.errors !== 0 ||
+          latestNetworkStats.inboundQueuedBytes !== 0 ||
+          (latestNetworkStats.integratedServerPumpFailures || 0) !== 0) {
+        events.push({
+          type: "network-state-mismatch",
+          networkStats: latestNetworkStats,
         });
         clearTimeout(timeout);
         finish(1);
@@ -379,6 +492,9 @@ if (isMainThread) {
     sessionId,
     renderDistance: 8,
     simulationDistance: 5,
+    distanceRampIntervalMillis: distanceRampIntervalMillis === undefined
+      ? undefined
+      : configuredDistanceRampIntervalMillis,
     port: port1,
   }, [port1]);
 } else if (workerData && workerData.runtime) {
@@ -531,6 +647,7 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
     blockActionProbeCount: 0,
     blockActionProbeTimer: undefined,
     blockActionStopTimer: undefined,
+    blockActionAckTimer: undefined,
     blockActionRetryTimer: undefined,
     loginStartedAt: undefined,
     compressionAt: undefined,
@@ -546,7 +663,9 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
     playToFirstChunkMs: undefined,
     miningStartedAt: undefined,
     targetAirAt: undefined,
+    targetStableAt: undefined,
     targetBlockStateId: undefined,
+    blockActionStopSequence: undefined,
     blockActionAcks: 0,
     blockActionAckSequences: [],
     blockActionSentAt: new Map(),
@@ -562,10 +681,12 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
     blockDropAt: undefined,
     blockDropLatencyMs: undefined,
     blockDropTimer: undefined,
+    blockReboundTimer: undefined,
     persistenceMarkerScheduled: false,
     persistenceMarkerCompleted: false,
     chunkBatchAckSent: false,
     chunkBatchAckCount: 0,
+    chunkBatchAckTimeline: [],
     lastAckedChunkPackets: 0,
     chunkBatchAckTimer: undefined,
     uniqueChunkPositions: new Set(),
@@ -633,6 +754,14 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
 
   function closeTransport() {
     clearTimeout(state.roamHeartbeatTimer);
+    clearTimeout(state.roamSettleTimer);
+    clearTimeout(state.roamStepTimer);
+    clearTimeout(state.blockActionProbeTimer);
+    clearTimeout(state.blockActionStopTimer);
+    clearTimeout(state.blockActionAckTimer);
+    clearTimeout(state.blockActionRetryTimer);
+    clearTimeout(state.blockDropTimer);
+    clearTimeout(state.blockReboundTimer);
     try {
       port.postMessage({type: "close"});
     } finally {
@@ -825,22 +954,43 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
           state.blockActionAckLatenciesMs.push(latency);
           state.blockActionMaxAckLatencyMs = Math.max(state.blockActionMaxAckLatencyMs, latency);
         }
+        if (sequence.value === state.blockActionStopSequence) {
+          clearTimeout(state.blockActionAckTimer);
+          completeBlockAction();
+        }
       } else if (packetId.value === 8) {
         const update = decodeBlockUpdate(payload);
         if (state.blockUpdates.length < 128) {
           state.blockUpdates.push({...update, receivedAt: Date.now()});
         }
-        if (state.blockActionTarget &&
-            sameBlockPos(update, state.blockActionTarget) && update.stateId === 0) {
-          state.targetAirUpdates++;
-          state.targetAirAt ??= Date.now();
-          if (state.blockDropAt !== undefined && state.blockDropLatencyMs === undefined) {
-            state.blockDropLatencyMs = Math.max(0, state.blockDropAt - state.targetAirAt);
+        const matchesCurrentTarget = state.blockActionTarget &&
+          sameBlockPos(update, state.blockActionTarget);
+        if (matchesCurrentTarget) {
+          if (update.stateId === 0) {
+            state.targetAirUpdates++;
+            if (state.targetAirAt === undefined) {
+              state.targetAirAt = Date.now();
+              state.blockReboundTimer = setTimeout(() => {
+                state.targetStableAt = Date.now();
+                completeBlockAction();
+              }, options.blockReboundWindowMs);
+            }
+            if (state.blockDropAt !== undefined && state.blockDropLatencyMs === undefined) {
+              state.blockDropLatencyMs = Math.max(0, state.blockDropAt - state.targetAirAt);
+            }
+            maybeRecordPriorBlockDrop();
+            completeBlockAction();
+          } else if (state.targetAirAt !== undefined) {
+            ready.reject(new Error(
+              `Broken block ${update.x},${update.y},${update.z} rebounded to state ` +
+              `${update.stateId} within ${options.blockReboundWindowMs} ms`
+            ));
           }
-          maybeRecordPriorBlockDrop();
-          completeBlockAction();
-        } else if (state.blockActionTarget &&
-            !state.blockActionCandidateConfirmed && update.stateId !== 0 &&
+        }
+        // Under world-generation load the authoritative update can arrive just after the
+        // 750 ms probe timer advances. It still proves that a previously probed target is
+        // solid and reachable, so do not discard it only because another probe is current.
+        if (update.stateId !== 0 && !state.blockActionCandidateConfirmed &&
             state.blockActionProbedTargets.some((target) => sameBlockPos(update, target))) {
           startConfirmedBlockAction(update);
         }
@@ -1064,7 +1214,13 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
     state.miningStartedAt = Date.now();
     sendPlayerAction(0);
     state.blockActionStopTimer = setTimeout(() => {
-      sendPlayerAction(2);
+      state.blockActionStopSequence = sendPlayerAction(2);
+      clearTimeout(state.blockActionAckTimer);
+      state.blockActionAckTimer = setTimeout(() => {
+        ready.reject(new Error(
+          `Block-action STOP sequence ${state.blockActionStopSequence} was not acknowledged`
+        ));
+      }, 5000);
       state.blockActionRetryTimer = setTimeout(() => {
         if (state.targetAirUpdates > 0) {
           return;
@@ -1089,10 +1245,15 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
       ]),
       state.compressionThreshold
     ));
+    return sequence;
   }
 
   function completeBlockAction() {
-    if (state.targetAirUpdates < 1) {
+    if (state.targetAirUpdates < 1 || state.targetStableAt === undefined) {
+      return;
+    }
+    if (state.blockActionStopSequence === undefined ||
+        !state.blockActionAckSequences.includes(state.blockActionStopSequence)) {
       return;
     }
     if (options.requireBlockDrop && state.blockDropEntity === undefined) {
@@ -1129,8 +1290,10 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
     state.miningCompleted = true;
     clearTimeout(state.blockActionProbeTimer);
     clearTimeout(state.blockActionStopTimer);
+    clearTimeout(state.blockActionAckTimer);
     clearTimeout(state.blockActionRetryTimer);
     clearTimeout(state.blockDropTimer);
+    clearTimeout(state.blockReboundTimer);
     maybeResolveReady();
   }
 
@@ -1146,7 +1309,11 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
     }
     if (options.requireBlockDrop &&
         (state.blockActionProbeCount < 1 || state.targetAirUpdates < 1 ||
-          state.blockDropEntity === undefined || state.blockDropLatencyMs === undefined)) {
+          state.targetStableAt === undefined ||
+          !state.blockActionAckSequences.includes(state.blockActionStopSequence) ||
+          state.blockDropEntity === undefined ||
+          state.blockDropEntity.entityTypeId !== itemEntityTypeId ||
+          state.blockDropLatencyMs === undefined)) {
       ready.reject(new Error("Block-drop smoke completed without a confirmed dropped entity"));
       return;
     }
@@ -1162,7 +1329,8 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
       if (entity.receivedAt < state.miningStartedAt) {
         break;
       }
-      if (isNearBlock(entity, state.blockActionTarget)) {
+      if (entity.entityTypeId === itemEntityTypeId &&
+          isNearBlock(entity, state.blockActionTarget)) {
         recordBlockDrop(entity);
         return;
       }
@@ -1172,6 +1340,7 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
   function maybeRecordBlockDrop(entity) {
     if (state.blockDropEntity !== undefined || !state.blockActionTarget ||
         state.miningStartedAt === undefined || entity.receivedAt < state.miningStartedAt ||
+        entity.entityTypeId !== itemEntityTypeId ||
         !isNearBlock(entity, state.blockActionTarget)) {
       return;
     }
@@ -1200,19 +1369,27 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
       if (state.chunkPackets <= state.lastAckedChunkPackets) {
         return;
       }
-      state.lastAckedChunkPackets = state.chunkPackets;
-      state.chunkBatchAckSent = true;
-      state.chunkBatchAckCount++;
+      const ackedChunkPackets = state.chunkPackets;
+      state.lastAckedChunkPackets = ackedChunkPackets;
       send(encodePacket(
         10,
         encodeFloat(options.chunkBatchDesiredRate),
         state.compressionThreshold
-      ));
+      ), () => {
+        state.chunkBatchAckSent = true;
+        state.chunkBatchAckCount++;
+        state.chunkBatchAckTimeline.push({
+          ackIndex: state.chunkBatchAckCount,
+          chunkPacketCount: ackedChunkPackets,
+          sentAt: Date.now(),
+          sentAtMs: performance.now(),
+        });
+      });
     }, options.chunkBatchAckDelayMs);
   }
 
-  function send(bytes) {
-    pendingSends.push(bytes);
+  function send(bytes, onSent) {
+    pendingSends.push({bytes, onSent});
     flushSends();
   }
 
@@ -1238,6 +1415,9 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
       blockActionProbeCount: state.blockActionProbeCount,
       blockActionLatencyMs: state.blockActionLatencyMs,
       blockActionHoldMs: options.blockActionHoldMs,
+      blockActionStopSequence: state.blockActionStopSequence,
+      blockReboundWindowMs: options.blockReboundWindowMs,
+      blockStable: state.targetStableAt !== undefined,
       miningCompleted: state.miningCompleted,
       targetAirUpdates: state.targetAirUpdates,
       targetBlockStateId: state.targetBlockStateId,
@@ -1267,6 +1447,7 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
       playTimeline: state.playTimeline.slice(),
       chunkBatchAckSent: state.chunkBatchAckSent,
       chunkBatchAckCount: state.chunkBatchAckCount,
+      chunkBatchAckTimeline: state.chunkBatchAckTimeline.slice(),
       chunkBatchAckDelayMs: options.chunkBatchAckDelayMs,
       chunkBatchDesiredRate: options.chunkBatchDesiredRate,
       receivedPacketIds: state.receivedPacketIds,
@@ -1275,9 +1456,10 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
 
   function flushSends() {
     while (!remotePaused && pendingSends.length > 0) {
-      const bytes = pendingSends.shift();
+      const {bytes, onSent} = pendingSends.shift();
       const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
       port.postMessage(buffer, [buffer]);
+      onSent?.();
     }
   }
 

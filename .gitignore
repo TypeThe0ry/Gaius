@@ -19,6 +19,8 @@ apps/server-plugin/target/
 port/overrides/libraries/*
 !port/overrides/libraries/lwjgl-openal/
 !port/overrides/libraries/lwjgl-openal/**
+!port/overrides/libraries/lwjgl-opengl/
+!port/overrides/libraries/lwjgl-opengl/**
 !port/overrides/libraries/lwjgl-glfw/
 !port/overrides/libraries/lwjgl-glfw/**
 !port/overrides/libraries/lwjgl-stb/
@@ -41,6 +43,8 @@ node_modules/
 .vscode/
 *.iml
 *.log
+*.log.gz
+logs/
 *.tsbuildinfo
 coverage/
 .coverage

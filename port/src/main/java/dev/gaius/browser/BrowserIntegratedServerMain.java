@@ -7,9 +7,12 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.concurrent.locks.LockSupport;
 import net.minecraft.server.Main;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.TickTask;
 import net.minecraft.server.players.PlayerList;
 import org.teavm.jso.JSBody;
 import org.teavm.jso.JSExport;
@@ -18,7 +21,7 @@ import org.teavm.jso.JSExport;
 public final class BrowserIntegratedServerMain {
     private static final int INITIAL_VIEW_DISTANCE = 1;
     private static final int INITIAL_SIMULATION_DISTANCE = 1;
-    private static final long DISTANCE_RAMP_INTERVAL_MILLIS = 750L;
+    private static final long DEFAULT_DISTANCE_RAMP_INTERVAL_MILLIS = 750L;
     private static MinecraftServer server;
     private static Thread serverThread;
     private static boolean serverThreadExited = true;
@@ -30,6 +33,11 @@ public final class BrowserIntegratedServerMain {
     private static boolean distanceAdvancePending;
     private static long nextDistanceAdvanceAtMillis;
     private static boolean urgentPacketPumpActive;
+    private static boolean networkInputTaskScheduled;
+    private static final Deque<Integer> sentChunkBatches = new ArrayDeque<>();
+    private static int acknowledgedChunkCount;
+    private static final Runnable NETWORK_INPUT_TASK =
+            BrowserIntegratedServerMain::runScheduledNetworkInput;
 
     private static String serverProperties() {
         int viewDistance = clampDistance(workerViewDistance(), 6);
@@ -94,6 +102,9 @@ public final class BrowserIntegratedServerMain {
         distanceAdvancePending = false;
         nextDistanceAdvanceAtMillis = 0L;
         urgentPacketPumpActive = false;
+        networkInputTaskScheduled = false;
+        sentChunkBatches.clear();
+        acknowledgedChunkCount = 0;
         configurePlayerList(minecraftServer.getPlayerList());
         setIntegratedServerDistances(workerViewDistance(), workerSimulationDistance());
         BrowserStartupScheduler.complete();
@@ -159,22 +170,38 @@ public final class BrowserIntegratedServerMain {
      * Advances one distance ring after the client has consumed the preceding chunk batch.
      * This keeps unexplored-area generation behind the browser client's real packet throughput.
      */
+    public static void recordChunkBatchSent(int batchSize) {
+        if (isWorkerRuntime() && batchSize > 0) {
+            sentChunkBatches.addLast(batchSize);
+        }
+    }
+
     public static void acknowledgeChunkBatch() {
         if (!isWorkerRuntime()) {
             return;
         }
+        Integer batchSize = sentChunkBatches.pollFirst();
+        if (batchSize == null) {
+            reportRuntimeEvent("chunk-batch-ack-without-send", "queued=0");
+            return;
+        }
+        acknowledgedChunkCount += batchSize;
         if (!configuredDistancesActive) {
             configuredDistancesActive = true;
             activeViewDistance = Math.min(configuredViewDistance, INITIAL_VIEW_DISTANCE + 1);
             activeSimulationDistance = INITIAL_SIMULATION_DISTANCE;
             nextDistanceAdvanceAtMillis = System.currentTimeMillis()
-                    + DISTANCE_RAMP_INTERVAL_MILLIS;
+                    + distanceRampIntervalMillis();
             distanceAdvancePending = false;
             applyActiveDistances();
             return;
         }
         if (distancesFullyApplied()) {
             distanceAdvancePending = false;
+            return;
+        }
+        if (!activeViewDistanceAcknowledged()) {
+            distanceAdvancePending = true;
             return;
         }
         long now = System.currentTimeMillis();
@@ -184,12 +211,15 @@ public final class BrowserIntegratedServerMain {
         }
         distanceAdvancePending = false;
         advanceConfiguredDistances();
-        nextDistanceAdvanceAtMillis = now + DISTANCE_RAMP_INTERVAL_MILLIS;
+        nextDistanceAdvanceAtMillis = now + distanceRampIntervalMillis();
     }
 
     /** Applies a deferred distance ring only after the preceding ring has had CPU time. */
     public static void tickIntegratedServerDistances() {
         if (!isWorkerRuntime() || !distanceAdvancePending || distancesFullyApplied()) {
+            return;
+        }
+        if (!activeViewDistanceAcknowledged()) {
             return;
         }
         long now = System.currentTimeMillis();
@@ -198,7 +228,7 @@ public final class BrowserIntegratedServerMain {
         }
         distanceAdvancePending = false;
         advanceConfiguredDistances();
-        nextDistanceAdvanceAtMillis = now + DISTANCE_RAMP_INTERVAL_MILLIS;
+        nextDistanceAdvanceAtMillis = now + distanceRampIntervalMillis();
     }
 
     private static void advanceConfiguredDistances() {
@@ -222,6 +252,24 @@ public final class BrowserIntegratedServerMain {
                 && activeSimulationDistance >= configuredSimulationDistance;
     }
 
+    private static boolean activeViewDistanceAcknowledged() {
+        int diameter = Math.max(1, activeViewDistance * 2 - 1);
+        return acknowledgedChunkCount >= diameter * diameter;
+    }
+
+    @JSBody(params = "fallback", script = """
+            const configured = Number(globalThis.__gaiusDistanceRampIntervalMillis);
+            return Number.isFinite(configured) && configured >= 100 && configured <= 2000
+              ? Math.round(configured)
+              : fallback;
+            """)
+    private static native double configuredDistanceRampIntervalMillis(double fallback);
+
+    private static long distanceRampIntervalMillis() {
+        return (long) configuredDistanceRampIntervalMillis(
+                DEFAULT_DISTANCE_RAMP_INTERVAL_MILLIS);
+    }
+
     public static boolean isWorkerServer() {
         return isWorkerRuntime();
     }
@@ -229,7 +277,8 @@ public final class BrowserIntegratedServerMain {
     /** Processes browser actions between synchronous worldgen slices on the server thread. */
     public static void pumpUrgentPackets() {
         MinecraftServer current = server;
-        if (!isWorkerRuntime() || current == null || urgentPacketPumpActive) {
+        if (!isWorkerRuntime() || current == null || Thread.currentThread() != serverThread
+                || urgentPacketPumpActive) {
             return;
         }
         urgentPacketPumpActive = true;
@@ -251,10 +300,42 @@ public final class BrowserIntegratedServerMain {
     /** Wakes the parked server thread without executing packet handlers from JavaScript. */
     @JSExport
     public static void signalIntegratedServerNetworkInput() {
-        Thread currentServerThread = serverThread;
-        if (currentServerThread != null) {
-            LockSupport.unpark(currentServerThread);
+        MinecraftServer current = server;
+        if (current == null) {
+            Thread currentServerThread = serverThread;
+            if (currentServerThread != null) {
+                LockSupport.unpark(currentServerThread);
+            }
+            return;
         }
+        if (networkInputTaskScheduled) {
+            return;
+        }
+        networkInputTaskScheduled = true;
+        try {
+            // MinecraftServer.shouldRun delays current-tick tasks whenever worldgen exhausts the
+            // tick budget. Mark this internal pump as overdue so player input cannot starve while
+            // the server is waiting on chunk work; execution still remains on the server thread.
+            current.schedule(new TickTask(Integer.MIN_VALUE, NETWORK_INPUT_TASK));
+        } catch (RuntimeException | Error exception) {
+            networkInputTaskScheduled = false;
+            reportRuntimeEvent("network-pump-schedule-error", String.valueOf(exception));
+        }
+    }
+
+    private static void runScheduledNetworkInput() {
+        networkInputTaskScheduled = false;
+        try {
+            pumpUrgentPackets();
+        } catch (RuntimeException | Error exception) {
+            reportRuntimeEvent("network-pump-error", String.valueOf(exception));
+        }
+    }
+
+    /** The helper coroutine only wakes the server thread; Netty decoding stays on that thread. */
+    @JSExport
+    public static void pumpIntegratedServerNetworkInput() {
+        signalIntegratedServerNetworkInput();
     }
 
     public static DataFixer dataFixer() {

@@ -7,6 +7,7 @@ import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.DefaultEventLoopGroup;
 import io.netty.channel.browser.BrowserWebSocketChannel;
 import com.google.gson.JsonParser;
+import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.URL;
@@ -61,6 +62,7 @@ import org.lwjgl.openal.AL10;
 import org.lwjgl.system.BrowserMemory;
 import org.lwjgl.system.MemoryUtil;
 import org.teavm.jso.JSBody;
+import org.teavm.jso.JSByRef;
 
 /** Fast TeaVM/browser verification for the platform layer used by Minecraft. */
 public final class PlatformSmoke {
@@ -1318,8 +1320,7 @@ public final class PlatformSmoke {
 
     private static void testEatingSoundAsset() throws Exception {
         String resource = "assets/minecraft/sounds/random/eat1.ogg";
-        try (InputStream encoded = PlatformSmoke.class.getClassLoader()
-                .getResourceAsStream(resource)) {
+        try (InputStream encoded = openPackagedAsset(resource)) {
             if (encoded == null) {
                 throw new AssertionError("Eating sound asset was not packaged: " + resource);
             }
@@ -1354,8 +1355,7 @@ public final class PlatformSmoke {
     private static void testUnicodeFontFallbackAssets() throws Exception {
         String definitionResource = "assets/minecraft/font/include/unifont.json";
         String zipResource = "assets/minecraft/font/unifont.zip";
-        try (InputStream definition = PlatformSmoke.class.getClassLoader()
-                .getResourceAsStream(definitionResource)) {
+        try (InputStream definition = openPackagedAsset(definitionResource)) {
             if (definition == null) {
                 throw new AssertionError("Unicode font definition was not packaged: " + definitionResource);
             }
@@ -1366,7 +1366,7 @@ public final class PlatformSmoke {
             }
         }
 
-        try (InputStream encoded = PlatformSmoke.class.getClassLoader().getResourceAsStream(zipResource)) {
+        try (InputStream encoded = openPackagedAsset(zipResource)) {
             if (encoded == null) {
                 throw new AssertionError("Unicode font archive was not packaged: " + zipResource);
             }
@@ -1384,6 +1384,44 @@ public final class PlatformSmoke {
             }
         }
     }
+
+    private static InputStream openPackagedAsset(String resource) {
+        int length = externalAssetLength(resource);
+        if (length >= 0) {
+            byte[] contents = new byte[length];
+            if (copyExternalAsset(resource, contents)) {
+                return new ByteArrayInputStream(contents);
+            }
+        }
+        return PlatformSmoke.class.getClassLoader().getResourceAsStream(resource);
+    }
+
+    @JSBody(params = "resource", script = """
+            const root = globalThis.__gaiusVanillaAssets;
+            if (!root || !root.bytes || !root.index) return -1;
+            if (!Object.prototype.hasOwnProperty.call(root.index, resource)) return -1;
+            const range = root.index[resource];
+            return Array.isArray(range) && range.length === 2 ? range[1] | 0 : -1;
+            """)
+    private static native int externalAssetLength(String resource);
+
+    @JSBody(params = {"resource", "output"}, script = """
+            const root = globalThis.__gaiusVanillaAssets;
+            if (!root || !root.bytes || !root.index) return false;
+            if (!Object.prototype.hasOwnProperty.call(root.index, resource)) return false;
+            const range = root.index[resource];
+            if (!Array.isArray(range) || range.length !== 2) return false;
+            const offset = range[0] | 0;
+            const length = range[1] | 0;
+            const target = output && output.data ? output.data : output;
+            if (!target || target.length !== length || offset < 0 || length < 0) return false;
+            const start = root.dataOffset + offset;
+            const end = start + length;
+            if (start < root.dataOffset || end > root.bytes.length) return false;
+            target.set(root.bytes.subarray(start, end));
+            return true;
+            """)
+    private static native boolean copyExternalAsset(String resource, @JSByRef byte[] output);
 
     private static void testBrowserNetwork() {
         DefaultEventLoopGroup group = new DefaultEventLoopGroup(1);

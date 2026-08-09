@@ -1,5 +1,6 @@
 package dev.gaius.browser;
 
+import org.teavm.classlib.java.lang.TModernRuntimeSupport;
 import org.teavm.jso.JSBody;
 
 /** Marks integrated-server world generation scheduling points for browser builds. */
@@ -7,7 +8,7 @@ public final class BrowserWorldgenScheduler {
     private static final double DEFAULT_SLICE_MILLIS = 12.0;
     private static final int CLOCK_CHECK_INTERVAL = 8;
     private static final int NETWORK_FAIRNESS_INTERVAL = 4;
-    private static final long NETWORK_PRIORITY_SLEEP_MILLIS = 1L;
+    private static final int NETWORK_PRIORITY_DELAY_MILLIS = 1;
 
     private static double deadlineMillis;
     private static int pulsesUntilClockCheck = 1;
@@ -29,28 +30,26 @@ public final class BrowserWorldgenScheduler {
         double now = nowMillis();
         if (deadlineMillis == 0.0) {
             deadlineMillis = now + sliceMillis();
-        } else if (now >= deadlineMillis) {
+        } else if (now >= deadlineMillis || hasPendingNetworkInput()) {
             yieldNow();
         }
     }
 
     private static void yieldNow() {
-        // TeaVM's Thread.yield only switches after a large call/time threshold. A zero-delay
-        // sleep resumes this server thread through the Worker event loop. Periodically give
-        // MessagePort one millisecond, then drain a bounded packet batch on this same thread.
-        boolean networkActive = networkPumpCount() > 0;
+        // TeaVM's Thread.sleep stores one interrupt handler on the emulated Thread. Worldgen and
+        // the server packet loop share that Thread, so overlapping sleeps can strand the wrong
+        // continuation. Use an independent platform callback for every cooperative yield.
+        boolean pendingNetworkInput = hasPendingNetworkInput();
+        boolean networkActive = pendingNetworkInput || networkPumpCount() > 0;
         boolean networkFairness = false;
         if (networkActive && --yieldsUntilNetworkFairness <= 0) {
             yieldsUntilNetworkFairness = NETWORK_FAIRNESS_INTERVAL;
             networkFairness = true;
         }
         boolean prioritizeNetwork = networkActive
-                && (networkFairness || hasPendingNetworkInput());
-        try {
-            Thread.sleep(prioritizeNetwork ? NETWORK_PRIORITY_SLEEP_MILLIS : 0L);
-        } catch (InterruptedException exception) {
-            Thread.currentThread().interrupt();
-        }
+                && (networkFairness || pendingNetworkInput);
+        TModernRuntimeSupport.yieldToEventLoop(
+                prioritizeNetwork ? NETWORK_PRIORITY_DELAY_MILLIS : 0);
         if (prioritizeNetwork) {
             BrowserIntegratedServerMain.pumpUrgentPackets();
         }

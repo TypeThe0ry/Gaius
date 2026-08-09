@@ -149,6 +149,8 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/server/network/ServerCommonPacketListenerImpl.class"));
         patchServerGamePacketListenerBrowserWorker(args[0], root.resolve(
                 "net/minecraft/server/network/ServerGamePacketListenerImpl.class"));
+        patchPlayerChunkSenderBrowserWorker(args[0], root.resolve(
+                "net/minecraft/server/network/PlayerChunkSender.class"));
         patchServerPlayerGameModeBrowserWorker(args[0], root.resolve(
                 "net/minecraft/server/level/ServerPlayerGameMode.class"));
         patchChunkGeneratorStructureStateBrowserFastRings(args[0], root.resolve(
@@ -196,8 +198,6 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/world/level/lighting/LightEngine.class"));
         patchLevelChunkSectionBrowserBiomeYield(args[0], root.resolve(
                 "net/minecraft/world/level/chunk/LevelChunkSection.class"));
-        patchChunkGenerationTaskBrowserYield(args[0], root.resolve(
-                "net/minecraft/server/level/ChunkGenerationTask.class"));
         patchFriendlyByteBufBrowserLongArray(args[0], root.resolve(
                 "net/minecraft/network/FriendlyByteBuf.class"));
         patchSimpleBitStorageBrowserUnpack(args[0], root.resolve(
@@ -8678,30 +8678,6 @@ public final class MinecraftClientPatcher {
         write(node, output);
     }
 
-    private static void patchChunkGenerationTaskBrowserYield(
-            String jar, Path output) throws IOException {
-        ClassNode node = read(jar, "net/minecraft/server/level/ChunkGenerationTask.class");
-        MethodNode method = find(node, "runUntilWait", "()Ljava/util/concurrent/CompletableFuture;");
-        int checkpoints = 0;
-        for (var instruction = method.instructions.getFirst();
-                instruction != null;
-                instruction = instruction.getNext()) {
-            if (instruction instanceof MethodInsnNode call
-                    && call.getOpcode() == Opcodes.INVOKEVIRTUAL
-                    && call.owner.equals("net/minecraft/server/level/ChunkGenerationTask")
-                    && call.name.equals("scheduleNextLayer")
-                    && call.desc.equals("()V")) {
-                method.instructions.insertBefore(instruction, browserWorldgenCheckpoint());
-                checkpoints++;
-            }
-        }
-        if (checkpoints != 1) {
-            throw new IllegalStateException(
-                    "ChunkGenerationTask browser yield point was not found: " + checkpoints);
-        }
-        write(node, output);
-    }
-
     private static int insertPulseAfterLoopCounter(
             MethodNode method, int localVariable, int increment) {
         int checkpoints = 0;
@@ -10749,14 +10725,12 @@ public final class MinecraftClientPatcher {
                 "(Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/core/BlockPos;)"
                         + "Ljava/util/concurrent/CompletableFuture;");
         InsnList code = new InsnList();
-        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new VarInsnNode(Opcodes.ALOAD, 1));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
-                "net/minecraft/server/level/PlayerSpawnFinder",
-                "fixupSpawnHeight",
-                "(Lnet/minecraft/world/level/CollisionGetter;Lnet/minecraft/core/BlockPos;)"
-                        + "Lnet/minecraft/world/phys/Vec3;",
+                "net/minecraft/world/phys/Vec3",
+                "atBottomCenterOf",
+                "(Lnet/minecraft/core/Vec3i;)Lnet/minecraft/world/phys/Vec3;",
                 false));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
@@ -10774,7 +10748,12 @@ public final class MinecraftClientPatcher {
                         + "Lnet/minecraft/world/phys/Vec3;",
                 null,
                 null);
+        LabelNode heightmapFallback = new LabelNode();
         fixupLoadedSpawn.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        fixupLoadedSpawn.instructions.add(new TypeInsnNode(
+                Opcodes.NEW,
+                "net/minecraft/world/level/ChunkPos"));
+        fixupLoadedSpawn.instructions.add(new InsnNode(Opcodes.DUP));
         fixupLoadedSpawn.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
         fixupLoadedSpawn.instructions.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
@@ -10783,14 +10762,59 @@ public final class MinecraftClientPatcher {
                 "(Lnet/minecraft/core/Position;)Lnet/minecraft/core/BlockPos;",
                 false));
         fixupLoadedSpawn.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                "net/minecraft/world/level/ChunkPos",
+                "<init>",
+                "(Lnet/minecraft/core/BlockPos;)V",
+                false));
+        fixupLoadedSpawn.instructions.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 owner,
-                "fixupSpawnHeight",
-                "(Lnet/minecraft/world/level/CollisionGetter;Lnet/minecraft/core/BlockPos;)"
-                        + "Lnet/minecraft/world/phys/Vec3;",
+                "getSpawnPosInChunk",
+                "(Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/world/level/ChunkPos;)"
+                        + "Lnet/minecraft/core/BlockPos;",
+                false));
+        fixupLoadedSpawn.instructions.add(new InsnNode(Opcodes.DUP));
+        fixupLoadedSpawn.instructions.add(new JumpInsnNode(
+                Opcodes.IFNULL,
+                heightmapFallback));
+        fixupLoadedSpawn.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "net/minecraft/world/phys/Vec3",
+                "atBottomCenterOf",
+                "(Lnet/minecraft/core/Vec3i;)Lnet/minecraft/world/phys/Vec3;",
                 false));
         fixupLoadedSpawn.instructions.add(new InsnNode(Opcodes.ARETURN));
-        fixupLoadedSpawn.maxStack = 2;
+        fixupLoadedSpawn.instructions.add(heightmapFallback);
+        fixupLoadedSpawn.instructions.add(new InsnNode(Opcodes.POP));
+        fixupLoadedSpawn.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        fixupLoadedSpawn.instructions.add(new FieldInsnNode(
+                Opcodes.GETSTATIC,
+                "net/minecraft/world/level/levelgen/Heightmap$Types",
+                "MOTION_BLOCKING_NO_LEAVES",
+                "Lnet/minecraft/world/level/levelgen/Heightmap$Types;"));
+        fixupLoadedSpawn.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        fixupLoadedSpawn.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "net/minecraft/core/BlockPos",
+                "containing",
+                "(Lnet/minecraft/core/Position;)Lnet/minecraft/core/BlockPos;",
+                false));
+        fixupLoadedSpawn.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/server/level/ServerLevel",
+                "getHeightmapPos",
+                "(Lnet/minecraft/world/level/levelgen/Heightmap$Types;"
+                        + "Lnet/minecraft/core/BlockPos;)Lnet/minecraft/core/BlockPos;",
+                false));
+        fixupLoadedSpawn.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "net/minecraft/world/phys/Vec3",
+                "atBottomCenterOf",
+                "(Lnet/minecraft/core/Vec3i;)Lnet/minecraft/world/phys/Vec3;",
+                false));
+        fixupLoadedSpawn.instructions.add(new InsnNode(Opcodes.ARETURN));
+        fixupLoadedSpawn.maxStack = 4;
         fixupLoadedSpawn.maxLocals = 2;
         node.methods.add(fixupLoadedSpawn);
         write(node, output);
@@ -11174,6 +11198,63 @@ public final class MinecraftClientPatcher {
         writeComputeFrames(node, output);
     }
 
+    private static void patchPlayerChunkSenderBrowserWorker(String jar, Path output)
+            throws IOException {
+        String owner = "net/minecraft/server/network/PlayerChunkSender";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode sendNextChunks = find(
+                node,
+                "sendNextChunks",
+                "(Lnet/minecraft/server/level/ServerPlayer;)V");
+        int records = 0;
+        for (AbstractInsnNode instruction = sendNextChunks.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (!(instruction instanceof TypeInsnNode allocation)
+                    || allocation.getOpcode() != Opcodes.NEW
+                    || !allocation.desc.equals(
+                            "net/minecraft/network/protocol/game/ClientboundChunkBatchFinishedPacket")) {
+                continue;
+            }
+            AbstractInsnNode batchFinishedSend = instruction.getNext();
+            while (batchFinishedSend != null
+                    && (!(batchFinishedSend instanceof MethodInsnNode call)
+                            || call.getOpcode() != Opcodes.INVOKEVIRTUAL
+                            || !call.owner.equals(
+                                    "net/minecraft/server/network/ServerGamePacketListenerImpl")
+                            || !call.name.equals("send")
+                            || !call.desc.equals(
+                                    "(Lnet/minecraft/network/protocol/Packet;)V"))) {
+                batchFinishedSend = batchFinishedSend.getNext();
+            }
+            if (batchFinishedSend == null) {
+                continue;
+            }
+            InsnList record = new InsnList();
+            record.add(new VarInsnNode(Opcodes.ALOAD, 5));
+            record.add(new MethodInsnNode(
+                    Opcodes.INVOKEINTERFACE,
+                    "java/util/List",
+                    "size",
+                    "()I",
+                    true));
+            record.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "dev/gaius/browser/BrowserIntegratedServerMain",
+                    "recordChunkBatchSent",
+                    "(I)V",
+                    false));
+            sendNextChunks.instructions.insert(batchFinishedSend, record);
+            records++;
+        }
+        if (records != 1) {
+            throw new IllegalStateException(
+                    "PlayerChunkSender chunk-batch size point changed: " + records);
+        }
+        sendNextChunks.maxStack = Math.max(sendNextChunks.maxStack, 2);
+        writeComputeFrames(node, output);
+    }
+
     private static void replaceInitialSpawnForBrowser(MethodNode method) {
         InsnList code = new InsnList();
 
@@ -11257,55 +11338,8 @@ public final class MinecraftClientPatcher {
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL,
                 "net/minecraft/server/level/ServerLevel",
-                "getChunkSource",
-                "()Lnet/minecraft/server/level/ServerChunkCache;",
-                false));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL,
-                "net/minecraft/server/level/ServerChunkCache",
-                "getGenerator",
-                "()Lnet/minecraft/world/level/chunk/ChunkGenerator;",
-                false));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 5));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL,
-                "net/minecraft/world/level/ChunkPos",
-                "getMiddleBlockX",
+                "getMaxY",
                 "()I",
-                false));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 5));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL,
-                "net/minecraft/world/level/ChunkPos",
-                "getMiddleBlockZ",
-                "()I",
-                false));
-        code.add(new FieldInsnNode(
-                Opcodes.GETSTATIC,
-                "net/minecraft/world/level/levelgen/Heightmap$Types",
-                "MOTION_BLOCKING_NO_LEAVES",
-                "Lnet/minecraft/world/level/levelgen/Heightmap$Types;"));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL,
-                "net/minecraft/server/level/ServerLevel",
-                "getChunkSource",
-                "()Lnet/minecraft/server/level/ServerChunkCache;",
-                false));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL,
-                "net/minecraft/server/level/ServerChunkCache",
-                "randomState",
-                "()Lnet/minecraft/world/level/levelgen/RandomState;",
-                false));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL,
-                "net/minecraft/world/level/chunk/ChunkGenerator",
-                "getBaseHeight",
-                "(IILnet/minecraft/world/level/levelgen/Heightmap$Types;"
-                        + "Lnet/minecraft/world/level/LevelHeightAccessor;"
-                        + "Lnet/minecraft/world/level/levelgen/RandomState;)I",
                 false));
         code.add(new VarInsnNode(Opcodes.ALOAD, 5));
         code.add(new MethodInsnNode(

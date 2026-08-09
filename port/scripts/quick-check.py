@@ -39,8 +39,10 @@ BRIDGE_CONFIG = ROOT / "apps" / "bridge" / "dist" / "config.js"
 BRIDGE_MAIN = ROOT / "apps" / "bridge" / "dist" / "main.js"
 BRIDGE_POLICY = ROOT / "apps" / "bridge" / "dist" / "policy.js"
 BRIDGE_REGISTRY = ROOT / "apps" / "bridge" / "dist" / "registry.js"
+BRIDGE_PACKAGE = ROOT / "apps" / "bridge" / "package.json"
 BRIDGE_SMOKE = ROOT / "apps" / "bridge" / "multiplayer-smoke.mjs"
 BRIDGE_REGISTRY_SMOKE = ROOT / "apps" / "bridge" / "registry-smoke.mjs"
+PUBLIC_RELAY_SMOKE = ROOT / "apps" / "bridge" / "public-relay-smoke.mjs"
 PUBLIC_RELAY_COMPOSE = ROOT / "apps" / "bridge" / "compose.public.example.yaml"
 PUBLIC_RELAY_CADDYFILE = ROOT / "apps" / "bridge" / "Caddyfile.public.example"
 PUBLIC_RELAY_ENV = ROOT / "apps" / "bridge" / "public.env.example"
@@ -123,10 +125,13 @@ FETCH_VERSION = PORT / "scripts" / "fetch-version.sh"
 BUILD_RELEASE = PORT / "scripts" / "build-teavm-release.sh"
 BUILD_OVERLAYS = PORT / "scripts" / "build-overlays.sh"
 COMPRESS_DIST = PORT / "scripts" / "compress-dist.sh"
+COMPRESS_BROTLI = PORT / "scripts" / "compress-brotli.mjs"
 BUILD_PORTABLE_HTML = PORT / "scripts" / "build-portable-html.py"
+BUILD_PORTABLE_HTML_TEST = PORT / "scripts" / "test-build-portable-html.py"
 BUILD_VANILLA_ASSETS_PACK = PORT / "scripts" / "build-vanilla-assets-pack.py"
 SERVE_DIST = PORT / "scripts" / "serve-dist.py"
 PLATFORM_SMOKE = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "PlatformSmoke.java"
+PLATFORM_SMOKE_ASSET_LOADER = PORT / "web" / "smoke" / "vanilla-assets-smoke-loader.js"
 INDEX_HTML = PORT / "web" / "dist" / "index.html"
 HOTPATH_WASM = PORT / "web" / "dist" / "gaius-hotpath.wasm"
 GENERATED_RESOURCE_LIST = TARGET / "generated-resources" / "dev" / "gaius" / "browser" / "minecraft-resources.txt"
@@ -134,6 +139,7 @@ GENERATED_EMBEDDED_RESOURCE_LIST = TARGET / "generated-resources" / "dev" / "gai
 GENERATED_SOUNDS_JSON = TARGET / "generated-resources" / "assets" / "minecraft" / "sounds.json"
 GENERATED_UNIFONT_JSON = TARGET / "generated-resources" / "assets" / "minecraft" / "font" / "include" / "unifont.json"
 POSTPROCESS_TEAVM_JS = PORT / "scripts" / "postprocess-teavm-js.py"
+POSTPROCESS_TEAVM_JS_TEST = PORT / "scripts" / "test-postprocess-teavm-js.py"
 POSTPROCESS_INDEX_HTML = PORT / "scripts" / "postprocess-index-html.py"
 PORTABLE_HTML = DIST / "Gaius.html"
 VANILLA_ASSET_PACK = DIST / "vanilla-assets.pack.gz"
@@ -251,6 +257,23 @@ def portable_embeds_gzip(portable: Path, key: str, compressed: Path) -> bool:
         return False
 
 
+def portable_embeds_assignment(portable: Path, name: str, value: object) -> bool:
+    if not portable.is_file():
+        return False
+    expected = (
+        f"const {name} = "
+        + json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+        + ";"
+    ).encode("utf-8")
+    try:
+        with portable.open("rb") as stream, mmap.mmap(
+            stream.fileno(), 0, access=mmap.ACCESS_READ
+        ) as data:
+            return data.find(expected) >= 0
+    except OSError:
+        return False
+
+
 def vanilla_asset_pack_index(path: Path) -> dict[str, list[int]]:
     try:
         with gzip.open(path, "rb") as stream:
@@ -264,6 +287,38 @@ def vanilla_asset_pack_index(path: Path) -> dict[str, list[int]]:
                 return {}
             value = json.loads(stream.read(index_length).decode("utf-8"))
             return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def vanilla_asset_pack_entries(path: Path, names: tuple[str, ...]) -> dict[str, bytes]:
+    try:
+        with gzip.open(path, "rb") as stream:
+            if stream.read(8) != b"GAIUSVP1":
+                return {}
+            length_bytes = stream.read(4)
+            if len(length_bytes) != 4:
+                return {}
+            index_length = struct.unpack("<I", length_bytes)[0]
+            if index_length <= 0 or index_length > 8 * 1024 * 1024:
+                return {}
+            index = json.loads(stream.read(index_length).decode("utf-8"))
+            payload_offset = 12 + index_length
+            result: dict[str, bytes] = {}
+            for name in names:
+                entry = index.get(name) if isinstance(index, dict) else None
+                if (
+                    not isinstance(entry, list)
+                    or len(entry) != 2
+                    or not all(isinstance(value, int) and value >= 0 for value in entry)
+                ):
+                    continue
+                offset, length = entry
+                stream.seek(payload_offset + offset)
+                content = stream.read(length)
+                if len(content) == length:
+                    result[name] = content
+            return result
     except (OSError, ValueError, json.JSONDecodeError):
         return {}
 
@@ -498,10 +553,16 @@ def check_source_patches() -> None:
     bridge_main = BRIDGE_MAIN.read_text(errors="replace") if BRIDGE_MAIN.exists() else ""
     bridge_policy = BRIDGE_POLICY.read_text(errors="replace") if BRIDGE_POLICY.exists() else ""
     bridge_registry = BRIDGE_REGISTRY.read_text(errors="replace") if BRIDGE_REGISTRY.exists() else ""
+    bridge_package = BRIDGE_PACKAGE.read_text(errors="replace") if BRIDGE_PACKAGE.exists() else ""
     bridge_smoke = BRIDGE_SMOKE.read_text(errors="replace") if BRIDGE_SMOKE.exists() else ""
     bridge_registry_smoke = (
         BRIDGE_REGISTRY_SMOKE.read_text(errors="replace")
         if BRIDGE_REGISTRY_SMOKE.exists()
+        else ""
+    )
+    public_relay_smoke = (
+        PUBLIC_RELAY_SMOKE.read_text(errors="replace")
+        if PUBLIC_RELAY_SMOKE.exists()
         else ""
     )
     public_relay_compose = (
@@ -631,26 +692,65 @@ def check_source_patches() -> None:
     build_release = BUILD_RELEASE.read_text(errors="replace") if BUILD_RELEASE.exists() else ""
     build_overlays = BUILD_OVERLAYS.read_text(errors="replace") if BUILD_OVERLAYS.exists() else ""
     compress_dist = COMPRESS_DIST.read_text(errors="replace") if COMPRESS_DIST.exists() else ""
+    compress_brotli = COMPRESS_BROTLI.read_text(errors="replace") if COMPRESS_BROTLI.exists() else ""
     build_portable_html = BUILD_PORTABLE_HTML.read_text(errors="replace") if BUILD_PORTABLE_HTML.exists() else ""
+    build_portable_html_test = (
+        BUILD_PORTABLE_HTML_TEST.read_text(errors="replace")
+        if BUILD_PORTABLE_HTML_TEST.exists()
+        else ""
+    )
     build_vanilla_assets_pack = BUILD_VANILLA_ASSETS_PACK.read_text(errors="replace") if BUILD_VANILLA_ASSETS_PACK.exists() else ""
     serve_dist = SERVE_DIST.read_text(errors="replace") if SERVE_DIST.exists() else ""
     platform_smoke = PLATFORM_SMOKE.read_text(errors="replace") if PLATFORM_SMOKE.exists() else ""
+    platform_smoke_asset_loader = (
+        PLATFORM_SMOKE_ASSET_LOADER.read_text(errors="replace")
+        if PLATFORM_SMOKE_ASSET_LOADER.exists()
+        else ""
+    )
     index_html = INDEX_HTML.read_text(errors="replace") if INDEX_HTML.exists() else ""
-    generated_resource_list = GENERATED_RESOURCE_LIST.read_text(errors="replace") if GENERATED_RESOURCE_LIST.exists() else ""
+    vanilla_assets_index = vanilla_asset_pack_index(VANILLA_ASSET_PACK)
+    packed_metadata = vanilla_asset_pack_entries(
+        VANILLA_ASSET_PACK,
+        (
+            "assets/minecraft/sounds.json",
+            "assets/minecraft/font/include/unifont.json",
+        ),
+    )
+    generated_resource_list = (
+        GENERATED_RESOURCE_LIST.read_text(errors="replace")
+        if GENERATED_RESOURCE_LIST.exists()
+        else "\n".join(vanilla_assets_index)
+    )
     generated_embedded_resource_list = (
         GENERATED_EMBEDDED_RESOURCE_LIST.read_text(errors="replace")
         if GENERATED_EMBEDDED_RESOURCE_LIST.exists()
         else ""
     )
-    vanilla_assets_index = vanilla_asset_pack_index(VANILLA_ASSET_PACK)
-    generated_sounds = load_json(GENERATED_SOUNDS_JSON) if GENERATED_SOUNDS_JSON.exists() else {}
-    generated_unifont = load_json(GENERATED_UNIFONT_JSON) if GENERATED_UNIFONT_JSON.exists() else {}
-    generated_unifont_base64 = (
-        base64.b64encode(GENERATED_UNIFONT_JSON.read_bytes())
-        if GENERATED_UNIFONT_JSON.exists()
-        else b""
+    generated_sounds_bytes = (
+        GENERATED_SOUNDS_JSON.read_bytes()
+        if GENERATED_SOUNDS_JSON.exists()
+        else packed_metadata.get("assets/minecraft/sounds.json", b"")
     )
+    generated_unifont_bytes = (
+        GENERATED_UNIFONT_JSON.read_bytes()
+        if GENERATED_UNIFONT_JSON.exists()
+        else packed_metadata.get("assets/minecraft/font/include/unifont.json", b"")
+    )
+    try:
+        generated_sounds = json.loads(generated_sounds_bytes) if generated_sounds_bytes else {}
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        generated_sounds = {}
+    try:
+        generated_unifont = json.loads(generated_unifont_bytes) if generated_unifont_bytes else {}
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        generated_unifont = {}
+    generated_unifont_base64 = base64.b64encode(generated_unifont_bytes)
     postprocess_teavm_js = POSTPROCESS_TEAVM_JS.read_text(errors="replace") if POSTPROCESS_TEAVM_JS.exists() else ""
+    postprocess_teavm_js_test = (
+        POSTPROCESS_TEAVM_JS_TEST.read_text(errors="replace")
+        if POSTPROCESS_TEAVM_JS_TEST.exists()
+        else ""
+    )
     postprocess_index_html = POSTPROCESS_INDEX_HTML.read_text(errors="replace") if POSTPROCESS_INDEX_HTML.exists() else ""
     server_plugin_pom = SERVER_PLUGIN_POM.read_text(errors="replace") if SERVER_PLUGIN_POM.exists() else ""
     server_plugin_main = SERVER_PLUGIN_MAIN.read_text(errors="replace") if SERVER_PLUGIN_MAIN.exists() else ""
@@ -1447,7 +1547,12 @@ def check_source_patches() -> None:
             and "decoder.readAll()" in platform_smoke
             and "AL_FORMAT_MONO16" in platform_smoke
             and "AL_FORMAT_STEREO16" in platform_smoke
-            and "Eating sound did not decode to playable PCM" in platform_smoke,
+            and "Eating sound did not decode to playable PCM" in platform_smoke
+            and "openPackagedAsset" in platform_smoke
+            and "__gaiusVanillaAssets" in platform_smoke
+            and "vanilla-assets.pack.gz" in platform_smoke_asset_loader
+            and "DecompressionStream" in platform_smoke_asset_loader
+            and "window.__gaiusVanillaAssets" in platform_smoke_asset_loader,
         ),
         (
             "Browser Netty channel batches cheap multiplayer frames within a time budget",
@@ -1745,8 +1850,11 @@ def check_source_patches() -> None:
             and "relayTunnelConnectTimeout" in netty_browser_channel
             and "targetConnectTimeoutMs" in netty_browser_channel
             and "perTarget * 2 + 5000" in netty_browser_channel
+            and "directPluginTunnelConnectTimeout" in netty_browser_channel
+            and "configured + 1000" in netty_browser_channel
             and "candidate.direct ? 800 : relayTunnelConnectTimeout(candidate)"
             in netty_browser_channel
+            and "slowDirectPluginBudget: true" in browser_relay_routing_smoke
             and "No Gaius direct endpoint or relay node could reach the server" in netty_browser_channel
             and "relayFailovers" in netty_browser_channel,
         ),
@@ -1794,6 +1902,33 @@ def check_source_patches() -> None:
             and "node tools/check-relay-registry.mjs" in repository_guard,
         ),
         (
+            "Public RelayNode smoke verifies portable-origin status traffic and lease cleanup",
+            'process.env.GAIUS_PUBLIC_RELAY_ORIGIN ?? "null"' in public_relay_smoke
+            and 'type: "connect"' in public_relay_smoke
+            and "encodePacket(0, handshake)" in public_relay_smoke
+            and "readStatusResponse(responseBuffer)" in public_relay_smoke
+            and "beforeActive + 1" in public_relay_smoke
+            and "waitForLeaseRelease" in public_relay_smoke
+            and "syntheticDnsFallback" in public_relay_smoke
+            and 'capabilities?.includes("target-attestation")' in public_relay_smoke
+            and "control.host === target.host" in public_relay_smoke
+            and '"smoke:public": "node public-relay-smoke.mjs"' in bridge_package,
+        ),
+        (
+            "RelayNodes attest the requested target and browser failover rejects mismatches",
+            '"target-attestation"' in bridge_main
+            and "host: request.host" in bridge_main
+            and "port: request.port" in bridge_main
+            and "candidate.targetAttestation" in netty_browser_channel
+            and "!candidate.direct && !attestationPresent" in netty_browser_channel
+            and "relayTargetAttestationFailures" in netty_browser_channel
+            and 'manifestScenario = "attestation"' in browser_relay_routing_smoke
+            and "RelayNode target attestation mismatch did not trigger failover"
+                in browser_relay_routing_smoke
+            and 'capabilities: ["target-attestation"]' in browser_relay_routing_smoke
+            and "Translator node did not attest the actual TCP peer" in bridge_smoke,
+        ),
+        (
             "Public RelayNodes renew verified leases without exposing registry credentials",
             "GAIUS_RELAY_REGISTRY_URL" in bridge_config
             and "GAIUS_RELAY_PUBLIC_URL" in bridge_config
@@ -1801,6 +1936,9 @@ def check_source_patches() -> None:
             and "function startRelayRegistration()" in bridge_main
             and 'kind: "gaius-relay-registration"' in bridge_main
             and "authorization: `Bearer ${registration.token}`" in bridge_main
+            and "stopRelayRegistration" in bridge_main
+            and 'method: "DELETE"' in bridge_main
+            and "gracefulUnregisterMs" in bridge_registry_smoke
             and "const leases = new Map()" in bridge_registry
             and 'requestUrl.pathname === "/relay-nodes.json"' in bridge_registry
             and "async function verifyRegistration" in bridge_registry
@@ -1915,7 +2053,13 @@ def check_source_patches() -> None:
             and "extends WebSocketServer" in server_plugin_gateway
             and 'type.equals("connect")' in server_plugin_gateway
             and 'type.equals("flow")' in server_plugin_gateway
-            and 'webSocket.send("{\\\"type\\\":\\\"connected\\\"}")' in server_plugin_gateway
+            and 'controlMessage("connecting", requestedTarget)' in server_plugin_gateway
+            and 'controlMessage("connected", requestedTarget)' in server_plugin_gateway
+            and "configuredTarget.equals(requestedTarget)" in server_plugin_gateway
+            and "Gaius target does not match the configured Minecraft server"
+                in server_plugin_gateway
+            and "socket = target" in server_plugin_gateway
+            and "if (closed.get())" in server_plugin_gateway
             and "new InetSocketAddress(minecraftHost, minecraftPort)" in server_plugin_gateway
             and "maximumFrameBytes" in server_plugin_gateway
             and "MessageDigest.isEqual" in server_plugin_gateway,
@@ -1962,12 +2106,19 @@ def check_source_patches() -> None:
             and '"getPlayerViewDistance"' in client_patcher
             and '"server-distances-staged"' in browser_integrated_server_main
             and '"server-distances-ramping"' in browser_integrated_server_main
+            and "recordChunkBatchSent" in browser_integrated_server_main
             and "acknowledgeChunkBatch" in browser_integrated_server_main
-            and "DISTANCE_RAMP_INTERVAL_MILLIS = 750L" in browser_integrated_server_main
+            and "sentChunkBatches" in browser_integrated_server_main
+            and "activeViewDistanceAcknowledged" in browser_integrated_server_main
+            and "DEFAULT_DISTANCE_RAMP_INTERVAL_MILLIS = 750L" in browser_integrated_server_main
+            and "distanceRampIntervalMillis()" in browser_integrated_server_main
+            and "__gaiusDistanceRampIntervalMillis" in browser_integrated_server_main
             and "distanceAdvancePending" in browser_integrated_server_main
             and "tickIntegratedServerDistances" in browser_integrated_server_main
             and "advanceConfiguredDistances" in browser_integrated_server_main
             and "patchServerGamePacketListenerBrowserWorker" in client_patcher
+            and "patchPlayerChunkSenderBrowserWorker" in client_patcher
+            and '"recordChunkBatchSent"' in client_patcher
             and '"handleChunkBatchReceived"' in client_patcher
             and 'message.type === "distances"' in server_worker_bootstrap
             and "__gaiusServerViewDistance" in server_worker_bootstrap
@@ -1976,7 +2127,10 @@ def check_source_patches() -> None:
             and "__gaiusWorldgenSliceMillis" in server_worker_bootstrap
             and "clampWorldgenSlice" in server_worker_bootstrap
             and "requestedWorldgenSlice" in server_worker_bootstrap
-            and "defaultWorldgenSliceMillis = 40" in server_worker_bootstrap
+            and "defaultWorldgenSliceMillis = 20" in server_worker_bootstrap
+            and "defaultDistanceRampIntervalMillis = 750" in server_worker_bootstrap
+            and "clampDistanceRampInterval" in server_worker_bootstrap
+            and "distanceRampIntervalMillis" in server_worker_bootstrap
             and "requestedWorldgenSlice,\n      defaultWorldgenSliceMillis," in server_worker_bootstrap
             and 'properties += "level-seed=" + seed' in browser_integrated_server_main
             and "workerSeed()" in browser_integrated_server_main
@@ -2165,13 +2319,33 @@ def check_source_patches() -> None:
             and file_contains(PORTABLE_HTML, "async function acquireGaiusRuntimeLease()")
             and portable_embeds_gzip(
                 PORTABLE_HTML,
+                "classes",
+                DIST / "classes.js.gz",
+            )
+            and portable_embeds_gzip(
+                PORTABLE_HTML,
                 "server",
                 Path(str(SERVER_WORKER_JS) + ".gz"),
             )
             and portable_embeds_gzip(
                 PORTABLE_HTML,
+                "wasm",
+                DIST / "gaius-hotpath.wasm.gz",
+            )
+            and portable_embeds_gzip(
+                PORTABLE_HTML,
                 "vanilla",
                 VANILLA_ASSET_PACK,
+            )
+            and portable_embeds_assignment(
+                PORTABLE_HTML,
+                "workerSource",
+                SERVER_WORKER_BOOTSTRAP_JS.read_text(encoding="utf-8"),
+            )
+            and portable_embeds_assignment(
+                PORTABLE_HTML,
+                "embeddedRelayNodes",
+                relay_registry.get("nodes", [])[:64],
             ),
         ),
         (
@@ -2180,6 +2354,7 @@ def check_source_patches() -> None:
             and build_release.find("compress-dist.sh")
             < build_release.find("build-portable-html.py")
             < build_release.rfind("compress-dist.sh")
+            and "GAIUS_COMPRESS_EXCLUDE=Gaius.html" in build_release
             and "GAIUS_COMPRESS_FILES=Gaius.html" in build_release
             and all(
                 gzip_matches(path)
@@ -2228,10 +2403,28 @@ def check_source_patches() -> None:
             and "playLoginPackets" in singleplayer_worker_runtime_smoke
             and "chunkPackets" in singleplayer_worker_runtime_smoke
             and 'message.type === "server-distances-staged"' in singleplayer_worker_runtime_smoke
-            and 'expectedStagedDistances = "1/1->7/3"' in singleplayer_worker_runtime_smoke
+            and "GAIUS_SMOKE_RENDER_DISTANCE" in singleplayer_worker_runtime_smoke
+            and "GAIUS_SMOKE_SIMULATION_DISTANCE" in singleplayer_worker_runtime_smoke
+            and "expectedStagedDistances = `1/1->${targetRenderDistance}/${targetSimulationDistance}`"
+                in singleplayer_worker_runtime_smoke
+            and "expectedTransitions.slice(0, -1)" in singleplayer_worker_runtime_smoke
             and 'message.type === "server-distances-ramping"' in singleplayer_worker_runtime_smoke
+            and "GAIUS_SMOKE_DISTANCE_RAMP_MS" in singleplayer_worker_runtime_smoke
             and "expectedDistanceRamp" in singleplayer_worker_runtime_smoke
             and "distance-ramp-mismatch" in singleplayer_worker_runtime_smoke
+            and "distance-ramp-causality-mismatch" in singleplayer_worker_runtime_smoke
+            and 'type: "network-state-mismatch"' in singleplayer_worker_runtime_smoke
+            and "latestNetworkStats.inboundQueuedBytes !== 0"
+                in singleplayer_worker_runtime_smoke
+            and "latestNetworkStats.integratedServerPumpFailures"
+                in singleplayer_worker_runtime_smoke
+            and "distanceTransitionTimeline" in singleplayer_worker_runtime_smoke
+            and "chunkBatchAckTimeline" in singleplayer_worker_runtime_smoke
+            and "ackCountAtTransition" in singleplayer_worker_runtime_smoke
+            and "chunkPacketCountAtTransition" in singleplayer_worker_runtime_smoke
+            and "ringBackpressureValid" in singleplayer_worker_runtime_smoke
+            and "previousDiameter * previousDiameter" in singleplayer_worker_runtime_smoke
+            and "configuredInterval - 50" in singleplayer_worker_runtime_smoke
             and 'packetId.value === 5' in singleplayer_worker_runtime_smoke
             and "configurationFinishedToPlayMs" in singleplayer_worker_runtime_smoke
             and "sendPlayerAction(0)" in singleplayer_worker_runtime_smoke
@@ -2516,7 +2709,7 @@ def check_source_patches() -> None:
             and r'\n\s*"--disableMultiplayer",' in postprocess_index_html,
         ),
         (
-            "Browser launcher resolves online profiles without leaking access tokens",
+            "Browser launcher resolves online profiles without leaking identity parameters",
             "async function buildGaiusSessionArgs()" in postprocess_index_html
             and "async function loadGaiusMinecraftProfile(accessToken)" in postprocess_index_html
             and '"https://api.minecraftservices.com/minecraft/profile"' in postprocess_index_html
@@ -2527,7 +2720,10 @@ def check_source_patches() -> None:
             and 'sessionStorage.getItem("gaius.session")' in postprocess_index_html
             and "window.__gaiusConfigureSession" in postprocess_index_html
             and 'args.push("--offlineDeveloperMode")' in postprocess_index_html
-            and 'scrubbed.searchParams.delete("accessToken")' in postprocess_index_html
+            and 'const identityQueryKeys = ["username", "uuid", "accessToken", "xuid", "clientId"]'
+                in postprocess_index_html
+            and "for (const key of identityQueryKeys) scrubbed.searchParams.delete(key)"
+                in postprocess_index_html
             and "<redacted>" in postprocess_index_html
             and "async function buildGaiusSessionArgs()" in index_html
             and "async function loadGaiusMinecraftProfile(accessToken)" in index_html
@@ -2535,6 +2731,10 @@ def check_source_patches() -> None:
             and 'await window.__gaiusDefaultArgsPromise' in index_html
             and '"<redacted>"' in index_html
             and 'window.__gaiusSessionMode = online ? "online" : "offline"' in index_html
+            and 'const identityQueryKeys = ["username", "uuid", "accessToken", "xuid", "clientId"]'
+                in index_html
+            and "for (const key of identityQueryKeys) scrubbed.searchParams.delete(key)"
+                in index_html
             and 'window.__gaiusDisplayArgs.join(" ")' in index_html,
         ),
         (
@@ -3169,13 +3369,14 @@ def check_source_patches() -> None:
             and "net/minecraft/util/Util" in server_catchup_section,
         ),
         (
-            "Minecraft patcher avoids full chunk generation while choosing browser spawn",
+            "Minecraft patcher anchors browser spawn above the generated column",
             "replaceInitialSpawnForBrowser" in client_patcher
             and "server.browserFastInitialSpawn" in client_patcher
             and "Climate$Sampler" in initial_spawn_section
             and "findSpawnPosition" in initial_spawn_section
-            and "getBaseHeight" in initial_spawn_section
-            and "MOTION_BLOCKING_NO_LEAVES" in initial_spawn_section
+            and '"getMaxY"' in initial_spawn_section
+            and "getBaseHeight" not in initial_spawn_section
+            and "MOTION_BLOCKING_NO_LEAVES" not in initial_spawn_section
             and "getMiddleBlockX" in initial_spawn_section
             and "getMiddleBlockZ" in initial_spawn_section
             and "PlayerSpawnFinder" not in initial_spawn_section
@@ -3183,12 +3384,14 @@ def check_source_patches() -> None:
             and "BlockPos.ZERO" not in initial_spawn_section,
         ),
         (
-            "Minecraft patcher rechecks player collision after the spawn chunk is full",
+            "Minecraft patcher finds a safe surface after the spawn chunk is full",
             "gaius$fixupLoadedSpawn" in client_patcher
             and "loadedSpawnFixups" in client_patcher
             and "PrepareSpawnTask loaded-spawn fixup point changed" in client_patcher
             and '"spawnLevel"' in client_patcher
-            and '"fixupSpawnHeight"' in client_patcher,
+            and '"getSpawnPosInChunk"' in client_patcher
+            and '"MOTION_BLOCKING_NO_LEAVES"' in client_patcher
+            and '"getHeightmapPos"' in client_patcher,
         ),
         (
             "Minecraft patcher skips synchronous stronghold biome relocation in browser",
@@ -3199,29 +3402,65 @@ def check_source_patches() -> None:
         ),
         (
             "Server Worker enforces bounded slices inside synchronous worldgen loops",
-            browser_worldgen_scheduler.count("Thread.sleep(") == 1
-            and "Worker event loop" in browser_worldgen_scheduler
-            and "InterruptedException" in browser_worldgen_scheduler
+            "Thread.sleep(" not in browser_worldgen_scheduler
+            and "TModernRuntimeSupport.yieldToEventLoop" in browser_worldgen_scheduler
+            and "independent platform callback" in browser_worldgen_scheduler
             and "DEFAULT_SLICE_MILLIS = 12.0" in browser_worldgen_scheduler
             and "CLOCK_CHECK_INTERVAL = 8" in browser_worldgen_scheduler
             and "NETWORK_FAIRNESS_INTERVAL = 4" in browser_worldgen_scheduler
-            and "NETWORK_PRIORITY_SLEEP_MILLIS = 1L" in browser_worldgen_scheduler
+            and "NETWORK_PRIORITY_DELAY_MILLIS = 1" in browser_worldgen_scheduler
+            and "public static native void yieldToEventLoop(int delayMillis);"
+                in modern_runtime_support
+            and "TThread.setCurrentThread(thread)" in modern_runtime_support
+            and "Platform.schedule(resume, delayMillis)" in modern_runtime_support
+            and "Platform.postpone(resume)" in modern_runtime_support
             and "__gaiusWorldgenSliceMillis" in browser_worldgen_scheduler
             and "configured >= 4 && configured <= 50" in browser_worldgen_scheduler
             and "hasPendingNetworkInput()" in browser_worldgen_scheduler
-            and "networkPumpCount() > 0" in browser_worldgen_scheduler
+            and "now >= deadlineMillis || hasPendingNetworkInput()"
+                in browser_worldgen_scheduler
+            and "boolean pendingNetworkInput = hasPendingNetworkInput()"
+                in browser_worldgen_scheduler
+            and "pendingNetworkInput || networkPumpCount() > 0"
+                in browser_worldgen_scheduler
+            and "networkFairness || pendingNetworkInput"
+                in browser_worldgen_scheduler
             and "BrowserIntegratedServerMain.pumpUrgentPackets()" in browser_worldgen_scheduler
             and "urgentPacketPumpActive" in browser_integrated_server_main
+            and "Thread.currentThread() != serverThread" in browser_integrated_server_main
             and "BrowserWebSocketChannel.pumpAll()" in browser_integrated_server_main
             and "BrowserWebSocketChannel.hasPendingInput()" in browser_integrated_server_main
             and "current.packetProcessor().processQueuedPackets()" in browser_integrated_server_main
             and "pumpUrgentPacketsIfPending" in client_patcher
             and 'method.name.equals("pollTask")' in client_patcher
             and "signalIntegratedServerNetworkInput" in browser_integrated_server_main
+            and "pumpIntegratedServerNetworkInput" in browser_integrated_server_main
+            and "pumpIntegratedServerNetworkInput() {\n        signalIntegratedServerNetworkInput();"
+                in browser_integrated_server_main
             and "serverThread = minecraftServer.getRunningThread()" in browser_integrated_server_main
             and "LockSupport.unpark" in browser_integrated_server_main
+            and "NETWORK_INPUT_TASK" in browser_integrated_server_main
+            and "current.schedule(new TickTask(Integer.MIN_VALUE, NETWORK_INPUT_TASK))"
+                in browser_integrated_server_main
+            and "current.schedule(new TickTask(current.getTickCount(), NETWORK_INPUT_TASK))"
+                not in browser_integrated_server_main
+            and "current.execute(NETWORK_INPUT_TASK)" not in browser_integrated_server_main
+            and 'reportRuntimeEvent("network-pump-error"'
+                in browser_integrated_server_main
+            and 'message.type === "network-pump-error"'
+                in singleplayer_worker_runtime_smoke
+            and 'message.type === "network-pump-schedule-error"'
+                in singleplayer_worker_runtime_smoke
+            and 'message.type === "chunk-batch-ack-without-send"'
+                in singleplayer_worker_runtime_smoke
+            and "networkInputTaskScheduled = false" in browser_integrated_server_main
+            and "__gaiusStartIntegratedServerPump" in netty_browser_channel
             and "__gaiusIntegratedServerNetworkSignal" in netty_browser_channel
             and "__gaiusIntegratedServerNetworkSignal" in server_worker_bootstrap
+            and 'typeof root.__gaiusStartIntegratedServerPump !== "function"'
+                in server_worker_bootstrap
+            and "Singleplayer server input dispatcher is unavailable"
+                in server_worker_bootstrap
             and "inboundQueuedBytes" in browser_worldgen_scheduler
             and "deadlineMillis" in browser_worldgen_scheduler
             and "nowMillis()" in browser_worldgen_scheduler
@@ -3576,7 +3815,9 @@ def check_source_patches() -> None:
             "Browser configuration retains lighting neighbors and waits only for center entities",
             "patchPlayerSpawnFinderBrowser" in client_patcher
             and '"findSpawn"' in client_patcher
-            and '"fixupSpawnHeight"' in client_patcher
+            and '"atBottomCenterOf"' in client_patcher
+            and '"getSpawnPosInChunk"' in client_patcher
+            and '"getHeightmapPos"' in client_patcher
             and '"completedFuture"' in client_patcher
             and "patchPrepareSpawnTaskBrowser" in client_patcher
             and '"lambda$tick$0"' in client_patcher
@@ -3604,7 +3845,7 @@ def check_source_patches() -> None:
             and "patchNoiseChunkBrowserYield" in client_patcher
             and "patchClimateRTreeBrowserYield" in client_patcher
             and "patchLevelChunkSectionBrowserBiomeYield" in client_patcher
-            and "patchChunkGenerationTaskBrowserYield" in client_patcher
+            and "patchChunkGenerationTaskBrowserYield" not in client_patcher
             and "patchChunkTaskDispatcher" not in client_patcher
             and "BrowserWorldgenScheduler" in client_patcher
             and "insertPulseAfterLoopCounter(method, 23, -1)" in client_patcher
@@ -3982,12 +4223,23 @@ def check_source_patches() -> None:
             and "EMBEDDED_RESOURCE_LIST" in minecraft_resource_supplier
             and "readResourceList(EMBEDDED_RESOURCE_LIST)" in minecraft_resource_supplier
             and "readResourceList(RESOURCE_LIST)" in minecraft_resource_supplier
-            and "assets/minecraft/lang/en_us.json" in generated_embedded_resource_list
-            and "assets/minecraft/lang/deprecated.json" in generated_embedded_resource_list
-            and "assets/minecraft/font/unifont.zip" in generated_embedded_resource_list
-            and "assets/minecraft/sounds/random/eat1.ogg" in generated_embedded_resource_list
-            and "assets/minecraft/textures/block/stone.png" not in generated_embedded_resource_list
-            and "data/minecraft/" not in generated_embedded_resource_list,
+            and (
+                (
+                    "assets/minecraft/lang/en_us.json" in generated_embedded_resource_list
+                    and "assets/minecraft/lang/deprecated.json" in generated_embedded_resource_list
+                    and "assets/minecraft/font/unifont.zip" in generated_embedded_resource_list
+                    and "assets/minecraft/sounds/random/eat1.ogg" in generated_embedded_resource_list
+                    and "assets/minecraft/textures/block/stone.png" not in generated_embedded_resource_list
+                    and "data/minecraft/" not in generated_embedded_resource_list
+                )
+                or (
+                    file_contains(DIST / "classes.js", "assets/minecraft/lang/en_us.json")
+                    and file_contains(DIST / "classes.js", "assets/minecraft/lang/deprecated.json")
+                    and file_contains(DIST / "classes.js", "assets/minecraft/font/unifont.zip")
+                    and file_contains(DIST / "classes.js", "assets/minecraft/sounds/random/eat1.ogg")
+                    and not file_contains(DIST / "classes.js", "assets/minecraft/textures/block/stone.png")
+                )
+            ),
         ),
         (
             "Generated vanilla asset pack is deterministic and contains rendering, sound, font, and data resources",
@@ -4031,6 +4283,14 @@ def check_source_patches() -> None:
             and not file_contains(
                 DIST / "classes.js",
                 '"assets/minecraft/textures/block/stone.png":"',
+            ),
+        ),
+        (
+            "Generated release client includes RelayNode target attestation guard",
+            file_contains(DIST / "classes.js", "target-attestation")
+            and file_contains(
+                DIST / "classes.js",
+                "RelayNode target attestation mismatch",
             ),
         ),
         (
@@ -4268,6 +4528,15 @@ def check_source_patches() -> None:
             and "compress-dist.sh" in build_release,
         ),
         (
+            "Release resume requires an exact validated client artifact",
+            "GAIUS_RESUME_CLIENT_SHA256" in build_release
+            and "actual_client_sha256" in build_release
+            and "gaius-java-finite-long-cast" in build_release
+            and "target-attestation" in build_release
+            and 'node --check "$client_js"' in build_release
+            and 'gzip -t "$vanilla_asset_pack"' in build_release,
+        ),
+        (
             "TeaVM build can skip overlay rebuild after a verified overlay-only pass",
             "GAIUS_SKIP_OVERLAY_BUILD" in build_teavm
             and 'Skipping overlay rebuild because GAIUS_SKIP_OVERLAY_BUILD=true' in build_teavm
@@ -4279,8 +4548,38 @@ def check_source_patches() -> None:
             and "Number.isFinite" in postprocess_teavm_js
             and "9223372036854775807" in postprocess_teavm_js
             and "gaius-java-finite-long-cast" in postprocess_teavm_js
+            and "gaius-integrated-server-input-coroutine" in postprocess_teavm_js
+            and "pumpIntegratedServerNetworkInput" in postprocess_teavm_js
+            and "$rt_startThread" in postprocess_teavm_js
+            and "integratedServerPumpCoalesced" in postprocess_teavm_js
             and 'find_anchored(' in postprocess_teavm_js
             and '"Number.isFinite"' in postprocess_teavm_js,
+        ),
+        (
+            "TeaVM JS postprocess preserves the release file on write failure",
+            "import os" in postprocess_teavm_js
+            and "import tempfile" in postprocess_teavm_js
+            and "temporary.flush()" in postprocess_teavm_js
+            and "os.fsync(temporary.fileno())" in postprocess_teavm_js
+            and "os.replace(temporary_name, target)" in postprocess_teavm_js
+            and "os.unlink(temporary_name)" in postprocess_teavm_js
+            and "write_text_atomically(target, patched)" in postprocess_teavm_js
+            and "test_replace_failure_preserves_original_and_cleans_temp"
+                in postprocess_teavm_js_test
+            and "test_fsync_failure_preserves_original_and_cleans_temp"
+                in postprocess_teavm_js_test
+            and "TEAVM_LONG_HELPER" in postprocess_teavm_js_test,
+        ),
+        (
+            "Portable HTML publication preserves the previous release on write failure",
+            "import tempfile" in build_portable_html
+            and "temporary.flush()" in build_portable_html
+            and "os.fsync(temporary.fileno())" in build_portable_html
+            and "os.replace(temporary_name, target)" in build_portable_html
+            and "write_text_atomically(output, portable)" in build_portable_html
+            and "test_atomic_write_replaces_complete_file" in build_portable_html_test
+            and "test_replace_failure_preserves_original_and_cleans_temp"
+                in build_portable_html_test,
         ),
         (
             "Generated release client uses JVM-safe finite-to-long conversion",
@@ -4295,6 +4594,29 @@ def check_source_patches() -> None:
                 rb"BigInt\.asIntN\(64,BigInt\([A-Za-z_$][A-Za-z0-9_$]*>=0\?"
                 rb"Math\.floor\([A-Za-z_$][A-Za-z0-9_$]*\):"
                 rb"Math\.ceil\([A-Za-z_$][A-Za-z0-9_$]*\)\)\)",
+            ),
+        ),
+        (
+            "Generated server Worker pumps input from a TeaVM coroutine context",
+            file_contains(
+                SERVER_WORKER_JS,
+                "/*gaius-integrated-server-input-coroutine*/",
+            )
+            and file_contains(
+                SERVER_WORKER_JS,
+                ".__gaiusStartIntegratedServerPump = () =>",
+            )
+            and file_contains(
+                SERVER_WORKER_JS,
+                ".$rt_startThread(",
+            )
+            and file_contains(
+                SERVER_WORKER_JS,
+                ".pumpIntegratedServerNetworkInput()",
+            )
+            and not file_contains(
+                SERVER_WORKER_JS,
+                "__gaiusDebugIntegratedServerThread",
             ),
         ),
         (
@@ -4340,8 +4662,13 @@ def check_source_patches() -> None:
             "Dist assets can be precompressed for faster browser loading",
             "gzip -kf -9" in compress_dist
             and "brotli -f -q 11" in compress_dist
+            and "compress-brotli.mjs" in compress_dist
+            and "createBrotliCompress" in compress_brotli
+            and "BROTLI_PARAM_QUALITY" in compress_brotli
+            and "rename(temporary, output)" in compress_brotli
             and "*.js" in compress_dist
-            and "*.html" in compress_dist,
+            and "*.html" in compress_dist
+            and "GAIUS_COMPRESS_EXCLUDE" in compress_dist,
         ),
         (
             "Local dist server serves precompressed classes.js when available",
@@ -4690,6 +5017,10 @@ def check_overlay_bytecode() -> None:
         "net.minecraft.client.renderer.chunk.SectionCompiler",
     )
     minecraft_server = run_javap(client_cp, "net.minecraft.server.MinecraftServer")
+    blockable_event_loop = run_javap(
+        client_cp,
+        "net.minecraft.util.thread.BlockableEventLoop",
+    )
     chunk_map = run_javap(client_cp, "net.minecraft.server.level.ChunkMap")
     server_chunk_cache = run_javap(
         client_cp,
@@ -4718,6 +5049,10 @@ def check_overlay_bytecode() -> None:
     server_game_packet_listener = run_javap(
         client_cp,
         "net.minecraft.server.network.ServerGamePacketListenerImpl",
+    )
+    player_chunk_sender = run_javap(
+        client_cp,
+        "net.minecraft.server.network.PlayerChunkSender",
     )
     server_player_game_mode = run_javap(
         client_cp,
@@ -5007,6 +5342,10 @@ def check_overlay_bytecode() -> None:
         server_game_packet_listener,
         "public void handleChunkBatchReceived(net.minecraft.network.protocol.game.ServerboundChunkBatchReceivedPacket);",
     )
+    player_send_next_chunks = method_section(
+        player_chunk_sender,
+        "public void sendNextChunks(net.minecraft.server.level.ServerPlayer);",
+    )
     server_player_handle_break = method_section(
         server_player_game_mode,
         "public void handleBlockBreakAction(net.minecraft.core.BlockPos, net.minecraft.network.protocol.game.ServerboundPlayerActionPacket$Action, net.minecraft.core.Direction, int, int);",
@@ -5273,6 +5612,22 @@ def check_overlay_bytecode() -> None:
         browser_integrated_server_main_class,
         "public static void pumpUrgentPacketsIfPending();",
     )
+    browser_stage_network_input = method_section(
+        browser_integrated_server_main_class,
+        "public static void pumpIntegratedServerNetworkInput();",
+    )
+    browser_signal_network_input = method_section(
+        browser_integrated_server_main_class,
+        "public static void signalIntegratedServerNetworkInput();",
+    )
+    browser_run_scheduled_network_input = method_section(
+        browser_integrated_server_main_class,
+        "private static void runScheduledNetworkInput();",
+    )
+    blockable_event_loop_schedule = method_section(
+        blockable_event_loop,
+        "public void schedule(R);",
+    )
     browser_gzip_read_nbt = method_section(
         browser_gzip_class,
         "public static net.minecraft.nbt.CompoundTag readCompressedNbt(java.io.InputStream) throws java.io.IOException;",
@@ -5364,6 +5719,14 @@ def check_overlay_bytecode() -> None:
     browser_acknowledge_chunk_batch = method_section(
         browser_integrated_server_main_class,
         "public static void acknowledgeChunkBatch();",
+    )
+    browser_record_chunk_batch = method_section(
+        browser_integrated_server_main_class,
+        "public static void recordChunkBatchSent(int);",
+    )
+    browser_active_view_acknowledged = method_section(
+        browser_integrated_server_main_class,
+        "private static boolean activeViewDistanceAcknowledged();",
     )
     browser_tick_distances = method_section(
         browser_integrated_server_main_class,
@@ -6441,7 +6804,8 @@ def check_overlay_bytecode() -> None:
         (
             "Compiled browser Math.fma remains native for TeaVM JSBody lowering",
             "public static native float fma(float, float, float);" in modern_runtime_support_class
-            and "public static native double fma(double, double, double);" in modern_runtime_support_class,
+            and "public static native double fma(double, double, double);" in modern_runtime_support_class
+            and "public static native void yieldToEventLoop(int);" in modern_runtime_support_class,
         ),
         (
             "Compiled JOML fma bypasses the TeaVM static runtime method",
@@ -7561,11 +7925,12 @@ def check_overlay_bytecode() -> None:
             and "Can't keep up! Is the server overloaded?" not in minecraft_run_server,
         ),
         (
-            "MinecraftServer chooses browser spawn height without generating a full chunk",
+            "MinecraftServer anchors browser spawn above the generated column",
             "server.browserFastInitialSpawn" in minecraft_initial_spawn
             and "Climate$Sampler.findSpawnPosition" in minecraft_initial_spawn
-            and "ChunkGenerator.getBaseHeight" in minecraft_initial_spawn
-            and "Heightmap$Types.MOTION_BLOCKING_NO_LEAVES" in minecraft_initial_spawn
+            and "ServerLevel.getMaxY" in minecraft_initial_spawn
+            and "ChunkGenerator.getBaseHeight" not in minecraft_initial_spawn
+            and "Heightmap$Types.MOTION_BLOCKING_NO_LEAVES" not in minecraft_initial_spawn
             and "ChunkPos.getMiddleBlockX" in minecraft_initial_spawn
             and "ChunkPos.getMiddleBlockZ" in minecraft_initial_spawn
             and "PlayerSpawnFinder.getSpawnPosInChunk" not in minecraft_initial_spawn
@@ -7574,12 +7939,15 @@ def check_overlay_bytecode() -> None:
         ),
         (
             "Browser spawn preparation retains neighbors and corrects unsafe saved heights",
-            "Method fixupSpawnHeight:" in player_find_spawn
+            "Vec3.atBottomCenterOf" in player_find_spawn
             and "CompletableFuture.completedFuture" in player_find_spawn
-            and "Vec3.atBottomCenterOf" not in player_find_spawn
+            and "Method fixupSpawnHeight:" not in player_find_spawn
             and "PlayerSpawnFinder.getSpawnPosInChunk" not in player_find_spawn
             and "BlockPos.containing" in player_fixup_loaded_spawn
-            and "Method fixupSpawnHeight:" in player_fixup_loaded_spawn
+            and "Method getSpawnPosInChunk:" in player_fixup_loaded_spawn
+            and "Heightmap$Types.MOTION_BLOCKING_NO_LEAVES" in player_fixup_loaded_spawn
+            and "ServerLevel.getHeightmapPos" in player_fixup_loaded_spawn
+            and "Vec3.atBottomCenterOf" in player_fixup_loaded_spawn
             and "PlayerSpawnFinder.gaius$fixupLoadedSpawn" in prepare_spawn_tick
             and prepare_spawn_tick.rfind(
                 "CompletableFuture.isDone",
@@ -7658,6 +8026,16 @@ def check_overlay_bytecode() -> None:
             and "PlayerChunkSender.onChunkBatchReceivedByClient" in server_game_chunk_batch
             and server_game_chunk_batch.find("PlayerChunkSender.onChunkBatchReceivedByClient")
                 < server_game_chunk_batch.find("acknowledgeChunkBatch")
+            and "BrowserIntegratedServerMain.recordChunkBatchSent" in player_send_next_chunks
+            and "ClientboundChunkBatchFinishedPacket" in player_send_next_chunks
+            and player_send_next_chunks.find("recordChunkBatchSent")
+                > player_send_next_chunks.find("ClientboundChunkBatchFinishedPacket")
+            and "java/util/Deque.addLast" in browser_record_chunk_batch
+            and "java/util/Deque.pollFirst" in browser_acknowledge_chunk_batch
+            and "chunk-batch-ack-without-send" in browser_acknowledge_chunk_batch
+            and "acknowledgedChunkCount" in browser_acknowledge_chunk_batch
+            and "Method activeViewDistanceAcknowledged:()Z"
+                in browser_acknowledge_chunk_batch
             and "configuredDistancesActive" in browser_acknowledge_chunk_batch
             and "Math.min" in browser_acknowledge_chunk_batch
             and "System.currentTimeMillis" in browser_acknowledge_chunk_batch
@@ -7665,8 +8043,12 @@ def check_overlay_bytecode() -> None:
             and "applyActiveDistances" in browser_acknowledge_chunk_batch
             and "advanceConfiguredDistances" in browser_acknowledge_chunk_batch
             and "distanceAdvancePending" in browser_tick_distances
+            and "Method activeViewDistanceAcknowledged:()Z" in browser_tick_distances
             and "System.currentTimeMillis" in browser_tick_distances
             and "advanceConfiguredDistances" in browser_tick_distances
+            and "activeViewDistance" in browser_active_view_acknowledged
+            and "acknowledgedChunkCount" in browser_active_view_acknowledged
+            and "Math.max" in browser_active_view_acknowledged
             and "activeViewDistance" in browser_advance_distances
             and "applyActiveDistances" in browser_advance_distances
             and "BrowserIntegratedServerMain.advanceConfiguredDistances"
@@ -7679,11 +8061,12 @@ def check_overlay_bytecode() -> None:
             and "BrowserWebSocketChannel.pumpAll" not in worldgen_checkpoint
             and "Method nowMillis:()D" in worldgen_pulse
             and "Method yieldNow:()V" in worldgen_pulse
-            and "java/lang/Thread.sleep:(J)V" in worldgen_yield_now
+            and "TModernRuntimeSupport.yieldToEventLoop:(I)V" in worldgen_yield_now
+            and "java/lang/Thread.sleep:(J)V" not in worldgen_yield_now
             and "Method networkPumpCount:()I" in worldgen_yield_now
             and "BrowserIntegratedServerMain.pumpUrgentPackets" in worldgen_yield_now
-            and "java/lang/Thread.currentThread:()Ljava/lang/Thread;" in worldgen_yield_now
-            and "java/lang/Thread.interrupt:()V" in worldgen_yield_now
+            and "java/lang/Thread.currentThread:()Ljava/lang/Thread;" not in worldgen_yield_now
+            and "java/lang/Thread.interrupt:()V" not in worldgen_yield_now
             and "BrowserWebSocketChannel.pumpAll" in browser_pump_urgent_packets
             and "MinecraftServer.packetProcessor" in browser_pump_urgent_packets
             and "PacketProcessor.processQueuedPackets" in browser_pump_urgent_packets,
@@ -7692,7 +8075,26 @@ def check_overlay_bytecode() -> None:
             "Integrated server pumps pending input while awaiting chunk futures",
             "BrowserIntegratedServerMain.pumpUrgentPacketsIfPending" in minecraft_poll_task
             and "BrowserWebSocketChannel.hasPendingInput" in browser_pump_pending_packets
-            and "pumpUrgentPackets:()V" in browser_pump_pending_packets,
+            and "pumpUrgentPackets:()V" in browser_pump_pending_packets
+            and "BrowserWebSocketChannel.pumpAll" not in browser_stage_network_input
+            and "Method signalIntegratedServerNetworkInput:()V"
+                in browser_stage_network_input
+            and "MinecraftServer.packetProcessor" not in browser_stage_network_input
+            and "PacketProcessor.processQueuedPackets" not in browser_stage_network_input
+            and 'net/minecraft/server/TickTask."<init>"' in browser_signal_network_input
+            and "-2147483648" in browser_signal_network_input
+            and "MinecraftServer.getTickCount" not in browser_signal_network_input
+            and "MinecraftServer.schedule" in browser_signal_network_input
+            and "MinecraftServer.execute" not in browser_signal_network_input
+            and "Method pumpUrgentPackets:()V" in browser_run_scheduled_network_input
+            and "Method reportRuntimeEvent" in browser_run_scheduled_network_input
+            and "java/util/Queue.add" in blockable_event_loop_schedule
+            and "Method getRunningThread" in blockable_event_loop_schedule
+            and "java/util/concurrent/locks/LockSupport.unpark"
+                in blockable_event_loop_schedule
+            and "java/lang/Runnable.run" not in blockable_event_loop_schedule
+            and "Method doRunTask" not in blockable_event_loop_schedule
+            and "Method execute" not in blockable_event_loop_schedule,
         ),
         (
             "Compiled structure templates retain NBT parsing behind native gzip",
@@ -7985,11 +8387,10 @@ def check_overlay_bytecode() -> None:
             and "PalettedContainer.getAndSetUnchecked" in section_fill_biomes,
         ),
         (
-            "ChunkGenerationTask retains hooks between synchronous generation stages",
-            "BrowserWorldgenScheduler.checkpoint" in generation_run_until_wait
-            and "Method scheduleNextLayer:()V" in generation_run_until_wait
-            and generation_run_until_wait.find("BrowserWorldgenScheduler.checkpoint")
-                < generation_run_until_wait.find("Method scheduleNextLayer:()V"),
+            "ChunkGenerationTask keeps layer claims synchronous to avoid dependency stalls",
+            "BrowserWorldgenScheduler.checkpoint" not in generation_run_until_wait
+            and "BrowserWorldgenScheduler.pulse" not in generation_run_until_wait
+            and "Method scheduleNextLayer:()V" in generation_run_until_wait,
         ),
         (
             "Browser ChunkTaskDispatcher preserves executor-future queue isolation",

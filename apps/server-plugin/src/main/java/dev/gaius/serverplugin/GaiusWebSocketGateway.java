@@ -12,9 +12,11 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.java_websocket.WebSocket;
@@ -28,6 +30,7 @@ final class GaiusWebSocketGateway extends WebSocketServer {
 
     private final String minecraftHost;
     private final int minecraftPort;
+    private final Target configuredTarget;
     private final int connectTimeoutMillis;
     private final int maximumConnections;
     private final int maximumFrameBytes;
@@ -35,6 +38,7 @@ final class GaiusWebSocketGateway extends WebSocketServer {
     private final byte[] accessToken;
     private final List<String> allowedOrigins;
     private final Logger logger;
+    private final Supplier<Socket> socketFactory;
     private final Map<WebSocket, Session> sessions = new ConcurrentHashMap<>();
 
     GaiusWebSocketGateway(
@@ -48,9 +52,36 @@ final class GaiusWebSocketGateway extends WebSocketServer {
             String accessToken,
             List<String> allowedOrigins,
             Logger logger) {
+        this(
+                listenAddress,
+                minecraftHost,
+                minecraftPort,
+                connectTimeoutMillis,
+                maximumConnections,
+                maximumFrameBytes,
+                proxyKeepAlives,
+                accessToken,
+                allowedOrigins,
+                logger,
+                Socket::new);
+    }
+
+    GaiusWebSocketGateway(
+            InetSocketAddress listenAddress,
+            String minecraftHost,
+            int minecraftPort,
+            int connectTimeoutMillis,
+            int maximumConnections,
+            int maximumFrameBytes,
+            boolean proxyKeepAlives,
+            String accessToken,
+            List<String> allowedOrigins,
+            Logger logger,
+            Supplier<Socket> socketFactory) {
         super(listenAddress);
         this.minecraftHost = minecraftHost;
         this.minecraftPort = minecraftPort;
+        this.configuredTarget = new Target(normalizeHost(minecraftHost), validatePort(minecraftPort));
         this.connectTimeoutMillis = connectTimeoutMillis;
         this.maximumConnections = maximumConnections;
         this.maximumFrameBytes = maximumFrameBytes;
@@ -60,6 +91,7 @@ final class GaiusWebSocketGateway extends WebSocketServer {
                 ? List.of("*")
                 : List.copyOf(allowedOrigins);
         this.logger = logger;
+        this.socketFactory = socketFactory;
         setReuseAddr(true);
         setTcpNoDelay(true);
         setConnectionLostTimeout(30);
@@ -209,17 +241,43 @@ final class GaiusWebSocketGateway extends WebSocketServer {
                 webSocket.close(CLOSE_POLICY, "Invalid Gaius access token");
                 return;
             }
+            Target requestedTarget;
+            try {
+                requestedTarget = targetFromControl(control);
+            } catch (IllegalArgumentException exception) {
+                webSocket.close(CLOSE_POLICY, exception.getMessage());
+                return;
+            }
+            if (!configuredTarget.equals(requestedTarget)) {
+                webSocket.close(
+                        CLOSE_POLICY,
+                        "Gaius target does not match the configured Minecraft server");
+                return;
+            }
+            webSocket.send(controlMessage("connecting", requestedTarget));
             Thread.ofVirtual().name("gaius-websocket-connect").start(() -> {
                 try {
-                    Socket target = new Socket();
+                    Socket target = socketFactory.get();
+                    socket = target;
+                    if (closed.get()) {
+                        target.close();
+                        return;
+                    }
                     target.setTcpNoDelay(true);
                     target.setKeepAlive(true);
                     target.connect(
                             new InetSocketAddress(minecraftHost, minecraftPort),
                             connectTimeoutMillis);
-                    socket = target;
-                    output = target.getOutputStream();
-                    webSocket.send("{\"type\":\"connected\"}");
+                    if (closed.get()) {
+                        return;
+                    }
+                    synchronized (outputLock) {
+                        if (closed.get()) {
+                            return;
+                        }
+                        output = target.getOutputStream();
+                    }
+                    webSocket.send(controlMessage("connected", requestedTarget));
                     copyServerToBrowser(target.getInputStream());
                 } catch (IOException exception) {
                     if (!closed.get()) {
@@ -229,6 +287,41 @@ final class GaiusWebSocketGateway extends WebSocketServer {
                     close();
                 }
             });
+        }
+
+        private Target targetFromControl(JsonObject control) {
+            boolean hasHost = control.has("host");
+            boolean hasPort = control.has("port");
+            if (!hasHost && !hasPort) {
+                // The original direct-plugin protocol omitted the target fields.
+                return configuredTarget;
+            }
+            if (!hasHost || !hasPort) {
+                throw new IllegalArgumentException("Gaius target host and port are required together");
+            }
+            if (!control.get("host").isJsonPrimitive()
+                    || !control.getAsJsonPrimitive("host").isString()) {
+                throw new IllegalArgumentException("Gaius target host must be a string");
+            }
+            String host = normalizeHost(control.get("host").getAsString());
+            int port;
+            try {
+                port = control.get("port").getAsInt();
+            } catch (RuntimeException exception) {
+                throw new IllegalArgumentException("Gaius target port must be an integer", exception);
+            }
+            return new Target(host, validatePort(port));
+        }
+
+        private String controlMessage(String type, Target target) {
+            JsonObject message = new JsonObject();
+            message.addProperty("type", type);
+            message.addProperty("host", target.host());
+            message.addProperty("port", target.port());
+            if (type.equals("connecting")) {
+                message.addProperty("targetConnectTimeoutMs", connectTimeoutMillis);
+            }
+            return message.toString();
         }
 
         private void write(byte[] bytes) {
@@ -328,5 +421,36 @@ final class GaiusWebSocketGateway extends WebSocketServer {
                 webSocket.close(1000, "Gaius tunnel closed");
             }
         }
+    }
+
+    private record Target(String host, int port) {}
+
+    private static String normalizeHost(String host) {
+        if (host == null) {
+            throw new IllegalArgumentException("Gaius target host must not be empty");
+        }
+        String normalized = host.trim().toLowerCase(Locale.ROOT);
+        if (normalized.startsWith("[") && normalized.endsWith("]")) {
+            normalized = normalized.substring(1, normalized.length() - 1);
+        }
+        while (normalized.length() > 1 && normalized.endsWith(".")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        if (normalized.isEmpty()
+                || normalized.indexOf('\0') >= 0
+                || normalized.indexOf('\r') >= 0
+                || normalized.indexOf('\n') >= 0
+                || normalized.indexOf('/') >= 0
+                || normalized.indexOf('\\') >= 0) {
+            throw new IllegalArgumentException("Gaius target host is invalid");
+        }
+        return normalized;
+    }
+
+    private static int validatePort(int port) {
+        if (port < 1 || port > 65535) {
+            throw new IllegalArgumentException("Gaius target port must be between 1 and 65535");
+        }
+        return port;
     }
 }

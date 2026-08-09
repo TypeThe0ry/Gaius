@@ -25,3 +25,63 @@ jobs:
 
       - name: Validate public RelayNode registry
         run: node tools/check-relay-registry.mjs
+
+  release-metadata:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/bridge/package-lock.json
+
+      - name: Validate release metadata and screenshots
+        run: node tools/check-release-metadata.mjs
+
+  bridge-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/bridge/package-lock.json
+
+      - name: Install RelayNode dependencies
+        run: npm ci --prefix apps/bridge
+
+      - name: Run RelayNode protocol and registry smoke tests
+        run: npm run smoke --prefix apps/bridge
+
+  paper-plugin-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: false
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: maven
+
+      - name: Run Paper plugin unit tests
+        run: ./port/mvnw -B -ntp -f apps/server-plugin/pom.xml test

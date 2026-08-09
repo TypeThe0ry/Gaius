@@ -30,6 +30,28 @@ else
   )
 fi
 
+if [[ -n "${GAIUS_COMPRESS_EXCLUDE:-}" ]]; then
+  IFS=: read -r -a excluded_files <<<"$GAIUS_COMPRESS_EXCLUDE"
+  filtered_files=()
+  for file in "${files[@]}"; do
+    excluded=false
+    for excluded_file in "${excluded_files[@]}"; do
+      if [[ -z "$excluded_file" || "$excluded_file" == */* ]]; then
+        echo "Invalid dist compression exclusion: $excluded_file" >&2
+        exit 1
+      fi
+      if [[ "${file##*/}" == "$excluded_file" ]]; then
+        excluded=true
+        break
+      fi
+    done
+    if [[ "$excluded" != "true" ]]; then
+      filtered_files+=("$file")
+    fi
+  done
+  files=("${filtered_files[@]}")
+fi
+
 if [[ "${#files[@]}" -eq 0 ]]; then
   echo "No compressible dist assets found in $dist" >&2
   exit 1
@@ -39,6 +61,11 @@ for file in "${files[@]}"; do
   gzip -kf -9 "$file"
   if command -v brotli >/dev/null 2>&1; then
     brotli -f -q 11 "$file"
+  elif command -v node >/dev/null 2>&1; then
+    node "$root/port/scripts/compress-brotli.mjs" "$file"
+  else
+    echo "Neither brotli nor node is available to create $file.br" >&2
+    exit 1
   fi
 done
 

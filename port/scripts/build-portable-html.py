@@ -5,11 +5,44 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 
 CHUNK_SIZE = 1_000_000
+
+
+def write_text_atomically(target: Path, text: str) -> None:
+    """Replace the portable artifact only after its complete contents are durable."""
+    temporary_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_name = temporary.name
+            temporary.write(text)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, target)
+        temporary_name = None
+        directory_fd = os.open(target.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
 
 
 def base64_chunks(path: Path) -> list[str]:
@@ -107,7 +140,7 @@ def build(dist: Path, output: Path) -> None:
     if marker not in index:
         raise RuntimeError("portable launcher insertion point was not found")
     portable = index.replace(marker, bootstrap + marker, 1)
-    output.write_text(portable, encoding="utf-8")
+    write_text_atomically(output, portable)
     print(f"Portable Gaius HTML: {output} ({output.stat().st_size} bytes)")
 
 

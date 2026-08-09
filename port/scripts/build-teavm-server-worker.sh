@@ -49,7 +49,7 @@ echo "POM: $pom"
 echo "Log: $log"
 
 set +e
-MAVEN_OPTS="${MAVEN_OPTS:--Xms4g -Xmx20g -XX:+UseG1GC -XX:MaxGCPauseMillis=300}" \
+MAVEN_OPTS="${MAVEN_OPTS:--Xms2g -Xmx14g -XX:+UseG1GC -XX:MaxGCPauseMillis=500}" \
   "$root/port/mvnw" \
   --batch-mode \
   --errors \

@@ -1,0 +1,45 @@
+package org.lwjgl.opengl;
+
+/** Browser replacement for LWJGL's native OpenGL loader. */
+public final class GL {
+    private static GLCapabilities capabilities;
+
+    private GL() {
+    }
+
+    static void initialize() {
+    }
+
+    public static void create() {
+        BrowserOpenGL.initialize();
+    }
+
+    public static void create(String libraryName) {
+        create();
+    }
+
+    public static void destroy() {
+        capabilities = null;
+    }
+
+    public static void setCapabilities(GLCapabilities value) {
+        capabilities = value;
+    }
+
+    public static GLCapabilities getCapabilities() {
+        if (capabilities == null) {
+            capabilities = createCapabilities();
+        }
+        return capabilities;
+    }
+
+    public static GLCapabilities createCapabilities() {
+        BrowserOpenGL.initialize();
+        capabilities = new GLCapabilities();
+        return capabilities;
+    }
+
+    public static GLCapabilities createCapabilities(boolean forwardCompatible) {
+        return createCapabilities();
+    }
+}

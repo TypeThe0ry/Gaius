@@ -15,7 +15,18 @@
 <body>
   <div id="status">Running the TeaVM platform smoke...</div>
   <canvas id="mc-canvas" tabindex="0"></canvas>
-  <script src="platform-smoke-v4.js?v=11"></script>
-  <script>main([]);</script>
+  <script src="vanilla-assets-smoke-loader.js?v=1"></script>
+  <script src="platform-smoke-v4.js?v=12"></script>
+  <script>
+    window.__gaiusVanillaAssetsReady.then(
+      () => main([]),
+      (error) => {
+        const status = document.getElementById("status");
+        status.dataset.success = "false";
+        status.textContent = "vanilla assets: " + String(error);
+        console.error(error);
+      }
+    );
+  </script>
 </body>
 </html>

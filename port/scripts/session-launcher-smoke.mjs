@@ -223,6 +223,22 @@ assert.equal(complete.mode, "online");
 assert.equal(complete.prompted, false);
 assert.equal(complete.args[complete.args.indexOf("--username") + 1], "StoredPlayer");
 
+const queriedIdentity = await runScenario({
+  search: "?username=QueryPlayer&uuid=00112233445566778899aabbccddeeff" +
+    "&accessToken=query-token&xuid=42&clientId=gaius-client&server=example.org",
+});
+assert.equal(queriedIdentity.mode, "online");
+assert.equal(queriedIdentity.args[queriedIdentity.args.indexOf("--username") + 1], "QueryPlayer");
+assert.equal(queriedIdentity.historyCalls.length, 1);
+const scrubbedIdentityUrl = new URL(
+  String(queriedIdentity.historyCalls[0][2]),
+  "http://127.0.0.1:8781",
+);
+assert.equal(scrubbedIdentityUrl.searchParams.get("server"), "example.org");
+for (const key of ["username", "uuid", "accessToken", "xuid", "clientId"]) {
+  assert.equal(scrubbedIdentityUrl.searchParams.has(key), false);
+}
+
 const switched = await runScenario({
   search: "?username=QueryPlayer&uuid=00112233445566778899aabbccddeeff&server=example.org",
   stored: {
@@ -264,6 +280,7 @@ console.log(JSON.stringify({
   profileResolution: true,
   completeSessionBypassesFetch: true,
   titleScreenNameSwitch: true,
+  identityQueryScrubbedOnLaunch: true,
   identityQueryScrubbedOnSwitch: true,
   invalidProfileRejected: true,
   accessTokenScrubbed: true,

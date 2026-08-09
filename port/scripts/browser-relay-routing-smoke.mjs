@@ -118,6 +118,7 @@ globalThis.fetch = async (input, options = {}) => {
             ok: true,
             kind: "gaius-relay-node",
             protocolVersion: 1,
+            capabilities: ["target-attestation"],
             availableConnections: manifestScenario === "capacity" &&
                 url.hostname === "priority.example"
                     ? 0
@@ -171,10 +172,27 @@ class MockWebSocket {
         const message = JSON.parse(data);
         sentControls.push({ url: this.url, message, socket: this });
         if (message.type === "connect") {
-            const connectedDelayMs = message.host === "slow.ellan.top" ? 9000 : 0;
+            const direct = new URL(this.url).port === "8081";
+            if (direct) {
+                this.onmessage?.({
+                    data: JSON.stringify({
+                        type: "connecting",
+                        targetConnectTimeoutMs: 2000,
+                    }),
+                });
+            }
+            const connectedDelayMs = message.host === "slow.ellan.top"
+                ? 9000
+                : (message.host === "slow-plugin.ellan.top" ? 1200 : 0);
             setTimeout(() => {
                 if (this.readyState === MockWebSocket.OPEN) {
-                    this.onmessage?.({ data: JSON.stringify({ type: "connected" }) });
+                    const wrongTarget = manifestScenario === "attestation" &&
+                        new URL(this.url).hostname === "priority.example";
+                    this.onmessage?.({ data: JSON.stringify({
+                        type: "connected",
+                        host: wrongTarget ? "wrong.example" : message.host,
+                        port: message.port,
+                    }) });
                 }
             }, connectedDelayMs);
         }
@@ -227,6 +245,30 @@ async function verifyDirectPluginFirst() {
     assert.equal(registryRequests.length, registriesAtStart,
             "RelayNode registries were fetched while the direct plugin was available");
     bridge.close(1);
+}
+
+async function verifySlowDirectPluginBudget() {
+    directPluginAvailable = true;
+    manifestScenario = "plugin";
+    const openedAtStart = openedSockets.length;
+    const manifestsAtStart = manifestRequests.length;
+    const registriesAtStart = registryRequests.length;
+    const connectedAtStart = stats.connected;
+    bridge.open(11, "slow-plugin.ellan.top", 25565);
+    await waitFor(
+            () => stats.connected === connectedAtStart + 1,
+            "slow direct plugin connection",
+            3000);
+    assert.deepEqual(
+            openedSockets.slice(openedAtStart).map((socket) => socket.url),
+            ["wss://slow-plugin.ellan.top:8081/tunnel"],
+            "A direct plugin that advertised its connect budget incorrectly fell back to RelayNode");
+    assert.equal(manifestRequests.length, manifestsAtStart,
+            "RelayNode manifests were probed while the direct plugin was connecting");
+    assert.equal(registryRequests.length, registriesAtStart,
+            "RelayNode registries were fetched while the direct plugin was connecting");
+    bridge.close(11);
+    await delay(2);
 }
 
 async function verifyRelaySelection(id, scenario, expectedUrl, host,
@@ -324,7 +366,32 @@ async function verifyRelayFailover(id, host) {
     await delay(2);
 }
 
+async function verifyTargetAttestationFailover(id, host) {
+    directPluginAvailable = false;
+    manifestScenario = "attestation";
+    const openedAtStart = openedSockets.length;
+    const connectedAtStart = stats.connected;
+    const failoversAtStart = stats.relayFailovers;
+    const attestationFailuresAtStart = stats.relayTargetAttestationFailures;
+    bridge.open(id, host, 25565);
+    await waitFor(() => stats.connected === connectedAtStart + 1,
+            "target-attested RelayNode failover connection");
+    const attempts = openedSockets.slice(openedAtStart).map((socket) => socket.url);
+    assert.deepEqual(attempts, [
+        `wss://${host}:8081/tunnel`,
+        "wss://priority.example/tunnel",
+        "wss://registry-node.example/tunnel",
+    ], "RelayNode target attestation mismatch did not trigger failover");
+    assert.equal(stats.relayFailovers, failoversAtStart + 1,
+            "Target attestation mismatch did not increment failover telemetry");
+    assert.equal(stats.relayTargetAttestationFailures, attestationFailuresAtStart + 1,
+            "Target attestation mismatch telemetry was not incremented");
+    bridge.close(id);
+    await delay(2);
+}
+
 await verifyDirectPluginFirst();
+await verifySlowDirectPluginBudget();
 await verifyRelaySelection(
         2, "active", "wss://affinity.example/tunnel", "active.ellan.top");
 await verifyRelaySelection(
@@ -340,13 +407,14 @@ await verifyRelaySelection(
 await verifyRelaySelection(
         8, "capacity", "wss://registry-node.example/tunnel", "capacity.ellan.top");
 await verifyRelayFailover(9, "failover.ellan.top");
+await verifyTargetAttestationFailover(12, "attestation.ellan.top");
 await verifyRelaySelection(
         10, "nested", "wss://dynamic-node.example/tunnel", "nested.ellan.top");
 
 const chosenRelaySockets = sentControls
-        .filter((entry) => entry.url !== "wss://ellan.top:8081/tunnel")
+        .filter((entry) => new URL(entry.url).port !== "8081")
         .map((entry) => entry.socket);
-assert.equal(new Set(chosenRelaySockets).size, 10,
+assert.equal(new Set(chosenRelaySockets).size, 12,
         "Browser channels shared a Minecraft TCP tunnel instead of node affinity");
 assert.ok(stats.relayTargetActiveSelections >= 1,
         "Active target-affinity selection was not recorded");
@@ -398,5 +466,6 @@ console.log(JSON.stringify({
     activeRelayTargetLeases: stats.activeRelayTargetLeases,
     targetConnectTimeoutMs:
         stats.relayNodes["wss://priority.example/tunnel"].targetConnectTimeoutMs,
+    slowDirectPluginBudget: true,
     isolatedRelaySockets: new Set(chosenRelaySockets).size,
 }));

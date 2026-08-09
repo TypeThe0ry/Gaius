@@ -7,17 +7,39 @@ can be verified.
 
 ## Development Setup
 
-Install JDK 21, a current Node.js LTS release, Python 3, `curl`, `jq`, `unzip`,
-and `shasum`. Then obtain the local-only game inputs and perform the first
-remap:
+Install Git LFS, JDK 21, Node.js 22 or newer, Python 3, `curl`, `jq`, `unzip`,
+and `shasum`. After cloning, fetch the large checked-in release objects before
+working with generated browser files:
+
+```sh
+git lfs install
+git lfs pull
+```
+
+The game inputs are local-only and are not supplied by this repository. Obtain
+them through the supported local workflow, then perform the first remap:
 
 ```sh
 ./port/scripts/fetch-version.sh
 ./port/scripts/remap-client.sh
 ```
 
-The full client compilation can use up to 20 GiB of Java heap. Use a machine
-with at least 32 GiB of physical memory for reliable full-release builds.
+The full client compilation defaults to a 14 GiB Java heap. Use a machine with
+at least 24 GiB of physical memory and close memory-heavy applications for
+reliable full-release builds. Override `MAVEN_OPTS` only when the host has
+enough headroom.
+
+For a source checkout that already has the local inputs, the normal browser
+release commands are:
+
+```sh
+./port/scripts/build-platform-smoke.sh
+./port/scripts/build-teavm-release.sh
+python3 port/scripts/quick-check.py
+```
+
+The build produces the runnable package under `port/web/dist/`. Do not edit
+generated files there by hand; change their source and rebuild instead.
 
 ## Repository Boundaries
 
@@ -57,9 +79,20 @@ For the Paper plugin:
 
 For RelayNode changes, run `cd apps/bridge && npm run smoke`; it verifies the
 manifest, required token, TCP forwarding, flow control, and local-tunnel
-pairing. A passing static check does not replace a Chrome
-runtime check: enter a local world and verify input, terrain rendering, sound,
-and a short movement through chunk boundaries.
+pairing. Use `npm run smoke:public` only against a relay endpoint you are
+authorized to test. A passing static check does not replace a Chrome runtime
+check: serve `port/web/` locally, open the `/dist/` launcher in Chrome, enter a
+local world, and verify input, terrain rendering, sound, and a short movement
+through chunk boundaries. For multiplayer changes, also verify server-list
+status and a connection through the intended plugin or relay path.
+
+Record the exact commands and environment in the pull request. Do not report a
+check as passing unless it was actually run. For release-sized files, confirm
+the checksum of each artifact with:
+
+```sh
+shasum -a 256 port/web/dist/Gaius.html
+```
 
 ## Pull Requests
 
@@ -72,6 +105,11 @@ Browser package changes belong with their source commit through Git LFS. Verify
 them with `./tools/check-lfs.sh` before opening a pull request. CI artifacts and
 GitHub Releases remain useful mirrors, but are not the only copy. Do not move
 the generated browser release to a separate repository.
+
+Keep generated release files in LFS and never commit local runtime output,
+worlds, credentials, or server access details. If a change adds a new large
+artifact, update `.gitattributes` deliberately and verify that the Git index
+contains an LFS pointer rather than a normal large blob.
 
 ## Reporting Bugs
 

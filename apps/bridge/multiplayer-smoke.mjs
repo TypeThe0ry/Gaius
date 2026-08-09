@@ -27,6 +27,9 @@ const minecraftAccessToken = process.env.GAIUS_SMOKE_ACCESS_TOKEN ?? "gaius-smok
 const minecraftProfileId = process.env.GAIUS_SMOKE_PROFILE_ID ??
         "00000000000040008000000000000002";
 const minecraftUsername = process.env.GAIUS_SMOKE_USERNAME ?? "GaiusSmoke";
+const dnsTransientHost = "dns-transient.gaius.test";
+const dnsPermanentHost = "dns-permanent.gaius.test";
+const srvTransientHost = "srv-transient.gaius.test";
 const minecraftPlaySoakMs = Math.max(
         0,
         Number.parseInt(process.env.GAIUS_SMOKE_PLAY_SOAK_MS ?? "0", 10) || 0);
@@ -126,13 +129,28 @@ const bridge = spawn(process.execPath, ["dist/main.js"], {
     cwd: directory,
     env: {
         ...process.env,
+        NODE_ENV: "test",
         GAIUS_BRIDGE_HOST: host,
         GAIUS_BRIDGE_PORT: String(bridgePort),
         GAIUS_ALLOWED_ORIGINS: origin,
-        GAIUS_ALLOWED_HOSTS: [host, minecraftHost].filter(Boolean).join(","),
+        GAIUS_ALLOWED_HOSTS: [
+            host,
+            minecraftHost,
+            dnsTransientHost,
+            dnsPermanentHost,
+            srvTransientHost,
+        ].filter(Boolean).join(","),
         GAIUS_ALLOWED_RESOURCE_PACK_HOSTS: [host, "localhost"].join(","),
         GAIUS_BRIDGE_TOKEN: bridgeToken,
         GAIUS_IDLE_TIMEOUT_MS: "60000",
+        GAIUS_DNS_RETRY_ATTEMPTS: "2",
+        GAIUS_DNS_RETRY_DELAY_MS: "1",
+        GAIUS_DNS_TEST_LOOKUP_HOST: dnsTransientHost,
+        GAIUS_DNS_TEST_LOOKUP_PERMANENT_HOST: dnsPermanentHost,
+        GAIUS_DNS_TEST_LOOKUP_FAILURES: "1",
+        GAIUS_DNS_TEST_SRV_HOST: srvTransientHost,
+        GAIUS_DNS_TEST_SRV_FAILURES: "1",
+        GAIUS_DNS_TEST_SRV_PORT: String(fixturePort),
     },
     stdio: ["ignore", "pipe", "pipe"],
 });
@@ -148,10 +166,12 @@ bridge.stderr.on("data", (chunk) => {
 });
 
 let webSocket;
+let dnsResolution;
 try {
     await waitFor(
             () => bridgeOutput.includes("Gaius translator node listening"),
             "translator node startup");
+    dnsResolution = await testDnsResolutionRetries(bridgePort, fixturePort, bridgeToken);
 
     const resourcePackProxyUrl = new URL(
             `http://${host}:${bridgePort}/proxy/resource-pack`);
@@ -226,6 +246,7 @@ try {
             !manifest.capabilities.includes("keepalive-proxy") ||
             !manifest.capabilities.includes("configuration-reentry") ||
             !manifest.capabilities.includes("target-affinity") ||
+            !manifest.capabilities.includes("target-attestation") ||
             manifest.targetAffinityMs < 1000 ||
             !manifest.capabilities.includes("resource-pack-proxy") ||
             !manifest.capabilities.includes("resource-pack-cache") ||
@@ -282,6 +303,14 @@ try {
     await waitFor(
             () => controls.some((message) => message.type === "connected"),
             "TCP tunnel connection");
+    const connectedControl = controls.find((message) => message.type === "connected");
+    if (connectedControl.host !== host || connectedControl.port !== fixturePort ||
+            connectedControl.candidateHost !== host ||
+            connectedControl.candidatePort !== fixturePort ||
+            !["127.0.0.1", "::ffff:127.0.0.1"].includes(connectedControl.remoteAddress) ||
+            connectedControl.remotePort !== fixturePort) {
+        throw new Error("Translator node did not attest the actual TCP peer");
+    }
     await waitFor(() => fixtureSocket !== undefined, "fixture connection");
 
     const targetActive = await (await fetchTargetManifest(
@@ -385,6 +414,7 @@ try {
             abortedUpstreamAttempts: slowResourcePackAttempts,
         },
         localTunnel,
+        dnsResolution,
         sharedTargetLifecycle,
         relayNode: {
             name: manifest.name,
@@ -501,9 +531,12 @@ async function testSharedTargetLifecycle(bridgePort, token) {
         await waitForTargetRoute(
                 bridgePort, targetPort, token, 1, "one remaining target lease");
 
-        clients[1].socket.close();
+        // A tab or browser process can disappear without completing a WebSocket close
+        // handshake. The RelayNode must release the final per-player TCP tunnel on that path
+        // too, otherwise a temporary target route can retain a live backend connection.
+        clients[1].socket.terminate();
         await once(clients[1].socket, "close");
-        await waitFor(() => targetSockets.size === 0, "last target tunnel release");
+        await waitFor(() => targetSockets.size === 0, "abrupt last target tunnel release");
         const released = await waitForTargetRoute(
                 bridgePort, targetPort, token, 0, "all target leases released");
         if (released.totalConnections !== 2 || released.recentlyReachable !== true) {
@@ -514,6 +547,7 @@ async function testSharedTargetLifecycle(bridgePort, token) {
             independentTcpSockets: 2,
             activeAfterFirstExit: 1,
             activeAfterLastExit: released.activeConnections,
+            abruptLastExit: true,
             recentlyReachableAfterLastExit: released.recentlyReachable,
         };
     }
@@ -567,6 +601,112 @@ async function testRejectedTunnel(bridgePort, fixturePort) {
     if (code !== 1008) {
         throw new Error(`Translator node accepted a tunnel without its required token (${code})`);
     }
+}
+
+async function testDnsResolutionRetries(bridgePort, fixturePort, token) {
+    const srvSocket = new WebSocket(`ws://${host}:${bridgePort}/tunnel`, {
+        headers: {origin},
+    });
+    const srvControls = [];
+    srvSocket.on("message", (data, binary) => {
+        if (!binary) srvControls.push(JSON.parse(data.toString("utf8")));
+    });
+    await once(srvSocket, "open");
+    srvSocket.send(JSON.stringify({
+        type: "connect",
+        host: srvTransientHost,
+        port: 25565,
+        token,
+    }));
+    await waitFor(
+            () => srvControls.some((message) => message.type === "connected"),
+            "transient SRV retry tunnel");
+    const connected = srvControls.find((message) => message.type === "connected");
+    if (connected.candidateHost !== host || connected.candidatePort !== fixturePort) {
+        throw new Error("RelayNode did not use the recovered SRV target");
+    }
+    srvSocket.close();
+    await once(srvSocket, "close");
+    fixtureSocket?.destroy();
+    fixtureSocket = undefined;
+
+    const retryBridgePort = await reservePort();
+    const retryBridge = spawn(process.execPath, ["dist/main.js"], {
+        cwd: directory,
+        env: {
+            ...process.env,
+            NODE_ENV: "test",
+            GAIUS_BRIDGE_HOST: host,
+            GAIUS_BRIDGE_PORT: String(retryBridgePort),
+            GAIUS_ALLOWED_ORIGINS: origin,
+            GAIUS_ALLOWED_HOSTS: [dnsTransientHost, dnsPermanentHost].join(","),
+            GAIUS_BRIDGE_TOKEN: token,
+            GAIUS_ALLOW_PRIVATE_TARGETS: "0",
+            GAIUS_DNS_RETRY_ATTEMPTS: "2",
+            GAIUS_DNS_RETRY_DELAY_MS: "1",
+            GAIUS_DNS_TEST_LOOKUP_HOST: dnsTransientHost,
+            GAIUS_DNS_TEST_LOOKUP_PERMANENT_HOST: dnsPermanentHost,
+            GAIUS_DNS_TEST_LOOKUP_FAILURES: "1",
+            GAIUS_DNS_TEST_LOOKUP_ADDRESS: host,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+    });
+    let retryBridgeOutput = "";
+    retryBridge.stdout.setEncoding("utf8");
+    retryBridge.stderr.setEncoding("utf8");
+    retryBridge.stdout.on("data", (chunk) => {
+        retryBridgeOutput += chunk;
+    });
+    retryBridge.stderr.on("data", (chunk) => {
+        retryBridgeOutput += chunk;
+    });
+    try {
+        await waitFor(
+                () => retryBridgeOutput.includes("Gaius translator node listening"),
+                "DNS guard test bridge startup");
+        const transientClose = await openDnsFailureTunnel(
+                retryBridgePort, dnsTransientHost, fixturePort, token);
+        if (transientClose.code !== 1011 ||
+                !retryBridgeOutput.includes("DNS lookup dns-transient.gaius.test") ||
+                !retryBridgeOutput.includes("retry 1/2") ||
+                !retryBridgeOutput.includes("Target hostname resolves only to private addresses")) {
+            throw new Error("RelayNode did not retry transient A/AAAA DNS errors before the private-target guard");
+        }
+        const transientRetryCount =
+                (retryBridgeOutput.match(/DNS lookup dns-transient\.gaius\.test/g) ?? []).length;
+        const permanentClose = await openDnsFailureTunnel(
+                retryBridgePort, dnsPermanentHost, fixturePort, token);
+        await delay(100);
+        const permanentRetryCount =
+                (retryBridgeOutput.match(/DNS lookup dns-permanent\.gaius\.test/g) ?? []).length;
+        if (permanentClose.code !== 1011 || permanentRetryCount !== 0 ||
+                !retryBridgeOutput.includes("ENOTFOUND resolving dns-permanent.gaius.test")) {
+            throw new Error("RelayNode retried a permanent ENOTFOUND DNS error");
+        }
+        return {
+            srvTransientFailures: 1,
+            srvRecoveredTarget: `${host}:${fixturePort}`,
+            lookupTransientFailures: transientRetryCount,
+            lookupPermanentRetries: permanentRetryCount,
+            privateTargetGuardPreserved: true,
+        };
+    }
+    finally {
+        retryBridge.kill("SIGTERM");
+        if (retryBridge.exitCode === null) {
+            await once(retryBridge, "exit");
+        }
+    }
+}
+
+async function openDnsFailureTunnel(bridgePort, targetHost, targetPort, token) {
+    const socket = new WebSocket(`ws://${host}:${bridgePort}/tunnel`, {
+        headers: {origin},
+    });
+    await once(socket, "open");
+    socket.send(JSON.stringify({type: "connect", host: targetHost, port: targetPort, token}));
+    const [code] = await once(socket, "close");
+    return {code};
 }
 
 function testConnectRequestNormalization() {

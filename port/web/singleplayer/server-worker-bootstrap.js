@@ -6,7 +6,8 @@ if (typeof Error === "function" && (!Error.stackTraceLimit || Error.stackTraceLi
 }
 const dbName = "gaius-fs-v1";
 const storeName = "files";
-const defaultWorldgenSliceMillis = 40;
+const defaultWorldgenSliceMillis = 20;
+const defaultDistanceRampIntervalMillis = 750;
 const files = root.__gaiusPersistentFiles = Object.create(null);
 let database;
 let pendingWrites = Promise.resolve();
@@ -27,6 +28,13 @@ function clampWorldgenSlice(value, fallback) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 4 && parsed <= 50
     ? parsed
+    : fallback;
+}
+
+function clampDistanceRampInterval(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 100 && parsed <= 2000
+    ? Math.round(parsed)
     : fallback;
 }
 
@@ -68,6 +76,12 @@ root.onmessage = async (event) => {
       requestedWorldgenSlice,
       defaultWorldgenSliceMillis,
     );
+    const requestedDistanceRampInterval = message.distanceRampIntervalMillis ??
+      root.__gaiusDistanceRampIntervalMillis;
+    root.__gaiusDistanceRampIntervalMillis = clampDistanceRampInterval(
+      requestedDistanceRampInterval,
+      defaultDistanceRampIntervalMillis,
+    );
     root.__gaiusBridgeUrl = message.bridgeUrl || undefined;
     root.__gaiusBridgeToken = message.bridgeToken || undefined;
     root.__gaiusLocalServerPorts = new Map([
@@ -98,6 +112,11 @@ root.onmessage = async (event) => {
       typeof signalIntegratedServerNetworkInput === "function"
         ? signalIntegratedServerNetworkInput
         : undefined;
+    // The generated helper owns a separate TeaVM continuation and only schedules a TickTask;
+    // packet decoding remains on the real server thread.
+    if (typeof root.__gaiusStartIntegratedServerPump !== "function") {
+      throw new Error("Singleplayer server input dispatcher is unavailable");
+    }
     postMessage({type: "runtime-ready", detail: root.__gaiusServerWorldId});
     markStartup("runtime-ready", startupStarted);
     main([]);

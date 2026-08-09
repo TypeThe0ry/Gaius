@@ -1833,17 +1833,21 @@ def patch_index(index: Path, classes_js: Path) -> bool:
     window.__gaiusClearSession = () => sessionStorage.removeItem("gaius.session");
     window.__gaiusDefaultArgsPromise = buildGaiusSessionArgs();
     window.__gaiusDefaultArgsPromise.catch(() => {});
-    if (urlParams.has("accessToken")) {
+    const identityQueryKeys = ["username", "uuid", "accessToken", "xuid", "clientId"];
+    if (identityQueryKeys.some(key => urlParams.has(key))) {
       const scrubbed = new URL(location.href);
-      scrubbed.searchParams.delete("accessToken");
+      for (const key of identityQueryKeys) scrubbed.searchParams.delete(key);
       history.replaceState(history.state, "", scrubbed.pathname + scrubbed.search + scrubbed.hash);
     }'''
     if "function createGaiusProxyUrl(target, kind)" in text:
         text, count = re.subn(
             r'    function createGaiusProxyUrl\(target, kind\) \{.*?'
-            r'    if \(urlParams\.has\("accessToken"\)\) \{\n'
+            r'(?:    const identityQueryKeys = \["username", "uuid", "accessToken", "xuid", "clientId"\];\n)?'
+            r'    if \((?:identityQueryKeys\.some\(key => urlParams\.has\(key\)\)'
+            r'|urlParams\.has\("accessToken"\))\) \{\n'
             r'      const scrubbed = new URL\(location\.href\);\n'
-            r'      scrubbed\.searchParams\.delete\("accessToken"\);\n'
+            r'(?:      for \(const key of identityQueryKeys\) scrubbed\.searchParams\.delete\(key\);'
+            r'|      scrubbed\.searchParams\.delete\("accessToken"\);)\n'
             r'      history\.replaceState\(history\.state, "", scrubbed\.pathname \+ scrubbed\.search \+ scrubbed\.hash\);\n'
             r'    \}',
             lambda _match: session_block,
