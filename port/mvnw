@@ -3,6 +3,9 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 config="$root/port/config.json"
+source "$root/port/scripts/version-profile.sh"
+gaius_load_version_profile "$root"
+gaius_select_java_home
 version="$(jq -er '.mavenVersion' "$config")"
 tools="$root/port/work/tools"
 archive="$tools/apache-maven-$version-bin.tar.gz"

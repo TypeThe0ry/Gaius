@@ -4,7 +4,11 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryUtil;
+import org.teavm.interop.Async;
+import org.teavm.interop.AsyncCallback;
 import org.teavm.jso.JSBody;
+import org.teavm.jso.JSFunctor;
+import org.teavm.jso.JSObject;
 
 /**
  * Browser implementation behind the original LWJGL GLFW API.
@@ -407,6 +411,7 @@ public final class BrowserGlfw {
             let now;
             if (telemetry && telemetry.enabled) {
               now=(typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+              if (!Number.isFinite(telemetry.startedAt)) telemetry.startedAt=now;
               const previous=telemetry.lastFrameAt;
               if (Number.isFinite(previous) && previous > 0) {
                 const frameElapsed=Math.max(0, now-previous);
@@ -420,7 +425,31 @@ public final class BrowserGlfw {
                 telemetry.frameCount=(telemetry.frameCount||0)+1;
                 telemetry.totalFrameMillis=(telemetry.totalFrameMillis||0)+frameElapsed;
                 telemetry.longestFrameMillis=Math.max(telemetry.longestFrameMillis||0, frameElapsed);
+                if (frameElapsed >= 500) {
+                  telemetry.freezeCount=(telemetry.freezeCount||0)+1;
+                }
+                let samples=telemetry.frameTimes;
+                if (!(samples instanceof Float32Array)) {
+                  const requested=Number(telemetry.sampleCapacity);
+                  const capacity=Number.isFinite(requested)
+                    ? Math.max(1024, Math.min(65536, Math.floor(requested)))
+                    : 65536;
+                  samples=new Float32Array(capacity);
+                  telemetry.frameTimes=samples;
+                  telemetry.sampleCapacity=capacity;
+                  telemetry.sampleWriteIndex=0;
+                  telemetry.sampleCount=0;
+                }
+                const writeIndex=(Number(telemetry.sampleWriteIndex)||0)%samples.length;
+                samples[writeIndex]=frameElapsed;
+                telemetry.sampleWriteIndex=(writeIndex+1)%samples.length;
+                telemetry.sampleCount=Math.min(
+                  samples.length,
+                  (Number(telemetry.sampleCount)||0)+1
+                );
               }
+              if (hidden) telemetry.hiddenFrameCount=(telemetry.hiddenFrameCount||0)+1;
+              else telemetry.visibleFrameCount=(telemetry.visibleFrameCount||0)+1;
               telemetry.lastFrameAt=now;
             }
             fps.gameFrames=(fps.gameFrames||0)+1;
@@ -448,12 +477,114 @@ public final class BrowserGlfw {
             """)
     private static native boolean swapBuffersJs();
 
+    @Async
+    private static native void yieldAfterPresent(boolean hidden);
+
+    private static void yieldAfterPresent(boolean hidden, AsyncCallback<Void> callback) {
+        scheduleFrameYield(hidden, () -> callback.complete(null));
+    }
+
+    @JSBody(params = {"hidden", "resume"}, script = """
+            const root=typeof window!=='undefined' ? window : globalThis;
+            const telemetry=root.__gaiusFrameTelemetry;
+            const telemetryEnabled=!!(telemetry && telemetry.enabled);
+            const clock=() => (typeof performance!=='undefined' && performance.now)
+              ? performance.now()
+              : Date.now();
+            const requestedAt=telemetryEnabled ? clock() : 0;
+            if (telemetryEnabled) {
+              telemetry.yieldRequestCount=(telemetry.yieldRequestCount||0)+1;
+              telemetry.pendingYieldCount=Math.max(
+                0,Number(telemetry.pendingYieldCount)||0)+1;
+              telemetry.maxPendingYieldCount=Math.max(
+                Number(telemetry.maxPendingYieldCount)||0,
+                telemetry.pendingYieldCount);
+              telemetry.duplicateYieldCallbackCount=
+                Number(telemetry.duplicateYieldCallbackCount)||0;
+              if (hidden) telemetry.hiddenYieldCount=(telemetry.hiddenYieldCount||0)+1;
+              else telemetry.visibleYieldCount=(telemetry.visibleYieldCount||0)+1;
+            }
+            let resumed=false;
+            let watchdog=-1;
+            const finish=source => {
+              if (resumed) {
+                if (telemetryEnabled) {
+                  telemetry.duplicateYieldCallbackCount=
+                    (Number(telemetry.duplicateYieldCallbackCount)||0)+1;
+                }
+                return;
+              }
+              resumed=true;
+              if (watchdog >= 0) clearTimeout(watchdog);
+              if (telemetryEnabled) {
+                telemetry.pendingYieldCount=Math.max(
+                  0,(Number(telemetry.pendingYieldCount)||0)-1);
+                const delay=Math.max(0, clock()-requestedAt);
+                telemetry.yieldCompletionCount=(telemetry.yieldCompletionCount||0)+1;
+                telemetry.lastYieldResumeDelayMillis=delay;
+                telemetry.totalYieldResumeDelayMillis=(telemetry.totalYieldResumeDelayMillis||0)+delay;
+                telemetry.longestYieldResumeDelayMillis=Math.max(
+                  telemetry.longestYieldResumeDelayMillis||0,
+                  delay
+                );
+                if (source==='message') {
+                  telemetry.messageChannelYieldCount=(telemetry.messageChannelYieldCount||0)+1;
+                } else {
+                  telemetry.timerYieldCount=(telemetry.timerYieldCount||0)+1;
+                }
+              }
+              resume();
+            };
+            const postTask=() => {
+              let scheduler=root.__gaiusFrameYieldScheduler;
+              if (!scheduler) {
+                scheduler={queue:[],channel:null};
+                if (typeof MessageChannel==='function') {
+                  const channel=new MessageChannel();
+                  channel.port1.onmessage=() => {
+                    const task=scheduler.queue.shift();
+                    if (task) task();
+                  };
+                  scheduler.channel=channel;
+                }
+                root.__gaiusFrameYieldScheduler=scheduler;
+              }
+              if (scheduler.channel) {
+                scheduler.queue.push(() => finish('message'));
+                scheduler.channel.port2.postMessage(0);
+              } else {
+                setTimeout(() => finish('timer'), 0);
+              }
+            };
+            if (hidden) {
+              setTimeout(() => finish('timer'), 50);
+            } else if (typeof requestAnimationFrame==='function') {
+              watchdog=setTimeout(() => finish('timer'), 100);
+              requestAnimationFrame(() => {
+                if (resumed) return;
+                if (telemetryEnabled) {
+                  const delay=Math.max(0, clock()-requestedAt);
+                  telemetry.presentToRafCount=(telemetry.presentToRafCount||0)+1;
+                  telemetry.lastPresentToRafMillis=delay;
+                  telemetry.totalPresentToRafMillis=(telemetry.totalPresentToRafMillis||0)+delay;
+                  telemetry.longestPresentToRafMillis=Math.max(
+                    telemetry.longestPresentToRafMillis||0,
+                    delay
+                  );
+                }
+                postTask();
+              });
+            } else {
+              postTask();
+            }
+            """)
+    private static native void scheduleFrameYield(boolean hidden, FrameYieldCallback resume);
+
     public static void swapBuffers(long window) {
         boolean hidden = swapBuffersJs();
-        // TeaVM's Thread.yield() only suspends after a long time slice. Yield on
-        // every presented frame so an unlimited game loop cannot starve Chrome's
-        // paint, input, audio, and MessagePort tasks for roughly 100 ms at a time.
-        sleepForBrowserMillis(hidden ? 50L : 1L);
+        // rAF follows the display refresh rate; the following task gives Chrome a
+        // paint boundary before the unlimited game loop resumes.
+        yieldAfterPresent(hidden);
     }
 
     public static void swapInterval(int interval) {
@@ -569,6 +700,11 @@ public final class BrowserGlfw {
         if (values != null && values.length != 0) {
             values[0] = value;
         }
+    }
+
+    @JSFunctor
+    private interface FrameYieldCallback extends JSObject {
+        void run();
     }
 
     @JSBody(script = """

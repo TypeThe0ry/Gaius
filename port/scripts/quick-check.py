@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import glob
 import gzip
+import hashlib
 import json
 import mmap
 import os
@@ -27,6 +28,8 @@ ROOT = Path(__file__).resolve().parents[2]
 PORT = ROOT / "port"
 TARGET = PORT / "target"
 DIST = PORT / "web" / "dist"
+VERSION_CONFIG = PORT / "config.json"
+PORTABLE_MANIFEST = DIST / "Gaius.manifest.json"
 OVERLAYS = PORT / "work" / "overlays"
 OPENGL_BRIDGE = PORT / "overrides" / "libraries" / "lwjgl-opengl" / "src" / "main" / "java" / "org" / "lwjgl" / "opengl" / "BrowserOpenGL.java"
 OPENGL_PATCHER = PORT / "tools" / "src" / "main" / "java" / "dev" / "gaius" / "tools" / "LwjglOpenGLBrowserPatcher.java"
@@ -59,6 +62,17 @@ SHADOWING_BROWSER_MEMORY = PORT / "src" / "main" / "java" / "org" / "lwjgl" / "s
 GLFW_BRIDGE = PORT / "overrides" / "libraries" / "lwjgl-glfw" / "src" / "main" / "java" / "org" / "lwjgl" / "glfw" / "BrowserGlfw.java"
 GLFW_PATCHER = PORT / "tools" / "src" / "main" / "java" / "dev" / "gaius" / "tools" / "LwjglGlfwBrowserPatcher.java"
 CLIENT_PATCHER = PORT / "tools" / "src" / "main" / "java" / "dev" / "gaius" / "tools" / "MinecraftClientPatcher.java"
+MINECRAFT_262_BROWSER_PATCHER = (
+    PORT
+    / "tools"
+    / "src"
+    / "main"
+    / "java"
+    / "dev"
+    / "gaius"
+    / "tools"
+    / "Minecraft262BrowserPatcher.java"
+)
 CLASSLIB_PATCHER = PORT / "tools" / "src" / "main" / "java" / "dev" / "gaius" / "tools" / "TeaVMClasslibPatcher.java"
 JOML_MATH_PATCHER = PORT / "tools" / "src" / "main" / "java" / "dev" / "gaius" / "tools" / "JomlMathPatcher.java"
 VANILLA_PACK_RESOURCES = PORT / "overrides" / "client" / "src" / "main" / "java" / "net" / "minecraft" / "server" / "packs" / "VanillaPackResources.java"
@@ -128,6 +142,8 @@ COMPRESS_DIST = PORT / "scripts" / "compress-dist.sh"
 COMPRESS_BROTLI = PORT / "scripts" / "compress-brotli.mjs"
 BUILD_PORTABLE_HTML = PORT / "scripts" / "build-portable-html.py"
 BUILD_PORTABLE_HTML_TEST = PORT / "scripts" / "test-build-portable-html.py"
+PORTABLE_ARTIFACT_IDENTITY_TEST = PORT / "scripts" / "test-portable-artifact-identity.py"
+BUILD_IDENTITY_HELPER = PORT / "scripts" / "gaius_build_identity.py"
 BUILD_VANILLA_ASSETS_PACK = PORT / "scripts" / "build-vanilla-assets-pack.py"
 SERVE_DIST = PORT / "scripts" / "serve-dist.py"
 PLATFORM_SMOKE = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "PlatformSmoke.java"
@@ -150,6 +166,47 @@ SERVER_PLUGIN_MAIN = ROOT / "apps" / "server-plugin" / "src" / "main" / "java" /
 SERVER_PLUGIN_GATEWAY = ROOT / "apps" / "server-plugin" / "src" / "main" / "java" / "dev" / "gaius" / "serverplugin" / "GaiusWebSocketGateway.java"
 SERVER_PLUGIN_YML = ROOT / "apps" / "server-plugin" / "src" / "main" / "resources" / "plugin.yml"
 FAILURES: list[str] = []
+
+BUILD_IDENTITY_SCHEMA_VERSION = 1
+BUILD_IDENTITY_INPUT_POLICY = "gaius-runtime-inputs-v1"
+BUILD_IDENTITY_PROTOCOL_POLICY = "gaius-browser-protocol-v1"
+BUILD_IDENTITY_OVERLAY_POLICY = "gaius-active-overlay-inputs-v1"
+BUILD_IDENTITY_SOURCE_DIRECTORIES = (
+    "port/src/main",
+    "port/overrides",
+    "port/tools/src/main",
+    "port/wasm/hotpath",
+)
+BUILD_IDENTITY_SOURCE_FILES = (
+    "port/config.json",
+    "port/web/singleplayer/index.html",
+    "port/web/singleplayer/server-worker-bootstrap.js",
+    "port/scripts/gaius_build_identity.py",
+    "port/scripts/version-profile.sh",
+    "port/scripts/build-overlays.sh",
+    "port/scripts/remap-client.sh",
+    "port/scripts/generate-pom.sh",
+    "port/scripts/build-teavm.sh",
+    "port/scripts/build-teavm-server-worker.sh",
+    "port/scripts/build-teavm-release.sh",
+    "port/scripts/postprocess-teavm-js.py",
+    "port/scripts/postprocess-index-html.py",
+    "port/scripts/build-vanilla-assets-pack.py",
+    "port/scripts/build-wasm-hotpath.sh",
+    "port/scripts/generate-wasm-hotpath.py",
+)
+BUILD_IDENTITY_PROTOCOL_FILES = (
+    "port/config.json",
+    "port/web/singleplayer/server-worker-bootstrap.js",
+    "port/src/main/java/dev/gaius/browser/BrowserSingleplayerClient.java",
+    "port/src/main/java/dev/gaius/browser/BrowserIntegratedServerMain.java",
+    "port/src/main/java/dev/gaius/browser/BrowserPacketScheduler.java",
+    "port/src/main/java/dev/gaius/browser/BrowserWorldgenScheduler.java",
+    "port/overrides/libraries/netty-transport/src/main/java/io/netty/channel/browser/BrowserWebSocketChannel.java",
+    "port/overrides/libraries/netty-transport/src/main/java/io/netty/channel/browser/BrowserInlineEventLoop.java",
+    "port/tools/src/main/java/dev/gaius/tools/MinecraftClientPatcher.java",
+    "port/scripts/postprocess-teavm-js.py",
+)
 
 
 def rel(path: Path) -> str:
@@ -197,8 +254,659 @@ def gzip_matches(path: Path) -> bool:
                     return False
                 if not raw_chunk:
                     return True
+    except (EOFError, OSError):
+        return False
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def canonical_identity_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def build_identity_input_paths(
+    root: Path,
+    relative_profile: str,
+    *,
+    protocol: bool,
+) -> list[Path]:
+    relative_paths = list(
+        BUILD_IDENTITY_PROTOCOL_FILES if protocol else BUILD_IDENTITY_SOURCE_FILES
+    )
+    relative_paths.append(f"port/{relative_profile}")
+    paths: dict[str, Path] = {}
+    for relative in relative_paths:
+        path = root / relative
+        if path.is_file():
+            paths[path.relative_to(root).as_posix()] = path
+    if not protocol:
+        for relative in BUILD_IDENTITY_SOURCE_DIRECTORIES:
+            directory = root / relative
+            if not directory.is_dir():
+                continue
+            for path in directory.rglob("*"):
+                if path.is_file():
+                    paths[path.relative_to(root).as_posix()] = path
+    return [paths[name] for name in sorted(paths)]
+
+
+def hash_build_identity_inputs(
+    root: Path,
+    paths: list[Path],
+    policy: str,
+) -> dict[str, object]:
+    digest = hashlib.sha256()
+    digest.update(policy.encode("ascii") + b"\0")
+    total_bytes = 0
+    for path in paths:
+        relative = path.relative_to(root).as_posix()
+        size = path.stat().st_size
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(size).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(sha256_file(path).encode("ascii"))
+        digest.update(b"\n")
+        total_bytes += size
+    return {
+        "policy": policy,
+        "sha256": digest.hexdigest(),
+        "fileCount": len(paths),
+        "bytes": total_bytes,
+    }
+
+
+def build_identity_overlay_paths(root: Path, profile: dict) -> list[Path]:
+    config = json.loads((root / "port" / "config.json").read_text(encoding="utf-8"))
+    teavm_version = config.get("teaVMVersion")
+    if not isinstance(teavm_version, str) or not teavm_version:
+        raise ValueError("active config has no TeaVM version")
+    version = profile["id"]
+    work = root / "port" / "work" / version
+    overlays = root / "port" / "work" / "overlays"
+    candidates = [
+        work / "version.json",
+        work / "client-version.json",
+        overlays / f"client-named-{version}-gaius.jar",
+        overlays / f"teavm-classlib-{teavm_version}-gaius.jar",
+        overlays / f"teavm-core-{teavm_version}-gaius.jar",
+    ]
+    metadata_path = work / "version.json"
+    if metadata_path.is_file():
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if not isinstance(metadata, dict) or metadata.get("id") != version:
+            raise ValueError(f"active metadata does not match profile {version}")
+        for library in metadata.get("libraries", []):
+            if not isinstance(library, dict):
+                continue
+            downloads = library.get("downloads")
+            artifact = downloads.get("artifact") if isinstance(downloads, dict) else None
+            relative = artifact.get("path") if isinstance(artifact, dict) else None
+            if not isinstance(relative, str) or not relative:
+                continue
+            relative_path = Path(relative)
+            if relative_path.is_absolute() or ".." in relative_path.parts:
+                raise ValueError(f"unsafe active library metadata path: {relative}")
+            candidates.append(overlays / "libraries" / relative_path)
+    unique: dict[str, Path] = {}
+    for path in candidates:
+        if path.is_file():
+            unique[path.relative_to(root).as_posix()] = path
+    return [unique[name] for name in sorted(unique)]
+
+
+def current_build_identity_for_quick_check(
+    profile: dict,
+    relative_profile: str,
+    profile_path: Path,
+) -> dict[str, object] | None:
+    protocol_version = profile.get("protocolVersion")
+    distribution = profile.get("clientDistribution")
+    if not isinstance(protocol_version, int) or distribution not in {
+        "named",
+        "obfuscated-with-mappings",
+    }:
+        return None
+    root = PORT.parent.resolve()
+    try:
+        source = hash_build_identity_inputs(
+            root,
+            build_identity_input_paths(root, relative_profile, protocol=False),
+            BUILD_IDENTITY_INPUT_POLICY,
+        )
+        protocol = hash_build_identity_inputs(
+            root,
+            build_identity_input_paths(root, relative_profile, protocol=True),
+            BUILD_IDENTITY_PROTOCOL_POLICY,
+        )
+        overlay = hash_build_identity_inputs(
+            root,
+            build_identity_overlay_paths(root, profile),
+            BUILD_IDENTITY_OVERLAY_POLICY,
+        )
+        profile_identity = {
+            "id": profile["id"],
+            "path": relative_profile,
+            "sha256": sha256_file(profile_path),
+            "clientDistribution": distribution,
+            "protocolVersion": protocol_version,
+        }
+    except (OSError, KeyError, ValueError):
+        return None
+    protocol["minecraftProtocolVersion"] = protocol_version
+    compatibility_payload = {
+        "schemaVersion": BUILD_IDENTITY_SCHEMA_VERSION,
+        "profile": profile_identity,
+        "sourceSha256": source["sha256"],
+        "protocolSha256": protocol["sha256"],
+        "overlaySha256": overlay["sha256"],
+    }
+    return {
+        "schemaVersion": BUILD_IDENTITY_SCHEMA_VERSION,
+        "profile": profile_identity,
+        "source": source,
+        "protocol": protocol,
+        "overlay": overlay,
+        "compatibilitySha256": hashlib.sha256(
+            canonical_identity_json(compatibility_payload).encode("ascii")
+        ).hexdigest(),
+    }
+
+
+def manifest_component_build_matches(
+    component: object,
+    artifact: Path,
+    role: str,
+    expected_common: dict[str, object],
+) -> bool:
+    if not isinstance(component, dict) or not artifact.is_file():
+        return False
+    sidecar = artifact.with_name(f"{artifact.name}.build.json")
+    try:
+        record = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return False
+    if not isinstance(record, dict):
+        return False
+    for key in ("profile", "source", "protocol", "overlay", "compatibilitySha256"):
+        if record.get(key) != expected_common.get(key):
+            return False
+    if (
+        record.get("kind") != "gaius-build-identity"
+        or record.get("schemaVersion") != BUILD_IDENTITY_SCHEMA_VERSION
+        or record.get("role") != role
+        or record.get("artifact")
+        != {
+            "name": artifact.name,
+            "sha256": sha256_file(artifact),
+            "bytes": artifact.stat().st_size,
+        }
+    ):
+        return False
+    unsigned = dict(record)
+    identity_hash = unsigned.pop("identitySha256", None)
+    if identity_hash != hashlib.sha256(
+        canonical_identity_json(unsigned).encode("ascii")
+    ).hexdigest():
+        return False
+    expected_component = {
+        "role": role,
+        "identitySha256": identity_hash,
+        "compatibilitySha256": expected_common["compatibilitySha256"],
+        "sidecarSha256": sha256_file(sidecar),
+        "sidecarBytes": sidecar.stat().st_size,
+    }
+    return component.get("build") == expected_component
+
+
+def manifest_file_matches(
+    value: object,
+    path: Path,
+    hash_key: str = "sha256",
+    bytes_key: str = "bytes",
+) -> bool:
+    if not isinstance(value, dict) or not path.is_file():
+        return False
+    try:
+        return (
+            path.stat().st_size > 0
+            and value.get(hash_key) == sha256_file(path)
+            and value.get(bytes_key) == path.stat().st_size
+        )
     except OSError:
         return False
+
+
+def manifest_gzip_pair_matches(
+    value: object,
+    raw_path: Path,
+    gzip_path: Path,
+) -> bool:
+    if not isinstance(value, dict) or not raw_path.is_file() or not gzip_path.is_file():
+        return False
+    try:
+        return (
+            raw_path.stat().st_size > 0
+            and gzip_path.stat().st_size > 0
+            and gzip_matches(raw_path)
+            and value.get("rawSha256") == sha256_file(raw_path)
+            and value.get("gzipSha256") == sha256_file(gzip_path)
+            and value.get("rawBytes") == raw_path.stat().st_size
+            and value.get("gzipBytes") == gzip_path.stat().st_size
+        )
+    except OSError:
+        return False
+
+
+def active_version_profile(port_root: Path | None = None) -> tuple[dict, str, Path] | None:
+    try:
+        port_root = PORT if port_root is None else Path(port_root)
+        config = json.loads((port_root / "config.json").read_text(encoding="utf-8"))
+        relative_profile = config["versionProfile"]
+        if not isinstance(relative_profile, str):
+            return None
+        versions_directory = (port_root / "versions").resolve()
+        profile_path = (port_root / relative_profile).resolve()
+        profile_path.relative_to(versions_directory)
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        if not isinstance(profile, dict) or not isinstance(profile.get("id"), str):
+            return None
+        if profile.get("clientDistribution") not in {
+            "named",
+            "obfuscated-with-mappings",
+        }:
+            return None
+        return profile, Path(relative_profile).as_posix(), profile_path
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+class OverlayResolutionError(RuntimeError):
+    """The active profile metadata cannot identify the overlay inputs."""
+
+
+def _required_json_object(path: Path, label: str) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise OverlayResolutionError(f"{label} is unreadable: {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise OverlayResolutionError(f"{label} must be a JSON object: {path}")
+    return value
+
+
+def _safe_metadata_path(raw_path: object, coordinate: str) -> str:
+    if not isinstance(raw_path, str) or not raw_path:
+        raise OverlayResolutionError(
+            f"{coordinate} has no downloads.artifact.path in active version metadata"
+        )
+    path = Path(raw_path)
+    if path.is_absolute() or ".." in path.parts:
+        raise OverlayResolutionError(
+            f"{coordinate} metadata path is not relative: {raw_path}"
+        )
+    return path.as_posix()
+
+
+def _library_artifact_path(
+    metadata: dict,
+    coordinate: str,
+    fallback_classifier: str | None = None,
+) -> str:
+    libraries = metadata.get("libraries")
+    if not isinstance(libraries, list):
+        raise OverlayResolutionError("active version metadata has no libraries array")
+    group, artifact = coordinate.split(":", 1)
+    exact: list[str] = []
+    fallback: list[str] = []
+    for library in libraries:
+        if not isinstance(library, dict) or not isinstance(library.get("name"), str):
+            continue
+        parts = library["name"].split(":")
+        if len(parts) < 3 or parts[0] != group or parts[1] != artifact:
+            continue
+        downloads = library.get("downloads")
+        artifact_download = downloads.get("artifact") if isinstance(downloads, dict) else None
+        raw_path = artifact_download.get("path") if isinstance(artifact_download, dict) else None
+        if len(parts) == 3:
+            if raw_path is not None:
+                exact.append(_safe_metadata_path(raw_path, coordinate))
+        elif (
+            fallback_classifier is not None
+            and len(parts) == 4
+            and parts[3] == fallback_classifier
+            and raw_path is not None
+        ):
+            fallback.append(_safe_metadata_path(raw_path, coordinate))
+    candidates = exact or fallback
+    if len(candidates) != 1:
+        classifier = f" or classifier {fallback_classifier!r}" if fallback_classifier else ""
+        raise OverlayResolutionError(
+            f"expected exactly one artifact for {coordinate}{classifier}, found {len(candidates)}"
+        )
+    return candidates[0]
+
+
+def _verify_generated_classpath(
+    classpath_path: Path,
+    work_directory: Path,
+    library_path: str,
+    coordinate: str,
+) -> None:
+    if not classpath_path.is_file():
+        return
+    try:
+        entries = [Path(value) for value in classpath_path.read_text(encoding="utf-8").split(os.pathsep) if value]
+    except (OSError, UnicodeDecodeError) as exc:
+        raise OverlayResolutionError(
+            f"generated classpath is unreadable: {classpath_path}: {exc}"
+        ) from exc
+    expected = (work_directory / "libraries" / library_path).resolve()
+    if not any(entry.resolve() == expected for entry in entries):
+        raise OverlayResolutionError(
+            f"generated classpath does not contain active {coordinate} artifact "
+            f"{expected}: {classpath_path}"
+        )
+
+
+def resolve_overlay_paths(
+    port_root: Path | None = None,
+    overlays_root: Path | None = None,
+) -> dict[str, object]:
+    """Resolve only the active profile's client and patched library artifacts.
+
+    The resolver deliberately constructs one exact path per active metadata entry. It
+    never searches the overlay directory, so an old profile cannot satisfy a missing
+    current artifact by accident.
+    """
+    port_root = PORT if port_root is None else Path(port_root)
+    active = active_version_profile(port_root)
+    if active is None:
+        raise OverlayResolutionError(
+            f"cannot load active profile from {port_root / 'config.json'}"
+        )
+    profile, relative_profile, profile_path = active
+    version = profile["id"]
+    work_directory = port_root / "work" / version
+    metadata_path = work_directory / "version.json"
+    metadata = _required_json_object(metadata_path, "active version metadata")
+    if metadata.get("id") != version:
+        raise OverlayResolutionError(
+            f"active version metadata id {metadata.get('id')!r} does not match profile {version!r}: "
+            f"{metadata_path}"
+        )
+    client_version_path = work_directory / "client-version.json"
+    if client_version_path.is_file():
+        client_version = _required_json_object(client_version_path, "generated client metadata")
+        if client_version.get("id") != version:
+            raise OverlayResolutionError(
+                f"generated client metadata id {client_version.get('id')!r} does not match "
+                f"profile {version!r}: {client_version_path}"
+            )
+
+    overlays = Path(overlays_root) if overlays_root is not None else port_root / "work" / "overlays"
+    library_specs = {
+        "lwjgl": ("org.lwjgl:lwjgl", "unsafe"),
+        "lwjgl_glfw": ("org.lwjgl:lwjgl-glfw", None),
+        "lwjgl_opengl": ("org.lwjgl:lwjgl-opengl", None),
+        "lwjgl_openal": ("org.lwjgl:lwjgl-openal", None),
+        "netty_transport": ("io.netty:netty-transport", None),
+        "authlib": ("com.mojang:authlib", None),
+        "joml": ("org.joml:joml", None),
+        "patchy": ("com.mojang:patchy", None),
+    }
+    library_paths: dict[str, Path] = {}
+    metadata_library_paths: dict[str, str] = {}
+    classpath_path = work_directory / "classpath.txt"
+    for key, (coordinate, fallback_classifier) in library_specs.items():
+        metadata_library_path = _library_artifact_path(
+            metadata,
+            coordinate,
+            fallback_classifier,
+        )
+        _verify_generated_classpath(
+            classpath_path,
+            work_directory,
+            metadata_library_path,
+            coordinate,
+        )
+        metadata_library_paths[key] = metadata_library_path
+        library_paths[key] = overlays / "libraries" / Path(metadata_library_path)
+
+    expected_paths: dict[str, Path] = {
+        "client": overlays / f"client-named-{version}-gaius.jar",
+    }
+    expected_paths.update(library_paths)
+    return {
+        "profile": profile,
+        "profile_path": profile_path,
+        "relative_profile": Path(relative_profile).as_posix(),
+        "metadata_path": metadata_path,
+        "classpath_path": classpath_path,
+        "client_distribution": profile["clientDistribution"],
+        "version": version,
+        "client": expected_paths["client"],
+        "libraries": library_paths,
+        "metadata_library_paths": metadata_library_paths,
+        "expected_paths": expected_paths,
+    }
+
+
+def missing_overlay_paths(resolved: dict[str, object]) -> list[tuple[str, Path]]:
+    expected_paths = resolved.get("expected_paths")
+    if not isinstance(expected_paths, dict):
+        return [("resolved overlay set", Path("<unresolved>"))]
+    return [
+        (label, path)
+        for label, path in expected_paths.items()
+        if isinstance(path, Path) and not path.is_file()
+    ]
+
+
+def launcher_argument(index: str, name: str) -> str | None:
+    match = re.search(
+        rf"[\"']{re.escape(name)}[\"']\s*,\s*[\"']([^\"']+)[\"']",
+        index,
+    )
+    return match.group(1) if match is not None else None
+
+
+PORTABLE_SIGNATURE_CONTRACT = (
+    (
+        "client-finite-long-patch",
+        "classes.js",
+        b"/*gaius-java-finite-long-cast*/",
+    ),
+    (
+        "client-target-attestation",
+        "classes.js",
+        b"target-attestation",
+    ),
+    (
+        "server-input-pump",
+        "singleplayer-server.js",
+        b"/*gaius-integrated-server-input-coroutine*/",
+    ),
+)
+
+
+def embedded_portable_manifest(path: Path) -> dict | None:
+    marker = b"const portableManifest = "
+    try:
+        with path.open("rb") as stream, mmap.mmap(
+            stream.fileno(), 0, access=mmap.ACCESS_READ
+        ) as data:
+            start = data.find(marker)
+            if start < 0:
+                return None
+            start += len(marker)
+            end = data.find(b";", start)
+            if end < 0:
+                return None
+            value = json.loads(bytes(data[start:end]).decode("ascii"))
+            return value if isinstance(value, dict) else None
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+
+
+def portable_artifact_identity_matches() -> bool:
+    """Recompute the portable identity without importing the build script."""
+    active = active_version_profile()
+    if active is None:
+        return False
+    profile, relative_profile, profile_path = active
+    if not PORTABLE_HTML.is_file() or not PORTABLE_MANIFEST.is_file():
+        return False
+
+    classes_js = DIST / "classes.js"
+    classes_gzip = DIST / "classes.js.gz"
+    try:
+        manifest = json.loads(PORTABLE_MANIFEST.read_text(encoding="utf-8"))
+        index = INDEX_HTML.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError, ValueError):
+        return False
+    if embedded_portable_manifest(PORTABLE_HTML) != manifest:
+        return False
+    expected_build_identity = current_build_identity_for_quick_check(
+        profile,
+        relative_profile,
+        profile_path,
+    )
+    if expected_build_identity is None:
+        return False
+    if (
+        manifest.get("kind") != "gaius-portable-artifact"
+        or manifest.get("schemaVersion") != 2
+        or manifest.get("artifact") != PORTABLE_HTML.name
+        or manifest.get("profile") != profile.get("id")
+        or manifest.get("profilePath") != relative_profile
+        or manifest.get("profileSha256") != sha256_file(profile_path)
+        or manifest.get("buildIdentity") != expected_build_identity
+    ):
+        return False
+
+    classes_component = manifest.get("classesJs")
+    if (
+        not manifest_gzip_pair_matches(classes_component, classes_js, classes_gzip)
+        or not manifest_component_build_matches(
+            classes_component,
+            classes_js,
+            "client",
+            expected_build_identity,
+        )
+    ):
+        return False
+    raw_hash = sha256_file(classes_js)
+
+    server_js = DIST / "singleplayer-server.js"
+    server_gzip = DIST / "singleplayer-server.js.gz"
+    server_component = manifest.get("singleplayerServerJs")
+    if not manifest_gzip_pair_matches(
+        server_component,
+        server_js,
+        server_gzip,
+    ) or not manifest_component_build_matches(
+        server_component,
+        server_js,
+        "singleplayer-worker",
+        expected_build_identity,
+    ):
+        return False
+
+    wasm_raw = DIST / "gaius-hotpath.wasm"
+    wasm_gzip = DIST / "gaius-hotpath.wasm.gz"
+    wasm_component = manifest.get("wasmHotpath")
+    if not manifest_gzip_pair_matches(
+        wasm_component,
+        wasm_raw,
+        wasm_gzip,
+    ) or not manifest_component_build_matches(
+        wasm_component,
+        wasm_raw,
+        "wasm-hotpath",
+        expected_build_identity,
+    ):
+        return False
+
+    bootstrap = DIST / "singleplayer-server-worker.js"
+    bootstrap_component = manifest.get("singleplayerWorkerBootstrap")
+    if (
+        not manifest_file_matches(bootstrap_component, bootstrap)
+        or not manifest_component_build_matches(
+            bootstrap_component,
+            bootstrap,
+            "worker-bootstrap",
+            expected_build_identity,
+        )
+    ):
+        return False
+    vanilla_assets = DIST / "vanilla-assets.pack.gz"
+    vanilla_component = manifest.get("vanillaAssetsPack")
+    if (
+        not manifest_file_matches(
+            vanilla_component,
+            vanilla_assets,
+            hash_key="gzipSha256",
+            bytes_key="gzipBytes",
+        )
+        or not manifest_component_build_matches(
+            vanilla_component,
+            vanilla_assets,
+            "vanilla-assets",
+            expected_build_identity,
+        )
+    ):
+        return False
+    relay_registry = DIST / "relay-nodes.json"
+    relay_component = manifest.get("relayRegistry")
+    if (
+        not manifest_file_matches(relay_component, relay_registry)
+        or not manifest_component_build_matches(
+            relay_component,
+            relay_registry,
+            "relay-registry",
+            expected_build_identity,
+        )
+    ):
+        return False
+
+    if launcher_argument(index, "--version") != profile.get("id"):
+        return False
+    official = profile.get("official")
+    if isinstance(official, dict) and official.get("assetIndexId") is not None:
+        if launcher_argument(index, "--assetIndex") != str(official["assetIndexId"]):
+            return False
+
+    required = PORTABLE_SIGNATURE_CONTRACT if profile.get("clientDistribution") == "named" else ()
+    signatures = manifest.get("signatures")
+    if not isinstance(signatures, list):
+        return False
+    for name, asset, marker in required:
+        path = DIST / asset
+        if not path.is_file() or not file_matches(path, re.escape(marker)):
+            return False
+        matches = [
+            value for value in signatures
+            if isinstance(value, dict) and value.get("name") == name
+        ]
+        if len(matches) != 1:
+            return False
+        signature = matches[0]
+        if (
+            signature.get("asset") != asset
+            or signature.get("marker") != marker.decode("ascii")
+            or signature.get("verified") is not True
+        ):
+            return False
+        if asset == "classes.js" and signature.get("sha256") != raw_hash:
+            return False
+    return len(signatures) == len(required)
 
 
 def file_matches(path: Path, pattern: bytes) -> bool:
@@ -419,6 +1127,11 @@ def method_section(text: str, header: str) -> str:
     return text[start:end]
 
 
+def required_method_section(text: str, header: str) -> str | None:
+    section_text = method_section(text, header)
+    return section_text if section_text else None
+
+
 def last_putstatic_bool(section_text: str, field: str) -> bool | None:
     matches = re.findall(
         r"(iconst_[01])\s*\n\s*\d+:\s+putstatic\s+#\d+\s+// Field " + re.escape(field),
@@ -614,6 +1327,11 @@ def check_source_patches() -> None:
     glfw_text = GLFW_BRIDGE.read_text(errors="replace") if GLFW_BRIDGE.exists() else ""
     glfw_patcher = GLFW_PATCHER.read_text(errors="replace") if GLFW_PATCHER.exists() else ""
     client_patcher = CLIENT_PATCHER.read_text(errors="replace") if CLIENT_PATCHER.exists() else ""
+    minecraft_262_browser_patcher = (
+        MINECRAFT_262_BROWSER_PATCHER.read_text(errors="replace")
+        if MINECRAFT_262_BROWSER_PATCHER.exists()
+        else ""
+    )
     classlib_patcher = CLASSLIB_PATCHER.read_text(errors="replace") if CLASSLIB_PATCHER.exists() else ""
     joml_math_patcher = JOML_MATH_PATCHER.read_text(errors="replace") if JOML_MATH_PATCHER.exists() else ""
     vanilla_pack_resources = VANILLA_PACK_RESOURCES.read_text(errors="replace") if VANILLA_PACK_RESOURCES.exists() else ""
@@ -694,9 +1412,19 @@ def check_source_patches() -> None:
     compress_dist = COMPRESS_DIST.read_text(errors="replace") if COMPRESS_DIST.exists() else ""
     compress_brotli = COMPRESS_BROTLI.read_text(errors="replace") if COMPRESS_BROTLI.exists() else ""
     build_portable_html = BUILD_PORTABLE_HTML.read_text(errors="replace") if BUILD_PORTABLE_HTML.exists() else ""
+    build_identity_helper = (
+        BUILD_IDENTITY_HELPER.read_text(errors="replace")
+        if BUILD_IDENTITY_HELPER.exists()
+        else ""
+    )
     build_portable_html_test = (
         BUILD_PORTABLE_HTML_TEST.read_text(errors="replace")
         if BUILD_PORTABLE_HTML_TEST.exists()
+        else ""
+    )
+    portable_artifact_identity_test = (
+        PORTABLE_ARTIFACT_IDENTITY_TEST.read_text(errors="replace")
+        if PORTABLE_ARTIFACT_IDENTITY_TEST.exists()
         else ""
     )
     build_vanilla_assets_pack = BUILD_VANILLA_ASSETS_PACK.read_text(errors="replace") if BUILD_VANILLA_ASSETS_PACK.exists() else ""
@@ -882,7 +1610,7 @@ def check_source_patches() -> None:
             and "const vao=state.getVaoEmu();" in text
             and "const nextId=elementBuffer|0;" in text
             and "state.bindPhysicalElementBuffer(vao,vao.elementArrayBufferObject || null);" in text
-            and "int type, int indexBytes, int instances, int elementBuffer);" in text,
+            and "int type, int indexBytes, int instances, int elementBuffer, int baseInstance);" in text,
         ),
         (
             "BrowserOpenGL can use Wasm hot-path for baseVertex index shifting",
@@ -963,8 +1691,8 @@ def check_source_patches() -> None:
             and "bumpBufferShadowPolicyVersion" not in text
             and "window.__gaiusMaxSingleBufferShadowBytes" in text
             and "window.__gaiusMaxTotalBufferShadowBytes" in text
-            and "256 * 1024 * 1024" in text
-            and "1024 * 1024 * 1024" in text
+            and "16 * 1024 * 1024" in text
+            and "64 * 1024 * 1024" in text
             and "268435456" in text
             and "trimBufferShadows" in text
             and "deleteBufferShadow" in text
@@ -984,7 +1712,7 @@ def check_source_patches() -> None:
             and "const refs=this.misalignedBufferRefs" in text
             and "if(refs)return((refs.get(id)||0)>0)" in text
             and "this.vaoEmu.forEach(function(v)" in text
-            and "state.releaseVaoMisalignedBuffers(state.vaoEmu.get(array))" in text,
+            and "state.releaseVaoMisalignedBuffers(vao)" in text,
         ),
         (
             "BrowserOpenGL skips redundant WebGL state calls in hot paths",
@@ -1165,7 +1893,7 @@ def check_source_patches() -> None:
         ),
         (
             "BrowserOpenGL submits draws without allocating wrapper callbacks",
-            "executeDraw=function(kind,mode,a,b,c,d,e)" in text
+            "executeDraw=function(kind,mode,a,b,c,d,e,f)" in text
             and "currentVaoCacheId" in text
             and "currentVaoCache" in text
             and "const attribsPrepared=(vao.drawReadyGeneration|0)===slowDrawGeneration" in text
@@ -1263,7 +1991,7 @@ def check_source_patches() -> None:
             and "const cached=vao.shiftedIndexLast" in text
             and "cached && !cached.deleted" in text
             and "vao.shiftedIndexLast=entry" in text
-            and "oldest.deleted=true" in text
+            and "this.deleteShiftedIndexEntry(oldestKey,true)" in text
             and "if (this.guiDrawDiagnostics && (this.guiDrawsRemaining|0)>0)" in text
             and "this.baseVertexExtensionChecked" in text
             and "const stats=this.hotPathTelemetryEnabled" in text
@@ -1291,7 +2019,7 @@ def check_source_patches() -> None:
                 text.find("cacheShiftedIndexBuffer=function"),
             )
             < text.find(
-                "const source=this.bufferBytes.get(elementBuffer)",
+                "let source=this.bufferBytes.get(elementBuffer)",
                 text.find("cacheShiftedIndexBuffer=function"),
             )
             and text.find(
@@ -1299,7 +2027,7 @@ def check_source_patches() -> None:
                 text.find("cacheShiftedIndexBuffer=function"),
             )
             < text.find(
-                "const source=this.bufferBytes.get(elementBuffer)",
+                "let source=this.bufferBytes.get(elementBuffer)",
                 text.find("cacheShiftedIndexBuffer=function"),
             )
             and "Math.imul((fastKey^(version|0))|0,16777619)" not in text
@@ -1387,11 +2115,12 @@ def check_source_patches() -> None:
         ),
         (
             "Browser block targeting recomputes from current camera angles every rendered frame",
-            "Vec3.directionFromRotation(camera.xRot(), camera.yRot())" in browser_targeting
-            and "camera.position()" in browser_targeting
-            and "minecraft.level.clip" in browser_targeting
+            "minecraft.player.raycastHitResult(partialTick, camera.entity())"
+            in browser_targeting
+            and "camera.isInitialized()" in browser_targeting
+            and "camera.entity()" in browser_targeting
             and "hasLastCamera" not in browser_targeting
-            and "camera.forwardVector()" not in browser_targeting,
+            and "minecraft.level.clip" not in browser_targeting,
         ),
         (
             "BrowserOpenGL exposes texture upload diagnostics for broken item/atlas triage",
@@ -1426,6 +2155,13 @@ def check_source_patches() -> None:
             and '"<class-name-unavailable>"' in text
             and "value.getClass().getName()" in text
             and "catch (Throwable ignored)" in text,
+        ),
+        (
+            "BrowserOpenGL reports real client chunk and spawn-collision readiness",
+            "clientLevel.getChunkSource().getLoadedChunksCount()" in text
+            and "clientLevel.noCollision(entity)" in text
+            and '"loadedChunkCount"' in text
+            and '"collisionFree"' in text,
         ),
         (
             "BrowserOpenGL throttles inventory-screen world background rendering",
@@ -1572,9 +2308,9 @@ def check_source_patches() -> None:
             and "const control = {type: 'connect'" in netty_browser_channel
             and "copyBytes(ByteBuf buffer)" in netty_browser_channel
             and "pipeline.fireChannelRead(Unpooled.wrappedBuffer(bytes))" in netty_browser_channel
-            and "MAX_CHUNKS_PER_PUMP = 64" in netty_browser_channel
-            and "MAX_BYTES_PER_PUMP = 2 * 1024 * 1024" in netty_browser_channel
-            and "MAX_MILLIS_PER_PUMP = 4.0" in netty_browser_channel
+            and "MAX_CHUNKS_PER_PUMP = 16" in netty_browser_channel
+            and "MAX_BYTES_PER_PUMP = 1024 * 1024" in netty_browser_channel
+            and "MAX_MILLIS_PER_PUMP = 2.0" in netty_browser_channel
             and "private boolean pumping;" in netty_browser_channel
             and "if (!open || pumping)" in netty_browser_channel
             and "pumping = true" in netty_browser_channel
@@ -1600,7 +2336,7 @@ def check_source_patches() -> None:
             and "state.stats.localFlushes += localFlushBatches" in netty_browser_channel
             and "state.stats.localFlushFrames += localFlushFrames" in netty_browser_channel
             and "state.stats.localReceivedFrames++" in netty_browser_channel
-            and "state.stats.localReceivedBytes += copy.byteLength" in netty_browser_channel
+            and "state.stats.localReceivedBytes += source.byteLength" in netty_browser_channel
             and "state.stats.peakLocalFlushBytes" in netty_browser_channel
             and "const batch = new Uint8Array(localBatchBytes);" in netty_browser_channel
             and "batch.set(part, offset);" in netty_browser_channel
@@ -2173,7 +2909,8 @@ def check_source_patches() -> None:
             and "pendingChanges = new Map()" in server_worker_bootstrap
             and "scheduleFlush" in server_worker_bootstrap
             and "writeBatch(changes)" in server_worker_bootstrap
-            and "await flushPendingChanges()" in server_worker_bootstrap
+            and 'await withTimeout(flushPendingChanges(), 10000, "Persistent storage flush timed out")'
+            in server_worker_bootstrap
             and "resolved.search = location.search" in server_worker_bootstrap
             and "storage-write-error" in server_worker_bootstrap
             and "failLocalSession" in netty_browser_channel
@@ -2181,10 +2918,12 @@ def check_source_patches() -> None:
             and "__gaiusStorageRefresh" in browser_singleplayer_client
             and "workers.delete(sessionId)" in browser_singleplayer_client
             and "ports.delete(sessionId)" in browser_singleplayer_client
-            and "Integrated server did not stop within 30 seconds" in browser_singleplayer_client
+            and "Integrated server did not stop within 20000 ms" in server_worker_bootstrap
+            and "Integrated server did not stop within 35 seconds" in browser_singleplayer_client
+            and "if (globalThis.__gaiusSingleplayerHandoff) return;"
+            in browser_singleplayer_client
             and "__gaiusHandoffPending" in browser_singleplayer_client
             and "__gaiusClientAttached" in browser_singleplayer_client
-            and "singleplayer:handoff-disconnect-ignored" in browser_singleplayer_client
             and "singleplayer:client-attached" in netty_browser_channel
             and "Integrated server client did not attach within 60 seconds" in browser_singleplayer_client
             and "async function" not in browser_singleplayer_client
@@ -2193,20 +2932,20 @@ def check_source_patches() -> None:
             and 'type: "stopped"' in server_worker_bootstrap,
         ),
         (
-            "Singleplayer region persistence avoids Base64 storage and compresses legacy worlds",
+            "Singleplayer region persistence migrates legacy Base64/gzip regions into OPFS",
             "normalized.endsWith(\".mca\") && setBytes(normalized, bytes)" in browser_file_persistence
             and "storedByteLength(normalized)" in browser_file_persistence
             and "copyStoredBytes(normalized, bytes)" in browser_file_persistence
             and "__gaiusFsPutBytes" in browser_file_persistence
             and "root.__gaiusFsPutBytes" in server_worker_bootstrap
             and "Uint8Array.fromBase64" in server_worker_bootstrap
-            and 'new CompressionStream("gzip")' in server_worker_bootstrap
             and 'new DecompressionStream("gzip")' in server_worker_bootstrap
-            and 'return {encoding: "gzip", bytes: compressed}' in server_worker_bootstrap
-            and "Migrate legacy Base64 regions" in server_worker_bootstrap
-            and 'IDBKeyRange.bound(worldPrefix, worldPrefix + "\\uffff")'
+            and "const migratedPaths = []" in server_worker_bootstrap
+            and "appendOpfsRegion(path, bytes, false)" in server_worker_bootstrap
+            and "await deleteStoredPaths(migratedPaths)" in server_worker_bootstrap
+            and 'IDBKeyRange.bound(prefix, prefix + "\\uffff")'
             in server_worker_bootstrap
-            and "openCursor(range)" in server_worker_bootstrap,
+            and "openKeyCursor(range)" in server_worker_bootstrap,
         ),
         (
             "Multiplayer server-pack cache persists bounded raw IndexedDB bytes",
@@ -2301,6 +3040,8 @@ def check_source_patches() -> None:
             and "__gaiusVanillaAssetsCompressedPromise" in build_portable_html
             and "__gaiusSingleplayerWorkerUrl" in build_portable_html
             and "__gaiusSingleplayerServerGzipUrl" in build_portable_html
+            and "Gaius.manifest.json" in build_portable_html
+            and "window.__gaiusPortableManifest" in build_portable_html
             and "serverScriptGzipUrl" in browser_singleplayer_client
             and "serverScriptGzipUrl" in server_worker_bootstrap
             and "URL.createObjectURL" in server_worker_bootstrap
@@ -2346,7 +3087,8 @@ def check_source_patches() -> None:
                 PORTABLE_HTML,
                 "embeddedRelayNodes",
                 relay_registry.get("nodes", [])[:64],
-            ),
+            )
+            and portable_artifact_identity_matches(),
         ),
         (
             "Release compresses embedded assets before portable HTML and refreshes its gzip",
@@ -2653,7 +3395,7 @@ def check_source_patches() -> None:
             and "Opcodes.POP" in authlib_patcher
             and '"dev/gaius/browser/BrowserHttpProxy"' in patchy_patcher
             and '"proxyAuthentication"' in patchy_patcher
-            and 'patchy_path="com/mojang/patchy/2.2.10/patchy-2.2.10.jar"'
+            and 'patchy_path="$(gaius_library_path "com.mojang:patchy")"'
             in build_overlays
             and '"proxyRealms"' in client_patcher
             and '"addRealmsCookie"' in client_patcher
@@ -2804,9 +3546,9 @@ def check_source_patches() -> None:
         ),
         (
             "BrowserMemory frees mapped buffers without scanning the whole address table",
-            "REGION_BUFFERS" in browser_memory
-            and "private static void remember(Buffer buffer, long address)" in browser_memory
-            and "REGION_BUFFERS.remove(id)" in browser_memory,
+            "private static boolean releaseRegion(int id, Region expected)" in browser_memory
+            and "REGIONS.remove(id)" in browser_memory
+            and "for (BufferReference reference : removed.buffers)" in browser_memory,
         ),
         (
             "BrowserMemory avoids registering transient memCopy/memSet views",
@@ -2843,7 +3585,8 @@ def check_source_patches() -> None:
             and "patchBufferBuilderBrowserFastVertex" in client_patcher
             and "patchByteBufferBuilderBrowserReserve" in client_patcher
             and "patchCompiledSectionMeshBrowserVertexBufferReuse" in client_patcher
-            and 'find(\n                node,\n                "uploadMeshLayer"' in client_patcher
+            and 'candidate.name.equals("uploadMeshLayer")' in client_patcher
+            and "candidate.desc.equals(uploadDescriptor)" in client_patcher
             and '"dev/gaius/browser/BrowserMeshUpload"' in client_patcher
             and "vertexBufferCalls != 4 || returns != 1" in client_patcher
             and "private static ByteBuffer activeVertexBuffer" in browser_mesh_upload
@@ -2948,7 +3691,10 @@ def check_source_patches() -> None:
             and "return hidden" in glfw_text
             and "__gaiusBackgroundFrameThrottles" in glfw_text
             and "boolean hidden = swapBuffersJs()" in glfw_text
-            and "sleepForBrowserMillis(hidden ? 50L : 1L)" in glfw_text
+            and "yieldAfterPresent(hidden)" in glfw_text
+            and "scheduleFrameYield(hidden" in glfw_text
+            and "requestAnimationFrame" in glfw_text
+            and "setTimeout(() => finish('timer'), 50)" in glfw_text
             and glfw_text.count("swapBuffersJs()") == 2,
         ),
         (
@@ -3038,11 +3784,13 @@ def check_source_patches() -> None:
             "patchBrowserInputCallbacks" in client_patcher
             and "patchBrowserMouseHandler" in client_patcher
             and "patchBrowserKeyboardHandler" in client_patcher
-            and 'find(node, "lambda$setup$3", "(JDD)V")' in client_patcher
-            and 'find(node, "lambda$setup$5", "(JIII)V")' in client_patcher
-            and 'find(node, "lambda$setup$7", "(JDD)V")' in client_patcher
-            and 'find(node, "lambda$setup$6", "(JIIII)V")' in client_patcher
-            and 'find(node, "lambda$setup$8", "(JII)V")' in client_patcher
+            and "findInputSetupDispatch" in client_patcher
+            and 'findInputSetupDispatch(node, "onMove", "(JDD)V")' in client_patcher
+            and 'findInputSetupDispatch(node, "onButton", "(JIII)V")' in client_patcher
+            and 'findInputSetupDispatch(node, "onScroll", "(JDD)V")' in client_patcher
+            and 'findInputSetupDispatch(node, "keyPress", "(JIIII)V")' in client_patcher
+            and 'findInputSetupDispatch(node, "charTyped", "(JII)V", "(JI)V")'
+            in client_patcher
             and '"onButton"' in client_patcher
             and '"keyPress"' in client_patcher
             and '"charTyped"' in client_patcher,
@@ -3157,13 +3905,27 @@ def check_source_patches() -> None:
             and "patchSectionRenderDispatcherBrowserThrottles" in client_patcher
             and "patchSectionRenderDispatcherBrowserExecutor" in client_patcher
             and "BrowserRenderScheduler" in client_patcher
-            and "BROWSER_SECTION_SCHEDULE_BUDGET = 4" in client_patcher
             and "BROWSER_SECTION_UPLOAD_BUDGET = 8" in client_patcher
             and "BROWSER_SECTION_CLOSE_BUDGET = 16" in client_patcher
             and "Window.requestAnimationFrame" in browser_render_scheduler
             and "Platform.schedule(BrowserRenderScheduler::runAfterPaint, 0)" in browser_render_scheduler
-            and "MAX_TASKS_PER_FRAME = 4" in browser_render_scheduler
-            and "FRAME_WORK_BUDGET_NANOS = 3_000_000L" in browser_render_scheduler
+            and "MAX_TASKS_PER_FRAME = 8" in browser_render_scheduler
+            and "FRAME_WORK_BUDGET_NANOS = 2_000_000L" in browser_render_scheduler
+            and "requestEmergencyUpload" in browser_render_scheduler
+            and "awaitUploadRetry" in browser_render_scheduler
+            and "clearUploadRetry" in browser_render_scheduler
+            and "TModernRuntimeSupport.yieldToEventLoop(1)" in browser_render_scheduler
+            and "MAX_UPLOAD_RETRY_YIELDS = 2_048" in browser_render_scheduler
+            and "MAX_UPLOAD_RETRY_NANOS = 5_000_000_000L" in browser_render_scheduler
+            and "emergencyUploadDrains" in browser_render_scheduler
+            and "emergencyUploadDeferrals" in browser_render_scheduler
+            and "uploadRetryCancellations" in browser_render_scheduler
+            and "patchSectionRenderEmergencyUpload" in minecraft_262_browser_patcher
+            and "patchSectionRenderTaskRetryYields" in minecraft_262_browser_patcher
+            and '"requestEmergencyUpload"' in minecraft_262_browser_patcher
+            and '"awaitUploadRetry"' in minecraft_262_browser_patcher
+            and '"clearUploadRetry"' in minecraft_262_browser_patcher
+            and '"uploadTerrainBuffersToGpu"' in minecraft_262_browser_patcher
             and "QUEUE.pollFirst()" in browser_render_scheduler
             and "uploadAllPendingUploads" in client_patcher
             and "rebuildSectionSync" in client_patcher
@@ -3207,8 +3969,9 @@ def check_source_patches() -> None:
         ),
         (
             "Minecraft patcher reports browser state after runTick mutations",
-            "private static InsnList minecraftStateReport()" in client_patcher
-            and "method.instructions.insertBefore(instruction, minecraftStateReport())" in run_tick_state_section
+            "private static InsnList minecraftStateReport(boolean hasNoRender)"
+            in client_patcher
+            and "instruction, minecraftStateReport(hasNoRender)" in run_tick_state_section
             and "instruction.getOpcode() == Opcodes.RETURN" in run_tick_state_section
             and "method.instructions.insert(code)" not in run_tick_state_section,
         ),
@@ -3281,7 +4044,8 @@ def check_source_patches() -> None:
         (
             "Browser resource-pack reloads send configuration keepalives immediately",
             "patchClientKeepAliveBrowser" in client_patcher
-            and '"lambda$handleKeepAlive$1", "()Z"' in client_patcher
+            and 'method.name.startsWith("lambda$handleKeepAlive$")' in client_patcher
+            and 'method.desc.equals("()Z")' in client_patcher
             and "ClientCommonPacketListenerImpl keepalive predicate was not found" in client_patcher
             and "Opcodes.ICONST_1" in client_patcher,
         ),
@@ -3395,7 +4159,9 @@ def check_source_patches() -> None:
         (
             "Minecraft patcher skips synchronous stronghold biome relocation in browser",
             "patchChunkGeneratorStructureStateBrowserFastRings" in client_patcher
-            and '"lambda$generateRingPositions$5"' in client_patcher
+            and 'candidate.name.startsWith("lambda$generateRingPositions$")'
+            in client_patcher
+            and "candidate.desc.equals(descriptor)" in client_patcher
             and '"net/minecraft/world/level/ChunkPos"' in client_patcher
             and '"(II)V"' in client_patcher,
         ),
@@ -3403,11 +4169,12 @@ def check_source_patches() -> None:
             "Server Worker enforces bounded slices inside synchronous worldgen loops",
             "Thread.sleep(" not in browser_worldgen_scheduler
             and "TModernRuntimeSupport.yieldToEventLoop" in browser_worldgen_scheduler
-            and "independent platform callback" in browser_worldgen_scheduler
             and "DEFAULT_SLICE_MILLIS = 12.0" in browser_worldgen_scheduler
-            and "CLOCK_CHECK_INTERVAL = 8" in browser_worldgen_scheduler
-            and "NETWORK_FAIRNESS_INTERVAL = 4" in browser_worldgen_scheduler
-            and "NETWORK_PRIORITY_DELAY_MILLIS = 1" in browser_worldgen_scheduler
+            and "MIN_ADAPTIVE_SLICE_MILLIS = 2.0" in browser_worldgen_scheduler
+            and "CLOCK_CHECK_INTERVAL = 4" in browser_worldgen_scheduler
+            and "NETWORK_CHECK_INTERVAL = 2" in browser_worldgen_scheduler
+            and "MAX_NETWORK_WAIT_PULSES = 2" in browser_worldgen_scheduler
+            and "MAX_PULSES_PER_TURN = 64" in browser_worldgen_scheduler
             and "public static native void yieldToEventLoop(int delayMillis);"
                 in modern_runtime_support
             and "TThread.setCurrentThread(thread)" in modern_runtime_support
@@ -3416,19 +4183,23 @@ def check_source_patches() -> None:
             and "__gaiusWorldgenSliceMillis" in browser_worldgen_scheduler
             and "configured >= 4 && configured <= 50" in browser_worldgen_scheduler
             and "hasPendingNetworkInput()" in browser_worldgen_scheduler
-            and "now >= deadlineMillis || hasPendingNetworkInput()"
+            and "boolean pendingBefore = queueDepthBefore > 0 || hasPendingNetworkInput()"
                 in browser_worldgen_scheduler
-            and "boolean pendingNetworkInput = hasPendingNetworkInput()"
+            and "boolean pendingAfter = queueDepthAfter > 0 || hasPendingNetworkInput()"
                 in browser_worldgen_scheduler
-            and "pendingNetworkInput || networkPumpCount() > 0"
+            and "BrowserWebSocketChannel.hasPendingInput()"
                 in browser_worldgen_scheduler
-            and "networkFairness || pendingNetworkInput"
+            and "BrowserPacketScheduler.hasPendingPackets()"
                 in browser_worldgen_scheduler
             and "BrowserIntegratedServerMain.pumpUrgentPackets()" in browser_worldgen_scheduler
+            and "TModernRuntimeSupport.yieldToEventLoop(0)" in browser_worldgen_scheduler
+            and browser_worldgen_scheduler.count(
+                "BrowserIntegratedServerMain.pumpUrgentPackets()") == 2
             and "urgentPacketPumpActive" in browser_integrated_server_main
             and "Thread.currentThread() != serverThread" in browser_integrated_server_main
             and "BrowserWebSocketChannel.pumpAll()" in browser_integrated_server_main
             and "BrowserWebSocketChannel.hasPendingInput()" in browser_integrated_server_main
+            and "BrowserPacketScheduler.hasPendingPackets()" in browser_integrated_server_main
             and "current.packetProcessor().processQueuedPackets()" in browser_integrated_server_main
             and "pumpUrgentPacketsIfPending" in client_patcher
             and 'method.name.equals("pollTask")' in client_patcher
@@ -3463,7 +4234,7 @@ def check_source_patches() -> None:
             and "inboundQueuedBytes" in browser_worldgen_scheduler
             and "deadlineMillis" in browser_worldgen_scheduler
             and "nowMillis()" in browser_worldgen_scheduler
-            and "yieldNow()" in browser_worldgen_scheduler
+            and "requestYield(" in browser_worldgen_scheduler
             and "public static void checkpoint()" in browser_worldgen_scheduler
             and "public static void pulse()" in browser_worldgen_scheduler,
         ),
@@ -4148,14 +4919,13 @@ def check_source_patches() -> None:
             "Minecraft patcher keeps block targeting stable and mining hits audible",
             "patchMultiPlayerGameModeBrowserHitSound" in client_patcher
             and "patchGameRendererBrowserTargetingAfterCamera" in client_patcher
+            and "Verified current vanilla single-raycast block targeting" in client_patcher
             and "patchLevelRendererBrowserBlockOutlineOpacity" in client_patcher
             and "BrowserTargeting" in client_patcher
             and "GameRenderer post-camera block targeting patch point was not found" in client_patcher
-            and "current instanceof EntityHitResult" in browser_targeting
-            and "camera.position()" in browser_targeting
-            and "Vec3.directionFromRotation(camera.xRot(), camera.yRot())" in browser_targeting
-            and "minecraft.player.blockInteractionRange()" in browser_targeting
-            and "minecraft.level.clip" in browser_targeting
+            and "minecraft.player.raycastHitResult(partialTick, camera.entity())"
+                in browser_targeting
+            and "minecraft.level.clip" not in browser_targeting
             and 'Float.valueOf(4.0f)' in client_patcher
             and 'alpha.operand == 102' in client_patcher
             and 'Opcodes.SIPUSH, 180' in client_patcher
@@ -4533,7 +5303,11 @@ def check_source_patches() -> None:
             and "gaius-java-finite-long-cast" in build_release
             and "target-attestation" in build_release
             and 'node --check "$client_js"' in build_release
-            and 'gzip -t "$vanilla_asset_pack"' in build_release,
+            and 'gzip -t "$vanilla_asset_pack"' in build_release
+            and "verify_identity client" in build_release
+            and "verify_identity vanilla-assets" in build_release
+            and "verify_identity singleplayer-worker" in build_release
+            and "verify_identity wasm-hotpath" in build_release,
         ),
         (
             "TeaVM build can skip overlay rebuild after a verified overlay-only pass",
@@ -4575,10 +5349,45 @@ def check_source_patches() -> None:
             and "temporary.flush()" in build_portable_html
             and "os.fsync(temporary.fileno())" in build_portable_html
             and "os.replace(temporary_name, target)" in build_portable_html
-            and "write_text_atomically(output, portable)" in build_portable_html
+            and "publish_portable_pair(output, portable, manifest_path, manifest_text)"
+                in build_portable_html
+            and "os.replace(html_temporary, output)" in build_portable_html
+            and "os.replace(manifest_temporary, manifest_path)" in build_portable_html
             and "test_atomic_write_replaces_complete_file" in build_portable_html_test
             and "test_replace_failure_preserves_original_and_cleans_temp"
                 in build_portable_html_test,
+        ),
+        (
+            "Build identity binds active profile, sources, overlays, protocol, and artifact bytes",
+            "gaius-runtime-inputs-v1" in build_identity_helper
+            and "gaius-browser-protocol-v1" in build_identity_helper
+            and "gaius-active-overlay-inputs-v1" in build_identity_helper
+            and "port/src/main" in build_identity_helper
+            and "port/overrides" in build_identity_helper
+            and "port/tools/src/main" in build_identity_helper
+            and "compatibilitySha256" in build_identity_helper
+            and "identitySha256" in build_identity_helper
+            and "gaius_build_identity.py" in build_teavm
+            and "gaius_build_identity.py" in build_server_worker,
+        ),
+        (
+            "Portable artifact identity fixtures cover profile and gzip skew",
+            all(
+                name in portable_artifact_identity_test
+                for name in (
+                    "test_correct_26_2_publishes_and_embeds_identity",
+                    "test_old_gzip_with_new_js_is_rejected",
+                    "test_wrong_profile_is_rejected",
+                    "test_truncated_gzip_is_rejected",
+                    "test_build_failure_does_not_overwrite_target",
+                    "test_manifest_replace_failure_rolls_back_html_and_commit_marker",
+                    "test_manifest_is_replaced_after_html_as_commit_marker",
+                    "test_missing_worker_identity_is_rejected",
+                    "test_source_change_rejects_all_previously_built_components",
+                    "test_1_21_11_legacy_profile_remains_compatible",
+                    "test_quick_check_rejects_mixed_versions_independently",
+                )
+            ),
         ),
         (
             "Generated release client uses JVM-safe finite-to-long conversion",
@@ -4812,6 +5621,12 @@ def check_source_patches() -> None:
             and "function gaiusFpsTick" in index_html
             and "requestAnimationFrame(gaiusFpsTick)" in index_html
             and "function gaiusFpsTick" in postprocess_index_html
+            and "new Float32Array(4096)" in index_html
+            and "fps.rafFrameWriteIndex" in index_html
+            and "fps.rafFrameCount" in index_html
+            and "const slowestCount = Math.max(1, Math.ceil(ordered.length * 0.01))" in index_html
+            and "slowestCount * 1000 / slowestTotalMs" in index_html
+            and "samples.splice(0" not in index_html
             and "__gaiusWasmHotpath" in index_html
             and "gaius-hotpath.wasm" in index_html
             and "WebAssembly.instantiate" in index_html
@@ -4831,22 +5646,47 @@ def check_source_patches() -> None:
 
 def check_overlay_bytecode() -> None:
     section("Overlay bytecode checks")
-    client_cp = OVERLAYS / "client-named-1.21.11-gaius.jar"
+    try:
+        resolved = resolve_overlay_paths()
+    except OverlayResolutionError as exc:
+        print(f"FAIL overlay path resolver: {exc}")
+        FAILURES.append("Overlay path resolver")
+        return
+
+    profile = resolved["profile"]
+    version = resolved["version"]
+    client_distribution = resolved["client_distribution"]
+    library_paths = resolved["libraries"]
+    if not isinstance(profile, dict) or not isinstance(library_paths, dict):
+        print("FAIL overlay path resolver returned an invalid contract")
+        FAILURES.append("Overlay path resolver contract")
+        return
+    print(f"active overlay profile: {version} ({client_distribution})")
+    for label, path in resolved["expected_paths"].items():
+        print(f"expected {label} overlay: {rel(path)}")
+    missing = missing_overlay_paths(resolved)
+    if missing:
+        for label, path in missing:
+            print_check(f"Current {label} overlay exists at {rel(path)}", False)
+            print(f"  expected path: {path}")
+        return
+
+    client_cp = resolved["client"]
     netty_common_cp = OVERLAYS / "library-patches" / "netty-common"
     netty_cp = OVERLAYS / "library-patches" / "netty-transport"
-    netty_transport_overlay_cp = OVERLAYS / "libraries" / "io" / "netty" / "netty-transport" / "4.2.7.Final" / "netty-transport-4.2.7.Final.jar"
+    netty_transport_overlay_cp = library_paths["netty_transport"]
     classlib_cp = OVERLAYS / "classlib-patches"
     classlib_classes_cp = OVERLAYS / "classlib-classes"
     lwjgl_cp = OVERLAYS / "library-classes" / "lwjgl"
     lwjgl_opengl_cp = OVERLAYS / "library-classes" / "lwjgl-opengl"
     lwjgl_opengl_patch_cp = OVERLAYS / "library-patches" / "lwjgl-opengl"
-    lwjgl_opengl_overlay_cp = OVERLAYS / "libraries" / "org" / "lwjgl" / "lwjgl-opengl" / "3.3.3" / "lwjgl-opengl-3.3.3.jar"
-    lwjgl_openal_cp = OVERLAYS / "libraries" / "org" / "lwjgl" / "lwjgl-openal" / "3.3.3" / "lwjgl-openal-3.3.3.jar"
+    lwjgl_opengl_overlay_cp = library_paths["lwjgl_opengl"]
+    lwjgl_openal_cp = library_paths["lwjgl_openal"]
     lwjgl_openal_classes_cp = OVERLAYS / "library-classes" / "lwjgl-openal"
-    lwjgl_glfw_cp = OVERLAYS / "libraries" / "org" / "lwjgl" / "lwjgl-glfw" / "3.3.3" / "lwjgl-glfw-3.3.3.jar"
-    joml_cp = OVERLAYS / "libraries" / "org" / "joml" / "joml" / "1.10.8" / "joml-1.10.8.jar"
-    authlib_cp = OVERLAYS / "libraries" / "com" / "mojang" / "authlib" / "7.0.61" / "authlib-7.0.61.jar"
-    patchy_cp = OVERLAYS / "libraries" / "com" / "mojang" / "patchy" / "2.2.10" / "patchy-2.2.10.jar"
+    lwjgl_glfw_cp = library_paths["lwjgl_glfw"]
+    joml_cp = library_paths["joml"]
+    authlib_cp = library_paths["authlib"]
+    patchy_cp = library_paths["patchy"]
     server_worker_classes_cp = TARGET / "server-worker" / "maven" / "classes"
     client_classes_cp = TARGET / "maven" / "classes"
     browser_opengl_class = lwjgl_opengl_cp / "org" / "lwjgl" / "opengl" / "BrowserOpenGL.class"
@@ -5301,6 +6141,44 @@ def check_overlay_bytecode() -> None:
         minecraft_main,
         "public static void main(java.lang.String[]);",
     )
+    is_current_named = client_distribution == "named"
+    minecraft_render_frame = (
+        required_method_section(minecraft, "public void renderFrame(boolean);")
+        if is_current_named
+        else None
+    )
+    current_game_renderer_extract = (
+        required_method_section(
+            game_renderer,
+            "public void extract(net.minecraft.client.DeltaTracker, boolean);",
+        )
+        if is_current_named
+        else None
+    )
+    legacy_game_render_level = (
+        required_method_section(
+            game_renderer,
+            "public void renderLevel(net.minecraft.client.DeltaTracker);",
+        )
+        if not is_current_named
+        else None
+    )
+    current_section_task_queue = (
+        run_javap(
+            client_cp,
+            "net.minecraft.client.renderer.chunk.SectionTaskDynamicQueue",
+        )
+        if is_current_named
+        else None
+    )
+    legacy_compile_task_queue = (
+        run_javap(
+            client_cp,
+            "net.minecraft.client.renderer.chunk.CompileTaskDynamicQueue",
+        )
+        if not is_current_named
+        else None
+    )
     atlas_entry_schedule_load = method_section(
         atlas_entry,
         "java.util.concurrent.CompletableFuture<net.minecraft.client.renderer.texture.SpriteLoader$Preparations> scheduleLoad(net.minecraft.server.packs.resources.ResourceManager, java.util.concurrent.Executor, int);",
@@ -5467,8 +6345,7 @@ def check_overlay_bytecode() -> None:
         abstract_button,
         "protected final void renderDefaultSprite(net.minecraft.client.gui.GuiGraphics);",
     )
-    game_render_level = method_section(game_renderer, "public void renderLevel(net.minecraft.client.DeltaTracker);")
-    game_render_level_head = game_render_level[:1000]
+    game_render_level = legacy_game_render_level
     client_level_animate_tick = method_section(
         client_level,
         "public void animateTick(int, int, int);",
@@ -5599,9 +6476,13 @@ def check_overlay_bytecode() -> None:
         browser_worldgen_scheduler_class,
         "public static void pulse();",
     )
-    worldgen_yield_now = method_section(
+    worldgen_request_yield = method_section(
         browser_worldgen_scheduler_class,
-        "private static void yieldNow();",
+        "private static void requestYield(int, int);",
+    )
+    worldgen_yield_reentrant = method_section(
+        browser_worldgen_scheduler_class,
+        "private static void yieldReentrantContinuation();",
     )
     browser_pump_urgent_packets = method_section(
         browser_integrated_server_main_class,
@@ -6169,6 +7050,72 @@ def check_overlay_bytecode() -> None:
     browser_glfw = run_javap(lwjgl_glfw_cp, "org.lwjgl.glfw.BrowserGlfw")
     glfw = run_javap(lwjgl_glfw_cp, "org.lwjgl.glfw.GLFW")
     face_bakery = run_javap(client_cp, "net.minecraft.client.renderer.block.model.FaceBakery")
+
+    if minecraft_render_frame is not None and current_game_renderer_extract is not None:
+        render_frame_order = [
+            minecraft_render_frame.find(
+                "Method net/minecraft/client/renderer/GameRenderer.update:"
+            ),
+            minecraft_render_frame.find("Method pick:(F)V"),
+            minecraft_render_frame.find(
+                "Method net/minecraft/client/renderer/GameRenderer.extract:"
+            ),
+        ]
+        current_render_frame_contract = all(
+            position >= 0 and position < next_position
+            for position, next_position in zip(render_frame_order, render_frame_order[1:])
+        ) and render_frame_order[0] >= 0
+    else:
+        current_render_frame_contract = False
+
+    current_queue_poll = (
+        required_method_section(
+            current_section_task_queue,
+            "public synchronized net.minecraft.client.renderer.chunk."
+            "SectionRenderDispatcher$RenderSection$SectionTask poll(net.minecraft.world.phys.Vec3);",
+        )
+        if current_section_task_queue is not None
+        else None
+    )
+    current_queue_clear = (
+        required_method_section(
+            current_section_task_queue,
+            "public synchronized void clear();",
+        )
+        if current_section_task_queue is not None
+        else None
+    )
+    current_section_queue_contract = (
+        current_section_task_queue is not None
+        and current_queue_poll is not None
+        and current_queue_clear is not None
+        and "implements java.util.Comparator" in current_section_task_queue
+        and current_section_task_queue.count("java.util.PriorityQueue<") == 2
+        and "java/util/ListIterator" not in current_section_task_queue
+        and "java/util/List.remove" not in current_section_task_queue
+        and all(
+            helper in current_section_task_queue
+            for helper in (
+                "browserDirtyTasks",
+                "browserTaskOrder",
+                "browserRebuild",
+                "browserTakeNearest",
+                "browserCancelAndClear",
+                "browserIsDirtyCompile",
+                "browserDistance",
+                "browserDistanceFrom",
+                "browserOrder",
+                "browserRequeue",
+                "browserFinishTask",
+                "recompileQuota",
+            )
+        )
+        and current_queue_poll.count("browserRebuild") == 2
+        and current_queue_poll.count("browserTakeNearest") == 2
+        and "Vec3.distanceTo" in current_queue_poll
+        and "recompileQuota" in current_queue_poll
+        and current_queue_clear.count("browserCancelAndClear") == 2
+    )
 
     checks = [
         (
@@ -7308,7 +8255,7 @@ def check_overlay_bytecode() -> None:
                 browser_opengl_constants.find("cacheShiftedIndexBuffer=function"),
             )
             < browser_opengl_constants.find(
-                "const source=this.bufferBytes.get(elementBuffer)",
+                "let source=this.bufferBytes.get(elementBuffer)",
                 browser_opengl_constants.find("cacheShiftedIndexBuffer=function"),
             )
             and "Math.imul((fastKey^(version|0))|0,16777619)"
@@ -7791,8 +8738,9 @@ def check_overlay_bytecode() -> None:
             and "WidgetSprites.get" not in abstract_button_sprite,
         ),
         (
-            "GameRenderer throttles inventory-screen world background before renderLevel",
-            "BrowserOpenGL.shouldSkipWorldRenderForScreen" in game_renderer
+            "Legacy GameRenderer throttles inventory-screen world background before renderLevel",
+            not is_current_named
+            and "BrowserOpenGL.shouldSkipWorldRenderForScreen" in game_renderer
             and "InterfaceMethod net/minecraft/util/profiling/ProfilerFiller.pop:()V" in game_renderer
             and "Method renderLevel:(Lnet/minecraft/client/DeltaTracker;)V" in game_renderer
             and "Field net/minecraft/client/Minecraft.screen:Lnet/minecraft/client/gui/screens/Screen;" in game_renderer,
@@ -8055,17 +9003,20 @@ def check_overlay_bytecode() -> None:
         ),
         (
             "Compiled Server Worker enforces bounded worldgen slices on its server thread",
-            "Method yieldNow:()V" in worldgen_checkpoint
+            "Method requestYield:(II)V" in worldgen_checkpoint
             and "Thread.yield" not in worldgen_checkpoint
             and "BrowserWebSocketChannel.pumpAll" not in worldgen_checkpoint
             and "Method nowMillis:()D" in worldgen_pulse
-            and "Method yieldNow:()V" in worldgen_pulse
-            and "TModernRuntimeSupport.yieldToEventLoop:(I)V" in worldgen_yield_now
-            and "java/lang/Thread.sleep:(J)V" not in worldgen_yield_now
-            and "Method networkPumpCount:()I" in worldgen_yield_now
-            and "BrowserIntegratedServerMain.pumpUrgentPackets" in worldgen_yield_now
-            and "java/lang/Thread.currentThread:()Ljava/lang/Thread;" not in worldgen_yield_now
-            and "java/lang/Thread.interrupt:()V" not in worldgen_yield_now
+            and "Method requestYield:(II)V" in worldgen_pulse
+            and "TModernRuntimeSupport.yieldToEventLoop:(I)V" in worldgen_request_yield
+            and "java/lang/Thread.sleep:(J)V" not in worldgen_request_yield
+            and "BrowserIntegratedServerMain.pumpUrgentPackets" in worldgen_request_yield
+            and "Method networkQueueDepth:()I" in worldgen_request_yield
+            and "java/lang/Thread.currentThread:()Ljava/lang/Thread;"
+                not in worldgen_request_yield
+            and "java/lang/Thread.interrupt:()V" not in worldgen_request_yield
+            and "TModernRuntimeSupport.yieldToEventLoop:(I)V"
+                in worldgen_yield_reentrant
             and "BrowserWebSocketChannel.pumpAll" in browser_pump_urgent_packets
             and "MinecraftServer.packetProcessor" in browser_pump_urgent_packets
             and "PacketProcessor.processQueuedPackets" in browser_pump_urgent_packets,
@@ -8419,25 +9370,57 @@ def check_overlay_bytecode() -> None:
             and "float 8.0f" not in multiplayer_continue_destroy,
         ),
         (
-            "Each rendered frame updates the shared block target after refreshing its camera",
-            "Method pick:(F)V" in game_render_level
-            and "Method extractCamera:(F)V" in game_render_level
-            and "BrowserTargeting.stabilizeBlockHit" in game_render_level
-            and "Minecraft.hitResult" in game_render_level
-            and "Method shouldRenderBlockOutline:()Z" in game_render_level
-            and game_render_level.find("Method pick:(F)V")
-                < game_render_level.find("Method shouldRenderBlockOutline:()Z")
-            and game_render_level.find("Method shouldRenderBlockOutline:()Z")
-                < game_render_level.find("Method extractCamera:(F)V")
-            and game_render_level.find("Method extractCamera:(F)V")
-                < game_render_level.find("BrowserTargeting.stabilizeBlockHit"),
+            "Legacy renderLevel updates the shared block target after refreshing its camera",
+            not is_current_named
+            and legacy_game_render_level is not None
+            and "Method pick:(F)V" in legacy_game_render_level
+            and "Method extractCamera:(F)V" in legacy_game_render_level
+            and "BrowserTargeting.stabilizeBlockHit" in legacy_game_render_level
+            and "Minecraft.hitResult" in legacy_game_render_level
+            and "Method shouldRenderBlockOutline:()Z" in legacy_game_render_level
+            and legacy_game_render_level.find("Method pick:(F)V")
+                < legacy_game_render_level.find("Method shouldRenderBlockOutline:()Z")
+            and legacy_game_render_level.find("Method shouldRenderBlockOutline:()Z")
+                < legacy_game_render_level.find("Method extractCamera:(F)V")
+            and legacy_game_render_level.find("Method extractCamera:(F)V")
+                < legacy_game_render_level.find("BrowserTargeting.stabilizeBlockHit"),
+        ),
+        (
+            "Current named renderFrame updates, picks, then extracts",
+            is_current_named
+            and minecraft_render_frame is not None
+            and current_game_renderer_extract is not None
+            and current_render_frame_contract,
+        ),
+        (
+            "Current named GameRenderer only observes vanilla pick telemetry",
+            is_current_named
+            and current_game_renderer_extract is not None
+            and re.findall(
+                r"BrowserTargeting\.([A-Za-z0-9_$]+)",
+                game_renderer,
+            ) == ["observeVanillaPick"]
+            and game_renderer.count("BrowserTargeting.observeVanillaPick") == 1
+            and current_game_renderer_extract.count("BrowserTargeting.observeVanillaPick") == 1
+            and "BrowserTargeting.stabilizeBlockHit" not in game_renderer
+            and "raycastHitResult" not in game_renderer,
+        ),
+        (
+            "Current named SectionTaskDynamicQueue uses two priority queues and bounded helpers",
+            is_current_named and current_section_queue_contract,
+        ),
+        (
+            "Legacy CompileTaskDynamicQueue remains profile-resolvable",
+            not is_current_named
+            and legacy_compile_task_queue is not None
+            and "class net.minecraft.client.renderer.chunk.CompileTaskDynamicQueue"
+                in legacy_compile_task_queue,
         ),
         (
             "Compiled browser targeting uses live camera angles without a stale-hit cache",
-            "Camera.xRot" in browser_targeting_class
-            and "Camera.yRot" in browser_targeting_class
-            and "Vec3.directionFromRotation" in browser_targeting_class
-            and "ClientLevel.clip" in browser_targeting_class
+            "LocalPlayer.raycastHitResult" in browser_targeting_class
+            and "Camera.entity" in browser_targeting_class
+            and "ClientLevel.clip" not in browser_targeting_class
             and "lastForward" not in browser_targeting_class
             and "hasLastCamera" not in browser_targeting_class,
         ),

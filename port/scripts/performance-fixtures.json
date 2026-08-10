@@ -1,0 +1,289 @@
+{
+  "schemaVersion": 1,
+  "frameCases": [
+    {
+      "name": "one-percent-low-is-slowest-one-percent-mean",
+      "assertDistinctFromP99Reciprocal": true,
+      "elapsedMs": 8300,
+      "segments": [
+        {"frameMs": 8, "count": 990},
+        {"frameMs": 20, "count": 9},
+        {"frameMs": 100, "count": 1}
+      ],
+      "expected": {
+        "sampleCount": 1000,
+        "p99FrameMs": 8,
+        "onePercentSlowestFrameCount": 10,
+        "onePercentSlowestMeanFrameMs": 28,
+        "onePercentLowFps": 35.714,
+        "longestFrameMs": 100
+      }
+    },
+    {
+      "name": "default-gate-passes-at-contract-boundary",
+      "assertDistinctFromP99Reciprocal": false,
+      "elapsedMs": 8333.333,
+      "segments": [
+        {"frameMs": 8.333333, "count": 1000}
+      ],
+      "expected": {
+        "averageFps": 120,
+        "onePercentLowFps": 120,
+        "atLeast500Ms": 0
+      }
+    }
+  ],
+  "ringCases": [
+    {
+      "name": "recover-wrapped-delta-in-chronological-order",
+      "snapshot": {
+        "frameTimes": [9, 10, 11, 4, 5, 6, 7, 8],
+        "sampleCapacity": 8,
+        "sampleWriteIndex": 3,
+        "sampleCount": 8,
+        "frameCount": 11
+      },
+      "previousFrameCount": 5,
+      "expectedSamples": [6, 7, 8, 9, 10, 11],
+      "expectedLostSamples": 0,
+      "expectedWrapped": true
+    },
+    {
+      "name": "report-loss-when-reader-misses-more-than-one-capacity",
+      "snapshot": {
+        "frameTimes": [9, 10, 11, 4, 5, 6, 7, 8],
+        "sampleCapacity": 8,
+        "sampleWriteIndex": 3,
+        "sampleCount": 8,
+        "frameCount": 11
+      },
+      "previousFrameCount": 0,
+      "expectedSamples": [4, 5, 6, 7, 8, 9, 10, 11],
+      "expectedLostSamples": 3,
+      "expectedWrapped": true
+    }
+  ],
+  "queueCases": [
+    {
+      "name": "ten-second-high-water-fails",
+      "thresholds": {"chunk.pendingTasks": 8},
+      "requiredDurationMs": 10000,
+      "timeline": [
+        {"atMillis": 0, "chunk": {"pendingTasks": 0}},
+        {"atMillis": 5000, "chunk": {"pendingTasks": 8}},
+        {"atMillis": 10000, "chunk": {"pendingTasks": 9}},
+        {"atMillis": 15000, "chunk": {"pendingTasks": 8}},
+        {"atMillis": 15500, "chunk": {"pendingTasks": 0}}
+      ],
+      "expectedVerdict": "fail"
+    },
+    {
+      "name": "short-high-water-recovers",
+      "thresholds": {"network.inboundQueuedBytes": 100},
+      "requiredDurationMs": 10000,
+      "timeline": [
+        {"atMillis": 0, "network": {"inboundQueuedBytes": 0}},
+        {"atMillis": 5000, "network": {"inboundQueuedBytes": 120}},
+        {"atMillis": 14000, "network": {"inboundQueuedBytes": 120}},
+        {"atMillis": 14500, "network": {"inboundQueuedBytes": 0}}
+      ],
+      "expectedVerdict": "pass"
+    }
+  ],
+  "memoryCases": [
+    {
+      "name": "positive-final-three-post-gc-windows-fail",
+      "durationMs": 1800000,
+      "loadedChunkDelta": 0,
+      "postGcMiB": [100, 101, 102, 103, 104, 105, 106],
+      "expectedVerdict": "fail"
+    },
+    {
+      "name": "gc-recovered-soak-passes",
+      "durationMs": 1800000,
+      "loadedChunkDelta": 0,
+      "postGcMiB": [100, 108, 104, 107, 103, 105, 102],
+      "expectedVerdict": "pass"
+    },
+    {
+      "name": "missing-post-gc-data-is-inconclusive",
+      "durationMs": 1800000,
+      "loadedChunkDelta": null,
+      "postGcMiB": [],
+      "expectedVerdict": "inconclusive"
+    }
+  ],
+  "nativeMemoryCases": [
+    {
+      "name": "browser-memory-recovers-after-exit",
+      "durationMs": 1800000,
+      "baseline": [10485760, 100, 50],
+      "regular": [[12582912, 120, 60], [15728640, 135, 70], [14680064, 130, 65]],
+      "postGc": [[12582912, 120, 60], [13631488, 125, 62], [13107200, 123, 61], [13369344, 124, 62]],
+      "cleanup": [[12058624, 115, 58], [11010048, 108, 54], [10485760, 101, 51]],
+      "expectedVerdict": "pass"
+    },
+    {
+      "name": "browser-memory-final-three-windows-grow",
+      "durationMs": 1800000,
+      "baseline": [10485760, 100, 50],
+      "regular": [[12582912, 120, 60], [15728640, 135, 70]],
+      "postGc": [[12582912, 120, 60], [13631488, 121, 61], [14680064, 122, 62], [15728640, 123, 63]],
+      "cleanup": [[15728640, 123, 63]],
+      "expectedVerdict": "fail"
+    },
+    {
+      "name": "browser-memory-cleanup-missing-is-inconclusive",
+      "durationMs": 1800000,
+      "baseline": [10485760, 100, 50],
+      "regular": [[12582912, 120, 60]],
+      "postGc": [[12582912, 120, 60], [13631488, 125, 62], [13107200, 123, 61], [13369344, 124, 62]],
+      "cleanup": [],
+      "expectedVerdict": "inconclusive"
+    }
+  ],
+  "runtimeInvariantCases": [
+    {
+      "name": "runtime-invariants-pass-at-boundary-with-gpu-timeouts",
+      "overrides": {
+        "glStats": {"gpuFenceTimeouts": 25}
+      },
+      "expectedVerdict": "pass",
+      "expectedGpuTimeoutVerdict": "pass"
+    },
+    {
+      "name": "runtime-invariants-missing-required-evidence-is-inconclusive",
+      "omit": ["glStats.gpuEarlyResourceReuse"],
+      "expectedVerdict": "inconclusive",
+      "expectedComponent": "gpuFences"
+    },
+    {
+      "name": "runtime-invariants-gpu-wait-failure-fails",
+      "overrides": {
+        "glStats": {"gpuWaitFailures": 1}
+      },
+      "expectedVerdict": "fail",
+      "expectedComponent": "gpuFences"
+    },
+    {
+      "name": "runtime-invariants-gpu-early-reuse-fails",
+      "overrides": {
+        "glStats": {"gpuEarlyResourceReuse": 1}
+      },
+      "expectedVerdict": "fail",
+      "expectedComponent": "gpuFences"
+    },
+    {
+      "name": "runtime-invariants-gpu-duplicate-delete-fails",
+      "overrides": {
+        "glStats": {"gpuFenceDuplicateDeletes": 1}
+      },
+      "expectedVerdict": "fail",
+      "expectedComponent": "gpuFences"
+    },
+    {
+      "name": "runtime-invariants-current-context-loss-fails",
+      "overrides": {
+        "glStats": {"gpuContextLost": true}
+      },
+      "expectedVerdict": "fail",
+      "expectedComponent": "gpuFences"
+    },
+    {
+      "name": "runtime-invariants-gpu-retire-backlog-fails",
+      "overrides": {
+        "glStats": {"gpuRetireBacklogMax": 9}
+      },
+      "expectedVerdict": "fail",
+      "expectedComponent": "gpuFences"
+    },
+    {
+      "name": "runtime-invariants-gpu-fence-age-fails",
+      "overrides": {
+        "glStats": {"gpuFenceMaxAgeFrames": 121}
+      },
+      "expectedVerdict": "fail",
+      "expectedComponent": "gpuFences"
+    },
+    {
+      "name": "runtime-invariants-gpu-controlled-error-fails",
+      "overrides": {
+        "glStats": {"gpuRetireControlledErrors": 1}
+      },
+      "expectedVerdict": "fail",
+      "expectedComponent": "gpuFences"
+    },
+    {
+      "name": "runtime-invariants-worldgen-network-wait-fails",
+      "overrides": {
+        "worldgen": {"maxNetworkWaitPulses": 3}
+      },
+      "expectedVerdict": "fail",
+      "expectedComponent": "worldgen"
+    },
+    {
+      "name": "runtime-invariants-targeting-per-frame-fails",
+      "overrides": {
+        "targeting": {"maxObservationsPerRenderedFrame": 2}
+      },
+      "expectedVerdict": "fail",
+      "expectedComponent": "targeting"
+    },
+    {
+      "name": "runtime-invariants-targeting-lag-fails",
+      "overrides": {
+        "targeting": {"maxObservationLagFrames": 2}
+      },
+      "expectedVerdict": "fail",
+      "expectedComponent": "targeting"
+    },
+    {
+      "name": "runtime-invariants-frame-continuation-gap-fails",
+      "overrides": {
+        "framePacing": {"yieldCompletionCount": 998}
+      },
+      "expectedVerdict": "fail",
+      "expectedComponent": "framePacing"
+    },
+    {
+      "name": "runtime-invariants-frame-historical-overlap-fails",
+      "overrides": {
+        "framePacing": {"maxPendingYieldCount": 2}
+      },
+      "expectedVerdict": "fail",
+      "expectedComponent": "framePacing"
+    },
+    {
+      "name": "runtime-invariants-frame-duplicate-callback-fails",
+      "overrides": {
+        "framePacing": {"duplicateYieldCallbackCount": 1}
+      },
+      "expectedVerdict": "fail",
+      "expectedComponent": "framePacing"
+    },
+    {
+      "name": "runtime-invariants-upload-hard-cap-fails",
+      "overrides": {
+        "renderPipeline": {"peakUploadDrainCount": 9}
+      },
+      "expectedVerdict": "fail",
+      "expectedComponent": "renderPipeline"
+    },
+    {
+      "name": "runtime-invariants-upload-retry-cancellation-fails",
+      "overrides": {
+        "renderPipeline": {"uploadRetryCancellations": 1}
+      },
+      "expectedVerdict": "fail",
+      "expectedComponent": "renderPipeline"
+    },
+    {
+      "name": "runtime-invariants-upload-retry-retention-fails",
+      "overrides": {
+        "renderPipeline": {"activeUploadRetryTasks": 9}
+      },
+      "expectedVerdict": "fail",
+      "expectedComponent": "renderPipeline"
+    }
+  ]
+}

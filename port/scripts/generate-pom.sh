@@ -14,6 +14,7 @@ maven_path() {
 config="$root/port/config.json"
 source "$root/port/scripts/version-profile.sh"
 gaius_load_version_profile "$root"
+gaius_select_java_home
 version="$GAIUS_MINECRAFT_VERSION"
 teavm_version="$(jq -er '.teaVMVersion' "$config")"
 work="$root/port/work/$version"
@@ -169,7 +170,13 @@ EOF
   done < <(
       jq -r '
         .libraries[]
-        | select((.name | split(":") | length) == 3)
+        | (.name | split(":")) as $coordinates
+        | select(
+            ($coordinates | length) == 3
+            or (($coordinates | length) == 4
+                and $coordinates[0] == "org.lwjgl"
+                and $coordinates[1] == "lwjgl"
+                and $coordinates[3] == "unsafe"))
         | .downloads.artifact.path
       ' "$metadata" |
       tr -d '\r' |

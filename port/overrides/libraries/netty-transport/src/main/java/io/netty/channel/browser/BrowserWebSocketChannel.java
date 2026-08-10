@@ -26,9 +26,9 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
     private static final int INITIAL_CHANNEL_CAPACITY = 16;
     // Client packets run inline on the browser event loop. Drain cheap frames in a batch while
     // the time budget still makes a heavy chunk/model update yield after its first frame.
-    private static final int MAX_CHUNKS_PER_PUMP = 64;
-    private static final int MAX_BYTES_PER_PUMP = 2 * 1024 * 1024;
-    private static final double MAX_MILLIS_PER_PUMP = 4.0;
+    private static final int MAX_CHUNKS_PER_PUMP = 16;
+    private static final int MAX_BYTES_PER_PUMP = 1024 * 1024;
+    private static final double MAX_MILLIS_PER_PUMP = 2.0;
     private static final EventLoop INLINE_EVENT_LOOP = new BrowserInlineEventLoop();
     private static BrowserWebSocketChannel[] channels =
             new BrowserWebSocketChannel[INITIAL_CHANNEL_CAPACITY];
@@ -50,6 +50,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
         }
         addChannel(this);
         initBridge();
+        initInboundScheduler();
     }
 
     public static void pumpAll() {
@@ -244,6 +245,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 byte[] bytes = data.copyToJavaArray();
                 if (bytes.length > 0) {
                     pipeline.fireChannelRead(Unpooled.wrappedBuffer(bytes));
+                    recordDecodedSlice(socketId);
                     chunks++;
                     bytesPumped += bytes.length;
                 }
@@ -367,13 +369,20 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             if (globalThis.__gaiusNettyBridge) return;
             const state = {
               channels: new Map(),
+              localSessionOwners: new Map(),
               directPluginMisses: new Map(),
               relayPreflightCache: new Map(),
               targetRelayLeases: new Map(),
               relayRegistryCache: new Map(),
               relayRegistryPromise: null,
+              decodedSliceOwners: [],
+              decodedSliceOwnerHead: 0,
+              exactPacketQueuePaused: false,
+              gapProbeTimer: 0,
+              gapProbeExpectedAt: 0,
               stats: {
                 created: true,
+                executionContext: typeof document === 'undefined' ? 'worker' : 'window',
                 opened: 0,
                 localOpened: 0,
                 directAttempts: 0,
@@ -403,6 +412,10 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 relayNodeFailures: 0,
                 relayTargetAttestationFailures: 0,
                 relayNodes: Object.create(null),
+                connectPhases: [],
+                relayParallelPreparations: 0,
+                relaySelectionDeadlineHits: 0,
+                relaySelectionReadyBeforeDeadline: 0,
                 connected: 0,
                 closed: 0,
                 sentFrames: 0,
@@ -412,6 +425,23 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 queuedBytes: 0,
                 inboundQueuedBytes: 0,
                 peakInboundQueuedBytes: 0,
+                inboundSlices: 0,
+                inboundSlicePumps: 0,
+                maxInboundSliceQueue: 0,
+                longestInboundSlicePumpMillis: 0,
+                decodedSliceBacklog: 0,
+                maxDecodedSliceBacklog: 0,
+                decodedSliceBacklogPauses: 0,
+                decodedSliceBacklogResumes: 0,
+                decodedPacketQueue: 0,
+                maxDecodedPacketQueue: 0,
+                decodedPacketQueuePauses: 0,
+                decodedPacketQueueResumes: 0,
+                decodedPacketDrainSignals: 0,
+                activeHighWatermarks: 0,
+                highWatermarkDurationMillis: 0,
+                longestHighWatermarkMillis: 0,
+                activeHighWatermarkMillis: 0,
                 flowPauses: 0,
                 flowResumes: 0,
                 localFlushes: 0,
@@ -419,6 +449,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 localFlushBytes: 0,
                 localReceivedFrames: 0,
                 localReceivedBytes: 0,
+                localClaimWaits: 0,
+                localClaimRetries: 0,
+                localClaimTimeouts: 0,
+                localDuplicateOpens: 0,
+                localSupersededClaims: 0,
                 peakLocalFlushFrames: 0,
                 peakLocalFlushBytes: 0,
                 pumpCalls: 0,
@@ -428,16 +463,19 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 peakPumpChunks: 0,
                 peakPumpBytes: 0,
                 peakPumpMillis: 0,
+                longestPumpMillis: 0,
+                eventLoopGapSamples: 0,
+                eventLoopGapsOver500: 0,
+                longestEventLoopGapMillis: 0,
                 errors: 0
               }
             };
-            const maximumInboundQueueBytes = 64 * 1024 * 1024;
-            const inboundPauseBytes = 24 * 1024 * 1024;
-            const inboundResumeBytes = 8 * 1024 * 1024;
             const maximumWebSocketBufferedBytes = 4 * 1024 * 1024;
             const maximumOutboundQueueBytes = 16 * 1024 * 1024;
             const relayPreflightTimeoutMs = 900;
             const relayRegistryTimeoutMs = 1500;
+            const relayParallelPreparationDelayMs = 50;
+            const relaySelectionDeadlineMs = 120;
             const relayRegistryCacheTtlMs = 5 * 60 * 1000;
             const maximumRelayRegistryNodes = 64;
             const maximumRelayRegistryUrls = 32;
@@ -454,6 +492,33 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             // MessagePort has TCP-stream semantics here, so adjacent Netty writes can share one
             // transferable buffer. Bound batches to retain low input latency and fair delivery.
             const maximumLocalBatchBytes = 16 * 1024;
+            const configuredLocalClaimTimeout = Number(
+              globalThis.__gaiusLocalPortClaimTimeoutMs
+            );
+            const localPortClaimTimeoutMs = Number.isFinite(configuredLocalClaimTimeout)
+              ? Math.max(50, Math.min(30000, configuredLocalClaimTimeout))
+              : 10000;
+            const localPortClaimRetryMs = 8;
+            function recordConnectPhase(entry, phase, detail) {
+              const now = typeof performance !== 'undefined' && performance.now
+                ? performance.now()
+                : Date.now();
+              if (!entry.connectStartedAt) entry.connectStartedAt = now;
+              const event = {
+                id: entry.id,
+                target: entry.targetKey,
+                phase: String(phase),
+                elapsedMillis: Math.max(0, now - entry.connectStartedAt),
+                at: Date.now()
+              };
+              if (detail !== undefined && detail !== null) {
+                event.detail = String(detail).slice(0, 160);
+              }
+              state.stats.connectPhases.push(event);
+              if (state.stats.connectPhases.length > 256) {
+                state.stats.connectPhases.splice(0, state.stats.connectPhases.length - 256);
+              }
+            }
             function authorityHost(value) {
               const host = String(value || '127.0.0.1');
               return host.includes(':') && !(host.startsWith('[') && host.endsWith(']'))
@@ -1027,29 +1092,93 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 clearTimeout(timeout);
               });
             }
+            function appendRelayCandidates(entry, candidates) {
+              const added = [];
+              for (let index = 0; index < candidates.length; index++) {
+                const candidate = candidates[index];
+                if (!candidate || entry.candidateUrls.has(candidate.url)) continue;
+                entry.candidateUrls.add(candidate.url);
+                entry.candidates.push(candidate);
+                added.push(candidate);
+              }
+              return added;
+            }
+            function probeRelayCandidates(entry, candidates) {
+              if (candidates.length === 0 || typeof fetch !== 'function') {
+                return Promise.resolve();
+              }
+              const probes = new Array(candidates.length);
+              for (let index = 0; index < candidates.length; index++) {
+                probes[index] = probeRelayCandidate(entry, candidates[index]);
+              }
+              return Promise.all(probes);
+            }
             function prepareRelayCandidates(entry) {
               entry.relayPreflightReady = false;
               entry.relayPreflightWaitStarted = false;
+              recordConnectPhase(entry, 'relay-preparation-start');
+              const immediate = appendRelayCandidates(entry, bridgeUrls([]));
+              const immediateProbes = probeRelayCandidates(entry, immediate);
               const registryPromise = state.relayRegistryPromise || discoverRelayNodes();
               state.relayRegistryPromise = registryPromise;
-              entry.relayPreflightPromise = registryPromise.then(function(discovered) {
-                const candidates = bridgeUrls(discovered);
-                entry.candidates.push.apply(entry.candidates, candidates);
-                if (candidates.length === 0 || typeof fetch !== 'function') return undefined;
-                const probes = new Array(candidates.length);
-                for (let index = 0; index < candidates.length; index++) {
-                  probes[index] = probeRelayCandidate(entry, candidates[index]);
-                }
-                return Promise.all(probes);
-              }).then(function() {
+              const discoveredProbes = registryPromise.then(function(discovered) {
+                return probeRelayCandidates(
+                  entry,
+                  appendRelayCandidates(entry, bridgeUrls(discovered))
+                );
+              });
+              entry.relayPreflightPromise = Promise.all([
+                immediateProbes,
+                discoveredProbes
+              ]).then(function() {
                 entry.relayPreflightReady = true;
                 rankRemainingRelayCandidates(entry);
+              });
+              entry.relaySelectionPromise = Promise.race([
+                entry.relayPreflightPromise.then(function() { return true; }),
+                new Promise(function(resolve) {
+                  entry.relaySelectionTimer = setTimeout(function() {
+                    entry.relaySelectionTimer = 0;
+                    resolve(false);
+                  }, relaySelectionDeadlineMs);
+                })
+              ]).then(function(readyBeforeDeadline) {
+                if (entry.relaySelectionTimer) {
+                  clearTimeout(entry.relaySelectionTimer);
+                  entry.relaySelectionTimer = 0;
+                }
+                if (entry.closed) return;
+                entry.relaySelectionReady = true;
+                rankRemainingRelayCandidates(entry);
+                if (readyBeforeDeadline) {
+                  state.stats.relaySelectionReadyBeforeDeadline++;
+                } else {
+                  state.stats.relaySelectionDeadlineHits++;
+                }
+                recordConnectPhase(
+                  entry,
+                  'relay-selection-ready',
+                  readyBeforeDeadline ? 'preflight' : '120ms-deadline'
+                );
               });
             }
             function ensureRelayCandidates(entry) {
               if (entry.relayPreparationStarted) return;
+              if (entry.relayPreparationTimer) {
+                clearTimeout(entry.relayPreparationTimer);
+                entry.relayPreparationTimer = 0;
+              }
               entry.relayPreparationStarted = true;
+              state.stats.relayParallelPreparations++;
               prepareRelayCandidates(entry);
+            }
+            function scheduleRelayPreparation(entry) {
+              if (entry.relayPreparationStarted || entry.relayPreparationTimer) return;
+              entry.relayPreparationTimer = setTimeout(function() {
+                entry.relayPreparationTimer = 0;
+                if (entry.closed || entry.connected || entry.directNegotiating) return;
+                ensureRelayCandidates(entry);
+              }, relayParallelPreparationDelayMs);
             }
             function relayNodeRecord(candidate) {
               if (!candidate || candidate.direct) return null;
@@ -1118,8 +1247,32 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               const match = /^(?:client|server)-([a-f0-9]{32})\\.gaius-local$/.exec(host);
               return match ? match[1] : null;
             }
-            function takeLocalPort(sessionId) {
+            function localPortMap() {
               const ports = globalThis.__gaiusLocalServerPorts;
+              if (!ports) return null;
+              if (typeof ports.get === 'function' &&
+                  typeof ports.set === 'function' &&
+                  !ports.__gaiusLocalPortObserver) {
+                const originalSet = ports.set;
+                try {
+                  Object.defineProperty(ports, '__gaiusLocalPortObserver', {
+                    value: true,
+                    configurable: false,
+                    enumerable: false
+                  });
+                  ports.set = function(sessionId, port) {
+                    const result = originalSet.call(this, sessionId, port);
+                    queueMicrotask(function() {
+                      notifyLocalPortAvailable(String(sessionId || ''));
+                    });
+                    return result;
+                  };
+                } catch (ignored) {}
+              }
+              return ports;
+            }
+            function takeLocalPort(sessionId) {
+              const ports = localPortMap();
               if (!ports) return null;
               if (typeof ports.get === 'function') {
                 const mappedPort = ports.get(sessionId) || null;
@@ -1130,10 +1283,154 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               if (objectPort) delete ports[sessionId];
               return objectPort;
             }
+            function clearLocalClaim(entry) {
+              if (!entry) return;
+              if (entry.localClaimTimer) {
+                clearTimeout(entry.localClaimTimer);
+                entry.localClaimTimer = 0;
+              }
+              entry.localClaimGeneration++;
+            }
+            function clearRelayPreparation(entry) {
+              if (!entry) return;
+              if (entry.relayPreparationTimer) {
+                clearTimeout(entry.relayPreparationTimer);
+                entry.relayPreparationTimer = 0;
+              }
+              if (entry.relaySelectionTimer) {
+                clearTimeout(entry.relaySelectionTimer);
+                entry.relaySelectionTimer = 0;
+              }
+            }
+            function forgetLocalOwner(entry) {
+              if (!entry || !entry.localSessionId) return;
+              if (state.localSessionOwners.get(entry.localSessionId) === entry) {
+                state.localSessionOwners.delete(entry.localSessionId);
+              }
+            }
+            function notifyLocalPortAvailable(sessionId) {
+              const entry = state.localSessionOwners.get(sessionId);
+              if (!entry || entry.closed || entry.connected) return;
+              if (entry.localClaimTimer) {
+                clearTimeout(entry.localClaimTimer);
+                entry.localClaimTimer = 0;
+              }
+              tryClaimLocalPort(entry, entry.localClaimGeneration);
+            }
+            function attachLocalPort(entry, localPort) {
+              if (entry.closed || !localPort) return false;
+              clearLocalClaim(entry);
+              entry.localPort = localPort;
+              entry.connected = true;
+              const sessionId = entry.localSessionId;
+              const workers = globalThis.__gaiusSingleplayerWorkers;
+              const localWorker = workers && typeof workers.get === 'function'
+                ? workers.get(sessionId)
+                : null;
+              if (localWorker) {
+                localWorker.__gaiusClientAttached = true;
+                localWorker.__gaiusHandoffPending = false;
+                if (localWorker.__gaiusHandoffTimeout) {
+                  clearTimeout(localWorker.__gaiusHandoffTimeout);
+                  localWorker.__gaiusHandoffTimeout = 0;
+                }
+                const events = globalThis.__gaiusMinecraftEvents ||
+                  (globalThis.__gaiusMinecraftEvents = []);
+                events.push({
+                  event: 'singleplayer:client-attached',
+                  detail: sessionId,
+                  at: Date.now()
+                });
+                if (events.length > 500) events.splice(0, events.length - 500);
+              }
+              state.stats.localOpened++;
+              state.stats.connected++;
+              localPort.onmessage = function(event) {
+                if (entry.closed || entry.localPort !== localPort) return;
+                const message = event.data;
+                if (message && typeof message === 'object' && !(message instanceof ArrayBuffer) &&
+                    !ArrayBuffer.isView(message)) {
+                  if (message.type === 'flow' && typeof message.paused === 'boolean') {
+                    entry.remotePaused = message.paused;
+                    if (!entry.remotePaused) requestFlush(entry);
+                  } else if (message.type === 'close') {
+                    entry.connected = false;
+                    entry.closed = true;
+                    entry.localPort = null;
+                    forgetLocalOwner(entry);
+                    try { localPort.close(); } catch (ignored) {}
+                    state.stats.closed++;
+                  }
+                  return;
+                }
+                if (message instanceof ArrayBuffer || ArrayBuffer.isView(message)) {
+                  entry.localActivity = true;
+                  deliverInbound(entry, message);
+                }
+              };
+              localPort.onmessageerror = function() {
+                if (entry.localPort === localPort) {
+                  fail(entry, 'Local server MessagePort decode failed');
+                }
+              };
+              if (typeof localPort.start === 'function') localPort.start();
+              requestFlush(entry);
+              return true;
+            }
+            function tryClaimLocalPort(entry, generation) {
+              if (entry.closed || entry.connected || generation !== entry.localClaimGeneration) {
+                return;
+              }
+              const localPort = takeLocalPort(entry.localSessionId);
+              if (localPort) {
+                attachLocalPort(entry, localPort);
+                return;
+              }
+              if (Date.now() >= entry.localClaimDeadline) {
+                state.stats.localClaimTimeouts++;
+                fail(
+                  entry,
+                  'Local server MessagePort did not register within ' +
+                    localPortClaimTimeoutMs + ' ms for ' + entry.localSessionId
+                );
+                return;
+              }
+              state.stats.localClaimRetries++;
+              entry.localClaimTimer = setTimeout(function() {
+                entry.localClaimTimer = 0;
+                tryClaimLocalPort(entry, generation);
+              }, localPortClaimRetryMs);
+            }
+            function claimLocalPort(entry, sessionId) {
+              entry.localSessionId = sessionId;
+              const previous = state.localSessionOwners.get(sessionId);
+              if (previous && previous !== entry && !previous.closed) {
+                if (previous.connected) {
+                  fail(entry, 'Local server session already has an active transport for ' + sessionId);
+                  return;
+                }
+                state.stats.localSupersededClaims++;
+                fail(previous, 'Local server connection attempt was superseded for ' + sessionId);
+              }
+              state.localSessionOwners.set(sessionId, entry);
+              const localPort = takeLocalPort(sessionId);
+              if (localPort) {
+                attachLocalPort(entry, localPort);
+                return;
+              }
+              state.stats.localClaimWaits++;
+              entry.localClaimDeadline = Date.now() + localPortClaimTimeoutMs;
+              const generation = ++entry.localClaimGeneration;
+              tryClaimLocalPort(entry, generation);
+            }
             function fail(entry, message) {
+              if (!entry || entry.closed) return;
               entry.errors.push(String(message || 'Browser bridge error'));
               state.stats.errors++;
               releaseTargetRelayLease(entry);
+              clearLocalClaim(entry);
+              clearRelayPreparation(entry);
+              forgetLocalOwner(entry);
               try { if (entry.ws) entry.ws.close(); } catch (ignored) {}
               try {
                 if (entry.localPort) {
@@ -1141,7 +1438,12 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                   entry.localPort.close();
                 }
               } catch (ignored) {}
+              entry.connected = false;
+              entry.localPort = null;
+              state.discardInbound(entry);
+              entry.disposed = true;
               entry.closed = true;
+              state.stopEventLoopGapProbeIfIdle();
             }
             function sendControl(entry, message) {
               if (entry.localPort) {
@@ -1155,54 +1457,19 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               try {
                 sendControl(entry, {type: 'flow', paused: !!paused});
                 entry.flowPaused = paused;
-                if (paused) state.stats.flowPauses++;
-                else state.stats.flowResumes++;
+                if (paused) {
+                  state.stats.flowPauses++;
+                  state.startHighWatermark(entry);
+                } else {
+                  state.stats.flowResumes++;
+                  state.finishHighWatermark(entry);
+                }
               } catch (error) {
                 fail(entry, error && (error.message || error));
               }
             }
             function deliverInbound(entry, buffer) {
-              if (entry.closed) return;
-              const source = buffer instanceof ArrayBuffer
-                ? new Uint8Array(buffer)
-                : new Uint8Array(buffer.buffer, buffer.byteOffset || 0, buffer.byteLength || 0);
-              let copy = source;
-              if (!entry.localPort || !(buffer instanceof ArrayBuffer)) {
-                copy = new Uint8Array(source.byteLength);
-                copy.set(source);
-              }
-              if (entry.inboundBytes + copy.byteLength > maximumInboundQueueBytes) {
-                fail(entry, 'Browser transport inbound queue exceeded 64 MiB');
-                return;
-              }
-              entry.inbound.push(copy);
-              entry.inboundBytes += copy.byteLength;
-              state.stats.inboundQueuedBytes += copy.byteLength;
-              state.stats.peakInboundQueuedBytes = Math.max(
-                state.stats.peakInboundQueuedBytes,
-                state.stats.inboundQueuedBytes
-              );
-              state.stats.receivedFrames++;
-              state.stats.receivedBytes += copy.byteLength;
-              if (entry.localPort) {
-                state.stats.localReceivedFrames++;
-                state.stats.localReceivedBytes += copy.byteLength;
-              }
-              if (entry.inboundBytes >= inboundPauseBytes) {
-                setInboundPaused(entry, true);
-              }
-              const integratedServerPump =
-                globalThis.__gaiusStartIntegratedServerPump;
-              const integratedServerSignal =
-                globalThis.__gaiusIntegratedServerNetworkSignal;
-              if (typeof integratedServerPump === 'function') {
-                integratedServerPump();
-              } else if (typeof integratedServerSignal === 'function') {
-                integratedServerSignal();
-              }
-              if (typeof state.inboundPump === 'function') {
-                state.inboundPump();
-              }
+              state.deliverInbound(entry, buffer);
             }
             function requestFlush(entry) {
               if (!entry.localPort) {
@@ -1246,6 +1513,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 state.stats.queuedBytes = Math.max(0, state.stats.queuedBytes - byteLength);
                 try {
                   if (entry.localPort) {
+                    entry.localActivity = true;
                     if (localBatchBytes > 0 &&
                         localBatchBytes + byteLength > maximumLocalBatchBytes) {
                       flushLocalBatch();
@@ -1289,11 +1557,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             function openRemoteCandidate(entry) {
               if (entry.closed || entry.connected) return;
               const upcoming = entry.candidates[entry.candidateIndex];
-              if ((!upcoming || !upcoming.direct) && !entry.relayPreflightReady) {
+              if ((!upcoming || !upcoming.direct) && !entry.relaySelectionReady) {
                 ensureRelayCandidates(entry);
                 if (!entry.relayPreflightWaitStarted) {
                   entry.relayPreflightWaitStarted = true;
-                  entry.relayPreflightPromise.then(function() {
+                  entry.relaySelectionPromise.then(function() {
                     if (entry.closed || entry.connected) return;
                     rankRemainingRelayCandidates(entry);
                     openRemoteCandidate(entry);
@@ -1302,6 +1570,16 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 return;
               }
               if (entry.candidateIndex >= entry.candidates.length) {
+                if (!entry.relayPreflightReady && !entry.relayExhaustionWaitStarted) {
+                  entry.relayExhaustionWaitStarted = true;
+                  entry.relayPreflightPromise.then(function() {
+                    if (entry.closed || entry.connected) return;
+                    entry.relayExhaustionWaitStarted = false;
+                    rankRemainingRelayCandidates(entry);
+                    openRemoteCandidate(entry);
+                  });
+                  return;
+                }
                 fail(entry, 'No Gaius direct endpoint or relay node could reach the server');
                 return;
               }
@@ -1329,6 +1607,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 recordRelayNodeAttempt(candidate);
               }
               const generation = ++entry.webSocketGeneration;
+              recordConnectPhase(
+                entry,
+                candidate.direct ? 'direct-websocket-start' : 'relay-websocket-start',
+                candidate.url
+              );
               let ws;
               try {
                 ws = new WebSocket(candidate.url);
@@ -1352,6 +1635,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 if (entry.closed || entry.connected || generation !== entry.webSocketGeneration) {
                   return;
                 }
+                recordConnectPhase(
+                  entry,
+                  candidate.direct ? 'direct-failed' : 'relay-failed',
+                  candidate.direct ? 'websocket-timeout' : 'target-timeout'
+                );
                 try { ws.close(); } catch (ignored) {}
                 if (candidate.direct) {
                   rememberDirectPluginUnavailable(entry, candidate);
@@ -1367,6 +1655,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               );
               ws.onopen = function() {
                 if (generation !== entry.webSocketGeneration || entry.closed) return;
+                recordConnectPhase(
+                  entry,
+                  candidate.direct ? 'direct-websocket-open' : 'relay-websocket-open',
+                  candidate.url
+                );
                 if (!candidate.direct) {
                   armCandidateTimeout(relayTunnelConnectTimeout(candidate));
                 }
@@ -1385,6 +1678,18 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                   try {
                     const message = JSON.parse(event.data);
                     if (message && message.type === 'connecting') {
+                      if (candidate.direct) {
+                        entry.directNegotiating = true;
+                        if (entry.relayPreparationTimer) {
+                          clearTimeout(entry.relayPreparationTimer);
+                          entry.relayPreparationTimer = 0;
+                        }
+                      }
+                      recordConnectPhase(
+                        entry,
+                        candidate.direct ? 'direct-target-connecting' : 'relay-target-connecting',
+                        candidate.url
+                      );
                       const advertisedTimeout = Number(message.targetConnectTimeoutMs);
                       if (Number.isFinite(advertisedTimeout)) {
                         candidate.targetConnectTimeoutMs = Math.max(
@@ -1402,6 +1707,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                       return;
                     }
                     if (message && message.type === 'connected') {
+                      if (entry.connected) return;
                       const attestationPresent = typeof message.host === 'string' &&
                         Number.isInteger(Number(message.port));
                       const attestationMatches = attestationPresent &&
@@ -1423,12 +1729,22 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                       }
                       clearTimeout(candidateTimeout);
                       entry.connected = true;
+                      entry.directNegotiating = false;
+                      if (entry.relayPreparationTimer) {
+                        clearTimeout(entry.relayPreparationTimer);
+                        entry.relayPreparationTimer = 0;
+                      }
                       if (candidate.direct) {
                         forgetDirectPluginUnavailable(entry, candidate);
                         state.stats.directConnected++;
                       }
                       else recordRelayNodeSuccess(entry, candidate);
                       state.stats.connected++;
+                      recordConnectPhase(
+                        entry,
+                        candidate.direct ? 'direct-connected' : 'relay-connected',
+                        candidate.url
+                      );
                       requestFlush(entry);
                     }
                   } catch (ignored) {}
@@ -1453,6 +1769,12 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 clearTimeout(candidateTimeout);
                 if (generation !== entry.webSocketGeneration || entry.closed) return;
                 if (!entry.connected) {
+                  entry.directNegotiating = false;
+                  recordConnectPhase(
+                    entry,
+                    candidate.direct ? 'direct-failed' : 'relay-failed',
+                    candidate.url
+                  );
                   if (candidate.direct) {
                     rememberDirectPluginUnavailable(entry, candidate);
                   } else {
@@ -1478,99 +1800,102 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             }
             state.open = function(id, host, port) {
               const key = id|0;
+              const normalizedHost = String(host);
+              const normalizedPort = port|0;
               const existing = state.channels.get(key);
               if (existing) {
+                if (!existing.closed && existing.host === normalizedHost &&
+                    existing.port === normalizedPort) {
+                  if (localSession(normalizedHost) !== null) {
+                    state.stats.localDuplicateOpens++;
+                  }
+                  return;
+                }
                 releaseTargetRelayLease(existing);
+                clearLocalClaim(existing);
+                clearRelayPreparation(existing);
+                forgetLocalOwner(existing);
+                state.discardInbound(existing);
+                existing.disposed = true;
                 existing.closed = true;
+                state.stopEventLoopGapProbeIfIdle();
                 try { if (existing.ws) existing.ws.close(); } catch (ignored) {}
+                try {
+                  if (existing.localPort) {
+                    existing.localPort.postMessage({type: 'close'});
+                    existing.localPort.close();
+                  }
+                } catch (ignored) {}
               }
               const entry = {
                 id: key,
-                host: String(host),
-                port: port|0,
+                host: normalizedHost,
+                port: normalizedPort,
                 targetKey: normalizedTargetKey(host, port),
                 ws: null,
                 localPort: null,
+                localSessionId: null,
+                localClaimTimer: 0,
+                localClaimGeneration: 0,
+                localClaimDeadline: 0,
+                localActivity: false,
                 connected: false,
                 remotePaused: false,
                 localFlushScheduled: false,
                 inbound: [],
                 inboundHead: 0,
                 inboundBytes: 0,
+                pendingInbound: [],
+                pendingInboundHead: 0,
+                pendingInboundBytes: 0,
+                inboundSliceScheduled: false,
+                inboundSliceHandle: null,
+                inboundSliceUsesRaf: false,
+                decodedSliceBacklog: 0,
+                decodeFlowPaused: false,
+                highWatermarkStartedAt: 0,
                 outbound: [],
                 outboundHead: 0,
                 errors: [],
                 closed: false,
+                disposed: false,
                 flowPaused: false,
                 queuedBytes: 0,
                 candidates: [],
+                candidateUrls: new Set(),
                 candidateIndex: 0,
                 currentCandidate: null,
                 webSocketGeneration: 0,
+                connectStartedAt: 0,
+                directNegotiating: false,
                 relayPreparationStarted: false,
+                relayPreparationTimer: 0,
                 relayPreflightReady: false,
                 relayPreflightWaitStarted: false,
                 relayPreflightPromise: Promise.resolve(),
+                relaySelectionReady: false,
+                relaySelectionTimer: 0,
+                relaySelectionPromise: Promise.resolve(),
+                relayExhaustionWaitStarted: false,
                 relayTargetLeaseKey: null
               };
               state.channels.set(key, entry);
               state.stats.opened++;
+              state.scheduleEventLoopGapProbe();
               const sessionId = localSession(entry.host);
               if (sessionId !== null) {
-                const localPort = takeLocalPort(sessionId);
-                if (!localPort) {
-                  fail(entry, 'Local server MessagePort is unavailable for ' + sessionId);
-                  return;
-                }
-                entry.localPort = localPort;
-                entry.connected = true;
-                const workers = globalThis.__gaiusSingleplayerWorkers;
-                const localWorker = workers && typeof workers.get === 'function'
-                  ? workers.get(sessionId)
-                  : null;
-                if (localWorker) {
-                  localWorker.__gaiusClientAttached = true;
-                  localWorker.__gaiusHandoffPending = false;
-                  if (localWorker.__gaiusHandoffTimeout) {
-                    clearTimeout(localWorker.__gaiusHandoffTimeout);
-                    localWorker.__gaiusHandoffTimeout = 0;
-                  }
-                  const events = globalThis.__gaiusMinecraftEvents ||
-                    (globalThis.__gaiusMinecraftEvents = []);
-                  events.push({
-                    event: 'singleplayer:client-attached',
-                    detail: sessionId,
-                    at: Date.now()
-                  });
-                  if (events.length > 500) events.splice(0, events.length - 500);
-                }
-                state.stats.localOpened++;
-                state.stats.connected++;
-                localPort.onmessage = function(event) {
-                  const message = event.data;
-                  if (message && typeof message === 'object' && !(message instanceof ArrayBuffer) &&
-                      !ArrayBuffer.isView(message)) {
-                    if (message.type === 'flow' && typeof message.paused === 'boolean') {
-                      entry.remotePaused = message.paused;
-                      if (!entry.remotePaused) requestFlush(entry);
-                    } else if (message.type === 'close') {
-                      entry.closed = true;
-                    }
-                    return;
-                  }
-                  if (message instanceof ArrayBuffer || ArrayBuffer.isView(message)) {
-                    deliverInbound(entry, message);
-                  }
-                };
-                localPort.onmessageerror = function() {
-                  fail(entry, 'Local server MessagePort decode failed');
-                };
-                if (typeof localPort.start === 'function') localPort.start();
-                requestFlush(entry);
+                claimLocalPort(entry, sessionId);
                 return;
               }
+              recordConnectPhase(entry, 'open');
               const directUrl = directPluginUrl(entry.host);
-              if (directUrl) entry.candidates.push({url: directUrl, direct: true});
+              if (directUrl) {
+                entry.candidates.push({url: directUrl, direct: true});
+                entry.candidateUrls.add(directUrl);
+                scheduleRelayPreparation(entry);
+              } else {
+                ensureRelayCandidates(entry);
+              }
               openRemoteCandidate(entry);
             };
             state.send = function(id, data) {
@@ -1592,28 +1917,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               return !entry.closed;
             };
             state.pollInbound = function(id) {
-              const entry = state.channels.get(id|0);
-              if (!entry) return null;
-              requestFlush(entry);
-              if (entry.inboundHead >= entry.inbound.length) return null;
-              const chunk = entry.inbound[entry.inboundHead++];
-              entry.inboundBytes = Math.max(0, entry.inboundBytes - chunk.byteLength);
-              state.stats.inboundQueuedBytes = Math.max(
-                0,
-                state.stats.inboundQueuedBytes - chunk.byteLength
-              );
-              if (entry.inboundBytes <= inboundResumeBytes) {
-                setInboundPaused(entry, false);
-              }
-              if (entry.inboundHead >= entry.inbound.length) {
-                entry.inbound = [];
-                entry.inboundHead = 0;
-              } else if (entry.inboundHead >= 1024 &&
-                         entry.inboundHead * 2 >= entry.inbound.length) {
-                entry.inbound = entry.inbound.slice(entry.inboundHead);
-                entry.inboundHead = 0;
-              }
-              return new Int8Array(chunk.buffer, chunk.byteOffset || 0, chunk.byteLength);
+              return state.pollInboundScheduled(id, requestFlush);
             };
             state.pollError = function(id) {
               const entry = state.channels.get(id|0);
@@ -1621,30 +1925,30 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               return String(entry.errors.shift());
             };
             state.recordPump = function(id, chunks, bytes, millis) {
-              const entry = state.channels.get(id|0);
-              state.stats.pumpCalls++;
-              state.stats.pumpChunks += chunks|0;
-              state.stats.pumpBytes += bytes|0;
-              state.stats.peakPumpChunks = Math.max(state.stats.peakPumpChunks, chunks|0);
-              state.stats.peakPumpBytes = Math.max(state.stats.peakPumpBytes, bytes|0);
-              state.stats.peakPumpMillis = Math.max(state.stats.peakPumpMillis, +millis || 0);
-              if (entry && entry.inboundBytes > 0) state.stats.deferredPumps++;
+              state.recordPumpTelemetry(id, chunks, bytes, millis);
+            };
+            state.recordDecodedSlice = function(id) {
+              state.recordDecodedSliceScheduled(id);
+            };
+            state.recordDecodedPacketQueue = function(depth, paused, processed) {
+              state.recordDecodedPacketQueueScheduled(depth, paused, processed);
             };
             state.close = function(id) {
               const entry = state.channels.get(id|0);
               if (!entry) return;
               releaseTargetRelayLease(entry);
+              clearLocalClaim(entry);
+              clearRelayPreparation(entry);
+              forgetLocalOwner(entry);
+              entry.disposed = true;
               entry.closed = true;
+              entry.connected = false;
               state.stats.queuedBytes = Math.max(
                 0,
                 state.stats.queuedBytes - entry.queuedBytes
               );
-              state.stats.inboundQueuedBytes = Math.max(
-                0,
-                state.stats.inboundQueuedBytes - entry.inboundBytes
-              );
               entry.queuedBytes = 0;
-              entry.inboundBytes = 0;
+              state.discardInbound(entry);
               try { if (entry.ws) entry.ws.close(); } catch (ignored) {}
               try {
                 if (entry.localPort) {
@@ -1652,15 +1956,16 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                   entry.localPort.close();
                 }
               } catch (ignored) {}
+              entry.localPort = null;
               state.channels.delete(id|0);
+              state.stopEventLoopGapProbeIfIdle();
             };
             state.closed = function(id) {
               const entry = state.channels.get(id|0);
               return !entry || !!entry.closed;
             };
             state.hasPendingInbound = function(id) {
-              const entry = state.channels.get(id|0);
-              return !!entry && entry.inboundHead < entry.inbound.length;
+              return state.hasPendingInboundScheduled(id);
             };
             state.failLocalSession = function(sessionId, message) {
               sessionId = String(sessionId || '');
@@ -1670,15 +1975,440 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 }
               });
             };
+            state.registerLocalPort = function(sessionId, port) {
+              sessionId = String(sessionId || '');
+              if (!sessionId || !port) return false;
+              let ports = globalThis.__gaiusLocalServerPorts;
+              if (!ports) {
+                ports = new Map();
+                globalThis.__gaiusLocalServerPorts = ports;
+              }
+              if (typeof ports.set === 'function') ports.set(sessionId, port);
+              else ports[sessionId] = port;
+              notifyLocalPortAvailable(sessionId);
+              return true;
+            };
             state.refreshRelayRegistry = function() {
               state.relayRegistryCache.clear();
               state.relayRegistryPromise = discoverRelayNodes();
               return state.relayRegistryPromise;
             };
+            // Lightweight defaults keep source-level bridge harnesses operational. The TeaVM
+            // constructor immediately replaces these with the bounded scheduler below.
+            state.scheduleEventLoopGapProbe = function() {};
+            state.stopEventLoopGapProbeIfIdle = function() {};
+            state.startHighWatermark = function() {};
+            state.finishHighWatermark = function() {};
+            state.discardInbound = function(entry) {
+              if (!entry) return;
+              state.stats.inboundQueuedBytes = Math.max(
+                0,
+                state.stats.inboundQueuedBytes - entry.inboundBytes - entry.pendingInboundBytes
+              );
+              entry.inbound = [];
+              entry.inboundHead = 0;
+              entry.inboundBytes = 0;
+              entry.pendingInbound = [];
+              entry.pendingInboundHead = 0;
+              entry.pendingInboundBytes = 0;
+            };
+            state.deliverInbound = function(entry, buffer) {
+              if (!entry || entry.closed) return;
+              const bytes = buffer instanceof ArrayBuffer
+                ? new Uint8Array(buffer)
+                : new Uint8Array(buffer.buffer, buffer.byteOffset || 0, buffer.byteLength || 0);
+              entry.inbound.push(bytes);
+              entry.inboundBytes += bytes.byteLength;
+              state.stats.inboundQueuedBytes += bytes.byteLength;
+              state.stats.receivedFrames++;
+              state.stats.receivedBytes += bytes.byteLength;
+            };
+            state.pollInboundScheduled = function(id, requestFlush) {
+              const entry = state.channels.get(id|0);
+              if (!entry || entry.inboundHead >= entry.inbound.length) return null;
+              requestFlush(entry);
+              const chunk = entry.inbound[entry.inboundHead++];
+              entry.inboundBytes = Math.max(0, entry.inboundBytes - chunk.byteLength);
+              state.stats.inboundQueuedBytes = Math.max(
+                0,
+                state.stats.inboundQueuedBytes - chunk.byteLength
+              );
+              if (entry.inboundHead >= entry.inbound.length) {
+                entry.inbound = [];
+                entry.inboundHead = 0;
+              }
+              return new Int8Array(chunk.buffer, chunk.byteOffset || 0, chunk.byteLength);
+            };
+            state.recordPumpTelemetry = function() {};
+            state.recordDecodedSliceScheduled = function() {};
+            state.recordDecodedPacketQueueScheduled = function() {};
+            state.hasPendingInboundScheduled = function(id) {
+              const entry = state.channels.get(id|0);
+              return !!entry && entry.inboundHead < entry.inbound.length;
+            };
+            state.setInboundPaused = setInboundPaused;
+            state.failInbound = fail;
+            localPortMap();
             globalThis.__gaiusNettyBridge = state;
             globalThis.__gaiusNetworkStats = state.stats;
             """)
     private static native void initBridge();
+
+    @JSBody(script = """
+            const state = globalThis.__gaiusNettyBridge;
+            if (!state || state.inboundSchedulerReady) return;
+            state.inboundSchedulerReady = true;
+            const maximumInboundQueueBytes = 64 * 1024 * 1024;
+            const inboundPauseBytes = 24 * 1024 * 1024;
+            const inboundResumeBytes = 8 * 1024 * 1024;
+            const maximumInboundSliceBytes = 64 * 1024;
+            const decodedSliceHighWatermark = 256;
+            const decodedSliceLowWatermark = 64;
+            const inboundSliceBudgetMillis = 2.0;
+            const eventLoopGapIntervalMillis = 100;
+            function now() {
+              return typeof performance !== 'undefined' && performance.now
+                ? performance.now()
+                : Date.now();
+            }
+            function sliceCount(entry) {
+              return Math.max(0, entry.inbound.length - entry.inboundHead);
+            }
+            function queuedBytes(entry) {
+              return Math.max(0, entry.inboundBytes + entry.pendingInboundBytes);
+            }
+            function workDepth(entry) {
+              return sliceCount(entry) + Math.max(0, entry.decodedSliceBacklog);
+            }
+            function refreshHighWatermark() {
+              const sampledAt = now();
+              let activeMillis = 0;
+              state.channels.forEach(function(entry) {
+                if (entry.highWatermarkStartedAt > 0) {
+                  activeMillis += Math.max(0, sampledAt - entry.highWatermarkStartedAt);
+                }
+              });
+              state.stats.activeHighWatermarkMillis = activeMillis;
+            }
+            state.startHighWatermark = function(entry) {
+              if (entry.highWatermarkStartedAt > 0) return;
+              entry.highWatermarkStartedAt = now();
+              state.stats.activeHighWatermarks++;
+            };
+            state.finishHighWatermark = function(entry) {
+              if (entry.highWatermarkStartedAt <= 0) return;
+              const duration = Math.max(0, now() - entry.highWatermarkStartedAt);
+              entry.highWatermarkStartedAt = 0;
+              state.stats.activeHighWatermarks = Math.max(
+                0,
+                state.stats.activeHighWatermarks - 1
+              );
+              state.stats.highWatermarkDurationMillis += duration;
+              state.stats.longestHighWatermarkMillis = Math.max(
+                state.stats.longestHighWatermarkMillis,
+                duration
+              );
+              refreshHighWatermark();
+            };
+            function hasActiveChannels() {
+              let active = false;
+              state.channels.forEach(function(entry) {
+                if (!entry.disposed) active = true;
+              });
+              return active;
+            }
+            state.scheduleEventLoopGapProbe = function() {
+              if (state.gapProbeTimer || !hasActiveChannels()) return;
+              state.gapProbeExpectedAt = now() + eventLoopGapIntervalMillis;
+              state.gapProbeTimer = setTimeout(function() {
+                state.gapProbeTimer = 0;
+                const gap = Math.max(0, now() - state.gapProbeExpectedAt);
+                state.stats.eventLoopGapSamples++;
+                state.stats.longestEventLoopGapMillis = Math.max(
+                  state.stats.longestEventLoopGapMillis,
+                  gap
+                );
+                if (gap >= 500) state.stats.eventLoopGapsOver500++;
+                state.scheduleEventLoopGapProbe();
+              }, eventLoopGapIntervalMillis);
+            };
+            state.stopEventLoopGapProbeIfIdle = function() {
+              if (hasActiveChannels()) return;
+              if (state.gapProbeTimer) clearTimeout(state.gapProbeTimer);
+              state.gapProbeTimer = 0;
+              state.gapProbeExpectedAt = 0;
+            };
+            function signalInbound() {
+              const integratedPump = globalThis.__gaiusStartIntegratedServerPump;
+              const integratedSignal = globalThis.__gaiusIntegratedServerNetworkSignal;
+              if (typeof integratedPump === 'function') integratedPump();
+              else if (typeof integratedSignal === 'function') integratedSignal();
+              if (typeof state.inboundPump === 'function') state.inboundPump();
+            }
+            function applyFlowControl(entry) {
+              if (!entry || entry.disposed) return;
+              const depth = workDepth(entry);
+              const bytes = queuedBytes(entry);
+              if (depth >= decodedSliceHighWatermark || bytes >= inboundPauseBytes ||
+                  state.exactPacketQueuePaused) {
+                if (!entry.decodeFlowPaused) {
+                  entry.decodeFlowPaused = true;
+                  state.stats.decodedSliceBacklogPauses++;
+                }
+                state.setInboundPaused(entry, true);
+                return;
+              }
+              if (entry.decodeFlowPaused && !state.exactPacketQueuePaused &&
+                  depth <= decodedSliceLowWatermark && bytes <= inboundResumeBytes) {
+                entry.decodeFlowPaused = false;
+                state.stats.decodedSliceBacklogResumes++;
+                state.setInboundPaused(entry, false);
+              }
+            }
+            function compactPending(entry) {
+              if (entry.pendingInboundHead >= entry.pendingInbound.length) {
+                entry.pendingInbound = [];
+                entry.pendingInboundHead = 0;
+              } else if (entry.pendingInboundHead >= 128 &&
+                         entry.pendingInboundHead * 2 >= entry.pendingInbound.length) {
+                entry.pendingInbound = entry.pendingInbound.slice(entry.pendingInboundHead);
+                entry.pendingInboundHead = 0;
+              }
+            }
+            function scheduleSlices(entry, immediate) {
+              if (!entry || entry.disposed || entry.inboundSliceScheduled ||
+                  entry.pendingInboundHead >= entry.pendingInbound.length ||
+                  workDepth(entry) >= decodedSliceHighWatermark) return;
+              entry.inboundSliceScheduled = true;
+              const run = function() {
+                entry.inboundSliceScheduled = false;
+                entry.inboundSliceHandle = null;
+                entry.inboundSliceUsesRaf = false;
+                pumpSlices(entry);
+              };
+              if (immediate && typeof queueMicrotask === 'function') queueMicrotask(run);
+              else if (typeof globalThis.requestAnimationFrame === 'function') {
+                entry.inboundSliceUsesRaf = true;
+                entry.inboundSliceHandle = globalThis.requestAnimationFrame(run);
+              } else {
+                entry.inboundSliceHandle = setTimeout(run, 0);
+              }
+            }
+            function pumpSlices(entry) {
+              if (!entry || entry.disposed) return;
+              const startedAt = now();
+              let slices = 0;
+              while (entry.pendingInboundHead < entry.pendingInbound.length &&
+                     workDepth(entry) < decodedSliceHighWatermark) {
+                if (slices > 0 && now() - startedAt >= inboundSliceBudgetMillis) break;
+                const frame = entry.pendingInbound[entry.pendingInboundHead];
+                const remaining = frame.bytes.byteLength - frame.offset;
+                if (remaining <= 0) {
+                  entry.pendingInboundHead++;
+                  continue;
+                }
+                const byteLength = Math.min(maximumInboundSliceBytes, remaining);
+                const chunk = frame.bytes.subarray(frame.offset, frame.offset + byteLength);
+                frame.offset += byteLength;
+                entry.pendingInboundBytes = Math.max(0, entry.pendingInboundBytes - byteLength);
+                entry.inbound.push(chunk);
+                entry.inboundBytes += byteLength;
+                slices++;
+                state.stats.inboundSlices++;
+                state.stats.maxInboundSliceQueue = Math.max(
+                  state.stats.maxInboundSliceQueue,
+                  sliceCount(entry)
+                );
+                if (frame.offset >= frame.bytes.byteLength) entry.pendingInboundHead++;
+              }
+              compactPending(entry);
+              const elapsed = Math.max(0, now() - startedAt);
+              state.stats.inboundSlicePumps++;
+              state.stats.longestInboundSlicePumpMillis = Math.max(
+                state.stats.longestInboundSlicePumpMillis,
+                elapsed
+              );
+              applyFlowControl(entry);
+              if (slices > 0) signalInbound();
+              if (entry.pendingInboundHead < entry.pendingInbound.length &&
+                  workDepth(entry) < decodedSliceHighWatermark) scheduleSlices(entry, false);
+            }
+            function removeDecodedOwners(entry) {
+              if (!entry || entry.decodedSliceBacklog <= 0) return;
+              const retained = [];
+              for (let index = state.decodedSliceOwnerHead;
+                   index < state.decodedSliceOwners.length; index++) {
+                const owner = state.decodedSliceOwners[index];
+                if (owner !== entry.id) retained.push(owner);
+              }
+              state.decodedSliceOwners = retained;
+              state.decodedSliceOwnerHead = 0;
+              state.stats.decodedSliceBacklog = Math.max(
+                0,
+                state.stats.decodedSliceBacklog - entry.decodedSliceBacklog
+              );
+              entry.decodedSliceBacklog = 0;
+            }
+            state.discardInbound = function(entry) {
+              if (!entry) return;
+              state.finishHighWatermark(entry);
+              removeDecodedOwners(entry);
+              if (entry.inboundSliceHandle !== null) {
+                if (entry.inboundSliceUsesRaf &&
+                    typeof globalThis.cancelAnimationFrame === 'function') {
+                  globalThis.cancelAnimationFrame(entry.inboundSliceHandle);
+                } else {
+                  clearTimeout(entry.inboundSliceHandle);
+                }
+              }
+              state.stats.inboundQueuedBytes = Math.max(
+                0,
+                state.stats.inboundQueuedBytes - queuedBytes(entry)
+              );
+              entry.inbound = [];
+              entry.inboundHead = 0;
+              entry.inboundBytes = 0;
+              entry.pendingInbound = [];
+              entry.pendingInboundHead = 0;
+              entry.pendingInboundBytes = 0;
+              entry.inboundSliceScheduled = false;
+              entry.inboundSliceHandle = null;
+              entry.inboundSliceUsesRaf = false;
+              entry.decodeFlowPaused = false;
+            };
+            state.deliverInbound = function(entry, buffer) {
+              if (!entry || entry.closed) return;
+              const source = buffer instanceof ArrayBuffer
+                ? new Uint8Array(buffer)
+                : new Uint8Array(buffer.buffer, buffer.byteOffset || 0, buffer.byteLength || 0);
+              if (queuedBytes(entry) + source.byteLength > maximumInboundQueueBytes) {
+                state.failInbound(entry, 'Browser transport inbound queue exceeded 64 MiB');
+                return;
+              }
+              entry.pendingInbound.push({bytes: source, offset: 0});
+              entry.pendingInboundBytes += source.byteLength;
+              state.stats.inboundQueuedBytes += source.byteLength;
+              state.stats.peakInboundQueuedBytes = Math.max(
+                state.stats.peakInboundQueuedBytes,
+                state.stats.inboundQueuedBytes
+              );
+              state.stats.receivedFrames++;
+              state.stats.receivedBytes += source.byteLength;
+              if (entry.localPort) {
+                state.stats.localReceivedFrames++;
+                state.stats.localReceivedBytes += source.byteLength;
+              }
+              applyFlowControl(entry);
+              scheduleSlices(entry, true);
+            };
+            state.pollInboundScheduled = function(id, requestFlush) {
+              const entry = state.channels.get(id|0);
+              if (!entry) return null;
+              requestFlush(entry);
+              if (entry.inboundHead >= entry.inbound.length) {
+                scheduleSlices(entry, true);
+                return null;
+              }
+              if (entry.decodedSliceBacklog >= decodedSliceHighWatermark) {
+                applyFlowControl(entry);
+                return null;
+              }
+              const chunk = entry.inbound[entry.inboundHead++];
+              entry.inboundBytes = Math.max(0, entry.inboundBytes - chunk.byteLength);
+              state.stats.inboundQueuedBytes = Math.max(
+                0,
+                state.stats.inboundQueuedBytes - chunk.byteLength
+              );
+              if (entry.inboundHead >= entry.inbound.length) {
+                entry.inbound = [];
+                entry.inboundHead = 0;
+              } else if (entry.inboundHead >= 1024 &&
+                         entry.inboundHead * 2 >= entry.inbound.length) {
+                entry.inbound = entry.inbound.slice(entry.inboundHead);
+                entry.inboundHead = 0;
+              }
+              applyFlowControl(entry);
+              scheduleSlices(entry, false);
+              return new Int8Array(chunk.buffer, chunk.byteOffset || 0, chunk.byteLength);
+            };
+            state.recordPumpTelemetry = function(id, chunks, bytes, millis) {
+              const entry = state.channels.get(id|0);
+              state.stats.pumpCalls++;
+              state.stats.pumpChunks += chunks|0;
+              state.stats.pumpBytes += bytes|0;
+              state.stats.peakPumpChunks = Math.max(state.stats.peakPumpChunks, chunks|0);
+              state.stats.peakPumpBytes = Math.max(state.stats.peakPumpBytes, bytes|0);
+              state.stats.peakPumpMillis = Math.max(state.stats.peakPumpMillis, +millis || 0);
+              state.stats.longestPumpMillis = Math.max(
+                state.stats.longestPumpMillis,
+                +millis || 0
+              );
+              refreshHighWatermark();
+              if (entry && queuedBytes(entry) > 0) state.stats.deferredPumps++;
+            };
+            state.recordDecodedSliceScheduled = function(id) {
+              const entry = state.channels.get(id|0);
+              if (!entry || entry.disposed) return;
+              entry.decodedSliceBacklog++;
+              state.decodedSliceOwners.push(entry.id);
+              state.stats.decodedSliceBacklog++;
+              state.stats.maxDecodedSliceBacklog = Math.max(
+                state.stats.maxDecodedSliceBacklog,
+                state.stats.decodedSliceBacklog
+              );
+              applyFlowControl(entry);
+            };
+            state.recordDecodedPacketQueueScheduled = function(depth, paused, processed) {
+              const queueDepth = Math.max(0, Number(depth) || 0);
+              const wasPaused = state.exactPacketQueuePaused;
+              state.exactPacketQueuePaused = !!paused;
+              state.stats.decodedPacketQueue = queueDepth;
+              state.stats.maxDecodedPacketQueue = Math.max(
+                state.stats.maxDecodedPacketQueue,
+                queueDepth
+              );
+              if (!wasPaused && state.exactPacketQueuePaused) {
+                state.stats.decodedPacketQueuePauses++;
+              } else if (wasPaused && !state.exactPacketQueuePaused) {
+                state.stats.decodedPacketQueueResumes++;
+              }
+              if (processed) {
+                state.stats.decodedPacketDrainSignals++;
+                while (state.decodedSliceOwnerHead < state.decodedSliceOwners.length) {
+                  const id = state.decodedSliceOwners[state.decodedSliceOwnerHead++];
+                  const entry = state.channels.get(id|0);
+                  if (!entry || entry.decodedSliceBacklog <= 0) continue;
+                  entry.decodedSliceBacklog--;
+                  state.stats.decodedSliceBacklog = Math.max(
+                    0,
+                    state.stats.decodedSliceBacklog - 1
+                  );
+                  break;
+                }
+              }
+              if (state.decodedSliceOwnerHead >= state.decodedSliceOwners.length) {
+                state.decodedSliceOwners = [];
+                state.decodedSliceOwnerHead = 0;
+              } else if (state.decodedSliceOwnerHead >= 256 &&
+                         state.decodedSliceOwnerHead * 2 >= state.decodedSliceOwners.length) {
+                state.decodedSliceOwners = state.decodedSliceOwners.slice(
+                  state.decodedSliceOwnerHead
+                );
+                state.decodedSliceOwnerHead = 0;
+              }
+              state.channels.forEach(function(entry) {
+                applyFlowControl(entry);
+                scheduleSlices(entry, false);
+              });
+              refreshHighWatermark();
+            };
+            state.hasPendingInboundScheduled = function(id) {
+              const entry = state.channels.get(id|0);
+              return !!entry && (entry.inboundHead < entry.inbound.length ||
+                entry.pendingInboundHead < entry.pendingInbound.length);
+            };
+            """)
+    private static native void initInboundScheduler();
 
     @JSBody(params = {"id", "host", "port"}, script = """
             globalThis.__gaiusNettyBridge.open(id, host, port);
@@ -1715,12 +2445,34 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             """)
     private static native boolean hasPendingInbound(int id);
 
+    /** Updates exact PacketProcessor queue depth and its independent transport pause state. */
+    public static void recordDecodedPacketQueue(int depth, boolean paused, boolean processed) {
+        recordDecodedPacketQueueJs(depth, paused, processed);
+    }
+
+    @JSBody(params = {"depth", "paused", "processed"}, script = """
+            const bridge = globalThis.__gaiusNettyBridge;
+            if (bridge && typeof bridge.recordDecodedPacketQueue === 'function') {
+              bridge.recordDecodedPacketQueue(depth, paused, processed);
+            }
+            """)
+    private static native void recordDecodedPacketQueueJs(
+            int depth, boolean paused, boolean processed);
+
     @JSBody(script = """
             return typeof performance !== 'undefined' && performance.now
               ? performance.now()
               : Date.now();
             """)
     private static native double monotonicMillis();
+
+    @JSBody(params = {"id"}, script = """
+            const bridge = globalThis.__gaiusNettyBridge;
+            if (bridge && typeof bridge.recordDecodedSlice === 'function') {
+              bridge.recordDecodedSlice(id);
+            }
+            """)
+    private static native void recordDecodedSlice(int id);
 
     @JSBody(params = {"id", "chunks", "bytes", "millis"}, script = """
             globalThis.__gaiusNettyBridge.recordPump(id, chunks, bytes, millis);

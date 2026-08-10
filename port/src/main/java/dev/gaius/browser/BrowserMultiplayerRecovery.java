@@ -35,11 +35,11 @@ public final class BrowserMultiplayerRecovery {
             return false;
         }
 
-        Screen parent = minecraft.screen;
+        Screen parent = minecraft.gaius$getScreen();
         ServerAddress parsedAddress = ServerAddress.parseString(address);
         report("cold-pack-timeout-retry-scheduled", address);
         minecraft.execute(() -> {
-            if (minecraft.level != null || minecraft.screen != parent) {
+            if (minecraft.level != null || minecraft.gaius$getScreen() != parent) {
                 report("cold-pack-timeout-retry-cancelled", address);
                 return;
             }

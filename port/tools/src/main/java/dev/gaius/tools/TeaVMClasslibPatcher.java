@@ -187,7 +187,11 @@ public final class TeaVMClasslibPatcher {
                 staticDelegate("from",
                         "(Ljava/time/Instant;)Lorg/teavm/classlib/java/util/TDate;",
                         "org/teavm/classlib/java/util/TDateModernSupport",
-                        "from")
+                        "from"),
+                instanceDelegate("toInstant", "()Ljava/time/Instant;",
+                        "org/teavm/classlib/java/util/TDateModernSupport",
+                        "toInstant",
+                        "(Lorg/teavm/classlib/java/util/TDate;)Ljava/time/Instant;")
         });
         patches.put("org/teavm/classlib/java/io/TFile", new MethodSpec[] {
                 instanceDelegate("toPath",

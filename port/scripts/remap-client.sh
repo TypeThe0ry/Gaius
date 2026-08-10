@@ -5,6 +5,7 @@ root="$(cd "$(dirname "$0")/../.." && pwd)"
 config="$root/port/config.json"
 source "$root/port/scripts/version-profile.sh"
 gaius_load_version_profile "$root"
+gaius_select_java_home
 version="$GAIUS_MINECRAFT_VERSION"
 art_version="$(jq -er '.autoRenamingToolVersion' "$config")"
 work="$root/port/work/$version"

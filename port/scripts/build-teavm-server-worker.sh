@@ -10,6 +10,24 @@ server_resources="$server_target/generated-resources"
 if [[ "${GAIUS_SKIP_OVERLAY_BUILD:-false}" != "true" ]]; then
   "$root/port/scripts/build-overlays.sh" >/dev/null
 fi
+
+# TeaVM keeps dependency JARs open throughout whole-program analysis. Prevent
+# another build from truncating and replacing an overlay while it is being read.
+overlay_lock="$root/port/work/.build-overlays.lock"
+while ! mkdir "$overlay_lock" 2>/dev/null; do
+  lock_pid="$(cat "$overlay_lock/pid" 2>/dev/null || true)"
+  if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+    sleep 0.2
+    continue
+  fi
+  rm -rf "$overlay_lock"
+done
+printf '%s\n' "$$" > "$overlay_lock/pid"
+release_overlay_lock() {
+  rm -rf "$overlay_lock"
+}
+trap release_overlay_lock EXIT
+
 if [[ ! -f "$resource_list" ]]; then
   echo "Browser resources are missing; run build-teavm.sh once first" >&2
   exit 1
@@ -72,9 +90,24 @@ if [[ "$analysis_status" -ne 0 ]]; then
   echo "TeaVM server analysis did not complete" >&2
 fi
 
+if grep -Fq "Error in @JSBody" "$log"; then
+  echo "TeaVM emitted invalid @JSBody JavaScript; refusing to publish the server Worker" >&2
+  build_status=1
+fi
+
 if [[ "$build_status" -eq 0 ]]; then
   "$root/port/scripts/run-python.sh" \
     "$root/port/scripts/postprocess-teavm-js.py" "$dist/singleplayer-server.js"
+  "$root/port/scripts/run-python.sh" \
+    "$root/port/scripts/gaius_build_identity.py" write \
+    --root "$root" \
+    --role singleplayer-worker \
+    --artifact "$dist/singleplayer-server.js"
+  "$root/port/scripts/run-python.sh" \
+    "$root/port/scripts/gaius_build_identity.py" write \
+    --root "$root" \
+    --role worker-bootstrap \
+    --artifact "$dist/singleplayer-server-worker.js"
   if [[ "${GAIUS_SKIP_COMPRESSION:-false}" != "true" ]]; then
     GAIUS_COMPRESS_FILES="singleplayer-server.js:singleplayer-server-worker.js" \
       "$root/port/scripts/compress-dist.sh" >/dev/null

@@ -1,5 +1,7 @@
 package org.lwjgl.opengl;
 
+import org.lwjgl.system.FunctionProvider;
+
 /** Browser replacement for LWJGL's native OpenGL loader. */
 public final class GL {
     private static GLCapabilities capabilities;
@@ -18,6 +20,10 @@ public final class GL {
         create();
     }
 
+    public static void create(FunctionProvider provider) {
+        create();
+    }
+
     public static void destroy() {
         capabilities = null;
     }
@@ -33,6 +39,10 @@ public final class GL {
         return capabilities;
     }
 
+    public static FunctionProvider getFunctionProvider() {
+        return null;
+    }
+
     public static GLCapabilities createCapabilities() {
         BrowserOpenGL.initialize();
         capabilities = new GLCapabilities();
@@ -41,5 +51,9 @@ public final class GL {
 
     public static GLCapabilities createCapabilities(boolean forwardCompatible) {
         return createCapabilities();
+    }
+
+    static GLCapabilities getICD() {
+        return getCapabilities();
     }
 }

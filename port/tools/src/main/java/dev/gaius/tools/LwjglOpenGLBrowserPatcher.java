@@ -112,6 +112,18 @@ public final class LwjglOpenGLBrowserPatcher {
         add(methods, "GL15", "glBufferSubData", "(IJLjava/nio/ByteBuffer;)V", "bufferSubData");
         add(methods, "GL15", "glUnmapBuffer", "(I)Z", "unmapBuffer");
         add(methods, "GL15C", "glUnmapBuffer", "(I)Z", "unmapBuffer");
+        for (String owner : new String[] {"GL15", "GL15C", "GL32", "GL32C"}) {
+            add(methods, owner, "nglGenQueries", "(IJ)V", "genQueries");
+            add(methods, owner, "glGenQueries", "(Ljava/nio/IntBuffer;)V", "genQueries");
+            add(methods, owner, "glGenQueries", "()I", "genQuery");
+            add(methods, owner, "glGenQueries", "([I)V", "genQueries");
+        }
+        for (String owner : new String[] {"GL20", "GL20C"}) {
+            add(methods, owner, "nglDrawBuffers", "(IJ)V", "drawBuffers");
+            add(methods, owner, "glDrawBuffers", "(Ljava/nio/IntBuffer;)V", "drawBuffers");
+            add(methods, owner, "glDrawBuffers", "(I)V", "drawBuffers");
+            add(methods, owner, "glDrawBuffers", "([I)V", "drawBuffers");
+        }
         add(methods, "GL20", "glCreateShader", "(I)I", "createShader");
         add(methods, "GL20C", "glCreateShader", "(I)I", "createShader");
         add(methods, "GL20", "glCreateProgram", "()I", "createProgram");
@@ -221,6 +233,11 @@ public final class LwjglOpenGLBrowserPatcher {
         add(methods, "GL30", "glFramebufferTexture2D", "(IIIII)V", "framebufferTexture2D");
         add(methods, "GL30", "glDeleteFramebuffers", "(I)V", "deleteFramebuffer");
         add(methods, "GL30", "glBlitFramebuffer", "(IIIIIIIIII)V", "blitFramebuffer");
+        for (String owner : new String[] {"GL30", "GL30C"}) {
+            add(methods, owner, "nglClearBufferfv", "(IIJ)V", "clearBufferfv");
+            add(methods, owner, "glClearBufferfv", "(IILjava/nio/FloatBuffer;)V", "clearBufferfv");
+            add(methods, owner, "glClearBufferfv", "(II[F)V", "clearBufferfv");
+        }
         add(methods, "ARBDirectStateAccess", "glCreateBuffers", "()I", "createBuffer");
         add(methods, "ARBDirectStateAccess", "glNamedBufferData", "(IJI)V", "namedBufferData");
         add(methods, "ARBDirectStateAccess", "glNamedBufferData", "(ILjava/nio/ByteBuffer;I)V", "namedBufferData");
@@ -276,9 +293,13 @@ public final class LwjglOpenGLBrowserPatcher {
         noop(methods, "GL11", "glGetTexLevelParameteri", "(III)I");
         noop(methods, "GL11", "glReadPixels", "(IIIIIIJ)V");
         noop(methods, "GL32C", "glBeginQuery", "(II)V");
-        noop(methods, "GL32C", "glDeleteQueries", "(I)V");
+        for (String owner : new String[] {"GL15", "GL15C", "GL32", "GL32C"}) {
+            noop(methods, owner, "nglDeleteQueries", "(IJ)V");
+            noop(methods, owner, "glDeleteQueries", "(Ljava/nio/IntBuffer;)V");
+            noop(methods, owner, "glDeleteQueries", "(I)V");
+            noop(methods, owner, "glDeleteQueries", "([I)V");
+        }
         noop(methods, "GL32C", "glEndQuery", "(I)V");
-        noop(methods, "GL32C", "glGenQueries", "()I");
         noop(methods, "GL32C", "glGetQueryObjecti", "(II)I");
         noop(methods, "ARBTimerQuery", "glGetQueryObjecti64", "(II)J");
         for (String owner : new String[] {

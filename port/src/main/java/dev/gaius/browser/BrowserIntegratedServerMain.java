@@ -292,7 +292,8 @@ public final class BrowserIntegratedServerMain {
 
     /** Keeps player input moving while the server thread waits on asynchronous chunk futures. */
     public static void pumpUrgentPacketsIfPending() {
-        if (isWorkerRuntime() && BrowserWebSocketChannel.hasPendingInput()) {
+        if (isWorkerRuntime() && (BrowserWebSocketChannel.hasPendingInput()
+                || BrowserPacketScheduler.hasPendingPackets())) {
             pumpUrgentPackets();
         }
     }

@@ -35,17 +35,71 @@ gaius_load_version_profile() {
 
 gaius_library_path() {
   local coordinate="$1"
+  local fallback_classifier="${2:-}"
   if [[ ! -f "$GAIUS_VERSION_METADATA" ]]; then
     echo "Version metadata is missing: $GAIUS_VERSION_METADATA" >&2
     return 1
   fi
 
-  jq -er --arg coordinate "$coordinate" '
-    first(
+  jq -er --arg coordinate "$coordinate" --arg fallback "$fallback_classifier" '
+    [
       .libraries[]
-      | select(.name == $coordinate or startswith($coordinate + ":"))
+      | select(.name | startswith($coordinate + ":"))
       | select(.downloads.artifact.path != null)
-      | .downloads.artifact.path
-    )
+      | {parts: (.name | split(":")), path: .downloads.artifact.path}
+    ] as $matches
+    | (
+        first($matches[] | select(.parts | length == 3))
+        // first($matches[] | select($fallback != "" and .parts[3] == $fallback))
+      ).path
   ' "$GAIUS_VERSION_METADATA"
+}
+
+gaius_select_java_home() {
+  local requested_version="$GAIUS_JAVA_VERSION"
+  local candidates=()
+  local candidate
+  local detected_version
+
+  if [[ -n "${GAIUS_JAVA_HOME:-}" ]]; then
+    candidates+=("$GAIUS_JAVA_HOME")
+  fi
+  if [[ -n "${JAVA_HOME:-}" ]]; then
+    candidates+=("$JAVA_HOME")
+  fi
+  candidates+=(
+    "/opt/homebrew/opt/openjdk@$requested_version/libexec/openjdk.jdk/Contents/Home"
+    "/usr/local/opt/openjdk@$requested_version/libexec/openjdk.jdk/Contents/Home"
+  )
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    candidate="$(/usr/libexec/java_home -v "$requested_version" 2>/dev/null || true)"
+    if [[ -n "$candidate" ]]; then
+      candidates+=("$candidate")
+    fi
+  fi
+  if command -v javac >/dev/null 2>&1; then
+    candidate="$(cd "$(dirname "$(command -v javac)")/.." 2>/dev/null && pwd || true)"
+    if [[ -n "$candidate" ]]; then
+      candidates+=("$candidate")
+    fi
+  fi
+
+  for candidate in "${candidates[@]}"; do
+    if [[ ! -x "$candidate/bin/javac" || ! -x "$candidate/bin/java" ]]; then
+      continue
+    fi
+    detected_version="$("$candidate/bin/javac" -version 2>&1 | awk '{print $2}' | cut -d. -f1)"
+    if [[ "$detected_version" =~ ^[0-9]+$ ]] &&
+        [[ "$detected_version" -ge "$requested_version" ]]; then
+      GAIUS_JAVA_HOME="$candidate"
+      JAVA_HOME="$candidate"
+      PATH="$candidate/bin:$PATH"
+      export GAIUS_JAVA_HOME JAVA_HOME PATH
+      return 0
+    fi
+  done
+
+  echo "Minecraft $GAIUS_MINECRAFT_VERSION requires JDK $requested_version or newer" >&2
+  echo "Set GAIUS_JAVA_HOME to a compatible JDK installation" >&2
+  return 1
 }

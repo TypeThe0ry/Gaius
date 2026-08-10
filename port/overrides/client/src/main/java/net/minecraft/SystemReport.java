@@ -38,6 +38,14 @@ public class SystemReport {
         }
     }
 
+    public void setDetail(String name, CrashReportDetail<Object> value) {
+        try {
+            setDetail(name, String.valueOf(value.call()));
+        } catch (Throwable throwable) {
+            setDetail(name, "ERR");
+        }
+    }
+
     public static float sizeInMiB(long bytes) {
         return (float) bytes / BYTES_PER_MEBIBYTE;
     }

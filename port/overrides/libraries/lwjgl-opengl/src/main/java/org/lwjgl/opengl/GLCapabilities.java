@@ -13,8 +13,13 @@ public final class GLCapabilities {
     public final boolean OpenGL33 = true;
 
     public final boolean GL_ARB_buffer_storage = false;
+    public final boolean GL_ARB_base_instance = false;
+    public final boolean GL_ARB_clip_control = false;
     public final boolean GL_ARB_debug_output = false;
     public final boolean GL_ARB_direct_state_access = false;
+    public final boolean GL_ARB_draw_indirect = false;
+    public final boolean GL_ARB_multi_draw_indirect = false;
+    public final boolean GL_ARB_shader_draw_parameters = false;
     public final boolean GL_ARB_vertex_attrib_binding = false;
     public final boolean GL_EXT_debug_label = false;
     public final boolean GL_EXT_texture_filter_anisotropic = false;

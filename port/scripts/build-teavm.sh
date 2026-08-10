@@ -4,6 +4,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$root/port/scripts/version-profile.sh"
 gaius_load_version_profile "$root"
+gaius_select_java_home
 version="$GAIUS_MINECRAFT_VERSION"
 if [[ "${GAIUS_SKIP_OVERLAY_BUILD:-false}" != "true" ]]; then
   "$root/port/scripts/build-overlays.sh" >/dev/null
@@ -22,6 +23,7 @@ else
   echo "Skipping overlay rebuild because GAIUS_SKIP_OVERLAY_BUILD=true"
 fi
 work="$root/port/work/$version"
+icu_path="$(gaius_library_path "com.ibm.icu:icu4j")"
 resource_list_dir="$root/port/target/generated-resources/dev/gaius/browser"
 resource_list="$resource_list_dir/minecraft-resources.txt"
 embedded_resource_list="$resource_list_dir/minecraft-embedded-resources.txt"
@@ -32,11 +34,13 @@ vanilla_asset_pack="$target_directory/vanilla-assets.pack.gz"
 mkdir -p "$resource_list_dir"
 jar tf "$root/port/work/overlays/client-named-$version-gaius.jar" |
   awk '(index($0, "assets/") == 1 || index($0, "data/") == 1 || $0 == "pack.png") && substr($0, length($0), 1) != "/" { print }' >"$resource_list"
-jar tf "$root/port/work/overlays/libraries/com/ibm/icu/icu4j/77.1/icu4j-77.1.jar" |
+jar tf "$root/port/work/overlays/libraries/$icu_path" |
   awk 'index($0, "com/ibm/icu/impl/data/icudata/") == 1 && substr($0, length($0), 1) != "/" { print }' >>"$resource_list"
 rm -rf "$generated_assets/minecraft/sounds" "$generated_assets/minecraft/sounds.json" \
   "$generated_assets/minecraft/font"
 asset_index_id="$(jq -er '.assetIndex.id // .assets' "$work/version.json" 2>/dev/null | tr -d '\r\n' || true)"
+GAIUS_ASSET_INDEX_ID="$asset_index_id"
+export GAIUS_ASSET_INDEX_ID
 asset_index="$work/assets/indexes/$asset_index_id.json"
 copied_sound_assets=0
 copied_font_assets=0
@@ -246,6 +250,11 @@ if [[ "$analysis_status" -ne 0 ]]; then
   echo "TeaVM analysis did not complete; canonical gap report was preserved" >&2
 fi
 
+if grep -Fq "Error in @JSBody" "$log"; then
+  echo "TeaVM emitted invalid @JSBody JavaScript; refusing to publish the client output" >&2
+  build_status=1
+fi
+
 if [[ "$build_status" -eq 0 ]]; then
   target_js="$target_directory/${GAIUS_TARGET_FILE:-classes.js}"
   "$root/port/scripts/run-python.sh" \
@@ -253,7 +262,19 @@ if [[ "$build_status" -eq 0 ]]; then
   "$root/port/scripts/run-python.sh" \
     "$root/port/scripts/postprocess-index-html.py" \
     "$target_directory/index.html" \
-    "$target_js"
+    "$target_js" \
+    "$version" \
+    "$asset_index_id"
+  "$root/port/scripts/run-python.sh" \
+    "$root/port/scripts/gaius_build_identity.py" write \
+    --root "$root" \
+    --role client \
+    --artifact "$target_js"
+  "$root/port/scripts/run-python.sh" \
+    "$root/port/scripts/gaius_build_identity.py" write \
+    --root "$root" \
+    --role vanilla-assets \
+    --artifact "$vanilla_asset_pack"
   if [[ "$target_directory" == "$root/port/web/dist" \
         && "${GAIUS_SKIP_COMPRESSION:-false}" != "true" ]]; then
     "$root/port/scripts/compress-dist.sh" >/dev/null

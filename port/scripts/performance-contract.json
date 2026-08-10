@@ -1,0 +1,414 @@
+{
+  "schemaVersion": 4,
+  "releaseEvidence": {
+    "hardTargetProfiles": ["steady-6-4", "traversal-6-4"],
+    "stabilityProfiles": ["soak-sp-6-4", "soak-mp-6-4"],
+    "diagnosticOnlyProfiles": ["steady-8-4", "traversal-8-4", "traversal-12-4"]
+  },
+  "measurement": {
+    "frameSource": "BrowserGlfw.swapBuffers",
+    "frameSampleCapacity": 65536,
+    "warmupMs": 30000,
+    "sampleMs": 300000,
+    "soakMs": 1800000,
+    "cleanupMs": 30000,
+    "sampleIntervalMs": 500,
+    "heapIntervalMs": 5000,
+    "postGcIntervalMs": 300000,
+    "heartbeatIntervalMs": 50,
+    "runtimeInvariantSampleCapacity": 4096,
+    "longTaskCapacity": 4096,
+    "freezeThresholdMs": 500,
+    "queueHighWaterDurationMs": 10000
+  },
+  "startup": {
+    "timeoutMs": 900000,
+    "newWorldInteractiveMsMax": 15000,
+    "minimumLoadedChunks": 1,
+    "requiredConsecutiveTerrainFrames": 16,
+    "minimumTerrainWindowMs": 250,
+    "maximumTerrainFrameGapMs": 100,
+    "minimumBlockHitFrames": 3,
+    "minimumVisualSamples": 3,
+    "terrainFrameIntervalMs": 50,
+    "externalSmokeRequired": [
+      "world-readiness-smoke.mjs"
+    ]
+  },
+  "browserMemory": {
+    "global": "globalThis.__gaiusMemoryTelemetry.browserMemory",
+    "liveFields": ["liveBytes", "liveRegions", "associatedBuffers"],
+    "counterFields": [
+      "allocations",
+      "frees",
+      "registrations",
+      "reallocations",
+      "collectedAssociations",
+      "addressLookupMisses"
+    ],
+    "postGcFinalWindows": 4,
+    "cleanupRequired": true
+  },
+  "heapMemory": {
+    "retainedGrowthPercentMax": 15,
+    "retainedGrowthBytesMax": 268435456,
+    "peakUsedBytesMax": 8589934592
+  },
+  "processRss": {
+    "source": "SystemInfo.getProcessInfo plus ps RSS",
+    "requiredDurationMs": 1800000,
+    "sampleIntervalMs": 15000,
+    "minimumAvailableRatio": 0.9,
+    "minimumDurationCoverageRatio": 0.98,
+    "trendWindowCount": 4,
+    "processTypes": ["browser", "renderer", "gpu", "utility"],
+    "requiredProcessTypes": ["browser", "renderer", "gpu"],
+    "total": {
+      "growthPercentMax": 25,
+      "growthBytesMax": 536870912,
+      "peakBytesMax": 12884901888
+    },
+    "byType": {
+      "browser": {
+        "growthPercentMax": 25,
+        "growthBytesMax": 268435456,
+        "peakBytesMax": 2147483648
+      },
+      "renderer": {
+        "growthPercentMax": 25,
+        "growthBytesMax": 402653184,
+        "peakBytesMax": 8589934592
+      },
+      "gpu": {
+        "growthPercentMax": 25,
+        "growthBytesMax": 268435456,
+        "peakBytesMax": 2147483648
+      },
+      "utility": {
+        "growthPercentMax": 50,
+        "growthBytesMax": 134217728,
+        "peakBytesMax": 2147483648
+      }
+    },
+    "externalSmokeRequired": ["process-rss-memory-smoke.mjs"]
+  },
+  "visualOutput": {
+    "source": "Chrome Page.captureScreenshot compositor output",
+    "capturesPerPhase": 3,
+    "captureIntervalMs": 200,
+    "sampleWidth": 80,
+    "sampleHeight": 45,
+    "requiredSamples": 6,
+    "requiredPhases": ["pre-measurement", "post-measurement"],
+    "minimumSamplesPerPhase": 3,
+    "expectedWidth": 1280,
+    "expectedHeight": 720,
+    "minimumNonBlackRatio": 0.05,
+    "minimumLuminanceStdDev": 6,
+    "minimumColorBuckets": 24,
+    "maximumDominantColorRatio": 0.97,
+    "minimumCentralNonBlackRatio": 0.05,
+    "minimumCentralLuminanceStdDev": 6,
+    "minimumCentralColorBuckets": 16,
+    "maximumCentralDominantColorRatio": 0.97,
+    "minimumActiveTileCount": 6,
+    "minimumTraversalFingerprintRms": 2,
+    "externalSmokeRequired": ["visual-output-evidence-smoke.mjs"]
+  },
+  "gameplayAuthority": {
+    "source": "browser-transport-and-client-state",
+    "route": "singleplayer-worker",
+    "protocols": {
+      "774": {
+        "airBlockStateId": 0,
+        "packetIds": {
+          "outboundPlayerAction": 40,
+          "outboundUseItemOn": 63,
+          "inboundBlockChangedAck": 4,
+          "inboundBlockUpdate": 8
+        }
+      },
+      "776": {
+        "airBlockStateId": 0,
+        "packetIds": {
+          "outboundPlayerAction": 41,
+          "outboundUseItemOn": 66,
+          "inboundBlockChangedAck": 4,
+          "inboundBlockUpdate": 8
+        }
+      }
+    },
+    "confirmation": "clientbound-block-update-or-sequence-ack-plus-client-state-transition",
+    "requiredOperations": ["break", "place"],
+    "minimumSamplesPerOperation": 3,
+    "maxP95Millis": 250,
+    "maxP99Millis": 500,
+    "maxRollbacks": 0,
+    "requireTransportEvidence": true,
+    "requireStateTransitionEvidence": true,
+    "requireActiveWorkloadEvidence": true,
+    "zeroLatencyIsInvalid": true
+  },
+  "runtimeInvariants": {
+    "sectionTaskQueue": {
+      "backlogFixtureTasks": 1000,
+      "pollP99MillisMax": 0.25,
+      "fullScansPerPollMax": 0,
+      "externalSmokeRequired": ["section-task-queue-smoke.mjs"]
+    },
+    "targeting": {
+      "raycastsPerRenderedFrameMax": 1,
+      "maximumObservationLagFrames": 1,
+      "externalSmokeRequired": ["minecraft-262-link-gap-smoke.mjs"]
+    },
+    "worldgen": {
+      "networkWaitPulsesMax": 2,
+      "schedulerTurnPulsesMax": 64,
+      "minimumAdaptiveSliceMillis": 2,
+      "reentrantYieldDepthMax": 1
+    },
+    "webglMemory": {
+      "bufferShadowBudgetBytes": 67108864,
+      "derivedBaseVertexBudgetBytes": 33554432,
+      "cleanupRequired": true,
+      "externalSmokeRequired": [
+        "browser-resource-lifecycle-smoke.mjs",
+        "browser-vao-reference-smoke.mjs"
+      ]
+    },
+    "renderPipeline": {
+      "uploadAllocationsPerFrameMax": 8,
+      "uploadRetryCancellationsMax": 0,
+      "activeUploadRetryTasksMax": 8,
+      "externalSmokeRequired": [
+        "render-pipeline-backpressure-smoke.mjs"
+      ]
+    },
+    "gpuFences": {
+      "timeoutIsFatal": false,
+      "earlyResourceReuseMax": 0,
+      "duplicateDeletesMax": 0,
+      "waitFailuresMax": 0,
+      "contextLossesMax": 0,
+      "retireBacklogMax": 8,
+      "fenceAgeFramesMax": 120,
+      "controlledErrorsMax": 0
+    },
+    "framePacing": {
+      "visibleFixedPositiveTimerMillisMax": 0,
+      "continuationResumeCountPerRequestMax": 1,
+      "continuationResumeCountPerRequestMin": 1,
+      "pendingYieldCountMax": 1,
+      "duplicateYieldCallbackCountMax": 0,
+      "externalSmokeRequired": ["frame-pacing-yield-smoke.mjs"]
+    }
+  },
+  "environment": {
+    "minimumDisplayHz": 120,
+    "viewport": {
+      "width": 1280,
+      "height": 720,
+      "deviceScaleFactor": 1
+    },
+    "foregroundRequired": true,
+    "maxFps": 260,
+    "maxFpsLabel": "Unlimited",
+    "unlimitedSentinel": 260,
+    "graphicsPreset": "fast",
+    "autoDpr": false
+  },
+  "queueHighWater": {
+    "chunk.pendingTasks": 8,
+    "chunk.compileBacklog": 8,
+    "chunk.uploadBacklog": 32,
+    "network.inboundQueuedBytes": 25165824,
+    "network.queuedBytes": 4194304,
+    "network.decodedPacketQueue": 256,
+    "worker.network.inboundQueuedBytes": 25165824,
+    "worker.network.queuedBytes": 4194304,
+    "worker.network.decodedPacketQueue": 256
+  },
+  "heartbeat": {
+    "pendingMax": 3,
+    "rttMaxMs": 500,
+    "delayMaxMs": 500
+  },
+  "profiles": {
+    "steady-6-4": {
+      "evidenceRole": "release-hard-target",
+      "releaseEvidence": true,
+      "scenario": "steady",
+      "route": "singleplayer",
+      "renderDistance": 6,
+      "simulationDistance": 4,
+      "workload": "none",
+      "requireNewChunks": false,
+      "warmupMs": 30000,
+      "durationMs": 300000,
+      "fpsWindowMs": 300000,
+      "gates": {
+        "averageFpsMin": 120,
+        "onePercentLowFpsMin": 60,
+        "coverageRatioMin": 0.98,
+        "p99FrameMsMax": 16.7,
+        "longestFrameMsMax": 150,
+        "freezeCountMax": 0,
+        "targeting": true,
+        "runtimeInvariants": true,
+        "queueHighWater": false,
+        "memory": false,
+        "gameplayAuthority": false
+      }
+    },
+    "traversal-6-4": {
+      "evidenceRole": "release-hard-target",
+      "releaseEvidence": true,
+      "scenario": "new-chunk-traversal",
+      "route": "singleplayer",
+      "renderDistance": 6,
+      "simulationDistance": 4,
+      "workload": "traverse",
+      "requireNewChunks": true,
+      "warmupMs": 30000,
+      "durationMs": 300000,
+      "fpsWindowMs": 300000,
+      "gates": {
+        "averageFpsMin": 120,
+        "onePercentLowFpsMin": 60,
+        "coverageRatioMin": 0.98,
+        "p99FrameMsMax": 16.7,
+        "longestFrameMsMax": 150,
+        "freezeCountMax": 0,
+        "targeting": true,
+        "runtimeInvariants": true,
+        "queueHighWater": true,
+        "memory": false,
+        "gameplayAuthority": true
+      }
+    },
+    "steady-8-4": {
+      "evidenceRole": "diagnostic-stress",
+      "releaseEvidence": false,
+      "scenario": "steady",
+      "route": "singleplayer",
+      "renderDistance": 8,
+      "simulationDistance": 4,
+      "workload": "none",
+      "requireNewChunks": false,
+      "warmupMs": 30000,
+      "durationMs": 300000,
+      "fpsWindowMs": 300000,
+      "gates": {
+        "onePercentLowFpsMin": 45,
+        "p99FrameMsMax": 22.2,
+        "longestFrameMsMax": 200,
+        "freezeCountMax": 0,
+        "targeting": true,
+        "queueHighWater": false,
+        "memory": false,
+        "gameplayAuthority": false
+      }
+    },
+    "traversal-8-4": {
+      "evidenceRole": "diagnostic-stress",
+      "releaseEvidence": false,
+      "scenario": "new-chunk-traversal",
+      "route": "singleplayer",
+      "renderDistance": 8,
+      "simulationDistance": 4,
+      "workload": "traverse",
+      "requireNewChunks": true,
+      "warmupMs": 30000,
+      "durationMs": 300000,
+      "fpsWindowMs": 300000,
+      "gates": {
+        "onePercentLowFpsMin": 45,
+        "p99FrameMsMax": 22.2,
+        "longestFrameMsMax": 200,
+        "freezeCountMax": 0,
+        "targeting": true,
+        "queueHighWater": true,
+        "memory": false,
+        "gameplayAuthority": true
+      }
+    },
+    "traversal-12-4": {
+      "evidenceRole": "diagnostic-stress",
+      "releaseEvidence": false,
+      "scenario": "new-chunk-traversal",
+      "route": "singleplayer",
+      "renderDistance": 12,
+      "simulationDistance": 4,
+      "workload": "traverse",
+      "requireNewChunks": true,
+      "warmupMs": 30000,
+      "durationMs": 300000,
+      "fpsWindowMs": 300000,
+      "gates": {
+        "onePercentLowFpsMin": 30,
+        "p99FrameMsMax": 33.3,
+        "freezeCountMax": 0,
+        "targeting": true,
+        "queueHighWater": true,
+        "memory": false,
+        "gameplayAuthority": true
+      }
+    },
+    "soak-sp-6-4": {
+      "evidenceRole": "release-stability",
+      "releaseEvidence": true,
+      "scenario": "soak",
+      "route": "singleplayer",
+      "renderDistance": 6,
+      "simulationDistance": 4,
+      "workload": "traverse",
+      "requireNewChunks": true,
+      "warmupMs": 30000,
+      "durationMs": 300000,
+      "fpsWindowMs": 300000,
+      "soakMs": 1800000,
+      "gates": {
+        "averageFpsMin": 120,
+        "onePercentLowFpsMin": 60,
+        "coverageRatioMin": 0.98,
+        "p99FrameMsMax": 16.7,
+        "longestFrameMsMax": 150,
+        "freezeCountMax": 0,
+        "targeting": true,
+        "runtimeInvariants": true,
+        "queueHighWater": true,
+        "memory": true,
+        "gameplayAuthority": true
+      }
+    },
+    "soak-mp-6-4": {
+      "evidenceRole": "release-stability",
+      "releaseEvidence": true,
+      "driverSupported": false,
+      "scenario": "soak",
+      "route": "multiplayer-relay",
+      "renderDistance": 6,
+      "simulationDistance": 4,
+      "workload": "traverse",
+      "requireNewChunks": true,
+      "warmupMs": 30000,
+      "durationMs": 300000,
+      "fpsWindowMs": 300000,
+      "soakMs": 1800000,
+      "gates": {
+        "averageFpsMin": 120,
+        "onePercentLowFpsMin": 60,
+        "coverageRatioMin": 0.98,
+        "p99FrameMsMax": 16.7,
+        "longestFrameMsMax": 150,
+        "freezeCountMax": 0,
+        "targeting": true,
+        "runtimeInvariants": true,
+        "queueHighWater": true,
+        "memory": true,
+        "gameplayAuthority": true,
+        "decodedPacketQueue": true
+      }
+    }
+  }
+}

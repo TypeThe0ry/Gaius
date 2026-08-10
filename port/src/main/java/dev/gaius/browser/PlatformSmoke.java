@@ -35,7 +35,6 @@ import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import javax.sound.sampled.AudioFormat;
 import net.minecraft.client.sounds.JOrbisAudioStream;
-import net.minecraft.client.renderer.block.model.TextureSlots;
 import net.minecraft.core.BlockPos;
 import net.minecraft.resources.Identifier;
 import net.minecraft.util.Mth;
@@ -333,12 +332,7 @@ public final class PlatformSmoke {
     }
 
     private static void testSpriteTextureSlotCompatibility() {
-        TextureSlots.Data slots = TextureSlots.parseTextureMap(JsonParser.parseString("""
-                {"base":"minecraft:block/stone","particle":{"sprite":"minecraft:block/dirt","force_translucent":true}}
-                """).getAsJsonObject());
-        if (slots.values().size() != 2
-                || !slots.values().containsKey("base")
-                || !slots.values().containsKey("particle")) {
+        if (!BrowserTextureSlotsCompat.acceptsSpriteObject()) {
             throw new AssertionError("Browser texture-slot sprite compatibility failed");
         }
     }
@@ -511,12 +505,14 @@ public final class PlatformSmoke {
                 0x3fcc596b40d4a2ddL);
         assertRawDouble(
                 "Perlin amplitudes p3",
-                first.getValue(100.125, 64.5, -200.25, 0.125, 0.5, false),
+                first.gaius$getValue(100.125, 64.5, -200.25, 0.125, 0.5, false),
                 0x3fd0353a3c9fb177L);
         assertRawDouble(
                 "Perlin amplitudes p4",
-                first.getValue(100.125, 64.5, -200.25, 0.125, 0.5, true),
-                0xbfc0cf7defd90d30L);
+                first.gaius$getValue(100.125, 64.5, -200.25, 0.125, 0.5, true),
+                PerlinNoise.gaius$hasOriginY()
+                        ? 0xbfc0cf7defd90d30L
+                        : 0x3fd0353a3c9fb177L);
 
         PerlinNoise sparse = PerlinNoise.create(
                 new LegacyRandomSource(987654321L),
@@ -534,7 +530,7 @@ public final class PlatformSmoke {
                 0x3fb2371a90529044L);
         assertRawDouble(
                 "Perlin amplitudes q1",
-                sparse.getValue(3.5e7, -6.75e7, 1.25e8, 0.0625, 1.75, false),
+                sparse.gaius$getValue(3.5e7, -6.75e7, 1.25e8, 0.0625, 1.75, false),
                 0xbf7a07e97df9e5c3L);
     }
 

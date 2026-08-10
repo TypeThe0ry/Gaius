@@ -6,6 +6,8 @@ libraries/
 versions/
 !port/versions/
 !port/versions/*.json
+!port/overrides/client/src/versions/
+!port/overrides/client/src/versions/**
 port/work/
 
 # Rebuildable Maven data and diagnostic output. The checked-in browser release
@@ -19,6 +21,8 @@ apps/server-plugin/target/
 # copied library trees.
 !port/overrides/libraries/
 port/overrides/libraries/*
+!port/overrides/libraries/lwjgl/
+!port/overrides/libraries/lwjgl/**
 !port/overrides/libraries/lwjgl-openal/
 !port/overrides/libraries/lwjgl-openal/**
 !port/overrides/libraries/lwjgl-opengl/
