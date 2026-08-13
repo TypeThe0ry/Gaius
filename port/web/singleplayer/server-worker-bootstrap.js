@@ -507,8 +507,9 @@ async function installPersistentFileSystem() {
     if (isRegionPath(path) && opfsAccessHandle) {
       try {
         appendOpfsRegion(path, bytes, false);
+        // Java may reclaim the TeaVM copy as soon as this call returns true.
+        flushOpfsSync();
         removeRegionCache(path);
-        scheduleFlush(250);
         return true;
       } catch (error) {
         storageStats.writeErrors++;
@@ -548,6 +549,7 @@ async function installPersistentFileSystem() {
       if (opfsAccessHandle && regionIndex.has(path)) {
         try {
           appendOpfsRegion(path, null, true);
+          flushOpfsSync();
         } catch (error) {
           storageStats.writeErrors++;
           reportStorageError(error);
@@ -1101,7 +1103,8 @@ async function closePersistentStorage(flush) {
 }
 
 function isRegionPath(path) {
-  return String(path || "").endsWith(".mca");
+  path = String(path || "");
+  return path.endsWith(".mca") || path.endsWith(".mcc");
 }
 
 function toUint8Array(value) {

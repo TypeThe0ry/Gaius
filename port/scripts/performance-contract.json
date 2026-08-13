@@ -1,8 +1,9 @@
 {
-  "schemaVersion": 4,
+  "schemaVersion": 11,
   "releaseEvidence": {
     "hardTargetProfiles": ["steady-6-4", "traversal-6-4"],
     "stabilityProfiles": ["soak-sp-6-4", "soak-mp-6-4"],
+    "requiredMemoryProfiles": ["soak-sp-6-4"],
     "diagnosticOnlyProfiles": ["steady-8-4", "traversal-8-4", "traversal-12-4"]
   },
   "measurement": {
@@ -19,7 +20,14 @@
     "runtimeInvariantSampleCapacity": 4096,
     "longTaskCapacity": 4096,
     "freezeThresholdMs": 500,
-    "queueHighWaterDurationMs": 10000
+    "queueHighWaterDurationMs": 10000,
+    "cdpCommandTimeoutMs": 15000,
+    "continuousVisualIntervalMs": 10000,
+    "watchdogGraceMs": 300000,
+    "minimumTraversalChunks": 16,
+    "minimumTraversalBlocks": 256,
+    "maximumTraversalStallMs": 10000,
+    "maximumStateStallMs": 1000
   },
   "startup": {
     "timeoutMs": 900000,
@@ -44,15 +52,41 @@
       "registrations",
       "reallocations",
       "collectedAssociations",
-      "addressLookupMisses"
+      "addressLookupMisses",
+      "allocationFailures",
+      "temporaryAllocationFailures",
+      "peakTemporaryBytes"
     ],
+    "safetyRequiredFields": [
+      "maxLiveBytes",
+      "maxTemporaryBytes",
+      "peakTemporaryBytes",
+      "allocationFailures",
+      "temporaryAllocationFailures"
+    ],
+    "failureFields": ["allocationFailures", "temporaryAllocationFailures"],
+    "limits": {
+      "maxLiveBytes": 2147483648,
+      "maxTemporaryBytes": 16777216
+    },
+    "aggregateLimits": {
+      "maxLiveBytes": 3221225472,
+      "maxTemporaryBytes": 33554432
+    },
     "postGcFinalWindows": 4,
-    "cleanupRequired": true
+    "cleanupRequired": true,
+    "minimumAvailableRatio": 0.9,
+    "minimumDurationCoverageRatio": 0.98,
+    "maximumSampleGapRatio": 1.5
   },
   "heapMemory": {
     "retainedGrowthPercentMax": 15,
     "retainedGrowthBytesMax": 268435456,
-    "peakUsedBytesMax": 8589934592
+    "peakUsedBytesMax": 8589934592,
+    "plateauSlopeMiBPerMinuteMax": 1,
+    "minimumAvailableRatio": 0.9,
+    "minimumDurationCoverageRatio": 0.98,
+    "maximumSampleGapRatio": 1.5
   },
   "processRss": {
     "source": "SystemInfo.getProcessInfo plus ps RSS",
@@ -60,6 +94,7 @@
     "sampleIntervalMs": 15000,
     "minimumAvailableRatio": 0.9,
     "minimumDurationCoverageRatio": 0.98,
+    "maximumSampleGapRatio": 1.5,
     "trendWindowCount": 4,
     "processTypes": ["browser", "renderer", "gpu", "utility"],
     "requiredProcessTypes": ["browser", "renderer", "gpu"],
@@ -165,11 +200,17 @@
       "networkWaitPulsesMax": 2,
       "schedulerTurnPulsesMax": 64,
       "minimumAdaptiveSliceMillis": 2,
-      "reentrantYieldDepthMax": 1
+      "reentrantYieldDepthMax": 1,
+      "p99SliceElapsedMillisMax": 14,
+      "maxSliceElapsedMillisMax": 50,
+      "maxBudgetOverrunMillisMax": 8,
+      "p99YieldDelayMillisMax": 16.7,
+      "maxYieldDelayMillisMax": 50
     },
     "webglMemory": {
       "bufferShadowBudgetBytes": 67108864,
       "derivedBaseVertexBudgetBytes": 33554432,
+      "derivedAlignedAttribBudgetBytes": 33554432,
       "cleanupRequired": true,
       "externalSmokeRequired": [
         "browser-resource-lifecycle-smoke.mjs",
@@ -183,6 +224,13 @@
       "externalSmokeRequired": [
         "render-pipeline-backpressure-smoke.mjs"
       ]
+    },
+    "networkOutbound": {
+      "turnsMin": 1,
+      "framesPerTurnMax": 32,
+      "bytesPerTurnMax": 262144,
+      "millisPerTurnMax": 8,
+      "externalSmokeRequired": ["browser-outbound-backpressure-smoke.mjs"]
     },
     "gpuFences": {
       "timeoutIsFatal": false,
@@ -215,7 +263,32 @@
     "maxFpsLabel": "Unlimited",
     "unlimitedSentinel": 260,
     "graphicsPreset": "fast",
-    "autoDpr": false
+    "autoDpr": false,
+    "uncappedEvidence": {
+      "requiredSwapInterval": 0,
+      "minimumSamples": 2,
+      "minimumUncappedYieldCount": 1,
+      "minimumFairYieldCount": 1,
+      "maximumVsyncYieldCount": 0,
+      "maximumPresentToRafCount": 0,
+      "maximumMessageChannelCreateFailureCount": 0,
+      "maximumMessageChannelPostFailureCount": 0,
+      "maximumMessageChannelRebuildCount": 0,
+      "maximumCancelledMessageTaskCount": 0,
+      "maximumWatchdogYieldCount": 0,
+      "requiredFields": [
+        "swapInterval",
+        "uncappedYieldCount",
+        "vsyncYieldCount",
+        "presentToRafCount",
+        "fairYieldCount",
+        "messageChannelCreateFailureCount",
+        "messageChannelPostFailureCount",
+        "messageChannelRebuildCount",
+        "cancelledMessageTaskCount",
+        "watchdogYieldCount"
+      ]
+    }
   },
   "queueHighWater": {
     "chunk.pendingTasks": 8,
@@ -230,8 +303,9 @@
   },
   "heartbeat": {
     "pendingMax": 3,
-    "rttMaxMs": 500,
-    "delayMaxMs": 500
+    "rttP99MaxMs": 50,
+    "rttMaxMs": 250,
+    "delayMaxMs": 250
   },
   "profiles": {
     "steady-6-4": {
@@ -251,7 +325,7 @@
         "onePercentLowFpsMin": 60,
         "coverageRatioMin": 0.98,
         "p99FrameMsMax": 16.7,
-        "longestFrameMsMax": 150,
+        "longestFrameMsMax": 50,
         "freezeCountMax": 0,
         "targeting": true,
         "runtimeInvariants": true,
@@ -277,7 +351,7 @@
         "onePercentLowFpsMin": 60,
         "coverageRatioMin": 0.98,
         "p99FrameMsMax": 16.7,
-        "longestFrameMsMax": 150,
+        "longestFrameMsMax": 50,
         "freezeCountMax": 0,
         "targeting": true,
         "runtimeInvariants": true,
@@ -301,7 +375,7 @@
       "gates": {
         "onePercentLowFpsMin": 45,
         "p99FrameMsMax": 22.2,
-        "longestFrameMsMax": 200,
+        "longestFrameMsMax": 100,
         "freezeCountMax": 0,
         "targeting": true,
         "queueHighWater": false,
@@ -324,7 +398,7 @@
       "gates": {
         "onePercentLowFpsMin": 45,
         "p99FrameMsMax": 22.2,
-        "longestFrameMsMax": 200,
+        "longestFrameMsMax": 100,
         "freezeCountMax": 0,
         "targeting": true,
         "queueHighWater": true,
@@ -372,7 +446,7 @@
         "onePercentLowFpsMin": 60,
         "coverageRatioMin": 0.98,
         "p99FrameMsMax": 16.7,
-        "longestFrameMsMax": 150,
+        "longestFrameMsMax": 50,
         "freezeCountMax": 0,
         "targeting": true,
         "runtimeInvariants": true,
@@ -400,7 +474,7 @@
         "onePercentLowFpsMin": 60,
         "coverageRatioMin": 0.98,
         "p99FrameMsMax": 16.7,
-        "longestFrameMsMax": 150,
+        "longestFrameMsMax": 50,
         "freezeCountMax": 0,
         "targeting": true,
         "runtimeInvariants": true,

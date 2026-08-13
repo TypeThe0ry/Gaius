@@ -14,6 +14,7 @@ const rules = {
   sampleIntervalMs: 15_000,
   minimumAvailableRatio: 0.9,
   minimumDurationCoverageRatio: 0.98,
+  maximumSampleGapRatio: 1.5,
   trendWindowCount: 4,
   processTypes: ["browser", "renderer", "gpu", "utility"],
   requiredProcessTypes: ["browser", "renderer", "gpu"],
@@ -92,6 +93,19 @@ const stable = summarizeChromeProcessRssTrend({
 assert.equal(stable.verdict, "pass");
 assert.equal(stable.availability.unavailableSampleCount, 0);
 assert.equal(stable.total.failed, false);
+
+const gappedSamples = stableSamples.map((entry, index) => index === 20
+  ? {...entry, atMillis: entry.atMillis + 30_000}
+  : entry);
+const gapped = summarizeChromeProcessRssTrend({
+  samples: gappedSamples,
+  durationMs: REQUIRED_DURATION_MS,
+  ...rules,
+});
+assert.equal(gapped.verdict, "inconclusive",
+  "a long RSS sampling blind spot must not pass on sample count alone");
+assert.ok(gapped.availability.maximumSampleGapMs
+  > gapped.availability.maximumAllowedSampleGapMs);
 
 const sparse = summarizeChromeProcessRssTrend({
   samples: stableSamples.filter((_, index) => index % 40 === 0),
@@ -186,6 +200,7 @@ console.log(JSON.stringify({
   passed: true,
   stable: stable.verdict,
   sparse: sparse.verdict,
+  gapped: gapped.verdict,
   unavailable: unavailable.verdict,
   sustainedGrowth: growing.verdict,
   highByteLowPercent: highByteLowPercent.verdict,

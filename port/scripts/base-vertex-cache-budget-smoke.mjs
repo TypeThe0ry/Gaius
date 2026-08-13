@@ -47,6 +47,7 @@ const deletedObjects = new Set();
 const physicalBindings = new Map();
 const gpuBytes = new Map();
 const frameCallbacks = [];
+let failNextBufferUpload = false;
 
 function copyBytes(value) {
   if (typeof value === "number") return new Uint8Array(value);
@@ -70,6 +71,10 @@ const gl = {
     physicalBindings.set(target, object || null);
   },
   bufferData(target, data) {
+    if (failNextBufferUpload) {
+      failNextBufferUpload = false;
+      throw new Error("injected derived buffer upload failure");
+    }
     const object = physicalBindings.get(target);
     assert.ok(object, `bufferData target ${target} has no physical buffer`);
     gpuBytes.set(object, copyBytes(data));
@@ -85,6 +90,8 @@ const gl = {
   },
   drawElements() {},
   drawElementsInstanced() {},
+  vertexAttribPointer() {},
+  vertexAttribIPointer() {},
 };
 
 globalThis.requestAnimationFrame = (callback) => {
@@ -97,6 +104,7 @@ globalThis.window = {
   __gaiusBufferShadowBudgetBytes: 4096,
   __gaiusMaxSingleBufferShadowBytes: 1024,
   __gaiusBaseVertexDerivedBufferBudgetBytes: 1024,
+  __gaiusAlignedAttribDerivedBufferBudgetBytes: 1024,
 };
 
 compile("initializeJs")();
@@ -109,6 +117,16 @@ const state = window.__gaiusGL;
 const stats = window.__gaiusGLStats;
 state.hotPathTelemetryEnabled = true;
 state.indexedBufferBindings = new Map();
+
+const activeMetadata = [{ location: 0, name: "Position" }];
+activeMetadata.byLocation = new Map([[0, activeMetadata[0]]]);
+state.programAttribs.set(99, activeMetadata);
+state.currentProgram = 99;
+const activeLocationIdentity = state.activeAttribLocations();
+for (let iteration = 0; iteration < 100_000; iteration++) {
+  assert.strictEqual(state.activeAttribLocations(), activeLocationIdentity,
+    "active attribute lookup allocated a per-draw Set");
+}
 
 const bufferData = compile("bufferDataJs", ["target", "data", "usage"]);
 const deleteBuffer = compile("deleteBufferJs", ["buffer"]);
@@ -123,6 +141,10 @@ assert.equal(
   /evictOldestBufferShadow=function[\s\S]*?bufferBytes\.forEach/.test(initializationBody),
   false,
   "buffer-shadow eviction still scans every live shadow",
+);
+assert.ok(
+  jsBody("deleteVertexArray").includes("state.releaseVaoShiftedIndexRefs(vao)"),
+  "VAO deletion does not release shifted-index reverse references",
 );
 
 function flushFrame() {
@@ -165,6 +187,10 @@ function assertBudgets() {
     state.shiftedIndexCacheTotalBytes <= state.maxShiftedIndexCacheBytes(),
     `derived index budget exceeded: ${state.shiftedIndexCacheTotalBytes}`,
   );
+  assert.ok(
+    state.alignedAttribCacheTotalBytes <= state.maxAlignedAttribCacheBytes(),
+    `derived attribute budget exceeded: ${state.alignedAttribCacheTotalBytes}`,
+  );
 }
 
 function assertBaseVertexBaseline() {
@@ -174,6 +200,12 @@ function assertBaseVertexBaseline() {
   assert.equal(state.bufferShadowTouch.size, 0, "CPU shadow LRU did not return to baseline");
   assert.equal(state.shiftedIndexCache.size, 0, "derived cache did not return to baseline");
   assert.equal(state.shiftedIndexCacheKeys.size, 0, "derived source index did not return to baseline");
+  assert.equal(state.alignedAttribCacheTotalBytes, 0,
+    "derived attribute bytes did not return to baseline");
+  assert.equal(state.alignedAttribCache.size, 0,
+    "derived attribute cache did not return to baseline");
+  assert.equal(state.alignedAttribCacheKeys.size, 0,
+    "derived attribute source index did not return to baseline");
 }
 
 // Without the extension, element uploads retain a bounded CPU shadow so a first
@@ -191,6 +223,21 @@ assert.strictEqual(
 );
 assert.equal(stats.bufferShadowReadbacks || 0, 0, "draw path performed a GPU readback");
 assert.ok(stats.baseVertexIndexCacheHits >= 1);
+
+// Deleting a VAO must remove only that VAO from each exact derived-entry ref set.
+const secondaryVao = state.newVaoEmu();
+state.trackShiftedIndexEntryVao(lazyEntry, secondaryVao);
+assert.equal(lazyEntry.vaoRefs.has(secondaryVao), true);
+secondaryVao.shiftedIndexLast = lazyEntry;
+secondaryVao.shiftedIndexFastCache.set("tracked", lazyEntry);
+state.releaseVaoShiftedIndexRefs(secondaryVao);
+assert.equal(lazyEntry.vaoRefs.has(secondaryVao), false,
+  "deleted VAO survived in a shifted-index reverse-reference set");
+assert.equal(lazyEntry.vaoRefs.has(vao), true,
+  "releasing one VAO detached a still-live VAO");
+assert.equal(secondaryVao.shiftedIndexEntries.size, 0);
+assert.equal(secondaryVao.shiftedIndexFastCache.size, 0);
+assert.equal(secondaryVao.shiftedIndexLast, null);
 deleteBuffer(sourceId);
 assertBaseVertexBaseline();
 
@@ -222,6 +269,103 @@ assertBudgets();
 for (const logicalId of [2_001, 2_002, 2_003]) deleteBuffer(logicalId);
 assertBaseVertexBaseline();
 window.__gaiusBufferShadowBudgetBytes = 4096;
+
+function selectMisalignedAttribSource(logicalId) {
+  if (!state.buffers.has(logicalId)) {
+    const payload = new Uint8Array([10, 11, 12, 13, 14]);
+    state.buffers.set(logicalId, gl.createBuffer());
+    state.bufferSizes.set(logicalId, payload.byteLength);
+    state.bufferVersions.set(logicalId, 1);
+    state.shadowBufferData(logicalId, payload, payload.byteLength);
+  }
+  const current = state.getVaoEmu();
+  current.enabledAttribs.add(0);
+  current.attribHasBuffer.add(0);
+  current.misalignedAttribs.add(0);
+  current.attribPointers.set(0, {
+    index: 0,
+    buffer: logicalId,
+    size: 1,
+    type: gl.UNSIGNED_BYTE,
+    normalized: false,
+    integer: false,
+    stride: 2,
+    offset: 1,
+  });
+  current.attribVersion = ((current.attribVersion || 0) + 1) | 0;
+  current.alignedAttribVersion = -1;
+  current.alignedAttribProgram = -1;
+  current.alignedAttribGlobalVersion = -1;
+  state.ensureAlignedAttribs();
+  const keys = state.alignedAttribCacheKeys.get(logicalId);
+  return keys && keys.size ? state.alignedAttribCache.get([...keys][0]) : null;
+}
+
+function clearMisalignedAttribState() {
+  const current = state.getVaoEmu();
+  current.enabledAttribs.delete(0);
+  current.attribHasBuffer.delete(0);
+  current.misalignedAttribs.delete(0);
+  current.attribPointers.delete(0);
+  current.missingEnabledAttribs.delete(0);
+  current.alignedAttribVersion = -1;
+}
+
+// Aligned attribute copies use a byte-bounded LRU and clean up by source buffer.
+window.__gaiusAlignedAttribDerivedBufferBudgetBytes = 16;
+const alignedA = selectMisalignedAttribSource(3_001);
+const alignedB = selectMisalignedAttribSource(3_002);
+assert.ok(alignedA && alignedB);
+const retainedAlignedVao = state.newVaoEmu();
+retainedAlignedVao.alignedAttribVersion = 17;
+retainedAlignedVao.alignedAttribProgram = 99;
+retainedAlignedVao.alignedAttribGlobalVersion = state.programVersion || 0;
+state.trackAlignedAttribEntryVao(alignedB, retainedAlignedVao);
+assert.equal(alignedA.bytes, 8);
+assert.equal(alignedB.bytes, 8);
+assert.strictEqual(selectMisalignedAttribSource(3_001), alignedA,
+  "repeat aligned-attrib draw missed the cache");
+const alignedC = selectMisalignedAttribSource(3_003);
+assert.ok(alignedC);
+assert.equal(state.alignedAttribCache.has(alignedB.cacheKey), false,
+  "least-recently-used aligned attribute entry survived");
+assert.equal(alignedB.deleted, true,
+  "evicted aligned attribute entry was not marked deleted");
+assert.equal(retainedAlignedVao.alignedAttribVersion, -1,
+  "aligned attribute eviction left a VAO eligible for a stale fast-skip");
+assert.equal(retainedAlignedVao.alignedAttribEntries.size, 0,
+  "aligned attribute eviction retained a VAO reverse reference");
+assert.equal(state.alignedAttribCache.has(alignedA.cacheKey), true,
+  "recently touched aligned attribute entry was evicted");
+assert.ok(stats.alignedAttribEvictions > 0);
+assertBudgets();
+for (const logicalId of [3_001, 3_002, 3_003]) deleteBuffer(logicalId);
+clearMisalignedAttribState();
+assertBaseVertexBaseline();
+
+// An entry larger than the hard budget is rejected before creating a GPU buffer.
+window.__gaiusAlignedAttribDerivedBufferBudgetBytes = 4;
+const createdBeforeOversize = nextObjectId;
+assert.equal(selectMisalignedAttribSource(3_004), null);
+assert.equal(nextObjectId, createdBeforeOversize + 1,
+  "oversized aligned entry created a derived GPU buffer");
+assert.ok(stats.alignedAttribBudgetFallbacks > 0);
+deleteBuffer(3_004);
+clearMisalignedAttribState();
+assertBaseVertexBaseline();
+window.__gaiusAlignedAttribDerivedBufferBudgetBytes = 1024;
+
+// Failed derived uploads delete their transient GPU object and do not poison the cache.
+const deletedBeforeFailure = deletedObjects.size;
+failNextBufferUpload = true;
+assert.equal(selectMisalignedAttribSource(3_005), null,
+  "failed aligned attribute upload produced a cache entry");
+assert.equal(deletedObjects.size, deletedBeforeFailure + 1,
+  "failed aligned attribute upload leaked its transient GPU buffer");
+assert.ok(stats.alignedAttribUploadFailures > 0);
+deleteBuffer(3_005);
+clearMisalignedAttribState();
+assertBaseVertexBaseline();
 
 // Exercise tens of thousands of shadow uploads with enough live sources to force LRU eviction.
 const uploadIterations = 20_000;

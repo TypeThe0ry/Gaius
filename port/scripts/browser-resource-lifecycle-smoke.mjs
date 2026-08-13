@@ -190,6 +190,12 @@ assert.match(source, /MAPPED_BUFFERS\.containsKey\(target\)/);
 assert.match(source, /ensureBufferNotMapped\(logicalBuffer\);/);
 assert.match(source, /ensureBufferNotMapped\(buffer\);/);
 assert.match(source, /finally\s*\{\s*MemoryUtil\.memFree\(mapped\.buffer\);/s);
+assert.match(source, /MAP_WRITE_BIT\s*=\s*0x0002/);
+assert.match(source, /MAP_FLUSH_EXPLICIT_BIT\s*=\s*0x0010/);
+assert.match(source,
+  /return \(access & MAP_WRITE_BIT\) != 0\s*&& \(access & MAP_FLUSH_EXPLICIT_BIT\) == 0;/);
+assert.equal(source.match(/if \(mapped\.uploadOnUnmap\(\)\)/g)?.length, 2,
+  "target and named mapped buffers do not share explicit-flush ownership");
 assert.match(source, /stats\.mappedBufferRegions=count\|0;/);
 
 console.log("Browser resource lifecycle smoke passed");

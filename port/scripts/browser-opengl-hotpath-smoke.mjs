@@ -340,6 +340,20 @@ assert.ok(calls.texSubImage2D.at(-1).pixels instanceof Uint8Array);
 assert.notStrictEqual(calls.texSubImage2D.at(-1).pixels, unsignedSubPixels);
 assert.deepEqual([...calls.texSubImage2D.at(-1).bytes], [0, 255, 127]);
 
+run(
+  "texSubImage2DOffsetJs",
+  ["target", "level", "x", "y", "width", "height", "format", "type", "offset"],
+  [gl.TEXTURE_2D, 0, 4, 5, 2, 2, gl.RED, gl.BYTE, 4],
+);
+assert.equal(calls.texSubImage2D.at(-1).pixels, 4);
+assert.equal(calls.texSubImage2D.at(-1).format, 0x8d94);
+assert.equal(calls.texSubImage2D.at(-1).type, gl.BYTE);
+assert.match(
+  source,
+  /boundBufferForTargetJs\(PIXEL_UNPACK_BUFFER\)\s*!=\s*0[\s\S]*?texSubImage2DOffsetJs\([\s\S]*?return;[\s\S]*?pointerBytes\(/,
+  "long texture uploads must preserve PBO offsets instead of dereferencing them",
+);
+
 for (const [parameter, value] of [
   [gl.UNPACK_ALIGNMENT, 8],
   [gl.UNPACK_ROW_LENGTH, 7],

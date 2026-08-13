@@ -33,7 +33,54 @@ def compressed(value: bytes) -> bytes:
     return gzip.compress(value, mtime=0)
 
 
+def teavm_pom(main_class: str, target_directory: Path, target_file: str) -> str:
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <build><plugins><plugin>
+    <groupId>org.teavm</groupId>
+    <artifactId>teavm-maven-plugin</artifactId>
+    <executions><execution>
+    <id>compile-fixture</id>
+    <phase>package</phase>
+    <goals><goal>compile</goal></goals>
+    <configuration>
+      <mainClass>{main_class}</mainClass>
+      <targetDirectory>{target_directory}</targetDirectory>
+      <targetFileName>{target_file}</targetFileName>
+      <optimizationLevel>ADVANCED</optimizationLevel>
+      <sourceMapsGenerated>false</sourceMapsGenerated>
+      <debugInformationGenerated>false</debugInformationGenerated>
+      <minifying>true</minifying>
+      <shortFileNames>true</shortFileNames>
+      <assertionsRemoved>true</assertionsRemoved>
+    </configuration></execution></executions>
+  </plugin></plugins></build>
+</project>
+"""
+
+
 class PortableArtifactIdentityTest(unittest.TestCase):
+    @staticmethod
+    def write_compiler_profile(
+        root: Path,
+        role: str,
+        artifact: Path,
+        pom: Path,
+        resources: list[Path],
+    ) -> None:
+        record = PORTABLE.compiler_profile.create_record(
+            root,
+            role,
+            artifact,
+            pom,
+            resources,
+            True,
+        )
+        PORTABLE.compiler_profile.write_atomically(
+            PORTABLE.compiler_profile.default_output(artifact),
+            PORTABLE.compiler_profile.canonical_json(record) + "\n",
+        )
+
     def make_fixture(
         self,
         directory: str,
@@ -135,6 +182,7 @@ class PortableArtifactIdentityTest(unittest.TestCase):
             json.dumps(
                 {
                     "id": version,
+                    "assetIndex": {"id": launcher_asset_index},
                     "libraries": [
                         {
                             "name": "example:browser-library:1.0",
@@ -144,6 +192,47 @@ class PortableArtifactIdentityTest(unittest.TestCase):
                         }
                     ],
                 }
+            ),
+            encoding="utf-8",
+        )
+        asset_index = version_work / "assets" / "indexes" / f"{launcher_asset_index}.json"
+        asset_index.parent.mkdir(parents=True)
+        asset_index.write_text('{"objects":{}}\n', encoding="utf-8")
+        generated_resources = root / "port" / "target" / "generated-resources"
+        client_resources = [
+            generated_resources / "dev/gaius/browser/minecraft-resources.txt",
+            generated_resources / "dev/gaius/browser/minecraft-embedded-resources.txt",
+            asset_index,
+            generated_resources / "assets/minecraft/sounds.json",
+            generated_resources / "assets/minecraft/font/include/unifont.json",
+            generated_resources / "assets/minecraft/font/include/unifont_pua.json",
+            dist / "vanilla-assets.pack.gz",
+        ]
+        for index, resource in enumerate(client_resources[:-1]):
+            if resource == asset_index:
+                continue
+            resource.parent.mkdir(parents=True, exist_ok=True)
+            resource.write_text(f"fixture-resource-{index}\n", encoding="utf-8")
+        client_pom = root / "port" / "target" / "generated-pom.xml"
+        client_pom.write_text(
+            teavm_pom("net.minecraft.client.main.Main", dist, "classes.js"),
+            encoding="utf-8",
+        )
+        worker_resources = (
+            root
+            / "port"
+            / "target"
+            / "server-worker"
+            / "generated-resources/dev/gaius/browser/minecraft-resources.txt"
+        )
+        worker_resources.parent.mkdir(parents=True, exist_ok=True)
+        worker_resources.write_text("fixture-worker-resources\n", encoding="utf-8")
+        worker_pom = root / "port" / "target" / "server-worker" / "generated-pom.xml"
+        worker_pom.write_text(
+            teavm_pom(
+                "dev.gaius.browser.BrowserIntegratedServerMain",
+                dist,
+                "singleplayer-server.js",
             ),
             encoding="utf-8",
         )
@@ -169,6 +258,16 @@ class PortableArtifactIdentityTest(unittest.TestCase):
                 role,
                 dist / artifact_name,
             )
+        for role, artifact, pom, resources in (
+            ("client", dist / "classes.js", client_pom, client_resources),
+            (
+                "singleplayer-worker",
+                dist / "singleplayer-server.js",
+                worker_pom,
+                [worker_resources],
+            ),
+        ):
+            self.write_compiler_profile(root, role, artifact, pom, resources)
         return root, dist, dist / "Gaius.html"
 
     @staticmethod
@@ -237,6 +336,36 @@ class PortableArtifactIdentityTest(unittest.TestCase):
                     "server-input-pump",
                 },
             )
+
+    def test_client_compiler_profile_rejects_wrong_target_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, dist, output = self.make_fixture(directory)
+            pom = root / "port" / "target" / "generated-pom.xml"
+            pom.write_text(
+                pom.read_text(encoding="utf-8").replace(
+                    "<targetFileName>classes.js</targetFileName>",
+                    "<targetFileName>other.js</targetFileName>",
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "targetFileName"):
+                self.run_build(root, dist, output)
+
+    def test_client_compiler_profile_rejects_wrong_main_class(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, dist, output = self.make_fixture(directory)
+            pom = root / "port" / "target" / "generated-pom.xml"
+            pom.write_text(
+                pom.read_text(encoding="utf-8").replace(
+                    "<mainClass>net.minecraft.client.main.Main</mainClass>",
+                    "<mainClass>example.WrongMain</mainClass>",
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "requires mainClass"):
+                self.run_build(root, dist, output)
 
     def test_old_gzip_with_new_js_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -419,6 +548,38 @@ class PortableArtifactIdentityTest(unittest.TestCase):
                 root,
                 "client",
                 dist / "classes.js",
+            )
+            version = PORTABLE.load_version_profile(root)[0]["id"]
+            metadata = json.loads(
+                (root / "port" / "work" / version / "version.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            asset_index_id = metadata["assetIndex"]["id"]
+            generated_resources = root / "port" / "target" / "generated-resources"
+            self.write_compiler_profile(
+                root,
+                "client",
+                dist / "classes.js",
+                root / "port" / "target" / "generated-pom.xml",
+                [
+                    generated_resources / "dev/gaius/browser/minecraft-resources.txt",
+                    generated_resources
+                    / "dev/gaius/browser/minecraft-embedded-resources.txt",
+                    root
+                    / "port"
+                    / "work"
+                    / version
+                    / "assets"
+                    / "indexes"
+                    / f"{asset_index_id}.json",
+                    generated_resources / "assets/minecraft/sounds.json",
+                    generated_resources
+                    / "assets/minecraft/font/include/unifont.json",
+                    generated_resources
+                    / "assets/minecraft/font/include/unifont_pua.json",
+                    dist / "vanilla-assets.pack.gz",
+                ],
             )
             original_replace = PORTABLE.os.replace
             failed = False

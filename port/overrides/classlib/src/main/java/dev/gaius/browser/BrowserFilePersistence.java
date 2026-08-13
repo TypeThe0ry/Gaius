@@ -4,6 +4,10 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
 import org.teavm.jso.JSBody;
 import org.teavm.jso.JSByRef;
 import org.teavm.runtime.fs.VirtualFile;
@@ -66,6 +70,9 @@ public final class BrowserFilePersistence {
             .replace("onboardAccessibility:false\n", "");
     private static final String DEFAULT_BROWSER_OPTIONS =
             "version:" + CURRENT_DATA_VERSION + "\n" + BROWSER_OPTION_DEFAULTS;
+    private static final Map<String, Integer> OPEN_MATERIALIZED_CHUNK_FILES = new HashMap<>();
+    private static final Set<String> INTERNAL_VIRTUAL_FILE_PATHS = new HashSet<>();
+    private static final Set<String> LAZY_CHUNK_FILE_PLACEHOLDERS = new HashSet<>();
     private static boolean mounted;
 
     private BrowserFilePersistence() {
@@ -96,11 +103,17 @@ public final class BrowserFilePersistence {
     }
 
     public static boolean persist(String path, byte[] bytes) {
-        if (path == null || bytes == null || !shouldPersist(path)) {
+        if (path == null || bytes == null) {
             return false;
         }
+        // FileChannel/FileOutputStream already wrote non-durable paths to TeaVM's
+        // in-memory filesystem. Skipping the browser mirror is success, not an I/O
+        // failure; only paths selected by shouldPersist require a durable write.
+        if (!shouldPersist(path)) {
+            return true;
+        }
         String normalized = normalize(path);
-        if (normalized.endsWith(".mca") && setBytes(normalized, bytes)) {
+        if (isBinaryChunkStoragePath(normalized) && setBytes(normalized, bytes)) {
             return true;
         }
         if (isDownloadedPackFile(normalized) && setBytes(normalized, bytes)) {
@@ -115,11 +128,138 @@ public final class BrowserFilePersistence {
         return stored;
     }
 
+    /** Makes durable chunk storage visible to metadata checks without reading its payload. */
+    public static boolean restoreOnDemand(String path) {
+        if (path == null) {
+            return false;
+        }
+        String normalized = normalize(path);
+        if (!isOnDemandChunkStoragePath(normalized)
+                || !INTERNAL_VIRTUAL_FILE_PATHS.add(normalized)) {
+            return false;
+        }
+        try {
+            if (!mounted) {
+                mount();
+            }
+            if (!hasStoredPath(normalized)) {
+                return false;
+            }
+            VirtualFile existing = VirtualFileSystemProvider.getInstance().getFile(normalized);
+            if (existing != null && existing.isFile()) {
+                return true;
+            }
+            writeVirtualFile(normalized, new byte[0]);
+            LAZY_CHUNK_FILE_PLACEHOLDERS.add(normalized);
+            reportRegion("storage-region-placeholder", normalized);
+            return true;
+        } catch (Throwable exception) {
+            reportRegion("storage-region-placeholder-failed", normalized + ": " + describe(exception));
+            return false;
+        } finally {
+            INTERNAL_VIRTUAL_FILE_PATHS.remove(normalized);
+        }
+    }
+
+    /** Restores bytes before an accessor is created; metadata placeholders are never opened. */
+    public static void materializeForOpen(String path) throws IOException {
+        if (path == null) {
+            return;
+        }
+        String normalized = normalize(path);
+        if (!isOnDemandChunkStoragePath(normalized)) {
+            return;
+        }
+        if (!INTERNAL_VIRTUAL_FILE_PATHS.add(normalized)) {
+            throw new IOException("Recursive browser chunk materialization for " + normalized);
+        }
+        try {
+            if (!mounted) {
+                mount();
+            }
+            if (!hasStoredPath(normalized)) {
+                return;
+            }
+            VirtualFile existing = VirtualFileSystemProvider.getInstance().getFile(normalized);
+            if (existing != null && existing.isFile()
+                    && !LAZY_CHUNK_FILE_PLACEHOLDERS.contains(normalized)) {
+                return;
+            }
+            if (!restore(normalized)) {
+                throw new IOException("Could not restore browser chunk file " + normalized);
+            }
+            LAZY_CHUNK_FILE_PLACEHOLDERS.remove(normalized);
+            reportRegion("storage-region-hydrated", normalized);
+        } catch (IOException exception) {
+            throw exception;
+        } catch (Throwable exception) {
+            IOException failure = new IOException("Could not restore browser chunk file " + normalized);
+            failure.initCause(exception);
+            throw failure;
+        } finally {
+            INTERNAL_VIRTUAL_FILE_PATHS.remove(normalized);
+        }
+    }
+
+    /** Pins a materialized .mca or .mcc file while a synchronous accessor can use it. */
+    public static boolean retainMaterializedChunkFile(String path) {
+        String normalized = normalize(path);
+        if (!isOnDemandChunkStoragePath(normalized)) {
+            return false;
+        }
+        OPEN_MATERIALIZED_CHUNK_FILES.put(
+                normalized, OPEN_MATERIALIZED_CHUNK_FILES.getOrDefault(normalized, 0) + 1);
+        return true;
+    }
+
+    /**
+     * Releases the TeaVM copy after the last channel closes. Durable storage is
+     * deliberately left untouched so the next getFile call can hydrate it again.
+     */
+    public static void releaseMaterializedChunkFile(String path, boolean durable) {
+        String normalized = normalize(path);
+        if (!isOnDemandChunkStoragePath(normalized)) {
+            return;
+        }
+        int references = OPEN_MATERIALIZED_CHUNK_FILES.getOrDefault(normalized, 0);
+        if (references > 1) {
+            OPEN_MATERIALIZED_CHUNK_FILES.put(normalized, references - 1);
+            return;
+        }
+        OPEN_MATERIALIZED_CHUNK_FILES.remove(normalized);
+        if (references == 0 || !durable || !hasStoredPath(normalized)) {
+            return;
+        }
+        reclaimMaterializedChunkFileIfUnreferenced(normalized);
+    }
+
+    private static void reclaimMaterializedChunkFileIfUnreferenced(String normalized) {
+        if (!isOnDemandChunkStoragePath(normalized)
+                || OPEN_MATERIALIZED_CHUNK_FILES.getOrDefault(normalized, 0) != 0
+                || !hasStoredPath(normalized)
+                || !INTERNAL_VIRTUAL_FILE_PATHS.add(normalized)) {
+            return;
+        }
+        try {
+            VirtualFile file = VirtualFileSystemProvider.getInstance().getFile(normalized);
+            LAZY_CHUNK_FILE_PLACEHOLDERS.remove(normalized);
+            if (file != null && file.isFile() && file.delete()) {
+                reportRegion("storage-region-reclaimed", normalized);
+            }
+        } catch (Throwable exception) {
+            reportRegion("storage-region-reclaim-failed", normalized + ": " + describe(exception));
+        } finally {
+            INTERNAL_VIRTUAL_FILE_PATHS.remove(normalized);
+        }
+    }
+
     public static boolean delete(String path) {
         if (path == null || !shouldPersist(path)) {
             return false;
         }
-        removeItem(PREFIX + normalize(path));
+        String normalized = normalize(path);
+        LAZY_CHUNK_FILE_PLACEHOLDERS.remove(normalized);
+        removeItem(PREFIX + normalized);
         return true;
     }
 
@@ -129,13 +269,15 @@ public final class BrowserFilePersistence {
         }
     }
 
-    public static void syncMove(String source, String target) {
+    public static void syncMove(String source, String target) throws IOException {
         boolean stored = syncFile(target);
         if (stored) {
             delete(source);
             report("storage-move", normalize(source) + " -> " + normalize(target));
+            reclaimMaterializedChunkFileIfUnreferenced(normalize(target));
         } else {
             report("storage-move-failed", normalize(source) + " -> " + normalize(target));
+            throw new IOException("Could not persist moved browser file " + normalize(target));
         }
     }
 
@@ -254,7 +396,8 @@ public final class BrowserFilePersistence {
         String normalized = normalize(path);
         String activeWorld = activeServerWorldId();
         if (activeWorld != null && !activeWorld.isEmpty()) {
-            return normalized.startsWith("/gaius/saves/" + activeWorld + "/");
+            return normalized.startsWith("/gaius/saves/" + activeWorld + "/")
+                    && !isOnDemandChunkStoragePath(normalized);
         }
         if (!normalized.startsWith("/gaius/saves/")) {
             return true;
@@ -267,6 +410,33 @@ public final class BrowserFilePersistence {
         return relative.equals("level.dat")
                 || relative.equals("level.dat_old")
                 || relative.equals("icon.png");
+    }
+
+    private static boolean isOnDemandChunkStoragePath(String normalized) {
+        if (!isChunkStoragePath(normalized)) {
+            return false;
+        }
+        String activeWorld = activeServerWorldId();
+        return activeWorld != null
+                && !activeWorld.isEmpty()
+                && normalized.startsWith("/gaius/saves/" + activeWorld + "/");
+    }
+
+    private static boolean isBinaryChunkStoragePath(String normalized) {
+        if (isChunkStoragePath(normalized)) {
+            return true;
+        }
+        String activeWorld = activeServerWorldId();
+        if (activeWorld == null || activeWorld.isEmpty()
+                || !normalized.startsWith("/gaius/saves/" + activeWorld + "/")) {
+            return false;
+        }
+        String fileName = name(normalized);
+        return fileName.startsWith("tmp") && fileName.endsWith(".tmp");
+    }
+
+    private static boolean isChunkStoragePath(String normalized) {
+        return normalized.endsWith(".mca") || normalized.endsWith(".mcc");
     }
 
     private static void seedDefaultOptions() {
@@ -525,6 +695,19 @@ public final class BrowserFilePersistence {
             """)
     private static native int copyStoredBytes(String path, @JSByRef byte[] output);
 
+    @JSBody(params = {"path"}, script = """
+            try {
+              path=String(path || '/');
+              var files=globalThis.__gaiusPersistentFiles;
+              if (files && Object.prototype.hasOwnProperty.call(files,path)) return true;
+              return !!(globalThis.localStorage &&
+                globalThis.localStorage.getItem('gaius.fs.v1:' + path) !== null);
+            } catch (e) {
+              return false;
+            }
+            """)
+    private static native boolean hasStoredPath(String path);
+
     @JSBody(params = {"key"}, script = """
             try {
               var prefix='gaius.fs.v1:';
@@ -558,6 +741,18 @@ public final class BrowserFilePersistence {
             }
             """)
     private static native String activeServerWorldId();
+
+    @JSBody(params = {"event", "detail"}, script = """
+            try {
+              var counters=globalThis.__gaiusMinecraftCounters || (globalThis.__gaiusMinecraftCounters={});
+              var key='storage:'+event;
+              counters[key]=(counters[key]||0)+1;
+              var events=globalThis.__gaiusMinecraftEvents || (globalThis.__gaiusMinecraftEvents=[]);
+              events.push({event:'storage:'+event,detail:detail,count:counters[key],at:Date.now()});
+              if (events.length>500) events.splice(0,events.length-500);
+            } catch (e) {}
+            """)
+    private static native void reportRegion(String event, String detail);
 
     @JSBody(params = {"event", "detail"}, script = """
             try {

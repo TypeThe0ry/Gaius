@@ -86,7 +86,7 @@ build_library_overlay() {
   fi
   local output_classes="$overlay_work/library-classes/$name"
   local compile_classpath="$source_jar:$work/client-named.jar:$(cat "$work/classpath.txt")"
-  for artifact in teavm-interop teavm-jso teavm-jso-apis; do
+  for artifact in teavm-interop teavm-jso teavm-jso-apis teavm-platform; do
     compile_classpath="$compile_classpath:$HOME/.m2/repository/org/teavm/$artifact/$teavm_version/$artifact-$teavm_version.jar"
   done
   local library_sources=()
@@ -427,6 +427,12 @@ java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
 jar --update \
   --file "$overlay_work/libraries/$lwjgl_path" \
   -C "$lwjgl_patch_classes" .
+if ! javap -classpath "$overlay_work/libraries/$lwjgl_path" -c -p \
+    'org.lwjgl.system.Platform$Architecture' | rg -q 'String wasm64'; then
+  echo "LWJGL browser architecture patch is missing" >&2
+  exit 1
+fi
+echo "Verified LWJGL browser architecture identity"
 find "$lwjgl_patch_classes" -type f -delete
 java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
   dev.gaius.tools.LwjglUnsafeAccessPatcher \
@@ -704,7 +710,8 @@ java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
 java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
   dev.gaius.tools.MinecraftClientPatcher \
   "$client_output" \
-  "$client_patch_classes"
+  "$client_patch_classes" \
+  "$version"
 jar --update \
   --file "$client_output" \
   -C "$client_patch_classes" .

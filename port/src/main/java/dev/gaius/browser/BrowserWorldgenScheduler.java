@@ -6,7 +6,7 @@ import org.teavm.jso.JSBody;
 
 /** Keeps integrated-server world generation cooperative in browser Workers. */
 public final class BrowserWorldgenScheduler {
-    private static final double DEFAULT_SLICE_MILLIS = 12.0;
+    private static final double DEFAULT_SLICE_MILLIS = 8.0;
     private static final double MIN_ADAPTIVE_SLICE_MILLIS = 2.0;
     private static final double BUDGET_RECOVERY_MILLIS = 0.5;
     private static final double MODERATE_YIELD_DELAY_MILLIS = 4.0;
@@ -16,6 +16,9 @@ public final class BrowserWorldgenScheduler {
     private static final int MIN_PROGRESS_PULSES_BEFORE_NETWORK_PREEMPTION = 2;
     private static final int MAX_NETWORK_WAIT_PULSES = 2;
     private static final int MAX_PULSES_PER_TURN = 64;
+    private static final int DEFAULT_DISTANCE_MANAGER_UPDATE_BUDGET = 64;
+    private static final int MIN_DISTANCE_MANAGER_UPDATE_BUDGET = 8;
+    private static final int MAX_DISTANCE_MANAGER_UPDATE_BUDGET = 512;
 
     private static final int YIELD_DEADLINE = 0;
     private static final int YIELD_NETWORK = 1;
@@ -39,12 +42,53 @@ public final class BrowserWorldgenScheduler {
     private static boolean networkPreemptionPending;
     private static boolean yieldActive;
     private static boolean deferredYield;
+    private static int lastDistanceManagerUpdateBudget = DEFAULT_DISTANCE_MANAGER_UPDATE_BUDGET;
 
     private BrowserWorldgenScheduler() {
     }
 
     public static void checkpoint() {
         requestYield(YIELD_CHECKPOINT, networkQueueDepth());
+    }
+
+    /**
+     * Bounds the vanilla all-updates distance pass without changing its queue ordering. Any
+     * remaining ticket work stays in the vanilla tracker and is resumed by the next server tick.
+     */
+    public static int distanceManagerUpdateBudget() {
+        int budget = configuredDistanceManagerUpdateBudget(
+                DEFAULT_DISTANCE_MANAGER_UPDATE_BUDGET);
+        lastDistanceManagerUpdateBudget = budget;
+        return budget;
+    }
+
+    /** Records the actual number of distance updates completed in one vanilla pass. */
+    public static void recordDistanceManagerUpdates(int processed) {
+        recordDistanceManagerUpdatesJs(
+                lastDistanceManagerUpdateBudget,
+                Math.max(0, processed));
+    }
+
+    /** Keeps the remaining vanilla distance-manager loops cooperative on the server thread. */
+    public static void pulseDistanceManager() {
+        recordDistanceManagerPulse();
+        pulse();
+    }
+
+    /** Starts a snapshot-backed changed-chunk broadcast batch. */
+    public static void beginChunkBroadcast(int entries) {
+        recordChunkBroadcastStart(Math.max(0, entries));
+    }
+
+    /** Allows long changed-chunk broadcasts to yield without retaining a live set iterator. */
+    public static void pulseChunkBroadcast() {
+        recordChunkBroadcastItem();
+        pulse();
+    }
+
+    /** Marks a fully processed broadcast snapshot; updates queued during it remain for next tick. */
+    public static void finishChunkBroadcast(int entries) {
+        recordChunkBroadcastFinish(Math.max(0, entries));
     }
 
     public static void pulse() {
@@ -250,7 +294,7 @@ public final class BrowserWorldgenScheduler {
 
     @JSBody(params = "fallback", script = """
             const configured = Number(globalThis.__gaiusWorldgenSliceMillis);
-            return Number.isFinite(configured) && configured >= 4 && configured <= 50
+            return Number.isFinite(configured) && configured >= 2 && configured <= 50
               ? configured
               : fallback;
             """)
@@ -259,6 +303,73 @@ public final class BrowserWorldgenScheduler {
     private static double sliceMillis() {
         return configuredSliceMillis(DEFAULT_SLICE_MILLIS);
     }
+
+    @JSBody(params = "fallback", script = """
+            const configured = Number(globalThis.__gaiusDistanceManagerUpdateBudget);
+            if (!Number.isFinite(configured)) return fallback;
+            return Math.max(8, Math.min(512, Math.floor(configured)));
+            """)
+    private static native int configuredDistanceManagerUpdateBudget(int fallback);
+
+    @JSBody(params = {"budget", "processed"}, script = """
+            const stats = globalThis.__gaiusWorldgenStats ||
+              (globalThis.__gaiusWorldgenStats = {});
+            const safeBudget = Math.max(1, Number(budget) || 0);
+            const safeProcessed = Math.max(0, Number(processed) || 0);
+            stats.distanceManagerBatches = (Number(stats.distanceManagerBatches) || 0) + 1;
+            stats.distanceManagerUpdateBudget = safeBudget;
+            stats.lastDistanceManagerUpdates = safeProcessed;
+            stats.totalDistanceManagerUpdates =
+              (Number(stats.totalDistanceManagerUpdates) || 0) + safeProcessed;
+            stats.maxDistanceManagerUpdates = Math.max(
+              Number(stats.maxDistanceManagerUpdates) || 0,
+              safeProcessed
+            );
+            if (safeProcessed >= safeBudget) {
+              stats.distanceManagerBudgetExhaustions =
+                (Number(stats.distanceManagerBudgetExhaustions) || 0) + 1;
+            }
+            """)
+    private static native void recordDistanceManagerUpdatesJs(int budget, int processed);
+
+    @JSBody(script = """
+            const stats = globalThis.__gaiusWorldgenStats ||
+              (globalThis.__gaiusWorldgenStats = {});
+            stats.distanceManagerLoopPulses =
+              (Number(stats.distanceManagerLoopPulses) || 0) + 1;
+            """)
+    private static native void recordDistanceManagerPulse();
+
+    @JSBody(params = "entries", script = """
+            const stats = globalThis.__gaiusWorldgenStats ||
+              (globalThis.__gaiusWorldgenStats = {});
+            const safeEntries = Math.max(0, Number(entries) || 0);
+            stats.chunkBroadcastBatches = (Number(stats.chunkBroadcastBatches) || 0) + 1;
+            stats.lastChunkBroadcastEntries = safeEntries;
+            stats.totalChunkBroadcastEntries =
+              (Number(stats.totalChunkBroadcastEntries) || 0) + safeEntries;
+            stats.maxChunkBroadcastEntries = Math.max(
+              Number(stats.maxChunkBroadcastEntries) || 0,
+              safeEntries
+            );
+            """)
+    private static native void recordChunkBroadcastStart(int entries);
+
+    @JSBody(script = """
+            const stats = globalThis.__gaiusWorldgenStats ||
+              (globalThis.__gaiusWorldgenStats = {});
+            stats.chunkBroadcastItems = (Number(stats.chunkBroadcastItems) || 0) + 1;
+            """)
+    private static native void recordChunkBroadcastItem();
+
+    @JSBody(params = "entries", script = """
+            const stats = globalThis.__gaiusWorldgenStats ||
+              (globalThis.__gaiusWorldgenStats = {});
+            stats.lastChunkBroadcastCompleted = Math.max(0, Number(entries) || 0);
+            stats.completedChunkBroadcastBatches =
+              (Number(stats.completedChunkBroadcastBatches) || 0) + 1;
+            """)
+    private static native void recordChunkBroadcastFinish(int entries);
 
     @JSBody(script = """
             return typeof performance !== 'undefined' && performance.now
@@ -311,9 +422,23 @@ public final class BrowserWorldgenScheduler {
                 enumerable: false
               });
             }
+            if (!stats.__yieldDelayHistogram) {
+              Object.defineProperty(stats, '__yieldDelayHistogram', {
+                value: new Uint32Array(256),
+                enumerable: false
+              });
+            }
             const histogram = stats.__sliceHistogram;
+            const yieldDelayHistogram = stats.__yieldDelayHistogram;
             const bucket = Math.min(histogram.length - 1, Math.floor(sliceElapsedMillis));
             if (histogram[bucket] < 0xffffffff) histogram[bucket]++;
+            const yieldDelayBucket = Math.min(
+              yieldDelayHistogram.length - 1,
+              Math.floor(yieldDelayMillis)
+            );
+            if (yieldDelayHistogram[yieldDelayBucket] < 0xffffffff) {
+              yieldDelayHistogram[yieldDelayBucket]++;
+            }
 
             stats.slices = (Number(stats.slices) || 0) + 1;
             stats.sliceElapsedMillis = sliceElapsedMillis;
@@ -324,17 +449,19 @@ public final class BrowserWorldgenScheduler {
               Number(stats.maxSliceElapsedMillis) || 0,
               sliceElapsedMillis
             );
-            const percentile = function(fraction) {
+            const percentile = function(values, fraction) {
               const target = Math.max(1, Math.ceil(stats.slices * fraction));
               let seen = 0;
-              for (let index = 0; index < histogram.length; index++) {
-                seen += histogram[index];
+              for (let index = 0; index < values.length; index++) {
+                seen += values[index];
                 if (seen >= target) return index + 1;
               }
-              return histogram.length;
+              return values.length;
             };
-            stats.p95SliceElapsedMillis = percentile(0.95);
-            stats.p99SliceElapsedMillis = percentile(0.99);
+            stats.p95SliceElapsedMillis = percentile(histogram, 0.95);
+            stats.p99SliceElapsedMillis = percentile(histogram, 0.99);
+            stats.p95YieldDelayMillis = percentile(yieldDelayHistogram, 0.95);
+            stats.p99YieldDelayMillis = percentile(yieldDelayHistogram, 0.99);
 
             stats.configuredBudgetMillis = Number(globalThis.__gaiusWorldgenSliceMillis) ||
               completedBudgetMillis;

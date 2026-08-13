@@ -22,13 +22,13 @@ for (const contract of [
   "openKeyCursor(range)",
   "message.type === 'storage-flushing'",
   "worker.__gaiusStopTimeout",
+  "beginClientHandoff(sessionId)",
+  "singleplayer:handoff-disconnect-ignored",
 ]) {
   assert.ok(source.includes(contract), `missing session contract: ${contract}`);
 }
 assert.equal(source.includes(".getAll()"), false,
   "singleplayer shutdown still performs an IndexedDB full-store read");
-assert.equal(source.includes("singleplayer:handoff-disconnect-ignored"), false,
-  "pending Workers can still bypass explicit stop requests");
 
 const ports = new Map();
 const workers = new Map();
@@ -205,10 +205,12 @@ function createLaunchRuntime(failureMode) {
     __gaiusArmStopTimeout: (delay, detail) => armed.push({delay, detail}),
   };
   const context = {
+    Date,
     Map,
     clearTimeout,
     setTimeout,
-    __gaiusSingleplayerHandoff: false,
+    __gaiusMinecraftEvents: [],
+    __gaiusSingleplayerHandoff: "pending",
     __gaiusSingleplayerWorkers: new Map([["pending", pendingWorker]]),
   };
   context.globalThis = context;
@@ -217,6 +219,13 @@ function createLaunchRuntime(failureMode) {
       `${source.slice(stopStart, stopScriptEnd)}\n};`,
     context,
   );
+  context.requestWorkerStop();
+  assert.equal(messages.length, 0,
+    "the delayed disconnect from world handoff stopped the new Worker");
+  assert.equal(context.__gaiusMinecraftEvents.at(-1)?.event,
+    "singleplayer:handoff-disconnect-ignored");
+
+  context.__gaiusSingleplayerHandoff = "";
   context.requestWorkerStop();
   assert.equal(messages.length, 1,
     "explicit disconnect did not send exactly one pending Worker stop");

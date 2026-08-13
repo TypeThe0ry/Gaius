@@ -21,7 +21,7 @@ public final class BrowserGlfw {
     private static final long WINDOW = 1L;
     private static final long MONITOR = 2L;
 
-    private static GLFWErrorCallbackI errorCallback;
+    private static GLFWErrorCallback errorCallback;
     private static GLFWMonitorCallbackI monitorCallback;
     private static GLFWWindowPosCallbackI windowPosCallback;
     private static GLFWWindowSizeCallbackI windowSizeCallback;
@@ -39,6 +39,7 @@ public final class BrowserGlfw {
     private static GLFWDropCallbackI dropCallback;
 
     private static boolean shouldClose;
+    private static int swapInterval;
     private static double cursorX;
     private static double cursorY;
     private static ByteBuffer videoModeMemory;
@@ -141,6 +142,10 @@ public final class BrowserGlfw {
 
     public static long getPrimaryMonitor() {
         return MONITOR;
+    }
+
+    public static String getMonitorName(long monitor) {
+        return "Browser Display";
     }
 
     public static void getMonitorPos(long monitor, int[] x, int[] y) {
@@ -478,16 +483,17 @@ public final class BrowserGlfw {
     private static native boolean swapBuffersJs();
 
     @Async
-    private static native void yieldAfterPresent(boolean hidden);
+    private static native void yieldAfterPresent(boolean hidden, int interval);
 
-    private static void yieldAfterPresent(boolean hidden, AsyncCallback<Void> callback) {
-        scheduleFrameYield(hidden, () -> callback.complete(null));
+    private static void yieldAfterPresent(boolean hidden, int interval, AsyncCallback<Void> callback) {
+        scheduleFrameYield(hidden, interval, () -> callback.complete(null));
     }
 
-    @JSBody(params = {"hidden", "resume"}, script = """
+    @JSBody(params = {"hidden", "interval", "resume"}, script = """
             const root=typeof window!=='undefined' ? window : globalThis;
             const telemetry=root.__gaiusFrameTelemetry;
             const telemetryEnabled=!!(telemetry && telemetry.enabled);
+            const synchronizedToDisplay=Number(interval)!==0;
             const clock=() => (typeof performance!=='undefined' && performance.now)
               ? performance.now()
               : Date.now();
@@ -501,11 +507,44 @@ public final class BrowserGlfw {
                 telemetry.pendingYieldCount);
               telemetry.duplicateYieldCallbackCount=
                 Number(telemetry.duplicateYieldCallbackCount)||0;
+              telemetry.swapInterval=Number(interval)||0;
+              if (synchronizedToDisplay) {
+                telemetry.vsyncYieldCount=(telemetry.vsyncYieldCount||0)+1;
+              } else {
+                telemetry.uncappedYieldCount=(telemetry.uncappedYieldCount||0)+1;
+              }
               if (hidden) telemetry.hiddenYieldCount=(telemetry.hiddenYieldCount||0)+1;
               else telemetry.visibleYieldCount=(telemetry.visibleYieldCount||0)+1;
             }
             let resumed=false;
             let watchdog=-1;
+            let activeMessageScheduler=null;
+            let activeMessageTaskId=0;
+            const retireMessageChannel=scheduler => {
+              const channel=scheduler && scheduler.channel;
+              if (!channel) return;
+              try { channel.port1.onmessage=null; } catch (ignored) {}
+              try { if (channel.port1.close) channel.port1.close(); } catch (ignored) {}
+              try { if (channel.port2.close) channel.port2.close(); } catch (ignored) {}
+              scheduler.channel=null;
+              if (telemetryEnabled) {
+                telemetry.messageChannelRebuildCount=
+                  (Number(telemetry.messageChannelRebuildCount)||0)+1;
+              }
+            };
+            const detachMessageTask=failed => {
+              const scheduler=activeMessageScheduler;
+              const taskId=activeMessageTaskId;
+              activeMessageScheduler=null;
+              activeMessageTaskId=0;
+              if (!scheduler || !taskId || !(scheduler.tasks instanceof Map)) return;
+              const removed=scheduler.tasks.delete(taskId);
+              if (removed && telemetryEnabled) {
+                telemetry.cancelledMessageTaskCount=
+                  (Number(telemetry.cancelledMessageTaskCount)||0)+1;
+              }
+              if (failed) retireMessageChannel(scheduler);
+            };
             const finish=source => {
               if (resumed) {
                 if (telemetryEnabled) {
@@ -516,6 +555,12 @@ public final class BrowserGlfw {
               }
               resumed=true;
               if (watchdog >= 0) clearTimeout(watchdog);
+              if (source==='message') {
+                activeMessageScheduler=null;
+                activeMessageTaskId=0;
+              } else {
+                detachMessageTask(source==='watchdog');
+              }
               if (telemetryEnabled) {
                 telemetry.pendingYieldCount=Math.max(
                   0,(Number(telemetry.pendingYieldCount)||0)-1);
@@ -529,37 +574,89 @@ public final class BrowserGlfw {
                 );
                 if (source==='message') {
                   telemetry.messageChannelYieldCount=(telemetry.messageChannelYieldCount||0)+1;
+                } else if (source==='scheduler') {
+                  telemetry.schedulerYieldCount=(telemetry.schedulerYieldCount||0)+1;
                 } else {
                   telemetry.timerYieldCount=(telemetry.timerYieldCount||0)+1;
+                  if (source==='watchdog') {
+                    telemetry.watchdogYieldCount=(telemetry.watchdogYieldCount||0)+1;
+                  }
                 }
               }
               resume();
             };
             const postTask=() => {
               let scheduler=root.__gaiusFrameYieldScheduler;
-              if (!scheduler) {
-                scheduler={queue:[],channel:null};
-                if (typeof MessageChannel==='function') {
-                  const channel=new MessageChannel();
-                  channel.port1.onmessage=() => {
-                    const task=scheduler.queue.shift();
-                    if (task) task();
-                  };
-                  scheduler.channel=channel;
-                }
+              if (!scheduler || !(scheduler.tasks instanceof Map)) {
+                if (scheduler && scheduler.channel) retireMessageChannel(scheduler);
+                scheduler={tasks:new Map(),channel:null,nextTaskId:1};
                 root.__gaiusFrameYieldScheduler=scheduler;
               }
+              if (!scheduler.channel) {
+                if (typeof MessageChannel==='function') {
+                  try {
+                    const channel=new MessageChannel();
+                    channel.port1.onmessage=event => {
+                      const taskId=Number(event && event.data)||0;
+                      const task=scheduler.tasks.get(taskId);
+                      if (!task) return;
+                      scheduler.tasks.delete(taskId);
+                      task();
+                    };
+                    scheduler.channel=channel;
+                  } catch (ignored) {
+                    if (telemetryEnabled) {
+                      telemetry.messageChannelCreateFailureCount=
+                        (Number(telemetry.messageChannelCreateFailureCount)||0)+1;
+                    }
+                  }
+                }
+              }
               if (scheduler.channel) {
-                scheduler.queue.push(() => finish('message'));
-                scheduler.channel.port2.postMessage(0);
+                let taskId=(Number(scheduler.nextTaskId)||1)>>>0;
+                if (taskId===0) taskId=1;
+                scheduler.nextTaskId=(taskId+1)>>>0;
+                activeMessageScheduler=scheduler;
+                activeMessageTaskId=taskId;
+                scheduler.tasks.set(taskId,() => finish('message'));
+                try {
+                  scheduler.channel.port2.postMessage(taskId);
+                } catch (ignored) {
+                  detachMessageTask(false);
+                  retireMessageChannel(scheduler);
+                  if (telemetryEnabled) {
+                    telemetry.messageChannelPostFailureCount=
+                      (Number(telemetry.messageChannelPostFailureCount)||0)+1;
+                  }
+                  setTimeout(() => finish('timer'), 0);
+                }
               } else {
                 setTimeout(() => finish('timer'), 0);
               }
             };
+            const scheduleFairYield=() => {
+              if (telemetryEnabled) {
+                telemetry.fairYieldCount=(telemetry.fairYieldCount||0)+1;
+              }
+              const browserScheduler=root.scheduler;
+              if (browserScheduler && typeof browserScheduler.yield==='function') {
+                try {
+                  const result=browserScheduler.yield();
+                  if (result && typeof result.then==='function') {
+                    result.then(
+                      () => finish('scheduler'),
+                      () => setTimeout(() => finish('timer'), 0)
+                    );
+                    return;
+                  }
+                } catch (ignored) {}
+              }
+              setTimeout(() => finish('timer'), 0);
+            };
             if (hidden) {
               setTimeout(() => finish('timer'), 50);
-            } else if (typeof requestAnimationFrame==='function') {
-              watchdog=setTimeout(() => finish('timer'), 100);
+            } else if (synchronizedToDisplay && typeof requestAnimationFrame==='function') {
+              watchdog=setTimeout(() => finish('watchdog'), 100);
               requestAnimationFrame(() => {
                 if (resumed) return;
                 if (telemetryEnabled) {
@@ -575,19 +672,22 @@ public final class BrowserGlfw {
                 postTask();
               });
             } else {
-              postTask();
+              watchdog=setTimeout(() => finish('watchdog'), 100);
+              const sequence=(Number(root.__gaiusUncappedYieldSequence)||0)+1;
+              root.__gaiusUncappedYieldSequence=sequence;
+              if ((sequence & 31)===0) scheduleFairYield();
+              else postTask();
             }
             """)
-    private static native void scheduleFrameYield(boolean hidden, FrameYieldCallback resume);
+    private static native void scheduleFrameYield(boolean hidden, int interval, FrameYieldCallback resume);
 
     public static void swapBuffers(long window) {
         boolean hidden = swapBuffersJs();
-        // rAF follows the display refresh rate; the following task gives Chrome a
-        // paint boundary before the unlimited game loop resumes.
-        yieldAfterPresent(hidden);
+        yieldAfterPresent(hidden, swapInterval);
     }
 
     public static void swapInterval(int interval) {
+        swapInterval = interval;
     }
 
     public static int getError(PointerBuffer description) {
@@ -595,8 +695,15 @@ public final class BrowserGlfw {
     }
 
     public static GLFWErrorCallback setErrorCallback(GLFWErrorCallbackI callback) {
-        errorCallback = callback;
-        return null;
+        GLFWErrorCallback previous = errorCallback;
+        if (callback == null) {
+            errorCallback = null;
+        } else if (callback instanceof GLFWErrorCallback glfwCallback) {
+            errorCallback = glfwCallback;
+        } else {
+            errorCallback = GLFWErrorCallback.create(callback);
+        }
+        return previous;
     }
 
     public static GLFWMonitorCallback setMonitorCallback(GLFWMonitorCallbackI callback) {

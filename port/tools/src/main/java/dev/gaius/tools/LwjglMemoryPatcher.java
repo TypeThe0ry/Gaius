@@ -48,6 +48,8 @@ public final class LwjglMemoryPatcher {
         patchCallback(args[0], root.resolve("org/lwjgl/system/Callback.class"));
         patchCallbackInterface(args[0], root.resolve("org/lwjgl/system/CallbackI.class"));
         patchPlatform(args[0], root.resolve("org/lwjgl/system/Platform.class"));
+        patchPlatformArchitecture(
+                args[0], root.resolve("org/lwjgl/system/Platform$Architecture.class"));
         patchMemCopy(args[0], root.resolve("org/lwjgl/system/MultiReleaseMemCopy.class"));
     }
 
@@ -121,7 +123,8 @@ public final class LwjglMemoryPatcher {
                     && hasNioBufferArguments(method, 1)
                     && Type.getArgumentTypes(method.desc).length == 1
                     && Type.getReturnType(method.desc).getSort() == Type.LONG) {
-                replaceBufferAddress(method, "address");
+                replaceBufferAddress(
+                        method, method.name.equals("memAddressSafe") ? "addressSafe" : "address");
                 replaced++;
                 continue;
             }
@@ -540,6 +543,36 @@ public final class LwjglMemoryPatcher {
         }
         if (!replaced) {
             throw new IllegalStateException("Platform os.name lookup not found");
+        }
+        write(node, output);
+    }
+
+    private static void patchPlatformArchitecture(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "org/lwjgl/system/Platform$Architecture.class");
+        MethodNode initializer = node.methods.stream()
+                .filter(method -> method.name.equals("<clinit>"))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(
+                        "Platform.Architecture initializer not found"));
+        boolean replaced = false;
+        for (var instruction = initializer.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("java/lang/System")
+                    && call.name.equals("getProperty")
+                    && call.desc.equals("(Ljava/lang/String;)Ljava/lang/String;")) {
+                InsnList browserArchitecture = new InsnList();
+                browserArchitecture.add(new InsnNode(Opcodes.POP));
+                browserArchitecture.add(new LdcInsnNode("wasm64"));
+                initializer.instructions.insert(call, browserArchitecture);
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) {
+            throw new IllegalStateException("Platform.Architecture os.arch lookup not found");
         }
         write(node, output);
     }

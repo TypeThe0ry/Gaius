@@ -16,9 +16,15 @@ pom="$(
   "$root/port/scripts/generate-pom.sh"
 )"
 
+log="$root/port/target/platform-smoke-teavm.log"
 MAVEN_OPTS="${MAVEN_OPTS:--Xms512m -Xmx4g -XX:+UseG1GC}" \
   "$root/port/mvnw" \
   --batch-mode \
   --errors \
   --file "$pom" \
-  package
+  package 2>&1 | tee "$log"
+
+if grep -Fq 'Error in @JSBody' "$log"; then
+  echo "Platform smoke rejected TeaVM @JSBody errors" >&2
+  exit 1
+fi

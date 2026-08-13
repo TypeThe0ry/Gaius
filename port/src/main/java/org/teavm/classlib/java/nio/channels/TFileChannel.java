@@ -27,14 +27,23 @@ public class TFileChannel implements TSeekableByteChannel {
     private final String path;
     private final boolean readable;
     private final boolean writable;
+    private final boolean materializedRetained;
     private boolean open = true;
     private boolean dirty;
 
-    private TFileChannel(String path, VirtualFileAccessor accessor, boolean readable, boolean writable) {
+    private TFileChannel(
+            String path,
+            VirtualFileAccessor accessor,
+            boolean readable,
+            boolean writable,
+            boolean materializedRetained,
+            boolean dirty) {
         this.path = path;
         this.accessor = accessor;
         this.readable = readable;
         this.writable = writable;
+        this.materializedRetained = materializedRetained;
+        this.dirty = dirty;
     }
 
     public static TFileChannel open(TPath path, TOpenOption... options) throws IOException {
@@ -66,8 +75,10 @@ public class TFileChannel implements TSeekableByteChannel {
             }
             file.createNewFile();
         }
+        String absolutePath = file.getAbsolutePath();
+        BrowserFilePersistence.materializeForOpen(absolutePath);
         VirtualFile virtualFile =
-                VirtualFileSystemProvider.getInstance().getFile(file.getAbsolutePath());
+                VirtualFileSystemProvider.getInstance().getFile(absolutePath);
         if (virtualFile == null || !virtualFile.isFile()) {
             throw new java.io.FileNotFoundException(path.toString());
         }
@@ -75,13 +86,29 @@ public class TFileChannel implements TSeekableByteChannel {
         if (accessor == null) {
             throw new java.io.FileNotFoundException(path.toString());
         }
-        if (truncate && write && !append) {
-            accessor.resize(0);
+        boolean retained = false;
+        boolean changed = truncate && write && !append;
+        try {
+            if (changed) {
+                accessor.resize(0);
+            }
+            if (append) {
+                accessor.seek(accessor.size());
+            }
+            retained = BrowserFilePersistence.retainMaterializedChunkFile(absolutePath);
+            return new TFileChannel(
+                    absolutePath, accessor, read, write, retained, changed);
+        } catch (IOException | RuntimeException | Error failure) {
+            try {
+                accessor.close();
+            } catch (IOException closeFailure) {
+                failure.addSuppressed(closeFailure);
+            }
+            if (retained) {
+                BrowserFilePersistence.releaseMaterializedChunkFile(absolutePath, !changed);
+            }
+            throw failure;
         }
-        if (append) {
-            accessor.seek(accessor.size());
-        }
-        return new TFileChannel(file.getAbsolutePath(), accessor, read, write);
     }
 
     @Override
@@ -271,11 +298,33 @@ public class TFileChannel implements TSeekableByteChannel {
 
     @Override
     public void close() throws IOException {
-        if (open) {
+        if (!open) {
+            return;
+        }
+        IOException failure = null;
+        try {
             accessor.flush();
             persistIfDirty();
+        } catch (IOException exception) {
+            failure = exception;
+        }
+        try {
             accessor.close();
+        } catch (IOException exception) {
+            if (failure == null) {
+                failure = exception;
+            } else {
+                failure.addSuppressed(exception);
+            }
+        } finally {
             open = false;
+            if (materializedRetained) {
+                BrowserFilePersistence.releaseMaterializedChunkFile(
+                        path, failure == null && !dirty);
+            }
+        }
+        if (failure != null) {
+            throw failure;
         }
     }
 
@@ -299,7 +348,9 @@ public class TFileChannel implements TSeekableByteChannel {
         if (offset < size) {
             bytes = Arrays.copyOf(bytes, offset);
         }
-        BrowserFilePersistence.persist(path, bytes);
+        if (!BrowserFilePersistence.persist(path, bytes)) {
+            throw new IOException("Could not persist browser file " + path);
+        }
         dirty = false;
     }
 

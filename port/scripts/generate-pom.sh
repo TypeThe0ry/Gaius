@@ -122,6 +122,8 @@ mkdir -p "$(dirname "$output")" "$root/port/src/main/java" \
       <groupId>org.teavm</groupId>
       <artifactId>teavm-core</artifactId>
       <version>\${teavm.version}</version>
+      <scope>system</scope>
+      <systemPath>$maven_teavm_core_patch</systemPath>
     </dependency>
     <dependency>
       <groupId>org.teavm</groupId>

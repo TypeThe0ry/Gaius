@@ -34,6 +34,9 @@ import org.lwjgl.system.MemoryUtil;
 
 /** WebGL2 implementation used by patched LWJGL OpenGL entry points. */
 public final class BrowserOpenGL {
+    private static final int MAP_WRITE_BIT = 0x0002;
+    private static final int MAP_FLUSH_EXPLICIT_BIT = 0x0010;
+    private static final int PIXEL_UNPACK_BUFFER = 0x88EC;
     private static GLCapabilities capabilities;
     private static final Map<Integer, MappedBuffer> MAPPED_BUFFERS = new HashMap<>();
     private static final ThreadLocal<UniformScratch> UNIFORM_SCRATCH =
@@ -82,6 +85,7 @@ public final class BrowserOpenGL {
                 currentProgram:0,programAttribs:new Map(),programVersion:0,drawProgramGeneration:1,
                 currentVaoId:0,vaoEmu:new Map(),alignedAttribCache:new Map(),shiftedIndexCache:new Map(),
                 alignedAttribCacheKeys:new Map(),shiftedIndexCacheKeys:new Map(),
+                alignedAttribCacheTotalBytes:0,alignedAttribCachePeakBytes:0,
                 shiftedIndexCacheTotalBytes:0,shiftedIndexCachePeakBytes:0,
                 shiftedIndexCreatedThisFrame:0,shiftedIndexCreatedFrameHighWater:0};
               window.__gaiusGL.registerBufferCacheKey=function(index,buffer,key) {
@@ -119,15 +123,99 @@ public final class BrowserOpenGL {
                 stats.baseVertexIndexPeakBytes=this.shiftedIndexCachePeakBytes;
                 stats.baseVertexIndexBudgetBytes=this.maxShiftedIndexCacheBytes();
               };
+              window.__gaiusGL.updateAlignedAttribTelemetry=function() {
+                const live=Math.max(0,Number(this.alignedAttribCacheTotalBytes)||0);
+                this.alignedAttribCacheTotalBytes=live;
+                this.alignedAttribCachePeakBytes=Math.max(
+                  Number(this.alignedAttribCachePeakBytes)||0,live);
+                const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+                stats.alignedAttribLiveBytes=live;
+                stats.alignedAttribPeakBytes=this.alignedAttribCachePeakBytes;
+                stats.alignedAttribBudgetBytes=this.maxAlignedAttribCacheBytes();
+              };
+              window.__gaiusGL.trackAlignedAttribEntryVao=function(entry,vao) {
+                if (!entry || !vao) return;
+                const byLocation=vao.alignedAttribByLocation
+                  || (vao.alignedAttribByLocation=new Map());
+                const replaced=new Set();
+                const layouts=entry.layouts || [];
+                for (let i=0;i<layouts.length;i++) {
+                  const location=layouts[i].index|0;
+                  const previous=byLocation.get(location);
+                  if (previous && previous!==entry) replaced.add(previous);
+                  byLocation.set(location,entry);
+                }
+                const refs=entry.vaoRefs || (entry.vaoRefs=new Set());
+                refs.add(vao);
+                const entries=vao.alignedAttribEntries || (vao.alignedAttribEntries=new Set());
+                entries.add(entry);
+                replaced.forEach(function(previous) {
+                  let retained=false;
+                  byLocation.forEach(function(candidate) {
+                    if (candidate===previous) retained=true;
+                  });
+                  if (retained) return;
+                  entries.delete(previous);
+                  if (previous.vaoRefs) previous.vaoRefs.delete(vao);
+                });
+              };
+              window.__gaiusGL.releaseVaoAlignedAttribRefs=function(vao) {
+                if (!vao) return;
+                const entries=vao.alignedAttribEntries;
+                if (entries && entries.size) {
+                  entries.forEach(function(entry) {
+                    if (entry && entry.vaoRefs) entry.vaoRefs.delete(vao);
+                  });
+                  entries.clear();
+                }
+                if (vao.alignedAttribByLocation) vao.alignedAttribByLocation.clear();
+              };
+              window.__gaiusGL.detachAlignedAttribEntry=function(entry) {
+                if (!entry || !entry.vaoRefs) return;
+                entry.vaoRefs.forEach(function(vao) {
+                  if (!vao) return;
+                  if (vao.alignedAttribEntries) vao.alignedAttribEntries.delete(entry);
+                  if (vao.alignedAttribByLocation) {
+                    const stale=[];
+                    vao.alignedAttribByLocation.forEach(function(candidate,location) {
+                      if (candidate===entry) stale.push(location);
+                    });
+                    for (let i=0;i<stale.length;i++) {
+                      vao.alignedAttribByLocation.delete(stale[i]);
+                    }
+                  }
+                  vao.alignedAttribVersion=-1;
+                  vao.alignedAttribProgram=-1;
+                  vao.alignedAttribGlobalVersion=-1;
+                  vao.alignedAttribInvalidated=true;
+                  vao.drawReadyGeneration=-1;
+                });
+                entry.vaoRefs.clear();
+              };
               window.__gaiusGL.trackShiftedIndexEntryVao=function(entry,vao) {
                 if (!entry || !vao) return;
                 const refs=entry.vaoRefs || (entry.vaoRefs=new Set());
                 refs.add(vao);
+                const entries=vao.shiftedIndexEntries || (vao.shiftedIndexEntries=new Set());
+                entries.add(entry);
+              };
+              window.__gaiusGL.releaseVaoShiftedIndexRefs=function(vao) {
+                if (!vao) return;
+                const entries=vao.shiftedIndexEntries;
+                if (entries && entries.size) {
+                  entries.forEach(function(entry) {
+                    if (entry && entry.vaoRefs) entry.vaoRefs.delete(vao);
+                  });
+                  entries.clear();
+                }
+                vao.shiftedIndexLast=null;
+                if (vao.shiftedIndexFastCache) vao.shiftedIndexFastCache.clear();
               };
               window.__gaiusGL.detachShiftedIndexEntry=function(entry) {
                 if (!entry || !entry.vaoRefs) return;
                 entry.vaoRefs.forEach(function(vao) {
                   if (!vao) return;
+                  if (vao.shiftedIndexEntries) vao.shiftedIndexEntries.delete(entry);
                   if (vao.shiftedIndexLast===entry) vao.shiftedIndexLast=null;
                   const fast=vao.shiftedIndexFastCache;
                   if (!fast || !fast.size) return;
@@ -162,17 +250,55 @@ public final class BrowserOpenGL {
                 }
                 return bytes;
               };
+              window.__gaiusGL.deleteAlignedAttribEntry=function(key,evicted) {
+                const entry=this.alignedAttribCache.get(key);
+                if (!entry) return 0;
+                entry.deleted=true;
+                this.detachAlignedAttribEntry(entry);
+                if (entry.buffer) {
+                  try { window.__gaiusWebGL.deleteBuffer(entry.buffer); } catch (ignored) {}
+                }
+                this.alignedAttribCache.delete(key);
+                this.forgetBufferCacheKey(
+                  this.alignedAttribCacheKeys,entry.source|0,key);
+                const bytes=Math.max(0,Number(entry.bytes)||0);
+                this.alignedAttribCacheTotalBytes=Math.max(
+                  0,(Number(this.alignedAttribCacheTotalBytes)||0)-bytes);
+                this.updateAlignedAttribTelemetry();
+                if (evicted) {
+                  const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+                  stats.alignedAttribEvictions=(stats.alignedAttribEvictions||0)+1;
+                  stats.alignedAttribEvictedBytes=(stats.alignedAttribEvictedBytes||0)+bytes;
+                }
+                return bytes;
+              };
+              window.__gaiusGL.touchAlignedAttribEntry=function(entry) {
+                if (!entry || !entry.cacheKey) return;
+                const key=entry.cacheKey;
+                if (this.alignedAttribCache.get(key)!==entry) return;
+                this.alignedAttribCache.delete(key);
+                this.alignedAttribCache.set(key,entry);
+              };
+              window.__gaiusGL.trimAlignedAttribCache=function(incomingBytes) {
+                const incoming=Math.max(0,Number(incomingBytes)||0);
+                const limit=this.maxAlignedAttribCacheBytes();
+                if (incoming>limit) return false;
+                while ((Number(this.alignedAttribCacheTotalBytes)||0)+incoming>limit
+                    && this.alignedAttribCache.size) {
+                  const oldestKey=this.alignedAttribCache.keys().next().value;
+                  this.deleteAlignedAttribEntry(oldestKey,true);
+                }
+                this.updateAlignedAttribTelemetry();
+                return (Number(this.alignedAttribCacheTotalBytes)||0)+incoming<=limit;
+              };
               window.__gaiusGL.dropBufferDerivedCaches=function(buffer) {
                 const id=buffer|0;
                 let keys=this.alignedAttribCacheKeys.get(id);
                 if (keys) {
-                  keys.forEach(function(key) {
-                    const entry=this.alignedAttribCache.get(key);
-                    if (entry && entry.buffer) {
-                      try { window.__gaiusWebGL.deleteBuffer(entry.buffer); } catch (ignored) {}
-                    }
-                    this.alignedAttribCache.delete(key);
-                  },this);
+                  const alignedKeys=Array.from(keys);
+                  for (let i=0;i<alignedKeys.length;i++) {
+                    this.deleteAlignedAttribEntry(alignedKeys[i],false);
+                  }
                   this.alignedAttribCacheKeys.delete(id);
                 }
                 keys=this.shiftedIndexCacheKeys.get(id);
@@ -218,7 +344,11 @@ public final class BrowserOpenGL {
                   directAttribDirty:false,
                   drawReadyGeneration:-1,
                   programAttribCache:new Map(),
-                  shiftedIndexFastCache:new Map()
+                  alignedAttribEntries:new Set(),
+                  alignedAttribByLocation:new Map(),
+                  alignedAttribInvalidated:false,
+                  shiftedIndexFastCache:new Map(),
+                  shiftedIndexEntries:new Set()
                 };
               };
               window.__gaiusGL.bumpDrawProgramGeneration=function() {
@@ -677,6 +807,14 @@ public final class BrowserOpenGL {
                 if (Number.isFinite(configured) && configured >= 0) return Math.floor(configured);
                 return fallback;
               };
+              window.__gaiusGL.maxAlignedAttribCacheBytes=function() {
+                const fallback=32 * 1024 * 1024;
+                const preferred=Number(window.__gaiusAlignedAttribDerivedBufferBudgetBytes);
+                if (Number.isFinite(preferred) && preferred >= 0) return Math.floor(preferred);
+                const configured=Number(window.__gaiusDerivedAttribBufferBudgetBytes);
+                if (Number.isFinite(configured) && configured >= 0) return Math.floor(configured);
+                return fallback;
+              };
               window.__gaiusGL.deleteBufferShadow=function(buffer) {
                 if (!buffer) return 0;
                 const existing=this.bufferBytes.get(buffer);
@@ -1028,13 +1166,16 @@ public final class BrowserOpenGL {
                   var stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
                   stats.activeAttribLazyRefresh=(stats.activeAttribLazyRefresh||0)+1;
                 }
-                const active=new Set();
-                if (!attribs || !attribs.length) return active;
-                for (var i=0;i<attribs.length;i++) {
-                  const location=attribs[i] && (attribs[i].location|0);
-                  if (location >= 0) active.add(location|0);
+                if (!attribs) return null;
+                if (!attribs.byLocation) {
+                  attribs.byLocation=new Map();
+                  for (var i=0;i<attribs.length;i++) {
+                    const entry=attribs[i];
+                    const location=entry && (entry.location|0);
+                    if (location >= 0) attribs.byLocation.set(location|0,entry);
+                  }
                 }
-                return active;
+                return attribs.byLocation;
               };
               window.__gaiusGL.attribIsActive=function(active, index) {
                 return !active || active.has(index|0);
@@ -1135,6 +1276,7 @@ public final class BrowserOpenGL {
                   stats.alignedAttribFastSkips=(stats.alignedAttribFastSkips||0)+1;
                   return 0;
                 }
+                vao.alignedAttribInvalidated=false;
                 var groups=new Map();
                 vao.misalignedAttribs.forEach(function(attrib) {
                   var index=attrib|0;
@@ -1197,6 +1339,7 @@ public final class BrowserOpenGL {
                   var bufferVersion=this.bufferVersions.get(sourceBuffer|0)||0;
                   var key=(sourceBuffer|0)+':'+bufferVersion+':'+vertexCount+':'+layoutKey;
                   var entry=this.alignedAttribCache.get(key);
+                  if (entry) this.touchAlignedAttribEntry(entry);
                   if (!entry) {
                     var cursor=0;
                     var layouts=[];
@@ -1259,9 +1402,34 @@ public final class BrowserOpenGL {
                       }
                       stats.alignedAttribJsFallback=(stats.alignedAttribJsFallback||0)+1;
                     }
-                    var buffer=gl.createBuffer();
-                    gl.bindBuffer(gl.ARRAY_BUFFER,buffer);
-                    gl.bufferData(gl.ARRAY_BUFFER,repacked,gl.STATIC_DRAW);
+                    var repackedBytes=Math.max(0,Number(repacked.byteLength)||0);
+                    if (!this.trimAlignedAttribCache(repackedBytes)) {
+                      stats.alignedAttribBudgetFallbacks=(stats.alignedAttribBudgetFallbacks||0)+1;
+                      for (var abi=0;abi<pointers.length;abi++) {
+                        vao.missingEnabledAttribs.add(pointers[abi].index|0);
+                      }
+                      complete=false;
+                      return;
+                    }
+                    var buffer=null;
+                    try {
+                      buffer=gl.createBuffer();
+                      if (!buffer) throw new Error('createBuffer returned null');
+                      gl.bindBuffer(gl.ARRAY_BUFFER,buffer);
+                      gl.bufferData(gl.ARRAY_BUFFER,repacked,gl.STATIC_DRAW);
+                    } catch (error) {
+                      if (buffer) {
+                        try { gl.deleteBuffer(buffer); } catch (ignored) {}
+                      }
+                      stats.alignedAttribUploadFailures=(stats.alignedAttribUploadFailures||0)+1;
+                      stats.alignedAttribUploadFailureReason=String(
+                        error && (error.message||error.name)||error);
+                      for (var afi=0;afi<pointers.length;afi++) {
+                        vao.missingEnabledAttribs.add(pointers[afi].index|0);
+                      }
+                      complete=false;
+                      return;
+                    }
                     var entryLayouts=[];
                     for (var entryLayoutIndex=0; entryLayoutIndex<layouts.length; entryLayoutIndex++) {
                       var entryLayout=layouts[entryLayoutIndex];
@@ -1274,12 +1442,18 @@ public final class BrowserOpenGL {
                         offset:entryLayout.offset|0
                       });
                     }
-                    entry={buffer:buffer,stride:alignedStride,layouts:entryLayouts};
+                    entry={buffer:buffer,stride:alignedStride,layouts:entryLayouts,
+                      bytes:repackedBytes,source:sourceBuffer|0,cacheKey:key,
+                      deleted:false,vaoRefs:new Set()};
                     this.alignedAttribCache.set(key,entry);
                     this.registerBufferCacheKey(this.alignedAttribCacheKeys,sourceBuffer|0,key);
+                    this.alignedAttribCacheTotalBytes=
+                      (Number(this.alignedAttribCacheTotalBytes)||0)+repackedBytes;
+                    this.updateAlignedAttribTelemetry();
                     stats.alignedAttribBuffers=(stats.alignedAttribBuffers||0)+1;
-                    stats.alignedAttribBytes=(stats.alignedAttribBytes||0)+repacked.byteLength;
+                    stats.alignedAttribBytes=(stats.alignedAttribBytes||0)+repackedBytes;
                   }
+                  this.trackAlignedAttribEntryVao(entry,vao);
                   gl.bindBuffer(gl.ARRAY_BUFFER,entry.buffer);
                   for (var bindLayoutIndex=0; bindLayoutIndex<entry.layouts.length; bindLayoutIndex++) {
                     var bindLayout=entry.layouts[bindLayoutIndex];
@@ -1304,7 +1478,7 @@ public final class BrowserOpenGL {
                   stats.alignedAttribDraws=(stats.alignedAttribDraws||0)+1;
                   stats.alignedAttribPointers=(stats.alignedAttribPointers||0)+aligned;
                 }
-                if (complete) {
+                if (complete && !vao.alignedAttribInvalidated) {
                   vao.alignedAttribVersion=version;
                   vao.alignedAttribProgram=program;
                   vao.alignedAttribGlobalVersion=globalVersion;
@@ -1759,9 +1933,27 @@ public final class BrowserOpenGL {
                     (stats.baseVertexIndexBudgetFallbacks||0)+1;
                   return null;
                 }
-                const buffer=gl.createBuffer();
-                this.bindPhysicalElementBuffer(vao,buffer);
-                gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,output,gl.STATIC_DRAW);
+                let buffer=null;
+                const previousPhysicalElement=vao.actualElementArrayBuffer || null;
+                try {
+                  buffer=gl.createBuffer();
+                  if (!buffer) throw new Error('createBuffer returned null');
+                  this.bindPhysicalElementBuffer(vao,buffer);
+                  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,output,gl.STATIC_DRAW);
+                } catch (error) {
+                  this.bindPhysicalElementBuffer(vao,previousPhysicalElement);
+                  if (buffer) {
+                    this.forgetPhysicalElementBuffer(buffer);
+                    try { gl.deleteBuffer(buffer); } catch (ignored) {}
+                  }
+                  if (stats) {
+                    stats.baseVertexIndexUploadFailures=
+                      (stats.baseVertexIndexUploadFailures||0)+1;
+                    stats.baseVertexIndexUploadFailureReason=String(
+                      error && (error.message||error.name)||error);
+                  }
+                  return null;
+                }
                 entry={buffer:buffer,type:outputType,count:length,bytes:output.byteLength,
                   min:minIndex,max:maxIndex,element:elementBuffer,version:version,inputType:type|0,
                   offset:start,inputCount:length,base:base,deleted:false,cacheKey:key};
@@ -1999,6 +2191,7 @@ public final class BrowserOpenGL {
             stats.hotPathTelemetryEnabled=state.hotPathTelemetryEnabled;
             state.updateBufferShadowTelemetry();
             state.updateShiftedIndexTelemetry();
+            state.updateAlignedAttribTelemetry();
             """)
     private static native void initializePerformanceStateJs();
 
@@ -3003,6 +3196,37 @@ public final class BrowserOpenGL {
             """)
     public static native void colorMask(boolean red, boolean green, boolean blue, boolean alpha);
 
+    @JSBody(params = {"index", "red", "green", "blue", "alpha"}, script = """
+            const gl=window.__gaiusWebGL,state=window.__gaiusGL,drawBuffer=index|0;
+            const bits=(red?1:0)|(green?2:0)|(blue?4:0)|(alpha?8:0);
+            if (drawBuffer===0 && state) {
+              state.colorMaskBits=bits;
+              state.colorMask=[!!red,!!green,!!blue,!!alpha];
+            }
+            const defaultFramebuffer=!!(state && (state.framebufferBindings.draw|0)===0);
+            if (drawBuffer===0 && defaultFramebuffer) {
+              gl.colorMask(red,green,blue,alpha);
+              return;
+            }
+            let extension=state ? state.drawBuffersIndexedExtension : undefined;
+            if (extension===undefined) {
+              extension=gl.getExtension('OES_draw_buffers_indexed') || null;
+              if (state) state.drawBuffersIndexedExtension=extension;
+            }
+            if (extension && typeof extension.colorMaskiOES==='function') {
+              extension.colorMaskiOES(drawBuffer,red,green,blue,alpha);
+              return;
+            }
+            if (drawBuffer===0) {
+              gl.colorMask(red,green,blue,alpha);
+              return;
+            }
+            const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+            stats.indexedColorMaskUnsupported=(stats.indexedColorMaskUnsupported||0)+1;
+            """)
+    public static native void colorMaski(
+            int index, boolean red, boolean green, boolean blue, boolean alpha);
+
     @JSBody(params = {"func"}, script = """
             const state=window.__gaiusGL,next=func|0;
             if (state && (state.depthFuncValue|0)===next) return;
@@ -3024,6 +3248,19 @@ public final class BrowserOpenGL {
             """)
     public static native void drawArrays(int mode, int first, int count);
 
+    public static void multiDrawArrays(int mode, long firsts, long counts, int drawCount) {
+        if (drawCount < 0 || firsts == 0L || counts == 0L) {
+            throw new IllegalArgumentException("Invalid WebGL multi-draw arrays arguments");
+        }
+        for (int index = 0; index < drawCount; index++) {
+            drawArrays(
+                    mode,
+                    MemoryUtil.memGetInt(firsts + (long) index * Integer.BYTES),
+                    MemoryUtil.memGetInt(counts + (long) index * Integer.BYTES));
+        }
+        noteMultiDrawFallbackJs(drawCount, false);
+    }
+
     public static void drawBuffers(IntBuffer buffers) {
         drawBuffersJs(ints(buffers));
     }
@@ -3038,14 +3275,34 @@ public final class BrowserOpenGL {
         drawBuffersJs(Int32Array.fromJavaArray(values));
     }
 
+    public static void drawBuffer(int buffer) {
+        drawBuffers(buffer);
+    }
+
     public static void drawBuffers(int count, long address) {
         drawBuffersJs(pointerInts(address, count));
     }
 
     @JSBody(params = {"buffers"}, script = """
+            const state=window.__gaiusGL;
+            if (state) {
+              state.lastDrawBuffers=Array.from(buffers || []);
+              state.drawBuffersCalls=(state.drawBuffersCalls||0)+1;
+            }
             window.__gaiusWebGL.drawBuffers(buffers);
             """)
     private static native void drawBuffersJs(Int32Array buffers);
+
+    @JSBody(
+            params = {"x", "y", "width", "height", "format", "type", "offset"},
+            script = """
+                    const gl=window.__gaiusWebGL;
+                    gl.readPixels(x,y,width,height,format,type,Number(offset));
+                    const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+                    stats.readPixelsCalls=(stats.readPixelsCalls||0)+1;
+                    """)
+    public static native void readPixels(
+            int x, int y, int width, int height, int format, int type, long offset);
 
     @JSBody(params = {"mode", "count", "type", "offset"}, script = """
             window.__gaiusGL.executeDraw(1,mode,count,type,offset,0,0);
@@ -3055,6 +3312,38 @@ public final class BrowserOpenGL {
     public static void drawElements(int mode, int count, int type, long offset) {
         drawElementsJs(mode, count, type, (int) offset);
     }
+
+    public static void multiDrawElementsBaseVertex(
+            int mode,
+            long counts,
+            int type,
+            long offsets,
+            int drawCount,
+            long baseVertices) {
+        if (drawCount < 0 || counts == 0L || offsets == 0L || baseVertices == 0L) {
+            throw new IllegalArgumentException("Invalid WebGL indexed multi-draw arguments");
+        }
+        for (int index = 0; index < drawCount; index++) {
+            drawElementsBaseVertex(
+                    mode,
+                    MemoryUtil.memGetInt(counts + (long) index * Integer.BYTES),
+                    type,
+                    MemoryUtil.memGetAddress(
+                            offsets + (long) index * org.lwjgl.system.Pointer.POINTER_SIZE),
+                    MemoryUtil.memGetInt(baseVertices + (long) index * Integer.BYTES));
+        }
+        noteMultiDrawFallbackJs(drawCount, true);
+    }
+
+    @JSBody(params = {"drawCount", "indexed"}, script = """
+            const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+            stats.multiDrawFallbackCalls=(stats.multiDrawFallbackCalls||0)+1;
+            stats.multiDrawFallbackDraws=(stats.multiDrawFallbackDraws||0)+(drawCount|0);
+            if (indexed) {
+              stats.multiDrawIndexedFallbackCalls=(stats.multiDrawIndexedFallbackCalls||0)+1;
+            }
+            """)
+    private static native void noteMultiDrawFallbackJs(int drawCount, boolean indexed);
 
     @JSBody(script = """
             if (window.__gaiusReadWebGLErrors===undefined) {
@@ -3398,9 +3687,42 @@ public final class BrowserOpenGL {
     public static void texSubImage2D(
             int target, int level, int x, int y, int width, int height,
             int format, int type, long pixels) {
+        if (boundBufferForTargetJs(PIXEL_UNPACK_BUFFER) != 0) {
+            if (pixels < 0 || pixels > Integer.MAX_VALUE) {
+                throw new IllegalArgumentException("WebGL pixel unpack buffer offset is out of range: " + pixels);
+            }
+            texSubImage2DOffsetJs(
+                    target, level, x, y, width, height, format, type, (int) pixels);
+            return;
+        }
         texSubImage2DJs(target, level, x, y, width, height, format, type,
                 pointerBytes(pixels, textureUploadLength(width, height, format, type)));
     }
+
+    @JSBody(params = {
+            "target", "level", "x", "y", "width", "height", "format", "type", "offset"
+    }, script = """
+            if (format === 0x1903 && type === 0x1400) {
+              format = 0x8D94;
+            }
+            const gl=window.__gaiusWebGL;
+            try {
+              gl.texSubImage2D(target,level,x,y,width,height,format,type,offset);
+              if (window.__gaiusGL && window.__gaiusGL.recordTextureUpload) {
+                window.__gaiusGL.recordTextureUpload(
+                  'texSubImage2D-pbo',target,level,x,y,width,height,0,format,type,offset);
+              }
+            } catch (error) {
+              if (window.__gaiusGL && window.__gaiusGL.recordTextureError) {
+                window.__gaiusGL.recordTextureError(
+                  'texSubImage2D-pbo',target,level,width,height,format,type,offset,error);
+              }
+              throw error;
+            }
+            """)
+    private static native void texSubImage2DOffsetJs(
+            int target, int level, int x, int y, int width, int height,
+            int format, int type, int offset);
 
     @JSBody(params = {
             "target", "level", "x", "y", "width", "height", "format", "type", "pixels"
@@ -3722,9 +4044,7 @@ public final class BrowserOpenGL {
     private static native void namedBufferSubDataJs(int buffer, int offset, Int8Array data);
 
     public static ByteBuffer mapBufferRange(int target, long offset, long length, int access) {
-        if (length < 0L || length > Integer.MAX_VALUE) {
-            throw new IllegalArgumentException("Unsupported WebGL mapped buffer length: " + length);
-        }
+        checkMappedRange(offset, length);
         int logicalBuffer = boundBufferForTargetJs(target);
         if (logicalBuffer == 0) {
             throw new IllegalStateException("Cannot map an unbound WebGL buffer target: " + target);
@@ -3734,9 +4054,13 @@ public final class BrowserOpenGL {
         }
         ensureBufferNotMapped(logicalBuffer);
         ByteBuffer buffer = MemoryUtil.memAlloc((int) length).order(ByteOrder.nativeOrder());
-        MAPPED_BUFFERS.put(target, new MappedBuffer(logicalBuffer, offset, buffer));
+        MAPPED_BUFFERS.put(target, new MappedBuffer(logicalBuffer, offset, access, buffer));
         noteMappedBufferCountJs(MAPPED_BUFFERS.size());
         return buffer;
+    }
+
+    public static long mapBufferRangeAddress(int target, long offset, long length, int access) {
+        return MemoryUtil.memAddress(mapBufferRange(target, offset, length, access));
     }
 
     public static boolean unmapBuffer(int target) {
@@ -3745,7 +4069,9 @@ public final class BrowserOpenGL {
             return true;
         }
         try {
-            bufferSubDataJs(target, (int) mapped.offset, allBytes(mapped.buffer));
+            if (mapped.uploadOnUnmap()) {
+                bufferSubDataJs(target, (int) mapped.offset, allBytes(mapped.buffer));
+            }
         } finally {
             MemoryUtil.memFree(mapped.buffer);
             noteMappedBufferCountJs(MAPPED_BUFFERS.size());
@@ -3758,20 +4084,19 @@ public final class BrowserOpenGL {
         if (mapped == null || length <= 0L) {
             return;
         }
-        long absoluteOffset = mapped.offset + offset;
-        bufferSubDataJs(target, (int) absoluteOffset, bytesSlice(mapped.buffer, offset, length));
+        int absoluteOffset = absoluteMappedOffset(mapped, offset, length);
+        bufferSubDataJs(target, absoluteOffset, bytesSlice(mapped.buffer, offset, length));
     }
 
     public static ByteBuffer mapNamedBufferRange(int buffer, long offset, long length, int access) {
-        if (length < 0L || length > Integer.MAX_VALUE) {
-            throw new IllegalArgumentException("Unsupported WebGL mapped buffer length: " + length);
-        }
+        checkMappedRange(offset, length);
         if (buffer == 0) {
             throw new IllegalStateException("Cannot map WebGL buffer 0");
         }
         ensureBufferNotMapped(buffer);
         ByteBuffer byteBuffer = MemoryUtil.memAlloc((int) length).order(ByteOrder.nativeOrder());
-        MAPPED_BUFFERS.put(namedBufferKey(buffer), new MappedBuffer(buffer, offset, byteBuffer));
+        MAPPED_BUFFERS.put(
+                namedBufferKey(buffer), new MappedBuffer(buffer, offset, access, byteBuffer));
         noteMappedBufferCountJs(MAPPED_BUFFERS.size());
         return byteBuffer;
     }
@@ -3782,7 +4107,9 @@ public final class BrowserOpenGL {
             return true;
         }
         try {
-            namedBufferSubDataJs(buffer, (int) mapped.offset, allBytes(mapped.buffer));
+            if (mapped.uploadOnUnmap()) {
+                namedBufferSubDataJs(buffer, (int) mapped.offset, allBytes(mapped.buffer));
+            }
         } finally {
             MemoryUtil.memFree(mapped.buffer);
             noteMappedBufferCountJs(MAPPED_BUFFERS.size());
@@ -3795,12 +4122,36 @@ public final class BrowserOpenGL {
         if (mapped == null || length <= 0L) {
             return;
         }
-        long absoluteOffset = mapped.offset + offset;
-        namedBufferSubDataJs(buffer, (int) absoluteOffset, bytesSlice(mapped.buffer, offset, length));
+        int absoluteOffset = absoluteMappedOffset(mapped, offset, length);
+        namedBufferSubDataJs(buffer, absoluteOffset, bytesSlice(mapped.buffer, offset, length));
     }
 
     private static int namedBufferKey(int buffer) {
         return 0x40000000 | buffer;
+    }
+
+    private static void checkMappedRange(long offset, long length) {
+        if (offset < 0L || length < 0L || length > Integer.MAX_VALUE
+                || offset > Integer.MAX_VALUE - length) {
+            throw new IllegalArgumentException(
+                    "Unsupported WebGL mapped buffer range: " + offset + " + " + length);
+        }
+    }
+
+    private static int absoluteMappedOffset(MappedBuffer mapped, long relativeOffset, long length) {
+        if (relativeOffset < 0L || length < 0L
+                || relativeOffset > mapped.buffer.capacity() - length) {
+            throw new IllegalArgumentException(
+                    "Unsupported WebGL mapped buffer flush range: "
+                            + relativeOffset + " + " + length);
+        }
+        long absoluteOffset = mapped.offset + relativeOffset;
+        if (absoluteOffset < 0L || absoluteOffset > Integer.MAX_VALUE - length) {
+            throw new IllegalArgumentException(
+                    "Unsupported WebGL mapped buffer absolute range: "
+                            + absoluteOffset + " + " + length);
+        }
+        return (int) absoluteOffset;
     }
 
     private static void ensureBufferNotMapped(int buffer) {
@@ -4789,6 +5140,8 @@ public final class BrowserOpenGL {
             state.releaseVaoMisalignedBuffers(vao);
             state.releaseVaoBufferRefs(vao);
             state.releaseVaoPhysicalElementBuffer(vao);
+            state.releaseVaoAlignedAttribRefs(vao);
+            state.releaseVaoShiftedIndexRefs(vao);
             state.vaoEmu.delete(array);
             if (state.currentVaoId===(array|0)) {
               state.currentVaoId=0;
@@ -6192,7 +6545,8 @@ public final class BrowserOpenGL {
     }
 
     private static Int8Array bytesSlice(ByteBuffer buffer, long offset, long length) {
-        if (offset < 0L || length < 0L || offset + length > buffer.capacity() || length > Integer.MAX_VALUE) {
+        if (offset < 0L || length < 0L || length > Integer.MAX_VALUE
+                || offset > buffer.capacity() - length) {
             throw new IllegalArgumentException(
                     "Unsupported WebGL mapped buffer flush range: " + offset + " + " + length);
         }
@@ -6316,7 +6670,10 @@ public final class BrowserOpenGL {
         };
     }
 
-    private record MappedBuffer(int logicalBuffer, long offset, ByteBuffer buffer) {
+    private record MappedBuffer(int logicalBuffer, long offset, int access, ByteBuffer buffer) {
+        private boolean uploadOnUnmap() {
+            return (access & MAP_WRITE_BIT) != 0 && (access & MAP_FLUSH_EXPLICIT_BIT) == 0;
+        }
     }
 
     private static final class UniformScratch {

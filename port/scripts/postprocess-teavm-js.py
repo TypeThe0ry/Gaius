@@ -48,7 +48,12 @@ INTEGRATED_SERVER_EXPORT_PATTERN = re.compile(
 )
 
 RUNTIME_THREAD_START_PATTERN = re.compile(
-    r"(?P<runtime>[A-Za-z_$][A-Za-z0-9_$]*)\.\$rt_startThread\s*="
+    r"(?P<call>[A-Za-z_$][A-Za-z0-9_$]*\.\$rt_startThread)\s*="
+)
+
+MINIFIED_RUNTIME_THREAD_START_PATTERN = re.compile(
+    r"(?P<call>[A-Za-z_$][A-Za-z0-9_$]*\.[A-Za-z_$][A-Za-z0-9_$]*)"
+    r"\(\(\)=>\{f\.call\(null,javaArgs\);\},callback\);"
 )
 
 
@@ -63,7 +68,7 @@ def patched_to_long(match: re.Match[str]) -> str:
     )
 
 
-def integrated_server_pump_shim(exports: str, runtime: str) -> str:
+def integrated_server_pump_shim(exports: str, runtime_start_call: str) -> str:
     return f"""
 {INTEGRATED_SERVER_PUMP_MARKER}
 let $gaiusIntegratedServerPumpRunning = false;
@@ -93,7 +98,7 @@ const $gaiusScheduleIntegratedServerPump = typeof queueMicrotask === 'function'
                 (stats.integratedServerPumpStarts || 0) + 1;
         }}
         try {{
-            {runtime}.$rt_startThread(
+            {runtime_start_call}(
                 () => {exports}.pumpIntegratedServerNetworkInput(),
                 result => {{
                     $gaiusIntegratedServerPumpRunning = false;
@@ -208,7 +213,13 @@ def main(argv: list[str]) -> int:
             f"Patched TeaVM JS finite-safe long conversion in {target} (1 occurrence)."
         )
 
-    worker_export = INTEGRATED_SERVER_EXPORT_PATTERN.search(patched)
+    worker_export = find_anchored(
+        INTEGRATED_SERVER_EXPORT_PATTERN,
+        patched,
+        ".pumpIntegratedServerNetworkInput=",
+        before=128,
+        after=256,
+    )
     if worker_export is not None:
         if INTEGRATED_SERVER_PUMP_MARKER in patched:
             messages.append(
@@ -216,6 +227,8 @@ def main(argv: list[str]) -> int:
             )
         else:
             runtime = RUNTIME_THREAD_START_PATTERN.search(patched)
+            if runtime is None:
+                runtime = MINIFIED_RUNTIME_THREAD_START_PATTERN.search(patched)
             if runtime is None:
                 print(
                     f"TeaVM native thread starter was not found in {target}; "
@@ -226,7 +239,7 @@ def main(argv: list[str]) -> int:
             insert_at = worker_export.end()
             shim = integrated_server_pump_shim(
                 worker_export.group("exports"),
-                runtime.group("runtime"),
+                runtime.group("call"),
             )
             patched = patched[:insert_at] + shim + patched[insert_at:]
             messages.append(f"Injected TeaVM server Worker coroutine input pump in {target}.")

@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import gzip
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -18,6 +19,15 @@ SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 if str(SCRIPT_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIRECTORY))
 import gaius_build_identity as build_identity
+
+COMPILER_PROFILE_PATH = SCRIPT_DIRECTORY / "teavm-compiler-profile.py"
+COMPILER_PROFILE_SPEC = importlib.util.spec_from_file_location(
+    "gaius_teavm_compiler_profile", COMPILER_PROFILE_PATH
+)
+if COMPILER_PROFILE_SPEC is None or COMPILER_PROFILE_SPEC.loader is None:
+    raise RuntimeError(f"could not load TeaVM compiler profile helper: {COMPILER_PROFILE_PATH}")
+compiler_profile = importlib.util.module_from_spec(COMPILER_PROFILE_SPEC)
+COMPILER_PROFILE_SPEC.loader.exec_module(compiler_profile)
 
 
 CHUNK_SIZE = 1_000_000
@@ -385,6 +395,39 @@ def verified_component_identity(
     }
 
 
+def verified_compiler_profile(
+    root: Path,
+    artifact: Path,
+    role: str,
+    pom: Path,
+    resources: list[Path],
+) -> dict[str, object]:
+    sidecar = compiler_profile.default_output(artifact)
+    expected = compiler_profile.create_record(
+        root,
+        role,
+        artifact,
+        pom,
+        resources,
+        True,
+    )
+    try:
+        actual = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"compiler profile is missing or invalid: {sidecar}") from exc
+    if actual != expected:
+        raise RuntimeError(f"compiler profile does not match current inputs: {sidecar}")
+    return {
+        "profileSha256": expected["profileSha256"],
+        "sidecarSha256": sha256_file(sidecar),
+        "sidecarBytes": sidecar.stat().st_size,
+        "optimizationLevel": expected["compiler"]["optimizationLevel"],
+        "minifying": expected["compiler"]["minifying"],
+        "shortFileNames": expected["compiler"]["shortFileNames"],
+        "assertionsRemoved": expected["compiler"]["assertionsRemoved"],
+    }
+
+
 def build(dist: Path, output: Path, root: Path | None = None) -> None:
     root = (root or Path(__file__).resolve().parents[2]).resolve()
     dist = dist.resolve()
@@ -434,6 +477,43 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
             root, relay_registry_path, "relay-registry", common_identity
         ),
     }
+    metadata = json.loads(
+        (root / "port" / "work" / profile["id"] / "version.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    asset_index_id = metadata.get("assetIndex", {}).get("id") or metadata.get("assets")
+    if not isinstance(asset_index_id, str) or not asset_index_id:
+        raise RuntimeError("active version metadata has no asset index")
+    generated_resources = root / "port" / "target" / "generated-resources"
+    client_compiler = verified_compiler_profile(
+        root,
+        classes_js,
+        "client",
+        root / "port" / "target" / "generated-pom.xml",
+        [
+            generated_resources / "dev/gaius/browser/minecraft-resources.txt",
+            generated_resources / "dev/gaius/browser/minecraft-embedded-resources.txt",
+            root / "port" / "work" / profile["id"] / "assets" / "indexes" / f"{asset_index_id}.json",
+            generated_resources / "assets/minecraft/sounds.json",
+            generated_resources / "assets/minecraft/font/include/unifont.json",
+            generated_resources / "assets/minecraft/font/include/unifont_pua.json",
+            vanilla_gzip,
+        ],
+    )
+    worker_compiler = verified_compiler_profile(
+        root,
+        server_js,
+        "singleplayer-worker",
+        root / "port" / "target" / "server-worker" / "generated-pom.xml",
+        [
+            root
+            / "port"
+            / "target"
+            / "server-worker"
+            / "generated-resources/dev/gaius/browser/minecraft-resources.txt"
+        ],
+    )
     signatures = verify_signatures(dist, profile, classes_hash)
     classes = base64_chunks(classes_gzip)
     server = base64_chunks(server_gzip)
@@ -461,6 +541,7 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
             "rawBytes": classes_js.stat().st_size,
             "gzipBytes": classes_gzip.stat().st_size,
             "build": component_identities["classesJs"],
+            "compiler": client_compiler,
         },
         "singleplayerServerJs": {
             "rawSha256": server_hash,
@@ -468,6 +549,7 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
             "rawBytes": server_js.stat().st_size,
             "gzipBytes": server_gzip.stat().st_size,
             "build": component_identities["singleplayerServerJs"],
+            "compiler": worker_compiler,
         },
         "wasmHotpath": {
             "rawSha256": wasm_hash,

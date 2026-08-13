@@ -28,6 +28,12 @@ import org.teavm.jso.JSByRef;
  * its low 32 bits. It never exposes a JVM or JavaScript object address.</p>
  */
 public final class BrowserMemory {
+    private static final long HARD_MAX_LIVE_BYTES = 2L * 1024L * 1024L * 1024L;
+    private static final long DEFAULT_MAX_LIVE_BYTES = HARD_MAX_LIVE_BYTES;
+    private static final int HARD_MAX_TEMPORARY_BYTES = 16 * 1024 * 1024;
+    private static final int DEFAULT_MAX_TEMPORARY_BYTES = HARD_MAX_TEMPORARY_BYTES;
+    private static final long MAX_LIVE_BYTES = configuredMaxLiveBytes();
+    private static final int MAX_TEMPORARY_BYTES = configuredMaxTemporaryBytes();
     private static final int TEMP_BYTES_SIZE = 65536;
     private static final int ADDRESS_CACHE_SIZE = 16;
     private static final int ADDRESS_CACHE_MASK = ADDRESS_CACHE_SIZE - 1;
@@ -45,6 +51,7 @@ public final class BrowserMemory {
     private static final long[] CACHED_BUFFER_ADDRESSES = new long[ADDRESS_CACHE_SIZE];
     private static int addressLookupMisses;
     private static long threadJniEnv;
+    private static long threadJniFunctionTable;
     private static long liveBytes;
     private static long peakLiveBytes;
     private static int associatedBuffers;
@@ -55,6 +62,9 @@ public final class BrowserMemory {
     private static long reallocationCount;
     private static long registrationCount;
     private static long collectedAssociationCount;
+    private static long allocationFailureCount;
+    private static int peakTemporaryBytes;
+    private static long temporaryAllocationFailureCount;
     private static boolean telemetryBridgeAvailable = true;
 
     private BrowserMemory() {
@@ -137,6 +147,29 @@ public final class BrowserMemory {
         return collectedAssociationCount;
     }
 
+    public static long maxLiveBytes() {
+        return MAX_LIVE_BYTES;
+    }
+
+    public static long allocationFailures() {
+        publishTelemetry();
+        return allocationFailureCount;
+    }
+
+    public static int maxTemporaryBytes() {
+        return MAX_TEMPORARY_BYTES;
+    }
+
+    public static int peakTemporaryBytes() {
+        publishTelemetry();
+        return peakTemporaryBytes;
+    }
+
+    public static long temporaryAllocationFailures() {
+        publishTelemetry();
+        return temporaryAllocationFailureCount;
+    }
+
     /** Number of cold Buffer identity-map probes; hot-cache hits do not allocate a key. */
     public static int addressLookupMisses() {
         return addressLookupMisses;
@@ -161,10 +194,11 @@ public final class BrowserMemory {
 
     private static long allocate(long byteCount, RegionOwnership ownership) {
         if (byteCount < 0 || byteCount > Integer.MAX_VALUE) {
-            throw new OutOfMemoryError("Unsupported browser allocation size: " + byteCount);
+            throw allocationFailure("Unsupported browser allocation size: " + byteCount);
         }
+        ensureLiveByteCapacity(byteCount);
         int id = nextRegionId++;
-        ByteBuffer bytes = ByteBuffer.allocate((int) byteCount).order(ByteOrder.nativeOrder());
+        ByteBuffer bytes = allocateByteBuffer((int) byteCount);
         return installRegion(id, bytes, ownership);
     }
 
@@ -193,6 +227,7 @@ public final class BrowserMemory {
         int id = nextRegionId++;
         ByteBuffer region = bytes.duplicate().order(ByteOrder.nativeOrder());
         region.clear();
+        ensureLiveByteCapacity(region.capacity());
         long address = installRegion(id, region, RegionOwnership.EXPLICIT);
         registrationCount++;
         remember(bytes, address);
@@ -208,17 +243,52 @@ public final class BrowserMemory {
     public static long threadJniEnv() {
         if (threadJniEnv == 0L) {
             long functionTable = allocate(32L * 1024L);
-            threadJniEnv = allocate(Long.BYTES);
-            putLong(threadJniEnv, functionTable);
+            long environment = 0L;
+            try {
+                environment = allocate(Long.BYTES);
+                putLong(environment, functionTable);
+                threadJniFunctionTable = functionTable;
+                threadJniEnv = environment;
+            } catch (RuntimeException | Error failure) {
+                free(environment);
+                free(functionTable);
+                throw failure;
+            }
         }
         return threadJniEnv;
     }
 
     /** Allocates and installs a per-thread JNI table stand-in for LWJGL. */
     public static long setupThreadEnv(int functionCount) {
-        int entries = Math.max(4, functionCount + 4);
-        long functionTable = allocate(Math.multiplyExact((long) entries, Long.BYTES));
-        putLong(threadJniEnv(), functionTable);
+        long entries = Math.max(4L, (long) functionCount + 4L);
+        long byteCount = Math.multiplyExact(entries, Long.BYTES);
+        if (threadJniEnv == 0L) {
+            long functionTable = allocate(byteCount);
+            long environment = 0L;
+            try {
+                environment = allocate(Long.BYTES);
+                putLong(environment, functionTable);
+                threadJniFunctionTable = functionTable;
+                threadJniEnv = environment;
+                return functionTable;
+            } catch (RuntimeException | Error failure) {
+                free(environment);
+                free(functionTable);
+                throw failure;
+            }
+        }
+        long functionTable = allocate(byteCount);
+        long previousTable = threadJniFunctionTable;
+        try {
+            putLong(threadJniEnv, functionTable);
+        } catch (RuntimeException | Error failure) {
+            free(functionTable);
+            throw failure;
+        }
+        threadJniFunctionTable = functionTable;
+        if (previousTable != 0L && previousTable != functionTable) {
+            free(previousTable);
+        }
         return functionTable;
     }
 
@@ -265,7 +335,8 @@ public final class BrowserMemory {
             return address;
         }
         if (buffer instanceof ByteBuffer bytes) {
-            ByteBuffer target = ByteBuffer.allocate(bytes.capacity()).order(ByteOrder.nativeOrder());
+            ensureLiveByteCapacity(bytes.capacity());
+            ByteBuffer target = allocateByteBuffer(bytes.capacity());
             ByteBuffer source = bytes.duplicate();
             source.clear();
             target.put(source);
@@ -292,6 +363,11 @@ public final class BrowserMemory {
         return addressAt(buffer, buffer.position());
     }
 
+    /** Null-preserving counterpart used by LWJGL's memAddressSafe overloads. */
+    public static long addressSafe(Buffer buffer) {
+        return buffer == null ? 0L : address(buffer);
+    }
+
     /** Returns the address at an element index relative to the buffer origin. */
     public static long addressAt(Buffer buffer, int index) {
         if (buffer == null) {
@@ -314,7 +390,7 @@ public final class BrowserMemory {
     }
 
     public static Buffer wrap(Class<?> type, long address, int capacity) {
-        ByteBuffer bytes = byteBuffer(address, byteCapacity(type, capacity));
+        ByteBuffer bytes = transientSlice(address, byteCapacity(type, capacity));
         Buffer result;
         String name = type.getName();
         if (name.contains("Short")) {
@@ -405,7 +481,7 @@ public final class BrowserMemory {
     private static Buffer reallocateView(Buffer old, int size, int shift, String type) {
         int position = old == null ? 0 : Math.min(old.position(), size);
         long address = reallocate(old == null ? 0 : address0(old), (long) size * shift);
-        ByteBuffer bytes = byteBuffer(address, size * shift);
+        ByteBuffer bytes = transientSlice(address, Math.multiplyExact(size, shift));
         Buffer result = switch (type) {
             case "Short" -> bytes.asShortBuffer();
             case "Int" -> bytes.asIntBuffer();
@@ -986,6 +1062,7 @@ public final class BrowserMemory {
     private static long installRegion(int id, ByteBuffer bytes, RegionOwnership ownership) {
         purgeCollectedBuffers();
         Region region = new Region(bytes, ownership);
+        ensureLiveByteCapacity(region.capacity);
         if (REGIONS.put(id, region) != null) {
             throw new IllegalStateException("Virtual memory region id collision: " + id);
         }
@@ -1066,7 +1143,12 @@ public final class BrowserMemory {
                     registrationCount,
                     reallocationCount,
                     collectedAssociationCount,
-                    addressLookupMisses);
+                    addressLookupMisses,
+                    MAX_LIVE_BYTES,
+                    allocationFailureCount,
+                    MAX_TEMPORARY_BYTES,
+                    peakTemporaryBytes,
+                    temporaryAllocationFailureCount);
         } catch (Throwable ignored) {
             // JVM-side lifecycle tests do not install TeaVM JS bodies.
             telemetryBridgeAvailable = false;
@@ -1077,7 +1159,9 @@ public final class BrowserMemory {
             "liveRegions", "liveBytes", "associatedBuffers",
             "peakLiveRegions", "peakLiveBytes", "peakAssociatedBuffers",
             "allocations", "frees", "registrations", "reallocations",
-            "collectedAssociations", "addressLookupMisses"
+            "collectedAssociations", "addressLookupMisses",
+            "maxLiveBytes", "allocationFailures", "maxTemporaryBytes",
+            "peakTemporaryBytes", "temporaryAllocationFailures"
     }, script = """
             let root = globalThis.__gaiusMemoryTelemetry;
             if (!root || typeof root !== 'object' || Array.isArray(root)) {
@@ -1101,6 +1185,11 @@ public final class BrowserMemory {
             memory.reallocations = Number(reallocations);
             memory.collectedAssociations = Number(collectedAssociations);
             memory.addressLookupMisses = addressLookupMisses | 0;
+            memory.maxLiveBytes = Number(maxLiveBytes);
+            memory.allocationFailures = Number(allocationFailures);
+            memory.maxTemporaryBytes = maxTemporaryBytes | 0;
+            memory.peakTemporaryBytes = peakTemporaryBytes | 0;
+            memory.temporaryAllocationFailures = Number(temporaryAllocationFailures);
             """)
     private static native void publishTelemetryBrowser(
             int liveRegions,
@@ -1114,15 +1203,96 @@ public final class BrowserMemory {
             long registrations,
             long reallocations,
             long collectedAssociations,
-            int addressLookupMisses);
+            int addressLookupMisses,
+            long maxLiveBytes,
+            long allocationFailures,
+            int maxTemporaryBytes,
+            int peakTemporaryBytes,
+            long temporaryAllocationFailures);
+
+    private static long configuredMaxLiveBytes() {
+        String configured = System.getProperty("gaius.browser.memory.maxBytes");
+        if (configured == null || configured.isBlank()) {
+            return DEFAULT_MAX_LIVE_BYTES;
+        }
+        try {
+            return Math.min(HARD_MAX_LIVE_BYTES, Math.max(1L, Long.parseLong(configured)));
+        } catch (NumberFormatException ignored) {
+            return DEFAULT_MAX_LIVE_BYTES;
+        }
+    }
+
+    private static int configuredMaxTemporaryBytes() {
+        String configured = System.getProperty("gaius.browser.memory.maxTemporaryBytes");
+        if (configured == null || configured.isBlank()) {
+            return DEFAULT_MAX_TEMPORARY_BYTES;
+        }
+        try {
+            return (int) Math.min(
+                    HARD_MAX_TEMPORARY_BYTES,
+                    Math.max(1L, Long.parseLong(configured)));
+        } catch (NumberFormatException ignored) {
+            return DEFAULT_MAX_TEMPORARY_BYTES;
+        }
+    }
+
+    private static void ensureLiveByteCapacity(long additionalBytes) {
+        if (additionalBytes < 0L || liveBytes > MAX_LIVE_BYTES - additionalBytes) {
+            throw allocationFailure(
+                    "Browser native memory budget exceeded: live=" + liveBytes
+                            + " requested=" + additionalBytes
+                            + " limit=" + MAX_LIVE_BYTES);
+        }
+    }
+
+    private static ByteBuffer allocateByteBuffer(int byteCount) {
+        try {
+            return ByteBuffer.allocate(byteCount).order(ByteOrder.nativeOrder());
+        } catch (OutOfMemoryError failure) {
+            recordAllocationFailure();
+            throw failure;
+        }
+    }
+
+    private static OutOfMemoryError allocationFailure(String message) {
+        recordAllocationFailure();
+        return new OutOfMemoryError(message);
+    }
+
+    private static void recordAllocationFailure() {
+        allocationFailureCount++;
+        publishTelemetry();
+    }
 
     private static ByteBuffer buffer(long address) {
         return region(address).bytes;
     }
 
     private static byte[] temporaryBytes(int length) {
+        if (length < 0) {
+            throw new IllegalArgumentException("Invalid temporary byte length: " + length);
+        }
+        if (length > MAX_TEMPORARY_BYTES) {
+            temporaryAllocationFailureCount++;
+            throw allocationFailure(
+                    "Browser temporary decode budget exceeded: requested=" + length
+                            + " limit=" + MAX_TEMPORARY_BYTES);
+        }
+        if (length > peakTemporaryBytes) {
+            peakTemporaryBytes = length;
+            publishTelemetry();
+        }
         byte[] bytes = BYTE_ARRAYS.get();
-        return length <= bytes.length ? bytes : new byte[length];
+        if (length <= bytes.length) {
+            return bytes;
+        }
+        try {
+            return new byte[length];
+        } catch (OutOfMemoryError failure) {
+            temporaryAllocationFailureCount++;
+            recordAllocationFailure();
+            throw failure;
+        }
     }
 
     private static void putRgba(ByteBuffer bytes, int offset, int argb) {
@@ -1262,6 +1432,10 @@ public final class BrowserMemory {
     private static ByteBuffer transientView(long address, int capacity) {
         Region region = region(address);
         return transientView(region, offset(address), capacity);
+    }
+
+    private static ByteBuffer transientSlice(long address, int capacity) {
+        return transientView(address, capacity).slice().order(ByteOrder.nativeOrder());
     }
 
     private static ByteBuffer transientView(Region region, int offset, int capacity) {

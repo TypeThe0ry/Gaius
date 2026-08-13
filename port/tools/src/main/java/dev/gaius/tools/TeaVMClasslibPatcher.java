@@ -334,14 +334,15 @@ public final class TeaVMClasslibPatcher {
             patchClass(jar, root, patch.getKey(), patch.getValue());
         }
         patchThrowableGetSuppressed(jar, root);
-        patchDefaultFileSystemProviderOutputStream(jar, root);
+        patchDefaultFileSystemProviderStreams(jar, root);
         patchZipFileRawInflaterPadding(jar, root);
     }
 
-    private static void patchDefaultFileSystemProviderOutputStream(String jarPath, Path root) throws IOException {
+    private static void patchDefaultFileSystemProviderStreams(String jarPath, Path root) throws IOException {
         String className = "org/teavm/classlib/java/nio/file/impl/TDefaultFileSystemProvider";
         String defaultPathClass = "org/teavm/classlib/java/nio/file/impl/TDefaultPath";
         ClassNode node = readClass(jarPath, className);
+        patchDefaultFileSystemProviderInputStream(node, defaultPathClass);
         MethodNode method = node.methods.stream()
                 .filter(candidate -> candidate.name.equals("newOutputStream")
                         && candidate.desc.equals("(Lorg/teavm/classlib/java/nio/file/TPath;"
@@ -369,6 +370,7 @@ public final class TeaVMClasslibPatcher {
             throw new IllegalStateException(
                     "TDefaultFileSystemProvider.newOutputStream defaultPath local was not found");
         }
+        insertMaterializeForOpen(method, defaultPathClass, defaultPathLocal, "newOutputStream");
 
         int truncateLocal = 6;
         boolean truncateLocalUsed = false;
@@ -412,16 +414,56 @@ public final class TeaVMClasslibPatcher {
                 throw new IllegalStateException(
                         "TDefaultFileSystemProvider.newOutputStream TFileOutputStream allocation was not found");
             }
-            InsnList truncateCall = new InsnList();
-            truncateCall.add(new VarInsnNode(Opcodes.ALOAD, varInsn.var));
-            truncateCall.add(new VarInsnNode(Opcodes.ILOAD, truncateLocal));
-            truncateCall.add(new MethodInsnNode(
-                    Opcodes.INVOKESTATIC,
-                    "org/teavm/classlib/java/io/TFileOutputStream",
-                    "truncateIfRequested",
-                    "(Lorg/teavm/runtime/fs/VirtualFileAccessor;Z)V",
-                    false));
-            method.instructions.insertBefore(streamAllocation, truncateCall);
+            InsnList pathLoad = new InsnList();
+            pathLoad.add(new VarInsnNode(Opcodes.ALOAD, defaultPathLocal));
+            pathLoad.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    defaultPathClass,
+                    "pathString",
+                    "Ljava/lang/String;"));
+            method.instructions.insertBefore(accessorLoad, pathLoad);
+            method.instructions.insert(accessorLoad, new VarInsnNode(Opcodes.ILOAD, truncateLocal));
+            call.desc = "(Ljava/lang/String;Lorg/teavm/runtime/fs/VirtualFileAccessor;Z)V";
+            method.maxStack = Math.max(method.maxStack, 6);
+            patched = true;
+        }
+        if (!patched) {
+            throw new IllegalStateException(
+                    "TDefaultFileSystemProvider.newOutputStream TFileOutputStream constructor call was not found");
+        }
+        patchDefaultFileSystemProviderDelete(node, defaultPathClass);
+        patchDefaultFileSystemProviderCopy(node, defaultPathClass);
+        patchDefaultFileSystemProviderMove(node, defaultPathClass);
+        writeClass(root, className, node);
+    }
+
+    private static void patchDefaultFileSystemProviderInputStream(
+            ClassNode node, String defaultPathClass) {
+        MethodNode method = node.methods.stream()
+                .filter(candidate -> candidate.name.equals("newInputStream")
+                        && candidate.desc.equals("(Lorg/teavm/classlib/java/nio/file/TPath;"
+                                + "[Lorg/teavm/classlib/java/nio/file/TOpenOption;)Ljava/io/InputStream;"))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(
+                        "TDefaultFileSystemProvider.newInputStream was not found"));
+        int defaultPathLocal = findDefaultPathLocal(method, defaultPathClass, "newInputStream");
+        insertMaterializeForOpen(method, defaultPathClass, defaultPathLocal, "newInputStream");
+
+        boolean patched = false;
+        for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+            if (!(insn instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKESPECIAL
+                    || !call.owner.equals("org/teavm/classlib/java/io/TFileInputStream")
+                    || !call.name.equals("<init>")
+                    || !call.desc.equals("(Lorg/teavm/runtime/fs/VirtualFileAccessor;)V")) {
+                continue;
+            }
+            AbstractInsnNode accessorLoad = previousExecutable(call);
+            if (!(accessorLoad instanceof VarInsnNode varInsn)
+                    || varInsn.getOpcode() != Opcodes.ALOAD) {
+                throw new IllegalStateException(
+                        "TDefaultFileSystemProvider.newInputStream accessor load was not found");
+            }
             InsnList pathLoad = new InsnList();
             pathLoad.add(new VarInsnNode(Opcodes.ALOAD, defaultPathLocal));
             pathLoad.add(new FieldInsnNode(
@@ -436,12 +478,62 @@ public final class TeaVMClasslibPatcher {
         }
         if (!patched) {
             throw new IllegalStateException(
-                    "TDefaultFileSystemProvider.newOutputStream TFileOutputStream constructor call was not found");
+                    "TDefaultFileSystemProvider.newInputStream TFileInputStream constructor call was not found");
         }
-        patchDefaultFileSystemProviderDelete(node, defaultPathClass);
-        patchDefaultFileSystemProviderCopy(node, defaultPathClass);
-        patchDefaultFileSystemProviderMove(node, defaultPathClass);
-        writeClass(root, className, node);
+    }
+
+    private static int findDefaultPathLocal(
+            MethodNode method, String defaultPathClass, String operation) {
+        for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+            if (insn instanceof TypeInsnNode typeInsn
+                    && typeInsn.getOpcode() == Opcodes.CHECKCAST
+                    && typeInsn.desc.equals(defaultPathClass)) {
+                AbstractInsnNode next = nextExecutable(insn);
+                if (next instanceof VarInsnNode varInsn && varInsn.getOpcode() == Opcodes.ASTORE) {
+                    return varInsn.var;
+                }
+            }
+        }
+        throw new IllegalStateException(
+                "TDefaultFileSystemProvider." + operation + " defaultPath local was not found");
+    }
+
+    private static void insertMaterializeForOpen(
+            MethodNode method, String defaultPathClass, int defaultPathLocal, String operation) {
+        AbstractInsnNode pathStore = null;
+        for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+            if (!(insn instanceof TypeInsnNode typeInsn)
+                    || typeInsn.getOpcode() != Opcodes.CHECKCAST
+                    || !typeInsn.desc.equals(defaultPathClass)) {
+                continue;
+            }
+            AbstractInsnNode next = nextExecutable(insn);
+            if (next instanceof VarInsnNode varInsn
+                    && varInsn.getOpcode() == Opcodes.ASTORE
+                    && varInsn.var == defaultPathLocal) {
+                pathStore = next;
+                break;
+            }
+        }
+        if (pathStore == null) {
+            throw new IllegalStateException(
+                    "TDefaultFileSystemProvider." + operation + " path store was not found");
+        }
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, defaultPathLocal));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                defaultPathClass,
+                "pathString",
+                "Ljava/lang/String;"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserFilePersistence",
+                "materializeForOpen",
+                "(Ljava/lang/String;)V",
+                false));
+        method.instructions.insert(pathStore, code);
+        method.maxStack = Math.max(method.maxStack, 5);
     }
 
     private static AbstractInsnNode previousExecutable(AbstractInsnNode insn) {
@@ -670,6 +762,7 @@ public final class TeaVMClasslibPatcher {
                                 + "[Lorg/teavm/classlib/java/nio/file/TCopyOption;)V"))
                 .findFirst()
                 .orElseThrow(() -> new IllegalStateException("TDefaultFileSystemProvider.move was not found"));
+        insertMaterializeForOpen(method, defaultPathClass, 5, "move");
         boolean patched = false;
         for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
             if (!(insn instanceof MethodInsnNode call)

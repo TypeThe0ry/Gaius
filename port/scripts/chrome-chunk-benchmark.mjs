@@ -13,8 +13,11 @@ import {fileURLToPath} from "node:url";
 import {
   aggregateChromeProcessRss,
   combineMemorySnapshots,
+  buildPerformanceEvidence,
+  evaluateBrowserMemorySafety,
   evaluatePerformanceGates,
   evaluateGameplayAuthority,
+  evaluateUncappedFramePacing,
   evaluateRuntimeInvariants,
   mergeMonotonicSamples,
   nearestRankPercentile,
@@ -30,6 +33,7 @@ import {
   summarizeScalarSamples,
   summarizeVisualOutput,
   summarizeWorldReadiness,
+  validateWorkerHeartbeatTelemetry,
 } from "./performance-metrics.mjs";
 
 const args = process.argv.slice(2);
@@ -156,6 +160,15 @@ const sampleMillis = Math.max(
   250,
   integer("--sample-millis", measurementContract.sampleIntervalMs || 500),
 );
+const frameMeasurementMillis = Math.max(performanceMillis, heapMillis);
+const cdpCommandTimeoutMillis = Math.max(
+  1000,
+  Number(measurementContract.cdpCommandTimeoutMs || 15_000),
+);
+const continuousVisualIntervalMillis = Math.max(
+  1000,
+  Number(measurementContract.continuousVisualIntervalMs || 10_000),
+);
 const startupTimeoutMillis = duration(
   "--startup-minutes",
   Number(startupContract.timeoutMs || 900_000) / 60_000,
@@ -197,6 +210,34 @@ const startupTerrainPollMillis = Math.max(
 );
 const explicitUrl = value("--url", "");
 const distRoot = resolve(fileURLToPath(new URL("../web/dist/", import.meta.url)));
+const releaseManifestPath = resolve(distRoot, "Gaius.manifest.json");
+
+async function readBenchmarkBuildIdentity() {
+  const bytes = await readFile(releaseManifestPath);
+  const manifest = JSON.parse(bytes.toString("utf8"));
+  const compatibilitySha256 = String(manifest.buildIdentity?.compatibilitySha256 || "");
+  const artifactCompatibilities = [
+    manifest.classesJs?.build?.compatibilitySha256,
+    manifest.singleplayerServerJs?.build?.compatibilitySha256,
+    manifest.singleplayerWorkerBootstrap?.build?.compatibilitySha256,
+    manifest.wasmHotpath?.build?.compatibilitySha256,
+  ].filter(Boolean).map(String);
+  return {
+    manifestPath: releaseManifestPath,
+    manifestSha256: createHash("sha256").update(bytes).digest("hex"),
+    compatibilitySha256,
+    artifactCompatibilities,
+    coherent: /^[a-f0-9]{64}$/i.test(compatibilitySha256)
+      && artifactCompatibilities.length === 4
+      && artifactCompatibilities.every((entry) => entry === compatibilitySha256),
+    profile: manifest.profile || null,
+  };
+}
+
+const benchmarkBuildIdentity = await readBenchmarkBuildIdentity();
+if (!benchmarkBuildIdentity.coherent) {
+  throw new Error("Gaius.manifest.json does not describe one coherent benchmark build");
+}
 const benchmarkOptionsText = [
   `version:${Number(activeVersionProfile.worldVersion)}`,
   "autoJump:false",
@@ -275,6 +316,7 @@ if (args.includes("--print-config")) {
     headless,
     warmupMillis,
     performanceMillis,
+    frameMeasurementMillis,
     heapMillis,
     heapIntervalMillis,
     heapSampleMillis,
@@ -304,11 +346,13 @@ if (args.includes("--print-config")) {
     expectedSimulationDistance,
     requestedFrameLimit: environmentContract.maxFpsLabel || "Unlimited",
     verifiedUncapped: null,
+    uncappedEvidence: environmentContract.uncappedEvidence || null,
     frameSampleCapacity,
     heartbeatIntervalMillis,
     postGcFinalWindows,
     longTaskCapacity,
     runtimeInvariantSampleCapacity,
+    buildIdentity: benchmarkBuildIdentity,
   }, null, 2));
   process.exit(0);
 }
@@ -317,7 +361,7 @@ if (benchmarkProfile.route !== "singleplayer") {
   const reason = `Profile ${profileName} uses unsupported route ${benchmarkProfile.route}; `
     + "no multiplayer/RelayNode benchmark driver is implemented";
   const unsupported = {
-    schemaVersion: 4,
+    schemaVersion: performanceContract.schemaVersion,
     generatedAt: new Date().toISOString(),
     passed: false,
     verdict: "inconclusive",
@@ -325,6 +369,7 @@ if (benchmarkProfile.route !== "singleplayer") {
     profileName,
     route: benchmarkProfile.route,
     routeSupported: false,
+    buildIdentity: benchmarkBuildIdentity,
     reason,
   };
   await mkdir(resolve(outputPath, ".."), {recursive: true});
@@ -448,6 +493,21 @@ function combineBrowserMemory(...snapshots) {
     ...(browserMemoryContract.counterFields || []),
   ];
   return combineMemorySnapshots(snapshots, fields);
+}
+
+function combineBrowserMemorySafety(page, worker) {
+  if (!page || !worker) return null;
+  const aggregateLimits = browserMemoryContract.aggregateLimits || {};
+  const maxLiveBytes = Number(aggregateLimits.maxLiveBytes);
+  const maxTemporaryBytes = Number(aggregateLimits.maxTemporaryBytes);
+  if (!Number.isFinite(maxLiveBytes) || maxLiveBytes <= 0
+      || !Number.isFinite(maxTemporaryBytes) || maxTemporaryBytes <= 0) {
+    return null;
+  }
+  const combined = combineBrowserMemory(page, worker);
+  return combined
+    ? {...combined, maxLiveBytes, maxTemporaryBytes}
+    : null;
 }
 
 async function withTimeout(promise, millis, label) {
@@ -620,6 +680,12 @@ class CdpSession {
   async open() {
     if (this.socket.readyState !== WebSocket.OPEN) {
       await new Promise((resolveOpen, rejectOpen) => {
+        const timeout = setTimeout(() => {
+          cleanup();
+          rejectOpen(new Error(
+            `Chrome DevTools WebSocket open timed out after ${cdpCommandTimeoutMillis} ms`,
+          ));
+        }, cdpCommandTimeoutMillis);
         const onOpen = () => {
           cleanup();
           resolveOpen();
@@ -629,6 +695,7 @@ class CdpSession {
           rejectOpen(event.error || new Error("Chrome DevTools WebSocket failed"));
         };
         const cleanup = () => {
+          clearTimeout(timeout);
           this.socket.removeEventListener("open", onOpen);
           this.socket.removeEventListener("error", onError);
         };
@@ -639,6 +706,7 @@ class CdpSession {
     this.socket.addEventListener("message", (event) => this.handleMessage(event.data));
     this.socket.addEventListener("close", () => {
       for (const pending of this.pending.values()) {
+        clearTimeout(pending.timeout);
         pending.reject(new Error("Chrome DevTools WebSocket closed"));
       }
       this.pending.clear();
@@ -651,6 +719,7 @@ class CdpSession {
       const pending = this.pending.get(message.id);
       if (!pending) return;
       this.pending.delete(message.id);
+      clearTimeout(pending.timeout);
       if (message.error) {
         pending.reject(new Error(pending.method + ": " + message.error.message));
       } else {
@@ -666,10 +735,22 @@ class CdpSession {
   send(method, params = {}, sessionId = null) {
     const id = this.nextId++;
     return new Promise((resolveSend, rejectSend) => {
-      this.pending.set(id, {method, resolve: resolveSend, reject: rejectSend});
+      const timeout = setTimeout(() => {
+        if (!this.pending.delete(id)) return;
+        rejectSend(new Error(
+          `${method} timed out after ${cdpCommandTimeoutMillis} ms`,
+        ));
+      }, cdpCommandTimeoutMillis);
+      this.pending.set(id, {method, resolve: resolveSend, reject: rejectSend, timeout});
       const message = {id, method, params};
       if (sessionId) message.sessionId = sessionId;
-      this.socket.send(JSON.stringify(message));
+      try {
+        this.socket.send(JSON.stringify(message));
+      } catch (error) {
+        this.pending.delete(id);
+        clearTimeout(timeout);
+        rejectSend(error);
+      }
     });
   }
 
@@ -709,6 +790,13 @@ async function waitFor(session, expression, timeoutMillis, label) {
       if (await evaluate(session, expression, 5000)) return;
     } catch (error) {
       lastError = error;
+    }
+    const fatal = stickyFatalEvents[0];
+    if (fatal) {
+      throw new Error(
+        "Fatal browser event while waiting for " + label + ": "
+          + String(fatal.text || fatal.source || "unknown browser failure"),
+      );
     }
     await sleep(250);
   }
@@ -908,20 +996,32 @@ async function passProfileGate(session) {
     60_000,
     "the player-name gate or Minecraft startup",
   );
+  await waitFor(
+    session,
+    "document.querySelector('#profile-gate')?.hidden!==false"
+      + "||typeof window.__gaiusFsReady!=='undefined'",
+    60_000,
+    "the browser persistence bootstrap",
+  );
   return evaluate(session, "(async() => {"
     + "const gate=document.querySelector('#profile-gate');"
     + "if(!gate||gate.hidden!==false)return {submitted:false,seeded:false,reason:'gate-not-visible'};"
     + "const path='/gaius/options.txt';"
     + "const encoded=" + JSON.stringify(benchmarkOptionsBase64) + ";"
+    + "const storageReady=typeof globalThis.__gaiusFsReady!=='undefined';"
+    + "if(globalThis.__gaiusFsReady)await globalThis.__gaiusFsReady;"
     + "const files=globalThis.__gaiusPersistentFiles||"
     + "(globalThis.__gaiusPersistentFiles=Object.create(null));"
     + "files[path]=encoded;"
-    + "try{localStorage.setItem('gaius.fs.v1:'+path,encoded);}catch(ignored){}"
     + "let fsPut=false;let flushed=false;"
     + "try{if(typeof globalThis.__gaiusFsPut==='function'){"
     + "fsPut=globalThis.__gaiusFsPut(path,encoded)!==false;}}catch(ignored){}"
     + "try{if(typeof globalThis.__gaiusFsFlush==='function'){"
     + "await globalThis.__gaiusFsFlush();flushed=true;}}catch(ignored){}"
+    + "let localStoragePut=false;"
+    + "try{if(globalThis.localStorage){"
+    + "localStorage.setItem('gaius.fs.v1:'+path,encoded);localStoragePut=true;"
+    + "}}catch(ignored){}"
     + "let persisted=false;try{persisted=localStorage.getItem('gaius.fs.v1:'+path)===encoded;}"
     + "catch(ignored){}"
     + "globalThis.__gaiusBenchmarkProfile=" + JSON.stringify({
@@ -930,14 +1030,39 @@ async function passProfileGate(session) {
       simulationDistance: expectedSimulationDistance,
       workload: benchmarkProfile.workload,
     }) + ";"
+    // The generated client can restore its own Options instance after the
+    // profile gate, so the file seed alone is not a reliable Worker launch
+    // parameter. Keep this benchmark-side override at the actual boundary
+    // where the integrated-server Worker receives its distances.
+    + "let workerDistanceOverrideInstalled=false;"
+    + "try{const NativeWorker=globalThis.Worker;"
+    + "if(typeof NativeWorker==='function'&&!globalThis.__gaiusBenchmarkWorkerDistanceOverride){"
+    + "const expectedDistances={renderDistance:" + JSON.stringify(expectedRenderDistance)
+    + ",simulationDistance:" + JSON.stringify(expectedSimulationDistance) + "};"
+    + "const WorkerProxy=new Proxy(NativeWorker,{construct(target,args){"
+    + "const worker=Reflect.construct(target,args,target);"
+    + "const originalPostMessage=worker.postMessage.bind(worker);"
+    + "worker.postMessage=function(message,transfer){"
+    + "if(message&&(message.type==='start'||message.type==='distances')){"
+    + "message=Object.assign({},message,expectedDistances);"
+    + "worker.__gaiusDistances=expectedDistances.renderDistance+':'+expectedDistances.simulationDistance;}"
+    + "return transfer===undefined?originalPostMessage(message):originalPostMessage(message,transfer);};"
+    + "return worker;}});"
+    + "globalThis.Worker=WorkerProxy;"
+    + "globalThis.__gaiusBenchmarkWorkerDistanceOverride=true;"
+    + "workerDistanceOverrideInstalled=true;}"
+    + "else if(globalThis.__gaiusBenchmarkWorkerDistanceOverride)workerDistanceOverrideInstalled=true;"
+    + "}catch(ignored){}"
     + "const input=document.querySelector('#profile-name');"
     + "const submit=document.querySelector('#profile-submit');"
-    + "if(!input||!submit)return {submitted:false,seeded:persisted||fsPut,"
-    + "persisted,fsPut,flushed,reason:'profile-controls-missing'};"
+    + "if(!input||!submit)return {submitted:false,seeded:persisted||fsPut||localStoragePut,"
+    + "persisted,fsPut,flushed,localStoragePut,storageReady,workerDistanceOverrideInstalled,"
+    + "reason:'profile-controls-missing'};"
     + "input.value=" + JSON.stringify(playerName) + ";"
     + "input.dispatchEvent(new Event('input',{bubbles:true}));"
     + "submit.click();"
-    + "return {submitted:true,seeded:persisted||fsPut,persisted,fsPut,flushed};"
+    + "return {submitted:true,seeded:persisted||fsPut||localStoragePut,"
+    + "persisted,fsPut,flushed,localStoragePut,storageReady,workerDistanceOverrideInstalled};"
     + "})()");
 }
 
@@ -968,30 +1093,44 @@ async function enterWorld(session) {
   }
   await waitFor(
     session,
-    "String(window.__gaiusMinecraftState?.screen||'').includes('SelectWorldScreen')",
+    "(() => {const screen=String(window.__gaiusMinecraftState?.screen||'');"
+      + "return screen.includes('SelectWorldScreen')"
+      + "||screen.includes('CreateWorldScreen');})()",
     60_000,
-    "the world list",
+    "world selection or the create-world screen",
   );
   await sleep(500);
   let worldLoadStartedAt;
   let createdNewWorld = false;
   worldLoadStartedAt = Date.now();
-  if (await clickFirstWorld(session)) {
-    await sleep(1000);
-    if (!await evaluate(session, "!!window.__gaiusMinecraftState?.level")) {
-      await clickButton(session, "Play Selected World", 5000);
+  const selectionScreen = String(await evaluate(
+    session,
+    "window.__gaiusMinecraftState?.screen||''",
+  ) || "");
+  if (selectionScreen.includes("SelectWorldScreen")) {
+    if (await clickFirstWorld(session)) {
+      await sleep(1000);
+      if (!await evaluate(session, "!!window.__gaiusMinecraftState?.level")) {
+        await clickButton(session, "Play Selected World", 5000);
+      }
+    } else {
+      createdNewWorld = true;
+      if (!await clickButton(session, "Create New World")) {
+        throw new Error("Create New World button was not exposed by UI telemetry");
+      }
+      await waitFor(
+        session,
+        "String(window.__gaiusMinecraftState?.screen||'').includes('CreateWorldScreen')",
+        60_000,
+        "the create-world screen",
+      );
     }
-  } else {
+  } else if (selectionScreen.includes("CreateWorldScreen")) {
     createdNewWorld = true;
-    if (!await clickButton(session, "Create New World")) {
-      throw new Error("Create New World button was not exposed by UI telemetry");
-    }
-    await waitFor(
-      session,
-      "!String(window.__gaiusMinecraftState?.screen||'').includes('SelectWorldScreen')",
-      60_000,
-      "the create-world screen",
-    );
+  } else {
+    throw new Error("Unexpected singleplayer screen: " + selectionScreen);
+  }
+  if (createdNewWorld) {
     await sleep(500);
     await clickButton(session, "Game Mode", 3000);
     await sleep(150);
@@ -1260,6 +1399,26 @@ async function collectVisualOutput(session, phase) {
   for (let index = 0; index < visualCapturesPerPhase; index++) {
     samples.push(await captureVisualOutputSample(session, phase, index + 1));
     if (index + 1 < visualCapturesPerPhase) await sleep(visualCaptureIntervalMillis);
+  }
+  return samples;
+}
+
+async function collectContinuousVisualOutput(session, durationMillis) {
+  const samples = [];
+  const startedAt = Date.now();
+  const deadline = startedAt + Math.max(0, durationMillis);
+  let nextCaptureAt = startedAt + continuousVisualIntervalMillis;
+  let index = 0;
+  while (nextCaptureAt <= deadline) {
+    await sleep(Math.max(0, nextCaptureAt - Date.now()));
+    if (Date.now() > deadline) break;
+    samples.push(await captureVisualOutputSample(
+      session,
+      "continuous-measurement",
+      ++index,
+      false,
+    ));
+    nextCaptureAt += continuousVisualIntervalMillis;
   }
   return samples;
 }
@@ -1982,11 +2141,13 @@ async function startTravel(session, center) {
     paused = true;
     await dispatchKey(session, "KeyW", "keyUp");
     await dispatchKey(session, "Space", "keyUp");
+    await evaluate(session, "globalThis.__gaiusBenchmarkWorkloadActive=false;true");
   };
   stop.resume = async () => {
     if (!paused) return;
     await dispatchKey(session, "Space", "keyDown");
     await dispatchKey(session, "KeyW", "keyDown");
+    await evaluate(session, "globalThis.__gaiusBenchmarkWorkloadActive=true;true");
     paused = false;
   };
   return stop;
@@ -2016,11 +2177,20 @@ async function leaveWorld(session) {
 async function resetMeasurement(session) {
   return evaluate(session, "(() => {"
     + "globalThis.__gaiusBenchmarkEnabled=true;"
+    + "const measurementId=globalThis.crypto&&typeof globalThis.crypto.randomUUID==='function'"
+    + "?globalThis.crypto.randomUUID():"
+    + "String(Date.now())+'-'+Math.random().toString(16).slice(2);"
+    + "globalThis.__gaiusBenchmarkMeasurementId=measurementId;"
+    + "globalThis.__gaiusWorkerMessageTelemetry=null;"
     + "const gameplayAuthority=globalThis.__gaiusGameplayAuthorityProbe;"
     + "if(gameplayAuthority&&typeof gameplayAuthority.reset==='function')gameplayAuthority.reset();"
     + "globalThis.__gaiusFrameTelemetry={enabled:true,lastFrameAt:performance.now(),"
     + "startedAt:performance.now(),frameCount:0,totalFrameMillis:0,longestFrameMillis:0,"
-    + "freezeCount:0,hiddenFrameCount:0,visibleFrameCount:0,yieldRequestCount:0,"
+    + "freezeCount:0,hiddenFrameCount:0,visibleFrameCount:0,swapInterval:null,"
+    + "uncappedYieldCount:0,vsyncYieldCount:0,presentToRafCount:0,fairYieldCount:0,"
+    + "messageChannelCreateFailureCount:0,messageChannelPostFailureCount:0,"
+    + "messageChannelRebuildCount:0,cancelledMessageTaskCount:0,watchdogYieldCount:0,"
+    + "yieldRequestCount:0,"
     + "yieldCompletionCount:0,pendingYieldCount:0,maxPendingYieldCount:0,"
     + "duplicateYieldCallbackCount:0,sampleCapacity:"
     + JSON.stringify(frameSampleCapacity) + ","
@@ -2038,7 +2208,8 @@ async function resetMeasurement(session) {
     + "}"
     + "const workers=globalThis.__gaiusSingleplayerWorkers;"
     + "if(workers&&typeof workers.forEach==='function')workers.forEach(worker=>{"
-    + "if(worker&&typeof worker.__gaiusResetTelemetry==='function')worker.__gaiusResetTelemetry();"
+    + "if(worker&&typeof worker.__gaiusResetTelemetry==='function')"
+    + "worker.__gaiusResetTelemetry(measurementId);"
     + "if(worker&&typeof worker.__gaiusSetTelemetryInterval==='function')"
     + "worker.__gaiusSetTelemetryInterval(" + JSON.stringify(heartbeatIntervalMillis) + ");"
     + "});"
@@ -2093,7 +2264,7 @@ async function resetMeasurement(session) {
     + "at:Date.now(),statusMessage:String(event.statusMessage||'')});"
     + "if(active&&active.contextLosses.length>64)active.contextLosses.splice(0,"
     + "active.contextLosses.length-64);},true);}"
-    + "return {distances:workers&&typeof workers.values==='function'"
+    + "return {measurementId,distances:workers&&typeof workers.values==='function'"
     + "?Array.from(workers.values()).filter(worker=>worker&&!worker.__gaiusTerminal)"
     + ".map(worker=>String(worker.__gaiusDistances||'')):[]};"
     + "})()");
@@ -2146,7 +2317,7 @@ async function samplePage(session, drainFrames = true) {
       + "const longTasks=globalThis.__gaiusBenchmarkLongTasks||{};"
       + "const workers=globalThis.__gaiusSingleplayerWorkers;"
       + "const workerEntries=workers&&typeof workers.entries==='function'?Array.from(workers.entries()):[];"
-      + "const workerStates=workerEntries.slice(0,16).map(([id,item])=>({sessionId:String(id),"
+      + "const workerStates=workerEntries.map(([id,item])=>({sessionId:String(id),"
       + "terminal:!!item?.__gaiusTerminal,runtimeReady:!!item?.__gaiusRuntimeReady,"
       + "stopped:!!item?.__gaiusStopped,distances:String(item?.__gaiusDistances||'')}));"
       + "const eventRing=globalThis.__gaiusMinecraftEvents||[];"
@@ -2165,6 +2336,7 @@ async function samplePage(session, drainFrames = true) {
       + "return {"
       + "now:performance.now(),"
       + "visibilityState:document.visibilityState,hasFocus:document.hasFocus(),"
+      + "workloadActive:globalThis.__gaiusBenchmarkWorkloadActive===true,"
       + "devicePixelRatio:Number(devicePixelRatio)||1,"
       + "viewport:{width:innerWidth,height:innerHeight},"
       + "visualViewport:globalThis.visualViewport?{width:Number(visualViewport.width)||0,"
@@ -2174,8 +2346,13 @@ async function samplePage(session, drainFrames = true) {
       + "canvas:(()=>{const value=document.querySelector('canvas');return value?"
       + "{width:value.width,height:value.height,clientWidth:value.clientWidth,"
       + "clientHeight:value.clientHeight}:null;})(),"
-      + "screen:state.screen||null,level:state.level||null,noRender:!!state.noRender,"
-      + "running:state.running!==false,player,"
+      + "stateAt:Number.isFinite(Number(state.at))?Number(state.at):null,"
+      + "screen:Object.hasOwn(state,'screen')?(state.screen||null):null,"
+      + "overlay:Object.hasOwn(state,'overlay')?(state.overlay||null):null,"
+      + "level:Object.hasOwn(state,'level')?(state.level||null):null,"
+      + "noRender:Object.hasOwn(state,'noRender')?!!state.noRender:null,"
+      + "running:Object.hasOwn(state,'running')?!!state.running:null,"
+      + "pause:Object.hasOwn(state,'pause')?!!state.pause:null,player,"
       + "loadedChunkCount:Number.isFinite(loadedChunkCount)?loadedChunkCount:null,"
       + "chunk:player&&Number.isFinite(player.x)&&Number.isFinite(player.z)"
       + "?{x:Math.floor(player.x/16),z:Math.floor(player.z/16)}:null,"
@@ -2183,6 +2360,16 @@ async function samplePage(session, drainFrames = true) {
       + "longestFrameMillis:Number(frame.longestFrameMillis)||0,"
       + "freezeCount:Number(frame.freezeCount)||0,hiddenFrameCount:Number(frame.hiddenFrameCount)||0,"
       + "visibleFrameCount:Number(frame.visibleFrameCount)||0,frameTimes,"
+      + "swapInterval:typeof frame.swapInterval==='number'&&Number.isFinite(frame.swapInterval)?frame.swapInterval:null,"
+      + "uncappedYieldCount:typeof frame.uncappedYieldCount==='number'&&Number.isFinite(frame.uncappedYieldCount)?frame.uncappedYieldCount:null,"
+      + "vsyncYieldCount:typeof frame.vsyncYieldCount==='number'&&Number.isFinite(frame.vsyncYieldCount)?frame.vsyncYieldCount:null,"
+      + "presentToRafCount:typeof frame.presentToRafCount==='number'&&Number.isFinite(frame.presentToRafCount)?frame.presentToRafCount:null,"
+      + "fairYieldCount:typeof frame.fairYieldCount==='number'&&Number.isFinite(frame.fairYieldCount)?frame.fairYieldCount:null,"
+      + "messageChannelCreateFailureCount:typeof frame.messageChannelCreateFailureCount==='number'&&Number.isFinite(frame.messageChannelCreateFailureCount)?frame.messageChannelCreateFailureCount:null,"
+      + "messageChannelPostFailureCount:typeof frame.messageChannelPostFailureCount==='number'&&Number.isFinite(frame.messageChannelPostFailureCount)?frame.messageChannelPostFailureCount:null,"
+      + "messageChannelRebuildCount:typeof frame.messageChannelRebuildCount==='number'&&Number.isFinite(frame.messageChannelRebuildCount)?frame.messageChannelRebuildCount:null,"
+      + "cancelledMessageTaskCount:typeof frame.cancelledMessageTaskCount==='number'&&Number.isFinite(frame.cancelledMessageTaskCount)?frame.cancelledMessageTaskCount:null,"
+      + "watchdogYieldCount:typeof frame.watchdogYieldCount==='number'&&Number.isFinite(frame.watchdogYieldCount)?frame.watchdogYieldCount:null,"
       + "lostFrameTimes:shouldDrain?Math.max(0,delta-available):0},"
       + "pipeline:{pendingTasks:Number(pipeline.pendingTasks)||0,"
       + "queueCapacity:Number(pipeline.queueCapacity)||0,"
@@ -2206,7 +2393,7 @@ async function samplePage(session, drainFrames = true) {
       + "inboundQueuedBytes:Number(network.inboundQueuedBytes)||0,"
       + "peakInboundQueuedBytes:Number(network.peakInboundQueuedBytes)||0,"
       + "decodedPacketQueue:Number(network.decodedPacketQueue)||0,"
-      + "maxDecodedQueue:Number(network.maxDecodedQueue)||0,"
+      + "maxDecodedPacketQueue:Number(network.maxDecodedPacketQueue)||0,"
       + "activeHighWatermarkMillis:Number(network.activeHighWatermarkMillis)||0,"
       + "longestHighWatermarkMillis:Number(network.longestHighWatermarkMillis)||0,"
       + "pumpCalls:Number(network.pumpCalls)||0,"
@@ -2216,7 +2403,7 @@ async function samplePage(session, drainFrames = true) {
       + "runtimeInvariants:{glStats,targeting:targetingSnapshot,"
       + "worldgen:scalarSnapshot(worker.worldgen||{}),"
       + "workerQueue:scalarSnapshot(worker.chunkPriority||{}),"
-      + "renderPipeline:scalarSnapshot(pipeline),framePacing},"
+      + "renderPipeline:scalarSnapshot(pipeline),network:scalarSnapshot(network),framePacing},"
       + "resources:{entries:resourceEntries.length,"
       + "transferBytes:resourceEntries.reduce((sum,item)=>sum+(Number(item.transferSize)||0),0),"
       + "decodedBytes:resourceEntries.reduce((sum,item)=>sum+(Number(item.decodedBodySize)||0),0),"
@@ -2224,7 +2411,7 @@ async function samplePage(session, drainFrames = true) {
       + "textures:gl.textures&&Number(gl.textures.size)||0,"
       + "framebuffers:gl.framebuffers&&Number(gl.framebuffers.size)||0,"
       + "programs:gl.programs&&Number(gl.programs.size)||0,"
-      + "vertexArrays:gl.vertexArrays&&Number(gl.vertexArrays.size)||0},"
+      + "vertexArrays:gl.vaos&&Number(gl.vaos.size)||0},"
       + "audio:{buffers:audio.buffers&&Number(audio.buffers.size)||0,"
       + "sources:audio.sources&&Number(audio.sources.size)||0,"
       + "contextState:audio.context&&String(audio.context.state||'unknown')||null},"
@@ -2280,7 +2467,7 @@ async function finalTelemetry(session) {
     + "const worker=globalThis.__gaiusWorkerMessageTelemetry||{};"
     + "const workers=globalThis.__gaiusSingleplayerWorkers;"
     + "const workerEntries=workers&&typeof workers.entries==='function'?Array.from(workers.entries()):[];"
-    + "const workerStates=workerEntries.slice(0,16).map(([id,item])=>({sessionId:String(id),"
+    + "const workerStates=workerEntries.map(([id,item])=>({sessionId:String(id),"
     + "terminal:!!item?.__gaiusTerminal,runtimeReady:!!item?.__gaiusRuntimeReady,"
     + "stopped:!!item?.__gaiusStopped,distances:String(item?.__gaiusDistances||'')}));"
     + "const scalarSnapshot=value=>{const result={};"
@@ -2349,6 +2536,16 @@ async function finalTelemetry(session) {
     + "longestFrameMillis:Number(frame.longestFrameMillis)||0,"
     + "freezeCount:Number(frame.freezeCount)||0,hiddenFrameCount:Number(frame.hiddenFrameCount)||0,"
     + "visibleFrameCount:Number(frame.visibleFrameCount)||0,"
+    + "swapInterval:typeof frame.swapInterval==='number'&&Number.isFinite(frame.swapInterval)?frame.swapInterval:null,"
+    + "uncappedYieldCount:typeof frame.uncappedYieldCount==='number'&&Number.isFinite(frame.uncappedYieldCount)?frame.uncappedYieldCount:null,"
+    + "vsyncYieldCount:typeof frame.vsyncYieldCount==='number'&&Number.isFinite(frame.vsyncYieldCount)?frame.vsyncYieldCount:null,"
+    + "presentToRafCount:typeof frame.presentToRafCount==='number'&&Number.isFinite(frame.presentToRafCount)?frame.presentToRafCount:null,"
+    + "fairYieldCount:typeof frame.fairYieldCount==='number'&&Number.isFinite(frame.fairYieldCount)?frame.fairYieldCount:null,"
+    + "messageChannelCreateFailureCount:typeof frame.messageChannelCreateFailureCount==='number'&&Number.isFinite(frame.messageChannelCreateFailureCount)?frame.messageChannelCreateFailureCount:null,"
+    + "messageChannelPostFailureCount:typeof frame.messageChannelPostFailureCount==='number'&&Number.isFinite(frame.messageChannelPostFailureCount)?frame.messageChannelPostFailureCount:null,"
+    + "messageChannelRebuildCount:typeof frame.messageChannelRebuildCount==='number'&&Number.isFinite(frame.messageChannelRebuildCount)?frame.messageChannelRebuildCount:null,"
+    + "cancelledMessageTaskCount:typeof frame.cancelledMessageTaskCount==='number'&&Number.isFinite(frame.cancelledMessageTaskCount)?frame.cancelledMessageTaskCount:null,"
+    + "watchdogYieldCount:typeof frame.watchdogYieldCount==='number'&&Number.isFinite(frame.watchdogYieldCount)?frame.watchdogYieldCount:null,"
     + "sampleCapacity:Number(frame.sampleCapacity)||0,sampleWriteIndex:Number(frame.sampleWriteIndex)||0,"
     + "sampleCount:Number(frame.sampleCount)||0,drainedFrameCount:drained,"
     + "frameTimes:frame.frameTimes?Array.from(frame.frameTimes):[],"
@@ -2386,7 +2583,7 @@ async function finalTelemetry(session) {
     + "runtimeInvariants:{glStats,targeting:targetingSnapshot,"
     + "worldgen:scalarSnapshot(worker.worldgen||{}),"
     + "workerQueue:scalarSnapshot(worker.chunkPriority||{}),"
-    + "renderPipeline:scalarSnapshot(pipeline),framePacing},"
+    + "renderPipeline:scalarSnapshot(pipeline),network:scalarSnapshot(network),framePacing},"
     + "memory:{browserMemory:globalThis.__gaiusMemoryTelemetry?.browserMemory"
     + "?Object.assign({},globalThis.__gaiusMemoryTelemetry.browserMemory):null},"
     + "longTasks:{capacity:Number(longTasks.capacity)||0,count:Number(longTasks.count)||0,"
@@ -2417,6 +2614,90 @@ async function finalTelemetry(session) {
     lostSamples: recovered.lostSamples,
   };
   return telemetry;
+}
+
+async function collectFailureDiagnostics(session) {
+  const startedAt = Date.now();
+  const unavailable = (reason) => ({
+    verdict: "unavailable",
+    capturedAt: new Date().toISOString(),
+    durationMillis: Date.now() - startedAt,
+    error: String(reason && (reason.stack || reason.message) || reason),
+  });
+  if (!session) return unavailable("page CDP session is unavailable");
+
+  // Keep failure collection independent from the benchmark's larger telemetry path. A
+  // bounded, defensive snapshot is useful even when the page is already stalled.
+  const expression = "(() => {"
+    + "const limits={depth:5,nodes:2500,array:256,keys:128,string:8192};"
+    + "let nodes=0;const seen=new WeakMap();let nextId=1;"
+    + "const text=value=>{const result=String(value??'');return result.length>limits.string"
+    + "?result.slice(0,limits.string)+'...[truncated]':result;};"
+    + "const serialize=(value,depth=0)=>{"
+    + "if(value===null||typeof value==='undefined'||typeof value==='boolean')return value;"
+    + "if(typeof value==='string')return text(value);"
+    + "if(typeof value==='number')return Number.isFinite(value)?value:String(value);"
+    + "if(typeof value==='bigint')return String(value)+'n';"
+    + "if(typeof value==='function')return '[Function '+text(value.name||'anonymous')+']';"
+    + "if(typeof value!=='object')return text(value);"
+    + "if(depth>=limits.depth)return '[DepthLimit]';"
+    + "if(nodes++>=limits.nodes)return '[NodeLimit]';"
+    + "if(seen.has(value))return '[Circular#'+seen.get(value)+']';"
+    + "const id=nextId++;seen.set(value,id);"
+    + "try{"
+    + "if(value instanceof Error)return {name:text(value.name),message:text(value.message),"
+    + "stack:text(value.stack)};"
+    + "if(value instanceof ArrayBuffer)return {type:'ArrayBuffer',byteLength:value.byteLength};"
+    + "if(ArrayBuffer.isView(value))return {type:text(value.constructor?.name||'View'),"
+    + "length:Number(value.length)||0,byteLength:Number(value.byteLength)||0};"
+    + "if(value instanceof Map){const result={type:'Map',size:value.size,entries:[]};"
+    + "let count=0;for(const [key,item] of value){if(count++>=limits.array)break;"
+    + "result.entries.push([serialize(key,depth+1),serialize(item,depth+1)]);}return result;}"
+    + "if(value instanceof Set){const result={type:'Set',size:value.size,values:[]};"
+    + "let count=0;for(const item of value){if(count++>=limits.array)break;"
+    + "result.values.push(serialize(item,depth+1));}return result;}"
+    + "if(Array.isArray(value)){const result=[];const start=Math.max(0,value.length-limits.array);"
+    + "for(let index=start;index<value.length;index++)result.push(serialize(value[index],depth+1));"
+    + "if(start>0)result.unshift('[...'+start+' earlier items omitted]');return result;}"
+    + "const result={};let count=0;for(const key of Object.keys(value)){"
+    + "if(count++>=limits.keys){result.__truncatedKeys=true;break;}"
+    + "try{result[key]=serialize(value[key],depth+1);}catch(error){result[key]='[GetterError '+text(error)+']';}}"
+    + "return result;"
+    + "}catch(error){return '[SerializeError '+text(error)+']';}};"
+    + "const workers=globalThis.__gaiusSingleplayerWorkers;const workerStates=[];"
+    + "if(workers&&typeof workers.entries==='function'){"
+    + "let count=0;for(const [id,item] of workers.entries()){if(count++>=limits.array)break;"
+    + "workerStates.push({sessionId:text(id),terminal:!!item?.__gaiusTerminal,"
+    + "runtimeReady:!!item?.__gaiusRuntimeReady,stopped:!!item?.__gaiusStopped,"
+    + "distances:text(item?.__gaiusDistances||''),state:serialize(item)});}}"
+    + "const events=globalThis.__gaiusMinecraftEvents;"
+    + "const eventSnapshot=Array.isArray(events)?events.slice(-limits.array):events;"
+    + "const snapshot=value=>{const result=serialize(value);return typeof result==='undefined'?null:result;};"
+    + "const url=(()=>{try{return text(globalThis.location?.href||'');}catch(error){return '[ReadError '+text(error)+']';}})();"
+    + "const title=(()=>{try{return text(globalThis.document?.title||'');}catch(error){return '[ReadError '+text(error)+']';}})();"
+    + "const bodyText=(()=>{try{return text(globalThis.document?.body?.innerText||'');}catch(error){return '[ReadError '+text(error)+']';}})();"
+    + "const minecraftState=snapshot(globalThis.__gaiusMinecraftState);"
+    + "const minecraftEvents=snapshot(eventSnapshot);"
+    + "const workerMessageTelemetry=snapshot(globalThis.__gaiusWorkerMessageTelemetry);"
+    + "const futurePumpTelemetry=snapshot(globalThis.__gaiusFuturePumpTelemetry);"
+    + "return {capturedAt:Date.now(),url,title,bodyText,page:{url,title,bodyText},"
+    + "minecraftState,minecraftEvents,workerMessageTelemetry,futurePumpTelemetry,"
+    + "singleplayerWorkers:workerStates};"
+    + "})()";
+  try {
+    const value = await withTimeout(
+      evaluate(session, expression, Math.min(1500, cdpCommandTimeoutMillis)),
+      2_000,
+      "failure diagnostics",
+    );
+    return {
+      verdict: "captured",
+      durationMillis: Date.now() - startedAt,
+      ...(value && typeof value === "object" ? value : {error: "page returned no diagnostic object"}),
+    };
+  } catch (error) {
+    return unavailable(error);
+  }
 }
 
 async function collectHeap(session, targetSessionId = null, forceGc = false) {
@@ -2461,23 +2742,46 @@ async function collectBrowserMemory(session, targetSessionId = null) {
 
 async function collectWorkerHeap(session, forceGc = false) {
   const targets = await session.send("Target.getTargets");
-  const workerTarget = (targets.targetInfos || []).find((target) => target.type === "worker"
-    && /singleplayer|server-worker|worker|blob:/i.test(
-      String(target.title || "") + " " + String(target.url || ""),
-    ));
-  if (!workerTarget?.targetId) return null;
-  const attached = await session.send("Target.attachToTarget", {
-    targetId: workerTarget.targetId,
-    flatten: true,
+  const workers = (targets.targetInfos || []).filter((target) => target.type === "worker");
+  workers.sort((left, right) => {
+    const exact = (target) => /singleplayer-server-worker|Gaius Integrated Server/i.test(
+      `${String(target.title || "")} ${String(target.url || "")}`,
+    ) ? 1 : 0;
+    return exact(right) - exact(left);
   });
-  try {
-    await session.send("Runtime.enable", {}, attached.sessionId);
-    const heap = await collectHeap(session, attached.sessionId, forceGc);
-    heap.browserMemory = await collectBrowserMemory(session, attached.sessionId);
-    return heap;
-  } finally {
-    await session.send("Target.detachFromTarget", {sessionId: attached.sessionId}).catch(() => {});
+  for (const workerTarget of workers) {
+    if (!workerTarget?.targetId) continue;
+    const attached = await session.send("Target.attachToTarget", {
+      targetId: workerTarget.targetId,
+      flatten: true,
+    });
+    try {
+      await session.send("Runtime.enable", {}, attached.sessionId);
+      const marker = await session.send("Runtime.evaluate", {
+        expression: "(() => ({isIntegratedServer:"
+          + "typeof globalThis.__gaiusServerSessionId==='string'"
+          + "&&globalThis.__gaiusServerSessionId.length>0"
+          + "&&typeof globalThis.__gaiusServerWorldId==='string',"
+          + "sessionId:String(globalThis.__gaiusServerSessionId||''),"
+          + "worldId:String(globalThis.__gaiusServerWorldId||'')}))()",
+        returnByValue: true,
+      }, attached.sessionId);
+      if (marker.result?.value?.isIntegratedServer !== true) continue;
+      const heap = await collectHeap(session, attached.sessionId, forceGc);
+      heap.browserMemory = await collectBrowserMemory(session, attached.sessionId);
+      heap.workerIdentity = {
+        targetId: workerTarget.targetId,
+        title: workerTarget.title || null,
+        url: workerTarget.url || null,
+        sessionId: marker.result.value.sessionId,
+        worldId: marker.result.value.worldId,
+      };
+      return heap;
+    } finally {
+      await session.send("Target.detachFromTarget", {sessionId: attached.sessionId}).catch(() => {});
+    }
   }
+  return null;
 }
 
 async function collectCombinedBrowserMemory(session) {
@@ -2696,6 +3000,17 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
   const stabilityWorker = telemetry.worker || {};
 
   const options = parseOptionsText(telemetry.environment?.optionsText);
+  const framePacingEvidence = evaluateUncappedFramePacing({
+    samples: validSamples
+      .map((sample) => ({
+        ...(sample.runtimeInvariants?.framePacing || {}),
+        ...Object.fromEntries(Object.entries(sample.frame || {})
+          .filter(([, value]) => value != null)),
+      }))
+      .filter((sample) => sample && typeof sample === "object"),
+    final: performanceFrame,
+    requirements: environmentRules.uncappedEvidence || {},
+  });
   const rafIntervals = Array.from(performanceProbe.rafIntervals || [], Number)
     .filter((current) => Number.isFinite(current) && current > 0);
   const raf = summarizeScalarSamples(rafIntervals);
@@ -2797,16 +3112,20 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
   if (!optionsSeeded) {
     environmentIssues.push("benchmark options were not proven to be seeded before Minecraft startup");
   }
-  const uncapped = optionsSeeded
+  const configuredUncapped = optionsSeeded
     && Number(options.maxFps) === unlimitedSentinel
     && options.enableVsync === false
     && Number.isFinite(runtimeGameFps)
     && runtimeGameFps > 0
     && Number(performanceFrame.frameCount || 0) > 0;
-  if (!uncapped) {
+  const uncapped = configuredUncapped && framePacingEvidence.verdict === "pass";
+  if (!configuredUncapped) {
     environmentIssues.push(
       "runtime frame telemetry did not prove the loaded Unlimited/VSync-off configuration",
     );
+  }
+  if (framePacingEvidence.verdict !== "pass") {
+    environmentIssues.push(...framePacingEvidence.reasons);
   }
   if (query.targetFps !== String(expectedMaxFps)
       || query.autoDpr !== (environmentRules.autoDpr === false ? "0" : "1")
@@ -2822,7 +3141,7 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
   if (strict && warmupMillis < Number(profile.warmupMs || measurementRules.warmupMs || 0)) {
     environmentIssues.push("warmup was shorter than the selected profile contract");
   }
-  if (strict && performanceMillis < Number(
+  if (strict && frameMeasurementMillis < Number(
     profile.fpsWindowMs || profile.durationMs || measurementRules.sampleMs || 0,
   )) {
     environmentIssues.push("FPS window was shorter than the selected profile contract");
@@ -2860,11 +3179,13 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
     optionsSeed: context.profileGateResult || null,
     frameLimiter: {
       uncapped,
-      source: "runtime-loaded-options-and-BrowserGlfw",
+      configured: configuredUncapped,
+      source: "runtime-loaded-options-and-uncapped-frame-pacing-telemetry",
       configuredMaxFps: Number.isFinite(Number(options.maxFps)) ? Number(options.maxFps) : null,
       unlimitedSentinel,
       runtimeGameFps: Number.isFinite(runtimeGameFps) ? runtimeGameFps : null,
       vsync: options.enableVsync,
+      evidence: framePacingEvidence,
     },
     foregroundRequired,
     frameSampleCapacity: Number(performanceFrame.sampleCapacity || 0),
@@ -2873,7 +3194,7 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
     profileName,
     durations: {
       warmupMillis,
-      fpsWindowMillis: performanceMillis,
+      fpsWindowMillis: frameMeasurementMillis,
       soakMillis: heapMillis,
       cleanupMillis,
       startupTimeoutMillis,
@@ -3051,41 +3372,130 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
     totalUsedBytes: heapTotal(sample),
     supported: sample.page?.gcSupported !== false && sample.worker?.gcSupported !== false,
   })).filter((sample) => Number.isFinite(sample.totalUsedBytes));
+  const memoryRequiredDurationMillis = Number(
+    profile.soakMs || measurementRules.soakMs || 1_800_000,
+  );
+  const heapAttemptedSampleTimes = heapSamples.map((sample) => sample.atMillis);
   const memoryTrend = summarizeMemoryTrend({
     regularSamples: regularHeap,
     postGcSamples: postGcHeap,
     durationMs: heapMillis,
-    requiredDurationMs: Number(profile.soakMs || measurementRules.soakMs || 1_800_000),
+    requiredDurationMs: memoryRequiredDurationMillis,
     loadedChunkDelta,
     postGcFinalWindows,
     retainedGrowthPercentMax: Number(heapMemoryContract.retainedGrowthPercentMax || 15),
     retainedGrowthBytesMax: Number(heapMemoryContract.retainedGrowthBytesMax || 268435456),
     peakUsedBytesMax: Number(heapMemoryContract.peakUsedBytesMax || 8589934592),
+    plateauSlopeMiBPerMinuteMax: Number(
+      heapMemoryContract.plateauSlopeMiBPerMinuteMax || 1,
+    ),
+    attemptedSampleTimes: heapAttemptedSampleTimes,
+    sampleIntervalMs: Number(measurementContract.heapIntervalMs || 5000),
+    minimumAvailableRatio: Number(heapMemoryContract.minimumAvailableRatio || 0.9),
+    minimumDurationCoverageRatio: Number(
+      heapMemoryContract.minimumDurationCoverageRatio || 0.98,
+    ),
+    maximumSampleGapRatio: Number(heapMemoryContract.maximumSampleGapRatio || 1.5),
   });
-  const nativeSample = (sample) => {
+  const nativeSample = (sample, requireWorker = true) => {
+    if (!sample?.page?.browserMemory
+        || (requireWorker && !sample?.worker?.browserMemory)) return null;
     const combined = combineBrowserMemory(
       sample?.page?.browserMemory,
       sample?.worker?.browserMemory,
     );
     return combined ? {atMillis: sample.atMillis, ...combined} : null;
   };
-  const nativeRegular = heapSamples.map(nativeSample).filter(Boolean);
+  const nativeRegular = heapSamples.map((sample) => nativeSample(sample, true)).filter(Boolean);
   const nativePostGc = heapSamples.filter((sample) => sample.postGc)
-    .map(nativeSample).filter(Boolean);
-  const nativeCleanup = (context.cleanupHeapSamples || []).map(nativeSample).filter(Boolean);
+    .map((sample) => nativeSample(sample, true)).filter(Boolean);
+  const nativeCleanup = (context.cleanupHeapSamples || [])
+    .map((sample) => nativeSample(sample, true)).filter(Boolean);
+  const missingCombinedNativeSamples = heapSamples.filter(
+    (sample) => !sample?.page?.browserMemory || !sample?.worker?.browserMemory,
+  );
+  const cleanupHeapSamples = context.cleanupHeapSamples || [];
+  const missingCleanupNativeSamples = cleanupHeapSamples.filter(
+    (sample) => !sample?.page?.browserMemory || !sample?.worker?.browserMemory,
+  );
+  const cleanupSourceComplete = cleanupHeapSamples.length > 0
+    && missingCleanupNativeSamples.length === 0;
   const nativeMemory = summarizeNativeMemoryTrend({
     regularSamples: nativeRegular,
     postGcSamples: nativePostGc,
     cleanupSamples: nativeCleanup,
     baseline: context.browserMemoryBaseline,
     durationMs: heapMillis,
-    requiredDurationMs: Number(profile.soakMs || measurementRules.soakMs || 1_800_000),
+    requiredDurationMs: memoryRequiredDurationMillis,
     postGcFinalWindows,
+    attemptedSampleTimes: heapAttemptedSampleTimes,
+    sampleIntervalMs: Number(measurementContract.heapIntervalMs || 5000),
+    minimumAvailableRatio: Number(browserMemoryContract.minimumAvailableRatio || 0.9),
+    minimumDurationCoverageRatio: Number(
+      browserMemoryContract.minimumDurationCoverageRatio || 0.98,
+    ),
+    maximumSampleGapRatio: Number(browserMemoryContract.maximumSampleGapRatio || 1.5),
+    cleanupSourceComplete,
   });
+  const browserMemorySafetySamples = [
+    ...heapSamples.map((sample) => ({...sample, sourcePhase: sample.phase || "soak"})),
+    ...cleanupHeapSamples.map((sample) => ({...sample, sourcePhase: "cleanup"})),
+  ].flatMap((sample) => [
+    {
+      source: `${sample.sourcePhase}:page`,
+      atMillis: sample.atMillis,
+      memory: sample?.page?.browserMemory,
+    },
+    {
+      source: `${sample.sourcePhase}:worker`,
+      atMillis: sample.atMillis,
+      memory: sample?.worker?.browserMemory,
+    },
+    {
+      source: `${sample.sourcePhase}:page+worker`,
+      atMillis: sample.atMillis,
+      aggregate: true,
+      memory: combineBrowserMemorySafety(
+        sample?.page?.browserMemory,
+        sample?.worker?.browserMemory,
+      ),
+    },
+  ]);
+  const browserMemorySafety = evaluateBrowserMemorySafety({
+    snapshots: browserMemorySafetySamples,
+    requiredFields: [
+      ...(browserMemoryContract.liveFields || []),
+      ...(browserMemoryContract.safetyRequiredFields || []),
+    ],
+    failureFields: browserMemoryContract.failureFields || [],
+    limits: browserMemoryContract.limits || {},
+    aggregateLimits: browserMemoryContract.aggregateLimits || {},
+  });
+  nativeMemory.safety = browserMemorySafety;
+  if (heapMillis >= memoryRequiredDurationMillis
+      && browserMemorySafety.verdict === "fail") {
+    nativeMemory.verdict = "fail";
+    nativeMemory.reasons.push(...browserMemorySafety.reasons);
+  } else if (heapMillis >= memoryRequiredDurationMillis
+      && browserMemorySafety.verdict !== "pass"
+      && nativeMemory.verdict !== "fail") {
+    nativeMemory.verdict = "inconclusive";
+    nativeMemory.reasons.push(...browserMemorySafety.reasons);
+  }
   if (nativeMemory.verdict === "pass" && !context.leftWorld) {
     nativeMemory.verdict = "inconclusive";
     nativeMemory.reasons.push("the benchmark did not verify a successful world exit");
   }
+  if (nativeMemory.verdict === "pass" && missingCombinedNativeSamples.length > 0) {
+    nativeMemory.verdict = "inconclusive";
+    nativeMemory.reasons.push(
+      `${missingCombinedNativeSamples.length} BrowserMemory sample(s) did not include both page and integrated-server Worker`,
+    );
+  }
+  nativeMemory.missingCombinedSourceSamples = missingCombinedNativeSamples.length;
+  nativeMemory.missingCleanupSourceSamples = missingCleanupNativeSamples.length;
+  nativeMemory.cleanupSourceComplete = cleanupSourceComplete;
+  nativeMemory.requiredRuntimeSourceCount = 2;
   const processRssRules = contract.processRss || {};
   const processRss = summarizeChromeProcessRssTrend({
     samples: context.processRssSamples || [],
@@ -3099,6 +3509,7 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
     minimumDurationCoverageRatio: Number(
       processRssRules.minimumDurationCoverageRatio || 0.98,
     ),
+    maximumSampleGapRatio: Number(processRssRules.maximumSampleGapRatio || 1.5),
     trendWindowCount: Number(processRssRules.trendWindowCount || 4),
     processTypes: processRssRules.processTypes,
     requiredProcessTypes: processRssRules.requiredProcessTypes,
@@ -3179,6 +3590,12 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
     .map((sample) => ({at: sample.at, ...sample.workerLifecycle}))
     .concat([{at: telemetry.stabilityCapturedAt, ...telemetry.workerLifecycle}])
     .filter((lifecycle) => Number.isFinite(Number(lifecycle.at)));
+  const workerHeartbeatTelemetry = validateWorkerHeartbeatTelemetry(
+    performanceWorker,
+    telemetry.workerLifecycle,
+    context,
+    heartbeatContract,
+  );
   const terminalWorkerSamples = lifecycleSamples.filter(
     (lifecycle) => Number(lifecycle.terminalCount || 0) > 0,
   );
@@ -3206,8 +3623,35 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
       || fatalPattern.test(detail);
   });
   const contextLosses = Array.from(stabilityProbe.contextLosses || []);
-  const worldLost = allSamples.some((sample) => !sample.level || sample.noRender || !sample.running);
-  const stabilitySamplingFailures = stabilitySamples.filter(
+  const stateViolations = allSamples.filter((sample) =>
+    !Number.isFinite(Number(sample.stateAt))
+      || Number(sample.stateAt) <= 0
+      || sample.level !== "net.minecraft.client.multiplayer.ClientLevel"
+      || sample.screen !== null
+      || sample.overlay !== null
+      || sample.noRender !== false
+      || sample.running !== true
+      || sample.pause !== false);
+  let maximumStateStallMillis = 0;
+  let lastStateAt = null;
+  let lastStateProgressAt = null;
+  for (const sample of allSamples) {
+    const stateAt = Number(sample.stateAt);
+    const at = Number(sample.at);
+    if (!Number.isFinite(stateAt) || !Number.isFinite(at)) continue;
+    if (lastStateAt == null || stateAt > lastStateAt) {
+      lastStateAt = stateAt;
+      lastStateProgressAt = at;
+    } else if (lastStateProgressAt != null) {
+      maximumStateStallMillis = Math.max(maximumStateStallMillis, at - lastStateProgressAt);
+    }
+  }
+  const maximumAllowedStateStallMillis = Number(
+    measurementRules.maximumStateStallMs || 1000,
+  );
+  const stateStalled = maximumStateStallMillis > maximumAllowedStateStallMillis;
+  const worldLost = stateViolations.length > 0 || stateStalled;
+  const stabilitySamplingFailures = samples.concat(stabilitySamples).filter(
     (sample) => sample.error || Number(sample.evaluationLatencyMillis) >= 500,
   );
   const cleanupSamplingFailures = (context.cleanupHeapSamples || []).filter(
@@ -3215,10 +3659,13 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
   );
   const stabilityHeartbeatGaps = Array.from(stabilityProbe.heartbeatGaps || [], Number)
     .filter((current) => Number.isFinite(current) && current >= 500);
-  const stabilityWorkerFrozen = Number(stabilityWorker.maxRttMillis || 0)
-      >= Number(heartbeatContract.rttMaxMs || 500)
-    || Number(stabilityWorker.longestHeartbeatDelayMillis || 0)
-      >= Number(heartbeatContract.delayMaxMs || 500);
+  const stabilityWorkerFrozen = workerHeartbeatTelemetry.verdict !== "pass"
+    || Number(stabilityWorker.maxRttMillis)
+      > Number(heartbeatContract.rttMaxMs || 250)
+    || Number(stabilityWorker.p99RttMillis)
+      > Number(heartbeatContract.rttP99MaxMs || 50)
+    || Number(stabilityWorker.longestHeartbeatDelayMillis)
+      > Number(heartbeatContract.delayMaxMs || 250);
   const stabilityWorkerFailed = Number(stabilityWorker.missed || 0) > 0
     || Number(stabilityWorker.errors || 0) > 0
     || Number(stabilityWorker.pending || 0) > Number(heartbeatContract.pendingMax || 3);
@@ -3245,11 +3692,14 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
   if (stabilityWorkerFrozen) {
     stabilityReasons.push("Worker heartbeat or MessagePort RTT exceeded the contract");
   }
+  stabilityReasons.push(...workerHeartbeatTelemetry.reasons);
   if (stabilityWorkerFailed) {
     stabilityReasons.push("Worker heartbeat reported missed, errored, or excessive pending probes");
   }
-  if (audioState != null && audioState !== "running") {
-    stabilityReasons.push(`audio context ended in ${audioState} state`);
+  if (audioState !== "running") {
+    stabilityReasons.push(audioState == null
+      ? "audio context state was unavailable"
+      : `audio context ended in ${audioState} state`);
   }
   const stability = {
     verdict: stabilityReasons.length ? "fail" : "pass",
@@ -3261,6 +3711,9 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
     disconnectedWorkerSamples,
     contextLosses,
     worldLost,
+    stateViolations,
+    maximumStateStallMillis,
+    maximumAllowedStateStallMillis,
     cleanupSamplingFailures,
     frameFreezeCount: Number(stabilityFrame.freezeCount || 0),
     hiddenFrameCount: Number(stabilityFrame.hiddenFrameCount || 0),
@@ -3268,23 +3721,57 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
     workerHeartbeat: stabilityWorker,
   };
 
-  const positions = validSamples.filter((sample) => sample.player
+  const positions = validSamples.filter((sample) => sample.workloadActive === true && sample.player
     && Number.isFinite(sample.player.x) && Number.isFinite(sample.player.z));
   const startPosition = positions[0]?.player || null;
   const endPosition = positions.at(-1)?.player || null;
   const displacementBlocks = startPosition && endPosition
     ? Math.hypot(endPosition.x - startPosition.x, endPosition.z - startPosition.z)
     : 0;
+  let maximumTraversalStallMillis = 0;
+  let lastTravelChunk = null;
+  let lastTravelChunkChangeAt = null;
+  for (const sample of validSamples) {
+    if (sample.workloadActive !== true || !sample.chunk) {
+      lastTravelChunk = null;
+      lastTravelChunkChangeAt = null;
+      continue;
+    }
+    const key = `${sample.chunk.x}:${sample.chunk.z}`;
+    const at = Number(sample.at);
+    if (!Number.isFinite(at)) continue;
+    if (lastTravelChunk == null || key !== lastTravelChunk) {
+      lastTravelChunk = key;
+      lastTravelChunkChangeAt = at;
+    } else if (lastTravelChunkChangeAt != null) {
+      maximumTraversalStallMillis = Math.max(
+        maximumTraversalStallMillis,
+        at - lastTravelChunkChangeAt,
+      );
+    }
+  }
+  const minimumTraversalChunks = Number(measurementRules.minimumTraversalChunks || 16);
+  const minimumTraversalBlocks = Number(measurementRules.minimumTraversalBlocks || 256);
+  const maximumAllowedTraversalStallMillis = Number(
+    measurementRules.maximumTraversalStallMs || 10_000,
+  );
+  const travelPassed = context.freshChromeProfile
+    && observedChunks.size >= minimumTraversalChunks
+    && displacementBlocks >= minimumTraversalBlocks
+    && maximumTraversalStallMillis <= maximumAllowedTraversalStallMillis;
   const travel = {
     uniqueChunkCoordinates: observedChunks.size,
     displacementBlocks,
     startPosition,
     endPosition,
+    minimumTraversalChunks,
+    minimumTraversalBlocks,
+    maximumTraversalStallMillis,
+    maximumAllowedTraversalStallMillis,
     freshChromeProfile: context.freshChromeProfile,
-    crossedNewTerrainVerdict: context.freshChromeProfile
-        && observedChunks.size >= 8 && displacementBlocks >= 128
+    crossedNewTerrainVerdict: travelPassed
       ? "pass"
-      : "inconclusive",
+      : (context.freshChromeProfile ? "fail" : "inconclusive"),
     note: context.freshChromeProfile
       ? "A fresh Chrome profile created a new local world before traversal."
       : "An attached profile cannot prove that crossed chunks were newly generated.",
@@ -3342,22 +3829,36 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
     runtimeInvariants,
   });
   const heartbeatPendingMax = Number(heartbeatContract.pendingMax || 3);
-  const heartbeatRttMax = Number(heartbeatContract.rttMaxMs || 500);
-  const heartbeatDelayMax = Number(heartbeatContract.delayMaxMs || 500);
-  const workerStatus = Number(performanceWorker.received || 0) > 0
-      && Number(performanceWorker.missed || 0) === 0
-      && Number(performanceWorker.errors || 0) === 0
-      && Number(performanceWorker.pending || 0) <= heartbeatPendingMax
-      && Number(performanceWorker.maxRttMillis || 0) < heartbeatRttMax
-      && Number(performanceWorker.longestHeartbeatDelayMillis || 0) < heartbeatDelayMax
+  const heartbeatRttP99Max = Number(heartbeatContract.rttP99MaxMs || 50);
+  const heartbeatRttMax = Number(heartbeatContract.rttMaxMs || 250);
+  const heartbeatDelayMax = Number(heartbeatContract.delayMaxMs || 250);
+  const workerStatus = workerHeartbeatTelemetry.verdict === "pass"
+      && Number(performanceWorker.missed) === 0
+      && Number(performanceWorker.errors) === 0
+      && Number(performanceWorker.pending) <= heartbeatPendingMax
+      && Number(performanceWorker.p99RttMillis) <= heartbeatRttP99Max
+      && Number(performanceWorker.maxRttMillis) <= heartbeatRttMax
+      && Number(performanceWorker.longestHeartbeatDelayMillis) <= heartbeatDelayMax
     ? "pass" : "fail";
   const heartbeat = {
     verdict: workerStatus,
-    pending: Number(performanceWorker.pending || 0),
+    reasons: workerHeartbeatTelemetry.reasons,
+    telemetryValidation: workerHeartbeatTelemetry,
+    sessionId: performanceWorker.sessionId || null,
+    measurementId: performanceWorker.measurementId || null,
+    updatedAt: Number.isFinite(Number(performanceWorker.updatedAt))
+      ? Number(performanceWorker.updatedAt) : null,
+    pending: Number.isFinite(Number(performanceWorker.pending))
+      ? Number(performanceWorker.pending) : null,
     pendingMax: heartbeatPendingMax,
-    maxRttMillis: Number(performanceWorker.maxRttMillis || 0),
+    p99RttMillis: Number.isFinite(Number(performanceWorker.p99RttMillis))
+      ? Number(performanceWorker.p99RttMillis) : null,
+    p99RttMaxMillis: heartbeatRttP99Max,
+    maxRttMillis: Number.isFinite(Number(performanceWorker.maxRttMillis))
+      ? Number(performanceWorker.maxRttMillis) : null,
     rttMaxMillis: heartbeatRttMax,
-    longestDelayMillis: Number(performanceWorker.longestHeartbeatDelayMillis || 0),
+    longestDelayMillis: Number.isFinite(Number(performanceWorker.longestHeartbeatDelayMillis))
+      ? Number(performanceWorker.longestHeartbeatDelayMillis) : null,
     delayMaxMillis: heartbeatDelayMax,
     note: "Heartbeat pending is probe health, not a world-generation or packet backlog.",
   };
@@ -3366,6 +3867,15 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
     runtimeInvariant: runtimeInvariants.components.worldgen,
     note: "Worker worldgen scheduler limits are release-gated when runtimeInvariants is required.",
   };
+  const performanceEvidence = buildPerformanceEvidence({
+    frames,
+    framePacing: framePacingEvidence,
+    memory,
+    freezes,
+    travel,
+    gates,
+    buildIdentity: context.buildIdentity || null,
+  });
   const rawFrameStatus = Number(performanceFrame.frameCount || 0) > 0
       && Number(performanceFrame.sampleCount || 0) > 0
       && frameTimes.length > 0
@@ -3401,7 +3911,7 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
     {name: "decoded packet queue contract",
       status: contractEvaluation.independent.decodedPacketQueue.verdict,
       actual: decodedPacketQueue},
-    {name: "Worker and MessagePort remain below 500 ms",
+    {name: "Worker heartbeat satisfies p99 and maximum latency bounds",
       status: workerStatus,
       actual: heartbeat},
     {name: "new-chunk traversal", status: travelStatus, actual: travel},
@@ -3453,6 +3963,8 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
     checks,
     contractEvaluation,
     environment,
+    performanceEvidence,
+    failureEvidence: strict && !passed ? performanceEvidence : null,
     startup,
     frame: frames,
     freezes,
@@ -3488,11 +4000,47 @@ let browserSessionError = null;
 let profileDirectory;
 let stopTravel = async () => {};
 let debuggingPort = attachPort;
-const chromeOutput = [];
+let chromeOutput = "";
 const events = [];
+const stickyFatalEvents = [];
+const immediateFatalPattern = /---- Minecraft Crash Report ----|Game crashed!|renderer crash|worker crash|bootstrap-crash|out of memory|allocation failed|\bOOM\b/i;
+const appendChromeOutput = (chunk) => {
+  chromeOutput = (chromeOutput + String(chunk)).slice(-64_000);
+};
+const recordEvent = (event) => {
+  events.push(event);
+  if (events.length > 1000) events.splice(0, events.length - 1000);
+  const text = String(event?.text || event?.detail || "");
+  if (event?.source === "exception"
+      || event?.source === "renderer crash"
+      || event?.source === "renderer detached"
+      || immediateFatalPattern.test(text)) {
+    stickyFatalEvents.push(event);
+    if (stickyFatalEvents.length > 64) stickyFatalEvents.shift();
+  }
+};
+const combinedEvents = () => {
+  const combined = events.slice();
+  for (const event of stickyFatalEvents) {
+    if (!combined.includes(event)) combined.push(event);
+  }
+  return combined;
+};
 const benchmarkStartedAt = Date.now();
 let result;
 let externalSmokeEvidence;
+const watchdogMillis = startupTimeoutMillis + warmupMillis + frameMeasurementMillis
+  + cleanupMillis + Number(measurementContract.watchdogGraceMs || 300_000);
+const watchdogTimer = setTimeout(() => {
+  recordEvent({
+    at: Date.now(),
+    source: "benchmark watchdog",
+    text: `benchmark exceeded its ${watchdogMillis} ms hard deadline`,
+  });
+  if (session) session.close();
+  if (browserSession) browserSession.close();
+  if (chrome) chrome.kill("SIGTERM");
+}, watchdogMillis);
 
 try {
   externalSmokeEvidence = await runExternalSmokeSuite();
@@ -3521,8 +4069,13 @@ try {
     if (headless) chromeArgs.push("--headless=new");
     chromeArgs.push("about:blank");
     chrome = spawn(chromeBinary, chromeArgs, {stdio: ["ignore", "pipe", "pipe"]});
-    chrome.stdout.on("data", (chunk) => chromeOutput.push(String(chunk)));
-    chrome.stderr.on("data", (chunk) => chromeOutput.push(String(chunk)));
+    chrome.stdout.on("data", appendChromeOutput);
+    chrome.stderr.on("data", appendChromeOutput);
+    chrome.on("exit", (code, signal) => recordEvent({
+      at: Date.now(),
+      source: "chrome process",
+      text: `Chrome exited with code ${code} signal ${signal || "none"}`,
+    }));
   }
 
   const browserVersion = await waitForJson(
@@ -3535,7 +4088,7 @@ try {
       await browserSession.open();
     } catch (error) {
       browserSessionError = String(error && (error.message || error) || error);
-      events.push({
+      recordEvent({
         at: Date.now(),
         source: "process-rss",
         text: `browser CDP session unavailable: ${browserSessionError}`,
@@ -3545,7 +4098,7 @@ try {
     }
   } else {
     browserSessionError = "Chrome /json/version did not expose webSocketDebuggerUrl";
-    events.push({at: Date.now(), source: "process-rss", text: browserSessionError});
+    recordEvent({at: Date.now(), source: "process-rss", text: browserSessionError});
   }
   const targets = await waitForJson("http://127.0.0.1:" + debuggingPort + "/json/list", 20_000);
   const page = targets.find((target) => target.type === "page");
@@ -3553,7 +4106,7 @@ try {
   session = new CdpSession(page.webSocketDebuggerUrl);
   await session.open();
   session.on("Runtime.consoleAPICalled", (event) => {
-    events.push({
+    recordEvent({
       at: Date.now(),
       source: "console",
       type: event.type,
@@ -3561,17 +4114,17 @@ try {
     });
   });
   session.on("Runtime.exceptionThrown", (event) => {
-    events.push({
+    recordEvent({
       at: Date.now(),
       source: "exception",
       text: event.exceptionDetails?.exception?.description || event.exceptionDetails?.text || "Unknown exception",
     });
   });
   session.on("Inspector.targetCrashed", (event) => {
-    events.push({at: Date.now(), source: "renderer crash", text: "renderer crash", detail: event});
+    recordEvent({at: Date.now(), source: "renderer crash", text: "renderer crash", detail: event});
   });
   session.on("Inspector.detached", (event) => {
-    events.push({at: Date.now(), source: "renderer detached", text: "renderer detached", detail: event});
+    recordEvent({at: Date.now(), source: "renderer detached", text: "renderer detached", detail: event});
   });
   await Promise.all([
     session.send("Page.enable"),
@@ -3590,7 +4143,7 @@ try {
   if (navigation.errorText) throw new Error("Chrome navigation failed: " + navigation.errorText);
   const profileGateResult = await passProfileGate(session);
   if (!profileGateResult?.seeded) {
-    events.push({
+    recordEvent({
       at: Date.now(),
       source: "benchmark",
       text: "The benchmark could not seed profile options before Minecraft startup",
@@ -3630,7 +4183,7 @@ try {
   };
   const gameplayProbe = await installGameplayAuthorityProbe(session);
   if (!gameplayProbe?.installed) {
-    events.push({
+    recordEvent({
       at: Date.now(),
       source: "gameplay-authority",
       text: gameplayProbe?.reason || "live gameplay authority probe was not installed",
@@ -3646,7 +4199,7 @@ try {
   }
   const reset = await resetMeasurement(session);
   if (!reset.distances.includes(expectedDistanceLabel)) {
-    events.push({
+    recordEvent({
       at: Date.now(),
       source: "benchmark",
       text: `Expected ${expectedDistanceLabel} distances, got ${reset.distances.join(",")}`,
@@ -3659,18 +4212,19 @@ try {
   let performanceTelemetry;
   let gameplayExercise;
   const measurementStartedAt = Date.now();
-  const processRssDurationMillis = heapMillis > 0 ? heapMillis : performanceMillis;
+  const processRssDurationMillis = frameMeasurementMillis;
   const performanceTask = (async () => {
-    await sampleFor(session, performanceMillis, samples);
+    await sampleFor(session, frameMeasurementMillis, samples);
     samples.push(await samplePage(session));
     performanceTelemetry = await finalTelemetry(session);
   })();
   const heapTask = heapMillis > 0
     ? collectHeapTrend(session, heapMillis, heapSampleMillis, heapIntervalMillis)
     : Promise.resolve([]);
-  const stabilityTask = heapMillis > 0
-    ? sampleFor(session, heapMillis, stabilitySamples, heapSampleMillis, false)
-    : Promise.resolve();
+  const continuousVisualTask = collectContinuousVisualOutput(
+    session,
+    frameMeasurementMillis,
+  );
   const processRssTask = collectChromeProcessRssTimeline(
     browserSession,
     processRssDurationMillis,
@@ -3681,23 +4235,23 @@ try {
   const gameplayTask = benchmarkProfile.gates?.gameplayAuthority
     ? exerciseGameplayAuthority(session, center, stopTravel)
     : Promise.resolve({verdict: "not-required"});
-  [, heapSamples, , processRssSamples, gameplayExercise] = await Promise.all([
+  let continuousVisualSamples;
+  [, heapSamples, continuousVisualSamples, processRssSamples, gameplayExercise] = await Promise.all([
     performanceTask,
     heapTask,
-    stabilityTask,
+    continuousVisualTask,
     processRssTask,
     gameplayTask,
   ]);
+  visualOutputSamples.push(...continuousVisualSamples);
   if (gameplayExercise?.verdict === "inconclusive") {
-    events.push({
+    recordEvent({
       at: Date.now(),
       source: "gameplay-authority",
       text: String(gameplayExercise.reason || "gameplay action evidence was inconclusive"),
     });
   }
-  const stabilityTelemetry = heapMillis > 0
-    ? await finalTelemetry(session)
-    : performanceTelemetry;
+  const stabilityTelemetry = performanceTelemetry;
   const measurementEndedAt = Date.now();
   await stopTravel();
   stopTravel = async () => {};
@@ -3707,7 +4261,7 @@ try {
     await leaveWorld(session);
     leftWorld = true;
   } catch (error) {
-    events.push({
+    recordEvent({
       at: Date.now(),
       source: "cleanup",
       text: String(error && (error.stack || error.message) || error),
@@ -3764,7 +4318,7 @@ try {
     stabilitySamples,
     telemetry,
     heapSamples,
-    events,
+    combinedEvents(),
     !smoke,
     {
       browserVersion,
@@ -3775,6 +4329,7 @@ try {
       performanceContract,
       browserMemoryBaseline,
       browserMemoryBaselineSources: browserMemoryBaselineSnapshot,
+      buildIdentity: benchmarkBuildIdentity,
       cleanupHeapSamples,
       processRssSamples,
       cleanupProcessRssSamples,
@@ -3784,6 +4339,7 @@ try {
       profileGateResult,
       measurementStartedAt,
       measurementEndedAt,
+      expectedWorkerMeasurementId: reset.measurementId,
       worldEntryTimings,
       warmupSamples,
       runEventStartedAt: benchmarkStartedAt,
@@ -3792,12 +4348,16 @@ try {
     },
   );
   result = {
-    schemaVersion: 4,
+    schemaVersion: performanceContract.schemaVersion,
     generatedAt: new Date().toISOString(),
+    passed: analysis.passed,
+    verdict: analysis.verdict,
     targetUrl,
+    buildIdentity: benchmarkBuildIdentity,
     configuration: {
       browser: "Google Chrome",
       browserVersion,
+      buildIdentity: benchmarkBuildIdentity,
       headless,
       requestedFrameLimit: environmentContract.maxFpsLabel || "Unlimited",
       verifiedUncapped: analysis.environment?.frameLimiter?.uncapped === true,
@@ -3812,7 +4372,7 @@ try {
       expectedSimulationDistance,
       warmupMillis,
       performanceMillis,
-      fpsWindowMillis: performanceMillis,
+      fpsWindowMillis: frameMeasurementMillis,
       heapMillis,
       soakMillis: heapMillis,
       heapIntervalMillis,
@@ -3824,6 +4384,8 @@ try {
       startupTimeoutMillis,
       strictChecks: !smoke,
     },
+    performanceEvidence: analysis.performanceEvidence,
+    failureEvidence: analysis.failureEvidence,
     analysis,
     telemetry,
     samples,
@@ -3842,8 +4404,8 @@ try {
     externalSmokeEvidence,
     leftWorld,
     warmupSampleCount: warmupSamples.length,
-    events: events.slice(-500),
-    chromeOutput: chromeOutput.join("").slice(-12_000),
+    events: combinedEvents().slice(-500),
+    chromeOutput: chromeOutput.slice(-12_000),
   };
   await mkdir(resolve(outputPath, ".."), {recursive: true});
   await writeFile(outputPath, JSON.stringify(result, null, 2) + "\n");
@@ -3867,19 +4429,34 @@ try {
   }, null, 2));
   process.exitCode = analysis.passed ? 0 : 1;
 } catch (error) {
+  const startupDiagnostics = await collectFailureDiagnostics(session);
   const failure = {
-    schemaVersion: 4,
+    schemaVersion: performanceContract.schemaVersion,
     generatedAt: new Date().toISOString(),
     passed: false,
+    verdict: "fail",
+    buildIdentity: benchmarkBuildIdentity,
+    configuration: {
+      profileName,
+      profile: benchmarkProfile,
+      strictChecks: !smoke,
+      buildIdentity: benchmarkBuildIdentity,
+    },
+    failureEvidence: buildPerformanceEvidence({
+      buildIdentity: benchmarkBuildIdentity,
+      gates: benchmarkProfile.gates || {},
+    }),
     error: String(error && (error.stack || error.message) || error),
-    events: events.slice(-500),
-    chromeOutput: chromeOutput.join("").slice(-12_000),
+    startupDiagnostics,
+    events: combinedEvents().slice(-500),
+    chromeOutput: chromeOutput.slice(-12_000),
   };
   await mkdir(resolve(outputPath, ".."), {recursive: true});
   await writeFile(outputPath, JSON.stringify(failure, null, 2) + "\n");
   console.error(failure.error);
   process.exitCode = 1;
 } finally {
+  clearTimeout(watchdogTimer);
   await stopTravel();
   if (session) session.close();
   if (browserSession) browserSession.close();

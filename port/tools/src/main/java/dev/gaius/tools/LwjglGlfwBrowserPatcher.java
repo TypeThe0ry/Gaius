@@ -131,6 +131,7 @@ public final class LwjglGlfwBrowserPatcher {
         add(result, "glfwPlatformSupported", "(I)Z", "platformSupported");
         add(result, "glfwGetMonitors", "()Lorg/lwjgl/PointerBuffer;", "getMonitors");
         add(result, "glfwGetPrimaryMonitor", "()J", "getPrimaryMonitor");
+        add(result, "glfwGetMonitorName", "(J)Ljava/lang/String;", "getMonitorName");
         add(result, "glfwGetMonitorPos", "(J[I[I)V", "getMonitorPos");
         add(result, "glfwGetMonitorContentScale", "(J[F[F)V", "getMonitorContentScale");
         add(result, "glfwGetVideoMode", "(J)Lorg/lwjgl/glfw/GLFWVidMode;", "getVideoMode");

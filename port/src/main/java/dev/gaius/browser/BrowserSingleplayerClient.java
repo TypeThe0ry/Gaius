@@ -44,11 +44,13 @@ public final class BrowserSingleplayerClient {
 
         worldStem.close();
         storage.safeClose();
-        setClientHandoff(true);
+        beginClientHandoff(sessionId);
         try {
             minecraft.disconnectWithProgressScreen();
-        } finally {
-            setClientHandoff(false);
+        } catch (RuntimeException | Error throwable) {
+            cancelClientHandoff(sessionId);
+            requestWorkerStop();
+            throw throwable;
         }
 
         connectWhenWorkerReady(minecraft, sessionId, 0);
@@ -153,7 +155,13 @@ public final class BrowserSingleplayerClient {
               if (!port) return;
               try { port.close(); } catch (ignored) {}
             };
+            const clearHandoffLease = function() {
+              if (sessionId && String(globalThis.__gaiusSingleplayerHandoff || '') === sessionId) {
+                globalThis.__gaiusSingleplayerHandoff = '';
+              }
+            };
             const rollbackLaunch = function(detail) {
+              clearHandoffLease();
               if (worker) {
                 worker.__gaiusTerminal = true;
                 if (worker.__gaiusHandoffTimeout) {
@@ -256,6 +264,14 @@ public final class BrowserSingleplayerClient {
               worker.__gaiusTelemetryLastRtt = 0;
               worker.__gaiusTelemetryMaxPageToWorker = 0;
               worker.__gaiusTelemetryMaxWorkerToPage = 0;
+              worker.__gaiusTelemetryRttHistogram = new Uint32Array(512);
+              worker.__gaiusTelemetryRttSamples = 0;
+              worker.__gaiusTelemetrySchemaVersion = 2;
+              worker.__gaiusTelemetryMeasurementId =
+                typeof globalThis.__gaiusBenchmarkMeasurementId === 'string'
+                  ? globalThis.__gaiusBenchmarkMeasurementId
+                  : '';
+              worker.__gaiusTelemetryResetAt = Date.now();
               worker.__gaiusTelemetryLongestHeartbeatGap = 0;
               worker.__gaiusTelemetryLongestHeartbeatDelay = 0;
               worker.__gaiusTelemetryInterval = 1000;
@@ -265,13 +281,27 @@ public final class BrowserSingleplayerClient {
               worker.__gaiusTelemetryNetwork = {};
               worker.__gaiusTelemetryWorldgen = {};
               worker.__gaiusTelemetryStorage = {};
+              const telemetryPercentile = function(histogram, count, fraction) {
+                if (!histogram || count <= 0) return 0;
+                const target = Math.max(1, Math.ceil(count * fraction));
+                let seen = 0;
+                for (let index = 0; index < histogram.length; index++) {
+                  seen += histogram[index];
+                  if (seen >= target) return index + 1;
+                }
+                return histogram.length;
+              };
               const publishWorkerTelemetry = function() {
                 if (!ownsSession()) return;
                 const state = globalThis.__gaiusWorkerMessageTelemetry ||
                   (globalThis.__gaiusWorkerMessageTelemetry = {});
+                state.schemaVersion = worker.__gaiusTelemetrySchemaVersion;
                 state.sessionId = sessionId;
+                state.measurementId = worker.__gaiusTelemetryMeasurementId;
+                state.resetAt = worker.__gaiusTelemetryResetAt;
                 state.sent = worker.__gaiusTelemetrySent;
                 state.received = worker.__gaiusTelemetryReceived;
+                state.rttSampleCount = worker.__gaiusTelemetryRttSamples;
                 state.missed = worker.__gaiusTelemetryMissed;
                 state.errors = worker.__gaiusTelemetryErrors;
                 state.pending = worker.__gaiusTelemetryPending.size;
@@ -280,6 +310,16 @@ public final class BrowserSingleplayerClient {
                   ? worker.__gaiusTelemetryTotalRtt / worker.__gaiusTelemetryReceived
                   : 0;
                 state.maxRttMillis = worker.__gaiusTelemetryMaxRtt;
+                state.p95RttMillis = telemetryPercentile(
+                  worker.__gaiusTelemetryRttHistogram,
+                  worker.__gaiusTelemetryRttSamples,
+                  0.95
+                );
+                state.p99RttMillis = telemetryPercentile(
+                  worker.__gaiusTelemetryRttHistogram,
+                  worker.__gaiusTelemetryRttSamples,
+                  0.99
+                );
                 state.maxPageToWorkerMillis = worker.__gaiusTelemetryMaxPageToWorker;
                 state.maxWorkerToPageMillis = worker.__gaiusTelemetryMaxWorkerToPage;
                 state.configuredIntervalMillis = worker.__gaiusTelemetryInterval;
@@ -306,7 +346,7 @@ public final class BrowserSingleplayerClient {
                 state.storage = copyScalarTelemetry(worker.__gaiusTelemetryStorage);
                 state.updatedAt = Date.now();
               };
-              const resetWorkerTelemetry = function() {
+              const resetWorkerTelemetry = function(measurementId) {
                 worker.__gaiusTelemetryPending.clear();
                 worker.__gaiusTelemetrySent = 0;
                 worker.__gaiusTelemetryReceived = 0;
@@ -317,6 +357,10 @@ public final class BrowserSingleplayerClient {
                 worker.__gaiusTelemetryLastRtt = 0;
                 worker.__gaiusTelemetryMaxPageToWorker = 0;
                 worker.__gaiusTelemetryMaxWorkerToPage = 0;
+                worker.__gaiusTelemetryRttHistogram.fill(0);
+                worker.__gaiusTelemetryRttSamples = 0;
+                worker.__gaiusTelemetryMeasurementId = String(measurementId || '');
+                worker.__gaiusTelemetryResetAt = Date.now();
                 worker.__gaiusTelemetryLongestHeartbeatGap = 0;
                 worker.__gaiusTelemetryLongestHeartbeatDelay = 0;
                 worker.__gaiusTelemetryLastPingAt = 0;
@@ -403,6 +447,14 @@ public final class BrowserSingleplayerClient {
                 worker.__gaiusTelemetryTotalRtt += rtt;
                 worker.__gaiusTelemetryLastRtt = rtt;
                 worker.__gaiusTelemetryMaxRtt = Math.max(worker.__gaiusTelemetryMaxRtt, rtt);
+                const rttBucket = Math.min(
+                  worker.__gaiusTelemetryRttHistogram.length - 1,
+                  Math.floor(rtt)
+                );
+                if (worker.__gaiusTelemetryRttHistogram[rttBucket] < 0xffffffff) {
+                  worker.__gaiusTelemetryRttHistogram[rttBucket]++;
+                }
+                worker.__gaiusTelemetryRttSamples++;
                 worker.__gaiusTelemetryMaxPageToWorker = Math.max(
                   worker.__gaiusTelemetryMaxPageToWorker,
                   pageToWorker
@@ -447,6 +499,7 @@ public final class BrowserSingleplayerClient {
               };
               const terminateFailedWorker = function(detail) {
                 if (worker.__gaiusTerminal) return;
+                clearHandoffLease();
                 worker.__gaiusTerminal = true;
                 stopWorkerTelemetry();
                 clearWorkerStopTimeout();
@@ -491,6 +544,7 @@ public final class BrowserSingleplayerClient {
                     );
                   }
                 } else if (message && message.type === 'stopped') {
+                  clearHandoffLease();
                   worker.__gaiusStopped = true;
                   worker.__gaiusTerminal = true;
                   stopWorkerTelemetry();
@@ -542,7 +596,7 @@ public final class BrowserSingleplayerClient {
                 bridgeToken: globalThis.__gaiusBridgeToken || null,
                 renderDistance: Math.max(2, Math.min(32, Number(renderDistance) || 6)),
                 simulationDistance: Math.max(2, Math.min(32, Number(simulationDistance) || 4)),
-                worldgenSliceMillis: Number(navigator.hardwareConcurrency) <= 4 ? 12 : 16,
+                worldgenSliceMillis: 8,
                 distanceRampIntervalMillis: 250,
                 serverScriptUrl: globalThis.__gaiusSingleplayerServerUrl || null,
                 serverScriptGzipUrl: globalThis.__gaiusSingleplayerServerGzipUrl || null,
@@ -796,8 +850,18 @@ public final class BrowserSingleplayerClient {
             """)
     private static native void postWorkerDistances(int renderDistance, int simulationDistance);
 
-    @JSBody(params = {"active"}, script = "globalThis.__gaiusSingleplayerHandoff = !!active;")
-    private static native void setClientHandoff(boolean active);
+    @JSBody(params = {"sessionId"}, script = """
+            globalThis.__gaiusSingleplayerHandoff = String(sessionId || '');
+            """)
+    private static native void beginClientHandoff(String sessionId);
+
+    @JSBody(params = {"sessionId"}, script = """
+            if (String(globalThis.__gaiusSingleplayerHandoff || '') ===
+                String(sessionId || '')) {
+              globalThis.__gaiusSingleplayerHandoff = '';
+            }
+            """)
+    private static native void cancelClientHandoff(String sessionId);
 
     @JSBody(script = """
             const workers = globalThis.__gaiusSingleplayerWorkers;
@@ -811,10 +875,22 @@ public final class BrowserSingleplayerClient {
     private static native boolean hasActiveWorker();
 
     @JSBody(script = """
-            if (globalThis.__gaiusSingleplayerHandoff) return;
             const workers = globalThis.__gaiusSingleplayerWorkers;
             if (!workers || typeof workers.values !== 'function') return;
+            const handoffSession = String(globalThis.__gaiusSingleplayerHandoff || '');
             workers.forEach(function(worker, sessionId) {
+              if (handoffSession === String(sessionId) &&
+                  worker.__gaiusHandoffPending && !worker.__gaiusClientAttached) {
+                const events = globalThis.__gaiusMinecraftEvents ||
+                  (globalThis.__gaiusMinecraftEvents = []);
+                events.push({
+                  event: 'singleplayer:handoff-disconnect-ignored',
+                  detail: String(sessionId),
+                  at: Date.now()
+                });
+                if (events.length > 500) events.splice(0, events.length - 500);
+                return;
+              }
               worker.__gaiusStopRequested = true;
               try {
                 worker.postMessage({type: 'stop'});

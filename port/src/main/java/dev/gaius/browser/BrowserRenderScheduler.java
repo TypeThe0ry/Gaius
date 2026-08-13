@@ -3,6 +3,7 @@ package dev.gaius.browser;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.IdentityHashMap;
+import java.util.Iterator;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Executor;
@@ -19,12 +20,17 @@ public final class BrowserRenderScheduler {
     private static final int MAX_UPLOAD_ALLOCATIONS_PER_FRAME = 8;
     private static final int MAX_COMPILE_RUNS_DURING_UPLOAD_PER_FRAME = 1;
     private static final long UPLOAD_WORK_BUDGET_NANOS = 2_000_000L;
+    private static final int MAX_UBER_NODE_CLEANUP_SCANS_PER_FRAME = 8;
+    private static final long UBER_NODE_CLEANUP_BUDGET_NANOS = 250_000L;
     private static final int MAX_UPLOAD_RETRY_YIELDS = 2_048;
     private static final long MAX_UPLOAD_RETRY_NANOS = 5_000_000_000L;
+    private static final long UPLOAD_RETRY_SWEEP_INTERVAL_NANOS = 1_000_000_000L;
+    private static final long UPLOAD_RETRY_TOMBSTONE_IDLE_NANOS = 5_000_000_000L;
     private static final Deque<Runnable> QUEUE = new ArrayDeque<>();
     private static final Map<Object, Integer> UPLOAD_BACKLOGS = new IdentityHashMap<>();
     private static final Map<Object, Integer> UPLOAD_FRAME_DRAIN_COUNTS = new IdentityHashMap<>();
     private static final Map<Object, UploadRetryState> UPLOAD_RETRY_STATES = new IdentityHashMap<>();
+    private static final Map<Object, Integer> UBER_NODE_CLEANUP_CURSORS = new IdentityHashMap<>();
     private static final Map<Object, DispatcherState> DISPATCHER_STATES =
             new IdentityHashMap<>();
     private static final Executor DEFERRED_EXECUTOR = BrowserRenderScheduler::enqueue;
@@ -84,7 +90,17 @@ public final class BrowserRenderScheduler {
     private static long uploadRetryYields;
     private static long uploadRetryNoProgressResumes;
     private static long uploadRetryCancellations;
+    private static long uploadRetryExpiredStates;
+    private static long nextUploadRetrySweepNanos;
     private static long uploadProgressEpoch;
+    private static int currentUberNodeCleanupScans;
+    private static int lastUberNodeCleanupScans;
+    private static int peakUberNodeCleanupScans;
+    private static long uberNodeCleanupPasses;
+    private static long uberNodeCleanupNodesScanned;
+    private static long uberNodeCleanupNodesReleased;
+    private static long uberNodeCleanupDeferrals;
+    private static long uberNodeCleanupDeadlineNanos;
 
     private BrowserRenderScheduler() {
     }
@@ -99,6 +115,7 @@ public final class BrowserRenderScheduler {
 
     /** Starts the hard upload budget shared by all terrain upload calls in one rendered frame. */
     public static void beginFrame() {
+        sweepExpiredUploadRetries();
         if (uploadFrameInitialized) {
             lastUploadDrainCount = currentUploadDrainCount;
             peakUploadDrainCount = Math.max(peakUploadDrainCount, currentUploadDrainCount);
@@ -111,6 +128,11 @@ public final class BrowserRenderScheduler {
         uploadBudgetExhaustedThisFrame = false;
         emergencyUploadEntriesRemaining = 0;
         emergencyUploadGrantedThisFrame = false;
+        lastUberNodeCleanupScans = currentUberNodeCleanupScans;
+        peakUberNodeCleanupScans = Math.max(
+                peakUberNodeCleanupScans, currentUberNodeCleanupScans);
+        currentUberNodeCleanupScans = 0;
+        uberNodeCleanupDeadlineNanos = 0L;
         renderFrames++;
     }
 
@@ -278,6 +300,11 @@ public final class BrowserRenderScheduler {
             state = new UploadRetryState(now);
             UPLOAD_RETRY_STATES.put(task, state);
         }
+        if (state.terminal) {
+            state.lastTouchedAtNanos = now;
+            return false;
+        }
+        state.lastTouchedAtNanos = now;
         long progressBeforeYield = uploadProgressEpoch;
         uploadRetryYields++;
         state.yields++;
@@ -286,10 +313,10 @@ public final class BrowserRenderScheduler {
             uploadRetryNoProgressResumes++;
         }
         now = System.nanoTime();
+        state.lastTouchedAtNanos = now;
         if (state.yields >= MAX_UPLOAD_RETRY_YIELDS
                 || now - state.startedAtNanos >= MAX_UPLOAD_RETRY_NANOS) {
-            UPLOAD_RETRY_STATES.remove(task);
-            uploadRetryCancellations++;
+            terminateUploadRetry(state, now, false);
             return false;
         }
         return true;
@@ -298,6 +325,54 @@ public final class BrowserRenderScheduler {
     public static void clearUploadRetry(Object task) {
         if (task != null) {
             UPLOAD_RETRY_STATES.remove(task);
+        }
+    }
+
+    private static void sweepExpiredUploadRetries() {
+        if (UPLOAD_RETRY_STATES.isEmpty()) {
+            return;
+        }
+        long now = System.nanoTime();
+        if (now < nextUploadRetrySweepNanos) {
+            return;
+        }
+        nextUploadRetrySweepNanos = now + UPLOAD_RETRY_SWEEP_INTERVAL_NANOS;
+        sweepExpiredUploadRetries(now);
+    }
+
+    private static void sweepExpiredUploadRetries(long now) {
+        Iterator<Map.Entry<Object, UploadRetryState>> iterator =
+                UPLOAD_RETRY_STATES.entrySet().iterator();
+        while (iterator.hasNext()) {
+            UploadRetryState state = iterator.next().getValue();
+            if (state == null) {
+                iterator.remove();
+                continue;
+            }
+            if (!state.terminal) {
+                if (now - state.startedAtNanos >= MAX_UPLOAD_RETRY_NANOS) {
+                    terminateUploadRetry(state, now, true);
+                }
+                continue;
+            }
+            if (now - state.lastTouchedAtNanos >= UPLOAD_RETRY_TOMBSTONE_IDLE_NANOS) {
+                iterator.remove();
+            }
+        }
+    }
+
+    private static void terminateUploadRetry(
+            UploadRetryState state,
+            long now,
+            boolean expiredBySweep) {
+        if (state.terminal) {
+            return;
+        }
+        state.terminal = true;
+        state.lastTouchedAtNanos = now;
+        uploadRetryCancellations++;
+        if (expiredBySweep) {
+            uploadRetryExpiredStates++;
         }
     }
 
@@ -363,6 +438,7 @@ public final class BrowserRenderScheduler {
     public static void releaseUploadBuffer(Object buffer) {
         Integer previousBacklog = UPLOAD_BACKLOGS.remove(buffer);
         UPLOAD_FRAME_DRAIN_COUNTS.remove(buffer);
+        UBER_NODE_CLEANUP_CURSORS.remove(buffer);
         if (previousBacklog == null) {
             return;
         }
@@ -400,6 +476,68 @@ public final class BrowserRenderScheduler {
             UPLOAD_BACKLOGS.put(buffer, boundedBacklog);
         }
         return result;
+    }
+
+    /** Returns the stable cleanup cursor for one UberGpuBuffer's reusable heap list. */
+    public static int beginUberNodeCleanup(Object buffer, int nodeCount) {
+        int safeCount = Math.max(0, nodeCount);
+        if (buffer == null || safeCount == 0) {
+            if (buffer != null) {
+                UBER_NODE_CLEANUP_CURSORS.remove(buffer);
+            }
+            return 0;
+        }
+        Integer previous = UBER_NODE_CLEANUP_CURSORS.get(buffer);
+        int cursor = previous == null ? 0 : Math.max(0, previous);
+        return cursor % safeCount;
+    }
+
+    /** Enforces one frame-wide time and entry ceiling across all UberGpuBuffer heap cleanup. */
+    public static boolean shouldCleanUberNode(Object buffer) {
+        if (buffer == null) {
+            return false;
+        }
+        ensureUploadFrameBudget();
+        long now = System.nanoTime();
+        if (currentUberNodeCleanupScans >= MAX_UBER_NODE_CLEANUP_SCANS_PER_FRAME) {
+            uberNodeCleanupDeferrals++;
+            return false;
+        }
+        if (uberNodeCleanupDeadlineNanos == 0L) {
+            uberNodeCleanupDeadlineNanos = now + UBER_NODE_CLEANUP_BUDGET_NANOS;
+        } else if (now >= uberNodeCleanupDeadlineNanos) {
+            uberNodeCleanupDeferrals++;
+            return false;
+        }
+        currentUberNodeCleanupScans++;
+        peakUberNodeCleanupScans = Math.max(
+                peakUberNodeCleanupScans, currentUberNodeCleanupScans);
+        return true;
+    }
+
+    /** Persists the next index only while the owning UberGpuBuffer still retains heap nodes. */
+    public static void finishUberNodeCleanup(
+            Object buffer,
+            int nextCursor,
+            int remainingNodes,
+            int scanned,
+            int released) {
+        if (buffer == null) {
+            return;
+        }
+        int safeRemaining = Math.max(0, remainingNodes);
+        int safeScanned = Math.max(0, scanned);
+        int safeReleased = Math.max(0, Math.min(released, safeScanned));
+        uberNodeCleanupPasses++;
+        uberNodeCleanupNodesScanned += safeScanned;
+        uberNodeCleanupNodesReleased += safeReleased;
+        if (safeRemaining == 0) {
+            UBER_NODE_CLEANUP_CURSORS.remove(buffer);
+            return;
+        }
+        UBER_NODE_CLEANUP_CURSORS.put(
+                buffer,
+                Math.floorMod(Math.max(0, nextCursor), safeRemaining));
     }
 
     private static void enqueue(Runnable command) {
@@ -557,6 +695,8 @@ public final class BrowserRenderScheduler {
         uploadBudgetExhaustedThisFrame = false;
         emergencyUploadEntriesRemaining = 0;
         emergencyUploadGrantedThisFrame = false;
+        currentUberNodeCleanupScans = 0;
+        uberNodeCleanupDeadlineNanos = 0L;
     }
 
     private static void markUploadBudgetExhausted(boolean timeBudget) {
@@ -634,10 +774,21 @@ public final class BrowserRenderScheduler {
                 uploadRetryYields,
                 uploadRetryNoProgressResumes,
                 uploadRetryCancellations,
+                uploadRetryExpiredStates,
                 UPLOAD_RETRY_STATES.size(),
                 MAX_UPLOAD_RETRY_YIELDS,
                 nanosToMillis(MAX_UPLOAD_RETRY_NANOS),
-                uploadProgressEpoch);
+                uploadProgressEpoch,
+                currentUberNodeCleanupScans,
+                lastUberNodeCleanupScans,
+                peakUberNodeCleanupScans,
+                MAX_UBER_NODE_CLEANUP_SCANS_PER_FRAME,
+                nanosToMillis(UBER_NODE_CLEANUP_BUDGET_NANOS),
+                uberNodeCleanupPasses,
+                uberNodeCleanupNodesScanned,
+                uberNodeCleanupNodesReleased,
+                uberNodeCleanupDeferrals,
+                UBER_NODE_CLEANUP_CURSORS.size());
     }
 
     private static void updateHighWaterState() {
@@ -683,8 +834,14 @@ public final class BrowserRenderScheduler {
             "uploadFairShareDeferrals", "activeUploadBuffers",
             "emergencyUploadRequests", "emergencyUploadDrains", "emergencyUploadDeferrals",
             "uploadRetryYields", "uploadRetryNoProgressResumes", "uploadRetryCancellations",
+            "uploadRetryExpiredStates",
             "activeUploadRetryTasks", "maxUploadRetryYields", "maxUploadRetryMillis",
-            "uploadProgressEpoch"
+            "uploadProgressEpoch", "currentUberNodeCleanupScans",
+            "lastUberNodeCleanupScans", "peakUberNodeCleanupScans",
+            "maxUberNodeCleanupScansPerFrame", "uberNodeCleanupBudgetMillis",
+            "uberNodeCleanupPasses", "uberNodeCleanupNodesScanned",
+            "uberNodeCleanupNodesReleased", "uberNodeCleanupDeferrals",
+            "activeUberNodeCleanupCursors"
     }, script = """
             const state=globalThis.__gaiusChunkPipelineTelemetry ||
               (globalThis.__gaiusChunkPipelineTelemetry={});
@@ -763,10 +920,22 @@ public final class BrowserRenderScheduler {
             state.uploadRetryYields=Number(uploadRetryYields)||0;
             state.uploadRetryNoProgressResumes=Number(uploadRetryNoProgressResumes)||0;
             state.uploadRetryCancellations=Number(uploadRetryCancellations)||0;
+            state.uploadRetryExpiredStates=Number(uploadRetryExpiredStates)||0;
             state.activeUploadRetryTasks=Number(activeUploadRetryTasks)||0;
             state.maxUploadRetryYields=Number(maxUploadRetryYields)||0;
             state.maxUploadRetryMillis=Number(maxUploadRetryMillis)||0;
             state.uploadProgressEpoch=Number(uploadProgressEpoch)||0;
+            state.currentUberNodeCleanupScans=Number(currentUberNodeCleanupScans)||0;
+            state.lastUberNodeCleanupScans=Number(lastUberNodeCleanupScans)||0;
+            state.peakUberNodeCleanupScans=Number(peakUberNodeCleanupScans)||0;
+            state.maxUberNodeCleanupScansPerFrame=
+              Number(maxUberNodeCleanupScansPerFrame)||0;
+            state.uberNodeCleanupBudgetMillis=Number(uberNodeCleanupBudgetMillis)||0;
+            state.uberNodeCleanupPasses=Number(uberNodeCleanupPasses)||0;
+            state.uberNodeCleanupNodesScanned=Number(uberNodeCleanupNodesScanned)||0;
+            state.uberNodeCleanupNodesReleased=Number(uberNodeCleanupNodesReleased)||0;
+            state.uberNodeCleanupDeferrals=Number(uberNodeCleanupDeferrals)||0;
+            state.activeUberNodeCleanupCursors=Number(activeUberNodeCleanupCursors)||0;
             state.droppedTasks=0;
             state.updatedAt=(typeof performance!=='undefined' && performance.now)
               ? performance.now() : Date.now();
@@ -828,17 +997,31 @@ public final class BrowserRenderScheduler {
             long uploadRetryYields,
             long uploadRetryNoProgressResumes,
             long uploadRetryCancellations,
+            long uploadRetryExpiredStates,
             int activeUploadRetryTasks,
             int maxUploadRetryYields,
             double maxUploadRetryMillis,
-            long uploadProgressEpoch);
+            long uploadProgressEpoch,
+            int currentUberNodeCleanupScans,
+            int lastUberNodeCleanupScans,
+            int peakUberNodeCleanupScans,
+            int maxUberNodeCleanupScansPerFrame,
+            double uberNodeCleanupBudgetMillis,
+            long uberNodeCleanupPasses,
+            long uberNodeCleanupNodesScanned,
+            long uberNodeCleanupNodesReleased,
+            long uberNodeCleanupDeferrals,
+            int activeUberNodeCleanupCursors);
 
     private static final class UploadRetryState {
         final long startedAtNanos;
+        long lastTouchedAtNanos;
         int yields;
+        boolean terminal;
 
         UploadRetryState(long startedAtNanos) {
             this.startedAtNanos = startedAtNanos;
+            this.lastTouchedAtNanos = startedAtNanos;
         }
     }
 

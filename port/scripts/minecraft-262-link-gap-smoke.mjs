@@ -2,12 +2,20 @@
 
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
-import {readFile} from "node:fs/promises";
+import {readFile, stat} from "node:fs/promises";
+import {delimiter} from "node:path";
 import {fileURLToPath} from "node:url";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const patchedJar = fileURLToPath(
   new URL("../work/overlays/client-named-26.2-gaius.jar", import.meta.url),
+);
+const runtimeClasses = fileURLToPath(new URL("../target/maven/classes", import.meta.url));
+const targetingSourcePath = fileURLToPath(
+  new URL("../src/main/java/dev/gaius/browser/BrowserTargeting.java", import.meta.url),
+);
+const targetingClassPath = fileURLToPath(
+  new URL("../target/maven/classes/dev/gaius/browser/BrowserTargeting.class", import.meta.url),
 );
 const clientPatcher = await readFile(
   new URL("../tools/src/main/java/dev/gaius/tools/MinecraftClientPatcher.java", import.meta.url),
@@ -33,7 +41,14 @@ for (const contract of [
 for (const contract of [
   "patchPreferredGraphicsApi(jar, root)",
   "patchVulkanBackend(jar, root)",
-  "patchVanillaTargetingObservation(jar, root)",
+  "patchChunkGenerationCooperation(jar, root)",
+  "patchRegionFileStorageCache(jar, root)",
+  "BROWSER_REGION_FILE_CACHE_SIZE = 16",
+  '"ChunkGenerationTask.runUntilWait"',
+  '"ChunkGenerationTask.scheduleLayer"',
+  '"ChunkGenerationTask.canLoadWithoutGeneration"',
+  "patchGlBufferMappedViewRanges(jar, root)",
+  "patchLiveFrameTargeting(jar, root)",
   "patchSectionRenderTaskRetryYields(jar, root)",
   '"CompileTask", "ResortTransparencyTask"',
   "replaceSpinWaitWithBoundedCancellation(method, owner)",
@@ -51,10 +66,14 @@ assert.ok(jdkCompat.includes("resolved = resolved.resolve(segment)"),
   "BrowserJdkCompat does not resolve every trailing segment");
 
 function javap(className) {
-  return execFileSync("javap", ["-classpath", patchedJar, "-p", "-c", className], {
+  return execFileSync(
+    "javap",
+    ["-classpath", `${patchedJar}${delimiter}${runtimeClasses}`, "-p", "-c", className],
+    {
     cwd: root,
     encoding: "utf8",
-  });
+    },
+  );
 }
 
 function methodBody(output, signature) {
@@ -74,18 +93,133 @@ assert.ok(!minecraft.includes("Field noRender:Z"),
   "26.2 Minecraft telemetry still reads the removed noRender field");
 const renderFrame = methodBody(minecraft, "public void renderFrame(boolean)");
 const rendererUpdate = renderFrame.indexOf("GameRenderer.update");
-const vanillaPick = renderFrame.indexOf("Method pick:(F)V");
+const deferredPick = renderFrame.indexOf("BrowserTargeting.deferFramePick");
 const rendererExtract = renderFrame.indexOf("GameRenderer.extract");
-assert.ok(rendererUpdate >= 0 && vanillaPick > rendererUpdate && rendererExtract > vanillaPick,
-  "26.2 renderFrame no longer updates, picks, and extracts in the expected order");
+assert.ok(rendererUpdate >= 0 && deferredPick > rendererUpdate && rendererExtract > deferredPick,
+  "26.2 renderFrame no longer defers its one pick between update and extract");
+assert.ok(!renderFrame.includes("Method pick:(F)V"),
+  "26.2 renderFrame still performs the stale pre-extract pick");
 
 const gameRenderer = javap("net.minecraft.client.renderer.GameRenderer");
-assert.ok(gameRenderer.includes("BrowserTargeting.observeVanillaPick"),
-  "26.2 GameRenderer does not observe the vanilla targeting result");
-assert.ok(!gameRenderer.includes("BrowserTargeting.stabilizeBlockHit"),
-  "26.2 GameRenderer still performs a duplicate browser targeting raycast");
+const gameRendererExtract = methodBody(
+  gameRenderer,
+  "public void extract(net.minecraft.client.DeltaTracker, boolean)",
+);
+const cameraExtract = gameRendererExtract.indexOf("Method extractCamera:");
+const refreshedPick = gameRendererExtract.indexOf("BrowserTargeting.refreshFramePick");
+const levelExtract = gameRendererExtract.indexOf("LevelExtractor.extract");
+assert.ok(cameraExtract >= 0 && refreshedPick > cameraExtract && levelExtract > refreshedPick,
+  "26.2 GameRenderer does not refresh targeting between camera and level extraction");
+const cameraCallEnd = gameRendererExtract.indexOf("\n", cameraExtract);
+const targetingBridge = gameRendererExtract.slice(cameraCallEnd, refreshedPick);
+assert.match(targetingBridge, /fload\s+5/,
+  "26.2 frame targeting does not use the world partial tick shared by level extraction");
+assert.doesNotMatch(targetingBridge, /fload\s+6/,
+  "26.2 frame targeting still uses camera-entity partial ticks and can drift from the crosshair");
+assert.equal(gameRenderer.match(/BrowserTargeting\.refreshFramePick/g)?.length, 1,
+  "26.2 GameRenderer must refresh targeting exactly once per rendered frame");
 assert.ok(!gameRenderer.includes("LocalPlayer.raycastHitResult"),
-  "26.2 GameRenderer targeting telemetry performs an extra raycast");
+  "26.2 GameRenderer embeds a second targeting raycast");
+
+const [targetingSourceStat, targetingClassStat] = await Promise.all([
+  stat(targetingSourcePath),
+  stat(targetingClassPath),
+]);
+assert.ok(targetingClassStat.mtimeMs >= targetingSourceStat.mtimeMs,
+  "BrowserTargeting runtime class is stale; rebuild the Gaius runtime sources");
+const browserTargeting = javap("dev.gaius.browser.BrowserTargeting");
+const refreshFramePick = methodBody(
+  browserTargeting,
+  "public static void refreshFramePick(net.minecraft.client.Minecraft, net.minecraft.client.Camera, float)",
+);
+const stabilizeBlockHit = methodBody(
+  browserTargeting,
+  "public static net.minecraft.world.phys.HitResult stabilizeBlockHit(net.minecraft.world.phys.HitResult, net.minecraft.client.Minecraft, net.minecraft.client.Camera, float)",
+);
+assert.match(refreshFramePick, /Method (?:dev\/gaius\/browser\/BrowserTargeting\.)?stabilizeBlockHit:/,
+  "frame targeting does not use the live camera raycast helper");
+assert.ok(refreshFramePick.includes("Field net/minecraft/client/Minecraft.hitResult"),
+  "frame targeting does not update the shared hit result");
+assert.ok(refreshFramePick.includes("Field net/minecraft/client/Minecraft.crosshairPickEntity"),
+  "frame targeting does not keep entity targeting coherent");
+assert.equal(stabilizeBlockHit.match(/LocalPlayer\.raycastHitResult/g)?.length, 1,
+  "frame targeting must perform exactly one raycast");
+
+const glBufferDirect = javap("com.mojang.blaze3d.opengl.GlBuffer$Direct");
+const mapBuffer = methodBody(
+  glBufferDirect,
+  "public com.mojang.blaze3d.buffers.GpuBufferSlice$MappedView map(long, long, boolean, boolean)",
+);
+assert.ok(
+  mapBuffer.includes(
+    'GlBuffer$Direct$1."<init>":(Lcom/mojang/blaze3d/opengl/GlBuffer$Direct;JJ)V',
+  ),
+  "mapped views do not capture their exact write range",
+);
+assert.ok(!mapBuffer.includes(
+  'GlBuffer$Direct$1."<init>":(Lcom/mojang/blaze3d/opengl/GlBuffer$Direct;)V',
+), "mapped views still use the range-blind close callback");
+
+const mappedViewClose = javap("com.mojang.blaze3d.opengl.GlBuffer$Direct$1");
+const mappedViewRun = methodBody(mappedViewClose, "public void run()");
+for (const contract of [
+  "Field mappedOffset:J",
+  "Field mappedLength:J",
+  "DirectStateAccess.flushMappedBufferRange:(IJJI)V",
+  "GlBuffer$Direct.unmap:()V",
+]) {
+  assert.ok(mappedViewRun.includes(contract),
+    `mapped-view close callback is missing ${contract}`);
+}
+assert.ok(!mappedViewRun.includes("GlBuffer$Direct.slice"),
+  "mapped-view close callback rebuilds or flushes a whole-buffer slice");
+
+const chunkGenerationTask = javap("net.minecraft.server.level.ChunkGenerationTask");
+const runUntilWait = methodBody(
+  chunkGenerationTask,
+  "public java.util.concurrent.CompletableFuture<?> runUntilWait()",
+);
+const scheduleLayer = methodBody(
+  chunkGenerationTask,
+  "private void scheduleLayer(net.minecraft.world.level.chunk.status.ChunkStatus, boolean)",
+);
+const canLoadWithoutGeneration = methodBody(
+  chunkGenerationTask,
+  "private boolean canLoadWithoutGeneration()",
+);
+assert.equal(runUntilWait.match(/BrowserWorldgenScheduler\.pulse/g)?.length, 1,
+  "runUntilWait must pulse exactly once per immediately-completed layer");
+assert.ok(runUntilWait.indexOf("scheduleNextLayer")
+    < runUntilWait.indexOf("BrowserWorldgenScheduler.pulse"),
+"runUntilWait pulses before making layer progress");
+assert.equal(scheduleLayer.match(/BrowserWorldgenScheduler\.pulse/g)?.length, 2,
+  "scheduleLayer must pulse on its two chunk-scan backedges");
+assert.equal(canLoadWithoutGeneration.match(/BrowserWorldgenScheduler\.pulse/g)?.length, 2,
+  "canLoadWithoutGeneration must pulse on its two dependency-scan backedges");
+for (const body of [runUntilWait, scheduleLayer, canLoadWithoutGeneration]) {
+  assert.ok(!body.includes("BrowserWorldgenScheduler.checkpoint"),
+    "chunk generation uses an unconditional checkpoint instead of bounded pulses");
+  assert.ok(!body.includes("java/util/concurrent/CompletableFuture.then"),
+    "chunk generation moved server-state progress into a future continuation");
+  assert.ok(!body.includes("java/util/concurrent/Executor"),
+    "chunk generation moved server-state progress to another executor");
+}
+
+const regionFileStorage = javap(
+  "net.minecraft.world.level.chunk.storage.RegionFileStorage",
+);
+const getRegionFile = methodBody(
+  regionFileStorage,
+  "private net.minecraft.world.level.chunk.storage.RegionFile getRegionFile(net.minecraft.world.level.ChunkPos) throws java.io.IOException",
+);
+assert.ok(getRegionFile.includes("bipush        16"),
+  "RegionFileStorage does not enforce the 16-file browser cache bound");
+assert.ok(!getRegionFile.includes("sipush        256"),
+  "RegionFileStorage still retains the vanilla 256-file cache bound");
+const eviction = getRegionFile.indexOf("Long2ObjectLinkedOpenHashMap.removeLast");
+const closeEvicted = getRegionFile.indexOf("RegionFile.close", eviction);
+assert.ok(eviction >= 0 && closeEvicted > eviction,
+  "RegionFileStorage no longer closes the least-recently-used region on eviction");
 
 const preferredGraphicsApi = javap("net.minecraft.client.PreferredGraphicsApi");
 const backendsToTry = preferredGraphicsApi.slice(

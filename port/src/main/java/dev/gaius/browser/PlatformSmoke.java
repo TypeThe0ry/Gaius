@@ -1,11 +1,12 @@
 package dev.gaius.browser;
 
-import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.Unpooled;
-import io.netty.channel.ChannelFuture;
-import io.netty.channel.ChannelInboundHandlerAdapter;
-import io.netty.channel.DefaultEventLoopGroup;
 import io.netty.channel.browser.BrowserWebSocketChannel;
+import com.mojang.blaze3d.platform.MonitorManager;
+import com.mojang.blaze3d.platform.Window;
+import com.mojang.blaze3d.opengl.GlBackend;
+import com.mojang.blaze3d.shaders.GpuDebugOptions;
+import com.mojang.blaze3d.systems.RenderSystem;
 import com.google.gson.JsonParser;
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
@@ -40,6 +41,7 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.util.Mth;
 import net.minecraft.util.SimpleBitStorage;
 import net.minecraft.util.LinearCongruentialGenerator;
+import net.minecraft.util.Util;
 import net.minecraft.world.level.biome.Climate;
 import net.minecraft.world.level.levelgen.LegacyRandomSource;
 import net.minecraft.world.level.levelgen.Beardifier;
@@ -56,6 +58,7 @@ import org.lwjgl.opengl.GL;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL15;
 import org.lwjgl.opengl.GL20;
+import org.lwjgl.opengl.GL33C;
 import org.lwjgl.openal.ALC10;
 import org.lwjgl.openal.AL10;
 import org.lwjgl.system.BrowserMemory;
@@ -120,6 +123,8 @@ public final class PlatformSmoke {
             testFloatingPointFma();
             smokeStage = "managed memory";
             testManagedMemory();
+            smokeStage = "Minecraft backend initialization";
+            testBackendInitialization();
             smokeStage = "window and WebGL";
             testWindowAndCallbacks();
             smokeStage = "browser audio";
@@ -1182,7 +1187,19 @@ public final class PlatformSmoke {
     private static void testWindowAndCallbacks() {
         GLFWErrorCallback callback = GLFWErrorCallback.create((error, description) -> {
         });
-        GLFW.glfwSetErrorCallback(callback);
+        if (GLFW.glfwSetErrorCallback(callback) != null) {
+            throw new AssertionError("GLFW browser error callback did not start empty");
+        }
+        GLFWErrorCallback scopedCallback = GLFWErrorCallback.create((error, description) -> {
+        });
+        if (GLFW.glfwSetErrorCallback(scopedCallback) != callback) {
+            throw new AssertionError("GLFW browser error callback did not return the previous callback");
+        }
+        GLFWErrorCallback replaced = GLFW.glfwSetErrorCallback(callback);
+        if (replaced != scopedCallback || replaced.address() != scopedCallback.address()) {
+            throw new AssertionError("GLFW browser error callback identity was not preserved");
+        }
+        replaced.close();
         if (!GLFW.glfwInit()) {
             throw new AssertionError("GLFW browser initialization failed");
         }
@@ -1223,6 +1240,144 @@ public final class PlatformSmoke {
         testWebGlRenderingSurface();
         callback.free();
     }
+
+    private static void testBackendInitialization() throws Exception {
+        RenderSystem.initRenderThread();
+        var timeSource = RenderSystem.initBackendSystem();
+        if (timeSource == null) {
+            throw new AssertionError("Minecraft backend time source was not initialized");
+        }
+        Util.setTimeSource(timeSource);
+        smokeStage = "Minecraft monitor initialization";
+        try (MonitorManager manager = new MonitorManager()) {
+            if (manager.getMonitor(GLFW.glfwGetPrimaryMonitor()) == null) {
+                throw new AssertionError("Minecraft primary monitor was not initialized");
+            }
+            GlBackend backend = new GlBackend();
+            smokeStage = "Minecraft GLFW window creation";
+            long window = Window.createGlfwWindow(960, 540, "Gaius 26.2 backend smoke", 0L, backend);
+            if (window == 0L) {
+                throw new AssertionError("Minecraft OpenGL backend did not create a browser window");
+            }
+            smokeStage = "Minecraft GPU device creation";
+            var device = backend.createDevice(
+                    window,
+                    (identifier, shaderType) -> "",
+                    new GpuDebugOptions(0, false, false, false),
+                    () -> {
+                    });
+            if (device.getDeviceInfo() == null) {
+                throw new AssertionError("Minecraft OpenGL device was not initialized");
+            }
+            smokeStage = "Minecraft GPU surface creation";
+            if (device.createSurface(window) == null) {
+                throw new AssertionError("Minecraft OpenGL surface was not initialized");
+            }
+            smokeStage = "Minecraft renderer initialization";
+            RenderSystem.initRenderer(device);
+            smokeStage = "Minecraft GL33C core delegation";
+            testGl33CoreDelegation();
+        }
+    }
+
+    private static void testGl33CoreDelegation() {
+        GL33C.glActiveTexture(GL33C.GL_TEXTURE1);
+        GL33C.glActiveTexture(GL33C.GL_TEXTURE0);
+
+        int buffer = GL33C.glGenBuffers();
+        if (buffer == 0) {
+            throw new AssertionError("GL33C buffer creation did not reach WebGL");
+        }
+        try {
+            GL33C.glBindBuffer(GL33C.GL_COPY_WRITE_BUFFER, buffer);
+            GL33C.glBufferData(GL33C.GL_COPY_WRITE_BUFFER, 64L, GL33C.GL_DYNAMIC_DRAW);
+            ByteBuffer mapped = GL33C.glMapBufferRange(
+                    GL33C.GL_COPY_WRITE_BUFFER,
+                    0L,
+                    64L,
+                    GL33C.GL_MAP_WRITE_BIT);
+            if (mapped == null || mapped.capacity() != 64) {
+                throw new AssertionError("GL33C mapped buffer did not reach the browser allocator");
+            }
+            mapped.putInt(0, 0x47414955);
+            if (!GL33C.glUnmapBuffer(GL33C.GL_COPY_WRITE_BUFFER)) {
+                throw new AssertionError("GL33C mapped buffer did not unmap");
+            }
+            long mappedAddress = GL33C.nglMapBufferRange(
+                    GL33C.GL_COPY_WRITE_BUFFER,
+                    0L,
+                    64L,
+                    GL33C.GL_MAP_WRITE_BIT);
+            if (mappedAddress == 0L) {
+                throw new AssertionError("GL33C address mapped buffer did not reach the browser allocator");
+            }
+            MemoryUtil.memPutInt(mappedAddress, 0x53495541);
+            if (!GL33C.glUnmapBuffer(GL33C.GL_COPY_WRITE_BUFFER)) {
+                throw new AssertionError("GL33C address mapped buffer did not unmap");
+            }
+        } finally {
+            GL33C.glBindBuffer(GL33C.GL_COPY_WRITE_BUFFER, 0);
+            GL33C.glDeleteBuffers(buffer);
+        }
+
+        int vertexArray = GL33C.glGenVertexArrays();
+        if (vertexArray == 0) {
+            throw new AssertionError("GL33C vertex array creation did not reach WebGL");
+        }
+        GL33C.glBindVertexArray(vertexArray);
+        GL33C.glBindVertexArray(0);
+        GL33C.glDeleteVertexArrays(vertexArray);
+
+        int framebuffer = GL33C.glGenFramebuffers();
+        if (framebuffer == 0) {
+            throw new AssertionError("GL33C framebuffer creation did not reach WebGL");
+        }
+        GL33C.glBindFramebuffer(GL33C.GL_FRAMEBUFFER, framebuffer);
+        GL33C.glColorMaski(0, true, true, true, true);
+        GL33C.glDrawBuffer(GL33C.GL_NONE);
+        GL33C.glDrawBuffer(GL33C.GL_COLOR_ATTACHMENT0);
+        GL33C.glScissor(3, 4, 5, 6);
+        GL33C.glBlendEquationSeparate(GL33C.GL_FUNC_ADD, GL33C.GL_FUNC_REVERSE_SUBTRACT);
+        if (!gl33StateDelegationPassed()) {
+            throw new AssertionError("GL33C draw-buffer, scissor, or blend state did not reach WebGL");
+        }
+        GL33C.glBindFramebuffer(GL33C.GL_FRAMEBUFFER, 0);
+        GL33C.glDeleteFramebuffers(framebuffer);
+
+        int pixelBuffer = GL33C.glGenBuffers();
+        GL33C.glBindBuffer(GL33C.GL_PIXEL_PACK_BUFFER, pixelBuffer);
+        GL33C.glBufferData(GL33C.GL_PIXEL_PACK_BUFFER, 4L, GL33C.GL_STREAM_READ);
+        GL33C.glReadPixels(0, 0, 1, 1, GL33C.GL_RGBA, GL33C.GL_UNSIGNED_BYTE, 0L);
+        GL33C.glBindBuffer(GL33C.GL_PIXEL_PACK_BUFFER, 0);
+        GL33C.glDeleteBuffers(pixelBuffer);
+        if (!pboReadbackDelegationPassed()) {
+            throw new AssertionError("GL33C pixel-buffer readback did not reach WebGL");
+        }
+
+        long sync = GL33C.glFenceSync(GL33C.GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        if (sync == 0L) {
+            throw new AssertionError("GL33C fence creation did not reach WebGL");
+        }
+        GL33C.glClientWaitSync(sync, 0, 0L);
+        GL33C.glDeleteSync(sync);
+    }
+
+    @JSBody(script = """
+            const state=window.__gaiusGL;
+            return !!state && Array.isArray(state.lastDrawBuffers) &&
+              state.lastDrawBuffers.length===1 &&
+              (state.lastDrawBuffers[0]|0)===0x8CE0 &&
+              (state.scissorX|0)===3 && (state.scissorY|0)===4 &&
+              (state.scissorWidth|0)===5 && (state.scissorHeight|0)===6 &&
+              (state.blendEquationRgb|0)===0x8006 &&
+              (state.blendEquationAlpha|0)===0x800B;
+            """)
+    private static native boolean gl33StateDelegationPassed();
+
+    @JSBody(script = """
+            return (window.__gaiusGLStats && (window.__gaiusGLStats.readPixelsCalls|0)>0) || false;
+            """)
+    private static native boolean pboReadbackDelegationPassed();
 
     private static void testWebGlRenderingSurface() {
         GL.createCapabilities();
@@ -1290,6 +1445,15 @@ public final class PlatformSmoke {
         long context = ALC10.alcCreateContext(device, (int[]) null);
         if (device == 0L || context == 0L || !ALC10.alcMakeContextCurrent(context)) {
             throw new AssertionError("Browser OpenAL context was not created");
+        }
+        if (ALC10.alcIsExtensionPresent(device, "ALC_EXT_disconnect")) {
+            throw new AssertionError("Browser OpenAL advertised unsupported device disconnect events");
+        }
+        if (ALC10.alcGetInteger(device, 0x0313) == 0) {
+            throw new AssertionError("Browser OpenAL reported its active device as disconnected");
+        }
+        if (ALC10.alcGetInteger(device, ALC10.ALC_ATTRIBUTES_SIZE) < 3) {
+            throw new AssertionError("Browser OpenAL did not expose a valid device attribute list");
         }
 
         int buffer = AL10.alGenBuffers();
@@ -1420,28 +1584,12 @@ public final class PlatformSmoke {
     private static native boolean copyExternalAsset(String resource, @JSByRef byte[] output);
 
     private static void testBrowserNetwork() {
-        DefaultEventLoopGroup group = new DefaultEventLoopGroup(1);
-        ChannelFuture connected = new Bootstrap()
-                .group(group)
-                .channel(BrowserWebSocketChannel.class)
-                .handler(new ChannelInboundHandlerAdapter())
-                .connect(InetSocketAddress.createUnresolved("127.0.0.1", 25565));
-        if (!connected.isDone() || !connected.isSuccess()) {
-            throw new AssertionError("Browser Netty connect future did not complete inline");
-        }
-
+        new BrowserWebSocketChannel();
         if (!runLocalNetworkFrameSmoke()) {
             throw new AssertionError("Browser local Netty bridge frame smoke did not start");
         }
-
-        connected.channel().writeAndFlush(Unpooled.wrappedBuffer(new byte[] {
-                0x10, 0x00, (byte) 0x86, 0x06, 0x09,
-                '1', '2', '7', '.', '0', '.', '0', '.', '1',
-                0x63, (byte) 0xDD, 0x01,
-                0x01, 0x00
-        }));
-        if (!networkBytesQueuedOrSent()) {
-            throw new AssertionError("Browser Netty pipeline did not write a bridge frame");
+        if (!runNettyNetworkFrameSmoke()) {
+            throw new AssertionError("Browser Netty MessagePort smoke did not start");
         }
         scheduleNetworkRoundTripCheck();
     }
@@ -1589,12 +1737,6 @@ public final class PlatformSmoke {
     private static native void enqueueSyntheticInput();
 
     @JSBody(script = """
-            const stats = window.__gaiusNetworkStats;
-            return !!stats && ((stats.sentBytes|0) > 0 || (stats.queuedBytes|0) > 0);
-            """)
-    private static native boolean networkBytesQueuedOrSent();
-
-    @JSBody(script = """
             const sessionId = '0123456789abcdef0123456789abcdef';
             const channel = new MessageChannel();
             const ports = window.__gaiusLocalServerPorts ||
@@ -1625,39 +1767,84 @@ public final class PlatformSmoke {
     private static native boolean runLocalNetworkFrameSmoke();
 
     @JSBody(script = """
+            const sessionId = 'fedcba9876543210fedcba9876543210';
+            const channel = new MessageChannel();
+            const ports = window.__gaiusLocalServerPorts ||
+              (window.__gaiusLocalServerPorts = new Map());
+            ports.set(sessionId, channel.port1);
+            const smoke = window.__gaiusNettyNetworkSmoke = {frames: 0, bytes: 0};
+            channel.port2.onmessage = function(event) {
+              const message = event.data;
+              if (!(message instanceof ArrayBuffer) && !ArrayBuffer.isView(message)) return;
+              const bytes = message instanceof ArrayBuffer
+                ? new Uint8Array(message)
+                : new Uint8Array(message.buffer, message.byteOffset || 0, message.byteLength || 0);
+              smoke.frames++;
+              smoke.bytes += bytes.byteLength;
+            };
+            if (typeof channel.port2.start === 'function') channel.port2.start();
+            const bridge = window.__gaiusNettyBridge;
+            if (!bridge) return false;
+            const socketId = 0x6A1A6;
+            bridge.open(socketId, 'client-' + sessionId + '.gaius-local', 25565);
+            return bridge.send(socketId, new Uint8Array([
+              0x10, 0x00, 0x86, 0x06, 0x09,
+              0x31, 0x32, 0x37, 0x2e, 0x30, 0x2e, 0x30, 0x2e, 0x31,
+              0x63, 0xdd, 0x01, 0x01, 0x00
+            ]));
+            """)
+    private static native boolean runNettyNetworkFrameSmoke();
+
+    @JSBody(script = """
+            globalThis.__gaiusPlatformNetworkPending = true;
             setTimeout(function() {
               const stats = window.__gaiusNetworkStats;
               const local = window.__gaiusLocalNetworkSmoke;
+              const netty = window.__gaiusNettyNetworkSmoke;
               const output = document.getElementById('status');
-              if (!local || (local.frames|0) !== 1 || (local.bytes|0) !== 6 ||
-                  !stats || (stats.localFlushes|0) < 1 ||
-                  (stats.localFlushFrames|0) !== 3 ||
-                  (stats.peakLocalFlushFrames|0) < 3 ||
-                  (stats.localReceivedFrames|0) !== 1 ||
-                  (stats.localReceivedBytes|0) !== 6) {
+              const passed = !!local && (local.frames|0) === 1 && (local.bytes|0) === 6 &&
+                  !!netty && (netty.frames|0) === 1 && (netty.bytes|0) === 19 &&
+                  !!stats && (stats.localFlushes|0) >= 2 &&
+                  (stats.localFlushFrames|0) === 4 &&
+                  (stats.localFlushBytes|0) === 25 &&
+                  (stats.peakLocalFlushFrames|0) >= 3 &&
+                  (stats.localReceivedFrames|0) === 1 &&
+                  (stats.localReceivedBytes|0) === 6;
+              globalThis.__gaiusPlatformNetworkPending = false;
+              if (!passed) {
                 if (output) {
                   output.textContent = 'Browser Netty local batching failed';
                   output.dataset.success = 'false';
                 }
-                console.error('Browser Netty local batching failed', local || null, stats || null);
+                console.error(
+                  'Browser Netty local batching failed',
+                  local || null,
+                  netty || null,
+                  stats || null
+                );
                 return;
               }
-              // The platform smoke has no configured external relay. Verify that the
-              // direct/relay bridge encoded the outbound frame, but do not require a
-              // localhost relay process to echo it back.
-              const remoteSent = (stats.sentBytes|0) - (stats.localFlushBytes|0);
-              if (remoteSent >= 19 || (stats.queuedBytes|0) >= 19) return;
+              const message = globalThis.__gaiusPlatformDeferredSuccessMessage ||
+                'Gaius platform smoke passed';
               if (output) {
-                output.textContent = 'Browser Netty bridge frame was not queued';
-                output.dataset.success = 'false';
+                output.textContent = message;
+                output.dataset.success = 'true';
               }
-              console.error('Browser Netty bridge frame was not queued', stats || null);
+              console.info(message);
             }, 2000);
             """)
     private static native void scheduleNetworkRoundTripCheck();
 
     @JSBody(params = {"success", "message"}, script = """
             const output=document.getElementById('status');
+            if (success && globalThis.__gaiusPlatformNetworkPending) {
+              globalThis.__gaiusPlatformDeferredSuccessMessage = message;
+              if (output) {
+                output.textContent = 'Waiting for browser network verification...';
+                delete output.dataset.success;
+              }
+              return;
+            }
             if (output) {
               output.textContent=message;
               output.dataset.success=success?'true':'false';

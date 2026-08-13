@@ -14,6 +14,17 @@ const scriptOffset = source.indexOf('"""', annotationOffset) + 3;
 const scriptEnd = source.lastIndexOf('""")', markerOffset);
 assert.ok(markerOffset > 0 && annotationOffset > 0 && scriptEnd > scriptOffset,
   "Browser bridge JSBody could not be extracted");
+const outboundMarker = "private static native void initOutboundScheduler();";
+const outboundMarkerOffset = source.indexOf(outboundMarker);
+const outboundAnnotationOffset = source.lastIndexOf(
+  '@JSBody(script = """',
+  outboundMarkerOffset,
+);
+const outboundScriptOffset = source.indexOf('"""', outboundAnnotationOffset) + 3;
+const outboundScriptEnd = source.lastIndexOf('""")', outboundMarkerOffset);
+assert.ok(outboundMarkerOffset > 0 && outboundAnnotationOffset > 0
+    && outboundScriptEnd > outboundScriptOffset,
+"Browser outbound scheduler JSBody could not be extracted");
 
 const delay = (millis) => new Promise((resolve) => setTimeout(resolve, millis));
 const startedAt = performance.now();
@@ -121,6 +132,7 @@ class MockWebSocket {
 
 globalThis.WebSocket = MockWebSocket;
 new Function(source.slice(scriptOffset, scriptEnd))();
+new Function(source.slice(outboundScriptOffset, outboundScriptEnd))();
 const bridge = globalThis.__gaiusNettyBridge;
 const stats = globalThis.__gaiusNetworkStats;
 

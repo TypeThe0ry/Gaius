@@ -50,6 +50,37 @@ class PostprocessTeaVMJSTest(unittest.TestCase):
             self.assertEqual(run_postprocess(target), 0)
             self.assertEqual(target.read_text(encoding="utf-8"), result)
 
+    def test_unminified_worker_runtime_gets_input_pump(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "singleplayer-server.js"
+            target.write_text(
+                TEAVM_LONG_HELPER
+                + "let runtime={};runtime.$rt_startThread=()=>{};"
+                + "let worker={};worker.pumpIntegratedServerNetworkInput=pump;",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(run_postprocess(target), 0)
+            result = target.read_text(encoding="utf-8")
+            self.assertIn(POSTPROCESS.INTEGRATED_SERVER_PUMP_MARKER, result)
+            self.assertIn("runtime.$rt_startThread(", result)
+
+    def test_minified_worker_runtime_gets_input_pump(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "singleplayer-server.js"
+            target.write_text(
+                TEAVM_LONG_HELPER
+                + "A.WPL=f=>(args,callback)=>{let javaArgs=args;"
+                + "A.HGZ(()=>{f.call(null,javaArgs);},callback);};"
+                + "let B={},F=()=>{};B.pumpIntegratedServerNetworkInput=F;",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(run_postprocess(target), 0)
+            result = target.read_text(encoding="utf-8")
+            self.assertIn(POSTPROCESS.INTEGRATED_SERVER_PUMP_MARKER, result)
+            self.assertIn("A.HGZ(", result)
+
     def test_atomic_write_replaces_complete_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "classes.js"

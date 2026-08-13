@@ -28,6 +28,7 @@ SOURCE_FILES = (
     "port/web/singleplayer/index.html",
     "port/web/singleplayer/server-worker-bootstrap.js",
     "port/scripts/gaius_build_identity.py",
+    "port/scripts/teavm-compiler-profile.py",
     "port/scripts/version-profile.sh",
     "port/scripts/build-overlays.sh",
     "port/scripts/remap-client.sh",

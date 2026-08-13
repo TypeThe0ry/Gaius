@@ -84,6 +84,25 @@ public final class BrowserOpenAL {
     private static final int AL_BITS = 0x2002;
     private static final int AL_CHANNELS = 0x2003;
     private static final int AL_SIZE = 0x2004;
+    private static final int ALC_MAJOR_VERSION = 0x1000;
+    private static final int ALC_MINOR_VERSION = 0x1001;
+    private static final int ALC_ATTRIBUTES_SIZE = 0x1002;
+    private static final int ALC_ALL_ATTRIBUTES = 0x1003;
+    private static final int ALC_FREQUENCY = 0x1007;
+    private static final int ALC_REFRESH = 0x1008;
+    private static final int ALC_SYNC = 0x1009;
+    private static final int ALC_MONO_SOURCES = 0x1010;
+    private static final int ALC_STEREO_SOURCES = 0x1011;
+    private static final int ALC_CONNECTED = 0x0313;
+    private static final int ALC_NUM_HRTF_SPECIFIERS_SOFT = 0x1994;
+    private static final int[] ALC_ATTRIBUTES = {
+            ALC_FREQUENCY, 48_000,
+            ALC_REFRESH, 60,
+            ALC_SYNC, 0,
+            ALC_MONO_SOURCES, 30,
+            ALC_STEREO_SOURCES, 8,
+            0
+    };
 
     private BrowserOpenAL() {
     }
@@ -93,6 +112,8 @@ public final class BrowserOpenAL {
               return;
             }
             const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+            const DEFAULT_FORWARD = [0, 0, -1];
+            const DEFAULT_UP = [0, 1, 0];
             const state = {
               next: 1,
               context: null,
@@ -105,7 +126,9 @@ public final class BrowserOpenAL {
                 position: [0, 0, 0],
                 velocity: [0, 0, 0],
                 forward: [0, 0, -1],
-                up: [0, 1, 0]
+                up: [0, 1, 0],
+                normalizedForward: [0, 0, -1],
+                normalizedUp: [0, 1, 0]
               },
               distanceModel: 0xD002,
               stats: {
@@ -123,6 +146,7 @@ public final class BrowserOpenAL {
                 webAudioNodesDisposed: 0,
                 webAudioConnections: 0,
                 webAudioDisconnects: 0,
+                webAudioNaturalEnds: 0,
                 lastFormat: 0,
                 lastFrequency: 0,
                 lastUploadBytes: 0,
@@ -145,13 +169,28 @@ public final class BrowserOpenAL {
               const number = Number(value);
               return Number.isFinite(number) ? number : fallback;
             }
-            function normalizedVector(value, fallback) {
+            function setVector(target, x, y, z, fallbackX, fallbackY, fallbackZ) {
+              target[0] = finiteNumber(x, fallbackX === undefined ? 0 : fallbackX);
+              target[1] = finiteNumber(y, fallbackY === undefined ? 0 : fallbackY);
+              target[2] = finiteNumber(z, fallbackZ === undefined ? 0 : fallbackZ);
+              return target;
+            }
+            function normalizedVector(value, fallback, target) {
               const x = finiteNumber(value && value[0], fallback[0]);
               const y = finiteNumber(value && value[1], fallback[1]);
               const z = finiteNumber(value && value[2], fallback[2]);
               const length = Math.hypot(x, y, z);
-              if (!(length > 0.000001)) return fallback.slice();
-              return [x / length, y / length, z / length];
+              const output = target || [0, 0, 0];
+              if (!(length > 0.000001)) {
+                output[0] = fallback[0];
+                output[1] = fallback[1];
+                output[2] = fallback[2];
+                return output;
+              }
+              output[0] = x / length;
+              output[1] = y / length;
+              output[2] = z / length;
+              return output;
             }
             function validDistanceModel(model) {
               model = model|0;
@@ -182,8 +221,10 @@ public final class BrowserOpenAL {
               const listener = ctx.listener;
               const p = state.listener.position;
               const v = state.listener.velocity;
-              const f = normalizedVector(state.listener.forward, [0, 0, -1]);
-              const u = normalizedVector(state.listener.up, [0, 1, 0]);
+              const f = normalizedVector(
+                state.listener.forward, DEFAULT_FORWARD, state.listener.normalizedForward);
+              const u = normalizedVector(
+                state.listener.up, DEFAULT_UP, state.listener.normalizedUp);
               try {
                 if (listener.positionX) {
                   setParam(listener.positionX, p[0]);
@@ -250,6 +291,7 @@ public final class BrowserOpenAL {
                 relative: false,
                 position: [0, 0, 0],
                 direction: [0, 0, -1],
+                normalizedDirection: [0, 0, -1],
                 velocity: [0, 0, 0],
                 referenceDistance: 1,
                 rolloffFactor: 1,
@@ -263,7 +305,10 @@ public final class BrowserOpenAL {
                 buffer: 0,
                 queue: [],
                 scheduled: [],
+                resumeOffset: 0,
+                resumeQueueIndex: 0,
                 state: 0x1011,
+                active: false,
                 gainNode: null,
                 panner: null
               };
@@ -289,7 +334,8 @@ public final class BrowserOpenAL {
                 panner.coneOuterGain = Math.max(0, Math.min(1,
                   finiteNumber(source.coneOuterGain, 0)));
                 const p = source.position || [0, 0, 0];
-                const d = normalizedVector(source.direction, [0, 0, -1]);
+                const d = normalizedVector(
+                  source.direction, DEFAULT_FORWARD, source.normalizedDirection);
                 const v = source.velocity || [0, 0, 0];
                 if (panner.positionX) {
                   setParam(panner.positionX, finiteNumber(p[0], 0));
@@ -375,8 +421,42 @@ public final class BrowserOpenAL {
             }
             function disposeScheduledEntry(entry) {
               if (!entry) return;
-              disposeTrackedNode(entry.node, true);
+              const node = entry.node;
               entry.node = null;
+              entry.ended = true;
+              if (node) node.onended = null;
+              disposeTrackedNode(node, true);
+            }
+            function setSourceActive(source, active) {
+              if (!source || !!source.active === !!active) return;
+              source.active = !!active;
+              state.stats.activeSources = Math.max(
+                0, state.stats.activeSources + (source.active ? 1 : -1));
+            }
+            function retireScheduledEntry(source, entry) {
+              if (!source || !entry || entry.ended) return;
+              const node = entry.node;
+              entry.node = null;
+              entry.ended = true;
+              if (node) node.onended = null;
+              disposeTrackedNode(node, false);
+              state.stats.webAudioNaturalEnds++;
+              if (entry.queued) {
+                const allEnded = !source.scheduled || source.scheduled.every(function(candidate) {
+                  return !candidate || candidate.ended;
+                });
+                if (allEnded && source.state === 0x1012) {
+                  source.state = 0x1014;
+                  setSourceActive(source, false);
+                }
+                return;
+              }
+              const index = source.scheduled ? source.scheduled.indexOf(entry) : -1;
+              if (index >= 0) source.scheduled.splice(index, 1);
+              if (source.state === 0x1012 && (!source.scheduled || source.scheduled.length === 0)) {
+                source.state = 0x1014;
+                setSourceActive(source, false);
+              }
             }
             function connectNode(source, node) {
               if (!ensureSourceGraph(source)) return false;
@@ -400,7 +480,35 @@ public final class BrowserOpenAL {
                 disposeScheduledEntry(source.scheduled[stopIndex]);
               }
               source.scheduled = [];
-              state.stats.activeSources = Math.max(0, state.stats.activeSources - 1);
+              setSourceActive(source, false);
+            }
+            function capturePausePosition(source) {
+              source.resumeOffset = 0;
+              source.resumeQueueIndex = 0;
+              const ctx = state.context;
+              if (!ctx || !source.scheduled || source.scheduled.length === 0) return;
+              const now = Number(ctx.currentTime) || 0;
+              let selectedIndex = -1;
+              for (let index = 0; index < source.scheduled.length; index++) {
+                const candidate = source.scheduled[index];
+                if (candidate && !candidate.ended && candidate.endTime > now + 0.0005) {
+                  selectedIndex = index;
+                  break;
+                }
+              }
+              if (selectedIndex < 0) return;
+              const entry = source.scheduled[selectedIndex];
+              const duration = Math.max(0.001, Number(entry.mediaDuration) || 0.001);
+              const pitch = Math.max(0.01, Number(entry.pitch) || Number(source.pitch) || 1);
+              const elapsed = Math.max(0, now - (Number(entry.startTime) || now)) * pitch;
+              let offset = Math.max(0, (Number(entry.startOffset) || 0) + elapsed);
+              if (entry.loop) {
+                offset %= duration;
+              } else {
+                offset = Math.min(offset, Math.max(0, duration - 0.0005));
+              }
+              source.resumeOffset = offset;
+              source.resumeQueueIndex = source.buffer ? 0 : selectedIndex;
             }
             function disposeSourceGraph(source) {
               if (!source) return;
@@ -418,7 +526,7 @@ public final class BrowserOpenAL {
                             var count = 0;
                             for (var processedIndex = 0; processedIndex < source.scheduled.length; processedIndex++) {
                                 var entry = source.scheduled[processedIndex];
-                if (entry && entry.endTime <= now + 0.005) count++;
+                if (entry && (entry.ended || entry.endTime <= now + 0.005)) count++;
               }
               return Math.min(count, source.queue ? source.queue.length : count);
             }
@@ -429,6 +537,7 @@ public final class BrowserOpenAL {
               const ctx = state.context;
               if (!ctx || !source.scheduled || source.scheduled.length === 0) {
                 source.state = 0x1014;
+                setSourceActive(source, false);
                 return source.state;
               }
               const now = ctx.currentTime || 0;
@@ -437,6 +546,7 @@ public final class BrowserOpenAL {
                 if (entry && entry.endTime > now + 0.005) return 0x1012;
               }
               source.state = 0x1014;
+              setSourceActive(source, false);
               return source.state;
             }
             function connectSourceNode(source, node) {
@@ -444,7 +554,7 @@ public final class BrowserOpenAL {
               setParam(node.playbackRate, Math.max(0.01, Number(source.pitch) || 1));
               return true;
             }
-            function scheduleBuffer(source, bufferId, startAt, loop) {
+            function scheduleBuffer(source, bufferId, startAt, loop, offsetSeconds) {
               const ctx = ensureContext();
               const buffer = state.buffers.get(bufferId|0);
               if (!ctx || !buffer || !buffer.audio) return startAt;
@@ -457,25 +567,46 @@ public final class BrowserOpenAL {
                 return startAt;
               }
               const when = Math.max(ctx.currentTime, Number(startAt) || ctx.currentTime);
+              const mediaDuration = Math.max(0.001, Number(buffer.audio.duration) || 0.001);
+              const pitch = Math.max(0.01, Number(source.pitch) || 1);
+              let offset = Math.max(0, Number(offsetSeconds) || 0);
+              if (loop) {
+                offset %= mediaDuration;
+              } else {
+                offset = Math.min(offset, Math.max(0, mediaDuration - 0.0005));
+              }
+              const duration = Math.max(0.001, (mediaDuration - offset) / pitch);
+              const queued = !loop && !source.buffer && !!(source.queue && source.queue.length);
+              const entry = {bufferId: bufferId|0, node: node,
+                startTime: when, startOffset: offset, mediaDuration: mediaDuration,
+                pitch: pitch, loop: !!loop,
+                endTime: loop ? Number.MAX_VALUE : when + duration,
+                queued: queued, ended: false};
+              source.scheduled.push(entry);
+              node.onended = function() { retireScheduledEntry(source, entry); };
               try {
-                node.start(when);
+                node.start(when, offset);
               } catch (error) {
                 state.stats.lastError = String(error && (error.message || error));
-                disposeTrackedNode(node, true);
+                const index = source.scheduled.indexOf(entry);
+                if (index >= 0) source.scheduled.splice(index, 1);
+                disposeScheduledEntry(entry);
                 return startAt;
               }
-              const duration = Math.max(0.001, buffer.audio.duration / Math.max(0.01, Number(source.pitch) || 1));
-              source.scheduled.push({bufferId: bufferId|0, node: node, endTime: loop ? Number.MAX_VALUE : when + duration});
               return when + duration;
             }
             state.ensureContext = ensureContext;
             state.setParam = setParam;
             state.finiteNumber = finiteNumber;
+            state.setVector = setVector;
             state.validDistanceModel = validDistanceModel;
             state.effectiveDistanceModel = effectiveDistanceModel;
             state.freshSource = freshSource;
             state.stopNodes = stopNodes;
+            state.capturePausePosition = capturePausePosition;
             state.disposeScheduledEntry = disposeScheduledEntry;
+            state.setSourceActive = setSourceActive;
+            state.retireScheduledEntry = retireScheduledEntry;
             state.disposeSourceGraph = disposeSourceGraph;
             state.processedCount = processedCount;
             state.refreshState = refreshState;
@@ -515,6 +646,67 @@ public final class BrowserOpenAL {
 
     public static int getError() {
         return 0;
+    }
+
+    public static boolean alcIsExtensionPresent(long device, CharSequence extension) {
+        return extension != null && ALC_EXTENSIONS.contains(extension.toString());
+    }
+
+    public static boolean alcIsExtensionPresent(long device, ByteBuffer extension) {
+        if (extension == null) {
+            return false;
+        }
+        ByteBuffer copy = extension.duplicate();
+        StringBuilder name = new StringBuilder(copy.remaining());
+        while (copy.hasRemaining()) {
+            int value = copy.get() & 0xFF;
+            if (value == 0) {
+                break;
+            }
+            name.append((char) value);
+        }
+        return alcIsExtensionPresent(device, name);
+    }
+
+    public static int alcGetInteger(long device, int parameter) {
+        return switch (parameter) {
+            case ALC_MAJOR_VERSION, ALC_MINOR_VERSION, ALC_CONNECTED -> 1;
+            case ALC_ATTRIBUTES_SIZE -> ALC_ATTRIBUTES.length;
+            case ALC_FREQUENCY -> 48_000;
+            case ALC_REFRESH -> 60;
+            case ALC_MONO_SOURCES -> 30;
+            case ALC_STEREO_SOURCES -> 8;
+            case ALC_SYNC, ALC_NUM_HRTF_SPECIFIERS_SOFT -> 0;
+            default -> 0;
+        };
+    }
+
+    public static void alcGetIntegerv(long device, int parameter, IntBuffer values) {
+        if (values == null) {
+            return;
+        }
+        IntBuffer copy = values.duplicate();
+        if (parameter == ALC_ALL_ATTRIBUTES) {
+            for (int value : ALC_ATTRIBUTES) {
+                if (!copy.hasRemaining()) {
+                    break;
+                }
+                copy.put(value);
+            }
+        } else if (copy.hasRemaining()) {
+            copy.put(alcGetInteger(device, parameter));
+        }
+    }
+
+    public static void alcGetIntegerv(long device, int parameter, int[] values) {
+        if (values == null || values.length == 0) {
+            return;
+        }
+        if (parameter == ALC_ALL_ATTRIBUTES) {
+            System.arraycopy(ALC_ATTRIBUTES, 0, values, 0, Math.min(values.length, ALC_ATTRIBUTES.length));
+        } else {
+            values[0] = alcGetInteger(device, parameter);
+        }
     }
 
     public static int getInteger(int parameter) {
@@ -703,19 +895,18 @@ public final class BrowserOpenAL {
             if (!state) return;
             const src = state.sources.get(source|0);
             if (!src) return;
-            const value = [state.finiteNumber(x, 0), state.finiteNumber(y, 0),
-              state.finiteNumber(z, 0)];
             if ((parameter|0) === 0x1004) {
-              src.position = value;
+              state.setVector(src.position, x, y, z);
               state.applyPanner(src);
             } else if ((parameter|0) === 0x1005) {
-              src.direction = value;
+              state.setVector(src.direction, x, y, z);
               state.applyPanner(src);
             } else if ((parameter|0) === 0x1006) {
-              src.velocity = value;
+              state.setVector(src.velocity, x, y, z);
               state.applyPanner(src);
             } else {
-              src[parameter|0] = value;
+              const value = src[parameter|0] || [0, 0, 0];
+              src[parameter|0] = state.setVector(value, x, y, z);
             }
             """)
     private static native void source3fJs(int source, int parameter, float x, float y, float z);
@@ -769,6 +960,8 @@ public final class BrowserOpenAL {
               }
             } else if (parameter === 0x1009) {
               src.buffer = value;
+              src.resumeOffset = 0;
+              src.resumeQueueIndex = 0;
             } else if (parameter === 0x0202) {
               src.relative = value !== 0;
               state.reconnectSource(src);
@@ -851,6 +1044,14 @@ public final class BrowserOpenAL {
             const src = state.sources.get(source|0);
             if (!src) return;
             src.queue.push(buffer|0);
+            if (src.state === 0x1012) {
+              let at = state.context ? state.context.currentTime : 0;
+              if (src.scheduled && src.scheduled.length) {
+                const tail = src.scheduled[src.scheduled.length - 1];
+                if (tail && Number.isFinite(tail.endTime)) at = Math.max(at, tail.endTime);
+              }
+              state.scheduleBuffer(src, buffer|0, at, false);
+            }
             state.stats.queuedBuffers++;
             """)
     private static native void sourceQueueBufferJs(int source, int buffer);
@@ -888,6 +1089,11 @@ public final class BrowserOpenAL {
             const id = src.queue.shift() || 0;
             if (src.scheduled && src.scheduled.length > 0) {
               state.disposeScheduledEntry(src.scheduled.shift());
+            }
+            if (src.resumeQueueIndex > 0) {
+              src.resumeQueueIndex--;
+            } else {
+              src.resumeOffset = 0;
             }
             state.stats.unqueuedBuffers++;
             return id|0;
@@ -976,19 +1182,33 @@ public final class BrowserOpenAL {
             const src = state.sources.get(source|0);
             if (!src) return;
             state.ensureContext();
+            const wasPaused = src.state === 0x1013;
+            const resumeOffset = wasPaused ? Math.max(0, Number(src.resumeOffset) || 0) : 0;
+            const resumeQueueIndex = wasPaused
+              ? Math.max(0, Math.min(src.queue ? src.queue.length : 0,
+                  Number(src.resumeQueueIndex) || 0)) : 0;
             state.stopNodes(src);
             src.scheduled = [];
             if (src.buffer) {
-              state.scheduleBuffer(src, src.buffer|0, 0, src.looping);
+              state.scheduleBuffer(src, src.buffer|0, 0, src.looping, resumeOffset);
             } else if (src.queue && src.queue.length) {
                             var at = state.context ? state.context.currentTime : 0;
-                            for (var queueIndex = 0; queueIndex < src.queue.length; queueIndex++) {
-                                at = state.scheduleBuffer(src, src.queue[queueIndex]|0, at, false);
+                            for (var processedIndex = 0; processedIndex < resumeQueueIndex; processedIndex++) {
+                              src.scheduled.push({bufferId: src.queue[processedIndex]|0, node: null,
+                                startTime: at, startOffset: 0, mediaDuration: 0,
+                                pitch: Math.max(0.01, Number(src.pitch) || 1), loop: false,
+                                endTime: at, queued: true, ended: true});
+                            }
+                            for (var queueIndex = resumeQueueIndex; queueIndex < src.queue.length; queueIndex++) {
+                                at = state.scheduleBuffer(src, src.queue[queueIndex]|0, at, false,
+                                  queueIndex === resumeQueueIndex ? resumeOffset : 0);
               }
             }
-            src.state = 0x1012;
+            src.resumeOffset = 0;
+            src.resumeQueueIndex = 0;
+            src.state = src.scheduled && src.scheduled.length ? 0x1012 : 0x1014;
             state.stats.sourcePlays++;
-            state.stats.activeSources = Math.max(state.stats.activeSources, 1);
+            state.setSourceActive(src, src.state === 0x1012);
             if (state.context) state.stats.contextState = state.context.state || 'unknown';
             """)
     private static native void sourcePlayJs(int source);
@@ -998,6 +1218,8 @@ public final class BrowserOpenAL {
             if (!state) return;
             const src = state.sources.get(source|0);
             if (!src) return;
+            if (state.refreshState(src) !== 0x1012) return;
+            state.capturePausePosition(src);
             state.stopNodes(src);
             src.state = 0x1013;
             """)
@@ -1009,6 +1231,8 @@ public final class BrowserOpenAL {
             const src = state.sources.get(source|0);
             if (!src) return;
             state.stopNodes(src);
+            src.resumeOffset = 0;
+            src.resumeQueueIndex = 0;
             src.state = 0x1014;
             state.stats.sourceStops++;
             """)
@@ -1217,10 +1441,11 @@ public final class BrowserOpenAL {
     @JSBody(params = {"parameter", "x", "y", "z"}, script = """
             const state = window.__gaiusOpenAL;
             if (!state) return;
-            const value = [state.finiteNumber(x, 0), state.finiteNumber(y, 0),
-              state.finiteNumber(z, 0)];
-            if ((parameter|0) === 0x1004) state.listener.position = value;
-            else if ((parameter|0) === 0x1006) state.listener.velocity = value;
+            if ((parameter|0) === 0x1004) {
+              state.setVector(state.listener.position, x, y, z);
+            } else if ((parameter|0) === 0x1006) {
+              state.setVector(state.listener.velocity, x, y, z);
+            }
             state.applyListener();
             """)
     private static native void listener3fJs(int parameter, float x, float y, float z);
@@ -1257,10 +1482,9 @@ public final class BrowserOpenAL {
     @JSBody(params = {"forwardX", "forwardY", "forwardZ", "upX", "upY", "upZ"}, script = """
             const state = window.__gaiusOpenAL;
             if (!state) return;
-            state.listener.forward = [state.finiteNumber(forwardX, 0),
-              state.finiteNumber(forwardY, 0), state.finiteNumber(forwardZ, -1)];
-            state.listener.up = [state.finiteNumber(upX, 0), state.finiteNumber(upY, 1),
-              state.finiteNumber(upZ, 0)];
+            state.setVector(
+              state.listener.forward, forwardX, forwardY, forwardZ, 0, 0, -1);
+            state.setVector(state.listener.up, upX, upY, upZ, 0, 1, 0);
             state.applyListener();
             """)
     private static native void listenerOrientationJs(

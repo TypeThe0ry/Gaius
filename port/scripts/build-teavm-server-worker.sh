@@ -55,9 +55,9 @@ export GAIUS_EXCLUDED_LIBRARY_PREFIXES="${GAIUS_SERVER_EXCLUDED_LIBRARY_PREFIXES
 export GAIUS_TEA_OPTIMIZATION_LEVEL="${GAIUS_SERVER_TEA_OPTIMIZATION_LEVEL:-ADVANCED}"
 export GAIUS_SOURCE_MAPS="${GAIUS_SERVER_SOURCE_MAPS:-false}"
 export GAIUS_DEBUG_INFO="${GAIUS_SERVER_DEBUG_INFO:-false}"
-export GAIUS_MINIFYING="${GAIUS_SERVER_MINIFYING:-false}"
-export GAIUS_SHORT_FILE_NAMES="${GAIUS_SERVER_SHORT_FILE_NAMES:-false}"
-export GAIUS_ASSERTIONS_REMOVED="${GAIUS_SERVER_ASSERTIONS_REMOVED:-false}"
+export GAIUS_MINIFYING="${GAIUS_SERVER_MINIFYING:-true}"
+export GAIUS_SHORT_FILE_NAMES="${GAIUS_SERVER_SHORT_FILE_NAMES:-true}"
+export GAIUS_ASSERTIONS_REMOVED="${GAIUS_SERVER_ASSERTIONS_REMOVED:-true}"
 
 pom="$("$root/port/scripts/generate-pom.sh")"
 log="$server_target/teavm-build.log"
@@ -103,6 +103,14 @@ if [[ "$build_status" -eq 0 ]]; then
     --root "$root" \
     --role singleplayer-worker \
     --artifact "$dist/singleplayer-server.js"
+  "$root/port/scripts/run-python.sh" \
+    "$root/port/scripts/teavm-compiler-profile.py" write \
+    --root "$root" \
+    --role singleplayer-worker \
+    --artifact "$dist/singleplayer-server.js" \
+    --pom "$pom" \
+    --resource "$server_resources/dev/gaius/browser/minecraft-resources.txt" \
+    --require-release
   "$root/port/scripts/run-python.sh" \
     "$root/port/scripts/gaius_build_identity.py" write \
     --root "$root" \

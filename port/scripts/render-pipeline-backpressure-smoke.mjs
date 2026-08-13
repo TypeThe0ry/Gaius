@@ -2,15 +2,17 @@
 
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
-import {readFile} from "node:fs/promises";
+import {mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
+import {tmpdir} from "node:os";
+import {join} from "node:path";
 import {fileURLToPath} from "node:url";
 
 const scriptsDirectory = fileURLToPath(new URL(".", import.meta.url));
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
-const scheduler = await readFile(
+const schedulerPath = fileURLToPath(
   new URL("../src/main/java/dev/gaius/browser/BrowserRenderScheduler.java", import.meta.url),
-  "utf8",
 );
+const scheduler = await readFile(schedulerPath, "utf8");
 const patcher = await readFile(
   new URL("../tools/src/main/java/dev/gaius/tools/MinecraftClientPatcher.java", import.meta.url),
   "utf8",
@@ -30,8 +32,12 @@ const overlayJar = `${repositoryRoot}/port/work/overlays/client-named-${version}
 for (const contract of [
   "MAX_UPLOAD_ALLOCATIONS_PER_FRAME = 8",
   "UPLOAD_WORK_BUDGET_NANOS = 2_000_000L",
+  "MAX_UBER_NODE_CLEANUP_SCANS_PER_FRAME = 8",
+  "UBER_NODE_CLEANUP_BUDGET_NANOS = 250_000L",
   "MAX_UPLOAD_RETRY_YIELDS = 2_048",
   "MAX_UPLOAD_RETRY_NANOS = 5_000_000_000L",
+  "UPLOAD_RETRY_SWEEP_INTERVAL_NANOS = 1_000_000_000L",
+  "UPLOAD_RETRY_TOMBSTONE_IDLE_NANOS = 5_000_000_000L",
   "scheduleDispatcher(",
   "rememberDispatcherContinuation(",
   "finishDispatcherRun(",
@@ -40,8 +46,13 @@ for (const contract of [
   "finishUploadBuffer(",
   "releaseUploadBuffer(",
   "requestEmergencyUpload(",
+  "beginUberNodeCleanup(",
+  "shouldCleanUberNode(",
+  "finishUberNodeCleanup(",
+  "UBER_NODE_CLEANUP_CURSORS",
   "awaitUploadRetry(",
   "clearUploadRetry(",
+  "sweepExpiredUploadRetries()",
   "TModernRuntimeSupport.yieldToEventLoop(1)",
   "emergencyUploadRequests",
   "emergencyUploadDrains",
@@ -49,6 +60,7 @@ for (const contract of [
   "uploadRetryYields",
   "uploadRetryNoProgressResumes",
   "uploadRetryCancellations",
+  "uploadRetryExpiredStates",
   "lastTaskDrainCount",
   "currentUploadDrainCount",
   "uploadBudgetExhaustions",
@@ -91,7 +103,16 @@ for (const contract of [
   '"requestEmergencyUpload"',
   '"awaitUploadRetry"',
   '"clearUploadRetry"',
+  "addUploadRetryExceptionCleanup(method)",
+  "TryCatchBlockNode",
+  "writeComputeFrames(node, root.resolve(owner + \".class\"))",
+  "ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS",
   '"uploadTerrainBuffersToGpu"',
+  "patchUberGpuBufferNodeCleanup",
+  '"beginUberNodeCleanup"',
+  '"shouldCleanUberNode"',
+  '"finishUberNodeCleanup"',
+  '"UberGpuBuffer upload budget patch must run before node cleanup patch"',
 ]) {
   assert.ok(patcher262.includes(contract), `missing 26.2 progress patch contract: ${contract}`);
 }
@@ -177,6 +198,12 @@ for (const taskName of ["CompileTask", "ResortTransparencyTask"]) {
     `${taskName} can retry staging in one uninterruptible JS turn`);
   assert.ok(doTask.includes("BrowserRenderScheduler.clearUploadRetry"),
     `${taskName} retains retry telemetry after completing`);
+  assert.ok(doTask.includes("Class java/lang/Throwable"),
+    `${taskName} has no retry cleanup exception handler`);
+  assert.ok(
+    doTask.split("BrowserRenderScheduler.clearUploadRetry").length - 1 >= 3,
+    `${taskName} does not clean retry ownership on every exit class`,
+  );
   assert.ok(doTask.includes("Method cancel:()V"),
     `${taskName} has no bounded-retry cancellation path`);
   assert.ok(!doTask.includes("RenderSystem.isOnRenderThread"),
@@ -227,5 +254,291 @@ while (pending.length > 0) {
 assert.deepEqual(drains, [8, 8, 3], "max-entry frame budget model regressed");
 assert.deepEqual(callbacks, Array.from({length: 19}, (_, index) => index),
   "resumable upload model lost or duplicated callbacks");
+
+function cleanUberNodes(nodes, cursors, owner, maximumScans) {
+  if (nodes.length === 0) {
+    cursors.delete(owner);
+    return {scanned: 0, released: 0};
+  }
+  let cursor = (cursors.get(owner) ?? 0) % nodes.length;
+  let scanned = 0;
+  let released = 0;
+  while (nodes.length > 0 && scanned < maximumScans) {
+    if (nodes[cursor].free) {
+      nodes[cursor].closed = true;
+      nodes.splice(cursor, 1);
+      released++;
+    } else {
+      cursor++;
+    }
+    scanned++;
+    if (nodes.length > 0) cursor %= nodes.length;
+  }
+  if (nodes.length === 0) cursors.delete(owner);
+  else cursors.set(owner, cursor);
+  return {scanned, released};
+}
+
+const cleanupCursorState = new Map();
+const cleanupOwner = {};
+const uberNodes = Array.from({length: 23}, (_, index) => ({
+  id: index,
+  free: index % 3 === 1,
+  closed: false,
+}));
+const initialFreeNodeIds = uberNodes.filter(node => node.free).map(node => node.id);
+let cleanupScans = 0;
+while (uberNodes.some(node => node.free)) {
+  const pass = cleanUberNodes(uberNodes, cleanupCursorState, cleanupOwner, 8);
+  assert.ok(pass.scanned <= 8, "UberGpuBuffer cleanup exceeded its frame scan budget");
+  cleanupScans += pass.scanned;
+}
+assert.deepEqual(
+  uberNodes.filter(node => node.closed).map(node => node.id),
+  [],
+  "released UberGpuBuffer nodes remained in the live heap list",
+);
+assert.ok(cleanupScans >= initialFreeNodeIds.length,
+  "UberGpuBuffer cleanup skipped a free heap node");
+assert.ok(cleanupCursorState.has(cleanupOwner),
+  "UberGpuBuffer cursor vanished while reusable heaps remained");
+for (const node of uberNodes) node.free = true;
+while (uberNodes.length > 0) {
+  const pass = cleanUberNodes(uberNodes, cleanupCursorState, cleanupOwner, 8);
+  assert.ok(pass.scanned <= 8, "UberGpuBuffer final cleanup exceeded its frame scan budget");
+}
+assert.equal(cleanupCursorState.has(cleanupOwner), false,
+  "UberGpuBuffer cleanup cursor leaked after all heap nodes were released");
+
+const retryRegressionRoot = await mkdtemp(join(tmpdir(), "gaius-render-retry-"));
+try {
+  const classesDirectory = join(retryRegressionRoot, "classes");
+  const sourceDirectory = join(retryRegressionRoot, "src");
+  await mkdir(classesDirectory, {recursive: true});
+
+  const sources = new Map([
+    ["org/teavm/classlib/java/lang/TModernRuntimeSupport.java", String.raw`
+package org.teavm.classlib.java.lang;
+public final class TModernRuntimeSupport {
+    private TModernRuntimeSupport() {}
+    public static void yieldToEventLoop(int millis) {}
+}
+`],
+    ["org/teavm/jso/JSBody.java", String.raw`
+package org.teavm.jso;
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.METHOD)
+public @interface JSBody {
+    String[] params() default {};
+    String script() default "";
+}
+`],
+    ["org/teavm/jso/browser/Window.java", String.raw`
+package org.teavm.jso.browser;
+public final class Window {
+    private Window() {}
+    @FunctionalInterface
+    public interface FrameCallback {
+        void onAnimationFrame(double timestamp);
+    }
+    public static int requestAnimationFrame(FrameCallback callback) { return 1; }
+    public static void cancelAnimationFrame(int requestId) {}
+}
+`],
+    ["org/teavm/platform/Platform.java", String.raw`
+package org.teavm.platform;
+public final class Platform {
+    private Platform() {}
+    public static void schedule(Runnable command, int timeout) { command.run(); }
+}
+`],
+    ["dev/gaius/browser/BrowserRenderSchedulerRetryRegression.java", String.raw`
+package dev.gaius.browser;
+
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.Map;
+
+public final class BrowserRenderSchedulerRetryRegression {
+    private static Field field(Class<?> owner, String name) throws Exception {
+        Field field = owner.getDeclaredField(name);
+        field.setAccessible(true);
+        return field;
+    }
+
+    private static void check(boolean condition, String message) {
+        if (!condition) {
+            throw new AssertionError(message);
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Class<?> scheduler = BrowserRenderScheduler.class;
+        Class<?> retryState = Class.forName(
+                "dev.gaius.browser.BrowserRenderScheduler$UploadRetryState");
+        Constructor<?> retryStateConstructor = retryState.getDeclaredConstructor(long.class);
+        retryStateConstructor.setAccessible(true);
+
+        Field retryStatesField = field(scheduler, "UPLOAD_RETRY_STATES");
+        @SuppressWarnings("unchecked")
+        Map<Object, Object> retryStates = (Map<Object, Object>) retryStatesField.get(null);
+        long maxRetryNanos = field(scheduler, "MAX_UPLOAD_RETRY_NANOS").getLong(null);
+        int maxRetryYields = field(scheduler, "MAX_UPLOAD_RETRY_YIELDS").getInt(null);
+        long idleNanos = field(scheduler, "UPLOAD_RETRY_TOMBSTONE_IDLE_NANOS").getLong(null);
+        Field terminalField = field(retryState, "terminal");
+        Field yieldsField = field(retryState, "yields");
+        Field lastTouchedField = field(retryState, "lastTouchedAtNanos");
+
+        Method sweep = scheduler.getDeclaredMethod("sweepExpiredUploadRetries", long.class);
+        sweep.setAccessible(true);
+        Method awaitRetry = scheduler.getDeclaredMethod("awaitUploadRetry", Object.class);
+        awaitRetry.setAccessible(true);
+
+        Object sweptTask = new Object();
+        long sweepNow = 20_000_000_000L;
+        Object sweptState = retryStateConstructor.newInstance(sweepNow - maxRetryNanos);
+        retryStates.put(sweptTask, sweptState);
+        sweep.invoke(null, sweepNow);
+        check(retryStates.get(sweptTask) == sweptState,
+                "time-expired retry was deleted instead of tombstoned");
+        check(terminalField.getBoolean(sweptState),
+                "time-expired retry was not marked terminal");
+        sweep.invoke(null, sweepNow + idleNanos - 1L);
+        check(retryStates.get(sweptTask) == sweptState,
+                "terminal retry was reclaimed before the idle grace");
+        check(!(Boolean) awaitRetry.invoke(null, sweptTask),
+                "next await recreated a swept retry budget");
+        check(retryStates.get(sweptTask) == sweptState,
+                "next await replaced the terminal retry state");
+        check(yieldsField.getInt(sweptState) == 0,
+                "terminal retry yielded or consumed a fresh attempt");
+        long sweptTouchedAt = lastTouchedField.getLong(sweptState);
+        sweep.invoke(null, sweptTouchedAt + idleNanos - 1L);
+        check(retryStates.containsKey(sweptTask),
+                "active tombstone was reclaimed before a full idle grace");
+        sweep.invoke(null, sweptTouchedAt + idleNanos);
+        check(!retryStates.containsKey(sweptTask),
+                "idle terminal tombstone was not reclaimed");
+
+        Object attemptTask = new Object();
+        long attemptNow = System.nanoTime();
+        Object attemptState = retryStateConstructor.newInstance(attemptNow);
+        yieldsField.setInt(attemptState, maxRetryYields - 1);
+        retryStates.put(attemptTask, attemptState);
+        check(!(Boolean) awaitRetry.invoke(null, attemptTask),
+                "attempt-limited retry did not terminate");
+        check(terminalField.getBoolean(attemptState),
+                "attempt-limited retry was removed instead of tombstoned");
+        check(retryStates.get(attemptTask) == attemptState,
+                "attempt-limited retry lost its terminal identity");
+        check(!(Boolean) awaitRetry.invoke(null, attemptTask),
+                "terminal attempt-limited retry received a fresh budget");
+        check(yieldsField.getInt(attemptState) == maxRetryYields,
+                "terminal retry consumed attempts after cancellation");
+        long attemptTouchedAt = lastTouchedField.getLong(attemptState);
+        sweep.invoke(null, attemptTouchedAt + idleNanos);
+        check(!retryStates.containsKey(attemptTask),
+                "attempt-limited tombstone exceeded its idle lifetime");
+
+        System.out.println("Upload retry tombstone regression passed");
+    }
+}
+`],
+    ["dev/gaius/browser/BrowserRenderSchedulerUberCleanupRegression.java", String.raw`
+package dev.gaius.browser;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.Map;
+
+public final class BrowserRenderSchedulerUberCleanupRegression {
+    private static void check(boolean condition, String message) {
+        if (!condition) {
+            throw new AssertionError(message);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    public static void main(String[] args) throws Exception {
+        Class<?> scheduler = BrowserRenderScheduler.class;
+        Field cursorField = scheduler.getDeclaredField("UBER_NODE_CLEANUP_CURSORS");
+        cursorField.setAccessible(true);
+        Map<Object, Integer> cursors = (Map<Object, Integer>) cursorField.get(null);
+        Field scanLimitField = scheduler.getDeclaredField("MAX_UBER_NODE_CLEANUP_SCANS_PER_FRAME");
+        scanLimitField.setAccessible(true);
+        int scanLimit = scanLimitField.getInt(null);
+
+        Method beginFrame = scheduler.getDeclaredMethod("beginFrame");
+        Method begin = scheduler.getDeclaredMethod(
+                "beginUberNodeCleanup", Object.class, int.class);
+        Method shouldClean = scheduler.getDeclaredMethod("shouldCleanUberNode", Object.class);
+        Method finish = scheduler.getDeclaredMethod(
+                "finishUberNodeCleanup",
+                Object.class, int.class, int.class, int.class, int.class);
+
+        Object buffer = new Object();
+        beginFrame.invoke(null);
+        int accepted = 0;
+        while ((Boolean) shouldClean.invoke(null, buffer)) {
+            accepted++;
+        }
+        check(accepted > 0 && accepted <= scanLimit,
+                "Uber cleanup did not obey its frame-wide scan ceiling");
+        finish.invoke(null, buffer, 5, 9, accepted, 2);
+        check(cursors.get(buffer) == 5,
+                "Uber cleanup did not retain its resumable cursor");
+        check((Integer) begin.invoke(null, buffer, 9) == 5,
+                "Uber cleanup resumed from a different heap node");
+
+        beginFrame.invoke(null);
+        int nextFrameAccepted = 0;
+        while ((Boolean) shouldClean.invoke(null, buffer)) {
+            nextFrameAccepted++;
+        }
+        check(nextFrameAccepted > 0 && nextFrameAccepted <= scanLimit,
+                "Uber cleanup did not reset its budget on the next render frame");
+        finish.invoke(null, buffer, 0, 0, nextFrameAccepted, 0);
+        check(!cursors.containsKey(buffer),
+                "Uber cleanup cursor leaked after the final heap was released");
+
+        finish.invoke(null, buffer, 3, 7, 1, 0);
+        BrowserRenderScheduler.releaseUploadBuffer(buffer);
+        check(!cursors.containsKey(buffer),
+                "Uber cleanup cursor survived UberGpuBuffer release");
+        System.out.println("UberGpuBuffer cleanup regression passed");
+    }
+}
+`],
+  ]);
+
+  const sourcePaths = [];
+  for (const [relativePath, contents] of sources) {
+    const sourcePath = join(sourceDirectory, relativePath);
+    await mkdir(join(sourcePath, ".."), {recursive: true});
+    await writeFile(sourcePath, contents);
+    sourcePaths.push(sourcePath);
+  }
+  execFileSync("javac", ["--release", "17", "-d", classesDirectory, schedulerPath, ...sourcePaths], {
+    cwd: scriptsDirectory,
+    stdio: "inherit",
+  });
+  execFileSync("java", ["-cp", classesDirectory,
+    "dev.gaius.browser.BrowserRenderSchedulerRetryRegression"], {
+    cwd: scriptsDirectory,
+    stdio: "inherit",
+  });
+  execFileSync("java", ["-cp", classesDirectory,
+    "dev.gaius.browser.BrowserRenderSchedulerUberCleanupRegression"], {
+    cwd: scriptsDirectory,
+    stdio: "inherit",
+  });
+} finally {
+  await rm(retryRegressionRoot, {recursive: true, force: true});
+}
 
 console.log("Render pipeline backpressure smoke passed");

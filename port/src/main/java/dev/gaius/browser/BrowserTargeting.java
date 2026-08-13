@@ -3,6 +3,7 @@ package dev.gaius.browser;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
+import net.minecraft.world.phys.EntityHitResult;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
@@ -11,6 +12,34 @@ import org.teavm.jso.JSBody;
 /** Recomputes targeting after the camera has been updated for the frame being rendered. */
 public final class BrowserTargeting {
     private BrowserTargeting() {
+    }
+
+    /**
+     * Consumes the vanilla per-frame pick call so the one raycast for this frame can run after
+     * the render camera has been extracted. Tick-time picks are left unchanged.
+     */
+    public static void deferFramePick(Minecraft minecraft, float partialTick) {
+        recordDeferredPick(partialTick);
+    }
+
+    /** Refreshes both block and entity targeting from the camera used by this rendered frame. */
+    public static void refreshFramePick(
+            Minecraft minecraft,
+            Camera camera,
+            float partialTick) {
+        if (minecraft == null) {
+            recordTargetingResult(false, partialTick, null, camera);
+            return;
+        }
+        HitResult updated = stabilizeBlockHit(
+                minecraft.hitResult,
+                minecraft,
+                camera,
+                partialTick);
+        minecraft.hitResult = updated;
+        minecraft.crosshairPickEntity = updated instanceof EntityHitResult entityHit
+                ? entityHit.getEntity()
+                : null;
     }
 
     public static HitResult stabilizeBlockHit(
@@ -75,6 +104,15 @@ public final class BrowserTargeting {
 
     @JSBody(script = "return !!globalThis.__gaiusBenchmarkEnabled;")
     private static native boolean targetingTelemetryEnabled();
+
+    @JSBody(params = "partialTick", script = """
+            if (!globalThis.__gaiusBenchmarkEnabled) return;
+            const state=globalThis.__gaiusTargetingTelemetry ||
+              (globalThis.__gaiusTargetingTelemetry={updates:0,skips:0});
+            state.deferredPicks=(Number(state.deferredPicks)||0)+1;
+            state.deferredPartialTick=Number(partialTick);
+            """)
+    private static native void recordDeferredPick(float partialTick);
 
     @JSBody(params = {
             "updated",

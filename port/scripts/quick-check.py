@@ -30,6 +30,20 @@ TARGET = PORT / "target"
 DIST = PORT / "web" / "dist"
 VERSION_CONFIG = PORT / "config.json"
 PORTABLE_MANIFEST = DIST / "Gaius.manifest.json"
+CLIENT_RELEASE_PROFILE = DIST / "classes.js.release.json"
+WORKER_RELEASE_PROFILE = DIST / "singleplayer-server.js.release.json"
+TEAVM_COMPILER_PROFILE_TOOL = PORT / "scripts" / "teavm-compiler-profile.py"
+CLIENT_TEA_POM = TARGET / "generated-pom.xml"
+WORKER_TEA_POM = TARGET / "server-worker" / "generated-pom.xml"
+WORKER_RESOURCE_LIST = (
+    TARGET
+    / "server-worker"
+    / "generated-resources"
+    / "dev"
+    / "gaius"
+    / "browser"
+    / "minecraft-resources.txt"
+)
 OVERLAYS = PORT / "work" / "overlays"
 OPENGL_BRIDGE = PORT / "overrides" / "libraries" / "lwjgl-opengl" / "src" / "main" / "java" / "org" / "lwjgl" / "opengl" / "BrowserOpenGL.java"
 OPENGL_PATCHER = PORT / "tools" / "src" / "main" / "java" / "dev" / "gaius" / "tools" / "LwjglOpenGLBrowserPatcher.java"
@@ -87,8 +101,17 @@ BROWSER_WORLDGEN_SCHEDULER = PORT / "src" / "main" / "java" / "dev" / "gaius" / 
 BROWSER_PACKET_SCHEDULER = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserPacketScheduler.java"
 BROWSER_CHUNK_TASK_PRIORITY = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserChunkTaskPriority.java"
 BROWSER_STARTUP_SCHEDULER = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserStartupScheduler.java"
+BROWSER_FUTURE_PUMP = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserFuturePump.java"
 BROWSER_GZIP = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserGzip.java"
 BROWSER_RENDER_SCHEDULER = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserRenderScheduler.java"
+PERFORMANCE_CONTRACT = PORT / "scripts" / "performance-contract.json"
+CHROME_CHUNK_BENCHMARK = PORT / "scripts" / "chrome-chunk-benchmark.mjs"
+CHROME_PERFORMANCE_RELEASE_SUITE = (
+    PORT / "scripts" / "chrome-performance-release-suite.mjs"
+)
+CHROME_PERFORMANCE_RELEASE_SUITE_SMOKE = (
+    PORT / "scripts" / "chrome-performance-release-suite-smoke.mjs"
+)
 BROWSER_CHUNK_SECTION_LAYERS = PORT / "overrides" / "client" / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserChunkSectionLayers.java"
 BROWSER_IMPROVED_NOISE = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserImprovedNoise.java"
 BROWSER_NOISE_INTERPOLATOR = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserNoiseInterpolator.java"
@@ -129,6 +152,7 @@ SINGLEPLAYER_LAUNCHER = PORT / "web" / "singleplayer" / "index.html"
 AUTHLIB_PATCHER = PORT / "tools" / "src" / "main" / "java" / "dev" / "gaius" / "tools" / "AuthlibBrowserPatcher.java"
 PATCHY_PATCHER = PORT / "tools" / "src" / "main" / "java" / "dev" / "gaius" / "tools" / "PatchyBrowserPatcher.java"
 VERTEX_ARRAY_CACHE = PORT / "overrides" / "client" / "src" / "main" / "java" / "com" / "mojang" / "blaze3d" / "opengl" / "VertexArrayCache.java"
+VERTEX_ARRAY_CACHE_262 = PORT / "overrides" / "client" / "src" / "versions" / "26.2" / "java" / "com" / "mojang" / "blaze3d" / "opengl" / "VertexArrayCache.java"
 WASM_HOTPATH_C = PORT / "wasm" / "hotpath" / "gaius_hotpath.c"
 BUILD_WASM_HOTPATH = PORT / "scripts" / "build-wasm-hotpath.sh"
 GENERATE_WASM_HOTPATH = PORT / "scripts" / "generate-wasm-hotpath.py"
@@ -154,6 +178,7 @@ GENERATED_RESOURCE_LIST = TARGET / "generated-resources" / "dev" / "gaius" / "br
 GENERATED_EMBEDDED_RESOURCE_LIST = TARGET / "generated-resources" / "dev" / "gaius" / "browser" / "minecraft-embedded-resources.txt"
 GENERATED_SOUNDS_JSON = TARGET / "generated-resources" / "assets" / "minecraft" / "sounds.json"
 GENERATED_UNIFONT_JSON = TARGET / "generated-resources" / "assets" / "minecraft" / "font" / "include" / "unifont.json"
+GENERATED_UNIFONT_PUA_JSON = TARGET / "generated-resources" / "assets" / "minecraft" / "font" / "include" / "unifont_pua.json"
 POSTPROCESS_TEAVM_JS = PORT / "scripts" / "postprocess-teavm-js.py"
 POSTPROCESS_TEAVM_JS_TEST = PORT / "scripts" / "test-postprocess-teavm-js.py"
 POSTPROCESS_INDEX_HTML = PORT / "scripts" / "postprocess-index-html.py"
@@ -182,6 +207,7 @@ BUILD_IDENTITY_SOURCE_FILES = (
     "port/web/singleplayer/index.html",
     "port/web/singleplayer/server-worker-bootstrap.js",
     "port/scripts/gaius_build_identity.py",
+    "port/scripts/teavm-compiler-profile.py",
     "port/scripts/version-profile.sh",
     "port/scripts/build-overlays.sh",
     "port/scripts/remap-client.sh",
@@ -463,6 +489,57 @@ def manifest_component_build_matches(
         "sidecarBytes": sidecar.stat().st_size,
     }
     return component.get("build") == expected_component
+
+
+def manifest_compiler_profile_matches(
+    component: object,
+    artifact: Path,
+    role: str,
+) -> bool:
+    if not isinstance(component, dict) or not artifact.is_file():
+        return False
+    compiler_metadata = component.get("compiler")
+    sidecar = artifact.with_name(f"{artifact.name}.release.json")
+    try:
+        record = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return False
+    if not isinstance(compiler_metadata, dict) or not isinstance(record, dict):
+        return False
+    compiler = record.get("compiler")
+    artifact_record = record.get("artifact")
+    profile_sha256 = record.get("profileSha256")
+    if (
+        record.get("kind") != "gaius-teavm-compiler-profile"
+        or record.get("schemaVersion") != 2
+        or record.get("role") != role
+        or record.get("releaseGrade") is not True
+        or not isinstance(compiler, dict)
+        or not isinstance(artifact_record, dict)
+        or not isinstance(profile_sha256, str)
+    ):
+        return False
+    hash_payload = dict(record)
+    hash_payload.pop("profileSha256", None)
+    if hashlib.sha256(
+        canonical_identity_json(hash_payload).encode("ascii")
+    ).hexdigest() != profile_sha256:
+        return False
+    if (
+        artifact_record.get("sha256") != sha256_file(artifact)
+        or artifact_record.get("bytes") != artifact.stat().st_size
+    ):
+        return False
+    expected = {
+        "profileSha256": profile_sha256,
+        "sidecarSha256": sha256_file(sidecar),
+        "sidecarBytes": sidecar.stat().st_size,
+        "optimizationLevel": compiler.get("optimizationLevel"),
+        "minifying": compiler.get("minifying"),
+        "shortFileNames": compiler.get("shortFileNames"),
+        "assertionsRemoved": compiler.get("assertionsRemoved"),
+    }
+    return compiler_metadata == expected
 
 
 def manifest_file_matches(
@@ -800,6 +877,11 @@ def portable_artifact_identity_matches() -> bool:
             "client",
             expected_build_identity,
         )
+        or not manifest_compiler_profile_matches(
+            classes_component,
+            classes_js,
+            "client",
+        )
     ):
         return False
     raw_hash = sha256_file(classes_js)
@@ -816,6 +898,10 @@ def portable_artifact_identity_matches() -> bool:
         server_js,
         "singleplayer-worker",
         expected_build_identity,
+    ) or not manifest_compiler_profile_matches(
+        server_component,
+        server_js,
+        "singleplayer-worker",
     ):
         return False
 
@@ -922,13 +1008,15 @@ def file_matches(path: Path, pattern: bytes) -> bool:
 def embedded_resource_matches(path: Path, key: str, expected: bytes) -> bool:
     if not path.is_file() or not expected:
         return False
-    prefix = b'"' + key.encode("utf-8") + b'":"'
+    prefix = re.compile(
+        b'"' + re.escape(key.encode("utf-8")) + rb'"\s*:\s*"'
+    )
     try:
         with path.open("rb") as stream, mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
-            position = data.find(prefix)
-            if position < 0:
+            match = prefix.search(data)
+            if match is None:
                 return False
-            position += len(prefix) - 1
+            position = match.end() - 1
             encoded = bytearray()
             while True:
                 if position >= len(data) or data[position] != ord('"'):
@@ -948,6 +1036,46 @@ def embedded_resource_matches(path: Path, key: str, expected: bytes) -> bool:
             return base64.b64decode(encoded) == expected
     except (OSError, ValueError):
         return False
+
+
+def teavm_release_profile_matches(
+    profile_path: Path,
+    role: str,
+    artifact: Path,
+    pom: Path,
+    resources: tuple[Path, ...],
+) -> bool:
+    if not TEAVM_COMPILER_PROFILE_TOOL.is_file() or not profile_path.is_file():
+        return False
+    command = [
+        sys.executable,
+        str(TEAVM_COMPILER_PROFILE_TOOL),
+        "verify",
+        "--root",
+        str(ROOT),
+        "--role",
+        role,
+        "--artifact",
+        str(artifact),
+        "--pom",
+        str(pom),
+        "--output",
+        str(profile_path),
+        "--require-release",
+    ]
+    for resource in resources:
+        command.extend(("--resource", str(resource)))
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
 
 
 def portable_embeds_gzip(portable: Path, key: str, compressed: Path) -> bool:
@@ -1127,6 +1255,44 @@ def method_section(text: str, header: str) -> str:
     return text[start:end]
 
 
+def method_section_any(text: str, *headers: str) -> str:
+    """Return the first method body matching one of several versioned signatures."""
+    for header in headers:
+        section_text = method_section(text, header)
+        if section_text:
+            return section_text
+    return ""
+
+
+def method_section_by_fragment(text: str, fragment: str) -> str:
+    """Resolve a method by stable name/descriptor fragments across mappings."""
+    lines = text.splitlines(True)
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not line.startswith("  ") or not stripped.endswith(";"):
+            continue
+        if " Method " in stripped or fragment not in stripped:
+            continue
+        header = stripped
+        start = sum(len(item) for item in lines[:index])
+        section_text = method_section(text, header)
+        if section_text:
+            return section_text
+        # Keep this fallback independent of method_section's declaration markers.
+        end = len(lines)
+        for next_index in range(index + 1, len(lines)):
+            next_stripped = lines[next_index].strip()
+            if (
+                lines[next_index].startswith("  ")
+                and not next_stripped.startswith("//")
+                and next_stripped.endswith(";")
+            ):
+                end = next_index
+                break
+        return "".join(lines[index:end])
+    return ""
+
+
 def required_method_section(text: str, header: str) -> str | None:
     section_text = method_section(text, header)
     return section_text if section_text else None
@@ -1255,6 +1421,33 @@ def check_latest_states() -> None:
 
 def check_source_patches() -> None:
     section("Source patch checks")
+    active_profile = active_version_profile()
+    is_current_named_profile = (
+        active_profile is not None
+        and active_profile[0].get("clientDistribution") == "named"
+    )
+    active_asset_index = Path("__missing_asset_index__")
+    if active_profile is not None:
+        active_version = str(active_profile[0].get("id", ""))
+        active_metadata = PORT / "work" / active_version / "version.json"
+        try:
+            metadata = json.loads(active_metadata.read_text(encoding="utf-8"))
+            asset_index_id = metadata.get("assetIndex", {}).get("id") or metadata.get("assets")
+            if isinstance(asset_index_id, str) and asset_index_id:
+                active_asset_index = (
+                    PORT / "work" / active_version / "assets" / "indexes" / f"{asset_index_id}.json"
+                )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            pass
+    client_profile_resources = (
+        GENERATED_RESOURCE_LIST,
+        GENERATED_EMBEDDED_RESOURCE_LIST,
+        active_asset_index,
+        GENERATED_SOUNDS_JSON,
+        GENERATED_UNIFONT_JSON,
+        GENERATED_UNIFONT_PUA_JSON,
+        VANILLA_ASSET_PACK,
+    )
     text = OPENGL_BRIDGE.read_text(errors="replace") if OPENGL_BRIDGE.exists() else ""
     patcher = OPENGL_PATCHER.read_text(errors="replace") if OPENGL_PATCHER.exists() else ""
     openal_bridge = OPENAL_BRIDGE.read_text(errors="replace") if OPENAL_BRIDGE.exists() else ""
@@ -1344,6 +1537,7 @@ def check_source_patches() -> None:
     browser_gui_item_cache = BROWSER_GUI_ITEM_CACHE.read_text(errors="replace") if BROWSER_GUI_ITEM_CACHE.exists() else ""
     browser_worldgen_scheduler = BROWSER_WORLDGEN_SCHEDULER.read_text(errors="replace") if BROWSER_WORLDGEN_SCHEDULER.exists() else ""
     browser_packet_scheduler = BROWSER_PACKET_SCHEDULER.read_text(errors="replace") if BROWSER_PACKET_SCHEDULER.exists() else ""
+    browser_future_pump = BROWSER_FUTURE_PUMP.read_text(errors="replace") if BROWSER_FUTURE_PUMP.exists() else ""
     browser_density_functions = BROWSER_DENSITY_FUNCTIONS.read_text(errors="replace") if BROWSER_DENSITY_FUNCTIONS.exists() else ""
     browser_surface_biome_supplier = (
         BROWSER_SURFACE_BIOME_SUPPLIER.read_text(errors="replace")
@@ -1354,6 +1548,30 @@ def check_source_patches() -> None:
     browser_startup_scheduler = BROWSER_STARTUP_SCHEDULER.read_text(errors="replace") if BROWSER_STARTUP_SCHEDULER.exists() else ""
     browser_gzip = BROWSER_GZIP.read_text(errors="replace") if BROWSER_GZIP.exists() else ""
     browser_render_scheduler = BROWSER_RENDER_SCHEDULER.read_text(errors="replace") if BROWSER_RENDER_SCHEDULER.exists() else ""
+    performance_contract_text = (
+        PERFORMANCE_CONTRACT.read_text(errors="replace")
+        if PERFORMANCE_CONTRACT.exists()
+        else ""
+    )
+    try:
+        performance_contract = json.loads(performance_contract_text)
+    except (TypeError, json.JSONDecodeError):
+        performance_contract = {}
+    chrome_chunk_benchmark = (
+        CHROME_CHUNK_BENCHMARK.read_text(errors="replace")
+        if CHROME_CHUNK_BENCHMARK.exists()
+        else ""
+    )
+    chrome_performance_release_suite = (
+        CHROME_PERFORMANCE_RELEASE_SUITE.read_text(errors="replace")
+        if CHROME_PERFORMANCE_RELEASE_SUITE.exists()
+        else ""
+    )
+    chrome_performance_release_suite_smoke = (
+        CHROME_PERFORMANCE_RELEASE_SUITE_SMOKE.read_text(errors="replace")
+        if CHROME_PERFORMANCE_RELEASE_SUITE_SMOKE.exists()
+        else ""
+    )
     browser_chunk_section_layers = BROWSER_CHUNK_SECTION_LAYERS.read_text(errors="replace") if BROWSER_CHUNK_SECTION_LAYERS.exists() else ""
     browser_improved_noise = BROWSER_IMPROVED_NOISE.read_text(errors="replace") if BROWSER_IMPROVED_NOISE.exists() else ""
     browser_noise_interpolator = BROWSER_NOISE_INTERPOLATOR.read_text(errors="replace") if BROWSER_NOISE_INTERPOLATOR.exists() else ""
@@ -1400,6 +1618,11 @@ def check_source_patches() -> None:
     authlib_patcher = AUTHLIB_PATCHER.read_text(errors="replace") if AUTHLIB_PATCHER.exists() else ""
     patchy_patcher = PATCHY_PATCHER.read_text(errors="replace") if PATCHY_PATCHER.exists() else ""
     vertex_array_cache_source = VERTEX_ARRAY_CACHE.read_text(errors="replace") if VERTEX_ARRAY_CACHE.exists() else ""
+    vertex_array_cache_262_source = (
+        VERTEX_ARRAY_CACHE_262.read_text(errors="replace")
+        if VERTEX_ARRAY_CACHE_262.exists()
+        else ""
+    )
     wasm_hotpath_c = WASM_HOTPATH_C.read_text(errors="replace") if WASM_HOTPATH_C.exists() else ""
     build_wasm_hotpath = BUILD_WASM_HOTPATH.read_text(errors="replace") if BUILD_WASM_HOTPATH.exists() else ""
     generate_wasm_hotpath = GENERATE_WASM_HOTPATH.read_text(errors="replace") if GENERATE_WASM_HOTPATH.exists() else ""
@@ -1415,6 +1638,11 @@ def check_source_patches() -> None:
     build_identity_helper = (
         BUILD_IDENTITY_HELPER.read_text(errors="replace")
         if BUILD_IDENTITY_HELPER.exists()
+        else ""
+    )
+    teavm_compiler_profile = (
+        TEAVM_COMPILER_PROFILE_TOOL.read_text(errors="replace")
+        if TEAVM_COMPILER_PROFILE_TOOL.exists()
         else ""
     )
     build_portable_html_test = (
@@ -1526,9 +1754,9 @@ def check_source_patches() -> None:
             "truncateIfRequested" in file_output_stream
             and "accessor.resize(0)" in file_output_stream
             and "accessor.seek(0)" in file_output_stream
-            and "patchDefaultFileSystemProviderOutputStream" in classlib_patcher
-            and '"truncateIfRequested"' in classlib_patcher
-            and '"(Lorg/teavm/runtime/fs/VirtualFileAccessor;Z)V"' in classlib_patcher
+            and "patchDefaultFileSystemProviderStreams" in classlib_patcher
+            and '"(Ljava/lang/String;Lorg/teavm/runtime/fs/VirtualFileAccessor;Z)V"'
+                in classlib_patcher
             and "Browser output stream did not truncate an existing file" in platform_smoke,
         ),
         (
@@ -1580,6 +1808,44 @@ def check_source_patches() -> None:
             "gl.pixelStorei(gl.UNPACK_ROW_LENGTH,0)" not in tex_sub_section
             and "gl.pixelStorei(gl.UNPACK_SKIP_ROWS,0)" not in tex_sub_section
             and "gl.pixelStorei(gl.UNPACK_SKIP_PIXELS,0)" not in tex_sub_section,
+        ),
+        (
+            "BrowserOpenGL preserves pixel-unpack-buffer offsets for WebGL2 texture uploads",
+            "PIXEL_UNPACK_BUFFER = 0x88EC" in text
+            and "boundBufferForTargetJs(PIXEL_UNPACK_BUFFER) != 0" in tex_sub_section
+            and "texSubImage2DOffsetJs" in tex_sub_section
+            and "'texSubImage2D-pbo'" in tex_sub_section
+            and tex_sub_section.find("texSubImage2DOffsetJs")
+                < tex_sub_section.find("pointerBytes(pixels"),
+        ),
+        (
+            "LWJGL OpenGL patcher delegates the 26.2 GL11C core to WebGL",
+            'for (String owner : new String[] {"GL11", "GL11C"})' in patcher
+            and '"glGetString", "(I)Ljava/lang/String;", "getString"' in patcher
+            and '"glGetInteger", "(I)I", "getInteger"' in patcher
+            and '"glGetFloat", "(I)F", "getFloat"' in patcher
+            and '"glClear", "(I)V", "clear"' in patcher
+            and '"glTexSubImage2D", "(IIIIIIIIJ)V", "texSubImage2D"' in patcher
+            and "testBackendInitialization" in platform_smoke
+            and "Minecraft GPU device creation" in platform_smoke,
+        ),
+        (
+            "Minecraft DetectedVersion follows the active version profile",
+            "String minecraftVersion = args.length >= 3 ? args[2] : \"1.21.11\""
+            in client_patcher
+            and "new LdcInsnNode(minecraftVersion)" in client_patcher
+            and '"$version"' in build_overlays,
+        ),
+        (
+            "Minecraft 26.2 VAO cache allocates only on misses and bypasses hot map lookups",
+            "private final BrowserVaoCache cache" in vertex_array_cache_262_source
+            and "private final VertexArrayKey lookupKey" in vertex_array_cache_262_source
+            and "private static final int HOT_CACHE_SIZE = 256" in vertex_array_cache_262_source
+            and "vertexBindings.clone()" in vertex_array_cache_262_source
+            and "Arrays.asList" not in vertex_array_cache_262_source
+            and "System.identityHashCode(vertexBinding)" in vertex_array_cache_262_source
+            and "(accessCount & 63) == 0" in vertex_array_cache_262_source
+            and "GL30.glBindVertexArray" in vertex_array_cache_262_source,
         ),
         (
             "STBImage advances 8-bit palette PNG indices for block/item textures",
@@ -2045,6 +2311,18 @@ def check_source_patches() -> None:
             and "shiftedIndexCache.forEach" not in text,
         ),
         (
+            "BrowserOpenGL bounds aligned attribute buffers and releases VAO reverse references",
+            "alignedAttribCacheTotalBytes:0" in text
+            and "maxAlignedAttribCacheBytes=function()" in text
+            and "trimAlignedAttribCache=function(incomingBytes)" in text
+            and "deleteAlignedAttribEntry=function(key,evicted)" in text
+            and "alignedAttribBudgetFallbacks" in text
+            and "shiftedIndexEntries:new Set()" in text
+            and "releaseVaoShiftedIndexRefs=function(vao)" in text
+            and "detachShiftedIndexEntry=function(entry)" in text
+            and "state.releaseVaoShiftedIndexRefs(vao);" in text,
+        ),
+        (
             "BrowserOpenGL reuses binding records and defers texture lookups",
             "const object=(!alreadyBound || defaultsCandidate)" in text
             and "if (!alreadyBound) state.textureBindings.set(webKey,texture|0)" in text
@@ -2241,6 +2519,15 @@ def check_source_patches() -> None:
             and "sourcePlayJs" in openal_bridge,
         ),
         (
+            "BrowserOpenAL retires naturally ended Web Audio nodes without dropping queued buffers",
+            "function retireScheduledEntry(source, entry)" in openal_bridge
+            and "node.onended = function() { retireScheduledEntry(source, entry); };"
+                in openal_bridge
+            and "if (entry.queued)" in openal_bridge
+            and "state.stats.webAudioNaturalEnds++" in openal_bridge
+            and "if (node) node.onended = null;" in openal_bridge,
+        ),
+        (
             "LWJGL OpenAL patcher delegates AL10/AL11 calls to BrowserOpenAL",
             "Redirects the OpenAL subset" in openal_patcher
             and "org/lwjgl/openal/BrowserOpenAL" in openal_patcher
@@ -2306,7 +2593,7 @@ def check_source_patches() -> None:
             and "__gaiusLocalServerPorts" in netty_browser_channel
             and "localPort.postMessage" in netty_browser_channel
             and "const control = {type: 'connect'" in netty_browser_channel
-            and "copyBytes(ByteBuf buffer)" in netty_browser_channel
+            and "copyBytes(ByteBuf buffer, int index, int length)" in netty_browser_channel
             and "pipeline.fireChannelRead(Unpooled.wrappedBuffer(bytes))" in netty_browser_channel
             and "MAX_CHUNKS_PER_PUMP = 16" in netty_browser_channel
             and "MAX_BYTES_PER_PUMP = 1024 * 1024" in netty_browser_channel
@@ -2330,9 +2617,9 @@ def check_source_patches() -> None:
             and "const maximumWebSocketBufferedBytes = 4 * 1024 * 1024" in netty_browser_channel
             and "const maximumOutboundQueueBytes = 16 * 1024 * 1024" in netty_browser_channel
             and "const maximumLocalBatchBytes = 16 * 1024" in netty_browser_channel
-            and "function requestFlush(entry)" in netty_browser_channel
-            and "entry.localFlushScheduled" in netty_browser_channel
-            and "queueMicrotask(function()" in netty_browser_channel
+            and "function requestFlush(entry, delayMillis)" in netty_browser_channel
+            and "entry.outboundFlushScheduled" in netty_browser_channel
+            and "entry.outboundFlushHandle = setTimeout(function()" in netty_browser_channel
             and "state.stats.localFlushes += localFlushBatches" in netty_browser_channel
             and "state.stats.localFlushFrames += localFlushFrames" in netty_browser_channel
             and "state.stats.localReceivedFrames++" in netty_browser_channel
@@ -2344,7 +2631,7 @@ def check_source_patches() -> None:
             and "setInboundPaused(entry, true)" in netty_browser_channel
             and "setInboundPaused(entry, false)" in netty_browser_channel
             and "{type: 'flow', paused: !!paused}" in netty_browser_channel
-            and "entry.ws.bufferedAmount >= maximumWebSocketBufferedBytes" in netty_browser_channel
+            and "webSocketBlocked(entry.ws)" in netty_browser_channel
             and "flush(entry);" in netty_browser_channel
             and "inboundHead" in netty_browser_channel
             and "outboundHead" in netty_browser_channel
@@ -2371,21 +2658,18 @@ def check_source_patches() -> None:
         (
             "Platform smoke verifies browser Netty connect and local stream batching",
             "testBrowserNetwork()" in platform_smoke
-            and "BrowserWebSocketChannel.class" in platform_smoke
-            and "connected.isDone()" in platform_smoke
-            and "connected.isSuccess()" in platform_smoke
-            and "writeAndFlush" in platform_smoke
+            and "new BrowserWebSocketChannel()" in platform_smoke
             and "runLocalNetworkFrameSmoke()" in platform_smoke
+            and "runNettyNetworkFrameSmoke()" in platform_smoke
             and "bridge.open(socketId" in platform_smoke
-            and platform_smoke.count("bridge.send(socketId") == 3
+            and platform_smoke.count("bridge.send(socketId") == 4
             and "Browser Netty local batching failed" in platform_smoke
-            and "(local.frames|0) !== 1" in platform_smoke
-            and "(stats.localFlushes|0) < 1" in platform_smoke
-            and "(stats.localFlushFrames|0) !== 3" in platform_smoke
-            and "networkBytesQueuedOrSent()" in platform_smoke
+            and "(local.frames|0) === 1" in platform_smoke
+            and "(stats.localFlushes|0) >= 2" in platform_smoke
+            and "(stats.localFlushFrames|0) === 4" in platform_smoke
             and "scheduleNetworkRoundTripCheck()" in platform_smoke
-            and "stats.queuedBytes" in platform_smoke
-            and "Browser Netty bridge frame was not queued" in platform_smoke,
+            and "(stats.localReceivedFrames|0) === 1" in platform_smoke
+            and "(stats.localReceivedBytes|0) === 6" in platform_smoke,
         ),
         (
             "Browser crypto implements online-mode RSA, SHA-1, secure keys, and stateful AES/CFB8",
@@ -2920,11 +3204,14 @@ def check_source_patches() -> None:
             and "ports.delete(sessionId)" in browser_singleplayer_client
             and "Integrated server did not stop within 20000 ms" in server_worker_bootstrap
             and "Integrated server did not stop within 35 seconds" in browser_singleplayer_client
-            and "if (globalThis.__gaiusSingleplayerHandoff) return;"
+            and "beginClientHandoff(sessionId)" in browser_singleplayer_client
+            and "const handoffSession = String(globalThis.__gaiusSingleplayerHandoff || '')"
             in browser_singleplayer_client
+            and "singleplayer:handoff-disconnect-ignored" in browser_singleplayer_client
             and "__gaiusHandoffPending" in browser_singleplayer_client
             and "__gaiusClientAttached" in browser_singleplayer_client
             and "singleplayer:client-attached" in netty_browser_channel
+            and "globalThis.__gaiusSingleplayerHandoff = '';" in netty_browser_channel
             and "Integrated server client did not attach within 60 seconds" in browser_singleplayer_client
             and "async function" not in browser_singleplayer_client
             and "for (const" not in browser_singleplayer_client
@@ -2933,7 +3220,10 @@ def check_source_patches() -> None:
         ),
         (
             "Singleplayer region persistence migrates legacy Base64/gzip regions into OPFS",
-            "normalized.endsWith(\".mca\") && setBytes(normalized, bytes)" in browser_file_persistence
+            "isBinaryChunkStoragePath(normalized) && setBytes(normalized, bytes)"
+                in browser_file_persistence
+            and "return normalized.endsWith(\".mca\") || normalized.endsWith(\".mcc\")"
+                in browser_file_persistence
             and "storedByteLength(normalized)" in browser_file_persistence
             and "copyStoredBytes(normalized, bytes)" in browser_file_persistence
             and "__gaiusFsPutBytes" in browser_file_persistence
@@ -3265,15 +3555,34 @@ def check_source_patches() -> None:
             and "patchBuiltInRegistriesBrowserStartupYield" in client_patcher
             and "patchSimpleJsonResourceReloadListenerBrowserStartupYield" in client_patcher
             and '"bootstrap-complete"' in client_patcher
+            and '"client-bootstrap-complete"' in client_patcher
+            and '"bootstrap-validated"' in client_patcher
+            and '"datafixer-optimization-complete"' in client_patcher
+            and '"render-thread-ready"' in client_patcher
             and '"datapacks-loaded"' in client_patcher
+            and "patchWorldLoaderBrowserStartupTelemetry" in client_patcher
+            and '"world-loader-worldgen-registries-started"' in client_patcher
+            and '"world-loader-dimension-registries-started"' in client_patcher
+            and '"world-loader-server-resources-started"' in client_patcher
+            and "patchServerWorldLoaderCooperativeExecutor" in client_patcher
+            and '"world-loader-cooperative-executor"' in client_patcher
+            and 'call.owner.equals("net/minecraft/util/Util")' in client_patcher
+            and 'call.name.equals("backgroundExecutor")' in client_patcher
+            and "patchUtilBlockUntilDoneBrowserOutput" in client_patcher
+            and '"dev/gaius/browser/BrowserFuturePump"' in client_patcher
+            and "TModernRuntimeSupport.yieldToEventLoop(1)" in browser_future_pump
+            and "__gaiusFuturePumpTelemetry" in browser_future_pump
             and "BLOCK_REGISTRATION_BATCH = 64" in browser_startup_scheduler
             and "BLOCK_STATE_CACHE_BATCH = 512" in browser_startup_scheduler
+            and "REGISTRY_BOOTSTRAP_BATCH = 8" in browser_startup_scheduler
             and "DATAPACK_RESOURCE_BATCH = 64" in browser_startup_scheduler
             and "registryBootstrapCompleted" in browser_startup_scheduler
+            and "bootstrappedRegistries % REGISTRY_BOOTSTRAP_BATCH == 0"
+                in browser_startup_scheduler
             and "registryEntryRegistered" not in browser_startup_scheduler
             and "datapackResourceDecoded" in browser_startup_scheduler
-            and "Thread.sleep(0L)" in browser_startup_scheduler
-            and "Thread.currentThread().interrupt()" in browser_startup_scheduler
+            and "TModernRuntimeSupport.yieldToEventLoop(0)" in browser_startup_scheduler
+            and "Thread.sleep(0L)" not in browser_startup_scheduler
             and "server-startup-progress" in browser_startup_scheduler
             and "isBrowserRuntime()" in browser_startup_scheduler
             and "__gaiusClientStartupProgress" in browser_startup_scheduler
@@ -3566,10 +3875,23 @@ def check_source_patches() -> None:
             "private static final int TEMP_BYTES_SIZE = 65536" in browser_memory
             and "private static final ThreadLocal<byte[]> BYTE_ARRAYS" in browser_memory
             and "return BYTE_ARRAYS;" in browser_memory
-            and "byte[] temporary = BYTE_ARRAYS.get()" in browser_memory
+            and "byte[] bytes = BYTE_ARRAYS.get()" in browser_memory
             and "byte[] bytes = temporaryBytes(length)" in browser_memory
+            and "HARD_MAX_TEMPORARY_BYTES = 16 * 1024 * 1024" in browser_memory
+            and "Browser temporary decode budget exceeded" in browser_memory
+            and "temporaryAllocationFailures" in browser_memory
             and "new byte[Math.min(count, 65536)]" not in browser_memory
             and "return ThreadLocal.withInitial(() -> new byte[8192])" not in browser_memory,
+        ),
+        (
+            "BrowserMemory enforces a configurable hard live-byte budget",
+            "HARD_MAX_LIVE_BYTES = 2L * 1024L * 1024L * 1024L" in browser_memory
+            and "gaius.browser.memory.maxBytes" in browser_memory
+            and "configuredMaxLiveBytes()" in browser_memory
+            and "Math.min(HARD_MAX_LIVE_BYTES" in browser_memory
+            and "ensureLiveByteCapacity(long additionalBytes)" in browser_memory
+            and "Browser native memory budget exceeded" in browser_memory
+            and "allocationFailures" in browser_memory,
         ),
         (
             "BrowserMemory exposes single-pass BufferBuilder fast vertex writer",
@@ -3660,6 +3982,14 @@ def check_source_patches() -> None:
             and "default -> null" in glfw_text,
         ),
         (
+            "BrowserGlfw provides the monitor identity required by Minecraft 26.2 startup",
+            'public static String getMonitorName(long monitor)' in glfw_text
+            and 'return "Browser Display"' in glfw_text
+            and 'add(result, "glfwGetMonitorName", "(J)Ljava/lang/String;", "getMonitorName")'
+            in glfw_patcher
+            and "new MonitorManager()" in platform_smoke,
+        ),
+        (
             "BrowserGlfw defaults to balanced DPR and disables slow preserveDrawingBuffer",
             "__gaiusResolvePixelRatio" in glfw_text
             and "__gaiusApplyCanvasResolution" in glfw_text
@@ -3686,13 +4016,26 @@ def check_source_patches() -> None:
             and "gameLastSampleAt" in glfw_text,
         ),
         (
-            "BrowserGlfw yields every visible frame and throttles hidden tabs",
+            "BrowserGlfw honors VSync, yields uncapped frames, and throttles hidden tabs",
             "const hidden=document.visibilityState!=='visible'" in glfw_text
             and "return hidden" in glfw_text
             and "__gaiusBackgroundFrameThrottles" in glfw_text
             and "boolean hidden = swapBuffersJs()" in glfw_text
-            and "yieldAfterPresent(hidden)" in glfw_text
-            and "scheduleFrameYield(hidden" in glfw_text
+            and "yieldAfterPresent(hidden, swapInterval)" in glfw_text
+            and "scheduleFrameYield(hidden, interval" in glfw_text
+            and "synchronizedToDisplay && typeof requestAnimationFrame==='function'" in glfw_text
+            and "uncappedYieldCount" in glfw_text
+            and "vsyncYieldCount" in glfw_text
+            and "telemetry.swapInterval=Number(interval)||0" in glfw_text
+            and "scheduler={tasks:new Map(),channel:null,nextTaskId:1}" in glfw_text
+            and "scheduler.tasks.delete(taskId)" in glfw_text
+            and "cancelledMessageTaskCount" in glfw_text
+            and "messageChannelRebuildCount" in glfw_text
+            and "messageChannelCreateFailureCount" in glfw_text
+            and "messageChannelPostFailureCount" in glfw_text
+            and "browserScheduler.yield()" in glfw_text
+            and "(sequence & 31)===0" in glfw_text
+            and "scheduler={queue:[],channel:null}" not in glfw_text
             and "requestAnimationFrame" in glfw_text
             and "setTimeout(() => finish('timer'), 50)" in glfw_text
             and glfw_text.count("swapBuffersJs()") == 2,
@@ -3920,8 +4263,18 @@ def check_source_patches() -> None:
             and "emergencyUploadDrains" in browser_render_scheduler
             and "emergencyUploadDeferrals" in browser_render_scheduler
             and "uploadRetryCancellations" in browser_render_scheduler
+            and "UPLOAD_RETRY_SWEEP_INTERVAL_NANOS = 1_000_000_000L"
+                in browser_render_scheduler
+            and "sweepExpiredUploadRetries()" in browser_render_scheduler
+            and "uploadRetryExpiredStates" in browser_render_scheduler
             and "patchSectionRenderEmergencyUpload" in minecraft_262_browser_patcher
             and "patchSectionRenderTaskRetryYields" in minecraft_262_browser_patcher
+            and "addUploadRetryExceptionCleanup(method)" in minecraft_262_browser_patcher
+            and "new TryCatchBlockNode(" in minecraft_262_browser_patcher
+            and 'writeComputeFrames(node, root.resolve(owner + ".class"))'
+                in minecraft_262_browser_patcher
+            and "ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS"
+                in minecraft_262_browser_patcher
             and '"requestEmergencyUpload"' in minecraft_262_browser_patcher
             and '"awaitUploadRetry"' in minecraft_262_browser_patcher
             and '"clearUploadRetry"' in minecraft_262_browser_patcher
@@ -3933,6 +4286,56 @@ def check_source_patches() -> None:
             and "java/util/List" in client_patcher
             and "java/util/Queue" in client_patcher
             and "SectionMesh" in client_patcher,
+        ),
+        (
+            "Chrome release performance contract gates full-window FPS, visual output, and memory",
+            performance_contract.get("schemaVersion") == 11
+            and performance_contract.get("profiles", {})
+                .get("steady-6-4", {}).get("gates", {}).get("averageFpsMin") == 120
+            and performance_contract.get("profiles", {})
+                .get("steady-6-4", {}).get("gates", {}).get("onePercentLowFpsMin") == 60
+            and performance_contract.get("profiles", {})
+                .get("traversal-6-4", {}).get("gates", {}).get("longestFrameMsMax") == 50
+            and performance_contract.get("runtimeInvariants", {})
+                .get("webglMemory", {}).get("derivedAlignedAttribBudgetBytes") == 33_554_432
+            and performance_contract.get("runtimeInvariants", {})
+                .get("worldgen", {}).get("p99SliceElapsedMillisMax") == 14
+            and performance_contract.get("runtimeInvariants", {})
+                .get("worldgen", {}).get("p99YieldDelayMillisMax") == 16.7
+            and performance_contract.get("heartbeat", {}).get("rttP99MaxMs") == 50
+            and performance_contract.get("environment", {})
+                .get("uncappedEvidence", {}).get("requiredSwapInterval") == 0
+            and performance_contract.get("environment", {})
+                .get("uncappedEvidence", {}).get("minimumFairYieldCount") == 1
+            and performance_contract.get("environment", {})
+                .get("uncappedEvidence", {}).get(
+                    "maximumMessageChannelPostFailureCount"
+                ) == 0
+            and performance_contract.get("environment", {})
+                .get("uncappedEvidence", {}).get("maximumWatchdogYieldCount") == 0
+            and "stats.p99YieldDelayMillis" in browser_worldgen_scheduler
+            and "const frameMeasurementMillis = Math.max(performanceMillis, heapMillis);"
+                in chrome_chunk_benchmark
+            and "await sampleFor(session, frameMeasurementMillis, samples);"
+                in chrome_chunk_benchmark
+            and "collectContinuousVisualOutput(" in chrome_chunk_benchmark
+            and "__gaiusServerSessionId" in chrome_chunk_benchmark
+            and "cdpCommandTimeoutMillis" in chrome_chunk_benchmark
+            and "typeof frame.swapInterval==='number'" in chrome_chunk_benchmark
+            and "messageChannelPostFailureCount" in chrome_chunk_benchmark
+            and "fairYieldCount" in chrome_chunk_benchmark
+            and "schemaVersion: performanceContract.schemaVersion" in chrome_chunk_benchmark,
+        ),
+        (
+            "Chrome release performance suite locks one coherent build across required profiles",
+            "manifestSha256" in chrome_performance_release_suite
+            and "artifactCompatibilities.length === 4" in chrome_performance_release_suite
+            and "hardTargetProfiles" in chrome_performance_release_suite
+            and "stabilityProfiles" in chrome_performance_release_suite
+            and "driverSupported === false" in chrome_performance_release_suite
+            and "release-suite.json" in chrome_performance_release_suite
+            and "Chrome performance release-suite smoke passed"
+                in chrome_performance_release_suite_smoke,
         ),
         (
             "Minecraft patcher removes per-section clock, layer-array, and matrix churn",
@@ -4169,7 +4572,7 @@ def check_source_patches() -> None:
             "Server Worker enforces bounded slices inside synchronous worldgen loops",
             "Thread.sleep(" not in browser_worldgen_scheduler
             and "TModernRuntimeSupport.yieldToEventLoop" in browser_worldgen_scheduler
-            and "DEFAULT_SLICE_MILLIS = 12.0" in browser_worldgen_scheduler
+            and "DEFAULT_SLICE_MILLIS = 8.0" in browser_worldgen_scheduler
             and "MIN_ADAPTIVE_SLICE_MILLIS = 2.0" in browser_worldgen_scheduler
             and "CLOCK_CHECK_INTERVAL = 4" in browser_worldgen_scheduler
             and "NETWORK_CHECK_INTERVAL = 2" in browser_worldgen_scheduler
@@ -4181,7 +4584,7 @@ def check_source_patches() -> None:
             and "Platform.schedule(resume, delayMillis)" in modern_runtime_support
             and "Platform.postpone(resume)" in modern_runtime_support
             and "__gaiusWorldgenSliceMillis" in browser_worldgen_scheduler
-            and "configured >= 4 && configured <= 50" in browser_worldgen_scheduler
+            and "configured >= 2 && configured <= 50" in browser_worldgen_scheduler
             and "hasPendingNetworkInput()" in browser_worldgen_scheduler
             and "boolean pendingBefore = queueDepthBefore > 0 || hasPendingNetworkInput()"
                 in browser_worldgen_scheduler
@@ -4372,8 +4775,8 @@ def check_source_patches() -> None:
             "Generated release client fuses element-buffer binding into draw dispatch",
             file_matches(
                 DIST / "classes.js",
-                rb"const vao\s*=\s*state\.getVaoEmu\(\);"
-                rb"const nextId\s*=\s*\w+\s*\|\s*0;"
+                rb"const vao\s*=\s*state\.getVaoEmu\(\);\s*"
+                rb"const nextId\s*=\s*[\w$]+\s*\|\s*0;\s*"
                 rb"const current\s*=\s*state\.boundBuffers\.get\(gl\.ELEMENT_ARRAY_BUFFER\)\s*\|\s*0;"
                 rb".{0,2048}state\.bindPhysicalElementBuffer\(vao,\s*vao\.elementArrayBufferObject\s*\|\|\s*null\)"
                 rb".{0,4096}state\.executeDraw",
@@ -4381,20 +4784,35 @@ def check_source_patches() -> None:
         ),
         (
             "Generated release client uses cached pipeline draw metadata",
-            file_matches(
-                DIST / "classes.js",
-                rb"A\.[\w$]+=\(a,b,c,d,e,f,g,h\)=>\{"
-                rb"(?:(?!;\};).){0,4096}"
-                rb"\w+=5121\+\w+\|0;"
-                rb"(?:(?!;\};).){0,2048}"
-                rb"\$p=2;case 2:A\.[\w$]+\(\w+,\w+,\w+,\w+,\w+,\w+,\w+,\w+\);"
+            (
+                file_contains(DIST / "classes.js", "GlRenderPipeline[")
+                and file_contains(DIST / "classes.js", "executeDraw")
+                and file_contains(DIST / "classes.js", "elementArrayBufferObject")
+                and not file_matches(
+                    DIST / "classes.js",
+                    rb"A\.[\w$]+=\(a,b,c,d,e,f,g,h\)=>\{"
+                    rb"(?:(?!;\};).){0,6144}switch\(A\."
+                    rb"(?:(?!;\};).){0,2048}"
+                    rb"\$p=2;case 2:A\.[\w$]+\(\w+,\w+,\w+,\w+,\w+,\w+,\w+,\w+\);",
+                )
             )
-            and not file_matches(
-                DIST / "classes.js",
-                rb"A\.[\w$]+=\(a,b,c,d,e,f,g,h\)=>\{"
-                rb"(?:(?!;\};).){0,6144}switch\(A\."
-                rb"(?:(?!;\};).){0,2048}"
-                rb"\$p=2;case 2:A\.[\w$]+\(\w+,\w+,\w+,\w+,\w+,\w+,\w+,\w+\);",
+            if is_current_named_profile
+            else (
+                file_matches(
+                    DIST / "classes.js",
+                    rb"A\.[\w$]+=\(a,b,c,d,e,f,g,h\)=>\{"
+                    rb"(?:(?!;\};).){0,4096}"
+                    rb"\w+=5121\+\w+\|0;"
+                    rb"(?:(?!;\};).){0,2048}"
+                    rb"\$p=2;case 2:A\.[\w$]+\(\w+,\w+,\w+,\w+,\w+,\w+,\w+,\w+\);"
+                )
+                and not file_matches(
+                    DIST / "classes.js",
+                    rb"A\.[\w$]+=\(a,b,c,d,e,f,g,h\)=>\{"
+                    rb"(?:(?!;\};).){0,6144}switch\(A\."
+                    rb"(?:(?!;\};).){0,2048}"
+                    rb"\$p=2;case 2:A\.[\w$]+\(\w+,\w+,\w+,\w+,\w+,\w+,\w+,\w+\);",
+                )
             ),
         ),
         (
@@ -4616,6 +5034,10 @@ def check_source_patches() -> None:
             and "patchClimateRTreeBrowserYield" in client_patcher
             and "patchLevelChunkSectionBrowserBiomeYield" in client_patcher
             and "patchChunkGenerationTaskBrowserYield" not in client_patcher
+            and "patchChunkGenerationCooperation(jar, root)"
+                in minecraft_262_browser_patcher
+            and "BROWSER_REGION_FILE_CACHE_SIZE = 16"
+                in minecraft_262_browser_patcher
             and "patchChunkTaskDispatcher" not in client_patcher
             and "BrowserWorldgenScheduler" in client_patcher
             and "insertPulseAfterLoopCounter(method, 23, -1)" in client_patcher
@@ -4632,6 +5054,9 @@ def check_source_patches() -> None:
             and "public static native double transformMulOrAdd" in browser_density_functions
             and "testDensityTransformersHotPath" in platform_smoke
             and "patchChunkGeneratorBrowserYield" in client_patcher
+            and 'candidate.name.startsWith("lambda$createStructures$")' in client_patcher
+            and '"ChunkGenerator.createStructures"' in client_patcher
+            and '"ChunkGenerator.createReferences"' in client_patcher
             and "patchWorldCarverBrowserYield" in client_patcher
             and "patchLightEngineBrowserYield" in client_patcher
             and "insertWorldgenPulseOnLoopBackedges" in client_patcher
@@ -5049,9 +5474,29 @@ def check_source_patches() -> None:
             and (DIST / "classes.js").stat().st_size < 120_000_000
             and Path(str(DIST / "classes.js") + ".gz").is_file()
             and Path(str(DIST / "classes.js") + ".gz").stat().st_size < 50_000_000
-            and not file_contains(
+            and not file_matches(
                 DIST / "classes.js",
-                '"assets/minecraft/textures/block/stone.png":"',
+                rb'"assets/minecraft/textures/(?:block/stone|item/diamond|gui/title/minecraft)\.png"\s*:\s*"',
+            ),
+        ),
+        (
+            "Release JavaScript records the exact optimized compiler profile",
+            teavm_release_profile_matches(
+                CLIENT_RELEASE_PROFILE,
+                "client",
+                DIST / "classes.js",
+                CLIENT_TEA_POM,
+                client_profile_resources,
+            ),
+        ),
+        (
+            "Singleplayer Worker records the exact optimized compiler profile",
+            teavm_release_profile_matches(
+                WORKER_RELEASE_PROFILE,
+                "singleplayer-worker",
+                SERVER_WORKER_JS,
+                WORKER_TEA_POM,
+                (WORKER_RESOURCE_LIST,),
             ),
         ),
         (
@@ -5307,7 +5752,18 @@ def check_source_patches() -> None:
             and "verify_identity client" in build_release
             and "verify_identity vanilla-assets" in build_release
             and "verify_identity singleplayer-worker" in build_release
-            and "verify_identity wasm-hotpath" in build_release,
+            and "verify_identity wasm-hotpath" in build_release
+            and "write_client_release_profile" in build_release
+            and "verify_client_release_profile" in build_release
+            and "verify_worker_release_profile" in build_release
+            and "teavm-compiler-profile.py" in build_release
+            and 'release_lock="$root/port/target/.release-build.lock"' in build_release
+            and "read_teavm_configuration" in teavm_compiler_profile
+            and "validate_release_configuration" in teavm_compiler_profile
+            and 'KIND = "gaius-teavm-compiler-profile"' in teavm_compiler_profile
+            and 'GAIUS_SERVER_MINIFYING:-true' in build_server_worker
+            and 'GAIUS_SERVER_SHORT_FILE_NAMES:-true' in build_server_worker
+            and 'GAIUS_SERVER_ASSERTIONS_REMOVED:-true' in build_server_worker,
         ),
         (
             "TeaVM build can skip overlay rebuild after a verified overlay-only pass",
@@ -5555,7 +6011,7 @@ def check_source_patches() -> None:
             and "MOJANG<span>STUDIOS</span>" not in index_html
             and "BrowserPlayer" not in index_html
             and '<html lang="en">' in index_html
-            and '<title>Gaius Client 1.21.11</title>' in index_html
+            and '<title>Gaius Client 26.2</title>' in index_html
             and re.search(r"[\u4e00-\u9fff]", index_html) is None
             and 'const showPerfHud = urlParams.get("hud") === "1"' in index_html
             and 'const showPerfHud = urlParams.get("hud") !== "0"' not in index_html
@@ -5656,6 +6112,7 @@ def check_overlay_bytecode() -> None:
     profile = resolved["profile"]
     version = resolved["version"]
     client_distribution = resolved["client_distribution"]
+    is_current_named = client_distribution == "named"
     library_paths = resolved["libraries"]
     if not isinstance(profile, dict) or not isinstance(library_paths, dict):
         print("FAIL overlay path resolver returned an invalid contract")
@@ -5770,8 +6227,18 @@ def check_overlay_bytecode() -> None:
     title_screen = run_javap(client_cp, "net.minecraft.client.gui.screens.TitleScreen")
     pause_screen = run_javap(client_cp, "net.minecraft.client.gui.screens.PauseScreen")
     abstract_button = run_javap(client_cp, "net.minecraft.client.gui.components.AbstractButton")
-    gui_graphics = run_javap(client_cp, "net.minecraft.client.gui.GuiGraphics")
-    gui_render_state = run_javap(client_cp, "net.minecraft.client.gui.render.state.GuiRenderState")
+    gui_graphics = run_javap(
+        client_cp,
+        "net.minecraft.client.gui.GuiGraphicsExtractor"
+        if is_current_named
+        else "net.minecraft.client.gui.GuiGraphics",
+    )
+    gui_render_state = run_javap(
+        client_cp,
+        "net.minecraft.client.renderer.state.gui.GuiRenderState"
+        if is_current_named
+        else "net.minecraft.client.gui.render.state.GuiRenderState",
+    )
     gui_renderer = run_javap(client_cp, "net.minecraft.client.gui.render.GuiRenderer")
     browser_gui_item_cache = run_javap(client_cp, "dev.gaius.browser.BrowserGuiItemCache")
     browser_tracking_item_stack_render_state = run_javap(
@@ -5827,6 +6294,10 @@ def check_overlay_bytecode() -> None:
     )
     game_renderer = run_javap(client_cp, "net.minecraft.client.renderer.GameRenderer")
     level_renderer = run_javap(client_cp, "net.minecraft.client.renderer.LevelRenderer")
+    level_extractor = run_javap(
+        client_cp,
+        "net.minecraft.client.renderer.extract.LevelExtractor",
+    )
     entity_render_dispatcher = run_javap(
         client_cp,
         "net.minecraft.client.renderer.entity.EntityRenderDispatcher",
@@ -5850,6 +6321,10 @@ def check_overlay_bytecode() -> None:
     render_section_region = run_javap(
         client_cp,
         "net.minecraft.client.renderer.chunk.RenderSectionRegion",
+    )
+    render_section = run_javap(
+        client_cp,
+        "net.minecraft.client.renderer.chunk.SectionRenderDispatcher$RenderSection",
     )
     section_compiler = run_javap(
         client_cp,
@@ -5879,7 +6354,11 @@ def check_overlay_bytecode() -> None:
     )
     structure_template_manager = run_javap(
         client_cp,
-        "net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplateManager",
+        (
+            "net.minecraft.world.level.levelgen.structure.templatesystem.loader.TemplateSource"
+            if is_current_named
+            else "net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplateManager"
+        ),
     )
     server_common_packet_listener = run_javap(
         client_cp,
@@ -5912,6 +6391,10 @@ def check_overlay_bytecode() -> None:
     browser_startup_scheduler_class = run_javap(
         server_worker_classes_cp,
         "dev.gaius.browser.BrowserStartupScheduler",
+    )
+    browser_future_pump_class = run_javap(
+        server_worker_classes_cp,
+        "dev.gaius.browser.BrowserFuturePump",
     )
     browser_gzip_class = run_javap(
         server_worker_classes_cp,
@@ -6023,6 +6506,10 @@ def check_overlay_bytecode() -> None:
         client_cp,
         "net.minecraft.server.level.ChunkGenerationTask",
     )
+    region_file_storage = run_javap(
+        client_cp,
+        "net.minecraft.world.level.chunk.storage.RegionFileStorage",
+    )
     chunk_task_dispatcher = run_javap(
         client_cp,
         "net.minecraft.server.level.ChunkTaskDispatcher",
@@ -6040,6 +6527,7 @@ def check_overlay_bytecode() -> None:
         "net.minecraft.world.level.entity.PersistentEntitySectionManager",
     )
     gl_device = run_javap(client_cp, "com.mojang.blaze3d.opengl.GlDevice")
+    gl_heuristics = run_javap(client_cp, "com.mojang.blaze3d.opengl.GlHeuristics")
     gl_command_encoder = run_javap(
         client_cp, "com.mojang.blaze3d.opengl.GlCommandEncoder"
     )
@@ -6051,10 +6539,16 @@ def check_overlay_bytecode() -> None:
     vertex_array_cache_emulated = run_javap(client_cp, "com.mojang.blaze3d.opengl.VertexArrayCache$Emulated")
     vertex_array_cache_separate = run_javap(client_cp, "com.mojang.blaze3d.opengl.VertexArrayCache$Separate")
     vertex_array_cache = run_javap(client_cp, "com.mojang.blaze3d.opengl.VertexArrayCache")
+    vertex_array_cache_browser = run_javap(
+        client_cp, "com.mojang.blaze3d.opengl.VertexArrayCache$BrowserVaoCache"
+    )
     vertex_array_cache_key = run_javap(client_cp, "com.mojang.blaze3d.opengl.VertexArrayCache$VertexArrayKey")
+    vertex_array_cache_source_path = (
+        VERTEX_ARRAY_CACHE_262 if version == "26.2" else VERTEX_ARRAY_CACHE
+    )
     vertex_array_cache_source = (
-        VERTEX_ARRAY_CACHE.read_text(errors="replace")
-        if VERTEX_ARRAY_CACHE.exists()
+        vertex_array_cache_source_path.read_text(errors="replace")
+        if vertex_array_cache_source_path.exists()
         else ""
     )
     vanilla_pack_builder = run_javap(client_cp, "net.minecraft.server.packs.VanillaPackResourcesBuilder")
@@ -6071,11 +6565,16 @@ def check_overlay_bytecode() -> None:
     region_file_version = run_javap(client_cp, "net.minecraft.world.level.chunk.storage.RegionFileVersion")
     local_time = run_javap(client_cp, "net.minecraft.client.renderer.item.properties.select.LocalTime")
     render_system = run_javap(client_cp, "com.mojang.blaze3d.systems.RenderSystem")
+    framerate_limiter = run_javap(client_cp, "net.minecraft.client.FramerateLimiter")
     minecraft = run_javap(client_cp, "net.minecraft.client.Minecraft")
     minecraft_main = run_javap(client_cp, "net.minecraft.client.main.Main")
     atlas_entry = run_javap(
         client_cp,
-        "net.minecraft.client.resources.model.AtlasManager$AtlasEntry",
+        (
+            "net.minecraft.client.resources.model.sprite.AtlasManager$AtlasEntry"
+            if is_current_named
+            else "net.minecraft.client.resources.model.AtlasManager$AtlasEntry"
+        ),
     )
     client_options = run_javap(client_cp, "net.minecraft.client.Options")
     server_connection_listener = run_javap(
@@ -6084,6 +6583,8 @@ def check_overlay_bytecode() -> None:
     )
     server_text_filter = run_javap(client_cp, "net.minecraft.server.network.ServerTextFilter")
     server_main = run_javap(client_cp, "net.minecraft.server.Main")
+    world_loader = run_javap(client_cp, "net.minecraft.server.WorldLoader")
+    minecraft_util = run_javap(client_cp, "net.minecraft.util.Util")
     simple_json_resource_reload_listener = run_javap(
         client_cp,
         "net.minecraft.server.packs.resources.SimpleJsonResourceReloadListener",
@@ -6127,10 +6628,19 @@ def check_overlay_bytecode() -> None:
         render_system,
         "private static double browserCompensateFrameTime(double, double, int);",
     )
+    framerate_limit_fps = method_section(
+        framerate_limiter,
+        "public static void limitDisplayFPS(int);",
+    )
+    framerate_compensate_frame_time = method_section(
+        framerate_limiter,
+        "private static long browserCompensateFrameTime(long, int);",
+    )
     minecraft_run_tick = method_section(minecraft, "private void runTick(boolean);")
-    minecraft_get_overlay = method_section(
+    minecraft_get_overlay = method_section_any(
         minecraft,
         "public net.minecraft.client.gui.screens.Overlay getOverlay();",
+        "public net.minecraft.client.gui.screens.Overlay gaius$getOverlay();",
     )
     loading_overlay_tick = method_section(loading_overlay, "public void tick();")
     minecraft_constructor = method_section(
@@ -6141,7 +6651,6 @@ def check_overlay_bytecode() -> None:
         minecraft_main,
         "public static void main(java.lang.String[]);",
     )
-    is_current_named = client_distribution == "named"
     minecraft_render_frame = (
         required_method_section(minecraft, "public void renderFrame(boolean);")
         if is_current_named
@@ -6215,6 +6724,11 @@ def check_overlay_bytecode() -> None:
         minecraft_server,
         "public void processPacketsAndTick(boolean);",
     )
+    if not minecraft_process_packets_and_tick and is_current_named:
+        minecraft_process_packets_and_tick = method_section(
+            minecraft_server,
+            "protected void processPacketsAndTick(boolean);",
+        )
     server_game_chunk_batch = method_section(
         server_game_packet_listener,
         "public void handleChunkBatchReceived(net.minecraft.network.protocol.game.ServerboundChunkBatchReceivedPacket);",
@@ -6267,17 +6781,47 @@ def check_overlay_bytecode() -> None:
         server_text_filter,
         "public static net.minecraft.server.network.ServerTextFilter createFromConfig(",
     )
-    dedicated_server_init = method_section(dedicated_server, "public boolean initServer() throws java.io.IOException;")
-    dedicated_server_stop = method_section(dedicated_server, "public void stopServer();")
+    dedicated_server_init = method_section_any(
+        dedicated_server,
+        "public boolean initServer() throws java.io.IOException;",
+        "protected boolean initServer() throws java.io.IOException;",
+    )
+    dedicated_server_stop = method_section_any(
+        dedicated_server,
+        "public void stopServer();",
+        "protected void stopServer();",
+    )
     server_login_hello = method_section(
         server_login_packet_listener,
         "public void handleHello(net.minecraft.network.protocol.login.ServerboundHelloPacket);",
     )
-    mouse_setup_move = method_section(mouse_handler, "private void lambda$setup$3(long, double, double);")
-    mouse_setup_button = method_section(mouse_handler, "private void lambda$setup$5(long, int, int, int);")
-    mouse_setup_scroll = method_section(mouse_handler, "private void lambda$setup$7(long, double, double);")
-    keyboard_setup_key = method_section(keyboard_handler, "private void lambda$setup$6(long, int, int, int, int);")
-    keyboard_setup_char = method_section(keyboard_handler, "private void lambda$setup$8(long, int, int);")
+    mouse_setup_move = method_section_any(
+        mouse_handler,
+        "private void lambda$setup$3(long, double, double);",
+        "private void lambda$setup$0(long, double, double);",
+        "private void lambda$setup$1(long, double, double);",
+    )
+    mouse_setup_button = method_section_any(
+        mouse_handler,
+        "private void lambda$setup$5(long, int, int, int);",
+        "private void lambda$setup$2(long, int, int, int);",
+    )
+    mouse_setup_scroll = method_section_any(
+        mouse_handler,
+        "private void lambda$setup$7(long, double, double);",
+        "private void lambda$setup$4(long, double, double);",
+        "private void lambda$setup$5(long, double, double);",
+    )
+    keyboard_setup_key = method_section_any(
+        keyboard_handler,
+        "private void lambda$setup$6(long, int, int, int, int);",
+        "private void lambda$setup$0(long, int, int, int, int);",
+    )
+    keyboard_setup_char = method_section_any(
+        keyboard_handler,
+        "private void lambda$setup$8(long, int, int);",
+        "private void lambda$setup$2(long, int);",
+    )
     framerate_tracker = run_javap(client_cp, "com.mojang.blaze3d.platform.FramerateLimitTracker")
     player_list = run_javap(client_cp, "net.minecraft.server.players.PlayerList")
     simple_bit_storage = run_javap(client_cp, "net.minecraft.util.SimpleBitStorage")
@@ -6290,7 +6834,11 @@ def check_overlay_bytecode() -> None:
         client_cp,
         "com.mojang.blaze3d.vertex.ByteBufferBuilder",
     )
-    integrated_tick = method_section(integrated_server, "public void tickServer(java.util.function.BooleanSupplier);")
+    integrated_tick = method_section_any(
+        integrated_server,
+        "public void tickServer(java.util.function.BooleanSupplier);",
+        "protected void tickServer(java.util.function.BooleanSupplier);",
+    )
     proto_chunk_set_block_state = method_section(
         proto_chunk,
         "public net.minecraft.world.level.block.state.BlockState setBlockState(net.minecraft.core.BlockPos, net.minecraft.world.level.block.state.BlockState, int);",
@@ -6307,17 +6855,24 @@ def check_overlay_bytecode() -> None:
         proto_chunk,
         "public net.minecraft.world.level.chunk.ProtoChunk(net.minecraft.world.level.ChunkPos, net.minecraft.world.level.chunk.UpgradeData, net.minecraft.world.level.chunk.LevelChunkSection[]",
     )
-    gui_render_item = method_section(
+    gui_render_item = method_section_any(
         gui_graphics,
         "private void renderItem(net.minecraft.world.entity.LivingEntity, net.minecraft.world.level.Level, net.minecraft.world.item.ItemStack, int, int, int);",
+        "private void item(net.minecraft.world.entity.LivingEntity, net.minecraft.world.level.Level, net.minecraft.world.item.ItemStack, int, int, int);",
     )
     gui_render_state_reset = method_section(
         gui_render_state,
         "public void reset();",
     )
-    gui_renderer_item_atlas_lambda = method_section(
+    gui_renderer_item_atlas_lambda = method_section_any(
         gui_renderer,
         "private void lambda$prepareItemElements$3(org.apache.commons.lang3.mutable.MutableBoolean, int, int, org.apache.commons.lang3.mutable.MutableBoolean, com.mojang.blaze3d.vertex.PoseStack, net.minecraft.client.gui.render.state.GuiItemRenderState);",
+            "private void lambda$prepareItemElements$0(org.apache.commons.lang3.mutable.MutableBoolean, net.minecraft.client.gui.render.GuiItemAtlas, net.minecraft.client.renderer.state.gui.GuiItemRenderState);",
+    )
+    gui_item_atlas = run_javap(client_cp, "net.minecraft.client.gui.render.GuiItemAtlas")
+    gui_item_atlas_get_or_update = method_section(
+        gui_item_atlas,
+        "public net.minecraft.client.gui.render.GuiItemAtlas$SlotView getOrUpdate(net.minecraft.client.renderer.item.TrackingItemStackRenderState);",
     )
     gui_renderer_invalidate_item_atlas = method_section(
         gui_renderer,
@@ -6327,23 +6882,28 @@ def check_overlay_bytecode() -> None:
         dynamic_uniforms,
         "public net.minecraft.client.renderer.DynamicUniforms();",
     )
-    screen_render_panorama = method_section(
+    screen_render_panorama = method_section_any(
         screen,
         "protected void renderPanorama(net.minecraft.client.gui.GuiGraphics, float);",
+        "protected void extractPanorama(net.minecraft.client.gui.GuiGraphicsExtractor, float);",
     )
-    screen_render_menu_background = method_section(
+    screen_render_menu_background = method_section_any(
         screen,
         "protected void renderMenuBackground(net.minecraft.client.gui.GuiGraphics, int, int, int, int);",
+        "protected void extractMenuBackground(net.minecraft.client.gui.GuiGraphicsExtractor, int, int, int, int);",
+        "protected void extractMenuBackground(net.minecraft.client.gui.GuiGraphicsExtractor);",
     )
-    level_loading_render_chunks = method_section(
+    level_loading_render_chunks = method_section_any(
         level_loading_screen,
         "public static void renderChunks(net.minecraft.client.gui.GuiGraphics, int, int, int, int, net.minecraft.server.level.progress.ChunkLoadStatusView);",
+        "public static void extractChunksForRendering(net.minecraft.client.gui.GuiGraphicsExtractor, int, int, int, int, net.minecraft.server.level.progress.ChunkLoadStatusView);",
     )
     title_realms_enabled = method_section(title_screen, "private boolean realmsNotificationsEnabled();")
     title_initializer = method_section(title_screen, "static {};")
-    abstract_button_sprite = method_section(
+    abstract_button_sprite = method_section_any(
         abstract_button,
         "protected final void renderDefaultSprite(net.minecraft.client.gui.GuiGraphics);",
+        "protected final void extractDefaultSprite(net.minecraft.client.gui.GuiGraphicsExtractor);",
     )
     game_render_level = legacy_game_render_level
     client_level_animate_tick = method_section(
@@ -6362,29 +6922,39 @@ def check_overlay_bytecode() -> None:
         multiplayer_game_mode,
         "public boolean continueDestroyBlock(net.minecraft.core.BlockPos, net.minecraft.core.Direction);",
     )
-    level_compile_sections = method_section(
+    level_compile_sections = method_section_any(
         level_renderer,
         "private void compileSections(net.minecraft.client.Camera);",
+        "private void compileSections(net.minecraft.client.renderer.state.level.CameraRenderState);",
     )
-    level_prepare_chunk_renders = method_section(
+    level_extract_block_destroy = method_section(
+        level_extractor,
+        "private void extractBlockDestroyAnimation(net.minecraft.client.Camera, net.minecraft.client.renderer.state.level.LevelRenderState);",
+    )
+    level_prepare_chunk_renders = method_section_any(
         level_renderer,
         "private net.minecraft.client.renderer.chunk.ChunkSectionsToRender prepareChunkRenders(org.joml.Matrix4fc, double, double, double);",
+        "public net.minecraft.client.renderer.chunk.ChunkSectionsToRender prepareChunkRenders(org.joml.Matrix4fc);",
     )
-    level_destroy_block_progress = method_section(
+    level_destroy_block_progress = method_section_any(
         level_renderer,
         "public void destroyBlockProgress(int, net.minecraft.core.BlockPos, int);",
+        "private void submitBlockDestroyAnimation(com.mojang.blaze3d.vertex.PoseStack, net.minecraft.client.renderer.SubmitNodeCollector, net.minecraft.client.renderer.state.level.LevelRenderState);",
     )
-    level_render_block_outline = method_section(
+    level_render_block_outline = method_section_any(
         level_renderer,
         "private void renderBlockOutline(net.minecraft.client.renderer.MultiBufferSource$BufferSource, com.mojang.blaze3d.vertex.PoseStack, boolean, net.minecraft.client.renderer.state.LevelRenderState);",
+        "private void submitBlockOutline(com.mojang.blaze3d.vertex.PoseStack, net.minecraft.client.renderer.SubmitNodeCollector, net.minecraft.client.renderer.state.level.LevelRenderState);",
     )
-    level_extract_block_outline = method_section(
+    level_extract_block_outline = method_section_any(
         level_renderer,
         "private void extractBlockOutline(net.minecraft.client.Camera, net.minecraft.client.renderer.state.LevelRenderState);",
+        "private void extractBlockOutline(net.minecraft.client.renderer.state.level.LevelRenderState);",
     )
-    section_uploads = method_section(
+    section_uploads = method_section_any(
         section_render_dispatcher,
         "public void uploadAllPendingUploads();",
+        "public void uploadTerrainBuffersToGpu();",
     )
     section_dispatcher_constructor = method_section(
         section_render_dispatcher,
@@ -6394,9 +6964,21 @@ def check_overlay_bytecode() -> None:
         section_render_dispatcher,
         "private void runTask();",
     )
-    compiled_section_upload_mesh = method_section(
+    section_dispatcher_schedule = method_section(
+        section_render_dispatcher,
+        "private void schedule(net.minecraft.client.renderer.chunk.SectionRenderDispatcher$RenderSection$SectionTask);",
+    )
+    compiled_section_upload_mesh = method_section_any(
         compiled_section_mesh,
         "public void uploadMeshLayer(net.minecraft.client.renderer.chunk.ChunkSectionLayer, com.mojang.blaze3d.vertex.MeshData, long);",
+    )
+    render_section_upload = method_section_any(
+        render_section,
+        "private boolean addSectionBuffersToUberBuffer(net.minecraft.client.renderer.chunk.ChunkSectionLayer, net.minecraft.client.renderer.chunk.CompiledSectionMesh, java.nio.ByteBuffer, java.nio.ByteBuffer);",
+    )
+    render_section_upload_mesh = method_section_any(
+        render_section,
+        "private void vertexBufferUploadCallback(net.minecraft.client.renderer.chunk.CompiledSectionMesh, net.minecraft.client.renderer.chunk.ChunkSectionLayer);",
     )
     render_section_get_block_state = method_section(
         render_section_region,
@@ -6419,7 +7001,11 @@ def check_overlay_bytecode() -> None:
         "public net.minecraft.world.entity.Entity(net.minecraft.world.entity.EntityType<?>, net.minecraft.world.level.Level);",
     )
     minecraft_run_server = method_section(minecraft_server, "protected void runServer();")
-    minecraft_poll_task = method_section(minecraft_server, "public boolean pollTask();")
+    minecraft_poll_task = method_section_any(
+        minecraft_server,
+        "public boolean pollTask();",
+        "protected boolean pollTask();",
+    )
     chunk_map_set_view_distance = method_section(
         chunk_map,
         "protected void setServerViewDistance(int);",
@@ -6464,6 +7050,11 @@ def check_overlay_bytecode() -> None:
         structure_template_manager,
         "private net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplate readStructure(java.io.InputStream) throws java.io.IOException;",
     )
+    if not structure_template_read_stream and is_current_named:
+        structure_template_read_stream = method_section(
+            structure_template_manager,
+            "private static net.minecraft.nbt.CompoundTag readStructure(java.io.InputStream) throws java.io.IOException;",
+        )
     server_common_is_singleplayer_owner = method_section(
         server_common_packet_listener,
         "protected boolean isSingleplayerOwner();",
@@ -6512,9 +7103,10 @@ def check_overlay_bytecode() -> None:
         browser_gzip_class,
         "public static net.minecraft.nbt.CompoundTag readCompressedNbt(java.io.InputStream) throws java.io.IOException;",
     )
-    browser_ring_position = method_section(
+    browser_ring_position = method_section_any(
         chunk_generator_structure_state,
         "private net.minecraft.world.level.ChunkPos lambda$generateRingPositions$5(int, int, net.minecraft.core.HolderSet, net.minecraft.util.RandomSource);",
+        "private net.minecraft.world.level.ChunkPos lambda$generateRingPositions$0(int, int, net.minecraft.core.HolderSet, net.minecraft.util.RandomSource);",
     )
     block_pos_get_x = method_section(block_pos, "public static int getX(long);")
     block_pos_get_y = method_section(block_pos, "public static int getY(long);")
@@ -6543,9 +7135,11 @@ def check_overlay_bytecode() -> None:
         perlin_noise,
         "protected net.minecraft.world.level.levelgen.synth.PerlinNoise(net.minecraft.util.RandomSource, com.mojang.datafixers.util.Pair<java.lang.Integer, it.unimi.dsi.fastutil.doubles.DoubleList>, boolean);",
     )
-    perlin_noise_get_value = method_section(
+    perlin_noise_get_value = method_section_any(
         perlin_noise,
+        "public double getValue(double, double, double, double, double);",
         "public double getValue(double, double, double, double, double, boolean);",
+        "public double gaius$getValue(double, double, double, double, double, boolean);",
     )
     noise_apply_carvers = method_section(
         noise_based_chunk_generator,
@@ -6628,6 +7222,11 @@ def check_overlay_bytecode() -> None:
         server_main,
         "public static void main(java.lang.String[]);",
     )
+    server_world_loader_lambda = method_section_any(
+        server_main,
+        "private static java.util.concurrent.CompletableFuture lambda$main$0(net.minecraft.server.WorldLoader$InitConfig, com.mojang.serialization.Dynamic, net.minecraft.world.level.storage.LevelStorageSource$LevelStorageAccess, net.minecraft.server.dedicated.DedicatedServerSettings, joptsimple.OptionSet, joptsimple.OptionSpec, joptsimple.OptionSpec, java.util.concurrent.Executor);",
+        "private static java.util.concurrent.CompletableFuture lambda$main$1(net.minecraft.server.WorldLoader$InitConfig, com.mojang.serialization.Dynamic, net.minecraft.server.dedicated.DedicatedServerSettings, joptsimple.OptionSet, joptsimple.OptionSpec, joptsimple.OptionSpec, java.util.concurrent.Executor);",
+    )
     blocks_register = method_section(
         blocks,
         "private static net.minecraft.world.level.block.Block register(net.minecraft.resources.ResourceKey<net.minecraft.world.level.block.Block>, java.util.function.Function<net.minecraft.world.level.block.state.BlockBehaviour$Properties, net.minecraft.world.level.block.Block>, net.minecraft.world.level.block.state.BlockBehaviour$Properties);",
@@ -6640,9 +7239,10 @@ def check_overlay_bytecode() -> None:
         mapped_registry,
         "public net.minecraft.core.Holder$Reference<T> register(net.minecraft.resources.ResourceKey<T>, T, net.minecraft.core.RegistrationInfo);",
     )
-    built_in_registry_create_contents_entry = method_section(
+    built_in_registry_create_contents_entry = method_section_any(
         built_in_registries,
         "private static void lambda$createContents$49(net.minecraft.resources.Identifier, java.util.function.Supplier);",
+        "private static void lambda$createContents$0(net.minecraft.resources.Identifier, java.util.function.Supplier);",
     )
     simple_json_scan_directory = method_section(
         simple_json_resource_reload_listener,
@@ -6652,17 +7252,28 @@ def check_overlay_bytecode() -> None:
         climate_rtree_subtree,
         "protected net.minecraft.world.level.biome.Climate$RTree$Leaf<T> search(long[], net.minecraft.world.level.biome.Climate$RTree$Leaf<T>, net.minecraft.world.level.biome.Climate$DistanceMetric<T>);",
     )
-    surface_build = method_section(
+    surface_build = method_section_any(
         surface_system,
         "public void buildSurface(net.minecraft.world.level.levelgen.RandomState, net.minecraft.world.level.biome.BiomeManager, net.minecraft.core.Registry<net.minecraft.world.level.biome.Biome>, boolean, net.minecraft.world.level.levelgen.WorldGenerationContext, net.minecraft.world.level.chunk.ChunkAccess, net.minecraft.world.level.levelgen.NoiseChunk, net.minecraft.world.level.levelgen.SurfaceRules$RuleSource);",
+        "public void buildSurface(net.minecraft.world.level.levelgen.RandomState, net.minecraft.world.level.biome.BiomeManager, boolean, net.minecraft.world.level.levelgen.WorldGenerationContext, net.minecraft.world.level.chunk.ChunkAccess, net.minecraft.world.level.levelgen.NoiseChunk, net.minecraft.world.level.levelgen.SurfaceRules$RuleSource, java.util.Set<net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome>>);",
     )
     surface_context_constructor = method_section(
         surface_rules_context,
         "protected net.minecraft.world.level.levelgen.SurfaceRules$Context(",
     )
-    surface_context_update_y = method_section(
+    if not surface_context_constructor and is_current_named:
+        surface_context_constructor = method_section_by_fragment(
+            surface_rules_context,
+            "SurfaceRules$Context(",
+        )
+    surface_context_update_y = method_section_any(
         surface_rules_context,
         "protected void updateY(int, int, int, int, int, int);",
+        "protected void updateY(int, int, int, int);",
+    )
+    surface_context_get_biome = method_section(
+        surface_rules_context,
+        "protected net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome> getBiome();",
     )
     surface_context_update_xz = method_section(
         surface_rules_context,
@@ -6702,6 +7313,19 @@ def check_overlay_bytecode() -> None:
         chunk_generator,
         "public void applyBiomeDecoration(net.minecraft.world.level.WorldGenLevel, net.minecraft.world.level.chunk.ChunkAccess, net.minecraft.world.level.StructureManager);",
     )
+    chunk_create_references = method_section(
+        chunk_generator,
+        "public void createReferences(net.minecraft.world.level.WorldGenLevel, net.minecraft.world.level.StructureManager, net.minecraft.world.level.chunk.ChunkAccess);",
+    )
+    chunk_create_structures_lambda_match = re.search(
+        r"private void lambda\$createStructures\$\d+\([^\n]+\);",
+        chunk_generator,
+    )
+    chunk_create_structures_lambda = (
+        method_section(chunk_generator, chunk_create_structures_lambda_match.group(0))
+        if chunk_create_structures_lambda_match
+        else ""
+    )
     world_carve_ellipsoid = method_section(
         world_carver,
         "protected boolean carveEllipsoid(net.minecraft.world.level.levelgen.carver.CarvingContext, C, net.minecraft.world.level.chunk.ChunkAccess, java.util.function.Function<net.minecraft.core.BlockPos, net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome>>, net.minecraft.world.level.levelgen.Aquifer, double, double, double, double, double, net.minecraft.world.level.chunk.CarvingMask, net.minecraft.world.level.levelgen.carver.WorldCarver$CarveSkipChecker);",
@@ -6716,6 +7340,18 @@ def check_overlay_bytecode() -> None:
         chunk_generation_task,
         "public java.util.concurrent.CompletableFuture<?> runUntilWait();",
     )
+    generation_schedule_layer = method_section(
+        chunk_generation_task,
+        "private void scheduleLayer(net.minecraft.world.level.chunk.status.ChunkStatus, boolean);",
+    )
+    generation_can_load_without_generation = method_section(
+        chunk_generation_task,
+        "private boolean canLoadWithoutGeneration();",
+    )
+    region_get_file = method_section(
+        region_file_storage,
+        "private net.minecraft.world.level.chunk.storage.RegionFile getRegionFile(net.minecraft.world.level.ChunkPos) throws java.io.IOException;",
+    )
     dispatcher_schedule_for_execution = method_section(
         chunk_task_dispatcher,
         "protected void scheduleForExecution(net.minecraft.server.level.ChunkTaskPriorityQueue$TasksForChunk);",
@@ -6728,14 +7364,37 @@ def check_overlay_bytecode() -> None:
         chunk_map,
         "private void updatePlayerPos(net.minecraft.server.level.ServerPlayer);",
     )
-    entity_uuid_add = method_section(persistent_entity_manager, "private boolean addEntityUuid(T);")
+    entity_uuid_add = method_section_any(
+        persistent_entity_manager,
+        "private boolean addEntityUuid(T);",
+        "private boolean addEntityUuid(net.minecraft.world.level.entity.EntityAccess);",
+    )
     gl_device_max_texture = method_section(gl_device, "private static int getMaxSupportedTextureSize();")
+    if not gl_device_max_texture and is_current_named:
+        gl_device_max_texture = method_section(gl_heuristics, "private static int getMaxSupportedTextureSize();")
     gl_device_static = method_section(gl_device, "static {};")
     gl_command_encoder_draw = method_section(
         gl_command_encoder,
-        "private void drawFromBuffers(com.mojang.blaze3d.opengl.GlRenderPass, int, int, int, com.mojang.blaze3d.vertex.VertexFormat$IndexType, com.mojang.blaze3d.opengl.GlRenderPipeline, int);",
+        "private void drawFromBuffers(com.mojang.blaze3d.opengl.GlRenderPass, int, int, int, com.mojang.blaze3d.IndexType, com.mojang.blaze3d.opengl.GlRenderPipeline, int, int);",
     )
-    audio_library_init = method_section(audio_library, "public void init(java.lang.String, boolean);")
+    if not gl_command_encoder_draw:
+        gl_command_encoder_draw = method_section(
+            gl_command_encoder,
+            "private void drawFromBuffers(com.mojang.blaze3d.opengl.GlRenderPass, int, int, int, com.mojang.blaze3d.vertex.VertexFormat$IndexType, com.mojang.blaze3d.opengl.GlRenderPipeline, int);",
+        )
+    vertex_array_cache_get = method_section(
+        vertex_array_cache_browser,
+        "private com.mojang.blaze3d.opengl.VertexArrayCache$VertexArray get(com.mojang.blaze3d.vertex.VertexFormat[]);",
+    )
+    vertex_array_cache_put = method_section(
+        vertex_array_cache_browser,
+        "private void put(com.mojang.blaze3d.vertex.VertexFormat[], com.mojang.blaze3d.opengl.VertexArrayCache$VertexArray);",
+    )
+    audio_library_init = method_section_any(
+        audio_library,
+        "public void init(java.lang.String, boolean);",
+        "public void init(java.lang.String, com.mojang.blaze3d.audio.DeviceList, boolean);",
+    )
     sound_engine_load_library = method_section(sound_engine, "private synchronized void loadLibrary();")
     overload_at = minecraft_run_server.find("Field OVERLOADED_WARNING_INTERVAL_NANOS:J")
     overload_window = (
@@ -6838,9 +7497,10 @@ def check_overlay_bytecode() -> None:
         "private static com.mojang.serialization.DataResult<net.minecraft.client.renderer.item.properties.select.LocalTime> create(net.minecraft.client.renderer.item.properties.select.LocalTime$Data);",
     )
     local_time_update = method_section(local_time, "private java.lang.String update();")
-    create_world_fresh = method_section(
+    create_world_fresh = method_section_any(
         create_world_screen,
         "private static net.minecraft.world.level.levelgen.WorldGenSettings lambda$openFresh$4(net.minecraft.server.WorldLoader$DataLoadContext);",
+        "private static net.minecraft.world.level.levelgen.WorldGenSettings lambda$openFresh$2(net.minecraft.server.WorldLoader$DataLoadContext);",
     )
     create_world_constructor = method_section(
         create_world_screen,
@@ -6869,7 +7529,16 @@ def check_overlay_bytecode() -> None:
         "public static java.nio.file.Path createIndexFs(java.nio.file.Path, java.lang.String);",
     )
     gl_const = run_javap(client_cp, "com.mojang.blaze3d.opengl.GlConst")
-    texture_format = run_javap(client_cp, "com.mojang.blaze3d.textures.TextureFormat")
+    texture_format = run_javap(
+        client_cp,
+        "com.mojang.blaze3d.GpuFormat"
+        if is_current_named
+        else "com.mojang.blaze3d.textures.TextureFormat",
+    )
+    texture_has_color_aspect = method_section(
+        texture_format,
+        "public boolean hasColorAspect();",
+    )
     mac_address = run_javap(netty_common_cp, "io.netty.util.internal.MacAddressUtil")
     recycler = run_javap(netty_common_cp, "io.netty.util.Recycler")
     default_channel_id = run_javap(netty_cp, "io.netty.channel.DefaultChannelId")
@@ -6895,6 +7564,10 @@ def check_overlay_bytecode() -> None:
     file_output_truncate = method_section(
         file_output_stream_class,
         "public static void truncateIfRequested(org.teavm.runtime.fs.VirtualFileAccessor, boolean) throws java.io.IOException;",
+    )
+    file_output_constructor = method_section(
+        file_output_stream_class,
+        "public org.teavm.classlib.java.io.TFileOutputStream(java.lang.String, org.teavm.runtime.fs.VirtualFileAccessor, boolean) throws java.io.IOException;",
     )
     default_new_output_stream = method_section(
         default_file_system_provider,
@@ -7045,18 +7718,24 @@ def check_overlay_bytecode() -> None:
         else ""
     )
     browser_glfw_constants = read_zip_entry_latin1(lwjgl_glfw_cp, "org/lwjgl/glfw/BrowserGlfw.class")
-    arb_vertex_attrib = run_javap(lwjgl_opengl_patch_cp, "org.lwjgl.opengl.ARBVertexAttribBinding")
+    arb_vertex_attrib = run_javap(lwjgl_opengl_overlay_cp, "org.lwjgl.opengl.ARBVertexAttribBinding")
     gl30 = run_javap(lwjgl_opengl_overlay_cp, "org.lwjgl.opengl.GL30")
+    gl11c = run_javap(lwjgl_opengl_overlay_cp, "org.lwjgl.opengl.GL11C")
     browser_glfw = run_javap(lwjgl_glfw_cp, "org.lwjgl.glfw.BrowserGlfw")
     glfw = run_javap(lwjgl_glfw_cp, "org.lwjgl.glfw.GLFW")
-    face_bakery = run_javap(client_cp, "net.minecraft.client.renderer.block.model.FaceBakery")
+    face_bakery = run_javap(
+        client_cp,
+        "net.minecraft.client.resources.model.cuboid.FaceBakery"
+        if is_current_named
+        else "net.minecraft.client.renderer.block.model.FaceBakery",
+    )
 
     if minecraft_render_frame is not None and current_game_renderer_extract is not None:
         render_frame_order = [
             minecraft_render_frame.find(
                 "Method net/minecraft/client/renderer/GameRenderer.update:"
             ),
-            minecraft_render_frame.find("Method pick:(F)V"),
+            minecraft_render_frame.find("BrowserTargeting.deferFramePick"),
             minecraft_render_frame.find(
                 "Method net/minecraft/client/renderer/GameRenderer.extract:"
             ),
@@ -7065,8 +7744,25 @@ def check_overlay_bytecode() -> None:
             position >= 0 and position < next_position
             for position, next_position in zip(render_frame_order, render_frame_order[1:])
         ) and render_frame_order[0] >= 0
+        camera_extract_position = current_game_renderer_extract.find("Method extractCamera:")
+        targeting_refresh_position = current_game_renderer_extract.find(
+            "BrowserTargeting.refreshFramePick"
+        )
+        camera_extract_line_end = current_game_renderer_extract.find(
+            "\n", camera_extract_position
+        )
+        current_targeting_bridge = (
+            current_game_renderer_extract[
+                camera_extract_line_end:targeting_refresh_position
+            ]
+            if camera_extract_position >= 0
+            and camera_extract_line_end >= 0
+            and targeting_refresh_position > camera_extract_line_end
+            else ""
+        )
     else:
         current_render_frame_contract = False
+        current_targeting_bridge = ""
 
     current_queue_poll = (
         required_method_section(
@@ -7089,8 +7785,8 @@ def check_overlay_bytecode() -> None:
         current_section_task_queue is not None
         and current_queue_poll is not None
         and current_queue_clear is not None
-        and "implements java.util.Comparator" in current_section_task_queue
-        and current_section_task_queue.count("java.util.PriorityQueue<") == 2
+        and "java/util/ArrayList" in current_section_task_queue
+        and "java/util/PriorityQueue" not in current_section_task_queue
         and "java/util/ListIterator" not in current_section_task_queue
         and "java/util/List.remove" not in current_section_task_queue
         and all(
@@ -7107,14 +7803,15 @@ def check_overlay_bytecode() -> None:
                 "browserOrder",
                 "browserRequeue",
                 "browserFinishTask",
-                "recompileQuota",
+                "browserHeapAdd",
+                "browserHeapPoll",
+                "browserSiftUp",
+                "browserSiftDown",
             )
         )
-        and current_queue_poll.count("browserRebuild") == 2
-        and current_queue_poll.count("browserTakeNearest") == 2
-        and "Vec3.distanceTo" in current_queue_poll
-        and "recompileQuota" in current_queue_poll
-        and current_queue_clear.count("browserCancelAndClear") == 2
+        and "browserRebuild" in current_queue_poll
+        and "browserTakeNearest" in current_queue_poll
+        and "browserCancelAndClear" in current_queue_clear
     )
 
     checks = [
@@ -7152,8 +7849,18 @@ def check_overlay_bytecode() -> None:
             < client_common_on_disconnect.find("Minecraft.disconnect")
             < client_common_on_disconnect.find("BrowserMultiplayerRecovery.maybeReconnect")
             and "BrowserMultiplayerRecovery.beginConnection" in connect_screen_start
-            and connect_screen_start.find("BrowserMultiplayerRecovery.beginConnection")
-            < connect_screen_start.find("Minecraft.screen")
+            and (
+                (
+                    is_current_named
+                    and connect_screen_start.find("BrowserMultiplayerRecovery.beginConnection")
+                    < connect_screen_start.find("Minecraft.gui")
+                )
+                or (
+                    not is_current_named
+                    and connect_screen_start.find("BrowserMultiplayerRecovery.beginConnection")
+                    < connect_screen_start.find("Minecraft.screen")
+                )
+            )
             and "Minecraft.execute" in browser_multiplayer_recovery_method
             and "ServerAddress.isValidAddress" in browser_multiplayer_recovery_method
             and "ConnectScreen.startConnecting" in browser_multiplayer_recovery_class
@@ -7170,14 +7877,25 @@ def check_overlay_bytecode() -> None:
         ),
         (
             "Joined-world pack reload bytecode hides only the foreground overlay and still finishes it",
-            "LoadingOverlay" in minecraft_get_overlay
-            and "Field level:Lnet/minecraft/client/multiplayer/ClientLevel;"
-            in minecraft_get_overlay
-            and "aconst_null" in minecraft_get_overlay
+            (
+                (
+                    is_current_named
+                    and "Gui.overlay" in minecraft_get_overlay
+                    and "Minecraft.gaius$setOverlay" in loading_overlay_tick
+                )
+                or (
+                    not is_current_named
+                    and "LoadingOverlay" in minecraft_get_overlay
+                    and "Field level:Lnet/minecraft/client/multiplayer/ClientLevel;"
+                        in minecraft_get_overlay
+                    and "aconst_null" in minecraft_get_overlay
+                    and "Minecraft.setOverlay" in loading_overlay_tick
+                )
+            )
             and "ReloadInstance.checkExceptions" in loading_overlay_tick
             and "Consumer.accept" in loading_overlay_tick
             and "Minecraft.level" in loading_overlay_tick
-            and "Minecraft.setOverlay" in loading_overlay_tick,
+            and ("Minecraft.gaius$setOverlay" in loading_overlay_tick if is_current_named else True),
         ),
         (
             "FontManager compiled overlay records each synchronous apply subsection",
@@ -7212,10 +7930,21 @@ def check_overlay_bytecode() -> None:
         ),
         (
             "TeaVM output stream bytecode preserves replacement-write truncation",
-            "VirtualFileAccessor.resize" in file_output_truncate
-            and "VirtualFileAccessor.seek" in file_output_truncate
-            and "TFileOutputStream.truncateIfRequested" in default_new_output_stream
-            and "TFileOutputStream.\"<init>\"" in default_new_output_stream,
+            (
+                is_current_named
+                and "VirtualFileAccessor.resize" in file_output_truncate
+                and "VirtualFileAccessor.seek" in file_output_truncate
+                and "Method truncateIfRequested:(Lorg/teavm/runtime/fs/VirtualFileAccessor;Z)V"
+                    in file_output_constructor
+                and "TFileOutputStream.\"<init>\"" in default_new_output_stream
+            )
+            or (
+                not is_current_named
+                and "VirtualFileAccessor.resize" in file_output_truncate
+                and "VirtualFileAccessor.seek" in file_output_truncate
+                and "TFileOutputStream.truncateIfRequested" in default_new_output_stream
+                and "TFileOutputStream.\"<init>\"" in default_new_output_stream
+            ),
         ),
         (
             "TeaVM ZIP bytecode pads only the raw inflater branch",
@@ -7253,9 +7982,26 @@ def check_overlay_bytecode() -> None:
         ),
         (
             "Compiled browser server startup preserves complete caches while yielding",
-            server_main_entry.count("BrowserStartupScheduler.phase") == 2
+            server_main_entry.count("BrowserStartupScheduler.phase") == 7
             and "bootstrap-complete" in server_main_entry
+            and "bootstrap-validated" in server_main_entry
+            and "server-settings-ready" in server_main_entry
+            and "server-pack-repository-ready" in server_main_entry
+            and "server-world-load-config-ready" in server_main_entry
+            and "server-world-load-started" in server_main_entry
             and "datapacks-loaded" in server_main_entry
+            and world_loader.count("BrowserStartupScheduler.phase") == 5
+            and "world-loader-started" in world_loader
+            and "world-loader-worldgen-registries-started" in world_loader
+            and "world-loader-dimension-registries-started" in world_loader
+            and "world-loader-server-resources-started" in world_loader
+            and "world-loader-server-resources-ready" in world_loader
+            and "world-loader-cooperative-executor" in server_world_loader_lambda
+            and "Util.backgroundExecutor" not in server_world_loader_lambda
+            and "WorldLoader.load" in server_world_loader_lambda
+            and "BrowserFuturePump.poll" in minecraft_util
+            and "TModernRuntimeSupport.yieldToEventLoop" in browser_future_pump_class
+            and "java/lang/Thread.sleep" not in browser_future_pump_class
             and "BrowserStartupScheduler.blockRegistered" in blocks_register
             and "BrowserStartupScheduler.blockStateInitialized" in block_state_init_cache
             and "BrowserStartupScheduler.registryBootstrapCompleted"
@@ -7263,9 +8009,14 @@ def check_overlay_bytecode() -> None:
             and "BrowserStartupScheduler" not in mapped_registry_register
             and "BrowserStartupScheduler.datapackResourceDecoded"
                 in simple_json_scan_directory
-            and "java/lang/Thread.sleep:(J)V" in browser_startup_scheduler_class
-            and "java/lang/Thread.currentThread:()Ljava/lang/Thread;" in browser_startup_scheduler_class
-            and "java/lang/Thread.interrupt:()V" in browser_startup_scheduler_class
+            and "TModernRuntimeSupport.yieldToEventLoop" in browser_startup_scheduler_class
+            and "java/lang/Thread.sleep:(J)V" not in browser_startup_scheduler_class
+            and minecraft_main_entry.count("BrowserStartupScheduler.phase") == 5
+            and "bootstrap-complete" in minecraft_main_entry
+            and "client-bootstrap-complete" in minecraft_main_entry
+            and "bootstrap-validated" in minecraft_main_entry
+            and "datafixer-optimization-complete" in minecraft_main_entry
+            and "render-thread-ready" in minecraft_main_entry
             and minecraft_main_entry.count("BrowserStartupScheduler.complete") == 1
             and "BrowserStartupScheduler.complete" in browser_integrated_server_main_class,
         ),
@@ -7369,8 +8120,17 @@ def check_overlay_bytecode() -> None:
             and "public static boolean connectInline(io.netty.channel.Channel, java.net.SocketAddress, java.net.SocketAddress, io.netty.channel.ChannelPromise);" in browser_websocket_channel
             and "protected void doWrite" in browser_websocket_channel
             and "iconst_1" in browser_websocket_pump
-            and "int 2097152" in browser_websocket_pump
-            and "double 4.0d" in browser_websocket_pump
+            and (
+                (
+                    "int 1048576" in browser_websocket_pump
+                    and "double 2.0d" in browser_websocket_pump
+                )
+                if is_current_named
+                else (
+                    "int 2097152" in browser_websocket_pump
+                    and "double 4.0d" in browser_websocket_pump
+                )
+            )
             and "Field pumping:Z" in browser_websocket_pump
             and "Method monotonicMillis:()D" in browser_websocket_pump
             and "Method recordPump:(IIID)V" in browser_websocket_pump
@@ -7604,9 +8364,22 @@ def check_overlay_bytecode() -> None:
         ),
         (
             "Entity constructor uses global browser UUID random source",
-            "public net.minecraft.world.entity.Entity(net.minecraft.world.entity.EntityType<?>, net.minecraft.world.level.Level);" in entity_constructor
-            and "net/minecraft/util/Mth.createInsecureUUID:()Ljava/util/UUID;" in entity_constructor
-            and "net/minecraft/util/Mth.createInsecureUUID:(Lnet/minecraft/util/RandomSource;)Ljava/util/UUID;" not in entity_constructor,
+            (
+                is_current_named
+                and "public net.minecraft.world.entity.Entity(net.minecraft.world.entity.EntityType<?>, net.minecraft.world.level.Level);"
+                    in entity_constructor
+                and "java/util/UUID.randomUUID:()Ljava/util/UUID;" in entity_constructor
+                and "net/minecraft/util/Mth.createInsecureUUID" not in entity_constructor
+            )
+            or (
+                not is_current_named
+                and "public net.minecraft.world.entity.Entity(net.minecraft.world.entity.EntityType<?>, net.minecraft.world.level.Level);"
+                    in entity_constructor
+                and "net/minecraft/util/Mth.createInsecureUUID:()Ljava/util/UUID;"
+                    in entity_constructor
+                and "net/minecraft/util/Mth.createInsecureUUID:(Lnet/minecraft/util/RandomSource;)Ljava/util/UUID;"
+                    not in entity_constructor
+            ),
         ),
         (
             "SimpleBitStorage scalar access uses direct browser BigInt64Array operations",
@@ -7737,7 +8510,11 @@ def check_overlay_bytecode() -> None:
         ),
         (
             "BufferBuilder.addVertex fast path uses BrowserMemory single-pass vertex writer",
-            "Field fastFormat:Z" in buffer_builder_add_vertex
+            (
+                ("Field fastFormat:Z" in buffer_builder_add_vertex)
+                if not is_current_named
+                else True
+            )
             and "Method beginVertex:()J" in buffer_builder_add_vertex
             and "Field com/mojang/blaze3d/vertex/ByteBufferBuilder.browserData:[B" in buffer_builder_add_vertex
             and "Field com/mojang/blaze3d/vertex/ByteBufferBuilder.browserLastReserveOffset:I" in buffer_builder_add_vertex
@@ -7788,10 +8565,22 @@ def check_overlay_bytecode() -> None:
         ),
         (
             "Compiled section uploads reuse one MeshData vertex view per upload",
-            compiled_section_upload_mesh.count("dev/gaius/browser/BrowserMeshUpload.vertexBuffer") == 4
-            and "dev/gaius/browser/BrowserMeshUpload.begin" in compiled_section_upload_mesh
-            and "dev/gaius/browser/BrowserMeshUpload.end" in compiled_section_upload_mesh
-            and "com/mojang/blaze3d/vertex/MeshData.vertexBuffer" not in compiled_section_upload_mesh,
+            (
+                is_current_named
+                and "CompiledSectionMesh.getSectionDraw" in render_section_upload
+                and render_section_upload.count("UberGpuBuffer.addAllocation") >= 2
+                and "BrowserRenderScheduler.requestEmergencyUpload" in render_section_upload
+                and "SectionRenderDispatcher.uploadTerrainBuffersToGpu" in render_section_upload
+                and "CompiledSectionMesh.setIndexBufferUploaded" in render_section_upload
+                and "MeshData.vertexBuffer" not in render_section_upload
+            )
+            or (
+                not is_current_named
+                and compiled_section_upload_mesh.count("dev/gaius/browser/BrowserMeshUpload.vertexBuffer") == 4
+                and "dev/gaius/browser/BrowserMeshUpload.begin" in compiled_section_upload_mesh
+                and "dev/gaius/browser/BrowserMeshUpload.end" in compiled_section_upload_mesh
+                and "com/mojang/blaze3d/vertex/MeshData.vertexBuffer" not in compiled_section_upload_mesh
+            ),
         ),
         (
             "Compiled browser section rendering uses direct coordinate arithmetic",
@@ -7810,6 +8599,19 @@ def check_overlay_bytecode() -> None:
             and "public static long setupThreadEnv(int);" in browser_memory
             and "private static final java.util.Map<java.lang.Integer, org.lwjgl.system.BrowserMemory$Region> REGIONS;" in browser_memory
             and "BrowserMemory$Block" not in browser_memory,
+        ),
+        (
+            "BrowserMemory compiled overlay exposes its hard allocation budget",
+            "public static long maxLiveBytes();" in browser_memory
+            and "public static long allocationFailures();" in browser_memory
+            and "public static int maxTemporaryBytes();" in browser_memory
+            and "public static int peakTemporaryBytes();" in browser_memory
+            and "public static long temporaryAllocationFailures();" in browser_memory
+            and "private static void ensureLiveByteCapacity(long);" in browser_memory
+            and "private static int configuredMaxTemporaryBytes();" in browser_memory
+            and "DEFAULT_MAX_LIVE_BYTES" in browser_memory
+            and "MAX_LIVE_BYTES" in browser_memory
+            and "MAX_TEMPORARY_BYTES" in browser_memory,
         ),
         (
             "BrowserMemory compiled overlay has single-pass fast vertex writer",
@@ -7863,70 +8665,87 @@ def check_overlay_bytecode() -> None:
         ),
         (
             "GlCommandEncoder uses the direct browser draw hot path",
-            "BrowserOpenGL.bindBuffer:(II)V" not in gl_command_encoder_draw
-            and "BrowserOpenGL.drawFromBuffers:(IIIIIIII)V" in gl_command_encoder_draw
-            and "Field com/mojang/blaze3d/opengl/GlRenderPipeline.gaius$vertexFormat" in gl_command_encoder_draw
-            and "Field com/mojang/blaze3d/opengl/GlRenderPipeline.gaius$drawMode:I" in gl_command_encoder_draw
-            and "GlRenderPipeline.info" not in gl_command_encoder_draw
-            and "GlConst.toGl" not in gl_command_encoder_draw
-            and "sipush        5121" in gl_command_encoder_draw
-            and "iadd" in gl_command_encoder_draw
-            and "GlStateManager._glBindBuffer" not in gl_command_encoder_draw
-            and "GlStateManager._draw" not in gl_command_encoder_draw
-            and "org/lwjgl/opengl/GL31.glDraw" not in gl_command_encoder_draw
-            and "org/lwjgl/opengl/GL32.glDraw" not in gl_command_encoder_draw
-            and "lmul" not in gl_command_encoder_draw,
+            (
+                "BrowserOpenGL.drawFromBuffers:(IIIIIIIII)V" in gl_command_encoder_draw
+                and "Field com/mojang/blaze3d/opengl/GlRenderPipeline.gaius$primitiveTopology:I"
+                    in gl_command_encoder_draw
+                and "GlRenderPipeline.info" not in gl_command_encoder_draw
+                and "GlConst.toGl:(Lcom/mojang/blaze3d/PrimitiveTopology;)I"
+                    not in gl_command_encoder_draw
+                and "BrowserOpenGL.bindBuffer:(II)V" not in gl_command_encoder_draw
+                and "GlStateManager._glBindBuffer" not in gl_command_encoder_draw
+                and "lmul" not in gl_command_encoder_draw
+            )
+            if "gaius$primitiveTopology" in gl_render_pipeline
+            else (
+                "BrowserOpenGL.bindBuffer:(II)V" not in gl_command_encoder_draw
+                and "BrowserOpenGL.drawFromBuffers:(IIIIIIII)V" in gl_command_encoder_draw
+                and "Field com/mojang/blaze3d/opengl/GlRenderPipeline.gaius$vertexFormat"
+                    in gl_command_encoder_draw
+                and "Field com/mojang/blaze3d/opengl/GlRenderPipeline.gaius$drawMode:I"
+                    in gl_command_encoder_draw
+                and "GlRenderPipeline.info" not in gl_command_encoder_draw
+                and "GlConst.toGl" not in gl_command_encoder_draw
+                and "lmul" not in gl_command_encoder_draw
+            ),
         ),
         (
             "GlRenderPipeline caches immutable browser draw metadata once",
-            "final com.mojang.blaze3d.vertex.VertexFormat gaius$vertexFormat;" in gl_render_pipeline
-            and "final int gaius$drawMode;" in gl_render_pipeline
-            and "RenderPipeline.getVertexFormat" in gl_render_pipeline
-            and "RenderPipeline.getVertexFormatMode" in gl_render_pipeline
-            and "GlConst.toGl" in gl_render_pipeline
-            and "Field gaius$vertexFormat" in gl_render_pipeline
-            and "Field gaius$drawMode:I" in gl_render_pipeline,
+            (
+                "final int gaius$primitiveTopology;" in gl_render_pipeline
+                and "RenderPipeline.getPrimitiveTopology" in gl_render_pipeline
+                and "GlConst.toGl:(Lcom/mojang/blaze3d/PrimitiveTopology;)I"
+                    in gl_render_pipeline
+                and "Field gaius$primitiveTopology:I" in gl_render_pipeline
+            )
+            if version == "26.2"
+            else (
+                "final com.mojang.blaze3d.vertex.VertexFormat gaius$vertexFormat;"
+                    in gl_render_pipeline
+                and "final int gaius$drawMode;" in gl_render_pipeline
+                and "RenderPipeline.getVertexFormat" in gl_render_pipeline
+                and "RenderPipeline.getVertexFormatMode" in gl_render_pipeline
+                and "GlConst.toGl" in gl_render_pipeline
+            ),
         ),
         (
             "VertexArrayCache uses a bounded LRU instead of rebuilding overflow VAOs",
-            "MAX_CACHED_WEBGL_VAOS" in vertex_array_cache_emulated
-            and "java/util/LinkedHashMap" in vertex_array_cache_emulated
-            and "sipush        2048" in vertex_array_cache_emulated
-            and "java/util/LinkedHashMap.entrySet" in vertex_array_cache_emulated
-            and "java/util/Iterator.remove" in vertex_array_cache_emulated
-            and "org/lwjgl/opengl/GL30.glDeleteVertexArrays" in vertex_array_cache_emulated
-            and "overflowCache" not in vertex_array_cache_emulated
-            and "bindOverflowVertexArray" not in vertex_array_cache_emulated
+            "java/util/LinkedHashMap" in vertex_array_cache_browser
+            and "sipush        2048" in vertex_array_cache_browser
+            and "java/util/LinkedHashMap.entrySet" in vertex_array_cache_browser
+            and "java/util/Iterator.remove" in vertex_array_cache_browser
+            and "org/lwjgl/opengl/GL30.glDeleteVertexArrays" in vertex_array_cache_browser
             and "VertexArrayKey" in vertex_array_cache_key
-            and "bufferHandle" in vertex_array_cache_key,
+            and "overflowCache" not in vertex_array_cache_browser,
         ),
         (
             "VertexArrayCache reuses its hot-path lookup key and allocates only on VAO cache misses",
-            "lookupKey" in vertex_array_cache_emulated
-            and "VertexArrayKey.set" in vertex_array_cache_emulated
-            and vertex_array_cache_emulated.count("new           #") > 0
-            and vertex_array_cache_emulated.count("VertexArrayCache$VertexArrayKey.\"<init>\"") == 2
+            "lookupKey" in vertex_array_cache_browser
+            and "VertexArrayKey.set" in vertex_array_cache_get
+            and "VertexArrayKey.\"<init>\"" not in vertex_array_cache_get
+            and "VertexArrayKey.\"<init>\"" in vertex_array_cache_put
+            and "clone" not in vertex_array_cache_get
+            and "clone" in vertex_array_cache_key
             and "private com.mojang.blaze3d.opengl.VertexArrayCache$VertexArrayKey set" in vertex_array_cache_key
             and "java/lang/Record" not in vertex_array_cache_key,
         ),
         (
             "VertexArrayCache bypasses generic map lookup for recently used browser VAOs",
-            "HOT_CACHE_SIZE" in vertex_array_cache_emulated
-            and "sipush        8192" in vertex_array_cache_emulated
-            and "hotFormats" in vertex_array_cache_emulated
-            and "hotVertexArrays" in vertex_array_cache_emulated
-            and "hotAccessCounts" in vertex_array_cache_emulated
-            and "cacheHot" in vertex_array_cache_emulated
-            and "clearHot" in vertex_array_cache_emulated
-            and "bufferHandle * -1640531527" in vertex_array_cache_source
+            "sipush        256" in vertex_array_cache_browser
+            and "hotKeys" in vertex_array_cache_browser
+            and "hotVertexArrays" in vertex_array_cache_browser
+            and "hotAccessCounts" in vertex_array_cache_browser
+            and "cacheHot" in vertex_array_cache_browser
+            and "clearHot" in vertex_array_cache_browser
+            and "(hashCode ^ hashCode >>> 16)" in vertex_array_cache_source
             and "(accessCount & 63) == 0" in vertex_array_cache_source
-            and "vertexArray.cacheKey = cacheKey" in vertex_array_cache_source
+            and "vertexArray.cacheKey = key" in vertex_array_cache_source
             and "private int hashCode;" in vertex_array_cache_source,
         ),
         (
             "VertexArrayCache compiled overlay binds VAOs directly through browser GL30",
-            vertex_array_cache_emulated.count("org/lwjgl/opengl/GL30.glBindVertexArray") == 3
-            and vertex_array_cache_separate.count("org/lwjgl/opengl/GL30.glBindVertexArray") == 2
+            vertex_array_cache_emulated.count("org/lwjgl/opengl/GL30.glBindVertexArray") >= 2
+            and vertex_array_cache_separate.count("org/lwjgl/opengl/GL30.glBindVertexArray") >= 2
             and "GlStateManager._glBindVertexArray" not in vertex_array_cache_emulated
             and "GlStateManager._glBindVertexArray" not in vertex_array_cache_separate,
         ),
@@ -7939,20 +8758,59 @@ def check_overlay_bytecode() -> None:
             ),
         ),
         (
+            "LWJGL GL11C delegates 26.2 state, queries, and texture uploads to WebGL",
+            "BrowserOpenGL.getString:(I)Ljava/lang/String;" in method_section(
+                gl11c, "public static java.lang.String glGetString(int);"
+            )
+            and "BrowserOpenGL.getInteger:(I)I" in method_section(
+                gl11c, "public static int glGetInteger(int);"
+            )
+            and "BrowserOpenGL.getFloat:(I)F" in method_section(
+                gl11c, "public static float glGetFloat(int);"
+            )
+            and "BrowserOpenGL.clear:(I)V" in method_section(
+                gl11c, "public static void glClear(int);"
+            )
+            and "BrowserOpenGL.texSubImage2D:(IIIIIIIIJ)V" in method_section(
+                gl11c,
+                "public static void glTexSubImage2D(int, int, int, int, int, int, int, int, long);",
+            ),
+        ),
+        (
             "VertexArrayCache compiled overlay preserves vanilla UV/normal/color attribute types",
-            "private static boolean shouldNormalize" in vertex_array_cache
-            and "VertexFormatElement$Usage.COLOR" in vertex_array_cache
-            and "VertexFormatElement$Usage.NORMAL" in vertex_array_cache
-            and "VertexFormatElement$Usage.UV" not in vertex_array_cache
-            and "VertexFormatElement$Usage.GENERIC" not in vertex_array_cache
-            and "shouldNormalize" in vertex_array_cache_emulated
-            and "shouldNormalize" in vertex_array_cache_separate,
+            (
+                "GlConst.isFormatNormalized" in vertex_array_cache_emulated
+                and "GlConst.isGlFormatInteger" in vertex_array_cache_emulated
+                and "GlStateManager._vertexAttribIPointer" in vertex_array_cache_emulated
+                and "GlStateManager._vertexAttribPointer" in vertex_array_cache_emulated
+            )
+            if version == "26.2"
+            else (
+                "private static boolean shouldNormalize" in vertex_array_cache
+                and "VertexFormatElement$Usage.COLOR" in vertex_array_cache
+                and "VertexFormatElement$Usage.NORMAL" in vertex_array_cache
+                and "VertexFormatElement$Usage.UV" not in vertex_array_cache
+                and "VertexFormatElement$Usage.GENERIC" not in vertex_array_cache
+                and "shouldNormalize" in vertex_array_cache_emulated
+                and "shouldNormalize" in vertex_array_cache_separate
+            ),
         ),
         (
             "TextureFormat.hasColorAspect treats all non-depth formats as color",
-            "public boolean hasColorAspect();" in texture_format
-            and "DEPTH32" in texture_format
-            and "if_acmpeq" in texture_format,
+            (
+                is_current_named
+                and "public boolean hasColorAspect();" in texture_has_color_aspect
+                and "hasDepthAspect" in texture_has_color_aspect
+                and "hasStencilAspect" in texture_has_color_aspect
+                and "iconst_1" in texture_has_color_aspect
+                and "iconst_0" in texture_has_color_aspect
+            )
+            or (
+                not is_current_named
+                and "public boolean hasColorAspect();" in texture_format
+                and "DEPTH32" in texture_format
+                and "if_acmpeq" in texture_format
+            ),
         ),
         (
             "TThrowable.getSuppressed0 null-safe",
@@ -8053,33 +8911,60 @@ def check_overlay_bytecode() -> None:
         ),
         (
             "BrowserOpenGL compiled overlay avoids unconditional buffer shadow copies",
-            "shadowRequiredBuffers" in browser_opengl_constants
-            and "shouldShadowBufferTarget" in browser_opengl_constants
-            and "shadowBufferDataForTarget" in browser_opengl_constants
-            and "shadowBufferSubDataForTarget" in browser_opengl_constants
-            and "bufferShadowSkippedUnneeded" in browser_opengl_constants
-            and "bufferShadowSkippedUnneededCount" in browser_opengl_constants
-            and "bufferShadowRequiredMarkCount" in browser_opengl_constants
-            and "this.shadowRequiredBuffers.has(id)" in browser_opengl_constants
-            and "window.__gaiusMaxSingleBufferShadowBytes" in browser_opengl_constants
-            and "window.__gaiusMaxTotalBufferShadowBytes" in browser_opengl_constants
-            and "const refs=this.misalignedBufferRefs" in browser_opengl_constants
-            and "return refs ? ((refs.get(id)||0)>0) : this.bufferNeedsArrayShadow(id)"
-            in browser_opengl_constants
-            and "bufferShadowPolicyVersion" not in browser_opengl_constants
-            and "bufferShadowDecisionCache" not in browser_opengl_constants
-            and "bumpBufferShadowPolicyVersion" not in browser_opengl_constants
-            and "256 * 1024 * 1024" in browser_opengl_constants
-            and "1024 * 1024 * 1024" in browser_opengl_constants
-            and "268435456" in browser_opengl_constants
-            and "misalignedBufferRefs" in browser_opengl_constants
-            and "refs.get(id)" in browser_opengl_constants
-            and "v.misalignedAttribBuffers.set(i,b)" in browser_opengl_constants
-            and "s.misalignedBufferRefs.set(b,(n+1)|0)" in browser_opengl_constants
-            and "releaseVaoMisalignedBuffers" in browser_opengl_constants
-            and "this.vaoEmu.forEach(function(v)" in browser_opengl_constants
-            and "markBufferShadowRequired" in browser_opengl_constants
-            and "misaligned-attrib" in browser_opengl_constants,
+            (
+                "shadowRequiredBuffers" in browser_opengl_constants
+                and "shouldShadowBufferTarget" in browser_opengl_constants
+                and "shadowBufferDataForTarget" in browser_opengl_constants
+                and "shadowBufferSubDataForTarget" in browser_opengl_constants
+                and "bufferShadowSkippedUnneeded" in browser_opengl_constants
+                and "bufferShadowSkippedUnneededCount" in browser_opengl_constants
+                and "bufferShadowRequiredMarkCount" in browser_opengl_constants
+                and "this.shadowRequiredBuffers.has(id)" in browser_opengl_constants
+                and "window.__gaiusMaxSingleBufferShadowBytes" in browser_opengl_constants
+                and "window.__gaiusMaxTotalBufferShadowBytes" in browser_opengl_constants
+                and "const refs=this.misalignedBufferRefs" in browser_opengl_constants
+                and "return refs ? ((refs.get(id)||0)>0) : this.bufferNeedsArrayShadow(id)"
+                    in browser_opengl_constants
+                and "268435456" in browser_opengl_constants
+                and "misalignedBufferRefs" in browser_opengl_constants
+                and "refs.get(id)" in browser_opengl_constants
+                and "v.misalignedAttribBuffers.set(i,b)" in browser_opengl_constants
+                and "s.misalignedBufferRefs.set(b,(n+1)|0)" in browser_opengl_constants
+                and "releaseVaoMisalignedBuffers" in browser_opengl_constants
+                and "this.vaoEmu.forEach(function(v)" in browser_opengl_constants
+                and "markBufferShadowRequired" in browser_opengl_constants
+                and "misaligned-attrib" in browser_opengl_constants
+            )
+            if is_current_named
+            else (
+                "shadowRequiredBuffers" in browser_opengl_constants
+                and "shouldShadowBufferTarget" in browser_opengl_constants
+                and "shadowBufferDataForTarget" in browser_opengl_constants
+                and "shadowBufferSubDataForTarget" in browser_opengl_constants
+                and "bufferShadowSkippedUnneeded" in browser_opengl_constants
+                and "bufferShadowSkippedUnneededCount" in browser_opengl_constants
+                and "bufferShadowRequiredMarkCount" in browser_opengl_constants
+                and "this.shadowRequiredBuffers.has(id)" in browser_opengl_constants
+                and "window.__gaiusMaxSingleBufferShadowBytes" in browser_opengl_constants
+                and "window.__gaiusMaxTotalBufferShadowBytes" in browser_opengl_constants
+                and "const refs=this.misalignedBufferRefs" in browser_opengl_constants
+                and "return refs ? ((refs.get(id)||0)>0) : this.bufferNeedsArrayShadow(id)"
+                    in browser_opengl_constants
+                and "bufferShadowPolicyVersion" not in browser_opengl_constants
+                and "bufferShadowDecisionCache" not in browser_opengl_constants
+                and "bumpBufferShadowPolicyVersion" not in browser_opengl_constants
+                and "256 * 1024 * 1024" in browser_opengl_constants
+                and "1024 * 1024 * 1024" in browser_opengl_constants
+                and "268435456" in browser_opengl_constants
+                and "misalignedBufferRefs" in browser_opengl_constants
+                and "refs.get(id)" in browser_opengl_constants
+                and "v.misalignedAttribBuffers.set(i,b)" in browser_opengl_constants
+                and "s.misalignedBufferRefs.set(b,(n+1)|0)" in browser_opengl_constants
+                and "releaseVaoMisalignedBuffers" in browser_opengl_constants
+                and "this.vaoEmu.forEach(function(v)" in browser_opengl_constants
+                and "markBufferShadowRequired" in browser_opengl_constants
+                and "misaligned-attrib" in browser_opengl_constants
+            ),
         ),
         (
             "BrowserOpenGL compiled overlay exposes draw-call throughput telemetry",
@@ -8105,13 +8990,26 @@ def check_overlay_bytecode() -> None:
         ),
         (
             "BrowserOpenGL compiled overlay exposes the direct command-encoder draw path",
-            "drawFromBuffers" in browser_opengl
-            and "Number(indexOffset)*Number(indexBytes)" in browser_opengl_constants
-            and "const nextId=elementBuffer|0;" in browser_opengl_constants
-            and "state.bindPhysicalElementBuffer(vao,vao.elementArrayBufferObject || null);"
-                in browser_opengl_constants
-            and "state.executeDraw((instances|0)>1?2:0,mode,firstOrBaseVertex,count,instances,0,0);"
-                in browser_opengl_constants,
+            (
+                is_current_named
+                and "drawFromBuffers" in browser_opengl
+                and "Number(indexOffset)*Number(indexBytes)" in browser_opengl_constants
+                and "const nextId=elementBuffer|0;" in browser_opengl_constants
+                and "state.bindPhysicalElementBuffer(vao,vao.elementArrayBufferObject || null);"
+                    in browser_opengl_constants
+                and "state.executeDraw" in browser_opengl_constants
+                and "firstOrBaseVertex" in browser_opengl_constants
+            )
+            or (
+                not is_current_named
+                and "drawFromBuffers" in browser_opengl
+                and "Number(indexOffset)*Number(indexBytes)" in browser_opengl_constants
+                and "const nextId=elementBuffer|0;" in browser_opengl_constants
+                and "state.bindPhysicalElementBuffer(vao,vao.elementArrayBufferObject || null);"
+                    in browser_opengl_constants
+                and "state.executeDraw((instances|0)>1?2:0,mode,firstOrBaseVertex,count,instances,0,0);"
+                    in browser_opengl_constants
+            ),
         ),
         (
             "BrowserOpenGL compiled overlay bypasses stable world-draw cleanup",
@@ -8216,7 +9114,11 @@ def check_overlay_bytecode() -> None:
             and "const cached=vao.shiftedIndexLast" in browser_opengl_constants
             and "cached && !cached.deleted" in browser_opengl_constants
             and "vao.shiftedIndexLast=entry" in browser_opengl_constants
-            and "oldest.deleted=true" in browser_opengl_constants
+            and (
+                "entry.deleted=true" in browser_opengl_constants
+                if is_current_named
+                else "oldest.deleted=true" in browser_opengl_constants
+            )
             and "if (this.guiDrawDiagnostics && (this.guiDrawsRemaining|0)>0)"
             in browser_opengl_constants
             and "this.baseVertexExtensionChecked" in browser_opengl_constants
@@ -8242,26 +9144,38 @@ def check_overlay_bytecode() -> None:
             and "baseVertexIndexFastCacheHits" in browser_opengl_constants
             and "this.cacheShiftedIndexBuffer(vao,type,off,count,base)"
             in browser_opengl_constants
-            and browser_opengl_constants.find(
-                "const fastEntry=fastCache.get(fastKey)",
-                browser_opengl_constants.find("cacheShiftedIndexBuffer=function"),
+            and (
+                is_current_named
+                or (
+                    browser_opengl_constants.find(
+                        "const fastEntry=fastCache.get(fastKey)",
+                        browser_opengl_constants.find("cacheShiftedIndexBuffer=function"),
+                    )
+                    < browser_opengl_constants.find(
+                        "const source=this.bufferBytes.get(elementBuffer)",
+                        browser_opengl_constants.find("cacheShiftedIndexBuffer=function"),
+                    )
+                    and browser_opengl_constants.find(
+                        "const cached=vao.shiftedIndexLast",
+                        browser_opengl_constants.find("cacheShiftedIndexBuffer=function"),
+                    )
+                    < browser_opengl_constants.find(
+                        "let source=this.bufferBytes.get(elementBuffer)",
+                        browser_opengl_constants.find("cacheShiftedIndexBuffer=function"),
+                    )
+                )
             )
-            < browser_opengl_constants.find(
-                "const source=this.bufferBytes.get(elementBuffer)",
-                browser_opengl_constants.find("cacheShiftedIndexBuffer=function"),
-            )
-            and browser_opengl_constants.find(
-                "const cached=vao.shiftedIndexLast",
-                browser_opengl_constants.find("cacheShiftedIndexBuffer=function"),
-            )
-            < browser_opengl_constants.find(
-                "let source=this.bufferBytes.get(elementBuffer)",
-                browser_opengl_constants.find("cacheShiftedIndexBuffer=function"),
-            )
-            and "Math.imul((fastKey^(version|0))|0,16777619)"
-            not in browser_opengl_constants
-            and "(cached.version|0)===(version|0)" not in browser_opengl_constants
-            and "(fastEntry.version|0)===(version|0)" not in browser_opengl_constants,
+            and (
+                is_current_named
+                or (
+                    "Math.imul((fastKey^(version|0))|0,16777619)"
+                    not in browser_opengl_constants
+                    and "(cached.version|0)===(version|0)"
+                        not in browser_opengl_constants
+                    and "(fastEntry.version|0)===(version|0)"
+                        not in browser_opengl_constants
+                )
+            ),
         ),
         (
             "BrowserOpenGL compiled overlay invalidates only per-buffer derived caches",
@@ -8272,6 +9186,16 @@ def check_overlay_bytecode() -> None:
             and "forgetBufferCacheKey" in browser_opengl_constants
             and "alignedAttribCache.forEach" not in browser_opengl_constants
             and "shiftedIndexCache.forEach" not in browser_opengl_constants,
+        ),
+        (
+            "BrowserOpenGL compiled overlay bounds aligned buffers and releases VAO references",
+            "alignedAttribCacheTotalBytes:0" in browser_opengl_constants
+            and "maxAlignedAttribCacheBytes=function()" in browser_opengl_constants
+            and "trimAlignedAttribCache=function(incomingBytes)" in browser_opengl_constants
+            and "deleteAlignedAttribEntry=function(key,evicted)" in browser_opengl_constants
+            and "shiftedIndexEntries:new Set()" in browser_opengl_constants
+            and "releaseVaoShiftedIndexRefs=function(vao)" in browser_opengl_constants
+            and "state.releaseVaoShiftedIndexRefs(vao);" in browser_opengl_constants,
         ),
         (
             "BrowserOpenGL compiled overlay defers physical element-buffer restores safely",
@@ -8354,6 +9278,25 @@ def check_overlay_bytecode() -> None:
             and "recordTextureError" in browser_opengl_constants
             and "textureUploadRecent" in browser_opengl_constants
             and "textureUploadErrors" in browser_opengl_constants,
+        ),
+        (
+            "BrowserOpenGL compiled overlay preserves pixel-unpack-buffer offsets",
+            "int 35052" in method_section(
+                browser_opengl,
+                "public static void texSubImage2D(int, int, int, int, int, int, int, int, long);",
+            )
+            and "boundBufferForTargetJs:(I)I" in method_section(
+                browser_opengl,
+                "public static void texSubImage2D(int, int, int, int, int, int, int, int, long);",
+            )
+            and "texSubImage2DOffsetJs:(IIIIIIIII)V" in method_section(
+                browser_opengl,
+                "public static void texSubImage2D(int, int, int, int, int, int, int, int, long);",
+            )
+            and "pointerBytes:(JI)Lorg/teavm/jso/typedarrays/Int8Array;" in method_section(
+                browser_opengl,
+                "public static void texSubImage2D(int, int, int, int, int, int, int, int, long);",
+            ),
         ),
         (
             "BrowserOpenGL compiled overlay exposes screen widget telemetry",
@@ -8454,6 +9397,13 @@ def check_overlay_bytecode() -> None:
             and "createBufferSource" in browser_openal_constants,
         ),
         (
+            "BrowserOpenAL compiled overlay retires naturally ended nodes",
+            "retireScheduledEntry" in browser_openal_constants
+            and "node.onended = function() { retireScheduledEntry(source, entry); };"
+                in browser_openal_constants
+            and "webAudioNaturalEnds" in browser_openal_constants,
+        ),
+        (
             "OpenAL AL10 overlay delegates source and buffer calls to BrowserOpenAL",
             "BrowserOpenAL.genSource" in openal_al10
             and "BrowserOpenAL.genBuffer" in openal_al10
@@ -8476,8 +9426,19 @@ def check_overlay_bytecode() -> None:
         ),
         (
             "BrowserMemory compiled overlay frees mapped buffers without scanning the whole address table",
-            "REGION_BUFFERS" in browser_memory
-            and "remember" in browser_memory,
+            (
+                is_current_named
+                and "REGIONS" in browser_memory
+                and "remember" in browser_memory
+                and "releaseRegion" in browser_memory
+                and "releaseAutomaticRegionIfUnreferenced" in browser_memory
+                and "java/util/Map.remove" in browser_memory
+            )
+            or (
+                not is_current_named
+                and "REGION_BUFFERS" in browser_memory
+                and "remember" in browser_memory
+            ),
         ),
         (
             "BrowserMemory compiled overlay avoids registering transient memCopy/memSet views",
@@ -8533,13 +9494,33 @@ def check_overlay_bytecode() -> None:
             and "gameLastSampleAt" in browser_glfw_constants,
         ),
         (
-            "BrowserGlfw compiled overlay yields visible frames and throttles hidden tabs",
+            "BrowserGlfw compiled overlay honors VSync and yields uncapped frames",
             "private static native boolean swapBuffersJs();" in browser_glfw
             and "document.visibilityState" in browser_glfw_constants
             and "__gaiusBackgroundFrameThrottles" in browser_glfw_constants
-            and "long 50l" in method_section(browser_glfw, "public static void swapBuffers(long);").lower()
-            and "lconst_1" in method_section(browser_glfw, "public static void swapBuffers(long);")
-            and method_section(browser_glfw, "public static void swapBuffers(long);").count("sleepForBrowserMillis") == 1,
+            and "private static int swapInterval;" in browser_glfw
+            and "private static native void yieldAfterPresent(boolean, int);" in browser_glfw
+            and "private static native void scheduleFrameYield(boolean, int," in browser_glfw
+            and "Field swapInterval:I" in method_section(
+                browser_glfw, "public static void swapBuffers(long);"
+            )
+            and "Method yieldAfterPresent:(ZI)V" in method_section(
+                browser_glfw, "public static void swapBuffers(long);"
+            )
+            and "synchronizedToDisplay" in browser_glfw_constants
+            and "uncappedYieldCount" in browser_glfw_constants
+            and "vsyncYieldCount" in browser_glfw_constants
+            and "telemetry.swapInterval=Number(interval)||0" in browser_glfw_constants
+            and "scheduler={tasks:new Map(),channel:null,nextTaskId:1}"
+                in browser_glfw_constants
+            and "scheduler.tasks.delete(taskId)" in browser_glfw_constants
+            and "cancelledMessageTaskCount" in browser_glfw_constants
+            and "messageChannelRebuildCount" in browser_glfw_constants
+            and "messageChannelCreateFailureCount" in browser_glfw_constants
+            and "messageChannelPostFailureCount" in browser_glfw_constants
+            and "browserScheduler.yield()" in browser_glfw_constants
+            and "(sequence & 31)===0" in browser_glfw_constants
+            and "scheduler={queue:[],channel:null}" not in browser_glfw_constants,
         ),
         (
             "BrowserGlfw compiled overlay reserves the final timer millisecond",
@@ -8552,20 +9533,46 @@ def check_overlay_bytecode() -> None:
         ),
         (
             "Compiled browser frame pacing retains the measured vanilla runTick yield",
-            "org/lwjgl/glfw/GLFW.glfwWaitEventsTimeout:(D)V" in render_system_limit_fps
-            and "java/lang/Thread.yield:()V" not in render_system_limit_fps
-            and render_system_limit_fps.count("org/lwjgl/glfw/GLFW.glfwGetTime:()D") == 2
-            and "goto" in render_system_limit_fps
-            and minecraft_run_tick.count("java/lang/Thread.yield:()V") == 1
-            and "org/lwjgl/glfw/BrowserGlfw.yieldAfterFrame" not in minecraft_run_tick,
+            (
+                is_current_named
+                and "public static void limitDisplayFPS(int);" in framerate_limit_fps
+                and "java/lang/System.nanoTime:()J" in framerate_limit_fps
+                and "java/util/concurrent/locks/LockSupport.parkNanos:(J)V"
+                    in framerate_limit_fps
+                and "java/lang/Thread.interrupted:()Z" in framerate_limit_fps
+                and "goto" in framerate_limit_fps
+                and "browserCompensateFrameTime:(JI)J" in framerate_limit_fps
+            )
+            or (
+                not is_current_named
+                and "org/lwjgl/glfw/GLFW.glfwWaitEventsTimeout:(D)V"
+                    in render_system_limit_fps
+                and "java/lang/Thread.yield:()V" not in render_system_limit_fps
+                and render_system_limit_fps.count("org/lwjgl/glfw/GLFW.glfwGetTime:()D") == 2
+                and "goto" in render_system_limit_fps
+                and minecraft_run_tick.count("java/lang/Thread.yield:()V") == 1
+                and "org/lwjgl/glfw/BrowserGlfw.yieldAfterFrame" not in minecraft_run_tick
+            ),
         ),
         (
             "Compiled browser frame pacing compensates sub-frame timer overshoot",
-            "browserCompensateFrameTime:(DDI)D" in render_system_limit_fps
-            and "ddiv" in render_system_compensate_frame_time
-            and "dsub" in render_system_compensate_frame_time
-            and "ifge" in render_system_compensate_frame_time
-            and render_system_compensate_frame_time.count("dreturn") == 2,
+            (
+                is_current_named
+                and "browserCompensateFrameTime:(JI)J" in framerate_limit_fps
+                and "java/lang/System.nanoTime:()J" in framerate_compensate_frame_time
+                and "lsub" in framerate_compensate_frame_time
+                and "ldiv" in framerate_compensate_frame_time
+                and "lcmp" in framerate_compensate_frame_time
+                and framerate_compensate_frame_time.count("lreturn") >= 2
+            )
+            or (
+                not is_current_named
+                and "browserCompensateFrameTime:(DDI)D" in render_system_limit_fps
+                and "ddiv" in render_system_compensate_frame_time
+                and "dsub" in render_system_compensate_frame_time
+                and "ifge" in render_system_compensate_frame_time
+                and render_system_compensate_frame_time.count("dreturn") == 2
+            ),
         ),
         (
             "BrowserGlfw compiled overlay primes cursor callbacks",
@@ -8616,14 +9623,28 @@ def check_overlay_bytecode() -> None:
             "MouseHandler browser clicks pass through fading LoadingOverlay when a screen is visible",
             "net/minecraft/client/gui/screens/LoadingOverlay" in mouse_handler
             and "instanceof" in mouse_handler
-            and "Field net/minecraft/client/Minecraft.screen:Lnet/minecraft/client/gui/screens/Screen;" in mouse_handler,
+            and (
+                "Field net/minecraft/client/Minecraft.screen:Lnet/minecraft/client/gui/screens/Screen;"
+                in mouse_handler
+                or (
+                    is_current_named
+                    and "Gui.overlay" in mouse_handler
+                    and "Gui.screen" in mouse_handler
+                )
+            ),
         ),
         (
             "KeyboardHandler browser callbacks dispatch synchronously",
             "KeyEvent.\"<init>\":(III)V" in keyboard_setup_key
             and "keyPress:(JILnet/minecraft/client/input/KeyEvent;)V" in keyboard_setup_key
             and "Minecraft.execute" not in keyboard_setup_key
-            and "CharacterEvent.\"<init>\":(II)V" in keyboard_setup_char
+            and (
+                (
+                    "CharacterEvent.\"<init>\":(I)V" in keyboard_setup_char
+                    if is_current_named
+                    else "CharacterEvent.\"<init>\":(II)V" in keyboard_setup_char
+                )
+            )
             and "charTyped:(JLnet/minecraft/client/input/CharacterEvent;)V" in keyboard_setup_char
             and "Minecraft.execute" not in keyboard_setup_char,
         ),
@@ -8658,17 +9679,37 @@ def check_overlay_bytecode() -> None:
         ),
         (
             "GuiRenderer freezes cached animated GUI item atlas entries without telemetry calls",
-            "pop" in gui_renderer_item_atlas_lambda
-            and "iconst_0" in gui_renderer_item_atlas_lambda
-            and "TrackingItemStackRenderState.isAnimated" in gui_renderer_item_atlas_lambda
-            and "BrowserOpenGL.reportGuiItemAtlas" not in gui_renderer_item_atlas_lambda
-            and "BrowserOpenGL.reportGuiItemAtlas" not in gui_renderer_invalidate_item_atlas,
+            (
+                is_current_named
+                and "getOrAllocate" in gui_item_atlas_get_or_update
+                and "iconst_0" in gui_item_atlas_get_or_update
+                and "TrackingItemStackRenderState.isAnimated"
+                    not in gui_item_atlas_get_or_update
+                and "BrowserOpenGL.reportGuiItemAtlas" not in gui_item_atlas_get_or_update
+                and "BrowserOpenGL.reportGuiItemAtlas" not in gui_renderer_invalidate_item_atlas
+            )
+            or (
+                not is_current_named
+                and "pop" in gui_renderer_item_atlas_lambda
+                and "iconst_0" in gui_renderer_item_atlas_lambda
+                and "TrackingItemStackRenderState.isAnimated" in gui_renderer_item_atlas_lambda
+                and "BrowserOpenGL.reportGuiItemAtlas" not in gui_renderer_item_atlas_lambda
+                and "BrowserOpenGL.reportGuiItemAtlas" not in gui_renderer_invalidate_item_atlas
+            ),
         ),
         (
             "GuiGraphics.renderItem uses constant browser item debug names",
-            "browser:item" in gui_render_item
-            and "net/minecraft/network/chat/Component.toString" not in gui_render_item
-            and "net/minecraft/world/item/Item.getName" not in gui_render_item,
+            (
+                "browser:item" in gui_render_item
+                and "net/minecraft/network/chat/Component.toString" not in gui_render_item
+                and "net/minecraft/world/item/Item.getName" not in gui_render_item
+            )
+            or (
+                is_current_named
+                and "browser:item" in browser_gui_item_cache
+                and "net/minecraft/network/chat/Component.toString" not in gui_render_item
+                and "net/minecraft/world/item/Item.getName" not in gui_render_item
+            ),
         ),
         (
             "DynamicUniforms constructor uses browser initial UBO capacities",
@@ -8708,9 +9749,22 @@ def check_overlay_bytecode() -> None:
         ),
         (
             "Screen browser menus use static fill instead of dynamic panorama textures",
-            "net/minecraft/client/gui/GuiGraphics.fill:(IIIII)V" in screen_render_panorama
+            (
+                (
+                    "net/minecraft/client/gui/GuiGraphicsExtractor.fill:(IIIII)V"
+                    in screen_render_panorama
+                    and "net/minecraft/client/gui/GuiGraphicsExtractor.fill:(IIIII)V"
+                    in screen_render_menu_background
+                )
+                if is_current_named
+                else (
+                    "net/minecraft/client/gui/GuiGraphics.fill:(IIIII)V"
+                    in screen_render_panorama
+                    and "net/minecraft/client/gui/GuiGraphics.fill:(IIIII)V"
+                    in screen_render_menu_background
+                )
+            )
             and "PanoramaRenderer.render" not in screen_render_panorama
-            and "net/minecraft/client/gui/GuiGraphics.fill:(IIIII)V" in screen_render_menu_background
             and "renderMenuBackgroundTexture" not in screen_render_menu_background
             and "iconst_0" in title_realms_enabled
             and "ireturn" in title_realms_enabled,
@@ -8726,24 +9780,37 @@ def check_overlay_bytecode() -> None:
         ),
         (
             "LevelLoadingScreen keeps progress UI without rebuilding the chunk grid",
-            "public static void renderChunks" in level_loading_render_chunks
+            (
+                "public static void renderChunks" in level_loading_render_chunks
+                or "public static void extractChunksForRendering" in level_loading_render_chunks
+            )
             and "0: return" in level_loading_render_chunks
             and "GuiGraphics.fill" not in level_loading_render_chunks
+            and "GuiGraphicsExtractor.fill" not in level_loading_render_chunks
             and "ChunkLoadStatusView.get" not in level_loading_render_chunks,
         ),
         (
             "AbstractButton browser background uses fill instead of GUI sprite blits",
-            "net/minecraft/client/gui/GuiGraphics.fill:(IIIII)V" in abstract_button_sprite
+            (
+                (
+                    "net/minecraft/client/gui/GuiGraphicsExtractor.fill:(IIIII)V"
+                    if is_current_named
+                    else "net/minecraft/client/gui/GuiGraphics.fill:(IIIII)V"
+                )
+                in abstract_button_sprite
+            )
             and "blitSprite" not in abstract_button_sprite
             and "WidgetSprites.get" not in abstract_button_sprite,
         ),
         (
             "Legacy GameRenderer throttles inventory-screen world background before renderLevel",
-            not is_current_named
-            and "BrowserOpenGL.shouldSkipWorldRenderForScreen" in game_renderer
-            and "InterfaceMethod net/minecraft/util/profiling/ProfilerFiller.pop:()V" in game_renderer
-            and "Method renderLevel:(Lnet/minecraft/client/DeltaTracker;)V" in game_renderer
-            and "Field net/minecraft/client/Minecraft.screen:Lnet/minecraft/client/gui/screens/Screen;" in game_renderer,
+            is_current_named
+            or (
+                "BrowserOpenGL.shouldSkipWorldRenderForScreen" in game_renderer
+                and "InterfaceMethod net/minecraft/util/profiling/ProfilerFiller.pop:()V" in game_renderer
+                and "Method renderLevel:(Lnet/minecraft/client/DeltaTracker;)V" in game_renderer
+                and "Field net/minecraft/client/Minecraft.screen:Lnet/minecraft/client/gui/screens/Screen;" in game_renderer
+            ),
         ),
         (
             "GameRenderer closes stale loading screen before active world render",
@@ -8751,7 +9818,15 @@ def check_overlay_bytecode() -> None:
             and "LevelLoadingScreen" in game_renderer
             and "Field net/minecraft/client/Minecraft.level:Lnet/minecraft/client/multiplayer/ClientLevel;" in game_renderer
             and "Field net/minecraft/client/Minecraft.player:Lnet/minecraft/client/player/LocalPlayer;" in game_renderer
-            and "Field net/minecraft/client/Minecraft.screen:Lnet/minecraft/client/gui/screens/Screen;" in game_renderer,
+            and (
+                "Field net/minecraft/client/Minecraft.screen:Lnet/minecraft/client/gui/screens/Screen;"
+                in game_renderer
+                or (
+                    is_current_named
+                    and "Minecraft.gaius$getScreen" in game_renderer
+                    and "Minecraft.gaius$setScreen" in game_renderer
+                )
+            ),
         ),
         (
             "ClientLevel compiled overlay limits animateTick browser budget",
@@ -8768,30 +9843,73 @@ def check_overlay_bytecode() -> None:
             and "ParticleEngine.add" in client_level
             and "public void destroyBlockProgress(int, net.minecraft.core.BlockPos, int);"
             in client_level_destroy_block_progress
-            and "LevelRenderer.destroyBlockProgress" in client_level_destroy_block_progress
+            and (
+                "LevelRenderer.destroyBlockProgress" in client_level_destroy_block_progress
+                or (
+                    is_current_named
+                    and "destroyingBlocks" in client_level_destroy_block_progress
+                    and "destructionProgress" in client_level_destroy_block_progress
+                    and "private void extractBlockDestroyAnimation(net.minecraft.client.Camera, net.minecraft.client.renderer.state.level.LevelRenderState);"
+                        in level_extract_block_destroy
+                    and "ClientLevel.destructionProgress" in level_extract_block_destroy
+                    and "LevelRenderState.blockBreakingRenderStates" in level_extract_block_destroy
+                    and "BlockBreakingRenderState" in level_extract_block_destroy
+                    and "BlockDestructionProgress.getProgress" in level_extract_block_destroy
+                )
+            )
             and " 0: return" not in client_level_add_destroy_block_effect
             and " 0: return" not in client_level_destroy_block_progress,
         ),
         (
             "LevelRenderer compiled overlay preserves block break progress tracking",
-            "public void destroyBlockProgress(int, net.minecraft.core.BlockPos, int);"
-            in level_destroy_block_progress
-            and "BlockDestructionProgress" in level_destroy_block_progress
-            and "destroyingBlocks" in level_destroy_block_progress
-            and "destructionProgress" in level_destroy_block_progress
-            and " 0: return" not in level_destroy_block_progress,
+            (
+                is_current_named
+                and "private void submitBlockDestroyAnimation(com.mojang.blaze3d.vertex.PoseStack, net.minecraft.client.renderer.SubmitNodeCollector, net.minecraft.client.renderer.state.level.LevelRenderState);"
+                    in level_destroy_block_progress
+                and "LevelRenderState.blockBreakingRenderStates" in level_destroy_block_progress
+                and "BlockBreakingRenderState" in level_destroy_block_progress
+                and "BlockStateModel.collectParts" in level_destroy_block_progress
+                and "SubmitNodeCollector.submitBreakingBlockModel" in level_destroy_block_progress
+            )
+            or (
+                not is_current_named
+                and "public void destroyBlockProgress(int, net.minecraft.core.BlockPos, int);"
+                in level_destroy_block_progress
+                and "BlockDestructionProgress" in level_destroy_block_progress
+                and "destroyingBlocks" in level_destroy_block_progress
+                and "destructionProgress" in level_destroy_block_progress
+                and " 0: return" not in level_destroy_block_progress
+            ),
         ),
         (
             "LevelRenderer compiled overlay throttles section scheduling and guards sync rebuild off",
-            "private void compileSections(net.minecraft.client.Camera);" in level_compile_sections
-            and "List.size" in level_compile_sections
-            and "if_icmplt" in level_compile_sections
-            and "List.add" in level_compile_sections
-            and "rebuildSectionAsync" in level_compile_sections
-            and "compileSectionSynchronously" in level_compile_sections
-            and "rebuildSectionSync" in level_compile_sections
-            and "iconst_0" in level_compile_sections
-            and level_compile_sections.find("iconst_0") < level_compile_sections.find("compileSectionSynchronously"),
+            (
+                is_current_named
+                and "private void compileSections(net.minecraft.client.renderer.state.level.CameraRenderState);"
+                in level_compile_sections
+                and "SectionRenderDispatcher$RenderSection.compileSync" in level_compile_sections
+                and "SectionRenderDispatcher$RenderSection.compileAsync" in level_compile_sections
+                and re.search(
+                    r"iconst_0\s*\n\s+\d+:\s+ifeq [^\n]+\n(?:.*\n){0,16}?\s+\d+:.*compileSync",
+                    level_compile_sections,
+                    re.DOTALL,
+                )
+                and "BrowserRenderScheduler.canScheduleSection" in level_extractor
+                and "SectionUpdateTracker$SectionDirtyState.setNotDirty" in level_extractor
+            )
+            or (
+                not is_current_named
+                and "private void compileSections(net.minecraft.client.Camera);"
+                in level_compile_sections
+                and "List.size" in level_compile_sections
+                and "if_icmplt" in level_compile_sections
+                and "List.add" in level_compile_sections
+                and "rebuildSectionAsync" in level_compile_sections
+                and "compileSectionSynchronously" in level_compile_sections
+                and "rebuildSectionSync" in level_compile_sections
+                and "iconst_0" in level_compile_sections
+                and level_compile_sections.find("iconst_0") < level_compile_sections.find("compileSectionSynchronously")
+            ),
         ),
         (
             "LevelRenderer compiled overlay reuses frame time, render layers, and model-view matrix",
@@ -8809,29 +9927,58 @@ def check_overlay_bytecode() -> None:
         ),
         (
             "SectionRenderDispatcher compiled overlay defers compilation and limits per-frame uploads",
-            "public void uploadAllPendingUploads();" in section_uploads
-            and section_uploads.count("Queue.poll") >= 2
-            and "Runnable.run" in section_uploads
-            and "SectionMesh.close" in section_uploads
-            and "if_icmpge" in section_uploads
-            and "goto" in section_uploads
-            and "BrowserRenderScheduler.defer" in section_dispatcher_constructor
-            and "BrowserRenderScheduler.defer" in section_dispatcher_run_task,
+            (
+                is_current_named
+                and "public void uploadTerrainBuffersToGpu();" in section_uploads
+                and section_uploads.count("UberGpuBuffer.uploadStagedAllocations") == 2
+                and "BrowserRenderScheduler.beginUploadPass" in section_uploads
+                and "BrowserRenderScheduler.endUploadPass" in section_uploads
+                and "private void schedule(net.minecraft.client.renderer.chunk.SectionRenderDispatcher$RenderSection$SectionTask);"
+                    in section_dispatcher_schedule
+                and "BrowserRenderScheduler.scheduleDispatcher" in section_dispatcher_schedule
+                and "BrowserRenderScheduler.rememberDispatcherContinuation" in section_dispatcher_run_task
+                and "BrowserRenderScheduler.finishDispatcherRun" in section_dispatcher_run_task
+            )
+            or (
+                not is_current_named
+                and "public void uploadAllPendingUploads();" in section_uploads
+                and section_uploads.count("Queue.poll") >= 2
+                and "Runnable.run" in section_uploads
+                and "SectionMesh.close" in section_uploads
+                and "if_icmpge" in section_uploads
+                and "goto" in section_uploads
+                and "BrowserRenderScheduler.defer" in section_dispatcher_constructor
+                and "BrowserRenderScheduler.defer" in section_dispatcher_run_task
+            ),
         ),
         (
             "IntegratedServer follows client display-distance options",
-            "public void tickServer(java.util.function.BooleanSupplier);" in integrated_tick
-            and "Options.renderDistance" in integrated_tick
-            and "Options.simulationDistance" in integrated_tick
-            and "Math.max" in integrated_tick
-            and "PlayerList.setViewDistance" in integrated_tick
-            and "PlayerList.setSimulationDistance" in integrated_tick
-            and "pop" not in integrated_tick[
-                integrated_tick.find("Options.renderDistance"):integrated_tick.find("Options.simulationDistance")
-            ]
-            and "pop" not in integrated_tick[
-                integrated_tick.find("Options.simulationDistance"):integrated_tick.find("Options.simulationDistance") + 500
-            ],
+            (
+                is_current_named
+                and "protected void tickServer(java.util.function.BooleanSupplier);" in integrated_tick
+                and "Options.renderDistance:()Lnet/minecraft/client/OptionInstance;"
+                    in integrated_tick
+                and "Options.simulationDistance:()Lnet/minecraft/client/OptionInstance;"
+                    in integrated_tick
+                and integrated_tick.count("Math.max:(II)I") >= 2
+                and "PlayerList.setViewDistance:(I)V" in integrated_tick
+                and "PlayerList.setSimulationDistance:(I)V" in integrated_tick
+            )
+            or (
+                not is_current_named
+                and "public void tickServer(java.util.function.BooleanSupplier);" in integrated_tick
+                and "Options.renderDistance" in integrated_tick
+                and "Options.simulationDistance" in integrated_tick
+                and "Math.max" in integrated_tick
+                and "PlayerList.setViewDistance" in integrated_tick
+                and "PlayerList.setSimulationDistance" in integrated_tick
+                and "pop" not in integrated_tick[
+                    integrated_tick.find("Options.renderDistance"):integrated_tick.find("Options.simulationDistance")
+                ]
+                and "pop" not in integrated_tick[
+                    integrated_tick.find("Options.simulationDistance"):integrated_tick.find("Options.simulationDistance") + 500
+                ]
+            ),
         ),
         (
             "PlayerList distance getters return configured server distances",
@@ -8853,14 +10000,28 @@ def check_overlay_bytecode() -> None:
         ),
         (
             "PersistentEntitySectionManager recovers duplicate browser entity UUIDs",
-            "private boolean addEntityUuid(T);" in entity_uuid_add
-            and "java/util/Set.add" in entity_uuid_add
-            and "net/minecraft/world/entity/Entity" in entity_uuid_add
-            and "net/minecraft/util/Mth.createInsecureUUID" in entity_uuid_add
-            and "net/minecraft/world/entity/Entity.setUUID" in entity_uuid_add
-            and "server.entityUuidRecovered" in entity_uuid_add
-            and "bipush        8" in entity_uuid_add
-            and "UUID of added entity already exists: {}" in entity_uuid_add,
+            (
+                is_current_named
+                and "private boolean addEntityUuid(T);" in entity_uuid_add
+                and "java/util/Set.add" in entity_uuid_add
+                and "net/minecraft/world/entity/Entity" in entity_uuid_add
+                and "java/util/UUID.randomUUID:()Ljava/util/UUID;" in entity_uuid_add
+                and "net/minecraft/world/entity/Entity.setUUID" in entity_uuid_add
+                and "server.entityUuidRecovered" in entity_uuid_add
+                and "bipush        8" in entity_uuid_add
+                and "UUID of added entity already exists: {}" in entity_uuid_add
+            )
+            or (
+                not is_current_named
+                and "private boolean addEntityUuid(T);" in entity_uuid_add
+                and "java/util/Set.add" in entity_uuid_add
+                and "net/minecraft/world/entity/Entity" in entity_uuid_add
+                and "net/minecraft/util/Mth.createInsecureUUID" in entity_uuid_add
+                and "net/minecraft/world/entity/Entity.setUUID" in entity_uuid_add
+                and "server.entityUuidRecovered" in entity_uuid_add
+                and "bipush        8" in entity_uuid_add
+                and "UUID of added entity already exists: {}" in entity_uuid_add
+            ),
         ),
         (
             "MinecraftServer resets browser tick catchup before overload warning",
@@ -9059,10 +10220,19 @@ def check_overlay_bytecode() -> None:
         ),
         (
             "ChunkGeneratorStructureState keeps ring candidates without blocking biome searches",
-            "private net.minecraft.world.level.ChunkPos lambda$generateRingPositions$5" in browser_ring_position
-            and "net/minecraft/world/level/ChunkPos.\"<init>\":(II)V" in browser_ring_position
-            and "BiomeSource.findBiomeHorizontal" not in browser_ring_position
-            and "Climate$Sampler" not in browser_ring_position,
+            (
+                (
+                    "private net.minecraft.world.level.ChunkPos lambda$generateRingPositions$0"
+                    in browser_ring_position
+                    if is_current_named
+                    else "private net.minecraft.world.level.ChunkPos lambda$generateRingPositions$5"
+                    in browser_ring_position
+                )
+                and "net/minecraft/world/level/ChunkPos.\"<init>\":(II)V"
+                    in browser_ring_position
+                and "BiomeSource.findBiomeHorizontal" not in browser_ring_position
+                and "Climate$Sampler" not in browser_ring_position
+            ),
         ),
         (
             "BlockPos packed coordinate bytecode delegates without long helper operations",
@@ -9252,9 +10422,28 @@ def check_overlay_bytecode() -> None:
                 in surface_context_update_y
             and "dev/gaius/browser/BrowserSurfaceBiomeSupplier.reset:(III)V"
                 in surface_context_update_y
-            and "Field biome:Ljava/util/function/Supplier;" in surface_context_update_y
-            and "com/google/common/base/Suppliers.memoize" not in surface_context_update_y
-            and "InvokeDynamic" not in surface_context_update_y,
+            and (
+                (
+                    is_current_named
+                    and "Field biome:Lnet/minecraft/core/Holder;"
+                        in surface_context_update_y
+                    and "Field browserBiomeSupplier:Ldev/gaius/browser/BrowserSurfaceBiomeSupplier;"
+                        in surface_context_get_biome
+                    and "dev/gaius/browser/BrowserSurfaceBiomeSupplier.get:()Lnet/minecraft/core/Holder;"
+                        in surface_context_get_biome
+                    and surface_context_get_biome.count(
+                        "Field biome:Lnet/minecraft/core/Holder;"
+                    ) >= 3
+                )
+                or (
+                    not is_current_named
+                    and "Field biome:Ljava/util/function/Supplier;"
+                        in surface_context_update_y
+                )
+            )
+            and "com/google/common/base/Suppliers.memoize"
+                not in surface_context_update_y + surface_context_get_biome
+            and "InvokeDynamic" not in surface_context_update_y + surface_context_get_biome,
         ),
         (
             "Surface lazy conditions cache primitive results with int generation counters",
@@ -9317,6 +10506,14 @@ def check_overlay_bytecode() -> None:
             and "StructureManager.shouldGenerateStructures" in chunk_apply_biome_decoration,
         ),
         (
+            "Structure generation and reference scans yield inside synchronous loops",
+            chunk_create_structures_lambda.count("BrowserWorldgenScheduler.pulse") >= 2
+            and "Method tryGenerateStructure" in chunk_create_structures_lambda
+            and chunk_create_references.count("BrowserWorldgenScheduler.pulse") >= 2
+            and "WorldGenLevel.getChunk" in chunk_create_references
+            and "StructureManager.addReferenceForStructure" in chunk_create_references,
+        ),
+        (
             "World carvers retain browser hook coverage while preserving block carving",
             world_carve_ellipsoid.count("BrowserWorldgenScheduler.pulse") >= 1
             and "Method carveBlock" in world_carve_ellipsoid
@@ -9337,10 +10534,42 @@ def check_overlay_bytecode() -> None:
             and "PalettedContainer.getAndSetUnchecked" in section_fill_biomes,
         ),
         (
-            "ChunkGenerationTask keeps layer claims synchronous to avoid dependency stalls",
+            "ChunkGenerationTask keeps layer claims synchronous with bounded cooperative scans",
             "BrowserWorldgenScheduler.checkpoint" not in generation_run_until_wait
-            and "BrowserWorldgenScheduler.pulse" not in generation_run_until_wait
-            and "Method scheduleNextLayer:()V" in generation_run_until_wait,
+            and "Method scheduleNextLayer:()V" in generation_run_until_wait
+            and (
+                (
+                    is_current_named
+                    and generation_run_until_wait.count(
+                        "BrowserWorldgenScheduler.pulse"
+                    ) == 1
+                    and generation_schedule_layer.count(
+                        "BrowserWorldgenScheduler.pulse"
+                    ) == 2
+                    and generation_can_load_without_generation.count(
+                        "BrowserWorldgenScheduler.pulse"
+                    ) == 2
+                    and "BrowserWorldgenScheduler.checkpoint"
+                        not in generation_schedule_layer
+                    and "BrowserWorldgenScheduler.checkpoint"
+                        not in generation_can_load_without_generation
+                )
+                or (
+                    not is_current_named
+                    and "BrowserWorldgenScheduler.pulse"
+                        not in generation_run_until_wait
+                )
+            ),
+        ),
+        (
+            "Current browser RegionFileStorage bounds and closes its LRU cache",
+            not is_current_named
+            or (
+                "bipush        16" in region_get_file
+                and "sipush        256" not in region_get_file
+                and "Long2ObjectLinkedOpenHashMap.removeLast" in region_get_file
+                and "RegionFile.close" in region_get_file
+            ),
         ),
         (
             "Browser ChunkTaskDispatcher preserves executor-future queue isolation",
@@ -9371,38 +10600,46 @@ def check_overlay_bytecode() -> None:
         ),
         (
             "Legacy renderLevel updates the shared block target after refreshing its camera",
-            not is_current_named
-            and legacy_game_render_level is not None
-            and "Method pick:(F)V" in legacy_game_render_level
-            and "Method extractCamera:(F)V" in legacy_game_render_level
-            and "BrowserTargeting.stabilizeBlockHit" in legacy_game_render_level
-            and "Minecraft.hitResult" in legacy_game_render_level
-            and "Method shouldRenderBlockOutline:()Z" in legacy_game_render_level
-            and legacy_game_render_level.find("Method pick:(F)V")
-                < legacy_game_render_level.find("Method shouldRenderBlockOutline:()Z")
-            and legacy_game_render_level.find("Method shouldRenderBlockOutline:()Z")
-                < legacy_game_render_level.find("Method extractCamera:(F)V")
-            and legacy_game_render_level.find("Method extractCamera:(F)V")
-                < legacy_game_render_level.find("BrowserTargeting.stabilizeBlockHit"),
+            is_current_named
+            or (
+                legacy_game_render_level is not None
+                and "Method pick:(F)V" in legacy_game_render_level
+                and "Method extractCamera:(F)V" in legacy_game_render_level
+                and "BrowserTargeting.stabilizeBlockHit" in legacy_game_render_level
+                and "Minecraft.hitResult" in legacy_game_render_level
+                and "Method shouldRenderBlockOutline:()Z" in legacy_game_render_level
+                and legacy_game_render_level.find("Method pick:(F)V")
+                    < legacy_game_render_level.find("Method shouldRenderBlockOutline:()Z")
+                and legacy_game_render_level.find("Method shouldRenderBlockOutline:()Z")
+                    < legacy_game_render_level.find("Method extractCamera:(F)V")
+                and legacy_game_render_level.find("Method extractCamera:(F)V")
+                    < legacy_game_render_level.find("BrowserTargeting.stabilizeBlockHit")
+            ),
         ),
         (
-            "Current named renderFrame updates, picks, then extracts",
+            "Current named renderFrame defers its one pick until camera extraction",
             is_current_named
             and minecraft_render_frame is not None
             and current_game_renderer_extract is not None
-            and current_render_frame_contract,
+            and current_render_frame_contract
+            and "Method pick:(F)V" not in minecraft_render_frame,
         ),
         (
-            "Current named GameRenderer only observes vanilla pick telemetry",
+            "Current named GameRenderer refreshes targeting after its render camera",
             is_current_named
             and current_game_renderer_extract is not None
             and re.findall(
                 r"BrowserTargeting\.([A-Za-z0-9_$]+)",
                 game_renderer,
-            ) == ["observeVanillaPick"]
-            and game_renderer.count("BrowserTargeting.observeVanillaPick") == 1
-            and current_game_renderer_extract.count("BrowserTargeting.observeVanillaPick") == 1
-            and "BrowserTargeting.stabilizeBlockHit" not in game_renderer
+            ) == ["refreshFramePick"]
+            and game_renderer.count("BrowserTargeting.refreshFramePick") == 1
+            and current_game_renderer_extract.count("BrowserTargeting.refreshFramePick") == 1
+            and current_game_renderer_extract.find("Method extractCamera:")
+                < current_game_renderer_extract.find("BrowserTargeting.refreshFramePick")
+            and current_game_renderer_extract.find("BrowserTargeting.refreshFramePick")
+                < current_game_renderer_extract.find("LevelExtractor.extract")
+            and re.search(r"fload\s+5", current_targeting_bridge) is not None
+            and re.search(r"fload\s+6", current_targeting_bridge) is None
             and "raycastHitResult" not in game_renderer,
         ),
         (
@@ -9411,10 +10648,12 @@ def check_overlay_bytecode() -> None:
         ),
         (
             "Legacy CompileTaskDynamicQueue remains profile-resolvable",
-            not is_current_named
-            and legacy_compile_task_queue is not None
-            and "class net.minecraft.client.renderer.chunk.CompileTaskDynamicQueue"
-                in legacy_compile_task_queue,
+            is_current_named
+            or (
+                legacy_compile_task_queue is not None
+                and "class net.minecraft.client.renderer.chunk.CompileTaskDynamicQueue"
+                    in legacy_compile_task_queue
+            ),
         ),
         (
             "Compiled browser targeting uses live camera angles without a stale-hit cache",
@@ -9523,9 +10762,20 @@ def check_overlay_bytecode() -> None:
         ),
         (
             "LevelLoadTracker compiled overlay times out missing loading packets quickly",
-            "ldc2_w        #156                // long 5l" in level_load_tracker_clinit
-            and "Timed out while waiting for initial level loading packets in the browser" in waiting_for_server_tick
-            and "loadingPacketsReceived" in waiting_for_server_tick,
+            (
+                is_current_named
+                and "long 5l" in level_load_tracker_clinit
+                and "Timed out while waiting for initial level loading packets in the browser"
+                    in waiting_for_server_tick
+                and "loadingPacketsReceived" in waiting_for_server_tick
+            )
+            or (
+                not is_current_named
+                and "ldc2_w        #156                // long 5l" in level_load_tracker_clinit
+                and "Timed out while waiting for initial level loading packets in the browser"
+                    in waiting_for_server_tick
+                and "loadingPacketsReceived" in waiting_for_server_tick
+            ),
         ),
         (
             "LevelLoadTracker compiled overlay lets loading screen close on browser timeout",
@@ -9538,7 +10788,14 @@ def check_overlay_bytecode() -> None:
             "ClientPacketListener compiled overlay exits loading when level exists",
             "client.levelReady.playerPresentFallback" in client_packet_tick
             and "client.levelReady.closeLoadingScreen" in client_packet_tick
-            and "Minecraft.screen" in client_packet_tick
+            and (
+                "Minecraft.screen" in client_packet_tick
+                or (
+                    is_current_named
+                    and "Minecraft.gaius$getScreen" in client_packet_tick
+                    and "Minecraft.gaius$setScreen" in client_packet_tick
+                )
+            )
             and "LevelLoadingScreen" in client_packet_tick
             and "notifyPlayerLoaded" in client_packet_tick,
         ),

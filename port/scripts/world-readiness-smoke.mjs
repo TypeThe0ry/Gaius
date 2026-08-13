@@ -61,6 +61,15 @@ const frozenCounter = readyFrames(30).map((frame) => ({
 }));
 assert.equal(summarizeWorldReadiness(frozenCounter, rules).verdict, "pending");
 
+const jumpedCounter = readyFrames(3).map((frame, index) => ({
+  ...frame,
+  at: index * 250,
+  stateAt: index * 250,
+  visibleFrameCount: index === 0 ? 1 : index * 100,
+}));
+assert.equal(summarizeWorldReadiness(jumpedCounter, rules).verdict, "pending",
+  "one observation must not stand in for hundreds of unobserved frames");
+
 console.log(JSON.stringify({
   passed: true,
   valid: valid.verdict,
@@ -68,4 +77,5 @@ console.log(JSON.stringify({
   stalled: summarizeWorldReadiness(stalled, rules).verdict,
   blackFrame: summarizeWorldReadiness(blackFrame, rules).verdict,
   frozenCounter: summarizeWorldReadiness(frozenCounter, rules).verdict,
+  jumpedCounter: summarizeWorldReadiness(jumpedCounter, rules).verdict,
 }, null, 2));

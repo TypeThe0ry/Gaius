@@ -18,6 +18,19 @@ assert.ok(markerOffset > 0 && annotationOffset > 0 && scriptEnd > scriptOffset,
   "Browser bridge JSBody could not be extracted");
 
 const bridgeScript = source.slice(scriptOffset, scriptEnd).replaceAll("\\\\", "\\");
+const outboundMarker = "private static native void initOutboundScheduler();";
+const outboundMarkerOffset = source.indexOf(outboundMarker);
+const outboundAnnotationOffset = source.lastIndexOf(
+  '@JSBody(script = """',
+  outboundMarkerOffset,
+);
+const outboundScriptOffset = source.indexOf('"""', outboundAnnotationOffset) + 3;
+const outboundScriptEnd = source.lastIndexOf('""")', outboundMarkerOffset);
+assert.ok(outboundMarkerOffset > 0 && outboundAnnotationOffset > 0
+    && outboundScriptEnd > outboundScriptOffset,
+"Browser outbound scheduler JSBody could not be extracted");
+const outboundSchedulerScript = source.slice(outboundScriptOffset, outboundScriptEnd)
+  .replaceAll("\\\\", "\\");
 const sessionA = "0123456789abcdef0123456789abcdef";
 const sessionB = "1123456789abcdef0123456789abcdef";
 const sessionC = "2123456789abcdef0123456789abcdef";
@@ -71,6 +84,7 @@ function createRuntime() {
   context.globalThis = context;
   context.window = context;
   vm.runInNewContext(`(function() {${bridgeScript}\n})();`, context);
+  vm.runInNewContext(`(function() {${outboundSchedulerScript}\n})();`, context);
   return context;
 }
 

@@ -87,12 +87,17 @@ class MockBufferSource extends MockNode {
     this.stopped = false;
   }
 
-  start(when) {
+  start(when, offset = 0) {
     this.startedAt = when;
+    this.startedOffset = offset;
   }
 
   stop() {
     this.stopped = true;
+  }
+
+  finish() {
+    if (typeof this.onended === "function") this.onended();
   }
 }
 
@@ -203,6 +208,22 @@ const unqueueBuffer = compileFunction(
   "private static native int sourceUnqueueBufferJs(int source);",
   ["source"]
 );
+const queueBuffer = compileFunction(
+  "private static native void sourceQueueBufferJs(int source, int buffer);",
+  ["source", "buffer"]
+);
+const playSource = compileFunction(
+  "private static native void sourcePlayJs(int source);",
+  ["source"]
+);
+const pauseSource = compileFunction(
+  "private static native void sourcePauseJs(int source);",
+  ["source"]
+);
+const stopSource = compileFunction(
+  "private static native void sourceStopJs(int source);",
+  ["source"]
+);
 const cleanup = compileFunction(
   "public static native void cleanup();",
   []
@@ -210,6 +231,9 @@ const cleanup = compileFunction(
 
 listener3f(0x1004, 12, 3, -7);
 listenerOrientation(0, 0, -4, 0, 2, 0);
+const listenerPositionIdentity = state.listener.position;
+const listenerForwardIdentity = state.listener.forward;
+const listenerNormalizedForwardIdentity = state.listener.normalizedForward;
 assert.deepEqual(
   [
     state.context.listener.positionX.value,
@@ -239,6 +263,9 @@ source.queue.push(7);
 state.scheduleBuffer(source, 7, 0, false);
 assert.ok(source.panner, "world source did not get a PannerNode");
 const scheduled = source.scheduled.at(-1).node;
+const sourcePositionIdentity = source.position;
+const sourceDirectionIdentity = source.direction;
+const sourceNormalizedDirectionIdentity = source.normalizedDirection;
 
 source3f(1, 0x1004, 8, 4, -2);
 source3f(1, 0x1005, 4, 0, 0);
@@ -258,6 +285,25 @@ assert.deepEqual(
 assert.equal(source.panner.refDistance, 2);
 assert.equal(source.panner.rolloffFactor, 0.75);
 assert.equal(source.panner.maxDistance, 32);
+
+for (let index = 0; index < 1_000; index++) {
+  source3f(1, 0x1004, index, index + 1, index + 2);
+  source3f(1, 0x1005, index + 1, 1, -1);
+  listener3f(0x1004, -index, index, 3);
+  listenerOrientation(0, 0, -1, 0, 1, 0);
+}
+assert.strictEqual(source.position, sourcePositionIdentity,
+  "source position updates allocated replacement vectors");
+assert.strictEqual(source.direction, sourceDirectionIdentity,
+  "source direction updates allocated replacement vectors");
+assert.strictEqual(source.normalizedDirection, sourceNormalizedDirectionIdentity,
+  "source panner normalization allocated replacement vectors");
+assert.strictEqual(state.listener.position, listenerPositionIdentity,
+  "listener position updates allocated replacement vectors");
+assert.strictEqual(state.listener.forward, listenerForwardIdentity,
+  "listener orientation updates allocated replacement vectors");
+assert.strictEqual(state.listener.normalizedForward, listenerNormalizedForwardIdentity,
+  "listener normalization allocated replacement vectors");
 
 sourcei(1, 0xD000, 0xD004);
 assert.equal(source.panner.distanceModel, "linear", "source linear model was not mapped");
@@ -279,18 +325,120 @@ sourcei(2, 0xD000, 0xD003);
 distanceModel(0xD001);
 assert.equal(inherited.panner.distanceModel, "linear", "source model did not override global model");
 
+const oneShot = state.freshSource();
+state.sources.set(4, oneShot);
+oneShot.buffer = 7;
+oneShot.state = 0x1012;
+state.scheduleBuffer(oneShot, 7, 0, false);
+const oneShotEntry = oneShot.scheduled[0];
+const oneShotNode = oneShotEntry.node;
+oneShotNode.finish();
+assert.equal(oneShot.scheduled.length, 0,
+  "naturally ended one-shot audio retained a scheduled entry");
+assert.equal(oneShotEntry.node, null, "naturally ended one-shot retained its node");
+assert.equal(oneShotNode.stopped, false, "natural completion redundantly stopped the node");
+assert.equal(oneShotNode.disconnected, 1,
+  "naturally ended one-shot did not disconnect exactly once");
+assert.equal(oneShot.state, 0x1014, "naturally ended one-shot did not stop its AL source");
+
 const streaming = state.freshSource();
 state.sources.set(3, streaming);
 streaming.queue.push(7);
 state.context.currentTime = 30;
 state.scheduleBuffer(streaming, 7, 0, false);
 const streamedNode = streaming.scheduled[0].node;
+const streamedEntry = streaming.scheduled[0];
+streamedNode.finish();
+assert.equal(streaming.scheduled.length, 1,
+  "naturally ended queued buffer disappeared before AL unqueue");
+assert.equal(streamedEntry.ended, true, "queued buffer was not marked processed on end");
+assert.equal(streamedEntry.node, null, "processed queued buffer retained its Web Audio node");
+assert.equal(streamedNode.stopped, false, "natural queued completion redundantly stopped the node");
+assert.equal(streamedNode.disconnected, 1,
+  "processed queued buffer did not disconnect exactly once");
 state.context.currentTime = 32;
 assert.equal(unqueueBuffer(3), 7, "processed streaming buffer was not unqueued");
-assert.equal(streamedNode.stopped, true, "unqueued BufferSourceNode was not stopped");
 assert.equal(streamedNode.disconnected, 1, "unqueued BufferSourceNode was not disconnected once");
 assert.equal(streaming.scheduled.length, 0, "unqueued entry retained its scheduled node");
 assert.ok(streaming.panner && streaming.gainNode, "unqueue destroyed the reusable spatial graph");
+
+state.buffers.set(8, { audio: { duration: 0.5 } });
+const appendStream = state.freshSource();
+state.sources.set(5, appendStream);
+appendStream.queue.push(7);
+state.scheduleBuffer(appendStream, 7, 0, false);
+appendStream.state = 0x1012;
+state.setSourceActive(appendStream, true);
+const firstStreamEnd = appendStream.scheduled[0].endTime;
+queueBuffer(5, 8);
+assert.equal(appendStream.scheduled.length, 2,
+  "buffer queued during playback was not scheduled in Web Audio");
+assert.equal(appendStream.scheduled[1].node.startedAt, firstStreamEnd,
+  "streaming append did not preserve gapless queue timing");
+deleteSource(5);
+
+const activeOne = state.freshSource();
+const activeTwo = state.freshSource();
+activeOne.buffer = 7;
+activeTwo.buffer = 7;
+state.sources.set(6, activeOne);
+state.sources.set(7, activeTwo);
+playSource(6);
+playSource(7);
+assert.equal(state.stats.activeSources, 2,
+  "active source telemetry did not count concurrent sources");
+activeOne.scheduled[0].node.finish();
+assert.equal(state.stats.activeSources, 1,
+  "natural source completion did not decrement active source telemetry");
+deleteSource(7);
+deleteSource(6);
+assert.equal(state.stats.activeSources, 0,
+  "source deletion did not return active source telemetry to baseline");
+
+state.buffers.set(9, { audio: { duration: 10 } });
+const resumable = state.freshSource();
+resumable.buffer = 9;
+state.sources.set(8, resumable);
+state.context.currentTime = 40;
+playSource(8);
+state.context.currentTime = 42.5;
+pauseSource(8);
+assert.equal(resumable.state, 0x1013, "playing source did not enter AL_PAUSED");
+assert.ok(Math.abs(resumable.resumeOffset - 2.5) < 0.001,
+  "paused source did not retain its playback offset");
+state.context.currentTime = 50;
+playSource(8);
+assert.ok(Math.abs(resumable.scheduled[0].node.startedOffset - 2.5) < 0.001,
+  "resumed source restarted from the beginning");
+stopSource(8);
+assert.equal(resumable.resumeOffset, 0, "stopped source retained a resume offset");
+deleteSource(8);
+
+const resumableStream = state.freshSource();
+resumableStream.queue.push(9, 9);
+state.sources.set(9, resumableStream);
+state.context.currentTime = 60;
+playSource(9);
+state.context.currentTime = 72.5;
+pauseSource(9);
+assert.equal(resumableStream.resumeQueueIndex, 1,
+  "paused stream did not retain its active queue index");
+assert.ok(Math.abs(resumableStream.resumeOffset - 2.5) < 0.001,
+  "paused stream did not retain its active-buffer offset");
+state.context.currentTime = 80;
+playSource(9);
+assert.equal(resumableStream.scheduled.length, 2,
+  "resumed stream lost its processed queue entry");
+assert.equal(resumableStream.scheduled[0].ended, true,
+  "resumed stream did not preserve its processed prefix");
+assert.ok(Math.abs(resumableStream.scheduled[1].node.startedOffset - 2.5) < 0.001,
+  "resumed stream restarted its active buffer from the beginning");
+assert.equal(unqueueBuffer(9), 9,
+  "resumed stream could not unqueue its processed prefix");
+assert.equal(resumableStream.scheduled.length, 1,
+  "unqueue removed the resumed active stream entry");
+stopSource(9);
+deleteSource(9);
 
 const lifecycleIterations = 20_000;
 for (let index = 0; index < lifecycleIterations; index++) {
@@ -303,7 +451,7 @@ for (let index = 0; index < lifecycleIterations; index++) {
   assert.equal(transient.panner, null);
   assert.equal(transient.gainNode, null);
 }
-assert.equal(state.sources.size, 3, "transient OpenAL sources leaked into the registry");
+assert.equal(state.sources.size, 4, "transient OpenAL sources leaked into the registry");
 
 cleanup();
 assert.equal(state.sources.size, 0, "OpenAL source registry did not return to baseline");
@@ -341,6 +489,7 @@ console.log(JSON.stringify({
     nodesDisposed: state.stats.webAudioNodesDisposed,
     connections: state.stats.webAudioConnections,
     disconnects: state.stats.webAudioDisconnects,
+    naturalEnds: state.stats.webAudioNaturalEnds,
     sources: state.sources.size,
     buffers: state.buffers.size
   }

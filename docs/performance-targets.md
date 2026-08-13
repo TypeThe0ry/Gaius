@@ -49,6 +49,32 @@ resource preset, and whether the route crossed newly generated chunks. The raw
 frame-time series and telemetry snapshot are release artifacts; rounded summary
 numbers alone are not sufficient evidence.
 
+Uncapped FPS evidence has an additional runtime proof requirement. The report
+must contain at least two measured frame-pacing samples and a final snapshot
+with `swapInterval=0`, `uncappedYieldCount>0`, `fairYieldCount>0`,
+`vsyncYieldCount=0`, and `presentToRafCount=0`. The fair-yield counter proves
+that the uncapped loop periodically returns control to input, networking, and
+audio task sources instead of running an uninterrupted microtask chain.
+
+The scheduler health counters must also be present and remain zero throughout
+the measured window: `messageChannelCreateFailureCount`,
+`messageChannelPostFailureCount`, `messageChannelRebuildCount`,
+`cancelledMessageTaskCount`, and `watchdogYieldCount`. A nonzero health counter
+fails release evidence even when the FPS thresholds pass. A missing or null
+runtime field is `inconclusive`, never an implicit zero; in particular,
+`swapInterval=null` before the first real frame cannot satisfy uncapped
+evidence. `maxFps=Unlimited`, `enableVsync=false`, or a positive in-game FPS
+counter by themselves are configuration evidence only and cannot make a
+release run pass.
+
+Every benchmark failure writes a structured `failureEvidence` section. It
+includes the actual and required average FPS, 1% low, P99, longest frame,
+coverage, freeze count, and new-chunk traversal stall; the V8 heap trend,
+post-GC slope, plateau/leak signal, retained growth, peak, coverage, native
+memory and Chrome RSS verdicts; and the complete client/Worker/Wasm
+`buildIdentity`. This keeps a failed run diagnosable even when Chrome crashes
+before the normal analysis section is produced.
+
 ## Release Targets
 
 These are the acceptance targets for a desktop-class Chrome machine. They are
@@ -57,8 +83,8 @@ will hit the same absolute FPS.
 
 | Scenario | Configuration | Target |
 | --- | --- | --- |
-| Steady local world | 6 render / 4 simulation | Average >= 120 FPS, 1% low >= 60 FPS, zero freezes, and no frame over 150 ms after warm-up. |
-| New-chunk traversal | 6 render / 4 simulation | Average >= 120 FPS, 1% low >= 60 FPS, zero >= 500 ms freezes, and no unbounded Worker, decode, compile, or upload backlog. |
+| Steady local world | 6 render / 4 simulation | Average >= 120 FPS, 1% low >= 60 FPS, P99 <= 16.7 ms, longest frame <= 50 ms, and zero freezes after warm-up. |
+| New-chunk traversal | 6 render / 4 simulation | Average >= 120 FPS, 1% low >= 60 FPS, P99 <= 16.7 ms, longest frame <= 50 ms, zero >= 500 ms freezes, and no traversal stall over 10 seconds. |
 | Higher visual range | 8 render / 4 simulation | 1% low >= 45 FPS, P99 <= 22.2 ms, no frame over 200 ms. |
 | Stress range | 12 render / 4 simulation | 1% low >= 30 FPS, P99 <= 33.3 ms, no persistent queue growth. |
 | New single-player world | default 6 / 4 | Initial interactive terrain within 15 seconds on the reference machine; no browser unresponsive event. |
@@ -137,6 +163,11 @@ report for slower-growth review.
 When explicit GC is unavailable, the report must mark the heap verdict as
 `inconclusive` instead of claiming a pass. Crash, OOM, queue, context-loss, and
 heartbeat gates still apply.
+
+The report labels a non-leaking stable post-GC trend as a `plateau` only when
+its measured slope is within the contract's plateau bound. A plateau is
+diagnostic evidence, not permission to ignore an absolute peak, native-memory
+failure, RSS growth, or incomplete sample coverage.
 
 ## Required Scenarios
 

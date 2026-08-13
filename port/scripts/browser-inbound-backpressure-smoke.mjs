@@ -23,14 +23,19 @@ function jsBodyBefore(marker) {
 assert.match(source, /maximumInboundSliceBytes = 64 \* 1024/);
 assert.match(source, /decodedSliceHighWatermark = 256/);
 assert.match(source, /decodedSliceLowWatermark = 64/);
+assert.match(source, /decoderCumulationPauseBytes = 12 \* 1024 \* 1024/);
+assert.match(source, /maximumDecoderCumulationBytes = 16 \* 1024 \* 1024/);
 assert.match(source, /MAX_MILLIS_PER_PUMP = 2\.0/);
 
 const bridgeScript = jsBodyBefore("private static native void initBridge();");
+const outboundSchedulerScript = jsBodyBefore(
+  "private static native void initOutboundScheduler();",
+);
 const schedulerScript = jsBodyBefore("private static native void initInboundScheduler();");
 const sessionId = "5123456789abcdef0123456789abcdef";
 const socketId = 91;
-const frameBytes = 16 * 1024 * 1024;
-const sliceBytes = 64 * 1024;
+const frameBytes = 8 * 1024 * 1024;
+const wireSliceBytes = 16 * 1024;
 const flowControls = [];
 const callbackDurations = [];
 
@@ -102,6 +107,7 @@ const context = {
 context.globalThis = context;
 context.window = context;
 vm.runInNewContext(`(function() {${bridgeScript}\n})();`, context);
+vm.runInNewContext(`(function() {${outboundSchedulerScript}\n})();`, context);
 vm.runInNewContext(`(function() {${schedulerScript}\n})();`, context);
 
 const bridge = context.__gaiusNettyBridge;
@@ -113,70 +119,114 @@ port2.on("message", (message) => {
 context.__gaiusLocalServerPorts.set(sessionId, port1);
 bridge.open(socketId, `client-${sessionId}.gaius-local`, 25565);
 
-let frame = new Uint8Array(frameBytes);
-for (let index = 0; index < frame.length; index++) {
-  frame[index] = (index * 31 + 7) & 0xff;
+for (let offset = 0; offset < frameBytes; offset += wireSliceBytes) {
+  const fragment = new Uint8Array(wireSliceBytes);
+  for (let index = 0; index < fragment.length; index++) {
+    fragment[index] = ((offset + index) * 31 + 7) & 0xff;
+  }
+  port2.postMessage(fragment.buffer, [fragment.buffer]);
 }
-port2.postMessage(frame.buffer, [frame.buffer]);
-frame = null;
 
+await waitFor(() => stats.receivedFrames === frameBytes / wireSliceBytes,
+  "all 8 MiB protocol-frame fragments");
 await waitFor(() => stats.maxInboundSliceQueue === 256, "256-slice high watermark");
 await waitFor(() => flowControls.some((message) => message.paused === true),
   "transport pause control");
 assert.equal(stats.peakInboundQueuedBytes, frameBytes,
-  "16 MiB first frame was not accounted once");
+  "8 MiB protocol frame was not accounted once");
 assert.ok(stats.inboundQueuedBytes <= frameBytes,
   "transport queue grew beyond the received first frame");
 
 let receivedBytes = 0;
 let receivedSlices = 0;
-let decodedPacketDepth = 0;
-let decodedPacketPaused = false;
+let pumpTurns = 0;
+let maxTurnChunks = 0;
+let maxTurnBytes = 0;
+const frameDeadline = Date.now() + 10_000;
 while (receivedBytes < frameBytes) {
-  const chunk = bridge.pollInbound(socketId);
-  if (!chunk) {
-    await delay(0);
-    continue;
+  assert.ok(Date.now() < frameDeadline,
+    `8 MiB protocol frame stalled after ${receivedSlices} slices`);
+  const turnStartedAt = performance.now();
+  let turnChunks = 0;
+  let turnBytes = 0;
+  while (turnChunks < 16 && turnBytes < 1024 * 1024) {
+    if (turnChunks > 0 && performance.now() - turnStartedAt >= 2) break;
+    const chunk = bridge.pollInbound(socketId);
+    if (!chunk) break;
+    assert.equal(chunk.byteLength, wireSliceBytes,
+      `protocol fragment was not ${wireSliceBytes} bytes`);
+    const firstAbsolute = receivedBytes;
+    const middleAbsolute = receivedBytes + (chunk.byteLength >>> 1);
+    const lastAbsolute = receivedBytes + chunk.byteLength - 1;
+    assert.equal(chunk[0] & 0xff, (firstAbsolute * 31 + 7) & 0xff,
+      `TCP byte order changed at offset ${firstAbsolute}`);
+    assert.equal(chunk[chunk.byteLength >>> 1] & 0xff,
+      (middleAbsolute * 31 + 7) & 0xff,
+      `TCP byte order changed at offset ${middleAbsolute}`);
+    assert.equal(chunk[chunk.byteLength - 1] & 0xff,
+      (lastAbsolute * 31 + 7) & 0xff,
+      `TCP byte order changed at offset ${lastAbsolute}`);
+    bridge.recordDecodedSlice(socketId, chunk.byteLength);
+    receivedBytes += chunk.byteLength;
+    receivedSlices++;
+    turnChunks++;
+    turnBytes += chunk.byteLength;
+    if (receivedBytes === frameBytes) {
+      // This is one protocol packet. No decoded-packet credit exists before its final slice.
+      bridge.recordDecodedPacketQueue(1, false, false);
+    }
+    bridge.finishDecodedSlice(socketId);
   }
-  assert.ok(chunk.byteLength > 0 && chunk.byteLength <= sliceBytes,
-    `inbound slice exceeded 64 KiB: ${chunk.byteLength}`);
-  for (let index = 0; index < chunk.byteLength; index++) {
-    const absolute = receivedBytes + index;
-    assert.equal(chunk[index] & 0xff, (absolute * 31 + 7) & 0xff,
-      `TCP byte order changed at offset ${absolute}`);
+  if (turnChunks > 0) {
+    const turnMillis = Math.max(0, performance.now() - turnStartedAt);
+    bridge.recordPump(socketId, turnChunks, turnBytes, turnMillis);
+    pumpTurns++;
+    maxTurnChunks = Math.max(maxTurnChunks, turnChunks);
+    maxTurnBytes = Math.max(maxTurnBytes, turnBytes);
   }
-  receivedBytes += chunk.byteLength;
-  receivedSlices++;
-  bridge.recordDecodedSlice(socketId);
-  decodedPacketDepth++;
-  if (decodedPacketDepth >= 256) decodedPacketPaused = true;
-  bridge.recordDecodedPacketQueue(decodedPacketDepth, decodedPacketPaused, false);
+  await delay(0);
 }
 
-assert.equal(receivedBytes, frameBytes, "16 MiB first frame lost bytes");
-assert.equal(receivedSlices, frameBytes / sliceBytes,
-  "16 MiB first frame did not produce exactly 64 KiB slices");
-assert.equal(stats.maxDecodedSliceBacklog, 256,
-  "decoded-slice backlog did not reach its bounded high watermark");
-assert.equal(stats.decodedSliceBacklog, 256,
-  "decoded-slice accounting diverged before packet drain");
+assert.equal(receivedBytes, frameBytes, "8 MiB protocol frame lost bytes");
+assert.equal(receivedSlices, 512,
+  "8 MiB protocol frame did not produce 512 16 KiB fragments");
+assert.ok(pumpTurns >= 32, "8 MiB frame bypassed bounded 16-slice event-loop turns");
+assert.ok(maxTurnChunks <= 16, "an inbound event-loop turn exceeded 16 slices");
+assert.ok(maxTurnBytes <= 1024 * 1024, "an inbound event-loop turn exceeded 1 MiB");
+assert.equal(stats.maxDecodedSliceBacklog, 1,
+  "raw-slice ownership survived beyond a synchronous decoder handoff");
+assert.equal(stats.decodedSliceBacklog, 0,
+  "raw-slice ownership remained after the decoder handoff returned");
+assert.equal(stats.maxDecoderCumulationBytes, frameBytes,
+  "decoder cumulation did not account the complete 8 MiB protocol frame");
+assert.ok(stats.decoderCumulationBytes <= wireSliceBytes,
+  "decoded packet retained more than the conservative active-slice tail");
+bridge.recordDecodedPacketQueue(0, false, true);
+await waitFor(() => flowControls.some((message) => message.paused === false),
+  "fragmented packet transport resume");
+assert.equal(stats.decodedSliceBacklog, 0,
+  "one fragmented packet retained raw-slice ownership");
+
+const mergedPayload = new Uint8Array(4096);
+const mergedExpectedFrames = stats.receivedFrames + 1;
+port2.postMessage(mergedPayload.buffer, [mergedPayload.buffer]);
+await waitFor(() => stats.receivedFrames === mergedExpectedFrames, "merged packet frame");
+let mergedChunk;
+await waitFor(() => (mergedChunk = bridge.pollInbound(socketId)) !== null,
+  "merged packet slice");
+assert.equal(mergedChunk.byteLength, 4096);
+bridge.recordDecodedSlice(socketId, mergedChunk.byteLength);
+bridge.recordDecodedPacketQueue(256, true, false);
+bridge.finishDecodedSlice(socketId);
+for (let depth = 255; depth >= 0; depth--) {
+  bridge.recordDecodedPacketQueue(depth, depth > 64, true);
+}
+await waitFor(() => flowControls.filter((message) => message.paused === false).length >= 2,
+  "merged packet transport resume");
+assert.equal(stats.decodedSliceBacklog, 0,
+  "coalesced packets created synthetic decoded-slice debt");
 assert.equal(stats.maxDecodedPacketQueue, 256,
   "exact decoded-packet queue did not reach its high watermark");
-
-for (let index = 0; index < 192; index++) {
-  decodedPacketDepth--;
-  if (decodedPacketDepth <= 64) decodedPacketPaused = false;
-  bridge.recordDecodedPacketQueue(decodedPacketDepth, decodedPacketPaused, true);
-}
-await waitFor(() => flowControls.some((message) => message.paused === false),
-  "transport resume control at low watermark");
-assert.equal(stats.decodedSliceBacklog, 64,
-  "decoded-slice backlog did not resume at the configured low watermark");
-for (let index = 0; index < 64; index++) {
-  decodedPacketDepth--;
-  bridge.recordDecodedPacketQueue(decodedPacketDepth, false, true);
-}
-assert.equal(stats.decodedSliceBacklog, 0, "decoded-slice backlog did not drain to zero");
 assert.equal(stats.decodedPacketQueue, 0, "exact decoded-packet queue did not drain to zero");
 
 const quickCycles = 180;
@@ -197,8 +247,9 @@ do {
     "sustained inbound slice");
   assert.equal(chunk.byteLength, 4096);
   assert.equal(chunk[0] & 0xff, cycles & 0xff);
-  bridge.recordDecodedSlice(socketId);
+  bridge.recordDecodedSlice(socketId, chunk.byteLength);
   bridge.recordDecodedPacketQueue(1, false, false);
+  bridge.finishDecodedSlice(socketId);
   bridge.recordDecodedPacketQueue(0, false, true);
   assert.equal(stats.inboundQueuedBytes, 0,
     "sustained transport cycle left queued bytes behind");
@@ -230,17 +281,24 @@ assert.equal(stats.inboundQueuedBytes, 0, "transport byte queue did not drain to
 assert.ok(stats.maxInboundSliceQueue <= 256, "slice queue exceeded its hard high watermark");
 assert.ok(stats.maxDecodedSliceBacklog <= 256,
   "decoded-slice backlog exceeded its hard high watermark");
+assert.ok(stats.maxDecoderCumulationBytes <= stats.decoderCumulationLimitBytes,
+  "decoder cumulation exceeded its 16 MiB hard limit");
 assert.ok(stats.maxDecodedPacketQueue <= 256,
   "exact decoded-packet queue exceeded its hard high watermark");
 assert.ok(stats.decodedSliceBacklogPauses >= 1 &&
   stats.decodedSliceBacklogResumes >= 1,
   "decoded-slice backpressure did not complete a pause/resume cycle");
-assert.ok(stats.decodedPacketDrainSignals >= 256,
+assert.ok(stats.decodedPacketDrainSignals >= 257,
   "actual PacketProcessor drain signals did not retire decoded-slice debt");
 assert.equal(stats.decodedPacketQueuePauses, 1,
   "exact decoded-packet queue did not pause once at 256");
 assert.equal(stats.decodedPacketQueueResumes, 1,
   "exact decoded-packet queue did not resume once at 64");
+assert.equal(entry.flowPaused, false, "transport remained flow-paused after the large packet");
+assert.equal(entry.decodeFlowPaused, false,
+  "decoder flow state remained paused after the large packet");
+assert.equal(bridge.exactPacketQueuePaused, false,
+  "decoded-packet queue remained paused after drain");
 assert.equal(stats.activeHighWatermarks, 0, "high watermark remained active after drain");
 assert.ok(stats.highWatermarkDurationMillis > 0,
   "high watermark duration telemetry was not recorded");
@@ -272,9 +330,14 @@ await delay(20);
 console.log(JSON.stringify({
   ok: true,
   firstFrameBytes: receivedBytes,
+  firstFrameSlices: receivedSlices,
+  firstFramePumpTurns: pumpTurns,
+  maxFirstFrameTurnChunks: maxTurnChunks,
+  maxFirstFrameTurnBytes: maxTurnBytes,
   inboundSlices: stats.inboundSlices,
   maxInboundSliceQueue: stats.maxInboundSliceQueue,
   maxDecodedSliceBacklog: stats.maxDecodedSliceBacklog,
+  maxDecoderCumulationBytes: stats.maxDecoderCumulationBytes,
   maxDecodedPacketQueue: stats.maxDecodedPacketQueue,
   decodedSliceBacklogPauses: stats.decodedSliceBacklogPauses,
   decodedSliceBacklogResumes: stats.decodedSliceBacklogResumes,

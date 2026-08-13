@@ -26,6 +26,7 @@ const [
   workerBootstrap,
   patcher,
   benchmark,
+  performanceMetrics,
   performanceContract,
 ] = await Promise.all([
   source("../src/main/java/dev/gaius/browser/BrowserRenderScheduler.java"),
@@ -34,6 +35,7 @@ const [
   source("../web/singleplayer/server-worker-bootstrap.js"),
   source("../tools/src/main/java/dev/gaius/tools/MinecraftClientPatcher.java"),
   source("./chrome-chunk-benchmark.mjs"),
+  source("./performance-metrics.mjs"),
   source("./performance-contract.json"),
 ]);
 
@@ -107,6 +109,12 @@ for (const contract of [
   "longestHeartbeatGapMillis",
   "configuredIntervalMillis",
   "longestHeartbeatDelayMillis",
+  "p95RttMillis",
+  "p99RttMillis",
+  "state.schemaVersion",
+  "state.measurementId",
+  "state.resetAt",
+  "state.rttSampleCount",
   "copyScalarTelemetry",
   "state.chunkPriority",
   "state.network",
@@ -179,13 +187,19 @@ for (const contract of [
   "profile frame-performance thresholds",
   "no contracted freeze signal",
   "queue high-water contract",
-  "Worker and MessagePort remain below 500 ms",
+  "Worker heartbeat satisfies p99 and maximum latency bounds",
   "post-GC memory trend",
   "gameplay block authority",
   "longestHeartbeatDelayMillis",
+  "p99RttMillis",
+  "validateWorkerHeartbeatTelemetry",
+  "expectedWorkerMeasurementId",
 ]) {
   assert.ok(benchmark.includes(contract), "missing benchmark acceptance contract: " + contract);
 }
+assert.ok(performanceMetrics.includes(
+  "Worker heartbeat telemetry does not belong to the current measurement window",
+), "missing current-window Worker heartbeat validator");
 const parsedPerformanceContract = JSON.parse(performanceContract);
 const newChunksProfile = parsedPerformanceContract.profiles["traversal-6-4"];
 assert.equal(newChunksProfile.warmupMs, 30_000, "new-chunk warmup must remain 30 seconds");

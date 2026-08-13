@@ -66,36 +66,41 @@ public final class LwjglOpenGLBrowserPatcher {
         Map<String, String> methods = new HashMap<>();
         add(methods, "GL", "setCapabilities", "(Lorg/lwjgl/opengl/GLCapabilities;)V", "setCapabilities");
         add(methods, "GL", "getCapabilities", "()Lorg/lwjgl/opengl/GLCapabilities;", "getCapabilities");
-        add(methods, "GL11", "glEnable", "(I)V", "enable");
-        add(methods, "GL11", "glDisable", "(I)V", "disable");
-        add(methods, "GL11", "glClearColor", "(FFFF)V", "clearColor");
-        add(methods, "GL11", "glClearDepth", "(D)V", "clearDepth");
-        add(methods, "GL11", "glClear", "(I)V", "clear");
-        add(methods, "GL11", "glColorMask", "(ZZZZ)V", "colorMask");
-        add(methods, "GL11", "glDepthFunc", "(I)V", "depthFunc");
-        add(methods, "GL11", "glDepthMask", "(Z)V", "depthMask");
-        add(methods, "GL11", "glDrawArrays", "(III)V", "drawArrays");
-        add(methods, "GL11", "glDrawElements", "(IIIJ)V", "drawElements");
-        add(methods, "GL11C", "glDrawArrays", "(III)V", "drawArrays");
-        add(methods, "GL11C", "glDrawElements", "(IIIJ)V", "drawElements");
-        add(methods, "GL11", "glGetError", "()I", "getError");
-        add(methods, "GL11", "glGetInteger", "(I)I", "getInteger");
-        add(methods, "GL11", "glGetFloat", "(I)F", "getFloat");
-        add(methods, "GL11", "glGetString", "(I)Ljava/lang/String;", "getString");
-        add(methods, "GL11", "glLogicOp", "(I)V", "logicOp");
-        add(methods, "GL11", "glPixelStorei", "(II)V", "pixelStorei");
-        add(methods, "GL11", "glPolygonMode", "(II)V", "polygonMode");
-        add(methods, "GL11", "glPolygonOffset", "(FF)V", "polygonOffset");
-        add(methods, "GL11", "glViewport", "(IIII)V", "viewport");
-        add(methods, "GL11", "glGenTextures", "()I", "genTexture");
-        add(methods, "GL11", "glDeleteTextures", "(I)V", "deleteTexture");
-        add(methods, "GL11", "glBindTexture", "(II)V", "bindTexture");
-        add(methods, "GL11C", "glBindTexture", "(II)V", "bindTexture");
-        add(methods, "GL11", "glTexParameteri", "(III)V", "texParameteri");
-        add(methods, "GL11", "glTexImage2D", "(IIIIIIIILjava/nio/ByteBuffer;)V", "texImage2D");
-        add(methods, "GL11", "glTexSubImage2D", "(IIIIIIIILjava/nio/ByteBuffer;)V", "texSubImage2D");
-        add(methods, "GL11", "glTexSubImage2D", "(IIIIIIIIJ)V", "texSubImage2D");
-        add(methods, "GL13", "glActiveTexture", "(I)V", "activeTexture");
+        for (String owner : new String[] {"GL11", "GL11C"}) {
+            add(methods, owner, "glEnable", "(I)V", "enable");
+            add(methods, owner, "glDisable", "(I)V", "disable");
+            add(methods, owner, "glClearColor", "(FFFF)V", "clearColor");
+            add(methods, owner, "glClearDepth", "(D)V", "clearDepth");
+            add(methods, owner, "glClear", "(I)V", "clear");
+            add(methods, owner, "glColorMask", "(ZZZZ)V", "colorMask");
+            add(methods, owner, "glDrawBuffer", "(I)V", "drawBuffer");
+            add(methods, owner, "glDepthFunc", "(I)V", "depthFunc");
+            add(methods, owner, "glDepthMask", "(Z)V", "depthMask");
+            add(methods, owner, "glDrawArrays", "(III)V", "drawArrays");
+            add(methods, owner, "glDrawElements", "(IIIJ)V", "drawElements");
+            add(methods, owner, "glGetError", "()I", "getError");
+            add(methods, owner, "glGetInteger", "(I)I", "getInteger");
+            add(methods, owner, "glGetFloat", "(I)F", "getFloat");
+            add(methods, owner, "glGetString", "(I)Ljava/lang/String;", "getString");
+            add(methods, owner, "glLogicOp", "(I)V", "logicOp");
+            add(methods, owner, "glPixelStorei", "(II)V", "pixelStorei");
+            add(methods, owner, "glPolygonMode", "(II)V", "polygonMode");
+            add(methods, owner, "glPolygonOffset", "(FF)V", "polygonOffset");
+            add(methods, owner, "glViewport", "(IIII)V", "viewport");
+            add(methods, owner, "glScissor", "(IIII)V", "scissor");
+            add(methods, owner, "glGenTextures", "()I", "genTexture");
+            add(methods, owner, "glDeleteTextures", "(I)V", "deleteTexture");
+            add(methods, owner, "glBindTexture", "(II)V", "bindTexture");
+            add(methods, owner, "glTexParameteri", "(III)V", "texParameteri");
+            add(methods, owner, "glTexImage2D", "(IIIIIIIILjava/nio/ByteBuffer;)V", "texImage2D");
+            add(methods, owner, "glTexSubImage2D", "(IIIIIIIILjava/nio/ByteBuffer;)V", "texSubImage2D");
+            add(methods, owner, "glTexSubImage2D", "(IIIIIIIIJ)V", "texSubImage2D");
+            add(methods, owner, "nglReadPixels", "(IIIIIIJ)V", "readPixels");
+            add(methods, owner, "glReadPixels", "(IIIIIIJ)V", "readPixels");
+        }
+        for (String owner : new String[] {"GL13", "GL13C"}) {
+            add(methods, owner, "glActiveTexture", "(I)V", "activeTexture");
+        }
         add(methods, "GL11", "glBlendFunc", "(II)V", "blendFunc");
         add(methods, "GL11C", "glBlendFunc", "(II)V", "blendFunc");
         add(methods, "GL14", "glBlendEquation", "(I)V", "blendEquation");
@@ -104,14 +109,19 @@ public final class LwjglOpenGLBrowserPatcher {
         add(methods, "GL14C", "glBlendFuncSeparate", "(IIII)V", "blendFuncSeparate");
         add(methods, "GL14", "glBlendEquationSeparate", "(II)V", "blendEquationSeparate");
         add(methods, "GL14C", "glBlendEquationSeparate", "(II)V", "blendEquationSeparate");
-        add(methods, "GL15", "glGenBuffers", "()I", "genBuffer");
-        add(methods, "GL15", "glDeleteBuffers", "(I)V", "deleteBuffer");
-        add(methods, "GL15", "glBindBuffer", "(II)V", "bindBuffer");
-        add(methods, "GL15", "glBufferData", "(IJI)V", "bufferData");
-        add(methods, "GL15", "glBufferData", "(ILjava/nio/ByteBuffer;I)V", "bufferData");
-        add(methods, "GL15", "glBufferSubData", "(IJLjava/nio/ByteBuffer;)V", "bufferSubData");
-        add(methods, "GL15", "glUnmapBuffer", "(I)Z", "unmapBuffer");
-        add(methods, "GL15C", "glUnmapBuffer", "(I)Z", "unmapBuffer");
+        add(methods, "GL14", "nglMultiDrawArrays", "(IJJI)V", "multiDrawArrays");
+        add(methods, "GL14C", "nglMultiDrawArrays", "(IJJI)V", "multiDrawArrays");
+        add(methods, "GL20", "glBlendEquationSeparate", "(II)V", "blendEquationSeparate");
+        add(methods, "GL20C", "glBlendEquationSeparate", "(II)V", "blendEquationSeparate");
+        for (String owner : new String[] {"GL15", "GL15C"}) {
+            add(methods, owner, "glGenBuffers", "()I", "genBuffer");
+            add(methods, owner, "glDeleteBuffers", "(I)V", "deleteBuffer");
+            add(methods, owner, "glBindBuffer", "(II)V", "bindBuffer");
+            add(methods, owner, "glBufferData", "(IJI)V", "bufferData");
+            add(methods, owner, "glBufferData", "(ILjava/nio/ByteBuffer;I)V", "bufferData");
+            add(methods, owner, "glBufferSubData", "(IJLjava/nio/ByteBuffer;)V", "bufferSubData");
+            add(methods, owner, "glUnmapBuffer", "(I)Z", "unmapBuffer");
+        }
         for (String owner : new String[] {"GL15", "GL15C", "GL32", "GL32C"}) {
             add(methods, owner, "nglGenQueries", "(IJ)V", "genQueries");
             add(methods, owner, "glGenQueries", "(Ljava/nio/IntBuffer;)V", "genQueries");
@@ -222,17 +232,17 @@ public final class LwjglOpenGLBrowserPatcher {
         add(methods, "GL33", "glVertexAttribDivisor", "(II)V", "vertexAttribDivisor");
         add(methods, "GL33C", "glVertexAttribDivisor", "(II)V", "vertexAttribDivisor");
         add(methods, "ARBInstancedArrays", "glVertexAttribDivisorARB", "(II)V", "vertexAttribDivisor");
-        add(methods, "GL20", "glScissor", "(IIII)V", "scissor");
-        add(methods, "GL20C", "glScissor", "(IIII)V", "scissor");
-        add(methods, "GL30", "glGenVertexArrays", "()I", "genVertexArray");
-        add(methods, "GL30", "glBindVertexArray", "(I)V", "bindVertexArray");
-        add(methods, "GL30", "glDeleteVertexArrays", "(I)V", "deleteVertexArray");
-        add(methods, "GL30C", "glDeleteVertexArrays", "(I)V", "deleteVertexArray");
-        add(methods, "GL30", "glGenFramebuffers", "()I", "genFramebuffer");
-        add(methods, "GL30", "glBindFramebuffer", "(II)V", "bindFramebuffer");
-        add(methods, "GL30", "glFramebufferTexture2D", "(IIIII)V", "framebufferTexture2D");
-        add(methods, "GL30", "glDeleteFramebuffers", "(I)V", "deleteFramebuffer");
-        add(methods, "GL30", "glBlitFramebuffer", "(IIIIIIIIII)V", "blitFramebuffer");
+        for (String owner : new String[] {"GL30", "GL30C"}) {
+            add(methods, owner, "glColorMaski", "(IZZZZ)V", "colorMaski");
+            add(methods, owner, "glGenVertexArrays", "()I", "genVertexArray");
+            add(methods, owner, "glBindVertexArray", "(I)V", "bindVertexArray");
+            add(methods, owner, "glDeleteVertexArrays", "(I)V", "deleteVertexArray");
+            add(methods, owner, "glGenFramebuffers", "()I", "genFramebuffer");
+            add(methods, owner, "glBindFramebuffer", "(II)V", "bindFramebuffer");
+            add(methods, owner, "glFramebufferTexture2D", "(IIIII)V", "framebufferTexture2D");
+            add(methods, owner, "glDeleteFramebuffers", "(I)V", "deleteFramebuffer");
+            add(methods, owner, "glBlitFramebuffer", "(IIIIIIIIII)V", "blitFramebuffer");
+        }
         for (String owner : new String[] {"GL30", "GL30C"}) {
             add(methods, owner, "nglClearBufferfv", "(IIJ)V", "clearBufferfv");
             add(methods, owner, "glClearBufferfv", "(IILjava/nio/FloatBuffer;)V", "clearBufferfv");
@@ -252,6 +262,8 @@ public final class LwjglOpenGLBrowserPatcher {
         add(methods, "ARBDirectStateAccess", "glBlitNamedFramebuffer", "(IIIIIIIIIIII)V", "blitNamedFramebuffer");
         add(methods, "GL30", "glMapBufferRange", "(IJJI)Ljava/nio/ByteBuffer;", "mapBufferRange");
         add(methods, "GL30C", "glMapBufferRange", "(IJJI)Ljava/nio/ByteBuffer;", "mapBufferRange");
+        add(methods, "GL30", "nglMapBufferRange", "(IJJI)J", "mapBufferRangeAddress");
+        add(methods, "GL30C", "nglMapBufferRange", "(IJJI)J", "mapBufferRangeAddress");
         add(methods, "GL30", "glFlushMappedBufferRange", "(IJJ)V", "flushMappedBufferRange");
         add(methods, "GL30C", "glFlushMappedBufferRange", "(IJJ)V", "flushMappedBufferRange");
         add(methods, "GL30", "glBindBufferRange", "(IIIJJ)V", "bindBufferRange");
@@ -270,15 +282,19 @@ public final class LwjglOpenGLBrowserPatcher {
         add(methods, "GL32C", "glDrawElementsBaseVertex", "(IIIJI)V", "drawElementsBaseVertex");
         add(methods, "GL32", "glDrawElementsInstancedBaseVertex", "(IIIJII)V", "drawElementsInstancedBaseVertex");
         add(methods, "GL32C", "glDrawElementsInstancedBaseVertex", "(IIIJII)V", "drawElementsInstancedBaseVertex");
+        add(methods, "GL32", "nglMultiDrawElementsBaseVertex", "(IJIJIJ)V", "multiDrawElementsBaseVertex");
+        add(methods, "GL32C", "nglMultiDrawElementsBaseVertex", "(IJIJIJ)V", "multiDrawElementsBaseVertex");
         add(methods, "GL31", "glGetUniformBlockIndex", "(ILjava/lang/CharSequence;)I", "getUniformBlockIndex");
         add(methods, "GL31C", "glGetUniformBlockIndex", "(ILjava/lang/CharSequence;)I", "getUniformBlockIndex");
         add(methods, "GL31", "glGetActiveUniformBlockName", "(II)Ljava/lang/String;", "getActiveUniformBlockName");
         add(methods, "GL31C", "glGetActiveUniformBlockName", "(II)Ljava/lang/String;", "getActiveUniformBlockName");
         add(methods, "GL31", "glUniformBlockBinding", "(III)V", "uniformBlockBinding");
         add(methods, "GL31C", "glUniformBlockBinding", "(III)V", "uniformBlockBinding");
-        add(methods, "GL32", "glFenceSync", "(II)J", "fenceSync");
-        add(methods, "GL32", "glClientWaitSync", "(JIJ)I", "clientWaitSync");
-        add(methods, "GL32", "glDeleteSync", "(J)V", "deleteSync");
+        for (String owner : new String[] {"GL32", "GL32C"}) {
+            add(methods, owner, "glFenceSync", "(II)J", "fenceSync");
+            add(methods, owner, "glClientWaitSync", "(JIJ)I", "clientWaitSync");
+            add(methods, owner, "glDeleteSync", "(J)V", "deleteSync");
+        }
         add(methods, "GL33C", "glGenSamplers", "()I", "genSampler");
         add(methods, "GL33C", "glBindSampler", "(II)V", "bindSampler");
         add(methods, "GL33C", "glDeleteSamplers", "(I)V", "deleteSampler");
@@ -289,9 +305,7 @@ public final class LwjglOpenGLBrowserPatcher {
 
     private static Set<String> noOps() {
         Set<String> methods = new HashSet<>();
-        noop(methods, "GL11", "glDrawBuffer", "(I)V");
         noop(methods, "GL11", "glGetTexLevelParameteri", "(III)I");
-        noop(methods, "GL11", "glReadPixels", "(IIIIIIJ)V");
         noop(methods, "GL32C", "glBeginQuery", "(II)V");
         for (String owner : new String[] {"GL15", "GL15C", "GL32", "GL32C"}) {
             noop(methods, owner, "nglDeleteQueries", "(IJ)V");

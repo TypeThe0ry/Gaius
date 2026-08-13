@@ -94,6 +94,7 @@ export function summarizeRuntimeInvariantTelemetry({
     worldgen: summarizeScalarSection(values, "worldgen"),
     workerQueue: summarizeScalarSection(values, "workerQueue"),
     renderPipeline: summarizeScalarSection(values, "renderPipeline"),
+    network: summarizeScalarSection(values, "network"),
     framePacing: summarizeScalarSection(values, "framePacing"),
   };
 }
@@ -149,6 +150,371 @@ function componentResult(checks, externalSmokeRequired = []) {
   };
 }
 
+/**
+ * Proves that a measured run used the uncapped scheduler, rather than merely
+ * carrying an Unlimited/VSync-off option in options.txt.
+ */
+export function evaluateUncappedFramePacing({
+  samples = [],
+  final = null,
+  requirements = {},
+} = {}) {
+  const finiteTelemetryValue = (value) =>
+    typeof value === "number" && Number.isFinite(value) ? value : null;
+  const requiredSwapInterval = Number.isFinite(Number(requirements.requiredSwapInterval))
+    ? Number(requirements.requiredSwapInterval) : 0;
+  const minimumSamples = Math.max(1, Math.floor(Number(requirements.minimumSamples) || 1));
+  const minimumUncappedYieldCount = Math.max(
+    1,
+    Math.floor(Number(requirements.minimumUncappedYieldCount) || 1),
+  );
+  const minimumFairYieldCount = Math.max(
+    1,
+    Math.floor(Number(requirements.minimumFairYieldCount) || 1),
+  );
+  const maximumVsyncYieldCount = Math.max(
+    0,
+    Math.floor(Number(requirements.maximumVsyncYieldCount) || 0),
+  );
+  const maximumPresentToRafCount = Math.max(
+    0,
+    Math.floor(Number(requirements.maximumPresentToRafCount) || 0),
+  );
+  const healthLimits = {
+    messageChannelCreateFailureCount: Math.max(
+      0,
+      Math.floor(Number(requirements.maximumMessageChannelCreateFailureCount) || 0),
+    ),
+    messageChannelPostFailureCount: Math.max(
+      0,
+      Math.floor(Number(requirements.maximumMessageChannelPostFailureCount) || 0),
+    ),
+    messageChannelRebuildCount: Math.max(
+      0,
+      Math.floor(Number(requirements.maximumMessageChannelRebuildCount) || 0),
+    ),
+    cancelledMessageTaskCount: Math.max(
+      0,
+      Math.floor(Number(requirements.maximumCancelledMessageTaskCount) || 0),
+    ),
+    watchdogYieldCount: Math.max(
+      0,
+      Math.floor(Number(requirements.maximumWatchdogYieldCount) || 0),
+    ),
+  };
+  const requiredFields = [
+    "swapInterval",
+    "uncappedYieldCount",
+    "vsyncYieldCount",
+    "presentToRafCount",
+    "fairYieldCount",
+    ...Object.keys(healthLimits),
+  ];
+  const entries = (Array.isArray(samples) ? samples : [])
+    .filter((sample) => sample && typeof sample === "object")
+    .map((sample) => Object.fromEntries(requiredFields.map((field) => [
+      field,
+      finiteTelemetryValue(sample[field]),
+    ])));
+  const finalEntry = final && typeof final === "object"
+    ? Object.fromEntries(requiredFields.map((field) => [
+      field,
+      finiteTelemetryValue(final[field]),
+    ]))
+    : null;
+  const missingFields = [...new Set([
+    ...entries.flatMap((entry) => requiredFields.filter((field) => entry[field] == null)),
+    ...(finalEntry ? requiredFields.filter((field) => finalEntry[field] == null) : requiredFields),
+  ])];
+  const allEntries = finalEntry ? [...entries, finalEntry] : entries;
+  const extrema = (field, direction) => {
+    const values = allEntries.map((entry) => entry[field]).filter((value) => value != null);
+    if (values.length === 0) return null;
+    return direction === "min" ? Math.min(...values) : Math.max(...values);
+  };
+  const observed = {
+    swapIntervalMin: extrema("swapInterval", "min"),
+    swapIntervalMax: extrema("swapInterval", "max"),
+    uncappedYieldCountMax: extrema("uncappedYieldCount", "max"),
+    vsyncYieldCountMax: extrema("vsyncYieldCount", "max"),
+    presentToRafCountMax: extrema("presentToRafCount", "max"),
+    fairYieldCountMax: extrema("fairYieldCount", "max"),
+    messageChannelCreateFailureCountMax: extrema("messageChannelCreateFailureCount", "max"),
+    messageChannelPostFailureCountMax: extrema("messageChannelPostFailureCount", "max"),
+    messageChannelRebuildCountMax: extrema("messageChannelRebuildCount", "max"),
+    cancelledMessageTaskCountMax: extrema("cancelledMessageTaskCount", "max"),
+    watchdogYieldCountMax: extrema("watchdogYieldCount", "max"),
+  };
+  const healthChecks = Object.entries(healthLimits).map(([field, maximum]) => {
+    const observedValue = observed[`${field}Max`];
+    const hasNonzeroFailure = observedValue != null && observedValue > maximum;
+    const missing = missingFields.includes(field);
+    return {
+      name: `no-${field}-during-measurement`,
+      verdict: hasNonzeroFailure ? "fail" : (missing ? "inconclusive" : "pass"),
+      expected: {[field]: maximum},
+      actual: observedValue,
+      reason: hasNonzeroFailure
+        ? `${field} was ${observedValue}; expected at most ${maximum}`
+        : (missing ? `${field} cannot be verified without complete runtime telemetry` : null),
+    };
+  });
+  const checks = [
+    {
+      name: "measured-sample-count",
+      verdict: entries.length >= minimumSamples ? "pass" : "inconclusive",
+      expected: {minimumSamples},
+      actual: entries.length,
+      reason: entries.length >= minimumSamples
+        ? null : `only ${entries.length} frame-pacing sample(s) were captured; ${minimumSamples} required`,
+    },
+    {
+      name: "required-runtime-fields",
+      verdict: missingFields.length > 0 ? "inconclusive" : "pass",
+      expected: requiredFields,
+      actual: requiredFields.filter((field) => !missingFields.includes(field)),
+      reason: missingFields.length > 0
+        ? `runtime frame-pacing telemetry is missing: ${missingFields.join(", ")}` : null,
+    },
+    {
+      name: "final-runtime-evidence-is-consistent",
+      verdict: missingFields.length > 0
+        ? "inconclusive"
+        : (finalEntry
+          && finalEntry.swapInterval === requiredSwapInterval
+          && finalEntry.uncappedYieldCount >= minimumUncappedYieldCount
+          && finalEntry.vsyncYieldCount <= maximumVsyncYieldCount
+          && finalEntry.presentToRafCount <= maximumPresentToRafCount
+          && finalEntry.fairYieldCount >= minimumFairYieldCount
+          && Object.entries(healthLimits).every(([field, maximum]) => finalEntry[field] <= maximum)
+          ? "pass" : "fail"),
+      expected: {
+        swapInterval: requiredSwapInterval,
+        minimumUncappedYieldCount,
+        minimumFairYieldCount,
+        maximumVsyncYieldCount,
+        maximumPresentToRafCount,
+        ...Object.fromEntries(Object.entries(healthLimits)
+          .map(([field, maximum]) => [`maximum${field[0].toUpperCase()}${field.slice(1)}`, maximum])),
+      },
+      actual: finalEntry,
+      reason: missingFields.length > 0
+        ? "the final frame-pacing snapshot is incomplete"
+        : (finalEntry
+          && finalEntry.swapInterval === requiredSwapInterval
+          && finalEntry.uncappedYieldCount >= minimumUncappedYieldCount
+          && finalEntry.vsyncYieldCount <= maximumVsyncYieldCount
+          && finalEntry.presentToRafCount <= maximumPresentToRafCount
+          && finalEntry.fairYieldCount >= minimumFairYieldCount
+          && Object.entries(healthLimits).every(([field, maximum]) => finalEntry[field] <= maximum)
+          ? null : "the final frame-pacing snapshot does not satisfy uncapped evidence"),
+    },
+    {
+      name: "swap-interval-zero-during-measurement",
+      verdict: missingFields.length > 0
+        ? "inconclusive"
+        : (observed.swapIntervalMin === requiredSwapInterval
+            && observed.swapIntervalMax === requiredSwapInterval ? "pass" : "fail"),
+      expected: {swapInterval: requiredSwapInterval},
+      actual: {min: observed.swapIntervalMin, max: observed.swapIntervalMax},
+      reason: missingFields.length > 0
+        ? "swapInterval cannot be verified without complete runtime telemetry"
+        : (observed.swapIntervalMin === requiredSwapInterval
+            && observed.swapIntervalMax === requiredSwapInterval
+          ? null
+          : `measured swapInterval range was ${observed.swapIntervalMin}..${observed.swapIntervalMax}`),
+    },
+    {
+      name: "uncapped-scheduler-exercised",
+      verdict: missingFields.length > 0
+        ? "inconclusive"
+        : (observed.uncappedYieldCountMax >= minimumUncappedYieldCount ? "pass" : "fail"),
+      expected: {minimumUncappedYieldCount},
+      actual: observed.uncappedYieldCountMax,
+      reason: missingFields.length > 0
+        ? "uncapped scheduler execution cannot be verified without complete runtime telemetry"
+        : (observed.uncappedYieldCountMax >= minimumUncappedYieldCount
+          ? null
+          : `uncappedYieldCount was ${observed.uncappedYieldCountMax}; expected at least ${minimumUncappedYieldCount}`),
+    },
+    {
+      name: "fair-browser-yield-exercised",
+      verdict: missingFields.length > 0
+        ? "inconclusive"
+        : (observed.fairYieldCountMax >= minimumFairYieldCount ? "pass" : "fail"),
+      expected: {minimumFairYieldCount},
+      actual: observed.fairYieldCountMax,
+      reason: missingFields.length > 0
+        ? "fair browser yielding cannot be verified without complete runtime telemetry"
+        : (observed.fairYieldCountMax >= minimumFairYieldCount
+          ? null
+          : `fairYieldCount was ${observed.fairYieldCountMax}; expected at least ${minimumFairYieldCount}`),
+    },
+    {
+      name: "no-vsync-yields-during-measurement",
+      verdict: missingFields.length > 0
+        ? "inconclusive"
+        : (observed.vsyncYieldCountMax <= maximumVsyncYieldCount ? "pass" : "fail"),
+      expected: {maximumVsyncYieldCount},
+      actual: observed.vsyncYieldCountMax,
+      reason: missingFields.length > 0
+        ? "VSync yield count cannot be verified without complete runtime telemetry"
+        : (observed.vsyncYieldCountMax <= maximumVsyncYieldCount
+          ? null
+          : `vsyncYieldCount was ${observed.vsyncYieldCountMax}; expected at most ${maximumVsyncYieldCount}`),
+    },
+    ...healthChecks,
+    {
+      name: "no-raf-yields-during-measurement",
+      verdict: missingFields.length > 0
+        ? "inconclusive"
+        : (observed.presentToRafCountMax <= maximumPresentToRafCount ? "pass" : "fail"),
+      expected: {maximumPresentToRafCount},
+      actual: observed.presentToRafCountMax,
+      reason: missingFields.length > 0
+        ? "rAF yield count cannot be verified without complete runtime telemetry"
+        : (observed.presentToRafCountMax <= maximumPresentToRafCount
+          ? null
+          : `presentToRafCount was ${observed.presentToRafCountMax}; expected at most ${maximumPresentToRafCount}`),
+    },
+  ];
+  const verdict = checks.some((check) => check.verdict === "fail")
+    ? "fail"
+    : (checks.some((check) => check.verdict === "inconclusive") ? "inconclusive" : "pass");
+  return {
+    verdict,
+    reasons: checks.filter((check) => check.reason).map((check) => check.reason),
+    checks,
+    requiredFields,
+    missingFields,
+    measuredSampleCount: entries.length,
+    requiredSampleCount: minimumSamples,
+    observed,
+    final: finalEntry,
+    requirements: {
+      requiredSwapInterval,
+      minimumUncappedYieldCount,
+      minimumFairYieldCount,
+      maximumVsyncYieldCount,
+      maximumPresentToRafCount,
+      ...Object.fromEntries(Object.entries(healthLimits)
+        .map(([field, maximum]) => [`maximum${field[0].toUpperCase()}${field.slice(1)}`, maximum])),
+    },
+  };
+}
+
+function metricEvidence(actual, required, direction) {
+  const finiteActual = Number.isFinite(Number(actual)) ? Number(actual) : null;
+  const finiteRequired = Number.isFinite(Number(required)) ? Number(required) : null;
+  const passed = finiteRequired == null
+    ? true
+    : (finiteActual != null && (direction === "max"
+        ? finiteActual <= finiteRequired : finiteActual >= finiteRequired));
+  return {actual: finiteActual, required: finiteRequired, passed};
+}
+
+/** Builds a stable, report-friendly summary for both passing and failed runs. */
+export function buildPerformanceEvidence({
+  frames = {},
+  framePacing = null,
+  memory = {},
+  freezes = {},
+  travel = {},
+  gates = {},
+  buildIdentity = null,
+} = {}) {
+  const frame = {
+    averageFps: metricEvidence(frames.averageFpsRaw ?? frames.averageFps, gates.averageFpsMin, "min"),
+    onePercentLowFps: metricEvidence(
+      frames.onePercentLowFpsRaw ?? frames.onePercentLowFps,
+      gates.onePercentLowFpsMin,
+      "min",
+    ),
+    p99FrameMs: metricEvidence(
+      frames.p99FrameMsRaw ?? frames.p99FrameMs,
+      gates.p99FrameMsMax,
+      "max",
+    ),
+    longestFrameMs: metricEvidence(
+      frames.longestFrameMsRaw ?? frames.longestFrameMs,
+      gates.longestFrameMsMax,
+      "max",
+    ),
+    coverageRatio: metricEvidence(
+      frames.coverageRatioRaw ?? frames.coverageRatio,
+      gates.coverageRatioMin,
+      "min",
+    ),
+    sampleCount: Number.isFinite(Number(frames.sampleCount)) ? Number(frames.sampleCount) : null,
+  };
+  const heap = memory.v8Heap || {};
+  const heapLeakSignal = heap.finalThreeWindowsPositive === true
+    || (Number.isFinite(Number(heap.retainedGrowthPercent))
+      && Number(heap.retainedGrowthPercent) > Number(heap.thresholds?.retainedGrowthPercentMax ?? 15))
+    || (Number.isFinite(Number(heap.retainedGrowthBytes))
+      && Number(heap.retainedGrowthBytes) > Number(heap.thresholds?.retainedGrowthBytesMax ?? 256 * MIB));
+  const heapSlope = Number.isFinite(Number(heap.postGcSlopeMiBPerMinute))
+    ? Number(heap.postGcSlopeMiBPerMinute) : null;
+  const heapPlateau = !heapLeakSignal
+    && heapSlope != null
+    && Math.abs(heapSlope) <= Number(heap.thresholds?.plateauSlopeMiBPerMinuteMax ?? 1);
+  const memoryEvidence = {
+    verdict: memory.verdict || "not-evaluated",
+    reasons: Array.isArray(memory.reasons) ? memory.reasons : [],
+    heap: {
+      verdict: heap.verdict || "not-evaluated",
+      trend: heapLeakSignal ? "leak-signal" : (heapPlateau ? "plateau" : "non-plateau"),
+      leakSignal: heapLeakSignal,
+      plateau: heapPlateau,
+      regularSlopeMiBPerMinute: heap.regularSlopeMiBPerMinute ?? null,
+      postGcSlopeMiBPerMinute: heap.postGcSlopeMiBPerMinute ?? null,
+      retainedGrowthPercent: heap.retainedGrowthPercent ?? null,
+      retainedGrowthMiB: heap.retainedGrowthMiB ?? null,
+      peakUsedMiB: heap.peakUsedMiB ?? null,
+      finalThreeWindowsPositive: heap.finalThreeWindowsPositive ?? null,
+      coverage: heap.coverage || null,
+    },
+    browserMemory: memory.browserMemory
+      ? {verdict: memory.browserMemory.verdict, reasons: memory.browserMemory.reasons || [],
+        metrics: memory.browserMemory.metrics || null}
+      : null,
+    processRss: memory.processRss
+      ? {verdict: memory.processRss.verdict, reasons: memory.processRss.reasons || [],
+        total: memory.processRss.total || null, byType: memory.processRss.byType || null}
+      : null,
+  };
+  const stall = {
+    longestFrameMs: metricEvidence(
+      frames.longestFrameMsRaw ?? frames.longestFrameMs,
+      gates.longestFrameMsMax,
+      "max",
+    ),
+    freezeCount: metricEvidence(freezes.total, gates.freezeCountMax, "max"),
+    maximumTraversalStallMs: metricEvidence(
+      travel.maximumTraversalStallMillis,
+      travel.maximumAllowedTraversalStallMillis,
+      "max",
+    ),
+    reasons: Array.isArray(freezes.reasons) ? freezes.reasons : [],
+  };
+  const failureReasons = [
+    ...Object.entries(frame)
+      .filter(([, value]) => value && value.passed === false)
+      .map(([name, value]) => `${name} actual=${value.actual} required=${value.required}`),
+    ...(framePacing?.reasons || []),
+    ...(memoryEvidence.reasons || []),
+    ...(stall.reasons || []),
+  ];
+  return {
+    buildIdentity,
+    frame,
+    framePacing,
+    stall,
+    memory: memoryEvidence,
+    failureReasons: [...new Set(failureReasons)],
+  };
+}
+
 /** Evaluates runtime invariants without treating absent instrumentation as a pass. */
 export function evaluateRuntimeInvariants({contract = {}, telemetry = {}} = {}) {
   const targetingRules = contract.targeting || {};
@@ -157,11 +523,13 @@ export function evaluateRuntimeInvariants({contract = {}, telemetry = {}} = {}) 
   const fenceRules = contract.gpuFences || {};
   const frameRules = contract.framePacing || {};
   const renderPipelineRules = contract.renderPipeline || {};
+  const networkRules = contract.networkOutbound || {};
   const targeting = telemetry.targeting || {};
   const worldgen = telemetry.worldgen || {};
   const glStats = telemetry.glStats || {};
   const framePacing = telemetry.framePacing || {};
   const renderPipeline = telemetry.renderPipeline || {};
+  const network = telemetry.network || {};
 
   const targetingChecks = [
     comparisonCheck(
@@ -219,6 +587,43 @@ export function evaluateRuntimeInvariants({contract = {}, telemetry = {}} = {}) 
       "minimum adaptive worldgen slice budget",
     ));
   }
+  worldgenChecks.push(
+    comparisonCheck(
+      "worldgen-slice-p99",
+      evidence(worldgen, ["p99SliceElapsedMillis"]),
+      {maximumMillis: finiteNumber(worldgenRules.p99SliceElapsedMillisMax, 14)},
+      (value, expected) => value <= expected.maximumMillis,
+      "worldgen slice p99 latency",
+    ),
+    comparisonCheck(
+      "worldgen-slice-maximum",
+      evidence(worldgen, ["maxSliceElapsedMillis"]),
+      {maximumMillis: finiteNumber(worldgenRules.maxSliceElapsedMillisMax, 50)},
+      (value, expected) => value <= expected.maximumMillis,
+      "maximum worldgen slice latency",
+    ),
+    comparisonCheck(
+      "worldgen-budget-overrun-maximum",
+      evidence(worldgen, ["maxBudgetOverrunMillis"]),
+      {maximumMillis: finiteNumber(worldgenRules.maxBudgetOverrunMillisMax, 8)},
+      (value, expected) => value <= expected.maximumMillis,
+      "maximum worldgen slice budget overrun",
+    ),
+    comparisonCheck(
+      "worldgen-yield-delay-p99",
+      evidence(worldgen, ["p99YieldDelayMillis"]),
+      {maximumMillis: finiteNumber(worldgenRules.p99YieldDelayMillisMax, 16.7)},
+      (value, expected) => value <= expected.maximumMillis,
+      "worldgen event-loop yield p99 latency",
+    ),
+    comparisonCheck(
+      "worldgen-yield-delay-maximum",
+      evidence(worldgen, ["maxYieldDelayMillis"]),
+      {maximumMillis: finiteNumber(worldgenRules.maxYieldDelayMillisMax, 50)},
+      (value, expected) => value <= expected.maximumMillis,
+      "maximum worldgen event-loop yield latency",
+    ),
+  );
 
   const webglChecks = [
     comparisonCheck(
@@ -234,6 +639,13 @@ export function evaluateRuntimeInvariants({contract = {}, telemetry = {}} = {}) 
       {maximumBytes: finiteNumber(webglRules.derivedBaseVertexBudgetBytes, 32 * MIB)},
       (value, expected) => value <= expected.maximumBytes,
       "peak derived base-vertex index bytes",
+    ),
+    comparisonCheck(
+      "webgl-derived-attribute-budget",
+      evidence(glStats, ["alignedAttribPeakBytes"]),
+      {maximumBytes: finiteNumber(webglRules.derivedAlignedAttribBudgetBytes, 32 * MIB)},
+      (value, expected) => value <= expected.maximumBytes,
+      "peak derived aligned-attribute bytes",
     ),
   ];
 
@@ -258,6 +670,37 @@ export function evaluateRuntimeInvariants({contract = {}, telemetry = {}} = {}) 
       {maximum: finiteNumber(renderPipelineRules.activeUploadRetryTasksMax, 8)},
       (value, expected) => value <= expected.maximum,
       "concurrently retained terrain upload retry tasks",
+    ),
+  ];
+
+  const networkChecks = [
+    comparisonCheck(
+      "network-outbound-scheduler-exercised",
+      evidence(network, ["outboundTurns"]),
+      {minimum: finiteNumber(networkRules.turnsMin, 1)},
+      (value, expected) => value >= expected.minimum,
+      "outbound scheduler turns",
+    ),
+    comparisonCheck(
+      "network-outbound-frame-turn-cap",
+      evidence(network, ["maxOutboundTurnFrames"]),
+      {maximum: finiteNumber(networkRules.framesPerTurnMax, 32)},
+      (value, expected) => value <= expected.maximum,
+      "maximum outbound frames in one event-loop turn",
+    ),
+    comparisonCheck(
+      "network-outbound-byte-turn-cap",
+      evidence(network, ["maxOutboundTurnBytes"]),
+      {maximumBytes: finiteNumber(networkRules.bytesPerTurnMax, 256 * 1024)},
+      (value, expected) => value <= expected.maximumBytes,
+      "maximum outbound bytes in one event-loop turn",
+    ),
+    comparisonCheck(
+      "network-outbound-time-turn-cap",
+      evidence(network, ["maxOutboundTurnMillis"]),
+      {maximumMillis: finiteNumber(networkRules.millisPerTurnMax, 8)},
+      (value, expected) => value <= expected.maximumMillis,
+      "maximum outbound scheduler turn duration",
     ),
   ];
 
@@ -417,6 +860,10 @@ export function evaluateRuntimeInvariants({contract = {}, telemetry = {}} = {}) 
       renderPipelineChecks,
       renderPipelineRules.externalSmokeRequired || [],
     ),
+    networkOutbound: componentResult(
+      networkChecks,
+      networkRules.externalSmokeRequired || [],
+    ),
     gpuFences: componentResult(gpuChecks),
     framePacing: componentResult(
       [continuationCheck],
@@ -433,6 +880,7 @@ export function evaluateRuntimeInvariants({contract = {}, telemetry = {}} = {}) 
     components.worldgen,
     components.webglMemory,
     components.renderPipeline,
+    components.networkOutbound,
     components.gpuFences,
     components.framePacing,
   ];
@@ -934,6 +1382,259 @@ export function combineMemorySnapshots(snapshots, fields) {
   return combined;
 }
 
+/** Rejects missing safety telemetry, allocation failures, and disabled runtime budgets. */
+export function evaluateBrowserMemorySafety({
+  snapshots = [],
+  requiredFields = [],
+  failureFields = [],
+  limits = {},
+  aggregateLimits = {},
+} = {}) {
+  const attempted = Array.isArray(snapshots) ? snapshots : [];
+  const baseRequired = [...new Set([
+    ...requiredFields,
+    ...failureFields,
+  ].map(String).filter(Boolean))];
+  const missing = [];
+  const failures = [];
+  for (const [index, entry] of attempted.entries()) {
+    const memory = entry?.memory && typeof entry.memory === "object"
+      ? entry.memory
+      : entry;
+    const source = String(entry?.source || `snapshot-${index}`);
+    const entryLimits = entry?.aggregate === true ? aggregateLimits : limits;
+    const required = [...new Set([
+      ...baseRequired,
+      ...Object.keys(entryLimits || {}),
+    ].map(String).filter(Boolean))];
+    if (!memory || typeof memory !== "object") {
+      missing.push({index, source, fields: required});
+      continue;
+    }
+    const missingFields = required.filter(
+      (field) => !Object.hasOwn(memory, field) || !Number.isFinite(Number(memory[field])),
+    );
+    if (missingFields.length > 0) missing.push({index, source, fields: missingFields});
+    for (const field of failureFields) {
+      const value = Number(memory[field]);
+      if (Number.isFinite(value) && value !== 0) {
+        failures.push({index, source, field, value, reason: "nonzero-failure-counter"});
+      }
+    }
+    for (const [field, rawMaximum] of Object.entries(entryLimits || {})) {
+      const value = Number(memory[field]);
+      const maximum = Number(rawMaximum);
+      if (Number.isFinite(value) && Number.isFinite(maximum)
+          && (value <= 0 || value > maximum)) {
+        failures.push({index, source, field, value, maximum, reason: "unsafe-limit"});
+      }
+    }
+    for (const [valueField, limitField] of [
+      ["liveBytes", "maxLiveBytes"],
+      ["peakTemporaryBytes", "maxTemporaryBytes"],
+    ]) {
+      const value = Number(memory[valueField]);
+      const limit = Number(memory[limitField]);
+      if (Number.isFinite(value) && Number.isFinite(limit)
+          && (value < 0 || value > limit)) {
+        failures.push({
+          index,
+          source,
+          field: valueField,
+          value,
+          maximum: limit,
+          reason: "runtime-budget-exceeded",
+        });
+      }
+    }
+  }
+  const reasons = [];
+  let verdict = "pass";
+  if (failures.length > 0) {
+    verdict = "fail";
+    reasons.push(`${failures.length} BrowserMemory safety violation(s) were recorded`);
+  } else if (attempted.length === 0 || missing.length > 0) {
+    verdict = "inconclusive";
+    reasons.push(attempted.length === 0
+      ? "BrowserMemory safety telemetry was not sampled"
+      : `${missing.length} BrowserMemory sample(s) lacked required safety fields`);
+  }
+  return {
+    verdict,
+    reasons,
+    attemptedSampleCount: attempted.length,
+    requiredFields: [...new Set([
+      ...baseRequired,
+      ...Object.keys(limits || {}),
+      ...Object.keys(aggregateLimits || {}),
+    ])],
+    failureFields: [...failureFields],
+    limits: {...limits},
+    aggregateLimits: {...aggregateLimits},
+    missing,
+    failures,
+  };
+}
+
+function summarizeTimedSampleCoverage({
+  attemptedSampleTimes = [],
+  availableSampleTimes = [],
+  requiredDurationMs = 0,
+  sampleIntervalMs = 5000,
+  minimumAvailableRatio = 0.9,
+  minimumDurationCoverageRatio = 0.98,
+  maximumSampleGapRatio = 1.5,
+} = {}) {
+  const available = availableSampleTimes
+    .map((value) => Number(value))
+    .filter(Number.isFinite)
+    .sort((left, right) => left - right);
+  const attemptedInput = Array.isArray(attemptedSampleTimes) ? attemptedSampleTimes : [];
+  const hasAttemptedTimeline = attemptedInput.length > 0;
+  const attempted = (hasAttemptedTimeline ? attemptedInput : available)
+    .map((value) => Number(value))
+    .filter(Number.isFinite)
+    .sort((left, right) => left - right);
+  const required = Math.max(0, Number(requiredDurationMs) || 0);
+  const interval = Math.max(1, Number(sampleIntervalMs) || 5000);
+  const minimumRatio = Math.max(0, Math.min(1, Number(minimumAvailableRatio) || 0));
+  const durationRatio = Math.max(
+    0,
+    Math.min(1, Number(minimumDurationCoverageRatio) || 0),
+  );
+  const gapRatio = Math.max(1, Number(maximumSampleGapRatio) || 1.5);
+  const expectedSampleCount = Math.floor(required / interval) + 1;
+  const minimumExpectedSampleCount = hasAttemptedTimeline
+    ? Math.ceil(expectedSampleCount * minimumRatio) : 0;
+  const availabilityRatio = attempted.length > 0
+    ? available.length / attempted.length : 0;
+  const availableDurationMs = available.length >= 2
+    ? available.at(-1) - available[0] : 0;
+  const measuredDurationRatio = required > 0
+    ? Math.min(1, availableDurationMs / required) : 0;
+  const maximumSampleGapMs = available.length >= 2
+    ? available.slice(1).reduce(
+      (maximum, at, index) => Math.max(maximum, at - available[index]),
+      0,
+    )
+    : null;
+  const maximumAllowedSampleGapMs = interval * gapRatio;
+  const boundaryToleranceMs = maximumAllowedSampleGapMs;
+  const firstSampleAt = available[0] ?? null;
+  const lastSampleAt = available.at(-1) ?? null;
+  const complete = available.length >= Math.max(2, minimumExpectedSampleCount)
+    && (!hasAttemptedTimeline || availabilityRatio >= minimumRatio)
+    && measuredDurationRatio >= durationRatio
+    && firstSampleAt != null
+    && firstSampleAt <= boundaryToleranceMs
+    && lastSampleAt != null
+    && lastSampleAt >= required - boundaryToleranceMs
+    && (maximumSampleGapMs == null || maximumSampleGapMs <= maximumAllowedSampleGapMs);
+  return {
+    complete,
+    hasAttemptedTimeline,
+    attemptedSampleCount: attempted.length,
+    availableSampleCount: available.length,
+    availabilityRatio,
+    expectedSampleCount,
+    minimumExpectedSampleCount,
+    firstSampleAt,
+    lastSampleAt,
+    availableDurationMs,
+    durationCoverageRatio: measuredDurationRatio,
+    minimumDurationCoverageRatio: durationRatio,
+    maximumSampleGapMs,
+    maximumAllowedSampleGapMs,
+    maximumSampleGapRatio: gapRatio,
+  };
+}
+
+/** Proves that Worker heartbeat data belongs to the active session and current run. */
+export function validateWorkerHeartbeatTelemetry(worker, lifecycle, context, heartbeatRules = {}) {
+  const requiredNumericFields = [
+    "schemaVersion",
+    "resetAt",
+    "updatedAt",
+    "sent",
+    "received",
+    "rttSampleCount",
+    "missed",
+    "errors",
+    "pending",
+    "p99RttMillis",
+    "maxRttMillis",
+    "longestHeartbeatDelayMillis",
+    "lastPongAt",
+    "configuredIntervalMillis",
+  ];
+  const missingFields = requiredNumericFields.filter(
+    (field) => !Object.hasOwn(worker || {}, field)
+      || !Number.isFinite(Number(worker[field])),
+  );
+  const activeSessionIds = Array.from(lifecycle?.states || [])
+    .filter((state) => state && state.terminal !== true)
+    .map((state) => String(state.sessionId || ""))
+    .filter(Boolean);
+  const expectedMeasurementId = String(context?.expectedWorkerMeasurementId || "");
+  const measurementStartedAt = Number(context?.measurementStartedAt);
+  const measurementEndedAt = Number(context?.measurementEndedAt);
+  const configuredInterval = Number(worker?.configuredIntervalMillis);
+  const freshnessLimitMillis = Math.max(
+    Number(heartbeatRules.rttMaxMs || 250),
+    Number.isFinite(configuredInterval) ? configuredInterval * 3 : 0,
+  );
+  const reasons = [];
+  if (missingFields.length > 0) {
+    reasons.push(`Worker heartbeat telemetry is missing finite fields: ${missingFields.join(", ")}`);
+  }
+  if (Number(worker?.schemaVersion) !== 2) {
+    reasons.push("Worker heartbeat telemetry schema is not version 2");
+  }
+  if (!expectedMeasurementId || String(worker?.measurementId || "") !== expectedMeasurementId) {
+    reasons.push("Worker heartbeat telemetry does not belong to the current measurement window");
+  }
+  if (activeSessionIds.length !== 1
+      || String(worker?.sessionId || "") !== activeSessionIds[0]) {
+    reasons.push("Worker heartbeat telemetry does not belong to the sole active Worker session");
+  }
+  if (Number(worker?.received) <= 0
+      || Number(worker?.sent) <= 0
+      || Number(worker?.received) > Number(worker?.sent)
+      || Number(worker?.rttSampleCount) !== Number(worker?.received)
+      || ["sent", "received", "rttSampleCount", "missed", "errors", "pending"]
+        .some((field) => Number(worker?.[field]) < 0)) {
+    reasons.push("Worker heartbeat counters are absent, negative, or inconsistent");
+  }
+  const resetAt = Number(worker?.resetAt);
+  if (!Number.isFinite(resetAt) || !Number.isFinite(measurementStartedAt)
+      || resetAt < measurementStartedAt - 5000 || resetAt > measurementStartedAt + 1000) {
+    reasons.push("Worker heartbeat reset timestamp is outside the current measurement start window");
+  }
+  const updatedAt = Number(worker?.updatedAt);
+  if (!Number.isFinite(updatedAt) || !Number.isFinite(measurementStartedAt)
+      || !Number.isFinite(measurementEndedAt)
+      || updatedAt < measurementStartedAt || updatedAt > measurementEndedAt + 1000) {
+    reasons.push("Worker heartbeat update timestamp is outside the current measurement window");
+  }
+  const lastPongAt = Number(worker?.lastPongAt);
+  if (!Number.isFinite(lastPongAt) || !Number.isFinite(measurementStartedAt)
+      || !Number.isFinite(measurementEndedAt)
+      || lastPongAt < measurementStartedAt
+      || lastPongAt > measurementEndedAt + 1000
+      || measurementEndedAt - lastPongAt > freshnessLimitMillis) {
+    reasons.push(`Worker heartbeat telemetry is stale by more than ${freshnessLimitMillis} ms`);
+  }
+  return {
+    verdict: reasons.length === 0 ? "pass" : "fail",
+    reasons,
+    requiredNumericFields,
+    missingFields,
+    expectedMeasurementId,
+    activeSessionIds,
+    freshnessLimitMillis,
+  };
+}
+
 export function parsePsRssOutput(output) {
   const rssByPid = {};
   for (const line of String(output || "").split(/\r?\n/)) {
@@ -1081,10 +1782,7 @@ export function summarizeWorldReadiness(observations = [], rules = {}) {
         streakStartedAt = at;
         consecutiveFrames = 1;
       } else {
-        consecutiveFrames += Math.min(
-          requiredConsecutiveFrames,
-          Math.max(1, visibleFrameCount - Number(lastVisibleFrameCount || 0)),
-        );
+        consecutiveFrames++;
       }
       if (observation?.hitIsSolidBlock === true
           && observation?.stateAt !== lastHitStateAt) {
@@ -1565,6 +2263,7 @@ export function summarizeChromeProcessRssTrend({
   sampleIntervalMs = 15000,
   minimumAvailableRatio = 0.9,
   minimumDurationCoverageRatio = 0.98,
+  maximumSampleGapRatio = 1.5,
   trendWindowCount = 4,
   processTypes = ["browser", "renderer", "gpu", "utility"],
   requiredProcessTypes = ["browser", "renderer", "gpu"],
@@ -1585,6 +2284,16 @@ export function summarizeChromeProcessRssTrend({
   const availableDurationMs = availableTimes.length >= 2
     ? availableTimes.at(-1) - availableTimes[0]
     : 0;
+  const maximumSampleGapMs = availableTimes.length >= 2
+    ? availableTimes.slice(1).reduce(
+      (maximum, at, index) => Math.max(maximum, at - availableTimes[index]),
+      0,
+    )
+    : null;
+  const maximumAllowedSampleGapMs = intervalMillis * Math.max(
+    1,
+    finiteNumber(maximumSampleGapRatio, 1.5),
+  );
   const durationCoverageRatio = requiredDurationMs > 0
     ? Math.min(1, availableDurationMs / requiredDurationMs)
     : 0;
@@ -1656,6 +2365,13 @@ export function summarizeChromeProcessRssTrend({
       reasons.push(
         `Chrome process RSS covered ${round(durationCoverageRatio * 100)}% of the required soak duration`,
       );
+    } else if (maximumSampleGapMs == null
+        || maximumSampleGapMs > maximumAllowedSampleGapMs) {
+      verdict = "inconclusive";
+      reasons.push(
+        `Chrome process RSS maximum sample gap was ${round(maximumSampleGapMs)} ms; `
+          + `maximum is ${round(maximumAllowedSampleGapMs)} ms`,
+      );
     } else if (unavailableRequiredTypes.length > 0) {
       verdict = "inconclusive";
       reasons.push(
@@ -1683,6 +2399,9 @@ export function summarizeChromeProcessRssTrend({
       availableDurationMs,
       durationCoverageRatio: round(durationCoverageRatio, 6),
       minimumDurationCoverageRatio: minimumDurationRatio,
+      maximumSampleGapMs,
+      maximumAllowedSampleGapMs,
+      maximumSampleGapRatio: Math.max(1, finiteNumber(maximumSampleGapRatio, 1.5)),
       errors,
     },
     total,
@@ -1709,6 +2428,12 @@ export function summarizeMemoryTrend({
   retainedGrowthPercentMax = 15,
   retainedGrowthBytesMax = 256 * MIB,
   peakUsedBytesMax = 8 * 1024 * MIB,
+  plateauSlopeMiBPerMinuteMax = 1,
+  attemptedSampleTimes = [],
+  sampleIntervalMs = 5000,
+  minimumAvailableRatio = 0.9,
+  minimumDurationCoverageRatio = 0.98,
+  maximumSampleGapRatio = 1.5,
 } = {}) {
   const regular = regularSamples
     .map((sample) => ({
@@ -1730,11 +2455,33 @@ export function summarizeMemoryTrend({
   const end = postGc.at(-1)?.y ?? null;
   const retainedGrowthRatio = base > 0 && end != null ? (end - base) / base : null;
   const retainedGrowthBytes = base != null && end != null ? end - base : null;
-  const peakUsedBytes = postGc.length > 0 ? Math.max(...postGc.map((sample) => sample.y)) : null;
+  const regularPeakUsedBytes = regular.length > 0
+    ? Math.max(...regular.map((sample) => sample.y)) : null;
+  const postGcPeakUsedBytes = postGc.length > 0
+    ? Math.max(...postGc.map((sample) => sample.y)) : null;
   const finalWindowCount = Math.max(2, Math.floor(finiteNumber(postGcFinalWindows, 4)));
   const finalIntervals = postGc.slice(-finalWindowCount);
   const finalThreePositive = finalIntervals.length === finalWindowCount
     && finalIntervals.slice(1).every((sample, index) => sample.y > finalIntervals[index].y);
+  const coverage = summarizeTimedSampleCoverage({
+    attemptedSampleTimes,
+    availableSampleTimes: regular.length > 0
+      ? regular.map((sample) => sample.x)
+      : postGc.map((sample) => sample.x),
+    requiredDurationMs,
+    sampleIntervalMs,
+    minimumAvailableRatio,
+    minimumDurationCoverageRatio,
+    maximumSampleGapRatio,
+  });
+  const postGcSlopeMiBPerMinute = postGcSlope == null
+    ? null : postGcSlope * 60000 / MIB;
+  const leakSignal = finalThreePositive
+    || (retainedGrowthRatio != null && retainedGrowthRatio * 100 > retainedGrowthPercentMax)
+    || (retainedGrowthBytes != null && retainedGrowthBytes > retainedGrowthBytesMax);
+  const plateau = !leakSignal
+    && postGcSlopeMiBPerMinute != null
+    && Math.abs(postGcSlopeMiBPerMinute) <= plateauSlopeMiBPerMinuteMax;
 
   let verdict = "not-evaluated";
   const reasons = [];
@@ -1747,9 +2494,9 @@ export function summarizeMemoryTrend({
     } else if (finalThreePositive) {
       verdict = "fail";
       reasons.push("Post-GC heap increased across each of the final three windows");
-    } else if (peakUsedBytes != null && peakUsedBytes > peakUsedBytesMax) {
+    } else if (regularPeakUsedBytes != null && regularPeakUsedBytes > peakUsedBytesMax) {
       verdict = "fail";
-      reasons.push(`Post-GC heap peak exceeded ${peakUsedBytesMax} bytes`);
+      reasons.push(`Regular heap peak exceeded ${peakUsedBytesMax} bytes`);
     } else if (retainedGrowthRatio != null
         && retainedGrowthRatio * 100 > retainedGrowthPercentMax) {
       verdict = "fail";
@@ -1758,6 +2505,12 @@ export function summarizeMemoryTrend({
         && retainedGrowthBytes > retainedGrowthBytesMax) {
       verdict = "fail";
       reasons.push(`Retained post-GC heap grew by more than ${retainedGrowthBytesMax} bytes`);
+    } else if (!coverage.complete) {
+      verdict = "inconclusive";
+      reasons.push(
+        `heap memory samples covered ${round(coverage.durationCoverageRatio * 100)}% of the required duration `
+          + `with ${coverage.availableSampleCount}/${coverage.attemptedSampleCount || coverage.expectedSampleCount} usable samples`,
+      );
     } else {
       verdict = "pass";
     }
@@ -1769,18 +2522,29 @@ export function summarizeMemoryTrend({
     regularSampleCount: regular.length,
     postGcSampleCount: postGc.length,
     regularSlopeMiBPerMinute: regularSlope == null ? null : round(regularSlope * 60000 / MIB, 6),
-    postGcSlopeMiBPerMinute: postGcSlope == null ? null : round(postGcSlope * 60000 / MIB, 6),
+    postGcSlopeMiBPerMinute: postGcSlopeMiBPerMinute == null
+      ? null : round(postGcSlopeMiBPerMinute, 6),
     firstPostGcMiB: base == null ? null : round(base / MIB),
     lastPostGcMiB: end == null ? null : round(end / MIB),
     retainedGrowthPercent: retainedGrowthRatio == null ? null : round(retainedGrowthRatio * 100),
+    retainedGrowthBytes: retainedGrowthBytes == null ? null : round(retainedGrowthBytes),
     retainedGrowthMiB: retainedGrowthBytes == null ? null : round(retainedGrowthBytes / MIB),
-    peakUsedMiB: peakUsedBytes == null ? null : round(peakUsedBytes / MIB),
+    peakUsedMiB: regularPeakUsedBytes == null ? null : round(regularPeakUsedBytes / MIB),
+    regularPeakUsedMiB: regularPeakUsedBytes == null
+      ? null : round(regularPeakUsedBytes / MIB),
+    postGcPeakUsedMiB: postGcPeakUsedBytes == null
+      ? null : round(postGcPeakUsedBytes / MIB),
+    coverage,
     thresholds: {
       retainedGrowthPercentMax,
       retainedGrowthBytesMax,
       peakUsedBytesMax,
+      plateauSlopeMiBPerMinuteMax,
     },
     finalThreeWindowsPositive: finalThreePositive,
+    leakSignal,
+    plateau,
+    retainedTrend: leakSignal ? "leak-signal" : (plateau ? "plateau" : "non-plateau"),
     postGcFinalWindows: finalWindowCount,
     loadedChunkDelta,
   };
@@ -1794,6 +2558,12 @@ export function summarizeNativeMemoryTrend({
   durationMs = 0,
   requiredDurationMs = 1800000,
   postGcFinalWindows = 4,
+  attemptedSampleTimes = [],
+  sampleIntervalMs = 5000,
+  minimumAvailableRatio = 0.9,
+  minimumDurationCoverageRatio = 0.98,
+  maximumSampleGapRatio = 1.5,
+  cleanupSourceComplete = true,
 } = {}) {
   const fields = ["liveBytes", "liveRegions", "associatedBuffers"];
   const clean = (samples) => samples
@@ -1811,6 +2581,15 @@ export function summarizeNativeMemoryTrend({
     : regular[0] || null;
   const cleanupLast = cleanup.at(-1) || null;
   const finalWindowCount = Math.max(2, Math.floor(finiteNumber(postGcFinalWindows, 4)));
+  const coverage = summarizeTimedSampleCoverage({
+    attemptedSampleTimes,
+    availableSampleTimes: regular.map((sample) => sample.atMillis),
+    requiredDurationMs,
+    sampleIntervalMs,
+    minimumAvailableRatio,
+    minimumDurationCoverageRatio,
+    maximumSampleGapRatio,
+  });
   const tolerances = {
     liveBytes: Math.max(MIB, Number(reference?.liveBytes || 0) * 0.05),
     liveRegions: Math.max(16, Number(reference?.liveRegions || 0) * 0.05),
@@ -1851,6 +2630,15 @@ export function summarizeNativeMemoryTrend({
     } else if (fields.some((field) => metrics[field].finalThreeWindowsPositive)) {
       verdict = "fail";
       reasons.push("a BrowserMemory live metric increased across all final three post-GC windows");
+    } else if (!coverage.complete) {
+      verdict = "inconclusive";
+      reasons.push(
+        `BrowserMemory samples covered ${round(coverage.durationCoverageRatio * 100)}% of the required duration `
+          + `with ${coverage.availableSampleCount}/${coverage.attemptedSampleCount || coverage.expectedSampleCount} usable samples`,
+      );
+    } else if (cleanupSourceComplete !== true) {
+      verdict = "inconclusive";
+      reasons.push("post-exit BrowserMemory cleanup did not include complete page and Worker evidence");
     } else if (cleanupLast == null || reference == null) {
       verdict = "inconclusive";
       reasons.push("pre-world baseline or post-exit BrowserMemory cleanup samples are unavailable");
@@ -1868,6 +2656,8 @@ export function summarizeNativeMemoryTrend({
     postGcSampleCount: postGc.length,
     cleanupSampleCount: cleanup.length,
     postGcFinalWindows: finalWindowCount,
+    coverage,
+    cleanupSourceComplete: cleanupSourceComplete === true,
     metrics,
   };
 }
@@ -1924,8 +2714,9 @@ export function evaluatePerformanceGates({
       `longest frame ${longestFrameMs} ms exceeds ${gates.longestFrameMsMax} ms`,
     );
   }
-  const freezeCount = finiteNumber(freezes?.total, 0);
-  if (gates.freezeCountMax != null && freezeCount > gates.freezeCountMax) {
+  const freezeCountAvailable = hasOwnFinite(freezes, "total");
+  const freezeCount = freezeCountAvailable ? Number(freezes.total) : null;
+  if (freezeCountAvailable && gates.freezeCountMax != null && freezeCount > gates.freezeCountMax) {
     frameFailures.push(`freeze count ${freezeCount} exceeds ${gates.freezeCountMax}`);
   }
 
@@ -1939,8 +2730,12 @@ export function evaluatePerformanceGates({
       reasons: frameFailures,
     },
     freezes: {
-      verdict: freezeCount <= finiteNumber(gates.freezeCountMax, 0) ? "pass" : "fail",
-      reasons: freezes?.reasons || [],
+      verdict: !freezeCountAvailable
+        ? "inconclusive"
+        : (freezeCount <= finiteNumber(gates.freezeCountMax, 0) ? "pass" : "fail"),
+      reasons: !freezeCountAvailable
+        ? ["freeze telemetry total is missing or non-finite"]
+        : (freezes?.reasons || []),
     },
     queues: gates.queueHighWater
       ? {verdict: queues?.verdict || "inconclusive", reasons: queues?.reasons || []}

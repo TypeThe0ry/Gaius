@@ -42,7 +42,9 @@ printf '%s\n' "$TELEMETRY_BLOCK" \
 for field in \
     liveRegions liveBytes associatedBuffers \
     peakLiveRegions peakLiveBytes peakAssociatedBuffers \
-    allocations frees registrations reallocations collectedAssociations addressLookupMisses; do
+    allocations frees registrations reallocations collectedAssociations addressLookupMisses \
+    maxLiveBytes allocationFailures maxTemporaryBytes peakTemporaryBytes \
+    temporaryAllocationFailures; do
     printf '%s\n' "$TELEMETRY_BLOCK" | rg -q "memory\\.${field} =" \
         || die "missing scalar telemetry field: $field"
 done
@@ -79,6 +81,24 @@ public final class BrowserMemoryLifecycleSmoke {
     }
 
     public static void main(String[] args) throws Exception {
+        if (args.length > 0 && args[0].equals("budget")) {
+            verifyConfiguredBudget();
+            return;
+        }
+        if (args.length > 0 && args[0].equals("hard-cap")) {
+            verifyHardCaps();
+            return;
+        }
+        if (args.length > 0 && args[0].equals("jni-env")) {
+            verifyJniEnvironmentReplacement();
+            return;
+        }
+        if (args.length > 0 && args[0].equals("jni-init-failure")) {
+            verifyJniEnvironmentInitializationRollback();
+            return;
+        }
+        check(MemoryUtil.memAddressSafe((ByteBuffer) null) == 0L,
+                "patched memAddressSafe(null) did not preserve LWJGL null semantics");
         int baselineRegions = BrowserMemory.liveRegions();
         long baselineBytes = BrowserMemory.liveBytes();
         int baselineAssociations = BrowserMemory.associatedBuffers();
@@ -88,6 +108,7 @@ public final class BrowserMemoryLifecycleSmoke {
 
         verifyRepeatedAllocateDeriveFree(
                 baselineRegions, baselineBytes, baselineAssociations);
+        verifyByteBufferWrap(baselineRegions, baselineBytes, baselineAssociations);
         verifyReallocate(baselineRegions, baselineBytes, baselineAssociations);
         verifyRegister(baselineRegions, baselineBytes, baselineAssociations);
         verifyAutomaticBufferRegionRecovery(
@@ -126,6 +147,119 @@ public final class BrowserMemoryLifecycleSmoke {
                 BrowserMemory.associatedBuffers(),
                 BrowserMemory.collectedAssociations() - baselineCollected,
                 BrowserMemory.peakAssociatedBuffers());
+    }
+
+    private static void verifyByteBufferWrap(
+            int baselineRegions, long baselineBytes, int baselineAssociations) {
+        long address = BrowserMemory.allocate(64);
+        BrowserMemory.putInt(address + 12L, 0x2468_ace0);
+        ByteBuffer bytes = (ByteBuffer) BrowserMemory.wrap(
+                BrowserMemory.bufferClass(0), address + 8L, 16);
+        check(BrowserMemory.address0(bytes) == address + 8L,
+                "byte-buffer wrap address mismatch");
+        check(bytes.getInt(4) == 0x2468_ace0, "byte-buffer wrap lost aliasing");
+        check(BrowserMemory.associatedBuffers() == baselineAssociations + 1,
+                "byte-buffer wrap registered the same slice more than once");
+        BrowserMemory.free(address);
+        check(BrowserMemory.liveRegions() == baselineRegions,
+                "byte-buffer wrap region was not released");
+        check(BrowserMemory.liveBytes() == baselineBytes,
+                "byte-buffer wrap bytes were not released");
+        check(BrowserMemory.associatedBuffers() == baselineAssociations,
+                "byte-buffer wrap association was not released");
+
+        address = BrowserMemory.allocate(64);
+        IntBuffer ints = (IntBuffer) BrowserMemory.wrap(
+                BrowserMemory.bufferClass(3), address, 8);
+        check(BrowserMemory.associatedBuffers() == baselineAssociations + 1,
+                "typed wrap retained an invisible intermediate ByteBuffer association");
+        BrowserMemory.free((Buffer) ints);
+        check(BrowserMemory.liveRegions() == baselineRegions,
+                "typed wrap region was not released");
+        check(BrowserMemory.liveBytes() == baselineBytes,
+                "typed wrap bytes were not released");
+        check(BrowserMemory.associatedBuffers() == baselineAssociations,
+                "typed wrap association was not released");
+    }
+
+    private static void verifyJniEnvironmentReplacement() {
+        int baselineRegions = BrowserMemory.liveRegions();
+        long baselineBytes = BrowserMemory.liveBytes();
+        long lastTable = 0L;
+        int finalFunctionCount = 0;
+        for (int iteration = 0; iteration < REPEAT_COUNT; iteration++) {
+            finalFunctionCount = 64 + (iteration & 31);
+            lastTable = BrowserMemory.setupThreadEnv(finalFunctionCount);
+        }
+        long environment = BrowserMemory.threadJniEnv();
+        long expectedTableBytes = (long) (finalFunctionCount + 4) * Long.BYTES;
+        check(BrowserMemory.getLong(environment) == lastTable,
+                "JNI environment did not point at the latest function table");
+        check(BrowserMemory.liveRegions() == baselineRegions + 2,
+                "repeated JNI setup retained obsolete function-table regions");
+        check(BrowserMemory.liveBytes() == baselineBytes + Long.BYTES + expectedTableBytes,
+                "repeated JNI setup retained obsolete function-table bytes");
+        System.out.println("browser JNI environment replacement smoke passed");
+    }
+
+    private static void verifyJniEnvironmentInitializationRollback() {
+        long failuresBefore = BrowserMemory.allocationFailures();
+        try {
+            BrowserMemory.threadJniEnv();
+            throw new AssertionError("JNI environment initialization escaped the memory budget");
+        } catch (OutOfMemoryError expected) {
+            check(expected.getMessage().contains("Browser native memory budget exceeded"),
+                    "JNI environment initialization reported the wrong failure");
+        }
+        check(BrowserMemory.liveRegions() == 0,
+                "failed JNI environment initialization retained a native region");
+        check(BrowserMemory.liveBytes() == 0L,
+                "failed JNI environment initialization retained native bytes");
+        check(BrowserMemory.allocationFailures() == failuresBefore + 1L,
+                "failed JNI environment initialization telemetry did not advance");
+        System.out.println("browser JNI environment initialization rollback smoke passed");
+    }
+
+    private static void verifyConfiguredBudget() {
+        check(BrowserMemory.maxLiveBytes() == 1024L, "configured memory budget was ignored");
+        check(BrowserMemory.maxTemporaryBytes() == 128,
+                "configured temporary memory budget was ignored");
+        long failuresBefore = BrowserMemory.allocationFailures();
+        long temporaryFailuresBefore = BrowserMemory.temporaryAllocationFailures();
+        long address = BrowserMemory.allocate(768L);
+        try {
+            BrowserMemory.allocate(300L);
+            throw new AssertionError("native memory budget accepted an over-limit allocation");
+        } catch (OutOfMemoryError expected) {
+            check(expected.getMessage().contains("Browser native memory budget exceeded"),
+                    "native memory budget reported the wrong failure");
+        }
+        check(BrowserMemory.liveBytes() == 768L,
+                "failed allocation changed live native bytes");
+        check(BrowserMemory.allocationFailures() == failuresBefore + 1L,
+                "failed allocation telemetry did not advance");
+        try {
+            BrowserMemory.decodeAscii(0L, 129);
+            throw new AssertionError("temporary decode budget accepted an over-limit allocation");
+        } catch (OutOfMemoryError expected) {
+            check(expected.getMessage().contains("Browser temporary decode budget exceeded"),
+                    "temporary decode budget reported the wrong failure");
+        }
+        check(BrowserMemory.allocationFailures() == failuresBefore + 2L,
+                "temporary allocation failure did not advance total failure telemetry");
+        check(BrowserMemory.temporaryAllocationFailures() == temporaryFailuresBefore + 1L,
+                "temporary allocation failure telemetry did not advance");
+        BrowserMemory.free(address);
+        check(BrowserMemory.liveBytes() == 0L, "budget test did not release native bytes");
+        System.out.println("browser memory hard-budget smoke passed");
+    }
+
+    private static void verifyHardCaps() {
+        check(BrowserMemory.maxLiveBytes() == 2L * 1024L * 1024L * 1024L,
+                "configured native memory budget escaped its 2 GiB hard cap");
+        check(BrowserMemory.maxTemporaryBytes() == 16 * 1024 * 1024,
+                "configured temporary budget escaped its 16 MiB hard cap");
+        System.out.println("browser memory configured hard-cap smoke passed");
     }
 
     private static void verifyRepeatedAllocateDeriveFree(
@@ -439,3 +573,32 @@ java \
     -Xmx96m \
     -classpath "$TMP/classes:$MEMORY_JAR:$JOML_JAR" \
     org.lwjgl.system.BrowserMemoryLifecycleSmoke
+
+java \
+    -Xms32m \
+    -Xmx96m \
+    -Dgaius.browser.memory.maxBytes=1024 \
+    -Dgaius.browser.memory.maxTemporaryBytes=128 \
+    -classpath "$TMP/classes:$MEMORY_JAR:$JOML_JAR" \
+    org.lwjgl.system.BrowserMemoryLifecycleSmoke budget
+
+java \
+    -Xms32m \
+    -Xmx96m \
+    -Dgaius.browser.memory.maxBytes=9223372036854775807 \
+    -Dgaius.browser.memory.maxTemporaryBytes=9223372036854775807 \
+    -classpath "$TMP/classes:$MEMORY_JAR:$JOML_JAR" \
+    org.lwjgl.system.BrowserMemoryLifecycleSmoke hard-cap
+
+java \
+    -Xms32m \
+    -Xmx96m \
+    -classpath "$TMP/classes:$MEMORY_JAR:$JOML_JAR" \
+    org.lwjgl.system.BrowserMemoryLifecycleSmoke jni-env
+
+java \
+    -Xms32m \
+    -Xmx96m \
+    -Dgaius.browser.memory.maxBytes=32768 \
+    -classpath "$TMP/classes:$MEMORY_JAR:$JOML_JAR" \
+    org.lwjgl.system.BrowserMemoryLifecycleSmoke jni-init-failure

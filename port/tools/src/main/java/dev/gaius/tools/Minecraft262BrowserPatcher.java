@@ -13,15 +13,22 @@ import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.FieldNode;
 import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
+import org.objectweb.asm.tree.IntInsnNode;
 import org.objectweb.asm.tree.JumpInsnNode;
+import org.objectweb.asm.tree.LabelNode;
+import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.TryCatchBlockNode;
 import org.objectweb.asm.tree.TypeInsnNode;
 import org.objectweb.asm.tree.VarInsnNode;
 
 /** Removes Java 25 and desktop-only paths that remain reachable in Minecraft 26.2. */
 public final class Minecraft262BrowserPatcher {
     private static final String JDK_COMPAT = "dev/gaius/browser/BrowserJdkCompat";
+    private static final String WORLDGEN_SCHEDULER =
+            "dev/gaius/browser/BrowserWorldgenScheduler";
+    private static final int BROWSER_REGION_FILE_CACHE_SIZE = 16;
 
     private Minecraft262BrowserPatcher() {
     }
@@ -38,10 +45,16 @@ public final class Minecraft262BrowserPatcher {
         patchVulkanBackend(jar, root);
         patchGlDeviceCapabilities(jar, root);
         patchFramerateLimiter(jar, root);
-        patchVanillaTargetingObservation(jar, root);
+        patchChunkGenerationCooperation(jar, root);
+        patchDistanceManagerCooperation(jar, root);
+        patchServerChunkBroadcastCooperation(jar, root);
+        patchRegionFileStorageCache(jar, root);
+        patchGlBufferMappedViewRanges(jar, root);
+        patchLiveFrameTargeting(jar, root);
         patchSectionRenderTaskRetryYields(jar, root);
         patchSectionRenderEmergencyUpload(jar, root);
         patchStagingBuffer(jar, root);
+        patchUberGpuBufferNodeCleanup(jar, root);
         patchTemplateSource(jar, root);
         patchRemoteFriendList(jar, root);
         patchNativeModuleLister(jar, root);
@@ -54,6 +67,735 @@ public final class Minecraft262BrowserPatcher {
         patchIdentifierResolveAgainst(jar, root);
         patchCopyOnWriteFileSystem(jar, root);
         patchCopyOnWriteProvider(jar, root);
+    }
+
+    private static void patchChunkGenerationCooperation(String jar, Path root)
+            throws IOException {
+        String owner = "net/minecraft/server/level/ChunkGenerationTask";
+        ClassNode node = read(jar, owner + ".class");
+
+        requireWorldgenLoopPulses(
+                "ChunkGenerationTask.runUntilWait",
+                find(node, "runUntilWait", "()Ljava/util/concurrent/CompletableFuture;"),
+                1,
+                "pulse");
+        requireWorldgenLoopPulses(
+                "ChunkGenerationTask.scheduleLayer",
+                find(node, "scheduleLayer",
+                        "(Lnet/minecraft/world/level/chunk/status/ChunkStatus;Z)V"),
+                2,
+                "pulse");
+        requireWorldgenLoopPulses(
+                "ChunkGenerationTask.canLoadWithoutGeneration",
+                find(node, "canLoadWithoutGeneration", "()Z"),
+                2,
+                "pulse");
+
+        write(node, root.resolve(owner + ".class"));
+        System.out.println(
+                "Bounded Minecraft 26.2 chunk-generation layer and scan backedges");
+    }
+
+    /**
+     * Makes the vanilla DistanceManager work queue resumable. The snapshots are essential:
+     * worldgen yields pump urgent packets on this same logical server thread, and those packets
+     * may enqueue more ticket work. Clearing the live sets before walking their snapshots leaves
+     * that new work in the live sets for the next tick instead of invalidating an iterator or
+     * clearing it at the end of the pass.
+     */
+    private static void patchDistanceManagerCooperation(String jar, Path root)
+            throws IOException {
+        String owner = "net/minecraft/server/level/DistanceManager";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode method = find(
+                node,
+                "runAllUpdates",
+                "(Lnet/minecraft/server/level/ChunkMap;)Z");
+
+        int updateLimits = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction instanceof LdcInsnNode constant
+                    && Integer.valueOf(Integer.MAX_VALUE).equals(constant.cst)) {
+                method.instructions.set(
+                        constant,
+                        new MethodInsnNode(
+                                Opcodes.INVOKESTATIC,
+                                WORLDGEN_SCHEDULER,
+                                "distanceManagerUpdateBudget",
+                                "()I",
+                                false));
+                updateLimits++;
+            }
+        }
+        if (updateLimits != 2) {
+            throw new IllegalStateException(
+                    "DistanceManager update limits changed: " + updateLimits);
+        }
+
+        int processedRecords = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (!(instruction instanceof VarInsnNode store)
+                    || store.getOpcode() != Opcodes.ISTORE
+                    || !(previousOpcode(store) instanceof InsnNode subtract)
+                    || subtract.getOpcode() != Opcodes.ISUB) {
+                continue;
+            }
+            InsnList record = new InsnList();
+            record.add(new VarInsnNode(Opcodes.ILOAD, store.var));
+            record.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    WORLDGEN_SCHEDULER,
+                    "recordDistanceManagerUpdates",
+                    "(I)V",
+                    false));
+            method.instructions.insert(store, record);
+            processedRecords++;
+        }
+        requireOne("DistanceManager processed-update telemetry", processedRecords);
+
+        snapshotChunkFutureUpdates(method, owner);
+        snapshotTicketReleases(method, owner);
+        requireWorldgenLoopPulses(
+                "DistanceManager.runAllUpdates",
+                method,
+                3,
+                "pulseDistanceManager");
+
+        writeComputeFrames(node, root.resolve(owner + ".class"));
+        System.out.println(
+                "Bounded Minecraft 26.2 DistanceManager updates, ticket releases, and futures");
+    }
+
+    private static void snapshotChunkFutureUpdates(MethodNode method, String owner) {
+        java.util.List<MethodInsnNode> setIterators = new java.util.ArrayList<>();
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals("java/util/Set")
+                    && call.name.equals("iterator")
+                    && call.desc.equals("()Ljava/util/Iterator;")) {
+                FieldInsnNode field = fieldBefore(call);
+                if (field != null
+                        && field.owner.equals(owner)
+                        && field.name.equals("chunksToUpdateFutures")) {
+                    setIterators.add(call);
+                }
+            }
+        }
+        if (setIterators.size() != 2) {
+            throw new IllegalStateException(
+                    "DistanceManager chunks-to-update iterator count changed: "
+                            + setIterators.size());
+        }
+
+        MethodInsnNode originalClear = null;
+        MethodInsnNode secondIterator = setIterators.get(1);
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals("java/util/Set")
+                    && call.name.equals("clear")
+                    && call.desc.equals("()V")) {
+                FieldInsnNode field = fieldBefore(call);
+                if (field != null
+                        && field.owner.equals(owner)
+                        && field.name.equals("chunksToUpdateFutures")
+                        && method.instructions.indexOf(call)
+                                > method.instructions.indexOf(secondIterator)) {
+                    originalClear = call;
+                    break;
+                }
+            }
+        }
+        if (originalClear == null) {
+            throw new IllegalStateException("DistanceManager futures clear was not found");
+        }
+
+        int snapshotLocal = method.maxLocals++;
+        MethodInsnNode first = setIterators.get(0);
+        FieldInsnNode firstField = fieldBefore(first);
+        AbstractInsnNode firstOwner = previousOpcode(firstField);
+        requireReceiverLoad("DistanceManager first futures iterator", firstOwner, firstField);
+        InsnList firstSnapshot = new InsnList();
+        firstSnapshot.add(new TypeInsnNode(Opcodes.NEW, "java/util/ArrayList"));
+        firstSnapshot.add(new InsnNode(Opcodes.DUP));
+        firstSnapshot.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        firstSnapshot.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "chunksToUpdateFutures", "Ljava/util/Set;"));
+        firstSnapshot.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                "java/util/ArrayList",
+                "<init>",
+                "(Ljava/util/Collection;)V",
+                false));
+        firstSnapshot.add(new VarInsnNode(Opcodes.ASTORE, snapshotLocal));
+        firstSnapshot.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        firstSnapshot.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "chunksToUpdateFutures", "Ljava/util/Set;"));
+        firstSnapshot.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Set",
+                "clear",
+                "()V",
+                true));
+        firstSnapshot.add(new VarInsnNode(Opcodes.ALOAD, snapshotLocal));
+        firstSnapshot.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/List",
+                "iterator",
+                "()Ljava/util/Iterator;",
+                true));
+        method.instructions.insertBefore(firstOwner, firstSnapshot);
+        method.instructions.remove(first);
+        method.instructions.remove(firstField);
+        method.instructions.remove(firstOwner);
+
+        MethodInsnNode second = secondIterator;
+        FieldInsnNode secondField = fieldBefore(second);
+        AbstractInsnNode secondOwner = previousOpcode(secondField);
+        requireReceiverLoad("DistanceManager second futures iterator", secondOwner, secondField);
+        InsnList secondSnapshot = new InsnList();
+        secondSnapshot.add(new VarInsnNode(Opcodes.ALOAD, snapshotLocal));
+        secondSnapshot.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/List",
+                "iterator",
+                "()Ljava/util/Iterator;",
+                true));
+        method.instructions.insertBefore(secondOwner, secondSnapshot);
+        method.instructions.remove(second);
+        method.instructions.remove(secondField);
+        method.instructions.remove(secondOwner);
+
+        FieldInsnNode clearField = fieldBefore(originalClear);
+        AbstractInsnNode clearOwner = previousOpcode(clearField);
+        requireReceiverLoad("DistanceManager futures clear", clearOwner, clearField);
+        method.instructions.remove(originalClear);
+        method.instructions.remove(clearField);
+        method.instructions.remove(clearOwner);
+    }
+
+    private static void snapshotTicketReleases(MethodNode method, String owner) {
+        MethodInsnNode iterator = null;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals("it/unimi/dsi/fastutil/longs/LongSet")
+                    && call.name.equals("iterator")
+                    && call.desc.equals("()Lit/unimi/dsi/fastutil/longs/LongIterator;")) {
+                FieldInsnNode field = fieldBefore(call);
+                if (field != null
+                        && field.owner.equals(owner)
+                        && field.name.equals("ticketsToRelease")) {
+                    iterator = call;
+                    break;
+                }
+            }
+        }
+        if (iterator == null) {
+            throw new IllegalStateException("DistanceManager ticket iterator was not found");
+        }
+        FieldInsnNode iteratorField = fieldBefore(iterator);
+        AbstractInsnNode iteratorOwner = previousOpcode(iteratorField);
+        requireReceiverLoad("DistanceManager ticket iterator", iteratorOwner, iteratorField);
+        AbstractInsnNode iteratorStore = nextOpcode(iterator);
+        AbstractInsnNode hasNextLoad = nextOpcode(iteratorStore);
+        AbstractInsnNode hasNext = nextOpcode(hasNextLoad);
+        AbstractInsnNode endJump = nextOpcode(hasNext);
+        AbstractInsnNode nextLongLoad = nextOpcode(endJump);
+        AbstractInsnNode nextLong = nextOpcode(nextLongLoad);
+        AbstractInsnNode ticketStore = nextOpcode(nextLong);
+        if (!(iteratorStore instanceof VarInsnNode storeIterator)
+                || storeIterator.getOpcode() != Opcodes.ASTORE
+                || !(hasNextLoad instanceof VarInsnNode loadIterator)
+                || loadIterator.getOpcode() != Opcodes.ALOAD
+                || loadIterator.var != storeIterator.var
+                || !(hasNext instanceof MethodInsnNode hasNextCall)
+                || !hasNextCall.owner.equals("it/unimi/dsi/fastutil/longs/LongIterator")
+                || !hasNextCall.name.equals("hasNext")
+                || !(endJump instanceof JumpInsnNode end)
+                || end.getOpcode() != Opcodes.IFEQ
+                || !(nextLongLoad instanceof VarInsnNode loadNext)
+                || loadNext.getOpcode() != Opcodes.ALOAD
+                || loadNext.var != storeIterator.var
+                || !(nextLong instanceof MethodInsnNode nextLongCall)
+                || !nextLongCall.owner.equals("it/unimi/dsi/fastutil/longs/LongIterator")
+                || !nextLongCall.name.equals("nextLong")
+                || !(ticketStore instanceof VarInsnNode storeTicket)
+                || storeTicket.getOpcode() != Opcodes.LSTORE) {
+            throw new IllegalStateException("DistanceManager ticket loop shape changed");
+        }
+
+        JumpInsnNode backedge = null;
+        for (AbstractInsnNode instruction = ticketStore.getNext(); instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof JumpInsnNode jump
+                    && jump.getOpcode() == Opcodes.GOTO
+                    && method.instructions.indexOf(jump.label)
+                            <= method.instructions.indexOf(hasNextLoad)) {
+                backedge = jump;
+                break;
+            }
+        }
+        if (backedge == null) {
+            throw new IllegalStateException("DistanceManager ticket loop backedge was not found");
+        }
+
+        int ticketsLocal = method.maxLocals++;
+        int ticketIndexLocal = method.maxLocals++;
+        InsnList snapshot = new InsnList();
+        snapshot.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        snapshot.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                "ticketsToRelease",
+                "Lit/unimi/dsi/fastutil/longs/LongSet;"));
+        snapshot.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "it/unimi/dsi/fastutil/longs/LongSet",
+                "toLongArray",
+                "()[J",
+                true));
+        snapshot.add(new VarInsnNode(Opcodes.ASTORE, ticketsLocal));
+        snapshot.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        snapshot.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                "ticketsToRelease",
+                "Lit/unimi/dsi/fastutil/longs/LongSet;"));
+        snapshot.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "it/unimi/dsi/fastutil/longs/LongSet",
+                "clear",
+                "()V",
+                true));
+        snapshot.add(new InsnNode(Opcodes.ICONST_0));
+        snapshot.add(new VarInsnNode(Opcodes.ISTORE, ticketIndexLocal));
+        method.instructions.insertBefore(iteratorOwner, snapshot);
+        method.instructions.remove(iterator);
+        method.instructions.remove(iteratorField);
+        method.instructions.remove(iteratorOwner);
+        method.instructions.remove(iteratorStore);
+
+        LabelNode loopCheck = new LabelNode();
+        InsnList condition = new InsnList();
+        condition.add(loopCheck);
+        condition.add(new VarInsnNode(Opcodes.ILOAD, ticketIndexLocal));
+        condition.add(new VarInsnNode(Opcodes.ALOAD, ticketsLocal));
+        condition.add(new InsnNode(Opcodes.ARRAYLENGTH));
+        condition.add(new JumpInsnNode(Opcodes.IF_ICMPGE, end.label));
+        method.instructions.insertBefore(hasNextLoad, condition);
+        method.instructions.remove(hasNextLoad);
+        method.instructions.remove(hasNext);
+        method.instructions.remove(endJump);
+
+        InsnList ticketLoad = new InsnList();
+        ticketLoad.add(new VarInsnNode(Opcodes.ALOAD, ticketsLocal));
+        ticketLoad.add(new VarInsnNode(Opcodes.ILOAD, ticketIndexLocal));
+        ticketLoad.add(new InsnNode(Opcodes.LALOAD));
+        method.instructions.insertBefore(nextLongLoad, ticketLoad);
+        method.instructions.remove(nextLongLoad);
+        method.instructions.remove(nextLong);
+
+        InsnList advance = new InsnList();
+        advance.add(new org.objectweb.asm.tree.IincInsnNode(ticketIndexLocal, 1));
+        advance.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                WORLDGEN_SCHEDULER,
+                "pulseDistanceManager",
+                "()V",
+                false));
+        advance.add(new JumpInsnNode(Opcodes.GOTO, loopCheck));
+        method.instructions.insertBefore(backedge, advance);
+        method.instructions.remove(backedge);
+
+        MethodInsnNode clear = null;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals("it/unimi/dsi/fastutil/longs/LongSet")
+                    && call.name.equals("clear")
+                    && call.desc.equals("()V")) {
+                FieldInsnNode field = fieldBefore(call);
+                if (field != null
+                        && field.owner.equals(owner)
+                        && field.name.equals("ticketsToRelease")
+                        && method.instructions.indexOf(call)
+                                > method.instructions.indexOf(end.label)) {
+                    clear = call;
+                    break;
+                }
+            }
+        }
+        if (clear == null) {
+            throw new IllegalStateException("DistanceManager ticket clear was not found");
+        }
+        FieldInsnNode clearField = fieldBefore(clear);
+        AbstractInsnNode clearOwner = previousOpcode(clearField);
+        requireReceiverLoad("DistanceManager ticket clear", clearOwner, clearField);
+        method.instructions.remove(clear);
+        method.instructions.remove(clearField);
+        method.instructions.remove(clearOwner);
+    }
+
+    private static void patchServerChunkBroadcastCooperation(String jar, Path root)
+            throws IOException {
+        String owner = "net/minecraft/server/level/ServerChunkCache";
+        String holder = "net/minecraft/server/level/ChunkHolder";
+        String levelChunk = "net/minecraft/world/level/chunk/LevelChunk";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode method = find(
+                node,
+                "broadcastChangedChunks",
+                "(Lnet/minecraft/util/profiling/ProfilerFiller;)V");
+
+        LabelNode loop = new LabelNode();
+        LabelNode skip = new LabelNode();
+        LabelNode done = new LabelNode();
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new LdcInsnNode("broadcast"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "net/minecraft/util/profiling/ProfilerFiller",
+                "push",
+                "(Ljava/lang/String;)V",
+                true));
+        // Snapshot before a cooperative pulse. New dirty holders stay in the live set for next tick.
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "chunkHoldersToBroadcast", "Ljava/util/Set;"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Set",
+                "toArray",
+                "()[Ljava/lang/Object;",
+                true));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 2));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "chunkHoldersToBroadcast", "Ljava/util/Set;"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Set",
+                "clear",
+                "()V",
+                true));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new InsnNode(Opcodes.ARRAYLENGTH));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                WORLDGEN_SCHEDULER,
+                "beginChunkBroadcast",
+                "(I)V",
+                false));
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 3));
+        code.add(loop);
+        code.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new InsnNode(Opcodes.ARRAYLENGTH));
+        code.add(new JumpInsnNode(Opcodes.IF_ICMPGE, done));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        code.add(new InsnNode(Opcodes.AALOAD));
+        code.add(new TypeInsnNode(Opcodes.CHECKCAST, holder));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 4));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                holder,
+                "getTickingChunk",
+                "()Lnet/minecraft/world/level/chunk/LevelChunk;",
+                false));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 5));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        code.add(new JumpInsnNode(Opcodes.IFNULL, skip));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                holder,
+                "broadcastChanges",
+                "(L" + levelChunk + ";)V",
+                false));
+        code.add(skip);
+        code.add(new org.objectweb.asm.tree.IincInsnNode(3, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                WORLDGEN_SCHEDULER,
+                "pulseChunkBroadcast",
+                "()V",
+                false));
+        code.add(new JumpInsnNode(Opcodes.GOTO, loop));
+        code.add(done);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new InsnNode(Opcodes.ARRAYLENGTH));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                WORLDGEN_SCHEDULER,
+                "finishChunkBroadcast",
+                "(I)V",
+                false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "net/minecraft/util/profiling/ProfilerFiller",
+                "pop",
+                "()V",
+                true));
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(method, code, 3, 6);
+        writeComputeFrames(node, root.resolve(owner + ".class"));
+        System.out.println("Made Minecraft 26.2 changed-chunk broadcasts cooperative");
+    }
+
+    private static void patchUberGpuBufferNodeCleanup(String jar, Path root)
+            throws IOException {
+        String owner = "com/mojang/blaze3d/vertex/UberGpuBuffer";
+        String pair = "com/mojang/datafixers/util/Pair";
+        String allocator = "com/mojang/blaze3d/vertex/TlsfAllocator";
+        String heap = owner + "$UberGpuBufferHeap";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode method = find(
+                node,
+                "uploadStagedAllocations",
+                "(Lcom/mojang/blaze3d/systems/GpuDevice;"
+                        + "Lcom/mojang/blaze3d/vertex/StagingBuffer$Uploader;)Z");
+
+        MethodInsnNode finishUpload = null;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("dev/gaius/browser/BrowserRenderScheduler")
+                    && call.name.equals("finishUploadBuffer")
+                    && call.desc.equals("(Ljava/lang/Object;Ljava/util/Map;Ljava/util/Set;)V")) {
+                finishUpload = call;
+                break;
+            }
+        }
+        if (finishUpload == null) {
+            throw new IllegalStateException(
+                    "UberGpuBuffer upload budget patch must run before node cleanup patch");
+        }
+
+        MethodInsnNode cleanupIterator = null;
+        for (AbstractInsnNode instruction = finishUpload.getNext(); instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals("java/util/List")
+                    && call.name.equals("iterator")
+                    && call.desc.equals("()Ljava/util/Iterator;")) {
+                cleanupIterator = call;
+            }
+        }
+        if (cleanupIterator == null) {
+            throw new IllegalStateException("UberGpuBuffer free-heap iterator was not found");
+        }
+        FieldInsnNode nodesField = fieldBefore(cleanupIterator);
+        AbstractInsnNode cleanupStart = previousOpcode(nodesField);
+        requireReceiverLoad("UberGpuBuffer free-heap iterator", cleanupStart, nodesField);
+
+        VarInsnNode resultLoad = null;
+        for (AbstractInsnNode instruction = cleanupIterator.getNext(); instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof VarInsnNode load
+                    && load.getOpcode() == Opcodes.ILOAD
+                    && load.var == 3) {
+                resultLoad = load;
+            }
+        }
+        if (resultLoad == null) {
+            throw new IllegalStateException("UberGpuBuffer upload result load was not found");
+        }
+
+        int nodeCountLocal = method.maxLocals++;
+        int cursorLocal = method.maxLocals++;
+        int scannedLocal = method.maxLocals++;
+        int releasedLocal = method.maxLocals++;
+        int pairLocal = method.maxLocals++;
+        int allocatorLocal = method.maxLocals++;
+        LabelNode loop = new LabelNode();
+        LabelNode retain = new LabelNode();
+        LabelNode normalized = new LabelNode();
+        LabelNode done = new LabelNode();
+        LabelNode unchangedResult = new LabelNode();
+        InsnList cleanup = new InsnList();
+        cleanup.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        cleanup.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "nodes", "Ljava/util/List;"));
+        cleanup.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE, "java/util/List", "size", "()I", true));
+        cleanup.add(new VarInsnNode(Opcodes.ISTORE, nodeCountLocal));
+        cleanup.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        cleanup.add(new VarInsnNode(Opcodes.ILOAD, nodeCountLocal));
+        cleanup.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserRenderScheduler",
+                "beginUberNodeCleanup",
+                "(Ljava/lang/Object;I)I",
+                false));
+        cleanup.add(new VarInsnNode(Opcodes.ISTORE, cursorLocal));
+        cleanup.add(new InsnNode(Opcodes.ICONST_0));
+        cleanup.add(new VarInsnNode(Opcodes.ISTORE, scannedLocal));
+        cleanup.add(new InsnNode(Opcodes.ICONST_0));
+        cleanup.add(new VarInsnNode(Opcodes.ISTORE, releasedLocal));
+        cleanup.add(loop);
+        cleanup.add(new VarInsnNode(Opcodes.ILOAD, nodeCountLocal));
+        cleanup.add(new JumpInsnNode(Opcodes.IFEQ, done));
+        cleanup.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        cleanup.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserRenderScheduler",
+                "shouldCleanUberNode",
+                "(Ljava/lang/Object;)Z",
+                false));
+        cleanup.add(new JumpInsnNode(Opcodes.IFEQ, done));
+        cleanup.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        cleanup.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "nodes", "Ljava/util/List;"));
+        cleanup.add(new VarInsnNode(Opcodes.ILOAD, cursorLocal));
+        cleanup.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/List",
+                "get",
+                "(I)Ljava/lang/Object;",
+                true));
+        cleanup.add(new TypeInsnNode(Opcodes.CHECKCAST, pair));
+        cleanup.add(new VarInsnNode(Opcodes.ASTORE, pairLocal));
+        cleanup.add(new VarInsnNode(Opcodes.ALOAD, pairLocal));
+        cleanup.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, pair, "getFirst", "()Ljava/lang/Object;", false));
+        cleanup.add(new TypeInsnNode(Opcodes.CHECKCAST, allocator));
+        cleanup.add(new VarInsnNode(Opcodes.ASTORE, allocatorLocal));
+        cleanup.add(new VarInsnNode(Opcodes.ALOAD, allocatorLocal));
+        cleanup.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, allocator, "isCompletelyFree", "()Z", false));
+        cleanup.add(new JumpInsnNode(Opcodes.IFEQ, retain));
+        cleanup.add(new VarInsnNode(Opcodes.ALOAD, pairLocal));
+        cleanup.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, pair, "getSecond", "()Ljava/lang/Object;", false));
+        cleanup.add(new TypeInsnNode(Opcodes.CHECKCAST, heap));
+        cleanup.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                heap,
+                "gpuBuffer",
+                "Lcom/mojang/blaze3d/buffers/GpuBuffer;"));
+        cleanup.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "com/mojang/blaze3d/buffers/GpuBuffer",
+                "close",
+                "()V",
+                false));
+        cleanup.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        cleanup.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "nodes", "Ljava/util/List;"));
+        cleanup.add(new VarInsnNode(Opcodes.ILOAD, cursorLocal));
+        cleanup.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/List",
+                "remove",
+                "(I)Ljava/lang/Object;",
+                true));
+        cleanup.add(new InsnNode(Opcodes.POP));
+        cleanup.add(new org.objectweb.asm.tree.IincInsnNode(nodeCountLocal, -1));
+        cleanup.add(new org.objectweb.asm.tree.IincInsnNode(releasedLocal, 1));
+        cleanup.add(new JumpInsnNode(Opcodes.GOTO, normalized));
+        cleanup.add(retain);
+        cleanup.add(new org.objectweb.asm.tree.IincInsnNode(cursorLocal, 1));
+        cleanup.add(normalized);
+        cleanup.add(new org.objectweb.asm.tree.IincInsnNode(scannedLocal, 1));
+        cleanup.add(new VarInsnNode(Opcodes.ILOAD, nodeCountLocal));
+        cleanup.add(new JumpInsnNode(Opcodes.IFEQ, done));
+        cleanup.add(new VarInsnNode(Opcodes.ILOAD, cursorLocal));
+        cleanup.add(new VarInsnNode(Opcodes.ILOAD, nodeCountLocal));
+        cleanup.add(new JumpInsnNode(Opcodes.IF_ICMPLT, loop));
+        cleanup.add(new InsnNode(Opcodes.ICONST_0));
+        cleanup.add(new VarInsnNode(Opcodes.ISTORE, cursorLocal));
+        cleanup.add(new JumpInsnNode(Opcodes.GOTO, loop));
+        cleanup.add(done);
+        cleanup.add(new VarInsnNode(Opcodes.ILOAD, releasedLocal));
+        cleanup.add(new JumpInsnNode(Opcodes.IFEQ, unchangedResult));
+        cleanup.add(new InsnNode(Opcodes.ICONST_1));
+        cleanup.add(new VarInsnNode(Opcodes.ISTORE, 3));
+        cleanup.add(unchangedResult);
+        cleanup.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        cleanup.add(new VarInsnNode(Opcodes.ILOAD, cursorLocal));
+        cleanup.add(new VarInsnNode(Opcodes.ILOAD, nodeCountLocal));
+        cleanup.add(new VarInsnNode(Opcodes.ILOAD, scannedLocal));
+        cleanup.add(new VarInsnNode(Opcodes.ILOAD, releasedLocal));
+        cleanup.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserRenderScheduler",
+                "finishUberNodeCleanup",
+                "(Ljava/lang/Object;IIII)V",
+                false));
+        method.instructions.insertBefore(cleanupStart, cleanup);
+        for (AbstractInsnNode instruction = cleanupStart; instruction != resultLoad;) {
+            AbstractInsnNode next = instruction.getNext();
+            method.instructions.remove(instruction);
+            instruction = next;
+        }
+        writeComputeFrames(node, root.resolve(owner + ".class"));
+        System.out.println("Bounded Minecraft 26.2 UberGpuBuffer heap cleanup");
+    }
+
+    private static FieldInsnNode fieldBefore(AbstractInsnNode instruction) {
+        AbstractInsnNode previous = previousOpcode(instruction);
+        return previous instanceof FieldInsnNode field
+                && field.getOpcode() == Opcodes.GETFIELD ? field : null;
+    }
+
+    private static void requireReceiverLoad(
+            String target, AbstractInsnNode receiver, FieldInsnNode field) {
+        if (!(receiver instanceof VarInsnNode load)
+                || load.getOpcode() != Opcodes.ALOAD
+                || load.var != 0
+                || field == null) {
+            throw new IllegalStateException(target + " receiver shape changed");
+        }
+    }
+
+    private static void patchRegionFileStorageCache(String jar, Path root)
+            throws IOException {
+        String owner = "net/minecraft/world/level/chunk/storage/RegionFileStorage";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode getRegionFile = find(
+                node,
+                "getRegionFile",
+                "(Lnet/minecraft/world/level/ChunkPos;)"
+                        + "Lnet/minecraft/world/level/chunk/storage/RegionFile;");
+
+        int limits = 0;
+        for (AbstractInsnNode instruction : getRegionFile.instructions.toArray()) {
+            if (instruction instanceof IntInsnNode integer
+                    && integer.getOpcode() == Opcodes.SIPUSH
+                    && integer.operand == 256) {
+                getRegionFile.instructions.set(
+                        integer,
+                        new IntInsnNode(
+                                Opcodes.BIPUSH, BROWSER_REGION_FILE_CACHE_SIZE));
+                limits++;
+            }
+        }
+        requireOne("RegionFileStorage 256-entry cache limit", limits);
+
+        int constants = 0;
+        for (FieldNode field : node.fields) {
+            if (field.name.equals("MAX_CACHE_SIZE")
+                    && field.desc.equals("I")
+                    && Integer.valueOf(256).equals(field.value)) {
+                field.value = BROWSER_REGION_FILE_CACHE_SIZE;
+                constants++;
+            }
+        }
+        requireOne("RegionFileStorage MAX_CACHE_SIZE constant", constants);
+
+        write(node, root.resolve(owner + ".class"));
+        System.out.println(
+                "Bounded Minecraft 26.2 RegionFileStorage cache to "
+                        + BROWSER_REGION_FILE_CACHE_SIZE + " open files");
     }
 
     private static void patchNativeLibrariesBootstrap(String jar, Path root) throws IOException {
@@ -191,8 +933,149 @@ public final class Minecraft262BrowserPatcher {
         write(node, root.resolve(owner + ".class"));
     }
 
-    private static void patchVanillaTargetingObservation(String jar, Path root)
+    private static void patchGlBufferMappedViewRanges(String jar, Path root) throws IOException {
+        String directOwner = "com/mojang/blaze3d/opengl/GlBuffer$Direct";
+        String closeOwner = directOwner + "$1";
+        String mappedView = "com/mojang/blaze3d/buffers/GpuBufferSlice$MappedView";
+
+        ClassNode direct = read(jar, directOwner + ".class");
+        MethodNode map = find(direct, "map", "(JJZZ)L" + mappedView + ";");
+        int constructors = 0;
+        for (AbstractInsnNode instruction : map.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKESPECIAL
+                    || !call.owner.equals(closeOwner)
+                    || !call.name.equals("<init>")
+                    || !call.desc.equals("(L" + directOwner + ";)V")) {
+                continue;
+            }
+            InsnList range = new InsnList();
+            range.add(new VarInsnNode(Opcodes.LLOAD, 1));
+            range.add(new VarInsnNode(Opcodes.LLOAD, 3));
+            map.instructions.insertBefore(call, range);
+            call.desc = "(L" + directOwner + ";JJ)V";
+            constructors++;
+        }
+        requireOne("GlBuffer.Direct mapped-view close constructor", constructors);
+        map.maxStack = Math.max(map.maxStack, 8);
+
+        ClassNode close = read(jar, closeOwner + ".class");
+        close.fields.add(new FieldNode(
+                Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL, "mappedOffset", "J", null, null));
+        close.fields.add(new FieldNode(
+                Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL, "mappedLength", "J", null, null));
+
+        MethodNode constructor = find(close, "<init>", "(L" + directOwner + ";)V");
+        constructor.desc = "(L" + directOwner + ";JJ)V";
+        InsnList init = new InsnList();
+        init.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        init.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        init.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, closeOwner, "this$0", "L" + directOwner + ";"));
+        init.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        init.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false));
+        init.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        init.add(new InsnNode(Opcodes.ICONST_0));
+        init.add(new FieldInsnNode(Opcodes.PUTFIELD, closeOwner, "closed", "Z"));
+        init.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        init.add(new VarInsnNode(Opcodes.LLOAD, 2));
+        init.add(new FieldInsnNode(Opcodes.PUTFIELD, closeOwner, "mappedOffset", "J"));
+        init.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        init.add(new VarInsnNode(Opcodes.LLOAD, 4));
+        init.add(new FieldInsnNode(Opcodes.PUTFIELD, closeOwner, "mappedLength", "J"));
+        init.add(new InsnNode(Opcodes.RETURN));
+        replace(constructor, init, 3, 6);
+
+        MethodNode run = find(close, "run", "()V");
+        LabelNode active = new LabelNode();
+        LabelNode unmap = new LabelNode();
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, closeOwner, "closed", "Z"));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, active));
+        code.add(new InsnNode(Opcodes.RETURN));
+        code.add(active);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(new FieldInsnNode(Opcodes.PUTFIELD, closeOwner, "closed", "Z"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD, closeOwner, "this$0", "L" + directOwner + ";"));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, directOwner, "mappingFlags", "I"));
+        code.add(new IntInsnNode(Opcodes.BIPUSH, 16));
+        code.add(new InsnNode(Opcodes.IAND));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, unmap));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD, closeOwner, "this$0", "L" + directOwner + ";"));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                directOwner,
+                "dsa",
+                "Lcom/mojang/blaze3d/opengl/DirectStateAccess;"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD, closeOwner, "this$0", "L" + directOwner + ";"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, directOwner, "handle", "()I", false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, closeOwner, "mappedOffset", "J"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, closeOwner, "mappedLength", "J"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD, closeOwner, "this$0", "L" + directOwner + ";"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, directOwner, "usage", "()I", false));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "com/mojang/blaze3d/opengl/DirectStateAccess",
+                "flushMappedBufferRange",
+                "(IJJI)V",
+                false));
+        code.add(unmap);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD, closeOwner, "this$0", "L" + directOwner + ";"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, directOwner, "unmap", "()V", false));
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(run, code, 7, 1);
+
+        writeComputeFrames(direct, root.resolve(directOwner + ".class"));
+        writeComputeFrames(close, root.resolve(closeOwner + ".class"));
+        System.out.println("Patched GlBuffer mapped views to flush only their written ranges");
+    }
+
+    private static void patchLiveFrameTargeting(String jar, Path root)
             throws IOException {
+        String minecraftOwner = "net/minecraft/client/Minecraft";
+        ClassNode minecraft = read(jar, minecraftOwner + ".class");
+        MethodNode renderFrame = find(minecraft, "renderFrame", "(Z)V");
+        int deferred = 0;
+        for (AbstractInsnNode instruction = renderFrame.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                    && call.owner.equals(minecraftOwner)
+                    && call.name.equals("pick")
+                    && call.desc.equals("(F)V")) {
+                call.setOpcode(Opcodes.INVOKESTATIC);
+                call.owner = "dev/gaius/browser/BrowserTargeting";
+                call.name = "deferFramePick";
+                call.desc = "(Lnet/minecraft/client/Minecraft;F)V";
+                call.itf = false;
+                deferred++;
+            }
+        }
+        if (deferred != 1) {
+            throw new IllegalStateException(
+                    "Minecraft.renderFrame targeting deferral changed: " + deferred);
+        }
+        write(minecraft, root.resolve(minecraftOwner + ".class"));
+
         String owner = "net/minecraft/client/renderer/GameRenderer";
         ClassNode node = read(jar, owner + ".class");
         MethodNode extract = find(
@@ -200,6 +1083,7 @@ public final class Minecraft262BrowserPatcher {
                 "extract",
                 "(Lnet/minecraft/client/DeltaTracker;Z)V");
         MethodInsnNode extractCamera = null;
+        MethodInsnNode extractLevel = null;
         for (AbstractInsnNode instruction = extract.instructions.getFirst();
                 instruction != null;
                 instruction = instruction.getNext()) {
@@ -213,51 +1097,61 @@ public final class Minecraft262BrowserPatcher {
                             "GameRenderer.extract has multiple extractCamera calls");
                 }
                 extractCamera = call;
+            } else if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                    && call.owner.equals("net/minecraft/client/renderer/extract/LevelExtractor")
+                    && call.name.equals("extract")
+                    && call.desc.equals("(Lnet/minecraft/client/DeltaTracker;"
+                            + "Lnet/minecraft/client/Camera;F)V")) {
+                if (extractLevel != null) {
+                    throw new IllegalStateException(
+                            "GameRenderer.extract has multiple level extraction calls");
+                }
+                extractLevel = call;
             }
         }
         if (extractCamera == null) {
             throw new IllegalStateException(
                     "GameRenderer.extract current camera observation point was not found");
         }
-        AbstractInsnNode partialTick = extractCamera.getPrevious();
-        while (partialTick != null && partialTick.getOpcode() < 0) {
-            partialTick = partialTick.getPrevious();
-        }
-        if (!(partialTick instanceof VarInsnNode partialTickLoad)
-                || partialTickLoad.getOpcode() != Opcodes.FLOAD) {
+        if (extractLevel == null) {
             throw new IllegalStateException(
-                    "GameRenderer.extract camera partial tick load was not found");
+                    "GameRenderer.extract current level extraction point was not found");
+        }
+        AbstractInsnNode worldPartialTick = extractLevel.getPrevious();
+        while (worldPartialTick != null && worldPartialTick.getOpcode() < 0) {
+            worldPartialTick = worldPartialTick.getPrevious();
+        }
+        if (!(worldPartialTick instanceof VarInsnNode worldPartialTickLoad)
+                || worldPartialTickLoad.getOpcode() != Opcodes.FLOAD) {
+            throw new IllegalStateException(
+                    "GameRenderer.extract world partial tick load was not found");
         }
 
-        InsnList observe = new InsnList();
-        observe.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        observe.add(new FieldInsnNode(
+        InsnList refresh = new InsnList();
+        refresh.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        refresh.add(new FieldInsnNode(
                 Opcodes.GETFIELD,
                 owner,
                 "minecraft",
                 "Lnet/minecraft/client/Minecraft;"));
-        observe.add(new FieldInsnNode(
-                Opcodes.GETFIELD,
-                "net/minecraft/client/Minecraft",
-                "hitResult",
-                "Lnet/minecraft/world/phys/HitResult;"));
-        observe.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        observe.add(new FieldInsnNode(
+        refresh.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        refresh.add(new FieldInsnNode(
                 Opcodes.GETFIELD,
                 owner,
                 "mainCamera",
                 "Lnet/minecraft/client/Camera;"));
-        observe.add(new VarInsnNode(Opcodes.FLOAD, partialTickLoad.var));
-        observe.add(new MethodInsnNode(
+        refresh.add(new VarInsnNode(Opcodes.FLOAD, worldPartialTickLoad.var));
+        refresh.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 "dev/gaius/browser/BrowserTargeting",
-                "observeVanillaPick",
-                "(Lnet/minecraft/world/phys/HitResult;Lnet/minecraft/client/Camera;F)V",
+                "refreshFramePick",
+                "(Lnet/minecraft/client/Minecraft;Lnet/minecraft/client/Camera;F)V",
                 false));
-        extract.instructions.insert(extractCamera, observe);
+        extract.instructions.insert(extractCamera, refresh);
         extract.maxStack = Math.max(extract.maxStack, 3);
         write(node, root.resolve(owner + ".class"));
-        System.out.println("Instrumented Minecraft 26.2 vanilla single-raycast targeting");
+        System.out.println("Moved Minecraft 26.2 frame targeting after camera extraction");
     }
 
     private static void patchSectionRenderTaskRetryYields(String jar, Path root)
@@ -276,13 +1170,14 @@ public final class Minecraft262BrowserPatcher {
             int patched = replaceRenderThreadRetryWithYield(method, expectedResultLocal);
             int cancelled = replaceSpinWaitWithBoundedCancellation(method, owner);
             int cleared = clearUploadRetryOnReturns(method);
+            addUploadRetryExceptionCleanup(method);
             requireOne(owner + " upload retry yield", patched);
             requireOne(owner + " bounded upload retry cancellation", cancelled);
             if (cleared < 2) {
                 throw new IllegalStateException(owner + " return cleanup changed: " + cleared);
             }
             method.maxStack = Math.max(method.maxStack, 3);
-            write(node, root.resolve(owner + ".class"));
+            writeComputeFrames(node, root.resolve(owner + ".class"));
         }
     }
 
@@ -367,6 +1262,31 @@ public final class Minecraft262BrowserPatcher {
             patched++;
         }
         return patched;
+    }
+
+    private static void addUploadRetryExceptionCleanup(MethodNode method) {
+        LabelNode start = new LabelNode();
+        LabelNode end = new LabelNode();
+        LabelNode handler = new LabelNode();
+        method.instructions.insertBefore(method.instructions.getFirst(), start);
+        int throwableLocal = method.maxLocals++;
+        InsnList cleanup = new InsnList();
+        cleanup.add(end);
+        cleanup.add(handler);
+        cleanup.add(new VarInsnNode(Opcodes.ASTORE, throwableLocal));
+        cleanup.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        cleanup.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserRenderScheduler",
+                "clearUploadRetry",
+                "(Ljava/lang/Object;)V",
+                false));
+        cleanup.add(new VarInsnNode(Opcodes.ALOAD, throwableLocal));
+        cleanup.add(new InsnNode(Opcodes.ATHROW));
+        method.instructions.add(cleanup);
+        method.tryCatchBlocks.add(new TryCatchBlockNode(
+                start, end, handler, "java/lang/Throwable"));
+        method.maxStack = Math.max(method.maxStack, 1);
     }
 
     private static void patchSectionRenderEmergencyUpload(String jar, Path root)
@@ -889,6 +1809,38 @@ public final class Minecraft262BrowserPatcher {
         }
     }
 
+    private static void requireWorldgenLoopPulses(
+            String target, MethodNode method, int expectedPulses, String pulseMethod) {
+        int pulses = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction instanceof JumpInsnNode jump
+                    && method.instructions.indexOf(jump.label)
+                            < method.instructions.indexOf(instruction)) {
+                AbstractInsnNode previous = previousOpcode(jump);
+                if (!(previous instanceof MethodInsnNode call)
+                        || call.getOpcode() != Opcodes.INVOKESTATIC
+                        || !call.owner.equals(WORLDGEN_SCHEDULER)
+                        || !call.name.equals(pulseMethod)
+                        || !call.desc.equals("()V")) {
+                    method.instructions.insertBefore(
+                            jump,
+                            new MethodInsnNode(
+                                    Opcodes.INVOKESTATIC,
+                                    WORLDGEN_SCHEDULER,
+                                    pulseMethod,
+                                    "()V",
+                                    false));
+                }
+                pulses++;
+            }
+        }
+        if (pulses != expectedPulses) {
+            throw new IllegalStateException(
+                    target + " loop backedges changed: " + pulses
+                            + " (expected " + expectedPulses + ")");
+        }
+    }
+
     private static MethodNode find(ClassNode node, String name, String descriptor) {
         return node.methods.stream()
                 .filter(method -> method.name.equals(name) && method.desc.equals(descriptor))
@@ -915,6 +1867,19 @@ public final class Minecraft262BrowserPatcher {
 
     private static void write(ClassNode node, Path output) throws IOException {
         ClassWriter writer = new ClassWriter(0);
+        node.accept(writer);
+        Files.createDirectories(output.getParent());
+        Files.write(output, writer.toByteArray());
+    }
+
+    private static void writeComputeFrames(ClassNode node, Path output) throws IOException {
+        ClassWriter writer = new ClassWriter(
+                ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS) {
+            @Override
+            protected String getCommonSuperClass(String type1, String type2) {
+                return "java/lang/Object";
+            }
+        };
         node.accept(writer);
         Files.createDirectories(output.getParent());
         Files.write(output, writer.toByteArray());

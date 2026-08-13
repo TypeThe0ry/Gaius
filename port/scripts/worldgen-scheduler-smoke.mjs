@@ -7,11 +7,12 @@ import {tmpdir} from "node:os";
 import path from "node:path";
 
 const source = relative => readFile(new URL(relative, import.meta.url), "utf8");
-const [worldgen, packets, server, client] = await Promise.all([
+const [worldgen, packets, server, client, patcher262] = await Promise.all([
   source("../src/main/java/dev/gaius/browser/BrowserWorldgenScheduler.java"),
   source("../src/main/java/dev/gaius/browser/BrowserPacketScheduler.java"),
   source("../src/main/java/dev/gaius/browser/BrowserIntegratedServerMain.java"),
   source("../src/main/java/dev/gaius/browser/BrowserSingleplayerClient.java"),
+  source("../tools/src/main/java/dev/gaius/tools/Minecraft262BrowserPatcher.java"),
 ]);
 
 function numericConstant(name) {
@@ -37,6 +38,7 @@ function jsBody(methodDeclaration) {
 }
 
 const constants = {
+  defaultBudget: numericConstant("DEFAULT_SLICE_MILLIS"),
   minBudget: numericConstant("MIN_ADAPTIVE_SLICE_MILLIS"),
   recovery: numericConstant("BUDGET_RECOVERY_MILLIS"),
   moderateDelay: numericConstant("MODERATE_YIELD_DELAY_MILLIS"),
@@ -46,6 +48,9 @@ const constants = {
   minProgress: numericConstant("MIN_PROGRESS_PULSES_BEFORE_NETWORK_PREEMPTION"),
   maxNetworkWait: numericConstant("MAX_NETWORK_WAIT_PULSES"),
   maxPulses: numericConstant("MAX_PULSES_PER_TURN"),
+  distanceManagerDefault: numericConstant("DEFAULT_DISTANCE_MANAGER_UPDATE_BUDGET"),
+  distanceManagerMin: numericConstant("MIN_DISTANCE_MANAGER_UPDATE_BUDGET"),
+  distanceManagerMax: numericConstant("MAX_DISTANCE_MANAGER_UPDATE_BUDGET"),
 };
 
 assert.ok(worldgen.includes("TModernRuntimeSupport.yieldToEventLoop(0)"),
@@ -78,6 +83,8 @@ for (const field of [
   "sliceElapsedMillis",
   "p95SliceElapsedMillis",
   "p99SliceElapsedMillis",
+  "p95YieldDelayMillis",
+  "p99YieldDelayMillis",
   "maxSliceElapsedMillis",
   "budgetOverruns",
   "yieldDelayMillis",
@@ -92,14 +99,50 @@ assert.equal(constants.maxNetworkWait, constants.networkCheck,
   "network wait contract no longer matches the probe interval");
 assert.ok(constants.minProgress > 0 && constants.maxPulses >= constants.minProgress,
   "worldgen progress and hard-cap constants are inconsistent");
+assert.equal(constants.distanceManagerDefault, 64,
+  "DistanceManager default work budget changed without an explicit benchmark update");
+assert.equal(constants.distanceManagerMin, 8,
+  "DistanceManager minimum work budget no longer guarantees forward progress");
+assert.equal(constants.distanceManagerMax, 512,
+  "DistanceManager maximum work budget no longer bounds one server turn");
+for (const contract of [
+  "distanceManagerUpdateBudget()",
+  "recordDistanceManagerUpdates(int processed)",
+  "pulseDistanceManager()",
+  "beginChunkBroadcast(int entries)",
+  "pulseChunkBroadcast()",
+  "finishChunkBroadcast(int entries)",
+  "distanceManagerBudgetExhaustions",
+  "chunkBroadcastBatches",
+  "chunkBroadcastItems",
+]) {
+  assert.ok(worldgen.includes(contract), `missing cooperative worldgen contract: ${contract}`);
+}
+for (const contract of [
+  "patchDistanceManagerCooperation",
+  "snapshotChunkFutureUpdates",
+  "snapshotTicketReleases",
+  "patchServerChunkBroadcastCooperation",
+  '"distanceManagerUpdateBudget"',
+  '"pulseDistanceManager"',
+  '"beginChunkBroadcast"',
+  '"pulseChunkBroadcast"',
+  '"finishChunkBroadcast"',
+  "toLongArray",
+  "chunkHoldersToBroadcast",
+]) {
+  assert.ok(patcher262.includes(contract), `missing 26.2 cooperative patch contract: ${contract}`);
+}
 assert.ok(packets.includes("MAX_PACKETS_PER_BATCH = 16")
     && packets.includes("BATCH_BUDGET_NANOS = 2_000_000L"),
   "urgent packet handling is not count- and time-bounded");
 assert.ok(server.includes("Thread.currentThread() != serverThread")
     && server.includes("urgentPacketPumpActive"),
   "urgent packet handling can leave the server thread or reenter");
-assert.ok(client.includes("hardwareConcurrency) <= 4 ? 12 : 16"),
-  "singleplayer no longer supplies the audited 12/16 ms configured ceiling");
+assert.equal(constants.defaultBudget, 8,
+  "worldgen default slice no longer protects 60 FPS network delivery");
+assert.ok(client.includes("worldgenSliceMillis: 8"),
+  "singleplayer no longer supplies the audited 8 ms configured ceiling");
 assert.ok(client.includes("state.worldgen = copyScalarTelemetry"),
   "page telemetry does not expose Worker worldgen metrics");
 
@@ -112,6 +155,108 @@ globalThis.__gaiusNetworkStats = {
 };
 assert.equal(queueDepth(), 7, "queue pressure does not report the deepest bounded stage");
 delete globalThis.__gaiusNetworkStats;
+
+const distanceBudget = new Function(
+  "fallback",
+  jsBody("private static native int configuredDistanceManagerUpdateBudget(int fallback)"),
+);
+globalThis.__gaiusDistanceManagerUpdateBudget = 1;
+assert.equal(distanceBudget(constants.distanceManagerDefault), constants.distanceManagerMin,
+  "DistanceManager lower budget clamp regressed");
+globalThis.__gaiusDistanceManagerUpdateBudget = 10_000;
+assert.equal(distanceBudget(constants.distanceManagerDefault), constants.distanceManagerMax,
+  "DistanceManager upper budget clamp regressed");
+globalThis.__gaiusDistanceManagerUpdateBudget = 37.9;
+assert.equal(distanceBudget(constants.distanceManagerDefault), 37,
+  "DistanceManager budget no longer uses a stable integer cap");
+delete globalThis.__gaiusDistanceManagerUpdateBudget;
+
+const recordDistanceUpdates = new Function(
+  "budget",
+  "processed",
+  jsBody("private static native void recordDistanceManagerUpdatesJs(int budget, int processed)"),
+);
+const recordBroadcastStart = new Function(
+  "entries",
+  jsBody("private static native void recordChunkBroadcastStart(int entries)"),
+);
+const recordBroadcastItem = new Function(
+  jsBody("private static native void recordChunkBroadcastItem()"),
+);
+const recordBroadcastFinish = new Function(
+  "entries",
+  jsBody("private static native void recordChunkBroadcastFinish(int entries)"),
+);
+globalThis.__gaiusWorldgenStats = undefined;
+recordDistanceUpdates(64, 64);
+recordDistanceUpdates(64, 13);
+recordBroadcastStart(3);
+recordBroadcastItem();
+recordBroadcastItem();
+recordBroadcastItem();
+recordBroadcastFinish(3);
+assert.deepEqual(globalThis.__gaiusWorldgenStats, {
+  distanceManagerBatches: 2,
+  distanceManagerUpdateBudget: 64,
+  lastDistanceManagerUpdates: 13,
+  totalDistanceManagerUpdates: 77,
+  maxDistanceManagerUpdates: 64,
+  distanceManagerBudgetExhaustions: 1,
+  chunkBroadcastBatches: 1,
+  lastChunkBroadcastEntries: 3,
+  totalChunkBroadcastEntries: 3,
+  maxChunkBroadcastEntries: 3,
+  chunkBroadcastItems: 3,
+  lastChunkBroadcastCompleted: 3,
+  completedChunkBroadcastBatches: 1,
+}, "worldgen cooperative telemetry lost a bounded batch");
+delete globalThis.__gaiusWorldgenStats;
+
+function drainBoundedQueue(queue, budget) {
+  const current = queue.splice(0, Math.min(queue.length, budget));
+  return current;
+}
+
+const distanceQueue = Array.from({length: 197}, (_, index) => index);
+const distanceBatches = [];
+const distanceProcessed = [];
+while (distanceQueue.length > 0) {
+  const batch = drainBoundedQueue(distanceQueue, constants.distanceManagerDefault);
+  distanceBatches.push(batch.length);
+  distanceProcessed.push(...batch);
+}
+assert.deepEqual(distanceBatches, [64, 64, 64, 5],
+  "DistanceManager queue no longer resumes at the configured boundary");
+assert.deepEqual(distanceProcessed, Array.from({length: 197}, (_, index) => index),
+  "DistanceManager budget model dropped or reordered ticket work");
+
+function drainSnapshot(live, onEntry) {
+  const snapshot = [...live];
+  live.clear();
+  for (const entry of snapshot) onEntry(entry, live);
+  return snapshot;
+}
+
+const dirtyTickets = new Set(["ticket-a", "ticket-b", "ticket-c"]);
+const processedTickets = drainSnapshot(dirtyTickets, (entry, live) => {
+  if (entry === "ticket-b") {
+    live.add("ticket-b");
+    live.add("ticket-new");
+  }
+});
+assert.deepEqual(processedTickets, ["ticket-a", "ticket-b", "ticket-c"],
+  "ticket snapshot changed the current server-turn ordering");
+assert.deepEqual([...dirtyTickets], ["ticket-b", "ticket-new"],
+  "ticket work queued during a cooperative yield was dropped");
+
+const dirtyBroadcasts = new Set(["chunk-0", "chunk-1", "chunk-2"]);
+const processedBroadcasts = drainSnapshot(dirtyBroadcasts, (entry, live) => {
+  if (entry === "chunk-1") live.add("chunk-1");
+});
+assert.deepEqual(processedBroadcasts, ["chunk-0", "chunk-1", "chunk-2"],
+  "broadcast snapshot changed its current ordering");
+assert.deepEqual([...dirtyBroadcasts], ["chunk-1"],
+  "broadcast work marked dirty during a pulse was cleared at batch end");
 
 const reportSlice = new Function(
   "reason",
@@ -150,6 +295,8 @@ assert.ok(telemetry.p99SliceElapsedMillis >= telemetry.p95SliceElapsedMillis,
 assert.ok(telemetry.budgetOverruns > 0 && telemetry.maxBudgetOverrunMillis === 496,
   "budget overrun telemetry is incomplete");
 assert.equal(telemetry.maxYieldDelayMillis, 500, "yield delay telemetry lost the long load");
+assert.ok(telemetry.p99YieldDelayMillis >= telemetry.p95YieldDelayMillis,
+  "p99 yield delay telemetry is below p95");
 assert.equal(telemetry.maxQueueDepth, 12, "queue depth telemetry lost burst pressure");
 assert.equal(telemetry.networkPreemptions, 1, "network preemption telemetry is wrong");
 assert.equal(telemetry.networkWaitPulseLimit, constants.maxNetworkWait,
@@ -160,6 +307,8 @@ assert.equal(telemetry.maxReentrantYieldDepth, 1,
   "worldgen reentrant continuation depth was not recorded");
 assert.equal(Object.keys(telemetry).includes("__sliceHistogram"), false,
   "bounded percentile histogram leaks into scalar telemetry snapshots");
+assert.equal(Object.keys(telemetry).includes("__yieldDelayHistogram"), false,
+  "bounded yield-delay histogram leaks into scalar telemetry snapshots");
 delete globalThis.__gaiusWorldgenStats;
 delete globalThis.__gaiusWorldgenSliceMillis;
 

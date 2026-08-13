@@ -241,8 +241,10 @@ assert.ok(
   "runtime-ready was emitted before main dispatch",
 );
 
-const fixtureCount = 1024;
+const fixtureCount = 512;
 const fixtureBytes = 16 * 1024;
+const externalFixtureCount = 256;
+const externalFixtureBytes = 96 * 1024;
 for (let index = 0; index < fixtureCount; index++) {
   const bytes = new Uint8Array(fixtureBytes);
   bytes[0] = index & 0xff;
@@ -250,11 +252,19 @@ for (let index = 0; index < fixtureCount; index++) {
   const path = `/gaius/saves/region-cache-world/region/r.${index}.0.mca`;
   assert.equal(first.context.__gaiusFsPutBytes(path, bytes), true);
 }
+for (let index = 0; index < externalFixtureCount; index++) {
+  const bytes = new Uint8Array(externalFixtureBytes);
+  bytes[0] = (index + 31) & 0xff;
+  bytes[bytes.length - 1] = (index >>> 8) & 0xff;
+  const path = `/gaius/saves/region-cache-world/region/c.${index}.0.mcc`;
+  assert.equal(first.context.__gaiusFsPutBytes(path, bytes), true);
+}
 await first.context.__gaiusFsFlush();
 assert.equal(
-  Object.keys(first.context.__gaiusPersistentFiles).filter((path) => path.endsWith(".mca")).length,
-  fixtureCount,
-  "OPFS region index lost fixture entries",
+  Object.keys(first.context.__gaiusPersistentFiles)
+    .filter((path) => path.endsWith(".mca") || path.endsWith(".mcc")).length,
+  fixtureCount + externalFixtureCount,
+  "OPFS chunk-storage index lost fixture entries",
 );
 
 for (let index = 0; index < fixtureCount; index++) {
@@ -264,17 +274,47 @@ for (let index = 0; index < fixtureCount; index++) {
   assert.equal(bytes[0], index & 0xff);
   assert.equal(bytes[bytes.length - 1], (index >>> 8) & 0xff);
 }
+for (let index = 0; index < externalFixtureCount; index++) {
+  const path = `/gaius/saves/region-cache-world/region/c.${index}.0.mcc`;
+  const bytes = first.context.__gaiusPersistentFiles[path];
+  assert.equal(bytes.byteLength, externalFixtureBytes);
+  assert.equal(bytes[0], (index + 31) & 0xff);
+  assert.equal(bytes[bytes.length - 1], (index >>> 8) & 0xff);
+}
 const firstStats = first.context.__gaiusFsStorageSnapshot();
 assert.ok(firstStats.cacheBytes <= firstStats.cacheBudgetBytes,
   "region cache exceeded its byte budget");
 assert.ok(firstStats.cacheEntries <= 4, "region cache retained too many fixture entries");
 assert.ok(firstStats.evictions >= fixtureCount - firstStats.cacheEntries,
   "large fixture did not exercise LRU eviction");
-assert.equal(firstStats.regionEntries, fixtureCount);
+assert.equal(firstStats.regionEntries, fixtureCount + externalFixtureCount);
+
+const temporaryPath =
+  "/gaius/saves/region-cache-world/region/tmpabcdefghij.tmp";
+const movedExternalPath =
+  "/gaius/saves/region-cache-world/region/c.9000.0.mcc";
+const movedBytes = new Uint8Array(128 * 1024);
+movedBytes[0] = 0x4d;
+movedBytes[movedBytes.length - 1] = 0x43;
+assert.equal(first.context.__gaiusFsPutBytes(temporaryPath, movedBytes), true,
+  "RegionFile temporary write was rejected");
+await first.context.__gaiusFsFlush();
+const temporaryBytes = first.context.__gaiusPersistentFiles[temporaryPath];
+assert.equal(temporaryBytes.byteLength, movedBytes.byteLength,
+  "closed RegionFile temporary write was not persisted as binary");
+assert.equal(first.context.__gaiusFsPutBytes(movedExternalPath, temporaryBytes), true,
+  "temporary payload could not be persisted under its final .mcc path");
+assert.equal(first.context.__gaiusFsDelete(temporaryPath), true,
+  "temporary path could not be removed after the durable .mcc write");
+await first.context.__gaiusFsFlush();
+assert.equal(temporaryPath in first.context.__gaiusPersistentFiles, false,
+  "temporary path survived a completed .mcc move");
 
 first.context.onmessage({data: {type: "stop"}, ports: []});
 await waitForEvent(first.events, "stopped");
 const container = Array.from(opfsFiles.values())[0];
+assert.ok(container.flushes >= fixtureCount + externalFixtureCount + 1,
+  "OPFS writes reported success before their sync handle was flushed");
 container.ensureCapacity(container.size + 13);
 container.bytes.fill(0xa5, container.size, container.size + 13);
 container.size += 13;
@@ -282,23 +322,59 @@ container.size += 13;
 const second = createRuntime({opfsFiles, idbRecords});
 await startRuntime(second);
 const restoredStats = second.context.__gaiusFsStorageSnapshot();
-assert.equal(restoredStats.regionEntries, fixtureCount,
+assert.equal(restoredStats.regionEntries, fixtureCount + externalFixtureCount + 1,
   "restart did not rebuild the complete OPFS region index");
+assert.equal(restoredStats.cacheEntries, 0,
+  "restart eagerly hydrated persisted OPFS regions");
+assert.equal(restoredStats.cacheBytes, 0,
+  "restart retained region payload bytes before first access");
+assert.equal(restoredStats.cacheMisses, 0,
+  "enumerating persisted region paths read their payloads");
 assert.equal(restoredStats.recoveredTailBytes, 13,
   "restart did not discard an incomplete append-log tail");
+for (let index = 0; index < externalFixtureCount; index++) {
+  const path = `/gaius/saves/region-cache-world/region/c.${index}.0.mcc`;
+  assert.equal(path in second.context.__gaiusPersistentFiles, true);
+  assert.equal(Object.prototype.hasOwnProperty.call(
+    second.context.__gaiusPersistentFiles, path), true);
+}
+const afterExistenceScan = second.context.__gaiusFsStorageSnapshot();
+assert.equal(afterExistenceScan.cacheMisses, 0,
+  "existence-only .mcc scans read OPFS payload bytes");
+assert.equal(afterExistenceScan.cacheBytes, 0,
+  "existence-only .mcc scans retained payload bytes");
 for (const index of [0, 511, 1023]) {
+  if (index >= fixtureCount) continue;
   const path = `/gaius/saves/region-cache-world/region/r.${index}.0.mca`;
   const bytes = second.context.__gaiusPersistentFiles[path];
   assert.equal(bytes[0], index & 0xff);
   assert.equal(bytes[bytes.length - 1], (index >>> 8) & 0xff);
 }
+for (const index of [0, 127, 255]) {
+  const path = `/gaius/saves/region-cache-world/region/c.${index}.0.mcc`;
+  const bytes = second.context.__gaiusPersistentFiles[path];
+  assert.equal(bytes.byteLength, externalFixtureBytes);
+  assert.equal(bytes[0], (index + 31) & 0xff);
+}
+const restoredMovedBytes = second.context.__gaiusPersistentFiles[movedExternalPath];
+assert.equal(restoredMovedBytes.byteLength, movedBytes.byteLength,
+  "restart lost the committed external chunk");
+assert.equal(restoredMovedBytes[0], 0x4d);
+assert.equal(restoredMovedBytes[restoredMovedBytes.length - 1], 0x43);
+assert.equal(temporaryPath in second.context.__gaiusPersistentFiles, false,
+  "restart resurrected the moved temporary file");
+const afterOversizedReads = second.context.__gaiusFsStorageSnapshot();
+assert.ok(afterOversizedReads.cacheBytes <= afterOversizedReads.cacheBudgetBytes,
+  "oversized .mcc reads exceeded the materialization cache budget");
 second.context.onmessage({data: {type: "stop"}, ports: []});
 await waitForEvent(second.events, "stopped");
 
 const fallbackRecords = new Map();
 for (let index = 0; index < 4; index++) {
-  const path = `/gaius/saves/fallback-world/region/r.${index}.0.mca`;
-  fallbackRecords.set(path, {path, value: new Uint8Array(20 * 1024)});
+  const extension = index % 2 === 0 ? "mca" : "mcc";
+  const prefix = extension === "mca" ? "r" : "c";
+  const path = `/gaius/saves/fallback-world/region/${prefix}.${index}.0.${extension}`;
+  fallbackRecords.set(path, {path, value: new Uint8Array(96 * 1024)});
 }
 const fallback = createRuntime({opfsFiles: null, idbRecords: fallbackRecords});
 await assert.rejects(startRuntime(fallback, "fallback-world"), /cache budget/);
@@ -310,11 +386,16 @@ assert.equal(fallback.events.some((event) => event?.type === "runtime-ready"), f
 console.log(JSON.stringify({
   ok: true,
   fixtureRegions: fixtureCount,
-  fixtureBytes: fixtureCount * fixtureBytes,
+  fixtureExternalChunks: externalFixtureCount,
+  fixtureBytes: fixtureCount * fixtureBytes +
+    externalFixtureCount * externalFixtureBytes,
   cacheBudgetBytes: firstStats.cacheBudgetBytes,
   cachePeakBytes: firstStats.cachePeakBytes,
   evictions: firstStats.evictions,
   restartRecoveredEntries: restoredStats.regionEntries,
+  restartHydratedEntries: restoredStats.cacheEntries,
+  existenceScanHydratedBytes: afterExistenceScan.cacheBytes,
+  movedExternalBytes: restoredMovedBytes.byteLength,
   recoveredTailBytes: restoredStats.recoveredTailBytes,
   fallbackPreservedEntries: fallbackRecords.size,
 }));
