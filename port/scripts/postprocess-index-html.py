@@ -79,6 +79,42 @@ def migrate_raf_frame_samples(text: str) -> str:
     return text
 
 
+def migrate_text_shader_diagnostics(text: str) -> str:
+    """Teach the lightmap diagnostic about the Minecraft 26.2 text shader."""
+    sample_call = (
+        '.replace("vertexColor = Color * sample_lightmap(Sampler2, UV2);", '
+        '"vertexColor = Color;")'
+    )
+    legacy_call = (
+        '.replace("vertexColor = Color * texelFetch(Sampler2, UV2 / 16, 0);", '
+        '"vertexColor = Color;")'
+    )
+    legacy_count = text.count(legacy_call)
+    sample_count = text.count(sample_call)
+    if ("installLightweightTextShaderPatch" in text
+            and "__gaiusTextShaderTelemetry" not in text):
+        raise RuntimeError("index.html text diagnostic is missing bounded telemetry")
+    if legacy_count == 0:
+        return text
+    if sample_count == legacy_count:
+        return text
+    if sample_count != 0:
+        raise RuntimeError("index.html has a partially migrated text lightmap diagnostic")
+    for indentation in ("              ", "                "):
+        old = indentation + legacy_call
+        new = (
+            indentation + sample_call + "\n"
+            + indentation
+            + '.replace("vertexColor = Color * sample_lightmap(Sampler2, UV2)", '
+            + '"vertexColor = Color")\n'
+            + old
+        )
+        text = text.replace(old, new, 1)
+    if text.count(sample_call) != legacy_count:
+        raise RuntimeError("index.html text lightmap diagnostic migration was incomplete")
+    return text
+
+
 def content_token(*paths: Path) -> str:
     digest = hashlib.sha256()
     found = False
@@ -698,6 +734,7 @@ def patch_index(
     )
     text = index.read_text(encoding="utf-8")
     original = text
+    text = migrate_text_shader_diagnostics(text)
 
     vanilla_assets_loader = '''    const vanillaAssetsToken = "__VANILLA_ASSETS_TOKEN__";
     function hasGaiusVanillaAssetsMagic(bytes) {

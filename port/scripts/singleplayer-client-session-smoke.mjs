@@ -13,9 +13,11 @@ const source = await readFile(sourceUrl, "utf8");
 for (const contract of [
   "worker.__gaiusClientPort = channel.port1",
   "worker.__gaiusRuntimeReady = false",
+  "worker.__gaiusServerReady = false",
   "workers.get(sessionId) === worker",
   "ports.get(sessionId) === worker.__gaiusClientPort",
   "message.type === 'runtime-ready'",
+  "message.type === 'server-listener-ready'",
   "connectWhenWorkerReady(minecraft, sessionId, 0)",
   "localWorkerState(sessionId)",
   "rollbackLaunch(detail)",
@@ -39,6 +41,7 @@ function createSession(sessionId) {
     __gaiusClientPort: port,
     __gaiusClientAttached: false,
     __gaiusRuntimeReady: false,
+    __gaiusServerReady: false,
     __gaiusTerminal: false,
   };
   ports.set(sessionId, port);
@@ -62,7 +65,7 @@ function workerState(sessionId) {
   if (ports.get(sessionId) !== worker.__gaiusClientPort) {
     ports.set(sessionId, worker.__gaiusClientPort);
   }
-  return worker.__gaiusRuntimeReady && ports.get(sessionId) ? 1 : 0;
+  return worker.__gaiusServerReady && ports.get(sessionId) ? 1 : 0;
 }
 
 const collisionId = "00".repeat(16);
@@ -79,7 +82,10 @@ assert.equal(ports.get(collisionId), newWorker.__gaiusClientPort,
   "readiness poll did not restore its owned pending port");
 
 newWorker.__gaiusRuntimeReady = true;
-assert.equal(workerState(collisionId), 1, "runtime-ready worker was not attachable");
+assert.equal(workerState(collisionId), 0,
+  "runtime-ready worker connected before its local listener was registered");
+newWorker.__gaiusServerReady = true;
+assert.equal(workerState(collisionId), 1, "listener-ready worker was not attachable");
 
 ports.delete(collisionId);
 newWorker.__gaiusClientAttached = true;
@@ -188,6 +194,21 @@ function createLaunchRuntime(failureMode) {
     "start postMessage failure leaked the local-port map entry");
   assert.equal(runtime.context.__gaiusSingleplayerWorkers.size, 0,
     "start postMessage failure leaked the Worker map entry");
+}
+
+{
+  const runtime = createLaunchRuntime(null);
+  const sessionId = runtime.context.launchWorker("world", true, 6, 4);
+  assert.notEqual(sessionId, null);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const worker = runtime.createdWorkers[0];
+  assert.equal(worker.__gaiusServerReady, false,
+    "new Worker started with its server listener marked ready");
+  worker.onmessage({data: {type: "server-listener-ready", detail: sessionId}});
+  assert.equal(worker.__gaiusServerReady, true,
+    "listener-ready event did not release the client connection gate");
+  clearTimeout(worker.__gaiusHandoffTimeout);
+  worker.terminate();
 }
 
 {

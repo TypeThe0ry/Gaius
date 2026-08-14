@@ -5,6 +5,7 @@ import {createHash} from "node:crypto";
 import {mkdir, readFile, writeFile} from "node:fs/promises";
 import {dirname, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
+import {summarizeAcceptanceEvidence} from "./performance-metrics.mjs";
 
 const scriptsRoot = fileURLToPath(new URL(".", import.meta.url));
 const repositoryRoot = resolve(scriptsRoot, "../..");
@@ -96,13 +97,46 @@ export function validateContractShape(contractValue) {
   const hardTargetProfiles = uniqueStrings(releaseEvidence.hardTargetProfiles);
   const stabilityProfiles = uniqueStrings(releaseEvidence.stabilityProfiles);
   const requiredMemoryProfiles = uniqueStrings(releaseEvidence.requiredMemoryProfiles);
+  const matrixProfiles = uniqueStrings(releaseEvidence.uncappedMatrixProfiles);
+  const acceptance = releaseEvidence.acceptance;
   if (hardTargetProfiles.length === 0) {
     throw new Error("releaseEvidence.hardTargetProfiles must name at least one hard target");
+  }
+  if (matrixProfiles.length === 0) {
+    throw new Error("releaseEvidence.uncappedMatrixProfiles must name the FPS distance matrix");
+  }
+  if (!acceptance || typeof acceptance !== "object") {
+    throw new Error("releaseEvidence.acceptance is required for release-side measurements");
+  }
+  for (const [field, minimum] of [
+    ["maximumTwoSecondStalls", 0],
+    ["maximumFreezeCount", 0],
+    ["maximumCrashSignals", 0],
+  ]) {
+    if (!Number.isFinite(Number(acceptance[field])) || Number(acceptance[field]) !== minimum) {
+      throw new Error(`releaseEvidence.acceptance.${field} must be ${minimum}`);
+    }
+  }
+  for (const field of ["messagePortP99MaxMs", "messagePortMaxMs"]) {
+    if (!Number.isFinite(Number(acceptance[field])) || Number(acceptance[field]) <= 0) {
+      throw new Error(`releaseEvidence.acceptance.${field} must be positive`);
+    }
+  }
+  const acceptanceMemoryProfiles = uniqueStrings(acceptance.memoryRequiredProfiles);
+  if (canonicalJson(acceptanceMemoryProfiles) !== canonicalJson(requiredMemoryProfiles)) {
+    throw new Error(
+      "releaseEvidence.acceptance.memoryRequiredProfiles must match releaseEvidence.requiredMemoryProfiles",
+    );
+  }
+  if (!Array.isArray(acceptance.chunkBacklogPaths)
+      || uniqueStrings(acceptance.chunkBacklogPaths).length === 0) {
+    throw new Error("releaseEvidence.acceptance.chunkBacklogPaths must name chunk backlog telemetry");
   }
   const allConfiguredProfiles = uniqueStrings([
     ...hardTargetProfiles,
     ...stabilityProfiles,
     ...requiredMemoryProfiles,
+    ...matrixProfiles,
   ]);
   for (const name of allConfiguredProfiles) {
     if (!profileFrom(contractValue, name)) {
@@ -116,6 +150,24 @@ export function validateContractShape(contractValue) {
     }
     if (profile.driverSupported === false) {
       throw new Error(`Hard target ${JSON.stringify(name)} uses an unsupported driver route`);
+    }
+  }
+  for (const name of matrixProfiles) {
+    const profile = profileFrom(contractValue, name);
+    if (profile.driverSupported === false) {
+      throw new Error(`Uncapped matrix profile ${JSON.stringify(name)} is unsupported`);
+    }
+    if (profile.renderDistance == null || profile.simulationDistance == null) {
+      throw new Error(`Uncapped matrix profile ${JSON.stringify(name)} has no distance pair`);
+    }
+  }
+  const matrixDistances = new Set(matrixProfiles.map((name) => {
+    const profile = profileFrom(contractValue, name);
+    return `${Number(profile.renderDistance)}/${Number(profile.simulationDistance)}`;
+  }));
+  for (const requiredDistance of ["6/4", "8/4", "12/4"]) {
+    if (!matrixDistances.has(requiredDistance)) {
+      throw new Error(`Uncapped matrix is missing the ${requiredDistance} distance pair`);
     }
   }
 
@@ -155,6 +207,8 @@ export function validateContractShape(contractValue) {
     hardTargetProfiles,
     stabilityProfiles,
     requiredMemoryProfiles,
+    matrixProfiles,
+    acceptance,
     requiredMemorySoakMillis,
     mandatoryProfiles: uniqueStrings([...hardTargetProfiles, ...requiredMemoryProfiles]),
     supportedStabilityProfiles,
@@ -162,7 +216,11 @@ export function validateContractShape(contractValue) {
   };
 }
 
-export function createReleasePlan(contractValue, requestedProfiles = null, {smoke = false} = {}) {
+export function createReleasePlan(
+  contractValue,
+  requestedProfiles = null,
+  {smoke = false, matrix = false} = {},
+) {
   const contractShape = validateContractShape(contractValue);
   const requested = requestedProfiles == null
     ? null
@@ -174,7 +232,10 @@ export function createReleasePlan(contractValue, requestedProfiles = null, {smok
     ...contractShape.requiredMemoryProfiles,
     ...contractShape.supportedStabilityProfiles,
   ]);
-  const selectedProfiles = requested == null ? defaultProfiles : requested;
+  const selectedProfiles = uniqueStrings([
+    ...(requested == null ? defaultProfiles : requested),
+    ...(matrix ? contractShape.matrixProfiles : []),
+  ]);
   const unknownProfiles = selectedProfiles.filter((name) => !profileFrom(contractValue, name));
   if (unknownProfiles.length > 0) {
     throw new Error(`Unknown performance profile(s): ${unknownProfiles.join(", ")}`);
@@ -203,6 +264,7 @@ export function createReleasePlan(contractValue, requestedProfiles = null, {smok
     optionalSelectedProfiles: selectedProfiles.filter(
       (name) => !contractShape.mandatoryProfiles.includes(name),
     ),
+    matrix,
   };
 }
 
@@ -243,6 +305,7 @@ export function validateChildReport(report, {
   profileName,
   profile,
   contractSchemaVersion,
+  contractValue = contract,
   smoke = false,
   expectedBuildIdentity = null,
   uncappedEvidence = null,
@@ -259,11 +322,14 @@ export function validateChildReport(report, {
     : (expectedReleaseEvidence ? "release-gating" : "diagnostic-stress");
   const expectedVerdict = smoke ? "non-gating" : "pass";
   const releaseEvidenceRequired = !smoke && profile?.releaseEvidence === true;
+  const reportInconclusive = !smoke
+    && (String(report.verdict || "") === "inconclusive"
+      || String(analysis?.verdict || "") === "inconclusive");
 
   if (Number(report.schemaVersion) !== Number(contractSchemaVersion)) {
     failures.push("child report schemaVersion does not match the active contract");
   }
-  if (String(report.verdict || "") !== expectedVerdict) {
+  if (String(report.verdict || "") !== expectedVerdict && !reportInconclusive) {
     failures.push(`child report verdict must be ${JSON.stringify(expectedVerdict)}`);
   }
   if (!configuration || typeof configuration !== "object") {
@@ -294,7 +360,7 @@ export function validateChildReport(report, {
   if (!analysis || typeof analysis !== "object") {
     failures.push("child report is missing analysis");
   } else {
-    if (String(analysis.verdict || "") !== expectedVerdict) {
+    if (String(analysis.verdict || "") !== expectedVerdict && !reportInconclusive) {
       failures.push(`child report analysis.verdict must be ${JSON.stringify(expectedVerdict)}`);
     }
     if (analysis.passed !== true || report.passed !== true) {
@@ -384,6 +450,30 @@ export function validateChildReport(report, {
   if (report.releaseEvidence != null && Boolean(report.releaseEvidence) !== expectedReleaseEvidence) {
     failures.push("child report releaseEvidence is inconsistent with suite mode");
   }
+  if (reportInconclusive) {
+    failures.push("child report is inconclusive; release evidence is unverified");
+  }
+
+  const acceptanceEvidence = !smoke
+    ? summarizeAcceptanceEvidence({
+        report,
+        profileName,
+        profile,
+        contract: contractValue,
+      })
+    : null;
+  if (acceptanceEvidence && acceptanceEvidence.verdict !== "pass") {
+    if (acceptanceEvidence.failures.length > 0) {
+      failures.push(...acceptanceEvidence.failures.map(
+        (failure) => `acceptance evidence: ${failure}`,
+      ));
+    }
+    if (acceptanceEvidence.missing.length > 0) {
+      failures.push(
+        `acceptance evidence is unverified; missing: ${acceptanceEvidence.missing.join(", ")}`,
+      );
+    }
+  }
 
   const identityCandidates = [
     ["report.buildIdentity", report.buildIdentity],
@@ -428,6 +518,8 @@ export function validateChildReport(report, {
     gating: analysis?.gating ?? configuration?.gating ?? null,
     releaseEvidence: analysis?.releaseEvidence ?? configuration?.releaseEvidence ?? null,
     performanceEvidence: analysis?.performanceEvidence || null,
+    acceptanceEvidence,
+    inconclusive: reportInconclusive,
   };
 }
 
@@ -516,6 +608,7 @@ async function runProfile(name, profile, {smoke, beforeIdentity, forwarded, outp
     profileName: name,
     profile,
     contractSchemaVersion: contract.schemaVersion,
+    contractValue: contract,
     smoke,
     expectedBuildIdentity: beforeIdentity,
     uncappedEvidence: contract.environment?.uncappedEvidence,
@@ -531,10 +624,24 @@ async function runProfile(name, profile, {smoke, beforeIdentity, forwarded, outp
     validation.failures.push(`child report could not be read: ${reportError}`);
   }
   const expectedVerdict = smoke ? "non-gating" : "pass";
+  const acceptanceEvidence = validation.acceptanceEvidence
+    || (report ? summarizeAcceptanceEvidence({
+      report,
+      profileName: name,
+      profile,
+      contract,
+    }) : null);
+  const childVerdict = validation.valid
+    ? expectedVerdict
+    : ((acceptanceEvidence?.verdict === "inconclusive" || validation.inconclusive === true)
+      && execution.exitCode === 0
+      && validation.failures.every((failure) => failure.startsWith("acceptance evidence")
+        || failure.startsWith("child report is inconclusive"))
+      ? "inconclusive" : "fail");
   return {
     profile: name,
     evidenceRole: profile.evidenceRole || null,
-    verdict: validation.valid ? expectedVerdict : "fail",
+    verdict: childVerdict,
     durationMs: Date.now() - startedAt,
     output,
     exitCode: execution.exitCode,
@@ -550,6 +657,7 @@ async function runProfile(name, profile, {smoke, beforeIdentity, forwarded, outp
       || report?.performanceEvidence || null,
     failureEvidence: report?.analysis?.failureEvidence
       || report?.failureEvidence || null,
+    acceptanceEvidence,
     gating: smoke ? false : profile.releaseEvidence === true,
     releaseEvidence: smoke ? false : profile.releaseEvidence === true,
     memoryVerdict: report?.analysis?.memory?.verdict || null,
@@ -561,13 +669,14 @@ async function runProfile(name, profile, {smoke, beforeIdentity, forwarded, outp
 async function main() {
   const args = process.argv.slice(2);
   const smoke = args.includes("--smoke");
+  const matrix = args.includes("--matrix");
   if (!smoke && value(args, "--url")) {
     throw new Error(
       "strict release evidence must use the suite-owned local build server; --url is smoke-only",
     );
   }
   const requestedProfiles = args.includes("--profiles") ? value(args, "--profiles") : null;
-  const plan = createReleasePlan(contract, requestedProfiles, {smoke});
+  const plan = createReleasePlan(contract, requestedProfiles, {smoke, matrix});
   const outputDirectory = resolve(value(
     args,
     "--output-directory",
@@ -610,11 +719,14 @@ async function main() {
       contractSchemaVersion: contract.schemaVersion,
       mode: smoke ? "smoke-suite" : "strict-release",
       smoke,
+      matrix,
       gating: false,
       releaseEvidence: false,
       profiles: configuration,
       releasePlan: plan,
+      acceptance: plan.acceptance,
       requiredMemoryProfiles: plan.requiredMemoryProfiles,
+      matrixProfiles: plan.matrixProfiles,
       requiredMemorySoakMillis: plan.requiredMemorySoakMillis,
       uncappedEvidence: contract.environment?.uncappedEvidence,
       unsupportedProfiles: plan.unsupportedStabilityProfiles.map((name) => ({
@@ -682,6 +794,34 @@ async function main() {
     : (requiredMemoryEvidence.some((entry) => entry.verdict === "fail" || entry.memoryVerdict === "fail")
         ? "fail"
         : (requiredMemoryEvidence.every((entry) => entry.valid) ? "pass" : "inconclusive"));
+  const acceptanceSummary = results.map((entry) => {
+    const measured = entry.acceptanceEvidence?.measured || {};
+    const frame = measured.frame || {};
+    const freezes = measured.freezes || {};
+    const messagePort = measured.messagePort || {};
+    const profile = profileFrom(contract, entry.profile) || {};
+    return {
+      profile: entry.profile,
+      renderDistance: profile.renderDistance ?? null,
+      simulationDistance: profile.simulationDistance ?? null,
+      verdict: entry.verdict,
+      averageFps: frame.averageFps ?? null,
+      onePercentLowFps: frame.onePercentLowFps ?? null,
+      longestFrameMs: frame.longestFrameMs ?? null,
+      twoSecondStallCount: frame.longFramesAtLeast2s ?? null,
+      freezeCount: freezes.freezeCount ?? null,
+      memory: measured.memory || null,
+      chunkBacklog: measured.chunkBacklog || null,
+      messagePort: {
+        available: messagePort.available === true,
+        sampleCount: messagePort.sampleCount ?? null,
+        p99RttMillis: messagePort.p99RttMillis ?? null,
+        maxRttMillis: messagePort.maxRttMillis ?? null,
+      },
+      missing: entry.acceptanceEvidence?.missing || [],
+      failures: entry.acceptanceEvidence?.failures || [],
+    };
+  });
   const selectedResultsValid = results.length === configuration.length
     && results.every((entry) => smoke
       ? entry.verdict === "non-gating" && entry.releaseEvidence === false && entry.gating === false
@@ -689,7 +829,7 @@ async function main() {
   const strictPass = selectedResultsValid && requiredMemoryEvidenceVerdict === "pass";
   const verdict = smoke
     ? (selectedResultsValid ? "smoke-pass" : "smoke-fail")
-    : (results.some((entry) => entry.verdict === "fail")
+      : (results.some((entry) => entry.verdict === "fail")
         || requiredMemoryEvidenceVerdict === "fail"
         ? "fail"
         : (strictPass ? "pass" : "inconclusive"));
@@ -700,6 +840,7 @@ async function main() {
     generatedAt: new Date().toISOString(),
     mode: smoke ? "smoke-suite" : "strict-release",
     smoke,
+    matrix,
     gating: suiteReleaseEvidence,
     releaseEvidence: suiteReleaseEvidence,
     verdict,
@@ -718,13 +859,16 @@ async function main() {
     })),
     requiredMemoryProfiles: plan.requiredMemoryProfiles,
     requiredMemorySoakMillis: plan.requiredMemorySoakMillis,
+    matrixProfiles: plan.matrixProfiles,
+    acceptance: plan.acceptance,
     requiredMemoryEvidence,
     requiredMemoryEvidenceVerdict,
+    acceptanceSummary,
     results,
   };
   await mkdir(dirname(reportPath), {recursive: true});
   await writeFile(reportPath, JSON.stringify(report, null, 2) + "\n");
-  console.log(JSON.stringify({verdict, reportPath, results}, null, 2));
+  console.log(JSON.stringify({verdict, reportPath, acceptanceSummary, results}, null, 2));
   process.exitCode = report.passed ? 0 : 1;
 }
 

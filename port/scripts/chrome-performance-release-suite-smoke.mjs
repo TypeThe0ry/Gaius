@@ -9,6 +9,12 @@ import {
   validateContractShape,
   validateChildReport,
 } from "./chrome-performance-release-suite.mjs";
+import {summarizeAcceptanceEvidence} from "./performance-metrics.mjs";
+import {
+  acceptanceFixtureIdentity,
+  acceptanceFixtureProfile,
+  makeAcceptanceFixtureReport,
+} from "./chrome-performance-release-fixtures.mjs";
 
 const script = fileURLToPath(new URL(
   "./chrome-performance-release-suite.mjs",
@@ -18,6 +24,7 @@ const source = await readFile(script, "utf8");
 for (const required of [
   "createReleasePlan",
   "validateChildReport",
+  "summarizeAcceptanceEvidence",
   "hardTargetProfiles",
   "requiredMemoryProfiles",
   "unsupportedStabilityProfiles",
@@ -44,23 +51,20 @@ for (const required of [
   "child report verdict must be",
   '"smoke-pass"',
   'releaseEvidence: false',
+  "uncappedMatrixProfiles",
+  "acceptance evidence is unverified",
+  "--matrix",
 ]) {
   assert.ok(source.includes(required), `release suite is missing ${required}`);
 }
 
 const fixtureProfile = {
-  evidenceRole: "release-hard-target",
-  releaseEvidence: true,
-  scenario: "steady",
-  route: "singleplayer",
-  renderDistance: 6,
-  simulationDistance: 4,
-  gates: {memory: false},
+  ...acceptanceFixtureProfile,
 };
 const fixtureMemoryProfile = {
   ...fixtureProfile,
   evidenceRole: "release-stability",
-  gates: {memory: true},
+  gates: {...fixtureProfile.gates, memory: true},
   soakMs: 1_800_000,
 };
 const fixtureUnsupportedProfile = {
@@ -102,27 +106,43 @@ const fixtureContract = {
     hardTargetProfiles: ["hard-a", "hard-b"],
     stabilityProfiles: ["soak-mp"],
     requiredMemoryProfiles: ["memory-a"],
+    uncappedMatrixProfiles: ["hard-a", "matrix-8", "matrix-12"],
+    acceptance: {
+      maximumTwoSecondStalls: 0,
+      maximumFreezeCount: 0,
+      maximumCrashSignals: 0,
+      messagePortP99MaxMs: 250,
+      messagePortMaxMs: 2_000,
+      chunkBacklogPaths: [
+        "chunk.pendingTasks",
+        "chunk.compileBacklog",
+        "chunk.uploadBacklog",
+      ],
+      memoryRequiredProfiles: ["memory-a"],
+    },
   },
   profiles: {
     "hard-a": fixtureProfile,
     "hard-b": fixtureProfile,
+    "matrix-8": {
+      ...fixtureProfile,
+      evidenceRole: "diagnostic-stress",
+      releaseEvidence: false,
+      renderDistance: 8,
+    },
+    "matrix-12": {
+      ...fixtureProfile,
+      evidenceRole: "diagnostic-stress",
+      releaseEvidence: false,
+      renderDistance: 12,
+    },
     "memory-a": fixtureMemoryProfile,
     "soak-mp": fixtureUnsupportedProfile,
   },
 };
 assert.doesNotThrow(() => validateContractShape(fixtureContract));
 const fixtureUncappedEvidence = fixtureContract.environment.uncappedEvidence;
-const fixtureIdentity = {
-  manifestSha256: "a".repeat(64),
-  compatibilitySha256: "b".repeat(64),
-  coherent: true,
-  artifactCompatibilities: [
-    "b".repeat(64),
-    "b".repeat(64),
-    "b".repeat(64),
-    "b".repeat(64),
-  ],
-};
+const fixtureIdentity = acceptanceFixtureIdentity;
 
 assert.throws(
   () => createReleasePlan(fixtureContract, ["hard-a"], {smoke: false}),
@@ -144,49 +164,73 @@ assert.deepEqual(defaultPlan.unsupportedStabilityProfiles, ["soak-mp"]);
 
 function childReport(overrides = {}) {
   return {
-    schemaVersion: fixtureContract.schemaVersion,
-    passed: true,
-    verdict: "pass",
-    buildIdentity: fixtureIdentity,
-    configuration: {
+    ...makeAcceptanceFixtureReport({
       profileName: "hard-a",
-      contractSchemaVersion: fixtureContract.schemaVersion,
       profile: fixtureContract.profiles["hard-a"],
-      gating: true,
-      releaseEvidence: true,
-      strictChecks: true,
+      contractSchemaVersion: fixtureContract.schemaVersion,
       buildIdentity: fixtureIdentity,
-    },
-    analysis: {
-      verdict: "pass",
-      passed: true,
-      mode: "release-gating",
-      gating: true,
-      releaseEvidence: true,
-      evidenceRole: "release-hard-target",
-      environment: {profileName: "hard-a"},
-      performanceEvidence: {
-        framePacing: {
-          verdict: "pass",
-          observed: {
-            swapIntervalMin: 0,
-            swapIntervalMax: 0,
-            uncappedYieldCountMax: 8,
-            vsyncYieldCountMax: 0,
-            presentToRafCountMax: 0,
-            fairYieldCountMax: 2,
-            messageChannelCreateFailureCountMax: 0,
-            messageChannelPostFailureCountMax: 0,
-            messageChannelRebuildCountMax: 0,
-            cancelledMessageTaskCountMax: 0,
-            watchdogYieldCountMax: 0,
-          },
-        },
-      },
-    },
+    }),
     ...overrides,
   };
 }
+
+const completeAcceptance = summarizeAcceptanceEvidence({
+  report: childReport(),
+  profileName: "hard-a",
+  profile: fixtureContract.profiles["hard-a"],
+  contract: fixtureContract,
+});
+assert.equal(completeAcceptance.verdict, "pass");
+assert.equal(completeAcceptance.measured.frame.averageFps, 144);
+assert.equal(completeAcceptance.measured.frame.onePercentLowFps, 72);
+assert.equal(completeAcceptance.measured.frame.longFramesAtLeast2s, 0);
+assert.equal(completeAcceptance.measured.messagePort.p99RttMillis, 12);
+assert.equal(completeAcceptance.measured.chunkBacklog.paths["chunk.compileBacklog"].maximum, 1);
+assert.equal(completeAcceptance.measured.memory.available, true);
+
+const missingMessagePortChild = childReport();
+delete missingMessagePortChild.analysis.workerMessage;
+const missingMessagePortEvidence = summarizeAcceptanceEvidence({
+  report: missingMessagePortChild,
+  profileName: "hard-a",
+  profile: fixtureContract.profiles["hard-a"],
+  contract: fixtureContract,
+});
+assert.equal(missingMessagePortEvidence.verdict, "inconclusive");
+assert.match(missingMessagePortEvidence.missing.join("\n"), /messagePort/);
+
+const missingMemoryChild = childReport();
+delete missingMemoryChild.analysis.memory;
+const missingMemoryEvidence = summarizeAcceptanceEvidence({
+  report: missingMemoryChild,
+  profileName: "hard-a",
+  profile: fixtureContract.profiles["hard-a"],
+  contract: fixtureContract,
+});
+assert.equal(missingMemoryEvidence.verdict, "inconclusive");
+assert.match(missingMemoryEvidence.missing.join("\n"), /memory\.trend/);
+
+const stalledChild = childReport();
+stalledChild.analysis.frame.longFrames.atLeast2000Ms = 1;
+const stalledEvidence = summarizeAcceptanceEvidence({
+  report: stalledChild,
+  profileName: "hard-a",
+  profile: fixtureContract.profiles["hard-a"],
+  contract: fixtureContract,
+});
+assert.equal(stalledEvidence.verdict, "fail");
+assert.match(stalledEvidence.failures.join("\n"), /2-second stall/);
+
+const growingMemoryChild = childReport();
+growingMemoryChild.analysis.memory.v8Heap.leakSignal = true;
+const growingMemoryEvidence = summarizeAcceptanceEvidence({
+  report: growingMemoryChild,
+  profileName: "hard-a",
+  profile: fixtureContract.profiles["hard-a"],
+  contract: fixtureContract,
+});
+assert.equal(growingMemoryEvidence.verdict, "fail");
+assert.match(growingMemoryEvidence.failures.join("\n"), /memory trend/);
 
 assert.equal(validateChildReport(childReport(), {
   profileName: "hard-a",
@@ -195,6 +239,20 @@ assert.equal(validateChildReport(childReport(), {
   expectedBuildIdentity: fixtureIdentity,
   uncappedEvidence: fixtureUncappedEvidence,
 }).valid, true);
+const inconclusiveChild = childReport({
+  verdict: "inconclusive",
+  analysis: {...childReport().analysis, verdict: "inconclusive"},
+});
+const inconclusiveValidation = validateChildReport(inconclusiveChild, {
+  profileName: "hard-a",
+  profile: fixtureContract.profiles["hard-a"],
+  contractSchemaVersion: fixtureContract.schemaVersion,
+  expectedBuildIdentity: fixtureIdentity,
+  uncappedEvidence: fixtureUncappedEvidence,
+});
+assert.equal(inconclusiveValidation.valid, false);
+assert.equal(inconclusiveValidation.inconclusive, true);
+assert.match(inconclusiveValidation.failures.join("\n"), /unverified/);
 assert.equal(validateChildReport(childReport({
   analysis: {
     ...childReport().analysis,
@@ -312,6 +370,15 @@ assert.deepEqual(
   ["steady-6-4", "traversal-6-4", "soak-sp-6-4"],
 );
 assert.deepEqual(configuration.requiredMemoryProfiles, ["soak-sp-6-4"]);
+assert.equal(configuration.matrix, false);
+assert.deepEqual(configuration.matrixProfiles, [
+  "steady-6-4",
+  "steady-8-4",
+  "steady-12-4",
+  "traversal-6-4",
+  "traversal-8-4",
+  "traversal-12-4",
+]);
 assert.deepEqual(configuration.releasePlan.mandatoryProfiles, [
   "steady-6-4",
   "traversal-6-4",
@@ -320,6 +387,31 @@ assert.deepEqual(configuration.releasePlan.mandatoryProfiles, [
 assert.deepEqual(configuration.unsupportedProfiles.map((profile) => profile.profile), ["soak-mp-6-4"]);
 assert.equal(configuration.unsupportedProfiles[0].releaseEvidence, false);
 assert.equal(configuration.releaseEvidence, false);
+
+const matrixConfiguration = JSON.parse(execFileSync(
+  process.execPath,
+  [script, "--matrix", "--print-config"],
+  {encoding: "utf8", maxBuffer: 4 * 1024 * 1024},
+));
+assert.equal(matrixConfiguration.matrix, true);
+assert.deepEqual(
+  matrixConfiguration.profiles.map((profile) => profile.name),
+  [
+    "steady-6-4",
+    "traversal-6-4",
+    "soak-sp-6-4",
+    "steady-8-4",
+    "steady-12-4",
+    "traversal-8-4",
+    "traversal-12-4",
+  ],
+);
+assert.deepEqual(
+  matrixConfiguration.profiles
+    .filter((profile) => profile.name.endsWith("-8-4") || profile.name.endsWith("-12-4"))
+    .map((profile) => profile.name),
+  ["steady-8-4", "steady-12-4", "traversal-8-4", "traversal-12-4"],
+);
 
 assert.throws(
   () => execFileSync(

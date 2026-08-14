@@ -240,6 +240,7 @@ public final class LwjglOpenGLBrowserPatcher {
             add(methods, owner, "glGenFramebuffers", "()I", "genFramebuffer");
             add(methods, owner, "glBindFramebuffer", "(II)V", "bindFramebuffer");
             add(methods, owner, "glFramebufferTexture2D", "(IIIII)V", "framebufferTexture2D");
+            add(methods, owner, "glCheckFramebufferStatus", "(I)I", "checkFramebufferStatus");
             add(methods, owner, "glDeleteFramebuffers", "(I)V", "deleteFramebuffer");
             add(methods, owner, "glBlitFramebuffer", "(IIIIIIIIII)V", "blitFramebuffer");
         }

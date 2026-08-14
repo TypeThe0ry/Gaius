@@ -3,6 +3,7 @@ package dev.gaius.browser;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.browser.BrowserWebSocketChannel;
 import com.mojang.blaze3d.platform.MonitorManager;
+import com.mojang.blaze3d.platform.NativeImage;
 import com.mojang.blaze3d.platform.Window;
 import com.mojang.blaze3d.opengl.GlBackend;
 import com.mojang.blaze3d.shaders.GpuDebugOptions;
@@ -131,6 +132,8 @@ public final class PlatformSmoke {
             testBrowserAudio();
             smokeStage = "Unicode font fallback";
             testUnicodeFontFallbackAssets();
+            smokeStage = "bitmap font decode";
+            testBitmapFontAssetDecode();
             smokeStage = "browser crypto";
             testBrowserCrypto();
             smokeStage = "HTTP proxy";
@@ -175,6 +178,45 @@ public final class PlatformSmoke {
                 if (read.array()[index] != expected[index]) {
                     throw new AssertionError("FileChannel data mismatch at " + index);
                 }
+            }
+        }
+
+        byte marker = 0x5A;
+        try (FileChannel reopened = FileChannel.open(
+                path,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.READ,
+                StandardOpenOption.WRITE)) {
+            if (reopened.size() != 8192L + expected.length) {
+                throw new AssertionError(
+                        "READ+WRITE reopen truncated an existing region file: "
+                                + reopened.size());
+            }
+            ByteBuffer preserved = ByteBuffer.allocate(expected.length);
+            reopened.position(8192);
+            while (preserved.hasRemaining() && reopened.read(preserved) >= 0) {
+                // Preserve the existing chunk payload while opening it for updates.
+            }
+            if (!Arrays.equals(expected, preserved.array())) {
+                throw new AssertionError("READ+WRITE reopen changed existing region data");
+            }
+            reopened.position(0);
+            reopened.write(ByteBuffer.wrap(new byte[] {marker}));
+        }
+
+        try (FileChannel verified = FileChannel.open(path, StandardOpenOption.READ)) {
+            ByteBuffer first = ByteBuffer.allocate(1);
+            verified.read(first);
+            if (first.get(0) != marker || verified.size() != 8192L + expected.length) {
+                throw new AssertionError("Region update was not preserved across a second reopen");
+            }
+            ByteBuffer preserved = ByteBuffer.allocate(expected.length);
+            verified.position(8192);
+            while (preserved.hasRemaining() && verified.read(preserved) >= 0) {
+                // Verify both the header update and the prior chunk payload survived.
+            }
+            if (!Arrays.equals(expected, preserved.array())) {
+                throw new AssertionError("Region payload was lost after update and reopen");
             }
         }
     }
@@ -1384,6 +1426,9 @@ public final class PlatformSmoke {
         GL11.glClearColor(0.08F, 0.10F, 0.14F, 1.0F);
         GL11.glClear(GL11.GL_COLOR_BUFFER_BIT | GL11.GL_DEPTH_BUFFER_BIT);
 
+        testMappedPixelBufferTextureUpload();
+        testMappedR8PixelBufferTextureUpload();
+
         int texture = GL11.glGenTextures();
         GL11.glBindTexture(GL11.GL_TEXTURE_2D, texture);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
@@ -1439,6 +1484,210 @@ public final class PlatformSmoke {
         GL15.glDeleteBuffers(buffer);
         GL11.glDeleteTextures(texture);
     }
+
+    /** Matches the 26.2 bitmap-font path: mapped staging buffer, PBO upload, then sampling. */
+    private static void testMappedPixelBufferTextureUpload() {
+        int fontBufferBytes = 128 * 128 * 4;
+        int pixelBuffer = GL33C.glGenBuffers();
+        int texture = GL11.glGenTextures();
+        int framebuffer = GL33C.glGenFramebuffers();
+        ByteBuffer source = MemoryUtil.memAlloc(fontBufferBytes);
+        ByteBuffer readback = MemoryUtil.memAlloc(4);
+        try {
+            source.put(0, (byte) 0x21);
+            source.put(1, (byte) 0x43);
+            source.put(2, (byte) 0x65);
+            source.put(3, (byte) 0xFF);
+            source.put(fontBufferBytes - 1, (byte) 0x7D);
+            GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, pixelBuffer);
+            GL33C.glBufferData(
+                    GL33C.GL_PIXEL_UNPACK_BUFFER, fontBufferBytes, GL33C.GL_STREAM_DRAW);
+            ByteBuffer mapped = GL33C.glMapBufferRange(
+                    GL33C.GL_PIXEL_UNPACK_BUFFER,
+                    0L,
+                    fontBufferBytes,
+                    GL33C.GL_MAP_WRITE_BIT | GL33C.GL_MAP_FLUSH_EXPLICIT_BIT);
+            ByteBuffer mappedView = MemoryUtil.memSlice(mapped, 0, fontBufferBytes);
+            MemoryUtil.memCopy(source, mappedView);
+            GL33C.glFlushMappedBufferRange(
+                    GL33C.GL_PIXEL_UNPACK_BUFFER, 0L, fontBufferBytes);
+            int stagedRgba = readBoundPixelUnpackBufferRgba();
+            int expectedRgba = 0x21 | (0x43 << 8) | (0x65 << 16) | (0xFF << 24);
+            if (stagedRgba != expectedRgba) {
+                throw new AssertionError(
+                        "Mapped pixel-buffer flush changed RGBA bytes: "
+                                + Integer.toUnsignedString(stagedRgba, 16));
+            }
+            if (readBoundPixelUnpackBufferByte(fontBufferBytes - 1) != 0x7D) {
+                throw new AssertionError("Mapped font-sized buffer copy truncated its tail");
+            }
+            if (!GL33C.glUnmapBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER)) {
+                throw new AssertionError("Mapped pixel buffer could not be unmapped");
+            }
+            GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, 0);
+
+            GL11.glBindTexture(GL11.GL_TEXTURE_2D, texture);
+            GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
+            GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
+            GL11.glTexImage2D(
+                    GL11.GL_TEXTURE_2D,
+                    0,
+                    GL33C.GL_RGBA8,
+                    1,
+                    1,
+                    0,
+                    GL11.GL_RGBA,
+                    GL11.GL_UNSIGNED_BYTE,
+                    (ByteBuffer) null);
+            GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, pixelBuffer);
+            GL11.glTexSubImage2D(
+                    GL11.GL_TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    1,
+                    1,
+                    GL11.GL_RGBA,
+                    GL11.GL_UNSIGNED_BYTE,
+                    0L);
+            GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, 0);
+
+            GL33C.glBindFramebuffer(GL33C.GL_FRAMEBUFFER, framebuffer);
+            GL33C.glFramebufferTexture2D(
+                    GL33C.GL_FRAMEBUFFER,
+                    GL33C.GL_COLOR_ATTACHMENT0,
+                    GL11.GL_TEXTURE_2D,
+                    texture,
+                    0);
+            int framebufferStatus = GL33C.glCheckFramebufferStatus(GL33C.GL_FRAMEBUFFER);
+            if (framebufferStatus != GL33C.GL_FRAMEBUFFER_COMPLETE) {
+                throw new AssertionError(
+                        "Mapped pixel-buffer smoke framebuffer is incomplete: "
+                                + framebufferStatus);
+            }
+            GL11.glReadPixels(0, 0, 1, 1, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, readback);
+            int red = readback.get(0) & 0xFF;
+            int green = readback.get(1) & 0xFF;
+            int blue = readback.get(2) & 0xFF;
+            int alpha = readback.get(3) & 0xFF;
+            if (red != 0x21 || green != 0x43 || blue != 0x65 || alpha != 0xFF) {
+                throw new AssertionError(
+                        "Mapped pixel-buffer texture upload changed RGBA bytes: "
+                                + red + "/" + green + "/" + blue + "/" + alpha);
+            }
+        } finally {
+            GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, 0);
+            GL33C.glBindFramebuffer(GL33C.GL_FRAMEBUFFER, 0);
+            GL33C.glDeleteFramebuffers(framebuffer);
+            GL11.glDeleteTextures(texture);
+            GL33C.glDeleteBuffers(pixelBuffer);
+            MemoryUtil.memFree(source);
+            MemoryUtil.memFree(readback);
+        }
+    }
+
+    /** Matches the single-channel atlas used by uncolored 26.2 font glyphs. */
+    private static void testMappedR8PixelBufferTextureUpload() {
+        int pixelBuffer = GL33C.glGenBuffers();
+        int texture = GL11.glGenTextures();
+        int framebuffer = GL33C.glGenFramebuffers();
+        ByteBuffer source = MemoryUtil.memAlloc(1);
+        ByteBuffer readback = MemoryUtil.memAlloc(4);
+        try {
+            source.put(0, (byte) 0xCC);
+            GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, pixelBuffer);
+            GL33C.glBufferData(GL33C.GL_PIXEL_UNPACK_BUFFER, 1L, GL33C.GL_STREAM_DRAW);
+            ByteBuffer mapped = GL33C.glMapBufferRange(
+                    GL33C.GL_PIXEL_UNPACK_BUFFER,
+                    0L,
+                    1L,
+                    GL33C.GL_MAP_WRITE_BIT | GL33C.GL_MAP_FLUSH_EXPLICIT_BIT);
+            ByteBuffer mappedView = MemoryUtil.memSlice(mapped, 0, 1);
+            MemoryUtil.memCopy(source, mappedView);
+            GL33C.glFlushMappedBufferRange(GL33C.GL_PIXEL_UNPACK_BUFFER, 0L, 1L);
+            if (!GL33C.glUnmapBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER)) {
+                throw new AssertionError("Mapped R8 pixel buffer could not be unmapped");
+            }
+            GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, 0);
+
+            GL11.glBindTexture(GL11.GL_TEXTURE_2D, texture);
+            GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
+            GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
+            GL11.glTexImage2D(
+                    GL11.GL_TEXTURE_2D,
+                    0,
+                    GL33C.GL_R8,
+                    1,
+                    1,
+                    0,
+                    GL11.GL_RED,
+                    GL11.GL_UNSIGNED_BYTE,
+                    (ByteBuffer) null);
+            GL11.glPixelStorei(GL11.GL_UNPACK_ALIGNMENT, 1);
+            GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, pixelBuffer);
+            GL11.glTexSubImage2D(
+                    GL11.GL_TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    1,
+                    1,
+                    GL11.GL_RED,
+                    GL11.GL_UNSIGNED_BYTE,
+                    0L);
+            GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, 0);
+            GL11.glPixelStorei(GL11.GL_UNPACK_ALIGNMENT, 4);
+
+            GL33C.glBindFramebuffer(GL33C.GL_FRAMEBUFFER, framebuffer);
+            GL33C.glFramebufferTexture2D(
+                    GL33C.GL_FRAMEBUFFER,
+                    GL33C.GL_COLOR_ATTACHMENT0,
+                    GL11.GL_TEXTURE_2D,
+                    texture,
+                    0);
+            int framebufferStatus = GL33C.glCheckFramebufferStatus(GL33C.GL_FRAMEBUFFER);
+            if (framebufferStatus != GL33C.GL_FRAMEBUFFER_COMPLETE) {
+                throw new AssertionError(
+                        "Mapped R8 pixel-buffer smoke framebuffer is incomplete: "
+                                + framebufferStatus);
+            }
+            GL11.glReadPixels(0, 0, 1, 1, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, readback);
+            int red = readback.get(0) & 0xFF;
+            int green = readback.get(1) & 0xFF;
+            int blue = readback.get(2) & 0xFF;
+            int alpha = readback.get(3) & 0xFF;
+            if (red != 0xCC || green != 0 || blue != 0 || alpha != 0xFF) {
+                throw new AssertionError(
+                        "Mapped R8 pixel-buffer texture upload changed RGBA bytes: "
+                                + red + "/" + green + "/" + blue + "/" + alpha);
+            }
+        } finally {
+            GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, 0);
+            GL11.glPixelStorei(GL11.GL_UNPACK_ALIGNMENT, 4);
+            GL33C.glBindFramebuffer(GL33C.GL_FRAMEBUFFER, 0);
+            GL33C.glDeleteFramebuffers(framebuffer);
+            GL11.glDeleteTextures(texture);
+            GL33C.glDeleteBuffers(pixelBuffer);
+            MemoryUtil.memFree(source);
+            MemoryUtil.memFree(readback);
+        }
+    }
+
+    @JSBody(script = """
+            const gl=window.__gaiusWebGL;
+            const rgba=new Uint8Array(4);
+            gl.getBufferSubData(gl.PIXEL_UNPACK_BUFFER,0,rgba);
+            return (rgba[0]|(rgba[1]<<8)|(rgba[2]<<16)|(rgba[3]<<24))|0;
+            """)
+    private static native int readBoundPixelUnpackBufferRgba();
+
+    @JSBody(params = "offset", script = """
+            const gl=window.__gaiusWebGL;
+            const value=new Uint8Array(1);
+            gl.getBufferSubData(gl.PIXEL_UNPACK_BUFFER,offset|0,value);
+            return value[0]|0;
+            """)
+    private static native int readBoundPixelUnpackBufferByte(int offset);
 
     private static void testBrowserAudio() throws Exception {
         long device = ALC10.alcOpenDevice((CharSequence) null);
@@ -1541,6 +1790,33 @@ public final class PlatformSmoke {
             }
             if (!foundHexFile) {
                 throw new AssertionError("Unicode font archive has no unihex glyph data");
+            }
+        }
+    }
+
+    private static void testBitmapFontAssetDecode() throws Exception {
+        String resource = "assets/minecraft/textures/font/ascii.png";
+        try (InputStream encoded = openPackagedAsset(resource)) {
+            if (encoded == null) {
+                throw new AssertionError("Bitmap font texture was not packaged: " + resource);
+            }
+            try (NativeImage image = NativeImage.read(encoded)) {
+                if (image.getWidth() != 128 || image.getHeight() != 128) {
+                    throw new AssertionError(
+                            "Bitmap font texture dimensions changed: "
+                                    + image.getWidth() + "x" + image.getHeight());
+                }
+                ByteBuffer pixels = image.getPixelBytes();
+                int nonZero = 0;
+                for (int index = pixels.position(); index < pixels.limit(); index++) {
+                    if (pixels.get(index) != 0) {
+                        nonZero++;
+                    }
+                }
+                if (nonZero < 512) {
+                    throw new AssertionError(
+                            "Bitmap font texture decoded as empty: nonZero=" + nonZero);
+                }
             }
         }
     }

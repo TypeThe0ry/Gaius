@@ -56,7 +56,8 @@ class PostprocessTeaVMJSTest(unittest.TestCase):
             target.write_text(
                 TEAVM_LONG_HELPER
                 + "let runtime={};runtime.$rt_startThread=()=>{};"
-                + "let worker={};worker.pumpIntegratedServerNetworkInput=pump;",
+                + "let worker = {};\n"
+                + "worker.pumpIntegratedServerNetworkInput = pump;",
                 encoding="utf-8",
             )
 

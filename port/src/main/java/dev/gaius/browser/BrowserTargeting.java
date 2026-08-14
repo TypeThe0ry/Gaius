@@ -3,8 +3,13 @@ package dev.gaius.browser;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
-import net.minecraft.world.phys.EntityHitResult;
+import net.minecraft.core.Direction;
+import net.minecraft.world.entity.EntitySelector;
+import net.minecraft.world.entity.projectile.ProjectileUtil;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.EntityHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import org.teavm.jso.JSBody;
@@ -56,9 +61,51 @@ public final class BrowserTargeting {
             recordTargetingResult(false, partialTick, current, camera);
             return current;
         }
-        HitResult updated = minecraft.player.raycastHitResult(partialTick, camera.entity());
+        Vec3 cameraPosition = camera.position();
+        HitResult updated = pickFromRenderCamera(minecraft, camera, cameraPosition);
         recordTargetingResult(true, partialTick, updated, camera);
         return updated;
+    }
+
+    private static HitResult pickFromRenderCamera(
+            Minecraft minecraft,
+            Camera camera,
+            Vec3 cameraPosition) {
+        double blockRange = minecraft.player.blockInteractionRange();
+        double entityRange = minecraft.player.entityInteractionRange();
+        double pickRange = Math.max(blockRange, entityRange);
+        Vec3 forward = new Vec3(camera.forwardVector()).normalize();
+        Vec3 end = cameraPosition.add(forward.scale(pickRange));
+        BlockHitResult block = minecraft.level.clip(new ClipContext(
+                cameraPosition,
+                end,
+                ClipContext.Block.OUTLINE,
+                ClipContext.Fluid.NONE,
+                camera.entity()));
+        double blockDistanceSquared = block.getType() == HitResult.Type.MISS
+                ? pickRange * pickRange
+                : cameraPosition.distanceToSqr(block.getLocation());
+        AABB searchBounds = new AABB(cameraPosition, end).inflate(1.0D);
+        EntityHitResult entityHit = ProjectileUtil.getEntityHitResult(
+                camera.entity(),
+                cameraPosition,
+                end,
+                searchBounds,
+                EntitySelector.CAN_BE_PICKED,
+                blockDistanceSquared);
+        if (entityHit != null
+                && cameraPosition.distanceToSqr(entityHit.getLocation()) < blockDistanceSquared
+                && cameraPosition.distanceToSqr(entityHit.getLocation()) < entityRange * entityRange) {
+            return entityHit;
+        }
+        if (block.getType() != HitResult.Type.MISS
+                && blockDistanceSquared < blockRange * blockRange) {
+            return block;
+        }
+        return BlockHitResult.miss(
+                end,
+                Direction.getApproximateNearest(forward.x, forward.y, forward.z),
+                BlockPos.containing(end));
     }
 
     /** Records the current-version vanilla pick without performing another raycast. */
@@ -90,6 +137,18 @@ public final class BrowserTargeting {
         Vec3 cameraPosition = camera != null && camera.isInitialized()
                 ? camera.position()
                 : Vec3.ZERO;
+        double cameraOriginError = 0.0;
+        double cameraDirectionError = 0.0;
+        if (camera != null && camera.isInitialized() && camera.entity() != null) {
+            cameraOriginError = Math.sqrt(cameraPosition.distanceToSqr(
+                    camera.entity().getEyePosition(partialTick)));
+            if (result != null) {
+                Vec3 cameraForward = new Vec3(camera.forwardVector()).normalize();
+                Vec3 hitDirection = result.getLocation().subtract(cameraPosition).normalize();
+                double dot = Math.max(-1.0D, Math.min(1.0D, cameraForward.dot(hitDirection)));
+                cameraDirectionError = Math.acos(dot);
+            }
+        }
         recordTargetingFrame(
                 updated,
                 partialTick,
@@ -99,7 +158,9 @@ public final class BrowserTargeting {
                 blockZ,
                 cameraPosition.x,
                 cameraPosition.y,
-                cameraPosition.z);
+                cameraPosition.z,
+                cameraOriginError,
+                cameraDirectionError);
     }
 
     @JSBody(script = "return !!globalThis.__gaiusBenchmarkEnabled;")
@@ -123,7 +184,9 @@ public final class BrowserTargeting {
             "blockZ",
             "cameraX",
             "cameraY",
-            "cameraZ"
+            "cameraZ",
+            "cameraOriginError",
+            "cameraDirectionError"
     }, script = """
             if (!globalThis.__gaiusBenchmarkEnabled) return;
             const state=globalThis.__gaiusTargetingTelemetry ||
@@ -162,6 +225,14 @@ public final class BrowserTargeting {
             state.cameraX=Number(cameraX);
             state.cameraY=Number(cameraY);
             state.cameraZ=Number(cameraZ);
+            state.cameraOriginError=Math.max(0,Number(cameraOriginError)||0);
+            state.maxCameraOriginError=Math.max(
+              Number(state.maxCameraOriginError)||0,
+              state.cameraOriginError);
+            state.cameraDirectionError=Math.max(0,Number(cameraDirectionError)||0);
+            state.maxCameraDirectionError=Math.max(
+              Number(state.maxCameraDirectionError)||0,
+              state.cameraDirectionError);
             let ring=state.ring;
             if (!ring || !(ring.blockX instanceof Int32Array)) {
               ring={
@@ -173,6 +244,8 @@ public final class BrowserTargeting {
                 cameraX:new Float64Array(256),
                 cameraY:new Float64Array(256),
                 cameraZ:new Float64Array(256),
+                cameraOriginError:new Float32Array(256),
+                cameraDirectionError:new Float32Array(256),
                 writeIndex:0,
                 count:0
               };
@@ -187,6 +260,8 @@ public final class BrowserTargeting {
             ring.cameraX[index]=Number(cameraX);
             ring.cameraY[index]=Number(cameraY);
             ring.cameraZ[index]=Number(cameraZ);
+            ring.cameraOriginError[index]=state.cameraOriginError;
+            ring.cameraDirectionError[index]=state.cameraDirectionError;
             ring.writeIndex=(index+1)&255;
             ring.count=Math.min(256,(Number(ring.count)||0)+1);
             state.lastAt=Date.now();
@@ -200,5 +275,7 @@ public final class BrowserTargeting {
             int blockZ,
             double cameraX,
             double cameraY,
-            double cameraZ);
+            double cameraZ,
+            double cameraOriginError,
+            double cameraDirectionError);
 }

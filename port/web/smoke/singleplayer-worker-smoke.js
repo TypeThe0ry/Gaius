@@ -1,19 +1,51 @@
 "use strict";
 
-const PROTOCOL_VERSION = 774;
 const SERVER_PORT = 25565;
 const PROFILE_ID = "00000000000040008000000000000002";
 const SMOKE_TIMEOUT_MS = 240000;
 const STOP_TIMEOUT_MS = 30000;
 const DB_NAME = "gaius-fs-v1";
 const STORE_NAME = "files";
+const PLAY_PROTOCOLS = Object.freeze({
+  774: Object.freeze({
+    clientbound: Object.freeze({
+      disconnect: 32,
+      keepAlive: 43,
+      levelChunkWithLight: 44,
+      login: 48,
+      ping: 59,
+    }),
+    serverbound: Object.freeze({
+      chunkBatchReceived: 10,
+      keepAlive: 27,
+      playerLoaded: 43,
+      pong: 44,
+    }),
+  }),
+  776: Object.freeze({
+    clientbound: Object.freeze({
+      disconnect: 32,
+      keepAlive: 44,
+      levelChunkWithLight: 45,
+      login: 49,
+      ping: 61,
+    }),
+    serverbound: Object.freeze({
+      chunkBatchReceived: 11,
+      keepAlive: 28,
+      playerLoaded: 44,
+      pong: 45,
+    }),
+  }),
+});
 
 const runButton = document.getElementById("run");
 const statusNode = document.getElementById("status");
 const logNode = document.getElementById("log");
 const smokeState = globalThis.__gaiusSingleplayerWorkerSmoke = {
   state: "idle",
-  protocolVersion: PROTOCOL_VERSION,
+  versionProfile: null,
+  protocolVersion: null,
   events: [],
   compressionThreshold: null,
   loginFinished: false,
@@ -21,6 +53,7 @@ const smokeState = globalThis.__gaiusSingleplayerWorkerSmoke = {
   playPackets: 0,
   playLoginPackets: 0,
   chunkPackets: 0,
+  chunkBatchAckCount: 0,
   knownPackRequests: 0,
   loginProfileId: null,
   serverDistances: null,
@@ -59,12 +92,28 @@ async function runSmoke() {
     smokeState.sessionId = sessionId;
     smokeState.worldId = worldId;
 
+    const activeVersionProfile = await loadActiveVersionProfile();
+    const activeProtocolVersion = Number(activeVersionProfile.protocolVersion);
+    const activePlayProtocol = PLAY_PROTOCOLS[activeProtocolVersion];
+    if (!activePlayProtocol) {
+      throw new Error(
+        "No browser smoke PLAY packet table exists for protocol " + activeProtocolVersion
+      );
+    }
+    smokeState.versionProfile = activeVersionProfile.id;
+    smokeState.protocolVersion = activeProtocolVersion;
+
     const version = new URLSearchParams(location.search).get("v") || "worker-smoke-v1";
     const workerUrl = new URL("../dist/singleplayer-server-worker.js", location.href);
     workerUrl.searchParams.set("v", version);
     const channel = new MessageChannel();
     clientPort = channel.port1;
-    const protocol = createProtocolClient(clientPort, sessionId);
+    const protocol = createProtocolClient(
+      clientPort,
+      sessionId,
+      activeProtocolVersion,
+      activePlayProtocol
+    );
     stopped = deferred();
     distancesActive = deferred();
     const failed = deferred();
@@ -123,6 +172,7 @@ async function runSmoke() {
     smokeState.playPackets = protocol.playPackets;
     smokeState.playLoginPackets = protocol.playLoginPackets;
     smokeState.chunkPackets = protocol.chunkPackets;
+    smokeState.chunkBatchAckCount = protocol.chunkBatchAckCount;
     smokeState.knownPackRequests = protocol.knownPackRequests;
     smokeState.loginProfileId = protocol.loginProfileId;
     setState("running", "PLAY and chunk data passed; stopping server cleanly");
@@ -142,12 +192,13 @@ async function runSmoke() {
     smokeState.finishedAt = Date.now();
     setState("passed", "Gaius singleplayer Worker smoke passed");
     record("result", "passed", JSON.stringify({
-      protocolVersion: PROTOCOL_VERSION,
+      protocolVersion: activeProtocolVersion,
       compressionThreshold: smokeState.compressionThreshold,
       configurationPackets: smokeState.configurationPackets,
       playPackets: smokeState.playPackets,
       playLoginPackets: smokeState.playLoginPackets,
       chunkPackets: smokeState.chunkPackets,
+      chunkBatchAckCount: smokeState.chunkBatchAckCount,
       knownPackRequests: smokeState.knownPackRequests,
       loginProfileId: smokeState.loginProfileId,
       serverDistances: smokeState.serverDistances,
@@ -183,9 +234,10 @@ async function runSmoke() {
   }
 }
 
-function createProtocolClient(port, sessionId) {
+function createProtocolClient(port, sessionId, protocolVersion, playProtocol) {
   const ready = deferred();
   const host = "client-" + sessionId + ".gaius-local";
+  const {clientbound: clientboundPlay, serverbound: serverboundPlay} = playProtocol;
   let buffered = new Uint8Array(0);
   let packetWork = Promise.resolve();
   let remotePaused = false;
@@ -204,6 +256,9 @@ function createProtocolClient(port, sessionId) {
     loginProfileId: undefined,
     playerLoadedSent: false,
     chunkBatchAckSent: false,
+    chunkBatchAckCount: 0,
+    chunkBatchAckTimer: undefined,
+    lastAckedChunkPackets: 0,
     playReady: ready.promise,
     startLogin,
     closeTransport,
@@ -244,7 +299,7 @@ function createProtocolClient(port, sessionId) {
     loginStarted = true;
     record("protocol", "handshake", host + ":" + SERVER_PORT);
     const handshake = concatenateMany([
-      encodeVarInt(PROTOCOL_VERSION),
+      encodeVarInt(protocolVersion),
       encodeString(host),
       new Uint8Array([(SERVER_PORT >>> 8) & 0xff, SERVER_PORT & 0xff]),
       encodeVarInt(2),
@@ -349,32 +404,59 @@ function createProtocolClient(port, sessionId) {
       }
     } else if (state.phase === "play") {
       state.playPackets++;
-      if (packetId.value === 32) {
+      if (packetId.value === clientboundPlay.disconnect) {
         throw new Error("Official server disconnected after entering PLAY");
       }
-      if (packetId.value === 43) {
-        send(encodePacket(27, payload, state.compressionThreshold));
-      } else if (packetId.value === 59) {
-        send(encodePacket(44, payload, state.compressionThreshold));
-      } else if (packetId.value === 48) {
+      if (packetId.value === clientboundPlay.keepAlive) {
+        send(encodePacket(serverboundPlay.keepAlive, payload, state.compressionThreshold));
+      } else if (packetId.value === clientboundPlay.ping) {
+        send(encodePacket(serverboundPlay.pong, payload, state.compressionThreshold));
+      } else if (packetId.value === clientboundPlay.login) {
         state.playLoginPackets++;
         record("protocol", "play-login", String(state.playLoginPackets));
         if (!state.playerLoadedSent) {
           state.playerLoadedSent = true;
-          send(encodePacket(43, new Uint8Array(0), state.compressionThreshold));
+          send(encodePacket(
+            serverboundPlay.playerLoaded,
+            new Uint8Array(0),
+            state.compressionThreshold
+          ));
         }
-      } else if (packetId.value === 44) {
+      } else if (packetId.value === clientboundPlay.levelChunkWithLight) {
         state.chunkPackets++;
         record("protocol", "chunk", String(state.chunkPackets));
-        if (!state.chunkBatchAckSent) {
-          state.chunkBatchAckSent = true;
-          send(encodePacket(10, encodeFloat(10), state.compressionThreshold));
-        }
+        maybeScheduleChunkBatchAck();
       }
       if (state.playLoginPackets > 0 && state.chunkPackets > 0) {
         ready.resolve();
       }
     }
+  }
+
+  function maybeScheduleChunkBatchAck() {
+    if (state.chunkBatchAckTimer !== undefined ||
+        state.chunkPackets <= state.lastAckedChunkPackets) {
+      return;
+    }
+    state.chunkBatchAckTimer = setTimeout(() => {
+      state.chunkBatchAckTimer = undefined;
+      if (state.chunkPackets <= state.lastAckedChunkPackets) {
+        return;
+      }
+      state.lastAckedChunkPackets = state.chunkPackets;
+      state.chunkBatchAckSent = true;
+      state.chunkBatchAckCount++;
+      record(
+        "protocol",
+        "chunk-batch-ack",
+        state.chunkBatchAckCount + ":" + state.lastAckedChunkPackets
+      );
+      send(encodePacket(
+        serverboundPlay.chunkBatchReceived,
+        encodeFloat(10),
+        state.compressionThreshold
+      ));
+    }, 200);
   }
 
   function send(bytes) {
@@ -391,6 +473,24 @@ function createProtocolClient(port, sessionId) {
   }
 
   return state;
+}
+
+async function loadActiveVersionProfile() {
+  const response = await fetch("../dist/classes.js.build.json", {cache: "no-store"});
+  if (!response.ok) {
+    throw new Error("Could not load the active client build identity: " + response.status);
+  }
+  const buildIdentity = await response.json();
+  if (!buildIdentity || buildIdentity.kind !== "gaius-build-identity" ||
+      buildIdentity.role !== "client") {
+    throw new Error("The active client build identity is invalid");
+  }
+  const activeVersionProfile = buildIdentity.profile;
+  if (!activeVersionProfile || typeof activeVersionProfile.id !== "string" ||
+      !Number.isSafeInteger(Number(activeVersionProfile.protocolVersion))) {
+    throw new Error("The active client version profile is invalid");
+  }
+  return activeVersionProfile;
 }
 
 function encodePacket(id, payload, compressionThreshold) {
@@ -586,12 +686,15 @@ function resetState() {
   smokeState.finishedAt = undefined;
   smokeState.error = undefined;
   smokeState.events.length = 0;
+  smokeState.versionProfile = null;
+  smokeState.protocolVersion = null;
   smokeState.compressionThreshold = null;
   smokeState.loginFinished = false;
   smokeState.configurationPackets = 0;
   smokeState.playPackets = 0;
   smokeState.playLoginPackets = 0;
   smokeState.chunkPackets = 0;
+  smokeState.chunkBatchAckCount = 0;
   smokeState.knownPackRequests = 0;
   smokeState.loginProfileId = null;
   smokeState.serverDistances = null;

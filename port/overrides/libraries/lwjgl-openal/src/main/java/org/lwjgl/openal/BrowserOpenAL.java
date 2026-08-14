@@ -121,6 +121,7 @@ public final class BrowserOpenAL {
               sources: new Map(),
               resumeHooked: false,
               masterGainNode: null,
+              directionalAudio: false,
               listener: {
                 gain: 1,
                 position: [0, 0, 0],
@@ -147,6 +148,9 @@ public final class BrowserOpenAL {
                 webAudioConnections: 0,
                 webAudioDisconnects: 0,
                 webAudioNaturalEnds: 0,
+                directionalAudio: false,
+                panningModel: 'equalpower',
+                hrtfFallbacks: 0,
                 lastFormat: 0,
                 lastFrequency: 0,
                 lastUploadBytes: 0,
@@ -214,6 +218,25 @@ public final class BrowserOpenAL {
               if (model === 0xD003 || model === 0xD004) return 'linear';
               if (model === 0xD005 || model === 0xD006) return 'exponential';
               return 'inverse';
+            }
+            function applyPanningModel(panner) {
+              if (!panner) return;
+              const requested = state.directionalAudio ? 'HRTF' : 'equalpower';
+              try {
+                panner.panningModel = requested;
+                const applied = String(panner.panningModel || requested);
+                state.stats.panningModel = applied;
+                if (state.directionalAudio && applied.toUpperCase() !== 'HRTF') {
+                  state.stats.hrtfFallbacks++;
+                }
+              } catch (error) {
+                state.stats.lastError = String(error && (error.message || error));
+                if (requested !== 'equalpower') {
+                  try { panner.panningModel = 'equalpower'; } catch (ignored) {}
+                  state.stats.panningModel = 'equalpower';
+                  state.stats.hrtfFallbacks++;
+                }
+              }
             }
             function applyListener() {
               const ctx = state.context;
@@ -381,7 +404,7 @@ public final class BrowserOpenAL {
               if (!source.relative && !source.panner) {
                 source.panner = ctx.createPanner();
                 trackNodeCreated(source.panner, 'source-panner');
-                source.panner.panningModel = 'equalpower';
+                applyPanningModel(source.panner);
                 connectTrackedNode(source.panner, source.gainNode);
               }
               if (source.panner) applyPanner(source);
@@ -612,12 +635,24 @@ public final class BrowserOpenAL {
             state.refreshState = refreshState;
             state.scheduleBuffer = scheduleBuffer;
             state.applyListener = applyListener;
+            state.applyPanningModel = applyPanningModel;
             state.applyPanner = applyPanner;
             state.reconnectSource = reconnectSource;
             window.__gaiusOpenAL = state;
             window.__gaiusAudioStats = state.stats;
             """)
     public static native void init();
+
+    @JSBody(params = "enabled", script = """
+            const state = window.__gaiusOpenAL;
+            if (!state) return;
+            state.directionalAudio = !!enabled;
+            state.stats.directionalAudio = state.directionalAudio;
+            state.sources.forEach(function(source) {
+              if (source && source.panner) state.applyPanningModel(source.panner);
+            });
+            """)
+    public static native void setDirectionalAudio(boolean enabled);
 
     @JSBody(script = """
             if (!window.__gaiusOpenAL) return;

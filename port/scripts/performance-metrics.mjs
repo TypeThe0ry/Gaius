@@ -489,6 +489,11 @@ export function buildPerformanceEvidence({
       gates.longestFrameMsMax,
       "max",
     ),
+    atLeast2s: metricEvidence(
+      frames.longFrames?.atLeast2000Ms,
+      gates.stallCountAtLeast2sMax,
+      "max",
+    ),
     freezeCount: metricEvidence(freezes.total, gates.freezeCountMax, "max"),
     maximumTraversalStallMs: metricEvidence(
       travel.maximumTraversalStallMillis,
@@ -566,7 +571,7 @@ export function evaluateRuntimeInvariants({contract = {}, telemetry = {}} = {}) 
     comparisonCheck(
       "worldgen-turn-pulses",
       evidence(worldgen, ["maxTurnPulses", "maxPulsesInTurn", "maxProgressPulsesPerTurn"]),
-      {maximum: finiteNumber(worldgenRules.schedulerTurnPulsesMax, 64)},
+      {maximum: finiteNumber(worldgenRules.schedulerTurnPulsesMax, 4096)},
       (value, expected) => value <= expected.maximum,
       "maximum worldgen scheduler pulses in one turn",
     ),
@@ -1001,6 +1006,345 @@ export function summarizeFrameTimes(frameTimes, elapsedMs, freezeThresholdMs = 5
       atLeast200Ms: countAtLeast(200),
       atLeast250Ms: countAtLeast(250),
       atLeast500Ms: countAtLeast(freezeThresholdMs),
+      atLeast1000Ms: countAtLeast(1000),
+      atLeast2000Ms: countAtLeast(2000),
+    },
+  };
+}
+
+function finitePath(value, paths) {
+  for (const path of paths) {
+    const parts = String(path).split(".");
+    let current = value;
+    for (const part of parts) {
+      if (current == null || typeof current !== "object") {
+        current = null;
+        break;
+      }
+      current = current[part];
+    }
+    if (current != null
+        && current !== ""
+        && (typeof current === "number" || typeof current === "string")
+        && Number.isFinite(Number(current))) {
+      return Number(current);
+    }
+  }
+  return null;
+}
+
+function booleanPath(value, paths) {
+  for (const path of paths) {
+    const parts = String(path).split(".");
+    let current = value;
+    for (const part of parts) {
+      if (current == null || typeof current !== "object") {
+        current = null;
+        break;
+      }
+      current = current[part];
+    }
+    if (typeof current === "boolean") {
+      return current;
+    }
+  }
+  return null;
+}
+
+function uniqueReasons(reasons) {
+  return [...new Set((Array.isArray(reasons) ? reasons : [])
+    .map((reason) => String(reason))
+    .filter(Boolean))];
+}
+
+/**
+ * Extracts release-side acceptance evidence from a real child benchmark report.
+ * Missing telemetry is deliberately inconclusive; zero is never used as a
+ * fallback for an absent measurement.
+ */
+export function summarizeAcceptanceEvidence({
+  report = null,
+  profileName = null,
+  profile = {},
+  contract = {},
+} = {}) {
+  const analysis = report?.analysis;
+  const acceptance = contract?.releaseEvidence?.acceptance || {};
+  const failures = [];
+  const missing = [];
+  const frame = analysis?.frame || {};
+  const gates = profile?.gates || {};
+  const frameEvidence = {
+    averageFps: finitePath(frame, ["averageFpsRaw"]),
+    onePercentLowFps: finitePath(frame, ["onePercentLowFpsRaw"]),
+    longestFrameMs: finitePath(frame, ["longestFrameMsRaw"]),
+    sampleCount: finitePath(frame, ["sampleCount"]),
+    rawFrameCount: finitePath(frame, ["rawFrameCount"]),
+    coverageRatio: finitePath(frame, ["coverageRatioRaw"]),
+    longFramesAtLeast2s: finitePath(frame, [
+      "longFrames.atLeast2000Ms",
+      "longFrames.atLeast2s",
+    ]),
+  };
+  for (const field of [
+    "averageFps",
+    "onePercentLowFps",
+    "longestFrameMs",
+    "sampleCount",
+    "rawFrameCount",
+    "coverageRatio",
+    "longFramesAtLeast2s",
+  ]) {
+    if (frameEvidence[field] == null) missing.push(`frame.${field}`);
+  }
+  if (frameEvidence.sampleCount != null && frameEvidence.sampleCount <= 0) {
+    failures.push("frame sample count is zero");
+  }
+  if (frameEvidence.rawFrameCount != null && frameEvidence.rawFrameCount <= 0) {
+    failures.push("raw frame count is zero");
+  }
+  if (gates.averageFpsMin != null
+      && frameEvidence.averageFps != null
+      && frameEvidence.averageFps < Number(gates.averageFpsMin)) {
+    failures.push(`average FPS ${frameEvidence.averageFps} is below ${gates.averageFpsMin}`);
+  }
+  if (gates.onePercentLowFpsMin != null
+      && frameEvidence.onePercentLowFps != null
+      && frameEvidence.onePercentLowFps < Number(gates.onePercentLowFpsMin)) {
+    failures.push(
+      `1% low FPS ${frameEvidence.onePercentLowFps} is below ${gates.onePercentLowFpsMin}`,
+    );
+  }
+  if (gates.coverageRatioMin != null
+      && frameEvidence.coverageRatio != null
+      && frameEvidence.coverageRatio < Number(gates.coverageRatioMin)) {
+    failures.push(
+      `frame coverage ${frameEvidence.coverageRatio} is below ${gates.coverageRatioMin}`,
+    );
+  }
+  if (gates.longestFrameMsMax != null
+      && frameEvidence.longestFrameMs != null
+      && frameEvidence.longestFrameMs > Number(gates.longestFrameMsMax)) {
+    failures.push(
+      `longest frame ${frameEvidence.longestFrameMs} ms exceeds ${gates.longestFrameMsMax} ms`,
+    );
+  }
+  const maximumTwoSecondStalls = Number(
+    acceptance.maximumTwoSecondStalls ?? gates.stallCountAtLeast2sMax ?? 0,
+  );
+  if (frameEvidence.longFramesAtLeast2s != null
+      && frameEvidence.longFramesAtLeast2s > maximumTwoSecondStalls) {
+    failures.push(
+      `2-second stall count ${frameEvidence.longFramesAtLeast2s} exceeds ${maximumTwoSecondStalls}`,
+    );
+  }
+
+  const freezes = analysis?.freezes;
+  const freezeCount = finitePath(freezes, ["total"]);
+  const stability = analysis?.stability;
+  const stabilityVerdict = typeof stability?.verdict === "string"
+    ? stability.verdict : null;
+  const fatalEventCount = Array.isArray(stability?.fatalEvents)
+    ? stability.fatalEvents.length : null;
+  const stabilityEvidence = {
+    verdict: stabilityVerdict,
+    freezeCount,
+    fatalEventCount,
+    contextLossCount: Array.isArray(stability?.contextLosses)
+      ? stability.contextLosses.length : null,
+    stateStallMs: finitePath(stability, ["maximumStateStallMillis"]),
+  };
+  if (freezeCount == null) missing.push("freezes.total");
+  if (stabilityVerdict == null) missing.push("stability.verdict");
+  if (fatalEventCount == null) missing.push("stability.fatalEvents");
+  if (freezeCount != null && freezeCount > Number(acceptance.maximumFreezeCount ?? 0)) {
+    failures.push(`freeze count ${freezeCount} exceeds ${acceptance.maximumFreezeCount ?? 0}`);
+  }
+  if (fatalEventCount != null && fatalEventCount > Number(acceptance.maximumCrashSignals ?? 0)) {
+    failures.push(`crash/exception signal count ${fatalEventCount} is non-zero`);
+  }
+  if (stabilityEvidence.contextLossCount != null && stabilityEvidence.contextLossCount > 0) {
+    failures.push(`WebGL context loss count ${stabilityEvidence.contextLossCount} is non-zero`);
+  }
+  if (stabilityVerdict != null && stabilityVerdict !== "pass") {
+    failures.push(`stability verdict is ${stabilityVerdict}`);
+  }
+
+  const queueSummary = analysis?.queues;
+  const queueEntries = queueSummary?.queues && typeof queueSummary.queues === "object"
+    ? queueSummary.queues : null;
+  const chunkBacklogPaths = Array.isArray(acceptance.chunkBacklogPaths)
+    ? acceptance.chunkBacklogPaths : [
+        "chunk.pendingTasks",
+        "chunk.compileBacklog",
+        "chunk.uploadBacklog",
+      ];
+  const chunkBacklog = {};
+  for (const path of chunkBacklogPaths) {
+    const entry = queueEntries?.[path];
+    if (entry && entry.available === true
+        && Number.isFinite(Number(entry.maximum))
+        && Number.isFinite(Number(entry.longestHighWaterMs))) {
+      chunkBacklog[path] = {
+        available: true,
+        maximum: Number(entry.maximum),
+        finalValue: Number.isFinite(Number(entry.finalValue)) ? Number(entry.finalValue) : null,
+        longestHighWaterMs: Number(entry.longestHighWaterMs),
+        failed: entry.failed === true,
+      };
+    }
+  }
+  if (Object.keys(chunkBacklog).length === 0) missing.push("queues.chunkBacklog");
+  for (const path of chunkBacklogPaths) {
+    if (!Object.hasOwn(chunkBacklog, path)) missing.push(`queues.${path}`);
+  }
+  for (const [path, entry] of Object.entries(chunkBacklog)) {
+    if (entry.failed) failures.push(`chunk backlog high-water contract failed for ${path}`);
+  }
+  const queueVerdict = typeof queueSummary?.verdict === "string"
+    ? queueSummary.verdict : null;
+  if (queueVerdict == null) missing.push("queues.verdict");
+  if (queueVerdict === "fail") failures.push("chunk/network queue high-water contract failed");
+  const backlogEvidence = {
+    verdict: queueVerdict,
+    paths: chunkBacklog,
+    unavailable: chunkBacklogPaths.filter((path) => !Object.hasOwn(chunkBacklog, path)),
+  };
+
+  const heartbeatCandidates = [analysis?.heartbeat, analysis?.workerMessage]
+    .filter((candidate) => candidate && typeof candidate === "object");
+  const heartbeat = heartbeatCandidates.find((candidate) =>
+    finitePath(candidate, ["p99RttMillis", "p99MessagePortLatencyMs"]) != null
+    && finitePath(candidate, ["maxRttMillis", "maxMessagePortLatencyMs"]) != null
+    && finitePath(candidate, ["rttSampleCount", "sampleCount"]) != null,
+  ) || null;
+  const messagePort = heartbeat ? {
+    available: true,
+    source: analysis?.heartbeat === heartbeat ? "analysis.heartbeat" : "analysis.workerMessage",
+    sampleCount: finitePath(heartbeat, ["rttSampleCount", "sampleCount"]),
+    p99RttMillis: finitePath(heartbeat, ["p99RttMillis", "p99MessagePortLatencyMs"]),
+    maxRttMillis: finitePath(heartbeat, ["maxRttMillis", "maxMessagePortLatencyMs"]),
+    pending: finitePath(heartbeat, ["pending"]),
+  } : {
+    available: false,
+    source: null,
+    sampleCount: null,
+    p99RttMillis: null,
+    maxRttMillis: null,
+    pending: null,
+  };
+  for (const field of ["sampleCount", "p99RttMillis", "maxRttMillis"]) {
+    if (messagePort[field] == null) missing.push(`messagePort.${field}`);
+  }
+  if (messagePort.sampleCount != null && messagePort.sampleCount <= 0) {
+    failures.push("MessagePort latency sample count is zero");
+  }
+  const p99Limit = Number(acceptance.messagePortP99MaxMs ?? 250);
+  const maxLimit = Number(acceptance.messagePortMaxMs ?? 2000);
+  if (messagePort.p99RttMillis != null && messagePort.p99RttMillis > p99Limit) {
+    failures.push(`MessagePort p99 latency ${messagePort.p99RttMillis} ms exceeds ${p99Limit} ms`);
+  }
+  if (messagePort.maxRttMillis != null && messagePort.maxRttMillis > maxLimit) {
+    failures.push(`MessagePort maximum latency ${messagePort.maxRttMillis} ms exceeds ${maxLimit} ms`);
+  }
+
+  const memory = analysis?.memory;
+  const memorySources = [
+    ["jsHeap", memory?.v8Heap],
+    ["chromeProcessRss", memory?.processRss],
+    ["browserMemory", memory?.browserMemory],
+  ].map(([name, source]) => ({
+    name,
+    source,
+    sampleCount: finitePath(source, [
+      "sampleCount",
+      "regularSampleCount",
+      "availability.availableSampleCount",
+    ]),
+    verdict: typeof source?.verdict === "string" ? source.verdict : null,
+    leakSignal: source?.leakSignal === true
+      || source?.finalThreeWindowsPositive === true
+      || source?.total?.failed === true
+      || (Array.isArray(source?.failedMetrics) && source.failedMetrics.length > 0)
+      || Object.values(source?.byType || {}).some((metric) => metric?.failed === true)
+      || source?.metrics && Object.values(source.metrics).some(
+        (metric) => metric?.finalThreeWindowsPositive === true,
+      ),
+    slopeMiBPerMinute: finitePath(source, [
+      "postGcSlopeMiBPerMinute",
+      "slopeMiBPerMinute",
+      "total.slopeMiBPerMinute",
+    ]),
+    growthPercent: finitePath(source, [
+      "retainedGrowthPercent",
+      "growthPercent",
+      "total.growthPercent",
+    ]),
+  })).filter((entry) => entry.source && typeof entry.source === "object");
+  const observedMemorySources = memorySources.filter((entry) =>
+    entry.sampleCount != null && entry.sampleCount >= 2,
+  );
+  const memoryLeak = observedMemorySources.some((entry) => entry.leakSignal || entry.verdict === "fail");
+  const memoryRequired = Array.isArray(acceptance.memoryRequiredProfiles)
+    && acceptance.memoryRequiredProfiles.includes(profileName);
+  const memoryEvidence = {
+    available: observedMemorySources.length > 0,
+    required: memoryRequired,
+    verdict: memoryLeak
+      ? "fail"
+      : (observedMemorySources.length > 0 ? "observed" : "inconclusive"),
+    sources: observedMemorySources.map(({name, sampleCount, verdict, leakSignal,
+      slopeMiBPerMinute, growthPercent}) => ({
+      name,
+      sampleCount,
+      verdict,
+      leakSignal,
+      slopeMiBPerMinute,
+      growthPercent,
+    })),
+    reportVerdict: typeof memory?.verdict === "string" ? memory.verdict : null,
+  };
+  if (memoryRequired) {
+    if (memory?.verdict !== "pass") {
+      failures.push(`required memory trend verdict is ${memory?.verdict || "missing"}`);
+    }
+  }
+  if (memoryEvidence.available === false) missing.push("memory.trend");
+  if (memoryLeak) failures.push("memory trend contains a sustained-growth signal");
+
+  const uncapped = booleanPath(analysis, [
+    "environment.frameLimiter.uncapped",
+    "environment.frameLimiter.configured",
+  ]);
+  if (uncapped !== true) missing.push("environment.frameLimiter.uncapped");
+
+  const uniqueMissing = [...new Set(missing)];
+  const uniqueFailures = uniqueReasons(failures);
+  let verdict = "pass";
+  if (uniqueFailures.length > 0) verdict = "fail";
+  else if (uniqueMissing.length > 0) verdict = "inconclusive";
+  return {
+    verdict,
+    profileName,
+    missing: uniqueMissing,
+    failures: uniqueFailures,
+    measured: {
+      frame: frameEvidence,
+      freezes: stabilityEvidence,
+      chunkBacklog: backlogEvidence,
+      messagePort,
+      memory: memoryEvidence,
+      uncapped,
+    },
+    requirements: {
+      averageFpsMin: gates.averageFpsMin ?? null,
+      onePercentLowFpsMin: gates.onePercentLowFpsMin ?? null,
+      maximumTwoSecondStalls,
+      maximumFreezeCount: Number(acceptance.maximumFreezeCount ?? 0),
+      maximumCrashSignals: Number(acceptance.maximumCrashSignals ?? 0),
+      messagePortP99MaxMs: p99Limit,
+      messagePortMaxMs: maxLimit,
+      memoryRequired,
     },
   };
 }
@@ -2712,6 +3056,15 @@ export function evaluatePerformanceGates({
       && !(longestFrameMs <= gates.longestFrameMsMax)) {
     frameFailures.push(
       `longest frame ${longestFrameMs} ms exceeds ${gates.longestFrameMsMax} ms`,
+    );
+  }
+  const twoSecondStallCount = hasOwnFinite(frames?.longFrames, "atLeast2000Ms")
+    ? Number(frames.longFrames.atLeast2000Ms) : null;
+  if (gates.stallCountAtLeast2sMax != null
+      && twoSecondStallCount != null
+      && twoSecondStallCount > Number(gates.stallCountAtLeast2sMax)) {
+    frameFailures.push(
+      `2-second stall count ${twoSecondStallCount} exceeds ${gates.stallCountAtLeast2sMax}`,
     );
   }
   const freezeCountAvailable = hasOwnFinite(freezes, "total");

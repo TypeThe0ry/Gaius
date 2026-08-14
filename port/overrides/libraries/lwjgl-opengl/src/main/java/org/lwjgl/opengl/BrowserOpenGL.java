@@ -27,6 +27,8 @@ import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.EntityHitResult;
 import net.minecraft.world.phys.HitResult;
 import org.teavm.jso.JSBody;
+import org.teavm.jso.JSFunctor;
+import org.teavm.jso.JSObject;
 import org.teavm.jso.typedarrays.Float32Array;
 import org.teavm.jso.typedarrays.Int8Array;
 import org.teavm.jso.typedarrays.Int32Array;
@@ -37,6 +39,7 @@ public final class BrowserOpenGL {
     private static final int MAP_WRITE_BIT = 0x0002;
     private static final int MAP_FLUSH_EXPLICIT_BIT = 0x0010;
     private static final int PIXEL_UNPACK_BUFFER = 0x88EC;
+    private static final int PIXEL_PACK_BUFFER = 0x88EB;
     private static GLCapabilities capabilities;
     private static final Map<Integer, MappedBuffer> MAPPED_BUFFERS = new HashMap<>();
     private static final ThreadLocal<UniformScratch> UNIFORM_SCRATCH =
@@ -45,9 +48,18 @@ public final class BrowserOpenGL {
     private static int unpackRowLength;
     private static int unpackSkipRows;
     private static int unpackSkipPixels;
+    private static int packAlignment = 4;
+    private static int packRowLength;
+    private static int packSkipRows;
+    private static int packSkipPixels;
     private static int inventoryWorldRenderFrame;
     private static String inventoryWorldRenderScreen;
     private static int nextSyntheticQuery = 1;
+
+    @JSFunctor
+    private interface MappedBufferReleaseCallback extends JSObject {
+        void run();
+    }
 
     private BrowserOpenGL() {
     }
@@ -2647,7 +2659,7 @@ public final class BrowserOpenGL {
             """)
     private static native void initializeBaseInstanceDrawJs();
 
-    @JSBody(script = """
+    @JSBody(params = {"releaseMappedBuffers"}, script = """
             const state=window.__gaiusGL,gl=window.__gaiusWebGL;
             if (!state || !gl || state.__gpuFenceLifecycleInit) return;
             state.__gpuFenceLifecycleInit=true;
@@ -2656,7 +2668,16 @@ public final class BrowserOpenGL {
             state.gpuFenceMeta=new Map();
             state.gpuCurrentRetireEntry=null;
             state.gpuNextFenceRetireOwned=false;
-            state.gpuContextLost=!!(gl.isContextLost && gl.isContextLost());
+            const initiallyLost=!!(gl.isContextLost && gl.isContextLost());
+            state.gpuContextLost=false;
+            state.gpuReloadScheduled=false;
+            state.gpuReloadStarted=false;
+            state.gpuSubmissionBlocked=false;
+            state.gpuContextLossController=null;
+            try {
+              state.gpuContextLossController=gl.getExtension
+                ? gl.getExtension('WEBGL_lose_context') : null;
+            } catch (ignored) {}
             state.gpuMaxClientWaitTimeout=0;
             try {
               state.gpuMaxClientWaitTimeout=Math.max(
@@ -2671,6 +2692,7 @@ public final class BrowserOpenGL {
             initialStats.gpuContextLosses=Number(initialStats.gpuContextLosses)||0;
             initialStats.gpuRetireControlledErrors=
               Number(initialStats.gpuRetireControlledErrors)||0;
+            initialStats.gpuContextRecovery='ready';
             state.gpuOldestFenceAge=function() {
               let oldest=0;
               this.gpuFenceMeta.forEach(function(meta) {
@@ -2841,7 +2863,132 @@ public final class BrowserOpenGL {
               this.gpuContextLost=true;
               stats.gpuContextLost=true;
               stats.gpuContextLossReason=String(reason||'unknown');
-              stats.gpuContextRecovery='awaiting-webglcontextrestored';
+              stats.gpuContextRecovery='reload-required';
+              this.gpuReleaseMappedBuffers('context-loss');
+              this.gpuBlockSubmissions('context-lost-stale-objects');
+              this.gpuScheduleReload(reason||'context-loss');
+            };
+            state.gpuReleaseMappedBuffers=function(reason) {
+              const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+              stats.gpuMappedBufferReleaseRequests=
+                (stats.gpuMappedBufferReleaseRequests||0)+1;
+              stats.gpuMappedBufferReleaseReason=String(reason||'unknown');
+              if (typeof releaseMappedBuffers!=='function') {
+                stats.gpuMappedBufferReleaseState='unavailable';
+                return false;
+              }
+              try {
+                releaseMappedBuffers();
+                stats.gpuMappedBufferReleaseState='released';
+                stats.gpuMappedBufferReleaseSuccesses=
+                  (stats.gpuMappedBufferReleaseSuccesses||0)+1;
+                return true;
+              } catch (error) {
+                stats.gpuMappedBufferReleaseState='failed';
+                stats.gpuMappedBufferReleaseFailures=
+                  (stats.gpuMappedBufferReleaseFailures||0)+1;
+                stats.gpuMappedBufferReleaseFailure=String(
+                  error && (error.stack||error.message)||error);
+                return false;
+              }
+            };
+            state.gpuBlockSubmissions=function(reason) {
+              const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+              stats.gpuSubmissionBlocked=true;
+              stats.gpuSubmissionBlockReason=String(reason||'unknown');
+              if (this.gpuSubmissionBlocked) return;
+              this.gpuSubmissionBlocked=true;
+              const blockedMethods=new Map();
+              const blocked=function(name,target) {
+                if (blockedMethods.has(name)) return blockedMethods.get(name);
+                const replacement=function() {
+                  stats.gpuBlockedCalls=(stats.gpuBlockedCalls||0)+1;
+                  stats.gpuLastBlockedCall=String(name);
+                  if (name==='isContextLost') return true;
+                  if (name==='getError') return target.CONTEXT_LOST_WEBGL||0x9242;
+                  if (name==='getSupportedExtensions') return [];
+                  return null;
+                };
+                blockedMethods.set(name,replacement);
+                return replacement;
+              };
+              const names=new Set();
+              let prototype=gl;
+              while (prototype && prototype!==Object.prototype) {
+                Object.getOwnPropertyNames(prototype).forEach(function(name) {
+                  if (name!=='constructor') names.add(name);
+                });
+                prototype=Object.getPrototypeOf(prototype);
+              }
+              let patched=0,failed=0;
+              names.forEach(function(name) {
+                let value;
+                try { value=gl[name]; } catch (ignored) { return; }
+                if (typeof value!=='function') return;
+                try {
+                  Object.defineProperty(gl,name,{
+                    configurable:true,
+                    value:blocked(name,gl),
+                    writable:false
+                  });
+                  patched++;
+                } catch (ignored) {
+                  failed++;
+                }
+              });
+              stats.gpuBlockedMethodCount=patched;
+              stats.gpuUnblockedMethodCount=failed;
+              if (failed>0 && typeof Proxy==='function') {
+                try {
+                  window.__gaiusWebGL=new Proxy(gl,{
+                    get(target,name) {
+                      const value=Reflect.get(target,name,target);
+                      return typeof value==='function' ? blocked(name,target) : value;
+                    }
+                  });
+                  stats.gpuSubmissionBlockFallback='proxy';
+                } catch (ignored) {
+                  stats.gpuSubmissionBlockFallback='failed';
+                }
+              }
+              if (failed>0 && this.gpuContextLossController
+                  && typeof this.gpuContextLossController.loseContext==='function') {
+                try {
+                  this.gpuContextLossController.loseContext();
+                  stats.gpuSubmissionContextQuarantined=true;
+                } catch (ignored) {
+                  stats.gpuSubmissionContextQuarantined=false;
+                }
+              }
+            };
+            state.gpuScheduleReload=function(reason) {
+              const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+              if (window.__gaiusDisableGpuContextAutoReload===true) {
+                stats.gpuContextRecovery='reload-required';
+                return false;
+              }
+              if (this.gpuReloadScheduled) return false;
+              this.gpuReloadScheduled=true;
+              stats.gpuContextRecovery='reload-scheduled';
+              stats.gpuReloadReason=String(reason||'unknown');
+              setTimeout(function() {
+                if (state.gpuReloadStarted) return;
+                state.gpuReloadStarted=true;
+                state.gpuReleaseMappedBuffers('before-reload');
+                stats.gpuContextRecovery='reloading';
+                try {
+                  if (window.location && typeof window.location.reload==='function') {
+                    window.location.reload();
+                  } else {
+                    stats.gpuContextRecovery='reload-required';
+                  }
+                } catch (error) {
+                  stats.gpuContextRecovery='reload-failed';
+                  stats.gpuReloadFailure=String(
+                    error && (error.stack||error.message)||error);
+                }
+              },0);
+              return true;
             };
             const canvas=gl.canvas;
             if (canvas && canvas.addEventListener) {
@@ -2851,22 +2998,19 @@ public final class BrowserOpenGL {
               },false);
               canvas.addEventListener('webglcontextrestored',function() {
                 const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
-                state.gpuContextLost=false;
-                stats.gpuContextLost=false;
+                state.gpuContextLost=true;
+                stats.gpuContextLost=true;
                 stats.gpuContextRestores=(stats.gpuContextRestores||0)+1;
-                stats.gpuContextRecovery='reload-scheduled';
-                if (window.__gaiusDisableGpuContextAutoReload===true) return;
-                setTimeout(function() {
-                  stats.gpuContextRecovery='reloading';
-                  if (window.location && typeof window.location.reload==='function') {
-                    window.location.reload();
-                  }
-                },0);
+                state.gpuReleaseMappedBuffers('context-restored');
+                state.gpuBlockSubmissions('context-restored-stale-objects');
+                state.gpuScheduleReload('webglcontextrestored');
               },false);
             }
+            if (initiallyLost) state.gpuMarkContextLost('initialization');
             state.gpuPublishRetire(0,0);
             """)
-    private static native void initializeGpuFenceLifecycleJs();
+    private static native void initializeGpuFenceLifecycleJs(
+            MappedBufferReleaseCallback releaseMappedBuffers);
 
     @JSBody(params = {"backlog", "capacity"}, script = """
             const state=window.__gaiusGL;
@@ -2904,7 +3048,7 @@ public final class BrowserOpenGL {
         initializeVaoFastPathJs();
         initializeBaseInstanceDrawJs();
         initializeDrawFastPathJs();
-        initializeGpuFenceLifecycleJs();
+        initializeGpuFenceLifecycleJs(BrowserOpenGL::releaseAllMappedBuffers);
         initializeShadowDecisionCache();
         initializeMisalignedBufferRefs();
         initializeVaoBufferRefsJs();
@@ -3293,16 +3437,88 @@ public final class BrowserOpenGL {
             """)
     private static native void drawBuffersJs(Int32Array buffers);
 
+    public static void readPixels(
+            int x, int y, int width, int height, int format, int type, long pixels) {
+        if (boundBufferForTargetJs(PIXEL_PACK_BUFFER) != 0) {
+            if (pixels < 0 || pixels > Integer.MAX_VALUE) {
+                throw new IllegalArgumentException(
+                        "WebGL pixel pack buffer offset is out of range: " + pixels);
+            }
+            readPixelsOffsetJs(x, y, width, height, format, type, (int) pixels);
+            return;
+        }
+        readPixelsBytesJs(
+                x,
+                y,
+                width,
+                height,
+                format,
+                type,
+                pointerBytes(pixels, pixelReadLength(width, height, format, type)));
+    }
+
     @JSBody(
             params = {"x", "y", "width", "height", "format", "type", "offset"},
             script = """
                     const gl=window.__gaiusWebGL;
-                    gl.readPixels(x,y,width,height,format,type,Number(offset));
+                    gl.readPixels(x,y,width,height,format,type,offset|0);
                     const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
                     stats.readPixelsCalls=(stats.readPixelsCalls||0)+1;
+                    stats.readPixelsPboCalls=(stats.readPixelsPboCalls||0)+1;
                     """)
-    public static native void readPixels(
-            int x, int y, int width, int height, int format, int type, long offset);
+    private static native void readPixelsOffsetJs(
+            int x, int y, int width, int height, int format, int type, int offset);
+
+    @JSBody(
+            params = {"x", "y", "width", "height", "format", "type", "pixels"},
+            script = """
+                    const gl=window.__gaiusWebGL;
+                    let view=pixels;
+                    if (pixels!==null && pixels!==undefined) {
+                      const buffer=pixels.buffer;
+                      const offset=pixels.byteOffset||0;
+                      const length=pixels.byteLength||0;
+                      switch (type|0) {
+                        case 0x1400:
+                          view=new Int8Array(buffer,offset,length);
+                          break;
+                        case 0x1401:
+                          view=new Uint8Array(buffer,offset,length);
+                          break;
+                        case 0x1402:
+                          view=new Int16Array(buffer,offset,length>>>1);
+                          break;
+                        case 0x1403:
+                        case 0x140B:
+                        case 0x8D61:
+                          view=new Uint16Array(buffer,offset,length>>>1);
+                          break;
+                        case 0x1404:
+                          view=new Int32Array(buffer,offset,length>>>2);
+                          break;
+                        case 0x1405:
+                        case 0x8033:
+                        case 0x8034:
+                        case 0x8035:
+                        case 0x8367:
+                        case 0x84FA:
+                          view=new Uint32Array(buffer,offset,length>>>2);
+                          break;
+                        case 0x1406:
+                          view=new Float32Array(buffer,offset,length>>>2);
+                          break;
+                        default:
+                          view=new Uint8Array(buffer,offset,length);
+                          break;
+                      }
+                    }
+                    gl.readPixels(x,y,width,height,format,type,view);
+                    const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+                    stats.readPixelsCalls=(stats.readPixelsCalls||0)+1;
+                    stats.readPixelsClientCalls=(stats.readPixelsClientCalls||0)+1;
+                    """)
+    private static native void readPixelsBytesJs(
+            int x, int y, int width, int height, int format, int type, Int8Array pixels);
 
     @JSBody(params = {"mode", "count", "type", "offset"}, script = """
             window.__gaiusGL.executeDraw(1,mode,count,type,offset,0,0);
@@ -3392,6 +3608,26 @@ public final class BrowserOpenGL {
         int browserValue = value;
         boolean unchanged = false;
         switch (parameter) {
+            case 0x0D02 -> {
+                browserValue = Math.max(0, value);
+                unchanged = packRowLength == browserValue;
+                packRowLength = browserValue;
+            }
+            case 0x0D03 -> {
+                browserValue = Math.max(0, value);
+                unchanged = packSkipRows == browserValue;
+                packSkipRows = browserValue;
+            }
+            case 0x0D04 -> {
+                browserValue = Math.max(0, value);
+                unchanged = packSkipPixels == browserValue;
+                packSkipPixels = browserValue;
+            }
+            case 0x0D05 -> {
+                browserValue = webGlPixelAlignment(value);
+                unchanged = packAlignment == browserValue;
+                packAlignment = browserValue;
+            }
             case 0x0CF2 -> {
                 browserValue = Math.max(0, value);
                 unchanged = unpackRowLength == browserValue;
@@ -3408,7 +3644,7 @@ public final class BrowserOpenGL {
                 unpackSkipPixels = browserValue;
             }
             case 0x0CF5 -> {
-                browserValue = webGlUnpackAlignment(value);
+                browserValue = webGlPixelAlignment(value);
                 unchanged = unpackAlignment == browserValue;
                 unpackAlignment = browserValue;
             }
@@ -3424,6 +3660,10 @@ public final class BrowserOpenGL {
             const state=window.__gaiusGL;
             if (state) {
               switch (parameter|0) {
+                case 0x0D02: state.packRowLength=value|0; break;
+                case 0x0D03: state.packSkipRows=value|0; break;
+                case 0x0D04: state.packSkipPixels=value|0; break;
+                case 0x0D05: state.packAlignment=value|0; break;
                 case 0x0CF2: state.unpackRowLength=value|0; break;
                 case 0x0CF3: state.unpackSkipRows=value|0; break;
                 case 0x0CF4: state.unpackSkipPixels=value|0; break;
@@ -4176,6 +4416,16 @@ public final class BrowserOpenGL {
             }
         }
         noteMappedBufferCountJs(MAPPED_BUFFERS.size());
+    }
+
+    /** Releases direct mapped-buffer storage when a lost WebGL context requires a reload. */
+    private static void releaseAllMappedBuffers() {
+        List<MappedBuffer> staleMappings = new java.util.ArrayList<>(MAPPED_BUFFERS.values());
+        MAPPED_BUFFERS.clear();
+        for (MappedBuffer mapped : staleMappings) {
+            MemoryUtil.memFree(mapped.buffer);
+        }
+        noteMappedBufferCountJs(0);
     }
 
     @JSBody(params = {"target"}, script = """
@@ -5218,6 +5468,11 @@ public final class BrowserOpenGL {
             """)
     public static native void framebufferTexture2D(
             int target, int attachment, int textureTarget, int texture, int level);
+
+    @JSBody(params = {"target"}, script = """
+            return window.__gaiusWebGL.checkFramebufferStatus(target)|0;
+            """)
+    public static native int checkFramebufferStatus(int target);
 
     @JSBody(params = {"framebuffer", "attachment", "texture", "level"}, script = """
             const gl=window.__gaiusWebGL,state=window.__gaiusGL;
@@ -6630,7 +6885,24 @@ public final class BrowserOpenGL {
         return (int) length;
     }
 
-    private static int webGlUnpackAlignment(int value) {
+    private static int pixelReadLength(int width, int height, int format, int type) {
+        if (width <= 0 || height <= 0) {
+            return 0;
+        }
+        int bytesPerPixel = bytesPerPixel(format, type);
+        int rowLength = packRowLength > 0 ? packRowLength : width;
+        long rowStride = aligned((long) rowLength * bytesPerPixel, packAlignment);
+        long length = (long) packSkipRows * rowStride
+                + (long) packSkipPixels * bytesPerPixel
+                + (long) (height - 1) * rowStride
+                + (long) width * bytesPerPixel;
+        if (length > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("Pixel read too large: " + width + "x" + height);
+        }
+        return (int) length;
+    }
+
+    private static int webGlPixelAlignment(int value) {
         return switch (value) {
             case 1, 2, 4, 8 -> value;
             default -> 1;

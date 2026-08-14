@@ -9,6 +9,7 @@ const sourcePath = new URL(
   import.meta.url,
 );
 const source = await readFile(sourcePath, "utf8");
+const UNCAPPED_FAIR_YIELD_CADENCE = 4;
 
 function jsBodyBefore(marker) {
   const markerOffset = source.indexOf(marker);
@@ -45,10 +46,10 @@ assert.match(source, /scheduler=\{tasks:new Map\(\),channel:null,nextTaskId:1\}/
   "MessageChannel continuations are not stored as cancellable tokens");
 assert.match(source, /scheduler\.tasks\.delete\(taskId\)/,
   "watchdog recovery cannot remove a stalled MessageChannel continuation");
-assert.match(source, /browserScheduler\.yield\(\)/,
-  "uncapped pacing has no cross-task-source fairness yield");
-assert.match(source, /\(sequence & 31\)===0/,
-  "uncapped pacing fairness cadence changed from once per 32 frames");
+assert.match(source, /setTimeout\(\(\) => finish\('timer'\), 0\)/,
+  "uncapped pacing has no real timer task for browser fairness");
+assert.match(source, /\(sequence & 3\)===0/,
+  "uncapped pacing fairness cadence changed from once per 4 frames");
 assert.doesNotMatch(source, /scheduler=\{queue:\[\],channel:null\}/,
   "frame pacing still retains an unbounded callback queue");
 assert.doesNotMatch(
@@ -316,7 +317,7 @@ async function simulateUncappedYield(frameCount = 1440) {
   const frameTimes = presentTimes.slice(1).map((at, index) => at - presentTimes[index]);
   const averageFps = 1000 / (frameTimes.reduce((total, value) => total + value, 0) / frameTimes.length);
   const onePercentLow = onePercentLowFps(frameTimes);
-  const fairYieldCount = Math.floor(frameCount / 32);
+  const fairYieldCount = Math.floor(frameCount / UNCAPPED_FAIR_YIELD_CADENCE);
   assert.equal(browser.rafRequests, 0, "uncapped pacing unexpectedly waited for rAF");
   assert.equal(telemetry.swapInterval, 0);
   assert.equal(telemetry.uncappedYieldCount, frameCount);
@@ -368,7 +369,7 @@ async function simulateDeadMessageChannel(frameCount = 2048) {
   present();
   browser.runUntil(() => completed === frameCount);
 
-  const fairYieldCount = Math.floor(frameCount / 32);
+  const fairYieldCount = Math.floor(frameCount / UNCAPPED_FAIR_YIELD_CADENCE);
   const messageAttempts = frameCount - fairYieldCount;
   const scheduler = window.__gaiusFrameYieldScheduler;
   assert.equal(telemetry.yieldRequestCount, frameCount);
@@ -413,7 +414,7 @@ async function simulateThrowingMessageChannel(frameCount = 128) {
   present();
   browser.runUntil(() => completed === frameCount);
 
-  const fairYieldCount = Math.floor(frameCount / 32);
+  const fairYieldCount = Math.floor(frameCount / UNCAPPED_FAIR_YIELD_CADENCE);
   const failedPosts = frameCount - fairYieldCount;
   const scheduler = window.__gaiusFrameYieldScheduler;
   assert.equal(telemetry.yieldCompletionCount, frameCount);

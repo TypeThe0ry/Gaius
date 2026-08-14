@@ -139,6 +139,35 @@ assert_delegate \
     'org.lwjgl.system.MemoryUtil$MemoryAllocator getAllocator(boolean)' \
     'BrowserMemoryAllocator.instance'
 
+MEMORY_TUNABLES_DUMP="$(javap -classpath "$MEMORY_JAR" -p -c org.lwjgl.system.MemoryUtilTunables)"
+assert_delegate \
+    "MemoryUtilTunables large memset" \
+    "$MEMORY_TUNABLES_DUMP" \
+    'void memset(long, int, long)' \
+    'BrowserMemory.set'
+assert_delegate \
+    "MemoryUtilTunables large memcpy" \
+    "$MEMORY_TUNABLES_DUMP" \
+    'void memcpy(long, long, long)' \
+    'BrowserMemory.copy'
+
+LIBC_STRING_DUMP="$(javap -classpath "$MEMORY_JAR" -p -c org.lwjgl.system.libc.LibCString)"
+assert_delegate \
+    "LibCString memset" \
+    "$LIBC_STRING_DUMP" \
+    'long nmemset(long, int, long)' \
+    'BrowserMemory.cMemset'
+assert_delegate \
+    "LibCString memcpy" \
+    "$LIBC_STRING_DUMP" \
+    'long nmemcpy(long, long, long)' \
+    'BrowserMemory.cMemcpy'
+assert_delegate \
+    "LibCString memmove" \
+    "$LIBC_STRING_DUMP" \
+    'long nmemmove(long, long, long)' \
+    'BrowserMemory.cMemmove'
+
 CALLBACK_I_DUMP="$(javap -classpath "$MEMORY_JAR" -p -c org.lwjgl.system.CallbackI)"
 CALLBACK_ADDRESS="$(method_block "$CALLBACK_I_DUMP" 'long address()')"
 printf '%s\n' "$CALLBACK_ADDRESS" | rg -q 'lconst_1' \

@@ -15,8 +15,263 @@ import {
 } from "node:worker_threads";
 
 const rootDirectory = fileURLToPath(new URL("../../", import.meta.url));
-const bootstrapPath = rootDirectory + "port/web/dist/singleplayer-server-worker.js";
-const itemEntityTypeId = 71;
+const bootstrapPath = process.env.GAIUS_SMOKE_BOOTSTRAP_PATH ||
+  rootDirectory + "port/web/dist/singleplayer-server-worker.js";
+const portConfig = JSON.parse(fs.readFileSync(rootDirectory + "port/config.json", "utf8"));
+const versionProfileRelative = String(portConfig.versionProfile || "");
+if (!/^versions\/[A-Za-z0-9._-]+\.json$/.test(versionProfileRelative)) {
+  throw new Error("port/config.json has an invalid versionProfile");
+}
+const activeVersionProfile = JSON.parse(fs.readFileSync(
+  rootDirectory + "port/" + versionProfileRelative,
+  "utf8",
+));
+const activeProtocolVersion = Number(activeVersionProfile.protocolVersion);
+if (!Number.isSafeInteger(activeProtocolVersion) || activeProtocolVersion < 0) {
+  throw new Error("The active version profile has an invalid protocolVersion");
+}
+const playProtocols = {
+  774: {
+    itemEntityTypeId: 71,
+    clientbound: {
+      addEntity: 1,
+      blockChangedAck: 4,
+      blockUpdate: 8,
+      disconnect: 32,
+      keepAlive: 43,
+      levelChunkWithLight: 44,
+      login: 48,
+      ping: 59,
+      playerPosition: 70,
+      setChunkCacheCenter: 92,
+    },
+    serverbound: {
+      acceptTeleportation: 0,
+      chatCommand: 6,
+      chunkBatchReceived: 10,
+      keepAlive: 27,
+      movePlayerPos: 29,
+      playerAction: 40,
+      playerLoaded: 43,
+      pong: 44,
+    },
+  },
+  776: {
+    itemEntityTypeId: 71,
+    clientbound: {
+      addEntity: 1,
+      blockChangedAck: 4,
+      blockUpdate: 8,
+      disconnect: 32,
+      keepAlive: 44,
+      levelChunkWithLight: 45,
+      login: 49,
+      ping: 61,
+      playerPosition: 72,
+      setChunkCacheCenter: 94,
+    },
+    serverbound: {
+      acceptTeleportation: 0,
+      chatCommand: 7,
+      chunkBatchReceived: 11,
+      keepAlive: 28,
+      movePlayerPos: 30,
+      playerAction: 41,
+      playerLoaded: 44,
+      pong: 45,
+    },
+  },
+};
+const activePlayProtocol = playProtocols[activeProtocolVersion];
+if (!activePlayProtocol) {
+  throw new Error(`No PLAY packet table exists for protocol ${activeProtocolVersion}`);
+}
+const {clientbound: clientboundPlay, serverbound: serverboundPlay} = activePlayProtocol;
+const itemEntityTypeId = activePlayProtocol.itemEntityTypeId;
+const requiredNetworkTaskTelemetryFields = Object.freeze([
+  "errors",
+  "inboundQueuedBytes",
+  "integratedServerPumpFailures",
+  "integratedServerPumpRequests",
+  "integratedServerPumpStarts",
+  "integratedServerPumpRetrySchedules",
+  "integratedServerPumpRetryExhaustions",
+  "integratedServerTaskSignals",
+  "integratedServerTaskUnparks",
+  "integratedServerTaskCoalesced",
+  "integratedServerTaskSchedules",
+  "integratedServerTaskScheduleFailures",
+  "integratedServerTaskRuns",
+  "integratedServerTaskFollowups",
+  "integratedServerTaskLifecycleDrops",
+  "integratedServerTaskWrongThread",
+  "integratedServerTaskBudgetExhaustions",
+  "integratedServerTaskDeferredRetries",
+  "integratedServerTaskRetryExhaustions",
+  "integratedServerTaskPending",
+  "integratedServerInputPending",
+]);
+
+function validateNetworkTaskTelemetry(stats, options = {}) {
+  const missingFields = [];
+  const nonFiniteFields = [];
+  const nonIntegerFields = [];
+  const negativeFields = [];
+  const relationshipErrors = [];
+  const healthErrors = [];
+  const fieldValues = Object.create(null);
+  const objectStats = stats !== null && typeof stats === "object" ? stats : null;
+  for (const field of requiredNetworkTaskTelemetryFields) {
+    if (!objectStats || !Object.prototype.hasOwnProperty.call(objectStats, field)) {
+      missingFields.push(field);
+      continue;
+    }
+    const value = objectStats[field];
+    fieldValues[field] = value;
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      nonFiniteFields.push(field);
+      continue;
+    }
+    if (!Number.isInteger(value)) {
+      nonIntegerFields.push(field);
+    }
+    if (value < 0) {
+      negativeFields.push(field);
+    }
+  }
+  const fieldComplete = missingFields.length === 0 && nonFiniteFields.length === 0;
+  if (fieldComplete && nonIntegerFields.length === 0 && negativeFields.length === 0) {
+    if (fieldValues.integratedServerTaskPending !== 0 &&
+        fieldValues.integratedServerTaskPending !== 1) {
+      relationshipErrors.push("integratedServerTaskPending must be 0 or 1");
+    }
+    if (fieldValues.integratedServerInputPending !== 0 &&
+        fieldValues.integratedServerInputPending !== 1) {
+      relationshipErrors.push("integratedServerInputPending must be 0 or 1");
+    }
+    if (fieldValues.integratedServerPumpStarts >
+        fieldValues.integratedServerPumpRequests +
+          fieldValues.integratedServerPumpRetrySchedules) {
+      relationshipErrors.push("integrated pump starts exceed requests plus retries");
+    }
+    if (fieldValues.integratedServerPumpFailures >
+        fieldValues.integratedServerPumpStarts) {
+      relationshipErrors.push("integrated pump failures exceed starts");
+    }
+    if (fieldValues.integratedServerPumpRetrySchedules >
+        fieldValues.integratedServerPumpFailures) {
+      relationshipErrors.push("integrated pump retries exceed failures");
+    }
+    if (fieldValues.integratedServerPumpRetryExhaustions >
+        fieldValues.integratedServerPumpFailures) {
+      relationshipErrors.push("integrated pump retry exhaustion exceeds failures");
+    }
+    if (fieldValues.integratedServerPumpRetrySchedules +
+        fieldValues.integratedServerPumpRetryExhaustions !==
+          fieldValues.integratedServerPumpFailures) {
+      relationshipErrors.push("integrated pump failure accounting is incomplete");
+    }
+    if (fieldValues.integratedServerTaskUnparks !==
+        fieldValues.integratedServerTaskSchedules +
+          fieldValues.integratedServerTaskCoalesced) {
+      relationshipErrors.push("task unparks do not match schedules plus coalesced signals");
+    }
+    if (fieldValues.integratedServerTaskCoalesced >
+        fieldValues.integratedServerTaskSignals +
+          fieldValues.integratedServerTaskFollowups +
+          fieldValues.integratedServerTaskDeferredRetries) {
+      relationshipErrors.push("task coalesced count exceeds all schedule attempts");
+    }
+    if (fieldValues.integratedServerTaskSchedules -
+        fieldValues.integratedServerTaskFollowups >
+          fieldValues.integratedServerTaskSignals +
+            fieldValues.integratedServerTaskDeferredRetries) {
+      relationshipErrors.push("burst task schedules exceed signals plus deferred retries");
+    }
+    if (fieldValues.integratedServerTaskRuns > fieldValues.integratedServerTaskSchedules) {
+      relationshipErrors.push("task runs exceed task schedules");
+    }
+    if (fieldValues.integratedServerTaskFollowups >
+        fieldValues.integratedServerTaskSchedules) {
+      relationshipErrors.push("task followups exceed task schedules");
+    }
+    if (fieldValues.integratedServerTaskDeferredRetries +
+        fieldValues.integratedServerTaskRetryExhaustions !==
+          fieldValues.integratedServerTaskBudgetExhaustions) {
+      relationshipErrors.push("task budget exhaustion accounting is incomplete");
+    }
+    if (options.requireActivity && fieldValues.integratedServerTaskSchedules <= 0) {
+      relationshipErrors.push("task schedules are zero");
+    }
+    if (options.requireActivity && fieldValues.integratedServerTaskRuns <= 0) {
+      relationshipErrors.push("task runs are zero");
+    }
+    if (options.requireActivity && fieldValues.integratedServerPumpRequests <= 0) {
+      relationshipErrors.push("integrated pump requests are zero");
+    }
+    if (options.requireActivity && fieldValues.integratedServerPumpStarts <= 0) {
+      relationshipErrors.push("integrated pump starts are zero");
+    }
+    if (options.requireDrained && fieldValues.inboundQueuedBytes !== 0) {
+      relationshipErrors.push("inbound queue is not drained");
+    }
+    if (options.requireDrained && fieldValues.integratedServerTaskPending !== 0) {
+      relationshipErrors.push("integrated server task is still pending");
+    }
+    if (options.requireDrained && fieldValues.integratedServerInputPending !== 0) {
+      relationshipErrors.push("integrated server input is still pending");
+    }
+    if (options.requireDrained && fieldValues.integratedServerTaskRuns !==
+        fieldValues.integratedServerTaskSchedules) {
+      relationshipErrors.push("scheduled integrated server tasks did not all run");
+    }
+    if (options.requireHealthy && fieldValues.errors !== 0) {
+      healthErrors.push("network errors are non-zero");
+    }
+    if (options.requireHealthy && fieldValues.integratedServerPumpFailures !== 0) {
+      healthErrors.push("integrated server pump failures are non-zero");
+    }
+    if (options.requireHealthy && fieldValues.integratedServerPumpRetryExhaustions !== 0) {
+      healthErrors.push("integrated server pump retry exhaustion is non-zero");
+    }
+    if (options.requireHealthy && fieldValues.integratedServerTaskScheduleFailures !== 0) {
+      healthErrors.push("integrated server task schedule failures are non-zero");
+    }
+    if (options.requireHealthy && fieldValues.integratedServerTaskLifecycleDrops !== 0) {
+      healthErrors.push("integrated server task lifecycle drops are non-zero");
+    }
+    if (options.requireHealthy && fieldValues.integratedServerTaskWrongThread !== 0) {
+      healthErrors.push("integrated server task wrong-thread runs are non-zero");
+    }
+    if (options.requireHealthy && fieldValues.integratedServerTaskRetryExhaustions !== 0) {
+      healthErrors.push("integrated server task deferred retries exhausted");
+    }
+  }
+  return {
+    valid: fieldComplete && nonIntegerFields.length === 0 && negativeFields.length === 0 &&
+      relationshipErrors.length === 0 && healthErrors.length === 0,
+    fieldComplete,
+    missingFields,
+    nonFiniteFields,
+    nonIntegerFields,
+    negativeFields,
+    relationshipErrors,
+    healthErrors,
+  };
+}
+
+function copyObjectSnapshot(value) {
+  return value !== null && typeof value === "object" ? {...value} : null;
+}
+
+function networkDrainSignature(stats) {
+  const validation = validateNetworkTaskTelemetry(stats);
+  if (!validation.fieldComplete || validation.nonIntegerFields.length > 0 ||
+      validation.negativeFields.length > 0) {
+    return undefined;
+  }
+  return requiredNetworkTaskTelemetryFields.map((field) => stats[field]).join("/");
+}
 
 if (isMainThread) {
   const smokeStartedAt = Date.now();
@@ -30,6 +285,7 @@ if (isMainThread) {
   const roamSpectator = process.env.GAIUS_SMOKE_ROAM_SPECTATOR === "1";
   const requireBlockDrop = process.env.GAIUS_SMOKE_REQUIRE_BLOCK_DROP === "1";
   const jsonOnly = process.env.GAIUS_SMOKE_JSON_ONLY === "1";
+  const traceEvents = process.env.GAIUS_SMOKE_TRACE_EVENTS === "1";
   const blockDropTimeoutMs = Number(
     process.env.GAIUS_SMOKE_BLOCK_DROP_TIMEOUT_MS || "5000",
   );
@@ -49,17 +305,48 @@ if (isMainThread) {
   const maximumGameplayStallMs = Number(
     process.env.GAIUS_SMOKE_MAX_GAMEPLAY_STALL_MS || "500",
   );
+  const telemetryBarrierTimeoutMs = Number(
+    process.env.GAIUS_SMOKE_TELEMETRY_BARRIER_TIMEOUT_MS || "1000",
+  );
+  const telemetryBarrierSampleCount = 2;
+  const telemetryBarrierMaxAttempts = Number(
+    process.env.GAIUS_SMOKE_TELEMETRY_BARRIER_MAX_ATTEMPTS || "20",
+  );
+  const telemetryBarrierSampleDelayMs = Number(
+    process.env.GAIUS_SMOKE_TELEMETRY_BARRIER_SAMPLE_DELAY_MS || "25",
+  );
   const distanceRampIntervalMillis = process.env.GAIUS_SMOKE_DISTANCE_RAMP_MS === undefined
     ? undefined
     : Number(process.env.GAIUS_SMOKE_DISTANCE_RAMP_MS);
   const targetRenderDistance = Number(process.env.GAIUS_SMOKE_RENDER_DISTANCE || "7");
   const targetSimulationDistance = Number(process.env.GAIUS_SMOKE_SIMULATION_DISTANCE || "3");
   const cpuProfilePhase = process.env.GAIUS_SMOKE_CPU_PROFILE_PHASE || "";
+  const cpuProfileDurationMs = Number(
+    process.env.GAIUS_SMOKE_CPU_PROFILE_DURATION_MS || "15000",
+  );
   const cpuProfilePath = process.env.GAIUS_SMOKE_CPU_PROFILE_PATH ||
     (rootDirectory + "port/target/singleplayer-worker-" +
       cpuProfilePhase.replace(/[^a-z0-9._-]+/gi, "-") + ".cpuprofile");
+  const coveragePhase = process.env.GAIUS_SMOKE_COVERAGE_PHASE || "";
+  const coverageDurationMs = Number(
+    process.env.GAIUS_SMOKE_COVERAGE_DURATION_MS || "10000",
+  );
+  const coveragePath = process.env.GAIUS_SMOKE_COVERAGE_PATH ||
+    (rootDirectory + "port/target/singleplayer-worker-" +
+      coveragePhase.replace(/[^a-z0-9._-]+/gi, "-") + "-coverage.json");
   if (!Number.isFinite(maximumGameplayStallMs) || maximumGameplayStallMs <= 0) {
     throw new Error("GAIUS_SMOKE_MAX_GAMEPLAY_STALL_MS must be a positive number");
+  }
+  if (!Number.isFinite(telemetryBarrierTimeoutMs) || telemetryBarrierTimeoutMs <= 0) {
+    throw new Error("GAIUS_SMOKE_TELEMETRY_BARRIER_TIMEOUT_MS must be a positive number");
+  }
+  if (!Number.isInteger(telemetryBarrierMaxAttempts) ||
+      telemetryBarrierMaxAttempts < telemetryBarrierSampleCount) {
+    throw new Error("GAIUS_SMOKE_TELEMETRY_BARRIER_MAX_ATTEMPTS must be at least 2");
+  }
+  if (!Number.isFinite(telemetryBarrierSampleDelayMs) ||
+      telemetryBarrierSampleDelayMs < 0) {
+    throw new Error("GAIUS_SMOKE_TELEMETRY_BARRIER_SAMPLE_DELAY_MS must be non-negative");
   }
   if (!Number.isFinite(blockDropTimeoutMs) || blockDropTimeoutMs <= 0) {
     throw new Error("GAIUS_SMOKE_BLOCK_DROP_TIMEOUT_MS must be a positive number");
@@ -91,6 +378,14 @@ if (isMainThread) {
       targetRenderDistance > 32 || !Number.isInteger(targetSimulationDistance) ||
       targetSimulationDistance < 2 || targetSimulationDistance > 32) {
     throw new Error("Smoke render and simulation distances must be integers between 2 and 32");
+  }
+  if (cpuProfilePhase &&
+      (!Number.isFinite(cpuProfileDurationMs) || cpuProfileDurationMs <= 0)) {
+    throw new Error("GAIUS_SMOKE_CPU_PROFILE_DURATION_MS must be a positive number");
+  }
+  if (coveragePhase &&
+      (!Number.isFinite(coverageDurationMs) || coverageDurationMs <= 0)) {
+    throw new Error("GAIUS_SMOKE_COVERAGE_DURATION_MS must be a positive number");
   }
   const configuredDistanceRampIntervalMillis = distanceRampIntervalMillis === undefined
     ? 750
@@ -158,7 +453,7 @@ if (isMainThread) {
   let distanceSyncReady = false;
   let configuredDistanceReady = false;
   let regionStorageWrites = 0;
-  let compressedRegionStorageWrites = 0;
+  let nonEmptyRegionStorageWrites = 0;
   let eventLoopProbeId = 0;
   const eventLoopProbeStartedAt = new Map();
   const eventLoopProbeLatenciesMs = [];
@@ -172,23 +467,359 @@ if (isMainThread) {
   };
   let latestChunkPriorityStats = null;
   let latestNetworkStats = null;
+  let latestWorldgenStats = null;
+  let lastWorldgenTraceAt = 0;
+  let workerExited = false;
+  let stopFlowStarted = false;
+  let stoppedReceived = false;
+  let stoppedFinalizationStarted = false;
+  let telemetrySequence = 0;
+  const pendingTelemetryPongs = new Map();
+  let preStopTelemetryBarrier = null;
+  let postStopTelemetryBarrier = null;
   let serverCreatedAt = 0;
   let protocolReadyAt = 0;
   let workerPhase = "startup";
   let cpuProfileActive = false;
   let cpuProfileWritten = !cpuProfilePhase;
+  let cpuProfileStopTimer = 0;
+  const cpuProfileCompletion = deferred();
+  if (!cpuProfilePhase) {
+    cpuProfileCompletion.resolve();
+  }
+  let coverageActive = false;
+  let coverageWritten = !coveragePhase;
+  let coverageStopTimer = 0;
+  const startTimedCpuProfile = (phase) => {
+    if (cpuProfileActive || cpuProfileWritten || cpuProfilePhase !== phase) {
+      return;
+    }
+    worker.postMessage({
+      type: "node-cpu-profile-start",
+      phase: cpuProfilePhase,
+      path: cpuProfilePath,
+    });
+    cpuProfileActive = true;
+    cpuProfileStopTimer = setTimeout(() => {
+      cpuProfileStopTimer = 0;
+      if (!cpuProfileActive) return;
+      worker.postMessage({type: "node-cpu-profile-stop"});
+      cpuProfileActive = false;
+    }, cpuProfileDurationMs);
+  };
+  const startTimedCoverage = (phase) => {
+    if (coverageActive || coverageWritten || coveragePhase !== phase) {
+      return;
+    }
+    worker.postMessage({
+      type: "node-coverage-start",
+      phase: coveragePhase,
+      path: coveragePath,
+    });
+    coverageActive = true;
+    coverageStopTimer = setTimeout(() => {
+      coverageStopTimer = 0;
+      if (!coverageActive) return;
+      worker.postMessage({type: "node-coverage-stop"});
+      coverageActive = false;
+    }, coverageDurationMs);
+  };
   const eventLoopProbeInterval = setInterval(() => {
     const probeId = ++eventLoopProbeId;
     eventLoopProbeStartedAt.set(probeId, {startedAt: Date.now(), phase: workerPhase});
     worker.postMessage({type: "node-event-loop-probe", probeId});
   }, 100);
-  const maybeStop = () => {
-    if (!protocolReady || (!stopAtFirstChunk && !configuredDistanceReady)) {
+  const requestTelemetryPong = (stage) => {
+    if (finished || workerExited) {
+      return Promise.resolve({
+        available: false,
+        source: "telemetry-pong",
+        stage,
+        reason: workerExited ? "worker-exited" : "smoke-finished",
+      });
+    }
+    const sequence = ++telemetrySequence;
+    const wait = deferred();
+    const pending = {
+      stage,
+      resolve: wait.resolve,
+      timer: 0,
+    };
+    pendingTelemetryPongs.set(sequence, pending);
+    const settle = (result) => {
+      if (pendingTelemetryPongs.get(sequence) !== pending) {
+        return;
+      }
+      pendingTelemetryPongs.delete(sequence);
+      if (pending.timer) clearTimeout(pending.timer);
+      wait.resolve(result);
+    };
+    pending.timer = setTimeout(() => {
+      settle({
+        available: false,
+        source: "telemetry-pong",
+        stage,
+        sequence,
+        reason: "timeout",
+      });
+    }, telemetryBarrierTimeoutMs);
+    try {
+      worker.postMessage({type: "telemetry-ping", sessionId, sequence});
+    } catch (error) {
+      settle({
+        available: false,
+        source: "telemetry-pong",
+        stage,
+        sequence,
+        reason: String(error && (error.stack || error.message) || error),
+      });
+    }
+    return wait.promise;
+  };
+  const requestNodeTelemetryPong = (stage) => {
+    if (finished || workerExited) {
+      return Promise.resolve({
+        available: false,
+        source: "node-event-loop-pong",
+        stage,
+        reason: workerExited ? "worker-exited" : "smoke-finished",
+      });
+    }
+    const probeId = ++eventLoopProbeId;
+    const wait = deferred();
+    const probe = {
+      startedAt: Date.now(),
+      phase: "telemetry-barrier-" + stage,
+      barrier: wait,
+      barrierTimer: 0,
+    };
+    eventLoopProbeStartedAt.set(probeId, probe);
+    const settle = (result) => {
+      if (eventLoopProbeStartedAt.get(probeId) !== probe) {
+        return;
+      }
+      eventLoopProbeStartedAt.delete(probeId);
+      if (probe.barrierTimer) clearTimeout(probe.barrierTimer);
+      wait.resolve(result);
+    };
+    probe.barrierTimer = setTimeout(() => {
+      settle({
+        available: false,
+        source: "node-event-loop-pong",
+        stage,
+        probeId,
+        reason: "timeout",
+      });
+    }, telemetryBarrierTimeoutMs);
+    try {
+      worker.postMessage({type: "node-event-loop-probe", probeId});
+    } catch (error) {
+      settle({
+        available: false,
+        source: "node-event-loop-pong",
+        stage,
+        probeId,
+        reason: String(error && (error.stack || error.message) || error),
+      });
+    }
+    return wait.promise;
+  };
+  const makeNetworkTelemetryBarrier = (
+    stage,
+    source,
+    samples,
+    directResponseCount,
+    fallbackUsed,
+  ) => {
+    const availableSamples = samples.filter((sample) => sample.available);
+    const stableSamples = samples.slice(-telemetryBarrierSampleCount);
+    const completeStableSamples = stableSamples.filter((sample) =>
+      sample.available && validateNetworkTaskTelemetry(sample.networkStats).fieldComplete);
+    const signatures = completeStableSamples
+      .map((sample) => networkDrainSignature(sample.networkStats));
+    const stable = completeStableSamples.length === telemetryBarrierSampleCount &&
+      signatures.length === telemetryBarrierSampleCount &&
+      signatures.every((signature) => signature !== undefined && signature === signatures[0]);
+    const selectedSample = [...availableSamples].reverse().find((sample) =>
+      sample.networkStats !== null);
+    const selectedValidation = validateNetworkTaskTelemetry(
+      selectedSample === undefined ? null : selectedSample.networkStats,
+      {requireDrained: true},
+    );
+    const drained = selectedValidation.fieldComplete &&
+      selectedValidation.nonIntegerFields.length === 0 &&
+      selectedValidation.negativeFields.length === 0 &&
+      selectedValidation.relationshipErrors.length === 0;
+    return {
+      stage,
+      source,
+      directResponseCount,
+      fallbackUsed,
+      available: availableSamples.length > 0,
+      stable,
+      drained,
+      attempts: samples.length,
+      samples: samples.map((sample) => {
+        const validation = validateNetworkTaskTelemetry(sample.networkStats);
+        return {
+          source: sample.source,
+          stage: sample.stage,
+          sequence: sample.sequence,
+          probeId: sample.probeId,
+          available: sample.available,
+          reason: sample.reason,
+          receivedAt: sample.receivedAt,
+          fieldComplete: validation.fieldComplete,
+          missingFields: validation.missingFields,
+          nonFiniteFields: validation.nonFiniteFields,
+          drainSignature: networkDrainSignature(sample.networkStats),
+        };
+      }),
+      networkStats: selectedSample === undefined
+        ? null
+        : copyObjectSnapshot(selectedSample.networkStats),
+    };
+  };
+  const waitForTelemetrySample = () => new Promise((resolve) => {
+    setTimeout(resolve, telemetryBarrierSampleDelayMs);
+  });
+  const requestNetworkTelemetryBarrier = async (stage) => {
+    const directSamples = [];
+    for (let index = 0; index < telemetryBarrierMaxAttempts; index++) {
+      const sample = await requestTelemetryPong(stage + "-direct-" + (index + 1));
+      if (!sample.available) {
+        break;
+      }
+      sample.receivedAt = Date.now();
+      directSamples.push(sample);
+      if (!validateNetworkTaskTelemetry(sample.networkStats).fieldComplete) {
+        break;
+      }
+      const barrier = makeNetworkTelemetryBarrier(
+        stage,
+        "telemetry-pong",
+        directSamples,
+        directSamples.length,
+        false,
+      );
+      if (barrier.stable && barrier.drained) {
+        return barrier;
+      }
+      if (index + 1 < telemetryBarrierMaxAttempts) {
+        await waitForTelemetrySample();
+      }
+    }
+    const directComplete = directSamples.length > 0 &&
+      directSamples.every((sample) =>
+        validateNetworkTaskTelemetry(sample.networkStats).fieldComplete);
+    if (directComplete) {
+      return makeNetworkTelemetryBarrier(
+        stage,
+        "telemetry-pong",
+        directSamples,
+        directSamples.length,
+        false,
+      );
+    }
+    const nodeSamples = [];
+    for (let index = 0; index < telemetryBarrierMaxAttempts; index++) {
+      const sample = await requestNodeTelemetryPong(stage + "-node-" + (index + 1));
+      if (!sample.available) {
+        break;
+      }
+      sample.receivedAt = Date.now();
+      nodeSamples.push(sample);
+      const barrier = makeNetworkTelemetryBarrier(
+        stage,
+        "node-event-loop-pong",
+        nodeSamples,
+        directSamples.length,
+        true,
+      );
+      if (barrier.stable && barrier.drained) {
+        return barrier;
+      }
+      if (index + 1 < telemetryBarrierMaxAttempts) {
+        await waitForTelemetrySample();
+      }
+    }
+    if (nodeSamples.length > 0) {
+      return makeNetworkTelemetryBarrier(
+        stage,
+        "node-event-loop-pong",
+        nodeSamples,
+        directSamples.length,
+        true,
+      );
+    }
+    return makeNetworkTelemetryBarrier(
+      stage,
+      "telemetry-pong",
+      directSamples,
+      directSamples.length,
+      false,
+    );
+  };
+  const completionReady = () => protocolReady &&
+    (stopAtFirstChunk || (distanceSyncReady && configuredDistanceReady));
+  const finishCpuProfileBeforeShutdown = async () => {
+    if (!cpuProfilePhase || cpuProfileWritten) {
+      return;
+    }
+    if (cpuProfileActive) {
+      if (cpuProfileStopTimer) {
+        clearTimeout(cpuProfileStopTimer);
+        cpuProfileStopTimer = 0;
+      }
+      worker.postMessage({type: "node-cpu-profile-stop"});
+      cpuProfileActive = false;
+    }
+    let timeoutId;
+    try {
+      await Promise.race([
+        cpuProfileCompletion.promise,
+        new Promise((resolve, reject) => {
+          timeoutId = setTimeout(
+            () => reject(new Error("Timed out writing the Worker CPU profile")),
+            5000,
+          );
+        }),
+      ]);
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+    }
+  };
+  const beginStop = async () => {
+    clearInterval(eventLoopProbeInterval);
+    workerPhase = "telemetry-pre-stop";
+    preStopTelemetryBarrier = await requestNetworkTelemetryBarrier("pre-stop");
+    if (preStopTelemetryBarrier.networkStats !== null) {
+      latestNetworkStats = copyObjectSnapshot(preStopTelemetryBarrier.networkStats);
+    }
+    await finishCpuProfileBeforeShutdown();
+    if (finished) {
       return;
     }
     workerPhase = "stopping";
     protocol.closeTransport();
     worker.postMessage({type: "stop"});
+  };
+  const maybeStop = () => {
+    if (!completionReady() || stopFlowStarted) {
+      return;
+    }
+    stopFlowStarted = true;
+    if (traceEvents) {
+      process.stderr.write(`[smoke-event] stop-requested phase=${workerPhase}\n`);
+    }
+    void beginStop().catch((error) => {
+      events.push({
+        type: "final-telemetry-barrier-error",
+        detail: error.stack || String(error),
+      });
+      clearTimeout(timeout);
+      finish(1);
+    });
   };
   const finish = (code) => {
     if (finished) {
@@ -196,6 +827,8 @@ if (isMainThread) {
     }
     finished = true;
     clearInterval(eventLoopProbeInterval);
+    if (cpuProfileStopTimer) clearTimeout(cpuProfileStopTimer);
+    if (coverageStopTimer) clearTimeout(coverageStopTimer);
     process.stdout.write(JSON.stringify({events}, null, 2) + "\n");
     void worker.terminate().finally(() => process.exit(code));
   };
@@ -204,6 +837,127 @@ if (isMainThread) {
     events.push({type: "protocol-timeout", ...protocol.snapshot()});
     finish(2);
   }, timeoutMs);
+  const finalizeStopped = async (stoppedMessage) => {
+    if (stoppedFinalizationStarted) {
+      return;
+    }
+    stoppedFinalizationStarted = true;
+    postStopTelemetryBarrier = await requestNetworkTelemetryBarrier("post-stopped");
+    let finalNetworkStats = latestNetworkStats;
+    let finalNetworkSource = "last-node-event-loop-pong";
+    if (preStopTelemetryBarrier !== null &&
+        preStopTelemetryBarrier.networkStats !== null) {
+      finalNetworkStats = copyObjectSnapshot(preStopTelemetryBarrier.networkStats);
+      finalNetworkSource = "pre-stop-barrier";
+    } else if (postStopTelemetryBarrier.networkStats !== null) {
+      finalNetworkStats = copyObjectSnapshot(postStopTelemetryBarrier.networkStats);
+      finalNetworkSource = "post-stopped-barrier-pre-stop-unavailable";
+    }
+    latestNetworkStats = finalNetworkStats === null
+      ? null
+      : copyObjectSnapshot(finalNetworkStats);
+    const networkValidation = validateNetworkTaskTelemetry(finalNetworkStats, {
+      requireActivity: true,
+      requireDrained: true,
+      requireHealthy: true,
+    });
+    const selectedBarrier = preStopTelemetryBarrier !== null &&
+        preStopTelemetryBarrier.networkStats !== null
+      ? preStopTelemetryBarrier
+      : postStopTelemetryBarrier;
+    if (!selectedBarrier || !selectedBarrier.stable) {
+      networkValidation.healthErrors.push("final network telemetry barrier was not stable");
+      networkValidation.valid = false;
+    }
+    if (preStopTelemetryBarrier === null || !preStopTelemetryBarrier.stable) {
+      networkValidation.healthErrors.push("pre-stop network telemetry barrier was not stable");
+      networkValidation.valid = false;
+    }
+    events.push({
+      type: "protocol-final",
+      stoppedDetail: stoppedMessage.detail,
+      distanceRampIntervalMillis: configuredDistanceRampIntervalMillis,
+      distanceTransitionTimeline: distanceTransitionTimeline.slice(),
+      ...protocol.snapshot(),
+      chunkPriorityStats: latestChunkPriorityStats,
+      networkStats: finalNetworkStats,
+      networkSource: finalNetworkSource,
+      networkValidation,
+      telemetryBarriers: {
+        preStop: preStopTelemetryBarrier,
+        postStopped: postStopTelemetryBarrier,
+      },
+      worldgenStats: latestWorldgenStats,
+    });
+    const sortedProbeLatencies = eventLoopProbeLatenciesMs.slice().sort((left, right) => left - right);
+    const phaseLatencies = summarizeProbePhases(eventLoopProbeSamples);
+    const gameplayLatency = summarizeGameplayProbeLatencies(eventLoopProbeSamples);
+    events.push({
+      type: "worker-event-loop-latency",
+      samples: sortedProbeLatencies.length,
+      p95Ms: percentile(sortedProbeLatencies, 0.95),
+      p99Ms: percentile(sortedProbeLatencies, 0.99),
+      maxMs: sortedProbeLatencies.at(-1) || 0,
+      maxStartedAfterSmokeMs: longestEventLoopProbe.startedAt - smokeStartedAt,
+      maxCompletedAfterSmokeMs: longestEventLoopProbe.completedAt - smokeStartedAt,
+      longestGameplay: {
+        ...longestGameplayEventLoopProbe,
+        startedAfterSmokeMs:
+          longestGameplayEventLoopProbe.startedAt - smokeStartedAt,
+        completedAfterSmokeMs:
+          longestGameplayEventLoopProbe.completedAt - smokeStartedAt,
+      },
+      afterServerCreated: summarizeProbeLatencies(eventLoopProbeSamples, serverCreatedAt),
+      afterProtocolReady: summarizeProbeLatencies(eventLoopProbeSamples, protocolReadyAt),
+      gameplay: gameplayLatency,
+      byPhase: phaseLatencies,
+      pending: eventLoopProbeStartedAt.size,
+    });
+    if (gameplayLatency.maxMs > maximumGameplayStallMs) {
+      events.push({
+        type: "worldgen-event-loop-stall",
+        maximumGameplayStallMs,
+        gameplayLatency,
+      });
+      clearTimeout(timeout);
+      finish(1);
+      return;
+    }
+    if (!networkValidation.valid) {
+      events.push({
+        type: "network-state-mismatch",
+        networkStats: finalNetworkStats,
+        networkSource: finalNetworkSource,
+        networkValidation,
+      });
+      clearTimeout(timeout);
+      finish(1);
+      return;
+    }
+    if (!stopAtFirstChunk && !skipMining &&
+        (regionStorageWrites === 0 || nonEmptyRegionStorageWrites !== regionStorageWrites)) {
+      events.push({
+        type: "region-storage-mismatch",
+        regionStorageWrites,
+        nonEmptyRegionStorageWrites,
+      });
+      clearTimeout(timeout);
+      finish(1);
+      return;
+    }
+    if (!cpuProfileWritten) {
+      events.push({
+        type: "cpu-profile-missing",
+        phase: cpuProfilePhase,
+        path: cpuProfilePath,
+      });
+      clearTimeout(timeout);
+      finish(1);
+      return;
+    }
+    clearTimeout(timeout);
+    finish(0);
+  };
   protocol.playReady.then(() => {
     protocolReady = true;
     protocolReadyAt = Date.now();
@@ -256,6 +1010,7 @@ if (isMainThread) {
       detail: error.stack || String(error),
       chunkPriorityStats: latestChunkPriorityStats,
       networkStats: latestNetworkStats,
+      worldgenStats: latestWorldgenStats,
       distanceRampIntervalMillis: configuredDistanceRampIntervalMillis,
       ...protocol.snapshot(),
     });
@@ -268,9 +1023,66 @@ if (isMainThread) {
     setTimeout(() => finish(1), profileWasActive ? 5000 : 2000);
   });
   worker.on("message", (message) => {
+    if (traceEvents && message && message.type &&
+        message.type !== "node-event-loop-pong" &&
+        message.type !== "node-idb-put" &&
+        message.type !== "server-startup-progress" &&
+        message.type !== "startup-timing" &&
+        message.type !== "telemetry-pong") {
+      const detail = message.detail === undefined
+        ? ""
+        : ` detail=${String(message.detail).slice(0, 500)}`;
+      process.stderr.write(`[smoke-event] ${message.type}${detail}\n`);
+    }
+    if (message && message.type === "telemetry-pong") {
+      const sequence = Number(message.sequence);
+      const pending = Number.isSafeInteger(sequence)
+        ? pendingTelemetryPongs.get(sequence)
+        : undefined;
+      if (pending === undefined) {
+        events.push({
+          type: "telemetry-pong-unmatched",
+          sequence: Number.isSafeInteger(sequence) ? sequence : null,
+        });
+        return;
+      }
+      pendingTelemetryPongs.delete(sequence);
+      if (pending.timer) clearTimeout(pending.timer);
+      const sessionMatches = message.sessionId === sessionId;
+      pending.resolve({
+        available: sessionMatches,
+        source: "telemetry-pong",
+        stage: pending.stage,
+        sequence,
+        receivedAt: Date.now(),
+        reason: sessionMatches ? undefined : "session-mismatch",
+        networkStats: copyObjectSnapshot(message.network),
+      });
+      return;
+    }
     if (message && message.type === "node-event-loop-pong") {
-      latestChunkPriorityStats = message.chunkPriorityStats || latestChunkPriorityStats;
-      latestNetworkStats = message.networkStats || latestNetworkStats;
+      latestChunkPriorityStats = message.chunkPriorityStats !== null &&
+        message.chunkPriorityStats !== undefined
+        ? copyObjectSnapshot(message.chunkPriorityStats)
+        : latestChunkPriorityStats;
+      latestNetworkStats = message.networkStats !== null && message.networkStats !== undefined
+        ? copyObjectSnapshot(message.networkStats)
+        : latestNetworkStats;
+      latestWorldgenStats = message.worldgenStats !== null &&
+        message.worldgenStats !== undefined
+        ? copyObjectSnapshot(message.worldgenStats)
+        : latestWorldgenStats;
+      if (traceEvents && Date.now() - lastWorldgenTraceAt >= 5000) {
+        lastWorldgenTraceAt = Date.now();
+        process.stderr.write(
+          `[smoke-worldgen] ${JSON.stringify({
+            phase: workerPhase,
+            chunkPriority: latestChunkPriorityStats,
+            network: latestNetworkStats,
+            worldgen: latestWorldgenStats,
+          })}\n`,
+        );
+      }
       const probe = eventLoopProbeStartedAt.get(message.probeId);
       if (probe !== undefined) {
         eventLoopProbeStartedAt.delete(message.probeId);
@@ -295,6 +1107,20 @@ if (isMainThread) {
             phase: probe.phase,
           };
         }
+        if (probe.barrier !== undefined) {
+          if (probe.barrierTimer) clearTimeout(probe.barrierTimer);
+          probe.barrier.resolve({
+            available: true,
+            source: "node-event-loop-pong",
+            stage: probe.phase.slice("telemetry-barrier-".length),
+            probeId: message.probeId,
+            receivedAt: completedAt,
+            networkStats: message.networkStats !== null &&
+              message.networkStats !== undefined
+              ? copyObjectSnapshot(message.networkStats)
+              : null,
+          });
+        }
       }
       return;
     }
@@ -304,17 +1130,34 @@ if (isMainThread) {
       finish(1);
     } else if (message && (message.type === "network-pump-error" ||
         message.type === "network-pump-schedule-error" ||
+        message.type === "network-pump-retry-exhausted" ||
         message.type === "chunk-batch-ack-without-send")) {
       clearTimeout(timeout);
       finish(1);
     } else if (message && message.type === "node-cpu-profile-written") {
       cpuProfileWritten = true;
+      cpuProfileCompletion.resolve();
+      if (cpuProfileStopTimer) {
+        clearTimeout(cpuProfileStopTimer);
+        cpuProfileStopTimer = 0;
+      }
+    } else if (message && message.type === "node-coverage-written") {
+      coverageWritten = true;
+      if (coverageStopTimer) {
+        clearTimeout(coverageStopTimer);
+        coverageStopTimer = 0;
+      }
     } else if (message && message.type === "node-idb-put" && message.path.endsWith(".mca")) {
       regionStorageWrites++;
-      if (message.encoding === "gzip") compressedRegionStorageWrites++;
+      if (message.bytes > 0) nonEmptyRegionStorageWrites++;
     } else if (message && message.type === "server-created") {
       serverCreatedAt = Date.now();
       workerPhase = "server-created";
+      startTimedCpuProfile(workerPhase);
+      startTimedCoverage(workerPhase);
+      protocol.startLogin();
+    } else if (message && message.type === "server-listener-ready") {
+      workerPhase = "server-listener-ready";
       setTimeout(() => {
         worker.postMessage({
           type: "distances",
@@ -326,7 +1169,8 @@ if (isMainThread) {
         message.detail === expectedStagedDistances && !distanceSyncReady) {
       workerPhase = "distance-staged";
       distanceSyncReady = true;
-      protocol.startLogin();
+      startTimedCpuProfile(workerPhase);
+      startTimedCoverage(workerPhase);
     } else if (message && message.type === "server-distances-ramping") {
       workerPhase = "distance-" + message.detail;
       distanceRamp.push(message.detail);
@@ -390,84 +1234,18 @@ if (isMainThread) {
       configuredDistanceReady = true;
       protocol.startRoam();
       maybeStop();
-    } else if (message && message.type === "stopped" && protocolReady &&
-        distanceSyncReady && (stopAtFirstChunk || configuredDistanceReady)) {
-      events.push({
-        type: "protocol-final",
-        distanceRampIntervalMillis: configuredDistanceRampIntervalMillis,
-        distanceTransitionTimeline: distanceTransitionTimeline.slice(),
-        ...protocol.snapshot(),
-        chunkPriorityStats: latestChunkPriorityStats,
-        networkStats: latestNetworkStats,
+    } else if (message && message.type === "stopped" && completionReady() &&
+        !stoppedReceived) {
+      stoppedReceived = true;
+      clearInterval(eventLoopProbeInterval);
+      void finalizeStopped(message).catch((error) => {
+        events.push({
+          type: "final-telemetry-barrier-error",
+          detail: error.stack || String(error),
+        });
+        clearTimeout(timeout);
+        finish(1);
       });
-      const sortedProbeLatencies = eventLoopProbeLatenciesMs.slice().sort((left, right) => left - right);
-      const phaseLatencies = summarizeProbePhases(eventLoopProbeSamples);
-      const gameplayLatency = summarizeGameplayProbeLatencies(eventLoopProbeSamples);
-      events.push({
-        type: "worker-event-loop-latency",
-        samples: sortedProbeLatencies.length,
-        p95Ms: percentile(sortedProbeLatencies, 0.95),
-        p99Ms: percentile(sortedProbeLatencies, 0.99),
-        maxMs: sortedProbeLatencies.at(-1) || 0,
-        maxStartedAfterSmokeMs: longestEventLoopProbe.startedAt - smokeStartedAt,
-        maxCompletedAfterSmokeMs: longestEventLoopProbe.completedAt - smokeStartedAt,
-        longestGameplay: {
-          ...longestGameplayEventLoopProbe,
-          startedAfterSmokeMs:
-            longestGameplayEventLoopProbe.startedAt - smokeStartedAt,
-          completedAfterSmokeMs:
-            longestGameplayEventLoopProbe.completedAt - smokeStartedAt,
-        },
-        afterServerCreated: summarizeProbeLatencies(eventLoopProbeSamples, serverCreatedAt),
-        afterProtocolReady: summarizeProbeLatencies(eventLoopProbeSamples, protocolReadyAt),
-        gameplay: gameplayLatency,
-        byPhase: phaseLatencies,
-        pending: eventLoopProbeStartedAt.size,
-      });
-      if (gameplayLatency.maxMs > maximumGameplayStallMs) {
-        events.push({
-          type: "worldgen-event-loop-stall",
-          maximumGameplayStallMs,
-          gameplayLatency,
-        });
-        clearTimeout(timeout);
-        finish(1);
-        return;
-      }
-      if (!latestNetworkStats || latestNetworkStats.errors !== 0 ||
-          latestNetworkStats.inboundQueuedBytes !== 0 ||
-          (latestNetworkStats.integratedServerPumpFailures || 0) !== 0) {
-        events.push({
-          type: "network-state-mismatch",
-          networkStats: latestNetworkStats,
-        });
-        clearTimeout(timeout);
-        finish(1);
-        return;
-      }
-      if (!stopAtFirstChunk && !skipMining &&
-          (regionStorageWrites === 0 || compressedRegionStorageWrites !== regionStorageWrites)) {
-        events.push({
-          type: "region-storage-mismatch",
-          regionStorageWrites,
-          compressedRegionStorageWrites,
-        });
-        clearTimeout(timeout);
-        finish(1);
-        return;
-      }
-      if (!cpuProfileWritten) {
-        events.push({
-          type: "cpu-profile-missing",
-          phase: cpuProfilePhase,
-          path: cpuProfilePath,
-        });
-        clearTimeout(timeout);
-        finish(1);
-        return;
-      }
-      clearTimeout(timeout);
-      finish(0);
     } else if (message && (message.type === "crash" || message.type === "bootstrap-crash")) {
       clearTimeout(timeout);
       finish(1);
@@ -479,7 +1257,8 @@ if (isMainThread) {
     finish(1);
   });
   worker.on("exit", (code) => {
-    if (!finished) {
+    workerExited = true;
+    if (!finished && !stoppedReceived) {
       events.push({type: "worker-exited-early", code, ...protocol.snapshot()});
       clearTimeout(timeout);
       finish(code === 0 ? 1 : code);
@@ -488,7 +1267,7 @@ if (isMainThread) {
   worker.postMessage({
     type: "start",
     worldId: "gaius-node-runtime-smoke",
-    seed: "gaius-runtime-smoke-v1",
+    seed: process.env.GAIUS_SMOKE_SEED || "gaius-runtime-smoke-v1",
     sessionId,
     renderDistance: 8,
     simulationDistance: 5,
@@ -512,6 +1291,7 @@ if (isMainThread) {
     parentPort.postMessage({
       type: "node-console-error",
       detail: args.map((value) => String(value)).join(" "),
+      stack: new Error("console-error-stack").stack,
     });
     originalConsoleError(...args);
   };
@@ -519,6 +1299,9 @@ if (isMainThread) {
   let cpuProfileSession;
   let cpuProfileStarted;
   let cpuProfileMetadata;
+  let coverageSession;
+  let coverageStarted;
+  let coverageMetadata;
   parentPort.on("message", (data) => {
     if (data && data.type === "node-event-loop-probe") {
       parentPort.postMessage({
@@ -529,6 +1312,9 @@ if (isMainThread) {
           : null,
         networkStats: globalThis.__gaiusNetworkStats
           ? {...globalThis.__gaiusNetworkStats}
+          : null,
+        worldgenStats: globalThis.__gaiusWorldgenStats
+          ? {...globalThis.__gaiusWorldgenStats}
           : null,
       });
       return;
@@ -556,17 +1342,46 @@ if (isMainThread) {
       );
       return;
     }
+    if (data && data.type === "node-coverage-start") {
+      if (coverageSession !== undefined) {
+        parentPort.postMessage({
+          type: "node-console-error",
+          detail: "Worker precise coverage was started more than once",
+        });
+        return;
+      }
+      coverageSession = new InspectorSession();
+      coverageSession.connect();
+      coverageMetadata = {phase: data.phase, path: data.path};
+      coverageStarted = inspectorPost(coverageSession, "Profiler.enable")
+        .then(() => inspectorPost(coverageSession, "Profiler.startPreciseCoverage", {
+          callCount: true,
+          detailed: true,
+          allowTriggeredUpdates: false,
+        }));
+      return;
+    }
+    if (data && data.type === "node-coverage-stop") {
+      void stopWorkerCoverage(
+        coverageSession,
+        coverageStarted,
+        coverageMetadata,
+      );
+      return;
+    }
     globalThis.onmessage({data, ports: []});
   });
   parentPort.postMessage({type: "node-wrapper-ready"});
 }
 
-function inspectorPost(session, method) {
+function inspectorPost(session, method, params) {
   return new Promise((resolve, reject) => {
-    session.post(method, (error, result) => {
+    const callback = (error, result) => {
       if (error) reject(error);
       else resolve(result);
-    });
+    };
+    if (params === undefined) session.post(method, callback);
+    else session.post(method, params, callback);
   });
 }
 
@@ -591,6 +1406,31 @@ async function stopWorkerCpuProfile(session, started, metadata) {
     parentPort.postMessage({
       type: "node-console-error",
       detail: "Worker CPU profile failed: " + (error.stack || String(error)),
+    });
+  } finally {
+    session?.disconnect();
+  }
+}
+
+async function stopWorkerCoverage(session, started, metadata) {
+  try {
+    if (!session || !started || !metadata?.path) {
+      throw new Error("Worker precise coverage stop arrived before start");
+    }
+    await started;
+    const result = await inspectorPost(session, "Profiler.takePreciseCoverage");
+    await inspectorPost(session, "Profiler.stopPreciseCoverage");
+    fs.writeFileSync(metadata.path, JSON.stringify(result));
+    parentPort.postMessage({
+      type: "node-coverage-written",
+      phase: metadata.phase,
+      path: metadata.path,
+      scripts: result.result.length,
+    });
+  } catch (error) {
+    parentPort.postMessage({
+      type: "node-console-error",
+      detail: "Worker precise coverage failed: " + (error.stack || String(error)),
     });
   } finally {
     session?.disconnect();
@@ -739,7 +1579,7 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
     loginStarted = true;
     state.loginStartedAt = Date.now();
     const handshake = concatenateMany([
-      encodeVarInt(774),
+      encodeVarInt(activeProtocolVersion),
       encodeString(host),
       new Uint8Array([0x63, 0xdd]),
       encodeVarInt(2),
@@ -871,29 +1711,33 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
         });
       }
       state.playPackets++;
-      if (packetId.value === 32) {
+      if (packetId.value === clientboundPlay.disconnect) {
         throw new Error("Official server disconnected after entering PLAY");
       }
-      if (packetId.value === 1) {
+      if (packetId.value === clientboundPlay.addEntity) {
         const entity = {...decodeAddEntity(payload), receivedAt: Date.now()};
         state.addEntityPackets++;
         if (state.addedEntities.length < 512) {
           state.addedEntities.push(entity);
         }
         maybeRecordBlockDrop(entity);
-      } else if (packetId.value === 43) {
-        send(encodePacket(27, payload, state.compressionThreshold));
-      } else if (packetId.value === 59) {
-        send(encodePacket(44, payload, state.compressionThreshold));
-      } else if (packetId.value === 48) {
+      } else if (packetId.value === clientboundPlay.keepAlive) {
+        send(encodePacket(serverboundPlay.keepAlive, payload, state.compressionThreshold));
+      } else if (packetId.value === clientboundPlay.ping) {
+        send(encodePacket(serverboundPlay.pong, payload, state.compressionThreshold));
+      } else if (packetId.value === clientboundPlay.login) {
         state.playLoginPackets++;
         state.playLoginAt ??= Date.now();
         state.loginToPlayMs ??= elapsed(state.loginStartedAt, state.playLoginAt);
         if (!state.playerLoadedSent) {
           state.playerLoadedSent = true;
-          send(encodePacket(43, new Uint8Array(0), state.compressionThreshold));
+          send(encodePacket(
+            serverboundPlay.playerLoaded,
+            new Uint8Array(0),
+            state.compressionThreshold,
+          ));
         }
-      } else if (packetId.value === 44) {
+      } else if (packetId.value === clientboundPlay.levelChunkWithLight) {
         state.chunkPackets++;
         const chunkPosition = decodeChunkPosition(payload);
         if (state.chunkTimeline.length < 256) {
@@ -912,7 +1756,7 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
         maybeCompleteRoamStep(chunkPosition);
         maybeScheduleRoam();
         maybeScheduleMining();
-      } else if (packetId.value === 70) {
+      } else if (packetId.value === clientboundPlay.playerPosition) {
         const previousPosition = state.playerPosition;
         state.playerPosition = decodePlayerPosition(payload);
         if (state.roamScheduled && previousPosition) {
@@ -926,7 +1770,7 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
         maybeScheduleMining();
         send(
           encodePacket(
-            0,
+            serverboundPlay.acceptTeleportation,
             encodeVarInt(state.playerPosition.teleportId),
             state.compressionThreshold
           )
@@ -935,12 +1779,12 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
           // A real client resumes movement heartbeats after accepting a server correction.
           scheduleRoamHeartbeat();
         }
-      } else if (packetId.value === 92) {
+      } else if (packetId.value === clientboundPlay.setChunkCacheCenter) {
         const center = decodeChunkCacheCenter(payload);
         if (center && state.chunkCenters.length < 32) {
           state.chunkCenters.push({...center, receivedAt: Date.now()});
         }
-      } else if (packetId.value === 4) {
+      } else if (packetId.value === clientboundPlay.blockChangedAck) {
         const sequence = decodeVarInt(payload, 0);
         if (sequence === undefined) {
           throw new Error("Block-action acknowledgement omitted its sequence");
@@ -958,7 +1802,7 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
           clearTimeout(state.blockActionAckTimer);
           completeBlockAction();
         }
-      } else if (packetId.value === 8) {
+      } else if (packetId.value === clientboundPlay.blockUpdate) {
         const update = decodeBlockUpdate(payload);
         if (state.blockUpdates.length < 128) {
           state.blockUpdates.push({...update, receivedAt: Date.now()});
@@ -1036,12 +1880,12 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
     state.blockActionProbedTargets.push(target);
     state.blockActionProbeCount++;
     send(encodePacket(
-      6,
+      serverboundPlay.chatCommand,
       encodeString("item replace entity @s weapon.mainhand with minecraft:diamond_pickaxe"),
       state.compressionThreshold
     ));
     send(encodePacket(
-      6,
+      serverboundPlay.chatCommand,
       encodeString(`setblock ${target.x} ${target.y} ${target.z} minecraft:nether_bricks`),
       state.compressionThreshold
     ));
@@ -1069,7 +1913,7 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
       }
       send(
         encodePacket(
-          29,
+          serverboundPlay.movePlayerPos,
           encodeMovePlayerPosition(state.playerPosition),
           state.compressionThreshold
         )
@@ -1104,7 +1948,7 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
     };
     send(
       encodePacket(
-        29,
+        serverboundPlay.movePlayerPos,
         encodeMovePlayerPosition(state.playerPosition),
         state.compressionThreshold
       )
@@ -1147,13 +1991,13 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
     // tripping the server's movement validation.
     if (state.roamStep === 1 && options.roamSpectator) {
       send(encodePacket(
-        6,
+        serverboundPlay.chatCommand,
         encodeString("gamemode spectator @s"),
         state.compressionThreshold
       ));
     }
     send(encodePacket(
-      6,
+      serverboundPlay.chatCommand,
       encodeString(
         `tp @s ${nextX} ${state.playerPosition.y} ${state.playerPosition.z}`
       ),
@@ -1236,7 +2080,7 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
     const sequence = ++state.blockActionSequence;
     state.blockActionSentAt.set(sequence, Date.now());
     send(encodePacket(
-      40,
+      serverboundPlay.playerAction,
       concatenateMany([
         encodeVarInt(action),
         encodeBlockPos(state.blockActionTarget),
@@ -1270,7 +2114,7 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
     if (options.requireBlockDrop && !state.persistenceMarkerScheduled) {
       state.persistenceMarkerScheduled = true;
       send(encodePacket(
-        6,
+        serverboundPlay.chatCommand,
         encodeString(
           `setblock ${state.blockActionTarget.x} ${state.blockActionTarget.y} ` +
           `${state.blockActionTarget.z + 1} minecraft:gold_block`
@@ -1372,7 +2216,7 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
       const ackedChunkPackets = state.chunkPackets;
       state.lastAckedChunkPackets = ackedChunkPackets;
       send(encodePacket(
-        10,
+        serverboundPlay.chunkBatchReceived,
         encodeFloat(options.chunkBatchDesiredRate),
         state.compressionThreshold
       ), () => {
@@ -1608,7 +2452,9 @@ function createBlockCandidates(position) {
   const baseX = Math.floor(position.x);
   const baseY = Math.floor(position.y);
   const baseZ = Math.floor(position.z);
-  const offsets = [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]];
+  // Never mine the stationary smoke player's supporting column. Falling into
+  // the probe hole can kill the client and make chunk streaming look stalled.
+  const offsets = [[1, 0], [-1, 0], [0, 1], [0, -1]];
   const candidates = [];
   for (let depth = 1; depth <= 4; depth++) {
     for (const [offsetX, offsetZ] of offsets) {
@@ -1759,6 +2605,7 @@ function summarizeGameplayProbeLatencies(samples) {
 
 function isGameplayProbePhase(phase) {
   return phase === "server-created" ||
+    phase === "server-listener-ready" ||
     phase === "distance-staged" ||
     phase.startsWith("distance-") ||
     phase.startsWith("roam-");
@@ -1785,6 +2632,12 @@ function installWorkerGlobals() {
   if (Number.isFinite(worldgenSliceMillis) && worldgenSliceMillis > 0) {
     globalThis.__gaiusWorldgenSliceMillis = worldgenSliceMillis;
   }
+  const distanceManagerUpdateBudget = Number(
+    process.env.GAIUS_SMOKE_DISTANCE_MANAGER_UPDATE_BUDGET || "",
+  );
+  if (Number.isFinite(distanceManagerUpdateBudget) && distanceManagerUpdateBudget > 0) {
+    globalThis.__gaiusDistanceManagerUpdateBudget = distanceManagerUpdateBudget;
+  }
   globalThis.location = pathToFileURL(bootstrapPath);
   globalThis.location.search = "";
   globalThis.postMessage = (message, transfer) => parentPort.postMessage(message, transfer);
@@ -1792,7 +2645,68 @@ function installWorkerGlobals() {
   globalThis.importScripts = (...urls) => {
     for (const url of urls) {
       const path = fileURLToPath(String(url));
-      vm.runInThisContext(fs.readFileSync(path, "utf8"), {filename: path});
+      let source = fs.readFileSync(path, "utf8");
+      if (process.env.GAIUS_SMOKE_MIN_SERVER_VIEW_DISTANCE === "2") {
+        const minimumDistanceReturn =
+          "return !(typeof WorkerGlobalScope !== 'undefined' && " +
+          "globalThis instanceof WorkerGlobalScope ? 1 : 0) ? 2 : 1;";
+        if (!source.includes(minimumDistanceReturn)) {
+          throw new Error(
+            "The diagnostic Worker has no replaceable minimum view-distance method",
+          );
+        }
+        source = source.replace(
+          minimumDistanceReturn,
+          "return 2;",
+        );
+      }
+      if (process.env.GAIUS_SMOKE_CAPTURE_JAVA_ERRORS === "1") {
+        const loggerErrorStart =
+          "osh_AbstractLogger_error = ($this, $format, $arg1, $arg2) => {";
+        const instrumentedLoggerErrorStart = `${loggerErrorStart}\n` +
+          "    if ($arg2 && $arg2.$jsException && $arg2.$jsException.stack) {\n" +
+          "        globalThis.postMessage({\n" +
+          "            type: 'node-java-error-stack',\n" +
+          "            detail: String($arg2.$jsException.stack)\n" +
+          "        });\n" +
+          "    }";
+        if (!source.includes(loggerErrorStart)) {
+          throw new Error(
+            "The diagnostic Worker has no instrumentable logger error method",
+          );
+        }
+        source = source.replace(loggerErrorStart, instrumentedLoggerErrorStart);
+      }
+      if (process.env.GAIUS_SMOKE_UNBOUNDED_DISTANCE_MANAGER === "1") {
+        const boundedDistanceManagerBudget =
+          "return Math.max(8, Math.min(512, Math.floor(configured)));";
+        if (!source.includes(boundedDistanceManagerBudget)) {
+          throw new Error(
+            "The diagnostic Worker has no replaceable distance-manager budget",
+          );
+        }
+        source = source.replace(
+          boundedDistanceManagerBudget,
+          "return Math.max(8, Math.floor(configured));",
+        );
+      }
+      if (process.env.GAIUS_SMOKE_DEFER_DISTANCE_MANAGER_FUTURES === "1") {
+        const distanceUpdateTelemetry =
+          "$rt_java.dgb_BrowserWorldgenScheduler_recordDistanceManagerUpdatesJs$js_body$_17(" +
+          "$rt_java.dgb_BrowserWorldgenScheduler_lastDistanceManagerUpdateBudget, " +
+          "jl_Math_max(0, $updates));";
+        const deferAfterTelemetry = `${distanceUpdateTelemetry}\n` +
+          "        if (!nmwll_LeveledPriorityQueue_isEmpty($chunk.$priorityQueue)) {\n" +
+          "            return 1;\n" +
+          "        }";
+        if (!source.includes(distanceUpdateTelemetry)) {
+          throw new Error(
+            "The diagnostic Worker has no instrumentable distance-manager telemetry",
+          );
+        }
+        source = source.replace(distanceUpdateTelemetry, deferAfterTelemetry);
+      }
+      vm.runInThisContext(source, {filename: path});
     }
   };
   globalThis.XMLHttpRequest = class NodeSmokeXmlHttpRequest {

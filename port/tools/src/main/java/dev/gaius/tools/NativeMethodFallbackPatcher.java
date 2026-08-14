@@ -93,6 +93,18 @@ public final class NativeMethodFallbackPatcher {
             replaceWithBrowserMemory(method, "setupThreadEnv");
             return true;
         }
+        if (owner.equals("org/lwjgl/system/libc/LibCString")) {
+            String target = switch (method.name + method.desc) {
+                case "nmemset(JIJ)J" -> "cMemset";
+                case "nmemcpy(JJJ)J" -> "cMemcpy";
+                case "nmemmove(JJJ)J" -> "cMemmove";
+                default -> null;
+            };
+            if (target != null) {
+                replaceWithBrowserMemory(method, target);
+                return true;
+            }
+        }
         return false;
     }
 

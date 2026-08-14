@@ -6,8 +6,26 @@ source "$root/port/scripts/version-profile.sh"
 gaius_load_version_profile "$root"
 gaius_select_java_home
 version="$GAIUS_MINECRAFT_VERSION"
+
+# TeaVM keeps dependency JARs open throughout whole-program analysis. Hold the
+# overlay writer lock from before regeneration until every consumer has closed.
+overlay_lock="$root/port/work/.build-overlays.lock"
+while ! mkdir "$overlay_lock" 2>/dev/null; do
+  lock_pid="$(cat "$overlay_lock/pid" 2>/dev/null || true)"
+  if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+    sleep 0.2
+    continue
+  fi
+  rm -rf "$overlay_lock"
+done
+printf '%s\n' "$$" > "$overlay_lock/pid"
+release_overlay_lock() {
+  rm -rf "$overlay_lock"
+}
+trap release_overlay_lock EXIT
+
 if [[ "${GAIUS_SKIP_OVERLAY_BUILD:-false}" != "true" ]]; then
-  "$root/port/scripts/build-overlays.sh" >/dev/null
+  GAIUS_OVERLAY_LOCK_HELD=true "$root/port/scripts/build-overlays.sh" >/dev/null
   gson_type_token_patches="$root/port/target/gson-type-token-client-patches"
   mkdir -p "$gson_type_token_patches"
   find "$gson_type_token_patches" -type f -delete

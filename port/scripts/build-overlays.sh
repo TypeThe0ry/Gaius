@@ -3,16 +3,24 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 build_lock="$root/port/work/.build-overlays.lock"
-while ! mkdir "$build_lock" 2>/dev/null; do
+if [[ "${GAIUS_OVERLAY_LOCK_HELD:-false}" != "true" ]]; then
+  while ! mkdir "$build_lock" 2>/dev/null; do
+    lock_pid="$(cat "$build_lock/pid" 2>/dev/null || true)"
+    if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+      sleep 0.2
+      continue
+    fi
+    rm -rf "$build_lock"
+  done
+  printf '%s\n' "$$" > "$build_lock/pid"
+  trap 'rm -rf "$build_lock"' EXIT
+else
   lock_pid="$(cat "$build_lock/pid" 2>/dev/null || true)"
-  if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
-    sleep 0.2
-    continue
+  if [[ ! -d "$build_lock" || "$lock_pid" != "$PPID" ]]; then
+    echo "GAIUS_OVERLAY_LOCK_HELD=true without a lock owned by the caller" >&2
+    exit 1
   fi
-  rm -rf "$build_lock"
-done
-printf '%s\n' "$$" > "$build_lock/pid"
-trap 'rm -rf "$build_lock"' EXIT
+fi
 
 config="$root/port/config.json"
 source "$root/port/scripts/version-profile.sh"

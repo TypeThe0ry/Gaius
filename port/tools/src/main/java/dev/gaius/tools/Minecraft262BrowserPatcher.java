@@ -105,53 +105,14 @@ public final class Minecraft262BrowserPatcher {
      */
     private static void patchDistanceManagerCooperation(String jar, Path root)
             throws IOException {
+        patchLoadingChunkTrackerCooperation(jar, root);
+
         String owner = "net/minecraft/server/level/DistanceManager";
         ClassNode node = read(jar, owner + ".class");
         MethodNode method = find(
                 node,
                 "runAllUpdates",
                 "(Lnet/minecraft/server/level/ChunkMap;)Z");
-
-        int updateLimits = 0;
-        for (AbstractInsnNode instruction : method.instructions.toArray()) {
-            if (instruction instanceof LdcInsnNode constant
-                    && Integer.valueOf(Integer.MAX_VALUE).equals(constant.cst)) {
-                method.instructions.set(
-                        constant,
-                        new MethodInsnNode(
-                                Opcodes.INVOKESTATIC,
-                                WORLDGEN_SCHEDULER,
-                                "distanceManagerUpdateBudget",
-                                "()I",
-                                false));
-                updateLimits++;
-            }
-        }
-        if (updateLimits != 2) {
-            throw new IllegalStateException(
-                    "DistanceManager update limits changed: " + updateLimits);
-        }
-
-        int processedRecords = 0;
-        for (AbstractInsnNode instruction : method.instructions.toArray()) {
-            if (!(instruction instanceof VarInsnNode store)
-                    || store.getOpcode() != Opcodes.ISTORE
-                    || !(previousOpcode(store) instanceof InsnNode subtract)
-                    || subtract.getOpcode() != Opcodes.ISUB) {
-                continue;
-            }
-            InsnList record = new InsnList();
-            record.add(new VarInsnNode(Opcodes.ILOAD, store.var));
-            record.add(new MethodInsnNode(
-                    Opcodes.INVOKESTATIC,
-                    WORLDGEN_SCHEDULER,
-                    "recordDistanceManagerUpdates",
-                    "(I)V",
-                    false));
-            method.instructions.insert(store, record);
-            processedRecords++;
-        }
-        requireOne("DistanceManager processed-update telemetry", processedRecords);
 
         snapshotChunkFutureUpdates(method, owner);
         snapshotTicketReleases(method, owner);
@@ -164,6 +125,94 @@ public final class Minecraft262BrowserPatcher {
         writeComputeFrames(node, root.resolve(owner + ".class"));
         System.out.println(
                 "Bounded Minecraft 26.2 DistanceManager updates, ticket releases, and futures");
+    }
+
+    private static void patchLoadingChunkTrackerCooperation(String jar, Path root)
+            throws IOException {
+        String owner = "net/minecraft/server/level/LoadingChunkTracker";
+        String graph = "net/minecraft/world/level/lighting/DynamicGraphMinFixedPoint";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode method = find(node, "runDistanceUpdates", "(I)I");
+
+        LabelNode loop = new LabelNode();
+        LabelNode done = new LabelNode();
+        LabelNode continueWithoutYield = new LabelNode();
+        InsnList code = new InsnList();
+        code.add(loop);
+        code.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        code.add(new JumpInsnNode(Opcodes.IFLE, done));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                graph,
+                "hasWork",
+                "()Z",
+                false));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, done));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                WORLDGEN_SCHEDULER,
+                "distanceManagerUpdateBudget",
+                "()I",
+                false));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "java/lang/Math",
+                "min",
+                "(II)I",
+                false));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 2));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                graph,
+                "runUpdates",
+                "(I)I",
+                false));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 3));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        code.add(new InsnNode(Opcodes.ISUB));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 4));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 4));
+        code.add(new InsnNode(Opcodes.ISUB));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 1));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 4));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                WORLDGEN_SCHEDULER,
+                "recordDistanceManagerUpdates",
+                "(I)V",
+                false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                graph,
+                "hasWork",
+                "()Z",
+                false));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, done));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        code.add(new JumpInsnNode(Opcodes.IFLE, done));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 4));
+        code.add(new JumpInsnNode(Opcodes.IFGT, continueWithoutYield));
+        code.add(new JumpInsnNode(Opcodes.GOTO, done));
+        code.add(continueWithoutYield);
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                WORLDGEN_SCHEDULER,
+                "pulseDistanceManager",
+                "()V",
+                false));
+        code.add(new JumpInsnNode(Opcodes.GOTO, loop));
+        code.add(done);
+        code.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        code.add(new InsnNode(Opcodes.IRETURN));
+        replace(method, code, 2, 5);
+        writeComputeFrames(node, root.resolve(owner + ".class"));
     }
 
     private static void snapshotChunkFutureUpdates(MethodNode method, String owner) {
@@ -1127,6 +1176,16 @@ public final class Minecraft262BrowserPatcher {
             throw new IllegalStateException(
                     "GameRenderer.extract world partial tick load was not found");
         }
+        AbstractInsnNode cameraPartialTick = extractCamera.getPrevious();
+        while (cameraPartialTick != null && cameraPartialTick.getOpcode() < 0) {
+            cameraPartialTick = cameraPartialTick.getPrevious();
+        }
+        if (!(cameraPartialTick instanceof VarInsnNode cameraPartialTickLoad)
+                || cameraPartialTickLoad.getOpcode() != Opcodes.FLOAD
+                || cameraPartialTickLoad.var == worldPartialTickLoad.var) {
+            throw new IllegalStateException(
+                    "GameRenderer.extract camera partial tick load was not found");
+        }
 
         InsnList refresh = new InsnList();
         refresh.add(new VarInsnNode(Opcodes.ALOAD, 0));
@@ -1141,7 +1200,7 @@ public final class Minecraft262BrowserPatcher {
                 owner,
                 "mainCamera",
                 "Lnet/minecraft/client/Camera;"));
-        refresh.add(new VarInsnNode(Opcodes.FLOAD, worldPartialTickLoad.var));
+        refresh.add(new VarInsnNode(Opcodes.FLOAD, cameraPartialTickLoad.var));
         refresh.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 "dev/gaius/browser/BrowserTargeting",

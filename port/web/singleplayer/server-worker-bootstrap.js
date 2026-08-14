@@ -6,7 +6,7 @@ if (typeof Error === "function" && (!Error.stackTraceLimit || Error.stackTraceLi
 }
 const dbName = "gaius-fs-v1";
 const storeName = "files";
-const defaultWorldgenSliceMillis = 20;
+const defaultWorldgenSliceMillis = 8;
 const defaultDistanceRampIntervalMillis = 750;
 const defaultRegionCacheBudgetBytes = 32 * 1024 * 1024;
 const minimumRegionCacheBudgetBytes = 64 * 1024;
@@ -16,6 +16,14 @@ const opfsRecordVersion = 1;
 const opfsRecordHeaderBytes = 24;
 const opfsRecordLive = 1;
 const opfsRecordDeleted = 2;
+const opfsPatchRecordMagic = 0x47525332;
+const opfsPatchRecordVersion = 2;
+const opfsPatchRecordHeaderBytes = 48;
+const opfsPatchRecordState = 3;
+const opfsPatchCommitMagic = 0x434f4d54;
+const maximumOpfsPatchRanges = 64;
+const maximumOpfsPatchChainRecords = 64;
+const maximumOpfsPatchChainBytes = 8 * 1024 * 1024;
 const fileValues = Object.create(null);
 const regionIndex = new Map();
 const regionCache = new Map();
@@ -39,6 +47,19 @@ const storageStats = root.__gaiusStorageStats = {
   writeErrors: 0,
   migratedRegions: 0,
   opfsFileBytes: 0,
+  opfsFullWrites: 0,
+  opfsFullWriteBytes: 0,
+  opfsPatchWrites: 0,
+  opfsPatchPayloadBytes: 0,
+  opfsPatchRanges: 0,
+  opfsPatchCheckpoints: 0,
+  opfsReconstructedRegions: 0,
+  opfsFlushes: 0,
+  opfsFlushMillis: 0,
+  opfsMaxFlushMillis: 0,
+  opfsScanRecords: 0,
+  opfsScanV1Records: 0,
+  opfsScanV2Records: 0,
 };
 const files = root.__gaiusPersistentFiles = createPersistentFileProxy();
 let database;
@@ -50,6 +71,7 @@ let flushTimer;
 let opfsAccessHandle;
 let opfsAppendOffset = 0;
 let opfsDirty = false;
+let opfsCrcTable;
 let persistentStorageClosed = false;
 let runtimeStarted = false;
 let stopRequested = false;
@@ -113,15 +135,39 @@ function monotonicMillis() {
     : Date.now();
 }
 
-function snapshotScalarTelemetry(value) {
+const networkTelemetryPriorityKeys = Object.freeze([
+  "errors",
+  "inboundQueuedBytes",
+  "integratedServerPumpFailures",
+  "integratedServerPumpRequests",
+  "integratedServerPumpStarts",
+  "integratedServerPumpRetrySchedules",
+  "integratedServerPumpRetryExhaustions",
+  "integratedServerTaskSignals",
+  "integratedServerTaskUnparks",
+  "integratedServerTaskCoalesced",
+  "integratedServerTaskSchedules",
+  "integratedServerTaskScheduleFailures",
+  "integratedServerTaskRuns",
+  "integratedServerTaskFollowups",
+  "integratedServerTaskLifecycleDrops",
+  "integratedServerTaskWrongThread",
+  "integratedServerTaskBudgetExhaustions",
+  "integratedServerTaskDeferredRetries",
+  "integratedServerTaskRetryExhaustions",
+  "integratedServerTaskPending",
+  "integratedServerInputPending",
+]);
+
+function snapshotScalarTelemetry(value, priorityKeys = []) {
   const snapshot = Object.create(null);
   if (!value || typeof value !== "object") {
     return snapshot;
   }
   let copied = 0;
-  for (const key of Object.keys(value)) {
-    if (copied >= 64) {
-      break;
+  const copy = (key) => {
+    if (copied >= 64 || Object.prototype.hasOwnProperty.call(snapshot, key)) {
+      return;
     }
     const current = value[key];
     if (typeof current === "number") {
@@ -132,6 +178,15 @@ function snapshotScalarTelemetry(value) {
     } else if (typeof current === "boolean" || typeof current === "string" || current === null) {
       snapshot[key] = current;
       copied++;
+    }
+  };
+  for (const key of priorityKeys) {
+    copy(key);
+  }
+  for (const key of Object.keys(value)) {
+    copy(key);
+    if (copied >= 64) {
+      break;
     }
   }
   return snapshot;
@@ -396,7 +451,10 @@ function handleControlMessage(event) {
       receivedAtEpoch,
       sentAtEpoch: Date.now(),
       chunkPriority: snapshotScalarTelemetry(root.__gaiusChunkPriorityStats),
-      network: snapshotScalarTelemetry(root.__gaiusNetworkStats),
+      network: snapshotScalarTelemetry(
+        root.__gaiusNetworkStats,
+        networkTelemetryPriorityKeys,
+      ),
       worldgen: snapshotScalarTelemetry(root.__gaiusWorldgenStats),
       storage: snapshotScalarTelemetry(storageStats),
     });
@@ -543,6 +601,30 @@ async function installPersistentFileSystem() {
     scheduleFlush(250);
     return true;
   };
+  root.__gaiusFsCanPatchBytes = (path) => {
+    path = normalize(path);
+    const indexed = regionIndex.get(path);
+    return !!opfsAccessHandle && isRegionPath(path) &&
+      (!indexed || indexed.backend === "opfs");
+  };
+  root.__gaiusFsPatchBytes = (path, logicalSize, offsets, lengths, value) => {
+    path = normalize(path);
+    const indexed = regionIndex.get(path);
+    if (!opfsAccessHandle || !isRegionPath(path) ||
+        (indexed && indexed.backend !== "opfs")) return false;
+    try {
+      appendOpfsPatch(path, logicalSize, offsets, lengths, value);
+      // One committed record may contain many ranges; flush exactly once after
+      // the complete transaction (and any bounded checkpoint) has been appended.
+      flushOpfsSync();
+      removeRegionCache(path);
+      return true;
+    } catch (error) {
+      storageStats.writeErrors++;
+      reportStorageError(error);
+      return false;
+    }
+  };
   root.__gaiusFsDelete = (path) => {
     path = normalize(path);
     if (isRegionPath(path)) {
@@ -635,42 +717,23 @@ function opfsContainerName(worldId) {
 
 function scanOpfsRegionStore() {
   const size = Number(opfsAccessHandle.getSize()) || 0;
-  const header = new Uint8Array(opfsRecordHeaderBytes);
+  const prefix = new Uint8Array(8);
   const decoder = new TextDecoder();
   const worldPrefix = activeWorldPrefix();
   let offset = 0;
-  while (offset + opfsRecordHeaderBytes <= size) {
-    if (readSync(opfsAccessHandle, header, offset) !== header.byteLength) break;
-    const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
+  while (offset + prefix.byteLength <= size) {
+    if (readSync(opfsAccessHandle, prefix, offset) !== prefix.byteLength) break;
+    const view = new DataView(prefix.buffer, prefix.byteOffset, prefix.byteLength);
     const magic = view.getUint32(0, true);
     const version = view.getUint32(4, true);
-    const state = view.getUint32(8, true);
-    const pathLength = view.getUint32(12, true);
-    const dataLength = view.getUint32(16, true);
-    const recordLength = view.getUint32(20, true);
-    if (magic !== opfsRecordMagic || version !== opfsRecordVersion ||
-        (state !== opfsRecordLive && state !== opfsRecordDeleted) ||
-        pathLength === 0 || pathLength > 4096 ||
-        recordLength !== opfsRecordHeaderBytes + pathLength + dataLength ||
-        offset + recordLength > size) {
-      break;
+    let recordLength = 0;
+    if (magic === opfsRecordMagic && version === opfsRecordVersion) {
+      recordLength = scanOpfsV1Record(offset, size, decoder, worldPrefix);
+    } else if (magic === opfsPatchRecordMagic && version === opfsPatchRecordVersion) {
+      recordLength = scanOpfsV2Record(offset, size, decoder, worldPrefix);
     }
-    const pathBytes = new Uint8Array(pathLength);
-    if (readSync(opfsAccessHandle, pathBytes, offset + opfsRecordHeaderBytes) !== pathLength) {
-      break;
-    }
-    const path = normalize(decoder.decode(pathBytes));
-    if (path.startsWith(worldPrefix) && isRegionPath(path)) {
-      if (state === opfsRecordDeleted) {
-        regionIndex.delete(path);
-      } else {
-        regionIndex.set(path, {
-          backend: "opfs",
-          offset: offset + opfsRecordHeaderBytes + pathLength,
-          length: dataLength,
-        });
-      }
-    }
+    if (recordLength <= 0) break;
+    storageStats.opfsScanRecords++;
     offset += recordLength;
   }
   if (offset < size) {
@@ -688,6 +751,138 @@ function scanOpfsRegionStore() {
   refreshStorageStats();
 }
 
+function scanOpfsV1Record(offset, size, decoder, worldPrefix) {
+  if (offset + opfsRecordHeaderBytes > size) return 0;
+  const header = new Uint8Array(opfsRecordHeaderBytes);
+  if (readSync(opfsAccessHandle, header, offset) !== header.byteLength) return 0;
+  const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
+  const state = view.getUint32(8, true);
+  const pathLength = view.getUint32(12, true);
+  const dataLength = view.getUint32(16, true);
+  const recordLength = view.getUint32(20, true);
+  if ((state !== opfsRecordLive && state !== opfsRecordDeleted) ||
+      pathLength === 0 || pathLength > 4096 ||
+      recordLength !== opfsRecordHeaderBytes + pathLength + dataLength ||
+      offset + recordLength > size) {
+    return 0;
+  }
+  const pathBytes = new Uint8Array(pathLength);
+  if (readSync(opfsAccessHandle, pathBytes, offset + opfsRecordHeaderBytes) !== pathLength) {
+    return 0;
+  }
+  const path = normalize(decoder.decode(pathBytes));
+  if (path.startsWith(worldPrefix) && isRegionPath(path)) {
+    if (state === opfsRecordDeleted) {
+      regionIndex.delete(path);
+    } else {
+      const generation = nextOpfsRegionGeneration(regionIndex.get(path));
+      regionIndex.set(path, fullOpfsRegionEntry(
+        offset + opfsRecordHeaderBytes + pathLength,
+        dataLength,
+        generation,
+      ));
+    }
+  }
+  storageStats.opfsScanV1Records++;
+  return recordLength;
+}
+
+function scanOpfsV2Record(offset, size, decoder, worldPrefix) {
+  if (offset + opfsPatchRecordHeaderBytes > size) return 0;
+  const header = new Uint8Array(opfsPatchRecordHeaderBytes);
+  if (readSync(opfsAccessHandle, header, offset) !== header.byteLength) return 0;
+  const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
+  const state = view.getUint32(8, true);
+  const pathLength = view.getUint32(12, true);
+  const logicalSize = view.getUint32(16, true);
+  const rangeCount = view.getUint32(20, true);
+  const metadataLength = view.getUint32(24, true);
+  const payloadLength = view.getUint32(28, true);
+  const recordLength = view.getUint32(32, true);
+  const generation = view.getUint32(36, true);
+  const checksum = view.getUint32(40, true);
+  const commitMagic = view.getUint32(44, true);
+  if (state !== opfsPatchRecordState || commitMagic !== opfsPatchCommitMagic ||
+      pathLength === 0 || pathLength > 4096 ||
+      rangeCount > maximumOpfsPatchRanges || metadataLength !== rangeCount * 8 ||
+      generation === 0 ||
+      recordLength !== opfsPatchRecordHeaderBytes + pathLength + metadataLength + payloadLength ||
+      offset + recordLength > size) {
+    return 0;
+  }
+
+  const pathBytes = new Uint8Array(pathLength);
+  const metadata = new Uint8Array(metadataLength);
+  const payload = new Uint8Array(payloadLength);
+  let cursor = offset + opfsPatchRecordHeaderBytes;
+  if (readSync(opfsAccessHandle, pathBytes, cursor) !== pathLength) return 0;
+  cursor += pathLength;
+  if (readSync(opfsAccessHandle, metadata, cursor) !== metadataLength) return 0;
+  cursor += metadataLength;
+  if (readSync(opfsAccessHandle, payload, cursor) !== payloadLength) return 0;
+  if (opfsPatchChecksum(pathBytes, metadata, payload, logicalSize, generation) !== checksum) {
+    return 0;
+  }
+
+  const ranges = decodeOpfsPatchRanges(metadata, logicalSize, payloadLength);
+  if (!ranges) return 0;
+  const path = normalize(decoder.decode(pathBytes));
+  if (path.startsWith(worldPrefix) && isRegionPath(path)) {
+    const previous = regionIndex.get(path);
+    if (generation !== nextOpfsRegionGeneration(previous)) return 0;
+    regionIndex.set(path, patchedOpfsRegionEntry(
+      previous,
+      logicalSize,
+      generation,
+      cursor,
+      payloadLength,
+      ranges,
+    ));
+  }
+  storageStats.opfsScanV2Records++;
+  return recordLength;
+}
+
+function fullOpfsRegionEntry(dataOffset, dataLength, generation) {
+  return {
+    backend: "opfs",
+    offset: dataOffset,
+    length: dataLength,
+    baseOffset: dataOffset,
+    baseLength: dataLength,
+    logicalSize: dataLength,
+    generation,
+    patches: [],
+    patchBytes: 0,
+  };
+}
+
+function patchedOpfsRegionEntry(
+  previous, logicalSize, generation, dataOffset, payloadLength, ranges,
+) {
+  const hasBase = previous && previous.backend === "opfs";
+  const patches = hasBase && Array.isArray(previous.patches)
+    ? previous.patches.slice()
+    : [];
+  patches.push({dataOffset, payloadLength, logicalSize, ranges});
+  return {
+    backend: "opfs",
+    offset: hasBase ? previous.baseOffset : undefined,
+    length: logicalSize,
+    baseOffset: hasBase ? previous.baseOffset : undefined,
+    baseLength: hasBase ? previous.baseLength : 0,
+    logicalSize,
+    generation,
+    patches,
+    patchBytes: (hasBase ? Number(previous.patchBytes) || 0 : 0) + payloadLength,
+  };
+}
+
+function nextOpfsRegionGeneration(previous) {
+  const next = (((previous && Number(previous.generation)) || 0) + 1) >>> 0;
+  return next || 1;
+}
+
 function appendOpfsRegion(path, value, deleted) {
   if (!opfsAccessHandle) {
     throw new Error("OPFS region handle is unavailable");
@@ -699,6 +894,7 @@ function appendOpfsRegion(path, value, deleted) {
   }
   const recordLength = opfsRecordHeaderBytes + pathBytes.byteLength + bytes.byteLength;
   const offset = opfsAppendOffset;
+  const generation = nextOpfsRegionGeneration(regionIndex.get(path));
   writeSync(opfsAccessHandle, new Uint8Array(opfsRecordHeaderBytes), offset);
   writeSync(opfsAccessHandle, pathBytes, offset + opfsRecordHeaderBytes);
   if (bytes.byteLength > 0) {
@@ -723,13 +919,220 @@ function appendOpfsRegion(path, value, deleted) {
   if (deleted) {
     regionIndex.delete(path);
   } else {
-    regionIndex.set(path, {
-      backend: "opfs",
-      offset: offset + opfsRecordHeaderBytes + pathBytes.byteLength,
-      length: bytes.byteLength,
-    });
+    regionIndex.set(path, fullOpfsRegionEntry(
+      offset + opfsRecordHeaderBytes + pathBytes.byteLength,
+      bytes.byteLength,
+      generation,
+    ));
+    storageStats.opfsFullWrites++;
+    storageStats.opfsFullWriteBytes += bytes.byteLength;
   }
   refreshStorageStats();
+}
+
+function appendOpfsPatch(path, logicalSizeValue, offsets, lengths, value) {
+  if (!opfsAccessHandle) {
+    throw new Error("OPFS region handle is unavailable");
+  }
+  const logicalSize = Number(logicalSizeValue);
+  const payload = toUint8Array(value);
+  const rangeCount = Number(offsets && offsets.length);
+  if (!Number.isInteger(logicalSize) || logicalSize < 0 || logicalSize > 0xffffffff ||
+      !payload || !Number.isInteger(rangeCount) || rangeCount < 0 ||
+      rangeCount > maximumOpfsPatchRanges || !lengths || lengths.length !== rangeCount) {
+    throw new Error("Invalid OPFS region patch for " + path);
+  }
+
+  const metadata = new Uint8Array(rangeCount * 8);
+  const metadataView = new DataView(metadata.buffer);
+  let payloadLength = 0;
+  let previousEnd = 0;
+  for (let index = 0; index < rangeCount; index++) {
+    const rangeOffset = Number(offsets[index]);
+    const rangeLength = Number(lengths[index]);
+    const rangeEnd = rangeOffset + rangeLength;
+    if (!Number.isInteger(rangeOffset) || !Number.isInteger(rangeLength) ||
+        rangeOffset < previousEnd || rangeLength <= 0 || rangeEnd > logicalSize) {
+      throw new Error("Invalid OPFS patch range " + index + " for " + path);
+    }
+    metadataView.setUint32(index * 8, rangeOffset, true);
+    metadataView.setUint32(index * 8 + 4, rangeLength, true);
+    payloadLength += rangeLength;
+    previousEnd = rangeEnd;
+  }
+  if (payloadLength !== payload.byteLength) {
+    throw new Error("OPFS patch payload length mismatch for " + path);
+  }
+
+  let previous = regionIndex.get(path);
+  if (shouldCheckpointOpfsRegion(previous, payloadLength)) {
+    checkpointOpfsRegion(path, previous);
+    previous = regionIndex.get(path);
+  }
+  const generation = nextOpfsRegionGeneration(previous);
+  const pathBytes = new TextEncoder().encode(path);
+  if (pathBytes.byteLength === 0 || pathBytes.byteLength > 4096) {
+    throw new Error("Invalid OPFS patch path length for " + path);
+  }
+  const recordLength = opfsPatchRecordHeaderBytes + pathBytes.byteLength +
+    metadata.byteLength + payload.byteLength;
+  if (recordLength > 0xffffffff) {
+    throw new Error("OPFS patch record is too large for " + path);
+  }
+
+  const offset = opfsAppendOffset;
+  let cursor = offset + opfsPatchRecordHeaderBytes;
+  writeSync(opfsAccessHandle, new Uint8Array(opfsPatchRecordHeaderBytes), offset);
+  writeSync(opfsAccessHandle, pathBytes, cursor);
+  cursor += pathBytes.byteLength;
+  if (metadata.byteLength > 0) {
+    writeSync(opfsAccessHandle, metadata, cursor);
+  }
+  cursor += metadata.byteLength;
+  if (payload.byteLength > 0) {
+    writeSync(opfsAccessHandle, payload, cursor);
+  }
+
+  const header = new Uint8Array(opfsPatchRecordHeaderBytes);
+  const view = new DataView(header.buffer);
+  view.setUint32(0, opfsPatchRecordMagic, true);
+  view.setUint32(4, opfsPatchRecordVersion, true);
+  view.setUint32(8, opfsPatchRecordState, true);
+  view.setUint32(12, pathBytes.byteLength, true);
+  view.setUint32(16, logicalSize, true);
+  view.setUint32(20, rangeCount, true);
+  view.setUint32(24, metadata.byteLength, true);
+  view.setUint32(28, payload.byteLength, true);
+  view.setUint32(32, recordLength, true);
+  view.setUint32(36, generation, true);
+  view.setUint32(
+    40,
+    opfsPatchChecksum(pathBytes, metadata, payload, logicalSize, generation),
+    true,
+  );
+  view.setUint32(44, opfsPatchCommitMagic, true);
+  writeSync(opfsAccessHandle, header, offset);
+
+  opfsAppendOffset += recordLength;
+  opfsDirty = true;
+  storageStats.opfsFileBytes = opfsAppendOffset;
+  const ranges = decodeOpfsPatchRanges(metadata, logicalSize, payload.byteLength);
+  if (!ranges) {
+    throw new Error("Could not decode committed OPFS patch ranges for " + path);
+  }
+  regionIndex.set(path, patchedOpfsRegionEntry(
+    previous,
+    logicalSize,
+    generation,
+    cursor,
+    payload.byteLength,
+    ranges,
+  ));
+  storageStats.opfsPatchWrites++;
+  storageStats.opfsPatchPayloadBytes += payload.byteLength;
+  storageStats.opfsPatchRanges += rangeCount;
+  refreshStorageStats();
+}
+
+function decodeOpfsPatchRanges(metadata, logicalSize, payloadLength) {
+  if (metadata.byteLength % 8 !== 0) return null;
+  const ranges = [];
+  const view = new DataView(metadata.buffer, metadata.byteOffset, metadata.byteLength);
+  let previousEnd = 0;
+  let payloadOffset = 0;
+  for (let index = 0; index < metadata.byteLength / 8; index++) {
+    const offset = view.getUint32(index * 8, true);
+    const length = view.getUint32(index * 8 + 4, true);
+    const end = offset + length;
+    if (length === 0 || offset < previousEnd || end > logicalSize ||
+        payloadOffset + length > payloadLength) {
+      return null;
+    }
+    ranges.push({offset, length, payloadOffset});
+    previousEnd = end;
+    payloadOffset += length;
+  }
+  return payloadOffset === payloadLength ? ranges : null;
+}
+
+function shouldCheckpointOpfsRegion(indexed, incomingPayloadBytes) {
+  if (!indexed || indexed.backend !== "opfs") return false;
+  const patches = Array.isArray(indexed.patches) ? indexed.patches.length : 0;
+  const patchBytes = Number(indexed.patchBytes) || 0;
+  return patches >= maximumOpfsPatchChainRecords ||
+    patchBytes + incomingPayloadBytes > maximumOpfsPatchChainBytes;
+}
+
+function checkpointOpfsRegion(path, indexed) {
+  const bytes = materializeOpfsRegion(indexed);
+  storageStats.opfsPatchCheckpoints++;
+  appendOpfsRegion(path, bytes, false);
+}
+
+function materializeOpfsRegion(indexed) {
+  const baseLength = Math.max(0, Number(indexed.baseLength) || 0);
+  let bytes = new Uint8Array(baseLength);
+  if (baseLength > 0) {
+    if (readSync(opfsAccessHandle, bytes, indexed.baseOffset) !== baseLength) {
+      throw new Error("Could not read complete OPFS region base");
+    }
+  }
+  const patches = Array.isArray(indexed.patches) ? indexed.patches : [];
+  for (const patch of patches) {
+    if (bytes.byteLength !== patch.logicalSize) {
+      const resized = new Uint8Array(patch.logicalSize);
+      resized.set(bytes.subarray(0, Math.min(bytes.byteLength, resized.byteLength)));
+      bytes = resized;
+    }
+    const payload = new Uint8Array(patch.payloadLength);
+    if (readSync(opfsAccessHandle, payload, patch.dataOffset) !== payload.byteLength) {
+      throw new Error("Could not read complete OPFS region patch");
+    }
+    for (const range of patch.ranges) {
+      bytes.set(
+        payload.subarray(range.payloadOffset, range.payloadOffset + range.length),
+        range.offset,
+      );
+    }
+  }
+  const logicalSize = Math.max(0, Number(indexed.logicalSize ?? indexed.length) || 0);
+  if (bytes.byteLength !== logicalSize) {
+    const resized = new Uint8Array(logicalSize);
+    resized.set(bytes.subarray(0, Math.min(bytes.byteLength, resized.byteLength)));
+    bytes = resized;
+  }
+  storageStats.opfsReconstructedRegions++;
+  return bytes;
+}
+
+function opfsPatchChecksum(pathBytes, metadata, payload, logicalSize, generation) {
+  const scalar = new Uint8Array(8);
+  const scalarView = new DataView(scalar.buffer);
+  scalarView.setUint32(0, logicalSize, true);
+  scalarView.setUint32(4, generation, true);
+  let crc = 0xffffffff;
+  crc = updateOpfsCrc32(crc, pathBytes);
+  crc = updateOpfsCrc32(crc, scalar);
+  crc = updateOpfsCrc32(crc, metadata);
+  crc = updateOpfsCrc32(crc, payload);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function updateOpfsCrc32(crc, bytes) {
+  if (!opfsCrcTable) {
+    opfsCrcTable = new Uint32Array(256);
+    for (let index = 0; index < opfsCrcTable.length; index++) {
+      let value = index;
+      for (let bit = 0; bit < 8; bit++) {
+        value = (value >>> 1) ^ ((value & 1) ? 0xedb88320 : 0);
+      }
+      opfsCrcTable[index] = value >>> 0;
+    }
+  }
+  for (let index = 0; index < bytes.byteLength; index++) {
+    crc = (crc >>> 8) ^ opfsCrcTable[(crc ^ bytes[index]) & 0xff];
+  }
+  return crc >>> 0;
 }
 
 function readSync(handle, output, at) {
@@ -945,8 +1348,16 @@ function queueIndexedDbChange(path, value, region) {
 
 function flushOpfsSync() {
   if (!opfsAccessHandle || !opfsDirty) return;
-  opfsAccessHandle.flush();
-  opfsDirty = false;
+  const startedAt = monotonicMillis();
+  try {
+    opfsAccessHandle.flush();
+    opfsDirty = false;
+  } finally {
+    const elapsed = Math.max(0, monotonicMillis() - startedAt);
+    storageStats.opfsFlushes++;
+    storageStats.opfsFlushMillis += elapsed;
+    storageStats.opfsMaxFlushMillis = Math.max(storageStats.opfsMaxFlushMillis, elapsed);
+  }
 }
 
 function readCachedRegion(path) {
@@ -962,10 +1373,7 @@ function readCachedRegion(path) {
     refreshStorageStats();
     return undefined;
   }
-  const bytes = new Uint8Array(indexed.length);
-  if (readSync(opfsAccessHandle, bytes, indexed.offset) !== bytes.byteLength) {
-    throw new Error("Could not read complete OPFS region: " + path);
-  }
+  const bytes = materializeOpfsRegion(indexed);
   putRegionCache(path, bytes, {
     dirty: false,
     pinned: false,

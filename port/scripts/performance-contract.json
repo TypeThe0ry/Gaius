@@ -4,7 +4,24 @@
     "hardTargetProfiles": ["steady-6-4", "traversal-6-4"],
     "stabilityProfiles": ["soak-sp-6-4", "soak-mp-6-4"],
     "requiredMemoryProfiles": ["soak-sp-6-4"],
-    "diagnosticOnlyProfiles": ["steady-8-4", "traversal-8-4", "traversal-12-4"]
+    "diagnosticOnlyProfiles": ["steady-8-4", "steady-12-4", "traversal-8-4", "traversal-12-4"],
+    "uncappedMatrixProfiles": [
+      "steady-6-4", "steady-8-4", "steady-12-4",
+      "traversal-6-4", "traversal-8-4", "traversal-12-4"
+    ],
+    "acceptance": {
+      "maximumTwoSecondStalls": 0,
+      "maximumFreezeCount": 0,
+      "maximumCrashSignals": 0,
+      "messagePortP99MaxMs": 250,
+      "messagePortMaxMs": 2000,
+      "chunkBacklogPaths": [
+        "chunk.pendingTasks",
+        "chunk.compileBacklog",
+        "chunk.uploadBacklog"
+      ],
+      "memoryRequiredProfiles": ["soak-sp-6-4"]
+    }
   },
   "measurement": {
     "frameSource": "BrowserGlfw.swapBuffers",
@@ -20,6 +37,8 @@
     "runtimeInvariantSampleCapacity": 4096,
     "longTaskCapacity": 4096,
     "freezeThresholdMs": 500,
+    "acceptanceStallThresholdMs": 2000,
+    "acceptanceStallCountMax": 0,
     "queueHighWaterDurationMs": 10000,
     "cdpCommandTimeoutMs": 15000,
     "continuousVisualIntervalMs": 10000,
@@ -198,7 +217,7 @@
     },
     "worldgen": {
       "networkWaitPulsesMax": 2,
-      "schedulerTurnPulsesMax": 64,
+      "schedulerTurnPulsesMax": 4096,
       "minimumAdaptiveSliceMillis": 2,
       "reentrantYieldDepthMax": 1,
       "p99SliceElapsedMillisMax": 14,
@@ -326,6 +345,7 @@
         "coverageRatioMin": 0.98,
         "p99FrameMsMax": 16.7,
         "longestFrameMsMax": 50,
+        "stallCountAtLeast2sMax": 0,
         "freezeCountMax": 0,
         "targeting": true,
         "runtimeInvariants": true,
@@ -352,6 +372,7 @@
         "coverageRatioMin": 0.98,
         "p99FrameMsMax": 16.7,
         "longestFrameMsMax": 50,
+        "stallCountAtLeast2sMax": 0,
         "freezeCountMax": 0,
         "targeting": true,
         "runtimeInvariants": true,
@@ -376,6 +397,31 @@
         "onePercentLowFpsMin": 45,
         "p99FrameMsMax": 22.2,
         "longestFrameMsMax": 100,
+        "stallCountAtLeast2sMax": 0,
+        "freezeCountMax": 0,
+        "targeting": true,
+        "queueHighWater": false,
+        "memory": false,
+        "gameplayAuthority": false
+      }
+    },
+    "steady-12-4": {
+      "evidenceRole": "diagnostic-stress",
+      "releaseEvidence": false,
+      "scenario": "steady",
+      "route": "singleplayer",
+      "renderDistance": 12,
+      "simulationDistance": 4,
+      "workload": "none",
+      "requireNewChunks": false,
+      "warmupMs": 30000,
+      "durationMs": 300000,
+      "fpsWindowMs": 300000,
+      "gates": {
+        "onePercentLowFpsMin": 30,
+        "p99FrameMsMax": 33.3,
+        "longestFrameMsMax": 2000,
+        "stallCountAtLeast2sMax": 0,
         "freezeCountMax": 0,
         "targeting": true,
         "queueHighWater": false,
@@ -399,6 +445,7 @@
         "onePercentLowFpsMin": 45,
         "p99FrameMsMax": 22.2,
         "longestFrameMsMax": 100,
+        "stallCountAtLeast2sMax": 0,
         "freezeCountMax": 0,
         "targeting": true,
         "queueHighWater": true,
@@ -421,6 +468,8 @@
       "gates": {
         "onePercentLowFpsMin": 30,
         "p99FrameMsMax": 33.3,
+        "longestFrameMsMax": 2000,
+        "stallCountAtLeast2sMax": 0,
         "freezeCountMax": 0,
         "targeting": true,
         "queueHighWater": true,
@@ -447,6 +496,7 @@
         "coverageRatioMin": 0.98,
         "p99FrameMsMax": 16.7,
         "longestFrameMsMax": 50,
+        "stallCountAtLeast2sMax": 0,
         "freezeCountMax": 0,
         "targeting": true,
         "runtimeInvariants": true,
@@ -475,6 +525,7 @@
         "coverageRatioMin": 0.98,
         "p99FrameMsMax": 16.7,
         "longestFrameMsMax": 50,
+        "stallCountAtLeast2sMax": 0,
         "freezeCountMax": 0,
         "targeting": true,
         "runtimeInvariants": true,

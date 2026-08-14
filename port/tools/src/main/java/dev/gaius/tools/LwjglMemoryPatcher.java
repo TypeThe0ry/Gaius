@@ -192,6 +192,22 @@ public final class LwjglMemoryPatcher {
         }
         code.add(new InsnNode(Opcodes.RETURN));
         replace(initializer, code, 2);
+
+        boolean copied = false;
+        boolean filled = false;
+        for (MethodNode method : node.methods) {
+            if (method.name.equals("memcpy") && method.desc.equals("(JJJ)V")) {
+                replaceWithDelegate(method, "copy");
+                copied = true;
+            } else if (method.name.equals("memset") && method.desc.equals("(JIJ)V")) {
+                replaceWithDelegate(method, "set");
+                filled = true;
+            }
+        }
+        if (!copied || !filled) {
+            throw new IllegalStateException(
+                    "MemoryUtilTunables browser copy/fill entry points not found");
+        }
         write(node, output);
     }
 

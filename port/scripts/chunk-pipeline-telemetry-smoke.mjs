@@ -73,7 +73,13 @@ for (const contract of [
 assert.ok(!scheduler.includes("QUEUE.removeLast("), "render tasks must not be dropped");
 
 for (const contract of [
-  "minecraft.player.raycastHitResult(partialTick, camera.entity())",
+  "pickFromRenderCamera(minecraft, camera, cameraPosition)",
+  "camera.position()",
+  "camera.forwardVector()",
+  "minecraft.level.clip(new ClipContext(",
+  "ProjectileUtil.getEntityHitResult",
+  "cameraOriginError",
+  "cameraDirectionError",
   "__gaiusBenchmarkEnabled",
   "__gaiusTargetingTelemetry",
   "maxObservationsPerRenderedFrame",
@@ -83,19 +89,21 @@ for (const contract of [
 }
 const recordTargetingFrame = Function(
   "updated", "partialTick", "type", "blockX", "blockY", "blockZ",
-  "cameraX", "cameraY", "cameraZ",
+  "cameraX", "cameraY", "cameraZ", "cameraOriginError", "cameraDirectionError",
   jsBody(targeting, "private static native void recordTargetingFrame("),
 );
 globalThis.__gaiusBenchmarkEnabled = true;
 globalThis.__gaiusFrameTelemetry = {visibleFrameCount: 0};
 globalThis.__gaiusTargetingTelemetry = {updates: 0, skips: 0, lastAt: 0};
-recordTargetingFrame(true, 0.25, 1, 2, 3, 4, 5, 6, 7);
+recordTargetingFrame(true, 0.25, 1, 2, 3, 4, 5, 6, 7, 0.125, 0.25);
 globalThis.__gaiusFrameTelemetry.visibleFrameCount = 1;
-recordTargetingFrame(true, 0.5, 1, 3, 3, 4, 5.5, 6, 7);
+recordTargetingFrame(true, 0.5, 1, 3, 3, 4, 5.5, 6, 7, 0.0625, 0.125);
 assert.equal(globalThis.__gaiusTargetingTelemetry.maxObservationsPerRenderedFrame, 1);
 assert.equal(globalThis.__gaiusTargetingTelemetry.maxObservationLagFrames, 1);
 assert.equal(globalThis.__gaiusTargetingTelemetry.ring.count, 2);
-recordTargetingFrame(true, 0.75, 1, 4, 3, 4, 6, 6, 7);
+assert.equal(globalThis.__gaiusTargetingTelemetry.maxCameraOriginError, 0.125);
+assert.equal(globalThis.__gaiusTargetingTelemetry.maxCameraDirectionError, 0.25);
+recordTargetingFrame(true, 0.75, 1, 4, 3, 4, 6, 6, 7, 0.03125, 0.0625);
 assert.equal(globalThis.__gaiusTargetingTelemetry.maxObservationsPerRenderedFrame, 2,
   "same-frame duplicate targeting observation was not detected");
 delete globalThis.__gaiusTargetingTelemetry;

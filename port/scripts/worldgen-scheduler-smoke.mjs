@@ -61,6 +61,8 @@ assert.ok(worldgen.includes("boolean yieldActive") && worldgen.includes("deferre
   "worldgen yield has no reentrancy gate");
 assert.ok(worldgen.includes("pulsesInTurn >= MAX_PULSES_PER_TURN"),
   "worldgen turn has no hard pulse cap");
+assert.ok(!worldgen.includes("pulseSparse") && !worldgen.includes("SPARSE_PULSE_INTERVAL"),
+  "worldgen scheduler retained the deep-loop suspendable sampling path");
 assert.ok(worldgen.includes("maxPulsesInTurn = Math.max(maxPulsesInTurn, pulsesInTurn)"),
   "worldgen does not track the actual maximum pulses in one scheduler turn");
 assert.ok(worldgen.includes("progressPulsesInSlice >= "
@@ -95,10 +97,14 @@ for (const field of [
 ]) {
   assert.ok(worldgen.includes(`stats.${field}`), `missing worldgen telemetry: ${field}`);
 }
-assert.equal(constants.maxNetworkWait, constants.networkCheck,
-  "network wait contract no longer matches the probe interval");
+assert.equal(constants.maxNetworkWait, 2,
+  "network wait contract no longer permits one bounded unit of progress");
 assert.ok(constants.minProgress > 0 && constants.maxPulses >= constants.minProgress,
   "worldgen progress and hard-cap constants are inconsistent");
+assert.equal(constants.clockCheck, 1,
+  "explicit worldgen boundaries no longer check their deadline immediately");
+assert.equal(constants.networkCheck, 1,
+  "explicit worldgen boundaries no longer check packet pressure immediately");
 assert.equal(constants.distanceManagerDefault, 64,
   "DistanceManager default work budget changed without an explicit benchmark update");
 assert.equal(constants.distanceManagerMin, 8,
@@ -121,6 +127,7 @@ for (const contract of [
 for (const contract of [
   "patchDistanceManagerCooperation",
   "snapshotChunkFutureUpdates",
+  "patchLoadingChunkTrackerCooperation",
   "snapshotTicketReleases",
   "patchServerChunkBroadcastCooperation",
   '"distanceManagerUpdateBudget"',

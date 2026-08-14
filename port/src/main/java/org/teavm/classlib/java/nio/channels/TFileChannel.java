@@ -23,13 +23,20 @@ import org.teavm.runtime.fs.VirtualFileSystemProvider;
  * persisted around the game loop.</p>
  */
 public class TFileChannel implements TSeekableByteChannel {
+    private static final int MAX_DIRTY_RANGES = 64;
+    private static final int[] EMPTY_RANGES = new int[0];
+    private static final byte[] ZERO_FILL_BUFFER = new byte[8192];
+
     private final VirtualFileAccessor accessor;
     private final String path;
     private final boolean readable;
     private final boolean writable;
     private final boolean materializedRetained;
+    private final int[] dirtyStarts = new int[MAX_DIRTY_RANGES + 1];
+    private final int[] dirtyEnds = new int[MAX_DIRTY_RANGES + 1];
     private boolean open = true;
     private boolean dirty;
+    private int dirtyRangeCount;
 
     private TFileChannel(
             String path,
@@ -82,7 +89,10 @@ public class TFileChannel implements TSeekableByteChannel {
         if (virtualFile == null || !virtualFile.isFile()) {
             throw new java.io.FileNotFoundException(path.toString());
         }
-        VirtualFileAccessor accessor = virtualFile.createAccessor(read, write, append);
+        // TeaVM's in-memory accessor truncates whenever writable=true and append=false.
+        // Java FileChannel only truncates for an explicit TRUNCATE_EXISTING option, so
+        // open writable accessors in preservation mode and position them ourselves.
+        VirtualFileAccessor accessor = virtualFile.createAccessor(read, write, write);
         if (accessor == null) {
             throw new java.io.FileNotFoundException(path.toString());
         }
@@ -94,6 +104,8 @@ public class TFileChannel implements TSeekableByteChannel {
             }
             if (append) {
                 accessor.seek(accessor.size());
+            } else {
+                accessor.seek(0);
             }
             retained = BrowserFilePersistence.retainMaterializedChunkFile(absolutePath);
             return new TFileChannel(
@@ -163,9 +175,16 @@ public class TFileChannel implements TSeekableByteChannel {
         if (count == 0) {
             return 0;
         }
+        int start = accessor.tell();
+        long end = (long) start + count;
+        if (start < 0 || end > Integer.MAX_VALUE) {
+            throw new IOException("Browser virtual file write is out of range: " + end);
+        }
+        zeroFillGap(start);
         byte[] bytes = new byte[count];
         source.get(bytes);
         accessor.write(bytes, 0, count);
+        addDirtyRange(start, (int) end);
         dirty = true;
         return count;
     }
@@ -221,11 +240,14 @@ public class TFileChannel implements TSeekableByteChannel {
     public TFileChannel truncate(long size) throws IOException {
         ensureWritable();
         int target = toIndex(size);
-        accessor.resize(target);
-        if (accessor.tell() > target) {
-            accessor.seek(target);
+        int currentSize = accessor.size();
+        if (target < currentSize) {
+            accessor.resize(target);
+            if (accessor.tell() > target) {
+                accessor.seek(target);
+            }
+            dirty = true;
         }
-        dirty = true;
         return this;
     }
 
@@ -332,6 +354,65 @@ public class TFileChannel implements TSeekableByteChannel {
         if (!writable || !dirty) {
             return;
         }
+        if (BrowserFilePersistence.supportsRangePersistence(path)) {
+            persistDirtyRanges();
+        } else {
+            persistFullSnapshot();
+        }
+        dirty = false;
+        dirtyRangeCount = 0;
+    }
+
+    private void persistDirtyRanges() throws IOException {
+        int size = accessor.size();
+        int retainedRanges = 0;
+        long payloadSize = 0;
+        for (int index = 0; index < dirtyRangeCount; index++) {
+            int start = Math.min(dirtyStarts[index], size);
+            int end = Math.min(dirtyEnds[index], size);
+            if (end <= start) {
+                continue;
+            }
+            dirtyStarts[retainedRanges] = start;
+            dirtyEnds[retainedRanges] = end;
+            retainedRanges++;
+            payloadSize += end - start;
+        }
+        if (payloadSize > Integer.MAX_VALUE) {
+            throw new IOException("Browser dirty-range payload is too large: " + payloadSize);
+        }
+
+        int[] offsets = retainedRanges == 0 ? EMPTY_RANGES : new int[retainedRanges];
+        int[] lengths = retainedRanges == 0 ? EMPTY_RANGES : new int[retainedRanges];
+        byte[] payload = new byte[(int) payloadSize];
+        int oldPosition = accessor.tell();
+        int payloadOffset = 0;
+        try {
+            for (int index = 0; index < retainedRanges; index++) {
+                int start = dirtyStarts[index];
+                int length = dirtyEnds[index] - start;
+                offsets[index] = start;
+                lengths[index] = length;
+                accessor.seek(start);
+                int read = 0;
+                while (read < length) {
+                    int count = accessor.read(payload, payloadOffset + read, length - read);
+                    if (count <= 0) {
+                        throw new EOFException("Could not read browser dirty range at " + start);
+                    }
+                    read += count;
+                }
+                payloadOffset += length;
+            }
+        } finally {
+            accessor.seek(oldPosition);
+        }
+        if (!BrowserFilePersistence.persistRanges(path, size, offsets, lengths, payload)) {
+            throw new IOException("Could not persist browser file ranges " + path);
+        }
+    }
+
+    private void persistFullSnapshot() throws IOException {
         int oldPosition = accessor.tell();
         int size = accessor.size();
         byte[] bytes = new byte[size];
@@ -351,7 +432,71 @@ public class TFileChannel implements TSeekableByteChannel {
         if (!BrowserFilePersistence.persist(path, bytes)) {
             throw new IOException("Could not persist browser file " + path);
         }
-        dirty = false;
+    }
+
+    private void zeroFillGap(int writePosition) throws IOException {
+        int size = accessor.size();
+        if (writePosition <= size) {
+            return;
+        }
+        accessor.seek(size);
+        int remaining = writePosition - size;
+        while (remaining > 0) {
+            int count = Math.min(remaining, ZERO_FILL_BUFFER.length);
+            accessor.write(ZERO_FILL_BUFFER, 0, count);
+            remaining -= count;
+        }
+        accessor.seek(writePosition);
+        addDirtyRange(size, writePosition);
+    }
+
+    private void addDirtyRange(int start, int end) {
+        if (end <= start) {
+            return;
+        }
+        int first = 0;
+        while (first < dirtyRangeCount && dirtyEnds[first] < start) {
+            first++;
+        }
+        int mergedStart = start;
+        int mergedEnd = end;
+        int last = first;
+        while (last < dirtyRangeCount && dirtyStarts[last] <= mergedEnd) {
+            mergedStart = Math.min(mergedStart, dirtyStarts[last]);
+            mergedEnd = Math.max(mergedEnd, dirtyEnds[last]);
+            last++;
+        }
+        int removed = last - first;
+        int tail = dirtyRangeCount - last;
+        if (tail > 0) {
+            System.arraycopy(dirtyStarts, last, dirtyStarts, first + 1, tail);
+            System.arraycopy(dirtyEnds, last, dirtyEnds, first + 1, tail);
+        }
+        dirtyStarts[first] = mergedStart;
+        dirtyEnds[first] = mergedEnd;
+        dirtyRangeCount = dirtyRangeCount - removed + 1;
+        if (dirtyRangeCount > MAX_DIRTY_RANGES) {
+            mergeClosestDirtyRanges();
+        }
+    }
+
+    private void mergeClosestDirtyRanges() {
+        int closest = 0;
+        int smallestGap = Integer.MAX_VALUE;
+        for (int index = 0; index + 1 < dirtyRangeCount; index++) {
+            int gap = dirtyStarts[index + 1] - dirtyEnds[index];
+            if (gap < smallestGap) {
+                smallestGap = gap;
+                closest = index;
+            }
+        }
+        dirtyEnds[closest] = Math.max(dirtyEnds[closest], dirtyEnds[closest + 1]);
+        int tail = dirtyRangeCount - closest - 2;
+        if (tail > 0) {
+            System.arraycopy(dirtyStarts, closest + 2, dirtyStarts, closest + 1, tail);
+            System.arraycopy(dirtyEnds, closest + 2, dirtyEnds, closest + 1, tail);
+        }
+        dirtyRangeCount--;
     }
 
     private void ensureOpen() throws TClosedChannelException {

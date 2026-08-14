@@ -11,11 +11,12 @@ public final class BrowserWorldgenScheduler {
     private static final double BUDGET_RECOVERY_MILLIS = 0.5;
     private static final double MODERATE_YIELD_DELAY_MILLIS = 4.0;
     private static final double BUSY_YIELD_DELAY_MILLIS = 8.0;
-    private static final int CLOCK_CHECK_INTERVAL = 4;
-    private static final int NETWORK_CHECK_INTERVAL = 2;
+    private static final int CLOCK_CHECK_INTERVAL = 1;
+    private static final int NETWORK_CHECK_INTERVAL = 1;
     private static final int MIN_PROGRESS_PULSES_BEFORE_NETWORK_PREEMPTION = 2;
     private static final int MAX_NETWORK_WAIT_PULSES = 2;
-    private static final int MAX_PULSES_PER_TURN = 64;
+    // Explicit patch points now represent bounded rows, columns, queues, or stage units.
+    private static final int MAX_PULSES_PER_TURN = 4096;
     private static final int DEFAULT_DISTANCE_MANAGER_UPDATE_BUDGET = 64;
     private static final int MIN_DISTANCE_MANAGER_UPDATE_BUDGET = 8;
     private static final int MAX_DISTANCE_MANAGER_UPDATE_BUDGET = 512;

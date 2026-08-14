@@ -112,10 +112,10 @@ assert.ok(cameraExtract >= 0 && refreshedPick > cameraExtract && levelExtract > 
   "26.2 GameRenderer does not refresh targeting between camera and level extraction");
 const cameraCallEnd = gameRendererExtract.indexOf("\n", cameraExtract);
 const targetingBridge = gameRendererExtract.slice(cameraCallEnd, refreshedPick);
-assert.match(targetingBridge, /fload\s+5/,
-  "26.2 frame targeting does not use the world partial tick shared by level extraction");
-assert.doesNotMatch(targetingBridge, /fload\s+6/,
-  "26.2 frame targeting still uses camera-entity partial ticks and can drift from the crosshair");
+assert.match(targetingBridge, /fload\s+6/,
+  "26.2 frame targeting does not use the render camera's entity partial tick");
+assert.doesNotMatch(targetingBridge, /fload\s+5/,
+  "26.2 frame targeting still uses world partial ticks and can drift from the crosshair");
 assert.equal(gameRenderer.match(/BrowserTargeting\.refreshFramePick/g)?.length, 1,
   "26.2 GameRenderer must refresh targeting exactly once per rendered frame");
 assert.ok(!gameRenderer.includes("LocalPlayer.raycastHitResult"),
@@ -136,14 +136,28 @@ const stabilizeBlockHit = methodBody(
   browserTargeting,
   "public static net.minecraft.world.phys.HitResult stabilizeBlockHit(net.minecraft.world.phys.HitResult, net.minecraft.client.Minecraft, net.minecraft.client.Camera, float)",
 );
+const pickFromRenderCamera = methodBody(
+  browserTargeting,
+  "private static net.minecraft.world.phys.HitResult pickFromRenderCamera(net.minecraft.client.Minecraft, net.minecraft.client.Camera, net.minecraft.world.phys.Vec3)",
+);
 assert.match(refreshFramePick, /Method (?:dev\/gaius\/browser\/BrowserTargeting\.)?stabilizeBlockHit:/,
   "frame targeting does not use the live camera raycast helper");
 assert.ok(refreshFramePick.includes("Field net/minecraft/client/Minecraft.hitResult"),
   "frame targeting does not update the shared hit result");
 assert.ok(refreshFramePick.includes("Field net/minecraft/client/Minecraft.crosshairPickEntity"),
   "frame targeting does not keep entity targeting coherent");
-assert.equal(stabilizeBlockHit.match(/LocalPlayer\.raycastHitResult/g)?.length, 1,
-  "frame targeting must perform exactly one raycast");
+assert.equal(stabilizeBlockHit.match(/pickFromRenderCamera/g)?.length, 1,
+  "frame targeting must invoke its render-camera picker exactly once");
+assert.match(stabilizeBlockHit, /Camera\.position/,
+  "frame targeting does not use the live render-camera origin");
+assert.equal(pickFromRenderCamera.match(/ClientLevel\.clip/g)?.length, 1,
+  "frame targeting must perform exactly one render-camera block raycast");
+assert.equal(pickFromRenderCamera.match(/ProjectileUtil\.getEntityHitResult/g)?.length, 1,
+  "frame targeting must perform exactly one coherent entity raycast");
+assert.match(pickFromRenderCamera, /Camera\.forwardVector/,
+  "frame targeting does not use the live render-camera direction");
+assert.ok(!browserTargeting.includes("LocalPlayer.raycastHitResult"),
+  "frame targeting still reuses the player-eye ray and can drift from the crosshair");
 
 const glBufferDirect = javap("com.mojang.blaze3d.opengl.GlBuffer$Direct");
 const mapBuffer = methodBody(

@@ -73,56 +73,109 @@ def integrated_server_pump_shim(exports: str, runtime_start_call: str) -> str:
 {INTEGRATED_SERVER_PUMP_MARKER}
 let $gaiusIntegratedServerPumpRunning = false;
 let $gaiusIntegratedServerPumpPending = false;
+let $gaiusIntegratedServerPumpDispatchScheduled = false;
+let $gaiusIntegratedServerPumpRetryTimer = 0;
+let $gaiusIntegratedServerPumpRetryCount = 0;
+const $gaiusIntegratedServerPumpMaxRetries = 4;
 const $gaiusScheduleIntegratedServerPump = typeof queueMicrotask === 'function'
     ? queueMicrotask
     : callback => Promise.resolve().then(callback);
+const $gaiusScheduleIntegratedServerPumpRetry = (callback, delay) => {{
+    if (typeof setTimeout === 'function') return setTimeout(callback, delay);
+    $gaiusScheduleIntegratedServerPump(callback);
+    return 1;
+}};
 {exports}.__gaiusStartIntegratedServerPump = () => {{
     const stats = globalThis.__gaiusNetworkStats;
     if (stats) {{
         stats.integratedServerPumpRequests =
-            (stats.integratedServerPumpRequests || 0) + 1;
+            Number(stats.integratedServerPumpRequests) || 0;
+        stats.integratedServerPumpStarts =
+            Number(stats.integratedServerPumpStarts) || 0;
+        stats.integratedServerPumpFailures =
+            Number(stats.integratedServerPumpFailures) || 0;
+        stats.integratedServerPumpCoalesced =
+            Number(stats.integratedServerPumpCoalesced) || 0;
+        stats.integratedServerPumpRetrySchedules =
+            Number(stats.integratedServerPumpRetrySchedules) || 0;
+        stats.integratedServerPumpRetryExhaustions =
+            Number(stats.integratedServerPumpRetryExhaustions) || 0;
+        stats.integratedServerPumpRequests =
+            stats.integratedServerPumpRequests + 1;
     }}
-    if ($gaiusIntegratedServerPumpRunning) {{
+    if ($gaiusIntegratedServerPumpRunning ||
+        $gaiusIntegratedServerPumpDispatchScheduled ||
+        $gaiusIntegratedServerPumpRetryTimer) {{
         $gaiusIntegratedServerPumpPending = true;
         if (stats) {{
             stats.integratedServerPumpCoalesced =
-                (stats.integratedServerPumpCoalesced || 0) + 1;
+                stats.integratedServerPumpCoalesced + 1;
         }}
         return;
     }}
-    const run = () => {{
+    $gaiusIntegratedServerPumpRetryCount = 0;
+    let run;
+    const fail = error => {{
+        $gaiusIntegratedServerPumpRunning = false;
+        $gaiusIntegratedServerPumpPending = true;
+        globalThis.__gaiusIntegratedServerPumpError =
+            String(error && (error.stack || error) || error);
+        if (stats) {{
+            stats.integratedServerPumpFailures =
+                stats.integratedServerPumpFailures + 1;
+        }}
+        if ($gaiusIntegratedServerPumpRetryCount <
+            $gaiusIntegratedServerPumpMaxRetries) {{
+            $gaiusIntegratedServerPumpRetryCount++;
+            if (stats) {{
+                stats.integratedServerPumpRetrySchedules =
+                    stats.integratedServerPumpRetrySchedules + 1;
+            }}
+            const delay = Math.min(
+                8,
+                1 << Math.min(3, $gaiusIntegratedServerPumpRetryCount - 1)
+            );
+            $gaiusIntegratedServerPumpRetryTimer =
+                $gaiusScheduleIntegratedServerPumpRetry(() => {{
+                    $gaiusIntegratedServerPumpRetryTimer = 0;
+                    if ($gaiusIntegratedServerPumpPending) run();
+                }}, delay);
+        }} else {{
+            $gaiusIntegratedServerPumpPending = false;
+            if (stats) {{
+                stats.integratedServerPumpRetryExhaustions =
+                    stats.integratedServerPumpRetryExhaustions + 1;
+            }}
+        }}
+    }};
+    run = () => {{
         $gaiusIntegratedServerPumpPending = false;
         $gaiusIntegratedServerPumpRunning = true;
         if (stats) {{
             stats.integratedServerPumpStarts =
-                (stats.integratedServerPumpStarts || 0) + 1;
+                stats.integratedServerPumpStarts + 1;
         }}
         try {{
             {runtime_start_call}(
                 () => {exports}.pumpIntegratedServerNetworkInput(),
                 result => {{
-                    $gaiusIntegratedServerPumpRunning = false;
                     if (result instanceof Error) {{
-                        globalThis.__gaiusIntegratedServerPumpError =
-                            String(result.stack || result);
-                        if (stats) {{
-                            stats.integratedServerPumpFailures =
-                                (stats.integratedServerPumpFailures || 0) + 1;
-                        }}
+                        fail(result);
+                        return;
                     }}
+                    $gaiusIntegratedServerPumpRunning = false;
+                    $gaiusIntegratedServerPumpRetryCount = 0;
                     if ($gaiusIntegratedServerPumpPending) {{
-                        $gaiusScheduleIntegratedServerPump(run);
+                        $gaiusIntegratedServerPumpDispatchScheduled = true;
+                        $gaiusScheduleIntegratedServerPump(() => {{
+                            $gaiusIntegratedServerPumpDispatchScheduled = false;
+                            if ($gaiusIntegratedServerPumpPending) run();
+                        }});
                     }}
                 }}
             );
         }} catch (error) {{
-            $gaiusIntegratedServerPumpRunning = false;
-            globalThis.__gaiusIntegratedServerPumpError =
-                String(error && (error.stack || error) || error);
-            if (stats) {{
-                stats.integratedServerPumpFailures =
-                    (stats.integratedServerPumpFailures || 0) + 1;
-            }}
+            fail(error);
         }}
     }};
     run();
@@ -213,13 +266,9 @@ def main(argv: list[str]) -> int:
             f"Patched TeaVM JS finite-safe long conversion in {target} (1 occurrence)."
         )
 
-    worker_export = find_anchored(
-        INTEGRATED_SERVER_EXPORT_PATTERN,
-        patched,
-        ".pumpIntegratedServerNetworkInput=",
-        before=128,
-        after=256,
-    )
+    # ADVANCED output may still retain whitespace when diagnostics disable
+    # minification. Match the semantic export instead of one formatted spelling.
+    worker_export = INTEGRATED_SERVER_EXPORT_PATTERN.search(patched)
     if worker_export is not None:
         if INTEGRATED_SERVER_PUMP_MARKER in patched:
             messages.append(

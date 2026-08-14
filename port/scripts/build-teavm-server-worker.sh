@@ -7,10 +7,6 @@ server_target="$root/port/target/server-worker"
 resource_list="$root/port/target/generated-resources/dev/gaius/browser/minecraft-resources.txt"
 server_resources="$server_target/generated-resources"
 
-if [[ "${GAIUS_SKIP_OVERLAY_BUILD:-false}" != "true" ]]; then
-  "$root/port/scripts/build-overlays.sh" >/dev/null
-fi
-
 # TeaVM keeps dependency JARs open throughout whole-program analysis. Prevent
 # another build from truncating and replacing an overlay while it is being read.
 overlay_lock="$root/port/work/.build-overlays.lock"
@@ -27,6 +23,10 @@ release_overlay_lock() {
   rm -rf "$overlay_lock"
 }
 trap release_overlay_lock EXIT
+
+if [[ "${GAIUS_SKIP_OVERLAY_BUILD:-false}" != "true" ]]; then
+  GAIUS_OVERLAY_LOCK_HELD=true "$root/port/scripts/build-overlays.sh" >/dev/null
+fi
 
 if [[ ! -f "$resource_list" ]]; then
   echo "Browser resources are missing; run build-teavm.sh once first" >&2

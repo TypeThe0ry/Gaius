@@ -128,6 +128,36 @@ public final class BrowserFilePersistence {
         return stored;
     }
 
+    /** Returns true only when the active Worker can durably append region range records. */
+    public static boolean supportsRangePersistence(String path) {
+        if (path == null) {
+            return false;
+        }
+        String normalized = normalize(path);
+        return isChunkStoragePath(normalized) && canPatchBytes(normalized);
+    }
+
+    /** Persists one atomic logical-size update and its bounded set of changed byte ranges. */
+    public static boolean persistRanges(
+            String path, int logicalSize, int[] offsets, int[] lengths, byte[] payload) {
+        if (path == null || logicalSize < 0 || offsets == null || lengths == null
+                || payload == null || offsets.length != lengths.length) {
+            return false;
+        }
+        if (!shouldPersist(path)) {
+            return true;
+        }
+        String normalized = normalize(path);
+        if (!isChunkStoragePath(normalized) || !canPatchBytes(normalized)) {
+            return false;
+        }
+        boolean stored = patchBytes(normalized, logicalSize, offsets, lengths, payload);
+        if (!stored) {
+            report("storage-quota-or-error", path + " patchBytes=" + payload.length);
+        }
+        return stored;
+    }
+
     /** Makes durable chunk storage visible to metadata checks without reading its payload. */
     public static boolean restoreOnDemand(String path) {
         if (path == null) {
@@ -624,6 +654,32 @@ public final class BrowserFilePersistence {
             }
             """)
     private static native boolean setBytes(String path, @JSByRef byte[] bytes);
+
+    @JSBody(params = {"path"}, script = """
+            try {
+              return typeof globalThis.__gaiusFsCanPatchBytes === 'function'
+                && !!globalThis.__gaiusFsCanPatchBytes(String(path || '/'));
+            } catch (e) {
+              return false;
+            }
+            """)
+    private static native boolean canPatchBytes(String path);
+
+    @JSBody(params = {"path", "logicalSize", "offsets", "lengths", "payload"}, script = """
+            try {
+              if (typeof globalThis.__gaiusFsPatchBytes !== 'function') return false;
+              return !!globalThis.__gaiusFsPatchBytes(
+                String(path || '/'), logicalSize, offsets, lengths, payload);
+            } catch (e) {
+              return false;
+            }
+            """)
+    private static native boolean patchBytes(
+            String path,
+            int logicalSize,
+            @JSByRef int[] offsets,
+            @JSByRef int[] lengths,
+            @JSByRef byte[] payload);
 
     @JSBody(params = {"path", "byteLength"}, script = """
             try {

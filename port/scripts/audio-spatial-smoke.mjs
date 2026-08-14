@@ -196,6 +196,10 @@ const listenerOrientation = compileFunction(
   "private static native void listenerOrientationJs(",
   ["forwardX", "forwardY", "forwardZ", "upX", "upY", "upZ"]
 );
+const setDirectionalAudio = compileFunction(
+  "public static native void setDirectionalAudio(boolean enabled);",
+  ["enabled"]
+);
 const distanceModel = compileFunction(
   "private static native void distanceModelJs(int model);",
   ["model"]
@@ -260,8 +264,15 @@ const source = state.freshSource();
 state.sources.set(1, source);
 state.buffers.set(7, { audio: { duration: 1 } });
 source.queue.push(7);
+setDirectionalAudio(true);
 state.scheduleBuffer(source, 7, 0, false);
 assert.ok(source.panner, "world source did not get a PannerNode");
+assert.equal(source.panner.panningModel, "HRTF",
+  "directional audio did not select the HRTF panning model");
+setDirectionalAudio(false);
+assert.equal(source.panner.panningModel, "equalpower",
+  "disabling directional audio did not update an existing PannerNode");
+setDirectionalAudio(true);
 const scheduled = source.scheduled.at(-1).node;
 const sourcePositionIdentity = source.position;
 const sourceDirectionIdentity = source.direction;
@@ -477,6 +488,7 @@ console.log(JSON.stringify({
       state.context.listener.forwardZ.value]
   },
   positional: {
+    panningModel: state.stats.panningModel,
     distanceModel: "inverse",
     referenceDistance: 2,
     rolloffFactor: 0,

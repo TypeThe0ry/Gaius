@@ -126,7 +126,7 @@ public final class BrowserSingleplayerClient {
             if (ownedPort && ports.get(String(sessionId)) !== ownedPort) {
               ports.set(String(sessionId), ownedPort);
             }
-            return worker.__gaiusRuntimeReady && ports.get(String(sessionId))
+            return worker.__gaiusServerReady && ports.get(String(sessionId))
               ? 1
               : 0;
             """)
@@ -223,6 +223,7 @@ public final class BrowserSingleplayerClient {
               worker.__gaiusClientAttached = false;
               worker.__gaiusClientPort = channel.port1;
               worker.__gaiusRuntimeReady = false;
+              worker.__gaiusServerReady = false;
               worker.__gaiusStopRequested = false;
               workers.set(sessionId, worker);
               const ownsSession = function() {
@@ -535,6 +536,8 @@ public final class BrowserSingleplayerClient {
                 if (message && message.type === 'runtime-ready') {
                   worker.__gaiusRuntimeReady = true;
                   startWorkerTelemetry();
+                } else if (message && message.type === 'server-listener-ready') {
+                  worker.__gaiusServerReady = true;
                 } else if (message && message.type === 'storage-flushing') {
                   worker.__gaiusStorageFlushing = true;
                   if (worker.__gaiusStopRequested) {

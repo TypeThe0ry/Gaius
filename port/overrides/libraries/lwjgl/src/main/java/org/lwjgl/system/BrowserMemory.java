@@ -748,6 +748,24 @@ public final class BrowserMemory {
         targetView.put(sourceView);
     }
 
+    /** Browser implementation of libc's destination-first memset contract. */
+    public static long cMemset(long target, int value, long byteCount) {
+        set(target, value, byteCount);
+        return target;
+    }
+
+    /** Browser implementation of libc's destination-first memcpy contract. */
+    public static long cMemcpy(long target, long source, long byteCount) {
+        copy(source, target, byteCount);
+        return target;
+    }
+
+    /** BrowserMemory.copy already preserves memmove overlap semantics. */
+    public static long cMemmove(long target, long source, long byteCount) {
+        copy(source, target, byteCount);
+        return target;
+    }
+
     public static int lengthNt1(long address, int maximum) {
         int length = 0;
         while (length < maximum && getByte(address + length) != 0) {

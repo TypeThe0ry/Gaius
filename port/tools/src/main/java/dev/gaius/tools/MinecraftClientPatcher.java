@@ -178,9 +178,9 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/world/level/levelgen/synth/ImprovedNoise.class"));
         patchPerlinNoiseBrowserDoubleWrap(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/synth/PerlinNoise.class"));
-        patchNoiseBasedChunkGeneratorBrowserYield(args[0], root.resolve(
+        patchNoiseBasedChunkGeneratorBrowserSynchronous(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/NoiseBasedChunkGenerator.class"));
-        patchNoiseChunkBrowserYield(args[0], root.resolve(
+        patchNoiseChunkBrowserSynchronous(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/NoiseChunk.class"));
         patchNoiseInterpolatorBrowserLerp(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/NoiseChunk$NoiseInterpolator.class"));
@@ -190,24 +190,24 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/world/level/levelgen/NoiseChunk$CacheOnce.class"));
         patchDensityFunctionsPureTransformersBrowserDirect(args[0], root);
         patchWorldgenRecordHashCodeCaches(args[0], root);
-        patchClimateRTreeBrowserYield(args[0], root.resolve(
+        patchClimateRTreeBrowserSynchronous(args[0], root.resolve(
                 "net/minecraft/world/level/biome/Climate$RTree$SubTree.class"));
         patchClimateRTreeNodeBrowserDoubleDistance(args[0], root.resolve(
                 "net/minecraft/world/level/biome/Climate$RTree$Node.class"));
-        patchSurfaceSystemBrowserYield(args[0], root.resolve(
+        patchSurfaceSystemBrowserSynchronous(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/SurfaceSystem.class"));
         patchSurfaceRulesContextBrowserReusableBiomeSupplier(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/SurfaceRules$Context.class"));
         patchSurfaceRulesLazyConditionBrowserPrimitiveCache(args[0], root);
         patchSurfaceRulesSequenceBrowserIndexed(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/SurfaceRules$SequenceRule.class"));
-        patchChunkGeneratorBrowserYield(args[0], root.resolve(
+        patchChunkGeneratorBrowserSynchronous(args[0], root.resolve(
                 "net/minecraft/world/level/chunk/ChunkGenerator.class"));
-        patchWorldCarverBrowserYield(args[0], root.resolve(
+        patchWorldCarverBrowserSynchronous(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/carver/WorldCarver.class"));
-        patchLightEngineBrowserYield(args[0], root.resolve(
+        patchLightEngineBrowserSynchronous(args[0], root.resolve(
                 "net/minecraft/world/level/lighting/LightEngine.class"));
-        patchLevelChunkSectionBrowserBiomeYield(args[0], root.resolve(
+        patchLevelChunkSectionBrowserSynchronous(args[0], root.resolve(
                 "net/minecraft/world/level/chunk/LevelChunkSection.class"));
         patchFriendlyByteBufBrowserLongArray(args[0], root.resolve(
                 "net/minecraft/network/FriendlyByteBuf.class"));
@@ -3368,6 +3368,13 @@ public final class MinecraftClientPatcher {
                 "init",
                 "()V",
                 false));
+        initCode.add(new VarInsnNode(Opcodes.ILOAD, trackedDevices ? 3 : 2));
+        initCode.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/openal/BrowserOpenAL",
+                "setDirectionalAudio",
+                "(Z)V",
+                false));
         initCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
         initCode.add(new TypeInsnNode(Opcodes.NEW, countingPool));
         initCode.add(new InsnNode(Opcodes.DUP));
@@ -3544,6 +3551,7 @@ public final class MinecraftClientPatcher {
     private static void patchBrowserAudioListener(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "com/mojang/blaze3d/audio/Listener.class");
         String owner = "com/mojang/blaze3d/audio/Listener";
+        String transform = "com/mojang/blaze3d/audio/ListenerTransform";
         MethodNode setTransform = find(
                 node,
                 "setTransform",
@@ -3556,9 +3564,44 @@ public final class MinecraftClientPatcher {
                 owner,
                 "transform",
                 "Lcom/mojang/blaze3d/audio/ListenerTransform;"));
+        code.add(new LdcInsnNode(0x1004));
+        appendListenerVector(code, transform, "position");
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/openal/BrowserOpenAL",
+                "listener3f",
+                "(IFFF)V",
+                false));
+        appendListenerVector(code, transform, "forward");
+        appendListenerVector(code, transform, "up");
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/openal/BrowserOpenAL",
+                "listenerOrientation",
+                "(FFFFFF)V",
+                false));
         code.add(new InsnNode(Opcodes.RETURN));
-        replace(setTransform, code, 2, 2);
+        replace(setTransform, code, 7, 2);
         write(node, output);
+    }
+
+    private static void appendListenerVector(
+            InsnList code, String transformOwner, String accessor) {
+        for (String component : new String[] {"x", "y", "z"}) {
+            code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    transformOwner,
+                    accessor,
+                    "()Lnet/minecraft/world/phys/Vec3;",
+                    false));
+            code.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    "net/minecraft/world/phys/Vec3",
+                    component,
+                    "D"));
+            code.add(new InsnNode(Opcodes.D2F));
+        }
     }
 
     private static void patchClientShutdownWatchdog(String jar, Path output) throws IOException {
@@ -8347,6 +8390,12 @@ public final class MinecraftClientPatcher {
                 "(Ljava/lang/Object;)Z",
                 true));
         code.add(new InsnNode(Opcodes.POP));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserIntegratedServerMain",
+                "markServerListenerReady",
+                "()V",
+                false));
         code.add(new InsnNode(Opcodes.RETURN));
         replace(method, code, 5, 3);
         writeComputeFrames(node, output);
@@ -11423,7 +11472,7 @@ public final class MinecraftClientPatcher {
         write(node, output);
     }
 
-    private static void patchNoiseBasedChunkGeneratorBrowserYield(
+    private static void patchNoiseBasedChunkGeneratorBrowserSynchronous(
             String jar, Path output) throws IOException {
         ClassNode node = read(jar, "net/minecraft/world/level/levelgen/NoiseBasedChunkGenerator.class");
         MethodNode method = find(
@@ -11435,12 +11484,7 @@ public final class MinecraftClientPatcher {
                         + "Lnet/minecraft/world/level/chunk/ChunkAccess;II)"
                         + "Lnet/minecraft/world/level/chunk/ChunkAccess;");
         cacheNoiseBasedChunkGeneratorDoFillConstants(method);
-        int checkpoints = insertPulseAfterLoopCounter(method, 23, -1);
-        if (checkpoints != 1) {
-            throw new IllegalStateException(
-                    "NoiseBasedChunkGenerator browser yield point was not found: " + checkpoints);
-        }
-        requireWorldgenLoopPulses("NoiseBasedChunkGenerator.doFill", method);
+        requireWorldgenSchedulerCalls("NoiseBasedChunkGenerator.doFill", method, 0);
         MethodNode applyCarvers = find(
                 node,
                 "applyCarvers",
@@ -11449,7 +11493,8 @@ public final class MinecraftClientPatcher {
                         + "Lnet/minecraft/world/level/biome/BiomeManager;"
                         + "Lnet/minecraft/world/level/StructureManager;"
                         + "Lnet/minecraft/world/level/chunk/ChunkAccess;)V");
-        requireWorldgenLoopPulses("NoiseBasedChunkGenerator.applyCarvers", applyCarvers);
+        requireWorldgenSchedulerCalls(
+                "NoiseBasedChunkGenerator.applyCarvers", applyCarvers, 0);
         writeComputeFrames(node, output);
     }
 
@@ -12107,7 +12152,8 @@ public final class MinecraftClientPatcher {
         write(node, output);
     }
 
-    private static void patchSurfaceSystemBrowserYield(String jar, Path output) throws IOException {
+    private static void patchSurfaceSystemBrowserSynchronous(String jar, Path output)
+            throws IOException {
         ClassNode node = read(jar, "net/minecraft/world/level/levelgen/SurfaceSystem.class");
         String legacyDescriptor =
                 "(Lnet/minecraft/world/level/levelgen/RandomState;"
@@ -12140,7 +12186,7 @@ public final class MinecraftClientPatcher {
         if (method == null) {
             throw new IllegalStateException("SurfaceSystem.buildSurface method was not found");
         }
-        requireWorldgenLoopPulses("SurfaceSystem.buildSurface", method);
+        requireWorldgenSchedulerCalls("SurfaceSystem.buildSurface", method, 0);
         write(node, output);
     }
 
@@ -12688,20 +12734,23 @@ public final class MinecraftClientPatcher {
         writeComputeFrames(node, output);
     }
 
-    private static void patchNoiseChunkBrowserYield(String jar, Path output) throws IOException {
+    private static void patchNoiseChunkBrowserSynchronous(String jar, Path output)
+            throws IOException {
         String owner = "net/minecraft/world/level/levelgen/NoiseChunk";
         ClassNode node = read(jar, owner + ".class");
         convertNoiseChunkCountersToInt(node, false);
         addNoiseInterpolatorArrayCache(node, owner);
-        requireWorldgenLoopPulses("NoiseChunk.fillSlice", find(node, "fillSlice", "(ZI)V"));
-        requireWorldgenLoopPulses(
+        MethodNode fillSlice = find(node, "fillSlice", "(ZI)V");
+        requireWorldgenSchedulerCalls("NoiseChunk.fillSlice", fillSlice, 0);
+        requireWorldgenSchedulerCalls(
                 "NoiseChunk.fillAllDirectly",
                 find(
                         node,
                         "fillAllDirectly",
-                        "([DLnet/minecraft/world/level/levelgen/DensityFunction;)V"));
-        requireWorldgenLoopPulses(
-                "NoiseChunk.selectCellYZ", find(node, "selectCellYZ", "(II)V"));
+                        "([DLnet/minecraft/world/level/levelgen/DensityFunction;)V"),
+                0);
+        requireWorldgenSchedulerCalls(
+                "NoiseChunk.selectCellYZ", find(node, "selectCellYZ", "(II)V"), 0);
         replaceNoiseInterpolatorUpdate(node, owner, "updateForY", "cellStartBlockY", "inCellY", false);
         replaceNoiseInterpolatorUpdate(node, owner, "updateForX", "cellStartBlockX", "inCellX", false);
         replaceNoiseInterpolatorUpdate(node, owner, "updateForZ", "cellStartBlockZ", "inCellZ", true);
@@ -13013,7 +13062,8 @@ public final class MinecraftClientPatcher {
         replace(method, code, 5, 6);
     }
 
-    private static void patchClimateRTreeBrowserYield(String jar, Path output) throws IOException {
+    private static void patchClimateRTreeBrowserSynchronous(String jar, Path output)
+            throws IOException {
         ClassNode node = read(jar, "net/minecraft/world/level/biome/Climate$RTree$SubTree.class");
         MethodNode method = find(
                 node,
@@ -13021,7 +13071,7 @@ public final class MinecraftClientPatcher {
                 "([JLnet/minecraft/world/level/biome/Climate$RTree$Leaf;"
                         + "Lnet/minecraft/world/level/biome/Climate$DistanceMetric;)"
                         + "Lnet/minecraft/world/level/biome/Climate$RTree$Leaf;");
-        requireWorldgenLoopPulses("Climate.RTree.SubTree.search", method);
+        requireWorldgenSchedulerCalls("Climate.RTree.SubTree.search", method, 0);
         write(node, output);
     }
 
@@ -13091,7 +13141,8 @@ public final class MinecraftClientPatcher {
         writeComputeFrames(node, output);
     }
 
-    private static void patchChunkGeneratorBrowserYield(String jar, Path output) throws IOException {
+    private static void patchChunkGeneratorBrowserSynchronous(String jar, Path output)
+            throws IOException {
         ClassNode node = read(jar, "net/minecraft/world/level/chunk/ChunkGenerator.class");
         MethodNode decoration = find(
                 node,
@@ -13099,7 +13150,7 @@ public final class MinecraftClientPatcher {
                 "(Lnet/minecraft/world/level/WorldGenLevel;"
                         + "Lnet/minecraft/world/level/chunk/ChunkAccess;"
                         + "Lnet/minecraft/world/level/StructureManager;)V");
-        requireWorldgenLoopPulses("ChunkGenerator.applyBiomeDecoration", decoration);
+        requireWorldgenSchedulerCalls("ChunkGenerator.applyBiomeDecoration", decoration, 0);
 
         String structureSetDescriptor =
                 "(Lnet/minecraft/world/level/StructureManager;"
@@ -13127,8 +13178,7 @@ public final class MinecraftClientPatcher {
         if (structureSets == null) {
             throw new IllegalStateException("ChunkGenerator createStructures lambda was not found");
         }
-        structureSets.instructions.insert(browserWorldgenPulse());
-        requireWorldgenLoopPulses("ChunkGenerator.createStructures", structureSets);
+        requireWorldgenSchedulerCalls("ChunkGenerator.createStructures", structureSets, 0);
 
         MethodNode references = find(
                 node,
@@ -13136,11 +13186,12 @@ public final class MinecraftClientPatcher {
                 "(Lnet/minecraft/world/level/WorldGenLevel;"
                         + "Lnet/minecraft/world/level/StructureManager;"
                         + "Lnet/minecraft/world/level/chunk/ChunkAccess;)V");
-        requireWorldgenLoopPulses("ChunkGenerator.createReferences", references);
+        requireWorldgenSchedulerCalls("ChunkGenerator.createReferences", references, 0);
         write(node, output);
     }
 
-    private static void patchWorldCarverBrowserYield(String jar, Path output) throws IOException {
+    private static void patchWorldCarverBrowserSynchronous(String jar, Path output)
+            throws IOException {
         ClassNode node = read(jar, "net/minecraft/world/level/levelgen/carver/WorldCarver.class");
         MethodNode method = find(
                 node,
@@ -13151,20 +13202,21 @@ public final class MinecraftClientPatcher {
                         + "Lnet/minecraft/world/level/levelgen/Aquifer;DDDDD"
                         + "Lnet/minecraft/world/level/chunk/CarvingMask;"
                         + "Lnet/minecraft/world/level/levelgen/carver/WorldCarver$CarveSkipChecker;)Z");
-        requireWorldgenLoopPulses("WorldCarver.carveEllipsoid", method);
+        requireWorldgenSchedulerCalls("WorldCarver.carveEllipsoid", method, 0);
         write(node, output);
     }
 
-    private static void patchLightEngineBrowserYield(String jar, Path output) throws IOException {
+    private static void patchLightEngineBrowserSynchronous(String jar, Path output)
+            throws IOException {
         ClassNode node = read(jar, "net/minecraft/world/level/lighting/LightEngine.class");
         MethodNode increases = find(node, "propagateIncreases", "()I");
         MethodNode decreases = find(node, "propagateDecreases", "()I");
-        requireWorldgenLoopPulses("LightEngine.propagateIncreases", increases);
-        requireWorldgenLoopPulses("LightEngine.propagateDecreases", decreases);
+        requireWorldgenSchedulerCalls("LightEngine.propagateIncreases", increases, 0);
+        requireWorldgenSchedulerCalls("LightEngine.propagateDecreases", decreases, 0);
         write(node, output);
     }
 
-    private static void patchLevelChunkSectionBrowserBiomeYield(
+    private static void patchLevelChunkSectionBrowserSynchronous(
             String jar, Path output) throws IOException {
         ClassNode node = read(jar, "net/minecraft/world/level/chunk/LevelChunkSection.class");
         MethodNode method = find(
@@ -13172,30 +13224,8 @@ public final class MinecraftClientPatcher {
                 "fillBiomesFromNoise",
                 "(Lnet/minecraft/world/level/biome/BiomeResolver;"
                         + "Lnet/minecraft/world/level/biome/Climate$Sampler;III)V");
-        int checkpoints = insertPulseAfterLoopCounter(method, 9, 1);
-        if (checkpoints != 1) {
-            throw new IllegalStateException(
-                    "LevelChunkSection browser biome yield point was not found: " + checkpoints);
-        }
+        requireWorldgenSchedulerCalls("LevelChunkSection.fillBiomesFromNoise", method, 0);
         write(node, output);
-    }
-
-    private static int insertPulseAfterLoopCounter(
-            MethodNode method, int localVariable, int increment) {
-        int checkpoints = 0;
-        for (var instruction = method.instructions.getFirst();
-                instruction != null;
-                instruction = instruction.getNext()) {
-            if (instruction instanceof IincInsnNode counter
-                    && counter.var == localVariable
-                    && counter.incr == increment
-                    && nextRealInstruction(instruction) instanceof JumpInsnNode jump
-                    && jump.getOpcode() == Opcodes.GOTO) {
-                method.instructions.insert(instruction, browserWorldgenPulse());
-                checkpoints++;
-            }
-        }
-        return checkpoints;
     }
 
     private static MethodInsnNode browserWorldgenCheckpoint() {
@@ -13207,35 +13237,22 @@ public final class MinecraftClientPatcher {
                 false);
     }
 
-    private static void requireWorldgenLoopPulses(String label, MethodNode method) {
-        int pulses = insertWorldgenPulseOnLoopBackedges(method);
-        if (pulses == 0) {
-            throw new IllegalStateException(label + " browser loop backedges were not found");
-        }
-    }
-
-    private static int insertWorldgenPulseOnLoopBackedges(MethodNode method) {
+    private static void requireWorldgenSchedulerCalls(
+            String label, MethodNode method, int expectedCalls) {
         int pulses = 0;
-        for (var instruction = method.instructions.getFirst();
-                instruction != null;
-                instruction = instruction.getNext()) {
-            if (instruction instanceof JumpInsnNode jump
-                    && method.instructions.indexOf(jump.label)
-                            < method.instructions.indexOf(instruction)) {
-                method.instructions.insertBefore(instruction, browserWorldgenPulse());
+        for (var instruction : method.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("dev/gaius/browser/BrowserWorldgenScheduler")
+                    && call.desc.equals("()V")) {
                 pulses++;
             }
         }
-        return pulses;
-    }
-
-    private static MethodInsnNode browserWorldgenPulse() {
-        return new MethodInsnNode(
-                Opcodes.INVOKESTATIC,
-                "dev/gaius/browser/BrowserWorldgenScheduler",
-                "pulse",
-                "()V",
-                false);
+        if (pulses != expectedCalls) {
+            throw new IllegalStateException(
+                    label + " browser scheduler calls changed: " + pulses
+                            + " (expected " + expectedCalls + ")");
+        }
     }
 
     private static void patchRegionFileVersionBrowserNoCompression(String jar, Path output) throws IOException {
