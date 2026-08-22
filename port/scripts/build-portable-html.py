@@ -573,7 +573,7 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
         root,
         classes_js,
         "client",
-        build_root / "generated-pom.xml",
+        build_root / "release-generated-pom.xml",
         [
             generated_resources / "dev/gaius/browser/minecraft-resources.txt",
             generated_resources / "dev/gaius/browser/minecraft-embedded-resources.txt",
@@ -588,7 +588,7 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
         root,
         server_js,
         "singleplayer-worker",
-        build_root / "server-worker" / "generated-pom.xml",
+        build_root / "server-worker" / "release-generated-pom.xml",
         [
             build_root
             / "server-worker"

@@ -263,7 +263,16 @@ class PortableArtifactIdentityTest(unittest.TestCase):
                 continue
             resource.parent.mkdir(parents=True, exist_ok=True)
             resource.write_text(f"fixture-resource-{index}\n", encoding="utf-8")
-        client_pom = root / "port" / "target" / "generated-pom.xml"
+        client_staging_pom = root / "port" / "target" / "generated-pom.xml"
+        client_staging_pom.write_text(
+            teavm_pom(
+                "net.minecraft.client.main.Main",
+                root / "port" / "target" / ".teavm-staging" / "client" / "dist",
+                "classes.js",
+            ),
+            encoding="utf-8",
+        )
+        client_pom = root / "port" / "target" / "release-generated-pom.xml"
         client_pom.write_text(
             teavm_pom("net.minecraft.client.main.Main", dist, "classes.js"),
             encoding="utf-8",
@@ -277,7 +286,25 @@ class PortableArtifactIdentityTest(unittest.TestCase):
         )
         worker_resources.parent.mkdir(parents=True, exist_ok=True)
         worker_resources.write_text("fixture-worker-resources\n", encoding="utf-8")
-        worker_pom = root / "port" / "target" / "server-worker" / "generated-pom.xml"
+        worker_staging_pom = (
+            root / "port" / "target" / "server-worker" / "generated-pom.xml"
+        )
+        worker_staging_pom.write_text(
+            teavm_pom(
+                "dev.gaius.browser.BrowserIntegratedServerMain",
+                root
+                / "port"
+                / "target"
+                / "server-worker"
+                / ".teavm-staging"
+                / "dist",
+                "singleplayer-server.js",
+            ),
+            encoding="utf-8",
+        )
+        worker_pom = (
+            root / "port" / "target" / "server-worker" / "release-generated-pom.xml"
+        )
         worker_pom.write_text(
             teavm_pom(
                 "dev.gaius.browser.BrowserIntegratedServerMain",
@@ -412,7 +439,7 @@ class PortableArtifactIdentityTest(unittest.TestCase):
     def test_client_compiler_profile_rejects_wrong_target_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, dist, output = self.make_fixture(directory)
-            pom = root / "port" / "target" / "generated-pom.xml"
+            pom = root / "port" / "target" / "release-generated-pom.xml"
             pom.write_text(
                 pom.read_text(encoding="utf-8").replace(
                     "<targetFileName>classes.js</targetFileName>",
@@ -427,7 +454,7 @@ class PortableArtifactIdentityTest(unittest.TestCase):
     def test_client_compiler_profile_rejects_wrong_main_class(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, dist, output = self.make_fixture(directory)
-            pom = root / "port" / "target" / "generated-pom.xml"
+            pom = root / "port" / "target" / "release-generated-pom.xml"
             pom.write_text(
                 pom.read_text(encoding="utf-8").replace(
                     "<mainClass>net.minecraft.client.main.Main</mainClass>",
@@ -657,7 +684,7 @@ class PortableArtifactIdentityTest(unittest.TestCase):
                 root,
                 "client",
                 dist / "classes.js",
-                root / "port" / "target" / "generated-pom.xml",
+                root / "port" / "target" / "release-generated-pom.xml",
                 [
                     generated_resources / "dev/gaius/browser/minecraft-resources.txt",
                     generated_resources
