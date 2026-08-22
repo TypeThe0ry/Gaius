@@ -115,8 +115,8 @@ CLIENT_RELEASE_PROFILE = DIST / "classes.js.release.json"
 WORKER_RELEASE_PROFILE = DIST / "singleplayer-server.js.release.json"
 TEAVM_COMPILER_PROFILE_TOOL = PORT / "scripts" / "teavm-compiler-profile.py"
 TEAVM_COMPILER_PROFILE_TEST = PORT / "scripts" / "test-teavm-compiler-profile.py"
-CLIENT_TEA_POM = TARGET / "generated-pom.xml"
-WORKER_TEA_POM = TARGET / "server-worker" / "generated-pom.xml"
+CLIENT_TEA_POM = TARGET / "release-generated-pom.xml"
+WORKER_TEA_POM = TARGET / "server-worker" / "release-generated-pom.xml"
 WORKER_RESOURCE_LIST = (
     TARGET
     / "server-worker"

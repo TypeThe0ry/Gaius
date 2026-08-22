@@ -178,6 +178,18 @@ def check_profile_scoped_defaults() -> None:
                 os.environ[key] = value
 
 
+def check_release_pom_contract() -> None:
+    require(
+        QUICK_CHECK.CLIENT_TEA_POM.name == "release-generated-pom.xml",
+        "quick-check client release validation uses the staging POM",
+    )
+    require(
+        QUICK_CHECK.WORKER_TEA_POM.name == "release-generated-pom.xml"
+        and QUICK_CHECK.WORKER_TEA_POM.parent.name == "server-worker",
+        "quick-check Worker release validation uses the staging POM",
+    )
+
+
 def check_manifest_top_level_identity() -> None:
     storage = {
         "schema": 2,
@@ -255,6 +267,7 @@ def check_manifest_top_level_identity() -> None:
 @hermetic_gaius_environment()
 def main() -> None:
     check_profile_scoped_defaults()
+    check_release_pom_contract()
     check_manifest_top_level_identity()
     current_versions = {
         "lwjgl": "3.4.1",
