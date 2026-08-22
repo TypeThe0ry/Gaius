@@ -39,7 +39,9 @@ work="$root/port/work/$version"
 overlay_work="$(gaius_overlay_directory "$root")"
 source_root="$root/port/overrides/classlib/src/main/java"
 classes="$overlay_work/classlib-classes"
-maven_repository="$HOME/.m2/repository"
+maven_repository="$(gaius_maven_repository "$root")"
+maven_repository_for_java="$(gaius_maven_repository_for_java "$root")"
+export GAIUS_MAVEN_REPOSITORY="$maven_repository"
 asm_version="9.8"
 
 # A fresh checkout has no generated POM yet, but the overlays must be built
@@ -62,7 +64,7 @@ for artifact_spec in "${required_maven_artifacts[@]}"; do
   if [[ ! -f "$artifact_path" ]]; then
     echo "Bootstrapping Maven artifact $artifact_coordinate"
     "$root/port/mvnw" --batch-mode --no-transfer-progress \
-      "-Dmaven.repo.local=$maven_repository" \
+      "-Dmaven.repo.local=$maven_repository_for_java" \
       org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
       "-Dartifact=$artifact_coordinate" \
       -Dtransitive=false
@@ -471,7 +473,7 @@ jar --update \
   --file "$overlay_work/libraries/$lwjgl_path" \
   -C "$lwjgl_patch_classes" .
 if ! javap -classpath "$overlay_work/libraries/$lwjgl_path" -c -p \
-    'org.lwjgl.system.Platform$Architecture' | rg -q 'String wasm64'; then
+    'org.lwjgl.system.Platform$Architecture' | grep -Fq 'String wasm64'; then
   echo "LWJGL browser architecture patch is missing" >&2
   exit 1
 fi

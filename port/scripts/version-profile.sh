@@ -114,6 +114,29 @@ gaius_resolve_path() {
   esac
 }
 
+# Keep the shell-visible Maven repository and Maven's Java-visible repository
+# on the same path.  Java derives user.home from the OS account rather than the
+# shell HOME variable, so isolated CI/cluster jobs must pass the repository
+# explicitly instead of silently falling back to a shared ~/.m2 cache.
+gaius_maven_repository() {
+  local root="$1"
+  if [[ -n "${GAIUS_MAVEN_REPOSITORY:-}" ]]; then
+    gaius_resolve_path "$root" "$GAIUS_MAVEN_REPOSITORY"
+  else
+    printf '%s\n' "$HOME/.m2/repository"
+  fi
+}
+
+gaius_maven_repository_for_java() {
+  local repository
+  repository="$(gaius_maven_repository "$1")"
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -m "$repository"
+  else
+    printf '%s\n' "$repository"
+  fi
+}
+
 gaius_build_root() {
   local root="$1"
   if [[ -n "${GAIUS_BUILD_ROOT:-}" ]]; then

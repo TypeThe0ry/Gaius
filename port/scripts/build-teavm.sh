@@ -9,6 +9,8 @@ gaius_select_java_home
 version="$GAIUS_MINECRAFT_VERSION"
 build_root="$(gaius_build_root "$root")"
 overlay_directory="$(gaius_overlay_directory "$root")"
+maven_repository="$(gaius_maven_repository "$root")"
+maven_repository_for_java="$(gaius_maven_repository_for_java "$root")"
 if [[ -n "${GAIUS_DIST_DIRECTORY:-}" || -n "${GAIUS_BUILD_ROOT:-}" || -n "${GAIUS_VERSION_PROFILE_PATH:-}" ]]; then
   target_directory="$(gaius_dist_directory "$root")"
 else
@@ -70,6 +72,7 @@ mkdir -p "$staged_target_directory"
 export GAIUS_BUILD_ROOT="$build_root"
 export GAIUS_OVERLAY_DIRECTORY="$overlay_directory"
 export GAIUS_DIST_DIRECTORY="$target_directory"
+export GAIUS_MAVEN_REPOSITORY="$maven_repository"
 
 # The browser client logs through the Gaius slf4j overlay; log4j-core and the
 # log4j slf4j binding pull desktop SSL/script/OSGi/disruptor paths into the
@@ -96,7 +99,7 @@ if [[ "${GAIUS_SKIP_OVERLAY_BUILD:-false}" != "true" ]]; then
   mkdir -p "$gson_type_token_patches"
   find "$gson_type_token_patches" -type f -delete
   java -classpath \
-    "$overlay_directory/tool-classes:$HOME/.m2/repository/org/ow2/asm/asm/9.8/asm-9.8.jar:$HOME/.m2/repository/org/ow2/asm/asm-tree/9.8/asm-tree-9.8.jar" \
+    "$overlay_directory/tool-classes:$maven_repository/org/ow2/asm/asm/9.8/asm-9.8.jar:$maven_repository/org/ow2/asm/asm-tree/9.8/asm-tree-9.8.jar" \
     dev.gaius.tools.GsonTypeTokenClientPatcher \
     "$overlay_directory/client-named-$version-gaius.jar" \
     "$gson_type_token_patches"
@@ -326,6 +329,7 @@ MAVEN_OPTS="${MAVEN_OPTS:--Xms2g -Xmx14g -XX:+UseG1GC -XX:MaxGCPauseMillis=500}"
   "$root/port/mvnw" \
   --batch-mode \
   --errors \
+  "-Dmaven.repo.local=$maven_repository_for_java" \
   --file "$pom" \
   package >"$log" 2>&1
 build_status="$?"

@@ -8,6 +8,9 @@ gaius_load_version_profile "$root"
 gaius_select_java_home
 build_root="$(gaius_build_root "$root")"
 overlay_directory="$(gaius_overlay_directory "$root")"
+maven_repository="$(gaius_maven_repository "$root")"
+maven_repository_for_java="$(gaius_maven_repository_for_java "$root")"
+export GAIUS_MAVEN_REPOSITORY="$maven_repository"
 smoke_directory="${GAIUS_PLATFORM_SMOKE_DIRECTORY:-$root/port/web/smoke}"
 if [[ -n "${GAIUS_BUILD_ROOT:-}" || -n "${GAIUS_VERSION_PROFILE_PATH:-}" ]] && [[ -z "${GAIUS_PLATFORM_SMOKE_DIRECTORY:-}" ]]; then
   smoke_directory="$root/port/web/smoke/$GAIUS_MINECRAFT_VERSION"
@@ -50,6 +53,7 @@ MAVEN_OPTS="${MAVEN_OPTS:--Xms512m -Xmx4g -XX:+UseG1GC}" \
   "$root/port/mvnw" \
   --batch-mode \
   --errors \
+  "-Dmaven.repo.local=$maven_repository_for_java" \
   --file "$pom" \
   package 2>&1 | tee "$log"
 

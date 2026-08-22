@@ -8,6 +8,8 @@ gaius_load_version_profile "$root"
 gaius_select_java_home
 build_root="$(gaius_build_root "$root")"
 overlay_directory="$(gaius_overlay_directory "$root")"
+maven_repository="$(gaius_maven_repository "$root")"
+maven_repository_for_java="$(gaius_maven_repository_for_java "$root")"
 if [[ -n "${GAIUS_DIST_DIRECTORY:-}" || -n "${GAIUS_BUILD_ROOT:-}" || -n "${GAIUS_VERSION_PROFILE_PATH:-}" ]]; then
   dist="$(gaius_dist_directory "$root")"
 else
@@ -101,6 +103,7 @@ export GAIUS_MAVEN_DIRECTORY="$server_target/maven"
 export GAIUS_RESOURCE_DIRECTORY="$server_resources"
 export GAIUS_BUILD_ROOT="$build_root"
 export GAIUS_OVERLAY_DIRECTORY="$overlay_directory"
+export GAIUS_MAVEN_REPOSITORY="$maven_repository"
 export GAIUS_EXCLUDED_LIBRARY_PREFIXES="${GAIUS_SERVER_EXCLUDED_LIBRARY_PREFIXES:-com/microsoft/azure/msal4j/,com/azure/azure-json/}"
 export GAIUS_TEA_OPTIMIZATION_LEVEL="${GAIUS_SERVER_TEA_OPTIMIZATION_LEVEL:-ADVANCED}"
 export GAIUS_SOURCE_MAPS="${GAIUS_SERVER_SOURCE_MAPS:-false}"
@@ -121,6 +124,7 @@ MAVEN_OPTS="${MAVEN_OPTS:--Xms2g -Xmx14g -XX:+UseG1GC -XX:MaxGCPauseMillis=500}"
   "$root/port/mvnw" \
   --batch-mode \
   --errors \
+  "-Dmaven.repo.local=$maven_repository_for_java" \
   --file "$pom" \
   package >"$log" 2>&1
 build_status="$?"

@@ -252,6 +252,7 @@ WASM_HOTPATH_C = PORT / "wasm" / "hotpath" / "gaius_hotpath.c"
 BUILD_WASM_HOTPATH = PORT / "scripts" / "build-wasm-hotpath.sh"
 GENERATE_WASM_HOTPATH = PORT / "scripts" / "generate-wasm-hotpath.py"
 GENERATE_POM = PORT / "scripts" / "generate-pom.sh"
+VERSION_PROFILE_SHELL = PORT / "scripts" / "version-profile.sh"
 BUILD_TEAVM = PORT / "scripts" / "build-teavm.sh"
 BUILD_SERVER_WORKER = PORT / "scripts" / "build-teavm-server-worker.sh"
 TEAVM_PUBLICATION_GATE = PORT / "scripts" / "teavm-publication-gate.sh"
@@ -2077,6 +2078,11 @@ def check_source_patches() -> None:
     build_wasm_hotpath = BUILD_WASM_HOTPATH.read_text(errors="replace") if BUILD_WASM_HOTPATH.exists() else ""
     generate_wasm_hotpath = GENERATE_WASM_HOTPATH.read_text(errors="replace") if GENERATE_WASM_HOTPATH.exists() else ""
     generate_pom = GENERATE_POM.read_text(errors="replace") if GENERATE_POM.exists() else ""
+    version_profile_shell = (
+        VERSION_PROFILE_SHELL.read_text(errors="replace")
+        if VERSION_PROFILE_SHELL.exists()
+        else ""
+    )
     build_teavm = BUILD_TEAVM.read_text(errors="replace") if BUILD_TEAVM.exists() else ""
     build_server_worker = BUILD_SERVER_WORKER.read_text(errors="replace") if BUILD_SERVER_WORKER.exists() else ""
     teavm_publication_gate = (
@@ -4404,12 +4410,28 @@ def check_source_patches() -> None:
             "Overlay builds bootstrap exact Maven inputs in a clean checkout",
             "maven-dependency-plugin:3.8.1:get" in build_overlays
             and "-Dtransitive=false" in build_overlays
-            and "-Dmaven.repo.local=$maven_repository" in build_overlays
+            and "-Dmaven.repo.local=$maven_repository_for_java" in build_overlays
             and "required_maven_artifacts" in build_overlays
             and "org.teavm:teavm-classlib:" in build_overlays
             and "org.teavm:teavm-core:" in build_overlays
             and "org.ow2.asm:asm-tree:" in build_overlays
             and "com.jcraft:jzlib:1.1.3" in build_overlays,
+        ),
+        (
+            "Overlay builds use baseline grep instead of an undeclared ripgrep dependency",
+            "grep -Fq 'String wasm64'" in build_overlays
+            and "| rg " not in build_overlays,
+        ),
+        (
+            "TeaVM builds keep Maven dependencies inside the configured job repository",
+            "gaius_maven_repository" in version_profile_shell
+            and "gaius_maven_repository_for_java" in version_profile_shell
+            and "GAIUS_MAVEN_REPOSITORY" in build_overlays
+            and "GAIUS_MAVEN_REPOSITORY" in build_teavm
+            and "GAIUS_MAVEN_REPOSITORY" in build_server_worker
+            and "-Dmaven.repo.local=$maven_repository_for_java" in build_teavm
+            and "-Dmaven.repo.local=$maven_repository_for_java" in build_server_worker
+            and "-Dmaven.repo.local=$maven_repository_for_java" in build_platform_smoke,
         ),
         (
             "Dedicated browser server removes unsupported desktop service branches",
