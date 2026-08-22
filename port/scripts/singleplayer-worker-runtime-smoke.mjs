@@ -1045,6 +1045,22 @@ function buildWorkerEventLoopEvidenceSnapshot({
   return {slowProbeEvidence, workerEventLoopLatency};
 }
 
+function buildWorldgenEventLoopStallEvent({
+  workerEventLoopLatency,
+  maximumGameplayStallMs,
+  slowProbeEvidence,
+}) {
+  return {
+    type: "worldgen-event-loop-stall",
+    maximumGameplayStallMs,
+    gameplayLatency: workerEventLoopLatency.stallValidation,
+    allGameplayLatency: workerEventLoopLatency.gameplay,
+    afterProtocolReadyGameplayLatency: workerEventLoopLatency.afterProtocolReady,
+    stallValidationScope: workerEventLoopLatency.stallValidationScope,
+    slowProbeEvidence,
+  };
+}
+
 function runWorkerEventLoopEvidenceSelfSmoke() {
   const slowSample = {
     probeId: 3,
@@ -1143,6 +1159,20 @@ function runWorkerEventLoopEvidenceSelfSmoke() {
       beforeReady.stallValidation.maxMs !== 6238) {
     throw new Error("timeout before-protocol-ready scope self-smoke failed");
   }
+  const stallEvent = buildWorldgenEventLoopStallEvent({
+    workerEventLoopLatency: latency,
+    maximumGameplayStallMs: 500,
+    slowProbeEvidence: snapshot.slowProbeEvidence,
+  });
+  if (stallEvent.type !== "worldgen-event-loop-stall" ||
+      stallEvent.maximumGameplayStallMs !== 500 ||
+      stallEvent.gameplayLatency !== latency.stallValidation ||
+      stallEvent.allGameplayLatency !== latency.gameplay ||
+      stallEvent.afterProtocolReadyGameplayLatency !== latency.afterProtocolReady ||
+      stallEvent.stallValidationScope !== "after-protocol-ready" ||
+      stallEvent.slowProbeEvidence !== snapshot.slowProbeEvidence) {
+    throw new Error("worldgen event-loop stall event self-smoke failed");
+  }
   return {
     ok: true,
     boundedSlowProbeEvidence: true,
@@ -1150,6 +1180,7 @@ function runWorkerEventLoopEvidenceSelfSmoke() {
     beforeProtocolReadyScope: true,
     currentWorkerPhase: true,
     protocolReadyAt: true,
+    stallEvent: true,
   };
 }
 
@@ -2455,17 +2486,11 @@ if (isMainThread) {
     events.push(workerEventLoopLatency);
     const {stallValidation} = workerEventLoopLatency;
     if (stallValidation.maxMs > maximumGameplayStallMs) {
-      events.push({
-        type: "worldgen-event-loop-stall",
+      events.push(buildWorldgenEventLoopStallEvent({
+        workerEventLoopLatency,
         maximumGameplayStallMs,
-        gameplayLatency: stallValidation,
-        allGameplayLatency: gameplayLatency,
-        afterProtocolReadyGameplayLatency,
-        stallValidationScope: cooperativePumpMode.requireActivity
-          ? "all-gameplay"
-          : "after-protocol-ready",
         slowProbeEvidence,
-      });
+      }));
       clearTimeout(timeout);
       finish(1);
       return;
