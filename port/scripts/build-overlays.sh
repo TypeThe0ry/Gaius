@@ -408,6 +408,30 @@ jar --update \
 jar --update \
   --file "$netty_transport_output" \
   -C "$netty_transport_patch_classes" .
+
+# Netty 4.2 guards its heap accessors with PlatformDependent.hasVarHandle(),
+# but TeaVM still analyzes the signature-polymorphic branch and cannot resolve
+# return-type-only VarHandle.get overloads. Fail here, before a long TeaVM
+# compile, unless the overlay contains only the portable byte-array branch.
+netty_heap_buffer_dump="$(
+  javap -classpath "$netty_buffer_output" -p -c io.netty.buffer.HeapByteBufUtil
+)"
+if grep -Fq 'io/netty/buffer/VarHandleByteBufferAccess' \
+    <<<"$netty_heap_buffer_dump"; then
+  echo "Netty heap-buffer overlay still reaches VarHandleByteBufferAccess" >&2
+  exit 1
+fi
+if grep -Fq 'io/netty/util/internal/PlatformDependent.hasVarHandle' \
+    <<<"$netty_heap_buffer_dump"; then
+  echo "Netty heap-buffer overlay still contains a runtime VarHandle guard" >&2
+  exit 1
+fi
+for portable_helper in getInt0 getLong0 setInt0 setLong0; do
+  if ! grep -Fq "$portable_helper" <<<"$netty_heap_buffer_dump"; then
+    echo "Netty heap-buffer overlay lost portable helper $portable_helper" >&2
+    exit 1
+  fi
+done
 netty_teavm_common_patches="$overlay_work/library-patches/netty-teavm-common"
 netty_teavm_http_patches="$overlay_work/library-patches/netty-teavm-codec-http"
 mkdir -p "$netty_teavm_common_patches" "$netty_teavm_http_patches"

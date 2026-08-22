@@ -51,6 +51,8 @@ public final class NettyBrowserPatcher {
                 commonRoot.resolve("io/netty/util/Recycler.class"));
         patchBuffer(Path.of(args[1]),
                 bufferRoot.resolve("io/netty/buffer/ByteBufUtil.class"));
+        patchHeapByteBufUtil(Path.of(args[1]),
+                bufferRoot.resolve("io/netty/buffer/HeapByteBufUtil.class"));
         patchAbstractByteBufAllocator(Path.of(args[1]),
                 bufferRoot.resolve("io/netty/buffer/AbstractByteBufAllocator.class"));
         patchReferenceCountedBuffer(Path.of(args[1]),
@@ -873,6 +875,85 @@ public final class NettyBrowserPatcher {
         replace(node, "<clinit>", "()V", code);
         replaceAsciiStringConstructor(node);
         write(node, output);
+    }
+
+    /**
+     * Removes Netty 4.2's signature-polymorphic VarHandle branches from the
+     * heap-buffer helpers. TeaVM analyzes both sides of a runtime
+     * {@code hasVarHandle()} guard, even though {@link #patchPlatform} forces
+     * that method to return false. Keeping the dead branch therefore exposes
+     * descriptors such as {@code VarHandle.get(byte[], int):int/long}, which
+     * Java source cannot represent as overloads and TeaVM cannot resolve.
+     *
+     * <p>Every affected Netty method starts with exactly this shape:</p>
+     *
+     * <pre>
+     * PlatformDependent.hasVarHandle();
+     * ifeq portablePath;
+     * ... VarHandleByteBufferAccess ...
+     * portablePath:
+     * ... byte-array implementation ...
+     * </pre>
+     *
+     * <p>Delete the guarded prefix so reachability begins at the already
+     * supplied portable implementation. This preserves Netty's byte order and
+     * bounds behaviour instead of emulating the accessors in the classlib.</p>
+     */
+    private static void patchHeapByteBufUtil(Path jar, Path output) throws IOException {
+        String owner = "io/netty/buffer/HeapByteBufUtil";
+        ClassNode node = read(jar, owner + ".class");
+        int patched = 0;
+        for (MethodNode method : node.methods) {
+            var first = firstExecutable(method.instructions.getFirst());
+            if (!(first instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKESTATIC
+                    || !call.owner.equals("io/netty/util/internal/PlatformDependent")
+                    || !call.name.equals("hasVarHandle")
+                    || !call.desc.equals("()Z")) {
+                continue;
+            }
+            var next = firstExecutable(first.getNext());
+            if (!(next instanceof JumpInsnNode branch)
+                    || branch.getOpcode() != Opcodes.IFEQ) {
+                throw new IllegalStateException(
+                        owner + "." + method.name + method.desc
+                                + " has an unexpected VarHandle guard");
+            }
+
+            var instruction = method.instructions.getFirst();
+            while (instruction != branch.label) {
+                if (instruction == null) {
+                    throw new IllegalStateException(
+                            owner + "." + method.name + method.desc
+                                    + " has no portable VarHandle fallback");
+                }
+                var following = instruction.getNext();
+                method.instructions.remove(instruction);
+                instruction = following;
+            }
+            if (method.localVariables != null) {
+                method.localVariables.clear();
+            }
+            patched++;
+        }
+        if (patched == 0) {
+            throw new IllegalStateException(
+                    owner + " contains no guarded VarHandle accessors");
+        }
+        write(node, output);
+        System.out.println(
+                "Forced " + patched + " Netty heap-buffer accessors onto portable byte arrays");
+    }
+
+    private static org.objectweb.asm.tree.AbstractInsnNode firstExecutable(
+            org.objectweb.asm.tree.AbstractInsnNode instruction) {
+        while (instruction != null
+                && (instruction.getType() == org.objectweb.asm.tree.AbstractInsnNode.LABEL
+                        || instruction.getType() == org.objectweb.asm.tree.AbstractInsnNode.LINE
+                        || instruction.getType() == org.objectweb.asm.tree.AbstractInsnNode.FRAME)) {
+            instruction = instruction.getNext();
+        }
+        return instruction;
     }
 
     private static void replaceAsciiStringConstructor(ClassNode node) {

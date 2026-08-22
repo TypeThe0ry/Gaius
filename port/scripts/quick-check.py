@@ -3443,6 +3443,14 @@ def check_source_patches() -> None:
             and '"connectInline"' in netty_browser_patcher,
         ),
         (
+            "Netty heap buffers remove signature-polymorphic VarHandle branches",
+            "patchHeapByteBufUtil" in netty_browser_patcher
+            and '"io/netty/buffer/HeapByteBufUtil"' in netty_browser_patcher
+            and 'call.name.equals("hasVarHandle")' in netty_browser_patcher
+            and "branch.getOpcode() != Opcodes.IFEQ" in netty_browser_patcher
+            and "contains no guarded VarHandle accessors" in netty_browser_patcher,
+        ),
+        (
             "Platform smoke verifies browser Netty connect and local stream batching",
             "testBrowserNetwork()" in platform_smoke
             and "new BrowserWebSocketChannel()" in platform_smoke
