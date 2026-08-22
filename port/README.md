@@ -1,10 +1,11 @@
-# Official Minecraft 1.21.11 TeaVM port
+# Minecraft TeaVM browser port
 
-This directory is the active Gaius implementation.
+This directory is the active Gaius implementation. The primary profile is
+Minecraft `26.2`; the `1.21.11` profile remains supported for compatibility.
 
 ## Rules
 
-- The game implementation comes from the official 1.21.11 client.
+- Each profile's game implementation comes from its official Minecraft client.
 - Browser adaptations are maintained as replacement/patch classes.
 - No rewritten TypeScript world simulation is used.
 - Official game JARs, mappings, libraries, and assets stay under `port/work/`
@@ -14,14 +15,15 @@ This directory is the active Gaius implementation.
 
 ## Stage A: acquire and remap
 
-Requirements: JDK 21, `curl`, `jq`, `unzip`, and `shasum`.
+Requirements: JDK 21 for `1.21.11`, JDK 25 or newer for `26.2`, plus `curl`,
+`jq`, `unzip`, and `shasum`.
 
 ```sh
 ./port/scripts/fetch-version.sh
 ./port/scripts/remap-client.sh
 ```
 
-Outputs:
+Outputs are profile-scoped (the example below selects `1.21.11`):
 
 ```text
 port/work/1.21.11/client-obfuscated.jar
@@ -29,6 +31,13 @@ port/work/1.21.11/client-mappings.txt
 port/work/1.21.11/client-named.jar
 port/work/1.21.11/libraries/
 port/work/1.21.11/classpath.txt
+```
+
+Select the profile explicitly before acquiring inputs for another version:
+
+```sh
+GAIUS_VERSION_PROFILE_PATH=versions/26.2.json ./port/scripts/fetch-version.sh
+GAIUS_VERSION_PROFILE_PATH=versions/26.2.json ./port/scripts/remap-client.sh
 ```
 
 `client-named.jar` is the actual official client bytecode remapped with Mojang's
@@ -82,10 +91,12 @@ calls so each missing subsystem can be replaced in order.
 
 ## Runtime architecture
 
-The release client is served from `port/web/dist/`. Single-player launches the
-official server entry point in `singleplayer-server-worker.js`; the client and
-server communicate through a paired `MessageChannel`, while IndexedDB persists
-world data between Worker sessions.
+The release client is served from `port/web/dist/<profile>/`. Single-player
+launches the official server entry point in
+`singleplayer-server-worker.js`; the client and server communicate through a
+paired `MessageChannel`, while IndexedDB persists world data between Worker
+sessions. Use `build-version-release.sh <profile>` so generated target,
+overlay, and dist state cannot cross profiles.
 
 `build-teavm-release.sh` also writes a self-contained `Gaius.html`. The portable
 file reconstructs the compressed client and Wasm as browser-local Blob URLs and
@@ -121,7 +132,8 @@ of the client. Short discovery caches avoid repeating an unavailable plugin
 probe and RelayNode manifest fetch between a status ping and its join; they do
 not share the underlying protocol stream.
 
-For unencrypted 1.21.11 traffic, RelayNode also tracks server-initiated
-`PLAY -> CONFIGURATION -> PLAY` cycles. Synthetic browser-stall ticks are
-disabled throughout reconfiguration, preventing stale PLAY packets from being
-sent into the configuration protocol after a plugin changes server state.
+For unencrypted `1.21.11` and `26.2` traffic, RelayNode also tracks
+server-initiated `PLAY -> CONFIGURATION -> PLAY` cycles. Synthetic
+browser-stall ticks are disabled throughout reconfiguration, preventing stale
+PLAY packets from being sent into the configuration protocol after a plugin
+changes server state.

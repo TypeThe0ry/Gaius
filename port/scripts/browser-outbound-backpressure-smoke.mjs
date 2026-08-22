@@ -217,9 +217,6 @@ async function runWebSocketSmoke() {
         this.readyState = FakeWebSocket.OPEN;
         if (this.onopen) this.onopen();
       }, 0);
-      setTimeout(() => {
-        this.bufferedAmount = 0;
-      }, 12);
     }
 
     send(payload) {
@@ -250,11 +247,14 @@ async function runWebSocketSmoke() {
   const bridge = context.__gaiusNettyBridge;
   const stats = context.__gaiusNetworkStats;
   bridge.open(socketId, "outbound-smoke.invalid", 25565);
-  await waitFor(() => bridge.channels.get(socketId)?.connected, "fake WebSocket connection");
   const entry = bridge.channels.get(socketId);
   const socket = sockets[0];
+  await waitFor(() => stats.webSocketBackpressureWaits >= 1,
+    "WebSocket handshake backpressure wait");
   assert.ok(stats.webSocketBackpressureWaits >= 1,
     "WebSocket handshake did not self-reschedule behind bufferedAmount");
+  socket.bufferedAmount = 0;
+  await waitFor(() => entry.connected, "fake WebSocket connection");
 
   socket.bufferedAmount = 4 * 1024 * 1024;
   const waitsBeforeData = stats.webSocketBackpressureWaits;
@@ -265,12 +265,12 @@ async function runWebSocketSmoke() {
     frame.fill(frameIndex & 0xff);
     assert.equal(bridge.send(socketId, frame), true);
   }
-  setTimeout(() => {
-    socket.bufferedAmount = 0;
-  }, 12);
-  await waitFor(() => entry.queuedBytes === 0, "WebSocket outbound queue drain");
+  await waitFor(() => stats.webSocketBackpressureWaits > waitsBeforeData,
+    "WebSocket data backpressure wait");
   assert.ok(stats.webSocketBackpressureWaits > waitsBeforeData,
     "WebSocket data backpressure did not self-reschedule");
+  socket.bufferedAmount = 0;
+  await waitFor(() => entry.queuedBytes === 0, "WebSocket outbound queue drain");
   assert.equal(socket.data.length, frameCount, "WebSocket queue lost or merged data frames");
   for (let frameIndex = 0; frameIndex < socket.data.length; frameIndex++) {
     const frame = socket.data[frameIndex];

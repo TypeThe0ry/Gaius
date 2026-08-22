@@ -19,14 +19,20 @@ version="$GAIUS_MINECRAFT_VERSION"
 teavm_version="$(jq -er '.teaVMVersion' "$config")"
 work="$root/port/work/$version"
 metadata="$work/version.json"
-client="$root/port/work/overlays/client-named-$version-gaius.jar"
-output="${GAIUS_POM:-$root/port/target/generated-pom.xml}"
+build_root="$(gaius_build_root "$root")"
+overlay_directory="$(gaius_overlay_directory "$root")"
+client="$overlay_directory/client-named-$version-gaius.jar"
+output="$(gaius_resolve_path "$root" "${GAIUS_POM:-$build_root/generated-pom.xml}")"
 main_class="${GAIUS_MAIN_CLASS:-net.minecraft.client.main.Main}"
-target_directory="${GAIUS_TARGET_DIRECTORY:-$root/port/web/dist}"
+if [[ -n "${GAIUS_TARGET_DIRECTORY:-}" ]]; then
+  target_directory="$(gaius_resolve_path "$root" "$GAIUS_TARGET_DIRECTORY")"
+else
+  target_directory="$(gaius_dist_directory "$root")"
+fi
 target_file="${GAIUS_TARGET_FILE:-classes.js}"
-maven_directory="${GAIUS_MAVEN_DIRECTORY:-$root/port/target/maven}"
-resource_directory="${GAIUS_RESOURCE_DIRECTORY:-$root/port/target/generated-resources}"
-patched_classlib="$root/port/work/overlays/teavm-classlib-$teavm_version-gaius.jar"
+maven_directory="$(gaius_resolve_path "$root" "${GAIUS_MAVEN_DIRECTORY:-$build_root/maven}")"
+resource_directory="$(gaius_resolve_path "$root" "${GAIUS_RESOURCE_DIRECTORY:-$build_root/generated-resources}")"
+patched_classlib="$overlay_directory/teavm-classlib-$teavm_version-gaius.jar"
 optimization_level="${GAIUS_TEA_OPTIMIZATION_LEVEL:-SIMPLE}"
 source_maps_generated="${GAIUS_SOURCE_MAPS:-true}"
 debug_information_generated="${GAIUS_DEBUG_INFO:-true}"
@@ -35,6 +41,19 @@ short_file_names="${GAIUS_SHORT_FILE_NAMES:-false}"
 assertions_removed="${GAIUS_ASSERTIONS_REMOVED:-false}"
 excluded_library_prefixes="${GAIUS_EXCLUDED_LIBRARY_PREFIXES:-}"
 
+# PlatformSmoke contains optional render-backend probes whose direct calls
+# track the current named (26.2) API.  The 1.21.11 mapped profile does not
+# need this smoke main class for the normal Minecraft client entrypoint, and
+# compiling it would incorrectly make the legacy POM depend on 26.2-only
+# method signatures. Keep the source available for the named profile while
+# excluding it from the legacy client compilation set.
+compiler_source_excludes=""
+if [[ "$GAIUS_CLIENT_DISTRIBUTION" == "obfuscated-with-mappings" ]]; then
+  compiler_source_excludes="            <excludes>
+              <exclude>dev/gaius/browser/PlatformSmoke.java</exclude>
+            </excludes>"
+fi
+
 maven_patched_classlib="$(maven_path "$patched_classlib")"
 maven_client="$(maven_path "$client")"
 maven_target_directory="$(maven_path "$target_directory")"
@@ -42,7 +61,7 @@ maven_maven_directory="$(maven_path "$maven_directory")"
 maven_resource_directory="$(maven_path "$resource_directory")"
 maven_source_directory="$(maven_path "$root/port/src/main/java")"
 maven_source_resources="$(maven_path "$root/port/src/main/resources")"
-maven_teavm_core_patch="$(maven_path "$root/port/work/overlays/teavm-core-$teavm_version-gaius.jar")"
+maven_teavm_core_patch="$(maven_path "$overlay_directory/teavm-core-$teavm_version-gaius.jar")"
 if [[ -n "$excluded_library_prefixes" ]]; then
   IFS=',' read -r -a excluded_library_prefix_list <<<"$excluded_library_prefixes"
 else
@@ -193,7 +212,7 @@ EOF
               "$path" == net/java/dev/jna/jna-platform/* ]]; then
           continue
         fi
-        patched="$root/port/work/overlays/libraries/$path"
+        patched="$overlay_directory/libraries/$path"
         if [[ -f "$patched" ]]; then
         printf '%s\n' "$(maven_path "$patched")"
       else
@@ -224,6 +243,7 @@ EOF
         <configuration>
           <release>21</release>
           <proc>none</proc>
+$compiler_source_excludes
         </configuration>
       </plugin>
       <plugin>

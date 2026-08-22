@@ -12,12 +12,29 @@ if ! command -v git-lfs >/dev/null 2>&1 && ! git lfs version >/dev/null 2>&1; th
   exit 1
 fi
 
-required_lfs_paths=(
-  port/web/dist/classes.js
-  port/web/dist/Gaius.html
-  port/web/dist/singleplayer-server.js
-  port/web/smoke/platform-smoke-v4.js
-)
+# Browser artifacts may be stored in the legacy root by older tags or below a
+# profile directory by newer dual-version releases. Derive the required paths
+# from the tracked tree instead of pinning one profile or shared dist root.
+required_lfs_paths=()
+while IFS= read -r -d '' path; do
+  case "$path" in
+    port/web/dist/*)
+      case "${path##*/}" in
+        classes.js|Gaius.html|singleplayer-server.js)
+          required_lfs_paths+=("$path")
+          ;;
+      esac
+      ;;
+    port/web/smoke/platform-smoke*.js)
+      required_lfs_paths+=("$path")
+      ;;
+  esac
+done < <(git ls-files -z -- 'port/web/dist/**' 'port/web/smoke/platform-smoke*.js')
+
+if (( ${#required_lfs_paths[@]} == 0 )); then
+  echo "error: no tracked browser release artifacts were found" >&2
+  failed=1
+fi
 
 for path in "${required_lfs_paths[@]}"; do
   filter=$(git check-attr filter -- "$path" | awk '{print $3}')

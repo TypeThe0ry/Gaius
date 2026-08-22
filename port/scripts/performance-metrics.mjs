@@ -520,10 +520,85 @@ export function buildPerformanceEvidence({
   };
 }
 
+const WORLDGEN_TELEMETRY_MODES = new Set(["task-pulsed", "checkpoint-only"]);
+
+function resolveWorldgenTelemetryMode({
+  contract,
+  telemetry,
+  worldgenTelemetryMode,
+  worldgenMode,
+  telemetryMode,
+  mode,
+} = {}) {
+  // The caller/profile is authoritative. In particular, never infer a mode
+  // from progressPulses (zero is valid evidence for checkpoint-only builds).
+  const explicit = [
+    worldgenTelemetryMode,
+    worldgenMode,
+    telemetryMode,
+    mode,
+    telemetry?.worldgenTelemetryMode,
+    contract?.worldgenTelemetryMode,
+    contract?.worldgen?.telemetryMode,
+    contract?.worldgen?.worldgenTelemetryMode,
+  ].find((value) => value != null && String(value).trim() !== "");
+  // Preserve the pre-mode API for callers that use the base contract directly;
+  // profile-aware callers always pass the explicit profile mode above.
+  return explicit == null ? "task-pulsed" : String(explicit).trim();
+}
+
+function minimumAlternativeEvidenceCheck(
+  name,
+  section,
+  aliases,
+  minimum,
+  description,
+) {
+  const evidenceValues = aliases.map((alias) => ({
+    alias,
+    evidence: evidence(section, [alias]),
+  }));
+  const available = evidenceValues.filter(({evidence: value}) => value.available);
+  if (available.length === 0) {
+    return {
+      name,
+      verdict: "inconclusive",
+      expected: {minimum, anyOf: aliases},
+      actual: null,
+      source: null,
+      reason: `required runtime telemetry is missing: ${description}`,
+    };
+  }
+  const passed = available.some(({evidence: value}) => value.value >= minimum);
+  return {
+    name,
+    verdict: passed ? "pass" : "fail",
+    expected: {minimum, anyOf: aliases},
+    actual: Object.fromEntries(available.map(({alias, evidence: value}) => [alias, value.value])),
+    source: available.map(({evidence: value}) => value.source).join(","),
+    reason: passed ? null : `${description} did not reach ${minimum}`,
+  };
+}
+
 /** Evaluates runtime invariants without treating absent instrumentation as a pass. */
-export function evaluateRuntimeInvariants({contract = {}, telemetry = {}} = {}) {
+export function evaluateRuntimeInvariants({
+  contract = {},
+  telemetry = {},
+  worldgenTelemetryMode = null,
+  worldgenMode = null,
+  telemetryMode = null,
+  mode = null,
+} = {}) {
   const targetingRules = contract.targeting || {};
   const worldgenRules = contract.worldgen || {};
+  const resolvedWorldgenTelemetryMode = resolveWorldgenTelemetryMode({
+    contract,
+    telemetry,
+    worldgenTelemetryMode,
+    worldgenMode,
+    telemetryMode,
+    mode,
+  });
   const webglRules = contract.webglMemory || {};
   const fenceRules = contract.gpuFences || {};
   const frameRules = contract.framePacing || {};
@@ -560,76 +635,201 @@ export function evaluateRuntimeInvariants({contract = {}, telemetry = {}} = {}) 
       "maximum targeting observation lag",
     ),
   ];
-  const worldgenChecks = [
-    comparisonCheck(
-      "worldgen-network-wait-pulses",
-      evidence(worldgen, ["maxNetworkWaitPulses"]),
-      {maximum: finiteNumber(worldgenRules.networkWaitPulsesMax, 2)},
-      (value, expected) => value <= expected.maximum,
-      "maximum worldgen network wait pulses",
-    ),
-    comparisonCheck(
-      "worldgen-turn-pulses",
-      evidence(worldgen, ["maxTurnPulses", "maxPulsesInTurn", "maxProgressPulsesPerTurn"]),
-      {maximum: finiteNumber(worldgenRules.schedulerTurnPulsesMax, 4096)},
-      (value, expected) => value <= expected.maximum,
-      "maximum worldgen scheduler pulses in one turn",
-    ),
-    comparisonCheck(
-      "worldgen-reentrant-depth",
-      evidence(worldgen, ["maxReentrantYieldDepth", "reentrantYieldDepthMax"]),
-      {maximum: finiteNumber(worldgenRules.reentrantYieldDepthMax, 1)},
-      (value, expected) => value <= expected.maximum,
-      "maximum worldgen reentrant yield depth",
-    ),
-  ];
-  if (worldgenRules.minimumAdaptiveSliceMillis != null) {
-    worldgenChecks.push(comparisonCheck(
-      "worldgen-adaptive-slice-floor",
-      evidence(worldgen, ["minimumBudgetMillis", "minBudgetMillis"], "minima"),
-      {minimum: Number(worldgenRules.minimumAdaptiveSliceMillis)},
-      (value, expected) => value >= expected.minimum,
-      "minimum adaptive worldgen slice budget",
-    ));
+  // Keep mode-specific evidence separate. In particular, checkpoint-only
+  // builds must not satisfy a checkpoint gate with the task-pulsed report's
+  // generic queue/delay/reentrant fields (or with the old checkpointYields
+  // counter). Those fields describe a different scheduler contract and are
+  // intentionally not aliases below.
+  const worldgenChecks = [];
+  if (resolvedWorldgenTelemetryMode === "task-pulsed") {
+    worldgenChecks.push(
+      comparisonCheck(
+        "worldgen-network-wait-pulses",
+        evidence(worldgen, ["maxNetworkWaitPulses"]),
+        {maximum: finiteNumber(worldgenRules.networkWaitPulsesMax, 2)},
+        (value, expected) => value <= expected.maximum,
+        "maximum worldgen network wait pulses",
+      ),
+      comparisonCheck(
+        "worldgen-reentrant-depth",
+        evidence(worldgen, ["maxReentrantYieldDepth", "reentrantYieldDepthMax"]),
+        {maximum: finiteNumber(worldgenRules.reentrantYieldDepthMax, 1)},
+        (value, expected) => value <= expected.maximum,
+        "maximum worldgen reentrant yield depth",
+      ),
+      comparisonCheck(
+        "worldgen-turn-pulses",
+        evidence(worldgen, ["maxTurnPulses", "maxPulsesInTurn", "maxProgressPulsesPerTurn"]),
+        {maximum: finiteNumber(worldgenRules.schedulerTurnPulsesMax, 4096)},
+        (value, expected) => value <= expected.maximum,
+        "maximum worldgen scheduler pulses in one turn",
+      ),
+    );
+    if (worldgenRules.minimumAdaptiveSliceMillis != null) {
+      worldgenChecks.push(comparisonCheck(
+        "worldgen-adaptive-slice-floor",
+        evidence(worldgen, ["minimumBudgetMillis", "minBudgetMillis"], "minima"),
+        {minimum: Number(worldgenRules.minimumAdaptiveSliceMillis)},
+        (value, expected) => value >= expected.minimum,
+        "minimum adaptive worldgen slice budget",
+      ));
+    }
+    worldgenChecks.push(
+      comparisonCheck(
+        "worldgen-slice-p99",
+        evidence(worldgen, ["p99SliceElapsedMillis"]),
+        {maximumMillis: finiteNumber(worldgenRules.p99SliceElapsedMillisMax, 14)},
+        (value, expected) => value <= expected.maximumMillis,
+        "worldgen slice p99 latency",
+      ),
+      comparisonCheck(
+        "worldgen-slice-maximum",
+        evidence(worldgen, ["maxSliceElapsedMillis"]),
+        {maximumMillis: finiteNumber(worldgenRules.maxSliceElapsedMillisMax, 50)},
+        (value, expected) => value <= expected.maximumMillis,
+        "maximum worldgen slice latency",
+      ),
+      comparisonCheck(
+        "worldgen-budget-overrun-maximum",
+        evidence(worldgen, ["maxBudgetOverrunMillis"]),
+        {maximumMillis: finiteNumber(worldgenRules.maxBudgetOverrunMillisMax, 8)},
+        (value, expected) => value <= expected.maximumMillis,
+        "maximum worldgen slice budget overrun",
+      ),
+      minimumAlternativeEvidenceCheck(
+        "worldgen-progress-evidence",
+        worldgen,
+        [
+          "progressSlices",
+          "progressSliceCount",
+          "totalProgressPulses",
+          "totalProgressPulse",
+        ],
+        Math.max(
+          1,
+          finiteNumber(worldgenRules.progressSlicesMin, 1),
+          finiteNumber(worldgenRules.totalProgressPulsesMin, 1),
+        ),
+        "at least one task progress slice or total progress pulse",
+      ),
+    );
+    worldgenChecks.push(
+      comparisonCheck(
+        "worldgen-yield-delay-p99",
+        evidence(worldgen, ["p99YieldDelayMillis"]),
+        {maximumMillis: finiteNumber(worldgenRules.p99YieldDelayMillisMax, 16.7)},
+        (value, expected) => value <= expected.maximumMillis,
+        "worldgen event-loop yield p99 latency",
+      ),
+      comparisonCheck(
+        "worldgen-yield-delay-maximum",
+        evidence(worldgen, ["maxYieldDelayMillis"]),
+        {maximumMillis: finiteNumber(worldgenRules.maxYieldDelayMillisMax, 50)},
+        (value, expected) => value <= expected.maximumMillis,
+        "maximum worldgen event-loop yield latency",
+      ),
+    );
+  } else if (resolvedWorldgenTelemetryMode === "checkpoint-only") {
+    // 1.21.11 has checkpoint yields but no meaningful active task-progress
+    // pulses. Keep checkpoint telemetry explicit and do not require the
+    // task-pulsed slice/budget fields above.
+    worldgenChecks.push(
+      comparisonCheck(
+        "worldgen-checkpoint-only-network-wait-pulses",
+        evidence(worldgen, [
+          "checkpointOnlyMaxNetworkWaitPulses",
+          "checkpointOnlyNetworkWaitPulsesMax",
+          "maxCheckpointOnlyNetworkWaitPulses",
+        ]),
+        {maximum: finiteNumber(
+          worldgenRules.checkpointOnlyNetworkWaitPulsesMax
+            ?? worldgenRules.networkWaitPulsesMax,
+          2)},
+        (value, expected) => value <= expected.maximum,
+        "maximum checkpoint-only worldgen network wait pulses",
+      ),
+      comparisonCheck(
+        "worldgen-checkpoint-only-reentrant-depth",
+        evidence(worldgen, [
+          "checkpointOnlyMaxReentrantYieldDepth",
+          "checkpointOnlyReentrantYieldDepthMax",
+          "maxCheckpointOnlyReentrantYieldDepth",
+        ]),
+        {maximum: finiteNumber(
+          worldgenRules.checkpointOnlyReentrantYieldDepthMax
+            ?? worldgenRules.reentrantYieldDepthMax,
+          1)},
+        (value, expected) => value <= expected.maximum,
+        "maximum checkpoint-only worldgen reentrant yield depth",
+      ),
+      comparisonCheck(
+        "worldgen-checkpoint-yields",
+        evidence(worldgen, [
+          "checkpointOnlyYields",
+          "checkpointOnlyYieldCount",
+          "totalCheckpointOnlyYields",
+        ]),
+        {minimum: Math.max(1, finiteNumber(
+          worldgenRules.checkpointOnlyYieldsMin ?? worldgenRules.checkpointYieldsMin,
+          1,
+        ))},
+        (value, expected) => value >= expected.minimum,
+        "checkpoint-only worldgen yield telemetry",
+      ),
+      comparisonCheck(
+        "worldgen-checkpoint-queue-depth",
+        evidence(worldgen, [
+          "checkpointOnlyMaxQueueDepth",
+          "checkpointOnlyQueueDepthMax",
+          "checkpointOnlyQueueDepth",
+          "maxCheckpointOnlyQueueDepth",
+        ]),
+        {maximum: finiteNumber(
+          worldgenRules.checkpointOnlyQueueDepthMax ?? worldgenRules.checkpointQueueDepthMax,
+          8,
+        )},
+        (value, expected) => value <= expected.maximum,
+        "maximum queue depth observed at worldgen checkpoints",
+      ),
+      comparisonCheck(
+        "worldgen-checkpoint-only-yield-delay-p99",
+        evidence(worldgen, [
+          "checkpointOnlyP99YieldDelayMillis",
+          "checkpointOnlyYieldDelayP99Millis",
+          "p99CheckpointOnlyYieldDelayMillis",
+        ]),
+        {maximumMillis: finiteNumber(
+          worldgenRules.checkpointOnlyP99YieldDelayMillisMax
+            ?? worldgenRules.p99YieldDelayMillisMax,
+          16.7)},
+        (value, expected) => value <= expected.maximumMillis,
+        "checkpoint-only worldgen event-loop yield p99 latency",
+      ),
+      comparisonCheck(
+        "worldgen-checkpoint-only-yield-delay-maximum",
+        evidence(worldgen, [
+          "checkpointOnlyMaxYieldDelayMillis",
+          "checkpointOnlyYieldDelayMaxMillis",
+          "maxCheckpointOnlyYieldDelayMillis",
+        ]),
+        {maximumMillis: finiteNumber(
+          worldgenRules.checkpointOnlyMaxYieldDelayMillisMax
+            ?? worldgenRules.maxYieldDelayMillisMax,
+          50)},
+        (value, expected) => value <= expected.maximumMillis,
+        "maximum checkpoint-only worldgen event-loop yield latency",
+      ),
+    );
+  } else {
+    worldgenChecks.push({
+      name: "worldgen-telemetry-mode",
+      verdict: "inconclusive",
+      expected: {modes: [...WORLDGEN_TELEMETRY_MODES]},
+      actual: resolvedWorldgenTelemetryMode,
+      source: null,
+      reason: `unsupported worldgen telemetry mode ${JSON.stringify(resolvedWorldgenTelemetryMode)}`,
+    });
   }
-  worldgenChecks.push(
-    comparisonCheck(
-      "worldgen-slice-p99",
-      evidence(worldgen, ["p99SliceElapsedMillis"]),
-      {maximumMillis: finiteNumber(worldgenRules.p99SliceElapsedMillisMax, 14)},
-      (value, expected) => value <= expected.maximumMillis,
-      "worldgen slice p99 latency",
-    ),
-    comparisonCheck(
-      "worldgen-slice-maximum",
-      evidence(worldgen, ["maxSliceElapsedMillis"]),
-      {maximumMillis: finiteNumber(worldgenRules.maxSliceElapsedMillisMax, 50)},
-      (value, expected) => value <= expected.maximumMillis,
-      "maximum worldgen slice latency",
-    ),
-    comparisonCheck(
-      "worldgen-budget-overrun-maximum",
-      evidence(worldgen, ["maxBudgetOverrunMillis"]),
-      {maximumMillis: finiteNumber(worldgenRules.maxBudgetOverrunMillisMax, 8)},
-      (value, expected) => value <= expected.maximumMillis,
-      "maximum worldgen slice budget overrun",
-    ),
-    comparisonCheck(
-      "worldgen-yield-delay-p99",
-      evidence(worldgen, ["p99YieldDelayMillis"]),
-      {maximumMillis: finiteNumber(worldgenRules.p99YieldDelayMillisMax, 16.7)},
-      (value, expected) => value <= expected.maximumMillis,
-      "worldgen event-loop yield p99 latency",
-    ),
-    comparisonCheck(
-      "worldgen-yield-delay-maximum",
-      evidence(worldgen, ["maxYieldDelayMillis"]),
-      {maximumMillis: finiteNumber(worldgenRules.maxYieldDelayMillisMax, 50)},
-      (value, expected) => value <= expected.maximumMillis,
-      "maximum worldgen event-loop yield latency",
-    ),
-  );
-
   const webglChecks = [
     comparisonCheck(
       "webgl-buffer-shadow-budget",
@@ -879,6 +1079,7 @@ export function evaluateRuntimeInvariants({contract = {}, telemetry = {}} = {}) 
       contract.sectionTaskQueue?.externalSmokeRequired || [],
     ),
   };
+  components.worldgen.telemetryMode = resolvedWorldgenTelemetryMode;
   components.sectionTaskQueue.verdict = "external-smoke-required";
   const runtimeComponents = [
     components.targeting,
@@ -897,6 +1098,7 @@ export function evaluateRuntimeInvariants({contract = {}, telemetry = {}} = {}) 
     .flatMap((component) => component.externalSmokeRequired || []))];
   return {
     verdict,
+    worldgenTelemetryMode: resolvedWorldgenTelemetryMode,
     reasons: runtimeComponents.flatMap((component) => component.reasons),
     components,
     externalSmokeRequired,
@@ -1317,6 +1519,58 @@ export function summarizeAcceptanceEvidence({
     "environment.frameLimiter.configured",
   ]);
   if (uncapped !== true) missing.push("environment.frameLimiter.uncapped");
+
+  // Worker distance acceptance is intentionally based on the raw natural
+  // launch witness.  A harness-pinned message is diagnostic-only and must not
+  // be allowed to satisfy a strict release child report.
+  if (profile?.releaseEvidence === true) {
+    const distanceContract = analysis?.environment?.distanceContract
+      || report?.configuration?.workerDistanceContract || {};
+    const expectedDistance = `${Number(profile.renderDistance)}:${Number(profile.simulationDistance)}`;
+    const natural = analysis?.naturalWorkerEvidence
+      || report?.naturalWorkerEvidence
+      || distanceContract.naturalWorkerEvidence;
+    const harness = analysis?.harnessOverrideEvidence
+      || report?.harnessOverrideEvidence
+      || distanceContract.harnessOverrideEvidence;
+    if (!natural || !Array.isArray(natural.messages)) {
+      missing.push("naturalWorkerEvidence.messages");
+    } else if (natural.complete === false || Number(natural.truncatedCount || 0) > 0) {
+      missing.push("naturalWorkerEvidence.complete");
+    }
+    if (harness?.enabled === true || harness?.releaseEligible === true
+        || String(distanceContract.mode || "") !== "natural-observation") {
+      failures.push("strict release Worker distance evidence was harness-pinned or not natural");
+    }
+    if (String(distanceContract.optionsPreference || "") !== expectedDistance) {
+      failures.push(
+        `Worker options preference ${JSON.stringify(distanceContract.optionsPreference)} is not exactly ${expectedDistance}`,
+      );
+    }
+    if (distanceContract.matchingWorkerStartMessages == null) {
+      missing.push("naturalWorkerEvidence.matchingWorkerStartMessages");
+    } else if (Number(distanceContract.matchingWorkerStartMessages) <= 0) {
+      failures.push("natural Worker start evidence did not match the active profile storage namespace");
+    }
+    const expectedStorage = distanceContract.expectedStorage;
+    const exactStart = Array.isArray(natural?.messages) && natural.messages.some((item) =>
+      item?.type === "start"
+      && Number(item.renderDistance) === Number(profile.renderDistance)
+      && Number(item.simulationDistance) === Number(profile.simulationDistance)
+      && (!expectedStorage || (
+        String(item.profileId || "") === String(expectedStorage.profileId || "")
+        && Number(item.worldVersion) === Number(expectedStorage.worldVersion)
+        && Number(item.storageSchema) === Number(expectedStorage.storageSchema)
+        && String(item.storageDatabaseName || "") === String(expectedStorage.storageDatabaseName || "")
+        && String(item.storagePrefix || "") === String(expectedStorage.storagePrefix || "")
+        && String(item.storageOpfsDirectory || "") === String(expectedStorage.storageOpfsDirectory || "")
+      )));
+    if (Array.isArray(natural?.messages) && !exactStart) {
+      failures.push(
+        `no natural Worker start message proved exact ${expectedDistance} with the active storage namespace`,
+      );
+    }
+  }
 
   const uniqueMissing = [...new Set(missing)];
   const uniqueFailures = uniqueReasons(failures);
@@ -2106,7 +2360,10 @@ export function summarizeWorldReadiness(observations = [], rules = {}) {
     streakStartedAt = null;
     consecutiveFrames = 0;
     blockHitFrames = 0;
-    validVisualSamples = 0;
+    // Valid terrain samples are cumulative evidence: a frame gap or a later
+    // failed capture does not erase the fact that the world was already seen
+    // rendering terrain. Only the frame-continuity streak (and its block-hit
+    // observations) restarts.
     lastHitStateAt = null;
   };
   for (const observation of Array.isArray(observations) ? observations : []) {

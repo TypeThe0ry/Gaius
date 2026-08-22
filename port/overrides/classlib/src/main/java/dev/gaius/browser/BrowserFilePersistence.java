@@ -24,9 +24,10 @@ import org.teavm.runtime.fs.VirtualFileSystemProvider;
  * writes from JavaScript.</p>
  */
 public final class BrowserFilePersistence {
-    private static final String PREFIX = "gaius.fs.v1:";
     private static final String OPTIONS_PATH = "/gaius/options.txt";
-    private static final int CURRENT_DATA_VERSION = 4671;
+    // 4671 is retained solely to recognize the legacy options payload. It is
+    // never used to select, read, or delete browser storage for a runtime.
+    private static final int LEGACY_DATA_VERSION = 4671;
     private static final String BROWSER_OPTION_DEFAULTS = String.join("\n",
             "autoJump:false",
             "operatorItemsTab:true",
@@ -68,22 +69,36 @@ public final class BrowserFilePersistence {
     private static final String LEGACY_BROWSER_OPTION_DEFAULTS = BROWSER_OPTION_DEFAULTS
             .replace("weatherRadius:3\n", "weatherRadius:0\n")
             .replace("onboardAccessibility:false\n", "");
-    private static final String DEFAULT_BROWSER_OPTIONS =
-            "version:" + CURRENT_DATA_VERSION + "\n" + BROWSER_OPTION_DEFAULTS;
     private static final Map<String, Integer> OPEN_MATERIALIZED_CHUNK_FILES = new HashMap<>();
     private static final Set<String> INTERNAL_VIRTUAL_FILE_PATHS = new HashSet<>();
     private static final Set<String> LAZY_CHUNK_FILE_PLACEHOLDERS = new HashSet<>();
     private static boolean mounted;
+    private static String mountedStorageSignature;
+    private static String mountedStoragePrefix;
+    private static int mountedWorldVersion;
 
     private BrowserFilePersistence() {
     }
 
     public static void mount() {
+        String storageSignature = storageConfigurationSignature();
         if (mounted) {
+            if (!storageSignature.equals(mountedStorageSignature)) {
+                throw new IllegalStateException("Browser storage profile changed after mount");
+            }
             return;
         }
+        String prefix = storagePrefix();
+        // Validate both pieces of profile configuration before marking the
+        // filesystem mounted. seedDefaultOptions reports ordinary I/O errors,
+        // so leaving this check inside that method would turn a missing runtime
+        // profile into a partially mounted client with an unversioned options file.
+        int worldVersion = currentDataVersion();
+        mountedStoragePrefix = prefix;
+        mountedWorldVersion = worldVersion;
         mounted = true;
-        String[] paths = storedPaths(PREFIX);
+        mountedStorageSignature = storageSignature;
+        String[] paths = storedPaths(prefix);
         int restored = 0;
         for (String path : paths) {
             if (!shouldRestoreAtStartup(path)) {
@@ -121,7 +136,7 @@ public final class BrowserFilePersistence {
             return true;
         }
         String encoded = Base64.getEncoder().encodeToString(bytes);
-        boolean stored = setItem(PREFIX + normalized, encoded);
+        boolean stored = setItem(storagePrefix() + normalized, encoded);
         if (!stored) {
             report("storage-quota-or-error", path + " bytes=" + bytes.length);
         }
@@ -289,7 +304,7 @@ public final class BrowserFilePersistence {
         }
         String normalized = normalize(path);
         LAZY_CHUNK_FILE_PLACEHOLDERS.remove(normalized);
-        removeItem(PREFIX + normalized);
+        removeItem(storagePrefix() + normalized);
         return true;
     }
 
@@ -368,7 +383,7 @@ public final class BrowserFilePersistence {
                 return false;
             }
         } else {
-            String encoded = getItem(PREFIX + normalized);
+            String encoded = getItem(storagePrefix() + normalized);
             if (encoded == null || encoded.isEmpty()) {
                 return false;
             }
@@ -439,7 +454,11 @@ public final class BrowserFilePersistence {
         String relative = normalized.substring(worldEnd + 1);
         return relative.equals("level.dat")
                 || relative.equals("level.dat_old")
-                || relative.equals("icon.png");
+                || relative.equals("icon.png")
+                // WorldOpenFlows reads this small saved-data record on the
+                // client before handing the world to the integrated Worker.
+                // Keep large region files on their OPFS/IDB backend instead.
+                || relative.equals("data/minecraft/world_gen_settings.dat");
     }
 
     private static boolean isOnDemandChunkStoragePath(String normalized) {
@@ -486,7 +505,7 @@ public final class BrowserFilePersistence {
     private static void migrateLegacyDefaultOptions(VirtualFile existing) throws IOException {
         byte[] bytes = readVirtualFile(existing);
         String options = new String(bytes, StandardCharsets.UTF_8);
-        String legacyVersionedOptions = "version:" + CURRENT_DATA_VERSION + "\n"
+        String legacyVersionedOptions = "version:" + LEGACY_DATA_VERSION + "\n"
                 + LEGACY_BROWSER_OPTION_DEFAULTS;
         if (!options.equals(LEGACY_BROWSER_OPTION_DEFAULTS)
                 && !options.equals(legacyVersionedOptions)) {
@@ -519,10 +538,50 @@ public final class BrowserFilePersistence {
     }
 
     private static void writeDefaultOptions(String detail) throws IOException {
-        byte[] bytes = DEFAULT_BROWSER_OPTIONS.getBytes(StandardCharsets.UTF_8);
+        byte[] bytes = defaultBrowserOptions().getBytes(StandardCharsets.UTF_8);
         writeVirtualFile(OPTIONS_PATH, bytes);
         persist(OPTIONS_PATH, bytes);
         report("storage-default-options", detail);
+    }
+
+    private static String defaultBrowserOptions() {
+        return "version:" + currentDataVersion() + "\n" + BROWSER_OPTION_DEFAULTS;
+    }
+
+    private static int currentDataVersion() {
+        if (mounted && mountedWorldVersion > 0) {
+            return mountedWorldVersion;
+        }
+        storageConfigurationSignature();
+        int value = runtimeWorldVersion();
+        if (value <= 0) {
+            throw new IllegalStateException("Browser storage world version is not configured");
+        }
+        return value;
+    }
+
+    private static String storagePrefix() {
+        if (mounted && mountedStoragePrefix != null) {
+            return mountedStoragePrefix;
+        }
+        storageConfigurationSignature();
+        String value = runtimeStoragePrefix();
+        if (value == null || value.trim().isEmpty()
+                || "gaius.fs.v1:".equals(value)) {
+            throw new IllegalStateException("Browser storage prefix is not configured");
+        }
+        return value;
+    }
+
+    private static String storageConfigurationSignature() {
+        String value = runtimeStorageConfigurationSignature();
+        if (value == null || value.isEmpty()) {
+            throw new IllegalStateException("Browser storage profile is not configured safely");
+        }
+        if (mounted && !value.equals(mountedStorageSignature)) {
+            throw new IllegalStateException("Browser storage profile changed after mount");
+        }
+        return value;
     }
 
     private static String describe(Throwable exception) {
@@ -617,9 +676,10 @@ public final class BrowserFilePersistence {
 
     @JSBody(params = {"key"}, script = """
             try {
-              var prefix='gaius.fs.v1:';
+              var prefix=String(globalThis.__gaiusStoragePrefix || '');
+              if (!prefix || !key || key.indexOf(prefix)!==0) return null;
               var files=globalThis.__gaiusPersistentFiles;
-              if (files && key && key.indexOf(prefix)===0) {
+              if (files) {
                 var path=key.substring(prefix.length);
                 return Object.prototype.hasOwnProperty.call(files,path) ? files[path] : null;
               }
@@ -632,8 +692,9 @@ public final class BrowserFilePersistence {
 
     @JSBody(params = {"key", "value"}, script = """
             try {
-              var prefix='gaius.fs.v1:';
-              if (key && key.indexOf(prefix)===0 && globalThis.__gaiusFsPut) {
+              var prefix=String(globalThis.__gaiusStoragePrefix || '');
+              if (!prefix || !key || key.indexOf(prefix)!==0) return false;
+              if (globalThis.__gaiusFsPut) {
                 return !!globalThis.__gaiusFsPut(key.substring(prefix.length), value);
               }
               if (!globalThis.localStorage) return false;
@@ -698,11 +759,13 @@ public final class BrowserFilePersistence {
     @JSBody(params = {"path"}, script = """
             try {
               path=String(path || '/');
+              var prefix=String(globalThis.__gaiusStoragePrefix || '');
+              if (!prefix) return -1;
               var files=globalThis.__gaiusPersistentFiles;
               var value=files && Object.prototype.hasOwnProperty.call(files,path)
                 ? files[path]
                 : (globalThis.localStorage
-                  ? globalThis.localStorage.getItem('gaius.fs.v1:' + path) : null);
+                  ? globalThis.localStorage.getItem(prefix + path) : null);
               if (typeof value === 'string') {
                 if (!value.length) return 0;
                 var padding=value.endsWith('==') ? 2 : (value.endsWith('=') ? 1 : 0);
@@ -720,11 +783,13 @@ public final class BrowserFilePersistence {
     @JSBody(params = {"path", "output"}, script = """
             try {
               path=String(path || '/');
+              var prefix=String(globalThis.__gaiusStoragePrefix || '');
+              if (!prefix) return -1;
               var files=globalThis.__gaiusPersistentFiles;
               var value=files && Object.prototype.hasOwnProperty.call(files,path)
                 ? files[path]
                 : (globalThis.localStorage
-                  ? globalThis.localStorage.getItem('gaius.fs.v1:' + path) : null);
+                  ? globalThis.localStorage.getItem(prefix + path) : null);
               var bytes;
               if (typeof value === 'string') {
                 if (typeof Uint8Array.fromBase64 === 'function') {
@@ -754,10 +819,12 @@ public final class BrowserFilePersistence {
     @JSBody(params = {"path"}, script = """
             try {
               path=String(path || '/');
+              var prefix=String(globalThis.__gaiusStoragePrefix || '');
+              if (!prefix) return false;
               var files=globalThis.__gaiusPersistentFiles;
               if (files && Object.prototype.hasOwnProperty.call(files,path)) return true;
               return !!(globalThis.localStorage &&
-                globalThis.localStorage.getItem('gaius.fs.v1:' + path) !== null);
+                globalThis.localStorage.getItem(prefix + path) !== null);
             } catch (e) {
               return false;
             }
@@ -766,8 +833,9 @@ public final class BrowserFilePersistence {
 
     @JSBody(params = {"key"}, script = """
             try {
-              var prefix='gaius.fs.v1:';
-              if (key && key.indexOf(prefix)===0 && globalThis.__gaiusFsDelete) {
+              var prefix=String(globalThis.__gaiusStoragePrefix || '');
+              if (!prefix || !key || key.indexOf(prefix)!==0) return;
+              if (globalThis.__gaiusFsDelete) {
                 globalThis.__gaiusFsDelete(key.substring(prefix.length));
                 return;
               }
@@ -786,6 +854,52 @@ public final class BrowserFilePersistence {
             }
             """)
     private static native String backendName();
+
+    @JSBody(script = """
+            try {
+              return Number(globalThis.__gaiusWorldVersion || 0) | 0;
+            } catch (e) {
+              return 0;
+            }
+            """)
+    private static native int runtimeWorldVersion();
+
+    @JSBody(script = """
+            try {
+              var value=globalThis.__gaiusStoragePrefix;
+              return value == null ? null : String(value);
+            } catch (e) {
+              return null;
+            }
+            """)
+    private static native String runtimeStoragePrefix();
+
+    @JSBody(script = """
+            try {
+              var profile=String(globalThis.__gaiusProfileId || '');
+              var world=Number(globalThis.__gaiusWorldVersion);
+              var schema=Number(globalThis.__gaiusStorageSchema);
+              var database=String(globalThis.__gaiusStorageDatabaseName || '');
+              var prefix=String(globalThis.__gaiusStoragePrefix || '');
+              var opfs=String(globalThis.__gaiusStorageOpfsDirectory || '');
+              if (profile==='1.21.11' && world===4671 && schema===2
+                  && database==='gaius-fs-v2-1.21.11'
+                  && prefix==='gaius.fs.v2:1.21.11:'
+                  && opfs==='regions-v2-1.21.11') {
+                return profile+'|'+world+'|'+schema+'|'+database+'|'+prefix+'|'+opfs;
+              }
+              if (profile==='26.2' && world===4903 && schema===2
+                  && database==='gaius-fs-v2-26.2'
+                  && prefix==='gaius.fs.v2:26.2:'
+                  && opfs==='regions-v2-26.2') {
+                return profile+'|'+world+'|'+schema+'|'+database+'|'+prefix+'|'+opfs;
+              }
+              return '';
+            } catch (e) {
+              return '';
+            }
+            """)
+    private static native String runtimeStorageConfigurationSignature();
 
     @JSBody(script = """
             try {

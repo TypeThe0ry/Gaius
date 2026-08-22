@@ -3,16 +3,113 @@
 import {spawn} from "node:child_process";
 import {createHash} from "node:crypto";
 import {mkdir, readFile, writeFile} from "node:fs/promises";
-import {dirname, resolve} from "node:path";
+import {basename, dirname, isAbsolute, relative, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
 import {summarizeAcceptanceEvidence} from "./performance-metrics.mjs";
 
 const scriptsRoot = fileURLToPath(new URL(".", import.meta.url));
 const repositoryRoot = resolve(scriptsRoot, "../..");
+const portRoot = resolve(repositoryRoot, "port");
 const contractPath = resolve(scriptsRoot, "performance-contract.json");
-const manifestPath = resolve(repositoryRoot, "port/web/dist/Gaius.manifest.json");
+const nativePath = (value) => {
+  if (!value) return value;
+  const text = String(value);
+  return process.platform === "win32" && /^\/[A-Za-z](?:\/|$)/.test(text)
+    ? `${text[1].toUpperCase()}:${text.slice(2)}` : text;
+};
+const pathIsAbsolute = (value) => {
+  const text = nativePath(value);
+  return isAbsolute(text) || /^[A-Za-z]:[\\/]/.test(String(text || ""));
+};
+// Child benchmarks run from repositoryRoot. Resolve all relative environment
+// paths explicitly instead of letting cwd=port/scripts or cwd=repositoryRoot
+// silently select a different profile/build/dist/overlay tree.
+const resolveRepositoryPortPath = (value) => {
+  if (value == null || String(value).trim() === "") return null;
+  const text = nativePath(String(value).trim());
+  if (pathIsAbsolute(text)) return resolve(text);
+  const slash = text.replaceAll("\\", "/").replace(/^\.\//, "");
+  return slash === "port" || slash.startsWith("port/")
+    ? resolve(repositoryRoot, slash)
+    : resolve(portRoot, slash);
+};
+const normalizedPath = (value) => String(value || "")
+  .replaceAll("\\", "/")
+  .replace(/^\.\/+/, "");
+const profileEnvironmentNames = [
+  "GAIUS_VERSION_PROFILE_PATH",
+  "GAIUS_BUILD_ROOT",
+  "GAIUS_DIST_DIRECTORY",
+  "GAIUS_OVERLAY_DIRECTORY",
+];
+const isolated = profileEnvironmentNames.some(
+  (name) => String(process.env[name] || "").trim() !== "",
+);
+const portConfig = JSON.parse(await readFile(resolve(portRoot, "config.json"), "utf8"));
+const configuredProfilePath = process.env.GAIUS_VERSION_PROFILE_PATH
+  || String(portConfig.versionProfile || "");
+const activeVersionProfilePath = resolveRepositoryPortPath(configuredProfilePath);
+if (!activeVersionProfilePath
+    || !(activeVersionProfilePath === portRoot
+      || activeVersionProfilePath.startsWith(portRoot + "\\")
+      || activeVersionProfilePath.startsWith(portRoot + "/"))) {
+  throw new Error("The active version profile escaped the port directory");
+}
+const activeVersionProfileBytes = await readFile(activeVersionProfilePath);
+const activeVersionProfile = JSON.parse(activeVersionProfileBytes.toString("utf8"));
+const activeVersionProfileSha256 = createHash("sha256").update(activeVersionProfileBytes).digest("hex");
+const profileId = String(activeVersionProfile.id || "");
+const profilePath = normalizedPath(relative(portRoot, activeVersionProfilePath));
+if (!profileId || !/^versions\/[^/]+\.json$/i.test(profilePath)) {
+  throw new Error(`The active version profile path is invalid: ${profilePath}`);
+}
+const activeStorage = activeVersionProfile.storage || {};
+const activeStorageConfig = {
+  profileId,
+  worldVersion: Number(activeVersionProfile.worldVersion),
+  worldgenTelemetryMode: String(activeVersionProfile.worldgenTelemetryMode || ""),
+  storageSchema: Number(activeStorage.schema),
+  storageDatabaseName: String(activeStorage.databaseName || ""),
+  storagePrefix: String(activeStorage.prefix || ""),
+  storageOpfsDirectory: String(activeStorage.opfsDirectory || ""),
+};
+const activeWorldgenTelemetryMode = String(
+  activeVersionProfile.worldgenTelemetryMode || "",
+).trim();
+if (activeWorldgenTelemetryMode !== "task-pulsed"
+    && activeWorldgenTelemetryMode !== "checkpoint-only") {
+  throw new Error(
+    `The active version profile has an invalid worldgenTelemetryMode: `
+      + `${JSON.stringify(activeVersionProfile.worldgenTelemetryMode)}`,
+  );
+}
+const configuredBuildRoot = process.env.GAIUS_BUILD_ROOT
+  ? resolveRepositoryPortPath(process.env.GAIUS_BUILD_ROOT)
+  : (isolated ? resolve(portRoot, "target", profileId) : resolve(portRoot, "target"));
+const configuredOverlayDirectory = process.env.GAIUS_OVERLAY_DIRECTORY
+  ? resolveRepositoryPortPath(process.env.GAIUS_OVERLAY_DIRECTORY)
+  : (isolated
+    ? resolve(portRoot, "work", "overlays", profileId)
+    : resolve(portRoot, "work", "overlays"));
+const distRoot = resolve(process.env.GAIUS_DIST_DIRECTORY
+  ? resolveRepositoryPortPath(process.env.GAIUS_DIST_DIRECTORY)
+  : (isolated ? resolve(portRoot, "web", "dist", profileId) : resolve(portRoot, "web", "dist")));
+if (isolated && basename(distRoot) !== profileId) {
+  throw new Error(
+    `An isolated release suite must use a profile-scoped dist basename ${JSON.stringify(profileId)}; got ${JSON.stringify(basename(distRoot))}`,
+  );
+}
+const manifestPath = resolve(distRoot, "Gaius.manifest.json");
 const benchmarkPath = resolve(scriptsRoot, "chrome-chunk-benchmark.mjs");
 const contract = JSON.parse(await readFile(contractPath, "utf8"));
+const runtimeInvariantContractForProfile = {
+  ...(contract.runtimeInvariants || {}),
+  worldgen: {
+    ...(contract.runtimeInvariants?.worldgen || {}),
+    telemetryMode: activeWorldgenTelemetryMode,
+    worldgenTelemetryMode: activeWorldgenTelemetryMode,
+  },
+};
 const isMain = process.argv[1]
   && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 const REQUIRED_UNCAPPED_TELEMETRY_FIELDS = [
@@ -45,6 +142,63 @@ function uniqueStrings(values) {
     .filter(Boolean))];
 }
 
+function validateNaturalWorkerDistanceEvidence(report, profile) {
+  const failures = [];
+  const expectedRender = Number(profile?.renderDistance);
+  const expectedSimulation = Number(profile?.simulationDistance);
+  const expectedDistance = `${expectedRender}:${expectedSimulation}`;
+  const analysis = report?.analysis || {};
+  const configuration = report?.configuration || {};
+  const environmentDistance = analysis.environment?.distanceContract
+    || configuration.workerDistanceContract || {};
+  const natural = analysis.naturalWorkerEvidence
+    || report?.naturalWorkerEvidence
+    || environmentDistance.naturalWorkerEvidence;
+  const harness = analysis.harnessOverrideEvidence
+    || report?.harnessOverrideEvidence
+    || environmentDistance.harnessOverrideEvidence;
+  if (!natural || typeof natural !== "object") {
+    failures.push("strict child report is missing naturalWorkerEvidence");
+  }
+  const messages = Array.isArray(natural?.messages) ? natural.messages : [];
+  if (!Array.isArray(natural?.messages)) {
+    failures.push("strict child report naturalWorkerEvidence.messages is missing");
+  }
+  if (natural?.complete === false || Number(natural?.truncatedCount || 0) > 0) {
+    failures.push("naturalWorkerEvidence was truncated; raw Worker launch evidence is incomplete");
+  }
+  if (harness?.enabled === true || harness?.releaseEligible === true
+      || String(environmentDistance.mode || "") === "harness-pin-diagnostic") {
+    failures.push("harnessOverrideEvidence cannot satisfy strict release evidence");
+  }
+  if (String(environmentDistance.mode || "") !== "natural-observation") {
+    failures.push("strict release Worker distance mode must be natural-observation");
+  }
+  if (environmentDistance.releaseEligible === false) {
+    failures.push("strict release Worker distance contract is marked non-release-eligible");
+  }
+  if (String(environmentDistance.optionsPreference || "") !== expectedDistance) {
+    failures.push(
+      `options preference must be exactly ${expectedDistance}; got ${JSON.stringify(environmentDistance.optionsPreference)}`,
+    );
+  }
+  const matches = messages.filter((item) => item && item.type === "start"
+    && Number(item.renderDistance) === expectedRender
+    && Number(item.simulationDistance) === expectedSimulation
+    && String(item.profileId || "") === activeStorageConfig.profileId
+    && Number(item.worldVersion) === activeStorageConfig.worldVersion
+    && Number(item.storageSchema) === activeStorageConfig.storageSchema
+    && String(item.storageDatabaseName || "") === activeStorageConfig.storageDatabaseName
+    && String(item.storagePrefix || "") === activeStorageConfig.storagePrefix
+    && String(item.storageOpfsDirectory || "") === activeStorageConfig.storageOpfsDirectory);
+  if (matches.length === 0) {
+    failures.push(
+      `no raw natural Worker start message proved ${expectedDistance} with active profile storage namespace`,
+    );
+  }
+  return failures;
+}
+
 function canonicalize(value) {
   if (Array.isArray(value)) return value.map(canonicalize);
   if (value && typeof value === "object") {
@@ -55,6 +209,89 @@ function canonicalize(value) {
 
 function canonicalJson(value) {
   return JSON.stringify(canonicalize(value));
+}
+
+function exactIdentityValue(actual, expected) {
+  if ((actual && typeof actual === "object")
+      || (expected && typeof expected === "object")) {
+    return canonicalJson(actual) === canonicalJson(expected);
+  }
+  return Object.is(actual, expected);
+}
+
+function exactIdentityFailure(label, actual, expected) {
+  return `${label}=${JSON.stringify(actual)} expected ${JSON.stringify(expected)}`;
+}
+
+/**
+ * Validate the profile portion of a release manifest without coercing any
+ * telemetry/storage values.  The portable manifest is an input to the
+ * release gate, so a missing field is deliberately different from an
+ * equivalent-looking value (for example, the string "4903" is not the
+ * configured world version number 4903).
+ *
+ * `expected` is injectable so the release-suite smoke can exercise this gate
+ * against an in-memory/file fixture while the checked-in dist is stale.
+ */
+export function validateManifestIdentity(manifest, expected = {}) {
+  const expectedIdentity = {
+    profileId,
+    profilePath,
+    profileSha256: activeVersionProfileSha256,
+    clientDistribution: activeVersionProfile.clientDistribution,
+    protocolVersion: Number(activeVersionProfile.protocolVersion),
+    worldVersion: Number(activeVersionProfile.worldVersion),
+    worldgenTelemetryMode: activeWorldgenTelemetryMode,
+    storage: activeStorage,
+    ...expected,
+  };
+  if (!manifest || typeof manifest !== "object") {
+    return ["manifest is not an object"];
+  }
+
+  const failures = [];
+  const manifestProfilePath = normalizedPath(manifest.profilePath);
+  const expectedProfilePath = normalizedPath(expectedIdentity.profilePath);
+  const topLevelChecks = [
+    ["manifest.profile", manifest.profile, expectedIdentity.profileId],
+    ["manifest.profilePath", manifestProfilePath, expectedProfilePath],
+    ["manifest.profileSha256", manifest.profileSha256, expectedIdentity.profileSha256],
+    ["manifest.worldVersion", manifest.worldVersion, expectedIdentity.worldVersion],
+    ["manifest.worldgenTelemetryMode", manifest.worldgenTelemetryMode,
+      expectedIdentity.worldgenTelemetryMode],
+    ["manifest.storage", manifest.storage, expectedIdentity.storage],
+  ];
+  for (const [label, actual, expectedValue] of topLevelChecks) {
+    if (!exactIdentityValue(actual, expectedValue)) {
+      failures.push(exactIdentityFailure(label, actual, expectedValue));
+    }
+  }
+
+  const nestedProfile = manifest?.buildIdentity?.profile;
+  if (!nestedProfile || typeof nestedProfile !== "object") {
+    failures.push("manifest.buildIdentity.profile is missing");
+    return failures;
+  }
+  const nestedProfileChecks = [
+    ["manifest.buildIdentity.profile.id", nestedProfile.id, expectedIdentity.profileId],
+    ["manifest.buildIdentity.profile.path", normalizedPath(nestedProfile.path), expectedProfilePath],
+    ["manifest.buildIdentity.profile.sha256", nestedProfile.sha256, expectedIdentity.profileSha256],
+    ["manifest.buildIdentity.profile.clientDistribution", nestedProfile.clientDistribution,
+      expectedIdentity.clientDistribution],
+    ["manifest.buildIdentity.profile.protocolVersion", nestedProfile.protocolVersion,
+      expectedIdentity.protocolVersion],
+    ["manifest.buildIdentity.profile.worldVersion", nestedProfile.worldVersion,
+      expectedIdentity.worldVersion],
+    ["manifest.buildIdentity.profile.worldgenTelemetryMode", nestedProfile.worldgenTelemetryMode,
+      expectedIdentity.worldgenTelemetryMode],
+    ["manifest.buildIdentity.profile.storage", nestedProfile.storage, expectedIdentity.storage],
+  ];
+  for (const [label, actual, expectedValue] of nestedProfileChecks) {
+    if (!exactIdentityValue(actual, expectedValue)) {
+      failures.push(exactIdentityFailure(label, actual, expectedValue));
+    }
+  }
+  return failures;
 }
 
 function profileFrom(contractValue, name) {
@@ -338,6 +575,12 @@ export function validateChildReport(report, {
     if (String(configuration.profileName || "") !== String(profileName)) {
       failures.push("child report configuration.profileName does not match the selected profile");
     }
+    if (String(configuration.worldgenTelemetryMode || "")
+        !== activeWorldgenTelemetryMode) {
+      failures.push(
+        "child report configuration.worldgenTelemetryMode does not match the active version profile",
+      );
+    }
     if (Number(configuration.contractSchemaVersion) !== Number(contractSchemaVersion)) {
       failures.push("child report configuration.contractSchemaVersion does not match the active contract");
     }
@@ -381,6 +624,14 @@ export function validateChildReport(report, {
     if (analysis.environment?.profileName != null
         && String(analysis.environment.profileName) !== String(profileName)) {
       failures.push("child report environment.profileName does not match the selected profile");
+    }
+    const reportedWorldgenTelemetryMode = analysis.runtimeInvariants?.worldgenTelemetryMode
+      || analysis.worldgenTelemetryMode;
+    if (reportedWorldgenTelemetryMode != null
+        && String(reportedWorldgenTelemetryMode) !== activeWorldgenTelemetryMode) {
+      failures.push(
+        "child report analysis worldgen telemetry mode does not match the active version profile",
+      );
     }
   }
   if (releaseEvidenceRequired) {
@@ -444,6 +695,7 @@ export function validateChildReport(report, {
       }
     }
   }
+  if (!smoke) failures.push(...validateNaturalWorkerDistanceEvidence(report, profile));
   if (report.gating != null && Boolean(report.gating) !== expectedReleaseEvidence) {
     failures.push("child report gating is inconsistent with suite mode");
   }
@@ -528,9 +780,17 @@ function value(args, name, fallback = "") {
   return index >= 0 && index + 1 < args.length ? args[index + 1] : fallback;
 }
 
-async function readBuildIdentity() {
-  const bytes = await readFile(manifestPath);
+export async function readBuildIdentity({manifestPath: manifestPathOverride = manifestPath} = {}) {
+  const identityManifestPath = resolve(manifestPathOverride);
+  const bytes = await readFile(identityManifestPath);
   const manifest = JSON.parse(bytes.toString("utf8"));
+  const nestedProfile = manifest?.buildIdentity?.profile;
+  const profileFailures = validateManifestIdentity(manifest);
+  if (profileFailures.length > 0) {
+    throw new Error(
+      `Gaius.manifest.json profile identity does not match the active profile: ${profileFailures.join("; ")}`,
+    );
+  }
   const compatibilitySha256 = String(manifest.buildIdentity?.compatibilitySha256 || "");
   const artifactCompatibilities = [
     manifest.classesJs?.build?.compatibilitySha256,
@@ -542,12 +802,19 @@ async function readBuildIdentity() {
     && artifactCompatibilities.length === 4
     && artifactCompatibilities.every((entry) => entry === compatibilitySha256);
   return {
-    manifestPath,
+    manifestPath: identityManifestPath,
     manifestSha256: createHash("sha256").update(bytes).digest("hex"),
     compatibilitySha256,
     artifactCompatibilities,
     coherent,
     profile: manifest.profile || null,
+    profilePath: manifest.profilePath || null,
+    nestedProfile: nestedProfile || null,
+    worldVersion: manifest.worldVersion,
+    worldgenTelemetryMode: manifest.worldgenTelemetryMode,
+    storage: manifest.storage || null,
+    buildRoot: configuredBuildRoot,
+    overlayDirectory: configuredOverlayDirectory,
   };
 }
 
@@ -652,14 +919,24 @@ async function runProfile(name, profile, {smoke, beforeIdentity, forwarded, outp
     reportVerdict: report?.analysis?.verdict || report?.verdict || null,
     reportProfile: report?.configuration?.profileName || report?.profileName || null,
     reportSchemaVersion: report?.schemaVersion ?? null,
+    worldgenTelemetryMode: report?.configuration?.worldgenTelemetryMode
+      || report?.analysis?.runtimeInvariants?.worldgenTelemetryMode || null,
     buildIdentity: report?.buildIdentity || null,
     performanceEvidence: report?.analysis?.performanceEvidence
       || report?.performanceEvidence || null,
     failureEvidence: report?.analysis?.failureEvidence
       || report?.failureEvidence || null,
+    workerDistanceMode: report?.analysis?.workerDistanceMode
+      || report?.configuration?.workerDistanceMode || null,
+    naturalWorkerEvidence: report?.analysis?.naturalWorkerEvidence
+      || report?.naturalWorkerEvidence || null,
+    harnessOverrideEvidence: report?.analysis?.harnessOverrideEvidence
+      || report?.harnessOverrideEvidence || null,
     acceptanceEvidence,
-    gating: smoke ? false : profile.releaseEvidence === true,
-    releaseEvidence: smoke ? false : profile.releaseEvidence === true,
+    gating: report?.analysis?.gating ?? report?.configuration?.gating
+      ?? (smoke ? false : profile.releaseEvidence === true),
+    releaseEvidence: report?.analysis?.releaseEvidence ?? report?.configuration?.releaseEvidence
+      ?? (smoke ? false : profile.releaseEvidence === true),
     memoryVerdict: report?.analysis?.memory?.verdict || null,
     passed: validation.valid,
     validation,
@@ -670,6 +947,21 @@ async function main() {
   const args = process.argv.slice(2);
   const smoke = args.includes("--smoke");
   const matrix = args.includes("--matrix");
+  if (args.includes("--allow-attached-input")) {
+    throw new Error(
+      "--allow-attached-input has been removed; release benchmarks never inject input into attached Chrome",
+    );
+  }
+  if (args.includes("--pin-worker-distance")) {
+    throw new Error(
+      "--pin-worker-distance is diagnostic-only and cannot be forwarded by the release suite",
+    );
+  }
+  if (args.includes("--attach-port") || value(args, "--attach-port")) {
+    throw new Error(
+      "--attach-port is disabled: release benchmarks require an isolated Chrome they launch themselves",
+    );
+  }
   if (!smoke && value(args, "--url")) {
     throw new Error(
       "strict release evidence must use the suite-owned local build server; --url is smoke-only",
@@ -677,20 +969,20 @@ async function main() {
   }
   const requestedProfiles = args.includes("--profiles") ? value(args, "--profiles") : null;
   const plan = createReleasePlan(contract, requestedProfiles, {smoke, matrix});
-  const outputDirectory = resolve(value(
+  const outputDirectory = resolveRepositoryPortPath(value(
     args,
     "--output-directory",
-    "port/target/chrome-performance-release-suite",
+    isolated ? `port/target/${profileId}/chrome-performance-release-suite` : "port/target/chrome-performance-release-suite",
   ));
-  const reportPath = resolve(value(
+  const reportPath = resolveRepositoryPortPath(value(
     args,
     "--output",
     resolve(outputDirectory, "release-suite.json"),
   ));
   const forwarded = [];
-  for (const name of ["--chrome", "--url", "--attach-port", "--player"]) {
+  for (const name of ["--chrome", "--url", "--player"]) {
     const selected = value(args, name);
-    if (selected) forwarded.push(name, selected);
+    if (selected) forwarded.push(name, name === "--chrome" ? nativePath(selected) : selected);
   }
   for (const flag of ["--headless", "--keep-chrome"]) {
     if (args.includes(flag)) forwarded.push(flag);
@@ -735,6 +1027,17 @@ async function main() {
         reason: "configured stability profile has no supported Chrome driver route",
       })),
       buildIdentity: initialIdentity,
+      activeProfile: {
+        id: profileId,
+        path: profilePath,
+        protocolVersion: activeVersionProfile.protocolVersion,
+        worldVersion: activeVersionProfile.worldVersion,
+        worldgenTelemetryMode: activeWorldgenTelemetryMode,
+      },
+      runtimeInvariantContract: runtimeInvariantContractForProfile,
+      distRoot,
+      overlayDirectory: configuredOverlayDirectory,
+      buildRoot: configuredBuildRoot,
       outputDirectory,
       reportPath,
     }, null, 2));

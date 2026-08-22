@@ -5,23 +5,34 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$ROOT/port/scripts/version-profile.sh"
 gaius_load_version_profile "$ROOT"
 gaius_select_java_home
+overlay_directory="$(gaius_overlay_directory "$ROOT")"
 
 MEMORY_PATH="$(gaius_library_path "org.lwjgl:lwjgl" "unsafe")"
 OPENGL_PATH="$(gaius_library_path "org.lwjgl:lwjgl-opengl")"
 GLFW_PATH="$(gaius_library_path "org.lwjgl:lwjgl-glfw")"
 STB_PATH="$(gaius_library_path "org.lwjgl:lwjgl-stb")"
-MEMORY_JAR="$ROOT/port/work/overlays/libraries/$MEMORY_PATH"
-OPENGL_JAR="$ROOT/port/work/overlays/libraries/$OPENGL_PATH"
-GLFW_JAR="$ROOT/port/work/overlays/libraries/$GLFW_PATH"
-STB_JAR="$ROOT/port/work/overlays/libraries/$STB_PATH"
+MEMORY_JAR="$overlay_directory/libraries/$MEMORY_PATH"
+OPENGL_JAR="$overlay_directory/libraries/$OPENGL_PATH"
+GLFW_JAR="$overlay_directory/libraries/$GLFW_PATH"
+STB_JAR="$overlay_directory/libraries/$STB_PATH"
 VMA_PATH="$(gaius_library_path "org.lwjgl:lwjgl-vma" 2>/dev/null || true)"
 VULKAN_PATH="$(gaius_library_path "org.lwjgl:lwjgl-vulkan" 2>/dev/null || true)"
-VMA_JAR="${VMA_PATH:+$ROOT/port/work/overlays/libraries/$VMA_PATH}"
-VULKAN_JAR="${VULKAN_PATH:+$ROOT/port/work/overlays/libraries/$VULKAN_PATH}"
+VMA_JAR="${VMA_PATH:+$overlay_directory/libraries/$VMA_PATH}"
+VULKAN_JAR="${VULKAN_PATH:+$overlay_directory/libraries/$VULKAN_PATH}"
 
 die() {
     printf 'lwjgl browser compatibility smoke failed: %s\n' "$1" >&2
     exit 1
+}
+
+# Git Bash on Windows can expose javap output with CRLF line endings.  Keep
+# method headers/bytecode stable for awk/rg on both Windows and Unix hosts.
+javap_dump() {
+    local javap_bin="javap"
+    if [[ -n "${GAIUS_JAVA_HOME:-}" && -x "$GAIUS_JAVA_HOME/bin/javap" ]]; then
+        javap_bin="$GAIUS_JAVA_HOME/bin/javap"
+    fi
+    "$javap_bin" "$@" | tr -d '\r'
 }
 
 [[ -f "$MEMORY_JAR" ]] || die "missing $MEMORY_JAR; run build-overlays.sh first"
@@ -65,7 +76,7 @@ assert_delegate() {
 
 QUERY_METHODS=0
 for owner in GL15 GL15C GL32 GL32C; do
-    if dump="$(javap -classpath "$OPENGL_JAR" -p -c "org.lwjgl.opengl.$owner" 2>/dev/null)"; then
+    if dump="$(javap_dump -classpath "$OPENGL_JAR" -p -c "org.lwjgl.opengl.$owner" 2>/dev/null)"; then
         headers="$(printf '%s\n' "$dump" | rg \
             '^  (public|protected|private|static).* (n?glGenQueries)\(' || true)"
         if [[ -n "$headers" ]]; then
@@ -81,7 +92,7 @@ done
 
 DRAW_BUFFER_METHODS=0
 for owner in GL20 GL20C; do
-    dump="$(javap -classpath "$OPENGL_JAR" -p -c "org.lwjgl.opengl.$owner")"
+    dump="$(javap_dump -classpath "$OPENGL_JAR" -p -c "org.lwjgl.opengl.$owner")"
     headers="$(printf '%s\n' "$dump" | rg \
         '^  (public|protected|private|static).* (n?glDrawBuffers)\(' || true)"
     while IFS= read -r header; do
@@ -94,7 +105,7 @@ done
 
 CLEAR_BUFFER_METHODS=0
 for owner in GL30 GL30C; do
-    dump="$(javap -classpath "$OPENGL_JAR" -p -c "org.lwjgl.opengl.$owner")"
+    dump="$(javap_dump -classpath "$OPENGL_JAR" -p -c "org.lwjgl.opengl.$owner")"
     headers="$(printf '%s\n' "$dump" | rg \
         '^  (public|protected|private|static).* (n?glClearBufferfv)\(' || true)"
     while IFS= read -r header; do
@@ -107,7 +118,7 @@ done
 
 DELETE_QUERY_METHODS=0
 for owner in GL15 GL15C GL32 GL32C; do
-    dump="$(javap -classpath "$OPENGL_JAR" -p -c "org.lwjgl.opengl.$owner" 2>/dev/null || true)"
+    dump="$(javap_dump -classpath "$OPENGL_JAR" -p -c "org.lwjgl.opengl.$owner" 2>/dev/null || true)"
     headers="$(printf '%s\n' "$dump" | rg \
         '^  (public|protected|private|static).* (n?glDeleteQueries)\(' || true)"
     while IFS= read -r header; do
@@ -123,7 +134,7 @@ for owner in GL15 GL15C GL32 GL32C; do
 done
 [[ "$DELETE_QUERY_METHODS" -ge 8 ]] || die "not all declared query-delete overloads were patched"
 
-MEMORY_DUMP="$(javap -classpath "$MEMORY_JAR" -p -c org.lwjgl.system.MemoryUtil)"
+MEMORY_DUMP="$(javap_dump -classpath "$MEMORY_JAR" -p -c org.lwjgl.system.MemoryUtil)"
 MEMORY_HEADERS="$(printf '%s\n' "$MEMORY_DUMP" | rg \
     '^  (public|protected|private|static).* (memFree|memAlignedFree|memAddress0|memAddressSafe|memAddress|memDuplicate|memSlice|wrapBuffer|write8Safe|slice|duplicate)\(' \
     | rg -v 'CustomBuffer|org\.lwjgl\.system\.Pointer' || true)"
@@ -133,25 +144,96 @@ while IFS= read -r header; do
     assert_delegate "MemoryUtil browser memory" "$MEMORY_DUMP" "$header" 'BrowserMemory'
 done <<< "$MEMORY_HEADERS"
 
+# APIUtil has two deliberately different null contracts in the browser:
+# required FunctionProvider lookups use the synthetic non-zero address, while
+# optional SharedLibrary lookups must return zero when there is no native
+# library at all.  The latter used to dereference null during 26.2 GLFW
+# initialization (notably GetPreeditCursorRectangle).
+API_UTIL_DUMP="$(javap_dump -classpath "$MEMORY_JAR" -p -c org.lwjgl.system.APIUtil)"
+API_REQUIRED_BLOCK="$(method_block "$API_UTIL_DUMP" \
+    'long apiGetFunctionAddress(org.lwjgl.system.FunctionProvider, java.lang.String)')"
+printf '%s\n' "$API_REQUIRED_BLOCK" | rg -q 'lconst_1' \
+    || die "APIUtil required lookup lost its browser fallback address"
+API_OPTIONAL_BLOCK="$(method_block "$API_UTIL_DUMP" \
+    'long apiGetFunctionAddressOptional(org.lwjgl.system.SharedLibrary, java.lang.String)')"
+[[ -n "$API_OPTIONAL_BLOCK" ]] || die "APIUtil optional lookup method not found"
+printf '%s\n' "$API_OPTIONAL_BLOCK" | rg -q 'ifnonnull' \
+    || die "APIUtil optional lookup has no null-library guard"
+printf '%s\n' "$API_OPTIONAL_BLOCK" | rg -q 'lconst_0' \
+    || die "APIUtil optional lookup has no zero-address null fallback"
+printf '%s\n' "$API_OPTIONAL_BLOCK" | rg -q \
+    'org[/\.]lwjgl[/\.]system[/\.]SharedLibrary[./]getFunctionAddress' \
+    || die "APIUtil optional lookup no longer delegates non-null libraries"
+
+# GLFW 3.4.1 exposes IME/preedit wrappers that have no browser implementation.
+# Older 3.3.x profiles do not declare these methods; assert only when a method
+# exists so the same smoke remains valid for both supported profiles.
+GLFW_DUMP="$(javap_dump -classpath "$GLFW_JAR" -p -c org.lwjgl.glfw.GLFW)"
+assert_ime_noop() {
+    local label="$1"
+    local signature="$2"
+    local return_kind="$3"
+    local block
+    block="$(method_block "$GLFW_DUMP" "$signature")"
+    [[ -n "$block" ]] || return 0
+    if printf '%s\n' "$block" | rg -q \
+            'nglfw|JNI\.|Checks\.|GLFW\$Functions|MemoryUtil\.'; then
+        die "$label still reaches native GLFW dispatch: $signature"
+    fi
+    if [[ "$return_kind" == "null" ]]; then
+        printf '%s\n' "$block" | rg -q 'aconst_null' \
+            || die "$label does not return null: $signature"
+        printf '%s\n' "$block" | rg -q 'areturn' \
+            || die "$label does not return a reference: $signature"
+    else
+        printf '%s\n' "$block" | rg -q 'return' \
+            || die "$label is not a no-op: $signature"
+    fi
+}
+
+assert_ime_noop "GLFW preedit rectangle (IntBuffer)" \
+    'void glfwGetPreeditCursorRectangle(long, java.nio.IntBuffer, java.nio.IntBuffer, java.nio.IntBuffer, java.nio.IntBuffer)' void
+assert_ime_noop "GLFW preedit rectangle (arrays)" \
+    'void glfwGetPreeditCursorRectangle(long, int[], int[], int[], int[])' void
+assert_ime_noop "GLFW set preedit rectangle" \
+    'void glfwSetPreeditCursorRectangle(long, int, int, int, int)' void
+assert_ime_noop "GLFW reset preedit text" \
+    'void glfwResetPreeditText(long)' void
+assert_ime_noop "GLFW get preedit candidate" \
+    'java.nio.IntBuffer glfwGetPreeditCandidate(long, int)' null
+assert_ime_noop "GLFW preedit callback" \
+    'org.lwjgl.glfw.GLFWPreeditCallback glfwSetPreeditCallback(long, org.lwjgl.glfw.GLFWPreeditCallbackI)' null
+assert_ime_noop "GLFW IME status callback" \
+    'org.lwjgl.glfw.GLFWIMEStatusCallback glfwSetIMEStatusCallback(long, org.lwjgl.glfw.GLFWIMEStatusCallbackI)' null
+assert_ime_noop "GLFW preedit candidate callback" \
+    'org.lwjgl.glfw.GLFWPreeditCandidateCallback glfwSetPreeditCandidateCallback(long, org.lwjgl.glfw.GLFWPreeditCandidateCallbackI)' null
+
 assert_delegate \
     "MemoryUtil allocator" \
     "$MEMORY_DUMP" \
     'org.lwjgl.system.MemoryUtil$MemoryAllocator getAllocator(boolean)' \
     'BrowserMemoryAllocator.instance'
 
-MEMORY_TUNABLES_DUMP="$(javap -classpath "$MEMORY_JAR" -p -c org.lwjgl.system.MemoryUtilTunables)"
-assert_delegate \
-    "MemoryUtilTunables large memset" \
-    "$MEMORY_TUNABLES_DUMP" \
-    'void memset(long, int, long)' \
-    'BrowserMemory.set'
-assert_delegate \
-    "MemoryUtilTunables large memcpy" \
-    "$MEMORY_TUNABLES_DUMP" \
-    'void memcpy(long, long, long)' \
-    'BrowserMemory.copy'
+# MemoryUtilTunables was introduced after the 3.3.x LWJGL used by the
+# 1.21.11 profile.  Keep the common smoke valid for both supported LWJGL
+# lines while retaining the stronger browser delegation checks when the class
+# is present (3.4.x/26.2).
+if MEMORY_TUNABLES_DUMP="$(javap_dump -classpath "$MEMORY_JAR" -p -c org.lwjgl.system.MemoryUtilTunables 2>/dev/null)"; then
+    assert_delegate \
+        "MemoryUtilTunables large memset" \
+        "$MEMORY_TUNABLES_DUMP" \
+        'void memset(long, int, long)' \
+        'BrowserMemory.set'
+    assert_delegate \
+        "MemoryUtilTunables large memcpy" \
+        "$MEMORY_TUNABLES_DUMP" \
+        'void memcpy(long, long, long)' \
+        'BrowserMemory.copy'
+else
+    printf 'lwjgl browser compatibility smoke: MemoryUtilTunables not present; skipping 3.4.x-only checks\n'
+fi
 
-LIBC_STRING_DUMP="$(javap -classpath "$MEMORY_JAR" -p -c org.lwjgl.system.libc.LibCString)"
+LIBC_STRING_DUMP="$(javap_dump -classpath "$MEMORY_JAR" -p -c org.lwjgl.system.libc.LibCString)"
 assert_delegate \
     "LibCString memset" \
     "$LIBC_STRING_DUMP" \
@@ -168,7 +250,7 @@ assert_delegate \
     'long nmemmove(long, long, long)' \
     'BrowserMemory.cMemmove'
 
-CALLBACK_I_DUMP="$(javap -classpath "$MEMORY_JAR" -p -c org.lwjgl.system.CallbackI)"
+CALLBACK_I_DUMP="$(javap_dump -classpath "$MEMORY_JAR" -p -c org.lwjgl.system.CallbackI)"
 CALLBACK_ADDRESS="$(method_block "$CALLBACK_I_DUMP" 'long address()')"
 printf '%s\n' "$CALLBACK_ADDRESS" | rg -q 'lconst_1' \
     || die "CallbackI.address does not use the browser callback handle"
@@ -185,12 +267,21 @@ for callback in \
         org.lwjgl.glfw.*) jar="$GLFW_JAR" ;;
         *) jar="$STB_JAR" ;;
     esac
-    callback_dump="$(javap -classpath "$jar" -p -c "$callback")"
-    if printf '%s\n' "$callback_dump" | rg -q 'MethodHandles\.lookup'; then
-        die "$callback still initializes a native libffi descriptor"
+    # Callback helper classes are not identical across the supported LWJGL
+    # lines (3.4.x adds DebugAllocator callback wrappers).  Only inspect a
+    # class when the selected profile actually ships it.
+    if callback_dump="$(javap_dump -classpath "$jar" -p -c "$callback" 2>/dev/null)"; then
+        if printf '%s\n' "$callback_dump" | rg -q 'MethodHandles\.lookup'; then
+            die "$callback still initializes a native libffi descriptor"
+        fi
+    else
+        printf 'lwjgl browser compatibility smoke: %s not present; skipping optional callback check\n' "$callback"
     fi
 done
 
+# Even private/package-private 3.3.x alignment helpers are patched. Keeping
+# desktop Unsafe bytecode in a supposedly browser-safe overlay makes future
+# reachability changes fragile, so do not exempt dead-code assumptions here.
 if printf '%s\n' "$MEMORY_DUMP" | rg -n \
         'getstatic .*UNSAFE|sun[/\.]misc[/\.]Unsafe\.|JNINativeInterface'; then
     die "MemoryUtil bytecode still contains reachable Unsafe/JNI implementation"
@@ -198,7 +289,7 @@ fi
 
 if [[ -n "$VMA_JAR" ]]; then
     for owner in org.lwjgl.util.vma.Vma org.lwjgl.util.vma.LibVma; do
-        dump="$(javap -classpath "$VMA_JAR" -p -c "$owner")"
+        dump="$(javap_dump -classpath "$VMA_JAR" -p -c "$owner")"
         if rg -q '^  .* native .*\(' <<< "$dump"; then
             die "$owner still declares desktop-native methods"
         fi
@@ -208,7 +299,7 @@ if [[ -n "$VMA_JAR" ]]; then
 fi
 
 if [[ -n "$VULKAN_JAR" ]]; then
-    dump="$(javap -classpath "$VULKAN_JAR" -p -c org.lwjgl.vulkan.VK10)"
+    dump="$(javap_dump -classpath "$VULKAN_JAR" -p -c org.lwjgl.vulkan.VK10)"
     if rg -q '^  .* native .*\(' <<< "$dump"; then
         die "org.lwjgl.vulkan.VK10 still declares desktop-native methods"
     fi

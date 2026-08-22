@@ -39,7 +39,9 @@ const calls = {
   bindBuffer: [],
   bufferData: 0,
   bufferSubData: 0,
+  invalidBufferSubData: 0,
   copyBufferSubData: 0,
+  invalidCopyBufferSubData: 0,
   clearBufferfv: [],
   drawBuffers: [],
   getParameter: 0,
@@ -98,11 +100,15 @@ const gl = {
     const object = physicalBindings.get(target);
     assert.ok(object, `bufferSubData target ${target} has no physical buffer`);
     const sourceBytes = copyBytes(data);
-    let targetBytes = bufferStorage.get(object.id) || new Uint8Array(0);
-    if (targetBytes.byteLength < offset + sourceBytes.byteLength) {
-      const grown = new Uint8Array(offset + sourceBytes.byteLength);
-      grown.set(targetBytes);
-      targetBytes = grown;
+    const targetBytes = bufferStorage.get(object.id);
+    if (
+      !targetBytes ||
+      !Number.isInteger(offset) ||
+      offset < 0 ||
+      offset + sourceBytes.byteLength > targetBytes.byteLength
+    ) {
+      calls.invalidBufferSubData += 1;
+      return;
     }
     targetBytes.set(sourceBytes, offset);
     bufferStorage.set(object.id, targetBytes);
@@ -112,11 +118,23 @@ const gl = {
     const sourceObject = physicalBindings.get(sourceTarget);
     const targetObject = physicalBindings.get(targetTarget);
     const sourceBytes = bufferStorage.get(sourceObject.id);
-    let targetBytes = bufferStorage.get(targetObject.id);
-    if (!targetBytes || targetBytes.byteLength < targetOffset + size) {
-      const grown = new Uint8Array(targetOffset + size);
-      if (targetBytes) grown.set(targetBytes);
-      targetBytes = grown;
+    const targetBytes = bufferStorage.get(targetObject.id);
+    if (
+      !sourceBytes ||
+      !targetBytes ||
+      !Number.isInteger(sourceOffset) ||
+      !Number.isInteger(targetOffset) ||
+      !Number.isInteger(size) ||
+      sourceOffset < 0 ||
+      targetOffset < 0 ||
+      size < 0 ||
+      sourceOffset + size > sourceBytes.byteLength ||
+      targetOffset + size > targetBytes.byteLength ||
+      (sourceObject === targetObject && size > 0 &&
+        sourceOffset < targetOffset + size && targetOffset < sourceOffset + size)
+    ) {
+      calls.invalidCopyBufferSubData += 1;
+      return;
     }
     targetBytes.set(sourceBytes.slice(sourceOffset, sourceOffset + size), targetOffset);
     bufferStorage.set(targetObject.id, targetBytes);
@@ -182,6 +200,8 @@ const state = {
   boundBuffers: new Map(),
   bufferBytes: new Map(),
   bufferSizes: new Map(),
+  bufferVersionBumps: 0,
+  bufferShadowDrops: 0,
   buffers: objects,
   shadowRequiredBuffers: new Set([1, 2, 3]),
   textureBindings: new Map(),
@@ -189,6 +209,9 @@ const state = {
   textureParameters: new Map(),
   textures: new Map([[10, textureObject]]),
   framebufferBindings: { draw: 0, read: 0 },
+  shouldShadowBufferTarget() {
+    return true;
+  },
   shadowBufferDataForTarget(_target, buffer, data, size) {
     this.bufferBytes.set(buffer, data ? copyBytes(data) : new Uint8Array(size));
   },
@@ -208,8 +231,13 @@ const state = {
   shadowBufferSubData(buffer, offset, data) {
     this.shadowBufferSubDataForTarget(0, buffer, offset, data);
   },
+  bumpBufferVersion() {
+    this.bufferVersionBumps += 1;
+  },
   dropBufferShadow(buffer) {
+    this.bufferShadowDrops += 1;
     this.bufferBytes.delete(buffer);
+    return true;
   },
   recordTextureUpload() {},
   recordTextureError(_kind, _target, _level, _width, _height, _format, _type, _pixels, error) {
@@ -280,6 +308,62 @@ assert.deepEqual([...bufferStorage.get(2).slice(0, 7)], [9, 8, 0, 0, 3, 4, 0]);
 assert.equal(window.__gaiusGLStats.namedBufferBindSkips, 4);
 assert.equal(window.__gaiusGLStats.namedBufferPhysicalBinds, 2);
 
+function snapshotBufferState(buffer) {
+  const shadow = state.bufferBytes.get(buffer);
+  return {
+    size: state.bufferSizes.get(buffer),
+    shadow,
+    shadowBytes: shadow ? copyBytes(shadow) : null,
+    physical: copyBytes(bufferStorage.get(buffer)),
+    bumps: state.bufferVersionBumps,
+    drops: state.bufferShadowDrops,
+  };
+}
+
+function assertBufferStateUnchanged(buffer, before) {
+  assert.equal(state.bufferSizes.get(buffer), before.size);
+  assert.strictEqual(state.bufferBytes.get(buffer), before.shadow);
+  assert.deepEqual(
+    [...(state.bufferBytes.get(buffer) || [])],
+    [...(before.shadowBytes || [])],
+  );
+  assert.deepEqual([...bufferStorage.get(buffer)], [...before.physical]);
+  assert.equal(state.bufferVersionBumps, before.bumps);
+  assert.equal(state.bufferShadowDrops, before.drops);
+}
+
+const logicalInvalidSubData = snapshotBufferState(1);
+run("bufferSubDataJs", ["target", "offset", "data"], [0x8a11, 255, new Int8Array([41, 42])]);
+assert.equal(calls.invalidBufferSubData, 1);
+assertBufferStateUnchanged(1, logicalInvalidSubData);
+
+run("bufferSubDataJs", ["target", "offset", "data"], [0x8a11, 254, new Int8Array([43, 44])]);
+assert.equal(calls.invalidBufferSubData, 1);
+assert.equal(state.bufferSizes.get(1), logicalInvalidSubData.size);
+assert.deepEqual([...bufferStorage.get(1).slice(254, 256)], [43, 44]);
+assert.deepEqual([...state.bufferBytes.get(1).slice(254, 256)], [43, 44]);
+
+const logicalZeroLengthSubData = snapshotBufferState(1);
+run("bufferSubDataJs", ["target", "offset", "data"], [0x8a11, 256, new Int8Array(0)]);
+assert.equal(calls.invalidBufferSubData, 1);
+assertBufferStateUnchanged(1, logicalZeroLengthSubData);
+
+const namedInvalidSubData = snapshotBufferState(2);
+run("namedBufferSubDataJs", ["buffer", "offset", "data"], [2, 255, new Int8Array([51, 52])]);
+assert.equal(calls.invalidBufferSubData, 2);
+assertBufferStateUnchanged(2, namedInvalidSubData);
+
+run("namedBufferSubDataJs", ["buffer", "offset", "data"], [2, 254, new Int8Array([53, 54])]);
+assert.equal(calls.invalidBufferSubData, 2);
+assert.equal(state.bufferSizes.get(2), namedInvalidSubData.size);
+assert.deepEqual([...bufferStorage.get(2).slice(254, 256)], [53, 54]);
+assert.deepEqual([...state.bufferBytes.get(2).slice(254, 256)], [53, 54]);
+
+const namedZeroLengthSubData = snapshotBufferState(2);
+run("namedBufferSubDataJs", ["buffer", "offset", "data"], [2, 256, new Int8Array(0)]);
+assert.equal(calls.invalidBufferSubData, 2);
+assertBufferStateUnchanged(2, namedZeroLengthSubData);
+
 bindLogical(gl.COPY_READ_BUFFER, 1);
 bindLogical(gl.COPY_WRITE_BUFFER, 2);
 bufferStorage.set(1, new Uint8Array([10, 11, 12, 13]));
@@ -307,8 +391,111 @@ assert.strictEqual(physicalBindings.get(gl.COPY_READ_BUFFER), objects.get(1));
 assert.strictEqual(physicalBindings.get(gl.COPY_WRITE_BUFFER), objects.get(2));
 assert.equal(state.boundBuffers.get(gl.COPY_READ_BUFFER), 1);
 assert.equal(state.boundBuffers.get(gl.COPY_WRITE_BUFFER), 2);
-assert.equal(window.__gaiusGLStats.namedBufferBindSkips, 8);
+assert.equal(window.__gaiusGLStats.namedBufferBindSkips, 14);
 assert.equal(window.__gaiusGLStats.namedBufferPhysicalBinds, 6);
+
+const namedInvalidCopy = snapshotBufferState(2);
+run(
+  "copyNamedBufferSubData",
+  ["sourceBuffer", "targetBuffer", "sourceOffset", "targetOffset", "size"],
+  [1, 2, 0, 255, 2],
+);
+assert.equal(calls.invalidCopyBufferSubData, 1);
+assertBufferStateUnchanged(2, namedInvalidCopy);
+
+run(
+  "copyNamedBufferSubData",
+  ["sourceBuffer", "targetBuffer", "sourceOffset", "targetOffset", "size"],
+  [1, 2, 0, 254, 2],
+);
+assert.equal(calls.invalidCopyBufferSubData, 1);
+assert.equal(state.bufferSizes.get(2), namedInvalidCopy.size);
+assert.deepEqual([...bufferStorage.get(2).slice(254, 256)], [21, 22]);
+assert.deepEqual([...state.bufferBytes.get(2).slice(254, 256)], [6, 5]);
+
+const genericInvalidCopy = snapshotBufferState(2);
+run(
+  "copyBufferSubData",
+  ["sourceTarget", "targetTarget", "sourceOffset", "targetOffset", "size"],
+  [gl.COPY_READ_BUFFER, gl.COPY_WRITE_BUFFER, 255, 0, 2],
+);
+assert.equal(calls.invalidCopyBufferSubData, 2);
+assertBufferStateUnchanged(2, genericInvalidCopy);
+
+run(
+  "copyBufferSubData",
+  ["sourceTarget", "targetTarget", "sourceOffset", "targetOffset", "size"],
+  [gl.COPY_READ_BUFFER, gl.COPY_WRITE_BUFFER, 0, 254, 2],
+);
+assert.equal(calls.invalidCopyBufferSubData, 2);
+assert.equal(state.bufferSizes.get(2), genericInvalidCopy.size);
+assert.deepEqual([...bufferStorage.get(2).slice(254, 256)], [21, 22]);
+assert.deepEqual([...state.bufferBytes.get(2).slice(254, 256)], [6, 5]);
+
+const namedOverlapCopy = snapshotBufferState(1);
+run(
+  "copyNamedBufferSubData",
+  ["sourceBuffer", "targetBuffer", "sourceOffset", "targetOffset", "size"],
+  [1, 1, 0, 1, 2],
+);
+assert.equal(calls.invalidCopyBufferSubData, 3);
+assertBufferStateUnchanged(1, namedOverlapCopy);
+
+const namedZeroLengthCopy = snapshotBufferState(1);
+run(
+  "copyNamedBufferSubData",
+  ["sourceBuffer", "targetBuffer", "sourceOffset", "targetOffset", "size"],
+  [1, 1, 1, 1, 0],
+);
+assert.equal(calls.invalidCopyBufferSubData, 3);
+assertBufferStateUnchanged(1, namedZeroLengthCopy);
+
+const previousGenericWriteObject = physicalBindings.get(gl.COPY_WRITE_BUFFER);
+const previousGenericWriteBuffer = state.boundBuffers.get(gl.COPY_WRITE_BUFFER);
+physicalBindings.set(gl.COPY_WRITE_BUFFER, objects.get(1));
+state.boundBuffers.set(gl.COPY_WRITE_BUFFER, 1);
+const genericOverlapCopy = snapshotBufferState(1);
+run(
+  "copyBufferSubData",
+  ["sourceTarget", "targetTarget", "sourceOffset", "targetOffset", "size"],
+  [gl.COPY_READ_BUFFER, gl.COPY_WRITE_BUFFER, 0, 1, 2],
+);
+assert.equal(calls.invalidCopyBufferSubData, 4);
+assertBufferStateUnchanged(1, genericOverlapCopy);
+
+run(
+  "copyBufferSubData",
+  ["sourceTarget", "targetTarget", "sourceOffset", "targetOffset", "size"],
+  [gl.COPY_READ_BUFFER, gl.COPY_WRITE_BUFFER, 0, 2, 2],
+);
+assert.equal(calls.invalidCopyBufferSubData, 4);
+assert.equal(state.bufferSizes.get(1), genericOverlapCopy.size);
+assert.deepEqual([...bufferStorage.get(1).slice(2, 4)], [21, 22]);
+
+const zeroLengthCopy = snapshotBufferState(1);
+run(
+  "copyBufferSubData",
+  ["sourceTarget", "targetTarget", "sourceOffset", "targetOffset", "size"],
+  [gl.COPY_READ_BUFFER, gl.COPY_WRITE_BUFFER, 1, 1, 0],
+);
+assert.equal(calls.invalidCopyBufferSubData, 4);
+assertBufferStateUnchanged(1, zeroLengthCopy);
+physicalBindings.set(gl.COPY_WRITE_BUFFER, previousGenericWriteObject);
+state.boundBuffers.set(gl.COPY_WRITE_BUFFER, previousGenericWriteBuffer);
+
+const missingSourceShadow = state.bufferBytes.get(1);
+const missingSourceTarget = snapshotBufferState(2);
+state.bufferBytes.delete(1);
+run(
+  "copyNamedBufferSubData",
+  ["sourceBuffer", "targetBuffer", "sourceOffset", "targetOffset", "size"],
+  [1, 2, 0, 0, 2],
+);
+assert.equal(calls.invalidCopyBufferSubData, 4);
+assert.equal(state.bufferSizes.get(2), missingSourceTarget.size);
+assert.equal(state.bufferShadowDrops, missingSourceTarget.drops + 1);
+assert.equal(state.bufferBytes.has(2), false);
+state.bufferBytes.set(1, missingSourceShadow);
 
 const signedPixels = new Int8Array([-1, 2, 3]);
 run(
@@ -397,6 +584,9 @@ console.log("Browser OpenGL hot-path smoke passed");
 console.log(JSON.stringify({
   bufferDataCalls: window.__gaiusGLStats.bufferDataCalls,
   bufferSubDataCalls: window.__gaiusGLStats.bufferSubDataCalls,
+  invalidBufferSubDataCalls: calls.invalidBufferSubData,
+  copyBufferSubDataCalls: calls.copyBufferSubData,
+  invalidCopyBufferSubDataCalls: calls.invalidCopyBufferSubData,
   bufferUploadBytes: window.__gaiusGLStats.bufferUploadBytes,
   namedBufferBindSkips: window.__gaiusGLStats.namedBufferBindSkips,
   namedBufferPhysicalBinds: window.__gaiusGLStats.namedBufferPhysicalBinds,

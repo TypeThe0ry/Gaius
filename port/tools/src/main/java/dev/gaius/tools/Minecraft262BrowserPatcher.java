@@ -19,6 +19,7 @@ import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.TableSwitchInsnNode;
 import org.objectweb.asm.tree.TryCatchBlockNode;
 import org.objectweb.asm.tree.TypeInsnNode;
 import org.objectweb.asm.tree.VarInsnNode;
@@ -45,6 +46,7 @@ public final class Minecraft262BrowserPatcher {
         patchVulkanBackend(jar, root);
         patchGlDeviceCapabilities(jar, root);
         patchFramerateLimiter(jar, root);
+        patchGraphicsPresetBrowserDistances(jar, root);
         patchChunkGenerationCooperation(jar, root);
         patchDistanceManagerCooperation(jar, root);
         patchServerChunkBroadcastCooperation(jar, root);
@@ -74,9 +76,22 @@ public final class Minecraft262BrowserPatcher {
         String owner = "net/minecraft/server/level/ChunkGenerationTask";
         ClassNode node = read(jar, owner + ".class");
 
+        MethodNode runUntilWait = find(
+                node,
+                "runUntilWait",
+                "()Ljava/util/concurrent/CompletableFuture;");
+        requireNoServerWorkTurnReset(
+                "ChunkGenerationTask.runUntilWait",
+                runUntilWait);
+        instrumentBrowserTaskScope(runUntilWait, "ChunkGenerationTask.runUntilWait", Opcodes.ARETURN);
         requireWorldgenLoopPulses(
                 "ChunkGenerationTask.runUntilWait",
-                find(node, "runUntilWait", "()Ljava/util/concurrent/CompletableFuture;"),
+                runUntilWait,
+                1,
+                "pulse");
+        requireWorldgenLoopPulses(
+                "ChunkGenerationTask.waitForScheduledLayer",
+                find(node, "waitForScheduledLayer", "()Ljava/util/concurrent/CompletableFuture;"),
                 1,
                 "pulse");
         requireWorldgenLoopPulses(
@@ -91,9 +106,104 @@ public final class Minecraft262BrowserPatcher {
                 2,
                 "pulse");
 
-        write(node, root.resolve(owner + ".class"));
+        // runUntilWait now has a catch-all task-scope finally plus token and
+        // Throwable locals.  Recompute StackMapTable frames before emitting
+        // the overlaid class; a plain writer leaves verifier frames stale on
+        // the ARETURN/ATHROW paths.
+        writeComputeFrames(node, root.resolve(owner + ".class"));
         System.out.println(
                 "Bounded Minecraft 26.2 chunk-generation layer and scan backedges");
+    }
+
+    private static MethodInsnNode browserWorldgenBeginTaskWork() {
+        return new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                WORLDGEN_SCHEDULER,
+                "beginTaskWork",
+                "()I",
+                false);
+    }
+
+    private static MethodInsnNode browserWorldgenEndTaskWork() {
+        return new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                WORLDGEN_SCHEDULER,
+                "endTaskWork",
+                "(I)V",
+                false);
+    }
+
+    /**
+     * Scope only the task-layer method.  A pending future returns before the
+     * server's waitUntilNextTick path, so closing the scope on every ARETURN is
+     * what keeps that wait's wall-clock idle time out of the scheduler slice.
+     */
+    private static void instrumentBrowserTaskScope(
+            MethodNode method, String target, int returnOpcode) {
+        if (method.instructions.getFirst() == null) {
+            throw new IllegalStateException(target + " has no instructions");
+        }
+
+        LabelNode start = new LabelNode();
+        LabelNode end = new LabelNode();
+        LabelNode handler = new LabelNode();
+        int taskScopeLocal = method.maxLocals++;
+        int throwableLocal = method.maxLocals++;
+        InsnList entry = new InsnList();
+        entry.add(browserWorldgenBeginTaskWork());
+        entry.add(new VarInsnNode(Opcodes.ISTORE, taskScopeLocal));
+        // The catch range starts only after beginTaskWork has initialized the
+        // per-invocation token.  This also keeps cleanup valid if the first
+        // task-layer instruction throws.
+        entry.add(start);
+        method.instructions.insertBefore(method.instructions.getFirst(), entry);
+
+        int returns = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction.getOpcode() != returnOpcode) {
+                continue;
+            }
+            InsnList close = new InsnList();
+            close.add(new VarInsnNode(Opcodes.ILOAD, taskScopeLocal));
+            close.add(browserWorldgenEndTaskWork());
+            method.instructions.insertBefore(instruction, close);
+            returns++;
+        }
+        if (returns == 0) {
+            throw new IllegalStateException(target + " has no normal return for task scope");
+        }
+
+        InsnList cleanup = new InsnList();
+        cleanup.add(end);
+        cleanup.add(handler);
+        cleanup.add(new VarInsnNode(Opcodes.ASTORE, throwableLocal));
+        cleanup.add(new VarInsnNode(Opcodes.ILOAD, taskScopeLocal));
+        cleanup.add(browserWorldgenEndTaskWork());
+        cleanup.add(new VarInsnNode(Opcodes.ALOAD, throwableLocal));
+        cleanup.add(new InsnNode(Opcodes.ATHROW));
+        method.instructions.add(cleanup);
+        method.tryCatchBlocks.add(new TryCatchBlockNode(
+                start, end, handler, "java/lang/Throwable"));
+        method.maxStack = Math.max(method.maxStack, 1);
+        System.out.println("Instrumented " + target + " active-work scope: returns=" + returns);
+    }
+
+    /**
+     * The scheduler clock is owned by MinecraftServer's work-turn boundary. Do not let a
+     * future 26.2 task patch reset it for every runUntilWait invocation: several tasks can run
+     * in one tick and must consume one cumulative pulse budget.
+     */
+    private static void requireNoServerWorkTurnReset(String target, MethodNode method) {
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals(WORLDGEN_SCHEDULER)
+                    && call.name.equals("beginServerWorkTurn")
+                    && call.desc.equals("()V")) {
+                throw new IllegalStateException(
+                        target + " must not reset the shared server work-turn clock");
+            }
+        }
     }
 
     /**
@@ -980,6 +1090,183 @@ public final class Minecraft262BrowserPatcher {
             throw new IllegalStateException("FramerateLimiter spin call was not found");
         }
         write(node, root.resolve(owner + ".class"));
+    }
+
+    /**
+     * Keeps the 26.2 FAST preset inside the browser profile's low-distance budget.
+     *
+     * <p>This is deliberately a bytecode overlay rather than a change to Options or the
+     * singleplayer distance contract.  The vanilla method is an ordinal switch: only the
+     * ordinal-zero FAST arm contains the render/simulation option writes with the 8/6
+     * constants.  Match that arm, both option getter calls, their receiver/field shape, and
+     * the boxed integer stores before changing exactly those two BIPUSH instructions.  A
+     * missing, duplicated, or reshaped target fails closed instead of replacing unrelated
+     * integer constants in the preset method.</p>
+     */
+    private static void patchGraphicsPresetBrowserDistances(String jar, Path root)
+            throws IOException {
+        String owner = "net/minecraft/client/GraphicsPreset";
+        String minecraft = "net/minecraft/client/Minecraft";
+        String options = "net/minecraft/client/Options";
+        String optionInstance = "Lnet/minecraft/client/OptionInstance;";
+        String optionScreen = "Lnet/minecraft/client/gui/screens/options/OptionsSubScreen;";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode apply = find(node, "apply", "(L" + minecraft + ";)V");
+
+        TableSwitchInsnNode presetSwitch = null;
+        int switches = 0;
+        for (AbstractInsnNode instruction : apply.instructions.toArray()) {
+            if (instruction instanceof TableSwitchInsnNode table
+                    && table.min == 0
+                    && table.max == 2) {
+                presetSwitch = table;
+                switches++;
+            }
+        }
+        requireOne("GraphicsPreset.apply ordinal switch", switches);
+        if (presetSwitch == null || presetSwitch.labels.size() != 3) {
+            throw new IllegalStateException("GraphicsPreset.apply FAST switch arm is missing");
+        }
+
+        int fastStart = apply.instructions.indexOf(presetSwitch.labels.get(0));
+        if (fastStart < 0) {
+            throw new IllegalStateException("GraphicsPreset.apply FAST switch label is missing");
+        }
+        AbstractInsnNode fastDistance = nextOpcode(presetSwitch.labels.get(0));
+        if (!(fastDistance instanceof IntInsnNode integer)
+                || integer.getOpcode() != Opcodes.BIPUSH
+                || integer.operand != 8) {
+            throw new IllegalStateException(
+                    "GraphicsPreset.apply FAST arm distance preamble changed");
+        }
+        AbstractInsnNode fastDistanceLocal = nextOpcode(fastDistance);
+        if (!(fastDistanceLocal instanceof VarInsnNode local)
+                || local.getOpcode() != Opcodes.ISTORE
+                || local.var != 4) {
+            throw new IllegalStateException(
+                    "GraphicsPreset.apply FAST arm distance local changed");
+        }
+
+        int fastEnd = apply.instructions.size();
+        for (LabelNode branch : presetSwitch.labels) {
+            int index = apply.instructions.indexOf(branch);
+            if (index > fastStart && index < fastEnd) {
+                fastEnd = index;
+            }
+        }
+        int defaultIndex = apply.instructions.indexOf(presetSwitch.dflt);
+        if (defaultIndex > fastStart && defaultIndex < fastEnd) {
+            fastEnd = defaultIndex;
+        }
+        if (fastEnd == apply.instructions.size()) {
+            throw new IllegalStateException("GraphicsPreset.apply FAST arm end is missing");
+        }
+
+        IntInsnNode renderDistance = findGraphicsPresetDistanceConstant(
+                apply,
+                fastStart,
+                fastEnd,
+                options,
+                optionInstance,
+                optionScreen,
+                minecraft,
+                owner,
+                "renderDistance",
+                8);
+        IntInsnNode simulationDistance = findGraphicsPresetDistanceConstant(
+                apply,
+                fastStart,
+                fastEnd,
+                options,
+                optionInstance,
+                optionScreen,
+                minecraft,
+                owner,
+                "simulationDistance",
+                6);
+        renderDistance.operand = 6;
+        simulationDistance.operand = 4;
+
+        write(node, root.resolve(owner + ".class"));
+        System.out.println(
+                "Bounded Minecraft 26.2 FAST graphics preset distances to render=6 simulation=4");
+    }
+
+    private static IntInsnNode findGraphicsPresetDistanceConstant(
+            MethodNode method,
+            int start,
+            int end,
+            String options,
+            String optionInstance,
+            String optionScreen,
+            String minecraft,
+            String graphicsPreset,
+            String getter,
+            int expected) {
+        int getterCount = 0;
+        IntInsnNode constant = null;
+        AbstractInsnNode[] instructions = method.instructions.toArray();
+        for (int index = start; index < end; index++) {
+            AbstractInsnNode instruction = instructions[index];
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKEVIRTUAL
+                    || !call.owner.equals(options)
+                    || !call.name.equals(getter)
+                    || !call.desc.equals("()" + optionInstance)) {
+                continue;
+            }
+            getterCount++;
+            AbstractInsnNode optionsField = previousOpcode(call);
+            AbstractInsnNode minecraftLoad = previousOpcode(optionsField);
+            AbstractInsnNode screenLoad = previousOpcode(minecraftLoad);
+            if (!(optionsField instanceof FieldInsnNode field)
+                    || field.getOpcode() != Opcodes.GETFIELD
+                    || !field.owner.equals(minecraft)
+                    || !field.name.equals("options")
+                    || !field.desc.equals("L" + options + ";")
+                    || !(minecraftLoad instanceof VarInsnNode minecraftReceiver)
+                    || minecraftReceiver.getOpcode() != Opcodes.ALOAD
+                    || minecraftReceiver.var != 1
+                    || !(screenLoad instanceof VarInsnNode screenReceiver)
+                    || screenReceiver.getOpcode() != Opcodes.ALOAD
+                    || screenReceiver.var != 2) {
+                throw new IllegalStateException(
+                        "GraphicsPreset.apply FAST " + getter + " receiver shape changed");
+            }
+            AbstractInsnNode value = nextOpcode(call);
+            if (!(value instanceof IntInsnNode integer)
+                    || integer.getOpcode() != Opcodes.BIPUSH
+                    || integer.operand != expected) {
+                throw new IllegalStateException(
+                        "GraphicsPreset.apply FAST " + getter + " constant shape changed");
+            }
+            AbstractInsnNode boxed = nextOpcode(value);
+            if (!(boxed instanceof MethodInsnNode box)
+                    || box.getOpcode() != Opcodes.INVOKESTATIC
+                    || !box.owner.equals("java/lang/Integer")
+                    || !box.name.equals("valueOf")
+                    || !box.desc.equals("(I)Ljava/lang/Integer;")) {
+                throw new IllegalStateException(
+                        "GraphicsPreset.apply FAST " + getter + " boxing shape changed");
+            }
+            AbstractInsnNode setter = nextOpcode(boxed);
+            if (!(setter instanceof MethodInsnNode set)
+                    || set.getOpcode() != Opcodes.INVOKESTATIC
+                    || !set.owner.equals(graphicsPreset)
+                    || !set.name.equals("set")
+                    || !set.desc.equals("(" + optionScreen + optionInstance
+                            + "Ljava/lang/Object;)V")) {
+                throw new IllegalStateException(
+                        "GraphicsPreset.apply FAST " + getter + " setter shape changed");
+            }
+            constant = integer;
+        }
+        requireOne("GraphicsPreset.apply FAST " + getter + " target", getterCount);
+        if (constant == null) {
+            throw new IllegalStateException(
+                    "GraphicsPreset.apply FAST " + getter + " target is missing");
+        }
+        return constant;
     }
 
     private static void patchGlBufferMappedViewRanges(String jar, Path root) throws IOException {

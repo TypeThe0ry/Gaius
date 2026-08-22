@@ -7,15 +7,24 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 
 
+def _native_external_path(value: str) -> Path:
+    """Accept Git-Bash /c/... paths when running Windows Python."""
+    if os.name == "nt" and re.match(r"^/[A-Za-z](?:/|$)", value):
+        value = f"{value[1].upper()}:{value[2:]}"
+    return Path(value).expanduser()
+
+
 IDENTITY_KIND = "gaius-build-identity"
-IDENTITY_SCHEMA_VERSION = 1
+IDENTITY_SCHEMA_VERSION = 2
 INPUT_POLICY = "gaius-runtime-inputs-v1"
 PROTOCOL_POLICY = "gaius-browser-protocol-v1"
 OVERLAY_POLICY = "gaius-active-overlay-inputs-v1"
+WORLDGEN_TELEMETRY_MODES = frozenset(("task-pulsed", "checkpoint-only"))
 
 SOURCE_DIRECTORIES = (
     "port/src/main",
@@ -36,6 +45,7 @@ SOURCE_FILES = (
     "port/scripts/build-teavm.sh",
     "port/scripts/build-teavm-server-worker.sh",
     "port/scripts/build-teavm-release.sh",
+    "port/scripts/build-version-release.sh",
     "port/scripts/postprocess-teavm-js.py",
     "port/scripts/postprocess-index-html.py",
     "port/scripts/build-vanilla-assets-pack.py",
@@ -76,7 +86,10 @@ def _load_profile(root: Path) -> tuple[dict, str, Path, bytes]:
     config_path = root / "port" / "config.json"
     try:
         config = json.loads(config_path.read_text(encoding="utf-8"))
-        relative_profile = config["versionProfile"]
+        relative_profile = (
+            os.environ.get("GAIUS_VERSION_PROFILE_PATH")
+            or config["versionProfile"]
+        )
     except (OSError, UnicodeDecodeError, ValueError, KeyError) as exc:
         raise RuntimeError(f"could not load active version profile from {config_path}") from exc
     if not isinstance(relative_profile, str) or not relative_profile:
@@ -102,7 +115,62 @@ def _load_profile(root: Path) -> tuple[dict, str, Path, bytes]:
         raise RuntimeError(f"active version profile has invalid clientDistribution: {profile_path}")
     if not isinstance(profile.get("protocolVersion"), int):
         raise RuntimeError(f"active version profile has no integer protocolVersion: {profile_path}")
+    if not isinstance(profile.get("worldVersion"), int) or profile["worldVersion"] < 0:
+        raise RuntimeError(f"active version profile has no valid worldVersion: {profile_path}")
+    _validate_worldgen_telemetry_mode(profile)
+    _validate_storage(profile)
     return profile, Path(relative_profile).as_posix(), profile_path, profile_bytes
+
+
+def _validate_worldgen_telemetry_mode(profile: dict, *, required: bool = False) -> str | None:
+    """Validate the explicit worldgen evidence mode when a profile declares it.
+
+    Older fixture profiles used by the artifact helper predate this field.  They
+    remain usable for identity-only tests, but an actual version profile is
+    required to declare one of the two modes by check-version-profile.mjs.
+    """
+    mode = profile.get("worldgenTelemetryMode")
+    if mode is None and not required:
+        return None
+    if mode not in WORLDGEN_TELEMETRY_MODES:
+        raise RuntimeError(
+            f"active version profile {profile.get('id', '<unknown>')} "
+            "worldgenTelemetryMode must be 'task-pulsed' or 'checkpoint-only' "
+            f"(received {mode!r})"
+        )
+    return mode
+
+
+def _validate_storage(profile: dict) -> dict[str, object]:
+    storage = profile.get("storage")
+    if not isinstance(storage, dict):
+        raise RuntimeError(
+            f"active version profile {profile.get('id', '<unknown>')} storage must be an object"
+        )
+    schema = storage.get("schema")
+    profile_id = profile.get("id")
+    if not isinstance(profile_id, str) or not profile_id:
+        raise RuntimeError("active version profile id must be a non-empty string")
+    if not isinstance(schema, int) or isinstance(schema, bool) or schema != 2:
+        raise RuntimeError(
+            f"active version profile {profile_id} storage.schema must be exactly 2 "
+            f"(received {schema!r})"
+        )
+    expected = {
+        "databaseName": f"gaius-fs-v2-{profile_id}",
+        "prefix": f"gaius.fs.v2:{profile_id}:",
+        "opfsDirectory": f"regions-v2-{profile_id}",
+    }
+    for key, expected_value in expected.items():
+        value = storage.get(key)
+        if not isinstance(value, str) or not value:
+            raise RuntimeError(f"active version profile storage.{key} must be non-empty")
+        if value != expected_value:
+            raise RuntimeError(
+                f"active version profile {profile_id} storage.{key} must be exactly "
+                f"{expected_value!r} (received {value!r})"
+            )
+    return storage
 
 
 def _input_paths(root: Path, relative_profile: str, *, protocol: bool) -> list[Path]:
@@ -158,7 +226,19 @@ def _overlay_paths(root: Path, profile: dict) -> list[Path]:
 
     version = profile["id"]
     work = root / "port" / "work" / version
-    overlays = root / "port" / "work" / "overlays"
+    configured_overlay = os.environ.get("GAIUS_OVERLAY_DIRECTORY")
+    if configured_overlay:
+        overlays = _native_external_path(configured_overlay)
+    elif os.environ.get("GAIUS_BUILD_ROOT") or os.environ.get("GAIUS_VERSION_PROFILE_PATH"):
+        # An isolated build root implies a version-scoped overlay unless the
+        # caller explicitly supplied another directory.  This keeps sidecar
+        # identity hashes aligned with the POM and TeaVM inputs.
+        overlays = root / "port" / "work" / "overlays" / profile["id"]
+    else:
+        overlays = root / "port" / "work" / "overlays"
+    if not overlays.is_absolute():
+        overlays = root / overlays
+    overlays = overlays.resolve()
     candidates = [
         work / "version.json",
         work / "client-version.json",
@@ -199,6 +279,7 @@ def _overlay_paths(root: Path, profile: dict) -> list[Path]:
 def current_build_identity(root: Path) -> dict[str, object]:
     root = root.resolve()
     profile, relative_profile, _profile_path, profile_bytes = _load_profile(root)
+    worldgen_telemetry_mode = _validate_worldgen_telemetry_mode(profile)
     source = _hash_input_set(
         root,
         _input_paths(root, relative_profile, protocol=False),
@@ -221,6 +302,9 @@ def current_build_identity(root: Path) -> dict[str, object]:
         "sha256": sha256_bytes(profile_bytes),
         "clientDistribution": profile["clientDistribution"],
         "protocolVersion": profile["protocolVersion"],
+        "worldVersion": profile["worldVersion"],
+        "worldgenTelemetryMode": worldgen_telemetry_mode,
+        "storage": profile["storage"],
     }
     compatibility_payload = {
         "schemaVersion": IDENTITY_SCHEMA_VERSION,
@@ -232,6 +316,9 @@ def current_build_identity(root: Path) -> dict[str, object]:
     return {
         "schemaVersion": IDENTITY_SCHEMA_VERSION,
         "profile": profile_identity,
+        "worldVersion": profile["worldVersion"],
+        "worldgenTelemetryMode": worldgen_telemetry_mode,
+        "storage": profile["storage"],
         "source": source,
         "protocol": protocol,
         "overlay": overlay,
@@ -262,6 +349,9 @@ def _write_text_atomically(target: Path, text: str) -> None:
             os.fsync(temporary.fileno())
         os.replace(temporary_name, target)
         temporary_name = None
+        # Windows cannot open a directory for fsync; the replace is atomic anyway.
+        if os.name == "nt":
+            return
         directory_fd = os.open(target.parent, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
@@ -285,6 +375,9 @@ def create_sidecar(root: Path, role: str, artifact: Path) -> dict[str, object]:
         "schemaVersion": IDENTITY_SCHEMA_VERSION,
         "role": role,
         "profile": identity["profile"],
+        "worldVersion": identity["worldVersion"],
+        "worldgenTelemetryMode": identity["worldgenTelemetryMode"],
+        "storage": identity["storage"],
         "source": identity["source"],
         "protocol": identity["protocol"],
         "overlay": identity["overlay"],
@@ -327,7 +420,16 @@ def verify_sidecar(
         raise RuntimeError(f"build identity sidecar is not an object: {sidecar}")
 
     expected_common = expected_common or current_build_identity(root)
-    for key in ("profile", "source", "protocol", "overlay", "compatibilitySha256"):
+    for key in (
+        "profile",
+        "worldVersion",
+        "worldgenTelemetryMode",
+        "storage",
+        "source",
+        "protocol",
+        "overlay",
+        "compatibilitySha256",
+    ):
         if record.get(key) != expected_common[key]:
             raise RuntimeError(f"build identity {key} does not match current inputs: {sidecar}")
     if (

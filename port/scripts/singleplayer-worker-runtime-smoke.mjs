@@ -4,6 +4,7 @@ import {Session as InspectorSession} from "node:inspector";
 import {performance} from "node:perf_hooks";
 import vm from "node:vm";
 import {inflateSync} from "node:zlib";
+import {basename, isAbsolute} from "node:path";
 import {fileURLToPath, pathToFileURL} from "node:url";
 import {
   MessageChannel,
@@ -15,17 +16,57 @@ import {
 } from "node:worker_threads";
 
 const rootDirectory = fileURLToPath(new URL("../../", import.meta.url));
-const bootstrapPath = process.env.GAIUS_SMOKE_BOOTSTRAP_PATH ||
-  rootDirectory + "port/web/dist/singleplayer-server-worker.js";
+const nativePath = (value) => {
+  if (!value) return value;
+  const text = String(value);
+  return process.platform === "win32" && /^\/[A-Za-z](?:\/|$)/.test(text)
+    ? `${text[1].toUpperCase()}:${text.slice(2)}` : text;
+};
 const portConfig = JSON.parse(fs.readFileSync(rootDirectory + "port/config.json", "utf8"));
-const versionProfileRelative = String(portConfig.versionProfile || "");
-if (!/^versions\/[A-Za-z0-9._-]+\.json$/.test(versionProfileRelative)) {
-  throw new Error("port/config.json has an invalid versionProfile");
+const versionProfileRelative = nativePath(
+  process.env.GAIUS_VERSION_PROFILE_PATH || String(portConfig.versionProfile || ""),
+);
+const profileId = basename(versionProfileRelative.replaceAll("\\", "/"))
+  .replace(/\.json$/, "") || "26.2";
+const versionProfilePath = isAbsolute(versionProfileRelative)
+  ? versionProfileRelative
+  : rootDirectory + "port/" + versionProfileRelative;
+const isolated = Boolean(process.env.GAIUS_BUILD_ROOT || process.env.GAIUS_VERSION_PROFILE_PATH);
+const distDirectory = nativePath(process.env.GAIUS_DIST_DIRECTORY ||
+  (isolated ? rootDirectory + "port/web/dist/" + profileId : rootDirectory + "port/web/dist"));
+const buildDirectory = nativePath(process.env.GAIUS_BUILD_ROOT ||
+  (isolated ? rootDirectory + "port/target/" + profileId : rootDirectory + "port/target"));
+const bootstrapPath = nativePath(process.env.GAIUS_SMOKE_BOOTSTRAP_PATH ||
+  distDirectory + "/singleplayer-server-worker.js");
+if (!isAbsolute(versionProfileRelative)
+    && !/^versions\/[A-Za-z0-9._-]+\.json$/.test(versionProfileRelative.replaceAll("\\", "/"))) {
+  throw new Error("the active version profile path is invalid");
 }
 const activeVersionProfile = JSON.parse(fs.readFileSync(
-  rootDirectory + "port/" + versionProfileRelative,
+  versionProfilePath,
   "utf8",
 ));
+const storageProfileId = String(activeVersionProfile.id || "");
+const worldVersion = Number(activeVersionProfile.worldVersion);
+const profileStorage = activeVersionProfile.storage || {};
+const storageConfig = Object.freeze({
+  profileId: storageProfileId,
+  worldVersion,
+  storageSchema: Number(profileStorage.schema),
+  storageDatabaseName: String(profileStorage.databaseName || ""),
+  storagePrefix: String(profileStorage.prefix || ""),
+  storageOpfsDirectory: String(profileStorage.opfsDirectory || ""),
+});
+if (!storageConfig.profileId || !Number.isSafeInteger(storageConfig.worldVersion) ||
+    storageConfig.worldVersion <= 0 || storageConfig.storageSchema !== 2 ||
+    storageConfig.storageDatabaseName !== `gaius-fs-v2-${storageConfig.profileId}` ||
+    storageConfig.storagePrefix !== `gaius.fs.v2:${storageConfig.profileId}:` ||
+    storageConfig.storageOpfsDirectory !== `regions-v2-${storageConfig.profileId}`) {
+  throw new Error(
+    `The active version profile has an invalid schema-2 storage namespace: ${
+      JSON.stringify(activeVersionProfile.storage)}`,
+  );
+}
 const activeProtocolVersion = Number(activeVersionProfile.protocolVersion);
 if (!Number.isSafeInteger(activeProtocolVersion) || activeProtocolVersion < 0) {
   throw new Error("The active version profile has an invalid protocolVersion");
@@ -112,6 +153,43 @@ const requiredNetworkTaskTelemetryFields = Object.freeze([
   "integratedServerInputPending",
 ]);
 
+// The Worker build intentionally bypasses BrowserCooperativeExecutor.  The
+// integrated-server network pump counters therefore remain zero in that mode;
+// only a runtime that actually uses the cooperative pump can be required to
+// demonstrate pump activity.  Keep this list limited to successful activity
+// counters so a failure cannot make an otherwise direct-executor run look
+// active.
+const cooperativePumpActivityFields = Object.freeze([
+  "integratedServerPumpRequests",
+  "integratedServerPumpStarts",
+  "integratedServerTaskSignals",
+  "integratedServerTaskSchedules",
+]);
+
+function hasCooperativePumpActivity(stats) {
+  if (stats === null || typeof stats !== "object") {
+    return false;
+  }
+  return cooperativePumpActivityFields.some((field) => Number(stats[field]) > 0);
+}
+
+function resolveCooperativePumpMode(stats, expected = false) {
+  const active = hasCooperativePumpActivity(stats);
+  return {
+    expected: Boolean(expected),
+    active,
+    requireActivity: Boolean(expected) || active,
+  };
+}
+
+function taskRunSkewAllowance(options = {}) {
+  // Telemetry counters are deltas from the first pong in a measurement window.
+  // A task already pending at that baseline contributes a run without a
+  // matching schedule in the window.  Only the one-bit pending gauge can
+  // justify that one-run allowance; unknown/malformed values get no allowance.
+  return options.initialIntegratedServerTaskPending === 1 ? 1 : 0;
+}
+
 function validateNetworkTaskTelemetry(stats, options = {}) {
   const missingFields = [];
   const nonFiniteFields = [];
@@ -120,6 +198,7 @@ function validateNetworkTaskTelemetry(stats, options = {}) {
   const relationshipErrors = [];
   const healthErrors = [];
   const fieldValues = Object.create(null);
+  const runSkewAllowance = taskRunSkewAllowance(options);
   const objectStats = stats !== null && typeof stats === "object" ? stats : null;
   for (const field of requiredNetworkTaskTelemetryFields) {
     if (!objectStats || !Object.prototype.hasOwnProperty.call(objectStats, field)) {
@@ -188,7 +267,8 @@ function validateNetworkTaskTelemetry(stats, options = {}) {
             fieldValues.integratedServerTaskDeferredRetries) {
       relationshipErrors.push("burst task schedules exceed signals plus deferred retries");
     }
-    if (fieldValues.integratedServerTaskRuns > fieldValues.integratedServerTaskSchedules) {
+    if (fieldValues.integratedServerTaskRuns >
+        fieldValues.integratedServerTaskSchedules + runSkewAllowance) {
       relationshipErrors.push("task runs exceed task schedules");
     }
     if (fieldValues.integratedServerTaskFollowups >
@@ -221,7 +301,7 @@ function validateNetworkTaskTelemetry(stats, options = {}) {
     if (options.requireDrained && fieldValues.integratedServerInputPending !== 0) {
       relationshipErrors.push("integrated server input is still pending");
     }
-    if (options.requireDrained && fieldValues.integratedServerTaskRuns !==
+    if (options.requireDrained && fieldValues.integratedServerTaskRuns <
         fieldValues.integratedServerTaskSchedules) {
       relationshipErrors.push("scheduled integrated server tasks did not all run");
     }
@@ -255,6 +335,7 @@ function validateNetworkTaskTelemetry(stats, options = {}) {
     nonFiniteFields,
     nonIntegerFields,
     negativeFields,
+    taskRunSkewAllowance: runSkewAllowance,
     relationshipErrors,
     healthErrors,
   };
@@ -262,6 +343,226 @@ function validateNetworkTaskTelemetry(stats, options = {}) {
 
 function copyObjectSnapshot(value) {
   return value !== null && typeof value === "object" ? {...value} : null;
+}
+
+// Telemetry pongs are the only samples that cross the Worker boundary after
+// the measurement window is reset.  Keep each object detached from the
+// structured-clone payload, and keep the update itself pure so a stale or
+// cross-session pong cannot repopulate the previous window's auxiliary stats.
+function snapshotTelemetryPong(message) {
+  return {
+    chunkPriorityStats: copyObjectSnapshot(message.chunkPriority),
+    networkStats: copyObjectSnapshot(message.network),
+    worldgenStats: copyObjectSnapshot(message.worldgen),
+    storageStats: copyObjectSnapshot(message.storage),
+  };
+}
+
+function updateLatestTelemetrySnapshots(latest, message, expectedSessionId) {
+  if (message === null || typeof message !== "object" ||
+      message.sessionId !== expectedSessionId) {
+    return {...latest};
+  }
+  return {
+    ...latest,
+    ...snapshotTelemetryPong(message),
+  };
+}
+
+function recentTelemetryAuxiliarySnapshot(samples, field, fallback) {
+  for (let index = samples.length - 1; index >= 0; index--) {
+    const sample = samples[index];
+    if (sample && sample.available &&
+        Object.prototype.hasOwnProperty.call(sample, field)) {
+      return copyObjectSnapshot(sample[field]);
+    }
+  }
+  return copyObjectSnapshot(fallback);
+}
+
+function runTelemetrySnapshotSelfSmoke() {
+  const oldWindow = {
+    chunkPriorityStats: {window: "old"},
+    networkStats: {window: "old"},
+    worldgenStats: {window: "old"},
+    storageStats: {window: "old"},
+  };
+  const stalePong = {
+    sessionId: "stale-session",
+    chunkPriority: {window: "stale"},
+    network: {window: "stale"},
+    worldgen: {window: "stale"},
+    storage: {window: "stale"},
+  };
+  const afterStale = updateLatestTelemetrySnapshots(
+    oldWindow,
+    stalePong,
+    "active-session",
+  );
+  if (JSON.stringify(afterStale) !== JSON.stringify(oldWindow)) {
+    throw new Error("stale telemetry pong polluted the latest snapshot");
+  }
+  const resetPong = {
+    sessionId: "active-session",
+    chunkPriority: {window: "reset"},
+    network: {window: "reset"},
+    worldgen: {window: "reset"},
+    storage: {window: "reset"},
+  };
+  const afterReset = updateLatestTelemetrySnapshots(
+    afterStale,
+    resetPong,
+    "active-session",
+  );
+  for (const field of [
+    "chunkPriorityStats",
+    "networkStats",
+    "worldgenStats",
+    "storageStats",
+  ]) {
+    if (afterReset[field]?.window !== "reset") {
+      throw new Error(`reset telemetry snapshot did not replace ${field}`);
+    }
+  }
+  // Ensure the returned objects are detached before the Worker payload can be
+  // reused or mutated by a later measurement window.
+  resetPong.storage.window = "mutated-after-snapshot";
+  if (afterReset.storageStats.window !== "reset") {
+    throw new Error("telemetry snapshot retained a mutable pong reference");
+  }
+  return {
+    ok: true,
+    staleSessionIgnored: true,
+    resetAuxiliarySnapshotsReplaced: true,
+    snapshotObjectsDetached: true,
+  };
+}
+
+function runNetworkValidationSelfSmoke() {
+  const zeroStats = Object.fromEntries(
+    requiredNetworkTaskTelemetryFields.map((field) => [field, 0]),
+  );
+  zeroStats.integratedServerTaskPending = 0;
+  zeroStats.integratedServerInputPending = 0;
+  const directMode = resolveCooperativePumpMode(zeroStats, false);
+  if (directMode.requireActivity || directMode.active) {
+    throw new Error("direct-executor self-smoke incorrectly requires pump activity");
+  }
+  const directValidation = validateNetworkTaskTelemetry(zeroStats, {
+    requireActivity: directMode.requireActivity,
+    requireDrained: true,
+    requireHealthy: true,
+  });
+  if (!directValidation.valid) {
+    throw new Error(
+      `direct-executor self-smoke rejected zero activity: ${JSON.stringify(directValidation)}`,
+    );
+  }
+
+  const activeStats = {...zeroStats,
+    integratedServerPumpRequests: 1,
+    integratedServerPumpStarts: 1,
+    integratedServerTaskSignals: 1,
+    integratedServerTaskUnparks: 1,
+    integratedServerTaskSchedules: 1,
+    integratedServerTaskRuns: 1,
+  };
+  const activeMode = resolveCooperativePumpMode(activeStats, false);
+  if (!activeMode.active || !activeMode.requireActivity) {
+    throw new Error("active cooperative-pump self-smoke did not require activity");
+  }
+  const activeValidation = validateNetworkTaskTelemetry(activeStats, {
+    requireActivity: activeMode.requireActivity,
+    requireDrained: true,
+    requireHealthy: true,
+  });
+  if (!activeValidation.valid) {
+    throw new Error(
+      `active cooperative-pump self-smoke rejected valid activity: ${JSON.stringify(activeValidation)}`,
+    );
+  }
+
+  const expectedMode = resolveCooperativePumpMode(zeroStats, true);
+  if (!expectedMode.requireActivity || expectedMode.active) {
+    throw new Error("expected cooperative-pump self-smoke did not require activity");
+  }
+  const expectedValidation = validateNetworkTaskTelemetry(zeroStats, {
+    requireActivity: expectedMode.requireActivity,
+    requireDrained: true,
+    requireHealthy: true,
+  });
+  if (expectedValidation.valid ||
+      !expectedValidation.relationshipErrors.includes("task schedules are zero") ||
+      !expectedValidation.relationshipErrors.includes("integrated pump requests are zero")) {
+    throw new Error(
+      `expected cooperative-pump self-smoke failed to reject missing activity: ${JSON.stringify(expectedValidation)}`,
+    );
+  }
+
+  const inFlightStats = {...zeroStats, integratedServerTaskRuns: 1};
+  const inFlightValidation = validateNetworkTaskTelemetry(inFlightStats, {
+    requireActivity: false,
+    requireDrained: true,
+    initialIntegratedServerTaskPending: 1,
+    requireHealthy: true,
+  });
+  if (!inFlightValidation.valid || inFlightValidation.taskRunSkewAllowance !== 1) {
+    throw new Error(
+      `in-flight baseline self-smoke rejected the permitted run: ${JSON.stringify(inFlightValidation)}`,
+    );
+  }
+  const overrunValidation = validateNetworkTaskTelemetry(
+    {...inFlightStats, integratedServerTaskRuns: 2},
+    {
+      requireActivity: false,
+      requireDrained: true,
+      initialIntegratedServerTaskPending: 1,
+      requireHealthy: true,
+    },
+  );
+  if (overrunValidation.valid ||
+      !overrunValidation.relationshipErrors.includes("task runs exceed task schedules")) {
+    throw new Error("in-flight baseline self-smoke failed to reject a second run");
+  }
+
+  const failedDirectStats = {...zeroStats, errors: 1};
+  const failedDirectValidation = validateNetworkTaskTelemetry(failedDirectStats, {
+    requireActivity: false,
+    requireDrained: true,
+    requireHealthy: true,
+  });
+  if (failedDirectValidation.valid ||
+      !failedDirectValidation.healthErrors.includes("network errors are non-zero")) {
+    throw new Error("direct-executor self-smoke failed to reject a network error");
+  }
+  const queuedDirectStats = {...zeroStats, inboundQueuedBytes: 1};
+  const queuedDirectValidation = validateNetworkTaskTelemetry(queuedDirectStats, {
+    requireActivity: false,
+    requireDrained: true,
+    requireHealthy: true,
+  });
+  if (queuedDirectValidation.valid ||
+      !queuedDirectValidation.relationshipErrors.includes("inbound queue is not drained")) {
+    throw new Error("direct-executor self-smoke failed to reject queued input");
+  }
+  return {
+    ok: true,
+    directExecutorZeroActivity: true,
+    activeCooperativePump: true,
+    expectedCooperativePumpMissingActivity: true,
+    inFlightRunAllowance: true,
+    overrunStillRejected: true,
+    directExecutorFailureStillRejected: true,
+    directExecutorQueueStillRejected: true,
+  };
+}
+
+if (isMainThread && process.env.GAIUS_SMOKE_SELF_TEST === "1") {
+  process.stdout.write(JSON.stringify({
+    ...runNetworkValidationSelfSmoke(),
+    telemetrySnapshots: runTelemetrySnapshotSelfSmoke(),
+  }) + "\n");
+  process.exit(0);
 }
 
 function networkDrainSignature(stats) {
@@ -302,6 +603,7 @@ if (isMainThread) {
   const chunkBatchDesiredRate = Number(
     process.env.GAIUS_SMOKE_CHUNK_BATCH_DESIRED_RATE || "10",
   );
+  const cooperativePumpExpected = process.env.GAIUS_SMOKE_EXPECT_COOPERATIVE_PUMP === "1";
   const maximumGameplayStallMs = Number(
     process.env.GAIUS_SMOKE_MAX_GAMEPLAY_STALL_MS || "500",
   );
@@ -324,15 +626,15 @@ if (isMainThread) {
   const cpuProfileDurationMs = Number(
     process.env.GAIUS_SMOKE_CPU_PROFILE_DURATION_MS || "15000",
   );
-  const cpuProfilePath = process.env.GAIUS_SMOKE_CPU_PROFILE_PATH ||
-    (rootDirectory + "port/target/singleplayer-worker-" +
+  const cpuProfilePath = nativePath(process.env.GAIUS_SMOKE_CPU_PROFILE_PATH) ||
+    (buildDirectory + "/singleplayer-worker-" +
       cpuProfilePhase.replace(/[^a-z0-9._-]+/gi, "-") + ".cpuprofile");
   const coveragePhase = process.env.GAIUS_SMOKE_COVERAGE_PHASE || "";
   const coverageDurationMs = Number(
     process.env.GAIUS_SMOKE_COVERAGE_DURATION_MS || "10000",
   );
-  const coveragePath = process.env.GAIUS_SMOKE_COVERAGE_PATH ||
-    (rootDirectory + "port/target/singleplayer-worker-" +
+  const coveragePath = nativePath(process.env.GAIUS_SMOKE_COVERAGE_PATH) ||
+    (buildDirectory + "/singleplayer-worker-" +
       coveragePhase.replace(/[^a-z0-9._-]+/gi, "-") + "-coverage.json");
   if (!Number.isFinite(maximumGameplayStallMs) || maximumGameplayStallMs <= 0) {
     throw new Error("GAIUS_SMOKE_MAX_GAMEPLAY_STALL_MS must be a positive number");
@@ -393,7 +695,7 @@ if (isMainThread) {
   const worker = new Worker(new URL(import.meta.url), {workerData: {runtime: true}});
   const {port1, port2} = new MessageChannel();
   const sessionId = "0123456789abcdef0123456789abcdef";
-  const profileId = "00000000000040008000000000000002";
+  const clientProfileId = "00000000000040008000000000000002";
   const expectedStagedDistances = `1/1->${targetRenderDistance}/${targetSimulationDistance}`;
   const expectedTransitions = [];
   let expectedViewDistance = Math.min(targetRenderDistance, 2);
@@ -412,7 +714,7 @@ if (isMainThread) {
   const expectedDistanceRamp = expectedTransitions.slice(0, -1);
   const distanceRamp = [];
   const distanceTransitionTimeline = [];
-  const protocol = createProtocolClient(port2, sessionId, profileId, {
+  const protocol = createProtocolClient(port2, sessionId, clientProfileId, {
     skipMining,
     roamSteps,
     roamStepBlocks,
@@ -468,6 +770,7 @@ if (isMainThread) {
   let latestChunkPriorityStats = null;
   let latestNetworkStats = null;
   let latestWorldgenStats = null;
+  let latestStorageStats = null;
   let lastWorldgenTraceAt = 0;
   let workerExited = false;
   let stopFlowStarted = false;
@@ -630,7 +933,16 @@ if (isMainThread) {
     samples,
     directResponseCount,
     fallbackUsed,
+    baselineNetworkStats = null,
   ) => {
+    const baselineTaskPending = baselineNetworkStats !== null &&
+      baselineNetworkStats.integratedServerTaskPending === 1;
+    const boundarySample = samples.find((sample) =>
+      sample.available && sample.networkStats !== null);
+    const boundarySampleTaskPending = boundarySample !== undefined &&
+      boundarySample.networkStats.integratedServerTaskPending === 1;
+    const initialIntegratedServerTaskPending = baselineTaskPending ||
+      boundarySampleTaskPending ? 1 : 0;
     const availableSamples = samples.filter((sample) => sample.available);
     const stableSamples = samples.slice(-telemetryBarrierSampleCount);
     const completeStableSamples = stableSamples.filter((sample) =>
@@ -644,7 +956,10 @@ if (isMainThread) {
       sample.networkStats !== null);
     const selectedValidation = validateNetworkTaskTelemetry(
       selectedSample === undefined ? null : selectedSample.networkStats,
-      {requireDrained: true},
+      {
+        requireDrained: true,
+        initialIntegratedServerTaskPending,
+      },
     );
     const drained = selectedValidation.fieldComplete &&
       selectedValidation.nonIntegerFields.length === 0 &&
@@ -655,6 +970,7 @@ if (isMainThread) {
       source,
       directResponseCount,
       fallbackUsed,
+      initialIntegratedServerTaskPending,
       available: availableSamples.length > 0,
       stable,
       drained,
@@ -678,12 +994,37 @@ if (isMainThread) {
       networkStats: selectedSample === undefined
         ? null
         : copyObjectSnapshot(selectedSample.networkStats),
+      // Auxiliary telemetry is diagnostic only.  Keep stability and drain
+      // decisions network-only, but return the newest detached snapshots so
+      // reset-window callers cannot fall back to an older cached window.
+      chunkPriorityStats: recentTelemetryAuxiliarySnapshot(
+        samples,
+        "chunkPriorityStats",
+        latestChunkPriorityStats,
+      ),
+      worldgenStats: recentTelemetryAuxiliarySnapshot(
+        samples,
+        "worldgenStats",
+        latestWorldgenStats,
+      ),
+      storageStats: recentTelemetryAuxiliarySnapshot(
+        samples,
+        "storageStats",
+        latestStorageStats,
+      ),
     };
   };
   const waitForTelemetrySample = () => new Promise((resolve) => {
     setTimeout(resolve, telemetryBarrierSampleDelayMs);
   });
   const requestNetworkTelemetryBarrier = async (stage) => {
+    // Capture the raw cumulative gauge before the first telemetry pong resets
+    // the worker's measurement baseline.  The pong counters are then deltas,
+    // so this preserves whether one task was already in flight at the window
+    // boundary without weakening ordinary counter relationships.  The first
+    // pong's raw pending gauge is also retained because a task can be queued
+    // between the last event-loop probe and the baseline reset.
+    const baselineNetworkStats = copyObjectSnapshot(latestNetworkStats);
     const directSamples = [];
     for (let index = 0; index < telemetryBarrierMaxAttempts; index++) {
       const sample = await requestTelemetryPong(stage + "-direct-" + (index + 1));
@@ -701,6 +1042,7 @@ if (isMainThread) {
         directSamples,
         directSamples.length,
         false,
+        baselineNetworkStats,
       );
       if (barrier.stable && barrier.drained) {
         return barrier;
@@ -719,6 +1061,7 @@ if (isMainThread) {
         directSamples,
         directSamples.length,
         false,
+        baselineNetworkStats,
       );
     }
     const nodeSamples = [];
@@ -735,6 +1078,7 @@ if (isMainThread) {
         nodeSamples,
         directSamples.length,
         true,
+        baselineNetworkStats,
       );
       if (barrier.stable && barrier.drained) {
         return barrier;
@@ -750,6 +1094,7 @@ if (isMainThread) {
         nodeSamples,
         directSamples.length,
         true,
+        baselineNetworkStats,
       );
     }
     return makeNetworkTelemetryBarrier(
@@ -758,6 +1103,7 @@ if (isMainThread) {
       directSamples,
       directSamples.length,
       false,
+      baselineNetworkStats,
     );
   };
   const completionReady = () => protocolReady &&
@@ -796,6 +1142,11 @@ if (isMainThread) {
     if (preStopTelemetryBarrier.networkStats !== null) {
       latestNetworkStats = copyObjectSnapshot(preStopTelemetryBarrier.networkStats);
     }
+    latestChunkPriorityStats = copyObjectSnapshot(
+      preStopTelemetryBarrier.chunkPriorityStats,
+    );
+    latestWorldgenStats = copyObjectSnapshot(preStopTelemetryBarrier.worldgenStats);
+    latestStorageStats = copyObjectSnapshot(preStopTelemetryBarrier.storageStats);
     await finishCpuProfileBeforeShutdown();
     if (finished) {
       return;
@@ -853,18 +1204,36 @@ if (isMainThread) {
       finalNetworkStats = copyObjectSnapshot(postStopTelemetryBarrier.networkStats);
       finalNetworkSource = "post-stopped-barrier-pre-stop-unavailable";
     }
+    const finalAuxiliaryBarrier = preStopTelemetryBarrier !== null
+      ? preStopTelemetryBarrier
+      : postStopTelemetryBarrier;
+    if (finalAuxiliaryBarrier !== null) {
+      latestChunkPriorityStats = copyObjectSnapshot(
+        finalAuxiliaryBarrier.chunkPriorityStats,
+      );
+      latestWorldgenStats = copyObjectSnapshot(finalAuxiliaryBarrier.worldgenStats);
+      latestStorageStats = copyObjectSnapshot(finalAuxiliaryBarrier.storageStats);
+    }
     latestNetworkStats = finalNetworkStats === null
       ? null
       : copyObjectSnapshot(finalNetworkStats);
-    const networkValidation = validateNetworkTaskTelemetry(finalNetworkStats, {
-      requireActivity: true,
-      requireDrained: true,
-      requireHealthy: true,
-    });
+    const cooperativePumpMode = resolveCooperativePumpMode(
+      finalNetworkStats,
+      cooperativePumpExpected,
+    );
     const selectedBarrier = preStopTelemetryBarrier !== null &&
         preStopTelemetryBarrier.networkStats !== null
       ? preStopTelemetryBarrier
       : postStopTelemetryBarrier;
+    const networkValidation = validateNetworkTaskTelemetry(finalNetworkStats, {
+      requireActivity: cooperativePumpMode.requireActivity,
+      requireDrained: true,
+      initialIntegratedServerTaskPending: selectedBarrier === null
+        ? 0
+        : selectedBarrier.initialIntegratedServerTaskPending,
+      requireHealthy: true,
+    });
+    networkValidation.cooperativePumpMode = cooperativePumpMode;
     if (!selectedBarrier || !selectedBarrier.stable) {
       networkValidation.healthErrors.push("final network telemetry barrier was not stable");
       networkValidation.valid = false;
@@ -888,10 +1257,22 @@ if (isMainThread) {
         postStopped: postStopTelemetryBarrier,
       },
       worldgenStats: latestWorldgenStats,
+      storageStats: latestStorageStats,
     });
     const sortedProbeLatencies = eventLoopProbeLatenciesMs.slice().sort((left, right) => left - right);
     const phaseLatencies = summarizeProbePhases(eventLoopProbeSamples);
     const gameplayLatency = summarizeGameplayProbeLatencies(eventLoopProbeSamples);
+    const afterProtocolReadyGameplayLatency = summarizeGameplayProbeLatencies(
+      eventLoopProbeSamples.filter((sample) => sample.startedAt >= protocolReadyAt),
+    );
+    // Worker direct-executor mode does not promise cooperative pump activity.
+    // Its meaningful stall window starts after the client is protocol-ready;
+    // startup/worldgen work before that point is intentionally staged.  When
+    // the cooperative pump is expected or observed, retain the stricter full
+    // gameplay window so regressions cannot hide behind protocol readiness.
+    const stallValidation = cooperativePumpMode.requireActivity
+      ? gameplayLatency
+      : afterProtocolReadyGameplayLatency;
     events.push({
       type: "worker-event-loop-latency",
       samples: sortedProbeLatencies.length,
@@ -910,14 +1291,23 @@ if (isMainThread) {
       afterServerCreated: summarizeProbeLatencies(eventLoopProbeSamples, serverCreatedAt),
       afterProtocolReady: summarizeProbeLatencies(eventLoopProbeSamples, protocolReadyAt),
       gameplay: gameplayLatency,
+      stallValidation,
+      stallValidationScope: cooperativePumpMode.requireActivity
+        ? "all-gameplay"
+        : "after-protocol-ready",
       byPhase: phaseLatencies,
       pending: eventLoopProbeStartedAt.size,
     });
-    if (gameplayLatency.maxMs > maximumGameplayStallMs) {
+    if (stallValidation.maxMs > maximumGameplayStallMs) {
       events.push({
         type: "worldgen-event-loop-stall",
         maximumGameplayStallMs,
-        gameplayLatency,
+        gameplayLatency: stallValidation,
+        allGameplayLatency: gameplayLatency,
+        afterProtocolReadyGameplayLatency,
+        stallValidationScope: cooperativePumpMode.requireActivity
+          ? "all-gameplay"
+          : "after-protocol-ready",
       });
       clearTimeout(timeout);
       finish(1);
@@ -1011,6 +1401,7 @@ if (isMainThread) {
       chunkPriorityStats: latestChunkPriorityStats,
       networkStats: latestNetworkStats,
       worldgenStats: latestWorldgenStats,
+      storageStats: latestStorageStats,
       distanceRampIntervalMillis: configuredDistanceRampIntervalMillis,
       ...protocol.snapshot(),
     });
@@ -1049,6 +1440,23 @@ if (isMainThread) {
       pendingTelemetryPongs.delete(sequence);
       if (pending.timer) clearTimeout(pending.timer);
       const sessionMatches = message.sessionId === sessionId;
+      const telemetrySnapshots = snapshotTelemetryPong(message);
+      if (sessionMatches) {
+        const latest = updateLatestTelemetrySnapshots(
+          {
+            chunkPriorityStats: latestChunkPriorityStats,
+            networkStats: latestNetworkStats,
+            worldgenStats: latestWorldgenStats,
+            storageStats: latestStorageStats,
+          },
+          message,
+          sessionId,
+        );
+        latestChunkPriorityStats = latest.chunkPriorityStats;
+        latestNetworkStats = latest.networkStats;
+        latestWorldgenStats = latest.worldgenStats;
+        latestStorageStats = latest.storageStats;
+      }
       pending.resolve({
         available: sessionMatches,
         source: "telemetry-pong",
@@ -1056,7 +1464,7 @@ if (isMainThread) {
         sequence,
         receivedAt: Date.now(),
         reason: sessionMatches ? undefined : "session-mismatch",
-        networkStats: copyObjectSnapshot(message.network),
+        ...telemetrySnapshots,
       });
       return;
     }
@@ -1118,6 +1526,14 @@ if (isMainThread) {
             networkStats: message.networkStats !== null &&
               message.networkStats !== undefined
               ? copyObjectSnapshot(message.networkStats)
+              : null,
+            chunkPriorityStats: message.chunkPriorityStats !== null &&
+              message.chunkPriorityStats !== undefined
+              ? copyObjectSnapshot(message.chunkPriorityStats)
+              : null,
+            worldgenStats: message.worldgenStats !== null &&
+              message.worldgenStats !== undefined
+              ? copyObjectSnapshot(message.worldgenStats)
               : null,
           });
         }
@@ -1269,6 +1685,13 @@ if (isMainThread) {
     worldId: "gaius-node-runtime-smoke",
     seed: process.env.GAIUS_SMOKE_SEED || "gaius-runtime-smoke-v1",
     sessionId,
+    launchGeneration: "1",
+    profileId: storageConfig.profileId,
+    worldVersion: storageConfig.worldVersion,
+    storageSchema: storageConfig.storageSchema,
+    storageDatabaseName: storageConfig.storageDatabaseName,
+    storagePrefix: storageConfig.storagePrefix,
+    storageOpfsDirectory: storageConfig.storageOpfsDirectory,
     renderDistance: 8,
     simulationDistance: 5,
     distanceRampIntervalMillis: distanceRampIntervalMillis === undefined

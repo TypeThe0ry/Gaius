@@ -201,11 +201,14 @@ def write_text_atomically(target: Path, text: str) -> None:
             os.fsync(temporary.fileno())
         os.replace(temporary_name, target)
         temporary_name = None
-        directory_fd = os.open(target.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        # Windows cannot open a directory for fsync; the replace above is still
+        # atomic, so durability of the directory entry is best-effort there.
+        if os.name != "nt":
+            directory_fd = os.open(target.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     finally:
         if temporary_name is not None:
             try:

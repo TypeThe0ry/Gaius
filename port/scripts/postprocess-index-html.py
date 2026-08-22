@@ -16,6 +16,13 @@ import sys
 from pathlib import Path
 
 
+def native_external_path(value: str) -> Path:
+    """Accept Git-Bash /c/... paths when Python runs on Windows."""
+    if os.name == "nt" and re.match(r"^/[A-Za-z](?:/|$)", value):
+        value = f"{value[1].upper()}:{value[2:]}"
+    return Path(value).expanduser()
+
+
 def replace_required(text: str, old: str, new: str, label: str) -> str:
     if old in text:
         return text.replace(old, new, 1)
@@ -718,12 +725,163 @@ def apply_gaius_client_shell(text: str) -> str:
     return text
 
 
+def validate_storage_profile(profile: dict) -> dict:
+    profile_id = profile.get("id")
+    if not isinstance(profile_id, str) or not profile_id:
+        raise RuntimeError("version profile id must be a non-empty string")
+    world_version = profile.get("worldVersion")
+    if not isinstance(world_version, int) or isinstance(world_version, bool) or world_version < 0:
+        raise RuntimeError(f"version profile {profile_id} has an invalid worldVersion")
+    storage = profile.get("storage")
+    if not isinstance(storage, dict):
+        raise RuntimeError(f"version profile {profile_id} storage must be an object")
+    schema = storage.get("schema")
+    if not isinstance(schema, int) or isinstance(schema, bool) or schema != 2:
+        raise RuntimeError(
+            f"version profile {profile_id} storage.schema must be exactly 2 "
+            f"(received {schema!r})"
+        )
+    expected = {
+        "databaseName": f"gaius-fs-v2-{profile_id}",
+        "prefix": f"gaius.fs.v2:{profile_id}:",
+        "opfsDirectory": f"regions-v2-{profile_id}",
+    }
+    for key, expected_value in expected.items():
+        value = storage.get(key)
+        if not isinstance(value, str) or not value:
+            raise RuntimeError(f"version profile {profile_id} storage.{key} must be non-empty")
+        if value != expected_value:
+            raise RuntimeError(
+                f"version profile {profile_id} storage.{key} must be exactly "
+                f"{expected_value!r} (received {value!r})"
+            )
+    return storage
+
+
+def load_profile_for_version(minecraft_version: str) -> dict:
+    root = Path(__file__).resolve().parents[2]
+    versions_directory = (root / "port" / "versions").resolve()
+    candidates: list[Path] = []
+    configured = os.environ.get("GAIUS_VERSION_PROFILE_PATH", "").strip()
+    if configured:
+        configured_path = native_external_path(configured.replace("\\", "/"))
+        if not configured_path.is_absolute():
+            configured_path = root / "port" / configured_path
+        candidates.append(configured_path)
+    config_path = root / "port" / "config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        relative = config.get("versionProfile")
+        if isinstance(relative, str) and relative:
+            candidates.append(root / "port" / relative)
+    except (OSError, ValueError, TypeError):
+        pass
+    candidates.extend(sorted(versions_directory.glob("*.json")))
+    seen: set[Path] = set()
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate in seen or not candidate.is_file():
+            continue
+        seen.add(candidate)
+        try:
+            profile = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if isinstance(profile, dict) and profile.get("id") == minecraft_version:
+            validate_storage_profile(profile)
+            return profile
+    raise RuntimeError(f"version profile is missing for {minecraft_version}")
+
+
+def patch_storage_persistence(text: str, profile: dict) -> str:
+    """Apply the profile storage namespace without touching legacy data."""
+    storage = validate_storage_profile(profile)
+    schema = int(storage["schema"])
+    prefix = json.dumps(storage["prefix"], ensure_ascii=True)
+    database_name = json.dumps(storage["databaseName"], ensure_ascii=True)
+    opfs_directory = json.dumps(storage["opfsDirectory"], ensure_ascii=True)
+
+    # The persistence bootstrap is generated into dist/index.html. Restrict
+    # replacements to that IIFE so unrelated launcher variables named `prefix`
+    # cannot be changed accidentally.
+    marker = "(function installPersistentFsBootstrap() {"
+    start = text.find(marker)
+    if start >= 0:
+        end = text.find("</script>", start)
+        if end < 0:
+            raise RuntimeError("index.html persistence bootstrap is unterminated")
+        end += len("</script>")
+        block = text[start:end]
+        block, prefix_count = re.subn(
+            r'(\b(?:const|let|var)\s+prefix\s*=\s*)["\'][^"\']*["\']\s*;',
+            rf'\g<1>{prefix};',
+            block,
+            count=1,
+        )
+        block, database_count = re.subn(
+            r'(\b(?:const|let|var)\s+dbName\s*=\s*)["\'][^"\']*["\']\s*;',
+            rf'\g<1>{database_name};',
+            block,
+            count=1,
+        )
+        block, opfs_count = re.subn(
+            r'(\b(?:const|let|var)\s+opfsDirectory\s*=\s*)["\'][^"\']*["\']\s*;',
+            rf'\g<1>{opfs_directory};',
+            block,
+            count=1,
+        )
+        if opfs_count == 0 and database_count:
+            block = re.sub(
+                r'(?m)^(\s*(?:const|let|var)\s+dbName\s*=.*\n)',
+                rf'\1      const opfsDirectory = {opfs_directory};\n',
+                block,
+                count=1,
+            )
+        block = re.sub(
+            r'(indexedDB\.open\(\s*dbName\s*,\s*)\d+(\s*\))',
+            rf'\g<1>{schema}\g<2>',
+            block,
+        )
+        text = text[:start] + block + text[end:]
+        if prefix_count == 0 or database_count == 0:
+            # A future bootstrap may use profile globals instead of local
+            # constants. The globals below remain the authoritative contract.
+            pass
+
+    globals_block = (
+        '  <script data-gaius-storage-profile="v2">\n'
+        f'    window.__gaiusProfileId = {json.dumps(profile["id"], ensure_ascii=True)};\n'
+        f'    window.__gaiusWorldVersion = {int(profile["worldVersion"])};\n'
+        f'    window.__gaiusStorageSchema = {schema};\n'
+        f'    window.__gaiusStorageDatabaseName = {database_name};\n'
+        f'    window.__gaiusStoragePrefix = {prefix};\n'
+        f'    window.__gaiusStorageOpfsDirectory = {opfs_directory};\n'
+        '  </script>\n'
+    )
+    script_pattern = re.compile(
+        r'  <script data-gaius-storage-profile="v2">.*?</script>\n',
+        flags=re.DOTALL,
+    )
+    # These globals are consumed by the persistence bootstrap itself and by
+    # BrowserFilePersistence during Java class initialization.  Put them before
+    # that IIFE rather than at the end of <body>; an async boot can otherwise
+    # observe an unconfigured profile before the trailing script executes.
+    text = script_pattern.sub("", text)
+    persistence = text.find(marker)
+    insertion = text.rfind("<script", 0, persistence) if persistence >= 0 else -1
+    if insertion < 0:
+        raise RuntimeError("index.html persistence bootstrap script was not found")
+    text = text[:insertion] + globals_block + text[insertion:]
+    return text
+
+
 
 def patch_index(
     index: Path,
     classes_js: Path,
     minecraft_version: str = "1.21.11",
     asset_index_id: str | None = None,
+    profile: dict | None = None,
 ) -> bool:
     asset_index_id = asset_index_id or minecraft_version
     build_token = content_token(classes_js)
@@ -735,6 +893,16 @@ def patch_index(
     text = index.read_text(encoding="utf-8")
     original = text
     text = migrate_text_shader_diagnostics(text)
+    selected_profile = profile or load_profile_for_version(minecraft_version)
+    # The historical replacement templates below are intentionally written
+    # against IndexedDB version 1. Normalize an already profile-patched page
+    # before applying those idempotent migrations; patch_storage_persistence()
+    # restores the selected profile schema at the end.
+    text = re.sub(
+        r"indexedDB\.open\(\s*dbName\s*,\s*\d+\s*\)",
+        "indexedDB.open(dbName, 1)",
+        text,
+    )
 
     vanilla_assets_loader = '''    const vanillaAssetsToken = "__VANILLA_ASSETS_TOKEN__";
     function hasGaiusVanillaAssetsMagic(bytes) {
@@ -1825,9 +1993,11 @@ def patch_index(
             "fs ready timing",
         )
 
-    # Do not hydrate region files into the title-screen filesystem. World
-    # metadata remains available for the world picker; the selected world's
-    # complete data is loaded by the dedicated integrated-server Worker.
+    # Do not hydrate region files into the title-screen filesystem. The small
+    # world metadata needed while opening a saved world remains available for
+    # the client (notably data/minecraft/world_gen_settings.dat); the selected
+    # world's complete data is loaded by the dedicated integrated-server
+    # Worker.
     if "function isClientBootstrapPath(path)" not in text:
         text = replace_required(
             text,
@@ -1840,11 +2010,25 @@ def patch_index(
             "        if (worldSeparator < 0 || worldSeparator + 1 >= path.length) return false;\n"
             "        const relative = path.slice(worldSeparator + 1);\n"
             "        return relative === \"level.dat\" || relative === \"level.dat_old\" ||\n"
-            "          relative === \"icon.png\";\n"
+            "          relative === \"icon.png\" ||\n"
+            "          relative === \"data/minecraft/world_gen_settings.dat\";\n"
             "      }\n\n"
             "      function openDatabase() {\n",
             "client IndexedDB bootstrap filter",
         )
+    elif 'relative === "data/minecraft/world_gen_settings.dat"' not in text:
+        # Migrate an already-postprocessed launcher from the old metadata
+        # allowlist. This keeps the patch effective on an existing dist tree;
+        # the guard above alone would otherwise leave world-gen settings out
+        # forever after the first postprocess pass.
+        text = replace_required(
+            text,
+            '          relative === "icon.png";\n',
+            '          relative === "icon.png" ||\n'
+            '          relative === "data/minecraft/world_gen_settings.dat";\n',
+            "client IndexedDB bootstrap world-gen metadata migration",
+        )
+    if '              files[normalize(value.path)] = value.value;\n' in text:
         text = replace_required(
             text,
             '            if (value && typeof value.path === "string" && typeof value.value === "string") {\n'
@@ -1856,6 +2040,7 @@ def patch_index(
             "            }\n",
             "client IndexedDB read filter",
         )
+    if "              files[path] = value;\n              migrated++;\n" in text:
         text = replace_required(
             text,
             "              files[path] = value;\n"
@@ -1864,6 +2049,7 @@ def patch_index(
             "              migrated++;\n",
             "client IndexedDB migration filter",
         )
+    if '                files[normalize(key.substring(prefix.length))] = value;\n' in text:
         text = replace_required(
             text,
             '              if (typeof value === "string") {\n'
@@ -2772,6 +2958,7 @@ def patch_index(
     if asset_index_argument_count != 1:
         raise RuntimeError("index.html patch point was not found: asset index argument")
 
+    text = patch_storage_persistence(text, selected_profile)
     text = apply_gaius_client_shell(text)
 
     if text != original:
@@ -2781,12 +2968,30 @@ def patch_index(
 
 
 def version_defaults() -> tuple[str, str]:
-    minecraft_version = os.environ.get("GAIUS_MINECRAFT_VERSION", "1.21.11").strip()
+    minecraft_version = os.environ.get("GAIUS_MINECRAFT_VERSION", "").strip()
     asset_index_id = os.environ.get("GAIUS_ASSET_INDEX_ID", "").strip()
     metadata_path = os.environ.get("GAIUS_VERSION_METADATA", "").strip()
+    if not minecraft_version:
+        try:
+            root = Path(__file__).resolve().parents[2]
+            config = json.loads((root / "port" / "config.json").read_text(encoding="utf-8"))
+            relative_profile = (
+                os.environ.get("GAIUS_VERSION_PROFILE_PATH")
+                or config.get("versionProfile")
+            )
+            profile = json.loads(
+                (root / "port" / relative_profile).read_text(encoding="utf-8")
+            )
+            minecraft_version = str(profile.get("id") or "").strip()
+            if not metadata_path:
+                metadata_path = str(root / "port" / "work" / minecraft_version / "version.json")
+        except (OSError, ValueError, TypeError, AttributeError):
+            minecraft_version = ""
+    if not minecraft_version:
+        minecraft_version = "1.21.11"
     if not asset_index_id and metadata_path:
         try:
-            metadata = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+            metadata = json.loads(native_external_path(metadata_path).read_text(encoding="utf-8"))
             asset_index_id = str(
                 metadata.get("assetIndex", {}).get("id") or metadata.get("assets") or ""
             ).strip()
@@ -2796,10 +3001,10 @@ def version_defaults() -> tuple[str, str]:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) not in (3, 5):
+    if len(argv) not in (3, 4, 5):
         print(
             "usage: postprocess-index-html.py <index.html> <classes.js> "
-            "[<minecraft-version> <asset-index-id>]",
+            "[<minecraft-version> [<asset-index-id>]]",
             file=sys.stderr,
         )
         return 2
@@ -2807,9 +3012,22 @@ def main(argv: list[str]) -> int:
     index = Path(argv[1])
     classes_js = Path(argv[2])
     minecraft_version, asset_index_id = version_defaults()
-    if len(argv) == 5:
+    explicit_asset_index = len(argv) == 5
+    if len(argv) in (4, 5):
         minecraft_version = argv[3].strip()
-        asset_index_id = argv[4].strip()
+        asset_index_id = argv[4].strip() if explicit_asset_index else ""
+    try:
+        profile = load_profile_for_version(minecraft_version)
+    except RuntimeError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    if not explicit_asset_index:
+        official = profile.get("official")
+        profile_asset_index = official.get("assetIndexId") if isinstance(official, dict) else None
+        if isinstance(profile_asset_index, (str, int)) and str(profile_asset_index):
+            asset_index_id = str(profile_asset_index)
+    if not asset_index_id:
+        asset_index_id = minecraft_version
     identifier = re.compile(r"^[A-Za-z0-9._+-]+$")
     if not identifier.fullmatch(minecraft_version) or not identifier.fullmatch(asset_index_id):
         print("invalid Minecraft version or asset index identifier", file=sys.stderr)
@@ -2821,7 +3039,7 @@ def main(argv: list[str]) -> int:
         print(f"missing classes.js: {classes_js}", file=sys.stderr)
         return 1
 
-    changed = patch_index(index, classes_js, minecraft_version, asset_index_id)
+    changed = patch_index(index, classes_js, minecraft_version, asset_index_id, profile)
     status = "Patched" if changed else "Index already patched"
     print(f"{status}: {index}")
     return 0

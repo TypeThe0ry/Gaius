@@ -4,7 +4,6 @@ const SERVER_PORT = 25565;
 const PROFILE_ID = "00000000000040008000000000000002";
 const SMOKE_TIMEOUT_MS = 240000;
 const STOP_TIMEOUT_MS = 30000;
-const DB_NAME = "gaius-fs-v1";
 const STORE_NAME = "files";
 const PLAY_PROTOCOLS = Object.freeze({
   774: Object.freeze({
@@ -46,6 +45,7 @@ const smokeState = globalThis.__gaiusSingleplayerWorkerSmoke = {
   state: "idle",
   versionProfile: null,
   protocolVersion: null,
+  storage: null,
   events: [],
   compressionThreshold: null,
   loginFinished: false,
@@ -81,6 +81,7 @@ async function runSmoke() {
   let stopped;
   let distancesActive;
   let worldId;
+  let storage;
   try {
     requireBrowserFeature("Worker", globalThis.Worker);
     requireBrowserFeature("MessageChannel", globalThis.MessageChannel);
@@ -102,6 +103,8 @@ async function runSmoke() {
     }
     smokeState.versionProfile = activeVersionProfile.id;
     smokeState.protocolVersion = activeProtocolVersion;
+    storage = storageConfigForProfile(activeVersionProfile);
+    smokeState.storage = storage;
 
     const version = new URLSearchParams(location.search).get("v") || "worker-smoke-v1";
     const workerUrl = new URL("../dist/singleplayer-server-worker.js", location.href);
@@ -151,8 +154,15 @@ async function runSmoke() {
     worker.postMessage({
       type: "start",
       sessionId,
+      launchGeneration: "1",
       worldId,
       newWorld: true,
+      profileId: storage.profileId,
+      worldVersion: storage.worldVersion,
+      storageSchema: storage.storageSchema,
+      storageDatabaseName: storage.storageDatabaseName,
+      storagePrefix: storage.storagePrefix,
+      storageOpfsDirectory: storage.storageOpfsDirectory,
       renderDistance: 8,
       simulationDistance: 5,
       port: channel.port2,
@@ -188,7 +198,10 @@ async function runSmoke() {
     worker = undefined;
     clientPort = undefined;
 
-    smokeState.removedWorldFiles = await removeSmokeWorld(worldId);
+    smokeState.removedWorldFiles = await removeSmokeWorld(
+      worldId,
+      storage.storageDatabaseName,
+    );
     smokeState.finishedAt = Date.now();
     setState("passed", "Gaius singleplayer Worker smoke passed");
     record("result", "passed", JSON.stringify({
@@ -222,9 +235,12 @@ async function runSmoke() {
     if (clientPort) {
       clientPort.close();
     }
-    if (worldId) {
+    if (worldId && storage) {
       try {
-        smokeState.removedWorldFiles = await removeSmokeWorld(worldId);
+        smokeState.removedWorldFiles = await removeSmokeWorld(
+          worldId,
+          storage.storageDatabaseName,
+        );
       } catch (cleanupError) {
         record("cleanup", "failed", String(cleanupError));
       }
@@ -493,6 +509,30 @@ async function loadActiveVersionProfile() {
   return activeVersionProfile;
 }
 
+function storageConfigForProfile(profile) {
+  const profileId = String(profile?.id || "");
+  const worldVersion = Number(profile?.worldVersion);
+  const storage = profile?.storage || {};
+  const result = {
+    profileId,
+    worldVersion,
+    storageSchema: Number(storage.schema),
+    storageDatabaseName: String(storage.databaseName || ""),
+    storagePrefix: String(storage.prefix || ""),
+    storageOpfsDirectory: String(storage.opfsDirectory || ""),
+  };
+  if (!result.profileId || !Number.isSafeInteger(result.worldVersion) ||
+      result.worldVersion <= 0 || result.storageSchema !== 2 ||
+      result.storageDatabaseName !== `gaius-fs-v2-${result.profileId}` ||
+      result.storagePrefix !== `gaius.fs.v2:${result.profileId}:` ||
+      result.storageOpfsDirectory !== `regions-v2-${result.profileId}`) {
+    throw new Error(
+      "The active client version profile has an invalid schema-2 storage namespace",
+    );
+  }
+  return Object.freeze(result);
+}
+
 function encodePacket(id, payload, compressionThreshold) {
   const packet = concatenate(encodeVarInt(id), payload);
   let body = packet;
@@ -603,8 +643,8 @@ function randomSessionId() {
   return value;
 }
 
-async function removeSmokeWorld(worldId) {
-  const database = await openDatabase();
+async function removeSmokeWorld(worldId, storageDatabaseName) {
+  const database = await openDatabase(storageDatabaseName);
   const prefix = "/gaius/saves/" + worldId;
   let removed = 0;
   await new Promise((resolve, reject) => {
@@ -631,9 +671,9 @@ async function removeSmokeWorld(worldId) {
   return removed;
 }
 
-function openDatabase() {
+function openDatabase(storageDatabaseName) {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 1);
+    const request = indexedDB.open(storageDatabaseName, 2);
     request.onupgradeneeded = () => {
       const database = request.result;
       if (!database.objectStoreNames.contains(STORE_NAME)) {
@@ -688,6 +728,7 @@ function resetState() {
   smokeState.events.length = 0;
   smokeState.versionProfile = null;
   smokeState.protocolVersion = null;
+  smokeState.storage = null;
   smokeState.compressionThreshold = null;
   smokeState.loginFinished = false;
   smokeState.configurationPackets = 0;

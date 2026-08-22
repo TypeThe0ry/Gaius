@@ -8,12 +8,32 @@ import path from "node:path";
 import {fileURLToPath} from "node:url";
 
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
-const version = "26.2";
+const nativePath = (value) => {
+  if (!value) return value;
+  const text = String(value);
+  return process.platform === "win32" && /^\/[A-Za-z](?:\/|$)/.test(text)
+    ? `${text[1].toUpperCase()}:${text.slice(2)}` : text;
+};
+const profileIdFromPath = (value) => path.basename(nativePath(value).replaceAll("\\", "/"))
+  .replace(/\.json$/, "");
+const overlayProfileId = process.env.GAIUS_OVERLAY_DIRECTORY
+  ? profileIdFromPath(process.env.GAIUS_OVERLAY_DIRECTORY) : "";
+const version = process.env.GAIUS_MINECRAFT_VERSION
+  || (process.env.GAIUS_VERSION_PROFILE_PATH
+    ? profileIdFromPath(process.env.GAIUS_VERSION_PROFILE_PATH)
+    : (/^\d+(?:\.\d+)+$/.test(overlayProfileId) ? overlayProfileId : "26.2"));
+if (version !== "26.2") {
+  throw new Error(`GPU fence retire smoke is 26.2-only; got profile ${version}`);
+}
 const workRoot = path.join(repositoryRoot, "port/work", version);
+const overlayRoot = nativePath(process.env.GAIUS_OVERLAY_DIRECTORY || path.join(
+  repositoryRoot, "port/work/overlays",
+  process.env.GAIUS_BUILD_ROOT || process.env.GAIUS_VERSION_PROFILE_PATH ? version : "",
+));
 const baseClient = path.join(workRoot, "client-named.jar");
 const overlayClient = path.join(
-  repositoryRoot,
-  `port/work/overlays/client-named-${version}-gaius.jar`,
+  overlayRoot,
+  `client-named-${version}-gaius.jar`,
 );
 const patcherSource = path.join(
   repositoryRoot,
@@ -24,12 +44,12 @@ const browserOpenGlSource = path.join(
   "port/overrides/libraries/lwjgl-opengl/src/main/java/org/lwjgl/opengl/BrowserOpenGL.java",
 );
 const lwjglOpenGl = path.join(
-  repositoryRoot,
-  "port/work/overlays/libraries/org/lwjgl/lwjgl-opengl/3.4.1/lwjgl-opengl-3.4.1.jar",
+  overlayRoot,
+  "libraries/org/lwjgl/lwjgl-opengl/3.4.1/lwjgl-opengl-3.4.1.jar",
 );
 const lwjglCore = path.join(
-  repositoryRoot,
-  "port/work/overlays/libraries/org/lwjgl/lwjgl/3.4.1/lwjgl-3.4.1-unsafe.jar",
+  overlayRoot,
+  "libraries/org/lwjgl/lwjgl/3.4.1/lwjgl-3.4.1-unsafe.jar",
 );
 
 function run(command, args, options = {}) {
@@ -44,8 +64,8 @@ function run(command, args, options = {}) {
 
 function selectJavaTools() {
   const homes = [
-    process.env.GAIUS_JAVA_HOME,
-    process.env.JAVA_HOME,
+    process.env.GAIUS_JAVA_HOME && nativePath(process.env.GAIUS_JAVA_HOME),
+    process.env.JAVA_HOME && nativePath(process.env.JAVA_HOME),
     "/opt/homebrew/opt/openjdk@25/libexec/openjdk.jdk/Contents/Home",
     "/usr/local/opt/openjdk@25/libexec/openjdk.jdk/Contents/Home",
   ].filter(Boolean);
@@ -171,10 +191,21 @@ try {
     patchedClasses,
   ], {stdio: ["ignore", "pipe", "pipe"]});
 
-  const runtimeClasspath = (await readFile(
+  let runtimeClasspath = (await readFile(
     path.join(workRoot, "classpath.txt"),
     "utf8",
   )).trim();
+  // classpath.txt is emitted by the Git-Bash build with ':' separators and
+  // MSYS /c/... paths.  Windows JDKs require ';' plus drive-letter paths;
+  // without this conversion javac silently drops the later jars (notably
+  // Brigadier), making the BrowserOpenGL compile fail for a missing Message.
+  if (process.platform === "win32") {
+    runtimeClasspath = runtimeClasspath
+      .split(":")
+      .filter(Boolean)
+      .map((entry) => entry.replace(/^\/([a-z])\//i, "$1:/"))
+      .join(path.delimiter);
+  }
   const teaVmJars = ["teavm-interop", "teavm-jso", "teavm-jso-apis"].map(
     artifact => path.join(
       homedir(),
@@ -328,7 +359,7 @@ const CONDITION_SATISFIED = 0x911C;
 const WAIT_FAILED = 0x911D;
 
 const initializeGpuFenceLifecycle = new Function(jsBodyBefore(
-  "private static native void initializeGpuFenceLifecycleJs();",
+  "private static native void initializeGpuFenceLifecycleJs(",
 ));
 const browserMarkNextFenceRetireOwned = new Function(jsBodyBefore(
   "public static native void markNextFenceRetireOwned();",
@@ -387,6 +418,9 @@ const mockWindow = {
   __gaiusGL: {next: 1, syncs: new Map()},
   __gaiusWebGL: mockGl,
   __gaiusGLStats: {},
+  // Keep the smoke process alive until assertions finish; production uses the
+  // scheduled reload, while this harness only verifies the quarantine signal.
+  __gaiusDisableGpuContextAutoReload: true,
   location: {reload() {}},
 };
 globalThis.window = mockWindow;
@@ -395,14 +429,35 @@ try {
     "GPU lifecycle JSBody did not initialize");
   assert.equal(webGlParameterReads, 1,
     "GPU maximum wait timeout was not cached during lifecycle initialization");
-  const state = mockWindow.__gaiusGL;
+  let state = mockWindow.__gaiusGL;
+  const originalGlMethods = new Map(
+    Object.keys(mockGl)
+      .filter((key) => typeof mockGl[key] === "function")
+      .map((key) => [key, mockGl[key]]),
+  );
 
   browserMarkNextFenceRetireOwned();
   mockGl.lost = true;
   assert.equal(browserFenceSync(0x9117, 0), 0,
     "context-lost fence creation unexpectedly succeeded");
+  // A real context loss quarantines the WebGL object and schedules a page
+  // reload; it must not be reused as though it were restored in-place.  Reset
+  // the mock to a fresh context before exercising normal timeout/signaled
+  // polling so this smoke tests both lifecycle halves without weakening the
+  // production quarantine contract.
   mockGl.lost = false;
-  state.gpuContextLost = false;
+  for (const [key, method] of originalGlMethods) {
+    Object.defineProperty(mockGl, key, {
+      configurable: true,
+      writable: true,
+      value: method,
+    });
+  }
+  mockWindow.__gaiusGL = {next: 1, syncs: new Map()};
+  mockWindow.__gaiusGLStats = {};
+  initializeGpuFenceLifecycle();
+  state = mockWindow.__gaiusGL;
+  const parameterReadsBeforePolling = webGlParameterReads;
   state.gpuBeginRetireFrame(0, 8);
   const unrelatedFence = browserFenceSync(0x9117, 0);
   state.gpuEndRetireFrame(0, false);
@@ -415,7 +470,7 @@ try {
   const firstFence = browserFenceSync(0x9117, 0);
   webGlWaitStatuses.push(TIMEOUT_EXPIRED, CONDITION_SATISFIED);
   assert.equal(browserClientWaitSync(firstFence, 1, 1_000_000), TIMEOUT_EXPIRED);
-  assert.equal(webGlParameterReads, 1,
+  assert.equal(webGlParameterReads, parameterReadsBeforePolling,
     "GPU fence poll performed a synchronous WebGL parameter read");
   assert.equal(webGlWaitCalls.at(-1).timeout, 0,
     "BrowserOpenGL passed a blocking timeout to WebGL");
@@ -439,16 +494,30 @@ try {
   assert.equal(state.syncs.has(lostFence), true, "context loss discarded the WebGL sync");
   assert.deepEqual(webGlDeleted, [1, 2], "context loss deleted a WebGL sync");
   assert.equal(mockWindow.__gaiusGLStats.gpuContextLossWaits, 1);
+  // Context loss is a quarantine boundary: the WebGL object remains unusable
+  // until the scheduled page reload, so polling the old sync must continue to
+  // return WAIT_FAILED rather than pretending the context recovered in-place.
   mockGl.lost = false;
-  state.gpuContextLost = false;
-  webGlWaitStatuses.push(ALREADY_SIGNALED);
-  assert.equal(browserClientWaitSync(lostFence, 0, 0), ALREADY_SIGNALED);
-  browserDeleteSync(lostFence);
-  browserDeleteSync(lostFence);
-  assert.deepEqual(webGlDeleted, [1, 2, 3], "recovered sync cleanup was not exact");
-  assert.equal(mockWindow.__gaiusGLStats.gpuFenceDuplicateDeletes, 1);
-  assert.equal(mockWindow.__gaiusGLStats.gpuEarlyResourceReuse, 0,
-    "recovered signaled retirement was reported as early reuse");
+  assert.equal(browserClientWaitSync(lostFence, 0, 0), WAIT_FAILED,
+    "quarantined context unexpectedly resumed fence polling");
+  assert.equal(webGlDeleted.length, 2,
+    "context-loss polling touched a WebGL sync after quarantine");
+
+  // Start a fresh mock context for the remaining retirement-ring assertions.
+  for (const [key, method] of originalGlMethods) {
+    Object.defineProperty(mockGl, key, {
+      configurable: true,
+      writable: true,
+      value: method,
+    });
+  }
+  mockGl.nextObject = 1;
+  webGlDeleted.length = 0;
+  webGlWaitStatuses.length = 0;
+  mockWindow.__gaiusGL = {next: 1, syncs: new Map()};
+  mockWindow.__gaiusGLStats = {};
+  initializeGpuFenceLifecycle();
+  state = mockWindow.__gaiusGL;
 
   state.gpuBeginRetireFrame(0, 8);
   browserMarkNextFenceRetireOwned();

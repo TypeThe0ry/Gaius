@@ -36,8 +36,7 @@ public final class LwjglUnsafeAccessPatcher {
                 if (!entry.getName().endsWith(".class")) {
                     continue;
                 }
-                if (entry.getName().equals("org/lwjgl/system/MemoryUtil.class")
-                        || entry.getName().equals("org/lwjgl/system/Pointer$Default.class")
+                if (entry.getName().equals("org/lwjgl/system/Pointer$Default.class")
                         || entry.getName().equals(
                                 "org/lwjgl/system/MultiReleaseTextDecoding.class")
                         || entry.getName().equals("org/lwjgl/system/Library.class")

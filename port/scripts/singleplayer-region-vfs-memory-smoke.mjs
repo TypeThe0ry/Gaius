@@ -1,10 +1,17 @@
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
 import {access, readFile} from "node:fs/promises";
+import {existsSync} from "node:fs";
 import {fileURLToPath} from "node:url";
 import path from "node:path";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const nativePath = (value) => {
+  if (!value) return value;
+  const text = String(value);
+  return process.platform === "win32" && /^\/[A-Za-z](?:\/|$)/.test(text)
+    ? `${text[1].toUpperCase()}:${text.slice(2)}` : text;
+};
 const persistencePath = path.join(root,
   "port/overrides/classlib/src/main/java/dev/gaius/browser/BrowserFilePersistence.java");
 const channelPath = path.join(root,
@@ -187,20 +194,44 @@ assert.deepEqual(boundedSkip(4, 1, -9), {skipped: 0, position: 1});
 assert.deepEqual(boundedSkip(4, 1, Number.MAX_SAFE_INTEGER), {skipped: 3, position: 4});
 assert.deepEqual(boundedSkip(4, 4, 10), {skipped: 0, position: 4});
 
-const {teaVMVersion} = JSON.parse(configText);
-const overlayJar = path.join(root, "port/work/overlays", `teavm-core-${teaVMVersion}-gaius.jar`);
+const parsedConfig = JSON.parse(configText);
+const buildRootProfileId = process.env.GAIUS_BUILD_ROOT
+  ? path.basename(nativePath(process.env.GAIUS_BUILD_ROOT).replaceAll("\\", "/")) : "";
+const overlayProfileId = process.env.GAIUS_OVERLAY_DIRECTORY
+  ? path.basename(nativePath(process.env.GAIUS_OVERLAY_DIRECTORY).replaceAll("\\", "/")) : "";
+const isolatedProfileId = [buildRootProfileId, overlayProfileId]
+  .find((value) => /^\d+(?:\.\d+)+$/.test(value)) || "";
+const configuredProfilePath = nativePath(
+  process.env.GAIUS_VERSION_PROFILE_PATH
+    || (isolatedProfileId ? `versions/${isolatedProfileId}.json` : String(parsedConfig.versionProfile || "")),
+);
+const version = path.basename(configuredProfilePath.replaceAll("\\", "/"))
+  .replace(/\.json$/, "");
+const {teaVMVersion} = parsedConfig;
+const overlayRoot = nativePath(process.env.GAIUS_OVERLAY_DIRECTORY || path.join(
+  root, "port/work/overlays", process.env.GAIUS_BUILD_ROOT || process.env.GAIUS_VERSION_PROFILE_PATH ? version : "",
+));
+const overlayJar = path.join(overlayRoot, `teavm-core-${teaVMVersion}-gaius.jar`);
+function javaTool(name) {
+  for (const home of [process.env.GAIUS_JAVA_HOME, process.env.JAVA_HOME]
+    .filter(Boolean).map(nativePath)) {
+    const candidate = path.join(home, "bin", name);
+    if (existsSync(candidate) || existsSync(`${candidate}.exe`)) return candidate;
+  }
+  return name;
+}
 let bytecodeVerified = false;
 try {
   await access(overlayJar);
-  const bytecode = execFileSync("javap", [
+  const bytecode = execFileSync(javaTool("javap"), [
     "-classpath", overlayJar, "-p", "-c",
     "org.teavm.runtime.fs.memory.InMemoryVirtualFileSystem",
   ], {encoding: "utf8"});
   assert.match(bytecode, /BrowserFilePersistence\.restoreOnDemand/,
     "built TeaVM VFS does not invoke on-demand restoration");
-  const classlibJar = path.join(root, "port/work/overlays",
+  const classlibJar = path.join(overlayRoot,
     `teavm-classlib-${teaVMVersion}-gaius.jar`);
-  const providerBytecode = execFileSync("javap", [
+  const providerBytecode = execFileSync(javaTool("javap"), [
     "-classpath", classlibJar, "-p", "-c",
     "org.teavm.classlib.java.nio.file.impl.TDefaultFileSystemProvider",
   ], {encoding: "utf8"});

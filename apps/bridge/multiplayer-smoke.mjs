@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import {
     constants as cryptoConstants,
     createCipheriv,
@@ -12,21 +13,32 @@ import { createServer as createHttpServer } from "node:http";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
+import path from "node:path";
 import { deflateSync, inflateSync } from "node:zlib";
 import { WebSocket } from "./node_modules/ws/wrapper.mjs";
 import { parseConnectRequest } from "./dist/policy.js";
+import {
+    MINECRAFT_1_21_11,
+    MINECRAFT_26_2,
+} from "./dist/protocol.js";
 
 const host = "127.0.0.1";
 const origin = "http://127.0.0.1:8781";
 const bridgeToken = "relay-smoke-token";
 const directory = fileURLToPath(new URL(".", import.meta.url));
+const repository = fileURLToPath(new URL("../../", import.meta.url));
+const activeVersionProfile = await loadActiveVersionProfile();
 const minecraftHost = process.env.GAIUS_SMOKE_MINECRAFT_HOST;
-const minecraftPort = Number(process.env.GAIUS_SMOKE_MINECRAFT_PORT ?? "25565");
+const minecraftPort = parseMinecraftPort(process.env.GAIUS_SMOKE_MINECRAFT_PORT ?? "25565");
 const minecraftSessionUrl = process.env.GAIUS_SMOKE_SESSION_URL;
 const minecraftAccessToken = process.env.GAIUS_SMOKE_ACCESS_TOKEN ?? "gaius-smoke-token";
 const minecraftProfileId = process.env.GAIUS_SMOKE_PROFILE_ID ??
         "00000000000040008000000000000002";
 const minecraftUsername = process.env.GAIUS_SMOKE_USERNAME ?? "GaiusSmoke";
+const minecraftProfile = resolveSmokeMinecraftProfile(
+        process.env.GAIUS_SMOKE_MINECRAFT_VERSION ??
+        process.env.GAIUS_SMOKE_PROTOCOL_VERSION ??
+        activeVersionProfile.id);
 const dnsTransientHost = "dns-transient.gaius.test";
 const dnsPermanentHost = "dns-permanent.gaius.test";
 const srvTransientHost = "srv-transient.gaius.test";
@@ -86,8 +98,10 @@ const resourcePackFixture = createHttpServer((request, response) => {
         "content-length": String(resourcePackPayload.byteLength),
     });
     if (resourcePackAttempts < 3) {
-        response.write(resourcePackPayload.subarray(0, 1024 * 1024));
-        response.destroy();
+        // End the response cleanly after a short body while retaining the
+        // full Content-Length. This specifically exercises the RelayNode's
+        // declared-length check rather than relying only on a socket reset.
+        response.end(resourcePackPayload.subarray(0, 1024 * 1024));
         return;
     }
     response.end(resourcePackPayload);
@@ -337,10 +351,28 @@ try {
         throw new Error("Tunnel echo bytes did not match the upload");
     }
 
+    // Keepalive rewriting is profile-gated. Establish the selected packet
+    // table before sending the fixture keepalive; an unprofiled/raw tunnel
+    // must never fall back to the 1.21.11 ids.
+    const profileHandshake = encodePacket(0, Buffer.concat([
+        encodeVarInt(minecraftProfile.protocolVersion),
+        encodeString("ellan.top"),
+        Buffer.from([(fixturePort >>> 8) & 0xff, fixturePort & 0xff]),
+        encodeVarInt(1),
+    ]));
+    const echoedBeforeHandshake = echoedBytes;
+    webSocket.send(profileHandshake);
+    await waitFor(
+            () => echoedBytes === echoedBeforeHandshake + profileHandshake.byteLength,
+            "profile handshake echo",
+    );
+    echoed.length = 0;
+    echoedBytes = 0;
+
     const keepAlive = Buffer.from("0a00040000000000000001", "hex");
     fixtureSocket.write(keepAlive);
     await waitFor(() => proxiedKeepAlives === 1, "proxied vanilla keepalive");
-    if (echoedBytes !== upload.byteLength) {
+    if (echoedBytes !== 0) {
         throw new Error("Translator node forwarded a proxied keepalive to the browser");
     }
 
@@ -402,6 +434,11 @@ try {
             : undefined;
     console.log(JSON.stringify({
         ok: true,
+        profile: {
+            id: minecraftProfile.name,
+            protocolVersion: minecraftProfile.protocolVersion,
+            profilePath: activeVersionProfile.path,
+        },
         echoBytes: echoedBytes,
         pausedBytes: 0,
         resumedBytes: floodedBytes,
@@ -750,19 +787,92 @@ function patternedBuffer(length, seed) {
     return bytes;
 }
 
+function nativePath(value) {
+    const text = String(value ?? "").trim().replaceAll("\\", "/");
+    if (process.platform === "win32" && /^\/[A-Za-z](?:\/|$)/u.test(text)) {
+        return `${text[1].toUpperCase()}:${text.slice(2)}`;
+    }
+    return text;
+}
+
+function resolveRepositoryPath(value) {
+    const normalized = nativePath(value);
+    return path.isAbsolute(normalized)
+        ? path.resolve(normalized)
+        : path.resolve(repository, normalized);
+}
+
+function pathInside(parent, child) {
+    const relative = path.relative(path.resolve(parent), path.resolve(child));
+    return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) &&
+        !path.isAbsolute(relative));
+}
+
+async function loadActiveVersionProfile() {
+    const config = JSON.parse(await readFile(path.join(repository, "port", "config.json"), "utf8"));
+    let selected = nativePath(
+            process.env.GAIUS_VERSION_PROFILE_PATH ?? config.versionProfile ?? "");
+    if (/^\d+(?:\.\d+)+$/u.test(selected)) selected = `versions/${selected}.json`;
+    let profilePath;
+    if (path.isAbsolute(selected)) {
+        profilePath = path.resolve(selected);
+    }
+    else if (selected.startsWith("port/")) {
+        profilePath = path.resolve(repository, selected);
+    }
+    else if (selected.startsWith("versions/")) {
+        profilePath = path.resolve(repository, "port", selected);
+    }
+    else {
+        profilePath = path.resolve(repository, selected);
+    }
+    const versionsDirectory = path.join(repository, "port", "versions");
+    if (!pathInside(versionsDirectory, profilePath) || !profilePath.endsWith(".json")) {
+        throw new Error(`Active version profile must be inside port/versions: ${profilePath}`);
+    }
+    const profile = JSON.parse(await readFile(profilePath, "utf8"));
+    if (typeof profile.id !== "string" || !Number.isInteger(profile.protocolVersion)) {
+        throw new Error(`Active version profile is invalid: ${profilePath}`);
+    }
+    return {...profile, path: profilePath};
+}
+
+function parseMinecraftPort(value) {
+    const port = Number(value);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new Error(`GAIUS_SMOKE_MINECRAFT_PORT must be an integer from 1 to 65535: ${value}`);
+    }
+    return port;
+}
+
+function resolveSmokeMinecraftProfile(value) {
+    const key = String(value ?? "").trim();
+    const profile = [MINECRAFT_1_21_11, MINECRAFT_26_2]
+            .find((candidate) => candidate.name === key ||
+                    String(candidate.protocolVersion) === key);
+    if (profile === undefined) {
+        throw new Error(
+                `Unsupported smoke Minecraft version ${value}; expected 1.21.11/774 or 26.2/776`);
+    }
+    return profile;
+}
+
 function isVanillaKeepAlive(chunk) {
     return chunk.byteLength === 11 && chunk[0] === 0x0a &&
-        chunk[1] === 0x00 && chunk[2] === 0x04;
+        chunk[1] === 0x00 &&
+        chunk[2] === minecraftProfile.configuration.clientboundKeepAlive;
 }
 
 function isPlayKeepAlive(chunk) {
     return chunk.byteLength === 11 && chunk[0] === 0x0a &&
-        chunk[1] === 0x00 && chunk[2] === 0x1b;
+        chunk[1] === 0x00 &&
+        chunk[2] === minecraftProfile.play.serverboundKeepAlive;
 }
 
 function isClientTickEnd(chunk) {
     return chunk.byteLength === 3 && chunk[0] === 0x02 &&
-        chunk[1] === 0x00 && chunk[2] === 0x0c;
+        chunk[1] === 0x00 &&
+        chunk[2] === minecraftProfile.play.serverboundClientTickEnd;
 }
 
 async function testFramedPlayKeepAlive(bridgePort, fixturePort) {
@@ -786,21 +896,38 @@ async function testFramedPlayKeepAlive(bridgePort, fixturePort) {
             "framed tunnel connection");
     await waitFor(() => fixtureSocket !== undefined, "framed fixture connection");
 
-    socket.send(Buffer.from("1000860609656c6c616e2e746f7063dd02", "hex"));
-    const splitClientFrames = Buffer.from("020003020003", "hex");
+    socket.send(encodePacket(0, Buffer.concat([
+        encodeVarInt(minecraftProfile.protocolVersion),
+        encodeString("ellan.top"),
+        Buffer.from("dd02", "hex"),
+        encodeVarInt(2),
+    ])));
+    const splitClientFrames = Buffer.concat([
+        encodePacket(minecraftProfile.configuration.serverboundFinish, Buffer.alloc(0), 256),
+        encodePacket(minecraftProfile.configuration.serverboundFinish, Buffer.alloc(0), 256),
+    ]);
     socket.send(splitClientFrames.subarray(0, 4));
     socket.send(splitClientFrames.subarray(4));
     await waitFor(() => proxiedPlayTicks >= 1, "synthetic initial play tick");
-    socket.send(Buffer.from("02000c", "hex"));
+    socket.send(encodePacket(
+            minecraftProfile.play.serverboundClientTickEnd,
+            Buffer.alloc(0),
+            256));
     await waitFor(() => proxiedPlayTicks >= 3, "proxied observed play ticks at vanilla cadence");
-    const playKeepAlive = Buffer.from("0a002b0000000000000002", "hex");
+    const playKeepAlive = encodePacket(
+            minecraftProfile.play.clientboundKeepAlive,
+            Buffer.from("0000000000000002", "hex"),
+            256);
     // Packet boundaries are independent from TCP chunks, so split this frame.
     fixtureSocket.write(playKeepAlive.subarray(0, 4));
     await delay(5);
     fixtureSocket.write(playKeepAlive.subarray(4));
     await waitFor(() => proxiedPlayKeepAlives === 1, "proxied framed play keepalive");
 
-    const startConfiguration = Buffer.from("020074", "hex");
+    const startConfiguration = encodePacket(
+            minecraftProfile.play.clientboundStartConfiguration,
+            Buffer.alloc(0),
+            256);
     fixtureSocket.write(startConfiguration);
     await waitFor(
             () => serverFrames.some((frame) => frame.equals(startConfiguration)),
@@ -811,18 +938,32 @@ async function testFramedPlayKeepAlive(bridgePort, fixturePort) {
         throw new Error("Translator node injected PLAY ticks while reconfiguration was pending");
     }
 
-    socket.send(Buffer.from("02000f", "hex"));
+    // The server is already in CONFIGURATION as soon as Start Configuration
+    // arrives, even before the browser sends its acknowledgement.
+    fixtureSocket.write(configurationKeepAliveFrame(minecraftProfile, 4));
+    await waitFor(
+            () => proxiedKeepAlives === 2,
+            "proxied keepalive during reconfiguration transition",
+    );
+
+    socket.send(encodePacket(
+            minecraftProfile.play.serverboundConfigurationAcknowledged,
+            Buffer.alloc(0),
+            256));
     await delay(20);
-    const configurationKeepAlive = Buffer.from("0a00040000000000000003", "hex");
+    const configurationKeepAlive = configurationKeepAliveFrame(minecraftProfile, 3);
     fixtureSocket.write(configurationKeepAlive);
-    await waitFor(() => proxiedKeepAlives === 2, "proxied reconfiguration keepalive");
+    await waitFor(() => proxiedKeepAlives === 3, "proxied reconfiguration keepalive");
     const ticksDuringConfiguration = proxiedPlayTicks;
     await delay(200);
     if (proxiedPlayTicks !== ticksDuringConfiguration) {
         throw new Error("Translator node injected PLAY ticks during CONFIGURATION");
     }
 
-    socket.send(Buffer.from("020003", "hex"));
+    socket.send(encodePacket(
+            minecraftProfile.configuration.serverboundFinish,
+            Buffer.alloc(0),
+            256));
     await waitFor(
             () => proxiedPlayTicks > ticksDuringConfiguration,
             "re-armed play ticks after reconfiguration");
@@ -832,6 +973,13 @@ async function testFramedPlayKeepAlive(bridgePort, fixturePort) {
     await once(socket, "close");
     fixtureSocket.destroy();
     fixtureSocket = undefined;
+}
+
+function configurationKeepAliveFrame(profile, value) {
+    return encodePacket(
+            profile.configuration.clientboundKeepAlive,
+            Buffer.from(`000000000000000${value}`, "hex"),
+            256);
 }
 
 async function writePatterned(socket, length, hash) {
@@ -856,6 +1004,9 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
     let cipher;
     let decipher;
     let encryptionRequest = false;
+    let rsaSecretEncrypted = false;
+    let rsaChallengeEncrypted = false;
+    let aesCfb8Enabled = false;
     let sessionJoin = false;
     let compressionThreshold;
     let phase = "login";
@@ -943,10 +1094,12 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
                     bytes: payload.byteLength,
                 });
                 if (recentPackets.length > 24) recentPackets.shift();
-                if (phase === "login" && packetId.value === 0) {
+                if (phase === "login" &&
+                        packetId.value === minecraftProfile.login.clientboundDisconnect) {
                     throw new Error("Minecraft server rejected the smoke login");
                 }
-                if (phase === "login" && packetId.value === 1) {
+                if (phase === "login" &&
+                        packetId.value === minecraftProfile.login.clientboundEncryptionRequest) {
                     if (session.sessionUrl === undefined) {
                         throw new Error(
                                 "Minecraft server requested online-mode encryption without a smoke session service");
@@ -956,29 +1109,37 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
                         protocolFailure = error;
                     });
                 }
-                else if (phase === "login" && packetId.value === 3) {
+                else if (phase === "login" &&
+                        packetId.value === minecraftProfile.login.clientboundCompression) {
                     const threshold = decodeVarInt(packet, packetId.bytesRead);
                     if (threshold === undefined || threshold.value < 0) {
                         throw new Error("Minecraft server sent an invalid compression threshold");
                     }
                     compressionThreshold = threshold.value;
                 }
-                else if (phase === "login" && packetId.value === 2) {
+                else if (phase === "login" &&
+                        packetId.value === minecraftProfile.login.clientboundLoginFinished) {
                     loginFinished = true;
                     phase = "configuration";
-                    sendMinecraftPacket(3, Buffer.alloc(0));
-                    sendMinecraftPacket(0, encodeClientInformation());
+                    sendMinecraftPacket(
+                            minecraftProfile.login.serverboundLoginAcknowledged,
+                            Buffer.alloc(0));
+                    sendMinecraftPacket(
+                            minecraftProfile.login.serverboundHello,
+                            encodeClientInformation());
                 }
                 else if (phase === "configuration") {
                     configurationPackets++;
-                    if (packetId.value === 2) {
+                    if (packetId.value === minecraftProfile.configuration.clientboundDisconnect) {
                         throw new Error("Minecraft server disconnected during configuration");
                     }
-                    if (packetId.value === 14) {
+                    if (packetId.value === minecraftProfile.configuration.clientboundKnownPacks) {
                         knownPackRequests++;
-                        sendMinecraftPacket(7, encodeVarInt(0));
+                        sendMinecraftPacket(
+                                minecraftProfile.configuration.serverboundSelectKnownPacks,
+                                encodeVarInt(0));
                     }
-                    else if (packetId.value === 9) {
+                    else if (packetId.value === minecraftProfile.configuration.clientboundResourcePackPush) {
                         if (payload.byteLength < 16) {
                             throw new Error("Resource-pack push omitted its UUID");
                         }
@@ -1005,10 +1166,12 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
                         // This protocol smoke verifies the transport and configuration
                         // handshake. Browser resource downloading is covered separately.
                         for (const action of [3, 4, 0]) {
-                            sendMinecraftPacket(6, Buffer.concat([packId, encodeVarInt(action)]));
+                            sendMinecraftPacket(
+                                    minecraftProfile.configuration.serverboundResourcePack,
+                                    Buffer.concat([packId, encodeVarInt(action)]));
                         }
                     }
-                    else if (packetId.value === 18) {
+                    else if (packetId.value === minecraftProfile.configuration.clientboundShowDialog) {
                         showDialogPackets++;
                         showDialogPayload ??= payload.toString("base64");
                         const dialog = decodeNetworkNbt(payload);
@@ -1028,11 +1191,13 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
                             throw new Error(`Minecraft server repeated dialog action ${actionId}`);
                         }
                         const inputValues = resolveDialogInputValues(prompt.inputs);
-                        sendMinecraftPacket(8, encodeCustomClickAction(actionId, inputValues));
+                        sendMinecraftPacket(
+                                minecraftProfile.configuration.serverboundCustomClickAction,
+                                encodeCustomClickAction(actionId, inputValues));
                         acceptedDialogActions.add(actionId);
                         showDialogAccepts++;
                     }
-                    else if (packetId.value === 19) {
+                    else if (packetId.value === minecraftProfile.configuration.clientboundCodeOfConduct) {
                         const codeOfConduct = decodeString(payload, 0);
                         if (codeOfConduct.nextOffset !== payload.byteLength ||
                                 codeOfConduct.value.length === 0) {
@@ -1047,49 +1212,65 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
                                     "GAIUS_SMOKE_ACCEPT_SERVER_PROMPTS=1 to model explicit acceptance");
                         }
                         // This models the explicit acceptance performed by the vanilla UI.
-                        sendMinecraftPacket(9, Buffer.alloc(0));
+                        sendMinecraftPacket(
+                                minecraftProfile.configuration.serverboundAcceptCodeOfConduct,
+                                Buffer.alloc(0));
                         codeOfConductAccepts++;
                     }
-                    else if (packetId.value === 3) {
+                    else if (packetId.value === minecraftProfile.configuration.clientboundFinish) {
                         configurationFinished = true;
                         configurationCycles++;
                         phase = "play";
-                        sendMinecraftPacket(3, Buffer.alloc(0));
+                        sendMinecraftPacket(
+                                minecraftProfile.configuration.serverboundFinish,
+                                Buffer.alloc(0));
                     }
-                    else if (packetId.value === 4) {
-                        sendMinecraftPacket(4, payload);
+                    else if (packetId.value === minecraftProfile.configuration.clientboundKeepAlive) {
+                        sendMinecraftPacket(
+                                minecraftProfile.configuration.serverboundKeepAlive,
+                                payload);
                     }
-                    else if (packetId.value === 5) {
-                        sendMinecraftPacket(5, payload);
+                    else if (packetId.value === minecraftProfile.configuration.clientboundPing) {
+                        sendMinecraftPacket(
+                                minecraftProfile.configuration.serverboundPong,
+                                payload);
                     }
                 }
                 else if (phase === "play") {
                     playPackets++;
-                    if (packetId.value === 32) {
+                    if (packetId.value === minecraftProfile.play.clientboundDisconnect) {
                         throw new Error("Minecraft server disconnected after entering PLAY");
                     }
-                    if (packetId.value === 43) {
-                        sendMinecraftPacket(27, payload);
+                    if (packetId.value === minecraftProfile.play.clientboundKeepAlive) {
+                        sendMinecraftPacket(
+                                minecraftProfile.play.serverboundKeepAlive,
+                                payload);
                     }
-                    else if (packetId.value === 59) {
-                        sendMinecraftPacket(44, payload);
+                    else if (packetId.value === minecraftProfile.play.clientboundPing) {
+                        sendMinecraftPacket(
+                                minecraftProfile.play.serverboundPong,
+                                payload);
                     }
-                    else if (packetId.value === 48) {
+                    else if (packetId.value === minecraftProfile.play.clientboundLogin) {
                         playLoginPackets++;
                         if (!playerLoadedSent) {
                             playerLoadedSent = true;
-                            sendMinecraftPacket(43, Buffer.alloc(0));
+                            sendMinecraftPacket(
+                                    minecraftProfile.play.serverboundPlayerLoaded,
+                                    Buffer.alloc(0));
                         }
                     }
-                    else if (packetId.value === 44) {
+                    else if (packetId.value === minecraftProfile.play.clientboundChunk) {
                         chunkPackets++;
                     }
-                    else if (packetId.value === 116) {
+                    else if (packetId.value === minecraftProfile.play.clientboundStartConfiguration) {
                         if (payload.byteLength !== 0) {
                             throw new Error("PLAY start-configuration packet was not payloadless");
                         }
                         reconfigurationRequests++;
-                        sendMinecraftPacket(15, Buffer.alloc(0));
+                        sendMinecraftPacket(
+                                minecraftProfile.play.serverboundConfigurationAcknowledged,
+                                Buffer.alloc(0));
                         phase = "configuration";
                     }
                 }
@@ -1110,6 +1291,9 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
             phase,
             encryptionRequest,
             sessionJoin,
+            rsaSecretEncrypted,
+            rsaChallengeEncrypted,
+            aesCfb8Enabled,
             compressionThreshold: compressionThreshold ?? null,
             loginFinished,
             configurationPackets,
@@ -1177,13 +1361,16 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
         };
         const encryptedSecret = publicEncrypt(rsaKey, secret);
         const encryptedChallenge = publicEncrypt(rsaKey, challenge.value);
+        rsaSecretEncrypted = encryptedSecret.byteLength > 0;
+        rsaChallengeEncrypted = encryptedChallenge.byteLength > 0;
         const keyPayload = Buffer.concat([
             encodeByteArray(encryptedSecret),
             encodeByteArray(encryptedChallenge),
         ]);
-        socket.send(encodePacket(1, keyPayload));
+        socket.send(encodePacket(minecraftProfile.login.serverboundKey, keyPayload));
         cipher = createCipheriv("aes-128-cfb8", secret, secret);
         decipher = createDecipheriv("aes-128-cfb8", secret, secret);
+        aesCfb8Enabled = true;
     }
 
     socket.send(JSON.stringify({ type: "connect", host: serverHost, port: serverPort, token }));
@@ -1193,7 +1380,7 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
     }, "Minecraft TCP connection", 10000, loginDiagnostics);
 
     const handshake = Buffer.concat([
-        encodeVarInt(774),
+        encodeVarInt(minecraftProfile.protocolVersion),
         encodeString(serverHost),
         Buffer.from([(serverPort >>> 8) & 0xff, serverPort & 0xff]),
         encodeVarInt(2),
@@ -1227,6 +1414,17 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
     return {
         server: `${serverHost}:${serverPort}`,
         onlineMode: encryptionRequest,
+        rsa: {
+            requested: encryptionRequest,
+            secretEncrypted: rsaSecretEncrypted,
+            challengeEncrypted: rsaChallengeEncrypted,
+            padding: "RSA_PKCS1_PADDING",
+        },
+        aes: {
+            cipher: "aes-128-cfb8",
+            enabled: aesCfb8Enabled,
+            iv: "shared-secret",
+        },
         sessionJoin,
         compressionThreshold: compressionThreshold ?? null,
         loginFinished,

@@ -5,20 +5,37 @@ root="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$root/port/scripts/version-profile.sh"
 gaius_load_version_profile "$root"
 minecraft_version="$GAIUS_MINECRAFT_VERSION"
+build_root="$(gaius_build_root "$root")"
+if [[ -n "${GAIUS_DIST_DIRECTORY:-}" ]]; then
+  dist="$(gaius_dist_directory "$root")"
+elif [[ -n "${GAIUS_BUILD_ROOT:-}" || -n "${GAIUS_VERSION_PROFILE_PATH:-}" ]]; then
+  # An isolated profile must never inherit a stale legacy TARGET_DIRECTORY.
+  dist="$(gaius_dist_directory "$root")"
+else
+  dist="${GAIUS_TARGET_DIRECTORY:-$(gaius_dist_directory "$root")}"
+fi
+# Keep every child invocation on the same profile-scoped state/output roots.
+# This also makes `build-teavm-release.sh` safe when callers pass only a
+# profile and a build root rather than repeating all path variables.
+export GAIUS_BUILD_ROOT="$build_root"
+export GAIUS_DIST_DIRECTORY="$dist"
+export GAIUS_TARGET_DIRECTORY="$dist"
+export GAIUS_OVERLAY_DIRECTORY="$(gaius_overlay_directory "$root")"
 asset_index_id="$(jq -er '.assetIndex.id // .assets' "$GAIUS_VERSION_METADATA" | tr -d '\r\n')"
 identity_tool="$root/port/scripts/gaius_build_identity.py"
 compiler_profile_tool="$root/port/scripts/teavm-compiler-profile.py"
-client_pom="$root/port/target/generated-pom.xml"
-client_resource_list="$root/port/target/generated-resources/dev/gaius/browser/minecraft-resources.txt"
-client_embedded_resources="$root/port/target/generated-resources/dev/gaius/browser/minecraft-embedded-resources.txt"
+client_pom="$build_root/generated-pom.xml"
+client_resource_list="$build_root/generated-resources/dev/gaius/browser/minecraft-resources.txt"
+client_embedded_resources="$build_root/generated-resources/dev/gaius/browser/minecraft-embedded-resources.txt"
 asset_index="$root/port/work/$minecraft_version/assets/indexes/$asset_index_id.json"
-generated_sounds="$root/port/target/generated-resources/assets/minecraft/sounds.json"
-generated_unifont="$root/port/target/generated-resources/assets/minecraft/font/include/unifont.json"
-generated_unifont_pua="$root/port/target/generated-resources/assets/minecraft/font/include/unifont_pua.json"
-server_pom="$root/port/target/server-worker/generated-pom.xml"
-server_resource_list="$root/port/target/server-worker/generated-resources/dev/gaius/browser/minecraft-resources.txt"
+generated_sounds="$build_root/generated-resources/assets/minecraft/sounds.json"
+generated_unifont="$build_root/generated-resources/assets/minecraft/font/include/unifont.json"
+generated_unifont_pua="$build_root/generated-resources/assets/minecraft/font/include/unifont_pua.json"
+server_pom="$build_root/server-worker/generated-pom.xml"
+server_resource_list="$build_root/server-worker/generated-resources/dev/gaius/browser/minecraft-resources.txt"
 
-release_lock="$root/port/target/.release-build.lock"
+release_lock="$build_root/.release-build.lock"
+mkdir -p "$build_root" "$dist"
 while ! mkdir "$release_lock" 2>/dev/null; do
   lock_pid="$(cat "$release_lock/pid" 2>/dev/null || true)"
   if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
@@ -53,16 +70,12 @@ write_identity() {
 
 artifact_sha256() {
   local artifact="$1"
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$artifact" | awk '{print $1}'
-  else
-    shasum -a 256 "$artifact" | awk '{print $1}'
-  fi
+  gaius_sha256_file "$artifact"
 }
 
 write_client_release_profile() {
   local client_js="$1"
-  local vanilla_asset_pack="$root/port/web/dist/vanilla-assets.pack.gz"
+  local vanilla_asset_pack="$dist/vanilla-assets.pack.gz"
   "$root/port/scripts/run-python.sh" "$compiler_profile_tool" write \
     --root "$root" \
     --role client \
@@ -80,7 +93,7 @@ write_client_release_profile() {
 
 verify_client_release_profile() {
   local client_js="$1"
-  local vanilla_asset_pack="$root/port/web/dist/vanilla-assets.pack.gz"
+  local vanilla_asset_pack="$dist/vanilla-assets.pack.gz"
   "$root/port/scripts/run-python.sh" "$compiler_profile_tool" verify \
     --root "$root" \
     --role client \
@@ -125,12 +138,12 @@ if [[ "$GAIUS_TEA_OPTIMIZATION_LEVEL" != "ADVANCED" \
   exit 1
 fi
 
-rm -f "$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}.map" \
-  "$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}.teavmdbg"
+rm -f "$dist/${GAIUS_TARGET_FILE:-classes.js}.map" \
+  "$dist/${GAIUS_TARGET_FILE:-classes.js}.teavmdbg"
 
 if [[ "${GAIUS_SKIP_CLIENT_BUILD:-false}" == "true" ]]; then
-  client_js="$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}"
-  vanilla_asset_pack="$root/port/web/dist/vanilla-assets.pack.gz"
+  client_js="$dist/${GAIUS_TARGET_FILE:-classes.js}"
+  vanilla_asset_pack="$dist/vanilla-assets.pack.gz"
   expected_client_sha256="${GAIUS_RESUME_CLIENT_SHA256:-}"
   if [[ ! -s "$client_js" || ! -s "$vanilla_asset_pack" ]]; then
     echo "Cannot resume release: client JavaScript or vanilla asset pack is missing" >&2
@@ -147,9 +160,9 @@ if [[ "${GAIUS_SKIP_CLIENT_BUILD:-false}" == "true" ]]; then
     echo "Cannot resume release: client JavaScript SHA-256 does not match" >&2
     exit 1
   fi
-  grep -Fq '[INFO] BUILD SUCCESS' "$root/port/target/teavm-build.log" \
+  grep -Fq '[INFO] BUILD SUCCESS' "$build_root/teavm-build.log" \
     || { echo "Cannot resume release: TeaVM log has no BUILD SUCCESS" >&2; exit 1; }
-  if grep -Fq 'Error in @JSBody' "$root/port/target/teavm-build.log"; then
+  if grep -Fq 'Error in @JSBody' "$build_root/teavm-build.log"; then
     echo "Cannot resume release: TeaVM log contains invalid @JSBody JavaScript" >&2
     exit 1
   fi
@@ -168,24 +181,24 @@ if [[ "${GAIUS_SKIP_CLIENT_BUILD:-false}" == "true" ]]; then
   echo "Reusing successfully compiled client JavaScript: $client_js"
   "$root/port/scripts/run-python.sh" \
     "$root/port/scripts/analyze-teavm-log.py" \
-    "$root/port/target/teavm-build.log" \
-    "$root/port/target/teavm-gap.json" \
-    "$root/port/target/teavm-gap.md"
+    "$build_root/teavm-build.log" \
+    "$build_root/teavm-gap.json" \
+    "$build_root/teavm-gap.md"
   "$root/port/scripts/run-python.sh" \
     "$root/port/scripts/postprocess-index-html.py" \
-    "$root/port/web/dist/index.html" \
+    "$dist/index.html" \
     "$client_js" \
     "$minecraft_version" \
     "$asset_index_id"
 else
   GAIUS_SKIP_COMPRESSION=true "$root/port/scripts/build-teavm.sh"
-  write_client_release_profile "$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}"
+  write_client_release_profile "$dist/${GAIUS_TARGET_FILE:-classes.js}"
 fi
 if [[ "${GAIUS_SKIP_SERVER_WORKER:-false}" != "true" ]]; then
   GAIUS_SKIP_OVERLAY_BUILD=true GAIUS_SKIP_COMPRESSION=true \
     "$root/port/scripts/build-teavm-server-worker.sh"
 else
-  server_js="$root/port/web/dist/singleplayer-server.js"
+  server_js="$dist/singleplayer-server.js"
   if [[ ! -s "$server_js" ]] || ! verify_identity singleplayer-worker "$server_js"; then
     echo "Cannot resume release: server Worker or matching build identity is missing at $server_js" >&2
     exit 1
@@ -193,20 +206,20 @@ else
   verify_worker_release_profile "$server_js" \
     || { echo "Cannot resume release: server Worker compiler profile is stale, missing, or not release-grade" >&2; exit 1; }
   cp "$root/port/web/singleplayer/server-worker-bootstrap.js" \
-    "$root/port/web/dist/singleplayer-server-worker.js"
+    "$dist/singleplayer-server-worker.js"
   write_identity worker-bootstrap \
-    "$root/port/web/dist/singleplayer-server-worker.js"
+    "$dist/singleplayer-server-worker.js"
   echo "Reusing successfully compiled server Worker JavaScript: $server_js"
 fi
 "$root/port/scripts/run-python.sh" \
   "$root/port/scripts/postprocess-index-html.py" \
-  "$root/port/web/dist/index.html" \
-  "$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}" \
+  "$dist/index.html" \
+  "$dist/${GAIUS_TARGET_FILE:-classes.js}" \
   "$minecraft_version" \
   "$asset_index_id"
-wasm_hotpath="$root/port/web/dist/gaius-hotpath.wasm"
+wasm_hotpath="$dist/gaius-hotpath.wasm"
 if [[ "${GAIUS_SKIP_WASM_HOTPATH:-false}" != "true" ]]; then
-  if ! "$root/port/scripts/build-wasm-hotpath.sh"; then
+  if ! GAIUS_DIST_DIRECTORY="$dist" "$root/port/scripts/build-wasm-hotpath.sh"; then
     if [[ "${GAIUS_REQUIRE_WASM_HOTPATH:-false}" == "true" ]]; then
       exit 1
     fi
@@ -222,12 +235,13 @@ elif ! verify_identity wasm-hotpath "$wasm_hotpath"; then
   echo "Cannot resume release: skipped Wasm artifact has no matching build identity" >&2
   exit 1
 fi
-rm -f "$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}.map" \
-  "$root/port/web/dist/${GAIUS_TARGET_FILE:-classes.js}.teavmdbg"
-cp "$root/relay-nodes.json" "$root/port/web/dist/relay-nodes.json"
-write_identity relay-registry "$root/port/web/dist/relay-nodes.json"
-GAIUS_COMPRESS_EXCLUDE=Gaius.html "$root/port/scripts/compress-dist.sh"
-"$root/port/scripts/run-python.sh" \
+rm -f "$dist/${GAIUS_TARGET_FILE:-classes.js}.map" \
+  "$dist/${GAIUS_TARGET_FILE:-classes.js}.teavmdbg"
+cp "$root/relay-nodes.json" "$dist/relay-nodes.json"
+write_identity relay-registry "$dist/relay-nodes.json"
+GAIUS_DIST_DIRECTORY="$dist" GAIUS_COMPRESS_EXCLUDE=Gaius.html "$root/port/scripts/compress-dist.sh"
+GAIUS_BUILD_ROOT="$build_root" GAIUS_DIST_DIRECTORY="$dist" \
+  "$root/port/scripts/run-python.sh" \
   "$root/port/scripts/build-portable-html.py"
-GAIUS_COMPRESS_FILES=Gaius.html:Gaius.manifest.json \
+GAIUS_DIST_DIRECTORY="$dist" GAIUS_COMPRESS_FILES=Gaius.html:Gaius.manifest.json \
   "$root/port/scripts/compress-dist.sh"

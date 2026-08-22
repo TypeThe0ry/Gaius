@@ -216,15 +216,27 @@
       "externalSmokeRequired": ["minecraft-262-link-gap-smoke.mjs"]
     },
     "worldgen": {
+      "telemetryMode": "task-pulsed",
+      "worldgenTelemetryMode": "task-pulsed",
+      "progressSlicesMin": 1,
+      "totalProgressPulsesMin": 1,
+      "checkpointYieldsMin": 1,
+      "checkpointOnlyYieldsMin": 1,
+      "checkpointQueueDepthMax": 8,
+      "checkpointOnlyQueueDepthMax": 8,
       "networkWaitPulsesMax": 2,
+      "checkpointOnlyNetworkWaitPulsesMax": 2,
       "schedulerTurnPulsesMax": 4096,
       "minimumAdaptiveSliceMillis": 2,
       "reentrantYieldDepthMax": 1,
+      "checkpointOnlyReentrantYieldDepthMax": 1,
       "p99SliceElapsedMillisMax": 14,
       "maxSliceElapsedMillisMax": 50,
       "maxBudgetOverrunMillisMax": 8,
       "p99YieldDelayMillisMax": 16.7,
-      "maxYieldDelayMillisMax": 50
+      "maxYieldDelayMillisMax": 50,
+      "checkpointOnlyP99YieldDelayMillisMax": 16.7,
+      "checkpointOnlyMaxYieldDelayMillisMax": 50
     },
     "webglMemory": {
       "bufferShadowBudgetBytes": 67108864,

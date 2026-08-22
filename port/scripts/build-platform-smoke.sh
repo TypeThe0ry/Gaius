@@ -2,7 +2,15 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
-
+source "$root/port/scripts/version-profile.sh"
+gaius_load_version_profile "$root"
+gaius_select_java_home
+build_root="$(gaius_build_root "$root")"
+overlay_directory="$(gaius_overlay_directory "$root")"
+smoke_directory="${GAIUS_PLATFORM_SMOKE_DIRECTORY:-$root/port/web/smoke}"
+if [[ -n "${GAIUS_BUILD_ROOT:-}" || -n "${GAIUS_VERSION_PROFILE_PATH:-}" ]] && [[ -z "${GAIUS_PLATFORM_SMOKE_DIRECTORY:-}" ]]; then
+  smoke_directory="$root/port/web/smoke/$GAIUS_MINECRAFT_VERSION"
+fi
 # The smoke compiler reads the same mutable overlay JARs as release builds.
 # Keep the writer lock until TeaVM exits so a concurrent rebuild cannot corrupt
 # an already-open ZipFile.
@@ -22,20 +30,22 @@ release_overlay_lock() {
 trap release_overlay_lock EXIT
 
 if [[ "${GAIUS_SKIP_OVERLAY_BUILD:-false}" != "true" ]]; then
-  GAIUS_OVERLAY_LOCK_HELD=true "$root/port/scripts/build-overlays.sh" >/dev/null
+  GAIUS_OVERLAY_DIRECTORY="$overlay_directory" GAIUS_OVERLAY_LOCK_HELD=true "$root/port/scripts/build-overlays.sh" >/dev/null
 else
   echo "Skipping overlay rebuild because GAIUS_SKIP_OVERLAY_BUILD=true"
 fi
 
 pom="$(
   GAIUS_MAIN_CLASS=dev.gaius.browser.PlatformSmoke \
-  GAIUS_TARGET_DIRECTORY="$root/port/web/smoke" \
+  GAIUS_TARGET_DIRECTORY="$smoke_directory" \
   GAIUS_TARGET_FILE=platform-smoke-v4.js \
-  GAIUS_POM="$root/port/target/platform-smoke-pom.xml" \
+  GAIUS_BUILD_ROOT="$build_root" \
+  GAIUS_OVERLAY_DIRECTORY="$overlay_directory" \
+  GAIUS_POM="$build_root/platform-smoke-pom.xml" \
   "$root/port/scripts/generate-pom.sh"
 )"
 
-log="$root/port/target/platform-smoke-teavm.log"
+log="$build_root/platform-smoke-teavm.log"
 MAVEN_OPTS="${MAVEN_OPTS:--Xms512m -Xmx4g -XX:+UseG1GC}" \
   "$root/port/mvnw" \
   --batch-mode \

@@ -38,6 +38,7 @@ public final class LwjglGlfwBrowserPatcher {
     private static void patchGlfw(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "org/lwjgl/glfw/GLFW.class");
         Map<String, String> delegates = delegates();
+        Map<String, String> browserNoOps = browserNoOps();
         int replaced = 0;
         for (MethodNode method : node.methods) {
             if (method.name.equals("<clinit>")) {
@@ -54,12 +55,65 @@ public final class LwjglGlfwBrowserPatcher {
             if (target != null) {
                 delegate(method, target);
                 replaced++;
+                continue;
+            }
+            String noOp = browserNoOps.get(method.name + method.desc);
+            if (noOp != null) {
+                noOp(method, noOp);
+                replaced++;
             }
         }
         if (replaced < 45) {
             throw new IllegalStateException("Too few GLFW methods patched: " + replaced);
         }
         write(node, output);
+    }
+
+    /**
+     * GLFW 3.4.1 added browser-unimplemented IME/preedit entry points.  The
+     * generated public wrappers perform a Checks check and then call their
+     * native nglfw method, which is invalid after the browser GLFW library is
+     * installed (the optional function address is deliberately zero).  Keep
+     * these entries conditional by matching methods only when the version's
+     * GLFW class actually contains them; LWJGL 3.3.x profiles simply have no
+     * matching methods and retain their existing patch set.
+     */
+    private static Map<String, String> browserNoOps() {
+        Map<String, String> result = new HashMap<>();
+        addNoOp(result, "glfwGetPreeditCursorRectangle",
+                "(JLjava/nio/IntBuffer;Ljava/nio/IntBuffer;Ljava/nio/IntBuffer;Ljava/nio/IntBuffer;)V",
+                "void");
+        addNoOp(result, "glfwGetPreeditCursorRectangle", "(J[I[I[I[I)V", "void");
+        addNoOp(result, "glfwSetPreeditCursorRectangle", "(JIIII)V", "void");
+        addNoOp(result, "glfwResetPreeditText", "(J)V", "void");
+        addNoOp(result, "glfwGetPreeditCandidate", "(JI)Ljava/nio/IntBuffer;", "null");
+        addNoOp(result, "glfwSetPreeditCallback",
+                "(JLorg/lwjgl/glfw/GLFWPreeditCallbackI;)Lorg/lwjgl/glfw/GLFWPreeditCallback;",
+                "null");
+        addNoOp(result, "glfwSetIMEStatusCallback",
+                "(JLorg/lwjgl/glfw/GLFWIMEStatusCallbackI;)Lorg/lwjgl/glfw/GLFWIMEStatusCallback;",
+                "null");
+        addNoOp(result, "glfwSetPreeditCandidateCallback",
+                "(JLorg/lwjgl/glfw/GLFWPreeditCandidateCallbackI;)Lorg/lwjgl/glfw/GLFWPreeditCandidateCallback;",
+                "null");
+        return result;
+    }
+
+    private static void addNoOp(Map<String, String> methods, String name, String descriptor, String returnKind) {
+        methods.put(name + descriptor, returnKind);
+    }
+
+    private static void noOp(MethodNode method, String returnKind) {
+        InsnList code = new InsnList();
+        if (returnKind.equals("void")) {
+            code.add(new InsnNode(Opcodes.RETURN));
+        } else if (returnKind.equals("null")) {
+            code.add(new InsnNode(Opcodes.ACONST_NULL));
+            code.add(new InsnNode(Opcodes.ARETURN));
+        } else {
+            throw new IllegalArgumentException("Unknown GLFW browser no-op return kind: " + returnKind);
+        }
+        replace(method, code, returnKind.equals("void") ? 0 : 1);
     }
 
     private static void patchErrorCallback(String jar, Path output) throws IOException {

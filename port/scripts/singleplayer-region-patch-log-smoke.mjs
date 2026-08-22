@@ -2,6 +2,17 @@ import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import vm from "node:vm";
 
+// This harness does not select a profile. Keep it on the safe, current
+// default storage namespace rather than reopening the removed v1 database.
+const DEFAULT_STORAGE_CONFIG = Object.freeze({
+  profileId: "26.2",
+  worldVersion: 4903,
+  storageSchema: 2,
+  storageDatabaseName: "gaius-fs-v2-26.2",
+  storagePrefix: "gaius.fs.v2:26.2:",
+  storageOpfsDirectory: "regions-v2-26.2",
+});
+
 const bootstrapUrl = new URL("../web/singleplayer/server-worker-bootstrap.js", import.meta.url);
 const channelUrl = new URL(
   "../src/main/java/org/teavm/classlib/java/nio/channels/TFileChannel.java",
@@ -222,6 +233,9 @@ function createRuntime(opfsFiles, idbRecords) {
   context.close = () => {};
   context.importScripts = () => {};
   context.main = () => {};
+  let runtimeStopped = false;
+  context.stopIntegratedServer = () => { runtimeStopped = true; };
+  context.isIntegratedServerStopped = () => runtimeStopped;
   vm.runInNewContext(bootstrap, context, {filename: "server-worker-bootstrap.js"});
   return {context, events};
 }
@@ -232,7 +246,14 @@ async function startRuntime(runtime, worldId) {
     data: {
       type: "start",
       sessionId: "8123456789abcdef0123456789abcdef",
+      launchGeneration: "1",
       worldId,
+      profileId: DEFAULT_STORAGE_CONFIG.profileId,
+      worldVersion: DEFAULT_STORAGE_CONFIG.worldVersion,
+      storageSchema: DEFAULT_STORAGE_CONFIG.storageSchema,
+      storageDatabaseName: DEFAULT_STORAGE_CONFIG.storageDatabaseName,
+      storagePrefix: DEFAULT_STORAGE_CONFIG.storagePrefix,
+      storageOpfsDirectory: DEFAULT_STORAGE_CONFIG.storageOpfsDirectory,
       renderDistance: 6,
       simulationDistance: 4,
       serverScriptUrl: "https://client.example/singleplayer-server.js",

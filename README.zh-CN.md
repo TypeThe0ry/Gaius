@@ -2,9 +2,9 @@
 
 [English](README.md) | **简体中文**
 
-Gaius Client `0.0.1` 是 Minecraft Java Edition `1.21.11` 的实验性浏览器移植。
-项目通过 TeaVM 和浏览器平台覆盖层运行原始 Java 客户端路径，并不是使用
-TypeScript 重新实现 Minecraft 游戏逻辑。
+Gaius Client `0.0.1` 是 Minecraft Java Edition `26.2` 的实验性浏览器移植，
+同时保留 `1.21.11` 兼容 profile。每个 profile 都通过 TeaVM 和浏览器平台覆盖层
+运行原始 Java 客户端路径，并不是使用 TypeScript 重新实现 Minecraft 游戏逻辑。
 
 **当前状态：** 实验性公开版本。可下载客户端主要用于评估和本地单人游戏。
 浏览器、服务器、资源包、世界生成、渲染和性能兼容性目前均不作保证。
@@ -32,20 +32,23 @@ Gaius 是独立软件，与 Mojang Studios、Microsoft 或 Minecraft 没有隶�
 
 ## 下载
 
-`v0.0.1` Release 页面提供可移植浏览器客户端和可选的 Paper 插件：
+`v0.0.1` Release 页面为每个支持的 profile 提供可移植浏览器客户端和可选的
+Paper 插件：
 
-- [下载 `Gaius.html`](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.1/Gaius.html)
+- [下载 Minecraft 26.2 客户端（`Gaius-26.2.html`）](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.1/Gaius-26.2.html)
+- [下载保留的 Minecraft 1.21.11 客户端（`Gaius-1.21.11.html`）](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.1/Gaius-1.21.11.html)
 - [下载可选 Paper 插件](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.1/gaius-server-plugin-0.0.1.jar)
 - [下载 `SHA256SUMS`](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.1/SHA256SUMS)
 - [打开 `v0.0.1` Release 页面](https://github.com/TypeThe0ry/Gaius/releases/tag/v0.0.1)
 
-`Gaius.html` 是前端独立的单人游戏包。下载后可以直接在 Chrome 中打开，单人模式
-不需要由 Gaius 托管网页服务器。多人模式仍需要兼容的 Gaius 服务端插件，或者
-一个浏览器可以访问的 RelayNode。
+每个 `Gaius-<profile>.html` 都是前端独立的单人游戏包。下载后可以直接在 Chrome
+中打开，单人模式不需要由 Gaius 托管网页服务器。多人模式仍需要兼容的 Gaius
+服务端插件，或者一个浏览器可以访问的 RelayNode。
 
 ## 浏览器快速开始
 
-1. 从上方 Release 下载 `Gaius.html`。
+1. 根据要连接的服务器 profile，从上方 Release 下载客户端（主 profile 使用
+   `Gaius-26.2.html`，兼容版本使用 `Gaius-1.21.11.html`）。
 2. 使用 Chrome 或 Chromium 打开。首次操作后，如果浏览器请求音频权限，请允许
    播放声音。
 3. 在进入世界或服务器前输入玩家名称。
@@ -58,16 +61,17 @@ Gaius 是独立软件，与 Mojang Studios、Microsoft 或 Minecraft 没有隶�
 python3 port/scripts/serve-dist.py --host 127.0.0.1 --port 8781
 ```
 
-构建客户端后，在 Chrome 中打开 <http://127.0.0.1:8781/dist/>。不要从任意目录
-直接打开 `/dist/` 文件，并假设所有浏览器安全策略都与 HTTP Origin 完全一致。
+构建对应 profile 后，在 Chrome 中打开 <http://127.0.0.1:8781/dist/26.2/>（或
+`/dist/1.21.11/`）。不要从任意目录直接打开 `/dist/<profile>/` 文件，并假设所有
+浏览器安全策略都与 HTTP Origin 完全一致。
 
 ## 当前功能
 
-- 使用 TeaVM 将 Minecraft Java Edition `1.21.11` 客户端路径编译到浏览器。
+- 使用 TeaVM 将 Minecraft Java Edition `26.2` 和保留的 `1.21.11` 客户端路径编译到浏览器。
 - 通过 Gaius 浏览器平台层提供 WebGL 渲染和 Web Audio 音频。
 - 单人游戏的集成服务器运行在浏览器 Worker 中。
 - 本地世界保存在 IndexedDB，客户端与服务器通过 `MessageChannel` 通信。
-- 生成的 `Gaius.html` 包含浏览器启动器和所需运行时数据。
+- 按 profile 生成的 `Gaius.html`（发布时命名为 `Gaius-<profile>.html`）包含浏览器启动器和所需运行时数据。
 - 多人服务器状态查询和加入流程可经过 WebSocket 到 TCP 的 RelayNode。
 - 提供可选 Paper 插件，为服务器提供直接 WebSocket 入口。
 - 使用 Git LFS 保存浏览器 Release 和 Smoke 构建产物，使源码与可运行版本位于同一仓库。
@@ -101,7 +105,7 @@ flowchart LR
 1. 规范化输入的主机名和端口，同时保留原始主机名用于 Minecraft 握手。
 2. 探测目标主机上的可选 Gaius/Paper 插件入口。插件可用时采用最短路径，不再经过
    外部 RelayNode。
-3. 插件不存在时，从 `Gaius.html` 内嵌注册表快照、仓库维护的
+3. 插件不存在时，从当前 profile 的 `Gaius-<profile>.html` 内嵌注册表快照、仓库维护的
    [`relay-nodes.json`](relay-nodes.json)以及用户配置的动态注册中心中发现公共或
    私有节点。发现数量受到限制，重复和循环注册表会被忽略。
 4. 请求每个候选节点的 `/relay-node/v1?host=...&port=...` 清单。客户端根据节点是否
@@ -123,10 +127,10 @@ RelayNode 是浏览器 WebSocket 帧与 Java 服务器 TCP 字节流之间的传
 不是通用的 Minecraft 协议版本转换器。客户端和目标服务器仍必须使用兼容的协议
 版本。大部分游戏数据保持原样转发，在线模式加密后的数据对 RelayNode 不透明。
 
-对于支持的未加密 `1.21.11` 流程，RelayNode 可以在浏览器长时间重载资源包期间
-执行范围严格受限的 Keepalive、配置阶段重入和资源包代理逻辑，避免服务器因浏览器
-主线程暂停而超时。这些功能不会把 RelayNode 变成游戏服务器，也不会对普通游戏包
-进行全面重写。
+对于支持的未加密 `1.21.11` 和 `26.2` 流程，RelayNode 可以在浏览器长时间重载
+资源包期间执行范围严格受限的 Keepalive、配置阶段重入和资源包代理逻辑，避免服务
+器因浏览器主线程暂停而超时。这些功能不会把 RelayNode 变成游戏服务器，也不会对
+普通游戏包进行全面重写。
 
 服务器列表状态 Ping、登录尝试、重连和每个玩家会话，都拥有独立的 WebSocket 和
 独立的 TCP Socket。多个玩家可以选择同一个 RelayNode，但它们的 Minecraft 协议流
@@ -185,7 +189,7 @@ Worker 负责服务器 Tick、世界生成和本地世界持久化。浏览器�
 | --- | --- |
 | `port/` | TeaVM 移植、浏览器覆盖层、字节码 Patcher、构建脚本和启动器 |
 | `port/web/` | 浏览器启动器、Worker Bootstrap、Smoke 页面和 Release 输入 |
-| `port/web/dist/` | 生成的客户端、Worker、Wasm、压缩数据和可移植 `Gaius.html` |
+| `port/web/dist/<profile>/` | 按 profile 生成的客户端、Worker、Wasm、压缩数据和可移植 `Gaius.html` |
 | `apps/bridge/` | 可自行部署的 RelayNode、注册中心、路由逻辑和 Smoke 测试 |
 | `apps/server-plugin/` | 提供服务端 Gaius 入口的可选 Paper 插件 |
 | `packages/` | 纳入版本控制的浏览器协议和本地世界支持模块 |
@@ -199,48 +203,63 @@ Worker 负责服务器 Tick、世界生成和本地世界持久化。浏览器�
 
 ## 从源码构建
 
-依赖：JDK 21、当前 Node.js LTS、Python 3、`curl`、`jq`、`unzip`、`shasum` 和
-Git LFS。默认构建使用 14 GiB Java Heap，建议物理内存不低于 24 GiB，并在构建时
-关闭占用大量内存的应用。
+依赖：保留的 `1.21.11` profile 需要 JDK 21，主 profile `26.2` 需要 JDK 25 或更高
+版本，另需当前 Node.js LTS、Python 3、`curl`、`jq`、`unzip`、`shasum` 和 Git LFS。
+默认构建使用 14 GiB Java Heap，建议物理内存不低于 24 GiB，并在构建时关闭占用大量
+内存的应用。
 
-获取仅存放在本机的 Minecraft 输入，然后构建浏览器 Release：
+获取仅存放在本机的 Minecraft 输入，然后构建两个 profile 的浏览器 Release。包装器会
+自动使用 `port/target/<profile>`、`port/work/overlays/<profile>` 和
+`port/web/dist/<profile>`，并选择所需的 JDK：
 
 ```sh
 git lfs install
 git lfs pull
-./port/scripts/fetch-version.sh
-./port/scripts/remap-client.sh
-./port/scripts/build-teavm-release.sh
+for profile in 1.21.11 26.2; do
+  export GAIUS_VERSION_PROFILE_PATH="versions/${profile}.json"
+  ./port/scripts/fetch-version.sh
+  ./port/scripts/remap-client.sh
+  bash port/scripts/build-version-release.sh "$profile"
+done
 ```
 
-生成的可移植客户端位于 `port/web/dist/Gaius.html`。不要手工修改
+生成的可移植客户端位于 `port/web/dist/<profile>/Gaius.html`。不要手工修改
 `port/web/dist/` 中的文件，应从启动器和平台源码重新构建。更多 TeaVM 说明见
 [`port/README.md`](port/README.md)。
 
 ## 测试与检查
 
-应运行与改动范围相匹配的检查。完整的浏览器移植验证流程为：
+完成上面的 profile 构建后，应运行与改动范围相匹配的 profile 产物检查：
 
 ```sh
-./port/scripts/build-platform-smoke.sh
-./port/scripts/build-teavm-release.sh
-python3 port/scripts/quick-check.py
-node port/scripts/singleplayer-worker-runtime-smoke.mjs
+for profile in 1.21.11 26.2; do
+  export GAIUS_VERSION_PROFILE_PATH="versions/${profile}.json"
+  export GAIUS_BUILD_ROOT="port/target/${profile}"
+  export GAIUS_OVERLAY_DIRECTORY="port/work/overlays/${profile}"
+  export GAIUS_DIST_DIRECTORY="port/web/dist/${profile}"
+  python3 port/scripts/quick-check.py
+  node port/scripts/singleplayer-worker-runtime-smoke.mjs
+done
 git diff --check
 ```
 
 修改 RelayNode 后还应运行：
 
 ```sh
-cd apps/bridge
-npm run smoke
-npm run smoke:public
+for profile in 1.21.11 26.2; do
+  GAIUS_SMOKE_MINECRAFT_VERSION="$profile" npm run smoke --prefix apps/bridge
+done
+npm run smoke:profiles --prefix apps/bridge
+for profile in 1.21.11 26.2; do
+  GAIUS_PUBLIC_RELAY_MINECRAFT_VERSION="$profile" npm run smoke:public --prefix apps/bridge
+done
 ```
 
 修改 Paper 插件后应运行：
 
 ```sh
-(cd apps/server-plugin && ../../port/mvnw test)
+GAIUS_VERSION_PROFILE_PATH=versions/1.21.11.json \
+  ./port/mvnw -B -ntp -f apps/server-plugin/pom.xml test
 ```
 
 静态检查不能代替 Chrome 运行时验证。修改渲染、输入、音频、世界生成或区块加载后，

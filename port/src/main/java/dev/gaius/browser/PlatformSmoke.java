@@ -1245,7 +1245,7 @@ public final class PlatformSmoke {
         if (!GLFW.glfwInit()) {
             throw new AssertionError("GLFW browser initialization failed");
         }
-        long window = GLFW.glfwCreateWindow(960, 540, "Gaius 1.21.11 platform smoke", 0L, 0L);
+        long window = GLFW.glfwCreateWindow(960, 540, "Gaius platform smoke", 0L, 0L);
         if (window == 0L) {
             throw new AssertionError("Browser window was not created");
         }
@@ -1524,6 +1524,7 @@ public final class PlatformSmoke {
             if (!GL33C.glUnmapBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER)) {
                 throw new AssertionError("Mapped pixel buffer could not be unmapped");
             }
+
             GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, 0);
 
             GL11.glBindTexture(GL11.GL_TEXTURE_2D, texture);
@@ -1574,6 +1575,35 @@ public final class PlatformSmoke {
                 throw new AssertionError(
                         "Mapped pixel-buffer texture upload changed RGBA bytes: "
                                 + red + "/" + green + "/" + blue + "/" + alpha);
+            }
+
+            // Minecraft 26.2 persistently maps each dynamic-uniform ring buffer
+            // and explicitly flushes one aligned block at a non-zero offset.  A
+            // ByteBuffer duplicate with only position/limit adjusted used to be
+            // exported by TeaVM as the entire mapped allocation, turning this
+            // four-byte flush into an out-of-bounds 32-byte WebGL upload.
+            GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, pixelBuffer);
+            GL33C.glBufferData(GL33C.GL_PIXEL_UNPACK_BUFFER, 32L, GL33C.GL_STREAM_DRAW);
+            ByteBuffer subrangeMapped = GL33C.glMapBufferRange(
+                    GL33C.GL_PIXEL_UNPACK_BUFFER,
+                    0L,
+                    32L,
+                    GL33C.GL_MAP_WRITE_BIT | GL33C.GL_MAP_FLUSH_EXPLICIT_BIT);
+            ByteBuffer subrangeView = MemoryUtil.memSlice(subrangeMapped, 4, 4);
+            subrangeView.put(0, (byte) 0x12);
+            subrangeView.put(1, (byte) 0x34);
+            subrangeView.put(2, (byte) 0x56);
+            subrangeView.put(3, (byte) 0x78);
+            GL33C.glFlushMappedBufferRange(GL33C.GL_PIXEL_UNPACK_BUFFER, 4L, 4L);
+            int subrangeRgba = readBoundPixelUnpackBufferRgba(4);
+            int expectedSubrangeRgba = 0x12 | (0x34 << 8) | (0x56 << 16) | (0x78 << 24);
+            if (subrangeRgba != expectedSubrangeRgba) {
+                throw new AssertionError(
+                        "Mapped pixel-buffer sub-range flush changed RGBA bytes: "
+                                + Integer.toUnsignedString(subrangeRgba, 16));
+            }
+            if (!GL33C.glUnmapBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER)) {
+                throw new AssertionError("Mapped pixel-buffer sub-range could not be unmapped");
             }
         } finally {
             GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, 0);
@@ -1680,6 +1710,14 @@ public final class PlatformSmoke {
             return (rgba[0]|(rgba[1]<<8)|(rgba[2]<<16)|(rgba[3]<<24))|0;
             """)
     private static native int readBoundPixelUnpackBufferRgba();
+
+    @JSBody(params = "offset", script = """
+            const gl=window.__gaiusWebGL;
+            const rgba=new Uint8Array(4);
+            gl.getBufferSubData(gl.PIXEL_UNPACK_BUFFER,offset|0,rgba);
+            return (rgba[0]|(rgba[1]<<8)|(rgba[2]<<16)|(rgba[3]<<24))|0;
+            """)
+    private static native int readBoundPixelUnpackBufferRgba(int offset);
 
     @JSBody(params = "offset", script = """
             const gl=window.__gaiusWebGL;

@@ -8,7 +8,8 @@ proxy. Normal Java clients continue to use the ordinary Minecraft port.
 Build with Java 21:
 
 ```sh
-../../port/mvnw -f pom.xml package
+GAIUS_VERSION_PROFILE_PATH=versions/1.21.11.json \
+  ../../port/mvnw -B -ntp -f pom.xml package
 ```
 
 Copy `target/gaius-server-plugin-0.0.1.jar` into the Paper server's

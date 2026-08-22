@@ -8,7 +8,7 @@ import {mkdir, mkdtemp, readFile, rm, stat, writeFile} from "node:fs/promises";
 import {createServer as createHttpServer} from "node:http";
 import {createServer as createNetServer} from "node:net";
 import {tmpdir} from "node:os";
-import {extname, resolve, sep} from "node:path";
+import {basename, extname, isAbsolute, relative, resolve, sep} from "node:path";
 import {fileURLToPath} from "node:url";
 import {
   aggregateChromeProcessRss,
@@ -38,17 +38,108 @@ import {
 
 const args = process.argv.slice(2);
 const smoke = args.includes("--smoke");
+// A distance pin is a test fixture only.  The default benchmark observes the
+// product's real Worker launch chain and must never rewrite its messages.
+const pinWorkerDistance = args.includes("--pin-worker-distance");
 const performanceContractPath = resolve(fileURLToPath(
   new URL("./performance-contract.json", import.meta.url),
 ));
 const performanceContract = JSON.parse(await readFile(performanceContractPath, "utf8"));
 const portRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
+const repositoryRoot = resolve(portRoot, "..");
+const nativePath = (value) => {
+  if (!value) return value;
+  const text = String(value);
+  return process.platform === "win32" && /^\/[A-Za-z](?:\/|$)/.test(text)
+    ? `${text[1].toUpperCase()}:${text.slice(2)}` : text;
+};
+const pathIsAbsolute = (value) => {
+  const text = nativePath(value);
+  return isAbsolute(text) || /^[A-Za-z]:[\\/]/.test(String(text || ""));
+};
+// Build scripts resolve relative paths from the repository root, while version
+// profile values are historically relative to port/.  Normalize both forms
+// explicitly so a child spawned from port/scripts cannot change the selected
+// profile/build/dist/overlay by changing process.cwd().
+const resolveRepositoryPortPath = (value) => {
+  if (value == null || String(value).trim() === "") return null;
+  const text = nativePath(String(value).trim());
+  if (pathIsAbsolute(text)) return resolve(text);
+  const slash = text.replaceAll("\\", "/").replace(/^\.\//, "");
+  return slash === "port" || slash.startsWith("port/")
+    ? resolve(repositoryRoot, slash)
+    : resolve(portRoot, slash);
+};
+const normalizedPath = (value) => String(value || "")
+  .replaceAll("\\", "/")
+  .replace(/^\.\/+/, "");
+const pathInside = (candidate, root) => {
+  const candidateText = normalizedPath(resolve(candidate));
+  const rootText = normalizedPath(resolve(root)).replace(/\/$/, "");
+  const comparableCandidate = process.platform === "win32"
+    ? candidateText.toLowerCase() : candidateText;
+  const comparableRoot = process.platform === "win32" ? rootText.toLowerCase() : rootText;
+  return comparableCandidate === comparableRoot
+    || comparableCandidate.startsWith(comparableRoot + "/");
+};
+const relativePortPath = (candidate) => normalizedPath(relative(portRoot, resolve(candidate)));
 const portConfig = JSON.parse(await readFile(resolve(portRoot, "config.json"), "utf8"));
-const activeVersionProfilePath = resolve(portRoot, String(portConfig.versionProfile || ""));
-if (!activeVersionProfilePath.startsWith(portRoot + sep)) {
+const isolatedEnvironment = [
+  "GAIUS_VERSION_PROFILE_PATH",
+  "GAIUS_BUILD_ROOT",
+  "GAIUS_DIST_DIRECTORY",
+  "GAIUS_OVERLAY_DIRECTORY",
+].some((name) => String(process.env[name] || "").trim() !== "");
+const versionProfileRelative = nativePath(
+  process.env.GAIUS_VERSION_PROFILE_PATH || String(portConfig.versionProfile || ""),
+);
+const activeVersionProfilePath = resolveRepositoryPortPath(versionProfileRelative);
+if (!activeVersionProfilePath || !pathInside(activeVersionProfilePath, portRoot)
+    || resolve(activeVersionProfilePath) === resolve(portRoot)) {
   throw new Error("The active version profile escaped the port directory");
 }
-const activeVersionProfile = JSON.parse(await readFile(activeVersionProfilePath, "utf8"));
+const activeVersionProfileBytes = await readFile(activeVersionProfilePath);
+const activeVersionProfile = JSON.parse(activeVersionProfileBytes.toString("utf8"));
+const activeVersionProfileSha256 = createHash("sha256").update(activeVersionProfileBytes).digest("hex");
+const activeProfileId = String(activeVersionProfile.id || "");
+const activeProfilePath = relativePortPath(activeVersionProfilePath);
+if (!activeProfileId || !/^versions\/[^/]+\.json$/i.test(activeProfilePath)) {
+  throw new Error(`The active version profile path is invalid: ${activeProfilePath}`);
+}
+const activeStorage = activeVersionProfile.storage || {};
+const activeStorageConfig = Object.freeze({
+  schema: Number(activeStorage.schema),
+  databaseName: String(activeStorage.databaseName || ""),
+  prefix: String(activeStorage.prefix || ""),
+  opfsDirectory: String(activeStorage.opfsDirectory || ""),
+});
+const activeWorldgenTelemetryMode = String(
+  activeVersionProfile.worldgenTelemetryMode || "",
+).trim();
+if (activeWorldgenTelemetryMode !== "task-pulsed"
+    && activeWorldgenTelemetryMode !== "checkpoint-only") {
+  throw new Error(
+    `The active version profile has an invalid worldgenTelemetryMode: `
+      + `${JSON.stringify(activeVersionProfile.worldgenTelemetryMode)}`,
+  );
+}
+const activeStorageProfileId = String(activeVersionProfile.id || "");
+const activeStorageWorldVersion = Number(activeVersionProfile.worldVersion);
+if (!activeStorageProfileId || !Number.isSafeInteger(activeStorageWorldVersion) ||
+    activeStorageWorldVersion <= 0 || activeStorageConfig.schema !== 2 ||
+    activeStorageConfig.databaseName !== `gaius-fs-v2-${activeStorageProfileId}` ||
+    activeStorageConfig.prefix !== `gaius.fs.v2:${activeStorageProfileId}:` ||
+    activeStorageConfig.opfsDirectory !== `regions-v2-${activeStorageProfileId}`) {
+  throw new Error(
+    `The active version profile has an invalid schema-2 storage namespace: ${
+      JSON.stringify(activeVersionProfile.storage)}`,
+  );
+}
+const activeStoragePrefix = activeStorageConfig.prefix;
+// The FAST 6/4 release contract is the 26.2 overlay contract. Keep older
+// profiles observable, but never turn an accidental 1.21 8/6 natural launch
+// into release evidence.
+const releaseDistanceProfileCompatible = activeStorageProfileId === "26.2";
 const profileName = value("--profile", "traversal-6-4");
 const benchmarkProfile = performanceContract.profiles?.[profileName];
 if (!benchmarkProfile) {
@@ -69,6 +160,14 @@ const processRssContract = performanceContract.processRss || {};
 const visualOutputContract = performanceContract.visualOutput || {};
 const heartbeatContract = performanceContract.heartbeat || {};
 const runtimeInvariantContract = performanceContract.runtimeInvariants || {};
+const runtimeInvariantContractForProfile = {
+  ...runtimeInvariantContract,
+  worldgen: {
+    ...(runtimeInvariantContract.worldgen || {}),
+    telemetryMode: activeWorldgenTelemetryMode,
+    worldgenTelemetryMode: activeWorldgenTelemetryMode,
+  },
+};
 const gameplayAuthorityContract = performanceContract.gameplayAuthority || {};
 const activeProtocolVersion = Number(activeVersionProfile.protocolVersion);
 const activeGameplayProtocol = gameplayAuthorityContract.protocols?.[String(activeProtocolVersion)];
@@ -114,9 +213,24 @@ const runtimeInvariantSampleCapacity = Math.max(
   64,
   Math.min(16384, Number(measurementContract.runtimeInvariantSampleCapacity || 4096)),
 );
-const chromeBinary = value("--chrome", process.env.GAIUS_CHROME_BIN
-  || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+const defaultChromeBinary = process.platform === "win32"
+  ? "C:/Program Files/Google/Chrome/Application/chrome.exe"
+  : process.platform === "darwin"
+    ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    : "google-chrome";
+const chromeBinary = nativePath(value("--chrome", process.env.GAIUS_CHROME_BIN || defaultChromeBinary));
+if (args.includes("--allow-attached-input")) {
+  throw new Error(
+    "--allow-attached-input has been removed; this benchmark never injects input into attached Chrome",
+  );
+}
+const attachPortRequested = args.includes("--attach-port");
 const attachPort = integer("--attach-port", 0);
+if (attachPortRequested || attachPort > 0) {
+  throw new Error(
+    "--attach-port is disabled: this benchmark requires synthetic input and can only launch its own isolated Chrome",
+  );
+}
 const headless = args.includes("--headless");
 const keepChrome = args.includes("--keep-chrome");
 const warmupMillis = duration(
@@ -175,9 +289,20 @@ const startupTimeoutMillis = duration(
   60_000,
 );
 const playerName = value("--player", "GaiusBench");
-const outputPath = resolve(value(
+const configuredBuildRoot = process.env.GAIUS_BUILD_ROOT
+  ? resolveRepositoryPortPath(process.env.GAIUS_BUILD_ROOT)
+  : (isolatedEnvironment ? resolve(portRoot, "target", activeProfileId) : resolve(portRoot, "target"));
+const configuredOverlayDirectory = process.env.GAIUS_OVERLAY_DIRECTORY
+  ? resolveRepositoryPortPath(process.env.GAIUS_OVERLAY_DIRECTORY)
+  : (isolatedEnvironment
+    ? resolve(portRoot, "work", "overlays", activeProfileId)
+    : resolve(portRoot, "work", "overlays"));
+const isolatedOutputRoot = isolatedEnvironment
+  ? configuredBuildRoot
+  : resolve(portRoot, "target");
+const outputPath = resolveRepositoryPortPath(value(
   "--output",
-  "port/target/chrome-chunk-benchmark.json",
+  resolve(isolatedOutputRoot, "chrome-chunk-benchmark.json"),
 ));
 const visualOutputDirectory = outputPath + ".frames";
 const visualCapturesPerPhase = Math.max(
@@ -204,17 +329,90 @@ const startupMinimumVisualSamples = Math.max(
   1,
   Number(startupContract.minimumVisualSamples || 3),
 );
+// The visual readiness window must cover the whole interactive startup budget:
+// terrain can legitimately appear up to newWorldInteractiveMsMax after world
+// entry (worldgen + first chunk meshes), so keep capturing until three valid
+// terrain samples arrive or roughly three interactive budgets have elapsed.
+// This replaces a fixed ~5s capture burst that could close before the first
+// terrain meshes were presented and then never resume.
+const startupVisualCaptureAttempts = Math.max(
+  24,
+  Math.ceil(
+    Number(startupContract.newWorldInteractiveMsMax || 15_000) * 3
+      / Math.max(100, visualCaptureIntervalMillis),
+  ),
+);
 const startupTerrainPollMillis = Math.max(
   16,
   Number(startupContract.terrainFrameIntervalMs || 50),
 );
 const explicitUrl = value("--url", "");
-const distRoot = resolve(fileURLToPath(new URL("../web/dist/", import.meta.url)));
+const configuredDistRoot = process.env.GAIUS_DIST_DIRECTORY
+  ? resolveRepositoryPortPath(process.env.GAIUS_DIST_DIRECTORY)
+  : (isolatedEnvironment
+    ? resolve(portRoot, "web", "dist", activeProfileId)
+    : fileURLToPath(new URL("../web/dist/", import.meta.url)));
+const distRoot = resolve(configuredDistRoot);
+if (isolatedEnvironment && basename(distRoot) !== activeProfileId) {
+  throw new Error(
+    `An isolated benchmark must use a profile-scoped dist basename ${JSON.stringify(activeProfileId)}; got ${JSON.stringify(basename(distRoot))}`,
+  );
+}
 const releaseManifestPath = resolve(distRoot, "Gaius.manifest.json");
 
 async function readBenchmarkBuildIdentity() {
   const bytes = await readFile(releaseManifestPath);
   const manifest = JSON.parse(bytes.toString("utf8"));
+  const nestedProfile = manifest.buildIdentity?.profile;
+  const expectedProtocolVersion = Number(activeVersionProfile.protocolVersion);
+  const expectedWorldVersion = Number(activeVersionProfile.worldVersion);
+  const manifestProfilePath = normalizedPath(manifest.profilePath);
+  const nestedProfilePath = normalizedPath(nestedProfile?.path);
+  const profileFailures = [];
+  if (String(manifest.profile || "") !== activeProfileId) {
+    profileFailures.push(
+      `manifest.profile=${JSON.stringify(manifest.profile)} expected ${JSON.stringify(activeProfileId)}`,
+    );
+  }
+  if (manifestProfilePath !== activeProfilePath) {
+    profileFailures.push(
+      `manifest.profilePath=${JSON.stringify(manifest.profilePath)} expected ${JSON.stringify(activeProfilePath)}`,
+    );
+  }
+  if (!nestedProfile || typeof nestedProfile !== "object") {
+    profileFailures.push("manifest.buildIdentity.profile is missing");
+  } else {
+    if (String(nestedProfile.id || "") !== activeProfileId) {
+      profileFailures.push(
+        `manifest.buildIdentity.profile.id=${JSON.stringify(nestedProfile.id)} expected ${JSON.stringify(activeProfileId)}`,
+      );
+    }
+    if (nestedProfilePath !== activeProfilePath) {
+      profileFailures.push(
+        `manifest.buildIdentity.profile.path=${JSON.stringify(nestedProfile.path)} expected ${JSON.stringify(activeProfilePath)}`,
+      );
+    }
+    if (Number(nestedProfile.protocolVersion) !== expectedProtocolVersion) {
+      profileFailures.push(
+        `manifest.buildIdentity.profile.protocolVersion=${JSON.stringify(nestedProfile.protocolVersion)} expected ${expectedProtocolVersion}`,
+      );
+    }
+    if (Number(nestedProfile.worldVersion) !== expectedWorldVersion) {
+      profileFailures.push(
+        `manifest.buildIdentity.profile.worldVersion=${JSON.stringify(nestedProfile.worldVersion)} expected ${expectedWorldVersion}`,
+      );
+    }
+    if (String(nestedProfile.sha256 || "").toLowerCase() !== activeVersionProfileSha256) {
+      profileFailures.push(
+        `manifest.buildIdentity.profile.sha256=${JSON.stringify(nestedProfile.sha256)} expected ${activeVersionProfileSha256}`,
+      );
+    }
+  }
+  if (profileFailures.length > 0) {
+    throw new Error(
+      `Gaius.manifest.json profile identity does not match the active profile: ${profileFailures.join("; ")}`,
+    );
+  }
   const compatibilitySha256 = String(manifest.buildIdentity?.compatibilitySha256 || "");
   const artifactCompatibilities = [
     manifest.classesJs?.build?.compatibilitySha256,
@@ -231,6 +429,10 @@ async function readBenchmarkBuildIdentity() {
       && artifactCompatibilities.length === 4
       && artifactCompatibilities.every((entry) => entry === compatibilitySha256),
     profile: manifest.profile || null,
+    profilePath: manifest.profilePath || null,
+    nestedProfile: nestedProfile || null,
+    distRoot,
+    overlayDirectory: configuredOverlayDirectory,
   };
 }
 
@@ -242,11 +444,14 @@ const benchmarkOptionsText = [
   `version:${Number(activeVersionProfile.worldVersion)}`,
   "autoJump:false",
   "operatorItemsTab:true",
+  // Apply the graphics preset before the distance overrides: 26.2's preset
+  // bundles its own render/simulation distance, so applying it after those
+  // lines overwrote the seeded 6/4 with the preset's 8/6.
+  `graphicsPreset:${JSON.stringify(String(environmentContract.graphicsPreset || "fast"))}`,
   `renderDistance:${expectedRenderDistance}`,
   `simulationDistance:${expectedSimulationDistance}`,
   "entityDistanceScaling:0.5",
   `maxFps:${Number(environmentContract.maxFps || 260)}`,
-  `graphicsPreset:${JSON.stringify(String(environmentContract.graphicsPreset || "fast"))}`,
   "renderClouds:\"false\"",
   "cloudRange:32",
   "ao:false",
@@ -289,7 +494,7 @@ if (args.includes("--help")) {
     "Options:",
     "  --url URL                     Use an existing Gaius URL instead of serving port/web/dist",
     "  --profile NAME                Contract profile (default traversal-6-4)",
-    "  --attach-port PORT            Attach to an existing remote-debugging Chrome",
+    "  --attach-port PORT            Rejected: this benchmark requires an isolated Chrome it launches itself",
     "  --headless                    Launch Chrome in headless mode",
     "  --warmup-seconds N            Override the 30 second warmup",
     "  --performance-minutes N       Override the 5 minute performance phase",
@@ -300,19 +505,33 @@ if (args.includes("--help")) {
     "  --sample-millis N             Override the 500 ms performance sample interval",
     "  --output PATH                 JSON report path",
     "  --smoke                       Short plumbing check without hard performance thresholds",
+    "  --pin-worker-distance         Diagnostic-only Worker distance harness override (never release evidence)",
     "  --print-config                Print resolved benchmark configuration and exit",
   ].join("\n"));
   process.exit(0);
 }
 if (args.includes("--print-config")) {
   console.log(JSON.stringify({
-    mode: smoke
-      ? "smoke-non-gating"
-      : (benchmarkProfile.releaseEvidence === true ? "release-gating" : "diagnostic-stress"),
-    gating: !smoke && benchmarkProfile.releaseEvidence === true,
-    releaseEvidence: benchmarkProfile.releaseEvidence === true,
+    mode: pinWorkerDistance
+      ? (smoke ? "smoke-pin-non-gating" : "diagnostic-pin-non-gating")
+      : (smoke
+        ? "smoke-non-gating"
+        : (benchmarkProfile.releaseEvidence === true && releaseDistanceProfileCompatible
+          ? "release-gating" : "diagnostic-stress")),
+    gating: !smoke && !pinWorkerDistance && releaseDistanceProfileCompatible
+      && benchmarkProfile.releaseEvidence === true,
+    releaseEvidence: !pinWorkerDistance && releaseDistanceProfileCompatible
+      && benchmarkProfile.releaseEvidence === true,
+    workerDistanceMode: pinWorkerDistance ? "harness-pin-diagnostic" : "natural-observation",
+    workerDistancePin: pinWorkerDistance,
     chromeBinary,
     attachPort,
+    attachPortRequested,
+    attachMode: "disabled-input-required",
+    isolatedEnvironment,
+    buildRoot: configuredBuildRoot,
+    distRoot,
+    overlayDirectory: configuredOverlayDirectory,
     headless,
     warmupMillis,
     performanceMillis,
@@ -329,6 +548,12 @@ if (args.includes("--print-config")) {
       id: activeVersionProfile.id,
       protocolVersion: activeProtocolVersion,
       worldVersion: activeVersionProfile.worldVersion,
+      worldgenTelemetryMode: activeWorldgenTelemetryMode,
+      storage: activeStorageConfig,
+      storageSchema: activeStorageConfig.schema,
+      storageDatabaseName: activeStorageConfig.databaseName,
+      storagePrefix: activeStorageConfig.prefix,
+      storageOpfsDirectory: activeStorageConfig.opfsDirectory,
       gameplayPacketIds: activeGameplayPacketIds,
       airBlockStateId: activeAirBlockStateId,
     },
@@ -344,6 +569,18 @@ if (args.includes("--print-config")) {
     profile: benchmarkProfile,
     expectedRenderDistance,
     expectedSimulationDistance,
+    workerDistanceContract: {
+      expectedStartDistance: expectedDistanceLabel,
+      effectiveDistanceModel: "min(client-options-preference,worker-server-distance)",
+      proof: pinWorkerDistance
+        ? "diagnostic harness override plus separately captured raw start message"
+        : "profile-gate observation wrapper plus captured raw start message",
+      mode: pinWorkerDistance ? "harness-pin-diagnostic" : "natural-observation",
+      releaseEligible: !pinWorkerDistance && releaseDistanceProfileCompatible,
+      releaseTargetProfile: "26.2",
+      activeProfileId: activeStorageProfileId,
+      storage: activeStorageConfig,
+    },
     requestedFrameLimit: environmentContract.maxFpsLabel || "Unlimited",
     verifiedUncapped: null,
     uncappedEvidence: environmentContract.uncappedEvidence || null,
@@ -352,6 +589,7 @@ if (args.includes("--print-config")) {
     postGcFinalWindows,
     longTaskCapacity,
     runtimeInvariantSampleCapacity,
+    worldgenTelemetryMode: activeWorldgenTelemetryMode,
     buildIdentity: benchmarkBuildIdentity,
   }, null, 2));
   process.exit(0);
@@ -365,7 +603,14 @@ if (benchmarkProfile.route !== "singleplayer") {
     generatedAt: new Date().toISOString(),
     passed: false,
     verdict: "inconclusive",
-    mode: smoke ? "smoke-non-gating" : "release-gating",
+    mode: smoke
+      ? "smoke-non-gating"
+      : (pinWorkerDistance
+        ? "diagnostic-pin-non-gating"
+        : (benchmarkProfile.releaseEvidence === true && releaseDistanceProfileCompatible
+          ? "release-gating" : "diagnostic-stress")),
+    gating: false,
+    releaseEvidence: false,
     profileName,
     route: benchmarkProfile.route,
     routeSupported: false,
@@ -529,13 +774,26 @@ async function readProcessRssByPid(pids) {
     .map(Number)
     .filter((pid) => Number.isSafeInteger(pid) && pid > 0))];
   if (requestedPids.length === 0) {
-    throw new Error("no Chrome process IDs were available for ps");
+    throw new Error("no Chrome process IDs were available for RSS query");
   }
+  const isWindows = process.platform === "win32";
+  const command = isWindows ? "powershell.exe" : "ps";
+  const commandArgs = isWindows
+    ? [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy", "Bypass",
+      "-Command",
+      `$ids = @(${requestedPids.join(",")}); `
+        + "Get-Process -Id $ids -ErrorAction SilentlyContinue "
+        + "| ForEach-Object { '{0} {1}' -f $_.Id, "
+        + "[math]::Floor($_.WorkingSet64 / 1KB) }",
+    ]
+    : ["-o", "pid=,rss=", "-p", requestedPids.join(",")];
+  const queryName = isWindows ? "PowerShell WorkingSet64" : "ps RSS";
   const output = await new Promise((resolveRead, rejectRead) => {
-    const child = spawn("ps", [
-      "-o", "pid=,rss=",
-      "-p", requestedPids.join(","),
-    ], {stdio: ["ignore", "pipe", "pipe"]});
+    const child = spawn(command, commandArgs, {stdio: ["ignore", "pipe", "pipe"]});
     let stdout = "";
     let stderr = "";
     let settled = false;
@@ -559,13 +817,14 @@ async function readProcessRssByPid(pids) {
         finish(null, stdout);
       } else {
         finish(new Error(
-          `ps RSS query exited with code ${code} signal ${signal || "none"}: ${stderr.trim()}`,
+          `${queryName} query exited with code ${code} signal ${signal || "none"}: ${stderr.trim()}`,
         ));
       }
     });
     const timeout = setTimeout(() => {
-      child.kill("SIGTERM");
-      finish(new Error("ps RSS query timed out after 5000 ms"));
+      if (isWindows) child.kill();
+      else child.kill("SIGTERM");
+      finish(new Error(`${queryName} query timed out after 5000 ms`));
     }, 5000);
   });
   return parsePsRssOutput(output);
@@ -787,7 +1046,7 @@ async function waitFor(session, expression, timeoutMillis, label) {
   let lastError;
   while (Date.now() < deadline) {
     try {
-      if (await evaluate(session, expression, 5000)) return;
+      if (await evaluate(session, expression, 25000)) return;
     } catch (error) {
       lastError = error;
     }
@@ -822,6 +1081,15 @@ function configureBenchmarkUrl(rawUrl) {
   configured.searchParams.set("autoDpr", environmentContract.autoDpr === false ? "0" : "1");
   configured.searchParams.set("perfHud", "0");
   configured.searchParams.set("glStats", "1");
+  // The launcher defaults the mesh buffer-shadow budget to 1 GiB (single 256 MiB),
+  // which lets the WebGL shadow grow past the contract's 64 MiB budget and stall a
+  // frame on one large shadow copy. Pin the runtime budget to the contract so the
+  // runtime-invariants webglMemory gate and the longest-frame gate see the intended
+  // configuration instead of the launcher's generous defaults.
+  const webglMemory = performanceContract.runtimeInvariants?.webglMemory || {};
+  const shadowBudgetBytes = Number(webglMemory.bufferShadowBudgetBytes) || 64 * 1024 * 1024;
+  configured.searchParams.set("totalShadowMB", String(Math.max(1, Math.round(shadowBudgetBytes / (1024 * 1024)))));
+  configured.searchParams.set("singleShadowMB", "16");
   return configured.href;
 }
 
@@ -848,7 +1116,11 @@ async function startStaticServer(root) {
         "Cross-Origin-Opener-Policy": "same-origin",
         "Cross-Origin-Resource-Policy": "same-origin",
       };
-      if (path.endsWith(".gz")) headers["Content-Encoding"] = "gzip";
+      // The Gaius launcher and its singleplayer worker fetch .gz assets and
+      // decompress them themselves (DecompressionStream). serve-dist.py also
+      // serves .gz raw; sending Content-Encoding: gzip here would make the
+      // browser transparently decompress the payload and the worker would
+      // decompress it a second time (bootstrap-crash: Failed to fetch).
       response.writeHead(200, headers);
       createReadStream(path).pipe(response);
     } catch (error) {
@@ -872,10 +1144,19 @@ function keyDefinition(code) {
   return {
     KeyW: {key: "w", virtualKey: 87},
     KeyA: {key: "a", virtualKey: 65},
+    KeyS: {key: "s", virtualKey: 83},
     KeyD: {key: "d", virtualKey: 68},
     Space: {key: " ", virtualKey: 32},
     ControlLeft: {key: "Control", virtualKey: 17},
+    ControlRight: {key: "Control", virtualKey: 17},
+    ShiftLeft: {key: "Shift", virtualKey: 16},
+    ShiftRight: {key: "Shift", virtualKey: 16},
+    AltLeft: {key: "Alt", virtualKey: 18},
+    AltRight: {key: "Alt", virtualKey: 18},
     Escape: {key: "Escape", virtualKey: 27},
+    Tab: {key: "Tab", virtualKey: 9},
+    Enter: {key: "Enter", virtualKey: 13},
+    Backspace: {key: "Backspace", virtualKey: 8},
     Digit1: {key: "1", virtualKey: 49},
     Digit2: {key: "2", virtualKey: 50},
     Digit3: {key: "3", virtualKey: 51},
@@ -888,6 +1169,17 @@ function keyDefinition(code) {
   }[code];
 }
 
+// Keep this superset in one place.  The cleanup path deliberately sends keyUp
+// for every key a benchmark phase can ever press, even when the phase failed
+// before its matching keyUp or the CDP command was delayed.
+const benchmarkKeyCodes = [
+  "KeyW", "KeyA", "KeyS", "KeyD", "Space",
+  "ControlLeft", "ControlRight", "ShiftLeft", "ShiftRight",
+  "AltLeft", "AltRight", "Escape", "Tab", "Enter", "Backspace",
+  "Digit1", "Digit2", "Digit3", "Digit4", "Digit5",
+  "Digit6", "Digit7", "Digit8", "Digit9",
+];
+
 async function dispatchKey(session, code, type) {
   const definition = keyDefinition(code);
   if (!definition) throw new Error("Unsupported benchmark key " + code);
@@ -898,6 +1190,42 @@ async function dispatchKey(session, code, type) {
     windowsVirtualKeyCode: definition.virtualKey,
     nativeVirtualKeyCode: definition.virtualKey,
   });
+}
+
+// CDP input can outlive a failed benchmark/leave-world transition.  Always
+// release every mouse button and pointer lock before closing the session so a
+// non-headless run cannot leave the operator's desktop in a drag/selection
+// state (or keep Minecraft's captured cursor stuck in a corner).
+async function releaseInputCapture(session) {
+  if (!session) return;
+  for (const code of benchmarkKeyCodes) {
+    try {
+      await dispatchKey(session, code, "keyUp");
+    } catch (ignored) {
+    }
+  }
+  for (const button of ["left", "middle", "right", "back", "forward"]) {
+    try {
+      await session.send("Input.dispatchMouseEvent", {
+        type: "mouseReleased",
+        x: 0,
+        y: 0,
+        button,
+        buttons: 0,
+        clickCount: 1,
+      });
+    } catch (ignored) {
+    }
+  }
+  try {
+    await evaluate(session, "(() => {"
+      + "if (document.exitPointerLock) document.exitPointerLock();"
+      + "const selection=window.getSelection&&window.getSelection();"
+      + "if(selection) selection.removeAllRanges();"
+      + "return true;"
+    + "})()");
+  } catch (ignored) {
+  }
 }
 
 async function click(session, x, y, count = 1) {
@@ -969,18 +1297,27 @@ async function clickButton(session, label, timeoutMillis = 45_000) {
 }
 
 async function clickFirstWorld(session) {
-  const entry = await evaluate(session, "(() => {"
-    + "const state=window.__gaiusMinecraftState||{};"
-    + "const first=state.worldSelection&&state.worldSelection.first;"
-    + "const canvas=document.querySelector('canvas');"
-    + "const rect=canvas?canvas.getBoundingClientRect():null;"
-    + "const size=state.screenSize||null;"
-    + "if(!first||!rect||!size)return null;"
-    + "return {"
-    + "x:Math.round(rect.left+(Number(first.x)+Number(first.width)/2)*rect.width/Number(size.width)),"
-    + "y:Math.round(rect.top+(Number(first.y)+Number(first.height)/2)*rect.height/Number(size.height))"
-    + "};"
-    + "})()");
+  // The world list populates asynchronously after the selection screen opens; poll
+  // briefly before giving up so the create-new-world fallback is not chosen while
+  // an existing save is still appearing.
+  let entry = null;
+  const listDeadline = Date.now() + 15_000;
+  while (Date.now() < listDeadline) {
+    entry = await evaluate(session, "(() => {"
+      + "const state=window.__gaiusMinecraftState||{};"
+      + "const first=state.worldSelection&&state.worldSelection.first;"
+      + "const canvas=document.querySelector('canvas');"
+      + "const rect=canvas?canvas.getBoundingClientRect():null;"
+      + "const size=state.screenSize||null;"
+      + "if(!first||!rect||!size)return null;"
+      + "return {"
+      + "x:Math.round(rect.left+(Number(first.x)+Number(first.width)/2)*rect.width/Number(size.width)),"
+      + "y:Math.round(rect.top+(Number(first.y)+Number(first.height)/2)*rect.height/Number(size.height))"
+      + "};"
+      + "})()");
+    if (entry) break;
+    await sleep(250);
+  }
   if (!entry) return false;
   await click(session, entry.x, entry.y, 1);
   await sleep(100);
@@ -1005,7 +1342,7 @@ async function passProfileGate(session) {
   );
   return evaluate(session, "(async() => {"
     + "const gate=document.querySelector('#profile-gate');"
-    + "if(!gate||gate.hidden!==false)return {submitted:false,seeded:false,reason:'gate-not-visible'};"
+    + "if(!gate||gate.hidden!==false)throw new Error('Profile gate was not visible; refusing to reuse an existing Worker');"
     + "const path='/gaius/options.txt';"
     + "const encoded=" + JSON.stringify(benchmarkOptionsBase64) + ";"
     + "const storageReady=typeof globalThis.__gaiusFsReady!=='undefined';"
@@ -1013,6 +1350,7 @@ async function passProfileGate(session) {
     + "const files=globalThis.__gaiusPersistentFiles||"
     + "(globalThis.__gaiusPersistentFiles=Object.create(null));"
     + "files[path]=encoded;"
+    + "const benchmarkStoragePrefix=" + JSON.stringify(activeStoragePrefix) + ";"
     + "let fsPut=false;let flushed=false;"
     + "try{if(typeof globalThis.__gaiusFsPut==='function'){"
     + "fsPut=globalThis.__gaiusFsPut(path,encoded)!==false;}}catch(ignored){}"
@@ -1020,49 +1358,120 @@ async function passProfileGate(session) {
     + "await globalThis.__gaiusFsFlush();flushed=true;}}catch(ignored){}"
     + "let localStoragePut=false;"
     + "try{if(globalThis.localStorage){"
-    + "localStorage.setItem('gaius.fs.v1:'+path,encoded);localStoragePut=true;"
+    + "localStorage.setItem(benchmarkStoragePrefix+path,encoded);localStoragePut=true;"
     + "}}catch(ignored){}"
-    + "let persisted=false;try{persisted=localStorage.getItem('gaius.fs.v1:'+path)===encoded;}"
+    + "let persisted=false;try{persisted=localStorage.getItem(benchmarkStoragePrefix+path)===encoded;}"
     + "catch(ignored){}"
-    + "globalThis.__gaiusBenchmarkProfile=" + JSON.stringify({
-      name: profileName,
-      renderDistance: expectedRenderDistance,
-      simulationDistance: expectedSimulationDistance,
-      workload: benchmarkProfile.workload,
+     + "globalThis.__gaiusBenchmarkProfile=" + JSON.stringify({
+       name: profileName,
+       renderDistance: expectedRenderDistance,
+       simulationDistance: expectedSimulationDistance,
+       workload: benchmarkProfile.workload,
+     }) + ";"
+    + "const workerRegistry=globalThis.__gaiusSingleplayerWorkers;"
+    + "const workerRegistryPresent=workerRegistry!==null&&workerRegistry!==undefined;"
+    + "const workerRegistrySize=workerRegistryPresent?workerRegistry.size:0;"
+    + "if(workerRegistryPresent&&(typeof workerRegistry.size!=='number'"
+    + "||!Number.isInteger(workerRegistrySize)||workerRegistrySize!==0))"
+    + "throw new Error('Profile gate requires zero pre-existing singleplayer Workers');"
+    // Install the observer before submit so the first product-owned Worker
+    // launch is visible.  The default path is deliberately natural: it only
+    // snapshots the original message and forwards that same object untouched.
+    // A pin is an explicit diagnostic fixture and is never release evidence.
+    + "let workerDistanceObserverInstalled=false;"
+    + "const pinWorkerDistance=" + JSON.stringify(pinWorkerDistance) + ";"
+    + "const expectedStorage=" + JSON.stringify({
+      profileId: activeStorageProfileId,
+      worldVersion: activeStorageWorldVersion,
+      storageSchema: activeStorageConfig.schema,
+      storageDatabaseName: activeStorageConfig.databaseName,
+      storagePrefix: activeStorageConfig.prefix,
+      storageOpfsDirectory: activeStorageConfig.opfsDirectory,
     }) + ";"
-    // The generated client can restore its own Options instance after the
-    // profile gate, so the file seed alone is not a reliable Worker launch
-    // parameter. Keep this benchmark-side override at the actual boundary
-    // where the integrated-server Worker receives its distances.
-    + "let workerDistanceOverrideInstalled=false;"
-    + "try{const NativeWorker=globalThis.Worker;"
-    + "if(typeof NativeWorker==='function'&&!globalThis.__gaiusBenchmarkWorkerDistanceOverride){"
     + "const expectedDistances={renderDistance:" + JSON.stringify(expectedRenderDistance)
-    + ",simulationDistance:" + JSON.stringify(expectedSimulationDistance) + "};"
-    + "const WorkerProxy=new Proxy(NativeWorker,{construct(target,args){"
-    + "const worker=Reflect.construct(target,args,target);"
-    + "const originalPostMessage=worker.postMessage.bind(worker);"
-    + "worker.postMessage=function(message,transfer){"
-    + "if(message&&(message.type==='start'||message.type==='distances')){"
-    + "message=Object.assign({},message,expectedDistances);"
-    + "worker.__gaiusDistances=expectedDistances.renderDistance+':'+expectedDistances.simulationDistance;}"
-    + "return transfer===undefined?originalPostMessage(message):originalPostMessage(message,transfer);};"
-    + "return worker;}});"
-    + "globalThis.Worker=WorkerProxy;"
-    + "globalThis.__gaiusBenchmarkWorkerDistanceOverride=true;"
-    + "workerDistanceOverrideInstalled=true;}"
-    + "else if(globalThis.__gaiusBenchmarkWorkerDistanceOverride)workerDistanceOverrideInstalled=true;"
-    + "}catch(ignored){}"
-    + "const input=document.querySelector('#profile-name');"
-    + "const submit=document.querySelector('#profile-submit');"
-    + "if(!input||!submit)return {submitted:false,seeded:persisted||fsPut||localStoragePut,"
-    + "persisted,fsPut,flushed,localStoragePut,storageReady,workerDistanceOverrideInstalled,"
-    + "reason:'profile-controls-missing'};"
+      + ",simulationDistance:" + JSON.stringify(expectedSimulationDistance) + "};"
+    + "const naturalWorkerLog=Array.isArray(globalThis.__gaiusBenchmarkNaturalWorkerMessages)"
+    + "?globalThis.__gaiusBenchmarkNaturalWorkerMessages"
+    + ":(globalThis.__gaiusBenchmarkNaturalWorkerMessages=[]);"
+    + "const workerOverrideLog=Array.isArray(globalThis.__gaiusBenchmarkWorkerOverrides)"
+    + "?globalThis.__gaiusBenchmarkWorkerOverrides"
+    + ":(globalThis.__gaiusBenchmarkWorkerOverrides=[]);"
+    + "const naturalWorkerLogState=globalThis.__gaiusBenchmarkNaturalWorkerEvidenceState||"
+    + "(globalThis.__gaiusBenchmarkNaturalWorkerEvidenceState={truncatedCount:0});"
+    + "const harnessOverrideLogState=globalThis.__gaiusBenchmarkHarnessOverrideEvidenceState||"
+    + "(globalThis.__gaiusBenchmarkHarnessOverrideEvidenceState={truncatedCount:0});"
+    + "const appendBounded=(log,state,entry)=>{"
+    + "if(log.length>=64){log.splice(0,log.length-63);state.truncatedCount++;}"
+    + "log.push(entry);};"
+    + "const snapshotWorkerMessage=message=>({"
+    + "type:String(message.type),"
+    + "renderDistance:message.renderDistance==null?null:message.renderDistance,"
+    + "simulationDistance:message.simulationDistance==null?null:message.simulationDistance,"
+    + "profileId:message.profileId==null?null:message.profileId,"
+    + "worldVersion:message.worldVersion==null?null:message.worldVersion,"
+    + "storageSchema:message.storageSchema==null?null:message.storageSchema,"
+    + "storageDatabaseName:message.storageDatabaseName==null?null:message.storageDatabaseName,"
+    + "storagePrefix:message.storagePrefix==null?null:message.storagePrefix,"
+    + "storageOpfsDirectory:message.storageOpfsDirectory==null?null:message.storageOpfsDirectory,"
+    + "storage:{profileId:message.profileId==null?null:message.profileId,"
+    + "worldVersion:message.worldVersion==null?null:message.worldVersion,"
+    + "storageSchema:message.storageSchema==null?null:message.storageSchema,"
+    + "storageDatabaseName:message.storageDatabaseName==null?null:message.storageDatabaseName,"
+    + "storagePrefix:message.storagePrefix==null?null:message.storagePrefix,"
+    + "storageOpfsDirectory:message.storageOpfsDirectory==null?null:message.storageOpfsDirectory}"
+    + "});"
+    + "const NativeWorker=globalThis.Worker;"
+    + "if(typeof NativeWorker!=='function')throw new Error('Worker constructor unavailable');"
+    + "if(globalThis.__gaiusBenchmarkWorkerObserverInstalled)"
+    + "throw new Error('Worker observation wrapper was already installed');"
+    + "{"
+     + "const WorkerProxy=new Proxy(NativeWorker,{construct(target,args){"
+     + "const worker=Reflect.construct(target,args,target);"
+    + "const workerSequence=Number(globalThis.__gaiusBenchmarkWorkerSequence||0)+1;"
+    + "globalThis.__gaiusBenchmarkWorkerSequence=workerSequence;"
+    + "worker.__gaiusBenchmarkWorkerSequence=workerSequence;"
+     + "const originalPostMessage=worker.postMessage.bind(worker);"
+     + "worker.postMessage=function(message,transfer){"
+     + "if(message&&(message.type==='start'||message.type==='distances')){"
+    + "const original=snapshotWorkerMessage(message);"
+    + "appendBounded(naturalWorkerLog,naturalWorkerLogState,{at:Date.now(),workerSequence,rawMessage:original,...original});"
+    + "if(pinWorkerDistance){"
+    + "const pinned={...message,...expectedDistances,...expectedStorage};"
+    + "appendBounded(workerOverrideLog,harnessOverrideLogState,{at:Date.now(),workerSequence,"
+    + "type:original.type,original,renderDistance:pinned.renderDistance,"
+    + "simulationDistance:pinned.simulationDistance,profileId:pinned.profileId,"
+    + "worldVersion:pinned.worldVersion,storageSchema:pinned.storageSchema,"
+    + "storageDatabaseName:pinned.storageDatabaseName,storagePrefix:pinned.storagePrefix,"
+    + "storageOpfsDirectory:pinned.storageOpfsDirectory,storage:{profileId:pinned.profileId,"
+    + "worldVersion:pinned.worldVersion,storageSchema:pinned.storageSchema,"
+    + "storageDatabaseName:pinned.storageDatabaseName,storagePrefix:pinned.storagePrefix,"
+    + "storageOpfsDirectory:pinned.storageOpfsDirectory}});"
+    + "message=pinned;worker.__gaiusDistances=expectedDistances.renderDistance+':'+"
+    + "expectedDistances.simulationDistance;}"
+      + "}"
+      + "return transfer===undefined?originalPostMessage(message):originalPostMessage(message,transfer);};"
+      + "return worker;}});"
+      + "globalThis.Worker=WorkerProxy;"
+      + "globalThis.__gaiusBenchmarkWorkerObserverInstalled=true;"
+      + "if(pinWorkerDistance)globalThis.__gaiusBenchmarkWorkerDistanceOverride=true;"
+    + "workerDistanceObserverInstalled=true;}"
+    + "const registryBeforeSubmit=globalThis.__gaiusSingleplayerWorkers;"
+    + "const registryBeforeSubmitPresent=registryBeforeSubmit!==null&&registryBeforeSubmit!==undefined;"
+    + "const registryBeforeSubmitSize=registryBeforeSubmitPresent?registryBeforeSubmit.size:0;"
+    + "if(registryBeforeSubmitPresent&&(typeof registryBeforeSubmit.size!=='number'"
+    + "||!Number.isInteger(registryBeforeSubmitSize)||registryBeforeSubmitSize!==0))"
+    + "throw new Error('Profile gate observed a pre-existing singleplayer Worker before submit');"
+      + "const input=document.querySelector('#profile-name');"
+      + "const submit=document.querySelector('#profile-submit');"
+      + "if(!input||!submit)throw new Error('Profile gate controls were not exposed');"
     + "input.value=" + JSON.stringify(playerName) + ";"
     + "input.dispatchEvent(new Event('input',{bubbles:true}));"
     + "submit.click();"
     + "return {submitted:true,seeded:persisted||fsPut||localStoragePut,"
-    + "persisted,fsPut,flushed,localStoragePut,storageReady,workerDistanceOverrideInstalled};"
+    + "persisted,fsPut,flushed,localStoragePut,storageReady,workerDistanceObserverInstalled,"
+    + "workerDistanceMode:pinWorkerDistance?'harness-pin-diagnostic':'natural-observation',"
+    + "workerRegistryPresent,workerRegistrySize,naturalWorkerCount:naturalWorkerLog.length,"
+    + "workerOverrideCount:workerOverrideLog.length};"
     + "})()");
 }
 
@@ -1518,7 +1927,7 @@ async function waitForStrictWorldReadiness(session, deadlineAt) {
       && observed.frameAgeMillis <= startupMaximumFrameGapMillis;
     if (observed.baseReady && frameContinuous && frameAdvanced
         && summary.validVisualSamples < startupMinimumVisualSamples
-        && visualAttempt < Math.max(24, startupMinimumVisualSamples * 4)
+        && visualAttempt < startupVisualCaptureAttempts
         && observed.at - lastVisualAttemptAt >= visualCaptureIntervalMillis) {
       visualAttempt++;
       lastVisualAttemptAt = observed.at;
@@ -2111,7 +2520,10 @@ async function startTravel(session, center) {
   await dispatchKey(session, "KeyW", "keyDown");
   let steering = 0;
   let paused = false;
-  const timer = setInterval(() => {
+  let stallTicks = 0;
+  let lastX = null;
+  let lastZ = null;
+  const timer = setInterval(async () => {
     if (paused) return;
     steering++;
     const x = center.x + Math.min(160, steering * 2);
@@ -2122,6 +2534,35 @@ async function startTravel(session, center) {
       button: "none",
     }).catch(() => {});
     if (steering >= 80) steering = 0;
+
+    // Stall detection: some spawns put a hill/cliff directly ahead and the
+    // player walks into it forever. If it has not advanced for a few seconds,
+    // swing the camera hard and re-tap jump to escape instead of stalling the
+    // traversal (which needs to cross 16 chunks / 256 blocks).
+    stallTicks++;
+    if (stallTicks >= 4) {
+      stallTicks = 0;
+      try {
+        const pos = await evaluate(session,
+          "(() => { const s = window.__gaiusMinecraftState || {}; const p = s.player; return p ? { x: p.x, z: p.z } : null; })()");
+        if (pos) {
+          if (lastX != null && lastZ != null
+              && Math.abs(pos.x - lastX) + Math.abs(pos.z - lastZ) < 1.0) {
+            steering = (steering + 40) % 80;
+            await session.send("Input.dispatchMouseEvent", {
+              type: "mouseMoved",
+              x: Math.min(center.x + 420, 1260),
+              y: center.y,
+              button: "none",
+            }).catch(() => {});
+            await dispatchKey(session, "Space", "keyUp").catch(() => {});
+            await dispatchKey(session, "Space", "keyDown").catch(() => {});
+          }
+          lastX = pos.x;
+          lastZ = pos.z;
+        }
+      } catch (ignored) {}
+    }
   }, 1000);
   const stop = async () => {
     clearInterval(timer);
@@ -2267,6 +2708,31 @@ async function resetMeasurement(session) {
     + "return {measurementId,distances:workers&&typeof workers.values==='function'"
     + "?Array.from(workers.values()).filter(worker=>worker&&!worker.__gaiusTerminal)"
     + ".map(worker=>String(worker.__gaiusDistances||'')):[]};"
+    + "})()");
+}
+
+async function collectWorkerDistanceEvidence(session) {
+  return evaluate(session, "(() => {"
+    + "const naturalRaw=Array.isArray(globalThis.__gaiusBenchmarkNaturalWorkerMessages)"
+    + "?globalThis.__gaiusBenchmarkNaturalWorkerMessages.slice(-64):[];"
+    + "const harnessRaw=Array.isArray(globalThis.__gaiusBenchmarkWorkerOverrides)"
+    + "?globalThis.__gaiusBenchmarkWorkerOverrides.slice(-64):[];"
+    + "const naturalState=globalThis.__gaiusBenchmarkNaturalWorkerEvidenceState||{};"
+    + "const harnessState=globalThis.__gaiusBenchmarkHarnessOverrideEvidenceState||{};"
+    + "const workers=globalThis.__gaiusSingleplayerWorkers;"
+    + "const workerStates=workers&&typeof workers.entries==='function'"
+    + "?Array.from(workers.entries()).map(([id,item])=>({sessionId:String(id),"
+    + "terminal:!!item?.__gaiusTerminal,distances:String(item?.__gaiusDistances||''),"
+    + "workerSequence:Number(item?.__gaiusBenchmarkWorkerSequence)||null})) : [];"
+    + "return {"
+    + "naturalWorkerEvidence:{mode:'natural-observation',messages:naturalRaw,"
+    + "rawMessages:naturalRaw,"
+    + "truncatedCount:Number(naturalState.truncatedCount)||0,complete:Number(naturalState.truncatedCount||0)===0},"
+    + "harnessOverrideEvidence:{enabled:globalThis.__gaiusBenchmarkWorkerDistanceOverride===true,"
+    + "mode:globalThis.__gaiusBenchmarkWorkerDistanceOverride===true?'harness-pin-diagnostic':'disabled',"
+    + "messages:harnessRaw,overrides:harnessRaw,truncatedCount:Number(harnessState.truncatedCount)||0,"
+    + "releaseEligible:false},"
+    + "workerStates,workerRegistrySize:workers&&typeof workers.size==='number'?workers.size:0};"
     + "})()");
 }
 
@@ -2517,7 +2983,8 @@ async function finalTelemetry(session) {
     + "const drained=Math.max(0,Number(globalThis.__gaiusBenchmarkFrameDrainCount)||0);"
     + "const optionsText=(()=>{try{const files=globalThis.__gaiusPersistentFiles||{};"
     + "let value=Object.prototype.hasOwnProperty.call(files,'/gaius/options.txt')"
-    + "?files['/gaius/options.txt']:localStorage.getItem('gaius.fs.v1:/gaius/options.txt');"
+    + "?files['/gaius/options.txt']:localStorage.getItem(" +
+      JSON.stringify(activeStoragePrefix) + "+'/gaius/options.txt');"
     + "if(value==null)return null;if(value instanceof ArrayBuffer)value=new Uint8Array(value);"
     + "if(ArrayBuffer.isView(value))return new TextDecoder().decode(value);"
     + "if(typeof value==='string'){try{const binary=atob(value);const bytes=new Uint8Array(binary.length);"
@@ -3035,6 +3502,47 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
   );
   const canvasValues = new Set(allSamples.map((sample) => JSON.stringify(sample.canvas)));
   const distances = new Set(validSamples.flatMap((sample) => sample.distances || []));
+  const workerDistanceEvidence = context.workerDistanceEvidence || {};
+  const naturalWorkerEvidence = workerDistanceEvidence.naturalWorkerEvidence || {};
+  const harnessOverrideEvidence = workerDistanceEvidence.harnessOverrideEvidence || {};
+  const naturalWorkerMessages = Array.isArray(naturalWorkerEvidence.messages)
+    ? naturalWorkerEvidence.messages : [];
+  const workerStartMessages = naturalWorkerMessages.filter(
+    (item) => item && item.type === "start",
+  );
+  const workerStartContractMatches = workerStartMessages.filter((item) =>
+    Number(item.renderDistance) === expectedRenderDistance
+      && Number(item.simulationDistance) === expectedSimulationDistance
+      && String(item.profileId || "") === activeStorageProfileId
+      && Number(item.worldVersion) === activeStorageWorldVersion
+      && Number(item.storageSchema) === activeStorageConfig.schema
+      && String(item.storageDatabaseName || "") === activeStorageConfig.databaseName
+      && String(item.storagePrefix || "") === activeStorageConfig.prefix
+      && String(item.storageOpfsDirectory || "") === activeStorageConfig.opfsDirectory,
+  );
+  const naturalWorkerDistances = new Set(naturalWorkerMessages
+    .filter((item) => item && (item.type === "start" || item.type === "distances"))
+    .map((item) => {
+      const render = Number(item.renderDistance);
+      const simulation = Number(item.simulationDistance);
+      return Number.isFinite(render) && Number.isFinite(simulation)
+        ? `${render}:${simulation}` : null;
+    })
+    .filter(Boolean));
+  const optionsRenderDistance = Number(options.renderDistance);
+  const optionsSimulationDistance = Number(options.simulationDistance);
+  const optionsPreferenceDistance = Number.isFinite(optionsRenderDistance)
+      && Number.isFinite(optionsSimulationDistance)
+    ? `${optionsRenderDistance}:${optionsSimulationDistance}` : null;
+  const naturalServerDistance = workerStartMessages.length > 0
+    ? `${Number(workerStartMessages.at(-1).renderDistance)}:${Number(
+      workerStartMessages.at(-1).simulationDistance,
+    )}` : null;
+  const effectiveDistance = Number.isFinite(optionsRenderDistance)
+      && Number.isFinite(optionsSimulationDistance) && naturalServerDistance
+    ? `${Math.min(optionsRenderDistance, Number(workerStartMessages.at(-1).renderDistance))}:${Math.min(
+      optionsSimulationDistance, Number(workerStartMessages.at(-1).simulationDistance),
+    )}` : null;
   const environmentIssues = [];
   if (context.headless) environmentIssues.push("headless Chrome is non-gating");
   if (!/(?:Google )?Chrome\//i.test(String(context.browserVersion?.Browser || ""))) {
@@ -3096,10 +3604,24 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
       `active Worker render/simulation distance was not exactly ${expectedDistanceLabel}`,
     );
   }
-  if (Number(options.renderDistance) !== expectedRenderDistance
-      || Number(options.simulationDistance) !== expectedSimulationDistance) {
+  if (workerStartContractMatches.length === 0) {
     environmentIssues.push(
-      `options.txt render/simulation distance was not exactly ${expectedDistanceLabel}`,
+      `no natural Worker start message proved ${expectedDistanceLabel} with the active profile storage namespace`,
+    );
+  }
+  if (optionsPreferenceDistance !== expectedDistanceLabel) {
+    environmentIssues.push(
+      `options.txt render/simulation preference was not exactly ${expectedDistanceLabel}`,
+    );
+  }
+  if (pinWorkerDistance) {
+    environmentIssues.push(
+      "--pin-worker-distance is diagnostic-only; harness overrides can never provide release evidence",
+    );
+  }
+  if (strict && profile.releaseEvidence === true && !releaseDistanceProfileCompatible) {
+    environmentIssues.push(
+      `strict 6/4 release evidence is only supported for active profile 26.2; active profile is ${activeStorageProfileId}`,
     );
   }
   const expectedMaxFps = Number(environmentRules.maxFps || 260);
@@ -3113,7 +3635,7 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
   const runtimeGameFps = Number(telemetry.environment?.fps?.gameFps);
   const optionsSeeded = context.profileGateResult?.seeded === true;
   if (!optionsSeeded) {
-    environmentIssues.push("benchmark options were not proven to be seeded before Minecraft startup");
+    environmentIssues.push("benchmark options were not proven to be seeded before profile submit");
   }
   const configuredUncapped = optionsSeeded
     && Number(options.maxFps) === unlimitedSentinel
@@ -3180,6 +3702,31 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
     query,
     options,
     optionsSeed: context.profileGateResult || null,
+    distanceContract: {
+      optionsPreference: optionsPreferenceDistance,
+      effectiveDistanceModel: "min(client-options-preference,worker-server-distance)",
+      effectiveDistance,
+      activeWorkerDistances: [...distances],
+      naturalWorkerDistances: [...naturalWorkerDistances],
+      naturalServerDistance,
+      expectedWorkerServerDistance: expectedDistanceLabel,
+      mode: pinWorkerDistance ? "harness-pin-diagnostic" : "natural-observation",
+      releaseEligible: !pinWorkerDistance && releaseDistanceProfileCompatible,
+      releaseTargetProfile: "26.2",
+      activeProfileId: activeStorageProfileId,
+      workerStartMessages: workerStartMessages.length,
+      matchingWorkerStartMessages: workerStartContractMatches.length,
+      naturalWorkerEvidence,
+      harnessOverrideEvidence,
+      expectedStorage: {
+        profileId: activeStorageProfileId,
+        worldVersion: activeStorageWorldVersion,
+        storageSchema: activeStorageConfig.schema,
+        storageDatabaseName: activeStorageConfig.databaseName,
+        storagePrefix: activeStorageConfig.prefix,
+        storageOpfsDirectory: activeStorageConfig.opfsDirectory,
+      },
+    },
     frameLimiter: {
       uncapped,
       configured: configuredUncapped,
@@ -3815,8 +4362,11 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
     renderedFrames: Number(performanceFrame.frameCount || 0),
   };
   const runtimeInvariants = evaluateRuntimeInvariants({
-    contract: contract.runtimeInvariants || runtimeInvariantContract,
+    contract: context.runtimeInvariantContract
+      || contract.runtimeInvariants
+      || runtimeInvariantContract,
     telemetry: runtimeInvariantTelemetry,
+    worldgenTelemetryMode: context.worldgenTelemetryMode || activeWorldgenTelemetryMode,
   });
 
   const contractEvaluation = evaluatePerformanceGates({
@@ -3894,9 +4444,28 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
     required: [],
     results: [],
   };
+  const naturalDistanceStatus = pinWorkerDistance
+    ? "inconclusive"
+    : (workerStartContractMatches.length > 0
+        && optionsPreferenceDistance === expectedDistanceLabel
+      ? "pass" : "fail");
+  const naturalDistanceReasons = pinWorkerDistance
+    ? ["--pin-worker-distance enabled; raw natural Worker evidence is non-gating"]
+    : (naturalDistanceStatus === "pass" ? [] : [
+        `natural Worker/options distance did not prove exact ${expectedDistanceLabel}`,
+      ]);
   const checks = [
     {name: "environment validity", status: contractEvaluation.independent.environment.verdict,
       actual: environment},
+    {name: "natural Worker distance and active profile storage namespace",
+      status: naturalDistanceStatus,
+      actual: {
+        expected: expectedDistanceLabel,
+        optionsPreference: optionsPreferenceDistance,
+        naturalWorkerDistances: [...naturalWorkerDistances],
+        matchingStartMessages: workerStartContractMatches.length,
+        reasons: naturalDistanceReasons,
+      }},
     {name: "new single-player world becomes interactive within the startup target",
       status: startup.verdict, actual: startup},
     {name: "profile frame-performance thresholds",
@@ -3942,30 +4511,41 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
   const strictStatuses = checks
     .map((check) => check.status)
     .filter((status) => status !== "not-required");
-  const passed = strict ? strictStatuses.every((status) => status === "pass") : smokeChecks.every(Boolean);
+  const passed = strict
+    ? (!pinWorkerDistance && strictStatuses.every((status) => status === "pass"))
+    : smokeChecks.every(Boolean);
   let strictVerdict = "pass";
   if (strictStatuses.includes("invalid")) strictVerdict = "invalid";
   else if (strictStatuses.includes("fail")) strictVerdict = "fail";
   else if (strictStatuses.includes("inconclusive")
       || strictStatuses.includes("not-evaluated")) strictVerdict = "inconclusive";
-  const releaseEvidence = strict && profile.releaseEvidence === true;
+  if (pinWorkerDistance && strict) strictVerdict = "inconclusive";
+  const releaseEvidence = strict && !pinWorkerDistance && releaseDistanceProfileCompatible
+    && profile.releaseEvidence === true;
   return {
     mode: strict
-      ? (releaseEvidence ? "release-gating" : "diagnostic-stress")
-      : "smoke-non-gating",
+      ? (pinWorkerDistance
+          ? "diagnostic-pin-non-gating"
+          : (releaseEvidence ? "release-gating" : "diagnostic-stress"))
+      : (pinWorkerDistance ? "smoke-pin-non-gating" : "smoke-non-gating"),
     gating: releaseEvidence,
     releaseEvidence,
+    workerDistanceMode: pinWorkerDistance ? "harness-pin-diagnostic" : "natural-observation",
     evidenceRole: profile.evidenceRole || null,
     verdict: strict ? strictVerdict : (passed ? "non-gating" : "smoke-fail"),
     passed,
-    note: strict
-      ? (releaseEvidence
-          ? "All independent gates must pass. Fail, invalid, and inconclusive are non-zero outcomes."
-          : "Diagnostic stress profile only; a pass is not evidence for the 6/4 release target.")
-      : "Smoke mode only checks plumbing and stability; it is never release evidence.",
+    note: pinWorkerDistance
+      ? "Worker distance pin is a diagnostic fixture only; naturalWorkerEvidence is the release contract and this report is never release evidence."
+      : (strict
+          ? (releaseEvidence
+              ? "All independent gates must pass. Fail, invalid, and inconclusive are non-zero outcomes."
+              : "Diagnostic stress profile only; a pass is not evidence for the 6/4 release target.")
+          : "Smoke mode only checks plumbing and stability; it is never release evidence."),
     checks,
     contractEvaluation,
     environment,
+    naturalWorkerEvidence,
+    harnessOverrideEvidence,
     performanceEvidence,
     failureEvidence: strict && !passed ? performanceEvidence : null,
     startup,
@@ -4062,9 +4642,15 @@ try {
       "--user-data-dir=" + profileDirectory,
       "--no-first-run",
       "--no-default-browser-check",
+      "--ignore-gpu-blocklist",
+      "--enable-webgl",
+      "--enable-unsafe-swiftshader",
       "--disable-background-networking",
       "--disable-background-timer-throttling",
       "--disable-renderer-backgrounding",
+      // Synthetic CDP clicks must never put a visible benchmark tab into OS-level
+      // pointer lock; keep the operator's real cursor independent of the test.
+      "--disable-pointer-lock",
       "--enable-precise-memory-info",
       "--window-size=" + Number(environmentContract.viewport?.width || 1280)
         + "," + Number(environmentContract.viewport?.height || 720),
@@ -4149,7 +4735,7 @@ try {
     recordEvent({
       at: Date.now(),
       source: "benchmark",
-      text: "The benchmark could not seed profile options before Minecraft startup",
+      text: "The benchmark could not seed profile options before profile submit",
     });
   }
   const browserMemoryBaselineSnapshot = await collectCombinedBrowserMemory(session);
@@ -4213,6 +4799,7 @@ try {
   let heapSamples = [];
   let processRssSamples = [];
   let performanceTelemetry;
+  let workerDistanceEvidence;
   let gameplayExercise;
   const measurementStartedAt = Date.now();
   const processRssDurationMillis = frameMeasurementMillis;
@@ -4246,6 +4833,7 @@ try {
     processRssTask,
     gameplayTask,
   ]);
+  workerDistanceEvidence = await collectWorkerDistanceEvidence(session);
   visualOutputSamples.push(...continuousVisualSamples);
   if (gameplayExercise?.verdict === "inconclusive") {
     recordEvent({
@@ -4261,6 +4849,10 @@ try {
   visualOutputSamples.push(...await collectVisualOutput(session, "post-measurement"));
   let leftWorld = false;
   try {
+    // Release benchmark input before Escape/leave-world.  If a CDP key-up or pointer-lock
+    // transition was delayed, Minecraft can otherwise keep the browser canvas in a captured
+    // selection state and never expose its pause screen to cleanup.
+    await releaseInputCapture(session);
     await leaveWorld(session);
     leftWorld = true;
   } catch (error) {
@@ -4330,6 +4922,8 @@ try {
       freshChromeProfile: Boolean(profileDirectory),
       profile: benchmarkProfile,
       performanceContract,
+      runtimeInvariantContract: runtimeInvariantContractForProfile,
+      worldgenTelemetryMode: activeWorldgenTelemetryMode,
       browserMemoryBaseline,
       browserMemoryBaselineSources: browserMemoryBaselineSnapshot,
       buildIdentity: benchmarkBuildIdentity,
@@ -4340,6 +4934,7 @@ try {
       visualOutputSamples,
       leftWorld,
       profileGateResult,
+      workerDistanceEvidence,
       measurementStartedAt,
       measurementEndedAt,
       expectedWorkerMeasurementId: reset.measurementId,
@@ -4371,8 +4966,10 @@ try {
       contractSchemaVersion: performanceContract.schemaVersion,
       profileName,
       profile: benchmarkProfile,
+      worldgenTelemetryMode: activeWorldgenTelemetryMode,
       expectedRenderDistance,
       expectedSimulationDistance,
+      workerDistanceContract: analysis.environment?.distanceContract || null,
       warmupMillis,
       performanceMillis,
       fpsWindowMillis: frameMeasurementMillis,
@@ -4403,6 +5000,9 @@ try {
     browserMemoryBaseline,
     browserMemoryBaselineSources: browserMemoryBaselineSnapshot,
     profileGateResult,
+    workerDistanceEvidence,
+    naturalWorkerEvidence: workerDistanceEvidence?.naturalWorkerEvidence || null,
+    harnessOverrideEvidence: workerDistanceEvidence?.harnessOverrideEvidence || null,
     worldEntryTimings,
     externalSmokeEvidence,
     leftWorld,
@@ -4437,12 +5037,32 @@ try {
     schemaVersion: performanceContract.schemaVersion,
     generatedAt: new Date().toISOString(),
     passed: false,
-    verdict: "fail",
+    verdict: pinWorkerDistance ? "inconclusive" : "fail",
     buildIdentity: benchmarkBuildIdentity,
     configuration: {
       profileName,
       profile: benchmarkProfile,
+      worldgenTelemetryMode: activeWorldgenTelemetryMode,
       strictChecks: !smoke,
+      mode: pinWorkerDistance
+        ? (smoke ? "smoke-pin-non-gating" : "diagnostic-pin-non-gating")
+        : (smoke ? "smoke-non-gating"
+          : (benchmarkProfile.releaseEvidence === true && releaseDistanceProfileCompatible
+            ? "release-gating" : "diagnostic-stress")),
+      gating: !pinWorkerDistance && !smoke && releaseDistanceProfileCompatible
+        && benchmarkProfile.releaseEvidence === true,
+      releaseEvidence: !pinWorkerDistance && !smoke && releaseDistanceProfileCompatible
+        && benchmarkProfile.releaseEvidence === true,
+      workerDistanceMode: pinWorkerDistance ? "harness-pin-diagnostic" : "natural-observation",
+      workerDistancePin: pinWorkerDistance,
+      workerDistanceContract: {
+        mode: pinWorkerDistance ? "harness-pin-diagnostic" : "natural-observation",
+        releaseEligible: !pinWorkerDistance && releaseDistanceProfileCompatible,
+        releaseTargetProfile: "26.2",
+        activeProfileId: activeStorageProfileId,
+        expectedStartDistance: expectedDistanceLabel,
+        expectedStorage: activeStorageConfig,
+      },
       buildIdentity: benchmarkBuildIdentity,
     },
     failureEvidence: buildPerformanceEvidence({
@@ -4450,6 +5070,12 @@ try {
       gates: benchmarkProfile.gates || {},
     }),
     error: String(error && (error.stack || error.message) || error),
+    naturalWorkerEvidence: null,
+    harnessOverrideEvidence: {
+      enabled: pinWorkerDistance,
+      mode: pinWorkerDistance ? "harness-pin-diagnostic" : "disabled",
+      releaseEligible: false,
+    },
     startupDiagnostics,
     events: combinedEvents().slice(-500),
     chromeOutput: chromeOutput.slice(-12_000),
@@ -4460,7 +5086,14 @@ try {
   process.exitCode = 1;
 } finally {
   clearTimeout(watchdogTimer);
-  await stopTravel();
+  try {
+    await stopTravel();
+  } catch (ignored) {
+  } finally {
+    // Never let a failed workload-stop skip the unconditional key/mouse/pointer
+    // cleanup.  This is intentionally before closing either CDP session.
+    await releaseInputCapture(session);
+  }
   if (session) session.close();
   if (browserSession) browserSession.close();
   if (chrome && !keepChrome) {

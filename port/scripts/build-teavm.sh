@@ -6,6 +6,27 @@ source "$root/port/scripts/version-profile.sh"
 gaius_load_version_profile "$root"
 gaius_select_java_home
 version="$GAIUS_MINECRAFT_VERSION"
+build_root="$(gaius_build_root "$root")"
+overlay_directory="$(gaius_overlay_directory "$root")"
+if [[ -n "${GAIUS_DIST_DIRECTORY:-}" || -n "${GAIUS_BUILD_ROOT:-}" || -n "${GAIUS_VERSION_PROFILE_PATH:-}" ]]; then
+  target_directory="$(gaius_dist_directory "$root")"
+else
+  target_directory="${GAIUS_TARGET_DIRECTORY:-$(gaius_dist_directory "$root")}"
+fi
+# The singleplayer launcher is only a redirect; the full dist shell contains
+# the vanilla-pack loader and is the canonical postprocess template.  It is
+# read-only here and copied into a profile-scoped output directory.
+index_template="${GAIUS_INDEX_TEMPLATE:-$root/port/web/dist/index.html}"
+export GAIUS_BUILD_ROOT="$build_root"
+export GAIUS_OVERLAY_DIRECTORY="$overlay_directory"
+export GAIUS_DIST_DIRECTORY="$target_directory"
+
+# The browser client logs through the Gaius slf4j overlay; log4j-core and the
+# log4j slf4j binding pull desktop SSL/script/OSGi/disruptor paths into the
+# TeaVM reachable graph, so they are excluded from the client classpath.
+# log4j-api stays available for any direct API references.
+client_log4j_exclusions="org/apache/logging/log4j/log4j-core/,org/apache/logging/log4j/log4j-slf4j2-impl/"
+export GAIUS_EXCLUDED_LIBRARY_PREFIXES="${GAIUS_EXCLUDED_LIBRARY_PREFIXES:+$GAIUS_EXCLUDED_LIBRARY_PREFIXES,}$client_log4j_exclusions"
 
 # TeaVM keeps dependency JARs open throughout whole-program analysis. Hold the
 # overlay writer lock from before regeneration until every consumer has closed.
@@ -25,34 +46,37 @@ release_overlay_lock() {
 trap release_overlay_lock EXIT
 
 if [[ "${GAIUS_SKIP_OVERLAY_BUILD:-false}" != "true" ]]; then
-  GAIUS_OVERLAY_LOCK_HELD=true "$root/port/scripts/build-overlays.sh" >/dev/null
-  gson_type_token_patches="$root/port/target/gson-type-token-client-patches"
+    GAIUS_OVERLAY_DIRECTORY="$overlay_directory" \
+      GAIUS_OVERLAY_LOCK_HELD=true "$root/port/scripts/build-overlays.sh" >/dev/null
+  gson_type_token_patches="$build_root/gson-type-token-client-patches"
   mkdir -p "$gson_type_token_patches"
   find "$gson_type_token_patches" -type f -delete
   java -classpath \
-    "$root/port/work/overlays/tool-classes:$HOME/.m2/repository/org/ow2/asm/asm/9.8/asm-9.8.jar:$HOME/.m2/repository/org/ow2/asm/asm-tree/9.8/asm-tree-9.8.jar" \
+    "$overlay_directory/tool-classes:$HOME/.m2/repository/org/ow2/asm/asm/9.8/asm-9.8.jar:$HOME/.m2/repository/org/ow2/asm/asm-tree/9.8/asm-tree-9.8.jar" \
     dev.gaius.tools.GsonTypeTokenClientPatcher \
-    "$root/port/work/overlays/client-named-$version-gaius.jar" \
+    "$overlay_directory/client-named-$version-gaius.jar" \
     "$gson_type_token_patches"
   jar --update \
-    --file "$root/port/work/overlays/client-named-$version-gaius.jar" \
+    --file "$overlay_directory/client-named-$version-gaius.jar" \
     -C "$gson_type_token_patches" .
 else
   echo "Skipping overlay rebuild because GAIUS_SKIP_OVERLAY_BUILD=true"
 fi
+node "$root/port/scripts/gson-type-token-smoke.mjs" \
+  --profile "$GAIUS_VERSION_PROFILE" \
+  --overlay "$overlay_directory"
 work="$root/port/work/$version"
 icu_path="$(gaius_library_path "com.ibm.icu:icu4j")"
-resource_list_dir="$root/port/target/generated-resources/dev/gaius/browser"
+resource_list_dir="$build_root/generated-resources/dev/gaius/browser"
 resource_list="$resource_list_dir/minecraft-resources.txt"
 embedded_resource_list="$resource_list_dir/minecraft-embedded-resources.txt"
-generated_resources="$root/port/target/generated-resources"
-generated_assets="$root/port/target/generated-resources/assets"
-target_directory="${GAIUS_TARGET_DIRECTORY:-$root/port/web/dist}"
+generated_resources="$build_root/generated-resources"
+generated_assets="$build_root/generated-resources/assets"
 vanilla_asset_pack="$target_directory/vanilla-assets.pack.gz"
 mkdir -p "$resource_list_dir"
-jar tf "$root/port/work/overlays/client-named-$version-gaius.jar" |
+jar tf "$overlay_directory/client-named-$version-gaius.jar" |
   awk '(index($0, "assets/") == 1 || index($0, "data/") == 1 || $0 == "pack.png") && substr($0, length($0), 1) != "/" { print }' >"$resource_list"
-jar tf "$root/port/work/overlays/libraries/$icu_path" |
+jar tf "$overlay_directory/libraries/$icu_path" |
   awk 'index($0, "com/ibm/icu/impl/data/icudata/") == 1 && substr($0, length($0), 1) != "/" { print }' >>"$resource_list"
 rm -rf "$generated_assets/minecraft/sounds" "$generated_assets/minecraft/sounds.json" \
   "$generated_assets/minecraft/font"
@@ -63,7 +87,7 @@ asset_index="$work/assets/indexes/$asset_index_id.json"
 copied_sound_assets=0
 copied_font_assets=0
 if [[ -n "$asset_index_id" && -f "$asset_index" ]]; then
-  browser_sound_manifest="$root/port/target/browser-sound-assets.tsv"
+  browser_sound_manifest="$build_root/browser-sound-assets.tsv"
   jq -r '
     .objects
     | to_entries[]
@@ -100,13 +124,19 @@ if [[ -n "$asset_index_id" && -f "$asset_index" ]]; then
     | [.key, .value.hash]
     | @tsv
   ' "$asset_index" | tr -d '\r' >"$browser_sound_manifest"
-  awk -F '\t' -v root="$generated_assets/" '
-    {
-      path = $1
-      sub("/[^/]+$", "", path)
-      print root path
-    }
-  ' "$browser_sound_manifest" | sort -u | xargs mkdir -p
+  while IFS= read -r sound_directory; do
+    if [[ -n "$sound_directory" ]]; then
+      mkdir -p "$sound_directory"
+    fi
+  done < <(
+    awk -F '\t' -v root="$generated_assets/" '
+      {
+        path = $1
+        sub("/[^/]+$", "", path)
+        print root path
+      }
+    ' "$browser_sound_manifest" | sort -u
+  )
   browser_sound_names=()
   while IFS=$'\t' read -r logical_path hash; do
     if [[ -z "$logical_path" || -z "$hash" ]]; then
@@ -118,6 +148,10 @@ if [[ -n "$asset_index_id" && -f "$asset_index" ]]; then
       continue
     fi
     target="$generated_assets/$logical_path"
+    # Ensure each parent exists even when the manifest contains a path whose
+    # directory was not emitted by the batched mkdir/xargs pass (Windows Git
+    # Bash can otherwise race filesystem translation for long argument lists).
+    mkdir -p "$(dirname "$target")"
     cp "$source" "$target"
     printf 'assets/%s\n' "$logical_path" >>"$resource_list"
     sound_name="${logical_path#minecraft/sounds/}"
@@ -127,7 +161,7 @@ if [[ -n "$asset_index_id" && -f "$asset_index" ]]; then
 
   # Mojang ships the Unicode fallback as indexed assets rather than client-jar
   # entries. Embed it so browser resource packs can safely override default.json.
-  browser_font_manifest="$root/port/target/browser-font-assets.tsv"
+  browser_font_manifest="$build_root/browser-font-assets.tsv"
   jq -r '
     .objects
     | to_entries[]
@@ -146,12 +180,12 @@ if [[ -n "$asset_index_id" && -f "$asset_index" ]]; then
       continue
     fi
     source="$work/assets/objects/${hash:0:2}/$hash"
-    if [[ ! -f "$source" ]] || [[ "$(shasum -a 1 "$source" | awk '{print $1}' | tr -d '\r\n')" != "$hash" ]]; then
+    if [[ ! -f "$source" ]] || [[ "$(gaius_sha1_file "$source")" != "$hash" ]]; then
       mkdir -p "$(dirname "$source")"
       temporary="$source.part"
       curl -fsSL --http1.1 --retry 5 --retry-delay 1 \
         -o "$temporary" "https://resources.download.minecraft.net/${hash:0:2}/$hash"
-      if [[ "$(shasum -a 1 "$temporary" | awk '{print $1}' | tr -d '\r\n')" != "$hash" ]]; then
+      if [[ "$(gaius_sha1_file "$temporary")" != "$hash" ]]; then
         rm -f "$temporary"
         echo "SHA-1 mismatch for browser Unicode font asset $logical_path" >&2
         exit 1
@@ -169,7 +203,7 @@ if [[ -n "$asset_index_id" && -f "$asset_index" ]]; then
   # generated-resource directory. Replace the empty JAR stub so the embedded
   # runtime definition actually reaches the browser instead of merely appearing
   # in minecraft-resources.txt.
-  client_overlay="$root/port/work/overlays/client-named-$version-gaius.jar"
+  client_overlay="$overlay_directory/client-named-$version-gaius.jar"
   for font_definition in \
     assets/minecraft/font/include/unifont.json \
     assets/minecraft/font/include/unifont_pua.json; do
@@ -182,7 +216,7 @@ if [[ -n "$asset_index_id" && -f "$asset_index" ]]; then
     sounds_json_source="$work/assets/objects/${sounds_json_hash:0:2}/$sounds_json_hash"
     if [[ -f "$sounds_json_source" ]]; then
       sounds_json_target="$generated_assets/minecraft/sounds.json"
-      allowed_sounds_json="$root/port/target/browser-sound-names.json"
+      allowed_sounds_json="$build_root/browser-sound-names.json"
       printf '%s\n' "${browser_sound_names[@]}" | jq -R . | jq -s . >"$allowed_sounds_json"
       mkdir -p "$(dirname "$sounds_json_target")"
       jq --slurpfile allowed "$allowed_sounds_json" '
@@ -229,15 +263,15 @@ awk '
 "$root/port/scripts/run-python.sh" \
   "$root/port/scripts/build-vanilla-assets-pack.py" \
   "$resource_list" \
-  "$root/port/work/overlays/client-named-$version-gaius.jar" \
+  "$overlay_directory/client-named-$version-gaius.jar" \
   "$generated_resources" \
   "$vanilla_asset_pack"
 echo "Generated browser resource list: $(wc -l <"$resource_list" | tr -d ' ') entries"
 echo "Embedded TeaVM resource subset: $(wc -l <"$embedded_resource_list" | tr -d ' ') entries"
 echo "Mapped browser sound assets: $copied_sound_assets"
 echo "Mapped browser Unicode font assets: $copied_font_assets"
-pom="$("$root/port/scripts/generate-pom.sh")"
-log="$root/port/target/teavm-build.log"
+pom="$(GAIUS_BUILD_ROOT="$build_root" GAIUS_OVERLAY_DIRECTORY="$overlay_directory" GAIUS_TARGET_DIRECTORY="$target_directory" GAIUS_RESOURCE_DIRECTORY="$generated_resources" "$root/port/scripts/generate-pom.sh")"
+log="$build_root/teavm-build.log"
 
 echo "Compiling the official Minecraft $version client with TeaVM"
 echo "POM: $pom"
@@ -259,8 +293,8 @@ set +e
 "$root/port/scripts/run-python.sh" \
   "$root/port/scripts/analyze-teavm-log.py" \
   "$log" \
-  "$root/port/target/teavm-gap.json" \
-  "$root/port/target/teavm-gap.md"
+  "$build_root/teavm-gap.json" \
+  "$build_root/teavm-gap.md"
 analysis_status="$?"
 set -e
 
@@ -275,6 +309,15 @@ fi
 
 if [[ "$build_status" -eq 0 ]]; then
   target_js="$target_directory/${GAIUS_TARGET_FILE:-classes.js}"
+  # An isolated profile target starts empty. Reuse the existing launcher as a
+  # template, then postprocess it with this profile's version and asset index.
+  if [[ ! -f "$target_directory/index.html" ]]; then
+    if [[ ! -f "$index_template" ]]; then
+      echo "Missing index template: $index_template" >&2
+      exit 1
+    fi
+    cp "$index_template" "$target_directory/index.html"
+  fi
   "$root/port/scripts/run-python.sh" \
     "$root/port/scripts/postprocess-teavm-js.py" "$target_js"
   "$root/port/scripts/run-python.sh" \
@@ -293,9 +336,9 @@ if [[ "$build_status" -eq 0 ]]; then
     --root "$root" \
     --role vanilla-assets \
     --artifact "$vanilla_asset_pack"
-  if [[ "$target_directory" == "$root/port/web/dist" \
-        && "${GAIUS_SKIP_COMPRESSION:-false}" != "true" ]]; then
-    "$root/port/scripts/compress-dist.sh" >/dev/null
+  if [[ "${GAIUS_SKIP_COMPRESSION:-false}" != "true" ]]; then
+    GAIUS_DIST_DIRECTORY="$target_directory" \
+      "$root/port/scripts/compress-dist.sh" >/dev/null
   fi
 fi
 

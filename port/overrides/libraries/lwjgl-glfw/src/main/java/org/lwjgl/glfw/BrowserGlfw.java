@@ -638,8 +638,23 @@ public final class BrowserGlfw {
               if (telemetryEnabled) {
                 telemetry.fairYieldCount=(telemetry.fairYieldCount||0)+1;
               }
-              // A real timer task breaks the endless MessageChannel chain. This keeps input,
-              // networking, audio and DevTools responsive even when vsync is disabled.
+              // Prefer the Web Scheduling API when available. Unlike a zero-delay timer,
+              // scheduler.yield() does not inherit Chrome's background/minimum timer clamp,
+              // so fairness does not add a several-millisecond bubble to every fourth frame.
+              // Keep the timer as a compatibility fallback for older browsers and test hosts.
+              const browserScheduler=root.scheduler;
+              if (browserScheduler && typeof browserScheduler.yield==='function') {
+                try {
+                  const result=browserScheduler.yield();
+                  if (result && typeof result.then==='function') {
+                    result.then(
+                      () => finish('scheduler'),
+                      () => setTimeout(() => finish('timer'), 0)
+                    );
+                    return;
+                  }
+                } catch (ignored) {}
+              }
               setTimeout(() => finish('timer'), 0);
             };
             if (hidden) {

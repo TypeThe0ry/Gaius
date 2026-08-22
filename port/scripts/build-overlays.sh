@@ -29,7 +29,7 @@ gaius_select_java_home
 version="$GAIUS_MINECRAFT_VERSION"
 teavm_version="$(jq -er '.teaVMVersion' "$config")"
 work="$root/port/work/$version"
-overlay_work="$root/port/work/overlays"
+overlay_work="$(gaius_overlay_directory "$root")"
 source_root="$root/port/overrides/classlib/src/main/java"
 classes="$overlay_work/classlib-classes"
 upstream="$HOME/.m2/repository/org/teavm/teavm-classlib/$teavm_version/teavm-classlib-$teavm_version.jar"

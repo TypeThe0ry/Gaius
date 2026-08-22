@@ -33,6 +33,14 @@ port/overrides/libraries/*
 !port/overrides/libraries/lwjgl-stb/**
 !port/overrides/libraries/netty-transport/
 !port/overrides/libraries/netty-transport/**
+!port/overrides/libraries/jopt-simple/
+!port/overrides/libraries/jopt-simple/**
+!port/overrides/libraries/mojang-logging/
+!port/overrides/libraries/mojang-logging/**
+!port/overrides/libraries/slf4j/
+!port/overrides/libraries/slf4j/**
+!port/overrides/libraries/gson/
+!port/overrides/libraries/gson/**
 
 # Local dependencies, environment files, coverage, and editor state.
 node_modules/
@@ -58,3 +66,22 @@ coverage/
 .ruff_cache/
 __pycache__/
 *.py[cod]
+
+# Local compiler/disassembly scratch produced by one-off migration probes.
+# Keep it on disk for diagnosis, but never publish it as repository source.
+/com/
+/io/
+/net/
+/_digest27.txt
+/chunk45-raw.txt
+/8800])
+/8800])'
+
+# TeaVM intermediate/debug files are not release artifacts. Versioned browser
+# releases and platform-smoke bundles remain checked in through Git LFS.
+port/web/dist/*.map
+port/web/dist/*.teavmdbg
+port/web/dist/*.release-bak
+port/web/dist/**/*.map
+port/web/dist/**/*.teavmdbg
+port/web/dist/**/*.release-bak

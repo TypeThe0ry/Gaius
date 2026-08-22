@@ -64,8 +64,13 @@ jobs:
       - name: Install RelayNode dependencies
         run: npm ci --prefix apps/bridge
 
-      - name: Run RelayNode protocol and registry smoke tests
-        run: npm run smoke --prefix apps/bridge
+      - name: Run RelayNode protocol and registry smoke tests for both profiles
+        run: |
+          set -euo pipefail
+          for profile in 1.21.11 26.2; do
+            GAIUS_SMOKE_MINECRAFT_VERSION="$profile" npm run smoke --prefix apps/bridge
+          done
+          npm run smoke:profiles --prefix apps/bridge
 
   paper-plugin-tests:
     runs-on: ubuntu-latest
@@ -84,4 +89,8 @@ jobs:
           cache: maven
 
       - name: Run Paper plugin unit tests
+        env:
+          # The optional plugin targets the retained 1.21.11 profile. Keep the
+          # JDK-21 guard job from inheriting the active 26.2/JDK-25 profile.
+          GAIUS_VERSION_PROFILE_PATH: versions/1.21.11.json
         run: ./port/mvnw -B -ntp -f apps/server-plugin/pom.xml test

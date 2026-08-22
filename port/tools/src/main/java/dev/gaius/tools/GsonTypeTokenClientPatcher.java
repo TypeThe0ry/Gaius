@@ -43,24 +43,69 @@ public final class GsonTypeTokenClientPatcher {
         write(sounds, root.resolve("net/minecraft/client/sounds/SoundManager.class"));
 
         Path clientJar = Path.of(args[0]);
-        Path gsonJar = clientJar.getParent().resolve(
-                "libraries/com/google/code/gson/gson/2.13.2/gson-2.13.2.jar");
+        // Resolve the configured version's library tree from the overlay jar name
+        // (client-named-<version>-gaius.jar) so no version-specific paths are hard-coded.
+        Path versionLibraries = workLibrariesFor(clientJar);
+        Path gsonJar = findJar(versionLibraries,
+                "com/google/code/gson/gson");
         GsonBrowserPatcher.main(new String[] {
                 gsonJar.toString(),
                 root.resolve("com/google/gson/reflect/TypeToken.class").toString()
         });
 
-        Path overlayRoot = clientJar.getParent();
-        Path guavaJar = overlayRoot.resolve(
-                "libraries/com/google/guava/guava/33.5.0-jre/guava-33.5.0-jre.jar");
-        Path dataFixerJar = overlayRoot.getParent().resolve(
-                "1.21.11/libraries/com/mojang/datafixerupper/9.0.19/"
-                        + "datafixerupper-9.0.19.jar");
+        Path guavaJar = findJar(versionLibraries,
+                "com/google/guava/guava");
+        Path dataFixerJar = findJar(versionLibraries,
+                "com/mojang/datafixerupper");
         GuavaTypeTokenBrowserPatcher.main(new String[] {
                 guavaJar.toString(), dataFixerJar.toString(), root.toString()
         });
 
         System.out.println("Patched browser Gson TypeToken initializers");
+    }
+
+    /**
+     * Resolves port/work/<version>/libraries from the overlay client jar name.
+     *
+     * The historical overlay root is port/work/overlays, while isolated
+     * profiles use port/work/overlays/<version>.  Prefer the candidate that
+     * contains the version's datafixerupper dependency so the patcher never
+     * accidentally treats an overlay directory as the vanilla library tree.
+     */
+    private static Path workLibrariesFor(Path clientJar) {
+        String name = clientJar.getFileName().toString();
+        String prefix = "client-named-";
+        String suffix = "-gaius.jar";
+        if (!name.startsWith(prefix) || !name.endsWith(suffix)) {
+            throw new IllegalArgumentException("Unexpected overlay jar name: " + name);
+        }
+        String version = name.substring(prefix.length(), name.length() - suffix.length());
+        Path overlayParent = clientJar.getParent().getParent();
+        Path historical = overlayParent.resolve(version).resolve("libraries");
+        Path isolated = overlayParent.getParent().resolve(version).resolve("libraries");
+        if (Files.isDirectory(historical.resolve("com/mojang/datafixerupper"))) {
+            return historical;
+        }
+        if (Files.isDirectory(isolated.resolve("com/mojang/datafixerupper"))) {
+            return isolated;
+        }
+        return historical;
+    }
+
+    /** Resolves a library JAR under the version library tree without hard-coded versions. */
+    private static Path findJar(Path overlayLibraries, String relativeDirectory)
+            throws IOException {
+        Path directory = overlayLibraries.resolve(relativeDirectory);
+        if (!Files.isDirectory(directory)) {
+            throw new IOException("Library directory is missing: " + directory);
+        }
+        try (var stream = Files.walk(directory)) {
+            return stream
+                    .filter(path -> path.getFileName().toString().endsWith(".jar"))
+                    .findFirst()
+                    .orElseThrow(() -> new IOException(
+                            "No JAR found under " + directory));
+        }
     }
 
     private static void replaceAnonymousTypeTokenConstruction(

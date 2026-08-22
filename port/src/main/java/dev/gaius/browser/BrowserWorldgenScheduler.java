@@ -26,7 +26,30 @@ public final class BrowserWorldgenScheduler {
     private static final int YIELD_HARD_CAP = 2;
     private static final int YIELD_CHECKPOINT = 3;
 
+    // Task-scope entry points are instrumented into methods which can be
+    // resumed independently by TeaVM.  Keep the token deliberately small and
+    // categorical: NONE means this invocation is nested inside an already
+    // active normal scope, NORMAL owns the active-work clock, and REENTRANT is
+    // isolated from that clock while a scheduler continuation is pumping.
+    private static final int TASK_SCOPE_NONE = 0;
+    private static final int TASK_SCOPE_NORMAL = 1;
+    private static final int TASK_SCOPE_REENTRANT = 2;
+
     private static double sliceStartedAtMillis;
+    // ``sliceStartedAtMillis`` is the start of the current scheduler slice, not a
+    // license to charge every wall-clock interval after the server tick begins.
+    // Task scopes accumulate only the intervals in which a world-generation task
+    // is actually running.  This is intentionally separate from the pulse
+    // counters: a task can yield and resume without resetting either budget.
+    private static double activeWorkElapsedMillis;
+    // -1 marks a paused segment; zero is a valid performance.now() value.
+    private static double activeWorkStartedAtMillis = -1.0;
+    private static int taskWorkDepth;
+    // A packet callback can enter a task while requestYield is pumping.  Keep
+    // those scopes in a separate counter so they cannot move the outer task's
+    // active segment or deadline underneath its continuation.
+    private static int reentrantTaskWorkDepth;
+    private static int deferredTaskScopeEnds;
     private static double deadlineMillis;
     private static double currentBudgetMillis;
     private static double previousYieldDelayMillis;
@@ -40,6 +63,11 @@ public final class BrowserWorldgenScheduler {
     private static int reentrantYieldRequests;
     private static int reentrantYieldDepth;
     private static int maxReentrantYieldDepth;
+    // Maximum nested continuation depth observed by the currently active
+    // requestYield call.  The cumulative max above remains the ordinary slice
+    // contract; this per-yield value keeps checkpoint-only telemetry scoped to
+    // the checkpoint that produced it.
+    private static int maxReentrantYieldDepthInYield;
     private static boolean networkPreemptionPending;
     private static boolean yieldActive;
     private static boolean deferredYield;
@@ -92,6 +120,116 @@ public final class BrowserWorldgenScheduler {
         recordChunkBroadcastFinish(Math.max(0, entries));
     }
 
+    /**
+     * Starts the synchronous server work turn containing its chunk-generation tasks.
+     *
+     * <p>This is called once immediately before {@code processPacketsAndTick}, not from every
+     * {@code ChunkGenerationTask.runUntilWait} invocation. A task can be resumed by the server
+     * on a later tick after returning a pending future; the elapsed wall-clock time between those
+     * ticks is idle time, not work in the current slice. Advance the wall-clock origin here while
+     * retaining any active task milliseconds left by the wait loop; pulse counters and the
+     * adaptive budget remain shared across task scopes. The reentrancy guard is important because
+     * an urgent-packet callback can enter another task while a TeaVM continuation is suspended.
+     * In that case the active continuation owns the clock and a nested task must not move its
+     * deadline underneath it.
+     */
+    public static void beginServerWorkTurn() {
+        if (yieldActive) {
+            return;
+        }
+
+        double now = nowMillis();
+        // A server work-turn boundary is outside the task scopes.  It may reset
+        // the timestamp for a new tick, but never resets the adaptive budget or
+        // pulse counters shared by all tasks in that tick.  If an unusual
+        // continuation re-enters here while a task is still active, leave its
+        // active segment intact rather than moving the deadline underneath it.
+        if (taskWorkDepth > 0) {
+            return;
+        }
+        if (currentBudgetMillis <= 0.0) {
+            beginSlice(now, networkQueueDepth());
+        } else {
+            sliceStartedAtMillis = now;
+            // Do not clear activeWorkElapsedMillis here.  A task can run from
+            // waitUntilNextTick after the previous checkpoint and return before
+            // this next server-turn boundary; that work belongs to the same
+            // adaptive slice and must be combined with the next task.
+            activeWorkStartedAtMillis = -1.0;
+            deadlineMillis = now + currentBudgetMillis;
+            pulsesUntilClockCheck = CLOCK_CHECK_INTERVAL;
+        }
+    }
+
+    /**
+     * Enters a world-generation task scope.  Scopes are deliberately nestable:
+     * a task may synchronously invoke another task while processing an urgent
+     * packet, but only the outermost scope owns the active wall-clock segment.
+     */
+    public static int beginTaskWork() {
+        if (yieldActive) {
+            if (reentrantTaskWorkDepth < Integer.MAX_VALUE) {
+                reentrantTaskWorkDepth++;
+            }
+            return TASK_SCOPE_REENTRANT;
+        }
+        if (taskWorkDepth > 0) {
+            return TASK_SCOPE_NONE;
+        }
+        taskWorkDepth = 1;
+
+        double now = nowMillis();
+        if (deadlineMillis == 0.0) {
+            beginSlice(now, networkQueueDepth());
+            return TASK_SCOPE_NORMAL;
+        }
+        // The clock was paused at endTaskWork (or at the previous checkpoint).
+        // Starting a new scope records a fresh active segment; the paused gap is
+        // intentionally absent from activeWorkElapsedMillis.
+        activeWorkStartedAtMillis = now;
+        return TASK_SCOPE_NORMAL;
+    }
+
+    /**
+     * Leaves a world-generation task scope.  The defensive underflow guard is
+     * useful on browser shutdown/error paths where a continuation can be
+     * cancelled after its normal return has already been observed.
+     */
+    public static void endTaskWork(int token) {
+        if (token == TASK_SCOPE_NONE) {
+            return;
+        }
+        if (token == TASK_SCOPE_REENTRANT) {
+            // A reentrant callback may resume after the outer requestYield has
+            // already dropped yieldActive.  Its token still closes only its
+            // own isolated scope and can never decrement the outer task.
+            if (reentrantTaskWorkDepth > 0) {
+                reentrantTaskWorkDepth--;
+            }
+            return;
+        }
+        if (token != TASK_SCOPE_NORMAL) {
+            return;
+        }
+        if (yieldActive) {
+            // Only a live NORMAL scope may be deferred.  In particular, an
+            // unmatched REENTRANT/NONE close must not leave a stale deferred
+            // close which a later continuation could apply to another task.
+            if (taskWorkDepth > 0 && deferredTaskScopeEnds == 0) {
+                deferredTaskScopeEnds++;
+            }
+            return;
+        }
+        if (taskWorkDepth <= 0) {
+            return;
+        }
+        taskWorkDepth = 0;
+
+        double now = nowMillis();
+        activeWorkElapsedMillis += activeSegmentElapsedMillis(now);
+        activeWorkStartedAtMillis = -1.0;
+    }
+
     public static void pulse() {
         progressPulsesInSlice++;
         pulsesInTurn++;
@@ -132,7 +270,7 @@ public final class BrowserWorldgenScheduler {
         double now = nowMillis();
         if (deadlineMillis == 0.0) {
             beginSlice(now, networkQueueDepth());
-        } else if (now >= deadlineMillis) {
+        } else if (activeSliceElapsedMillis(now) >= currentBudgetMillis) {
             requestYield(YIELD_DEADLINE, networkQueueDepth());
         }
     }
@@ -142,10 +280,18 @@ public final class BrowserWorldgenScheduler {
             yieldReentrantContinuation();
             return;
         }
+
+        double beforePumpAt = nowMillis();
+        double sliceElapsedMillis = activeSliceElapsedMillis(beforePumpAt);
+        // Freeze the active segment while the scheduler pumps packets and yields
+        // to the browser event loop.  The continuation starts a new segment only
+        // after it resumes, so the event-loop delay is never charged to work.
+        activeWorkElapsedMillis = sliceElapsedMillis;
+        activeWorkStartedAtMillis = -1.0;
         yieldActive = true;
+        maxReentrantYieldDepthInYield = 0;
         try {
             double configuredBudgetMillis = sliceMillis();
-            double beforePumpAt = nowMillis();
             if (sliceStartedAtMillis == 0.0) {
                 sliceStartedAtMillis = beforePumpAt;
             }
@@ -159,7 +305,6 @@ public final class BrowserWorldgenScheduler {
             }
 
             double completedBudgetMillis = currentBudgetMillis;
-            double sliceElapsedMillis = Math.max(0.0, beforePumpAt - sliceStartedAtMillis);
             double overrunMillis = Math.max(0.0, sliceElapsedMillis - completedBudgetMillis);
             int queueDepthBefore = Math.max(observedQueueDepth, networkQueueDepth());
             boolean pendingBefore = queueDepthBefore > 0 || hasPendingNetworkInput();
@@ -185,38 +330,68 @@ public final class BrowserWorldgenScheduler {
             if (pendingAfter) {
                 BrowserIntegratedServerMain.pumpUrgentPackets();
                 queueDepthAfter = networkQueueDepth();
+                if (queueDepthAfter == 0 && hasPendingNetworkInput()) {
+                    queueDepthAfter = 1;
+                }
             }
 
+            // A checkpoint is a server-turn boundary, not evidence that a
+            // worldgen slice completed.  Decide this only after both urgent
+            // packet pumps and the event-loop continuation: a callback may
+            // have produced a pulse while yieldActive was true, in which case
+            // the checkpoint is an ordinary progress-bearing slice.
             boolean madeProgress = progressPulsesInSlice > 0;
+            boolean checkpointOnly = reason == YIELD_CHECKPOINT
+                    && progressPulsesInSlice == 0;
             int pressureDepth = Math.max(queueDepthBefore, queueDepthAfter);
-            previousYieldDelayMillis = yieldDelayMillis;
-            previousOverrunMillis = overrunMillis;
-            currentBudgetMillis = adaptiveBudgetMillis(
-                    configuredBudgetMillis,
-                    pressureDepth,
-                    yieldDelayMillis,
-                    overrunMillis,
-                    madeProgress);
             boolean networkPreemption = reason == YIELD_NETWORK || pendingBefore || pendingAfter;
-            reportSlice(
-                    reason,
-                    networkPreemption,
-                    progressPulsesInSlice,
-                    networkWaitPulses,
-                    sliceElapsedMillis,
-                    completedBudgetMillis,
-                    currentBudgetMillis,
-                    overrunMillis,
-                    yieldDelayMillis,
-                    queueDepthBefore,
-                    queueDepthAfter,
-                    reentrantYieldRequests,
-                    MAX_NETWORK_WAIT_PULSES,
-                    maxPulsesInTurn,
-                    maxReentrantYieldDepth);
+            if (checkpointOnly) {
+                // Keep checkpoint-only waits out of the adaptive controller and
+                // ordinary slice counters.  They still record the pressure and
+                // event-loop delay needed by the checkpoint-only evaluator.
+                recordCheckpointOnlyYield(
+                        networkWaitPulses,
+                        yieldDelayMillis,
+                        queueDepthBefore,
+                        queueDepthAfter,
+                        maxReentrantYieldDepthInYield);
+            } else {
+                previousYieldDelayMillis = yieldDelayMillis;
+                previousOverrunMillis = overrunMillis;
+                currentBudgetMillis = adaptiveBudgetMillis(
+                        configuredBudgetMillis,
+                        pressureDepth,
+                        yieldDelayMillis,
+                        overrunMillis,
+                        madeProgress);
+                reportSlice(
+                        reason,
+                        networkPreemption,
+                        progressPulsesInSlice,
+                        networkWaitPulses,
+                        sliceElapsedMillis,
+                        completedBudgetMillis,
+                        currentBudgetMillis,
+                        overrunMillis,
+                        yieldDelayMillis,
+                        queueDepthBefore,
+                        queueDepthAfter,
+                        reentrantYieldRequests,
+                        MAX_NETWORK_WAIT_PULSES,
+                        maxPulsesInTurn,
+                        maxReentrantYieldDepth);
+            }
 
             double nextSliceStartedAt = nowMillis();
             sliceStartedAtMillis = nextSliceStartedAt;
+            activeWorkElapsedMillis = 0.0;
+            // A checkpoint-only boundary is intentionally a paused clock.  The
+            // following server turn will explicitly start a task segment; an
+            // ordinary progress-bearing yield retains the existing nested-task
+            // behavior.
+            activeWorkStartedAtMillis = !checkpointOnly && taskWorkDepth > 0
+                    ? nextSliceStartedAt
+                    : -1.0;
             deadlineMillis = nextSliceStartedAt + currentBudgetMillis;
             pulsesUntilClockCheck = CLOCK_CHECK_INTERVAL;
             pulsesUntilNetworkCheck = NETWORK_CHECK_INTERVAL;
@@ -227,8 +402,23 @@ public final class BrowserWorldgenScheduler {
             networkPreemptionPending = false;
         } finally {
             yieldActive = false;
+            while (deferredTaskScopeEnds > 0 && taskWorkDepth > 0) {
+                deferredTaskScopeEnds--;
+                taskWorkDepth = 0;
+                activeWorkStartedAtMillis = -1.0;
+            }
+            // A continuation can be cancelled after its normal close.  Do not
+            // carry unmatched deferred closes into the next invocation.
+            deferredTaskScopeEnds = 0;
             if (deferredYield) {
                 deferredYield = false;
+                // A nested callback requested another yield while the outer
+                // continuation was suspended.  Carry that request into the
+                // active-work clock so the next pulse cannot clear it merely
+                // because the event-loop delay was excluded from elapsed work.
+                activeWorkElapsedMillis = Math.max(
+                        activeWorkElapsedMillis,
+                        currentBudgetMillis);
                 deadlineMillis = sliceStartedAtMillis;
                 pulsesUntilClockCheck = 1;
             }
@@ -244,7 +434,21 @@ public final class BrowserWorldgenScheduler {
                 previousOverrunMillis,
                 true);
         sliceStartedAtMillis = now;
+        activeWorkElapsedMillis = 0.0;
+        activeWorkStartedAtMillis = taskWorkDepth > 0 ? now : -1.0;
         deadlineMillis = now + currentBudgetMillis;
+    }
+
+    private static double activeSegmentElapsedMillis(double now) {
+        if (activeWorkStartedAtMillis < 0.0) {
+            return 0.0;
+        }
+        return Math.max(0.0, now - activeWorkStartedAtMillis);
+    }
+
+    private static double activeSliceElapsedMillis(double now) {
+        return activeWorkElapsedMillis
+                + (taskWorkDepth > 0 ? activeSegmentElapsedMillis(now) : 0.0);
     }
 
     private static double adaptiveBudgetMillis(
@@ -286,6 +490,9 @@ public final class BrowserWorldgenScheduler {
         // slice. Suspending this continuation prevents the guard from hiding a long task.
         reentrantYieldDepth++;
         maxReentrantYieldDepth = Math.max(maxReentrantYieldDepth, reentrantYieldDepth);
+        maxReentrantYieldDepthInYield = Math.max(
+                maxReentrantYieldDepthInYield,
+                reentrantYieldDepth);
         try {
             TModernRuntimeSupport.yieldToEventLoop(0);
         } finally {
@@ -397,6 +604,76 @@ public final class BrowserWorldgenScheduler {
             return Math.min(2147483647, Math.max(packets, slices, byteUnits));
             """)
     private static native int networkQueueDepth();
+
+    @JSBody(params = {
+            "networkWaitPulses",
+            "yieldDelayMillis",
+            "queueDepthBefore",
+            "queueDepthAfter",
+            "maximumReentrantYieldDepth"
+    }, script = """
+            const stats = globalThis.__gaiusWorldgenStats ||
+              (globalThis.__gaiusWorldgenStats = {});
+            if (!stats.__checkpointOnlyYieldDelayHistogram) {
+              Object.defineProperty(stats, '__checkpointOnlyYieldDelayHistogram', {
+                value: new Uint32Array(256),
+                enumerable: false
+              });
+            }
+            const histogram = stats.__checkpointOnlyYieldDelayHistogram;
+            const safeDelay = Math.max(0, Number(yieldDelayMillis) || 0);
+            const bucket = Math.min(histogram.length - 1, Math.floor(safeDelay));
+            if (histogram[bucket] < 0xffffffff) histogram[bucket]++;
+
+            stats.checkpointOnlyYields =
+              (Number(stats.checkpointOnlyYields) || 0) + 1;
+            stats.checkpointOnlyYieldDelayMillis = safeDelay;
+            stats.totalCheckpointOnlyYieldDelayMillis =
+              (Number(stats.totalCheckpointOnlyYieldDelayMillis) || 0) + safeDelay;
+            stats.averageCheckpointOnlyYieldDelayMillis =
+              stats.totalCheckpointOnlyYieldDelayMillis / stats.checkpointOnlyYields;
+            stats.checkpointOnlyMaxYieldDelayMillis = Math.max(
+              Number(stats.checkpointOnlyMaxYieldDelayMillis) || 0,
+              safeDelay
+            );
+            const percentile = function(values, fraction) {
+              const target = Math.max(
+                1,
+                Math.ceil(stats.checkpointOnlyYields * fraction)
+              );
+              let seen = 0;
+              for (let index = 0; index < values.length; index++) {
+                seen += values[index];
+                if (seen >= target) return index + 1;
+              }
+              return values.length;
+            };
+            stats.checkpointOnlyP99YieldDelayMillis = percentile(histogram, 0.99);
+            stats.checkpointOnlyQueueDepth = Math.max(
+              0,
+              Number(queueDepthAfter) || 0
+            );
+            stats.checkpointOnlyMaxQueueDepth = Math.max(
+              Number(stats.checkpointOnlyMaxQueueDepth) || 0,
+              Number(queueDepthBefore) || 0,
+              Number(queueDepthAfter) || 0
+            );
+            stats.checkpointOnlyMaxNetworkWaitPulses = Math.max(
+              Number(stats.checkpointOnlyMaxNetworkWaitPulses) || 0,
+              Number(networkWaitPulses) || 0
+            );
+            stats.checkpointOnlyMaxReentrantYieldDepth = Math.max(
+              Number(stats.checkpointOnlyMaxReentrantYieldDepth) || 0,
+              Number(maximumReentrantYieldDepth) || 0
+            );
+            stats.checkpointOnlyLastYieldAt = Date.now();
+            """)
+    private static native void recordCheckpointOnlyYield(
+            int networkWaitPulses,
+            double yieldDelayMillis,
+            int queueDepthBefore,
+            int queueDepthAfter,
+            int maximumReentrantYieldDepth);
 
     @JSBody(params = {
             "reason",

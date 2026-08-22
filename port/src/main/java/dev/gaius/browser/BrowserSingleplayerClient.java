@@ -15,6 +15,8 @@ public final class BrowserSingleplayerClient {
     private static final int LOCAL_SERVER_PORT = 25565;
     private static final int READY_POLL_MILLIS = 25;
     private static final int READY_POLL_LIMIT = 2_400;
+    /** Returned by the JS readiness probe when its poll belongs to an older launch. */
+    private static final int STALE_WORKER_STATE = -2;
 
     private BrowserSingleplayerClient() {
     }
@@ -28,6 +30,9 @@ public final class BrowserSingleplayerClient {
         if (!isSupported()) {
             return false;
         }
+        if (!storageConfigurationValid()) {
+            return false;
+        }
 
         String worldId = storage.getLevelId();
         worldStem.gaius$saveDataTag(storage);
@@ -38,30 +43,40 @@ public final class BrowserSingleplayerClient {
                 newWorld,
                 renderDistance,
                 simulationDistance);
-        if (sessionId == null || sessionId.isEmpty()) {
+        String launchGeneration = sessionId == null || sessionId.isEmpty()
+                ? ""
+                : localWorkerGeneration(sessionId);
+        if (sessionId == null || sessionId.isEmpty() ||
+                launchGeneration == null || launchGeneration.isEmpty()) {
             return false;
         }
 
         worldStem.close();
         storage.safeClose();
-        beginClientHandoff(sessionId);
+        beginClientHandoff(sessionId, launchGeneration);
         try {
             minecraft.disconnectWithProgressScreen();
         } catch (RuntimeException | Error throwable) {
-            cancelClientHandoff(sessionId);
-            requestWorkerStop();
+            cancelClientHandoff(sessionId, launchGeneration);
+            requestWorkerStop(sessionId, launchGeneration);
             throw throwable;
         }
 
-        connectWhenWorkerReady(minecraft, sessionId, 0);
+        connectWhenWorkerReady(minecraft, sessionId, launchGeneration, 0);
         return true;
     }
 
     private static void connectWhenWorkerReady(
             Minecraft minecraft,
             String sessionId,
+            String launchGeneration,
             int pollCount) {
-        int state = localWorkerState(sessionId);
+        int state = localWorkerState(sessionId, launchGeneration);
+        if (state == STALE_WORKER_STATE) {
+            // A delayed poll from a previous launch must not change the screen
+            // or touch the replacement Worker that reused this session key.
+            return;
+        }
         if (state > 0) {
             String host = "client-" + sessionId + ".gaius-local";
             ServerData serverData = new ServerData(
@@ -78,14 +93,23 @@ public final class BrowserSingleplayerClient {
             return;
         }
         if (state < 0 || pollCount >= READY_POLL_LIMIT) {
-            reportAttachFailure(sessionId, state < 0
+            String detail = state < 0
                     ? "Integrated server stopped before client attach"
-                    : "Integrated server startup timed out before client attach");
+                    : "Integrated server startup timed out before client attach";
+            reportAttachFailure(sessionId, launchGeneration, detail);
+            // This is an attach failure, not a normal disconnect.  Clear this
+            // handoff and stop only the Worker that belongs to this poller;
+            // the regular no-argument stop path deliberately protects a
+            // pending handoff from a delayed disconnect.
+            cancelClientHandoff(sessionId, launchGeneration);
+            requestWorkerStop(sessionId, launchGeneration);
             minecraft.gaius$setScreen(new TitleScreen());
             return;
         }
         Platform.schedule(
-                () -> connectWhenWorkerReady(minecraft, sessionId, pollCount + 1),
+                () -> Platform.startThread(
+                        () -> connectWhenWorkerReady(
+                                minecraft, sessionId, launchGeneration, pollCount + 1)),
                 READY_POLL_MILLIS);
     }
 
@@ -113,39 +137,95 @@ public final class BrowserSingleplayerClient {
             """)
     private static native boolean isSupported();
 
+    @JSBody(script = """
+            try {
+              const profile=String(globalThis.__gaiusProfileId || '').trim();
+              const world=Number(globalThis.__gaiusWorldVersion);
+              const schema=Number(globalThis.__gaiusStorageSchema);
+              const database=String(globalThis.__gaiusStorageDatabaseName || '').trim();
+              const prefix=String(globalThis.__gaiusStoragePrefix || '');
+              const opfs=String(globalThis.__gaiusStorageOpfsDirectory || '').trim();
+              return (profile==='1.21.11' && world===4671 && schema===2
+                && database==='gaius-fs-v2-1.21.11'
+                && prefix==='gaius.fs.v2:1.21.11:'
+                && opfs==='regions-v2-1.21.11') ||
+                (profile==='26.2' && world===4903 && schema===2
+                && database==='gaius-fs-v2-26.2'
+                && prefix==='gaius.fs.v2:26.2:'
+                && opfs==='regions-v2-26.2');
+            } catch (e) {
+              return false;
+            }
+            """)
+    private static native boolean storageConfigurationValid();
+
     @JSBody(params = {"sessionId"}, script = """
             const workers = globalThis.__gaiusSingleplayerWorkers;
             const worker = workers && typeof workers.get === 'function'
               ? workers.get(String(sessionId))
               : null;
-            if (!worker || worker.__gaiusTerminal) return -1;
+            const generation = worker && worker.__gaiusLaunchGeneration
+              ? String(worker.__gaiusLaunchGeneration)
+              : '';
+            return /^[1-9][0-9]*$/.test(generation) ? generation : '';
+            """)
+    private static native String localWorkerGeneration(String sessionId);
+
+    @JSBody(params = {"sessionId", "launchGeneration"}, script = """
+            const workers = globalThis.__gaiusSingleplayerWorkers;
+            const key = String(sessionId || '');
+            const expectedGeneration = String(launchGeneration || '');
+            const worker = workers && typeof workers.get === 'function'
+              ? workers.get(key)
+              : null;
+            if (!key || !/^[1-9][0-9]*$/.test(expectedGeneration) ||
+                !worker || worker.__gaiusTerminal) return -1;
+            if (String(worker.__gaiusLaunchGeneration || '') !== expectedGeneration) {
+              return -2;
+            }
             if (worker.__gaiusClientAttached) return 1;
             const ports = globalThis.__gaiusLocalServerPorts ||
               (globalThis.__gaiusLocalServerPorts = new Map());
             const ownedPort = worker.__gaiusClientPort || null;
-            if (ownedPort && ports.get(String(sessionId)) !== ownedPort) {
-              ports.set(String(sessionId), ownedPort);
+            if (ownedPort && ports.get(key) !== ownedPort) {
+              ports.set(key, ownedPort);
             }
-            return worker.__gaiusServerReady && ports.get(String(sessionId))
+            const mappedPort = ports.get(key);
+            return worker.__gaiusServerReady && mappedPort &&
+              String(mappedPort.__gaiusLaunchGeneration || '') === expectedGeneration
               ? 1
               : 0;
             """)
-    private static native int localWorkerState(String sessionId);
+    private static native int localWorkerState(String sessionId, String launchGeneration);
 
-    @JSBody(params = {"sessionId", "detail"}, script = """
+    @JSBody(params = {"sessionId", "launchGeneration", "detail"}, script = """
+            const key = String(sessionId || '');
+            const expectedGeneration = String(launchGeneration || '');
+            const workers = globalThis.__gaiusSingleplayerWorkers;
+            const worker = workers && typeof workers.get === 'function'
+              ? workers.get(key)
+              : null;
+            if (!key || !expectedGeneration || !worker ||
+                String(worker.__gaiusLaunchGeneration || '') !== expectedGeneration) {
+              return;
+            }
             const events = globalThis.__gaiusMinecraftEvents ||
               (globalThis.__gaiusMinecraftEvents = []);
             events.push({
               event: 'singleplayer:client-attach-failed',
-              detail: String(sessionId) + ': ' + String(detail),
+              detail: key + ': ' + String(detail),
               at: Date.now()
             });
             if (events.length > 500) events.splice(0, events.length - 500);
             """)
-    private static native void reportAttachFailure(String sessionId, String detail);
+    private static native void reportAttachFailure(
+            String sessionId,
+            String launchGeneration,
+            String detail);
 
     @JSBody(params = {"worldId", "newWorld", "renderDistance", "simulationDistance"}, script = """
             let sessionId = '';
+            let launchGeneration = '';
             let channel = null;
             let ports = null;
             let workers = null;
@@ -155,10 +235,32 @@ public final class BrowserSingleplayerClient {
               if (!port) return;
               try { port.close(); } catch (ignored) {}
             };
-            const clearHandoffLease = function() {
-              if (sessionId && String(globalThis.__gaiusSingleplayerHandoff || '') === sessionId) {
-                globalThis.__gaiusSingleplayerHandoff = '';
+            const bindPortGeneration = function(port) {
+              if (!port || !/^[1-9][0-9]*$/.test(launchGeneration)) return false;
+              try { port.__gaiusLaunchGeneration = launchGeneration; } catch (ignored) {}
+              return String(port.__gaiusLaunchGeneration || '') === launchGeneration;
+            };
+            const handoffMatches = function(expectedSession, expectedGeneration) {
+              const handoff = globalThis.__gaiusSingleplayerHandoff;
+              if (handoff && typeof handoff === 'object') {
+                return String(handoff.sessionId || '') === String(expectedSession || '') &&
+                  String(handoff.generation || '') === String(expectedGeneration || '');
               }
+              return String(handoff || '') === String(expectedSession || '') &&
+                String(globalThis.__gaiusSingleplayerHandoffGeneration || '') ===
+                  String(expectedGeneration || '');
+            };
+            const ownsLaunch = function() {
+              return workers && sessionId && worker && workers.get(sessionId) === worker &&
+                String(worker.__gaiusLaunchGeneration || '') === launchGeneration;
+            };
+            const clearHandoffLease = function() {
+              if (!ownsLaunch() || !sessionId || !launchGeneration ||
+                  !handoffMatches(sessionId, launchGeneration)) {
+                return;
+              }
+              globalThis.__gaiusSingleplayerHandoff = '';
+              globalThis.__gaiusSingleplayerHandoffGeneration = '';
             };
             const rollbackLaunch = function(detail) {
               clearHandoffLease();
@@ -178,11 +280,12 @@ public final class BrowserSingleplayerClient {
                 }
                 try { worker.terminate(); } catch (ignored) {}
               }
-              if (ports && sessionId && channel &&
+              if (ports && sessionId && channel && (!worker || ownsLaunch()) &&
                   ports.get(sessionId) === channel.port1) {
                 ports.delete(sessionId);
               }
-              if (workers && sessionId && worker && workers.get(sessionId) === worker) {
+              if (workers && sessionId && worker && workers.get(sessionId) === worker &&
+                  String(worker.__gaiusLaunchGeneration || '') === launchGeneration) {
                 workers.delete(sessionId);
               }
               if (channel) {
@@ -190,18 +293,59 @@ public final class BrowserSingleplayerClient {
                 if (!port2Transferred) closePort(channel.port2);
               }
               const bridge = globalThis.__gaiusNettyBridge;
-              if (sessionId && bridge && typeof bridge.failLocalSession === 'function') {
-                bridge.failLocalSession(sessionId, detail);
+              if (workers && sessionId && worker && workers.get(sessionId) === worker &&
+                  String(worker.__gaiusLaunchGeneration || '') === launchGeneration &&
+                  bridge && typeof bridge.failLocalSession === 'function') {
+                bridge.failLocalSession(sessionId, detail, launchGeneration);
               }
             };
             try {
+              const profileId = String(globalThis.__gaiusProfileId || '').trim();
+              const worldVersion = Number(globalThis.__gaiusWorldVersion);
+              const storageSchema = Number(globalThis.__gaiusStorageSchema);
+              const storageDatabaseName = String(
+                globalThis.__gaiusStorageDatabaseName || ''
+              ).trim();
+              const storagePrefix = String(globalThis.__gaiusStoragePrefix || '');
+              const storageOpfsDirectory = String(
+                globalThis.__gaiusStorageOpfsDirectory || ''
+              ).trim();
+              const storageMatchesProfile =
+                (profileId === '1.21.11' && worldVersion === 4671 &&
+                  storageSchema === 2 &&
+                  storageDatabaseName === 'gaius-fs-v2-1.21.11' &&
+                  storagePrefix === 'gaius.fs.v2:1.21.11:' &&
+                  storageOpfsDirectory === 'regions-v2-1.21.11') ||
+                (profileId === '26.2' && worldVersion === 4903 &&
+                  storageSchema === 2 &&
+                  storageDatabaseName === 'gaius-fs-v2-26.2' &&
+                  storagePrefix === 'gaius.fs.v2:26.2:' &&
+                  storageOpfsDirectory === 'regions-v2-26.2');
+              if (!storageMatchesProfile) {
+                throw new Error('Singleplayer storage configuration does not match profile');
+              }
               const bytes = new Uint8Array(16);
               crypto.getRandomValues(bytes);
               for (let i = 0; i < bytes.length; i++) {
                 sessionId += bytes[i].toString(16).padStart(2, '0');
               }
+              const previousGeneration = Number(
+                globalThis.__gaiusSingleplayerLaunchGeneration
+              );
+              const nextGeneration = Number.isSafeInteger(previousGeneration) &&
+                previousGeneration >= 0 && previousGeneration < Number.MAX_SAFE_INTEGER
+                ? previousGeneration + 1
+                : 1;
+              launchGeneration = String(nextGeneration);
+              globalThis.__gaiusSingleplayerLaunchGeneration = nextGeneration;
+              if (!/^[1-9][0-9]*$/.test(launchGeneration)) {
+                throw new Error('Singleplayer launch generation is invalid');
+              }
 
               channel = new MessageChannel();
+              if (!bindPortGeneration(channel.port1) || !bindPortGeneration(channel.port2)) {
+                throw new Error('Singleplayer MessagePort generation binding failed');
+              }
               ports = globalThis.__gaiusLocalServerPorts ||
                 (globalThis.__gaiusLocalServerPorts = new Map());
               ports.set(sessionId, channel.port1);
@@ -219,6 +363,7 @@ public final class BrowserSingleplayerClient {
                 location.href
               );
               worker = new Worker(workerUrl, {name: 'Gaius Integrated Server'});
+              worker.__gaiusLaunchGeneration = launchGeneration;
               worker.__gaiusHandoffPending = true;
               worker.__gaiusClientAttached = false;
               worker.__gaiusClientPort = channel.port1;
@@ -227,10 +372,11 @@ public final class BrowserSingleplayerClient {
               worker.__gaiusStopRequested = false;
               workers.set(sessionId, worker);
               const ownsSession = function() {
-                return workers.get(sessionId) === worker;
+                return workers.get(sessionId) === worker &&
+                  String(worker.__gaiusLaunchGeneration || '') === launchGeneration;
               };
               const ownsPendingPort = function() {
-                return ports.get(sessionId) === worker.__gaiusClientPort;
+                return ownsSession() && ports.get(sessionId) === worker.__gaiusClientPort;
               };
               const copyScalarTelemetry = function(value) {
                 const snapshot = {};
@@ -273,6 +419,8 @@ public final class BrowserSingleplayerClient {
                   ? globalThis.__gaiusBenchmarkMeasurementId
                   : '';
               worker.__gaiusTelemetryResetAt = Date.now();
+              worker.__gaiusTelemetryWorkerResetAt = 0;
+              worker.__gaiusTelemetryMeasurementMismatches = 0;
               worker.__gaiusTelemetryLongestHeartbeatGap = 0;
               worker.__gaiusTelemetryLongestHeartbeatDelay = 0;
               worker.__gaiusTelemetryInterval = 1000;
@@ -300,6 +448,8 @@ public final class BrowserSingleplayerClient {
                 state.sessionId = sessionId;
                 state.measurementId = worker.__gaiusTelemetryMeasurementId;
                 state.resetAt = worker.__gaiusTelemetryResetAt;
+                state.workerResetAt = worker.__gaiusTelemetryWorkerResetAt;
+                state.measurementMismatches = worker.__gaiusTelemetryMeasurementMismatches;
                 state.sent = worker.__gaiusTelemetrySent;
                 state.received = worker.__gaiusTelemetryReceived;
                 state.rttSampleCount = worker.__gaiusTelemetryRttSamples;
@@ -362,6 +512,8 @@ public final class BrowserSingleplayerClient {
                 worker.__gaiusTelemetryRttSamples = 0;
                 worker.__gaiusTelemetryMeasurementId = String(measurementId || '');
                 worker.__gaiusTelemetryResetAt = Date.now();
+                worker.__gaiusTelemetryWorkerResetAt = 0;
+                worker.__gaiusTelemetryMeasurementMismatches = 0;
                 worker.__gaiusTelemetryLongestHeartbeatGap = 0;
                 worker.__gaiusTelemetryLongestHeartbeatDelay = 0;
                 worker.__gaiusTelemetryLastPingAt = 0;
@@ -401,7 +553,8 @@ public final class BrowserSingleplayerClient {
                     type: 'telemetry-ping',
                     sessionId: sessionId,
                     sequence: sequence,
-                    sentAtEpoch: now
+                    sentAtEpoch: now,
+                    measurementId: worker.__gaiusTelemetryMeasurementId
                   });
                 } catch (error) {
                   worker.__gaiusTelemetryPending.delete(sequence);
@@ -430,6 +583,12 @@ public final class BrowserSingleplayerClient {
               };
               const receiveWorkerTelemetryPong = function(message) {
                 if (!ownsSession() || String(message.sessionId || '') !== sessionId) return;
+                if (typeof message.measurementId !== 'string' ||
+                    message.measurementId !== worker.__gaiusTelemetryMeasurementId) {
+                  worker.__gaiusTelemetryMeasurementMismatches++;
+                  publishWorkerTelemetry();
+                  return;
+                }
                 const sequence = Number(message.sequence) || 0;
                 const sentAt = worker.__gaiusTelemetryPending.get(sequence);
                 if (!sentAt) return;
@@ -476,6 +635,7 @@ public final class BrowserSingleplayerClient {
                   );
                 }
                 worker.__gaiusTelemetryLastPongAt = now;
+                worker.__gaiusTelemetryWorkerResetAt = Number(message.workerResetAt) || 0;
                 worker.__gaiusTelemetryChunkPriority = copyScalarTelemetry(
                   message.chunkPriority
                 );
@@ -490,7 +650,7 @@ public final class BrowserSingleplayerClient {
               const failLocalSession = function(detail) {
                 const bridge = globalThis.__gaiusNettyBridge;
                 if (bridge && typeof bridge.failLocalSession === 'function') {
-                  bridge.failLocalSession(sessionId, detail);
+                  bridge.failLocalSession(sessionId, detail, launchGeneration);
                 }
               };
               const clearWorkerStopTimeout = function() {
@@ -512,6 +672,9 @@ public final class BrowserSingleplayerClient {
                 if (ownsPendingPort()) {
                   try { worker.__gaiusClientPort.close(); } catch (ignored) {}
                   ports.delete(sessionId);
+                } else {
+                  try { if (worker.__gaiusClientPort) worker.__gaiusClientPort.close(); }
+                  catch (ignored) {}
                 }
                 try { worker.terminate(); } catch (ignored) {}
                 if (ownsSession()) workers.delete(sessionId);
@@ -556,18 +719,23 @@ public final class BrowserSingleplayerClient {
                     clearTimeout(worker.__gaiusHandoffTimeout);
                     worker.__gaiusHandoffTimeout = 0;
                   }
-                  const storageRefresh = refreshPersistentFiles();
-                  worker.__gaiusStorageRefresh = storageRefresh;
-                  storageRefresh.catch(function(error) {
-                    events.push({
-                      event: 'singleplayer:storage-refresh-error',
-                      detail: String(error && (error.stack || error.message) || error),
-                      at: Date.now()
+                  if (ownsSession()) {
+                    const storageRefresh = refreshPersistentFiles();
+                    worker.__gaiusStorageRefresh = storageRefresh;
+                    storageRefresh.catch(function(error) {
+                      events.push({
+                        event: 'singleplayer:storage-refresh-error',
+                        detail: String(error && (error.stack || error.message) || error),
+                        at: Date.now()
+                      });
                     });
-                  });
+                  }
                   if (ownsPendingPort()) {
                     try { worker.__gaiusClientPort.close(); } catch (ignored) {}
                     ports.delete(sessionId);
+                  } else {
+                    try { if (worker.__gaiusClientPort) worker.__gaiusClientPort.close(); }
+                    catch (ignored) {}
                   }
                   try { worker.terminate(); } catch (ignored) {}
                   if (ownsSession()) workers.delete(sessionId);
@@ -593,8 +761,15 @@ public final class BrowserSingleplayerClient {
               const init = {
                 type: 'start',
                 sessionId: sessionId,
+                launchGeneration: launchGeneration,
                 worldId: String(worldId),
                 newWorld: !!newWorld,
+                profileId: globalThis.__gaiusProfileId || null,
+                worldVersion: globalThis.__gaiusWorldVersion || null,
+                storageSchema: globalThis.__gaiusStorageSchema || null,
+                storageDatabaseName: globalThis.__gaiusStorageDatabaseName || null,
+                storagePrefix: globalThis.__gaiusStoragePrefix || null,
+                storageOpfsDirectory: globalThis.__gaiusStorageOpfsDirectory || null,
                 bridgeUrl: globalThis.__gaiusBridgeUrl || null,
                 bridgeToken: globalThis.__gaiusBridgeToken || null,
                 renderDistance: Math.max(2, Math.min(32, Number(renderDistance) || 6)),
@@ -628,6 +803,14 @@ public final class BrowserSingleplayerClient {
               const stopPreviousWorker = function(entry) {
                 const previousSessionId = entry[0];
                 const previousWorker = entry[1];
+                const previousGeneration = String(
+                  previousWorker && previousWorker.__gaiusLaunchGeneration || ''
+                );
+                const ownsPreviousWorker = function() {
+                  return workers.get(previousSessionId) === previousWorker &&
+                    String(previousWorker && previousWorker.__gaiusLaunchGeneration || '') ===
+                      previousGeneration;
+                };
                 if (!previousWorker || previousWorker.__gaiusTerminal) {
                   return Promise.resolve();
                 }
@@ -657,17 +840,20 @@ public final class BrowserSingleplayerClient {
                       previousWorker.__gaiusStopTelemetry();
                     }
                     const bridge = globalThis.__gaiusNettyBridge;
-                    if (workers.get(previousSessionId) === previousWorker &&
-                        bridge && typeof bridge.failLocalSession === 'function') {
-                      bridge.failLocalSession(previousSessionId, detail);
-                    }
+                  if (ownsPreviousWorker() &&
+                      bridge && typeof bridge.failLocalSession === 'function') {
+                      bridge.failLocalSession(previousSessionId, detail, previousGeneration);
+                  }
                     const pendingPort = ports.get(previousSessionId);
-                    if (pendingPort && pendingPort === previousWorker.__gaiusClientPort) {
+                    if (ownsPreviousWorker() && pendingPort &&
+                        pendingPort === previousWorker.__gaiusClientPort) {
                       try { pendingPort.close(); } catch (ignored) {}
                       ports.delete(previousSessionId);
+                    } else {
+                      closePort(previousWorker.__gaiusClientPort);
                     }
                     try { previousWorker.terminate(); } catch (ignored) {}
-                    if (workers.get(previousSessionId) === previousWorker) {
+                    if (ownsPreviousWorker()) {
                       workers.delete(previousSessionId);
                     }
                   };
@@ -710,6 +896,32 @@ public final class BrowserSingleplayerClient {
                 });
               };
               const refreshPersistentFiles = function() {
+                const storageDatabaseName = String(
+                  globalThis.__gaiusStorageDatabaseName || ''
+                ).trim();
+                const storageSchema = Number(globalThis.__gaiusStorageSchema);
+                const profileId = String(globalThis.__gaiusProfileId || '').trim();
+                const worldVersion = Number(globalThis.__gaiusWorldVersion);
+                const storagePrefix = String(globalThis.__gaiusStoragePrefix || '');
+                const storageOpfsDirectory = String(
+                  globalThis.__gaiusStorageOpfsDirectory || ''
+                ).trim();
+                const storageMatchesProfile =
+                  (profileId === '1.21.11' && worldVersion === 4671 &&
+                    storageSchema === 2 &&
+                    storageDatabaseName === 'gaius-fs-v2-1.21.11' &&
+                    storagePrefix === 'gaius.fs.v2:1.21.11:' &&
+                    storageOpfsDirectory === 'regions-v2-1.21.11') ||
+                  (profileId === '26.2' && worldVersion === 4903 &&
+                    storageSchema === 2 &&
+                    storageDatabaseName === 'gaius-fs-v2-26.2' &&
+                    storagePrefix === 'gaius.fs.v2:26.2:' &&
+                    storageOpfsDirectory === 'regions-v2-26.2');
+                if (!storageMatchesProfile) {
+                  return Promise.reject(new Error(
+                    'IndexedDB refresh storage configuration does not match profile'
+                  ));
+                }
                 if (typeof indexedDB === 'undefined') return Promise.resolve();
                 const worldPrefix = '/gaius/saves/';
                 const isWorldMetadataPath = function(path) {
@@ -721,10 +933,11 @@ public final class BrowserSingleplayerClient {
                   if (separator <= 0) return false;
                   const file = relative.substring(separator + 1);
                   return file === 'level.dat' || file === 'level.dat_old' ||
-                    file === 'icon.png';
+                    file === 'icon.png' ||
+                    file === 'data/minecraft/world_gen_settings.dat';
                 };
                 return new Promise(function(resolve, reject) {
-                  const request = indexedDB.open('gaius-fs-v1', 1);
+                  const request = indexedDB.open(storageDatabaseName, storageSchema);
                   request.onsuccess = function() { resolve(request.result); };
                   request.onerror = function() {
                     reject(request.error || new Error('IndexedDB refresh open failed'));
@@ -853,18 +1066,38 @@ public final class BrowserSingleplayerClient {
             """)
     private static native void postWorkerDistances(int renderDistance, int simulationDistance);
 
-    @JSBody(params = {"sessionId"}, script = """
-            globalThis.__gaiusSingleplayerHandoff = String(sessionId || '');
+    @JSBody(params = {"sessionId", "launchGeneration"}, script = """
+            const key = String(sessionId || '');
+            const generation = String(launchGeneration || '');
+            if (!key || !/^[1-9][0-9]*$/.test(generation)) return;
+            globalThis.__gaiusSingleplayerHandoff = key;
+            globalThis.__gaiusSingleplayerHandoffGeneration = generation;
             """)
-    private static native void beginClientHandoff(String sessionId);
+    private static native void beginClientHandoff(String sessionId, String launchGeneration);
 
-    @JSBody(params = {"sessionId"}, script = """
-            if (String(globalThis.__gaiusSingleplayerHandoff || '') ===
-                String(sessionId || '')) {
+    @JSBody(params = {"sessionId", "launchGeneration"}, script = """
+            const key = String(sessionId || '');
+            const generation = String(launchGeneration || '');
+            const workers = globalThis.__gaiusSingleplayerWorkers;
+            const worker = workers && typeof workers.get === 'function'
+              ? workers.get(key)
+              : null;
+            if (!key || !generation || !worker || worker.__gaiusTerminal ||
+                String(worker.__gaiusLaunchGeneration || '') !== generation) {
+              return;
+            }
+            const handoff = globalThis.__gaiusSingleplayerHandoff;
+            const matches = handoff && typeof handoff === 'object'
+              ? String(handoff.sessionId || '') === key &&
+                String(handoff.generation || '') === generation
+              : String(handoff || '') === key &&
+                String(globalThis.__gaiusSingleplayerHandoffGeneration || '') === generation;
+            if (matches) {
               globalThis.__gaiusSingleplayerHandoff = '';
+              globalThis.__gaiusSingleplayerHandoffGeneration = '';
             }
             """)
-    private static native void cancelClientHandoff(String sessionId);
+    private static native void cancelClientHandoff(String sessionId, String launchGeneration);
 
     @JSBody(script = """
             const workers = globalThis.__gaiusSingleplayerWorkers;
@@ -880,9 +1113,22 @@ public final class BrowserSingleplayerClient {
     @JSBody(script = """
             const workers = globalThis.__gaiusSingleplayerWorkers;
             if (!workers || typeof workers.values !== 'function') return;
-            const handoffSession = String(globalThis.__gaiusSingleplayerHandoff || '');
+            const handoff = globalThis.__gaiusSingleplayerHandoff;
+            const handoffSession = handoff && typeof handoff === 'object'
+              ? String(handoff.sessionId || '')
+              : String(handoff || '');
+            const handoffGeneration = handoff && typeof handoff === 'object'
+              ? String(handoff.generation || '')
+              : String(globalThis.__gaiusSingleplayerHandoffGeneration || '');
             workers.forEach(function(worker, sessionId) {
+              const workerGeneration = String(worker && worker.__gaiusLaunchGeneration || '');
+              const ownsWorker = function() {
+                return workers.get(sessionId) === worker &&
+                  String(worker && worker.__gaiusLaunchGeneration || '') === workerGeneration;
+              };
               if (handoffSession === String(sessionId) &&
+                  handoffGeneration && handoffGeneration === workerGeneration &&
+                  ownsWorker() &&
                   worker.__gaiusHandoffPending && !worker.__gaiusClientAttached) {
                 const events = globalThis.__gaiusMinecraftEvents ||
                   (globalThis.__gaiusMinecraftEvents = []);
@@ -894,15 +1140,16 @@ public final class BrowserSingleplayerClient {
                 if (events.length > 500) events.splice(0, events.length - 500);
                 return;
               }
+              if (!ownsWorker()) return;
               worker.__gaiusStopRequested = true;
               try {
                 worker.postMessage({type: 'stop'});
               } catch (error) {
                 const bridge = globalThis.__gaiusNettyBridge;
-                if (workers.get(sessionId) === worker && bridge &&
+                if (ownsWorker() && bridge &&
                     typeof bridge.failLocalSession === 'function') {
                   bridge.failLocalSession(sessionId, String(error &&
-                    (error.message || error) || error));
+                    (error.message || error) || error), workerGeneration);
                 }
               }
               if (typeof worker.__gaiusArmStopTimeout === 'function') {
@@ -920,25 +1167,106 @@ public final class BrowserSingleplayerClient {
                   worker.__gaiusStopTelemetry();
                 }
                 const bridge = globalThis.__gaiusNettyBridge;
-                if (workers.get(sessionId) === worker &&
+                if (ownsWorker() &&
                     bridge && typeof bridge.failLocalSession === 'function') {
                   bridge.failLocalSession(
                     sessionId,
-                    'Integrated server did not stop within 35 seconds'
+                    'Integrated server did not stop within 35 seconds',
+                    workerGeneration
                   );
                 }
                 const ports = globalThis.__gaiusLocalServerPorts;
                 const pendingPort = ports && typeof ports.get === 'function'
                   ? ports.get(sessionId)
                   : null;
-                if (pendingPort && pendingPort === worker.__gaiusClientPort) {
+                if (ownsWorker() && pendingPort &&
+                    pendingPort === worker.__gaiusClientPort) {
                   try { pendingPort.close(); } catch (ignored) {}
                   ports.delete(sessionId);
+                } else {
+                  try { if (worker.__gaiusClientPort) worker.__gaiusClientPort.close(); }
+                  catch (ignored) {}
                 }
                 try { worker.terminate(); } catch (ignored) {}
-                if (workers.get(sessionId) === worker) workers.delete(sessionId);
+                if (ownsWorker()) workers.delete(sessionId);
               }, 35000);
             });
             """)
     private static native void requestWorkerStop();
+
+    @JSBody(params = {"sessionId", "launchGeneration"}, script = """
+            const key = String(sessionId || '');
+            const expectedGeneration = String(launchGeneration || '');
+            if (!key || !expectedGeneration) return;
+            const workers = globalThis.__gaiusSingleplayerWorkers;
+            if (!workers || typeof workers.get !== 'function') return;
+            const worker = workers.get(key);
+            if (!worker || worker.__gaiusTerminal ||
+                String(worker.__gaiusLaunchGeneration || '') !== expectedGeneration) return;
+            const ownsWorker = function() {
+              return workers.get(key) === worker &&
+                String(worker.__gaiusLaunchGeneration || '') === expectedGeneration;
+            };
+            const handoff = globalThis.__gaiusSingleplayerHandoff;
+            const handoffMatches = handoff && typeof handoff === 'object'
+              ? String(handoff.sessionId || '') === key &&
+                String(handoff.generation || '') === expectedGeneration
+              : String(handoff || '') === key &&
+                String(globalThis.__gaiusSingleplayerHandoffGeneration || '') ===
+                  expectedGeneration;
+            if (handoffMatches && ownsWorker()) {
+              globalThis.__gaiusSingleplayerHandoff = '';
+              globalThis.__gaiusSingleplayerHandoffGeneration = '';
+            }
+            worker.__gaiusHandoffPending = false;
+            worker.__gaiusStopRequested = true;
+            try {
+              worker.postMessage({type: 'stop'});
+            } catch (error) {
+              const bridge = globalThis.__gaiusNettyBridge;
+              if (ownsWorker() && bridge &&
+                  typeof bridge.failLocalSession === 'function') {
+                bridge.failLocalSession(key, String(error &&
+                  (error.message || error) || error), expectedGeneration);
+              }
+            }
+            if (typeof worker.__gaiusArmStopTimeout === 'function') {
+              worker.__gaiusArmStopTimeout(
+                35000,
+                'Integrated server did not stop within 35 seconds'
+              );
+              return;
+            }
+            if (worker.__gaiusStopTimeout) clearTimeout(worker.__gaiusStopTimeout);
+            worker.__gaiusStopTimeout = setTimeout(function() {
+              if (worker.__gaiusTerminal) return;
+              worker.__gaiusTerminal = true;
+              if (typeof worker.__gaiusStopTelemetry === 'function') {
+                worker.__gaiusStopTelemetry();
+              }
+              const bridge = globalThis.__gaiusNettyBridge;
+              if (ownsWorker() && bridge &&
+                  typeof bridge.failLocalSession === 'function') {
+                bridge.failLocalSession(
+                  key,
+                  'Integrated server did not stop within 35 seconds',
+                  expectedGeneration
+                );
+              }
+              const ports = globalThis.__gaiusLocalServerPorts;
+              const pendingPort = ports && typeof ports.get === 'function'
+                ? ports.get(key)
+                : null;
+              if (ownsWorker() && pendingPort && pendingPort === worker.__gaiusClientPort) {
+                try { pendingPort.close(); } catch (ignored) {}
+                ports.delete(key);
+              } else {
+                try { if (worker.__gaiusClientPort) worker.__gaiusClientPort.close(); }
+                catch (ignored) {}
+              }
+              try { worker.terminate(); } catch (ignored) {}
+              if (ownsWorker()) workers.delete(key);
+            }, 35000);
+            """)
+    private static native void requestWorkerStop(String sessionId, String launchGeneration);
 }

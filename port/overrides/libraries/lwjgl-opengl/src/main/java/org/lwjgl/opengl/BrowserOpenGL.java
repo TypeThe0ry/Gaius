@@ -55,6 +55,15 @@ public final class BrowserOpenGL {
     private static int inventoryWorldRenderFrame;
     private static String inventoryWorldRenderScreen;
     private static int nextSyntheticQuery = 1;
+    /**
+     * The client tick hook reports state from the game loop. Keep the state
+     * itself fresh, but do not repeat collision queries and diagnostic string
+     * construction on every 50/100 ms report. Four reports is deliberately a
+     * small bound (at most about 400 ms in-world) and key changes still refresh
+     * immediately.
+     */
+    private static final MinecraftStateDetails MINECRAFT_STATE_DETAILS =
+            new MinecraftStateDetails();
 
     @JSFunctor
     private interface MappedBufferReleaseCallback extends JSObject {
@@ -4193,10 +4202,14 @@ public final class BrowserOpenGL {
             state.noteBufferUpload(data ? data.byteLength : 0,data ? data.byteLength : 0,true);
             const buffer=state.boundBuffers.get(target)|0;
             if (buffer && data) {
-              const end=Number(offset)+data.byteLength;
-              const known=state.bufferSizes.get(buffer)||0;
-              if (end > known) state.bufferSizes.set(buffer,end);
-              state.shadowBufferSubDataForTarget(target,buffer,Number(offset),data);
+              const start=Number(offset);
+              const length=Number(data.byteLength);
+              const end=start+length;
+              const known=state.bufferSizes.get(buffer);
+              const validRange=Number.isFinite(start) && start>=0
+                && Number.isFinite(length) && length>=0 && Number.isFinite(end)
+                && Number.isFinite(known) && known>=0 && end<=known;
+              if (validRange && length>0) state.shadowBufferSubDataForTarget(target,buffer,start,data);
             }
             """)
     private static native void bufferSubDataJs(int target, int offset, Int8Array data);
@@ -4269,13 +4282,19 @@ public final class BrowserOpenGL {
             gl.bufferSubData(gl.COPY_WRITE_BUFFER,Number(offset),data);
             state.noteBufferUpload(data ? data.byteLength : 0,data ? data.byteLength : 0,true);
             if (buffer && data) {
-              const end=Number(offset)+data.byteLength;
-              const known=state.bufferSizes.get(buffer)||0;
-              if (end > known) state.bufferSizes.set(buffer,end);
-              if (state.shadowRequiredBuffers && state.shadowRequiredBuffers.has(buffer|0)) {
-                state.shadowBufferSubData(buffer,Number(offset),data);
-              } else {
-                if (!state.dropBufferShadow(buffer,'named-buffer')) state.bumpBufferVersion(buffer);
+              const start=Number(offset);
+              const length=Number(data.byteLength);
+              const end=start+length;
+              const known=state.bufferSizes.get(buffer);
+              const validRange=Number.isFinite(start) && start>=0
+                && Number.isFinite(length) && length>=0 && Number.isFinite(end)
+                && Number.isFinite(known) && known>=0 && end<=known;
+              if (validRange && length>0) {
+                if (state.shadowRequiredBuffers && state.shadowRequiredBuffers.has(buffer|0)) {
+                  state.shadowBufferSubData(buffer,start,data);
+                } else {
+                  if (!state.dropBufferShadow(buffer,'named-buffer')) state.bumpBufferVersion(buffer);
+                }
               }
             }
             if (!bindingMatches) gl.bindBuffer(gl.COPY_WRITE_BUFFER,previous);
@@ -5816,11 +5835,26 @@ public final class BrowserOpenGL {
             const sourceBuffer=state.boundBuffers.get(sourceTarget)|0;
             const targetBuffer=state.boundBuffers.get(targetTarget)|0;
             const source=state.bufferBytes.get(sourceBuffer);
-            if (targetBuffer) {
-              if (source && state.shouldShadowBufferTarget(targetTarget,targetBuffer)) {
-                const start=Number(sourceOffset);
-                const end=start+Number(size);
-                state.shadowBufferSubData(targetBuffer,Number(targetOffset),source.subarray(start,end));
+            const start=Number(sourceOffset);
+            const targetStart=Number(targetOffset);
+            const length=Number(size);
+            const sourceEnd=start+length;
+            const targetEnd=targetStart+length;
+            const sourceKnown=sourceBuffer ? state.bufferSizes.get(sourceBuffer) : undefined;
+            const targetKnown=targetBuffer ? state.bufferSizes.get(targetBuffer) : undefined;
+            const sameBufferOverlap=sourceBuffer===targetBuffer && length>0
+              && start<targetEnd && targetStart<sourceEnd;
+            const validRange=Number.isFinite(start) && start>=0
+              && Number.isFinite(targetStart) && targetStart>=0
+              && Number.isFinite(length) && length>=0
+              && Number.isFinite(sourceEnd) && Number.isFinite(targetEnd)
+              && Number.isFinite(sourceKnown) && sourceKnown>=0 && sourceEnd<=sourceKnown
+              && Number.isFinite(targetKnown) && targetKnown>=0 && targetEnd<=targetKnown
+              && !sameBufferOverlap;
+            if (targetBuffer && validRange && length>0) {
+              if (source && source.byteLength>=sourceEnd
+                  && state.shouldShadowBufferTarget(targetTarget,targetBuffer)) {
+                state.shadowBufferSubData(targetBuffer,targetStart,source.subarray(start,sourceEnd));
               } else {
                 if (!state.dropBufferShadow(
                     targetBuffer,source ? 'copy-target:'+targetTarget : 'copy-missing-source')) {
@@ -5845,17 +5879,32 @@ public final class BrowserOpenGL {
             gl.copyBufferSubData(
               gl.COPY_READ_BUFFER,gl.COPY_WRITE_BUFFER,Number(sourceOffset),Number(targetOffset),Number(size));
             if (targetBuffer) {
-              const end=Number(targetOffset)+Number(size);
-              const known=state.bufferSizes.get(targetBuffer)||0;
-              if (end > known) state.bufferSizes.set(targetBuffer,end);
+              const start=Number(sourceOffset);
+              const targetStart=Number(targetOffset);
+              const length=Number(size);
+              const sourceEnd=start+length;
+              const targetEnd=targetStart+length;
+              const sourceKnown=sourceBuffer ? state.bufferSizes.get(sourceBuffer) : undefined;
+              const targetKnown=state.bufferSizes.get(targetBuffer);
+              const sameBufferOverlap=sourceBuffer===targetBuffer && length>0
+                && start<targetEnd && targetStart<sourceEnd;
+              const validRange=Number.isFinite(start) && start>=0
+                && Number.isFinite(targetStart) && targetStart>=0
+                && Number.isFinite(length) && length>=0
+                && Number.isFinite(sourceEnd) && Number.isFinite(targetEnd)
+                && Number.isFinite(sourceKnown) && sourceKnown>=0 && sourceEnd<=sourceKnown
+                && Number.isFinite(targetKnown) && targetKnown>=0 && targetEnd<=targetKnown
+                && !sameBufferOverlap;
               const source=state.bufferBytes.get(sourceBuffer);
-              if (source && state.shadowRequiredBuffers && state.shadowRequiredBuffers.has(targetBuffer|0)) {
-                const start=Number(sourceOffset);
-                state.shadowBufferSubData(targetBuffer,Number(targetOffset),source.subarray(start,start+Number(size)));
-              } else {
-                if (!state.dropBufferShadow(
-                    targetBuffer,source ? 'named-copy-target' : 'named-copy-missing-source')) {
-                  state.bumpBufferVersion(targetBuffer);
+              if (validRange && length>0) {
+                if (source && source.byteLength>=sourceEnd
+                    && state.shadowRequiredBuffers && state.shadowRequiredBuffers.has(targetBuffer|0)) {
+                  state.shadowBufferSubData(targetBuffer,targetStart,source.subarray(start,sourceEnd));
+                } else {
+                  if (!state.dropBufferShadow(
+                      targetBuffer,source ? 'named-copy-target' : 'named-copy-missing-source')) {
+                    state.bumpBufferVersion(targetBuffer);
+                  }
                 }
               }
             }
@@ -6141,6 +6190,7 @@ public final class BrowserOpenGL {
     public static void reportMinecraftState(
             Object screen, Object overlay, Object level, Object player, Object gameMode, Object hitResult,
             boolean noRender, boolean running, boolean pause) {
+        boolean refreshDetails = MINECRAFT_STATE_DETAILS.beginReport();
         String screenTitle = null;
         int screenWidth = -1;
         int screenHeight = -1;
@@ -6189,10 +6239,22 @@ public final class BrowserOpenGL {
                 Inventory inventory = typedPlayer.getInventory();
                 selectedSlot = inventory.getSelectedSlot();
                 ItemStack stack = inventory.getSelectedItem();
+                Object itemKey = null;
                 if (stack != null && !stack.isEmpty()) {
-                    selectedItem = String.valueOf(stack.getItem());
+                    itemKey = stack.getItem();
                     selectedCount = stack.getCount();
                 }
+                boolean selectedItemChanged = MINECRAFT_STATE_DETAILS.selectedPlayer != typedPlayer
+                        || MINECRAFT_STATE_DETAILS.selectedSlot != selectedSlot
+                        || MINECRAFT_STATE_DETAILS.selectedItemKey != itemKey;
+                if (selectedItemChanged || refreshDetails) {
+                    MINECRAFT_STATE_DETAILS.selectedItem = itemKey == null
+                            ? null : String.valueOf(itemKey);
+                }
+                MINECRAFT_STATE_DETAILS.selectedPlayer = typedPlayer;
+                MINECRAFT_STATE_DETAILS.selectedSlot = selectedSlot;
+                MINECRAFT_STATE_DETAILS.selectedItemKey = itemKey;
+                selectedItem = MINECRAFT_STATE_DETAILS.selectedItem;
                 playerMode = String.valueOf(typedPlayer.gameMode());
             } catch (Throwable ignored) {
                 // Telemetry must never break the game loop.
@@ -6209,8 +6271,20 @@ public final class BrowserOpenGL {
             try {
                 loadedChunkCount = clientLevel.getChunkSource().getLoadedChunksCount();
                 if (player instanceof Entity entity) {
-                    playerCollisionFree = clientLevel.noCollision(entity);
-                    playerCollisionKnown = true;
+                    boolean collisionKeyChanged = MINECRAFT_STATE_DETAILS.collisionLevel != clientLevel
+                            || MINECRAFT_STATE_DETAILS.collisionPlayer != entity;
+                    if (collisionKeyChanged) {
+                        MINECRAFT_STATE_DETAILS.collisionLevel = clientLevel;
+                        MINECRAFT_STATE_DETAILS.collisionPlayer = entity;
+                        MINECRAFT_STATE_DETAILS.collisionKnown = false;
+                    }
+                    if (collisionKeyChanged || refreshDetails
+                            || !MINECRAFT_STATE_DETAILS.collisionKnown) {
+                        MINECRAFT_STATE_DETAILS.collisionFree = clientLevel.noCollision(entity);
+                        MINECRAFT_STATE_DETAILS.collisionKnown = true;
+                    }
+                    playerCollisionKnown = MINECRAFT_STATE_DETAILS.collisionKnown;
+                    playerCollisionFree = MINECRAFT_STATE_DETAILS.collisionFree;
                 }
             } catch (Throwable ignored) {
                 // Telemetry must never break the game loop.
@@ -6218,29 +6292,60 @@ public final class BrowserOpenGL {
         }
         if (hitResult instanceof HitResult typedHit) {
             try {
-                hitType = String.valueOf(typedHit.getType());
-            } catch (Throwable ignored) {
-                // Telemetry must never break the game loop.
-            }
-        }
-        if (hitResult instanceof BlockHitResult blockHit) {
-            try {
-                BlockPos pos = blockHit.getBlockPos();
-                hitBlockPos = String.valueOf(pos);
-                hitDirection = String.valueOf(blockHit.getDirection());
-                if (level instanceof ClientLevel clientLevel) {
-                    BlockState state = clientLevel.getBlockState(pos);
-                    hitBlockState = String.valueOf(state);
+                Object typeKey = typedHit.getType();
+                hitType = String.valueOf(typeKey);
+                if (hitResult instanceof BlockHitResult blockHit) {
+                    BlockPos pos = blockHit.getBlockPos();
+                    Object directionKey = blockHit.getDirection();
+                    boolean sameBlockHit = MINECRAFT_STATE_DETAILS.hitLevel == level
+                            && MINECRAFT_STATE_DETAILS.hitTypeKey == typeKey
+                            && MINECRAFT_STATE_DETAILS.hitBlockX == pos.getX()
+                            && MINECRAFT_STATE_DETAILS.hitBlockY == pos.getY()
+                            && MINECRAFT_STATE_DETAILS.hitBlockZ == pos.getZ()
+                            && MINECRAFT_STATE_DETAILS.hitDirectionKey == directionKey
+                            && MINECRAFT_STATE_DETAILS.hitBlockPos != null
+                            && MINECRAFT_STATE_DETAILS.hitEntityKey == null;
+                    if (!sameBlockHit) {
+                        MINECRAFT_STATE_DETAILS.rememberBlockHit(
+                                level, typeKey, pos, directionKey);
+                        if (level instanceof ClientLevel clientLevel) {
+                            try {
+                                BlockState state = clientLevel.getBlockState(pos);
+                                MINECRAFT_STATE_DETAILS.hitBlockState = String.valueOf(state);
+                            } catch (Throwable ignored) {
+                                // Telemetry must never break the game loop.
+                            }
+                        }
+                    } else if (refreshDetails && level instanceof ClientLevel clientLevel) {
+                        try {
+                            BlockState state = clientLevel.getBlockState(pos);
+                            MINECRAFT_STATE_DETAILS.hitBlockState = String.valueOf(state);
+                        } catch (Throwable ignored) {
+                            // Telemetry must never break the game loop.
+                        }
+                    }
+                    hitBlockPos = MINECRAFT_STATE_DETAILS.hitBlockPos;
+                    hitDirection = MINECRAFT_STATE_DETAILS.hitDirection;
+                    hitBlockState = MINECRAFT_STATE_DETAILS.hitBlockState;
+                } else if (hitResult instanceof EntityHitResult entityHit) {
+                    Entity target = entityHit.getEntity();
+                    boolean sameEntityHit = MINECRAFT_STATE_DETAILS.hitLevel == level
+                            && MINECRAFT_STATE_DETAILS.hitTypeKey == typeKey
+                            && MINECRAFT_STATE_DETAILS.hitEntityKey == target
+                            && MINECRAFT_STATE_DETAILS.hitBlockPos == null;
+                    if (!sameEntityHit || refreshDetails) {
+                        MINECRAFT_STATE_DETAILS.rememberEntityHit(
+                                level, typeKey, target);
+                    }
+                    hitEntity = MINECRAFT_STATE_DETAILS.hitEntity;
+                } else {
+                    MINECRAFT_STATE_DETAILS.rememberNonDetailedHit(level, typeKey);
                 }
             } catch (Throwable ignored) {
                 // Telemetry must never break the game loop.
             }
-        } else if (hitResult instanceof EntityHitResult entityHit) {
-            try {
-                hitEntity = String.valueOf(entityHit.getEntity());
-            } catch (Throwable ignored) {
-                // Telemetry must never break the game loop.
-            }
+        } else {
+            MINECRAFT_STATE_DETAILS.clearHit();
         }
         reportMinecraftStateJs(
                 className(screen), screenTitle, screenWidth, screenHeight, screenWidgetsJson,
@@ -6808,7 +6913,14 @@ public final class BrowserOpenGL {
         ByteBuffer copy = buffer.duplicate();
         copy.position((int) offset);
         copy.limit((int) (offset + length));
-        return Int8Array.fromJavaBuffer(copy);
+        // TeaVM's JSBuffer bridge exports a Buffer's backing view rather than its
+        // mutable position/limit window.  A duplicate whose position is non-zero
+        // therefore still becomes the whole mapped allocation and makes a
+        // sub-range upload overflow the destination WebGL buffer.  Materialize a
+        // real ByteBuffer slice so its capacity and backing offset exactly match
+        // the flushed range while keeping the upload zero-copy.
+        ByteBuffer slice = copy.slice().order(buffer.order());
+        return Int8Array.fromJavaBuffer(slice);
     }
 
     private static Int8Array pointerBytes(long address, int length) {
@@ -6945,6 +7057,91 @@ public final class BrowserOpenGL {
     private record MappedBuffer(int logicalBuffer, long offset, int access, ByteBuffer buffer) {
         private boolean uploadOnUnmap() {
             return (access & MAP_WRITE_BIT) != 0 && (access & MAP_FLUSH_EXPLICIT_BIT) == 0;
+        }
+    }
+
+    private static final class MinecraftStateDetails {
+        private static final int REFRESH_AFTER_REPORTS = 3;
+        private int reportsUntilRefresh;
+
+        private Object collisionLevel;
+        private Object collisionPlayer;
+        private boolean collisionKnown;
+        private boolean collisionFree;
+
+        private Object selectedPlayer;
+        private int selectedSlot = -1;
+        private Object selectedItemKey;
+        private String selectedItem;
+
+        private Object hitLevel;
+        private Object hitTypeKey;
+        private int hitBlockX;
+        private int hitBlockY;
+        private int hitBlockZ;
+        private Object hitDirectionKey;
+        private Object hitEntityKey;
+        private String hitBlockPos;
+        private String hitDirection;
+        private String hitBlockState;
+        private String hitEntity;
+
+        private boolean beginReport() {
+            if (reportsUntilRefresh <= 0) {
+                reportsUntilRefresh = REFRESH_AFTER_REPORTS;
+                return true;
+            }
+            reportsUntilRefresh--;
+            return false;
+        }
+
+        private void rememberBlockHit(
+                Object level, Object typeKey, BlockPos pos, Object directionKey) {
+            hitLevel = level;
+            hitTypeKey = typeKey;
+            hitBlockX = pos.getX();
+            hitBlockY = pos.getY();
+            hitBlockZ = pos.getZ();
+            hitDirectionKey = directionKey;
+            hitEntityKey = null;
+            hitBlockPos = String.valueOf(pos);
+            hitDirection = String.valueOf(directionKey);
+            hitBlockState = null;
+            hitEntity = null;
+        }
+
+        private void rememberEntityHit(
+                Object level, Object typeKey, Entity entity) {
+            hitLevel = level;
+            hitTypeKey = typeKey;
+            hitDirectionKey = null;
+            hitEntityKey = entity;
+            hitBlockPos = null;
+            hitDirection = null;
+            hitBlockState = null;
+            hitEntity = String.valueOf(entity);
+        }
+
+        private void rememberNonDetailedHit(Object level, Object typeKey) {
+            hitLevel = level;
+            hitTypeKey = typeKey;
+            hitDirectionKey = null;
+            hitEntityKey = null;
+            hitBlockPos = null;
+            hitDirection = null;
+            hitBlockState = null;
+            hitEntity = null;
+        }
+
+        private void clearHit() {
+            hitLevel = null;
+            hitTypeKey = null;
+            hitDirectionKey = null;
+            hitEntityKey = null;
+            hitBlockPos = null;
+            hitDirection = null;
+            hitBlockState = null;
+            hitEntity = null;
         }
     }
 

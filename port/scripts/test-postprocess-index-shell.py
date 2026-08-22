@@ -108,6 +108,16 @@ def main() -> int:
             '<title>Gaius Client 26.2</title>',
             '"--version", "26.2"',
             '"--assetIndex", "32"',
+            'const prefix = "gaius.fs.v2:26.2:"',
+            'const dbName = "gaius-fs-v2-26.2"',
+            'indexedDB.open(dbName, 2)',
+            'window.__gaiusProfileId = "26.2"',
+            'window.__gaiusWorldVersion = 4903',
+            'window.__gaiusStorageSchema = 2',
+            'window.__gaiusStorageDatabaseName = "gaius-fs-v2-26.2"',
+            'window.__gaiusStoragePrefix = "gaius.fs.v2:26.2:"',
+            'window.__gaiusStorageOpfsDirectory = "regions-v2-26.2"',
+            'relative === "data/minecraft/world_gen_settings.dat"',
             "Starting Gaius Client 26.2...",
             "Loading the 26.2 client runtime...",
         ):
@@ -134,6 +144,10 @@ def main() -> int:
             raise AssertionError("shell must not use a decorative gradient background")
         if "samples.splice(0" in generated:
             raise AssertionError("FPS telemetry must not shift an array on every frame")
+        if generated.find('data-gaius-storage-profile="v2"') > generated.find(
+            "(function installPersistentFsBootstrap() {"
+        ):
+            raise AssertionError("storage profile globals execute after persistence bootstrap")
 
         check_inline_script_syntax(generated, directory)
 

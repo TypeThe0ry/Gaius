@@ -2,9 +2,18 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
-dist="$root/port/web/dist"
-server_target="$root/port/target/server-worker"
-resource_list="$root/port/target/generated-resources/dev/gaius/browser/minecraft-resources.txt"
+source "$root/port/scripts/version-profile.sh"
+gaius_load_version_profile "$root"
+gaius_select_java_home
+build_root="$(gaius_build_root "$root")"
+overlay_directory="$(gaius_overlay_directory "$root")"
+if [[ -n "${GAIUS_DIST_DIRECTORY:-}" || -n "${GAIUS_BUILD_ROOT:-}" || -n "${GAIUS_VERSION_PROFILE_PATH:-}" ]]; then
+  dist="$(gaius_dist_directory "$root")"
+else
+  dist="${GAIUS_TARGET_DIRECTORY:-$(gaius_dist_directory "$root")}"
+fi
+server_target="$build_root/server-worker"
+resource_list="$build_root/generated-resources/dev/gaius/browser/minecraft-resources.txt"
 server_resources="$server_target/generated-resources"
 
 # TeaVM keeps dependency JARs open throughout whole-program analysis. Prevent
@@ -25,7 +34,7 @@ release_overlay_lock() {
 trap release_overlay_lock EXIT
 
 if [[ "${GAIUS_SKIP_OVERLAY_BUILD:-false}" != "true" ]]; then
-  GAIUS_OVERLAY_LOCK_HELD=true "$root/port/scripts/build-overlays.sh" >/dev/null
+  GAIUS_OVERLAY_DIRECTORY="$overlay_directory" GAIUS_OVERLAY_LOCK_HELD=true "$root/port/scripts/build-overlays.sh" >/dev/null
 fi
 
 if [[ ! -f "$resource_list" ]]; then
@@ -51,6 +60,8 @@ export GAIUS_TARGET_DIRECTORY="$dist"
 export GAIUS_TARGET_FILE="singleplayer-server.js"
 export GAIUS_MAVEN_DIRECTORY="$server_target/maven"
 export GAIUS_RESOURCE_DIRECTORY="$server_resources"
+export GAIUS_BUILD_ROOT="$build_root"
+export GAIUS_OVERLAY_DIRECTORY="$overlay_directory"
 export GAIUS_EXCLUDED_LIBRARY_PREFIXES="${GAIUS_SERVER_EXCLUDED_LIBRARY_PREFIXES:-com/microsoft/azure/msal4j/,com/azure/azure-json/}"
 export GAIUS_TEA_OPTIMIZATION_LEVEL="${GAIUS_SERVER_TEA_OPTIMIZATION_LEVEL:-ADVANCED}"
 export GAIUS_SOURCE_MAPS="${GAIUS_SERVER_SOURCE_MAPS:-false}"
@@ -117,7 +128,7 @@ if [[ "$build_status" -eq 0 ]]; then
     --role worker-bootstrap \
     --artifact "$dist/singleplayer-server-worker.js"
   if [[ "${GAIUS_SKIP_COMPRESSION:-false}" != "true" ]]; then
-    GAIUS_COMPRESS_FILES="singleplayer-server.js:singleplayer-server-worker.js" \
+    GAIUS_DIST_DIRECTORY="$dist" GAIUS_COMPRESS_FILES="singleplayer-server.js:singleplayer-server-worker.js" \
       "$root/port/scripts/compress-dist.sh" >/dev/null
   fi
 fi

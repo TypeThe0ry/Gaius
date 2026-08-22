@@ -41,7 +41,7 @@ download_verified() {
   local output="$3"
   expected_sha1="$(printf '%s' "$expected_sha1" | tr -d '\r\n')"
   if [[ -f "$output" ]] &&
-    [[ "$(shasum -a 1 "$output" | awk '{print $1}' | tr -d '\r\n')" == "$expected_sha1" ]]; then
+    [[ "$(gaius_sha1_file "$output")" == "$expected_sha1" ]]; then
     return
   fi
 
@@ -54,7 +54,7 @@ download_verified() {
   local actual_sha1
   # Git Bash on Windows can emit CRLF while jq/curl output is LF-only. Normalize
   # both sides before comparing so an identical digest is not rejected.
-  actual_sha1="$(shasum -a 1 "$temporary" | awk '{print $1}' | tr -d '\r\n')"
+  actual_sha1="$(gaius_sha1_file "$temporary")"
   if [[ "$actual_sha1" != "$expected_sha1" ]]; then
     echo "SHA-1 mismatch for $url" >&2
     echo "expected: $expected_sha1" >&2
@@ -152,6 +152,7 @@ download_browser_asset() {
     "$assets/objects/${hash:0:2}/$hash"
 }
 export asset_index assets
+export -f gaius_hash_file gaius_sha1_file gaius_sha256_file
 export -f curl_with_retries download_verified download_browser_asset
 printf '%s\n' "${browser_sound_metadata_assets[@]}" "${browser_sound_assets[@]}" "${browser_font_assets[@]}" |
   xargs -n 1 -P "${GAIUS_FETCH_PARALLEL:-16}" bash -c 'download_browser_asset "$0"'
@@ -168,4 +169,6 @@ echo "  browser sound assets: ${#browser_sound_assets[@]} playable, ${#browser_s
 echo "  browser Unicode font assets: ${#browser_font_assets[@]}"
 jq '{id, protocol_version, world_version, java_version, pack_version}' \
   "$work/client-version.json"
-node "$root/port/scripts/check-version-profile.mjs" --require-local
+node "$root/port/scripts/check-version-profile.mjs" \
+  --profile "$GAIUS_VERSION_PROFILE" \
+  --require-local

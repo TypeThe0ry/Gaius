@@ -5,12 +5,20 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { setTimeout as delay } from "node:timers/promises";
 import { WebSocket } from "ws";
+import {
+    MINECRAFT_1_21_11,
+    MINECRAFT_26_2,
+} from "./dist/protocol.js";
 
 const registryPath = new URL("../../relay-nodes.json", import.meta.url);
 const registry = JSON.parse(await readFile(registryPath, "utf8"));
 const relayUrl = process.env.GAIUS_PUBLIC_RELAY_URL ?? registry.nodes?.[0]?.url;
 const target = parseTarget(process.env.GAIUS_PUBLIC_RELAY_TARGET ?? "ellan.top:25565");
 const handshakeHost = process.env.GAIUS_PUBLIC_RELAY_HANDSHAKE_HOST ?? target.host;
+const minecraftProfile = resolveSmokeMinecraftProfile(
+    process.env.GAIUS_PUBLIC_RELAY_MINECRAFT_VERSION ??
+    process.env.GAIUS_PUBLIC_RELAY_PROTOCOL_VERSION ??
+    MINECRAFT_1_21_11.name);
 const origin = process.env.GAIUS_PUBLIC_RELAY_ORIGIN ?? "null";
 const timeoutMs = parsePositiveInteger(
     process.env.GAIUS_PUBLIC_RELAY_TIMEOUT_MS ?? "15000",
@@ -115,7 +123,7 @@ const status = await new Promise((resolve, reject) => {
         assert((during.target?.activeConnections ?? 0) >= beforeActive + 1,
             "RelayNode target affinity did not report the temporary tunnel");
         const handshake = Buffer.concat([
-            encodeVarInt(774),
+            encodeVarInt(minecraftProfile.protocolVersion),
             encodeString(handshakeHost),
             Buffer.from([target.port >> 8, target.port & 0xff]),
             encodeVarInt(1),
@@ -161,6 +169,18 @@ console.log(JSON.stringify({
     attestedTarget: `${connectedControl.candidateHost}:${connectedControl.candidatePort}`,
     remotePeer: `${connectedControl.remoteAddress}:${connectedControl.remotePort}`,
 }));
+
+function resolveSmokeMinecraftProfile(value) {
+    const key = String(value ?? "").trim();
+    const profile = [MINECRAFT_1_21_11, MINECRAFT_26_2]
+        .find((candidate) => candidate.name === key ||
+            String(candidate.protocolVersion) === key);
+    if (profile === undefined) {
+        throw new Error(
+            `Unsupported public smoke Minecraft version ${value}; expected 1.21.11/774 or 26.2/776`);
+    }
+    return profile;
+}
 
 async function openRelay(url, requestOrigin, timeout, address) {
     return new Promise((resolve, reject) => {

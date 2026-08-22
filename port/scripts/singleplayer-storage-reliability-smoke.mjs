@@ -19,6 +19,25 @@ assert.match(source, /__gaiusPersistentFiles = fallbackFiles/);
 assert.match(source, /IndexedDB region rehydration exceeds bounded memory budget/);
 assert.match(source, /storage-flush-ack/);
 
+const storageProfiles = Object.freeze([
+  Object.freeze({
+    profileId: "26.2",
+    worldVersion: 4903,
+    storageSchema: 2,
+    storageDatabaseName: "gaius-fs-v2-26.2",
+    storagePrefix: "gaius.fs.v2:26.2:",
+    storageOpfsDirectory: "regions-v2-26.2",
+  }),
+  Object.freeze({
+    profileId: "1.21.11",
+    worldVersion: 4671,
+    storageSchema: 2,
+    storageDatabaseName: "gaius-fs-v2-1.21.11",
+    storagePrefix: "gaius.fs.v2:1.21.11:",
+    storageOpfsDirectory: "regions-v2-1.21.11",
+  }),
+]);
+
 function extractJsBody(methodMarker) {
   const methodEnd = source.indexOf(methodMarker);
   assert.ok(methodEnd >= 0, "missing method marker: " + methodMarker);
@@ -93,7 +112,7 @@ function makeFiles(cached) {
   });
 }
 
-function createHydrationContext(records, cached) {
+function createHydrationContext(records, cached, storageProfile) {
   const events = [];
   const files = makeFiles(cached);
   const context = {
@@ -114,6 +133,12 @@ function createHydrationContext(records, cached) {
     __gaiusFsBackend: "indexeddb-worker-lru",
     __gaiusPersistentFiles: files,
     __gaiusServerWorldId: "fallback-world",
+    __gaiusProfileId: storageProfile.profileId,
+    __gaiusWorldVersion: storageProfile.worldVersion,
+    __gaiusStorageSchema: storageProfile.storageSchema,
+    __gaiusStorageDatabaseName: storageProfile.storageDatabaseName,
+    __gaiusStoragePrefix: storageProfile.storagePrefix,
+    __gaiusStorageOpfsDirectory: storageProfile.storageOpfsDirectory,
     __gaiusFsPutBytes(path, value) {
       return value instanceof Uint8Array && String(path).endsWith(".mca");
     },
@@ -152,42 +177,44 @@ const records = new Map([
   [cachedPath, {path: cachedPath, value: new Uint8Array([1, 2, 3])}],
   [evictedPath, {path: evictedPath, value: new Uint8Array([4, 5, 6, 7])}],
 ]);
-const runtime = createHydrationContext(records, new Map([
-  [cachedPath, new Uint8Array([1, 2, 3])],
-]));
-vm.runInNewContext(
-  "globalThis.beginHydration = function(maxBytes, maxEntries) {" +
-    hydrationScript + "\n};",
-  runtime.context,
-  {filename: "BrowserIntegratedServerMain.java:hydration"},
-);
-assert.equal(runtime.context.beginHydration(1024 * 1024, 16), true);
-await new Promise((resolve) => setTimeout(resolve, 10));
-assert.equal(runtime.events.find((event) => event.type === "hydration-result")?.success, true);
-assert.deepEqual([...runtime.context.__gaiusPersistentFiles[evictedPath]], [4, 5, 6, 7]);
-delete runtime.context.__gaiusPersistentFiles[cachedPath];
-assert.deepEqual([...runtime.context.__gaiusPersistentFiles[cachedPath]], [1, 2, 3]);
-const changedPath = "/gaius/saves/fallback-world/region/changed.0.0.mca";
-const changed = new Uint8Array([8, 9]);
-assert.equal(runtime.context.__gaiusFsPutBytes(changedPath, changed), true);
-assert.deepEqual([...runtime.context.__gaiusPersistentFiles[changedPath]], [8, 9]);
-assert.equal(runtime.context.__gaiusFsDelete(changedPath), true);
-assert.equal(runtime.context.__gaiusPersistentFiles[changedPath], undefined);
+for (const storageProfile of storageProfiles) {
+  const runtime = createHydrationContext(records, new Map([
+    [cachedPath, new Uint8Array([1, 2, 3])],
+  ]), storageProfile);
+  vm.runInNewContext(
+    "globalThis.beginHydration = function(maxBytes, maxEntries) {" +
+      hydrationScript + "\n};",
+    runtime.context,
+    {filename: `BrowserIntegratedServerMain.java:hydration:${storageProfile.profileId}`},
+  );
+  assert.equal(runtime.context.beginHydration(1024 * 1024, 16), true);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(runtime.events.find((event) => event.type === "hydration-result")?.success, true);
+  assert.deepEqual([...runtime.context.__gaiusPersistentFiles[evictedPath]], [4, 5, 6, 7]);
+  delete runtime.context.__gaiusPersistentFiles[cachedPath];
+  assert.deepEqual([...runtime.context.__gaiusPersistentFiles[cachedPath]], [1, 2, 3]);
+  const changedPath = "/gaius/saves/fallback-world/region/changed.0.0.mca";
+  const changed = new Uint8Array([8, 9]);
+  assert.equal(runtime.context.__gaiusFsPutBytes(changedPath, changed), true);
+  assert.deepEqual([...runtime.context.__gaiusPersistentFiles[changedPath]], [8, 9]);
+  assert.equal(runtime.context.__gaiusFsDelete(changedPath), true);
+  assert.equal(runtime.context.__gaiusPersistentFiles[changedPath], undefined);
 
-const overBudget = new Map([
-  [evictedPath, {path: evictedPath, value: new Uint8Array(32)}],
-]);
-const rejected = createHydrationContext(overBudget, new Map());
-vm.runInNewContext(
-  "globalThis.beginHydration = function(maxBytes, maxEntries) {" +
-    hydrationScript + "\n};",
-  rejected.context,
-  {filename: "BrowserIntegratedServerMain.java:hydration-budget"},
-);
-assert.equal(rejected.context.beginHydration(8, 16), true);
-await new Promise((resolve) => setTimeout(resolve, 10));
-assert.equal(rejected.events.find((event) => event.type === "hydration-result")?.success, false);
-assert.equal(rejected.context.__gaiusPersistentFiles[evictedPath], undefined);
+  const overBudget = new Map([
+    [evictedPath, {path: evictedPath, value: new Uint8Array(32)}],
+  ]);
+  const rejected = createHydrationContext(overBudget, new Map(), storageProfile);
+  vm.runInNewContext(
+    "globalThis.beginHydration = function(maxBytes, maxEntries) {" +
+      hydrationScript + "\n};",
+    rejected.context,
+    {filename: `BrowserIntegratedServerMain.java:hydration-budget:${storageProfile.profileId}`},
+  );
+  assert.equal(rejected.context.beginHydration(8, 16), true);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(rejected.events.find((event) => event.type === "hydration-result")?.success, false);
+  assert.equal(rejected.context.__gaiusPersistentFiles[evictedPath], undefined);
+}
 
 const flushScript = extractJsBody(
   "private static native void beginIntegratedServerStorageFlush();",

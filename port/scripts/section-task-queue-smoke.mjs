@@ -5,20 +5,52 @@ import {execFileSync} from "node:child_process";
 import {mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import path from "node:path";
-import {fileURLToPath} from "node:url";
+import {fileURLToPath, pathToFileURL} from "node:url";
 
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
 const config = JSON.parse(await readFile(
   new URL("../config.json", import.meta.url),
   "utf8",
 ));
+const nativePath = (value) => {
+  if (!value) return value;
+  const text = String(value);
+  return process.platform === "win32" && /^\/[A-Za-z](?:\/|$)/.test(text)
+    ? `${text[1].toUpperCase()}:${text.slice(2)}` : text;
+};
+const profileIdFromPath = (value) => path.basename(nativePath(value).replaceAll("\\", "/"))
+  .replace(/\.json$/, "");
+const buildRootProfileId = process.env.GAIUS_BUILD_ROOT
+  ? profileIdFromPath(process.env.GAIUS_BUILD_ROOT) : "";
+const overlayProfileId = process.env.GAIUS_OVERLAY_DIRECTORY
+  ? profileIdFromPath(process.env.GAIUS_OVERLAY_DIRECTORY) : "";
+const isolatedProfileId = [buildRootProfileId, overlayProfileId]
+  .find((value) => /^\d+(?:\.\d+)+$/.test(value)) || "";
+const configuredProfilePath = nativePath(
+  process.env.GAIUS_VERSION_PROFILE_PATH
+    || (isolatedProfileId ? `versions/${isolatedProfileId}.json` : String(config.versionProfile || "")),
+);
+const configuredProfileUrl = /^[A-Za-z]:[\\/]/.test(configuredProfilePath)
+  || configuredProfilePath.startsWith("/")
+  ? pathToFileURL(configuredProfilePath)
+  : new URL(`../${configuredProfilePath.replaceAll("\\", "/")}`, import.meta.url);
 const profile = JSON.parse(await readFile(
-  new URL(`../${config.versionProfile}`, import.meta.url),
+  configuredProfileUrl,
   "utf8",
 ));
 const version = String(profile.id);
+const configuredProfileId = process.env.GAIUS_VERSION_PROFILE_PATH
+  ? profileIdFromPath(process.env.GAIUS_VERSION_PROFILE_PATH)
+  : (isolatedProfileId || version);
+if (configuredProfileId !== version) {
+  throw new Error(`section task queue smoke is for profile ${version}, got ${configuredProfileId}`);
+}
+if (version !== "26.2") {
+  throw new Error(`section task queue smoke is 26.2-only; got profile ${version}`);
+}
 const overlayJar = process.env.GAIUS_SECTION_QUEUE_JAR
-  ?? `${repositoryRoot}/port/work/overlays/client-named-${version}-gaius.jar`;
+  ? nativePath(process.env.GAIUS_SECTION_QUEUE_JAR)
+  : `${nativePath(process.env.GAIUS_OVERLAY_DIRECTORY || `${repositoryRoot}/port/work/overlays${process.env.GAIUS_BUILD_ROOT || process.env.GAIUS_VERSION_PROFILE_PATH ? `/${version}` : ""}`)}/client-named-${version}-gaius.jar`;
 const queueClass = "net.minecraft.client.renderer.chunk.SectionTaskDynamicQueue";
 
 function run(command, args, options = {}) {
@@ -43,19 +75,20 @@ function method(bytecode, signature, nextSignature) {
 function selectJavaTools() {
   const requested = Number(profile.javaVersion);
   const homes = [
-    process.env.GAIUS_JAVA_HOME,
-    process.env.JAVA_HOME,
+    process.env.GAIUS_JAVA_HOME && nativePath(process.env.GAIUS_JAVA_HOME),
+    process.env.JAVA_HOME && nativePath(process.env.JAVA_HOME),
     `/opt/homebrew/opt/openjdk@${requested}/libexec/openjdk.jdk/Contents/Home`,
     `/usr/local/opt/openjdk@${requested}/libexec/openjdk.jdk/Contents/Home`,
   ].filter(Boolean);
   for (const home of homes) {
     const javac = path.join(home, "bin/javac");
     const java = path.join(home, "bin/java");
+    const javap = path.join(home, "bin/javap");
     try {
       const versionOutput = execFileSync(javac, ["-version"], {encoding: "utf8"});
       const major = Number(versionOutput.match(/javac (\d+)/)?.[1]);
       if (major >= requested) {
-        return {java, javac};
+        return {java, javac, javap};
       }
     } catch {
       // Try the next configured JDK home.
@@ -84,7 +117,7 @@ for (const contract of [
   assert.ok(patcher.includes(contract), `missing queue patch contract: ${contract}`);
 }
 
-const bytecode = run("javap", ["-classpath", overlayJar, "-p", "-c", queueClass]);
+const bytecode = run(javaTools.javap, ["-classpath", overlayJar, "-p", "-c", queueClass]);
 assert.ok(
   !bytecode.includes("implements java.util.Comparator"),
   "patched queue still routes comparisons through PriorityQueue.Comparator",
@@ -536,10 +569,19 @@ try {
   await mkdir(sourceDirectory, {recursive: true});
   await mkdir(classesDirectory, {recursive: true});
   await writeFile(sourceFile, harnessSource, "utf8");
-  const minecraftClasspath = (await readFile(
+  let minecraftClasspath = (await readFile(
     `${repositoryRoot}/port/work/${version}/classpath.txt`,
     "utf8",
   )).trim();
+  // classpath.txt is written for the bash build with `:` separators and MSYS
+  // `/c/...` paths. Windows javac/java need `;` separators and drive-letter
+  // paths, so convert the list before handing it to the JDK directly.
+  if (process.platform === "win32") {
+    minecraftClasspath = minecraftClasspath
+      .split(":")
+      .map((entry) => entry.replace(/^\/c\//i, "C:/"))
+      .join(path.delimiter);
+  }
   const compileClasspath = [overlayJar, minecraftClasspath].join(path.delimiter);
   run(javaTools.javac, [
     "-proc:none",

@@ -17,8 +17,32 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish:
+  # Build every supported Minecraft profile from its local-only Mojang inputs.
+  # The matrix keeps Java 21 and Java 25 isolated; no profile writes the legacy
+  # shared dist directory or another profile's generated Maven state.
+  build-profile:
+    name: Build Minecraft ${{ matrix.profile }} (JDK ${{ matrix.java }})
     runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: 1.21.11
+            java: "21"
+            protocol: "774"
+            world: "4671"
+            worldgenTelemetryMode: "checkpoint-only"
+          - profile: "26.2"
+            java: "25"
+            protocol: "776"
+            world: "4903"
+            worldgenTelemetryMode: "task-pulsed"
+    env:
+      GAIUS_VERSION_PROFILE_PATH: versions/${{ matrix.profile }}.json
+      GAIUS_BUILD_ROOT: port/target/${{ matrix.profile }}
+      GAIUS_OVERLAY_DIRECTORY: port/work/overlays/${{ matrix.profile }}
+      GAIUS_DIST_DIRECTORY: port/web/dist/${{ matrix.profile }}
     steps:
       - name: Check out requested tag with Git LFS
         uses: actions/checkout@v4
@@ -34,11 +58,101 @@ jobs:
           cache: npm
           cache-dependency-path: apps/bridge/package-lock.json
 
-      - name: Set up Java
+      - name: Set up profile JDK
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 21
+          java-version: ${{ matrix.java }}
+          cache: maven
+
+      - name: Fetch and verify local Minecraft inputs
+        run: |
+          set -euo pipefail
+          git lfs install --local
+          ./port/scripts/fetch-version.sh
+          ./port/scripts/remap-client.sh
+          node port/scripts/check-version-profile.mjs \
+            --profile "$GAIUS_VERSION_PROFILE_PATH" \
+            --require-local
+
+      - name: Build the profile-scoped TeaVM release
+        run: bash port/scripts/build-version-release.sh "$GAIUS_VERSION_PROFILE_PATH"
+
+      - name: Verify profile artifact identity and runtime smoke
+        env:
+          GAIUS_SMOKE_MAX_GAMEPLAY_STALL_MS: "10000"
+        run: |
+          set -euo pipefail
+          python3 port/scripts/quick-check.py
+          node port/scripts/gson-type-token-smoke.mjs \
+            --profile "$GAIUS_VERSION_PROFILE_PATH" \
+            --overlay "$GAIUS_OVERLAY_DIRECTORY"
+          node port/scripts/singleplayer-worker-runtime-smoke.mjs
+          manifest="$GAIUS_DIST_DIRECTORY/Gaius.manifest.json"
+          test -s "$manifest"
+          jq -e \
+            --arg profile "${{ matrix.profile }}" \
+            --arg protocol "${{ matrix.protocol }}" \
+            --arg world "${{ matrix.world }}" \
+            --arg worldgen "${{ matrix.worldgenTelemetryMode }}" \
+            '(.profile == $profile)
+             and (.profilePath == ("versions/" + $profile + ".json"))
+             and ((.worldVersion | tostring) == $world)
+             and (.worldgenTelemetryMode == $worldgen)
+             and (.storage == .buildIdentity.storage)
+             and (.buildIdentity.profile.id == $profile)
+             and (.buildIdentity.profile.path == ("versions/" + $profile + ".json"))
+             and ((.buildIdentity.profile.protocolVersion | tostring) == $protocol)
+             and ((.buildIdentity.profile.worldVersion | tostring) == $world)
+             and ((.buildIdentity.protocol.minecraftProtocolVersion | tostring) == $protocol)
+             and ((.buildIdentity.worldVersion | tostring) == $world)
+             and (.buildIdentity.worldgenTelemetryMode == $worldgen)
+             and (.buildIdentity.profile.worldgenTelemetryMode == $worldgen)
+             and (.buildIdentity.storage == {
+               schema: 2,
+               databaseName: ("gaius-fs-v2-" + $profile),
+               prefix: ("gaius.fs.v2:" + $profile + ":"),
+               opfsDirectory: ("regions-v2-" + $profile)
+             })
+             and (.buildIdentity.profile.storage == .buildIdentity.storage)' \
+            "$manifest"
+          for artifact in Gaius.html Gaius.html.gz Gaius.manifest.json classes.js classes.js.gz singleplayer-server.js singleplayer-server.js.gz; do
+            test -s "$GAIUS_DIST_DIRECTORY/$artifact"
+            ! head -c 64 "$GAIUS_DIST_DIRECTORY/$artifact" | grep -Fq 'version https://git-lfs.github.com/spec/v1'
+          done
+
+      - name: Upload profile-scoped browser artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gaius-dist-${{ matrix.profile }}
+          path: port/web/dist/${{ matrix.profile }}/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish dual-version release
+    runs-on: ubuntu-latest
+    needs: build-profile
+    steps:
+      - name: Check out requested tag with Git LFS
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          lfs: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/bridge/package-lock.json
+
+      - name: Set up plugin JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
           cache: maven
 
       - name: Validate tag, metadata, LFS, and RelayNode registry
@@ -58,11 +172,30 @@ jobs:
 
       - name: Install RelayNode dependencies and run smoke tests
         run: |
+          set -euo pipefail
           npm ci --prefix apps/bridge
-          npm run smoke --prefix apps/bridge
+          GAIUS_SMOKE_MINECRAFT_VERSION=1.21.11 npm run smoke --prefix apps/bridge
+          GAIUS_SMOKE_MINECRAFT_VERSION=26.2 npm run smoke --prefix apps/bridge
+
+      - name: Verify the public RelayNode for both protocol profiles
+        run: |
+          set -euo pipefail
+          GAIUS_PUBLIC_RELAY_MINECRAFT_VERSION=1.21.11 npm run smoke:public --prefix apps/bridge
+          GAIUS_PUBLIC_RELAY_MINECRAFT_VERSION=26.2 npm run smoke:public --prefix apps/bridge
 
       - name: Build Paper plugin
+        env:
+          # The plugin targets Paper 1.21.11 and therefore builds with JDK 21;
+          # do not let the repository's active 26.2 profile make mvnw demand 25.
+          GAIUS_VERSION_PROFILE_PATH: versions/1.21.11.json
         run: ./port/mvnw -B -ntp -f apps/server-plugin/pom.xml clean package
+
+      - name: Download profile-scoped browser artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gaius-dist-*
+          path: release-builds
+          merge-multiple: false
 
       - name: Stage release assets and checksums
         env:
@@ -71,14 +204,27 @@ jobs:
           set -euo pipefail
           version="$(tr -d '[:space:]' < VERSION)"
           plugin="apps/server-plugin/target/gaius-server-plugin-${version}.jar"
-          test -s port/web/dist/Gaius.html
           test -s "$plugin"
           rm -rf release-assets
           mkdir -p release-assets
-          cp port/web/dist/Gaius.html release-assets/Gaius.html
+          for profile in 1.21.11 26.2; do
+            dist="release-builds/gaius-dist-${profile}"
+            test -s "$dist/Gaius.html"
+            test -s "$dist/Gaius.manifest.json"
+            cp "$dist/Gaius.html" "release-assets/Gaius-${profile}.html"
+            cp "$dist/Gaius.manifest.json" "release-assets/Gaius-${profile}.manifest.json"
+          done
           cp "$plugin" "release-assets/gaius-server-plugin-${version}.jar"
-          (cd release-assets && sha256sum Gaius.html "gaius-server-plugin-${version}.jar" > SHA256SUMS)
-          printf 'Release %s\n\nPortable Gaius Client 1.21.11 build and optional Paper plugin.\n\nThis is independent software and is not affiliated with Mojang Studios or Microsoft. Review the repository licensing and attribution notes before redistribution.\n' "$RELEASE_TAG" > release-notes.md
+          (cd release-assets && sha256sum * > SHA256SUMS)
+          {
+            printf 'Release %s\n\n' "$RELEASE_TAG"
+            printf 'Portable Gaius Client builds:\n'
+            printf -- '- Minecraft Java 1.21.11: Gaius-1.21.11.html\n'
+            printf -- '- Minecraft Java 26.2: Gaius-26.2.html\n'
+            printf '\nEach browser asset is accompanied by its profile manifest and SHA256SUMS.\n'
+            printf 'The optional Paper plugin is built from the repository source.\n\n'
+            printf 'This is independent software and is not affiliated with Mojang Studios or Microsoft. Review the repository licensing and attribution notes before redistribution.\n'
+          } > release-notes.md
 
       - name: Create or update GitHub Release
         env:
@@ -86,17 +232,37 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
+          title="Gaius Client 1.21.11 + 26.2 $RELEASE_TAG"
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # Updating an existing tag must not leave any artifact from the
+            # former shared dist root beside the new profile-scoped portable
+            # builds.  Match only the exact legacy root basenames/prefixes so
+            # Gaius-1.21.11.* and Gaius-26.2.* are never removed here.
+            while IFS= read -r legacy_asset; do
+              case "$legacy_asset" in
+                Gaius.html|Gaius.html.*|Gaius.manifest.json|Gaius.manifest.json.*|\
+                classes.js|classes.js.*|\
+                singleplayer-server.js|singleplayer-server.js.*|\
+                singleplayer-server-worker.js|singleplayer-server-worker.js.*|\
+                gaius-hotpath.wasm|gaius-hotpath.wasm.*|\
+                index.html|index.html.*|\
+                relay-nodes.json|relay-nodes.json.*|\
+                vanilla-assets.pack.gz|vanilla-assets.pack.gz.*)
+                  gh release delete-asset "$RELEASE_TAG" "$legacy_asset" \
+                    --repo "$GITHUB_REPOSITORY" --yes
+                  ;;
+              esac
+            done < <(
+              gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+                --json assets --jq '.assets[].name'
+            )
             gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-              release-assets/Gaius.html \
-              release-assets/gaius-server-plugin-"$(tr -d '[:space:]' < VERSION)".jar \
-              release-assets/SHA256SUMS \
-              --clobber
+              release-assets/* --clobber
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "$title" --notes-file release-notes.md
           else
             gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-              --title "Gaius Client 1.21.11 $RELEASE_TAG" \
+              --title "$title" \
               --notes-file release-notes.md \
-              release-assets/Gaius.html \
-              release-assets/gaius-server-plugin-"$(tr -d '[:space:]' < VERSION)".jar \
-              release-assets/SHA256SUMS
+              release-assets/*
           fi

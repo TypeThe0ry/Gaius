@@ -343,6 +343,47 @@ async function simulateUncappedYield(frameCount = 1440) {
   return {averageFps, onePercentLow};
 }
 
+async function simulateSchedulerFairYield(frameCount = 64) {
+  const browser = new VirtualBrowser({refreshRate: 60, timerClamp: 4, messageDelay: 0.01});
+  const telemetry = {enabled: true};
+  const window = {__gaiusFrameTelemetry: telemetry};
+  window.scheduler = {
+    yield: () => ({
+      then: resolve => browser.schedule(browser.now + browser.messageDelay, resolve, "scheduler"),
+    }),
+  };
+  const context = vm.createContext({
+    Date: {now: () => browser.now},
+    clearTimeout: handle => browser.clearTimeout(handle),
+    Math,
+    MessageChannel: createMessageChannelClass(browser),
+    Number,
+    performance: {now: () => browser.now},
+    requestAnimationFrame: callback => browser.requestAnimationFrame(callback),
+    setTimeout: (callback, delay) => browser.setTimeout(callback, delay),
+    window,
+  });
+  const scheduleYield = vm.runInContext(`(hidden, interval, resume) => {${frameYieldScript}}`, context);
+  let completed = 0;
+  const present = () => scheduleYield(false, 0, () => {
+    completed++;
+    if (completed < frameCount) present();
+  });
+  present();
+  browser.runUntil(() => completed === frameCount);
+
+  const fairYieldCount = Math.floor(frameCount / UNCAPPED_FAIR_YIELD_CADENCE);
+  assert.equal(telemetry.fairYieldCount, fairYieldCount,
+    "scheduler.yield fairness cadence changed unexpectedly");
+  assert.equal(telemetry.schedulerYieldCount, fairYieldCount,
+    "Web Scheduling API fairness path was not used");
+  assert.equal(telemetry.timerYieldCount || 0, 0,
+    "scheduler.yield unexpectedly fell back to a clamped timer");
+  assert.equal(telemetry.messageChannelYieldCount, frameCount - fairYieldCount);
+  assert.equal(telemetry.pendingYieldCount, 0);
+  assert.equal(telemetry.yieldCompletionCount, frameCount);
+}
+
 async function simulateDeadMessageChannel(frameCount = 2048) {
   const browser = new VirtualBrowser({refreshRate: 60, timerClamp: 4});
   const telemetry = {enabled: true};
@@ -577,6 +618,7 @@ async function simulateOverlappingYields() {
 const visiblePresents = await simulateVisibleYield(120);
 const highRefreshPresents = await simulateVisibleYield(144);
 const uncapped = await simulateUncappedYield();
+await simulateSchedulerFairYield();
 await simulateDeadMessageChannel();
 await simulateThrowingMessageChannel();
 await simulateHiddenYield();

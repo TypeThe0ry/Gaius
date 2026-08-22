@@ -1,11 +1,39 @@
 #!/usr/bin/env bash
 
+# macOS ships `shasum`, while GNU/Linux and Git for Windows normally ship the
+# coreutils `sha1sum`/`sha256sum` pair.  Keep artifact verification portable
+# instead of assuming the macOS command exists on every migration host.
+gaius_hash_file() {
+  local algorithm="$1"
+  local file="$2"
+  local command_name="${algorithm}sum"
+
+  if command -v "$command_name" >/dev/null 2>&1; then
+    "$command_name" "$file" | awk '{print $1}' | tr '[:upper:]' '[:lower:]' | tr -d '\r\n'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a "${algorithm#sha}" "$file" | awk '{print $1}' | tr '[:upper:]' '[:lower:]' | tr -d '\r\n'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst "-$algorithm" "$file" | awk '{print $NF}' | tr '[:upper:]' '[:lower:]' | tr -d '\r\n'
+  else
+    echo "No $algorithm checksum tool is available (tried $command_name, shasum, and openssl)" >&2
+    return 1
+  fi
+}
+
+gaius_sha1_file() {
+  gaius_hash_file sha1 "$1"
+}
+
+gaius_sha256_file() {
+  gaius_hash_file sha256 "$1"
+}
+
 gaius_load_version_profile() {
   local root="$1"
   local config="$root/port/config.json"
   local relative_profile
 
-  relative_profile="$(jq -er '.versionProfile' "$config")"
+  relative_profile="${GAIUS_VERSION_PROFILE_PATH:-$(jq -er '.versionProfile' "$config")}"
   case "$relative_profile" in
     versions/*.json) ;;
     *)
@@ -26,11 +54,97 @@ gaius_load_version_profile() {
   GAIUS_JAVA_VERSION="$(jq -er '.javaVersion' "$GAIUS_VERSION_PROFILE")"
   GAIUS_CLASS_FILE_VERSION="$(jq -er '.classFileVersion' "$GAIUS_VERSION_PROFILE")"
   GAIUS_CLIENT_DISTRIBUTION="$(jq -er '.clientDistribution' "$GAIUS_VERSION_PROFILE")"
+  GAIUS_STORAGE_SCHEMA="$(jq -er '.storage.schema' "$GAIUS_VERSION_PROFILE")"
+  GAIUS_STORAGE_DATABASE_NAME="$(jq -er '.storage.databaseName' "$GAIUS_VERSION_PROFILE")"
+  GAIUS_STORAGE_PREFIX="$(jq -er '.storage.prefix' "$GAIUS_VERSION_PROFILE")"
+  GAIUS_STORAGE_OPFS_DIRECTORY="$(jq -er '.storage.opfsDirectory' "$GAIUS_VERSION_PROFILE")"
+  if [[ "$GAIUS_STORAGE_SCHEMA" != "2" ]]; then
+    echo "Version profile storage.schema must be exactly 2: $GAIUS_VERSION_PROFILE (got $GAIUS_STORAGE_SCHEMA)" >&2
+    return 1
+  fi
+  local expected_database_name="gaius-fs-v2-$GAIUS_MINECRAFT_VERSION"
+  local expected_prefix="gaius.fs.v2:$GAIUS_MINECRAFT_VERSION:"
+  local expected_opfs_directory="regions-v2-$GAIUS_MINECRAFT_VERSION"
+  if [[ "$GAIUS_STORAGE_DATABASE_NAME" != "$expected_database_name" ]]; then
+    echo "Version profile storage.databaseName must be $expected_database_name: $GAIUS_VERSION_PROFILE" >&2
+    return 1
+  fi
+  if [[ "$GAIUS_STORAGE_PREFIX" != "$expected_prefix" ]]; then
+    echo "Version profile storage.prefix must be $expected_prefix: $GAIUS_VERSION_PROFILE" >&2
+    return 1
+  fi
+  if [[ "$GAIUS_STORAGE_OPFS_DIRECTORY" != "$expected_opfs_directory" ]]; then
+    echo "Version profile storage.opfsDirectory must be $expected_opfs_directory: $GAIUS_VERSION_PROFILE" >&2
+    return 1
+  fi
   GAIUS_VERSION_METADATA="$root/port/work/$GAIUS_MINECRAFT_VERSION/version.json"
 
   export GAIUS_VERSION_PROFILE GAIUS_MINECRAFT_VERSION GAIUS_PROTOCOL_VERSION
   export GAIUS_WORLD_VERSION GAIUS_JAVA_VERSION GAIUS_CLASS_FILE_VERSION
   export GAIUS_CLIENT_DISTRIBUTION GAIUS_VERSION_METADATA
+  export GAIUS_STORAGE_SCHEMA GAIUS_STORAGE_DATABASE_NAME
+  export GAIUS_STORAGE_PREFIX GAIUS_STORAGE_OPFS_DIRECTORY
+}
+
+# Build-state paths are version-scoped when GAIUS_BUILD_ROOT is supplied.  The
+# legacy defaults intentionally remain unchanged so existing 26.2 commands
+# continue to publish to port/target and port/web/dist.  Release automation can
+# therefore build both profiles in separate invocations without changing
+# port/config.json or clobbering another profile's generated files:
+#
+#   GAIUS_VERSION_PROFILE_PATH=versions/1.21.11.json \
+#   GAIUS_BUILD_ROOT=port/target/1.21.11 \
+#   GAIUS_OVERLAY_DIRECTORY=port/work/overlays/1.21.11 \
+#   GAIUS_DIST_DIRECTORY=port/web/dist/1.21.11 \
+#   port/scripts/build-teavm-release.sh
+#
+# Keep these as functions instead of exporting default values.  A child script
+# must be able to distinguish the historical default from an explicitly
+# isolated build root.
+gaius_resolve_path() {
+  local root="$1"
+  local value="$2"
+  case "$value" in
+    /*|[A-Za-z]:/*|[A-Za-z]:\\*)
+      printf '%s\n' "$value"
+      ;;
+    *)
+      printf '%s/%s\n' "$root" "$value"
+      ;;
+  esac
+}
+
+gaius_build_root() {
+  local root="$1"
+  if [[ -n "${GAIUS_BUILD_ROOT:-}" ]]; then
+    gaius_resolve_path "$root" "$GAIUS_BUILD_ROOT"
+  elif [[ -n "${GAIUS_VERSION_PROFILE_PATH:-}" ]]; then
+    printf '%s\n' "$root/port/target/$GAIUS_MINECRAFT_VERSION"
+  else
+    printf '%s\n' "$root/port/target"
+  fi
+}
+
+gaius_dist_directory() {
+  local root="$1"
+  if [[ -n "${GAIUS_DIST_DIRECTORY:-}" ]]; then
+    gaius_resolve_path "$root" "$GAIUS_DIST_DIRECTORY"
+  elif [[ -n "${GAIUS_BUILD_ROOT:-}" || -n "${GAIUS_VERSION_PROFILE_PATH:-}" ]]; then
+    printf '%s\n' "$root/port/web/dist/$GAIUS_MINECRAFT_VERSION"
+  else
+    printf '%s\n' "$root/port/web/dist"
+  fi
+}
+
+gaius_overlay_directory() {
+  local root="$1"
+  if [[ -n "${GAIUS_OVERLAY_DIRECTORY:-}" ]]; then
+    gaius_resolve_path "$root" "$GAIUS_OVERLAY_DIRECTORY"
+  elif [[ -n "${GAIUS_BUILD_ROOT:-}" || -n "${GAIUS_VERSION_PROFILE_PATH:-}" ]]; then
+    printf '%s\n' "$root/port/work/overlays/$GAIUS_MINECRAFT_VERSION"
+  else
+    printf '%s\n' "$root/port/work/overlays"
+  fi
 }
 
 gaius_library_path() {

@@ -9208,6 +9208,55 @@ public final class MinecraftClientPatcher {
                     "saveDataTag",
                     "(Lnet/minecraft/world/level/storage/WorldData;)V",
                     false));
+            // 26.2 splits world gen settings into data/minecraft/world_gen_settings.dat,
+            // which the server Worker reads back when loading the level. Write it too,
+            // otherwise the Worker falls back to random settings and the dimension
+            // registry lacks the overworld stem.
+            bridge.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            bridge.instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    owner,
+                    "registries",
+                    "()Lnet/minecraft/core/LayeredRegistryAccess;",
+                    false));
+            bridge.instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    "net/minecraft/core/LayeredRegistryAccess",
+                    "compositeAccess",
+                    "()Lnet/minecraft/core/RegistryAccess$Frozen;",
+                    false));
+            bridge.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+            bridge.instructions.add(new FieldInsnNode(
+                    Opcodes.GETSTATIC,
+                    "net/minecraft/world/level/storage/LevelResource",
+                    "ROOT",
+                    "Lnet/minecraft/world/level/storage/LevelResource;"));
+            bridge.instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    storage,
+                    "getLevelPath",
+                    "(Lnet/minecraft/world/level/storage/LevelResource;)Ljava/nio/file/Path;",
+                    false));
+            bridge.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            bridge.instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    owner,
+                    currentWorldData.name,
+                    currentWorldData.desc,
+                    false));
+            bridge.instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    "net/minecraft/world/level/storage/LevelDataAndDimensions$WorldDataAndGenSettings",
+                    "genSettings",
+                    "()Lnet/minecraft/world/level/levelgen/WorldGenSettings;",
+                    false));
+            bridge.instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "net/minecraft/world/level/storage/LevelStorageSource",
+                    "writeWorldGenSettings",
+                    "(Lnet/minecraft/core/RegistryAccess;Ljava/nio/file/Path;"
+                            + "Lnet/minecraft/world/level/levelgen/WorldGenSettings;)V",
+                    false));
         } else {
             MethodNode legacyWorldData = findNullable(
                     node,
@@ -9244,7 +9293,7 @@ public final class MinecraftClientPatcher {
                     false));
         }
         bridge.instructions.add(new InsnNode(Opcodes.RETURN));
-        bridge.maxStack = 3;
+        bridge.maxStack = 4;
         bridge.maxLocals = 2;
         node.methods.add(bridge);
         writeComputeFrames(node, output);
@@ -13237,6 +13286,107 @@ public final class MinecraftClientPatcher {
                 false);
     }
 
+    private static MethodInsnNode browserWorldgenBeginTaskWork() {
+        return new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserWorldgenScheduler",
+                "beginTaskWork",
+                "()I",
+                false);
+    }
+
+    private static MethodInsnNode browserWorldgenEndTaskWork() {
+        return new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserWorldgenScheduler",
+                "endTaskWork",
+                "(I)V",
+                false);
+    }
+
+    /**
+     * Instruments a task-layer entry without touching the deep synchronous
+     * worldgen methods.  Normal returns are explicit so the scope closes before
+     * {@code pollTask} hands control back to {@code waitUntilNextTick}; the
+     * per-invocation token is loaded at every close, and the catch-all is a
+     * Java-bytecode finally for exceptions which escape existing handlers.
+     */
+    private static void instrumentBrowserTaskScope(
+            MethodNode method, String target, int returnOpcode) {
+        instrumentBrowserTaskScope(method, target, returnOpcode, null);
+    }
+
+    /**
+     * Adds a task-scope token and a caller-supplied entry operation.  The
+     * optional operation is placed after the token store but inside the
+     * catch-all range, so generic pollTask keeps its urgent packet pump while
+     * every exceptional path still closes the exact invocation that began.
+     */
+    private static void instrumentBrowserTaskScope(
+            MethodNode method,
+            String target,
+            int returnOpcode,
+            InsnList afterTokenEntry) {
+        if (method.instructions.getFirst() == null) {
+            throw new IllegalStateException(target + " has no instructions");
+        }
+
+        LabelNode start = new LabelNode();
+        LabelNode end = new LabelNode();
+        LabelNode handler = new LabelNode();
+        int taskScopeLocal = method.maxLocals++;
+        int throwableLocal = method.maxLocals++;
+        InsnList entry = new InsnList();
+        entry.add(browserWorldgenBeginTaskWork());
+        entry.add(new VarInsnNode(Opcodes.ISTORE, taskScopeLocal));
+        // Start the catch range only after beginTaskWork has returned its
+        // token.  Any generic entry pump after this point is therefore closed
+        // with the same token if it throws.
+        entry.add(start);
+        if (afterTokenEntry != null) {
+            entry.add(afterTokenEntry);
+        }
+        method.instructions.insertBefore(method.instructions.getFirst(), entry);
+
+        int returns = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction.getOpcode() != returnOpcode) {
+                continue;
+            }
+            InsnList close = new InsnList();
+            close.add(new VarInsnNode(Opcodes.ILOAD, taskScopeLocal));
+            close.add(browserWorldgenEndTaskWork());
+            method.instructions.insertBefore(instruction, close);
+            returns++;
+        }
+        if (returns == 0) {
+            throw new IllegalStateException(target + " has no normal return for task scope");
+        }
+
+        InsnList cleanup = new InsnList();
+        cleanup.add(end);
+        cleanup.add(handler);
+        cleanup.add(new VarInsnNode(Opcodes.ASTORE, throwableLocal));
+        cleanup.add(new VarInsnNode(Opcodes.ILOAD, taskScopeLocal));
+        cleanup.add(browserWorldgenEndTaskWork());
+        cleanup.add(new VarInsnNode(Opcodes.ALOAD, throwableLocal));
+        cleanup.add(new InsnNode(Opcodes.ATHROW));
+        method.instructions.add(cleanup);
+        method.tryCatchBlocks.add(new TryCatchBlockNode(
+                start, end, handler, "java/lang/Throwable"));
+        method.maxStack = Math.max(method.maxStack, 1);
+        System.out.println("Instrumented " + target + " active-work scope: returns=" + returns);
+    }
+
+    private static MethodInsnNode browserWorldgenBeginServerWorkTurn() {
+        return new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserWorldgenScheduler",
+                "beginServerWorkTurn",
+                "()V",
+                false);
+    }
+
     private static void requireWorldgenSchedulerCalls(
             String label, MethodNode method, int expectedCalls) {
         int pulses = 0;
@@ -15124,8 +15274,42 @@ public final class MinecraftClientPatcher {
         boolean patchedBrowserPacketPump = false;
         boolean patchedBrowserWaitingPacketPump = false;
         boolean patchedBrowserMetricsRecorder = false;
+        boolean patchedCooperativeServerExecutor = false;
         for (MethodNode method : node.methods) {
-            if (method.name.equals("spin")
+            if (method.name.equals("<init>")) {
+                for (var instruction = method.instructions.getFirst();
+                        instruction != null;
+                        instruction = instruction.getNext()) {
+                    if (!(instruction instanceof MethodInsnNode call)
+                            || call.getOpcode() != Opcodes.INVOKESTATIC
+                            || !call.owner.equals("net/minecraft/util/Util")
+                            || !call.name.equals("backgroundExecutor")
+                            || !call.desc.equals("()Lnet/minecraft/TracingExecutor;")) {
+                        continue;
+                    }
+                    AbstractInsnNode next = nextOpcode(call);
+                    if (!(next instanceof FieldInsnNode field)
+                            || field.getOpcode() != Opcodes.PUTFIELD
+                            || !field.owner.equals(owner)
+                            || !field.name.equals("executor")
+                            || !field.desc.equals("Ljava/util/concurrent/Executor;")) {
+                        throw new IllegalStateException(
+                                "MinecraftServer background executor assignment shape changed");
+                    }
+                    method.instructions.insert(call, new MethodInsnNode(
+                            Opcodes.INVOKESTATIC,
+                            "dev/gaius/browser/BrowserCooperativeExecutor",
+                            "defer",
+                            "(Ljava/util/concurrent/Executor;)Ljava/util/concurrent/Executor;",
+                            false));
+                    method.maxStack = Math.max(method.maxStack, 1);
+                    if (patchedCooperativeServerExecutor) {
+                        throw new IllegalStateException(
+                                "Multiple MinecraftServer cooperative executor patch points found");
+                    }
+                    patchedCooperativeServerExecutor = true;
+                }
+            } else if (method.name.equals("spin")
                     && method.desc.equals("(Ljava/util/function/Function;)"
                             + "Lnet/minecraft/server/MinecraftServer;")) {
                 for (var instruction = method.instructions.getFirst();
@@ -15282,12 +15466,18 @@ public final class MinecraftClientPatcher {
                 method.maxStack = Math.max(method.maxStack, 1);
                 patchedBrowserPacketPump = true;
             } else if (method.name.equals("pollTask") && method.desc.equals("()Z")) {
-                method.instructions.insert(new MethodInsnNode(
+                InsnList taskEntry = new InsnList();
+                taskEntry.add(new MethodInsnNode(
                         Opcodes.INVOKESTATIC,
                         "dev/gaius/browser/BrowserIntegratedServerMain",
                         "pumpUrgentPacketsIfPending",
                         "()V",
                         false));
+                instrumentBrowserTaskScope(
+                        method,
+                        "MinecraftServer.pollTask",
+                        Opcodes.IRETURN,
+                        taskEntry);
                 patchedBrowserWaitingPacketPump = true;
             } else if (method.name.equals("createProfiler")
                     && method.desc.equals("()Lnet/minecraft/util/profiling/ProfilerFiller;")) {
@@ -15347,7 +15537,12 @@ public final class MinecraftClientPatcher {
                             && call.owner.equals(owner)
                             && call.name.equals("processPacketsAndTick")
                             && call.desc.equals("(Z)V")) {
-                        method.instructions.insertBefore(instruction, browserWorldgenCheckpoint());
+                        // The server's waitUntilNextTick runs after processPacketsAndTick.
+                        // Start the scheduler clock immediately before active tick work, then
+                        // checkpoint after that work. This excludes the inter-tick idle gap
+                        // without resetting the cumulative budget between chunk tasks.
+                        method.instructions.insertBefore(instruction, browserWorldgenBeginServerWorkTurn());
+                        method.instructions.insert(instruction, browserWorldgenCheckpoint());
                         patchedRunServerTickYield = true;
                         break;
                     }
@@ -15391,7 +15586,8 @@ public final class MinecraftClientPatcher {
                 || !patchedSaveBeforeWorldInitialization
                 || !patchedBrowserPacketPump
                 || !patchedBrowserWaitingPacketPump
-                || !patchedBrowserMetricsRecorder) {
+                || !patchedBrowserMetricsRecorder
+                || !patchedCooperativeServerExecutor) {
             throw new IllegalStateException("MinecraftServer browser patch points were not found");
         }
         writeComputeFrames(node, output);

@@ -8,6 +8,7 @@ import gzip
 import importlib.util
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -27,6 +28,24 @@ QUICK_CHECK_SPEC = importlib.util.spec_from_file_location(
 assert QUICK_CHECK_SPEC is not None and QUICK_CHECK_SPEC.loader is not None
 QUICK_CHECK = importlib.util.module_from_spec(QUICK_CHECK_SPEC)
 QUICK_CHECK_SPEC.loader.exec_module(QUICK_CHECK)
+
+
+@contextlib.contextmanager
+def hermetic_gaius_environment():
+    """Run fixture code without inheriting profile-selection overrides."""
+    fixture_env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GAIUS_")
+    }
+    saved_env = dict(os.environ)
+    try:
+        os.environ.clear()
+        os.environ.update(fixture_env)
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_env)
 
 
 def compressed(value: bytes) -> bytes:
@@ -60,6 +79,11 @@ def teavm_pom(main_class: str, target_directory: Path, target_file: str) -> str:
 
 
 class PortableArtifactIdentityTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._fixture_environment = hermetic_gaius_environment()
+        self._fixture_environment.__enter__()
+        self.addCleanup(self._fixture_environment.__exit__, None, None, None)
+
     @staticmethod
     def write_compiler_profile(
         root: Path,
@@ -119,6 +143,13 @@ class PortableArtifactIdentityTest(unittest.TestCase):
                     "releaseType": "release",
                     "clientDistribution": distribution,
                     "protocolVersion": 776 if version == "26.2" else 774,
+                    "worldVersion": 4903 if version == "26.2" else 4671,
+                    "storage": {
+                        "schema": 2,
+                        "databaseName": f"gaius-fs-v2-{profile_id}",
+                        "prefix": f"gaius.fs.v2:{profile_id}:",
+                        "opfsDirectory": f"regions-v2-{profile_id}",
+                    },
                     "official": {"assetIndexId": launcher_asset_index},
                 }
             ),
@@ -129,6 +160,13 @@ class PortableArtifactIdentityTest(unittest.TestCase):
             "<!doctype html>\n"
             f'<script>const args = ["--version", "{launcher_version}", '
             f'"--assetIndex", "{launcher_asset_index}"];</script>\n'
+            f'<script data-gaius-storage-profile="v2">'
+            f'window.__gaiusProfileId = "{profile_id}"; '
+            f'window.__gaiusWorldVersion = {4903 if version == "26.2" else 4671}; '
+            'window.__gaiusStorageSchema = 2; '
+            f'window.__gaiusStorageDatabaseName = "gaius-fs-v2-{profile_id}"; '
+            f'window.__gaiusStoragePrefix = "gaius.fs.v2:{profile_id}:"; '
+            f'window.__gaiusStorageOpfsDirectory = "regions-v2-{profile_id}";</script>\n'
             '  <script>\n    if (typeof Error === "function") {}\n  </script>\n'
         )
         (dist / "index.html").write_text(index, encoding="utf-8")
@@ -290,7 +328,17 @@ class PortableArtifactIdentityTest(unittest.TestCase):
                 mock.patch.object(QUICK_CHECK, "DIST", dist), \
                 mock.patch.object(QUICK_CHECK, "PORTABLE_HTML", output), \
                 mock.patch.object(QUICK_CHECK, "PORTABLE_MANIFEST", dist / "Gaius.manifest.json"), \
-                mock.patch.object(QUICK_CHECK, "INDEX_HTML", dist / "index.html"):
+                mock.patch.object(QUICK_CHECK, "INDEX_HTML", dist / "index.html"), \
+                mock.patch.object(
+                    QUICK_CHECK,
+                    "BUILD_IDENTITY_SCHEMA_VERSION",
+                    PORTABLE.build_identity.IDENTITY_SCHEMA_VERSION,
+                ), \
+                mock.patch.object(
+                    QUICK_CHECK,
+                    "current_build_identity_for_quick_check",
+                    side_effect=lambda *_args, **_kwargs: PORTABLE.build_identity.current_build_identity(root),
+                ):
             return QUICK_CHECK.portable_artifact_identity_matches()
 
     def test_correct_26_2_publishes_and_embeds_identity(self) -> None:
@@ -302,6 +350,18 @@ class PortableArtifactIdentityTest(unittest.TestCase):
             manifest_path = dist / "Gaius.manifest.json"
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(manifest["profile"], "26.2")
+            self.assertEqual(manifest["worldVersion"], 4903)
+            self.assertEqual(
+                manifest["storage"],
+                {
+                    "schema": 2,
+                    "databaseName": "gaius-fs-v2-26.2",
+                    "prefix": "gaius.fs.v2:26.2:",
+                    "opfsDirectory": "regions-v2-26.2",
+                },
+            )
+            self.assertEqual(manifest["buildIdentity"]["worldVersion"], 4903)
+            self.assertEqual(manifest["buildIdentity"]["storage"], manifest["storage"])
             self.assertEqual(
                 manifest["buildIdentity"]["compatibilitySha256"],
                 manifest["classesJs"]["build"]["compatibilitySha256"],

@@ -2,10 +2,14 @@
 
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
-import {readFile} from "node:fs/promises";
+import {mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
+import {createHash} from "node:crypto";
+import {tmpdir} from "node:os";
+import {join} from "node:path";
 import {fileURLToPath} from "node:url";
 import {
   createReleasePlan,
+  validateManifestIdentity,
   validateContractShape,
   validateChildReport,
 } from "./chrome-performance-release-suite.mjs";
@@ -13,7 +17,10 @@ import {summarizeAcceptanceEvidence} from "./performance-metrics.mjs";
 import {
   acceptanceFixtureIdentity,
   acceptanceFixtureProfile,
+  legacyReleaseManifestFixtureIdentity,
+  makeManifestIdentityFixture,
   makeAcceptanceFixtureReport,
+  releaseManifestFixtureIdentity,
 } from "./chrome-performance-release-fixtures.mjs";
 
 const script = fileURLToPath(new URL(
@@ -21,8 +28,54 @@ const script = fileURLToPath(new URL(
   import.meta.url,
 ));
 const source = await readFile(script, "utf8");
+const fixtureRoot = await mkdtemp(join(tmpdir(), "gaius-release-suite-smoke-"));
+const fixtureProfileBytes = new Map();
+for (const profileId of ["26.2", "1.21.11"]) {
+  const profilePath = fileURLToPath(new URL(`../versions/${profileId}.json`, import.meta.url));
+  const profileBytes = await readFile(profilePath);
+  fixtureProfileBytes.set(profileId, createHash("sha256").update(profileBytes).digest("hex"));
+}
+const suiteManifestIdentities = new Map([
+  ["26.2", {
+    ...releaseManifestFixtureIdentity,
+    profileSha256: fixtureProfileBytes.get("26.2"),
+  }],
+  ["1.21.11", {
+    ...legacyReleaseManifestFixtureIdentity,
+    profileSha256: fixtureProfileBytes.get("1.21.11"),
+  }],
+]);
+for (const identity of suiteManifestIdentities.values()) {
+  const fixtureDist = join(fixtureRoot, identity.profileId);
+  await mkdir(fixtureDist, {recursive: true});
+  await writeFile(
+    join(fixtureDist, "Gaius.manifest.json"),
+    `${JSON.stringify(makeManifestIdentityFixture(identity), null, 2)}\n`,
+  );
+}
+const suiteExecOptions = (identityOrExtra = suiteManifestIdentities.get("26.2"), extra = {}) => {
+  const usesIdentity = identityOrExtra?.profileId != null;
+  const identity = usesIdentity
+    ? identityOrExtra
+    : suiteManifestIdentities.get("26.2");
+  const options = usesIdentity ? extra : identityOrExtra;
+  return {
+    encoding: "utf8",
+    maxBuffer: 4 * 1024 * 1024,
+    env: {
+      ...process.env,
+      GAIUS_VERSION_PROFILE_PATH: identity.profilePath,
+      GAIUS_BUILD_ROOT: `port/target/${identity.profileId}`,
+      GAIUS_DIST_DIRECTORY: join(fixtureRoot, identity.profileId),
+      GAIUS_OVERLAY_DIRECTORY: `port/work/overlays/${identity.profileId}`,
+    },
+    ...options,
+  };
+};
 for (const required of [
   "createReleasePlan",
+  "validateManifestIdentity",
+  "readBuildIdentity",
   "validateChildReport",
   "summarizeAcceptanceEvidence",
   "hardTargetProfiles",
@@ -31,7 +84,14 @@ for (const required of [
   "configuration.profileName",
   "configuration.contractSchemaVersion",
   "analysis.releaseEvidence",
+  "naturalWorkerEvidence",
+  "harnessOverrideEvidence",
+  "natural-observation",
+  "harness-pin-diagnostic",
+  "options preference must be exactly",
   "analysis.performanceEvidence",
+  "worldgenTelemetryMode",
+  "runtimeInvariantContract",
   "uncappedYieldCount",
   "presentToRafCount",
   "fairYieldCount",
@@ -48,6 +108,13 @@ for (const required of [
   "failureEvidence",
   "manifestSha256",
   "compatibilitySha256",
+  "manifest.worldVersion",
+  "manifest.worldgenTelemetryMode",
+  "manifest.storage",
+  "manifest.buildIdentity.profile.worldgenTelemetryMode",
+  "manifest.buildIdentity.profile.storage",
+  "exactIdentityValue",
+  "canonicalJson",
   "child report verdict must be",
   '"smoke-pass"',
   'releaseEvidence: false',
@@ -57,6 +124,51 @@ for (const required of [
 ]) {
   assert.ok(source.includes(required), `release suite is missing ${required}`);
 }
+assert.match(source, /--attach-port is disabled/,
+  "release suite must fail closed for attached Chrome");
+assert.doesNotMatch(source, /forwarded.*attach-port/,
+  "release suite must not forward attached input to child benchmarks");
+assert.match(source, /resolveRepositoryPortPath/,
+  "release suite paths must not depend on child cwd");
+assert.match(source, /manifest\.buildIdentity\.profile\.worldVersion/,
+  "release suite must verify nested manifest world version");
+assert.match(source, /profile-scoped dist basename/,
+  "release suite must reject a shared dist root for isolated profiles");
+assert.match(source, /--pin-worker-distance is diagnostic-only/,
+  "release suite must keep Worker distance pin diagnostic-only");
+
+const manifestFixture = makeManifestIdentityFixture(releaseManifestFixtureIdentity);
+assert.deepEqual(
+  validateManifestIdentity(manifestFixture, releaseManifestFixtureIdentity),
+  [],
+  "a complete manifest identity fixture must pass the exact profile/telemetry/storage gate",
+);
+for (const [label, mutate, expectedFailure] of [
+  ["top-level world version", (manifest) => { manifest.worldVersion += 1; }, /manifest\.worldVersion/],
+  ["top-level telemetry mode", (manifest) => { manifest.worldgenTelemetryMode = "checkpoint-only"; }, /manifest\.worldgenTelemetryMode/],
+  ["top-level storage", (manifest) => { manifest.storage.prefix += "forged"; }, /manifest\.storage/],
+  ["nested telemetry mode", (manifest) => {
+    manifest.buildIdentity.profile.worldgenTelemetryMode = "checkpoint-only";
+  }, /manifest\.buildIdentity\.profile\.worldgenTelemetryMode/],
+  ["nested storage", (manifest) => {
+    manifest.buildIdentity.profile.storage.opfsDirectory += "-forged";
+  }, /manifest\.buildIdentity\.profile\.storage/],
+  ["world version type coercion", (manifest) => { manifest.worldVersion = "4903"; }, /manifest\.worldVersion/],
+]) {
+  const forgedManifest = makeManifestIdentityFixture(releaseManifestFixtureIdentity);
+  mutate(forgedManifest);
+  const failures = validateManifestIdentity(forgedManifest, releaseManifestFixtureIdentity);
+  assert.notDeepEqual(failures, [], `${label} unexpectedly passed the identity gate`);
+  assert.match(failures.join("\n"), expectedFailure, `${label} failure was not reported`);
+}
+assert.deepEqual(
+  validateManifestIdentity(
+    makeManifestIdentityFixture(legacyReleaseManifestFixtureIdentity),
+    legacyReleaseManifestFixtureIdentity,
+  ),
+  [],
+  "the legacy profile fixture must retain the same exact identity gate",
+);
 
 const fixtureProfile = {
   ...acceptanceFixtureProfile,
@@ -239,6 +351,31 @@ assert.equal(validateChildReport(childReport(), {
   expectedBuildIdentity: fixtureIdentity,
   uncappedEvidence: fixtureUncappedEvidence,
 }).valid, true);
+const forgedWorkerDistanceChild = childReport();
+forgedWorkerDistanceChild.analysis.environment.distanceContract.optionsPreference = "8:6";
+const forgedWorkerDistanceValidation = validateChildReport(forgedWorkerDistanceChild, {
+  profileName: "hard-a",
+  profile: fixtureContract.profiles["hard-a"],
+  contractSchemaVersion: fixtureContract.schemaVersion,
+  expectedBuildIdentity: fixtureIdentity,
+  uncappedEvidence: fixtureUncappedEvidence,
+});
+assert.equal(forgedWorkerDistanceValidation.valid, false,
+  "strict release must reject a non-6/4 natural options preference");
+assert.match(forgedWorkerDistanceValidation.failures.join("\n"), /options preference/);
+const pinnedWorkerDistanceChild = childReport();
+pinnedWorkerDistanceChild.analysis.environment.distanceContract.mode = "harness-pin-diagnostic";
+pinnedWorkerDistanceChild.analysis.harnessOverrideEvidence.enabled = true;
+const pinnedWorkerDistanceValidation = validateChildReport(pinnedWorkerDistanceChild, {
+  profileName: "hard-a",
+  profile: fixtureContract.profiles["hard-a"],
+  contractSchemaVersion: fixtureContract.schemaVersion,
+  expectedBuildIdentity: fixtureIdentity,
+  uncappedEvidence: fixtureUncappedEvidence,
+});
+assert.equal(pinnedWorkerDistanceValidation.valid, false,
+  "strict release must reject harness-pinned Worker distance evidence");
+assert.match(pinnedWorkerDistanceValidation.failures.join("\n"), /harnessOverrideEvidence|natural-observation/);
 const inconclusiveChild = childReport({
   verdict: "inconclusive",
   analysis: {...childReport().analysis, verdict: "inconclusive"},
@@ -362,9 +499,17 @@ assert.equal(validateChildReport(childReport(), {
 const configuration = JSON.parse(execFileSync(
   process.execPath,
   [script, "--print-config"],
-  {encoding: "utf8", maxBuffer: 4 * 1024 * 1024},
+  suiteExecOptions(),
 ));
 assert.equal(configuration.buildIdentity.coherent, true);
+assert.equal(configuration.activeProfile.id, "26.2");
+assert.equal(configuration.activeProfile.path, "versions/26.2.json");
+assert.equal(configuration.activeProfile.worldgenTelemetryMode, "task-pulsed");
+assert.equal(configuration.buildIdentity.profilePath, "versions/26.2.json");
+assert.equal(configuration.buildIdentity.nestedProfile.worldVersion, 4903);
+assert.equal(configuration.buildIdentity.worldVersion, 4903);
+assert.equal(configuration.buildIdentity.worldgenTelemetryMode, "task-pulsed");
+assert.deepEqual(configuration.buildIdentity.storage, releaseManifestFixtureIdentity.storage);
 assert.deepEqual(
   configuration.profiles.map((profile) => profile.name),
   ["steady-6-4", "traversal-6-4", "soak-sp-6-4"],
@@ -388,10 +533,27 @@ assert.deepEqual(configuration.unsupportedProfiles.map((profile) => profile.prof
 assert.equal(configuration.unsupportedProfiles[0].releaseEvidence, false);
 assert.equal(configuration.releaseEvidence, false);
 
+const legacyConfiguration = JSON.parse(execFileSync(
+  process.execPath,
+  [script, "--print-config"],
+  suiteExecOptions(suiteManifestIdentities.get("1.21.11")),
+));
+assert.equal(legacyConfiguration.activeProfile.id, "1.21.11");
+assert.equal(legacyConfiguration.activeProfile.path, "versions/1.21.11.json");
+assert.equal(legacyConfiguration.activeProfile.worldVersion, 4671);
+assert.equal(legacyConfiguration.activeProfile.worldgenTelemetryMode, "checkpoint-only");
+assert.equal(legacyConfiguration.buildIdentity.profilePath, "versions/1.21.11.json");
+assert.equal(legacyConfiguration.buildIdentity.nestedProfile.worldVersion, 4671);
+assert.equal(legacyConfiguration.buildIdentity.worldgenTelemetryMode, "checkpoint-only");
+assert.deepEqual(
+  legacyConfiguration.buildIdentity.storage,
+  legacyReleaseManifestFixtureIdentity.storage,
+);
+
 const matrixConfiguration = JSON.parse(execFileSync(
   process.execPath,
   [script, "--matrix", "--print-config"],
-  {encoding: "utf8", maxBuffer: 4 * 1024 * 1024},
+  suiteExecOptions(),
 ));
 assert.equal(matrixConfiguration.matrix, true);
 assert.deepEqual(
@@ -417,7 +579,7 @@ assert.throws(
   () => execFileSync(
     process.execPath,
     [script, "--profiles", "steady-6-4", "--print-config"],
-    {encoding: "utf8", maxBuffer: 4 * 1024 * 1024, stdio: ["ignore", "ignore", "ignore"]},
+    suiteExecOptions({stdio: ["ignore", "ignore", "ignore"]}),
   ),
   (error) => error?.status === 1,
   "strict release must reject a profile list that omits hard targets or memory evidence",
@@ -426,7 +588,7 @@ assert.throws(
   () => execFileSync(
     process.execPath,
     [script, "--profiles", "steady-6-4,traversal-6-4,soak-sp-6-4,soak-mp-6-4", "--print-config"],
-    {encoding: "utf8", maxBuffer: 4 * 1024 * 1024, stdio: ["ignore", "ignore", "ignore"]},
+    suiteExecOptions({stdio: ["ignore", "ignore", "ignore"]}),
   ),
   (error) => error?.status === 1,
   "strict release must reject explicitly selected unsupported soak-mp evidence",
@@ -435,19 +597,47 @@ assert.throws(
   () => execFileSync(
     process.execPath,
     [script, "--url", "https://example.invalid/Gaius.html", "--print-config"],
-    {encoding: "utf8", maxBuffer: 4 * 1024 * 1024, stdio: ["ignore", "ignore", "ignore"]},
+    suiteExecOptions({stdio: ["ignore", "ignore", "ignore"]}),
   ),
   (error) => error?.status === 1,
   "strict release must not accept an unverified external build URL",
 );
+assert.throws(
+  () => execFileSync(
+    process.execPath,
+    [script, "--attach-port", "9222", "--print-config"],
+    suiteExecOptions({stdio: ["ignore", "ignore", "ignore"]}),
+  ),
+  (error) => error?.status === 1,
+  "release suite must fail closed for attached Chrome input",
+);
+assert.throws(
+  () => execFileSync(
+    process.execPath,
+    [script, "--allow-attached-input", "--print-config"],
+    suiteExecOptions({stdio: ["ignore", "ignore", "ignore"]}),
+  ),
+  (error) => error?.status === 1,
+  "removed attached-input escape hatch must remain rejected",
+);
+assert.throws(
+  () => execFileSync(
+    process.execPath,
+    [script, "--pin-worker-distance", "--print-config"],
+    suiteExecOptions({stdio: ["ignore", "ignore", "ignore"]}),
+  ),
+  (error) => error?.status === 1,
+  "release suite must reject diagnostic Worker distance pinning",
+);
 const smokeConfiguration = JSON.parse(execFileSync(
   process.execPath,
   [script, "--smoke", "--profiles", "steady-6-4", "--print-config"],
-  {encoding: "utf8", maxBuffer: 4 * 1024 * 1024},
+  suiteExecOptions(),
 ));
 assert.equal(smokeConfiguration.mode, "smoke-suite");
 assert.equal(smokeConfiguration.releaseEvidence, false);
 assert.equal(smokeConfiguration.gating, false);
 assert.equal(smokeConfiguration.profiles[0].releaseEvidence, false);
 
+await rm(fixtureRoot, {recursive: true, force: true});
 console.log("Chrome performance release-suite smoke passed");

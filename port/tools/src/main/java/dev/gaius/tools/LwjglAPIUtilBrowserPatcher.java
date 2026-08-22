@@ -9,6 +9,7 @@ import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.Label;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.FrameNode;
 import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.JumpInsnNode;
@@ -27,19 +28,46 @@ public final class LwjglAPIUtilBrowserPatcher {
             throw new IllegalArgumentException("usage: LwjglAPIUtilBrowserPatcher INPUT_JAR OUTPUT_ROOT");
         }
         ClassNode node = read(args[0], "org/lwjgl/system/APIUtil.class");
-        int replacements = 0;
+        int requiredReplacements = 0;
+        int optionalReplacements = 0;
         for (MethodNode method : node.methods) {
             if (method.name.equals("apiGetFunctionAddress")
                     && method.desc.equals("(Lorg/lwjgl/system/FunctionProvider;Ljava/lang/String;)J")) {
                 replaceApiGetFunctionAddress(method);
-                replacements++;
+                requiredReplacements++;
+            } else if (method.name.equals("apiGetFunctionAddressOptional")
+                    && method.desc.equals("(Lorg/lwjgl/system/SharedLibrary;Ljava/lang/String;)J")) {
+                guardOptionalLibrary(method);
+                optionalReplacements++;
             }
         }
-        if (replacements != 1) {
-            throw new IllegalStateException("Expected to patch one APIUtil method, patched " + replacements);
+        if (requiredReplacements != 1 || optionalReplacements != 1) {
+            throw new IllegalStateException(
+                    "Expected one required and one optional APIUtil method, patched "
+                            + requiredReplacements + " required and " + optionalReplacements + " optional");
         }
         write(node, Path.of(args[1]).resolve("org/lwjgl/system/APIUtil.class"));
-        System.out.println("Patched " + replacements + " LWJGL APIUtil methods");
+        System.out.println("Patched required and optional LWJGL APIUtil methods");
+    }
+
+    /**
+     * LWJGL's optional lookup normally receives a native SharedLibrary.  The
+     * browser GLFW path deliberately has no native library, so a null handle
+     * is a valid "optional symbol unavailable" result rather than a reason to
+     * dereference the handle.  Keep the original lookup/debug behavior for a
+     * non-null handle and only add the null guard.
+     */
+    private static void guardOptionalLibrary(MethodNode method) {
+        LabelNode libraryNonNull = new LabelNode(new Label());
+        InsnList prefix = new InsnList();
+        prefix.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        prefix.add(new JumpInsnNode(Opcodes.IFNONNULL, libraryNonNull));
+        prefix.add(new InsnNode(Opcodes.LCONST_0));
+        prefix.add(new InsnNode(Opcodes.LRETURN));
+        prefix.add(libraryNonNull);
+        prefix.add(new FrameNode(Opcodes.F_SAME, 0, null, 0, null));
+        method.instructions.insert(prefix);
+        method.maxStack = Math.max(method.maxStack, 2);
     }
 
     private static void replaceApiGetFunctionAddress(MethodNode method) {

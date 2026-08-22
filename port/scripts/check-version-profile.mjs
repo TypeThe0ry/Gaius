@@ -1,17 +1,92 @@
 #!/usr/bin/env node
 
-import {access, readFile} from "node:fs/promises";
-import {dirname, resolve} from "node:path";
+import {access, readdir, readFile} from "node:fs/promises";
+import {dirname, isAbsolute, relative, resolve, sep} from "node:path";
 import {fileURLToPath} from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const configPath = resolve(root, "port/config.json");
 const config = JSON.parse(await readFile(configPath, "utf8"));
-const profilePath = resolve(root, "port", requiredString(config, "versionProfile"));
 const versionsDirectory = resolve(root, "port/versions");
+const allProfiles = process.argv.includes("--all");
+const profileOptionIndex = process.argv.indexOf("--profile");
+if (allProfiles && profileOptionIndex >= 0) {
+    fail("--all and --profile cannot be combined");
+}
+if (profileOptionIndex >= 0 &&
+        (!process.argv[profileOptionIndex + 1] || process.argv[profileOptionIndex + 1].startsWith("--"))) {
+    fail("--profile requires a version id or profile path");
+}
+const selectedProfile = profileOptionIndex >= 0
+    ? process.argv[profileOptionIndex + 1]
+    : (process.env.GAIUS_VERSION_PROFILE_PATH || requiredString(config, "versionProfile"));
+const configuredProfilePath = resolveProfilePath(selectedProfile);
 
-if (profilePath !== versionsDirectory && !profilePath.startsWith(`${versionsDirectory}/`)) {
-    fail("port/config.json versionProfile must point inside port/versions");
+let profilePaths;
+if (allProfiles) {
+    profilePaths = (await readdir(versionsDirectory, {withFileTypes: true}))
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+        .map((entry) => resolve(versionsDirectory, entry.name))
+        .sort();
+    if (profilePaths.length === 0) {
+        fail("port/versions contains no JSON profiles");
+    }
+} else {
+    profilePaths = [configuredProfilePath];
+}
+
+function resolveProfilePath(value) {
+    let normalized = nativePath(String(value).trim().replaceAll("\\", "/"));
+    if (/^\d+(?:\.\d+)+$/u.test(normalized)) {
+        normalized = `versions/${normalized}.json`;
+    }
+    const path = isAbsolute(normalized)
+        ? resolve(normalized)
+        : resolve(root, normalized.startsWith("versions/") ? "port" : "", normalized);
+    const relativePath = relative(versionsDirectory, path);
+    if (relativePath === "" || relativePath.startsWith(`..${sep}`) ||
+            relativePath === ".." || isAbsolute(relativePath) || !path.endsWith(".json")) {
+        fail(`version profile must point to a JSON file inside port/versions: ${path}`);
+    }
+    return path;
+}
+
+function nativePath(value) {
+    if (process.platform === "win32" && /^\/[A-Za-z](?:\/|$)/u.test(value)) {
+        return `${value[1].toUpperCase()}:${value.slice(2)}`;
+    }
+    return value;
+}
+
+const results = [];
+let remoteManifest;
+if (process.argv.includes("--remote")) {
+    const manifestResponse = await fetch(
+        "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json");
+    if (!manifestResponse.ok) {
+        fail(`official version manifest returned HTTP ${manifestResponse.status}`);
+    }
+    remoteManifest = await manifestResponse.json();
+}
+
+for (const profilePath of profilePaths) {
+    results.push(await checkProfile(profilePath, remoteManifest));
+}
+
+if (allProfiles) {
+    validateProfileUniqueness(results);
+}
+
+if (allProfiles) {
+    console.log(JSON.stringify({ok: true, profiles: results}, null, 2));
+} else {
+    console.log(JSON.stringify({ok: true, ...results[0]}, null, 2));
+}
+
+async function checkProfile(profilePath, remoteManifest) {
+
+if (profilePath !== versionsDirectory && !profilePath.startsWith(versionsDirectory + sep)) {
+    fail(`version profile must point inside port/versions: ${profilePath}`);
 }
 
 const profile = JSON.parse(await readFile(profilePath, "utf8"));
@@ -35,14 +110,8 @@ if (await exists(localClientVersionPath)) {
 }
 
 let checkedRemoteMetadata = false;
-if (process.argv.includes("--remote")) {
-    const manifestResponse = await fetch(
-        "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json");
-    if (!manifestResponse.ok) {
-        fail(`official version manifest returned HTTP ${manifestResponse.status}`);
-    }
-    const manifest = await manifestResponse.json();
-    const entry = manifest.versions?.find((candidate) => candidate.id === profile.id);
+if (remoteManifest) {
+    const entry = remoteManifest.versions?.find((candidate) => candidate.id === profile.id);
     if (!entry) fail(`official version manifest does not contain ${profile.id}`);
     if (entry.type !== profile.releaseType) {
         fail(`official manifest type ${entry.type} does not match ${profile.releaseType}`);
@@ -60,18 +129,20 @@ if (process.argv.includes("--require-local") &&
     fail(`local ${profile.id} metadata is incomplete; run fetch-version.sh first`);
 }
 
-console.log(JSON.stringify({
-    ok: true,
+return {
     profile: profile.id,
     protocolVersion: profile.protocolVersion,
     worldVersion: profile.worldVersion,
     javaVersion: profile.javaVersion,
     classFileVersion: profile.classFileVersion,
     clientDistribution: profile.clientDistribution,
+    worldgenTelemetryMode: profile.worldgenTelemetryMode,
+    storage: profile.storage,
     checkedLocalMetadata,
     checkedClientVersion,
     checkedRemoteMetadata,
-}, null, 2));
+};
+}
 
 function validateProfile(value) {
     requiredString(value, "id");
@@ -80,6 +151,8 @@ function validateProfile(value) {
     requiredInteger(value, "worldVersion");
     requiredInteger(value, "javaVersion");
     requiredInteger(value, "classFileVersion");
+    validateWorldgenTelemetryMode(value);
+    validateStorage(value);
     if (!["named", "obfuscated-with-mappings"].includes(value.clientDistribution)) {
         fail("clientDistribution must be named or obfuscated-with-mappings");
     }
@@ -96,6 +169,52 @@ function validateProfile(value) {
         requiredSha1(value.official, "clientMappingsSha1");
     } else if (value.official.clientMappingsSha1 !== null) {
         fail("official.clientMappingsSha1 must be null for a named client");
+    }
+}
+
+function validateWorldgenTelemetryMode(profile) {
+    const mode = profile?.worldgenTelemetryMode;
+    if (mode !== "task-pulsed" && mode !== "checkpoint-only") {
+        fail(`profile ${profile?.id ?? "<unknown>"}.worldgenTelemetryMode must be "task-pulsed" or "checkpoint-only"`);
+    }
+}
+
+function validateStorage(profile) {
+    const storage = profile?.storage;
+    if (storage === null || typeof storage !== "object" || Array.isArray(storage)) {
+        fail(`profile ${profile?.id ?? "<unknown>"}.storage must be an object`);
+    }
+    const schema = storage.schema;
+    const id = requiredString(profile, "id");
+    if (schema !== 2) {
+        fail(`profile ${id}.storage.schema must be exactly 2 (received ${JSON.stringify(schema)})`);
+    }
+    const expected = {
+        databaseName: `gaius-fs-v2-${id}`,
+        prefix: `gaius.fs.v2:${id}:`,
+        opfsDirectory: `regions-v2-${id}`,
+    };
+    for (const [key, expectedValue] of Object.entries(expected)) {
+        const field = requiredString(storage, key, "profile.storage");
+        if (field !== expectedValue) {
+            fail(`profile ${id}.storage.${key} must be exactly ${JSON.stringify(expectedValue)} ` +
+                `(received ${JSON.stringify(field)})`);
+        }
+    }
+}
+
+function validateProfileUniqueness(profiles) {
+    for (const field of ["profile", "storage.databaseName", "storage.prefix", "storage.opfsDirectory"]) {
+        const seen = new Set();
+        for (const result of profiles) {
+            const value = field === "profile"
+                ? result.profile
+                : result.storage[field.slice("storage.".length)];
+            if (seen.has(value)) {
+                fail(`all version profiles must have unique ${field}`);
+            }
+            seen.add(value);
+        }
     }
 }
 

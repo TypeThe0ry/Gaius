@@ -2,6 +2,7 @@
 
 import assert from "node:assert/strict";
 import {spawnSync} from "node:child_process";
+import {accessSync} from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import {fileURLToPath} from "node:url";
@@ -9,14 +10,35 @@ import {fileURLToPath} from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const postprocess = path.join(root, "port/scripts/postprocess-teavm-js.py");
 const python = path.join(root, "port/scripts/run-python.sh");
+const postprocessForPython = postprocess.replaceAll("\\", "/");
 const generator = [
   "import importlib.util",
-  `spec = importlib.util.spec_from_file_location('gaius_postprocess', ${JSON.stringify(postprocess)})`,
+  `spec = importlib.util.spec_from_file_location('gaius_postprocess', ${JSON.stringify(postprocessForPython)})`,
   "module = importlib.util.module_from_spec(spec)",
   "spec.loader.exec_module(module)",
   "print(module.integrated_server_pump_shim('exports', 'startThread'), end='')",
 ].join("; ");
-const generated = spawnSync(python, ["-c", generator], {
+// On Windows `.sh` files are not directly executable and `bash` may resolve
+// to the WSL shim (which is absent on the migration host).  Prefer the
+// installed Git-for-Windows bash explicitly, while retaining the direct
+// script path on POSIX hosts.
+const shell = process.platform === "win32"
+  ? [
+    process.env.GAIUS_BASH,
+    process.env.GIT_BASH,
+    "C:/Program Files/Git/bin/bash.exe",
+    "C:/Program Files/Git/usr/bin/bash.exe",
+  ].filter(Boolean).find((candidate) => {
+    try { accessSync(candidate); return true; } catch { return false; }
+  })
+  : null;
+const generated = shell === null
+  ? spawnSync(python, ["-c", generator], {
+    cwd: root,
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024,
+  })
+  : spawnSync(shell, [python, "-c", generator], {
   cwd: root,
   encoding: "utf8",
   maxBuffer: 1024 * 1024,

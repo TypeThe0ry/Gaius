@@ -2,10 +2,11 @@
 
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
+import {existsSync} from "node:fs";
 import {mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
 import {tmpdir} from "node:os";
-import {join} from "node:path";
-import {fileURLToPath} from "node:url";
+import {basename, join} from "node:path";
+import {fileURLToPath, pathToFileURL} from "node:url";
 
 const scriptsDirectory = fileURLToPath(new URL(".", import.meta.url));
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
@@ -21,13 +22,55 @@ const patcher262 = await readFile(
   new URL("../tools/src/main/java/dev/gaius/tools/Minecraft262BrowserPatcher.java", import.meta.url),
   "utf8",
 );
+const nativePath = (value) => {
+  if (!value) return value;
+  const text = String(value);
+  return process.platform === "win32" && /^\/[A-Za-z](?:\/|$)/.test(text)
+    ? `${text[1].toUpperCase()}:${text.slice(2)}` : text;
+};
+const profileIdFromPath = (value) => basename(nativePath(value).replaceAll("\\", "/"))
+  .replace(/\.json$/, "");
 const config = JSON.parse(await readFile(new URL("../config.json", import.meta.url), "utf8"));
+const buildRootProfileId = process.env.GAIUS_BUILD_ROOT
+  ? profileIdFromPath(process.env.GAIUS_BUILD_ROOT) : "";
+const overlayProfileId = process.env.GAIUS_OVERLAY_DIRECTORY
+  ? profileIdFromPath(process.env.GAIUS_OVERLAY_DIRECTORY) : "";
+const isolatedProfileId = [buildRootProfileId, overlayProfileId]
+  .find((value) => /^\d+(?:\.\d+)+$/.test(value)) || "";
+const configuredProfilePath = nativePath(
+  process.env.GAIUS_VERSION_PROFILE_PATH
+    || (isolatedProfileId ? `versions/${isolatedProfileId}.json` : String(config.versionProfile || "")),
+);
+const configuredProfileUrl = /^[A-Za-z]:[\\/]/.test(configuredProfilePath)
+  || configuredProfilePath.startsWith("/")
+  ? pathToFileURL(configuredProfilePath)
+  : new URL(`../${configuredProfilePath.replaceAll("\\", "/")}`, import.meta.url);
 const profile = JSON.parse(await readFile(
-  new URL(`../${config.versionProfile}`, import.meta.url),
+  configuredProfileUrl,
   "utf8",
 ));
 const version = String(profile.id);
-const overlayJar = `${repositoryRoot}/port/work/overlays/client-named-${version}-gaius.jar`;
+const configuredProfileId = process.env.GAIUS_VERSION_PROFILE_PATH
+  ? profileIdFromPath(process.env.GAIUS_VERSION_PROFILE_PATH)
+  : (isolatedProfileId || version);
+if (configuredProfileId !== version) {
+  throw new Error(`render pipeline smoke is for profile ${version}, got ${configuredProfileId}`);
+}
+if (version !== "26.2") {
+  throw new Error(`render pipeline backpressure smoke is 26.2-only; got profile ${version}`);
+}
+const overlayRoot = nativePath(process.env.GAIUS_OVERLAY_DIRECTORY ||
+  `${repositoryRoot}/port/work/overlays${process.env.GAIUS_BUILD_ROOT || process.env.GAIUS_VERSION_PROFILE_PATH ? `/${version}` : ""}`);
+const overlayJar = `${overlayRoot}/client-named-${version}-gaius.jar`;
+
+function javaTool(name) {
+  for (const home of [process.env.GAIUS_JAVA_HOME, process.env.JAVA_HOME]
+    .filter(Boolean).map(nativePath)) {
+    const candidate = join(home, "bin", name);
+    if (existsSync(candidate) || existsSync(`${candidate}.exe`)) return candidate;
+  }
+  return name;
+}
 
 for (const contract of [
   "MAX_UPLOAD_ALLOCATIONS_PER_FRAME = 8",
@@ -119,7 +162,7 @@ for (const contract of [
 
 function javap(className) {
   return execFileSync(
-    "javap",
+    javaTool("javap"),
     ["-classpath", overlayJar, "-p", "-c", className],
     {cwd: scriptsDirectory, encoding: "utf8", maxBuffer: 32 * 1024 * 1024},
   );
@@ -523,16 +566,16 @@ public final class BrowserRenderSchedulerUberCleanupRegression {
     await writeFile(sourcePath, contents);
     sourcePaths.push(sourcePath);
   }
-  execFileSync("javac", ["--release", "17", "-d", classesDirectory, schedulerPath, ...sourcePaths], {
+  execFileSync(javaTool("javac"), ["--release", "17", "-d", classesDirectory, schedulerPath, ...sourcePaths], {
     cwd: scriptsDirectory,
     stdio: "inherit",
   });
-  execFileSync("java", ["-cp", classesDirectory,
+  execFileSync(javaTool("java"), ["-cp", classesDirectory,
     "dev.gaius.browser.BrowserRenderSchedulerRetryRegression"], {
     cwd: scriptsDirectory,
     stdio: "inherit",
   });
-  execFileSync("java", ["-cp", classesDirectory,
+  execFileSync(javaTool("java"), ["-cp", classesDirectory,
     "dev.gaius.browser.BrowserRenderSchedulerUberCleanupRegression"], {
     cwd: scriptsDirectory,
     stdio: "inherit",

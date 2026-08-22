@@ -2,6 +2,17 @@ import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import vm from "node:vm";
 
+// This harness does not select a profile. Keep it on the safe, current
+// default storage namespace rather than reopening the removed v1 database.
+const DEFAULT_STORAGE_CONFIG = Object.freeze({
+  profileId: "26.2",
+  worldVersion: 4903,
+  storageSchema: 2,
+  storageDatabaseName: "gaius-fs-v2-26.2",
+  storagePrefix: "gaius.fs.v2:26.2:",
+  storageOpfsDirectory: "regions-v2-26.2",
+});
+
 const bootstrap = await readFile(
   new URL("../web/singleplayer/server-worker-bootstrap.js", import.meta.url),
   "utf8",
@@ -199,6 +210,9 @@ function createRuntime({opfsFiles, idbRecords, budgetBytes = 64 * 1024}) {
   context.close = () => events.push({type: "harness-close"});
   context.importScripts = () => {};
   context.main = () => events.push({type: "harness-main"});
+  let runtimeStopped = false;
+  context.stopIntegratedServer = () => { runtimeStopped = true; };
+  context.isIntegratedServerStopped = () => runtimeStopped;
   vm.runInNewContext(bootstrap, context, {filename: "server-worker-bootstrap.js"});
   return {context, events};
 }
@@ -212,7 +226,14 @@ function startRuntime(runtime, worldId = "region-cache-world") {
     data: {
       type: "start",
       sessionId: "7123456789abcdef0123456789abcdef",
+      launchGeneration: "1",
       worldId,
+      profileId: DEFAULT_STORAGE_CONFIG.profileId,
+      worldVersion: DEFAULT_STORAGE_CONFIG.worldVersion,
+      storageSchema: DEFAULT_STORAGE_CONFIG.storageSchema,
+      storageDatabaseName: DEFAULT_STORAGE_CONFIG.storageDatabaseName,
+      storagePrefix: DEFAULT_STORAGE_CONFIG.storagePrefix,
+      storageOpfsDirectory: DEFAULT_STORAGE_CONFIG.storageOpfsDirectory,
       renderDistance: 6,
       simulationDistance: 4,
       serverScriptUrl: "https://client.example/singleplayer-server.js",
@@ -377,7 +398,13 @@ for (let index = 0; index < 4; index++) {
   fallbackRecords.set(path, {path, value: new Uint8Array(96 * 1024)});
 }
 const fallback = createRuntime({opfsFiles: null, idbRecords: fallbackRecords});
-await assert.rejects(startRuntime(fallback, "fallback-world"), /cache budget/);
+await startRuntime(fallback, "fallback-world");
+await waitForEvent(fallback.events, "bootstrap-crash");
+assert.match(
+  String(fallback.events.find((event) => event?.type === "bootstrap-crash")?.detail || ""),
+  /cache budget/,
+  "over-budget IndexedDB fallback did not report its bootstrap failure",
+);
 assert.equal(fallbackRecords.size, 4,
   "over-budget IndexedDB fallback silently deleted durable regions");
 assert.equal(fallback.events.some((event) => event?.type === "runtime-ready"), false,

@@ -15,6 +15,13 @@ import sys
 import tempfile
 from pathlib import Path
 
+
+def _native_external_path(value: str) -> Path:
+    """Accept Git-Bash /c/... paths when running Windows Python."""
+    if os.name == "nt" and re.match(r"^/[A-Za-z](?:/|$)", value):
+        value = f"{value[1].upper()}:{value[2:]}"
+    return Path(value).expanduser()
+
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 if str(SCRIPT_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIRECTORY))
@@ -74,11 +81,13 @@ def write_text_atomically(target: Path, text: str) -> None:
             os.fsync(temporary.fileno())
         os.replace(temporary_name, target)
         temporary_name = None
-        directory_fd = os.open(target.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        # Windows cannot open a directory for fsync; the replace is atomic anyway.
+        if os.name != "nt":
+            directory_fd = os.open(target.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     finally:
         if temporary_name is not None:
             try:
@@ -140,6 +149,9 @@ def _backup_path(path: Path) -> str | None:
 
 
 def _fsync_directory(directory: Path) -> None:
+    # Windows cannot open a directory for fsync.
+    if os.name == "nt":
+        return
     descriptor = os.open(directory, os.O_RDONLY)
     try:
         os.fsync(descriptor)
@@ -243,7 +255,10 @@ def load_version_profile(root: Path) -> tuple[dict, str, bytes]:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"could not read version config: {config_path}") from exc
 
-    relative_profile = config.get("versionProfile")
+    relative_profile = (
+        os.environ.get("GAIUS_VERSION_PROFILE_PATH")
+        or config.get("versionProfile")
+    )
     if not isinstance(relative_profile, str) or not relative_profile:
         raise RuntimeError("port/config.json versionProfile must be a non-empty string")
 
@@ -270,7 +285,42 @@ def load_version_profile(root: Path) -> tuple[dict, str, bytes]:
     distribution = profile.get("clientDistribution")
     if distribution not in {"named", "obfuscated-with-mappings"}:
         raise RuntimeError(f"version profile clientDistribution is invalid: {profile_path}")
+    if not isinstance(profile.get("worldVersion"), int) or profile["worldVersion"] < 0:
+        raise RuntimeError(f"version profile worldVersion is invalid: {profile_path}")
+    build_identity._validate_worldgen_telemetry_mode(profile)
+    build_identity._validate_storage(profile)
     return profile, relative_profile, profile_bytes
+
+
+def configured_build_root(root: Path) -> Path:
+    """Return the target/state root for the active profile.
+
+    The historical default remains port/target.  Supplying
+    GAIUS_BUILD_ROOT makes every generated POM, resource list, Maven output,
+    log and gap report live under that caller-owned directory.
+    """
+    raw = os.environ.get("GAIUS_BUILD_ROOT")
+    if not raw:
+        if os.environ.get("GAIUS_VERSION_PROFILE_PATH"):
+            profile, _, _ = load_version_profile(root)
+            return root / "port" / "target" / str(profile["id"])
+        return root / "port" / "target"
+    path = _native_external_path(raw)
+    return (root / path).resolve() if not path.is_absolute() else path.resolve()
+
+
+def configured_dist_directory(root: Path, profile_id: str) -> Path:
+    raw = os.environ.get("GAIUS_DIST_DIRECTORY")
+    if not raw and not (
+        os.environ.get("GAIUS_BUILD_ROOT") or os.environ.get("GAIUS_VERSION_PROFILE_PATH")
+    ):
+        raw = os.environ.get("GAIUS_TARGET_DIRECTORY")
+    if raw:
+        path = _native_external_path(raw)
+        return (root / path).resolve() if not path.is_absolute() else path.resolve()
+    if os.environ.get("GAIUS_BUILD_ROOT") or os.environ.get("GAIUS_VERSION_PROFILE_PATH"):
+        return root / "port" / "web" / "dist" / profile_id
+    return root / "port" / "web" / "dist"
 
 
 def launcher_argument(index: str, name: str) -> str | None:
@@ -300,6 +350,37 @@ def validate_launcher_profile(index: str, profile: dict) -> None:
             raise RuntimeError(
                 f"portable launcher asset index {actual_asset_index!r} does not match "
                 f"active profile {expected_asset_index!r}"
+            )
+
+
+def launcher_global(index: str, name: str) -> object | None:
+    match = re.search(
+        rf"window\.{re.escape(name)}\s*=\s*(\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'|-?\d+)\s*;",
+        index,
+    )
+    if match is None:
+        return None
+    expression = match.group(1)
+    if expression.startswith("'"):
+        return bytes(expression[1:-1], "utf-8").decode("unicode_escape")
+    return json.loads(expression)
+
+
+def validate_launcher_storage(index: str, profile: dict) -> None:
+    storage = build_identity._validate_storage(profile)
+    expected = {
+        "__gaiusProfileId": profile["id"],
+        "__gaiusWorldVersion": profile["worldVersion"],
+        "__gaiusStorageSchema": storage["schema"],
+        "__gaiusStorageDatabaseName": storage["databaseName"],
+        "__gaiusStoragePrefix": storage["prefix"],
+        "__gaiusStorageOpfsDirectory": storage["opfsDirectory"],
+    }
+    for name, expected_value in expected.items():
+        actual = launcher_global(index, name)
+        if actual != expected_value:
+            raise RuntimeError(
+                f"portable launcher {name} {actual!r} does not match profile {expected_value!r}"
             )
 
 
@@ -436,6 +517,7 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
         raise FileNotFoundError(f"portable output directory is missing: {output.parent}")
 
     profile, relative_profile, profile_bytes = load_version_profile(root)
+    build_root = configured_build_root(root)
     common_identity = build_identity.current_build_identity(root)
     if (
         common_identity["profile"]["id"] != profile["id"]
@@ -445,6 +527,7 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
         raise RuntimeError("portable profile does not match the current build identity")
     index = require(dist / "index.html").read_text(encoding="utf-8")
     validate_launcher_profile(index, profile)
+    validate_launcher_storage(index, profile)
     classes_js = require_nonempty(dist / "classes.js")
     classes_gzip = require_nonempty(dist / "classes.js.gz")
     classes_hash, classes_gzip_hash = compare_gzip_with_raw(classes_js, classes_gzip)
@@ -485,12 +568,12 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
     asset_index_id = metadata.get("assetIndex", {}).get("id") or metadata.get("assets")
     if not isinstance(asset_index_id, str) or not asset_index_id:
         raise RuntimeError("active version metadata has no asset index")
-    generated_resources = root / "port" / "target" / "generated-resources"
+    generated_resources = build_root / "generated-resources"
     client_compiler = verified_compiler_profile(
         root,
         classes_js,
         "client",
-        root / "port" / "target" / "generated-pom.xml",
+        build_root / "generated-pom.xml",
         [
             generated_resources / "dev/gaius/browser/minecraft-resources.txt",
             generated_resources / "dev/gaius/browser/minecraft-embedded-resources.txt",
@@ -505,11 +588,9 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
         root,
         server_js,
         "singleplayer-worker",
-        root / "port" / "target" / "server-worker" / "generated-pom.xml",
+        build_root / "server-worker" / "generated-pom.xml",
         [
-            root
-            / "port"
-            / "target"
+            build_root
             / "server-worker"
             / "generated-resources/dev/gaius/browser/minecraft-resources.txt"
         ],
@@ -534,6 +615,9 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
         "profile": profile["id"],
         "profilePath": Path(relative_profile).as_posix(),
         "profileSha256": sha256_bytes(profile_bytes),
+        "worldVersion": profile["worldVersion"],
+        "worldgenTelemetryMode": profile.get("worldgenTelemetryMode"),
+        "storage": profile["storage"],
         "buildIdentity": common_identity,
         "classesJs": {
             "rawSha256": classes_hash,
@@ -665,7 +749,11 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
 
 def main() -> int:
     root = Path(__file__).resolve().parents[2]
-    dist = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else root / "port" / "web" / "dist"
+    if len(sys.argv) > 1:
+        dist = Path(sys.argv[1]).resolve()
+    else:
+        profile, _, _ = load_version_profile(root)
+        dist = configured_dist_directory(root, profile["id"])
     output = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else dist / "Gaius.html"
     build(dist, output)
     return 0

@@ -5,18 +5,81 @@ import {MessageChannel, Worker} from "node:worker_threads";
 const bootstrapPath = new URL("../web/singleplayer/server-worker-bootstrap.js", import.meta.url);
 const bootstrap = await readFile(bootstrapPath, "utf8");
 const sessionId = "5123456789abcdef0123456789abcdef";
+const storageConfig = Object.freeze({
+  profileId: "26.2",
+  worldVersion: 4903,
+  storageSchema: 2,
+  storageDatabaseName: "gaius-fs-v2-26.2",
+  storagePrefix: "gaius.fs.v2:26.2:",
+  storageOpfsDirectory: "regions-v2-26.2",
+});
 
 const harness = `
-const {parentPort, MessagePort} = require("node:worker_threads");
+const {parentPort, MessagePort, workerData} = require("node:worker_threads");
 const {performance} = require("node:perf_hooks");
+const testConfig = workerData || {};
+process.on("uncaughtException", (error) => {
+  parentPort.postMessage({type: "test-worker-error", detail: String(error)});
+});
+process.on("unhandledRejection", (error) => {
+  parentPort.postMessage({type: "test-worker-error", detail: String(error)});
+});
 globalThis.MessagePort = MessagePort;
 globalThis.performance = performance;
+globalThis.__gaiusStorageFlushWatchdogMillis = testConfig.flushWatchdogMillis;
+globalThis.__gaiusStorageFlushAbortSettleMillis = testConfig.flushAbortSettleMillis;
+globalThis.__gaiusStorageStartupSettleMillis = testConfig.storageStartupSettleMillis;
+globalThis.__gaiusRuntimeStopWatchdogMillis = testConfig.runtimeStopWatchdogMillis;
 globalThis.location = new URL("file:///Downloads/singleplayer-server-worker.js");
 globalThis.postMessage = (message, transfer) => parentPort.postMessage(message, transfer || []);
 globalThis.close = () => parentPort.postMessage({type: "harness-close"});
 globalThis.importScripts = () => {};
 globalThis.main = () => {};
 globalThis.__gaiusStartIntegratedServerPump = () => {};
+let runtimeStopped = false;
+if (!testConfig.missingStopIntegratedServer) {
+  globalThis.stopIntegratedServer = () => {
+    if (testConfig.runtimeStopNeverStops) return;
+    if (!testConfig.runtimeStopSave) {
+      runtimeStopped = true;
+      return;
+    }
+    setTimeout(() => {
+      const putAccepted = Boolean(globalThis.__gaiusFsPut?.(
+        "/gaius/saves/runtime-stop-save/level.dat",
+        "final save from integrated server stop",
+      ));
+      const putBytesAccepted = Boolean(globalThis.__gaiusFsPutBytes?.(
+        "/gaius/saves/runtime-stop-save/uid.dat",
+        new Uint8Array([7, 8, 9]),
+      ));
+      const flush = typeof globalThis.__gaiusFsFlush === "function"
+        ? globalThis.__gaiusFsFlush()
+        : Promise.reject(new Error("final save flush callback missing"));
+      Promise.resolve(flush).then(
+        () => {
+          runtimeStopped = true;
+          parentPort.postMessage({
+            type: "runtime-stop-save",
+            putAccepted,
+            putBytesAccepted,
+          });
+        },
+        (error) => {
+          parentPort.postMessage({
+            type: "runtime-stop-save",
+            putAccepted: false,
+            putBytesAccepted: false,
+            detail: String(error),
+          });
+        },
+      );
+    }, Math.max(0, Number(testConfig.runtimeStopDelayMillis) || 20));
+  };
+}
+if (!testConfig.missingIsIntegratedServerStopped) {
+  globalThis.isIntegratedServerStopped = () => runtimeStopped;
+}
 globalThis.__gaiusChunkPriorityStats = {
   queued: 7,
   longestTaskMillis: 12.5,
@@ -27,8 +90,19 @@ globalThis.__gaiusChunkPriorityStats = {
   typed: new Uint8Array([1, 2, 3]),
 };
 globalThis.__gaiusNetworkStats = {
-  queuedPackets: 3,
-  maxPacketLatencyMillis: 8,
+  receivedFrames: 3,
+  longestInboundSlicePumpMillis: 8,
+  queuedBytes: 128,
+  peakInboundQueuedBytes: 1024,
+  decodedPacketQueue: 2,
+  maxDecodedPacketQueue: 3,
+  pumpCalls: 11,
+  pumpChunks: 12,
+  pumpBytes: 13,
+  peakPumpMillis: 4,
+  eventLoopGapSamples: 7,
+  activeHighWatermarks: 1,
+  highWatermarkDurationMillis: 10,
   connected: true,
   optional: null,
   nested: {mustNotCross: true},
@@ -40,15 +114,33 @@ globalThis.__gaiusWorldgenStats = {
   healthy: true,
   nested: {mustNotCross: true},
 };
+if (testConfig.assetFailure) {
+  globalThis.DecompressionStream = function() {};
+  globalThis.fetch = () => Promise.reject(new Error("deterministic asset failure"));
+}
 globalThis.indexedDB = {
   open() {
     const request = {};
-    queueMicrotask(() => {
+    parentPort.postMessage({type: "test-db-open"});
+    setTimeout(() => {
+      let transactionCount = 0;
       const database = {
         objectStoreNames: {contains: () => true},
-        close() {},
+        close() {
+          parentPort.postMessage({type: "test-db-close"});
+        },
         transaction() {
           const transaction = {};
+          const transactionIndex = transactionCount++;
+          const configuredDelays = Array.isArray(testConfig.transactionDelays)
+            ? testConfig.transactionDelays
+            : [];
+          const configuredDelay = configuredDelays[transactionIndex];
+          const transactionDelay = configuredDelay === undefined
+            ? Number(testConfig.transactionDelayMillis) || 0
+            : Number(configuredDelay) || 0;
+          let finished = false;
+          let completionTimer;
           const store = {
             delete() {},
             put() {},
@@ -62,23 +154,70 @@ globalThis.indexedDB = {
             },
           };
           transaction.objectStore = () => store;
-          setTimeout(() => transaction.oncomplete?.(), 0);
+          const finish = () => {
+            if (finished) return;
+            finished = true;
+            transaction.oncomplete?.();
+          };
+          completionTimer = setTimeout(
+            finish,
+            Math.max(0, transactionDelay),
+          );
+          transaction.abort = () => {
+            parentPort.postMessage({type: "test-tx-abort"});
+            if (finished) return;
+            if (testConfig.abortNeverSettles) return;
+            finished = true;
+            clearTimeout(completionTimer);
+            setTimeout(
+              () => transaction.onabort?.(),
+              Math.max(0, Number(testConfig.abortDelayMillis) || 0),
+            );
+          };
           return transaction;
         },
       };
       request.result = database;
       request.onsuccess?.();
-    });
+    }, Math.max(0, Number(testConfig.openDelayMillis) || 0));
     return request;
   },
 };
 ${bootstrap}
 parentPort.on("message", (message) => {
+  if (message?.type === "mutate-telemetry") {
+    Object.assign(globalThis.__gaiusWorldgenStats, message.worldgen || {});
+    Object.assign(globalThis.__gaiusChunkPriorityStats, message.chunkPriority || {});
+    Object.assign(globalThis.__gaiusNetworkStats, message.network || {});
+    Object.assign(globalThis.__gaiusStorageStats, message.storage || {});
+    return;
+  }
+  if (message?.type === "test-write") {
+    const accepted = globalThis.__gaiusFsPut?.(
+      "/gaius/saves/flush-race/level.dat",
+      "deterministic flush race",
+    );
+    parentPort.postMessage({type: "test-write-done", accepted: Boolean(accepted)});
+    return;
+  }
+  if (message?.type === "test-late-fs-put") {
+    const installed = typeof globalThis.__gaiusFsPut === "function";
+    const accepted = installed && globalThis.__gaiusFsPut(
+      "/gaius/saves/late-asset/level.dat",
+      "must not install after asset failure",
+    );
+    parentPort.postMessage({
+      type: "test-late-fs-result",
+      installed,
+      accepted: Boolean(accepted),
+    });
+    return;
+  }
   globalThis.onmessage({data: message, ports: message && message.port ? [message.port] : []});
 });
 `;
 
-const worker = new Worker(harness, {eval: true});
+const worker = new Worker(harness, {eval: true, workerData: {}});
 const events = [];
 let waiter;
 worker.on("message", (message) => {
@@ -103,11 +242,81 @@ async function waitFor(type, timeoutMillis = 1000) {
   }
 }
 
+async function waitForTelemetry(sequence, timeoutMillis = 1000) {
+  const deadline = Date.now() + timeoutMillis;
+  while (true) {
+    const event = events.find((message) =>
+      message && message.type === "telemetry-pong" && message.sequence === sequence);
+    if (event) return event;
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for telemetry ${sequence}`);
+    await new Promise((resolve) => {
+      const timeout = setTimeout(resolve, 5);
+      waiter = () => {
+        clearTimeout(timeout);
+        waiter = undefined;
+        resolve();
+      };
+    });
+  }
+}
+
+async function waitForWorkerEvent(events, type, timeoutMillis = 1000) {
+  const deadline = Date.now() + timeoutMillis;
+  while (true) {
+    const event = events.find((message) => message && message.type === type);
+    if (event) return event;
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${type}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+function assertNoWorkerErrors(events, detail) {
+  assert.equal(
+    events.some((message) => message?.type === "test-worker-error"),
+    false,
+    detail,
+  );
+}
+
+const invalidGenerationWorker = new Worker(harness, {eval: true, workerData: {}});
+const invalidGenerationEvents = [];
+invalidGenerationWorker.on("message", (message) => invalidGenerationEvents.push(message));
+const invalidGenerationChannel = new MessageChannel();
+invalidGenerationChannel.port2.start();
+const invalidGenerationPortClosed = new Promise((resolve) => {
+  invalidGenerationChannel.port2.once("message", resolve);
+});
+invalidGenerationWorker.postMessage({
+  type: "start",
+  sessionId: "invalid-generation-session",
+  launchGeneration: "0",
+  port: invalidGenerationChannel.port1,
+}, [invalidGenerationChannel.port1]);
+await waitForWorkerEvent(invalidGenerationEvents, "start-invalid-generation");
+assert.deepEqual(await invalidGenerationPortClosed, {type: "close"},
+  "invalid launch generation did not close its transferred MessagePort");
+await new Promise((resolve) => setTimeout(resolve, 20));
+assert.equal(invalidGenerationEvents.some((event) =>
+  event?.type === "port-waiting" || event?.type === "test-db-open" ||
+  event?.type === "runtime-ready"), false,
+"invalid launch generation was accepted by the Worker bootstrap");
+assertNoWorkerErrors(invalidGenerationEvents,
+  "invalid launch generation raised a Worker harness error");
+invalidGenerationChannel.port2.close();
+await invalidGenerationWorker.terminate();
+
 worker.postMessage({
   type: "start",
   sessionId,
+  launchGeneration: "1",
   worldId: "portable-lifecycle-world",
   newWorld: true,
+  profileId: storageConfig.profileId,
+  worldVersion: storageConfig.worldVersion,
+  storageSchema: storageConfig.storageSchema,
+  storageDatabaseName: storageConfig.storageDatabaseName,
+  storagePrefix: storageConfig.storagePrefix,
+  storageOpfsDirectory: storageConfig.storageOpfsDirectory,
   renderDistance: 6,
   simulationDistance: 4,
   serverScriptUrl: "file:///Downloads/singleplayer-server.js",
@@ -123,31 +332,100 @@ worker.postMessage({type: "attach-port", sessionId, port: activeChannel.port1},
 await waitFor("port-attached");
 await waitFor("runtime-ready");
 
-worker.postMessage({type: "telemetry-ping", sessionId, sequence: 17});
-const telemetryPong = await waitFor("telemetry-pong");
+worker.postMessage({type: "telemetry-ping", sessionId, sequence: 17, measurementId: "measurement-a"});
+const telemetryPong = await waitForTelemetry(17);
 assert.equal(telemetryPong.sequence, 17, "heartbeat sequence was not preserved");
+assert.equal(telemetryPong.measurementId, "measurement-a");
+assert.ok(telemetryPong.workerResetAt > 0, "Worker did not expose its measurement reset time");
 assert.deepEqual({...telemetryPong.chunkPriority}, {
-  queued: 7,
-  longestTaskMillis: 12.5,
-  active: true,
-  phase: "terrain",
-}, "Worker chunk priority snapshot crossed non-scalar values");
+  playerUpdates: 0,
+  pops: 0,
+  reorderedPops: 0,
+  scannedCandidates: 0,
+  maxCandidates: 0,
+}, "new measurement did not reset chunk-priority telemetry");
 assert.deepEqual({...telemetryPong.network}, {
-  queuedPackets: 3,
-  maxPacketLatencyMillis: 8,
+  receivedFrames: 0,
+  longestInboundSlicePumpMillis: 8,
+  queuedBytes: 128,
+  peakInboundQueuedBytes: 1024,
+  decodedPacketQueue: 2,
+  maxDecodedPacketQueue: 3,
+  pumpCalls: 0,
+  pumpChunks: 0,
+  pumpBytes: 0,
+  peakPumpMillis: 4,
+  eventLoopGapSamples: 0,
+  activeHighWatermarks: 1,
+  highWatermarkDurationMillis: 10,
   connected: true,
   optional: null,
 }, "Worker network snapshot crossed non-scalar values");
-assert.deepEqual({...telemetryPong.worldgen}, {
-  heartbeatCount: 19,
-  longestHeartbeatDelayMillis: 14,
-  sliceMillis: 16,
-  healthy: true,
-}, "Worker worldgen heartbeat snapshot regressed");
+assert.deepEqual({...telemetryPong.worldgen}, {},
+  "new measurement did not reset worldgen telemetry");
 assert.equal(telemetryPong.storage.backend, "indexeddb-worker-lru");
 assert.equal(telemetryPong.storage.cacheBytes, 0);
 assert.equal(telemetryPong.storage.cacheEntries, 0);
 assert.equal(telemetryPong.storage.evictions, 0);
+
+worker.postMessage({
+  type: "mutate-telemetry",
+  worldgen: {slices: 3, healthy: true},
+  chunkPriority: {pops: 4, playerChunk: "2,3"},
+  network: {receivedFrames: 5, longestInboundSlicePumpMillis: 12, queuedBytes: 256},
+  storage: {opfsFlushes: 2},
+});
+worker.postMessage({type: "telemetry-ping", sessionId, sequence: 18, measurementId: "measurement-a"});
+const sameMeasurementPong = await waitForTelemetry(18);
+assert.equal(sameMeasurementPong.workerResetAt, telemetryPong.workerResetAt,
+  "same measurement ID reset the Worker more than once");
+assert.equal(sameMeasurementPong.worldgen.slices, 3,
+  "same measurement ID discarded worldgen telemetry");
+assert.equal(sameMeasurementPong.chunkPriority.pops, 4,
+  "same measurement ID discarded chunk-priority telemetry");
+assert.equal(sameMeasurementPong.network.receivedFrames, 2,
+  "network cumulative telemetry did not use a measurement baseline");
+assert.equal(sameMeasurementPong.network.longestInboundSlicePumpMillis, 12,
+  "network extrema were incorrectly baselined as counters");
+assert.equal(sameMeasurementPong.network.queuedBytes, 256,
+  "network queue gauge was reset instead of preserved");
+assert.equal(sameMeasurementPong.storage.opfsFlushes, 2,
+  "storage cumulative telemetry did not use a measurement baseline");
+
+worker.postMessage({type: "telemetry-ping", sessionId, sequence: 19, measurementId: "measurement-b"});
+const newMeasurementPong = await waitForTelemetry(19);
+assert.equal(newMeasurementPong.measurementId, "measurement-b");
+assert.ok(newMeasurementPong.workerResetAt > sameMeasurementPong.workerResetAt,
+  "new measurement ID did not reset the Worker");
+assert.deepEqual({...newMeasurementPong.worldgen}, {},
+  "new measurement retained startup worldgen telemetry");
+assert.deepEqual({...newMeasurementPong.chunkPriority}, {
+  playerUpdates: 0,
+  pops: 0,
+  reorderedPops: 0,
+  scannedCandidates: 0,
+  maxCandidates: 0,
+}, "new measurement retained startup chunk-priority telemetry");
+assert.equal(newMeasurementPong.network.receivedFrames, 0,
+  "network cumulative baseline was not advanced for the new measurement");
+assert.equal(newMeasurementPong.network.longestInboundSlicePumpMillis, 12,
+  "network extrema changed during measurement reset");
+assert.equal(newMeasurementPong.network.queuedBytes, 256,
+  "network gauge changed during measurement reset");
+assert.equal(newMeasurementPong.storage.opfsFlushes, 0,
+  "storage cumulative baseline was not advanced for the new measurement");
+
+worker.postMessage({
+  type: "mutate-telemetry",
+  worldgen: {slices: 1},
+  chunkPriority: {pops: 1},
+});
+worker.postMessage({type: "telemetry-ping", sessionId, sequence: 20, measurementId: "measurement-b"});
+const repeatedNewMeasurementPong = await waitForTelemetry(20);
+assert.equal(repeatedNewMeasurementPong.workerResetAt, newMeasurementPong.workerResetAt,
+  "repeated new measurement ping reset more than once");
+assert.equal(repeatedNewMeasurementPong.worldgen.slices, 1);
+assert.equal(repeatedNewMeasurementPong.chunkPriority.pops, 1);
 
 const duplicateChannel = new MessageChannel();
 const duplicateMessages = [];
@@ -156,7 +434,14 @@ duplicateChannel.port2.start();
 worker.postMessage({
   type: "start",
   sessionId,
+  launchGeneration: "1",
   worldId: "must-not-restart",
+  profileId: storageConfig.profileId,
+  worldVersion: storageConfig.worldVersion,
+  storageSchema: storageConfig.storageSchema,
+  storageDatabaseName: storageConfig.storageDatabaseName,
+  storagePrefix: storageConfig.storagePrefix,
+  storageOpfsDirectory: storageConfig.storageOpfsDirectory,
   port: duplicateChannel.port1,
 }, [duplicateChannel.port1]);
 await waitFor("start-duplicate-ignored");
@@ -175,10 +460,336 @@ assert.ok(
 );
 assert.deepEqual(activeMessages, [{type: "close"}],
   "Worker stop did not close the active local session port");
+assertNoWorkerErrors(events, "clean lifecycle emitted test-worker-error");
 
 await worker.terminate();
 activeChannel.port2.close();
 duplicateChannel.port2.close();
+
+// Runtime shutdown must leave the filesystem generation live until the
+// integrated server's final save has run. Both text and byte writes must be
+// accepted before the flush/close phase begins.
+const runtimeStopSaveWorker = new Worker(harness, {
+  eval: true,
+  workerData: {runtimeStopSave: true},
+});
+const runtimeStopSaveEvents = [];
+runtimeStopSaveWorker.on("message", (message) => runtimeStopSaveEvents.push(message));
+runtimeStopSaveWorker.on("error", (error) => {
+  runtimeStopSaveEvents.push({type: "test-worker-error", detail: String(error)});
+});
+const runtimeStopSaveChannel = new MessageChannel();
+runtimeStopSaveWorker.postMessage({
+  type: "start",
+  sessionId: "runtime-stop-save-session",
+  launchGeneration: "1",
+  worldId: "runtime-stop-save-world",
+  newWorld: true,
+  profileId: storageConfig.profileId,
+  worldVersion: storageConfig.worldVersion,
+  storageSchema: storageConfig.storageSchema,
+  storageDatabaseName: storageConfig.storageDatabaseName,
+  storagePrefix: storageConfig.storagePrefix,
+  storageOpfsDirectory: storageConfig.storageOpfsDirectory,
+  renderDistance: 6,
+  simulationDistance: 4,
+  serverScriptUrl: "file:///Downloads/singleplayer-server.js",
+  port: runtimeStopSaveChannel.port1,
+}, [runtimeStopSaveChannel.port1]);
+await waitForWorkerEvent(runtimeStopSaveEvents, "runtime-ready");
+runtimeStopSaveWorker.postMessage({type: "stop"});
+const runtimeStopSave = await waitForWorkerEvent(
+  runtimeStopSaveEvents,
+  "runtime-stop-save",
+);
+assert.equal(runtimeStopSave.putAccepted, true,
+  "runtime stop invalidated text filesystem callback before final save");
+assert.equal(runtimeStopSave.putBytesAccepted, true,
+  "runtime stop invalidated byte filesystem callback before final save");
+await waitForWorkerEvent(runtimeStopSaveEvents, "stopped");
+await waitForWorkerEvent(runtimeStopSaveEvents, "harness-close");
+const finalSaveIndex = runtimeStopSaveEvents.findIndex((message) =>
+  message?.type === "runtime-stop-save");
+const storageFlushingIndex = runtimeStopSaveEvents.findIndex((message) =>
+  message?.type === "storage-flushing");
+const runtimeDbCloseIndex = runtimeStopSaveEvents.findIndex((message) =>
+  message?.type === "test-db-close");
+const runtimeStoppedIndex = runtimeStopSaveEvents.findIndex((message) =>
+  message?.type === "stopped");
+assert.ok(finalSaveIndex >= 0 && finalSaveIndex < storageFlushingIndex,
+  "runtime final save did not run before storage flush");
+assert.ok(runtimeDbCloseIndex > storageFlushingIndex,
+  "runtime database closed before final save flush phase");
+assert.ok(runtimeStoppedIndex > runtimeDbCloseIndex,
+  "runtime worker reported stopped before database close");
+assertNoWorkerErrors(runtimeStopSaveEvents,
+  "runtime final save emitted test-worker-error");
+await runtimeStopSaveWorker.terminate();
+runtimeStopSaveChannel.port2.close();
+
+async function assertRuntimeStopFailure(workerData, label) {
+  const failureWorker = new Worker(harness, {eval: true, workerData});
+  const failureEvents = [];
+  failureWorker.on("message", (message) => failureEvents.push(message));
+  failureWorker.on("error", (error) => {
+    failureEvents.push({type: "test-worker-error", detail: String(error)});
+  });
+  const failureChannel = new MessageChannel();
+  failureWorker.postMessage({
+    type: "start",
+    sessionId: `${label}-session`,
+    launchGeneration: "1",
+    worldId: `${label}-world`,
+    newWorld: true,
+    profileId: storageConfig.profileId,
+    worldVersion: storageConfig.worldVersion,
+    storageSchema: storageConfig.storageSchema,
+    storageDatabaseName: storageConfig.storageDatabaseName,
+    storagePrefix: storageConfig.storagePrefix,
+    storageOpfsDirectory: storageConfig.storageOpfsDirectory,
+    renderDistance: 6,
+    simulationDistance: 4,
+    serverScriptUrl: "file:///Downloads/singleplayer-server.js",
+    port: failureChannel.port1,
+  }, [failureChannel.port1]);
+  await waitForWorkerEvent(failureEvents, "runtime-ready");
+  failureWorker.postMessage({type: "stop"});
+  await waitForWorkerEvent(failureEvents, "runtime-stop-failed", 2000);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(failureEvents.some((message) => message?.type === "stopped"), false,
+    `${label} incorrectly reported stopped`);
+  assert.equal(failureEvents.some((message) => message?.type === "harness-close"), false,
+    `${label} incorrectly closed the harness`);
+  assert.equal(failureEvents.some((message) => message?.type === "storage-flushing"), false,
+    `${label} flushed storage after runtime stop proof failed`);
+  assert.equal(failureEvents.some((message) => message?.type === "test-db-close"), false,
+    `${label} closed the database after runtime stop proof failed`);
+  assertNoWorkerErrors(failureEvents, `${label} emitted test-worker-error`);
+  await failureWorker.terminate();
+  failureChannel.port2.close();
+}
+
+await assertRuntimeStopFailure(
+  {missingStopIntegratedServer: true, runtimeStopWatchdogMillis: 50},
+  "missing-stop-hook",
+);
+await assertRuntimeStopFailure(
+  {missingIsIntegratedServerStopped: true, runtimeStopWatchdogMillis: 50},
+  "missing-stopped-hook",
+);
+await assertRuntimeStopFailure(
+  {runtimeStopNeverStops: true, runtimeStopWatchdogMillis: 75},
+  "runtime-stop-timeout",
+);
+
+// A timed-out flush must first abort/settle its active transaction.  The
+// backend handles are allowed to close only after the abort callback, never
+// merely because the watchdog raced the original promise.
+const flushRaceWorker = new Worker(harness, {
+  eval: true,
+  workerData: {
+    transactionDelayMillis: 500,
+    abortDelayMillis: 40,
+    flushWatchdogMillis: 25,
+    flushAbortSettleMillis: 300,
+  },
+});
+const flushRaceEvents = [];
+flushRaceWorker.on("message", (message) => flushRaceEvents.push(message));
+flushRaceWorker.on("error", (error) => {
+  flushRaceEvents.push({type: "test-worker-error", detail: String(error)});
+});
+const flushRaceChannel = new MessageChannel();
+flushRaceWorker.postMessage({
+  type: "start",
+  sessionId: "flush-race-session",
+  launchGeneration: "1",
+  worldId: "flush-race-world",
+  newWorld: true,
+  profileId: storageConfig.profileId,
+  worldVersion: storageConfig.worldVersion,
+  storageSchema: storageConfig.storageSchema,
+  storageDatabaseName: storageConfig.storageDatabaseName,
+  storagePrefix: storageConfig.storagePrefix,
+  storageOpfsDirectory: storageConfig.storageOpfsDirectory,
+  renderDistance: 6,
+  simulationDistance: 4,
+  serverScriptUrl: "file:///Downloads/singleplayer-server.js",
+  port: flushRaceChannel.port1,
+}, [flushRaceChannel.port1]);
+await waitForWorkerEvent(flushRaceEvents, "runtime-ready");
+flushRaceWorker.postMessage({type: "test-write"});
+const writeResult = await waitForWorkerEvent(flushRaceEvents, "test-write-done");
+assert.equal(writeResult.accepted, true, "flush race write was not accepted");
+await new Promise((resolve) => setTimeout(resolve, 60));
+flushRaceWorker.postMessage({type: "stop"});
+await waitForWorkerEvent(flushRaceEvents, "stopped", 2000);
+await waitForWorkerEvent(flushRaceEvents, "harness-close", 2000);
+const timeoutEvidence = flushRaceEvents.find((message) =>
+  message?.type === "storage-write-error" &&
+  String(message.detail || "").includes("Persistent storage flush timed out"));
+assert.ok(timeoutEvidence, "flush watchdog timeout evidence was not preserved");
+const abortIndex = flushRaceEvents.findIndex((message) => message?.type === "test-tx-abort");
+const closeIndex = flushRaceEvents.findIndex((message) => message?.type === "test-db-close");
+assert.ok(abortIndex >= 0, "flush watchdog did not request transaction abort");
+assert.ok(closeIndex > abortIndex,
+  "database closed before the in-flight flush transaction settled");
+assertNoWorkerErrors(flushRaceEvents,
+  "settled-abort retry emitted test-worker-error");
+await flushRaceWorker.terminate();
+flushRaceChannel.port2.close();
+
+// If an IndexedDB abort callback never arrives, shutdown must leave the
+// transaction and database alone. In particular, a watchdog race is not a
+// license to emit stopped/close while persistence is still in flight.
+const unsettledAbortWorker = new Worker(harness, {
+  eval: true,
+  workerData: {
+    transactionDelayMillis: 500,
+    abortNeverSettles: true,
+    flushWatchdogMillis: 25,
+    flushAbortSettleMillis: 50,
+  },
+});
+const unsettledAbortEvents = [];
+unsettledAbortWorker.on("message", (message) => unsettledAbortEvents.push(message));
+unsettledAbortWorker.on("error", (error) => {
+  unsettledAbortEvents.push({type: "test-worker-error", detail: String(error)});
+});
+const unsettledAbortChannel = new MessageChannel();
+unsettledAbortWorker.postMessage({
+  type: "start",
+  sessionId: "unsettled-abort-session",
+  launchGeneration: "1",
+  worldId: "unsettled-abort-world",
+  newWorld: true,
+  profileId: storageConfig.profileId,
+  worldVersion: storageConfig.worldVersion,
+  storageSchema: storageConfig.storageSchema,
+  storageDatabaseName: storageConfig.storageDatabaseName,
+  storagePrefix: storageConfig.storagePrefix,
+  storageOpfsDirectory: storageConfig.storageOpfsDirectory,
+  renderDistance: 6,
+  simulationDistance: 4,
+  serverScriptUrl: "file:///Downloads/singleplayer-server.js",
+  port: unsettledAbortChannel.port1,
+}, [unsettledAbortChannel.port1]);
+await waitForWorkerEvent(unsettledAbortEvents, "runtime-ready");
+unsettledAbortWorker.postMessage({type: "test-write"});
+await waitForWorkerEvent(unsettledAbortEvents, "test-write-done");
+await new Promise((resolve) => setTimeout(resolve, 60));
+unsettledAbortWorker.postMessage({type: "stop"});
+await waitForWorkerEvent(unsettledAbortEvents, "storage-flush-failed", 2000);
+await new Promise((resolve) => setTimeout(resolve, 100));
+assert.equal(unsettledAbortEvents.some((message) => message?.type === "test-tx-abort"), true,
+  "unsettled flush watchdog did not request transaction abort");
+assert.equal(unsettledAbortEvents.some((message) => message?.type === "test-db-close"), false,
+  "database closed while abort promise remained unsettled");
+assert.equal(unsettledAbortEvents.some((message) => message?.type === "stopped"), false,
+  "unsettled flush claimed a clean stop");
+assert.equal(unsettledAbortEvents.some((message) => message?.type === "harness-close"), false,
+  "unsettled flush closed the harness");
+assertNoWorkerErrors(unsettledAbortEvents,
+  "unsettled abort emitted test-worker-error");
+await unsettledAbortWorker.terminate();
+unsettledAbortChannel.port2.close();
+
+// A stop received after the port is attached but before storage finishes must
+// invalidate the generation immediately. The startup await then converges to
+// false and the same safe finalizer can close the one late-opened database.
+const startupStopWorker = new Worker(harness, {
+  eval: true,
+  workerData: {
+    openDelayMillis: 120,
+    storageStartupSettleMillis: 1000,
+  },
+});
+const startupStopEvents = [];
+startupStopWorker.on("message", (message) => startupStopEvents.push(message));
+startupStopWorker.on("error", (error) => {
+  startupStopEvents.push({type: "test-worker-error", detail: String(error)});
+});
+const startupStopChannel = new MessageChannel();
+startupStopWorker.postMessage({
+  type: "start",
+  sessionId: "startup-stop-session",
+  launchGeneration: "1",
+  worldId: "startup-stop-world",
+  newWorld: true,
+  profileId: storageConfig.profileId,
+  worldVersion: storageConfig.worldVersion,
+  storageSchema: storageConfig.storageSchema,
+  storageDatabaseName: storageConfig.storageDatabaseName,
+  storagePrefix: storageConfig.storagePrefix,
+  storageOpfsDirectory: storageConfig.storageOpfsDirectory,
+  renderDistance: 6,
+  simulationDistance: 4,
+  serverScriptUrl: "file:///Downloads/singleplayer-server.js",
+  port: startupStopChannel.port1,
+}, [startupStopChannel.port1]);
+await waitForWorkerEvent(startupStopEvents, "test-db-open");
+startupStopWorker.postMessage({type: "stop"});
+await waitForWorkerEvent(startupStopEvents, "stopped", 2000);
+await waitForWorkerEvent(startupStopEvents, "harness-close", 2000);
+assert.equal(startupStopEvents.some((message) => message?.type === "runtime-ready"), false,
+  "stop during storage startup dispatched the runtime");
+assert.equal(startupStopEvents.filter((message) => message?.type === "test-db-close").length, 1,
+  "stop during startup did not close the late-opened database exactly once");
+assertNoWorkerErrors(startupStopEvents,
+  "startup stop emitted test-worker-error");
+await startupStopWorker.terminate();
+startupStopChannel.port2.close();
+
+// If the portable server asset rejects while storage is still opening, the
+// startup generation is cancelled and the late open is closed locally.  No
+// storage callbacks may be installed after the bootstrap has already failed.
+const assetRaceWorker = new Worker(harness, {
+  eval: true,
+  workerData: {
+    assetFailure: true,
+    openDelayMillis: 75,
+    storageStartupSettleMillis: 1000,
+  },
+});
+const assetRaceEvents = [];
+assetRaceWorker.on("message", (message) => assetRaceEvents.push(message));
+assetRaceWorker.on("error", (error) => {
+  assetRaceEvents.push({type: "test-worker-error", detail: String(error)});
+});
+const assetRaceChannel = new MessageChannel();
+assetRaceWorker.postMessage({
+  type: "start",
+  sessionId: "asset-race-session",
+  launchGeneration: "1",
+  worldId: "asset-race-world",
+  newWorld: true,
+  profileId: storageConfig.profileId,
+  worldVersion: storageConfig.worldVersion,
+  storageSchema: storageConfig.storageSchema,
+  storageDatabaseName: storageConfig.storageDatabaseName,
+  storagePrefix: storageConfig.storagePrefix,
+  storageOpfsDirectory: storageConfig.storageOpfsDirectory,
+  renderDistance: 6,
+  simulationDistance: 4,
+  serverScriptGzipUrl: "file:///Downloads/missing-server.js.gz",
+  port: assetRaceChannel.port1,
+}, [assetRaceChannel.port1]);
+const assetCrash = await waitForWorkerEvent(assetRaceEvents, "bootstrap-crash", 2000);
+assert.match(String(assetCrash.detail || ""), /deterministic asset failure/);
+await new Promise((resolve) => setTimeout(resolve, 150));
+assetRaceWorker.postMessage({type: "test-late-fs-put"});
+const lateStorage = await waitForWorkerEvent(assetRaceEvents, "test-late-fs-result", 1000);
+assert.equal(lateStorage.installed, false,
+  "late storage startup installed filesystem callbacks after asset failure");
+assert.equal(lateStorage.accepted, false,
+  "late storage callback accepted a write after asset failure");
+assert.equal(assetRaceEvents.some((message) => message?.type === "storage-ready"), false,
+  "failed asset startup reported storage-ready");
+assert.equal(assetRaceEvents.filter((message) => message?.type === "test-db-close").length, 1,
+  "late IndexedDB open was not closed exactly once");
+await assetRaceWorker.terminate();
+assetRaceChannel.port2.close();
+
 console.log(JSON.stringify({
   ok: true,
   phases: events.map((message) => message && message.type).filter(Boolean),
@@ -188,5 +799,9 @@ console.log(JSON.stringify({
   portableWorkerUrl: true,
   scalarTelemetryPong: true,
   storageTelemetryPong: true,
-  worldgenHeartbeatPreserved: true,
+  measurementWindowIsolation: true,
+  measurementIdEcho: true,
+  workerResetAtEcho: true,
+  flushTimeoutAbortOrdering: true,
+  assetFailureStorageCancellation: true,
 }));

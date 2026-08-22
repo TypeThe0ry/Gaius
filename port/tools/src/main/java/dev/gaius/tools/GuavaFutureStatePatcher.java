@@ -6,7 +6,10 @@ import java.nio.file.Path;
 import java.util.zip.ZipFile;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.FieldInsnNode;
+import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.TypeInsnNode;
@@ -21,6 +24,8 @@ public final class GuavaFutureStatePatcher {
             "com/google/common/util/concurrent/AbstractFutureState$UnsafeAtomicHelper";
     private static final String SYNCHRONIZED_HELPER =
             "com/google/common/util/concurrent/AbstractFutureState$SynchronizedHelper";
+    private static final String VAR_HANDLE_MAKER =
+            "com/google/common/util/concurrent/AbstractFutureState$VarHandleAtomicHelperMaker";
 
     private GuavaFutureStatePatcher() {
     }
@@ -57,12 +62,26 @@ public final class GuavaFutureStatePatcher {
                         && methodInsn.owner.equals(UNSAFE_HELPER)) {
                     methodInsn.owner = SYNCHRONIZED_HELPER;
                     replacements++;
+                } else if (instruction instanceof FieldInsnNode fieldInsn
+                        && fieldInsn.owner.equals(VAR_HANDLE_MAKER)
+                        && fieldInsn.name.equals("INSTANCE")) {
+                    // VarHandle helpers are unavailable in the browser; make the
+                    // selection return null so guava falls back to the next helper.
+                    method.instructions.set(instruction, new InsnNode(Opcodes.ACONST_NULL));
+                    replacements++;
+                } else if (instruction instanceof MethodInsnNode methodInsn
+                        && methodInsn.owner.equals(VAR_HANDLE_MAKER)) {
+                    // Keep iteration stable: neutralize in place; the preceding
+                    // INSTANCE reference was already replaced by ACONST_NULL.
+                    method.instructions.set(instruction, new InsnNode(Opcodes.NOP));
+                    replacements++;
                 }
             }
         }
-        if (replacements != 2) {
+        if (replacements != 4) {
             throw new IllegalStateException(
-                    "Expected two Unsafe helper references, found " + replacements);
+                    "Expected two Unsafe and two VarHandle maker references, found "
+                            + replacements);
         }
 
         ClassWriter writer = new ClassWriter(0);

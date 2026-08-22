@@ -2,21 +2,57 @@
 
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
+import {existsSync} from "node:fs";
 import {readFile, stat} from "node:fs/promises";
-import {delimiter} from "node:path";
+import {basename, delimiter, join} from "node:path";
 import {fileURLToPath} from "node:url";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
-const patchedJar = fileURLToPath(
-  new URL("../work/overlays/client-named-26.2-gaius.jar", import.meta.url),
+const nativePath = (value) => {
+  if (!value) return value;
+  const text = String(value);
+  return process.platform === "win32" && /^\/[A-Za-z](?:\/|$)/.test(text)
+    ? `${text[1].toUpperCase()}:${text.slice(2)}` : text;
+};
+const profileIdFromPath = (value) => basename(nativePath(value).replaceAll("\\", "/"))
+  .replace(/\.json$/, "");
+const buildProfileId = process.env.GAIUS_BUILD_ROOT
+  ? profileIdFromPath(process.env.GAIUS_BUILD_ROOT) : "";
+const overlayProfileId = process.env.GAIUS_OVERLAY_DIRECTORY
+  ? profileIdFromPath(process.env.GAIUS_OVERLAY_DIRECTORY) : "";
+const profileId = process.env.GAIUS_MINECRAFT_VERSION
+  || (process.env.GAIUS_VERSION_PROFILE_PATH
+    ? profileIdFromPath(process.env.GAIUS_VERSION_PROFILE_PATH)
+    : (/^\d+(?:\.\d+)+$/.test(buildProfileId) ? buildProfileId
+      : (/^\d+(?:\.\d+)+$/.test(overlayProfileId) ? overlayProfileId : "26.2")));
+if (profileId !== "26.2") {
+  throw new Error(`Minecraft 26.2 link-gap smoke is 26.2-only; got profile ${profileId}`);
+}
+const isolated = Boolean(
+  process.env.GAIUS_OVERLAY_DIRECTORY
+  || process.env.GAIUS_BUILD_ROOT
+  || process.env.GAIUS_VERSION_PROFILE_PATH,
 );
-const runtimeClasses = fileURLToPath(new URL("../target/maven/classes", import.meta.url));
+const overlayRoot = nativePath(process.env.GAIUS_OVERLAY_DIRECTORY || join(
+  root, "port/work/overlays", isolated ? profileId : "",
+));
+const buildRoot = nativePath(process.env.GAIUS_BUILD_ROOT || join(
+  root, "port/target", isolated ? profileId : "",
+));
+const patchedJar = join(overlayRoot, "client-named-26.2-gaius.jar");
+const runtimeClasses = join(buildRoot, "maven/classes");
 const targetingSourcePath = fileURLToPath(
   new URL("../src/main/java/dev/gaius/browser/BrowserTargeting.java", import.meta.url),
 );
-const targetingClassPath = fileURLToPath(
-  new URL("../target/maven/classes/dev/gaius/browser/BrowserTargeting.class", import.meta.url),
-);
+const targetingClassPath = join(runtimeClasses, "dev/gaius/browser/BrowserTargeting.class");
+function javaTool(name) {
+  for (const home of [process.env.GAIUS_JAVA_HOME, process.env.JAVA_HOME]
+    .filter(Boolean).map(nativePath)) {
+    const candidate = join(home, "bin", name);
+    if (existsSync(candidate) || existsSync(`${candidate}.exe`)) return candidate;
+  }
+  return name;
+}
 const clientPatcher = await readFile(
   new URL("../tools/src/main/java/dev/gaius/tools/MinecraftClientPatcher.java", import.meta.url),
   "utf8",
@@ -60,6 +96,32 @@ for (const contract of [
 ]) {
   assert.ok(versionPatcher.includes(contract), "missing 26.2 patch contract: " + contract);
 }
+assert.ok(versionPatcher.includes("requireNoServerWorkTurnReset"),
+  "26.2 task patcher does not guard the shared server-work clock from per-task resets");
+for (const contract of [
+  '"beginTaskWork",\n                "()I"',
+  '"endTaskWork",\n                "(I)V"',
+]) {
+  assert.ok(versionPatcher.includes(contract),
+    `missing 26.2 task-scope token contract: ${contract}`);
+}
+assert.ok(versionPatcher.includes(
+  'writeComputeFrames(node, root.resolve(owner + ".class"))',
+), "26.2 task patcher does not recompute frames after task-scope instrumentation");
+for (const contract of [
+  "browserWorldgenBeginServerWorkTurn()",
+  "method.instructions.insertBefore(instruction, browserWorldgenBeginServerWorkTurn())",
+  "method.instructions.insert(instruction, browserWorldgenCheckpoint())",
+  "browserWorldgenBeginTaskWork()",
+  "browserWorldgenEndTaskWork()",
+  "instrumentBrowserTaskScope(",
+  '"MinecraftServer.pollTask"',
+  '"beginTaskWork",\n                "()I"',
+  '"endTaskWork",\n                "(I)V"',
+]) {
+  assert.ok(clientPatcher.includes(contract),
+    "missing server tick scheduler boundary contract: " + contract);
+}
 assert.ok(jdkCompat.includes("public static Path resolve(Path root, String first, String... more)"),
   "BrowserJdkCompat does not expose the sequential Path.resolve adapter");
 assert.ok(jdkCompat.includes("resolved = resolved.resolve(segment)"),
@@ -67,8 +129,8 @@ assert.ok(jdkCompat.includes("resolved = resolved.resolve(segment)"),
 
 function javap(className) {
   return execFileSync(
-    "javap",
-    ["-classpath", `${patchedJar}${delimiter}${runtimeClasses}`, "-p", "-c", className],
+    javaTool("javap"),
+    ["-classpath", [patchedJar, runtimeClasses].join(delimiter), "-p", "-c", className],
     {
     cwd: root,
     encoding: "utf8",
@@ -81,7 +143,7 @@ function methodBody(output, signature) {
   assert.ok(start >= 0, `javap output is missing ${signature}`);
   const remaining = output.slice(start + signature.length);
   const nextMethod = remaining.search(
-    /\n  (?:public|protected|private) [^\n]+\);\n/,
+    /\r?\n  (?:public|protected|private) [^\r\n]+\);/,
   );
   return nextMethod >= 0
     ? output.slice(start, start + signature.length + nextMethod)
@@ -203,6 +265,14 @@ const canLoadWithoutGeneration = methodBody(
 );
 assert.equal(runUntilWait.match(/BrowserWorldgenScheduler\.pulse/g)?.length, 1,
   "runUntilWait must pulse exactly once per immediately-completed layer");
+assert.equal(runUntilWait.match(/BrowserWorldgenScheduler\.beginServerWorkTurn/g)?.length ?? 0, 0,
+  "runUntilWait must not reset the shared tick budget per task invocation");
+assert.equal(runUntilWait.match(/BrowserWorldgenScheduler\.beginTaskWork/g)?.length ?? 0, 1,
+  "runUntilWait must enter one active-work task scope");
+assert.ok((runUntilWait.match(/BrowserWorldgenScheduler\.endTaskWork/g)?.length ?? 0) >= 3,
+  "runUntilWait must close its scope on returns and exceptions");
+assert.match(runUntilWait, /Exception table:[\s\S]*Throwable/,
+  "runUntilWait task scope has no catch-all exception cleanup");
 assert.ok(runUntilWait.indexOf("scheduleNextLayer")
     < runUntilWait.indexOf("BrowserWorldgenScheduler.pulse"),
 "runUntilWait pulses before making layer progress");
@@ -218,6 +288,23 @@ for (const body of [runUntilWait, scheduleLayer, canLoadWithoutGeneration]) {
   assert.ok(!body.includes("java/util/concurrent/Executor"),
     "chunk generation moved server-state progress to another executor");
 }
+
+const minecraftServer = javap("net.minecraft.server.MinecraftServer");
+const runServer = methodBody(minecraftServer, "protected void runServer();");
+const tickStart = runServer.indexOf("BrowserWorldgenScheduler.beginServerWorkTurn");
+const processTick = runServer.indexOf("processPacketsAndTick");
+const tickCheckpoint = runServer.indexOf("BrowserWorldgenScheduler.checkpoint");
+assert.equal(runServer.match(/BrowserWorldgenScheduler\.beginServerWorkTurn/g)?.length ?? 0, 1,
+  "runServer must reset the scheduler clock exactly once per tick");
+assert.equal(runServer.match(/BrowserWorldgenScheduler\.checkpoint/g)?.length ?? 0, 1,
+  "runServer must checkpoint exactly once per tick");
+assert.ok(tickStart >= 0 && processTick > tickStart && tickCheckpoint > processTick,
+  "server tick must reset before processPacketsAndTick and checkpoint after it");
+const pollTask = methodBody(minecraftServer, "protected boolean pollTask()");
+assert.equal(pollTask.match(/BrowserWorldgenScheduler\.beginTaskWork/g)?.length ?? 0, 1,
+  "MinecraftServer.pollTask must enter one active-work task scope");
+assert.ok((pollTask.match(/BrowserWorldgenScheduler\.endTaskWork/g)?.length ?? 0) >= 2,
+  "MinecraftServer.pollTask must close its scope on returns and exceptions");
 
 const regionFileStorage = javap(
   "net.minecraft.world.level.chunk.storage.RegionFileStorage",

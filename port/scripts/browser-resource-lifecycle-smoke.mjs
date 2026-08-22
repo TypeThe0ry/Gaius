@@ -196,6 +196,9 @@ assert.match(source,
   /return \(access & MAP_WRITE_BIT\) != 0\s*&& \(access & MAP_FLUSH_EXPLICIT_BIT\) == 0;/);
 assert.equal(source.match(/if \(mapped\.uploadOnUnmap\(\)\)/g)?.length, 2,
   "target and named mapped buffers do not share explicit-flush ownership");
+assert.match(source,
+  /ByteBuffer slice = copy\.slice\(\)\.order\(buffer\.order\(\)\);\s*return Int8Array\.fromJavaBuffer\(slice\);/s,
+  "mapped-buffer sub-range uploads must export a true sliced ByteBuffer view");
 assert.match(source, /stats\.mappedBufferRegions=count\|0;/);
 
 console.log("Browser resource lifecycle smoke passed");
@@ -209,4 +212,5 @@ console.log(JSON.stringify({
   physicalProgramUnbinds: calls.unbindProgram,
   registriesAtBaseline: true,
   mappedRegionGuardsVerified: true,
+  mappedSubrangeViewVerified: true,
 }, null, 2));

@@ -22,3 +22,6 @@ port/web/dist/** filter=lfs diff=lfs merge=lfs -text
 port/web/smoke/platform-smoke*.js filter=lfs diff=lfs merge=lfs -text
 port/web/smoke/platform-smoke*.js.map filter=lfs diff=lfs merge=lfs -text
 port/web/smoke/platform-smoke*.js.teavmdbg filter=lfs diff=lfs merge=lfs -text
+port/web/smoke/**/platform-smoke*.js filter=lfs diff=lfs merge=lfs -text
+port/web/smoke/**/platform-smoke*.js.map filter=lfs diff=lfs merge=lfs -text
+port/web/smoke/**/platform-smoke*.js.teavmdbg filter=lfs diff=lfs merge=lfs -text

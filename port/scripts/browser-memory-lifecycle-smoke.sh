@@ -5,11 +5,12 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$ROOT/port/scripts/version-profile.sh"
 gaius_load_version_profile "$ROOT"
 gaius_select_java_home
+overlay_directory="$(gaius_overlay_directory "$ROOT")"
 
 MEMORY_SOURCE="$ROOT/port/overrides/libraries/lwjgl/src/main/java/org/lwjgl/system/BrowserMemory.java"
-MEMORY_JAR="$(find "$ROOT/port/work/overlays/libraries/org/lwjgl/lwjgl" \
+MEMORY_JAR="$(find "$overlay_directory/libraries/org/lwjgl/lwjgl" \
     -type f -name 'lwjgl-*-unsafe.jar' -print | sort | tail -1)"
-JOML_JAR="$(find "$ROOT/port/work/overlays/libraries/org/joml/joml" \
+JOML_JAR="$(find "$overlay_directory/libraries/org/joml/joml" \
     -type f -name 'joml-*.jar' -print | sort | tail -1)"
 TEAVM_JSO_JAR="$(find "$HOME/.m2/repository/org/teavm/teavm-jso" \
     -type f -name 'teavm-jso-*.jar' ! -name '*-sources.jar' ! -name '*-javadoc.jar' \

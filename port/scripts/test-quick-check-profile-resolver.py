@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import copy
 import importlib.util
 import json
 import os
@@ -16,6 +18,24 @@ if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"cannot import {SCRIPT}")
 QUICK_CHECK = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(QUICK_CHECK)
+
+
+@contextlib.contextmanager
+def hermetic_gaius_environment():
+    """Run fixture code without inheriting profile-selection overrides."""
+    fixture_env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GAIUS_")
+    }
+    saved_env = dict(os.environ)
+    try:
+        os.environ.clear()
+        os.environ.update(fixture_env)
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_env)
 
 
 def require(condition: bool, message: str) -> None:
@@ -116,7 +136,126 @@ def set_active_profile(root: Path, version: str) -> None:
     )
 
 
+def check_profile_scoped_defaults() -> None:
+    keys = ("GAIUS_BUILD_ROOT", "GAIUS_VERSION_PROFILE_PATH")
+    saved = {key: os.environ.get(key) for key in keys}
+    try:
+        for key in keys:
+            os.environ.pop(key, None)
+        base = QUICK_CHECK.PORT / "target"
+        require(
+            QUICK_CHECK._profile_scoped_default(base, "1.21.11") == base,
+            "legacy quick-check target default unexpectedly became profile-scoped",
+        )
+
+        os.environ["GAIUS_VERSION_PROFILE_PATH"] = "versions/1.21.11.json"
+        require(
+            QUICK_CHECK._profile_scoped_default(base, "1.21.11") == base / "1.21.11",
+            "GAIUS_VERSION_PROFILE_PATH did not select a profile-scoped target",
+        )
+
+        os.environ.pop("GAIUS_VERSION_PROFILE_PATH")
+        os.environ["GAIUS_BUILD_ROOT"] = "port/target/1.21.11"
+        require(
+            QUICK_CHECK._profile_scoped_default(base, "1.21.11") == base / "1.21.11",
+            "GAIUS_BUILD_ROOT did not select a profile-scoped target",
+        )
+
+        if os.name == "nt":
+            msys_path = QUICK_CHECK._configured_path(
+                "/c/gaius-profile-target",
+                base,
+            )
+            require(
+                msys_path == Path("C:/gaius-profile-target").resolve(),
+                "Git-Bash /c/... path was not converted to a native Windows path",
+            )
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def check_manifest_top_level_identity() -> None:
+    storage = {
+        "schema": 2,
+        "databaseName": "gaius-fs-v2-26.2",
+        "prefix": "gaius.fs.v2:26.2:",
+        "opfsDirectory": "regions-v2-26.2",
+    }
+    expected = {
+        "schemaVersion": 2,
+        "profile": {
+            "id": "26.2",
+            "path": "versions/26.2.json",
+            "sha256": "a" * 64,
+            "clientDistribution": "named",
+            "protocolVersion": 776,
+            "worldVersion": 4903,
+            "worldgenTelemetryMode": "task-pulsed",
+            "storage": storage,
+        },
+        "worldVersion": 4903,
+        "worldgenTelemetryMode": "task-pulsed",
+        "storage": storage,
+        "source": {"sha256": "b" * 64},
+        "protocol": {"sha256": "c" * 64},
+        "overlay": {"sha256": "d" * 64},
+        "compatibilitySha256": "e" * 64,
+    }
+    manifest = {
+        "profile": "26.2",
+        "profilePath": "versions/26.2.json",
+        "worldVersion": 4903,
+        "worldgenTelemetryMode": "task-pulsed",
+        "storage": storage,
+        "buildIdentity": copy.deepcopy(expected),
+    }
+    require(
+        QUICK_CHECK.manifest_top_level_identity_matches(manifest, expected),
+        "matching portable top-level identity was rejected",
+    )
+
+    for field, forged in (
+        ("profile", 262),
+        ("profilePath", None),
+        ("worldVersion", "4903"),
+        ("worldgenTelemetryMode", None),
+        ("storage", None),
+    ):
+        candidate = copy.deepcopy(manifest)
+        if forged is None and field == "profilePath":
+            candidate.pop(field)
+        elif forged is None and field in {"worldgenTelemetryMode", "storage"}:
+            candidate.pop(field)
+        else:
+            candidate[field] = forged
+        require(
+            not QUICK_CHECK.manifest_top_level_identity_matches(candidate, expected),
+            f"forged or missing top-level {field} identity was accepted",
+        )
+
+    candidate = copy.deepcopy(manifest)
+    candidate["buildIdentity"]["profile"].pop("worldVersion")
+    require(
+        not QUICK_CHECK.manifest_top_level_identity_matches(candidate, expected),
+        "missing nested profile worldVersion was accepted",
+    )
+
+    candidate = copy.deepcopy(manifest)
+    candidate["buildIdentity"]["storage"]["schema"] = True
+    require(
+        not QUICK_CHECK.manifest_top_level_identity_matches(candidate, expected),
+        "boolean storage schema spoof was accepted as integer 2",
+    )
+
+
+@hermetic_gaius_environment()
 def main() -> None:
+    check_profile_scoped_defaults()
+    check_manifest_top_level_identity()
     current_versions = {
         "lwjgl": "3.4.1",
         "netty": "4.2.15.Final",

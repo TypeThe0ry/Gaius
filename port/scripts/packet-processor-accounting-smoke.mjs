@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
 import {readFile} from "node:fs/promises";
 import {fileURLToPath} from "node:url";
+import path from "node:path";
 
 const scheduler = await readFile(new URL(
   "../src/main/java/dev/gaius/browser/BrowserPacketScheduler.java",
@@ -42,10 +43,43 @@ for (const contract of [
 }
 
 const repository = fileURLToPath(new URL("../..", import.meta.url));
-const patchedClasses = repository + "/port/work/overlays/client-patches";
+const nativePath = (value) => {
+  if (!value) return value;
+  const text = String(value);
+  return process.platform === "win32" && /^\/[A-Za-z](?:\/|$)/.test(text)
+    ? `${text[1].toUpperCase()}:${text.slice(2)}` : text;
+};
+const profileIdFromPath = (value) => path.basename(nativePath(value).replaceAll("\\", "/"))
+  .replace(/\.json$/, "");
+const overlayProfileId = process.env.GAIUS_OVERLAY_DIRECTORY
+  ? profileIdFromPath(process.env.GAIUS_OVERLAY_DIRECTORY) : "";
+const profileId = process.env.GAIUS_MINECRAFT_VERSION
+  || (process.env.GAIUS_VERSION_PROFILE_PATH
+    ? profileIdFromPath(process.env.GAIUS_VERSION_PROFILE_PATH)
+    : (/^\d+(?:\.\d+)+$/.test(overlayProfileId) ? overlayProfileId : "26.2"));
+if (profileId !== "26.2") {
+  throw new Error(`PacketProcessor accounting smoke is 26.2-only; got profile ${profileId}`);
+}
+const overlayRoot = nativePath(process.env.GAIUS_OVERLAY_DIRECTORY ||
+  `${repository}/port/work/overlays${process.env.GAIUS_BUILD_ROOT || process.env.GAIUS_VERSION_PROFILE_PATH ? `/${profileId}` : ""}`);
+const patchedClasses = `${overlayRoot}/client-patches`;
+function javaTool(name) {
+  for (const home of [process.env.GAIUS_JAVA_HOME, process.env.JAVA_HOME]
+    .filter(Boolean).map(nativePath)) {
+    const candidate = path.join(home, "bin", name);
+    try {
+      execFileSync(candidate, ["-version"], {encoding: "utf8", stdio: "ignore"});
+      return candidate;
+    } catch {
+      // Try the next configured JDK, then the process PATH below.
+    }
+  }
+  return name;
+}
+const javap = javaTool("javap");
 let bytecode;
 try {
-  bytecode = execFileSync("javap", [
+  bytecode = execFileSync(javap, [
     "-classpath",
     patchedClasses,
     "-p",
@@ -70,7 +104,7 @@ const processBytecode = bytecode.slice(processStart, closeStart);
 const closeBytecode = bytecode.slice(closeStart);
 
 assert.match(scheduleBytecode,
-  /Queue\.add:[^\n]*\n\s*\d+: dup\n\s*\d+: ifeq[^\n]*\n\s*\d+: invokestatic[^\n]*BrowserPacketScheduler\.packetQueued/,
+  /Queue\.add[\s\S]{0,400}?\n\s*\d+:\s+dup[\s\S]{0,120}?\n\s*\d+:\s+ifeq[\s\S]{0,120}?\n\s*\d+:\s+invokestatic[\s\S]{0,400}?BrowserPacketScheduler\.packetQueued/,
   "packetQueued is not conditional on successful Queue.add");
 assert.equal(
   (processBytecode.match(/BrowserPacketScheduler\.packetProcessed/g) || []).length,

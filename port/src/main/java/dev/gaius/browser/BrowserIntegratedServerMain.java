@@ -834,6 +834,32 @@ public final class BrowserIntegratedServerMain {
               const originalFiles = root.__gaiusPersistentFiles;
               const worldId = String(root.__gaiusServerWorldId || '');
               if (!originalFiles || !worldId || typeof indexedDB === 'undefined') return false;
+              const profileId = String(root.__gaiusProfileId || '').trim();
+              const worldVersion = Number(root.__gaiusWorldVersion);
+              const storageDatabaseName = String(root.__gaiusStorageDatabaseName || '').trim();
+              const storagePrefix = String(root.__gaiusStoragePrefix || '');
+              const storageOpfsDirectory = String(root.__gaiusStorageOpfsDirectory || '').trim();
+              const storageSchema = Number(root.__gaiusStorageSchema);
+              const storageMatchesProfile =
+                (profileId === '1.21.11' && worldVersion === 4671 &&
+                  storageSchema === 2 &&
+                  storageDatabaseName === 'gaius-fs-v2-1.21.11' &&
+                  storagePrefix === 'gaius.fs.v2:1.21.11:' &&
+                  storageOpfsDirectory === 'regions-v2-1.21.11') ||
+                (profileId === '26.2' && worldVersion === 4903 &&
+                  storageSchema === 2 &&
+                  storageDatabaseName === 'gaius-fs-v2-26.2' &&
+                  storagePrefix === 'gaius.fs.v2:26.2:' &&
+                  storageOpfsDirectory === 'regions-v2-26.2');
+              if (!storageMatchesProfile) {
+                Promise.resolve().then(() => {
+                  if (typeof completeIndexedDbFallbackHydration === 'function') {
+                    completeIndexedDbFallbackHydration(false,
+                      'IndexedDB storage configuration does not match profile');
+                  }
+                });
+                return true;
+              }
               const prefix = '/gaius/saves/' + worldId + '/';
               const state = {cancelled: false};
               root.__gaiusIndexedDbFallbackHydrationState = state;
@@ -881,7 +907,7 @@ public final class BrowserIntegratedServerMain {
                 return new Response(stream).arrayBuffer().then(bytes => new Uint8Array(bytes));
               };
               const open = () => new Promise((resolve, reject) => {
-                const request = indexedDB.open('gaius-fs-v1', 1);
+                const request = indexedDB.open(storageDatabaseName, storageSchema);
                 request.onsuccess = () => resolve(request.result);
                 request.onerror = () => reject(request.error || new Error('IndexedDB open failed'));
                 request.onblocked = () => reject(new Error('IndexedDB open blocked'));

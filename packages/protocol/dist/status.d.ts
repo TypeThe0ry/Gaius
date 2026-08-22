@@ -21,7 +21,7 @@ export interface ServerStatus {
     readonly enforcesSecureChat?: boolean;
     readonly [key: string]: unknown;
 }
-export declare function createStatusHandshake(host: string, port?: number, protocolVersion?: 774): Uint8Array;
+export declare function createStatusHandshake(host: string, port?: number, protocol?: number | string | import("./constants.js").MinecraftProtocolProfile | null): Uint8Array;
 export declare function createStatusRequest(): Uint8Array;
 export declare function createPingRequest(timestamp: bigint): Uint8Array;
 export declare function parseStatusResponse(payload: Uint8Array): ServerStatus;

@@ -327,6 +327,64 @@
       "expectedComponent": "worldgen"
     },
     {
+      "name": "runtime-invariants-task-pulsed-missing-progress-is-inconclusive",
+      "worldgenTelemetryMode": "task-pulsed",
+      "omit": [
+        "worldgen.progressSlices",
+        "worldgen.totalProgressPulses"
+      ],
+      "expectedVerdict": "inconclusive",
+      "expectedComponent": "worldgen"
+    },
+    {
+      "name": "runtime-invariants-task-pulsed-zero-progress-does-not-downgrade",
+      "worldgenTelemetryMode": "task-pulsed",
+      "overrides": {
+        "worldgen": {
+          "progressSlices": 0,
+          "totalProgressPulses": 0
+        }
+      },
+      "expectedVerdict": "fail",
+      "expectedComponent": "worldgen"
+    },
+    {
+      "name": "runtime-invariants-checkpoint-only-passes-without-active-slice-fields",
+      "worldgenTelemetryMode": "checkpoint-only",
+      "omit": [
+        "worldgen.maxTurnPulses",
+        "worldgen.minimumBudgetMillis",
+        "worldgen.p99SliceElapsedMillis",
+        "worldgen.maxSliceElapsedMillis",
+        "worldgen.maxBudgetOverrunMillis",
+        "worldgen.progressSlices",
+        "worldgen.totalProgressPulses"
+      ],
+      "expectedVerdict": "pass",
+      "expectedComponent": "worldgen"
+    },
+    {
+      "name": "runtime-invariants-checkpoint-only-missing-yield-is-inconclusive",
+      "worldgenTelemetryMode": "checkpoint-only",
+      "omit": ["worldgen.checkpointOnlyYields"],
+      "expectedVerdict": "inconclusive",
+      "expectedComponent": "worldgen"
+    },
+    {
+      "name": "runtime-invariants-checkpoint-only-generic-telemetry-is-inconclusive",
+      "worldgenTelemetryMode": "checkpoint-only",
+      "omit": [
+        "worldgen.checkpointOnlyMaxNetworkWaitPulses",
+        "worldgen.checkpointOnlyMaxReentrantYieldDepth",
+        "worldgen.checkpointOnlyYields",
+        "worldgen.checkpointOnlyMaxQueueDepth",
+        "worldgen.checkpointOnlyP99YieldDelayMillis",
+        "worldgen.checkpointOnlyMaxYieldDelayMillis"
+      ],
+      "expectedVerdict": "inconclusive",
+      "expectedComponent": "worldgen"
+    },
+    {
       "name": "runtime-invariants-targeting-per-frame-fails",
       "overrides": {
         "targeting": {"maxObservationsPerRenderedFrame": 2}

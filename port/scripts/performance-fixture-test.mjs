@@ -627,14 +627,24 @@ const passingRuntimeSnapshot = {
   },
   worldgen: {
     maxNetworkWaitPulses: 2,
+    checkpointOnlyMaxNetworkWaitPulses: 2,
     maxTurnPulses: 64,
     maxReentrantYieldDepth: 1,
+    checkpointOnlyMaxReentrantYieldDepth: 1,
+    maxQueueDepth: 1,
+    checkpointYields: 12,
+    checkpointOnlyYields: 12,
+    checkpointOnlyMaxQueueDepth: 1,
     minimumBudgetMillis: 2,
     p99SliceElapsedMillis: 14,
     maxSliceElapsedMillis: 50,
     maxBudgetOverrunMillis: 8,
     p99YieldDelayMillis: 16.7,
     maxYieldDelayMillis: 50,
+    checkpointOnlyP99YieldDelayMillis: 16.7,
+    checkpointOnlyMaxYieldDelayMillis: 50,
+    progressSlices: 8,
+    totalProgressPulses: 32,
   },
   workerQueue: {
     pendingTasks: 4,
@@ -673,6 +683,7 @@ for (const testCase of fixtures.runtimeInvariantCases) {
   const result = evaluateRuntimeInvariants({
     contract: contract.runtimeInvariants,
     telemetry,
+    worldgenTelemetryMode: testCase.worldgenTelemetryMode || null,
   });
   assert.equal(result.verdict, testCase.expectedVerdict, `${testCase.name}: verdict`);
   if (testCase.expectedComponent) {
