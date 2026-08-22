@@ -113,6 +113,7 @@ await new Promise((resolve, reject) => {
 const resourcePackFixturePort = resourcePackFixture.address().port;
 
 let fixtureSocket;
+let fixtureTcpBytes = 0;
 let echoEnabled = true;
 let proxiedKeepAlives = 0;
 let proxiedPlayKeepAlives = 0;
@@ -121,6 +122,7 @@ fixture.on("connection", (socket) => {
     fixtureSocket = socket;
     socket.setNoDelay(true);
     socket.on("data", (chunk) => {
+        fixtureTcpBytes += chunk.byteLength;
         if (isVanillaKeepAlive(chunk)) {
             proxiedKeepAlives++;
             return;
@@ -349,13 +351,6 @@ try {
         throw new Error("Translator node health did not report the active tunnel");
     }
 
-    const upload = patternedBuffer(4 * 1024 * 1024, 0x31);
-    webSocket.send(upload);
-    await waitFor(() => echoedBytes === upload.byteLength, "4 MiB tunnel echo");
-    if (!Buffer.concat(echoed, echoedBytes).equals(upload)) {
-        throw new Error("Tunnel echo bytes did not match the upload");
-    }
-
     // Keepalive rewriting is profile-gated. Establish the selected packet
     // table before sending the fixture keepalive; an unprofiled/raw tunnel
     // must never fall back to the 1.21.11 ids.
@@ -374,10 +369,26 @@ try {
     echoed.length = 0;
     echoedBytes = 0;
 
+    const uploadChannel = Buffer.from("minecraft:brand", "utf8");
+    const uploadPayload = Buffer.concat([
+        Buffer.from([uploadChannel.byteLength]),
+        uploadChannel,
+        patternedBuffer(4 * 1024 * 1024 - 1 - uploadChannel.byteLength, 0x31),
+    ]);
+    const upload = encodePacket(
+            minecraftProfile.play.serverboundCustomPayload,
+            uploadPayload);
+    webSocket.send(upload);
+    await waitFor(() => echoedBytes === upload.byteLength, "4 MiB tunnel echo");
+    if (!Buffer.concat(echoed, echoedBytes).equals(upload)) {
+        throw new Error("Tunnel echo bytes did not match the upload");
+    }
+
     const keepAlive = Buffer.from("0a00040000000000000001", "hex");
+    const echoedBeforeKeepAlive = echoedBytes;
     fixtureSocket.write(keepAlive);
     await waitFor(() => proxiedKeepAlives === 1, "proxied vanilla keepalive");
-    if (echoedBytes !== 0) {
+    if (echoedBytes !== echoedBeforeKeepAlive) {
         throw new Error("Translator node forwarded a proxied keepalive to the browser");
     }
 
@@ -504,6 +515,63 @@ function fetchTargetManifest(bridgePort, targetPort, token) {
         headers.authorization = `Bearer ${token}`;
     }
     return fetch(url, {headers});
+}
+
+async function fetchRelayRuntime(bridgePort, token) {
+    const response = await fetch(`http://${host}:${bridgePort}/relay-node/v1`, {
+        headers: {
+            origin,
+            authorization: `Bearer ${token}`,
+        },
+    });
+    if (!response.ok) {
+        throw new Error(`RelayNode runtime manifest returned ${response.status}`);
+    }
+    const manifest = await response.json();
+    return manifest.runtime ?? {};
+}
+
+async function waitForRelayRuntime(bridgePort, token, predicate, label, timeoutMs = 10000) {
+    const deadline = Date.now() + timeoutMs;
+    let runtime;
+    while (Date.now() < deadline) {
+        runtime = await fetchRelayRuntime(bridgePort, token);
+        if (predicate(runtime)) return runtime;
+        await delay(10);
+    }
+    throw new Error(`${label} timed out: ${JSON.stringify(runtime ?? {})}`);
+}
+
+async function waitForFixtureBackpressureDrain(
+        bridgePort,
+        token,
+        baselineBytes,
+        expectedPayloadBytes,
+        baselineSyntheticWrites,
+        syntheticTickBytes,
+        label,
+        timeoutMs = 10000) {
+    const deadline = Date.now() + timeoutMs;
+    let runtime;
+    while (Date.now() < deadline) {
+        runtime = await fetchRelayRuntime(bridgePort, token);
+        const syntheticWrites = Math.max(
+                0,
+                (runtime.syntheticPlayTickWrites ?? 0) - baselineSyntheticWrites);
+        const expectedBytes = expectedPayloadBytes + syntheticWrites * syntheticTickBytes;
+        if ((runtime.pendingSyntheticPlayTicks ?? 0) === 0 &&
+                syntheticWrites > 0 &&
+                fixtureTcpBytes - baselineBytes >= expectedBytes) {
+            return runtime;
+        }
+        await delay(10);
+    }
+    throw new Error(`${label} timed out: ${JSON.stringify({
+        runtime: runtime ?? {},
+        fixtureTcpBytes,
+        baselineBytes,
+        expectedPayloadBytes,
+    })}`);
 }
 
 async function testSharedTargetLifecycle(bridgePort, token) {
@@ -918,6 +986,68 @@ async function testFramedPlayKeepAlive(bridgePort, fixturePort) {
     socket.send(splitClientFrames.subarray(0, 4));
     socket.send(splitClientFrames.subarray(4));
     await waitFor(() => proxiedPlayTicks >= 1, "synthetic initial play tick");
+    // Pause the backend reader and fill RelayNode's TCP write queue with one
+    // legal, bounded PLAY custom-payload frame. This makes write() return
+    // false deterministically instead of relying on a timing-only pause.
+    const backpressureBefore = await fetchRelayRuntime(bridgePort, bridgeToken);
+    const customChannel = Buffer.from("minecraft:brand", "utf8");
+    const largePayloadBytes = 4 * 1024 * 1024;
+    const largeCustomPayload = Buffer.concat([
+        Buffer.from([customChannel.byteLength]),
+        customChannel,
+        Buffer.alloc(largePayloadBytes - 1 - customChannel.byteLength, 0x5a),
+    ]);
+    const largeClientFrame = encodePacket(
+            minecraftProfile.play.serverboundCustomPayload,
+            largeCustomPayload);
+    const largeClientBurst = Buffer.concat([
+        largeClientFrame,
+        largeClientFrame,
+        largeClientFrame,
+    ]);
+    const fixtureBytesBeforeBackpressure = fixtureTcpBytes;
+    const syntheticWritesBeforeBackpressure =
+        backpressureBefore.syntheticPlayTickWrites ?? 0;
+    const syntheticTickFrame = encodePacket(
+            minecraftProfile.play.serverboundClientTickEnd,
+            Buffer.alloc(0),
+            256);
+    fixtureSocket.pause();
+    echoEnabled = false;
+    try {
+        for (let index = 0; index < 8; index++) {
+            socket.send(largeClientBurst);
+        }
+        await waitForRelayRuntime(
+                bridgePort,
+                bridgeToken,
+                (runtime) =>
+                    (runtime.syntheticPlayTickBackpressureEvents ?? 0) >
+                        (backpressureBefore.syntheticPlayTickBackpressureEvents ?? 0) &&
+                    (runtime.pendingSyntheticPlayTicks ?? 0) === 1 &&
+                    (runtime.maxPendingSyntheticPlayTicks ?? 0) <= 1,
+                "deterministic synthetic PLAY tick backpressure",
+        );
+    }
+    finally {
+        fixtureSocket.resume();
+    }
+    const drainedRuntime = await waitForFixtureBackpressureDrain(
+            bridgePort,
+            bridgeToken,
+            fixtureBytesBeforeBackpressure,
+            largeClientBurst.byteLength * 8,
+            syntheticWritesBeforeBackpressure,
+            syntheticTickFrame.byteLength,
+            "synthetic PLAY tick drain",
+    );
+    if ((drainedRuntime.syntheticPlayTickWrites ?? 0) <= syntheticWritesBeforeBackpressure) {
+        throw new Error("Synthetic PLAY tick backpressure drained without a retry write");
+    }
+    // Do not re-enable fixture echo until every queued large frame and the
+    // drain-triggered synthetic tick have reached the fixture reader. Otherwise
+    // trailing probe bytes can be echoed back into the framed client parser.
+    echoEnabled = true;
     socket.send(encodePacket(
             minecraftProfile.play.serverboundClientTickEnd,
             Buffer.alloc(0),
@@ -982,6 +1112,13 @@ async function testFramedPlayKeepAlive(bridgePort, fixturePort) {
     await once(socket, "close");
     fixtureSocket.destroy();
     fixtureSocket = undefined;
+    await waitForRelayRuntime(
+            bridgePort,
+            bridgeToken,
+            (runtime) => (runtime.activeClientStallTimers ?? 0) === 0 &&
+                (runtime.pendingSyntheticPlayTicks ?? 0) === 0,
+            "closed PLAY stall state",
+    );
 }
 
 function configurationKeepAliveFrame(profile, value) {
@@ -1476,79 +1613,146 @@ function minecraftServerHash(serverId, secret, publicKey) {
 
 async function testLocalTunnelPair(bridgePort, token) {
     const sessionId = "0123456789abcdef0123456789abcdef";
-    const client = new WebSocket(`ws://${host}:${bridgePort}/tunnel`, {
-        headers: { origin },
-    });
-    const server = new WebSocket(`ws://${host}:${bridgePort}/tunnel`, {
-        headers: { origin },
-    });
-    await Promise.all([once(client, "open"), once(server, "open")]);
+    const openPair = async () => {
+        const client = new WebSocket(`ws://${host}:${bridgePort}/tunnel`, {
+            headers: { origin },
+        });
+        const server = new WebSocket(`ws://${host}:${bridgePort}/tunnel`, {
+            headers: { origin },
+        });
+        await Promise.all([once(client, "open"), once(server, "open")]);
+        const clientControls = [];
+        const serverControls = [];
+        const clientFrames = [];
+        const serverFrames = [];
+        let clientBytes = 0;
+        let serverBytes = 0;
+        client.on("message", (data, binary) => {
+            if (binary) {
+                const bytes = Buffer.from(data);
+                clientFrames.push(bytes);
+                clientBytes += bytes.byteLength;
+            }
+            else {
+                clientControls.push(JSON.parse(data.toString("utf8")));
+            }
+        });
+        server.on("message", (data, binary) => {
+            if (binary) {
+                const bytes = Buffer.from(data);
+                serverFrames.push(bytes);
+                serverBytes += bytes.byteLength;
+            }
+            else {
+                serverControls.push(JSON.parse(data.toString("utf8")));
+            }
+        });
+        client.send(JSON.stringify({
+            type: "connect",
+            host: `client-${sessionId}.gaius-local`,
+            port: 25565,
+            token,
+        }));
+        server.send(JSON.stringify({
+            type: "connect",
+            host: `server-${sessionId}.gaius-local`,
+            port: 25565,
+            token,
+        }));
+        await waitFor(
+                () => clientControls.some((message) => message.type === "connected") &&
+                    serverControls.some((message) => message.type === "connected"),
+                "paired local server tunnel");
+        return {
+            client,
+            server,
+            clientFrames,
+            serverFrames,
+            get clientBytes() { return clientBytes; },
+            get serverBytes() { return serverBytes; },
+        };
+    };
 
-    const clientControls = [];
-    const serverControls = [];
-    const clientFrames = [];
-    const serverFrames = [];
-    let clientBytes = 0;
-    let serverBytes = 0;
-    client.on("message", (data, binary) => {
-        if (binary) {
-            const bytes = Buffer.from(data);
-            clientFrames.push(bytes);
-            clientBytes += bytes.byteLength;
-        }
-        else {
-            clientControls.push(JSON.parse(data.toString("utf8")));
-        }
-    });
-    server.on("message", (data, binary) => {
-        if (binary) {
-            const bytes = Buffer.from(data);
-            serverFrames.push(bytes);
-            serverBytes += bytes.byteLength;
-        }
-        else {
-            serverControls.push(JSON.parse(data.toString("utf8")));
-        }
-    });
-
-    client.send(JSON.stringify({
-        type: "connect",
-        host: `client-${sessionId}.gaius-local`,
-        port: 25565,
-        token,
-    }));
-    server.send(JSON.stringify({
-        type: "connect",
-        host: `server-${sessionId}.gaius-local`,
-        port: 25565,
-        token,
-    }));
-    await waitFor(
-            () => clientControls.some((message) => message.type === "connected") &&
-                serverControls.some((message) => message.type === "connected"),
-            "paired local server tunnel");
+    const firstPair = await openPair();
+    await waitForLocalTunnelSessions(bridgePort, token, 1,
+            "one active local tunnel session after pairing");
 
     const clientPayload = patternedBuffer(2 * 1024 * 1024, 0x53);
-    client.send(clientPayload);
-    await waitFor(() => serverBytes === clientPayload.byteLength, "local client-to-server payload");
-    if (!Buffer.concat(serverFrames, serverBytes).equals(clientPayload)) {
+    firstPair.client.send(clientPayload);
+    await waitFor(() => firstPair.serverBytes === clientPayload.byteLength,
+            "local client-to-server payload");
+    if (!Buffer.concat(firstPair.serverFrames).equals(clientPayload)) {
         throw new Error("Local client-to-server bytes did not match");
     }
 
     const serverPayload = patternedBuffer(2 * 1024 * 1024, 0x71);
-    server.send(serverPayload);
-    await waitFor(() => clientBytes === serverPayload.byteLength, "local server-to-client payload");
-    if (!Buffer.concat(clientFrames, clientBytes).equals(serverPayload)) {
+    firstPair.server.send(serverPayload);
+    await waitFor(() => firstPair.clientBytes === serverPayload.byteLength,
+            "local server-to-client payload");
+    if (!Buffer.concat(firstPair.clientFrames).equals(serverPayload)) {
         throw new Error("Local server-to-client bytes did not match");
     }
 
-    client.close();
-    await Promise.all([once(client, "close"), once(server, "close")]);
+    firstPair.client.close();
+    await Promise.all([once(firstPair.client, "close"), once(firstPair.server, "close")]);
+    await waitForLocalTunnelSessions(bridgePort, token, 0,
+            "local tunnel session cleanup after peer close");
+
+    // Reuse the exact same session id after both sides closed. The old
+    // implementation cleared only the initiating role and left a closed peer
+    // in the map, so this pair was rejected as a duplicate and leaked state.
+    const reconnectPair = await openPair();
+    await waitForLocalTunnelSessions(bridgePort, token, 1,
+            "one active local tunnel session after same-session reconnect");
+    const reconnectClientPayload = Buffer.from("same-session-reconnect-client", "utf8");
+    const reconnectServerPayload = Buffer.from("same-session-reconnect-server", "utf8");
+    reconnectPair.client.send(reconnectClientPayload);
+    await waitFor(() => reconnectPair.serverBytes === reconnectClientPayload.byteLength,
+            "same-session reconnect client-to-server payload");
+    if (!Buffer.concat(reconnectPair.serverFrames).equals(reconnectClientPayload)) {
+        throw new Error("Same-session reconnect client-to-server bytes did not match");
+    }
+    reconnectPair.server.send(reconnectServerPayload);
+    await waitFor(() => reconnectPair.clientBytes === reconnectServerPayload.byteLength,
+            "same-session reconnect server-to-client payload");
+    if (!Buffer.concat(reconnectPair.clientFrames).equals(reconnectServerPayload)) {
+        throw new Error("Same-session reconnect server-to-client bytes did not match");
+    }
+    reconnectPair.server.close();
+    await Promise.all([once(reconnectPair.server, "close"), once(reconnectPair.client, "close")]);
+    const finalRuntime = await waitForLocalTunnelSessions(bridgePort, token, 0,
+            "final local tunnel session cleanup");
     return {
         paired: true,
-        clientToServerBytes: serverBytes,
-        serverToClientBytes: clientBytes,
+        clientToServerBytes: firstPair.serverBytes,
+        serverToClientBytes: firstPair.clientBytes,
+        sameSessionReconnect: true,
+        reconnectClientToServerBytes: reconnectPair.serverBytes,
+        reconnectServerToClientBytes: reconnectPair.clientBytes,
+        activeLocalTunnelSessions: finalRuntime.activeLocalTunnelSessions,
     };
+}
+
+async function waitForLocalTunnelSessions(bridgePort, token, expected, label) {
+    const deadline = Date.now() + 10000;
+    let lastRuntime;
+    while (Date.now() < deadline) {
+        const response = await fetch(`http://${host}:${bridgePort}/relay-node/v1`, {
+            headers: {
+                origin,
+                authorization: `Bearer ${token}`,
+            },
+        });
+        if (!response.ok) {
+            throw new Error(`RelayNode runtime manifest returned ${response.status} while waiting for ${label}`);
+        }
+        lastRuntime = (await response.json()).runtime;
+        if (lastRuntime?.activeLocalTunnelSessions === expected) {
+            return lastRuntime;
+        }
+        await delay(10);
+    }
+    throw new Error(`Timed out waiting for ${label}: ${JSON.stringify(lastRuntime)}`);
 }
 
 function encodePacket(id, payload, compressionThreshold) {
