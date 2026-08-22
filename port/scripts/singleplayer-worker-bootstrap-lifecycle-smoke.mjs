@@ -36,6 +36,13 @@ globalThis.close = () => parentPort.postMessage({type: "harness-close"});
 globalThis.importScripts = () => {};
 globalThis.main = () => {};
 globalThis.__gaiusStartIntegratedServerPump = () => {};
+globalThis.setIntegratedServerDistances = (viewDistance, simulationDistance) => {
+  parentPort.postMessage({
+    type: "test-distances-applied",
+    viewDistance,
+    simulationDistance,
+  });
+};
 let runtimeStopped = false;
 if (!testConfig.missingStopIntegratedServer) {
   globalThis.stopIntegratedServer = () => {
@@ -332,6 +339,14 @@ worker.postMessage({type: "attach-port", sessionId, port: activeChannel.port1},
 await waitFor("port-attached");
 await waitFor("runtime-ready");
 
+worker.postMessage({type: "distances", renderDistance: 5, simulationDistance: 3});
+const activeDistanceApply = await waitFor("test-distances-applied");
+assert.deepEqual({...activeDistanceApply}, {
+  type: "test-distances-applied",
+  viewDistance: 5,
+  simulationDistance: 3,
+}, "active Worker rejected a distance update");
+
 worker.postMessage({type: "telemetry-ping", sessionId, sequence: 17, measurementId: "measurement-a"});
 const telemetryPong = await waitForTelemetry(17);
 assert.equal(telemetryPong.sequence, 17, "heartbeat sequence was not preserved");
@@ -450,6 +465,7 @@ assert.deepEqual(duplicateMessages, [{type: "close"}],
   "duplicate start leaked its transferred MessagePort");
 
 worker.postMessage({type: "stop"});
+worker.postMessage({type: "distances", renderDistance: 6, simulationDistance: 4});
 await waitFor("stopped");
 await waitFor("harness-close");
 await new Promise((resolve) => setTimeout(resolve, 10));
@@ -460,6 +476,8 @@ assert.ok(
 );
 assert.deepEqual(activeMessages, [{type: "close"}],
   "Worker stop did not close the active local session port");
+assert.equal(events.filter((message) => message?.type === "test-distances-applied").length, 1,
+  "Worker applied a queued distance update after stop was requested");
 assertNoWorkerErrors(events, "clean lifecycle emitted test-worker-error");
 
 await worker.terminate();

@@ -814,6 +814,10 @@ function handleControlMessage(event) {
     return;
   }
   if (message.type === "distances") {
+    // A queued client preference update must not revive distance work after
+    // shutdown has started. PlayerList setters rebroadcast and walk every
+    // ServerLevel, so even a late no-op message is expensive in this Worker.
+    if (stopRequested || stopping) return;
     root.__gaiusServerViewDistance = clampDistance(message.renderDistance, 6);
     root.__gaiusServerSimulationDistance = clampDistance(message.simulationDistance, 4);
     if (typeof setIntegratedServerDistances === "function") {

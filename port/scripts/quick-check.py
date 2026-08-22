@@ -3709,8 +3709,10 @@ def check_source_patches() -> None:
         ),
         (
             "Browser bridge tracks PLAY and reversible reconfiguration across framed streams",
-            "let clientFrameBuffer = Buffer.alloc(0)" in bridge_main
-            and "Buffer.concat([clientFrameBuffer, clientData])" in bridge_main
+            "import { MinecraftFrameAccumulator }" in bridge_main
+            and "const clientFrameBuffer = new MinecraftFrameAccumulator(config.maximumFrameBytes)"
+            in bridge_main
+            and "appendClientFrameBuffer(frameClientData)" in bridge_main
             and "while (clientFrameBuffer.byteLength > 0)" in bridge_main
             and 'let protocolPhase = "login"' in bridge_main
             and "minecraftProfile.play.clientboundStartConfiguration" in bridge_main
@@ -3993,6 +3995,7 @@ def check_source_patches() -> None:
             and "appliedDistancePlayerList" in browser_integrated_server_main
             and "appliedViewDistance != view" in browser_integrated_server_main
             and "appliedSimulationDistance != simulation" in browser_integrated_server_main
+            and "current != null && !serverThreadExited" in browser_integrated_server_main
             and "public static void configurePlayerList" in browser_integrated_server_main
             and "setAllowCommandsForAllPlayers(true)" in browser_integrated_server_main
             and "DedicatedServer player list configuration point was not found" in client_patcher
@@ -4018,6 +4021,7 @@ def check_source_patches() -> None:
             and '"recordChunkBatchSent"' in client_patcher
             and '"handleChunkBatchReceived"' in client_patcher
             and 'message.type === "distances"' in server_worker_bootstrap
+            and "if (stopRequested || stopping) return;" in server_worker_bootstrap
             and "__gaiusServerViewDistance" in server_worker_bootstrap
             and "__gaiusServerSimulationDistance" in server_worker_bootstrap
             and "__gaiusServerSeed" in server_worker_bootstrap
@@ -4644,7 +4648,10 @@ def check_source_patches() -> None:
         ),
         (
             "Bridge smoke verifies flow control and unmodified Minecraft PLAY with chunks",
-            'const upload = patternedBuffer(4 * 1024 * 1024' in bridge_smoke
+            'const uploadPayload = Buffer.concat([' in bridge_smoke
+            and 'patternedBuffer(4 * 1024 * 1024 - 1 - uploadChannel.byteLength'
+            in bridge_smoke
+            and 'const upload = encodePacket(' in bridge_smoke
             and 'const floodLength = 8 * 1024 * 1024' in bridge_smoke
             and '{ type: "flow", paused: true }' in bridge_smoke
             and '{ type: "flow", paused: false }' in bridge_smoke
@@ -8125,9 +8132,13 @@ def check_overlay_bytecode() -> None:
         browser_worldgen_scheduler_class,
         "public static void beginServerWorkTurn();",
     )
-    worldgen_begin_task = method_section(
+    worldgen_begin_task_unlabeled = method_section(
         browser_worldgen_scheduler_class,
         "public static int beginTaskWork();",
+    )
+    worldgen_begin_task = method_section(
+        browser_worldgen_scheduler_class,
+        "public static int beginTaskWork(java.lang.String);",
     )
     worldgen_end_task = method_section(
         browser_worldgen_scheduler_class,
@@ -11341,6 +11352,8 @@ def check_overlay_bytecode() -> None:
             and "Method requestYield:(II)V" in worldgen_pulse
             and "Method nowMillis:()D" in worldgen_begin_server_tick
             and "deadlineMillis" in worldgen_begin_server_tick
+            and "Method beginTaskWork:(Ljava/lang/String;)I"
+                in worldgen_begin_task_unlabeled
             and "Method nowMillis:()D" in worldgen_begin_task
             and "activeWorkStartedAtMillis" in worldgen_begin_task
             and "activeWorkElapsedMillis" in worldgen_end_task

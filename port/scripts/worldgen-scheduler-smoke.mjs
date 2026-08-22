@@ -144,6 +144,7 @@ assert.ok(server.includes("private static PlayerList appliedDistancePlayerList")
     && server.includes("if (appliedViewDistance != view || playerList.getViewDistance() != view)")
     && server.includes("if (appliedSimulationDistance != simulation")
     && server.includes("playerList.getSimulationDistance() != simulation)")
+    && server.includes("current != null && !serverThreadExited")
     && server.includes("distanceApplyTelemetryEnabled()")
     && server.includes("integratedServerDistanceMaxViewApplyMillis")
     && server.includes("integratedServerDistanceMaxSimulationApplyMillis")
@@ -157,7 +158,7 @@ assert.ok(distanceApplyStart >= 0 && distanceApplyEnd > distanceApplyStart
       < distanceApplySource.indexOf("appliedViewDistance = view")
     && distanceApplySource.indexOf("playerList.setSimulationDistance(simulation)")
       < distanceApplySource.indexOf("appliedSimulationDistance = simulation"),
-  "distance setter cache commits before the vanilla setter succeeds");
+  "distance setter cache was committed before the vanilla setter succeeded");
 
 // Behavioural policy model for the source contract above. It covers the four
 // regressions that matter without constructing Minecraft's concrete PlayerList.
@@ -167,7 +168,8 @@ const distanceCache = {
   simulation: Number.MIN_SAFE_INTEGER,
 };
 const distanceCalls = {view: 0, simulation: 0};
-function applyDistanceModel(owner, view, simulation, failSimulation = false) {
+function applyDistanceModel(owner, view, simulation, failSimulation = false, stopped = false) {
+  if (stopped) return;
   if (owner !== distanceCache.owner) {
     distanceCache.owner = owner;
     distanceCache.view = Number.MIN_SAFE_INTEGER;
@@ -202,6 +204,9 @@ const replacementPlayerList = {view: 1, simulation: 2};
 applyDistanceModel(replacementPlayerList, 1, 2);
 assert.deepEqual(distanceCalls, {view: 3, simulation: 4},
   "replacement PlayerList did not invalidate both cached distances");
+applyDistanceModel(replacementPlayerList, 6, 4, false, true);
+assert.deepEqual(distanceCalls, {view: 3, simulation: 4},
+  "stopped server accepted a late distance update");
 assert.ok(!worldgen.includes("setTimeout(") && !worldgen.includes("setInterval("),
   "worldgen scheduler owns a timer that can leak after shutdown");
 assert.ok(worldgen.includes("recordSchedulerMarker(")

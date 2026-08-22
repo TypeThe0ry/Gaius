@@ -179,7 +179,7 @@ public final class BrowserIntegratedServerMain {
 
     private static void applyActiveDistances() {
         MinecraftServer current = server;
-        if (current != null && current.getPlayerList() != null) {
+        if (current != null && !serverThreadExited && current.getPlayerList() != null) {
             PlayerList playerList = current.getPlayerList();
             if (playerList != appliedDistancePlayerList) {
                 appliedDistancePlayerList = playerList;
