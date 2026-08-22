@@ -39,13 +39,42 @@ work="$root/port/work/$version"
 overlay_work="$(gaius_overlay_directory "$root")"
 source_root="$root/port/overrides/classlib/src/main/java"
 classes="$overlay_work/classlib-classes"
-upstream="$HOME/.m2/repository/org/teavm/teavm-classlib/$teavm_version/teavm-classlib-$teavm_version.jar"
-output="$overlay_work/teavm-classlib-$teavm_version-gaius.jar"
+maven_repository="$HOME/.m2/repository"
+asm_version="9.8"
 
-if [[ ! -f "$upstream" ]]; then
-  echo "TeaVM classlib is missing; run ./port/mvnw validate once first" >&2
-  exit 1
-fi
+# A fresh checkout has no generated POM yet, but the overlays must be built
+# before that POM can be generated. Bootstrap the exact compile-time JARs
+# directly so release/CI jobs do not depend on a pre-warmed ~/.m2 cache.
+required_maven_artifacts=(
+  "org.teavm:teavm-classlib:$teavm_version|org/teavm/teavm-classlib/$teavm_version/teavm-classlib-$teavm_version.jar"
+  "org.teavm:teavm-interop:$teavm_version|org/teavm/teavm-interop/$teavm_version/teavm-interop-$teavm_version.jar"
+  "org.teavm:teavm-jso:$teavm_version|org/teavm/teavm-jso/$teavm_version/teavm-jso-$teavm_version.jar"
+  "org.teavm:teavm-jso-apis:$teavm_version|org/teavm/teavm-jso-apis/$teavm_version/teavm-jso-apis-$teavm_version.jar"
+  "org.teavm:teavm-core:$teavm_version|org/teavm/teavm-core/$teavm_version/teavm-core-$teavm_version.jar"
+  "org.teavm:teavm-platform:$teavm_version|org/teavm/teavm-platform/$teavm_version/teavm-platform-$teavm_version.jar"
+  "com.jcraft:jzlib:1.1.3|com/jcraft/jzlib/1.1.3/jzlib-1.1.3.jar"
+  "org.ow2.asm:asm:$asm_version|org/ow2/asm/asm/$asm_version/asm-$asm_version.jar"
+  "org.ow2.asm:asm-tree:$asm_version|org/ow2/asm/asm-tree/$asm_version/asm-tree-$asm_version.jar"
+)
+for artifact_spec in "${required_maven_artifacts[@]}"; do
+  IFS='|' read -r artifact_coordinate artifact_relative_path <<<"$artifact_spec"
+  artifact_path="$maven_repository/$artifact_relative_path"
+  if [[ ! -f "$artifact_path" ]]; then
+    echo "Bootstrapping Maven artifact $artifact_coordinate"
+    "$root/port/mvnw" --batch-mode --no-transfer-progress \
+      "-Dmaven.repo.local=$maven_repository" \
+      org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
+      "-Dartifact=$artifact_coordinate" \
+      -Dtransitive=false
+  fi
+  if [[ ! -f "$artifact_path" ]]; then
+    echo "Maven artifact bootstrap did not produce $artifact_path" >&2
+    exit 1
+  fi
+done
+
+upstream="$maven_repository/org/teavm/teavm-classlib/$teavm_version/teavm-classlib-$teavm_version.jar"
+output="$overlay_work/teavm-classlib-$teavm_version-gaius.jar"
 
 mkdir -p "$classes" "$overlay_work"
 find "$classes" -type f -delete
@@ -79,9 +108,9 @@ fi
 
 classpath="$upstream"
 for artifact in teavm-interop teavm-jso teavm-jso-apis teavm-core teavm-platform; do
-  classpath="$classpath:$HOME/.m2/repository/org/teavm/$artifact/$teavm_version/$artifact-$teavm_version.jar"
+  classpath="$classpath:$maven_repository/org/teavm/$artifact/$teavm_version/$artifact-$teavm_version.jar"
 done
-classpath="$classpath:$HOME/.m2/repository/com/jcraft/jzlib/1.1.3/jzlib-1.1.3.jar"
+classpath="$classpath:$maven_repository/com/jcraft/jzlib/1.1.3/jzlib-1.1.3.jar"
 classpath="$classpath:$(cat "$work/classpath.txt")"
 
 javac --release 21 -proc:none -classpath "$classpath" -d "$classes" "${sources[@]}"
@@ -102,7 +131,7 @@ build_library_overlay() {
   local output_classes="$overlay_work/library-classes/$name"
   local compile_classpath="$source_jar:$work/client-named.jar:$(cat "$work/classpath.txt")"
   for artifact in teavm-interop teavm-jso teavm-jso-apis teavm-platform; do
-    compile_classpath="$compile_classpath:$HOME/.m2/repository/org/teavm/$artifact/$teavm_version/$artifact-$teavm_version.jar"
+    compile_classpath="$compile_classpath:$maven_repository/org/teavm/$artifact/$teavm_version/$artifact-$teavm_version.jar"
   done
   local library_sources=()
 
@@ -183,9 +212,8 @@ text2speech_path="$(gaius_library_path "com.mojang:text2speech")"
 text2speech_output="$overlay_work/libraries/$text2speech_path"
 
 tool_classes="$overlay_work/tool-classes"
-asm_version="9.8"
-asm_jar="$HOME/.m2/repository/org/ow2/asm/asm/$asm_version/asm-$asm_version.jar"
-asm_tree_jar="$HOME/.m2/repository/org/ow2/asm/asm-tree/$asm_version/asm-tree-$asm_version.jar"
+asm_jar="$maven_repository/org/ow2/asm/asm/$asm_version/asm-$asm_version.jar"
+asm_tree_jar="$maven_repository/org/ow2/asm/asm-tree/$asm_version/asm-tree-$asm_version.jar"
 mkdir -p "$tool_classes"
 find "$tool_classes" -type f -delete
 javac --release 21 -proc:none \
@@ -203,7 +231,7 @@ patch_lwjgl_callback_descriptors() {
     "$module_patches"
   jar --update --file "$module_output" -C "$module_patches" .
 }
-teavm_core="$HOME/.m2/repository/org/teavm/teavm-core/$teavm_version/teavm-core-$teavm_version.jar"
+teavm_core="$maven_repository/org/teavm/teavm-core/$teavm_version/teavm-core-$teavm_version.jar"
 teavm_core_output="$overlay_work/teavm-core-$teavm_version-gaius.jar"
 teavm_core_patches="$overlay_work/teavm-core-patches"
 mkdir -p "$teavm_core_patches"
@@ -711,7 +739,7 @@ fi
 echo "Compiling ${#client_override_sources[@]} Minecraft $version browser overrides"
 client_override_classpath="$work/client-named.jar:$(cat "$work/classpath.txt")"
 for artifact in teavm-interop teavm-jso teavm-jso-apis; do
-  client_override_classpath="$client_override_classpath:$HOME/.m2/repository/org/teavm/$artifact/$teavm_version/$artifact-$teavm_version.jar"
+  client_override_classpath="$client_override_classpath:$maven_repository/org/teavm/$artifact/$teavm_version/$artifact-$teavm_version.jar"
 done
 javac --release 21 -proc:none \
   -classpath "$client_override_classpath" \

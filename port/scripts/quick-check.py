@@ -4401,6 +4401,17 @@ def check_source_patches() -> None:
             and "trap release_overlay_lock EXIT" in build_platform_smoke,
         ),
         (
+            "Overlay builds bootstrap exact Maven inputs in a clean checkout",
+            "maven-dependency-plugin:3.8.1:get" in build_overlays
+            and "-Dtransitive=false" in build_overlays
+            and "-Dmaven.repo.local=$maven_repository" in build_overlays
+            and "required_maven_artifacts" in build_overlays
+            and "org.teavm:teavm-classlib:" in build_overlays
+            and "org.teavm:teavm-core:" in build_overlays
+            and "org.ow2.asm:asm-tree:" in build_overlays
+            and "com.jcraft:jzlib:1.1.3" in build_overlays,
+        ),
+        (
             "Dedicated browser server removes unsupported desktop service branches",
             "patchServerMainBrowser" in client_patcher
             and '"createOffline"' in client_patcher
