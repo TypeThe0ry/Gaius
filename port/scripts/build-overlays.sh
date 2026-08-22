@@ -2,18 +2,25 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$root/port/scripts/teavm-publication-gate.sh"
 build_lock="$root/port/work/.build-overlays.lock"
+build_lock_owner=""
+build_lock_owned_here=false
+
+release_build_lock() {
+  local status="$?"
+  trap - EXIT
+  if [[ "$build_lock_owned_here" == true && -n "${build_lock_owner:-}" ]]; then
+    gaius_teavm_lock_release "$build_lock" "$build_lock_owner" || true
+  fi
+  exit "$status"
+}
+trap release_build_lock EXIT
+
 if [[ "${GAIUS_OVERLAY_LOCK_HELD:-false}" != "true" ]]; then
-  while ! mkdir "$build_lock" 2>/dev/null; do
-    lock_pid="$(cat "$build_lock/pid" 2>/dev/null || true)"
-    if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
-      sleep 0.2
-      continue
-    fi
-    rm -rf "$build_lock"
-  done
-  printf '%s\n' "$$" > "$build_lock/pid"
-  trap 'rm -rf "$build_lock"' EXIT
+  gaius_teavm_lock_acquire "$build_lock"
+  build_lock_owner="$GAIUS_TEA_LOCK_OWNER_TOKEN"
+  build_lock_owned_here=true
 else
   lock_pid="$(cat "$build_lock/pid" 2>/dev/null || true)"
   if [[ ! -d "$build_lock" || "$lock_pid" != "$PPID" ]]; then

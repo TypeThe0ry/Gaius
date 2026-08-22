@@ -199,6 +199,18 @@ class PortableArtifactIdentityTest(unittest.TestCase):
         source_bootstrap = root / "port" / "web" / "singleplayer" / "server-worker-bootstrap.js"
         source_bootstrap.parent.mkdir(parents=True)
         source_bootstrap.write_text("self.__gaiusBootstrap = true;\n", encoding="utf-8")
+        source_publication_gate = root / "port" / "scripts" / "teavm-publication-gate.sh"
+        source_publication_gate.parent.mkdir(parents=True, exist_ok=True)
+        source_publication_gate.write_text(
+            "gaius_teavm_publish_allowed() { return 0; }\n",
+            encoding="utf-8",
+        )
+        source_launcher_template = root / "port" / "web" / "launcher" / "index.template.html"
+        source_launcher_template.parent.mkdir(parents=True, exist_ok=True)
+        source_launcher_template.write_text(
+            "<!doctype html><title>Gaius fixture</title>\n",
+            encoding="utf-8",
+        )
         source_file = (
             root
             / "port"
@@ -523,6 +535,30 @@ class PortableArtifactIdentityTest(unittest.TestCase):
                 / "Fixture.java"
             )
             source.write_text("final class Fixture { int changed; }\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "source does not match"):
+                self.run_build(root, dist, output)
+
+    def test_teavm_publication_gate_change_rejects_previous_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, dist, output = self.make_fixture(directory)
+            gate = root / "port" / "scripts" / "teavm-publication-gate.sh"
+            gate.write_text(
+                "gaius_teavm_publish_allowed() { return 1; }\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "source does not match"):
+                self.run_build(root, dist, output)
+
+    def test_launcher_template_change_rejects_previous_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, dist, output = self.make_fixture(directory)
+            template = root / "port" / "web" / "launcher" / "index.template.html"
+            template.write_text(
+                "<!doctype html><title>Changed Gaius fixture</title>\n",
+                encoding="utf-8",
+            )
 
             with self.assertRaisesRegex(RuntimeError, "source does not match"):
                 self.run_build(root, dist, output)

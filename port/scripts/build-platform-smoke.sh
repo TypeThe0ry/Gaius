@@ -3,6 +3,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$root/port/scripts/version-profile.sh"
+source "$root/port/scripts/teavm-publication-gate.sh"
 gaius_load_version_profile "$root"
 gaius_select_java_home
 build_root="$(gaius_build_root "$root")"
@@ -15,19 +16,18 @@ fi
 # Keep the writer lock until TeaVM exits so a concurrent rebuild cannot corrupt
 # an already-open ZipFile.
 overlay_lock="$root/port/work/.build-overlays.lock"
-while ! mkdir "$overlay_lock" 2>/dev/null; do
-  lock_pid="$(cat "$overlay_lock/pid" 2>/dev/null || true)"
-  if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
-    sleep 0.2
-    continue
-  fi
-  rm -rf "$overlay_lock"
-done
-printf '%s\n' "$$" > "$overlay_lock/pid"
+overlay_lock_owner=""
 release_overlay_lock() {
-  rm -rf "$overlay_lock"
+  local status="$?"
+  trap - EXIT
+  if [[ -n "${overlay_lock_owner:-}" ]]; then
+    gaius_teavm_lock_release "$overlay_lock" "$overlay_lock_owner" || true
+  fi
+  exit "$status"
 }
 trap release_overlay_lock EXIT
+gaius_teavm_lock_acquire "$overlay_lock"
+overlay_lock_owner="$GAIUS_TEA_LOCK_OWNER_TOKEN"
 
 if [[ "${GAIUS_SKIP_OVERLAY_BUILD:-false}" != "true" ]]; then
   GAIUS_OVERLAY_DIRECTORY="$overlay_directory" GAIUS_OVERLAY_LOCK_HELD=true "$root/port/scripts/build-overlays.sh" >/dev/null

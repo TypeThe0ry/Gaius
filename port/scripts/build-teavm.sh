@@ -3,6 +3,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$root/port/scripts/version-profile.sh"
+source "$root/port/scripts/teavm-publication-gate.sh"
 gaius_load_version_profile "$root"
 gaius_select_java_home
 version="$GAIUS_MINECRAFT_VERSION"
@@ -13,10 +14,59 @@ if [[ -n "${GAIUS_DIST_DIRECTORY:-}" || -n "${GAIUS_BUILD_ROOT:-}" || -n "${GAIU
 else
   target_directory="${GAIUS_TARGET_DIRECTORY:-$(gaius_dist_directory "$root")}"
 fi
-# The singleplayer launcher is only a redirect; the full dist shell contains
-# the vanilla-pack loader and is the canonical postprocess template.  It is
-# read-only here and copied into a profile-scoped output directory.
-index_template="${GAIUS_INDEX_TEMPLATE:-$root/port/web/dist/index.html}"
+# The singleplayer launcher is only a redirect.  Build each profile from the
+# tracked, version-neutral full shell instead of treating a generated shared
+# dist as source input.
+index_template="${GAIUS_INDEX_TEMPLATE:-$root/port/web/launcher/index.template.html}"
+mkdir -p "$build_root"
+
+# Client and integrated-server builds share the profile's generated POM/log,
+# reports, resource table, dist directory, identities, and compression pass.
+# Serialize those outputs per profile; a different GAIUS_BUILD_ROOT remains
+# independent and can run in parallel.
+output_lock="$build_root/.teavm-output.lock"
+output_lock_owner=""
+output_lock_owned_here=false
+overlay_lock_owner=""
+staging_root=""
+
+cleanup_teavm_client() {
+  local status="$?"
+  trap - EXIT
+  if [[ -n "${staging_root:-}" ]]; then
+    case "$staging_root" in
+      "$build_root"/.teavm-staging/*)
+        rm -rf -- "$staging_root" || true
+        ;;
+      *)
+        echo "Refusing to remove unsafe TeaVM staging path: $staging_root" >&2
+        ;;
+    esac
+  fi
+  if declare -F release_overlay_lock >/dev/null 2>&1; then
+    release_overlay_lock || true
+  fi
+  if [[ "$output_lock_owned_here" == true && -n "${output_lock_owner:-}" ]]; then
+    gaius_teavm_lock_release "$output_lock" "$output_lock_owner" || true
+  fi
+  exit "$status"
+}
+trap cleanup_teavm_client EXIT
+
+if [[ "${GAIUS_TEA_OUTPUT_LOCK_HELD:-false}" == "true" ]]; then
+  output_lock_owner="${GAIUS_TEA_OUTPUT_LOCK_OWNER:-}"
+  gaius_teavm_lock_assert_owner "$output_lock" "$output_lock_owner" \
+    || { echo "GAIUS_TEA_OUTPUT_LOCK_HELD=true without the profile output lock" >&2; exit 1; }
+else
+  gaius_teavm_lock_acquire "$output_lock"
+  output_lock_owner="$GAIUS_TEA_LOCK_OWNER_TOKEN"
+  output_lock_owned_here=true
+fi
+
+staging_root="$build_root/.teavm-staging/client-$output_lock_owner"
+staged_target_directory="$staging_root/dist"
+mkdir -p "$staged_target_directory"
+
 export GAIUS_BUILD_ROOT="$build_root"
 export GAIUS_OVERLAY_DIRECTORY="$overlay_directory"
 export GAIUS_DIST_DIRECTORY="$target_directory"
@@ -31,19 +81,13 @@ export GAIUS_EXCLUDED_LIBRARY_PREFIXES="${GAIUS_EXCLUDED_LIBRARY_PREFIXES:+$GAIU
 # TeaVM keeps dependency JARs open throughout whole-program analysis. Hold the
 # overlay writer lock from before regeneration until every consumer has closed.
 overlay_lock="$root/port/work/.build-overlays.lock"
-while ! mkdir "$overlay_lock" 2>/dev/null; do
-  lock_pid="$(cat "$overlay_lock/pid" 2>/dev/null || true)"
-  if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
-    sleep 0.2
-    continue
-  fi
-  rm -rf "$overlay_lock"
-done
-printf '%s\n' "$$" > "$overlay_lock/pid"
 release_overlay_lock() {
-  rm -rf "$overlay_lock"
+  if [[ -n "${overlay_lock_owner:-}" ]]; then
+    gaius_teavm_lock_release "$overlay_lock" "$overlay_lock_owner"
+  fi
 }
-trap release_overlay_lock EXIT
+gaius_teavm_lock_acquire "$overlay_lock"
+overlay_lock_owner="$GAIUS_TEA_LOCK_OWNER_TOKEN"
 
 if [[ "${GAIUS_SKIP_OVERLAY_BUILD:-false}" != "true" ]]; then
     GAIUS_OVERLAY_DIRECTORY="$overlay_directory" \
@@ -72,7 +116,7 @@ resource_list="$resource_list_dir/minecraft-resources.txt"
 embedded_resource_list="$resource_list_dir/minecraft-embedded-resources.txt"
 generated_resources="$build_root/generated-resources"
 generated_assets="$build_root/generated-resources/assets"
-vanilla_asset_pack="$target_directory/vanilla-assets.pack.gz"
+vanilla_asset_pack="$staged_target_directory/vanilla-assets.pack.gz"
 mkdir -p "$resource_list_dir"
 jar tf "$overlay_directory/client-named-$version-gaius.jar" |
   awk '(index($0, "assets/") == 1 || index($0, "data/") == 1 || $0 == "pack.png") && substr($0, length($0), 1) != "/" { print }' >"$resource_list"
@@ -270,7 +314,7 @@ echo "Generated browser resource list: $(wc -l <"$resource_list" | tr -d ' ') en
 echo "Embedded TeaVM resource subset: $(wc -l <"$embedded_resource_list" | tr -d ' ') entries"
 echo "Mapped browser sound assets: $copied_sound_assets"
 echo "Mapped browser Unicode font assets: $copied_font_assets"
-pom="$(GAIUS_BUILD_ROOT="$build_root" GAIUS_OVERLAY_DIRECTORY="$overlay_directory" GAIUS_TARGET_DIRECTORY="$target_directory" GAIUS_RESOURCE_DIRECTORY="$generated_resources" "$root/port/scripts/generate-pom.sh")"
+pom="$(GAIUS_BUILD_ROOT="$build_root" GAIUS_OVERLAY_DIRECTORY="$overlay_directory" GAIUS_TARGET_DIRECTORY="$staged_target_directory" GAIUS_RESOURCE_DIRECTORY="$generated_resources" "$root/port/scripts/generate-pom.sh")"
 log="$build_root/teavm-build.log"
 
 echo "Compiling the official Minecraft $version client with TeaVM"
@@ -299,43 +343,83 @@ analysis_status="$?"
 set -e
 
 if [[ "$analysis_status" -ne 0 ]]; then
-  echo "TeaVM analysis did not complete; canonical gap report was preserved" >&2
+  echo "TeaVM analysis did not complete; incomplete gap report was preserved" >&2
 fi
 
 if grep -Fq "Error in @JSBody" "$log"; then
   echo "TeaVM emitted invalid @JSBody JavaScript; refusing to publish the client output" >&2
+  if [[ "$build_status" -eq 0 ]]; then
+    build_status=1
+  fi
+fi
+
+teavm_publish_allowed=false
+if gaius_teavm_publish_allowed "$log" "$analysis_status"; then
+  teavm_publish_allowed=true
+elif [[ "$build_status" -eq 0 ]]; then
+  # Preserve a real Maven failure status.  Only a Maven-successful build that
+  # fails this post-build gate is converted to the generic publication error.
   build_status=1
 fi
 
-if [[ "$build_status" -eq 0 ]]; then
-  target_js="$target_directory/${GAIUS_TARGET_FILE:-classes.js}"
-  # An isolated profile target starts empty. Reuse the existing launcher as a
-  # template, then postprocess it with this profile's version and asset index.
-  if [[ ! -f "$target_directory/index.html" ]]; then
-    if [[ ! -f "$index_template" ]]; then
-      echo "Missing index template: $index_template" >&2
-      exit 1
-    fi
-    cp "$index_template" "$target_directory/index.html"
+if [[ "$build_status" -eq 0 && "$teavm_publish_allowed" == true ]]; then
+  staged_target_js="$staged_target_directory/${GAIUS_TARGET_FILE:-classes.js}"
+  final_target_js="$target_directory/${GAIUS_TARGET_FILE:-classes.js}"
+  # All postprocessing and identity generation happens in the job directory.
+  # The previous release is not touched until every validation step succeeds.
+  # Start from the tracked version-neutral launcher, then postprocess it with
+  # this profile's version and asset index.
+  if [[ ! -f "$index_template" ]]; then
+    echo "Missing index template: $index_template" >&2
+    exit 1
   fi
+  if head -n 1 "$index_template" | grep -Fqx \
+      'version https://git-lfs.github.com/spec/v1'; then
+    echo "Index template is an unresolved Git LFS pointer: $index_template" >&2
+    exit 1
+  fi
+  cp "$index_template" "$staged_target_directory/index.html"
+  # Keep index metadata stable for artifacts not produced by this job.  The
+  # release wrapper reruns index postprocess after the Worker build, while a
+  # standalone client build must retain the previous Worker tokens.
+  for preserved_asset in \
+    singleplayer-server.js \
+    singleplayer-server-worker.js; do
+    if [[ -f "$target_directory/$preserved_asset" ]]; then
+      cp "$target_directory/$preserved_asset" "$staged_target_directory/$preserved_asset"
+    fi
+  done
   "$root/port/scripts/run-python.sh" \
-    "$root/port/scripts/postprocess-teavm-js.py" "$target_js"
+    "$root/port/scripts/postprocess-teavm-js.py" "$staged_target_js"
   "$root/port/scripts/run-python.sh" \
     "$root/port/scripts/postprocess-index-html.py" \
-    "$target_directory/index.html" \
-    "$target_js" \
+    "$staged_target_directory/index.html" \
+    "$staged_target_js" \
     "$version" \
     "$asset_index_id"
   "$root/port/scripts/run-python.sh" \
     "$root/port/scripts/gaius_build_identity.py" write \
     --root "$root" \
     --role client \
-    --artifact "$target_js"
+    --artifact "$staged_target_js"
   "$root/port/scripts/run-python.sh" \
     "$root/port/scripts/gaius_build_identity.py" write \
     --root "$root" \
     --role vanilla-assets \
     --artifact "$vanilla_asset_pack"
+
+  # Copy into destination-local temporary files and replace only after all
+  # staged artifacts, postprocess output, and identity records exist.  This
+  # is the publication commit; Maven never writes the final dist file.
+  gaius_teavm_publish_bundle \
+    "$staged_target_js" "$final_target_js" \
+    "${staged_target_js}.build.json" "${final_target_js}.build.json" \
+    "$vanilla_asset_pack" "$target_directory/vanilla-assets.pack.gz" \
+    "${vanilla_asset_pack}.build.json" \
+      "$target_directory/vanilla-assets.pack.gz.build.json" \
+    "$staged_target_directory/index.html" "$target_directory/index.html"
+  gaius_teavm_remove_stale_incomplete_reports \
+    "$build_root/teavm-gap.json" "$build_root/teavm-gap.md"
   if [[ "${GAIUS_SKIP_COMPRESSION:-false}" != "true" ]]; then
     GAIUS_DIST_DIRECTORY="$target_directory" \
       "$root/port/scripts/compress-dist.sh" >/dev/null

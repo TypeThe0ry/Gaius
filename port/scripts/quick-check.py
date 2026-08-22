@@ -114,6 +114,7 @@ PORTABLE_MANIFEST = DIST / "Gaius.manifest.json"
 CLIENT_RELEASE_PROFILE = DIST / "classes.js.release.json"
 WORKER_RELEASE_PROFILE = DIST / "singleplayer-server.js.release.json"
 TEAVM_COMPILER_PROFILE_TOOL = PORT / "scripts" / "teavm-compiler-profile.py"
+TEAVM_COMPILER_PROFILE_TEST = PORT / "scripts" / "test-teavm-compiler-profile.py"
 CLIENT_TEA_POM = TARGET / "generated-pom.xml"
 WORKER_TEA_POM = TARGET / "server-worker" / "generated-pom.xml"
 WORKER_RESOURCE_LIST = (
@@ -253,6 +254,10 @@ GENERATE_WASM_HOTPATH = PORT / "scripts" / "generate-wasm-hotpath.py"
 GENERATE_POM = PORT / "scripts" / "generate-pom.sh"
 BUILD_TEAVM = PORT / "scripts" / "build-teavm.sh"
 BUILD_SERVER_WORKER = PORT / "scripts" / "build-teavm-server-worker.sh"
+TEAVM_PUBLICATION_GATE = PORT / "scripts" / "teavm-publication-gate.sh"
+TEAVM_PUBLICATION_GATE_TEST = PORT / "scripts" / "test-teavm-publication-gate.py"
+INDEX_TEMPLATE = PORT / "web" / "launcher" / "index.template.html"
+INDEX_TEMPLATE_TEST = PORT / "scripts" / "test-index-template.py"
 BUILD_PLATFORM_SMOKE = PORT / "scripts" / "build-platform-smoke.sh"
 FETCH_VERSION = PORT / "scripts" / "fetch-version.sh"
 BUILD_RELEASE = PORT / "scripts" / "build-teavm-release.sh"
@@ -318,10 +323,12 @@ BUILD_IDENTITY_SOURCE_FILES = (
     "port/scripts/generate-pom.sh",
     "port/scripts/build-teavm.sh",
     "port/scripts/build-teavm-server-worker.sh",
+    "port/scripts/teavm-publication-gate.sh",
     "port/scripts/build-teavm-release.sh",
     "port/scripts/build-version-release.sh",
     "port/scripts/postprocess-teavm-js.py",
     "port/scripts/postprocess-index-html.py",
+    "port/web/launcher/index.template.html",
     "port/scripts/build-vanilla-assets-pack.py",
     "port/scripts/build-wasm-hotpath.sh",
     "port/scripts/generate-wasm-hotpath.py",
@@ -2072,6 +2079,22 @@ def check_source_patches() -> None:
     generate_pom = GENERATE_POM.read_text(errors="replace") if GENERATE_POM.exists() else ""
     build_teavm = BUILD_TEAVM.read_text(errors="replace") if BUILD_TEAVM.exists() else ""
     build_server_worker = BUILD_SERVER_WORKER.read_text(errors="replace") if BUILD_SERVER_WORKER.exists() else ""
+    teavm_publication_gate = (
+        TEAVM_PUBLICATION_GATE.read_text(errors="replace")
+        if TEAVM_PUBLICATION_GATE.exists()
+        else ""
+    )
+    teavm_publication_gate_test = (
+        TEAVM_PUBLICATION_GATE_TEST.read_text(errors="replace")
+        if TEAVM_PUBLICATION_GATE_TEST.exists()
+        else ""
+    )
+    index_template = INDEX_TEMPLATE.read_text(errors="replace") if INDEX_TEMPLATE.exists() else ""
+    index_template_test = (
+        INDEX_TEMPLATE_TEST.read_text(errors="replace")
+        if INDEX_TEMPLATE_TEST.exists()
+        else ""
+    )
     build_platform_smoke = (
         BUILD_PLATFORM_SMOKE.read_text(errors="replace")
         if BUILD_PLATFORM_SMOKE.exists()
@@ -2096,6 +2119,11 @@ def check_source_patches() -> None:
     teavm_compiler_profile = (
         TEAVM_COMPILER_PROFILE_TOOL.read_text(errors="replace")
         if TEAVM_COMPILER_PROFILE_TOOL.exists()
+        else ""
+    )
+    teavm_compiler_profile_test = (
+        TEAVM_COMPILER_PROFILE_TEST.read_text(errors="replace")
+        if TEAVM_COMPILER_PROFILE_TEST.exists()
         else ""
     )
     build_portable_html_test = (
@@ -3947,8 +3975,11 @@ def check_source_patches() -> None:
             and "pendingChanges = new Map()" in server_worker_bootstrap
             and "scheduleFlush" in server_worker_bootstrap
             and "writeBatch(changes)" in server_worker_bootstrap
+            and "flushForShutdown" in server_worker_bootstrap
+            and "flushWithWatchdog" in server_worker_bootstrap
+            and '"Persistent storage flush timed out"' in server_worker_bootstrap
             and 'await withTimeout(flushPendingChanges(), 10000, "Persistent storage flush timed out")'
-            in server_worker_bootstrap
+            not in server_worker_bootstrap
             and "resolved.search = location.search" in server_worker_bootstrap
             and "storage-write-error" in server_worker_bootstrap
             and "failLocalSession" in netty_browser_channel
@@ -3956,10 +3987,17 @@ def check_source_patches() -> None:
             and "__gaiusStorageRefresh" in browser_singleplayer_client
             and "workers.delete(sessionId)" in browser_singleplayer_client
             and "ports.delete(sessionId)" in browser_singleplayer_client
-            and "Integrated server did not stop within 20000 ms" in server_worker_bootstrap
+            and 'const detail = "Integrated server did not stop within " +' in server_worker_bootstrap
+            and 'stopWatchdog + " ms"' in server_worker_bootstrap
+            and "Integrated server did not stop within 20000 ms" not in server_worker_bootstrap
             and "Integrated server did not stop within 35 seconds" in browser_singleplayer_client
-            and "beginClientHandoff(sessionId)" in browser_singleplayer_client
-            and "const handoffSession = String(globalThis.__gaiusSingleplayerHandoff || '')"
+            and "beginClientHandoff(sessionId, launchGeneration)" in browser_singleplayer_client
+            and "beginClientHandoff(sessionId)" not in browser_singleplayer_client
+            and "const handoff = globalThis.__gaiusSingleplayerHandoff;"
+            in browser_singleplayer_client
+            and "handoff && typeof handoff === 'object'" in browser_singleplayer_client
+            and "String(handoff.generation || '')" in browser_singleplayer_client
+            and "const handoffSession = handoff && typeof handoff === 'object'"
             in browser_singleplayer_client
             and "singleplayer:handoff-disconnect-ignored" in browser_singleplayer_client
             and "__gaiusHandoffPending" in browser_singleplayer_client
@@ -4358,8 +4396,8 @@ def check_source_patches() -> None:
             and '.build-overlays.lock' in build_teavm
             and '.build-overlays.lock' in build_server_worker
             and '.build-overlays.lock' in build_platform_smoke
-            and "trap release_overlay_lock EXIT" in build_teavm
-            and "trap release_overlay_lock EXIT" in build_server_worker
+            and "trap cleanup_teavm_client EXIT" in build_teavm
+            and "trap cleanup_teavm_server_worker EXIT" in build_server_worker
             and "trap release_overlay_lock EXIT" in build_platform_smoke,
         ),
         (
@@ -4450,7 +4488,14 @@ def check_source_patches() -> None:
             "Singleplayer client waits for the Worker listener instead of runtime import",
             "worker.__gaiusServerReady = false" in browser_singleplayer_client
             and "message.type === 'server-listener-ready'" in browser_singleplayer_client
-            and "worker.__gaiusServerReady && ports.get" in browser_singleplayer_client
+            and "const ownedPort = worker.__gaiusClientPort || null" in browser_singleplayer_client
+            and "if (ownedPort && ports.get(key) !== ownedPort)" in browser_singleplayer_client
+            and "ports.set(key, ownedPort)" in browser_singleplayer_client
+            and "const mappedPort = ports.get(key)" in browser_singleplayer_client
+            and "worker.__gaiusServerReady && mappedPort &&" in browser_singleplayer_client
+            and "String(mappedPort.__gaiusLaunchGeneration || '') === expectedGeneration"
+            in browser_singleplayer_client
+            and "worker.__gaiusServerReady && ports.get" not in browser_singleplayer_client
             and 'report("server-listener-ready"' in browser_integrated_server_main
             and '"markServerListenerReady"' in client_patcher,
         ),
@@ -6459,9 +6504,17 @@ def check_source_patches() -> None:
             and "verify_worker_release_profile" in build_release
             and "teavm-compiler-profile.py" in build_release
             and 'release_lock="$build_root/.release-build.lock"' in build_release
+            and 'release_backup_root="${dist}.release-backup-$release_lock_owner"'
+                in build_release
+            and 'release_completed=true' in build_release
+            and 'Could not restore the previous release dist' in build_release
             and "read_teavm_configuration" in teavm_compiler_profile
             and "validate_release_configuration" in teavm_compiler_profile
             and 'KIND = "gaius-teavm-compiler-profile"' in teavm_compiler_profile
+            and "--artifact-input" in teavm_compiler_profile
+            and "TeaVM staged compiler profile regression passed"
+                in teavm_compiler_profile_test
+            and "--artifact-input" in build_server_worker
             and 'GAIUS_SERVER_MINIFYING:-true' in build_server_worker
             and 'GAIUS_SERVER_SHORT_FILE_NAMES:-true' in build_server_worker
             and 'GAIUS_SERVER_ASSERTIONS_REMOVED:-true' in build_server_worker,
@@ -6536,8 +6589,45 @@ def check_source_patches() -> None:
             and "port/tools/src/main" in build_identity_helper
             and "compatibilitySha256" in build_identity_helper
             and "identitySha256" in build_identity_helper
+            and "teavm-publication-gate.sh" in build_identity_helper
             and "gaius_build_identity.py" in build_teavm
             and "gaius_build_identity.py" in build_server_worker,
+        ),
+        (
+            "TeaVM publication gate requires completed analysis before publishing identity",
+            "teavm-publication-gate.sh" in build_teavm
+            and "teavm-publication-gate.sh" in build_server_worker
+            and "gaius_teavm_publish_allowed" in teavm_publication_gate
+            and "gaius_teavm_publish_bundle" in teavm_publication_gate
+            and "GAIUS_TEA_PUBLISH_FAIL_AFTER=1" in teavm_publication_gate_test
+            and "old-bundle-artifact" in teavm_publication_gate_test
+            and "Output file built with errors" in teavm_publication_gate
+            and "[INFO] BUILD SUCCESS" in teavm_publication_gate
+            and "analysis_status" in build_teavm
+            and "analysis_status" in build_server_worker
+            and "gaius_teavm_remove_stale_incomplete_reports" in build_teavm
+            and "gaius_teavm_remove_stale_incomplete_reports" in build_server_worker
+            and '"${json_path%.json}.incomplete.json"' in teavm_publication_gate
+            and '"${markdown_path%.md}.incomplete.md"' in teavm_publication_gate
+            and "TeaVM publication gate regression passed" in teavm_publication_gate_test
+            and "old-identity" in teavm_publication_gate_test
+        ),
+        (
+            "Profile builds use the tracked launcher template instead of shared dist output",
+            "port/web/launcher/index.template.html" in build_teavm
+            and "port/web/dist/index.html" not in build_teavm
+            and 'if [[ -f "$target_directory/index.html"' not in build_teavm
+            and "Index template is an unresolved Git LFS pointer" in build_teavm
+            and "function decodeGaiusVanillaAssets(source)" in index_template
+            and 'window.__gaiusProfileId = "template";' in index_template
+            and "26.2" not in index_template
+            and "1.21.11" not in index_template
+            and "gaius.fs.v2:" not in index_template
+            and 'const vanillaAssetsToken = "dev";' in index_template
+            and 'const fallbackBuildToken = "dev";' in index_template
+            and "launcher template regression passed" in index_template_test
+            and '"26.2.json"' in index_template_test
+            and '"1.21.11.json"' in index_template_test
         ),
         (
             "Portable artifact identity fixtures cover profile and gzip skew",
@@ -6553,6 +6643,8 @@ def check_source_patches() -> None:
                     "test_manifest_is_replaced_after_html_as_commit_marker",
                     "test_missing_worker_identity_is_rejected",
                     "test_source_change_rejects_all_previously_built_components",
+                    "test_teavm_publication_gate_change_rejects_previous_artifacts",
+                    "test_launcher_template_change_rejects_previous_artifacts",
                     "test_1_21_11_legacy_profile_remains_compatible",
                     "test_quick_check_rejects_mixed_versions_independently",
                 )

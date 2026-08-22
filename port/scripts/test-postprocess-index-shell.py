@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 POSTPROCESS = ROOT / "port/scripts/postprocess-index-html.py"
-SOURCE_INDEX = ROOT / "port/web/dist/index.html"
+SOURCE_INDEX = ROOT / "port/web/launcher/index.template.html"
 
 
 def require(text: str, needle: str) -> None:
@@ -45,7 +45,7 @@ def check_inline_script_syntax(html: str, directory: Path) -> None:
 
 def main() -> int:
     if not SOURCE_INDEX.is_file():
-        raise SystemExit(f"missing generated launcher: {SOURCE_INDEX}")
+        raise SystemExit(f"missing tracked launcher template: {SOURCE_INDEX}")
 
     with tempfile.TemporaryDirectory(prefix="gaius-shell-smoke-") as temporary:
         directory = Path(temporary)

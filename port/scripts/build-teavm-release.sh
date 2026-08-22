@@ -3,6 +3,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$root/port/scripts/version-profile.sh"
+source "$root/port/scripts/teavm-publication-gate.sh"
 gaius_load_version_profile "$root"
 minecraft_version="$GAIUS_MINECRAFT_VERSION"
 build_root="$(gaius_build_root "$root")"
@@ -35,20 +36,99 @@ server_pom="$build_root/server-worker/generated-pom.xml"
 server_resource_list="$build_root/server-worker/generated-resources/dev/gaius/browser/minecraft-resources.txt"
 
 release_lock="$build_root/.release-build.lock"
-mkdir -p "$build_root" "$dist"
-while ! mkdir "$release_lock" 2>/dev/null; do
-  lock_pid="$(cat "$release_lock/pid" 2>/dev/null || true)"
-  if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
-    sleep 0.2
-    continue
-  fi
-  rm -rf "$release_lock"
-done
-printf '%s\n' "$$" >"$release_lock/pid"
+mkdir -p "$build_root"
+release_lock_owner=""
+output_lock="$build_root/.teavm-output.lock"
+output_lock_owner=""
+output_lock_owned_here=false
+release_staging_root=""
+release_backup_root=""
+release_backup_ready=false
+release_completed=false
+dist_existed_before_release=false
+
 release_build_lock() {
-  rm -rf "$release_lock"
+  local status="$?"
+  local failed_dist=""
+  trap - EXIT
+  if [[ "$release_completed" != true && "$release_backup_ready" == true ]]; then
+    failed_dist="${dist}.release-failed-${release_lock_owner:-$$}"
+    if [[ -e "$failed_dist" ]]; then
+      echo "Refusing to overwrite existing failed release quarantine: $failed_dist" >&2
+    elif [[ -d "$dist" ]] && mv "$dist" "$failed_dist"; then
+      if [[ "$dist_existed_before_release" == true ]]; then
+        if [[ -d "$release_backup_root" ]] && mv "$release_backup_root" "$dist"; then
+          rm -rf -- "$failed_dist" || true
+        else
+          echo "Could not restore the previous release dist: $release_backup_root" >&2
+          mv "$failed_dist" "$dist" 2>/dev/null || true
+        fi
+      else
+        rm -rf -- "$failed_dist" || true
+      fi
+    elif [[ "$dist_existed_before_release" == true && -d "$release_backup_root" ]]; then
+      mv "$release_backup_root" "$dist" 2>/dev/null \
+        || echo "Could not restore missing release dist: $release_backup_root" >&2
+    fi
+  elif [[ "$release_completed" == true && -n "${release_backup_root:-}" ]]; then
+    case "$release_backup_root" in
+      "${dist}.release-backup-"*) rm -rf -- "$release_backup_root" || true ;;
+      *) echo "Refusing to remove unsafe release backup: $release_backup_root" >&2 ;;
+    esac
+  fi
+  if [[ -n "${release_staging_root:-}" ]]; then
+    case "$release_staging_root" in
+      "$build_root"/.teavm-staging/*)
+        rm -rf -- "$release_staging_root" || true
+        ;;
+      *)
+        echo "Refusing to remove unsafe TeaVM release staging path: $release_staging_root" >&2
+        ;;
+    esac
+  fi
+  if [[ "$output_lock_owned_here" == true && -n "${output_lock_owner:-}" ]]; then
+    gaius_teavm_lock_release "$output_lock" "$output_lock_owner" || true
+  fi
+  if [[ -n "${release_lock_owner:-}" ]]; then
+    gaius_teavm_lock_release "$release_lock" "$release_lock_owner" || true
+  fi
+  exit "$status"
 }
 trap release_build_lock EXIT
+
+gaius_teavm_lock_acquire "$release_lock"
+release_lock_owner="$GAIUS_TEA_LOCK_OWNER_TOKEN"
+
+# The release wrapper also touches the final dist (HTML, relay registry,
+# Wasm, compression). Hold the same profile output lock as direct client and
+# Worker invocations, and let child scripts assert/reuse this ownership.
+if [[ "${GAIUS_TEA_OUTPUT_LOCK_HELD:-false}" == "true" ]]; then
+  output_lock_owner="${GAIUS_TEA_OUTPUT_LOCK_OWNER:-}"
+  gaius_teavm_lock_assert_owner "$output_lock" "$output_lock_owner" \
+    || { echo "GAIUS_TEA_OUTPUT_LOCK_HELD=true without the profile output lock" >&2; exit 1; }
+else
+  gaius_teavm_lock_acquire "$output_lock"
+  output_lock_owner="$GAIUS_TEA_LOCK_OWNER_TOKEN"
+  output_lock_owned_here=true
+fi
+
+release_staging_root="$build_root/.teavm-staging/release-$release_lock_owner"
+mkdir -p "$release_staging_root"
+release_backup_root="${dist}.release-backup-$release_lock_owner"
+if [[ -e "$release_backup_root" ]]; then
+  echo "Release backup path already exists: $release_backup_root" >&2
+  exit 1
+fi
+if [[ -d "$dist" ]]; then
+  dist_existed_before_release=true
+  cp -a "$dist" "$release_backup_root"
+  release_backup_ready=true
+fi
+mkdir -p "$dist"
+release_backup_ready=true
+
+export GAIUS_TEA_OUTPUT_LOCK_HELD=true
+export GAIUS_TEA_OUTPUT_LOCK_OWNER="$output_lock_owner"
 
 verify_identity() {
   local role="$1"
@@ -120,6 +200,15 @@ verify_worker_release_profile() {
     --require-release >/dev/null
 }
 
+generate_client_release_pom() {
+  client_pom="$build_root/release-generated-pom.xml"
+  GAIUS_POM="$client_pom" \
+    GAIUS_TARGET_DIRECTORY="$dist" \
+    GAIUS_TARGET_FILE="${GAIUS_TARGET_FILE:-classes.js}" \
+    GAIUS_RESOURCE_DIRECTORY="$build_root/generated-resources" \
+    "$root/port/scripts/generate-pom.sh" >/dev/null
+}
+
 export GAIUS_TEA_OPTIMIZATION_LEVEL="${GAIUS_TEA_OPTIMIZATION_LEVEL:-ADVANCED}"
 export GAIUS_SOURCE_MAPS="${GAIUS_SOURCE_MAPS:-false}"
 export GAIUS_DEBUG_INFO="${GAIUS_DEBUG_INFO:-false}"
@@ -138,10 +227,11 @@ if [[ "$GAIUS_TEA_OPTIMIZATION_LEVEL" != "ADVANCED" \
   exit 1
 fi
 
-rm -f "$dist/${GAIUS_TARGET_FILE:-classes.js}.map" \
-  "$dist/${GAIUS_TARGET_FILE:-classes.js}.teavmdbg"
-
 if [[ "${GAIUS_SKIP_CLIENT_BUILD:-false}" == "true" ]]; then
+  # A previous staged build may have left generated-pom.xml pointing at its
+  # private target directory. Resume verification must use a POM whose target
+  # directory is the published dist, not that discarded staging path.
+  generate_client_release_pom
   client_js="$dist/${GAIUS_TARGET_FILE:-classes.js}"
   vanilla_asset_pack="$dist/vanilla-assets.pack.gz"
   expected_client_sha256="${GAIUS_RESUME_CLIENT_SHA256:-}"
@@ -160,8 +250,6 @@ if [[ "${GAIUS_SKIP_CLIENT_BUILD:-false}" == "true" ]]; then
     echo "Cannot resume release: client JavaScript SHA-256 does not match" >&2
     exit 1
   fi
-  grep -Fq '[INFO] BUILD SUCCESS' "$build_root/teavm-build.log" \
-    || { echo "Cannot resume release: TeaVM log has no BUILD SUCCESS" >&2; exit 1; }
   if grep -Fq 'Error in @JSBody' "$build_root/teavm-build.log"; then
     echo "Cannot resume release: TeaVM log contains invalid @JSBody JavaScript" >&2
     exit 1
@@ -178,12 +266,19 @@ if [[ "${GAIUS_SKIP_CLIENT_BUILD:-false}" == "true" ]]; then
     || { echo "Cannot resume release: client compiler profile is stale, missing, or not release-grade" >&2; exit 1; }
   verify_identity vanilla-assets "$vanilla_asset_pack" \
     || { echo "Cannot resume release: vanilla asset build identity is stale or missing" >&2; exit 1; }
-  echo "Reusing successfully compiled client JavaScript: $client_js"
+  set +e
   "$root/port/scripts/run-python.sh" \
     "$root/port/scripts/analyze-teavm-log.py" \
     "$build_root/teavm-build.log" \
     "$build_root/teavm-gap.json" \
     "$build_root/teavm-gap.md"
+  analysis_status="$?"
+  set -e
+  gaius_teavm_publish_allowed "$build_root/teavm-build.log" "$analysis_status" \
+    || { echo "Cannot resume release: TeaVM publication gate rejected the client log" >&2; exit 1; }
+  gaius_teavm_remove_stale_incomplete_reports \
+    "$build_root/teavm-gap.json" "$build_root/teavm-gap.md"
+  echo "Reusing successfully compiled client JavaScript: $client_js"
   "$root/port/scripts/run-python.sh" \
     "$root/port/scripts/postprocess-index-html.py" \
     "$dist/index.html" \
@@ -192,23 +287,60 @@ if [[ "${GAIUS_SKIP_CLIENT_BUILD:-false}" == "true" ]]; then
     "$asset_index_id"
 else
   GAIUS_SKIP_COMPRESSION=true "$root/port/scripts/build-teavm.sh"
+  generate_client_release_pom
   write_client_release_profile "$dist/${GAIUS_TARGET_FILE:-classes.js}"
 fi
 if [[ "${GAIUS_SKIP_SERVER_WORKER:-false}" != "true" ]]; then
   GAIUS_SKIP_OVERLAY_BUILD=true GAIUS_SKIP_COMPRESSION=true \
     "$root/port/scripts/build-teavm-server-worker.sh"
+  server_pom="$build_root/server-worker/release-generated-pom.xml"
 else
   server_js="$dist/singleplayer-server.js"
+  server_log="$build_root/server-worker/teavm-build.log"
+  if [[ ! -f "$server_log" ]]; then
+    echo "Cannot resume release: server Worker TeaVM log is missing at $server_log" >&2
+    exit 1
+  fi
+  set +e
+  "$root/port/scripts/run-python.sh" \
+    "$root/port/scripts/analyze-teavm-log.py" \
+    "$server_log" \
+    "$build_root/server-worker/teavm-gap.json" \
+    "$build_root/server-worker/teavm-gap.md"
+  server_analysis_status="$?"
+  set -e
+  gaius_teavm_publish_allowed "$server_log" "$server_analysis_status" \
+    || { echo "Cannot resume release: TeaVM publication gate rejected the server log" >&2; exit 1; }
+  gaius_teavm_remove_stale_incomplete_reports \
+    "$build_root/server-worker/teavm-gap.json" \
+    "$build_root/server-worker/teavm-gap.md"
+  if grep -Fq 'Error in @JSBody' "$server_log"; then
+    echo "Cannot resume release: server Worker TeaVM log contains invalid @JSBody JavaScript" >&2
+    exit 1
+  fi
   if [[ ! -s "$server_js" ]] || ! verify_identity singleplayer-worker "$server_js"; then
     echo "Cannot resume release: server Worker or matching build identity is missing at $server_js" >&2
     exit 1
   fi
+  server_pom="$build_root/server-worker/release-generated-pom.xml"
+  if [[ ! -f "$server_pom" ]]; then
+    GAIUS_POM="$server_pom" \
+      GAIUS_TARGET_DIRECTORY="$dist" \
+      GAIUS_TARGET_FILE="singleplayer-server.js" \
+      GAIUS_RESOURCE_DIRECTORY="$build_root/server-worker/generated-resources" \
+      "$root/port/scripts/generate-pom.sh" >/dev/null
+  fi
   verify_worker_release_profile "$server_js" \
     || { echo "Cannot resume release: server Worker compiler profile is stale, missing, or not release-grade" >&2; exit 1; }
+  staged_worker_bootstrap="$release_staging_root/singleplayer-server-worker.js"
+  final_worker_bootstrap="$dist/singleplayer-server-worker.js"
   cp "$root/port/web/singleplayer/server-worker-bootstrap.js" \
-    "$dist/singleplayer-server-worker.js"
-  write_identity worker-bootstrap \
-    "$dist/singleplayer-server-worker.js"
+    "$staged_worker_bootstrap"
+  write_identity worker-bootstrap "$staged_worker_bootstrap"
+  gaius_teavm_publish_bundle \
+    "$staged_worker_bootstrap" "$final_worker_bootstrap" \
+    "${staged_worker_bootstrap}.build.json" \
+      "${final_worker_bootstrap}.build.json"
   echo "Reusing successfully compiled server Worker JavaScript: $server_js"
 fi
 "$root/port/scripts/run-python.sh" \
@@ -245,3 +377,4 @@ GAIUS_BUILD_ROOT="$build_root" GAIUS_DIST_DIRECTORY="$dist" \
   "$root/port/scripts/build-portable-html.py"
 GAIUS_DIST_DIRECTORY="$dist" GAIUS_COMPRESS_FILES=Gaius.html:Gaius.manifest.json \
   "$root/port/scripts/compress-dist.sh"
+release_completed=true

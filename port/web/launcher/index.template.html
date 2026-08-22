@@ -1,0 +1,3456 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>Gaius Client template</title>
+  <style>
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #050505;
+      color: #d8d8d8;
+      font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+
+    #mc-canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      background: #000;
+      outline: none;
+    }
+
+    #status {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      right: 12px;
+      max-height: 46vh;
+      overflow: auto;
+      box-sizing: border-box;
+      padding: 10px 12px;
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      border-radius: 6px;
+      background: rgba(0, 0, 0, 0.72);
+      white-space: pre-wrap;
+      pointer-events: none;
+    }
+
+    #status[data-state="running"] { color: #7dd3fc; }
+    #status[data-state="error"] { color: #ff8787; }
+
+    #boot-progress {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      top: min(50vh, 178px);
+      height: 16px;
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      border-radius: 4px;
+      background: rgba(0, 0, 0, 0.72);
+      overflow: hidden;
+      pointer-events: none;
+    }
+
+    #boot-progress-bar {
+      width: 2%;
+      height: 100%;
+      background: #54d68b;
+      transition: width 180ms linear;
+    }
+
+    #boot-progress-text {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      top: calc(min(50vh, 178px) + 22px);
+      color: #d8f3ff;
+      text-shadow: 0 1px 2px #000;
+      pointer-events: none;
+      font-size: 12px;
+    }
+
+    #perf-hud {
+      position: fixed;
+      top: 12px;
+      right: 12px;
+      z-index: 20;
+      min-width: 176px;
+      box-sizing: border-box;
+      padding: 8px 10px;
+      border: 1px solid rgba(125, 211, 252, 0.35);
+      border-radius: 6px;
+      background: rgba(0, 0, 0, 0.58);
+      color: #c7f9ff;
+      font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      text-shadow: 0 1px 2px #000;
+      pointer-events: none;
+      white-space: pre;
+    }
+
+    #perf-hud[data-tier="warn"] {
+      border-color: rgba(250, 204, 21, 0.55);
+      color: #fde68a;
+    }
+
+    #perf-hud[data-tier="bad"] {
+      border-color: rgba(248, 113, 113, 0.65);
+      color: #fecaca;
+    }
+    /* Gaius boot screen */
+    #boot-screen {
+      position: fixed;
+      inset: 0;
+      z-index: 10;
+      background: #101511;
+      pointer-events: none;
+    }
+
+    #boot-brand {
+      position: fixed;
+      left: 50%;
+      top: 38%;
+      z-index: 11;
+      transform: translate(-50%, -50%);
+      color: #fff;
+      text-align: center;
+      font: 900 72px/0.82 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+      text-shadow: 0 4px 0 rgba(0, 0, 0, 0.28);
+      animation: gaius-logo-enter 420ms ease-out both;
+      pointer-events: none;
+    }
+
+    #boot-brand span {
+      display: block;
+      margin-top: 16px;
+      font-size: 0.28em;
+      line-height: 1;
+      letter-spacing: 0;
+    }
+
+    #boot-progress {
+      left: 50%;
+      right: auto;
+      top: 58%;
+      z-index: 11;
+      width: min(460px, calc(100vw - 48px));
+      height: 10px;
+      box-sizing: border-box;
+      padding: 2px;
+      transform: translateX(-50%);
+      border: 2px solid #fff;
+      border-radius: 0;
+      background: transparent;
+    }
+
+    #boot-progress-bar {
+      min-width: 2px;
+      background: #54d68b;
+      transition: width 160ms linear;
+    }
+
+    #boot-progress-text {
+      left: 24px;
+      right: 24px;
+      top: calc(58% + 24px);
+      z-index: 11;
+      color: #fff;
+      text-align: center;
+      font-size: 12px;
+      text-shadow: none;
+    }
+
+    #status {
+      left: 50%;
+      right: auto;
+      top: calc(58% + 56px);
+      z-index: 11;
+      width: min(640px, calc(100vw - 48px));
+      max-height: 28vh;
+      transform: translateX(-50%);
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      color: rgba(255, 255, 255, 0.9);
+      text-align: center;
+      font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+
+    #status[data-state="error"] {
+      padding: 14px 16px;
+      border: 2px solid rgba(255, 255, 255, 0.82);
+      background: rgba(0, 0, 0, 0.76);
+      color: #fff;
+      text-align: left;
+    }
+    @keyframes gaius-logo-enter {
+      from { opacity: 0; transform: translate(-50%, -46%) scale(0.96); }
+      to { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+    }
+
+    @media (max-width: 600px) {
+      #boot-brand { font-size: 44px; }
+    }
+
+    #profile-gate {
+      position: fixed;
+      inset: 0;
+      z-index: 14;
+      display: grid;
+      place-items: center;
+      box-sizing: border-box;
+      padding: 32px 24px;
+      background: #101511;
+      color: #f4f7f5;
+    }
+
+    #profile-gate[hidden] {
+      display: none;
+    }
+
+    #profile-form {
+      width: min(380px, 100%);
+      margin: 0;
+    }
+
+    #profile-title {
+      margin: 0 0 34px;
+      font: 900 54px/1 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+      text-align: center;
+    }
+
+    #profile-form label {
+      display: block;
+      margin-bottom: 8px;
+      color: #d6ddd8;
+      font: 600 13px/1.2 Arial, Helvetica, sans-serif;
+    }
+
+    #profile-name {
+      width: 100%;
+      height: 46px;
+      box-sizing: border-box;
+      padding: 0 12px;
+      border: 2px solid #66756c;
+      border-radius: 4px;
+      outline: none;
+      background: #171d19;
+      color: #fff;
+      font: 18px/1 Arial, Helvetica, sans-serif;
+    }
+
+    #profile-name:focus {
+      border-color: #54d68b;
+    }
+
+    #profile-submit {
+      width: 100%;
+      height: 46px;
+      margin-top: 14px;
+      border: 0;
+      border-radius: 4px;
+      background: #54d68b;
+      color: #08100b;
+      font: 700 15px/1 Arial, Helvetica, sans-serif;
+      cursor: pointer;
+    }
+
+    #profile-submit:hover,
+    #profile-submit:focus-visible {
+      background: #72e7a2;
+      outline: 2px solid #fff;
+      outline-offset: 2px;
+    }
+
+    #profile-error {
+      min-height: 18px;
+      margin: 8px 0 0;
+      color: #ff9b9b;
+      font: 12px/1.4 Arial, Helvetica, sans-serif;
+    }
+
+    #profile-legal {
+      margin: 24px 0 0;
+      color: #9eaaa2;
+      font: 11px/1.45 Arial, Helvetica, sans-serif;
+      text-align: center;
+    }
+
+    #profile-switch {
+      position: fixed;
+      left: 16px;
+      top: 16px;
+      z-index: 9;
+      min-height: 36px;
+      box-sizing: border-box;
+      padding: 0 14px;
+      border: 1px solid #7b8980;
+      border-radius: 4px;
+      background: rgba(16, 21, 17, 0.94);
+      color: #f4f7f5;
+      font: 600 13px/1 Arial, Helvetica, sans-serif;
+      cursor: pointer;
+    }
+
+    #profile-switch[hidden] {
+      display: none;
+    }
+
+    #profile-switch:hover,
+    #profile-switch:focus-visible {
+      border-color: #54d68b;
+      background: #1b241e;
+      outline: 2px solid #fff;
+      outline-offset: 2px;
+    }
+
+    #profile-switch:disabled {
+      cursor: wait;
+      opacity: 0.65;
+    }
+
+    /* Gaius Client shell v2: browser launcher controls only. */
+    :root {
+      --gaius-shell-bg: #0b1116;
+      --gaius-shell-panel: #111a21;
+      --gaius-shell-panel-strong: #17232c;
+      --gaius-shell-line: #31414c;
+      --gaius-shell-muted: #9aaab4;
+      --gaius-shell-text: #f1f5f7;
+      --gaius-shell-accent: #9bd36a;
+      --gaius-shell-accent-strong: #c3ec8f;
+      --gaius-shell-danger: #f08a7b;
+    }
+
+    html,
+    body {
+      background: var(--gaius-shell-bg);
+      color: var(--gaius-shell-text);
+    }
+
+    #mc-canvas {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      background: #05080a;
+    }
+
+    #boot-screen {
+      z-index: 10;
+      background: var(--gaius-shell-bg);
+    }
+
+    #boot-screen::before {
+      position: absolute;
+      inset: 18px;
+      content: "";
+      border: 1px solid rgba(155, 211, 106, 0.18);
+      pointer-events: none;
+    }
+
+    #gaius-shell-header {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 12;
+      display: flex;
+      align-items: center;
+      min-height: 56px;
+      box-sizing: border-box;
+      padding: 0 24px;
+      border-bottom: 2px solid var(--gaius-shell-line);
+      background: var(--gaius-shell-bg);
+      pointer-events: none;
+      transition: opacity 140ms linear, visibility 140ms linear;
+    }
+
+    #gaius-shell-brand {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      font: 800 15px/1 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+    }
+
+    #gaius-shell-brand strong {
+      color: var(--gaius-shell-accent-strong);
+      font-size: 19px;
+    }
+
+    #gaius-shell-mode,
+    #gaius-shell-version {
+      color: var(--gaius-shell-muted);
+      font: 700 11px/1 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    #gaius-shell-mode {
+      margin-left: auto;
+      margin-right: 18px;
+      color: var(--gaius-shell-accent);
+    }
+
+    #gaius-shell-footer {
+      position: fixed;
+      left: 24px;
+      right: 24px;
+      bottom: 18px;
+      z-index: 12;
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      color: var(--gaius-shell-muted);
+      font: 11px/1.4 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+      pointer-events: none;
+      transition: opacity 140ms linear, visibility 140ms linear;
+    }
+
+    #gaius-shell-footer strong {
+      color: var(--gaius-shell-text);
+      font-weight: 700;
+    }
+
+    html[data-gaius-shell-view="canvas"] #gaius-shell-header,
+    html[data-gaius-shell-view="canvas"] #gaius-shell-footer {
+      visibility: hidden;
+      opacity: 0;
+    }
+
+    #boot-brand {
+      top: 40%;
+      z-index: 11;
+      max-width: calc(100vw - 32px);
+      color: var(--gaius-shell-text);
+      font: 900 72px/0.84 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+      text-shadow: 0 4px 0 #27343b;
+    }
+
+    #boot-brand span {
+      margin-top: 14px;
+      color: var(--gaius-shell-accent);
+      font-size: 12px;
+      font-weight: 700;
+      line-height: 1;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    #boot-progress {
+      top: 58%;
+      z-index: 11;
+      width: min(480px, calc(100vw - 48px));
+      height: 14px;
+      padding: 2px;
+      border: 2px solid var(--gaius-shell-text);
+      border-radius: 0;
+      background: transparent;
+    }
+
+    #boot-progress-bar {
+      min-width: 2px;
+      background: var(--gaius-shell-accent);
+      transition: width 160ms linear;
+    }
+
+    #boot-progress-text {
+      top: calc(58% + 28px);
+      z-index: 11;
+      color: var(--gaius-shell-muted);
+      font: 700 12px/1.4 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+      text-align: center;
+      text-shadow: none;
+    }
+
+    #status {
+      top: calc(58% + 62px);
+      z-index: 11;
+      width: min(660px, calc(100vw - 48px));
+      max-height: 22vh;
+      box-sizing: border-box;
+      padding: 0;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      color: var(--gaius-shell-muted);
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      letter-spacing: 0;
+      text-align: center;
+    }
+
+    #status[data-state="error"] {
+      max-height: 25vh;
+      overflow: auto;
+      padding: 12px 14px;
+      border: 2px solid var(--gaius-shell-danger);
+      border-left-width: 5px;
+      background: var(--gaius-shell-panel);
+      color: var(--gaius-shell-text);
+      text-align: left;
+    }
+
+    #gaius-error-actions {
+      position: fixed;
+      top: calc(58% + 190px);
+      left: 50%;
+      z-index: 12;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 8px;
+      width: min(660px, calc(100vw - 48px));
+      transform: translateX(-50%);
+    }
+
+    #gaius-error-actions[hidden],
+    #gaius-error-details[hidden] {
+      display: none;
+    }
+
+    #gaius-error-actions button {
+      min-height: 36px;
+      box-sizing: border-box;
+      padding: 0 14px;
+      border: 2px solid var(--gaius-shell-line);
+      border-radius: 0;
+      background: var(--gaius-shell-panel-strong);
+      color: var(--gaius-shell-text);
+      font: 700 12px/1 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+      cursor: pointer;
+    }
+
+    #gaius-error-actions button:first-child {
+      border-color: var(--gaius-shell-accent);
+      background: var(--gaius-shell-accent);
+      color: #0b1116;
+    }
+
+    #gaius-error-actions button:hover,
+    #gaius-error-actions button:focus-visible {
+      outline: 2px solid var(--gaius-shell-text);
+      outline-offset: 2px;
+    }
+
+    #gaius-error-actions button:disabled {
+      cursor: wait;
+      opacity: 0.65;
+    }
+
+    #gaius-error-details {
+      position: fixed;
+      top: calc(58% + 238px);
+      left: 50%;
+      z-index: 12;
+      width: min(660px, calc(100vw - 48px));
+      max-height: 20vh;
+      box-sizing: border-box;
+      margin: 0;
+      padding: 10px 12px;
+      overflow: auto;
+      border: 1px solid var(--gaius-shell-line);
+      background: #080d11;
+      color: var(--gaius-shell-muted);
+      font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      letter-spacing: 0;
+      transform: translateX(-50%);
+      white-space: pre-wrap;
+    }
+
+    #profile-gate {
+      z-index: 14;
+      padding: 32px 16px;
+      background: var(--gaius-shell-bg);
+      color: var(--gaius-shell-text);
+    }
+
+    #profile-form {
+      width: min(440px, calc(100vw - 32px));
+      box-sizing: border-box;
+      padding: 30px 32px 26px;
+      border: 2px solid var(--gaius-shell-line);
+      border-radius: 0;
+      background: var(--gaius-shell-panel);
+      box-shadow: 8px 8px 0 #06090c;
+    }
+
+    #profile-title {
+      margin: 0;
+      color: var(--gaius-shell-text);
+      font: 900 52px/0.9 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+      text-align: left;
+    }
+
+    #profile-kicker {
+      margin: 10px 0 28px;
+      color: var(--gaius-shell-accent);
+      font: 700 11px/1.4 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    #profile-subtitle {
+      margin: -16px 0 24px;
+      color: var(--gaius-shell-muted);
+      font: 13px/1.45 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+    }
+
+    #profile-form label {
+      margin-bottom: 8px;
+      color: var(--gaius-shell-text);
+      font: 700 12px/1.2 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+    }
+
+    #profile-name {
+      height: 46px;
+      border: 2px solid #5a6b76;
+      border-radius: 0;
+      background: #0a1014;
+      color: var(--gaius-shell-text);
+      font: 18px/1 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+    }
+
+    #profile-name:focus {
+      border-color: var(--gaius-shell-accent);
+      box-shadow: 0 0 0 2px rgba(155, 211, 106, 0.18);
+    }
+
+    #profile-submit {
+      height: 46px;
+      margin-top: 14px;
+      border: 2px solid var(--gaius-shell-accent);
+      border-radius: 0;
+      background: var(--gaius-shell-accent);
+      color: #0b1116;
+      font: 800 14px/1 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    #profile-submit:hover,
+    #profile-submit:focus-visible {
+      background: var(--gaius-shell-accent-strong);
+      outline: 2px solid var(--gaius-shell-text);
+      outline-offset: 2px;
+    }
+
+    #profile-error {
+      min-height: 18px;
+      margin: 9px 0 0;
+      color: var(--gaius-shell-danger);
+      font: 12px/1.4 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+    }
+
+    #profile-legal {
+      margin: 22px 0 0;
+      color: var(--gaius-shell-muted);
+      font: 11px/1.5 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+      text-align: left;
+    }
+
+    #profile-switch {
+      top: 16px;
+      right: 16px;
+      left: auto;
+      z-index: 30;
+      min-height: 36px;
+      padding: 0 12px;
+      border: 2px solid var(--gaius-shell-line);
+      border-radius: 0;
+      background: rgba(11, 17, 22, 0.96);
+      color: var(--gaius-shell-text);
+      font: 700 12px/1 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+    }
+
+    #profile-switch:hover,
+    #profile-switch:focus-visible {
+      border-color: var(--gaius-shell-accent);
+      background: var(--gaius-shell-panel-strong);
+      outline: 2px solid var(--gaius-shell-text);
+      outline-offset: 2px;
+    }
+
+    @media (max-width: 600px) {
+      #gaius-shell-header {
+        min-height: 48px;
+        padding: 0 16px;
+      }
+
+      #gaius-shell-version {
+        display: none;
+      }
+
+      #gaius-shell-footer {
+        left: 16px;
+        right: 16px;
+        bottom: 12px;
+      }
+
+      #gaius-shell-footer span:last-child {
+        display: none;
+      }
+
+      #boot-brand {
+        font-size: 46px;
+      }
+
+      #profile-form {
+        padding: 24px 20px 22px;
+      }
+
+      #profile-title {
+        font-size: 44px;
+      }
+
+      #gaius-error-actions {
+        top: calc(58% + 160px);
+      }
+
+      #gaius-error-details {
+        top: calc(58% + 208px);
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      #gaius-shell-header,
+      #gaius-shell-footer,
+      #boot-brand,
+      #boot-progress-bar {
+        animation: none;
+        transition: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <canvas id="mc-canvas" tabindex="0"></canvas>
+  <div id="boot-screen" aria-hidden="true"></div>
+  <div id="boot-brand" aria-hidden="true">GAIUS<span>CLIENT</span></div>
+  <div id="gaius-shell-header" data-gaius-shell="v2" aria-hidden="true">
+    <div id="gaius-shell-brand"><strong>GAIUS</strong><span>CLIENT</span></div>
+    <span id="gaius-shell-mode">BROWSER CLIENT</span>
+    <span id="gaius-shell-version">VERSION 0.0.1</span>
+  </div>
+  <div id="profile-gate" hidden>
+    <form id="profile-form" novalidate>
+      <h1 id="profile-title">GAIUS</h1>
+      <p id="profile-kicker">Browser client | offline and online play</p>
+      <p id="profile-subtitle">Choose a player name to continue.</p>
+      <label for="profile-name">Player name</label>
+      <input id="profile-name" name="username" type="text" maxlength="16" pattern="[A-Za-z0-9_]{1,16}" autocomplete="username" spellcheck="false">
+      <button id="profile-submit" type="submit">Play</button>
+      <p id="profile-error" role="alert"></p>
+      <p id="profile-legal">Gaius is an independent browser client. It is not affiliated with Mojang Studios or Microsoft.</p>
+    </form>
+  </div>
+  <button id="profile-switch" type="button" hidden>Change player name</button>
+  <pre id="status" data-state="running" hidden>Starting Gaius Client template...</pre>
+  <div id="gaius-error-actions" hidden>
+    <button id="gaius-retry" type="button">Retry startup</button>
+    <button id="gaius-error-toggle" type="button">Show diagnostics</button>
+  </div>
+  <pre id="gaius-error-details" hidden></pre>
+  <div id="gaius-shell-footer" data-gaius-shell="v2" aria-hidden="true">
+    <span><strong>Gaius Client</strong> | independent browser software</span>
+    <span>HTML runtime | local storage enabled</span>
+  </div>
+  <div id="boot-progress" aria-hidden="true"><div id="boot-progress-bar"></div></div>
+  <div id="boot-progress-text">0% Initializing...</div>
+  <div id="perf-hud">FPS --</div>
+
+  <script>
+    if (typeof Error === "function") {
+      Error.stackTraceLimit = 100;
+    }
+
+    const statusBox = document.getElementById("status");
+    const bootScreen = document.getElementById("boot-screen");
+    const bootBrand = document.getElementById("boot-brand");
+    const profileGate = document.getElementById("profile-gate");
+    const profileForm = document.getElementById("profile-form");
+    const profileName = document.getElementById("profile-name");
+    const profileError = document.getElementById("profile-error");
+    const profileSwitch = document.getElementById("profile-switch");
+    const bootProgress = document.getElementById("boot-progress");
+    const bootProgressBar = document.getElementById("boot-progress-bar");
+    const bootProgressText = document.getElementById("boot-progress-text");
+    const perfHud = document.getElementById("perf-hud");
+    const bootTimings = window.__gaiusBootTimings = {
+      pageStart: performance.now()
+    };
+    const urlParams = new URLSearchParams(location.search);
+    const vanillaAssetsToken = "dev";
+    function hasGaiusVanillaAssetsMagic(bytes) {
+      const magic = "GAIUSVP1";
+      if (!(bytes instanceof Uint8Array) || bytes.length < 12) return false;
+      for (let index = 0; index < magic.length; index++) {
+        if (bytes[index] !== magic.charCodeAt(index)) return false;
+      }
+      return true;
+    }
+
+    async function gunzipGaiusVanillaAssets(bytes) {
+      if (hasGaiusVanillaAssetsMagic(bytes)) return bytes;
+      if (typeof DecompressionStream !== "function") {
+        throw new Error("This browser cannot decompress the Gaius vanilla asset pack");
+      }
+      const stream = new Blob([bytes])
+        .stream()
+        .pipeThrough(new DecompressionStream("gzip"));
+      const unpacked = new Uint8Array(await new Response(stream).arrayBuffer());
+      if (!hasGaiusVanillaAssetsMagic(unpacked)) {
+        throw new Error("The Gaius vanilla asset pack has an invalid header");
+      }
+      return unpacked;
+    }
+
+    async function decodeGaiusVanillaAssets(source) {
+      const compressed = source instanceof Uint8Array
+        ? source
+        : new Uint8Array(await source.arrayBuffer());
+      const bytes = await gunzipGaiusVanillaAssets(compressed);
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const indexLength = view.getUint32(8, true);
+      const indexStart = 12;
+      const dataOffset = indexStart + indexLength;
+      if (indexLength <= 0 || dataOffset > bytes.length) {
+        throw new Error("The Gaius vanilla asset index is truncated");
+      }
+      let index;
+      try {
+        index = JSON.parse(new TextDecoder().decode(bytes.subarray(indexStart, dataOffset)));
+      } catch (error) {
+        throw new Error("The Gaius vanilla asset index is invalid: " + String(error));
+      }
+      if (!index || typeof index !== "object" || Array.isArray(index)) {
+        throw new Error("The Gaius vanilla asset index is not an object");
+      }
+      const payloadLength = bytes.length - dataOffset;
+      let resourceCount = 0;
+      for (const name in index) {
+        if (!Object.prototype.hasOwnProperty.call(index, name)) continue;
+        const range = index[name];
+        if (!Array.isArray(range) || range.length !== 2 ||
+            !Number.isSafeInteger(range[0]) || !Number.isSafeInteger(range[1]) ||
+            range[0] < 0 || range[1] < 0 || range[0] + range[1] > payloadLength) {
+          throw new Error("The Gaius vanilla asset range is invalid: " + name);
+        }
+        resourceCount++;
+      }
+      if (resourceCount < 1000) {
+        throw new Error("The Gaius vanilla asset pack is incomplete");
+      }
+      const root = {bytes, index, dataOffset, resourceCount};
+      window.__gaiusVanillaAssets = root;
+      bootTimings.vanillaAssetsDecoded = performance.now();
+      return root;
+    }
+
+    async function loadGaiusVanillaAssets() {
+      bootTimings.vanillaAssetsRequestStart = performance.now();
+      const portableSource = window.__gaiusVanillaAssetsCompressedPromise;
+      if (portableSource) {
+        return decodeGaiusVanillaAssets(await portableSource);
+      }
+      const source = new URL(
+        urlParams.get("vanillaAssets") || "vanilla-assets.pack.gz",
+        location.href
+      );
+      const version = urlParams.get("fresh") === "1" || urlParams.get("cache") === "0"
+        ? vanillaAssetsToken + "-fresh-" + Date.now()
+        : vanillaAssetsToken;
+      source.searchParams.set("v", version);
+      const response = await fetch(source, {cache: "force-cache"});
+      if (!response.ok) {
+        throw new Error("Could not load the Gaius vanilla asset pack: HTTP " + response.status);
+      }
+      return decodeGaiusVanillaAssets(await response.blob());
+    }
+
+    window.__gaiusDecodeVanillaAssets = decodeGaiusVanillaAssets;
+    window.__gaiusVanillaAssetsReady = window.__gaiusVanillaAssetsReady ||
+      loadGaiusVanillaAssets();
+    window.__gaiusVanillaAssetsReady.catch(() => {});
+    const targetFps = Math.max(30, Math.min(260, Number(urlParams.get("targetFps")) || 120));
+    const showPerfHud = urlParams.get("hud") === "1";
+    const showLauncherDetails = urlParams.get("debug") === "1" || showPerfHud;
+    const rawDevicePixelRatio = Math.max(1.0, Math.min(3.0, Number(devicePixelRatio) || 1.0));
+    const defaultMaxDpr = Math.min(1.0, rawDevicePixelRatio);
+    const requestedWorldMinDpr = Number(urlParams.get("worldMinDpr"));
+    const requestedMenuMinDpr = Number(urlParams.get("menuMinDpr"));
+    const requestedMaxDpr = Number(urlParams.get("maxDpr"));
+    window.__gaiusWorldMinDpr = Math.max(
+      1.0,
+      Math.min(3.0, Number.isFinite(requestedWorldMinDpr) && requestedWorldMinDpr > 0 ? requestedWorldMinDpr : 1.0)
+    );
+    window.__gaiusMenuMinDpr = Math.max(
+      window.__gaiusWorldMinDpr,
+      Math.min(3.0, Number.isFinite(requestedMenuMinDpr) && requestedMenuMinDpr > 0 ? requestedMenuMinDpr : 1.0)
+    );
+    window.__gaiusMinDpr = window.__gaiusWorldMinDpr;
+    window.__gaiusMaxDpr = Math.max(
+      window.__gaiusMenuMinDpr,
+      Math.min(3.0, Number.isFinite(requestedMaxDpr) && requestedMaxDpr > 0 ? requestedMaxDpr : defaultMaxDpr)
+    );
+    window.__gaiusDefaultMaxDpr = window.__gaiusMaxDpr;
+    window.__gaiusMaxSingleBufferShadowBytes = Math.max(
+      0,
+      Math.min(256, Number(urlParams.get("singleShadowMB")) || 256) * 1024 * 1024
+    );
+    window.__gaiusMaxTotalBufferShadowBytes = Math.max(
+      0,
+      Math.min(1024, Number(urlParams.get("totalShadowMB")) || 1024) * 1024 * 1024
+    );
+    if (perfHud) perfHud.hidden = !showPerfHud;
+
+    (function installWasmHotpath() {
+      const state = window.__gaiusWasmHotpath = {
+        ready: false,
+        disabled: false,
+        error: null,
+        version: 0,
+        shiftIndices: null,
+        repackInterleaved: null,
+        unpackBitStorage: null
+      };
+      if (urlParams.get("wasmHotpath") === "0") {
+        state.disabled = true;
+        state.error = "disabled-by-url";
+        return;
+      }
+      if (typeof WebAssembly === "undefined") {
+        state.disabled = true;
+        state.error = "webassembly-unavailable";
+        return;
+      }
+      const indexBytes = type => {
+        switch (type | 0) {
+          case 0x1401: return 1;
+          case 0x1403: return 2;
+          case 0x1405: return 4;
+          default: return 0;
+        }
+      };
+      const record = (event, detail) => {
+        const counters = window.__gaiusMinecraftCounters || (window.__gaiusMinecraftCounters = {});
+        counters[event] = (counters[event] || 0) + 1;
+        const events = window.__gaiusMinecraftEvents || (window.__gaiusMinecraftEvents = []);
+        events.push({ event, detail: String(detail || ""), at: Date.now() });
+        if (events.length > 300) events.splice(0, events.length - 300);
+      };
+      state.readyPromise = (async () => {
+        await (window.__gaiusPortableAssetsReady || Promise.resolve());
+        const wasmUrl = window.__gaiusHotpathWasmUrl || new URL(
+          urlParams.get("hotpathWasm") || "gaius-hotpath.wasm",
+          location.href
+        );
+        const response = await fetch(wasmUrl, { cache: "force-cache" });
+        if (!response.ok) {
+          throw new Error("HTTP " + response.status + " while loading " + wasmUrl.pathname);
+        }
+        let result;
+        const contentType = response.headers.get("Content-Type") || "";
+        if (WebAssembly.instantiateStreaming && contentType.includes("wasm")) {
+          result = await WebAssembly.instantiateStreaming(response, {});
+        } else {
+          result = await WebAssembly.instantiate(await response.arrayBuffer(), {});
+        }
+        const exports = result.instance.exports;
+        const memory = exports.memory;
+        if (!memory || !exports.gaius_shift_indices) {
+          throw new Error("invalid Gaius hot-path wasm exports");
+        }
+        const capacity = exports.gaius_shift_indices_capacity() >>> 0;
+        const inputPtr = exports.gaius_shift_indices_input_ptr() >>> 0;
+        const outputPtr = exports.gaius_shift_indices_output_ptr() >>> 0;
+        const repackSourcePtr = exports.gaius_repack_source_ptr ? exports.gaius_repack_source_ptr() >>> 0 : 0;
+        const repackOutputPtr = exports.gaius_repack_output_ptr ? exports.gaius_repack_output_ptr() >>> 0 : 0;
+        const repackLayoutsPtr = exports.gaius_repack_layouts_ptr ? exports.gaius_repack_layouts_ptr() >>> 0 : 0;
+        const repackSourceCapacity = exports.gaius_repack_source_capacity ? exports.gaius_repack_source_capacity() >>> 0 : 0;
+        const repackOutputCapacity = exports.gaius_repack_output_capacity ? exports.gaius_repack_output_capacity() >>> 0 : 0;
+        const repackLayoutCapacity = exports.gaius_repack_layout_capacity ? exports.gaius_repack_layout_capacity() >>> 0 : 0;
+        const bitStorageInputPtr = exports.gaius_unpack_bit_storage_input_ptr ? exports.gaius_unpack_bit_storage_input_ptr() >>> 0 : 0;
+        const bitStorageOutputPtr = exports.gaius_unpack_bit_storage_output_ptr ? exports.gaius_unpack_bit_storage_output_ptr() >>> 0 : 0;
+        const bitStorageValueCapacity = exports.gaius_unpack_bit_storage_value_capacity ? exports.gaius_unpack_bit_storage_value_capacity() >>> 0 : 0;
+        const bitStorageLongCapacity = exports.gaius_unpack_bit_storage_long_capacity ? exports.gaius_unpack_bit_storage_long_capacity() >>> 0 : 0;
+        state.version = exports.gaius_hotpath_version ? exports.gaius_hotpath_version() >>> 0 : 0;
+        state.capacity = capacity;
+        state.repackSourceCapacity = repackSourceCapacity;
+        state.repackOutputCapacity = repackOutputCapacity;
+        state.repackLayoutCapacity = repackLayoutCapacity;
+        state.bitStorageValueCapacity = bitStorageValueCapacity;
+        state.bitStorageLongCapacity = bitStorageLongCapacity;
+        state.shiftIndices = function(type, source, start, count, baseVertex) {
+          const bytesPerIndex = indexBytes(type);
+          const length = count | 0;
+          const offset = Number(start);
+          if (!source || !bytesPerIndex || length <= 0 || length > capacity) return null;
+          const byteLength = length * bytesPerIndex;
+          if (!Number.isFinite(offset) || offset < 0 || offset + byteLength > source.byteLength) return null;
+          const memoryBytes = new Uint8Array(memory.buffer);
+          memoryBytes.set(source.subarray(offset, offset + byteLength), inputPtr);
+          if (!exports.gaius_shift_indices(type | 0, length, baseVertex | 0)) return null;
+          const outputType = exports.gaius_shift_indices_last_type() >>> 0;
+          const outputBytes = exports.gaius_shift_indices_last_bytes() >>> 0;
+          let output;
+          if (outputType === 0x1401) {
+            output = new Uint8Array(memory.buffer, outputPtr, length).slice();
+          } else if (outputType === 0x1403) {
+            output = new Uint16Array(memory.buffer, outputPtr, length).slice();
+          } else if (outputType === 0x1405) {
+            output = new Uint32Array(memory.buffer, outputPtr, length).slice();
+          } else {
+            return null;
+          }
+          return {
+            output,
+            type: outputType,
+            bytes: outputBytes,
+            min: exports.gaius_shift_indices_last_min() >>> 0,
+            max: exports.gaius_shift_indices_last_max() >>> 0
+          };
+        };
+        state.repackInterleaved = function(source, vertexCount, outputStride, layouts) {
+          if (!exports.gaius_repack_interleaved || !repackSourcePtr || !repackOutputPtr || !repackLayoutsPtr) return null;
+          const sourceBytes = source && source.byteLength ? source.byteLength >>> 0 : 0;
+          const vertices = vertexCount >>> 0;
+          const stride = outputStride >>> 0;
+          const layoutCount = layouts && layouts.length ? layouts.length >>> 0 : 0;
+          if (!sourceBytes || sourceBytes > repackSourceCapacity
+              || !vertices || !stride
+              || !layoutCount || layoutCount > repackLayoutCapacity
+              || vertices * stride > repackOutputCapacity) {
+            return null;
+          }
+          const memoryBytes = new Uint8Array(memory.buffer);
+          memoryBytes.set(source.subarray(0, sourceBytes), repackSourcePtr);
+          const layoutWords = new Uint32Array(memory.buffer, repackLayoutsPtr, layoutCount * 4);
+          for (let i = 0; i < layoutCount; i++) {
+            const layout = layouts[i];
+            const base = i * 4;
+            layoutWords[base] = layout.sourceOffset >>> 0;
+            layoutWords[base + 1] = layout.sourceStride >>> 0;
+            layoutWords[base + 2] = layout.bytes >>> 0;
+            layoutWords[base + 3] = layout.targetOffset >>> 0;
+          }
+          if (!exports.gaius_repack_interleaved(sourceBytes, vertices, layoutCount, stride)) return null;
+          const outputBytes = exports.gaius_repack_last_bytes ? exports.gaius_repack_last_bytes() >>> 0 : (vertices * stride);
+          return new Uint8Array(memory.buffer, repackOutputPtr, outputBytes).slice();
+        };
+        state.unpackBitStorage = function(sourceLongs, outputInts, size, bits, valuesPerLong) {
+          if (!exports.gaius_unpack_bit_storage || !bitStorageInputPtr || !bitStorageOutputPtr) return false;
+          const count = size >>> 0;
+          const bitCount = bits >>> 0;
+          const perLong = valuesPerLong >>> 0;
+          if (!sourceLongs || !outputInts
+              || !count || count > bitStorageValueCapacity
+              || !bitCount || bitCount > 32
+              || !perLong || perLong !== Math.floor(64 / bitCount)
+              || outputInts.length < count) {
+            return false;
+          }
+          const longCount = Math.ceil(count / perLong) >>> 0;
+          if (!longCount || longCount > bitStorageLongCapacity || sourceLongs.length < longCount) {
+            return false;
+          }
+          const input = new BigInt64Array(memory.buffer, bitStorageInputPtr, longCount);
+          input.set(sourceLongs.subarray(0, longCount));
+          if (!exports.gaius_unpack_bit_storage(count, bitCount, perLong)) return false;
+          outputInts.set(new Int32Array(memory.buffer, bitStorageOutputPtr, count));
+          const counters = window.__gaiusMinecraftCounters || (window.__gaiusMinecraftCounters = {});
+          counters.bitStorageWasmUnpack = (counters.bitStorageWasmUnpack || 0) + 1;
+          counters.bitStorageWasmValues = (counters.bitStorageWasmValues || 0) + count;
+          return true;
+        };
+        state.ready = true;
+        record("wasm-hotpath-ready", "version=" + state.version + " capacity=" + capacity);
+        return state;
+      })().catch(error => {
+        state.ready = false;
+        state.error = error && error.message ? error.message : String(error);
+        record("wasm-hotpath-fallback", state.error);
+        return state;
+      });
+    })();
+
+    let bootProgressValue = 0;
+    let bootProgressLabel = "Initializing...";
+    let bootLastProgressAt = performance.now();
+    let bootWarnedStall = false;
+
+    function setBootProgress(value, label) {
+      const next = Math.max(0, Math.min(100, Number(value) || 0));
+      if (next >= bootProgressValue || label) {
+        bootProgressValue = Math.max(bootProgressValue, next);
+        bootProgressLabel = label || bootProgressLabel;
+        bootLastProgressAt = performance.now();
+        if (bootProgressBar) bootProgressBar.style.width = Math.max(2, bootProgressValue) + "%";
+        if (bootProgressText) bootProgressText.textContent = Math.round(bootProgressValue) + "% " + bootProgressLabel;
+      }
+    }
+
+    window.__gaiusSetBootProgress = setBootProgress;
+
+    function showBootOverlay(label) {
+      const restarting = !!(bootScreen && bootScreen.hidden);
+      if (restarting) {
+        bootProgressValue = 8;
+        bootLastProgressAt = performance.now();
+        bootWarnedStall = false;
+        if (bootProgressBar) bootProgressBar.style.width = "8%";
+      }
+      if (bootScreen) bootScreen.hidden = false;
+      if (bootBrand) bootBrand.hidden = false;
+      if (profileGate) profileGate.hidden = true;
+      if (bootProgress) bootProgress.hidden = false;
+      if (bootProgressText) bootProgressText.hidden = false;
+      statusBox.hidden = !showLauncherDetails;
+      statusBox.dataset.state = "running";
+      statusBox.textContent = label || "Loading...";
+    }
+
+    window.__gaiusShowBootOverlay = showBootOverlay;
+
+    function hideBootOverlay() {
+      statusBox.hidden = true;
+      if (bootScreen) bootScreen.hidden = true;
+      if (bootBrand) bootBrand.hidden = true;
+      if (profileGate) profileGate.hidden = true;
+      if (bootProgress) bootProgress.hidden = true;
+      if (bootProgressText) bootProgressText.hidden = true;
+    }
+
+	    function setStatus(state, message, progress, progressLabel) {
+	      statusBox.hidden = state !== "error" && !showLauncherDetails;
+	      statusBox.dataset.state = state;
+	      statusBox.textContent = message;
+	      if (bootProgress) bootProgress.hidden = state === "error" ? false : bootProgress.hidden;
+	      if (bootProgressText) bootProgressText.hidden = state === "error" ? false : bootProgressText.hidden;
+	      if (progress !== undefined) {
+	        setBootProgress(progress, progressLabel || message.split("\n")[0]);
+	      }
+	      console[state === "error" ? "error" : "info"](message);
+	    }
+
+    setBootProgress(3, "Preparing the browser runtime...");
+
+    window.__gaiusFps = {
+      fps: 0,
+      rafFps: 0,
+      frames: 0,
+      gameFps: 0,
+      gameFrames: 0,
+      targetFps,
+      lowSamples: 0,
+      highSamples: 0,
+      degradedCount: 0,
+      recoveredCount: 0,
+      lastSampleAt: performance.now()
+    };
+    function maybeDegradeResolutionForFps() {
+      const fps = window.__gaiusFps;
+      const minecraftState = window.__gaiusMinecraftState || null;
+      const inWorld = !!(minecraftState && minecraftState.level);
+      const screenName = minecraftState && minecraftState.screen ? String(minecraftState.screen) : "";
+      if (screenName.includes("LevelLoadingScreen") || screenName.includes("ProgressScreen")) {
+        fps.lowSamples = 0;
+        fps.highSamples = 0;
+        return;
+      }
+      const nowMs = performance.now();
+      if (inWorld) {
+        if (!fps.worldEnteredAt) fps.worldEnteredAt = nowMs;
+        if (nowMs - fps.worldEnteredAt < 10000) {
+          fps.lowSamples = 0;
+          fps.highSamples = 0;
+          return;
+        }
+      } else {
+        fps.worldEnteredAt = 0;
+      }
+      const measured = Number.isFinite(fps.rafFps) && fps.rafFps > 0 ? fps.rafFps : 0;
+      if (!Number.isFinite(measured) || measured <= 0) return;
+      if (urlParams.has("dpr") || urlParams.has("pixelRatio") || urlParams.get("autoDpr") === "0") return;
+      if (fps.lastDprChangeAt && nowMs - fps.lastDprChangeAt < 8000) {
+        fps.lowSamples = 0;
+        fps.highSamples = 0;
+        return;
+      }
+      const lowTarget = Math.max(45, Math.min(targetFps * 0.70, targetFps - 20));
+      const recoveredTarget = Math.max(lowTarget + 10, Math.min(targetFps, lowTarget + 20));
+      const defaultMaxDpr = Number(window.__gaiusDefaultMaxDpr) || 1.0;
+      if (window.__gaiusMaxDpr < defaultMaxDpr && measured >= recoveredTarget) {
+        fps.highSamples++;
+        fps.lowSamples = 0;
+        if (fps.highSamples >= 5) {
+          window.__gaiusMaxDpr = Math.min(
+            defaultMaxDpr,
+            window.__gaiusMaxDpr < 1.0 ? 1.0 : window.__gaiusMaxDpr + 0.25
+          );
+          fps.highSamples = 0;
+          fps.recoveredCount++;
+          fps.lastDprChangeAt = nowMs;
+          if (window.__gaiusApplyCanvasResolution) {
+            window.__gaiusApplyCanvasResolution(window.innerWidth, window.innerHeight, true);
+          }
+        }
+        return;
+      }
+      fps.highSamples = 0;
+      if (measured < lowTarget) {
+        fps.lowSamples++;
+      } else if (measured >= recoveredTarget) {
+        fps.lowSamples = 0;
+      } else {
+        fps.lowSamples = Math.max(0, fps.lowSamples - 1);
+      }
+      const minDpr = inWorld
+        ? (Number(window.__gaiusWorldMinDpr) || 1.0)
+        : (Number(window.__gaiusMenuMinDpr) || 1.0);
+      if (fps.lowSamples < 3 || window.__gaiusMaxDpr <= minDpr) return;
+      const nextMaxDpr = Math.round((window.__gaiusMaxDpr - 0.25) * 4) / 4;
+      window.__gaiusMaxDpr = Math.max(minDpr, nextMaxDpr);
+      fps.lowSamples = 0;
+      fps.highSamples = 0;
+      fps.degradedCount++;
+      fps.lastDprChangeAt = nowMs;
+      if (window.__gaiusApplyCanvasResolution) {
+        window.__gaiusApplyCanvasResolution(window.innerWidth, window.innerHeight, true);
+      }
+    }
+    requestAnimationFrame(function gaiusFpsTick(now) {
+      const fps = window.__gaiusFps;
+      const inWorld = !!window.__gaiusMinecraftState?.level;
+      if (inWorld && !fps.rafMetricsWorldEnteredAt) {
+        fps.rafMetricsWorldEnteredAt = now;
+        fps.rafFrameTimes = new Float32Array(4096);
+        fps.rafFrameWriteIndex = 0;
+        fps.rafFrameCount = 0;
+        fps.rafLastFrameAt = 0;
+        fps.rafLongestFrameMs = 0;
+      } else if (!inWorld) {
+        fps.rafMetricsWorldEnteredAt = 0;
+      }
+      const previousFrameAt = fps.rafLastFrameAt;
+      if (Number.isFinite(previousFrameAt) && previousFrameAt > 0) {
+        const frameMs = now - previousFrameAt;
+        if (frameMs > 0 && frameMs <= 1000 && fps.rafMetricsWorldEnteredAt) {
+          let samples = fps.rafFrameTimes;
+          if (!(samples instanceof Float32Array) || samples.length !== 4096) {
+            samples = new Float32Array(4096);
+            fps.rafFrameTimes = samples;
+            fps.rafFrameWriteIndex = 0;
+            fps.rafFrameCount = 0;
+          }
+          const writeIndex = (Number(fps.rafFrameWriteIndex) || 0) % samples.length;
+          samples[writeIndex] = frameMs;
+          fps.rafFrameWriteIndex = (writeIndex + 1) % samples.length;
+          fps.rafFrameCount = Math.min(samples.length, (Number(fps.rafFrameCount) || 0) + 1);
+          fps.rafLongestFrameMs = Math.max(fps.rafLongestFrameMs || 0, frameMs);
+        }
+      }
+      fps.rafLastFrameAt = now;
+      fps.frames++;
+      const elapsed = now - fps.lastSampleAt;
+      if (elapsed >= 1000) {
+        fps.rafFps = Math.round((fps.frames * 1000 / elapsed) * 10) / 10;
+        const samples = fps.rafFrameTimes;
+        const sampleCount = samples instanceof Float32Array
+          ? Math.min(samples.length, Number(fps.rafFrameCount) || 0)
+          : 0;
+        if (sampleCount > 0) {
+          const ordered = Array.from(samples.subarray(0, sampleCount))
+            .sort((left, right) => left - right);
+          const totalMs = ordered.reduce((sum, value) => sum + value, 0);
+          const slowestCount = Math.max(1, Math.ceil(ordered.length * 0.01));
+          let slowestTotalMs = 0;
+          for (let index = ordered.length - slowestCount; index < ordered.length; index++) {
+            slowestTotalMs += ordered[index];
+          }
+          fps.rafAverageFps = Math.round((ordered.length * 1000 / totalMs) * 10) / 10;
+          fps.rafOnePercentLow = Math.round((slowestCount * 1000 / slowestTotalMs) * 10) / 10;
+        }
+        fps.fps = fps.rafFps;
+        fps.frames = 0;
+        fps.lastSampleAt = now;
+        maybeDegradeResolutionForFps();
+      }
+      requestAnimationFrame(gaiusFpsTick);
+    });
+
+    setInterval(() => {
+      if (!perfHud || !showPerfHud) return;
+      const fps = window.__gaiusFps || {};
+      const glStats = window.__gaiusGLStats || {};
+      const display = window.__gaiusDisplay || {};
+      const screen = window.__gaiusMinecraftState?.screen;
+      const level = window.__gaiusMinecraftState?.level;
+      const shownFps = Number.isFinite(fps.rafFps) && fps.rafFps > 0 ? fps.rafFps : 0;
+      const tier = shownFps >= 90 ? "ok" : (shownFps >= 45 ? "warn" : "bad");
+      perfHud.dataset.tier = tier;
+      perfHud.textContent = [
+        "Display FPS " + (shownFps ? shownFps.toFixed(1) : "--") + " / " + targetFps,
+        "Game loop " + (fps.gameFps ? fps.gameFps.toFixed(1) : "--"),
+        "Draw/s " + (glStats.drawCallsPerSecond ?? "--"),
+        "DPR " + (display.pixelRatio ? display.pixelRatio.toFixed(2) : "--")
+          + " FB " + (display.framebufferWidth || "--") + "x" + (display.framebufferHeight || "--"),
+        "Screen " + (screen ? String(screen).split(".").pop() : (level ? "InGame" : "Loading")),
+        fps.degradedCount || fps.recoveredCount
+          ? "AutoDPR -" + (fps.degradedCount || 0) + " +" + (fps.recoveredCount || 0)
+          : "AutoDPR ready"
+      ].join("\n");
+    }, 500);
+
+    setInterval(() => {
+      if (statusBox.dataset.state !== "running") return;
+	      const state = window.__gaiusMinecraftState;
+	      if (state && state.level) {
+	        setBootProgress(100, "World ready");
+	        hideBootOverlay();
+	        return;
+	      }
+	      if (state && (state.overlay || state.screen)) {
+	        const overlay = state.overlay ? String(state.overlay).split(".").pop() : "";
+	        const screen = state.screen ? String(state.screen).split(".").pop() : "";
+	        const keepGaiusBootVisible = [
+	          "GenericMessageScreen",
+	          "ProgressScreen",
+	          "LevelLoadingScreen",
+	          "ReceivingLevelScreen"
+	        ].includes(screen) || overlay === "LoadingOverlay";
+	        if (keepGaiusBootVisible) {
+	          const loadingLabel = screen === "ReceivingLevelScreen"
+	            ? "Connecting to world..."
+	            : (screen === "LevelLoadingScreen"
+	              ? "Loading world..."
+	              : "Loading game resources...");
+	          showBootOverlay(loadingLabel);
+	          setBootProgress(Math.max(bootProgressValue, 35), loadingLabel);
+	          return;
+	        }
+	        if (screen) {
+	          setBootProgress(100, "Client screen ready: " + screen);
+	          hideBootOverlay();
+	          return;
+	        }
+	      }
+      const idleMs = performance.now() - bootLastProgressAt;
+      if (idleMs > 30000 && !bootWarnedStall) {
+        bootWarnedStall = true;
+        statusBox.textContent += "\n\nStartup has made no visible progress for 30 seconds. The browser is still running, but resource loading, world generation, or a long main-thread task may be stalled.";
+      }
+    }, 1000);
+
+    window.addEventListener("error", event => {
+      const error = event.error;
+      setStatus("error", [
+        "Browser runtime error:",
+        error && error.stack ? error.stack : event.message
+      ].join("\n"));
+    });
+
+    window.addEventListener("unhandledrejection", event => {
+      const reason = event.reason;
+      setStatus("error", [
+        "Unhandled browser promise rejection:",
+        reason && reason.stack ? reason.stack : String(reason)
+      ].join("\n"));
+    });
+
+    function createGaiusProxyUrl(target, kind) {
+      const configured = urlParams.get("bridge") || urlParams.get("relay") || window.__gaiusBridgeUrl;
+      let bridge;
+      if (configured && String(configured).trim()) {
+        bridge = new URL(String(configured).trim(), location.href);
+      } else {
+        const scheme = location.protocol === "https:" ? "https:" : "http:";
+        const rawHost = String(window.__gaiusBridgeHost || location.hostname || "127.0.0.1");
+        const host = rawHost.includes(":") &&
+          !(rawHost.startsWith("[") && rawHost.endsWith("]"))
+          ? "[" + rawHost + "]"
+          : rawHost;
+        const port = window.__gaiusBridgePort || "8080";
+        bridge = new URL(scheme + "//" + host + ":" + port + "/");
+      }
+      if (bridge.protocol === "ws:") bridge.protocol = "http:";
+      if (bridge.protocol === "wss:") bridge.protocol = "https:";
+      if (bridge.protocol !== "http:" && bridge.protocol !== "https:") {
+        throw new Error("Unsupported Gaius bridge protocol: " + bridge.protocol);
+      }
+      bridge.pathname = "/proxy/" + String(kind);
+      bridge.hash = "";
+      bridge.search = "";
+      bridge.searchParams.set("url", String(target));
+      const token = urlParams.get("bridgeToken") || urlParams.get("relayToken") || window.__gaiusBridgeToken;
+      if (token && String(token).length) bridge.searchParams.set("token", String(token));
+      return bridge.href;
+    }
+
+    async function loadGaiusMinecraftProfile(accessToken) {
+      const response = await fetch(createGaiusProxyUrl(
+        "https://api.minecraftservices.com/minecraft/profile",
+        "auth"
+      ), {
+        method: "GET",
+        headers: {
+          "accept": "application/json",
+          "authorization": "Bearer " + accessToken
+        },
+        cache: "no-store"
+      });
+      if (!response.ok) {
+        throw new Error("Minecraft profile request failed with HTTP " + response.status);
+      }
+      const profile = await response.json();
+      const username = String(profile && profile.name || "").trim();
+      const uuid = String(profile && profile.id || "").replace(/-/g, "").toLowerCase();
+      if (!/^[A-Za-z0-9_]{1,16}$/.test(username) || !/^[0-9a-f]{32}$/.test(uuid)) {
+        throw new Error("Minecraft profile response did not contain a valid Java profile");
+      }
+      return {username, uuid};
+    }
+
+    function requestGaiusPlayerName(initialName) {
+      if (!profileGate || !profileForm || !profileName || !profileError) {
+        throw new Error("The Gaius player-name screen is unavailable");
+      }
+      profileName.value = String(initialName || "").trim();
+      profileError.textContent = "";
+      profileGate.hidden = false;
+      if (bootBrand) bootBrand.hidden = true;
+      if (bootProgress) bootProgress.hidden = true;
+      if (bootProgressText) bootProgressText.hidden = true;
+      statusBox.hidden = true;
+      return new Promise(resolve => {
+        const submit = event => {
+          event.preventDefault();
+          const username = profileName.value.trim();
+          if (!/^[A-Za-z0-9_]{1,16}$/.test(username)) {
+            profileError.textContent = "Use 1-16 letters, numbers, or underscores.";
+            profileName.focus();
+            return;
+          }
+          profileForm.removeEventListener("submit", submit);
+          try {
+            localStorage.setItem("gaius.playerName", username);
+          } catch (error) {
+            console.warn("Could not remember the Gaius player name", error);
+          }
+          profileGate.hidden = true;
+          if (bootBrand) bootBrand.hidden = false;
+          if (bootProgress) bootProgress.hidden = false;
+          if (bootProgressText) bootProgressText.hidden = false;
+          statusBox.hidden = !showLauncherDetails;
+          setBootProgress(Math.max(bootProgressValue, 3), "Preparing the browser runtime...");
+          resolve(username);
+        };
+        profileForm.addEventListener("submit", submit);
+        requestAnimationFrame(() => {
+          profileName.focus();
+          profileName.select();
+        });
+      });
+    }
+
+    function changeGaiusPlayerName() {
+      if (profileSwitch) profileSwitch.disabled = true;
+      try {
+        sessionStorage.removeItem("gaius.session");
+      } catch (error) {
+        console.warn("Could not clear the current Gaius session", error);
+      }
+      window.__gaiusSession = {};
+      const next = new URL(location.href);
+      for (const key of ["username", "uuid", "accessToken", "xuid", "clientId"]) {
+        next.searchParams.delete(key);
+      }
+      try {
+        if (typeof window.__gaiusReleaseRuntimeLease === "function") {
+          window.__gaiusReleaseRuntimeLease();
+        }
+      } finally {
+        location.replace(next.href);
+      }
+    }
+
+    function updateGaiusProfileSwitch() {
+      if (!profileSwitch) return;
+      const state = window.__gaiusMinecraftState;
+      const screen = state && state.screen
+        ? String(state.screen).split(".").pop()
+        : "";
+      profileSwitch.hidden = !profileGate || !profileGate.hidden || screen !== "TitleScreen";
+    }
+
+    if (profileSwitch) {
+      profileSwitch.addEventListener("click", changeGaiusPlayerName);
+      setInterval(updateGaiusProfileSwitch, 250);
+      updateGaiusProfileSwitch();
+    }
+    window.__gaiusChangePlayerName = changeGaiusPlayerName;
+
+    async function buildGaiusSessionArgs() {
+      let stored = {};
+      try {
+        const value = sessionStorage.getItem("gaius.session");
+        stored = value ? JSON.parse(value) : {};
+      } catch (error) {
+        console.warn("Ignoring invalid Gaius sessionStorage data", error);
+      }
+      const injected = window.__gaiusSession && typeof window.__gaiusSession === "object"
+        ? window.__gaiusSession
+        : {};
+      const queried = {};
+      for (const key of ["username", "uuid", "accessToken", "xuid", "clientId"]) {
+        const value = urlParams.get(key);
+        if (value !== null && value.trim()) queried[key] = value.trim();
+      }
+      const session = Object.assign({}, stored, injected, queried);
+      const quickPlayServer = String(urlParams.get("server") || "").trim();
+      if (quickPlayServer.length > 512) {
+        throw new Error("Quick-play server address is too long");
+      }
+      const accessToken = String(session.accessToken || "").trim();
+      const online = accessToken.length > 0 && accessToken !== "0";
+      let username = String(session.username || "").trim();
+      let uuid = String(session.uuid || (online ? "" : "00000000000040008000000000000001"))
+        .replace(/-/g, "")
+        .toLowerCase();
+      if (username && !/^[A-Za-z0-9_]{1,16}$/.test(username)) {
+        throw new Error("Player name must use 1-16 letters, numbers, or underscores");
+      }
+      if (uuid && !/^[0-9a-f]{32}$/.test(uuid)) {
+        throw new Error("Online session UUID must contain 32 hexadecimal digits");
+      }
+      if (online && (!username || !uuid)) {
+        const profile = await loadGaiusMinecraftProfile(accessToken);
+        if (!username) username = profile.username;
+        if (!uuid) uuid = profile.uuid;
+        session.username = username;
+        session.uuid = uuid;
+        sessionStorage.setItem("gaius.session", JSON.stringify(session));
+      }
+      if (!online && !username) {
+        let rememberedName = "";
+        try {
+          rememberedName = localStorage.getItem("gaius.playerName") || "";
+        } catch (error) {
+          console.warn("Could not read the remembered Gaius player name", error);
+        }
+        username = await requestGaiusPlayerName(rememberedName);
+        session.username = username;
+        session.uuid = uuid;
+        sessionStorage.setItem("gaius.session", JSON.stringify(session));
+      }
+      if (!/^[A-Za-z0-9_]{1,16}$/.test(username)) {
+        throw new Error("Player name must use 1-16 letters, numbers, or underscores");
+      }
+      if (!/^[0-9a-f]{32}$/.test(uuid)) {
+        throw new Error("Online session UUID must contain 32 hexadecimal digits");
+      }
+      const args = [
+        "--version", "template",
+        "--versionType", "release",
+        "--accessToken", online ? accessToken : "0",
+        "--username", username,
+        "--uuid", uuid,
+        "--gameDir", "/gaius",
+        "--assetsDir", "/gaius/assets",
+        "--assetIndex", "template",
+        "--resourcePackDir", "/gaius/resourcepacks",
+        "--width", String(Math.max(854, window.innerWidth || 854)),
+        "--height", String(Math.max(480, window.innerHeight || 480))
+      ];
+      if (online) {
+        if (session.xuid) args.push("--xuid", String(session.xuid));
+        if (session.clientId) args.push("--clientId", String(session.clientId));
+      } else {
+        args.push("--offlineDeveloperMode");
+      }
+      if (quickPlayServer) args.push("--quickPlayMultiplayer", quickPlayServer);
+      window.__gaiusSessionMode = online ? "online" : "offline";
+      return args;
+    }
+
+    window.__gaiusConfigureSession = session => {
+      if (!session || typeof session !== "object") throw new TypeError("Session must be an object");
+      sessionStorage.setItem("gaius.session", JSON.stringify(session));
+    };
+    window.__gaiusClearSession = () => sessionStorage.removeItem("gaius.session");
+    window.__gaiusDefaultArgsPromise = buildGaiusSessionArgs();
+    window.__gaiusDefaultArgsPromise.catch(() => {});
+    const identityQueryKeys = ["username", "uuid", "accessToken", "xuid", "clientId"];
+    if (identityQueryKeys.some(key => urlParams.has(key))) {
+      const scrubbed = new URL(location.href);
+      for (const key of identityQueryKeys) scrubbed.searchParams.delete(key);
+      history.replaceState(history.state, "", scrubbed.pathname + scrubbed.search + scrubbed.hash);
+    }
+
+    const gaiusDiagMode = new URLSearchParams(location.search).get("diag");
+    const gaiusTextDiagnosticModes = new Set([
+      "texttrace", "nolightmaptext", "textforcefrag", "texttexfrag", "textvertexfrag"
+    ]);
+    if (gaiusTextDiagnosticModes.has(gaiusDiagMode)) (function installLightweightTextShaderPatch() {
+      const originalGetContext = HTMLCanvasElement.prototype.getContext;
+      HTMLCanvasElement.prototype.getContext = function(type, attributes) {
+        const gl = originalGetContext.call(this, type, attributes);
+        if (type !== "webgl2" || !gl || gl.__gaiusTextShaderPatchInstalled) {
+          return gl;
+        }
+        gl.__gaiusTextShaderPatchInstalled = true;
+        const shaderTypes = new WeakMap();
+        const textShaders = new WeakSet();
+        const programShaders = new WeakMap();
+        const textPrograms = new WeakSet();
+        const programIds = new WeakMap();
+        const uniformMetadata = new WeakMap();
+        const uniformValues = new WeakMap();
+        const textureMetadata = new WeakMap();
+        const samplerIds = new WeakMap();
+        const boundTextures = new Map();
+        const boundSamplers = new Map();
+        const telemetry = {
+          version: 1,
+          mode: gaiusDiagMode,
+          programs: [],
+          draws: 0,
+          samples: [],
+          textureCreates: 0,
+          samplerCreates: 0
+        };
+        window.__gaiusTextShaderTelemetry = telemetry;
+        let nextProgramId = 1;
+        let nextTextureId = 1;
+        let nextSamplerId = 1;
+        let activeUnit = 0;
+        let currentProgram = null;
+        const textureKey = (unit, target) => unit * 65536 + (target & 65535);
+        const byteLength = value => value && Number.isFinite(value.byteLength)
+          ? Number(value.byteLength) : 0;
+        const findBackendTextureId = texture => {
+          if (!texture) return 0;
+          const metadata = textureMetadata.get(texture);
+          if (metadata && metadata.backendId !== undefined) return metadata.backendId;
+          let backendId = 0;
+          const state = window.__gaiusGL;
+          if (state && state.textures) {
+            for (const entry of state.textures.entries()) {
+              if (entry[1] === texture) {
+                backendId = Number(entry[0]) | 0;
+                break;
+              }
+            }
+          }
+          if (metadata) metadata.backendId = backendId;
+          return backendId;
+        };
+        const describeTexture = texture => {
+          if (!texture) return null;
+          const metadata = textureMetadata.get(texture) || { diagnosticId: 0 };
+          const backendId = findBackendTextureId(texture);
+          const state = window.__gaiusGL;
+          const backendInfo = backendId && state && state.textureInfo
+            ? state.textureInfo.get(backendId) : null;
+          return {
+            diagnosticId: metadata.diagnosticId | 0,
+            backendId,
+            width: Number(metadata.width || (backendInfo && backendInfo.width) || 0) | 0,
+            height: Number(metadata.height || (backendInfo && backendInfo.height) || 0) | 0,
+            internalFormat: Number(metadata.internalFormat
+              || (backendInfo && backendInfo.internalFormat) || 0) | 0,
+            format: Number(metadata.format || (backendInfo && backendInfo.format) || 0) | 0,
+            type: Number(metadata.type || (backendInfo && backendInfo.type) || 0) | 0,
+            imageBytes: Number(metadata.imageBytes || 0) | 0,
+            subImageCalls: Number(metadata.subImageCalls || 0) | 0,
+            subImageBytes: Number(metadata.subImageBytes || 0) | 0,
+            lastSubImageWidth: Number(metadata.lastSubImageWidth || 0) | 0,
+            lastSubImageHeight: Number(metadata.lastSubImageHeight || 0) | 0
+          };
+        };
+        const describeUnit = unit => ({
+          unit: unit | 0,
+          texture: describeTexture(boundTextures.get(textureKey(unit, gl.TEXTURE_2D)) || null),
+          samplerId: samplerIds.get(boundSamplers.get(unit)) || 0
+        });
+        const createShader = gl.createShader.bind(gl);
+        gl.createShader = function(shaderType) {
+          const shader = createShader(shaderType);
+          shaderTypes.set(shader, shaderType);
+          return shader;
+        };
+        const shaderSource = gl.shaderSource.bind(gl);
+        gl.shaderSource = function(shader, source) {
+          const shaderType = shaderTypes.get(shader);
+          const sourceText = String(source);
+          const looksLikeTextShader = shaderType === gl.FRAGMENT_SHADER
+            && sourceText.includes("uniform sampler2D Sampler0")
+            && sourceText.includes("in vec4 vertexColor")
+            && sourceText.includes("in vec2 texCoord0")
+            && sourceText.includes("ColorModulator")
+            && sourceText.includes("apply_fog");
+          if (looksLikeTextShader) textShaders.add(shader);
+          if ((gaiusDiagMode === "nolightmaptext"
+              || gaiusDiagMode === "textforcefrag"
+              || gaiusDiagMode === "texttexfrag"
+              || gaiusDiagMode === "textvertexfrag") && shaderType === gl.VERTEX_SHADER) {
+            source = String(source)
+              .replace("vertexColor = Color * sample_lightmap(Sampler2, UV2);", "vertexColor = Color;")
+              .replace("vertexColor = Color * sample_lightmap(Sampler2, UV2)", "vertexColor = Color")
+              .replace("vertexColor = Color * texelFetch(Sampler2, UV2 / 16, 0);", "vertexColor = Color;")
+              .replace("vertexColor = Color * texelFetch(Sampler2, ivec2(UV2) / 16, 0);", "vertexColor = Color;")
+              .replace("vertexColor = Color * texelFetch(Sampler2, UV2 / 16, 0)", "vertexColor = Color")
+              .replace("vertexColor = Color * texelFetch(Sampler2, ivec2(UV2) / 16, 0)", "vertexColor = Color");
+          }
+          if ((gaiusDiagMode === "textforcefrag"
+              || gaiusDiagMode === "texttexfrag"
+              || gaiusDiagMode === "textvertexfrag") && shaderType === gl.FRAGMENT_SHADER) {
+            if (looksLikeTextShader) {
+              if (gaiusDiagMode === "textforcefrag") {
+                source = "#version 300 es\nprecision highp float;\nprecision highp int;\nout vec4 fragColor;\nvoid main(){ fragColor = vec4(1.0, 0.0, 1.0, 1.0); }\n";
+              } else if (gaiusDiagMode === "texttexfrag") {
+                source = "#version 300 es\nprecision highp float;\nprecision highp int;\nuniform sampler2D Sampler0;\nin vec2 texCoord0;\nout vec4 fragColor;\nvoid main(){ fragColor = texture(Sampler0, texCoord0); }\n";
+              } else if (gaiusDiagMode === "textvertexfrag") {
+                source = "#version 300 es\nprecision highp float;\nprecision highp int;\nin vec4 vertexColor;\nout vec4 fragColor;\nvoid main(){ fragColor = vertexColor; }\n";
+              }
+            }
+          }
+          return shaderSource(shader, source);
+        };
+        const createProgram = gl.createProgram.bind(gl);
+        gl.createProgram = function() {
+          const program = createProgram();
+          programIds.set(program, nextProgramId++);
+          programShaders.set(program, []);
+          return program;
+        };
+        const attachShader = gl.attachShader.bind(gl);
+        gl.attachShader = function(program, shader) {
+          const shaders = programShaders.get(program);
+          if (shaders) shaders.push(shader);
+          return attachShader(program, shader);
+        };
+        const linkProgram = gl.linkProgram.bind(gl);
+        gl.linkProgram = function(program) {
+          const result = linkProgram(program);
+          const shaders = programShaders.get(program) || [];
+          if (shaders.some(shader => textShaders.has(shader))) {
+            textPrograms.add(program);
+            telemetry.programs.push({ id: programIds.get(program) || 0 });
+          }
+          return result;
+        };
+        const useProgram = gl.useProgram.bind(gl);
+        gl.useProgram = function(program) {
+          currentProgram = program;
+          return useProgram(program);
+        };
+        const getUniformLocation = gl.getUniformLocation.bind(gl);
+        gl.getUniformLocation = function(program, name) {
+          const location = getUniformLocation(program, name);
+          if (location) uniformMetadata.set(location, { program, name: String(name) });
+          return location;
+        };
+        const noteUniformInteger = (location, value) => {
+          const metadata = location && uniformMetadata.get(location);
+          if (!metadata) return;
+          let values = uniformValues.get(metadata.program);
+          if (!values) {
+            values = new Map();
+            uniformValues.set(metadata.program, values);
+          }
+          values.set(metadata.name, Number(value) | 0);
+        };
+        const uniform1i = gl.uniform1i.bind(gl);
+        gl.uniform1i = function(location, value) {
+          noteUniformInteger(location, value);
+          return uniform1i(location, value);
+        };
+        const uniform1iv = gl.uniform1iv.bind(gl);
+        gl.uniform1iv = function(location, values) {
+          if (values && values.length) noteUniformInteger(location, values[0]);
+          return uniform1iv(location, values);
+        };
+        const activeTexture = gl.activeTexture.bind(gl);
+        gl.activeTexture = function(texture) {
+          activeUnit = Math.max(0, (Number(texture) | 0) - gl.TEXTURE0);
+          return activeTexture(texture);
+        };
+        const createTexture = gl.createTexture.bind(gl);
+        gl.createTexture = function() {
+          const texture = createTexture();
+          textureMetadata.set(texture, { diagnosticId: nextTextureId++ });
+          telemetry.textureCreates++;
+          return texture;
+        };
+        const bindTexture = gl.bindTexture.bind(gl);
+        gl.bindTexture = function(target, texture) {
+          boundTextures.set(textureKey(activeUnit, target), texture);
+          return bindTexture(target, texture);
+        };
+        const texImage2D = gl.texImage2D.bind(gl);
+        gl.texImage2D = function(...args) {
+          const result = texImage2D(...args);
+          const texture = boundTextures.get(textureKey(activeUnit, args[0]));
+          const metadata = texture && textureMetadata.get(texture);
+          if (metadata) {
+            metadata.internalFormat = Number(args[2]) | 0;
+            if (args.length >= 9) {
+              metadata.width = Number(args[3]) | 0;
+              metadata.height = Number(args[4]) | 0;
+              metadata.format = Number(args[6]) | 0;
+              metadata.type = Number(args[7]) | 0;
+              metadata.imageBytes = byteLength(args[8]);
+            } else {
+              const source = args[5];
+              metadata.width = Number(source && (source.width || source.videoWidth) || 0) | 0;
+              metadata.height = Number(source && (source.height || source.videoHeight) || 0) | 0;
+              metadata.format = Number(args[3]) | 0;
+              metadata.type = Number(args[4]) | 0;
+            }
+          }
+          return result;
+        };
+        const texSubImage2D = gl.texSubImage2D.bind(gl);
+        gl.texSubImage2D = function(...args) {
+          const result = texSubImage2D(...args);
+          const texture = boundTextures.get(textureKey(activeUnit, args[0]));
+          const metadata = texture && textureMetadata.get(texture);
+          if (metadata) {
+            const source = args.length >= 9 ? args[8] : args[6];
+            metadata.subImageCalls = (metadata.subImageCalls || 0) + 1;
+            metadata.subImageBytes = (metadata.subImageBytes || 0) + byteLength(source);
+            metadata.lastSubImageWidth = Number(args[4]
+              || (source && (source.width || source.videoWidth)) || 0) | 0;
+            metadata.lastSubImageHeight = Number(args[5]
+              || (source && (source.height || source.videoHeight)) || 0) | 0;
+          }
+          return result;
+        };
+        if (gl.createSampler && gl.bindSampler) {
+          const createSampler = gl.createSampler.bind(gl);
+          gl.createSampler = function() {
+            const sampler = createSampler();
+            samplerIds.set(sampler, nextSamplerId++);
+            telemetry.samplerCreates++;
+            return sampler;
+          };
+          const bindSampler = gl.bindSampler.bind(gl);
+          gl.bindSampler = function(unit, sampler) {
+            boundSamplers.set(Number(unit) | 0, sampler);
+            return bindSampler(unit, sampler);
+          };
+        }
+        const recordTextDraw = (kind, count) => {
+          if (!currentProgram || !textPrograms.has(currentProgram)) return;
+          telemetry.draws++;
+          if (telemetry.samples.length >= 64) return;
+          const values = uniformValues.get(currentProgram);
+          const sampler0 = values && values.has("Sampler0") ? values.get("Sampler0") : 0;
+          const sampler2 = values && values.has("Sampler2") ? values.get("Sampler2") : 0;
+          telemetry.samples.push({
+            at: performance.now(),
+            kind,
+            count: Number(count) | 0,
+            programId: programIds.get(currentProgram) || 0,
+            activeUnit,
+            sampler0: describeUnit(sampler0),
+            sampler2: describeUnit(sampler2)
+          });
+        };
+        for (const method of ["drawArrays", "drawElements", "drawArraysInstanced", "drawElementsInstanced"]) {
+          if (!gl[method]) continue;
+          const draw = gl[method].bind(gl);
+          gl[method] = function(...args) {
+            recordTextDraw(method, method.includes("Elements") ? args[1] : args[2]);
+            return draw(...args);
+          };
+        }
+        return gl;
+      };
+    })();
+
+    if (gaiusDiagMode === "1"
+        || gaiusDiagMode === "forcefrag"
+        || gaiusDiagMode === "vertexfrag"
+        || gaiusDiagMode === "texfrag") (function installWebGLStats() {
+      const originalGetContext = HTMLCanvasElement.prototype.getContext;
+      HTMLCanvasElement.prototype.getContext = function(type, attributes) {
+        const gl = originalGetContext.call(this, type, attributes);
+        if (type !== "webgl2" || !gl || gl.__gaiusStatsInstalled) {
+          return gl;
+        }
+        gl.__gaiusStatsInstalled = true;
+        const stats = window.__gaiusGLStats = {
+          drawArrays: 0,
+          drawElements: 0,
+          blitFramebuffer: 0,
+          clear: 0,
+          clearColor: [0, 0, 0, 0],
+          clearSamples: [],
+          texUploads: [],
+          activeTextureSamples: [],
+          textureBindSamples: [],
+          samplerBindSamples: [],
+          bufferUploads: [],
+          uniformCalls: {},
+          uniformSamples: [],
+          uniformBlocks: [],
+          uniformBufferRanges: [],
+          uniformBufferRangeCounts: {},
+          uniformBufferRangeSamples: [],
+          uniformBufferBindings: [],
+          shaderPrograms: {},
+          textureInfo: {},
+          attribPointers: {},
+          currentProgramId: null,
+          extensions: {},
+          lastDrawState: null,
+          bindFramebuffer: [],
+          framebufferTexture2D: [],
+          framebufferStatus: [],
+          framebufferAttachments: {},
+          blitSamples: [],
+          drawSamples: [],
+          mainDrawSamples: [],
+          sequence: 0,
+          mainBufferState: {
+            everNonBlack: false,
+            lastNonBlack: false,
+            watchPoint: null,
+            lastPixel: null
+          },
+          mainBufferTransitions: [],
+          nonBlackMainDraw: null,
+          nonBlackAfterDraw: null,
+          lastError: 0,
+          samplingState: false
+        };
+        if (gaiusDiagMode === "forcefrag"
+            || gaiusDiagMode === "vertexfrag"
+            || gaiusDiagMode === "texfrag"
+            || gaiusDiagMode === "nolightmaptext") {
+          const shaderTypes = new Map();
+          const createShader = gl.createShader.bind(gl);
+          gl.createShader = function(type) {
+            const shader = createShader(type);
+            shaderTypes.set(shader, type);
+            return shader;
+          };
+          const shaderSource = gl.shaderSource.bind(gl);
+          gl.shaderSource = function(shader, source) {
+            if (gaiusDiagMode === "nolightmaptext" && shaderTypes.get(shader) === gl.VERTEX_SHADER) {
+              source = String(source)
+                .replace("vertexColor = Color * sample_lightmap(Sampler2, UV2);", "vertexColor = Color;")
+                .replace("vertexColor = Color * sample_lightmap(Sampler2, UV2)", "vertexColor = Color")
+                .replace("vertexColor = Color * texelFetch(Sampler2, UV2 / 16, 0);", "vertexColor = Color;")
+                .replace("vertexColor = Color * texelFetch(Sampler2, ivec2(UV2) / 16, 0);", "vertexColor = Color;")
+                .replace("vertexColor = Color * texelFetch(Sampler2, UV2 / 16, 0)", "vertexColor = Color")
+                .replace("vertexColor = Color * texelFetch(Sampler2, ivec2(UV2) / 16, 0)", "vertexColor = Color");
+            }
+            if (shaderTypes.get(shader) === gl.FRAGMENT_SHADER) {
+              if (gaiusDiagMode === "forcefrag") {
+                source = "#version 300 es\nprecision highp float;\nprecision highp int;\nout vec4 fragColor;\nvoid main(){ fragColor = vec4(1.0, 0.0, 1.0, 1.0); }\n";
+              } else if (gaiusDiagMode === "vertexfrag" && String(source).includes("vertexColor")) {
+                source = "#version 300 es\nprecision highp float;\nprecision highp int;\nin vec4 vertexColor;\nout vec4 fragColor;\nvoid main(){ fragColor = vertexColor; }\n";
+              } else if (gaiusDiagMode === "texfrag" && String(source).includes("texCoord0") && String(source).includes("Sampler0")) {
+                source = "#version 300 es\nprecision highp float;\nprecision highp int;\nuniform sampler2D Sampler0;\nin vec2 texCoord0;\nout vec4 fragColor;\nvoid main(){ fragColor = texture(Sampler0, texCoord0); }\n";
+              }
+            }
+            return shaderSource(shader, source);
+          };
+        }
+        const shaderIds = new WeakMap();
+        const programIds = new WeakMap();
+        let nextWebGLObjectId = 1;
+        const createShaderForStats = gl.createShader.bind(gl);
+        gl.createShader = function(type) {
+          const shader = createShaderForStats(type);
+          shaderIds.set(shader, nextWebGLObjectId++);
+          stats.shaderPrograms[`shader:${shaderIds.get(shader)}`] = {type, source: null};
+          return shader;
+        };
+        const shaderSourceForStats = gl.shaderSource.bind(gl);
+        gl.shaderSource = function(shader, source) {
+          const id = shaderIds.get(shader);
+          if (id) {
+            const item = stats.shaderPrograms[`shader:${id}`] || {};
+            item.type = item.type || null;
+            item.source = String(source).slice(0, 4000);
+            stats.shaderPrograms[`shader:${id}`] = item;
+          }
+          return shaderSourceForStats(shader, source);
+        };
+        const createProgramForStats = gl.createProgram.bind(gl);
+        gl.createProgram = function() {
+          const program = createProgramForStats();
+          programIds.set(program, nextWebGLObjectId++);
+          stats.shaderPrograms[`program:${programIds.get(program)}`] = {shaders: []};
+          return program;
+        };
+        const attachShaderForStats = gl.attachShader.bind(gl);
+        gl.attachShader = function(program, shader) {
+          const programId = programIds.get(program);
+          const shaderId = shaderIds.get(shader);
+          if (programId && shaderId) {
+            const item = stats.shaderPrograms[`program:${programId}`] || {shaders: []};
+            item.shaders = item.shaders || [];
+            item.shaders.push(shaderId);
+            stats.shaderPrograms[`program:${programId}`] = item;
+          }
+          return attachShaderForStats(program, shader);
+        };
+        const useProgramForStats = gl.useProgram.bind(gl);
+        gl.useProgram = function(program) {
+          stats.currentProgramId = program ? programIds.get(program) || null : null;
+          return useProgramForStats(program);
+        };
+        const samplePoints = () => {
+          const width = gl.drawingBufferWidth || this.width || 854;
+          const height = gl.drawingBufferHeight || this.height || 480;
+          const points = [
+            [Math.floor(width * 0.50), Math.floor(height * 0.50)],
+            [Math.floor(width * 0.50), Math.floor(height * 0.25)],
+            [Math.floor(width * 0.50), Math.floor(height * 0.75)],
+            [Math.floor(width * 0.25), Math.floor(height * 0.50)],
+            [Math.floor(width * 0.75), Math.floor(height * 0.50)],
+            [Math.floor(width * 0.15), Math.floor(height * 0.15)],
+            [Math.floor(width * 0.85), Math.floor(height * 0.85)]
+          ];
+          for (let y = 1; y <= 5; y++) {
+            for (let x = 1; x <= 8; x++) {
+              points.push([Math.floor(width * x / 9), Math.floor(height * y / 6)]);
+            }
+          }
+          return points;
+        };
+        const readState = (method, args) => {
+          const bindings = window.__gaiusGL && window.__gaiusGL.framebufferBindings;
+          const state = {
+            method,
+            seq: stats.sequence,
+            args: args.map(Number),
+            framebuffer: bindings ? {"draw": bindings.draw, "read": bindings.read} : null,
+            attachments: bindings
+              ? {"draw": attachmentsFor(bindings.draw), "read": attachmentsFor(bindings.read)}
+              : null
+          };
+          try {
+            stats.samplingState = true;
+            state.viewport = Array.from(gl.getParameter(gl.VIEWPORT));
+            state.scissorBox = Array.from(gl.getParameter(gl.SCISSOR_BOX));
+            state.colorMask = Array.from(gl.getParameter(gl.COLOR_WRITEMASK));
+            state.depthMask = !!gl.getParameter(gl.DEPTH_WRITEMASK);
+            state.blend = gl.isEnabled(gl.BLEND);
+            state.depthTest = gl.isEnabled(gl.DEPTH_TEST);
+            state.scissorTest = gl.isEnabled(gl.SCISSOR_TEST);
+            state.cullFace = gl.isEnabled(gl.CULL_FACE);
+            state.currentProgram = !!gl.getParameter(gl.CURRENT_PROGRAM);
+            const program = gl.getParameter(gl.CURRENT_PROGRAM);
+            if (program) {
+              state.programId = programIds.get(program) || null;
+              const attributeCount = gl.getProgramParameter(program, gl.ACTIVE_ATTRIBUTES) || 0;
+              state.activeAttributes = [];
+              for (let i = 0; i < attributeCount; i++) {
+                const info = gl.getActiveAttrib(program, i);
+                if (info) state.activeAttributes.push({name: info.name, size: info.size, type: info.type, location: gl.getAttribLocation(program, info.name)});
+              }
+              const uniformCount = gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS) || 0;
+              state.activeUniforms = [];
+              for (let i = 0; i < uniformCount; i++) {
+                const info = gl.getActiveUniform(program, i);
+                if (info) {
+                  const location = gl.getUniformLocation(program, info.name);
+                  let value = null;
+                  try {
+                    const uniformValue = location ? gl.getUniform(program, location) : null;
+                    value = uniformValue && typeof uniformValue.length === "number" ? Array.from(uniformValue) : uniformValue;
+                  } catch {}
+                  state.activeUniforms.push({name: info.name, size: info.size, type: info.type, value});
+                }
+              }
+              const uniformBlockCount = gl.getProgramParameter(program, gl.ACTIVE_UNIFORM_BLOCKS) || 0;
+              state.activeUniformBlocks = [];
+              for (let i = 0; i < uniformBlockCount; i++) {
+                let name = null;
+                let binding = null;
+                try { name = gl.getActiveUniformBlockName(program, i); } catch {}
+                try { binding = gl.getActiveUniformBlockParameter(program, i, gl.UNIFORM_BLOCK_BINDING); } catch {}
+                state.activeUniformBlocks.push({index: i, name, binding});
+              }
+            }
+            state.vertexAttribs = [];
+            for (let i = 0; i < 16; i++) {
+              const attribBuffer = gl.getVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_BUFFER_BINDING);
+              const attribBufferId = reverseLookup(window.__gaiusGL && window.__gaiusGL.buffers, attribBuffer);
+              const trackedPointer = stats.attribPointers[String(i)] || null;
+              let bufferSample = null;
+              if (attribBuffer && trackedPointer && trackedPointer.enabled !== false) {
+                const previousCopyRead = gl.getParameter(gl.COPY_READ_BUFFER_BINDING);
+                try {
+                  const sampleOffset = trackedPointer.offset || 0;
+                  const knownSize = (window.__gaiusGL && window.__gaiusGL.bufferSizes && attribBufferId)
+                    ? (window.__gaiusGL.bufferSizes.get(attribBufferId) || 2048)
+                    : 2048;
+                  const sampleLength = Math.max(0, Math.min(2048, knownSize - sampleOffset));
+                  const bytes = new Uint8Array(sampleLength);
+                  gl.bindBuffer(gl.COPY_READ_BUFFER, attribBuffer);
+                  gl.getBufferSubData(gl.COPY_READ_BUFFER, sampleOffset, bytes);
+                  bufferSample = {
+                    offset: sampleOffset,
+                    length: sampleLength,
+                    knownSize,
+                    bytes: Array.from(bytes),
+                    floats: Array.from(new Float32Array(bytes.buffer)),
+                    shorts: Array.from(new Int16Array(bytes.buffer)),
+                    ushorts: Array.from(new Uint16Array(bytes.buffer))
+                  };
+                } catch (error) {
+                  bufferSample = {error: String(error)};
+                } finally {
+                  gl.bindBuffer(gl.COPY_READ_BUFFER, previousCopyRead);
+                }
+              }
+              state.vertexAttribs.push({
+                index: i,
+                enabled: !!gl.getVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_ENABLED),
+                size: gl.getVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_SIZE),
+                type: gl.getVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_TYPE),
+                normalized: !!gl.getVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_NORMALIZED),
+                stride: gl.getVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_STRIDE),
+                divisor: gl.getVertexAttrib(i, gl.VERTEX_ATTRIB_ARRAY_DIVISOR),
+                buffer: !!attribBuffer,
+                bufferId: attribBufferId,
+                pointer: trackedPointer,
+                bufferSample
+              });
+            }
+            state.activeTexture = gl.getParameter(gl.ACTIVE_TEXTURE);
+            state.boundTexture2D = !!gl.getParameter(gl.TEXTURE_BINDING_2D);
+            state.textureUnits = [];
+            const previousActiveTexture = state.activeTexture;
+            for (let i = 0; i < 8; i++) {
+              gl.activeTexture(gl.TEXTURE0 + i);
+              const texture = gl.getParameter(gl.TEXTURE_BINDING_2D);
+              const sampler = gl.getParameter(gl.SAMPLER_BINDING);
+              const textureId = reverseLookup(window.__gaiusGL && window.__gaiusGL.textures, texture);
+              state.textureUnits.push({
+                unit: i,
+                texture2D: textureId,
+                sampler: reverseLookup(window.__gaiusGL && window.__gaiusGL.samplers, sampler),
+                info: stats.textureInfo[String(textureId)] || null
+              });
+            }
+            gl.activeTexture(previousActiveTexture);
+            state.uniformBufferBindings = [];
+            for (let i = 0; i < 8; i++) {
+              let buffer = null;
+              let offset = 0;
+              let size = 0;
+              let sample = null;
+              try {
+                const object = gl.getIndexedParameter(gl.UNIFORM_BUFFER_BINDING, i);
+                buffer = reverseLookup(window.__gaiusGL && window.__gaiusGL.buffers, object);
+                offset = Number(gl.getIndexedParameter(gl.UNIFORM_BUFFER_START, i) || 0);
+                size = Number(gl.getIndexedParameter(gl.UNIFORM_BUFFER_SIZE, i) || 0);
+                if (object && size > 0) {
+                  const previousCopyRead = gl.getParameter(gl.COPY_READ_BUFFER_BINDING);
+                  try {
+                    const bytes = new Uint8Array(Math.min(128, size));
+                    gl.bindBuffer(gl.COPY_READ_BUFFER, object);
+                    gl.getBufferSubData(gl.COPY_READ_BUFFER, offset, bytes);
+                    sample = {
+                      nonZero: Array.from(bytes).filter(value => value !== 0).length,
+                      floats: Array.from(new Float32Array(bytes.buffer.slice(0, Math.floor(bytes.byteLength / 4) * 4))).slice(0, 48)
+                    };
+                  } finally {
+                    gl.bindBuffer(gl.COPY_READ_BUFFER, previousCopyRead);
+                  }
+                }
+              } catch (error) {
+                sample = {error: String(error)};
+              }
+              state.uniformBufferBindings.push({index: i, buffer, offset, size, sample});
+            }
+            state.drawFramebufferStatus = gl.checkFramebufferStatus(gl.DRAW_FRAMEBUFFER);
+            state.readFramebufferStatus = gl.checkFramebufferStatus(gl.READ_FRAMEBUFFER);
+          } catch (error) {
+            state.error = String(error);
+          } finally {
+            stats.samplingState = false;
+          }
+          return state;
+        };
+        const framebufferObject = id => {
+          const state = window.__gaiusGL;
+          return id ? state && state.framebuffers && state.framebuffers.get(id) : null;
+        };
+        const reverseLookup = (map, object) => {
+          if (!map || !object) return object === null ? 0 : null;
+          for (const [id, value] of map.entries()) {
+            if (value === object) return Number(id);
+          }
+          return null;
+        };
+        const activeTextureForStats = gl.activeTexture.bind(gl);
+        gl.activeTexture = function(unit) {
+          if (!stats.samplingState) {
+            stats.activeTextureSamples.push({
+              seq: stats.sequence,
+              unit: Number(unit),
+              unitIndex: Number(unit) - gl.TEXTURE0
+            });
+            if (stats.activeTextureSamples.length > 800) stats.activeTextureSamples.shift();
+          }
+          return activeTextureForStats(unit);
+        };
+        const bindTextureForStats = gl.bindTexture.bind(gl);
+        gl.bindTexture = function(target, texture) {
+          const active = gl.getParameter(gl.ACTIVE_TEXTURE);
+          if (!stats.samplingState) {
+            stats.textureBindSamples.push({
+              seq: stats.sequence,
+              activeTexture: Number(active),
+              unit: Number(active) - gl.TEXTURE0,
+              target: Number(target),
+              texture: reverseLookup(window.__gaiusGL && window.__gaiusGL.textures, texture)
+            });
+            if (stats.textureBindSamples.length > 1200) stats.textureBindSamples.shift();
+          }
+          return bindTextureForStats(target, texture);
+        };
+        if (gl.bindSampler) {
+          const bindSamplerForStats = gl.bindSampler.bind(gl);
+          gl.bindSampler = function(unit, sampler) {
+            if (!stats.samplingState) {
+              stats.samplerBindSamples.push({
+                seq: stats.sequence,
+                unit: Number(unit),
+                sampler: reverseLookup(window.__gaiusGL && window.__gaiusGL.samplers, sampler)
+              });
+              if (stats.samplerBindSamples.length > 800) stats.samplerBindSamples.shift();
+            }
+            return bindSamplerForStats(unit, sampler);
+          };
+        }
+        const currentFramebufferIdForTarget = target => {
+          const state = window.__gaiusGL;
+          const bindings = state && state.framebufferBindings;
+          if (!bindings) return null;
+          if (target === gl.FRAMEBUFFER || target === gl.DRAW_FRAMEBUFFER) return bindings.draw;
+          if (target === gl.READ_FRAMEBUFFER) return bindings.read;
+          return null;
+        };
+        const attachmentName = attachment => {
+          if (attachment === gl.COLOR_ATTACHMENT0) return "color0";
+          if (attachment === gl.DEPTH_ATTACHMENT) return "depth";
+          if (attachment === gl.STENCIL_ATTACHMENT) return "stencil";
+          if (attachment === gl.DEPTH_STENCIL_ATTACHMENT) return "depthStencil";
+          return String(attachment);
+        };
+        const attachmentsFor = id => {
+          if (id === null || id === undefined) return null;
+          const value = stats.framebufferAttachments[String(id)];
+          return value ? JSON.parse(JSON.stringify(value)) : null;
+        };
+        const restoreTrackedFramebuffers = () => {
+          const state = window.__gaiusGL;
+          if (!state || !state.framebufferBindings) return;
+          gl.bindFramebuffer(gl.READ_FRAMEBUFFER, framebufferObject(state.framebufferBindings.read));
+          gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, framebufferObject(state.framebufferBindings.draw));
+        };
+        const sampleCurrentFramebuffer = () => {
+          const state = window.__gaiusGL;
+          const bindings = state && state.framebufferBindings;
+          if (bindings) {
+            gl.bindFramebuffer(gl.READ_FRAMEBUFFER, framebufferObject(bindings.draw));
+          }
+          const samples = [];
+          try {
+            for (const point of samplePoints()) {
+              const pixel = new Uint8Array(4);
+              gl.readPixels(point[0], point[1], 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+              samples.push({point, pixel: Array.from(pixel)});
+            }
+          } finally {
+            restoreTrackedFramebuffers();
+          }
+          return samples;
+        };
+        const sampleCurrentFramebufferAt = point => {
+          const state = window.__gaiusGL;
+          const bindings = state && state.framebufferBindings;
+          if (bindings) {
+            gl.bindFramebuffer(gl.READ_FRAMEBUFFER, framebufferObject(bindings.draw));
+          }
+          try {
+            const pixel = new Uint8Array(4);
+            gl.readPixels(point[0], point[1], 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+            return Array.from(pixel);
+          } finally {
+            restoreTrackedFramebuffers();
+          }
+        };
+        const isPixelNonBlack = pixel => !!(pixel && (pixel[0] || pixel[1] || pixel[2] || pixel[3]));
+        const isMainColorTarget = state => {
+          const drawAttachment = state && state.attachments && state.attachments.draw && state.attachments.draw.color0;
+          return !!(drawAttachment && drawAttachment.texture === 75);
+        };
+        const recordMainBufferTransition = (phase, state, pixel, point) => {
+          const nonBlack = isPixelNonBlack(pixel);
+          const oldNonBlack = stats.mainBufferState.lastNonBlack;
+          stats.mainBufferState.lastNonBlack = nonBlack;
+          stats.mainBufferState.lastPixel = pixel;
+          if (nonBlack && !stats.mainBufferState.everNonBlack) {
+            stats.mainBufferState.everNonBlack = true;
+            stats.mainBufferState.watchPoint = point;
+            stats.mainBufferTransitions.push({
+              seq: stats.sequence,
+              phase,
+              transition: "firstNonBlack",
+              point,
+              pixel,
+              state
+            });
+          } else if (stats.mainBufferState.everNonBlack && oldNonBlack && !nonBlack) {
+            stats.mainBufferTransitions.push({
+              seq: stats.sequence,
+              phase,
+              transition: "becameBlack",
+              point,
+              pixel,
+              state
+            });
+          }
+          if (stats.mainBufferTransitions.length > 40) stats.mainBufferTransitions.shift();
+        };
+        for (const name of ["drawArrays", "drawElements"]) {
+          const original = gl[name].bind(gl);
+          gl[name] = function(...args) {
+            stats.sequence++;
+            stats[name]++;
+            stats.lastDrawState = readState(name, args);
+            const bindings = window.__gaiusGL && window.__gaiusGL.framebufferBindings;
+            if (stats.drawSamples.length < 40 || (stats[name] % 1000) === 0) {
+              stats.drawSamples.push(stats.lastDrawState);
+              if (stats.drawSamples.length > 80) stats.drawSamples.shift();
+            }
+            const result = original(...args);
+            try {
+              const drawAttachment = stats.lastDrawState && stats.lastDrawState.attachments
+                && stats.lastDrawState.attachments.draw && stats.lastDrawState.attachments.draw.color0;
+              const viewport = stats.lastDrawState && stats.lastDrawState.viewport;
+              if (drawAttachment && drawAttachment.texture === 75 && viewport
+                  && viewport[2] === (gl.drawingBufferWidth || 854)
+                  && viewport[3] === (gl.drawingBufferHeight || 480)) {
+                const samples = sampleCurrentFramebuffer();
+                const mainSample = {
+                  method: name,
+                  args: args.map(Number),
+                  framebuffer: stats.lastDrawState.framebuffer,
+                  samples
+                };
+                stats.mainDrawSamples.push(mainSample);
+                if (stats.mainDrawSamples.length > 80) stats.mainDrawSamples.shift();
+                if (!stats.nonBlackMainDraw) {
+                  const hit = samples.find(item => item.pixel[0] || item.pixel[1] || item.pixel[2]);
+                  if (hit) {
+                    stats.mainBufferState.watchPoint = hit.point;
+                    stats.nonBlackMainDraw = {
+                      method: name,
+                      args: args.map(Number),
+                      framebuffer: stats.lastDrawState.framebuffer,
+                      point: hit.point,
+                      pixel: hit.pixel
+                    };
+                  }
+                }
+                const watchPoint = stats.mainBufferState.watchPoint || (samples[0] && samples[0].point);
+                const watchSample = watchPoint
+                  ? (samples.find(item => item.point[0] === watchPoint[0] && item.point[1] === watchPoint[1]) || {point: watchPoint, pixel: sampleCurrentFramebufferAt(watchPoint)})
+                  : null;
+                if (watchSample) {
+                  recordMainBufferTransition(`after ${name}`, stats.lastDrawState, watchSample.pixel, watchSample.point);
+                }
+              }
+            } catch (error) {
+              if (!stats.nonBlackMainDraw) stats.nonBlackMainDraw = {"error": String(error)};
+            }
+            if (!stats.nonBlackAfterDraw && (stats[name] % 100) === 0) {
+              try {
+                for (const item of sampleCurrentFramebuffer()) {
+                  const pixel = item.pixel;
+                  if (pixel[0] || pixel[1] || pixel[2] || pixel[3]) {
+                    stats.nonBlackAfterDraw = {
+                      method: name,
+                      args: args.map(Number),
+                      point: item.point,
+                      pixel,
+                      framebuffer: window.__gaiusGL && window.__gaiusGL.framebufferBindings
+                        ? {"draw": window.__gaiusGL.framebufferBindings.draw, "read": window.__gaiusGL.framebufferBindings.read}
+                        : null,
+                      state: stats.lastDrawState
+                    };
+                    break;
+                  }
+                }
+              } catch (error) {
+                stats.nonBlackAfterDraw = {"error": String(error)};
+              }
+            }
+            return result;
+          };
+        }
+        const clear = gl.clear.bind(gl);
+        gl.clear = function(...args) {
+          stats.sequence++;
+          stats.clear++;
+          const sample = {mask: Number(args[0]), color: stats.clearColor.slice(), beforeState: readState("clear", args)};
+          const result = clear(...args);
+          try {
+            if (isMainColorTarget(sample.beforeState)) {
+              const watchPoint = stats.mainBufferState.watchPoint || [Math.floor((gl.drawingBufferWidth || 854) / 2), Math.floor((gl.drawingBufferHeight || 480) / 2)];
+              const pixel = sampleCurrentFramebufferAt(watchPoint);
+              recordMainBufferTransition("after clear", sample.beforeState, pixel, watchPoint);
+            }
+          } catch (error) {
+            stats.mainBufferTransitions.push({
+              seq: stats.sequence,
+              phase: "after clear",
+              transition: "sampleError",
+              error: String(error),
+              state: sample.beforeState
+            });
+          }
+          if (stats.clearSamples.length < 80) {
+            try {
+              sample.after = sampleCurrentFramebuffer();
+            } catch (error) {
+              sample.afterError = String(error);
+            }
+            stats.clearSamples.push(sample);
+          }
+          return result;
+        };
+        const clearColor = gl.clearColor.bind(gl);
+        gl.clearColor = function(...args) {
+          stats.clearColor = args.map(Number);
+          return clearColor(...args);
+        };
+        const getExtension = gl.getExtension.bind(gl);
+        gl.getExtension = function(name) {
+          const extension = getExtension(name);
+          stats.extensions[name] = !!extension;
+          return extension;
+        };
+        const bufferData = gl.bufferData.bind(gl);
+        gl.bufferData = function(...args) {
+          if (stats.bufferUploads.length < 1000) {
+            const data = args[1];
+            const bindingParameter = Number(args[0]) === gl.ARRAY_BUFFER ? gl.ARRAY_BUFFER_BINDING
+              : Number(args[0]) === gl.ELEMENT_ARRAY_BUFFER ? gl.ELEMENT_ARRAY_BUFFER_BINDING
+              : Number(args[0]) === gl.UNIFORM_BUFFER ? gl.UNIFORM_BUFFER_BINDING
+              : Number(args[0]) === gl.COPY_READ_BUFFER ? gl.COPY_READ_BUFFER_BINDING
+              : Number(args[0]) === gl.COPY_WRITE_BUFFER ? gl.COPY_WRITE_BUFFER_BINDING
+              : null;
+            const bufferId = bindingParameter
+              ? reverseLookup(window.__gaiusGL && window.__gaiusGL.buffers, gl.getParameter(bindingParameter))
+              : null;
+            let byteLength = typeof data === "number" ? data : (data ? data.byteLength : 0);
+            let nonZero = null;
+            if (data && typeof data !== "number" && data.byteLength !== undefined) {
+              const bytes = data instanceof Uint8Array ? data : new Uint8Array(data.buffer || data);
+              nonZero = 0;
+              for (let i = 0; i < Math.min(bytes.length, 512); i++) {
+                if (bytes[i] !== 0) nonZero++;
+              }
+            }
+            stats.bufferUploads.push({target: Number(args[0]), buffer: bufferId, byteLength, usage: Number(args[2]), nonZeroFirst512: nonZero});
+          }
+          return bufferData(...args);
+        };
+        const bufferSubData = gl.bufferSubData.bind(gl);
+        gl.bufferSubData = function(...args) {
+          if (stats.bufferUploads.length < 1000) {
+            const data = args[2];
+            const bindingParameter = Number(args[0]) === gl.ARRAY_BUFFER ? gl.ARRAY_BUFFER_BINDING
+              : Number(args[0]) === gl.ELEMENT_ARRAY_BUFFER ? gl.ELEMENT_ARRAY_BUFFER_BINDING
+              : Number(args[0]) === gl.UNIFORM_BUFFER ? gl.UNIFORM_BUFFER_BINDING
+              : Number(args[0]) === gl.COPY_READ_BUFFER ? gl.COPY_READ_BUFFER_BINDING
+              : Number(args[0]) === gl.COPY_WRITE_BUFFER ? gl.COPY_WRITE_BUFFER_BINDING
+              : null;
+            const bufferId = bindingParameter
+              ? reverseLookup(window.__gaiusGL && window.__gaiusGL.buffers, gl.getParameter(bindingParameter))
+              : null;
+            let nonZero = null;
+            if (data && data.byteLength !== undefined) {
+              const bytes = data instanceof Uint8Array ? data : new Uint8Array(data.buffer || data);
+              nonZero = 0;
+              for (let i = 0; i < Math.min(bytes.length, 512); i++) {
+                if (bytes[i] !== 0) nonZero++;
+              }
+            }
+            stats.bufferUploads.push({subData: true, target: Number(args[0]), buffer: bufferId, offset: Number(args[1]), byteLength: data ? data.byteLength : 0, nonZeroFirst512: nonZero});
+          }
+          return bufferSubData(...args);
+        };
+        const vertexAttribPointer = gl.vertexAttribPointer.bind(gl);
+        gl.vertexAttribPointer = function(...args) {
+          const buffer = gl.getParameter(gl.ARRAY_BUFFER_BINDING);
+          stats.attribPointers[String(Number(args[0]))] = {
+            kind: "float",
+            index: Number(args[0]),
+            size: Number(args[1]),
+            type: Number(args[2]),
+            normalized: !!args[3],
+            stride: Number(args[4]),
+            offset: Number(args[5]) || 0,
+            bufferId: reverseLookup(window.__gaiusGL && window.__gaiusGL.buffers, buffer)
+          };
+          return vertexAttribPointer(...args);
+        };
+        const vertexAttribIPointer = gl.vertexAttribIPointer.bind(gl);
+        gl.vertexAttribIPointer = function(...args) {
+          const buffer = gl.getParameter(gl.ARRAY_BUFFER_BINDING);
+          stats.attribPointers[String(Number(args[0]))] = {
+            kind: "int",
+            index: Number(args[0]),
+            size: Number(args[1]),
+            type: Number(args[2]),
+            normalized: false,
+            stride: Number(args[3]),
+            offset: Number(args[4]) || 0,
+            bufferId: reverseLookup(window.__gaiusGL && window.__gaiusGL.buffers, buffer)
+          };
+          return vertexAttribIPointer(...args);
+        };
+        const bindBufferRange = gl.bindBufferRange.bind(gl);
+        gl.bindBufferRange = function(...args) {
+          const mapped = args.map(Number);
+          stats.uniformBufferRangeCounts[String(mapped[1])] = (stats.uniformBufferRangeCounts[String(mapped[1])] || 0) + 1;
+          if (stats.uniformBufferRangeSamples.length < 200 && args[2]
+              && (mapped[1] === 1 || mapped[1] === 2 || mapped[1] === 3 || (mapped[1] === 0 && (Number(args[4]) || 0) <= 256))) {
+            const previousCopyRead = gl.getParameter(gl.COPY_READ_BUFFER_BINDING);
+            try {
+              const byteLength = Math.min(128, Number(args[4]) || 0);
+              const bytes = new Uint8Array(byteLength);
+              gl.bindBuffer(gl.COPY_READ_BUFFER, args[2]);
+              gl.getBufferSubData(gl.COPY_READ_BUFFER, Number(args[3]) || 0, bytes);
+              const floats = Array.from(new Float32Array(bytes.buffer.slice(0, Math.floor(bytes.byteLength / 4) * 4))).slice(0, 16);
+              stats.uniformBufferRangeSamples.push({
+                index: mapped[1],
+                offset: Number(args[3]) || 0,
+                size: Number(args[4]) || 0,
+                nonZero: Array.from(bytes).filter(value => value !== 0).length,
+                floats: floats.slice(0, 48)
+              });
+            } catch (error) {
+              stats.uniformBufferRangeSamples.push({index: mapped[1], error: String(error)});
+            } finally {
+              gl.bindBuffer(gl.COPY_READ_BUFFER, previousCopyRead);
+            }
+          }
+          stats.uniformBufferRanges.push(mapped);
+          if (stats.uniformBufferRanges.length > 400) stats.uniformBufferRanges.shift();
+          return bindBufferRange(...args);
+        };
+        const bindBufferBase = gl.bindBufferBase.bind(gl);
+        gl.bindBufferBase = function(...args) {
+          if (stats.uniformBufferBindings.length < 400) {
+            stats.uniformBufferBindings.push(args.map(Number));
+          }
+          return bindBufferBase(...args);
+        };
+        const getUniformBlockIndex = gl.getUniformBlockIndex.bind(gl);
+        gl.getUniformBlockIndex = function(program, name) {
+          const index = getUniformBlockIndex(program, name);
+          if (stats.uniformBlocks.length < 240) {
+            stats.uniformBlocks.push({op: "getIndex", name, index});
+          }
+          return index;
+        };
+        const getActiveUniformBlockName = gl.getActiveUniformBlockName.bind(gl);
+        gl.getActiveUniformBlockName = function(program, index) {
+          const name = getActiveUniformBlockName(program, index);
+          if (stats.uniformBlocks.length < 240) {
+            stats.uniformBlocks.push({op: "getName", index, name});
+          }
+          return name;
+        };
+        const uniformBlockBinding = gl.uniformBlockBinding.bind(gl);
+        gl.uniformBlockBinding = function(program, index, binding) {
+          if (stats.uniformBlocks.length < 240) {
+            stats.uniformBlocks.push({op: "binding", index, binding});
+          }
+          return uniformBlockBinding(program, index, binding);
+        };
+        for (const name of [
+          "uniform1i", "uniform2i", "uniform3i", "uniform4i",
+          "uniform1f", "uniform2f", "uniform3f", "uniform4f",
+          "uniform1iv", "uniform2iv", "uniform3iv", "uniform4iv",
+          "uniform1fv", "uniform2fv", "uniform3fv", "uniform4fv",
+          "uniformMatrix2fv", "uniformMatrix3fv", "uniformMatrix4fv"
+        ]) {
+          const original = gl[name] && gl[name].bind(gl);
+          if (!original) continue;
+          gl[name] = function(...args) {
+            stats.uniformCalls[name] = (stats.uniformCalls[name] || 0) + 1;
+            if (stats.uniformSamples.length < 160) {
+              stats.uniformSamples.push({
+                name,
+                location: args[0] ? "[location]" : null,
+                values: args.slice(1).map(value => {
+                  if (typeof value === "number" || typeof value === "boolean") return value;
+                  if (value && value.length !== undefined) return Array.from(value.slice ? value.slice(0, 20) : Array.prototype.slice.call(value, 0, 20));
+                  return value ? "[object]" : null;
+                })
+              });
+            }
+            return original(...args);
+          };
+        }
+        const texImage2D = gl.texImage2D.bind(gl);
+        gl.texImage2D = function(...args) {
+          const textureId = reverseLookup(window.__gaiusGL && window.__gaiusGL.textures, gl.getParameter(gl.TEXTURE_BINDING_2D));
+          const level = Number(args[1]) || 0;
+          const width = Number(args[3]) || 0;
+          const height = Number(args[4]) || 0;
+          const data = args[8];
+          let nonZero2048 = null;
+          if (data && data.byteLength !== undefined) {
+            const bytes = data instanceof Uint8Array ? data : new Uint8Array(data.buffer || data);
+            nonZero2048 = 0;
+            for (let i = 0; i < Math.min(bytes.length, 2048); i++) {
+              if (bytes[i] !== 0) nonZero2048++;
+            }
+          }
+          if (textureId !== null && textureId !== undefined) {
+            const item = stats.textureInfo[String(textureId)] || {};
+            item.target = Number(args[0]);
+            item.levels = item.levels || {};
+            item.levels[String(level)] = {
+              width,
+              height,
+              internalFormat: Number(args[2]),
+              format: Number(args[6]),
+              type: Number(args[7]),
+              lastImageNonZeroFirst2048: nonZero2048
+            };
+            stats.textureInfo[String(textureId)] = item;
+          }
+          if (stats.texUploads.length < 120) {
+            let nonZero = null;
+            if (data && data.byteLength !== undefined) {
+              const bytes = data instanceof Uint8Array ? data : new Uint8Array(data.buffer || data);
+              nonZero = 0;
+              for (let i = 0; i < Math.min(bytes.length, 512); i++) {
+                if (bytes[i] !== 0) nonZero++;
+              }
+            }
+            stats.texUploads.push({method: "texImage2D", texture: textureId, args: args.slice(0, 8).map(Number), byteLength: data ? data.byteLength : 0, nonZeroFirst512: nonZero});
+          }
+          return texImage2D(...args);
+        };
+        const texSubImage2D = gl.texSubImage2D.bind(gl);
+        gl.texSubImage2D = function(...args) {
+          const textureId = reverseLookup(window.__gaiusGL && window.__gaiusGL.textures, gl.getParameter(gl.TEXTURE_BINDING_2D));
+          const level = Number(args[1]) || 0;
+          const data = args[8];
+          let nonZero2048 = null;
+          if (data && data.byteLength !== undefined) {
+            const bytes = data instanceof Uint8Array ? data : new Uint8Array(data.buffer || data);
+            nonZero2048 = 0;
+            for (let i = 0; i < Math.min(bytes.length, 2048); i++) {
+              if (bytes[i] !== 0) nonZero2048++;
+            }
+          }
+          if (textureId !== null && textureId !== undefined) {
+            const item = stats.textureInfo[String(textureId)] || {};
+            item.target = Number(args[0]);
+            item.levels = item.levels || {};
+            const currentLevel = item.levels[String(level)] || {};
+            item.levels[String(level)] = {
+              ...currentLevel,
+              lastSubImage: {
+                x: Number(args[2]),
+                y: Number(args[3]),
+                width: Number(args[4]),
+                height: Number(args[5]),
+                format: Number(args[6]),
+                type: Number(args[7]),
+                nonZeroFirst2048: nonZero2048
+              }
+            };
+            stats.textureInfo[String(textureId)] = item;
+          }
+          if (stats.texUploads.length < 240) {
+            let nonZero = null;
+            if (data && data.byteLength !== undefined) {
+              const bytes = data instanceof Uint8Array ? data : new Uint8Array(data.buffer || data);
+              nonZero = 0;
+              for (let i = 0; i < Math.min(bytes.length, 512); i++) {
+                if (bytes[i] !== 0) nonZero++;
+              }
+            }
+            stats.texUploads.push({method: "texSubImage2D", texture: textureId, args: args.slice(0, 8).map(Number), byteLength: data ? data.byteLength : 0, nonZeroFirst512: nonZero});
+          }
+          return texSubImage2D(...args);
+        };
+        const blitFramebuffer = gl.blitFramebuffer.bind(gl);
+        gl.blitFramebuffer = function(...args) {
+          stats.blitFramebuffer++;
+          const beforeBindings = window.__gaiusGL && window.__gaiusGL.framebufferBindings
+            ? {"draw": window.__gaiusGL.framebufferBindings.draw, "read": window.__gaiusGL.framebufferBindings.read}
+            : null;
+          const sample = { args: args.map(Number), framebufferBefore: beforeBindings };
+          sample.attachmentsBefore = beforeBindings
+            ? {"read": attachmentsFor(beforeBindings.read), "draw": attachmentsFor(beforeBindings.draw)}
+            : null;
+          try {
+            sample.beforeSamples = [];
+            for (const point of samplePoints()) {
+              const src = new Uint8Array(4);
+              gl.readPixels(point[0], point[1], 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, src);
+              sample.beforeSamples.push({point, pixel: Array.from(src)});
+            }
+            sample.before = sample.beforeSamples[0] ? sample.beforeSamples[0].pixel : null;
+          } catch (error) {
+            sample.beforeError = String(error);
+          }
+          const result = blitFramebuffer(...args);
+          try {
+            const dst = new Uint8Array(4);
+            gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+            gl.readPixels(Math.floor((Number(args[4]) + Number(args[6])) / 2), Math.floor((Number(args[5]) + Number(args[7])) / 2), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, dst);
+            sample.afterDefault = Array.from(dst);
+          } catch (error) {
+            sample.afterError = String(error);
+          } finally {
+            restoreTrackedFramebuffers();
+          }
+          sample.framebufferAfter = window.__gaiusGL && window.__gaiusGL.framebufferBindings
+            ? {"draw": window.__gaiusGL.framebufferBindings.draw, "read": window.__gaiusGL.framebufferBindings.read}
+            : null;
+          sample.attachmentsAfter = sample.framebufferAfter
+            ? {"read": attachmentsFor(sample.framebufferAfter.read), "draw": attachmentsFor(sample.framebufferAfter.draw)}
+            : null;
+          stats.blitSamples.push(sample);
+          if (stats.blitSamples.length > 12) stats.blitSamples.shift();
+          return result;
+        };
+        const bindFramebuffer = gl.bindFramebuffer.bind(gl);
+        gl.bindFramebuffer = function(...args) {
+          stats.bindFramebuffer.push(args.map(Number));
+          if (stats.bindFramebuffer.length > 40) stats.bindFramebuffer.shift();
+          return bindFramebuffer(...args);
+        };
+        const framebufferTexture2D = gl.framebufferTexture2D.bind(gl);
+        gl.framebufferTexture2D = function(...args) {
+          const state = window.__gaiusGL;
+          const framebufferId = currentFramebufferIdForTarget(Number(args[0]));
+          const textureId = reverseLookup(state && state.textures, args[3]);
+          const record = {
+            target: Number(args[0]),
+            framebuffer: framebufferId,
+            attachment: Number(args[1]),
+            attachmentName: attachmentName(Number(args[1])),
+            textureTarget: Number(args[2]),
+            texture: textureId,
+            level: Number(args[4])
+          };
+          if (framebufferId !== null) {
+            const key = String(framebufferId);
+            const attachmentKey = record.attachmentName;
+            const current = stats.framebufferAttachments[key] || {};
+            if (textureId === 0 || textureId === null) {
+              delete current[attachmentKey];
+            } else {
+              current[attachmentKey] = {
+                texture: textureId,
+                textureTarget: record.textureTarget,
+                level: record.level
+              };
+            }
+            stats.framebufferAttachments[key] = current;
+          }
+          stats.framebufferTexture2D.push(record);
+          if (stats.framebufferTexture2D.length > 40) stats.framebufferTexture2D.shift();
+          const result = framebufferTexture2D(...args);
+          try {
+            stats.framebufferStatus.push({
+              record,
+              status: gl.checkFramebufferStatus(args[0])
+            });
+            if (stats.framebufferStatus.length > 40) stats.framebufferStatus.shift();
+          } catch (error) {
+            stats.framebufferStatus.push({error: String(error)});
+          }
+          return result;
+        };
+        const getError = gl.getError.bind(gl);
+        gl.getError = function() {
+          const error = getError();
+          stats.lastError = error;
+          return error;
+        };
+        return gl;
+      };
+    })();
+  </script>
+    <script data-gaius-storage-profile="v2">
+    window.__gaiusProfileId = "template";
+    window.__gaiusWorldVersion = 0;
+    window.__gaiusStorageSchema = 2;
+    window.__gaiusStorageDatabaseName = "gaius-fs-template";
+    window.__gaiusStoragePrefix = "gaius.fs.template:";
+    window.__gaiusStorageOpfsDirectory = "regions-template";
+  </script>
+<script>
+    (function installPersistentFsBootstrap() {
+      const prefix = "gaius.fs.template:";
+      const dbName = "gaius-fs-template";
+      const opfsDirectory = "regions-template";
+      const storeName = "files";
+      const files = window.__gaiusPersistentFiles = window.__gaiusPersistentFiles || Object.create(null);
+      let db = null;
+      let pending = Promise.resolve();
+
+      function report(event, detail) {
+        try {
+          const counters = window.__gaiusMinecraftCounters || (window.__gaiusMinecraftCounters = {});
+          const key = "storage:" + event + ":" + detail;
+          counters[key] = (counters[key] || 0) + 1;
+          const events = window.__gaiusMinecraftEvents || (window.__gaiusMinecraftEvents = []);
+          events.push({ event: "storage:" + event, detail, count: counters[key], at: Date.now() });
+          if (events.length > 500) events.splice(0, events.length - 500);
+        } catch (error) {
+          // Telemetry must never block the game.
+        }
+      }
+
+      function normalize(path) {
+        path = String(path || "/").replace(/\\/g, "/");
+        // Collapse "." and redundant segments so write and read keys agree even when
+        // Java-side Path.resolve introduces "./" (e.g. world_gen_settings.dat).
+        const absolute = path.startsWith("/");
+        const parts = path.split("/");
+        const kept = [];
+        for (let index = 0; index < parts.length; index++) {
+          const part = parts[index];
+          if (part === "" || part === ".") continue;
+          if (part === "..") {
+            if (kept.length > 0) kept.pop();
+            continue;
+          }
+          kept.push(part);
+        }
+        return (absolute ? "/" : "") + kept.join("/");
+      }
+
+
+      function isClientBootstrapPath(path) {
+        path = normalize(path);
+        const savesRoot = "/gaius/saves/";
+        if (!path.startsWith(savesRoot)) return true;
+        const worldSeparator = path.indexOf("/", savesRoot.length);
+        if (worldSeparator < 0 || worldSeparator + 1 >= path.length) return false;
+        const relative = path.slice(worldSeparator + 1);
+        return relative === "level.dat" || relative === "level.dat_old" ||
+          relative === "icon.png" ||
+          relative === "data/minecraft/world_gen_settings.dat";
+      }
+
+      function copyPersistentBytes(value) {
+        if (value instanceof Uint8Array) return value.slice();
+        if (value instanceof ArrayBuffer) return new Uint8Array(value.slice(0));
+        if (ArrayBuffer.isView(value)) {
+          return new Uint8Array(value.buffer, value.byteOffset, value.byteLength).slice();
+        }
+        return null;
+      }
+
+      function isDownloadedPackBinaryPath(path) {
+        path = normalize(path);
+        return path.startsWith("/gaius/downloads/") && !path.endsWith("/log.json");
+      }
+
+      function persistentValueByteLength(value) {
+        if (typeof value === "string") {
+          const padding = value.endsWith("==") ? 2 : (value.endsWith("=") ? 1 : 0);
+          return Math.max(0, Math.floor(value.length * 3 / 4) - padding);
+        }
+        if (value instanceof ArrayBuffer) return value.byteLength;
+        if (ArrayBuffer.isView(value)) return value.byteLength;
+        return 0;
+      }
+
+      function openDatabase() {
+        return new Promise((resolve, reject) => {
+          if (!("indexedDB" in window)) {
+            reject(new Error("IndexedDB is not available"));
+            return;
+          }
+          let settled = false;
+          const timeout = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            reject(new Error("IndexedDB open timed out"));
+          }, 8000);
+          const fail = error => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
+            reject(error);
+          };
+          const request = indexedDB.open(dbName, 2);
+          request.onupgradeneeded = () => {
+            const database = request.result;
+            if (!database.objectStoreNames.contains(storeName)) {
+              database.createObjectStore(storeName, { keyPath: "path" });
+            }
+          };
+          request.onsuccess = () => {
+            const database = request.result;
+            if (settled) {
+              database.close();
+              return;
+            }
+            settled = true;
+            clearTimeout(timeout);
+            resolve(database);
+          };
+          request.onerror = () => fail(request.error || new Error("IndexedDB open failed"));
+          request.onblocked = () => fail(new Error("IndexedDB open blocked"));
+        });
+      }
+
+      function transactionDone(transaction) {
+        return new Promise((resolve, reject) => {
+          transaction.oncomplete = () => resolve();
+          transaction.onerror = () => reject(transaction.error || new Error("IndexedDB transaction failed"));
+          transaction.onabort = () => reject(transaction.error || new Error("IndexedDB transaction aborted"));
+        });
+      }
+
+      async function readIndexedDbFiles(database) {
+        const transaction = database.transaction(storeName, "readonly");
+        const store = transaction.objectStore(storeName);
+        const downloadedPacks = [];
+        let scannedKeys = 0;
+        let hydratedRecords = 0;
+        await new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            reject(new Error("IndexedDB bootstrap timed out"));
+            try {
+              transaction.abort();
+            } catch (error) {
+              // The transaction may have completed between the timer and abort.
+            }
+          }, 8000);
+          transaction.oncomplete = () => {
+            clearTimeout(timeout);
+            resolve();
+          };
+          transaction.onerror = () => {
+            clearTimeout(timeout);
+            reject(transaction.error || new Error("IndexedDB bootstrap transaction failed"));
+          };
+          transaction.onabort = () => {
+            clearTimeout(timeout);
+            reject(transaction.error || new Error("IndexedDB bootstrap transaction aborted"));
+          };
+          const request = store.openKeyCursor();
+          request.onsuccess = () => {
+            const cursor = request.result;
+            if (!cursor) return;
+            scannedKeys++;
+            const primaryKey = cursor.primaryKey;
+            const path = normalize(primaryKey);
+            if (isClientBootstrapPath(path)) {
+              const read = store.get(primaryKey);
+              read.onsuccess = () => {
+                const value = read.result;
+                if (value && typeof value.path === "string") {
+                  const storedValue = value.value;
+                  const supported = typeof storedValue === "string" ||
+                    storedValue instanceof ArrayBuffer || ArrayBuffer.isView(storedValue);
+                  if (supported) {
+                    hydratedRecords++;
+                    if (isDownloadedPackBinaryPath(path)) {
+                      downloadedPacks.push({
+                        path,
+                        value: storedValue,
+                        updatedAt: Number(value.updatedAt) || 0
+                      });
+                    } else {
+                      const bytes = copyPersistentBytes(storedValue);
+                      files[path] = bytes === null ? storedValue : bytes;
+                    }
+                  }
+                }
+              };
+            }
+            cursor.continue();
+          };
+          request.onerror = () => reject(
+            request.error || new Error("IndexedDB key cursor failed"));
+        });
+        report("storage-key-scan", scannedKeys + " keys, hydrated=" + hydratedRecords);
+
+        downloadedPacks.sort((left, right) => right.updatedAt - left.updatedAt ||
+          left.path.localeCompare(right.path));
+        const maximumDownloadedPacks = 4;
+        const maximumDownloadedPackBytes = 256 * 1024 * 1024;
+        const evicted = [];
+        let kept = 0;
+        let keptBytes = 0;
+        for (const entry of downloadedPacks) {
+          const byteLength = persistentValueByteLength(entry.value);
+          const withinBudget = kept < maximumDownloadedPacks &&
+            (kept === 0 || keptBytes + byteLength <= maximumDownloadedPackBytes);
+          if (withinBudget) {
+            const bytes = copyPersistentBytes(entry.value);
+            files[entry.path] = bytes === null ? entry.value : bytes;
+            kept++;
+            keptBytes += byteLength;
+          } else {
+            evicted.push(entry.path);
+          }
+        }
+        if (evicted.length > 0) {
+          const cleanup = database.transaction(storeName, "readwrite");
+          const cleanupStore = cleanup.objectStore(storeName);
+          for (const path of evicted) cleanupStore.delete(path);
+          await transactionDone(cleanup);
+          report("storage-download-cache-pruned", evicted.length + " files");
+        }
+      }
+
+      async function putIndexedDbFile(path, value) {
+        const transaction = db.transaction(storeName, "readwrite");
+        const bytes = copyPersistentBytes(value);
+        const storedValue = bytes === null ? String(value || "") : bytes;
+        transaction.objectStore(storeName).put({
+          path: normalize(path),
+          value: storedValue,
+          updatedAt: Date.now()
+        });
+        await transactionDone(transaction);
+      }
+
+      async function deleteIndexedDbFile(path) {
+        const transaction = db.transaction(storeName, "readwrite");
+        transaction.objectStore(storeName).delete(normalize(path));
+        await transactionDone(transaction);
+      }
+
+      async function migrateLocalStorage(database) {
+        let migrated = 0;
+        let removed = 0;
+        let keys = [];
+        try {
+          const storage = window.localStorage;
+          if (!storage) return { migrated, removed };
+          for (let i = 0; i < storage.length; i++) {
+            const key = storage.key(i);
+            if (key && key.startsWith(prefix)) keys.push(key);
+          }
+          for (const key of keys) {
+            const path = normalize(key.substring(prefix.length));
+            const value = storage.getItem(key);
+            if (typeof value !== "string") continue;
+            if (!Object.prototype.hasOwnProperty.call(files, path)) {
+              const transaction = database.transaction(storeName, "readwrite");
+              transaction.objectStore(storeName).put({ path, value });
+              await transactionDone(transaction);
+              if (isClientBootstrapPath(path)) files[path] = value;
+              migrated++;
+            }
+            storage.removeItem(key);
+            removed++;
+          }
+        } catch (error) {
+          report("storage-local-migration-error", error && error.message ? error.message : String(error));
+        }
+        return { migrated, removed };
+      }
+
+      function loadLocalStorageFallback() {
+        let restored = 0;
+        try {
+          const storage = window.localStorage;
+          if (!storage) return restored;
+          for (let i = 0; i < storage.length; i++) {
+            const key = storage.key(i);
+            if (key && key.startsWith(prefix)) {
+              const value = storage.getItem(key);
+              if (typeof value === "string") {
+                const path = normalize(key.substring(prefix.length));
+                if (isClientBootstrapPath(path)) files[path] = value;
+                restored++;
+              }
+            }
+          }
+        } catch (error) {
+          report("storage-local-load-error", error && error.message ? error.message : String(error));
+        }
+        return restored;
+      }
+
+      window.__gaiusFsPut = function(path, value) {
+        path = normalize(path);
+        value = String(value || "");
+        files[path] = value;
+        if (db) {
+          pending = pending.then(() => putIndexedDbFile(path, value)).catch(error => {
+            report("storage-indexeddb-write-error", path + ": " + (error && error.message ? error.message : String(error)));
+          });
+          return true;
+        }
+        try {
+          if (!window.localStorage) return false;
+          window.localStorage.setItem(prefix + path, value);
+          return true;
+        } catch (error) {
+          report("storage-quota-or-error", path + " chars=" + value.length);
+          return false;
+        }
+      };
+
+      window.__gaiusFsPutBytes = function(path, value) {
+        path = normalize(path);
+        const bytes = copyPersistentBytes(value);
+        if (bytes === null || !db) return false;
+        files[path] = bytes;
+        pending = pending.then(() => putIndexedDbFile(path, bytes)).catch(error => {
+          report("storage-indexeddb-write-error", path + ": " + (error && error.message ? error.message : String(error)));
+        });
+        return true;
+      };
+
+      window.__gaiusFsDelete = function(path) {
+        path = normalize(path);
+        delete files[path];
+        if (db) {
+          pending = pending.then(() => deleteIndexedDbFile(path)).catch(error => {
+            report("storage-indexeddb-delete-error", path + ": " + (error && error.message ? error.message : String(error)));
+          });
+          return true;
+        }
+        try {
+          if (window.localStorage) window.localStorage.removeItem(prefix + path);
+          return true;
+        } catch (error) {
+          return false;
+        }
+      };
+
+      window.__gaiusFsFlush = function() {
+        return pending;
+      };
+
+      window.__gaiusFsReady = (async () => {
+        try {
+          db = await openDatabase();
+          await readIndexedDbFiles(db);
+          const migration = await migrateLocalStorage(db);
+          window.__gaiusFsBackend = "indexeddb";
+          report("storage-indexeddb-ready", Object.keys(files).length + " files, migrated=" + migration.migrated + ", removedLocal=" + migration.removed);
+        } catch (error) {
+          if (db) {
+            try {
+              db.close();
+            } catch (closeError) {
+              // The failed transaction may already have closed the database.
+            }
+            db = null;
+          }
+          const restored = loadLocalStorageFallback();
+          window.__gaiusFsBackend = "localStorage";
+          report("storage-indexeddb-unavailable", (error && error.message ? error.message : String(error)) + ", fallbackFiles=" + restored);
+        }
+      })();
+    })();
+
+    function loadScript(src) {
+      return new Promise((resolve, reject) => {
+        const script = document.createElement("script");
+        script.src = src;
+        script.onload = () => {
+          bootTimings.classesLoaded = performance.now();
+          resolve();
+        };
+        script.onerror = () => reject(new Error("Could not load " + src));
+        document.body.appendChild(script);
+      });
+    }
+
+    function waitForPaint() {
+      return new Promise(resolve => {
+        requestAnimationFrame(() => setTimeout(resolve, 0));
+      });
+    }
+
+    async function acquireGaiusRuntimeLease() {
+      if (window.__gaiusRuntimeLeaseHeld || urlParams.get("allowMultipleTabs") === "1") {
+        return true;
+      }
+      const lockName = "gaius-client-runtime-v1";
+      if (navigator.locks && typeof navigator.locks.request === "function") {
+        const acquired = await new Promise(resolve => {
+          let settled = false;
+          const finish = value => {
+            if (settled) return;
+            settled = true;
+            resolve(value);
+          };
+          try {
+            navigator.locks.request(lockName, {mode: "exclusive", ifAvailable: true}, lock => {
+              if (!lock) {
+                finish(false);
+                return;
+              }
+              window.__gaiusRuntimeLeaseHeld = true;
+              finish(true);
+              return new Promise(release => {
+                window.__gaiusReleaseRuntimeLease = release;
+              });
+            }).catch(error => {
+              console.warn("Web Locks runtime lease is unavailable", error);
+              finish(null);
+            });
+          } catch (error) {
+            console.warn("Web Locks runtime lease failed", error);
+            finish(null);
+          }
+        });
+        if (acquired !== null) return acquired;
+      }
+
+      const leaseKey = "gaius.runtimeLease.v1";
+      const leaseId = (crypto.randomUUID ? crypto.randomUUID() :
+        Date.now().toString(36) + Math.random().toString(36).slice(2));
+      const readLease = () => {
+        try {
+          return JSON.parse(localStorage.getItem(leaseKey) || "null");
+        } catch (error) {
+          return null;
+        }
+      };
+      const writeLease = () => {
+        localStorage.setItem(leaseKey, JSON.stringify({id: leaseId, at: Date.now()}));
+      };
+      try {
+        const current = readLease();
+        if (current && current.id !== leaseId && Date.now() - Number(current.at || 0) < 10000) {
+          return false;
+        }
+        writeLease();
+        await new Promise(resolve => setTimeout(resolve, 80));
+        const claimed = readLease();
+        if (!claimed || claimed.id !== leaseId) return false;
+        const heartbeat = setInterval(writeLease, 3000);
+        const release = () => {
+          clearInterval(heartbeat);
+          const owned = readLease();
+          if (owned && owned.id === leaseId) localStorage.removeItem(leaseKey);
+        };
+        addEventListener("pagehide", release, {once: true});
+        addEventListener("beforeunload", release, {once: true});
+        window.__gaiusReleaseRuntimeLease = release;
+        window.__gaiusRuntimeLeaseHeld = true;
+        return true;
+      } catch (error) {
+        console.warn("Cross-tab runtime lease is unavailable", error);
+        return true;
+      }
+    }
+
+    (async () => {
+      setStatus("running", "Loading persistent browser storage...", 8, "Loading browser storage...");
+      await window.__gaiusFsReady;
+      bootTimings.fsReady = performance.now();
+      window.__gaiusDefaultArgs = await window.__gaiusDefaultArgsPromise;
+      window.__gaiusDisplayArgs = window.__gaiusDefaultArgs.map((value, index, args) =>
+        index > 0 && args[index - 1] === "--accessToken" ? "<redacted>" : value
+      );
+      bootTimings.sessionReady = performance.now();
+      if (!await acquireGaiusRuntimeLease()) {
+        throw new Error("Gaius is already running in another tab. Close that tab, then reload this page.");
+      }
+      bootTimings.runtimeLeaseReady = performance.now();
+      const fallbackBuildToken = "dev";
+      const requestedBuildToken = new URLSearchParams(location.search).get("build");
+      let buildToken = requestedBuildToken && requestedBuildToken.trim()
+        ? requestedBuildToken.trim()
+        : fallbackBuildToken;
+      if (urlParams.get("fresh") === "1" || urlParams.get("cache") === "0") {
+        buildToken += "-fresh-" + Date.now();
+      }
+      bootTimings.buildToken = buildToken;
+      const singleplayerBuildToken = "dev" +
+        (urlParams.get("fresh") === "1" || urlParams.get("cache") === "0"
+          ? "-fresh-" + Date.now()
+          : "");
+      window.__gaiusSingleplayerWorkerUrl = new URL(
+        "singleplayer-server-worker.js?v=" + encodeURIComponent(singleplayerBuildToken),
+        location.href
+      ).href;
+      window.__gaiusSingleplayerServerUrl = new URL(
+        "singleplayer-server.js?v=" + encodeURIComponent(singleplayerBuildToken),
+        location.href
+      ).href;
+      window.__gaiusSingleplayerServerGzipUrl = new URL(
+        "singleplayer-server.js.gz?v=" + encodeURIComponent(singleplayerBuildToken),
+        location.href
+      ).href;
+      bootTimings.classesStart = performance.now();
+      setStatus("running", "Browser storage is ready (" + (window.__gaiusFsBackend || "unknown") + "); loading classes.js...", 24, "Loading the template client runtime...");
+      await waitForPaint();
+      bootTimings.beforeClassesPaint = performance.now();
+      await (window.__gaiusPortableAssetsReady || Promise.resolve());
+      setBootProgress(Math.max(bootProgressValue, 30), "Loading game assets...");
+      await window.__gaiusVanillaAssetsReady;
+      bootTimings.vanillaAssetsReady = performance.now();
+      const classesUrl = window.__gaiusClassesUrl ||
+        ("classes.js?v=" + encodeURIComponent(buildToken));
+      await loadScript(classesUrl);
+      if (typeof main !== "function") {
+        setStatus("error", "The TeaVM build did not expose main(args).");
+	      } else {
+	        setStatus("running", "classes.js loaded; calling net.minecraft.client.main.Main.main(args)...\n" + window.__gaiusDisplayArgs.join(" "), 68, "Starting Gaius Client...");
+	        await waitForPaint();
+	        bootTimings.mainStart = performance.now();
+	        main(window.__gaiusDefaultArgs);
+	        bootTimings.mainReturned = performance.now();
+	        setBootProgress(82, "Waiting for the first client frame...");
+	      }
+    })().catch(error => {
+      window.__gaiusBootError = error;
+      const bootErrorDetails = [];
+      const primitiveFields = value => Object.fromEntries(
+        Object.getOwnPropertyNames(value).slice(0, 80).flatMap(key => {
+          const field = value[key];
+          return field == null || ["string", "number", "boolean", "bigint"].includes(typeof field)
+            ? [[key, String(field)]] : [];
+        })
+      );
+      for (const symbol of Object.getOwnPropertySymbols(error || {})) {
+        const javaError = error[symbol];
+        if (!javaError || typeof javaError !== "object") continue;
+        bootErrorDetails.push("Java fields: " + JSON.stringify(primitiveFields(javaError)));
+        const constructor = javaError.constructor;
+        for (const metadataSymbol of Object.getOwnPropertySymbols(constructor || {})) {
+          const metadata = constructor[metadataSymbol];
+          if (metadata && typeof metadata === "object") {
+            const fields = primitiveFields(metadata);
+            if (Object.keys(fields).length) bootErrorDetails.push("Java class: " + JSON.stringify(fields));
+          }
+        }
+      }
+      window.__gaiusBootErrorDetails = bootErrorDetails;
+      setStatus("error", [
+        "Gaius Client failed to start:",
+        error && error.stack ? error.stack : String(error),
+        ...bootErrorDetails
+      ].join("\n"));
+    });
+  </script>
+  <script>
+    (function installGaiusClientShellV2() {
+      const root = document.documentElement;
+      const bootScreen = document.getElementById("boot-screen");
+      const profileGate = document.getElementById("profile-gate");
+      const statusBox = document.getElementById("status");
+      const shellMode = document.getElementById("gaius-shell-mode");
+      const errorActions = document.getElementById("gaius-error-actions");
+      const retryButton = document.getElementById("gaius-retry");
+      const detailsButton = document.getElementById("gaius-error-toggle");
+      const detailsBox = document.getElementById("gaius-error-details");
+      if (!root || !statusBox) return;
+
+      function bootDiagnostics() {
+        const diagnostics = [];
+        const bootError = window.__gaiusBootError;
+        if (bootError && bootError.stack) diagnostics.push(String(bootError.stack));
+        const extra = window.__gaiusBootErrorDetails;
+        if (Array.isArray(extra)) {
+          for (const line of extra) diagnostics.push(String(line));
+        }
+        return diagnostics.join("\n");
+      }
+
+      function renderShell() {
+        const profileOpen = !!(profileGate && !profileGate.hidden);
+        const bootOpen = !!(bootScreen && !bootScreen.hidden);
+        const failed = statusBox.dataset.state === "error";
+        const view = profileOpen ? "profile" : (failed ? "error" : (bootOpen ? "boot" : "canvas"));
+        root.dataset.gaiusShellView = view;
+        if (shellMode) {
+          const sessionMode = String(window.__gaiusSessionMode || "").toLowerCase();
+          shellMode.textContent = sessionMode === "online"
+            ? "ONLINE SESSION"
+            : (location.protocol === "file:" ? "PORTABLE HTML" : "BROWSER CLIENT");
+        }
+        if (errorActions) errorActions.hidden = !failed;
+        if (detailsButton) {
+          detailsButton.hidden = !failed;
+          detailsButton.textContent = detailsBox && detailsBox.dataset.open === "1"
+            ? "Hide diagnostics"
+            : "Show diagnostics";
+        }
+        if (detailsBox) {
+          detailsBox.textContent = bootDiagnostics() || "No additional diagnostics were captured.";
+          detailsBox.hidden = !failed || detailsBox.dataset.open !== "1";
+        }
+      }
+
+      function retryGaiusStartup() {
+        if (retryButton) {
+          retryButton.disabled = true;
+          retryButton.textContent = "Restarting...";
+        }
+        const next = new URL(location.href);
+        next.searchParams.set("retry", String(Date.now()));
+        location.replace(next.href);
+      }
+
+      if (retryButton) retryButton.addEventListener("click", retryGaiusStartup);
+      if (detailsButton && detailsBox) {
+        detailsButton.addEventListener("click", () => {
+          detailsBox.dataset.open = detailsBox.dataset.open === "1" ? "0" : "1";
+          renderShell();
+        });
+      }
+
+      const observer = new MutationObserver(renderShell);
+      observer.observe(statusBox, {attributes: true, childList: true, subtree: true});
+      if (bootScreen) observer.observe(bootScreen, {attributes: true});
+      if (profileGate) observer.observe(profileGate, {attributes: true});
+      window.__gaiusShell = {
+        version: 2,
+        refresh: renderShell,
+        retry: retryGaiusStartup
+      };
+      renderShell();
+    })();
+  </script>
+</body>
+</html>

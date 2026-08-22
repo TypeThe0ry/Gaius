@@ -128,14 +128,20 @@ def relative_name(root: Path, path: Path) -> str:
         return path.resolve().as_posix()
 
 
-def file_record(root: Path, path: Path) -> dict[str, object]:
+def file_record(
+    root: Path,
+    path: Path,
+    content_path: Path | None = None,
+) -> dict[str, object]:
+    """Record a logical path while optionally hashing staged file contents."""
     path = path.resolve()
-    if not path.is_file() or path.stat().st_size == 0:
-        raise RuntimeError(f"profile input is missing or empty: {path}")
+    content_path = (content_path or path).resolve()
+    if not content_path.is_file() or content_path.stat().st_size == 0:
+        raise RuntimeError(f"profile input is missing or empty: {content_path}")
     return {
         "path": relative_name(root, path),
-        "sha256": sha256_file(path),
-        "bytes": path.stat().st_size,
+        "sha256": sha256_file(content_path),
+        "bytes": content_path.stat().st_size,
     }
 
 
@@ -192,6 +198,7 @@ def create_record(
     pom: Path,
     resources: list[Path],
     require_release: bool,
+    artifact_input: Path | None = None,
 ) -> dict[str, object]:
     compiler = read_teavm_configuration(pom)
     validate_artifact_target(role, artifact, pom, compiler)
@@ -202,7 +209,7 @@ def create_record(
         "schemaVersion": SCHEMA_VERSION,
         "role": role,
         "releaseGrade": require_release,
-        "artifact": file_record(root, artifact),
+        "artifact": file_record(root, artifact, artifact_input),
         "pom": file_record(root, pom),
         "compiler": compiler,
         "resources": [file_record(root, path) for path in resources],
@@ -249,6 +256,11 @@ def main() -> int:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--role", required=True)
     parser.add_argument("--artifact", type=Path, required=True)
+    parser.add_argument(
+        "--artifact-input",
+        type=Path,
+        help="hash staged bytes while recording --artifact as the published path",
+    )
     parser.add_argument("--pom", type=Path, required=True)
     parser.add_argument("--resource", action="append", type=Path, default=[])
     parser.add_argument("--output", type=Path)
@@ -262,12 +274,15 @@ def main() -> int:
         args.pom,
         args.resource,
         args.require_release,
+        args.artifact_input,
     )
     output = (args.output or default_output(args.artifact)).resolve()
     if args.command == "write":
         write_atomically(output, canonical_json(expected) + "\n")
         print(f"TeaVM compiler profile: {output}")
         return 0
+    if args.artifact_input is not None:
+        raise RuntimeError("--artifact-input is valid only while writing a staged profile")
     try:
         actual = json.loads(output.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
