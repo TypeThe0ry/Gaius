@@ -87,6 +87,8 @@ jobs:
           node port/scripts/gson-type-token-smoke.mjs \
             --profile "$GAIUS_VERSION_PROFILE_PATH" \
             --overlay "$GAIUS_OVERLAY_DIRECTORY"
+          GAIUS_SMOKE_SELF_TEST=1 \
+            node port/scripts/singleplayer-worker-runtime-smoke.mjs
           node port/scripts/singleplayer-worker-runtime-smoke.mjs
           manifest="$GAIUS_DIST_DIRECTORY/Gaius.manifest.json"
           test -s "$manifest"

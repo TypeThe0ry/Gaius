@@ -77,7 +77,21 @@ public final class BrowserWorldgenScheduler {
     }
 
     public static void checkpoint() {
+        recordSchedulerMarker(
+                "server-work-turn-checkpoint",
+                YIELD_CHECKPOINT,
+                taskWorkDepth,
+                reentrantTaskWorkDepth,
+                yieldActive,
+                activeWorkElapsedMillis);
         requestYield(YIELD_CHECKPOINT, networkQueueDepth());
+        recordSchedulerMarker(
+                "server-work-turn-end",
+                YIELD_CHECKPOINT,
+                taskWorkDepth,
+                reentrantTaskWorkDepth,
+                yieldActive,
+                activeWorkElapsedMillis);
     }
 
     /**
@@ -159,6 +173,13 @@ public final class BrowserWorldgenScheduler {
             deadlineMillis = now + currentBudgetMillis;
             pulsesUntilClockCheck = CLOCK_CHECK_INTERVAL;
         }
+        recordSchedulerMarker(
+                "server-work-turn-start",
+                0,
+                taskWorkDepth,
+                reentrantTaskWorkDepth,
+                false,
+                activeWorkElapsedMillis);
     }
 
     /**
@@ -171,9 +192,23 @@ public final class BrowserWorldgenScheduler {
             if (reentrantTaskWorkDepth < Integer.MAX_VALUE) {
                 reentrantTaskWorkDepth++;
             }
+            recordSchedulerMarker(
+                    "task-start-reentrant",
+                    TASK_SCOPE_REENTRANT,
+                    taskWorkDepth,
+                    reentrantTaskWorkDepth,
+                    true,
+                    activeWorkElapsedMillis);
             return TASK_SCOPE_REENTRANT;
         }
         if (taskWorkDepth > 0) {
+            recordSchedulerMarker(
+                    "task-start-nested",
+                    TASK_SCOPE_NONE,
+                    taskWorkDepth,
+                    reentrantTaskWorkDepth,
+                    false,
+                    activeWorkElapsedMillis);
             return TASK_SCOPE_NONE;
         }
         taskWorkDepth = 1;
@@ -181,12 +216,26 @@ public final class BrowserWorldgenScheduler {
         double now = nowMillis();
         if (deadlineMillis == 0.0) {
             beginSlice(now, networkQueueDepth());
+            recordSchedulerMarker(
+                    "task-start-normal",
+                    TASK_SCOPE_NORMAL,
+                    taskWorkDepth,
+                    reentrantTaskWorkDepth,
+                    false,
+                    activeWorkElapsedMillis);
             return TASK_SCOPE_NORMAL;
         }
         // The clock was paused at endTaskWork (or at the previous checkpoint).
         // Starting a new scope records a fresh active segment; the paused gap is
         // intentionally absent from activeWorkElapsedMillis.
         activeWorkStartedAtMillis = now;
+        recordSchedulerMarker(
+                "task-start-normal",
+                TASK_SCOPE_NORMAL,
+                taskWorkDepth,
+                reentrantTaskWorkDepth,
+                false,
+                activeWorkElapsedMillis);
         return TASK_SCOPE_NORMAL;
     }
 
@@ -197,30 +246,93 @@ public final class BrowserWorldgenScheduler {
      */
     public static void endTaskWork(int token) {
         if (token == TASK_SCOPE_NONE) {
+            if (taskWorkDepth <= 0) {
+                recordSchedulerMarker(
+                        "task-end-underflow",
+                        token,
+                        taskWorkDepth,
+                        reentrantTaskWorkDepth,
+                        yieldActive,
+                        activeWorkElapsedMillis);
+                return;
+            }
+            recordSchedulerMarker(
+                    "task-end-nested",
+                    token,
+                    taskWorkDepth,
+                    reentrantTaskWorkDepth,
+                    yieldActive,
+                    activeWorkElapsedMillis);
             return;
         }
         if (token == TASK_SCOPE_REENTRANT) {
             // A reentrant callback may resume after the outer requestYield has
             // already dropped yieldActive.  Its token still closes only its
             // own isolated scope and can never decrement the outer task.
-            if (reentrantTaskWorkDepth > 0) {
-                reentrantTaskWorkDepth--;
+            if (reentrantTaskWorkDepth <= 0) {
+                recordSchedulerMarker(
+                        "task-end-underflow",
+                        token,
+                        taskWorkDepth,
+                        reentrantTaskWorkDepth,
+                        yieldActive,
+                        activeWorkElapsedMillis);
+                return;
             }
+            reentrantTaskWorkDepth--;
+            recordSchedulerMarker(
+                    "task-end-reentrant",
+                    token,
+                    taskWorkDepth,
+                    reentrantTaskWorkDepth,
+                    yieldActive,
+                    activeWorkElapsedMillis);
             return;
         }
         if (token != TASK_SCOPE_NORMAL) {
+            recordSchedulerMarker(
+                    "task-end-invalid",
+                    token,
+                    taskWorkDepth,
+                    reentrantTaskWorkDepth,
+                    yieldActive,
+                    activeWorkElapsedMillis);
             return;
         }
         if (yieldActive) {
             // Only a live NORMAL scope may be deferred.  In particular, an
             // unmatched REENTRANT/NONE close must not leave a stale deferred
             // close which a later continuation could apply to another task.
-            if (taskWorkDepth > 0 && deferredTaskScopeEnds == 0) {
+            if (taskWorkDepth <= 0) {
+                recordSchedulerMarker(
+                        "task-end-underflow",
+                        token,
+                        taskWorkDepth,
+                        reentrantTaskWorkDepth,
+                        true,
+                        activeWorkElapsedMillis);
+                return;
+            }
+            if (deferredTaskScopeEnds == 0) {
                 deferredTaskScopeEnds++;
             }
+            recordSchedulerMarker(
+                    "task-end-deferred",
+                    token,
+                    taskWorkDepth,
+                    reentrantTaskWorkDepth,
+                    true,
+                    activeWorkElapsedMillis);
             return;
         }
         if (taskWorkDepth <= 0) {
+            recordSchedulerMarker(
+                    "task-end-underflow",
+                    token,
+                    taskWorkDepth,
+                    reentrantTaskWorkDepth,
+                    false,
+                    activeWorkElapsedMillis);
             return;
         }
         taskWorkDepth = 0;
@@ -228,6 +340,13 @@ public final class BrowserWorldgenScheduler {
         double now = nowMillis();
         activeWorkElapsedMillis += activeSegmentElapsedMillis(now);
         activeWorkStartedAtMillis = -1.0;
+        recordSchedulerMarker(
+                "task-end-normal",
+                token,
+                taskWorkDepth,
+                reentrantTaskWorkDepth,
+                false,
+                activeWorkElapsedMillis);
     }
 
     public static void pulse() {
@@ -289,6 +408,13 @@ public final class BrowserWorldgenScheduler {
         activeWorkElapsedMillis = sliceElapsedMillis;
         activeWorkStartedAtMillis = -1.0;
         yieldActive = true;
+        recordSchedulerMarker(
+                "yield-start",
+                reason,
+                taskWorkDepth,
+                reentrantTaskWorkDepth,
+                true,
+                activeWorkElapsedMillis);
         maxReentrantYieldDepthInYield = 0;
         try {
             double configuredBudgetMillis = sliceMillis();
@@ -402,10 +528,29 @@ public final class BrowserWorldgenScheduler {
             networkPreemptionPending = false;
         } finally {
             yieldActive = false;
+            boolean appliedDeferredTaskEnd = false;
             while (deferredTaskScopeEnds > 0 && taskWorkDepth > 0) {
                 deferredTaskScopeEnds--;
                 taskWorkDepth = 0;
                 activeWorkStartedAtMillis = -1.0;
+                appliedDeferredTaskEnd = true;
+            }
+            if (appliedDeferredTaskEnd) {
+                recordSchedulerMarker(
+                        "task-end-deferred-applied",
+                        TASK_SCOPE_NORMAL,
+                        taskWorkDepth,
+                        reentrantTaskWorkDepth,
+                        false,
+                        activeWorkElapsedMillis);
+            } else {
+                recordSchedulerMarker(
+                        "yield-end",
+                        reason,
+                        taskWorkDepth,
+                        reentrantTaskWorkDepth,
+                        false,
+                        activeWorkElapsedMillis);
             }
             // A continuation can be cancelled after its normal close.  Do not
             // carry unmatched deferred closes into the next invocation.
@@ -585,6 +730,121 @@ public final class BrowserWorldgenScheduler {
               : Date.now();
             """)
     private static native double nowMillis();
+
+    /**
+     * Publishes fixed scalar task/turn markers only for the Node runtime smoke.
+     * The browser release leaves the flag unset; malformed diagnostic state is
+     * swallowed so evidence collection can never alter scheduler control flow.
+     */
+    @JSBody(params = {
+            "event",
+            "token",
+            "taskDepth",
+            "reentrantDepth",
+            "yielding",
+            "activeWorkMillis"
+    }, script = """
+            try {
+              if (globalThis.__gaiusSlowProbeTelemetryEnabled !== true) return;
+              const marker = globalThis.__gaiusWorldgenSchedulerMarker ||
+                (globalThis.__gaiusWorldgenSchedulerMarker = {});
+              const eventName = String(event || 'unknown');
+              const now = Date.now();
+              const workMillis = Math.max(0, Number(activeWorkMillis) || 0);
+              marker.schemaVersion = 1;
+              marker.eventSequence = (Number(marker.eventSequence) || 0) + 1;
+              marker.lastEvent = eventName;
+              marker.lastEventAtEpochMs = now;
+              marker.token = Number(token) || 0;
+              marker.taskWorkDepth = Math.max(0, Number(taskDepth) || 0);
+              marker.reentrantTaskWorkDepth = Math.max(0, Number(reentrantDepth) || 0);
+              marker.normalTaskScopeActive = marker.taskWorkDepth > 0;
+              marker.activeTaskScope = marker.normalTaskScopeActive ||
+                marker.reentrantTaskWorkDepth > 0;
+              marker.yieldActive = !!yielding;
+              marker.activeWorkMillis = workMillis;
+            if (eventName === 'server-work-turn-start') {
+              marker.serverWorkTurnSequence =
+                (Number(marker.serverWorkTurnSequence) || 0) + 1;
+              marker.serverWorkTurnActive = true;
+              marker.lastServerWorkTurnStartedAtEpochMs = now;
+            } else if (eventName === 'server-work-turn-end') {
+              const serverWorkTurnWallMillis = Math.max(
+                0,
+                now - (Number(marker.lastServerWorkTurnStartedAtEpochMs) || now)
+              );
+              marker.serverWorkTurnActive = false;
+              marker.lastServerWorkTurnEndedAtEpochMs = now;
+              marker.lastServerWorkTurnWallMillis = serverWorkTurnWallMillis;
+              marker.maxServerWorkTurnWallMillis = Math.max(
+                Number(marker.maxServerWorkTurnWallMillis) || 0,
+                serverWorkTurnWallMillis
+              );
+            } else if (eventName === 'task-start-normal') {
+              marker.taskScopesStarted = (Number(marker.taskScopesStarted) || 0) + 1;
+              marker.lastTaskStartedAtEpochMs = now;
+              marker.__taskActiveWorkBaselineMillis = workMillis;
+              marker.__taskActiveWorkAccumulatedMillis = 0;
+            } else if (eventName === 'task-start-reentrant') {
+              marker.reentrantTaskScopesStarted =
+                (Number(marker.reentrantTaskScopesStarted) || 0) + 1;
+            } else if (eventName === 'task-end-reentrant') {
+              marker.reentrantTaskScopesEnded =
+                (Number(marker.reentrantTaskScopesEnded) || 0) + 1;
+            } else if (eventName === 'yield-start' && marker.normalTaskScopeActive) {
+              marker.__taskActiveWorkAccumulatedMillis =
+                Math.max(0, Number(marker.__taskActiveWorkAccumulatedMillis) || 0) +
+                Math.max(0, workMillis -
+                  (Number(marker.__taskActiveWorkBaselineMillis) || 0));
+              marker.__taskActiveWorkBaselineMillis = workMillis;
+            } else if (eventName === 'yield-end' && marker.normalTaskScopeActive) {
+              // requestYield starts the resumed active segment from zero.  Keep
+              // the next delta scoped to this task rather than the whole slice.
+              marker.__taskActiveWorkBaselineMillis = workMillis;
+            } else if (eventName === 'task-end-normal' ||
+                       eventName === 'task-end-deferred-applied') {
+              marker.__taskActiveWorkAccumulatedMillis =
+                Math.max(0, Number(marker.__taskActiveWorkAccumulatedMillis) || 0) +
+                Math.max(0, workMillis -
+                  (Number(marker.__taskActiveWorkBaselineMillis) || 0));
+              const taskActiveWorkMillis =
+                Math.max(0, Number(marker.__taskActiveWorkAccumulatedMillis) || 0);
+              const taskScopeWallMillis = Math.max(
+                0,
+                now - (Number(marker.lastTaskStartedAtEpochMs) || now)
+              );
+              marker.taskScopesEnded = (Number(marker.taskScopesEnded) || 0) + 1;
+              marker.lastTaskEndedAtEpochMs = now;
+              marker.lastTaskActiveWorkMillis = taskActiveWorkMillis;
+              marker.maxTaskActiveWorkMillis = Math.max(
+                Number(marker.maxTaskActiveWorkMillis) || 0,
+                taskActiveWorkMillis
+              );
+              marker.lastTaskScopeWallMillis = taskScopeWallMillis;
+              marker.maxTaskScopeWallMillis = Math.max(
+                Number(marker.maxTaskScopeWallMillis) || 0,
+                taskScopeWallMillis
+              );
+              delete marker.__taskActiveWorkBaselineMillis;
+              delete marker.__taskActiveWorkAccumulatedMillis;
+            } else if (eventName === 'task-end-underflow') {
+              marker.taskScopeUnderflows =
+                (Number(marker.taskScopeUnderflows) || 0) + 1;
+            } else if (eventName === 'task-end-invalid') {
+              marker.taskScopeInvalidEnds =
+                (Number(marker.taskScopeInvalidEnds) || 0) + 1;
+            }
+            } catch (_) {
+              // Diagnostic telemetry is fail-open and may never perturb the scheduler.
+            }
+            """)
+    private static native void recordSchedulerMarker(
+            String event,
+            int token,
+            int taskDepth,
+            int reentrantDepth,
+            boolean yielding,
+            double activeWorkMillis);
 
     private static boolean hasPendingNetworkInput() {
         return BrowserWebSocketChannel.hasPendingInput()

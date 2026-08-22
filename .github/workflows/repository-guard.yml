@@ -72,6 +72,34 @@ jobs:
           done
           npm run smoke:profiles --prefix apps/bridge
 
+  worker-telemetry-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Validate bounded Worker stall telemetry
+        run: |
+          set -euo pipefail
+          node --check port/scripts/singleplayer-worker-runtime-smoke.mjs
+          GAIUS_SMOKE_SELF_TEST=1 \
+            node port/scripts/singleplayer-worker-runtime-smoke.mjs
+          node port/scripts/worldgen-scheduler-smoke.mjs
+
   paper-plugin-tests:
     runs-on: ubuntu-latest
     steps:

@@ -4189,6 +4189,19 @@ def check_source_patches() -> None:
             and "__gaiusWorldgenSliceMillis" in singleplayer_worker_runtime_smoke
             and "GAIUS_SMOKE_MAX_GAMEPLAY_STALL_MS" in singleplayer_worker_runtime_smoke
             and 'type: "worldgen-event-loop-stall"' in singleplayer_worker_runtime_smoke
+            and 'SLOW_SAMPLE_SCHEMA = "gaius.worker-event-loop-slow-sample.v1"'
+                in singleplayer_worker_runtime_smoke
+            and "MAX_SLOW_SAMPLES = 64" in singleplayer_worker_runtime_smoke
+            and "parentSendEpochMs" in singleplayer_worker_runtime_smoke
+            and "workerStartEpochMs" in singleplayer_worker_runtime_smoke
+            and "workerEndEpochMs" in singleplayer_worker_runtime_smoke
+            and "parentReceiveEpochMs" in singleplayer_worker_runtime_smoke
+            and "workerInterProbeGapMs" in singleplayer_worker_runtime_smoke
+            and "workerSlowProbeSnapshot" in singleplayer_worker_runtime_smoke
+            and "slowProbeEvidence" in singleplayer_worker_runtime_smoke
+            and "STORAGE_SLOW_SAMPLE_FIELDS" in singleplayer_worker_runtime_smoke
+            and "SCHEDULER_SLOW_SAMPLE_FIELDS" in singleplayer_worker_runtime_smoke
+            and "__gaiusWorldgenSchedulerMarker" in singleplayer_worker_runtime_smoke
             and "summarizeGameplayProbeLatencies" in singleplayer_worker_runtime_smoke
             and 'process.env.GAIUS_SMOKE_SEED || "gaius-runtime-smoke-v1"'
                 in singleplayer_worker_runtime_smoke
@@ -5619,9 +5632,16 @@ def check_source_patches() -> None:
             and "TASK_SCOPE_NORMAL" in browser_worldgen_scheduler
             and "TASK_SCOPE_REENTRANT" in browser_worldgen_scheduler
             and "if (token == TASK_SCOPE_REENTRANT)" in browser_worldgen_scheduler
-            and "if (taskWorkDepth > 0 && deferredTaskScopeEnds == 0)"
-                in browser_worldgen_scheduler
+            and "if (deferredTaskScopeEnds == 0)" in browser_worldgen_scheduler
             and "deferredTaskScopeEnds = 0;" in browser_worldgen_scheduler
+            and "recordSchedulerMarker(" in browser_worldgen_scheduler
+            and "__gaiusSlowProbeTelemetryEnabled !== true" in browser_worldgen_scheduler
+            and "__gaiusWorldgenSchedulerMarker" in browser_worldgen_scheduler
+            and "lastTaskActiveWorkMillis" in browser_worldgen_scheduler
+            and "lastTaskScopeWallMillis" in browser_worldgen_scheduler
+            and "serverWorkTurnActive" in browser_worldgen_scheduler
+            and '"server-work-turn-start"' in browser_worldgen_scheduler
+            and '"server-work-turn-end"' in browser_worldgen_scheduler
             and "boolean checkpointOnly = reason == YIELD_CHECKPOINT"
                 in browser_worldgen_scheduler
             and "&& progressPulsesInSlice == 0;" in browser_worldgen_scheduler

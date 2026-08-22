@@ -1,8 +1,9 @@
 import fs from "node:fs";
 import {createHash} from "node:crypto";
 import {Session as InspectorSession} from "node:inspector";
-import {performance} from "node:perf_hooks";
+import {PerformanceObserver, performance} from "node:perf_hooks";
 import vm from "node:vm";
+import {getHeapStatistics} from "node:v8";
 import {inflateSync} from "node:zlib";
 import {basename, isAbsolute} from "node:path";
 import {fileURLToPath, pathToFileURL} from "node:url";
@@ -14,6 +15,155 @@ import {
   parentPort,
   workerData,
 } from "node:worker_threads";
+
+const SLOW_SAMPLE_SCHEMA_VERSION = 1;
+const SLOW_SAMPLE_SCHEMA = "gaius.worker-event-loop-slow-sample.v1";
+const SLOW_SAMPLE_THRESHOLD_MS = 250;
+const MAX_SLOW_SAMPLES = 64;
+const MAX_SLOW_SAMPLES_PER_SCOPE = MAX_SLOW_SAMPLES / 2;
+const MAX_SLOW_SAMPLE_FIELDS_PER_GROUP = 32;
+const WORLDGEN_SLOW_SAMPLE_FIELDS = Object.freeze([
+  "slices",
+  "sliceElapsedMillis",
+  "totalSliceElapsedMillis",
+  "maxSliceElapsedMillis",
+  "configuredBudgetMillis",
+  "completedBudgetMillis",
+  "budgetMillis",
+  "minimumBudgetMillis",
+  "budgetOverruns",
+  "lastBudgetOverrunMillis",
+  "maxBudgetOverrunMillis",
+  "yieldDelayMillis",
+  "maxYieldDelayMillis",
+  "queueDepth",
+  "maxQueueDepth",
+  "progressPulses",
+  "totalProgressPulses",
+  "maxTurnPulses",
+  "networkPreemptions",
+  "deadlineYields",
+  "hardCapYields",
+  "checkpointYields",
+  "checkpointOnlyYields",
+  "checkpointOnlyYieldDelayMillis",
+  "checkpointOnlyMaxYieldDelayMillis",
+  "checkpointOnlyQueueDepth",
+  "checkpointOnlyMaxQueueDepth",
+  "distanceManagerBatches",
+  "distanceManagerLoopPulses",
+  "lastDistanceManagerUpdates",
+  "maxDistanceManagerUpdates",
+  "chunkBroadcastBatches",
+]);
+const NETWORK_SLOW_SAMPLE_FIELDS = Object.freeze([
+  "inboundQueuedBytes",
+  "decodedPacketQueue",
+  "decodedSliceBacklog",
+  "pumpCalls",
+  "pumpChunks",
+  "pumpBytes",
+  "longestPumpMillis",
+  "eventLoopGapSamples",
+  "eventLoopGapsOver500",
+  "longestEventLoopGapMillis",
+  "integratedServerTaskPending",
+  "integratedServerInputPending",
+  "integratedServerPumpRequests",
+  "integratedServerPumpStarts",
+  "integratedServerPumpRetrySchedules",
+  "integratedServerPumpRetryExhaustions",
+  "integratedServerTaskSchedules",
+  "integratedServerTaskRuns",
+  "integratedServerTaskSignals",
+  "integratedServerTaskUnparks",
+  "integratedServerTaskCoalesced",
+  "integratedServerTaskFollowups",
+  "integratedServerPumpFailures",
+  "integratedServerTaskScheduleFailures",
+  "integratedServerTaskLifecycleDrops",
+  "integratedServerTaskWrongThread",
+  "integratedServerTaskBudgetExhaustions",
+  "integratedServerTaskDeferredRetries",
+  "integratedServerTaskRetryExhaustions",
+  "errors",
+]);
+const STORAGE_SLOW_SAMPLE_FIELDS = Object.freeze([
+  "backend",
+  "cacheBudgetBytes",
+  "cacheBytes",
+  "cachePeakBytes",
+  "cacheEntries",
+  "dirtyEntries",
+  "pinnedEntries",
+  "flushingEntries",
+  "pendingEntries",
+  "evictions",
+  "cacheHits",
+  "cacheMisses",
+  "rejectedWrites",
+  "writeErrors",
+  "migratedRegions",
+  "opfsFileBytes",
+  "opfsFullWrites",
+  "opfsFullWriteBytes",
+  "opfsPatchWrites",
+  "opfsPatchPayloadBytes",
+  "opfsPatchRanges",
+  "opfsPatchCheckpoints",
+  "opfsReconstructedRegions",
+  "opfsFlushes",
+  "opfsFlushMillis",
+  "opfsMaxFlushMillis",
+  "opfsScanRecords",
+  "opfsScanV1Records",
+  "opfsScanV2Records",
+  "flushTimeouts",
+  "flushAbortRequests",
+  "flushAbortTimeouts",
+]);
+const SCHEDULER_SLOW_SAMPLE_FIELDS = Object.freeze([
+  "schemaVersion",
+  "eventSequence",
+  "lastEvent",
+  "lastEventAtEpochMs",
+  "token",
+  "taskWorkDepth",
+  "reentrantTaskWorkDepth",
+  "activeTaskScope",
+  "normalTaskScopeActive",
+  "yieldActive",
+  "activeWorkMillis",
+  "taskScopesStarted",
+  "taskScopesEnded",
+  "reentrantTaskScopesStarted",
+  "reentrantTaskScopesEnded",
+  "lastTaskStartedAtEpochMs",
+  "lastTaskEndedAtEpochMs",
+  "lastTaskActiveWorkMillis",
+  "maxTaskActiveWorkMillis",
+  "lastTaskScopeWallMillis",
+  "maxTaskScopeWallMillis",
+  "taskScopeUnderflows",
+  "taskScopeInvalidEnds",
+  "serverWorkTurnSequence",
+  "serverWorkTurnActive",
+  "lastServerWorkTurnStartedAtEpochMs",
+  "lastServerWorkTurnEndedAtEpochMs",
+  "lastServerWorkTurnWallMillis",
+  "maxServerWorkTurnWallMillis",
+]);
+
+let workerGcObserver;
+const workerGcStats = {
+  supported: typeof PerformanceObserver === "function",
+  count: 0,
+  durationMs: 0,
+  maxDurationMs: 0,
+  lastDurationMs: 0,
+  lastKind: 0,
+  lastAtEpochMs: 0,
+};
 
 const rootDirectory = fileURLToPath(new URL("../../", import.meta.url));
 const nativePath = (value) => {
@@ -345,6 +495,386 @@ function copyObjectSnapshot(value) {
   return value !== null && typeof value === "object" ? {...value} : null;
 }
 
+function highResolutionEpochMillis() {
+  return performance.timeOrigin + performance.now();
+}
+
+function roundedMillis(value) {
+  return Number(Math.max(0, Number(value) || 0).toFixed(3));
+}
+
+function selectScalarTelemetry(source, fields) {
+  if (source === null || typeof source !== "object") {
+    return null;
+  }
+  const snapshot = {};
+  for (const field of fields) {
+    if (!Object.prototype.hasOwnProperty.call(source, field)) continue;
+    const value = source[field];
+    if (typeof value === "number") {
+      if (Number.isFinite(value)) snapshot[field] = value;
+    } else if (typeof value === "string" || typeof value === "boolean") {
+      snapshot[field] = value;
+    }
+  }
+  return snapshot;
+}
+
+function installWorkerGcObserver() {
+  if (!workerGcStats.supported || workerGcObserver !== undefined) return;
+  try {
+    workerGcObserver = new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) {
+        const duration = Math.max(0, Number(entry.duration) || 0);
+        workerGcStats.count++;
+        workerGcStats.durationMs += duration;
+        workerGcStats.maxDurationMs = Math.max(workerGcStats.maxDurationMs, duration);
+        workerGcStats.lastDurationMs = duration;
+        workerGcStats.lastKind = Number(entry.detail?.kind) || 0;
+        workerGcStats.lastAtEpochMs = performance.timeOrigin + entry.startTime + duration;
+      }
+    });
+    workerGcObserver.observe({entryTypes: ["gc"]});
+    process.once("exit", () => {
+      workerGcObserver?.disconnect();
+      workerGcObserver = undefined;
+    });
+  } catch {
+    workerGcStats.supported = false;
+    workerGcObserver = undefined;
+  }
+}
+
+function workerSlowProbeSnapshot() {
+  const memory = process.memoryUsage();
+  const heap = getHeapStatistics();
+  return {
+    worldgen: selectScalarTelemetry(
+      globalThis.__gaiusWorldgenStats,
+      WORLDGEN_SLOW_SAMPLE_FIELDS,
+    ),
+    network: selectScalarTelemetry(
+      globalThis.__gaiusNetworkStats,
+      NETWORK_SLOW_SAMPLE_FIELDS,
+    ),
+    storage: selectScalarTelemetry(
+      globalThis.__gaiusStorageStats,
+      STORAGE_SLOW_SAMPLE_FIELDS,
+    ),
+    scheduler: selectScalarTelemetry(
+      globalThis.__gaiusWorldgenSchedulerMarker,
+      SCHEDULER_SLOW_SAMPLE_FIELDS,
+    ),
+    gc: {
+      supported: workerGcStats.supported,
+      count: workerGcStats.count,
+      durationMs: roundedMillis(workerGcStats.durationMs),
+      maxDurationMs: roundedMillis(workerGcStats.maxDurationMs),
+      lastDurationMs: roundedMillis(workerGcStats.lastDurationMs),
+      lastKind: workerGcStats.lastKind,
+      lastAtEpochMs: workerGcStats.lastAtEpochMs,
+      rssBytes: memory.rss,
+      heapUsedBytes: memory.heapUsed,
+      heapTotalBytes: memory.heapTotal,
+      externalBytes: memory.external,
+      arrayBuffersBytes: memory.arrayBuffers,
+      heapLimitBytes: heap.heap_size_limit,
+    },
+  };
+}
+
+function safeWorkerSlowProbeSnapshot() {
+  try {
+    return {snapshot: workerSlowProbeSnapshot(), error: null};
+  } catch (error) {
+    return {
+      snapshot: null,
+      error: String(error && (error.stack || error.message) || error).slice(0, 512),
+    };
+  }
+}
+
+function eventLoopProbeSample(probe, message, parentReceiveEpochMs,
+    parentReceiveMonoMs, phaseAtReceive, protocolReadyAt) {
+  const anomalies = [];
+  const workerStartEpochMs = Number(message.workerStartEpochMs);
+  const workerEndEpochMs = Number(message.workerEndEpochMs);
+  const workerStartMonoMs = Number(message.workerStartMonoMs);
+  const workerEndMonoMs = Number(message.workerEndMonoMs);
+  const workerInterProbeGapMs = Number(message.workerInterProbeGapMs);
+  const timingValues = [
+    workerStartEpochMs,
+    workerEndEpochMs,
+    workerStartMonoMs,
+    workerEndMonoMs,
+    workerInterProbeGapMs,
+  ];
+  if (message.slowSampleSchemaVersion !== SLOW_SAMPLE_SCHEMA_VERSION) {
+    anomalies.push("schema-version-mismatch");
+  }
+  if (message.slowSampleThresholdMismatch === true) {
+    anomalies.push("threshold-mismatch");
+  }
+  if (message.probeId !== probe.probeId) anomalies.push("probe-id-mismatch");
+  if (!timingValues.every(Number.isFinite)) anomalies.push("worker-timing-missing");
+  if (workerStartEpochMs + 1 < probe.parentSendEpochMs) {
+    anomalies.push("worker-start-before-parent-send");
+  }
+  if (workerEndEpochMs + 1 < workerStartEpochMs ||
+      workerEndMonoMs + 0.001 < workerStartMonoMs) {
+    anomalies.push("worker-end-before-worker-start");
+  }
+  if (parentReceiveEpochMs + 1 < workerEndEpochMs) {
+    anomalies.push("parent-receive-before-worker-end");
+  }
+  if (message.parentSendEpochMs !== probe.parentSendEpochMs ||
+      message.parentSendMonoMs !== probe.parentSendMonoMs) {
+    anomalies.push("parent-send-echo-mismatch");
+  }
+  if (message.phaseAtSend !== probe.phaseAtSend) {
+    anomalies.push("phase-echo-mismatch");
+  }
+
+  const parentToWorkerMs = roundedMillis(workerStartEpochMs - probe.parentSendEpochMs);
+  const workerHandlerMs = roundedMillis(workerEndMonoMs - workerStartMonoMs);
+  const workerToParentMs = roundedMillis(parentReceiveEpochMs - workerEndEpochMs);
+  const roundTripMs = roundedMillis(parentReceiveMonoMs - probe.parentSendMonoMs);
+  const decompositionDriftMs = roundedMillis(Math.abs(roundTripMs -
+    (parentToWorkerMs + workerHandlerMs + workerToParentMs)));
+  if (decompositionDriftMs > 5) anomalies.push("cross-clock-decomposition-drift");
+
+  const trigger = new Set(Array.isArray(message.slowTrigger) ? message.slowTrigger : []);
+  if (parentToWorkerMs >= SLOW_SAMPLE_THRESHOLD_MS) trigger.add("parent-to-worker");
+  if (workerHandlerMs >= SLOW_SAMPLE_THRESHOLD_MS) trigger.add("worker-handler");
+  if (workerToParentMs >= SLOW_SAMPLE_THRESHOLD_MS) trigger.add("worker-to-parent");
+  if (roundTripMs >= SLOW_SAMPLE_THRESHOLD_MS) trigger.add("round-trip");
+  if (workerInterProbeGapMs >= SLOW_SAMPLE_THRESHOLD_MS) {
+    trigger.add("worker-inter-probe-gap");
+  }
+  const snapshot = message.slowSnapshot && typeof message.slowSnapshot === "object"
+    ? {
+        worldgen: selectScalarTelemetry(
+          message.slowSnapshot.worldgen,
+          WORLDGEN_SLOW_SAMPLE_FIELDS,
+        ),
+        network: selectScalarTelemetry(
+          message.slowSnapshot.network,
+          NETWORK_SLOW_SAMPLE_FIELDS,
+        ),
+        storage: selectScalarTelemetry(
+          message.slowSnapshot.storage,
+          STORAGE_SLOW_SAMPLE_FIELDS,
+        ),
+        scheduler: selectScalarTelemetry(
+          message.slowSnapshot.scheduler,
+          SCHEDULER_SLOW_SAMPLE_FIELDS,
+        ),
+        gc: selectScalarTelemetry(message.slowSnapshot.gc, [
+          "supported",
+          "count",
+          "durationMs",
+          "maxDurationMs",
+          "lastDurationMs",
+          "lastKind",
+          "lastAtEpochMs",
+          "rssBytes",
+          "heapUsedBytes",
+          "heapTotalBytes",
+          "externalBytes",
+          "arrayBuffersBytes",
+          "heapLimitBytes",
+        ]),
+      }
+    : null;
+  return {
+    schemaVersion: SLOW_SAMPLE_SCHEMA_VERSION,
+    probeId: probe.probeId,
+    phaseAtSend: probe.phaseAtSend,
+    phaseAtReceive,
+    afterProtocolReady: protocolReadyAt > 0 &&
+      probe.parentSendEpochMs >= protocolReadyAt,
+    parentSendEpochMs: probe.parentSendEpochMs,
+    parentSendMonoMs: probe.parentSendMonoMs,
+    workerStartEpochMs,
+    workerStartMonoMs,
+    workerEndEpochMs,
+    workerEndMonoMs,
+    parentReceiveEpochMs,
+    parentReceiveMonoMs,
+    parentToWorkerMs,
+    workerHandlerMs,
+    workerToParentMs,
+    roundTripMs,
+    workerInterProbeGapMs: roundedMillis(workerInterProbeGapMs),
+    decompositionDriftMs,
+    trigger: [...trigger].sort(),
+    clockAnomaly: anomalies.length > 0,
+    clockAnomalies: anomalies,
+    snapshotCaptured: snapshot !== null,
+    snapshotDropped: message.slowSnapshotDropped === true,
+    snapshotError: typeof message.slowSnapshotError === "string"
+      ? message.slowSnapshotError.slice(0, 512)
+      : null,
+    worldgen: snapshot?.worldgen ?? null,
+    network: snapshot?.network ?? null,
+    storage: snapshot?.storage ?? null,
+    scheduler: snapshot?.scheduler ?? null,
+    gc: snapshot?.gc ?? null,
+  };
+}
+
+function compareSlowProbeSamples(left, right) {
+  return right.roundTripMs - left.roundTripMs || left.probeId - right.probeId;
+}
+
+function retainSlowProbeSample(samples, sample, limit = MAX_SLOW_SAMPLES_PER_SCOPE) {
+  if (sample.trigger.length === 0) return false;
+  samples.push(sample);
+  samples.sort(compareSlowProbeSamples);
+  if (samples.length > limit) samples.length = limit;
+  return true;
+}
+
+function combinedSlowProbeSamples(beforeProtocolReady, afterProtocolReady) {
+  const byProbe = new Map();
+  for (const sample of [...beforeProtocolReady, ...afterProtocolReady]) {
+    byProbe.set(sample.probeId, sample);
+  }
+  return [...byProbe.values()].sort(compareSlowProbeSamples).slice(0, MAX_SLOW_SAMPLES);
+}
+
+function runSlowProbeSelfSmoke() {
+  for (const [name, fields] of Object.entries({
+    worldgen: WORLDGEN_SLOW_SAMPLE_FIELDS,
+    network: NETWORK_SLOW_SAMPLE_FIELDS,
+    storage: STORAGE_SLOW_SAMPLE_FIELDS,
+    scheduler: SCHEDULER_SLOW_SAMPLE_FIELDS,
+  })) {
+    if (fields.length > MAX_SLOW_SAMPLE_FIELDS_PER_GROUP) {
+      throw new Error(`${name} slow-probe allowlist exceeded the fixed scalar limit`);
+    }
+  }
+  const probe = {
+    probeId: 7,
+    phaseAtSend: "distance-6/3",
+    parentSendEpochMs: 1000,
+    parentSendMonoMs: 500,
+  };
+  const sample = eventLoopProbeSample(probe, {
+    probeId: 7,
+    slowSampleSchemaVersion: SLOW_SAMPLE_SCHEMA_VERSION,
+    phaseAtSend: "distance-6/3",
+    parentSendEpochMs: 1000,
+    parentSendMonoMs: 500,
+    workerStartEpochMs: 1300,
+    workerStartMonoMs: 800,
+    workerEndEpochMs: 1302,
+    workerEndMonoMs: 802,
+    workerInterProbeGapMs: 301,
+    slowTrigger: ["parent-to-worker", "worker-inter-probe-gap"],
+    slowSnapshot: {
+      worldgen: {
+        slices: 5,
+        totalSliceElapsedMillis: 198.5,
+        deadlineYields: 4,
+        checkpointYields: 1,
+        forbidden: 1,
+      },
+      network: {inboundQueuedBytes: 2, forbidden: 1},
+      storage: {backend: "opfs", pendingEntries: 2, opfsFlushes: 3, forbidden: 1},
+      scheduler: {
+        activeTaskScope: true,
+        taskWorkDepth: 1,
+        lastTaskActiveWorkMillis: 94.1,
+        lastTaskScopeWallMillis: 6220,
+        serverWorkTurnActive: true,
+        forbidden: 1,
+      },
+      gc: {supported: false, count: 0, forbidden: 1},
+    },
+  }, 1310, 810, "distance-6/3", 900);
+  if (sample.parentToWorkerMs !== 300 || sample.workerHandlerMs !== 2 ||
+      sample.workerToParentMs !== 8 || sample.roundTripMs !== 310 ||
+      sample.worldgen?.forbidden !== undefined ||
+      sample.network?.forbidden !== undefined || sample.gc?.forbidden !== undefined) {
+    throw new Error("slow probe timing or scalar allowlist self-smoke failed");
+  }
+  if (sample.worldgen.totalSliceElapsedMillis !== 198.5 ||
+      sample.worldgen.deadlineYields !== 4 || sample.worldgen.checkpointYields !== 1 ||
+      sample.storage?.opfsFlushes !== 3 || sample.storage?.forbidden !== undefined ||
+      sample.storage?.backend !== "opfs" || sample.storage?.pendingEntries !== 2 ||
+      sample.scheduler?.activeTaskScope !== true ||
+      sample.scheduler?.lastTaskActiveWorkMillis !== 94.1 ||
+      sample.scheduler?.lastTaskScopeWallMillis !== 6220 ||
+      sample.scheduler?.serverWorkTurnActive !== true ||
+      sample.scheduler?.forbidden !== undefined) {
+    throw new Error("slow probe diagnostic snapshot self-smoke failed");
+  }
+  const segmented = eventLoopProbeSample(probe, {
+    probeId: 7,
+    slowSampleSchemaVersion: SLOW_SAMPLE_SCHEMA_VERSION,
+    phaseAtSend: probe.phaseAtSend,
+    parentSendEpochMs: probe.parentSendEpochMs,
+    parentSendMonoMs: probe.parentSendMonoMs,
+    workerStartEpochMs: 1010,
+    workerStartMonoMs: 510,
+    workerEndEpochMs: 1310,
+    workerEndMonoMs: 810,
+    workerInterProbeGapMs: 10,
+    slowTrigger: [],
+    slowSnapshot: null,
+  }, 1610, 1110, probe.phaseAtSend, 900);
+  for (const trigger of ["worker-handler", "worker-to-parent", "round-trip"]) {
+    if (!segmented.trigger.includes(trigger)) {
+      throw new Error(`slow probe did not retain the ${trigger} segment trigger`);
+    }
+  }
+  const fast = eventLoopProbeSample(probe, {
+    probeId: 7,
+    slowSampleSchemaVersion: SLOW_SAMPLE_SCHEMA_VERSION,
+    phaseAtSend: probe.phaseAtSend,
+    parentSendEpochMs: probe.parentSendEpochMs,
+    parentSendMonoMs: probe.parentSendMonoMs,
+    workerStartEpochMs: 1001,
+    workerStartMonoMs: 501,
+    workerEndEpochMs: 1002,
+    workerEndMonoMs: 502,
+    workerInterProbeGapMs: 100,
+    slowTrigger: [],
+    slowSnapshot: null,
+  }, 1003, 503, probe.phaseAtSend, 900);
+  if (fast.trigger.length !== 0 || fast.snapshotCaptured ||
+      retainSlowProbeSample([], fast)) {
+    throw new Error("fast event-loop probe entered the bounded slow-sample ring");
+  }
+  const retained = [];
+  for (let index = 0; index < MAX_SLOW_SAMPLES_PER_SCOPE + 1; index++) {
+    retainSlowProbeSample(retained, {
+      ...sample,
+      probeId: index + 1,
+      roundTripMs: index + 1,
+    });
+  }
+  if (retained.length !== MAX_SLOW_SAMPLES_PER_SCOPE ||
+      retained[0].roundTripMs !== MAX_SLOW_SAMPLES_PER_SCOPE + 1 ||
+      retained.at(-1).roundTripMs !== 2) {
+    throw new Error("slow probe bounded top-K self-smoke failed");
+  }
+  return {
+    ok: true,
+    schema: SLOW_SAMPLE_SCHEMA,
+    thresholdMs: SLOW_SAMPLE_THRESHOLD_MS,
+    limit: MAX_SLOW_SAMPLES,
+    perScopeLimit: MAX_SLOW_SAMPLES_PER_SCOPE,
+    timingDecomposition: true,
+    boundedTopK: true,
+    scalarAllowlist: true,
+    maxFieldsPerGroup: MAX_SLOW_SAMPLE_FIELDS_PER_GROUP,
+    segmentedTriggers: true,
+    fastProbeExcluded: true,
+  };
+}
+
 // Telemetry pongs are the only samples that cross the Worker boundary after
 // the measurement window is reset.  Keep each object detached from the
 // structured-clone payload, and keep the update itself pure so a stale or
@@ -561,6 +1091,7 @@ if (isMainThread && process.env.GAIUS_SMOKE_SELF_TEST === "1") {
   process.stdout.write(JSON.stringify({
     ...runNetworkValidationSelfSmoke(),
     telemetrySnapshots: runTelemetrySnapshotSelfSmoke(),
+    slowProbe: runSlowProbeSelfSmoke(),
   }) + "\n");
   process.exit(0);
 }
@@ -760,6 +1291,13 @@ if (isMainThread) {
   const eventLoopProbeStartedAt = new Map();
   const eventLoopProbeLatenciesMs = [];
   const eventLoopProbeSamples = [];
+  const slowProbeSamplesBeforeProtocolReady = [];
+  const slowProbeSamplesAfterProtocolReady = [];
+  const slowProbeClockAnomalies = [];
+  let slowProbeCandidateCount = 0;
+  let slowProbeClockAnomalyCount = 0;
+  let slowProbeSnapshotDroppedCount = 0;
+  let slowProbeSnapshotErrorCount = 0;
   let longestEventLoopProbe = {latencyMs: 0, startedAt: 0, completedAt: 0};
   let longestGameplayEventLoopProbe = {
     latencyMs: 0,
@@ -829,8 +1367,27 @@ if (isMainThread) {
   };
   const eventLoopProbeInterval = setInterval(() => {
     const probeId = ++eventLoopProbeId;
-    eventLoopProbeStartedAt.set(probeId, {startedAt: Date.now(), phase: workerPhase});
-    worker.postMessage({type: "node-event-loop-probe", probeId});
+    const parentSendEpochMs = highResolutionEpochMillis();
+    const parentSendMonoMs = performance.now();
+    const probe = {
+      probeId,
+      startedAt: parentSendEpochMs,
+      phase: workerPhase,
+      phaseAtSend: workerPhase,
+      parentSendEpochMs,
+      parentSendMonoMs,
+    };
+    eventLoopProbeStartedAt.set(probeId, probe);
+    worker.postMessage({
+      type: "node-event-loop-probe",
+      probeId,
+      phaseAtSend: probe.phaseAtSend,
+      afterProtocolReady: protocolReadyAt > 0 && parentSendEpochMs >= protocolReadyAt,
+      parentSendEpochMs,
+      parentSendMonoMs,
+      slowSampleSchemaVersion: SLOW_SAMPLE_SCHEMA_VERSION,
+      slowSampleThresholdMs: SLOW_SAMPLE_THRESHOLD_MS,
+    });
   }, 100);
   const requestTelemetryPong = (stage) => {
     if (finished || workerExited) {
@@ -890,9 +1447,15 @@ if (isMainThread) {
     }
     const probeId = ++eventLoopProbeId;
     const wait = deferred();
+    const parentSendEpochMs = highResolutionEpochMillis();
+    const parentSendMonoMs = performance.now();
     const probe = {
-      startedAt: Date.now(),
+      probeId,
+      startedAt: parentSendEpochMs,
       phase: "telemetry-barrier-" + stage,
+      phaseAtSend: "telemetry-barrier-" + stage,
+      parentSendEpochMs,
+      parentSendMonoMs,
       barrier: wait,
       barrierTimer: 0,
     };
@@ -915,7 +1478,16 @@ if (isMainThread) {
       });
     }, telemetryBarrierTimeoutMs);
     try {
-      worker.postMessage({type: "node-event-loop-probe", probeId});
+      worker.postMessage({
+        type: "node-event-loop-probe",
+        probeId,
+        phaseAtSend: probe.phaseAtSend,
+        afterProtocolReady: protocolReadyAt > 0 && parentSendEpochMs >= protocolReadyAt,
+        parentSendEpochMs,
+        parentSendMonoMs,
+        slowSampleSchemaVersion: SLOW_SAMPLE_SCHEMA_VERSION,
+        slowSampleThresholdMs: SLOW_SAMPLE_THRESHOLD_MS,
+      });
     } catch (error) {
       settle({
         available: false,
@@ -1242,7 +1814,7 @@ if (isMainThread) {
       networkValidation.healthErrors.push("pre-stop network telemetry barrier was not stable");
       networkValidation.valid = false;
     }
-    events.push({
+    const protocolFinalEvent = {
       type: "protocol-final",
       stoppedDetail: stoppedMessage.detail,
       distanceRampIntervalMillis: configuredDistanceRampIntervalMillis,
@@ -1258,13 +1830,42 @@ if (isMainThread) {
       },
       worldgenStats: latestWorldgenStats,
       storageStats: latestStorageStats,
-    });
+    };
+    events.push(protocolFinalEvent);
     const sortedProbeLatencies = eventLoopProbeLatenciesMs.slice().sort((left, right) => left - right);
     const phaseLatencies = summarizeProbePhases(eventLoopProbeSamples);
     const gameplayLatency = summarizeGameplayProbeLatencies(eventLoopProbeSamples);
     const afterProtocolReadyGameplayLatency = summarizeGameplayProbeLatencies(
       eventLoopProbeSamples.filter((sample) => sample.startedAt >= protocolReadyAt),
     );
+    const slowProbeSamples = combinedSlowProbeSamples(
+      slowProbeSamplesBeforeProtocolReady,
+      slowProbeSamplesAfterProtocolReady,
+    );
+    const slowProbeEvidence = {
+      schemaVersion: SLOW_SAMPLE_SCHEMA_VERSION,
+      schema: SLOW_SAMPLE_SCHEMA,
+      thresholdMs: SLOW_SAMPLE_THRESHOLD_MS,
+      limit: MAX_SLOW_SAMPLES,
+      perScopeLimit: MAX_SLOW_SAMPLES_PER_SCOPE,
+      countTotal: slowProbeCandidateCount,
+      countRetained: slowProbeSamples.length,
+      dropped: Math.max(0, slowProbeCandidateCount - slowProbeSamples.length),
+      retainedBeforeProtocolReady: slowProbeSamplesBeforeProtocolReady.length,
+      retainedAfterProtocolReady: slowProbeSamplesAfterProtocolReady.length,
+      snapshotDropped: slowProbeSnapshotDroppedCount,
+      snapshotErrors: slowProbeSnapshotErrorCount,
+      clockAnomalyCount: slowProbeClockAnomalyCount,
+      clockAnomalies: slowProbeClockAnomalies.slice(),
+      timingModel: {
+        parentToWorker: "cross-thread epoch: worker-start - parent-send",
+        workerHandler: "worker monotonic: worker-end - worker-start",
+        workerToParent: "cross-thread epoch: parent-receive - worker-end",
+        roundTrip: "parent monotonic: parent-receive - parent-send",
+      },
+      samples: slowProbeSamples,
+    };
+    protocolFinalEvent.slowProbeEvidence = slowProbeEvidence;
     // Worker direct-executor mode does not promise cooperative pump activity.
     // Its meaningful stall window starts after the client is protocol-ready;
     // startup/worldgen work before that point is intentionally staged.  When
@@ -1275,6 +1876,7 @@ if (isMainThread) {
       : afterProtocolReadyGameplayLatency;
     events.push({
       type: "worker-event-loop-latency",
+      schemaVersion: 3,
       samples: sortedProbeLatencies.length,
       p95Ms: percentile(sortedProbeLatencies, 0.95),
       p99Ms: percentile(sortedProbeLatencies, 0.99),
@@ -1297,6 +1899,7 @@ if (isMainThread) {
         : "after-protocol-ready",
       byPhase: phaseLatencies,
       pending: eventLoopProbeStartedAt.size,
+      slowProbeEvidence,
     });
     if (stallValidation.maxMs > maximumGameplayStallMs) {
       events.push({
@@ -1308,6 +1911,7 @@ if (isMainThread) {
         stallValidationScope: cooperativePumpMode.requireActivity
           ? "all-gameplay"
           : "after-protocol-ready",
+        slowProbeEvidence,
       });
       clearTimeout(timeout);
       finish(1);
@@ -1480,6 +2084,10 @@ if (isMainThread) {
         message.worldgenStats !== undefined
         ? copyObjectSnapshot(message.worldgenStats)
         : latestWorldgenStats;
+      latestStorageStats = message.storageStats !== null &&
+        message.storageStats !== undefined
+        ? copyObjectSnapshot(message.storageStats)
+        : latestStorageStats;
       if (traceEvents && Date.now() - lastWorldgenTraceAt >= 5000) {
         lastWorldgenTraceAt = Date.now();
         process.stderr.write(
@@ -1494,21 +2102,65 @@ if (isMainThread) {
       const probe = eventLoopProbeStartedAt.get(message.probeId);
       if (probe !== undefined) {
         eventLoopProbeStartedAt.delete(message.probeId);
-        const completedAt = Date.now();
-        const latencyMs = completedAt - probe.startedAt;
+        const parentReceiveEpochMs = highResolutionEpochMillis();
+        const parentReceiveMonoMs = performance.now();
+        const slowSample = eventLoopProbeSample(
+          probe,
+          message,
+          parentReceiveEpochMs,
+          parentReceiveMonoMs,
+          workerPhase,
+          protocolReadyAt,
+        );
+        const completedAt = parentReceiveEpochMs;
+        const latencyMs = slowSample.roundTripMs;
         eventLoopProbeLatenciesMs.push(latencyMs);
         eventLoopProbeSamples.push({
+          probeId: probe.probeId,
           latencyMs,
           startedAt: probe.startedAt,
           completedAt,
           phase: probe.phase,
+          parentToWorkerMs: slowSample.parentToWorkerMs,
+          workerHandlerMs: slowSample.workerHandlerMs,
+          workerToParentMs: slowSample.workerToParentMs,
+          workerInterProbeGapMs: slowSample.workerInterProbeGapMs,
+          clockAnomaly: slowSample.clockAnomaly,
         });
+        if (slowSample.trigger.length > 0) {
+          slowProbeCandidateCount++;
+          retainSlowProbeSample(
+            slowSample.afterProtocolReady
+              ? slowProbeSamplesAfterProtocolReady
+              : slowProbeSamplesBeforeProtocolReady,
+            slowSample,
+          );
+        }
+        if (slowSample.clockAnomaly &&
+            slowProbeClockAnomalies.length < MAX_SLOW_SAMPLES) {
+          slowProbeClockAnomalyCount++;
+          slowProbeClockAnomalies.push({
+            probeId: slowSample.probeId,
+            anomalies: slowSample.clockAnomalies,
+          });
+        } else if (slowSample.clockAnomaly) {
+          slowProbeClockAnomalyCount++;
+        }
+        if (slowSample.snapshotDropped) slowProbeSnapshotDroppedCount++;
+        if (slowSample.snapshotError !== null) slowProbeSnapshotErrorCount++;
         if (latencyMs > longestEventLoopProbe.latencyMs) {
-          longestEventLoopProbe = {latencyMs, startedAt: probe.startedAt, completedAt};
+          longestEventLoopProbe = {
+            probeId: probe.probeId,
+            latencyMs,
+            startedAt: probe.startedAt,
+            completedAt,
+            phase: probe.phase,
+          };
         }
         if (isGameplayProbePhase(probe.phase) &&
             latencyMs > longestGameplayEventLoopProbe.latencyMs) {
           longestGameplayEventLoopProbe = {
+            probeId: probe.probeId,
             latencyMs,
             startedAt: probe.startedAt,
             completedAt,
@@ -1534,6 +2186,10 @@ if (isMainThread) {
             worldgenStats: message.worldgenStats !== null &&
               message.worldgenStats !== undefined
               ? copyObjectSnapshot(message.worldgenStats)
+              : null,
+            storageStats: message.storageStats !== null &&
+              message.storageStats !== undefined
+              ? copyObjectSnapshot(message.storageStats)
               : null,
           });
         }
@@ -1709,6 +2365,7 @@ if (isMainThread) {
     console.warn = writeDiagnostic;
   }
   installWorkerGlobals();
+  installWorkerGcObserver();
   const originalConsoleError = console.error.bind(console);
   console.error = (...args) => {
     parentPort.postMessage({
@@ -1725,20 +2382,96 @@ if (isMainThread) {
   let coverageSession;
   let coverageStarted;
   let coverageMetadata;
+  let previousWorkerProbeStartMonoMs = Number.NaN;
+  let workerSlowSnapshotsBeforeProtocolReady = 0;
+  let workerSlowSnapshotsAfterProtocolReady = 0;
   parentPort.on("message", (data) => {
     if (data && data.type === "node-event-loop-probe") {
+      const workerStartEpochMs = highResolutionEpochMillis();
+      const workerStartMonoMs = performance.now();
+      const workerInterProbeGapMs = Number.isFinite(previousWorkerProbeStartMonoMs)
+        ? Math.max(0, workerStartMonoMs - previousWorkerProbeStartMonoMs)
+        : 0;
+      previousWorkerProbeStartMonoMs = workerStartMonoMs;
+      const threshold = SLOW_SAMPLE_THRESHOLD_MS;
+      const thresholdMismatch = Number(data.slowSampleThresholdMs) !== threshold;
+      const parentToWorkerMs = Math.max(
+        0,
+        workerStartEpochMs - Number(data.parentSendEpochMs),
+      );
+      const slowTrigger = [];
+      if (parentToWorkerMs >= threshold) slowTrigger.push("parent-to-worker");
+      if (workerInterProbeGapMs >= threshold) {
+        slowTrigger.push("worker-inter-probe-gap");
+      }
+      let slowSnapshot = null;
+      let slowSnapshotError = null;
+      let slowSnapshotAttempted = false;
+      const captureSlowSnapshot = () => {
+        if (slowSnapshotAttempted) return;
+        slowSnapshotAttempted = true;
+        if (data.afterProtocolReady) {
+          if (workerSlowSnapshotsAfterProtocolReady >= MAX_SLOW_SAMPLES_PER_SCOPE) {
+            return;
+          }
+          workerSlowSnapshotsAfterProtocolReady++;
+        } else {
+          if (workerSlowSnapshotsBeforeProtocolReady >= MAX_SLOW_SAMPLES_PER_SCOPE) {
+            return;
+          }
+          workerSlowSnapshotsBeforeProtocolReady++;
+        }
+        const captured = safeWorkerSlowProbeSnapshot();
+        slowSnapshot = captured.snapshot;
+        slowSnapshotError = captured.error;
+      };
+      if (slowTrigger.length > 0) captureSlowSnapshot();
+      const chunkPriorityStats = globalThis.__gaiusChunkPriorityStats
+        ? {...globalThis.__gaiusChunkPriorityStats}
+        : null;
+      const networkStats = globalThis.__gaiusNetworkStats
+        ? {...globalThis.__gaiusNetworkStats}
+        : null;
+      const worldgenStats = globalThis.__gaiusWorldgenStats
+        ? {...globalThis.__gaiusWorldgenStats}
+        : null;
+      const storageStats = globalThis.__gaiusStorageStats
+        ? {...globalThis.__gaiusStorageStats}
+        : null;
+      let workerEndEpochMs = highResolutionEpochMillis();
+      let workerEndMonoMs = performance.now();
+      if (workerEndMonoMs - workerStartMonoMs >= threshold &&
+          !slowTrigger.includes("worker-handler")) {
+        slowTrigger.push("worker-handler");
+        if (!slowSnapshotAttempted) {
+          captureSlowSnapshot();
+          workerEndEpochMs = highResolutionEpochMillis();
+          workerEndMonoMs = performance.now();
+        }
+      }
+      const slowSnapshotDropped = slowTrigger.length > 0 &&
+        slowSnapshot === null && slowSnapshotError === null;
       parentPort.postMessage({
         type: "node-event-loop-pong",
         probeId: data.probeId,
-        chunkPriorityStats: globalThis.__gaiusChunkPriorityStats
-          ? {...globalThis.__gaiusChunkPriorityStats}
-          : null,
-        networkStats: globalThis.__gaiusNetworkStats
-          ? {...globalThis.__gaiusNetworkStats}
-          : null,
-        worldgenStats: globalThis.__gaiusWorldgenStats
-          ? {...globalThis.__gaiusWorldgenStats}
-          : null,
+        slowSampleSchemaVersion: data.slowSampleSchemaVersion,
+        phaseAtSend: data.phaseAtSend,
+        parentSendEpochMs: data.parentSendEpochMs,
+        parentSendMonoMs: data.parentSendMonoMs,
+        workerStartEpochMs,
+        workerStartMonoMs,
+        workerEndEpochMs,
+        workerEndMonoMs,
+        workerInterProbeGapMs,
+        slowTrigger,
+        slowSampleThresholdMismatch: thresholdMismatch,
+        slowSnapshot,
+        slowSnapshotDropped,
+        slowSnapshotError,
+        chunkPriorityStats,
+        networkStats,
+        worldgenStats,
+        storageStats,
       });
       return;
     }
@@ -3051,6 +3784,7 @@ function installWorkerGlobals() {
   globalThis.WorkerGlobalScope = NodeWorkerGlobalScope;
   globalThis.MessagePort = MessagePort;
   globalThis.self = globalThis;
+  globalThis.__gaiusSlowProbeTelemetryEnabled = true;
   const worldgenSliceMillis = Number(process.env.GAIUS_SMOKE_WORLDGEN_SLICE_MS || "");
   if (Number.isFinite(worldgenSliceMillis) && worldgenSliceMillis > 0) {
     globalThis.__gaiusWorldgenSliceMillis = worldgenSliceMillis;

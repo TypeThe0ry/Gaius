@@ -74,7 +74,7 @@ assert.ok(worldgen.includes("public static int beginTaskWork()")
     && worldgen.includes("TASK_SCOPE_NORMAL")
     && worldgen.includes("TASK_SCOPE_REENTRANT")
     && worldgen.includes("if (token == TASK_SCOPE_REENTRANT)")
-    && worldgen.includes("if (taskWorkDepth > 0 && deferredTaskScopeEnds == 0)"),
+    && worldgen.includes("if (deferredTaskScopeEnds == 0)"),
   "worldgen task active-work token scope is missing");
 assert.ok(worldgen.includes("deferredTaskScopeEnds = 0;"),
   "worldgen task-scope finally does not clear stale deferred closes");
@@ -133,6 +133,15 @@ assert.ok(!worldgen.includes("new Thread") && !worldgen.includes("Executor")
   "worldgen scheduler introduces parallel server-state execution");
 assert.ok(!worldgen.includes("setTimeout(") && !worldgen.includes("setInterval("),
   "worldgen scheduler owns a timer that can leak after shutdown");
+assert.ok(worldgen.includes("recordSchedulerMarker(")
+    && worldgen.includes("globalThis.__gaiusSlowProbeTelemetryEnabled !== true")
+    && worldgen.includes("globalThis.__gaiusWorldgenSchedulerMarker")
+    && worldgen.includes("Diagnostic telemetry is fail-open")
+    && worldgen.includes('"task-end-underflow"'),
+  "worldgen task scheduler is missing its opt-in slow-probe marker");
+assert.ok(worldgen.includes("if (reentrantTaskWorkDepth <= 0)")
+    && worldgen.includes("if (taskWorkDepth <= 0)"),
+  "worldgen task-scope underflow paths are not fail-closed");
 for (const field of [
   "sliceElapsedMillis",
   "p95SliceElapsedMillis",
@@ -231,6 +240,75 @@ globalThis.__gaiusNetworkStats = {
 };
 assert.equal(queueDepth(), 7, "queue pressure does not report the deepest bounded stage");
 delete globalThis.__gaiusNetworkStats;
+
+const recordSchedulerMarker = new Function(
+  "event",
+  "token",
+  "taskDepth",
+  "reentrantDepth",
+  "yielding",
+  "activeWorkMillis",
+  jsBody("private static native void recordSchedulerMarker("),
+);
+delete globalThis.__gaiusWorldgenSchedulerMarker;
+delete globalThis.__gaiusSlowProbeTelemetryEnabled;
+recordSchedulerMarker("task-start-normal", 1, 1, 0, false, 4);
+assert.equal(globalThis.__gaiusWorldgenSchedulerMarker, undefined,
+  "worldgen slow-probe marker mutated release state while disabled");
+globalThis.__gaiusSlowProbeTelemetryEnabled = true;
+recordSchedulerMarker("server-work-turn-start", 0, 0, 0, false, 0);
+recordSchedulerMarker("task-start-normal", 1, 1, 0, false, 4);
+recordSchedulerMarker("yield-start", 0, 1, 0, true, 12);
+recordSchedulerMarker("yield-end", 0, 1, 0, false, 0);
+recordSchedulerMarker("task-end-normal", 1, 0, 0, false, 6);
+recordSchedulerMarker("server-work-turn-end", 3, 0, 0, false, 0);
+assert.equal(globalThis.__gaiusWorldgenSchedulerMarker.taskScopesStarted, 1,
+  "worldgen slow-probe marker did not count task entry");
+assert.equal(globalThis.__gaiusWorldgenSchedulerMarker.taskScopesEnded, 1,
+  "worldgen slow-probe marker did not count task exit");
+assert.equal(globalThis.__gaiusWorldgenSchedulerMarker.lastTaskActiveWorkMillis, 14,
+  "worldgen slow-probe marker did not isolate active task work across a yield");
+assert.equal(globalThis.__gaiusWorldgenSchedulerMarker.activeTaskScope, false,
+  "worldgen slow-probe marker retained a closed task scope");
+assert.equal(globalThis.__gaiusWorldgenSchedulerMarker.yieldActive, false,
+  "worldgen slow-probe marker retained a completed yield");
+assert.equal(globalThis.__gaiusWorldgenSchedulerMarker.serverWorkTurnSequence, 1,
+  "worldgen slow-probe marker did not count the server work turn");
+assert.equal(globalThis.__gaiusWorldgenSchedulerMarker.serverWorkTurnActive, false,
+  "worldgen slow-probe marker retained a completed server work turn");
+assert.ok(globalThis.__gaiusWorldgenSchedulerMarker.lastTaskScopeWallMillis >= 0,
+  "worldgen slow-probe marker omitted task wall time");
+assert.ok(!Object.keys(globalThis.__gaiusWorldgenSchedulerMarker)
+  .some(key => key.startsWith("__task")),
+  "worldgen slow-probe marker leaked internal task accounting fields");
+delete globalThis.__gaiusWorldgenSchedulerMarker;
+recordSchedulerMarker("task-start-reentrant", 2, 0, 1, true, 0);
+assert.equal(globalThis.__gaiusWorldgenSchedulerMarker.activeTaskScope, true,
+  "worldgen slow-probe marker omitted a reentrant-only task scope");
+assert.equal(globalThis.__gaiusWorldgenSchedulerMarker.normalTaskScopeActive, false,
+  "worldgen slow-probe marker confused reentrant work with the outer task clock");
+recordSchedulerMarker("task-end-reentrant", 2, 0, 0, true, 0);
+assert.equal(globalThis.__gaiusWorldgenSchedulerMarker.activeTaskScope, false,
+  "worldgen slow-probe marker retained a closed reentrant-only task scope");
+assert.equal(globalThis.__gaiusWorldgenSchedulerMarker.reentrantTaskScopesEnded, 1,
+  "worldgen slow-probe marker did not count a matched reentrant close");
+delete globalThis.__gaiusWorldgenSchedulerMarker;
+recordSchedulerMarker("task-end-underflow", 2, 0, 0, true, 0);
+assert.equal(globalThis.__gaiusWorldgenSchedulerMarker.taskScopeUnderflows, 1,
+  "worldgen slow-probe marker did not count a reentrant/deferred underflow");
+assert.equal(globalThis.__gaiusWorldgenSchedulerMarker.reentrantTaskScopesEnded || 0, 0,
+  "worldgen slow-probe marker counted an unmatched reentrant scope as closed");
+delete globalThis.__gaiusWorldgenSchedulerMarker;
+Object.defineProperty(globalThis, "__gaiusWorldgenSchedulerMarker", {
+  configurable: true,
+  get() {
+    throw new Error("poisoned diagnostic marker");
+  },
+});
+assert.doesNotThrow(() => recordSchedulerMarker("task-start-normal", 1, 1, 0, false, 0),
+  "worldgen diagnostic marker exception escaped into scheduler work");
+delete globalThis.__gaiusWorldgenSchedulerMarker;
+delete globalThis.__gaiusSlowProbeTelemetryEnabled;
 
 const distanceBudget = new Function(
   "fallback",
