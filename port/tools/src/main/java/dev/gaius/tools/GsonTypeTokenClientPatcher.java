@@ -23,7 +23,13 @@ public final class GsonTypeTokenClientPatcher {
     }
 
     public static void main(String[] args) throws IOException {
+        if (args.length != 3) {
+            throw new IllegalArgumentException(
+                    "usage: GsonTypeTokenClientPatcher <client-overlay.jar> "
+                            + "<patch-output> <version-libraries>");
+        }
         Path root = Path.of(args[1]);
+        Path versionLibraries = Path.of(args[2]);
 
         ClassNode options = read(args[0], "net/minecraft/client/Options.class");
         replaceAnonymousTypeTokenConstruction(
@@ -42,10 +48,6 @@ public final class GsonTypeTokenClientPatcher {
                 "net/minecraft/client/resources/sounds/SoundEventRegistration");
         write(sounds, root.resolve("net/minecraft/client/sounds/SoundManager.class"));
 
-        Path clientJar = Path.of(args[0]);
-        // Resolve the configured version's library tree from the overlay jar name
-        // (client-named-<version>-gaius.jar) so no version-specific paths are hard-coded.
-        Path versionLibraries = workLibrariesFor(clientJar);
         Path gsonJar = findJar(versionLibraries,
                 "com/google/code/gson/gson");
         GsonBrowserPatcher.main(new String[] {
@@ -62,34 +64,6 @@ public final class GsonTypeTokenClientPatcher {
         });
 
         System.out.println("Patched browser Gson TypeToken initializers");
-    }
-
-    /**
-     * Resolves port/work/<version>/libraries from the overlay client jar name.
-     *
-     * The historical overlay root is port/work/overlays, while isolated
-     * profiles use port/work/overlays/<version>.  Prefer the candidate that
-     * contains the version's datafixerupper dependency so the patcher never
-     * accidentally treats an overlay directory as the vanilla library tree.
-     */
-    private static Path workLibrariesFor(Path clientJar) {
-        String name = clientJar.getFileName().toString();
-        String prefix = "client-named-";
-        String suffix = "-gaius.jar";
-        if (!name.startsWith(prefix) || !name.endsWith(suffix)) {
-            throw new IllegalArgumentException("Unexpected overlay jar name: " + name);
-        }
-        String version = name.substring(prefix.length(), name.length() - suffix.length());
-        Path overlayParent = clientJar.getParent().getParent();
-        Path historical = overlayParent.resolve(version).resolve("libraries");
-        Path isolated = overlayParent.getParent().resolve(version).resolve("libraries");
-        if (Files.isDirectory(historical.resolve("com/mojang/datafixerupper"))) {
-            return historical;
-        }
-        if (Files.isDirectory(isolated.resolve("com/mojang/datafixerupper"))) {
-            return isolated;
-        }
-        return historical;
     }
 
     /** Resolves a library JAR under the version library tree without hard-coded versions. */

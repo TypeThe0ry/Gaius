@@ -7,6 +7,7 @@ source "$root/port/scripts/teavm-publication-gate.sh"
 gaius_load_version_profile "$root"
 gaius_select_java_home
 version="$GAIUS_MINECRAFT_VERSION"
+work="$root/port/work/$version"
 build_root="$(gaius_build_root "$root")"
 overlay_directory="$(gaius_overlay_directory "$root")"
 maven_repository="$(gaius_maven_repository "$root")"
@@ -102,7 +103,8 @@ if [[ "${GAIUS_SKIP_OVERLAY_BUILD:-false}" != "true" ]]; then
     "$overlay_directory/tool-classes:$maven_repository/org/ow2/asm/asm/9.8/asm-9.8.jar:$maven_repository/org/ow2/asm/asm-tree/9.8/asm-tree-9.8.jar" \
     dev.gaius.tools.GsonTypeTokenClientPatcher \
     "$overlay_directory/client-named-$version-gaius.jar" \
-    "$gson_type_token_patches"
+    "$gson_type_token_patches" \
+    "$work/libraries"
   jar --update \
     --file "$overlay_directory/client-named-$version-gaius.jar" \
     -C "$gson_type_token_patches" .
@@ -112,7 +114,6 @@ fi
 node "$root/port/scripts/gson-type-token-smoke.mjs" \
   --profile "$GAIUS_VERSION_PROFILE" \
   --overlay "$overlay_directory"
-work="$root/port/work/$version"
 icu_path="$(gaius_library_path "com.ibm.icu:icu4j")"
 resource_list_dir="$build_root/generated-resources/dev/gaius/browser"
 resource_list="$resource_list_dir/minecraft-resources.txt"
