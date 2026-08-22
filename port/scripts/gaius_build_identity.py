@@ -194,12 +194,14 @@ def _input_paths(root: Path, relative_profile: str, *, protocol: bool) -> list[P
     return [paths[name] for name in sorted(paths)]
 
 
-def _hash_input_set(root: Path, paths: list[Path], policy: str) -> dict[str, object]:
+def _hash_named_input_set(
+    inputs: list[tuple[str, Path]],
+    policy: str,
+) -> dict[str, object]:
     digest = hashlib.sha256()
     digest.update(policy.encode("ascii") + b"\0")
     total_bytes = 0
-    for path in paths:
-        relative = path.relative_to(root).as_posix()
+    for relative, path in inputs:
         size = path.stat().st_size
         file_hash = sha256_file(path)
         digest.update(relative.encode("utf-8"))
@@ -212,12 +214,19 @@ def _hash_input_set(root: Path, paths: list[Path], policy: str) -> dict[str, obj
     return {
         "policy": policy,
         "sha256": digest.hexdigest(),
-        "fileCount": len(paths),
+        "fileCount": len(inputs),
         "bytes": total_bytes,
     }
 
 
-def _overlay_paths(root: Path, profile: dict) -> list[Path]:
+def _hash_input_set(root: Path, paths: list[Path], policy: str) -> dict[str, object]:
+    return _hash_named_input_set(
+        [(path.relative_to(root).as_posix(), path) for path in paths],
+        policy,
+    )
+
+
+def _overlay_inputs(root: Path, profile: dict) -> list[tuple[str, Path]]:
     try:
         config = json.loads((root / "port" / "config.json").read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, ValueError) as exc:
@@ -241,14 +250,14 @@ def _overlay_paths(root: Path, profile: dict) -> list[Path]:
     if not overlays.is_absolute():
         overlays = root / overlays
     overlays = overlays.resolve()
+    metadata_candidates = (work / "version.json", work / "client-version.json")
     candidates = [
-        work / "version.json",
-        work / "client-version.json",
+        *metadata_candidates,
         overlays / f"client-named-{version}-gaius.jar",
         overlays / f"teavm-classlib-{teavm_version}-gaius.jar",
         overlays / f"teavm-core-{teavm_version}-gaius.jar",
     ]
-    metadata_path = work / "version.json"
+    metadata_path = metadata_candidates[0]
     if metadata_path.is_file():
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -271,11 +280,34 @@ def _overlay_paths(root: Path, profile: dict) -> list[Path]:
                 raise RuntimeError(f"active library metadata path is unsafe: {relative}")
             candidates.append(overlays / "libraries" / relative_path)
 
+    isolated = bool(
+        os.environ.get("GAIUS_BUILD_ROOT")
+        or os.environ.get("GAIUS_VERSION_PROFILE_PATH")
+    )
+    logical_overlay_root = Path("port/work/overlays")
+    if isolated:
+        logical_overlay_root /= version
+
     unique: dict[str, Path] = {}
     for path in candidates:
-        if path.is_file():
-            unique[path.relative_to(root).as_posix()] = path
-    return [unique[name] for name in sorted(unique)]
+        if not path.is_file():
+            continue
+        if path in metadata_candidates:
+            logical_name = path.relative_to(root).as_posix()
+        else:
+            try:
+                overlay_relative = path.relative_to(overlays)
+            except ValueError:
+                logical_name = path.relative_to(root).as_posix()
+            else:
+                # Overlay identities describe their logical profile-scoped input
+                # names, not the host-specific staging directory.  Cluster and CI
+                # builds deliberately place overlays outside the checkout; hashing
+                # an absolute path would either fail or make identical artifacts
+                # produce different identities on every worker.
+                logical_name = (logical_overlay_root / overlay_relative).as_posix()
+        unique[logical_name] = path
+    return [(name, unique[name]) for name in sorted(unique)]
 
 
 def current_build_identity(root: Path) -> dict[str, object]:
@@ -292,11 +324,7 @@ def current_build_identity(root: Path) -> dict[str, object]:
         _input_paths(root, relative_profile, protocol=True),
         PROTOCOL_POLICY,
     )
-    overlay = _hash_input_set(
-        root,
-        _overlay_paths(root, profile),
-        OVERLAY_POLICY,
-    )
+    overlay = _hash_named_input_set(_overlay_inputs(root, profile), OVERLAY_POLICY)
     protocol["minecraftProtocolVersion"] = profile["protocolVersion"]
     profile_identity = {
         "id": profile["id"],

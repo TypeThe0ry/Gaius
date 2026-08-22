@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import contextlib
 import gzip
+import hashlib
 import importlib.util
 import io
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -380,6 +382,38 @@ class PortableArtifactIdentityTest(unittest.TestCase):
                 ):
             return QUICK_CHECK.portable_artifact_identity_matches()
 
+    @staticmethod
+    def legacy_overlay_identity(root: Path, paths: list[Path]) -> dict[str, object]:
+        """Hash overlay paths exactly as the pre-external-root implementation did."""
+        digest = hashlib.sha256()
+        policy = PORTABLE.build_identity.OVERLAY_POLICY
+        digest.update(policy.encode("ascii") + b"\0")
+        total_bytes = 0
+        ordered = sorted(paths, key=lambda path: path.relative_to(root).as_posix())
+        for path in ordered:
+            relative = path.relative_to(root).as_posix()
+            size = path.stat().st_size
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(size).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(PORTABLE.build_identity.sha256_file(path).encode("ascii"))
+            digest.update(b"\n")
+            total_bytes += size
+        return {
+            "policy": policy,
+            "sha256": digest.hexdigest(),
+            "fileCount": len(ordered),
+            "bytes": total_bytes,
+        }
+
+    @staticmethod
+    def msys_path(path: Path) -> str:
+        value = str(path.resolve()).replace("\\", "/")
+        if len(value) < 3 or value[1] != ":":
+            raise AssertionError(f"expected a Windows drive path, got {value}")
+        return f"/{value[0].lower()}{value[2:]}"
+
     def test_correct_26_2_publishes_and_embeds_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root, dist, output = self.make_fixture(directory)
@@ -435,6 +469,173 @@ class PortableArtifactIdentityTest(unittest.TestCase):
                     "server-input-pump",
                 },
             )
+
+    def test_overlay_identity_is_location_stable_across_scope_and_path_styles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, _dist, _output = self.make_fixture(directory)
+            self.assertEqual(
+                PORTABLE.build_identity.IDENTITY_SCHEMA_VERSION,
+                QUICK_CHECK.BUILD_IDENTITY_SCHEMA_VERSION,
+            )
+            self.assertEqual(
+                PORTABLE.build_identity.IDENTITY_SCHEMA_VERSION,
+                2,
+            )
+            self.assertEqual(
+                PORTABLE.build_identity.OVERLAY_POLICY,
+                QUICK_CHECK.BUILD_IDENTITY_OVERLAY_POLICY,
+            )
+            self.assertEqual(
+                PORTABLE.build_identity.OVERLAY_POLICY,
+                "gaius-active-overlay-inputs-v1",
+            )
+            shared_overlays = root / "port" / "work" / "overlays"
+            isolated_overlays = root / "port" / "work" / "overlays" / "26.2"
+            shutil.copytree(shared_overlays, isolated_overlays)
+            external_shared_overlays = Path(directory) / "external-shared-overlays"
+            external_isolated_overlays = Path(directory) / "external-isolated-overlays"
+            shutil.copytree(shared_overlays, external_shared_overlays)
+            shutil.copytree(isolated_overlays, external_isolated_overlays)
+            client_version = root / "port" / "work" / "26.2" / "client-version.json"
+            client_version.write_bytes(b'{"id":"26.2"}\n')
+            profile_path = root / "port" / "versions" / "26.2.json"
+            profile = json.loads(profile_path.read_text(encoding="utf-8"))
+            base_environment = {
+                "GAIUS_VERSION_PROFILE_PATH": "versions/26.2.json",
+                "GAIUS_BUILD_ROOT": str(root / "port" / "target" / "26.2"),
+            }
+
+            cases: list[tuple[str, dict[str, str], Path, str]] = [
+                ("shared-internal", {}, shared_overlays, "shared"),
+                (
+                    "shared-external",
+                    {"GAIUS_OVERLAY_DIRECTORY": str(external_shared_overlays)},
+                    external_shared_overlays,
+                    "shared",
+                ),
+                (
+                    "isolated-internal",
+                    {
+                        **base_environment,
+                        "GAIUS_OVERLAY_DIRECTORY": str(isolated_overlays),
+                    },
+                    isolated_overlays,
+                    "isolated",
+                ),
+                (
+                    "isolated-external",
+                    {
+                        **base_environment,
+                        "GAIUS_OVERLAY_DIRECTORY": str(external_isolated_overlays),
+                    },
+                    external_isolated_overlays,
+                    "isolated",
+                ),
+            ]
+            if os.name == "nt":
+                cases.append(
+                    (
+                        "isolated-external-msys",
+                        {
+                            **base_environment,
+                            "GAIUS_OVERLAY_DIRECTORY": self.msys_path(
+                                external_isolated_overlays
+                            ),
+                        },
+                        external_isolated_overlays,
+                        "isolated",
+                    )
+                )
+
+            identities: dict[str, dict[str, object]] = {}
+            for label, environment, overlay_root, scope in cases:
+                with self.subTest(case=label), mock.patch.dict(
+                    os.environ, environment, clear=False
+                ), mock.patch.object(QUICK_CHECK, "PORT", root / "port"):
+                    identity = PORTABLE.build_identity.current_build_identity(root)
+                    quick_check = QUICK_CHECK.current_build_identity_for_quick_check(
+                        profile,
+                        "versions/26.2.json",
+                        profile_path,
+                    )
+                    self.assertIsNotNone(quick_check)
+                    assert quick_check is not None
+                    identities[label] = identity
+
+                    overlay_inputs = PORTABLE.build_identity._overlay_inputs(root, profile)
+                    self.assertEqual(identity["overlay"]["fileCount"], len(overlay_inputs))
+                    if overlay_root.is_relative_to(root):
+                        self.assertEqual(
+                            identity["overlay"],
+                            self.legacy_overlay_identity(
+                                root, [path for _name, path in overlay_inputs]
+                            ),
+                        )
+                    if scope == "isolated":
+                        self.assertTrue(
+                            all(
+                                name == "port/work/26.2/version.json"
+                                or name == "port/work/26.2/client-version.json"
+                                or name.startswith("port/work/overlays/26.2/")
+                                for name, _path in overlay_inputs
+                            )
+                        )
+                    else:
+                        self.assertTrue(
+                            all(
+                                name == "port/work/26.2/version.json"
+                                or name == "port/work/26.2/client-version.json"
+                                or name.startswith("port/work/overlays/")
+                                for name, _path in overlay_inputs
+                            )
+                        )
+                    self.assertEqual(quick_check["overlay"], identity["overlay"])
+                    self.assertEqual(
+                        quick_check["compatibilitySha256"],
+                        identity["compatibilitySha256"],
+                    )
+
+            self.assertEqual(
+                identities["shared-external"]["overlay"],
+                identities["shared-internal"]["overlay"],
+            )
+            self.assertEqual(
+                identities["isolated-external"]["overlay"],
+                identities["isolated-internal"]["overlay"],
+            )
+            self.assertEqual(
+                identities["isolated-external"]["compatibilitySha256"],
+                identities["isolated-internal"]["compatibilitySha256"],
+            )
+            if os.name == "nt":
+                self.assertEqual(
+                    identities["isolated-external-msys"]["overlay"],
+                    identities["isolated-internal"]["overlay"],
+                )
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    **base_environment,
+                    "GAIUS_OVERLAY_DIRECTORY": str(root / "port" / "work"),
+                },
+                clear=False,
+            ), mock.patch.object(QUICK_CHECK, "PORT", root / "port"):
+                ancestor_inputs = dict(
+                    PORTABLE.build_identity._overlay_inputs(root, profile)
+                )
+                ancestor_quick_inputs = dict(
+                    QUICK_CHECK.build_identity_overlay_inputs(root, profile)
+                )
+            self.assertIn("port/work/26.2/version.json", ancestor_inputs)
+            self.assertIn("port/work/26.2/client-version.json", ancestor_inputs)
+            self.assertNotIn("port/work/overlays/26.2/version.json", ancestor_inputs)
+            self.assertNotIn(
+                "port/work/overlays/26.2/client-version.json", ancestor_inputs
+            )
+            self.assertEqual(ancestor_quick_inputs.keys(), ancestor_inputs.keys())
+            self.assertIn("port/work/26.2/version.json", ancestor_quick_inputs)
+            self.assertIn("port/work/26.2/client-version.json", ancestor_quick_inputs)
 
     def test_client_compiler_profile_rejects_wrong_target_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

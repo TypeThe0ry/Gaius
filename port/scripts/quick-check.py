@@ -459,11 +459,20 @@ def hash_build_identity_inputs(
     paths: list[Path],
     policy: str,
 ) -> dict[str, object]:
+    return hash_named_build_identity_inputs(
+        [(path.relative_to(root).as_posix(), path) for path in paths],
+        policy,
+    )
+
+
+def hash_named_build_identity_inputs(
+    inputs: list[tuple[str, Path]],
+    policy: str,
+) -> dict[str, object]:
     digest = hashlib.sha256()
     digest.update(policy.encode("ascii") + b"\0")
     total_bytes = 0
-    for path in paths:
-        relative = path.relative_to(root).as_posix()
+    for relative, path in inputs:
         size = path.stat().st_size
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
@@ -475,12 +484,12 @@ def hash_build_identity_inputs(
     return {
         "policy": policy,
         "sha256": digest.hexdigest(),
-        "fileCount": len(paths),
+        "fileCount": len(inputs),
         "bytes": total_bytes,
     }
 
 
-def build_identity_overlay_paths(root: Path, profile: dict) -> list[Path]:
+def build_identity_overlay_inputs(root: Path, profile: dict) -> list[tuple[str, Path]]:
     config = json.loads((root / "port" / "config.json").read_text(encoding="utf-8"))
     teavm_version = config.get("teaVMVersion")
     if not isinstance(teavm_version, str) or not teavm_version:
@@ -499,14 +508,14 @@ def build_identity_overlay_paths(root: Path, profile: dict) -> list[Path]:
     if not overlays.is_absolute():
         overlays = root / overlays
     overlays = overlays.resolve()
+    metadata_candidates = (work / "version.json", work / "client-version.json")
     candidates = [
-        work / "version.json",
-        work / "client-version.json",
+        *metadata_candidates,
         overlays / f"client-named-{version}-gaius.jar",
         overlays / f"teavm-classlib-{teavm_version}-gaius.jar",
         overlays / f"teavm-core-{teavm_version}-gaius.jar",
     ]
-    metadata_path = work / "version.json"
+    metadata_path = metadata_candidates[0]
     if metadata_path.is_file():
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         if not isinstance(metadata, dict) or metadata.get("id") != version:
@@ -523,11 +532,29 @@ def build_identity_overlay_paths(root: Path, profile: dict) -> list[Path]:
             if relative_path.is_absolute() or ".." in relative_path.parts:
                 raise ValueError(f"unsafe active library metadata path: {relative}")
             candidates.append(overlays / "libraries" / relative_path)
+    isolated = bool(
+        os.environ.get("GAIUS_BUILD_ROOT")
+        or os.environ.get("GAIUS_VERSION_PROFILE_PATH")
+    )
+    logical_overlay_root = Path("port/work/overlays")
+    if isolated:
+        logical_overlay_root /= version
+
     unique: dict[str, Path] = {}
     for path in candidates:
-        if path.is_file():
-            unique[path.relative_to(root).as_posix()] = path
-    return [unique[name] for name in sorted(unique)]
+        if not path.is_file():
+            continue
+        if path in metadata_candidates:
+            logical_name = path.relative_to(root).as_posix()
+        else:
+            try:
+                overlay_relative = path.relative_to(overlays)
+            except ValueError:
+                logical_name = path.relative_to(root).as_posix()
+            else:
+                logical_name = (logical_overlay_root / overlay_relative).as_posix()
+        unique[logical_name] = path
+    return [(name, unique[name]) for name in sorted(unique)]
 
 
 def current_build_identity_for_quick_check(
@@ -589,9 +616,8 @@ def current_build_identity_for_quick_check(
             build_identity_input_paths(root, relative_profile, protocol=True),
             BUILD_IDENTITY_PROTOCOL_POLICY,
         )
-        overlay = hash_build_identity_inputs(
-            root,
-            build_identity_overlay_paths(root, profile),
+        overlay = hash_named_build_identity_inputs(
+            build_identity_overlay_inputs(root, profile),
             BUILD_IDENTITY_OVERLAY_POLICY,
         )
         profile_identity = {
