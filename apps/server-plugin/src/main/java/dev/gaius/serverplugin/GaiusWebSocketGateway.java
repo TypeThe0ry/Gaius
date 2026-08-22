@@ -15,6 +15,9 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 import java.util.logging.Level;
@@ -24,6 +27,7 @@ import org.java_websocket.handshake.ClientHandshake;
 import org.java_websocket.server.WebSocketServer;
 
 final class GaiusWebSocketGateway extends WebSocketServer {
+    private static final long STARTUP_TIMEOUT_MILLIS = 10_000;
     private static final int CLOSE_POLICY = 1008;
     private static final int CLOSE_TOO_LARGE = 1009;
     private static final int COPY_BUFFER_BYTES = 64 * 1024;
@@ -40,6 +44,13 @@ final class GaiusWebSocketGateway extends WebSocketServer {
     private final Logger logger;
     private final Supplier<Socket> socketFactory;
     private final Map<WebSocket, Session> sessions = new ConcurrentHashMap<>();
+    private final Object lifecycleLock = new Object();
+    private final Object shutdownLock = new Object();
+    private final CountDownLatch ready = new CountDownLatch(1);
+    private final AtomicReference<Exception> startupFailure = new AtomicReference<>();
+    private final AtomicBoolean started = new AtomicBoolean();
+    private final AtomicBoolean shutdownRequested = new AtomicBoolean();
+    private final AtomicBoolean shutdownComplete = new AtomicBoolean();
 
     GaiusWebSocketGateway(
             InetSocketAddress listenAddress,
@@ -107,11 +118,17 @@ final class GaiusWebSocketGateway extends WebSocketServer {
             connection.close(CLOSE_POLICY, "Origin is not allowed");
             return;
         }
-        if (sessions.size() >= maximumConnections) {
-            connection.close(1013, "Gaius transport is at capacity");
-            return;
+        synchronized (lifecycleLock) {
+            if (shutdownRequested.get()) {
+                connection.close(1001, "Gaius transport is shutting down");
+                return;
+            }
+            if (sessions.size() >= maximumConnections) {
+                connection.close(1013, "Gaius transport is at capacity");
+                return;
+            }
+            sessions.put(connection, new Session(connection));
         }
-        sessions.put(connection, new Session(connection));
     }
 
     @Override
@@ -162,6 +179,18 @@ final class GaiusWebSocketGateway extends WebSocketServer {
 
     @Override
     public void onError(WebSocket connection, Exception exception) {
+        // WebSocketServer invokes this callback on its selector thread for a
+        // fatal startup error.  Do not call stop()/join() here: stop() joins
+        // the selector thread and would deadlock it.  The waiting caller will
+        // perform the idempotent shutdown after this barrier is released.
+        if (connection == null && !started.get()) {
+            startupFailure.compareAndSet(
+                    null,
+                    exception == null
+                            ? new IllegalStateException("Gaius WebSocket gateway startup failed")
+                            : exception);
+            ready.countDown();
+        }
         if (connection != null) {
             Session session = sessions.remove(connection);
             if (session != null) {
@@ -173,18 +202,76 @@ final class GaiusWebSocketGateway extends WebSocketServer {
 
     @Override
     public void onStart() {
-        // The plugin logs the configured endpoint after start().
+        started.set(true);
+        ready.countDown();
+    }
+
+    void awaitReady() {
+        awaitReady(STARTUP_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+    }
+
+    void awaitReady(long timeout, TimeUnit unit) {
+        if (timeout <= 0) {
+            throw new IllegalArgumentException("Gateway startup timeout must be positive");
+        }
+        if (unit == null) {
+            throw new NullPointerException("Gateway startup timeout unit must not be null");
+        }
+        try {
+            if (!ready.await(timeout, unit)) {
+                shutdown();
+                throw new IllegalStateException("Gaius WebSocket gateway startup timed out");
+            }
+        } catch (InterruptedException exception) {
+            shutdown();
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(
+                    "Interrupted while waiting for the Gaius WebSocket gateway to start",
+                    exception);
+        }
+
+        Exception failure = startupFailure.get();
+        if (failure != null) {
+            shutdown();
+            throw new IllegalStateException("Gaius WebSocket gateway failed to start", failure);
+        }
+        if (shutdownRequested.get()) {
+            throw new IllegalStateException("Gaius WebSocket gateway was shut down before readiness");
+        }
+        if (!started.get()) {
+            shutdown();
+            throw new IllegalStateException("Gaius WebSocket gateway stopped before startup");
+        }
     }
 
     void shutdown() {
-        for (Session session : new ArrayList<>(sessions.values())) {
+        shutdownRequested.set(true);
+        if (!started.get() && ready.getCount() != 0) {
+            startupFailure.compareAndSet(
+                    null,
+                    new IllegalStateException("Gaius WebSocket gateway was stopped before startup"));
+            ready.countDown();
+        }
+        List<Session> sessionsToClose;
+        synchronized (lifecycleLock) {
+            sessionsToClose = new ArrayList<>(sessions.values());
+            sessions.clear();
+        }
+        for (Session session : sessionsToClose) {
             session.close();
         }
-        sessions.clear();
-        try {
-            stop(5000);
-        } catch (InterruptedException exception) {
-            Thread.currentThread().interrupt();
+        synchronized (shutdownLock) {
+            if (shutdownComplete.get()) {
+                return;
+            }
+            try {
+                stop(5000);
+                shutdownComplete.set(true);
+            } catch (InterruptedException exception) {
+                // Keep shutdownRequested set so no new Session can appear, but
+                // leave shutdownComplete false so another caller can retry.
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
