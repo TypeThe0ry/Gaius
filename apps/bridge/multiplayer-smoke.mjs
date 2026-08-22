@@ -997,11 +997,14 @@ async function testFramedPlayKeepAlive(bridgePort, fixturePort) {
     // tail large enough to cross it. The tail therefore starts on a frame
     // boundary and must leave several complete frames retained when parsing
     // pauses; this avoids accepting a partial-frame-only false positive.
-    const backpressurePrefixFrameCount = 256;
-    const backpressureTailFrameCount = 1024;
+    const backpressurePrefixFrameCount = 512;
+    const backpressureTailFrameCount = 4096;
     const backpressureFrameCount =
         backpressurePrefixFrameCount + backpressureTailFrameCount;
-    const backpressurePayloadBytes = 8 * 1024;
+    // Keep frames smaller than the usual TCP data callback.  That makes the
+    // high-water assertion deterministic: when ws crosses 4 MiB, the same
+    // callback still owns several complete frames that must remain queued.
+    const backpressurePayloadBytes = 2 * 1024;
     const backpressureFrames = Array.from({ length: backpressureFrameCount }, (_, index) => encodePacket(
         minecraftProfile.play.clientboundCustomPayload,
         Buffer.concat([
