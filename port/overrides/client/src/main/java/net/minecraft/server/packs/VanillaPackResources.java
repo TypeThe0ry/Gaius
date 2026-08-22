@@ -6,6 +6,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -48,7 +49,7 @@ public class VanillaPackResources implements PackResources {
         this.location = location;
         this.metadata = metadata;
         this.namespaces = namespaces;
-        this.resources = loadResourceList();
+        this.resources = sortedResourceCopy(loadResourceList());
         this.resourceSet = new HashSet<>(List.of(this.resources));
     }
 
@@ -250,6 +251,12 @@ public class VanillaPackResources implements PackResources {
         } catch (IOException e) {
             return new String[0];
         }
+    }
+
+    private static String[] sortedResourceCopy(String[] values) {
+        String[] copy = Arrays.copyOf(values, values.length);
+        Arrays.sort(copy);
+        return copy;
     }
 
     private static final class ListedResource {

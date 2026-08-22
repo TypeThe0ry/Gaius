@@ -20,6 +20,30 @@ resource_list="$build_root/generated-resources/dev/gaius/browser/minecraft-resou
 server_resources="$server_target/generated-resources"
 mkdir -p "$build_root"
 
+# VanillaPackResources.lowerBound() relies on Java String.compareTo order.  A
+# locale-aware or partially generated list can make the binary-search prefix
+# range stop early and silently omit datapack resources, so fail closed before
+# the Worker compiler consumes it.
+assert_java_sorted_resource_list() {
+  local path="$1"
+  if [[ ! -s "$path" ]]; then
+    echo "Browser resource list is missing or empty: $path" >&2
+    exit 1
+  fi
+  if LC_ALL=C grep -nFx '' "$path" >/dev/null 2>&1; then
+    echo "Browser resource list contains a blank entry: $path" >&2
+    exit 1
+  fi
+  if ! LC_ALL=C sort -c "$path" >/dev/null 2>&1; then
+    echo "Browser resource list is not sorted in Java String.compareTo order: $path" >&2
+    exit 1
+  fi
+  if [[ -n "$(LC_ALL=C uniq -d "$path")" ]]; then
+    echo "Browser resource list contains duplicate entries: $path" >&2
+    exit 1
+  fi
+}
+
 # Client and Worker builds for one profile share the generated resources,
 # release dist, identities, and compression pass.  Serialize that output
 # surface while keeping distinct profile roots independently runnable.
@@ -81,20 +105,22 @@ if [[ "${GAIUS_SKIP_OVERLAY_BUILD:-false}" != "true" ]]; then
   GAIUS_OVERLAY_DIRECTORY="$overlay_directory" GAIUS_OVERLAY_LOCK_HELD=true "$root/port/scripts/build-overlays.sh" >/dev/null
 fi
 
-if [[ ! -f "$resource_list" ]]; then
-  echo "Browser resources are missing; run build-teavm.sh once first" >&2
-  exit 1
-fi
+assert_java_sorted_resource_list "$resource_list"
 
 rm -rf "$server_resources" "$server_target/maven"
 mkdir -p "$staged_dist" "$server_target" \
   "$server_resources/dev/gaius/browser"
+server_resource_list="$server_resources/dev/gaius/browser/minecraft-resources.txt"
+server_resource_list_tmp="$server_resource_list.tmp"
 awk 'index($0, "data/") == 1 \
   || $0 == "assets/.mcassetsroot" \
   || $0 == "assets/minecraft/lang/deprecated.json" \
   || $0 == "assets/minecraft/lang/en_us.json" \
   || $0 == "pack.png" { print }' "$resource_list" \
-  >"$server_resources/dev/gaius/browser/minecraft-resources.txt"
+  >"$server_resource_list_tmp"
+LC_ALL=C sort -u -o "$server_resource_list_tmp" "$server_resource_list_tmp"
+mv "$server_resource_list_tmp" "$server_resource_list"
+assert_java_sorted_resource_list "$server_resource_list"
 export GAIUS_POM="$server_target/generated-pom.xml"
 export GAIUS_MAIN_CLASS="dev.gaius.browser.BrowserIntegratedServerMain"
 export GAIUS_TARGET_DIRECTORY="$staged_dist"

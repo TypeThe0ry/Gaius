@@ -298,7 +298,10 @@ if [[ -n "$asset_index_id" && -f "$asset_index" ]]; then
 else
   echo "WARNING: asset index not found at $asset_index; run port/scripts/fetch-version.sh to enable browser game sounds" >&2
 fi
-sort -u -o "$resource_list" "$resource_list"
+# VanillaPackResources.lowerBound() uses Java String.compareTo ordering.  For
+# UTF-8 resource paths, the C/POSIX byte order is the same code-point order,
+# unlike locale-aware sort order (which can make a prefix range incomplete).
+LC_ALL=C sort -u -o "$resource_list" "$resource_list"
 awk '
   index($0, "assets/") != 1 && index($0, "data/") != 1 && $0 != "pack.png" { print; next }
   $0 == "assets/minecraft/lang/deprecated.json" { print; next }
@@ -306,7 +309,7 @@ awk '
   $0 == "assets/minecraft/font/include/unifont.json" { print; next }
   $0 == "assets/minecraft/font/unifont.zip" { print; next }
   $0 == "assets/minecraft/sounds/random/eat1.ogg" { print; next }
-' "$resource_list" | sort -u >"$embedded_resource_list"
+' "$resource_list" | LC_ALL=C sort -u >"$embedded_resource_list"
 "$root/port/scripts/run-python.sh" \
   "$root/port/scripts/build-vanilla-assets-pack.py" \
   "$resource_list" \

@@ -177,6 +177,8 @@ MINECRAFT_262_BROWSER_PATCHER = (
 CLASSLIB_PATCHER = PORT / "tools" / "src" / "main" / "java" / "dev" / "gaius" / "tools" / "TeaVMClasslibPatcher.java"
 JOML_MATH_PATCHER = PORT / "tools" / "src" / "main" / "java" / "dev" / "gaius" / "tools" / "JomlMathPatcher.java"
 VANILLA_PACK_RESOURCES = PORT / "overrides" / "client" / "src" / "main" / "java" / "net" / "minecraft" / "server" / "packs" / "VanillaPackResources.java"
+VANILLA_PACK_RESOURCES_262 = PORT / "overrides" / "client" / "src" / "versions" / "26.2" / "java" / "net" / "minecraft" / "server" / "packs" / "VanillaPackResources.java"
+SYSTEM_REPORT = PORT / "overrides" / "client" / "src" / "main" / "java" / "net" / "minecraft" / "SystemReport.java"
 BROWSER_FILE_PERSISTENCE = PORT / "overrides" / "classlib" / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserFilePersistence.java"
 MODERN_RUNTIME_SUPPORT = PORT / "overrides" / "classlib" / "src" / "main" / "java" / "org" / "teavm" / "classlib" / "java" / "lang" / "TModernRuntimeSupport.java"
 TEAVM_LOCK_SUPPORT = PORT / "src" / "main" / "java" / "org" / "teavm" / "classlib" / "java" / "util" / "concurrent" / "locks" / "TLockSupport.java"
@@ -271,6 +273,7 @@ BUILD_PORTABLE_HTML_TEST = PORT / "scripts" / "test-build-portable-html.py"
 PORTABLE_ARTIFACT_IDENTITY_TEST = PORT / "scripts" / "test-portable-artifact-identity.py"
 BUILD_IDENTITY_HELPER = PORT / "scripts" / "gaius_build_identity.py"
 BUILD_VANILLA_ASSETS_PACK = PORT / "scripts" / "build-vanilla-assets-pack.py"
+VANILLA_RESOURCE_ORDER_TEST = PORT / "scripts" / "test-vanilla-resource-order.py"
 SERVE_DIST = PORT / "scripts" / "serve-dist.py"
 PLATFORM_SMOKE = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "PlatformSmoke.java"
 PLATFORM_SMOKE_ASSET_LOADER = PORT / "web" / "smoke" / "vanilla-assets-smoke-loader.js"
@@ -1963,6 +1966,17 @@ def check_source_patches() -> None:
     classlib_patcher = CLASSLIB_PATCHER.read_text(errors="replace") if CLASSLIB_PATCHER.exists() else ""
     joml_math_patcher = JOML_MATH_PATCHER.read_text(errors="replace") if JOML_MATH_PATCHER.exists() else ""
     vanilla_pack_resources = VANILLA_PACK_RESOURCES.read_text(errors="replace") if VANILLA_PACK_RESOURCES.exists() else ""
+    vanilla_pack_resources_262 = (
+        VANILLA_PACK_RESOURCES_262.read_text(errors="replace")
+        if VANILLA_PACK_RESOURCES_262.exists()
+        else ""
+    )
+    system_report = SYSTEM_REPORT.read_text(errors="replace") if SYSTEM_REPORT.exists() else ""
+    vanilla_resource_order_test = (
+        VANILLA_RESOURCE_ORDER_TEST.read_text(errors="replace")
+        if VANILLA_RESOURCE_ORDER_TEST.exists()
+        else ""
+    )
     browser_file_persistence = BROWSER_FILE_PERSISTENCE.read_text(errors="replace") if BROWSER_FILE_PERSISTENCE.exists() else ""
     modern_runtime_support = MODERN_RUNTIME_SUPPORT.read_text(errors="replace") if MODERN_RUNTIME_SUPPORT.exists() else ""
     teavm_lock_support = TEAVM_LOCK_SUPPORT.read_text(errors="replace") if TEAVM_LOCK_SUPPORT.exists() else ""
@@ -4388,6 +4402,9 @@ def check_source_patches() -> None:
             and '$0 == "assets/minecraft/lang/en_us.json"' in build_server_worker
             and '$0 == "assets/minecraft/lang/deprecated.json"' in build_server_worker
             and 'rm -rf "$server_resources" "$server_target/maven"' in build_server_worker
+            and "assert_java_sorted_resource_list" in build_server_worker
+            and 'LC_ALL=C sort -c "$path"' in build_server_worker
+            and 'LC_ALL=C sort -u -o "$server_resource_list_tmp" "$server_resource_list_tmp"' in build_server_worker
             and "GAIUS_RESOURCE_DIRECTORY" in build_server_worker
             and "com/microsoft/azure/msal4j/" in build_server_worker
             and "com/azure/azure-json/" in build_server_worker
@@ -6172,6 +6189,14 @@ def check_source_patches() -> None:
             ),
         ),
         (
+            "TeaVM resource-list production uses stable Java String.compareTo order",
+            'LC_ALL=C sort -u -o "$resource_list" "$resource_list"' in build_teavm
+            and "assert_java_sorted_resource_list" in build_server_worker
+            and 'LC_ALL=C sort -c "$path"' in build_server_worker
+            and 'LC_ALL=C sort -u -o "$server_resource_list_tmp" "$server_resource_list_tmp"'
+            in build_server_worker,
+        ),
+        (
             "Generated vanilla asset pack is deterministic and contains rendering, sound, font, and data resources",
             VANILLA_ASSET_PACK.is_file()
             and VANILLA_ASSET_PACK.stat().st_size > 30_000_000
@@ -6269,7 +6294,34 @@ def check_source_patches() -> None:
             and "listedResources(type, namespace, path)" in vanilla_pack_resources
             and "listedResourceCache.put(key, cached)" in vanilla_pack_resources
             and "int start = lowerBound(resources, prefix)" in vanilla_pack_resources
-            and "values[middle].compareTo(target)" in vanilla_pack_resources,
+            and "values[middle].compareTo(target)" in vanilla_pack_resources
+            and "sortedResourceCopy" in vanilla_pack_resources
+            and "Arrays.copyOf" in vanilla_pack_resources
+            and "Arrays.sort" in vanilla_pack_resources,
+        ),
+        (
+            "26.2 VanillaPackResources defensively sorts resource lists for lowerBound",
+            "sortedResourceCopy" in vanilla_pack_resources_262
+            and "Arrays.copyOf" in vanilla_pack_resources_262
+            and "Arrays.sort" in vanilla_pack_resources_262
+            and "String.compareTo" in vanilla_pack_resources_262,
+        ),
+        (
+            "Resource-order regression test covers all five former omission classes",
+            "VanillaPackResources.lowerBound(String.compareTo)" in vanilla_resource_order_test
+            and "data/minecraft/enchantment/" in vanilla_resource_order_test
+            and "data/minecraft/worldgen/noise/" in vanilla_resource_order_test
+            and "data/minecraft/worldgen/noise_settings/" in vanilla_resource_order_test
+            and "data/minecraft/worldgen/structure/" in vanilla_resource_order_test
+            and "data/minecraft/worldgen/structure_set/" in vanilla_resource_order_test
+            and "repairedOmissions" in vanilla_resource_order_test,
+        ),
+        (
+            "Browser SystemReport avoids TeaVM-unsupported Formatter percent-n",
+            "String.format" not in system_report
+            and '"%s: %s%n"' not in system_report
+            and ".append(name).append(\": \").append(value).append('\\n')"
+                in system_report,
         ),
         (
             "Generated browser resource list contains vanilla texture atlases and representative textures",
