@@ -188,6 +188,17 @@ public final class BrowserWorldgenScheduler {
      * packet, but only the outermost scope owns the active wall-clock segment.
      */
     public static int beginTaskWork() {
+        return beginTaskWork("unlabeled");
+    }
+
+    /**
+     * Enters a labelled task scope for opt-in slow-probe attribution.
+     *
+     * <p>The label is diagnostic only: the release browser leaves the telemetry flag unset, and
+     * the scheduler token/depth/deadline behavior remains identical to {@link #beginTaskWork()}.
+     */
+    public static int beginTaskWork(String taskLabel) {
+        recordSchedulerTaskLabel(taskLabel);
         if (yieldActive) {
             if (reentrantTaskWorkDepth < Integer.MAX_VALUE) {
                 reentrantTaskWorkDepth++;
@@ -731,6 +742,25 @@ public final class BrowserWorldgenScheduler {
             """)
     private static native double nowMillis();
 
+    /** Stores one bounded label for the immediately following task-start marker. */
+    @JSBody(params = {"taskLabel"}, script = """
+            try {
+              if (globalThis.__gaiusSlowProbeTelemetryEnabled !== true) return;
+              const marker = globalThis.__gaiusWorldgenSchedulerMarker ||
+                (globalThis.__gaiusWorldgenSchedulerMarker = {});
+              const label = String(taskLabel || 'unlabeled').slice(0, 160);
+              Object.defineProperty(marker, '__pendingTaskLabel', {
+                configurable: true,
+                enumerable: false,
+                writable: true,
+                value: label
+              });
+            } catch (_) {
+              // Diagnostic telemetry is fail-open and may never perturb the scheduler.
+            }
+            """)
+    private static native void recordSchedulerTaskLabel(String taskLabel);
+
     /**
      * Publishes fixed scalar task/turn markers only for the Node runtime smoke.
      * The browser release leaves the flag unset; malformed diagnostic state is
@@ -751,7 +781,13 @@ public final class BrowserWorldgenScheduler {
               const eventName = String(event || 'unknown');
               const now = Date.now();
               const workMillis = Math.max(0, Number(activeWorkMillis) || 0);
-              marker.schemaVersion = 1;
+              const pendingTaskLabel = String(
+                marker.__pendingTaskLabel || 'unlabeled'
+              ).slice(0, 160);
+              if (eventName.startsWith('task-start-')) {
+                delete marker.__pendingTaskLabel;
+              }
+              marker.schemaVersion = 2;
               marker.eventSequence = (Number(marker.eventSequence) || 0) + 1;
               marker.lastEvent = eventName;
               marker.lastEventAtEpochMs = now;
@@ -782,15 +818,26 @@ public final class BrowserWorldgenScheduler {
               );
             } else if (eventName === 'task-start-normal') {
               marker.taskScopesStarted = (Number(marker.taskScopesStarted) || 0) + 1;
+              marker.taskScopeSequence = (Number(marker.taskScopeSequence) || 0) + 1;
+              marker.currentTaskScopeId = marker.taskScopeSequence;
+              marker.currentTaskLabel = pendingTaskLabel;
+              marker.currentNestedTaskLabel = '';
+              marker.currentReentrantTaskLabel = '';
               marker.lastTaskStartedAtEpochMs = now;
               marker.__taskActiveWorkBaselineMillis = workMillis;
               marker.__taskActiveWorkAccumulatedMillis = 0;
+            } else if (eventName === 'task-start-nested') {
+              marker.currentNestedTaskLabel = pendingTaskLabel;
+            } else if (eventName === 'task-end-nested') {
+              marker.currentNestedTaskLabel = '';
             } else if (eventName === 'task-start-reentrant') {
               marker.reentrantTaskScopesStarted =
                 (Number(marker.reentrantTaskScopesStarted) || 0) + 1;
+              marker.currentReentrantTaskLabel = pendingTaskLabel;
             } else if (eventName === 'task-end-reentrant') {
               marker.reentrantTaskScopesEnded =
                 (Number(marker.reentrantTaskScopesEnded) || 0) + 1;
+              marker.currentReentrantTaskLabel = '';
             } else if (eventName === 'yield-start' && marker.normalTaskScopeActive) {
               marker.__taskActiveWorkAccumulatedMillis =
                 Math.max(0, Number(marker.__taskActiveWorkAccumulatedMillis) || 0) +
@@ -816,15 +863,29 @@ public final class BrowserWorldgenScheduler {
               marker.taskScopesEnded = (Number(marker.taskScopesEnded) || 0) + 1;
               marker.lastTaskEndedAtEpochMs = now;
               marker.lastTaskActiveWorkMillis = taskActiveWorkMillis;
+              const previousMaxTaskActiveWorkMillis =
+                Number(marker.maxTaskActiveWorkMillis) || 0;
               marker.maxTaskActiveWorkMillis = Math.max(
-                Number(marker.maxTaskActiveWorkMillis) || 0,
-                taskActiveWorkMillis
-              );
+                previousMaxTaskActiveWorkMillis, taskActiveWorkMillis);
               marker.lastTaskScopeWallMillis = taskScopeWallMillis;
+              const previousMaxTaskScopeWallMillis =
+                Number(marker.maxTaskScopeWallMillis) || 0;
               marker.maxTaskScopeWallMillis = Math.max(
-                Number(marker.maxTaskScopeWallMillis) || 0,
-                taskScopeWallMillis
-              );
+                previousMaxTaskScopeWallMillis, taskScopeWallMillis);
+              if (taskActiveWorkMillis >= previousMaxTaskActiveWorkMillis ||
+                  taskScopeWallMillis >= previousMaxTaskScopeWallMillis) {
+                marker.maxTaskContext = JSON.stringify({
+                  schemaVersion: 1,
+                  taskScopeId: Math.max(0, Number(marker.currentTaskScopeId) || 0),
+                  taskLabel: String(marker.currentTaskLabel || 'unlabeled').slice(0, 160),
+                  taskActiveWorkMillis,
+                  taskScopeWallMillis
+                }).slice(0, 512);
+              }
+              marker.currentTaskScopeId = 0;
+              marker.currentTaskLabel = '';
+              marker.currentNestedTaskLabel = '';
+              marker.currentReentrantTaskLabel = '';
               delete marker.__taskActiveWorkBaselineMillis;
               delete marker.__taskActiveWorkAccumulatedMillis;
             } else if (eventName === 'task-end-underflow') {
@@ -983,10 +1044,10 @@ public final class BrowserWorldgenScheduler {
             stats.totalSliceElapsedMillis =
               (Number(stats.totalSliceElapsedMillis) || 0) + sliceElapsedMillis;
             stats.averageSliceElapsedMillis = stats.totalSliceElapsedMillis / stats.slices;
+            const previousMaxSliceElapsedMillis =
+              Number(stats.maxSliceElapsedMillis) || 0;
             stats.maxSliceElapsedMillis = Math.max(
-              Number(stats.maxSliceElapsedMillis) || 0,
-              sliceElapsedMillis
-            );
+              previousMaxSliceElapsedMillis, sliceElapsedMillis);
             const percentile = function(values, fraction) {
               const target = Math.max(1, Math.ceil(stats.slices * fraction));
               let seen = 0;
@@ -1072,6 +1133,37 @@ public final class BrowserWorldgenScheduler {
               maximumReentrantYieldDepth
             );
             stats.lastYieldAt = Date.now();
+            try {
+              if (globalThis.__gaiusSlowProbeTelemetryEnabled === true &&
+                  sliceElapsedMillis >= previousMaxSliceElapsedMillis) {
+                const marker = globalThis.__gaiusWorldgenSchedulerMarker ||
+                  (globalThis.__gaiusWorldgenSchedulerMarker = {});
+                const reasonNames = ['deadline', 'network', 'hard-cap', 'checkpoint'];
+                const taskLabel = String(
+                  marker.currentNestedTaskLabel ||
+                  marker.currentReentrantTaskLabel ||
+                  marker.currentTaskLabel ||
+                  'unlabeled'
+                ).slice(0, 160);
+                marker.maxSliceContext = JSON.stringify({
+                  schemaVersion: 1,
+                  sequence: Math.max(0, Number(stats.slices) || 0),
+                  reason: reasonNames[Number(reason)] || 'unknown',
+                  reasonCode: Number(reason) || 0,
+                  taskScopeId: Math.max(0, Number(marker.currentTaskScopeId) || 0),
+                  taskLabel,
+                  sliceElapsedMillis: Math.max(0, Number(sliceElapsedMillis) || 0),
+                  budgetOverrunMillis: Math.max(0, Number(overrunMillis) || 0),
+                  progressPulses: Math.max(0, Number(progressPulses) || 0),
+                  networkWaitPulses: Math.max(0, Number(networkWaitPulses) || 0),
+                  queueDepthBefore: Math.max(0, Number(queueDepthBefore) || 0),
+                  queueDepthAfter: Math.max(0, Number(queueDepthAfter) || 0),
+                  networkPreemption: !!networkPreemption
+                }).slice(0, 512);
+              }
+            } catch (_) {
+              // Slow-probe attribution is diagnostic and fail-open.
+            }
             """)
     private static native void reportSlice(
             int reason,

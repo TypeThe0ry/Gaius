@@ -120,7 +120,7 @@ public final class Minecraft262BrowserPatcher {
                 Opcodes.INVOKESTATIC,
                 WORLDGEN_SCHEDULER,
                 "beginTaskWork",
-                "()I",
+                "(Ljava/lang/String;)I",
                 false);
     }
 
@@ -150,6 +150,7 @@ public final class Minecraft262BrowserPatcher {
         int taskScopeLocal = method.maxLocals++;
         int throwableLocal = method.maxLocals++;
         InsnList entry = new InsnList();
+        entry.add(new LdcInsnNode(target));
         entry.add(browserWorldgenBeginTaskWork());
         entry.add(new VarInsnNode(Opcodes.ISTORE, taskScopeLocal));
         // The catch range starts only after beginTaskWork has initialized the

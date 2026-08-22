@@ -16,12 +16,14 @@ import {
   workerData,
 } from "node:worker_threads";
 
-const SLOW_SAMPLE_SCHEMA_VERSION = 1;
-const SLOW_SAMPLE_SCHEMA = "gaius.worker-event-loop-slow-sample.v1";
+const SLOW_SAMPLE_SCHEMA_VERSION = 2;
+const SLOW_SAMPLE_SCHEMA = "gaius.worker-event-loop-slow-sample.v2";
 const SLOW_SAMPLE_THRESHOLD_MS = 250;
 const MAX_SLOW_SAMPLES = 64;
 const MAX_SLOW_SAMPLES_PER_SCOPE = MAX_SLOW_SAMPLES / 2;
+const MAX_SLOW_BLOCK_ID = 0x7fffffff;
 const MAX_SLOW_SAMPLE_FIELDS_PER_GROUP = 32;
+const SLOW_PROBE_TOP_K_EVICTED = Symbol("slow-probe-top-k-evicted");
 const WORLDGEN_SLOW_SAMPLE_FIELDS = Object.freeze([
   "slices",
   "sliceElapsedMillis",
@@ -127,7 +129,6 @@ const SCHEDULER_SLOW_SAMPLE_FIELDS = Object.freeze([
   "eventSequence",
   "lastEvent",
   "lastEventAtEpochMs",
-  "token",
   "taskWorkDepth",
   "reentrantTaskWorkDepth",
   "activeTaskScope",
@@ -152,6 +153,10 @@ const SCHEDULER_SLOW_SAMPLE_FIELDS = Object.freeze([
   "lastServerWorkTurnEndedAtEpochMs",
   "lastServerWorkTurnWallMillis",
   "maxServerWorkTurnWallMillis",
+  "currentTaskScopeId",
+  "currentTaskLabel",
+  "maxTaskContext",
+  "maxSliceContext",
 ]);
 
 let workerGcObserver;
@@ -594,8 +599,181 @@ function safeWorkerSlowProbeSnapshot() {
   }
 }
 
+function normalizeSlowBlockId(value) {
+  const numeric = Number(value);
+  return Number.isSafeInteger(numeric) && numeric > 0 && numeric <= MAX_SLOW_BLOCK_ID
+    ? numeric
+    : 0;
+}
+
+function normalizeSlowSnapshotDropReason(value) {
+  return value === "block-cap" || value === "capture-error" || value === "snapshot-empty"
+    ? value
+    : null;
+}
+
+function selectSlowProbeSnapshot(value) {
+  if (value === null || typeof value !== "object") {
+    return null;
+  }
+  return {
+    worldgen: selectScalarTelemetry(value.worldgen, WORLDGEN_SLOW_SAMPLE_FIELDS),
+    network: selectScalarTelemetry(value.network, NETWORK_SLOW_SAMPLE_FIELDS),
+    storage: selectScalarTelemetry(value.storage, STORAGE_SLOW_SAMPLE_FIELDS),
+    scheduler: selectScalarTelemetry(value.scheduler, SCHEDULER_SLOW_SAMPLE_FIELDS),
+    gc: selectScalarTelemetry(value.gc, [
+      "supported",
+      "count",
+      "durationMs",
+      "maxDurationMs",
+      "lastDurationMs",
+      "lastKind",
+      "lastAtEpochMs",
+      "rssBytes",
+      "heapUsedBytes",
+      "heapTotalBytes",
+      "externalBytes",
+      "arrayBuffersBytes",
+      "heapLimitBytes",
+    ]),
+  };
+}
+
+// A block is a contiguous run of probes that arrived while the Worker was
+// draining a backlog.  Snapshot accounting belongs to blocks, not probes:
+// one block can therefore serve dozens of queued probes without repeatedly
+// serializing the same diagnostic object.
+function createSlowProbeBlockState() {
+  let nextBlockId = 0;
+  let activeBlock = null;
+  let beforeCaptureCount = 0;
+  let afterCaptureCount = 0;
+
+  function beginBlock(afterProtocolReady) {
+    nextBlockId = nextBlockId >= MAX_SLOW_BLOCK_ID ? 1 : nextBlockId + 1;
+    activeBlock = {
+      id: nextBlockId,
+      afterProtocolReady: Boolean(afterProtocolReady),
+      state: "pending",
+    };
+    return activeBlock;
+  }
+
+  function resetIfFast(backlogSignal) {
+    if (!backlogSignal) activeBlock = null;
+  }
+
+  function ensureBlock(afterProtocolReady) {
+    return activeBlock || beginBlock(afterProtocolReady);
+  }
+
+  function capture(block, snapshotFactory) {
+    if (!block || typeof block !== "object") {
+      return {
+        snapshot: null,
+        error: null,
+        reused: false,
+        dropReason: null,
+      };
+    }
+    if (block.state === "captured") {
+      return {
+        snapshot: null,
+        error: null,
+        reused: true,
+        dropReason: null,
+      };
+    }
+    // A capped/error/empty block records its reason only on the rising edge;
+    // later probes in that same block do not become repeated drops.
+    if (block.state !== "pending") {
+      return {
+        snapshot: null,
+        error: null,
+        reused: false,
+        dropReason: null,
+      };
+    }
+    block.state = "attempted";
+    if (block.afterProtocolReady) {
+      if (afterCaptureCount >= MAX_SLOW_SAMPLES_PER_SCOPE) {
+        block.state = "block-cap";
+        return {
+          snapshot: null,
+          error: null,
+          reused: false,
+          dropReason: "block-cap",
+        };
+      }
+      afterCaptureCount++;
+    } else {
+      if (beforeCaptureCount >= MAX_SLOW_SAMPLES_PER_SCOPE) {
+        block.state = "block-cap";
+        return {
+          snapshot: null,
+          error: null,
+          reused: false,
+          dropReason: "block-cap",
+        };
+      }
+      beforeCaptureCount++;
+    }
+    let captured;
+    try {
+      captured = snapshotFactory();
+    } catch (error) {
+      captured = {
+        snapshot: null,
+        error: String(error && (error.stack || error.message) || error).slice(0, 512),
+      };
+    }
+    if (captured && captured.snapshot !== null && captured.snapshot !== undefined) {
+      block.state = "captured";
+      return {
+        snapshot: captured.snapshot,
+        error: null,
+        reused: false,
+        dropReason: null,
+      };
+    }
+    const error = captured && typeof captured.error === "string"
+      ? captured.error.slice(0, 512)
+      : null;
+    if (error !== null) {
+      block.state = "capture-error";
+      return {
+        snapshot: null,
+        error,
+        reused: false,
+        dropReason: "capture-error",
+      };
+    }
+    block.state = "snapshot-empty";
+    return {
+      snapshot: null,
+      error: null,
+      reused: false,
+      dropReason: "snapshot-empty",
+    };
+  }
+
+  return {
+    beginBlock,
+    resetIfFast,
+    ensureBlock,
+    capture,
+    counts() {
+      return {
+        before: beforeCaptureCount,
+        after: afterCaptureCount,
+      };
+    },
+  };
+}
+
 function eventLoopProbeSample(probe, message, parentReceiveEpochMs,
-    parentReceiveMonoMs, phaseAtReceive, protocolReadyAt) {
+    parentReceiveMonoMs, phaseAtReceive, protocolReadyAt,
+    snapshotBlockMap = null, fallbackSnapshotBlockMap = null) {
   const anomalies = [];
   const workerStartEpochMs = Number(message.workerStartEpochMs);
   const workerEndEpochMs = Number(message.workerEndEpochMs);
@@ -651,44 +829,25 @@ function eventLoopProbeSample(probe, message, parentReceiveEpochMs,
   if (workerInterProbeGapMs >= SLOW_SAMPLE_THRESHOLD_MS) {
     trigger.add("worker-inter-probe-gap");
   }
-  const snapshot = message.slowSnapshot && typeof message.slowSnapshot === "object"
-    ? {
-        worldgen: selectScalarTelemetry(
-          message.slowSnapshot.worldgen,
-          WORLDGEN_SLOW_SAMPLE_FIELDS,
-        ),
-        network: selectScalarTelemetry(
-          message.slowSnapshot.network,
-          NETWORK_SLOW_SAMPLE_FIELDS,
-        ),
-        storage: selectScalarTelemetry(
-          message.slowSnapshot.storage,
-          STORAGE_SLOW_SAMPLE_FIELDS,
-        ),
-        scheduler: selectScalarTelemetry(
-          message.slowSnapshot.scheduler,
-          SCHEDULER_SLOW_SAMPLE_FIELDS,
-        ),
-        gc: selectScalarTelemetry(message.slowSnapshot.gc, [
-          "supported",
-          "count",
-          "durationMs",
-          "maxDurationMs",
-          "lastDurationMs",
-          "lastKind",
-          "lastAtEpochMs",
-          "rssBytes",
-          "heapUsedBytes",
-          "heapTotalBytes",
-          "externalBytes",
-          "arrayBuffersBytes",
-          "heapLimitBytes",
-        ]),
-      }
+  const slowBlockId = normalizeSlowBlockId(message.slowBlockId);
+  const directSnapshot = selectSlowProbeSnapshot(message.slowSnapshot);
+  const rawSnapshotReused = message.slowSnapshotReused === true;
+  const reusedSnapshot = directSnapshot === null && rawSnapshotReused && slowBlockId > 0
+    ? snapshotBlockMap?.get(slowBlockId) ?? fallbackSnapshotBlockMap?.get(slowBlockId) ?? null
     : null;
+  const snapshot = directSnapshot ?? reusedSnapshot;
+  const snapshotReused = rawSnapshotReused && snapshot !== null;
+  const slowSnapshotDropReason = normalizeSlowSnapshotDropReason(
+    message.slowSnapshotDropReason,
+  );
+  const snapshotDropped = snapshot === null && message.slowSnapshotDropped === true &&
+    !rawSnapshotReused;
   return {
     schemaVersion: SLOW_SAMPLE_SCHEMA_VERSION,
     probeId: probe.probeId,
+    slowBlockId,
+    slowSnapshotReused: rawSnapshotReused,
+    slowSnapshotDropReason,
     phaseAtSend: probe.phaseAtSend,
     phaseAtReceive,
     afterProtocolReady: protocolReadyAt > 0 &&
@@ -711,7 +870,9 @@ function eventLoopProbeSample(probe, message, parentReceiveEpochMs,
     clockAnomaly: anomalies.length > 0,
     clockAnomalies: anomalies,
     snapshotCaptured: snapshot !== null,
-    snapshotDropped: message.slowSnapshotDropped === true,
+    snapshotReused,
+    snapshotDropped,
+    snapshotDropReason: slowSnapshotDropReason,
     snapshotError: typeof message.slowSnapshotError === "string"
       ? message.slowSnapshotError.slice(0, 512)
       : null,
@@ -731,8 +892,10 @@ function retainSlowProbeSample(samples, sample, limit = MAX_SLOW_SAMPLES_PER_SCO
   if (sample.trigger.length === 0) return false;
   samples.push(sample);
   samples.sort(compareSlowProbeSamples);
-  if (samples.length > limit) samples.length = limit;
-  return true;
+  const evicted = samples.length > limit;
+  if (evicted) samples.length = limit;
+  sample[SLOW_PROBE_TOP_K_EVICTED] = evicted;
+  return samples.includes(sample);
 }
 
 function combinedSlowProbeSamples(beforeProtocolReady, afterProtocolReady) {
@@ -772,6 +935,9 @@ function runSlowProbeSelfSmoke() {
     workerEndMonoMs: 802,
     workerInterProbeGapMs: 301,
     slowTrigger: ["parent-to-worker", "worker-inter-probe-gap"],
+    slowBlockId: 1,
+    slowSnapshotReused: false,
+    slowSnapshotDropReason: null,
     slowSnapshot: {
       worldgen: {
         slices: 5,
@@ -795,6 +961,7 @@ function runSlowProbeSelfSmoke() {
   }, 1310, 810, "distance-6/3", 900);
   if (sample.parentToWorkerMs !== 300 || sample.workerHandlerMs !== 2 ||
       sample.workerToParentMs !== 8 || sample.roundTripMs !== 310 ||
+      sample.slowBlockId !== 1 || sample.snapshotReused ||
       sample.worldgen?.forbidden !== undefined ||
       sample.network?.forbidden !== undefined || sample.gc?.forbidden !== undefined) {
     throw new Error("slow probe timing or scalar allowlist self-smoke failed");
@@ -822,6 +989,8 @@ function runSlowProbeSelfSmoke() {
     workerEndMonoMs: 810,
     workerInterProbeGapMs: 10,
     slowTrigger: [],
+    slowBlockId: 0,
+    slowSnapshotReused: false,
     slowSnapshot: null,
   }, 1610, 1110, probe.phaseAtSend, 900);
   for (const trigger of ["worker-handler", "worker-to-parent", "round-trip"]) {
@@ -829,6 +998,7 @@ function runSlowProbeSelfSmoke() {
       throw new Error(`slow probe did not retain the ${trigger} segment trigger`);
     }
   }
+
   const fast = eventLoopProbeSample(probe, {
     probeId: 7,
     slowSampleSchemaVersion: SLOW_SAMPLE_SCHEMA_VERSION,
@@ -841,25 +1011,132 @@ function runSlowProbeSelfSmoke() {
     workerEndMonoMs: 502,
     workerInterProbeGapMs: 100,
     slowTrigger: [],
+    slowBlockId: 0,
+    slowSnapshotReused: false,
     slowSnapshot: null,
   }, 1003, 503, probe.phaseAtSend, 900);
-  if (fast.trigger.length !== 0 || fast.snapshotCaptured ||
-      retainSlowProbeSample([], fast)) {
+  if (fast.trigger.length !== 0 || fast.snapshotCaptured || fast.slowBlockId !== 0 ||
+      fast.snapshotReused || retainSlowProbeSample([], fast)) {
     throw new Error("fast event-loop probe entered the bounded slow-sample ring");
   }
-  const retained = [];
-  for (let index = 0; index < MAX_SLOW_SAMPLES_PER_SCOPE + 1; index++) {
-    retainSlowProbeSample(retained, {
-      ...sample,
-      probeId: index + 1,
-      roundTripMs: index + 1,
+
+  const snapshotForSample = (value) => ({
+    worldgen: value.worldgen,
+    network: value.network,
+    storage: value.storage,
+    scheduler: value.scheduler,
+    gc: value.gc,
+  });
+  const backlogState = createSlowProbeBlockState();
+  const backlogSnapshotMap = new Map();
+  const backlogSamples = [];
+  let backlogCaptureCount = 0;
+  const backlogSnapshot = {
+    worldgen: {slices: 1, totalSliceElapsedMillis: 1},
+    network: {inboundQueuedBytes: 1},
+    storage: {backend: "opfs"},
+    scheduler: {taskWorkDepth: 1},
+    gc: {supported: false},
+  };
+  for (let index = 0; index < MAX_SLOW_SAMPLES; index++) {
+    backlogState.resetIfFast(true);
+    const block = backlogState.ensureBlock(false);
+    const captured = backlogState.capture(block, () => {
+      backlogCaptureCount++;
+      return {snapshot: backlogSnapshot, error: null};
     });
+    const backlogProbe = {
+      probeId: 100 + index,
+      phaseAtSend: "distance-backlog",
+      parentSendEpochMs: 2000 + index,
+      parentSendMonoMs: 2000 + index,
+    };
+    const backlogSample = eventLoopProbeSample(backlogProbe, {
+      probeId: backlogProbe.probeId,
+      slowSampleSchemaVersion: SLOW_SAMPLE_SCHEMA_VERSION,
+      phaseAtSend: backlogProbe.phaseAtSend,
+      parentSendEpochMs: backlogProbe.parentSendEpochMs,
+      parentSendMonoMs: backlogProbe.parentSendMonoMs,
+      workerStartEpochMs: backlogProbe.parentSendEpochMs + 300,
+      workerStartMonoMs: backlogProbe.parentSendMonoMs + 300,
+      workerEndEpochMs: backlogProbe.parentSendEpochMs + 301,
+      workerEndMonoMs: backlogProbe.parentSendMonoMs + 301,
+      workerInterProbeGapMs: 1,
+      slowTrigger: ["parent-to-worker"],
+      slowBlockId: block.id,
+      slowSnapshotReused: captured.reused,
+      slowSnapshotDropReason: captured.dropReason,
+      slowSnapshotDropped: captured.dropReason !== null,
+      slowSnapshot: captured.snapshot,
+    }, backlogProbe.parentSendEpochMs + 302, backlogProbe.parentSendMonoMs + 302,
+    backlogProbe.phaseAtSend, 0, backlogSnapshotMap);
+    if (backlogSample.snapshotCaptured && !backlogSnapshotMap.has(block.id)) {
+      backlogSnapshotMap.set(block.id, snapshotForSample(backlogSample));
+    }
+    backlogSamples.push(backlogSample);
+  }
+  const firstBacklog = backlogSamples[0];
+  const lastBacklog = backlogSamples.at(-1);
+  if (backlogCaptureCount !== 1 || backlogState.counts().before !== 1 ||
+      firstBacklog.slowBlockId === 0 || firstBacklog.snapshotReused ||
+      !firstBacklog.snapshotCaptured || !lastBacklog.snapshotCaptured ||
+      !lastBacklog.snapshotReused || lastBacklog.snapshotDropped ||
+      lastBacklog.slowSnapshotDropReason !== null) {
+    throw new Error("slow backlog block reuse self-smoke failed");
+  }
+
+  backlogState.resetIfFast(false);
+  const secondBlock = backlogState.ensureBlock(false);
+  const secondCapture = backlogState.capture(secondBlock, () => {
+    backlogCaptureCount++;
+    return {snapshot: backlogSnapshot, error: null};
+  });
+  if (secondBlock.id === firstBacklog.slowBlockId || !secondCapture.snapshot ||
+      secondCapture.reused || backlogCaptureCount !== 2) {
+    throw new Error("slow backlog rising-edge block self-smoke failed");
+  }
+
+  const retained = [];
+  let topKRetentionDropped = 0;
+  for (let index = 0; index < MAX_SLOW_SAMPLES_PER_SCOPE + 1; index++) {
+    const candidate = {
+      ...lastBacklog,
+      probeId: 500 + index,
+      roundTripMs: index + 1,
+    };
+    retainSlowProbeSample(retained, candidate);
+    if (candidate[SLOW_PROBE_TOP_K_EVICTED] === true) topKRetentionDropped++;
   }
   if (retained.length !== MAX_SLOW_SAMPLES_PER_SCOPE ||
       retained[0].roundTripMs !== MAX_SLOW_SAMPLES_PER_SCOPE + 1 ||
-      retained.at(-1).roundTripMs !== 2) {
-    throw new Error("slow probe bounded top-K self-smoke failed");
+      retained.at(-1).roundTripMs !== 2 || topKRetentionDropped !== 1 ||
+      !retained[0].snapshotCaptured || !retained[0].snapshotReused) {
+    throw new Error("slow probe bounded top-K reuse self-smoke failed");
   }
+
+  const capState = createSlowProbeBlockState();
+  let capCaptureCount = 0;
+  let blockCapDropped = 0;
+  let repeatedBlockCapDropped = 0;
+  for (let index = 0; index < MAX_SLOW_SAMPLES_PER_SCOPE + 1; index++) {
+    capState.resetIfFast(false);
+    const cappedBlock = capState.ensureBlock(false);
+    const capped = capState.capture(cappedBlock, () => {
+      capCaptureCount++;
+      return {snapshot: backlogSnapshot, error: null};
+    });
+    if (capped.dropReason === "block-cap") blockCapDropped++;
+    const repeated = capState.capture(cappedBlock, () => {
+      capCaptureCount++;
+      return {snapshot: backlogSnapshot, error: null};
+    });
+    if (repeated.dropReason === "block-cap") repeatedBlockCapDropped++;
+  }
+  if (capCaptureCount !== MAX_SLOW_SAMPLES_PER_SCOPE || blockCapDropped !== 1 ||
+      repeatedBlockCapDropped !== 0 || capState.counts().before !== MAX_SLOW_SAMPLES_PER_SCOPE) {
+    throw new Error("slow probe block-cap self-smoke failed");
+  }
+
   return {
     ok: true,
     schema: SLOW_SAMPLE_SCHEMA,
@@ -872,6 +1149,12 @@ function runSlowProbeSelfSmoke() {
     maxFieldsPerGroup: MAX_SLOW_SAMPLE_FIELDS_PER_GROUP,
     segmentedTriggers: true,
     fastProbeExcluded: true,
+    backlogBlockReuse: true,
+    sameBacklogCaptureCount: backlogCaptureCount - 1,
+    risingEdgeBlock: true,
+    topKRetentionDropped,
+    blockCapDropped,
+    repeatedBlockCapDropped,
   };
 }
 
@@ -1293,10 +1576,14 @@ if (isMainThread) {
   const eventLoopProbeSamples = [];
   const slowProbeSamplesBeforeProtocolReady = [];
   const slowProbeSamplesAfterProtocolReady = [];
+  const slowProbeSnapshotBlocksBeforeProtocolReady = new Map();
+  const slowProbeSnapshotBlocksAfterProtocolReady = new Map();
+  const slowProbeSnapshotBlocksById = new Map();
   const slowProbeClockAnomalies = [];
   let slowProbeCandidateCount = 0;
+  let slowProbeTopKRetentionDroppedCount = 0;
   let slowProbeClockAnomalyCount = 0;
-  let slowProbeSnapshotDroppedCount = 0;
+  let slowProbeSnapshotBlockCapDroppedCount = 0;
   let slowProbeSnapshotErrorCount = 0;
   let longestEventLoopProbe = {latencyMs: 0, startedAt: 0, completedAt: 0};
   let longestGameplayEventLoopProbe = {
@@ -1310,6 +1597,29 @@ if (isMainThread) {
   let latestWorldgenStats = null;
   let latestStorageStats = null;
   let lastWorldgenTraceAt = 0;
+  const snapshotFromSlowProbeSample = (sample) => ({
+    worldgen: sample.worldgen,
+    network: sample.network,
+    storage: sample.storage,
+    scheduler: sample.scheduler,
+    gc: sample.gc,
+  });
+  const rememberSlowProbeSnapshot = (scopeMap, sample) => {
+    const blockId = normalizeSlowBlockId(sample.slowBlockId);
+    if (blockId === 0 || !sample.snapshotCaptured) return;
+    const needScopeSnapshot = !scopeMap.has(blockId) &&
+      scopeMap.size < MAX_SLOW_SAMPLES_PER_SCOPE;
+    const needGlobalSnapshot = !slowProbeSnapshotBlocksById.has(blockId) &&
+      slowProbeSnapshotBlocksById.size < MAX_SLOW_SAMPLES;
+    if (!needScopeSnapshot && !needGlobalSnapshot) return;
+    const snapshot = snapshotFromSlowProbeSample(sample);
+    if (needScopeSnapshot) {
+      scopeMap.set(blockId, snapshot);
+    }
+    if (needGlobalSnapshot) {
+      slowProbeSnapshotBlocksById.set(blockId, snapshot);
+    }
+  };
   let workerExited = false;
   let stopFlowStarted = false;
   let stoppedReceived = false;
@@ -1850,10 +2160,15 @@ if (isMainThread) {
       perScopeLimit: MAX_SLOW_SAMPLES_PER_SCOPE,
       countTotal: slowProbeCandidateCount,
       countRetained: slowProbeSamples.length,
-      dropped: Math.max(0, slowProbeCandidateCount - slowProbeSamples.length),
+      dropped: slowProbeTopKRetentionDroppedCount,
+      topKRetentionDropped: slowProbeTopKRetentionDroppedCount,
       retainedBeforeProtocolReady: slowProbeSamplesBeforeProtocolReady.length,
       retainedAfterProtocolReady: slowProbeSamplesAfterProtocolReady.length,
-      snapshotDropped: slowProbeSnapshotDroppedCount,
+      snapshotDropped: slowProbeSnapshotBlockCapDroppedCount,
+      snapshotBlockCapDropped: slowProbeSnapshotBlockCapDroppedCount,
+      snapshotBlockCapDropCount: slowProbeSnapshotBlockCapDroppedCount,
+      snapshotBlocksBeforeProtocolReady: slowProbeSnapshotBlocksBeforeProtocolReady.size,
+      snapshotBlocksAfterProtocolReady: slowProbeSnapshotBlocksAfterProtocolReady.size,
       snapshotErrors: slowProbeSnapshotErrorCount,
       clockAnomalyCount: slowProbeClockAnomalyCount,
       clockAnomalies: slowProbeClockAnomalies.slice(),
@@ -2104,6 +2419,10 @@ if (isMainThread) {
         eventLoopProbeStartedAt.delete(message.probeId);
         const parentReceiveEpochMs = highResolutionEpochMillis();
         const parentReceiveMonoMs = performance.now();
+        const scopeSnapshotMap = protocolReadyAt > 0 &&
+          probe.parentSendEpochMs >= protocolReadyAt
+          ? slowProbeSnapshotBlocksAfterProtocolReady
+          : slowProbeSnapshotBlocksBeforeProtocolReady;
         const slowSample = eventLoopProbeSample(
           probe,
           message,
@@ -2111,6 +2430,8 @@ if (isMainThread) {
           parentReceiveMonoMs,
           workerPhase,
           protocolReadyAt,
+          scopeSnapshotMap,
+          slowProbeSnapshotBlocksById,
         );
         const completedAt = parentReceiveEpochMs;
         const latencyMs = slowSample.roundTripMs;
@@ -2127,6 +2448,7 @@ if (isMainThread) {
           workerInterProbeGapMs: slowSample.workerInterProbeGapMs,
           clockAnomaly: slowSample.clockAnomaly,
         });
+        rememberSlowProbeSnapshot(scopeSnapshotMap, slowSample);
         if (slowSample.trigger.length > 0) {
           slowProbeCandidateCount++;
           retainSlowProbeSample(
@@ -2135,6 +2457,9 @@ if (isMainThread) {
               : slowProbeSamplesBeforeProtocolReady,
             slowSample,
           );
+          if (slowSample[SLOW_PROBE_TOP_K_EVICTED] === true) {
+            slowProbeTopKRetentionDroppedCount++;
+          }
         }
         if (slowSample.clockAnomaly &&
             slowProbeClockAnomalies.length < MAX_SLOW_SAMPLES) {
@@ -2146,7 +2471,9 @@ if (isMainThread) {
         } else if (slowSample.clockAnomaly) {
           slowProbeClockAnomalyCount++;
         }
-        if (slowSample.snapshotDropped) slowProbeSnapshotDroppedCount++;
+        if (slowSample.slowSnapshotDropReason === "block-cap") {
+          slowProbeSnapshotBlockCapDroppedCount++;
+        }
         if (slowSample.snapshotError !== null) slowProbeSnapshotErrorCount++;
         if (latencyMs > longestEventLoopProbe.latencyMs) {
           longestEventLoopProbe = {
@@ -2383,8 +2710,7 @@ if (isMainThread) {
   let coverageStarted;
   let coverageMetadata;
   let previousWorkerProbeStartMonoMs = Number.NaN;
-  let workerSlowSnapshotsBeforeProtocolReady = 0;
-  let workerSlowSnapshotsAfterProtocolReady = 0;
+  const workerSlowProbeBlockState = createSlowProbeBlockState();
   parentPort.on("message", (data) => {
     if (data && data.type === "node-event-loop-probe") {
       const workerStartEpochMs = highResolutionEpochMillis();
@@ -2404,26 +2730,31 @@ if (isMainThread) {
       if (workerInterProbeGapMs >= threshold) {
         slowTrigger.push("worker-inter-probe-gap");
       }
+      const backlogSignalAtStart = parentToWorkerMs >= threshold ||
+        workerInterProbeGapMs >= threshold;
+      workerSlowProbeBlockState.resetIfFast(backlogSignalAtStart);
+      let slowBlock = backlogSignalAtStart
+        ? workerSlowProbeBlockState.ensureBlock(data.afterProtocolReady === true)
+        : null;
       let slowSnapshot = null;
       let slowSnapshotError = null;
+      let slowSnapshotReused = false;
+      let slowSnapshotDropReason = null;
       let slowSnapshotAttempted = false;
       const captureSlowSnapshot = () => {
         if (slowSnapshotAttempted) return;
         slowSnapshotAttempted = true;
-        if (data.afterProtocolReady) {
-          if (workerSlowSnapshotsAfterProtocolReady >= MAX_SLOW_SAMPLES_PER_SCOPE) {
-            return;
-          }
-          workerSlowSnapshotsAfterProtocolReady++;
-        } else {
-          if (workerSlowSnapshotsBeforeProtocolReady >= MAX_SLOW_SAMPLES_PER_SCOPE) {
-            return;
-          }
-          workerSlowSnapshotsBeforeProtocolReady++;
+        if (slowBlock === null) {
+          slowBlock = workerSlowProbeBlockState.ensureBlock(data.afterProtocolReady === true);
         }
-        const captured = safeWorkerSlowProbeSnapshot();
+        const captured = workerSlowProbeBlockState.capture(
+          slowBlock,
+          safeWorkerSlowProbeSnapshot,
+        );
         slowSnapshot = captured.snapshot;
         slowSnapshotError = captured.error;
+        slowSnapshotReused = captured.reused;
+        slowSnapshotDropReason = captured.dropReason;
       };
       if (slowTrigger.length > 0) captureSlowSnapshot();
       const chunkPriorityStats = globalThis.__gaiusChunkPriorityStats
@@ -2450,7 +2781,8 @@ if (isMainThread) {
         }
       }
       const slowSnapshotDropped = slowTrigger.length > 0 &&
-        slowSnapshot === null && slowSnapshotError === null;
+        slowSnapshot === null && slowSnapshotError === null &&
+        slowSnapshotDropReason !== null;
       parentPort.postMessage({
         type: "node-event-loop-pong",
         probeId: data.probeId,
@@ -2464,6 +2796,9 @@ if (isMainThread) {
         workerEndMonoMs,
         workerInterProbeGapMs,
         slowTrigger,
+        slowBlockId: slowTrigger.length > 0 && slowBlock !== null ? slowBlock.id : 0,
+        slowSnapshotReused,
+        slowSnapshotDropReason,
         slowSampleThresholdMismatch: thresholdMismatch,
         slowSnapshot,
         slowSnapshotDropped,

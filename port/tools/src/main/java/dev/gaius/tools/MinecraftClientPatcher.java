@@ -13291,7 +13291,7 @@ public final class MinecraftClientPatcher {
                 Opcodes.INVOKESTATIC,
                 "dev/gaius/browser/BrowserWorldgenScheduler",
                 "beginTaskWork",
-                "()I",
+                "(Ljava/lang/String;)I",
                 false);
     }
 
@@ -13337,6 +13337,7 @@ public final class MinecraftClientPatcher {
         int taskScopeLocal = method.maxLocals++;
         int throwableLocal = method.maxLocals++;
         InsnList entry = new InsnList();
+        entry.add(new LdcInsnNode(target));
         entry.add(browserWorldgenBeginTaskWork());
         entry.add(new VarInsnNode(Opcodes.ISTORE, taskScopeLocal));
         // Start the catch range only after beginTaskWork has returned its

@@ -130,7 +130,7 @@ for (const contract of [
   "browserWorldgenEndTaskWork()",
   "instrumentBrowserTaskScope(",
   '"MinecraftServer.pollTask"',
-  '"beginTaskWork",\n                "()I"',
+  '"beginTaskWork",\n                "(Ljava/lang/String;)I"',
   '"endTaskWork",\n                "(I)V"',
 ]) {
   assert.ok(clientPatcherSource.includes(contract),
@@ -139,7 +139,7 @@ for (const contract of [
 assert.ok(browserPatcherSource.includes("requireNoServerWorkTurnReset"),
   "26.2 task patcher does not guard the shared server-work clock from per-task resets");
 for (const contract of [
-  '"beginTaskWork",\n                "()I"',
+  '"beginTaskWork",\n                "(Ljava/lang/String;)I"',
   '"endTaskWork",\n                "(I)V"',
 ]) {
   assert.ok(browserPatcherSource.includes(contract),
@@ -288,8 +288,9 @@ assert.equal(occurrences(runUntilWait, "BrowserWorldgenScheduler.beginServerWork
     "runUntilWait must not reset the shared tick budget per task invocation");
   assert.equal(occurrences(runUntilWait, "BrowserWorldgenScheduler.beginTaskWork"), 1,
     "runUntilWait must enter one active-work task scope");
-  assert.match(runUntilWait, /BrowserWorldgenScheduler\.beginTaskWork:\(\)I/,
-    "runUntilWait must store the integer task-scope token");
+  assert.match(runUntilWait,
+    /String ChunkGenerationTask\.runUntilWait[\s\S]*BrowserWorldgenScheduler\.beginTaskWork:\(Ljava\/lang\/String;\)I/,
+    "runUntilWait must label and store the integer task-scope token");
   assert.match(runUntilWait, /BrowserWorldgenScheduler\.endTaskWork:\(I\)V/,
     "runUntilWait must close task scopes with the integer token");
   assert.ok(occurrences(runUntilWait, "BrowserWorldgenScheduler.endTaskWork") >= 3,
@@ -309,11 +310,14 @@ assert.equal(occurrences(runUntilWait, "BrowserWorldgenScheduler.beginServerWork
   const pollTask = method(bytecode, "protected boolean pollTask();", "private boolean pollTaskInternal");
   assert.equal(occurrences(pollTask, "BrowserWorldgenScheduler.beginTaskWork"), 1,
     "MinecraftServer.pollTask must enter one active-work task scope");
-  assert.match(pollTask, /BrowserWorldgenScheduler\.beginTaskWork:\(\)I/,
-    "MinecraftServer.pollTask must store the integer task-scope token");
+  assert.match(pollTask,
+    /String MinecraftServer\.pollTask[\s\S]*BrowserWorldgenScheduler\.beginTaskWork:\(Ljava\/lang\/String;\)I/,
+    "MinecraftServer.pollTask must label and store the integer task-scope token");
   assert.match(pollTask, /BrowserWorldgenScheduler\.endTaskWork:\(I\)V/,
     "MinecraftServer.pollTask must close task scopes with the integer token");
-  const pollBegin = pollTask.indexOf("BrowserWorldgenScheduler.beginTaskWork:()I");
+  const pollBegin = pollTask.indexOf(
+    "BrowserWorldgenScheduler.beginTaskWork:(Ljava/lang/String;)I",
+  );
   const pollPump = pollTask.indexOf("BrowserIntegratedServerMain.pumpUrgentPacketsIfPending");
   assert.ok(pollBegin >= 0 && pollPump > pollBegin,
     "MinecraftServer.pollTask must pump urgent packets after token initialization");

@@ -4189,9 +4189,14 @@ def check_source_patches() -> None:
             and "__gaiusWorldgenSliceMillis" in singleplayer_worker_runtime_smoke
             and "GAIUS_SMOKE_MAX_GAMEPLAY_STALL_MS" in singleplayer_worker_runtime_smoke
             and 'type: "worldgen-event-loop-stall"' in singleplayer_worker_runtime_smoke
-            and 'SLOW_SAMPLE_SCHEMA = "gaius.worker-event-loop-slow-sample.v1"'
+            and 'SLOW_SAMPLE_SCHEMA = "gaius.worker-event-loop-slow-sample.v2"'
                 in singleplayer_worker_runtime_smoke
             and "MAX_SLOW_SAMPLES = 64" in singleplayer_worker_runtime_smoke
+            and "createSlowProbeBlockState" in singleplayer_worker_runtime_smoke
+            and "slowSnapshotReused" in singleplayer_worker_runtime_smoke
+            and "slowSnapshotDropReason" in singleplayer_worker_runtime_smoke
+            and "snapshotBlockCapDropped" in singleplayer_worker_runtime_smoke
+            and "topKRetentionDropped" in singleplayer_worker_runtime_smoke
             and "parentSendEpochMs" in singleplayer_worker_runtime_smoke
             and "workerStartEpochMs" in singleplayer_worker_runtime_smoke
             and "workerEndEpochMs" in singleplayer_worker_runtime_smoke
@@ -5608,13 +5613,13 @@ def check_source_patches() -> None:
             and "browserWorldgenCheckpoint" in client_patcher
             and "browserWorldgenBeginTaskWork" in client_patcher
             and "browserWorldgenEndTaskWork" in client_patcher
-            and '"beginTaskWork",\n                "()I"' in client_patcher
+            and '"beginTaskWork",\n                "(Ljava/lang/String;)I"' in client_patcher
             and '"endTaskWork",\n                "(I)V"' in client_patcher
             and "instrumentBrowserTaskScope(" in client_patcher
             and '"MinecraftServer.pollTask"' in client_patcher
             and "browserWorldgenBeginTaskWork" in minecraft_262_browser_patcher
             and "browserWorldgenEndTaskWork" in minecraft_262_browser_patcher
-            and '"beginTaskWork",\n                "()I"' in minecraft_262_browser_patcher
+            and '"beginTaskWork",\n                "(Ljava/lang/String;)I"' in minecraft_262_browser_patcher
             and '"endTaskWork",\n                "(I)V"' in minecraft_262_browser_patcher
             and "instrumentBrowserTaskScope(runUntilWait" in minecraft_262_browser_patcher
             and "TryCatchBlockNode" in minecraft_262_browser_patcher
@@ -5622,6 +5627,13 @@ def check_source_patches() -> None:
             and "public static void checkpoint()" in browser_worldgen_scheduler
             and "public static void beginServerWorkTurn()" in browser_worldgen_scheduler
             and "public static int beginTaskWork()" in browser_worldgen_scheduler
+            and "public static int beginTaskWork(String taskLabel)"
+                in browser_worldgen_scheduler
+            and "recordSchedulerTaskLabel(taskLabel)" in browser_worldgen_scheduler
+            and "currentTaskScopeId" in browser_worldgen_scheduler
+            and "currentTaskLabel" in browser_worldgen_scheduler
+            and "maxTaskContext" in browser_worldgen_scheduler
+            and "maxSliceContext" in browser_worldgen_scheduler
             and "public static void endTaskWork(int token)" in browser_worldgen_scheduler
             and "private static int taskWorkDepth" in browser_worldgen_scheduler
             and "activeWorkElapsedMillis" in browser_worldgen_scheduler
@@ -11310,10 +11322,14 @@ def check_overlay_bytecode() -> None:
             "Integrated server pumps pending input while awaiting chunk futures",
             "BrowserIntegratedServerMain.pumpUrgentPacketsIfPending" in minecraft_poll_task
             and "BrowserWorldgenScheduler.beginTaskWork" in minecraft_poll_task
-            and "BrowserWorldgenScheduler.beginTaskWork:()I" in minecraft_poll_task
+            and "String MinecraftServer.pollTask" in minecraft_poll_task
+            and "BrowserWorldgenScheduler.beginTaskWork:(Ljava/lang/String;)I"
+                in minecraft_poll_task
             and "BrowserWorldgenScheduler.endTaskWork:(I)V" in minecraft_poll_task
             and minecraft_poll_task.count("BrowserWorldgenScheduler.endTaskWork") >= 2
-            and minecraft_poll_task.find("BrowserWorldgenScheduler.beginTaskWork:()I")
+            and minecraft_poll_task.find(
+                "BrowserWorldgenScheduler.beginTaskWork:(Ljava/lang/String;)I"
+            )
                 < minecraft_poll_task.find("BrowserIntegratedServerMain.pumpUrgentPacketsIfPending")
             and "BrowserWebSocketChannel.hasPendingInput" in browser_pump_pending_packets
             and "pumpUrgentPackets:()V" in browser_pump_pending_packets
@@ -11678,7 +11694,9 @@ def check_overlay_bytecode() -> None:
                     and generation_run_until_wait.count(
                         "BrowserWorldgenScheduler.beginTaskWork"
                     ) == 1
-                    and "BrowserWorldgenScheduler.beginTaskWork:()I"
+                    and "String ChunkGenerationTask.runUntilWait"
+                        in generation_run_until_wait
+                    and "BrowserWorldgenScheduler.beginTaskWork:(Ljava/lang/String;)I"
                         in generation_run_until_wait
                     and "BrowserWorldgenScheduler.endTaskWork:(I)V"
                         in generation_run_until_wait

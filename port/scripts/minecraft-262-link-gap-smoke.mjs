@@ -99,7 +99,7 @@ for (const contract of [
 assert.ok(versionPatcher.includes("requireNoServerWorkTurnReset"),
   "26.2 task patcher does not guard the shared server-work clock from per-task resets");
 for (const contract of [
-  '"beginTaskWork",\n                "()I"',
+  '"beginTaskWork",\n                "(Ljava/lang/String;)I"',
   '"endTaskWork",\n                "(I)V"',
 ]) {
   assert.ok(versionPatcher.includes(contract),
@@ -116,7 +116,7 @@ for (const contract of [
   "browserWorldgenEndTaskWork()",
   "instrumentBrowserTaskScope(",
   '"MinecraftServer.pollTask"',
-  '"beginTaskWork",\n                "()I"',
+  '"beginTaskWork",\n                "(Ljava/lang/String;)I"',
   '"endTaskWork",\n                "(I)V"',
 ]) {
   assert.ok(clientPatcher.includes(contract),
@@ -269,6 +269,9 @@ assert.equal(runUntilWait.match(/BrowserWorldgenScheduler\.beginServerWorkTurn/g
   "runUntilWait must not reset the shared tick budget per task invocation");
 assert.equal(runUntilWait.match(/BrowserWorldgenScheduler\.beginTaskWork/g)?.length ?? 0, 1,
   "runUntilWait must enter one active-work task scope");
+assert.match(runUntilWait,
+  /String ChunkGenerationTask\.runUntilWait[\s\S]*BrowserWorldgenScheduler\.beginTaskWork:\(Ljava\/lang\/String;\)I/,
+  "runUntilWait must carry its bounded diagnostic task label");
 assert.ok((runUntilWait.match(/BrowserWorldgenScheduler\.endTaskWork/g)?.length ?? 0) >= 3,
   "runUntilWait must close its scope on returns and exceptions");
 assert.match(runUntilWait, /Exception table:[\s\S]*Throwable/,
@@ -303,6 +306,9 @@ assert.ok(tickStart >= 0 && processTick > tickStart && tickCheckpoint > processT
 const pollTask = methodBody(minecraftServer, "protected boolean pollTask()");
 assert.equal(pollTask.match(/BrowserWorldgenScheduler\.beginTaskWork/g)?.length ?? 0, 1,
   "MinecraftServer.pollTask must enter one active-work task scope");
+assert.match(pollTask,
+  /String MinecraftServer\.pollTask[\s\S]*BrowserWorldgenScheduler\.beginTaskWork:\(Ljava\/lang\/String;\)I/,
+  "MinecraftServer.pollTask must carry its bounded diagnostic task label");
 assert.ok((pollTask.match(/BrowserWorldgenScheduler\.endTaskWork/g)?.length ?? 0) >= 2,
   "MinecraftServer.pollTask must close its scope on returns and exceptions");
 

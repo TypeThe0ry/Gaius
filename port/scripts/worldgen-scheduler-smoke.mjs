@@ -66,6 +66,8 @@ assert.ok(worldgen.includes("public static void beginServerWorkTurn()")
     && worldgen.includes("if (yieldActive) {\n            return;\n        }"),
   "worldgen server-tick clock reset is missing its reentrancy guard");
 assert.ok(worldgen.includes("public static int beginTaskWork()")
+    && worldgen.includes("public static int beginTaskWork(String taskLabel)")
+    && worldgen.includes("recordSchedulerTaskLabel(taskLabel)")
     && worldgen.includes("public static void endTaskWork(int token)")
     && worldgen.includes("private static int taskWorkDepth")
     && worldgen.includes("activeWorkElapsedMillis")
@@ -94,12 +96,16 @@ assert.ok(clientPatcher.includes("browserWorldgenBeginServerWorkTurn()")
     && clientPatcher.includes("method.instructions.insertBefore(instruction, browserWorldgenBeginServerWorkTurn())"),
   "server tick does not reset the clock before work and checkpoint after work");
 assert.ok(clientPatcher.includes("browserWorldgenBeginTaskWork()")
+    && clientPatcher.includes('"(Ljava/lang/String;)I"')
+    && clientPatcher.includes("new LdcInsnNode(target)")
     && clientPatcher.includes("browserWorldgenEndTaskWork()")
     && clientPatcher.includes("instrumentBrowserTaskScope(")
     && clientPatcher.includes("\"MinecraftServer.pollTask\"")
     && clientPatcher.includes("pumpUrgentPacketsIfPending"),
   "MinecraftServer.pollTask has no active-work task scope");
 assert.ok(patcher262.includes("browserWorldgenBeginTaskWork()")
+    && patcher262.includes('"(Ljava/lang/String;)I"')
+    && patcher262.includes("new LdcInsnNode(target)")
     && patcher262.includes("browserWorldgenEndTaskWork()")
     && patcher262.includes("instrumentBrowserTaskScope(runUntilWait")
     && patcher262.includes("TryCatchBlockNode"),
@@ -250,14 +256,31 @@ const recordSchedulerMarker = new Function(
   "activeWorkMillis",
   jsBody("private static native void recordSchedulerMarker("),
 );
+const recordSchedulerTaskLabel = new Function(
+  "taskLabel",
+  jsBody("private static native void recordSchedulerTaskLabel("),
+);
 delete globalThis.__gaiusWorldgenSchedulerMarker;
 delete globalThis.__gaiusSlowProbeTelemetryEnabled;
+recordSchedulerTaskLabel("MinecraftServer.pollTask");
+assert.equal(globalThis.__gaiusWorldgenSchedulerMarker, undefined,
+  "worldgen task label mutated release state while disabled");
 recordSchedulerMarker("task-start-normal", 1, 1, 0, false, 4);
 assert.equal(globalThis.__gaiusWorldgenSchedulerMarker, undefined,
   "worldgen slow-probe marker mutated release state while disabled");
 globalThis.__gaiusSlowProbeTelemetryEnabled = true;
 recordSchedulerMarker("server-work-turn-start", 0, 0, 0, false, 0);
+recordSchedulerTaskLabel("MinecraftServer.pollTask");
 recordSchedulerMarker("task-start-normal", 1, 1, 0, false, 4);
+recordSchedulerTaskLabel("ChunkGenerationTask.runUntilWait");
+recordSchedulerMarker("task-start-nested", 0, 1, 0, false, 4);
+assert.equal(globalThis.__gaiusWorldgenSchedulerMarker.currentTaskLabel,
+  "MinecraftServer.pollTask", "normal task label was not retained");
+assert.equal(globalThis.__gaiusWorldgenSchedulerMarker.currentNestedTaskLabel,
+  "ChunkGenerationTask.runUntilWait", "nested task label was not retained");
+assert.equal(globalThis.__gaiusWorldgenSchedulerMarker.currentTaskScopeId, 1,
+  "normal task scope did not receive a bounded sequence id");
+recordSchedulerMarker("task-end-nested", 0, 1, 0, false, 4);
 recordSchedulerMarker("yield-start", 0, 1, 0, true, 12);
 recordSchedulerMarker("yield-end", 0, 1, 0, false, 0);
 recordSchedulerMarker("task-end-normal", 1, 0, 0, false, 6);
@@ -278,10 +301,18 @@ assert.equal(globalThis.__gaiusWorldgenSchedulerMarker.serverWorkTurnActive, fal
   "worldgen slow-probe marker retained a completed server work turn");
 assert.ok(globalThis.__gaiusWorldgenSchedulerMarker.lastTaskScopeWallMillis >= 0,
   "worldgen slow-probe marker omitted task wall time");
+const maximumTaskContext = JSON.parse(
+  globalThis.__gaiusWorldgenSchedulerMarker.maxTaskContext,
+);
+assert.equal(maximumTaskContext.taskScopeId, 1,
+  "maximum task context lost its task scope id");
+assert.equal(maximumTaskContext.taskLabel, "MinecraftServer.pollTask",
+  "maximum task context lost its task label");
 assert.ok(!Object.keys(globalThis.__gaiusWorldgenSchedulerMarker)
   .some(key => key.startsWith("__task")),
   "worldgen slow-probe marker leaked internal task accounting fields");
 delete globalThis.__gaiusWorldgenSchedulerMarker;
+recordSchedulerTaskLabel("ChunkGenerationTask.runUntilWait");
 recordSchedulerMarker("task-start-reentrant", 2, 0, 1, true, 0);
 assert.equal(globalThis.__gaiusWorldgenSchedulerMarker.activeTaskScope, true,
   "worldgen slow-probe marker omitted a reentrant-only task scope");
@@ -307,6 +338,8 @@ Object.defineProperty(globalThis, "__gaiusWorldgenSchedulerMarker", {
 });
 assert.doesNotThrow(() => recordSchedulerMarker("task-start-normal", 1, 1, 0, false, 0),
   "worldgen diagnostic marker exception escaped into scheduler work");
+assert.doesNotThrow(() => recordSchedulerTaskLabel("poisoned"),
+  "worldgen diagnostic task label exception escaped into scheduler work");
 delete globalThis.__gaiusWorldgenSchedulerMarker;
 delete globalThis.__gaiusSlowProbeTelemetryEnabled;
 
@@ -464,10 +497,16 @@ assert.equal(Object.keys(checkpointOnlyTelemetry)
 delete globalThis.__gaiusWorldgenStats;
 globalThis.__gaiusWorldgenSliceMillis = 16;
 globalThis.__gaiusWorldgenStats = undefined;
+globalThis.__gaiusSlowProbeTelemetryEnabled = true;
+delete globalThis.__gaiusWorldgenSchedulerMarker;
+recordSchedulerTaskLabel("MinecraftServer.pollTask");
+recordSchedulerMarker("task-start-normal", 1, 1, 0, false, 0);
 for (let elapsed = 1; elapsed <= 100; elapsed++) {
   reportSlice(0, false, 4, 0, elapsed, 16, 8, Math.max(0, elapsed - 16), 1,
     0, 0, 0, constants.maxNetworkWait, 4, 1);
 }
+recordSchedulerTaskLabel("ChunkGenerationTask.runUntilWait");
+recordSchedulerMarker("task-start-nested", 0, 1, 0, false, 100);
 reportSlice(1, true, 2, 2, 500, 4, 2, 496, 500, 12, 0, 1,
   constants.maxNetworkWait, 2, 1);
 const telemetry = globalThis.__gaiusWorldgenStats;
@@ -491,12 +530,29 @@ assert.equal(telemetry.maxTurnPulses, 4, "worldgen turn maximum was not recorded
 assert.equal(telemetry.minimumBudgetMillis, 2, "adaptive budget floor was not recorded");
 assert.equal(telemetry.maxReentrantYieldDepth, 1,
   "worldgen reentrant continuation depth was not recorded");
+const maximumSliceContextText =
+  globalThis.__gaiusWorldgenSchedulerMarker.maxSliceContext;
+const maximumSliceContext = JSON.parse(maximumSliceContextText);
+assert.equal(maximumSliceContext.reason, "network",
+  "maximum slice context lost its yield reason");
+assert.equal(maximumSliceContext.taskScopeId, 1,
+  "maximum slice context lost its task scope id");
+assert.equal(maximumSliceContext.taskLabel, "ChunkGenerationTask.runUntilWait",
+  "maximum slice context lost the nested task label");
+assert.equal(maximumSliceContext.sliceElapsedMillis, 500,
+  "maximum slice context lost the long slice duration");
+reportSlice(0, false, 1, 0, 10, 16, 8, 0, 1, 0, 0, 0,
+  constants.maxNetworkWait, 1, 0);
+assert.equal(globalThis.__gaiusWorldgenSchedulerMarker.maxSliceContext,
+  maximumSliceContextText, "a shorter later slice overwrote maximum context");
 assert.equal(Object.keys(telemetry).includes("__sliceHistogram"), false,
   "bounded percentile histogram leaks into scalar telemetry snapshots");
 assert.equal(Object.keys(telemetry).includes("__yieldDelayHistogram"), false,
   "bounded yield-delay histogram leaks into scalar telemetry snapshots");
 delete globalThis.__gaiusWorldgenStats;
 delete globalThis.__gaiusWorldgenSliceMillis;
+delete globalThis.__gaiusWorldgenSchedulerMarker;
+delete globalThis.__gaiusSlowProbeTelemetryEnabled;
 
 class DeterministicScheduler {
   constructor(configuredBudget = 16) {
