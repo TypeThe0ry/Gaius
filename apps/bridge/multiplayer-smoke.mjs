@@ -986,6 +986,156 @@ async function testFramedPlayKeepAlive(bridgePort, fixturePort) {
     socket.send(splitClientFrames.subarray(0, 4));
     socket.send(splitClientFrames.subarray(4));
     await waitFor(() => proxiedPlayTicks >= 1, "synthetic initial play tick");
+    // Regression: one upstream TCP write can contain several complete framed
+    // packets. Pause the browser reader so RelayNode's WebSocket high-water
+    // guard must stop the parser inside that same data callback, then prove
+    // that the retained complete frames drain on a scheduled turn before TCP
+    // read resumes.
+    const serverBackpressureBefore = await fetchRelayRuntime(bridgePort, bridgeToken);
+    const backpressureChannel = Buffer.from("minecraft:brand", "utf8");
+    // Fill well below the 4 MiB high-water mark first, then write a separate
+    // tail large enough to cross it. The tail therefore starts on a frame
+    // boundary and must leave several complete frames retained when parsing
+    // pauses; this avoids accepting a partial-frame-only false positive.
+    const backpressurePrefixFrameCount = 256;
+    const backpressureTailFrameCount = 1024;
+    const backpressureFrameCount =
+        backpressurePrefixFrameCount + backpressureTailFrameCount;
+    const backpressurePayloadBytes = 8 * 1024;
+    const backpressureFrames = Array.from({ length: backpressureFrameCount }, (_, index) => encodePacket(
+        minecraftProfile.play.clientboundCustomPayload,
+        Buffer.concat([
+            Buffer.from([backpressureChannel.byteLength]),
+            backpressureChannel,
+            patternedBuffer(
+                backpressurePayloadBytes - 1 - backpressureChannel.byteLength,
+                0x71 + index,
+            ),
+        ]),
+    ));
+    const backpressureBurst = Buffer.concat(backpressureFrames);
+    const backpressurePrefixBurst = Buffer.concat(
+        backpressureFrames.slice(0, backpressurePrefixFrameCount));
+    const backpressureTailBurst = Buffer.concat(
+        backpressureFrames.slice(backpressurePrefixFrameCount));
+    const backpressureExpectedHash = createHash("sha256")
+        .update(backpressureBurst)
+        .digest("hex");
+    const serverFramesBeforeBackpressure = serverFrames.length;
+    const pausedReader = socket._socket;
+    if (pausedReader === undefined || typeof pausedReader.pause !== "function" ||
+        typeof pausedReader.resume !== "function") {
+        throw new Error("WebSocket smoke transport did not expose a pausable reader");
+    }
+    pausedReader.pause();
+    try {
+        fixtureSocket.write(backpressurePrefixBurst);
+        const prefixRuntime = await waitForRelayRuntime(
+            bridgePort,
+            bridgeToken,
+            (runtime) =>
+                (runtime.serverFramePauses ?? 0) ===
+                    (serverBackpressureBefore.serverFramePauses ?? 0) &&
+                (runtime.serverFrameBufferedBytes ??
+                    runtime.serverFrameBackpressure?.bufferedFrameBytes ?? 0) === 0 &&
+                (runtime.serverFramesSent ?? 0) -
+                    (serverBackpressureBefore.serverFramesSent ?? 0) ===
+                    backpressurePrefixFrameCount,
+            "server framed WebSocket below-water prefix",
+        );
+        fixtureSocket.write(backpressureTailBurst);
+        const pausedRuntime = await waitForRelayRuntime(
+            bridgePort,
+            bridgeToken,
+            (runtime) =>
+                (runtime.serverFramePauses ?? 0) >
+                    (serverBackpressureBefore.serverFramePauses ?? 0) &&
+                (runtime.serverFrameBufferedBytes ??
+                    runtime.serverFrameBackpressure?.bufferedFrameBytes ?? 0) > 0 &&
+                (runtime.serverFrameBufferedCompleteFrames ?? 0) > 0 &&
+                (runtime.serverFramesSent ?? 0) -
+                    (serverBackpressureBefore.serverFramesSent ?? 0) < backpressureFrameCount &&
+                (runtime.serverFrameDataCallbacks ?? 0) ===
+                    (runtime.serverFrameDataCallbacksAtPause ?? -1) &&
+                (runtime.serverFrameDataCallbacksAtPause ?? 0) >
+                    (prefixRuntime.serverFrameDataCallbacks ?? 0),
+            "server framed WebSocket high-water pause",
+        );
+        if ((pausedRuntime.serverFramesAfterPause ?? 0) !==
+                (serverBackpressureBefore.serverFramesAfterPause ?? 0) ||
+            (pausedRuntime.serverFrameBufferedCompleteFrames ?? 0) <= 0 ||
+            (pausedRuntime.serverFrameDataCallbacks ?? 0) !==
+                (pausedRuntime.serverFrameDataCallbacksAtPause ?? -1) ||
+            (pausedRuntime.serverFrameDataCallbacksAtPause ?? 0) <=
+                (prefixRuntime.serverFrameDataCallbacks ?? 0)) {
+            throw new Error(
+                "RelayNode parser advanced after TCP pause or retained no complete framed packet",
+            );
+        }
+    }
+    finally {
+        pausedReader.resume();
+    }
+    const drainedServerRuntime = await waitForRelayRuntime(
+        bridgePort,
+        bridgeToken,
+        (runtime) =>
+            (runtime.serverFrameResumes ?? 0) >
+                (serverBackpressureBefore.serverFrameResumes ?? 0) &&
+            (runtime.serverFrameBufferedBytes ??
+                runtime.serverFrameBackpressure?.bufferedFrameBytes ?? 0) === 0 &&
+            (runtime.serverFramesSent ?? 0) -
+                (serverBackpressureBefore.serverFramesSent ?? 0) === backpressureFrameCount &&
+            (runtime.serverFrameScheduledDrains ?? 0) >
+                (serverBackpressureBefore.serverFrameScheduledDrains ?? 0) &&
+            (runtime.serverFrameDrainCompletions ?? 0) >
+                (serverBackpressureBefore.serverFrameDrainCompletions ?? 0) &&
+            (runtime.serverFrameBufferedCompleteFrames ?? 0) === 0 &&
+            (runtime.serverFrameDataCallbacksAtDrainStart ?? -1) ===
+                (runtime.serverFrameDataCallbacksAtPause ?? -2) &&
+            (runtime.serverFrameDataCallbacksAtDrainCompletion ?? -1) ===
+                (runtime.serverFrameDataCallbacksAtPause ?? -2),
+        "server framed WebSocket low-water drain",
+    );
+    await waitFor(
+        () => serverFrames.length >= serverFramesBeforeBackpressure + backpressureFrameCount,
+        "server framed WebSocket messages after low-water drain",
+    );
+    const drainedServerFrames = serverFrames.slice(serverFramesBeforeBackpressure);
+    if (drainedServerFrames.length !== backpressureFrameCount ||
+        !Buffer.concat(drainedServerFrames).equals(backpressureBurst)) {
+        throw new Error(`RelayNode did not preserve framed server bytes across backpressure: ` +
+            `frames=${drainedServerFrames.length}/${backpressureFrameCount} ` +
+            `bytes=${Buffer.concat(drainedServerFrames).byteLength}/${backpressureBurst.byteLength}`);
+    }
+    const drainedServerHash = createHash("sha256")
+        .update(Buffer.concat(drainedServerFrames))
+        .digest("hex");
+    if (drainedServerHash !== backpressureExpectedHash ||
+        (drainedServerRuntime.serverFrameBytesSent ?? 0) -
+            (serverBackpressureBefore.serverFrameBytesSent ?? 0) !== backpressureBurst.byteLength ||
+        (drainedServerRuntime.serverFrameScheduledDrains ?? 0) <=
+            (serverBackpressureBefore.serverFrameScheduledDrains ?? 0) ||
+        (drainedServerRuntime.serverFrameDataCallbacksAtDrainStart ?? -1) !==
+            (drainedServerRuntime.serverFrameDataCallbacksAtPause ?? -2) ||
+        (drainedServerRuntime.serverFrameDataCallbacksAtDrainCompletion ?? -1) !==
+            (drainedServerRuntime.serverFrameDataCallbacksAtPause ?? -2) ||
+        (drainedServerRuntime.serverFrameBufferedCompleteFrames ?? 0) !== 0 ||
+        (drainedServerRuntime.serverFramesAfterPause ?? 0) !==
+            (serverBackpressureBefore.serverFramesAfterPause ?? 0) ||
+        (drainedServerRuntime.serverFrameSendErrors ?? 0) !==
+            (serverBackpressureBefore.serverFrameSendErrors ?? 0) ||
+        (drainedServerRuntime.serverFrameCleanupBytes ?? 0) !==
+            (serverBackpressureBefore.serverFrameCleanupBytes ?? 0) ||
+        (drainedServerRuntime.serverFrameBufferedUnderflows ?? 0) !==
+            (serverBackpressureBefore.serverFrameBufferedUnderflows ?? 0) ||
+        (drainedServerRuntime.activeServerFrameDrainHandleUnderflows ?? 0) !==
+            (serverBackpressureBefore.activeServerFrameDrainHandleUnderflows ?? 0) ||
+        (drainedServerRuntime.serverFrameMaxBufferedAmount ?? 0) <= 0 ||
+        (drainedServerRuntime.serverFrameMaxBufferedBytes ??
+            drainedServerRuntime.serverFrameBackpressure?.maxBufferedFrameBytes ?? 0) <= 0) {
+        throw new Error("RelayNode server framed backpressure telemetry or SHA mismatch");
+    }
     // Pause the backend reader and fill RelayNode's TCP write queue with one
     // legal, bounded PLAY custom-payload frame. This makes write() return
     // false deterministically instead of relying on a timing-only pause.
@@ -1115,8 +1265,16 @@ async function testFramedPlayKeepAlive(bridgePort, fixturePort) {
     await waitForRelayRuntime(
             bridgePort,
             bridgeToken,
-            (runtime) => (runtime.activeClientStallTimers ?? 0) === 0 &&
-                (runtime.pendingSyntheticPlayTicks ?? 0) === 0,
+        (runtime) => (runtime.activeClientStallTimers ?? 0) === 0 &&
+                (runtime.pendingSyntheticPlayTicks ?? 0) === 0 &&
+            (runtime.serverFrameBufferedBytes ??
+                    runtime.serverFrameBackpressure?.bufferedFrameBytes ?? 0) === 0 &&
+                (runtime.serverFrameBufferedCompleteFrames ?? 0) === 0 &&
+                (runtime.serverFrameCleanupBytes ?? 0) ===
+                    (serverBackpressureBefore.serverFrameCleanupBytes ?? 0) &&
+                (runtime.serverFrameBufferedUnderflows ?? 0) ===
+                    (serverBackpressureBefore.serverFrameBufferedUnderflows ?? 0) &&
+                (runtime.activeServerFrameDrainHandles ?? 0) === 0,
             "closed PLAY stall state",
     );
 }
