@@ -330,10 +330,39 @@ public final class BrowserIntegratedServerMain {
 
     /** Keeps player input moving while the server thread waits on asynchronous chunk futures. */
     public static void pumpUrgentPacketsIfPending() {
-        if (isWorkerRuntime() && (BrowserWebSocketChannel.hasPendingInput()
-                || BrowserPacketScheduler.hasPendingPackets())) {
+        MinecraftServer current = server;
+        if (!isWorkerRuntime() || current == null
+                || !bindServerThreadFromServerLoop(current)) {
+            return;
+        }
+        if (BrowserWebSocketChannel.hasPendingInput()
+                || BrowserPacketScheduler.hasPendingPackets()) {
             pumpUrgentPackets();
         }
+    }
+
+    /**
+     * {@code MinecraftServer.pollTask} is a patched server-loop boundary. TeaVM can resume the
+     * helper coroutine with a Java {@link Thread} object that is not the one which actually runs
+     * that boundary, so the constructor-provided thread is not a reliable execution identity.
+     * Only this server-loop callback is allowed to refresh the binding; JavaScript wakeups and
+     * the queued input task must never adopt their own helper thread.
+     */
+    private static boolean bindServerThreadFromServerLoop(MinecraftServer current) {
+        if (current != server || serverThreadExited || !current.isRunning()) {
+            return false;
+        }
+        Thread actualServerThread = Thread.currentThread();
+        if (actualServerThread == null) {
+            return false;
+        }
+        if (serverThread != actualServerThread) {
+            serverThread = actualServerThread;
+            reportRuntimeEvent(
+                    "network-pump-server-thread-bound",
+                    "bound from MinecraftServer.pollTask");
+        }
+        return true;
     }
 
     /** Wakes the parked server thread without executing packet handlers from JavaScript. */
@@ -411,6 +440,7 @@ public final class BrowserIntegratedServerMain {
             recordNetworkPumpState(5, false);
         }
         if (!pumped) {
+            retryNetworkInputAfterTaskFailure();
             return;
         }
         boolean inputPending = hasPendingNetworkInput();
@@ -433,6 +463,37 @@ public final class BrowserIntegratedServerMain {
         }
         networkInputFollowupsRemaining--;
         scheduleNetworkInputTask(true, false);
+    }
+
+    /**
+     * A TickTask can be resumed by a stale TeaVM continuation before the server-loop binding has
+     * been refreshed. The old path cleared the task permit and returned, silently leaving the
+     * browser input queue behind. Keep the pending signal, then use the existing bounded delayed
+     * retry path. The retry resumes the same continuation and never starts a Java helper thread.
+     */
+    private static void retryNetworkInputAfterTaskFailure() {
+        boolean inputPending = hasPendingNetworkInput();
+        recordNetworkInputPending(inputPending);
+        if (!inputPending) {
+            finishNetworkInputBurst();
+            return;
+        }
+        MinecraftServer current = server;
+        if (current == null || serverThread == null || serverThreadExited
+                || !current.isRunning()) {
+            finishNetworkInputBurst();
+            recordNetworkPumpState(7, false);
+            reportRuntimeEvent(
+                    "network-pump-lifecycle-drop",
+                    "Pending input remained after the integrated server stopped");
+            return;
+        }
+        if (!networkInputBurstActive) {
+            networkInputBurstActive = true;
+            networkInputFollowupsRemaining = 0;
+            networkInputDeferredRetriesRemaining = MAX_NETWORK_INPUT_DEFERRED_RETRIES;
+        }
+        deferNetworkInputRetry();
     }
 
     private static void deferNetworkInputRetry() {

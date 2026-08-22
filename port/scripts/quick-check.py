@@ -6165,13 +6165,25 @@ def check_source_patches() -> None:
         (
             "Client and integrated server pump idle browser packets before each tick",
             client_patcher.count("browserPackets.add(pumpBrowserChannels())") == 2
-            and 'method.name.equals("processPacketsAndTick")' in client_patcher
+                and 'method.name.equals("processPacketsAndTick")' in client_patcher
             and "patchedRunServerTickYield" in client_patcher
             and "method.instructions.insert(instruction, browserWorldgenCheckpoint())"
                 in client_patcher
             and "method.instructions.insert(browserPackets)" in client_patcher
             and '"io/netty/channel/browser/BrowserWebSocketChannel"' in client_patcher
             and '"pumpAll"' in client_patcher,
+        ),
+        (
+            "Worker input wakeup retains wrong-thread pending work",
+            "bindServerThreadFromServerLoop" in browser_integrated_server_main
+            and "retryNetworkInputAfterTaskFailure" in browser_integrated_server_main
+            and "network-pump-lifecycle-drop" in browser_integrated_server_main
+            and "wrongThreadRetriesBounded: true" in singleplayer_network_wakeup_smoke
+            and "wrongThreadExactlyOnceServerRun: true"
+                in singleplayer_network_wakeup_smoke
+            and "wrongThreadFailClosed: true" in singleplayer_network_wakeup_smoke
+            and "Pending input remained after the integrated server stopped"
+                in singleplayer_network_wakeup_smoke,
         ),
         (
             "Worker singleplayer block breaking follows wall time and validated client STOP",

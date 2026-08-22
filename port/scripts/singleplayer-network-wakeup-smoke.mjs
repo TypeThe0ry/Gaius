@@ -21,6 +21,13 @@ assert.ok(signalStart >= 0 && scheduleStart > signalStart && runStart > schedule
 const signal = source.slice(signalStart, scheduleStart);
 const schedule = source.slice(scheduleStart, runStart);
 const run = source.slice(runStart, nextMethod);
+const pendingPumpStart = source.indexOf("public static void pumpUrgentPacketsIfPending()");
+const pendingPumpEnd = source.indexOf(
+  "/** Wakes the parked server thread",
+  pendingPumpStart,
+);
+const pendingPump = source.slice(pendingPumpStart, pendingPumpEnd);
+assert.ok(pendingPumpStart >= 0 && pendingPumpEnd > pendingPumpStart);
 assert.match(source, /MAX_NETWORK_INPUT_FOLLOWUPS = 4;/);
 assert.match(source, /MAX_NETWORK_INPUT_DEFERRED_RETRIES = 4;/);
 assert.match(source,
@@ -48,9 +55,18 @@ assert.ok(
   schedule.indexOf("LockSupport.unpark(currentServerThread)") < enqueue,
   "a coalesced signal must refresh the queued task's wake permit",
 );
+assert.match(source, /bindServerThreadFromServerLoop/);
+assert.match(source, /bound from MinecraftServer\.pollTask/);
+assert.ok(
+  pendingPump.indexOf("bindServerThreadFromServerLoop") <
+    pendingPump.indexOf("BrowserWebSocketChannel.hasPendingInput"),
+  "the server-loop thread binding must happen before pending input is drained",
+);
 assert.match(run, /pumped = drainUrgentPackets\(\);/);
 assert.match(run, /network-pump-wrong-thread/);
 assert.match(run, /finally\s*\{\s*NETWORK_INPUT_TASK_SCHEDULED\.set\(false\);/s);
+assert.match(run, /retryNetworkInputAfterTaskFailure\(\);/);
+assert.match(run, /Pending input remained after the integrated server stopped/);
 assert.match(run, /networkInputFollowupsRemaining <= 0/);
 assert.match(run, /networkInputFollowupsRemaining--;/);
 assert.match(run, /scheduleNetworkInputTask\(true, false\);/);
@@ -59,6 +75,7 @@ assert.match(run, /TModernRuntimeSupport\.yieldToEventLoop\(delayMillis\);/);
 assert.match(run, /scheduleNetworkInputTask\(false, false\);/);
 assert.match(run, /network-pump-retry-exhausted/);
 assert.doesNotMatch(run, /signalIntegratedServerNetworkInput\(\);/);
+assert.doesNotMatch(run, /new Thread|setTimeout\(|setInterval\(/);
 assert.match(source, /integratedServerTaskBudgetExhaustions/);
 assert.match(source, /integratedServerTaskWrongThread/);
 assert.match(source, /var field = '';/,
@@ -77,6 +94,8 @@ let coalesced = 0;
 let followups = 0;
 let runs = 0;
 let wrongThread = 0;
+let serverThreadRuns = 0;
+let pendingInput = false;
 let lifecycleDrops = 0;
 let budgetExhaustions = 0;
 let deferredRetries = 0;
@@ -109,6 +128,7 @@ const scheduleModel = (followup, externalSignal) => {
 };
 const signalModel = () => {
   signals++;
+  pendingInput = true;
   return scheduleModel(false, true);
 };
 const finishBurstModel = () => {
@@ -125,8 +145,27 @@ const runModel = ({
   runs++;
   if (!pumpSucceeded) {
     wrongThread++;
+    if (!pendingInput) {
+      finishBurstModel();
+      return;
+    }
+    if (!burstActive) {
+      burstActive = true;
+      followupsRemaining = 0;
+      deferredRetriesRemaining = 4;
+    }
+    if (deferredRetriesRemaining <= 0) {
+      retryExhaustions++;
+      finishBurstModel();
+      return;
+    }
+    deferredRetriesRemaining--;
+    deferredRetries++;
+    if (resumeDeferred) scheduleModel(false, false);
     return;
   }
+  serverThreadRuns++;
+  pendingInput = pendingAfterPump;
   if (!pendingAfterPump) {
     finishBurstModel();
     return;
@@ -204,9 +243,32 @@ assert.equal(retryExhaustions - retryExhaustionsBeforeStuckBacklog, 1,
 assert.equal(scheduled, false);
 
 signalModel();
+const serverThreadRunsBeforeWrongThread = serverThreadRuns;
 runModel({pendingAfterPump: true, pumpSucceeded: false});
 assert.equal(wrongThread, 1);
-assert.equal(scheduled, false, "wrong-thread execution must not schedule a retry");
+assert.equal(scheduled, true, "wrong-thread execution must retain a bounded retry");
+assert.equal(pendingInput, true, "wrong-thread execution must retain queued input");
+runModel({pendingAfterPump: false});
+assert.equal(serverThreadRuns - serverThreadRunsBeforeWrongThread, 1,
+  "a wrong-thread task must be followed by exactly one server-thread execution");
+assert.equal(scheduled, false);
+assert.equal(pendingInput, false);
+assert.equal(deferredRetriesRemaining, 0,
+  "successful recovery must clear delayed retry state");
+
+const wrongThreadRetryExhaustionsBefore = retryExhaustions;
+signalModel();
+for (let index = 0; index < 5; index++) {
+  runModel({pendingAfterPump: true, pumpSucceeded: false});
+}
+assert.equal(retryExhaustions - wrongThreadRetryExhaustionsBefore, 1,
+  "a permanently wrong-thread task must fail closed after bounded retries");
+assert.equal(scheduled, false);
+assert.equal(burstActive, false);
+assert.equal(deferredRetriesRemaining, 0,
+  "wrong-thread exhaustion must clear delayed retry state");
+assert.equal(pendingInput, true,
+  "wrong-thread exhaustion must leave the physical input backlog observable");
 
 active = false;
 signalModel();
@@ -236,6 +298,8 @@ console.log(JSON.stringify({
   followups,
   runs,
   boundedFollowupDrain: true,
-  wrongThreadStopsRetry: true,
+  wrongThreadRetriesBounded: true,
+  wrongThreadExactlyOnceServerRun: true,
+  wrongThreadFailClosed: true,
   lifecycleGuard: true,
 }));
