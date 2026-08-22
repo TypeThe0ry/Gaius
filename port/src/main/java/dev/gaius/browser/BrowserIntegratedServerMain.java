@@ -37,6 +37,9 @@ public final class BrowserIntegratedServerMain {
     private static int configuredSimulationDistance = 4;
     private static int activeViewDistance = INITIAL_VIEW_DISTANCE;
     private static int activeSimulationDistance = INITIAL_SIMULATION_DISTANCE;
+    private static PlayerList appliedDistancePlayerList;
+    private static int appliedViewDistance = Integer.MIN_VALUE;
+    private static int appliedSimulationDistance = Integer.MIN_VALUE;
     private static boolean configuredDistancesActive;
     private static boolean distanceAdvancePending;
     private static long nextDistanceAdvanceAtMillis;
@@ -120,6 +123,9 @@ public final class BrowserIntegratedServerMain {
         configuredSimulationDistance = clampDistance(workerSimulationDistance(), 4);
         activeViewDistance = INITIAL_VIEW_DISTANCE;
         activeSimulationDistance = INITIAL_SIMULATION_DISTANCE;
+        appliedDistancePlayerList = null;
+        appliedViewDistance = Integer.MIN_VALUE;
+        appliedSimulationDistance = Integer.MIN_VALUE;
         configuredDistancesActive = false;
         distanceAdvancePending = false;
         nextDistanceAdvanceAtMillis = 0L;
@@ -174,14 +180,52 @@ public final class BrowserIntegratedServerMain {
     private static void applyActiveDistances() {
         MinecraftServer current = server;
         if (current != null && current.getPlayerList() != null) {
+            PlayerList playerList = current.getPlayerList();
+            if (playerList != appliedDistancePlayerList) {
+                appliedDistancePlayerList = playerList;
+                appliedViewDistance = Integer.MIN_VALUE;
+                appliedSimulationDistance = Integer.MIN_VALUE;
+            }
             int view = configuredDistancesActive
                     ? activeViewDistance
                     : INITIAL_VIEW_DISTANCE;
             int simulation = configuredDistancesActive
                     ? activeSimulationDistance
                     : INITIAL_SIMULATION_DISTANCE;
-            current.getPlayerList().setViewDistance(view);
-            current.getPlayerList().setSimulationDistance(simulation);
+            // Both supported vanilla PlayerList implementations rebroadcast and
+            // traverse every ServerLevel even when the requested value is unchanged.
+            // Worker bootstrap, profile sync, and chunk acknowledgements can all
+            // converge on the same staged pair, so keep those idempotent calls out
+            // of the single Worker event loop.
+            if (appliedViewDistance != view || playerList.getViewDistance() != view) {
+                boolean recordDuration = distanceApplyTelemetryEnabled();
+                double startedAt = recordDuration ? distanceApplyNowMillis() : 0.0;
+                try {
+                    playerList.setViewDistance(view);
+                    appliedViewDistance = view;
+                } finally {
+                    if (recordDuration) {
+                        recordDistanceApplyDuration(
+                                0,
+                                Math.max(0.0, distanceApplyNowMillis() - startedAt));
+                    }
+                }
+            }
+            if (appliedSimulationDistance != simulation
+                    || playerList.getSimulationDistance() != simulation) {
+                boolean recordDuration = distanceApplyTelemetryEnabled();
+                double startedAt = recordDuration ? distanceApplyNowMillis() : 0.0;
+                try {
+                    playerList.setSimulationDistance(simulation);
+                    appliedSimulationDistance = simulation;
+                } finally {
+                    if (recordDuration) {
+                        recordDistanceApplyDuration(
+                                1,
+                                Math.max(0.0, distanceApplyNowMillis() - startedAt));
+                    }
+                }
+            }
             if (configuredDistancesActive) {
                 String event = view == configuredViewDistance
                                 && simulation == configuredSimulationDistance
@@ -623,6 +667,32 @@ public final class BrowserIntegratedServerMain {
             """)
     private static native void recordNetworkInputPending(boolean pending);
 
+    @JSBody(script = "return globalThis.__gaiusSlowProbeTelemetryEnabled === true;")
+    private static native boolean distanceApplyTelemetryEnabled();
+
+    @JSBody(script = """
+            return typeof performance !== 'undefined' && performance.now
+              ? performance.now()
+              : Date.now();
+            """)
+    private static native double distanceApplyNowMillis();
+
+    @JSBody(params = {"kind", "durationMillis"}, script = """
+            try {
+              if (globalThis.__gaiusSlowProbeTelemetryEnabled !== true) return;
+              const stats = globalThis.__gaiusNetworkStats;
+              if (!stats) return;
+              const field = (kind | 0) === 0
+                ? 'integratedServerDistanceMaxViewApplyMillis'
+                : 'integratedServerDistanceMaxSimulationApplyMillis';
+              const duration = Math.max(0, Number(durationMillis) || 0);
+              stats[field] = Math.max(Number(stats[field]) || 0, duration);
+            } catch (ignored) {
+              // Diagnostic telemetry is fail-open.
+            }
+            """)
+    private static native void recordDistanceApplyDuration(int kind, double durationMillis);
+
     /** Vanilla's minimum of two forces 25 chunks before a browser player can enter. */
     public static int minimumServerViewDistance() {
         return isWorkerRuntime() ? INITIAL_VIEW_DISTANCE : 2;
@@ -696,6 +766,9 @@ public final class BrowserIntegratedServerMain {
         if (server == minecraftServer) {
             serverThreadExited = true;
             serverThread = null;
+            appliedDistancePlayerList = null;
+            appliedViewDistance = Integer.MIN_VALUE;
+            appliedSimulationDistance = Integer.MIN_VALUE;
             finishNetworkInputBurst();
             NETWORK_INPUT_TASK_SCHEDULED.set(false);
             recordNetworkPumpState(-1, false);

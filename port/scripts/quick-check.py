@@ -3990,6 +3990,9 @@ def check_source_patches() -> None:
             and "setIntegratedServerDistances" in browser_integrated_server_main
             and "setViewDistance(view)" in browser_integrated_server_main
             and "setSimulationDistance(simulation)" in browser_integrated_server_main
+            and "appliedDistancePlayerList" in browser_integrated_server_main
+            and "appliedViewDistance != view" in browser_integrated_server_main
+            and "appliedSimulationDistance != simulation" in browser_integrated_server_main
             and "public static void configurePlayerList" in browser_integrated_server_main
             and "setAllowCommandsForAllPlayers(true)" in browser_integrated_server_main
             and "DedicatedServer player list configuration point was not found" in client_patcher

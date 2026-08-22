@@ -137,6 +137,71 @@ assert.ok(worldgen.includes("decodedPacketQueue") && worldgen.includes("inboundQ
 assert.ok(!worldgen.includes("new Thread") && !worldgen.includes("Executor")
     && !worldgen.includes("CompletableFuture"),
   "worldgen scheduler introduces parallel server-state execution");
+assert.ok(server.includes("private static PlayerList appliedDistancePlayerList")
+    && server.includes("private static int appliedViewDistance = Integer.MIN_VALUE")
+    && server.includes("private static int appliedSimulationDistance = Integer.MIN_VALUE")
+    && server.includes("if (playerList != appliedDistancePlayerList)")
+    && server.includes("if (appliedViewDistance != view || playerList.getViewDistance() != view)")
+    && server.includes("if (appliedSimulationDistance != simulation")
+    && server.includes("playerList.getSimulationDistance() != simulation)")
+    && server.includes("distanceApplyTelemetryEnabled()")
+    && server.includes("integratedServerDistanceMaxViewApplyMillis")
+    && server.includes("integratedServerDistanceMaxSimulationApplyMillis")
+    && server.includes("Diagnostic telemetry is fail-open"),
+  "integrated server repeats unchanged PlayerList distance traversals");
+const distanceApplyStart = server.indexOf("private static void applyActiveDistances()");
+const distanceApplyEnd = server.indexOf("public static void recordChunkBatchSent", distanceApplyStart);
+const distanceApplySource = server.slice(distanceApplyStart, distanceApplyEnd);
+assert.ok(distanceApplyStart >= 0 && distanceApplyEnd > distanceApplyStart
+    && distanceApplySource.indexOf("playerList.setViewDistance(view)")
+      < distanceApplySource.indexOf("appliedViewDistance = view")
+    && distanceApplySource.indexOf("playerList.setSimulationDistance(simulation)")
+      < distanceApplySource.indexOf("appliedSimulationDistance = simulation"),
+  "distance setter cache commits before the vanilla setter succeeds");
+
+// Behavioural policy model for the source contract above. It covers the four
+// regressions that matter without constructing Minecraft's concrete PlayerList.
+const distanceCache = {
+  owner: null,
+  view: Number.MIN_SAFE_INTEGER,
+  simulation: Number.MIN_SAFE_INTEGER,
+};
+const distanceCalls = {view: 0, simulation: 0};
+function applyDistanceModel(owner, view, simulation, failSimulation = false) {
+  if (owner !== distanceCache.owner) {
+    distanceCache.owner = owner;
+    distanceCache.view = Number.MIN_SAFE_INTEGER;
+    distanceCache.simulation = Number.MIN_SAFE_INTEGER;
+  }
+  if (distanceCache.view !== view || owner.view !== view) {
+    distanceCalls.view++;
+    owner.view = view;
+    distanceCache.view = view;
+  }
+  if (distanceCache.simulation !== simulation || owner.simulation !== simulation) {
+    distanceCalls.simulation++;
+    if (failSimulation) throw new Error("simulated setter failure");
+    owner.simulation = simulation;
+    distanceCache.simulation = simulation;
+  }
+}
+const firstPlayerList = {view: 10, simulation: 10};
+applyDistanceModel(firstPlayerList, 1, 1);
+applyDistanceModel(firstPlayerList, 1, 1);
+assert.deepEqual(distanceCalls, {view: 1, simulation: 1},
+  "same PlayerList and distance pair was not idempotent");
+firstPlayerList.view = 7;
+applyDistanceModel(firstPlayerList, 1, 1);
+assert.equal(distanceCalls.view, 2, "external view-distance mutation was not repaired");
+assert.throws(() => applyDistanceModel(firstPlayerList, 1, 2, true),
+  /simulated setter failure/);
+applyDistanceModel(firstPlayerList, 1, 2);
+assert.equal(distanceCalls.simulation, 3,
+  "failed simulation setter was cached instead of retried");
+const replacementPlayerList = {view: 1, simulation: 2};
+applyDistanceModel(replacementPlayerList, 1, 2);
+assert.deepEqual(distanceCalls, {view: 3, simulation: 4},
+  "replacement PlayerList did not invalidate both cached distances");
 assert.ok(!worldgen.includes("setTimeout(") && !worldgen.includes("setInterval("),
   "worldgen scheduler owns a timer that can leak after shutdown");
 assert.ok(worldgen.includes("recordSchedulerMarker(")

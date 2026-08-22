@@ -59,6 +59,9 @@ const WORLDGEN_SLOW_SAMPLE_FIELDS = Object.freeze([
   "chunkBroadcastBatches",
 ]);
 const NETWORK_SLOW_SAMPLE_FIELDS = Object.freeze([
+  // This direct Worker snapshot is raw. Telemetry-pong measurement windows
+  // baseline-difference counters such as eventLoopGapsOver500 separately;
+  // neither value is used as the independent 250 ms slow-probe trigger.
   "inboundQueuedBytes",
   "decodedPacketQueue",
   "decodedSliceBacklog",
@@ -88,6 +91,8 @@ const NETWORK_SLOW_SAMPLE_FIELDS = Object.freeze([
   "integratedServerTaskBudgetExhaustions",
   "integratedServerTaskDeferredRetries",
   "integratedServerTaskRetryExhaustions",
+  "integratedServerDistanceMaxViewApplyMillis",
+  "integratedServerDistanceMaxSimulationApplyMillis",
   "errors",
 ]);
 const STORAGE_SLOW_SAMPLE_FIELDS = Object.freeze([
@@ -1224,7 +1229,12 @@ function runSlowProbeSelfSmoke() {
         checkpointYields: 1,
         forbidden: 1,
       },
-      network: {inboundQueuedBytes: 2, forbidden: 1},
+      network: {
+        inboundQueuedBytes: 2,
+        integratedServerDistanceMaxViewApplyMillis: 6238,
+        integratedServerDistanceMaxSimulationApplyMillis: 565,
+        forbidden: 1,
+      },
       storage: {backend: "opfs", pendingEntries: 2, opfsFlushes: 3, forbidden: 1},
       scheduler: {
         activeTaskScope: true,
@@ -1246,6 +1256,8 @@ function runSlowProbeSelfSmoke() {
   }
   if (sample.worldgen.totalSliceElapsedMillis !== 198.5 ||
       sample.worldgen.deadlineYields !== 4 || sample.worldgen.checkpointYields !== 1 ||
+      sample.network?.integratedServerDistanceMaxViewApplyMillis !== 6238 ||
+      sample.network?.integratedServerDistanceMaxSimulationApplyMillis !== 565 ||
       sample.storage?.opfsFlushes !== 3 || sample.storage?.forbidden !== undefined ||
       sample.storage?.backend !== "opfs" || sample.storage?.pendingEntries !== 2 ||
       sample.scheduler?.activeTaskScope !== true ||
