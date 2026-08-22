@@ -86,6 +86,10 @@ async function runSmoke() {
     let relayOutput = "";
     let relayPort;
     let browserRuntime;
+    let relayRuntimeBaseline;
+    let relayRuntimeAtChunks;
+    let relayRuntimeAfterSoak;
+    let relayRuntimeAfterClose;
     let failure;
     let serverSpawnError;
     let relaySpawnError;
@@ -165,6 +169,7 @@ try {
         !relayOutput.includes("Gaius translator node listening")) {
         throw new Error("RelayNode failed to start:\n" + relayOutput);
     }
+    relayRuntimeBaseline = await fetchRelayRuntime(relayPort);
 
     browserRuntime = await createBrowserRuntime(relayPort, relayToken);
     const clients = Array.from({ length: clientCount }, (_, index) =>
@@ -190,9 +195,11 @@ try {
             "browser Relay Minecraft PLAY/chunk", 90000,
             () => JSON.stringify(clients.map((client) => client.diagnostics())));
         for (const client of clients) client.checkError();
+        relayRuntimeAtChunks = await fetchRelayRuntime(relayPort);
         if (soakMs > 0) {
             await delay(soakMs);
         }
+        relayRuntimeAfterSoak = await fetchRelayRuntime(relayPort);
     }
     finally {
         clearInterval(pollTimer);
@@ -210,6 +217,13 @@ try {
             // Preserve the primary protocol failure. Successful runs assert every
             // cleanup counter below with a more specific lifecycle error.
         });
+        relayRuntimeAfterClose = await waitForRelayRuntime(
+            relayPort,
+            (snapshot) => snapshot.activeConnections === 0 &&
+                snapshot.runtime.activeClientStallTimers === 0,
+            "RelayNode tunnel/timer cleanup",
+            5000,
+        ).catch(() => undefined);
     }
 
     const phases = clients.flatMap((client) => client.connectPhases);
@@ -243,6 +257,18 @@ try {
         "browser transport retained inbound bytes after multiplayer cleanup");
     assert.equal(browserRuntime.stats.activeRelayTargetLeases, 0,
         "browser transport retained a RelayNode target lease after multiplayer cleanup");
+    assert.equal(relayRuntimeBaseline.activeConnections, 0,
+        "RelayNode baseline unexpectedly had active browser tunnels");
+    assert.equal(relayRuntimeAtChunks.activeConnections, clientCount,
+        "RelayNode did not report every active multiplayer tunnel at chunk readiness");
+    assert.equal(relayRuntimeAtChunks.runtime.activeClientStallTimers, 0,
+        "encrypted online-mode tunnels armed unnecessary RelayNode stall timers");
+    assert.equal(relayRuntimeAfterSoak.runtime.activeClientStallTimers, 0,
+        "encrypted online-mode soak armed unnecessary RelayNode stall timers");
+    assert.equal(relayRuntimeAfterClose?.activeConnections, 0,
+        "RelayNode retained an active tunnel after browser cleanup");
+    assert.equal(relayRuntimeAfterClose?.runtime?.activeClientStallTimers, 0,
+        "RelayNode retained a stall timer after browser cleanup");
 
     const result = {
         ok: true,
@@ -291,6 +317,18 @@ try {
         },
         clients: clients.map((client) => client.result()),
         relayPhases: phases,
+        relayRuntime: {
+            baseline: relayRuntimeBaseline,
+            atMinimumChunks: relayRuntimeAtChunks,
+            afterSoak: relayRuntimeAfterSoak,
+            afterClose: relayRuntimeAfterClose,
+            connectAndChunkDelta:
+                relayRuntimeDelta(relayRuntimeBaseline, relayRuntimeAtChunks),
+            soakDelta:
+                relayRuntimeDelta(relayRuntimeAtChunks, relayRuntimeAfterSoak),
+            totalDelta:
+                relayRuntimeDelta(relayRuntimeBaseline, relayRuntimeAfterSoak),
+        },
         performanceContract: browserFullPathPerformanceContract(),
         elapsedMillis: Number((performance.now() - smokeStartedAt).toFixed(1)),
     };
@@ -750,6 +788,66 @@ function browserFullPathPerformanceContract() {
             "first-chunk",
             `chunk-${minimumChunkPackets}`,
         ],
+    };
+}
+
+async function fetchRelayRuntime(port) {
+    const response = await fetch(`http://127.0.0.1:${port}/relay-node/v1`, {
+        headers: { origin },
+    });
+    if (!response.ok) {
+        throw new Error(`RelayNode runtime manifest returned ${response.status}`);
+    }
+    const manifest = await response.json();
+    if (!manifest?.capabilities?.includes("runtime-telemetry") ||
+        !Number.isSafeInteger(manifest.runtime?.activeClientStallTimers) ||
+        !Number.isSafeInteger(manifest.runtime?.rssBytes) ||
+        !Number.isSafeInteger(manifest.runtime?.cpuUserMicros) ||
+        !Number.isSafeInteger(manifest.runtime?.cpuSystemMicros)) {
+        throw new Error("RelayNode runtime manifest omitted bounded performance telemetry");
+    }
+    return {
+        activeConnections: manifest.activeConnections,
+        availableConnections: manifest.availableConnections,
+        runtime: manifest.runtime,
+    };
+}
+
+async function waitForRelayRuntime(port, predicate, label, timeoutMillis) {
+    const deadline = Date.now() + timeoutMillis;
+    let snapshot;
+    while (true) {
+        snapshot = await fetchRelayRuntime(port);
+        if (predicate(snapshot)) return snapshot;
+        if (Date.now() >= deadline) {
+            throw new Error(`Timed out waiting for ${label}: ${JSON.stringify(snapshot)}`);
+        }
+        await delay(20);
+    }
+}
+
+function relayRuntimeDelta(before, after) {
+    if (!before?.runtime || !after?.runtime) return null;
+    const elapsed = Math.max(0,
+        after.runtime.uptimeMillis - before.runtime.uptimeMillis);
+    const userMicros = Math.max(0,
+        after.runtime.cpuUserMicros - before.runtime.cpuUserMicros);
+    const systemMicros = Math.max(0,
+        after.runtime.cpuSystemMicros - before.runtime.cpuSystemMicros);
+    const cpuMicros = userMicros + systemMicros;
+    return {
+        elapsedMillis: elapsed,
+        cpuUserMicros: userMicros,
+        cpuSystemMicros: systemMicros,
+        cpuTotalMicros: cpuMicros,
+        cpuPercentOfOneCore: elapsed > 0
+            ? Number((cpuMicros / (elapsed * 10)).toFixed(3))
+            : null,
+        rssDeltaBytes: after.runtime.rssBytes - before.runtime.rssBytes,
+        heapUsedDeltaBytes:
+            after.runtime.heapUsedBytes - before.runtime.heapUsedBytes,
+        externalDeltaBytes:
+            after.runtime.externalBytes - before.runtime.externalBytes,
     };
 }
 

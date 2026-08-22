@@ -261,11 +261,16 @@ try {
             !manifest.capabilities.includes("configuration-reentry") ||
             !manifest.capabilities.includes("target-affinity") ||
             !manifest.capabilities.includes("target-attestation") ||
+            !manifest.capabilities.includes("runtime-telemetry") ||
             manifest.targetAffinityMs < 1000 ||
             !manifest.capabilities.includes("resource-pack-proxy") ||
             !manifest.capabilities.includes("resource-pack-cache") ||
             manifest.resourcePackCache?.entries !== 1 ||
-            manifest.resourcePackCache?.bytes !== resourcePackPayload.byteLength) {
+            manifest.resourcePackCache?.bytes !== resourcePackPayload.byteLength ||
+            manifest.runtime?.activeClientStallTimers !== 0 ||
+            !Number.isSafeInteger(manifest.runtime?.rssBytes) ||
+            !Number.isSafeInteger(manifest.runtime?.cpuUserMicros) ||
+            !Number.isSafeInteger(manifest.runtime?.cpuSystemMicros)) {
         throw new Error("Translator node manifest did not describe the tunnel capability");
     }
     const deniedTargetResponse = await fetchTargetManifest(

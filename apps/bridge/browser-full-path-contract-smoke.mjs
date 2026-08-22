@@ -63,6 +63,17 @@ assert.equal(
     2,
     "RelayNode must not decode PLAY packet ids solely for disabled tracing",
 );
+assert.match(relayMain, /const armClientStallTimer = \(\) => \{/);
+assert.match(relayMain, /const clearClientStallTimer = \(\) => \{/);
+assert.match(relayMain, /armClientStallTimer\(\);/);
+assert.match(relayMain, /clearClientStallTimer\(\);/);
+assert.match(relayMain, /"runtime-telemetry"/);
+assert.match(relayMain, /runtime: relayRuntimeSnapshot\(\)/);
+assert.doesNotMatch(
+    relayMain,
+    /updateTcpReadState = \(\) => \{[\s\S]*?\};\s+clientStallTimer = setInterval/,
+    "RelayNode must not arm an idle stall timer before a connection reaches PLAY",
+);
 
 console.log(JSON.stringify({
     ok: true,
@@ -70,4 +81,5 @@ console.log(JSON.stringify({
     minimumChunkPackets: { default: 9, minimum: 1, maximum: 128 },
     lifecycleCleanupRequired: true,
     traceFormattingGuarded: true,
+    stallTimerArmedOnlyInPlay: true,
 }));

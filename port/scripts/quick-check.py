@@ -3666,6 +3666,22 @@ def check_source_patches() -> None:
             ) is not None,
         ),
         (
+            "RelayNode arms stall-tick timers only for framed PLAY tunnels",
+            'const armClientStallTimer = () => {' in bridge_main
+            and 'const clearClientStallTimer = () => {' in bridge_main
+            and 'activeClientStallTimers++' in bridge_main
+            and 'activeClientStallTimers = Math.max(0, activeClientStallTimers - 1)'
+            in bridge_main
+            and '"runtime-telemetry"' in bridge_main
+            and 'runtime: relayRuntimeSnapshot()' in bridge_main
+            and re.search(
+                r'updateTcpReadState = \(\) => \{.*?\};\s+'
+                r'clientStallTimer = setInterval',
+                bridge_main,
+                re.DOTALL,
+            ) is None,
+        ),
+        (
             "Browser bridge tracks PLAY and reversible reconfiguration across framed streams",
             "let clientFrameBuffer = Buffer.alloc(0)" in bridge_main
             and "Buffer.concat([clientFrameBuffer, clientData])" in bridge_main
