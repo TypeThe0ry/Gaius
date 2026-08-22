@@ -878,8 +878,8 @@ public final class BrowserWorldgenScheduler {
                   schemaVersion: 1,
                   taskScopeId: Math.max(0, Number(marker.currentTaskScopeId) || 0),
                   taskLabel: String(marker.currentTaskLabel || 'unlabeled').slice(0, 160),
-                  taskActiveWorkMillis,
-                  taskScopeWallMillis
+                  taskActiveWorkMillis: taskActiveWorkMillis,
+                  taskScopeWallMillis: taskScopeWallMillis
                 }).slice(0, 512);
               }
               marker.currentTaskScopeId = 0;
@@ -1151,7 +1151,7 @@ public final class BrowserWorldgenScheduler {
                   reason: reasonNames[Number(reason)] || 'unknown',
                   reasonCode: Number(reason) || 0,
                   taskScopeId: Math.max(0, Number(marker.currentTaskScopeId) || 0),
-                  taskLabel,
+                  taskLabel: taskLabel,
                   sliceElapsedMillis: Math.max(0, Number(sliceElapsedMillis) || 0),
                   budgetOverrunMillis: Math.max(0, Number(overrunMillis) || 0),
                   progressPulses: Math.max(0, Number(progressPulses) || 0),

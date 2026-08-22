@@ -247,6 +247,20 @@ globalThis.__gaiusNetworkStats = {
 assert.equal(queueDepth(), 7, "queue pressure does not report the deepest bounded stage");
 delete globalThis.__gaiusNetworkStats;
 
+const recordSchedulerMarkerSource = jsBody(
+  "private static native void recordSchedulerMarker(",
+);
+assert.doesNotMatch(
+  recordSchedulerMarkerSource,
+  /^\s*(?:taskActiveWorkMillis|taskScopeWallMillis),\s*$/mu,
+  "TeaVM JSBody parser does not accept shorthand task-context properties",
+);
+assert.match(recordSchedulerMarkerSource,
+  /taskActiveWorkMillis:\s*taskActiveWorkMillis/,
+  "task active-work context must use TeaVM-compatible explicit property syntax");
+assert.match(recordSchedulerMarkerSource,
+  /taskScopeWallMillis:\s*taskScopeWallMillis/,
+  "task wall-time context must use TeaVM-compatible explicit property syntax");
 const recordSchedulerMarker = new Function(
   "event",
   "token",
@@ -254,7 +268,7 @@ const recordSchedulerMarker = new Function(
   "reentrantDepth",
   "yielding",
   "activeWorkMillis",
-  jsBody("private static native void recordSchedulerMarker("),
+  recordSchedulerMarkerSource,
 );
 const recordSchedulerTaskLabel = new Function(
   "taskLabel",
@@ -445,6 +459,14 @@ assert.deepEqual(processedBroadcasts, ["chunk-0", "chunk-1", "chunk-2"],
 assert.deepEqual([...dirtyBroadcasts], ["chunk-1"],
   "broadcast work marked dirty during a pulse was cleared at batch end");
 
+const reportSliceSource = jsBody("private static native void reportSlice(");
+assert.doesNotMatch(
+  reportSliceSource,
+  /^\s*taskLabel,\s*$/mu,
+  "TeaVM JSBody parser does not accept shorthand slice-context properties",
+);
+assert.match(reportSliceSource, /taskLabel:\s*taskLabel/,
+  "slice label context must use TeaVM-compatible explicit property syntax");
 const reportSlice = new Function(
   "reason",
   "networkPreemption",
@@ -461,7 +483,7 @@ const reportSlice = new Function(
   "networkWaitPulseLimit",
   "maximumPulsesInTurn",
   "maximumReentrantYieldDepth",
-  jsBody("private static native void reportSlice("),
+  reportSliceSource,
 );
 const reportCheckpointOnlyYield = new Function(
   "networkWaitPulses",
