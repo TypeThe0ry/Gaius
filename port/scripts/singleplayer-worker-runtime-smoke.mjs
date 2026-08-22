@@ -906,6 +906,253 @@ function combinedSlowProbeSamples(beforeProtocolReady, afterProtocolReady) {
   return [...byProbe.values()].sort(compareSlowProbeSamples).slice(0, MAX_SLOW_SAMPLES);
 }
 
+function buildSlowProbeEvidenceSnapshot({
+  slowProbeSamplesBeforeProtocolReady,
+  slowProbeSamplesAfterProtocolReady,
+  slowProbeCandidateCount,
+  slowProbeTopKRetentionDroppedCount,
+  slowProbeSnapshotBlockCapDroppedCount,
+  slowProbeSnapshotBlocksBeforeProtocolReady,
+  slowProbeSnapshotBlocksAfterProtocolReady,
+  slowProbeSnapshotErrorCount,
+  slowProbeClockAnomalyCount,
+  slowProbeClockAnomalies,
+}) {
+  const slowProbeSamples = combinedSlowProbeSamples(
+    slowProbeSamplesBeforeProtocolReady,
+    slowProbeSamplesAfterProtocolReady,
+  );
+  return {
+    schemaVersion: SLOW_SAMPLE_SCHEMA_VERSION,
+    schema: SLOW_SAMPLE_SCHEMA,
+    thresholdMs: SLOW_SAMPLE_THRESHOLD_MS,
+    limit: MAX_SLOW_SAMPLES,
+    perScopeLimit: MAX_SLOW_SAMPLES_PER_SCOPE,
+    countTotal: slowProbeCandidateCount,
+    countRetained: slowProbeSamples.length,
+    dropped: slowProbeTopKRetentionDroppedCount,
+    topKRetentionDropped: slowProbeTopKRetentionDroppedCount,
+    retainedBeforeProtocolReady: slowProbeSamplesBeforeProtocolReady.length,
+    retainedAfterProtocolReady: slowProbeSamplesAfterProtocolReady.length,
+    snapshotDropped: slowProbeSnapshotBlockCapDroppedCount,
+    snapshotBlockCapDropped: slowProbeSnapshotBlockCapDroppedCount,
+    snapshotBlockCapDropCount: slowProbeSnapshotBlockCapDroppedCount,
+    snapshotBlocksBeforeProtocolReady: slowProbeSnapshotBlocksBeforeProtocolReady.size,
+    snapshotBlocksAfterProtocolReady: slowProbeSnapshotBlocksAfterProtocolReady.size,
+    snapshotErrors: slowProbeSnapshotErrorCount,
+    clockAnomalyCount: slowProbeClockAnomalyCount,
+    clockAnomalies: slowProbeClockAnomalies.slice(),
+    timingModel: {
+      parentToWorker: "cross-thread epoch: worker-start - parent-send",
+      workerHandler: "worker monotonic: worker-end - worker-start",
+      workerToParent: "cross-thread epoch: parent-receive - worker-end",
+      roundTrip: "parent monotonic: parent-receive - parent-send",
+    },
+    samples: slowProbeSamples,
+  };
+}
+
+function buildWorkerEventLoopEvidenceSnapshot({
+  eventLoopProbeLatenciesMs,
+  eventLoopProbeSamples,
+  slowProbeSamplesBeforeProtocolReady,
+  slowProbeSamplesAfterProtocolReady,
+  slowProbeCandidateCount,
+  slowProbeTopKRetentionDroppedCount,
+  slowProbeSnapshotBlockCapDroppedCount,
+  slowProbeSnapshotBlocksBeforeProtocolReady,
+  slowProbeSnapshotBlocksAfterProtocolReady,
+  slowProbeSnapshotErrorCount,
+  slowProbeClockAnomalyCount,
+  slowProbeClockAnomalies,
+  longestEventLoopProbe,
+  longestGameplayEventLoopProbe,
+  smokeStartedAt,
+  serverCreatedAt,
+  protocolReadyAt,
+  cooperativePumpMode,
+  currentWorkerPhase,
+  pendingProbeCount,
+}) {
+  const sortedProbeLatencies = eventLoopProbeLatenciesMs
+    .slice()
+    .sort((left, right) => left - right);
+  const phaseLatencies = summarizeProbePhases(eventLoopProbeSamples);
+  const gameplayLatency = summarizeGameplayProbeLatencies(eventLoopProbeSamples);
+  const protocolReady = protocolReadyAt > 0;
+  const afterProtocolReadyGameplayLatency = protocolReady
+    ? summarizeGameplayProbeLatencies(
+      eventLoopProbeSamples.filter((sample) => sample.startedAt >= protocolReadyAt),
+    )
+    : summarizeGameplayProbeLatencies([]);
+  const slowProbeEvidence = buildSlowProbeEvidenceSnapshot({
+    slowProbeSamplesBeforeProtocolReady,
+    slowProbeSamplesAfterProtocolReady,
+    slowProbeCandidateCount,
+    slowProbeTopKRetentionDroppedCount,
+    slowProbeSnapshotBlockCapDroppedCount,
+    slowProbeSnapshotBlocksBeforeProtocolReady,
+    slowProbeSnapshotBlocksAfterProtocolReady,
+    slowProbeSnapshotErrorCount,
+    slowProbeClockAnomalyCount,
+    slowProbeClockAnomalies,
+  });
+  // Worker direct-executor mode does not promise cooperative pump activity.
+  // Its meaningful stall window starts after the client is protocol-ready;
+  // startup/worldgen work before that point is intentionally staged.  When
+  // the cooperative pump is expected or observed, retain the stricter full
+  // gameplay window so regressions cannot hide behind protocol readiness.
+  const stallValidation = !protocolReady
+    ? gameplayLatency
+    : cooperativePumpMode.requireActivity
+      ? gameplayLatency
+      : afterProtocolReadyGameplayLatency;
+  const stallValidationScope = !protocolReady
+    ? "before-protocol-ready"
+    : cooperativePumpMode.requireActivity
+      ? "all-gameplay"
+      : "after-protocol-ready";
+  const afterSmokeMillis = (timestamp) => timestamp > 0
+    ? timestamp - smokeStartedAt
+    : 0;
+  const workerEventLoopLatency = {
+    type: "worker-event-loop-latency",
+    schemaVersion: 3,
+    samples: sortedProbeLatencies.length,
+    p95Ms: percentile(sortedProbeLatencies, 0.95),
+    p99Ms: percentile(sortedProbeLatencies, 0.99),
+    maxMs: sortedProbeLatencies.at(-1) || 0,
+    maxStartedAfterSmokeMs: afterSmokeMillis(longestEventLoopProbe.startedAt),
+    maxCompletedAfterSmokeMs: afterSmokeMillis(longestEventLoopProbe.completedAt),
+    longestGameplay: {
+      ...longestGameplayEventLoopProbe,
+      startedAfterSmokeMs: afterSmokeMillis(longestGameplayEventLoopProbe.startedAt),
+      completedAfterSmokeMs: afterSmokeMillis(longestGameplayEventLoopProbe.completedAt),
+    },
+    afterServerCreated: summarizeProbeLatencies(eventLoopProbeSamples, serverCreatedAt),
+    afterProtocolReady: summarizeProbeLatencies(eventLoopProbeSamples, protocolReadyAt),
+    gameplay: gameplayLatency,
+    stallValidation,
+    stallValidationScope,
+    byPhase: phaseLatencies,
+    pending: pendingProbeCount,
+    protocolReady,
+    currentWorkerPhase,
+    workerPhase: currentWorkerPhase,
+    protocolReadyAt,
+    slowProbeEvidence,
+  };
+  return {slowProbeEvidence, workerEventLoopLatency};
+}
+
+function runWorkerEventLoopEvidenceSelfSmoke() {
+  const slowSample = {
+    probeId: 3,
+    roundTripMs: 6238,
+    trigger: ["round-trip"],
+  };
+  const snapshot = buildWorkerEventLoopEvidenceSnapshot({
+    eventLoopProbeLatenciesMs: [94, 565, 6238],
+    eventLoopProbeSamples: [
+      {probeId: 1, latencyMs: 94, startedAt: 1000, phase: "server-created"},
+      {probeId: 2, latencyMs: 565, startedAt: 2000, phase: "distance-staged"},
+      {probeId: 3, latencyMs: 6238, startedAt: 3000, phase: "distance-7/3"},
+    ],
+    slowProbeSamplesBeforeProtocolReady: [],
+    slowProbeSamplesAfterProtocolReady: [slowSample],
+    slowProbeCandidateCount: 1,
+    slowProbeTopKRetentionDroppedCount: 0,
+    slowProbeSnapshotBlockCapDroppedCount: 0,
+    slowProbeSnapshotBlocksBeforeProtocolReady: new Map(),
+    slowProbeSnapshotBlocksAfterProtocolReady: new Map([[1, {scheduler: {lastTaskScopeWallMillis: 6238}}]]),
+    slowProbeSnapshotErrorCount: 0,
+    slowProbeClockAnomalyCount: 0,
+    slowProbeClockAnomalies: [],
+    longestEventLoopProbe: {
+      probeId: 3,
+      latencyMs: 6238,
+      startedAt: 3000,
+      completedAt: 9238,
+      phase: "distance-7/3",
+    },
+    longestGameplayEventLoopProbe: {
+      probeId: 3,
+      latencyMs: 6238,
+      startedAt: 3000,
+      completedAt: 9238,
+      phase: "distance-7/3",
+    },
+    smokeStartedAt: 900,
+    serverCreatedAt: 1000,
+    protocolReadyAt: 1500,
+    cooperativePumpMode: {requireActivity: false},
+    currentWorkerPhase: "distance-7/3",
+    pendingProbeCount: 2,
+  });
+  const latency = snapshot.workerEventLoopLatency;
+  if (snapshot.slowProbeEvidence.schemaVersion !== SLOW_SAMPLE_SCHEMA_VERSION ||
+      snapshot.slowProbeEvidence.countTotal !== 1 ||
+      snapshot.slowProbeEvidence.countRetained !== 1 ||
+      snapshot.slowProbeEvidence.samples[0].roundTripMs !== 6238 ||
+      latency.maxMs !== 6238 || latency.byPhase["distance-7/3"].maxMs !== 6238 ||
+      latency.currentWorkerPhase !== "distance-7/3" ||
+      latency.workerPhase !== "distance-7/3" || latency.protocolReadyAt !== 1500 ||
+      latency.protocolReady !== true || latency.stallValidationScope !== "after-protocol-ready") {
+    throw new Error("timeout worker event-loop evidence self-smoke failed");
+  }
+  const beforeReady = buildWorkerEventLoopEvidenceSnapshot({
+    eventLoopProbeLatenciesMs: [6238],
+    eventLoopProbeSamples: [
+      {probeId: 3, latencyMs: 6238, startedAt: 3000, phase: "distance-staged"},
+    ],
+    slowProbeSamplesBeforeProtocolReady: [slowSample],
+    slowProbeSamplesAfterProtocolReady: [],
+    slowProbeCandidateCount: 1,
+    slowProbeTopKRetentionDroppedCount: 0,
+    slowProbeSnapshotBlockCapDroppedCount: 0,
+    slowProbeSnapshotBlocksBeforeProtocolReady: new Map([[1, {scheduler: {activeTaskScope: true}}]]),
+    slowProbeSnapshotBlocksAfterProtocolReady: new Map(),
+    slowProbeSnapshotErrorCount: 0,
+    slowProbeClockAnomalyCount: 0,
+    slowProbeClockAnomalies: [],
+    longestEventLoopProbe: {
+      probeId: 3,
+      latencyMs: 6238,
+      startedAt: 3000,
+      completedAt: 9238,
+      phase: "distance-staged",
+    },
+    longestGameplayEventLoopProbe: {
+      probeId: 3,
+      latencyMs: 6238,
+      startedAt: 3000,
+      completedAt: 9238,
+      phase: "distance-staged",
+    },
+    smokeStartedAt: 900,
+    serverCreatedAt: 1000,
+    protocolReadyAt: 0,
+    cooperativePumpMode: {requireActivity: false},
+    currentWorkerPhase: "distance-staged",
+    pendingProbeCount: 1,
+  }).workerEventLoopLatency;
+  if (beforeReady.protocolReady !== false || beforeReady.protocolReadyAt !== 0 ||
+      beforeReady.afterProtocolReady.samples !== 0 ||
+      beforeReady.afterProtocolReady.maxMs !== 0 ||
+      beforeReady.stallValidationScope !== "before-protocol-ready" ||
+      beforeReady.stallValidation.maxMs !== 6238) {
+    throw new Error("timeout before-protocol-ready scope self-smoke failed");
+  }
+  return {
+    ok: true,
+    boundedSlowProbeEvidence: true,
+    workerEventLoopAggregate: true,
+    beforeProtocolReadyScope: true,
+    currentWorkerPhase: true,
+    protocolReadyAt: true,
+  };
+}
+
 function runSlowProbeSelfSmoke() {
   for (const [name, fields] of Object.entries({
     worldgen: WORLDGEN_SLOW_SAMPLE_FIELDS,
@@ -1375,6 +1622,7 @@ if (isMainThread && process.env.GAIUS_SMOKE_SELF_TEST === "1") {
     ...runNetworkValidationSelfSmoke(),
     telemetrySnapshots: runTelemetrySnapshotSelfSmoke(),
     slowProbe: runSlowProbeSelfSmoke(),
+    timeoutEvidence: runWorkerEventLoopEvidenceSelfSmoke(),
   }) + "\n");
   process.exit(0);
 }
@@ -2067,7 +2315,45 @@ if (isMainThread) {
   };
   const timeoutMs = Number(process.env.GAIUS_SMOKE_TIMEOUT_MS || "240000");
   const timeout = setTimeout(() => {
-    events.push({type: "protocol-timeout", ...protocol.snapshot()});
+    const timeoutEventLoopEvidence = buildWorkerEventLoopEvidenceSnapshot({
+      eventLoopProbeLatenciesMs,
+      eventLoopProbeSamples,
+      slowProbeSamplesBeforeProtocolReady,
+      slowProbeSamplesAfterProtocolReady,
+      slowProbeCandidateCount,
+      slowProbeTopKRetentionDroppedCount,
+      slowProbeSnapshotBlockCapDroppedCount,
+      slowProbeSnapshotBlocksBeforeProtocolReady,
+      slowProbeSnapshotBlocksAfterProtocolReady,
+      slowProbeSnapshotErrorCount,
+      slowProbeClockAnomalyCount,
+      slowProbeClockAnomalies,
+      longestEventLoopProbe,
+      longestGameplayEventLoopProbe,
+      smokeStartedAt,
+      serverCreatedAt,
+      protocolReadyAt,
+      cooperativePumpMode: resolveCooperativePumpMode(
+        latestNetworkStats,
+        cooperativePumpExpected,
+      ),
+      currentWorkerPhase: workerPhase,
+      pendingProbeCount: eventLoopProbeStartedAt.size,
+    });
+    // Preserve the existing typed event shape for consumers that locate the
+    // event-loop aggregate by type, while keeping protocol-timeout as the
+    // final event for result readers that use events[-1]/finalEventType.
+    events.push(timeoutEventLoopEvidence.workerEventLoopLatency);
+    events.push({
+      type: "protocol-timeout",
+      ...protocol.snapshot(),
+      workerPhase,
+      currentWorkerPhase: workerPhase,
+      protocolReady: protocolReadyAt > 0,
+      protocolReadyAt,
+      slowProbeEvidence: timeoutEventLoopEvidence.slowProbeEvidence,
+      workerEventLoopLatency: timeoutEventLoopEvidence.workerEventLoopLatency,
+    });
     finish(2);
   }, timeoutMs);
   const finalizeStopped = async (stoppedMessage) => {
@@ -2142,80 +2428,32 @@ if (isMainThread) {
       storageStats: latestStorageStats,
     };
     events.push(protocolFinalEvent);
-    const sortedProbeLatencies = eventLoopProbeLatenciesMs.slice().sort((left, right) => left - right);
-    const phaseLatencies = summarizeProbePhases(eventLoopProbeSamples);
-    const gameplayLatency = summarizeGameplayProbeLatencies(eventLoopProbeSamples);
-    const afterProtocolReadyGameplayLatency = summarizeGameplayProbeLatencies(
-      eventLoopProbeSamples.filter((sample) => sample.startedAt >= protocolReadyAt),
-    );
-    const slowProbeSamples = combinedSlowProbeSamples(
+    const workerEventLoopEvidence = buildWorkerEventLoopEvidenceSnapshot({
+      eventLoopProbeLatenciesMs,
+      eventLoopProbeSamples,
       slowProbeSamplesBeforeProtocolReady,
       slowProbeSamplesAfterProtocolReady,
-    );
-    const slowProbeEvidence = {
-      schemaVersion: SLOW_SAMPLE_SCHEMA_VERSION,
-      schema: SLOW_SAMPLE_SCHEMA,
-      thresholdMs: SLOW_SAMPLE_THRESHOLD_MS,
-      limit: MAX_SLOW_SAMPLES,
-      perScopeLimit: MAX_SLOW_SAMPLES_PER_SCOPE,
-      countTotal: slowProbeCandidateCount,
-      countRetained: slowProbeSamples.length,
-      dropped: slowProbeTopKRetentionDroppedCount,
-      topKRetentionDropped: slowProbeTopKRetentionDroppedCount,
-      retainedBeforeProtocolReady: slowProbeSamplesBeforeProtocolReady.length,
-      retainedAfterProtocolReady: slowProbeSamplesAfterProtocolReady.length,
-      snapshotDropped: slowProbeSnapshotBlockCapDroppedCount,
-      snapshotBlockCapDropped: slowProbeSnapshotBlockCapDroppedCount,
-      snapshotBlockCapDropCount: slowProbeSnapshotBlockCapDroppedCount,
-      snapshotBlocksBeforeProtocolReady: slowProbeSnapshotBlocksBeforeProtocolReady.size,
-      snapshotBlocksAfterProtocolReady: slowProbeSnapshotBlocksAfterProtocolReady.size,
-      snapshotErrors: slowProbeSnapshotErrorCount,
-      clockAnomalyCount: slowProbeClockAnomalyCount,
-      clockAnomalies: slowProbeClockAnomalies.slice(),
-      timingModel: {
-        parentToWorker: "cross-thread epoch: worker-start - parent-send",
-        workerHandler: "worker monotonic: worker-end - worker-start",
-        workerToParent: "cross-thread epoch: parent-receive - worker-end",
-        roundTrip: "parent monotonic: parent-receive - parent-send",
-      },
-      samples: slowProbeSamples,
-    };
-    protocolFinalEvent.slowProbeEvidence = slowProbeEvidence;
-    // Worker direct-executor mode does not promise cooperative pump activity.
-    // Its meaningful stall window starts after the client is protocol-ready;
-    // startup/worldgen work before that point is intentionally staged.  When
-    // the cooperative pump is expected or observed, retain the stricter full
-    // gameplay window so regressions cannot hide behind protocol readiness.
-    const stallValidation = cooperativePumpMode.requireActivity
-      ? gameplayLatency
-      : afterProtocolReadyGameplayLatency;
-    events.push({
-      type: "worker-event-loop-latency",
-      schemaVersion: 3,
-      samples: sortedProbeLatencies.length,
-      p95Ms: percentile(sortedProbeLatencies, 0.95),
-      p99Ms: percentile(sortedProbeLatencies, 0.99),
-      maxMs: sortedProbeLatencies.at(-1) || 0,
-      maxStartedAfterSmokeMs: longestEventLoopProbe.startedAt - smokeStartedAt,
-      maxCompletedAfterSmokeMs: longestEventLoopProbe.completedAt - smokeStartedAt,
-      longestGameplay: {
-        ...longestGameplayEventLoopProbe,
-        startedAfterSmokeMs:
-          longestGameplayEventLoopProbe.startedAt - smokeStartedAt,
-        completedAfterSmokeMs:
-          longestGameplayEventLoopProbe.completedAt - smokeStartedAt,
-      },
-      afterServerCreated: summarizeProbeLatencies(eventLoopProbeSamples, serverCreatedAt),
-      afterProtocolReady: summarizeProbeLatencies(eventLoopProbeSamples, protocolReadyAt),
-      gameplay: gameplayLatency,
-      stallValidation,
-      stallValidationScope: cooperativePumpMode.requireActivity
-        ? "all-gameplay"
-        : "after-protocol-ready",
-      byPhase: phaseLatencies,
-      pending: eventLoopProbeStartedAt.size,
-      slowProbeEvidence,
+      slowProbeCandidateCount,
+      slowProbeTopKRetentionDroppedCount,
+      slowProbeSnapshotBlockCapDroppedCount,
+      slowProbeSnapshotBlocksBeforeProtocolReady,
+      slowProbeSnapshotBlocksAfterProtocolReady,
+      slowProbeSnapshotErrorCount,
+      slowProbeClockAnomalyCount,
+      slowProbeClockAnomalies,
+      longestEventLoopProbe,
+      longestGameplayEventLoopProbe,
+      smokeStartedAt,
+      serverCreatedAt,
+      protocolReadyAt,
+      cooperativePumpMode,
+      currentWorkerPhase: workerPhase,
+      pendingProbeCount: eventLoopProbeStartedAt.size,
     });
+    const {slowProbeEvidence, workerEventLoopLatency} = workerEventLoopEvidence;
+    protocolFinalEvent.slowProbeEvidence = slowProbeEvidence;
+    events.push(workerEventLoopLatency);
+    const {stallValidation} = workerEventLoopLatency;
     if (stallValidation.maxMs > maximumGameplayStallMs) {
       events.push({
         type: "worldgen-event-loop-stall",
