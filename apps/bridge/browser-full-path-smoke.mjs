@@ -50,6 +50,12 @@ const clientCount = Number.isInteger(requestedClients)
     : 2;
 const soakMs = Math.max(0, Number.parseInt(
     process.env.GAIUS_BROWSER_FULL_PATH_SOAK_MS ?? "1000", 10) || 0);
+const requestedMinimumChunkPackets = Number.parseInt(
+    process.env.GAIUS_BROWSER_FULL_PATH_MIN_CHUNKS ?? "9", 10);
+const minimumChunkPackets = Number.isInteger(requestedMinimumChunkPackets)
+    ? Math.max(1, Math.min(128, requestedMinimumChunkPackets))
+    : 9;
+const printConfigOnly = process.argv.includes("--print-config");
 const smokeStartedAt = performance.now();
 
 let activeProfile;
@@ -179,7 +185,8 @@ try {
         await Promise.all(clients.map((client) => client.connect()));
         await waitFor(
             () => clients.every((client) => client.failure === undefined &&
-                client.playLoginPackets > 0 && client.chunkPackets > 0),
+                client.playLoginPackets > 0 &&
+                client.chunkPackets >= minimumChunkPackets),
             "browser Relay Minecraft PLAY/chunk", 90000,
             () => JSON.stringify(clients.map((client) => client.diagnostics())));
         for (const client of clients) client.checkError();
@@ -190,7 +197,19 @@ try {
     finally {
         clearInterval(pollTimer);
         for (const client of clients) client.close();
-        await delay(200);
+        await waitFor(() => browserRuntime.bridge.channels.size === 0 &&
+            browserRuntime.wsStats.sockets.size === 0,
+        "browser Relay transport cleanup", 5000, () => JSON.stringify({
+            activeChannels: browserRuntime.bridge.channels.size,
+            activeWebSockets: browserRuntime.wsStats.sockets.size,
+            queuedBytes: browserRuntime.stats.queuedBytes,
+            queuedFrames: browserRuntime.stats.queuedFrames,
+            inboundQueuedBytes: browserRuntime.stats.inboundQueuedBytes,
+            activeRelayTargetLeases: browserRuntime.stats.activeRelayTargetLeases,
+        })).catch(() => {
+            // Preserve the primary protocol failure. Successful runs assert every
+            // cleanup counter below with a more specific lifecycle error.
+        });
     }
 
     const phases = clients.flatMap((client) => client.connectPhases);
@@ -212,6 +231,18 @@ try {
         "vanilla online-mode login did not produce one authenticated session join per client");
     assert.equal(sessionState.hasJoined.length, clientCount,
         "vanilla online-mode login did not verify one hasJoined request per client");
+    assert.equal(browserRuntime.bridge.channels.size, 0,
+        "browser transport leaked a channel after multiplayer cleanup");
+    assert.equal(browserRuntime.wsStats.sockets.size, 0,
+        "browser transport leaked a WebSocket after multiplayer cleanup");
+    assert.equal(browserRuntime.stats.queuedBytes, 0,
+        "browser transport retained outbound bytes after multiplayer cleanup");
+    assert.equal(browserRuntime.stats.queuedFrames, 0,
+        "browser transport retained outbound frames after multiplayer cleanup");
+    assert.equal(browserRuntime.stats.inboundQueuedBytes, 0,
+        "browser transport retained inbound bytes after multiplayer cleanup");
+    assert.equal(browserRuntime.stats.activeRelayTargetLeases, 0,
+        "browser transport retained a RelayNode target lease after multiplayer cleanup");
 
     const result = {
         ok: true,
@@ -230,6 +261,13 @@ try {
             inboundFrames: browserRuntime.stats.receivedFrames,
             inboundBytes: browserRuntime.stats.receivedBytes,
             relayTargetAttestationFailures: browserRuntime.stats.relayTargetAttestationFailures,
+            activeChannelsAfterClose: browserRuntime.bridge.channels.size,
+            activeWebSocketsAfterClose: browserRuntime.wsStats.sockets.size,
+            queuedBytesAfterClose: browserRuntime.stats.queuedBytes,
+            queuedFramesAfterClose: browserRuntime.stats.queuedFrames,
+            inboundQueuedBytesAfterClose: browserRuntime.stats.inboundQueuedBytes,
+            activeRelayTargetLeasesAfterClose:
+                browserRuntime.stats.activeRelayTargetLeases,
         },
         profile: {
             id: activeProfile.id,
@@ -253,6 +291,7 @@ try {
         },
         clients: clients.map((client) => client.result()),
         relayPhases: phases,
+        performanceContract: browserFullPathPerformanceContract(),
         elapsedMillis: Number((performance.now() - smokeStartedAt).toFixed(1)),
     };
     await writeFile(path.join(workDirectory, "result.json"),
@@ -315,9 +354,28 @@ class BrowserMinecraftClient {
         this.connectPhases = [];
         this.failure = undefined;
         this.closed = false;
+        this.startedAt = performance.now();
+        this.connectStartedAt = undefined;
+        this.relayConnectedAt = undefined;
+        this.handshakeSentAt = undefined;
+        this.encryptionRequestAt = undefined;
+        this.sessionJoinAt = undefined;
+        this.loginFinishedAt = undefined;
+        this.configurationFinishedAt = undefined;
+        this.playLoginAt = undefined;
+        this.firstChunkAt = undefined;
+        this.minimumChunksAt = undefined;
+        this.closedAt = undefined;
+        this.inboundFrames = 0;
+        this.inboundBytes = 0;
+        this.outboundFrames = 0;
+        this.outboundBytes = 0;
+        this.decodedPackets = 0;
+        this.maximumBufferedBytes = 0;
     }
 
     async connect() {
+        this.connectStartedAt = performance.now();
         this.bridge.open(this.id, this.host, this.port);
         await waitFor(() => {
             this.checkError();
@@ -325,6 +383,7 @@ class BrowserMinecraftClient {
             return this.connectPhases.some((event) => event.phase === "relay-connected");
         }, `browser Relay client ${this.index + 1}`, 20000,
         () => JSON.stringify(this.diagnostics()));
+        this.relayConnectedAt = performance.now();
         this.sendPacket(0, Buffer.concat([
             encodeVarInt(this.profile.protocolVersion),
             encodeString(this.host),
@@ -335,6 +394,7 @@ class BrowserMinecraftClient {
             encodeString(this.username),
             Buffer.from(this.profileId, "hex"),
         ]));
+        this.handshakeSentAt = performance.now();
     }
 
     poll() {
@@ -349,6 +409,12 @@ class BrowserMinecraftClient {
                     this.buffer,
                     this.decipher === undefined ? bytes : this.decipher.update(bytes),
                 ]);
+                this.inboundFrames++;
+                this.inboundBytes += bytes.byteLength;
+                this.maximumBufferedBytes = Math.max(
+                    this.maximumBufferedBytes,
+                    this.buffer.byteLength,
+                );
                 this.parsePackets();
             }
         }
@@ -381,6 +447,7 @@ class BrowserMinecraftClient {
             }
             const packetId = decodeVarInt(frame, 0);
             if (packetId === undefined) throw new Error("packet omitted id");
+            this.decodedPackets++;
             this.handlePacket(packetId.value, frame.subarray(packetId.bytesRead));
             if (this.failure !== undefined) throw this.failure;
         }
@@ -393,6 +460,7 @@ class BrowserMinecraftClient {
             }
             if (packetId === this.profile.login.clientboundEncryptionRequest) {
                 this.encryptionRequest = true;
+                this.encryptionRequestAt ??= performance.now();
                 void this.answerEncryptionRequest(payload).catch((error) => {
                     this.failure ??= error;
                 });
@@ -408,6 +476,7 @@ class BrowserMinecraftClient {
             }
             if (packetId === this.profile.login.clientboundLoginFinished) {
                 this.loginFinished = true;
+                this.loginFinishedAt ??= performance.now();
                 this.phase = "configuration";
                 this.sendPacket(this.profile.login.serverboundLoginAcknowledged, Buffer.alloc(0));
                 this.sendPacket(this.profile.login.serverboundHello, encodeClientInformation());
@@ -441,6 +510,7 @@ class BrowserMinecraftClient {
             }
             else if (packetId === this.profile.configuration.clientboundFinish) {
                 this.configurationFinished = true;
+                this.configurationFinishedAt ??= performance.now();
                 this.configurationCycles++;
                 this.phase = "play";
                 this.sendPacket(this.profile.configuration.serverboundFinish, Buffer.alloc(0));
@@ -460,6 +530,7 @@ class BrowserMinecraftClient {
         }
         else if (packetId === this.profile.play.clientboundLogin) {
             this.playLoginPackets++;
+            this.playLoginAt ??= performance.now();
             if (!this.playerLoadedSent) {
                 this.playerLoadedSent = true;
                 this.sendPacket(this.profile.play.serverboundPlayerLoaded, Buffer.alloc(0));
@@ -467,6 +538,10 @@ class BrowserMinecraftClient {
         }
         else if (packetId === this.profile.play.clientboundChunk) {
             this.chunkPackets++;
+            this.firstChunkAt ??= performance.now();
+            if (this.chunkPackets >= minimumChunkPackets) {
+                this.minimumChunksAt ??= performance.now();
+            }
         }
         else if (packetId === this.profile.play.clientboundStartConfiguration) {
             if (payload.byteLength !== 0) throw new Error("PLAY start-configuration had payload");
@@ -497,6 +572,7 @@ class BrowserMinecraftClient {
         });
         if (!joinResponse.ok) throw new Error(`${this.username}: session join HTTP ${joinResponse.status}`);
         this.sessionJoin = true;
+        this.sessionJoinAt ??= performance.now();
         const encryptedSecret = publicEncrypt({
             key: publicKey.value,
             format: "der",
@@ -528,6 +604,8 @@ class BrowserMinecraftClient {
         if (!this.bridge.send(this.id, new Uint8Array(wire))) {
             throw new Error(`${this.username}: browser transport rejected outbound frame`);
         }
+        this.outboundFrames++;
+        this.outboundBytes += wire.byteLength;
     }
 
     checkError() {
@@ -546,6 +624,7 @@ class BrowserMinecraftClient {
     close() {
         if (this.closed) return;
         this.closed = true;
+        this.closedAt = performance.now();
         try { this.bridge.close(this.id); } catch {}
     }
 
@@ -568,6 +647,13 @@ class BrowserMinecraftClient {
             playLoginPackets: this.playLoginPackets,
             chunkPackets: this.chunkPackets,
             bufferedBytes: this.buffer.byteLength,
+            minimumChunkPackets,
+            inboundFrames: this.inboundFrames,
+            inboundBytes: this.inboundBytes,
+            outboundFrames: this.outboundFrames,
+            outboundBytes: this.outboundBytes,
+            decodedPackets: this.decodedPackets,
+            maximumBufferedBytes: this.maximumBufferedBytes,
             failure: this.failure === undefined ? null : String(this.failure),
         };
     }
@@ -591,8 +677,100 @@ class BrowserMinecraftClient {
             reconfigurationRequests: this.reconfigurationRequests,
             playLoginPackets: this.playLoginPackets,
             chunkPackets: this.chunkPackets,
+            timing: this.timingResult(),
+            traffic: {
+                inboundFrames: this.inboundFrames,
+                inboundBytes: this.inboundBytes,
+                outboundFrames: this.outboundFrames,
+                outboundBytes: this.outboundBytes,
+                decodedPackets: this.decodedPackets,
+                maximumBufferedBytes: this.maximumBufferedBytes,
+                packetsPerSecondToMinimumChunks: ratePerSecond(
+                    this.decodedPackets,
+                    elapsedMillis(this.connectStartedAt, this.minimumChunksAt),
+                ),
+                inboundBytesPerSecondToMinimumChunks: ratePerSecond(
+                    this.inboundBytes,
+                    elapsedMillis(this.connectStartedAt, this.minimumChunksAt),
+                ),
+            },
         };
     }
+
+    timingResult() {
+        return {
+            relayConnectedMillis:
+                elapsedMillis(this.connectStartedAt, this.relayConnectedAt),
+            relayToHandshakeMillis:
+                elapsedMillis(this.relayConnectedAt, this.handshakeSentAt),
+            handshakeToEncryptionRequestMillis:
+                elapsedMillis(this.handshakeSentAt, this.encryptionRequestAt),
+            encryptionRequestToSessionJoinMillis:
+                elapsedMillis(this.encryptionRequestAt, this.sessionJoinAt),
+            handshakeToLoginFinishedMillis:
+                elapsedMillis(this.handshakeSentAt, this.loginFinishedAt),
+            loginToConfigurationFinishedMillis:
+                elapsedMillis(this.loginFinishedAt, this.configurationFinishedAt),
+            configurationToPlayLoginMillis:
+                elapsedMillis(this.configurationFinishedAt, this.playLoginAt),
+            playLoginToFirstChunkMillis:
+                elapsedMillis(this.playLoginAt, this.firstChunkAt),
+            firstChunkToMinimumChunksMillis:
+                elapsedMillis(this.firstChunkAt, this.minimumChunksAt),
+            connectToFirstChunkMillis:
+                elapsedMillis(this.connectStartedAt, this.firstChunkAt),
+            connectToMinimumChunksMillis:
+                elapsedMillis(this.connectStartedAt, this.minimumChunksAt),
+            connectedLifetimeMillis:
+                elapsedMillis(this.connectStartedAt, this.closedAt),
+        };
+    }
+}
+
+function elapsedMillis(start, end) {
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return null;
+    return Number((end - start).toFixed(3));
+}
+
+function ratePerSecond(value, millis) {
+    if (!Number.isFinite(value) || !Number.isFinite(millis) || millis <= 0) return null;
+    return Number((value * 1000 / millis).toFixed(3));
+}
+
+function browserFullPathPerformanceContract() {
+    return {
+        minimumChunkPackets,
+        soakMillis: soakMs,
+        lifecycleCleanupRequired: true,
+        requiredMilestones: [
+            "relay-connected",
+            "login-finished",
+            "configuration-finished",
+            "play-login",
+            "first-chunk",
+            `chunk-${minimumChunkPackets}`,
+        ],
+    };
+}
+
+async function printConfiguration() {
+    activeProfile = await loadActiveVersionProfile();
+    const wireProfile = resolveWireProfile(activeProfile);
+    console.log(JSON.stringify({
+        profile: {
+            id: activeProfile.id,
+            protocolVersion: activeProfile.protocolVersion,
+            worldVersion: activeProfile.worldVersion,
+            javaVersion: activeProfile.javaVersion,
+            path: activeProfile.path,
+        },
+        wireProfile: {
+            name: wireProfile.name,
+            protocolVersion: wireProfile.protocolVersion,
+        },
+        clients: clientCount,
+        performanceContract: browserFullPathPerformanceContract(),
+    }));
 }
 
 async function createBrowserRuntime(port, token) {
@@ -1117,4 +1295,5 @@ async function closeHttpServer(server) {
     });
 }
 
-await runSmoke();
+if (printConfigOnly) await printConfiguration();
+else await runSmoke();

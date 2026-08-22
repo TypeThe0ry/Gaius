@@ -3644,6 +3644,28 @@ def check_source_patches() -> None:
             and 'maximumFrameBytes: parseInteger("GAIUS_MAXIMUM_FRAME_BYTES", 16 * 1024 * 1024' in bridge_config,
         ),
         (
+            "RelayNode keeps disabled tunnel tracing off the multiplayer packet hot path",
+            re.search(
+                r'if \(traceTunnel\) \{\s+traceTunnelEvent\(\s+'
+                r'`server data .*?toString\("hex"\)',
+                bridge_main,
+                re.DOTALL,
+            ) is not None
+            and re.search(
+                r'if \(traceTunnel\) \{\s+traceTunnelEvent\(\s+'
+                r'`client data .*?toString\("hex"\)',
+                bridge_main,
+                re.DOTALL,
+            ) is not None
+            and bridge_main.count('if (traceTunnel && protocolPhase === "play")') == 2
+            and re.search(
+                r'if \(traceTunnel\) \{\s+traceTunnelEvent\(\s+'
+                r'`proxied .*?response\.toString\("hex"\)',
+                bridge_main,
+                re.DOTALL,
+            ) is not None,
+        ),
+        (
             "Browser bridge tracks PLAY and reversible reconfiguration across framed streams",
             "let clientFrameBuffer = Buffer.alloc(0)" in bridge_main
             and "Buffer.concat([clientFrameBuffer, clientData])" in bridge_main
