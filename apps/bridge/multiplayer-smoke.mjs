@@ -417,12 +417,16 @@ try {
     fixtureSocket.destroy();
     fixtureSocket = undefined;
 
-    const targetRecent = await (await fetchTargetManifest(
-            bridgePort, fixturePort, bridgeToken)).json();
-    if (targetRecent.target?.activeConnections !== 0 ||
-            targetRecent.target?.recentlyReachable !== true ||
-            targetRecent.target?.totalConnections !== 1) {
-        throw new Error("Translator node did not retain recent target affinity after close");
+    // The client WebSocket close event can win the RelayNode process' matching
+    // close callback. Wait for the server-side route release instead of racing
+    // a single manifest fetch on slower CI runners.
+    const targetRecent = await waitForTargetRoute(
+            bridgePort, fixturePort, bridgeToken, 0, "recent target release");
+    if (targetRecent.activeConnections !== 0 ||
+            targetRecent.recentlyReachable !== true ||
+            targetRecent.totalConnections !== 1) {
+        throw new Error("Translator node did not retain recent target affinity after close: " +
+            JSON.stringify(targetRecent));
     }
 
     const sharedTargetLifecycle = await testSharedTargetLifecycle(bridgePort, bridgeToken);
@@ -464,7 +468,7 @@ try {
             requiresToken: manifest.requiresToken,
             targetAffinityMs: manifest.targetAffinityMs,
             targetActiveConnections: targetActive.target.activeConnections,
-            targetRecentlyReachable: targetRecent.target.recentlyReachable,
+            targetRecentlyReachable: targetRecent.recentlyReachable,
         },
         ...(minecraftLogin === undefined ? {} : { minecraftLogin }),
     }));
