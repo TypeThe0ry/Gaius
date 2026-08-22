@@ -33,7 +33,35 @@ for (const expected of expectedProfiles) {
     assert.equal(config.wireProfile.name, expected.id);
     assert.equal(config.wireProfile.protocolVersion, expected.protocol);
     assert.equal(config.performanceContract.minimumChunkPackets, 9);
+    assert.equal(config.performanceContract.reconnectWaves, 0);
     assert.equal(config.performanceContract.lifecycleCleanupRequired, true);
+    assert.deepEqual(config.performanceContract.reconnect, {
+        simultaneousDrop: true,
+        abnormalTransportDrop: true,
+        transportCloseErrorRetained: true,
+        syntheticInboundMarkerRetained: true,
+        javaFinalCloseAfterTransportDrop: true,
+        freshChannelIds: true,
+        sameAccountIdentity: true,
+        freshProtocolBuffers: true,
+        freshEncryptionState: true,
+        requiredSessionChecksPerClientPerWave: {
+            joins: 1,
+            hasJoined: 1,
+        },
+        requiredMilestonesPerWave: [
+            "abnormal-transport-drop",
+            "close-error-retained",
+            "synthetic-inbound-marker-retained",
+            "java-final-close-all-zero",
+            "relay-connected",
+            "login-finished",
+            "configuration-finished",
+            "play-login",
+            "first-chunk",
+            "chunk-9",
+        ],
+    });
     assert.deepEqual(config.performanceContract.requiredMilestones, [
         "relay-connected",
         "login-finished",
@@ -50,8 +78,50 @@ assert.equal(configuration("versions/26.2.json", {
 assert.equal(configuration("versions/1.21.11.json", {
     GAIUS_BROWSER_FULL_PATH_MIN_CHUNKS: "999",
 }).performanceContract.minimumChunkPackets, 128);
+assert.equal(configuration("versions/26.2.json", {
+    GAIUS_BROWSER_FULL_PATH_RECONNECT_WAVES: "1",
+}).performanceContract.reconnectWaves, 1);
+assert.equal(configuration("versions/26.2.json", {
+    GAIUS_BROWSER_FULL_PATH_RECONNECT_WAVES: "-1",
+}).performanceContract.reconnectWaves, 0);
+assert.equal(configuration("versions/1.21.11.json", {
+    GAIUS_BROWSER_FULL_PATH_RECONNECT_WAVES: "999",
+}).performanceContract.reconnectWaves, 8);
 
-const relayMain = await readFile(relayMainPath, "utf8");
+const [relayMain, fullPathSource] = await Promise.all([
+    readFile(relayMainPath, "utf8"),
+    readFile(fullPathScript, "utf8"),
+]);
+assert.match(fullPathSource,
+    /for \(let wave = 1; wave <= reconnectWaves; wave\+\+\)/);
+assert.match(fullPathSource,
+    /forceAbnormalTransportDrop\(\s*browserRuntime, previousClients, wave\)/);
+assert.match(fullPathSource,
+    /probe\.entry\.ws\.terminate\(\)/);
+assert.match(fullPathSource,
+    /entry\.ws\.onmessage\(\{\s*data: tail\.buffer\.slice/);
+assert.match(fullPathSource,
+    /client\.close\("java-final-close"\)/);
+assert.match(fullPathSource,
+    /abnormal close discarded channel \$\{probe\.id\} synthetic inbound marker/);
+assert.match(fullPathSource,
+    /tailOffset \+ probe\.tail\.byteLength, drained\.byteLength/);
+assert.match(fullPathSource,
+    /syntheticInboundMarker: \{[\s\S]*?networkFrame: false/);
+assert.match(fullPathSource,
+    /\^WebSocket transport closed: \(\?!1000\\b\)\\d\+/);
+assert.match(fullPathSource,
+    /id: 700 \+ wave \* 100 \+ index/);
+assert.match(fullPathSource,
+    /"reconnect reused an AES shared secret"/);
+assert.match(fullPathSource,
+    /sessionAtChunks\.joins - sessionBeforeDrop\.joins/);
+assert.match(fullPathSource,
+    /snapshot\.target\.activeConnections === 0/);
+assert.match(fullPathSource,
+    /authorization: `Bearer \$\{relayToken\}`/);
+assert.match(fullPathSource,
+    /client\.dropTimingResult\(dropAt\)/);
 assert.match(relayMain,
     /if \(traceTunnel\) \{\s+traceTunnelEvent\(\s+`server data [\s\S]*?toString\("hex"\)/);
 assert.match(relayMain,
@@ -79,6 +149,19 @@ console.log(JSON.stringify({
     ok: true,
     profiles: expectedProfiles.map(({ id, protocol, world }) => ({ id, protocol, world })),
     minimumChunkPackets: { default: 9, minimum: 1, maximum: 128 },
+    reconnectWaves: { default: 0, minimum: 0, maximum: 8 },
+    reconnectContract: {
+        simultaneousDrop: true,
+        abnormalTransportDrop: true,
+        closeErrorAndSyntheticMarkerRetained: true,
+        javaFinalCloseAfterTransportDrop: true,
+        freshChannelIds: true,
+        sameAccountIdentity: true,
+        freshProtocolBuffers: true,
+        freshEncryptionState: true,
+        sessionJoinPerClientPerWave: true,
+        relayAndBrowserCleanupEvidence: true,
+    },
     lifecycleCleanupRequired: true,
     traceFormattingGuarded: true,
     stallTimerArmedOnlyInPlay: true,

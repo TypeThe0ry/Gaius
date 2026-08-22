@@ -55,6 +55,11 @@ const requestedMinimumChunkPackets = Number.parseInt(
 const minimumChunkPackets = Number.isInteger(requestedMinimumChunkPackets)
     ? Math.max(1, Math.min(128, requestedMinimumChunkPackets))
     : 9;
+const requestedReconnectWaves = Number.parseInt(
+    process.env.GAIUS_BROWSER_FULL_PATH_RECONNECT_WAVES ?? "0", 10);
+const reconnectWaves = Number.isInteger(requestedReconnectWaves)
+    ? Math.max(0, Math.min(8, requestedReconnectWaves))
+    : 0;
 const printConfigOnly = process.argv.includes("--print-config");
 const smokeStartedAt = performance.now();
 
@@ -88,6 +93,7 @@ async function runSmoke() {
     let browserRuntime;
     let relayRuntimeBaseline;
     let relayRuntimeAtChunks;
+    let relayRuntimeBeforeSoak;
     let relayRuntimeAfterSoak;
     let relayRuntimeAfterClose;
     let failure;
@@ -169,13 +175,14 @@ try {
         !relayOutput.includes("Gaius translator node listening")) {
         throw new Error("RelayNode failed to start:\n" + relayOutput);
     }
-    relayRuntimeBaseline = await fetchRelayRuntime(relayPort);
+    relayRuntimeBaseline = await fetchRelayRuntime(relayPort, minecraftPort);
 
     browserRuntime = await createBrowserRuntime(relayPort, relayToken);
-    const clients = Array.from({ length: clientCount }, (_, index) =>
+    const createClients = (wave) => Array.from({ length: clientCount }, (_, index) =>
         new BrowserMinecraftClient({
-            id: 700 + index,
+            id: 700 + wave * 100 + index,
             index,
+            wave,
             profile: wireProfile,
             bridge: browserRuntime.bridge,
             stats: browserRuntime.stats,
@@ -183,68 +190,289 @@ try {
             port: minecraftPort,
             sessionUrl: sessionBaseUrl,
         }));
+    const allClients = [];
+    const reconnectEvidence = [];
+    let currentClients = createClients(0);
+    allClients.push(...currentClients);
     const pollTimer = setInterval(() => {
-        for (const client of clients) client.poll();
+        for (const client of currentClients) client.poll();
     }, 1);
     try {
-        await Promise.all(clients.map((client) => client.connect()));
+        await Promise.all(currentClients.map((client) => client.connect()));
         await waitFor(
-            () => clients.every((client) => client.failure === undefined &&
+            () => currentClients.every((client) => client.failure === undefined &&
                 client.playLoginPackets > 0 &&
                 client.chunkPackets >= minimumChunkPackets),
             "browser Relay Minecraft PLAY/chunk", 90000,
-            () => JSON.stringify(clients.map((client) => client.diagnostics())));
-        for (const client of clients) client.checkError();
-        relayRuntimeAtChunks = await fetchRelayRuntime(relayPort);
+            () => JSON.stringify(currentClients.map((client) => client.diagnostics())));
+        for (const client of currentClients) client.checkError();
+        relayRuntimeAtChunks = await fetchRelayRuntime(relayPort, minecraftPort);
+        relayRuntimeBeforeSoak = relayRuntimeAtChunks;
+        const seenBuffers = new Set(currentClients.map((client) => client.buffer));
+        const seenCiphers = new Set(currentClients.map((client) => client.cipher));
+        const seenDeciphers = new Set(currentClients.map((client) => client.decipher));
+        const seenSecretFingerprints = new Set(currentClients.map((client) =>
+            client.secretFingerprint));
+
+        for (let wave = 1; wave <= reconnectWaves; wave++) {
+            const previousClients = currentClients;
+            const relayBeforeDrop = await fetchRelayRuntime(relayPort, minecraftPort);
+            const browserBeforeDrop = browserRuntimeSnapshot(browserRuntime);
+            const sessionBeforeDrop = sessionRuntimeSnapshot(sessionState);
+            const dropAt = performance.now();
+
+            // Freeze the Java-side poll analogue, queue a deterministic marker, and
+            // abnormally tear down every live WebSocket in one JS turn. This is a
+            // real mid-PLAY transport loss: the bridge's onclose path must retain
+            // the synthetic onmessage marker and the non-1000 close error until the
+            // Java channel observes them and invokes its final close hook. The marker
+            // exercises JSBody queue ordering; it is not claimed as a network tail.
+            for (const client of previousClients) client.pausePollingForTransportDrop();
+            const transportDrop = forceAbnormalTransportDrop(
+                browserRuntime, previousClients, wave);
+            const dropDispatchSpreadMillis = timestampSpread(
+                transportDrop.map((probe) => probe.terminatedAt));
+            assert.ok(dropDispatchSpreadMillis <= 50,
+                `reconnect wave ${wave} did not drop all clients together`);
+            await waitFor(
+                () => transportDrop.every((probe) => probe.entry.closed) &&
+                    browserRuntime.wsStats.sockets.size === 0,
+                `reconnect wave ${wave} abnormal WebSocket close`, 5000,
+                () => JSON.stringify({
+                    activeWebSockets: browserRuntime.wsStats.sockets.size,
+                    entries: transportDrop.map((probe) => ({
+                        id: probe.id,
+                        closed: probe.entry.closed,
+                        errors: probe.entry.errors,
+                        hasPendingInbound:
+                            browserRuntime.bridge.hasPendingInbound(probe.id),
+                    })),
+                }));
+            const relayAfterDrop = await waitForRelayRuntime(
+                relayPort,
+                (snapshot) => snapshot.activeConnections === 0 &&
+                    snapshot.target.activeConnections === 0 &&
+                    snapshot.runtime.activeClientStallTimers === 0,
+                `reconnect wave ${wave} RelayNode final-close cleanup`,
+                5000,
+                minecraftPort,
+            );
+            const transportDropEvidence = await captureAbnormalTransportDrop(
+                browserRuntime, transportDrop);
+            const browserAfterTransportDrop = browserRuntimeSnapshot(browserRuntime);
+            assert.equal(browserAfterTransportDrop.activeChannels, clientCount,
+                "abnormal transport close retired bridge entries before Java final close");
+            assert.deepEqual({
+                activeWebSockets: browserAfterTransportDrop.activeWebSockets,
+                queuedBytes: browserAfterTransportDrop.queuedBytes,
+                queuedFrames: browserAfterTransportDrop.queuedFrames,
+                inboundQueuedBytes: browserAfterTransportDrop.inboundQueuedBytes,
+                activeRelayTargetLeases:
+                    browserAfterTransportDrop.activeRelayTargetLeases,
+            }, {
+                activeWebSockets: 0,
+                queuedBytes: 0,
+                queuedFrames: 0,
+                inboundQueuedBytes: 0,
+                activeRelayTargetLeases: 0,
+            }, "abnormal transport close retained browser queue/lease state");
+            assert.equal(relayAfterDrop.target.totalConnections,
+                clientCount * wave,
+                `reconnect wave ${wave} changed target totals while dropping`);
+
+            const javaFinalCloseAt = performance.now();
+            for (const client of previousClients) client.close("java-final-close");
+            const javaFinalCloseDispatchSpreadMillis = timestampSpread(
+                previousClients.map((client) => client.closedAt));
+            assert.ok(javaFinalCloseDispatchSpreadMillis <= 50,
+                `reconnect wave ${wave} did not finalize all Java channels together`);
+            await waitForBrowserRuntimeCleanup(browserRuntime,
+                `reconnect wave ${wave} browser Java final-close cleanup`);
+            const browserAfterJavaFinalClose = browserRuntimeSnapshot(browserRuntime);
+            assertBrowserRuntimeClean(browserAfterJavaFinalClose,
+                `reconnect wave ${wave} Java final-close`);
+            // Give the vanilla server one tick to retire the old player objects;
+            // the reconnect timers below still start at the simultaneous drop.
+            await delay(100);
+
+            const replacementClients = createClients(wave);
+            assert.equal(replacementClients.length, previousClients.length);
+            for (let index = 0; index < replacementClients.length; index++) {
+                const previous = previousClients[index];
+                const replacement = replacementClients[index];
+                assert.notEqual(replacement.id, previous.id,
+                    "reconnect reused a BrowserWebSocketChannel id");
+                assert.equal(replacement.username, previous.username,
+                    "reconnect changed the Minecraft account username");
+                assert.equal(replacement.profileId, previous.profileId,
+                    "reconnect changed the Minecraft account profile");
+                assert.equal(replacement.accessToken, previous.accessToken,
+                    "reconnect changed the deterministic session identity");
+                assert.ok(!seenBuffers.has(replacement.buffer),
+                    "reconnect reused a protocol input buffer");
+                assert.equal(replacement.cipher, undefined,
+                    "reconnect inherited an AES cipher before login");
+                assert.equal(replacement.decipher, undefined,
+                    "reconnect inherited an AES decipher before login");
+            }
+            currentClients = replacementClients;
+            allClients.push(...replacementClients);
+            await Promise.all(replacementClients.map((client) => client.connect()));
+            await waitFor(
+                () => replacementClients.every((client) =>
+                    client.failure === undefined &&
+                    client.playLoginPackets > 0 &&
+                    client.chunkPackets >= minimumChunkPackets),
+                `browser Relay reconnect wave ${wave} PLAY/chunk`, 90000,
+                () => JSON.stringify(replacementClients.map((client) =>
+                    client.diagnostics())));
+            for (const client of replacementClients) {
+                client.checkError();
+                assert.ok(client.cipher !== undefined && !seenCiphers.has(client.cipher),
+                    "reconnect reused an AES cipher object");
+                assert.ok(client.decipher !== undefined &&
+                    !seenDeciphers.has(client.decipher),
+                    "reconnect reused an AES decipher object");
+                assert.ok(client.secretFingerprint !== undefined &&
+                    !seenSecretFingerprints.has(client.secretFingerprint),
+                "reconnect reused an AES shared secret");
+                seenBuffers.add(client.buffer);
+                seenCiphers.add(client.cipher);
+                seenDeciphers.add(client.decipher);
+                seenSecretFingerprints.add(client.secretFingerprint);
+            }
+            const secretFingerprints = allClients.map((client) =>
+                client.secretFingerprint).filter(Boolean);
+            assert.equal(new Set(secretFingerprints).size, secretFingerprints.length,
+                "reconnect reused an AES shared secret");
+            const relayAtChunks = await fetchRelayRuntime(relayPort, minecraftPort);
+            relayRuntimeBeforeSoak = relayAtChunks;
+            const browserAtChunks = browserRuntimeSnapshot(browserRuntime);
+            const sessionAtChunks = sessionRuntimeSnapshot(sessionState);
+            assert.equal(sessionAtChunks.joins - sessionBeforeDrop.joins, clientCount,
+                `reconnect wave ${wave} did not create fresh session joins`);
+            assert.equal(sessionAtChunks.hasJoined - sessionBeforeDrop.hasJoined, clientCount,
+                `reconnect wave ${wave} did not create fresh hasJoined checks`);
+            assert.equal(relayAtChunks.activeConnections, clientCount,
+                `reconnect wave ${wave} did not restore every Relay tunnel`);
+            assert.equal(relayAtChunks.target.activeConnections, clientCount,
+                `reconnect wave ${wave} did not restore every target route`);
+            assert.equal(relayAtChunks.target.totalConnections,
+                clientCount * (wave + 1),
+                `reconnect wave ${wave} target connection count was not monotonic`);
+            reconnectEvidence.push({
+                wave,
+                simultaneousDrop: true,
+                transportDrop: {
+                    abnormalWebSocketClose: true,
+                    method: "node-websocket-terminate",
+                    harnessRequestedMinecraftDisconnectPacket: false,
+                    dispatchSpreadMillis: dropDispatchSpreadMillis,
+                    retainedEntriesBeforeJavaFinalClose: clientCount,
+                    evidence: transportDropEvidence,
+                    retireClosedEntry: {
+                        defined: typeof browserRuntime.bridge.retireClosedEntry === "function",
+                        invoked: false,
+                        note: "optional hook is reported only; retention is tested, not repaired",
+                    },
+                },
+                javaFinalClose: {
+                    invoked: true,
+                    atMillis: Number(javaFinalCloseAt.toFixed(3)),
+                    dispatchSpreadMillis: javaFinalCloseDispatchSpreadMillis,
+                    cleanupAllZero: true,
+                },
+                dropDispatchSpreadMillis,
+                previousChannelIds: previousClients.map((client) => client.id),
+                replacementChannelIds: replacementClients.map((client) => client.id),
+                sameAccountIdentity: true,
+                stateIsolation: {
+                    newChannelIds: true,
+                    newProtocolBuffers: true,
+                    newCipherObjects: true,
+                    uniqueSharedSecretFingerprints: true,
+                },
+                session: {
+                    beforeDrop: sessionBeforeDrop,
+                    atMinimumChunks: sessionAtChunks,
+                    joinsDelta: sessionAtChunks.joins - sessionBeforeDrop.joins,
+                    hasJoinedDelta:
+                        sessionAtChunks.hasJoined - sessionBeforeDrop.hasJoined,
+                },
+                browser: {
+                    beforeDrop: browserBeforeDrop,
+                    afterTransportDrop: browserAfterTransportDrop,
+                    afterJavaFinalClose: browserAfterJavaFinalClose,
+                    atMinimumChunks: browserAtChunks,
+                },
+                relay: {
+                    beforeDrop: relayBeforeDrop,
+                    afterDrop: relayAfterDrop,
+                    atMinimumChunks: relayAtChunks,
+                    reconnectDelta: relayRuntimeDelta(relayAfterDrop, relayAtChunks),
+                },
+                clients: replacementClients.map((client) => ({
+                    ...client.result(),
+                    dropTiming: client.dropTimingResult(dropAt),
+                })),
+            });
+        }
         if (soakMs > 0) {
             await delay(soakMs);
         }
-        relayRuntimeAfterSoak = await fetchRelayRuntime(relayPort);
+        relayRuntimeAfterSoak = await fetchRelayRuntime(relayPort, minecraftPort);
     }
     finally {
         clearInterval(pollTimer);
-        for (const client of clients) client.close();
-        await waitFor(() => browserRuntime.bridge.channels.size === 0 &&
-            browserRuntime.wsStats.sockets.size === 0,
-        "browser Relay transport cleanup", 5000, () => JSON.stringify({
-            activeChannels: browserRuntime.bridge.channels.size,
-            activeWebSockets: browserRuntime.wsStats.sockets.size,
-            queuedBytes: browserRuntime.stats.queuedBytes,
-            queuedFrames: browserRuntime.stats.queuedFrames,
-            inboundQueuedBytes: browserRuntime.stats.inboundQueuedBytes,
-            activeRelayTargetLeases: browserRuntime.stats.activeRelayTargetLeases,
-        })).catch(() => {
+        for (const client of currentClients) client.close("final-close");
+        await waitForBrowserRuntimeCleanup(browserRuntime,
+            "browser Relay transport cleanup").catch(() => {
             // Preserve the primary protocol failure. Successful runs assert every
             // cleanup counter below with a more specific lifecycle error.
         });
         relayRuntimeAfterClose = await waitForRelayRuntime(
             relayPort,
             (snapshot) => snapshot.activeConnections === 0 &&
+                snapshot.target.activeConnections === 0 &&
                 snapshot.runtime.activeClientStallTimers === 0,
             "RelayNode tunnel/timer cleanup",
             5000,
+            minecraftPort,
         ).catch(() => undefined);
     }
 
-    const phases = clients.flatMap((client) => client.connectPhases);
+    const expectedConnections = clientCount * (reconnectWaves + 1);
+    const phases = allClients.flatMap((client) => client.connectPhases);
     const relayConnections = phases.filter((event) => event.phase === "relay-connected");
-    assert.equal(relayConnections.length, clientCount,
+    assert.equal(relayConnections.length, expectedConnections,
         "browser transport did not establish one real RelayNode WebSocket per client");
-    assert.equal(browserRuntime.wsStats.connections, clientCount,
+    assert.equal(browserRuntime.wsStats.connections, expectedConnections,
         "browser transport opened an unexpected number of WebSocket tunnels");
     assert.ok(browserRuntime.wsStats.urls.every((url) =>
         url === `ws://127.0.0.1:${relayPort}/tunnel`),
     "browser transport connected to a relay other than the local test node");
     assert.equal(browserRuntime.stats.relayTargetAttestationFailures, 0,
         "Relay target attestation rejected a valid browser tunnel");
-    assert.ok(browserRuntime.wsStats.controlFrames >= clientCount,
+    assert.ok(browserRuntime.wsStats.controlFrames >= expectedConnections,
         "browser runtime did not send WebSocket connect controls");
     assert.ok(browserRuntime.wsStats.binaryBytes > 0,
         "browser runtime did not send binary WebSocket frames");
-    assert.equal(sessionState.joins.length, clientCount,
+    assert.equal(sessionState.joins.length, expectedConnections,
         "vanilla online-mode login did not produce one authenticated session join per client");
-    assert.equal(sessionState.hasJoined.length, clientCount,
+    assert.equal(sessionState.hasJoined.length, expectedConnections,
         "vanilla online-mode login did not verify one hasJoined request per client");
+    for (const [accessToken, profileId] of sessionState.expectedProfiles) {
+        const identityJoins = sessionState.joins.filter((join) =>
+            join.accessToken === accessToken && join.selectedProfile === profileId);
+        assert.equal(identityJoins.length, reconnectWaves + 1,
+            `session identity ${profileId} did not authenticate in every wave`);
+    }
+    assert.equal(new Set(allClients.map((client) => client.id)).size,
+        expectedConnections,
+        "browser reconnect lifecycle reused a channel id");
+    assert.equal(new Set(allClients.map((client) => client.secretFingerprint)).size,
+        expectedConnections,
+        "browser reconnect lifecycle reused encryption state");
     assert.equal(browserRuntime.bridge.channels.size, 0,
         "browser transport leaked a channel after multiplayer cleanup");
     assert.equal(browserRuntime.wsStats.sockets.size, 0,
@@ -259,14 +487,26 @@ try {
         "browser transport retained a RelayNode target lease after multiplayer cleanup");
     assert.equal(relayRuntimeBaseline.activeConnections, 0,
         "RelayNode baseline unexpectedly had active browser tunnels");
+    assert.equal(relayRuntimeBaseline.target.totalConnections, 0,
+        "RelayNode baseline unexpectedly retained target connection history");
     assert.equal(relayRuntimeAtChunks.activeConnections, clientCount,
         "RelayNode did not report every active multiplayer tunnel at chunk readiness");
+    assert.equal(relayRuntimeAtChunks.target.activeConnections, clientCount,
+        "RelayNode did not report every active target route at initial chunk readiness");
+    assert.equal(relayRuntimeAtChunks.target.totalConnections, clientCount,
+        "RelayNode initial target connection count did not match client count");
+    assert.equal(relayRuntimeAfterSoak.target.totalConnections, expectedConnections,
+        "RelayNode target route did not count every reconnect tunnel");
     assert.equal(relayRuntimeAtChunks.runtime.activeClientStallTimers, 0,
         "encrypted online-mode tunnels armed unnecessary RelayNode stall timers");
     assert.equal(relayRuntimeAfterSoak.runtime.activeClientStallTimers, 0,
         "encrypted online-mode soak armed unnecessary RelayNode stall timers");
     assert.equal(relayRuntimeAfterClose?.activeConnections, 0,
         "RelayNode retained an active tunnel after browser cleanup");
+    assert.equal(relayRuntimeAfterClose?.target?.activeConnections, 0,
+        "RelayNode retained an active target route after browser cleanup");
+    assert.equal(relayRuntimeAfterClose?.target?.totalConnections, expectedConnections,
+        "RelayNode final target connection count omitted a reconnect tunnel");
     assert.equal(relayRuntimeAfterClose?.runtime?.activeClientStallTimers, 0,
         "RelayNode retained a stall timer after browser cleanup");
 
@@ -279,6 +519,8 @@ try {
             realWebSocketFraming: true,
             relayUrl: `ws://127.0.0.1:${relayPort}/tunnel`,
             clients: clientCount,
+            reconnectWaves,
+            expectedConnections,
             webSocketConnections: browserRuntime.wsStats.connections,
             webSocketUrls: browserRuntime.wsStats.urls,
             controlFrames: browserRuntime.wsStats.controlFrames,
@@ -315,17 +557,19 @@ try {
             hasJoined: sessionState.hasJoined.length,
             publicKeyRequests: sessionState.publicKeyRequests,
         },
-        clients: clients.map((client) => client.result()),
+        clients: allClients.map((client) => client.result()),
+        reconnectWaves: reconnectEvidence,
         relayPhases: phases,
         relayRuntime: {
             baseline: relayRuntimeBaseline,
             atMinimumChunks: relayRuntimeAtChunks,
+            beforeSoak: relayRuntimeBeforeSoak,
             afterSoak: relayRuntimeAfterSoak,
             afterClose: relayRuntimeAfterClose,
             connectAndChunkDelta:
                 relayRuntimeDelta(relayRuntimeBaseline, relayRuntimeAtChunks),
             soakDelta:
-                relayRuntimeDelta(relayRuntimeAtChunks, relayRuntimeAfterSoak),
+                relayRuntimeDelta(relayRuntimeBeforeSoak, relayRuntimeAfterSoak),
             totalDelta:
                 relayRuntimeDelta(relayRuntimeBaseline, relayRuntimeAfterSoak),
         },
@@ -379,6 +623,7 @@ class BrowserMinecraftClient {
         this.rsaSecretEncrypted = false;
         this.rsaChallengeEncrypted = false;
         this.aesCfb8Enabled = false;
+        this.secretFingerprint = undefined;
         this.sessionJoin = false;
         this.loginFinished = false;
         this.configurationFinished = false;
@@ -392,6 +637,7 @@ class BrowserMinecraftClient {
         this.connectPhases = [];
         this.failure = undefined;
         this.closed = false;
+        this.pollingPaused = false;
         this.startedAt = performance.now();
         this.connectStartedAt = undefined;
         this.relayConnectedAt = undefined;
@@ -404,6 +650,7 @@ class BrowserMinecraftClient {
         this.firstChunkAt = undefined;
         this.minimumChunksAt = undefined;
         this.closedAt = undefined;
+        this.closeReason = undefined;
         this.inboundFrames = 0;
         this.inboundBytes = 0;
         this.outboundFrames = 0;
@@ -436,7 +683,7 @@ class BrowserMinecraftClient {
     }
 
     poll() {
-        if (this.closed) return;
+        if (this.closed || this.pollingPaused) return;
         try {
             this.checkError();
             this.recordPhases();
@@ -597,6 +844,7 @@ class BrowserMinecraftClient {
             throw new Error(`${this.username}: server disabled session authentication`);
         }
         const secret = randomBytes(16);
+        this.secretFingerprint = createHash("sha256").update(secret).digest("hex");
         const serverHash = minecraftServerHash(serverId.value, secret, publicKey.value);
         const joinResponse = await fetch(new URL(
             "session/minecraft/join", `${this.sessionUrl}/`), {
@@ -659,17 +907,24 @@ class BrowserMinecraftClient {
         }
     }
 
-    close() {
+    close(reason = "final-close") {
         if (this.closed) return;
         this.closed = true;
         this.closedAt = performance.now();
+        this.closeReason = reason;
         try { this.bridge.close(this.id); } catch {}
+    }
+
+    pausePollingForTransportDrop() {
+        assert.equal(this.closed, false, "cannot pause a closed reconnect client");
+        this.pollingPaused = true;
     }
 
     diagnostics() {
         return {
             username: this.username,
             id: this.id,
+            wave: this.wave,
             phase: this.phase,
             encryptionRequest: this.encryptionRequest,
             rsaSecretEncrypted: this.rsaSecretEncrypted,
@@ -692,6 +947,8 @@ class BrowserMinecraftClient {
             outboundBytes: this.outboundBytes,
             decodedPackets: this.decodedPackets,
             maximumBufferedBytes: this.maximumBufferedBytes,
+            closeReason: this.closeReason ?? null,
+            pollingPaused: this.pollingPaused,
             failure: this.failure === undefined ? null : String(this.failure),
         };
     }
@@ -709,6 +966,7 @@ class BrowserMinecraftClient {
                 cipher: "aes-128-cfb8",
                 enabled: this.aesCfb8Enabled,
                 iv: "shared-secret",
+                secretFingerprint: this.secretFingerprint ?? null,
             },
             onlineMode: this.encryptionRequest,
             configurationCycles: this.configurationCycles,
@@ -763,6 +1021,22 @@ class BrowserMinecraftClient {
                 elapsedMillis(this.connectStartedAt, this.closedAt),
         };
     }
+
+    dropTimingResult(dropAt) {
+        return {
+            dropToRelayConnectedMillis: elapsedMillis(dropAt, this.relayConnectedAt),
+            dropToHandshakeSentMillis: elapsedMillis(dropAt, this.handshakeSentAt),
+            dropToEncryptionRequestMillis:
+                elapsedMillis(dropAt, this.encryptionRequestAt),
+            dropToSessionJoinMillis: elapsedMillis(dropAt, this.sessionJoinAt),
+            dropToLoginFinishedMillis: elapsedMillis(dropAt, this.loginFinishedAt),
+            dropToConfigurationFinishedMillis:
+                elapsedMillis(dropAt, this.configurationFinishedAt),
+            dropToPlayLoginMillis: elapsedMillis(dropAt, this.playLoginAt),
+            dropToFirstChunkMillis: elapsedMillis(dropAt, this.firstChunkAt),
+            dropToMinimumChunksMillis: elapsedMillis(dropAt, this.minimumChunksAt),
+        };
+    }
 }
 
 function elapsedMillis(start, end) {
@@ -775,11 +1049,177 @@ function ratePerSecond(value, millis) {
     return Number((value * 1000 / millis).toFixed(3));
 }
 
+function timestampSpread(values) {
+    const finite = values.filter(Number.isFinite);
+    if (finite.length === 0) return null;
+    return Number((Math.max(...finite) - Math.min(...finite)).toFixed(3));
+}
+
+function sessionRuntimeSnapshot(state) {
+    return {
+        joins: state.joins.length,
+        hasJoined: state.hasJoined.length,
+        publicKeyRequests: state.publicKeyRequests,
+    };
+}
+
+function browserRuntimeSnapshot(runtime) {
+    return {
+        activeChannels: runtime.bridge.channels.size,
+        activeWebSockets: runtime.wsStats.sockets.size,
+        webSocketConnections: runtime.wsStats.connections,
+        queuedBytes: runtime.stats.queuedBytes,
+        queuedFrames: runtime.stats.queuedFrames,
+        inboundQueuedBytes: runtime.stats.inboundQueuedBytes,
+        activeRelayTargetLeases: runtime.stats.activeRelayTargetLeases,
+        relayTargetAttestationFailures: runtime.stats.relayTargetAttestationFailures,
+    };
+}
+
+function forceAbnormalTransportDrop(runtime, clients, wave) {
+    const probes = clients.map((client) => {
+        const entry = runtime.bridge.channels.get(client.id);
+        assert.ok(entry && !entry.closed && entry.ws,
+            `reconnect wave ${wave} client ${client.id} has no live bridge entry`);
+        const tail = Buffer.from(`gaius-reconnect-tail:${wave}:${client.id}`, "utf8");
+        assert.equal(typeof entry.ws.onmessage, "function",
+            "live bridge entry omitted its WebSocket message handler");
+        entry.ws.onmessage({
+            data: tail.buffer.slice(tail.byteOffset, tail.byteOffset + tail.byteLength),
+        });
+        return {
+            id: client.id,
+            entry,
+            tail,
+            terminatedAt: undefined,
+        };
+    });
+    for (const probe of probes) {
+        probe.terminatedAt = performance.now();
+        probe.entry.ws.terminate();
+    }
+    return probes;
+}
+
+async function captureAbnormalTransportDrop(runtime, probes) {
+    const evidence = [];
+    for (const probe of probes) {
+        await waitFor(
+            () => probe.entry.errors.length > 0 &&
+                runtime.bridge.hasPendingInbound(probe.id),
+            `abnormal close evidence for channel ${probe.id}`, 5000,
+            () => JSON.stringify({
+                closed: probe.entry.closed,
+                errors: probe.entry.errors,
+                pendingInbound: runtime.bridge.hasPendingInbound(probe.id),
+            }));
+        const chunks = [];
+        const deadline = Date.now() + 5000;
+        while (runtime.bridge.hasPendingInbound(probe.id)) {
+            const chunk = runtime.bridge.pollInbound(probe.id);
+            if (chunk === null) {
+                if (Date.now() >= deadline) {
+                    throw new Error(`timed out draining channel ${probe.id} close tail`);
+                }
+                await delay(0);
+                continue;
+            }
+            chunks.push(Buffer.from(chunk));
+        }
+        const drained = Buffer.concat(chunks);
+        const tailOffset = drained.indexOf(probe.tail);
+        assert.ok(tailOffset >= 0,
+            `abnormal close discarded channel ${probe.id} synthetic inbound marker`);
+        assert.equal(tailOffset + probe.tail.byteLength, drained.byteLength,
+            `channel ${probe.id} synthetic inbound marker was not the final queued bytes`);
+        const error = runtime.bridge.pollError(probe.id);
+        assert.match(String(error), /^WebSocket transport closed: (?!1000\b)\d+/,
+            `abnormal close omitted channel ${probe.id} transport error`);
+        assert.equal(runtime.bridge.channels.get(probe.id), probe.entry,
+            `abnormal close retired channel ${probe.id} before Java final close`);
+        evidence.push({
+            channelId: probe.id,
+            closeError: error,
+            nonNormalClose: true,
+            retainedEntry: true,
+            syntheticInboundMarker: {
+                preserved: true,
+                networkFrame: false,
+                source: "websocket-onmessage-before-abnormal-close",
+                markerSha256: createHash("sha256").update(probe.tail).digest("hex"),
+                drainedChunks: chunks.length,
+                drainedBytes: drained.byteLength,
+                markerOffset: tailOffset,
+                finalQueuedBytes: true,
+            },
+        });
+    }
+    return evidence;
+}
+
+function assertBrowserRuntimeClean(snapshot, label) {
+    assert.deepEqual({
+        activeChannels: snapshot.activeChannels,
+        activeWebSockets: snapshot.activeWebSockets,
+        queuedBytes: snapshot.queuedBytes,
+        queuedFrames: snapshot.queuedFrames,
+        inboundQueuedBytes: snapshot.inboundQueuedBytes,
+        activeRelayTargetLeases: snapshot.activeRelayTargetLeases,
+    }, {
+        activeChannels: 0,
+        activeWebSockets: 0,
+        queuedBytes: 0,
+        queuedFrames: 0,
+        inboundQueuedBytes: 0,
+        activeRelayTargetLeases: 0,
+    }, `${label} retained browser transport state`);
+}
+
+async function waitForBrowserRuntimeCleanup(runtime, label) {
+    await waitFor(() => {
+        const snapshot = browserRuntimeSnapshot(runtime);
+        return snapshot.activeChannels === 0 &&
+            snapshot.activeWebSockets === 0 &&
+            snapshot.queuedBytes === 0 &&
+            snapshot.queuedFrames === 0 &&
+            snapshot.inboundQueuedBytes === 0 &&
+            snapshot.activeRelayTargetLeases === 0;
+    }, label, 5000, () => JSON.stringify(browserRuntimeSnapshot(runtime)));
+}
+
 function browserFullPathPerformanceContract() {
     return {
         minimumChunkPackets,
         soakMillis: soakMs,
+        reconnectWaves,
         lifecycleCleanupRequired: true,
+        reconnect: {
+            simultaneousDrop: true,
+            abnormalTransportDrop: true,
+            transportCloseErrorRetained: true,
+            syntheticInboundMarkerRetained: true,
+            javaFinalCloseAfterTransportDrop: true,
+            freshChannelIds: true,
+            sameAccountIdentity: true,
+            freshProtocolBuffers: true,
+            freshEncryptionState: true,
+            requiredSessionChecksPerClientPerWave: {
+                joins: 1,
+                hasJoined: 1,
+            },
+            requiredMilestonesPerWave: [
+                "abnormal-transport-drop",
+                "close-error-retained",
+                "synthetic-inbound-marker-retained",
+                "java-final-close-all-zero",
+                "relay-connected",
+                "login-finished",
+                "configuration-finished",
+                "play-login",
+                "first-chunk",
+                `chunk-${minimumChunkPackets}`,
+            ],
+        },
         requiredMilestones: [
             "relay-connected",
             "login-finished",
@@ -791,9 +1231,17 @@ function browserFullPathPerformanceContract() {
     };
 }
 
-async function fetchRelayRuntime(port) {
-    const response = await fetch(`http://127.0.0.1:${port}/relay-node/v1`, {
-        headers: { origin },
+async function fetchRelayRuntime(port, targetPort) {
+    const runtimeUrl = new URL(`http://127.0.0.1:${port}/relay-node/v1`);
+    if (Number.isInteger(targetPort)) {
+        runtimeUrl.searchParams.set("host", "127.0.0.1");
+        runtimeUrl.searchParams.set("port", String(targetPort));
+    }
+    const response = await fetch(runtimeUrl, {
+        headers: {
+            origin,
+            authorization: `Bearer ${relayToken}`,
+        },
     });
     if (!response.ok) {
         throw new Error(`RelayNode runtime manifest returned ${response.status}`);
@@ -809,15 +1257,21 @@ async function fetchRelayRuntime(port) {
     return {
         activeConnections: manifest.activeConnections,
         availableConnections: manifest.availableConnections,
+        target: {
+            activeConnections: manifest.target?.activeConnections ?? 0,
+            totalConnections: manifest.target?.totalConnections ?? 0,
+            recentlyReachable: manifest.target?.recentlyReachable ?? false,
+            lastSuccessAgeMs: manifest.target?.lastSuccessAgeMs ?? null,
+        },
         runtime: manifest.runtime,
     };
 }
 
-async function waitForRelayRuntime(port, predicate, label, timeoutMillis) {
+async function waitForRelayRuntime(port, predicate, label, timeoutMillis, targetPort) {
     const deadline = Date.now() + timeoutMillis;
     let snapshot;
     while (true) {
-        snapshot = await fetchRelayRuntime(port);
+        snapshot = await fetchRelayRuntime(port, targetPort);
         if (predicate(snapshot)) return snapshot;
         if (Date.now() >= deadline) {
             throw new Error(`Timed out waiting for ${label}: ${JSON.stringify(snapshot)}`);
@@ -949,7 +1403,7 @@ async function createBrowserRuntime(port, token) {
                 socket.readyState === NodeWebSocket.CLOSED
                     ? Promise.resolve()
                     : once(socket, "close").catch(() => {})));
-            for (const id of [700, 701, 702, 703]) {
+            for (const id of [...bridge.channels.keys()]) {
                 try { bridge.close(id); } catch {}
             }
             await Promise.race([
