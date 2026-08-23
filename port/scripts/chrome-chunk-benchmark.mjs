@@ -136,10 +136,53 @@ if (!activeStorageProfileId || !Number.isSafeInteger(activeStorageWorldVersion) 
   );
 }
 const activeStoragePrefix = activeStorageConfig.prefix;
-// The FAST 6/4 release contract is the 26.2 overlay contract. Keep older
-// profiles observable, but never turn an accidental 1.21 8/6 natural launch
-// into release evidence.
-const releaseDistanceProfileCompatible = activeStorageProfileId === "26.2";
+// The headed Chrome release contract is shared by the supported version
+// profiles. Keep the capability table explicit and fail closed for an unknown
+// profile (or a profile whose identity/capability fields do not match).
+const supportedReleaseDistanceCapabilities = Object.freeze({
+  "26.2": Object.freeze({
+    capability: "headed-chrome-worker-distance-6-4",
+    clientDistribution: "named",
+    protocolVersion: 776,
+    worldVersion: 4903,
+    worldgenTelemetryMode: "task-pulsed",
+    workerDistance: "6:4",
+    workerDistanceMode: "natural-observation",
+  }),
+  "1.21.11": Object.freeze({
+    capability: "headed-chrome-worker-distance-6-4",
+    clientDistribution: "obfuscated-with-mappings",
+    protocolVersion: 774,
+    worldVersion: 4671,
+    worldgenTelemetryMode: "checkpoint-only",
+    workerDistance: "6:4",
+    workerDistanceMode: "natural-observation",
+  }),
+});
+const activeReleaseDistanceCapability = (() => {
+  const capability = supportedReleaseDistanceCapabilities[activeStorageProfileId];
+  if (!capability) return null;
+  const identityMatches = [
+    ["clientDistribution", activeVersionProfile.clientDistribution, capability.clientDistribution],
+    ["protocolVersion", Number(activeVersionProfile.protocolVersion), capability.protocolVersion],
+    ["worldVersion", activeStorageWorldVersion, capability.worldVersion],
+    ["worldgenTelemetryMode", activeWorldgenTelemetryMode, capability.worldgenTelemetryMode],
+  ].every(([, actual, expected]) => actual === expected);
+  return identityMatches ? capability : null;
+})();
+const releaseDistanceProfileCompatible = activeReleaseDistanceCapability !== null;
+const releaseDistanceCapability = Object.freeze({
+  supported: releaseDistanceProfileCompatible,
+  profileId: activeStorageProfileId,
+  capability: activeReleaseDistanceCapability?.capability || null,
+  workerDistance: activeReleaseDistanceCapability?.workerDistance || null,
+  workerDistanceMode: activeReleaseDistanceCapability?.workerDistanceMode || null,
+  reason: releaseDistanceProfileCompatible
+    ? null
+    : (supportedReleaseDistanceCapabilities[activeStorageProfileId]
+      ? "active version profile identity does not match its supported Chrome capability"
+      : "active version profile is not a supported headed Chrome release capability"),
+});
 const profileName = value("--profile", "traversal-6-4");
 const benchmarkProfile = performanceContract.profiles?.[profileName];
 if (!benchmarkProfile) {
@@ -232,6 +275,11 @@ if (attachPortRequested || attachPort > 0) {
   );
 }
 const headless = args.includes("--headless");
+if (!smoke && headless) {
+  throw new Error(
+    "--headless is disabled for strict headed Chrome release evidence",
+  );
+}
 const keepChrome = args.includes("--keep-chrome");
 const warmupMillis = duration(
   "--warmup-seconds",
@@ -557,6 +605,7 @@ if (args.includes("--print-config")) {
       gameplayPacketIds: activeGameplayPacketIds,
       airBlockStateId: activeAirBlockStateId,
     },
+    releaseDistanceCapability,
     visualOutputDirectory,
     cleanupMillis,
     sampleMillis,
@@ -577,7 +626,9 @@ if (args.includes("--print-config")) {
         : "profile-gate observation wrapper plus captured raw start message",
       mode: pinWorkerDistance ? "harness-pin-diagnostic" : "natural-observation",
       releaseEligible: !pinWorkerDistance && releaseDistanceProfileCompatible,
-      releaseTargetProfile: "26.2",
+      releaseTargetProfile: releaseDistanceProfileCompatible
+        ? releaseDistanceCapability.profileId : null,
+      capability: releaseDistanceCapability.capability,
       activeProfileId: activeStorageProfileId,
       storage: activeStorageConfig,
     },
@@ -3621,7 +3672,8 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
   }
   if (strict && profile.releaseEvidence === true && !releaseDistanceProfileCompatible) {
     environmentIssues.push(
-      `strict 6/4 release evidence is only supported for active profile 26.2; active profile is ${activeStorageProfileId}`,
+      `strict 6/4 release evidence requires a supported headed Chrome capability; `
+        + `${releaseDistanceCapability.reason} (active profile ${activeStorageProfileId})`,
     );
   }
   const expectedMaxFps = Number(environmentRules.maxFps || 260);
@@ -3712,7 +3764,9 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
       expectedWorkerServerDistance: expectedDistanceLabel,
       mode: pinWorkerDistance ? "harness-pin-diagnostic" : "natural-observation",
       releaseEligible: !pinWorkerDistance && releaseDistanceProfileCompatible,
-      releaseTargetProfile: "26.2",
+      releaseTargetProfile: releaseDistanceProfileCompatible
+        ? releaseDistanceCapability.profileId : null,
+      capability: releaseDistanceCapability.capability,
       activeProfileId: activeStorageProfileId,
       workerStartMessages: workerStartMessages.length,
       matchingWorkerStartMessages: workerStartContractMatches.length,
@@ -4962,6 +5016,7 @@ try {
       mode: analysis.mode,
       gating: analysis.gating,
       releaseEvidence: analysis.releaseEvidence,
+      releaseDistanceCapability,
       evidenceRole: analysis.evidenceRole,
       contractSchemaVersion: performanceContract.schemaVersion,
       profileName,
@@ -5053,12 +5108,15 @@ try {
         && benchmarkProfile.releaseEvidence === true,
       releaseEvidence: !pinWorkerDistance && !smoke && releaseDistanceProfileCompatible
         && benchmarkProfile.releaseEvidence === true,
+      releaseDistanceCapability,
       workerDistanceMode: pinWorkerDistance ? "harness-pin-diagnostic" : "natural-observation",
       workerDistancePin: pinWorkerDistance,
       workerDistanceContract: {
         mode: pinWorkerDistance ? "harness-pin-diagnostic" : "natural-observation",
         releaseEligible: !pinWorkerDistance && releaseDistanceProfileCompatible,
-        releaseTargetProfile: "26.2",
+        releaseTargetProfile: releaseDistanceProfileCompatible
+          ? releaseDistanceCapability.profileId : null,
+        capability: releaseDistanceCapability.capability,
         activeProfileId: activeStorageProfileId,
         expectedStartDistance: expectedDistanceLabel,
         expectedStorage: activeStorageConfig,

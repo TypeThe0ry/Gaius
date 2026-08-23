@@ -27,7 +27,12 @@ const script = fileURLToPath(new URL(
   "./chrome-performance-release-suite.mjs",
   import.meta.url,
 ));
+const benchmarkScript = fileURLToPath(new URL(
+  "./chrome-chunk-benchmark.mjs",
+  import.meta.url,
+));
 const source = await readFile(script, "utf8");
+const benchmarkSource = await readFile(benchmarkScript, "utf8");
 const fixtureRoot = await mkdtemp(join(tmpdir(), "gaius-release-suite-smoke-"));
 const fixtureProfileBytes = new Map();
 for (const profileId of ["26.2", "1.21.11"]) {
@@ -123,6 +128,16 @@ for (const required of [
   "--matrix",
 ]) {
   assert.ok(source.includes(required), `release suite is missing ${required}`);
+}
+for (const required of [
+  "supportedReleaseDistanceCapabilities",
+  "headed-chrome-worker-distance-6-4",
+  "releaseDistanceCapability",
+  "active version profile is not a supported headed Chrome release capability",
+  "--headless is disabled for strict headed Chrome release evidence",
+  "natural-observation",
+]) {
+  assert.ok(benchmarkSource.includes(required), `benchmark is missing ${required}`);
 }
 assert.match(source, /--attach-port is disabled/,
   "release suite must fail closed for attached Chrome");
@@ -496,6 +511,50 @@ assert.equal(validateChildReport(childReport(), {
   expectedBuildIdentity: fixtureIdentity,
 }).valid, false, "strict child cannot become smoke evidence");
 
+const benchmarkConfigurationFor = (identity) => JSON.parse(execFileSync(
+  process.execPath,
+  [benchmarkScript, "--profile", "traversal-6-4", "--print-config"],
+  suiteExecOptions(identity),
+));
+for (const [profileId, expected] of [
+  ["26.2", {
+    protocolVersion: 776,
+    worldVersion: 4903,
+    worldgenTelemetryMode: "task-pulsed",
+  }],
+  ["1.21.11", {
+    protocolVersion: 774,
+    worldVersion: 4671,
+    worldgenTelemetryMode: "checkpoint-only",
+  }],
+]) {
+  const benchmarkConfiguration = benchmarkConfigurationFor(
+    suiteManifestIdentities.get(profileId),
+  );
+  assert.equal(benchmarkConfiguration.activeVersionProfile.id, profileId);
+  assert.equal(benchmarkConfiguration.activeVersionProfile.protocolVersion,
+    expected.protocolVersion);
+  assert.equal(benchmarkConfiguration.activeVersionProfile.worldVersion,
+    expected.worldVersion);
+  assert.equal(benchmarkConfiguration.activeVersionProfile.worldgenTelemetryMode,
+    expected.worldgenTelemetryMode);
+  assert.equal(benchmarkConfiguration.releaseDistanceCapability.supported, true);
+  assert.equal(benchmarkConfiguration.releaseDistanceCapability.profileId, profileId);
+  assert.equal(
+    benchmarkConfiguration.releaseDistanceCapability.capability,
+    "headed-chrome-worker-distance-6-4",
+  );
+  assert.equal(benchmarkConfiguration.workerDistanceMode, "natural-observation");
+  assert.equal(benchmarkConfiguration.workerDistanceContract.mode, "natural-observation");
+  assert.equal(benchmarkConfiguration.workerDistanceContract.releaseEligible, true);
+  assert.equal(benchmarkConfiguration.workerDistanceContract.releaseTargetProfile, profileId);
+  assert.equal(benchmarkConfiguration.workerDistanceContract.capability,
+    "headed-chrome-worker-distance-6-4");
+  assert.equal(benchmarkConfiguration.mode, "release-gating");
+  assert.equal(benchmarkConfiguration.gating, true);
+  assert.equal(benchmarkConfiguration.releaseEvidence, true);
+}
+
 const configuration = JSON.parse(execFileSync(
   process.execPath,
   [script, "--print-config"],
@@ -532,6 +591,11 @@ assert.deepEqual(configuration.releasePlan.mandatoryProfiles, [
 assert.deepEqual(configuration.unsupportedProfiles.map((profile) => profile.profile), ["soak-mp-6-4"]);
 assert.equal(configuration.unsupportedProfiles[0].releaseEvidence, false);
 assert.equal(configuration.releaseEvidence, false);
+assert.ok(
+  configuration.profiles.length > 0
+    && configuration.profiles.every((profile) => profile.releaseEvidence === true),
+  "strict 26.2 suite profiles must remain release-gating",
+);
 
 const legacyConfiguration = JSON.parse(execFileSync(
   process.execPath,
@@ -548,6 +612,11 @@ assert.equal(legacyConfiguration.buildIdentity.worldgenTelemetryMode, "checkpoin
 assert.deepEqual(
   legacyConfiguration.buildIdentity.storage,
   legacyReleaseManifestFixtureIdentity.storage,
+);
+assert.ok(
+  legacyConfiguration.profiles.length > 0
+    && legacyConfiguration.profiles.every((profile) => profile.releaseEvidence === true),
+  "strict 1.21.11 suite profiles must remain release-gating",
 );
 
 const matrixConfiguration = JSON.parse(execFileSync(

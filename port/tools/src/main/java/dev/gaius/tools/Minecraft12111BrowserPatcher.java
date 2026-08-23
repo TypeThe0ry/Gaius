@@ -11,6 +11,7 @@ import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.FieldNode;
+import org.objectweb.asm.tree.IntInsnNode;
 import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.JumpInsnNode;
@@ -18,6 +19,7 @@ import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.TableSwitchInsnNode;
 import org.objectweb.asm.tree.TryCatchBlockNode;
 import org.objectweb.asm.tree.TypeInsnNode;
 import org.objectweb.asm.tree.VarInsnNode;
@@ -55,7 +57,189 @@ public final class Minecraft12111BrowserPatcher {
         }
         String jar = args[0];
         Path root = Path.of(args[1]);
+        patchGraphicsPresetBrowserDistances(jar, root);
         patchChunkGenerationCooperation(jar, root);
+    }
+
+    /**
+     * Keeps the 1.21.11 FAST preset inside the browser profile's 6/4 distance
+     * contract.
+     *
+     * <p>This is a narrow bytecode overlay on the FAST ordinal arm.  Match the
+     * ordinal switch, the FAST arm's vanilla 8/6 constants, both Options getter
+     * receiver chains, the boxed integer stores, and the preset setter
+     * before changing exactly those two constants.  Any missing, duplicated, or
+     * reshaped target fails closed instead of changing an unrelated integer in
+     * the preset method.</p>
+     */
+    private static void patchGraphicsPresetBrowserDistances(String jar, Path root)
+            throws IOException {
+        String owner = "net/minecraft/client/GraphicsPreset";
+        String minecraft = "net/minecraft/client/Minecraft";
+        String options = "net/minecraft/client/Options";
+        String optionInstance = "Lnet/minecraft/client/OptionInstance;";
+        String optionScreen = "Lnet/minecraft/client/gui/screens/options/OptionsSubScreen;";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode apply = find(node, "apply", "(L" + minecraft + ";)V");
+
+        TableSwitchInsnNode presetSwitch = null;
+        int switches = 0;
+        for (AbstractInsnNode instruction : apply.instructions.toArray()) {
+            if (instruction instanceof TableSwitchInsnNode table
+                    && table.min == 0
+                    && table.max == 2) {
+                presetSwitch = table;
+                switches++;
+            }
+        }
+        requireOne("GraphicsPreset.apply ordinal switch", switches);
+        if (presetSwitch == null || presetSwitch.labels.size() != 3) {
+            throw new IllegalStateException("GraphicsPreset.apply FAST switch arm is missing");
+        }
+
+        int fastStart = apply.instructions.indexOf(presetSwitch.labels.get(0));
+        if (fastStart < 0) {
+            throw new IllegalStateException("GraphicsPreset.apply FAST switch label is missing");
+        }
+        AbstractInsnNode fastDistance = nextOpcode(presetSwitch.labels.get(0));
+        if (!(fastDistance instanceof IntInsnNode integer)
+                || integer.getOpcode() != Opcodes.BIPUSH
+                || integer.operand != 8) {
+            throw new IllegalStateException(
+                    "GraphicsPreset.apply FAST arm distance preamble changed");
+        }
+        AbstractInsnNode fastDistanceLocal = nextOpcode(fastDistance);
+        if (!(fastDistanceLocal instanceof VarInsnNode local)
+                || local.getOpcode() != Opcodes.ISTORE
+                || local.var != 4) {
+            throw new IllegalStateException(
+                    "GraphicsPreset.apply FAST arm distance local changed");
+        }
+
+        int fastEnd = apply.instructions.size();
+        for (LabelNode branch : presetSwitch.labels) {
+            int index = apply.instructions.indexOf(branch);
+            if (index > fastStart && index < fastEnd) {
+                fastEnd = index;
+            }
+        }
+        int defaultIndex = apply.instructions.indexOf(presetSwitch.dflt);
+        if (defaultIndex > fastStart && defaultIndex < fastEnd) {
+            fastEnd = defaultIndex;
+        }
+        if (fastEnd == apply.instructions.size()) {
+            throw new IllegalStateException("GraphicsPreset.apply FAST arm end is missing");
+        }
+
+        IntInsnNode renderDistance = findGraphicsPresetDistanceConstant(
+                apply,
+                fastStart,
+                fastEnd,
+                options,
+                optionInstance,
+                optionScreen,
+                minecraft,
+                owner,
+                "renderDistance",
+                8);
+        IntInsnNode simulationDistance = findGraphicsPresetDistanceConstant(
+                apply,
+                fastStart,
+                fastEnd,
+                options,
+                optionInstance,
+                optionScreen,
+                minecraft,
+                owner,
+                "simulationDistance",
+                6);
+        renderDistance.operand = 6;
+        simulationDistance.operand = 4;
+
+        write(node, root.resolve(owner + ".class"));
+        System.out.println(
+                "Bounded Minecraft 1.21.11 FAST graphics preset distances to render=6 simulation=4");
+    }
+
+    private static IntInsnNode findGraphicsPresetDistanceConstant(
+            MethodNode method,
+            int start,
+            int end,
+            String options,
+            String optionInstance,
+            String optionScreen,
+            String minecraft,
+            String graphicsPreset,
+            String getter,
+            int expected) {
+        int getterCount = 0;
+        IntInsnNode constant = null;
+        AbstractInsnNode[] instructions = method.instructions.toArray();
+        for (int index = start; index < end; index++) {
+            AbstractInsnNode instruction = instructions[index];
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKEVIRTUAL
+                    || !call.owner.equals(options)
+                    || !call.name.equals(getter)
+                    || !call.desc.equals("()" + optionInstance)) {
+                continue;
+            }
+            getterCount++;
+            AbstractInsnNode optionsField = previousOpcode(call);
+            AbstractInsnNode minecraftLoad = previousOpcode(optionsField);
+            AbstractInsnNode screenLoad = previousOpcode(minecraftLoad);
+            AbstractInsnNode presetLoad = previousOpcode(screenLoad);
+            if (!(optionsField instanceof FieldInsnNode field)
+                    || field.getOpcode() != Opcodes.GETFIELD
+                    || !field.owner.equals(minecraft)
+                    || !field.name.equals("options")
+                    || !field.desc.equals("L" + options + ";")
+                    || !(minecraftLoad instanceof VarInsnNode minecraftReceiver)
+                    || minecraftReceiver.getOpcode() != Opcodes.ALOAD
+                    || minecraftReceiver.var != 1
+                    || !(screenLoad instanceof VarInsnNode screenReceiver)
+                    || screenReceiver.getOpcode() != Opcodes.ALOAD
+                    || screenReceiver.var != 2
+                    || !(presetLoad instanceof VarInsnNode presetReceiver)
+                    || presetReceiver.getOpcode() != Opcodes.ALOAD
+                    || presetReceiver.var != 0) {
+                throw new IllegalStateException(
+                        "GraphicsPreset.apply FAST " + getter + " receiver shape changed");
+            }
+            AbstractInsnNode value = nextOpcode(call);
+            if (!(value instanceof IntInsnNode integer)
+                    || integer.getOpcode() != Opcodes.BIPUSH
+                    || integer.operand != expected) {
+                throw new IllegalStateException(
+                        "GraphicsPreset.apply FAST " + getter + " constant shape changed");
+            }
+            AbstractInsnNode boxed = nextOpcode(value);
+            if (!(boxed instanceof MethodInsnNode box)
+                    || box.getOpcode() != Opcodes.INVOKESTATIC
+                    || !box.owner.equals("java/lang/Integer")
+                    || !box.name.equals("valueOf")
+                    || !box.desc.equals("(I)Ljava/lang/Integer;")) {
+                throw new IllegalStateException(
+                        "GraphicsPreset.apply FAST " + getter + " boxing shape changed");
+            }
+            AbstractInsnNode setter = nextOpcode(boxed);
+            if (!(setter instanceof MethodInsnNode set)
+                    || set.getOpcode() != Opcodes.INVOKEVIRTUAL
+                    || !set.owner.equals(graphicsPreset)
+                    || !set.name.equals("set")
+                    || !set.desc.equals("(" + optionScreen + optionInstance
+                            + "Ljava/lang/Object;)V")) {
+                throw new IllegalStateException(
+                        "GraphicsPreset.apply FAST " + getter + " setter shape changed");
+            }
+            constant = integer;
+        }
+        requireOne("GraphicsPreset.apply FAST " + getter + " target", getterCount);
+        if (constant == null) {
+            throw new IllegalStateException(
+                    "GraphicsPreset.apply FAST " + getter + " target is missing");
+        }
+        return constant;
     }
 
     private static void patchChunkGenerationCooperation(String jar, Path root)
@@ -690,6 +874,28 @@ public final class Minecraft12111BrowserPatcher {
         method.maxLocals = maxLocals;
     }
 
+    private static AbstractInsnNode nextOpcode(AbstractInsnNode instruction) {
+        AbstractInsnNode cursor = instruction == null ? null : instruction.getNext();
+        while (cursor != null && cursor.getOpcode() < 0) {
+            cursor = cursor.getNext();
+        }
+        return cursor;
+    }
+
+    private static AbstractInsnNode previousOpcode(AbstractInsnNode instruction) {
+        AbstractInsnNode cursor = instruction == null ? null : instruction.getPrevious();
+        while (cursor != null && cursor.getOpcode() < 0) {
+            cursor = cursor.getPrevious();
+        }
+        return cursor;
+    }
+
+    private static void requireOne(String target, int count) {
+        if (count != 1) {
+            throw new IllegalStateException(target + " changed: " + count);
+        }
+    }
+
     private static MethodNode find(ClassNode node, String name, String descriptor) {
         return node.methods.stream()
                 .filter(method -> method.name.equals(name) && method.desc.equals(descriptor))
@@ -712,6 +918,13 @@ public final class Minecraft12111BrowserPatcher {
         ClassNode node = new ClassNode();
         new ClassReader(bytes).accept(node, 0);
         return node;
+    }
+
+    private static void write(ClassNode node, Path output) throws IOException {
+        ClassWriter writer = new ClassWriter(0);
+        node.accept(writer);
+        Files.createDirectories(output.getParent());
+        Files.write(output, writer.toByteArray());
     }
 
     private static void writeComputeFrames(ClassNode node, Path output) throws IOException {

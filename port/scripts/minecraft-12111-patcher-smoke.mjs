@@ -79,6 +79,31 @@ function bytecodeInstructions(methodBytecode) {
   });
 }
 
+function graphicsPresetApply(bytecode) {
+  return method(bytecode,
+    "public void apply(net.minecraft.client.Minecraft);",
+    "private static <T> void set(");
+}
+
+function graphicsPresetDistanceConstants(applyBytecode, getter) {
+  const instructions = bytecodeInstructions(applyBytecode);
+  const matches = instructions.flatMap((entry, index) =>
+    entry.instruction.includes(`Options.${getter}:`) ? [index] : []);
+  assert.equal(matches.length, 3,
+    `GraphicsPreset.apply must have three ${getter} setter calls`);
+  return matches.map(index => (instructions[index + 1]?.instruction ?? "").replace(/\s+/g, " "));
+}
+
+function graphicsPresetCustomReturn(applyBytecode) {
+  const target = applyBytecode.match(/default:\s+(\d+)/);
+  assert.ok(target, "GraphicsPreset.apply ordinal switch has no CUSTOM default");
+  const entry = bytecodeInstructions(applyBytecode)
+    .find(instruction => instruction.offset === Number(target[1]));
+  assert.equal(entry?.instruction, "return",
+    "GraphicsPreset.apply CUSTOM arm is no longer the default return arm");
+  return entry.instruction;
+}
+
 const HOLDERS_PER_TURN = 16;
 
 function cursorModel(radius, stop = null, batchLimit = HOLDERS_PER_TURN) {
@@ -312,6 +337,12 @@ assert.match(patcherSource, /Opcodes\.GETFIELD, CHUNK_POS, "z", "I"/,
   "1.21.11 cursor must read public ChunkPos.z");
 assert.match(patcherSource, /Platform/,
   "1.21.11 cursor must schedule a browser-turn continuation");
+assert.match(patcherSource, /patchGraphicsPresetBrowserDistances\(jar, root\)/,
+  "1.21.11 dedicated patcher must invoke its FAST graphics overlay");
+assert.match(patcherSource, /findGraphicsPresetDistanceConstant/,
+  "1.21.11 graphics overlay must retain the render-distance shape guard");
+assert.match(patcherSource, /GraphicsPreset\.apply FAST .*getter/,
+  "1.21.11 graphics overlay must retain the per-getter shape guard");
 
 const root = await mkdtemp(join(tmpdir(), "gaius-mc12111-cursor-"));
 try {
@@ -342,9 +373,38 @@ try {
     "dedicated patcher did not emit ChunkGenerationTask.class");
   assert.ok(patchNames.includes("dev/gaius/browser/BrowserChunkGenerationYield.class"),
     "dedicated patcher did not emit BrowserChunkGenerationYield.class");
+  assert.ok(patchNames.includes("net/minecraft/client/GraphicsPreset.class"),
+    "dedicated patcher did not emit GraphicsPreset.class");
+
+  const rawGraphics = execFileSync(javap, ["-classpath", rawClientJar, "-p", "-c",
+    "net.minecraft.client.GraphicsPreset"], {
+      encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30_000,
+    });
   await execFileSync(jar, ["--update", "--file", clientJar, "-C", patches, "."], {
     encoding: "utf8", timeout: 30_000,
   });
+
+  const patchedGraphics = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
+    "net.minecraft.client.GraphicsPreset"], {
+      encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30_000,
+    });
+  const rawGraphicsApply = graphicsPresetApply(rawGraphics);
+  const patchedGraphicsApply = graphicsPresetApply(patchedGraphics);
+  assert.deepEqual(graphicsPresetDistanceConstants(rawGraphicsApply, "renderDistance"),
+    ["bipush 8", "bipush 16", "bipush 32"],
+    "1.21.11 raw FAST render distance shape changed");
+  assert.deepEqual(graphicsPresetDistanceConstants(rawGraphicsApply, "simulationDistance"),
+    ["bipush 6", "bipush 12", "bipush 12"],
+    "1.21.11 raw FAST simulation distance shape changed");
+  assert.deepEqual(graphicsPresetDistanceConstants(patchedGraphicsApply, "renderDistance"),
+    ["bipush 6", "bipush 16", "bipush 32"],
+    "1.21.11 FAST render distance was not overlaid to 6");
+  assert.deepEqual(graphicsPresetDistanceConstants(patchedGraphicsApply, "simulationDistance"),
+    ["bipush 4", "bipush 12", "bipush 12"],
+    "1.21.11 FAST simulation distance was not overlaid to 4");
+  assert.equal(graphicsPresetCustomReturn(patchedGraphicsApply),
+    graphicsPresetCustomReturn(rawGraphicsApply),
+    "1.21.11 CUSTOM graphics preset arm changed");
 
   const verifierClasspath = [asm, asmTree, asmAnalysis].join(delimiter);
   execFileSync(javac, [
