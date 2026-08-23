@@ -174,6 +174,17 @@ MINECRAFT_262_BROWSER_PATCHER = (
     / "tools"
     / "Minecraft262BrowserPatcher.java"
 )
+MINECRAFT_12111_BROWSER_PATCHER = (
+    PORT
+    / "tools"
+    / "src"
+    / "main"
+    / "java"
+    / "dev"
+    / "gaius"
+    / "tools"
+    / "Minecraft12111BrowserPatcher.java"
+)
 CLASSLIB_PATCHER = PORT / "tools" / "src" / "main" / "java" / "dev" / "gaius" / "tools" / "TeaVMClasslibPatcher.java"
 JOML_MATH_PATCHER = PORT / "tools" / "src" / "main" / "java" / "dev" / "gaius" / "tools" / "JomlMathPatcher.java"
 VANILLA_PACK_RESOURCES = PORT / "overrides" / "client" / "src" / "main" / "java" / "net" / "minecraft" / "server" / "packs" / "VanillaPackResources.java"
@@ -1987,6 +1998,11 @@ def check_source_patches() -> None:
     minecraft_262_browser_patcher = (
         MINECRAFT_262_BROWSER_PATCHER.read_text(errors="replace")
         if MINECRAFT_262_BROWSER_PATCHER.exists()
+        else ""
+    )
+    minecraft_12111_browser_patcher = (
+        MINECRAFT_12111_BROWSER_PATCHER.read_text(errors="replace")
+        if MINECRAFT_12111_BROWSER_PATCHER.exists()
         else ""
     )
     classlib_patcher = CLASSLIB_PATCHER.read_text(errors="replace") if CLASSLIB_PATCHER.exists() else ""
@@ -5743,6 +5759,31 @@ def check_source_patches() -> None:
                     'requireWorldgenSchedulerCalls("LevelChunkSection.fillBiomesFromNoise", method, 0)',
                 )
             ),
+        ),
+        (
+            "1.21.11 keeps worldgen checkpoint-only with a scheduler-free holder cursor",
+            "patchChunkGenerationCooperation(jar, root)" in minecraft_12111_browser_patcher
+            and "Minecraft 1.21.11" in minecraft_12111_browser_patcher
+            and all(
+                marker in minecraft_12111_browser_patcher
+                for marker in (
+                    "ChunkGenerationTask.runUntilWait",
+                    "replaceChunkGenerationScheduleNextLayer(",
+                    "replaceChunkGenerationScheduleLayer(",
+                    "writeChunkGenerationYieldHelper(root)",
+                    'Opcodes.GETFIELD, CHUNK_POS, "x", "I"',
+                    'Opcodes.GETFIELD, CHUNK_POS, "z", "I"',
+                    '"org/teavm/platform/Platform"',
+                    '"schedule"',
+                    '"Ljava/util/concurrent/CompletableFuture;"',
+                )
+            )
+            and "BrowserWorldgenScheduler" not in minecraft_12111_browser_patcher
+            and '"pulse"' not in minecraft_12111_browser_patcher
+            and '"checkpoint"' not in minecraft_12111_browser_patcher
+            and "TryCatchBlockNode" in minecraft_12111_browser_patcher
+            and "writeComputeFrames(node, root.resolve(owner + \".class\"))"
+                in minecraft_12111_browser_patcher
         ),
         (
             "TeaVM LockSupport wakes parked Worker threads with one-shot permits",

@@ -799,6 +799,17 @@ if [[ "$version" == "26.2" ]]; then
   jar --update \
     --file "$client_output" \
     -C "$client_patch_classes" net/minecraft/server/jsonrpc/JsonRpc.class
+elif [[ "$version" == "1.21.11" ]]; then
+  # 1.21.11 keeps deep worldgen synchronous.  Its checkpoint-only contract
+  # is implemented by the task-layer holder cursor, not by adding scheduler
+  # pulse/checkpoint calls to ChunkGenerationTask or any deep hot class.
+  java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
+    dev.gaius.tools.Minecraft12111BrowserPatcher \
+    "$client_output" \
+    "$client_patch_classes"
+  jar --update \
+    --file "$client_output" \
+    -C "$client_patch_classes" .
 fi
 
 echo "$output"
