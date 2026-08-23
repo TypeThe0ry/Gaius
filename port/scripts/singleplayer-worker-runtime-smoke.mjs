@@ -8,6 +8,11 @@ import {inflateSync} from "node:zlib";
 import {basename, isAbsolute} from "node:path";
 import {fileURLToPath, pathToFileURL} from "node:url";
 import {
+  FINAL_OUTPUT_WRITE_TIMEOUT_MS,
+  effectiveExitCode,
+  writeChunkAndDrain,
+} from "./singleplayer-worker-runtime-output.mjs";
+import {
   MessageChannel,
   MessagePort,
   Worker,
@@ -1660,14 +1665,29 @@ function runNetworkValidationSelfSmoke() {
   };
 }
 
-if (isMainThread && process.env.GAIUS_SMOKE_SELF_TEST === "1") {
-  process.stdout.write(JSON.stringify({
+const runtimeSelfTest = isMainThread && process.env.GAIUS_SMOKE_SELF_TEST === "1";
+
+if (runtimeSelfTest) {
+  const selfTestOutput = JSON.stringify({
     ...runNetworkValidationSelfSmoke(),
     telemetrySnapshots: runTelemetrySnapshotSelfSmoke(),
     slowProbe: runSlowProbeSelfSmoke(),
     timeoutEvidence: runWorkerEventLoopEvidenceSelfSmoke(),
-  }) + "\n");
-  process.exit(0);
+  }) + "\n";
+  try {
+    await writeChunkAndDrain(process.stdout, selfTestOutput, {
+      timeoutMs: FINAL_OUTPUT_WRITE_TIMEOUT_MS,
+    });
+    process.exitCode = 0;
+  } catch (error) {
+    try {
+      process.stderr.write(`singleplayer-worker-runtime self-test output failed: ${
+        error.stack || String(error)}\n`);
+    } finally {
+      process.exitCode = 1;
+    }
+  }
+  process.exit(process.exitCode);
 }
 
 function networkDrainSignature(stats) {
@@ -1679,7 +1699,7 @@ function networkDrainSignature(stats) {
   return requiredNetworkTaskTelemetryFields.map((field) => stats[field]).join("/");
 }
 
-if (isMainThread) {
+if (isMainThread && !runtimeSelfTest) {
   const smokeStartedAt = Date.now();
   const events = [];
   let finished = false;
@@ -2345,16 +2365,56 @@ if (isMainThread) {
       finish(1);
     });
   };
+  let finishPromise;
   const finish = (code) => {
-    if (finished) {
-      return;
+    if (finishPromise !== undefined) {
+      return finishPromise;
     }
     finished = true;
     clearInterval(eventLoopProbeInterval);
     if (cpuProfileStopTimer) clearTimeout(cpuProfileStopTimer);
     if (coverageStopTimer) clearTimeout(coverageStopTimer);
-    process.stdout.write(JSON.stringify({events}, null, 2) + "\n");
-    void worker.terminate().finally(() => process.exit(code));
+    finishPromise = (async () => {
+      let finalOutputFailed = false;
+      try {
+        const finalJson = JSON.stringify({events}, null, 2) + "\n";
+        await writeChunkAndDrain(process.stdout, finalJson, {
+          timeoutMs: FINAL_OUTPUT_WRITE_TIMEOUT_MS,
+        });
+      } catch (error) {
+        finalOutputFailed = true;
+        // Promote a nominal success when the final record failed; existing
+        // nonzero smoke reasons remain unchanged.
+        try {
+          process.stderr.write(`singleplayer-worker-runtime final output failed: ${
+            error.stack || String(error)}\n`);
+        } catch {
+          // stderr can itself be closed during an abnormal shutdown.
+        }
+      }
+      const finalExitCode = effectiveExitCode(code, finalOutputFailed);
+      let terminationTimer;
+      try {
+        await Promise.race([
+          Promise.resolve().then(() => worker.terminate()),
+          new Promise((resolve) => {
+            terminationTimer = setTimeout(resolve, FINAL_OUTPUT_WRITE_TIMEOUT_MS);
+          }),
+        ]);
+      } catch (error) {
+        try {
+          process.stderr.write(`singleplayer-worker-runtime worker termination failed: ${
+            error.stack || String(error)}\n`);
+        } catch {
+          // stderr can itself be closed during an abnormal shutdown.
+        }
+      } finally {
+        if (terminationTimer !== undefined) clearTimeout(terminationTimer);
+      }
+      process.exitCode = finalExitCode;
+      process.exit(finalExitCode);
+    })();
+    return finishPromise;
   };
   const timeoutMs = Number(process.env.GAIUS_SMOKE_TIMEOUT_MS || "240000");
   const timeout = setTimeout(() => {
