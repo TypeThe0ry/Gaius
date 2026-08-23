@@ -81,8 +81,13 @@ for (const contract of [
   "patchRegionFileStorageCache(jar, root)",
   "BROWSER_REGION_FILE_CACHE_SIZE = 16",
   '"ChunkGenerationTask.runUntilWait"',
-  '"ChunkGenerationTask.scheduleLayer"',
   '"ChunkGenerationTask.canLoadWithoutGeneration"',
+  '"browserLayerActive"',
+  '"browserLayerYield"',
+  'BrowserChunkGenerationYield',
+  '"org/teavm/platform/Platform"',
+  'replaceChunkGenerationScheduleLayer(',
+  'writeChunkGenerationYieldHelper(root)',
   "patchGlBufferMappedViewRanges(jar, root)",
   "patchLiveFrameTargeting(jar, root)",
   "patchSectionRenderTaskRetryYields(jar, root)",
@@ -279,8 +284,21 @@ assert.match(runUntilWait, /Exception table:[\s\S]*Throwable/,
 assert.ok(runUntilWait.indexOf("scheduleNextLayer")
     < runUntilWait.indexOf("BrowserWorldgenScheduler.pulse"),
 "runUntilWait pulses before making layer progress");
-assert.equal(scheduleLayer.match(/BrowserWorldgenScheduler\.pulse/g)?.length, 2,
-  "scheduleLayer must pulse on its two chunk-scan backedges");
+assert.equal(scheduleLayer.match(/BrowserWorldgenScheduler\.pulse/g)?.length, 1,
+  "scheduleLayer must pulse once at each holder cursor boundary");
+assert.match(scheduleLayer, /browserLayerX[\s\S]*browserLayerZ/,
+  "scheduleLayer must retain a holder cursor across browser turns");
+assert.match(scheduleLayer, /BrowserChunkGenerationYield/,
+  "scheduleLayer must schedule a continuation future after each holder");
+assert.equal(scheduleLayer.match(/Platform\.schedule/g)?.length, 1,
+  "scheduleLayer must use one zero-delay platform continuation");
+assert.match(scheduleLayer, /Exception table:[\s\S]*Throwable/,
+  "scheduleLayer must clean cursor state when holder work throws");
+const scheduleLayerExceptionCleanup = scheduleLayer.slice(scheduleLayer.lastIndexOf("astore"));
+assert.match(scheduleLayerExceptionCleanup, /Field browserLayerActive/,
+  "scheduleLayer exception path must clear active cursor state");
+assert.match(scheduleLayerExceptionCleanup, /Field browserLayerYield/,
+  "scheduleLayer exception path must clear pending continuation state");
 assert.equal(canLoadWithoutGeneration.match(/BrowserWorldgenScheduler\.pulse/g)?.length, 2,
   "canLoadWithoutGeneration must pulse on its two dependency-scan backedges");
 for (const body of [runUntilWait, scheduleLayer, canLoadWithoutGeneration]) {

@@ -5641,7 +5641,7 @@ def check_source_patches() -> None:
                 for marker in (
                     "ChunkGenerationTask.runUntilWait",
                     "ChunkGenerationTask.waitForScheduledLayer",
-                    "ChunkGenerationTask.scheduleLayer",
+                    "replaceChunkGenerationScheduleLayer(",
                     "ChunkGenerationTask.canLoadWithoutGeneration",
                 )
             )
@@ -11765,7 +11765,15 @@ def check_overlay_bytecode() -> None:
                     ) == 1
                     and generation_schedule_layer.count(
                         "BrowserWorldgenScheduler.pulse"
-                    ) == 2
+                    ) == 1
+                    and "browserLayerX" in generation_schedule_layer
+                    and "browserLayerZ" in generation_schedule_layer
+                    and "browserLayerYield" in generation_schedule_layer
+                    and "BrowserChunkGenerationYield" in generation_schedule_layer
+                    and "org/teavm/platform/Platform.schedule" in generation_schedule_layer
+                    and "Exception table:" in generation_schedule_layer
+                    and "Field browserLayerActive" in generation_schedule_layer
+                    and "Field browserLayerYield" in generation_schedule_layer
                     and generation_can_load_without_generation.count(
                         "BrowserWorldgenScheduler.pulse"
                     ) == 2

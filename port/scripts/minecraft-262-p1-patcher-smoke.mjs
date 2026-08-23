@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
-import {access, copyFile, mkdir, mkdtemp, readFile, rm} from "node:fs/promises";
+import {access, copyFile, mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
 import {existsSync} from "node:fs";
 import {homedir, tmpdir} from "node:os";
 import {basename, delimiter, join} from "node:path";
@@ -29,6 +29,7 @@ const toolsSource = join(repositoryRoot, "port/tools/src/main/java/dev/gaius/too
 const asmRoot = join(homedir(), ".m2/repository/org/ow2/asm");
 const asm = join(asmRoot, "asm/9.8/asm-9.8.jar");
 const asmTree = join(asmRoot, "asm-tree/9.8/asm-tree-9.8.jar");
+const asmAnalysis = join(asmRoot, "asm-analysis/9.8/asm-analysis-9.8.jar");
 const forbiddenDeepWorldgenPatchHelpers = Object.freeze([
   "patchFeatureDecorationCooperation",
   "patchCarverCooperation",
@@ -109,7 +110,70 @@ function graphicsPresetCustomReturn(applyBytecode) {
   return entry.instruction;
 }
 
-await Promise.all([access(rawClientJar), access(raw121ClientJar), access(asm), access(asmTree)]);
+function cursorModel(radius, stop = null) {
+  const turns = [];
+  let active = true;
+  let yieldPending = false;
+  for (let x = -radius; x <= radius && active; x++) {
+    for (let z = -radius; z <= radius && active; z++) {
+      const index = turns.length;
+      const outcome = stop?.index === index ? stop.kind : "success";
+      turns.push({x, z, outcome});
+      if (outcome !== "success") {
+        active = false;
+        yieldPending = false;
+        continue;
+      }
+      // Each successful holder schedules one continuation; the next browser turn
+      // consumes it before resuming the cursor.
+      yieldPending = true;
+      yieldPending = false;
+      if (x === radius && z === radius) {
+        active = false;
+      }
+    }
+  }
+  return {turns, active, yieldPending};
+}
+
+for (const radius of [0, 1, 2]) {
+  const run = cursorModel(radius);
+  const expected = (radius * 2 + 1) ** 2;
+  assert.equal(run.turns.length, expected,
+    `cursor radius ${radius} must visit every holder exactly once`);
+  assert.equal(run.active, false,
+    `cursor radius ${radius} must close after its final holder`);
+  assert.equal(new Set(run.turns.map(({x, z}) => `${x},${z}`)).size, expected,
+    `cursor radius ${radius} must not duplicate holders`);
+  assert.equal(run.turns.at(-1)?.outcome, "success",
+    `cursor radius ${radius} must process its final holder before closing`);
+}
+const cancelledCursor = cursorModel(2, {index: 3, kind: "cancel"});
+assert.equal(cancelledCursor.turns.length, 4,
+  "cursor cancellation must stop at the cancellation holder");
+assert.equal(cancelledCursor.turns.at(-1)?.outcome, "cancel",
+  "cursor cancellation outcome must be observable at the holder boundary");
+assert.equal(cancelledCursor.active, false,
+  "cursor cancellation must clear active state");
+assert.equal(cancelledCursor.yieldPending, false,
+  "cursor cancellation must not retain a continuation future");
+const failedCursor = cursorModel(2, {index: 4, kind: "failure"});
+assert.equal(failedCursor.turns.length, 5,
+  "cursor failure must stop at the failed holder");
+assert.equal(failedCursor.turns.at(-1)?.outcome, "failure",
+  "cursor failure outcome must be observable at the holder boundary");
+assert.equal(failedCursor.active, false,
+  "cursor failure must clear active state");
+assert.equal(failedCursor.yieldPending, false,
+  "cursor failure must not retain a continuation future");
+
+await Promise.all([
+  access(rawClientJar),
+  access(raw121ClientJar),
+  access(asm),
+  access(asmTree),
+  access(asmAnalysis),
+]);
 const browserPatcherSource = await readFile(
   join(toolsSource, "Minecraft262BrowserPatcher.java"),
   "utf8",
@@ -193,6 +257,55 @@ try {
   execFileSync(jar, ["--update", "--file", clientJar, "-C", browserPatches, "."], {
     encoding: "utf8", timeout: 30_000,
   });
+
+  const verifierSource = join(root, "GaiusBytecodeVerifier.java");
+  await writeFile(verifierSource, `
+import java.util.zip.ZipFile;
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.analysis.Analyzer;
+import org.objectweb.asm.tree.analysis.BasicValue;
+import org.objectweb.asm.tree.analysis.BasicVerifier;
+
+public final class GaiusBytecodeVerifier {
+    private static void verify(ZipFile jar, String name) throws Exception {
+        var entry = jar.getEntry(name);
+        if (entry == null) {
+            throw new IllegalStateException("missing verifier entry: " + name);
+        }
+        ClassNode node = new ClassNode();
+        try (var input = jar.getInputStream(entry)) {
+            new ClassReader(input.readAllBytes()).accept(node, 0);
+        }
+        for (MethodNode method : node.methods) {
+            new Analyzer<BasicValue>(new BasicVerifier()).analyze(node.name, method);
+        }
+        System.out.println("BASIC_VERIFIER_OK " + name);
+    }
+
+    public static void main(String[] args) throws Exception {
+        try (ZipFile jar = new ZipFile(args[0])) {
+            verify(jar, "net/minecraft/server/level/ChunkGenerationTask.class");
+            verify(jar, "dev/gaius/browser/BrowserChunkGenerationYield.class");
+        }
+    }
+}
+`, "utf8");
+  const verifierClasspath = [asm, asmTree, asmAnalysis].join(delimiter);
+  execFileSync(javac, [
+    "--release", "21", "-proc:none", "-classpath", verifierClasspath,
+    "-d", classes, verifierSource,
+  ], {encoding: "utf8", timeout: 30_000});
+  const verifierOutput = execFileSync(java, [
+    "-classpath", [classes, verifierClasspath].join(delimiter),
+    "GaiusBytecodeVerifier", clientJar,
+  ], {encoding: "utf8", timeout: 30_000});
+  assert.match(verifierOutput, /BASIC_VERIFIER_OK .*ChunkGenerationTask\.class/,
+    "ASM BasicVerifier did not validate ChunkGenerationTask");
+  assert.match(verifierOutput, /BASIC_VERIFIER_OK .*BrowserChunkGenerationYield\.class/,
+    "ASM BasicVerifier did not validate BrowserChunkGenerationYield");
+  process.stdout.write(verifierOutput);
 
   const rawGraphics = execFileSync(javap, ["-classpath", rawClientJar, "-p", "-c",
     "net.minecraft.client.GraphicsPreset"], {
@@ -283,8 +396,27 @@ try {
   const runUntilWait = method(bytecode,
     "public java.util.concurrent.CompletableFuture<?> runUntilWait();",
     "private void scheduleNextLayer");
+  const scheduleLayer = method(bytecode,
+    "private void scheduleLayer(net.minecraft.world.level.chunk.status.ChunkStatus, boolean);",
+    "private int getRadiusForLayer");
   const runUntilWaitInstructions = bytecodeInstructions(runUntilWait);
-assert.equal(occurrences(runUntilWait, "BrowserWorldgenScheduler.beginServerWorkTurn"), 0,
+  const runUntilWaitBackedges = runUntilWaitInstructions.flatMap((entry, index) => {
+    const match = entry.instruction.match(/^goto(?:_w)?\s+(\d+)\s*$/);
+    return match && Number(match[1]) < entry.offset
+      ? [{entry, index, target: Number(match[1])}] : [];
+  });
+  assert.equal(runUntilWaitBackedges.length, 1,
+    "ChunkGenerationTask.runUntilWait must retain one loop backedge");
+  const yieldFieldIndex = runUntilWaitInstructions.findIndex(entry =>
+    entry.instruction.includes("Field browserLayerYield"));
+  assert.ok(yieldFieldIndex > 0,
+    "runUntilWait yield gate field load is missing from the patched bytecode");
+  const yieldGateStart = runUntilWaitInstructions[yieldFieldIndex - 1];
+  assert.match(yieldGateStart.instruction, /^aload_0|^aload\s+0$/,
+    "runUntilWait yield gate does not begin with its receiver load");
+  assert.equal(runUntilWaitBackedges[0].target, yieldGateStart.offset,
+    "runUntilWait backedge bypasses the holder-yield gate");
+  assert.equal(occurrences(runUntilWait, "BrowserWorldgenScheduler.beginServerWorkTurn"), 0,
     "runUntilWait must not reset the shared tick budget per task invocation");
   assert.equal(occurrences(runUntilWait, "BrowserWorldgenScheduler.beginTaskWork"), 1,
     "runUntilWait must enter one active-work task scope");
@@ -297,6 +429,13 @@ assert.equal(occurrences(runUntilWait, "BrowserWorldgenScheduler.beginServerWork
     "runUntilWait must close its scope on returns and exceptions");
   assert.match(runUntilWait, /Exception table:[\s\S]*Throwable/,
     "runUntilWait task scope has no catch-all exception cleanup");
+  assert.match(scheduleLayer, /Exception table:[\s\S]*Throwable/,
+    "scheduleLayer must clean cursor state when holder work throws");
+  const scheduleLayerExceptionCleanup = scheduleLayer.slice(scheduleLayer.lastIndexOf("astore"));
+  assert.match(scheduleLayerExceptionCleanup, /Field browserLayerActive/,
+    "scheduleLayer exception path must clear active cursor state");
+  assert.match(scheduleLayerExceptionCleanup, /Field browserLayerYield/,
+    "scheduleLayer exception path must clear pending continuation state");
   const runServer = method(bytecode, "protected void runServer", "private void");
   const tickStart = runServer.indexOf("BrowserWorldgenScheduler.beginServerWorkTurn");
   const processTick = runServer.indexOf("processPacketsAndTick");
