@@ -48,6 +48,10 @@ const eventLoopGapLimitMillis = parseBoundedNumber(
     process.env.GAIUS_EXTERNAL_EVENT_LOOP_GAP_LIMIT_MS ?? "500",
     "GAIUS_EXTERNAL_EVENT_LOOP_GAP_LIMIT_MS", 1, 120000,
 );
+const relayDrainLimitMillis = parseBoundedNumber(
+    process.env.GAIUS_EXTERNAL_MAX_RELAY_DRAIN_MS ?? "2",
+    "GAIUS_EXTERNAL_MAX_RELAY_DRAIN_MS", 0.1, 1000,
+);
 
 const source = await readFile(channelSourceUrl, "utf8");
 const bridgeScript = extractJsBody(source, "private static native void initBridge();");
@@ -418,6 +422,29 @@ let lastExternalResult;
 async function main() {
     const { bridge, stats } = installBridge();
     const baselineManifest = await fetchManifest();
+    // STATUS is a terminal probe for many Minecraft proxies: the server may
+    // close the TCP stream immediately after the response. Sample the target
+    // route while clients are being opened so short-lived concurrency is not
+    // lost before the post-response manifest read.
+    let peakObservedTargetActive = Number(baselineManifest.target?.activeConnections ?? 0);
+    let peakObservedTargetManifest = baselineManifest;
+    let targetPollInFlight = false;
+    const targetPollTimer = setInterval(() => {
+        if (targetPollInFlight) return;
+        targetPollInFlight = true;
+        fetchManifest()
+            .then((manifest) => {
+                const active = Number(manifest.target?.activeConnections ?? 0);
+                if (active > peakObservedTargetActive) {
+                    peakObservedTargetActive = active;
+                    peakObservedTargetManifest = manifest;
+                }
+            })
+            .catch(() => {})
+            .finally(() => {
+                targetPollInFlight = false;
+            });
+    }, 25);
     const clients = Array.from({ length: clientCount }, (_, index) =>
         createClient(500 + index, bridge, stats));
     const startedAt = performance.now();
@@ -463,9 +490,11 @@ async function main() {
         // returning the pong, the server is allowed to close the STATUS TCP
         // stream. Capture target activity before issuing that probe so a
         // normal status close cannot erase the peak-concurrency evidence.
-        const peakManifest = await waitForTargetConnections(
-            baselineManifest, clients.length,
-        );
+        const sampledPeakManifest = peakObservedTargetActive >=
+            Number(baselineManifest.target?.activeConnections ?? 0) + clients.length
+            ? peakObservedTargetManifest
+            : await waitForTargetConnections(baselineManifest, clients.length);
+        const peakManifest = sampledPeakManifest;
         if (enablePing) {
             await waitFor(
                 () => clients.every((client) => client.pingResponses >= 1),
@@ -486,6 +515,7 @@ async function main() {
         const dnsCachePeak = dnsCacheRuntime(peakManifest);
         const dnsCacheAfterSoak = dnsCacheRuntime(afterSoakManifest);
         clearInterval(pollTimer);
+        clearInterval(targetPollTimer);
         for (const client of clients) bridge.close(client.id);
         await waitFor(
             () => runtimeClean(bridge, stats), "external browser/bridge cleanup", 15000,
@@ -512,6 +542,18 @@ async function main() {
         const measuredRtt = enablePing ? pingRtt : statusRtt;
         const measuredRttSummary = latencySummary(measuredRtt);
         const targetActive = (manifest) => Number(manifest.target?.activeConnections ?? 0);
+        const runtimeSnapshots = [runtimeBaseline, runtimePeak, runtimeAfterSoak,
+            runtimeAfterClose].filter((snapshot) => snapshot !== undefined);
+        const relayDrainMaxDurationMillis = runtimeSnapshots.length === 0
+            ? Number.POSITIVE_INFINITY
+            : Math.max(...runtimeSnapshots.map((snapshot) =>
+                snapshot.serverFrameMaxDrainDurationMillis));
+        const relayDrainSendErrors = runtimeSnapshots.length === 0
+            ? Number.POSITIVE_INFINITY
+            : Math.max(...runtimeSnapshots.map((snapshot) => snapshot.serverFrameSendErrors));
+        const relayDrainMaxBufferedBytes = runtimeSnapshots.length === 0
+            ? Number.POSITIVE_INFINITY
+            : Math.max(...runtimeSnapshots.map((snapshot) => snapshot.serverFrameMaxBufferedBytes));
         const result = {
             schemaVersion: "browser-relay-external-multiplayer-v1",
             ok: true,
@@ -540,6 +582,7 @@ async function main() {
                 peakTargetActive: targetActive(peakManifest),
                 afterSoakTargetActive: targetActive(afterSoakManifest),
                 afterCloseTargetActive: targetActive(afterCloseManifest),
+                peakObservedTargetActive,
                 targetAttestationFailures: stats.relayTargetAttestationFailures,
                 dnsCache: {
                     baseline: dnsCacheBaseline,
@@ -579,7 +622,11 @@ async function main() {
                 p99RttMillis: measuredRttSummary.p99Millis,
                 maxRttMillis: measuredRttSummary.maxMillis,
                 eventLoopGapMillis: stats.longestEventLoopGapMillis,
-                targetObserved: targetActive(peakManifest) >= targetActive(baselineManifest) + clientCount,
+                relayDrainMaxDurationMillis,
+                relayDrainSendErrors,
+                relayDrainMaxBufferedBytes,
+                targetObserved: peakObservedTargetActive >=
+                    targetActive(baselineManifest) + clientCount,
                 dnsCacheTelemetry: dnsCacheBaseline !== undefined &&
                     dnsCachePeak !== undefined && dnsCacheAfterSoak !== undefined &&
                     dnsCacheAfterClose !== undefined,
@@ -587,12 +634,17 @@ async function main() {
                     runtimePeak !== undefined &&
                     runtimeAfterSoak !== undefined &&
                     runtimeAfterClose !== undefined,
+                relayDrainWithinBudget: relayDrainMaxDurationMillis < relayDrainLimitMillis &&
+                    relayDrainSendErrors === 0 &&
+                    runtimeAfterClose?.serverFrameBufferedBytes === 0 &&
+                    runtimeAfterClose?.activeServerFrameDrainHandles === 0,
                 dnsLookupsShared: dnsCachePeak === undefined ? 0 :
                     (dnsCachePeak.publicDnsCacheHits -
                         (dnsCacheBaseline?.publicDnsCacheHits ?? 0)) +
                     (dnsCachePeak.publicDnsCacheInflightJoins -
                         (dnsCacheBaseline?.publicDnsCacheInflightJoins ?? 0)),
                 thresholds: { p99RttLimitMillis, maxRttLimitMillis, eventLoopGapLimitMillis,
+                    relayDrainLimitMillis,
                     pingEnabled: enablePing,
                     minimumSharedDnsLookups: Math.max(0, clientCount - 1),
                 },
@@ -611,6 +663,8 @@ async function main() {
                 "RelayNode did not expose DNS cache telemetry; deployed node is stale");
             assert.ok(result.gate.runtimeTelemetry,
                 "RelayNode did not expose drain runtime telemetry; deployed node is stale");
+            assert.ok(result.gate.relayDrainWithinBudget,
+                `RelayNode drain exceeded ${relayDrainLimitMillis}ms or reported send errors`);
             assert.ok(result.gate.dnsLookupsShared >=
                 result.gate.thresholds.minimumSharedDnsLookups,
                 "RelayNode did not merge/cache same-target DNS lookups for every extra client");
@@ -638,6 +692,7 @@ async function main() {
     }
     finally {
         clearInterval(pollTimer);
+        clearInterval(targetPollTimer);
         for (const client of clients) bridge.close(client.id);
     }
 }
