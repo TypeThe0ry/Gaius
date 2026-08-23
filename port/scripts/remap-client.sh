@@ -58,7 +58,11 @@ else
 fi
 
 main_class="net/minecraft/client/main/Main.class"
-if [[ "$(unzip -Z1 "$output" "$main_class" 2>/dev/null || true)" != "$main_class" ]]; then
+# BusyBox unzip (used by the isolated Linux workers) does not implement the
+# Info-ZIP -Z1 listing mode. Use the portable long-listing format and match
+# the final member column exactly so a valid remap is not rejected falsely.
+if ! unzip -l "$output" 2>/dev/null |
+  awk -v expected="$main_class" '$NF == expected { found = 1 } END { exit(found ? 0 : 1) }'; then
   echo "Remapped client does not contain $main_class" >&2
   exit 1
 fi
