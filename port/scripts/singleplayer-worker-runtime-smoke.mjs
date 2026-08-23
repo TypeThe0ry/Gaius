@@ -2519,39 +2519,39 @@ if (isMainThread && !runtimeSelfTest) {
       ...postReadySoakEvidence(),
     });
   };
-  const completionReady = () => {
-    const ready = protocolReady &&
-      (stopAtFirstChunk || (distanceSyncReady && configuredDistanceReady));
-    if (!ready) return false;
-    if (completionReadyAt === 0) {
-      completionReadyAt = Date.now();
-      postReadySoakStartedMonoMs = performance.now();
-      events.push({
-        type: "post-ready-soak-start",
-        ...postReadySoakEvidence(),
-      });
-      if (configuredPostReadySoakMs === 0) {
-        completePostReadySoak();
-      } else {
-        const waitForPostReadySoak = () => {
-          postReadySoakTimer = 0;
-          if (finished || stopFlowStarted) return;
-          const remainingMs = configuredPostReadySoakMs -
-            (performance.now() - postReadySoakStartedMonoMs);
-          if (remainingMs > 0) {
-            postReadySoakTimer = setTimeout(waitForPostReadySoak, remainingMs);
-            return;
-          }
-          completePostReadySoak();
-          maybeStop();
-        };
-        postReadySoakTimer = setTimeout(
-          waitForPostReadySoak,
-          configuredPostReadySoakMs,
-        );
-      }
+  const isCompletionReady = () => protocolReady &&
+    (stopAtFirstChunk || (distanceSyncReady && configuredDistanceReady));
+  const armPostReadySoak = () => {
+    if (!isCompletionReady() || completionReadyAt !== 0 ||
+        finished || stopFlowStarted) {
+      return;
     }
-    return postReadySoakCompletedAt !== 0;
+    completionReadyAt = Date.now();
+    postReadySoakStartedMonoMs = performance.now();
+    events.push({
+      type: "post-ready-soak-start",
+      ...postReadySoakEvidence(),
+    });
+    if (configuredPostReadySoakMs === 0) {
+      completePostReadySoak();
+      return;
+    }
+    const waitForPostReadySoak = () => {
+      postReadySoakTimer = 0;
+      if (finished || stopFlowStarted) return;
+      const remainingMs = configuredPostReadySoakMs -
+        (performance.now() - postReadySoakStartedMonoMs);
+      if (remainingMs > 0) {
+        postReadySoakTimer = setTimeout(waitForPostReadySoak, remainingMs);
+        return;
+      }
+      completePostReadySoak();
+      maybeStop();
+    };
+    postReadySoakTimer = setTimeout(
+      waitForPostReadySoak,
+      configuredPostReadySoakMs,
+    );
   };
   const finishCpuProfileBeforeShutdown = async () => {
     if (!cpuProfilePhase || cpuProfileWritten) {
@@ -2601,9 +2601,11 @@ if (isMainThread && !runtimeSelfTest) {
     worker.postMessage({type: "stop"});
   };
   const maybeStop = () => {
-    if (!completionReady() || stopFlowStarted) {
+    if (finished || stopFlowStarted || !isCompletionReady()) {
       return;
     }
+    armPostReadySoak();
+    if (postReadySoakCompletedAt === 0) return;
     stopFlowStarted = true;
     if (traceEvents) {
       process.stderr.write(`[smoke-event] stop-requested phase=${workerPhase}\n`);
@@ -2612,6 +2614,7 @@ if (isMainThread && !runtimeSelfTest) {
       events.push({
         type: "final-telemetry-barrier-error",
         detail: error.stack || String(error),
+        postReadySoak: postReadySoakEvidence(),
       });
       clearTimeout(timeout);
       finish(1);
@@ -2711,6 +2714,7 @@ if (isMainThread && !runtimeSelfTest) {
       currentWorkerPhase: workerPhase,
       protocolReady: protocolReadyAt > 0,
       protocolReadyAt,
+      postReadySoak: postReadySoakEvidence(),
       slowProbeEvidence: timeoutEventLoopEvidence.slowProbeEvidence,
       workerEventLoopLatency: timeoutEventLoopEvidence.workerEventLoopLatency,
     });
@@ -3229,14 +3233,15 @@ if (isMainThread && !runtimeSelfTest) {
       configuredDistanceReady = true;
       protocol.startRoam();
       maybeStop();
-    } else if (message && message.type === "stopped" && completionReady() &&
-        !stoppedReceived) {
+    } else if (message && message.type === "stopped" && isCompletionReady() &&
+        postReadySoakCompletedAt !== 0 && !stoppedReceived) {
       stoppedReceived = true;
       clearInterval(eventLoopProbeInterval);
       void finalizeStopped(message).catch((error) => {
         events.push({
           type: "final-telemetry-barrier-error",
           detail: error.stack || String(error),
+          postReadySoak: postReadySoakEvidence(),
         });
         clearTimeout(timeout);
         finish(1);
