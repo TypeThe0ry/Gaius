@@ -27,7 +27,9 @@ const origin = "http://127.0.0.1:8781";
 const bridgeToken = "relay-smoke-token";
 const directory = fileURLToPath(new URL(".", import.meta.url));
 const repository = fileURLToPath(new URL("../../", import.meta.url));
-const activeVersionProfile = await loadActiveVersionProfile();
+const requestedSmokeVersion = process.env.GAIUS_SMOKE_MINECRAFT_VERSION ??
+        process.env.GAIUS_SMOKE_PROTOCOL_VERSION;
+const activeVersionProfile = await loadActiveVersionProfile(requestedSmokeVersion);
 const minecraftHost = process.env.GAIUS_SMOKE_MINECRAFT_HOST;
 const minecraftPort = parseMinecraftPort(process.env.GAIUS_SMOKE_MINECRAFT_PORT ?? "25565");
 const minecraftSessionUrl = process.env.GAIUS_SMOKE_SESSION_URL;
@@ -36,9 +38,11 @@ const minecraftProfileId = process.env.GAIUS_SMOKE_PROFILE_ID ??
         "00000000000040008000000000000002";
 const minecraftUsername = process.env.GAIUS_SMOKE_USERNAME ?? "GaiusSmoke";
 const minecraftProfile = resolveSmokeMinecraftProfile(
-        process.env.GAIUS_SMOKE_MINECRAFT_VERSION ??
-        process.env.GAIUS_SMOKE_PROTOCOL_VERSION ??
-        activeVersionProfile.id);
+        requestedSmokeVersion ?? activeVersionProfile.id);
+if (activeVersionProfile.id !== minecraftProfile.name) {
+    throw new Error(`Smoke profile ${activeVersionProfile.id} does not match ` +
+        `Minecraft protocol profile ${minecraftProfile.name}`);
+}
 const dnsTransientHost = "dns-transient.gaius.test";
 const dnsPermanentHost = "dns-permanent.gaius.test";
 const srvTransientHost = "srv-transient.gaius.test";
@@ -885,10 +889,14 @@ function pathInside(parent, child) {
         !path.isAbsolute(relative));
 }
 
-async function loadActiveVersionProfile() {
+async function loadActiveVersionProfile(requestedProfileSelector) {
     const config = JSON.parse(await readFile(path.join(repository, "port", "config.json"), "utf8"));
     let selected = nativePath(
             process.env.GAIUS_VERSION_PROFILE_PATH ?? config.versionProfile ?? "");
+    if (process.env.GAIUS_VERSION_PROFILE_PATH === undefined &&
+            requestedProfileSelector !== undefined) {
+        selected = `versions/${resolveSmokeMinecraftProfile(requestedProfileSelector).name}.json`;
+    }
     if (/^\d+(?:\.\d+)+$/u.test(selected)) selected = `versions/${selected}.json`;
     let profilePath;
     if (path.isAbsolute(selected)) {
