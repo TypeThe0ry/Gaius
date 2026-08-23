@@ -4246,6 +4246,13 @@ def check_source_patches() -> None:
             and "slowSnapshotDropReason" in singleplayer_worker_runtime_smoke
             and "snapshotBlockCapDropped" in singleplayer_worker_runtime_smoke
             and "topKRetentionDropped" in singleplayer_worker_runtime_smoke
+            and "slowProbeSamplesGlobal" in singleplayer_worker_runtime_smoke
+            and "global-top-64-with-balanced-phase-views"
+                in singleplayer_worker_runtime_smoke
+            and "retainedGlobalBeforeProtocolReady"
+                in singleplayer_worker_runtime_smoke
+            and "retainedGlobalAfterProtocolReady"
+                in singleplayer_worker_runtime_smoke
             and "parentSendEpochMs" in singleplayer_worker_runtime_smoke
             and "workerStartEpochMs" in singleplayer_worker_runtime_smoke
             and "workerEndEpochMs" in singleplayer_worker_runtime_smoke

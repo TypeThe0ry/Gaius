@@ -96,11 +96,14 @@ jobs:
         run: |
           set -euo pipefail
           node --check port/scripts/singleplayer-worker-runtime-smoke.mjs
+          node --check port/scripts/singleplayer-worker-slow-sample-smoke.mjs
           node --check port/scripts/singleplayer-worker-runtime-output.mjs
           node --check port/scripts/singleplayer-worker-runtime-output-smoke.mjs
           node port/scripts/singleplayer-worker-runtime-output-smoke.mjs
           GAIUS_SMOKE_SELF_TEST=1 \
             node port/scripts/singleplayer-worker-runtime-smoke.mjs
+          node port/scripts/singleplayer-worker-slow-sample-smoke.mjs
+          node port/scripts/chunk-pipeline-telemetry-smoke.mjs
           node port/scripts/gson-type-token-external-overlay-smoke.mjs
           node port/scripts/worldgen-scheduler-smoke.mjs
 

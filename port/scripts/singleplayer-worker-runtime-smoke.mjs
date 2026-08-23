@@ -21,10 +21,15 @@ import {
   workerData,
 } from "node:worker_threads";
 
+// This diagnostic schema is independent from the 500 ms release gate.  The
+// block-attribution fields (slowBlockId/reuse/drop) are part of v2 and must
+// remain stable for existing evidence readers.
 const SLOW_SAMPLE_SCHEMA_VERSION = 2;
 const SLOW_SAMPLE_SCHEMA = "gaius.worker-event-loop-slow-sample.v2";
 const SLOW_SAMPLE_THRESHOLD_MS = 250;
 const MAX_SLOW_SAMPLES = 64;
+// Keep the phase-attribution views balanced and bounded.  The independent
+// global Top-64 ring below is the authoritative retention contract.
 const MAX_SLOW_SAMPLES_PER_SCOPE = MAX_SLOW_SAMPLES / 2;
 const MAX_SLOW_BLOCK_ID = 0x7fffffff;
 const MAX_SLOW_SAMPLE_FIELDS_PER_GROUP = 32;
@@ -515,7 +520,8 @@ function highResolutionEpochMillis() {
 }
 
 function roundedMillis(value) {
-  return Number(Math.max(0, Number(value) || 0).toFixed(3));
+  const numeric = Number(value);
+  return Number(Math.max(0, Number.isFinite(numeric) ? numeric : 0).toFixed(3));
 }
 
 function selectScalarTelemetry(source, fields) {
@@ -800,6 +806,10 @@ function eventLoopProbeSample(probe, message, parentReceiveEpochMs,
   if (message.slowSampleSchemaVersion !== SLOW_SAMPLE_SCHEMA_VERSION) {
     anomalies.push("schema-version-mismatch");
   }
+  if (message.slowSampleSchema !== undefined &&
+      message.slowSampleSchema !== SLOW_SAMPLE_SCHEMA) {
+    anomalies.push("schema-name-mismatch");
+  }
   if (message.slowSampleThresholdMismatch === true) {
     anomalies.push("threshold-mismatch");
   }
@@ -814,6 +824,12 @@ function eventLoopProbeSample(probe, message, parentReceiveEpochMs,
   }
   if (parentReceiveEpochMs + 1 < workerEndEpochMs) {
     anomalies.push("parent-receive-before-worker-end");
+  }
+  if (parentReceiveMonoMs + 0.001 < probe.parentSendMonoMs) {
+    anomalies.push("parent-receive-mono-before-parent-send");
+  }
+  if (workerInterProbeGapMs < -0.001) {
+    anomalies.push("worker-inter-probe-gap-negative");
   }
   if (message.parentSendEpochMs !== probe.parentSendEpochMs ||
       message.parentSendMonoMs !== probe.parentSendMonoMs) {
@@ -919,6 +935,7 @@ function combinedSlowProbeSamples(beforeProtocolReady, afterProtocolReady) {
 function buildSlowProbeEvidenceSnapshot({
   slowProbeSamplesBeforeProtocolReady,
   slowProbeSamplesAfterProtocolReady,
+  slowProbeSamplesGlobal = null,
   slowProbeCandidateCount,
   slowProbeTopKRetentionDroppedCount,
   slowProbeSnapshotBlockCapDroppedCount,
@@ -928,22 +945,38 @@ function buildSlowProbeEvidenceSnapshot({
   slowProbeClockAnomalyCount,
   slowProbeClockAnomalies,
 }) {
-  const slowProbeSamples = combinedSlowProbeSamples(
-    slowProbeSamplesBeforeProtocolReady,
-    slowProbeSamplesAfterProtocolReady,
+  const slowProbeSamples = Array.isArray(slowProbeSamplesGlobal)
+    ? slowProbeSamplesGlobal.slice().sort(compareSlowProbeSamples).slice(0, MAX_SLOW_SAMPLES)
+    : combinedSlowProbeSamples(
+      slowProbeSamplesBeforeProtocolReady,
+      slowProbeSamplesAfterProtocolReady,
+    );
+  // Count candidates lost by the authoritative global Top-64 contract.  The
+  // before/after arrays remain attribution views and are not used to infer
+  // global retention.
+  const retentionDropped = Math.max(
+    0,
+    Number(slowProbeCandidateCount) - slowProbeSamples.length,
   );
   return {
     schemaVersion: SLOW_SAMPLE_SCHEMA_VERSION,
     schema: SLOW_SAMPLE_SCHEMA,
+    slowSampleSchema: SLOW_SAMPLE_SCHEMA,
+    slowSampleSchemaVersion: SLOW_SAMPLE_SCHEMA_VERSION,
     thresholdMs: SLOW_SAMPLE_THRESHOLD_MS,
     limit: MAX_SLOW_SAMPLES,
     perScopeLimit: MAX_SLOW_SAMPLES_PER_SCOPE,
     countTotal: slowProbeCandidateCount,
     countRetained: slowProbeSamples.length,
-    dropped: slowProbeTopKRetentionDroppedCount,
+    dropped: retentionDropped,
     topKRetentionDropped: slowProbeTopKRetentionDroppedCount,
     retainedBeforeProtocolReady: slowProbeSamplesBeforeProtocolReady.length,
     retainedAfterProtocolReady: slowProbeSamplesAfterProtocolReady.length,
+    retainedGlobalBeforeProtocolReady: slowProbeSamples.filter((sample) =>
+      sample.afterProtocolReady !== true).length,
+    retainedGlobalAfterProtocolReady: slowProbeSamples.filter((sample) =>
+      sample.afterProtocolReady === true).length,
+    retentionModel: "global-top-64-with-balanced-phase-views",
     snapshotDropped: slowProbeSnapshotBlockCapDroppedCount,
     snapshotBlockCapDropped: slowProbeSnapshotBlockCapDroppedCount,
     snapshotBlockCapDropCount: slowProbeSnapshotBlockCapDroppedCount,
@@ -967,6 +1000,7 @@ function buildWorkerEventLoopEvidenceSnapshot({
   eventLoopProbeSamples,
   slowProbeSamplesBeforeProtocolReady,
   slowProbeSamplesAfterProtocolReady,
+  slowProbeSamplesGlobal = null,
   slowProbeCandidateCount,
   slowProbeTopKRetentionDroppedCount,
   slowProbeSnapshotBlockCapDroppedCount,
@@ -998,6 +1032,7 @@ function buildWorkerEventLoopEvidenceSnapshot({
   const slowProbeEvidence = buildSlowProbeEvidenceSnapshot({
     slowProbeSamplesBeforeProtocolReady,
     slowProbeSamplesAfterProtocolReady,
+    slowProbeSamplesGlobal,
     slowProbeCandidateCount,
     slowProbeTopKRetentionDroppedCount,
     slowProbeSnapshotBlockCapDroppedCount,
@@ -1028,6 +1063,8 @@ function buildWorkerEventLoopEvidenceSnapshot({
   const workerEventLoopLatency = {
     type: "worker-event-loop-latency",
     schemaVersion: 3,
+    slowSampleSchema: SLOW_SAMPLE_SCHEMA,
+    slowSampleSchemaVersion: SLOW_SAMPLE_SCHEMA_VERSION,
     samples: sortedProbeLatencies.length,
     p95Ms: percentile(sortedProbeLatencies, 0.95),
     p99Ms: percentile(sortedProbeLatencies, 0.99),
@@ -1195,6 +1232,10 @@ function runWorkerEventLoopEvidenceSelfSmoke() {
 }
 
 function runSlowProbeSelfSmoke() {
+  if ([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]
+      .some((value) => roundedMillis(value) !== 0)) {
+    throw new Error("slow probe non-finite timing clamp self-smoke failed");
+  }
   for (const [name, fields] of Object.entries({
     worldgen: WORLDGEN_SLOW_SAMPLE_FIELDS,
     network: NETWORK_SLOW_SAMPLE_FIELDS,
@@ -1292,6 +1333,30 @@ function runSlowProbeSelfSmoke() {
     if (!segmented.trigger.includes(trigger)) {
       throw new Error(`slow probe did not retain the ${trigger} segment trigger`);
     }
+  }
+  const clockAnomaly = eventLoopProbeSample(probe, {
+    probeId: probe.probeId,
+    slowSampleSchemaVersion: SLOW_SAMPLE_SCHEMA_VERSION,
+    phaseAtSend: probe.phaseAtSend,
+    parentSendEpochMs: probe.parentSendEpochMs,
+    parentSendMonoMs: probe.parentSendMonoMs,
+    workerStartEpochMs: 900,
+    workerStartMonoMs: 400,
+    workerEndEpochMs: 899,
+    workerEndMonoMs: 399,
+    workerInterProbeGapMs: -3,
+    slowTrigger: [],
+    slowBlockId: 0,
+    slowSnapshotReused: false,
+    slowSnapshot: null,
+  }, 800, 450, probe.phaseAtSend, 900);
+  if (!clockAnomaly.clockAnomaly || clockAnomaly.parentToWorkerMs !== 0 ||
+      clockAnomaly.workerHandlerMs !== 0 || clockAnomaly.workerToParentMs !== 0 ||
+      clockAnomaly.roundTripMs !== 0 || clockAnomaly.workerInterProbeGapMs !== 0 ||
+      !clockAnomaly.clockAnomalies.includes("worker-start-before-parent-send") ||
+      !clockAnomaly.clockAnomalies.includes("parent-receive-mono-before-parent-send") ||
+      !clockAnomaly.clockAnomalies.includes("worker-inter-probe-gap-negative")) {
+    throw new Error("slow probe clock anomaly clamp self-smoke failed");
   }
 
   const fast = eventLoopProbeSample(probe, {
@@ -1392,7 +1457,7 @@ function runSlowProbeSelfSmoke() {
   }
 
   const retained = [];
-  let topKRetentionDropped = 0;
+  let scopeTopKRetentionDropped = 0;
   for (let index = 0; index < MAX_SLOW_SAMPLES_PER_SCOPE + 1; index++) {
     const candidate = {
       ...lastBacklog,
@@ -1400,13 +1465,65 @@ function runSlowProbeSelfSmoke() {
       roundTripMs: index + 1,
     };
     retainSlowProbeSample(retained, candidate);
-    if (candidate[SLOW_PROBE_TOP_K_EVICTED] === true) topKRetentionDropped++;
+    if (candidate[SLOW_PROBE_TOP_K_EVICTED] === true) scopeTopKRetentionDropped++;
   }
   if (retained.length !== MAX_SLOW_SAMPLES_PER_SCOPE ||
       retained[0].roundTripMs !== MAX_SLOW_SAMPLES_PER_SCOPE + 1 ||
-      retained.at(-1).roundTripMs !== 2 || topKRetentionDropped !== 1 ||
+      retained.at(-1).roundTripMs !== 2 || scopeTopKRetentionDropped !== 1 ||
       !retained[0].snapshotCaptured || !retained[0].snapshotReused) {
     throw new Error("slow probe bounded top-K reuse self-smoke failed");
+  }
+  const globalRetained = [];
+  let topKRetentionDropped = 0;
+  for (let index = 0; index < MAX_SLOW_SAMPLES + 1; index++) {
+    const candidate = {
+      ...lastBacklog,
+      probeId: 700 + index,
+      roundTripMs: index + 1,
+    };
+    retainSlowProbeSample(globalRetained, candidate, MAX_SLOW_SAMPLES);
+    if (candidate[SLOW_PROBE_TOP_K_EVICTED] === true) topKRetentionDropped++;
+  }
+  if (globalRetained.length !== MAX_SLOW_SAMPLES ||
+      globalRetained[0].roundTripMs !== MAX_SLOW_SAMPLES + 1 ||
+      globalRetained.at(-1).roundTripMs !== 2 || topKRetentionDropped !== 1 ||
+      !globalRetained[0].snapshotCaptured || !globalRetained[0].snapshotReused) {
+    throw new Error("slow probe global top-K reuse self-smoke failed");
+  }
+  const tieRetained = [];
+  for (const [probeId, roundTripMs] of [[901, 100], [900, 100], [899, 101]]) {
+    retainSlowProbeSample(tieRetained, {
+      ...lastBacklog,
+      probeId,
+      roundTripMs,
+    }, MAX_SLOW_SAMPLES);
+  }
+  if (tieRetained.map((sample) => sample.probeId).join(",") !== "899,900,901") {
+    throw new Error("slow probe Top-64 tie ordering self-smoke failed");
+  }
+  const boundedEvidence = buildSlowProbeEvidenceSnapshot({
+    slowProbeSamplesBeforeProtocolReady: [],
+    slowProbeSamplesAfterProtocolReady: retained,
+    slowProbeSamplesGlobal: globalRetained,
+    slowProbeCandidateCount: MAX_SLOW_SAMPLES + 1,
+    slowProbeTopKRetentionDroppedCount: topKRetentionDropped,
+    slowProbeSnapshotBlockCapDroppedCount: 0,
+    slowProbeSnapshotBlocksBeforeProtocolReady: new Map(),
+    slowProbeSnapshotBlocksAfterProtocolReady: new Map(),
+    slowProbeSnapshotErrorCount: 0,
+    slowProbeClockAnomalyCount: 0,
+    slowProbeClockAnomalies: [],
+  });
+  if (boundedEvidence.countTotal !== MAX_SLOW_SAMPLES + 1 ||
+      boundedEvidence.countRetained !== MAX_SLOW_SAMPLES ||
+      boundedEvidence.dropped !== 1 ||
+      boundedEvidence.samples.length !== MAX_SLOW_SAMPLES ||
+      boundedEvidence.samples[0].roundTripMs !== MAX_SLOW_SAMPLES + 1 ||
+      boundedEvidence.samples.at(-1).roundTripMs !== 2 ||
+      boundedEvidence.retentionModel !== "global-top-64-with-balanced-phase-views" ||
+      boundedEvidence.retainedGlobalBeforeProtocolReady !== MAX_SLOW_SAMPLES ||
+      boundedEvidence.retainedGlobalAfterProtocolReady !== 0) {
+    throw new Error("slow probe total/dropped/top-64 evidence self-smoke failed");
   }
 
   const capState = createSlowProbeBlockState();
@@ -1448,6 +1565,11 @@ function runSlowProbeSelfSmoke() {
     sameBacklogCaptureCount: backlogCaptureCount - 1,
     risingEdgeBlock: true,
     topKRetentionDropped,
+    scopeTopKRetentionDropped,
+    totalCandidates: boundedEvidence.countTotal,
+    retainedTopK: boundedEvidence.countRetained,
+    droppedCandidates: boundedEvidence.dropped,
+    retentionModel: boundedEvidence.retentionModel,
     blockCapDropped,
     repeatedBlockCapDropped,
   };
@@ -1887,6 +2009,7 @@ if (isMainThread && !runtimeSelfTest) {
   const eventLoopProbeSamples = [];
   const slowProbeSamplesBeforeProtocolReady = [];
   const slowProbeSamplesAfterProtocolReady = [];
+  const slowProbeSamplesGlobal = [];
   const slowProbeSnapshotBlocksBeforeProtocolReady = new Map();
   const slowProbeSnapshotBlocksAfterProtocolReady = new Map();
   const slowProbeSnapshotBlocksById = new Map();
@@ -2007,6 +2130,7 @@ if (isMainThread && !runtimeSelfTest) {
       parentSendEpochMs,
       parentSendMonoMs,
       slowSampleSchemaVersion: SLOW_SAMPLE_SCHEMA_VERSION,
+      slowSampleSchema: SLOW_SAMPLE_SCHEMA,
       slowSampleThresholdMs: SLOW_SAMPLE_THRESHOLD_MS,
     });
   }, 100);
@@ -2107,6 +2231,7 @@ if (isMainThread && !runtimeSelfTest) {
         parentSendEpochMs,
         parentSendMonoMs,
         slowSampleSchemaVersion: SLOW_SAMPLE_SCHEMA_VERSION,
+        slowSampleSchema: SLOW_SAMPLE_SCHEMA,
         slowSampleThresholdMs: SLOW_SAMPLE_THRESHOLD_MS,
       });
     } catch (error) {
@@ -2423,6 +2548,7 @@ if (isMainThread && !runtimeSelfTest) {
       eventLoopProbeSamples,
       slowProbeSamplesBeforeProtocolReady,
       slowProbeSamplesAfterProtocolReady,
+      slowProbeSamplesGlobal,
       slowProbeCandidateCount,
       slowProbeTopKRetentionDroppedCount,
       slowProbeSnapshotBlockCapDroppedCount,
@@ -2536,6 +2662,7 @@ if (isMainThread && !runtimeSelfTest) {
       eventLoopProbeSamples,
       slowProbeSamplesBeforeProtocolReady,
       slowProbeSamplesAfterProtocolReady,
+      slowProbeSamplesGlobal,
       slowProbeCandidateCount,
       slowProbeTopKRetentionDroppedCount,
       slowProbeSnapshotBlockCapDroppedCount,
@@ -2786,13 +2913,15 @@ if (isMainThread && !runtimeSelfTest) {
         rememberSlowProbeSnapshot(scopeSnapshotMap, slowSample);
         if (slowSample.trigger.length > 0) {
           slowProbeCandidateCount++;
-          retainSlowProbeSample(
-            slowSample.afterProtocolReady
-              ? slowProbeSamplesAfterProtocolReady
-              : slowProbeSamplesBeforeProtocolReady,
-            slowSample,
-          );
-          if (slowSample[SLOW_PROBE_TOP_K_EVICTED] === true) {
+          const scopeSamples = slowSample.afterProtocolReady
+            ? slowProbeSamplesAfterProtocolReady
+            : slowProbeSamplesBeforeProtocolReady;
+          retainSlowProbeSample(scopeSamples, slowSample);
+          retainSlowProbeSample(slowProbeSamplesGlobal, slowSample, MAX_SLOW_SAMPLES);
+          const globalRetentionEvicted = slowSample[SLOW_PROBE_TOP_K_EVICTED] === true;
+          // The global ring is authoritative for `dropped`; the balanced
+          // before/after arrays are only phase attribution views.
+          if (globalRetentionEvicted) {
             slowProbeTopKRetentionDroppedCount++;
           }
         }
@@ -3122,6 +3251,7 @@ if (isMainThread && !runtimeSelfTest) {
         type: "node-event-loop-pong",
         probeId: data.probeId,
         slowSampleSchemaVersion: data.slowSampleSchemaVersion,
+        slowSampleSchema: data.slowSampleSchema,
         phaseAtSend: data.phaseAtSend,
         parentSendEpochMs: data.parentSendEpochMs,
         parentSendMonoMs: data.parentSendMonoMs,

@@ -28,6 +28,7 @@ const [
   benchmark,
   performanceMetrics,
   performanceContract,
+  runtimeSmoke,
 ] = await Promise.all([
   source("../src/main/java/dev/gaius/browser/BrowserRenderScheduler.java"),
   source("../src/main/java/dev/gaius/browser/BrowserTargeting.java"),
@@ -37,6 +38,7 @@ const [
   source("./chrome-chunk-benchmark.mjs"),
   source("./performance-metrics.mjs"),
   source("./performance-contract.json"),
+  source("./singleplayer-worker-runtime-smoke.mjs"),
 ]);
 
 for (const contract of [
@@ -150,6 +152,32 @@ const heartbeatBranch = workerBootstrap.slice(
 );
 assert.ok(!heartbeatBranch.includes("...root.__gaiusChunkPriorityStats"),
   "Worker heartbeat must not spread an unbounded chunk telemetry object");
+
+for (const contract of [
+  'const SLOW_SAMPLE_SCHEMA_VERSION = 2',
+  'const SLOW_SAMPLE_SCHEMA = "gaius.worker-event-loop-slow-sample.v2"',
+  "const SLOW_SAMPLE_THRESHOLD_MS = 250",
+  "const MAX_SLOW_SAMPLES = 64",
+  "const MAX_SLOW_SAMPLE_FIELDS_PER_GROUP = 32",
+  "parentSendEpochMs",
+  "parentSendMonoMs",
+  "workerStartEpochMs",
+  "workerStartMonoMs",
+  "workerEndEpochMs",
+  "workerEndMonoMs",
+  "parentReceiveEpochMs",
+  "parentReceiveMonoMs",
+  "parentToWorkerMs",
+  "workerHandlerMs",
+  "workerToParentMs",
+  "workerInterProbeGapMs",
+  "slowSampleSchema: SLOW_SAMPLE_SCHEMA",
+  "schemaVersion: 3",
+  "slowProbeEvidence",
+]) {
+  assert.ok(runtimeSmoke.includes(contract),
+    "missing bounded Worker slow-probe evidence contract: " + contract);
+}
 
 const shouldContinueDrain = (completed, elapsedNanos) =>
   completed < 8 && (completed === 0 || elapsedNanos < 2_000_000);
