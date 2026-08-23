@@ -276,7 +276,11 @@ try {
             manifest.runtime?.activeClientStallTimers !== 0 ||
             !Number.isSafeInteger(manifest.runtime?.rssBytes) ||
             !Number.isSafeInteger(manifest.runtime?.cpuUserMicros) ||
-            !Number.isSafeInteger(manifest.runtime?.cpuSystemMicros)) {
+            !Number.isSafeInteger(manifest.runtime?.cpuSystemMicros) ||
+            !Number.isSafeInteger(manifest.runtime?.publicDnsCacheEntries) ||
+            !Number.isSafeInteger(manifest.runtime?.publicDnsCacheHits) ||
+            !Number.isSafeInteger(manifest.runtime?.publicDnsCacheMisses) ||
+            !Number.isSafeInteger(manifest.runtime?.publicDnsCacheInflightJoins)) {
         throw new Error("Translator node manifest did not describe the tunnel capability");
     }
     const deniedTargetResponse = await fetchTargetManifest(

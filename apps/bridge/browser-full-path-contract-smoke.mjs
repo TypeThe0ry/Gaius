@@ -377,6 +377,26 @@ assert.match(relayMain, /armClientStallTimer\(\);/);
 assert.match(relayMain, /clearClientStallTimer\(\);/);
 assert.match(relayMain, /"runtime-telemetry"/);
 assert.match(relayMain, /runtime: relayRuntimeSnapshot\(\)/);
+assert.match(relayMain, /const publicDnsCache = new Map\(\)/);
+assert.match(relayMain, /const publicDnsCacheTtlMs = 5_000/);
+assert.match(relayMain, /const maximumPublicDnsCacheEntries = 1024/);
+assert.match(relayMain, /let publicDnsCacheHits = 0/);
+assert.match(relayMain, /let publicDnsCacheMisses = 0/);
+assert.match(relayMain, /let publicDnsCacheInflightJoins = 0/);
+assert.match(relayMain, /function resolvePublicAddresses\(host, lookupOptions\)/);
+assert.match(relayMain, /if \(cached\?\.promise !== undefined\) \{/);
+assert.match(relayMain, /publicDnsCacheInflightJoins\+\+/);
+assert.match(relayMain, /publicDnsCache\.set\(key, \{\s+addresses: publicAddresses,/);
+assert.match(relayMain, /if \(current\?\.promise === promise\) \{\s+publicDnsCache\.delete\(key\)/);
+assert.match(relayMain, /while \(publicDnsCache\.size > maximumPublicDnsCacheEntries\)/);
+const externalMultiplayerSource = await readFile(
+    new URL("../../port/scripts/browser-relay-external-multiplayer-smoke.mjs", import.meta.url),
+    "utf8",
+);
+assert.match(externalMultiplayerSource, /function dnsCacheRuntime\(manifest\)/);
+assert.match(externalMultiplayerSource, /dnsCacheTelemetry/);
+assert.match(externalMultiplayerSource, /dnsLookupsShared/);
+assert.match(externalMultiplayerSource, /minimumSharedDnsLookups/);
 assert.doesNotMatch(
     relayMain,
     /updateTcpReadState = \(\) => \{[\s\S]*?\};\s+clientStallTimer = setInterval/,

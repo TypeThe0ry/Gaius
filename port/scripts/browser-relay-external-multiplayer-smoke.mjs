@@ -217,6 +217,21 @@ function relayManifestUrl(value) {
     return parsed.href;
 }
 
+function dnsCacheRuntime(manifest) {
+    const runtime = manifest?.runtime;
+    const fields = [
+        "publicDnsCacheEntries",
+        "publicDnsCacheHits",
+        "publicDnsCacheMisses",
+        "publicDnsCacheInflightJoins",
+    ];
+    if (!fields.every((field) => Number.isSafeInteger(runtime?.[field]) &&
+            runtime[field] >= 0)) {
+        return undefined;
+    }
+    return Object.fromEntries(fields.map((field) => [field, runtime[field]]));
+}
+
 async function fetchManifest() {
     const response = await fetch(relayManifestUrl(relayUrl), {
         signal: AbortSignal.timeout(15000),
@@ -420,6 +435,9 @@ async function main() {
                 pingSent: client.pingSent, pingResponses: client.pingResponses })),
         );
         const afterSoakManifest = await fetchManifest();
+        const dnsCacheBaseline = dnsCacheRuntime(baselineManifest);
+        const dnsCachePeak = dnsCacheRuntime(peakManifest);
+        const dnsCacheAfterSoak = dnsCacheRuntime(afterSoakManifest);
         clearInterval(pollTimer);
         for (const client of clients) bridge.close(client.id);
         await waitFor(
@@ -435,6 +453,7 @@ async function main() {
         const afterCloseManifest = await waitForTargetBaseline(
             baselineManifest, "external browser/bridge cleanup",
         );
+        const dnsCacheAfterClose = dnsCacheRuntime(afterCloseManifest);
         const statusRtt = clients.flatMap((client) => client.statusRtt);
         const pingRtt = clients.flatMap((client) => client.pingRtt);
         const pingSent = clients.reduce((sum, client) => sum + client.pingSent, 0);
@@ -471,6 +490,12 @@ async function main() {
                 afterSoakTargetActive: targetActive(afterSoakManifest),
                 afterCloseTargetActive: targetActive(afterCloseManifest),
                 targetAttestationFailures: stats.relayTargetAttestationFailures,
+                dnsCache: {
+                    baseline: dnsCacheBaseline,
+                    peak: dnsCachePeak,
+                    afterSoak: dnsCacheAfterSoak,
+                    afterClose: dnsCacheAfterClose,
+                },
             },
             browser: {
                 longestEventLoopGapMillis: Number(stats.longestEventLoopGapMillis.toFixed(3)),
@@ -498,8 +523,18 @@ async function main() {
                 maxRttMillis: measuredRttSummary.maxMillis,
                 eventLoopGapMillis: stats.longestEventLoopGapMillis,
                 targetObserved: targetActive(peakManifest) >= targetActive(baselineManifest) + clientCount,
+                dnsCacheTelemetry: dnsCacheBaseline !== undefined &&
+                    dnsCachePeak !== undefined && dnsCacheAfterSoak !== undefined &&
+                    dnsCacheAfterClose !== undefined,
+                dnsLookupsShared: dnsCachePeak === undefined ? 0 :
+                    (dnsCachePeak.publicDnsCacheHits -
+                        (dnsCacheBaseline?.publicDnsCacheHits ?? 0)) +
+                    (dnsCachePeak.publicDnsCacheInflightJoins -
+                        (dnsCacheBaseline?.publicDnsCacheInflightJoins ?? 0)),
                 thresholds: { p99RttLimitMillis, maxRttLimitMillis, eventLoopGapLimitMillis,
-                    pingEnabled: enablePing },
+                    pingEnabled: enablePing,
+                    minimumSharedDnsLookups: Math.max(0, clientCount - 1),
+                },
             },
             elapsedMillis: Number((performance.now() - startedAt).toFixed(1)),
             phases: stats.connectPhases.filter((event) => clients.some((client) => client.id === event.id)),
@@ -511,6 +546,11 @@ async function main() {
                 "external RelayNode target attestation failure detected");
             assert.ok(result.gate.targetObserved,
                 "RelayNode manifest did not observe all external target connections");
+            assert.ok(result.gate.dnsCacheTelemetry,
+                "RelayNode did not expose DNS cache telemetry; deployed node is stale");
+            assert.ok(result.gate.dnsLookupsShared >=
+                result.gate.thresholds.minimumSharedDnsLookups,
+                "RelayNode did not merge/cache same-target DNS lookups for every extra client");
             assert.ok(result.gate.p99RttMillis <= p99RttLimitMillis,
                 `external ${result.gate.rttSource} p99 exceeded ${p99RttLimitMillis}ms`);
             assert.ok(result.gate.maxRttMillis <= maxRttLimitMillis,
