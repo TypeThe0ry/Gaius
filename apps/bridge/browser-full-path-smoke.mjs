@@ -554,7 +554,7 @@ try {
             });
         }
         soakStartedAt = performance.now();
-        if (soakMs > 0) await delay(soakMs);
+        if (soakMs > 0) await delayAtLeast(soakMs);
         soakCompletedAt = performance.now();
         relayRuntimeAfterSoak = await waitForRelayRuntime(
             relayPort,
@@ -1327,6 +1327,19 @@ function assertOnlineEncryption(client, label) {
 function elapsedMillis(start, end) {
     if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return null;
     return Number((end - start).toFixed(3));
+}
+
+async function delayAtLeast(durationMillis) {
+    const requested = Math.max(0, Number(durationMillis) || 0);
+    const startedAt = performance.now();
+    while (true) {
+        const remaining = requested - (performance.now() - startedAt);
+        if (remaining <= 0) return;
+        // Node timers may wake a fraction of a millisecond early. Re-check the
+        // monotonic deadline instead of letting a strict 15 s soak fail on
+        // timer quantization (for example, 14999.936 ms).
+        await delay(Math.max(1, Math.ceil(remaining)));
+    }
 }
 
 function ratePerSecond(value, millis) {

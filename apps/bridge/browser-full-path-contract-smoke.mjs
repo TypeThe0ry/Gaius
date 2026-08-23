@@ -350,6 +350,13 @@ assert.match(fullPathSource,
 assert.match(fullPathSource,
     /schemaVersion: "browser-full-path-result-v2"/);
 assert.match(fullPathSource,
+    /if \(soakMs > 0\) await delayAtLeast\(soakMs\)/);
+assert.match(fullPathSource,
+    /async function delayAtLeast\(durationMillis\)[\s\S]*?performance\.now\(\)[\s\S]*?Math\.ceil\(remaining\)/);
+assert.doesNotMatch(fullPathSource,
+    /if \(soakMs > 0\) await delay\(soakMs\)/,
+    "strict soak must re-check its monotonic deadline after an early timer wakeup");
+assert.match(fullPathSource,
     /authorization: `Bearer \$\{relayToken\}`/);
 assert.match(fullPathSource,
     /client\.dropTimingResult\(dropAt\)/);
