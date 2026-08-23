@@ -15,6 +15,7 @@ import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.JumpInsnNode;
 import org.objectweb.asm.tree.LabelNode;
+import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.TryCatchBlockNode;
@@ -42,6 +43,7 @@ public final class Minecraft12111BrowserPatcher {
     private static final String BROWSER_LAYER_YIELD = "browserLayerYield";
     private static final String CHUNK_GENERATION_YIELD =
             "dev/gaius/browser/BrowserChunkGenerationYield";
+    private static final int BROWSER_HOLDERS_PER_TURN = 16;
 
     private Minecraft12111BrowserPatcher() {
     }
@@ -110,6 +112,7 @@ public final class Minecraft12111BrowserPatcher {
     private static void patchRunUntilWaitYieldGate(MethodNode method, String owner) {
         LabelNode noYield = new LabelNode();
         LabelNode returnPending = new LabelNode();
+        LabelNode continueVanilla = new LabelNode();
         InsnList gate = new InsnList();
         gate.add(new VarInsnNode(Opcodes.ALOAD, 0));
         gate.add(new FieldInsnNode(
@@ -148,6 +151,30 @@ public final class Minecraft12111BrowserPatcher {
                 "Ljava/util/concurrent/CompletableFuture;"));
         gate.add(new InsnNode(Opcodes.ARETURN));
         gate.add(noYield);
+        // Preserve vanilla's layer barrier: submit the whole cursor before waiting on any
+        // scheduled holder future, otherwise a pending holder can wait on an unscheduled peer.
+        gate.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        gate.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, BROWSER_LAYER_ACTIVE, "Z"));
+        gate.add(new JumpInsnNode(Opcodes.IFEQ, continueVanilla));
+        gate.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        gate.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, owner, "scheduleNextLayer", "()V", false));
+        gate.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        gate.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                BROWSER_LAYER_YIELD,
+                "Ljava/util/concurrent/CompletableFuture;"));
+        gate.add(new JumpInsnNode(Opcodes.IFNULL, continueVanilla));
+        gate.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        gate.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                BROWSER_LAYER_YIELD,
+                "Ljava/util/concurrent/CompletableFuture;"));
+        gate.add(new InsnNode(Opcodes.ARETURN));
+        gate.add(continueVanilla);
         // Keep the original loop target label in front of the gate.  The vanilla
         // runUntilWait backedge jumps to that label, so inserting before the label
         // would let the backedge bypass the yield check on every subsequent holder.
@@ -312,6 +339,7 @@ public final class Minecraft12111BrowserPatcher {
         LabelNode cancel = new LabelNode();
         LabelNode successful = new LabelNode();
         LabelNode nextColumn = new LabelNode();
+        LabelNode continueBatch = new LabelNode();
         LabelNode scheduleYield = new LabelNode();
         LabelNode normalReturn = new LabelNode();
         LabelNode tryEnd = new LabelNode();
@@ -319,6 +347,8 @@ public final class Minecraft12111BrowserPatcher {
         LabelNode start = new LabelNode();
         InsnList code = new InsnList();
         code.add(start);
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 7));
 
         // Initialize the cursor only for a new status.  On resume, the saved x/z pair
         // already points at the next holder and the status arguments are unchanged.
@@ -460,6 +490,10 @@ public final class Minecraft12111BrowserPatcher {
 
         // The checkpoint-only profile yields only through the holder continuation below.
         code.add(successful);
+        code.add(new VarInsnNode(Opcodes.ILOAD, 7));
+        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(new InsnNode(Opcodes.IADD));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 7));
 
         // Advance the cursor.  The final holder marks the layer complete but still
         // schedules a continuation so the following layer starts on a later turn.
@@ -497,7 +531,7 @@ public final class Minecraft12111BrowserPatcher {
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new FieldInsnNode(
                 Opcodes.GETFIELD, owner, BROWSER_LAYER_END_X, "I"));
-        code.add(new JumpInsnNode(Opcodes.IF_ICMPLE, scheduleYield));
+        code.add(new JumpInsnNode(Opcodes.IF_ICMPLE, continueBatch));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new InsnNode(Opcodes.ICONST_0));
         code.add(new FieldInsnNode(
@@ -510,6 +544,11 @@ public final class Minecraft12111BrowserPatcher {
         code.add(new FieldInsnNode(
                 Opcodes.PUTFIELD, owner, BROWSER_LAYER_Z, "I"));
 
+        code.add(continueBatch);
+        code.add(new VarInsnNode(Opcodes.ILOAD, 7));
+        code.add(new LdcInsnNode(BROWSER_HOLDERS_PER_TURN));
+        code.add(new JumpInsnNode(Opcodes.IF_ICMPLT, resume));
+
         code.add(scheduleYield);
         // browserLayerYield = new CompletableFuture<>();
         code.add(new TypeInsnNode(Opcodes.NEW, "java/util/concurrent/CompletableFuture"));
@@ -520,9 +559,9 @@ public final class Minecraft12111BrowserPatcher {
                 "<init>",
                 "()V",
                 false));
-        code.add(new VarInsnNode(Opcodes.ASTORE, 7));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 8));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 7));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 8));
         code.add(new FieldInsnNode(
                 Opcodes.PUTFIELD,
                 owner,
@@ -530,7 +569,7 @@ public final class Minecraft12111BrowserPatcher {
                 "Ljava/util/concurrent/CompletableFuture;"));
         code.add(new TypeInsnNode(Opcodes.NEW, CHUNK_GENERATION_YIELD));
         code.add(new InsnNode(Opcodes.DUP));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 7));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 8));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESPECIAL,
                 CHUNK_GENERATION_YIELD,
@@ -553,7 +592,7 @@ public final class Minecraft12111BrowserPatcher {
         // A holder or Platform.schedule failure must not leave a live cursor or a
         // never-completing browser future attached to the task.
         code.add(handler);
-        code.add(new VarInsnNode(Opcodes.ASTORE, 8));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 9));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new InsnNode(Opcodes.ICONST_0));
         code.add(new FieldInsnNode(
@@ -565,9 +604,9 @@ public final class Minecraft12111BrowserPatcher {
                 owner,
                 BROWSER_LAYER_YIELD,
                 "Ljava/util/concurrent/CompletableFuture;"));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 8));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 9));
         code.add(new InsnNode(Opcodes.ATHROW));
-        replace(method, code, 5, 9);
+        replace(method, code, 5, 10);
         method.tryCatchBlocks.add(new TryCatchBlockNode(
                 start, tryEnd, handler, "java/lang/Throwable"));
     }

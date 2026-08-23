@@ -5665,6 +5665,7 @@ def check_source_patches() -> None:
                     "ChunkGenerationTask.runUntilWait",
                     "ChunkGenerationTask.waitForScheduledLayer",
                     "replaceChunkGenerationScheduleLayer(",
+                    "BROWSER_HOLDERS_PER_TURN = 16",
                     "ChunkGenerationTask.canLoadWithoutGeneration",
                 )
             )
@@ -5778,6 +5779,7 @@ def check_source_patches() -> None:
                     "replaceChunkGenerationScheduleNextLayer(",
                     "replaceChunkGenerationScheduleLayer(",
                     "writeChunkGenerationYieldHelper(root)",
+                    "BROWSER_HOLDERS_PER_TURN = 16",
                     'Opcodes.GETFIELD, CHUNK_POS, "x", "I"',
                     'Opcodes.GETFIELD, CHUNK_POS, "z", "I"',
                     '"org/teavm/platform/Platform"',
@@ -11808,6 +11810,14 @@ def check_overlay_bytecode() -> None:
                     and generation_run_until_wait.count(
                         "BrowserWorldgenScheduler.beginServerWorkTurn"
                     ) == 0
+                    and generation_run_until_wait.count(
+                        "Method scheduleNextLayer:()V"
+                    ) == 2
+                    and 0 <= generation_run_until_wait.find(
+                        "Field browserLayerActive"
+                    ) < generation_run_until_wait.find(
+                        "Method waitForScheduledLayer:"
+                    )
                     and generation_wait_for_scheduled_layer.count(
                         "BrowserWorldgenScheduler.pulse"
                     ) == 1
@@ -11819,6 +11829,8 @@ def check_overlay_bytecode() -> None:
                     and "browserLayerYield" in generation_schedule_layer
                     and "BrowserChunkGenerationYield" in generation_schedule_layer
                     and "org/teavm/platform/Platform.schedule" in generation_schedule_layer
+                    and "// int 16" in generation_schedule_layer
+                    and "if_icmplt" in generation_schedule_layer
                     and "Exception table:" in generation_schedule_layer
                     and "Field browserLayerActive" in generation_schedule_layer
                     and "Field browserLayerYield" in generation_schedule_layer

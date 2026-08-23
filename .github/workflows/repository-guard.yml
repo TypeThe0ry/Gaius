@@ -104,6 +104,7 @@ jobs:
             node port/scripts/singleplayer-worker-runtime-smoke.mjs
           node port/scripts/singleplayer-worker-slow-sample-smoke.mjs
           node port/scripts/chunk-pipeline-telemetry-smoke.mjs
+          node port/scripts/chunk-layer-barrier-smoke.mjs
           node port/scripts/gson-type-token-external-overlay-smoke.mjs
           node port/scripts/worldgen-scheduler-smoke.mjs
 

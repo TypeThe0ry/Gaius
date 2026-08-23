@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
-import {access, copyFile, mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
+import {access, copyFile, mkdir, mkdtemp, readFile, rm} from "node:fs/promises";
 import {existsSync} from "node:fs";
 import {homedir, tmpdir} from "node:os";
 import {basename, delimiter, join} from "node:path";
@@ -30,6 +30,7 @@ const asmRoot = join(homedir(), ".m2/repository/org/ow2/asm");
 const asm = join(asmRoot, "asm/9.8/asm-9.8.jar");
 const asmTree = join(asmRoot, "asm-tree/9.8/asm-tree-9.8.jar");
 const asmAnalysis = join(asmRoot, "asm-analysis/9.8/asm-analysis-9.8.jar");
+const verifierSource = join(repositoryRoot, "port/scripts/fixtures/GaiusChunkLayerBytecodeVerifier.java");
 const forbiddenDeepWorldgenPatchHelpers = Object.freeze([
   "patchFeatureDecorationCooperation",
   "patchCarverCooperation",
@@ -110,62 +111,237 @@ function graphicsPresetCustomReturn(applyBytecode) {
   return entry.instruction;
 }
 
-function cursorModel(radius, stop = null) {
-  const turns = [];
+const HOLDERS_PER_TURN = 16;
+
+function cursorModel(radius, stop = null, batchLimit = HOLDERS_PER_TURN) {
+  const visits = [];
+  const batches = [];
+  let batch = [];
   let active = true;
   let yieldPending = false;
   for (let x = -radius; x <= radius && active; x++) {
     for (let z = -radius; z <= radius && active; z++) {
-      const index = turns.length;
+      const index = visits.length;
       const outcome = stop?.index === index ? stop.kind : "success";
-      turns.push({x, z, outcome});
+      const visit = {x, z, outcome};
+      visits.push(visit);
       if (outcome !== "success") {
         active = false;
         yieldPending = false;
+        if (batch.length) batches.push(batch);
         continue;
       }
-      // Each successful holder schedules one continuation; the next browser turn
-      // consumes it before resuming the cursor.
-      yieldPending = true;
-      yieldPending = false;
+      batch.push(visit);
       if (x === radius && z === radius) {
         active = false;
       }
+      if (batch.length === batchLimit || !active) {
+        batches.push(batch);
+        batch = [];
+        // One zero-delay continuation separates bounded batches.  The final
+        // batch also crosses this barrier before scheduled futures are drained.
+        yieldPending = true;
+        yieldPending = false;
+      }
     }
   }
-  return {turns, active, yieldPending};
+  return {visits, batches, active, yieldPending};
+}
+
+function pendingDependencyLayerModel(
+  turns,
+  dependencyOf = new Map(),
+  {drainAfterEachTurn = false} = {},
+) {
+  const submitted = [];
+  const submittedSet = new Set();
+  const completed = [];
+  const completedSet = new Set();
+  const pending = [];
+  // Keep the planned turn shape separate from the turns actually submitted.
+  // The old one-holder await stops after turn 0, but its intended schedule is
+  // still [1, ...] and must be visible to the regression assertion.
+  const batches = turns.map(turn => [...turn]);
+  const submittedBatches = [];
+  const drains = [];
+
+  function drainPending(stage) {
+    let progress = true;
+    const drained = [];
+    while (progress) {
+      progress = false;
+      const remaining = [];
+      for (const item of pending) {
+        const dependency = item.dependsOn;
+        if (dependency == null || completedSet.has(dependency)) {
+          completed.push(item.holder);
+          completedSet.add(item.holder);
+          drained.push(item.holder);
+          progress = true;
+        } else {
+          remaining.push(item);
+        }
+      }
+      pending.splice(0, pending.length, ...remaining);
+    }
+    drains.push({stage, drained, pending: pending.map(item => item.holder)});
+  }
+
+  for (const [turnIndex, turn] of turns.entries()) {
+    const submittedBatch = [];
+    for (const holder of turn) {
+      assert.equal(submittedSet.has(holder), false,
+        `layer model submitted holder ${holder} more than once`);
+      submittedSet.add(holder);
+      submitted.push(holder);
+      submittedBatch.push(holder);
+      pending.push({holder, dependsOn: dependencyOf.get(holder) ?? null});
+    }
+    submittedBatches.push(submittedBatch);
+    if (drainAfterEachTurn) {
+      drainPending(`turn-${turnIndex}`);
+      if (pending.length) {
+        return {
+          blocked: true,
+          blockedAtTurn: turnIndex,
+          waitedAt: submitted.length,
+          submitted,
+          completed,
+          pending: pending.map(item => ({...item})),
+          batches,
+          submittedBatches,
+          drains,
+        };
+      }
+    }
+  }
+
+  // The fixed barrier drains only after every holder in the layer was submitted.
+  drainPending("final-layer-barrier");
+  return {
+    blocked: pending.length !== 0,
+    blockedAtTurn: null,
+    waitedAt: submitted.length,
+    submitted,
+    completed,
+    pending: pending.map(item => ({...item})),
+    batches,
+    submittedBatches,
+    drains,
+  };
+}
+
+function boundedLayerTurns(holderCount, batchLimit) {
+  const turns = [];
+  for (let holder = 0; holder < holderCount; holder += batchLimit) {
+    turns.push(Array.from(
+      {length: Math.min(batchLimit, holderCount - holder)},
+      (_, offset) => holder + offset,
+    ));
+  }
+  return turns;
+}
+
+function oneHolderTurns(holderCount) {
+  return boundedLayerTurns(holderCount, 1);
+}
+
+function layerBarrierSafetyModel(holderCount, batchLimit, waitBetweenBatches) {
+  const run = pendingDependencyLayerModel(
+    boundedLayerTurns(holderCount, batchLimit),
+    new Map([[0, holderCount - 1]]),
+    {drainAfterEachTurn: waitBetweenBatches},
+  );
+  return {
+    blocked: run.blocked,
+    waitedAt: run.waitedAt,
+    scheduled: run.submitted,
+    batches: run.batches,
+    submittedBatches: run.submittedBatches,
+    completed: run.completed,
+    pending: run.pending,
+    drains: run.drains,
+  };
 }
 
 for (const radius of [0, 1, 2]) {
   const run = cursorModel(radius);
   const expected = (radius * 2 + 1) ** 2;
-  assert.equal(run.turns.length, expected,
+  assert.equal(run.visits.length, expected,
     `cursor radius ${radius} must visit every holder exactly once`);
   assert.equal(run.active, false,
     `cursor radius ${radius} must close after its final holder`);
-  assert.equal(new Set(run.turns.map(({x, z}) => `${x},${z}`)).size, expected,
+  assert.equal(new Set(run.visits.map(({x, z}) => `${x},${z}`)).size, expected,
     `cursor radius ${radius} must not duplicate holders`);
-  assert.equal(run.turns.at(-1)?.outcome, "success",
+  assert.equal(run.visits.at(-1)?.outcome, "success",
     `cursor radius ${radius} must process its final holder before closing`);
+  assert.equal(run.batches.length, Math.ceil(expected / HOLDERS_PER_TURN),
+    `cursor radius ${radius} must use the minimum bounded continuation count`);
+  assert.ok(run.batches.every(batch => batch.length > 0 && batch.length <= HOLDERS_PER_TURN),
+    `cursor radius ${radius} exceeded the holder batch limit`);
 }
 const cancelledCursor = cursorModel(2, {index: 3, kind: "cancel"});
-assert.equal(cancelledCursor.turns.length, 4,
+assert.equal(cancelledCursor.visits.length, 4,
   "cursor cancellation must stop at the cancellation holder");
-assert.equal(cancelledCursor.turns.at(-1)?.outcome, "cancel",
+assert.equal(cancelledCursor.visits.at(-1)?.outcome, "cancel",
   "cursor cancellation outcome must be observable at the holder boundary");
 assert.equal(cancelledCursor.active, false,
   "cursor cancellation must clear active state");
 assert.equal(cancelledCursor.yieldPending, false,
   "cursor cancellation must not retain a continuation future");
 const failedCursor = cursorModel(2, {index: 4, kind: "failure"});
-assert.equal(failedCursor.turns.length, 5,
+assert.equal(failedCursor.visits.length, 5,
   "cursor failure must stop at the failed holder");
-assert.equal(failedCursor.turns.at(-1)?.outcome, "failure",
+assert.equal(failedCursor.visits.at(-1)?.outcome, "failure",
   "cursor failure outcome must be observable at the holder boundary");
 assert.equal(failedCursor.active, false,
   "cursor failure must clear active state");
 assert.equal(failedCursor.yieldPending, false,
   "cursor failure must not retain a continuation future");
+
+const unsafeLayerOrder = layerBarrierSafetyModel(17, HOLDERS_PER_TURN, true);
+assert.equal(unsafeLayerOrder.blocked, true,
+  "the dependency fixture must expose per-batch await starvation");
+assert.equal(unsafeLayerOrder.waitedAt, HOLDERS_PER_TURN,
+  "the unsafe model must wait before the final holder is submitted");
+const fixedLayerOrder = layerBarrierSafetyModel(17, HOLDERS_PER_TURN, false);
+assert.equal(fixedLayerOrder.blocked, false,
+  "the active cursor must submit the complete layer before waiting");
+assert.deepEqual(fixedLayerOrder.batches.map(batch => batch.length), [16, 1],
+  "a 17-holder layer must span two bounded turns without an intermediate layer wait");
+assert.deepEqual(fixedLayerOrder.submittedBatches.map(batch => batch.length), [16, 1],
+  "the fixed barrier must submit both bounded turns before draining");
+assert.deepEqual(fixedLayerOrder.scheduled,
+  Array.from({length: 17}, (_, holder) => holder),
+  "the fixed barrier must submit all 17 holders before waiting");
+assert.equal(fixedLayerOrder.waitedAt, 17,
+  "the fixed model must reach the layer barrier only after every holder is submitted");
+assert.equal(fixedLayerOrder.pending.length, 0,
+  "the fixed layer barrier must drain every pending holder future");
+assert.deepEqual(fixedLayerOrder.completed.sort((a, b) => a - b),
+  Array.from({length: 17}, (_, holder) => holder),
+  "the fixed layer barrier must complete all holders after the final batch");
+assert.equal(fixedLayerOrder.drains.length, 1,
+  "the fixed model must not drain any holder batch before the final barrier");
+assert.equal(fixedLayerOrder.drains.at(-1)?.stage, "final-layer-barrier",
+  "the fixed layer must drain pending futures only at its final barrier");
+
+const oldOneHolderOrder = pendingDependencyLayerModel(
+  oneHolderTurns(17),
+  new Map([[0, 16]]),
+  {drainAfterEachTurn: true},
+);
+assert.equal(oldOneHolderOrder.blocked, true,
+  "the old one-holder await order must block on a same-layer dependency");
+assert.equal(oldOneHolderOrder.blockedAtTurn, 0,
+  "the old order must await holder 0 before submitting its dependency holder");
+assert.deepEqual(oldOneHolderOrder.batches.map(batch => batch.length),
+  Array.from({length: 17}, () => 1),
+  "the old regression model must use one holder per browser turn");
+assert.deepEqual(oldOneHolderOrder.pending, [{holder: 0, dependsOn: 16}],
+  "the old blocked order must retain holder 0 pending on holder 16");
+assert.deepEqual(oldOneHolderOrder.submitted, [0],
+  "the old await model must not submit the dependency holder after blocking");
 
 await Promise.all([
   access(rawClientJar),
@@ -173,11 +349,14 @@ await Promise.all([
   access(asm),
   access(asmTree),
   access(asmAnalysis),
+  access(verifierSource),
 ]);
 const browserPatcherSource = await readFile(
   join(toolsSource, "Minecraft262BrowserPatcher.java"),
   "utf8",
 );
+assert.match(browserPatcherSource, /BROWSER_HOLDERS_PER_TURN = 16/,
+  "26.2 holder batching must retain the reviewed 16-holder upper bound");
 const clientPatcherSource = await readFile(
   join(toolsSource, "MinecraftClientPatcher.java"),
   "utf8",
@@ -258,40 +437,6 @@ try {
     encoding: "utf8", timeout: 30_000,
   });
 
-  const verifierSource = join(root, "GaiusBytecodeVerifier.java");
-  await writeFile(verifierSource, `
-import java.util.zip.ZipFile;
-import org.objectweb.asm.ClassReader;
-import org.objectweb.asm.tree.ClassNode;
-import org.objectweb.asm.tree.MethodNode;
-import org.objectweb.asm.tree.analysis.Analyzer;
-import org.objectweb.asm.tree.analysis.BasicValue;
-import org.objectweb.asm.tree.analysis.BasicVerifier;
-
-public final class GaiusBytecodeVerifier {
-    private static void verify(ZipFile jar, String name) throws Exception {
-        var entry = jar.getEntry(name);
-        if (entry == null) {
-            throw new IllegalStateException("missing verifier entry: " + name);
-        }
-        ClassNode node = new ClassNode();
-        try (var input = jar.getInputStream(entry)) {
-            new ClassReader(input.readAllBytes()).accept(node, 0);
-        }
-        for (MethodNode method : node.methods) {
-            new Analyzer<BasicValue>(new BasicVerifier()).analyze(node.name, method);
-        }
-        System.out.println("BASIC_VERIFIER_OK " + name);
-    }
-
-    public static void main(String[] args) throws Exception {
-        try (ZipFile jar = new ZipFile(args[0])) {
-            verify(jar, "net/minecraft/server/level/ChunkGenerationTask.class");
-            verify(jar, "dev/gaius/browser/BrowserChunkGenerationYield.class");
-        }
-    }
-}
-`, "utf8");
   const verifierClasspath = [asm, asmTree, asmAnalysis].join(delimiter);
   execFileSync(javac, [
     "--release", "21", "-proc:none", "-classpath", verifierClasspath,
@@ -299,12 +444,14 @@ public final class GaiusBytecodeVerifier {
   ], {encoding: "utf8", timeout: 30_000});
   const verifierOutput = execFileSync(java, [
     "-classpath", [classes, verifierClasspath].join(delimiter),
-    "GaiusBytecodeVerifier", clientJar,
+    "GaiusChunkLayerBytecodeVerifier", clientJar,
   ], {encoding: "utf8", timeout: 30_000});
   assert.match(verifierOutput, /BASIC_VERIFIER_OK .*ChunkGenerationTask\.class/,
     "ASM BasicVerifier did not validate ChunkGenerationTask");
   assert.match(verifierOutput, /BASIC_VERIFIER_OK .*BrowserChunkGenerationYield\.class/,
     "ASM BasicVerifier did not validate BrowserChunkGenerationYield");
+  assert.match(verifierOutput, /CFG_VERIFIER_OK net\/minecraft\/server\/level\/ChunkGenerationTask/,
+    "ASM CFG verifier did not validate the chunk layer barrier");
   process.stdout.write(verifierOutput);
 
   const rawGraphics = execFileSync(javap, ["-classpath", rawClientJar, "-p", "-c",
@@ -416,6 +563,18 @@ public final class GaiusBytecodeVerifier {
     "runUntilWait yield gate does not begin with its receiver load");
   assert.equal(runUntilWaitBackedges[0].target, yieldGateStart.offset,
     "runUntilWait backedge bypasses the holder-yield gate");
+  const activeFieldIndex = runUntilWaitInstructions.findIndex(entry =>
+    entry.instruction.includes("Field browserLayerActive"));
+  const firstScheduleNextIndex = runUntilWaitInstructions.findIndex(entry =>
+    entry.instruction.includes("Method scheduleNextLayer:()V"));
+  const firstLayerWaitIndex = runUntilWaitInstructions.findIndex(entry =>
+    entry.instruction.includes("Method waitForScheduledLayer:"));
+  assert.ok(yieldFieldIndex < activeFieldIndex
+      && activeFieldIndex < firstScheduleNextIndex
+      && firstScheduleNextIndex < firstLayerWaitIndex,
+  "active cursor must resume scheduleNextLayer before waitForScheduledLayer is reachable");
+  assert.equal(occurrences(runUntilWait, "Method scheduleNextLayer:()V"), 2,
+    "runUntilWait must retain active-resume and vanilla fresh-layer scheduling paths");
   assert.equal(occurrences(runUntilWait, "BrowserWorldgenScheduler.beginServerWorkTurn"), 0,
     "runUntilWait must not reset the shared tick budget per task invocation");
   assert.equal(occurrences(runUntilWait, "BrowserWorldgenScheduler.beginTaskWork"), 1,
@@ -436,6 +595,19 @@ public final class GaiusBytecodeVerifier {
     "scheduleLayer exception path must clear active cursor state");
   assert.match(scheduleLayerExceptionCleanup, /Field browserLayerYield/,
     "scheduleLayer exception path must clear pending continuation state");
+  const scheduleLayerInstructions = bytecodeInstructions(scheduleLayer);
+  const batchBackedges = scheduleLayerInstructions.flatMap((entry, index) => {
+    const match = entry.instruction.match(/^if_icmplt\s+(\d+)\s*$/);
+    return match && Number(match[1]) < entry.offset
+      ? [{entry, index, target: Number(match[1])}] : [];
+  });
+  assert.equal(batchBackedges.length, 1,
+    "scheduleLayer must retain one bounded holder-batch backedge");
+  assert.match(scheduleLayerInstructions[batchBackedges[0].index - 1]?.instruction ?? "",
+    /(?:bipush\s+16|ldc(?:_w)?\s+.*\/\/ int 16)/,
+    "scheduleLayer batch backedge must enforce the 16-holder upper bound");
+  assert.ok(scheduleLayer.indexOf("scheduleChunkInLayer") < scheduleLayer.indexOf("Platform.schedule"),
+    "scheduleLayer must submit holders before publishing its batch continuation");
   const runServer = method(bytecode, "protected void runServer", "private void");
   const tickStart = runServer.indexOf("BrowserWorldgenScheduler.beginServerWorkTurn");
   const processTick = runServer.indexOf("processPacketsAndTick");
@@ -568,6 +740,8 @@ public final class GaiusBytecodeVerifier {
     distancePulses: occurrences(distance, "pulseDistanceManager"),
     graphicsPresetDistances: "6/4",
     oneTwentyOneFastDistances: "8/6",
+    holderBatchLimit: HOLDERS_PER_TURN,
+    layerBarrier: true,
     broadcastSnapshot: true,
     uberCleanupCursor: true,
     targetingPartialTickLocal: 6,

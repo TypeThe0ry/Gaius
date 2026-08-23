@@ -80,6 +80,7 @@ for (const contract of [
   "patchChunkGenerationCooperation(jar, root)",
   "patchRegionFileStorageCache(jar, root)",
   "BROWSER_REGION_FILE_CACHE_SIZE = 16",
+  "BROWSER_HOLDERS_PER_TURN = 16",
   '"ChunkGenerationTask.runUntilWait"',
   '"ChunkGenerationTask.canLoadWithoutGeneration"',
   '"browserLayerActive"',
@@ -284,12 +285,20 @@ assert.match(runUntilWait, /Exception table:[\s\S]*Throwable/,
 assert.ok(runUntilWait.indexOf("scheduleNextLayer")
     < runUntilWait.indexOf("BrowserWorldgenScheduler.pulse"),
 "runUntilWait pulses before making layer progress");
+assert.ok(runUntilWait.indexOf("Field browserLayerActive")
+    < runUntilWait.indexOf("waitForScheduledLayer"),
+"runUntilWait reaches the vanilla layer wait before checking its active cursor");
+assert.ok(runUntilWait.indexOf("scheduleNextLayer")
+    < runUntilWait.indexOf("waitForScheduledLayer"),
+"runUntilWait does not resume its active layer before waiting on holder futures");
 assert.equal(scheduleLayer.match(/BrowserWorldgenScheduler\.pulse/g)?.length, 1,
   "scheduleLayer must pulse once at each holder cursor boundary");
 assert.match(scheduleLayer, /browserLayerX[\s\S]*browserLayerZ/,
   "scheduleLayer must retain a holder cursor across browser turns");
 assert.match(scheduleLayer, /BrowserChunkGenerationYield/,
-  "scheduleLayer must schedule a continuation future after each holder");
+  "scheduleLayer must schedule a continuation future after each bounded holder batch");
+assert.match(scheduleLayer, /ldc(?:_w)?\s+.*\/\/ int 16[\s\S]*if_icmplt/,
+  "scheduleLayer must cap each browser turn at 16 holders");
 assert.equal(scheduleLayer.match(/Platform\.schedule/g)?.length, 1,
   "scheduleLayer must use one zero-delay platform continuation");
 assert.match(scheduleLayer, /Exception table:[\s\S]*Throwable/,
