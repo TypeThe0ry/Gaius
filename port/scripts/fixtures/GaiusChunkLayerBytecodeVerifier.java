@@ -9,6 +9,12 @@ import org.objectweb.asm.tree.analysis.BasicValue;
 import org.objectweb.asm.tree.analysis.BasicVerifier;
 
 public final class GaiusChunkLayerBytecodeVerifier {
+    private static final String BROWSER_WORLDGEN_SCHEDULER =
+            "dev/gaius/browser/BrowserWorldgenScheduler";
+    private static final String SCHEDULE_CHUNK_IN_LAYER_DESCRIPTOR =
+            "(Lnet/minecraft/world/level/chunk/status/ChunkStatus;Z"
+                    + "Lnet/minecraft/server/level/GenerationChunkHolder;)Z";
+
     private static void require(boolean condition, String message) {
         if (!condition) throw new IllegalStateException(message);
     }
@@ -48,6 +54,118 @@ public final class GaiusChunkLayerBytecodeVerifier {
         return null;
     }
 
+    private static boolean isTerminal(AbstractInsnNode instruction) {
+        if (instruction == null) return true;
+        return switch (instruction.getOpcode()) {
+            case Opcodes.ATHROW,
+                    Opcodes.IRETURN,
+                    Opcodes.LRETURN,
+                    Opcodes.FRETURN,
+                    Opcodes.DRETURN,
+                    Opcodes.ARETURN,
+                    Opcodes.RETURN,
+                    Opcodes.RET -> true;
+            default -> false;
+        };
+    }
+
+    private static void addSuccessor(List<AbstractInsnNode> successors,
+            AbstractInsnNode instruction) {
+        if (instruction != null) successors.add(instruction);
+    }
+
+    private static List<AbstractInsnNode> successors(AbstractInsnNode instruction) {
+        List<AbstractInsnNode> successors = new ArrayList<>();
+        if (instruction instanceof JumpInsnNode jump) {
+            addSuccessor(successors, firstExecutable(jump.label));
+            if (jump.getOpcode() != Opcodes.GOTO && jump.getOpcode() != Opcodes.JSR) {
+                addSuccessor(successors, nextExecutable(instruction));
+            }
+        } else if (instruction instanceof TableSwitchInsnNode tableSwitch) {
+            addSuccessor(successors, firstExecutable(tableSwitch.dflt));
+            for (LabelNode label : tableSwitch.labels) {
+                addSuccessor(successors, firstExecutable(label));
+            }
+        } else if (instruction instanceof LookupSwitchInsnNode lookupSwitch) {
+            addSuccessor(successors, firstExecutable(lookupSwitch.dflt));
+            for (LabelNode label : lookupSwitch.labels) {
+                addSuccessor(successors, firstExecutable(label));
+            }
+        } else if (!isTerminal(instruction)) {
+            addSuccessor(successors, nextExecutable(instruction));
+        }
+        return successors;
+    }
+
+    private static boolean isBrowserWorldgenPulse(AbstractInsnNode instruction) {
+        return instruction instanceof MethodInsnNode call
+                && call.getOpcode() == Opcodes.INVOKESTATIC
+                && BROWSER_WORLDGEN_SCHEDULER.equals(call.owner)
+                && call.name.equals("pulse")
+                && call.desc.equals("()V");
+    }
+
+    private static boolean everyPathHitsPulse(AbstractInsnNode instruction,
+            java.util.IdentityHashMap<AbstractInsnNode, Boolean> memo,
+            java.util.Set<AbstractInsnNode> active) {
+        if (isBrowserWorldgenPulse(instruction)) return true;
+        if (isTerminal(instruction)) return false;
+        Boolean cached = memo.get(instruction);
+        if (cached != null) return cached;
+        if (!active.add(instruction)) return false;
+        List<AbstractInsnNode> next = successors(instruction);
+        boolean allPathsHit = !next.isEmpty();
+        for (AbstractInsnNode successor : next) {
+            if (!everyPathHitsPulse(successor, memo, active)) {
+                allPathsHit = false;
+                break;
+            }
+        }
+        active.remove(instruction);
+        memo.put(instruction, allPathsHit);
+        return allPathsHit;
+    }
+
+    private static void verifySuccessfulHolderPulsePaths(MethodNode layer, String owner) {
+        int successfulHolderBranches = 0;
+        for (AbstractInsnNode instruction : layer.instructions) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || !call.name.equals("scheduleChunkInLayer")) continue;
+            require(call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                            && owner.equals(call.owner)
+                            && SCHEDULE_CHUNK_IN_LAYER_DESCRIPTOR.equals(call.desc),
+                    "scheduleLayer holder submission call shape changed");
+            AbstractInsnNode branch = nextExecutable(call);
+            require(branch instanceof JumpInsnNode jump && jump.getOpcode() == Opcodes.IFEQ,
+                    "scheduleLayer holder result must branch on success");
+            AbstractInsnNode successPath = nextExecutable(branch);
+            require(successPath != null,
+                    "scheduleLayer successful holder path is empty");
+            successfulHolderBranches++;
+            require(everyPathHitsPulse(successPath,
+                            new java.util.IdentityHashMap<>(),
+                            java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>())),
+                    "scheduleLayer successful holder path lost BrowserWorldgenScheduler.pulse");
+        }
+        require(successfulHolderBranches > 0,
+                "scheduleLayer holder submission call is missing");
+    }
+
+    private static void verifyNoBrowserWorldgenSchedulerCalls(ClassNode node,
+            String profile) {
+        for (MethodNode method : node.methods) {
+            for (AbstractInsnNode instruction : method.instructions) {
+                if (instruction instanceof MethodInsnNode call
+                        && BROWSER_WORLDGEN_SCHEDULER.equals(call.owner)) {
+                    throw new IllegalStateException(profile + " " + node.name
+                            + " must not call BrowserWorldgenScheduler ("
+                            + call.name + call.desc + ")");
+                }
+            }
+        }
+        System.out.println("PROFILE_CALL_SURFACE_OK " + profile + " " + node.name);
+    }
+
     private static void verifyCleanupBlock(LabelNode label, String target) {
         boolean activeCleared = false;
         boolean yieldCleared = false;
@@ -71,7 +189,7 @@ public final class GaiusChunkLayerBytecodeVerifier {
         require(activeCleared && yieldCleared && exits, target + " cleanup CFG changed");
     }
 
-    private static void verifyLayerBarrierCfg(ClassNode node) {
+    private static void verifyLayerBarrierCfg(ClassNode node, String profile) {
         MethodNode run = method(node, "runUntilWait");
         List<FieldInsnNode> activeGets = new ArrayList<>();
         for (AbstractInsnNode instruction : run.instructions) {
@@ -275,10 +393,14 @@ public final class GaiusChunkLayerBytecodeVerifier {
         }
         require(handlerActiveCleared && handlerYieldCleared && rethrowsSame,
                 "scheduleLayer Throwable cleanup/rethrow changed");
+        if (profile.equals("26.2")) {
+            verifySuccessfulHolderPulsePaths(layer, node.name);
+            System.out.println("PROFILE_CFG_OK " + profile + " " + node.name);
+        }
         System.out.println("CFG_VERIFIER_OK " + node.name);
     }
 
-    private static void verify(ZipFile jar, String name) throws Exception {
+    private static void verify(ZipFile jar, String name, String profile) throws Exception {
         var entry = jar.getEntry(name);
         if (entry == null) {
             throw new IllegalStateException("missing verifier entry: " + name);
@@ -291,15 +413,23 @@ public final class GaiusChunkLayerBytecodeVerifier {
             new Analyzer<BasicValue>(new BasicVerifier()).analyze(node.name, method);
         }
         if (name.equals("net/minecraft/server/level/ChunkGenerationTask.class")) {
-            verifyLayerBarrierCfg(node);
+            verifyLayerBarrierCfg(node, profile);
+        }
+        if (profile.equals("1.21.11")) {
+            verifyNoBrowserWorldgenSchedulerCalls(node, profile);
         }
         System.out.println("BASIC_VERIFIER_OK " + name);
     }
 
     public static void main(String[] args) throws Exception {
+        require(args.length == 2,
+                "usage: GaiusChunkLayerBytecodeVerifier <client.jar> <1.21.11|26.2>");
+        String profile = args[1];
+        require(profile.equals("1.21.11") || profile.equals("26.2"),
+                "unsupported Minecraft profile: " + profile);
         try (ZipFile jar = new ZipFile(args[0])) {
-            verify(jar, "net/minecraft/server/level/ChunkGenerationTask.class");
-            verify(jar, "dev/gaius/browser/BrowserChunkGenerationYield.class");
+            verify(jar, "net/minecraft/server/level/ChunkGenerationTask.class", profile);
+            verify(jar, "dev/gaius/browser/BrowserChunkGenerationYield.class", profile);
         }
     }
 }

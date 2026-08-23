@@ -444,7 +444,7 @@ try {
   ], {encoding: "utf8", timeout: 30_000});
   const verifierOutput = execFileSync(java, [
     "-classpath", [classes, verifierClasspath].join(delimiter),
-    "GaiusChunkLayerBytecodeVerifier", clientJar,
+    "GaiusChunkLayerBytecodeVerifier", clientJar, "26.2",
   ], {encoding: "utf8", timeout: 30_000});
   assert.match(verifierOutput, /BASIC_VERIFIER_OK .*ChunkGenerationTask\.class/,
     "ASM BasicVerifier did not validate ChunkGenerationTask");
@@ -452,6 +452,9 @@ try {
     "ASM BasicVerifier did not validate BrowserChunkGenerationYield");
   assert.match(verifierOutput, /CFG_VERIFIER_OK net\/minecraft\/server\/level\/ChunkGenerationTask/,
     "ASM CFG verifier did not validate the chunk layer barrier");
+  assert.match(verifierOutput,
+    /PROFILE_CFG_OK 26\.2 net\/minecraft\/server\/level\/ChunkGenerationTask/,
+    "ASM profile verifier did not validate 26.2 holder pulse paths");
   process.stdout.write(verifierOutput);
 
   const rawGraphics = execFileSync(javap, ["-classpath", rawClientJar, "-p", "-c",

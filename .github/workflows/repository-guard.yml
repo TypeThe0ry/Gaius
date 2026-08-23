@@ -108,6 +108,85 @@ jobs:
           node port/scripts/gson-type-token-external-overlay-smoke.mjs
           node port/scripts/worldgen-scheduler-smoke.mjs
 
+  patcher-bytecode-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up JDK 26 for class-file version 69 and release 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "26"
+
+      - name: Fetch and remap both Minecraft patcher inputs
+        run: |
+          set -euo pipefail
+          export GAIUS_JAVA_HOME="$JAVA_HOME"
+          for tool in curl jq unzip zip sha1sum shasum; do
+            command -v "$tool" >/dev/null
+          done
+          for profile in 1.21.11 26.2; do
+            export GAIUS_VERSION_PROFILE_PATH="versions/${profile}.json"
+            ./port/scripts/fetch-version.sh
+            ./port/scripts/remap-client.sh
+            jar_path="port/work/${profile}/client-named.jar"
+            test -s "$jar_path"
+            unzip -tq "$jar_path"
+            case "$profile" in
+              1.21.11) expected_major=65 ;;
+              26.2) expected_major=69 ;;
+            esac
+            actual_major="$("$JAVA_HOME/bin/javap" -verbose \
+              -classpath "$jar_path" \
+              net.minecraft.server.level.ChunkGenerationTask \
+              | awk '/major version/{print $3; exit}')"
+            test "$actual_major" = "$expected_major"
+          done
+
+      - name: Bootstrap ASM verifier dependencies
+        run: |
+          set -euo pipefail
+          export GAIUS_JAVA_HOME="$JAVA_HOME"
+          for artifact in asm asm-tree asm-analysis; do
+            ./port/mvnw --batch-mode --no-transfer-progress \
+              org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
+              "-Dartifact=org.ow2.asm:${artifact}:9.8" \
+              -Dtransitive=false
+          done
+
+      - name: Run profile-aware ASM CFG patcher gates
+        run: |
+          set -euo pipefail
+          export GAIUS_JAVA_HOME="$JAVA_HOME"
+          "$JAVA_HOME/bin/java" --version
+          "$JAVA_HOME/bin/javac" --release 21 -version
+          major_version="$("$JAVA_HOME/bin/javap" -verbose \
+            -classpath port/work/26.2/client-named.jar \
+            net.minecraft.server.level.ChunkGenerationTask \
+            | awk '/major version/{print $3; exit}')"
+          test "$major_version" = 69
+          node --check port/scripts/minecraft-12111-patcher-smoke.mjs
+          node --check port/scripts/minecraft-262-p1-patcher-smoke.mjs
+          node port/scripts/chunk-layer-barrier-smoke.mjs
+          GAIUS_VERSION_PROFILE_PATH=versions/1.21.11.json \
+            node port/scripts/minecraft-12111-patcher-smoke.mjs
+          GAIUS_VERSION_PROFILE_PATH=versions/26.2.json \
+            node port/scripts/minecraft-262-p1-patcher-smoke.mjs
+
+      - name: Check repository diff formatting
+        run: git diff --check
+
   paper-plugin-tests:
     runs-on: ubuntu-latest
     steps:

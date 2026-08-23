@@ -353,12 +353,18 @@ try {
   ], {encoding: "utf8", timeout: 30_000});
   const verifierOutput = execFileSync(java, [
     "-Xverify:all", "-classpath", [classes, verifierClasspath].join(delimiter),
-    "GaiusChunkLayerBytecodeVerifier", clientJar,
+    "GaiusChunkLayerBytecodeVerifier", clientJar, "1.21.11",
   ], {encoding: "utf8", timeout: 30_000});
   assert.match(verifierOutput, /BASIC_VERIFIER_OK .*ChunkGenerationTask\.class/);
   assert.match(verifierOutput, /BASIC_VERIFIER_OK .*BrowserChunkGenerationYield\.class/);
   assert.match(verifierOutput, /CFG_VERIFIER_OK net\/minecraft\/server\/level\/ChunkGenerationTask/,
     "ASM CFG verifier did not validate the 1.21.11 chunk layer barrier");
+  assert.match(verifierOutput,
+    /PROFILE_CALL_SURFACE_OK 1\.21\.11 net\/minecraft\/server\/level\/ChunkGenerationTask/,
+    "ASM profile verifier did not validate 1.21.11 task scheduler call surface");
+  assert.match(verifierOutput,
+    /PROFILE_CALL_SURFACE_OK 1\.21\.11 dev\/gaius\/browser\/BrowserChunkGenerationYield/,
+    "ASM profile verifier did not validate 1.21.11 yield scheduler call surface");
   process.stdout.write(verifierOutput);
 
   const bytecode = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
