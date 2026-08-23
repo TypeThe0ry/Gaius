@@ -343,6 +343,24 @@ async function waitForTargetConnections(baselineManifest, expectedAdditional) {
         JSON.stringify(latest, null, 2));
 }
 
+async function waitForTargetBaseline(baselineManifest, label) {
+    const baseline = Number(baselineManifest.target?.activeConnections ?? 0);
+    const deadline = Date.now() + 15000;
+    let latest = baselineManifest;
+    while (Date.now() < deadline) {
+        latest = await fetchManifest();
+        if (Number(latest.target?.activeConnections ?? 0) <= baseline) {
+            return latest;
+        }
+        await delay(100);
+    }
+    throw new Error(`RelayNode target active connections did not return to baseline for ${label}: ` +
+        `${latest.target?.activeConnections ?? "unknown"} > ${baseline}\n` +
+        JSON.stringify(latest, null, 2));
+}
+
+let lastExternalResult;
+
 async function main() {
     const { bridge, stats } = installBridge();
     const baselineManifest = await fetchManifest();
@@ -411,7 +429,12 @@ async function main() {
                 inboundQueuedBytes: stats.inboundQueuedBytes,
                 activeRelayTargetLeases: stats.activeRelayTargetLeases }),
         );
-        const afterCloseManifest = await fetchManifest();
+        // The browser-side lease can be gone before the RelayNode's TCP close
+        // callback publishes its target-route decrement. Wait for the same
+        // target baseline instead of sampling that short propagation window.
+        const afterCloseManifest = await waitForTargetBaseline(
+            baselineManifest, "external browser/bridge cleanup",
+        );
         const statusRtt = clients.flatMap((client) => client.statusRtt);
         const pingRtt = clients.flatMap((client) => client.pingRtt);
         const pingSent = clients.reduce((sum, client) => sum + client.pingSent, 0);
@@ -481,6 +504,7 @@ async function main() {
             elapsedMillis: Number((performance.now() - startedAt).toFixed(1)),
             phases: stats.connectPhases.filter((event) => clients.some((client) => client.id === event.id)),
         };
+        lastExternalResult = result;
         try {
             assert.equal(result.packets.pingLoss, 0, "external status ping loss detected");
             assert.equal(stats.relayTargetAttestationFailures, 0,
@@ -525,6 +549,14 @@ catch (error) {
         relayUrl,
         target: target.text,
         profile,
+        snapshot: lastExternalResult === undefined ? undefined : {
+            statusRtt: lastExternalResult.statusRtt,
+            pingRtt: lastExternalResult.pingRtt,
+            connectionMillis: lastExternalResult.connectionMillis,
+            relay: lastExternalResult.relay,
+            browser: lastExternalResult.browser,
+            gate: lastExternalResult.gate,
+        },
         error: String(error?.stack || error),
     }));
     process.exitCode = 1;
