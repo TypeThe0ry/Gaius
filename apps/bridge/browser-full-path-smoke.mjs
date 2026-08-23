@@ -43,30 +43,112 @@ const channelSourceUrl = new URL(
 const origin = process.env.GAIUS_BROWSER_FULL_PATH_ORIGIN ?? "http://127.0.0.1:8781";
 const relayToken = process.env.GAIUS_BROWSER_FULL_PATH_TOKEN ?? "browser-full-path-token";
 const usernamePrefix = process.env.GAIUS_BROWSER_FULL_PATH_USERNAME_PREFIX ?? "GaiusBrowser";
+const commandLineArguments = process.argv.slice(2);
+const printConfigOnly = commandLineArguments.includes("--print-config");
+const printJavaResolutionOnly = commandLineArguments.includes("--print-java-resolution");
+if (printConfigOnly && printJavaResolutionOnly) {
+    throw new Error("--print-config and --print-java-resolution are mutually exclusive");
+}
+const malformedAcceptanceArgument = commandLineArguments.find((argument) =>
+    argument.startsWith("--acceptance") && argument !== "--acceptance");
+if (malformedAcceptanceArgument !== undefined) {
+    throw new Error(`Unsupported acceptance argument ${malformedAcceptanceArgument}; use --acceptance`);
+}
+const acceptanceEnvironment = process.env.GAIUS_BROWSER_FULL_PATH_ACCEPTANCE;
+if (acceptanceEnvironment !== undefined && acceptanceEnvironment !== "0" &&
+    acceptanceEnvironment !== "1") {
+    throw new Error("GAIUS_BROWSER_FULL_PATH_ACCEPTANCE must be exactly 0 or 1");
+}
+const acceptanceMode = commandLineArguments.includes("--acceptance") ||
+    acceptanceEnvironment === "1";
+const STRICT_ACCEPTANCE_TARGET = Object.freeze({
+    clients: 4,
+    minimumChunkPackets: 9,
+    soakMillis: 15_000,
+    reconnectWaves: 1,
+});
+const CANONICAL_PROFILES = Object.freeze({
+    "26.2": Object.freeze({
+        protocolVersion: 776,
+        worldVersion: 4903,
+        javaVersion: 25,
+        serverSha1: "823e2250d24b3ddac457a60c92a6a941943fcd6a",
+    }),
+    "1.21.11": Object.freeze({
+        protocolVersion: 774,
+        worldVersion: 4671,
+        javaVersion: 21,
+        serverSha1: "64bb6d763bed0a9f1d632ec347938594144943ed",
+    }),
+});
+const STRICT_RUNTIME_JAVA_POLICY = Object.freeze({
+    "1.21.11": "major-exactly-21",
+    "26.2": "major-at-least-25",
+});
+const RELAY_RUNTIME_GAUGES = Object.freeze([
+    "activeLocalTunnelSessions",
+    "pendingSyntheticPlayTicks",
+    "activeServerFrameDrainHandles",
+    "activeServerFrameDrainTimers",
+    "activeClientStallTimers",
+]);
+// These counters are exported by BrowserWebSocketChannel's JSBody stats. Keep
+// their exact source names: a missing source field is evidence, not a made-up
+// zero, and is handled explicitly by browserRuntimeCleanupGaugeEvidence().
+const BROWSER_RUNTIME_CLEANUP_GAUGES = Object.freeze([
+    "activeHighWatermarks",
+    "decodedSliceBacklog",
+    "decoderCumulationBytes",
+    "decodedPacketQueue",
+]);
+
+function parseStrictAcceptanceNumber(name, expected) {
+    const raw = process.env[name];
+    if (raw === undefined) return expected;
+    if (!/^(?:0|[1-9][0-9]*)$/u.test(raw) || raw !== String(expected)) {
+        throw new Error(`${name} must be exactly ${expected} in strict acceptance mode`);
+    }
+    return expected;
+}
+
 const requestedClients = Number.parseInt(
-    process.env.GAIUS_BROWSER_FULL_PATH_CLIENTS ?? "2", 10);
+    acceptanceMode
+        ? parseStrictAcceptanceNumber("GAIUS_BROWSER_FULL_PATH_CLIENTS",
+            STRICT_ACCEPTANCE_TARGET.clients)
+        : process.env.GAIUS_BROWSER_FULL_PATH_CLIENTS ?? "2", 10);
 const clientCount = Number.isInteger(requestedClients)
-    ? Math.max(1, Math.min(4, requestedClients))
+    ? acceptanceMode ? requestedClients : Math.max(1, Math.min(4, requestedClients))
     : 2;
-const soakMs = Math.max(0, Number.parseInt(
-    process.env.GAIUS_BROWSER_FULL_PATH_SOAK_MS ?? "1000", 10) || 0);
+const soakMs = acceptanceMode
+    ? parseStrictAcceptanceNumber("GAIUS_BROWSER_FULL_PATH_SOAK_MS",
+        STRICT_ACCEPTANCE_TARGET.soakMillis)
+    : Math.max(0, Number.parseInt(
+        process.env.GAIUS_BROWSER_FULL_PATH_SOAK_MS ?? "1000", 10) || 0);
 const requestedMinimumChunkPackets = Number.parseInt(
-    process.env.GAIUS_BROWSER_FULL_PATH_MIN_CHUNKS ?? "9", 10);
+    acceptanceMode
+        ? parseStrictAcceptanceNumber("GAIUS_BROWSER_FULL_PATH_MIN_CHUNKS",
+            STRICT_ACCEPTANCE_TARGET.minimumChunkPackets)
+        : process.env.GAIUS_BROWSER_FULL_PATH_MIN_CHUNKS ?? "9", 10);
 const minimumChunkPackets = Number.isInteger(requestedMinimumChunkPackets)
-    ? Math.max(1, Math.min(128, requestedMinimumChunkPackets))
+    ? acceptanceMode ? requestedMinimumChunkPackets :
+        Math.max(1, Math.min(128, requestedMinimumChunkPackets))
     : 9;
 const requestedReconnectWaves = Number.parseInt(
-    process.env.GAIUS_BROWSER_FULL_PATH_RECONNECT_WAVES ?? "0", 10);
+    acceptanceMode
+        ? parseStrictAcceptanceNumber("GAIUS_BROWSER_FULL_PATH_RECONNECT_WAVES",
+            STRICT_ACCEPTANCE_TARGET.reconnectWaves)
+        : process.env.GAIUS_BROWSER_FULL_PATH_RECONNECT_WAVES ?? "0", 10);
 const reconnectWaves = Number.isInteger(requestedReconnectWaves)
-    ? Math.max(0, Math.min(8, requestedReconnectWaves))
+    ? acceptanceMode ? requestedReconnectWaves :
+        Math.max(0, Math.min(8, requestedReconnectWaves))
     : 0;
-const printConfigOnly = process.argv.includes("--print-config");
 const smokeStartedAt = performance.now();
 
 let activeProfile;
 
 async function runSmoke() {
     activeProfile = await loadActiveVersionProfile();
+    assertCanonicalProfile(activeProfile);
     const wireProfile = resolveWireProfile(activeProfile);
     const verifiedServerJar = await resolveVerifiedServerJar(activeProfile);
     const serverJar = verifiedServerJar.path;
@@ -96,6 +178,10 @@ async function runSmoke() {
     let relayRuntimeBeforeSoak;
     let relayRuntimeAfterSoak;
     let relayRuntimeAfterClose;
+    let browserRuntimeAfterSoak;
+    let soakHealth;
+    let soakStartedAt;
+    let soakCompletedAt;
     let failure;
     let serverSpawnError;
     let relaySpawnError;
@@ -112,7 +198,8 @@ try {
     await writeFile(path.join(workDirectory, "server.properties"),
         serverProperties(minecraftPort));
     const sessionBaseUrl = `http://127.0.0.1:${sessionPort}`;
-    const javaExecutable = await resolveJavaExecutable(activeProfile.javaVersion);
+    const runtimeJava = await resolveJavaExecutable(activeProfile);
+    const javaExecutable = runtimeJava.executable;
     serverProcess = spawn(javaExecutable, [
         `-Dminecraft.api.session.host=${sessionBaseUrl}`,
         `-Dminecraft.api.services.host=${sessionBaseUrl}`,
@@ -201,12 +288,29 @@ try {
         await Promise.all(currentClients.map((client) => client.connect()));
         await waitFor(
             () => currentClients.every((client) => client.failure === undefined &&
+                client.phase === "play" &&
+                client.loginFinished &&
+                client.encryptionRequest &&
+                client.aesCfb8Enabled &&
                 client.playLoginPackets > 0 &&
                 client.chunkPackets >= minimumChunkPackets),
             "browser Relay Minecraft PLAY/chunk", 90000,
             () => JSON.stringify(currentClients.map((client) => client.diagnostics())));
-        for (const client of currentClients) client.checkError();
-        relayRuntimeAtChunks = await fetchRelayRuntime(relayPort, minecraftPort);
+        for (const client of currentClients) {
+            client.checkError();
+            assertOnlineEncryption(client, `initial client ${client.id}`);
+        }
+        relayRuntimeAtChunks = await waitForRelayRuntime(
+            relayPort,
+            (snapshot) => snapshot.activeConnections === clientCount &&
+                snapshot.target?.activeConnections === clientCount &&
+                relayRuntimeGaugesAreZero(snapshot),
+            "initial RelayNode active tunnel quiescence",
+            5000,
+            minecraftPort,
+        );
+        assertRelayRuntimeGaugesZero(relayRuntimeAtChunks,
+            "initial active tunnel gauge check");
         relayRuntimeBeforeSoak = relayRuntimeAtChunks;
         const seenBuffers = new Set(currentClients.map((client) => client.buffer));
         const seenCiphers = new Set(currentClients.map((client) => client.cipher));
@@ -250,9 +354,7 @@ try {
                 }));
             const relayAfterDrop = await waitForRelayRuntime(
                 relayPort,
-                (snapshot) => snapshot.activeConnections === 0 &&
-                    snapshot.target.activeConnections === 0 &&
-                    snapshot.runtime.activeClientStallTimers === 0,
+                (snapshot) => relayRuntimeIsClean(snapshot),
                 `reconnect wave ${wave} RelayNode final-close cleanup`,
                 5000,
                 minecraftPort,
@@ -279,6 +381,10 @@ try {
             assert.equal(relayAfterDrop.target.totalConnections,
                 clientCount * wave,
                 `reconnect wave ${wave} changed target totals while dropping`);
+            const relayAfterDropGauges = assertRelayRuntimeGaugesZero(
+                relayAfterDrop,
+                `reconnect wave ${wave} abnormal-drop cleanup`,
+            );
 
             const javaFinalCloseAt = performance.now();
             for (const client of previousClients) client.close("java-final-close");
@@ -321,6 +427,10 @@ try {
             await waitFor(
                 () => replacementClients.every((client) =>
                     client.failure === undefined &&
+                    client.phase === "play" &&
+                    client.loginFinished &&
+                    client.encryptionRequest &&
+                    client.aesCfb8Enabled &&
                     client.playLoginPackets > 0 &&
                     client.chunkPackets >= minimumChunkPackets),
                 `browser Relay reconnect wave ${wave} PLAY/chunk`, 90000,
@@ -328,6 +438,7 @@ try {
                     client.diagnostics())));
             for (const client of replacementClients) {
                 client.checkError();
+                assertOnlineEncryption(client, `reconnect wave ${wave} client ${client.id}`);
                 assert.ok(client.cipher !== undefined && !seenCiphers.has(client.cipher),
                     "reconnect reused an AES cipher object");
                 assert.ok(client.decipher !== undefined &&
@@ -345,7 +456,16 @@ try {
                 client.secretFingerprint).filter(Boolean);
             assert.equal(new Set(secretFingerprints).size, secretFingerprints.length,
                 "reconnect reused an AES shared secret");
-            const relayAtChunks = await fetchRelayRuntime(relayPort, minecraftPort);
+            const relayAtChunks = await waitForRelayRuntime(
+                relayPort,
+                (snapshot) => snapshot.activeConnections === clientCount &&
+                    snapshot.target?.activeConnections === clientCount &&
+                    snapshot.target?.totalConnections === clientCount * (wave + 1) &&
+                    relayRuntimeGaugesAreZero(snapshot),
+                `reconnect wave ${wave} RelayNode active tunnel quiescence`,
+                5000,
+                minecraftPort,
+            );
             relayRuntimeBeforeSoak = relayAtChunks;
             const browserAtChunks = browserRuntimeSnapshot(browserRuntime);
             const sessionAtChunks = sessionRuntimeSnapshot(sessionState);
@@ -360,6 +480,16 @@ try {
             assert.equal(relayAtChunks.target.totalConnections,
                 clientCount * (wave + 1),
                 `reconnect wave ${wave} target connection count was not monotonic`);
+            const relayAtChunksGauges = assertRelayRuntimeGaugesZero(
+                relayAtChunks,
+                `reconnect wave ${wave} active tunnel gauge check`,
+            );
+            const replacementHealth = assertSoakLiveness(
+                replacementClients,
+                browserAtChunks,
+                relayAtChunks,
+                `reconnect wave ${wave}`,
+            );
             reconnectEvidence.push({
                 wave,
                 simultaneousDrop: true,
@@ -370,6 +500,7 @@ try {
                     dispatchSpreadMillis: dropDispatchSpreadMillis,
                     retainedEntriesBeforeJavaFinalClose: clientCount,
                     evidence: transportDropEvidence,
+                    syntheticMarkerLabel: "synthetic-inbound-marker",
                     retireClosedEntry: {
                         defined: typeof browserRuntime.bridge.retireClosedEntry === "function",
                         invoked: false,
@@ -409,18 +540,38 @@ try {
                     beforeDrop: relayBeforeDrop,
                     afterDrop: relayAfterDrop,
                     atMinimumChunks: relayAtChunks,
+                    runtimeGauges: {
+                        afterDrop: relayAfterDropGauges,
+                        atMinimumChunks: relayAtChunksGauges,
+                    },
                     reconnectDelta: relayRuntimeDelta(relayAfterDrop, relayAtChunks),
                 },
+                health: replacementHealth,
                 clients: replacementClients.map((client) => ({
                     ...client.result(),
                     dropTiming: client.dropTimingResult(dropAt),
                 })),
             });
         }
-        if (soakMs > 0) {
-            await delay(soakMs);
-        }
-        relayRuntimeAfterSoak = await fetchRelayRuntime(relayPort, minecraftPort);
+        soakStartedAt = performance.now();
+        if (soakMs > 0) await delay(soakMs);
+        soakCompletedAt = performance.now();
+        relayRuntimeAfterSoak = await waitForRelayRuntime(
+            relayPort,
+            (snapshot) => snapshot.activeConnections === clientCount &&
+                snapshot.target?.activeConnections === clientCount &&
+                relayRuntimeGaugesAreZero(snapshot),
+            "post-soak RelayNode active tunnel quiescence",
+            5000,
+            minecraftPort,
+        );
+        browserRuntimeAfterSoak = browserRuntimeSnapshot(browserRuntime);
+        soakHealth = assertSoakLiveness(
+            currentClients,
+            browserRuntimeAfterSoak,
+            relayRuntimeAfterSoak,
+            "post-soak",
+        );
     }
     finally {
         clearInterval(pollTimer);
@@ -432,9 +583,7 @@ try {
         });
         relayRuntimeAfterClose = await waitForRelayRuntime(
             relayPort,
-            (snapshot) => snapshot.activeConnections === 0 &&
-                snapshot.target.activeConnections === 0 &&
-                snapshot.runtime.activeClientStallTimers === 0,
+            (snapshot) => relayRuntimeIsClean(snapshot),
             "RelayNode tunnel/timer cleanup",
             5000,
             minecraftPort,
@@ -485,10 +634,14 @@ try {
         "browser transport retained inbound bytes after multiplayer cleanup");
     assert.equal(browserRuntime.stats.activeRelayTargetLeases, 0,
         "browser transport retained a RelayNode target lease after multiplayer cleanup");
+    assertBrowserRuntimeClean(browserRuntimeSnapshot(browserRuntime),
+        "final browser transport cleanup");
     assert.equal(relayRuntimeBaseline.activeConnections, 0,
         "RelayNode baseline unexpectedly had active browser tunnels");
-    assert.equal(relayRuntimeBaseline.target.totalConnections, 0,
-        "RelayNode baseline unexpectedly retained target connection history");
+    assert.equal(relayRuntimeBaseline.target, undefined,
+        "RelayNode baseline unexpectedly reported a target route before first use");
+    assert.equal(relayRuntimeBaseline.targetEvidence.available, false,
+        "RelayNode baseline target evidence was synthesized instead of observed");
     assert.equal(relayRuntimeAtChunks.activeConnections, clientCount,
         "RelayNode did not report every active multiplayer tunnel at chunk readiness");
     assert.equal(relayRuntimeAtChunks.target.activeConnections, clientCount,
@@ -497,21 +650,119 @@ try {
         "RelayNode initial target connection count did not match client count");
     assert.equal(relayRuntimeAfterSoak.target.totalConnections, expectedConnections,
         "RelayNode target route did not count every reconnect tunnel");
-    assert.equal(relayRuntimeAtChunks.runtime.activeClientStallTimers, 0,
-        "encrypted online-mode tunnels armed unnecessary RelayNode stall timers");
-    assert.equal(relayRuntimeAfterSoak.runtime.activeClientStallTimers, 0,
-        "encrypted online-mode soak armed unnecessary RelayNode stall timers");
+    assertRelayRuntimeGaugesZero(relayRuntimeAtChunks,
+        "encrypted online-mode tunnels retained RelayNode runtime gauges");
+    assertRelayRuntimeGaugesZero(relayRuntimeAfterSoak,
+        "encrypted online-mode soak retained RelayNode runtime gauges");
     assert.equal(relayRuntimeAfterClose?.activeConnections, 0,
         "RelayNode retained an active tunnel after browser cleanup");
     assert.equal(relayRuntimeAfterClose?.target?.activeConnections, 0,
         "RelayNode retained an active target route after browser cleanup");
     assert.equal(relayRuntimeAfterClose?.target?.totalConnections, expectedConnections,
         "RelayNode final target connection count omitted a reconnect tunnel");
-    assert.equal(relayRuntimeAfterClose?.runtime?.activeClientStallTimers, 0,
-        "RelayNode retained a stall timer after browser cleanup");
+    assertRelayRuntimeGaugesZero(relayRuntimeAfterClose,
+        "RelayNode retained a runtime gauge after browser cleanup");
 
+    const actualSoakMillis = elapsedMillis(soakStartedAt, soakCompletedAt) ?? 0;
+    if (acceptanceMode) {
+        assert.equal(clientCount, STRICT_ACCEPTANCE_TARGET.clients,
+            "strict acceptance client count drifted");
+        assert.equal(minimumChunkPackets, STRICT_ACCEPTANCE_TARGET.minimumChunkPackets,
+            "strict acceptance chunk target drifted");
+        assert.equal(soakMs, STRICT_ACCEPTANCE_TARGET.soakMillis,
+            "strict acceptance soak target drifted");
+        assert.equal(reconnectWaves, STRICT_ACCEPTANCE_TARGET.reconnectWaves,
+            "strict acceptance reconnect target drifted");
+        assert.ok(actualSoakMillis >= STRICT_ACCEPTANCE_TARGET.soakMillis,
+            `strict acceptance soak elapsed only ${actualSoakMillis}ms`);
+    }
     const result = {
+        schemaVersion: "browser-full-path-result-v2",
         ok: true,
+        acceptance: {
+            mode: acceptanceMode ? "strict-acceptance" : "compatible-smoke",
+            required: acceptanceMode
+                ? {
+                    ...STRICT_ACCEPTANCE_TARGET,
+                    profiles: Object.keys(CANONICAL_PROFILES),
+                    relayRuntimeGaugesZero: [...RELAY_RUNTIME_GAUGES],
+                    browserCleanupGaugesZero: [...BROWSER_RUNTIME_CLEANUP_GAUGES],
+                    syntheticMarkerLabel: "synthetic-inbound-marker",
+                    runtimeJavaPolicy: { ...STRICT_RUNTIME_JAVA_POLICY },
+                }
+                : {
+                    clients: clientCount,
+                    minimumChunkPackets,
+                    soakMillis: soakMs,
+                    reconnectWaves,
+                    relayRuntimeGaugesZero: [...RELAY_RUNTIME_GAUGES],
+                    browserCleanupGaugesZero: [...BROWSER_RUNTIME_CLEANUP_GAUGES],
+                    syntheticMarkerLabel: "synthetic-inbound-marker",
+                },
+            observed: {
+                clients: clientCount,
+                minimumChunkPackets,
+                soakMillis: soakMs,
+                actualSoakMillis,
+                reconnectWaveCount: reconnectEvidence.length,
+                expectedConnections,
+                profile: {
+                    id: activeProfile.id,
+                    path: repositoryRelativePath(activeProfile.path),
+                    canonicalProfilePath: repositoryRelativePath(activeProfile.path),
+                    protocolVersion: activeProfile.protocolVersion,
+                    worldVersion: activeProfile.worldVersion,
+                    javaVersion: activeProfile.javaVersion,
+                    runtimeJavaMajor: runtimeJava.major,
+                    runtimeJavaExecutable: runtimeJava.executable,
+                    serverSha1: verifiedServerJar.sha1,
+                    expectedServerJarSha1: activeProfile.official.serverSha1,
+                    actualServerJarSha1: verifiedServerJar.sha1,
+                },
+                runtimeJavaMajor: runtimeJava.major,
+                runtimeJavaExecutable: runtimeJava.executable,
+                soak: soakHealth,
+                reconnectWaves: reconnectEvidence.map((wave) => ({
+                    wave: wave.wave,
+                    health: wave.health,
+                    syntheticMarkerLabel: wave.transportDrop.syntheticMarkerLabel,
+                    relayRuntimeGauges: wave.relay.runtimeGauges,
+                })),
+                finalCleanup: {
+                    browser: browserRuntimeSnapshot(browserRuntime),
+                    browserCleanupGauges: browserRuntimeCleanupGaugeEvidence(
+                        browserRuntimeSnapshot(browserRuntime)),
+                    relay: relayRuntimeAfterClose,
+                    relayRuntimeGauges: relayRuntimeGaugeEvidence(relayRuntimeAfterClose),
+                },
+            },
+            actual: {
+                soakMillis: actualSoakMillis,
+                soak: soakHealth,
+                reconnectWaves: reconnectEvidence.map((wave) => ({
+                    wave: wave.wave,
+                    health: wave.health,
+                    syntheticMarkerLabel: wave.transportDrop.syntheticMarkerLabel,
+                    relayRuntimeGauges: wave.relay.runtimeGauges,
+                })),
+                serverJarSha1: verifiedServerJar.sha1,
+                runtimeJavaMajor: runtimeJava.major,
+                runtimeJavaExecutable: runtimeJava.executable,
+                profile: {
+                    id: activeProfile.id,
+                    path: repositoryRelativePath(activeProfile.path),
+                    canonicalProfilePath: repositoryRelativePath(activeProfile.path),
+                    protocolVersion: activeProfile.protocolVersion,
+                    worldVersion: activeProfile.worldVersion,
+                    javaVersion: activeProfile.javaVersion,
+                    runtimeJavaMajor: runtimeJava.major,
+                    runtimeJavaExecutable: runtimeJava.executable,
+                    serverSha1: verifiedServerJar.sha1,
+                    expectedServerJarSha1: activeProfile.official.serverSha1,
+                    actualServerJarSha1: verifiedServerJar.sha1,
+                },
+            },
+        },
         transport: {
             browserChannelSource: fileURLToPath(channelSourceUrl),
             browserJsBody: true,
@@ -536,12 +787,19 @@ try {
             inboundQueuedBytesAfterClose: browserRuntime.stats.inboundQueuedBytes,
             activeRelayTargetLeasesAfterClose:
                 browserRuntime.stats.activeRelayTargetLeases,
+            browserCleanupGaugesAfterClose: browserRuntimeCleanupGaugeEvidence(
+                browserRuntimeSnapshot(browserRuntime)),
         },
         profile: {
             id: activeProfile.id,
             protocolVersion: activeProfile.protocolVersion,
             worldVersion: activeProfile.worldVersion,
             javaVersion: activeProfile.javaVersion,
+            runtimeJavaMajor: runtimeJava.major,
+            runtimeJavaExecutable: runtimeJava.executable,
+            serverSha1: verifiedServerJar.sha1,
+            path: repositoryRelativePath(activeProfile.path),
+            canonicalProfilePath: repositoryRelativePath(activeProfile.path),
             serverJar,
             serverJarSha1: verifiedServerJar.sha1,
             expectedServerJarSha1: activeProfile.official.serverSha1,
@@ -956,6 +1214,7 @@ class BrowserMinecraftClient {
     result() {
         return {
             ...this.diagnostics(),
+            onlineEncryption: this.onlineEncryptionResult(),
             rsa: {
                 requested: this.encryptionRequest,
                 secretEncrypted: this.rsaSecretEncrypted,
@@ -990,6 +1249,23 @@ class BrowserMinecraftClient {
                     elapsedMillis(this.connectStartedAt, this.minimumChunksAt),
                 ),
             },
+        };
+    }
+
+    onlineEncryptionResult() {
+        return {
+            required: true,
+            encryptionRequest: this.encryptionRequest,
+            sessionJoin: this.sessionJoin,
+            rsaSecretEncrypted: this.rsaSecretEncrypted,
+            rsaChallengeEncrypted: this.rsaChallengeEncrypted,
+            aesCfb8Enabled: this.aesCfb8Enabled,
+            secretFingerprint: this.secretFingerprint ?? null,
+            failClosed: this.failure === undefined && this.encryptionRequest &&
+                this.sessionJoin && this.rsaSecretEncrypted &&
+                this.rsaChallengeEncrypted && this.aesCfb8Enabled &&
+                typeof this.secretFingerprint === "string" &&
+                /^[0-9a-f]{64}$/u.test(this.secretFingerprint),
         };
     }
 
@@ -1039,6 +1315,15 @@ class BrowserMinecraftClient {
     }
 }
 
+function assertOnlineEncryption(client, label) {
+    const observed = client.onlineEncryptionResult();
+    assert.equal(observed.failClosed, true,
+        `${label} did not complete online-mode RSA/AES encryption fail-closed: ` +
+        JSON.stringify(observed));
+    assert.equal(client.failure, undefined,
+        `${label} reported a client failure after encrypted login`);
+}
+
 function elapsedMillis(start, end) {
     if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return null;
     return Number((end - start).toFixed(3));
@@ -1064,7 +1349,7 @@ function sessionRuntimeSnapshot(state) {
 }
 
 function browserRuntimeSnapshot(runtime) {
-    return {
+    const snapshot = {
         activeChannels: runtime.bridge.channels.size,
         activeWebSockets: runtime.wsStats.sockets.size,
         webSocketConnections: runtime.wsStats.connections,
@@ -1073,6 +1358,162 @@ function browserRuntimeSnapshot(runtime) {
         inboundQueuedBytes: runtime.stats.inboundQueuedBytes,
         activeRelayTargetLeases: runtime.stats.activeRelayTargetLeases,
         relayTargetAttestationFailures: runtime.stats.relayTargetAttestationFailures,
+    };
+    for (const name of BROWSER_RUNTIME_CLEANUP_GAUGES) {
+        if (Object.prototype.hasOwnProperty.call(runtime.stats, name)) {
+            snapshot[name] = runtime.stats[name];
+        }
+    }
+    return snapshot;
+}
+
+function browserRuntimeCleanupGaugeEvidence(snapshot) {
+    const observed = Object.fromEntries(BROWSER_RUNTIME_CLEANUP_GAUGES.map((name) => [
+        name,
+        snapshot !== undefined && Object.prototype.hasOwnProperty.call(snapshot, name)
+            ? snapshot[name]
+            : null,
+    ]));
+    const missing = BROWSER_RUNTIME_CLEANUP_GAUGES.filter((name) =>
+        !Number.isSafeInteger(observed[name]));
+    return {
+        source: "BrowserWebSocketChannel.__gaiusNettyBridge.stats",
+        fields: [...BROWSER_RUNTIME_CLEANUP_GAUGES],
+        observed,
+        missing,
+        available: missing.length === 0,
+        allZero: missing.length === 0 &&
+            BROWSER_RUNTIME_CLEANUP_GAUGES.every((name) => observed[name] === 0),
+        note: missing.length === 0
+            ? "Browser JSBody cleanup counters observed directly"
+            : "Browser JSBody cleanup counters were absent; no zero was synthesized",
+    };
+}
+
+function assertBrowserRuntimeCleanupGaugesZero(snapshot, label) {
+    const evidence = browserRuntimeCleanupGaugeEvidence(snapshot);
+    assert.deepEqual(evidence.missing, [],
+        `${label}: browser cleanup telemetry omitted required fields: ` +
+        JSON.stringify(evidence));
+    assert.deepEqual(evidence.observed,
+        Object.fromEntries(BROWSER_RUNTIME_CLEANUP_GAUGES.map((name) => [name, 0])),
+        `${label}: browser cleanup gauges did not drain to zero`);
+    return evidence;
+}
+
+function relayRuntimeGaugeEvidence(snapshot) {
+    const runtime = snapshot?.runtime;
+    const observed = Object.fromEntries(RELAY_RUNTIME_GAUGES.map((name) => [
+        name,
+        runtime !== undefined && Object.prototype.hasOwnProperty.call(runtime, name)
+            ? runtime[name]
+            : null,
+    ]));
+    const missing = RELAY_RUNTIME_GAUGES.filter((name) =>
+        !Number.isSafeInteger(observed[name]));
+    return {
+        source: "/relay-node/v1.runtime",
+        fields: [...RELAY_RUNTIME_GAUGES],
+        observed,
+        missing,
+        available: missing.length === 0,
+        allZero: missing.length === 0 &&
+            RELAY_RUNTIME_GAUGES.every((name) => observed[name] === 0),
+    };
+}
+
+function relayRuntimeGaugesAreZero(snapshot) {
+    const evidence = relayRuntimeGaugeEvidence(snapshot);
+    return evidence.available && evidence.allZero;
+}
+
+function assertRelayRuntimeGaugesZero(snapshot, label) {
+    const evidence = relayRuntimeGaugeEvidence(snapshot);
+    assert.deepEqual(evidence.missing, [],
+        `${label}: RelayNode runtime telemetry omitted required gauges: ` +
+        JSON.stringify(evidence));
+    assert.deepEqual(evidence.observed,
+        Object.fromEntries(RELAY_RUNTIME_GAUGES.map((name) => [name, 0])),
+        `${label}: RelayNode runtime gauges did not drain to zero`);
+    return evidence;
+}
+
+function relayRuntimeIsClean(snapshot) {
+    return snapshot !== undefined && snapshot.target !== undefined &&
+        snapshot.activeConnections === 0 &&
+        snapshot.target.activeConnections === 0 &&
+        relayRuntimeGaugesAreZero(snapshot);
+}
+
+function clientLivenessEvidence(client) {
+    return {
+        id: client.id,
+        username: client.username,
+        wave: client.wave,
+        phase: client.phase,
+        loginFinished: client.loginFinished,
+        playLoginPackets: client.playLoginPackets,
+        chunkPackets: client.chunkPackets,
+        failure: client.failure === undefined ? null : String(client.failure),
+        onlineEncryption: client.onlineEncryptionResult(),
+    };
+}
+
+function assertSoakLiveness(clients, browser, relay, label) {
+    const observedClients = clients.map((client) => {
+        const evidence = clientLivenessEvidence(client);
+        assert.equal(evidence.failure, null,
+            `${label}: ${evidence.username} reported failure: ${evidence.failure}`);
+        assert.equal(evidence.phase, "play",
+            `${label}: ${evidence.username} is not in PLAY`);
+        assert.equal(evidence.loginFinished, true,
+            `${label}: ${evidence.username} did not finish LOGIN`);
+        assert.ok(evidence.playLoginPackets > 0,
+            `${label}: ${evidence.username} did not receive PLAY login`);
+        assert.ok(evidence.chunkPackets >= minimumChunkPackets,
+            `${label}: ${evidence.username} received only ${evidence.chunkPackets} chunks`);
+        assertOnlineEncryption(client, `${label} ${evidence.username}`);
+        return evidence;
+    });
+    assert.equal(browser.activeChannels, clientCount,
+        `${label}: browser active channel count drifted`);
+    assert.equal(browser.activeWebSockets, clientCount,
+        `${label}: browser active WebSocket count drifted`);
+    assert.equal(relay.target !== undefined, true,
+        `${label}: RelayNode omitted the target route telemetry`);
+    assert.equal(relay.activeConnections, clientCount,
+        `${label}: RelayNode active connection count drifted`);
+    assert.equal(relay.target.activeConnections, clientCount,
+        `${label}: RelayNode active target connection count drifted`);
+    const relayGauges = relayRuntimeGaugeEvidence(relay);
+    assertRelayRuntimeGaugesZero(relay, `${label}: RelayNode gauges`);
+    return {
+        required: {
+            clientCount,
+            phase: "play",
+            loginFinished: true,
+            minimumChunkPackets,
+            failure: null,
+            onlineEncryptionFailClosed: true,
+            browserActiveChannels: clientCount,
+            browserActiveWebSockets: clientCount,
+            relayActiveConnections: clientCount,
+            relayTargetActiveConnections: clientCount,
+            relayRuntimeGaugesZero: [...RELAY_RUNTIME_GAUGES],
+        },
+        observed: {
+            clients: observedClients,
+            browser: {
+                activeChannels: browser.activeChannels,
+                activeWebSockets: browser.activeWebSockets,
+            },
+            relay: {
+                activeConnections: relay.activeConnections,
+                targetActiveConnections: relay.target.activeConnections,
+            },
+            relayRuntimeGauges: relayGauges,
+        },
+        ok: true,
     };
 }
 
@@ -1142,6 +1583,7 @@ async function captureAbnormalTransportDrop(runtime, probes) {
             closeError: error,
             nonNormalClose: true,
             retainedEntry: true,
+            label: "synthetic-inbound-marker",
             syntheticInboundMarker: {
                 preserved: true,
                 networkFrame: false,
@@ -1173,6 +1615,7 @@ function assertBrowserRuntimeClean(snapshot, label) {
         inboundQueuedBytes: 0,
         activeRelayTargetLeases: 0,
     }, `${label} retained browser transport state`);
+    assertBrowserRuntimeCleanupGaugesZero(snapshot, label);
 }
 
 async function waitForBrowserRuntimeCleanup(runtime, label) {
@@ -1183,12 +1626,22 @@ async function waitForBrowserRuntimeCleanup(runtime, label) {
             snapshot.queuedBytes === 0 &&
             snapshot.queuedFrames === 0 &&
             snapshot.inboundQueuedBytes === 0 &&
-            snapshot.activeRelayTargetLeases === 0;
+            snapshot.activeRelayTargetLeases === 0 &&
+            browserRuntimeCleanupGaugeEvidence(snapshot).allZero;
     }, label, 5000, () => JSON.stringify(browserRuntimeSnapshot(runtime)));
 }
 
 function browserFullPathPerformanceContract() {
     return {
+        mode: acceptanceMode ? "strict-acceptance" : "compatible-smoke",
+        strictAcceptanceTarget: acceptanceMode ? { ...STRICT_ACCEPTANCE_TARGET } : null,
+        canonicalProfiles: CANONICAL_PROFILES,
+        relayRuntimeGauges: [...RELAY_RUNTIME_GAUGES],
+        browserRuntimeCleanupGauges: [...BROWSER_RUNTIME_CLEANUP_GAUGES],
+        syntheticMarkerLabel: "synthetic-inbound-marker",
+        runtimeJavaPolicy: acceptanceMode
+            ? { ...STRICT_RUNTIME_JAVA_POLICY }
+            : null,
         minimumChunkPackets,
         soakMillis: soakMs,
         reconnectWaves,
@@ -1248,22 +1701,48 @@ async function fetchRelayRuntime(port, targetPort) {
     }
     const manifest = await response.json();
     if (!manifest?.capabilities?.includes("runtime-telemetry") ||
-        !Number.isSafeInteger(manifest.runtime?.activeClientStallTimers) ||
         !Number.isSafeInteger(manifest.runtime?.rssBytes) ||
         !Number.isSafeInteger(manifest.runtime?.cpuUserMicros) ||
         !Number.isSafeInteger(manifest.runtime?.cpuSystemMicros)) {
         throw new Error("RelayNode runtime manifest omitted bounded performance telemetry");
     }
+    if (!Number.isSafeInteger(manifest.activeConnections) ||
+        !Number.isSafeInteger(manifest.availableConnections)) {
+        throw new Error("RelayNode runtime manifest omitted active connection gauges");
+    }
+    const targetManifest = Number.isInteger(targetPort) ? manifest.target : undefined;
+    const target = targetManifest !== undefined &&
+        Number.isSafeInteger(targetManifest.activeConnections) &&
+        Number.isSafeInteger(targetManifest.totalConnections) &&
+        typeof targetManifest.recentlyReachable === "boolean" &&
+        (targetManifest.lastSuccessAgeMs === null ||
+            Number.isSafeInteger(targetManifest.lastSuccessAgeMs))
+        ? targetManifest
+        : undefined;
+    const runtimeGaugeEvidence = relayRuntimeGaugeEvidence(manifest);
+    if (acceptanceMode && !runtimeGaugeEvidence.available) {
+        throw new Error("strict acceptance requires every RelayNode runtime gauge: " +
+            JSON.stringify(runtimeGaugeEvidence));
+    }
     return {
         activeConnections: manifest.activeConnections,
         availableConnections: manifest.availableConnections,
-        target: {
-            activeConnections: manifest.target?.activeConnections ?? 0,
-            totalConnections: manifest.target?.totalConnections ?? 0,
-            recentlyReachable: manifest.target?.recentlyReachable ?? false,
-            lastSuccessAgeMs: manifest.target?.lastSuccessAgeMs ?? null,
+        target: target === undefined ? undefined : {
+            activeConnections: target.activeConnections,
+            totalConnections: target.totalConnections,
+            recentlyReachable: target.recentlyReachable,
+            lastSuccessAgeMs: target.lastSuccessAgeMs,
+        },
+        targetEvidence: {
+            source: "/relay-node/v1?host=127.0.0.1&port=target",
+            available: target !== undefined,
+            observed: targetManifest === undefined ? null : targetManifest,
+            note: target === undefined
+                ? "RelayNode target route telemetry was absent or partial; no zero was synthesized"
+                : "RelayNode target route fields observed directly",
         },
         runtime: manifest.runtime,
+        runtimeGaugeEvidence,
     };
 }
 
@@ -1307,6 +1786,7 @@ function relayRuntimeDelta(before, after) {
 
 async function printConfiguration() {
     activeProfile = await loadActiveVersionProfile();
+    assertCanonicalProfile(activeProfile);
     const wireProfile = resolveWireProfile(activeProfile);
     console.log(JSON.stringify({
         profile: {
@@ -1314,14 +1794,38 @@ async function printConfiguration() {
             protocolVersion: activeProfile.protocolVersion,
             worldVersion: activeProfile.worldVersion,
             javaVersion: activeProfile.javaVersion,
+            serverSha1: activeProfile.official.serverSha1,
+            expectedServerJarSha1: activeProfile.official.serverSha1,
             path: activeProfile.path,
+            canonicalProfilePath: repositoryRelativePath(activeProfile.path),
         },
         wireProfile: {
             name: wireProfile.name,
             protocolVersion: wireProfile.protocolVersion,
         },
         clients: clientCount,
+        acceptanceMode,
+        strictAcceptanceTarget: acceptanceMode ? STRICT_ACCEPTANCE_TARGET : null,
         performanceContract: browserFullPathPerformanceContract(),
+    }));
+}
+
+async function printJavaResolution() {
+    activeProfile = await loadActiveVersionProfile();
+    assertCanonicalProfile(activeProfile);
+    const runtimeJava = await resolveJavaExecutable(activeProfile);
+    console.log(JSON.stringify({
+        profile: {
+            id: activeProfile.id,
+            javaVersion: activeProfile.javaVersion,
+            path: repositoryRelativePath(activeProfile.path),
+        },
+        runtimeJavaMajor: runtimeJava.major,
+        runtimeJavaExecutable: runtimeJava.executable,
+        runtimeJavaSource: runtimeJava.source,
+        runtimeJavaPolicy: acceptanceMode
+            ? STRICT_RUNTIME_JAVA_POLICY[activeProfile.id] ?? null
+            : `major-at-least-${activeProfile.javaVersion}`,
     }));
 }
 
@@ -1568,6 +2072,16 @@ function resolveRepositoryPath(value) {
         : path.resolve(repository, normalized);
 }
 
+function repositoryRelativePath(value) {
+    const relative = path.relative(repository, path.resolve(value))
+        .replaceAll(path.sep, "/");
+    assert.ok(relative !== "" && relative !== "." &&
+        !relative.startsWith("../") && relative !== ".." &&
+        !path.isAbsolute(relative),
+    `path is outside the repository: ${value}`);
+    return relative;
+}
+
 function pathInside(parent, child) {
     const relative = path.relative(path.resolve(parent), path.resolve(child));
     return relative === "" || (relative !== ".." &&
@@ -1597,11 +2111,38 @@ async function loadActiveVersionProfile() {
         typeof profile.official?.serverSha1 === "string" &&
         /^[0-9a-f]{40}$/iu.test(profile.official.serverSha1),
         `invalid version profile ${profilePath}`);
+    if (acceptanceMode && path.basename(profilePath) !== `${profile.id}.json`) {
+        throw new Error(
+            `strict acceptance profile basename must be exactly ${profile.id}.json: ` +
+            `${path.basename(profilePath)}`,
+        );
+    }
     return {
         ...profile,
         path: profilePath,
         official: { ...profile.official, serverSha1: profile.official.serverSha1.toLowerCase() },
     };
+}
+
+function assertCanonicalProfile(profile) {
+    const canonical = CANONICAL_PROFILES[profile.id];
+    if (canonical === undefined) {
+        if (acceptanceMode) {
+            throw new Error(`strict acceptance does not support profile ${profile.id}`);
+        }
+        return;
+    }
+    if (!acceptanceMode) return;
+    assert.equal(path.basename(profile.path), `${profile.id}.json`,
+        `non-canonical strict acceptance profile basename ${profile.path}`);
+    assert.equal(repositoryRelativePath(profile.path), `port/versions/${profile.id}.json`,
+        `non-canonical strict acceptance profile path ${profile.path}`);
+    assert.deepEqual({
+        protocolVersion: profile.protocolVersion,
+        worldVersion: profile.worldVersion,
+        javaVersion: profile.javaVersion,
+        serverSha1: profile.official.serverSha1,
+    }, canonical, `non-canonical strict acceptance profile ${profile.id}`);
 }
 
 function resolveWireProfile(profile) {
@@ -1648,65 +2189,114 @@ async function listen(server, port, host) {
     });
 }
 
-async function resolveJavaExecutable(requiredVersion) {
+function runtimeJavaMajorMeetsPolicy(profile, major) {
+    if (!Number.isSafeInteger(major)) return false;
+    if (acceptanceMode && profile.id === "1.21.11") return major === 21;
+    return major >= profile.javaVersion;
+}
+
+function javaCandidateVariants(value) {
+    if (typeof value !== "string" || value.trim() === "") return [];
+    const normalized = nativePath(value.trim());
+    const variants = [normalized];
+    const baseName = path.basename(normalized).toLowerCase();
+    if (baseName !== "java" && baseName !== "java.exe") {
+        variants.push(path.join(normalized, "bin", "java"));
+        variants.push(path.join(normalized, "bin", "java.exe"));
+    }
+    else if (path.extname(normalized) === "") {
+        variants.push(`${normalized}.exe`);
+    }
+    return variants;
+}
+
+async function resolveJavaExecutable(profile) {
     const candidates = [];
-    const addCandidate = (value) => {
-        if (!value) return;
-        const candidate = nativePath(value);
-        candidates.push(candidate);
-        if (path.extname(candidate) === "" && /[\\/]/u.test(candidate)) {
-            candidates.push(`${candidate}.exe`);
+    const addCandidate = (value, source) => {
+        for (const candidate of javaCandidateVariants(value)) {
+            candidates.push({ candidate, source });
         }
     };
-    addCandidate(process.env.GAIUS_JAVA);
+    // The profile-specific variable is first and may name either a java
+    // executable or a JDK home. This prevents a globally selected JDK from
+    // silently satisfying the wrong Minecraft profile.
+    const profileJavaVariable = `GAIUS_JAVA_${profile.javaVersion}`;
+    addCandidate(process.env[profileJavaVariable], profileJavaVariable);
+    addCandidate(process.env.GAIUS_JAVA, "GAIUS_JAVA");
     for (const home of [process.env.GAIUS_JAVA_HOME, process.env.JAVA_HOME]) {
-        if (!home) continue;
-        const normalizedHome = nativePath(home);
-        addCandidate(path.join(normalizedHome, "bin", "java"));
-        addCandidate(path.join(normalizedHome, "bin", "java.exe"));
+        addCandidate(home, home === process.env.GAIUS_JAVA_HOME
+            ? "GAIUS_JAVA_HOME" : "JAVA_HOME");
     }
     candidates.push(
-        "C:\\Program Files\\Java\\jdk-24\\bin\\java.exe",
-        "C:\\Program Files\\Java\\jdk-26.0.1\\bin\\java.exe",
-        "java",
+        { candidate: "C:\\Program Files\\Java\\jdk-24\\bin\\java.exe", source: "known-jdk" },
+        { candidate: "C:\\Program Files\\Java\\jdk-26.0.1\\bin\\java.exe", source: "known-jdk" },
+        { candidate: "java", source: "PATH" },
     );
     const diagnostics = [];
-    for (const candidate of [...new Set(candidates)]) {
+    for (const { candidate, source } of candidates) {
         const result = await probeJava(candidate);
-        if (result.error === undefined && result.major >= requiredVersion) return candidate;
-        diagnostics.push(`${candidate}: ${result.error ?? `Java ${result.major}`}`);
+        if (result.error === undefined &&
+            runtimeJavaMajorMeetsPolicy(profile, result.major)) {
+            return {
+                executable: result.executable ?? candidate,
+                major: result.major,
+                source,
+            };
+        }
+        const version = result.error ?? `Java ${result.major}`;
+        diagnostics.push(`${candidate} [${source}]: ${version}`);
     }
-    throw new Error(`No Java >= ${requiredVersion} for ${activeProfile.id}: ${diagnostics.join("; ")}`);
+    const policy = acceptanceMode && profile.id === "1.21.11"
+        ? "Java 21 exactly"
+        : `Java >= ${profile.javaVersion}`;
+    throw new Error(`No ${policy} for ${profile.id}: ${diagnostics.join("; ")}`);
 }
 
 async function probeJava(candidate) {
     return await new Promise((resolve) => {
         let output = "";
-        const child = spawn(candidate, ["-version"], {
+        let settled = false;
+        const finish = (value) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(value);
+        };
+        const windowsScript = process.platform === "win32" &&
+            /\.(?:cmd|bat)$/iu.test(candidate);
+        const command = windowsScript
+            ? (process.env.ComSpec ?? process.env.COMSPEC ?? "cmd.exe")
+            : candidate;
+        const argumentsList = windowsScript
+            ? ["/d", "/c", candidate, "-version"]
+            : ["-version"];
+        const child = spawn(command, argumentsList, {
             stdio: ["ignore", "pipe", "pipe"],
             windowsHide: true,
+            shell: false,
         });
         const timer = setTimeout(() => {
-            child.kill();
-            resolve({ error: "timed out" });
+            try { child.kill(); } catch {}
+            finish({ executable: candidate, error: "timed out" });
         }, 5000);
         child.stdout.setEncoding("utf8");
         child.stderr.setEncoding("utf8");
         child.stdout.on("data", (chunk) => { output += chunk; });
         child.stderr.on("data", (chunk) => { output += chunk; });
         child.once("error", (error) => {
-            clearTimeout(timer);
-            resolve({ error: error.message });
+            finish({ executable: candidate, error: error.message });
         });
         child.once("close", (code) => {
-            clearTimeout(timer);
             if (code !== 0) {
-                resolve({ error: `exited ${code}: ${output.trim()}` });
+                finish({ executable: candidate,
+                    error: `exited ${code}: ${output.trim()}` });
                 return;
             }
             const match = output.match(/version\s+["']?(\d+)/iu);
-            resolve(match ? { major: Number(match[1]) } :
-                { error: `could not parse version: ${output.trim()}` });
+            finish(match ? { executable: candidate, major: Number(match[1]) } : {
+                executable: candidate,
+                error: `could not parse version: ${output.trim()}`,
+            });
         });
     });
 }
@@ -1847,5 +2437,6 @@ async function closeHttpServer(server) {
     });
 }
 
-if (printConfigOnly) await printConfiguration();
+if (printJavaResolutionOnly) await printJavaResolution();
+else if (printConfigOnly) await printConfiguration();
 else await runSmoke();
