@@ -400,6 +400,264 @@ public final class GaiusChunkLayerBytecodeVerifier {
         System.out.println("CFG_VERIFIER_OK " + node.name);
     }
 
+    private static void verifyNoArtificialLayerYield(ClassNode node) {
+        for (FieldNode field : node.fields) {
+            require(!field.name.equals("browserLayerYield"),
+                    "26.2 ChunkGenerationTask must not contain browserLayerYield");
+        }
+        for (MethodNode method : node.methods) {
+            for (AbstractInsnNode instruction : method.instructions) {
+                if (instruction instanceof FieldInsnNode field) {
+                    require(!field.name.equals("browserLayerYield"),
+                            "26.2 bytecode still references browserLayerYield");
+                }
+                if (!(instruction instanceof MethodInsnNode call)) continue;
+                require(!call.owner.equals("dev/gaius/browser/BrowserChunkGenerationYield"),
+                        "26.2 bytecode still references BrowserChunkGenerationYield");
+                require(!(call.owner.equals("org/teavm/platform/Platform")
+                                && call.name.equals("schedule")),
+                        "26.2 bytecode still invokes Platform.schedule");
+            }
+        }
+        System.out.println("NO_ARTIFICIAL_LAYER_YIELD_OK " + node.name);
+    }
+
+    private static void verifyActiveCleanupBlock(LabelNode label, String target) {
+        boolean activeCleared = false;
+        boolean exits = false;
+        for (AbstractInsnNode instruction = firstExecutable(label); instruction != null;
+                instruction = nextExecutable(instruction)) {
+            if (instruction instanceof FieldInsnNode field
+                    && field.getOpcode() == Opcodes.PUTFIELD
+                    && field.name.equals("browserLayerActive")) {
+                activeCleared = previousExecutable(instruction).getOpcode() == Opcodes.ICONST_0;
+            } else if (instruction instanceof JumpInsnNode jump
+                    && jump.getOpcode() == Opcodes.GOTO) {
+                exits = true;
+                break;
+            }
+        }
+        require(activeCleared && exits, target + " active cleanup CFG changed");
+    }
+
+    private static void verifyLayerBarrierCfg262(ClassNode node) {
+        verifyNoArtificialLayerYield(node);
+        MethodNode run = method(node, "runUntilWait");
+
+        List<FieldInsnNode> activeGets = new ArrayList<>();
+        for (AbstractInsnNode instruction : run.instructions) {
+            if (instruction instanceof FieldInsnNode field
+                    && field.getOpcode() == Opcodes.GETFIELD
+                    && field.name.equals("browserLayerActive")) {
+                activeGets.add(field);
+            }
+        }
+        require(activeGets.size() == 1,
+                "26.2 runUntilWait active gate count changed");
+        FieldInsnNode activeGet = activeGets.get(0);
+        AbstractInsnNode activeNext = nextExecutable(activeGet);
+        require(activeNext instanceof JumpInsnNode jump
+                        && jump.getOpcode() == Opcodes.IFEQ,
+                "26.2 runUntilWait active gate must use IFEQ to vanilla wait");
+        JumpInsnNode activeBranch = (JumpInsnNode) activeNext;
+        MethodInsnNode activeSchedule = firstCall(activeBranch, activeBranch.label);
+        require(activeSchedule != null
+                        && activeSchedule.getOpcode() == Opcodes.INVOKEVIRTUAL
+                        && activeSchedule.name.equals("scheduleNextLayer"),
+                "26.2 active gate must schedule the current layer before re-entry");
+
+        JumpInsnNode activeResume = null;
+        for (AbstractInsnNode instruction = nextExecutable(activeSchedule);
+                instruction != null && instruction != activeBranch.label;
+                instruction = nextExecutable(instruction)) {
+            if (instruction instanceof JumpInsnNode jump
+                    && jump.getOpcode() == Opcodes.GOTO) {
+                activeResume = jump;
+                break;
+            }
+            require(!(instruction instanceof MethodInsnNode call
+                            && call.name.equals("waitForScheduledLayer")),
+                    "26.2 active branch reaches vanilla wait before re-entry");
+        }
+        require(activeResume != null,
+                "26.2 active branch lost forward re-entry edge");
+
+        List<JumpInsnNode> runBackedges = new ArrayList<>();
+        for (AbstractInsnNode instruction : run.instructions) {
+            if (instruction instanceof JumpInsnNode jump
+                    && jump.getOpcode() == Opcodes.GOTO
+                    && run.instructions.indexOf(jump.label)
+                            < run.instructions.indexOf(jump)) {
+                runBackedges.add(jump);
+            }
+        }
+        require(runBackedges.size() == 1,
+                "26.2 runUntilWait must retain exactly one vanilla backward edge");
+        JumpInsnNode vanillaBackedge = runBackedges.get(0);
+        require(activeResume.label != vanillaBackedge.label
+                        && run.instructions.indexOf(activeResume.label)
+                                < run.instructions.indexOf(vanillaBackedge),
+                "26.2 active resume must target the original edge prologue");
+        AbstractInsnNode pulseBeforeBackedge = previousExecutable(vanillaBackedge);
+        require(isBrowserWorldgenPulse(pulseBeforeBackedge),
+                "26.2 original runUntilWait edge lost its scheduler pulse");
+        require(firstExecutable(activeResume.label) == pulseBeforeBackedge,
+                "26.2 active branch must jump to the pulse before the vanilla edge");
+
+        AbstractInsnNode vanillaWait = firstCall(activeBranch.label, null);
+        require(vanillaWait instanceof MethodInsnNode call
+                        && call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                        && call.name.equals("waitForScheduledLayer"),
+                "26.2 inactive gate target must enter vanilla layer wait");
+
+        MethodNode layer = method(node, "scheduleLayer");
+        AbstractInsnNode first = firstExecutable(layer.instructions.getFirst());
+        AbstractInsnNode second = nextExecutable(first);
+        require(first != null && first.getOpcode() == Opcodes.ICONST_0,
+                "26.2 scheduleLayer batch counter must initialize at entry");
+        require(second instanceof VarInsnNode && second.getOpcode() == Opcodes.ISTORE
+                        && ((VarInsnNode) second).var == 7,
+                "26.2 scheduleLayer batch counter must reset local 7 at entry");
+
+        JumpInsnNode resumeBranch = null;
+        for (AbstractInsnNode instruction : layer.instructions) {
+            if (instruction instanceof FieldInsnNode field
+                    && field.getOpcode() == Opcodes.GETFIELD
+                    && field.name.equals("browserLayerActive")) {
+                AbstractInsnNode branch = nextExecutable(field);
+                if (branch instanceof JumpInsnNode jump && jump.getOpcode() == Opcodes.IFNE) {
+                    require(resumeBranch == null,
+                            "26.2 scheduleLayer active resume branch changed");
+                    resumeBranch = jump;
+                }
+            }
+        }
+        require(resumeBranch != null,
+                "26.2 scheduleLayer active resume branch missing");
+
+        List<JumpInsnNode> batchGuards = new ArrayList<>();
+        for (AbstractInsnNode instruction : layer.instructions) {
+            if (instruction instanceof JumpInsnNode jump
+                    && jump.getOpcode() == Opcodes.IF_ICMPLT) {
+                batchGuards.add(jump);
+            }
+        }
+        require(batchGuards.size() == 1,
+                "26.2 scheduleLayer must retain one holder batch guard");
+        JumpInsnNode batchGuard = batchGuards.get(0);
+        AbstractInsnNode limit = previousExecutable(batchGuard);
+        AbstractInsnNode count = previousExecutable(limit);
+        require(limit instanceof LdcInsnNode && Integer.valueOf(16).equals(((LdcInsnNode) limit).cst),
+                "26.2 scheduleLayer holder batch limit changed");
+        require(count instanceof VarInsnNode && count.getOpcode() == Opcodes.ILOAD
+                        && ((VarInsnNode) count).var == 7,
+                "26.2 scheduleLayer batch guard must read local 7");
+        require(batchGuard.label == resumeBranch.label
+                        && layer.instructions.indexOf(batchGuard.label)
+                                < layer.instructions.indexOf(batchGuard),
+                "26.2 scheduleLayer batch guard must re-enter the holder body");
+
+        List<JumpInsnNode> layerBackedges = new ArrayList<>();
+        for (AbstractInsnNode instruction : layer.instructions) {
+            if (instruction instanceof JumpInsnNode jump
+                    && layer.instructions.indexOf(jump.label)
+                            < layer.instructions.indexOf(jump)) {
+                layerBackedges.add(jump);
+            }
+        }
+        require(layerBackedges.size() == 1,
+                "26.2 scheduleLayer must retain one method-local re-entry edge");
+        JumpInsnNode layerBackedge = layerBackedges.get(0);
+        require(layerBackedge.getOpcode() == Opcodes.IF_ICMPLT
+                        && layerBackedge.label == resumeBranch.label,
+                "26.2 scheduleLayer re-entry edge must resume the holder body");
+        AbstractInsnNode fullBatchReturn = nextExecutable(batchGuard);
+        require(fullBatchReturn instanceof JumpInsnNode jump
+                        && jump.getOpcode() == Opcodes.GOTO
+                        && layer.instructions.indexOf(jump.label)
+                                > layer.instructions.indexOf(jump),
+                "26.2 full holder batch must return with its active cursor");
+
+        JumpInsnNode cancellation = null;
+        JumpInsnNode holderRejected = null;
+        for (AbstractInsnNode instruction : layer.instructions) {
+            if (instruction instanceof FieldInsnNode field
+                    && field.getOpcode() == Opcodes.GETFIELD
+                    && field.name.equals("markedForCancellation")) {
+                AbstractInsnNode branch = nextExecutable(field);
+                if (branch instanceof JumpInsnNode jump && jump.getOpcode() == Opcodes.IFNE) {
+                    cancellation = jump;
+                }
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.name.equals("scheduleChunkInLayer")) {
+                AbstractInsnNode branch = nextExecutable(call);
+                if (branch instanceof JumpInsnNode jump && jump.getOpcode() == Opcodes.IFEQ) {
+                    holderRejected = jump;
+                }
+            }
+        }
+        require(cancellation != null && holderRejected != null
+                        && cancellation.label == holderRejected.label,
+                "26.2 cancellation and rejected holder must share cleanup");
+        verifyActiveCleanupBlock(cancellation.label, "26.2 scheduleLayer cancel");
+
+        JumpInsnNode finalCoordinateBranch = null;
+        for (AbstractInsnNode instruction : layer.instructions) {
+            if (instruction instanceof JumpInsnNode jump
+                    && jump.getOpcode() == Opcodes.IF_ICMPLE
+                    && jump.label != cancellation.label) {
+                finalCoordinateBranch = jump;
+            }
+        }
+        require(finalCoordinateBranch != null,
+                "26.2 final holder coordinate branch missing");
+        boolean finalActiveCleared = false;
+        for (AbstractInsnNode instruction = nextExecutable(finalCoordinateBranch);
+                instruction != null && instruction != firstExecutable(finalCoordinateBranch.label);
+                instruction = nextExecutable(instruction)) {
+            if (instruction instanceof FieldInsnNode field
+                    && field.getOpcode() == Opcodes.PUTFIELD
+                    && field.name.equals("browserLayerActive")
+                    && previousExecutable(field).getOpcode() == Opcodes.ICONST_0) {
+                finalActiveCleared = true;
+                break;
+            }
+        }
+        require(finalActiveCleared,
+                "26.2 final holder path must clear active before vanilla wait");
+
+        List<TryCatchBlockNode> throwableHandlers = layer.tryCatchBlocks.stream()
+                .filter(block -> "java/lang/Throwable".equals(block.type)).toList();
+        require(throwableHandlers.size() == 1,
+                "26.2 scheduleLayer Throwable handler changed");
+        AbstractInsnNode handlerStart = firstExecutable(throwableHandlers.get(0).handler);
+        require(handlerStart instanceof VarInsnNode && handlerStart.getOpcode() == Opcodes.ASTORE,
+                "26.2 scheduleLayer Throwable handler must retain the thrown value");
+        int throwableLocal = ((VarInsnNode) handlerStart).var;
+        boolean handlerActiveCleared = false;
+        boolean rethrowsSame = false;
+        for (AbstractInsnNode instruction = nextExecutable(handlerStart); instruction != null;
+                instruction = nextExecutable(instruction)) {
+            if (instruction instanceof FieldInsnNode field
+                    && field.getOpcode() == Opcodes.PUTFIELD
+                    && field.name.equals("browserLayerActive")) {
+                handlerActiveCleared = previousExecutable(field).getOpcode() == Opcodes.ICONST_0;
+            } else if (instruction.getOpcode() == Opcodes.ATHROW) {
+                AbstractInsnNode loaded = previousExecutable(instruction);
+                rethrowsSame = loaded instanceof VarInsnNode
+                        && loaded.getOpcode() == Opcodes.ALOAD
+                        && ((VarInsnNode) loaded).var == throwableLocal;
+                break;
+            }
+        }
+        require(handlerActiveCleared && rethrowsSame,
+                "26.2 scheduleLayer Throwable cleanup/rethrow changed");
+        verifySuccessfulHolderPulsePaths(layer, node.name);
+        System.out.println("PROFILE_CFG_OK 26.2 " + node.name);
+        System.out.println("CFG_VERIFIER_OK " + node.name);
+    }
+
     private static void verify(ZipFile jar, String name, String profile) throws Exception {
         var entry = jar.getEntry(name);
         if (entry == null) {
@@ -413,7 +671,11 @@ public final class GaiusChunkLayerBytecodeVerifier {
             new Analyzer<BasicValue>(new BasicVerifier()).analyze(node.name, method);
         }
         if (name.equals("net/minecraft/server/level/ChunkGenerationTask.class")) {
-            verifyLayerBarrierCfg(node, profile);
+            if (profile.equals("26.2")) {
+                verifyLayerBarrierCfg262(node);
+            } else {
+                verifyLayerBarrierCfg(node, profile);
+            }
         }
         if (profile.equals("1.21.11")) {
             verifyNoBrowserWorldgenSchedulerCalls(node, profile);
@@ -429,7 +691,13 @@ public final class GaiusChunkLayerBytecodeVerifier {
                 "unsupported Minecraft profile: " + profile);
         try (ZipFile jar = new ZipFile(args[0])) {
             verify(jar, "net/minecraft/server/level/ChunkGenerationTask.class", profile);
-            verify(jar, "dev/gaius/browser/BrowserChunkGenerationYield.class", profile);
+            if (profile.equals("1.21.11")) {
+                verify(jar, "dev/gaius/browser/BrowserChunkGenerationYield.class", profile);
+            } else {
+                require(jar.getEntry("dev/gaius/browser/BrowserChunkGenerationYield.class") == null,
+                        "26.2 overlay must not emit BrowserChunkGenerationYield.class");
+                System.out.println("NO_HELPER_CLASS_OK 26.2");
+            }
         }
     }
 }

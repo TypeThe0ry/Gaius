@@ -5664,11 +5664,17 @@ def check_source_patches() -> None:
                 for marker in (
                     "ChunkGenerationTask.runUntilWait",
                     "ChunkGenerationTask.waitForScheduledLayer",
+                    "patchRunUntilWaitActiveGate",
+                    "activeResume",
                     "replaceChunkGenerationScheduleLayer(",
                     "BROWSER_HOLDERS_PER_TURN = 16",
                     "ChunkGenerationTask.canLoadWithoutGeneration",
                 )
             )
+            and "BROWSER_LAYER_YIELD" not in minecraft_262_browser_patcher
+            and "CHUNK_GENERATION_YIELD" not in minecraft_262_browser_patcher
+            and "BrowserChunkGenerationYield" not in minecraft_262_browser_patcher
+            and "Platform.schedule" not in minecraft_262_browser_patcher
             and "BrowserWorldgenScheduler" in minecraft_262_browser_patcher
             and "browserWorldgenCheckpoint" in client_patcher
             and "browserWorldgenBeginTaskWork" in client_patcher
@@ -11826,14 +11832,14 @@ def check_overlay_bytecode() -> None:
                     ) == 1
                     and "browserLayerX" in generation_schedule_layer
                     and "browserLayerZ" in generation_schedule_layer
-                    and "browserLayerYield" in generation_schedule_layer
-                    and "BrowserChunkGenerationYield" in generation_schedule_layer
-                    and "org/teavm/platform/Platform.schedule" in generation_schedule_layer
+                    and "browserLayerYield" not in generation_schedule_layer
+                    and "BrowserChunkGenerationYield" not in generation_schedule_layer
+                    and "org/teavm/platform/Platform.schedule" not in generation_schedule_layer
+                    and "java/util/concurrent/CompletableFuture" not in generation_schedule_layer
                     and "// int 16" in generation_schedule_layer
                     and "if_icmplt" in generation_schedule_layer
                     and "Exception table:" in generation_schedule_layer
                     and "Field browserLayerActive" in generation_schedule_layer
-                    and "Field browserLayerYield" in generation_schedule_layer
                     and generation_can_load_without_generation.count(
                         "BrowserWorldgenScheduler.pulse"
                     ) == 2

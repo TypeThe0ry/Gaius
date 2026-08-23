@@ -84,11 +84,9 @@ for (const contract of [
   '"ChunkGenerationTask.runUntilWait"',
   '"ChunkGenerationTask.canLoadWithoutGeneration"',
   '"browserLayerActive"',
-  '"browserLayerYield"',
-  'BrowserChunkGenerationYield',
-  '"org/teavm/platform/Platform"',
+  'patchRunUntilWaitActiveGate(',
+  'activeResume',
   'replaceChunkGenerationScheduleLayer(',
-  'writeChunkGenerationYieldHelper(root)',
   "patchGlBufferMappedViewRanges(jar, root)",
   "patchLiveFrameTargeting(jar, root)",
   "patchSectionRenderTaskRetryYields(jar, root)",
@@ -101,6 +99,17 @@ for (const contract of [
   '"(Ljava/nio/file/Path;Ljava/lang/String;[Ljava/lang/String;)"',
 ]) {
   assert.ok(versionPatcher.includes(contract), "missing 26.2 patch contract: " + contract);
+}
+for (const forbidden of [
+  "BROWSER_LAYER_YIELD",
+  "CHUNK_GENERATION_YIELD",
+  "BrowserChunkGenerationYield",
+  "browserLayerYield",
+  "Platform.schedule",
+  "writeChunkGenerationYieldHelper",
+]) {
+  assert.ok(!versionPatcher.includes(forbidden),
+    `26.2 patcher still contains artificial layer-yield contract: ${forbidden}`);
 }
 assert.ok(versionPatcher.includes("requireNoServerWorkTurnReset"),
   "26.2 task patcher does not guard the shared server-work clock from per-task resets");
@@ -295,19 +304,18 @@ assert.equal(scheduleLayer.match(/BrowserWorldgenScheduler\.pulse/g)?.length, 1,
   "scheduleLayer must pulse once at each holder cursor boundary");
 assert.match(scheduleLayer, /browserLayerX[\s\S]*browserLayerZ/,
   "scheduleLayer must retain a holder cursor across browser turns");
-assert.match(scheduleLayer, /BrowserChunkGenerationYield/,
-  "scheduleLayer must schedule a continuation future after each bounded holder batch");
 assert.match(scheduleLayer, /ldc(?:_w)?\s+.*\/\/ int 16[\s\S]*if_icmplt/,
   "scheduleLayer must cap each browser turn at 16 holders");
-assert.equal(scheduleLayer.match(/Platform\.schedule/g)?.length, 1,
-  "scheduleLayer must use one zero-delay platform continuation");
+assert.doesNotMatch(scheduleLayer,
+  /BrowserChunkGenerationYield|browserLayerYield|Platform\.schedule|CompletableFuture/,
+  "scheduleLayer still returns through an artificial future/requeue path");
 assert.match(scheduleLayer, /Exception table:[\s\S]*Throwable/,
   "scheduleLayer must clean cursor state when holder work throws");
 const scheduleLayerExceptionCleanup = scheduleLayer.slice(scheduleLayer.lastIndexOf("astore"));
 assert.match(scheduleLayerExceptionCleanup, /Field browserLayerActive/,
   "scheduleLayer exception path must clear active cursor state");
-assert.match(scheduleLayerExceptionCleanup, /Field browserLayerYield/,
-  "scheduleLayer exception path must clear pending continuation state");
+assert.doesNotMatch(scheduleLayerExceptionCleanup, /Field browserLayerYield/,
+  "scheduleLayer exception path still carries removed continuation state");
 assert.equal(canLoadWithoutGeneration.match(/BrowserWorldgenScheduler\.pulse/g)?.length, 2,
   "canLoadWithoutGeneration must pulse on its two dependency-scan backedges");
 for (const body of [runUntilWait, scheduleLayer, canLoadWithoutGeneration]) {

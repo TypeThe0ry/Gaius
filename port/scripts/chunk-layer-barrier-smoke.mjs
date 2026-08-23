@@ -228,45 +228,87 @@ for (const patcher of patchers) {
 
   const gate = sourceSection(
     source,
-    "private static void patchRunUntilWaitYieldGate",
+    patcher.scheduler
+      ? "private static void patchRunUntilWaitActiveGate"
+      : "private static void patchRunUntilWaitYieldGate",
     "private static void replaceChunkGenerationScheduleNextLayer",
   );
-  assertOrdered(gate, [
-    "BROWSER_LAYER_ACTIVE",
-    '"scheduleNextLayer"',
-    "BROWSER_LAYER_YIELD",
-    "Opcodes.ARETURN",
-    "gate.add(continueVanilla)",
-    "method.instructions.insert(entryLabel, gate)",
-  ], `${patcher.profile} active-before-wait gate`);
+  if (patcher.scheduler) {
+    assertOrdered(gate, [
+      "originalBackedge",
+      "activeResume",
+      "BROWSER_LAYER_ACTIVE",
+      '"scheduleNextLayer"',
+      "Opcodes.GOTO, activeResume",
+      "gate.add(continueVanilla)",
+      "method.instructions.insert(entryLabel, gate)",
+    ], `${patcher.profile} active-before-wait gate`);
+    assert.doesNotMatch(gate, /BROWSER_LAYER_YIELD|Opcodes\.ARETURN/,
+      `${patcher.profile} gate must not return an artificial future`);
+  } else {
+    assertOrdered(gate, [
+      "BROWSER_LAYER_ACTIVE",
+      '"scheduleNextLayer"',
+      "BROWSER_LAYER_YIELD",
+      "Opcodes.ARETURN",
+      "gate.add(continueVanilla)",
+      "method.instructions.insert(entryLabel, gate)",
+    ], `${patcher.profile} active-before-wait gate`);
+  }
   assert.doesNotMatch(gate, /Opcodes\.GOTO,\s*gateStart/,
     `${patcher.profile} gate added a second runUntilWait backedge`);
 
   const scheduleLayer = sourceSection(
     source,
     "private static void replaceChunkGenerationScheduleLayer",
-    "private static void writeChunkGenerationYieldHelper",
+    patcher.scheduler
+      ? "private static MethodInsnNode browserWorldgenBeginTaskWork"
+      : "private static void writeChunkGenerationYieldHelper",
   );
-  assertOrdered(scheduleLayer, [
-    "code.add(start)",
-    "Opcodes.ISTORE, 7",
-    "code.add(resume)",
-    '"scheduleChunkInLayer"',
-    "BROWSER_HOLDERS_PER_TURN",
-    "Opcodes.IF_ICMPLT, resume",
-    "code.add(scheduleYield)",
-    'Opcodes.NEW, "java/util/concurrent/CompletableFuture"',
-    '"org/teavm/platform/Platform"',
-  ], `${patcher.profile} bounded holder batch`);
-  assert.match(scheduleLayer,
-    /Opcodes\.PUTFIELD, owner, BROWSER_LAYER_ACTIVE, "Z"[\s\S]*Opcodes\.GOTO, scheduleYield/,
-    `${patcher.profile} final holder does not retain the final continuation barrier`);
-  assert.match(scheduleLayer,
-    /code\.add\(cancel\)[\s\S]*BROWSER_LAYER_ACTIVE[\s\S]*BROWSER_LAYER_YIELD[\s\S]*normalReturn/,
-    `${patcher.profile} cancellation does not clear cursor/yield state`);
-  assert.match(scheduleLayer,
-    /code\.add\(handler\)[\s\S]*BROWSER_LAYER_ACTIVE[\s\S]*BROWSER_LAYER_YIELD[\s\S]*ATHROW/,
-    `${patcher.profile} exception cleanup does not clear cursor/yield state`);
+  if (patcher.scheduler) {
+    assertOrdered(scheduleLayer, [
+      "code.add(start)",
+      "Opcodes.ISTORE, 7",
+      "code.add(resume)",
+      '"scheduleChunkInLayer"',
+      "BROWSER_HOLDERS_PER_TURN",
+      "Opcodes.IF_ICMPLT, resume",
+      "Opcodes.GOTO, normalReturn",
+    ], `${patcher.profile} bounded holder batch`);
+    assert.doesNotMatch(scheduleLayer,
+      /BROWSER_LAYER_YIELD|CHUNK_GENERATION_YIELD|CompletableFuture|Platform\.schedule/,
+      `${patcher.profile} scheduleLayer must not synthesize a future callback`);
+    assert.match(scheduleLayer,
+      /Opcodes\.PUTFIELD, owner, BROWSER_LAYER_ACTIVE, "Z"[\s\S]*Opcodes\.GOTO, normalReturn/,
+      `${patcher.profile} final holder does not clear the active cursor`);
+    assert.match(scheduleLayer,
+      /code\.add\(cancel\)[\s\S]*BROWSER_LAYER_ACTIVE[\s\S]*normalReturn/,
+      `${patcher.profile} cancellation does not clear cursor state`);
+    assert.match(scheduleLayer,
+      /code\.add\(handler\)[\s\S]*BROWSER_LAYER_ACTIVE[\s\S]*ATHROW/,
+      `${patcher.profile} exception cleanup does not clear cursor state`);
+  } else {
+    assertOrdered(scheduleLayer, [
+      "code.add(start)",
+      "Opcodes.ISTORE, 7",
+      "code.add(resume)",
+      '"scheduleChunkInLayer"',
+      "BROWSER_HOLDERS_PER_TURN",
+      "Opcodes.IF_ICMPLT, resume",
+      "code.add(scheduleYield)",
+      'Opcodes.NEW, "java/util/concurrent/CompletableFuture"',
+      '"org/teavm/platform/Platform"',
+    ], `${patcher.profile} bounded holder batch`);
+    assert.match(scheduleLayer,
+      /Opcodes\.PUTFIELD, owner, BROWSER_LAYER_ACTIVE, "Z"[\s\S]*Opcodes\.GOTO, scheduleYield/,
+      `${patcher.profile} final holder does not retain the final continuation barrier`);
+    assert.match(scheduleLayer,
+      /code\.add\(cancel\)[\s\S]*BROWSER_LAYER_ACTIVE[\s\S]*BROWSER_LAYER_YIELD[\s\S]*normalReturn/,
+      `${patcher.profile} cancellation does not clear cursor/yield state`);
+    assert.match(scheduleLayer,
+      /code\.add\(handler\)[\s\S]*BROWSER_LAYER_ACTIVE[\s\S]*BROWSER_LAYER_YIELD[\s\S]*ATHROW/,
+      `${patcher.profile} exception cleanup does not clear cursor/yield state`);
+  }
 
   if (patcher.scheduler) {
     assertOrdered(scheduleLayer, [

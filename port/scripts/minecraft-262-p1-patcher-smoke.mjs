@@ -357,6 +357,17 @@ const browserPatcherSource = await readFile(
 );
 assert.match(browserPatcherSource, /BROWSER_HOLDERS_PER_TURN = 16/,
   "26.2 holder batching must retain the reviewed 16-holder upper bound");
+for (const forbidden of [
+  "BROWSER_LAYER_YIELD",
+  "CHUNK_GENERATION_YIELD",
+  "BrowserChunkGenerationYield",
+  "browserLayerYield",
+  "Platform.schedule",
+  "writeChunkGenerationYieldHelper",
+]) {
+  assert.equal(browserPatcherSource.includes(forbidden), false,
+    `26.2 patcher must not retain artificial yield path: ${forbidden}`);
+}
 const clientPatcherSource = await readFile(
   join(toolsSource, "MinecraftClientPatcher.java"),
   "utf8",
@@ -448,8 +459,10 @@ try {
   ], {encoding: "utf8", timeout: 30_000});
   assert.match(verifierOutput, /BASIC_VERIFIER_OK .*ChunkGenerationTask\.class/,
     "ASM BasicVerifier did not validate ChunkGenerationTask");
-  assert.match(verifierOutput, /BASIC_VERIFIER_OK .*BrowserChunkGenerationYield\.class/,
-    "ASM BasicVerifier did not validate BrowserChunkGenerationYield");
+  assert.match(verifierOutput, /NO_ARTIFICIAL_LAYER_YIELD_OK .*ChunkGenerationTask/,
+    "ASM CFG verifier did not reject artificial 26.2 layer yield paths");
+  assert.match(verifierOutput, /NO_HELPER_CLASS_OK 26\.2/,
+    "26.2 patcher still emitted the artificial yield helper");
   assert.match(verifierOutput, /CFG_VERIFIER_OK net\/minecraft\/server\/level\/ChunkGenerationTask/,
     "ASM CFG verifier did not validate the chunk layer barrier");
   assert.match(verifierOutput,
@@ -557,25 +570,34 @@ try {
   });
   assert.equal(runUntilWaitBackedges.length, 1,
     "ChunkGenerationTask.runUntilWait must retain one loop backedge");
-  const yieldFieldIndex = runUntilWaitInstructions.findIndex(entry =>
-    entry.instruction.includes("Field browserLayerYield"));
-  assert.ok(yieldFieldIndex > 0,
-    "runUntilWait yield gate field load is missing from the patched bytecode");
-  const yieldGateStart = runUntilWaitInstructions[yieldFieldIndex - 1];
-  assert.match(yieldGateStart.instruction, /^aload_0|^aload\s+0$/,
-    "runUntilWait yield gate does not begin with its receiver load");
-  assert.equal(runUntilWaitBackedges[0].target, yieldGateStart.offset,
-    "runUntilWait backedge bypasses the holder-yield gate");
+  assert.doesNotMatch(runUntilWait,
+    /Field browserLayerYield|BrowserChunkGenerationYield|Platform\.schedule/,
+    "runUntilWait still contains an artificial yield path");
   const activeFieldIndex = runUntilWaitInstructions.findIndex(entry =>
     entry.instruction.includes("Field browserLayerActive"));
   const firstScheduleNextIndex = runUntilWaitInstructions.findIndex(entry =>
     entry.instruction.includes("Method scheduleNextLayer:()V"));
   const firstLayerWaitIndex = runUntilWaitInstructions.findIndex(entry =>
     entry.instruction.includes("Method waitForScheduledLayer:"));
-  assert.ok(yieldFieldIndex < activeFieldIndex
+  const activeResumeGoto = runUntilWaitInstructions
+    .map((entry, index) => ({entry, index}))
+    .find(({entry, index}) => {
+    if (index <= firstScheduleNextIndex || index >= firstLayerWaitIndex) return false;
+    const match = entry.instruction.match(/^goto(?:_w)?\s+(\d+)\s*$/);
+    return match && Number(match[1]) > entry.offset;
+  });
+  assert.ok(activeResumeGoto
+      && activeFieldIndex >= 0
       && activeFieldIndex < firstScheduleNextIndex
-      && firstScheduleNextIndex < firstLayerWaitIndex,
-  "active cursor must resume scheduleNextLayer before waitForScheduledLayer is reachable");
+      && firstScheduleNextIndex < activeResumeGoto.index
+      && activeResumeGoto.index < firstLayerWaitIndex,
+  "active cursor must schedule next layer and forward to the vanilla edge before wait");
+  assert.equal(activeResumeGoto?.entry.instruction.match(/^goto(?:_w)?\s+(\d+)/)?.[1],
+    String(runUntilWaitInstructions[runUntilWaitBackedges[0].index - 1].offset),
+    "active branch must target the original backedge prologue");
+  assert.match(runUntilWaitInstructions[runUntilWaitBackedges[0].index - 1].instruction,
+    /BrowserWorldgenScheduler\.pulse/,
+    "original runUntilWait backedge lost its scheduler pulse");
   assert.equal(occurrences(runUntilWait, "Method scheduleNextLayer:()V"), 2,
     "runUntilWait must retain active-resume and vanilla fresh-layer scheduling paths");
   assert.equal(occurrences(runUntilWait, "BrowserWorldgenScheduler.beginServerWorkTurn"), 0,
@@ -596,8 +618,9 @@ try {
   const scheduleLayerExceptionCleanup = scheduleLayer.slice(scheduleLayer.lastIndexOf("astore"));
   assert.match(scheduleLayerExceptionCleanup, /Field browserLayerActive/,
     "scheduleLayer exception path must clear active cursor state");
-  assert.match(scheduleLayerExceptionCleanup, /Field browserLayerYield/,
-    "scheduleLayer exception path must clear pending continuation state");
+  assert.doesNotMatch(scheduleLayerExceptionCleanup,
+    /Field browserLayerYield|BrowserChunkGenerationYield|Platform\.schedule/,
+    "scheduleLayer exception path still contains artificial continuation state");
   const scheduleLayerInstructions = bytecodeInstructions(scheduleLayer);
   const batchBackedges = scheduleLayerInstructions.flatMap((entry, index) => {
     const match = entry.instruction.match(/^if_icmplt\s+(\d+)\s*$/);
@@ -609,8 +632,12 @@ try {
   assert.match(scheduleLayerInstructions[batchBackedges[0].index - 1]?.instruction ?? "",
     /(?:bipush\s+16|ldc(?:_w)?\s+.*\/\/ int 16)/,
     "scheduleLayer batch backedge must enforce the 16-holder upper bound");
-  assert.ok(scheduleLayer.indexOf("scheduleChunkInLayer") < scheduleLayer.indexOf("Platform.schedule"),
-    "scheduleLayer must submit holders before publishing its batch continuation");
+  assert.match(scheduleLayerInstructions[batchBackedges[0].index + 1]?.instruction ?? "",
+    /^goto(?:_w)?\s+\d+$/,
+    "scheduleLayer full batch must return through the original task continuation");
+  assert.doesNotMatch(scheduleLayer,
+    /Field browserLayerYield|BrowserChunkGenerationYield|Platform\.schedule|CompletableFuture/,
+    "scheduleLayer must not synthesize a future continuation");
   const runServer = method(bytecode, "protected void runServer", "private void");
   const tickStart = runServer.indexOf("BrowserWorldgenScheduler.beginServerWorkTurn");
   const processTick = runServer.indexOf("processPacketsAndTick");

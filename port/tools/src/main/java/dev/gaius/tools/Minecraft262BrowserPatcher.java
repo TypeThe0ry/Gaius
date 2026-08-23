@@ -45,9 +45,6 @@ public final class Minecraft262BrowserPatcher {
     private static final String BROWSER_LAYER_START_Z = "browserLayerStartZ";
     private static final String BROWSER_LAYER_END_X = "browserLayerEndX";
     private static final String BROWSER_LAYER_END_Z = "browserLayerEndZ";
-    private static final String BROWSER_LAYER_YIELD = "browserLayerYield";
-    private static final String CHUNK_GENERATION_YIELD =
-            "dev/gaius/browser/BrowserChunkGenerationYield";
     private static final int BROWSER_HOLDERS_PER_TURN = 16;
     private static final int BROWSER_REGION_FILE_CACHE_SIZE = 16;
 
@@ -104,9 +101,6 @@ public final class Minecraft262BrowserPatcher {
         addPrivateField(node, BROWSER_LAYER_START_Z, "I");
         addPrivateField(node, BROWSER_LAYER_END_X, "I");
         addPrivateField(node, BROWSER_LAYER_END_Z, "I");
-        addPrivateField(node, BROWSER_LAYER_YIELD,
-                "Ljava/util/concurrent/CompletableFuture;");
-
         MethodNode runUntilWait = find(
                 node,
                 "runUntilWait",
@@ -114,7 +108,7 @@ public final class Minecraft262BrowserPatcher {
         requireNoServerWorkTurnReset(
                 "ChunkGenerationTask.runUntilWait",
                 runUntilWait);
-        patchRunUntilWaitYieldGate(runUntilWait, owner);
+        patchRunUntilWaitActiveGate(runUntilWait, owner);
         replaceChunkGenerationScheduleNextLayer(
                 find(node, "scheduleNextLayer", "()V"), owner);
         replaceChunkGenerationScheduleLayer(
@@ -143,9 +137,9 @@ public final class Minecraft262BrowserPatcher {
         // the overlaid class; a plain writer leaves verifier frames stale on
         // the ARETURN/ATHROW paths.
         writeComputeFrames(node, root.resolve(owner + ".class"));
-        writeChunkGenerationYieldHelper(root);
         System.out.println(
-                "Bounded Minecraft 26.2 chunk-generation layer at holder boundaries");
+                "Bounded Minecraft 26.2 chunk-generation layer at holder boundaries"
+                        + " with method-local scheduler continuation");
     }
 
     private static void addPrivateField(ClassNode node, String name, String descriptor) {
@@ -168,51 +162,37 @@ public final class Minecraft262BrowserPatcher {
      * <p>{@code waitForScheduledLayer()} may only run after every holder in the current layer has
      * been submitted. Waiting after the first cursor batch serializes the layer and can starve
      * progress; it is also unsafe if a pending holder depends on one not submitted yet. Re-enter
-     * {@code scheduleNextLayer()} until the cursor closes, yielding through the cursor future
-     * between bounded batches; only then resume the vanilla wait/status loop.
+     * {@code scheduleNextLayer()} while the cursor is active, using the existing task-layer
+     * scheduler pulse between bounded batches; only the completed cursor reaches the vanilla
+     * wait/status loop.
      */
-    private static void patchRunUntilWaitYieldGate(MethodNode method, String owner) {
-        LabelNode noYield = new LabelNode();
-        LabelNode returnPending = new LabelNode();
+    private static void patchRunUntilWaitActiveGate(MethodNode method, String owner) {
         LabelNode continueVanilla = new LabelNode();
+        JumpInsnNode originalBackedge = null;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (!(instruction instanceof JumpInsnNode jump)
+                    || jump.getOpcode() != Opcodes.GOTO
+                    || method.instructions.indexOf(jump.label)
+                            >= method.instructions.indexOf(jump)) {
+                continue;
+            }
+            if (originalBackedge != null) {
+                throw new IllegalStateException(
+                        "ChunkGenerationTask.runUntilWait has multiple vanilla backedges");
+            }
+            originalBackedge = jump;
+        }
+        if (originalBackedge == null) {
+            throw new IllegalStateException(
+                    "ChunkGenerationTask.runUntilWait has no vanilla backedge");
+        }
+        // The active branch must re-enter the original runUntilWait edge.  The scheduler pulse
+        // inserter runs after this method and places exactly one pulse immediately before that
+        // edge, so no second artificial future/backedge is introduced here.
+        LabelNode activeResume = new LabelNode();
+        method.instructions.insertBefore(originalBackedge, activeResume);
+
         InsnList gate = new InsnList();
-        gate.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        gate.add(new FieldInsnNode(
-                Opcodes.GETFIELD,
-                owner,
-                BROWSER_LAYER_YIELD,
-                "Ljava/util/concurrent/CompletableFuture;"));
-        gate.add(new JumpInsnNode(Opcodes.IFNULL, noYield));
-        gate.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        gate.add(new FieldInsnNode(
-                Opcodes.GETFIELD,
-                owner,
-                BROWSER_LAYER_YIELD,
-                "Ljava/util/concurrent/CompletableFuture;"));
-        gate.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL,
-                "java/util/concurrent/CompletableFuture",
-                "isDone",
-                "()Z",
-                false));
-        gate.add(new JumpInsnNode(Opcodes.IFEQ, returnPending));
-        gate.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        gate.add(new InsnNode(Opcodes.ACONST_NULL));
-        gate.add(new FieldInsnNode(
-                Opcodes.PUTFIELD,
-                owner,
-                BROWSER_LAYER_YIELD,
-                "Ljava/util/concurrent/CompletableFuture;"));
-        gate.add(new JumpInsnNode(Opcodes.GOTO, noYield));
-        gate.add(returnPending);
-        gate.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        gate.add(new FieldInsnNode(
-                Opcodes.GETFIELD,
-                owner,
-                BROWSER_LAYER_YIELD,
-                "Ljava/util/concurrent/CompletableFuture;"));
-        gate.add(new InsnNode(Opcodes.ARETURN));
-        gate.add(noYield);
         gate.add(new VarInsnNode(Opcodes.ALOAD, 0));
         gate.add(new FieldInsnNode(
                 Opcodes.GETFIELD, owner, BROWSER_LAYER_ACTIVE, "Z"));
@@ -220,23 +200,7 @@ public final class Minecraft262BrowserPatcher {
         gate.add(new VarInsnNode(Opcodes.ALOAD, 0));
         gate.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL, owner, "scheduleNextLayer", "()V", false));
-        // A successful batch, including the final batch, always publishes exactly one
-        // continuation future.  Return it directly rather than adding a second bytecode
-        // backedge; cancellation/failure clears the field and falls through to vanilla drain.
-        gate.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        gate.add(new FieldInsnNode(
-                Opcodes.GETFIELD,
-                owner,
-                BROWSER_LAYER_YIELD,
-                "Ljava/util/concurrent/CompletableFuture;"));
-        gate.add(new JumpInsnNode(Opcodes.IFNULL, continueVanilla));
-        gate.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        gate.add(new FieldInsnNode(
-                Opcodes.GETFIELD,
-                owner,
-                BROWSER_LAYER_YIELD,
-                "Ljava/util/concurrent/CompletableFuture;"));
-        gate.add(new InsnNode(Opcodes.ARETURN));
+        gate.add(new JumpInsnNode(Opcodes.GOTO, activeResume));
         gate.add(continueVanilla);
         // Keep the original loop target label in front of the gate.  The vanilla
         // runUntilWait backedge jumps to that label, so inserting before the label
@@ -246,7 +210,7 @@ public final class Minecraft262BrowserPatcher {
             method.instructions.insert(entryLabel, gate);
         } else {
             throw new IllegalStateException(
-                    "ChunkGenerationTask.runUntilWait has no entry label for yield gate");
+                    "ChunkGenerationTask.runUntilWait has no entry label for active gate");
         }
     }
 
@@ -396,10 +360,11 @@ public final class Minecraft262BrowserPatcher {
 
     /**
      * Replaces the vanilla nested holder scan with a bounded task-layer cursor.  The holder
-     * remains the minimum unit of work: no deep generation method is changed.  Each invocation
-     * submits at most {@link #BROWSER_HOLDERS_PER_TURN} holders before a platform continuation;
-     * the scheduler pulse at every holder preserves task-layer budget and telemetry accounting.
-     * The final batch also yields before the layer barrier is observed.
+     * remains the minimum unit of work: no deep generation method is changed.  Each method-local
+     * turn submits at most {@link #BROWSER_HOLDERS_PER_TURN} holders before the existing
+     * task-layer scheduler pulse; the pulse preserves task-layer budget and telemetry accounting
+     * while TeaVM resumes this method.  The final batch reaches the vanilla layer barrier only
+     * after its holders have been submitted.
      */
     private static void replaceChunkGenerationScheduleLayer(
             MethodNode method, String owner) {
@@ -410,7 +375,6 @@ public final class Minecraft262BrowserPatcher {
         LabelNode successful = new LabelNode();
         LabelNode nextColumn = new LabelNode();
         LabelNode continueBatch = new LabelNode();
-        LabelNode scheduleYield = new LabelNode();
         LabelNode normalReturn = new LabelNode();
         LabelNode tryEnd = new LabelNode();
         LabelNode handler = new LabelNode();
@@ -549,13 +513,6 @@ public final class Minecraft262BrowserPatcher {
         code.add(new InsnNode(Opcodes.ICONST_0));
         code.add(new FieldInsnNode(
                 Opcodes.PUTFIELD, owner, BROWSER_LAYER_ACTIVE, "Z"));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new InsnNode(Opcodes.ACONST_NULL));
-        code.add(new FieldInsnNode(
-                Opcodes.PUTFIELD,
-                owner,
-                BROWSER_LAYER_YIELD,
-                "Ljava/util/concurrent/CompletableFuture;"));
         code.add(new JumpInsnNode(Opcodes.GOTO, normalReturn));
 
         // Keep one inexpensive pulse at the holder boundary for scheduler telemetry.
@@ -571,8 +528,8 @@ public final class Minecraft262BrowserPatcher {
         code.add(new InsnNode(Opcodes.IADD));
         code.add(new VarInsnNode(Opcodes.ISTORE, 7));
 
-        // Advance the cursor.  The final holder marks the layer complete but still
-        // schedules a continuation so the following layer starts on a later turn.
+        // Advance the cursor.  The final holder marks the layer complete and reaches the
+        // vanilla layer barrier; partial batches stay inside this method and use pulse().
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new FieldInsnNode(
                 Opcodes.GETFIELD, owner, BROWSER_LAYER_Z, "I"));
@@ -612,7 +569,7 @@ public final class Minecraft262BrowserPatcher {
         code.add(new InsnNode(Opcodes.ICONST_0));
         code.add(new FieldInsnNode(
                 Opcodes.PUTFIELD, owner, BROWSER_LAYER_ACTIVE, "Z"));
-        code.add(new JumpInsnNode(Opcodes.GOTO, scheduleYield));
+        code.add(new JumpInsnNode(Opcodes.GOTO, normalReturn));
 
         code.add(nextColumn);
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
@@ -624,134 +581,26 @@ public final class Minecraft262BrowserPatcher {
         code.add(new VarInsnNode(Opcodes.ILOAD, 7));
         code.add(new LdcInsnNode(BROWSER_HOLDERS_PER_TURN));
         code.add(new JumpInsnNode(Opcodes.IF_ICMPLT, resume));
-
-        code.add(scheduleYield);
-        // browserLayerYield = new CompletableFuture<>();
-        code.add(new TypeInsnNode(Opcodes.NEW, "java/util/concurrent/CompletableFuture"));
-        code.add(new InsnNode(Opcodes.DUP));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKESPECIAL,
-                "java/util/concurrent/CompletableFuture",
-                "<init>",
-                "()V",
-                false));
-        code.add(new VarInsnNode(Opcodes.ASTORE, 8));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 8));
-        code.add(new FieldInsnNode(
-                Opcodes.PUTFIELD,
-                owner,
-                BROWSER_LAYER_YIELD,
-                "Ljava/util/concurrent/CompletableFuture;"));
-        code.add(new TypeInsnNode(Opcodes.NEW, CHUNK_GENERATION_YIELD));
-        code.add(new InsnNode(Opcodes.DUP));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 8));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKESPECIAL,
-                CHUNK_GENERATION_YIELD,
-                "<init>",
-                "(Ljava/util/concurrent/CompletableFuture;)V",
-                false));
-        code.add(new InsnNode(Opcodes.ICONST_0));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKESTATIC,
-                "org/teavm/platform/Platform",
-                "schedule",
-                "(Lorg/teavm/platform/PlatformRunnable;I)I",
-                false));
-        code.add(new InsnNode(Opcodes.POP));
+        // A full holder batch returns with the cursor active.  The original runUntilWait
+        // backedge pulses and re-enters the active gate, which invokes scheduleNextLayer for
+        // the next batch.  No synthetic future or callback is attached to the task.
         code.add(new JumpInsnNode(Opcodes.GOTO, normalReturn));
 
         code.add(normalReturn);
         code.add(tryEnd);
         code.add(new InsnNode(Opcodes.RETURN));
-        // A holder or Platform.schedule failure must not leave a live cursor or a
-        // never-completing browser future attached to the task.
+        // A holder or scheduler failure must not leave a live cursor attached to the task.
         code.add(handler);
         code.add(new VarInsnNode(Opcodes.ASTORE, 9));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new InsnNode(Opcodes.ICONST_0));
         code.add(new FieldInsnNode(
                 Opcodes.PUTFIELD, owner, BROWSER_LAYER_ACTIVE, "Z"));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new InsnNode(Opcodes.ACONST_NULL));
-        code.add(new FieldInsnNode(
-                Opcodes.PUTFIELD,
-                owner,
-                BROWSER_LAYER_YIELD,
-                "Ljava/util/concurrent/CompletableFuture;"));
         code.add(new VarInsnNode(Opcodes.ALOAD, 9));
         code.add(new InsnNode(Opcodes.ATHROW));
         replace(method, code, 5, 10);
         method.tryCatchBlocks.add(new TryCatchBlockNode(
                 start, tryEnd, handler, "java/lang/Throwable"));
-    }
-
-    private static void writeChunkGenerationYieldHelper(Path root) throws IOException {
-        ClassNode node = new ClassNode();
-        node.version = Opcodes.V21;
-        node.access = Opcodes.ACC_PUBLIC | Opcodes.ACC_FINAL | Opcodes.ACC_SUPER;
-        node.name = CHUNK_GENERATION_YIELD;
-        node.superName = "java/lang/Object";
-        node.interfaces.add("org/teavm/platform/PlatformRunnable");
-        node.fields.add(new FieldNode(
-                Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL,
-                "future",
-                "Ljava/util/concurrent/CompletableFuture;",
-                null,
-                null));
-
-        MethodNode constructor = new MethodNode(
-                Opcodes.ACC_PUBLIC,
-                "<init>",
-                "(Ljava/util/concurrent/CompletableFuture;)V",
-                null,
-                null);
-        InsnList constructorCode = new InsnList();
-        constructorCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        constructorCode.add(new MethodInsnNode(
-                Opcodes.INVOKESPECIAL,
-                "java/lang/Object",
-                "<init>",
-                "()V",
-                false));
-        constructorCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        constructorCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
-        constructorCode.add(new FieldInsnNode(
-                Opcodes.PUTFIELD,
-                CHUNK_GENERATION_YIELD,
-                "future",
-                "Ljava/util/concurrent/CompletableFuture;"));
-        constructorCode.add(new InsnNode(Opcodes.RETURN));
-        replace(constructor, constructorCode, 2, 2);
-        node.methods.add(constructor);
-
-        MethodNode run = new MethodNode(
-                Opcodes.ACC_PUBLIC,
-                "run",
-                "()V",
-                null,
-                null);
-        InsnList runCode = new InsnList();
-        runCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        runCode.add(new FieldInsnNode(
-                Opcodes.GETFIELD,
-                CHUNK_GENERATION_YIELD,
-                "future",
-                "Ljava/util/concurrent/CompletableFuture;"));
-        runCode.add(new InsnNode(Opcodes.ACONST_NULL));
-        runCode.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL,
-                "java/util/concurrent/CompletableFuture",
-                "complete",
-                "(Ljava/lang/Object;)Z",
-                false));
-        runCode.add(new InsnNode(Opcodes.POP));
-        runCode.add(new InsnNode(Opcodes.RETURN));
-        replace(run, runCode, 2, 1);
-        node.methods.add(run);
-
-        writeComputeFrames(node, root.resolve(CHUNK_GENERATION_YIELD + ".class"));
     }
 
     private static MethodInsnNode browserWorldgenBeginTaskWork() {
