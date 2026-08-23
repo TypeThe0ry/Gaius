@@ -1787,6 +1787,59 @@ function runNetworkValidationSelfSmoke() {
   };
 }
 
+// Keep the post-ready soak contract executable without starting a Worker.  In
+// particular, a configured soak must not be satisfied by a CPU-profile timer
+// or by the first readiness callback; the stop decision is only valid once the
+// monotonic elapsed time reaches the requested duration.
+function runPostReadySoakSelfSmoke() {
+  const createModel = (configuredMs) => {
+    let completionReadyAt = 0;
+    let completedAt = 0;
+    const markCompletionReady = (at) => {
+      if (completionReadyAt !== 0) return;
+      completionReadyAt = at;
+      if (configuredMs === 0) completedAt = at;
+    };
+    const advance = (at) => {
+      if (completionReadyAt === 0 || completedAt !== 0 ||
+          at - completionReadyAt < configuredMs) {
+        return;
+      }
+      completedAt = at;
+    };
+    return {
+      markCompletionReady,
+      advance,
+      shouldStop: () => completedAt !== 0,
+      elapsedMs: () => completedAt === 0 ? 0 : completedAt - completionReadyAt,
+    };
+  };
+
+  const immediate = createModel(0);
+  immediate.markCompletionReady(1000);
+  if (!immediate.shouldStop() || immediate.elapsedMs() < 0) {
+    throw new Error("post-ready soak zero-duration self-smoke did not complete immediately");
+  }
+
+  const delayed = createModel(15_000);
+  delayed.markCompletionReady(1000);
+  delayed.advance(15_999);
+  if (delayed.shouldStop()) {
+    throw new Error("post-ready soak self-smoke stopped before 15 seconds");
+  }
+  delayed.advance(16_000);
+  if (!delayed.shouldStop() || delayed.elapsedMs() < 15_000) {
+    throw new Error("post-ready soak self-smoke did not complete at its configured duration");
+  }
+  return {
+    ok: true,
+    zeroDurationCompletesImmediately: true,
+    configuredDurationHonored: true,
+    earlyStopRejected: true,
+    elapsedMsAtCompletion: delayed.elapsedMs(),
+  };
+}
+
 const runtimeSelfTest = isMainThread && process.env.GAIUS_SMOKE_SELF_TEST === "1";
 
 if (runtimeSelfTest) {
@@ -1795,6 +1848,7 @@ if (runtimeSelfTest) {
     telemetrySnapshots: runTelemetrySnapshotSelfSmoke(),
     slowProbe: runSlowProbeSelfSmoke(),
     timeoutEvidence: runWorkerEventLoopEvidenceSelfSmoke(),
+    postReadySoak: runPostReadySoakSelfSmoke(),
   }) + "\n";
   try {
     await writeChunkAndDrain(process.stdout, selfTestOutput, {
@@ -1867,6 +1921,9 @@ if (isMainThread && !runtimeSelfTest) {
   const distanceRampIntervalMillis = process.env.GAIUS_SMOKE_DISTANCE_RAMP_MS === undefined
     ? undefined
     : Number(process.env.GAIUS_SMOKE_DISTANCE_RAMP_MS);
+  const configuredPostReadySoakMs = Number(
+    process.env.GAIUS_SMOKE_POST_READY_SOAK_MS ?? "0",
+  );
   const targetRenderDistance = Number(process.env.GAIUS_SMOKE_RENDER_DISTANCE || "7");
   const targetSimulationDistance = Number(process.env.GAIUS_SMOKE_SIMULATION_DISTANCE || "3");
   const cpuProfilePhase = process.env.GAIUS_SMOKE_CPU_PROFILE_PHASE || "";
@@ -1922,6 +1979,12 @@ if (isMainThread && !runtimeSelfTest) {
       (!Number.isFinite(distanceRampIntervalMillis) ||
         distanceRampIntervalMillis < 100 || distanceRampIntervalMillis > 2000)) {
     throw new Error("GAIUS_SMOKE_DISTANCE_RAMP_MS must be between 100 and 2000");
+  }
+  if (!Number.isFinite(configuredPostReadySoakMs) ||
+      configuredPostReadySoakMs < 0 || configuredPostReadySoakMs > 300000) {
+    throw new Error(
+      "GAIUS_SMOKE_POST_READY_SOAK_MS must be a finite number between 0 and 300000",
+    );
   }
   if (!Number.isInteger(targetRenderDistance) || targetRenderDistance < 2 ||
       targetRenderDistance > 32 || !Number.isInteger(targetSimulationDistance) ||
@@ -2064,6 +2127,11 @@ if (isMainThread && !runtimeSelfTest) {
   let postStopTelemetryBarrier = null;
   let serverCreatedAt = 0;
   let protocolReadyAt = 0;
+  let completionReadyAt = 0;
+  let postReadySoakStartedMonoMs = 0;
+  let postReadySoakCompletedAt = 0;
+  let postReadySoakCompletedMonoMs = 0;
+  let postReadySoakTimer = 0;
   let workerPhase = "startup";
   let cpuProfileActive = false;
   let cpuProfileWritten = !cpuProfilePhase;
@@ -2424,8 +2492,67 @@ if (isMainThread && !runtimeSelfTest) {
       baselineNetworkStats,
     );
   };
-  const completionReady = () => protocolReady &&
-    (stopAtFirstChunk || (distanceSyncReady && configuredDistanceReady));
+  const postReadySoakEvidence = () => {
+    const elapsedMs = completionReadyAt === 0
+      ? 0
+      : roundedMillis(
+        (postReadySoakCompletedMonoMs || performance.now()) -
+          postReadySoakStartedMonoMs,
+      );
+    return {
+      configuredMs: configuredPostReadySoakMs,
+      elapsedMs,
+      protocolReadyAt,
+      completionReadyAt,
+      completedAt: postReadySoakCompletedAt,
+      completed: postReadySoakCompletedAt !== 0,
+    };
+  };
+  const completePostReadySoak = () => {
+    if (completionReadyAt === 0 || postReadySoakCompletedAt !== 0) {
+      return;
+    }
+    postReadySoakCompletedMonoMs = performance.now();
+    postReadySoakCompletedAt = Date.now();
+    events.push({
+      type: "post-ready-soak-complete",
+      ...postReadySoakEvidence(),
+    });
+  };
+  const completionReady = () => {
+    const ready = protocolReady &&
+      (stopAtFirstChunk || (distanceSyncReady && configuredDistanceReady));
+    if (!ready) return false;
+    if (completionReadyAt === 0) {
+      completionReadyAt = Date.now();
+      postReadySoakStartedMonoMs = performance.now();
+      events.push({
+        type: "post-ready-soak-start",
+        ...postReadySoakEvidence(),
+      });
+      if (configuredPostReadySoakMs === 0) {
+        completePostReadySoak();
+      } else {
+        const waitForPostReadySoak = () => {
+          postReadySoakTimer = 0;
+          if (finished || stopFlowStarted) return;
+          const remainingMs = configuredPostReadySoakMs -
+            (performance.now() - postReadySoakStartedMonoMs);
+          if (remainingMs > 0) {
+            postReadySoakTimer = setTimeout(waitForPostReadySoak, remainingMs);
+            return;
+          }
+          completePostReadySoak();
+          maybeStop();
+        };
+        postReadySoakTimer = setTimeout(
+          waitForPostReadySoak,
+          configuredPostReadySoakMs,
+        );
+      }
+    }
+    return postReadySoakCompletedAt !== 0;
+  };
   const finishCpuProfileBeforeShutdown = async () => {
     if (!cpuProfilePhase || cpuProfileWritten) {
       return;
@@ -2499,6 +2626,10 @@ if (isMainThread && !runtimeSelfTest) {
     clearInterval(eventLoopProbeInterval);
     if (cpuProfileStopTimer) clearTimeout(cpuProfileStopTimer);
     if (coverageStopTimer) clearTimeout(coverageStopTimer);
+    if (postReadySoakTimer) {
+      clearTimeout(postReadySoakTimer);
+      postReadySoakTimer = 0;
+    }
     finishPromise = (async () => {
       let finalOutputFailed = false;
       try {
@@ -2644,6 +2775,7 @@ if (isMainThread && !runtimeSelfTest) {
       stoppedDetail: stoppedMessage.detail,
       distanceRampIntervalMillis: configuredDistanceRampIntervalMillis,
       distanceTransitionTimeline: distanceTransitionTimeline.slice(),
+      postReadySoak: postReadySoakEvidence(),
       ...protocol.snapshot(),
       chunkPriorityStats: latestChunkPriorityStats,
       networkStats: finalNetworkStats,
