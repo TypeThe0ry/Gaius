@@ -232,6 +232,32 @@ function dnsCacheRuntime(manifest) {
     return Object.fromEntries(fields.map((field) => [field, runtime[field]]));
 }
 
+function relayRuntimeSnapshot(manifest) {
+    const runtime = manifest?.runtime;
+    const integerFields = [
+        "cpuUserMicros",
+        "cpuSystemMicros",
+        "rssBytes",
+        "heapUsedBytes",
+        "serverFrameDrainBudgetYields",
+        "serverFrameMaxDrainFrames",
+        "serverFrameMaxDrainBytes",
+        "serverFrameBufferedBytes",
+        "serverFrameMaxBufferedBytes",
+        "serverFrameSendErrors",
+        "activeServerFrameDrainHandles",
+    ];
+    const numberFields = ["serverFrameMaxDrainDurationMillis"];
+    if (!integerFields.every((field) => Number.isSafeInteger(runtime?.[field]) &&
+            runtime[field] >= 0) ||
+        !numberFields.every((field) => Number.isFinite(runtime?.[field]) &&
+            runtime[field] >= 0)) {
+        return undefined;
+    }
+    const fields = [...integerFields, ...numberFields];
+    return Object.fromEntries(fields.map((field) => [field, runtime[field]]));
+}
+
 async function fetchManifest() {
     const response = await fetch(relayManifestUrl(relayUrl), {
         signal: AbortSignal.timeout(15000),
@@ -475,6 +501,10 @@ async function main() {
             baselineManifest, "external browser/bridge cleanup",
         );
         const dnsCacheAfterClose = dnsCacheRuntime(afterCloseManifest);
+        const runtimeBaseline = relayRuntimeSnapshot(baselineManifest);
+        const runtimePeak = relayRuntimeSnapshot(peakManifest);
+        const runtimeAfterSoak = relayRuntimeSnapshot(afterSoakManifest);
+        const runtimeAfterClose = relayRuntimeSnapshot(afterCloseManifest);
         const statusRtt = clients.flatMap((client) => client.statusRtt);
         const pingRtt = clients.flatMap((client) => client.pingRtt);
         const pingSent = clients.reduce((sum, client) => sum + client.pingSent, 0);
@@ -517,6 +547,12 @@ async function main() {
                     afterSoak: dnsCacheAfterSoak,
                     afterClose: dnsCacheAfterClose,
                 },
+                runtime: {
+                    baseline: runtimeBaseline,
+                    peak: runtimePeak,
+                    afterSoak: runtimeAfterSoak,
+                    afterClose: runtimeAfterClose,
+                },
             },
             browser: {
                 longestEventLoopGapMillis: Number(stats.longestEventLoopGapMillis.toFixed(3)),
@@ -547,6 +583,10 @@ async function main() {
                 dnsCacheTelemetry: dnsCacheBaseline !== undefined &&
                     dnsCachePeak !== undefined && dnsCacheAfterSoak !== undefined &&
                     dnsCacheAfterClose !== undefined,
+                runtimeTelemetry: runtimeBaseline !== undefined &&
+                    runtimePeak !== undefined &&
+                    runtimeAfterSoak !== undefined &&
+                    runtimeAfterClose !== undefined,
                 dnsLookupsShared: dnsCachePeak === undefined ? 0 :
                     (dnsCachePeak.publicDnsCacheHits -
                         (dnsCacheBaseline?.publicDnsCacheHits ?? 0)) +
@@ -569,6 +609,8 @@ async function main() {
                 "RelayNode manifest did not observe all external target connections");
             assert.ok(result.gate.dnsCacheTelemetry,
                 "RelayNode did not expose DNS cache telemetry; deployed node is stale");
+            assert.ok(result.gate.runtimeTelemetry,
+                "RelayNode did not expose drain runtime telemetry; deployed node is stale");
             assert.ok(result.gate.dnsLookupsShared >=
                 result.gate.thresholds.minimumSharedDnsLookups,
                 "RelayNode did not merge/cache same-target DNS lookups for every extra client");

@@ -377,6 +377,12 @@ assert.match(relayMain, /armClientStallTimer\(\);/);
 assert.match(relayMain, /clearClientStallTimer\(\);/);
 assert.match(relayMain, /"runtime-telemetry"/);
 assert.match(relayMain, /runtime: relayRuntimeSnapshot\(\)/);
+assert.match(relayMain, /const maximumServerFrameDrainFrames = 32/);
+assert.match(relayMain, /const maximumServerFrameDrainBytes = 512 \* 1024/);
+assert.match(relayMain, /const maximumServerFrameDrainMillis = 2/);
+assert.match(relayMain, /serverFrameTelemetry\.drainBudgetYields\+\+/);
+assert.match(relayMain, /serverFrameTelemetry\.maxDrainDurationMillis/);
+assert.match(relayMain, /if \(drainBudgetYielded\) \{\s+serverFrameDrainRescheduleRequested = true;/);
 assert.match(relayMain, /const publicDnsCache = new Map\(\)/);
 assert.match(relayMain, /const publicDnsCacheTtlMs = 5_000/);
 assert.match(relayMain, /httpServer\.on\("upgrade", \(request, socket, head\) => \{\s+\/\/ Minecraft status[\s\S]*?socket\.setNoDelay\(true\);\s+socket\.setKeepAlive\(true, 30_000\);/);
@@ -401,6 +407,8 @@ assert.match(externalMultiplayerSource, /if \(client\.pingSent > 0 \|\| client\.
 assert.match(externalMultiplayerSource, /client\.closed = true;\s+client\.failure = String\(error\?\.stack \|\| error\);/);
 assert.match(externalMultiplayerSource, /client\.pingSent === 0/);
 assert.match(externalMultiplayerSource, /dnsCacheTelemetry/);
+assert.match(externalMultiplayerSource, /function relayRuntimeSnapshot\(manifest\)/);
+assert.match(externalMultiplayerSource, /runtimeTelemetry/);
 assert.match(externalMultiplayerSource, /dnsLookupsShared/);
 assert.match(externalMultiplayerSource, /minimumSharedDnsLookups/);
 assert.doesNotMatch(
