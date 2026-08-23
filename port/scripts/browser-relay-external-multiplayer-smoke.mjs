@@ -262,6 +262,7 @@ function createClient(id, bridge, stats) {
         statusPayload: undefined,
         pingSent: 0,
         pingResponses: 0,
+        closed: false,
         unexpectedPackets: 0,
         lastInboundAt: 0,
     };
@@ -275,10 +276,22 @@ function createClient(id, bridge, stats) {
         client.send(Buffer.concat([encodeStatusHandshake(), encodeStatusRequest()]));
     };
     client.sendPing = () => {
+        if (client.pingSent > 0 || client.closed || !bridge.channels.has(id)) {
+            return false;
+        }
         const token = Math.round(performance.now() * 1000);
         client.pendingPings.set(token, performance.now());
         client.pingSent++;
-        client.send(encodePing(token));
+        try {
+            client.send(encodePing(token));
+            return true;
+        }
+        catch (error) {
+            client.closed = true;
+            client.failure = String(error?.stack || error);
+            client.pendingPings.delete(token);
+            return false;
+        }
     };
     client.consume = () => {
         let chunk;
@@ -387,13 +400,17 @@ async function main() {
             try {
                 const error = bridge.pollError(client.id);
                 if (error) client.failure = error;
+                if (!bridge.channels.has(client.id)) {
+                    client.closed = true;
+                    continue;
+                }
                 client.consume();
                 if (!client.connected && phaseFor(stats, client.id, "relay-connected")) {
                     client.connected = true;
                     client.sendInitial();
                 }
-                if (enablePing && client.statusReceivedAt > 0 &&
-                    performance.now() >= client.nextPingAt) {
+                if (enablePing && !client.closed && client.statusReceivedAt > 0 &&
+                    client.pingSent === 0 && performance.now() >= client.nextPingAt) {
                     client.sendPing();
                     client.nextPingAt = performance.now() + pingIntervalMillis;
                 }
@@ -416,6 +433,13 @@ async function main() {
             () => clients.map((client) => ({ id: client.id, statusResponses: client.statusResponses,
                 failure: client.failure, bufferBytes: client.buffer.byteLength })),
         );
+        // STATUS ping is a terminal probe for many Minecraft proxies: after
+        // returning the pong, the server is allowed to close the STATUS TCP
+        // stream. Capture target activity before issuing that probe so a
+        // normal status close cannot erase the peak-concurrency evidence.
+        const peakManifest = await waitForTargetConnections(
+            baselineManifest, clients.length,
+        );
         if (enablePing) {
             await waitFor(
                 () => clients.every((client) => client.pingResponses >= 1),
@@ -424,9 +448,6 @@ async function main() {
                     pingResponses: client.pingResponses })),
             );
         }
-        const peakManifest = await waitForTargetConnections(
-            baselineManifest, clients.length,
-        );
         const soakStartedAt = performance.now();
         await waitFor(
             () => performance.now() - soakStartedAt >= soakMillis,

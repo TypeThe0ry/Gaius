@@ -379,6 +379,7 @@ assert.match(relayMain, /"runtime-telemetry"/);
 assert.match(relayMain, /runtime: relayRuntimeSnapshot\(\)/);
 assert.match(relayMain, /const publicDnsCache = new Map\(\)/);
 assert.match(relayMain, /const publicDnsCacheTtlMs = 5_000/);
+assert.match(relayMain, /httpServer\.on\("upgrade", \(request, socket, head\) => \{\s+\/\/ Minecraft status[\s\S]*?socket\.setNoDelay\(true\);\s+socket\.setKeepAlive\(true, 30_000\);/);
 assert.match(relayMain, /const maximumPublicDnsCacheEntries = 1024/);
 assert.match(relayMain, /let publicDnsCacheHits = 0/);
 assert.match(relayMain, /let publicDnsCacheMisses = 0/);
@@ -394,6 +395,11 @@ const externalMultiplayerSource = await readFile(
     "utf8",
 );
 assert.match(externalMultiplayerSource, /function dnsCacheRuntime\(manifest\)/);
+assert.match(externalMultiplayerSource, /Capture target activity before issuing that probe/);
+assert.match(externalMultiplayerSource, /if \(!bridge\.channels\.has\(client\.id\)\)/);
+assert.match(externalMultiplayerSource, /if \(client\.pingSent > 0 \|\| client\.closed \|\| !bridge\.channels\.has\(id\)\)/);
+assert.match(externalMultiplayerSource, /client\.closed = true;\s+client\.failure = String\(error\?\.stack \|\| error\);/);
+assert.match(externalMultiplayerSource, /client\.pingSent === 0/);
 assert.match(externalMultiplayerSource, /dnsCacheTelemetry/);
 assert.match(externalMultiplayerSource, /dnsLookupsShared/);
 assert.match(externalMultiplayerSource, /minimumSharedDnsLookups/);
