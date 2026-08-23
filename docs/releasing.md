@@ -32,7 +32,7 @@ for profile in 1.21.11 26.2; do
   ./port/scripts/remap-client.sh
   bash port/scripts/build-version-release.sh "$profile"
   python3 port/scripts/quick-check.py
-  GAIUS_SMOKE_MAX_GAMEPLAY_STALL_MS=10000 \
+  GAIUS_SMOKE_MAX_GAMEPLAY_STALL_MS=500 \
     node port/scripts/singleplayer-worker-runtime-smoke.mjs
 done
 env -u GAIUS_BUILD_ROOT -u GAIUS_OVERLAY_DIRECTORY -u GAIUS_DIST_DIRECTORY \

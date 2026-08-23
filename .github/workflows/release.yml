@@ -80,7 +80,10 @@ jobs:
 
       - name: Verify profile artifact identity and runtime smoke
         env:
-          GAIUS_SMOKE_MAX_GAMEPLAY_STALL_MS: "10000"
+          # Keep the release gate aligned with the measured runtime contract.
+          # A relaxed value would allow multi-second Worker/event-loop stalls
+          # to ship as a passing profile build.
+          GAIUS_SMOKE_MAX_GAMEPLAY_STALL_MS: "500"
         run: |
           set -euo pipefail
           python3 port/scripts/quick-check.py
