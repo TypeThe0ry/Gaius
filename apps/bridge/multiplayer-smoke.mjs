@@ -283,6 +283,11 @@ try {
             !Number.isSafeInteger(manifest.runtime?.publicDnsCacheInflightJoins)) {
         throw new Error("Translator node manifest did not describe the tunnel capability");
     }
+    if (manifest.activeConnections !== 0 ||
+            manifest.runtime?.activeTunnelLeases !== 0 ||
+            manifest.runtime?.activeTransportWebSockets !== 0) {
+        throw new Error("Translator node baseline retained a logical or physical tunnel");
+    }
     const deniedTargetResponse = await fetchTargetManifest(
             bridgePort, fixturePort, undefined);
     if (deniedTargetResponse.status !== 403) {
@@ -348,6 +353,11 @@ try {
             targetActive.target?.recentlyReachable !== true ||
             targetActive.target?.totalConnections !== 1) {
         throw new Error("Translator node did not publish active target affinity");
+    }
+    if (targetActive.activeConnections !== 1 ||
+            targetActive.runtime?.activeTunnelLeases !== 1 ||
+            targetActive.runtime?.activeTransportWebSockets !== 1) {
+        throw new Error("Translator node did not publish the active logical/physical tunnel");
     }
 
     const healthResponse = await fetch(`http://${host}:${bridgePort}/health`, {
@@ -447,6 +457,13 @@ try {
         throw new Error("Translator node did not retain recent target affinity after close: " +
             JSON.stringify(targetRecent));
     }
+    const afterCloseRuntime = await waitForRelayRuntime(
+        bridgePort,
+        bridgeToken,
+        (runtime) => runtime.activeTunnelLeases === 0 &&
+            runtime.activeTransportWebSockets === 0,
+        "logical and physical tunnel cleanup",
+    );
 
     const sharedTargetLifecycle = await testSharedTargetLifecycle(bridgePort, bridgeToken);
     await testFramedPlayKeepAlive(bridgePort, fixturePort);
@@ -488,6 +505,8 @@ try {
             targetAffinityMs: manifest.targetAffinityMs,
             targetActiveConnections: targetActive.target.activeConnections,
             targetRecentlyReachable: targetRecent.recentlyReachable,
+            activeTunnelLeasesAfterClose: afterCloseRuntime.activeTunnelLeases,
+            activeTransportWebSocketsAfterClose: afterCloseRuntime.activeTransportWebSockets,
         },
         ...(minecraftLogin === undefined ? {} : { minecraftLogin }),
     }));

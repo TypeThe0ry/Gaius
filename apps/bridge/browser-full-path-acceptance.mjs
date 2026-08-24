@@ -57,6 +57,10 @@ const relayRuntimeGauges = Object.freeze([
     "activeServerFrameDrainTimers",
     "activeClientStallTimers",
 ]);
+const relayRuntimeConnectionGauges = Object.freeze([
+    "activeTunnelLeases",
+    "activeTransportWebSockets",
+]);
 const browserCleanupGauges = Object.freeze([
     "activeHighWatermarks",
     "decodedSliceBacklog",
@@ -71,6 +75,7 @@ const requiredChildAcceptance = Object.freeze({
     ...requiredAcceptance,
     profiles: [...profiles],
     relayRuntimeGaugesZero: [...relayRuntimeGauges],
+    relayRuntimeConnectionGauges: [...relayRuntimeConnectionGauges],
     browserCleanupGaugesZero: [...browserCleanupGauges],
     syntheticMarkerLabel: "synthetic-inbound-marker",
     runtimeJavaPolicy,
@@ -183,6 +188,7 @@ else {
             profileOrder: [...profiles],
             canonicalProfiles,
             relayRuntimeGaugesZero: [...relayRuntimeGauges],
+            relayRuntimeConnectionGauges: [...relayRuntimeConnectionGauges],
             browserCleanupGaugesZero: [...browserCleanupGauges],
             syntheticMarkerLabel: "synthetic-inbound-marker",
             runtimeJavaPolicy,
@@ -633,6 +639,9 @@ function validateChildResult(profile, report, processState) {
         "performance runtime Java policy");
     exact(report.performanceContract?.multiplayerPerformance,
         multiplayerPerformanceTarget, "performance multiplayer no-stall contract");
+    equal(JSON.stringify(report.performanceContract?.relayRuntimeConnectionGauges),
+        JSON.stringify([...relayRuntimeConnectionGauges]),
+        "performance RelayNode connection gauge contract");
     equal(JSON.stringify(report.performanceContract?.canonicalProfiles?.[profile]),
         JSON.stringify({
             protocolVersion: expected.protocolVersion,
@@ -707,6 +716,8 @@ function validateChildResult(profile, report, processState) {
 
     checkGaugeEvidence(observed?.finalCleanup?.relayRuntimeGauges,
         "observed final RelayNode gauges", failures, add, equal);
+    checkConnectionGaugeEvidence(observed?.finalCleanup?.relayRuntimeConnectionGauges,
+        "observed final RelayNode connection gauges", 0, failures, add, equal);
     checkGaugeEvidence(observed?.finalCleanup?.browserCleanupGauges,
         "observed final browser cleanup gauges", failures, add, equal,
         browserCleanupGauges);
@@ -730,6 +741,9 @@ function validateChildResult(profile, report, processState) {
             checkReconnectGaugeEvidence(wave?.relayRuntimeGauges,
                 `observed reconnect wave ${index + 1} RelayNode gauges`,
                 failures, add, equal);
+            checkReconnectConnectionGaugeEvidence(wave?.relayRuntimeConnectionGauges,
+                `observed reconnect wave ${index + 1} RelayNode connection gauges`,
+                failures, add, equal);
         }
     }
     if (array(actual?.reconnectWaves)) {
@@ -743,6 +757,9 @@ function validateChildResult(profile, report, processState) {
                 failures, add, equal);
             checkReconnectGaugeEvidence(wave?.relayRuntimeGauges,
                 `actual reconnect wave ${index + 1} RelayNode gauges`,
+                failures, add, equal);
+            checkReconnectConnectionGaugeEvidence(wave?.relayRuntimeConnectionGauges,
+                `actual reconnect wave ${index + 1} RelayNode connection gauges`,
                 failures, add, equal);
         }
     }
@@ -780,6 +797,12 @@ function validateChildResult(profile, report, processState) {
                 `${label} after-drop RelayNode gauges`, failures, add, equal);
             checkGaugeEvidence(wave?.relay?.runtimeGauges?.atMinimumChunks,
                 `${label} at-chunks RelayNode gauges`, failures, add, equal);
+            checkConnectionGaugeEvidence(wave?.relay?.runtimeConnectionGauges?.afterDrop,
+                `${label} after-drop RelayNode connection gauges`, 0,
+                failures, add, equal);
+            checkConnectionGaugeEvidence(wave?.relay?.runtimeConnectionGauges?.atMinimumChunks,
+                `${label} at-chunks RelayNode connection gauges`,
+                requiredAcceptance.clients, failures, add, equal);
             checkTransportDrop(wave?.transportDrop, label, failures, add, equal);
             checkHealth(wave?.health, `${label} health`, failures, add, equal);
         }
@@ -847,6 +870,18 @@ function checkReconnectGaugeEvidence(evidence, label, failures, add, equal) {
     }
     checkGaugeEvidence(evidence.afterDrop, `${label} afterDrop`, failures, add, equal);
     checkGaugeEvidence(evidence.atMinimumChunks, `${label} atMinimumChunks`,
+        failures, add, equal);
+}
+
+function checkReconnectConnectionGaugeEvidence(evidence, label, failures, add, equal) {
+    if (evidence === null || typeof evidence !== "object" || Array.isArray(evidence)) {
+        failures.push(`${label}: reconnect connection gauge evidence is missing`);
+        return;
+    }
+    checkConnectionGaugeEvidence(evidence.afterDrop, `${label} afterDrop`, 0,
+        failures, add, equal);
+    checkConnectionGaugeEvidence(evidence.atMinimumChunks,
+        `${label} atMinimumChunks`, requiredAcceptance.clients,
         failures, add, equal);
 }
 
@@ -964,6 +999,9 @@ function checkHealth(health, label, failures, add, equal) {
         `${label} Relay target active connections`);
     checkGaugeEvidence(health.observed?.relayRuntimeGauges,
         `${label} RelayNode gauges`, failures, add, equal);
+    checkConnectionGaugeEvidence(health.observed?.relayRuntimeConnectionGauges,
+        `${label} RelayNode connection gauges`, requiredAcceptance.clients,
+        failures, add, equal);
 }
 
 function checkGaugeEvidence(evidence, label, failures, add, equal,
@@ -982,6 +1020,24 @@ function checkGaugeEvidence(evidence, label, failures, add, equal,
         `${label} field names`);
     for (const name of fields) {
         equal(evidence.observed?.[name], 0, `${label}.${name}`);
+    }
+}
+
+function checkConnectionGaugeEvidence(evidence, label, expected, failures, add, equal,
+    fields = relayRuntimeConnectionGauges) {
+    if (evidence === null || typeof evidence !== "object" || Array.isArray(evidence)) {
+        failures.push(`${label}: connection gauge evidence is missing`);
+        return;
+    }
+    equal(evidence.available, true, `${label} available`);
+    if (Array.isArray(evidence.missing)) {
+        equal(evidence.missing.length, 0, `${label} missing fields`);
+    }
+    else failures.push(`${label}: missing field list is absent`);
+    equal(JSON.stringify(evidence.fields), JSON.stringify([...fields]),
+        `${label} field names`);
+    for (const name of fields) {
+        equal(evidence.observed?.[name], expected, `${label}.${name}`);
     }
 }
 
@@ -1043,6 +1099,8 @@ function checkRelaySnapshots(relayRuntime, expectedConnections, failures, add, e
         "Relay baseline target evidence availability");
     checkGaugeEvidence(relayRuntime.baseline?.runtimeGaugeEvidence,
         "Relay baseline gauges", failures, add, equal);
+    checkConnectionGaugeEvidence(relayRuntime.baseline?.runtimeConnectionGaugeEvidence,
+        "Relay baseline connection gauges", 0, failures, add, equal);
     for (const [name, snapshot, totalConnections] of [
         ["atMinimumChunks", relayRuntime.atMinimumChunks, requiredAcceptance.clients],
         ["beforeSoak", relayRuntime.beforeSoak, expectedConnections],
@@ -1056,10 +1114,15 @@ function checkRelaySnapshots(relayRuntime, expectedConnections, failures, add, e
             `Relay ${name} target total connections`);
         checkGaugeEvidence(snapshot?.runtimeGaugeEvidence,
             `Relay ${name} gauges`, failures, add, equal);
+        checkConnectionGaugeEvidence(snapshot?.runtimeConnectionGaugeEvidence,
+            `Relay ${name} connection gauges`, requiredAcceptance.clients,
+            failures, add, equal);
     }
     checkRelayCleanup(relayRuntime.afterClose, "Relay afterClose", failures, equal);
     checkGaugeEvidence(relayRuntime.afterClose?.runtimeGaugeEvidence,
         "Relay afterClose gauges", failures, add, equal);
+    checkConnectionGaugeEvidence(relayRuntime.afterClose?.runtimeConnectionGaugeEvidence,
+        "Relay afterClose connection gauges", 0, failures, add, equal);
 }
 
 function checkRelayCleanup(relay, label, failures, equal) {

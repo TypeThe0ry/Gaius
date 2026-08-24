@@ -71,6 +71,11 @@ if (acceptanceEnvironment !== undefined && acceptanceEnvironment !== "0" &&
 }
 const acceptanceMode = commandLineArguments.includes("--acceptance") ||
     acceptanceEnvironment === "1";
+// A strict acceptance run must prove the RelayNode-side lifecycle as well as
+// browser/client cleanup, including when the node is external.  The
+// compatible external smoke remains usable for nodes that predate the
+// runtime-gauge contract, but it is never evidence for strict no-stall release.
+const relayRuntimeTelemetryRequired = !externalMode || acceptanceMode;
 const STRICT_ACCEPTANCE_TARGET = Object.freeze({
     clients: 4,
     minimumChunkPackets: 9,
@@ -101,6 +106,14 @@ const RELAY_RUNTIME_GAUGES = Object.freeze([
     "activeServerFrameDrainHandles",
     "activeServerFrameDrainTimers",
     "activeClientStallTimers",
+]);
+// These are connection-state gauges rather than zero-only worker gauges.  A
+// strict run must observe exactly the client count while PLAY is live and zero
+// after each transport/final-close boundary; otherwise a node can report a
+// clean worker while retaining a logical lease or physical WebSocket.
+const RELAY_RUNTIME_CONNECTION_GAUGES = Object.freeze([
+    "activeTunnelLeases",
+    "activeTransportWebSockets",
 ]);
 const RELAY_DRAIN_MAX_DURATION_MILLIS = 16.7;
 // Multiplayer acceptance is intentionally bounded by observed transport and
@@ -325,6 +338,13 @@ try {
             waitForRelayRuntimeReader(readRelayRuntime, predicate, label, timeoutMillis);
     }
     relayRuntimeBaseline = await readRelayRuntime();
+    if (relayRuntimeTelemetryRequired) {
+        assertRelayRuntimeConnectionGauges(
+            relayRuntimeBaseline,
+            0,
+            "RelayNode baseline logical/physical connection gauges",
+        );
+    }
 
     browserRuntime = await createBrowserRuntime(relayEndpoint.url, relayToken);
     const createClients = (wave) => Array.from({ length: clientCount }, (_, index) =>
@@ -365,11 +385,18 @@ try {
         relayRuntimeAtChunks = await waitRelayRuntime(
             (snapshot) => snapshot.activeConnections === clientCount &&
                 snapshot.target?.activeConnections === clientCount &&
-                (externalMode || relayRuntimeGaugesAreZero(snapshot)),
+                (!relayRuntimeTelemetryRequired ||
+                    relayRuntimeConnectionGaugesEqual(snapshot, clientCount)) &&
+                (!relayRuntimeTelemetryRequired || relayRuntimeGaugesAreZero(snapshot)),
             "initial RelayNode active tunnel quiescence",
             5000,
         );
-        if (!externalMode) {
+        if (relayRuntimeTelemetryRequired) {
+            assertRelayRuntimeConnectionGauges(
+                relayRuntimeAtChunks,
+                clientCount,
+                "initial RelayNode logical/physical connection gauges",
+            );
             assertRelayRuntimeGaugesZero(relayRuntimeAtChunks,
                 "initial active tunnel gauge check");
             assertRelayDrainPerformance(
@@ -447,12 +474,19 @@ try {
                     clientCount * wave,
                     `reconnect wave ${wave} changed target totals while dropping`);
             }
-            const relayAfterDropGauges = externalMode
-                ? relayRuntimeGaugeEvidence(relayAfterDrop)
-                : assertRelayRuntimeGaugesZero(
+            const relayAfterDropGauges = relayRuntimeTelemetryRequired
+                ? assertRelayRuntimeGaugesZero(
                     relayAfterDrop,
                     `reconnect wave ${wave} abnormal-drop cleanup`,
+                )
+                : relayRuntimeGaugeEvidence(relayAfterDrop);
+            if (relayRuntimeTelemetryRequired) {
+                assertRelayRuntimeConnectionGauges(
+                    relayAfterDrop,
+                    0,
+                    `reconnect wave ${wave} abnormal-drop logical/physical cleanup`,
                 );
+            }
 
             const javaFinalCloseAt = performance.now();
             for (const client of previousClients) client.close("java-final-close");
@@ -529,7 +563,9 @@ try {
                 (snapshot) => snapshot.activeConnections === clientCount &&
                     snapshot.target?.activeConnections === clientCount &&
                     snapshot.target?.totalConnections === clientCount * (wave + 1) &&
-                    (externalMode || relayRuntimeGaugesAreZero(snapshot)),
+                    (!relayRuntimeTelemetryRequired ||
+                        relayRuntimeConnectionGaugesEqual(snapshot, clientCount)) &&
+                    (!relayRuntimeTelemetryRequired || relayRuntimeGaugesAreZero(snapshot)),
                 `reconnect wave ${wave} RelayNode active tunnel quiescence`,
                 5000,
             );
@@ -553,13 +589,18 @@ try {
                     clientCount * (wave + 1),
                     `reconnect wave ${wave} target connection count was not monotonic`);
             }
-            const relayAtChunksGauges = externalMode
-                ? relayRuntimeGaugeEvidence(relayAtChunks)
-                : assertRelayRuntimeGaugesZero(
+            const relayAtChunksGauges = relayRuntimeTelemetryRequired
+                ? assertRelayRuntimeGaugesZero(
                     relayAtChunks,
                     `reconnect wave ${wave} active tunnel gauge check`,
+                )
+                : relayRuntimeGaugeEvidence(relayAtChunks);
+            if (relayRuntimeTelemetryRequired) {
+                assertRelayRuntimeConnectionGauges(
+                    relayAtChunks,
+                    clientCount,
+                    `reconnect wave ${wave} active logical/physical connection gauges`,
                 );
-            if (!externalMode) {
                 assertRelayDrainPerformance(
                     [relayAfterDrop, relayAtChunks],
                     `reconnect wave ${wave} multiplayer drain`,
@@ -629,6 +670,10 @@ try {
                         afterDrop: relayAfterDropGauges,
                         atMinimumChunks: relayAtChunksGauges,
                     },
+                    runtimeConnectionGauges: {
+                        afterDrop: relayRuntimeConnectionGaugeEvidence(relayAfterDrop),
+                        atMinimumChunks: relayRuntimeConnectionGaugeEvidence(relayAtChunks),
+                    },
                     reconnectDelta: relayRuntimeDelta(relayAfterDrop, relayAtChunks),
                 },
                 health: replacementHealth,
@@ -650,7 +695,9 @@ try {
         relayRuntimeAfterSoak = await waitRelayRuntime(
             (snapshot) => snapshot.activeConnections === clientCount &&
                 snapshot.target?.activeConnections === clientCount &&
-                (externalMode || relayRuntimeGaugesAreZero(snapshot)),
+                (!relayRuntimeTelemetryRequired ||
+                    relayRuntimeConnectionGaugesEqual(snapshot, clientCount)) &&
+                (!relayRuntimeTelemetryRequired || relayRuntimeGaugesAreZero(snapshot)),
             "post-soak RelayNode active tunnel quiescence",
             5000,
         );
@@ -664,7 +711,12 @@ try {
         for (const client of currentClients) {
             assertClientPerformance(client, `post-soak client ${client.id}`);
         }
-        if (!externalMode) {
+        if (relayRuntimeTelemetryRequired) {
+            assertRelayRuntimeConnectionGauges(
+                relayRuntimeAfterSoak,
+                clientCount,
+                "post-soak logical/physical connection gauges",
+            );
             assertRelayDrainPerformance(
                 [relayRuntimeAfterSoak],
                 "post-soak multiplayer drain",
@@ -759,6 +811,8 @@ try {
     if (!externalMode) {
         assert.equal(relayRuntimeAfterSoak.target.totalConnections, expectedConnections,
             "RelayNode target route did not count every reconnect tunnel");
+    }
+    if (relayRuntimeTelemetryRequired) {
         assertRelayRuntimeGaugesZero(relayRuntimeAtChunks,
             "encrypted online-mode tunnels retained RelayNode runtime gauges");
         assertRelayRuntimeGaugesZero(relayRuntimeAfterSoak,
@@ -771,6 +825,13 @@ try {
     if (!externalMode) {
         assert.equal(relayRuntimeAfterClose?.target?.totalConnections, expectedConnections,
             "RelayNode final target connection count omitted a reconnect tunnel");
+    }
+    if (relayRuntimeTelemetryRequired) {
+        assertRelayRuntimeConnectionGauges(
+            relayRuntimeAfterClose,
+            0,
+            "RelayNode retained a logical/physical connection after browser cleanup",
+        );
         assertRelayRuntimeGaugesZero(relayRuntimeAfterClose,
             "RelayNode retained a runtime gauge after browser cleanup");
         assertRelayDrainPerformance(
@@ -802,6 +863,7 @@ try {
                     ...STRICT_ACCEPTANCE_TARGET,
                     profiles: Object.keys(CANONICAL_PROFILES),
                     relayRuntimeGaugesZero: [...RELAY_RUNTIME_GAUGES],
+                    relayRuntimeConnectionGauges: [...RELAY_RUNTIME_CONNECTION_GAUGES],
                     relayDrainMaxDurationMillis: RELAY_DRAIN_MAX_DURATION_MILLIS,
                     relayDrainSendErrors: 0,
                     relayDrainCleanupRequired: true,
@@ -816,6 +878,7 @@ try {
                     soakMillis: soakMs,
                     reconnectWaves,
                     relayRuntimeGaugesZero: [...RELAY_RUNTIME_GAUGES],
+                    relayRuntimeConnectionGauges: [...RELAY_RUNTIME_CONNECTION_GAUGES],
                     relayDrainMaxDurationMillis: RELAY_DRAIN_MAX_DURATION_MILLIS,
                     relayDrainSendErrors: 0,
                     relayDrainCleanupRequired: true,
@@ -852,6 +915,7 @@ try {
                     health: wave.health,
                     syntheticMarkerLabel: wave.transportDrop.syntheticMarkerLabel,
                     relayRuntimeGauges: wave.relay.runtimeGauges,
+                    relayRuntimeConnectionGauges: wave.relay.runtimeConnectionGauges,
                 })),
                 finalCleanup: {
                     browser: browserRuntimeSnapshot(browserRuntime),
@@ -859,6 +923,8 @@ try {
                         browserRuntimeSnapshot(browserRuntime)),
                     relay: relayRuntimeAfterClose,
                     relayRuntimeGauges: relayRuntimeGaugeEvidence(relayRuntimeAfterClose),
+                    relayRuntimeConnectionGauges:
+                        relayRuntimeConnectionGaugeEvidence(relayRuntimeAfterClose),
                 },
             },
             actual: {
@@ -870,6 +936,7 @@ try {
                     health: wave.health,
                     syntheticMarkerLabel: wave.transportDrop.syntheticMarkerLabel,
                     relayRuntimeGauges: wave.relay.runtimeGauges,
+                    relayRuntimeConnectionGauges: wave.relay.runtimeConnectionGauges,
                 })),
                 serverJarSha1: verifiedServerJar?.sha1 ?? null,
                 runtimeJavaMajor: runtimeJava?.major ?? null,
@@ -1752,6 +1819,42 @@ function relayRuntimeGaugeEvidence(snapshot) {
     };
 }
 
+function relayRuntimeConnectionGaugeEvidence(snapshot) {
+    const runtime = snapshot?.runtime;
+    const observed = Object.fromEntries(RELAY_RUNTIME_CONNECTION_GAUGES.map((name) => [
+        name,
+        runtime !== undefined && Object.prototype.hasOwnProperty.call(runtime, name)
+            ? runtime[name]
+            : null,
+    ]));
+    const missing = RELAY_RUNTIME_CONNECTION_GAUGES.filter((name) =>
+        !Number.isSafeInteger(observed[name]) || observed[name] < 0);
+    return {
+        source: "/relay-node/v1.runtime",
+        fields: [...RELAY_RUNTIME_CONNECTION_GAUGES],
+        observed,
+        missing,
+        available: missing.length === 0,
+    };
+}
+
+function relayRuntimeConnectionGaugesEqual(snapshot, expected) {
+    const evidence = relayRuntimeConnectionGaugeEvidence(snapshot);
+    return evidence.available && RELAY_RUNTIME_CONNECTION_GAUGES.every((name) =>
+        evidence.observed[name] === expected);
+}
+
+function assertRelayRuntimeConnectionGauges(snapshot, expected, label) {
+    const evidence = relayRuntimeConnectionGaugeEvidence(snapshot);
+    assert.deepEqual(evidence.missing, [],
+        `${label}: RelayNode connection telemetry omitted required gauges: ` +
+        JSON.stringify(evidence));
+    assert.deepEqual(evidence.observed,
+        Object.fromEntries(RELAY_RUNTIME_CONNECTION_GAUGES.map((name) => [name, expected])),
+        `${label}: RelayNode logical/physical connection gauges drifted`);
+    return evidence;
+}
+
 function relayRuntimeGaugesAreZero(snapshot) {
     const evidence = relayRuntimeGaugeEvidence(snapshot);
     return evidence.available && evidence.allZero;
@@ -1792,7 +1895,9 @@ function assertRelayDrainPerformance(snapshots, label) {
 function relayRuntimeIsClean(snapshot) {
     return snapshot !== undefined && snapshot.activeConnections === 0 &&
         (snapshot.target === undefined || snapshot.target.activeConnections === 0) &&
-        (externalMode || relayRuntimeGaugesAreZero(snapshot));
+        (!relayRuntimeTelemetryRequired ||
+            (relayRuntimeGaugesAreZero(snapshot) &&
+                relayRuntimeConnectionGaugesEqual(snapshot, 0)));
 }
 
 function clientLivenessEvidence(client) {
@@ -2004,7 +2109,14 @@ function assertSoakLiveness(clients, browser, relay, label) {
         `${label}: external RelayNode target connection count drifted`);
     }
     const relayGauges = relayRuntimeGaugeEvidence(relay);
-    if (!externalMode) assertRelayRuntimeGaugesZero(relay, `${label}: RelayNode gauges`);
+    if (relayRuntimeTelemetryRequired) {
+        assertRelayRuntimeConnectionGauges(
+            relay,
+            clientCount,
+            `${label}: RelayNode logical/physical connection gauges`,
+        );
+        assertRelayRuntimeGaugesZero(relay, `${label}: RelayNode gauges`);
+    }
     return {
         required: {
             clientCount,
@@ -2030,6 +2142,7 @@ function assertSoakLiveness(clients, browser, relay, label) {
                 targetActiveConnections: relay.target.activeConnections,
             },
             relayRuntimeGauges: relayGauges,
+            relayRuntimeConnectionGauges: relayRuntimeConnectionGaugeEvidence(relay),
         },
         ok: true,
     };
@@ -2157,8 +2270,10 @@ function browserFullPathPerformanceContract() {
         externalRelay: externalMode ? {
             relayUrl: externalRelayUrl,
             target: externalTarget?.text,
-            runtimeTelemetryRequired: false,
-            note: "External node runtime gauges are optional evidence; browser/client PLAY and cleanup remain required",
+            runtimeTelemetryRequired: relayRuntimeTelemetryRequired,
+            note: relayRuntimeTelemetryRequired
+                ? "Strict acceptance requires complete RelayNode runtime gauges and zero-state cleanup"
+                : "Compatible external smoke records runtime gauges when available; use --acceptance for release evidence",
         } : null,
         configurationPrompts: {
             autoAccept: acceptServerPrompts,
@@ -2170,6 +2285,7 @@ function browserFullPathPerformanceContract() {
         strictAcceptanceTarget: acceptanceMode ? { ...STRICT_ACCEPTANCE_TARGET } : null,
         canonicalProfiles: CANONICAL_PROFILES,
         relayRuntimeGauges: [...RELAY_RUNTIME_GAUGES],
+        relayRuntimeConnectionGauges: [...RELAY_RUNTIME_CONNECTION_GAUGES],
         relayDrainMaxDurationMillis: RELAY_DRAIN_MAX_DURATION_MILLIS,
         relayDrainSendErrors: 0,
         relayDrainCleanupRequired: true,
@@ -2257,9 +2373,11 @@ async function fetchRelayRuntime(port, targetPort) {
         ? targetManifest
         : undefined;
     const runtimeGaugeEvidence = relayRuntimeGaugeEvidence(manifest);
-    if (acceptanceMode && !runtimeGaugeEvidence.available) {
+    const runtimeConnectionGaugeEvidence = relayRuntimeConnectionGaugeEvidence(manifest);
+    if (acceptanceMode &&
+            (!runtimeGaugeEvidence.available || !runtimeConnectionGaugeEvidence.available)) {
         throw new Error("strict acceptance requires every RelayNode runtime gauge: " +
-            JSON.stringify(runtimeGaugeEvidence));
+            JSON.stringify({ runtimeGaugeEvidence, runtimeConnectionGaugeEvidence }));
     }
     return {
         activeConnections: manifest.activeConnections,
@@ -2280,6 +2398,7 @@ async function fetchRelayRuntime(port, targetPort) {
         },
         runtime: manifest.runtime,
         runtimeGaugeEvidence,
+        runtimeConnectionGaugeEvidence,
     };
 }
 
@@ -2311,6 +2430,25 @@ async function fetchExternalRelayRuntime(relayUrl, target, token) {
             Number.isSafeInteger(targetManifest.lastSuccessAgeMs));
     const activeConnections = Number.isSafeInteger(body?.activeConnections)
         ? body.activeConnections : undefined;
+    const runtime = body?.runtime !== undefined && typeof body.runtime === "object"
+        ? body.runtime : undefined;
+    const runtimeGaugeEvidence = relayRuntimeGaugeEvidence({ runtime });
+    const runtimeConnectionGaugeEvidence = relayRuntimeConnectionGaugeEvidence({ runtime });
+    if (acceptanceMode) {
+        if (!body?.capabilities?.includes("runtime-telemetry") ||
+            !Number.isSafeInteger(runtime?.rssBytes) ||
+            !Number.isSafeInteger(runtime?.cpuUserMicros) ||
+            !Number.isSafeInteger(runtime?.cpuSystemMicros)) {
+            throw new Error("strict acceptance requires bounded external RelayNode performance telemetry");
+        }
+        if (!Number.isSafeInteger(activeConnections) || !targetAvailable) {
+            throw new Error("strict acceptance requires complete external RelayNode connection telemetry");
+        }
+        if (!runtimeGaugeEvidence.available || !runtimeConnectionGaugeEvidence.available) {
+            throw new Error("strict acceptance requires every external RelayNode runtime gauge: " +
+                JSON.stringify({ runtimeGaugeEvidence, runtimeConnectionGaugeEvidence }));
+        }
+    }
     return {
         external: true,
         activeConnections,
@@ -2330,9 +2468,9 @@ async function fetchExternalRelayRuntime(relayUrl, target, token) {
                 ? "External RelayNode target route fields observed directly"
                 : "External RelayNode omitted complete target route fields",
         },
-        runtime: body?.runtime !== undefined && typeof body.runtime === "object"
-            ? body.runtime : undefined,
-        runtimeGaugeEvidence: relayRuntimeGaugeEvidence({ runtime: body?.runtime }),
+        runtime,
+        runtimeGaugeEvidence,
+        runtimeConnectionGaugeEvidence,
         raw: body,
     };
 }

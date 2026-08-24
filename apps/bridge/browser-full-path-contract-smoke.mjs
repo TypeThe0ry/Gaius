@@ -11,6 +11,9 @@ const fullPathScript = fileURLToPath(
 const acceptanceRunnerPath = fileURLToPath(
     new URL("./browser-full-path-acceptance.mjs", import.meta.url));
 const relayMainPath = fileURLToPath(new URL("./dist/main.js", import.meta.url));
+const multiplayerPath = fileURLToPath(new URL("./multiplayer-smoke.mjs", import.meta.url));
+const verifyRuntimePath = fileURLToPath(
+    new URL("./deploy/verify-runtime.sh", import.meta.url));
 const packagePath = fileURLToPath(new URL("./package.json", import.meta.url));
 
 const COMPATIBILITY_ENVIRONMENT = Object.freeze({
@@ -260,9 +263,11 @@ assert.equal(configuration("versions/1.21.11.json", {
     GAIUS_BROWSER_FULL_PATH_RECONNECT_WAVES: "999",
 }).performanceContract.reconnectWaves, 8);
 
-const [relayMain, fullPathSource] = await Promise.all([
+const [relayMain, fullPathSource, multiplayerSource, verifyRuntimeSource] = await Promise.all([
     readFile(relayMainPath, "utf8"),
     readFile(fullPathScript, "utf8"),
+    readFile(multiplayerPath, "utf8"),
+    readFile(verifyRuntimePath, "utf8"),
 ]);
 const [acceptanceRunner, packageSource] = await Promise.all([
     readFile(acceptanceRunnerPath, "utf8"),
@@ -394,6 +399,13 @@ assert.match(relayMain, /armClientStallTimer\(\);/);
 assert.match(relayMain, /clearClientStallTimer\(\);/);
 assert.match(relayMain, /"runtime-telemetry"/);
 assert.match(relayMain, /runtime: relayRuntimeSnapshot\(\)/);
+assert.match(relayMain, /const activeTunnelLeases = new Set\(\)/);
+assert.match(relayMain, /activeTunnelLeases\.size/);
+assert.match(relayMain, /activeTransportWebSockets: webSocketServer\.clients\.size/);
+assert.match(verifyRuntimeSource, /"activeTunnelLeases"/);
+assert.match(verifyRuntimeSource, /"activeTransportWebSockets"/);
+assert.match(multiplayerSource, /activeTunnelLeasesAfterClose/);
+assert.match(multiplayerSource, /logical and physical tunnel cleanup/);
 assert.match(relayMain, /const maximumServerFrameDrainFrames = 32/);
 assert.match(relayMain, /const maximumServerFrameDrainBytes = 512 \* 1024/);
 assert.match(relayMain, /const maximumServerFrameDrainMillis = 2/);
@@ -431,6 +443,12 @@ assert.match(externalMultiplayerSource, /function relayRuntimeSnapshot\(manifest
 assert.match(externalMultiplayerSource, /runtimeTelemetry/);
 assert.match(externalMultiplayerSource, /dnsLookupsShared/);
 assert.match(externalMultiplayerSource, /minimumSharedDnsLookups/);
+assert.match(fullPathSource, /const relayRuntimeTelemetryRequired = !externalMode \|\| acceptanceMode/);
+assert.match(fullPathSource, /strict acceptance requires every external RelayNode runtime gauge/);
+assert.match(fullPathSource, /runtimeTelemetryRequired: relayRuntimeTelemetryRequired/);
+assert.match(fullPathSource, /RELAY_RUNTIME_CONNECTION_GAUGES/);
+assert.match(fullPathSource, /activeTunnelLeases/);
+assert.match(fullPathSource, /activeTransportWebSockets/);
 assert.doesNotMatch(
     relayMain,
     /updateTcpReadState = \(\) => \{[\s\S]*?\};\s+clientStallTimer = setInterval/,
