@@ -48,6 +48,11 @@ const eventLoopGapLimitMillis = parseBoundedNumber(
     process.env.GAIUS_EXTERNAL_EVENT_LOOP_GAP_LIMIT_MS ?? "500",
     "GAIUS_EXTERNAL_EVENT_LOOP_GAP_LIMIT_MS", 1, 120000,
 );
+const pingResponseGapLimitMillis = parseBoundedNumber(
+    process.env.GAIUS_EXTERNAL_MAX_PING_GAP_MS ??
+        String(Math.max(1500, pingIntervalMillis * 2)),
+    "GAIUS_EXTERNAL_MAX_PING_GAP_MS", 1, 120000,
+);
 const relayDrainLimitMillis = parseBoundedNumber(
     process.env.GAIUS_EXTERNAL_MAX_RELAY_DRAIN_MS ?? "2",
     "GAIUS_EXTERNAL_MAX_RELAY_DRAIN_MS", 0.1, 1000,
@@ -286,8 +291,10 @@ function createClient(id, bridge, stats) {
         statusReceivedAt: 0,
         statusRtt: [],
         pingRtt: [],
+        pingResponseGaps: [],
         pendingPings: new Map(),
         nextPingAt: 0,
+        lastPingResponseAt: 0,
         statusResponses: 0,
         statusPayload: undefined,
         pingSent: 0,
@@ -306,12 +313,15 @@ function createClient(id, bridge, stats) {
         client.send(Buffer.concat([encodeStatusHandshake(), encodeStatusRequest()]));
     };
     client.sendPing = () => {
-        if (client.pingSent > 0 || client.closed || !bridge.channels.has(id)) {
+        if (client.closed || client.stopPinging || !bridge.channels.has(id) ||
+            performance.now() < client.nextPingAt) {
             return false;
         }
         const token = Math.round(performance.now() * 1000);
-        client.pendingPings.set(token, performance.now());
+        const sentAt = performance.now();
+        client.pendingPings.set(token, sentAt);
         client.pingSent++;
+        client.nextPingAt = sentAt + pingIntervalMillis;
         try {
             client.send(encodePing(token));
             return true;
@@ -362,7 +372,14 @@ function consumeFrames(client) {
             if (sentAt !== undefined) {
                 client.pendingPings.delete(token);
                 client.pingResponses++;
-                client.pingRtt.push(performance.now() - sentAt);
+                const receivedAt = performance.now();
+                client.pingRtt.push(receivedAt - sentAt);
+                if (client.lastPingResponseAt > 0) {
+                    client.pingResponseGaps.push(
+                        receivedAt - client.lastPingResponseAt,
+                    );
+                }
+                client.lastPingResponseAt = receivedAt;
             }
         }
         else {
@@ -463,9 +480,8 @@ async function main() {
                     client.sendInitial();
                 }
                 if (enablePing && !client.closed && client.statusReceivedAt > 0 &&
-                    client.pingSent === 0 && performance.now() >= client.nextPingAt) {
+                    performance.now() >= client.nextPingAt) {
                     client.sendPing();
-                    client.nextPingAt = performance.now() + pingIntervalMillis;
                 }
             }
             catch (error) {
@@ -510,6 +526,19 @@ async function main() {
             () => clients.map((client) => ({ id: client.id, failure: client.failure,
                 pingSent: client.pingSent, pingResponses: client.pingResponses })),
         );
+        if (enablePing) {
+            for (const client of clients) client.stopPinging = true;
+            await waitFor(
+                () => clients.every((client) => client.pendingPings.size === 0),
+                "external status ping drain", 5000,
+                () => clients.map((client) => ({
+                    id: client.id,
+                    pendingPings: client.pendingPings.size,
+                    pingSent: client.pingSent,
+                    pingResponses: client.pingResponses,
+                })),
+            );
+        }
         const afterSoakManifest = await fetchManifest();
         const dnsCacheBaseline = dnsCacheRuntime(baselineManifest);
         const dnsCachePeak = dnsCacheRuntime(peakManifest);
@@ -537,10 +566,15 @@ async function main() {
         const runtimeAfterClose = relayRuntimeSnapshot(afterCloseManifest);
         const statusRtt = clients.flatMap((client) => client.statusRtt);
         const pingRtt = clients.flatMap((client) => client.pingRtt);
+        const pingResponseGaps = clients.flatMap((client) => client.pingResponseGaps);
         const pingSent = clients.reduce((sum, client) => sum + client.pingSent, 0);
         const pingResponses = clients.reduce((sum, client) => sum + client.pingResponses, 0);
         const measuredRtt = enablePing ? pingRtt : statusRtt;
         const measuredRttSummary = latencySummary(measuredRtt);
+        const pingResponseGapSummary = latencySummary(pingResponseGaps);
+        const minimumPingResponsesPerClient = enablePing
+            ? Math.max(3, Math.floor(soakMillis / pingIntervalMillis) - 1)
+            : 0;
         const targetActive = (manifest) => Number(manifest.target?.activeConnections ?? 0);
         const runtimeSnapshots = [runtimeBaseline, runtimePeak, runtimeAfterSoak,
             runtimeAfterClose].filter((snapshot) => snapshot !== undefined);
@@ -569,6 +603,7 @@ async function main() {
             }),
             statusRtt: latencySummary(statusRtt),
             pingRtt: latencySummary(pingRtt),
+            pingResponseGaps: pingResponseGapSummary,
             packets: { statusResponses: clients.map((client) => client.statusResponses),
                 pingSent, pingResponses, pingLoss: pingSent - pingResponses },
             minecraftStatus: clients.map((client) => ({
@@ -621,6 +656,8 @@ async function main() {
                 rttSource: enablePing ? "status-ping" : "status-response",
                 p99RttMillis: measuredRttSummary.p99Millis,
                 maxRttMillis: measuredRttSummary.maxMillis,
+                maxPingResponseGapMillis: pingResponseGapSummary.maxMillis,
+                minimumPingResponsesPerClient,
                 eventLoopGapMillis: stats.longestEventLoopGapMillis,
                 relayDrainMaxDurationMillis,
                 relayDrainSendErrors,
@@ -644,6 +681,7 @@ async function main() {
                     (dnsCachePeak.publicDnsCacheInflightJoins -
                         (dnsCacheBaseline?.publicDnsCacheInflightJoins ?? 0)),
                 thresholds: { p99RttLimitMillis, maxRttLimitMillis, eventLoopGapLimitMillis,
+                    pingResponseGapLimitMillis,
                     relayDrainLimitMillis,
                     pingEnabled: enablePing,
                     minimumSharedDnsLookups: Math.max(0, clientCount - 1),
@@ -655,6 +693,14 @@ async function main() {
         lastExternalResult = result;
         try {
             assert.equal(result.packets.pingLoss, 0, "external status ping loss detected");
+            if (enablePing) {
+                assert.ok(clients.every((client) =>
+                    client.pingResponses >= minimumPingResponsesPerClient),
+                "external status ping sample count was too low");
+                assert.ok(result.gate.maxPingResponseGapMillis <=
+                    pingResponseGapLimitMillis,
+                `external ping response gap reached ${result.gate.maxPingResponseGapMillis}ms`);
+            }
             assert.equal(stats.relayTargetAttestationFailures, 0,
                 "external RelayNode target attestation failure detected");
             assert.ok(result.gate.targetObserved,
@@ -710,6 +756,7 @@ catch (error) {
         snapshot: lastExternalResult === undefined ? undefined : {
             statusRtt: lastExternalResult.statusRtt,
             pingRtt: lastExternalResult.pingRtt,
+            pingResponseGaps: lastExternalResult.pingResponseGaps,
             connectionMillis: lastExternalResult.connectionMillis,
             relay: lastExternalResult.relay,
             browser: lastExternalResult.browser,

@@ -22,6 +22,18 @@ const requiredAcceptance = Object.freeze({
     soakMillis: 15000,
     reconnectWaves: 1,
 });
+const multiplayerPerformanceTarget = Object.freeze({
+    maxConnectToMinimumChunksMillis: 15000,
+    maxConfigurationToPlayLoginMillis: 10000,
+    maxPlayLoginToFirstChunkMillis: 10000,
+    maxPreMinimumChunkPacketGapMillis: 500,
+    maxPlayTickGapMillis: 250,
+    maxPollGapMillis: 500,
+    maxParserBufferedBytes: 4 * 1024 * 1024,
+    maxBrowserQueuedFrames: 1024,
+    maxBrowserInboundQueuedBytes: 24 * 1024 * 1024,
+    maxSoakPhaseStallMillis: 500,
+});
 const canonicalProfiles = Object.freeze({
     "26.2": Object.freeze({
         canonicalPath: "port/versions/26.2.json",
@@ -619,6 +631,8 @@ function validateChildResult(profile, report, processState) {
         requiredAcceptance.reconnectWaves, "performance strict wave target");
     exact(report.performanceContract?.runtimeJavaPolicy, runtimeJavaPolicy,
         "performance runtime Java policy");
+    exact(report.performanceContract?.multiplayerPerformance,
+        multiplayerPerformanceTarget, "performance multiplayer no-stall contract");
     equal(JSON.stringify(report.performanceContract?.canonicalProfiles?.[profile]),
         JSON.stringify({
             protocolVersion: expected.protocolVersion,
@@ -700,6 +714,10 @@ function validateChildResult(profile, report, processState) {
 
     checkHealth(observed?.soak, "observed soak", failures, add, equal);
     checkHealth(actual?.soak, "actual soak", failures, add, equal);
+    checkSoakPerformance(observed?.soakPerformance, "observed soak performance",
+        failures, add, equal);
+    checkSoakPerformance(actual?.soakPerformance, "actual soak performance",
+        failures, add, equal);
     checkArrayLength(observed?.reconnectWaves, requiredAcceptance.reconnectWaves,
         "observed reconnect waves", failures, add);
     if (array(observed?.reconnectWaves)) {
@@ -845,6 +863,7 @@ function checkClient(client, label, failures, add, equal) {
     add(Number.isSafeInteger(client.chunkPackets) &&
         client.chunkPackets >= requiredAcceptance.minimumChunkPackets,
     `${label} received fewer than ${requiredAcceptance.minimumChunkPackets} chunks`);
+    checkClientPerformance(client, label, failures, add, equal);
     const encryption = client.onlineEncryption;
     if (encryption === null || typeof encryption !== "object") {
         failures.push(`${label} online encryption evidence is missing`);
@@ -860,6 +879,66 @@ function checkClient(client, label, failures, add, equal) {
     add(typeof encryption.secretFingerprint === "string" &&
         /^[0-9a-f]{64}$/u.test(encryption.secretFingerprint),
     `${label} encryption fingerprint evidence is invalid`);
+}
+
+function checkClientPerformance(client, label, failures, add, equal) {
+    const timing = client?.timing;
+    const performance = client?.performance;
+    if (timing === null || typeof timing !== "object" ||
+        performance === null || typeof performance !== "object") {
+        failures.push(`${label} multiplayer performance evidence is missing`);
+        return;
+    }
+    for (const [name, value, limit] of [
+        ["connectToMinimumChunksMillis", timing.connectToMinimumChunksMillis,
+            multiplayerPerformanceTarget.maxConnectToMinimumChunksMillis],
+        ["configurationToPlayLoginMillis", timing.configurationToPlayLoginMillis,
+            multiplayerPerformanceTarget.maxConfigurationToPlayLoginMillis],
+        ["playLoginToFirstChunkMillis", timing.playLoginToFirstChunkMillis,
+            multiplayerPerformanceTarget.maxPlayLoginToFirstChunkMillis],
+        ["maxPreMinimumChunkPacketGapMillis",
+            performance.maxPreMinimumChunkPacketGapMillis,
+            multiplayerPerformanceTarget.maxPreMinimumChunkPacketGapMillis],
+        ["maxPlayTickGapMillis", performance.maxPlayTickGapMillis,
+            multiplayerPerformanceTarget.maxPlayTickGapMillis],
+        ["maxPollGapMillis", performance.maxPollGapMillis,
+            multiplayerPerformanceTarget.maxPollGapMillis],
+    ]) {
+        add(Number.isFinite(value) && value <= limit,
+            `${label} ${name} exceeded ${limit}ms: ${JSON.stringify(value)}`);
+    }
+    add(Number.isSafeInteger(performance.maximumBufferedBytes) &&
+        performance.maximumBufferedBytes <= multiplayerPerformanceTarget.maxParserBufferedBytes,
+    `${label} parser buffer exceeded ${multiplayerPerformanceTarget.maxParserBufferedBytes}: ` +
+        `${JSON.stringify(performance.maximumBufferedBytes)}`);
+}
+
+function checkSoakPerformance(performance, label, failures, add, equal) {
+    if (performance === null || typeof performance !== "object") {
+        failures.push(`${label} evidence is missing`);
+        return;
+    }
+    equal(performance.ok, true, `${label} ok`);
+    add(Number.isSafeInteger(performance.samples) && performance.samples >= 10,
+        `${label} sample count is too low: ${JSON.stringify(performance.samples)}`);
+    add(Number.isFinite(performance.maxPhaseStallMillis) &&
+        performance.maxPhaseStallMillis <= multiplayerPerformanceTarget.maxSoakPhaseStallMillis,
+    `${label} phase stall exceeded ${multiplayerPerformanceTarget.maxSoakPhaseStallMillis}ms: ` +
+        `${JSON.stringify(performance.maxPhaseStallMillis)}`);
+    add(Number.isSafeInteger(performance.maxBrowserQueuedFrames) &&
+        performance.maxBrowserQueuedFrames <= multiplayerPerformanceTarget.maxBrowserQueuedFrames,
+    `${label} browser queued frames exceeded limit: ` +
+        `${JSON.stringify(performance.maxBrowserQueuedFrames)}`);
+    add(Number.isSafeInteger(performance.maxBrowserInboundQueuedBytes) &&
+        performance.maxBrowserInboundQueuedBytes <=
+        multiplayerPerformanceTarget.maxBrowserInboundQueuedBytes,
+    `${label} browser inbound queue exceeded limit: ` +
+        `${JSON.stringify(performance.maxBrowserInboundQueuedBytes)}`);
+    add(Number.isFinite(performance.maxBrowserEventLoopGapMillis) &&
+        performance.maxBrowserEventLoopGapMillis <= multiplayerPerformanceTarget.maxPollGapMillis,
+    `${label} browser event-loop gap exceeded limit: ` +
+        `${JSON.stringify(performance.maxBrowserEventLoopGapMillis)}`);
+    equal(performance.violations?.length, 0, `${label} violations`);
 }
 
 function checkHealth(health, label, failures, add, equal) {

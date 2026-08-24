@@ -104,6 +104,21 @@ const RELAY_RUNTIME_GAUGES = Object.freeze([
     "activeClientStallTimers",
 ]);
 const RELAY_DRAIN_MAX_DURATION_MILLIS = 16.7;
+// Multiplayer acceptance is intentionally bounded by observed transport and
+// scheduling behavior, not by the old 90-second protocol timeout. These are
+// fixed in --acceptance mode so a caller cannot hide a stall by widening env.
+const MULTIPLAYER_PERFORMANCE_TARGET = Object.freeze({
+    maxConnectToMinimumChunksMillis: 15_000,
+    maxConfigurationToPlayLoginMillis: 10_000,
+    maxPlayLoginToFirstChunkMillis: 10_000,
+    maxPreMinimumChunkPacketGapMillis: 500,
+    maxPlayTickGapMillis: 250,
+    maxPollGapMillis: 500,
+    maxParserBufferedBytes: 4 * 1024 * 1024,
+    maxBrowserQueuedFrames: 1024,
+    maxBrowserInboundQueuedBytes: 24 * 1024 * 1024,
+    maxSoakPhaseStallMillis: 500,
+});
 // These counters are exported by BrowserWebSocketChannel's JSBody stats. Keep
 // their exact source names: a missing source field is evidence, not a made-up
 // zero, and is handled explicitly by browserRuntimeCleanupGaugeEvidence().
@@ -205,6 +220,7 @@ async function runSmoke() {
     let relayRuntimeAfterClose;
     let browserRuntimeAfterSoak;
     let soakHealth;
+    let soakPerformance;
     let soakStartedAt;
     let soakCompletedAt;
     let failure;
@@ -345,6 +361,7 @@ try {
         for (const client of currentClients) {
             client.checkError();
             assertClientSecurity(client, `initial client ${client.id}`);
+            assertClientPerformance(client, `initial client ${client.id}`);
         }
         relayRuntimeAtChunks = await waitRelayRuntime(
             (snapshot) => snapshot.activeConnections === clientCount &&
@@ -555,6 +572,10 @@ try {
                 relayAtChunks,
                 `reconnect wave ${wave}`,
             );
+            for (const client of replacementClients) {
+                assertClientPerformance(client,
+                    `reconnect wave ${wave} client ${client.id}`);
+            }
             reconnectEvidence.push({
                 wave,
                 simultaneousDrop: true,
@@ -619,7 +640,13 @@ try {
             });
         }
         soakStartedAt = performance.now();
+        const soakObservation = startSoakPerformanceObservation(
+            currentClients,
+            browserRuntime,
+        );
         if (soakMs > 0) await delayAtLeast(soakMs);
+        soakPerformance = soakObservation.finish();
+        assertSoakPerformance(soakPerformance, "post-soak multiplayer performance");
         soakCompletedAt = performance.now();
         relayRuntimeAfterSoak = await waitRelayRuntime(
             (snapshot) => snapshot.activeConnections === clientCount &&
@@ -635,6 +662,9 @@ try {
             relayRuntimeAfterSoak,
             "post-soak",
         );
+        for (const client of currentClients) {
+            assertClientPerformance(client, `post-soak client ${client.id}`);
+        }
         if (!externalMode) {
             assertRelayDrainPerformance(
                 [relayRuntimeAfterSoak],
@@ -779,6 +809,7 @@ try {
                     browserCleanupGaugesZero: [...BROWSER_RUNTIME_CLEANUP_GAUGES],
                     syntheticMarkerLabel: "synthetic-inbound-marker",
                     runtimeJavaPolicy: { ...STRICT_RUNTIME_JAVA_POLICY },
+                    multiplayerPerformance: { ...MULTIPLAYER_PERFORMANCE_TARGET },
                 }
                 : {
                     clients: clientCount,
@@ -791,6 +822,7 @@ try {
                     relayDrainCleanupRequired: true,
                     browserCleanupGaugesZero: [...BROWSER_RUNTIME_CLEANUP_GAUGES],
                     syntheticMarkerLabel: "synthetic-inbound-marker",
+                    multiplayerPerformance: { ...MULTIPLAYER_PERFORMANCE_TARGET },
                 },
             observed: {
                 clients: clientCount,
@@ -815,6 +847,7 @@ try {
                 runtimeJavaMajor: runtimeJava?.major ?? null,
                 runtimeJavaExecutable: runtimeJava?.executable ?? null,
                 soak: soakHealth,
+                soakPerformance,
                 reconnectWaves: reconnectEvidence.map((wave) => ({
                     wave: wave.wave,
                     health: wave.health,
@@ -832,6 +865,7 @@ try {
             actual: {
                 soakMillis: actualSoakMillis,
                 soak: soakHealth,
+                soakPerformance,
                 reconnectWaves: reconnectEvidence.map((wave) => ({
                     wave: wave.wave,
                     health: wave.health,
@@ -1031,6 +1065,20 @@ class BrowserMinecraftClient {
         this.outboundBytes = 0;
         this.decodedPackets = 0;
         this.maximumBufferedBytes = 0;
+        this.lastPollAt = undefined;
+        this.pollGapSamples = 0;
+        this.maxPollGapMillis = 0;
+        this.lastInboundPacketAt = undefined;
+        this.inboundPacketGapSamples = 0;
+        this.maxInboundPacketGapMillis = 0;
+        this.lastPlayPacketAt = undefined;
+        this.playPacketGapSamples = 0;
+        this.maxPlayPacketGapMillis = 0;
+        this.preMinimumChunkPacketGapSamples = 0;
+        this.maxPreMinimumChunkPacketGapMillis = 0;
+        this.lastPlayTickAt = undefined;
+        this.playTickGapSamples = 0;
+        this.maxPlayTickGapMillis = 0;
     }
 
     async connect() {
@@ -1059,6 +1107,15 @@ class BrowserMinecraftClient {
     poll() {
         if (this.closed || this.pollingPaused) return;
         try {
+            const polledAt = performance.now();
+            if (this.lastPollAt !== undefined) {
+                this.pollGapSamples++;
+                this.maxPollGapMillis = Math.max(
+                    this.maxPollGapMillis,
+                    polledAt - this.lastPollAt,
+                );
+            }
+            this.lastPollAt = polledAt;
             this.checkError();
             this.recordPhases();
             let chunk;
@@ -1107,6 +1164,33 @@ class BrowserMinecraftClient {
             const packetId = decodeVarInt(frame, 0);
             if (packetId === undefined) throw new Error("packet omitted id");
             this.decodedPackets++;
+            const packetAt = performance.now();
+            if (this.lastInboundPacketAt !== undefined) {
+                this.inboundPacketGapSamples++;
+                this.maxInboundPacketGapMillis = Math.max(
+                    this.maxInboundPacketGapMillis,
+                    packetAt - this.lastInboundPacketAt,
+                );
+            }
+            this.lastInboundPacketAt = packetAt;
+            if (this.phase === "play") {
+                if (this.lastPlayPacketAt !== undefined) {
+                    const playGap = packetAt - this.lastPlayPacketAt;
+                    this.playPacketGapSamples++;
+                    this.maxPlayPacketGapMillis = Math.max(
+                        this.maxPlayPacketGapMillis,
+                        playGap,
+                    );
+                    if (this.chunkPackets < minimumChunkPackets) {
+                        this.preMinimumChunkPacketGapSamples++;
+                        this.maxPreMinimumChunkPacketGapMillis = Math.max(
+                            this.maxPreMinimumChunkPacketGapMillis,
+                            playGap,
+                        );
+                    }
+                }
+                this.lastPlayPacketAt = packetAt;
+            }
             this.handlePacket(packetId.value, frame.subarray(packetId.bytesRead));
             if (this.failure !== undefined) throw this.failure;
         }
@@ -1319,6 +1403,15 @@ class BrowserMinecraftClient {
         const sendTick = () => {
             if (this.closed || this.failure !== undefined || this.phase !== "play") return;
             try {
+                const tickAt = performance.now();
+                if (this.lastPlayTickAt !== undefined) {
+                    this.playTickGapSamples++;
+                    this.maxPlayTickGapMillis = Math.max(
+                        this.maxPlayTickGapMillis,
+                        tickAt - this.lastPlayTickAt,
+                    );
+                }
+                this.lastPlayTickAt = tickAt;
                 this.sendPacket(this.profile.play.serverboundClientTickEnd, Buffer.alloc(0));
                 this.playTickPackets++;
             }
@@ -1400,6 +1493,7 @@ class BrowserMinecraftClient {
             outboundBytes: this.outboundBytes,
             decodedPackets: this.decodedPackets,
             maximumBufferedBytes: this.maximumBufferedBytes,
+            performance: this.performanceResult(),
             closeReason: this.closeReason ?? null,
             pollingPaused: this.pollingPaused,
             failure: this.failure === undefined ? null : String(this.failure),
@@ -1444,6 +1538,7 @@ class BrowserMinecraftClient {
                     elapsedMillis(this.connectStartedAt, this.minimumChunksAt),
                 ),
             },
+            performance: this.performanceResult(),
         };
     }
 
@@ -1490,6 +1585,23 @@ class BrowserMinecraftClient {
                 elapsedMillis(this.connectStartedAt, this.minimumChunksAt),
             connectedLifetimeMillis:
                 elapsedMillis(this.connectStartedAt, this.closedAt),
+        };
+    }
+
+    performanceResult() {
+        return {
+            pollGapSamples: this.pollGapSamples,
+            maxPollGapMillis: Number(this.maxPollGapMillis.toFixed(3)),
+            inboundPacketGapSamples: this.inboundPacketGapSamples,
+            maxInboundPacketGapMillis: Number(this.maxInboundPacketGapMillis.toFixed(3)),
+            playPacketGapSamples: this.playPacketGapSamples,
+            maxPlayPacketGapMillis: Number(this.maxPlayPacketGapMillis.toFixed(3)),
+            preMinimumChunkPacketGapSamples: this.preMinimumChunkPacketGapSamples,
+            maxPreMinimumChunkPacketGapMillis:
+                Number(this.maxPreMinimumChunkPacketGapMillis.toFixed(3)),
+            playTickGapSamples: this.playTickGapSamples,
+            maxPlayTickGapMillis: Number(this.maxPlayTickGapMillis.toFixed(3)),
+            maximumBufferedBytes: this.maximumBufferedBytes,
         };
     }
 
@@ -1570,7 +1682,11 @@ function browserRuntimeSnapshot(runtime) {
         webSocketConnections: runtime.wsStats.connections,
         queuedBytes: runtime.stats.queuedBytes,
         queuedFrames: runtime.stats.queuedFrames,
+        peakQueuedFrames: runtime.stats.peakQueuedFrames,
         inboundQueuedBytes: runtime.stats.inboundQueuedBytes,
+        peakInboundQueuedBytes: runtime.stats.peakInboundQueuedBytes,
+        maxDecodedSliceBacklog: runtime.stats.maxDecodedSliceBacklog,
+        longestEventLoopGapMillis: runtime.stats.longestEventLoopGapMillis,
         activeRelayTargetLeases: runtime.stats.activeRelayTargetLeases,
         relayTargetAttestationFailures: runtime.stats.relayTargetAttestationFailures,
     };
@@ -1689,9 +1805,167 @@ function clientLivenessEvidence(client) {
         loginFinished: client.loginFinished,
         playLoginPackets: client.playLoginPackets,
         chunkPackets: client.chunkPackets,
+        timing: client.timingResult(),
+        performance: client.performanceResult(),
         failure: client.failure === undefined ? null : String(client.failure),
         onlineEncryption: client.onlineEncryptionResult(),
     };
+}
+
+function assertClientPerformance(client, label) {
+    if (!acceptanceMode) return client.performanceResult();
+    const timing = client.timingResult();
+    const performanceEvidence = client.performanceResult();
+    for (const [name, value, limit] of [
+        ["connectToMinimumChunksMillis", timing.connectToMinimumChunksMillis,
+            MULTIPLAYER_PERFORMANCE_TARGET.maxConnectToMinimumChunksMillis],
+        ["configurationToPlayLoginMillis", timing.configurationToPlayLoginMillis,
+            MULTIPLAYER_PERFORMANCE_TARGET.maxConfigurationToPlayLoginMillis],
+        ["playLoginToFirstChunkMillis", timing.playLoginToFirstChunkMillis,
+            MULTIPLAYER_PERFORMANCE_TARGET.maxPlayLoginToFirstChunkMillis],
+        ["maxPreMinimumChunkPacketGapMillis",
+            performanceEvidence.maxPreMinimumChunkPacketGapMillis,
+            MULTIPLAYER_PERFORMANCE_TARGET.maxPreMinimumChunkPacketGapMillis],
+        ["maxPlayTickGapMillis", performanceEvidence.maxPlayTickGapMillis,
+            MULTIPLAYER_PERFORMANCE_TARGET.maxPlayTickGapMillis],
+        ["maxPollGapMillis", performanceEvidence.maxPollGapMillis,
+            MULTIPLAYER_PERFORMANCE_TARGET.maxPollGapMillis],
+    ]) {
+        assert.ok(Number.isFinite(value) && value <= limit,
+            `${label}: ${name} reached ${value}ms (limit ${limit}ms)`);
+    }
+    assert.ok(performanceEvidence.maximumBufferedBytes <=
+        MULTIPLAYER_PERFORMANCE_TARGET.maxParserBufferedBytes,
+    `${label}: parser buffered ${performanceEvidence.maximumBufferedBytes} bytes`);
+    return {
+        timing,
+        performance: performanceEvidence,
+        limits: { ...MULTIPLAYER_PERFORMANCE_TARGET },
+    };
+}
+
+function startSoakPerformanceObservation(clients, browserRuntime) {
+    const startedAt = performance.now();
+    const notPlaySince = new Map();
+    const reported = new Set();
+    const violations = [];
+    let samples = 0;
+    let maxPhaseStallMillis = 0;
+    let maxBrowserQueuedFrames = 0;
+    let maxBrowserInboundQueuedBytes = 0;
+    let maxBrowserEventLoopGapMillis = 0;
+    const sample = () => {
+        const now = performance.now();
+        samples++;
+        for (const client of clients) {
+            if (client.failure !== undefined) {
+                const key = `${client.id}:failure`;
+                if (!reported.has(key)) {
+                    reported.add(key);
+                    violations.push({
+                        type: "client-failure",
+                        clientId: client.id,
+                        error: String(client.failure),
+                    });
+                }
+            }
+            const healthy = client.failure === undefined &&
+                client.phase === "play" &&
+                client.chunkPackets >= minimumChunkPackets;
+            if (healthy) {
+                notPlaySince.delete(client.id);
+                continue;
+            }
+            const began = notPlaySince.get(client.id) ?? now;
+            notPlaySince.set(client.id, began);
+            const duration = now - began;
+            maxPhaseStallMillis = Math.max(maxPhaseStallMillis, duration);
+            if (duration > MULTIPLAYER_PERFORMANCE_TARGET.maxSoakPhaseStallMillis) {
+                const key = `${client.id}:phase-stall`;
+                if (!reported.has(key)) {
+                    reported.add(key);
+                    violations.push({
+                        type: "play-liveness-stall",
+                        clientId: client.id,
+                        phase: client.phase,
+                        chunkPackets: client.chunkPackets,
+                        durationMillis: Number(duration.toFixed(3)),
+                    });
+                }
+            }
+        }
+        const browser = browserRuntimeSnapshot(browserRuntime);
+        maxBrowserQueuedFrames = Math.max(
+            maxBrowserQueuedFrames,
+            Number(browser.peakQueuedFrames ?? browser.queuedFrames ?? 0),
+        );
+        maxBrowserInboundQueuedBytes = Math.max(
+            maxBrowserInboundQueuedBytes,
+            Number(browser.peakInboundQueuedBytes ?? browser.inboundQueuedBytes ?? 0),
+        );
+        maxBrowserEventLoopGapMillis = Math.max(
+            maxBrowserEventLoopGapMillis,
+            Number(browser.longestEventLoopGapMillis ?? 0),
+        );
+        if (browser.activeChannels !== clientCount ||
+            browser.activeWebSockets !== clientCount) {
+            const key = "browser-liveness";
+            if (!reported.has(key)) {
+                reported.add(key);
+                violations.push({
+                    type: key,
+                    activeChannels: browser.activeChannels,
+                    activeWebSockets: browser.activeWebSockets,
+                });
+            }
+        }
+    };
+    const timer = setInterval(sample, 100);
+    timer.unref();
+    return {
+        finish() {
+            clearInterval(timer);
+            sample();
+            return {
+                samples,
+                elapsedMillis: Number((performance.now() - startedAt).toFixed(3)),
+                maxPhaseStallMillis: Number(maxPhaseStallMillis.toFixed(3)),
+                maxBrowserQueuedFrames,
+                maxBrowserInboundQueuedBytes,
+                maxBrowserEventLoopGapMillis:
+                    Number(maxBrowserEventLoopGapMillis.toFixed(3)),
+                violations,
+                ok: violations.length === 0,
+                limits: {
+                    maxSoakPhaseStallMillis:
+                        MULTIPLAYER_PERFORMANCE_TARGET.maxSoakPhaseStallMillis,
+                    maxBrowserQueuedFrames:
+                        MULTIPLAYER_PERFORMANCE_TARGET.maxBrowserQueuedFrames,
+                    maxBrowserInboundQueuedBytes:
+                        MULTIPLAYER_PERFORMANCE_TARGET.maxBrowserInboundQueuedBytes,
+                    maxPollGapMillis: MULTIPLAYER_PERFORMANCE_TARGET.maxPollGapMillis,
+                },
+            };
+        },
+    };
+}
+
+function assertSoakPerformance(evidence, label) {
+    if (!acceptanceMode) return evidence;
+    assert.ok(evidence?.ok === true,
+        `${label}: liveness violations ${JSON.stringify(evidence?.violations ?? [])}`);
+    assert.ok(evidence.samples >= 10,
+        `${label}: insufficient liveness samples (${evidence.samples})`);
+    assert.ok(evidence.maxBrowserQueuedFrames <=
+        MULTIPLAYER_PERFORMANCE_TARGET.maxBrowserQueuedFrames,
+    `${label}: browser queued frames reached ${evidence.maxBrowserQueuedFrames}`);
+    assert.ok(evidence.maxBrowserInboundQueuedBytes <=
+        MULTIPLAYER_PERFORMANCE_TARGET.maxBrowserInboundQueuedBytes,
+    `${label}: browser inbound queue reached ${evidence.maxBrowserInboundQueuedBytes} bytes`);
+    assert.ok(evidence.maxBrowserEventLoopGapMillis <=
+        MULTIPLAYER_PERFORMANCE_TARGET.maxPollGapMillis,
+    `${label}: browser event-loop gap reached ${evidence.maxBrowserEventLoopGapMillis}ms`);
+    return evidence;
 }
 
 function assertSoakLiveness(clients, browser, relay, label) {
@@ -1900,6 +2174,7 @@ function browserFullPathPerformanceContract() {
         relayDrainMaxDurationMillis: RELAY_DRAIN_MAX_DURATION_MILLIS,
         relayDrainSendErrors: 0,
         relayDrainCleanupRequired: true,
+        multiplayerPerformance: { ...MULTIPLAYER_PERFORMANCE_TARGET },
         browserRuntimeCleanupGauges: [...BROWSER_RUNTIME_CLEANUP_GAUGES],
         syntheticMarkerLabel: "synthetic-inbound-marker",
         runtimeJavaPolicy: acceptanceMode

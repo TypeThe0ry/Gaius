@@ -363,6 +363,20 @@ assert.match(fullPathSource,
     /authorization: `Bearer \$\{relayToken\}`/);
 assert.match(fullPathSource,
     /client\.dropTimingResult\(dropAt\)/);
+assert.match(fullPathSource,
+    /const MULTIPLAYER_PERFORMANCE_TARGET = Object\.freeze\(/);
+assert.match(fullPathSource,
+    /maxConnectToMinimumChunksMillis: 15_000/);
+assert.match(fullPathSource,
+    /maxPreMinimumChunkPacketGapMillis: 500/);
+assert.match(fullPathSource,
+    /function assertClientPerformance\(client, label\)/);
+assert.match(fullPathSource,
+    /function startSoakPerformanceObservation\(clients, browserRuntime\)/);
+assert.match(fullPathSource,
+    /maxBrowserEventLoopGapMillis/);
+assert.match(fullPathSource,
+    /assertSoakPerformance\(soakPerformance, "post-soak multiplayer performance"\)/);
 assert.match(relayMain,
     /if \(traceTunnel\) \{\s+traceTunnelEvent\(\s+`server data [\s\S]*?toString\("hex"\)/);
 assert.match(relayMain,
@@ -406,9 +420,12 @@ const externalMultiplayerSource = await readFile(
 assert.match(externalMultiplayerSource, /function dnsCacheRuntime\(manifest\)/);
 assert.match(externalMultiplayerSource, /Capture target activity before issuing that probe/);
 assert.match(externalMultiplayerSource, /if \(!bridge\.channels\.has\(client\.id\)\)/);
-assert.match(externalMultiplayerSource, /if \(client\.pingSent > 0 \|\| client\.closed \|\| !bridge\.channels\.has\(id\)\)/);
 assert.match(externalMultiplayerSource, /client\.closed = true;\s+client\.failure = String\(error\?\.stack \|\| error\);/);
-assert.match(externalMultiplayerSource, /client\.pingSent === 0/);
+assert.doesNotMatch(externalMultiplayerSource, /client\.pingSent === 0\) \{/,
+    "external multiplayer smoke must not be limited to one ping per client");
+assert.match(externalMultiplayerSource, /pingResponseGaps/);
+assert.match(externalMultiplayerSource, /pingResponseGapLimitMillis/);
+assert.match(externalMultiplayerSource, /external status ping drain/);
 assert.match(externalMultiplayerSource, /dnsCacheTelemetry/);
 assert.match(externalMultiplayerSource, /function relayRuntimeSnapshot\(manifest\)/);
 assert.match(externalMultiplayerSource, /runtimeTelemetry/);
