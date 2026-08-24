@@ -85,6 +85,9 @@ for (const expected of expectedProfiles) {
         "activeServerFrameDrainTimers",
         "activeClientStallTimers",
     ]);
+    assert.equal(config.performanceContract.relayDrainMaxDurationMillis, 16.7);
+    assert.equal(config.performanceContract.relayDrainSendErrors, 0);
+    assert.equal(config.performanceContract.relayDrainCleanupRequired, true);
     assert.deepEqual(config.performanceContract.browserRuntimeCleanupGauges, [
         "activeHighWatermarks",
         "decodedSliceBacklog",
