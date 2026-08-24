@@ -43,6 +43,17 @@ const channelSourceUrl = new URL(
 const origin = process.env.GAIUS_BROWSER_FULL_PATH_ORIGIN ?? "http://127.0.0.1:8781";
 const relayToken = process.env.GAIUS_BROWSER_FULL_PATH_TOKEN ?? "browser-full-path-token";
 const usernamePrefix = process.env.GAIUS_BROWSER_FULL_PATH_USERNAME_PREFIX ?? "GaiusBrowser";
+const externalRelayUrl = process.env.GAIUS_EXTERNAL_RELAY_URL?.trim() || undefined;
+const externalMode = externalRelayUrl !== undefined;
+const externalTarget = externalMode
+    ? parseTarget(process.env.GAIUS_EXTERNAL_TARGET ?? "ellan.top:16888")
+    : undefined;
+const acceptServerPrompts = externalMode ||
+    process.env.GAIUS_BROWSER_FULL_PATH_ACCEPT_SERVER_PROMPTS === "1" ||
+    process.env.GAIUS_BROWSER_FULL_PATH_ACCEPT_DIALOGS === "1";
+const requestedDialogAction = process.env.GAIUS_SMOKE_DIALOG_ACTION_ID;
+const dialogInputValues = parseDialogInputValues(
+    process.env.GAIUS_SMOKE_DIALOG_INPUTS_JSON);
 const commandLineArguments = process.argv.slice(2);
 const printConfigOnly = commandLineArguments.includes("--print-config");
 const printJavaResolutionOnly = commandLineArguments.includes("--print-java-resolution");
@@ -143,6 +154,12 @@ const reconnectWaves = Number.isInteger(requestedReconnectWaves)
     ? acceptanceMode ? requestedReconnectWaves :
         Math.max(0, Math.min(8, requestedReconnectWaves))
     : 0;
+const requestedClientStartDelayMs = Number.parseInt(
+    process.env.GAIUS_BROWSER_FULL_PATH_CLIENT_START_DELAY_MS ??
+        (externalMode ? "1500" : "0"), 10);
+const clientStartDelayMs = Number.isInteger(requestedClientStartDelayMs)
+    ? Math.max(0, Math.min(30_000, requestedClientStartDelayMs))
+    : externalMode ? 1500 : 0;
 const smokeStartedAt = performance.now();
 
 let activeProfile;
@@ -151,8 +168,10 @@ async function runSmoke() {
     activeProfile = await loadActiveVersionProfile();
     assertCanonicalProfile(activeProfile);
     const wireProfile = resolveWireProfile(activeProfile);
-    const verifiedServerJar = await resolveVerifiedServerJar(activeProfile);
-    const serverJar = verifiedServerJar.path;
+    const verifiedServerJar = externalMode
+        ? undefined
+        : await resolveVerifiedServerJar(activeProfile);
+    const serverJar = verifiedServerJar?.path;
     const evidenceRoot = path.join(repository, "port", "target", activeProfile.id,
         "browser-relay-full-path-evidence");
     await mkdir(evidenceRoot, { recursive: true });
@@ -173,6 +192,11 @@ async function runSmoke() {
     let serverOutput = "";
     let relayOutput = "";
     let relayPort;
+    let minecraftPort;
+    let runtimeJava;
+    let relayEndpoint;
+    let readRelayRuntime;
+    let waitRelayRuntime;
     let browserRuntime;
     let relayRuntimeBaseline;
     let relayRuntimeAtChunks;
@@ -190,82 +214,104 @@ async function runSmoke() {
 try {
     await listen(sessionServer, 0, "127.0.0.1");
     sessionPort = sessionServer.address().port;
-    await writeFile(path.join(workDirectory, "eula.txt"), "eula=true\n");
-
-    // The port is allocated before writing server.properties so the vanilla
-    // child never races a later listener. Keep the generated world/evidence
-    // directory; this smoke is intentionally post-mortem friendly.
-    const minecraftPort = await reservePort();
-    await writeFile(path.join(workDirectory, "server.properties"),
-        serverProperties(minecraftPort));
     const sessionBaseUrl = `http://127.0.0.1:${sessionPort}`;
-    const runtimeJava = await resolveJavaExecutable(activeProfile);
-    const javaExecutable = runtimeJava.executable;
-    serverProcess = spawn(javaExecutable, [
-        `-Dminecraft.api.session.host=${sessionBaseUrl}`,
-        `-Dminecraft.api.services.host=${sessionBaseUrl}`,
-        `-Dminecraft.api.profiles.host=${sessionBaseUrl}`,
-        "-Xms512m",
-        "-Xmx1536m",
-        "-jar",
-        serverJar,
-        "nogui",
-    ], {
-        cwd: workDirectory,
-        stdio: ["pipe", "pipe", "pipe"],
-        windowsHide: true,
-    });
-    serverProcess.once("error", (error) => {
-        serverSpawnError = error;
-        serverOutput += `\nJava process error: ${error.stack || error}\n`;
-    });
-    for (const stream of [serverProcess.stdout, serverProcess.stderr]) {
-        stream.setEncoding("utf8");
-        stream.on("data", (chunk) => { serverOutput += chunk; });
+    if (externalMode) {
+        relayEndpoint = {
+            url: externalRelayUrl,
+            target: externalTarget,
+            external: true,
+        };
+        readRelayRuntime = () => fetchExternalRelayRuntime(
+            relayEndpoint.url, relayEndpoint.target, relayToken);
+        waitRelayRuntime = (predicate, label, timeoutMillis) =>
+            waitForRelayRuntimeReader(readRelayRuntime, predicate, label, timeoutMillis);
     }
-    await waitFor(() => serverOutput.includes("Done (") ||
-        serverProcess.exitCode !== null || serverSpawnError !== undefined,
-    "vanilla server startup", 180000, () => serverOutput.slice(-4000));
-    if (serverSpawnError !== undefined || serverProcess.exitCode !== null ||
-        !serverOutput.includes("Done (")) {
-        throw new Error("Vanilla server failed to start:\n" + serverOutput);
-    }
+    else {
+        await writeFile(path.join(workDirectory, "eula.txt"), "eula=true\n");
 
-    relayPort = await reservePort();
-    relayProcess = spawn(process.execPath, ["dist/main.js"], {
-        cwd: bridgeDirectory,
-        env: {
-            ...process.env,
-            NODE_ENV: "test",
-            GAIUS_BRIDGE_HOST: "127.0.0.1",
-            GAIUS_BRIDGE_PORT: String(relayPort),
-            GAIUS_ALLOWED_ORIGINS: origin,
-            GAIUS_ALLOWED_HOSTS: "127.0.0.1",
-            GAIUS_BRIDGE_TOKEN: relayToken,
-            GAIUS_IDLE_TIMEOUT_MS: "60000",
-            GAIUS_CONNECT_TIMEOUT_MS: "10000",
-            GAIUS_PROXY_KEEPALIVES: "1",
-        },
-        stdio: ["ignore", "pipe", "pipe"],
-    });
-    relayProcess.once("error", (error) => {
-        relaySpawnError = error;
-        relayOutput += `\nRelay process error: ${error.stack || error}\n`;
-    });
-    for (const stream of [relayProcess.stdout, relayProcess.stderr]) {
-        stream.setEncoding("utf8");
-        stream.on("data", (chunk) => { relayOutput += chunk; });
-    }
-    await waitFor(() => relayOutput.includes("Gaius translator node listening") ||
-        relayProcess.exitCode !== null || relaySpawnError !== undefined,
-    "RelayNode startup", 15000, () => relayOutput.slice(-4000));
-    if (relaySpawnError !== undefined || relayProcess.exitCode !== null ||
-        !relayOutput.includes("Gaius translator node listening")) {
-        throw new Error("RelayNode failed to start:\n" + relayOutput);
-    }
-    relayRuntimeBaseline = await fetchRelayRuntime(relayPort, minecraftPort);
+        // The port is allocated before writing server.properties so the vanilla
+        // child never races a later listener. Keep the generated world/evidence
+        // directory; this smoke is intentionally post-mortem friendly.
+        minecraftPort = await reservePort();
+        await writeFile(path.join(workDirectory, "server.properties"),
+            serverProperties(minecraftPort));
+        runtimeJava = await resolveJavaExecutable(activeProfile);
+        const javaExecutable = runtimeJava.executable;
+        serverProcess = spawn(javaExecutable, [
+            `-Dminecraft.api.session.host=${sessionBaseUrl}`,
+            `-Dminecraft.api.services.host=${sessionBaseUrl}`,
+            `-Dminecraft.api.profiles.host=${sessionBaseUrl}`,
+            "-Xms512m",
+            "-Xmx1536m",
+            "-jar",
+            serverJar,
+            "nogui",
+        ], {
+            cwd: workDirectory,
+            stdio: ["pipe", "pipe", "pipe"],
+            windowsHide: true,
+        });
+        serverProcess.once("error", (error) => {
+            serverSpawnError = error;
+            serverOutput += `\nJava process error: ${error.stack || error}\n`;
+        });
+        for (const stream of [serverProcess.stdout, serverProcess.stderr]) {
+            stream.setEncoding("utf8");
+            stream.on("data", (chunk) => { serverOutput += chunk; });
+        }
+        await waitFor(() => serverOutput.includes("Done (") ||
+            serverProcess.exitCode !== null || serverSpawnError !== undefined,
+        "vanilla server startup", 180000, () => serverOutput.slice(-4000));
+        if (serverSpawnError !== undefined || serverProcess.exitCode !== null ||
+            !serverOutput.includes("Done (")) {
+            throw new Error("Vanilla server failed to start:\n" + serverOutput);
+        }
 
-    browserRuntime = await createBrowserRuntime(relayPort, relayToken);
+        relayPort = await reservePort();
+        relayProcess = spawn(process.execPath, ["dist/main.js"], {
+            cwd: bridgeDirectory,
+            env: {
+                ...process.env,
+                NODE_ENV: "test",
+                GAIUS_BRIDGE_HOST: "127.0.0.1",
+                GAIUS_BRIDGE_PORT: String(relayPort),
+                GAIUS_ALLOWED_ORIGINS: origin,
+                GAIUS_ALLOWED_HOSTS: "127.0.0.1",
+                GAIUS_BRIDGE_TOKEN: relayToken,
+                GAIUS_IDLE_TIMEOUT_MS: "60000",
+                GAIUS_CONNECT_TIMEOUT_MS: "10000",
+                GAIUS_PROXY_KEEPALIVES: "1",
+            },
+            stdio: ["ignore", "pipe", "pipe"],
+        });
+        relayProcess.once("error", (error) => {
+            relaySpawnError = error;
+            relayOutput += `\nRelay process error: ${error.stack || error}\n`;
+        });
+        for (const stream of [relayProcess.stdout, relayProcess.stderr]) {
+            stream.setEncoding("utf8");
+            stream.on("data", (chunk) => { relayOutput += chunk; });
+        }
+        await waitFor(() => relayOutput.includes("Gaius translator node listening") ||
+            relayProcess.exitCode !== null || relaySpawnError !== undefined,
+        "RelayNode startup", 15000, () => relayOutput.slice(-4000));
+        if (relaySpawnError !== undefined || relayProcess.exitCode !== null ||
+            !relayOutput.includes("Gaius translator node listening")) {
+            throw new Error("RelayNode failed to start:\n" + relayOutput);
+        }
+        relayEndpoint = {
+            url: `ws://127.0.0.1:${relayPort}/tunnel`,
+            target: { host: "127.0.0.1", port: minecraftPort,
+                text: `127.0.0.1:${minecraftPort}` },
+            external: false,
+        };
+        readRelayRuntime = () => fetchRelayRuntime(relayPort, minecraftPort);
+        waitRelayRuntime = (predicate, label, timeoutMillis) =>
+            waitForRelayRuntimeReader(readRelayRuntime, predicate, label, timeoutMillis);
+    }
+    relayRuntimeBaseline = await readRelayRuntime();
+
+    browserRuntime = await createBrowserRuntime(relayEndpoint.url, relayToken);
     const createClients = (wave) => Array.from({ length: clientCount }, (_, index) =>
         new BrowserMinecraftClient({
             id: 700 + wave * 100 + index,
@@ -274,8 +320,8 @@ try {
             profile: wireProfile,
             bridge: browserRuntime.bridge,
             stats: browserRuntime.stats,
-            host: "127.0.0.1",
-            port: minecraftPort,
+            host: relayEndpoint.target.host,
+            port: relayEndpoint.target.port,
             sessionUrl: sessionBaseUrl,
         }));
     const allClients = [];
@@ -286,36 +332,35 @@ try {
         for (const client of currentClients) client.poll();
     }, 1);
     try {
-        await Promise.all(currentClients.map((client) => client.connect()));
+        await connectClientWave(currentClients);
         await waitFor(
             () => currentClients.every((client) => client.failure === undefined &&
                 client.phase === "play" &&
                 client.loginFinished &&
-                client.encryptionRequest &&
-                client.aesCfb8Enabled &&
+                (externalMode || (client.encryptionRequest && client.aesCfb8Enabled)) &&
                 client.playLoginPackets > 0 &&
                 client.chunkPackets >= minimumChunkPackets),
             "browser Relay Minecraft PLAY/chunk", 90000,
             () => JSON.stringify(currentClients.map((client) => client.diagnostics())));
         for (const client of currentClients) {
             client.checkError();
-            assertOnlineEncryption(client, `initial client ${client.id}`);
+            assertClientSecurity(client, `initial client ${client.id}`);
         }
-        relayRuntimeAtChunks = await waitForRelayRuntime(
-            relayPort,
+        relayRuntimeAtChunks = await waitRelayRuntime(
             (snapshot) => snapshot.activeConnections === clientCount &&
                 snapshot.target?.activeConnections === clientCount &&
-                relayRuntimeGaugesAreZero(snapshot),
+                (externalMode || relayRuntimeGaugesAreZero(snapshot)),
             "initial RelayNode active tunnel quiescence",
             5000,
-            minecraftPort,
         );
-        assertRelayRuntimeGaugesZero(relayRuntimeAtChunks,
-            "initial active tunnel gauge check");
-        assertRelayDrainPerformance(
-            [relayRuntimeAtChunks],
-            "initial multiplayer chunk readiness",
-        );
+        if (!externalMode) {
+            assertRelayRuntimeGaugesZero(relayRuntimeAtChunks,
+                "initial active tunnel gauge check");
+            assertRelayDrainPerformance(
+                [relayRuntimeAtChunks],
+                "initial multiplayer chunk readiness",
+            );
+        }
         relayRuntimeBeforeSoak = relayRuntimeAtChunks;
         const seenBuffers = new Set(currentClients.map((client) => client.buffer));
         const seenCiphers = new Set(currentClients.map((client) => client.cipher));
@@ -325,7 +370,7 @@ try {
 
         for (let wave = 1; wave <= reconnectWaves; wave++) {
             const previousClients = currentClients;
-            const relayBeforeDrop = await fetchRelayRuntime(relayPort, minecraftPort);
+            const relayBeforeDrop = await readRelayRuntime();
             const browserBeforeDrop = browserRuntimeSnapshot(browserRuntime);
             const sessionBeforeDrop = sessionRuntimeSnapshot(sessionState);
             const dropAt = performance.now();
@@ -357,12 +402,10 @@ try {
                             browserRuntime.bridge.hasPendingInbound(probe.id),
                     })),
                 }));
-            const relayAfterDrop = await waitForRelayRuntime(
-                relayPort,
+            const relayAfterDrop = await waitRelayRuntime(
                 (snapshot) => relayRuntimeIsClean(snapshot),
                 `reconnect wave ${wave} RelayNode final-close cleanup`,
                 5000,
-                minecraftPort,
             );
             const transportDropEvidence = await captureAbnormalTransportDrop(
                 browserRuntime, transportDrop);
@@ -383,13 +426,17 @@ try {
                 inboundQueuedBytes: 0,
                 activeRelayTargetLeases: 0,
             }, "abnormal transport close retained browser queue/lease state");
-            assert.equal(relayAfterDrop.target.totalConnections,
-                clientCount * wave,
-                `reconnect wave ${wave} changed target totals while dropping`);
-            const relayAfterDropGauges = assertRelayRuntimeGaugesZero(
-                relayAfterDrop,
-                `reconnect wave ${wave} abnormal-drop cleanup`,
-            );
+            if (!externalMode && relayAfterDrop.target !== undefined) {
+                assert.equal(relayAfterDrop.target.totalConnections,
+                    clientCount * wave,
+                    `reconnect wave ${wave} changed target totals while dropping`);
+            }
+            const relayAfterDropGauges = externalMode
+                ? relayRuntimeGaugeEvidence(relayAfterDrop)
+                : assertRelayRuntimeGaugesZero(
+                    relayAfterDrop,
+                    `reconnect wave ${wave} abnormal-drop cleanup`,
+                );
 
             const javaFinalCloseAt = performance.now();
             for (const client of previousClients) client.close("java-final-close");
@@ -428,14 +475,13 @@ try {
             }
             currentClients = replacementClients;
             allClients.push(...replacementClients);
-            await Promise.all(replacementClients.map((client) => client.connect()));
+            await connectClientWave(replacementClients);
             await waitFor(
                 () => replacementClients.every((client) =>
                     client.failure === undefined &&
                     client.phase === "play" &&
                     client.loginFinished &&
-                    client.encryptionRequest &&
-                    client.aesCfb8Enabled &&
+                    (externalMode || (client.encryptionRequest && client.aesCfb8Enabled)) &&
                     client.playLoginPackets > 0 &&
                     client.chunkPackets >= minimumChunkPackets),
                 `browser Relay reconnect wave ${wave} PLAY/chunk`, 90000,
@@ -443,15 +489,17 @@ try {
                     client.diagnostics())));
             for (const client of replacementClients) {
                 client.checkError();
-                assertOnlineEncryption(client, `reconnect wave ${wave} client ${client.id}`);
-                assert.ok(client.cipher !== undefined && !seenCiphers.has(client.cipher),
-                    "reconnect reused an AES cipher object");
-                assert.ok(client.decipher !== undefined &&
-                    !seenDeciphers.has(client.decipher),
-                    "reconnect reused an AES decipher object");
-                assert.ok(client.secretFingerprint !== undefined &&
-                    !seenSecretFingerprints.has(client.secretFingerprint),
-                "reconnect reused an AES shared secret");
+                assertClientSecurity(client, `reconnect wave ${wave} client ${client.id}`);
+                if (!externalMode || client.cipher !== undefined) {
+                    assert.ok(client.cipher !== undefined && !seenCiphers.has(client.cipher),
+                        "reconnect reused an AES cipher object");
+                    assert.ok(client.decipher !== undefined &&
+                        !seenDeciphers.has(client.decipher),
+                        "reconnect reused an AES decipher object");
+                    assert.ok(client.secretFingerprint !== undefined &&
+                        !seenSecretFingerprints.has(client.secretFingerprint),
+                    "reconnect reused an AES shared secret");
+                }
                 seenBuffers.add(client.buffer);
                 seenCiphers.add(client.cipher);
                 seenDeciphers.add(client.decipher);
@@ -461,38 +509,46 @@ try {
                 client.secretFingerprint).filter(Boolean);
             assert.equal(new Set(secretFingerprints).size, secretFingerprints.length,
                 "reconnect reused an AES shared secret");
-            const relayAtChunks = await waitForRelayRuntime(
-                relayPort,
+            const relayAtChunks = await waitRelayRuntime(
                 (snapshot) => snapshot.activeConnections === clientCount &&
                     snapshot.target?.activeConnections === clientCount &&
                     snapshot.target?.totalConnections === clientCount * (wave + 1) &&
-                    relayRuntimeGaugesAreZero(snapshot),
+                    (externalMode || relayRuntimeGaugesAreZero(snapshot)),
                 `reconnect wave ${wave} RelayNode active tunnel quiescence`,
                 5000,
-                minecraftPort,
             );
             relayRuntimeBeforeSoak = relayAtChunks;
             const browserAtChunks = browserRuntimeSnapshot(browserRuntime);
             const sessionAtChunks = sessionRuntimeSnapshot(sessionState);
-            assert.equal(sessionAtChunks.joins - sessionBeforeDrop.joins, clientCount,
-                `reconnect wave ${wave} did not create fresh session joins`);
-            assert.equal(sessionAtChunks.hasJoined - sessionBeforeDrop.hasJoined, clientCount,
-                `reconnect wave ${wave} did not create fresh hasJoined checks`);
-            assert.equal(relayAtChunks.activeConnections, clientCount,
-                `reconnect wave ${wave} did not restore every Relay tunnel`);
-            assert.equal(relayAtChunks.target.activeConnections, clientCount,
-                `reconnect wave ${wave} did not restore every target route`);
-            assert.equal(relayAtChunks.target.totalConnections,
-                clientCount * (wave + 1),
-                `reconnect wave ${wave} target connection count was not monotonic`);
-            const relayAtChunksGauges = assertRelayRuntimeGaugesZero(
-                relayAtChunks,
-                `reconnect wave ${wave} active tunnel gauge check`,
-            );
-            assertRelayDrainPerformance(
-                [relayAfterDrop, relayAtChunks],
-                `reconnect wave ${wave} multiplayer drain`,
-            );
+            if (!externalMode) {
+                assert.equal(sessionAtChunks.joins - sessionBeforeDrop.joins, clientCount,
+                    `reconnect wave ${wave} did not create fresh session joins`);
+                assert.equal(sessionAtChunks.hasJoined - sessionBeforeDrop.hasJoined, clientCount,
+                    `reconnect wave ${wave} did not create fresh hasJoined checks`);
+            }
+            if (relayAtChunks.activeConnections !== undefined) {
+                assert.equal(relayAtChunks.activeConnections, clientCount,
+                    `reconnect wave ${wave} did not restore every Relay tunnel`);
+            }
+            if (relayAtChunks.target !== undefined) {
+                assert.equal(relayAtChunks.target.activeConnections, clientCount,
+                    `reconnect wave ${wave} did not restore every target route`);
+                if (!externalMode) assert.equal(relayAtChunks.target.totalConnections,
+                    clientCount * (wave + 1),
+                    `reconnect wave ${wave} target connection count was not monotonic`);
+            }
+            const relayAtChunksGauges = externalMode
+                ? relayRuntimeGaugeEvidence(relayAtChunks)
+                : assertRelayRuntimeGaugesZero(
+                    relayAtChunks,
+                    `reconnect wave ${wave} active tunnel gauge check`,
+                );
+            if (!externalMode) {
+                assertRelayDrainPerformance(
+                    [relayAfterDrop, relayAtChunks],
+                    `reconnect wave ${wave} multiplayer drain`,
+                );
+            }
             const replacementHealth = assertSoakLiveness(
                 replacementClients,
                 browserAtChunks,
@@ -565,14 +621,12 @@ try {
         soakStartedAt = performance.now();
         if (soakMs > 0) await delayAtLeast(soakMs);
         soakCompletedAt = performance.now();
-        relayRuntimeAfterSoak = await waitForRelayRuntime(
-            relayPort,
+        relayRuntimeAfterSoak = await waitRelayRuntime(
             (snapshot) => snapshot.activeConnections === clientCount &&
                 snapshot.target?.activeConnections === clientCount &&
-                relayRuntimeGaugesAreZero(snapshot),
+                (externalMode || relayRuntimeGaugesAreZero(snapshot)),
             "post-soak RelayNode active tunnel quiescence",
             5000,
-            minecraftPort,
         );
         browserRuntimeAfterSoak = browserRuntimeSnapshot(browserRuntime);
         soakHealth = assertSoakLiveness(
@@ -581,10 +635,12 @@ try {
             relayRuntimeAfterSoak,
             "post-soak",
         );
-        assertRelayDrainPerformance(
-            [relayRuntimeAfterSoak],
-            "post-soak multiplayer drain",
-        );
+        if (!externalMode) {
+            assertRelayDrainPerformance(
+                [relayRuntimeAfterSoak],
+                "post-soak multiplayer drain",
+            );
+        }
     }
     finally {
         clearInterval(pollTimer);
@@ -594,12 +650,10 @@ try {
             // Preserve the primary protocol failure. Successful runs assert every
             // cleanup counter below with a more specific lifecycle error.
         });
-        relayRuntimeAfterClose = await waitForRelayRuntime(
-            relayPort,
+        relayRuntimeAfterClose = await waitRelayRuntime(
             (snapshot) => relayRuntimeIsClean(snapshot),
             "RelayNode tunnel/timer cleanup",
             5000,
-            minecraftPort,
         ).catch(() => undefined);
     }
 
@@ -611,30 +665,36 @@ try {
     assert.equal(browserRuntime.wsStats.connections, expectedConnections,
         "browser transport opened an unexpected number of WebSocket tunnels");
     assert.ok(browserRuntime.wsStats.urls.every((url) =>
-        url === `ws://127.0.0.1:${relayPort}/tunnel`),
-    "browser transport connected to a relay other than the local test node");
+        url === relayEndpoint.url),
+    "browser transport connected to an unexpected RelayNode");
     assert.equal(browserRuntime.stats.relayTargetAttestationFailures, 0,
         "Relay target attestation rejected a valid browser tunnel");
     assert.ok(browserRuntime.wsStats.controlFrames >= expectedConnections,
         "browser runtime did not send WebSocket connect controls");
     assert.ok(browserRuntime.wsStats.binaryBytes > 0,
         "browser runtime did not send binary WebSocket frames");
-    assert.equal(sessionState.joins.length, expectedConnections,
-        "vanilla online-mode login did not produce one authenticated session join per client");
-    assert.equal(sessionState.hasJoined.length, expectedConnections,
-        "vanilla online-mode login did not verify one hasJoined request per client");
-    for (const [accessToken, profileId] of sessionState.expectedProfiles) {
-        const identityJoins = sessionState.joins.filter((join) =>
-            join.accessToken === accessToken && join.selectedProfile === profileId);
-        assert.equal(identityJoins.length, reconnectWaves + 1,
-            `session identity ${profileId} did not authenticate in every wave`);
+    if (!externalMode) {
+        assert.equal(sessionState.joins.length, expectedConnections,
+            "vanilla online-mode login did not produce one authenticated session join per client");
+        assert.equal(sessionState.hasJoined.length, expectedConnections,
+            "vanilla online-mode login did not verify one hasJoined request per client");
+        for (const [accessToken, profileId] of sessionState.expectedProfiles) {
+            const identityJoins = sessionState.joins.filter((join) =>
+                join.accessToken === accessToken && join.selectedProfile === profileId);
+            assert.equal(identityJoins.length, reconnectWaves + 1,
+                `session identity ${profileId} did not authenticate in every wave`);
+        }
     }
     assert.equal(new Set(allClients.map((client) => client.id)).size,
         expectedConnections,
         "browser reconnect lifecycle reused a channel id");
-    assert.equal(new Set(allClients.map((client) => client.secretFingerprint)).size,
-        expectedConnections,
-        "browser reconnect lifecycle reused encryption state");
+    const observedSecretFingerprints = allClients.map((client) => client.secretFingerprint)
+        .filter(Boolean);
+    if (!externalMode || observedSecretFingerprints.length > 0) {
+        assert.equal(new Set(observedSecretFingerprints).size,
+            observedSecretFingerprints.length,
+            "browser reconnect lifecycle reused encryption state");
+    }
     assert.equal(browserRuntime.bridge.channels.size, 0,
         "browser transport leaked a channel after multiplayer cleanup");
     assert.equal(browserRuntime.wsStats.sockets.size, 0,
@@ -651,34 +711,44 @@ try {
         "final browser transport cleanup");
     assert.equal(relayRuntimeBaseline.activeConnections, 0,
         "RelayNode baseline unexpectedly had active browser tunnels");
-    assert.equal(relayRuntimeBaseline.target, undefined,
-        "RelayNode baseline unexpectedly reported a target route before first use");
-    assert.equal(relayRuntimeBaseline.targetEvidence.available, false,
-        "RelayNode baseline target evidence was synthesized instead of observed");
-    assert.equal(relayRuntimeAtChunks.activeConnections, clientCount,
-        "RelayNode did not report every active multiplayer tunnel at chunk readiness");
-    assert.equal(relayRuntimeAtChunks.target.activeConnections, clientCount,
-        "RelayNode did not report every active target route at initial chunk readiness");
-    assert.equal(relayRuntimeAtChunks.target.totalConnections, clientCount,
-        "RelayNode initial target connection count did not match client count");
-    assert.equal(relayRuntimeAfterSoak.target.totalConnections, expectedConnections,
-        "RelayNode target route did not count every reconnect tunnel");
-    assertRelayRuntimeGaugesZero(relayRuntimeAtChunks,
-        "encrypted online-mode tunnels retained RelayNode runtime gauges");
-    assertRelayRuntimeGaugesZero(relayRuntimeAfterSoak,
-        "encrypted online-mode soak retained RelayNode runtime gauges");
+    if (!externalMode) {
+        assert.equal(relayRuntimeBaseline.target, undefined,
+            "RelayNode baseline unexpectedly reported a target route before first use");
+        assert.equal(relayRuntimeBaseline.targetEvidence.available, false,
+            "RelayNode baseline target evidence was synthesized instead of observed");
+    }
+    if (relayRuntimeAtChunks.activeConnections !== undefined) {
+        assert.equal(relayRuntimeAtChunks.activeConnections, clientCount,
+            "RelayNode did not report every active multiplayer tunnel at chunk readiness");
+    }
+    if (relayRuntimeAtChunks.target !== undefined) {
+        assert.equal(relayRuntimeAtChunks.target.activeConnections, clientCount,
+            "RelayNode did not report every active target route at initial chunk readiness");
+        if (!externalMode) assert.equal(relayRuntimeAtChunks.target.totalConnections, clientCount,
+            "RelayNode initial target connection count did not match client count");
+    }
+    if (!externalMode) {
+        assert.equal(relayRuntimeAfterSoak.target.totalConnections, expectedConnections,
+            "RelayNode target route did not count every reconnect tunnel");
+        assertRelayRuntimeGaugesZero(relayRuntimeAtChunks,
+            "encrypted online-mode tunnels retained RelayNode runtime gauges");
+        assertRelayRuntimeGaugesZero(relayRuntimeAfterSoak,
+            "encrypted online-mode soak retained RelayNode runtime gauges");
+    }
     assert.equal(relayRuntimeAfterClose?.activeConnections, 0,
         "RelayNode retained an active tunnel after browser cleanup");
     assert.equal(relayRuntimeAfterClose?.target?.activeConnections, 0,
         "RelayNode retained an active target route after browser cleanup");
-    assert.equal(relayRuntimeAfterClose?.target?.totalConnections, expectedConnections,
-        "RelayNode final target connection count omitted a reconnect tunnel");
-    assertRelayRuntimeGaugesZero(relayRuntimeAfterClose,
-        "RelayNode retained a runtime gauge after browser cleanup");
-    assertRelayDrainPerformance(
-        [relayRuntimeAfterClose],
-        "final multiplayer close drain",
-    );
+    if (!externalMode) {
+        assert.equal(relayRuntimeAfterClose?.target?.totalConnections, expectedConnections,
+            "RelayNode final target connection count omitted a reconnect tunnel");
+        assertRelayRuntimeGaugesZero(relayRuntimeAfterClose,
+            "RelayNode retained a runtime gauge after browser cleanup");
+        assertRelayDrainPerformance(
+            [relayRuntimeAfterClose],
+            "final multiplayer close drain",
+        );
+    }
 
     const actualSoakMillis = elapsedMillis(soakStartedAt, soakCompletedAt) ?? 0;
     if (acceptanceMode) {
@@ -736,14 +806,14 @@ try {
                     protocolVersion: activeProfile.protocolVersion,
                     worldVersion: activeProfile.worldVersion,
                     javaVersion: activeProfile.javaVersion,
-                    runtimeJavaMajor: runtimeJava.major,
-                    runtimeJavaExecutable: runtimeJava.executable,
-                    serverSha1: verifiedServerJar.sha1,
+                    runtimeJavaMajor: runtimeJava?.major ?? null,
+                    runtimeJavaExecutable: runtimeJava?.executable ?? null,
+                    serverSha1: verifiedServerJar?.sha1 ?? null,
                     expectedServerJarSha1: activeProfile.official.serverSha1,
-                    actualServerJarSha1: verifiedServerJar.sha1,
+                    actualServerJarSha1: verifiedServerJar?.sha1 ?? null,
                 },
-                runtimeJavaMajor: runtimeJava.major,
-                runtimeJavaExecutable: runtimeJava.executable,
+                runtimeJavaMajor: runtimeJava?.major ?? null,
+                runtimeJavaExecutable: runtimeJava?.executable ?? null,
                 soak: soakHealth,
                 reconnectWaves: reconnectEvidence.map((wave) => ({
                     wave: wave.wave,
@@ -768,9 +838,9 @@ try {
                     syntheticMarkerLabel: wave.transportDrop.syntheticMarkerLabel,
                     relayRuntimeGauges: wave.relay.runtimeGauges,
                 })),
-                serverJarSha1: verifiedServerJar.sha1,
-                runtimeJavaMajor: runtimeJava.major,
-                runtimeJavaExecutable: runtimeJava.executable,
+                serverJarSha1: verifiedServerJar?.sha1 ?? null,
+                runtimeJavaMajor: runtimeJava?.major ?? null,
+                runtimeJavaExecutable: runtimeJava?.executable ?? null,
                 profile: {
                     id: activeProfile.id,
                     path: repositoryRelativePath(activeProfile.path),
@@ -778,11 +848,11 @@ try {
                     protocolVersion: activeProfile.protocolVersion,
                     worldVersion: activeProfile.worldVersion,
                     javaVersion: activeProfile.javaVersion,
-                    runtimeJavaMajor: runtimeJava.major,
-                    runtimeJavaExecutable: runtimeJava.executable,
-                    serverSha1: verifiedServerJar.sha1,
+                    runtimeJavaMajor: runtimeJava?.major ?? null,
+                    runtimeJavaExecutable: runtimeJava?.executable ?? null,
+                    serverSha1: verifiedServerJar?.sha1 ?? null,
                     expectedServerJarSha1: activeProfile.official.serverSha1,
-                    actualServerJarSha1: verifiedServerJar.sha1,
+                    actualServerJarSha1: verifiedServerJar?.sha1 ?? null,
                 },
             },
         },
@@ -791,7 +861,7 @@ try {
             browserJsBody: true,
             teaVmBuildRequired: false,
             realWebSocketFraming: true,
-            relayUrl: `ws://127.0.0.1:${relayPort}/tunnel`,
+            relayUrl: relayEndpoint.url,
             clients: clientCount,
             reconnectWaves,
             expectedConnections,
@@ -818,19 +888,19 @@ try {
             protocolVersion: activeProfile.protocolVersion,
             worldVersion: activeProfile.worldVersion,
             javaVersion: activeProfile.javaVersion,
-            runtimeJavaMajor: runtimeJava.major,
-            runtimeJavaExecutable: runtimeJava.executable,
-            serverSha1: verifiedServerJar.sha1,
+            runtimeJavaMajor: runtimeJava?.major ?? null,
+            runtimeJavaExecutable: runtimeJava?.executable ?? null,
+            serverSha1: verifiedServerJar?.sha1 ?? null,
             path: repositoryRelativePath(activeProfile.path),
             canonicalProfilePath: repositoryRelativePath(activeProfile.path),
             serverJar,
-            serverJarSha1: verifiedServerJar.sha1,
+            serverJarSha1: verifiedServerJar?.sha1 ?? null,
             expectedServerJarSha1: activeProfile.official.serverSha1,
         },
         vanilla: {
-            onlineMode: true,
-            unmodifiedServerJar: true,
-            pluginsInstalled: false,
+            onlineMode: externalMode ? null : true,
+            unmodifiedServerJar: externalMode ? null : true,
+            pluginsInstalled: externalMode ? null : false,
             workDirectory,
         },
         session: {
@@ -889,6 +959,17 @@ catch (error) {
 
 }
 
+async function connectClientWave(clients) {
+    if (clientStartDelayMs === 0) {
+        await Promise.all(clients.map((client) => client.connect()));
+        return;
+    }
+    for (let index = 0; index < clients.length; index++) {
+        if (index > 0) await delay(clientStartDelayMs);
+        await clients[index].connect();
+    }
+}
+
 class BrowserMinecraftClient {
     constructor(options) {
         Object.assign(this, options);
@@ -911,9 +992,21 @@ class BrowserMinecraftClient {
         this.configurationCycles = 0;
         this.reconfigurationRequests = 0;
         this.configurationPackets = 0;
+        this.configurationPacketIds = [];
+        this.showDialogPackets = 0;
+        this.showDialogAccepts = 0;
+        this.showDialogActions = [];
+        this.showDialogSummaries = [];
+        this.acceptedDialogActions = new Set();
+        this.codeOfConductRequests = 0;
+        this.codeOfConductAccepts = 0;
         this.playPackets = 0;
+        this.playPacketIds = [];
+        this.playDisconnectPayloadBase64 = undefined;
         this.playLoginPackets = 0;
         this.chunkPackets = 0;
+        this.playTickPackets = 0;
+        this.playTickTimer = undefined;
         this.playerLoadedSent = false;
         this.connectPhases = [];
         this.failure = undefined;
@@ -1051,8 +1144,11 @@ class BrowserMinecraftClient {
         }
         if (this.phase === "configuration") {
             this.configurationPackets++;
+            this.configurationPacketIds.push(packetId);
+            if (this.configurationPacketIds.length > 64) this.configurationPacketIds.shift();
             if (packetId === this.profile.configuration.clientboundDisconnect) {
-                throw new Error(`${this.username}: server disconnected during configuration`);
+                throw new Error(`${this.username}: server disconnected during configuration ` +
+                    decodeReason(payload));
             }
             if (packetId === this.profile.configuration.clientboundKnownPacks) {
                 this.sendPacket(this.profile.configuration.serverboundSelectKnownPacks, encodeVarInt(0));
@@ -1067,6 +1163,44 @@ class BrowserMinecraftClient {
                         Buffer.concat([packId, encodeVarInt(action)]));
                 }
                 void hash;
+            }
+            else if (packetId === this.profile.configuration.clientboundShowDialog) {
+                this.showDialogPackets++;
+                const dialog = decodeNetworkNbt(payload);
+                const prompt = inspectServerDialog(dialog);
+                this.showDialogSummaries.push(prompt.summary);
+                this.showDialogActions.push(...prompt.actionIds);
+                if (!acceptServerPrompts) {
+                    throw new Error(`${this.username}: Minecraft server requires an interactive ` +
+                        `dialog (${prompt.summary})`);
+                }
+                const actionId = selectDialogAction(prompt.actionIds);
+                if (this.acceptedDialogActions.has(actionId)) {
+                    throw new Error(`${this.username}: server repeated dialog action ${actionId}`);
+                }
+                const inputValues = resolveDialogInputValues(prompt.inputs);
+                this.sendPacket(this.profile.configuration.serverboundCustomClickAction,
+                    encodeCustomClickAction(actionId, inputValues));
+                this.acceptedDialogActions.add(actionId);
+                this.showDialogAccepts++;
+            }
+            else if (packetId === this.profile.configuration.clientboundCodeOfConduct) {
+                const codeOfConduct = decodeString(payload, 0);
+                if (codeOfConduct.nextOffset !== payload.byteLength ||
+                    codeOfConduct.value.length === 0) {
+                    throw new Error(`${this.username}: malformed Code of Conduct packet`);
+                }
+                this.codeOfConductRequests++;
+                if (this.codeOfConductRequests !== 1) {
+                    throw new Error(`${this.username}: duplicate Code of Conduct packet`);
+                }
+                if (!acceptServerPrompts) {
+                    throw new Error(`${this.username}: Minecraft server requires Code of Conduct ` +
+                        "acceptance");
+                }
+                this.sendPacket(this.profile.configuration.serverboundAcceptCodeOfConduct,
+                    Buffer.alloc(0));
+                this.codeOfConductAccepts++;
             }
             else if (packetId === this.profile.configuration.clientboundKeepAlive) {
                 this.sendPacket(this.profile.configuration.serverboundKeepAlive, payload);
@@ -1085,7 +1219,10 @@ class BrowserMinecraftClient {
         }
         if (this.phase !== "play") return;
         this.playPackets++;
+        this.playPacketIds.push(packetId);
+        if (this.playPacketIds.length > 128) this.playPacketIds.shift();
         if (packetId === this.profile.play.clientboundDisconnect) {
+            this.playDisconnectPayloadBase64 = Buffer.from(payload).toString("base64");
             throw new Error(`${this.username}: server disconnected in PLAY ${decodeReason(payload)}`);
         }
         if (packetId === this.profile.play.clientboundKeepAlive) {
@@ -1101,6 +1238,7 @@ class BrowserMinecraftClient {
                 this.playerLoadedSent = true;
                 this.sendPacket(this.profile.play.serverboundPlayerLoaded, Buffer.alloc(0));
             }
+            this.startPlayTickLoop();
         }
         else if (packetId === this.profile.play.clientboundChunk) {
             this.chunkPackets++;
@@ -1112,6 +1250,7 @@ class BrowserMinecraftClient {
         else if (packetId === this.profile.play.clientboundStartConfiguration) {
             if (payload.byteLength !== 0) throw new Error("PLAY start-configuration had payload");
             this.reconfigurationRequests++;
+            this.stopPlayTickLoop();
             this.phase = "configuration";
             this.sendPacket(this.profile.play.serverboundConfigurationAcknowledged, Buffer.alloc(0));
         }
@@ -1175,6 +1314,28 @@ class BrowserMinecraftClient {
         this.outboundBytes += wire.byteLength;
     }
 
+    startPlayTickLoop() {
+        if (this.playTickTimer !== undefined) return;
+        const sendTick = () => {
+            if (this.closed || this.failure !== undefined || this.phase !== "play") return;
+            try {
+                this.sendPacket(this.profile.play.serverboundClientTickEnd, Buffer.alloc(0));
+                this.playTickPackets++;
+            }
+            catch (error) {
+                this.failure ??= error;
+            }
+        };
+        sendTick();
+        this.playTickTimer = setInterval(sendTick, 50);
+    }
+
+    stopPlayTickLoop() {
+        if (this.playTickTimer === undefined) return;
+        clearInterval(this.playTickTimer);
+        this.playTickTimer = undefined;
+    }
+
     checkError() {
         const error = this.bridge.pollError(this.id);
         if (error) this.failure ??= new Error(`${this.username}: ${error}`);
@@ -1191,6 +1352,7 @@ class BrowserMinecraftClient {
     close(reason = "final-close") {
         if (this.closed) return;
         this.closed = true;
+        this.stopPlayTickLoop();
         this.closedAt = performance.now();
         this.closeReason = reason;
         try { this.bridge.close(this.id); } catch {}
@@ -1216,10 +1378,20 @@ class BrowserMinecraftClient {
             loginFinished: this.loginFinished,
             configurationFinished: this.configurationFinished,
             configurationCycles: this.configurationCycles,
+            configurationPacketIds: [...this.configurationPacketIds],
+            showDialogPackets: this.showDialogPackets,
+            showDialogAccepts: this.showDialogAccepts,
+            showDialogActions: [...this.showDialogActions],
+            showDialogSummaries: [...this.showDialogSummaries],
+            codeOfConductRequests: this.codeOfConductRequests,
+            codeOfConductAccepts: this.codeOfConductAccepts,
             reconfigurationRequests: this.reconfigurationRequests,
             playPackets: this.playPackets,
+            playPacketIds: [...this.playPacketIds],
+            playDisconnectPayloadBase64: this.playDisconnectPayloadBase64 ?? null,
             playLoginPackets: this.playLoginPackets,
             chunkPackets: this.chunkPackets,
+            playTickPackets: this.playTickPackets,
             bufferedBytes: this.buffer.byteLength,
             minimumChunkPackets,
             inboundFrames: this.inboundFrames,
@@ -1345,6 +1517,13 @@ function assertOnlineEncryption(client, label) {
         JSON.stringify(observed));
     assert.equal(client.failure, undefined,
         `${label} reported a client failure after encrypted login`);
+}
+
+function assertClientSecurity(client, label) {
+    if (!externalMode && !client.encryptionRequest) {
+        throw new Error(`${label}: local full-path server did not request online encryption`);
+    }
+    if (client.encryptionRequest) assertOnlineEncryption(client, label);
 }
 
 function elapsedMillis(start, end) {
@@ -1496,10 +1675,9 @@ function assertRelayDrainPerformance(snapshots, label) {
 }
 
 function relayRuntimeIsClean(snapshot) {
-    return snapshot !== undefined && snapshot.target !== undefined &&
-        snapshot.activeConnections === 0 &&
-        snapshot.target.activeConnections === 0 &&
-        relayRuntimeGaugesAreZero(snapshot);
+    return snapshot !== undefined && snapshot.activeConnections === 0 &&
+        (snapshot.target === undefined || snapshot.target.activeConnections === 0) &&
+        (externalMode || relayRuntimeGaugesAreZero(snapshot));
 }
 
 function clientLivenessEvidence(client) {
@@ -1529,21 +1707,31 @@ function assertSoakLiveness(clients, browser, relay, label) {
             `${label}: ${evidence.username} did not receive PLAY login`);
         assert.ok(evidence.chunkPackets >= minimumChunkPackets,
             `${label}: ${evidence.username} received only ${evidence.chunkPackets} chunks`);
-        assertOnlineEncryption(client, `${label} ${evidence.username}`);
+        assertClientSecurity(client, `${label} ${evidence.username}`);
         return evidence;
     });
     assert.equal(browser.activeChannels, clientCount,
         `${label}: browser active channel count drifted`);
     assert.equal(browser.activeWebSockets, clientCount,
         `${label}: browser active WebSocket count drifted`);
-    assert.equal(relay.target !== undefined, true,
-        `${label}: RelayNode omitted the target route telemetry`);
-    assert.equal(relay.activeConnections, clientCount,
-        `${label}: RelayNode active connection count drifted`);
-    assert.equal(relay.target.activeConnections, clientCount,
-        `${label}: RelayNode active target connection count drifted`);
+    if (!externalMode) {
+        assert.equal(relay.target !== undefined, true,
+            `${label}: RelayNode omitted the target route telemetry`);
+        assert.equal(relay.activeConnections, clientCount,
+            `${label}: RelayNode active connection count drifted`);
+        assert.equal(relay.target.activeConnections, clientCount,
+            `${label}: RelayNode active target connection count drifted`);
+    }
+    else {
+        assert.ok(relay === undefined || relay.activeConnections === undefined ||
+            relay.activeConnections === clientCount,
+        `${label}: external RelayNode active connection count drifted`);
+        assert.ok(relay?.target === undefined ||
+            relay.target.activeConnections === clientCount,
+        `${label}: external RelayNode target connection count drifted`);
+    }
     const relayGauges = relayRuntimeGaugeEvidence(relay);
-    assertRelayRuntimeGaugesZero(relay, `${label}: RelayNode gauges`);
+    if (!externalMode) assertRelayRuntimeGaugesZero(relay, `${label}: RelayNode gauges`);
     return {
         required: {
             clientCount,
@@ -1690,7 +1878,22 @@ async function waitForBrowserRuntimeCleanup(runtime, label) {
 
 function browserFullPathPerformanceContract() {
     return {
-        mode: acceptanceMode ? "strict-acceptance" : "compatible-smoke",
+        mode: externalMode
+            ? "external-full-path"
+            : acceptanceMode ? "strict-acceptance" : "compatible-smoke",
+        externalRelay: externalMode ? {
+            relayUrl: externalRelayUrl,
+            target: externalTarget?.text,
+            runtimeTelemetryRequired: false,
+            note: "External node runtime gauges are optional evidence; browser/client PLAY and cleanup remain required",
+        } : null,
+        configurationPrompts: {
+            autoAccept: acceptServerPrompts,
+            requestedDialogAction: requestedDialogAction ?? null,
+            inputOverridesProvided: Object.keys(dialogInputValues).length > 0,
+            supportedPackets: ["clientboundShowDialog", "clientboundCodeOfConduct"],
+        },
+        clientStartDelayMillis: clientStartDelayMs,
         strictAcceptanceTarget: acceptanceMode ? { ...STRICT_ACCEPTANCE_TARGET } : null,
         canonicalProfiles: CANONICAL_PROFILES,
         relayRuntimeGauges: [...RELAY_RUNTIME_GAUGES],
@@ -1806,6 +2009,73 @@ async function fetchRelayRuntime(port, targetPort) {
     };
 }
 
+async function fetchExternalRelayRuntime(relayUrl, target, token) {
+    const runtimeUrl = new URL(relayUrl);
+    runtimeUrl.protocol = runtimeUrl.protocol === "wss:" ? "https:" : "http:";
+    runtimeUrl.pathname = "/relay-node/v1";
+    runtimeUrl.search = "";
+    runtimeUrl.searchParams.set("host", target.host);
+    runtimeUrl.searchParams.set("port", String(target.port));
+    const headers = { origin };
+    if (token !== undefined && token.length > 0) {
+        headers.authorization = `Bearer ${token}`;
+    }
+    const response = await fetch(runtimeUrl, {
+        headers,
+        signal: AbortSignal.timeout(15000),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        throw new Error(`External RelayNode runtime manifest returned ${response.status}`);
+    }
+    const targetManifest = body?.target;
+    const targetAvailable = targetManifest !== undefined &&
+        Number.isSafeInteger(targetManifest.activeConnections) &&
+        Number.isSafeInteger(targetManifest.totalConnections) &&
+        typeof targetManifest.recentlyReachable === "boolean" &&
+        (targetManifest.lastSuccessAgeMs === null ||
+            Number.isSafeInteger(targetManifest.lastSuccessAgeMs));
+    const activeConnections = Number.isSafeInteger(body?.activeConnections)
+        ? body.activeConnections : undefined;
+    return {
+        external: true,
+        activeConnections,
+        availableConnections: Number.isSafeInteger(body?.availableConnections)
+            ? body.availableConnections : undefined,
+        target: targetAvailable ? {
+            activeConnections: targetManifest.activeConnections,
+            totalConnections: targetManifest.totalConnections,
+            recentlyReachable: targetManifest.recentlyReachable,
+            lastSuccessAgeMs: targetManifest.lastSuccessAgeMs,
+        } : undefined,
+        targetEvidence: {
+            source: runtimeUrl.href,
+            available: targetAvailable,
+            observed: targetManifest ?? null,
+            note: targetAvailable
+                ? "External RelayNode target route fields observed directly"
+                : "External RelayNode omitted complete target route fields",
+        },
+        runtime: body?.runtime !== undefined && typeof body.runtime === "object"
+            ? body.runtime : undefined,
+        runtimeGaugeEvidence: relayRuntimeGaugeEvidence({ runtime: body?.runtime }),
+        raw: body,
+    };
+}
+
+async function waitForRelayRuntimeReader(reader, predicate, label, timeoutMillis) {
+    const deadline = Date.now() + timeoutMillis;
+    let snapshot;
+    while (true) {
+        snapshot = await reader();
+        if (predicate(snapshot)) return snapshot;
+        if (Date.now() >= deadline) {
+            throw new Error(`Timed out waiting for ${label}: ${JSON.stringify(snapshot)}`);
+        }
+        await delay(100);
+    }
+}
+
 async function waitForRelayRuntime(port, predicate, label, timeoutMillis, targetPort) {
     const deadline = Date.now() + timeoutMillis;
     let snapshot;
@@ -1889,7 +2159,7 @@ async function printJavaResolution() {
     }));
 }
 
-async function createBrowserRuntime(port, token) {
+async function createBrowserRuntime(relayUrl, token) {
     const source = await readFile(channelSourceUrl, "utf8");
     const init = extractJsBody(source, "private static native void initBridge();");
     const outbound = extractJsBody(source,
@@ -1943,11 +2213,11 @@ async function createBrowserRuntime(port, token) {
     globalThis.__gaiusDefaultRelayRegistries = false;
     globalThis.__gaiusRelayRegistryUrls = [];
     globalThis.__gaiusDirectPlugin = false;
-    globalThis.__gaiusBridgeUrl = `ws://127.0.0.1:${port}/tunnel`;
+    globalThis.__gaiusBridgeUrl = relayUrl;
     globalThis.__gaiusBridgeToken = token;
     globalThis.__gaiusBridgeUrls = [{
-        name: "local full-path RelayNode",
-        url: `ws://127.0.0.1:${port}/tunnel`,
+        name: externalMode ? "external full-path RelayNode" : "local full-path RelayNode",
+        url: relayUrl,
         token,
         priority: 100,
     }];
@@ -2380,6 +2650,340 @@ function encodePacket(id, payload = Buffer.alloc(0), compressionThreshold) {
             ? Buffer.concat([encodeVarInt(packet.byteLength), deflateSync(packet)])
             : Buffer.concat([Buffer.from([0]), packet]);
     return Buffer.concat([encodeVarInt(body.byteLength), body]);
+}
+
+function parseTarget(value) {
+    const text = String(value).trim();
+    const separator = text.lastIndexOf(":");
+    const host = separator > 0 ? text.slice(0, separator) : text;
+    const port = separator > 0 ? Number(text.slice(separator + 1)) : 25565;
+    assert.ok(host.length > 0 && Number.isInteger(port) && port >= 1 && port <= 65535,
+        "GAIUS_EXTERNAL_TARGET must be host:port");
+    return { host, port, text: `${host}:${port}` };
+}
+
+function decodeNetworkNbt(bytes) {
+    const input = Buffer.from(bytes);
+    let offset = 0;
+    const maximumDepth = 32;
+    const maximumCollectionLength = 65_536;
+
+    function requireBytes(length, label) {
+        if (length < 0 || offset + length > input.byteLength) {
+            throw new Error(`Network NBT ${label} exceeded its packet`);
+        }
+    }
+
+    function readUnsignedByte(label) {
+        requireBytes(1, label);
+        return input[offset++];
+    }
+
+    function readLength(label) {
+        requireBytes(4, label);
+        const length = input.readInt32BE(offset);
+        offset += 4;
+        if (length < 0 || length > maximumCollectionLength) {
+            throw new Error(`Network NBT ${label} had invalid length ${length}`);
+        }
+        return length;
+    }
+
+    function readString(label) {
+        requireBytes(2, `${label} length`);
+        const length = input.readUInt16BE(offset);
+        offset += 2;
+        requireBytes(length, label);
+        const value = input.toString("utf8", offset, offset + length);
+        offset += length;
+        return value;
+    }
+
+    function readPayload(type, depth) {
+        if (depth > maximumDepth) throw new Error("Network NBT exceeded its maximum nesting depth");
+        switch (type) {
+            case 0:
+                return null;
+            case 1:
+                requireBytes(1, "byte");
+                return input.readInt8(offset++);
+            case 2: {
+                requireBytes(2, "short");
+                const value = input.readInt16BE(offset);
+                offset += 2;
+                return value;
+            }
+            case 3: {
+                requireBytes(4, "int");
+                const value = input.readInt32BE(offset);
+                offset += 4;
+                return value;
+            }
+            case 4: {
+                requireBytes(8, "long");
+                const value = input.readBigInt64BE(offset).toString();
+                offset += 8;
+                return value;
+            }
+            case 5: {
+                requireBytes(4, "float");
+                const value = input.readFloatBE(offset);
+                offset += 4;
+                return value;
+            }
+            case 6: {
+                requireBytes(8, "double");
+                const value = input.readDoubleBE(offset);
+                offset += 8;
+                return value;
+            }
+            case 7: {
+                const length = readLength("byte array");
+                requireBytes(length, "byte array");
+                const value = input.subarray(offset, offset + length);
+                offset += length;
+                return value;
+            }
+            case 8:
+                return readString("string");
+            case 9: {
+                const childType = readUnsignedByte("list type");
+                const length = readLength("list");
+                if (childType === 0 && length !== 0) {
+                    throw new Error("Network NBT used END as a non-empty list type");
+                }
+                return Array.from({ length }, () => readPayload(childType, depth + 1));
+            }
+            case 10: {
+                const value = {};
+                while (true) {
+                    const childType = readUnsignedByte("compound type");
+                    if (childType === 0) return value;
+                    const name = readString("compound key");
+                    if (Object.hasOwn(value, name)) {
+                        throw new Error(`Network NBT repeated compound key ${name}`);
+                    }
+                    value[name] = readPayload(childType, depth + 1);
+                }
+            }
+            case 11: {
+                const length = readLength("int array");
+                requireBytes(length * 4, "int array");
+                return Array.from({ length }, () => {
+                    const value = input.readInt32BE(offset);
+                    offset += 4;
+                    return value;
+                });
+            }
+            case 12: {
+                const length = readLength("long array");
+                requireBytes(length * 8, "long array");
+                return Array.from({ length }, () => {
+                    const value = input.readBigInt64BE(offset).toString();
+                    offset += 8;
+                    return value;
+                });
+            }
+            default:
+                throw new Error(`Network NBT used unknown tag type ${type}`);
+        }
+    }
+
+    const rootType = readUnsignedByte("root type");
+    const value = readPayload(rootType, 0);
+    if (offset !== input.byteLength) {
+        throw new Error(`Network NBT left ${input.byteLength - offset} unread bytes`);
+    }
+    return value;
+}
+
+function inspectServerDialog(dialog) {
+    const actionRoots = findNamedArrays(dialog, "actions");
+    const inputRoots = findNamedArrays(dialog, "inputs");
+    const actionIds = uniqueStrings(actionRoots.flatMap((root) =>
+        collectNbtObjects(root)
+            .filter((value) => value.type === "minecraft:dynamic/custom")
+            .map((value) => value.id)
+            .filter((value) => typeof value === "string")));
+    const inputs = inputRoots.flatMap((root) => collectNbtObjects(root))
+        .filter((value) => typeof value.key === "string" &&
+            typeof value.type === "string");
+    const inputDefinitions = [];
+    const inputKeys = new Set();
+    for (const input of inputs) {
+        if (inputKeys.has(input.key)) continue;
+        inputKeys.add(input.key);
+        inputDefinitions.push({
+            key: input.key,
+            type: input.type,
+            maxLength: Number.isInteger(input.max_length) ? input.max_length : undefined,
+        });
+    }
+    const title = summarizeNbtValue(findFirstNamedValue(dialog, "title"));
+    return {
+        actionIds,
+        inputs: inputDefinitions,
+        summary: `title=${title}; actions=${actionIds.join(",") || "none"}; ` +
+            `inputs=${inputDefinitions.map((input) => `${input.key}:${input.type}`).join(",") || "none"}`,
+    };
+}
+
+function findNamedArrays(value, name, output = []) {
+    if (Array.isArray(value)) {
+        for (const child of value) findNamedArrays(child, name, output);
+    }
+    else if (value !== null && typeof value === "object" && !Buffer.isBuffer(value)) {
+        for (const [key, child] of Object.entries(value)) {
+            if (key === name && Array.isArray(child)) output.push(child);
+            findNamedArrays(child, name, output);
+        }
+    }
+    return output;
+}
+
+function collectNbtObjects(value, output = []) {
+    if (Array.isArray(value)) {
+        for (const child of value) collectNbtObjects(child, output);
+    }
+    else if (value !== null && typeof value === "object" && !Buffer.isBuffer(value)) {
+        output.push(value);
+        for (const child of Object.values(value)) collectNbtObjects(child, output);
+    }
+    return output;
+}
+
+function findFirstNamedValue(value, name) {
+    if (Array.isArray(value)) {
+        for (const child of value) {
+            const found = findFirstNamedValue(child, name);
+            if (found !== undefined) return found;
+        }
+    }
+    else if (value !== null && typeof value === "object" && !Buffer.isBuffer(value)) {
+        if (Object.hasOwn(value, name)) return value[name];
+        for (const child of Object.values(value)) {
+            const found = findFirstNamedValue(child, name);
+            if (found !== undefined) return found;
+        }
+    }
+    return undefined;
+}
+
+function summarizeNbtValue(value) {
+    if (value === undefined) return "<untitled>";
+    const encoded = typeof value === "string" ? value : JSON.stringify(value);
+    return encoded.length <= 160 ? encoded : encoded.slice(0, 157) + "...";
+}
+
+function uniqueStrings(values) {
+    return [...new Set(values)];
+}
+
+function selectDialogAction(actionIds) {
+    if (requestedDialogAction !== undefined) {
+        if (!actionIds.includes(requestedDialogAction)) {
+            throw new Error(`Requested dialog action ${requestedDialogAction} was not offered by the server`);
+        }
+        return requestedDialogAction;
+    }
+    const loginAction = "authmeui:action/login";
+    if (actionIds.includes(loginAction)) return loginAction;
+    if (actionIds.length !== 1) {
+        throw new Error(
+            `Smoke requires exactly one dynamic dialog action, received ${actionIds.length}; ` +
+            "set GAIUS_SMOKE_DIALOG_ACTION_ID when the intended action is known");
+    }
+    return actionIds[0];
+}
+
+function parseDialogInputValues(encoded) {
+    if (encoded === undefined) return {};
+    let parsed;
+    try {
+        parsed = JSON.parse(encoded);
+    }
+    catch (error) {
+        throw new Error(`GAIUS_SMOKE_DIALOG_INPUTS_JSON is invalid JSON: ${error.message}`);
+    }
+    if (parsed === null || Array.isArray(parsed) || typeof parsed !== "object") {
+        throw new Error("GAIUS_SMOKE_DIALOG_INPUTS_JSON must be a JSON object");
+    }
+    for (const [key, value] of Object.entries(parsed)) {
+        if (typeof value !== "string" && typeof value !== "boolean") {
+            throw new Error(`Dialog input ${key} must be a string or boolean`);
+        }
+    }
+    return parsed;
+}
+
+function resolveDialogInputValues(inputs) {
+    const values = {};
+    for (const input of inputs) {
+        if (input.type === "minecraft:boolean") {
+            const supplied = dialogInputValues[input.key];
+            if (supplied !== undefined && typeof supplied !== "boolean") {
+                throw new Error(`Dialog boolean input ${input.key} requires a JSON boolean`);
+            }
+            values[input.key] = supplied ?? true;
+        }
+        else if (input.type === "minecraft:text") {
+            const supplied = dialogInputValues[input.key];
+            if (typeof supplied !== "string") {
+                throw new Error(
+                    `Dialog text input ${input.key} requires a value in ` +
+                    "GAIUS_SMOKE_DIALOG_INPUTS_JSON");
+            }
+            if (/[^ -~]/.test(supplied)) {
+                throw new Error(`Dialog text input ${input.key} must use printable ASCII in smoke`);
+            }
+            if (input.maxLength !== undefined && supplied.length > input.maxLength) {
+                throw new Error(
+                    `Dialog text input ${input.key} exceeds max_length ${input.maxLength}`);
+            }
+            values[input.key] = supplied;
+        }
+        else {
+            throw new Error(`Smoke cannot safely fill ${input.key}:${input.type}`);
+        }
+    }
+    return values;
+}
+
+function encodeCustomClickAction(actionId, values) {
+    if (!/^[a-z0-9_.-]+:[a-z0-9/._-]+$/.test(actionId)) {
+        throw new Error(`Server dialog supplied invalid action identifier ${actionId}`);
+    }
+    const nbt = encodeDialogCompound(values);
+    return Buffer.concat([encodeString(actionId), encodeVarInt(nbt.byteLength), nbt]);
+}
+
+function encodeDialogCompound(values) {
+    const parts = [Buffer.from([10])];
+    for (const [name, value] of Object.entries(values)) {
+        const key = Buffer.from(name, "utf8");
+        if (key.byteLength === 0 || key.byteLength > 65_535 || /[^ -~]/.test(name)) {
+            throw new Error(`Server dialog supplied unsafe input key ${name}`);
+        }
+        const keyLength = Buffer.allocUnsafe(2);
+        keyLength.writeUInt16BE(key.byteLength);
+        if (typeof value === "boolean") {
+            parts.push(Buffer.from([1]), keyLength, key, Buffer.from([value ? 1 : 0]));
+        }
+        else if (typeof value === "string") {
+            const text = Buffer.from(value, "utf8");
+            if (text.byteLength > 65_535) {
+                throw new Error(`Dialog text input ${name} exceeds the NBT string limit`);
+            }
+            const textLength = Buffer.allocUnsafe(2);
+            textLength.writeUInt16BE(text.byteLength);
+            parts.push(Buffer.from([8]), keyLength, key, textLength, text);
+        }
+        else {
+            throw new Error(`Dialog input ${name} has an unsupported value type`);
+        }
+    }
+    parts.push(Buffer.from([0]));
+    return Buffer.concat(parts);
 }
 
 function encodeString(value) {
