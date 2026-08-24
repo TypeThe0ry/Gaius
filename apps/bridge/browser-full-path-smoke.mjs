@@ -52,8 +52,7 @@ const acceptServerPrompts = externalMode ||
     process.env.GAIUS_BROWSER_FULL_PATH_ACCEPT_SERVER_PROMPTS === "1" ||
     process.env.GAIUS_BROWSER_FULL_PATH_ACCEPT_DIALOGS === "1";
 const requestedDialogAction = process.env.GAIUS_SMOKE_DIALOG_ACTION_ID;
-const dialogInputValues = parseDialogInputValues(
-    process.env.GAIUS_SMOKE_DIALOG_INPUTS_JSON);
+const dialogInputValues = await loadDialogInputValues();
 const commandLineArguments = process.argv.slice(2);
 const printConfigOnly = commandLineArguments.includes("--print-config");
 const printJavaResolutionOnly = commandLineArguments.includes("--print-java-resolution");
@@ -3189,6 +3188,30 @@ function parseDialogInputValues(encoded) {
         }
     }
     return parsed;
+}
+
+async function loadDialogInputValues() {
+    const inputFile = process.env.GAIUS_SMOKE_DIALOG_INPUTS_FILE?.trim();
+    const inputJson = process.env.GAIUS_SMOKE_DIALOG_INPUTS_JSON;
+    if (inputFile !== undefined && inputFile !== "" && inputJson !== undefined) {
+        throw new Error(
+            "Set only one of GAIUS_SMOKE_DIALOG_INPUTS_FILE or " +
+            "GAIUS_SMOKE_DIALOG_INPUTS_JSON",
+        );
+    }
+    if (inputFile === undefined || inputFile === "") {
+        return parseDialogInputValues(inputJson);
+    }
+    const info = await lstat(inputFile).catch((error) => {
+        throw new Error(`GAIUS_SMOKE_DIALOG_INPUTS_FILE cannot be read: ${error.message}`);
+    });
+    if (!info.isFile() || info.isSymbolicLink()) {
+        throw new Error("GAIUS_SMOKE_DIALOG_INPUTS_FILE must be a regular file");
+    }
+    if (process.platform !== "win32" && (info.mode & 0o077) !== 0) {
+        throw new Error("GAIUS_SMOKE_DIALOG_INPUTS_FILE must be owner-readable only");
+    }
+    return parseDialogInputValues(await readFile(inputFile, "utf8"));
 }
 
 function resolveDialogInputValues(inputs) {
