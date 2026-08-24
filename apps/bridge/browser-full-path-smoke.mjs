@@ -92,6 +92,7 @@ const RELAY_RUNTIME_GAUGES = Object.freeze([
     "activeServerFrameDrainTimers",
     "activeClientStallTimers",
 ]);
+const RELAY_DRAIN_MAX_DURATION_MILLIS = 16.7;
 // These counters are exported by BrowserWebSocketChannel's JSBody stats. Keep
 // their exact source names: a missing source field is evidence, not a made-up
 // zero, and is handled explicitly by browserRuntimeCleanupGaugeEvidence().
@@ -311,6 +312,10 @@ try {
         );
         assertRelayRuntimeGaugesZero(relayRuntimeAtChunks,
             "initial active tunnel gauge check");
+        assertRelayDrainPerformance(
+            [relayRuntimeAtChunks],
+            "initial multiplayer chunk readiness",
+        );
         relayRuntimeBeforeSoak = relayRuntimeAtChunks;
         const seenBuffers = new Set(currentClients.map((client) => client.buffer));
         const seenCiphers = new Set(currentClients.map((client) => client.cipher));
@@ -484,6 +489,10 @@ try {
                 relayAtChunks,
                 `reconnect wave ${wave} active tunnel gauge check`,
             );
+            assertRelayDrainPerformance(
+                [relayAfterDrop, relayAtChunks],
+                `reconnect wave ${wave} multiplayer drain`,
+            );
             const replacementHealth = assertSoakLiveness(
                 replacementClients,
                 browserAtChunks,
@@ -571,6 +580,10 @@ try {
             browserRuntimeAfterSoak,
             relayRuntimeAfterSoak,
             "post-soak",
+        );
+        assertRelayDrainPerformance(
+            [relayRuntimeAfterSoak],
+            "post-soak multiplayer drain",
         );
     }
     finally {
@@ -662,6 +675,10 @@ try {
         "RelayNode final target connection count omitted a reconnect tunnel");
     assertRelayRuntimeGaugesZero(relayRuntimeAfterClose,
         "RelayNode retained a runtime gauge after browser cleanup");
+    assertRelayDrainPerformance(
+        [relayRuntimeAfterClose],
+        "final multiplayer close drain",
+    );
 
     const actualSoakMillis = elapsedMillis(soakStartedAt, soakCompletedAt) ?? 0;
     if (acceptanceMode) {
@@ -1449,6 +1466,27 @@ function assertRelayRuntimeGaugesZero(snapshot, label) {
         Object.fromEntries(RELAY_RUNTIME_GAUGES.map((name) => [name, 0])),
         `${label}: RelayNode runtime gauges did not drain to zero`);
     return evidence;
+}
+
+function assertRelayDrainPerformance(snapshots, label) {
+    const entries = snapshots.filter((snapshot) => snapshot?.runtime !== undefined);
+    assert.ok(entries.length > 0, `${label}: RelayNode runtime telemetry missing`);
+    for (const snapshot of entries) {
+        const runtime = snapshot.runtime;
+        assert.ok(Number.isFinite(runtime.serverFrameMaxDrainDurationMillis),
+            `${label}: RelayNode drain duration telemetry missing`);
+        assert.ok(runtime.serverFrameMaxDrainDurationMillis <=
+            RELAY_DRAIN_MAX_DURATION_MILLIS,
+            `${label}: RelayNode server-frame drain reached ` +
+            `${runtime.serverFrameMaxDrainDurationMillis}ms`);
+        assert.equal(runtime.serverFrameSendErrors, 0,
+            `${label}: RelayNode server-frame send error detected`);
+    }
+    const final = entries.at(-1).runtime;
+    assert.equal(final.serverFrameBufferedBytes, 0,
+        `${label}: RelayNode retained server-frame bytes`);
+    assert.equal(final.activeServerFrameDrainHandles, 0,
+        `${label}: RelayNode retained an active server-frame drain`);
 }
 
 function relayRuntimeIsClean(snapshot) {
