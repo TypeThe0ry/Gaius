@@ -84,7 +84,18 @@ jq -r '
 find "$libraries" -type f -name '*.jar' -print | sort |
   paste -sd ':' - >"$work/classpath.txt"
 
-unzip -p "$client_input" version.json >"$work/client-version.json"
+if command -v unzip >/dev/null 2>&1; then
+  unzip -p "$client_input" version.json >"$work/client-version.json"
+else
+  python3 - "$client_input" version.json >"$work/client-version.json" <<'PY'
+import sys
+import zipfile
+
+archive, member = sys.argv[1:]
+with zipfile.ZipFile(archive) as bundle:
+    sys.stdout.buffer.write(bundle.read(member))
+PY
+fi
 
 asset_index_id="$(jq -er '.assetIndex.id // .assets' "$metadata" | tr -d '\r\n')"
 asset_index_url="$(jq -er '.assetIndex.url' "$metadata" | tr -d '\r\n')"

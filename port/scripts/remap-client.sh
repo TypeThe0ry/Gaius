@@ -22,8 +22,10 @@ fi
 
 if [[ "$GAIUS_CLIENT_DISTRIBUTION" == "named" ]]; then
   cp "$input" "$output"
-  zip -q -d "$output" 'META-INF/*.SF' 'META-INF/*.RSA' 'META-INF/*.DSA' \
-    >/dev/null 2>&1 || true
+  if command -v zip >/dev/null 2>&1; then
+    zip -q -d "$output" 'META-INF/*.SF' 'META-INF/*.RSA' 'META-INF/*.DSA' \
+      >/dev/null 2>&1 || true
+  fi
   echo "Using the official named Minecraft $version client without remapping"
 else
   if [[ ! -f "$mappings" ]]; then
@@ -58,19 +60,31 @@ else
 fi
 
 main_class="net/minecraft/client/main/Main.class"
-# BusyBox unzip (used by the isolated Linux workers) does not implement the
-# Info-ZIP -Z1 listing mode. Use the portable long-listing format and match
-# the final member column exactly so a valid remap is not rejected falsely.
-if ! unzip -l "$output" 2>/dev/null |
-  awk -v expected="$main_class" '$NF == expected { found = 1 } END { exit(found ? 0 : 1) }'; then
-  echo "Remapped client does not contain $main_class" >&2
-  exit 1
-fi
+if command -v unzip >/dev/null 2>&1; then
+  # BusyBox unzip does not implement every Info-ZIP listing mode. Match the
+  # final member column in the portable long-listing format.
+  if ! unzip -l "$output" 2>/dev/null |
+    awk -v expected="$main_class" '$NF == expected { found = 1 } END { exit(found ? 0 : 1) }'; then
+    echo "Remapped client does not contain $main_class" >&2
+    exit 1
+  fi
+  class_count="$(unzip -l "$output" | awk '$4 ~ /\.class$/ { count++ } END { print count + 0 }')"
+else
+  read -r main_present class_count < <(python3 - "$output" "$main_class" <<'PY'
+import sys
+import zipfile
 
-class_count="$(
-  unzip -l "$output" |
-    awk '$4 ~ /\.class$/ { count++ } END { print count + 0 }'
-)"
+archive, expected = sys.argv[1:]
+with zipfile.ZipFile(archive) as bundle:
+    names = bundle.namelist()
+print(1 if expected in names else 0, sum(name.endswith('.class') for name in names))
+PY
+  )
+  if [[ "$main_present" != "1" ]]; then
+    echo "Remapped client does not contain $main_class" >&2
+    exit 1
+  fi
+fi
 echo "Named client ready:"
 echo "  output:  $output"
 echo "  classes: $class_count"
