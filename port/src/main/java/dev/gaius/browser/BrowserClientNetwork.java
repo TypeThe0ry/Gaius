@@ -158,19 +158,19 @@ public final class BrowserClientNetwork {
                 : Date.now();
             };
             let scheduler = bridge.inboundPumpScheduler;
-            const initialBridgeGeneration = Number(bridge.inboundPumpGeneration);
-            const initialSchedulerGeneration = Number(scheduler && scheduler.generation);
+            const observedBridgeGeneration = Number(bridge.inboundPumpGeneration);
+            const observedSchedulerGeneration = Number(scheduler && scheduler.generation);
             const activeGenerationDrift = !!(scheduler && scheduler.pending &&
-              Number.isFinite(initialBridgeGeneration) && initialBridgeGeneration > 0 &&
-              Number.isFinite(initialSchedulerGeneration) && initialSchedulerGeneration > 0 &&
-              initialBridgeGeneration !== initialSchedulerGeneration);
+              Number.isFinite(observedBridgeGeneration) && observedBridgeGeneration > 0 &&
+              Number.isFinite(observedSchedulerGeneration) && observedSchedulerGeneration > 0 &&
+              observedBridgeGeneration !== observedSchedulerGeneration);
             if (!scheduler || scheduler.version !== 2 || scheduler.__gaiusRetired === true ||
                 activeGenerationDrift) {
-              const bridgeGeneration = Number(bridge.inboundPumpGeneration);
+              const replacementBridgeGeneration = Number(bridge.inboundPumpGeneration);
               const retiredSchedulerGeneration = Number(scheduler && scheduler.generation);
               const replacementBaseGeneration = Math.max(
-                Number.isFinite(bridgeGeneration) && bridgeGeneration > 0
-                  ? bridgeGeneration : 0,
+                Number.isFinite(replacementBridgeGeneration) && replacementBridgeGeneration > 0
+                  ? replacementBridgeGeneration : 0,
                 Number.isFinite(retiredSchedulerGeneration) && retiredSchedulerGeneration > 0
                   ? retiredSchedulerGeneration : 0
               );

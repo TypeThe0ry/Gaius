@@ -62,6 +62,10 @@ assert.match(browserClientNetworkSource,
 assert.match(browserClientNetworkSource,
     /const normalizedGeneration = Math\.max\([\s\S]*?bridge\.inboundPumpGeneration = normalizedGeneration/u,
     "legacy scheduler generation must normalize monotonically");
+assert.equal(
+    (browserClientNetworkSource.match(/const bridgeGeneration\s*=\s*Number\(/gu) ?? []).length,
+    1,
+    "inbound pump JSBody must avoid duplicate bridgeGeneration declarations");
 
 // Server-free race model: replacing the scheduler while an old watchdog/message
 // callback is queued must leave the replacement pending record untouched and must
