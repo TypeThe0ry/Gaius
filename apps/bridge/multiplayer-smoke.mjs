@@ -18,6 +18,7 @@ import { deflateSync, inflateSync } from "node:zlib";
 import { WebSocket } from "./node_modules/ws/wrapper.mjs";
 import { parseConnectRequest } from "./dist/policy.js";
 import {
+    decodeClientboundLoginDistances,
     MINECRAFT_1_21_11,
     MINECRAFT_26_2,
 } from "./dist/protocol.js";
@@ -49,6 +50,10 @@ const srvTransientHost = "srv-transient.gaius.test";
 const minecraftPlaySoakMs = Math.max(
         0,
         Number.parseInt(process.env.GAIUS_SMOKE_PLAY_SOAK_MS ?? "0", 10) || 0);
+const minecraftClientViewDistance = parseBoundedInteger(
+        "GAIUS_SMOKE_CLIENT_VIEW_DISTANCE", 6, 2, 32);
+const minecraftDesiredChunksPerTick = parseBoundedFloat(
+        "GAIUS_SMOKE_DESIRED_CHUNKS_PER_TICK", 64, 0.01, 64);
 const acceptServerPrompts =
         process.env.GAIUS_SMOKE_ACCEPT_SERVER_PROMPTS === "1" ||
         process.env.GAIUS_SMOKE_ACCEPT_DIALOGS === "1";
@@ -953,6 +958,32 @@ function parseMinecraftPort(value) {
     return port;
 }
 
+function parseBoundedInteger(name, defaultValue, minimum, maximum) {
+    const raw = process.env[name];
+    if (raw === undefined) return defaultValue;
+    if (!/^(?:0|[1-9][0-9]*)$/u.test(raw)) {
+        throw new Error(`${name} must be an integer from ${minimum} to ${maximum}`);
+    }
+    const value = Number(raw);
+    if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+        throw new Error(`${name} must be an integer from ${minimum} to ${maximum}`);
+    }
+    return value;
+}
+
+function parseBoundedFloat(name, defaultValue, minimum, maximum) {
+    const raw = process.env[name];
+    if (raw === undefined) return defaultValue;
+    if (!/^(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)$/u.test(raw)) {
+        throw new Error(`${name} must be a finite number from ${minimum} to ${maximum}`);
+    }
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value < minimum || value > maximum) {
+        throw new Error(`${name} must be a finite number from ${minimum} to ${maximum}`);
+    }
+    return value;
+}
+
 function resolveSmokeMinecraftProfile(value) {
     const key = String(value ?? "").trim();
     const profile = [MINECRAFT_1_21_11, MINECRAFT_26_2]
@@ -1360,7 +1391,22 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
     const resourcePackTargets = [];
     let playPackets = 0;
     let playLoginPackets = 0;
+    let playLoginDistanceContracts = 0;
     let chunkPackets = 0;
+    const uniqueChunkPositions = new Set();
+    let duplicateChunkPackets = 0;
+    let observedChunkCacheCenter = null;
+    let observedChunkCacheRadius = null;
+    let observedSimulationDistance = null;
+    let chunkCacheCenterUpdates = 0;
+    let chunkCacheRadiusUpdates = 0;
+    let simulationDistanceUpdates = 0;
+    let chunkBatchStarts = 0;
+    let chunkBatchFinished = 0;
+    let chunkBatchAcknowledgements = 0;
+    let chunkBatchCountMismatches = 0;
+    let chunkBatchOpen = false;
+    let currentChunkBatchPackets = 0;
     let playerLoadedSent = false;
     let protocolFailure;
     let expectedClose = false;
@@ -1585,6 +1631,12 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
                     }
                     else if (packetId.value === minecraftProfile.play.clientboundLogin) {
                         playLoginPackets++;
+                        const initialDistances = decodeClientboundLoginDistances(payload);
+                        playLoginDistanceContracts++;
+                        observedChunkCacheRadius = initialDistances.chunkRadius;
+                        observedSimulationDistance = initialDistances.simulationDistance;
+                        chunkCacheRadiusUpdates++;
+                        simulationDistanceUpdates++;
                         if (!playerLoadedSent) {
                             playerLoadedSent = true;
                             sendMinecraftPacket(
@@ -1592,8 +1644,80 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
                                     Buffer.alloc(0));
                         }
                     }
+                    else if (packetId.value ===
+                            minecraftProfile.play.clientboundSetChunkCacheCenter) {
+                        const x = decodeVarInt(payload, 0);
+                        const z = x === undefined
+                                ? undefined : decodeVarInt(payload, x.bytesRead);
+                        if (x === undefined || z === undefined ||
+                                x.bytesRead + z.bytesRead !== payload.byteLength) {
+                            throw new Error("Malformed PLAY chunk-cache center");
+                        }
+                        observedChunkCacheCenter = {
+                            x: x.value | 0,
+                            z: z.value | 0,
+                        };
+                        chunkCacheCenterUpdates++;
+                    }
+                    else if (packetId.value ===
+                            minecraftProfile.play.clientboundSetChunkCacheRadius) {
+                        const radius = decodeVarInt(payload, 0);
+                        if (radius === undefined || radius.bytesRead !== payload.byteLength ||
+                                radius.value < 2 || radius.value > 32) {
+                            throw new Error("Malformed PLAY chunk-cache radius");
+                        }
+                        observedChunkCacheRadius = radius.value;
+                        chunkCacheRadiusUpdates++;
+                    }
+                    else if (packetId.value ===
+                            minecraftProfile.play.clientboundSetSimulationDistance) {
+                        const distance = decodeVarInt(payload, 0);
+                        if (distance === undefined ||
+                                distance.bytesRead !== payload.byteLength ||
+                                distance.value < 2 || distance.value > 32) {
+                            throw new Error("Malformed PLAY simulation distance");
+                        }
+                        observedSimulationDistance = distance.value;
+                        simulationDistanceUpdates++;
+                    }
+                    else if (packetId.value ===
+                            minecraftProfile.play.clientboundChunkBatchStart) {
+                        if (payload.byteLength !== 0 || chunkBatchOpen) {
+                            throw new Error("Malformed or repeated PLAY chunk-batch start");
+                        }
+                        chunkBatchStarts++;
+                        chunkBatchOpen = true;
+                        currentChunkBatchPackets = 0;
+                    }
+                    else if (packetId.value ===
+                            minecraftProfile.play.clientboundChunkBatchFinished) {
+                        const advertised = decodeVarInt(payload, 0);
+                        if (!chunkBatchOpen || advertised === undefined || advertised.value < 0 ||
+                                advertised.bytesRead !== payload.byteLength) {
+                            throw new Error("Malformed PLAY chunk-batch finish");
+                        }
+                        chunkBatchFinished++;
+                        chunkBatchOpen = false;
+                        if (advertised.value !== currentChunkBatchPackets) {
+                            chunkBatchCountMismatches++;
+                        }
+                        const acknowledgement = Buffer.allocUnsafe(4);
+                        acknowledgement.writeFloatBE(minecraftDesiredChunksPerTick, 0);
+                        sendMinecraftPacket(
+                                minecraftProfile.play.serverboundChunkBatchReceived,
+                                acknowledgement);
+                        chunkBatchAcknowledgements++;
+                        currentChunkBatchPackets = 0;
+                    }
                     else if (packetId.value === minecraftProfile.play.clientboundChunk) {
+                        if (payload.byteLength < 8) {
+                            throw new Error("PLAY chunk packet omitted coordinates");
+                        }
+                        const key = `${payload.readInt32BE(0)},${payload.readInt32BE(4)}`;
                         chunkPackets++;
+                        if (chunkBatchOpen) currentChunkBatchPackets++;
+                        if (uniqueChunkPositions.has(key)) duplicateChunkPackets++;
+                        else uniqueChunkPositions.add(key);
                     }
                     else if (packetId.value === minecraftProfile.play.clientboundStartConfiguration) {
                         if (payload.byteLength !== 0) {
@@ -1644,7 +1768,22 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
             resourcePackTargets,
             playPackets,
             playLoginPackets,
+            playLoginDistanceContracts,
             chunkPackets,
+            uniqueChunkPositions: uniqueChunkPositions.size,
+            duplicateChunkPackets,
+            observedChunkCacheCenter,
+            observedChunkCacheRadius,
+            observedSimulationDistance,
+            chunkCacheCenterUpdates,
+            chunkCacheRadiusUpdates,
+            simulationDistanceUpdates,
+            chunkBatchStarts,
+            chunkBatchFinished,
+            chunkBatchAcknowledgements,
+            chunkBatchCountMismatches,
+            chunkBatchOpen,
+            currentChunkBatchPackets,
             bufferedBytes: buffered.byteLength,
             packetCounts,
             recentPackets,
@@ -1775,7 +1914,32 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
         resourcePackTargets,
         playPackets,
         playLoginPackets,
+        playLoginDistanceContracts,
         chunkPackets,
+        uniqueChunkPositions: uniqueChunkPositions.size,
+        duplicateChunkPackets,
+        chunkWindow: {
+            clientViewDistance: minecraftClientViewDistance,
+            observedChunkCacheCenter,
+            observedChunkCacheRadius,
+            observedSimulationDistance,
+            chunkCacheCenterUpdates,
+            chunkCacheRadiusUpdates,
+            simulationDistanceUpdates,
+        },
+        chunkBatch: {
+            starts: chunkBatchStarts,
+            finished: chunkBatchFinished,
+            acknowledgements: chunkBatchAcknowledgements,
+            countMismatches: chunkBatchCountMismatches,
+            openAtClose: chunkBatchOpen,
+            clientboundStartPacketId: minecraftProfile.play.clientboundChunkBatchStart,
+            clientboundFinishedPacketId: minecraftProfile.play.clientboundChunkBatchFinished,
+            serverboundAcknowledgementPacketId:
+                    minecraftProfile.play.serverboundChunkBatchReceived,
+            desiredChunksPerTick: minecraftDesiredChunksPerTick,
+            acknowledgementEncoding: "float32-be",
+        },
         playSoakMs: minecraftPlaySoakMs,
     };
 }
@@ -2315,7 +2479,7 @@ function encodeDialogCompound(values) {
 function encodeClientInformation() {
     return Buffer.concat([
         encodeString("en_us"),
-        Buffer.from([6]),
+        Buffer.from([minecraftClientViewDistance]),
         encodeVarInt(0),
         Buffer.from([1, 0x7f]),
         encodeVarInt(1),
