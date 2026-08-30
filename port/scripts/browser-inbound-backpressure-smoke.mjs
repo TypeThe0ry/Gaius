@@ -30,7 +30,12 @@ function jsBodyBefore(marker) {
   const scriptEnd = source.lastIndexOf('""")', markerOffset);
   assert.ok(markerOffset > 0 && annotationOffset > 0 && scriptEnd > scriptOffset,
     `JSBody could not be extracted for ${marker}`);
-  return source.slice(scriptOffset, scriptEnd).replaceAll("\\\\", "\\");
+  const body = source.slice(scriptOffset, scriptEnd).replaceAll("\\\\", "\\");
+  if (marker === "private static native void initBridge();") {
+    return "{\n" + body + "\n}\n{\n" +
+      jsBodyBefore("private static native void initBridgeTail();") + "\n}";
+  }
+  return body;
 }
 function jsBodyBeforeIn(javaSource, marker) {
   const markerOffset = javaSource.indexOf(marker);

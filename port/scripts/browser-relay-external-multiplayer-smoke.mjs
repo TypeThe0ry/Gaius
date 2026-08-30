@@ -59,7 +59,7 @@ const relayDrainLimitMillis = parseBoundedNumber(
 );
 
 const source = await readFile(channelSourceUrl, "utf8");
-const bridgeScript = extractJsBody(source, "private static native void initBridge();");
+const bridgeScript = extractBridgeScript(source);
 const outboundScript = extractJsBody(
     source, "private static native void initOutboundScheduler();",
 );
@@ -99,6 +99,11 @@ function installBridge() {
         bridge: globalThis.__gaiusNettyBridge,
         stats: globalThis.__gaiusNetworkStats,
     };
+}
+
+function extractBridgeScript(text) {
+    return "{\n" + extractJsBody(text, "private static native void initBridge();") + "\n}\n{\n" +
+        extractJsBody(text, "private static native void initBridgeTail();") + "\n}";
 }
 
 function extractJsBody(text, marker) {

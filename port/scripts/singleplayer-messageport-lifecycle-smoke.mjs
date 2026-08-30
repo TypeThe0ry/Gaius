@@ -9,28 +9,20 @@ const sourcePath = new URL(
   import.meta.url,
 );
 const source = await readFile(sourcePath, "utf8");
-const marker = "private static native void initBridge();";
-const markerOffset = source.indexOf(marker);
-const annotationOffset = source.lastIndexOf('@JSBody(script = """', markerOffset);
-const scriptOffset = source.indexOf('"""', annotationOffset) + 3;
-const scriptEnd = source.lastIndexOf('""")', markerOffset);
-assert.ok(markerOffset > 0 && annotationOffset > 0 && scriptEnd > scriptOffset,
-  "Browser bridge JSBody could not be extracted");
+function extractJsBody(marker) {
+  const markerOffset = source.indexOf(marker);
+  const annotationOffset = source.lastIndexOf('@JSBody(script = """', markerOffset);
+  const scriptOffset = source.indexOf('"""', annotationOffset) + 3;
+  const scriptEnd = source.lastIndexOf('""")', markerOffset);
+  assert.ok(markerOffset > 0 && annotationOffset > 0 && scriptEnd > scriptOffset,
+    `Browser JSBody could not be extracted for ${marker}`);
+  return source.slice(scriptOffset, scriptEnd).replaceAll("\\\\", "\\");
+}
 
-const bridgeScript = source.slice(scriptOffset, scriptEnd).replaceAll("\\\\", "\\");
-const outboundMarker = "private static native void initOutboundScheduler();";
-const outboundMarkerOffset = source.indexOf(outboundMarker);
-const outboundAnnotationOffset = source.lastIndexOf(
-  '@JSBody(script = """',
-  outboundMarkerOffset,
-);
-const outboundScriptOffset = source.indexOf('"""', outboundAnnotationOffset) + 3;
-const outboundScriptEnd = source.lastIndexOf('""")', outboundMarkerOffset);
-assert.ok(outboundMarkerOffset > 0 && outboundAnnotationOffset > 0
-    && outboundScriptEnd > outboundScriptOffset,
-"Browser outbound scheduler JSBody could not be extracted");
-const outboundSchedulerScript = source.slice(outboundScriptOffset, outboundScriptEnd)
-  .replaceAll("\\\\", "\\");
+const bridgeScript = "{\n" + extractJsBody("private static native void initBridge();") + "\n}\n{\n" +
+  extractJsBody("private static native void initBridgeTail();") + "\n}";
+const outboundSchedulerScript = extractJsBody("private static native void initOutboundScheduler();");
+
 const sessionA = "0123456789abcdef0123456789abcdef";
 const sessionB = "1123456789abcdef0123456789abcdef";
 const sessionC = "2123456789abcdef0123456789abcdef";
