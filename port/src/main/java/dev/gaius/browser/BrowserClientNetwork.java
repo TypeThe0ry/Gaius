@@ -159,7 +159,15 @@ public final class BrowserClientNetwork {
             };
             let scheduler = bridge.inboundPumpScheduler;
             if (!scheduler || scheduler.version !== 2 || scheduler.__gaiusRetired === true) {
-              let nextGeneration = ((Number(bridge.inboundPumpGeneration) || 0) + 1) >>> 0;
+              const bridgeGeneration = Number(bridge.inboundPumpGeneration);
+              const retiredSchedulerGeneration = Number(scheduler && scheduler.generation);
+              const replacementBaseGeneration = Math.max(
+                Number.isFinite(bridgeGeneration) && bridgeGeneration > 0
+                  ? bridgeGeneration : 0,
+                Number.isFinite(retiredSchedulerGeneration) && retiredSchedulerGeneration > 0
+                  ? retiredSchedulerGeneration : 0
+              );
+              let nextGeneration = (replacementBaseGeneration + 1) >>> 0;
               if (nextGeneration === 0) nextGeneration = 1;
               if (scheduler) {
                 scheduler.__gaiusRetired = true;

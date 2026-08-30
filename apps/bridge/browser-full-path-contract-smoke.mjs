@@ -48,8 +48,8 @@ assert.match(browserClientNetworkSource,
     /generation:\s*nextGeneration,/u,
     "inbound pump scheduler must carry a bridge-scoped generation");
 assert.match(browserClientNetworkSource,
-    /bridge\.inboundPumpGeneration\) \|\| 0\) \+ 1/u,
-    "replacement scheduler generation must advance monotonically");
+    /const replacementBaseGeneration = Math\.max\([\s\S]*?retiredSchedulerGeneration[\s\S]*?let nextGeneration = \(replacementBaseGeneration \+ 1\) >>> 0/u,
+    "replacement scheduler generation must advance beyond bridge and retired scheduler");
 assert.match(browserClientNetworkSource,
     /const pending = \{token: token, finish: null, watchdog: 0\}/u,
     "pending pump record must retain its watchdog for retirement cleanup");
@@ -162,6 +162,13 @@ assert.match(browserClientNetworkSource,
         "legacy scheduler must not lower bridge generation");
     assert.equal(legacyBridge.inboundPumpGeneration, 9,
         "bridge generation must remain monotonic");
+
+    const retiredHighGeneration = 17;
+    const replacementBaseGeneration = Math.max(9, retiredHighGeneration);
+    let replacementGeneration = (replacementBaseGeneration + 1) >>> 0;
+    if (replacementGeneration === 0) replacementGeneration = 1;
+    assert.equal(replacementGeneration, 18,
+        "replacement must advance beyond a higher retired scheduler generation");
 
     const versionMutatedScheduler = {
         version: 1,
