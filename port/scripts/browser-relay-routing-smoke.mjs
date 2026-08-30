@@ -9,23 +9,19 @@ const channelSourcePath = resolve(root,
         "port/overrides/libraries/netty-transport/src/main/java/" +
         "io/netty/channel/browser/BrowserWebSocketChannel.java");
 const channelSource = await readFile(channelSourcePath, "utf8");
-const initMarker = "private static native void initBridge();";
-const markerOffset = channelSource.indexOf(initMarker);
-const annotationOffset = channelSource.lastIndexOf('@JSBody(script = """', markerOffset);
-const scriptOffset = channelSource.indexOf('"""', annotationOffset) + 3;
-const scriptEnd = channelSource.lastIndexOf('""")', markerOffset);
+function extractJsBody(marker) {
+    const markerOffset = channelSource.indexOf(marker);
+    const annotationOffset = channelSource.lastIndexOf('@JSBody(script = """', markerOffset);
+    const scriptOffset = channelSource.indexOf('"""', annotationOffset) + 3;
+    const scriptEnd = channelSource.lastIndexOf('""")', markerOffset);
+    assert.ok(markerOffset > 0 && annotationOffset > 0 && scriptEnd > scriptOffset,
+        `Browser JSBody could not be extracted for ${marker}`);
+    return channelSource.slice(scriptOffset, scriptEnd).replaceAll("\\\\", "\\");
+}
 
-assert.ok(markerOffset > 0 && annotationOffset > 0 && scriptOffset > annotationOffset &&
-        scriptEnd > scriptOffset, "Browser bridge JSBody could not be extracted");
-const outboundMarker = "private static native void initOutboundScheduler();";
-const outboundMarkerOffset = channelSource.indexOf(outboundMarker);
-const outboundAnnotationOffset = channelSource.lastIndexOf(
-    '@JSBody(script = """', outboundMarkerOffset);
-const outboundScriptOffset = channelSource.indexOf('"""', outboundAnnotationOffset) + 3;
-const outboundScriptEnd = channelSource.lastIndexOf('""")', outboundMarkerOffset);
-assert.ok(outboundMarkerOffset > 0 && outboundAnnotationOffset > 0 &&
-        outboundScriptEnd > outboundScriptOffset,
-"Browser outbound scheduler JSBody could not be extracted");
+const bridgeScript = "{\n" + extractJsBody("private static native void initBridge();") + "\n}\n{\n" +
+    extractJsBody("private static native void initBridgeTail();") + "\n}";
+const outboundScript = extractJsBody("private static native void initOutboundScheduler();");
 
 const delay = (millis) => new Promise((resolveDelay) => setTimeout(resolveDelay, millis));
 const openedSockets = [];
@@ -217,8 +213,8 @@ class MockWebSocket {
 }
 
 globalThis.WebSocket = MockWebSocket;
-new Function(channelSource.slice(scriptOffset, scriptEnd))();
-new Function(channelSource.slice(outboundScriptOffset, outboundScriptEnd))();
+new Function(bridgeScript)();
+new Function(outboundScript)();
 
 const bridge = globalThis.__gaiusNettyBridge;
 const stats = globalThis.__gaiusNetworkStats;

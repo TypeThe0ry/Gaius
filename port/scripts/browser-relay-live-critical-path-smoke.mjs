@@ -10,24 +10,19 @@ const sourcePath = new URL(
   import.meta.url,
 );
 const source = await readFile(sourcePath, "utf8");
-const marker = "private static native void initBridge();";
-const markerOffset = source.indexOf(marker);
-const annotationOffset = source.lastIndexOf('@JSBody(script = """', markerOffset);
-const scriptOffset = source.indexOf('"""', annotationOffset) + 3;
-const scriptEnd = source.lastIndexOf('""")', markerOffset);
-assert.ok(markerOffset > 0 && annotationOffset > 0 && scriptEnd > scriptOffset,
-  "Browser bridge JSBody could not be extracted");
-const outboundMarker = "private static native void initOutboundScheduler();";
-const outboundMarkerOffset = source.indexOf(outboundMarker);
-const outboundAnnotationOffset = source.lastIndexOf(
-  '@JSBody(script = """',
-  outboundMarkerOffset,
-);
-const outboundScriptOffset = source.indexOf('"""', outboundAnnotationOffset) + 3;
-const outboundScriptEnd = source.lastIndexOf('""")', outboundMarkerOffset);
-assert.ok(outboundMarkerOffset > 0 && outboundAnnotationOffset > 0
-    && outboundScriptEnd > outboundScriptOffset,
-"Browser outbound scheduler JSBody could not be extracted");
+function extractJsBody(marker) {
+  const markerOffset = source.indexOf(marker);
+  const annotationOffset = source.lastIndexOf('@JSBody(script = """', markerOffset);
+  const scriptOffset = source.indexOf('"""', annotationOffset) + 3;
+  const scriptEnd = source.lastIndexOf('""")', markerOffset);
+  assert.ok(markerOffset > 0 && annotationOffset > 0 && scriptEnd > scriptOffset,
+    `Browser JSBody could not be extracted for ${marker}`);
+  return source.slice(scriptOffset, scriptEnd).replaceAll("\\\\", "\\");
+}
+
+const bridgeScript = "{\n" + extractJsBody("private static native void initBridge();") + "\n}\n{\n" +
+  extractJsBody("private static native void initBridgeTail();") + "\n}";
+const outboundScript = extractJsBody("private static native void initOutboundScheduler();");
 
 const relayUrl = process.env.GAIUS_PUBLIC_RELAY_URL || "wss://ellan.site/tunnel";
 const target = process.env.GAIUS_PUBLIC_RELAY_TARGET || "ellan.top:25565";
@@ -73,8 +68,8 @@ globalThis.__gaiusRelayRegistryUrls = [];
 globalThis.__gaiusBridgeUrl = relayUrl;
 globalThis.__gaiusBridgeUrls = [{name: "Live public relay", url: relayUrl, priority: 100}];
 
-new Function(source.slice(scriptOffset, scriptEnd))();
-new Function(source.slice(outboundScriptOffset, outboundScriptEnd))();
+new Function(bridgeScript)();
+new Function(outboundScript)();
 const bridge = globalThis.__gaiusNettyBridge;
 const stats = globalThis.__gaiusNetworkStats;
 const startedAt = performance.now();
