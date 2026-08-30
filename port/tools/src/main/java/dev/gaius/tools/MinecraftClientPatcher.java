@@ -8930,6 +8930,7 @@ public final class MinecraftClientPatcher {
                                     + wrapperCalls + ", direct=" + directPacketProcessorCalls);
                 }
                 browserChannelPumpHooked = true;
+                clientPacketFrameBoundaryHooked = true;
                 for (var instruction = method.instructions.getFirst();
                         instruction != null;
                         instruction = instruction.getNext()) {
