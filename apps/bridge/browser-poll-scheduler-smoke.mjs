@@ -53,6 +53,13 @@ assert.match(schedulerSource, /isPollReady/u);
 assert.match(schedulerSource, /readPollFairnessFloor/u);
 assert.match(schedulerSource, /isPollFairlyEligible/u);
 assert.match(schedulerSource, /hasFairPollReady/u);
+assert.match(schedulerSource, /visibleClientIdCollator/u,
+    "client-id collator must be pre-warmed outside the callback hot path");
+assert.match(schedulerSource, /compareVisibleClientIds/u,
+    "visible client evidence must use the bounded id comparator");
+assert.doesNotMatch(schedulerSource,
+    /String\(left\.id\)\.localeCompare\(/u,
+    "callback hot path must not lazily initialize numeric locale collation");
 assert.match(schedulerSource, /fairnessSkips/u);
 assert.match(schedulerSource, /callbackSequence/u);
 assert.match(schedulerSource, /callbackTail/u);

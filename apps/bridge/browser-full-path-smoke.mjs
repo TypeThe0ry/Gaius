@@ -1699,6 +1699,38 @@ function createFairClientPollScheduler(getClients) {
         }
         return hasPendingInbound(client);
     };
+    // Client ids are numeric in the production harness.  Calling
+    // String(...).localeCompare(..., {numeric:true}) from the callback hot
+    // path forces ICU collation setup during the first scheduler turn (the
+    // 1.21.11 run measured ~29 ms before any tick or poll was serviced).  Build
+    // the collator once when the scheduler is created and keep the common
+    // numeric-id path allocation/ICU free.  Non-numeric ids retain the old
+    // numeric-aware ordering through the pre-warmed collator, with a simple
+    // lexical fallback for runtimes without Intl.Collator.
+    const visibleClientIdCollator = (() => {
+        try {
+            return typeof Intl === "object" && typeof Intl.Collator === "function"
+                ? new Intl.Collator(undefined, { numeric: true }) : undefined;
+        }
+        catch {
+            return undefined;
+        }
+    })();
+    const compareVisibleClientIds = (left, right) => {
+        const leftId = left?.id;
+        const rightId = right?.id;
+        if (typeof leftId === "number" && typeof rightId === "number" &&
+            Number.isFinite(leftId) && Number.isFinite(rightId)) {
+            return leftId - rightId;
+        }
+        if (leftId === rightId) return 0;
+        const leftText = String(leftId);
+        const rightText = String(rightId);
+        if (visibleClientIdCollator !== undefined) {
+            return visibleClientIdCollator.compare(leftText, rightText);
+        }
+        return leftText < rightText ? -1 : leftText > rightText ? 1 : 0;
+    };
     const visibleDispatchEvidence = (clients) => {
         const entries = new Map();
         for (const client of clients) {
@@ -1710,8 +1742,7 @@ function createFairClientPollScheduler(getClients) {
                 count: dispatchCounts.get(id) ?? 0,
             });
         }
-        return [...entries.values()].sort((left, right) =>
-            String(left.id).localeCompare(String(right.id), undefined, { numeric: true }));
+        return [...entries.values()].sort(compareVisibleClientIds);
     };
     const recordVisibleDispatchEvidence = (clients) => {
         const entries = visibleDispatchEvidence(clients);
