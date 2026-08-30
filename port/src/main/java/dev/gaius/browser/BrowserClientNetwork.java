@@ -158,8 +158,17 @@ public final class BrowserClientNetwork {
                 : Date.now();
             };
             let scheduler = bridge.inboundPumpScheduler;
-            if (!scheduler || scheduler.version !== 2) {
+            if (!scheduler || scheduler.version !== 2 || scheduler.__gaiusRetired === true) {
+              let nextGeneration = ((Number(bridge.inboundPumpGeneration) || 0) + 1) >>> 0;
+              if (nextGeneration === 0) nextGeneration = 1;
               if (scheduler) {
+                scheduler.__gaiusRetired = true;
+                const retiredPending = scheduler.pending;
+                if (retiredPending && retiredPending.watchdog) {
+                  try { clearTimeout(retiredPending.watchdog); } catch (ignored) {}
+                  retiredPending.watchdog = 0;
+                }
+                scheduler.pending = null;
                 // Invalidate a queued diagnostics microtask from a retired scheduler before
                 // replacing it; transport callbacks use a separate token/queue and are untouched.
                 let retiredGeneration =
@@ -178,6 +187,11 @@ public final class BrowserClientNetwork {
               }
               scheduler = {
                 version: 2,
+                // Pump generation changes whenever this scheduler is replaced.  A
+                // pending callback captures both the object identity and generation so
+                // a late MessageChannel/watchdog callback from a retired scheduler can
+                // never clear state or enter Java on the current bridge.
+                generation: nextGeneration,
                 channel: null,
                 pending: null,
                 running: false,
@@ -189,7 +203,15 @@ public final class BrowserClientNetwork {
                 reportHandle: 0
               };
               bridge.inboundPumpScheduler = scheduler;
+              bridge.inboundPumpGeneration = nextGeneration;
+              bridge.inboundPumpPending = false;
             }
+            if (!Number.isFinite(Number(scheduler.generation)) ||
+                Number(scheduler.generation) <= 0) {
+              scheduler.generation = Math.max(
+                1, Number(bridge.inboundPumpGeneration) || 1);
+            }
+            bridge.inboundPumpGeneration = scheduler.generation;
             // Keep the scheduler object compatible with older generated clients while adding
             // a bounded latest-only diagnostics lane. These fields never gate transport work.
             if (typeof scheduler.reportPending !== 'boolean') scheduler.reportPending = false;
@@ -451,9 +473,10 @@ public final class BrowserClientNetwork {
               if (scheduler.channel || typeof MessageChannel !== 'function') return;
               try {
                 const channel = new MessageChannel();
+                const channelScheduler = scheduler;
                 channel.port1.onmessage = function(event) {
                   const token = Number(event && event.data) || 0;
-                  const pending = scheduler.pending;
+                  const pending = channelScheduler.pending;
                   if (!pending || pending.token !== token) {
                     stats.inboundPumpStaleCallbacks++;
                     return;
@@ -466,6 +489,13 @@ public final class BrowserClientNetwork {
               }
             }
             function schedulePump(reason) {
+              if (globalThis.__gaiusNettyBridge !== bridge ||
+                  scheduler.__gaiusRetired === true ||
+                  scheduler.version !== 2 ||
+                  bridge.inboundPumpScheduler !== scheduler) {
+                stats.inboundPumpStaleCallbacks++;
+                return false;
+              }
               if (bridge.exactPacketQueuePaused) {
                 stats.inboundPumpBlockedByExactQueue++;
                 report('exact-paused');
@@ -480,16 +510,43 @@ public final class BrowserClientNetwork {
               if (token === 0) token = 1;
               scheduler.nextToken = (token + 1) >>> 0;
               const scheduledAt = clock();
+              const ownerScheduler = scheduler;
+              const ownerGeneration = Number(ownerScheduler.generation) || 1;
               let watchdog = 0;
               let finished = false;
-              const pending = {token: token, finish: null};
+              let staleReported = false;
+              const pending = {token: token, finish: null, watchdog: 0};
               const finish = function(source) {
+                // The bridge may have installed a replacement scheduler while this
+                // callback was queued.  Fail closed: only the exact pending record
+                // on the owning generation may mutate bridge/scheduler state or call
+                // the Java pump callback.  Retired callbacks are telemetry-only.
+                if (globalThis.__gaiusNettyBridge !== bridge ||
+                    bridge.inboundPumpScheduler !== ownerScheduler ||
+                    ownerScheduler.__gaiusRetired === true ||
+                    ownerScheduler.version !== 2 ||
+                    (Number(ownerScheduler.generation) || 0) !== ownerGeneration ||
+                    ownerScheduler.pending !== pending) {
+                  if (!staleReported) {
+                    staleReported = true;
+                    if (pending.watchdog) {
+                      try { clearTimeout(pending.watchdog); } catch (ignored) {}
+                      pending.watchdog = 0;
+                    }
+                    stats.inboundPumpStaleCallbacks++;
+                  }
+                  return;
+                }
                 if (finished) {
-                  stats.inboundPumpStaleCallbacks++;
+                  if (!staleReported) {
+                    staleReported = true;
+                    stats.inboundPumpStaleCallbacks++;
+                  }
                   return;
                 }
                 finished = true;
                 if (watchdog) clearTimeout(watchdog);
+                pending.watchdog = 0;
                 if (scheduler.pending === pending) scheduler.pending = null;
                 bridge.inboundPumpPending = false;
                 const waitMillis = Math.max(0, clock() - scheduledAt);
@@ -516,6 +573,13 @@ public final class BrowserClientNetwork {
                   stats.inboundPumpJavaCompleted++;
                   scheduler.running = false;
                 }
+                // callback() may synchronously install a replacement bridge scheduler;
+                // do not publish reports or schedule work against retired state.
+                if (globalThis.__gaiusNettyBridge !== bridge ||
+                    bridge.inboundPumpScheduler !== ownerScheduler ||
+                    (Number(ownerScheduler.generation) || 0) !== ownerGeneration) {
+                  return;
+                }
                 report(source);
                 if (continuePumping && !bridge.exactPacketQueuePaused) {
                   stats.inboundPumpRescheduled++;
@@ -528,6 +592,7 @@ public final class BrowserClientNetwork {
               stats.inboundPumpScheduled++;
               ensureMessageChannel();
               watchdog = setTimeout(function() { finish('watchdog'); }, 100);
+              pending.watchdog = watchdog;
               if (scheduler.channel) {
                 try {
                   scheduler.channel.port2.postMessage(token);

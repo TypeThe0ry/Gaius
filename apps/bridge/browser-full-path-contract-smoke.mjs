@@ -19,6 +19,130 @@ const verifyRuntimePath = fileURLToPath(
     new URL("./deploy/verify-runtime.sh", import.meta.url));
 const packagePath = fileURLToPath(new URL("./package.json", import.meta.url));
 const fullPathSourceText = await readFile(fullPathScript, "utf8");
+const browserClientNetworkPath = path.resolve(
+    bridgeDirectory,
+    "../../port/src/main/java/dev/gaius/browser/BrowserClientNetwork.java",
+);
+const browserClientNetworkSource = await readFile(browserClientNetworkPath, "utf8");
+
+// A late MessageChannel/watchdog callback from an inbound-pump scheduler that has
+// since been replaced must be telemetry-only.  Keep this source contract here so
+// reconnect/bridge replacement cannot regress into clearing the current bridge
+// pending flag or re-entering Java on a retired scheduler.
+assert.match(browserClientNetworkSource,
+    /const ownerScheduler = scheduler[\s\S]*?const ownerGeneration = Number\(ownerScheduler\.generation\)/u,
+    "inbound pump callbacks must capture scheduler identity and generation");
+assert.match(browserClientNetworkSource,
+    /if \(globalThis\.__gaiusNettyBridge !== bridge \|\|[\s\S]*?bridge\.inboundPumpScheduler !== ownerScheduler[\s\S]*?ownerScheduler\.__gaiusRetired === true[\s\S]*?ownerScheduler\.version !== 2[\s\S]*?ownerScheduler\.pending !== pending\)[\s\S]*?stats\.inboundPumpStaleCallbacks\+\+/u,
+    "retired inbound pump callbacks must fail closed before mutating state");
+assert.match(browserClientNetworkSource,
+    /function schedulePump[\s\S]*?globalThis\.__gaiusNettyBridge !== bridge/u,
+    "stale scheduler calls must reject a replaced bridge object");
+assert.match(browserClientNetworkSource,
+    /scheduler\.__gaiusRetired = true[\s\S]*?retiredPending\.watchdog/u,
+    "scheduler replacement must retire and clean the old pending watchdog");
+assert.match(browserClientNetworkSource,
+    /scheduler\.version !== 2 \|\| scheduler\.__gaiusRetired === true/u,
+    "retired scheduler objects must be replaced if reattached");
+assert.match(browserClientNetworkSource,
+    /generation:\s*nextGeneration,/u,
+    "inbound pump scheduler must carry a bridge-scoped generation");
+assert.match(browserClientNetworkSource,
+    /bridge\.inboundPumpGeneration\) \|\| 0\) \+ 1/u,
+    "replacement scheduler generation must advance monotonically");
+assert.match(browserClientNetworkSource,
+    /const pending = \{token: token, finish: null, watchdog: 0\}/u,
+    "pending pump record must retain its watchdog for retirement cleanup");
+
+// Server-free race model: replacing the scheduler while an old watchdog/message
+// callback is queued must leave the replacement pending record untouched and must
+// not re-enter the callback supplied to the retired generation.
+{
+    const oldScheduler = {
+        generation: 1,
+        __gaiusRetired: true,
+        pending: { token: 7, watchdog: 42 },
+    };
+    const newScheduler = { generation: 1, pending: { token: 1 } };
+    const bridge = { inboundPumpScheduler: newScheduler, inboundPumpPending: true };
+    let staleCallbacks = 0;
+    let javaCallbacks = 0;
+    let reports = 0;
+    let scheduled = 0;
+    const oldPending = oldScheduler.pending;
+    const clearTimer = () => { oldPending.watchdog = 0; };
+    const finishRetired = () => {
+        if (bridge.inboundPumpScheduler !== oldScheduler ||
+            oldScheduler.__gaiusRetired === true ||
+            oldScheduler.generation !== 1 || oldScheduler.pending !== oldPending) {
+            if (oldPending.watchdog !== 0) clearTimer();
+            if (staleCallbacks === 0) staleCallbacks++;
+            return;
+        }
+        javaCallbacks++;
+        bridge.inboundPumpPending = false;
+        reports++;
+        scheduled++;
+    };
+    finishRetired();
+    finishRetired();
+    assert.equal(staleCallbacks, 1, "retired callback must be counted once");
+    assert.equal(javaCallbacks, 0, "retired callback must not re-enter Java");
+    assert.equal(reports, 0, "retired callback must not publish a report");
+    assert.equal(scheduled, 0, "retired callback must not schedule continuation");
+    assert.equal(oldPending.watchdog, 0, "retired watchdog must be cleared");
+    assert.equal(bridge.inboundPumpPending, true,
+        "retired callback must not clear replacement pending state");
+    assert.equal(newScheduler.pending.token, 1,
+        "replacement pending record must remain intact");
+
+    // Rebuilding the bridge object is a separate identity boundary from replacing
+    // the scheduler field on the same object; a retired callback must fail closed
+    // in both cases.
+    const bridgeOwnerScheduler = { generation: 3, pending: { token: 9 } };
+    const bridgeObject = {
+        inboundPumpScheduler: bridgeOwnerScheduler,
+        inboundPumpPending: true,
+    };
+    const replacementBridgeObject = {
+        inboundPumpScheduler: newScheduler,
+        inboundPumpPending: true,
+    };
+    let activeBridgeObject = bridgeObject;
+    let bridgeObjectJavaCallbacks = 0;
+    const finishAcrossBridgeReplacement = () => {
+        if (activeBridgeObject !== bridgeObject ||
+            bridgeObject.inboundPumpScheduler !== bridgeOwnerScheduler ||
+            bridgeOwnerScheduler.__gaiusRetired === true) {
+            return;
+        }
+        bridgeObjectJavaCallbacks++;
+    };
+    activeBridgeObject = replacementBridgeObject;
+    finishAcrossBridgeReplacement();
+    assert.equal(bridgeObjectJavaCallbacks, 0,
+        "replaced bridge object must not re-enter Java from an old callback");
+
+    const callbackScheduler = { generation: 2, pending: { token: 8 } };
+    const callbackBridge = { inboundPumpScheduler: callbackScheduler };
+    let callbackReports = 0;
+    let callbackContinuations = 0;
+    const ownerGeneration = callbackScheduler.generation;
+    callbackScheduler.pending.finish = () => {
+        callbackScheduler.pending = null;
+        // Simulate callback-triggered bridge replacement (reconnect/install).
+        callbackBridge.inboundPumpScheduler = { generation: ownerGeneration + 1, pending: null };
+        if (callbackBridge.inboundPumpScheduler !== callbackScheduler ||
+            callbackScheduler.generation !== ownerGeneration) return;
+        callbackReports++;
+        callbackContinuations++;
+    };
+    callbackScheduler.pending.finish();
+    assert.equal(callbackReports, 0,
+        "replacement during callback must suppress stale report");
+    assert.equal(callbackContinuations, 0,
+        "replacement during callback must suppress stale continuation");
+}
 
 // Arrival timeline is diagnostic evidence only.  Keep these source-level
 // assertions here so a future scheduler refactor cannot silently turn the
