@@ -45,6 +45,9 @@ assert.match(browserClientNetworkSource,
     /scheduler\.version !== 2 \|\| scheduler\.__gaiusRetired === true/u,
     "retired scheduler objects must be replaced if reattached");
 assert.match(browserClientNetworkSource,
+    /const activeGenerationDrift = !!\(scheduler && scheduler\.pending[\s\S]*?activeGenerationDrift/u,
+    "active pending generation drift must trigger scheduler replacement");
+assert.match(browserClientNetworkSource,
     /generation:\s*nextGeneration,/u,
     "inbound pump scheduler must carry a bridge-scoped generation");
 assert.match(browserClientNetworkSource,
@@ -169,6 +172,25 @@ assert.match(browserClientNetworkSource,
     if (replacementGeneration === 0) replacementGeneration = 1;
     assert.equal(replacementGeneration, 18,
         "replacement must advance beyond a higher retired scheduler generation");
+
+    const activePendingScheduler = { version: 2, generation: 2, pending: { token: 4 } };
+    const activePendingBridgeGeneration = 9;
+    const activePendingDrift = !!(activePendingScheduler.pending &&
+        Number.isFinite(activePendingBridgeGeneration) &&
+        activePendingBridgeGeneration > 0 &&
+        Number.isFinite(activePendingScheduler.generation) &&
+        activePendingScheduler.generation > 0 &&
+        activePendingBridgeGeneration !== activePendingScheduler.generation);
+    assert.equal(activePendingDrift, true,
+        "active pending generation bump must be detected before normalization");
+    activePendingScheduler.__gaiusRetired = true;
+    activePendingScheduler.pending.watchdog = 0;
+    activePendingScheduler.pending = null;
+    const activePendingBridgeState = { inboundPumpPending: false };
+    assert.equal(activePendingScheduler.pending, null,
+        "generation drift replacement must clear the retired pending record");
+    assert.equal(activePendingBridgeState.inboundPumpPending, false,
+        "generation drift replacement must clear bridge pending state");
 
     const versionMutatedScheduler = {
         version: 1,
