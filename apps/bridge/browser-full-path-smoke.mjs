@@ -5101,6 +5101,8 @@ async function printJavaResolution() {
 async function createBrowserRuntime(relayUrl, token) {
     const source = await readFile(channelSourceUrl, "utf8");
     const init = extractJsBody(source, "private static native void initBridge();");
+    const initTail = extractJsBody(source,
+        "private static native void initBridgeTail();");
     const outbound = extractJsBody(source,
         "private static native void initOutboundScheduler();");
     const inbound = extractJsBody(source,
@@ -5161,6 +5163,7 @@ async function createBrowserRuntime(relayUrl, token) {
         priority: 100,
     }];
     new Function(init)();
+    new Function(initTail)();
     new Function(outbound)();
     new Function(inbound)();
     const bridge = globalThis.__gaiusNettyBridge;

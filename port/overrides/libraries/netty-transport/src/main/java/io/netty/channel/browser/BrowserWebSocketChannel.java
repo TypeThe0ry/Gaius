@@ -1400,6 +1400,13 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               ensureRelayCandidates(entry);
             }, relayParallelPreparationDelayMs);
             }
+            // initBridgeTail is a separate @JSBody method, so its helper lexical scope is not
+            // visible to callbacks declared in this method. Resolve the tail implementation
+            // through the shared state instead of relying on a cross-script bare identifier.
+            function relayNodeRecord(candidate) {
+            const resolver = state.relayNodeRecordResolver;
+            return typeof resolver === 'function' ? resolver(candidate) : null;
+            }
             globalThis.__gaiusNettyBridgeBootstrapState = state;
             globalThis.__gaiusNettyBridgeBootstrapScope = {
               recordConnectPhase: recordConnectPhase,
@@ -1522,6 +1529,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             }
             return record;
             }
+            state.relayNodeRecordResolver = relayNodeRecord;
             function recordRelayNodeAttempt(candidate) {
             const record = relayNodeRecord(candidate);
             if (!record) return;

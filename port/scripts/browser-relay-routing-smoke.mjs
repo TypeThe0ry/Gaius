@@ -35,8 +35,11 @@ assert.doesNotMatch(bridgeScope,
 assert.match(bridgeScope,
     /recordConnectPhase:\s*recordConnectPhase,/,
     "initBridge bootstrap scope lost explicit recordConnectPhase binding");
-const bridgeScript = "{\n" + initBridgeScript + "\n}\n{\n" +
-    extractJsBody("private static native void initBridgeTail();") + "\n}";
+const initBridgeTailScript = extractJsBody("private static native void initBridgeTail();");
+assert.match(initBridgeScript, /state\.relayNodeRecordResolver/,
+    "initBridge must resolve relayNodeRecord through shared state");
+assert.match(initBridgeTailScript, /state\.relayNodeRecordResolver\s*=\s*relayNodeRecord/,
+    "initBridgeTail must publish relayNodeRecord through shared state");
 const outboundScript = extractJsBody("private static native void initOutboundScheduler();");
 
 const delay = (millis) => new Promise((resolveDelay) => setTimeout(resolveDelay, millis));
@@ -229,7 +232,10 @@ class MockWebSocket {
 }
 
 globalThis.WebSocket = MockWebSocket;
-new Function(bridgeScript)();
+// Execute split @JSBody methods independently, matching TeaVM's generated method boundaries.
+// Concatenating them in one Function can accidentally mask cross-script lexical-scope bugs.
+new Function(initBridgeScript)();
+new Function(initBridgeTailScript)();
 new Function(outboundScript)();
 
 const bridge = globalThis.__gaiusNettyBridge;
