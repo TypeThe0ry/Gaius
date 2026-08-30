@@ -206,12 +206,17 @@ public final class BrowserClientNetwork {
               bridge.inboundPumpGeneration = nextGeneration;
               bridge.inboundPumpPending = false;
             }
-            if (!Number.isFinite(Number(scheduler.generation)) ||
-                Number(scheduler.generation) <= 0) {
-              scheduler.generation = Math.max(
-                1, Number(bridge.inboundPumpGeneration) || 1);
-            }
-            bridge.inboundPumpGeneration = scheduler.generation;
+            const bridgeGeneration = Number(bridge.inboundPumpGeneration);
+            const schedulerGeneration = Number(scheduler.generation);
+            const normalizedGeneration = Math.max(
+              Number.isFinite(bridgeGeneration) && bridgeGeneration > 0
+                ? bridgeGeneration : 0,
+              Number.isFinite(schedulerGeneration) && schedulerGeneration > 0
+                ? schedulerGeneration : 0,
+              1
+            );
+            scheduler.generation = normalizedGeneration;
+            bridge.inboundPumpGeneration = normalizedGeneration;
             // Keep the scheduler object compatible with older generated clients while adding
             // a bounded latest-only diagnostics lane. These fields never gate transport work.
             if (typeof scheduler.reportPending !== 'boolean') scheduler.reportPending = false;
@@ -577,6 +582,8 @@ public final class BrowserClientNetwork {
                 // do not publish reports or schedule work against retired state.
                 if (globalThis.__gaiusNettyBridge !== bridge ||
                     bridge.inboundPumpScheduler !== ownerScheduler ||
+                    ownerScheduler.__gaiusRetired === true ||
+                    ownerScheduler.version !== 2 ||
                     (Number(ownerScheduler.generation) || 0) !== ownerGeneration) {
                   return;
                 }

@@ -53,6 +53,12 @@ assert.match(browserClientNetworkSource,
 assert.match(browserClientNetworkSource,
     /const pending = \{token: token, finish: null, watchdog: 0\}/u,
     "pending pump record must retain its watchdog for retirement cleanup");
+assert.match(browserClientNetworkSource,
+    /callback\(\) may synchronously install[\s\S]*?ownerScheduler\.__gaiusRetired === true[\s\S]*?ownerScheduler\.version !== 2/u,
+    "post-callback owner guard must reject retired or legacy scheduler state");
+assert.match(browserClientNetworkSource,
+    /const normalizedGeneration = Math\.max\([\s\S]*?bridge\.inboundPumpGeneration = normalizedGeneration/u,
+    "legacy scheduler generation must normalize monotonically");
 
 // Server-free race model: replacing the scheduler while an old watchdog/message
 // callback is queued must leave the replacement pending record untouched and must
@@ -142,6 +148,35 @@ assert.match(browserClientNetworkSource,
         "replacement during callback must suppress stale report");
     assert.equal(callbackContinuations, 0,
         "replacement during callback must suppress stale continuation");
+
+    const legacyBridge = { inboundPumpGeneration: 9 };
+    const legacyScheduler = { generation: 2 };
+    const normalizedGeneration = Math.max(
+        Number(legacyBridge.inboundPumpGeneration) || 0,
+        Number(legacyScheduler.generation) || 0,
+        1,
+    );
+    legacyScheduler.generation = normalizedGeneration;
+    legacyBridge.inboundPumpGeneration = normalizedGeneration;
+    assert.equal(legacyScheduler.generation, 9,
+        "legacy scheduler must not lower bridge generation");
+    assert.equal(legacyBridge.inboundPumpGeneration, 9,
+        "bridge generation must remain monotonic");
+
+    const versionMutatedScheduler = {
+        version: 1,
+        __gaiusRetired: false,
+        generation: 4,
+    };
+    const versionMutatedBridge = { inboundPumpScheduler: versionMutatedScheduler };
+    let versionMutatedReports = 0;
+    if (versionMutatedBridge.inboundPumpScheduler === versionMutatedScheduler &&
+        versionMutatedScheduler.__gaiusRetired !== true &&
+        versionMutatedScheduler.version === 2) {
+        versionMutatedReports++;
+    }
+    assert.equal(versionMutatedReports, 0,
+        "version-mutated scheduler must not publish after callback");
 }
 
 // Arrival timeline is diagnostic evidence only.  Keep these source-level
