@@ -358,7 +358,7 @@ function assertStressSchedulerEvidence(result, tier, configuration) {
     assert.ok(scheduler.maxClientsPerCallback <= scheduler.maxBatchClients,
         `stress tier ${tier} exceeded poll callback client cap`);
     assert.ok(scheduler.maxPlayTickServicesPerCallback <=
-        scheduler.maxPlayTicksPerSchedulerCallbackLimit,
+        scheduler.maxPlayTickServicesPerCallbackLimit,
     `stress tier ${tier} exceeded PLAY tick callback cap`);
     assert.equal(scheduler.dueMapEntries, 0,
         `stress tier ${tier} scheduler retained due-map entries after stop`);
