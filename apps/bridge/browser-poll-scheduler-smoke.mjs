@@ -36,6 +36,67 @@ assert.match(source,
     /const MAX_PLAY_TICKS_PER_SCHEDULER_CALLBACK = MAX_CLIENTS_PER_POLL_CALLBACK/u);
 assert.match(source, /const CALLBACK_TAIL_SLOW_THRESHOLD_MILLIS = 16\.7/u);
 assert.match(source, /const CALLBACK_TAIL_SAMPLE_LIMIT = 64/u);
+// Per-client poll phase evidence is deliberately a diagnostic ring.  Keep the
+// schema/caps visible at source level so a scheduler refactor cannot silently
+// turn it into an unbounded trace or alter the strict frame gate.
+assert.match(source,
+    /const POLL_PHASE_TELEMETRY_SCHEMA_VERSION\s*=\s*["']gaius\.browser-client-poll-phase\.v1["']/u,
+    "poll phase telemetry schema drifted");
+assert.match(source,
+    /const POLL_PHASE_SLOW_THRESHOLD_MILLIS\s*=\s*16\.7/u,
+    "poll phase diagnostic threshold drifted");
+assert.match(source,
+    /const POLL_PHASE_SAMPLE_LIMIT\s*=\s*64/u,
+    "poll phase sample limit drifted");
+assert.match(source,
+    /const POLL_PHASE_FRAME_SAMPLE_LIMIT\s*=\s*8/u,
+    "poll phase frame cap drifted");
+assert.match(source,
+    /const POLL_PHASE_PACKET_SAMPLE_LIMIT\s*=\s*64/u,
+    "poll phase packet cap drifted");
+assert.match(source, /pollPhaseSamplesTotal/u,
+    "client poll phase total counter is missing");
+assert.match(source, /pollPhaseSamplesDropped/u,
+    "client poll phase dropped counter is missing");
+assert.match(source, /pollPhaseSamples/u,
+    "client poll phase bounded ring is missing");
+assert.match(source, /resetPollPhaseContext\(/u,
+    "poll phase context is not reset per poll");
+assert.match(source, /addPollPhaseSegment\(/u,
+    "poll phase segment timing helper is missing");
+assert.match(source, /retainPollPhaseSample\(/u,
+    "poll phase bounded retention helper is missing");
+assert.match(source, /pollPhaseTelemetryResult\(/u,
+    "poll phase result serializer is missing");
+const clientPollStart = source.indexOf("    poll(schedulerCallbackSequence");
+const clientPollEnd = source.indexOf("\n    parsePackets(", clientPollStart);
+assert.ok(clientPollStart >= 0 && clientPollEnd > clientPollStart,
+    "BrowserMinecraftClient.poll boundaries changed; inspect telemetry hooks");
+const clientPollSource = source.slice(clientPollStart, clientPollEnd);
+for (const marker of [
+    "this.checkError()",
+    "this.recordPhases()",
+    "this.parsePackets(",
+    "this.bridge.pollInbound(",
+    "Buffer.concat(",
+    "this.decipher.update(",
+    "retainPollPhaseSample(",
+]) {
+    assert.match(clientPollSource, new RegExp(marker.replace(/[().]/gu, "\\$&"), "u"),
+        `poll phase source omitted ${marker}`);
+}
+assert.match(clientPollSource, /finally\s*\{[\s\S]*?pollContext\.durationRawMillis/u,
+    "poll phase duration must be finalized on success and error");
+const pollPhaseContractIndex = source.indexOf("pollPhaseTelemetry");
+assert.ok(pollPhaseContractIndex >= 0,
+    "performance contract omitted pollPhaseTelemetry");
+const pollPhaseContractWindows = [...source.matchAll(/pollPhaseTelemetry/gu)]
+    .map(({ index }) => source.slice(index, index + 2500));
+assert.ok(pollPhaseContractWindows.some((window) =>
+    /strictGatesChanged\s*:\s*false/u.test(window) &&
+    /independentExecution\s*:\s*false/u.test(window) &&
+    /diagnosticOnly\s*:\s*true/u.test(window)),
+"poll phase evidence must remain diagnostic-only and non-independent");
 assert.match(schedulerSource, /setImmediate/u);
 assert.match(schedulerSource, /setTimeout\(\(\) => \{[\s\S]*?\}, 0\)/u);
 assert.match(schedulerSource, /POLL_SCHEDULER_TIMER_YIELD_TURNS/u);
@@ -507,6 +568,258 @@ function retainCallbackTailSample(state, sample) {
     "callback-tail phase timings were not monotonic");
 }
 
+// Poll-phase diagnostic model.  The production client may parse/inflate a
+// bounded burst of frames synchronously, so callback-tail evidence must retain
+// one bounded sample per slow poll rather than infer phases from packet-arrival
+// gaps.  This model is intentionally independent of the strict gate: it only
+// checks shape, clamping, and deterministic retention policy.
+const POLL_PHASE_SCHEMA_VERSION = "gaius.browser-client-poll-phase.v1";
+const POLL_PHASE_THRESHOLD_MILLIS = 16.7;
+const POLL_PHASE_LIMIT = 64;
+const POLL_PHASE_FRAME_LIMIT = 8;
+const POLL_PHASE_PACKET_LIMIT = 64;
+const POLL_PHASE_PACKET_ID_LIMIT = 8;
+const POLL_PHASE_SEGMENTS = Object.freeze([
+    "preludeMillis",
+    "checkErrorMillis",
+    "recordPhasesMillis",
+    "prefixParseMillis",
+    "bridgeDrainMillis",
+    "bridgePollMillis",
+    "decryptMillis",
+    "concatMillis",
+    "parseMillis",
+    "inflateMillis",
+    "handlerMillis",
+    "finalizeMillis",
+]);
+
+function clampPollSegment(startAt, endAt) {
+    const start = Number(startAt);
+    const end = Number(endAt);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) {
+        return { millis: 0, clockAnomaly: true };
+    }
+    const millis = end - start;
+    if (!Number.isFinite(millis) || millis < 0) {
+        return { millis: 0, clockAnomaly: true };
+    }
+    return { millis, clockAnomaly: false };
+}
+
+function boundedInteger(value, maximum) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return 0;
+    return Math.min(maximum, Math.max(0, Math.trunc(number)));
+}
+
+function normalizePollPhaseSample(candidate) {
+    const durationRawMillis = Number(candidate?.durationRawMillis);
+    const duration = Number.isFinite(durationRawMillis) && durationRawMillis >= 0
+        ? durationRawMillis : 0;
+    const rawSegments = candidate?.segments ?? {};
+    const segments = Object.fromEntries(POLL_PHASE_SEGMENTS.map((name) => {
+        const value = Number(rawSegments[name]);
+        return [name, Number.isFinite(value) && value >= 0
+            ? Math.min(duration, value) : 0];
+    }));
+    const rawWork = candidate?.work ?? {};
+    const rawPacketIds = Array.isArray(candidate?.slowPacketIds)
+        ? candidate.slowPacketIds : [];
+    const clockAnomaly = candidate?.clockAnomaly === true ||
+        POLL_PHASE_SEGMENTS.some((name) => {
+            const value = Number(rawSegments[name]);
+            return Number.isFinite(value) && value < 0;
+        });
+    return {
+        schemaVersion: POLL_PHASE_SCHEMA_VERSION,
+        pollSequence: Number.isSafeInteger(candidate?.pollSequence)
+            ? candidate.pollSequence : 0,
+        durationRawMillis: duration,
+        durationMillis: Number(duration.toFixed(3)),
+        strictThresholdMillis: POLL_PHASE_THRESHOLD_MILLIS,
+        strictGatesChanged: false,
+        independentExecution: false,
+        diagnosticOnly: true,
+        clockAnomaly,
+        outcome: candidate?.outcome === "error" ? "error" : "ok",
+        trigger: candidate?.trigger ?? "poll-duration",
+        segments,
+        work: {
+            frames: boundedInteger(rawWork.frames, POLL_PHASE_FRAME_LIMIT),
+            packetsParsed: boundedInteger(rawWork.packetsParsed,
+                POLL_PHASE_PACKET_LIMIT),
+            bridgePollCalls: boundedInteger(rawWork.bridgePollCalls,
+                POLL_PHASE_FRAME_LIMIT),
+            frameBytes: boundedInteger(rawWork.frameBytes, Number.MAX_SAFE_INTEGER),
+            compressedPackets: boundedInteger(rawWork.compressedPackets,
+                POLL_PHASE_PACKET_LIMIT),
+        },
+        slowPacketIds: rawPacketIds.slice(0, POLL_PHASE_PACKET_ID_LIMIT),
+    };
+}
+
+function classifyPollPhase(sample) {
+    const candidates = [
+        ["bridge-drain", sample?.segments?.bridgeDrainMillis],
+        ["decrypt-transform", sample?.segments?.decryptMillis],
+        ["buffer-concat", sample?.segments?.concatMillis],
+        ["parse-inflate", Math.max(
+            Number(sample?.segments?.parseMillis) || 0,
+            Number(sample?.segments?.inflateMillis) || 0)],
+        ["packet-dispatch", sample?.segments?.handlerMillis],
+        ["prelude", Math.max(
+            Number(sample?.segments?.preludeMillis) || 0,
+            Number(sample?.segments?.checkErrorMillis) || 0,
+            Number(sample?.segments?.recordPhasesMillis) || 0)],
+        ["finalize", sample?.segments?.finalizeMillis],
+    ];
+    let winner = "poll-duration";
+    let maximum = 0;
+    for (const [name, value] of candidates) {
+        const duration = Number(value);
+        if (Number.isFinite(duration) && duration > maximum) {
+            winner = name;
+            maximum = duration;
+        }
+    }
+    return maximum >= POLL_PHASE_THRESHOLD_MILLIS ? winner : "poll-duration";
+}
+
+function retainPollPhaseSample(state, candidate) {
+    const duration = Number(candidate?.durationRawMillis);
+    if (!Number.isFinite(duration) || duration < POLL_PHASE_THRESHOLD_MILLIS) {
+        return false;
+    }
+    state.total++;
+    state.samples.push(normalizePollPhaseSample(candidate));
+    state.samples.sort((left, right) =>
+        right.durationRawMillis - left.durationRawMillis ||
+        left.pollSequence - right.pollSequence);
+    if (state.samples.length > POLL_PHASE_LIMIT) {
+        state.samples.length = POLL_PHASE_LIMIT;
+        state.dropped++;
+    }
+    return true;
+}
+
+{
+    const fast = { total: 0, dropped: 0, samples: [] };
+    assert.equal(retainPollPhaseSample(fast, {
+        pollSequence: 1, durationRawMillis: 16.699,
+    }), false, "sub-threshold poll entered diagnostic ring");
+    assert.deepEqual(fast, { total: 0, dropped: 0, samples: [] },
+        "sub-threshold poll changed diagnostic counters");
+
+    const forward = clampPollSegment(10, 12.5);
+    assert.equal(forward.clockAnomaly, false,
+        "normal poll segment was marked as a clock anomaly");
+    assert.equal(forward.millis, 2.5,
+        "normal poll segment duration was not preserved");
+    const reversed = clampPollSegment(12.5, 10);
+    assert.equal(reversed.millis, 0,
+        "negative poll segment was not clamped to zero");
+    assert.equal(reversed.clockAnomaly, true,
+        "negative poll segment did not expose a clock anomaly");
+    const invalid = clampPollSegment("not-a-time", 10);
+    assert.equal(invalid.clockAnomaly, true,
+        "non-finite poll segment did not expose a clock anomaly");
+
+    const ring = { total: 0, dropped: 0, samples: [] };
+    for (let sequence = 1; sequence <= 65; sequence++) {
+        retainPollPhaseSample(ring, {
+            pollSequence: sequence,
+            durationRawMillis: 16.7 + sequence / 1000,
+            segments: { parseMillis: sequence / 1000 },
+            work: { frames: 8, packetsParsed: 64, bridgePollCalls: 8 },
+        });
+    }
+    assert.equal(ring.total, 65,
+        "poll phase total did not count every slow candidate");
+    assert.equal(ring.samples.length, POLL_PHASE_LIMIT,
+        "poll phase ring exceeded its hard limit");
+    assert.equal(ring.dropped, 1,
+        "poll phase dropped count did not track overflow");
+    assert.equal(ring.total, ring.samples.length + ring.dropped,
+        "poll phase total/retained/dropped accounting diverged");
+    for (let index = 1; index < ring.samples.length; index++) {
+        const previous = ring.samples[index - 1];
+        const current = ring.samples[index];
+        assert.ok(previous.durationRawMillis > current.durationRawMillis ||
+            previous.durationRawMillis === current.durationRawMillis &&
+                previous.pollSequence <= current.pollSequence,
+        "poll phase ring ordering was not duration-desc/sequence-asc");
+    }
+    assert.ok(ring.samples.every((sample) =>
+        sample.work.frames <= POLL_PHASE_FRAME_LIMIT &&
+        sample.work.packetsParsed <= POLL_PHASE_PACKET_LIMIT &&
+        sample.work.bridgePollCalls <= POLL_PHASE_FRAME_LIMIT),
+    "poll phase frame/packet work exceeded bounded caps");
+
+    const tie = { total: 0, dropped: 0, samples: [] };
+    retainPollPhaseSample(tie, { pollSequence: 9, durationRawMillis: 20 });
+    retainPollPhaseSample(tie, { pollSequence: 3, durationRawMillis: 20 });
+    assert.deepEqual(tie.samples.map((sample) => sample.pollSequence), [3, 9],
+        "equal-duration poll phases were not sequence ordered");
+
+    const anomaly = normalizePollPhaseSample({
+        pollSequence: 7,
+        durationRawMillis: 24,
+        clockAnomaly: true,
+        outcome: "error",
+        segments: { parseMillis: -4, handlerMillis: 12, finalizeMillis: 40 },
+        work: { frames: 99, packetsParsed: 99, bridgePollCalls: 99 },
+        slowPacketIds: [1, 2, 3, 4, 5, 6, 7, 8, 9],
+    });
+    assert.equal(anomaly.clockAnomaly, true,
+        "poll phase clock anomaly marker was lost during normalization");
+    assert.equal(anomaly.outcome, "error",
+        "poll phase error outcome was lost during normalization");
+    assert.equal(anomaly.segments.parseMillis, 0,
+        "negative poll phase segment was not clamped");
+    assert.equal(anomaly.segments.finalizeMillis, 24,
+        "poll phase segment was not bounded by poll duration");
+    assert.equal(anomaly.work.frames, POLL_PHASE_FRAME_LIMIT,
+        "poll phase frame count escaped its cap");
+    assert.equal(anomaly.work.packetsParsed, POLL_PHASE_PACKET_LIMIT,
+        "poll phase packet count escaped its cap");
+    assert.equal(anomaly.slowPacketIds.length, POLL_PHASE_PACKET_ID_LIMIT,
+        "poll phase packet-id detail escaped its cap");
+    assert.equal(classifyPollPhase({
+        segments: { bridgeDrainMillis: 18, parseMillis: 17 },
+    }), "bridge-drain", "bridge phase trigger classification drifted");
+    assert.equal(classifyPollPhase({
+        segments: { parseMillis: 20, inflateMillis: 19 },
+    }), "parse-inflate", "parse phase trigger classification drifted");
+    assert.equal(classifyPollPhase({
+        segments: { handlerMillis: 19 },
+    }), "packet-dispatch", "handler phase trigger classification drifted");
+    assert.equal(classifyPollPhase({
+        segments: { parseMillis: 2 },
+    }), "poll-duration", "fast phase incorrectly changed trigger");
+
+    const empty = { total: 0, dropped: 0, samples: [] };
+    assert.equal(retainPollPhaseSample(empty, {
+        pollSequence: 1, durationRawMillis: 0,
+        work: { frames: 0, packetsParsed: 0 },
+    }), false, "empty poll produced a slow diagnostic sample");
+    const failed = { total: 0, dropped: 0, samples: [] };
+    assert.equal(retainPollPhaseSample(failed, {
+        pollSequence: 2, durationRawMillis: 18, outcome: "error",
+    }), true, "poll error did not retain a slow diagnostic sample");
+    assert.equal(failed.samples[0].outcome, "error",
+        "retained poll error lost its outcome");
+    for (const sample of ring.samples) {
+        assert.ok(sample.durationRawMillis >= POLL_PHASE_THRESHOLD_MILLIS,
+            "poll phase ring retained a sub-threshold sample");
+        for (const value of Object.values(sample.segments)) {
+            assert.ok(Number.isFinite(value) && value >= 0 &&
+                value <= sample.durationRawMillis,
+            "poll phase segment was negative/non-finite/outside duration");
+        }
+    }
+}
+
 {
     const ticks = {
         active: true,
@@ -743,5 +1056,16 @@ console.log(JSON.stringify({
     callbackWorkBudgetMillis: CALLBACK_WORK_BUDGET_MILLIS,
     runMillis: RUN_MILLIS,
     strictPollGapTarget: { p99Millis: 16.7, p999Millis: 50, maxMillis: 100 },
+    pollPhaseTelemetry: {
+        schemaVersion: POLL_PHASE_SCHEMA_VERSION,
+        slowThresholdMillis: POLL_PHASE_THRESHOLD_MILLIS,
+        sampleLimit: POLL_PHASE_LIMIT,
+        frameSampleLimit: POLL_PHASE_FRAME_LIMIT,
+        packetSampleLimit: POLL_PHASE_PACKET_LIMIT,
+        diagnosticOnly: true,
+        strictGatesChanged: false,
+        independentExecution: false,
+        retention: "longest-duration-desc-sequence-asc",
+    },
     results,
 }));

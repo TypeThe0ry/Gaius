@@ -264,6 +264,18 @@ const CALLBACK_TAIL_TELEMETRY_SCHEMA_VERSION =
     "gaius.browser-client-poll-callback-tail.v1";
 const CALLBACK_TAIL_SLOW_THRESHOLD_MILLIS = 16.7;
 const CALLBACK_TAIL_SAMPLE_LIMIT = 64;
+// A callback-tail overrun often collapses to one synchronous client poll.
+// Retain a bounded scalar-only phase breakdown so the next run can distinguish
+// bridge dequeue/transform, inflate/parse, packet dispatch, and bookkeeping.
+// This is diagnostic evidence only: it neither changes the 8 ms admission
+// budget nor the strict 16.7 ms raw callback/poll gates.
+const POLL_PHASE_TELEMETRY_SCHEMA_VERSION =
+    "gaius.browser-client-poll-phase.v1";
+const POLL_PHASE_SLOW_THRESHOLD_MILLIS = 16.7;
+const POLL_PHASE_SAMPLE_LIMIT = 64;
+const POLL_PHASE_FRAME_SAMPLE_LIMIT = 8;
+const POLL_PHASE_PACKET_SAMPLE_LIMIT = 64;
+const POLL_PHASE_PACKET_ID_SAMPLE_LIMIT = 8;
 // Arrival-gap telemetry is diagnostic-only.  It is deliberately separate
 // from every acceptance gate so a long decoded-packet gap can be attributed
 // without turning a sampled/unsampled result into a pass.  The bridge does not
@@ -671,7 +683,8 @@ try {
         "initialConnectThroughMinimumChunks",
         "initial connect through minimum chunks",
     );
-    const createClients = (wave, previousClients = undefined, reconnectScheduledAt = undefined) => Array.from({ length: clientCount }, (_, index) =>
+    const createClients = (wave, previousClients = undefined,
+        reconnectScheduledAt = undefined, reconnectDropAt = undefined) => Array.from({ length: clientCount }, (_, index) =>
         new BrowserMinecraftClient({
             id: 700 + wave * 100 + index,
             index,
@@ -684,7 +697,13 @@ try {
             sessionUrl: sessionBaseUrl,
             identity: clientIdentities[index],
             previousDecodeEndAt: previousClients?.[index]?.arrivalLastDecodeEndAt,
-            reconnectDropAt: previousClients?.[index]?.arrivalReconnectDropAt,
+            // Keep the boundary timestamp owned by this lifecycle immutable.
+            // The current wave's drop is passed explicitly below; falling back
+            // to the previous seed is only for callers that do not have a new
+            // transport-drop marker.
+            reconnectDropAt: Number.isFinite(reconnectDropAt)
+                ? Number(reconnectDropAt)
+                : previousClients?.[index]?.arrivalReconnectDropAt,
             reconnectScheduledAt,
         }));
     allClients = [];
@@ -863,7 +882,8 @@ try {
             // the reconnect timers below still start at the simultaneous drop.
             await delay(100);
 
-            const replacementClients = createClients(wave, previousClients, performance.now());
+            const replacementClients = createClients(
+                wave, previousClients, performance.now(), dropAt);
             assert.equal(replacementClients.length, previousClients.length);
             for (let index = 0; index < replacementClients.length; index++) {
                 const previous = previousClients[index];
@@ -2151,6 +2171,10 @@ function createFairClientPollScheduler(getClients) {
                     }
                     const pollStartedAt = performance.now();
                     try {
+                        // Keep the established no-argument client contract. A
+                        // poll-phase sample can still be joined by client/wave
+                        // and poll sequence; scheduler provenance remains null
+                        // for synthetic and production-compatible clients.
                         candidate.poll();
                     }
                     finally {
@@ -2779,6 +2803,56 @@ class BrowserMinecraftClient {
         this.playTickGapSamples = 0;
         this.maxPlayTickGapMillis = 0;
         this.playTickGapHistogram = createLatencyHistogram();
+        // Reuse one accumulator per client so the normal (sub-threshold) poll
+        // path does not allocate a trace object on every scheduler turn.  A
+        // materialized sample is copied into the bounded ring only when the
+        // complete poll exceeds the diagnostic threshold.
+        this.pollPhaseSequence = 0;
+        this.pollPhasePollsTotal = 0;
+        this.pollPhaseSamplesTotal = 0;
+        this.pollPhaseSamplesDropped = 0;
+        this.pollPhaseSamples = [];
+        this.pollPhaseContext = {
+            active: false,
+            pollSequence: 0,
+            schedulerCallbackSequence: null,
+            schedulerTrigger: null,
+            startedAt: 0,
+            durationRawMillis: 0,
+            clockAnomaly: false,
+            outcome: "ok",
+            segments: {
+                preludeMillis: 0,
+                checkErrorMillis: 0,
+                recordPhasesMillis: 0,
+                prefixParseMillis: 0,
+                bridgeDrainMillis: 0,
+                bridgePollMillis: 0,
+                decryptMillis: 0,
+                concatMillis: 0,
+                parseMillis: 0,
+                inflateMillis: 0,
+                handlerMillis: 0,
+                finalizeMillis: 0,
+            },
+            work: {
+                frames: 0,
+                frameBytes: 0,
+                packetsParsed: 0,
+                bridgePollCalls: 0,
+                compressedPackets: 0,
+                maxBridgePollMillis: 0,
+                maxInflateMillis: 0,
+                maxHandlerMillis: 0,
+                maxPacketMillis: 0,
+            },
+            bufferBefore: 0,
+            bufferAfter: 0,
+            maximumBufferedBytes: 0,
+            frameBudgetYield: false,
+            packetBudgetYield: false,
+            slowPacketIds: [],
+        };
         // Bounded, diagnostic-only packet arrival evidence.  `wireAt` is
         // intentionally never synthesized: the browser/WebSocket bridge does
         // not expose a server wire timestamp.  Frame metadata is associated
@@ -3190,9 +3264,213 @@ class BrowserMinecraftClient {
         }
     }
 
-    poll() {
+    resetPollPhaseContext(pollStartedAt, schedulerCallbackSequence = null,
+        schedulerTrigger = null) {
+        const context = this.pollPhaseContext;
+        context.active = true;
+        context.pollSequence = ++this.pollPhaseSequence;
+        context.schedulerCallbackSequence = Number.isSafeInteger(
+            schedulerCallbackSequence) ? schedulerCallbackSequence : null;
+        context.schedulerTrigger = typeof schedulerTrigger === "string"
+            ? schedulerTrigger : null;
+        context.startedAt = pollStartedAt;
+        context.durationRawMillis = 0;
+        context.clockAnomaly = false;
+        context.outcome = "ok";
+        const segments = context.segments;
+        segments.preludeMillis = 0;
+        segments.checkErrorMillis = 0;
+        segments.recordPhasesMillis = 0;
+        segments.prefixParseMillis = 0;
+        segments.bridgeDrainMillis = 0;
+        segments.bridgePollMillis = 0;
+        segments.decryptMillis = 0;
+        segments.concatMillis = 0;
+        segments.parseMillis = 0;
+        segments.inflateMillis = 0;
+        segments.handlerMillis = 0;
+        segments.finalizeMillis = 0;
+        const work = context.work;
+        work.frames = 0;
+        work.frameBytes = 0;
+        work.packetsParsed = 0;
+        work.bridgePollCalls = 0;
+        work.compressedPackets = 0;
+        work.maxBridgePollMillis = 0;
+        work.maxInflateMillis = 0;
+        work.maxHandlerMillis = 0;
+        work.maxPacketMillis = 0;
+        context.bufferBefore = this.buffer.byteLength;
+        context.bufferAfter = context.bufferBefore;
+        context.maximumBufferedBytes = this.maximumBufferedBytes;
+        context.frameBudgetYield = false;
+        context.packetBudgetYield = false;
+        context.slowPacketIds.length = 0;
+        return context;
+    }
+
+    addPollPhaseSegment(context, name, startedAt, endedAt) {
+        const start = Number(startedAt);
+        const end = Number(endedAt);
+        const delta = end - start;
+        if (!Number.isFinite(delta) || delta < 0) {
+            context.clockAnomaly = true;
+            return 0;
+        }
+        context.segments[name] += delta;
+        return delta;
+    }
+
+    retainPollPhaseSample(context) {
+        const duration = Number(context.durationRawMillis);
+        if (!Number.isFinite(duration) || duration < POLL_PHASE_SLOW_THRESHOLD_MILLIS) {
+            return false;
+        }
+        const segments = context.segments;
+        let trigger = "poll-duration";
+        let triggerMillis = 0;
+        const candidates = [
+            ["bridge-drain", segments.bridgeDrainMillis],
+            ["decrypt-transform", segments.decryptMillis],
+            ["buffer-concat", segments.concatMillis],
+            ["parse-inflate", Math.max(segments.parseMillis, segments.inflateMillis)],
+            ["packet-dispatch", segments.handlerMillis],
+            ["prelude", Math.max(segments.preludeMillis,
+                segments.checkErrorMillis, segments.recordPhasesMillis)],
+            ["finalize", segments.finalizeMillis],
+        ];
+        for (const [name, value] of candidates) {
+            if (Number.isFinite(value) && value > triggerMillis) {
+                trigger = name;
+                triggerMillis = value;
+            }
+        }
+        // A poll can exceed the diagnostic threshold because several small
+        // phases add up.  Do not mislabel that as a slow phase: retain the
+        // aggregate poll-duration trigger unless one individual segment is
+        // itself at least as slow as the diagnostic threshold.
+        if (triggerMillis < POLL_PHASE_SLOW_THRESHOLD_MILLIS) {
+            trigger = "poll-duration";
+        }
+        const boundedSegment = (value) => Number.isFinite(value) && value >= 0
+            ? Math.min(duration, value) : 0;
+        const boundedInteger = (value, maximum) => {
+            const number = Number(value);
+            return Number.isFinite(number)
+                ? Math.min(maximum, Math.max(0, Math.trunc(number))) : 0;
+        };
+        const sample = {
+            schemaVersion: POLL_PHASE_TELEMETRY_SCHEMA_VERSION,
+            pollSequence: context.pollSequence,
+            schedulerCallbackSequence: context.schedulerCallbackSequence,
+            schedulerTrigger: context.schedulerTrigger,
+            clientId: this.id,
+            wave: this.wave,
+            startedAtMillis: context.startedAt,
+            durationRawMillis: duration,
+            durationMillis: Number(duration.toFixed(3)),
+            slowThresholdMillis: POLL_PHASE_SLOW_THRESHOLD_MILLIS,
+            strictThresholdMillis: 16.7,
+            strictGatesChanged: false,
+            independentExecution: false,
+            diagnosticOnly: true,
+            trigger,
+            triggerMillis: boundedSegment(triggerMillis),
+            outcome: context.outcome === "error" ? "error" : "ok",
+            clockAnomaly: context.clockAnomaly,
+            segments: {
+                preludeMillis: boundedSegment(segments.preludeMillis),
+                checkErrorMillis: boundedSegment(segments.checkErrorMillis),
+                recordPhasesMillis: boundedSegment(segments.recordPhasesMillis),
+                prefixParseMillis: boundedSegment(segments.prefixParseMillis),
+                bridgeDrainMillis: boundedSegment(segments.bridgeDrainMillis),
+                bridgePollMillis: boundedSegment(segments.bridgePollMillis),
+                decryptMillis: boundedSegment(segments.decryptMillis),
+                concatMillis: boundedSegment(segments.concatMillis),
+                parseMillis: boundedSegment(segments.parseMillis),
+                inflateMillis: boundedSegment(segments.inflateMillis),
+                handlerMillis: boundedSegment(segments.handlerMillis),
+                finalizeMillis: boundedSegment(segments.finalizeMillis),
+            },
+            work: {
+                frames: boundedInteger(context.work.frames, POLL_PHASE_FRAME_SAMPLE_LIMIT),
+                frameBytes: boundedInteger(context.work.frameBytes, Number.MAX_SAFE_INTEGER),
+                packetsParsed: boundedInteger(context.work.packetsParsed,
+                    POLL_PHASE_PACKET_SAMPLE_LIMIT),
+                bridgePollCalls: boundedInteger(context.work.bridgePollCalls,
+                    POLL_PHASE_FRAME_SAMPLE_LIMIT),
+                compressedPackets: boundedInteger(context.work.compressedPackets,
+                    POLL_PHASE_PACKET_SAMPLE_LIMIT),
+                maxBridgePollMillis: boundedSegment(context.work.maxBridgePollMillis),
+                maxInflateMillis: boundedSegment(context.work.maxInflateMillis),
+                maxHandlerMillis: boundedSegment(context.work.maxHandlerMillis),
+                maxPacketMillis: boundedSegment(context.work.maxPacketMillis),
+            },
+            buffer: {
+                beforeBytes: boundedInteger(context.bufferBefore, Number.MAX_SAFE_INTEGER),
+                afterBytes: boundedInteger(context.bufferAfter, Number.MAX_SAFE_INTEGER),
+                maximumBytes: boundedInteger(context.maximumBufferedBytes,
+                    Number.MAX_SAFE_INTEGER),
+            },
+            budget: {
+                frameYield: context.frameBudgetYield,
+                packetYield: context.packetBudgetYield,
+            },
+            slowPacketIds: context.slowPacketIds.slice(0,
+                POLL_PHASE_PACKET_ID_SAMPLE_LIMIT),
+        };
+        this.pollPhaseSamplesTotal++;
+        this.pollPhaseSamples.push(sample);
+        this.pollPhaseSamples.sort((left, right) =>
+            right.durationRawMillis - left.durationRawMillis ||
+            left.pollSequence - right.pollSequence);
+        if (this.pollPhaseSamples.length > POLL_PHASE_SAMPLE_LIMIT) {
+            this.pollPhaseSamples.length = POLL_PHASE_SAMPLE_LIMIT;
+            this.pollPhaseSamplesDropped++;
+        }
+        return true;
+    }
+
+    pollPhaseTelemetryResult() {
+        return {
+            schemaVersion: POLL_PHASE_TELEMETRY_SCHEMA_VERSION,
+            slowThresholdMillis: POLL_PHASE_SLOW_THRESHOLD_MILLIS,
+            strictThresholdMillis: 16.7,
+            sampleLimit: POLL_PHASE_SAMPLE_LIMIT,
+            frameSampleLimit: POLL_PHASE_FRAME_SAMPLE_LIMIT,
+            packetSampleLimit: POLL_PHASE_PACKET_SAMPLE_LIMIT,
+            diagnosticOnly: true,
+            strictGatesChanged: false,
+            independentExecution: false,
+            retention: "longest-duration-desc-sequence-asc",
+            source: "BrowserMinecraftClient.poll",
+            pollsTotal: this.pollPhasePollsTotal,
+            slowSamplesTotal: this.pollPhaseSamplesTotal,
+            pollPhaseSamplesTotal: this.pollPhaseSamplesTotal,
+            retainedSampleCount: this.pollPhaseSamples.length,
+            slowSamplesDropped: this.pollPhaseSamplesDropped,
+            pollPhaseSamplesDropped: this.pollPhaseSamplesDropped,
+            droppedSampleCount: this.pollPhaseSamplesDropped,
+            samples: this.pollPhaseSamples.map((sample) => ({
+                ...sample,
+                segments: { ...sample.segments },
+                work: { ...sample.work },
+                buffer: { ...sample.buffer },
+                budget: { ...sample.budget },
+                slowPacketIds: [...sample.slowPacketIds],
+            })),
+        };
+    }
+
+    poll(schedulerCallbackSequence = null, schedulerTrigger = null) {
         if (this.closed || this.pollingPaused) return;
         const pollStartedAt = performance.now();
+        const pollContext = this.resetPollPhaseContext(
+            pollStartedAt, schedulerCallbackSequence, schedulerTrigger);
+        this.pollPhasePollsTotal++;
+        let checkErrorStartedAt;
+        let recordPhasesStartedAt;
+        let finalizeStartedAt;
         try {
             const polledAt = pollStartedAt;
             if (this.lastPollAt !== undefined) {
@@ -3204,33 +3482,68 @@ class BrowserMinecraftClient {
                 observeLatency(this.pollGapHistogram, polledAt - this.lastPollAt);
             }
             this.lastPollAt = polledAt;
+            checkErrorStartedAt = performance.now();
             this.checkError();
+            this.addPollPhaseSegment(pollContext, "checkErrorMillis",
+                checkErrorStartedAt, performance.now());
+            recordPhasesStartedAt = performance.now();
             this.recordPhases();
+            this.addPollPhaseSegment(pollContext, "recordPhasesMillis",
+                recordPhasesStartedAt, performance.now());
             let framesPolled = 0;
             let packetsRemaining = MAX_PACKETS_PER_POLL;
             // Bytes already held in the protocol cumulation have no new
             // bridge dequeue associated with them.  Clear the frame context
             // before parsing that prefix, then attach metadata for each newly
             // dequeued bridge chunk below.
+            const prefixParseStartedAt = performance.now();
             this.clearArrivalFrame();
             const parsedBeforeInbound = this.parsePackets(packetsRemaining);
+            this.addPollPhaseSegment(
+                pollContext, "prefixParseMillis", prefixParseStartedAt,
+                performance.now());
             packetsRemaining -= parsedBeforeInbound;
             let chunk;
             while (framesPolled < MAX_INBOUND_FRAMES_PER_POLL &&
-                packetsRemaining > 0 &&
-                (chunk = this.bridge.pollInbound(this.id)) !== null) {
+                packetsRemaining > 0) {
+                const bridgeDrainStartedAt = performance.now();
+                const bridgePollStartedAt = bridgeDrainStartedAt;
+                chunk = this.bridge.pollInbound(this.id);
+                const bridgePollEndedAt = performance.now();
+                const bridgePollMillis = this.addPollPhaseSegment(
+                    pollContext, "bridgePollMillis", bridgePollStartedAt,
+                    bridgePollEndedAt);
+                pollContext.work.bridgePollCalls++;
+                pollContext.work.maxBridgePollMillis = Math.max(
+                    pollContext.work.maxBridgePollMillis, bridgePollMillis);
+                if (chunk === null) break;
                 this.setArrivalFrameFromBridge(polledAt);
                 const bytes = Buffer.from(chunk);
+                const decryptStartedAt = performance.now();
+                const transformed = this.decipher === undefined
+                    ? bytes : this.decipher.update(bytes);
+                this.addPollPhaseSegment(
+                    pollContext, "decryptMillis", decryptStartedAt,
+                    performance.now());
+                const concatStartedAt = performance.now();
                 this.buffer = Buffer.concat([
                     this.buffer,
-                    this.decipher === undefined ? bytes : this.decipher.update(bytes),
+                    transformed,
                 ]);
+                this.addPollPhaseSegment(pollContext, "concatMillis", concatStartedAt,
+                    performance.now());
+                this.addPollPhaseSegment(pollContext, "bridgeDrainMillis",
+                    bridgeDrainStartedAt, performance.now());
                 this.inboundFrames++;
                 this.inboundBytes += bytes.byteLength;
+                pollContext.work.frames++;
+                pollContext.work.frameBytes += bytes.byteLength;
                 this.maximumBufferedBytes = Math.max(
                     this.maximumBufferedBytes,
                     this.buffer.byteLength,
                 );
+                pollContext.maximumBufferedBytes = Math.max(
+                    pollContext.maximumBufferedBytes, this.buffer.byteLength);
                 framesPolled++;
                 packetsRemaining -= this.parsePackets(packetsRemaining);
             }
@@ -3240,21 +3553,45 @@ class BrowserMinecraftClient {
             if (framesPolled === MAX_INBOUND_FRAMES_PER_POLL &&
                 this.bridge.hasPendingInbound(this.id)) {
                 this.inboundFrameBudgetYields++;
+                pollContext.frameBudgetYield = true;
             }
             if (packetsRemaining === 0 && this.buffer.byteLength > 0) {
                 this.packetBudgetYields++;
+                pollContext.packetBudgetYield = true;
             }
+            finalizeStartedAt = performance.now();
         }
         catch (error) {
             this.failure ??= error;
+            pollContext.outcome = "error";
         }
         finally {
+            if (finalizeStartedAt === undefined) finalizeStartedAt = performance.now();
+            const finalizeEndedAt = performance.now();
+            this.addPollPhaseSegment(pollContext, "finalizeMillis",
+                finalizeStartedAt, finalizeEndedAt);
             this.clearArrivalFrame();
+            pollContext.bufferAfter = this.buffer.byteLength;
+            pollContext.durationRawMillis = Math.max(0,
+                performance.now() - pollStartedAt);
+            if (this.failure !== undefined) pollContext.outcome = "error";
+            // Prelude is the bounded check/phase bookkeeping before parsing.
+            // Keep it as an explicit scalar instead of double-counting the
+            // wall-clock interval (which also includes scheduler admission).
+            pollContext.segments.preludeMillis =
+                pollContext.segments.checkErrorMillis +
+                pollContext.segments.recordPhasesMillis;
+            this.retainPollPhaseSample(pollContext);
+            pollContext.active = false;
         }
     }
 
     parsePackets(maximumPackets = Number.POSITIVE_INFINITY) {
         let parsedPackets = 0;
+        const pollContext = this.pollPhaseContext?.active
+            ? this.pollPhaseContext : null;
+        const parseStartedAt = pollContext === null ? 0 : performance.now();
+        try {
         while (parsedPackets < maximumPackets) {
             const decodeStartAt = performance.now();
             const outerLength = decodeVarInt(this.buffer, 0);
@@ -3268,7 +3605,16 @@ class BrowserMinecraftClient {
                 const dataLength = decodeVarInt(frame, 0);
                 if (dataLength === undefined) throw new Error("compressed frame omitted data length");
                 if (dataLength.value !== 0) {
+                    if (pollContext !== null) pollContext.work.compressedPackets++;
+                    const inflateStartedAt = pollContext === null ? 0 : performance.now();
                     frame = inflateSync(frame.subarray(dataLength.bytesRead));
+                    if (pollContext !== null) {
+                        const inflateMillis = this.addPollPhaseSegment(
+                            pollContext, "inflateMillis", inflateStartedAt,
+                            performance.now());
+                        pollContext.work.maxInflateMillis = Math.max(
+                            pollContext.work.maxInflateMillis, inflateMillis);
+                    }
                     if (frame.byteLength !== dataLength.value) {
                         throw new Error("compressed frame length mismatch");
                     }
@@ -3281,6 +3627,7 @@ class BrowserMinecraftClient {
             if (packetId === undefined) throw new Error("packet omitted id");
             this.decodedPackets++;
             parsedPackets++;
+            if (pollContext !== null) pollContext.work.packetsParsed++;
             const packetAt = performance.now();
             if (this.lastInboundPacketAt !== undefined) {
                 this.inboundPacketGapSamples++;
@@ -3334,6 +3681,20 @@ class BrowserMinecraftClient {
                 dispatchError = error;
             }
             const dispatchAt = performance.now();
+            if (pollContext !== null) {
+                const handlerMillis = this.addPollPhaseSegment(
+                    pollContext, "handlerMillis", packetAt, dispatchAt);
+                const packetMillis = Math.max(0, dispatchAt - decodeStartAt);
+                if (dispatchAt < decodeStartAt) pollContext.clockAnomaly = true;
+                pollContext.work.maxHandlerMillis = Math.max(
+                    pollContext.work.maxHandlerMillis, handlerMillis);
+                pollContext.work.maxPacketMillis = Math.max(
+                    pollContext.work.maxPacketMillis, packetMillis);
+                if (packetMillis >= POLL_PHASE_SLOW_THRESHOLD_MILLIS &&
+                    pollContext.slowPacketIds.length < POLL_PHASE_PACKET_ID_SAMPLE_LIMIT) {
+                    pollContext.slowPacketIds.push(packetId.value);
+                }
+            }
             this.recordArrivalPacket({
                 packetId: packetId.value,
                 phaseAtDecode,
@@ -3346,6 +3707,13 @@ class BrowserMinecraftClient {
             if (this.failure !== undefined) throw this.failure;
         }
         return parsedPackets;
+        }
+        finally {
+            if (pollContext !== null) {
+                this.addPollPhaseSegment(pollContext, "parseMillis",
+                    parseStartedAt, performance.now());
+            }
+        }
     }
 
     handlePacket(packetId, payload) {
@@ -3886,7 +4254,10 @@ class BrowserMinecraftClient {
         this.lastPlayTickAt = undefined;
         this.arrivalIntentionalDropPending = true;
         this.arrivalIntentionalTransportDropCount++;
-        this.arrivalReconnectDropAt = Number.isFinite(dropAt) ? Number(dropAt) : null;
+        // `arrivalReconnectDropAt` is the immutable boundary seed for this
+        // lifecycle.  Do not overwrite it when a later reconnect wave drops
+        // this client; the next lifecycle receives the current `dropAt`
+        // explicitly from createClients().
         this.recordArrivalPhase("disconnect", dropAt, {
             intentional: true,
             source: "browser-full-path-harness",
@@ -4072,6 +4443,7 @@ class BrowserMinecraftClient {
                 frameBudgetYields: this.inboundFrameBudgetYields,
                 packetBudgetYields: this.packetBudgetYields,
             },
+            pollPhaseTelemetry: this.pollPhaseTelemetryResult(),
         };
     }
 
@@ -5349,6 +5721,17 @@ function browserFullPathPerformanceContract() {
             attributionPolicy:
                 "trusted-wire-required-for-upstream; missing-local-segments=>unattributed",
             strictGatesChanged: false,
+        },
+        pollPhaseTelemetry: {
+            schemaVersion: POLL_PHASE_TELEMETRY_SCHEMA_VERSION,
+            slowThresholdMillis: POLL_PHASE_SLOW_THRESHOLD_MILLIS,
+            sampleLimit: POLL_PHASE_SAMPLE_LIMIT,
+            frameSampleLimit: POLL_PHASE_FRAME_SAMPLE_LIMIT,
+            packetSampleLimit: POLL_PHASE_PACKET_SAMPLE_LIMIT,
+            diagnosticOnly: true,
+            strictGatesChanged: false,
+            independentExecution: false,
+            retention: "longest-duration-desc-sequence-asc",
         },
         multiplayerPerformance: { ...MULTIPLAYER_PERFORMANCE_TARGET },
         pollScheduler: {

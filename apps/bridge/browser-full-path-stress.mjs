@@ -76,6 +76,37 @@ const INBOUND_FLOW_DURATION_FIELDS = new Set([
 ]);
 const MAX_STDOUT_BYTES = 64 * 1024 * 1024;
 const MAX_DIAGNOSTIC_TAIL_BYTES = 64 * 1024;
+const POLL_PHASE_TELEMETRY_SCHEMA_VERSION =
+    "gaius.browser-client-poll-phase.v1";
+const POLL_PHASE_SLOW_THRESHOLD_MILLIS = 16.7;
+const POLL_PHASE_SAMPLE_LIMIT = 64;
+const POLL_PHASE_FRAME_SAMPLE_LIMIT = 8;
+const POLL_PHASE_PACKET_SAMPLE_LIMIT = 64;
+const POLL_PHASE_PACKET_ID_SAMPLE_LIMIT = 8;
+const POLL_PHASE_SEGMENT_FIELDS = Object.freeze([
+    "preludeMillis",
+    "checkErrorMillis",
+    "recordPhasesMillis",
+    "prefixParseMillis",
+    "bridgeDrainMillis",
+    "bridgePollMillis",
+    "decryptMillis",
+    "concatMillis",
+    "parseMillis",
+    "inflateMillis",
+    "handlerMillis",
+    "finalizeMillis",
+]);
+const POLL_PHASE_TRIGGERS = new Set([
+    "poll-duration",
+    "bridge-drain",
+    "decrypt-transform",
+    "buffer-concat",
+    "parse-inflate",
+    "packet-dispatch",
+    "prelude",
+    "finalize",
+]);
 const argumentsList = process.argv.slice(2);
 const printConfigOnly = removeFlag("--print-config");
 const runAll = removeFlag("--all");
@@ -175,6 +206,23 @@ for (const tier of tiers) {
         retention: "longest-duration-desc-sequence-asc",
         strictRawDurationGateMillis: 16.7,
     });
+    const pollPhaseContract = configuration.performanceContract.pollPhaseTelemetry;
+    assert.ok(pollPhaseContract && typeof pollPhaseContract === "object",
+        `stress tier ${tier} omitted poll phase telemetry contract`);
+    assert.equal(pollPhaseContract.schemaVersion,
+        POLL_PHASE_TELEMETRY_SCHEMA_VERSION);
+    assert.equal(pollPhaseContract.slowThresholdMillis,
+        POLL_PHASE_SLOW_THRESHOLD_MILLIS);
+    assert.equal(pollPhaseContract.sampleLimit, POLL_PHASE_SAMPLE_LIMIT);
+    assert.equal(pollPhaseContract.frameSampleLimit,
+        POLL_PHASE_FRAME_SAMPLE_LIMIT);
+    assert.equal(pollPhaseContract.packetSampleLimit,
+        POLL_PHASE_PACKET_SAMPLE_LIMIT);
+    assert.equal(pollPhaseContract.diagnosticOnly, true);
+    assert.equal(pollPhaseContract.strictGatesChanged, false);
+    assert.equal(pollPhaseContract.independentExecution, false);
+    assert.equal(pollPhaseContract.retention,
+        "longest-duration-desc-sequence-asc");
     configurations.push(configuration);
     if (!printConfigOnly) {
         const run = await runChild(
@@ -357,7 +405,7 @@ function validateStressResult(result, tier, configuration) {
     assert.equal(soak.limits.maxBrowserEventLoopGapMillis,
         configuration.performanceContract.pollScheduler.strictEventLoopMaxMillis,
         `stress tier ${tier} event-loop limit drifted`);
-    assertStressClientRawLatency(result.clients, tier);
+    assertStressClientRawLatency(result.clients, tier, configuration);
 }
 
 function assertStressSchedulerEvidence(result, tier, configuration) {
@@ -512,7 +560,200 @@ function assertStressSchedulerEvidence(result, tier, configuration) {
         `stress tier ${tier} actual scheduler evidence diverged`);
 }
 
-function assertStressClientRawLatency(clients, tier) {
+function assertOptionalPollPhaseTelemetry(
+    performanceEvidence,
+    tier,
+    lifecycleLabel,
+    contract,
+) {
+    const telemetry = performanceEvidence?.pollPhaseTelemetry;
+    // The field is additive diagnostic evidence.  Older result artifacts may
+    // legitimately omit it; when present, malformed data fails closed.  No
+    // assertion below requires a retained sample, so an entirely fast run is
+    // still a valid strict run.
+    if (telemetry === undefined || telemetry === null) return false;
+    const label = `stress tier ${tier} ${lifecycleLabel} poll phase`;
+    assert.ok(telemetry && typeof telemetry === "object",
+        `${label} telemetry was not an object`);
+    const expected = contract ?? {
+        schemaVersion: POLL_PHASE_TELEMETRY_SCHEMA_VERSION,
+        slowThresholdMillis: POLL_PHASE_SLOW_THRESHOLD_MILLIS,
+        sampleLimit: POLL_PHASE_SAMPLE_LIMIT,
+        frameSampleLimit: POLL_PHASE_FRAME_SAMPLE_LIMIT,
+        packetSampleLimit: POLL_PHASE_PACKET_SAMPLE_LIMIT,
+    };
+    assert.equal(telemetry.schemaVersion, expected.schemaVersion,
+        `${label} schema drifted`);
+    assert.equal(telemetry.slowThresholdMillis,
+        expected.slowThresholdMillis, `${label} threshold drifted`);
+    assert.equal(telemetry.strictThresholdMillis, 16.7,
+        `${label} strict threshold drifted`);
+    assert.equal(telemetry.sampleLimit, expected.sampleLimit,
+        `${label} sample limit drifted`);
+    assert.equal(telemetry.frameSampleLimit, expected.frameSampleLimit,
+        `${label} frame cap drifted`);
+    assert.equal(telemetry.packetSampleLimit, expected.packetSampleLimit,
+        `${label} packet cap drifted`);
+    assert.equal(telemetry.diagnosticOnly, true,
+        `${label} was not marked diagnostic-only`);
+    assert.equal(telemetry.strictGatesChanged, false,
+        `${label} changed strict gates`);
+    assert.equal(telemetry.independentExecution, false,
+        `${label} claimed independent execution`);
+    assert.equal(telemetry.retention,
+        "longest-duration-desc-sequence-asc",
+        `${label} retention policy drifted`);
+    const integerFields = [
+        "pollsTotal",
+        "slowSamplesTotal",
+        "pollPhaseSamplesTotal",
+        "retainedSampleCount",
+        "slowSamplesDropped",
+        "pollPhaseSamplesDropped",
+        "droppedSampleCount",
+    ];
+    for (const name of integerFields) {
+        assert.ok(Number.isSafeInteger(telemetry[name]) && telemetry[name] >= 0,
+            `${label} ${name} was not a non-negative safe integer`);
+    }
+    assert.equal(telemetry.slowSamplesTotal, telemetry.pollPhaseSamplesTotal,
+        `${label} slow/phase total aliases diverged`);
+    assert.equal(telemetry.slowSamplesDropped,
+        telemetry.pollPhaseSamplesDropped,
+        `${label} slow/phase dropped aliases diverged`);
+    assert.equal(telemetry.slowSamplesDropped, telemetry.droppedSampleCount,
+        `${label} dropped aliases diverged`);
+    const samples = telemetry.samples;
+    assert.ok(Array.isArray(samples), `${label} samples were not an array`);
+    assert.ok(samples.length <= telemetry.sampleLimit,
+        `${label} sample ring exceeded its hard limit`);
+    assert.equal(telemetry.retainedSampleCount, samples.length,
+        `${label} retained sample count diverged`);
+    assert.equal(telemetry.slowSamplesTotal,
+        telemetry.retainedSampleCount + telemetry.slowSamplesDropped,
+        `${label} total/retained/dropped accounting diverged`);
+    assert.ok(telemetry.pollsTotal >= telemetry.slowSamplesTotal,
+        `${label} slow sample count exceeded poll count`);
+
+    const assertFiniteNonNegative = (value, name, maximum = undefined) => {
+        assert.ok(Number.isFinite(value) && value >= 0,
+            `${label} ${name} was not finite/non-negative`);
+        if (maximum !== undefined) assert.ok(value <= maximum,
+            `${label} ${name} exceeded ${maximum}`);
+    };
+    for (let index = 0; index < samples.length; index++) {
+        const sample = samples[index];
+        assert.ok(sample && typeof sample === "object",
+            `${label} sample ${index} was not an object`);
+        assert.equal(sample.schemaVersion, telemetry.schemaVersion,
+            `${label} sample ${index} schema drifted`);
+        assert.ok(Number.isSafeInteger(sample.pollSequence) &&
+            sample.pollSequence >= 0,
+        `${label} sample ${index} poll sequence was invalid`);
+        assertFiniteNonNegative(sample.startedAtMillis,
+            `sample ${index} startedAtMillis`);
+        assertFiniteNonNegative(sample.durationRawMillis,
+            `sample ${index} durationRawMillis`);
+        assertFiniteNonNegative(sample.durationMillis,
+            `sample ${index} durationMillis`);
+        assert.ok(sample.durationRawMillis >= telemetry.slowThresholdMillis,
+            `${label} sample ${index} was below the slow threshold`);
+        assert.equal(sample.slowThresholdMillis,
+            telemetry.slowThresholdMillis,
+            `${label} sample ${index} diagnostic threshold drifted`);
+        assert.equal(sample.strictThresholdMillis, 16.7,
+            `${label} sample ${index} strict threshold drifted`);
+        assert.equal(sample.strictGatesChanged, false,
+            `${label} sample ${index} changed strict gates`);
+        assert.equal(sample.independentExecution, false,
+            `${label} sample ${index} claimed independent execution`);
+        assert.equal(sample.diagnosticOnly, true,
+            `${label} sample ${index} was not diagnostic-only`);
+        assert.ok(POLL_PHASE_TRIGGERS.has(sample.trigger),
+            `${label} sample ${index} trigger was invalid: ${sample.trigger}`);
+        assertFiniteNonNegative(sample.triggerMillis,
+            `sample ${index} triggerMillis`, sample.durationRawMillis);
+        assert.ok(sample.outcome === "ok" || sample.outcome === "error",
+            `${label} sample ${index} outcome was invalid`);
+        assert.equal(typeof sample.clockAnomaly, "boolean",
+            `${label} sample ${index} clockAnomaly was not boolean`);
+        if (sample.schedulerCallbackSequence !== null) {
+            assert.ok(Number.isSafeInteger(sample.schedulerCallbackSequence) &&
+                sample.schedulerCallbackSequence >= 0,
+            `${label} sample ${index} scheduler callback sequence was invalid`);
+        }
+        assert.ok(sample.clientId !== undefined && sample.clientId !== null,
+            `${label} sample ${index} omitted client id`);
+        assert.ok(Number.isSafeInteger(sample.wave) && sample.wave >= 0,
+            `${label} sample ${index} wave was invalid`);
+        assert.ok(sample.segments && typeof sample.segments === "object",
+            `${label} sample ${index} segments were omitted`);
+        for (const name of POLL_PHASE_SEGMENT_FIELDS) {
+            assert.ok(Object.prototype.hasOwnProperty.call(sample.segments, name),
+                `${label} sample ${index} omitted segment ${name}`);
+            assertFiniteNonNegative(sample.segments[name],
+                `sample ${index} segment ${name}`, sample.durationRawMillis);
+        }
+        const work = sample.work;
+        assert.ok(work && typeof work === "object",
+            `${label} sample ${index} work was omitted`);
+        for (const [name, maximum] of [
+            ["frames", expected.frameSampleLimit],
+            ["bridgePollCalls", expected.frameSampleLimit],
+            ["packetsParsed", expected.packetSampleLimit],
+            ["compressedPackets", expected.packetSampleLimit],
+        ]) {
+            assert.ok(Number.isSafeInteger(work[name]) && work[name] >= 0 &&
+                work[name] <= maximum,
+            `${label} sample ${index} work.${name} exceeded cap ${maximum}`);
+        }
+        assert.ok(Number.isSafeInteger(work.frameBytes) && work.frameBytes >= 0,
+            `${label} sample ${index} frameBytes was invalid`);
+        for (const name of [
+            "maxBridgePollMillis",
+            "maxInflateMillis",
+            "maxHandlerMillis",
+            "maxPacketMillis",
+        ]) {
+            assertFiniteNonNegative(work[name],
+                `sample ${index} work.${name}`, sample.durationRawMillis);
+        }
+        const buffer = sample.buffer;
+        assert.ok(buffer && typeof buffer === "object",
+            `${label} sample ${index} buffer was omitted`);
+        for (const name of ["beforeBytes", "afterBytes", "maximumBytes"]) {
+            assert.ok(Number.isSafeInteger(buffer[name]) && buffer[name] >= 0,
+                `${label} sample ${index} buffer.${name} was invalid`);
+        }
+        assert.ok(sample.budget && typeof sample.budget === "object",
+            `${label} sample ${index} budget was omitted`);
+        assert.equal(typeof sample.budget.frameYield, "boolean",
+            `${label} sample ${index} frame-yield flag was invalid`);
+        assert.equal(typeof sample.budget.packetYield, "boolean",
+            `${label} sample ${index} packet-yield flag was invalid`);
+        assert.ok(Array.isArray(sample.slowPacketIds) &&
+            sample.slowPacketIds.length <= POLL_PHASE_PACKET_ID_SAMPLE_LIMIT,
+        `${label} sample ${index} slow packet-id detail exceeded cap`);
+        for (const packetId of sample.slowPacketIds) {
+            assert.ok(Number.isSafeInteger(packetId) && packetId >= 0,
+                `${label} sample ${index} packet id was invalid`);
+        }
+        assert.equal(Object.prototype.hasOwnProperty.call(sample, "payload"), false,
+            `${label} sample ${index} retained raw payload bytes`);
+        assert.equal(Object.prototype.hasOwnProperty.call(sample, "stack"), false,
+            `${label} sample ${index} retained a stack trace`);
+        if (index > 0) {
+            const previous = samples[index - 1];
+            assert.ok(previous.durationRawMillis > sample.durationRawMillis ||
+                previous.durationRawMillis === sample.durationRawMillis &&
+                    previous.pollSequence <= sample.pollSequence,
+            `${label} samples were not ordered duration-desc/sequence-asc`);
+        }
+    }
+    return true;
+}
+
+function assertStressClientRawLatency(clients, tier, configuration) {
     for (const [index, client] of clients.entries()) {
         const performanceEvidence = client?.performance;
         assert.ok(performanceEvidence && typeof performanceEvidence === "object",
@@ -535,6 +776,12 @@ function assertStressClientRawLatency(clients, tier) {
             assert.ok(bounds && Number.isFinite(bounds.p99Millis),
                 `stress tier ${tier} client lifecycle ${index + 1} ${name} omitted raw quantile bounds`);
         }
+        assertOptionalPollPhaseTelemetry(
+            performanceEvidence,
+            tier,
+            `client lifecycle ${index + 1}`,
+            configuration?.performanceContract?.pollPhaseTelemetry,
+        );
     }
 }
 

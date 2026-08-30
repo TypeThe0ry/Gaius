@@ -67,6 +67,49 @@ assert.match(fullPathSourceText,
 assert.match(fullPathSourceText,
     /CALLBACK_TAIL_SLOW_THRESHOLD_MILLIS\s*=\s*16\.7/u,
     "strict callback tail gate drifted");
+// Per-poll phase evidence is bounded diagnostic context for explaining a
+// callback tail.  It must not become a second acceptance gate, an independent
+// execution claim, or an unbounded packet/payload trace.
+assert.match(fullPathSourceText,
+    /const POLL_PHASE_TELEMETRY_SCHEMA_VERSION\s*=\s*["']gaius\.browser-client-poll-phase\.v1["']/u,
+    "poll phase telemetry schema drifted");
+assert.match(fullPathSourceText,
+    /const POLL_PHASE_SLOW_THRESHOLD_MILLIS\s*=\s*16\.7/u,
+    "poll phase diagnostic threshold drifted");
+assert.match(fullPathSourceText,
+    /const POLL_PHASE_SAMPLE_LIMIT\s*=\s*64/u,
+    "poll phase sample limit drifted");
+assert.match(fullPathSourceText,
+    /const POLL_PHASE_FRAME_SAMPLE_LIMIT\s*=\s*8/u,
+    "poll phase frame cap drifted");
+assert.match(fullPathSourceText,
+    /const POLL_PHASE_PACKET_SAMPLE_LIMIT\s*=\s*64/u,
+    "poll phase packet cap drifted");
+const pollPhaseContractSourceIndex = fullPathSourceText.indexOf(
+    "pollPhaseTelemetry");
+assert.ok(pollPhaseContractSourceIndex >= 0,
+    "poll phase telemetry was omitted from the performance contract");
+const pollPhaseContractWindows = [
+    ...fullPathSourceText.matchAll(/pollPhaseTelemetry/gu),
+].map(({ index }) => fullPathSourceText.slice(index, index + 2500));
+assert.ok(pollPhaseContractWindows.some((window) =>
+    /strictGatesChanged\s*:\s*false/u.test(window) &&
+    /independentExecution\s*:\s*false/u.test(window) &&
+    /diagnosticOnly\s*:\s*true/u.test(window) &&
+    /retention\s*:\s*["']longest-duration-desc-sequence-asc["']/u.test(window)),
+"poll phase telemetry contract must remain bounded, diagnostic-only, and non-independent");
+for (const marker of [
+    "resetPollPhaseContext(",
+    "addPollPhaseSegment(",
+    "retainPollPhaseSample(",
+    "pollPhaseTelemetryResult(",
+    "this.bridge.pollInbound(",
+    "Buffer.concat(",
+    "inflateSync(",
+]) {
+    assert.ok(fullPathSourceText.includes(marker),
+        `poll phase source omitted ${marker}`);
+}
 
 const COMPATIBILITY_ENVIRONMENT = Object.freeze({
     GAIUS_BROWSER_FULL_PATH_ACCEPTANCE: "0",
@@ -100,6 +143,37 @@ function configuration(profilePath, overrides = {}, argumentsList = ["--print-co
     }));
 }
 
+function assertPollPhaseTelemetryContract(config, label) {
+    // Accept the historical nested location while requiring one canonical
+    // object in the emitted performance contract.  This lets the scheduler
+    // keep its callback-tail grouping without duplicating a potentially large
+    // sample ring in the top-level result.
+    const telemetry = config?.performanceContract?.pollPhaseTelemetry ??
+        config?.performanceContract?.pollScheduler?.pollPhaseTelemetry;
+    assert.ok(telemetry && typeof telemetry === "object",
+        `${label}: pollPhaseTelemetry contract missing`);
+    assert.equal(telemetry.schemaVersion,
+        "gaius.browser-client-poll-phase.v1",
+        `${label}: poll phase schema drifted`);
+    assert.equal(telemetry.slowThresholdMillis, 16.7,
+        `${label}: poll phase diagnostic threshold drifted`);
+    assert.equal(telemetry.sampleLimit, 64,
+        `${label}: poll phase sample limit drifted`);
+    assert.equal(telemetry.frameSampleLimit, 8,
+        `${label}: poll phase frame cap drifted`);
+    assert.equal(telemetry.packetSampleLimit, 64,
+        `${label}: poll phase packet cap drifted`);
+    assert.equal(telemetry.diagnosticOnly, true,
+        `${label}: poll phase telemetry is not diagnostic-only`);
+    assert.equal(telemetry.strictGatesChanged, false,
+        `${label}: poll phase telemetry changed strict gates`);
+    assert.equal(telemetry.independentExecution, false,
+        `${label}: poll phase telemetry claimed independent execution`);
+    assert.equal(telemetry.retention,
+        "longest-duration-desc-sequence-asc",
+        `${label}: poll phase retention policy drifted`);
+}
+
 const expectedProfiles = [
     {
         path: "versions/26.2.json", id: "26.2", protocol: 776, world: 4903,
@@ -124,6 +198,7 @@ for (const expected of expectedProfiles) {
     assert.equal(config.acceptanceMode, false);
     assert.equal(config.clients, 2);
     assert.equal(config.performanceContract.mode, "compatible-smoke");
+    assertPollPhaseTelemetryContract(config, `${expected.id} compatible config`);
     assert.equal(config.performanceContract.strictAcceptanceTarget, null);
     assert.equal(config.performanceContract.soakMillis, 1000);
     assert.equal(config.performanceContract.reconnectWaves, 0);
@@ -215,6 +290,8 @@ for (const expected of expectedProfiles) {
         assert.equal(stress.stressTier, tier);
         assert.equal(stress.clients, tier);
         assert.equal(stress.performanceContract.mode, `stress-tier-${tier}`);
+        assertPollPhaseTelemetryContract(stress,
+            `${expected.id} stress tier ${tier} config`);
         assert.equal(stress.performanceContract.minimumChunkPackets, 257);
         assert.equal(stress.performanceContract.soakMillis, soakMillis);
         assert.equal(stress.performanceContract.reconnectWaves, reconnectWaves);
@@ -1190,6 +1267,17 @@ console.log(JSON.stringify({
         reconnectWaves: { 8: 2, 16: 4 },
         clientLifecycles: { 8: 24, 16: 80 },
         desiredChunksPerTick: { 8: 32, 16: 64 },
+    },
+    pollPhaseTelemetry: {
+        schemaVersion: "gaius.browser-client-poll-phase.v1",
+        slowThresholdMillis: 16.7,
+        sampleLimit: 64,
+        frameSampleLimit: 8,
+        packetSampleLimit: 64,
+        diagnosticOnly: true,
+        strictGatesChanged: false,
+        independentExecution: false,
+        retention: "longest-duration-desc-sequence-asc",
     },
     chunkBatchProtocol: {
         clientboundFinished: 11,
