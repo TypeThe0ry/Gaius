@@ -22,6 +22,7 @@ import { createServer as createHttpServer } from "node:http";
 import { createServer as createTcpServer } from "node:net";
 import { once } from "node:events";
 import { mkdtemp, mkdir, readFile, writeFile, lstat } from "node:fs/promises";
+import { monitorEventLoopDelay } from "node:perf_hooks";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -29,6 +30,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { deflateSync, inflateSync } from "node:zlib";
 import { WebSocket as NodeWebSocket } from "./node_modules/ws/wrapper.mjs";
 import {
+    decodeClientboundLoginDistances,
     MINECRAFT_1_21_11,
     MINECRAFT_26_2,
 } from "./dist/protocol.js";
@@ -71,16 +73,59 @@ if (acceptanceEnvironment !== undefined && acceptanceEnvironment !== "0" &&
 }
 const acceptanceMode = commandLineArguments.includes("--acceptance") ||
     acceptanceEnvironment === "1";
+const malformedStressArgument = commandLineArguments.find((argument) =>
+    argument.startsWith("--stress") && argument !== "--stress");
+if (malformedStressArgument !== undefined) {
+    throw new Error(`Unsupported stress argument ${malformedStressArgument}; use --stress`);
+}
+const stressEnvironment = process.env.GAIUS_BROWSER_FULL_PATH_STRESS;
+if (stressEnvironment !== undefined && stressEnvironment !== "0" && stressEnvironment !== "1") {
+    throw new Error("GAIUS_BROWSER_FULL_PATH_STRESS must be exactly 0 or 1");
+}
+const stressMode = commandLineArguments.includes("--stress") || stressEnvironment === "1";
+if (acceptanceMode && stressMode) {
+    throw new Error("--acceptance and --stress are mutually exclusive");
+}
+if (stressMode && externalMode) {
+    throw new Error("stress tiers require the canonical local RelayNode and vanilla server");
+}
+const releaseEvidenceMode = acceptanceMode || stressMode;
 // A strict acceptance run must prove the RelayNode-side lifecycle as well as
 // browser/client cleanup, including when the node is external.  The
 // compatible external smoke remains usable for nodes that predate the
 // runtime-gauge contract, but it is never evidence for strict no-stall release.
-const relayRuntimeTelemetryRequired = !externalMode || acceptanceMode;
+const relayRuntimeTelemetryRequired = !externalMode || acceptanceMode || stressMode;
 const STRICT_ACCEPTANCE_TARGET = Object.freeze({
     clients: 4,
     minimumChunkPackets: 9,
     soakMillis: 15_000,
     reconnectWaves: 1,
+});
+const STRESS_TIER_TARGETS = Object.freeze({
+    8: Object.freeze({
+        clients: 8,
+        minimumChunkPackets: 257,
+        soakMillis: 60_000,
+        reconnectWaves: 2,
+        clientLifecycles: 24,
+        clientViewDistance: 8,
+        serverViewDistance: 8,
+        maximumUniqueChunkCapacity: 257,
+        simulationDistance: 4,
+        desiredChunksPerTick: 32,
+    }),
+    16: Object.freeze({
+        clients: 16,
+        minimumChunkPackets: 257,
+        soakMillis: 120_000,
+        reconnectWaves: 4,
+        clientLifecycles: 80,
+        clientViewDistance: 8,
+        serverViewDistance: 8,
+        maximumUniqueChunkCapacity: 257,
+        simulationDistance: 4,
+        desiredChunksPerTick: 64,
+    }),
 });
 const CANONICAL_PROFILES = Object.freeze({
     "26.2": Object.freeze({
@@ -131,6 +176,77 @@ const MULTIPLAYER_PERFORMANCE_TARGET = Object.freeze({
     maxBrowserInboundQueuedBytes: 24 * 1024 * 1024,
     maxSoakPhaseStallMillis: 500,
 });
+const LATENCY_HISTOGRAM_BUCKETS_MILLIS = Object.freeze([
+    1, 2, 4, 8, 16.7, 25, 50, 60, 75, 100, 250, 500, 1000, Infinity,
+]);
+const STRESS_LATENCY_DISTRIBUTION_TARGET = Object.freeze({
+    schemaVersion: "gaius.multiplayer-stress-latency-target.v1",
+    histogramSchemaVersion: "gaius.latency-histogram.v1",
+    // null is the JSON representation of the final +Infinity bucket.
+    bucketUpperBoundsMillis: LATENCY_HISTOGRAM_BUCKETS_MILLIS.map((value) =>
+        Number.isFinite(value) ? value : null),
+    pollGap: Object.freeze({ p99Millis: 16.7, p999Millis: 50, maxMillis: 100 }),
+    playTickGap: Object.freeze({ p99Millis: 60, p999Millis: 75, maxMillis: 100 }),
+    preMinimumChunkGap: Object.freeze({ p99Millis: 100, maxMillis: 250 }),
+});
+// The browser bridge is polled from a shared event loop.  A client must not
+// synchronously inflate and parse an unbounded burst while its peers wait for
+// their next poll turn.  These budgets preserve frame ordering and leave any
+// unread bytes in the bridge/client buffer for the following poll.
+const MAX_INBOUND_FRAMES_PER_POLL = 8;
+const MAX_PACKETS_PER_POLL = 64;
+// The smoke models independent browser tabs in one Node process. Dispatching
+// every live client from one timer callback made callback duration scale with
+// fan-in and manufactured long poll buckets even when RelayNode had no queued
+// frames or backpressure. A one-client callback, however, adds one timer turn
+// per logical tab and itself creates an N× timer-jitter floor (the tier-8 run
+// exposed ~126 ms gaps at eight clients). Bound each callback to four clients:
+// per-client frame/packet budgets still cap synchronous work, while a client
+// receives a poll turn at least every two macrotasks at tier 8. The latency
+// gates remain unchanged; scheduler evidence is emitted below so a fairness
+// change cannot hide a real client gap.
+const CLIENT_POLL_INTERVAL_MILLIS = 1;
+const MAX_CLIENTS_PER_POLL_CALLBACK = 4;
+// Keep one scheduler callback comfortably below a 16.7 ms render frame even
+// when several clients have work ready at once.  The per-client parser/poll
+// budgets remain authoritative; this aggregate guard only decides how many
+// round-robin clients enter this macrotask.  A later immediate turn resumes
+// at the next cursor, so a slow client cannot monopolise its peers.
+const MAX_POLL_CALLBACK_WORK_MILLIS = 8;
+// Node's Windows timer backend can quantize a one-millisecond timeout to a
+// much larger wall-clock interval.  Keep the timer only as a *rare* bounded
+// fairness backstop; the normal poll turn uses setImmediate so a timer quantum
+// cannot become the per-client latency floor.  Eight-turn yields put a timer
+// gap in roughly every fourth client cycle at tier-8 and showed up directly in
+// the p99=25 ms Helio failure.  256 turns leaves the check phase responsive to
+// I/O while keeping timer-quantized gaps below one percent of samples.  The
+// work value below is an evidence marker only: forcing a timer after every
+// heavy callback would reintroduce that quantization under real parser load.
+// These are harness controls, not release thresholds and are deliberately not
+// environment-overridable.
+const POLL_SCHEDULER_TIMER_YIELD_TURNS = 256;
+const POLL_SCHEDULER_TIMER_YIELD_WORK_MILLIS = 2;
+const POLL_SCHEDULER_WATCHDOG_MILLIS = 25;
+// When every live client has no inbound frame ready, park the shared poll
+// continuation on a short timer instead of spinning setImmediate callbacks.
+// This is an idle backoff only; it does not alter any latency acceptance gate.
+const POLL_SCHEDULER_IDLE_BACKOFF_MILLIS = 1;
+// Tick servicing shares the poll callback but has its own cursor and cap. A
+// large stress tier therefore cannot turn one scheduler callback into an
+// unbounded fan-out of outbound tick writes.
+const MAX_PLAY_TICKS_PER_SCHEDULER_CALLBACK = MAX_CLIENTS_PER_POLL_CALLBACK;
+// A scheduler callback must leave room for the browser event loop to service
+// rendering/input work.  This is an evidence limit for the stress validator;
+// the existing per-client poll/tick latency gates remain authoritative.
+const MAX_VISIBLE_DISPATCH_SKEW = 1;
+const STRESS_EVENT_LOOP_MAX_MILLIS = 100;
+// Keep callback-tail attribution bounded and diagnostic-only.  The 16.7 ms
+// render-frame threshold is still enforced by the stress validator; retaining
+// the slow samples here must never turn a strict overrun into a pass.
+const CALLBACK_TAIL_TELEMETRY_SCHEMA_VERSION =
+    "gaius.browser-client-poll-callback-tail.v1";
+const CALLBACK_TAIL_SLOW_THRESHOLD_MILLIS = 16.7;
+const CALLBACK_TAIL_SAMPLE_LIMIT = 64;
 // These counters are exported by BrowserWebSocketChannel's JSBody stats. Keep
 // their exact source names: a missing source field is evidence, not a made-up
 // zero, and is handled explicitly by browserRuntimeCleanupGaugeEvidence().
@@ -140,6 +256,71 @@ const BROWSER_RUNTIME_CLEANUP_GAUGES = Object.freeze([
     "decoderCumulationBytes",
     "decodedPacketQueue",
 ]);
+// BrowserWebSocketChannel.pumpAllAndReportProgress() exposes these aggregate
+// Java global-pump counters through the JSBody bridge.  Older generated
+// classes may not have the fields yet; browserRuntimeSnapshot() deliberately
+// reports null in that case instead of synthesizing a zero.
+const BROWSER_GLOBAL_PUMP_TELEMETRY_FIELDS = Object.freeze([
+    "pumpAllTurns",
+    "pumpAllChannelsVisited",
+    "pumpAllBudgetYields",
+    "pumpAllMaxTurnMillis",
+    "pumpAllMaxChannelsPerTurn",
+    "pumpAllLastTurnMillis",
+    "pumpAllLastChannelsVisited",
+]);
+// Mirrors BrowserWebSocketChannel.MAX_TOTAL_MILLIS_PER_PUMP. This is a
+// descriptive contract marker only; strict acceptance does not invent a new
+// Java-side threshold from the Node harness.
+const BROWSER_GLOBAL_PUMP_MAX_TOTAL_MILLIS = 4;
+const BROWSER_INBOUND_FLOW_EVIDENCE_FIELDS = Object.freeze([
+    "flowPausedChannels",
+    "decodeFlowPausedChannels",
+    "activeHighWatermarks",
+    "decodedSliceBacklog",
+    "decoderCumulationBytes",
+    "decodedPacketQueue",
+    "flowPauses",
+    "flowResumes",
+    "decodedSliceBacklogPauses",
+    "decodedSliceBacklogResumes",
+    "inlineDecodedPackets",
+    "maxDecoderCumulationBytes",
+    "maxDecodedPacketQueue",
+    "highWatermarkDurationMillis",
+    "longestHighWatermarkMillis",
+    "activeHighWatermarkLongestMillis",
+]);
+const BROWSER_INBOUND_FLOW_DURATION_FIELDS = new Set([
+    "highWatermarkDurationMillis",
+    "longestHighWatermarkMillis",
+    "activeHighWatermarkLongestMillis",
+]);
+const BROWSER_INBOUND_FLOW_EVENT_FIELDS = Object.freeze([
+    "sequence",
+    "channelId",
+    "reason",
+    "startedAtMillis",
+    "endedAtMillis",
+    "durationMillis",
+    "startDepth",
+    "endDepth",
+    "startQueuedBytes",
+    "endQueuedBytes",
+]);
+const BROWSER_INBOUND_FLOW_WINDOW_STAGES = Object.freeze([
+    "initialConnectThroughMinimumChunks",
+    "preDrop",
+    "reconnectRecovery",
+    "steadySoak",
+    "finalCleanup",
+]);
+const BROWSER_INBOUND_FLOW_WINDOW_SCHEMA =
+    "gaius.browser-inbound-flow-window-evidence.v2";
+// BrowserWebSocketChannel keeps the diagnostic ring bounded to the latest 64
+// slow queued-packet handlers.  Copy through the same hard limit so a malformed
+// or older runtime cannot inflate strict-result JSON without bound.
+const BROWSER_QUEUED_PACKET_SLOW_EVENT_LIMIT = 64;
 
 function parseStrictAcceptanceNumber(name, expected) {
     const raw = process.env[name];
@@ -150,37 +331,109 @@ function parseStrictAcceptanceNumber(name, expected) {
     return expected;
 }
 
+function parseStressTier() {
+    if (!stressMode) return undefined;
+    const raw = process.env.GAIUS_BROWSER_FULL_PATH_STRESS_TIER ?? "8";
+    if (!/^(?:8|16)$/u.test(raw)) {
+        throw new Error("GAIUS_BROWSER_FULL_PATH_STRESS_TIER must be exactly 8 or 16");
+    }
+    return Number(raw);
+}
+
+function parseStressNumber(name, expected) {
+    const raw = process.env[name];
+    if (raw === undefined) return expected;
+    if (!/^(?:0|[1-9][0-9]*)$/u.test(raw) || raw !== String(expected)) {
+        throw new Error(`${name} must be exactly ${expected} for the selected stress tier`);
+    }
+    return expected;
+}
+
+function parseBoundedInteger(name, defaultValue, minimum, maximum) {
+    const raw = process.env[name];
+    if (raw === undefined) return defaultValue;
+    if (!/^(?:0|[1-9][0-9]*)$/u.test(raw)) {
+        throw new Error(`${name} must be an integer from ${minimum} to ${maximum}`);
+    }
+    const value = Number(raw);
+    if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+        throw new Error(`${name} must be an integer from ${minimum} to ${maximum}`);
+    }
+    return value;
+}
+
+const stressTier = parseStressTier();
+const stressTarget = stressTier === undefined ? undefined : STRESS_TIER_TARGETS[stressTier];
+
 const requestedClients = Number.parseInt(
     acceptanceMode
         ? parseStrictAcceptanceNumber("GAIUS_BROWSER_FULL_PATH_CLIENTS",
             STRICT_ACCEPTANCE_TARGET.clients)
+        : stressMode
+            ? parseStressNumber("GAIUS_BROWSER_FULL_PATH_CLIENTS", stressTarget.clients)
         : process.env.GAIUS_BROWSER_FULL_PATH_CLIENTS ?? "2", 10);
 const clientCount = Number.isInteger(requestedClients)
-    ? acceptanceMode ? requestedClients : Math.max(1, Math.min(4, requestedClients))
+    ? acceptanceMode || stressMode
+        ? requestedClients
+        : Math.max(1, Math.min(4, requestedClients))
     : 2;
 const soakMs = acceptanceMode
     ? parseStrictAcceptanceNumber("GAIUS_BROWSER_FULL_PATH_SOAK_MS",
         STRICT_ACCEPTANCE_TARGET.soakMillis)
+    : stressMode
+        ? parseStressNumber("GAIUS_BROWSER_FULL_PATH_SOAK_MS", stressTarget.soakMillis)
     : Math.max(0, Number.parseInt(
         process.env.GAIUS_BROWSER_FULL_PATH_SOAK_MS ?? "1000", 10) || 0);
 const requestedMinimumChunkPackets = Number.parseInt(
     acceptanceMode
         ? parseStrictAcceptanceNumber("GAIUS_BROWSER_FULL_PATH_MIN_CHUNKS",
             STRICT_ACCEPTANCE_TARGET.minimumChunkPackets)
+        : stressMode
+            ? parseStressNumber("GAIUS_BROWSER_FULL_PATH_MIN_CHUNKS",
+                stressTarget.minimumChunkPackets)
         : process.env.GAIUS_BROWSER_FULL_PATH_MIN_CHUNKS ?? "9", 10);
 const minimumChunkPackets = Number.isInteger(requestedMinimumChunkPackets)
-    ? acceptanceMode ? requestedMinimumChunkPackets :
+    ? acceptanceMode || stressMode ? requestedMinimumChunkPackets :
         Math.max(1, Math.min(128, requestedMinimumChunkPackets))
     : 9;
 const requestedReconnectWaves = Number.parseInt(
     acceptanceMode
         ? parseStrictAcceptanceNumber("GAIUS_BROWSER_FULL_PATH_RECONNECT_WAVES",
             STRICT_ACCEPTANCE_TARGET.reconnectWaves)
+        : stressMode
+            ? parseStressNumber("GAIUS_BROWSER_FULL_PATH_RECONNECT_WAVES",
+                stressTarget.reconnectWaves)
         : process.env.GAIUS_BROWSER_FULL_PATH_RECONNECT_WAVES ?? "0", 10);
 const reconnectWaves = Number.isInteger(requestedReconnectWaves)
-    ? acceptanceMode ? requestedReconnectWaves :
+    ? acceptanceMode || stressMode ? requestedReconnectWaves :
         Math.max(0, Math.min(8, requestedReconnectWaves))
     : 0;
+const clientViewDistance = acceptanceMode
+    ? parseStrictAcceptanceNumber("GAIUS_BROWSER_FULL_PATH_CLIENT_VIEW_DISTANCE", 6)
+    : stressMode
+        ? parseStressNumber("GAIUS_BROWSER_FULL_PATH_CLIENT_VIEW_DISTANCE",
+            stressTarget.clientViewDistance)
+        : parseBoundedInteger("GAIUS_BROWSER_FULL_PATH_CLIENT_VIEW_DISTANCE", 6, 2, 32);
+const serverViewDistance = acceptanceMode
+    ? parseStrictAcceptanceNumber("GAIUS_BROWSER_FULL_PATH_SERVER_VIEW_DISTANCE", 2)
+    : stressMode
+        ? parseStressNumber("GAIUS_BROWSER_FULL_PATH_SERVER_VIEW_DISTANCE",
+            stressTarget.serverViewDistance)
+        : parseBoundedInteger("GAIUS_BROWSER_FULL_PATH_SERVER_VIEW_DISTANCE", 2, 2, 32);
+const effectiveChunkRadius = Math.min(clientViewDistance, serverViewDistance);
+const maximumUniqueChunkCapacity = chunkTrackingCapacity(effectiveChunkRadius);
+if (stressMode && maximumUniqueChunkCapacity !== stressTarget.maximumUniqueChunkCapacity) {
+    throw new Error(`stress tier ${stressTier} chunk capacity drifted: ` +
+        `${maximumUniqueChunkCapacity} != ${stressTarget.maximumUniqueChunkCapacity}`);
+}
+const desiredChunksPerTick = parseDesiredChunksPerTick(
+    process.env.GAIUS_BROWSER_FULL_PATH_DESIRED_CHUNKS_PER_TICK ??
+        String(stressTarget?.desiredChunksPerTick ?? 64));
+if (stressMode && desiredChunksPerTick !== stressTarget.desiredChunksPerTick) {
+    throw new Error(
+        `GAIUS_BROWSER_FULL_PATH_DESIRED_CHUNKS_PER_TICK must be exactly ` +
+        `${stressTarget.desiredChunksPerTick} for stress tier ${stressTier}`);
+}
 const requestedClientStartDelayMs = Number.parseInt(
     process.env.GAIUS_BROWSER_FULL_PATH_CLIENT_START_DELAY_MS ??
         (externalMode ? "1500" : "0"), 10);
@@ -190,10 +443,19 @@ const clientStartDelayMs = Number.isInteger(requestedClientStartDelayMs)
 const smokeStartedAt = performance.now();
 
 let activeProfile;
+let lastInboundFlowAttempt = null;
 
 async function runSmoke() {
     activeProfile = await loadActiveVersionProfile();
     assertCanonicalProfile(activeProfile);
+    if (minimumChunkPackets > maximumUniqueChunkCapacity) {
+        throw new Error(
+            `GAIUS_BROWSER_FULL_PATH_MIN_CHUNKS=${minimumChunkPackets} exceeds ` +
+            `the effective chunk radius ${effectiveChunkRadius} capacity ` +
+            `${maximumUniqueChunkCapacity} (client view ${clientViewDistance}, ` +
+            `server view ${serverViewDistance})`,
+        );
+    }
     const wireProfile = resolveWireProfile(activeProfile);
     const verifiedServerJar = externalMode
         ? undefined
@@ -203,13 +465,19 @@ async function runSmoke() {
         "browser-relay-full-path-evidence");
     await mkdir(evidenceRoot, { recursive: true });
     const workDirectory = await mkdtemp(path.join(evidenceRoot, "run-"));
+    const clientIdentities = Array.from({ length: clientCount }, (_, index) =>
+        createClientIdentity(index));
     const sessionState = {
         publicKeyRequests: 0,
         joins: [],
         hasJoined: [],
-        expectedProfiles: new Map(Array.from({ length: clientCount }, (_, index) => [
-            `${relayToken}-${index + 1}`,
-            `0000000000004000800000000000000${index + 2}`,
+        expectedProfiles: new Map(clientIdentities.map((identity) => [
+            identity.accessToken,
+            identity.profileId,
+        ])),
+        profileUsernames: new Map(clientIdentities.map((identity) => [
+            identity.profileId,
+            identity.username,
         ])),
     };
     const sessionServer = createSessionServer(sessionState);
@@ -238,6 +506,28 @@ async function runSmoke() {
     let failure;
     let serverSpawnError;
     let relaySpawnError;
+    let allClients = [];
+    let currentClients = [];
+    let pollScheduler;
+    const inboundFlowEvidence = {
+        schemaVersion: BROWSER_INBOUND_FLOW_WINDOW_SCHEMA,
+        initialConnectThroughMinimumChunks: null,
+        preDrop: [],
+        reconnectRecovery: [],
+        steadySoak: null,
+        // Legacy aliases are retained for result readers from the v1 contract.
+        initial: null,
+        reconnectWaves: [],
+        postSoak: null,
+        finalCleanup: null,
+        compatibilityAliases: {
+            initial: "initialConnectThroughMinimumChunks",
+            reconnectWaves: ["preDrop", "reconnectRecovery"],
+            postSoak: "steadySoak",
+        },
+    };
+    let initialInboundFlowWindow;
+    let finalCleanupInboundFlowWindow;
 
 try {
     await listen(sessionServer, 0, "127.0.0.1");
@@ -347,6 +637,11 @@ try {
     }
 
     browserRuntime = await createBrowserRuntime(relayEndpoint.url, relayToken);
+    initialInboundFlowWindow = beginBrowserInboundFlowWindow(
+        browserRuntime,
+        "initialConnectThroughMinimumChunks",
+        "initial connect through minimum chunks",
+    );
     const createClients = (wave) => Array.from({ length: clientCount }, (_, index) =>
         new BrowserMinecraftClient({
             id: 700 + wave * 100 + index,
@@ -358,14 +653,13 @@ try {
             host: relayEndpoint.target.host,
             port: relayEndpoint.target.port,
             sessionUrl: sessionBaseUrl,
+            identity: clientIdentities[index],
         }));
-    const allClients = [];
+    allClients = [];
     const reconnectEvidence = [];
-    let currentClients = createClients(0);
+    currentClients = createClients(0);
     allClients.push(...currentClients);
-    const pollTimer = setInterval(() => {
-        for (const client of currentClients) client.poll();
-    }, 1);
+    pollScheduler = createFairClientPollScheduler(() => currentClients);
     try {
         await connectClientWave(currentClients);
         await waitFor(
@@ -374,13 +668,19 @@ try {
                 client.loginFinished &&
                 (externalMode || (client.encryptionRequest && client.aesCfb8Enabled)) &&
                 client.playLoginPackets > 0 &&
-                client.chunkPackets >= minimumChunkPackets),
+                client.minimumChunkTargetReached()),
             "browser Relay Minecraft PLAY/chunk", 90000,
             () => JSON.stringify(currentClients.map((client) => client.diagnostics())));
         for (const client of currentClients) {
             client.checkError();
             assertClientSecurity(client, `initial client ${client.id}`);
-            assertClientPerformance(client, `initial client ${client.id}`);
+            // At the minimum-chunk readiness boundary a replacement client has
+            // only a handful of 50 ms tick samples.  Scalar readiness limits
+            // are still enforced here, while percentile gates wait for the
+            // steady-soak window where the sample population is meaningful.
+            assertClientPerformance(client, `initial client ${client.id}`, {
+                requireLatencyDistributions: false,
+            });
         }
         relayRuntimeAtChunks = await waitRelayRuntime(
             (snapshot) => snapshot.activeConnections === clientCount &&
@@ -391,6 +691,14 @@ try {
             "initial RelayNode active tunnel quiescence",
             5000,
         );
+        inboundFlowEvidence.initialConnectThroughMinimumChunks =
+            await finishBrowserInboundFlowWindow(
+            browserRuntime,
+            initialInboundFlowWindow,
+            "initial connect through minimum chunks",
+            );
+        inboundFlowEvidence.initial =
+            inboundFlowEvidence.initialConnectThroughMinimumChunks;
         if (relayRuntimeTelemetryRequired) {
             assertRelayRuntimeConnectionGauges(
                 relayRuntimeAtChunks,
@@ -413,6 +721,24 @@ try {
 
         for (let wave = 1; wave <= reconnectWaves; wave++) {
             const previousClients = currentClients;
+            const preDropInboundFlowWindow = beginBrowserInboundFlowWindow(
+                browserRuntime,
+                "preDrop",
+                `reconnect wave ${wave} pre-drop browser inbound flow resume`,
+                { wave },
+            );
+            const preDropInboundFlow = await finishBrowserInboundFlowWindow(
+                browserRuntime,
+                preDropInboundFlowWindow,
+                `reconnect wave ${wave} pre-drop browser inbound flow resume`,
+            );
+            inboundFlowEvidence.preDrop.push(preDropInboundFlow);
+            const reconnectRecoveryInboundFlowWindow = beginBrowserInboundFlowWindow(
+                browserRuntime,
+                "reconnectRecovery",
+                `reconnect wave ${wave} recovery through minimum chunks`,
+                { wave },
+            );
             const relayBeforeDrop = await readRelayRuntime();
             const browserBeforeDrop = browserRuntimeSnapshot(browserRuntime);
             const sessionBeforeDrop = sessionRuntimeSnapshot(sessionState);
@@ -533,7 +859,7 @@ try {
                     client.loginFinished &&
                     (externalMode || (client.encryptionRequest && client.aesCfb8Enabled)) &&
                     client.playLoginPackets > 0 &&
-                    client.chunkPackets >= minimumChunkPackets),
+                    client.minimumChunkTargetReached()),
                 `browser Relay reconnect wave ${wave} PLAY/chunk`, 90000,
                 () => JSON.stringify(replacementClients.map((client) =>
                     client.diagnostics())));
@@ -569,6 +895,18 @@ try {
                 `reconnect wave ${wave} RelayNode active tunnel quiescence`,
                 5000,
             );
+            const reconnectInboundFlow = await finishBrowserInboundFlowWindow(
+                browserRuntime,
+                reconnectRecoveryInboundFlowWindow,
+                `reconnect wave ${wave} recovery through minimum chunks`,
+            );
+            inboundFlowEvidence.reconnectRecovery.push(reconnectInboundFlow);
+            const reconnectInboundFlowStage = {
+                wave,
+                preDrop: preDropInboundFlow,
+                ...reconnectInboundFlow,
+            };
+            inboundFlowEvidence.reconnectWaves.push(reconnectInboundFlowStage);
             relayRuntimeBeforeSoak = relayAtChunks;
             const browserAtChunks = browserRuntimeSnapshot(browserRuntime);
             const sessionAtChunks = sessionRuntimeSnapshot(sessionState);
@@ -613,8 +951,15 @@ try {
                 `reconnect wave ${wave}`,
             );
             for (const client of replacementClients) {
+                // Do not make a p99 decision from the 9-20 samples available
+                // immediately after reconnect.  Keep scalar max-gap and
+                // readiness checks active; the strict p99/p99.9/max histogram
+                // gates run for every live replacement client after the
+                // complete steady-soak window below.
                 assertClientPerformance(client,
-                    `reconnect wave ${wave} client ${client.id}`);
+                    `reconnect wave ${wave} client ${client.id}`, {
+                        requireLatencyDistributions: false,
+                    });
             }
             reconnectEvidence.push({
                 wave,
@@ -662,6 +1007,7 @@ try {
                     afterJavaFinalClose: browserAfterJavaFinalClose,
                     atMinimumChunks: browserAtChunks,
                 },
+                inboundFlow: reconnectInboundFlowStage,
                 relay: {
                     beforeDrop: relayBeforeDrop,
                     afterDrop: relayAfterDrop,
@@ -683,6 +1029,11 @@ try {
                 })),
             });
         }
+        const steadySoakInboundFlowWindow = beginBrowserInboundFlowWindow(
+            browserRuntime,
+            "steadySoak",
+            "steady multiplayer soak",
+        );
         soakStartedAt = performance.now();
         const soakObservation = startSoakPerformanceObservation(
             currentClients,
@@ -690,6 +1041,12 @@ try {
         );
         if (soakMs > 0) await delayAtLeast(soakMs);
         soakPerformance = soakObservation.finish();
+        inboundFlowEvidence.steadySoak = await finishBrowserInboundFlowWindow(
+            browserRuntime,
+            steadySoakInboundFlowWindow,
+            "steady multiplayer soak",
+        );
+        inboundFlowEvidence.postSoak = inboundFlowEvidence.steadySoak;
         assertSoakPerformance(soakPerformance, "post-soak multiplayer performance");
         soakCompletedAt = performance.now();
         relayRuntimeAfterSoak = await waitRelayRuntime(
@@ -724,13 +1081,27 @@ try {
         }
     }
     finally {
-        clearInterval(pollTimer);
+        pollScheduler?.stop();
+        if (browserRuntime !== undefined) {
+            finalCleanupInboundFlowWindow = beginBrowserInboundFlowWindow(
+                browserRuntime,
+                "finalCleanup",
+                "final browser transport cleanup",
+            );
+        }
         for (const client of currentClients) client.close("final-close");
         await waitForBrowserRuntimeCleanup(browserRuntime,
             "browser Relay transport cleanup").catch(() => {
             // Preserve the primary protocol failure. Successful runs assert every
             // cleanup counter below with a more specific lifecycle error.
         });
+        if (browserRuntime !== undefined) {
+            inboundFlowEvidence.finalCleanup = captureBrowserInboundFlowWindow(
+                browserRuntime,
+                finalCleanupInboundFlowWindow,
+                "final browser transport cleanup",
+            );
+        }
         relayRuntimeAfterClose = await waitRelayRuntime(
             (snapshot) => relayRuntimeIsClean(snapshot),
             "RelayNode tunnel/timer cleanup",
@@ -788,8 +1159,14 @@ try {
         "browser transport retained inbound bytes after multiplayer cleanup");
     assert.equal(browserRuntime.stats.activeRelayTargetLeases, 0,
         "browser transport retained a RelayNode target lease after multiplayer cleanup");
-    assertBrowserRuntimeClean(browserRuntimeSnapshot(browserRuntime),
+    const finalBrowserRuntimeSnapshot = browserRuntimeSnapshot(browserRuntime);
+    assertBrowserRuntimeClean(finalBrowserRuntimeSnapshot,
         "final browser transport cleanup");
+    inboundFlowEvidence.finalCleanup = assertBrowserInboundFlowWindow(
+        inboundFlowEvidence.finalCleanup,
+        "final browser transport cleanup",
+        { requireCleanup: true },
+    );
     assert.equal(relayRuntimeBaseline.activeConnections, 0,
         "RelayNode baseline unexpectedly had active browser tunnels");
     if (!externalMode) {
@@ -853,11 +1230,56 @@ try {
         assert.ok(actualSoakMillis >= STRICT_ACCEPTANCE_TARGET.soakMillis,
             `strict acceptance soak elapsed only ${actualSoakMillis}ms`);
     }
+    if (stressMode) {
+        assert.equal(clientCount, stressTarget.clients,
+            "stress tier client count drifted");
+        assert.equal(minimumChunkPackets, stressTarget.minimumChunkPackets,
+            "stress tier chunk target drifted");
+        assert.equal(soakMs, stressTarget.soakMillis,
+            "stress tier soak target drifted");
+        assert.equal(reconnectWaves, stressTarget.reconnectWaves,
+            "stress tier reconnect target drifted");
+        assert.equal(expectedConnections, stressTarget.clientLifecycles,
+            "stress tier total client lifecycle count drifted");
+        assert.ok(actualSoakMillis >= stressTarget.soakMillis,
+            `stress tier soak elapsed only ${actualSoakMillis}ms`);
+        for (const client of allClients) {
+            assert.ok(client.stressQualifiedChunkPositions.size >= minimumChunkPackets,
+                `${client.username} stress wave observed only ` +
+                `${client.stressQualifiedChunkPositions.size} unique chunks after ` +
+                `the distance contract`);
+            assert.ok(Number.isInteger(client.observedChunkCacheCenter?.x) &&
+                Number.isInteger(client.observedChunkCacheCenter?.z),
+            `${client.username} did not observe the chunk-cache center contract`);
+            assert.equal(client.observedChunkCacheRadius, stressTarget.serverViewDistance,
+                `${client.username} did not observe the radius-8 cache contract`);
+            assert.equal(client.observedSimulationDistance, stressTarget.simulationDistance,
+                `${client.username} did not observe the simulation-distance contract`);
+            assert.equal(chunkTrackingCapacity(client.observedChunkCacheRadius),
+                stressTarget.maximumUniqueChunkCapacity,
+                `${client.username} observed an impossible chunk-window capacity`);
+            assert.ok(client.chunkBatchAcknowledgements > 0,
+                `${client.username} stress wave did not acknowledge a chunk batch`);
+            assert.equal(client.chunkBatchStarts, client.chunkBatchFinished,
+                `${client.username} stress wave retained an unfinished chunk batch`);
+            assert.equal(client.chunkBatchFinished, client.chunkBatchAcknowledgements,
+                `${client.username} stress wave omitted a chunk-batch ACK`);
+            assert.equal(client.chunkBatchOpen, false,
+                `${client.username} stress wave closed with an open chunk batch`);
+            assert.equal(client.chunkBatchProtocolErrors, 0,
+                `${client.username} stress wave reported chunk-batch protocol errors`);
+            assert.equal(client.chunkBatchCountMismatches, 0,
+                `${client.username} stress wave reported chunk-batch count mismatches`);
+        }
+    }
+    const pollSchedulerEvidence = pollScheduler?.evidence() ?? null;
     const result = {
         schemaVersion: "browser-full-path-result-v2",
         ok: true,
         acceptance: {
-            mode: acceptanceMode ? "strict-acceptance" : "compatible-smoke",
+            mode: acceptanceMode
+                ? "strict-acceptance"
+                : stressMode ? `stress-tier-${stressTier}` : "compatible-smoke",
             required: acceptanceMode
                 ? {
                     ...STRICT_ACCEPTANCE_TARGET,
@@ -872,7 +1294,17 @@ try {
                     runtimeJavaPolicy: { ...STRICT_RUNTIME_JAVA_POLICY },
                     multiplayerPerformance: { ...MULTIPLAYER_PERFORMANCE_TARGET },
                 }
-                : {
+                : stressMode
+                    ? {
+                        ...stressTarget,
+                        uniqueChunkTarget: true,
+                        maximumUniqueChunkCapacity,
+                        observedDistanceContractRequired: true,
+                        chunkBatchAcknowledgementRequired: true,
+                        multiplayerPerformance: { ...MULTIPLAYER_PERFORMANCE_TARGET },
+                        latencyDistribution: stressLatencyDistributionContract(),
+                    }
+                    : {
                     clients: clientCount,
                     minimumChunkPackets,
                     soakMillis: soakMs,
@@ -889,6 +1321,12 @@ try {
             observed: {
                 clients: clientCount,
                 minimumChunkPackets,
+                uniqueChunkTarget: stressMode,
+                maximumUniqueChunkCapacity,
+                clientViewDistance,
+                serverViewDistance,
+                effectiveChunkRadius,
+                desiredChunksPerTick,
                 soakMillis: soakMs,
                 actualSoakMillis,
                 reconnectWaveCount: reconnectEvidence.length,
@@ -910,6 +1348,8 @@ try {
                 runtimeJavaExecutable: runtimeJava?.executable ?? null,
                 soak: soakHealth,
                 soakPerformance,
+                pollScheduler: pollSchedulerEvidence,
+                inboundFlow: inboundFlowEvidence,
                 reconnectWaves: reconnectEvidence.map((wave) => ({
                     wave: wave.wave,
                     health: wave.health,
@@ -931,6 +1371,8 @@ try {
                 soakMillis: actualSoakMillis,
                 soak: soakHealth,
                 soakPerformance,
+                pollScheduler: pollSchedulerEvidence,
+                inboundFlow: inboundFlowEvidence,
                 reconnectWaves: reconnectEvidence.map((wave) => ({
                     wave: wave.wave,
                     health: wave.health,
@@ -965,6 +1407,8 @@ try {
             clients: clientCount,
             reconnectWaves,
             expectedConnections,
+            stressMode,
+            stressTier: stressTier ?? null,
             webSocketConnections: browserRuntime.wsStats.connections,
             webSocketUrls: browserRuntime.wsStats.urls,
             controlFrames: browserRuntime.wsStats.controlFrames,
@@ -982,6 +1426,8 @@ try {
                 browserRuntime.stats.activeRelayTargetLeases,
             browserCleanupGaugesAfterClose: browserRuntimeCleanupGaugeEvidence(
                 browserRuntimeSnapshot(browserRuntime)),
+            browserGlobalPumpTelemetryAfterClose:
+                browserGlobalPumpTelemetryEvidence(finalBrowserRuntimeSnapshot),
         },
         profile: {
             id: activeProfile.id,
@@ -1010,6 +1456,7 @@ try {
         },
         clients: allClients.map((client) => client.result()),
         reconnectWaves: reconnectEvidence,
+        inboundFlow: inboundFlowEvidence,
         relayPhases: phases,
         relayRuntime: {
             baseline: relayRuntimeBaseline,
@@ -1024,7 +1471,12 @@ try {
             totalDelta:
                 relayRuntimeDelta(relayRuntimeBaseline, relayRuntimeAfterSoak),
         },
+        browserGlobalPumpTelemetry: {
+            afterSoak: browserGlobalPumpTelemetryEvidence(browserRuntimeAfterSoak),
+            afterClose: browserGlobalPumpTelemetryEvidence(finalBrowserRuntimeSnapshot),
+        },
         performanceContract: browserFullPathPerformanceContract(),
+        pollScheduler: pollSchedulerEvidence,
         elapsedMillis: Number((performance.now() - smokeStartedAt).toFixed(1)),
     };
     await writeFile(path.join(workDirectory, "result.json"),
@@ -1033,11 +1485,34 @@ try {
 }
 catch (error) {
     failure = error;
+    let partialRelayRuntime;
+    if (typeof readRelayRuntime === "function") {
+        partialRelayRuntime = await readRelayRuntime().catch((runtimeError) => ({
+            unavailable: true,
+            error: String(runtimeError?.stack || runtimeError),
+        }));
+    }
+    const partialBrowserRuntime = browserRuntime === undefined
+        ? undefined
+        : browserRuntimeSnapshot(browserRuntime);
     await writeFile(path.join(workDirectory, "failure.json"), JSON.stringify({
         ok: false,
         profile: activeProfile.id,
         error: String(error?.stack || error),
         workDirectory,
+        partialEvidence: {
+            clients: allClients.map((client) => clientLivenessEvidence(client)),
+            activeClientIds: currentClients.map((client) => client.id),
+            browserRuntime: partialBrowserRuntime,
+            inboundFlow: inboundFlowEvidence,
+            lastInboundFlowAttempt,
+            relayRuntime: partialRelayRuntime,
+            session: sessionRuntimeSnapshot(sessionState),
+            performanceContract: browserFullPathPerformanceContract(),
+            pollScheduler: pollScheduler?.evidence() ?? null,
+            capturedAtElapsedMillis: Number(
+                (performance.now() - smokeStartedAt).toFixed(3)),
+        },
     }, null, 2) + "\n").catch(() => {});
     throw error;
 }
@@ -1070,12 +1545,893 @@ async function connectClientWave(clients) {
     }
 }
 
+/**
+ * Dispatches a bounded batch of client polls per macrotask in round-robin
+ * order.  The normal continuation is setImmediate; a zero-delay timer is used
+ * only as a rare bounded fairness yield (every 256 immediate turns), while an
+ * idle client set parks on the one-millisecond backoff timer. PLAY ticks are
+ * serviced from this same continuation with a separate bounded cursor, so
+ * each tab keeps its 50 ms cadence without a competing setInterval. Long
+ * turns are recorded but do not force a timer: the immediate continuation
+ * already returns control to Node between callbacks. A per-client due time and
+ * bridge readiness check prevent empty tabs from manufacturing a busy-spin.
+ * Windows commonly quantizes a
+ * one-millisecond timeout, so recursively using setTimeout(1) makes the timer
+ * quantum itself visible as a client poll gap.  The scheduler is deliberately
+ * a test-harness component; shipped browser scheduling is measured separately
+ * by BrowserWebSocketChannel telemetry.
+ */
+function createFairClientPollScheduler(getClients) {
+    let stopped = false;
+    let immediateHandle;
+    let timerHandle;
+    let watchdogHandle;
+    let scheduleSequence = 0;
+    let callbackSequence = 0;
+    let cursor = 0;
+    let callbackCount = 0;
+    let dispatchedPolls = 0;
+    let emptyCallbacks = 0;
+    let maxVisibleClients = 0;
+    let maxClientsPerCallback = 0;
+    let maxVisibleDispatchSkew = 0;
+    let lastVisibleDispatchCounts = [];
+    let tickCursor = 0;
+    let maxPlayTickServicesPerCallback = 0;
+    let maxCallbackDurationMillis = 0;
+    let maxCallbackDurationRawMillis = 0;
+    let maxInterCallbackGapMillis = 0;
+    let maxInterCallbackGapRawMillis = 0;
+    let maxScheduleDelayMillis = 0;
+    let maxScheduleDelayRawMillis = 0;
+    let maxClientPollDurationMillis = 0;
+    let maxClientPollDurationRawMillis = 0;
+    let callbackBudgetExhaustions = 0;
+    let callbackBudgetOverruns = 0;
+    let callbackBudgetTickSkips = 0;
+    let callbackBudgetPollSkips = 0;
+    let slowCallbackSamplesTotal = 0;
+    let slowCallbackSamplesDropped = 0;
+    const slowCallbackSamples = [];
+    let fairnessSkips = 0;
+    let lastCallbackAt;
+    let immediateSchedules = 0;
+    let immediateCallbacks = 0;
+    let timerSchedules = 0;
+    let timerYieldCallbacks = 0;
+    let timerFallbackCallbacks = 0;
+    let idleSchedules = 0;
+    let idleCallbacks = 0;
+    let playTickServiceCalls = 0;
+    let playTickDispatches = 0;
+    let playTickServiceErrors = 0;
+    let lastDueTicksAfterService = 0;
+    let lastDueTicksBeforeIdle = 0;
+    let maxDueTicks = 0;
+    let dueTickImmediateContinuations = 0;
+    let watchdogFires = 0;
+    let overlappingCallbacks = 0;
+    let turnsSinceTimerYield = 0;
+    let heavyTurnCount = 0;
+    let callbackRunning = false;
+    const dispatchCounts = new Map();
+    const pollDurationByClient = new Map();
+    const retainSlowCallbackSample = (sample) => {
+        slowCallbackSamples.push(sample);
+        slowCallbackSamples.sort((left, right) =>
+            right.durationRawMillis - left.durationRawMillis ||
+            left.callbackSequence - right.callbackSequence);
+        if (slowCallbackSamples.length > CALLBACK_TAIL_SAMPLE_LIMIT) {
+            slowCallbackSamples.length = CALLBACK_TAIL_SAMPLE_LIMIT;
+            slowCallbackSamplesDropped++;
+        }
+    };
+    // Keep scheduling state per client rather than forcing every visible tab
+    // through poll() on every immediate turn. The property is mirrored onto
+    // normal BrowserMinecraftClient instances for diagnostics; the side map
+    // keeps frozen/synthetic clients usable in the server-free smoke.
+    const nextPollDueAtByClient = new Map();
+    const validPollDueAt = (value) => Number.isFinite(value) || value === Infinity;
+    const readNextPollDueAt = (client) => {
+        // The side map is authoritative once a client has entered the
+        // scheduler.  `client.nextPollDueAt` is only a compatibility mirror;
+        // generated/frozen clients and reconnect replacements must not be able
+        // to overwrite the scheduler's cursor by mutating that property.
+        if (nextPollDueAtByClient.has(client)) {
+            const stored = Number(nextPollDueAtByClient.get(client));
+            return validPollDueAt(stored) ? stored : 0;
+        }
+        const explicit = Number(client?.nextPollDueAt);
+        if (validPollDueAt(explicit)) {
+            nextPollDueAtByClient.set(client, explicit);
+            return explicit;
+        }
+        return 0;
+    };
+    const writeNextPollDueAt = (client, dueAt) => {
+        const due = Number.isFinite(Number(dueAt))
+            ? Number(dueAt) : performance.now();
+        nextPollDueAtByClient.set(client, due);
+        try {
+            if (client !== null && client !== undefined &&
+                (typeof client === "object" || typeof client === "function")) {
+                client.nextPollDueAt = due;
+            }
+        }
+        catch {
+            // A frozen synthetic client is still schedulable via the side map.
+        }
+    };
+    const hasPendingInbound = (client) => {
+        if (client === null || client === undefined) return false;
+        if (typeof client.hasPendingInbound === "function") {
+            try { return !!client.hasPendingInbound(); }
+            catch { return true; }
+        }
+        const bridge = client.bridge;
+        if (bridge !== null && bridge !== undefined &&
+            typeof bridge.hasPendingInbound === "function") {
+            try { return !!bridge.hasPendingInbound(client.id); }
+            catch { return true; }
+        }
+        if (client.buffer !== null && client.buffer !== undefined &&
+            Number.isFinite(client.buffer.byteLength)) {
+            return client.buffer.byteLength > 0;
+        }
+        // Unknown client implementations retain the old dispatch behaviour
+        // rather than being silently starved by an unsupported readiness API.
+        return true;
+    };
+    const hasImmediateInbound = (client) => {
+        // BrowserMinecraftClient owns the authoritative immediate-readiness
+        // contract (buffer first, then bridge).  Prefer it over bridge-only
+        // compatibility probes so a stale bridge answer cannot park a client
+        // that already has decoded bytes in its local cumulation buffer.
+        if (typeof client?.hasImmediateInbound === "function") {
+            try { return !!client.hasImmediateInbound(); }
+            catch { return true; }
+        }
+        const bridge = client?.bridge;
+        if (bridge !== null && bridge !== undefined &&
+            typeof bridge.hasPendingInbound === "function") {
+            try { return !!bridge.hasPendingInbound(client.id); }
+            catch { return true; }
+        }
+        return hasPendingInbound(client);
+    };
+    const visibleDispatchEvidence = (clients) => {
+        const entries = new Map();
+        for (const client of clients) {
+            if (client === null || client === undefined) continue;
+            const id = client.id;
+            if (id === undefined || id === null || entries.has(id)) continue;
+            entries.set(id, {
+                id,
+                count: dispatchCounts.get(id) ?? 0,
+            });
+        }
+        return [...entries.values()].sort((left, right) =>
+            String(left.id).localeCompare(String(right.id), undefined, { numeric: true }));
+    };
+    const recordVisibleDispatchEvidence = (clients) => {
+        const entries = visibleDispatchEvidence(clients);
+        const counts = entries.map(({ count }) => count);
+        const skew = counts.length === 0
+            ? 0 : Math.max(...counts) - Math.min(...counts);
+        maxVisibleDispatchSkew = Math.max(maxVisibleDispatchSkew, skew);
+        lastVisibleDispatchCounts = entries;
+        return entries;
+    };
+    const isPollLive = (client) => client !== null && client !== undefined &&
+        !client.closed && !client.pollingPaused && client.failure === undefined;
+    const readPollFairnessFloor = (clients) => {
+        let floor = Infinity;
+        for (const client of clients) {
+            if (!isPollLive(client)) continue;
+            floor = Math.min(floor, dispatchCounts.get(client.id) ?? 0);
+        }
+        return Number.isFinite(floor) ? floor : 0;
+    };
+    const isPollFairlyEligible = (client, clients, floor =
+        readPollFairnessFloor(clients)) => isPollLive(client) &&
+        (dispatchCounts.get(client.id) ?? 0) <= floor;
+    const hasFairPollReady = (clients, now = performance.now()) => {
+        const floor = readPollFairnessFloor(clients);
+        return clients.some((candidate) => isPollFairlyEligible(candidate, clients, floor) &&
+            isPollReady(candidate, now));
+    };
+    const isPollReady = (client, now = performance.now()) => {
+        if (client === null || client === undefined || client.closed ||
+            client.pollingPaused || client.failure !== undefined) {
+            return false;
+        }
+        // A bridge queue is eligible for the next fair due turn, but it does
+        // not bypass that turn.  The old immediate-or-due shortcut let one
+        // client with a continuous inbound stream remain ready on every
+        // setImmediate callback while peers were still waiting for their
+        // one-millisecond cadence.  Under tier-8 fan-in that produced large
+        // visible dispatch skew and inflated peer poll p99.  Keep the
+        // readiness probe in the contract, but gate both queued and partial
+        // input on the scheduler-owned due cursor so a busy client cannot
+        // monopolise the shared callback.
+        const dueAt = readNextPollDueAt(client);
+        if (now < dueAt) return false;
+        // A complete queued frame is still useful evidence, but it cannot
+        // bypass the scheduler-owned due boundary.  Once that boundary is
+        // reached, poll both queued and quiescent clients so the due cadence
+        // remains fair and the client can discover a newly arrived frame.
+        if (hasImmediateInbound(client)) return true;
+        return Number.isFinite(dueAt);
+    };
+    const isPlayTickDue = (client, now = performance.now()) => {
+        if (client === null || client === undefined || client.closed ||
+            client.pollingPaused || client.failure !== undefined ||
+            client.phase !== "play" ||
+            (client.playTickActive !== undefined && !client.playTickActive) ||
+            typeof client.servicePlayTick !== "function") {
+            return false;
+        }
+        const dueAt = Number(client.nextPlayTickDueAt);
+        const current = Number(now);
+        return Number.isFinite(dueAt) && Number.isFinite(current) && current >= dueAt;
+    };
+    const countDuePlayTicks = (clients, now = performance.now()) => {
+        let count = 0;
+        for (const client of clients) {
+            if (isPlayTickDue(client, now)) count++;
+        }
+        return count;
+    };
+    let eventLoopDelayMonitor;
+    try {
+        eventLoopDelayMonitor = monitorEventLoopDelay({ resolution: 10 });
+        eventLoopDelayMonitor.enable();
+    }
+    catch {
+        // Older/non-Node harnesses can still run the scheduler without the
+        // optional perf_hooks histogram.  Evidence marks it unavailable.
+        eventLoopDelayMonitor = undefined;
+    }
+
+    const roundedMillis = (value) => Number.isFinite(value) && value >= 0
+        ? Number(value.toFixed(3)) : 0;
+    const eventLoopDelayEvidence = () => {
+        const histogram = eventLoopDelayMonitor;
+        if (histogram === undefined) {
+            return {
+                available: false,
+                resolutionMillis: null,
+                samples: 0,
+                minMillis: null,
+                p50Millis: null,
+                p95Millis: null,
+                p99Millis: null,
+                maxMillis: null,
+                rawMinMillis: null,
+                rawP50Millis: null,
+                rawP95Millis: null,
+                rawP99Millis: null,
+                rawMaxMillis: null,
+            };
+        }
+        const samples = Number(histogram.count) || 0;
+        if (samples === 0) {
+            return {
+                available: true,
+                resolutionMillis: 10,
+                samples: 0,
+                minMillis: null,
+                p50Millis: null,
+                p95Millis: null,
+                p99Millis: null,
+                maxMillis: null,
+                rawMinMillis: null,
+                rawP50Millis: null,
+                rawP95Millis: null,
+                rawP99Millis: null,
+                rawMaxMillis: null,
+            };
+        }
+        const millis = (value) => {
+            const number = Number(value);
+            return Number.isFinite(number) && number > 0
+                ? roundedMillis(number / 1e6) : 0;
+        };
+        const raw = (value) => {
+            const number = Number(value);
+            return Number.isFinite(number) && number >= 0 ? number / 1e6 : null;
+        };
+        return {
+            available: true,
+            resolutionMillis: 10,
+            samples,
+            minMillis: millis(histogram.min),
+            p50Millis: millis(histogram.percentile(50)),
+            p95Millis: millis(histogram.percentile(95)),
+            p99Millis: millis(histogram.percentile(99)),
+            maxMillis: millis(histogram.max),
+            // Keep unrounded values for strict gates.  The rounded aliases are
+            // retained for human-readable reports and backwards compatibility.
+            rawMinMillis: raw(histogram.min),
+            rawP50Millis: raw(histogram.percentile(50)),
+            rawP95Millis: raw(histogram.percentile(95)),
+            rawP99Millis: raw(histogram.percentile(99)),
+            rawMaxMillis: raw(histogram.max),
+        };
+    };
+
+    const clearPending = () => {
+        if (immediateHandle !== undefined) {
+            clearImmediate(immediateHandle);
+            immediateHandle = undefined;
+        }
+        if (timerHandle !== undefined) {
+            clearTimeout(timerHandle);
+            timerHandle = undefined;
+        }
+        if (watchdogHandle !== undefined) {
+            clearTimeout(watchdogHandle);
+            watchdogHandle = undefined;
+        }
+    };
+
+    let schedule;
+    const run = (trigger, scheduledAt) => {
+        if (stopped) return;
+        if (callbackRunning) {
+            overlappingCallbacks++;
+            return;
+        }
+        callbackRunning = true;
+        const callbackSequenceNumber = ++callbackSequence;
+        const callbackStartedAt = performance.now();
+        // One deadline covers both PLAY ticks and inbound polls.  Previously
+        // ticks ran before the poll deadline was created, so a slow tick burst
+        // could consume an entire macrotask and manufacture peer poll gaps.
+        const workDeadline = callbackStartedAt + MAX_POLL_CALLBACK_WORK_MILLIS;
+        let callbackBudgetReached = false;
+        let callbackBudgetReachedPhase;
+        let callbackBudgetReachedAtMillis;
+        let callbackPhase = "start";
+        let timeBeforeTickLoop;
+        let timeAfterTickLoop;
+        let timeBeforePollLoop;
+        let timeAfterPollLoop;
+        let timeBeforeEvidenceOrFinalize;
+        let clients = [];
+        let dispatched = 0;
+        let tickServicesThisCallback = 0;
+        let tickAttemptsThisCallback = 0;
+        let tickServicesCompletedThisCallback = 0;
+        let tickDispatchesThisCallback = 0;
+        let tickServiceErrorsThisCallback = 0;
+        let maxPerTickDurationMillis = 0;
+        let pollCandidatesInspectedThisCallback = 0;
+        let fairnessFloorScansThisCallback = 0;
+        let fairnessSkipsThisCallback = 0;
+        let maxPerPollDurationMillis = 0;
+        let nextContinuation = "immediate";
+        const markPhase = (phase) => {
+            callbackPhase = phase;
+            return performance.now();
+        };
+        const markBudgetReached = (phase) => {
+            callbackBudgetReached = true;
+            if (callbackBudgetReachedPhase === undefined) {
+                callbackBudgetReachedPhase = phase;
+                callbackBudgetReachedAtMillis = Math.max(
+                    0, performance.now() - callbackStartedAt);
+            }
+        };
+        const elapsedSinceStart = (timestamp) => Number.isFinite(timestamp)
+            ? Math.max(0, timestamp - callbackStartedAt) : null;
+        try {
+            if (lastCallbackAt !== undefined) {
+                const interCallbackGapMillis = callbackStartedAt - lastCallbackAt;
+                maxInterCallbackGapRawMillis = Math.max(
+                    maxInterCallbackGapRawMillis, interCallbackGapMillis);
+                maxInterCallbackGapMillis = Math.max(
+                    maxInterCallbackGapMillis, interCallbackGapMillis);
+            }
+            lastCallbackAt = callbackStartedAt;
+            const scheduleDelayMillis = callbackStartedAt - scheduledAt;
+            maxScheduleDelayRawMillis = Math.max(
+                maxScheduleDelayRawMillis, scheduleDelayMillis);
+            maxScheduleDelayMillis = Math.max(maxScheduleDelayMillis, scheduleDelayMillis);
+            callbackCount++;
+            markPhase("client-snapshot");
+            try {
+                const observed = getClients();
+                if (Array.isArray(observed)) clients = observed;
+            }
+            catch {
+                // The owner of the client array remains authoritative. A
+                // transient replacement race is retried on the next turn.
+            }
+            maxVisibleClients = Math.max(maxVisibleClients, clients.length);
+            recordVisibleDispatchEvidence(clients);
+            // Reconnect waves replace the visible array. Drop scheduling state
+            // for retired client objects so the due-map cannot retain channels
+            // (or their bridge references) indefinitely.
+            const visibleClients = new Set(clients);
+            for (const knownClient of nextPollDueAtByClient.keys()) {
+                if (!visibleClients.has(knownClient)) {
+                    nextPollDueAtByClient.delete(knownClient);
+                }
+            }
+            lastDueTicksAfterService = 0;
+            lastDueTicksBeforeIdle = 0;
+            // PLAY ticks share the same macrotask continuation as inbound
+            // polling. This removes one independent timer per client while
+            // retaining the client's 50 ms due cadence and pause/close gates.
+            if (clients.length > 0) {
+                timeBeforeTickLoop = markPhase("tick-loop");
+                if (tickCursor >= clients.length) tickCursor = 0;
+                // A separate cursor keeps tick servicing fair without coupling
+                // it to whichever clients happened to consume the poll batch.
+                for (let attempts = 0;
+                    attempts < clients.length &&
+                    tickServicesThisCallback <
+                        Math.min(MAX_PLAY_TICKS_PER_SCHEDULER_CALLBACK, clients.length);
+                    attempts++) {
+                    tickAttemptsThisCallback++;
+                    if (performance.now() >= workDeadline) {
+                        markBudgetReached("tick-admission");
+                        callbackBudgetTickSkips++;
+                        break;
+                    }
+                    const candidate = clients[tickCursor];
+                    tickCursor = (tickCursor + 1) % clients.length;
+                    if (candidate === undefined || candidate === null || candidate.closed ||
+                        candidate.pollingPaused ||
+                        typeof candidate.servicePlayTick !== "function") continue;
+                    tickServicesThisCallback++;
+                    playTickServiceCalls++;
+                    const tickStartedAt = performance.now();
+                    try {
+                        if (candidate.servicePlayTick(performance.now())) {
+                            playTickDispatches++;
+                            tickDispatchesThisCallback++;
+                        }
+                    }
+                    catch (error) {
+                        playTickServiceErrors++;
+                        tickServiceErrorsThisCallback++;
+                        candidate.failure ??= error;
+                    }
+                    finally {
+                        tickServicesCompletedThisCallback++;
+                        maxPerTickDurationMillis = Math.max(
+                            maxPerTickDurationMillis,
+                            performance.now() - tickStartedAt);
+                    }
+                    if (performance.now() >= workDeadline && attempts + 1 < clients.length) {
+                        markBudgetReached("tick-service");
+                        callbackBudgetTickSkips++;
+                        break;
+                    }
+                }
+            }
+            maxPlayTickServicesPerCallback = Math.max(
+                maxPlayTickServicesPerCallback, tickServicesThisCallback);
+            timeAfterTickLoop = markPhase("post-tick");
+            // The per-callback tick cap deliberately services only a bounded
+            // subset of PLAY clients.  Before deciding to park on the idle
+            // timer, count the still-due clients; otherwise the remaining due
+            // ticks wait behind the host's one-millisecond timer quantum and
+            // inflate the strict PLAY tick gap histogram.  This is a
+            // continuation choice only: the cap, cadence, and latency gates
+            // remain unchanged.
+            lastDueTicksAfterService = countDuePlayTicks(clients);
+            maxDueTicks = Math.max(maxDueTicks, lastDueTicksAfterService);
+            if (clients.length > 0) {
+                timeBeforePollLoop = markPhase("poll-loop");
+                if (cursor >= clients.length) cursor = 0;
+                const batchLimit = Math.min(
+                    MAX_CLIENTS_PER_POLL_CALLBACK, clients.length);
+                const visited = new Set();
+                // Prefer live, unpaused clients and advance the cursor for every
+                // inspected entry. The per-client poll() budgets bound work in
+                // this callback; no unbounded fan-out is permitted.
+                for (let attempts = 0;
+                    attempts < clients.length && dispatched < batchLimit;
+                    attempts++) {
+                    pollCandidatesInspectedThisCallback++;
+                    if (performance.now() >= workDeadline) {
+                        markBudgetReached("poll-admission");
+                        callbackBudgetPollSkips++;
+                        break;
+                    }
+                    const candidate = clients[cursor];
+                    cursor = (cursor + 1) % clients.length;
+                    if (candidate === undefined || candidate === null ||
+                        visited.has(candidate)) continue;
+                    visited.add(candidate);
+                    const pollNow = performance.now();
+                    if (!isPollReady(candidate, pollNow)) continue;
+                    // A due client that has already received more turns than
+                    // the least-served visible client must wait for the
+                    // fairness floor.  This prevents a continuously busy
+                    // client from consuming every callback while a peer is
+                    // delayed by timer quantization or a transient I/O gap.
+                    fairnessFloorScansThisCallback++;
+                    const fairnessFloor = readPollFairnessFloor(clients);
+                    if (!isPollFairlyEligible(candidate, clients, fairnessFloor)) {
+                        fairnessSkips++;
+                        fairnessSkipsThisCallback++;
+                        continue;
+                    }
+                    const pollStartedAt = performance.now();
+                    try {
+                        candidate.poll();
+                    }
+                    finally {
+                        const pollDurationMillis = performance.now() - pollStartedAt;
+                        maxPerPollDurationMillis = Math.max(
+                            maxPerPollDurationMillis, pollDurationMillis);
+                        maxClientPollDurationRawMillis = Math.max(
+                            maxClientPollDurationRawMillis, pollDurationMillis);
+                        maxClientPollDurationMillis = Math.max(
+                            maxClientPollDurationMillis, pollDurationMillis);
+                        const previous = pollDurationByClient.get(candidate.id) ?? 0;
+                        pollDurationByClient.set(candidate.id,
+                            Math.max(previous, pollDurationMillis));
+                    }
+                    dispatched++;
+                    dispatchCounts.set(candidate.id,
+                        (dispatchCounts.get(candidate.id) ?? 0) + 1);
+                    // Every dispatched client gets the same short due
+                    // cadence, including a client with more queued input.  The
+                    // readiness probe above still observes queued input, but
+                    // the due cursor is the fairness boundary that prevents a
+                    // continuously busy client from monopolising setImmediate.
+                    writeNextPollDueAt(candidate,
+                        performance.now() + CLIENT_POLL_INTERVAL_MILLIS);
+                    if (performance.now() >= workDeadline && attempts + 1 < clients.length) {
+                        markBudgetReached("poll-dispatch");
+                        callbackBudgetPollSkips++;
+                        break;
+                    }
+                }
+                // If no candidate is currently ready, park the continuation
+                // on the idle backoff timer.  Otherwise retain immediate
+                // round-robin scheduling for queued work or another batch.
+                const readinessAt = performance.now();
+                const readyAfterDispatch = hasFairPollReady(clients, readinessAt);
+                lastDueTicksBeforeIdle = countDuePlayTicks(clients, readinessAt);
+                maxDueTicks = Math.max(maxDueTicks, lastDueTicksBeforeIdle);
+                if (lastDueTicksBeforeIdle > 0) {
+                    nextContinuation = "immediate";
+                    dueTickImmediateContinuations++;
+                }
+                else if (!readyAfterDispatch) nextContinuation = "idle";
+                timeAfterPollLoop = markPhase("post-poll");
+            }
+            if (dispatched === 0) {
+                emptyCallbacks++;
+                // Keep a due PLAY client on the immediate path even when this
+                // callback had no inbound poll dispatches.
+                if (lastDueTicksBeforeIdle > 0 || lastDueTicksAfterService > 0) {
+                    nextContinuation = "immediate";
+                }
+                else {
+                    nextContinuation = "idle";
+                }
+            }
+            dispatchedPolls += dispatched;
+            maxClientsPerCallback = Math.max(maxClientsPerCallback, dispatched);
+            timeBeforeEvidenceOrFinalize = markPhase("evidence");
+            recordVisibleDispatchEvidence(clients);
+        }
+        finally {
+            callbackRunning = false;
+            const callbackPhaseBeforeFinalize = callbackPhase;
+            const callbackFinishedAt = performance.now();
+            const callbackDurationMillis = callbackFinishedAt - callbackStartedAt;
+            maxCallbackDurationMillis = Math.max(
+                maxCallbackDurationMillis,
+                callbackDurationMillis,
+            );
+            maxCallbackDurationRawMillis = Math.max(
+                maxCallbackDurationRawMillis,
+                callbackDurationMillis,
+            );
+            if (callbackBudgetReached) callbackBudgetExhaustions++;
+            if (callbackDurationMillis > MAX_POLL_CALLBACK_WORK_MILLIS) {
+                callbackBudgetOverruns++;
+            }
+            if (callbackDurationMillis >= POLL_SCHEDULER_TIMER_YIELD_WORK_MILLIS) {
+                heavyTurnCount++;
+            }
+            if (trigger === "timer-yield" || trigger === "timer-fallback" ||
+                trigger === "idle" || trigger === "watchdog") {
+                turnsSinceTimerYield = 0;
+            }
+            else {
+                turnsSinceTimerYield++;
+            }
+            const needsTimerYield = turnsSinceTimerYield >=
+                POLL_SCHEDULER_TIMER_YIELD_TURNS;
+            if (needsTimerYield) turnsSinceTimerYield = 0;
+            // Keep the scheduler alive even if a future client implementation
+            // throws outside its normal poll() fail-closed handler. The next
+            // turn is selected only after this callback fully unwinds.
+            // A timer-yield must never postpone a due PLAY tick batch. The
+            // bounded tick cap can leave peers due after this callback; force
+            // one immediate continuation first, then resume the normal
+            // 256-turn fairness cadence once no due tick remains.
+            const dueTicksPending = lastDueTicksAfterService > 0 ||
+                lastDueTicksBeforeIdle > 0;
+            const continuation = dueTicksPending
+                ? "immediate"
+                : needsTimerYield ? "timer-yield" : nextContinuation;
+            if (callbackDurationMillis >= CALLBACK_TAIL_SLOW_THRESHOLD_MILLIS) {
+                slowCallbackSamplesTotal++;
+                retainSlowCallbackSample({
+                    schemaVersion: CALLBACK_TAIL_TELEMETRY_SCHEMA_VERSION,
+                    callbackSequence: callbackSequenceNumber,
+                    trigger,
+                    startedAtMillis: callbackStartedAt,
+                    scheduledAtMillis: scheduledAt,
+                    scheduledDelayMillis: Math.max(0, callbackStartedAt - scheduledAt),
+                    durationRawMillis: callbackDurationMillis,
+                    durationMillis: roundedMillis(callbackDurationMillis),
+                    slowThresholdMillis: CALLBACK_TAIL_SLOW_THRESHOLD_MILLIS,
+                    callbackWorkBudgetMillis: MAX_POLL_CALLBACK_WORK_MILLIS,
+                    strictFrameBudgetMillis: 16.7,
+                    callbackWorkOverrunMillis: Math.max(
+                        0, callbackDurationMillis - MAX_POLL_CALLBACK_WORK_MILLIS),
+                    strictFrameBudgetExcessMillis: Math.max(
+                        0, callbackDurationMillis - 16.7),
+                    phase: callbackPhaseBeforeFinalize,
+                    terminalPhase: callbackPhaseBeforeFinalize,
+                    budgetReached: callbackBudgetReached,
+                    budgetCheckReached: callbackBudgetReached,
+                    budgetReachedPhase: callbackBudgetReachedPhase ?? null,
+                    budgetReachedAtMillis: callbackBudgetReachedAtMillis ?? null,
+                    tickAttempts: tickAttemptsThisCallback,
+                    tickCandidatesInspected: tickAttemptsThisCallback,
+                    tickServices: tickServicesThisCallback,
+                    tickServicesAttempted: tickServicesThisCallback,
+                    tickServicesCompleted: tickServicesCompletedThisCallback,
+                    tickDispatches: tickDispatchesThisCallback,
+                    tickServiceErrors: tickServiceErrorsThisCallback,
+                    maxPerTickDurationRawMillis: maxPerTickDurationMillis,
+                    maxPerTickDurationMillis: roundedMillis(maxPerTickDurationMillis),
+                    pollCandidatesInspected: pollCandidatesInspectedThisCallback,
+                    pollDispatches: dispatched,
+                    fairnessFloorScans: fairnessFloorScansThisCallback,
+                    fairnessSkips: fairnessSkipsThisCallback,
+                    maxPerPollDurationRawMillis: maxPerPollDurationMillis,
+                    maxPerPollDurationMillis: roundedMillis(maxPerPollDurationMillis),
+                    visibleClientCount: clients.length,
+                    dueTicksAfterService: lastDueTicksAfterService,
+                    dueTicksBeforeIdle: lastDueTicksBeforeIdle,
+                    phaseTimingsMillis: {
+                        beforeTickLoop: elapsedSinceStart(timeBeforeTickLoop),
+                        afterTickLoop: elapsedSinceStart(timeAfterTickLoop),
+                        beforePollLoop: elapsedSinceStart(timeBeforePollLoop),
+                        afterPollLoop: elapsedSinceStart(timeAfterPollLoop),
+                        beforeFinalEvidence: elapsedSinceStart(timeBeforeEvidenceOrFinalize),
+                        afterFinalEvidence: elapsedSinceStart(callbackFinishedAt),
+                    },
+                    nextContinuation: continuation,
+                });
+            }
+            if (!stopped) {
+                schedule(continuation);
+            }
+        }
+    };
+
+    schedule = (kind = "immediate") => {
+        if (stopped || immediateHandle !== undefined || timerHandle !== undefined) return;
+        const sequence = ++scheduleSequence;
+        const scheduledAt = performance.now();
+        let fired = false;
+        const fire = (trigger) => {
+            if (fired || stopped || sequence !== scheduleSequence) return;
+            fired = true;
+            if (trigger === "immediate") {
+                immediateHandle = undefined;
+                immediateCallbacks++;
+                if (watchdogHandle !== undefined) {
+                    clearTimeout(watchdogHandle);
+                    watchdogHandle = undefined;
+                }
+            }
+            else if (trigger === "watchdog") {
+                if (immediateHandle !== undefined) {
+                    clearImmediate(immediateHandle);
+                    immediateHandle = undefined;
+                }
+                watchdogHandle = undefined;
+                watchdogFires++;
+            }
+            else {
+                timerHandle = undefined;
+                if (trigger === "timer-fallback") timerFallbackCallbacks++;
+                else if (trigger === "idle") idleCallbacks++;
+                else timerYieldCallbacks++;
+            }
+            run(trigger, scheduledAt);
+        };
+        const useTimer = kind === "timer-yield" || kind === "idle" ||
+            typeof setImmediate !== "function";
+        if (useTimer) {
+            timerSchedules++;
+            if (kind === "idle") idleSchedules++;
+            const fireTimer = () => {
+                const trigger = typeof setImmediate !== "function"
+                    ? "timer-fallback"
+                    : kind === "idle" ? "idle" : "timer-yield";
+                fire(trigger);
+            };
+            if (kind === "idle") {
+                timerHandle = setTimeout(fireTimer,
+                    POLL_SCHEDULER_IDLE_BACKOFF_MILLIS);
+            }
+            else {
+                // Keep the fairness-yield path explicitly zero-delay; the
+                // static contract smoke treats this as a required backstop.
+                timerHandle = setTimeout(() => {
+                    fireTimer();
+                }, 0);
+            }
+            return;
+        }
+        immediateSchedules++;
+        immediateHandle = setImmediate(() => {
+            fire("immediate");
+        });
+        // A watchdog prevents a blocked check phase from silently stopping the
+        // poll loop. It races the immediate with a generation token; exactly one
+        // callback is allowed to enter run().
+        watchdogHandle = setTimeout(() => {
+            if (immediateHandle === undefined) return;
+            fire("watchdog");
+        }, POLL_SCHEDULER_WATCHDOG_MILLIS);
+    };
+
+    schedule("timer-yield");
+    return {
+        stop() {
+            if (stopped) return;
+            stopped = true;
+            scheduleSequence++;
+            clearPending();
+            nextPollDueAtByClient.clear();
+            eventLoopDelayMonitor?.disable();
+        },
+        evidence() {
+            const counts = [...dispatchCounts.entries()]
+                .sort(([left], [right]) => Number(left) - Number(right))
+                .slice(0, 128)
+                .map(([id, count]) => ({ id, count }));
+            const durations = [...pollDurationByClient.entries()]
+                .sort(([left], [right]) => Number(left) - Number(right))
+                .slice(0, 128)
+                .map(([id, millis]) => ({ id,
+                    maxPollDurationMillis: roundedMillis(millis) }));
+            const numericCounts = counts.map(({ count }) => count);
+            const minimumDispatches = numericCounts.length === 0
+                ? 0 : Math.min(...numericCounts);
+            const maximumDispatches = numericCounts.length === 0
+                ? 0 : Math.max(...numericCounts);
+            let visibleClients = [];
+            try {
+                const observed = getClients();
+                if (Array.isArray(observed)) visibleClients = observed;
+            }
+            catch {
+                // Keep the last authoritative visible set when a reconnect
+                // replacement races evidence collection.
+            }
+            const visibleDispatchCounts = visibleClients.length > 0
+                ? recordVisibleDispatchEvidence(visibleClients)
+                : lastVisibleDispatchCounts;
+            return {
+                schemaVersion: "gaius.browser-client-poll-scheduler.v1",
+                mode: "round-robin-bounded-batch-per-macrotask",
+                schedulerMechanism:
+                    "setImmediate-primary-idle-backoff-timer-yield-watchdog",
+                maxBatchClients: MAX_CLIENTS_PER_POLL_CALLBACK,
+                intervalMillis: CLIENT_POLL_INTERVAL_MILLIS,
+                idleBackoffMillis: POLL_SCHEDULER_IDLE_BACKOFF_MILLIS,
+                timerYieldTurns: POLL_SCHEDULER_TIMER_YIELD_TURNS,
+                timerYieldWorkMillis: POLL_SCHEDULER_TIMER_YIELD_WORK_MILLIS,
+                timerYieldPolicy: "turn-count-only-heavy-turns-observed",
+                watchdogMillis: POLL_SCHEDULER_WATCHDOG_MILLIS,
+                stopped,
+                callbacks: callbackCount,
+                dispatchedPolls,
+                emptyCallbacks,
+                maxVisibleClients,
+                maxClientsPerCallback,
+                maxCallbackDurationMillis: roundedMillis(maxCallbackDurationMillis),
+                maxCallbackDurationRawMillis,
+                callbackWorkBudgetMillis: MAX_POLL_CALLBACK_WORK_MILLIS,
+                callbackBudgetCoversPlayTicks: true,
+                callbackBudgetExhaustions,
+                callbackBudgetOverruns,
+                callbackBudgetTickSkips,
+                callbackBudgetPollSkips,
+                callbackTail: {
+                    schemaVersion: CALLBACK_TAIL_TELEMETRY_SCHEMA_VERSION,
+                    slowThresholdMillis: CALLBACK_TAIL_SLOW_THRESHOLD_MILLIS,
+                    sampleLimit: CALLBACK_TAIL_SAMPLE_LIMIT,
+                    slowCallbackSamplesTotal,
+                    retainedSampleCount: slowCallbackSamples.length,
+                    slowCallbackSamplesDropped,
+                    droppedSampleCount: slowCallbackSamplesDropped,
+                    retention: "longest-duration-desc-sequence-asc",
+                    samples: slowCallbackSamples.map((sample) => ({ ...sample })),
+                },
+                fairnessSkips,
+                maxInterCallbackGapMillis: roundedMillis(maxInterCallbackGapMillis),
+                maxInterCallbackGapRawMillis,
+                maxScheduleDelayMillis: roundedMillis(maxScheduleDelayMillis),
+                maxScheduleDelayRawMillis,
+                maxClientPollDurationMillis: roundedMillis(maxClientPollDurationMillis),
+                maxClientPollDurationRawMillis,
+                immediateSchedules,
+                immediateCallbacks,
+                timerSchedules,
+                timerYieldCallbacks,
+                timerFallbackCallbacks,
+                idleSchedules,
+                idleCallbacks,
+                maxPlayTickServicesPerCallback,
+                maxPlayTickServicesPerCallbackLimit:
+                    MAX_PLAY_TICKS_PER_SCHEDULER_CALLBACK,
+                playTickServiceCalls,
+                playTickDispatches,
+                playTickServiceErrors,
+                dueTicksAfterService: lastDueTicksAfterService,
+                dueTicksBeforeIdle: lastDueTicksBeforeIdle,
+                maxDueTicks,
+                dueTickImmediateContinuations,
+                watchdogFires,
+                overlappingCallbacks,
+                heavyTurnCount,
+                dispatchCounts: counts,
+                pollDurationByClient: durations,
+                dispatchSkew: maximumDispatches - minimumDispatches,
+                maxVisibleDispatchSkew,
+                maxVisibleDispatchSkewLimit: MAX_VISIBLE_DISPATCH_SKEW,
+                visibleDispatchCounts,
+                visibleClientCount: visibleDispatchCounts.length,
+                dueMapEntries: nextPollDueAtByClient.size,
+                eventLoopDelay: eventLoopDelayEvidence(),
+            };
+        },
+    };
+}
+
+function createClientIdentity(index) {
+    const ordinal = index + 1;
+    const usernameSuffix = String(ordinal);
+    const usernameBase = usernamePrefix.slice(0, Math.max(0, 16 - usernameSuffix.length));
+    const username = `${usernameBase}${usernameSuffix}`;
+    if (!/^[A-Za-z0-9_]{1,16}$/u.test(username)) {
+        throw new Error(
+            `GAIUS_BROWSER_FULL_PATH_USERNAME_PREFIX produced invalid username ${username}`);
+    }
+    const profileId = `00000000000040008000${(index + 2).toString(16).padStart(12, "0")}`;
+    assert.match(profileId, /^[0-9a-f]{32}$/u, "smoke profile UUID must be 32 hex digits");
+    return Object.freeze({
+        username,
+        profileId,
+        accessToken: `${relayToken}-${ordinal}`,
+    });
+}
+
 class BrowserMinecraftClient {
     constructor(options) {
         Object.assign(this, options);
-        this.username = `${usernamePrefix}${options.index + 1}`.slice(0, 16);
-        this.profileId = `0000000000004000800000000000000${options.index + 2}`;
-        this.accessToken = `${relayToken}-${options.index + 1}`;
+        this.username = options.identity.username;
+        this.profileId = options.identity.profileId;
+        this.accessToken = options.identity.accessToken;
         this.phase = "login";
         this.buffer = Buffer.alloc(0);
         this.cipher = undefined;
@@ -1104,14 +2460,48 @@ class BrowserMinecraftClient {
         this.playPacketIds = [];
         this.playDisconnectPayloadBase64 = undefined;
         this.playLoginPackets = 0;
+        this.playLoginDistanceContracts = 0;
+        this.playLoginChunkRadius = undefined;
+        this.playLoginSimulationDistance = undefined;
         this.chunkPackets = 0;
+        this.uniqueChunkPositions = new Set();
+        // Extreme evidence begins only after the server has explicitly sent
+        // its cache-radius and simulation-distance contract.  Keeping this
+        // separate from all observed chunks prevents an early/default window
+        // from being counted toward the radius-8 / 257-chunk target.
+        this.stressQualifiedChunkPositions = new Set();
+        this.chunkPacketsBeforeDistanceContract = 0;
+        this.duplicateChunkPackets = 0;
+        this.chunkBounds = undefined;
+        this.observedChunkCacheCenter = undefined;
+        this.observedChunkCacheRadius = undefined;
+        this.observedSimulationDistance = undefined;
+        this.chunkCacheCenterUpdates = 0;
+        this.chunkCacheRadiusUpdates = 0;
+        this.simulationDistanceUpdates = 0;
+        this.chunkBatchStarts = 0;
+        this.chunkBatchFinished = 0;
+        this.chunkBatchAcknowledgements = 0;
+        this.chunkBatchProtocolErrors = 0;
+        this.chunkBatchCountMismatches = 0;
+        this.chunkBatchOpen = false;
+        this.currentChunkBatchPackets = 0;
+        this.chunkBatches = [];
         this.playTickPackets = 0;
+        this.playTickActive = false;
+        this.playTickSuspended = false;
+        this.nextPlayTickDueAt = undefined;
+        this.playTickSkippedPeriods = 0;
         this.playTickTimer = undefined;
         this.playerLoadedSent = false;
         this.connectPhases = [];
         this.failure = undefined;
         this.closed = false;
         this.pollingPaused = false;
+        // Shared poll scheduler state. The scheduler mirrors its own due map
+        // into this field for diagnostics and for clients that can be observed
+        // without a bridge-specific side table.
+        this.nextPollDueAt = performance.now();
         this.startedAt = performance.now();
         this.connectStartedAt = undefined;
         this.relayConnectedAt = undefined;
@@ -1127,6 +2517,10 @@ class BrowserMinecraftClient {
         this.closeReason = undefined;
         this.inboundFrames = 0;
         this.inboundBytes = 0;
+        this.maxInboundFramesPerPoll = 0;
+        this.maxPacketsPerPoll = 0;
+        this.inboundFrameBudgetYields = 0;
+        this.packetBudgetYields = 0;
         this.outboundFrames = 0;
         this.outboundBytes = 0;
         this.decodedPackets = 0;
@@ -1134,6 +2528,7 @@ class BrowserMinecraftClient {
         this.lastPollAt = undefined;
         this.pollGapSamples = 0;
         this.maxPollGapMillis = 0;
+        this.pollGapHistogram = createLatencyHistogram();
         this.lastInboundPacketAt = undefined;
         this.inboundPacketGapSamples = 0;
         this.maxInboundPacketGapMillis = 0;
@@ -1142,9 +2537,12 @@ class BrowserMinecraftClient {
         this.maxPlayPacketGapMillis = 0;
         this.preMinimumChunkPacketGapSamples = 0;
         this.maxPreMinimumChunkPacketGapMillis = 0;
+        this.preMinimumChunkGapHistogram = createLatencyHistogram();
+        this.lastChunkPacketAt = undefined;
         this.lastPlayTickAt = undefined;
         this.playTickGapSamples = 0;
         this.maxPlayTickGapMillis = 0;
+        this.playTickGapHistogram = createLatencyHistogram();
     }
 
     async connect() {
@@ -1170,6 +2568,58 @@ class BrowserMinecraftClient {
         this.handshakeSentAt = performance.now();
     }
 
+    hasImmediateInbound() {
+        // A complete outer frame in the local cumulation is an immediate
+        // wake-up.  A split/partial frame is deliberately *not* immediate:
+        // without another bridge chunk it would make the shared scheduler
+        // recurse through setImmediate forever while parsePackets has no new
+        // bytes to consume.  Partial bytes remain visible through
+        // hasPendingInbound() and are retried on the normal due cadence.
+        if (this.buffer.byteLength > 0) {
+            try {
+                const outerLength = decodeVarInt(this.buffer, 0);
+                if (outerLength === undefined) {
+                    // Split length VarInt; ask the bridge below whether the
+                    // remaining bytes have already arrived in its queue.
+                }
+                else {
+                    const frameEnd = outerLength.bytesRead + outerLength.value;
+                    if (outerLength.value < 0 || !Number.isSafeInteger(frameEnd)) {
+                        // Let poll()/parsePackets() raise the concrete framing
+                        // error instead of parking malformed input forever.
+                        return true;
+                    }
+                    if (frameEnd <= this.buffer.byteLength) return true;
+                }
+            }
+            catch {
+                // Malformed VarInts are ready for poll() to report; do not
+                // hide a protocol error behind the due-time fallback.
+                return true;
+            }
+        }
+        try {
+            return !!this.bridge.hasPendingInbound(this.id);
+        }
+        catch {
+            // A bridge race is treated as ready; poll() captures the concrete
+            // transport error instead of parking a client indefinitely.
+            return true;
+        }
+    }
+
+    hasPendingInbound() {
+        if (this.buffer.byteLength > 0) return true;
+        try {
+            return !!this.bridge.hasPendingInbound(this.id);
+        }
+        catch {
+            // A bridge race is treated as ready so a transient failure cannot
+            // starve protocol progress; poll() will capture the real error.
+            return true;
+        }
+    }
+
     poll() {
         if (this.closed || this.pollingPaused) return;
         try {
@@ -1180,12 +2630,19 @@ class BrowserMinecraftClient {
                     this.maxPollGapMillis,
                     polledAt - this.lastPollAt,
                 );
+                observeLatency(this.pollGapHistogram, polledAt - this.lastPollAt);
             }
             this.lastPollAt = polledAt;
             this.checkError();
             this.recordPhases();
+            let framesPolled = 0;
+            let packetsRemaining = MAX_PACKETS_PER_POLL;
+            const parsedBeforeInbound = this.parsePackets(packetsRemaining);
+            packetsRemaining -= parsedBeforeInbound;
             let chunk;
-            while ((chunk = this.bridge.pollInbound(this.id)) !== null) {
+            while (framesPolled < MAX_INBOUND_FRAMES_PER_POLL &&
+                packetsRemaining > 0 &&
+                (chunk = this.bridge.pollInbound(this.id)) !== null) {
                 const bytes = Buffer.from(chunk);
                 this.buffer = Buffer.concat([
                     this.buffer,
@@ -1197,7 +2654,18 @@ class BrowserMinecraftClient {
                     this.maximumBufferedBytes,
                     this.buffer.byteLength,
                 );
-                this.parsePackets();
+                framesPolled++;
+                packetsRemaining -= this.parsePackets(packetsRemaining);
+            }
+            const packetsParsed = MAX_PACKETS_PER_POLL - packetsRemaining;
+            this.maxInboundFramesPerPoll = Math.max(this.maxInboundFramesPerPoll, framesPolled);
+            this.maxPacketsPerPoll = Math.max(this.maxPacketsPerPoll, packetsParsed);
+            if (framesPolled === MAX_INBOUND_FRAMES_PER_POLL &&
+                this.bridge.hasPendingInbound(this.id)) {
+                this.inboundFrameBudgetYields++;
+            }
+            if (packetsRemaining === 0 && this.buffer.byteLength > 0) {
+                this.packetBudgetYields++;
             }
         }
         catch (error) {
@@ -1205,13 +2673,14 @@ class BrowserMinecraftClient {
         }
     }
 
-    parsePackets() {
-        while (true) {
+    parsePackets(maximumPackets = Number.POSITIVE_INFINITY) {
+        let parsedPackets = 0;
+        while (parsedPackets < maximumPackets) {
             const outerLength = decodeVarInt(this.buffer, 0);
-            if (outerLength === undefined) return;
+            if (outerLength === undefined) return parsedPackets;
             const frameStart = outerLength.bytesRead;
             const frameEnd = frameStart + outerLength.value;
-            if (frameEnd > this.buffer.byteLength) return;
+            if (frameEnd > this.buffer.byteLength) return parsedPackets;
             let frame = this.buffer.subarray(frameStart, frameEnd);
             this.buffer = this.buffer.subarray(frameEnd);
             if (this.compressionThreshold !== undefined) {
@@ -1230,6 +2699,7 @@ class BrowserMinecraftClient {
             const packetId = decodeVarInt(frame, 0);
             if (packetId === undefined) throw new Error("packet omitted id");
             this.decodedPackets++;
+            parsedPackets++;
             const packetAt = performance.now();
             if (this.lastInboundPacketAt !== undefined) {
                 this.inboundPacketGapSamples++;
@@ -1247,19 +2717,13 @@ class BrowserMinecraftClient {
                         this.maxPlayPacketGapMillis,
                         playGap,
                     );
-                    if (this.chunkPackets < minimumChunkPackets) {
-                        this.preMinimumChunkPacketGapSamples++;
-                        this.maxPreMinimumChunkPacketGapMillis = Math.max(
-                            this.maxPreMinimumChunkPacketGapMillis,
-                            playGap,
-                        );
-                    }
                 }
                 this.lastPlayPacketAt = packetAt;
             }
             this.handlePacket(packetId.value, frame.subarray(packetId.bytesRead));
             if (this.failure !== undefined) throw this.failure;
         }
+        return parsedPackets;
     }
 
     handlePacket(packetId, payload) {
@@ -1384,18 +2848,114 @@ class BrowserMinecraftClient {
         else if (packetId === this.profile.play.clientboundLogin) {
             this.playLoginPackets++;
             this.playLoginAt ??= performance.now();
+            const initialDistances = decodeClientboundLoginDistances(payload);
+            this.playLoginDistanceContracts++;
+            this.playLoginChunkRadius = initialDistances.chunkRadius;
+            this.playLoginSimulationDistance = initialDistances.simulationDistance;
+            this.observedChunkCacheRadius = initialDistances.chunkRadius;
+            this.observedSimulationDistance = initialDistances.simulationDistance;
+            this.chunkCacheRadiusUpdates++;
+            this.simulationDistanceUpdates++;
+            if (stressMode &&
+                (initialDistances.chunkRadius !== stressTarget.serverViewDistance ||
+                    initialDistances.simulationDistance !== stressTarget.simulationDistance)) {
+                throw new Error(
+                    `${this.username}: PLAY login distance contract ` +
+                    `${initialDistances.chunkRadius}/${initialDistances.simulationDistance}, ` +
+                    `expected ${stressTarget.serverViewDistance}/` +
+                    `${stressTarget.simulationDistance}`,
+                );
+            }
             if (!this.playerLoadedSent) {
                 this.playerLoadedSent = true;
                 this.sendPacket(this.profile.play.serverboundPlayerLoaded, Buffer.alloc(0));
             }
             this.startPlayTickLoop();
         }
-        else if (packetId === this.profile.play.clientboundChunk) {
-            this.chunkPackets++;
-            this.firstChunkAt ??= performance.now();
-            if (this.chunkPackets >= minimumChunkPackets) {
-                this.minimumChunksAt ??= performance.now();
+        else if (packetId === this.profile.play.clientboundSetChunkCacheCenter) {
+            const x = decodeVarInt(payload, 0);
+            const z = x === undefined ? undefined : decodeVarInt(payload, x.bytesRead);
+            if (x === undefined || z === undefined ||
+                x.bytesRead + z.bytesRead !== payload.byteLength) {
+                throw new Error(`${this.username}: malformed chunk-cache center`);
             }
+            this.observedChunkCacheCenter = {
+                x: signedVarInt(x.value),
+                z: signedVarInt(z.value),
+            };
+            this.chunkCacheCenterUpdates++;
+        }
+        else if (packetId === this.profile.play.clientboundSetChunkCacheRadius) {
+            const radius = decodeVarInt(payload, 0);
+            if (radius === undefined || radius.bytesRead !== payload.byteLength ||
+                radius.value < 2 || radius.value > 32) {
+                throw new Error(`${this.username}: malformed chunk-cache radius`);
+            }
+            this.observedChunkCacheRadius = radius.value;
+            this.chunkCacheRadiusUpdates++;
+            if (stressMode && radius.value !== stressTarget.serverViewDistance) {
+                throw new Error(`${this.username}: observed chunk-cache radius ` +
+                    `${radius.value}, expected ${stressTarget.serverViewDistance}`);
+            }
+        }
+        else if (packetId === this.profile.play.clientboundSetSimulationDistance) {
+            const distance = decodeVarInt(payload, 0);
+            if (distance === undefined || distance.bytesRead !== payload.byteLength ||
+                distance.value < 2 || distance.value > 32) {
+                throw new Error(`${this.username}: malformed simulation distance`);
+            }
+            this.observedSimulationDistance = distance.value;
+            this.simulationDistanceUpdates++;
+            if (stressMode && distance.value !== stressTarget.simulationDistance) {
+                throw new Error(`${this.username}: observed simulation distance ` +
+                    `${distance.value}, expected ${stressTarget.simulationDistance}`);
+            }
+        }
+        else if (packetId === this.profile.play.clientboundChunkBatchStart) {
+            if (payload.byteLength !== 0) {
+                this.chunkBatchProtocolErrors++;
+                throw new Error(`${this.username}: chunk-batch start had a payload`);
+            }
+            if (this.chunkBatchOpen) {
+                this.chunkBatchProtocolErrors++;
+                throw new Error(`${this.username}: chunk-batch start repeated before finish`);
+            }
+            this.chunkBatchStarts++;
+            this.chunkBatchOpen = true;
+            this.currentChunkBatchPackets = 0;
+        }
+        else if (packetId === this.profile.play.clientboundChunkBatchFinished) {
+            const advertised = decodeVarInt(payload, 0);
+            if (advertised === undefined || advertised.value < 0 ||
+                advertised.bytesRead !== payload.byteLength) {
+                this.chunkBatchProtocolErrors++;
+                throw new Error(`${this.username}: malformed chunk-batch finish`);
+            }
+            if (!this.chunkBatchOpen) {
+                this.chunkBatchProtocolErrors++;
+                throw new Error(`${this.username}: chunk-batch finish arrived without start`);
+            }
+            this.chunkBatchFinished++;
+            this.chunkBatchOpen = false;
+            const countMatches = advertised.value === this.currentChunkBatchPackets;
+            if (!countMatches) this.chunkBatchCountMismatches++;
+            const acknowledgement = Buffer.allocUnsafe(4);
+            acknowledgement.writeFloatBE(desiredChunksPerTick, 0);
+            this.sendPacket(this.profile.play.serverboundChunkBatchReceived, acknowledgement);
+            this.chunkBatchAcknowledgements++;
+            if (this.chunkBatches.length < 64) {
+                this.chunkBatches.push({
+                    index: this.chunkBatchFinished,
+                    advertisedChunkCount: advertised.value,
+                    observedChunkPackets: this.currentChunkBatchPackets,
+                    countMatches,
+                    desiredChunksPerTick,
+                });
+            }
+            this.currentChunkBatchPackets = 0;
+        }
+        else if (packetId === this.profile.play.clientboundChunk) {
+            this.recordChunkPacket(payload);
         }
         else if (packetId === this.profile.play.clientboundStartConfiguration) {
             if (payload.byteLength !== 0) throw new Error("PLAY start-configuration had payload");
@@ -1404,6 +2964,112 @@ class BrowserMinecraftClient {
             this.phase = "configuration";
             this.sendPacket(this.profile.play.serverboundConfigurationAcknowledged, Buffer.alloc(0));
         }
+    }
+
+    recordChunkPacket(payload) {
+        if (payload.byteLength < 8) {
+            throw new Error(`${this.username}: chunk packet omitted coordinates`);
+        }
+        const x = payload.readInt32BE(0);
+        const z = payload.readInt32BE(4);
+        const key = `${x},${z}`;
+        const packetAt = performance.now();
+        const targetAlreadyReached = this.minimumChunkTargetReached();
+        if (this.lastChunkPacketAt !== undefined && !targetAlreadyReached) {
+            const chunkGap = packetAt - this.lastChunkPacketAt;
+            this.preMinimumChunkPacketGapSamples++;
+            this.maxPreMinimumChunkPacketGapMillis = Math.max(
+                this.maxPreMinimumChunkPacketGapMillis,
+                chunkGap,
+            );
+            observeLatency(this.preMinimumChunkGapHistogram, chunkGap);
+        }
+        this.lastChunkPacketAt = packetAt;
+        this.chunkPackets++;
+        if (this.chunkBatchOpen) this.currentChunkBatchPackets++;
+        if (stressMode) {
+            const distanceContractReady =
+                this.observedChunkCacheRadius === stressTarget.serverViewDistance &&
+                this.observedSimulationDistance === stressTarget.simulationDistance;
+            if (distanceContractReady) this.stressQualifiedChunkPositions.add(key);
+            else this.chunkPacketsBeforeDistanceContract++;
+        }
+        if (this.uniqueChunkPositions.has(key)) {
+            this.duplicateChunkPackets++;
+        }
+        else {
+            this.uniqueChunkPositions.add(key);
+            if (this.chunkBounds === undefined) {
+                this.chunkBounds = { minX: x, maxX: x, minZ: z, maxZ: z };
+            }
+            else {
+                this.chunkBounds.minX = Math.min(this.chunkBounds.minX, x);
+                this.chunkBounds.maxX = Math.max(this.chunkBounds.maxX, x);
+                this.chunkBounds.minZ = Math.min(this.chunkBounds.minZ, z);
+                this.chunkBounds.maxZ = Math.max(this.chunkBounds.maxZ, z);
+            }
+        }
+        this.firstChunkAt ??= packetAt;
+        if (this.minimumChunkTargetReached()) {
+            this.minimumChunksAt ??= packetAt;
+        }
+    }
+
+    minimumChunkTargetReached() {
+        return stressMode
+            ? this.observedChunkCacheRadius === serverViewDistance &&
+                this.observedSimulationDistance === stressTarget.simulationDistance &&
+                this.stressQualifiedChunkPositions.size >= minimumChunkPackets
+            : this.chunkPackets >= minimumChunkPackets;
+    }
+
+    chunkWindowResult() {
+        const bounds = this.chunkBounds === undefined ? null : { ...this.chunkBounds };
+        const spanX = bounds === null ? 0 : bounds.maxX - bounds.minX + 1;
+        const spanZ = bounds === null ? 0 : bounds.maxZ - bounds.minZ + 1;
+        return {
+            configuredClientViewDistance: clientViewDistance,
+            configuredServerViewDistance: serverViewDistance,
+            effectiveRadius: effectiveChunkRadius,
+            maximumUniqueChunkCapacity,
+            observedChunkCacheCenter: this.observedChunkCacheCenter === undefined
+                ? null : { ...this.observedChunkCacheCenter },
+            observedChunkCacheRadius: this.observedChunkCacheRadius ?? null,
+            observedSimulationDistance: this.observedSimulationDistance ?? null,
+            observedMaximumUniqueChunkCapacity:
+                this.observedChunkCacheRadius === undefined
+                    ? null : chunkTrackingCapacity(this.observedChunkCacheRadius),
+            chunkCacheCenterUpdates: this.chunkCacheCenterUpdates,
+            chunkCacheRadiusUpdates: this.chunkCacheRadiusUpdates,
+            simulationDistanceUpdates: this.simulationDistanceUpdates,
+            uniqueChunkPositions: this.uniqueChunkPositions.size,
+            uniqueChunkPositionsTowardTarget: stressMode
+                ? this.stressQualifiedChunkPositions.size
+                : this.uniqueChunkPositions.size,
+            chunkPacketsBeforeDistanceContract: this.chunkPacketsBeforeDistanceContract,
+            duplicateChunkPackets: this.duplicateChunkPackets,
+            bounds,
+            spanX,
+            spanZ,
+            observedRadiusLowerBound: Math.ceil(Math.max(0, Math.max(spanX, spanZ) - 1) / 2),
+        };
+    }
+
+    chunkBatchResult() {
+        return {
+            clientboundStartPacketId: this.profile.play.clientboundChunkBatchStart,
+            clientboundFinishedPacketId: this.profile.play.clientboundChunkBatchFinished,
+            serverboundAcknowledgementPacketId:
+                this.profile.play.serverboundChunkBatchReceived,
+            desiredChunksPerTick,
+            starts: this.chunkBatchStarts,
+            finished: this.chunkBatchFinished,
+            acknowledgements: this.chunkBatchAcknowledgements,
+            protocolErrors: this.chunkBatchProtocolErrors,
+            countMismatches: this.chunkBatchCountMismatches,
+            openAtSnapshot: this.chunkBatchOpen,
+            retainedBatches: this.chunkBatches.map((batch) => ({ ...batch })),
+        };
     }
 
     async answerEncryptionRequest(payload) {
@@ -1464,34 +3130,78 @@ class BrowserMinecraftClient {
         this.outboundBytes += wire.byteLength;
     }
 
+    servicePlayTick(now = performance.now()) {
+        if (!this.playTickActive || this.closed || this.failure !== undefined ||
+            this.phase !== "play") return false;
+        if (this.pollingPaused) {
+            this.playTickSuspended = true;
+            this.nextPlayTickDueAt = undefined;
+            return false;
+        }
+        if (this.playTickSuspended) {
+            // A transport-drop pause is intentional. Do not charge the paused
+            // interval to the strict PLAY tick histogram when the channel is
+            // resumed by a caller.
+            this.playTickSuspended = false;
+            this.lastPlayTickAt = undefined;
+            this.nextPlayTickDueAt = now;
+        }
+        const dueAt = Number(this.nextPlayTickDueAt);
+        if (!Number.isFinite(dueAt) || now < dueAt) return false;
+        try {
+            const tickAt = performance.now();
+            if (this.lastPlayTickAt !== undefined) {
+                this.playTickGapSamples++;
+                this.maxPlayTickGapMillis = Math.max(
+                    this.maxPlayTickGapMillis,
+                    tickAt - this.lastPlayTickAt,
+                );
+                observeLatency(this.playTickGapHistogram, tickAt - this.lastPlayTickAt);
+            }
+            this.lastPlayTickAt = tickAt;
+            this.sendPacket(this.profile.play.serverboundClientTickEnd, Buffer.alloc(0));
+            this.playTickPackets++;
+            // Preserve the 50 ms cadence without catch-up bursts after a long
+            // event-loop turn. Count skipped periods for diagnostics and
+            // re-anchor the next due time to the observed clock.
+            const periodMillis = 50;
+            const nextDueAt = dueAt + periodMillis;
+            if (nextDueAt < tickAt) {
+                this.playTickSkippedPeriods += Math.max(1,
+                    Math.ceil((tickAt - nextDueAt) / periodMillis));
+                this.nextPlayTickDueAt = tickAt + periodMillis;
+            }
+            else {
+                this.nextPlayTickDueAt = nextDueAt;
+            }
+            return true;
+        }
+        catch (error) {
+            this.failure ??= error;
+            return false;
+        }
+    }
+
     startPlayTickLoop() {
-        if (this.playTickTimer !== undefined) return;
-        const sendTick = () => {
-            if (this.closed || this.failure !== undefined || this.phase !== "play") return;
-            try {
-                const tickAt = performance.now();
-                if (this.lastPlayTickAt !== undefined) {
-                    this.playTickGapSamples++;
-                    this.maxPlayTickGapMillis = Math.max(
-                        this.maxPlayTickGapMillis,
-                        tickAt - this.lastPlayTickAt,
-                    );
-                }
-                this.lastPlayTickAt = tickAt;
-                this.sendPacket(this.profile.play.serverboundClientTickEnd, Buffer.alloc(0));
-                this.playTickPackets++;
-            }
-            catch (error) {
-                this.failure ??= error;
-            }
-        };
-        sendTick();
-        this.playTickTimer = setInterval(sendTick, 50);
+        if (this.playTickActive) return;
+        this.playTickActive = true;
+        this.playTickSuspended = false;
+        this.nextPlayTickDueAt = performance.now();
+        // Preserve the vanilla immediate first tick; subsequent ticks are
+        // serviced by the shared fair poll scheduler.
+        this.servicePlayTick(performance.now());
     }
 
     stopPlayTickLoop() {
-        if (this.playTickTimer === undefined) return;
-        clearInterval(this.playTickTimer);
+        this.playTickActive = false;
+        this.playTickSuspended = false;
+        this.nextPlayTickDueAt = undefined;
+        // A stopped/reconnected client starts a fresh cadence.  Retaining the
+        // previous timestamp would charge the transport-drop interval to the
+        // next PLAY tick gap and create a synthetic strict-latency violation.
+        this.lastPlayTickAt = undefined;
+        // Kept as an explicit undefined compatibility marker for diagnostics;
+        // no per-client timer is allocated by the shared scheduler.
         this.playTickTimer = undefined;
     }
 
@@ -1520,6 +3230,9 @@ class BrowserMinecraftClient {
     pausePollingForTransportDrop() {
         assert.equal(this.closed, false, "cannot pause a closed reconnect client");
         this.pollingPaused = true;
+        this.playTickSuspended = true;
+        this.nextPlayTickDueAt = undefined;
+        this.lastPlayTickAt = undefined;
     }
 
     diagnostics() {
@@ -1549,8 +3262,19 @@ class BrowserMinecraftClient {
             playPacketIds: [...this.playPacketIds],
             playDisconnectPayloadBase64: this.playDisconnectPayloadBase64 ?? null,
             playLoginPackets: this.playLoginPackets,
+            playLoginDistanceContracts: this.playLoginDistanceContracts,
+            playLoginChunkRadius: this.playLoginChunkRadius ?? null,
+            playLoginSimulationDistance: this.playLoginSimulationDistance ?? null,
             chunkPackets: this.chunkPackets,
+            uniqueChunkPositions: this.uniqueChunkPositions.size,
+            chunkWindow: this.chunkWindowResult(),
+            chunkBatch: this.chunkBatchResult(),
             playTickPackets: this.playTickPackets,
+            playTickActive: this.playTickActive,
+            playTickSuspended: this.playTickSuspended,
+            nextPlayTickDueAt: Number.isFinite(this.nextPlayTickDueAt)
+                ? Number(this.nextPlayTickDueAt.toFixed(3)) : null,
+            playTickSkippedPeriods: this.playTickSkippedPeriods,
             bufferedBytes: this.buffer.byteLength,
             minimumChunkPackets,
             inboundFrames: this.inboundFrames,
@@ -1658,16 +3382,33 @@ class BrowserMinecraftClient {
         return {
             pollGapSamples: this.pollGapSamples,
             maxPollGapMillis: Number(this.maxPollGapMillis.toFixed(3)),
+            maxPollGapRawMillis: this.maxPollGapMillis,
+            pollGapHistogram: latencyHistogramResult(this.pollGapHistogram),
             inboundPacketGapSamples: this.inboundPacketGapSamples,
             maxInboundPacketGapMillis: Number(this.maxInboundPacketGapMillis.toFixed(3)),
+            maxInboundPacketGapRawMillis: this.maxInboundPacketGapMillis,
             playPacketGapSamples: this.playPacketGapSamples,
             maxPlayPacketGapMillis: Number(this.maxPlayPacketGapMillis.toFixed(3)),
+            maxPlayPacketGapRawMillis: this.maxPlayPacketGapMillis,
             preMinimumChunkPacketGapSamples: this.preMinimumChunkPacketGapSamples,
             maxPreMinimumChunkPacketGapMillis:
                 Number(this.maxPreMinimumChunkPacketGapMillis.toFixed(3)),
+            maxPreMinimumChunkPacketGapRawMillis: this.maxPreMinimumChunkPacketGapMillis,
+            preMinimumChunkGapHistogram:
+                latencyHistogramResult(this.preMinimumChunkGapHistogram),
             playTickGapSamples: this.playTickGapSamples,
             maxPlayTickGapMillis: Number(this.maxPlayTickGapMillis.toFixed(3)),
+            maxPlayTickGapRawMillis: this.maxPlayTickGapMillis,
+            playTickGapHistogram: latencyHistogramResult(this.playTickGapHistogram),
             maximumBufferedBytes: this.maximumBufferedBytes,
+            inboundDrainBudget: {
+                maxFramesPerPoll: MAX_INBOUND_FRAMES_PER_POLL,
+                maxPacketsPerPoll: MAX_PACKETS_PER_POLL,
+                observedMaxFramesPerPoll: this.maxInboundFramesPerPoll,
+                observedMaxPacketsPerPoll: this.maxPacketsPerPoll,
+                frameBudgetYields: this.inboundFrameBudgetYields,
+                packetBudgetYields: this.packetBudgetYields,
+            },
         };
     }
 
@@ -1742,8 +3483,17 @@ function sessionRuntimeSnapshot(state) {
 }
 
 function browserRuntimeSnapshot(runtime) {
+    const activeEntries = [...runtime.bridge.channels.values()];
+    const sampledAt = performance.now();
+    const activeHighWatermarkLongestMillis = activeEntries.reduce((longest, entry) =>
+        entry.highWatermarkStartedAt > 0
+            ? Math.max(longest, sampledAt - entry.highWatermarkStartedAt)
+            : longest, 0);
     const snapshot = {
         activeChannels: runtime.bridge.channels.size,
+        flowPausedChannels: activeEntries.filter((entry) => entry.flowPaused).length,
+        decodeFlowPausedChannels:
+            activeEntries.filter((entry) => entry.decodeFlowPaused).length,
         activeWebSockets: runtime.wsStats.sockets.size,
         webSocketConnections: runtime.wsStats.connections,
         queuedBytes: runtime.stats.queuedBytes,
@@ -1753,6 +3503,82 @@ function browserRuntimeSnapshot(runtime) {
         peakInboundQueuedBytes: runtime.stats.peakInboundQueuedBytes,
         maxDecodedSliceBacklog: runtime.stats.maxDecodedSliceBacklog,
         longestEventLoopGapMillis: runtime.stats.longestEventLoopGapMillis,
+        // These values are emitted by the Java global pump when the generated
+        // BrowserWebSocketChannel includes that telemetry. Keep null for an
+        // older classlib/runtime so evidence distinguishes absent from zero.
+        pumpAllTurns: Object.prototype.hasOwnProperty.call(runtime.stats,
+            "pumpAllTurns") ? runtime.stats.pumpAllTurns : null,
+        pumpAllChannelsVisited: Object.prototype.hasOwnProperty.call(runtime.stats,
+            "pumpAllChannelsVisited") ? runtime.stats.pumpAllChannelsVisited : null,
+        pumpAllBudgetYields: Object.prototype.hasOwnProperty.call(runtime.stats,
+            "pumpAllBudgetYields") ? runtime.stats.pumpAllBudgetYields : null,
+        pumpAllMaxTurnMillis: Object.prototype.hasOwnProperty.call(runtime.stats,
+            "pumpAllMaxTurnMillis") ? runtime.stats.pumpAllMaxTurnMillis : null,
+        pumpAllMaxChannelsPerTurn: Object.prototype.hasOwnProperty.call(runtime.stats,
+            "pumpAllMaxChannelsPerTurn") ? runtime.stats.pumpAllMaxChannelsPerTurn : null,
+        pumpAllLastTurnMillis: Object.prototype.hasOwnProperty.call(runtime.stats,
+            "pumpAllLastTurnMillis") ? runtime.stats.pumpAllLastTurnMillis : null,
+        pumpAllLastChannelsVisited: Object.prototype.hasOwnProperty.call(runtime.stats,
+            "pumpAllLastChannelsVisited") ? runtime.stats.pumpAllLastChannelsVisited : null,
+        outboundTurns: runtime.stats.outboundTurns,
+        outboundTurnFrames: runtime.stats.outboundTurnFrames,
+        outboundTurnBytes: runtime.stats.outboundTurnBytes,
+        outboundYields: runtime.stats.outboundYields,
+        maxOutboundTurnMillis: runtime.stats.maxOutboundTurnMillis,
+        webSocketBackpressureWaits: runtime.stats.webSocketBackpressureWaits,
+        outboundBackpressureDeferrals: runtime.stats.outboundBackpressureDeferrals,
+        outboundImmediateFlushes: runtime.stats.outboundImmediateFlushes ?? null,
+        outboundTimerFlushes: runtime.stats.outboundTimerFlushes ?? null,
+        outboundContinuationTimers: runtime.stats.outboundContinuationTimers ?? null,
+        outboundMessageChannelFlushes:
+            runtime.stats.outboundMessageChannelFlushes ?? null,
+        outboundMessageChannelCallbacks:
+            runtime.stats.outboundMessageChannelCallbacks ?? null,
+        outboundContinuationMacrotasks:
+            runtime.stats.outboundContinuationMacrotasks ?? null,
+        outboundFlushWaitSamples: runtime.stats.outboundFlushWaitSamples ?? null,
+        maxOutboundFlushWaitMillis: runtime.stats.maxOutboundFlushWaitMillis ?? null,
+        outboundEmptyTurns: runtime.stats.outboundEmptyTurns ?? null,
+        inboundImmediateSchedules: runtime.stats.inboundImmediateSchedules ?? null,
+        inboundRafSchedules: runtime.stats.inboundRafSchedules ?? null,
+        inboundTimerSchedules: runtime.stats.inboundTimerSchedules ?? null,
+        inboundSliceScheduleWaitSamples:
+            runtime.stats.inboundSliceScheduleWaitSamples ?? null,
+        maxInboundSliceScheduleWaitMillis:
+            runtime.stats.maxInboundSliceScheduleWaitMillis ?? null,
+        longestInboundSlicePumpMillis: runtime.stats.longestInboundSlicePumpMillis,
+        longestPumpMillis: runtime.stats.longestPumpMillis,
+        peakPumpMillis: runtime.stats.peakPumpMillis,
+        maxDecoderCumulationBytes: runtime.stats.maxDecoderCumulationBytes,
+        maxDecodedPacketQueue: runtime.stats.maxDecodedPacketQueue,
+        decodedSliceBacklogPauses: runtime.stats.decodedSliceBacklogPauses,
+        decodedSliceBacklogResumes: runtime.stats.decodedSliceBacklogResumes,
+        inlineDecodedPackets: runtime.stats.inlineDecodedPackets,
+        queuedPacketHandleSamples: runtime.stats.queuedPacketHandleSamples ?? null,
+        maxQueuedPacketHandleMillis: runtime.stats.maxQueuedPacketHandleMillis ?? null,
+        maxQueuedPacketHandleType:
+            typeof runtime.stats.maxQueuedPacketHandleType === "string"
+                ? runtime.stats.maxQueuedPacketHandleType
+                : null,
+        slowQueuedPacketEventSequence:
+            runtime.stats.slowQueuedPacketEventSequence ?? null,
+        slowQueuedPacketEventsDropped:
+            runtime.stats.slowQueuedPacketEventsDropped ?? null,
+        slowQueuedPacketEvents: Array.isArray(runtime.stats.slowQueuedPacketEvents)
+            ? runtime.stats.slowQueuedPacketEvents
+                .slice(-BROWSER_QUEUED_PACKET_SLOW_EVENT_LIMIT)
+                .map((event) => ({ ...event }))
+            : null,
+        highWatermarkDurationMillis: runtime.stats.highWatermarkDurationMillis,
+        longestHighWatermarkMillis: runtime.stats.longestHighWatermarkMillis,
+        activeHighWatermarkLongestMillis,
+        highWatermarkEventSequence: runtime.stats.highWatermarkEventSequence ?? null,
+        highWatermarkEventsDropped: runtime.stats.highWatermarkEventsDropped ?? null,
+        highWatermarkEvents: Array.isArray(runtime.stats.highWatermarkEvents)
+            ? runtime.stats.highWatermarkEvents.map((event) => ({ ...event }))
+            : null,
+        flowPauses: runtime.stats.flowPauses,
+        flowResumes: runtime.stats.flowResumes,
         activeRelayTargetLeases: runtime.stats.activeRelayTargetLeases,
         relayTargetAttestationFailures: runtime.stats.relayTargetAttestationFailures,
     };
@@ -1762,6 +3588,314 @@ function browserRuntimeSnapshot(runtime) {
         }
     }
     return snapshot;
+}
+
+function browserGlobalPumpTelemetryEvidence(snapshot) {
+    const observed = Object.fromEntries(BROWSER_GLOBAL_PUMP_TELEMETRY_FIELDS.map((name) => [
+        name,
+        snapshot !== undefined && Object.prototype.hasOwnProperty.call(snapshot, name)
+            ? snapshot[name]
+            : null,
+    ]));
+    const missing = BROWSER_GLOBAL_PUMP_TELEMETRY_FIELDS.filter((name) =>
+        observed[name] === null || observed[name] === undefined);
+    return {
+        source: "BrowserWebSocketChannel.pumpAllAndReportProgress",
+        fields: [...BROWSER_GLOBAL_PUMP_TELEMETRY_FIELDS],
+        observed,
+        missing,
+        available: missing.length === 0,
+        maxTotalMillis: BROWSER_GLOBAL_PUMP_MAX_TOTAL_MILLIS,
+        note: missing.length === 0
+            ? "Java global-pump telemetry observed directly"
+            : "Generated class omitted one or more Java global-pump fields; null preserved",
+    };
+}
+
+function browserInboundFlowEvidence(snapshot, label) {
+    const observed = Object.fromEntries(BROWSER_INBOUND_FLOW_EVIDENCE_FIELDS.map((name) => [
+        name,
+        snapshot !== undefined && Object.prototype.hasOwnProperty.call(snapshot, name)
+            ? snapshot[name]
+            : null,
+    ]));
+    const missing = BROWSER_INBOUND_FLOW_EVIDENCE_FIELDS.filter((name) => {
+        const value = observed[name];
+        return BROWSER_INBOUND_FLOW_DURATION_FIELDS.has(name)
+            ? !Number.isFinite(value) || value < 0
+            : !Number.isSafeInteger(value) || value < 0;
+    });
+    const lifetimeMaximumPauseMillis = missing.length === 0
+        ? Math.max(
+            observed.longestHighWatermarkMillis,
+            observed.activeHighWatermarkLongestMillis,
+        )
+        : null;
+    const lifetimeWithinPauseLimit = lifetimeMaximumPauseMillis !== null &&
+        lifetimeMaximumPauseMillis <=
+            MULTIPLAYER_PERFORMANCE_TARGET.maxSoakPhaseStallMillis;
+    const ready = missing.length === 0 &&
+        observed.flowPausedChannels === 0 &&
+        observed.decodeFlowPausedChannels === 0 &&
+        observed.activeHighWatermarks === 0;
+    return {
+        schemaVersion: "gaius.browser-inbound-flow-evidence.v1",
+        label,
+        capturedAt: new Date().toISOString(),
+        capturedAtElapsedMillis: Number(
+            (performance.now() - smokeStartedAt).toFixed(3)),
+        source: "BrowserWebSocketChannel.__gaiusNettyBridge.stats",
+        fields: [...BROWSER_INBOUND_FLOW_EVIDENCE_FIELDS],
+        observed,
+        missing,
+        available: missing.length === 0,
+        lifetimeMaximumPauseMillis,
+        lifetimeWithinPauseLimit,
+        // v1 readers used these names. They are explicitly lifetime aliases;
+        // strict v2 evidence gates windowMaximumPauseMillis instead.
+        maximumPauseMillis: lifetimeMaximumPauseMillis,
+        pauseLimitMillis: MULTIPLAYER_PERFORMANCE_TARGET.maxSoakPhaseStallMillis,
+        withinPauseLimit: lifetimeWithinPauseLimit,
+        compatibilityAliases: {
+            maximumPauseMillis: "lifetimeMaximumPauseMillis",
+            withinPauseLimit: "lifetimeWithinPauseLimit",
+        },
+        ready,
+    };
+}
+
+function assertBrowserInboundFlowReady(snapshot, label) {
+    const evidence = browserInboundFlowEvidence(snapshot, label);
+    assert.deepEqual(evidence.missing, [],
+        `${label}: browser inbound-flow telemetry omitted required fields: ` +
+        JSON.stringify(evidence));
+    assert.equal(evidence.ready, true,
+        `${label}: browser inbound flow remained paused: ${JSON.stringify(evidence)}`);
+    return evidence;
+}
+
+function inboundFlowWindowMarker(snapshot) {
+    const sequence = snapshot?.highWatermarkEventSequence;
+    const eventsDropped = snapshot?.highWatermarkEventsDropped;
+    const events = snapshot?.highWatermarkEvents;
+    const telemetryMissing = [];
+    if (!Number.isSafeInteger(sequence) || sequence < 0) {
+        telemetryMissing.push("highWatermarkEventSequence");
+    }
+    if (!Number.isSafeInteger(eventsDropped) || eventsDropped < 0) {
+        telemetryMissing.push("highWatermarkEventsDropped");
+    }
+    if (!Array.isArray(events)) telemetryMissing.push("highWatermarkEvents");
+    const retainedSequences = Array.isArray(events)
+        ? events.map((event) => event?.sequence).filter((value) =>
+            Number.isSafeInteger(value) && value >= 0).sort((left, right) => left - right)
+        : [];
+    const readiness = browserInboundFlowEvidence(snapshot, "inbound-flow window marker");
+    return {
+        capturedAt: new Date().toISOString(),
+        capturedAtElapsedMillis: Number(
+            (performance.now() - smokeStartedAt).toFixed(3)),
+        sequence: Number.isSafeInteger(sequence) ? sequence : null,
+        eventsDropped: Number.isSafeInteger(eventsDropped) ? eventsDropped : null,
+        retainedFirstSequence: retainedSequences[0] ?? null,
+        retainedLastSequence: retainedSequences.at(-1) ?? null,
+        retainedEventCount: Array.isArray(events) ? events.length : null,
+        telemetryMissing,
+        current: {
+            flowPausedChannels: readiness.observed.flowPausedChannels,
+            decodeFlowPausedChannels: readiness.observed.decodeFlowPausedChannels,
+            activeHighWatermarks: readiness.observed.activeHighWatermarks,
+        },
+        ready: readiness.ready,
+        lifetimeMaximumPauseMillis: readiness.lifetimeMaximumPauseMillis,
+        observed: readiness.observed,
+    };
+}
+
+function beginBrowserInboundFlowWindow(runtime, stage, label, metadata = {}) {
+    const attempt = {
+        schemaVersion: BROWSER_INBOUND_FLOW_WINDOW_SCHEMA,
+        stage,
+        label,
+        status: "started",
+        source: "BrowserWebSocketChannel.__gaiusNettyBridge.stats.highWatermarkEvents",
+        eventFields: [...BROWSER_INBOUND_FLOW_EVENT_FIELDS],
+        pauseLimitMillis: MULTIPLAYER_PERFORMANCE_TARGET.maxSoakPhaseStallMillis,
+        ...metadata,
+        start: inboundFlowWindowMarker(browserRuntimeSnapshot(runtime)),
+        end: null,
+    };
+    // Persist the stage before any exact-evidence assertion can throw. failure.json
+    // must identify which strict window was being collected.
+    lastInboundFlowAttempt = attempt;
+    return attempt;
+}
+
+function normalizedInboundFlowEvent(event) {
+    return Object.fromEntries(BROWSER_INBOUND_FLOW_EVENT_FIELDS.map((name) =>
+        [name, event?.[name] ?? null]));
+}
+
+function invalidInboundFlowEventFields(event) {
+    const invalid = [];
+    for (const name of BROWSER_INBOUND_FLOW_EVENT_FIELDS) {
+        const value = event?.[name];
+        if (name === "reason") {
+            if (typeof value !== "string" || value.length === 0) invalid.push(name);
+        }
+        else if (name === "startedAtMillis" || name === "endedAtMillis" ||
+            name === "durationMillis") {
+            if (!Number.isFinite(value) || value < 0) invalid.push(name);
+        }
+        else if (!Number.isSafeInteger(value) || value < 0) invalid.push(name);
+    }
+    if (Number.isFinite(event?.startedAtMillis) && Number.isFinite(event?.endedAtMillis) &&
+        event.endedAtMillis < event.startedAtMillis) {
+        invalid.push("endedAtMillis-before-startedAtMillis");
+    }
+    return invalid;
+}
+
+function captureBrowserInboundFlowWindow(runtime, attempt, label = attempt?.label) {
+    const snapshot = browserRuntimeSnapshot(runtime);
+    const end = inboundFlowWindowMarker(snapshot);
+    const startSequence = attempt?.start?.sequence;
+    const endSequence = end.sequence;
+    const sequenceMonotonic = Number.isSafeInteger(startSequence) &&
+        Number.isSafeInteger(endSequence) && endSequence >= startSequence;
+    const expectedEventCount = sequenceMonotonic ? endSequence - startSequence : null;
+    const rawRetainedEvents = Array.isArray(snapshot.highWatermarkEvents)
+        ? snapshot.highWatermarkEvents : [];
+    const windowEvents = sequenceMonotonic
+        ? rawRetainedEvents
+            .filter((event) => Number.isSafeInteger(event?.sequence) &&
+                event.sequence > startSequence && event.sequence <= endSequence)
+            .map(normalizedInboundFlowEvent)
+            .sort((left, right) => left.sequence - right.sequence)
+        : [];
+    const invalidEvents = windowEvents.map((event) => ({
+        sequence: event.sequence,
+        fields: invalidInboundFlowEventFields(event),
+    })).filter((event) => event.fields.length > 0);
+    let sequenceGap = expectedEventCount === null ||
+        windowEvents.length !== expectedEventCount;
+    const duplicateSequences = [];
+    for (let index = 0; index < windowEvents.length; index++) {
+        const expectedSequence = startSequence + index + 1;
+        if (windowEvents[index].sequence !== expectedSequence) sequenceGap = true;
+        if (index > 0 && windowEvents[index].sequence === windowEvents[index - 1].sequence) {
+            duplicateSequences.push(windowEvents[index].sequence);
+        }
+    }
+    const startDropped = attempt?.start?.eventsDropped;
+    const endDropped = end.eventsDropped;
+    const droppedMonotonic = Number.isSafeInteger(startDropped) &&
+        Number.isSafeInteger(endDropped) && endDropped >= startDropped;
+    const eventsDroppedDelta = droppedMonotonic ? endDropped - startDropped : null;
+    const ringDropAffectedWindow = sequenceGap ||
+        (expectedEventCount > 0 && end.retainedFirstSequence !== null &&
+            end.retainedFirstSequence > startSequence + 1);
+    const windowMaximumPauseMillis = invalidEvents.length === 0
+        ? windowEvents.reduce((maximum, event) =>
+            Math.max(maximum, event.durationMillis), 0)
+        : null;
+    const lifetimeMaximumPauseMillis = end.lifetimeMaximumPauseMillis;
+    const telemetryMissing = [
+        ...(attempt?.start?.telemetryMissing ?? ["start-marker"]),
+        ...end.telemetryMissing.map((name) => `end.${name}`),
+    ];
+    const complete = telemetryMissing.length === 0 && sequenceMonotonic &&
+        droppedMonotonic && !sequenceGap && duplicateSequences.length === 0 &&
+        invalidEvents.length === 0 && !ringDropAffectedWindow;
+    const evidence = {
+        ...attempt,
+        label,
+        status: "captured",
+        capturedAt: end.capturedAt,
+        capturedAtElapsedMillis: end.capturedAtElapsedMillis,
+        end,
+        events: windowEvents,
+        telemetryMissing,
+        sequence: {
+            start: startSequence ?? null,
+            end: endSequence ?? null,
+            expectedEventCount,
+            observedEventCount: windowEvents.length,
+            sequenceGap,
+            duplicateSequences,
+        },
+        ring: {
+            droppedAtStart: startDropped ?? null,
+            droppedAtEnd: endDropped ?? null,
+            eventsDroppedDelta,
+            ringDropAffectedWindow,
+        },
+        invalidEvents,
+        complete,
+        ready: end.ready,
+        windowMaximumPauseMillis,
+        lifetimeMaximumPauseMillis,
+        windowWithinPauseLimit: windowMaximumPauseMillis !== null &&
+            windowMaximumPauseMillis <=
+                MULTIPLAYER_PERFORMANCE_TARGET.maxSoakPhaseStallMillis,
+        lifetimeWithinPauseLimit: lifetimeMaximumPauseMillis !== null &&
+            lifetimeMaximumPauseMillis <=
+                MULTIPLAYER_PERFORMANCE_TARGET.maxSoakPhaseStallMillis,
+        // Compatibility aliases are window-scoped in v2; lifetime values are
+        // never substituted into a steady/reconnect window verdict.
+        maximumPauseMillis: windowMaximumPauseMillis,
+        withinPauseLimit: windowMaximumPauseMillis !== null &&
+            windowMaximumPauseMillis <=
+                MULTIPLAYER_PERFORMANCE_TARGET.maxSoakPhaseStallMillis,
+        compatibilityAliases: {
+            maximumPauseMillis: "windowMaximumPauseMillis",
+            withinPauseLimit: "windowWithinPauseLimit",
+        },
+        observed: end.observed,
+        missing: telemetryMissing,
+        available: telemetryMissing.length === 0,
+    };
+    lastInboundFlowAttempt = evidence;
+    return evidence;
+}
+
+function finishBrowserInboundFlowWindow(runtime, attempt, label, options = {}) {
+    const evidence = captureBrowserInboundFlowWindow(runtime, attempt, label);
+    return assertBrowserInboundFlowWindow(evidence, label, options);
+}
+
+function assertBrowserInboundFlowWindow(evidence, label, options = {}) {
+    // Save the fully captured attempt before the first assertion. A failed strict
+    // gate therefore retains the stage, sequence range, ring state, and events.
+    lastInboundFlowAttempt = evidence;
+    assert.equal(evidence?.schemaVersion, BROWSER_INBOUND_FLOW_WINDOW_SCHEMA,
+        `${label}: inbound-flow window schema drifted`);
+    assert.ok(BROWSER_INBOUND_FLOW_WINDOW_STAGES.includes(evidence?.stage),
+        `${label}: unsupported inbound-flow stage ${evidence?.stage}`);
+    assert.deepEqual(evidence?.telemetryMissing, [],
+        `${label}: exact high-watermark telemetry was unavailable: ` +
+            JSON.stringify(evidence));
+    assert.equal(evidence?.complete, true,
+        `${label}: high-watermark ring did not retain a complete sequence window: ` +
+            JSON.stringify(evidence));
+    assert.equal(evidence?.ready, true,
+        `${label}: browser inbound flow remained paused: ${JSON.stringify(evidence)}`);
+    assert.equal(evidence?.windowWithinPauseLimit, true,
+        `${label}: exact window pause reached ${evidence?.windowMaximumPauseMillis}ms ` +
+            `(limit ${evidence?.pauseLimitMillis}ms)`);
+    assert.equal(evidence?.maximumPauseMillis, evidence?.windowMaximumPauseMillis,
+        `${label}: compatibility maximum was not window scoped`);
+    assert.equal(evidence?.withinPauseLimit, evidence?.windowWithinPauseLimit,
+        `${label}: compatibility verdict was not window scoped`);
+    if (options.requireCleanup === true) {
+        for (const name of BROWSER_RUNTIME_CLEANUP_GAUGES) {
+            assert.equal(evidence?.observed?.[name], 0,
+                `${label}: final cleanup retained ${name}`);
+        }
+    }
+    evidence.status = "passed";
+    lastInboundFlowAttempt = evidence;
+    return evidence;
 }
 
 function browserRuntimeCleanupGaugeEvidence(snapshot) {
@@ -1796,6 +3930,31 @@ function assertBrowserRuntimeCleanupGaugesZero(snapshot, label) {
         Object.fromEntries(BROWSER_RUNTIME_CLEANUP_GAUGES.map((name) => [name, 0])),
         `${label}: browser cleanup gauges did not drain to zero`);
     return evidence;
+}
+
+function assertBrowserOutboundContinuationScheduler(snapshot, label) {
+    const observed = {
+        macrotasks: snapshot.outboundContinuationMacrotasks,
+        messageChannelSchedules: snapshot.outboundMessageChannelFlushes,
+        messageChannelCallbacks: snapshot.outboundMessageChannelCallbacks,
+        timerFallbacks: snapshot.outboundContinuationTimers,
+    };
+    for (const [name, value] of Object.entries(observed)) {
+        assert.ok(Number.isSafeInteger(value) && value >= 0,
+            `${label}: outbound continuation telemetry ${name} is ${value}`);
+    }
+    assert.equal(observed.timerFallbacks, 0,
+        `${label}: multiplayer budget continuation regressed to a clamped timer`);
+    assert.equal(observed.messageChannelSchedules, observed.macrotasks,
+        `${label}: a continuation macrotask bypassed MessageChannel`);
+    assert.ok(observed.messageChannelCallbacks <= observed.messageChannelSchedules,
+        `${label}: MessageChannel callback accounting exceeded scheduled callbacks`);
+    return {
+        source: "BrowserWebSocketChannel.__gaiusNettyBridge.stats",
+        scheduler: "MessageChannel-one-callback-per-task",
+        ...observed,
+        timerClampAvoided: observed.timerFallbacks === 0,
+    };
 }
 
 function relayRuntimeGaugeEvidence(snapshot) {
@@ -1909,6 +4068,9 @@ function clientLivenessEvidence(client) {
         loginFinished: client.loginFinished,
         playLoginPackets: client.playLoginPackets,
         chunkPackets: client.chunkPackets,
+        uniqueChunkPositions: client.uniqueChunkPositions.size,
+        chunkWindow: client.chunkWindowResult(),
+        chunkBatch: client.chunkBatchResult(),
         timing: client.timingResult(),
         performance: client.performanceResult(),
         failure: client.failure === undefined ? null : String(client.failure),
@@ -1916,8 +4078,9 @@ function clientLivenessEvidence(client) {
     };
 }
 
-function assertClientPerformance(client, label) {
-    if (!acceptanceMode) return client.performanceResult();
+function assertClientPerformance(client, label, options = {}) {
+    if (!releaseEvidenceMode) return client.performanceResult();
+    const requireLatencyDistributions = options.requireLatencyDistributions !== false;
     const timing = client.timingResult();
     const performanceEvidence = client.performanceResult();
     for (const [name, value, limit] of [
@@ -1938,12 +4101,121 @@ function assertClientPerformance(client, label) {
         assert.ok(Number.isFinite(value) && value <= limit,
             `${label}: ${name} reached ${value}ms (limit ${limit}ms)`);
     }
+    // Use the unrounded monotonic measurements for the actual gate.  The
+    // three-decimal aliases above are for report readability only and must not
+    // turn 100.0004 ms into a false 100 ms pass.
+    for (const [name, value, limit] of [
+        ["maxPollGapRawMillis", performanceEvidence.maxPollGapRawMillis,
+            MULTIPLAYER_PERFORMANCE_TARGET.maxPollGapMillis],
+        ["maxPlayTickGapRawMillis", performanceEvidence.maxPlayTickGapRawMillis,
+            MULTIPLAYER_PERFORMANCE_TARGET.maxPlayTickGapMillis],
+        ["maxPreMinimumChunkPacketGapRawMillis",
+            performanceEvidence.maxPreMinimumChunkPacketGapRawMillis,
+            MULTIPLAYER_PERFORMANCE_TARGET.maxPreMinimumChunkPacketGapMillis],
+    ]) {
+        assert.ok(Number.isFinite(value) && value <= limit,
+            `${label}: ${name} reached ${value}ms (limit ${limit}ms)`);
+    }
     assert.ok(performanceEvidence.maximumBufferedBytes <=
         MULTIPLAYER_PERFORMANCE_TARGET.maxParserBufferedBytes,
     `${label}: parser buffered ${performanceEvidence.maximumBufferedBytes} bytes`);
+    if (stressMode) {
+        const latencyTarget = STRESS_LATENCY_DISTRIBUTION_TARGET;
+        if (requireLatencyDistributions) {
+            assertHistogramLimit(performanceEvidence.pollGapHistogram, "p95Millis", 16.7,
+                `${label} poll p95`);
+            assertHistogramLimit(performanceEvidence.pollGapHistogram, "p99Millis",
+                latencyTarget.pollGap.p99Millis,
+                `${label} poll p99`);
+            assertHistogramLimit(performanceEvidence.pollGapHistogram, "p999Millis",
+                latencyTarget.pollGap.p999Millis,
+                `${label} poll p99.9`);
+            assertHistogramLimit(performanceEvidence.pollGapHistogram, "maxMillis",
+                latencyTarget.pollGap.maxMillis,
+                `${label} poll max`);
+            assertHistogramLimit(performanceEvidence.playTickGapHistogram, "p99Millis",
+                latencyTarget.playTickGap.p99Millis,
+                `${label} tick p99`);
+            assertHistogramLimit(performanceEvidence.playTickGapHistogram, "p999Millis",
+                latencyTarget.playTickGap.p999Millis,
+                `${label} tick p99.9`);
+            assertHistogramLimit(performanceEvidence.playTickGapHistogram, "maxMillis",
+                latencyTarget.playTickGap.maxMillis,
+                `${label} tick max`);
+            assertHistogramLimit(performanceEvidence.preMinimumChunkGapHistogram, "p99Millis",
+                latencyTarget.preMinimumChunkGap.p99Millis,
+                `${label} pre-chunk p99`);
+            assertHistogramLimit(performanceEvidence.preMinimumChunkGapHistogram, "maxMillis",
+                latencyTarget.preMinimumChunkGap.maxMillis,
+                `${label} pre-chunk max`);
+            for (const [name, histogram, limit] of [
+                ["poll", performanceEvidence.pollGapHistogram,
+                    latencyTarget.pollGap.maxMillis],
+                ["tick", performanceEvidence.playTickGapHistogram,
+                    latencyTarget.playTickGap.maxMillis],
+                ["pre-chunk", performanceEvidence.preMinimumChunkGapHistogram,
+                    latencyTarget.preMinimumChunkGap.maxMillis],
+            ]) {
+                assert.ok(Number.isFinite(histogram?.rawMaxMillis) &&
+                    histogram.rawMaxMillis <= limit,
+                `${label} ${name} raw max reached ${histogram?.rawMaxMillis}ms ` +
+                    `(limit ${limit}ms)`);
+            }
+            for (const [name, histogram, p99Limit] of [
+                ["poll", performanceEvidence.pollGapHistogram,
+                    latencyTarget.pollGap.p99Millis],
+                ["tick", performanceEvidence.playTickGapHistogram,
+                    latencyTarget.playTickGap.p99Millis],
+                ["pre-chunk", performanceEvidence.preMinimumChunkGapHistogram,
+                    latencyTarget.preMinimumChunkGap.p99Millis],
+            ]) {
+                const rawBounds = histogram?.rawQuantileUpperBoundsMillis;
+                assert.ok(Number.isFinite(rawBounds?.p99Millis) &&
+                    rawBounds.p99Millis <= p99Limit,
+                `${label} ${name} raw p99 bound reached ${rawBounds?.p99Millis}ms ` +
+                    `(limit ${p99Limit}ms)`);
+            }
+        } else {
+            // A reconnect boundary has too few samples for a percentile to be
+            // statistically meaningful, but a single long gap is still a real
+            // visible hitch. Keep the hard max buckets active while deferring
+            // only p95/p99/p99.9 decisions until the steady-soak population.
+            assertHistogramLimit(performanceEvidence.pollGapHistogram, "maxMillis",
+                latencyTarget.pollGap.maxMillis,
+                `${label} poll max`);
+            assertHistogramLimit(performanceEvidence.playTickGapHistogram, "maxMillis",
+                latencyTarget.playTickGap.maxMillis,
+                `${label} tick max`);
+            assertHistogramLimit(performanceEvidence.preMinimumChunkGapHistogram, "maxMillis",
+                latencyTarget.preMinimumChunkGap.maxMillis,
+                `${label} pre-chunk max`);
+            for (const [name, histogram, limit] of [
+                ["poll", performanceEvidence.pollGapHistogram,
+                    latencyTarget.pollGap.maxMillis],
+                ["tick", performanceEvidence.playTickGapHistogram,
+                    latencyTarget.playTickGap.maxMillis],
+                ["pre-chunk", performanceEvidence.preMinimumChunkGapHistogram,
+                    latencyTarget.preMinimumChunkGap.maxMillis],
+            ]) {
+                assert.ok(Number.isFinite(histogram?.rawMaxMillis) &&
+                    histogram.rawMaxMillis <= limit,
+                `${label} ${name} raw max reached ${histogram?.rawMaxMillis}ms ` +
+                    `(limit ${limit}ms)`);
+            }
+            // Percentile gates are intentionally deferred at startup and
+            // reconnect boundaries: those windows contain too few samples to
+            // make a meaningful p99 decision.  Keep the raw max gate above as
+            // the hard no-hitch bound; the full raw p99/p99.9 checks remain in
+            // the requireLatencyDistributions=true (steady-soak) branch.
+        }
+    }
     return {
         timing,
         performance: performanceEvidence,
+        latencyDistributionGate: {
+            required: requireLatencyDistributions,
+            deferredUntilSteadySoak: !requireLatencyDistributions,
+        },
         limits: { ...MULTIPLAYER_PERFORMANCE_TARGET },
     };
 }
@@ -1958,6 +4230,11 @@ function startSoakPerformanceObservation(clients, browserRuntime) {
     let maxBrowserQueuedFrames = 0;
     let maxBrowserInboundQueuedBytes = 0;
     let maxBrowserEventLoopGapMillis = 0;
+    let maxFlowPausedChannels = 0;
+    let maxDecodeFlowPausedChannels = 0;
+    let maxActiveHighWatermarks = 0;
+    let pausedSamples = 0;
+    let maxContinuousFlowPauseMillis = 0;
     const sample = () => {
         const now = performance.now();
         samples++;
@@ -1975,7 +4252,7 @@ function startSoakPerformanceObservation(clients, browserRuntime) {
             }
             const healthy = client.failure === undefined &&
                 client.phase === "play" &&
-                client.chunkPackets >= minimumChunkPackets;
+                client.minimumChunkTargetReached();
             if (healthy) {
                 notPlaySince.delete(client.id);
                 continue;
@@ -2011,6 +4288,55 @@ function startSoakPerformanceObservation(clients, browserRuntime) {
             maxBrowserEventLoopGapMillis,
             Number(browser.longestEventLoopGapMillis ?? 0),
         );
+        const inboundFlow = browserInboundFlowEvidence(browser, "soak sample");
+        if (!inboundFlow.available) {
+            const key = "browser-inbound-flow-telemetry";
+            if (!reported.has(key)) {
+                reported.add(key);
+                violations.push({
+                    type: key,
+                    missing: inboundFlow.missing,
+                });
+            }
+        }
+        else {
+            maxFlowPausedChannels = Math.max(
+                maxFlowPausedChannels,
+                inboundFlow.observed.flowPausedChannels,
+            );
+            maxDecodeFlowPausedChannels = Math.max(
+                maxDecodeFlowPausedChannels,
+                inboundFlow.observed.decodeFlowPausedChannels,
+            );
+            maxActiveHighWatermarks = Math.max(
+                maxActiveHighWatermarks,
+                inboundFlow.observed.activeHighWatermarks,
+            );
+            const paused = inboundFlow.observed.flowPausedChannels > 0 ||
+                inboundFlow.observed.decodeFlowPausedChannels > 0 ||
+                inboundFlow.observed.activeHighWatermarks > 0;
+            if (paused) pausedSamples++;
+            maxContinuousFlowPauseMillis = Math.max(
+                maxContinuousFlowPauseMillis,
+                inboundFlow.maximumPauseMillis,
+            );
+            if (!inboundFlow.withinPauseLimit) {
+                const key = "browser-inbound-flow-stall";
+                if (!reported.has(key)) {
+                    reported.add(key);
+                    violations.push({
+                        type: key,
+                        durationMillis: Number(inboundFlow.maximumPauseMillis.toFixed(3)),
+                        source: "per-channel-high-watermark",
+                        flowPausedChannels: inboundFlow.observed.flowPausedChannels,
+                        decodeFlowPausedChannels:
+                            inboundFlow.observed.decodeFlowPausedChannels,
+                        activeHighWatermarks:
+                            inboundFlow.observed.activeHighWatermarks,
+                    });
+                }
+            }
+        }
         if (browser.activeChannels !== clientCount ||
             browser.activeWebSockets !== clientCount) {
             const key = "browser-liveness";
@@ -2038,6 +4364,13 @@ function startSoakPerformanceObservation(clients, browserRuntime) {
                 maxBrowserInboundQueuedBytes,
                 maxBrowserEventLoopGapMillis:
                     Number(maxBrowserEventLoopGapMillis.toFixed(3)),
+                rawMaxBrowserEventLoopGapMillis: maxBrowserEventLoopGapMillis,
+                maxFlowPausedChannels,
+                maxDecodeFlowPausedChannels,
+                maxActiveHighWatermarks,
+                pausedSamples,
+                maxContinuousFlowPauseMillis:
+                    Number(maxContinuousFlowPauseMillis.toFixed(3)),
                 violations,
                 ok: violations.length === 0,
                 limits: {
@@ -2048,6 +4381,11 @@ function startSoakPerformanceObservation(clients, browserRuntime) {
                     maxBrowserInboundQueuedBytes:
                         MULTIPLAYER_PERFORMANCE_TARGET.maxBrowserInboundQueuedBytes,
                     maxPollGapMillis: MULTIPLAYER_PERFORMANCE_TARGET.maxPollGapMillis,
+                    maxBrowserEventLoopGapMillis: stressMode
+                        ? STRESS_EVENT_LOOP_MAX_MILLIS
+                        : MULTIPLAYER_PERFORMANCE_TARGET.maxPollGapMillis,
+                    maxContinuousFlowPauseMillis:
+                        MULTIPLAYER_PERFORMANCE_TARGET.maxSoakPhaseStallMillis,
                 },
             };
         },
@@ -2055,7 +4393,7 @@ function startSoakPerformanceObservation(clients, browserRuntime) {
 }
 
 function assertSoakPerformance(evidence, label) {
-    if (!acceptanceMode) return evidence;
+    if (!releaseEvidenceMode) return evidence;
     assert.ok(evidence?.ok === true,
         `${label}: liveness violations ${JSON.stringify(evidence?.violations ?? [])}`);
     assert.ok(evidence.samples >= 10,
@@ -2066,9 +4404,19 @@ function assertSoakPerformance(evidence, label) {
     assert.ok(evidence.maxBrowserInboundQueuedBytes <=
         MULTIPLAYER_PERFORMANCE_TARGET.maxBrowserInboundQueuedBytes,
     `${label}: browser inbound queue reached ${evidence.maxBrowserInboundQueuedBytes} bytes`);
-    assert.ok(evidence.maxBrowserEventLoopGapMillis <=
-        MULTIPLAYER_PERFORMANCE_TARGET.maxPollGapMillis,
-    `${label}: browser event-loop gap reached ${evidence.maxBrowserEventLoopGapMillis}ms`);
+    const eventLoopGapLimitMillis = stressMode
+        ? STRESS_EVENT_LOOP_MAX_MILLIS
+        : MULTIPLAYER_PERFORMANCE_TARGET.maxPollGapMillis;
+    const rawEventLoopGapMillis = Number.isFinite(evidence.rawMaxBrowserEventLoopGapMillis)
+        ? evidence.rawMaxBrowserEventLoopGapMillis
+        : evidence.maxBrowserEventLoopGapMillis;
+    assert.ok(rawEventLoopGapMillis <= eventLoopGapLimitMillis,
+        `${label}: browser event-loop gap reached ${rawEventLoopGapMillis}ms ` +
+        `(limit ${eventLoopGapLimitMillis}ms)`);
+    assert.ok(evidence.maxContinuousFlowPauseMillis <=
+        MULTIPLAYER_PERFORMANCE_TARGET.maxSoakPhaseStallMillis,
+    `${label}: browser inbound flow stayed paused for ` +
+        `${evidence.maxContinuousFlowPauseMillis}ms`);
     return evidence;
 }
 
@@ -2083,8 +4431,9 @@ function assertSoakLiveness(clients, browser, relay, label) {
             `${label}: ${evidence.username} did not finish LOGIN`);
         assert.ok(evidence.playLoginPackets > 0,
             `${label}: ${evidence.username} did not receive PLAY login`);
-        assert.ok(evidence.chunkPackets >= minimumChunkPackets,
-            `${label}: ${evidence.username} received only ${evidence.chunkPackets} chunks`);
+        assert.ok(client.minimumChunkTargetReached(),
+            `${label}: ${evidence.username} received ${evidence.chunkPackets} chunk packets / ` +
+            `${evidence.uniqueChunkPositions} unique chunks, expected ${minimumChunkPackets}`);
         assertClientSecurity(client, `${label} ${evidence.username}`);
         return evidence;
     });
@@ -2109,6 +4458,12 @@ function assertSoakLiveness(clients, browser, relay, label) {
         `${label}: external RelayNode target connection count drifted`);
     }
     const relayGauges = relayRuntimeGaugeEvidence(relay);
+    const inboundFlow = assertBrowserInboundFlowReady(
+        browser,
+        `${label}: browser inbound flow`,
+    );
+    const outboundContinuationScheduler =
+        assertBrowserOutboundContinuationScheduler(browser, label);
     if (relayRuntimeTelemetryRequired) {
         assertRelayRuntimeConnectionGauges(
             relay,
@@ -2127,9 +4482,11 @@ function assertSoakLiveness(clients, browser, relay, label) {
             onlineEncryptionFailClosed: true,
             browserActiveChannels: clientCount,
             browserActiveWebSockets: clientCount,
+            browserInboundFlowReady: true,
             relayActiveConnections: clientCount,
             relayTargetActiveConnections: clientCount,
             relayRuntimeGaugesZero: [...RELAY_RUNTIME_GAUGES],
+            outboundContinuationTimerFallbacks: 0,
         },
         observed: {
             clients: observedClients,
@@ -2137,12 +4494,14 @@ function assertSoakLiveness(clients, browser, relay, label) {
                 activeChannels: browser.activeChannels,
                 activeWebSockets: browser.activeWebSockets,
             },
+            inboundFlow,
             relay: {
                 activeConnections: relay.activeConnections,
                 targetActiveConnections: relay.target.activeConnections,
             },
             relayRuntimeGauges: relayGauges,
             relayRuntimeConnectionGauges: relayRuntimeConnectionGaugeEvidence(relay),
+            outboundContinuationScheduler,
         },
         ok: true,
     };
@@ -2233,6 +4592,8 @@ async function captureAbnormalTransportDrop(runtime, probes) {
 function assertBrowserRuntimeClean(snapshot, label) {
     assert.deepEqual({
         activeChannels: snapshot.activeChannels,
+        flowPausedChannels: snapshot.flowPausedChannels,
+        decodeFlowPausedChannels: snapshot.decodeFlowPausedChannels,
         activeWebSockets: snapshot.activeWebSockets,
         queuedBytes: snapshot.queuedBytes,
         queuedFrames: snapshot.queuedFrames,
@@ -2240,6 +4601,8 @@ function assertBrowserRuntimeClean(snapshot, label) {
         activeRelayTargetLeases: snapshot.activeRelayTargetLeases,
     }, {
         activeChannels: 0,
+        flowPausedChannels: 0,
+        decodeFlowPausedChannels: 0,
         activeWebSockets: 0,
         queuedBytes: 0,
         queuedFrames: 0,
@@ -2262,11 +4625,25 @@ async function waitForBrowserRuntimeCleanup(runtime, label) {
     }, label, 5000, () => JSON.stringify(browserRuntimeSnapshot(runtime)));
 }
 
+async function waitForBrowserInboundFlowReady(runtime, label) {
+    await waitFor(() => {
+        const snapshot = browserRuntimeSnapshot(runtime);
+        const evidence = browserInboundFlowEvidence(snapshot, label);
+        assert.ok(evidence.withinPauseLimit !== false,
+            `${label}: per-channel inbound flow paused for ` +
+                `${evidence.maximumPauseMillis}ms (limit ${evidence.pauseLimitMillis}ms)`);
+        return evidence.ready;
+    }, label, 5000, () => JSON.stringify(browserRuntimeSnapshot(runtime)));
+    return assertBrowserInboundFlowReady(browserRuntimeSnapshot(runtime), label);
+}
+
 function browserFullPathPerformanceContract() {
     return {
         mode: externalMode
             ? "external-full-path"
-            : acceptanceMode ? "strict-acceptance" : "compatible-smoke",
+            : acceptanceMode
+                ? "strict-acceptance"
+                : stressMode ? `stress-tier-${stressTier}` : "compatible-smoke",
         externalRelay: externalMode ? {
             relayUrl: externalRelayUrl,
             target: externalTarget?.text,
@@ -2283,6 +4660,7 @@ function browserFullPathPerformanceContract() {
         },
         clientStartDelayMillis: clientStartDelayMs,
         strictAcceptanceTarget: acceptanceMode ? { ...STRICT_ACCEPTANCE_TARGET } : null,
+        stressTarget: stressMode ? { tier: stressTier, ...stressTarget } : null,
         canonicalProfiles: CANONICAL_PROFILES,
         relayRuntimeGauges: [...RELAY_RUNTIME_GAUGES],
         relayRuntimeConnectionGauges: [...RELAY_RUNTIME_CONNECTION_GAUGES],
@@ -2290,12 +4668,101 @@ function browserFullPathPerformanceContract() {
         relayDrainSendErrors: 0,
         relayDrainCleanupRequired: true,
         multiplayerPerformance: { ...MULTIPLAYER_PERFORMANCE_TARGET },
+        pollScheduler: {
+            schemaVersion: "gaius.browser-client-poll-scheduler.v1",
+            mode: "round-robin-bounded-batch-per-macrotask",
+            maxBatchClients: MAX_CLIENTS_PER_POLL_CALLBACK,
+            callbackWorkBudgetMillis: MAX_POLL_CALLBACK_WORK_MILLIS,
+            callbackBudgetCoversPlayTicks: true,
+            maxPlayTicksPerSchedulerCallback:
+                MAX_PLAY_TICKS_PER_SCHEDULER_CALLBACK,
+            maxVisibleDispatchSkew: MAX_VISIBLE_DISPATCH_SKEW,
+            strictEventLoopMaxMillis: stressMode
+                ? STRESS_EVENT_LOOP_MAX_MILLIS
+                : MULTIPLAYER_PERFORMANCE_TARGET.maxPollGapMillis,
+            rawLatencyEvidence: true,
+            callbackTail: {
+                schemaVersion: CALLBACK_TAIL_TELEMETRY_SCHEMA_VERSION,
+                slowThresholdMillis: CALLBACK_TAIL_SLOW_THRESHOLD_MILLIS,
+                sampleLimit: CALLBACK_TAIL_SAMPLE_LIMIT,
+                retention: "longest-duration-desc-sequence-asc",
+                strictRawDurationGateMillis: 16.7,
+            },
+            dueState: "side-map-authoritative-client-property-mirror-only",
+            immediateInboundPriority: "client-method-buffer-then-bridge",
+        },
+        stressLatencyDistribution: stressMode
+            ? stressLatencyDistributionContract()
+            : null,
         browserRuntimeCleanupGauges: [...BROWSER_RUNTIME_CLEANUP_GAUGES],
+        browserGlobalPumpTelemetry: {
+            source: "BrowserWebSocketChannel.pumpAllAndReportProgress",
+            fields: [...BROWSER_GLOBAL_PUMP_TELEMETRY_FIELDS],
+            maxTotalMillis: BROWSER_GLOBAL_PUMP_MAX_TOTAL_MILLIS,
+            missingValue: null,
+            note: "Generated Java telemetry is observed when present; absent fields remain null",
+        },
+        browserInboundFlowEvidence: {
+            schemaVersion: "gaius.browser-inbound-flow-evidence.v1",
+            windowSchemaVersion: BROWSER_INBOUND_FLOW_WINDOW_SCHEMA,
+            fields: [...BROWSER_INBOUND_FLOW_EVIDENCE_FIELDS],
+            windowStages: [...BROWSER_INBOUND_FLOW_WINDOW_STAGES],
+            maximumContinuousPauseMillis:
+                MULTIPLAYER_PERFORMANCE_TARGET.maxSoakPhaseStallMillis,
+            requiredStages: [
+                ...BROWSER_INBOUND_FLOW_WINDOW_STAGES,
+            ],
+            compatibilityAliases: {
+                initial: "initialConnectThroughMinimumChunks",
+                reconnectWaves: ["preDrop", "reconnectRecovery"],
+                postSoak: "steadySoak",
+                finalCleanup: "finalCleanup",
+            },
+        },
         syntheticMarkerLabel: "synthetic-inbound-marker",
-        runtimeJavaPolicy: acceptanceMode
+        runtimeJavaPolicy: releaseEvidenceMode
             ? { ...STRICT_RUNTIME_JAVA_POLICY }
             : null,
         minimumChunkPackets,
+        minimumChunkMetric: stressMode ? "unique-chunk-position" : "chunk-packet",
+        chunkWindow: {
+            clientViewDistance,
+            serverViewDistance,
+            effectiveRadius: effectiveChunkRadius,
+            maximumUniqueChunkCapacity,
+            initialDistanceContract: {
+                source: "clientbound-login",
+                packetId: activeProfile?.id === "1.21.11"
+                    ? MINECRAFT_1_21_11.play.clientboundLogin
+                    : MINECRAFT_26_2.play.clientboundLogin,
+                fields: ["chunkRadius", "simulationDistance"],
+            },
+            observedDistancePackets: {
+                cacheCenter: activeProfile?.id === "1.21.11"
+                    ? MINECRAFT_1_21_11.play.clientboundSetChunkCacheCenter
+                    : MINECRAFT_26_2.play.clientboundSetChunkCacheCenter,
+                cacheRadius: activeProfile?.id === "1.21.11"
+                    ? MINECRAFT_1_21_11.play.clientboundSetChunkCacheRadius
+                    : MINECRAFT_26_2.play.clientboundSetChunkCacheRadius,
+                simulationDistance: activeProfile?.id === "1.21.11"
+                    ? MINECRAFT_1_21_11.play.clientboundSetSimulationDistance
+                    : MINECRAFT_26_2.play.clientboundSetSimulationDistance,
+            },
+            observedDistanceContractRequiredBeforeCounting: stressMode,
+        },
+        chunkBatch: {
+            clientboundFinishedPacketId: activeProfile?.id === "1.21.11"
+                ? MINECRAFT_1_21_11.play.clientboundChunkBatchFinished
+                : MINECRAFT_26_2.play.clientboundChunkBatchFinished,
+            clientboundStartPacketId: activeProfile?.id === "1.21.11"
+                ? MINECRAFT_1_21_11.play.clientboundChunkBatchStart
+                : MINECRAFT_26_2.play.clientboundChunkBatchStart,
+            serverboundAcknowledgementPacketId: activeProfile?.id === "1.21.11"
+                ? MINECRAFT_1_21_11.play.serverboundChunkBatchReceived
+                : MINECRAFT_26_2.play.serverboundChunkBatchReceived,
+            desiredChunksPerTick,
+            acknowledgementEncoding: "float32-be",
+        },
         soakMillis: soakMs,
         reconnectWaves,
         lifecycleCleanupRequired: true,
@@ -2337,6 +4804,24 @@ function browserFullPathPerformanceContract() {
     };
 }
 
+function stressLatencyDistributionContract() {
+    return {
+        schemaVersion: STRESS_LATENCY_DISTRIBUTION_TARGET.schemaVersion,
+        histogramSchemaVersion:
+            STRESS_LATENCY_DISTRIBUTION_TARGET.histogramSchemaVersion,
+        bucketUpperBoundsMillis: [
+            ...STRESS_LATENCY_DISTRIBUTION_TARGET.bucketUpperBoundsMillis,
+        ],
+        pollGap: { ...STRESS_LATENCY_DISTRIBUTION_TARGET.pollGap },
+        playTickGap: { ...STRESS_LATENCY_DISTRIBUTION_TARGET.playTickGap },
+        preMinimumChunkGap: {
+            ...STRESS_LATENCY_DISTRIBUTION_TARGET.preMinimumChunkGap,
+        },
+        storage: "fixed-bucket-counts-only",
+        rawSamplesRetained: false,
+    };
+}
+
 async function fetchRelayRuntime(port, targetPort) {
     const runtimeUrl = new URL(`http://127.0.0.1:${port}/relay-node/v1`);
     if (Number.isInteger(targetPort)) {
@@ -2374,7 +4859,7 @@ async function fetchRelayRuntime(port, targetPort) {
         : undefined;
     const runtimeGaugeEvidence = relayRuntimeGaugeEvidence(manifest);
     const runtimeConnectionGaugeEvidence = relayRuntimeConnectionGaugeEvidence(manifest);
-    if (acceptanceMode &&
+    if (releaseEvidenceMode &&
             (!runtimeGaugeEvidence.available || !runtimeConnectionGaugeEvidence.available)) {
         throw new Error("strict acceptance requires every RelayNode runtime gauge: " +
             JSON.stringify({ runtimeGaugeEvidence, runtimeConnectionGaugeEvidence }));
@@ -2434,7 +4919,7 @@ async function fetchExternalRelayRuntime(relayUrl, target, token) {
         ? body.runtime : undefined;
     const runtimeGaugeEvidence = relayRuntimeGaugeEvidence({ runtime });
     const runtimeConnectionGaugeEvidence = relayRuntimeConnectionGaugeEvidence({ runtime });
-    if (acceptanceMode) {
+    if (releaseEvidenceMode) {
         if (!body?.capabilities?.includes("runtime-telemetry") ||
             !Number.isSafeInteger(runtime?.rssBytes) ||
             !Number.isSafeInteger(runtime?.cpuUserMicros) ||
@@ -2530,6 +5015,8 @@ async function printConfiguration() {
     activeProfile = await loadActiveVersionProfile();
     assertCanonicalProfile(activeProfile);
     const wireProfile = resolveWireProfile(activeProfile);
+    const identities = Array.from({ length: clientCount }, (_, index) =>
+        createClientIdentity(index));
     console.log(JSON.stringify({
         profile: {
             id: activeProfile.id,
@@ -2547,7 +5034,16 @@ async function printConfiguration() {
         },
         clients: clientCount,
         acceptanceMode,
+        stressMode,
+        stressTier: stressTier ?? null,
         strictAcceptanceTarget: acceptanceMode ? STRICT_ACCEPTANCE_TARGET : null,
+        stressTarget: stressMode ? stressTarget : null,
+        identityContract: {
+            explicitProfileUsernameMap: true,
+            uniqueProfiles: new Set(identities.map(({ profileId }) => profileId)).size,
+            uniqueUsernames: new Set(identities.map(({ username }) => username)).size,
+            identities,
+        },
         performanceContract: browserFullPathPerformanceContract(),
     }));
 }
@@ -2565,7 +5061,7 @@ async function printJavaResolution() {
         runtimeJavaMajor: runtimeJava.major,
         runtimeJavaExecutable: runtimeJava.executable,
         runtimeJavaSource: runtimeJava.source,
-        runtimeJavaPolicy: acceptanceMode
+        runtimeJavaPolicy: releaseEvidenceMode
             ? STRICT_RUNTIME_JAVA_POLICY[activeProfile.id] ?? null
             : `major-at-least-${activeProfile.javaVersion}`,
     }));
@@ -2700,7 +5196,7 @@ function createSessionServer(state) {
                 state.hasJoined.push(query);
                 const join = [...state.joins].reverse().find((candidate) =>
                     candidate.serverId === query.serverId &&
-                    query.username === profileUsernameForId(candidate.selectedProfile));
+                    query.username === profileUsernameForId(state, candidate.selectedProfile));
                 if (join === undefined) {
                     response.writeHead(204);
                     response.end();
@@ -2719,7 +5215,7 @@ function createSessionServer(state) {
                 const id = url.pathname.slice("/session/minecraft/profile/".length);
                 sendJson(response, 200, {
                     id,
-                    name: profileUsernameForId(id),
+                    name: profileUsernameForId(state, id),
                     properties: [],
                     profileActions: [],
                 });
@@ -2733,9 +5229,12 @@ function createSessionServer(state) {
     });
 }
 
-function profileUsernameForId(id) {
-    const suffix = Number.parseInt(String(id).slice(-1), 16);
-    return `${usernamePrefix}${Number.isInteger(suffix) ? suffix - 1 : 0}`.slice(0, 16);
+function profileUsernameForId(state, id) {
+    const username = state.profileUsernames.get(String(id));
+    if (username === undefined) {
+        throw new Error(`Session server received unknown profile id ${id}`);
+    }
+    return username;
 }
 
 function sendJson(response, status, value) {
@@ -2774,7 +5273,7 @@ function serverProperties(port) {
         "level-seed=1",
         "level-type=minecraft:flat",
         "log-ips=false",
-        "max-players=4",
+        `max-players=${stressMode ? clientCount : 4}`,
         "motd=Gaius browser RelayNode full-path smoke",
         "network-compression-threshold=256",
         "online-mode=true",
@@ -2785,14 +5284,14 @@ function serverProperties(port) {
         "rate-limit=0",
         "server-ip=127.0.0.1",
         `server-port=${port}`,
-        "simulation-distance=2",
+        `simulation-distance=${stressTarget?.simulationDistance ?? 2}`,
         "spawn-animals=false",
         "spawn-monsters=false",
         "spawn-npcs=false",
         "spawn-protection=0",
         "sync-chunk-writes=false",
         "use-native-transport=false",
-        "view-distance=2",
+        `view-distance=${serverViewDistance}`,
         "white-list=false",
         "",
     ].join("\n");
@@ -2853,7 +5352,7 @@ async function loadActiveVersionProfile() {
         typeof profile.official?.serverSha1 === "string" &&
         /^[0-9a-f]{40}$/iu.test(profile.official.serverSha1),
         `invalid version profile ${profilePath}`);
-    if (acceptanceMode && path.basename(profilePath) !== `${profile.id}.json`) {
+    if (releaseEvidenceMode && path.basename(profilePath) !== `${profile.id}.json`) {
         throw new Error(
             `strict acceptance profile basename must be exactly ${profile.id}.json: ` +
             `${path.basename(profilePath)}`,
@@ -2869,12 +5368,12 @@ async function loadActiveVersionProfile() {
 function assertCanonicalProfile(profile) {
     const canonical = CANONICAL_PROFILES[profile.id];
     if (canonical === undefined) {
-        if (acceptanceMode) {
+        if (releaseEvidenceMode) {
             throw new Error(`strict acceptance does not support profile ${profile.id}`);
         }
         return;
     }
-    if (!acceptanceMode) return;
+    if (!releaseEvidenceMode) return;
     assert.equal(path.basename(profile.path), `${profile.id}.json`,
         `non-canonical strict acceptance profile basename ${profile.path}`);
     assert.equal(repositoryRelativePath(profile.path), `port/versions/${profile.id}.json`,
@@ -2933,7 +5432,7 @@ async function listen(server, port, host) {
 
 function runtimeJavaMajorMeetsPolicy(profile, major) {
     if (!Number.isSafeInteger(major)) return false;
-    if (acceptanceMode && profile.id === "1.21.11") return major === 21;
+    if (releaseEvidenceMode && profile.id === "1.21.11") return major === 21;
     return major >= profile.javaVersion;
 }
 
@@ -2988,7 +5487,7 @@ async function resolveJavaExecutable(profile) {
         const version = result.error ?? `Java ${result.major}`;
         diagnostics.push(`${candidate} [${source}]: ${version}`);
     }
-    const policy = acceptanceMode && profile.id === "1.21.11"
+    const policy = releaseEvidenceMode && profile.id === "1.21.11"
         ? "Java 21 exactly"
         : `Java >= ${profile.javaVersion}`;
     throw new Error(`No ${policy} for ${profile.id}: ${diagnostics.join("; ")}`);
@@ -3435,13 +5934,113 @@ function encodeByteArray(value) {
 function encodeClientInformation() {
     return Buffer.concat([
         encodeString("en_us"),
-        Buffer.from([6]),
+        Buffer.from([clientViewDistance]),
         encodeVarInt(0),
         Buffer.from([1, 0x7f]),
         encodeVarInt(1),
         Buffer.from([0, 1]),
         encodeVarInt(0),
     ]);
+}
+
+function parseDesiredChunksPerTick(raw) {
+    if (!/^(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)$/u.test(String(raw))) {
+        throw new Error(
+            "GAIUS_BROWSER_FULL_PATH_DESIRED_CHUNKS_PER_TICK must be a finite number " +
+            "from 0.01 to 64");
+    }
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value < 0.01 || value > 64) {
+        throw new Error(
+            "GAIUS_BROWSER_FULL_PATH_DESIRED_CHUNKS_PER_TICK must be a finite number " +
+            "from 0.01 to 64");
+    }
+    return value;
+}
+
+function chunkTrackingCapacity(viewDistance) {
+    let capacity = 0;
+    for (let x = -(viewDistance + 1); x <= viewDistance + 1; x++) {
+        for (let z = -(viewDistance + 1); z <= viewDistance + 1; z++) {
+            const normalizedX = Math.max(0, Math.abs(x) - 1);
+            const normalizedZ = Math.max(0, Math.abs(z) - 1);
+            if (normalizedX * normalizedX + normalizedZ * normalizedZ <
+                viewDistance * viewDistance) {
+                capacity++;
+            }
+        }
+    }
+    return capacity;
+}
+
+function createLatencyHistogram() {
+    return {
+        counts: new Array(LATENCY_HISTOGRAM_BUCKETS_MILLIS.length).fill(0),
+        count: 0,
+        maxMillis: 0,
+    };
+}
+
+function observeLatency(histogram, value) {
+    if (!Number.isFinite(value) || value < 0) return;
+    histogram.count++;
+    histogram.maxMillis = Math.max(histogram.maxMillis, value);
+    const bucket = LATENCY_HISTOGRAM_BUCKETS_MILLIS.findIndex((limit) => value <= limit);
+    histogram.counts[bucket === -1 ? histogram.counts.length - 1 : bucket]++;
+}
+
+function latencyHistogramResult(histogram) {
+    const quantile = (fraction) => {
+        if (histogram.count === 0) return null;
+        const target = Math.ceil(histogram.count * fraction);
+        let cumulative = 0;
+        for (let index = 0; index < histogram.counts.length; index++) {
+            cumulative += histogram.counts[index];
+            if (cumulative >= target) {
+                const limit = LATENCY_HISTOGRAM_BUCKETS_MILLIS[index];
+                return Number.isFinite(limit) ? limit : null;
+            }
+        }
+        return null;
+    };
+    const p95Millis = quantile(0.95);
+    const p99Millis = quantile(0.99);
+    const p999Millis = quantile(0.999);
+    const rawQuantileUpperBoundsMillis = {
+        p95Millis,
+        p99Millis,
+        p999Millis,
+    };
+    return {
+        schemaVersion: "gaius.latency-histogram.v1",
+        count: histogram.count,
+        buckets: LATENCY_HISTOGRAM_BUCKETS_MILLIS.map((upperBound, index) => ({
+            upperBoundMillis: Number.isFinite(upperBound) ? upperBound : null,
+            count: histogram.counts[index],
+        })),
+        p95Millis,
+        p99Millis,
+        p999Millis,
+        // Human-readable alias retained alongside the conventional p999 key.
+        p99_9Millis: p999Millis,
+        maxMillis: Number(histogram.maxMillis.toFixed(3)),
+        // The bucket aliases above intentionally remain stable for existing
+        // readers.  Strict stress validation also consumes the raw maximum so
+        // a value such as 100.0004 ms cannot be rounded down to a false pass.
+        rawMaxMillis: Number.isFinite(histogram.maxMillis)
+            ? histogram.maxMillis : null,
+        rawQuantileUpperBoundsMillis,
+    };
+}
+
+function assertHistogramLimit(histogram, field, limit, label) {
+    const value = histogram?.[field];
+    assert.ok(Number.isFinite(value) && value <= limit,
+        `${label} reached ${value}ms (limit ${limit}ms)`);
+}
+
+function signedVarInt(value) {
+    return value | 0;
 }
 
 function encodeVarInt(value) {

@@ -1,0 +1,740 @@
+/*
+ * Fast, server-free regression smoke for browser-full-path's Node poll
+ * scheduler.  It deliberately exercises only synthetic clients: no Java,
+ * RelayNode, WebSocket, or generated artifacts are required.  The strict
+ * multiplayer latency limits are checked as source invariants here and remain
+ * unchanged; this smoke checks scheduler ordering/fairness and records host
+ * timer behaviour without turning a noisy desktop into a false pass.
+ */
+
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { monitorEventLoopDelay } from "node:perf_hooks";
+import { performance } from "node:perf_hooks";
+import { fileURLToPath } from "node:url";
+
+const schedulerPath = fileURLToPath(
+    new URL("./browser-full-path-smoke.mjs", import.meta.url));
+const source = await readFile(schedulerPath, "utf8");
+const channelSource = await readFile(fileURLToPath(new URL(
+    "../../port/overrides/libraries/netty-transport/src/main/java/" +
+        "io/netty/channel/browser/BrowserWebSocketChannel.java",
+    import.meta.url)), "utf8");
+const schedulerStart = source.indexOf("function createFairClientPollScheduler");
+const schedulerEnd = source.indexOf("\nfunction createClientIdentity", schedulerStart);
+assert.ok(schedulerStart >= 0 && schedulerEnd > schedulerStart,
+    "poll scheduler function boundaries changed; inspect before updating this smoke");
+const schedulerSource = source.slice(schedulerStart, schedulerEnd);
+
+// Static contract: bounded batch/fairness is mandatory, and poll scheduling
+// must not regress to a recursive timer, setInterval fan-out, or nextTick loop.
+assert.match(source, /const MAX_CLIENTS_PER_POLL_CALLBACK = 4/u);
+assert.match(source, /const MAX_POLL_CALLBACK_WORK_MILLIS = 8/u);
+assert.match(source, /const POLL_SCHEDULER_TIMER_YIELD_TURNS = 256/u);
+assert.match(source, /const POLL_SCHEDULER_IDLE_BACKOFF_MILLIS = 1/u);
+assert.match(source,
+    /const MAX_PLAY_TICKS_PER_SCHEDULER_CALLBACK = MAX_CLIENTS_PER_POLL_CALLBACK/u);
+assert.match(source, /const CALLBACK_TAIL_SLOW_THRESHOLD_MILLIS = 16\.7/u);
+assert.match(source, /const CALLBACK_TAIL_SAMPLE_LIMIT = 64/u);
+assert.match(schedulerSource, /setImmediate/u);
+assert.match(schedulerSource, /setTimeout\(\(\) => \{[\s\S]*?\}, 0\)/u);
+assert.match(schedulerSource, /POLL_SCHEDULER_TIMER_YIELD_TURNS/u);
+assert.match(schedulerSource, /POLL_SCHEDULER_TIMER_YIELD_WORK_MILLIS/u);
+assert.match(schedulerSource, /POLL_SCHEDULER_WATCHDOG_MILLIS/u);
+assert.match(schedulerSource, /maxClientPollDurationMillis/u);
+assert.match(schedulerSource, /eventLoopDelayMonitor/u);
+assert.match(schedulerSource, /callbackRunning/u);
+assert.match(schedulerSource, /nextPollDueAtByClient/u);
+assert.match(schedulerSource, /readNextPollDueAt/u);
+assert.match(schedulerSource, /writeNextPollDueAt/u);
+assert.match(schedulerSource, /hasPendingInbound/u);
+assert.match(schedulerSource, /hasImmediateInbound/u);
+assert.match(schedulerSource, /isPollReady/u);
+assert.match(schedulerSource, /readPollFairnessFloor/u);
+assert.match(schedulerSource, /isPollFairlyEligible/u);
+assert.match(schedulerSource, /hasFairPollReady/u);
+assert.match(schedulerSource, /fairnessSkips/u);
+assert.match(schedulerSource, /callbackSequence/u);
+assert.match(schedulerSource, /callbackTail/u);
+assert.match(schedulerSource, /slowCallbackSamplesTotal/u);
+assert.match(schedulerSource, /slowCallbackSamplesDropped/u);
+assert.match(schedulerSource, /slowCallbackSamples/u);
+assert.match(schedulerSource, /phaseTimingsMillis/u);
+assert.match(schedulerSource, /pollCandidatesInspected/u);
+assert.match(schedulerSource, /tickCandidatesInspected/u);
+assert.match(schedulerSource, /maxPerTickDurationRawMillis/u);
+assert.match(schedulerSource, /maxPerPollDurationRawMillis/u);
+assert.match(schedulerSource, /budgetReachedPhase/u);
+assert.match(schedulerSource, /terminalPhase/u);
+assert.match(schedulerSource, /strictFrameBudgetExcessMillis/u);
+assert.match(schedulerSource, /nextContinuation/u);
+assert.match(schedulerSource, /servicePlayTick/u);
+assert.match(schedulerSource, /MAX_PLAY_TICKS_PER_SCHEDULER_CALLBACK/u);
+assert.match(schedulerSource, /isPlayTickDue/u,
+    "scheduler must inspect unserviced PLAY tick deadlines before idling");
+assert.match(schedulerSource, /countDuePlayTicks/u,
+    "scheduler must count due PLAY ticks after the bounded tick batch");
+assert.match(schedulerSource, /lastDueTicksAfterService/u);
+assert.match(schedulerSource, /lastDueTicksBeforeIdle/u);
+assert.match(schedulerSource,
+    /lastDueTicksBeforeIdle\s*=\s*countDuePlayTicks\(clients,\s*readinessAt\)/u);
+assert.match(schedulerSource,
+    /if\s*\(lastDueTicksBeforeIdle\s*>\s*0\)\s*\{[\s\S]*?nextContinuation\s*=\s*"immediate"/u,
+    "due PLAY ticks must force an immediate continuation instead of idle timer");
+assert.match(schedulerSource, /dueTickImmediateContinuations/u);
+assert.match(schedulerSource,
+    /const dueTicksPending\s*=\s*lastDueTicksAfterService\s*>\s*0\s*\|\|\s*\n\s*lastDueTicksBeforeIdle\s*>\s*0/u,
+    "due PLAY tick state must be carried through the final continuation choice");
+assert.match(schedulerSource,
+    /const continuation\s*=\s*dueTicksPending\s*\n\s*\?\s*"immediate"\s*\n\s*:\s*needsTimerYield\s*\?/u,
+    "due PLAY ticks must take precedence over the periodic timer yield");
+assert.match(schedulerSource, /idleCallbacks/u);
+assert.match(schedulerSource, /POLL_SCHEDULER_IDLE_BACKOFF_MILLIS/u);
+assert.match(source, /this\.nextPollDueAt = performance\.now\(\)/u);
+assert.match(source, /hasPendingInbound\(\)\s*\{[\s\S]*?this\.buffer\.byteLength/u);
+assert.match(source, /playTickActive/u);
+assert.match(source, /nextPlayTickDueAt/u);
+assert.match(source, /playTickSkippedPeriods/u);
+const tickStart = source.indexOf("    servicePlayTick(now = performance.now())");
+const tickEnd = source.indexOf("\n    checkError()", tickStart);
+assert.ok(tickStart >= 0 && tickEnd > tickStart,
+    "shared play-tick service boundaries changed; inspect before updating this smoke");
+const tickSource = source.slice(tickStart, tickEnd);
+assert.doesNotMatch(tickSource, /setInterval\s*\(/u,
+    "play ticks must use the shared due-driven scheduler, not per-client intervals");
+assert.doesNotMatch(tickSource, /setTimeout\s*\(/u,
+    "play-tick service must not create a hidden per-client timer");
+assert.match(source, /this\.nextPlayTickDueAt = performance\.now\(\)/u);
+assert.match(source, /periodMillis = 50/u);
+assert.match(source,
+    /Math\.ceil\(\(tickAt - nextDueAt\) \/ periodMillis\)/u,
+    "production PLAY tick skip accounting must use ceil from the next due time");
+assert.match(source, /hasImmediateInbound\(\)\s*\{[\s\S]*?decodeVarInt\(this\.buffer, 0\)/u,
+    "client immediate-readiness must inspect a complete outer frame before waking");
+assert.match(source, /frameEnd <= this\.buffer\.byteLength/u,
+    "client immediate-readiness must not spin on split/partial frames");
+assert.doesNotMatch(schedulerSource, /setInterval\s*\(/u,
+    "poll scheduler must not use setInterval");
+assert.doesNotMatch(schedulerSource, /process\.nextTick\s*\(/u,
+    "poll scheduler must not recurse through nextTick");
+// Keep the release thresholds immutable.  A scheduler optimization is not a
+// license to loosen the acceptance gate.
+assert.match(source,
+    /pollGap: Object\.freeze\(\{ p99Millis: 16\.7, p999Millis: 50, maxMillis: 100 \}\)/u);
+assert.match(source, /BROWSER_GLOBAL_PUMP_TELEMETRY_FIELDS/u);
+for (const field of [
+    "pumpAllTurns",
+    "pumpAllChannelsVisited",
+    "pumpAllBudgetYields",
+    "pumpAllMaxTurnMillis",
+    "pumpAllMaxChannelsPerTurn",
+    "pumpAllLastTurnMillis",
+    "pumpAllLastChannelsVisited",
+]) {
+    assert.match(source, new RegExp(`${field}: Object\\.prototype\\.hasOwnProperty`, "u"),
+        `browserRuntimeSnapshot omitted ${field}`);
+}
+assert.match(source, /browserGlobalPumpTelemetryEvidence/u);
+assert.match(source, /BROWSER_GLOBAL_PUMP_MAX_TOTAL_MILLIS = 4/u);
+assert.match(channelSource, /MAX_TOTAL_MILLIS_PER_PUMP\s*=\s*4\.0/u,
+    "Java global pump aggregate budget marker changed");
+
+const CLIENT_COUNT = 8;
+const BATCH_LIMIT = 4;
+const CALLBACK_WORK_BUDGET_MILLIS = 8;
+const RUN_MILLIS = 180;
+const HARD_STOP_MILLIS = RUN_MILLIS + 500;
+
+function round(value) {
+    return Number(Number(value).toFixed(3));
+}
+
+function eventLoopEvidence(histogram) {
+    const toMillis = (value) => {
+        const number = Number(value);
+        return Number.isFinite(number) && number > 0 ? round(number / 1e6) : 0;
+    };
+    return {
+        samples: Number(histogram.count) || 0,
+        p99Millis: toMillis(histogram.percentile(99)),
+        maxMillis: toMillis(histogram.max),
+    };
+}
+
+function busyWait(millis) {
+    const duration = Math.max(0, Number(millis) || 0);
+    if (duration === 0) return;
+    const deadline = performance.now() + duration;
+    while (performance.now() < deadline) {
+        // Deliberately synchronous: model inflate/parse work inside one
+        // client.poll() without involving a server or socket.
+    }
+}
+
+/**
+ * Run a tiny synthetic eight-client poll loop.  `hybrid` mirrors the
+ * production harness policy: setImmediate is the normal continuation and a
+ * zero-delay timer is inserted every 256 turns.  Each callback also observes
+ * the production 8 ms aggregate work budget before admitting another client.
+ * The other candidates are
+ * diagnostic baselines only; their numbers are never used to relax a gate.
+ */
+async function runCandidate(kind, workMillis = 0) {
+    const counts = Array(CLIENT_COUNT).fill(0);
+    const maximumGaps = Array(CLIENT_COUNT).fill(0);
+    let cursor = 0;
+    let callbacks = 0;
+    let immediateCallbacks = 0;
+    let timerCallbacks = 0;
+    let timerYields = 0;
+    let overlaps = 0;
+    let running = false;
+    let scheduledHandle;
+    let scheduledKind;
+    let turnsSinceTimer = 0;
+    let lastCallbackAt;
+    const lastPollAt = Array(CLIENT_COUNT).fill(undefined);
+    const startedAt = performance.now();
+    const histogram = monitorEventLoopDelay({ resolution: 10 });
+    histogram.enable();
+    let heartbeatSamples = 0;
+    let heartbeatMaxGap = 0;
+    let lastHeartbeatAt;
+    const heartbeat = setInterval(() => {
+        const now = performance.now();
+        if (lastHeartbeatAt !== undefined) {
+            heartbeatMaxGap = Math.max(heartbeatMaxGap, now - lastHeartbeatAt);
+        }
+        lastHeartbeatAt = now;
+        heartbeatSamples++;
+    }, 10);
+    heartbeat.unref?.();
+
+    return await new Promise((resolve) => {
+        let stopped = false;
+        const clearScheduled = () => {
+            if (scheduledHandle === undefined) return;
+            if (scheduledKind === "immediate") clearImmediate(scheduledHandle);
+            else clearTimeout(scheduledHandle);
+            scheduledHandle = undefined;
+            scheduledKind = undefined;
+        };
+        const finish = () => {
+            if (stopped) return;
+            stopped = true;
+            clearScheduled();
+            clearInterval(heartbeat);
+            histogram.disable();
+            resolve({
+                kind,
+                workMillis,
+                elapsedMillis: round(performance.now() - startedAt),
+                callbacks,
+                immediateCallbacks,
+                timerCallbacks,
+                timerYields,
+                overlaps,
+                counts,
+                dispatchSkew: Math.max(...counts) - Math.min(...counts),
+                maxPollGapsMillis: maximumGaps.map(round),
+                maxPollGapMillis: round(Math.max(...maximumGaps)),
+                heartbeatSamples,
+                heartbeatMaxGapMillis: round(heartbeatMaxGap),
+                eventLoopDelay: eventLoopEvidence(histogram),
+            });
+        };
+        const schedule = (mode) => {
+            if (stopped || scheduledHandle !== undefined) return;
+            if (mode === "immediate") {
+                scheduledKind = "immediate";
+                scheduledHandle = setImmediate(() => {
+                    scheduledHandle = undefined;
+                    scheduledKind = undefined;
+                    immediateCallbacks++;
+                    run("immediate");
+                });
+            }
+            else {
+                scheduledKind = "timer";
+                scheduledHandle = setTimeout(() => {
+                    scheduledHandle = undefined;
+                    scheduledKind = undefined;
+                    timerCallbacks++;
+                    if (mode === "timer-yield") timerYields++;
+                    run(mode);
+                }, mode === "timer-1" ? 1 : 0);
+            }
+        };
+        const run = (trigger) => {
+            if (stopped) return;
+            if (running) {
+                overlaps++;
+                return;
+            }
+            running = true;
+            const callbackStartedAt = performance.now();
+            if (lastCallbackAt !== undefined) {
+                // Keep the variable live for parity with the production
+                // scheduler's inter-callback evidence.
+                void (callbackStartedAt - lastCallbackAt);
+            }
+            lastCallbackAt = callbackStartedAt;
+            callbacks++;
+            const dispatchLimit = Math.min(BATCH_LIMIT, CLIENT_COUNT);
+            for (let index = 0; index < dispatchLimit; index++) {
+                if (index > 0 && performance.now() - callbackStartedAt >=
+                    CALLBACK_WORK_BUDGET_MILLIS) break;
+                const client = cursor;
+                cursor = (cursor + 1) % CLIENT_COUNT;
+                counts[client]++;
+                busyWait(workMillis);
+                const pollAt = performance.now();
+                if (lastPollAt[client] !== undefined) {
+                    maximumGaps[client] = Math.max(
+                        maximumGaps[client], pollAt - lastPollAt[client]);
+                }
+                lastPollAt[client] = pollAt;
+                if (performance.now() - callbackStartedAt >= CALLBACK_WORK_BUDGET_MILLIS) break;
+            }
+            running = false;
+            if (performance.now() - startedAt >= RUN_MILLIS || callbacks >= 100_000) {
+                finish();
+                return;
+            }
+            if (trigger === "timer" || trigger === "timer-yield" || trigger === "timer-1") {
+                turnsSinceTimer = 0;
+            }
+            else {
+                turnsSinceTimer++;
+            }
+            if (kind === "hybrid") {
+                const timerYield = turnsSinceTimer >= 256;
+                if (timerYield) turnsSinceTimer = 0;
+                schedule(timerYield ? "timer-yield" : "immediate");
+            }
+            else {
+                schedule(kind === "immediate" ? "immediate" : kind);
+            }
+        };
+        // Give every candidate a real asynchronous first turn.  This also
+        // exercises the Windows zero-delay timer path in the hybrid policy.
+        schedule(kind === "hybrid" ? "timer-yield" : kind);
+        setTimeout(finish, HARD_STOP_MILLIS).unref?.();
+    });
+}
+
+// Deterministic model of the production due/readiness filter.  It deliberately
+// keeps the same four-client cap and cursor advancement as the real scheduler,
+// but uses plain objects so the regression is server-free and repeatable.
+function modelDispatch(clients, cursor, now, batchLimit = BATCH_LIMIT) {
+    if (clients.length === 0) return {
+        ids: [], cursor: 0, idle: true, inspected: 0, fairnessSkips: 0,
+    };
+    let nextCursor = cursor >= clients.length ? 0 : cursor;
+    const visited = new Set();
+    const ids = [];
+    let inspected = 0;
+    let fairnessSkips = 0;
+    const live = clients.filter((client) => client !== undefined &&
+        !client.closed && !client.pollingPaused && !client.failure);
+    const fairnessFloor = live.length === 0 ? 0 : Math.min(...live.map((client) =>
+        client.dispatchCount ?? 0));
+    while (inspected < clients.length && ids.length < batchLimit) {
+        const client = clients[nextCursor];
+        nextCursor = (nextCursor + 1) % clients.length;
+        inspected++;
+        if (client === undefined || visited.has(client.id)) continue;
+        visited.add(client.id);
+        if (client.closed || client.pollingPaused || client.failure) continue;
+        const ready = now >= client.nextPollDueAt;
+        if (!ready) continue;
+        if ((client.dispatchCount ?? 0) > fairnessFloor) {
+            fairnessSkips++;
+            continue;
+        }
+        ids.push(client.id);
+        // Model a successful poll. Queued input is observed at the next
+        // scheduler-owned due turn rather than bypassing peer fairness.
+        client.nextPollDueAt = now + 1;
+        client.pendingInbound = false;
+        client.dispatchCount = (client.dispatchCount ?? 0) + 1;
+    }
+    const currentLive = clients.filter((client) => client !== undefined &&
+        !client.closed && !client.pollingPaused && !client.failure);
+    const currentFloor = currentLive.length === 0 ? 0 : Math.min(...currentLive.map((client) =>
+        client.dispatchCount ?? 0));
+    const readyAfter = clients.some((client) =>
+        client !== undefined && !client.closed && !client.pollingPaused &&
+        !client.failure &&
+        (client.dispatchCount ?? 0) <= currentFloor &&
+        now >= client.nextPollDueAt);
+    return {
+        ids,
+        cursor: nextCursor,
+        idle: ids.length === 0 || !readyAfter,
+        inspected,
+        fairnessSkips,
+    };
+}
+
+function makeModelClients({ dueAt = 100, pending = [] } = {}) {
+    const pendingIds = new Set(pending);
+    return Array.from({ length: CLIENT_COUNT }, (_, id) => ({
+        id,
+        nextPollDueAt: dueAt,
+        pendingInbound: pendingIds.has(id),
+        closed: false,
+        pollingPaused: false,
+        failure: undefined,
+        dispatchCount: 0,
+    }));
+}
+
+// Deterministic model for the shared 20 Hz PLAY tick service. It permits one
+// send per scheduler turn, preserves the 50 ms cadence, and re-anchors after a
+// delayed turn instead of emitting a catch-up burst that would contend with
+// inbound parsing.
+function modelPlayTick(state, now) {
+    if (!state.active || state.closed || state.phase !== "play" ||
+        state.paused || now < state.nextDueAt) return false;
+    const dueAt = state.nextDueAt;
+    state.ticks++;
+    state.lastTickAt = now;
+    const nextDueAt = dueAt + 50;
+    if (nextDueAt < now) {
+        state.skippedPeriods += Math.max(1, Math.ceil((now - nextDueAt) / 50));
+        state.nextDueAt = now + 50;
+    }
+    else {
+        state.nextDueAt = nextDueAt;
+    }
+    return true;
+}
+
+function modelPlayTickBatch(states, cursor, now, limit = BATCH_LIMIT) {
+    let nextCursor = states.length === 0 ? 0 : cursor % states.length;
+    let serviced = 0;
+    let sent = 0;
+    for (let attempts = 0;
+        attempts < states.length && serviced < Math.min(limit, states.length);
+        attempts++) {
+        const state = states[nextCursor];
+        nextCursor = (nextCursor + 1) % states.length;
+        if (state === undefined || state.closed || state.paused || !state.active) continue;
+        serviced++;
+        if (modelPlayTick(state, now)) sent++;
+    }
+    return { cursor: nextCursor, serviced, sent };
+}
+
+function modelIsPlayTickDue(state, now) {
+    if (state === undefined || state === null || state.closed || state.paused ||
+        state.failure !== undefined || state.phase !== "play" ||
+        state.active !== true) return false;
+    const dueAt = Number(state.nextDueAt);
+    const current = Number(now);
+    return Number.isFinite(dueAt) && Number.isFinite(current) && current >= dueAt;
+}
+
+function modelCountDuePlayTicks(states, now) {
+    return states.reduce((count, state) =>
+        count + (modelIsPlayTickDue(state, now) ? 1 : 0), 0);
+}
+
+// Bounded callback-tail retention model.  Only callbacks at/above the strict
+// 16.7 ms frame threshold enter the diagnostic ring; the strict gate itself
+// remains a separate assertion in browser-full-path-stress.mjs.
+function retainCallbackTailSample(state, sample) {
+    if (sample.durationRawMillis < 16.7) return false;
+    state.total++;
+    state.samples.push(sample);
+    state.samples.sort((left, right) =>
+        right.durationRawMillis - left.durationRawMillis ||
+        left.callbackSequence - right.callbackSequence);
+    if (state.samples.length > 64) {
+        state.samples.length = 64;
+        state.dropped++;
+    }
+    return true;
+}
+
+{
+    const tail = { total: 0, dropped: 0, samples: [] };
+    assert.equal(retainCallbackTailSample(tail, {
+        callbackSequence: 1, durationRawMillis: 16.699,
+    }), false, "fast callback entered the slow-tail ring");
+    assert.deepEqual(tail, { total: 0, dropped: 0, samples: [] },
+        "fast callback changed slow-tail counters");
+    for (let sequence = 1; sequence <= 65; sequence++) {
+        retainCallbackTailSample(tail, {
+            callbackSequence: sequence,
+            durationRawMillis: 16.7 + sequence / 1000,
+        });
+    }
+    assert.equal(tail.total, 65, "slow-tail total did not count every candidate");
+    assert.equal(tail.samples.length, 64, "slow-tail ring exceeded its hard limit");
+    assert.equal(tail.dropped, 1, "slow-tail dropped count did not track overflow");
+    assert.equal(tail.total, tail.samples.length + tail.dropped,
+        "slow-tail total/retained/dropped accounting diverged");
+    assert.ok(tail.samples.every((sample) => sample.durationRawMillis >= 16.7),
+        "slow-tail ring retained a sub-threshold sample");
+    for (let index = 1; index < tail.samples.length; index++) {
+        const previous = tail.samples[index - 1];
+        const current = tail.samples[index];
+        assert.ok(previous.durationRawMillis > current.durationRawMillis ||
+            previous.durationRawMillis === current.durationRawMillis &&
+                previous.callbackSequence <= current.callbackSequence,
+        "slow-tail ring ordering was not duration-desc/sequence-asc");
+    }
+    const phaseTimings = {
+        beforeTickLoop: 0.3,
+        afterTickLoop: 2.1,
+        beforePollLoop: 2.1,
+        afterPollLoop: 8.4,
+        beforeFinalEvidence: 9.0,
+        afterFinalEvidence: 16.8,
+    };
+    const phaseValues = Object.values(phaseTimings);
+    assert.ok(phaseValues.every((value, index) => index === 0 ||
+        value >= phaseValues[index - 1]),
+    "callback-tail phase timings were not monotonic");
+}
+
+{
+    const ticks = {
+        active: true,
+        closed: false,
+        phase: "play",
+        paused: false,
+        nextDueAt: 0,
+        lastTickAt: undefined,
+        ticks: 0,
+        skippedPeriods: 0,
+    };
+    assert.equal(modelPlayTick(ticks, 0), true,
+        "shared tick service did not preserve the immediate PLAY tick");
+    assert.equal(modelPlayTick(ticks, 49), false,
+        "shared tick service sent a tick before the 50 ms due time");
+    assert.equal(modelPlayTick(ticks, 50), true,
+        "shared tick service missed the second 50 ms tick");
+    assert.equal(ticks.nextDueAt, 100,
+        "shared tick service drifted from the nominal cadence");
+    assert.equal(modelPlayTick(ticks, 260), true,
+        "shared tick service did not recover after a delayed scheduler turn");
+    assert.equal(ticks.nextDueAt, 310,
+        "delayed tick did not re-anchor its next due time");
+    assert.equal(ticks.skippedPeriods, 3,
+        "delayed tick did not account for skipped periods from the next due time");
+    const boundaryTicks = {
+        active: true,
+        closed: false,
+        phase: "play",
+        paused: false,
+        nextDueAt: 100,
+        ticks: 0,
+        skippedPeriods: 0,
+    };
+    assert.equal(modelPlayTick(boundaryTicks, 250), true,
+        "boundary delayed tick was not serviced");
+    assert.equal(boundaryTicks.skippedPeriods, 2,
+        "exact-period delay must count from nextDueAt with ceil semantics");
+    ticks.paused = true;
+    assert.equal(modelPlayTick(ticks, 400), false,
+        "paused client emitted a shared tick");
+
+    const tickClients = Array.from({ length: 16 }, () => ({
+        active: true,
+        closed: false,
+        phase: "play",
+        paused: false,
+        nextDueAt: 0,
+        ticks: 0,
+        skippedPeriods: 0,
+    }));
+    const firstBatch = modelPlayTickBatch(tickClients, 0, 0);
+    const secondBatch = modelPlayTickBatch(tickClients, firstBatch.cursor, 0);
+    assert.equal(firstBatch.serviced, BATCH_LIMIT,
+        "shared tick batch exceeded/under-ran its bounded first turn");
+    assert.equal(secondBatch.serviced, BATCH_LIMIT,
+        "shared tick batch did not retain its independent fair cursor");
+    assert.ok(firstBatch.sent + secondBatch.sent <= BATCH_LIMIT * 2,
+        "shared tick batch emitted more than its per-turn cap");
+}
+
+// A bounded tick batch must not park the continuation while peers still have
+// due PLAY ticks. With eight due clients and a four-client cap, the first turn
+// services four and the remaining four force an immediate next turn rather
+// than the one-millisecond idle timer (whose host quantization inflated the
+// previous tier-8 tick p99).
+{
+    const dueClients = Array.from({ length: CLIENT_COUNT }, () => ({
+        active: true,
+        closed: false,
+        phase: "play",
+        paused: false,
+        failure: undefined,
+        nextDueAt: 0,
+        ticks: 0,
+        skippedPeriods: 0,
+    }));
+    const first = modelPlayTickBatch(dueClients, 0, 0, BATCH_LIMIT);
+    assert.equal(first.serviced, BATCH_LIMIT,
+        "due PLAY model exceeded its per-turn service cap");
+    assert.equal(first.sent, BATCH_LIMIT,
+        "due PLAY model did not service the first bounded batch");
+    const dueAfterFirst = modelCountDuePlayTicks(dueClients, 0);
+    assert.equal(dueAfterFirst, CLIENT_COUNT - BATCH_LIMIT,
+        "unserviced due PLAY clients were not retained for the next turn");
+    const continuation = dueAfterFirst > 0 ? "immediate" : "idle";
+    assert.equal(continuation, "immediate",
+        "remaining due PLAY ticks incorrectly selected idle backoff");
+    const second = modelPlayTickBatch(dueClients, first.cursor, 0, BATCH_LIMIT);
+    assert.equal(second.serviced, BATCH_LIMIT,
+        "second due PLAY batch did not preserve the bounded cap");
+    assert.equal(modelCountDuePlayTicks(dueClients, 0), 0,
+        "all due PLAY clients were not drained across immediate turns");
+    assert.equal(
+        modelCountDuePlayTicks(dueClients.map((state) => ({ ...state,
+            paused: true,
+            nextDueAt: 0,
+        })), 0),
+        0,
+        "paused PLAY clients incorrectly forced an immediate continuation");
+}
+
+// Immediate-readiness model: a split outer VarInt/packet must wait for the
+// bridge or the normal due cadence, while a complete frame wakes immediately.
+function modelHasImmediateInbound(buffer, bridgePending = false) {
+    const bytes = Buffer.from(buffer ?? []);
+    if (bytes.byteLength > 0) {
+        let value = 0;
+        for (let index = 0; index < 5; index++) {
+            if (index >= bytes.byteLength) break;
+            const next = bytes[index];
+            value |= (next & 0x7f) << (index * 7);
+            if ((next & 0x80) === 0) {
+                const frameEnd = index + 1 + value;
+                if (value < 0 || !Number.isSafeInteger(frameEnd)) return true;
+                if (frameEnd <= bytes.byteLength) return true;
+                break;
+            }
+        }
+    }
+    return bridgePending;
+}
+
+assert.equal(modelHasImmediateInbound(Buffer.from([0x80])), false,
+    "split outer VarInt must not manufacture an immediate wake-up");
+assert.equal(modelHasImmediateInbound(Buffer.from([0x80]), true), true,
+    "split outer VarInt must wake when the bridge has another chunk");
+assert.equal(modelHasImmediateInbound(Buffer.from([0x01, 0xaa])), true,
+    "complete outer frame must wake immediately");
+assert.equal(modelHasImmediateInbound(Buffer.from([0x03, 0xaa])), false,
+    "incomplete outer payload must remain on due cadence");
+
+// Idle filtering: a fully quiescent client set must not receive a fallback
+// no-op poll, and the scheduler must select its idle timer continuation.
+{
+    const idleClients = makeModelClients({ dueAt: 100 });
+    const idle = modelDispatch(idleClients, 0, 0);
+    assert.deepEqual(idle.ids, [], "all-not-due clients were spuriously polled");
+    assert.equal(idle.idle, true, "all-not-due clients did not select idle backoff");
+    assert.equal(idle.inspected, CLIENT_COUNT,
+        "idle filter stopped before inspecting the visible client set");
+}
+
+// A queued inbound frame does not bypass nextPollDueAt.  This is the
+// starvation regression: a continuously busy client must wait for its fair
+// due turn instead of monopolising setImmediate while peers are parked.
+{
+    const pendingClients = makeModelClients({ dueAt: 100, pending: [6] });
+    const pending = modelDispatch(pendingClients, 0, 0);
+    assert.deepEqual(pending.ids, [],
+        "pending inbound client bypassed the fairness due boundary");
+    assert.equal(pending.idle, true,
+        "not-due pending client did not select idle backoff");
+}
+
+// Due clients retain strict round-robin ordering across bounded callbacks.
+{
+    const dueClients = makeModelClients({ dueAt: 0 });
+    const first = modelDispatch(dueClients, 0, 0);
+    const second = modelDispatch(dueClients, first.cursor, 0);
+    assert.deepEqual(first.ids, [0, 1, 2, 3], "first due batch lost round-robin order");
+    assert.deepEqual(second.ids, [4, 5, 6, 7], "second due batch lost round-robin order");
+    assert.ok(first.ids.length <= BATCH_LIMIT && second.ids.length <= BATCH_LIMIT,
+        "due model exceeded MAX_CLIENTS_PER_POLL_CALLBACK");
+}
+
+// Fairness floor regression: a continuously-ready client may not take a
+// second turn until every visible peer has received its first turn.  Repeating
+// the model at due times must keep the count spread at one or less, including
+// when the shared callback is capped at four clients.
+{
+    const busyClients = makeModelClients({ dueAt: 0, pending: [0] });
+    let busyCursor = 0;
+    for (let now = 0; now <= 8; now++) {
+        const result = modelDispatch(busyClients, busyCursor, now);
+        busyCursor = result.cursor;
+    }
+    const counts = busyClients.map((client) => client.dispatchCount ?? 0);
+    assert.ok(Math.max(...counts) - Math.min(...counts) <= 1,
+        "fairness floor allowed a busy client to run more than one turn ahead");
+    assert.ok(busyClients[0].dispatchCount <= busyClients[7].dispatchCount + 1,
+        "busy inbound client bypassed the visible-client fairness floor");
+}
+
+// Closed/paused/failed clients are never revived by an unconditional fallback.
+{
+    const retired = makeModelClients({ dueAt: 0 });
+    for (const client of retired) client.pollingPaused = true;
+    const result = modelDispatch(retired, 0, 0);
+    assert.deepEqual(result.ids, [], "paused clients were dispatched by fallback");
+    assert.equal(result.idle, true, "retired client set did not choose idle backoff");
+}
+
+const results = [];
+for (const kind of ["hybrid", "immediate", "timer-0", "timer-1"]) {
+    results.push(await runCandidate(kind));
+}
+// Regression guard for the failure mode that motivated this smoke: if every
+// 2--3 ms parser turn forces a zero-delay timer, Windows timer quantization can
+// turn an otherwise healthy eight-client loop into ~32 ms gaps.  The hybrid
+// policy must keep the immediate path dominant and yield on the bounded
+// 256-turn cadence instead of timer-yielding after each heavy callback.
+const heavyHybrid = await runCandidate("hybrid", 2.5);
+const heavyTimerBaseline = await runCandidate("timer-0", 2.5);
+results.push(heavyHybrid, heavyTimerBaseline);
+
+for (const result of results) {
+    assert.equal(result.overlaps, 0, `${result.kind}: overlapping callbacks`);
+    assert.ok(result.callbacks > 0, `${result.kind}: no callbacks ran`);
+    assert.ok(result.counts.every((count) => count > 0),
+        `${result.kind}: a synthetic client was starved`);
+    assert.ok(result.dispatchSkew <= 1,
+        `${result.kind}: round-robin skew exceeded one dispatch`);
+}
+const hybrid = results[0];
+assert.ok(hybrid.immediateCallbacks > 0,
+    "hybrid scheduler never exercised setImmediate");
+assert.ok(hybrid.timerYields > 0,
+    "hybrid scheduler never exercised the bounded timer yield");
+assert.ok(heavyHybrid.immediateCallbacks > heavyHybrid.timerYields * 2,
+    "heavy hybrid loop regressed to a timer after every parser turn");
+assert.ok(heavyHybrid.maxPollGapMillis <= 100,
+    `heavy hybrid poll gap exceeded strict max: ${heavyHybrid.maxPollGapMillis}ms`);
+assert.ok(heavyHybrid.maxPollGapMillis <=
+    heavyTimerBaseline.maxPollGapMillis + 5,
+    `heavy hybrid gap ${heavyHybrid.maxPollGapMillis}ms exceeded timer baseline ` +
+        `${heavyTimerBaseline.maxPollGapMillis}ms by more than scheduler jitter`);
+
+console.log(JSON.stringify({
+    ok: true,
+    schemaVersion: "gaius.browser-client-poll-scheduler-smoke.v1",
+    clients: CLIENT_COUNT,
+    batchLimit: BATCH_LIMIT,
+    callbackWorkBudgetMillis: CALLBACK_WORK_BUDGET_MILLIS,
+    runMillis: RUN_MILLIS,
+    strictPollGapTarget: { p99Millis: 16.7, p999Millis: 50, maxMillis: 100 },
+    results,
+}));

@@ -10,7 +10,10 @@ const fullPathScript = fileURLToPath(
     new URL("./browser-full-path-smoke.mjs", import.meta.url));
 const acceptanceRunnerPath = fileURLToPath(
     new URL("./browser-full-path-acceptance.mjs", import.meta.url));
+const stressRunnerPath = fileURLToPath(
+    new URL("./browser-full-path-stress.mjs", import.meta.url));
 const relayMainPath = fileURLToPath(new URL("./dist/main.js", import.meta.url));
+const protocolPath = fileURLToPath(new URL("./dist/protocol.js", import.meta.url));
 const multiplayerPath = fileURLToPath(new URL("./multiplayer-smoke.mjs", import.meta.url));
 const verifyRuntimePath = fileURLToPath(
     new URL("./deploy/verify-runtime.sh", import.meta.url));
@@ -139,6 +142,127 @@ for (const expected of expectedProfiles) {
     ]);
 }
 
+for (const expected of expectedProfiles) {
+    for (const tier of [8, 16]) {
+        const desiredChunksPerTick = tier === 8 ? 32 : 64;
+        const soakMillis = tier === 8 ? 60_000 : 120_000;
+        const reconnectWaves = tier === 8 ? 2 : 4;
+        const clientLifecycles = tier === 8 ? 24 : 80;
+        const stress = configuration(expected.path, {
+            GAIUS_BROWSER_FULL_PATH_ACCEPTANCE: "0",
+            GAIUS_BROWSER_FULL_PATH_STRESS: "1",
+            GAIUS_BROWSER_FULL_PATH_STRESS_TIER: String(tier),
+            GAIUS_BROWSER_FULL_PATH_CLIENTS: String(tier),
+            GAIUS_BROWSER_FULL_PATH_MIN_CHUNKS: "257",
+            GAIUS_BROWSER_FULL_PATH_SOAK_MS: String(soakMillis),
+            GAIUS_BROWSER_FULL_PATH_RECONNECT_WAVES: String(reconnectWaves),
+            GAIUS_BROWSER_FULL_PATH_CLIENT_VIEW_DISTANCE: "8",
+            GAIUS_BROWSER_FULL_PATH_SERVER_VIEW_DISTANCE: "8",
+            GAIUS_BROWSER_FULL_PATH_DESIRED_CHUNKS_PER_TICK:
+                String(desiredChunksPerTick),
+        }, ["--print-config", "--stress"]);
+        assert.equal(stress.acceptanceMode, false);
+        assert.equal(stress.stressMode, true);
+        assert.equal(stress.stressTier, tier);
+        assert.equal(stress.clients, tier);
+        assert.equal(stress.performanceContract.mode, `stress-tier-${tier}`);
+        assert.equal(stress.performanceContract.minimumChunkPackets, 257);
+        assert.equal(stress.performanceContract.soakMillis, soakMillis);
+        assert.equal(stress.performanceContract.reconnectWaves, reconnectWaves);
+        assert.equal(stress.stressTarget.clientLifecycles, clientLifecycles);
+        assert.equal(stress.performanceContract.minimumChunkMetric,
+            "unique-chunk-position");
+        assert.deepEqual(stress.performanceContract.chunkWindow, {
+            clientViewDistance: 8,
+            serverViewDistance: 8,
+            effectiveRadius: 8,
+            maximumUniqueChunkCapacity: 257,
+            initialDistanceContract: {
+                source: "clientbound-login",
+                packetId: expected.protocol === 776 ? 49 : 48,
+                fields: ["chunkRadius", "simulationDistance"],
+            },
+            observedDistancePackets: {
+                cacheCenter: expected.protocol === 776 ? 94 : 92,
+                cacheRadius: expected.protocol === 776 ? 95 : 93,
+                simulationDistance: expected.protocol === 776 ? 111 : 109,
+            },
+            observedDistanceContractRequiredBeforeCounting: true,
+        });
+        assert.deepEqual(stress.performanceContract.stressLatencyDistribution, {
+            schemaVersion: "gaius.multiplayer-stress-latency-target.v1",
+            histogramSchemaVersion: "gaius.latency-histogram.v1",
+            bucketUpperBoundsMillis: [
+                1, 2, 4, 8, 16.7, 25, 50, 60, 75, 100, 250, 500, 1000, null,
+            ],
+            pollGap: { p99Millis: 16.7, p999Millis: 50, maxMillis: 100 },
+            playTickGap: { p99Millis: 60, p999Millis: 75, maxMillis: 100 },
+            preMinimumChunkGap: { p99Millis: 100, maxMillis: 250 },
+            storage: "fixed-bucket-counts-only",
+            rawSamplesRetained: false,
+        });
+        assert.deepEqual(stress.performanceContract.chunkBatch, {
+            clientboundFinishedPacketId: 11,
+            clientboundStartPacketId: 12,
+            serverboundAcknowledgementPacketId: expected.protocol === 776 ? 11 : 10,
+            desiredChunksPerTick,
+            acknowledgementEncoding: "float32-be",
+        });
+        assert.equal(stress.identityContract.explicitProfileUsernameMap, true);
+        assert.equal(stress.identityContract.uniqueProfiles, tier);
+        assert.equal(stress.identityContract.uniqueUsernames, tier);
+        assert.equal(stress.identityContract.identities.length, tier);
+        for (const identity of stress.identityContract.identities) {
+            assert.match(identity.profileId, /^[0-9a-f]{32}$/u);
+            assert.match(identity.username, /^[A-Za-z0-9_]{1,16}$/u);
+        }
+    }
+}
+
+// The dedicated runner is canonical-local by construction. Deliberately feed
+// it a 1.21.11 profile plus an external target and shared-output roots; its
+// print-only child must still resolve the immutable 26.2 extreme contract.
+const canonicalStressRunner = JSON.parse(execFileSync(process.execPath, [
+    stressRunnerPath, "--print-config", "--tier=16",
+], {
+    cwd: bridgeDirectory,
+    env: sanitizedEnvironment("versions/1.21.11.json", {
+        GAIUS_EXTERNAL_RELAY_URL: "wss://example.invalid/tunnel",
+        GAIUS_EXTERNAL_TARGET: "example.invalid:25565",
+        GAIUS_BUILD_ROOT: "poison-build-root",
+        GAIUS_DIST_DIRECTORY: "poison-dist-root",
+    }),
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+}));
+assert.equal(canonicalStressRunner.ok, true);
+assert.deepEqual(canonicalStressRunner.tiers, [16]);
+assert.equal(canonicalStressRunner.configurations[0].profile.id, "26.2");
+assert.equal(canonicalStressRunner.configurations[0].profile.protocolVersion, 776);
+assert.equal(canonicalStressRunner.configurations[0].profile.worldVersion, 4903);
+assert.equal(canonicalStressRunner.configurations[0].clients, 16);
+
+expectConfigurationFailure("versions/26.2.json", {
+    GAIUS_BROWSER_FULL_PATH_ACCEPTANCE: "1",
+    GAIUS_BROWSER_FULL_PATH_STRESS: "1",
+}, ["--print-config", "--acceptance", "--stress"]);
+expectConfigurationFailure("versions/26.2.json", {
+    GAIUS_BROWSER_FULL_PATH_STRESS: "1",
+    GAIUS_BROWSER_FULL_PATH_STRESS_TIER: "32",
+}, ["--print-config", "--stress"]);
+expectConfigurationFailure("versions/26.2.json", {
+    GAIUS_BROWSER_FULL_PATH_STRESS: "1",
+    GAIUS_BROWSER_FULL_PATH_STRESS_TIER: "8",
+    GAIUS_BROWSER_FULL_PATH_CLIENTS: "8",
+    GAIUS_BROWSER_FULL_PATH_MIN_CHUNKS: "257",
+    GAIUS_BROWSER_FULL_PATH_SOAK_MS: "60000",
+    GAIUS_BROWSER_FULL_PATH_RECONNECT_WAVES: "2",
+    GAIUS_BROWSER_FULL_PATH_CLIENT_VIEW_DISTANCE: "8",
+    GAIUS_BROWSER_FULL_PATH_SERVER_VIEW_DISTANCE: "8",
+    GAIUS_BROWSER_FULL_PATH_DESIRED_CHUNKS_PER_TICK: "32",
+    GAIUS_EXTERNAL_RELAY_URL: "wss://example.invalid/tunnel",
+}, ["--print-config", "--stress"]);
+
 // The contract runner itself must not inherit a developer's strict gate.  This
 // deliberately pollutes the parent environment with every browser gate knob;
 // configuration() must clear all of them and inject the compatibility baseline.
@@ -262,15 +386,37 @@ assert.equal(configuration("versions/26.2.json", {
 assert.equal(configuration("versions/1.21.11.json", {
     GAIUS_BROWSER_FULL_PATH_RECONNECT_WAVES: "999",
 }).performanceContract.reconnectWaves, 8);
+for (const [radius, capacity] of [[2, 25], [4, 77], [6, 157], [8, 257]]) {
+    const configured = configuration("versions/26.2.json", {
+        GAIUS_BROWSER_FULL_PATH_CLIENT_VIEW_DISTANCE: String(radius),
+        GAIUS_BROWSER_FULL_PATH_SERVER_VIEW_DISTANCE: String(radius),
+    });
+    assert.equal(configured.performanceContract.chunkWindow.effectiveRadius, radius);
+    assert.equal(configured.performanceContract.chunkWindow.maximumUniqueChunkCapacity, capacity);
+}
 
-const [relayMain, fullPathSource, multiplayerSource, verifyRuntimeSource] = await Promise.all([
+assert.throws(() => execFileSync(process.execPath, [fullPathScript], {
+    cwd: bridgeDirectory,
+    env: sanitizedEnvironment("versions/26.2.json", {
+        GAIUS_BROWSER_FULL_PATH_MIN_CHUNKS: "128",
+        GAIUS_BROWSER_FULL_PATH_CLIENT_VIEW_DISTANCE: "6",
+        GAIUS_BROWSER_FULL_PATH_SERVER_VIEW_DISTANCE: "2",
+    }),
+    stdio: ["ignore", "pipe", "pipe"],
+}), /Command failed/u,
+"execution accepted a chunk target above the effective radius capacity");
+
+const [relayMain, fullPathSource, multiplayerSource, verifyRuntimeSource,
+    protocolSource] = await Promise.all([
     readFile(relayMainPath, "utf8"),
     readFile(fullPathScript, "utf8"),
     readFile(multiplayerPath, "utf8"),
     readFile(verifyRuntimePath, "utf8"),
+    readFile(protocolPath, "utf8"),
 ]);
-const [acceptanceRunner, packageSource] = await Promise.all([
+const [acceptanceRunner, stressRunner, packageSource] = await Promise.all([
     readFile(acceptanceRunnerPath, "utf8"),
+    readFile(stressRunnerPath, "utf8"),
     readFile(packagePath, "utf8"),
 ]);
 assert.match(fullPathSource,
@@ -308,6 +454,18 @@ assert.match(fullPathSource,
 assert.match(fullPathSource,
     /GAIUS_BROWSER_FULL_PATH_RECONNECT_WAVES/);
 assert.match(fullPathSource,
+    /partialEvidence:\s*\{[\s\S]*?clients: allClients\.map\(\(client\) =>\s*clientLivenessEvidence\(client\)\)/,
+"failure evidence does not retain every client latency histogram");
+assert.match(fullPathSource,
+    /browserRuntime: partialBrowserRuntime/,
+"failure evidence does not retain the browser transport snapshot");
+assert.match(fullPathSource,
+    /relayRuntime: partialRelayRuntime/,
+"failure evidence does not retain the RelayNode runtime snapshot");
+assert.match(fullPathSource,
+    /performanceContract: browserFullPathPerformanceContract\(\)/,
+"failure evidence does not bind diagnostics to the fixed performance contract");
+assert.match(fullPathSource,
     /assertSoakLiveness\(/);
 assert.match(fullPathSource,
     /onlineEncryptionResult\(\)/);
@@ -331,6 +489,21 @@ assert.match(fullPathSource,
     /decoderCumulationBytes/);
 assert.match(fullPathSource,
     /decodedPacketQueue/);
+assert.match(fullPathSource,
+    /const BROWSER_QUEUED_PACKET_SLOW_EVENT_LIMIT = 64/);
+assert.match(fullPathSource,
+    /queuedPacketHandleSamples: runtime\.stats\.queuedPacketHandleSamples \?\? null/);
+assert.match(fullPathSource,
+    /maxQueuedPacketHandleMillis: runtime\.stats\.maxQueuedPacketHandleMillis \?\? null/);
+assert.match(fullPathSource,
+    /maxQueuedPacketHandleType:[\s\S]*?typeof runtime\.stats\.maxQueuedPacketHandleType === "string"[\s\S]*?: null/);
+assert.match(fullPathSource,
+    /slowQueuedPacketEventSequence:[\s\S]*?runtime\.stats\.slowQueuedPacketEventSequence \?\? null/);
+assert.match(fullPathSource,
+    /slowQueuedPacketEventsDropped:[\s\S]*?runtime\.stats\.slowQueuedPacketEventsDropped \?\? null/);
+assert.match(fullPathSource,
+    /slowQueuedPacketEvents: Array\.isArray\(runtime\.stats\.slowQueuedPacketEvents\)[\s\S]*?\.slice\(-BROWSER_QUEUED_PACKET_SLOW_EVENT_LIMIT\)[\s\S]*?\.map\(\(event\) => \(\{ \.\.\.event \}\)\)/,
+    "full-path evidence must defensively copy at most 64 queued-handler slow events");
 assert.match(fullPathSource,
     /browserRuntimeCleanupGaugeEvidence/);
 assert.match(fullPathSource,
@@ -375,19 +548,295 @@ assert.match(fullPathSource,
 assert.match(fullPathSource,
     /maxPreMinimumChunkPacketGapMillis: 500/);
 assert.match(fullPathSource,
-    /function assertClientPerformance\(client, label\)/);
+    /function assertClientPerformance\(client, label, options = \{\}\)/);
 assert.match(fullPathSource,
     /function startSoakPerformanceObservation\(clients, browserRuntime\)/);
 assert.match(fullPathSource,
     /maxBrowserEventLoopGapMillis/);
 assert.match(fullPathSource,
     /assertSoakPerformance\(soakPerformance, "post-soak multiplayer performance"\)/);
+assert.match(fullPathSource,
+    /async function waitForBrowserInboundFlowReady\(runtime, label\)/);
+assert.match(fullPathSource,
+    /const evidence = browserInboundFlowEvidence\(snapshot, label\);[\s\S]*?return evidence\.ready/);
+assert.match(fullPathSource,
+    /assert\.ok\(evidence\.withinPauseLimit !== false/);
+assert.ok(
+    (fullPathSource.match(/await finishBrowserInboundFlowWindow\(/g) ?? []).length >= 4,
+    "inbound-flow window evidence must gate initial, pre-drop, reconnect, and post-soak paths",
+);
+assert.match(fullPathSource,
+    /inboundFlowEvidence\.initialConnectThroughMinimumChunks\s*=\s*\n?\s*await finishBrowserInboundFlowWindow/);
+assert.match(fullPathSource,
+    /inboundFlowEvidence\.reconnectWaves\.push\([\s\S]*?reconnectInboundFlow/);
+assert.match(fullPathSource,
+    /preDrop: preDropInboundFlow/);
+assert.match(fullPathSource,
+    /inboundFlowEvidence\.steadySoak = await finishBrowserInboundFlowWindow/);
+assert.match(fullPathSource,
+    /inboundFlowEvidence\.finalCleanup = assertBrowserInboundFlowWindow\(/);
+assert.match(fullPathSource,
+    /schemaVersion: BROWSER_INBOUND_FLOW_WINDOW_SCHEMA/);
+assert.match(fullPathSource,
+    /schemaVersion: "gaius\.browser-inbound-flow-evidence\.v1"/);
+assert.match(fullPathSource,
+    /maxContinuousFlowPauseMillis/);
+assert.match(fullPathSource,
+    /activeHighWatermarkLongestMillis/);
+assert.match(fullPathSource,
+    /source: "per-channel-high-watermark"/);
+assert.match(fullPathSource,
+    /const key = "browser-inbound-flow-stall";[\s\S]*?type: key/);
+assert.match(fullPathSource,
+    /MULTIPLAYER_PERFORMANCE_TARGET\.maxSoakPhaseStallMillis/);
+assert.match(fullPathSource,
+    /inboundFlow: inboundFlowEvidence/);
+assert.match(fullPathSource,
+    /00000000000040008000.*toString\(16\)\.padStart\(12, "0"\)/);
+assert.match(fullPathSource,
+    /profileUsernames: new Map/);
+assert.match(fullPathSource,
+    /state\.profileUsernames\.get\(String\(id\)\)/);
+assert.match(fullPathSource,
+    /clientboundChunkBatchStart/);
+assert.match(fullPathSource,
+    /clientboundChunkBatchFinished/);
+assert.match(fullPathSource,
+    /serverboundChunkBatchReceived/);
+assert.match(fullPathSource,
+    /stress tiers require the canonical local RelayNode and vanilla server/);
+assert.match(fullPathSource,
+    /function assertBrowserOutboundContinuationScheduler\(snapshot, label\)/);
+assert.match(fullPathSource,
+    /multiplayer budget continuation regressed to a clamped timer/);
+assert.match(fullPathSource,
+    /MessageChannel-one-callback-per-task/);
+assert.match(fullPathSource,
+    /client\.chunkBatchStarts, client\.chunkBatchFinished/);
+assert.match(fullPathSource,
+    /client\.chunkBatchFinished, client\.chunkBatchAcknowledgements/);
+assert.match(fullPathSource,
+    /client\.chunkBatchOpen, false/);
+assert.match(fullPathSource,
+    /client\.chunkBatchCountMismatches, 0/);
+assert.match(fullPathSource,
+    /acknowledgement\.writeFloatBE\(desiredChunksPerTick, 0\)/);
+assert.match(fullPathSource,
+    /function chunkTrackingCapacity\(viewDistance\)/);
+assert.match(fullPathSource,
+    /normalizedX \* normalizedX \+ normalizedZ \* normalizedZ/);
+assert.match(fullPathSource,
+    /minimumChunkMetric: stressMode \? "unique-chunk-position" : "chunk-packet"/);
+assert.match(fullPathSource,
+    /stressQualifiedChunkPositions\.size >= minimumChunkPackets/);
+assert.match(fullPathSource,
+    /observedDistanceContractRequiredBeforeCounting: stressMode/);
+assert.match(fullPathSource,
+    /client\.observedChunkCacheCenter\?\.x/);
+assert.match(fullPathSource,
+    /chunkTrackingCapacity\(client\.observedChunkCacheRadius\)/);
+assert.match(fullPathSource,
+    /const LATENCY_HISTOGRAM_BUCKETS_MILLIS = Object\.freeze\(\[[\s\S]*?16\.7[\s\S]*?Infinity/);
+assert.match(fullPathSource,
+    /schemaVersion: "gaius\.latency-histogram\.v1"/);
+assert.match(fullPathSource,
+    /pollGapHistogram: latencyHistogramResult\(this\.pollGapHistogram\)/);
+assert.match(fullPathSource,
+    /playTickGapHistogram: latencyHistogramResult\(this\.playTickGapHistogram\)/);
+assert.match(fullPathSource,
+    /preMinimumChunkGapHistogram:[\s\S]*?latencyHistogramResult\(this\.preMinimumChunkGapHistogram\)/);
+assert.match(fullPathSource,
+    /const MAX_INBOUND_FRAMES_PER_POLL = 8/);
+assert.match(fullPathSource,
+    /const MAX_PACKETS_PER_POLL = 64/);
+assert.match(fullPathSource,
+    /const CLIENT_POLL_INTERVAL_MILLIS = 1/);
+assert.match(fullPathSource,
+    /const MAX_CLIENTS_PER_POLL_CALLBACK = 4/);
+assert.match(fullPathSource,
+    /function createFairClientPollScheduler\(getClients\)/);
+assert.match(fullPathSource,
+    /mode: "round-robin-bounded-batch-per-macrotask"/);
+assert.match(fullPathSource,
+    /maxBatchClients: MAX_CLIENTS_PER_POLL_CALLBACK/);
+assert.match(fullPathSource,
+    /const CALLBACK_TAIL_SLOW_THRESHOLD_MILLIS = 16\.7/);
+assert.match(fullPathSource,
+    /const CALLBACK_TAIL_SAMPLE_LIMIT = 64/);
+assert.match(fullPathSource,
+    /callbackTail: \{/);
+assert.match(fullPathSource,
+    /CALLBACK_TAIL_TELEMETRY_SCHEMA_VERSION/);
+assert.match(fullPathSource,
+    /slowCallbackSamplesTotal/);
+assert.match(fullPathSource,
+    /slowCallbackSamplesDropped/);
+assert.match(fullPathSource,
+    /retainSlowCallbackSample/);
+assert.match(fullPathSource,
+    /phaseTimingsMillis/);
+assert.match(fullPathSource,
+    /pollCandidatesInspected/);
+assert.match(fullPathSource,
+    /tickCandidatesInspected/);
+assert.match(fullPathSource,
+    /maxPerTickDurationRawMillis/);
+assert.match(fullPathSource,
+    /maxPerPollDurationRawMillis/);
+assert.match(fullPathSource,
+    /budgetReachedPhase/);
+assert.match(fullPathSource,
+    /strictFrameBudgetExcessMillis/);
+assert.match(fullPathSource,
+    /slowCallbackSamples\.length > CALLBACK_TAIL_SAMPLE_LIMIT/);
+assert.match(fullPathSource,
+    /candidate\.poll\(\);/);
+assert.doesNotMatch(fullPathSource,
+    /setInterval\(\(\) => \{\s*for \(const client of currentClients\) client\.poll\(\)/,
+    "full-path poll scheduler must not fan out every client in one timer callback");
+assert.match(fullPathSource,
+    /pollScheduler: pollScheduler\?\.evidence\(\) \?\? null/);
+assert.match(fullPathSource,
+    /while \(framesPolled < MAX_INBOUND_FRAMES_PER_POLL[\s\S]*?packetsRemaining > 0/);
+assert.match(fullPathSource,
+    /parsePackets\(maximumPackets = Number\.POSITIVE_INFINITY\)/);
+assert.match(fullPathSource,
+    /return parsedPackets;/);
+assert.match(fullPathSource,
+    /inboundDrainBudget: \{[\s\S]*?frameBudgetYields:[\s\S]*?packetBudgetYields:/);
+assert.match(fullPathSource,
+    /p99_9Millis: p999Millis/);
+assert.match(fullPathSource,
+    /latencyTarget\.pollGap\.p99Millis/);
+assert.match(fullPathSource,
+    /latencyTarget\.pollGap\.p999Millis/);
+assert.match(fullPathSource,
+    /latencyTarget\.playTickGap\.p99Millis/);
+assert.match(fullPathSource,
+    /latencyTarget\.playTickGap\.p999Millis/);
+assert.match(fullPathSource,
+    /latencyTarget\.preMinimumChunkGap\.p99Millis/);
+assert.match(fullPathSource,
+    /requireLatencyDistributions: false/);
+assert.match(fullPathSource,
+    /deferredUntilSteadySoak: !requireLatencyDistributions/);
+assert.match(multiplayerSource,
+    /acknowledgement\.writeFloatBE\(minecraftDesiredChunksPerTick, 0\)/);
+assert.match(multiplayerSource,
+    /clientboundSetChunkCacheCenter/);
+assert.match(multiplayerSource,
+    /clientboundSetChunkCacheRadius/);
+assert.match(multiplayerSource,
+    /clientboundSetSimulationDistance/);
+assert.match(protocolSource,
+    /MINECRAFT_1_21_11[\s\S]*?serverboundChunkBatchReceived: 10/);
+assert.match(protocolSource,
+    /MINECRAFT_26_2[\s\S]*?serverboundChunkBatchReceived: 11/);
+assert.match(protocolSource,
+    /MINECRAFT_1_21_11[\s\S]*?clientboundSetChunkCacheCenter: 92[\s\S]*?clientboundSetChunkCacheRadius: 93[\s\S]*?clientboundSetSimulationDistance: 109/);
+assert.match(protocolSource,
+    /MINECRAFT_26_2[\s\S]*?clientboundSetChunkCacheCenter: 94[\s\S]*?clientboundSetChunkCacheRadius: 95[\s\S]*?clientboundSetSimulationDistance: 111/);
+assert.match(protocolSource,
+    /export function decodeClientboundLoginDistances\(payload\)/);
+assert.match(fullPathSource,
+    /const initialDistances = decodeClientboundLoginDistances\(payload\)/);
+assert.match(fullPathSource,
+    /initialDistanceContract:[\s\S]*?source: "clientbound-login"[\s\S]*?fields: \["chunkRadius", "simulationDistance"\]/);
+
+// Guard the PLAY control-flow ordering, not just field presence. Distance
+// contract packets must be decoded before batch/chunk handling, and a batch
+// must open, finish, ACK, and close through one ordered branch chain.
+const playBranchOrder = [
+    "clientboundSetChunkCacheCenter",
+    "clientboundSetChunkCacheRadius",
+    "clientboundSetSimulationDistance",
+    "clientboundChunkBatchStart",
+    "clientboundChunkBatchFinished",
+    "clientboundChunk) {",
+].map((marker) => fullPathSource.indexOf(marker));
+assert.ok(playBranchOrder.every((index) => index >= 0),
+    "full-path PLAY distance/batch/chunk branch missing");
+for (let index = 1; index < playBranchOrder.length; index++) {
+    assert.ok(playBranchOrder[index - 1] < playBranchOrder[index],
+        "full-path PLAY distance/batch/chunk control flow changed order");
+}
+const batchStartBranch = fullPathSource.indexOf(
+    "else if (packetId === this.profile.play.clientboundChunkBatchStart)");
+const batchFinishedBranch = fullPathSource.indexOf(
+    "else if (packetId === this.profile.play.clientboundChunkBatchFinished)");
+const batchBranchSource = fullPathSource.slice(batchStartBranch, playBranchOrder.at(-1));
+for (const marker of [
+    "this.chunkBatchOpen = true",
+    "if (!this.chunkBatchOpen)",
+    "this.chunkBatchOpen = false",
+    "acknowledgement.writeFloatBE(desiredChunksPerTick, 0)",
+    "this.chunkBatchAcknowledgements++",
+]) {
+    assert.ok(batchBranchSource.includes(marker), `chunk-batch CFG omitted ${marker}`);
+}
+assert.ok(batchStartBranch < batchFinishedBranch,
+    "chunk-batch finished branch moved before start branch");
+assert.match(stressRunner,
+    /const tiers = runAll \? \[8, 16\]/);
+assert.match(stressRunner,
+    /maximumUniqueChunkCapacity, 257/);
+assert.match(stressRunner,
+    /const HARD_DEADLINES_MILLIS = Object\.freeze/);
+assert.match(stressRunner,
+    /timedOut[\s\S]*?stderrTail[\s\S]*?parseError/);
+assert.match(stressRunner,
+    /if \(!ok\) process\.exitCode = 1/);
+assert.match(stressRunner,
+    /function validateStressResult\(result, tier, configuration\)/);
+assert.match(stressRunner,
+    /assertInboundFlowStage\(inboundFlow\.initial/);
+assert.match(stressRunner,
+    /inboundFlow\.reconnectWaves\.length/);
+assert.match(stressRunner,
+    /assertInboundFlowStage\(inboundFlow\.postSoak/);
+assert.match(stressRunner,
+    /assertInboundFlowStage\(inboundFlow\.finalCleanup/);
+assert.match(stressRunner,
+    /const INBOUND_FLOW_EVENT_FIELDS = Object\.freeze\(\[/);
+assert.match(stressRunner,
+    /isWindowEvidence \? INBOUND_FLOW_EVENT_FIELDS : INBOUND_FLOW_EVIDENCE_FIELDS/);
+assert.match(stressRunner,
+    /uniqueChunkPositionsTowardTarget/);
+assert.match(stressRunner,
+    /capturedAtElapsedMillis/);
+assert.match(stressRunner,
+    /derivedMaximumPauseMillis/);
+assert.match(stressRunner,
+    /pauseLimitMillis/);
+assert.match(stressRunner,
+    /resultValidationError === null/);
+assert.match(stressRunner,
+    /environment\.GAIUS_VERSION_PROFILE_PATH = canonicalProfilePath/);
+assert.match(stressRunner,
+    /normalized\.startsWith\("GAIUS_EXTERNAL_"\)/);
+assert.match(stressRunner,
+    /blockedExactNames\.has\(normalized\)/);
+assert.match(stressRunner,
+    /process\.kill\(-child\.pid, "SIGTERM"\)/);
+assert.match(stressRunner,
+    /"taskkill\.exe"/);
+assert.match(stressRunner,
+    /"\/PID", String\(child\.pid\), "\/T", "\/F"/);
+assert.match(stressRunner,
+    /cleanupAttempted[\s\S]*?cleanupMethod[\s\S]*?cleanupError[\s\S]*?cleanupExitCode/);
+assert.match(packageSource,
+    /"stress:browser-full-path": "node browser-full-path-stress\.mjs"/);
 assert.match(relayMain,
     /if \(traceTunnel\) \{\s+traceTunnelEvent\(\s+`server data [\s\S]*?toString\("hex"\)/);
 assert.match(relayMain,
     /if \(traceTunnel\) \{\s+traceTunnelEvent\(\s+`client data [\s\S]*?toString\("hex"\)/);
 assert.match(relayMain,
-    /if \(traceTunnel\) \{\s+traceTunnelEvent\(\s+`proxied [\s\S]*?response\.toString\("hex"\)/);
+    /if \(traceTunnel\) \{\s+traceTunnelEvent\(\s+`proxied \$\{keepAlivePhase\} keepalive profile=\$\{profile\.protocolVersion\}`/);
+assert.doesNotMatch(relayMain,
+    /proxied [\s\S]*?response\.toString\("hex"\)/,
+    "KeepAlive trace must retain only fixed profile/phase scalars, not packet bytes");
+assert.match(relayMain,
+    /recordProxiedKeepAlive\(profile, keepAlivePhase\);/);
 assert.equal(
     (relayMain.match(/if \(traceTunnel && protocolPhase === "play"\)/g) ?? []).length,
     2,
@@ -680,6 +1129,44 @@ console.log(JSON.stringify({
             "1.21.11": "major-exactly-21",
             "26.2": "major-at-least-25",
         },
+    },
+    stressTiers: {
+        optInOnly: true,
+        clients: [8, 16],
+        uniqueChunksPerClient: 257,
+        clientViewDistance: 8,
+        serverViewDistance: 8,
+        simulationDistance: 4,
+        soakMillis: { 8: 60000, 16: 120000 },
+        reconnectWaves: { 8: 2, 16: 4 },
+        clientLifecycles: { 8: 24, 16: 80 },
+        desiredChunksPerTick: { 8: 32, 16: 64 },
+    },
+    chunkBatchProtocol: {
+        clientboundFinished: 11,
+        clientboundStart: 12,
+        serverboundAcknowledgement: { "1.21.11": 10, "26.2": 11 },
+        acknowledgementEncoding: "float32-be",
+    },
+    observedDistancePackets: {
+        initialDistanceContract: {
+            source: "clientbound-login",
+            packetIds: { "1.21.11": 48, "26.2": 49 },
+            fields: ["chunkRadius", "simulationDistance"],
+        },
+        "1.21.11": { cacheCenter: 92, cacheRadius: 93, simulationDistance: 109 },
+        "26.2": { cacheCenter: 94, cacheRadius: 95, simulationDistance: 111 },
+        requiredBeforeStressChunkCounting: true,
+    },
+    stressLatencyHistograms: {
+        bucketUpperBoundsMillis: [
+            1, 2, 4, 8, 16.7, 25, 50, 60, 75, 100, 250, 500, 1000, null,
+        ],
+        output: ["count", "p95Millis", "p99Millis", "p999Millis", "maxMillis"],
+        pollGap: { p99Millis: 16.7, p999Millis: 50, maxMillis: 100 },
+        playTickGap: { p99Millis: 60, p999Millis: 75, maxMillis: 100 },
+        preMinimumChunkGap: { p99Millis: 100, maxMillis: 250 },
+        rawSamplesRetained: false,
     },
     reconnectContract: {
         simultaneousDrop: true,
