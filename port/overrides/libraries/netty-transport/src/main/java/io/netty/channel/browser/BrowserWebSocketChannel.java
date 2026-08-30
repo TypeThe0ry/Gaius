@@ -65,6 +65,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
         }
         addChannel(this);
         initBridge();
+        initBridgeTail();
         initOutboundScheduler();
         initInboundScheduler();
     }
@@ -1399,6 +1400,100 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               ensureRelayCandidates(entry);
             }, relayParallelPreparationDelayMs);
             }
+            globalThis.__gaiusNettyBridgeBootstrapState = state;
+            globalThis.__gaiusNettyBridgeBootstrapScope = {
+              recordConnectPhase,
+              authorityHost,
+              normalizedTargetKey,
+              pruneDiscoveryCache,
+              targetRelayLeaseKey,
+              targetAffinityTtl,
+              pruneTargetRelayLeases,
+              localTargetRelayAffinity,
+              acquireTargetRelayLease,
+              releaseTargetRelayLease,
+              defaultBridgeUrl,
+              normalizeRelayUrl,
+              relayNodeCandidate,
+              normalizeRelayRegistryUrl,
+              relayRegistryUrls,
+              loadRelayRegistry,
+              discoverRelayNodes,
+              bridgeUrls,
+              directPluginUrl,
+              bridgeToken,
+              relayManifestUrl,
+              directPluginCacheKey,
+              directPluginWasRecentlyUnavailable,
+              rememberDirectPluginUnavailable,
+              forgetDirectPluginUnavailable,
+              relayPreflightCacheKey,
+              applyRelayPreflight,
+              relayCandidateScore,
+              rankRemainingRelayCandidates,
+              probeRelayCandidate,
+              appendRelayCandidates,
+              probeRelayCandidates,
+              prepareRelayCandidates,
+              ensureRelayCandidates,
+              scheduleRelayPreparation,
+              maximumWebSocketBufferedBytes,
+              maximumOutboundQueueBytes,
+              maximumOutboundQueueFrames,
+              maximumOutboundControlFrames,
+              maximumOutboundControlBytes,
+              maximumOutboundFramesPerTurn,
+              maximumOutboundBytesPerTurn,
+              maximumOutboundMillisPerTurn,
+              webSocketBackpressureRetryMs,
+              relayPreflightTimeoutMs,
+              relayRegistryTimeoutMs,
+              relayParallelPreparationDelayMs,
+              relaySelectionDeadlineMs,
+              relayRegistryCacheTtlMs,
+              maximumRelayRegistryNodes,
+              maximumRelayRegistryUrls,
+              maximumNestedRegistriesPerResponse,
+              defaultRelayRegistryUrl,
+              directPluginMissTtlMs,
+              relayPreflightCacheTtlMs,
+              relayPreflightFailureCacheTtlMs,
+              defaultTargetAffinityMs,
+              maximumDiscoveryCacheEntries,
+              maximumLocalBatchBytes,
+              configuredLocalClaimTimeout,
+              localPortClaimTimeoutMs,
+              localPortClaimRetryMs
+            };
+            """)
+    private static native void initBridge();
+
+    @JSBody(script = """
+            const state = globalThis.__gaiusNettyBridgeBootstrapState;
+            const scope = globalThis.__gaiusNettyBridgeBootstrapScope;
+            if (!state || !scope) return;
+            const {
+              recordConnectPhase,
+              normalizedTargetKey,
+              localTargetRelayAffinity,
+              acquireTargetRelayLease,
+              releaseTargetRelayLease,
+              discoverRelayNodes,
+              directPluginUrl,
+              bridgeToken,
+              directPluginWasRecentlyUnavailable,
+              rememberDirectPluginUnavailable,
+              forgetDirectPluginUnavailable,
+              rankRemainingRelayCandidates,
+              ensureRelayCandidates,
+              scheduleRelayPreparation,
+              maximumOutboundQueueBytes,
+              maximumOutboundQueueFrames,
+              maximumOutboundBytesPerTurn,
+              webSocketBackpressureRetryMs,
+              localPortClaimTimeoutMs,
+              localPortClaimRetryMs
+            } = scope;
             function relayNodeRecord(candidate) {
             if (!candidate || candidate.direct) return null;
             const nodes = state.stats.relayNodes;
@@ -2438,8 +2533,10 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             localPortMap();
             globalThis.__gaiusNettyBridge = state;
             globalThis.__gaiusNetworkStats = state.stats;
+            delete globalThis.__gaiusNettyBridgeBootstrapState;
+            delete globalThis.__gaiusNettyBridgeBootstrapScope;
             """)
-    private static native void initBridge();
+    private static native void initBridgeTail();
 
     @JSBody(script = """
             const state = globalThis.__gaiusNettyBridge;
