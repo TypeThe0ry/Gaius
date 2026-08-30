@@ -8,10 +8,29 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 const fullPathScript = fileURLToPath(
     new URL("./browser-full-path-smoke.mjs", import.meta.url));
+const channelSourcePath = fileURLToPath(new URL(
+    "../../port/overrides/libraries/netty-transport/src/main/java/" +
+        "io/netty/channel/browser/BrowserWebSocketChannel.java",
+    import.meta.url,
+));
+const BROWSER_CHANNEL_SOURCE_EVIDENCE_SCHEMA_VERSION =
+    "gaius.browser-websocket-channel-source.v1";
+const BROWSER_CHANNEL_SOURCE_MARKERS = Object.freeze([
+    ["pumpAllAndReportProgress", "public static boolean pumpAllAndReportProgress()", false],
+    ["aggregatePumpBudget", "private static final double MAX_TOTAL_MILLIS_PER_PUMP = 4.0;", false],
+    ["initBridge", "private static native void initBridge();", true],
+    ["initBridgeTail", "private static native void initBridgeTail();", true],
+    ["initOutboundScheduler", "private static native void initOutboundScheduler();", true],
+    ["initInboundScheduler", "private static native void initInboundScheduler();", true],
+    ["relayNodeRecordResolverRead", "const resolver = state.relayNodeRecordResolver;", false],
+    ["relayNodeRecordResolverPublish", "state.relayNodeRecordResolver = relayNodeRecord;", false],
+].map(([name, marker, jsBody]) => Object.freeze({name, marker, jsBody})));
 const canonicalProfilePath = fileURLToPath(
     new URL("../../port/versions/26.2.json", import.meta.url));
 const canonicalEvidenceRoot = fileURLToPath(
@@ -68,6 +87,7 @@ if (runAll && selectedTier !== undefined) {
     throw new Error("--all and --tier are mutually exclusive");
 }
 const tiers = runAll ? [8, 16] : [selectedTier ?? 8];
+const browserChannelSourceEvidence = await inspectBrowserChannelSource();
 
 const configurations = [];
 const runs = [];
@@ -85,6 +105,16 @@ for (const tier of tiers) {
     assert.equal(configuration.profile.protocolVersion, 776);
     assert.equal(configuration.profile.worldVersion, 4903);
     assert.equal(configuration.clients, tier);
+    assertSourceProvenance(
+        configuration.browserChannelSourceEvidence,
+        browserChannelSourceEvidence,
+        `stress tier ${tier} configuration`,
+    );
+    assertSourceProvenance(
+        configuration.performanceContract.browserChannelSourceEvidence,
+        browserChannelSourceEvidence,
+        `stress tier ${tier} performance contract`,
+    );
     assert.equal(configuration.performanceContract.mode, `stress-tier-${tier}`);
     assert.equal(configuration.performanceContract.minimumChunkMetric,
         "unique-chunk-position");
@@ -181,6 +211,7 @@ console.log(JSON.stringify({
     hardDeadlinesMillis: Object.fromEntries(tiers.map((tier) => [
         tier, HARD_DEADLINES_MILLIS[tier],
     ])),
+    browserChannelSourceEvidence,
     evidenceRoot: canonicalEvidenceRoot,
     configurations,
     runs,
@@ -192,6 +223,20 @@ function validateStressResult(result, tier, configuration) {
     assert.equal(result?.ok, true, `stress tier ${tier} child result was not ok`);
     assert.equal(result?.profile?.id, "26.2");
     assert.equal(result?.profile?.protocolVersion, 776);
+    assertSourceProvenance(
+        result?.transport?.browserChannelSourceEvidence,
+        browserChannelSourceEvidence,
+        `stress tier ${tier} child transport`,
+    );
+    assert.equal(result?.transport?.browserChannelSourceSha256,
+        result?.transport?.browserChannelSourceEvidence?.sourceSha256,
+        `stress tier ${tier} child source SHA-256 alias drifted`);
+    assert.equal(result?.transport?.browserChannelSourceNormalizedSha256,
+        result?.transport?.browserChannelSourceEvidence?.normalizedSourceSha256,
+        `stress tier ${tier} child normalized source SHA-256 alias drifted`);
+    assert.deepEqual(result?.transport?.browserJsBodyMarkers,
+        result?.transport?.browserChannelSourceEvidence?.jsBodyMarkers,
+        `stress tier ${tier} child JSBody marker alias drifted`);
     assert.equal(result?.transport?.stressMode, true,
         `stress tier ${tier} child did not report stress mode`);
     assert.equal(result?.transport?.stressTier, tier,
@@ -789,4 +834,112 @@ function boundedTail(previous, next, maximumBytes) {
     return combined.byteLength <= maximumBytes
         ? combined
         : combined.subarray(combined.byteLength - maximumBytes);
+}
+
+async function inspectBrowserChannelSource() {
+    const source = await readFile(channelSourcePath, "utf8");
+    const normalizedSource = source.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+    const markers = BROWSER_CHANNEL_SOURCE_MARKERS.map(({name, marker, jsBody}) => {
+        const offset = source.indexOf(marker);
+        assert.ok(offset >= 0,
+            `BrowserWebSocketChannel source marker missing: ${name}`);
+        const entry = { name, marker, present: true };
+        if (jsBody) {
+            const script = extractJsBody(source, marker);
+            entry.jsBodyBytes = Buffer.byteLength(script, "utf8");
+            entry.jsBodySha256 = createHash("sha256").update(script).digest("hex");
+            entry.jsBodyNormalizedSha256 = createHash("sha256")
+                .update(script.replaceAll("\r\n", "\n").replaceAll("\r", "\n"))
+                .digest("hex");
+        }
+        return entry;
+    });
+    const jsBodyMarkers = markers
+        .filter((marker) => marker.jsBodySha256 !== undefined)
+        .map((marker) => ({
+            name: marker.name,
+            marker: marker.marker,
+            present: marker.present,
+            jsBodyBytes: marker.jsBodyBytes,
+            jsBodySha256: marker.jsBodySha256,
+            jsBodyNormalizedSha256: marker.jsBodyNormalizedSha256,
+        }));
+    return {
+        schemaVersion: BROWSER_CHANNEL_SOURCE_EVIDENCE_SCHEMA_VERSION,
+        independentExecution: true,
+        path: channelSourcePath,
+        relativePath: "port/overrides/libraries/netty-transport/src/main/java/" +
+            "io/netty/channel/browser/BrowserWebSocketChannel.java",
+        hashAlgorithm: "sha256",
+        sourceBytes: Buffer.byteLength(source, "utf8"),
+        sourceSha256: createHash("sha256").update(source).digest("hex"),
+        normalizedSourceBytes: Buffer.byteLength(normalizedSource, "utf8"),
+        normalizedSourceSha256: createHash("sha256")
+            .update(normalizedSource)
+            .digest("hex"),
+        requiredMarkerCount: markers.length,
+        sourceMarkers: markers.map((marker) => ({
+            name: marker.name,
+            marker: marker.marker,
+            present: marker.present,
+            ...(marker.jsBodySha256 === undefined ? {} : {
+                jsBodySha256: marker.jsBodySha256,
+                jsBodyNormalizedSha256: marker.jsBodyNormalizedSha256,
+            }),
+        })),
+        jsBodyMarkers,
+    };
+}
+
+function extractJsBody(source, marker) {
+    const markerOffset = source.indexOf(marker);
+    const annotationOffset = source.lastIndexOf("@JSBody(script = \"\"\"", markerOffset);
+    const scriptOffset = source.indexOf("\"\"\"", annotationOffset) + 3;
+    const firstScriptEnd = source.indexOf("\"\"\")", scriptOffset);
+    // Method signatures occur after their text block, while resolver markers
+    // live inside the JSBody text itself. Select the enclosing terminator in
+    // both cases without changing the extracted script bytes.
+    const scriptEnd = markerOffset > scriptOffset && markerOffset < firstScriptEnd
+        ? firstScriptEnd
+        : source.lastIndexOf("\"\"\")", markerOffset);
+    assert.ok(markerOffset > 0 && annotationOffset > 0 && scriptEnd > scriptOffset,
+        `could not extract BrowserWebSocketChannel JSBody for ${marker}`);
+    return source.slice(scriptOffset, scriptEnd);
+}
+
+function assertSourceProvenance(actual, expected, label) {
+    assert.ok(actual && typeof actual === "object",
+        `${label} omitted BrowserWebSocketChannel source evidence`);
+    assert.equal(actual.schemaVersion, expected.schemaVersion,
+        `${label} source evidence schema drifted`);
+    assert.equal(actual.independentExecution, true,
+        `${label} source evidence was not independently collected`);
+    assert.equal(actual.relativePath, expected.relativePath,
+        `${label} BrowserWebSocketChannel source path drifted`);
+    assert.equal(actual.hashAlgorithm, "sha256",
+        `${label} source hash algorithm drifted`);
+    for (const [name, value] of [
+        ["sourceBytes", actual.sourceBytes],
+        ["normalizedSourceBytes", actual.normalizedSourceBytes],
+        ["requiredMarkerCount", actual.requiredMarkerCount],
+    ]) {
+        assert.ok(Number.isSafeInteger(value) && value > 0,
+            `${label} source evidence ${name} was invalid: ${value}`);
+    }
+    for (const name of ["sourceSha256", "normalizedSourceSha256"]) {
+        assert.match(actual[name], /^[0-9a-f]{64}$/u,
+            `${label} source evidence ${name} was invalid`);
+    }
+    assert.equal(actual.normalizedSourceSha256, expected.normalizedSourceSha256,
+        `${label} source normalized SHA-256 drifted`);
+    assert.equal(actual.sourceSha256, expected.sourceSha256,
+        `${label} source SHA-256 drifted`);
+    assert.equal(actual.requiredMarkerCount, expected.requiredMarkerCount,
+        `${label} source marker count drifted`);
+    assert.ok(Array.isArray(actual.sourceMarkers),
+        `${label} source markers were not an array`);
+    assert.deepEqual(actual.sourceMarkers, expected.sourceMarkers,
+        `${label} source marker evidence drifted`);
+    assert.deepEqual(actual.jsBodyMarkers, expected.jsBodyMarkers,
+        `${label} JSBody marker evidence drifted`);
 }

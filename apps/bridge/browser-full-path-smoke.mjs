@@ -42,6 +42,23 @@ const channelSourceUrl = new URL(
         "io/netty/channel/browser/BrowserWebSocketChannel.java",
     import.meta.url,
 );
+// Keep the full-path harness tied to the exact BrowserWebSocketChannel source
+// that supplies its JSBody bridge.  The evidence is diagnostic and additive:
+// it does not alter the bridge behavior, but it makes a runtime result
+// reproducible when multiple dirty/generated trees are present.
+const BROWSER_CHANNEL_SOURCE_EVIDENCE_SCHEMA_VERSION =
+    "gaius.browser-websocket-channel-source.v1";
+const BROWSER_CHANNEL_SOURCE_MARKERS = Object.freeze([
+    ["pumpAllAndReportProgress", "public static boolean pumpAllAndReportProgress()", false],
+    ["aggregatePumpBudget", "private static final double MAX_TOTAL_MILLIS_PER_PUMP = 4.0;", false],
+    ["initBridge", "private static native void initBridge();", true],
+    ["initBridgeTail", "private static native void initBridgeTail();", true],
+    ["initOutboundScheduler", "private static native void initOutboundScheduler();", true],
+    ["initInboundScheduler", "private static native void initInboundScheduler();", true],
+    ["relayNodeRecordResolverRead", "const resolver = state.relayNodeRecordResolver;", false],
+    ["relayNodeRecordResolverPublish", "state.relayNodeRecordResolver = relayNodeRecord;", false],
+].map(([name, marker, jsBody]) => Object.freeze({name, marker, jsBody})));
+let browserChannelSourceCache;
 const origin = process.env.GAIUS_BROWSER_FULL_PATH_ORIGIN ?? "http://127.0.0.1:8781";
 const relayToken = process.env.GAIUS_BROWSER_FULL_PATH_TOKEN ?? "browser-full-path-token";
 const usernamePrefix = process.env.GAIUS_BROWSER_FULL_PATH_USERNAME_PREFIX ?? "GaiusBrowser";
@@ -448,6 +465,7 @@ let lastInboundFlowAttempt = null;
 async function runSmoke() {
     activeProfile = await loadActiveVersionProfile();
     assertCanonicalProfile(activeProfile);
+    const browserChannelSource = await loadBrowserChannelSourceEvidence();
     if (minimumChunkPackets > maximumUniqueChunkCapacity) {
         throw new Error(
             `GAIUS_BROWSER_FULL_PATH_MIN_CHUNKS=${minimumChunkPackets} exceeds ` +
@@ -1400,6 +1418,11 @@ try {
         },
         transport: {
             browserChannelSource: fileURLToPath(channelSourceUrl),
+            browserChannelSourceSha256: browserChannelSource.evidence.sourceSha256,
+            browserChannelSourceNormalizedSha256:
+                browserChannelSource.evidence.normalizedSourceSha256,
+            browserJsBodyMarkers: browserChannelSource.evidence.jsBodyMarkers,
+            browserChannelSourceEvidence: browserChannelSource.evidence,
             browserJsBody: true,
             teaVmBuildRequired: false,
             realWebSocketFraming: true,
@@ -1508,6 +1531,7 @@ catch (error) {
             lastInboundFlowAttempt,
             relayRuntime: partialRelayRuntime,
             session: sessionRuntimeSnapshot(sessionState),
+            browserChannelSourceEvidence: browserChannelSourceEvidenceForOutput(),
             performanceContract: browserFullPathPerformanceContract(),
             pollScheduler: pollScheduler?.evidence() ?? null,
             capturedAtElapsedMillis: Number(
@@ -4693,6 +4717,7 @@ function browserFullPathPerformanceContract() {
         strictAcceptanceTarget: acceptanceMode ? { ...STRICT_ACCEPTANCE_TARGET } : null,
         stressTarget: stressMode ? { tier: stressTier, ...stressTarget } : null,
         canonicalProfiles: CANONICAL_PROFILES,
+        browserChannelSourceEvidence: browserChannelSourceEvidenceForOutput(),
         relayRuntimeGauges: [...RELAY_RUNTIME_GAUGES],
         relayRuntimeConnectionGauges: [...RELAY_RUNTIME_CONNECTION_GAUGES],
         relayDrainMaxDurationMillis: RELAY_DRAIN_MAX_DURATION_MILLIS,
@@ -5045,6 +5070,7 @@ function relayRuntimeDelta(before, after) {
 async function printConfiguration() {
     activeProfile = await loadActiveVersionProfile();
     assertCanonicalProfile(activeProfile);
+    const browserChannelSource = await loadBrowserChannelSourceEvidence();
     const wireProfile = resolveWireProfile(activeProfile);
     const identities = Array.from({ length: clientCount }, (_, index) =>
         createClientIdentity(index));
@@ -5075,6 +5101,7 @@ async function printConfiguration() {
             uniqueUsernames: new Set(identities.map(({ username }) => username)).size,
             identities,
         },
+        browserChannelSourceEvidence: browserChannelSource.evidence,
         performanceContract: browserFullPathPerformanceContract(),
     }));
 }
@@ -5099,7 +5126,8 @@ async function printJavaResolution() {
 }
 
 async function createBrowserRuntime(relayUrl, token) {
-    const source = await readFile(channelSourceUrl, "utf8");
+    const browserChannelSource = await loadBrowserChannelSourceEvidence();
+    const source = browserChannelSource.source;
     const init = extractJsBody(source, "private static native void initBridge();");
     const initTail = extractJsBody(source,
         "private static native void initBridgeTail();");
@@ -5107,6 +5135,10 @@ async function createBrowserRuntime(relayUrl, token) {
         "private static native void initOutboundScheduler();");
     const inbound = extractJsBody(source,
         "private static native void initInboundScheduler();");
+    assert.match(init, /state\.relayNodeRecordResolver/,
+        "initBridge lost the shared relayNodeRecord resolver read marker");
+    assert.match(initTail, /state\.relayNodeRecordResolver\s*=\s*relayNodeRecord/,
+        "initBridgeTail lost the shared relayNodeRecord resolver publish marker");
     const wsStats = {
         connections: 0,
         controlFrames: 0,
@@ -5169,10 +5201,13 @@ async function createBrowserRuntime(relayUrl, token) {
     const bridge = globalThis.__gaiusNettyBridge;
     const stats = globalThis.__gaiusNetworkStats;
     assert.ok(bridge && stats, "BrowserWebSocketChannel JSBody did not initialize");
+    assert.equal(typeof bridge.relayNodeRecordResolver, "function",
+        "BrowserWebSocketChannel JSBody did not publish relayNodeRecord resolver state");
     return {
         bridge,
         stats,
         wsStats,
+        browserChannelSourceEvidence: browserChannelSource.evidence,
         async close() {
             const sockets = [...wsStats.sockets];
             const closed = Promise.all(sockets.map((socket) =>
@@ -5193,11 +5228,78 @@ async function createBrowserRuntime(relayUrl, token) {
     };
 }
 
+async function loadBrowserChannelSourceEvidence() {
+    if (browserChannelSourceCache !== undefined) return browserChannelSourceCache;
+    const source = await readFile(channelSourceUrl, "utf8");
+    const normalizedSource = source.replaceAll("\r\n", "\n").replaceAll("\r", "\n");
+    const markers = BROWSER_CHANNEL_SOURCE_MARKERS.map(({name, marker, jsBody}) => {
+        const offset = source.indexOf(marker);
+        assert.ok(offset >= 0,
+            `BrowserWebSocketChannel source marker missing: ${name}`);
+        const entry = { name, marker, present: true };
+        if (jsBody) {
+            const script = extractJsBody(source, marker);
+            entry.jsBodyBytes = Buffer.byteLength(script, "utf8");
+            entry.jsBodySha256 = createHash("sha256").update(script).digest("hex");
+            entry.jsBodyNormalizedSha256 = createHash("sha256")
+                .update(script.replaceAll("\r\n", "\n").replaceAll("\r", "\n"))
+                .digest("hex");
+        }
+        return entry;
+    });
+    const jsBodyMarkers = markers
+        .filter((marker) => marker.jsBodySha256 !== undefined)
+        .map((marker) => ({
+            name: marker.name,
+            marker: marker.marker,
+            present: marker.present,
+            jsBodyBytes: marker.jsBodyBytes,
+            jsBodySha256: marker.jsBodySha256,
+            jsBodyNormalizedSha256: marker.jsBodyNormalizedSha256,
+        }));
+    const evidence = Object.freeze({
+        schemaVersion: BROWSER_CHANNEL_SOURCE_EVIDENCE_SCHEMA_VERSION,
+        independentExecution: true,
+        path: fileURLToPath(channelSourceUrl),
+        relativePath: repositoryRelativePath(fileURLToPath(channelSourceUrl)),
+        hashAlgorithm: "sha256",
+        sourceBytes: Buffer.byteLength(source, "utf8"),
+        sourceSha256: createHash("sha256").update(source).digest("hex"),
+        normalizedSourceBytes: Buffer.byteLength(normalizedSource, "utf8"),
+        normalizedSourceSha256: createHash("sha256")
+            .update(normalizedSource)
+            .digest("hex"),
+        requiredMarkerCount: markers.length,
+        sourceMarkers: markers.map((marker) => ({
+            name: marker.name,
+            marker: marker.marker,
+            present: marker.present,
+            ...(marker.jsBodySha256 === undefined ? {} : {
+                jsBodySha256: marker.jsBodySha256,
+                jsBodyNormalizedSha256: marker.jsBodyNormalizedSha256,
+            }),
+        })),
+        jsBodyMarkers,
+    });
+    browserChannelSourceCache = Object.freeze({source, evidence});
+    return browserChannelSourceCache;
+}
+
+function browserChannelSourceEvidenceForOutput() {
+    return browserChannelSourceCache?.evidence ?? null;
+}
+
 function extractJsBody(source, marker) {
     const markerOffset = source.indexOf(marker);
     const annotationOffset = source.lastIndexOf("@JSBody(script = \"\"\"", markerOffset);
     const scriptOffset = source.indexOf("\"\"\"", annotationOffset) + 3;
-    const scriptEnd = source.lastIndexOf('\"\"\")', markerOffset);
+    const firstScriptEnd = source.indexOf('\"\"\")', scriptOffset);
+    // Method signatures occur after their text block, while resolver markers
+    // live inside the JSBody text itself. Select the enclosing terminator in
+    // both cases without changing the extracted script bytes.
+    const scriptEnd = markerOffset > scriptOffset && markerOffset < firstScriptEnd
+        ? firstScriptEnd
+        : source.lastIndexOf('\"\"\")', markerOffset);
     assert.ok(markerOffset > 0 && annotationOffset > 0 && scriptEnd > scriptOffset,
         `could not extract BrowserWebSocketChannel JSBody for ${marker}`);
     return source.slice(scriptOffset, scriptEnd);
