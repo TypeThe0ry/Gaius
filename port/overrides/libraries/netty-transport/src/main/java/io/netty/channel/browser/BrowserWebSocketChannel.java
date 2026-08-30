@@ -25,11 +25,18 @@ import org.teavm.platform.Platform;
 public final class BrowserWebSocketChannel extends AbstractChannel {
     private static final ChannelMetadata METADATA = new ChannelMetadata(false);
     private static final int INITIAL_CHANNEL_CAPACITY = 16;
-    // Client packets run inline on the browser event loop. Drain cheap frames in a batch while
-    // the time budget still makes a heavy chunk/model update yield after its first frame.
-    private static final int MAX_CHUNKS_PER_PUMP = 16;
-    private static final int MAX_BYTES_PER_PUMP = 1024 * 1024;
+    // Decoder work runs on the browser event loop. A single pipeline handoff cannot be preempted
+    // by the time check below, so the JS scheduler splits large TCP frames into 4 KiB slices. Tiny
+    // relay frames are cheap enough to batch more deeply; the 2 ms check still runs between every
+    // handoff and the byte cap keeps a turn bounded even when all slices are cheap.
+    private static final int MAX_CHUNKS_PER_PUMP = 64;
+    private static final int MAX_BYTES_PER_PUMP = 256 * 1024;
     private static final double MAX_MILLIS_PER_PUMP = 2.0;
+    // A server/client runtime can own many browser channels (one per multiplayer player).  The
+    // per-channel bound above is not a global bound: iterating sixteen busy channels could keep
+    // one JavaScript turn runnable for roughly 32 ms.  Keep a small aggregate budget and resume
+    // from a round-robin cursor so a busy first channel cannot starve the rest.
+    private static final double MAX_TOTAL_MILLIS_PER_PUMP = 4.0;
     private static final int MAX_OUTBOUND_WRITES_PER_PUMP = 32;
     private static final int MAX_OUTBOUND_BYTES_PER_PUMP = 256 * 1024;
     private static final double MAX_OUTBOUND_MILLIS_PER_PUMP = 2.0;
@@ -37,6 +44,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
     private static BrowserWebSocketChannel[] channels =
             new BrowserWebSocketChannel[INITIAL_CHANNEL_CAPACITY];
     private static int nextSocketId = 1;
+    private static int nextPumpChannelIndex;
 
     private final ChannelConfig config = new DefaultChannelConfig(this);
     private final int socketId;
@@ -62,18 +70,76 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
     }
 
     public static void pumpAll() {
-        for (BrowserWebSocketChannel channel : channels) {
-            if (channel == null) {
-                continue;
+        pumpAllAndReportProgress();
+    }
+
+    /**
+     * Runs one bounded raw-transport turn.
+     *
+     * <p>The result is a continuation hint: it is true when a slice was consumed or when the
+     * aggregate budget stopped the round-robin scan before the captured channel set was visited.
+     * Callers must pair this hint with {@link #hasPumpableInput()} before scheduling another turn;
+     * the budget-only case lets a ready channel that was later in the cursor order get a chance
+     * without creating an idle busy loop.</p>
+     */
+    public static boolean pumpAllAndReportProgress() {
+        boolean progressed = false;
+        final double startedAt = monotonicMillis();
+        int channelsVisited = 0;
+        int openChannelsVisited = 0;
+        boolean budgetExhausted = false;
+        // Capture the current length. A pipeline callback may create another channel or grow the
+        // array; that channel is intentionally left for the next turn rather than extending this
+        // turn's work without bound.
+        final int channelCount = channels.length;
+        if (channelCount > 0) {
+            int index = nextPumpChannelIndex;
+            if (index < 0 || index >= channelCount) {
+                index = 0;
             }
-            channel.pump();
+            while (channelsVisited < channelCount) {
+                // Always inspect at least one slot. This preserves error/close handling for a
+                // newly signalled channel even if the clock is already at the aggregate limit.
+                if (openChannelsVisited > 0
+                        && monotonicMillis() - startedAt >= MAX_TOTAL_MILLIS_PER_PUMP) {
+                    budgetExhausted = true;
+                    break;
+                }
+                BrowserWebSocketChannel channel = channels[index];
+                index++;
+                if (index >= channelCount) {
+                    index = 0;
+                }
+                channelsVisited++;
+                if (channel == null || !channel.open) {
+                    continue;
+                }
+                openChannelsVisited++;
+                progressed |= channel.pump();
+            }
+            // Keep the cursor valid if a callback grew the backing array during this turn.
+            int currentLength = channels.length;
+            nextPumpChannelIndex = currentLength == 0 ? 0 : index % currentLength;
         }
+        double elapsed = Math.max(0.0, monotonicMillis() - startedAt);
+        recordPumpAllTelemetry(channelsVisited, elapsed, budgetExhausted);
+        return progressed || budgetExhausted;
     }
 
     /** Returns whether a browser transport has data waiting for the Java pipeline. */
     public static boolean hasPendingInput() {
         for (BrowserWebSocketChannel channel : channels) {
             if (channel != null && channel.open && hasPendingInbound(channel.socketId)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Returns whether an unpaused channel has a ready slice for the Java decoder. */
+    public static boolean hasPumpableInput() {
+        for (BrowserWebSocketChannel channel : channels) {
+            if (channel != null && channel.open && hasPumpableInbound(channel.socketId)) {
                 return true;
             }
         }
@@ -274,9 +340,9 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
         pipeline().fireChannelActive();
     }
 
-    private void pump() {
+    private boolean pump() {
         if (!open || pumping) {
-            return;
+            return false;
         }
         pumping = true;
         try {
@@ -284,7 +350,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             if (error != null) {
                 pipeline().fireExceptionCaught(new ChannelException(error));
                 close();
-                return;
+                return false;
             }
 
             ChannelPipeline pipeline = pipeline();
@@ -330,6 +396,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             } else if (isSocketClosed(socketId) && !hasPendingInbound(socketId)) {
                 close();
             }
+            return chunks > 0;
         } finally {
             pumping = false;
         }
@@ -500,8 +567,31 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               peakInboundQueuedBytes: 0,
               inboundSlices: 0,
               inboundSlicePumps: 0,
+              inboundImmediateSchedules: 0,
+              inboundRafSchedules: 0,
+              inboundTimerSchedules: 0,
+              inboundSliceScheduleWaitSamples: 0,
+              maxInboundSliceScheduleWaitMillis: 0,
               maxInboundSliceQueue: 0,
               longestInboundSlicePumpMillis: 0,
+              inboundPumpInstalled: 0,
+              inboundPumpRequested: 0,
+              inboundPumpScheduled: 0,
+              inboundPumpCoalesced: 0,
+              inboundPumpCallbacks: 0,
+              inboundPumpMessageCallbacks: 0,
+              inboundPumpTimerCallbacks: 0,
+              inboundPumpWatchdogCallbacks: 0,
+              inboundPumpStaleCallbacks: 0,
+              inboundPumpJavaStarted: 0,
+              inboundPumpJavaCompleted: 0,
+              inboundPumpJavaSkipped: 0,
+              inboundPumpJavaFailures: 0,
+              inboundPumpRescheduled: 0,
+              inboundPumpBlockedByExactQueue: 0,
+              inboundPumpMessageChannelFailures: 0,
+              maxInboundPumpScheduleWaitMillis: 0,
+              inboundPumpLastCallbackAtMillis: 0,
               decodedSliceBacklog: 0,
               maxDecodedSliceBacklog: 0,
               decodedSliceBacklogPauses: 0,
@@ -515,10 +605,20 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               decodedPacketQueuePauses: 0,
               decodedPacketQueueResumes: 0,
               decodedPacketDrainSignals: 0,
+              queuedPacketHandleSamples: 0,
+              maxQueuedPacketHandleMillis: 0,
+              maxQueuedPacketHandleType: '',
+              slowQueuedPacketEventSequence: 0,
+              slowQueuedPacketEvents: [],
+              slowQueuedPacketEventsDropped: 0,
+              inlineDecodedPackets: 0,
               activeHighWatermarks: 0,
               highWatermarkDurationMillis: 0,
               longestHighWatermarkMillis: 0,
               activeHighWatermarkMillis: 0,
+              highWatermarkEventSequence: 0,
+              highWatermarkEvents: [],
+              highWatermarkEventsDropped: 0,
               flowPauses: 0,
               flowResumes: 0,
               localFlushes: 0,
@@ -540,6 +640,15 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               maxOutboundTurnBytes: 0,
               maxOutboundTurnMillis: 0,
               outboundYields: 0,
+              outboundImmediateFlushes: 0,
+              outboundTimerFlushes: 0,
+              outboundContinuationTimers: 0,
+              outboundMessageChannelFlushes: 0,
+              outboundMessageChannelCallbacks: 0,
+              outboundContinuationMacrotasks: 0,
+              outboundFlushWaitSamples: 0,
+              maxOutboundFlushWaitMillis: 0,
+              outboundEmptyTurns: 0,
               outboundBackpressureDeferrals: 0,
               queuedFrames: 0,
               peakQueuedFrames: 0,
@@ -555,6 +664,13 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               pumpCalls: 0,
               pumpChunks: 0,
               pumpBytes: 0,
+              pumpAllTurns: 0,
+              pumpAllChannelsVisited: 0,
+              pumpAllBudgetYields: 0,
+              pumpAllMaxTurnMillis: 0,
+              pumpAllMaxChannelsPerTurn: 0,
+              pumpAllLastTurnMillis: 0,
+              pumpAllLastChannelsVisited: 0,
               deferredPumps: 0,
               peakPumpChunks: 0,
               peakPumpBytes: 0,
@@ -1701,17 +1817,17 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             queueControl(entry, message, target, false);
             return true;
             }
-            function setInboundPaused(entry, paused) {
+            function setInboundPaused(entry, paused, reason, depth, queuedBytes) {
             if (entry.flowPaused === paused || !entry.connected) return;
             try {
               sendControl(entry, {type: 'flow', paused: !!paused});
               entry.flowPaused = paused;
               if (paused) {
                 state.stats.flowPauses++;
-                state.startHighWatermark(entry);
+                state.startHighWatermark(entry, reason, depth, queuedBytes);
               } else {
                 state.stats.flowResumes++;
-                state.finishHighWatermark(entry);
+                state.finishHighWatermark(entry, depth, queuedBytes);
               }
             } catch (error) {
               fail(entry, error && (error.message || error));
@@ -2040,6 +2156,8 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               candidateTimeout: 0,
               outboundFlushScheduled: false,
               outboundFlushHandle: 0,
+              outboundFlushGeneration: 0,
+              outboundFlushKind: '',
               inbound: [],
               inboundHead: 0,
               inboundBytes: 0,
@@ -2049,10 +2167,13 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               inboundSliceScheduled: false,
               inboundSliceHandle: null,
               inboundSliceUsesRaf: false,
+              inboundSliceScheduledAt: 0,
+              inboundSliceSchedulerKind: '',
               decodedSliceBacklog: 0,
               decoderCumulationBytes: 0,
               decodeFlowPaused: false,
               highWatermarkStartedAt: 0,
+              highWatermarkEpisode: null,
               outbound: [],
               outboundHead: 0,
               outboundControls: [],
@@ -2167,8 +2288,13 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             state.finishDecodedSlice = function(id) {
             state.finishDecodedSliceScheduled(id);
             };
-            state.recordDecodedPacketQueue = function(depth, paused, processed) {
-            state.recordDecodedPacketQueueScheduled(depth, paused, processed);
+            state.recordDecodedPacketQueue = function(
+                depth, paused, processed, handleMillis, handleType) {
+            state.recordDecodedPacketQueueScheduled(
+                depth, paused, processed, handleMillis, handleType);
+            };
+            state.recordInlineDecodedPacket = function() {
+            state.recordInlineDecodedPacketScheduled();
             };
             state.close = function(id) {
             const entry = state.channels.get(id|0);
@@ -2198,6 +2324,9 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             };
             state.hasPendingInbound = function(id) {
             return state.hasPendingInboundScheduled(id);
+            };
+            state.hasPumpableInbound = function(id) {
+            return state.hasPumpableInboundScheduled(id);
             };
             state.failLocalSession = function(sessionId, message, launchGeneration) {
             sessionId = String(sessionId || '');
@@ -2250,6 +2379,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             state.finishHighWatermark = function() {};
             state.discardInbound = function(entry) {
             if (!entry) return;
+            state.finishHighWatermark(entry);
             state.stats.inboundQueuedBytes = Math.max(
               0,
               state.stats.inboundQueuedBytes - entry.inboundBytes - entry.pendingInboundBytes
@@ -2260,6 +2390,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             entry.pendingInbound = [];
             entry.pendingInboundHead = 0;
             entry.pendingInboundBytes = 0;
+            entry.flowPaused = false;
             };
             state.deliverInbound = function(entry, buffer) {
             if (!entry || entry.closed) return;
@@ -2292,9 +2423,15 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             state.recordDecodedSliceScheduled = function() {};
             state.finishDecodedSliceScheduled = function() {};
             state.recordDecodedPacketQueueScheduled = function() {};
+            state.recordInlineDecodedPacketScheduled = function() {};
             state.hasPendingInboundScheduled = function(id) {
             const entry = state.channels.get(id|0);
             return !!entry && entry.inboundHead < entry.inbound.length;
+            };
+            state.hasPumpableInboundScheduled = function(id) {
+            const entry = state.channels.get(id|0);
+            return !!entry && !entry.disposed && !state.exactPacketQueuePaused &&
+              entry.inboundHead < entry.inbound.length;
             };
             state.setInboundPaused = setInboundPaused;
             state.failInbound = fail;
@@ -2386,20 +2523,105 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             function webSocketBlocked(target) {
               return target && target.bufferedAmount >= maximumWebSocketBufferedBytes;
             }
-            function requestFlush(entry, delayMillis) {
-              if (!entry || entry.outboundFlushScheduled) return;
+            // A zero-delay setTimeout continuation is eventually clamped to roughly 4 ms by
+            // browsers. Large multiplayer packet bursts can need several bounded turns, so the
+            // clamp becomes visible as avoidable movement/input latency. MessageChannel keeps a
+            // real macrotask boundary (rendering and inbound network tasks may run between turns)
+            // without creating a chain of clamped timers. Process exactly one callback per
+            // message task; generation guards in requestFlush make queued close-race callbacks
+            // harmless. The fallback remains the old timer path for unusual runtimes.
+            const outboundContinuationScheduler = (function() {
+              if (typeof MessageChannel !== 'function') return null;
+              try {
+                const channel = new MessageChannel();
+                const callbacks = [];
+                let head = 0;
+                let posted = false;
+                channel.port1.onmessage = function() {
+                  posted = false;
+                  const callback = head < callbacks.length ? callbacks[head++] : null;
+                  if (head >= callbacks.length) {
+                    callbacks.length = 0;
+                    head = 0;
+                  } else {
+                    posted = true;
+                    channel.port2.postMessage(0);
+                  }
+                  if (callback) {
+                    state.stats.outboundMessageChannelCallbacks++;
+                    callback();
+                  }
+                };
+                if (typeof channel.port1.start === 'function') channel.port1.start();
+                if (typeof channel.port1.unref === 'function') channel.port1.unref();
+                if (typeof channel.port2.unref === 'function') channel.port2.unref();
+                return function(callback) {
+                  callbacks.push(callback);
+                  if (!posted) {
+                    posted = true;
+                    channel.port2.postMessage(0);
+                  }
+                };
+              } catch (_error) {
+                return null;
+              }
+            })();
+            function hasFlushableOutbound(entry) {
+              if (!entry) return false;
+              if (entry.outboundControlHead < entry.outboundControls.length) return true;
+              return entry.connected && !entry.closed && !entry.remotePaused &&
+                entry.outboundHead < entry.outbound.length;
+            }
+            function requestFlush(entry, delayMillis, continuation) {
+              if (!entry || entry.outboundFlushScheduled || !hasFlushableOutbound(entry)) return;
+              const delay = Math.max(0, delayMillis|0);
+              const generation = (entry.outboundFlushGeneration || 0) + 1;
+              const requestedAt = now();
+              entry.outboundFlushGeneration = generation;
               entry.outboundFlushScheduled = true;
-              entry.outboundFlushHandle = setTimeout(function() {
+              const run = function() {
+                if (!entry.outboundFlushScheduled ||
+                    entry.outboundFlushGeneration !== generation) return;
                 entry.outboundFlushScheduled = false;
                 entry.outboundFlushHandle = 0;
+                entry.outboundFlushKind = '';
+                state.stats.outboundFlushWaitSamples++;
+                state.stats.maxOutboundFlushWaitMillis = Math.max(
+                  state.stats.maxOutboundFlushWaitMillis,
+                  Math.max(0, now() - requestedAt)
+                );
                 flush(entry);
-              }, Math.max(0, delayMillis|0));
+              };
+              if (!continuation && delay === 0 && typeof queueMicrotask === 'function') {
+                entry.outboundFlushKind = 'microtask';
+                state.stats.outboundImmediateFlushes++;
+                queueMicrotask(run);
+                return;
+              }
+              if (continuation && delay === 0 && outboundContinuationScheduler) {
+                entry.outboundFlushKind = 'message-channel';
+                state.stats.outboundMessageChannelFlushes++;
+                state.stats.outboundContinuationMacrotasks++;
+                outboundContinuationScheduler(run);
+                return;
+              }
+              entry.outboundFlushKind = 'timer';
+              state.stats.outboundTimerFlushes++;
+              if (continuation) {
+                state.stats.outboundContinuationTimers++;
+                state.stats.outboundContinuationMacrotasks++;
+              }
+              entry.outboundFlushHandle = setTimeout(run, delay);
             }
             function cancelFlush(entry) {
               if (!entry) return;
-              if (entry.outboundFlushHandle) clearTimeout(entry.outboundFlushHandle);
+              entry.outboundFlushGeneration = (entry.outboundFlushGeneration || 0) + 1;
+              if (entry.outboundFlushKind === 'timer') {
+                clearTimeout(entry.outboundFlushHandle);
+              }
               entry.outboundFlushScheduled = false;
               entry.outboundFlushHandle = 0;
+              entry.outboundFlushKind = '';
             }
             function queueControl(entry, message, target, closeAfterSend, generation) {
               if (!entry || !target) return;
@@ -2600,6 +2822,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               state.stats.outboundTurns++;
               state.stats.outboundTurnFrames += outboundFrames;
               state.stats.outboundTurnBytes += outboundBytes;
+              if (outboundFrames === 0) state.stats.outboundEmptyTurns++;
               state.stats.maxOutboundTurnFrames = Math.max(
                 state.stats.maxOutboundTurnFrames,
                 outboundFrames
@@ -2620,7 +2843,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               } else if (controlsPending ||
                          (dataPending && entry.connected && !entry.remotePaused && !entry.closed)) {
                 state.stats.outboundYields++;
-                requestFlush(entry, 0);
+                // The first idle -> active transition uses a microtask to avoid the browser's
+                // zero-delay timer clamp. Once a bounded turn exhausts its frame/byte/time
+                // budget, continue on a macrotask so rendering and inbound network tasks keep
+                // their event-loop turn.
+                requestFlush(entry, 0, true);
               }
             }
             state.discardOutboundData = discardData;
@@ -2638,13 +2865,19 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             const maximumInboundQueueBytes = 64 * 1024 * 1024;
             const inboundPauseBytes = 24 * 1024 * 1024;
             const inboundResumeBytes = 8 * 1024 * 1024;
-            const maximumInboundSliceBytes = 64 * 1024;
+            // A 64 KiB compressed chunk handoff took 365 ms in a real 26.2 multiplayer burst.
+            // The elapsed-time guard is necessarily checked after that first handoff, so cap the
+            // non-preemptible unit itself rather than pretending the 2 ms turn budget can stop it.
+            const maximumInboundSliceBytes = 4 * 1024;
             const decodedSliceHighWatermark = 256;
             const decodedSliceLowWatermark = 64;
             const decoderCumulationPauseBytes = 12 * 1024 * 1024;
             const maximumDecoderCumulationBytes = 16 * 1024 * 1024;
             const inboundSliceBudgetMillis = 2.0;
             const eventLoopGapIntervalMillis = 100;
+            const maximumHighWatermarkEvents = 64;
+            const maximumSlowQueuedPacketEvents = 64;
+            const slowQueuedPacketThresholdMillis = 50;
             function now() {
               return typeof performance !== 'undefined' && performance.now
                 ? performance.now()
@@ -2663,20 +2896,81 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               const sampledAt = now();
               let activeMillis = 0;
               state.channels.forEach(function(entry) {
-                if (entry.highWatermarkStartedAt > 0) {
-                  activeMillis += Math.max(0, sampledAt - entry.highWatermarkStartedAt);
+                const episode = entry.highWatermarkEpisode;
+                if (episode && episode.startedAtMillis >= 0) {
+                  activeMillis += Math.max(0, sampledAt - episode.startedAtMillis);
                 }
               });
               state.stats.activeHighWatermarkMillis = activeMillis;
             }
-            state.startHighWatermark = function(entry) {
-              if (entry.highWatermarkStartedAt > 0) return;
-              entry.highWatermarkStartedAt = now();
+            function boundedCount(value) {
+              return Math.max(0, Math.floor(Number(value) || 0));
+            }
+            state.startHighWatermark = function(entry, reason, depth, queuedByteCount) {
+              if (!entry || entry.highWatermarkEpisode) return;
+              const startedAtMillis = now();
+              const sequence = boundedCount(state.stats.highWatermarkEventSequence) + 1;
+              const normalizedReason = reason === 'inbound-bytes' ||
+                  reason === 'exact-packet-queue'
+                ? reason
+                : 'inbound-slice-depth';
+              state.stats.highWatermarkEventSequence = sequence;
+              entry.highWatermarkEpisode = {
+                sequence: sequence,
+                channelId: entry.id|0,
+                reason: normalizedReason,
+                startedAtMillis: startedAtMillis,
+                startDepth: boundedCount(depth),
+                startQueuedBytes: boundedCount(queuedByteCount),
+                startDecodedPacketQueue: boundedCount(state.stats.decodedPacketQueue),
+                startDecodedPacketDrainSignals: boundedCount(
+                  state.stats.decodedPacketDrainSignals
+                ),
+                startPumpCalls: boundedCount(state.stats.pumpCalls),
+                startInboundSlicePumps: boundedCount(state.stats.inboundSlicePumps),
+                startInboundPumpJavaCompleted: boundedCount(
+                  state.stats.inboundPumpJavaCompleted
+                ),
+                startExactPacketQueuePaused: !!state.exactPacketQueuePaused
+              };
+              entry.highWatermarkStartedAt = startedAtMillis;
               state.stats.activeHighWatermarks++;
+              refreshHighWatermark();
             };
-            state.finishHighWatermark = function(entry) {
-              if (entry.highWatermarkStartedAt <= 0) return;
-              const duration = Math.max(0, now() - entry.highWatermarkStartedAt);
+            state.finishHighWatermark = function(entry, depth, queuedByteCount) {
+              if (!entry || !entry.highWatermarkEpisode) return;
+              const episode = entry.highWatermarkEpisode;
+              const endedAtMillis = now();
+              const duration = Math.max(0, endedAtMillis - episode.startedAtMillis);
+              const event = {
+                sequence: episode.sequence,
+                channelId: episode.channelId,
+                reason: episode.reason,
+                startedAtMillis: episode.startedAtMillis,
+                endedAtMillis: endedAtMillis,
+                durationMillis: duration,
+                startDepth: episode.startDepth,
+                endDepth: boundedCount(depth),
+                startQueuedBytes: episode.startQueuedBytes,
+                endQueuedBytes: boundedCount(queuedByteCount),
+                startDecodedPacketQueue: episode.startDecodedPacketQueue,
+                endDecodedPacketQueue: boundedCount(state.stats.decodedPacketQueue),
+                startDecodedPacketDrainSignals: episode.startDecodedPacketDrainSignals,
+                endDecodedPacketDrainSignals: boundedCount(
+                  state.stats.decodedPacketDrainSignals
+                ),
+                startPumpCalls: episode.startPumpCalls,
+                endPumpCalls: boundedCount(state.stats.pumpCalls),
+                startInboundSlicePumps: episode.startInboundSlicePumps,
+                endInboundSlicePumps: boundedCount(state.stats.inboundSlicePumps),
+                startInboundPumpJavaCompleted: episode.startInboundPumpJavaCompleted,
+                endInboundPumpJavaCompleted: boundedCount(
+                  state.stats.inboundPumpJavaCompleted
+                ),
+                startExactPacketQueuePaused: !!episode.startExactPacketQueuePaused,
+                endExactPacketQueuePaused: !!state.exactPacketQueuePaused
+              };
+              entry.highWatermarkEpisode = null;
               entry.highWatermarkStartedAt = 0;
               state.stats.activeHighWatermarks = Math.max(
                 0,
@@ -2687,6 +2981,21 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 state.stats.longestHighWatermarkMillis,
                 duration
               );
+              if (!Array.isArray(state.stats.highWatermarkEvents)) {
+                state.stats.highWatermarkEvents = [];
+              }
+              state.stats.highWatermarkEvents.push(event);
+              state.stats.highWatermarkEvents.sort(function(left, right) {
+                return left.sequence - right.sequence;
+              });
+              if (state.stats.highWatermarkEvents.length > maximumHighWatermarkEvents) {
+                const dropped = state.stats.highWatermarkEvents.length -
+                  maximumHighWatermarkEvents;
+                state.stats.highWatermarkEvents.splice(0, dropped);
+                state.stats.highWatermarkEventsDropped = boundedCount(
+                  state.stats.highWatermarkEventsDropped
+                ) + dropped;
+              }
               refreshHighWatermark();
             };
             function hasActiveChannels() {
@@ -2729,21 +3038,29 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               const depth = workDepth(entry);
               const bytes = queuedBytes(entry);
               if (depth >= decodedSliceHighWatermark || bytes >= inboundPauseBytes ||
-                  entry.decoderCumulationBytes >= decoderCumulationPauseBytes ||
                   state.exactPacketQueuePaused) {
+                const reason = state.exactPacketQueuePaused
+                  ? 'exact-packet-queue'
+                  : depth >= decodedSliceHighWatermark
+                    ? 'inbound-slice-depth'
+                    : 'inbound-bytes';
                 if (!entry.decodeFlowPaused) {
                   entry.decodeFlowPaused = true;
                   state.stats.decodedSliceBacklogPauses++;
                 }
-                state.setInboundPaused(entry, true);
+                state.setInboundPaused(entry, true, reason, depth, bytes);
                 return;
               }
               if (entry.decodeFlowPaused && !state.exactPacketQueuePaused &&
-                  depth <= decodedSliceLowWatermark && bytes <= inboundResumeBytes &&
-                  entry.decoderCumulationBytes <= maximumInboundSliceBytes) {
+                  depth <= decodedSliceLowWatermark && bytes <= inboundResumeBytes) {
+                // Decoder cumulation can be the unfinished tail of a length-prefixed packet.
+                // Pausing the only TCP source until that tail shrinks is a self-deadlock: it
+                // cannot shrink until the remaining packet bytes arrive.  Keep the independent
+                // 16 MiB hard limit below, but gate transport pause/resume only on work that the
+                // browser can actually drain while the relay is paused.
                 entry.decodeFlowPaused = false;
                 state.stats.decodedSliceBacklogResumes++;
-                state.setInboundPaused(entry, false);
+                state.setInboundPaused(entry, false, null, depth, bytes);
               }
             }
             function compactPending(entry) {
@@ -2756,27 +3073,61 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 entry.pendingInboundHead = 0;
               }
             }
+            function shouldBlockInboundSliceAdmission(entry) {
+              // An exact decoded-packet queue pause must stop decoding completely.  Slice-depth
+              // pressure only blocks while Java drains above the low watermark.  A byte-only
+              // pause still admits already-received pending bytes once depth is low enough;
+              // otherwise pendingInboundBytes can never fall below the resume threshold.
+              return !!entry && entry.decodeFlowPaused &&
+                (state.exactPacketQueuePaused ||
+                 workDepth(entry) > decodedSliceLowWatermark);
+            }
             function scheduleSlices(entry, immediate) {
               if (!entry || entry.disposed || entry.inboundSliceScheduled ||
                   entry.pendingInboundHead >= entry.pendingInbound.length ||
-                  workDepth(entry) >= decodedSliceHighWatermark) return;
+                  workDepth(entry) >= decodedSliceHighWatermark ||
+                  shouldBlockInboundSliceAdmission(entry)) {
+                return;
+              }
+              const scheduledAt = now();
               entry.inboundSliceScheduled = true;
+              entry.inboundSliceScheduledAt = scheduledAt;
               const run = function() {
+                state.stats.inboundSliceScheduleWaitSamples++;
+                state.stats.maxInboundSliceScheduleWaitMillis = Math.max(
+                  state.stats.maxInboundSliceScheduleWaitMillis,
+                  Math.max(0, now() - scheduledAt)
+                );
                 entry.inboundSliceScheduled = false;
                 entry.inboundSliceHandle = null;
                 entry.inboundSliceUsesRaf = false;
+                entry.inboundSliceScheduledAt = 0;
+                entry.inboundSliceSchedulerKind = '';
                 pumpSlices(entry);
               };
-              if (immediate && typeof queueMicrotask === 'function') queueMicrotask(run);
+              if (immediate && typeof queueMicrotask === 'function') {
+                entry.inboundSliceSchedulerKind = 'microtask';
+                state.stats.inboundImmediateSchedules++;
+                queueMicrotask(run);
+              }
               else if (typeof globalThis.requestAnimationFrame === 'function') {
                 entry.inboundSliceUsesRaf = true;
+                entry.inboundSliceSchedulerKind = 'raf';
+                state.stats.inboundRafSchedules++;
                 entry.inboundSliceHandle = globalThis.requestAnimationFrame(run);
               } else {
+                entry.inboundSliceSchedulerKind = 'timer';
+                state.stats.inboundTimerSchedules++;
                 entry.inboundSliceHandle = setTimeout(run, 0);
               }
             }
             function pumpSlices(entry) {
               if (!entry || entry.disposed) return;
+              // A slice/exact-queue pause must drain toward 64 without refilling 255 -> 256.
+              // A byte-only pause is different: pending bytes are already in this process, so
+              // admitting them below the depth low watermark is how the byte count can drain.
+              applyFlowControl(entry);
+              if (shouldBlockInboundSliceAdmission(entry)) return;
               const startedAt = now();
               let slices = 0;
               while (entry.pendingInboundHead < entry.pendingInbound.length &&
@@ -2837,7 +3188,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             }
             state.discardInbound = function(entry) {
               if (!entry) return;
-              state.finishHighWatermark(entry);
+              state.finishHighWatermark(entry, workDepth(entry), queuedBytes(entry));
               releaseDecoderCumulation(entry, 0);
               releaseDecodedSliceOwnership(entry);
               if (state.activeDecoderEntryId === entry.id) {
@@ -2865,7 +3216,10 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               entry.inboundSliceScheduled = false;
               entry.inboundSliceHandle = null;
               entry.inboundSliceUsesRaf = false;
+              entry.inboundSliceScheduledAt = 0;
+              entry.inboundSliceSchedulerKind = '';
               entry.decodeFlowPaused = false;
+              entry.flowPaused = false;
             };
             state.deliverInbound = function(entry, buffer) {
               if (!entry || entry.closed) return;
@@ -2980,7 +3334,8 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               applyFlowControl(entry);
               scheduleSlices(entry, false);
             };
-            state.recordDecodedPacketQueueScheduled = function(depth, paused, processed) {
+            state.recordDecodedPacketQueueScheduled = function(
+                depth, paused, processed, handleMillis, handleType) {
               const queueDepth = Math.max(0, Number(depth) || 0);
               const wasPaused = state.exactPacketQueuePaused;
               state.exactPacketQueuePaused = !!paused;
@@ -2993,9 +3348,42 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 state.stats.decodedPacketQueuePauses++;
               } else if (wasPaused && !state.exactPacketQueuePaused) {
                 state.stats.decodedPacketQueueResumes++;
+                // Raw slices may already be waiting with no new WebSocket frame left to wake the
+                // independent Java transport pump. Resume it on the exact-queue falling edge.
+                signalInbound();
               }
               if (processed) {
                 state.stats.decodedPacketDrainSignals++;
+                const elapsed = Number(handleMillis);
+                if (Number.isFinite(elapsed) && elapsed >= 0) {
+                  state.stats.queuedPacketHandleSamples++;
+                  if (elapsed > state.stats.maxQueuedPacketHandleMillis) {
+                    state.stats.maxQueuedPacketHandleMillis = elapsed;
+                    state.stats.maxQueuedPacketHandleType = String(handleType || 'unknown');
+                  }
+                  if (elapsed >= slowQueuedPacketThresholdMillis) {
+                    const sequence = boundedCount(
+                      state.stats.slowQueuedPacketEventSequence
+                    ) + 1;
+                    state.stats.slowQueuedPacketEventSequence = sequence;
+                    state.stats.slowQueuedPacketEvents.push({
+                      sequence: sequence,
+                      atMillis: now(),
+                      packetType: String(handleType || 'unknown'),
+                      elapsedMillis: elapsed,
+                      queueDepthAfter: queueDepth
+                    });
+                    if (state.stats.slowQueuedPacketEvents.length >
+                        maximumSlowQueuedPacketEvents) {
+                      const dropped = state.stats.slowQueuedPacketEvents.length -
+                        maximumSlowQueuedPacketEvents;
+                      state.stats.slowQueuedPacketEvents.splice(0, dropped);
+                      state.stats.slowQueuedPacketEventsDropped = boundedCount(
+                        state.stats.slowQueuedPacketEventsDropped
+                      ) + dropped;
+                    }
+                  }
+                }
               } else if (queueDepth > 0 && state.activeDecoderEntryId) {
                 const entry = state.channels.get(state.activeDecoderEntryId|0);
                 if (entry && !entry.disposed) {
@@ -3004,16 +3392,37 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                   releaseDecoderCumulation(entry, state.activeDecoderSliceBytes);
                 }
               }
+              if (!processed && queueDepth >= 64 &&
+                  typeof state.clientPacketDrain === 'function') {
+                // This hook only records pressure demand for Minecraft.runTick's one scheduled
+                // PacketProcessor boundary. It never schedules or executes a PLAY handler here.
+                state.clientPacketDrain();
+              }
               state.channels.forEach(function(entry) {
                 applyFlowControl(entry);
                 scheduleSlices(entry, false);
               });
               refreshHighWatermark();
             };
+            state.recordInlineDecodedPacketScheduled = function() {
+              const entry = state.channels.get(state.activeDecoderEntryId|0);
+              if (!entry || entry.disposed) return;
+              // A browser-inline handler proves that at least one complete packet was
+              // decoded from the active slice.  Any retained partial packet can therefore use at
+              // most the active slice; older cumulation has been consumed by completed packets.
+              releaseDecoderCumulation(entry, state.activeDecoderSliceBytes);
+              state.stats.inlineDecodedPackets++;
+              applyFlowControl(entry);
+            };
             state.hasPendingInboundScheduled = function(id) {
               const entry = state.channels.get(id|0);
               return !!entry && (entry.inboundHead < entry.inbound.length ||
                 entry.pendingInboundHead < entry.pendingInbound.length);
+            };
+            state.hasPumpableInboundScheduled = function(id) {
+              const entry = state.channels.get(id|0);
+              return !!entry && !entry.disposed && !state.exactPacketQueuePaused &&
+                entry.inboundHead < entry.inbound.length;
             };
             """)
     private static native void initInboundScheduler();
@@ -3053,19 +3462,49 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             """)
     private static native boolean hasPendingInbound(int id);
 
+    @JSBody(params = {"id"}, script = """
+            const bridge = globalThis.__gaiusNettyBridge;
+            return !!bridge && typeof bridge.hasPumpableInbound === 'function' &&
+              !!bridge.hasPumpableInbound(id);
+            """)
+    private static native boolean hasPumpableInbound(int id);
+
     /** Updates exact PacketProcessor queue depth and its independent transport pause state. */
-    public static void recordDecodedPacketQueue(int depth, boolean paused, boolean processed) {
-        recordDecodedPacketQueueJs(depth, paused, processed);
+    public static void recordDecodedPacketQueue(
+            int depth,
+            boolean paused,
+            boolean processed,
+            double handleMillis,
+            String handleType) {
+        recordDecodedPacketQueueJs(depth, paused, processed, handleMillis, handleType);
     }
 
-    @JSBody(params = {"depth", "paused", "processed"}, script = """
+    /** Retires decoder cumulation for a packet handled inline before PacketProcessor. */
+    public static void recordInlineDecodedPacket() {
+        recordInlineDecodedPacketJs();
+    }
+
+    @JSBody(params = {"depth", "paused", "processed", "handleMillis", "handleType"}, script = """
             const bridge = globalThis.__gaiusNettyBridge;
             if (bridge && typeof bridge.recordDecodedPacketQueue === 'function') {
-              bridge.recordDecodedPacketQueue(depth, paused, processed);
+              bridge.recordDecodedPacketQueue(
+                depth, paused, processed, handleMillis, handleType);
             }
             """)
     private static native void recordDecodedPacketQueueJs(
-            int depth, boolean paused, boolean processed);
+            int depth,
+            boolean paused,
+            boolean processed,
+            double handleMillis,
+            String handleType);
+
+    @JSBody(script = """
+            const bridge = globalThis.__gaiusNettyBridge;
+            if (bridge && typeof bridge.recordInlineDecodedPacket === 'function') {
+              bridge.recordInlineDecodedPacket();
+            }
+            """)
+    private static native void recordInlineDecodedPacketJs();
 
     @JSBody(script = """
             return typeof performance !== 'undefined' && performance.now
@@ -3094,4 +3533,31 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             globalThis.__gaiusNettyBridge.recordPump(id, chunks, bytes, millis);
             """)
     private static native void recordPump(int id, int chunks, int bytes, double millis);
+
+    @JSBody(params = {"channelsVisited", "millis", "budgetExhausted"}, script = """
+            const bridge = globalThis.__gaiusNettyBridge;
+            const stats = bridge && (bridge.stats || globalThis.__gaiusNetworkStats);
+            if (!stats) return;
+            const visited = Math.max(0, Number(channelsVisited) || 0);
+            const elapsed = Math.max(0, Number(millis) || 0);
+            stats.pumpAllTurns = (Number(stats.pumpAllTurns) || 0) + 1;
+            stats.pumpAllChannelsVisited =
+              (Number(stats.pumpAllChannelsVisited) || 0) + visited;
+            stats.pumpAllBudgetYields =
+              (Number(stats.pumpAllBudgetYields) || 0) + (budgetExhausted ? 1 : 0);
+            stats.pumpAllMaxTurnMillis = Math.max(
+              Number(stats.pumpAllMaxTurnMillis) || 0,
+              elapsed
+            );
+            stats.pumpAllMaxChannelsPerTurn = Math.max(
+              Number(stats.pumpAllMaxChannelsPerTurn) || 0,
+              visited
+            );
+            stats.pumpAllLastTurnMillis = elapsed;
+            stats.pumpAllLastChannelsVisited = visited;
+            """)
+    private static native void recordPumpAllTelemetry(
+            int channelsVisited,
+            double millis,
+            boolean budgetExhausted);
 }
