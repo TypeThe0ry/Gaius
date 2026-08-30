@@ -1459,6 +1459,14 @@ final class BrowserIntegratedServerMain {
     static void pumpUrgentPackets() {}
 }
 `],
+    // BrowserWorldgenScheduler's optional Mob-AI diagnostic fallback keeps the
+    // production type check explicit.  The smoke compiler intentionally uses a
+    // tiny fixture classpath, so provide the referenced type without pulling in
+    // the full Minecraft client JAR.
+    ["net/minecraft/world/entity/Mob.java", `
+package net.minecraft.world.entity;
+public class Mob {}
+`],
     ["io/netty/channel/browser/BrowserWebSocketChannel.java", `
 package io.netty.channel.browser;
 public final class BrowserWebSocketChannel {
