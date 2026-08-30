@@ -48,6 +48,18 @@ assert.match(browserClientNetworkSource,
     /const activeGenerationDrift = !!\(scheduler && scheduler\.pending[\s\S]*?activeGenerationDrift/u,
     "active pending generation drift must trigger scheduler replacement");
 assert.match(browserClientNetworkSource,
+    /const observedBridgeGenerationValid\s*=\s*[\s\S]*?Number\.isFinite\(observedBridgeGeneration\)[\s\S]*?observedBridgeGeneration > 0/u,
+    "bridge generation validity must be established before normalizing a pending scheduler");
+assert.match(browserClientNetworkSource,
+    /const observedSchedulerGenerationValid\s*=\s*[\s\S]*?Number\.isFinite\(observedSchedulerGeneration\)[\s\S]*?observedSchedulerGeneration > 0/u,
+    "scheduler generation validity must be established before normalizing a pending scheduler");
+assert.match(browserClientNetworkSource,
+    /const activeGenerationInvalid = !!\(scheduler && scheduler\.pending[\s\S]*?!observedBridgeGenerationValid[\s\S]*?!observedSchedulerGenerationValid/u,
+    "a pending scheduler with a one-sided invalid generation must fail closed");
+assert.match(browserClientNetworkSource,
+    /activeGenerationInvalid \|\| activeGenerationDrift/u,
+    "pending generation replacement must cover invalid and mismatched generations");
+assert.match(browserClientNetworkSource,
     /generation:\s*nextGeneration,/u,
     "inbound pump scheduler must carry a bridge-scoped generation");
 assert.match(browserClientNetworkSource,
@@ -70,6 +82,7 @@ assert.equal(
 // Server-free race model: replacing the scheduler while an old watchdog/message
 // callback is queued must leave the replacement pending record untouched and must
 // not re-enter the callback supplied to the retired generation.
+let generationGuardEvidence = null;
 {
     const oldScheduler = {
         generation: 1,
@@ -195,6 +208,94 @@ assert.equal(
         "generation drift replacement must clear the retired pending record");
     assert.equal(activePendingBridgeState.inboundPumpPending, false,
         "generation drift replacement must clear bridge pending state");
+
+    // A pending callback must never be repaired in place when either side of the
+    // bridge generation is invalid.  In particular, normalizing scheduler NaN/0
+    // to bridge=5 would invalidate the callback's captured ownerGeneration while
+    // leaving pending=true forever.  The production path replaces the scheduler,
+    // clears its watchdog and clears the bridge pending flag instead.
+    const generationInvalidCases = [
+        {label: "scheduler-zero", bridge: 5, scheduler: 0},
+        {label: "scheduler-nan", bridge: 5, scheduler: Number.NaN},
+        {label: "bridge-zero", bridge: 0, scheduler: 5},
+        {label: "bridge-nan", bridge: Number.NaN, scheduler: 5},
+    ];
+    generationGuardEvidence = generationInvalidCases.map((entry) => {
+        const pending = {token: 11, watchdog: 91};
+        const scheduler = {
+            version: 2,
+            generation: entry.scheduler,
+            pending,
+            __gaiusRetired: false,
+        };
+        const bridge = {
+            inboundPumpGeneration: entry.bridge,
+            inboundPumpScheduler: scheduler,
+            inboundPumpPending: true,
+        };
+        const bridgeGeneration = Number(bridge.inboundPumpGeneration);
+        const schedulerGeneration = Number(scheduler.generation);
+        const bridgeValid = Number.isFinite(bridgeGeneration) && bridgeGeneration > 0;
+        const schedulerValid = Number.isFinite(schedulerGeneration) && schedulerGeneration > 0;
+        const invalid = !!(scheduler && scheduler.pending &&
+            (!bridgeValid || !schedulerValid));
+        assert.equal(invalid, true,
+            `${entry.label}: one-sided invalid generation was not detected`);
+        const replacementBase = Math.max(
+            bridgeValid ? bridgeGeneration : 0,
+            schedulerValid ? schedulerGeneration : 0,
+        );
+        let replacementGeneration = (replacementBase + 1) >>> 0;
+        if (replacementGeneration === 0) replacementGeneration = 1;
+        if (invalid) {
+            scheduler.__gaiusRetired = true;
+            pending.watchdog = 0;
+            scheduler.pending = null;
+            bridge.inboundPumpPending = false;
+            bridge.inboundPumpGeneration = replacementGeneration;
+        }
+        assert.equal(pending.watchdog, 0,
+            `${entry.label}: retired watchdog was not cleared`);
+        assert.equal(scheduler.pending, null,
+            `${entry.label}: retired pending record was not cleared`);
+        assert.equal(bridge.inboundPumpPending, false,
+            `${entry.label}: bridge pending flag was not cleared`);
+        assert.equal(bridge.inboundPumpGeneration, replacementGeneration,
+            `${entry.label}: replacement generation was not advanced`);
+        return {
+            label: entry.label,
+            bridgeGenerationValid: bridgeValid,
+            schedulerGenerationValid: schedulerValid,
+            replacementGeneration,
+            pendingCleared: scheduler.pending === null,
+            watchdogCleared: pending.watchdog === 0,
+            bridgePendingCleared: bridge.inboundPumpPending === false,
+        };
+    });
+
+    // With no pending callback, an old/legacy scheduler is still normalized in
+    // place.  This preserves compatibility without reopening the stale-pending
+    // wedge above.
+    const legacyNoPendingBridge = {inboundPumpGeneration: 5};
+    const legacyNoPendingScheduler = {generation: 0, pending: null};
+    const legacyBridgeGeneration = Number(legacyNoPendingBridge.inboundPumpGeneration);
+    const legacySchedulerGeneration = Number(legacyNoPendingScheduler.generation);
+    const legacyBridgeValid = Number.isFinite(legacyBridgeGeneration) &&
+        legacyBridgeGeneration > 0;
+    const legacySchedulerValid = Number.isFinite(legacySchedulerGeneration) &&
+        legacySchedulerGeneration > 0;
+    const legacyActiveGenerationInvalid = !!(legacyNoPendingScheduler.pending &&
+        (!legacyBridgeValid || !legacySchedulerValid));
+    assert.equal(legacyActiveGenerationInvalid, false,
+        "legacy no-pending scheduler must keep the normalization path");
+    const legacyNormalizedGeneration = Math.max(
+        legacyBridgeValid ? legacyBridgeGeneration : 0,
+        legacySchedulerValid ? legacySchedulerGeneration : 0,
+        1,
+    );
+    legacyNoPendingScheduler.generation = legacyNormalizedGeneration;
+    assert.equal(legacyNoPendingScheduler.generation, 5,
+        "legacy no-pending scheduler generation did not normalize");
 
     const versionMutatedScheduler = {
         version: 1,
@@ -1670,4 +1771,9 @@ console.log(JSON.stringify({
     lifecycleCleanupRequired: true,
     traceFormattingGuarded: true,
     stallTimerArmedOnlyInPlay: true,
+    generationGuard: {
+        schemaVersion: "gaius.browser-inbound-pump-generation-guard.v1",
+        invalidPendingCases: generationGuardEvidence,
+        legacyNoPendingNormalization: true,
+    },
 }));

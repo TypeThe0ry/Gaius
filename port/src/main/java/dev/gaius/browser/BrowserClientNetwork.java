@@ -160,12 +160,21 @@ public final class BrowserClientNetwork {
             let scheduler = bridge.inboundPumpScheduler;
             const observedBridgeGeneration = Number(bridge.inboundPumpGeneration);
             const observedSchedulerGeneration = Number(scheduler && scheduler.generation);
+            const observedBridgeGenerationValid =
+              Number.isFinite(observedBridgeGeneration) && observedBridgeGeneration > 0;
+            const observedSchedulerGenerationValid =
+              Number.isFinite(observedSchedulerGeneration) && observedSchedulerGeneration > 0;
+            // A pending callback has captured the scheduler generation.  If either side of
+            // the bridge identity is invalid, normalizing it in place can make that callback
+            // permanently stale while leaving pending=true.  Replace the whole scheduler
+            // instead; legacy no-pending objects still take the normalization path below.
+            const activeGenerationInvalid = !!(scheduler && scheduler.pending &&
+              (!observedBridgeGenerationValid || !observedSchedulerGenerationValid));
             const activeGenerationDrift = !!(scheduler && scheduler.pending &&
-              Number.isFinite(observedBridgeGeneration) && observedBridgeGeneration > 0 &&
-              Number.isFinite(observedSchedulerGeneration) && observedSchedulerGeneration > 0 &&
+              observedBridgeGenerationValid && observedSchedulerGenerationValid &&
               observedBridgeGeneration !== observedSchedulerGeneration);
             if (!scheduler || scheduler.version !== 2 || scheduler.__gaiusRetired === true ||
-                activeGenerationDrift) {
+                activeGenerationInvalid || activeGenerationDrift) {
               const replacementBridgeGeneration = Number(bridge.inboundPumpGeneration);
               const retiredSchedulerGeneration = Number(scheduler && scheduler.generation);
               const replacementBaseGeneration = Math.max(
