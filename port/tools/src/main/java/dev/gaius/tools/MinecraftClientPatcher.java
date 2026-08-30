@@ -8827,6 +8827,7 @@ public final class MinecraftClientPatcher {
         boolean stateHooked = false;
         boolean throwableHooked = false;
         boolean browserChannelPumpHooked = false;
+        boolean clientPacketFrameBoundaryHooked = false;
         boolean singleplayerWorkerHooked = false;
         boolean singleplayerWorkerStopHooked = false;
         boolean singleplayerWorkerReturnHooked = false;
@@ -8859,15 +8860,77 @@ public final class MinecraftClientPatcher {
                 found = true;
             } else if (method.name.equals("runTick") && method.desc.equals("(Z)V")) {
                 InsnList browserPackets = new InsnList();
-                browserPackets.add(new MethodInsnNode(
+                MethodInsnNode beginClientPacketFrame = new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "dev/gaius/browser/BrowserClientNetwork",
+                        "beginClientPacketFrame",
+                        "()V",
+                        false);
+                MethodInsnNode installClientNetwork = new MethodInsnNode(
                         Opcodes.INVOKESTATIC,
                         "dev/gaius/browser/BrowserClientNetwork",
                         "install",
                         "()V",
-                        false));
-                browserPackets.add(pumpBrowserChannels());
+                        false);
+                MethodInsnNode pumpClientChannels = pumpBrowserChannels();
+                browserPackets.add(beginClientPacketFrame);
+                browserPackets.add(installClientNetwork);
+                browserPackets.add(pumpClientChannels);
                 method.instructions.insert(browserPackets);
+                if (nextOpcode(beginClientPacketFrame) != installClientNetwork
+                        || nextOpcode(installClientNetwork) != pumpClientChannels) {
+                    throw new IllegalStateException(
+                            "Minecraft runTick browser packet frame/pump order changed");
+                }
+                int scheduledPacketBoundaries = 0;
+                MethodInsnNode scheduledPacketBoundary = null;
+                for (AbstractInsnNode instruction : method.instructions.toArray()) {
+                    if (instruction instanceof MethodInsnNode call
+                            && call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                            && call.owner.equals("net/minecraft/network/PacketProcessor")
+                            && call.name.equals("processQueuedPackets")
+                            && call.desc.equals("()V")) {
+                        scheduledPacketBoundaries++;
+                        scheduledPacketBoundary = call;
+                    }
+                }
+                if (scheduledPacketBoundaries != 1 || scheduledPacketBoundary == null) {
+                    throw new IllegalStateException(
+                            "Minecraft runTick scheduled PacketProcessor boundary changed: "
+                                    + scheduledPacketBoundaries);
+                }
+                MethodInsnNode frameBoundaryWrapper = new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "dev/gaius/browser/BrowserClientNetwork",
+                        "processClientPacketsAtScheduledFrameBoundary",
+                        "(Lnet/minecraft/network/PacketProcessor;)V",
+                        false);
+                method.instructions.set(scheduledPacketBoundary, frameBoundaryWrapper);
+                int wrapperCalls = 0;
+                int directPacketProcessorCalls = 0;
+                for (AbstractInsnNode instruction : method.instructions.toArray()) {
+                    if (!(instruction instanceof MethodInsnNode call)) {
+                        continue;
+                    }
+                    if (call.getOpcode() == Opcodes.INVOKESTATIC
+                            && call.owner.equals("dev/gaius/browser/BrowserClientNetwork")
+                            && call.name.equals("processClientPacketsAtScheduledFrameBoundary")
+                            && call.desc.equals("(Lnet/minecraft/network/PacketProcessor;)V")) {
+                        wrapperCalls++;
+                    } else if (call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                            && call.owner.equals("net/minecraft/network/PacketProcessor")
+                            && call.name.equals("processQueuedPackets")
+                            && call.desc.equals("()V")) {
+                        directPacketProcessorCalls++;
+                    }
+                }
+                if (wrapperCalls != 1 || directPacketProcessorCalls != 0) {
+                    throw new IllegalStateException(
+                            "Minecraft runTick packet boundary replacement changed: wrapper="
+                                    + wrapperCalls + ", direct=" + directPacketProcessorCalls);
+                }
                 browserChannelPumpHooked = true;
+                clientPacketFrameBoundaryHooked = true;
                 for (var instruction = method.instructions.getFirst();
                         instruction != null;
                         instruction = instruction.getNext()) {
@@ -8995,6 +9058,10 @@ public final class MinecraftClientPatcher {
         }
         if (!browserChannelPumpHooked) {
             throw new IllegalStateException("Minecraft browser channel pump hook point was not found");
+        }
+        if (!clientPacketFrameBoundaryHooked) {
+            throw new IllegalStateException(
+                    "Minecraft client packet frame-boundary hook point was not found");
         }
         if (!throwableHooked) {
             throw new IllegalStateException("Minecraft run throwable diagnostic hook point was not found");
@@ -9967,6 +10034,65 @@ public final class MinecraftClientPatcher {
     private static void patchClientKeepAliveBrowser(String jar, Path output) throws IOException {
         ClassNode node = read(jar,
                 "net/minecraft/client/multiplayer/ClientCommonPacketListenerImpl.class");
+        MethodNode keepAlive = find(
+                node,
+                "handleKeepAlive",
+                "(Lnet/minecraft/network/protocol/common/ClientboundKeepAlivePacket;)V");
+        int keepAliveIdCalls = 0;
+        int keepAliveConstructors = 0;
+        int sendWhenCalls = 0;
+        int packetThreadChecks = 0;
+        int existingInlineAccountingCalls = 0;
+        for (AbstractInsnNode instruction : keepAlive.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode call)) {
+                continue;
+            }
+            if (call.owner.equals(
+                    "net/minecraft/network/protocol/common/ClientboundKeepAlivePacket")
+                    && call.name.equals("getId")
+                    && call.desc.equals("()J")) {
+                keepAliveIdCalls++;
+            } else if (call.owner.equals(
+                    "net/minecraft/network/protocol/common/ServerboundKeepAlivePacket")
+                    && call.name.equals("<init>")
+                    && call.desc.equals("(J)V")) {
+                keepAliveConstructors++;
+            } else if (call.owner.equals(node.name)
+                    && call.name.equals("sendWhen")
+                    && call.desc.equals("(Lnet/minecraft/network/protocol/Packet;"
+                            + "Ljava/util/function/BooleanSupplier;Ljava/time/Duration;)V")) {
+                sendWhenCalls++;
+            } else if (call.owner.equals("net/minecraft/network/protocol/PacketUtils")
+                    && call.name.equals("ensureRunningOnSameThread")) {
+                packetThreadChecks++;
+            } else if (call.owner.equals("io/netty/channel/browser/BrowserWebSocketChannel")
+                    && call.name.equals("recordInlineDecodedPacket")
+                    && call.desc.equals("()V")) {
+                existingInlineAccountingCalls++;
+            }
+        }
+        if (keepAliveIdCalls != 1
+                || keepAliveConstructors != 1
+                || sendWhenCalls != 1
+                || packetThreadChecks != 0
+                || existingInlineAccountingCalls != 0) {
+            throw new IOException(
+                    "ClientCommonPacketListenerImpl keepalive direct-send CFG changed: id="
+                            + keepAliveIdCalls
+                            + ", constructors=" + keepAliveConstructors
+                            + ", sendWhen=" + sendWhenCalls
+                            + ", packetThreadChecks=" + packetThreadChecks
+                            + ", inlineAccounting=" + existingInlineAccountingCalls);
+        }
+        InsnList keepAliveAccounting = new InsnList();
+        keepAliveAccounting.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "io/netty/channel/browser/BrowserWebSocketChannel",
+                "recordInlineDecodedPacket",
+                "()V",
+                false));
+        keepAlive.instructions.insert(keepAliveAccounting);
+
         MethodNode predicate = null;
         for (MethodNode method : node.methods) {
             if (!method.name.startsWith("lambda$handleKeepAlive$")
@@ -10440,6 +10566,25 @@ public final class MinecraftClientPatcher {
      * after configuration completes. Ordinary game packets stay queued so terrain handling is
      * still sliced by the client tick.
      */
+    private static boolean allExactlyOne(int[] values) {
+        for (int value : values) {
+            if (value != 1) {
+                return false;
+            }
+        }
+        return true;
+    }
+    private static String counts(int[] values) {
+        StringBuilder result = new StringBuilder("[");
+        for (int index = 0; index < values.length; index++) {
+            if (index > 0) {
+                result.append(',');
+            }
+            result.append(values[index]);
+        }
+        return result.append(']').toString();
+    }
+
     private static void patchClientPacketUtilsBrowserInline(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "net/minecraft/network/protocol/PacketUtils.class");
         MethodNode method = find(node, "ensureRunningOnSameThread",
@@ -10449,25 +10594,192 @@ public final class MinecraftClientPatcher {
             throw new IOException("PacketUtils client packet scheduler patch point was not found");
         }
         LabelNode inline = new LabelNode();
+        LabelNode queuedHandleReturn = new LabelNode();
         LabelNode vanillaScheduling = new LabelNode();
+        String[] transitionPacketTypes = {
+            "net/minecraft/network/protocol/game/ClientboundStartConfigurationPacket",
+            "net/minecraft/network/protocol/game/ClientboundLoginPacket"
+        };
+        String[] commonInlinePacketTypes = {
+            "net/minecraft/network/protocol/common/ClientboundPingPacket",
+            "net/minecraft/network/protocol/common/ClientboundCustomPayloadPacket",
+            "net/minecraft/network/protocol/common/ClientboundResourcePackPushPacket",
+            "net/minecraft/network/protocol/common/ClientboundResourcePackPopPacket",
+            "net/minecraft/network/protocol/cookie/ClientboundCookieRequestPacket",
+            "net/minecraft/network/protocol/common/ClientboundStoreCookiePacket",
+            "net/minecraft/network/protocol/common/ClientboundCustomReportDetailsPacket",
+            "net/minecraft/network/protocol/common/ClientboundServerLinksPacket",
+            "net/minecraft/network/protocol/common/ClientboundShowDialogPacket",
+            "net/minecraft/network/protocol/common/ClientboundClearDialogPacket",
+            "net/minecraft/network/protocol/common/ClientboundTransferPacket"
+        };
+        LabelNode transitionBacklogCheck = new LabelNode();
+        LabelNode forcedPlayQueue = new LabelNode();
+        MethodInsnNode forcedPlaySchedule = new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/network/PacketProcessor",
+                "scheduleIfPossible",
+                "(Lnet/minecraft/network/PacketListener;"
+                        + "Lnet/minecraft/network/protocol/Packet;)V",
+                false);
+        FieldInsnNode forcedPlayAbort = new FieldInsnNode(
+                Opcodes.GETSTATIC,
+                "net/minecraft/server/RunningOnDifferentThreadException",
+                "RUNNING_ON_DIFFERENT_THREAD",
+                "Lnet/minecraft/server/RunningOnDifferentThreadException;");
         InsnList code = new InsnList();
         code.add(new VarInsnNode(Opcodes.ALOAD, 1));
         code.add(new TypeInsnNode(Opcodes.INSTANCEOF,
                 "net/minecraft/client/multiplayer/ClientConfigurationPacketListenerImpl"));
         code.add(new JumpInsnNode(Opcodes.IFNE, inline));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        for (String packetType : commonInlinePacketTypes) {
+            code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            code.add(new TypeInsnNode(Opcodes.INSTANCEOF, packetType));
+            code.add(new JumpInsnNode(Opcodes.IFNE, inline));
+        }
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
         code.add(new TypeInsnNode(Opcodes.INSTANCEOF,
-                "net/minecraft/network/protocol/game/ClientboundStartConfigurationPacket"));
-        code.add(new JumpInsnNode(Opcodes.IFNE, inline));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new TypeInsnNode(Opcodes.INSTANCEOF,
-                "net/minecraft/network/protocol/game/ClientboundLoginPacket"));
+                "net/minecraft/client/multiplayer/ClientPacketListener"));
         code.add(new JumpInsnNode(Opcodes.IFEQ, vanillaScheduling));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserPacketScheduler",
+                "isProcessingQueuedPacket",
+                "()Z",
+                false));
+        code.add(new JumpInsnNode(Opcodes.IFNE, queuedHandleReturn));
+        for (String packetType : transitionPacketTypes) {
+            code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            code.add(new TypeInsnNode(Opcodes.INSTANCEOF, packetType));
+            code.add(new JumpInsnNode(Opcodes.IFNE, transitionBacklogCheck));
+        }
+        code.add(new JumpInsnNode(Opcodes.GOTO, forcedPlayQueue));
+        code.add(transitionBacklogCheck);
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserPacketScheduler",
+                "hasPendingPackets",
+                "()Z",
+                false));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, inline));
+        code.add(forcedPlayQueue);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(forcedPlaySchedule);
+        code.add(forcedPlayAbort);
+        code.add(new InsnNode(Opcodes.ATHROW));
+        code.add(queuedHandleReturn);
+        code.add(new InsnNode(Opcodes.RETURN));
         code.add(inline);
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "io/netty/channel/browser/BrowserWebSocketChannel",
+                "recordInlineDecodedPacket",
+                "()V",
+                false));
         code.add(new InsnNode(Opcodes.RETURN));
         code.add(vanillaScheduling);
         method.instructions.insert(code);
-        method.maxStack = Math.max(method.maxStack, 1);
+        int inlineHooks = 0;
+        int configurationBranches = 0;
+        int[] transitionPacketBranches = new int[transitionPacketTypes.length];
+        int[] commonInlinePacketBranches = new int[commonInlinePacketTypes.length];
+        int clientPlayBranches = 0;
+        int queuedDrainGuardCalls = 0;
+        int transitionBacklogChecks = 0;
+        MethodInsnNode inlineHook = null;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("io/netty/channel/browser/BrowserWebSocketChannel")
+                    && call.name.equals("recordInlineDecodedPacket")
+                    && call.desc.equals("()V")) {
+                inlineHooks++;
+                inlineHook = call;
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("dev/gaius/browser/BrowserPacketScheduler")
+                    && call.name.equals("isProcessingQueuedPacket")
+                    && call.desc.equals("()Z")
+                    && nextOpcode(call) instanceof JumpInsnNode branch
+                    && branch.getOpcode() == Opcodes.IFNE
+                    && branch.label == queuedHandleReturn) {
+                queuedDrainGuardCalls++;
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("dev/gaius/browser/BrowserPacketScheduler")
+                    && call.name.equals("hasPendingPackets")
+                    && call.desc.equals("()Z")
+                    && nextOpcode(call) instanceof JumpInsnNode branch
+                    && branch.getOpcode() == Opcodes.IFEQ
+                    && branch.label == inline) {
+                transitionBacklogChecks++;
+            }
+            if (!(instruction instanceof TypeInsnNode type)
+                    || type.getOpcode() != Opcodes.INSTANCEOF
+                    || !(nextOpcode(type) instanceof JumpInsnNode branch)) {
+                continue;
+            }
+            if (type.desc.equals(
+                    "net/minecraft/client/multiplayer/ClientConfigurationPacketListenerImpl")
+                    && branch.getOpcode() == Opcodes.IFNE
+                    && branch.label == inline) {
+                configurationBranches++;
+            } else if (type.desc.equals(
+                    "net/minecraft/client/multiplayer/ClientPacketListener")
+                    && branch.getOpcode() == Opcodes.IFEQ
+                    && branch.label == vanillaScheduling) {
+                clientPlayBranches++;
+            } else if (branch.getOpcode() == Opcodes.IFNE && branch.label == inline) {
+                for (int index = 0; index < commonInlinePacketTypes.length; index++) {
+                    if (type.desc.equals(commonInlinePacketTypes[index])) {
+                        commonInlinePacketBranches[index]++;
+                    }
+                }
+            } else if (branch.getOpcode() == Opcodes.IFNE
+                    && branch.label == transitionBacklogCheck) {
+                for (int index = 0; index < transitionPacketTypes.length; index++) {
+                    if (type.desc.equals(transitionPacketTypes[index])) {
+                        transitionPacketBranches[index]++;
+                    }
+                }
+            }
+        }
+        AbstractInsnNode inlineStart = nextOpcode(inline);
+        AbstractInsnNode inlineReturn = inlineHook == null ? null : nextOpcode(inlineHook);
+        AbstractInsnNode queuedReturn = nextOpcode(queuedHandleReturn);
+        AbstractInsnNode vanillaStart = nextOpcode(vanillaScheduling);
+        AbstractInsnNode forcedAbort = nextOpcode(forcedPlaySchedule);
+        AbstractInsnNode forcedThrow = forcedAbort == null ? null : nextOpcode(forcedAbort);
+        if (inlineHooks != 1
+                || inlineStart != inlineHook
+                || inlineReturn == null
+                || inlineReturn.getOpcode() != Opcodes.RETURN
+                || configurationBranches != 1
+                || !allExactlyOne(transitionPacketBranches)
+                || !allExactlyOne(commonInlinePacketBranches)
+                || clientPlayBranches != 1
+                || queuedDrainGuardCalls != 1
+                || transitionBacklogChecks != 1
+                || queuedReturn == null
+                || queuedReturn.getOpcode() != Opcodes.RETURN
+                || forcedAbort != forcedPlayAbort
+                || forcedThrow == null
+                || forcedThrow.getOpcode() != Opcodes.ATHROW
+                || vanillaStart == inlineHook) {
+            throw new IllegalStateException(
+                    "PacketUtils inline decoder accounting CFG changed: hooks=" + inlineHooks
+                            + ", configuration=" + configurationBranches
+                            + ", transitionPackets=" + counts(transitionPacketBranches)
+                            + ", commonInlinePackets=" + counts(commonInlinePacketBranches)
+                            + ", clientPlay=" + clientPlayBranches
+                            + ", drainGuard=" + queuedDrainGuardCalls
+                            + ", transitionBacklog=" + transitionBacklogChecks);
+        }
+        method.maxStack = Math.max(method.maxStack, 3);
         writeComputeFrames(node, output);
     }
 
@@ -10519,6 +10831,19 @@ public final class MinecraftClientPatcher {
         code.add(new VarInsnNode(Opcodes.ALOAD, 1));
         code.add(new JumpInsnNode(Opcodes.IFNULL, done));
         code.add(handleStart);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/network/PacketProcessor$ListenerAndPacket",
+                "packet",
+                "()Lnet/minecraft/network/protocol/Packet;",
+                false));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserPacketScheduler",
+                "beginQueuedPacket",
+                "(Ljava/lang/Object;)V",
+                false));
         code.add(new VarInsnNode(Opcodes.ALOAD, 1));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL,
@@ -10634,6 +10959,7 @@ public final class MinecraftClientPatcher {
         int processed = 0;
         int reset = 0;
         int shouldProcess = 0;
+        int beginQueued = 0;
         for (MethodNode method : node.methods) {
             for (AbstractInsnNode instruction : method.instructions.toArray()) {
                 if (!(instruction instanceof MethodInsnNode call)
@@ -10648,15 +10974,20 @@ public final class MinecraftClientPatcher {
                     reset++;
                 } else if (call.name.equals("shouldProcessNext") && call.desc.equals("()Z")) {
                     shouldProcess++;
+                } else if (call.name.equals("beginQueuedPacket")
+                        && call.desc.equals("(Ljava/lang/Object;)V")) {
+                    beginQueued++;
                 }
             }
         }
-        if (queued != 1 || processed != 2 || reset != 1 || shouldProcess != 1) {
+        if (queued != 1 || processed != 2 || reset != 1 || shouldProcess != 1
+                || beginQueued != 1) {
             throw new IllegalStateException(
                     "PacketProcessor accounting hooks changed: queued=" + queued
                             + ", processed=" + processed
                             + ", reset=" + reset
-                            + ", shouldProcess=" + shouldProcess);
+                            + ", shouldProcess=" + shouldProcess
+                            + ", beginQueued=" + beginQueued);
         }
         System.out.println("Instrumented exact decoded-packet queue accounting");
     }

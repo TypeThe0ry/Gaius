@@ -85,8 +85,11 @@ assert.match(schedulerSource,
   "mid-drain reset can erase the claimed batch epoch/completion evidence");
 const schedulerReset = between(schedulerSource, "public static void reset()", "\n    }\n}");
 assert.match(schedulerReset,
-  /if \(!preserveActiveDrainEvidence \|\| queuedPacketHandleDepth == 0\)[\s\S]*queuedPacketHandleDepth = 0[\s\S]*queuedPackets = 0/,
+  /if \(queuedPacketHandleDepth == 0\)[\s\S]*queuedPacketHandleDepth = 0[\s\S]*queuedPackets = 0/,
   "mid-handler reset does not preserve the active handle scope until packetProcessed finalizes it");
+assert.doesNotMatch(schedulerReset,
+  /!preserveActiveDrainEvidence\s*\|\|\s*queuedPacketHandleDepth\s*==\s*0/,
+  "reset may not clear a live queued-handler scope merely because adaptive drain is inactive");
 const packetProcessed = between(schedulerSource,
   "public static void packetProcessed()", "/** Mirrors PacketProcessor.close");
 assert.match(packetProcessed,
@@ -512,6 +515,45 @@ function scheduledFrameModel(initialDepth, {enabled = true, paused = false,
   };
 }
 
+// A close/reset from inside a queued handler must preserve the handler guard even when the
+// adaptive drain feature is disabled. Otherwise the still-running listener can re-enter the
+// inline path and packetProcessed() loses its outer-scope completion accounting.
+function queuedHandlerResetModel({drainActive = false, fixed = true} = {}) {
+  let handleDepth = 0;
+  let completionCount = 0;
+  handleDepth++;
+  const depthBeforeReset = handleDepth;
+  const preserveActiveDrainEvidence = drainActive;
+  if ((!fixed && !preserveActiveDrainEvidence) || handleDepth === 0) {
+    handleDepth = 0;
+  }
+  const processingDuringHandler = handleDepth > 0;
+  if (processingDuringHandler) {
+    handleDepth--;
+    if (handleDepth === 0) completionCount++;
+  }
+  return {drainActive, depthBeforeReset, processingDuringHandler, handleDepth,
+    completionCount};
+}
+
+const legacyInactiveDrainReset = queuedHandlerResetModel({drainActive: false, fixed: false});
+assert.equal(legacyInactiveDrainReset.processingDuringHandler, false,
+  "regression model no longer demonstrates the pre-fix guard loss");
+assert.equal(legacyInactiveDrainReset.completionCount, 0,
+  "regression model unexpectedly retained completion after legacy reset");
+
+const inactiveDrainReset = queuedHandlerResetModel({drainActive: false});
+assert.equal(inactiveDrainReset.depthBeforeReset, 1);
+assert.equal(inactiveDrainReset.processingDuringHandler, true,
+  "default drain reset cleared the queued-handler guard while the handler was live");
+assert.equal(inactiveDrainReset.handleDepth, 0);
+assert.equal(inactiveDrainReset.completionCount, 1,
+  "default drain reset lost the outer queued-handler completion");
+
+const activeDrainReset = queuedHandlerResetModel({drainActive: true});
+assert.equal(activeDrainReset.processingDuringHandler, true);
+assert.equal(activeDrainReset.completionCount, 1);
+
 const vanillaDisabled = scheduledFrameModel(256, {enabled: false});
 assert.equal(vanillaDisabled.mode, "vanilla");
 assert.equal(vanillaDisabled.calls, 1);
@@ -581,6 +623,8 @@ console.log(JSON.stringify({
   q64FailureHandlerCompletions: q64HandlerFailure.handlerCompletions,
   midDrainResetHandlerCompletions: midDrainReset.handlerCompletions,
   midDrainResetQueueDepthReduction: midDrainReset.queueDepthReduction,
+  inactiveDrainResetPreservesHandler: inactiveDrainReset.processingDuringHandler,
+  inactiveDrainResetCompletions: inactiveDrainReset.completionCount,
   vanillaMaximumPackets: vanillaDisabled.handled.length,
   budgetMillis: 2,
   passiveDemandSignals: stats.clientPacketDrainDemandSignals,
