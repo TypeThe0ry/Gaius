@@ -264,6 +264,15 @@ const CALLBACK_TAIL_TELEMETRY_SCHEMA_VERSION =
     "gaius.browser-client-poll-callback-tail.v1";
 const CALLBACK_TAIL_SLOW_THRESHOLD_MILLIS = 16.7;
 const CALLBACK_TAIL_SAMPLE_LIMIT = 64;
+// Finalization telemetry starts at the existing callback work endpoint and
+// ends after the continuation has been scheduled.  It is deliberately
+// diagnostic-only: callbackDurationRawMillis remains the strict 16.7 ms gate
+// and callbackWorkBudgetMillis remains the 8 ms admission budget.
+const CALLBACK_FINALIZATION_TAIL_TELEMETRY_SCHEMA_VERSION =
+    "gaius.browser-client-poll-callback-finalization-tail.v1";
+const CALLBACK_FINALIZATION_TAIL_SLOW_THRESHOLD_MILLIS = 16.7;
+const CALLBACK_FINALIZATION_TAIL_SAMPLE_LIMIT = 64;
+const CALLBACK_FINALIZATION_TAIL_RETENTION = "longest-tail-desc-sequence-asc";
 // A callback-tail overrun often collapses to one synchronous client poll.
 // Retain a bounded scalar-only phase breakdown so the next run can distinguish
 // bridge dequeue/transform, inflate/parse, packet dispatch, and bookkeeping.
@@ -293,6 +302,20 @@ const ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS = 250;
 const ARRIVAL_TIMELINE_SAMPLE_LIMIT = 64;
 const ARRIVAL_TIMELINE_RECONNECT_PHASE_LIMIT = 64;
 const ARRIVAL_TIMELINE_FRAME_RING_LIMIT = 64;
+// 26.2 emits ClientboundSetTime (play packet id 113) on the vanilla
+// twenty-tick cadence.  A decoded gap near one second ending in that packet
+// is a useful cadence hint, not proof of a user-visible stall.  Keep this
+// classification deliberately narrow and diagnostic-only: raw gap counters,
+// packet-gap measurements, and every strict gate remain unchanged.
+const ARRIVAL_PERIODIC_SERVER_SYNC_SCHEMA_VERSION =
+    "gaius.browser-client-arrival-periodic-server-sync.v1";
+const ARRIVAL_PERIODIC_SERVER_SYNC_CLASSIFICATION = "periodic-server-sync";
+const ARRIVAL_PERIODIC_SERVER_SYNC_PROFILE_ID = "26.2";
+const ARRIVAL_PERIODIC_SERVER_SYNC_PROTOCOL_VERSION = 776;
+const ARRIVAL_PERIODIC_SERVER_SYNC_PACKET_ID = 113;
+const ARRIVAL_PERIODIC_SERVER_SYNC_NOMINAL_GAP_MILLIS = 1000;
+const ARRIVAL_PERIODIC_SERVER_SYNC_TOLERANCE_MILLIS = 125;
+const ARRIVAL_PERIODIC_SERVER_SYNC_EXCLUDED_FROM_USER_VISIBLE_STALL = true;
 // These counters are exported by BrowserWebSocketChannel's JSBody stats. Keep
 // their exact source names: a missing source field is evidence, not a made-up
 // zero, and is handled explicitly by browserRuntimeCleanupGaugeEvidence().
@@ -1529,6 +1552,7 @@ try {
                 perClientReconnectPhases: ARRIVAL_TIMELINE_RECONNECT_PHASE_LIMIT,
                 frameMetadataRing: ARRIVAL_TIMELINE_FRAME_RING_LIMIT,
             },
+            periodicServerSync: arrivalPeriodicServerSyncContract(),
             transport: browserRuntime.arrivalTelemetry?.evidence?.() ?? null,
             clients: allClients.map((client) => ({
                 id: client.id,
@@ -1676,6 +1700,14 @@ function createFairClientPollScheduler(getClients) {
     let slowCallbackSamplesTotal = 0;
     let slowCallbackSamplesDropped = 0;
     const slowCallbackSamples = [];
+    let maxFinalizationTailMillis = 0;
+    let maxFinalizationTailRawMillis = 0;
+    let maxTotalAfterFinalizeMillis = 0;
+    let maxTotalAfterFinalizeRawMillis = 0;
+    let slowFinalizationTailSamplesTotal = 0;
+    let slowFinalizationTailSamplesDropped = 0;
+    const slowFinalizationTailSamples = [];
+    let lastFinalizationTail;
     let fairnessSkips = 0;
     let lastCallbackAt;
     let immediateSchedules = 0;
@@ -1707,6 +1739,18 @@ function createFairClientPollScheduler(getClients) {
         if (slowCallbackSamples.length > CALLBACK_TAIL_SAMPLE_LIMIT) {
             slowCallbackSamples.length = CALLBACK_TAIL_SAMPLE_LIMIT;
             slowCallbackSamplesDropped++;
+        }
+    };
+    const retainSlowFinalizationTailSample = (sample) => {
+        slowFinalizationTailSamples.push(sample);
+        slowFinalizationTailSamples.sort((left, right) =>
+            right.tailRawMillis - left.tailRawMillis ||
+            left.callbackSequence - right.callbackSequence);
+        if (slowFinalizationTailSamples.length >
+            CALLBACK_FINALIZATION_TAIL_SAMPLE_LIMIT) {
+            slowFinalizationTailSamples.length =
+                CALLBACK_FINALIZATION_TAIL_SAMPLE_LIMIT;
+            slowFinalizationTailSamplesDropped++;
         }
     };
     // Keep scheduling state per client rather than forcing every visible tab
@@ -1909,6 +1953,10 @@ function createFairClientPollScheduler(getClients) {
 
     const roundedMillis = (value) => Number.isFinite(value) && value >= 0
         ? Number(value.toFixed(3)) : 0;
+    const finiteNonNegativeMillis = (value) => {
+        const number = Number(value);
+        return Number.isFinite(number) && number >= 0 ? number : 0;
+    };
     const eventLoopDelayEvidence = () => {
         const histogram = eventLoopDelayMonitor;
         if (histogram === undefined) {
@@ -2247,6 +2295,10 @@ function createFairClientPollScheduler(getClients) {
             const callbackPhaseBeforeFinalize = callbackPhase;
             const callbackFinishedAt = performance.now();
             const callbackDurationMillis = callbackFinishedAt - callbackStartedAt;
+            // Keep the existing callback work endpoint untouched for strict
+            // gates.  Finalization telemetry begins after that measurement so
+            // its own clock read cannot inflate callbackDurationRawMillis.
+            const finalizeStartAt = performance.now();
             maxCallbackDurationMillis = Math.max(
                 maxCallbackDurationMillis,
                 callbackDurationMillis,
@@ -2339,6 +2391,50 @@ function createFairClientPollScheduler(getClients) {
             }
             if (!stopped) {
                 schedule(continuation);
+            }
+            // Include the existing continuation scheduling work in the
+            // diagnostic finalization interval, but keep the bounded telemetry
+            // ring itself out of the interval to avoid measuring its own sort
+            // and allocation overhead recursively.
+            const finalizeFinishAt = performance.now();
+            const finalizationTailRawMillis = finiteNonNegativeMillis(
+                finalizeFinishAt - finalizeStartAt);
+            const totalAfterFinalizeRawMillis = finiteNonNegativeMillis(
+                finalizeFinishAt - callbackStartedAt);
+            maxFinalizationTailRawMillis = Math.max(
+                maxFinalizationTailRawMillis, finalizationTailRawMillis);
+            maxFinalizationTailMillis = Math.max(
+                maxFinalizationTailMillis, finalizationTailRawMillis);
+            maxTotalAfterFinalizeRawMillis = Math.max(
+                maxTotalAfterFinalizeRawMillis, totalAfterFinalizeRawMillis);
+            maxTotalAfterFinalizeMillis = Math.max(
+                maxTotalAfterFinalizeMillis, totalAfterFinalizeRawMillis);
+            lastFinalizationTail = {
+                schemaVersion:
+                    CALLBACK_FINALIZATION_TAIL_TELEMETRY_SCHEMA_VERSION,
+                callbackSequence: callbackSequenceNumber,
+                trigger,
+                finalizeStartAtMillis: finiteNonNegativeMillis(finalizeStartAt),
+                finalizeFinishAtMillis: finiteNonNegativeMillis(finalizeFinishAt),
+                tailRawMillis: finalizationTailRawMillis,
+                tailMillis: roundedMillis(finalizationTailRawMillis),
+                totalAfterFinalizeRawMillis: totalAfterFinalizeRawMillis,
+                totalAfterFinalizeMillis: roundedMillis(totalAfterFinalizeRawMillis),
+                callbackDurationRawMillis: finiteNonNegativeMillis(
+                    callbackDurationMillis),
+                callbackDurationMillis: roundedMillis(callbackDurationMillis),
+                strictFrameBudgetMillis: 16.7,
+                diagnosticOnly: true,
+                strictGatesChanged: false,
+            };
+            if (finalizationTailRawMillis >=
+                CALLBACK_FINALIZATION_TAIL_SLOW_THRESHOLD_MILLIS) {
+                slowFinalizationTailSamplesTotal++;
+                retainSlowFinalizationTailSample({
+                    ...lastFinalizationTail,
+                    slowThresholdMillis:
+                        CALLBACK_FINALIZATION_TAIL_SLOW_THRESHOLD_MILLIS,
+                });
             }
         }
     };
@@ -2485,6 +2581,32 @@ function createFairClientPollScheduler(getClients) {
                     droppedSampleCount: slowCallbackSamplesDropped,
                     retention: "longest-duration-desc-sequence-asc",
                     samples: slowCallbackSamples.map((sample) => ({ ...sample })),
+                },
+                callbackFinalizationTail: {
+                    schemaVersion:
+                        CALLBACK_FINALIZATION_TAIL_TELEMETRY_SCHEMA_VERSION,
+                    slowThresholdMillis:
+                        CALLBACK_FINALIZATION_TAIL_SLOW_THRESHOLD_MILLIS,
+                    sampleLimit: CALLBACK_FINALIZATION_TAIL_SAMPLE_LIMIT,
+                    retention: CALLBACK_FINALIZATION_TAIL_RETENTION,
+                    diagnosticOnly: true,
+                    strictGatesChanged: false,
+                    strictRawDurationGateMillis: 16.7,
+                    includesContinuationScheduling: true,
+                    maxTailMillis: roundedMillis(maxFinalizationTailMillis),
+                    maxTailRawMillis: maxFinalizationTailRawMillis,
+                    maxTotalAfterFinalizeMillis:
+                        roundedMillis(maxTotalAfterFinalizeMillis),
+                    maxTotalAfterFinalizeRawMillis,
+                    slowTailSamplesTotal: slowFinalizationTailSamplesTotal,
+                    retainedSampleCount: slowFinalizationTailSamples.length,
+                    slowTailSamplesDropped: slowFinalizationTailSamplesDropped,
+                    droppedSampleCount: slowFinalizationTailSamplesDropped,
+                    lastFinalization: lastFinalizationTail === undefined
+                        ? null : { ...lastFinalizationTail },
+                    samples: slowFinalizationTailSamples.map((sample) => ({
+                        ...sample,
+                    })),
                 },
                 fairnessSkips,
                 maxInterCallbackGapMillis: roundedMillis(maxInterCallbackGapMillis),
@@ -2643,7 +2765,50 @@ function arrivalDelta(start, end, clock = undefined) {
     return Math.max(0, raw);
 }
 
+function isPeriodicServerSyncArrival({
+    profileId,
+    profileName,
+    protocolVersion,
+    packetId,
+    decodedGapMillis,
+    phaseAtDecode,
+    onmessageToDequeueMillis,
+    pollToBridgeDequeueMillis,
+    pollToDecodeMillis,
+    decodeMillis,
+    decodeToDispatchMillis,
+}) {
+    const resolvedProfileId = profileId ?? profileName;
+    const localSegments = [
+        onmessageToDequeueMillis,
+        pollToBridgeDequeueMillis,
+        pollToDecodeMillis,
+        decodeMillis,
+        decodeToDispatchMillis,
+    ];
+    // A cadence hint is only safe in steady PLAY with no independently
+    // observed local segment consuming the slow-gap window.  Otherwise keep
+    // the narrower bridge/decode/dispatch attribution below; a packet id and
+    // a coincidental ~1s interval must never hide a real browser stall.
+    const localSlowSegment = localSegments.some((value) =>
+        Number.isFinite(value) && value >= ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS);
+    return resolvedProfileId === ARRIVAL_PERIODIC_SERVER_SYNC_PROFILE_ID &&
+        protocolVersion === ARRIVAL_PERIODIC_SERVER_SYNC_PROTOCOL_VERSION &&
+        packetId === ARRIVAL_PERIODIC_SERVER_SYNC_PACKET_ID &&
+        phaseAtDecode === "play" &&
+        !localSlowSegment &&
+        Number.isFinite(decodedGapMillis) &&
+        Math.abs(decodedGapMillis - ARRIVAL_PERIODIC_SERVER_SYNC_NOMINAL_GAP_MILLIS) <=
+            ARRIVAL_PERIODIC_SERVER_SYNC_TOLERANCE_MILLIS;
+}
+
 function classifyBrowserArrivalGap({
+    profileId,
+    profileName,
+    protocolVersion,
+    packetId,
+    decodedGapMillis,
+    phaseAtDecode,
     intentional,
     reconnect,
     onmessageToDequeueMillis,
@@ -2654,6 +2819,21 @@ function classifyBrowserArrivalGap({
 }) {
     if (intentional) return "intentional-transport-drop-tail";
     if (reconnect) return "reconnect-gap";
+    if (isPeriodicServerSyncArrival({
+        profileId,
+        profileName,
+        protocolVersion,
+        packetId,
+        decodedGapMillis,
+        phaseAtDecode,
+        onmessageToDequeueMillis,
+        pollToBridgeDequeueMillis,
+        pollToDecodeMillis,
+        decodeMillis,
+        decodeToDispatchMillis,
+    })) {
+        return ARRIVAL_PERIODIC_SERVER_SYNC_CLASSIFICATION;
+    }
     if (Number.isFinite(pollToBridgeDequeueMillis) &&
         pollToBridgeDequeueMillis >= ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS) {
         // Prefer the narrower bridge segment when both it and the aggregate
@@ -2876,6 +3056,8 @@ class BrowserMinecraftClient {
         this.arrivalSlowSamples = [];
         this.arrivalReconnectPhases = [];
         this.arrivalClassificationCounts = new Map();
+        this.arrivalPeriodicServerSyncGapCountTotal = 0;
+        this.arrivalPeriodicServerSyncGapsExcluded = 0;
         this.arrivalPhaseSequence = 0;
         this.arrivalSeenPhaseEvents = new WeakSet();
         // A replacement client may inherit only the previous lifecycle's last
@@ -3031,6 +3213,12 @@ class BrowserMinecraftClient {
             this.arrivalFirstDecodedAfterReconnect = true;
         }
         const classification = classifyBrowserArrivalGap({
+            profileId: this.profile?.name,
+            profileName: this.profile?.name,
+            protocolVersion: this.profile?.protocolVersion,
+            packetId,
+            decodedGapMillis,
+            phaseAtDecode,
             intentional,
             // Snapshot this before handlePacket() can observe the first chunk
             // and close the recovery window.  A gap ending at that explicit
@@ -3047,6 +3235,12 @@ class BrowserMinecraftClient {
             classification,
             (this.arrivalClassificationCounts.get(classification) ?? 0) + 1,
         );
+        const excludedFromUserVisibleStall =
+            classification === ARRIVAL_PERIODIC_SERVER_SYNC_CLASSIFICATION;
+        if (excludedFromUserVisibleStall) {
+            this.arrivalPeriodicServerSyncGapCountTotal++;
+            this.arrivalPeriodicServerSyncGapsExcluded++;
+        }
         if (intentional) {
             this.arrivalIntentionalDropGapsExcluded++;
             return;
@@ -3057,6 +3251,9 @@ class BrowserMinecraftClient {
             sampleSequence: this.arrivalSlowSampleCountTotal + 1,
             clientId: this.id,
             wave: this.wave,
+            profileId: this.profile?.name ?? null,
+            protocolVersion: Number.isSafeInteger(this.profile?.protocolVersion)
+                ? this.profile.protocolVersion : null,
             packetSequence: this.decodedPackets,
             frameSequence: this.arrivalCurrentFrameSequence,
             packetId,
@@ -3110,9 +3307,14 @@ class BrowserMinecraftClient {
             correlationQuality: this.arrivalCurrentFrameSequence === null
                 ? "unknown" : "best-effort",
             classification,
+            cadenceHint: excludedFromUserVisibleStall
+                ? ARRIVAL_PERIODIC_SERVER_SYNC_CLASSIFICATION : null,
+            excludedFromUserVisibleStall,
+            strictGateImpact: "none",
             classificationConfidence: classification === "unattributed-arrival-gap"
                 ? "unattributed" : classification === "reconnect-gap"
-                    ? "reconnect-boundary" : "best-effort-local-segment",
+                    ? "reconnect-boundary" : excludedFromUserVisibleStall
+                        ? "periodic-cadence-hint" : "best-effort-local-segment",
             clock: {
                 ...clock,
             },
@@ -3161,6 +3363,12 @@ class BrowserMinecraftClient {
             frameMetadataDropped: this.arrivalFrameMetadataDropped,
             reconnectPhaseCountTotal: this.arrivalReconnectPhaseCountTotal,
             reconnectPhasesDropped: this.arrivalReconnectPhasesDropped,
+            periodicServerSync: {
+                ...arrivalPeriodicServerSyncContract(),
+                gapCountTotal: this.arrivalPeriodicServerSyncGapCountTotal,
+                gapsExcludedFromUserVisibleStall:
+                    this.arrivalPeriodicServerSyncGapsExcluded,
+            },
             // The bounded phase ring includes connect/login/play/close events
             // for the whole lifecycle, not only reconnect markers.  Keep the
             // historical field names for consumers while making its scope
@@ -5690,6 +5898,38 @@ async function waitForBrowserInboundFlowReady(runtime, label) {
     return assertBrowserInboundFlowReady(browserRuntimeSnapshot(runtime), label);
 }
 
+function callbackFinalizationTailContract() {
+    return {
+        schemaVersion: CALLBACK_FINALIZATION_TAIL_TELEMETRY_SCHEMA_VERSION,
+        slowThresholdMillis: CALLBACK_FINALIZATION_TAIL_SLOW_THRESHOLD_MILLIS,
+        sampleLimit: CALLBACK_FINALIZATION_TAIL_SAMPLE_LIMIT,
+        retention: CALLBACK_FINALIZATION_TAIL_RETENTION,
+        diagnosticOnly: true,
+        strictGatesChanged: false,
+        strictRawDurationGateMillis: 16.7,
+        measuredFrom: "callback-work-end-to-finalize-finish",
+        totalAfterFinalizeFrom: "callback-start-to-finalize-finish",
+        includesContinuationScheduling: true,
+    };
+}
+
+function arrivalPeriodicServerSyncContract() {
+    return {
+        schemaVersion: ARRIVAL_PERIODIC_SERVER_SYNC_SCHEMA_VERSION,
+        classification: ARRIVAL_PERIODIC_SERVER_SYNC_CLASSIFICATION,
+        profileId: ARRIVAL_PERIODIC_SERVER_SYNC_PROFILE_ID,
+        protocolVersion: ARRIVAL_PERIODIC_SERVER_SYNC_PROTOCOL_VERSION,
+        packetId: ARRIVAL_PERIODIC_SERVER_SYNC_PACKET_ID,
+        nominalGapMillis: ARRIVAL_PERIODIC_SERVER_SYNC_NOMINAL_GAP_MILLIS,
+        toleranceMillis: ARRIVAL_PERIODIC_SERVER_SYNC_TOLERANCE_MILLIS,
+        excludedFromUserVisibleStall:
+            ARRIVAL_PERIODIC_SERVER_SYNC_EXCLUDED_FROM_USER_VISIBLE_STALL,
+        strictGateImpact: "none",
+        diagnosticOnly: true,
+        strictGatesChanged: false,
+    };
+}
+
 function browserFullPathPerformanceContract() {
     return {
         mode: externalMode
@@ -5724,6 +5964,7 @@ function browserFullPathPerformanceContract() {
         arrivalTimeline: {
             schemaVersion: ARRIVAL_TIMELINE_SCHEMA_VERSION,
             wireAtSource: ARRIVAL_WIRE_AT_SOURCE,
+            periodicServerSync: arrivalPeriodicServerSyncContract(),
             slowThresholdMillis: ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS,
             perClientSlowSampleLimit: ARRIVAL_TIMELINE_SAMPLE_LIMIT,
             perClientReconnectPhaseLimit: ARRIVAL_TIMELINE_RECONNECT_PHASE_LIMIT,
@@ -5745,6 +5986,7 @@ function browserFullPathPerformanceContract() {
             independentExecution: false,
             retention: "longest-duration-desc-sequence-asc",
         },
+        callbackFinalizationTail: callbackFinalizationTailContract(),
         multiplayerPerformance: { ...MULTIPLAYER_PERFORMANCE_TARGET },
         pollScheduler: {
             schemaVersion: "gaius.browser-client-poll-scheduler.v1",
@@ -5766,6 +6008,7 @@ function browserFullPathPerformanceContract() {
                 retention: "longest-duration-desc-sequence-asc",
                 strictRawDurationGateMillis: 16.7,
             },
+            callbackFinalizationTail: callbackFinalizationTailContract(),
             dueState: "side-map-authoritative-client-property-mirror-only",
             immediateInboundPriority: "client-method-buffer-then-bridge",
         },
@@ -6124,8 +6367,10 @@ async function printConfiguration() {
             identities,
         },
         browserChannelSourceEvidence: browserChannelSource.evidence,
+        callbackFinalizationTail: callbackFinalizationTailContract(),
         arrivalTimeline: {
             schemaVersion: ARRIVAL_TIMELINE_SCHEMA_VERSION,
+            periodicServerSync: arrivalPeriodicServerSyncContract(),
             slowThresholdMillis: ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS,
             perClientSlowSampleLimit: ARRIVAL_TIMELINE_SAMPLE_LIMIT,
             perClientReconnectPhaseLimit: ARRIVAL_TIMELINE_RECONNECT_PHASE_LIMIT,
@@ -6217,6 +6462,7 @@ async function createBrowserRuntime(relayUrl, token) {
                     frameCorrelation: "websocket-message-to-bridge-chunk-best-effort",
                     correlationExact: false,
                 },
+                periodicServerSync: arrivalPeriodicServerSyncContract(),
                 binaryOnmessageFrames: this.binaryOnmessageFrames,
                 binaryOnmessageBytes: this.binaryOnmessageBytes,
                 bridgeDequeuedFrames: this.bridgeDequeuedFrames,

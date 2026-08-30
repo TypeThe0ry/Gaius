@@ -36,6 +36,15 @@ assert.match(source,
     /const MAX_PLAY_TICKS_PER_SCHEDULER_CALLBACK = MAX_CLIENTS_PER_POLL_CALLBACK/u);
 assert.match(source, /const CALLBACK_TAIL_SLOW_THRESHOLD_MILLIS = 16\.7/u);
 assert.match(source, /const CALLBACK_TAIL_SAMPLE_LIMIT = 64/u);
+assert.match(source,
+    /const CALLBACK_FINALIZATION_TAIL_TELEMETRY_SCHEMA_VERSION\s*=\s*["']gaius\.browser-client-poll-callback-finalization-tail\.v1["']/u,
+    "callback finalization-tail schema drifted");
+assert.match(source,
+    /const CALLBACK_FINALIZATION_TAIL_SLOW_THRESHOLD_MILLIS = 16\.7/u,
+    "callback finalization-tail threshold drifted");
+assert.match(source,
+    /const CALLBACK_FINALIZATION_TAIL_SAMPLE_LIMIT = 64/u,
+    "callback finalization-tail sample limit drifted");
 // Per-client poll phase evidence is deliberately a diagnostic ring.  Keep the
 // schema/caps visible at source level so a scheduler refactor cannot silently
 // turn it into an unbounded trace or alter the strict frame gate.
@@ -57,6 +66,33 @@ assert.match(source,
 assert.match(source,
     /const POLL_PHASE_SEGMENT_ACCOUNTING\s*=\s*["']inclusive-overlapping["']/u,
     "poll phase segment accounting semantics drifted");
+// A 26.2 ClientboundSetTime packet (id 113) normally arrives on the vanilla
+// twenty-tick cadence.  This is a narrow diagnostic hint only; it must never
+// relax or replace the strict packet/tick/callback gates.
+assert.match(source,
+    /ARRIVAL_PERIODIC_SERVER_SYNC_PROFILE_ID\s*=\s*["']26\.2["']/u,
+    "periodic server-sync profile contract drifted");
+assert.match(source,
+    /ARRIVAL_PERIODIC_SERVER_SYNC_PROTOCOL_VERSION\s*=\s*776/u,
+    "periodic server-sync protocol contract drifted");
+assert.match(source,
+    /ARRIVAL_PERIODIC_SERVER_SYNC_PACKET_ID\s*=\s*113/u,
+    "periodic server-sync packet id contract drifted");
+assert.match(source,
+    /ARRIVAL_PERIODIC_SERVER_SYNC_NOMINAL_GAP_MILLIS\s*=\s*1000/u,
+    "periodic server-sync cadence contract drifted");
+assert.match(source,
+    /ARRIVAL_PERIODIC_SERVER_SYNC_TOLERANCE_MILLIS\s*=\s*125/u,
+    "periodic server-sync cadence tolerance drifted");
+assert.match(source,
+    /phaseAtDecode\s*===\s*["']play["'][\s\S]*?!localSlowSegment/u,
+    "periodic server-sync hint must be restricted to PLAY without a slow local segment");
+assert.match(source,
+    /excludedFromUserVisibleStall\s*:/u,
+    "periodic server-sync exclusion marker missing");
+assert.match(source,
+    /strictGateImpact\s*:\s*["']none["']/u,
+    "periodic server-sync must remain outside strict gates");
 assert.match(source, /pollPhaseSamplesTotal/u,
     "client poll phase total counter is missing");
 assert.match(source, /pollPhaseSamplesDropped/u,
@@ -144,6 +180,18 @@ assert.match(schedulerSource, /budgetReachedPhase/u);
 assert.match(schedulerSource, /terminalPhase/u);
 assert.match(schedulerSource, /strictFrameBudgetExcessMillis/u);
 assert.match(schedulerSource, /nextContinuation/u);
+assert.match(schedulerSource, /finalizeStartAt/u,
+    "callback finalization-tail start timestamp is missing");
+assert.match(schedulerSource, /finalizeFinishAt/u,
+    "callback finalization-tail finish timestamp is missing");
+assert.match(schedulerSource, /tailRawMillis/u,
+    "callback finalization-tail raw duration is missing");
+assert.match(schedulerSource, /totalAfterFinalizeRawMillis/u,
+    "callback finalization-tail total endpoint is missing");
+assert.match(schedulerSource, /slowFinalizationTailSamplesDropped/u,
+    "callback finalization-tail drop counter is missing");
+assert.match(schedulerSource, /callbackFinalizationTail/u,
+    "callback finalization-tail evidence is missing");
 assert.match(schedulerSource, /servicePlayTick/u);
 assert.match(schedulerSource, /MAX_PLAY_TICKS_PER_SCHEDULER_CALLBACK/u);
 assert.match(schedulerSource, /isPlayTickDue/u,
@@ -534,6 +582,30 @@ function retainCallbackTailSample(state, sample) {
     return true;
 }
 
+// Finalization-tail model mirrors the production diagnostic ring.  It is
+// intentionally separate from callbackDurationRawMillis: a slow finalizer is
+// evidence for attribution, never a replacement for the strict callback gate.
+function retainCallbackFinalizationTailSample(state, sample) {
+    const tail = Number(sample?.tailRawMillis);
+    if (!Number.isFinite(tail) || tail < 16.7) return false;
+    state.total++;
+    state.samples.push({
+        ...sample,
+        tailRawMillis: tail,
+        totalAfterFinalizeRawMillis: Number(
+            sample?.totalAfterFinalizeRawMillis) >= 0
+            ? Number(sample.totalAfterFinalizeRawMillis) : 0,
+    });
+    state.samples.sort((left, right) =>
+        right.tailRawMillis - left.tailRawMillis ||
+        left.callbackSequence - right.callbackSequence);
+    if (state.samples.length > 64) {
+        state.samples.length = 64;
+        state.dropped++;
+    }
+    return true;
+}
+
 {
     const tail = { total: 0, dropped: 0, samples: [] };
     assert.equal(retainCallbackTailSample(tail, {
@@ -576,6 +648,54 @@ function retainCallbackTailSample(state, sample) {
     "callback-tail phase timings were not monotonic");
 }
 
+{
+    const tail = { total: 0, dropped: 0, samples: [] };
+    assert.equal(retainCallbackFinalizationTailSample(tail, {
+        callbackSequence: 1, tailRawMillis: 16.699,
+    }), false, "fast finalization tail entered the slow-tail ring");
+    assert.equal(retainCallbackFinalizationTailSample(tail, {
+        callbackSequence: 2, tailRawMillis: Number.NaN,
+    }), false, "non-finite finalization tail entered the slow-tail ring");
+    assert.deepEqual(tail, { total: 0, dropped: 0, samples: [] },
+        "fast finalization tail changed diagnostic counters");
+    for (let sequence = 1; sequence <= 65; sequence++) {
+        retainCallbackFinalizationTailSample(tail, {
+            schemaVersion:
+                "gaius.browser-client-poll-callback-finalization-tail.v1",
+            callbackSequence: sequence,
+            finalizeStartAtMillis: sequence,
+            finalizeFinishAtMillis: sequence + 17,
+            tailRawMillis: 16.7 + sequence / 1000,
+            totalAfterFinalizeRawMillis: 20 + sequence / 1000,
+            callbackDurationRawMillis: 12,
+        });
+    }
+    assert.equal(tail.total, 65,
+        "finalization-tail total did not count every candidate");
+    assert.equal(tail.samples.length, 64,
+        "finalization-tail ring exceeded its hard limit");
+    assert.equal(tail.dropped, 1,
+        "finalization-tail dropped count did not track overflow");
+    assert.equal(tail.total, tail.samples.length + tail.dropped,
+        "finalization-tail total/retained/dropped accounting diverged");
+    for (let index = 0; index < tail.samples.length; index++) {
+        const sample = tail.samples[index];
+        assert.ok(Number.isFinite(sample.tailRawMillis) &&
+            sample.tailRawMillis >= 16.7,
+        "finalization-tail ring retained an invalid sample");
+        assert.ok(Number.isFinite(sample.totalAfterFinalizeRawMillis) &&
+            sample.totalAfterFinalizeRawMillis >= 0,
+        "finalization-tail total endpoint was not finite");
+        if (index > 0) {
+            const previous = tail.samples[index - 1];
+            assert.ok(previous.tailRawMillis > sample.tailRawMillis ||
+                previous.tailRawMillis === sample.tailRawMillis &&
+                    previous.callbackSequence <= sample.callbackSequence,
+            "finalization-tail ring ordering drifted");
+        }
+    }
+}
+
 // Poll-phase diagnostic model.  The production client may parse/inflate a
 // bounded burst of frames synchronously, so callback-tail evidence must retain
 // one bounded sample per slow poll rather than infer phases from packet-arrival
@@ -602,6 +722,38 @@ const POLL_PHASE_SEGMENTS = Object.freeze([
     "handlerMillis",
     "finalizeMillis",
 ]);
+
+const ARRIVAL_PERIODIC_SERVER_SYNC_SCHEMA_VERSION =
+    "gaius.browser-client-arrival-periodic-server-sync.v1";
+const ARRIVAL_PERIODIC_SERVER_SYNC_CLASSIFICATION = "periodic-server-sync";
+const ARRIVAL_PERIODIC_SERVER_SYNC_PROFILE_ID = "26.2";
+const ARRIVAL_PERIODIC_SERVER_SYNC_PROTOCOL_VERSION = 776;
+const ARRIVAL_PERIODIC_SERVER_SYNC_PACKET_ID = 113;
+const ARRIVAL_PERIODIC_SERVER_SYNC_NOMINAL_GAP_MILLIS = 1000;
+const ARRIVAL_PERIODIC_SERVER_SYNC_TOLERANCE_MILLIS = 125;
+
+function classifyPeriodicServerSyncArrival({
+    profileId,
+    protocolVersion,
+    packetId,
+    decodedGapMillis,
+    phaseAtDecode = "play",
+    localSegments = [],
+}) {
+    const localSlowSegment = localSegments.some((value) =>
+        Number.isFinite(value) && value >= 250);
+    const periodic = profileId === ARRIVAL_PERIODIC_SERVER_SYNC_PROFILE_ID &&
+        protocolVersion === ARRIVAL_PERIODIC_SERVER_SYNC_PROTOCOL_VERSION &&
+        packetId === ARRIVAL_PERIODIC_SERVER_SYNC_PACKET_ID &&
+        phaseAtDecode === "play" &&
+        !localSlowSegment &&
+        Number.isFinite(decodedGapMillis) &&
+        Math.abs(decodedGapMillis - ARRIVAL_PERIODIC_SERVER_SYNC_NOMINAL_GAP_MILLIS) <=
+            ARRIVAL_PERIODIC_SERVER_SYNC_TOLERANCE_MILLIS;
+    return periodic
+        ? ARRIVAL_PERIODIC_SERVER_SYNC_CLASSIFICATION
+        : "unknown-arrival-gap";
+}
 
 function clampPollSegment(startAt, endAt) {
     const start = Number(startAt);
@@ -845,6 +997,58 @@ function retainPollPhaseSample(state, candidate) {
                 value <= sample.durationRawMillis,
             "poll phase segment was negative/non-finite/outside duration");
         }
+    }
+
+    // Cadence-hint model: only the canonical 26.2/protocol-776 packet 113
+    // with a gap in the narrow one-second window receives the periodic-server
+    // sync label.  Every nearby/non-canonical case stays unknown; the hint is
+    // diagnostic and carries no strict-pass semantics.
+    assert.equal(classifyPeriodicServerSyncArrival({
+        profileId: "26.2",
+        protocolVersion: 776,
+        packetId: 113,
+        decodedGapMillis: 1000,
+    }), ARRIVAL_PERIODIC_SERVER_SYNC_CLASSIFICATION,
+    "canonical 26.2 packet 113 cadence was not classified");
+    assert.equal(classifyPeriodicServerSyncArrival({
+        profileId: "26.2",
+        protocolVersion: 776,
+        packetId: 113,
+        decodedGapMillis: 1004.5,
+    }), ARRIVAL_PERIODIC_SERVER_SYNC_CLASSIFICATION,
+    "near-one-second 26.2 packet 113 cadence was not classified");
+    assert.equal(classifyPeriodicServerSyncArrival({
+        profileId: "26.2",
+        protocolVersion: 776,
+        packetId: 113,
+        decodedGapMillis: 1000,
+        phaseAtDecode: "configuration",
+    }), "unknown-arrival-gap",
+    "packet 113 outside PLAY must not receive a cadence hint");
+    assert.equal(classifyPeriodicServerSyncArrival({
+        profileId: "26.2",
+        protocolVersion: 776,
+        packetId: 113,
+        decodedGapMillis: 1000,
+        phaseAtDecode: "play",
+        localSegments: [300],
+    }), "unknown-arrival-gap",
+    "a slow local segment must not be hidden by a cadence hint");
+    for (const candidate of [
+        { profileId: "1.21.11", protocolVersion: 774, packetId: 113,
+            decodedGapMillis: 1000 },
+        { profileId: "26.2", protocolVersion: 776, packetId: 112,
+            decodedGapMillis: 1000 },
+        { profileId: "26.2", protocolVersion: 776, packetId: 113,
+            decodedGapMillis: 800 },
+        { profileId: "26.2", protocolVersion: 776, packetId: 113,
+            decodedGapMillis: 1201 },
+        { profileId: "26.2", protocolVersion: 775, packetId: 113,
+            decodedGapMillis: 1000 },
+    ]) {
+        assert.equal(classifyPeriodicServerSyncArrival(candidate),
+            "unknown-arrival-gap",
+        `non-canonical cadence candidate was misclassified: ${JSON.stringify(candidate)}`);
     }
 }
 
@@ -1095,6 +1299,36 @@ console.log(JSON.stringify({
         strictGatesChanged: false,
         independentExecution: false,
         retention: "longest-duration-desc-sequence-asc",
+    },
+    callbackFinalizationTail: {
+        schemaVersion:
+            "gaius.browser-client-poll-callback-finalization-tail.v1",
+        slowThresholdMillis: 16.7,
+        sampleLimit: 64,
+        retention: "longest-tail-desc-sequence-asc",
+        diagnosticOnly: true,
+        strictGatesChanged: false,
+        strictRawDurationGateMillis: 16.7,
+        measuredFrom: "callback-work-end-to-finalize-finish",
+        totalAfterFinalizeFrom: "callback-start-to-finalize-finish",
+        includesContinuationScheduling: true,
+    },
+    arrivalPeriodicServerSync: {
+        schemaVersion: ARRIVAL_PERIODIC_SERVER_SYNC_SCHEMA_VERSION,
+        classification: ARRIVAL_PERIODIC_SERVER_SYNC_CLASSIFICATION,
+        profileId: ARRIVAL_PERIODIC_SERVER_SYNC_PROFILE_ID,
+        protocolVersion: ARRIVAL_PERIODIC_SERVER_SYNC_PROTOCOL_VERSION,
+        packetId: ARRIVAL_PERIODIC_SERVER_SYNC_PACKET_ID,
+        nominalGapMillis: ARRIVAL_PERIODIC_SERVER_SYNC_NOMINAL_GAP_MILLIS,
+        toleranceMillis: ARRIVAL_PERIODIC_SERVER_SYNC_TOLERANCE_MILLIS,
+        excludedFromUserVisibleStall: true,
+        strictGateImpact: "none",
+        diagnosticOnly: true,
+        strictGatesChanged: false,
+        model: {
+            canonical: "periodic-server-sync",
+            nonCanonical: "unknown-arrival-gap",
+        },
     },
     results,
 }));

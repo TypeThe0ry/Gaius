@@ -84,7 +84,20 @@ const POLL_PHASE_FRAME_SAMPLE_LIMIT = 8;
 const POLL_PHASE_PACKET_SAMPLE_LIMIT = 64;
 const POLL_PHASE_PACKET_ID_SAMPLE_LIMIT = 8;
 const POLL_PHASE_SEGMENT_ACCOUNTING = "inclusive-overlapping";
+const CALLBACK_FINALIZATION_TAIL_TELEMETRY_SCHEMA_VERSION =
+    "gaius.browser-client-poll-callback-finalization-tail.v1";
+const CALLBACK_FINALIZATION_TAIL_SLOW_THRESHOLD_MILLIS = 16.7;
+const CALLBACK_FINALIZATION_TAIL_SAMPLE_LIMIT = 64;
+const CALLBACK_FINALIZATION_TAIL_RETENTION = "longest-tail-desc-sequence-asc";
 const ARRIVAL_WIRE_AT_SOURCE = "unavailable";
+const ARRIVAL_PERIODIC_SERVER_SYNC_SCHEMA_VERSION =
+    "gaius.browser-client-arrival-periodic-server-sync.v1";
+const ARRIVAL_PERIODIC_SERVER_SYNC_CLASSIFICATION = "periodic-server-sync";
+const ARRIVAL_PERIODIC_SERVER_SYNC_PROFILE_ID = "26.2";
+const ARRIVAL_PERIODIC_SERVER_SYNC_PROTOCOL_VERSION = 776;
+const ARRIVAL_PERIODIC_SERVER_SYNC_PACKET_ID = 113;
+const ARRIVAL_PERIODIC_SERVER_SYNC_NOMINAL_GAP_MILLIS = 1000;
+const ARRIVAL_PERIODIC_SERVER_SYNC_TOLERANCE_MILLIS = 125;
 const POLL_PHASE_SEGMENT_FIELDS = Object.freeze([
     "preludeMillis",
     "checkErrorMillis",
@@ -152,6 +165,10 @@ for (const tier of tiers) {
     assert.equal(configuration.performanceContract.arrivalTimeline?.wireAtSource,
         ARRIVAL_WIRE_AT_SOURCE,
         `stress tier ${tier} arrival wire source contract drifted`);
+    assertPeriodicServerSyncContract(
+        configuration.performanceContract.arrivalTimeline?.periodicServerSync,
+        `stress tier ${tier} configuration`,
+    );
     assert.equal(configuration.performanceContract.minimumChunkMetric,
         "unique-chunk-position");
     assert.equal(configuration.performanceContract.chunkWindow.maximumUniqueChunkCapacity, 257);
@@ -210,6 +227,18 @@ for (const tier of tiers) {
         sampleLimit: 64,
         retention: "longest-duration-desc-sequence-asc",
         strictRawDurationGateMillis: 16.7,
+    });
+    assert.deepEqual(schedulerContract.callbackFinalizationTail, {
+        schemaVersion: CALLBACK_FINALIZATION_TAIL_TELEMETRY_SCHEMA_VERSION,
+        slowThresholdMillis: CALLBACK_FINALIZATION_TAIL_SLOW_THRESHOLD_MILLIS,
+        sampleLimit: CALLBACK_FINALIZATION_TAIL_SAMPLE_LIMIT,
+        retention: CALLBACK_FINALIZATION_TAIL_RETENTION,
+        diagnosticOnly: true,
+        strictGatesChanged: false,
+        strictRawDurationGateMillis: 16.7,
+        measuredFrom: "callback-work-end-to-finalize-finish",
+        totalAfterFinalizeFrom: "callback-start-to-finalize-finish",
+        includesContinuationScheduling: true,
     });
     const pollPhaseContract = configuration.performanceContract.pollPhaseTelemetry;
     assert.ok(pollPhaseContract && typeof pollPhaseContract === "object",
@@ -513,6 +542,7 @@ function assertStressSchedulerEvidence(result, tier, configuration) {
             Math.max(...callbackTail.samples.map((sample) => sample.durationRawMillis)),
             `stress tier ${tier} callback-tail max sample was not retained first`);
     }
+    assertCallbackFinalizationTailEvidence(scheduler, tier, configuration);
     for (const [name, value] of [
         ["maxCallbackDurationRawMillis", scheduler.maxCallbackDurationRawMillis],
         ["maxClientPollDurationRawMillis", scheduler.maxClientPollDurationRawMillis],
@@ -566,6 +596,140 @@ function assertStressSchedulerEvidence(result, tier, configuration) {
         `stress tier ${tier} observed scheduler evidence diverged`);
     assert.deepEqual(result?.acceptance?.actual?.pollScheduler, scheduler,
         `stress tier ${tier} actual scheduler evidence diverged`);
+}
+
+function assertCallbackFinalizationTailEvidence(scheduler, tier, configuration) {
+    const contract = configuration.performanceContract.pollScheduler
+        .callbackFinalizationTail;
+    const tail = scheduler.callbackFinalizationTail;
+    assert.ok(tail && typeof tail === "object",
+        `stress tier ${tier} omitted callback-finalization-tail telemetry`);
+    assert.equal(tail.schemaVersion, contract.schemaVersion,
+        `stress tier ${tier} callback-finalization-tail schema drifted`);
+    assert.equal(tail.slowThresholdMillis,
+        CALLBACK_FINALIZATION_TAIL_SLOW_THRESHOLD_MILLIS,
+        `stress tier ${tier} callback-finalization-tail threshold drifted`);
+    assert.equal(tail.sampleLimit, CALLBACK_FINALIZATION_TAIL_SAMPLE_LIMIT,
+        `stress tier ${tier} callback-finalization-tail sample limit drifted`);
+    assert.equal(tail.retention, CALLBACK_FINALIZATION_TAIL_RETENTION,
+        `stress tier ${tier} callback-finalization-tail retention drifted`);
+    assert.equal(tail.diagnosticOnly, true,
+        `stress tier ${tier} callback-finalization-tail became a gate`);
+    assert.equal(tail.strictGatesChanged, false,
+        `stress tier ${tier} callback-finalization-tail changed strict gates`);
+    assert.equal(tail.strictRawDurationGateMillis, 16.7,
+        `stress tier ${tier} callback-finalization-tail strict gate drifted`);
+    assert.equal(tail.includesContinuationScheduling, true,
+        `stress tier ${tier} callback-finalization-tail omitted schedule endpoint`);
+    for (const [name, value] of [
+        ["slowTailSamplesTotal", tail.slowTailSamplesTotal],
+        ["slowTailSamplesDropped", tail.slowTailSamplesDropped],
+        ["retainedSampleCount", tail.retainedSampleCount],
+        ["droppedSampleCount", tail.droppedSampleCount],
+    ]) {
+        assert.ok(Number.isSafeInteger(value) && value >= 0,
+            `stress tier ${tier} callback-finalization-tail ${name} invalid: ${value}`);
+    }
+    assert.equal(tail.droppedSampleCount, tail.slowTailSamplesDropped,
+        `stress tier ${tier} callback-finalization-tail dropped aliases diverged`);
+    assert.ok(Array.isArray(tail.samples),
+        `stress tier ${tier} callback-finalization-tail samples were not an array`);
+    assert.ok(tail.samples.length <= tail.sampleLimit,
+        `stress tier ${tier} callback-finalization-tail ring exceeded its hard limit`);
+    assert.equal(tail.retainedSampleCount, tail.samples.length,
+        `stress tier ${tier} callback-finalization-tail retained count diverged`);
+    assert.equal(tail.slowTailSamplesTotal,
+        tail.retainedSampleCount + tail.slowTailSamplesDropped,
+        `stress tier ${tier} callback-finalization-tail total/drop accounting diverged`);
+    for (let index = 0; index < tail.samples.length; index++) {
+        const sample = tail.samples[index];
+        assert.ok(sample && typeof sample === "object",
+            `stress tier ${tier} callback-finalization-tail sample ${index} invalid`);
+        assert.equal(sample.schemaVersion, tail.schemaVersion,
+            `stress tier ${tier} callback-finalization-tail sample ${index} schema drifted`);
+        assert.ok(Number.isSafeInteger(sample.callbackSequence) &&
+            sample.callbackSequence > 0,
+        `stress tier ${tier} callback-finalization-tail sample ${index} sequence invalid`);
+        for (const [name, value] of [
+            ["finalizeStartAtMillis", sample.finalizeStartAtMillis],
+            ["finalizeFinishAtMillis", sample.finalizeFinishAtMillis],
+            ["tailRawMillis", sample.tailRawMillis],
+            ["tailMillis", sample.tailMillis],
+            ["totalAfterFinalizeRawMillis", sample.totalAfterFinalizeRawMillis],
+            ["totalAfterFinalizeMillis", sample.totalAfterFinalizeMillis],
+            ["callbackDurationRawMillis", sample.callbackDurationRawMillis],
+            ["callbackDurationMillis", sample.callbackDurationMillis],
+        ]) {
+            assert.ok(Number.isFinite(value) && value >= 0,
+                `stress tier ${tier} callback-finalization-tail sample ${index} ` +
+                `${name} was not finite/non-negative: ${value}`);
+        }
+        assert.ok(sample.finalizeFinishAtMillis >= sample.finalizeStartAtMillis,
+            `stress tier ${tier} callback-finalization-tail sample ${index} ` +
+            "finish preceded start");
+        assert.ok(sample.tailRawMillis >= tail.slowThresholdMillis,
+            `stress tier ${tier} callback-finalization-tail sample ${index} ` +
+            "was below threshold");
+        assert.ok(sample.totalAfterFinalizeRawMillis >=
+            sample.callbackDurationRawMillis,
+        `stress tier ${tier} callback-finalization-tail sample ${index} ` +
+            "total endpoint preceded callback work endpoint");
+        assert.equal(sample.tailMillis,
+            Number(sample.tailRawMillis.toFixed(3)),
+            `stress tier ${tier} callback-finalization-tail sample ${index} ` +
+            "rounded tail diverged");
+        if (index > 0) {
+            const previous = tail.samples[index - 1];
+            assert.ok(previous.tailRawMillis > sample.tailRawMillis ||
+                previous.tailRawMillis === sample.tailRawMillis &&
+                    previous.callbackSequence <= sample.callbackSequence,
+            `stress tier ${tier} callback-finalization-tail samples were not ` +
+            "stably ordered");
+        }
+    }
+    for (const [name, value] of [
+        ["maxTailRawMillis", tail.maxTailRawMillis],
+        ["maxTailMillis", tail.maxTailMillis],
+        ["maxTotalAfterFinalizeRawMillis", tail.maxTotalAfterFinalizeRawMillis],
+        ["maxTotalAfterFinalizeMillis", tail.maxTotalAfterFinalizeMillis],
+    ]) {
+        assert.ok(Number.isFinite(value) && value >= 0,
+            `stress tier ${tier} callback-finalization-tail ${name} invalid: ${value}`);
+    }
+    const maxSampleTail = tail.samples.length === 0 ? 0 :
+        Math.max(...tail.samples.map((sample) => sample.tailRawMillis));
+    assert.ok(tail.maxTailRawMillis >= maxSampleTail,
+        `stress tier ${tier} callback-finalization-tail max omitted a retained sample`);
+    assert.equal(tail.maxTailMillis,
+        Number(tail.maxTailRawMillis.toFixed(3)),
+        `stress tier ${tier} callback-finalization-tail rounded max diverged`);
+    const last = tail.lastFinalization;
+    if (scheduler.callbacks > 0) {
+        assert.ok(last && typeof last === "object",
+            `stress tier ${tier} callback-finalization-tail omitted last sample`);
+    }
+    if (last !== null && last !== undefined) {
+        assert.equal(last.schemaVersion, tail.schemaVersion,
+            `stress tier ${tier} callback-finalization-tail last schema drifted`);
+        assert.ok(Number.isSafeInteger(last.callbackSequence) &&
+            last.callbackSequence > 0,
+        `stress tier ${tier} callback-finalization-tail last sequence invalid`);
+        for (const [name, value] of [
+            ["finalizeStartAtMillis", last.finalizeStartAtMillis],
+            ["finalizeFinishAtMillis", last.finalizeFinishAtMillis],
+            ["tailRawMillis", last.tailRawMillis],
+            ["totalAfterFinalizeRawMillis", last.totalAfterFinalizeRawMillis],
+            ["callbackDurationRawMillis", last.callbackDurationRawMillis],
+        ]) {
+            assert.ok(Number.isFinite(value) && value >= 0,
+                `stress tier ${tier} callback-finalization-tail last ${name} invalid`);
+        }
+        assert.ok(last.finalizeFinishAtMillis >= last.finalizeStartAtMillis,
+            `stress tier ${tier} callback-finalization-tail last finish preceded start`);
+        assert.ok(last.totalAfterFinalizeRawMillis >=
+            last.callbackDurationRawMillis,
+        `stress tier ${tier} callback-finalization-tail last endpoint regressed`);
+    }
 }
 
 function assertOptionalPollPhaseTelemetry(
@@ -1097,6 +1261,48 @@ function boundedTail(previous, next, maximumBytes) {
         : combined.subarray(combined.byteLength - maximumBytes);
 }
 
+function assertPeriodicServerSyncContract(telemetry, label) {
+    assert.ok(telemetry && typeof telemetry === "object",
+        `${label}: periodic server-sync contract missing`);
+    assert.equal(telemetry.schemaVersion,
+        ARRIVAL_PERIODIC_SERVER_SYNC_SCHEMA_VERSION,
+        `${label}: periodic server-sync schema drifted`);
+    assert.equal(telemetry.classification,
+        ARRIVAL_PERIODIC_SERVER_SYNC_CLASSIFICATION,
+        `${label}: periodic server-sync classification drifted`);
+    assert.equal(telemetry.profileId,
+        ARRIVAL_PERIODIC_SERVER_SYNC_PROFILE_ID,
+        `${label}: periodic server-sync profile drifted`);
+    assert.equal(telemetry.protocolVersion,
+        ARRIVAL_PERIODIC_SERVER_SYNC_PROTOCOL_VERSION,
+        `${label}: periodic server-sync protocol drifted`);
+    assert.equal(telemetry.packetId,
+        ARRIVAL_PERIODIC_SERVER_SYNC_PACKET_ID,
+        `${label}: periodic server-sync packet id drifted`);
+    assert.equal(telemetry.nominalGapMillis,
+        ARRIVAL_PERIODIC_SERVER_SYNC_NOMINAL_GAP_MILLIS,
+        `${label}: periodic server-sync nominal cadence drifted`);
+    assert.equal(telemetry.toleranceMillis,
+        ARRIVAL_PERIODIC_SERVER_SYNC_TOLERANCE_MILLIS,
+        `${label}: periodic server-sync tolerance drifted`);
+    assert.equal(telemetry.excludedFromUserVisibleStall, true,
+        `${label}: periodic server-sync exclusion marker drifted`);
+    assert.equal(telemetry.strictGateImpact, "none",
+        `${label}: periodic server-sync changed strict-gate accounting`);
+    assert.equal(telemetry.diagnosticOnly, true,
+        `${label}: periodic server-sync telemetry is not diagnostic-only`);
+    assert.equal(telemetry.strictGatesChanged, false,
+        `${label}: periodic server-sync changed strict gates`);
+    if (Object.prototype.hasOwnProperty.call(telemetry, "gapCountTotal")) {
+        assert.ok(Number.isSafeInteger(telemetry.gapCountTotal) &&
+            telemetry.gapCountTotal >= 0,
+        `${label}: periodic server-sync gap count is invalid`);
+        assert.equal(telemetry.gapsExcludedFromUserVisibleStall,
+            telemetry.gapCountTotal,
+            `${label}: periodic server-sync exclusion count diverged`);
+    }
+}
+
 function assertArrivalTimelineEvidence(result, tier) {
     const topLevel = result?.arrivalTimeline;
     assert.equal(topLevel?.schemaVersion,
@@ -1106,6 +1312,8 @@ function assertArrivalTimelineEvidence(result, tier) {
         `stress tier ${tier} mislabelled live arrival evidence as independent`);
     assert.equal(topLevel?.strictGatesChanged, false,
         `stress tier ${tier} arrival timeline changed strict gates`);
+    assertPeriodicServerSyncContract(topLevel?.periodicServerSync,
+        `stress tier ${tier} top-level arrival timeline`);
     assert.equal(topLevel?.limits?.perClientSlowSamples, 64);
     assert.equal(topLevel?.limits?.perClientReconnectPhases, 64);
     assert.equal(topLevel?.limits?.frameMetadataRing, 64);
@@ -1122,6 +1330,8 @@ function assertArrivalTimelineEvidence(result, tier) {
     assert.equal(topLevel.transport?.source?.attributionPolicy,
         "trusted-wire-required-for-upstream; missing-local-segments=>unattributed",
         `stress tier ${tier} transport arrival attribution policy drifted`);
+    assertPeriodicServerSyncContract(topLevel.transport?.periodicServerSync,
+        `stress tier ${tier} transport arrival timeline`);
     for (const [index, client] of result.clients.entries()) {
         const topLevelClient = topLevel.clients[index];
         assert.equal(topLevelClient?.id, client?.id,
@@ -1132,6 +1342,8 @@ function assertArrivalTimelineEvidence(result, tier) {
             `stress tier ${tier} client lifecycle ${index + 1} omitted arrival schema`);
         assert.equal(timeline?.strictGatesChanged, false,
             `stress tier ${tier} client lifecycle ${index + 1} changed strict gates`);
+        assertPeriodicServerSyncContract(timeline?.periodicServerSync,
+            `stress tier ${tier} client lifecycle ${index + 1}`);
         assert.equal(timeline?.source?.wireAtSource, "unavailable",
             `stress tier ${tier} client lifecycle ${index + 1} synthesized wire time`);
         assert.equal(timeline?.source?.attributionPolicy,
@@ -1145,6 +1357,46 @@ function assertArrivalTimelineEvidence(result, tier) {
                 assert.equal(sample.wireAtSource, ARRIVAL_WIRE_AT_SOURCE,
                     `stress tier ${tier} lifecycle ${index + 1} arrival sample ${sampleIndex} ` +
                     "synthesized wire timestamp source");
+            }
+            if (sample.classification === ARRIVAL_PERIODIC_SERVER_SYNC_CLASSIFICATION) {
+                assert.equal(sample.profileId, ARRIVAL_PERIODIC_SERVER_SYNC_PROFILE_ID,
+                    `stress tier ${tier} lifecycle ${index + 1} periodic sample ` +
+                    `${sampleIndex} profile id drifted`);
+                assert.equal(sample.protocolVersion,
+                    ARRIVAL_PERIODIC_SERVER_SYNC_PROTOCOL_VERSION,
+                    `stress tier ${tier} lifecycle ${index + 1} periodic sample ` +
+                    `${sampleIndex} protocol drifted`);
+                assert.equal(sample.phaseAtDecode, "play",
+                    `stress tier ${tier} lifecycle ${index + 1} periodic sample ` +
+                    `${sampleIndex} was outside PLAY`);
+                assert.equal(sample.packetId, ARRIVAL_PERIODIC_SERVER_SYNC_PACKET_ID,
+                    `stress tier ${tier} lifecycle ${index + 1} periodic sample ` +
+                    `${sampleIndex} packet id drifted`);
+                assert.equal(sample.excludedFromUserVisibleStall, true,
+                    `stress tier ${tier} lifecycle ${index + 1} periodic sample ` +
+                    `${sampleIndex} was not excluded from visible-stall reporting`);
+                assert.equal(sample.strictGateImpact, "none",
+                    `stress tier ${tier} lifecycle ${index + 1} periodic sample ` +
+                    `${sampleIndex} changed strict-gate accounting`);
+                assert.equal(sample.cadenceHint,
+                    ARRIVAL_PERIODIC_SERVER_SYNC_CLASSIFICATION,
+                    `stress tier ${tier} lifecycle ${index + 1} periodic sample ` +
+                    `${sampleIndex} cadence hint drifted`);
+                assert.ok(Math.abs(sample.decodedGapMillis -
+                    ARRIVAL_PERIODIC_SERVER_SYNC_NOMINAL_GAP_MILLIS) <=
+                    ARRIVAL_PERIODIC_SERVER_SYNC_TOLERANCE_MILLIS,
+                `stress tier ${tier} lifecycle ${index + 1} periodic sample ` +
+                    `${sampleIndex} gap escaped cadence tolerance`);
+                for (const [segmentName, segmentValue] of Object.entries(
+                    sample.segments ?? {})) {
+                    if (segmentName === "wireToOnmessageMillis" ||
+                        segmentValue === null || segmentValue === undefined) {
+                        continue;
+                    }
+                    assert.ok(!(Number.isFinite(segmentValue) && segmentValue >= 250),
+                        `stress tier ${tier} lifecycle ${index + 1} periodic sample ` +
+                        `${sampleIndex} hid slow local segment ${segmentName}`);
+                }
             }
         }
         assert.ok(Array.isArray(timeline?.reconnectPhases));

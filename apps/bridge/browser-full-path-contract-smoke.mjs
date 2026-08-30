@@ -65,8 +65,41 @@ assert.match(fullPathSourceText,
     /reconnectRecoveryAtDecode/u,
     "arrival timeline must mark reconnect-boundary decode samples explicitly");
 assert.match(fullPathSourceText,
+    /ARRIVAL_PERIODIC_SERVER_SYNC_PACKET_ID\s*=\s*113/u,
+    "periodic server-sync packet id contract drifted");
+assert.match(fullPathSourceText,
+    /ARRIVAL_PERIODIC_SERVER_SYNC_NOMINAL_GAP_MILLIS\s*=\s*1000/u,
+    "periodic server-sync cadence contract drifted");
+assert.match(fullPathSourceText,
+    /ARRIVAL_PERIODIC_SERVER_SYNC_TOLERANCE_MILLIS\s*=\s*125/u,
+    "periodic server-sync cadence tolerance drifted");
+assert.match(fullPathSourceText,
+    /ARRIVAL_PERIODIC_SERVER_SYNC_CLASSIFICATION\s*=\s*["']periodic-server-sync["']/u,
+    "periodic server-sync classification label drifted");
+assert.match(fullPathSourceText,
+    /ARRIVAL_PERIODIC_SERVER_SYNC_PROFILE_ID\s*=\s*["']26\.2["']/u,
+    "periodic server-sync profile contract drifted");
+assert.match(fullPathSourceText,
+    /ARRIVAL_PERIODIC_SERVER_SYNC_PROTOCOL_VERSION\s*=\s*776/u,
+    "periodic server-sync protocol contract drifted");
+assert.match(fullPathSourceText,
+    /excludedFromUserVisibleStall\s*:/u,
+    "periodic server-sync exclusion marker missing");
+assert.match(fullPathSourceText,
+    /strictGateImpact\s*:\s*["']none["']/u,
+    "periodic server-sync must remain outside strict gates");
+assert.match(fullPathSourceText,
     /CALLBACK_TAIL_SLOW_THRESHOLD_MILLIS\s*=\s*16\.7/u,
     "strict callback tail gate drifted");
+assert.match(fullPathSourceText,
+    /const CALLBACK_FINALIZATION_TAIL_TELEMETRY_SCHEMA_VERSION\s*=\s*["']gaius\.browser-client-poll-callback-finalization-tail\.v1["']/u,
+    "callback finalization-tail schema drifted");
+assert.match(fullPathSourceText,
+    /const CALLBACK_FINALIZATION_TAIL_SLOW_THRESHOLD_MILLIS\s*=\s*16\.7/u,
+    "callback finalization-tail threshold drifted");
+assert.match(fullPathSourceText,
+    /const CALLBACK_FINALIZATION_TAIL_SAMPLE_LIMIT\s*=\s*64/u,
+    "callback finalization-tail sample limit drifted");
 // Per-poll phase evidence is bounded diagnostic context for explaining a
 // callback tail.  It must not become a second acceptance gate, an independent
 // execution claim, or an unbounded packet/payload trace.
@@ -184,6 +217,66 @@ function assertPollPhaseTelemetryContract(config, label) {
         `${label}: poll phase retention policy drifted`);
 }
 
+function assertCallbackFinalizationTailContract(config, label) {
+    const telemetry = config?.performanceContract?.callbackFinalizationTail ??
+        config?.performanceContract?.pollScheduler?.callbackFinalizationTail;
+    assert.ok(telemetry && typeof telemetry === "object",
+        `${label}: callbackFinalizationTail contract missing`);
+    assert.equal(telemetry.schemaVersion,
+        "gaius.browser-client-poll-callback-finalization-tail.v1",
+        `${label}: callback finalization-tail schema drifted`);
+    assert.equal(telemetry.slowThresholdMillis, 16.7,
+        `${label}: callback finalization-tail threshold drifted`);
+    assert.equal(telemetry.sampleLimit, 64,
+        `${label}: callback finalization-tail sample limit drifted`);
+    assert.equal(telemetry.retention, "longest-tail-desc-sequence-asc",
+        `${label}: callback finalization-tail retention drifted`);
+    assert.equal(telemetry.diagnosticOnly, true,
+        `${label}: callback finalization-tail became a gate`);
+    assert.equal(telemetry.strictGatesChanged, false,
+        `${label}: callback finalization-tail changed strict gates`);
+    assert.equal(telemetry.strictRawDurationGateMillis, 16.7,
+        `${label}: callback finalization-tail strict gate drifted`);
+    assert.equal(telemetry.measuredFrom,
+        "callback-work-end-to-finalize-finish",
+        `${label}: callback finalization-tail start semantics drifted`);
+    assert.equal(telemetry.totalAfterFinalizeFrom,
+        "callback-start-to-finalize-finish",
+        `${label}: callback finalization-tail total semantics drifted`);
+    assert.equal(telemetry.includesContinuationScheduling, true,
+        `${label}: callback finalization-tail omitted scheduling endpoint`);
+}
+
+function assertPeriodicServerSyncContract(config, label) {
+    const telemetry = config?.performanceContract?.arrivalTimeline
+        ?.periodicServerSync;
+    assert.ok(telemetry && typeof telemetry === "object",
+        `${label}: periodic server-sync contract missing`);
+    assert.equal(telemetry.schemaVersion,
+        "gaius.browser-client-arrival-periodic-server-sync.v1",
+        `${label}: periodic server-sync schema drifted`);
+    assert.equal(telemetry.classification, "periodic-server-sync",
+        `${label}: periodic server-sync classification drifted`);
+    assert.equal(telemetry.profileId, "26.2",
+        `${label}: periodic server-sync profile drifted`);
+    assert.equal(telemetry.protocolVersion, 776,
+        `${label}: periodic server-sync protocol drifted`);
+    assert.equal(telemetry.packetId, 113,
+        `${label}: periodic server-sync packet id drifted`);
+    assert.equal(telemetry.nominalGapMillis, 1000,
+        `${label}: periodic server-sync nominal cadence drifted`);
+    assert.equal(telemetry.toleranceMillis, 125,
+        `${label}: periodic server-sync tolerance drifted`);
+    assert.equal(telemetry.excludedFromUserVisibleStall, true,
+        `${label}: periodic server-sync exclusion marker drifted`);
+    assert.equal(telemetry.strictGateImpact, "none",
+        `${label}: periodic server-sync changed strict-gate accounting`);
+    assert.equal(telemetry.diagnosticOnly, true,
+        `${label}: periodic server-sync telemetry is not diagnostic-only`);
+    assert.equal(telemetry.strictGatesChanged, false,
+        `${label}: periodic server-sync changed strict gates`);
+}
+
 const expectedProfiles = [
     {
         path: "versions/26.2.json", id: "26.2", protocol: 776, world: 4903,
@@ -212,6 +305,10 @@ for (const expected of expectedProfiles) {
         "unavailable",
         `${expected.id} arrival wire source contract drifted`);
     assertPollPhaseTelemetryContract(config, `${expected.id} compatible config`);
+    assertCallbackFinalizationTailContract(config,
+        `${expected.id} compatible config`);
+    assertPeriodicServerSyncContract(config,
+        `${expected.id} compatible config`);
     assert.equal(config.performanceContract.strictAcceptanceTarget, null);
     assert.equal(config.performanceContract.soakMillis, 1000);
     assert.equal(config.performanceContract.reconnectWaves, 0);
@@ -304,6 +401,10 @@ for (const expected of expectedProfiles) {
         assert.equal(stress.clients, tier);
         assert.equal(stress.performanceContract.mode, `stress-tier-${tier}`);
         assertPollPhaseTelemetryContract(stress,
+            `${expected.id} stress tier ${tier} config`);
+        assertCallbackFinalizationTailContract(stress,
+            `${expected.id} stress tier ${tier} config`);
+        assertPeriodicServerSyncContract(stress,
             `${expected.id} stress tier ${tier} config`);
         assert.equal(stress.performanceContract.minimumChunkPackets, 257);
         assert.equal(stress.performanceContract.soakMillis, soakMillis);
@@ -456,6 +557,8 @@ for (const expected of expectedProfiles) {
     assert.deepEqual(strict.performanceContract.strictAcceptanceTarget,
         strict.strictAcceptanceTarget);
     assert.equal(strict.performanceContract.mode, "strict-acceptance");
+    assertCallbackFinalizationTailContract(strict,
+        `${expected.id} strict config`);
 }
 
 function expectConfigurationFailure(profilePath, overrides, argumentsList = ["--print-config"]) {
@@ -828,6 +931,27 @@ assert.match(fullPathSource,
     /strictFrameBudgetExcessMillis/);
 assert.match(fullPathSource,
     /slowCallbackSamples\.length > CALLBACK_TAIL_SAMPLE_LIMIT/);
+assert.match(fullPathSource,
+    /callbackFinalizationTail:\s*\{/u,
+    "callback finalization-tail evidence object is missing");
+for (const marker of [
+    "finalizeStartAtMillis",
+    "finalizeFinishAtMillis",
+    "tailRawMillis",
+    "totalAfterFinalizeRawMillis",
+    "slowFinalizationTailSamplesTotal",
+    "slowFinalizationTailSamplesDropped",
+    "CALLBACK_FINALIZATION_TAIL_SAMPLE_LIMIT",
+]) {
+    assert.ok(fullPathSource.includes(marker),
+        `callback finalization-tail source omitted ${marker}`);
+}
+assert.match(fullPathSource,
+    /finalizationTailRawMillis\s*=\s*finiteNonNegativeMillis/u,
+    "callback finalization-tail must clamp non-finite raw duration");
+assert.match(fullPathSource,
+    /totalAfterFinalizeRawMillis\s*=\s*finiteNonNegativeMillis/u,
+    "callback finalization-tail total endpoint is missing");
 assert.match(fullPathSource,
     /candidate\.poll\(callbackSequenceNumber,\s*trigger\)/,
     "scheduler poll must carry callback provenance");
@@ -1293,6 +1417,19 @@ console.log(JSON.stringify({
         strictGatesChanged: false,
         independentExecution: false,
         retention: "longest-duration-desc-sequence-asc",
+    },
+    callbackFinalizationTail: {
+        schemaVersion:
+            "gaius.browser-client-poll-callback-finalization-tail.v1",
+        slowThresholdMillis: 16.7,
+        sampleLimit: 64,
+        retention: "longest-tail-desc-sequence-asc",
+        diagnosticOnly: true,
+        strictGatesChanged: false,
+        strictRawDurationGateMillis: 16.7,
+        measuredFrom: "callback-work-end-to-finalize-finish",
+        totalAfterFinalizeFrom: "callback-start-to-finalize-finish",
+        includesContinuationScheduling: true,
     },
     arrivalTimeline: {
         schemaVersion: "gaius.browser-client-arrival-timeline.v1",
