@@ -83,6 +83,8 @@ const POLL_PHASE_SAMPLE_LIMIT = 64;
 const POLL_PHASE_FRAME_SAMPLE_LIMIT = 8;
 const POLL_PHASE_PACKET_SAMPLE_LIMIT = 64;
 const POLL_PHASE_PACKET_ID_SAMPLE_LIMIT = 8;
+const POLL_PHASE_SEGMENT_ACCOUNTING = "inclusive-overlapping";
+const ARRIVAL_WIRE_AT_SOURCE = "unavailable";
 const POLL_PHASE_SEGMENT_FIELDS = Object.freeze([
     "preludeMillis",
     "checkErrorMillis",
@@ -147,6 +149,9 @@ for (const tier of tiers) {
         `stress tier ${tier} performance contract`,
     );
     assert.equal(configuration.performanceContract.mode, `stress-tier-${tier}`);
+    assert.equal(configuration.performanceContract.arrivalTimeline?.wireAtSource,
+        ARRIVAL_WIRE_AT_SOURCE,
+        `stress tier ${tier} arrival wire source contract drifted`);
     assert.equal(configuration.performanceContract.minimumChunkMetric,
         "unique-chunk-position");
     assert.equal(configuration.performanceContract.chunkWindow.maximumUniqueChunkCapacity, 257);
@@ -218,6 +223,9 @@ for (const tier of tiers) {
         POLL_PHASE_FRAME_SAMPLE_LIMIT);
     assert.equal(pollPhaseContract.packetSampleLimit,
         POLL_PHASE_PACKET_SAMPLE_LIMIT);
+    assert.equal(pollPhaseContract.segmentAccounting,
+        POLL_PHASE_SEGMENT_ACCOUNTING,
+        `stress tier ${tier} poll phase segment accounting semantics drifted`);
     assert.equal(pollPhaseContract.diagnosticOnly, true);
     assert.equal(pollPhaseContract.strictGatesChanged, false);
     assert.equal(pollPhaseContract.independentExecution, false);
@@ -581,6 +589,7 @@ function assertOptionalPollPhaseTelemetry(
         sampleLimit: POLL_PHASE_SAMPLE_LIMIT,
         frameSampleLimit: POLL_PHASE_FRAME_SAMPLE_LIMIT,
         packetSampleLimit: POLL_PHASE_PACKET_SAMPLE_LIMIT,
+        segmentAccounting: POLL_PHASE_SEGMENT_ACCOUNTING,
     };
     assert.equal(telemetry.schemaVersion, expected.schemaVersion,
         `${label} schema drifted`);
@@ -594,6 +603,8 @@ function assertOptionalPollPhaseTelemetry(
         `${label} frame cap drifted`);
     assert.equal(telemetry.packetSampleLimit, expected.packetSampleLimit,
         `${label} packet cap drifted`);
+    assert.equal(telemetry.segmentAccounting, expected.segmentAccounting,
+        `${label} segment accounting semantics drifted`);
     assert.equal(telemetry.diagnosticOnly, true,
         `${label} was not marked diagnostic-only`);
     assert.equal(telemetry.strictGatesChanged, false,
@@ -647,6 +658,8 @@ function assertOptionalPollPhaseTelemetry(
             `${label} sample ${index} was not an object`);
         assert.equal(sample.schemaVersion, telemetry.schemaVersion,
             `${label} sample ${index} schema drifted`);
+        assert.equal(sample.segmentAccounting, telemetry.segmentAccounting,
+            `${label} sample ${index} segment accounting semantics drifted`);
         assert.ok(Number.isSafeInteger(sample.pollSequence) &&
             sample.pollSequence >= 0,
         `${label} sample ${index} poll sequence was invalid`);
@@ -1127,6 +1140,13 @@ function assertArrivalTimelineEvidence(result, tier) {
         assert.ok(Array.isArray(timeline?.slowSamples));
         assert.ok(timeline.slowSamples.length <= 64,
             `stress tier ${tier} client lifecycle ${index + 1} exceeded slow sample cap`);
+        for (const [sampleIndex, sample] of timeline.slowSamples.entries()) {
+            if (Object.prototype.hasOwnProperty.call(sample ?? {}, "wireAtSource")) {
+                assert.equal(sample.wireAtSource, ARRIVAL_WIRE_AT_SOURCE,
+                    `stress tier ${tier} lifecycle ${index + 1} arrival sample ${sampleIndex} ` +
+                    "synthesized wire timestamp source");
+            }
+        }
         assert.ok(Array.isArray(timeline?.reconnectPhases));
         assert.ok(timeline.reconnectPhases.length <= 64,
             `stress tier ${tier} client lifecycle ${index + 1} exceeded phase cap`);

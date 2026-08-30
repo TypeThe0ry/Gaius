@@ -85,6 +85,14 @@ assert.match(fullPathSourceText,
 assert.match(fullPathSourceText,
     /const POLL_PHASE_PACKET_SAMPLE_LIMIT\s*=\s*64/u,
     "poll phase packet cap drifted");
+assert.match(fullPathSourceText,
+    /const POLL_PHASE_SEGMENT_ACCOUNTING\s*=\s*["']inclusive-overlapping["']/u,
+    "poll phase segment accounting semantics drifted");
+assert.match(fullPathSourceText,
+    /candidate\.poll\(callbackSequenceNumber,\s*trigger\)/u,
+    "scheduler must pass callback provenance into client poll");
+assert.doesNotMatch(fullPathSourceText, /candidate\.poll\(\);/u,
+    "scheduler retained a no-argument poll call");
 const pollPhaseContractSourceIndex = fullPathSourceText.indexOf(
     "pollPhaseTelemetry");
 assert.ok(pollPhaseContractSourceIndex >= 0,
@@ -163,6 +171,8 @@ function assertPollPhaseTelemetryContract(config, label) {
         `${label}: poll phase frame cap drifted`);
     assert.equal(telemetry.packetSampleLimit, 64,
         `${label}: poll phase packet cap drifted`);
+    assert.equal(telemetry.segmentAccounting, "inclusive-overlapping",
+        `${label}: poll phase segment accounting semantics drifted`);
     assert.equal(telemetry.diagnosticOnly, true,
         `${label}: poll phase telemetry is not diagnostic-only`);
     assert.equal(telemetry.strictGatesChanged, false,
@@ -198,6 +208,9 @@ for (const expected of expectedProfiles) {
     assert.equal(config.acceptanceMode, false);
     assert.equal(config.clients, 2);
     assert.equal(config.performanceContract.mode, "compatible-smoke");
+    assert.equal(config.performanceContract.arrivalTimeline?.wireAtSource,
+        "unavailable",
+        `${expected.id} arrival wire source contract drifted`);
     assertPollPhaseTelemetryContract(config, `${expected.id} compatible config`);
     assert.equal(config.performanceContract.strictAcceptanceTarget, null);
     assert.equal(config.performanceContract.soakMillis, 1000);
@@ -816,7 +829,8 @@ assert.match(fullPathSource,
 assert.match(fullPathSource,
     /slowCallbackSamples\.length > CALLBACK_TAIL_SAMPLE_LIMIT/);
 assert.match(fullPathSource,
-    /candidate\.poll\(\);/);
+    /candidate\.poll\(callbackSequenceNumber,\s*trigger\)/,
+    "scheduler poll must carry callback provenance");
 assert.doesNotMatch(fullPathSource,
     /setInterval\(\(\) => \{\s*for \(const client of currentClients\) client\.poll\(\)/,
     "full-path poll scheduler must not fan out every client in one timer callback");
@@ -1270,6 +1284,7 @@ console.log(JSON.stringify({
     },
     pollPhaseTelemetry: {
         schemaVersion: "gaius.browser-client-poll-phase.v1",
+        segmentAccounting: "inclusive-overlapping",
         slowThresholdMillis: 16.7,
         sampleLimit: 64,
         frameSampleLimit: 8,
@@ -1278,6 +1293,12 @@ console.log(JSON.stringify({
         strictGatesChanged: false,
         independentExecution: false,
         retention: "longest-duration-desc-sequence-asc",
+    },
+    arrivalTimeline: {
+        schemaVersion: "gaius.browser-client-arrival-timeline.v1",
+        wireAtSource: "unavailable",
+        attributionPolicy:
+            "trusted-wire-required-for-upstream; missing-local-segments=>unattributed",
     },
     chunkBatchProtocol: {
         clientboundFinished: 11,

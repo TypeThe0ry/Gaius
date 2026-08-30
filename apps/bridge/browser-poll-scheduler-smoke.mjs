@@ -54,6 +54,9 @@ assert.match(source,
 assert.match(source,
     /const POLL_PHASE_PACKET_SAMPLE_LIMIT\s*=\s*64/u,
     "poll phase packet cap drifted");
+assert.match(source,
+    /const POLL_PHASE_SEGMENT_ACCOUNTING\s*=\s*["']inclusive-overlapping["']/u,
+    "poll phase segment accounting semantics drifted");
 assert.match(source, /pollPhaseSamplesTotal/u,
     "client poll phase total counter is missing");
 assert.match(source, /pollPhaseSamplesDropped/u,
@@ -98,6 +101,11 @@ assert.ok(pollPhaseContractWindows.some((window) =>
     /diagnosticOnly\s*:\s*true/u.test(window)),
 "poll phase evidence must remain diagnostic-only and non-independent");
 assert.match(schedulerSource, /setImmediate/u);
+assert.match(schedulerSource,
+    /candidate\.poll\(callbackSequenceNumber,\s*trigger\)/u,
+    "scheduler did not pass callback provenance into client poll");
+assert.doesNotMatch(schedulerSource, /candidate\.poll\(\);/u,
+    "scheduler retained a no-argument poll call");
 assert.match(schedulerSource, /setTimeout\(\(\) => \{[\s\S]*?\}, 0\)/u);
 assert.match(schedulerSource, /POLL_SCHEDULER_TIMER_YIELD_TURNS/u);
 assert.match(schedulerSource, /POLL_SCHEDULER_TIMER_YIELD_WORK_MILLIS/u);
@@ -579,6 +587,7 @@ const POLL_PHASE_LIMIT = 64;
 const POLL_PHASE_FRAME_LIMIT = 8;
 const POLL_PHASE_PACKET_LIMIT = 64;
 const POLL_PHASE_PACKET_ID_LIMIT = 8;
+const POLL_PHASE_SEGMENT_ACCOUNTING = "inclusive-overlapping";
 const POLL_PHASE_SEGMENTS = Object.freeze([
     "preludeMillis",
     "checkErrorMillis",
@@ -633,8 +642,14 @@ function normalizePollPhaseSample(candidate) {
         });
     return {
         schemaVersion: POLL_PHASE_SCHEMA_VERSION,
+        segmentAccounting: POLL_PHASE_SEGMENT_ACCOUNTING,
         pollSequence: Number.isSafeInteger(candidate?.pollSequence)
             ? candidate.pollSequence : 0,
+        schedulerCallbackSequence: Number.isSafeInteger(
+            candidate?.schedulerCallbackSequence)
+            ? candidate.schedulerCallbackSequence : null,
+        schedulerTrigger: typeof candidate?.schedulerTrigger === "string"
+            ? candidate.schedulerTrigger : null,
         durationRawMillis: duration,
         durationMillis: Number(duration.toFixed(3)),
         strictThresholdMillis: POLL_PHASE_THRESHOLD_MILLIS,
@@ -773,6 +788,8 @@ function retainPollPhaseSample(state, candidate) {
     });
     assert.equal(anomaly.clockAnomaly, true,
         "poll phase clock anomaly marker was lost during normalization");
+    assert.equal(anomaly.segmentAccounting, POLL_PHASE_SEGMENT_ACCOUNTING,
+        "poll phase segment accounting semantics were lost during normalization");
     assert.equal(anomaly.outcome, "error",
         "poll phase error outcome was lost during normalization");
     assert.equal(anomaly.segments.parseMillis, 0,
@@ -797,6 +814,17 @@ function retainPollPhaseSample(state, candidate) {
     assert.equal(classifyPollPhase({
         segments: { parseMillis: 2 },
     }), "poll-duration", "fast phase incorrectly changed trigger");
+
+    const correlated = normalizePollPhaseSample({
+        pollSequence: 11,
+        schedulerCallbackSequence: 7,
+        schedulerTrigger: "immediate",
+        durationRawMillis: 18,
+    });
+    assert.equal(correlated.schedulerCallbackSequence, 7,
+        "scheduler callback provenance was not retained by the model");
+    assert.equal(correlated.schedulerTrigger, "immediate",
+        "scheduler trigger provenance was not retained by the model");
 
     const empty = { total: 0, dropped: 0, samples: [] };
     assert.equal(retainPollPhaseSample(empty, {
@@ -1058,6 +1086,7 @@ console.log(JSON.stringify({
     strictPollGapTarget: { p99Millis: 16.7, p999Millis: 50, maxMillis: 100 },
     pollPhaseTelemetry: {
         schemaVersion: POLL_PHASE_SCHEMA_VERSION,
+        segmentAccounting: POLL_PHASE_SEGMENT_ACCOUNTING,
         slowThresholdMillis: POLL_PHASE_THRESHOLD_MILLIS,
         sampleLimit: POLL_PHASE_LIMIT,
         frameSampleLimit: POLL_PHASE_FRAME_LIMIT,

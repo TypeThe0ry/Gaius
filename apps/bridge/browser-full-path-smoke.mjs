@@ -276,6 +276,11 @@ const POLL_PHASE_SAMPLE_LIMIT = 64;
 const POLL_PHASE_FRAME_SAMPLE_LIMIT = 8;
 const POLL_PHASE_PACKET_SAMPLE_LIMIT = 64;
 const POLL_PHASE_PACKET_ID_SAMPLE_LIMIT = 8;
+// Phase envelopes intentionally include their nested work (for example,
+// bridgeDrain contains bridgePoll/decrypt/concat and parse contains inflate /
+// handler). Keep this explicit so consumers never sum the segments as if
+// they were disjoint slices of the poll duration.
+const POLL_PHASE_SEGMENT_ACCOUNTING = "inclusive-overlapping";
 // Arrival-gap telemetry is diagnostic-only.  It is deliberately separate
 // from every acceptance gate so a long decoded-packet gap can be attributed
 // without turning a sampled/unsampled result into a pass.  The bridge does not
@@ -283,6 +288,7 @@ const POLL_PHASE_PACKET_ID_SAMPLE_LIMIT = 8;
 // sample rather than being guessed from an onmessage timestamp.
 const ARRIVAL_TIMELINE_SCHEMA_VERSION =
     "gaius.browser-client-arrival-timeline.v1";
+const ARRIVAL_WIRE_AT_SOURCE = "unavailable";
 const ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS = 250;
 const ARRIVAL_TIMELINE_SAMPLE_LIMIT = 64;
 const ARRIVAL_TIMELINE_RECONNECT_PHASE_LIMIT = 64;
@@ -2171,11 +2177,12 @@ function createFairClientPollScheduler(getClients) {
                     }
                     const pollStartedAt = performance.now();
                     try {
-                        // Keep the established no-argument client contract. A
-                        // poll-phase sample can still be joined by client/wave
-                        // and poll sequence; scheduler provenance remains null
-                        // for synthetic and production-compatible clients.
-                        candidate.poll();
+                        // Supply scheduler provenance when the client accepts
+                        // the optional arguments. JavaScript's extra-argument
+                        // rule keeps older synthetic/production-compatible
+                        // poll() implementations source-compatible; clients
+                        // that ignore the arguments retain their old behavior.
+                        candidate.poll(callbackSequenceNumber, trigger);
                     }
                     finally {
                         const pollDurationMillis = performance.now() - pollStartedAt;
@@ -3046,6 +3053,7 @@ class BrowserMinecraftClient {
         }
         const sample = {
             schemaVersion: ARRIVAL_TIMELINE_SCHEMA_VERSION,
+            wireAtSource: "unavailable",
             sampleSequence: this.arrivalSlowSampleCountTotal + 1,
             clientId: this.id,
             wave: this.wave,
@@ -3361,6 +3369,7 @@ class BrowserMinecraftClient {
         };
         const sample = {
             schemaVersion: POLL_PHASE_TELEMETRY_SCHEMA_VERSION,
+            segmentAccounting: POLL_PHASE_SEGMENT_ACCOUNTING,
             pollSequence: context.pollSequence,
             schedulerCallbackSequence: context.schedulerCallbackSequence,
             schedulerTrigger: context.schedulerTrigger,
@@ -3434,6 +3443,7 @@ class BrowserMinecraftClient {
     pollPhaseTelemetryResult() {
         return {
             schemaVersion: POLL_PHASE_TELEMETRY_SCHEMA_VERSION,
+            segmentAccounting: POLL_PHASE_SEGMENT_ACCOUNTING,
             slowThresholdMillis: POLL_PHASE_SLOW_THRESHOLD_MILLIS,
             strictThresholdMillis: 16.7,
             sampleLimit: POLL_PHASE_SAMPLE_LIMIT,
@@ -5713,6 +5723,7 @@ function browserFullPathPerformanceContract() {
         relayDrainCleanupRequired: true,
         arrivalTimeline: {
             schemaVersion: ARRIVAL_TIMELINE_SCHEMA_VERSION,
+            wireAtSource: ARRIVAL_WIRE_AT_SOURCE,
             slowThresholdMillis: ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS,
             perClientSlowSampleLimit: ARRIVAL_TIMELINE_SAMPLE_LIMIT,
             perClientReconnectPhaseLimit: ARRIVAL_TIMELINE_RECONNECT_PHASE_LIMIT,
@@ -5724,6 +5735,7 @@ function browserFullPathPerformanceContract() {
         },
         pollPhaseTelemetry: {
             schemaVersion: POLL_PHASE_TELEMETRY_SCHEMA_VERSION,
+            segmentAccounting: POLL_PHASE_SEGMENT_ACCOUNTING,
             slowThresholdMillis: POLL_PHASE_SLOW_THRESHOLD_MILLIS,
             sampleLimit: POLL_PHASE_SAMPLE_LIMIT,
             frameSampleLimit: POLL_PHASE_FRAME_SAMPLE_LIMIT,
