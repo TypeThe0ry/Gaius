@@ -19,7 +19,23 @@ function extractJsBody(marker) {
     return channelSource.slice(scriptOffset, scriptEnd).replaceAll("\\\\", "\\");
 }
 
-const bridgeScript = "{\n" + extractJsBody("private static native void initBridge();") + "\n}\n{\n" +
+const initBridgeScript = extractJsBody("private static native void initBridge();");
+const bridgeScopeStart = initBridgeScript.indexOf(
+    "globalThis.__gaiusNettyBridgeBootstrapScope = {");
+const bridgeScopeEnd = initBridgeScript.indexOf("\n            };", bridgeScopeStart);
+assert.ok(bridgeScopeStart >= 0 && bridgeScopeEnd > bridgeScopeStart,
+    "initBridge lost its bootstrap scope object");
+const bridgeScope = initBridgeScript.slice(bridgeScopeStart, bridgeScopeEnd);
+// TeaVM's JavaScript parser intentionally targets an older ES dialect and rejects object
+// shorthand (`{recordConnectPhase, ...}`) even though modern Node accepts it. Keep the bridge
+// scope explicit so a generated client cannot fail after a long TeaVM analysis.
+assert.doesNotMatch(bridgeScope,
+    /^\s+[A-Za-z_$][A-Za-z0-9_$]*,\s*$/m,
+    "initBridge bootstrap scope uses ES2015 object shorthand unsupported by TeaVM");
+assert.match(bridgeScope,
+    /recordConnectPhase:\s*recordConnectPhase,/,
+    "initBridge bootstrap scope lost explicit recordConnectPhase binding");
+const bridgeScript = "{\n" + initBridgeScript + "\n}\n{\n" +
     extractJsBody("private static native void initBridgeTail();") + "\n}";
 const outboundScript = extractJsBody("private static native void initOutboundScheduler();");
 
