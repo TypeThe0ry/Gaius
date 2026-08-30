@@ -248,6 +248,7 @@ function validateStressResult(result, tier, configuration) {
         configuration.stressTarget.clientLifecycles);
     assert.equal(result?.acceptance?.mode, `stress-tier-${tier}`);
     assertStressSchedulerEvidence(result, tier, configuration);
+    assertArrivalTimelineEvidence(result, tier);
     const observed = result?.acceptance?.observed;
     assert.equal(observed?.clients, configuration.stressTarget.clients);
     assert.equal(observed?.minimumChunkPackets,
@@ -834,6 +835,77 @@ function boundedTail(previous, next, maximumBytes) {
     return combined.byteLength <= maximumBytes
         ? combined
         : combined.subarray(combined.byteLength - maximumBytes);
+}
+
+function assertArrivalTimelineEvidence(result, tier) {
+    const topLevel = result?.arrivalTimeline;
+    assert.equal(topLevel?.schemaVersion,
+        "gaius.browser-client-arrival-timeline.v1",
+        `stress tier ${tier} omitted arrival timeline schema`);
+    assert.equal(topLevel?.independentExecution, false,
+        `stress tier ${tier} mislabelled live arrival evidence as independent`);
+    assert.equal(topLevel?.strictGatesChanged, false,
+        `stress tier ${tier} arrival timeline changed strict gates`);
+    assert.equal(topLevel?.limits?.perClientSlowSamples, 64);
+    assert.equal(topLevel?.limits?.perClientReconnectPhases, 64);
+    assert.equal(topLevel?.limits?.frameMetadataRing, 64);
+    assert.ok(Array.isArray(topLevel?.clients),
+        `stress tier ${tier} omitted per-client arrival evidence`);
+    assert.ok(Array.isArray(result?.clients),
+        `stress tier ${tier} omitted lifecycle client evidence`);
+    assert.equal(topLevel.clients.length, result.clients.length,
+        `stress tier ${tier} arrival/client lifecycle count diverged`);
+    assert.equal(topLevel.transport?.strictGatesChanged, false,
+        `stress tier ${tier} transport arrival telemetry changed strict gates`);
+    assert.equal(topLevel.transport?.source?.wireAtSource, "unavailable",
+        `stress tier ${tier} transport arrival telemetry synthesized wire time`);
+    assert.equal(topLevel.transport?.source?.attributionPolicy,
+        "trusted-wire-required-for-upstream; missing-local-segments=>unattributed",
+        `stress tier ${tier} transport arrival attribution policy drifted`);
+    for (const [index, client] of result.clients.entries()) {
+        const topLevelClient = topLevel.clients[index];
+        assert.equal(topLevelClient?.id, client?.id,
+            `stress tier ${tier} lifecycle ${index + 1} arrival client id diverged`);
+        const timeline = client?.arrivalTimeline;
+        assert.equal(timeline?.schemaVersion,
+            "gaius.browser-client-arrival-timeline.v1",
+            `stress tier ${tier} client lifecycle ${index + 1} omitted arrival schema`);
+        assert.equal(timeline?.strictGatesChanged, false,
+            `stress tier ${tier} client lifecycle ${index + 1} changed strict gates`);
+        assert.equal(timeline?.source?.wireAtSource, "unavailable",
+            `stress tier ${tier} client lifecycle ${index + 1} synthesized wire time`);
+        assert.equal(timeline?.source?.attributionPolicy,
+            "trusted-wire-required-for-upstream; missing-local-segments=>unattributed",
+            `stress tier ${tier} lifecycle ${index + 1} attribution policy drifted`);
+        assert.ok(Array.isArray(timeline?.slowSamples));
+        assert.ok(timeline.slowSamples.length <= 64,
+            `stress tier ${tier} client lifecycle ${index + 1} exceeded slow sample cap`);
+        assert.ok(Array.isArray(timeline?.reconnectPhases));
+        assert.ok(timeline.reconnectPhases.length <= 64,
+            `stress tier ${tier} client lifecycle ${index + 1} exceeded phase cap`);
+        assert.equal(timeline?.phaseRingScope, "all-lifecycle-phases",
+            `stress tier ${tier} lifecycle ${index + 1} mislabelled phase ring scope`);
+        if (client.wave > 0) {
+            const boundary = timeline.reconnectBoundary;
+            assert.equal(timeline.reconnectBoundary?.attempted, true,
+                `stress tier ${tier} reconnect lifecycle ${index + 1} omitted boundary`);
+            assert.equal(boundary?.seededFromPreviousLifecycle, true,
+                `stress tier ${tier} reconnect lifecycle ${index + 1} omitted prior decode seed`);
+            assert.equal(boundary?.firstDecodedAfterReconnect, true,
+                `stress tier ${tier} reconnect lifecycle ${index + 1} omitted first decode boundary`);
+            for (const field of ["priorDecodeEndAt", "disconnectAt",
+                "reconnectScheduledAt", "firstDecodedAt", "reconnectGapMillis"]) {
+                assert.ok(Number.isFinite(boundary?.[field]) && boundary[field] >= 0,
+                    `stress tier ${tier} reconnect lifecycle ${index + 1} missing finite ${field}`);
+            }
+            assert.ok(boundary.reconnectScheduledAt >= boundary.disconnectAt,
+                `stress tier ${tier} reconnect lifecycle ${index + 1} phase order disconnect/schedule`);
+            assert.ok(boundary.firstDecodedAt >= boundary.reconnectScheduledAt,
+                `stress tier ${tier} reconnect lifecycle ${index + 1} phase order schedule/decode`);
+            assert.ok(boundary.reconnectGapMillis >= 0,
+                `stress tier ${tier} reconnect lifecycle ${index + 1} negative reconnect gap`);
+        }
+    }
 }
 
 async function inspectBrowserChannelSource() {

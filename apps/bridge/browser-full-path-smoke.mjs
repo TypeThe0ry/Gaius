@@ -264,6 +264,17 @@ const CALLBACK_TAIL_TELEMETRY_SCHEMA_VERSION =
     "gaius.browser-client-poll-callback-tail.v1";
 const CALLBACK_TAIL_SLOW_THRESHOLD_MILLIS = 16.7;
 const CALLBACK_TAIL_SAMPLE_LIMIT = 64;
+// Arrival-gap telemetry is diagnostic-only.  It is deliberately separate
+// from every acceptance gate so a long decoded-packet gap can be attributed
+// without turning a sampled/unsampled result into a pass.  The bridge does not
+// expose a trusted wire timestamp; wireAt therefore remains null in every
+// sample rather than being guessed from an onmessage timestamp.
+const ARRIVAL_TIMELINE_SCHEMA_VERSION =
+    "gaius.browser-client-arrival-timeline.v1";
+const ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS = 250;
+const ARRIVAL_TIMELINE_SAMPLE_LIMIT = 64;
+const ARRIVAL_TIMELINE_RECONNECT_PHASE_LIMIT = 64;
+const ARRIVAL_TIMELINE_FRAME_RING_LIMIT = 64;
 // These counters are exported by BrowserWebSocketChannel's JSBody stats. Keep
 // their exact source names: a missing source field is evidence, not a made-up
 // zero, and is handled explicitly by browserRuntimeCleanupGaugeEvidence().
@@ -660,7 +671,7 @@ try {
         "initialConnectThroughMinimumChunks",
         "initial connect through minimum chunks",
     );
-    const createClients = (wave) => Array.from({ length: clientCount }, (_, index) =>
+    const createClients = (wave, previousClients = undefined, reconnectScheduledAt = undefined) => Array.from({ length: clientCount }, (_, index) =>
         new BrowserMinecraftClient({
             id: 700 + wave * 100 + index,
             index,
@@ -672,6 +683,9 @@ try {
             port: relayEndpoint.target.port,
             sessionUrl: sessionBaseUrl,
             identity: clientIdentities[index],
+            previousDecodeEndAt: previousClients?.[index]?.arrivalLastDecodeEndAt,
+            reconnectDropAt: previousClients?.[index]?.arrivalReconnectDropAt,
+            reconnectScheduledAt,
         }));
     allClients = [];
     const reconnectEvidence = [];
@@ -768,7 +782,9 @@ try {
             // the synthetic onmessage marker and the non-1000 close error until the
             // Java channel observes them and invokes its final close hook. The marker
             // exercises JSBody queue ordering; it is not claimed as a network tail.
-            for (const client of previousClients) client.pausePollingForTransportDrop();
+            for (const client of previousClients) {
+                client.pausePollingForTransportDrop(dropAt);
+            }
             const transportDrop = forceAbnormalTransportDrop(
                 browserRuntime, previousClients, wave);
             const dropDispatchSpreadMillis = timestampSpread(
@@ -847,7 +863,7 @@ try {
             // the reconnect timers below still start at the simultaneous drop.
             await delay(100);
 
-            const replacementClients = createClients(wave);
+            const replacementClients = createClients(wave, previousClients, performance.now());
             assert.equal(replacementClients.length, previousClients.length);
             for (let index = 0; index < replacementClients.length; index++) {
                 const previous = previousClients[index];
@@ -1451,6 +1467,7 @@ try {
                 browserRuntimeSnapshot(browserRuntime)),
             browserGlobalPumpTelemetryAfterClose:
                 browserGlobalPumpTelemetryEvidence(finalBrowserRuntimeSnapshot),
+            arrivalTimeline: browserRuntime.arrivalTelemetry?.evidence?.() ?? null,
         },
         profile: {
             id: activeProfile.id,
@@ -1476,6 +1493,22 @@ try {
             joins: sessionState.joins.length,
             hasJoined: sessionState.hasJoined.length,
             publicKeyRequests: sessionState.publicKeyRequests,
+        },
+        arrivalTimeline: {
+            schemaVersion: ARRIVAL_TIMELINE_SCHEMA_VERSION,
+            independentExecution: false,
+            strictGatesChanged: false,
+            limits: {
+                perClientSlowSamples: ARRIVAL_TIMELINE_SAMPLE_LIMIT,
+                perClientReconnectPhases: ARRIVAL_TIMELINE_RECONNECT_PHASE_LIMIT,
+                frameMetadataRing: ARRIVAL_TIMELINE_FRAME_RING_LIMIT,
+            },
+            transport: browserRuntime.arrivalTelemetry?.evidence?.() ?? null,
+            clients: allClients.map((client) => ({
+                id: client.id,
+                wave: client.wave,
+                evidence: client.arrivalTimelineResult(),
+            })),
         },
         clients: allClients.map((client) => client.result()),
         reconnectWaves: reconnectEvidence,
@@ -2481,6 +2514,154 @@ function createClientIdentity(index) {
     });
 }
 
+// The Java/TeaVM bridge intentionally exposes byte queues rather than a
+// trusted packet-arrival clock.  The harness can still observe the Node
+// WebSocket `message` callback and the later bridge dequeue without touching
+// the production bridge.  Keep only primitive values in a fixed ring per
+// socket; no per-frame objects or unbounded arrays are created on this path.
+function createArrivalSocketState() {
+    return {
+        frameSequence: 0,
+        consumedFrameSequence: 0,
+        frameAtRing: new Float64Array(ARRIVAL_TIMELINE_FRAME_RING_LIMIT),
+        frameBytesRing: new Uint32Array(ARRIVAL_TIMELINE_FRAME_RING_LIMIT),
+        frameMetadataDropped: 0,
+        lastDequeuedAt: null,
+        lastDequeuedPollStartedAt: null,
+        lastDequeuedOnmessageAt: null,
+        lastDequeuedFrameSequence: null,
+        lastDequeuedBytes: null,
+    };
+}
+
+function binaryMessageBytes(data) {
+    if (Buffer.isBuffer(data)) return data.byteLength;
+    if (data instanceof ArrayBuffer) return data.byteLength;
+    if (ArrayBuffer.isView(data)) return data.byteLength;
+    return 0;
+}
+
+function recordArrivalSocketMessage(state, data, isBinary, telemetry) {
+    // The `ws` callback may hand text frames to Node as a Buffer while
+    // explicitly setting `isBinary=false`.  Respect that flag; counting such
+    // control/status text as a wire frame would shift the bounded sequence
+    // correlation and manufacture metadata drops on the following packet.
+    const binary = isBinary !== false && (isBinary === true ||
+        Buffer.isBuffer(data) || data instanceof ArrayBuffer ||
+        ArrayBuffer.isView(data));
+    if (!binary) return;
+    const at = performance.now();
+    const sequence = ++state.frameSequence;
+    const slot = (sequence - 1) % ARRIVAL_TIMELINE_FRAME_RING_LIMIT;
+    state.frameAtRing[slot] = at;
+    state.frameBytesRing[slot] = Math.min(
+        0xffffffff,
+        Math.max(0, binaryMessageBytes(data)),
+    );
+    telemetry.binaryOnmessageFrames++;
+    telemetry.binaryOnmessageBytes += state.frameBytesRing[slot];
+}
+
+function recordArrivalBridgeDequeue(socket, polledAt, chunk, telemetry) {
+    const state = socket?.__gaiusArrivalState;
+    if (state === undefined || chunk === null) return;
+    if (telemetry.syntheticSockets?.has(socket)) {
+        telemetry.syntheticDequeuedFrames++;
+        telemetry.syntheticDequeuedBytes += Number.isFinite(chunk?.byteLength)
+            ? Number(chunk.byteLength) : 0;
+        return;
+    }
+    const sequence = ++state.consumedFrameSequence;
+    // `polledAt` is the call-start timestamp.  Capture a second timestamp
+    // after pollInbound returns so bridge dequeue latency is not silently
+    // under-measured when the bridge itself does work before returning.
+    state.lastDequeuedPollStartedAt = polledAt;
+    state.lastDequeuedAt = performance.now();
+    state.lastDequeuedOnmessageAt = null;
+    state.lastDequeuedFrameSequence = null;
+    state.lastDequeuedBytes = Number.isFinite(chunk?.byteLength)
+        ? Number(chunk.byteLength) : null;
+    const oldestRetained = state.frameSequence - ARRIVAL_TIMELINE_FRAME_RING_LIMIT + 1;
+    if (sequence >= oldestRetained && sequence <= state.frameSequence && sequence > 0) {
+        const slot = (sequence - 1) % ARRIVAL_TIMELINE_FRAME_RING_LIMIT;
+        state.lastDequeuedOnmessageAt = state.frameAtRing[slot];
+        state.lastDequeuedFrameSequence = sequence;
+    }
+    else {
+        state.frameMetadataDropped++;
+        telemetry.frameMetadataDropped++;
+    }
+    telemetry.bridgeDequeuedFrames++;
+    telemetry.bridgeDequeuedBytes += state.lastDequeuedBytes ?? 0;
+}
+
+function arrivalSocketStateForClient(client) {
+    try {
+        const entry = client?.bridge?.channels?.get(client.id);
+        return entry?.ws?.__gaiusArrivalState;
+    }
+    catch {
+        return undefined;
+    }
+}
+
+function arrivalDelta(start, end, clock = undefined) {
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+    const raw = end - start;
+    if (raw < 0 && clock !== undefined) clock.clampedNegativeDeltas = true;
+    return Math.max(0, raw);
+}
+
+function classifyBrowserArrivalGap({
+    intentional,
+    reconnect,
+    onmessageToDequeueMillis,
+    pollToBridgeDequeueMillis,
+    pollToDecodeMillis,
+    decodeMillis,
+    decodeToDispatchMillis,
+}) {
+    if (intentional) return "intentional-transport-drop-tail";
+    if (reconnect) return "reconnect-gap";
+    if (Number.isFinite(pollToBridgeDequeueMillis) &&
+        pollToBridgeDequeueMillis >= ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS) {
+        // Prefer the narrower bridge segment when both it and the aggregate
+        // onmessage-to-dequeue interval are large; otherwise the aggregate
+        // label would hide the actual synchronous bridge delay.
+        return "bridge-dequeue-delay";
+    }
+    if (Number.isFinite(onmessageToDequeueMillis) &&
+        onmessageToDequeueMillis >= ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS) {
+        return "browser-queue-delay";
+    }
+    if (Number.isFinite(pollToDecodeMillis) &&
+        pollToDecodeMillis >= ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS) {
+        // pollToDecode includes buffered-prefix parsing and handler work.  In
+        // the absence of an independent enqueue/wire timestamp it cannot be
+        // promoted to a definitive scheduler/dispatch attribution.
+        return "unknown-arrival-gap";
+    }
+    if (Number.isFinite(decodeMillis) &&
+        decodeMillis >= ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS) {
+        return "decode-delay";
+    }
+    if (Number.isFinite(decodeToDispatchMillis) &&
+        decodeToDispatchMillis >= ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS) {
+        return "dispatch-delay";
+    }
+    if (onmessageToDequeueMillis === null &&
+        pollToBridgeDequeueMillis === null && pollToDecodeMillis === null &&
+        decodeMillis === null && decodeToDispatchMillis === null) {
+        // Missing local timestamps do not prove that the upstream server was
+        // silent.  A packet already held in the protocol cumulation, for
+        // example, intentionally has no new WebSocket/dequeue marker.  Keep
+        // the attribution unknown until a trusted wire/transport source is
+        // available.
+        return "unattributed-arrival-gap";
+    }
+    return "unknown-arrival-gap";
+}
+
 class BrowserMinecraftClient {
     constructor(options) {
         Object.assign(this, options);
@@ -2598,10 +2779,342 @@ class BrowserMinecraftClient {
         this.playTickGapSamples = 0;
         this.maxPlayTickGapMillis = 0;
         this.playTickGapHistogram = createLatencyHistogram();
+        // Bounded, diagnostic-only packet arrival evidence.  `wireAt` is
+        // intentionally never synthesized: the browser/WebSocket bridge does
+        // not expose a server wire timestamp.  Frame metadata is associated
+        // with the latest bridge dequeue and may be null when the per-socket
+        // primitive ring overflowed.
+        this.arrivalSlowGapCountTotal = 0;
+        this.arrivalSlowSampleCountTotal = 0;
+        this.arrivalSlowSamplesDropped = 0;
+        this.arrivalIntentionalTransportDropCount = 0;
+        this.arrivalIntentionalDropGapsExcluded = 0;
+        this.arrivalFrameMetadataDropped = 0;
+        this.arrivalReconnectPhaseCountTotal = 0;
+        this.arrivalReconnectPhasesDropped = 0;
+        this.arrivalSlowSamples = [];
+        this.arrivalReconnectPhases = [];
+        this.arrivalClassificationCounts = new Map();
+        this.arrivalPhaseSequence = 0;
+        this.arrivalSeenPhaseEvents = new WeakSet();
+        // A replacement client may inherit only the previous lifecycle's last
+        // decode timestamp as a diagnostic seed.  This lets the first decoded
+        // packet after reconnect expose the full reconnect gap without sharing
+        // protocol buffers, ciphers, or any live scheduler state.
+        this.arrivalReconnectPriorDecodeEndAt = Number.isFinite(options.previousDecodeEndAt)
+            ? Number(options.previousDecodeEndAt) : null;
+        this.arrivalLastDecodeEndAt = this.arrivalReconnectPriorDecodeEndAt ?? undefined;
+        this.arrivalReconnectDropAt = Number.isFinite(options.reconnectDropAt)
+            ? Number(options.reconnectDropAt) : null;
+        this.arrivalReconnectScheduledAt = Number.isFinite(options.reconnectScheduledAt)
+            ? Number(options.reconnectScheduledAt) : null;
+        this.arrivalIntentionalDropPending = false;
+        this.arrivalReconnectRecoveryPending = this.wave > 0;
+        this.arrivalCurrentFrameSequence = null;
+        this.arrivalCurrentOnmessageAt = null;
+        this.arrivalCurrentBridgeDequeueAt = null;
+        this.arrivalCurrentFrameBytes = null;
+        this.arrivalCurrentPollAt = null;
+        this.arrivalCurrentFrameMetadataDropped = false;
+        this.arrivalObservedOnmessage = false;
+        this.arrivalObservedBridgeDequeue = false;
+        this.arrivalObservedDecodedPacket = false;
+        this.arrivalObservedDispatch = false;
+        this.arrivalFirstChunkRecorded = false;
+        this.arrivalMinimumChunksRecorded = false;
+        this.arrivalFirstDecodedAfterReconnect = false;
+        this.arrivalReconnectFirstDecodedAt = null;
+        this.arrivalReconnectGapMillis = null;
+        this.arrivalReconnectClockAnomaly = false;
+        this.arrivalFirstOnmessageRecorded = false;
+        if (this.arrivalReconnectDropAt !== null) {
+            this.recordArrivalPhase("disconnect", this.arrivalReconnectDropAt, {
+                intentional: true,
+                source: "browser-full-path-harness",
+            });
+        }
+        if (this.arrivalReconnectScheduledAt !== null) {
+            this.recordArrivalPhase("reconnect-scheduled",
+                this.arrivalReconnectScheduledAt, {
+                    source: "browser-full-path-harness",
+                });
+        }
+        this.recordArrivalPhase("client-created", this.startedAt);
+    }
+
+    recordArrivalPhase(phase, monotonicAt = performance.now(), details = {}) {
+        const entry = {
+            sequence: ++this.arrivalPhaseSequence,
+            phase: String(phase),
+            monotonicAt: Number.isFinite(monotonicAt) ? monotonicAt : null,
+            wallAt: Number.isFinite(details.wallAt) ? details.wallAt : null,
+            elapsedMillis: Number.isFinite(details.elapsedMillis)
+                ? Math.max(0, details.elapsedMillis) : null,
+            source: details.source ?? "browser-client-harness",
+            intentional: details.intentional === true,
+            ...(details.detail === undefined ? {} : {
+                detail: String(details.detail).slice(0, 160),
+            }),
+        };
+        this.arrivalReconnectPhaseCountTotal++;
+        if (this.arrivalReconnectPhases.length >= ARRIVAL_TIMELINE_RECONNECT_PHASE_LIMIT) {
+            this.arrivalReconnectPhases.shift();
+            this.arrivalReconnectPhasesDropped++;
+        }
+        this.arrivalReconnectPhases.push(entry);
+        return entry;
+    }
+
+    setArrivalFrameFromBridge(pollAt) {
+        this.arrivalCurrentPollAt = Number.isFinite(pollAt) ? pollAt : null;
+        this.arrivalCurrentFrameSequence = null;
+        this.arrivalCurrentOnmessageAt = null;
+        this.arrivalCurrentBridgeDequeueAt = null;
+        this.arrivalCurrentFrameBytes = null;
+        this.arrivalCurrentFrameMetadataDropped = false;
+        const state = arrivalSocketStateForClient(this);
+        if (state === undefined) return;
+        if (Number.isFinite(state.lastDequeuedPollStartedAt)) {
+            this.arrivalCurrentPollAt = state.lastDequeuedPollStartedAt;
+        }
+        this.arrivalCurrentFrameSequence = state.lastDequeuedFrameSequence;
+        this.arrivalCurrentOnmessageAt = state.lastDequeuedOnmessageAt;
+        this.arrivalCurrentBridgeDequeueAt = state.lastDequeuedAt;
+        this.arrivalCurrentFrameBytes = state.lastDequeuedBytes;
+        this.arrivalCurrentFrameMetadataDropped = state.lastDequeuedFrameSequence === null;
+        this.arrivalFrameMetadataDropped += state.frameMetadataDropped;
+        // The bridge state is cumulative; clear the per-client accounting
+        // cursor after consuming it so the same overflow is not counted on
+        // every packet in a later poll.
+        state.frameMetadataDropped = 0;
+        this.arrivalObservedOnmessage ||= Number.isFinite(this.arrivalCurrentOnmessageAt);
+        this.arrivalObservedBridgeDequeue ||= Number.isFinite(
+            this.arrivalCurrentBridgeDequeueAt);
+        if (Number.isFinite(this.arrivalCurrentOnmessageAt) &&
+            !this.arrivalFirstOnmessageRecorded) {
+            this.arrivalFirstOnmessageRecorded = true;
+            this.recordArrivalPhase("first-onmessage", this.arrivalCurrentOnmessageAt);
+        }
+    }
+
+    clearArrivalFrame() {
+        this.arrivalCurrentFrameSequence = null;
+        this.arrivalCurrentOnmessageAt = null;
+        this.arrivalCurrentBridgeDequeueAt = null;
+        this.arrivalCurrentFrameBytes = null;
+        this.arrivalCurrentPollAt = null;
+        this.arrivalCurrentFrameMetadataDropped = false;
+    }
+
+    recordArrivalPacket({
+        packetId,
+        phaseAtDecode,
+        decodeStartAt,
+        decodeEndAt,
+        dispatchAt,
+        reconnectRecoveryAtDecode = false,
+    }) {
+        this.arrivalObservedDecodedPacket = true;
+        this.arrivalObservedDispatch ||= Number.isFinite(dispatchAt);
+        const previousDecodeEndAt = this.arrivalLastDecodeEndAt;
+        this.arrivalLastDecodeEndAt = decodeEndAt;
+        const clock = {
+            monotonic: true,
+            clampedNegativeDeltas: false,
+        };
+        const decodedGapMillis = arrivalDelta(previousDecodeEndAt, decodeEndAt, clock);
+        if (!Number.isFinite(decodedGapMillis) ||
+            decodedGapMillis < ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS) {
+            return;
+        }
+        this.arrivalSlowGapCountTotal++;
+        const onmessageToDequeueMillis = arrivalDelta(
+            this.arrivalCurrentOnmessageAt,
+            this.arrivalCurrentBridgeDequeueAt,
+            clock,
+        );
+        const pollToBridgeDequeueMillis = arrivalDelta(
+            this.arrivalCurrentPollAt,
+            this.arrivalCurrentBridgeDequeueAt,
+            clock,
+        );
+        const pollToDecodeMillis = arrivalDelta(
+            this.arrivalCurrentPollAt,
+            decodeStartAt,
+            clock,
+        );
+        const decodeMillis = arrivalDelta(decodeStartAt, decodeEndAt, clock);
+        const decodeToDispatchMillis = arrivalDelta(decodeEndAt, dispatchAt, clock);
+        const intentional = this.arrivalIntentionalDropPending;
+        if (reconnectRecoveryAtDecode === true) {
+            this.arrivalFirstDecodedAfterReconnect = true;
+        }
+        const classification = classifyBrowserArrivalGap({
+            intentional,
+            // Snapshot this before handlePacket() can observe the first chunk
+            // and close the recovery window.  A gap ending at that explicit
+            // first-chunk boundary is reconnect evidence; later steady-wave
+            // gaps are not classified by the wave number alone.
+            reconnect: reconnectRecoveryAtDecode === true,
+            onmessageToDequeueMillis,
+            pollToBridgeDequeueMillis,
+            pollToDecodeMillis,
+            decodeMillis,
+            decodeToDispatchMillis,
+        });
+        this.arrivalClassificationCounts.set(
+            classification,
+            (this.arrivalClassificationCounts.get(classification) ?? 0) + 1,
+        );
+        if (intentional) {
+            this.arrivalIntentionalDropGapsExcluded++;
+            return;
+        }
+        const sample = {
+            schemaVersion: ARRIVAL_TIMELINE_SCHEMA_VERSION,
+            sampleSequence: this.arrivalSlowSampleCountTotal + 1,
+            clientId: this.id,
+            wave: this.wave,
+            packetSequence: this.decodedPackets,
+            frameSequence: this.arrivalCurrentFrameSequence,
+            packetId,
+            phaseAtDecode,
+            phaseAtReceive: this.phase,
+            decodedGapMillis,
+            thresholdMillis: ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS,
+            intentionalTransportDrop: false,
+            timestamps: {
+                wireAt: null,
+                onmessageAt: this.arrivalCurrentOnmessageAt,
+                bridgeEnqueueAt: null,
+                bridgeDequeueAt: this.arrivalCurrentBridgeDequeueAt,
+                pollAt: this.arrivalCurrentPollAt,
+                decodeStartAt,
+                decodeEndAt,
+                dispatchAt,
+            },
+            segments: {
+                wireToOnmessageMillis: null,
+                onmessageToBridgeDequeueMillis: onmessageToDequeueMillis,
+                pollToBridgeDequeueMillis,
+                pollToDecodeMillis,
+                decodeMillis,
+                decodeToDispatchMillis,
+            },
+            queue: {
+                // The bridge stats object is runtime-global.  Use the channel
+                // entry for the primary value so one busy client cannot be
+                // mistaken for another client's backlog in a multi-client
+                // sample; retain the global gauge only as explicitly scoped
+                // context.
+                inboundQueuedBytes: (() => {
+                    const entry = this.bridge?.channels?.get(this.id);
+                    const inbound = Number(entry?.inboundBytes);
+                    const pending = Number(entry?.pendingInboundBytes);
+                    if (!Number.isSafeInteger(inbound) || inbound < 0 ||
+                        !Number.isSafeInteger(pending) || pending < 0) return null;
+                    return inbound + pending;
+                })(),
+                inboundQueuedBytesScope: "per-client",
+                globalInboundQueuedBytes:
+                    Number.isSafeInteger(this.stats?.inboundQueuedBytes)
+                        ? this.stats.inboundQueuedBytes : null,
+                globalInboundQueuedBytesScope: "runtime-global",
+                bufferedBytes: this.buffer.byteLength,
+                frameBytes: this.arrivalCurrentFrameBytes,
+                frameMetadataDropped: this.arrivalCurrentFrameMetadataDropped,
+            },
+            frameCorrelation: "latest-dequeued-websocket-message-best-effort",
+            correlationQuality: this.arrivalCurrentFrameSequence === null
+                ? "unknown" : "best-effort",
+            classification,
+            classificationConfidence: classification === "unattributed-arrival-gap"
+                ? "unattributed" : classification === "reconnect-gap"
+                    ? "reconnect-boundary" : "best-effort-local-segment",
+            clock: {
+                ...clock,
+            },
+        };
+        this.arrivalSlowSampleCountTotal++;
+        this.arrivalSlowSamples.push(sample);
+        this.arrivalSlowSamples.sort((left, right) =>
+            right.decodedGapMillis - left.decodedGapMillis ||
+            left.sampleSequence - right.sampleSequence);
+        if (this.arrivalSlowSamples.length > ARRIVAL_TIMELINE_SAMPLE_LIMIT) {
+            this.arrivalSlowSamples.length = ARRIVAL_TIMELINE_SAMPLE_LIMIT;
+            this.arrivalSlowSamplesDropped++;
+        }
+    }
+
+    arrivalTimelineResult() {
+        return {
+            schemaVersion: ARRIVAL_TIMELINE_SCHEMA_VERSION,
+            independentExecution: false,
+            strictGatesChanged: false,
+            slowThresholdMillis: ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS,
+            limits: {
+                slowSamples: ARRIVAL_TIMELINE_SAMPLE_LIMIT,
+                reconnectPhases: ARRIVAL_TIMELINE_RECONNECT_PHASE_LIMIT,
+                frameMetadataRing: ARRIVAL_TIMELINE_FRAME_RING_LIMIT,
+            },
+            source: {
+                wireTimestampAvailable: false,
+                wireAtSource: "unavailable",
+                onmessageTimestampAvailable: this.arrivalObservedOnmessage,
+                bridgeEnqueueTimestampAvailable: false,
+                bridgeDequeueTimestampAvailable: this.arrivalObservedBridgeDequeue,
+                decodeTimestampAvailable: this.arrivalObservedDecodedPacket,
+                dispatchTimestampAvailable: this.arrivalObservedDispatch,
+                wireAtPolicy: "null-when-unavailable",
+                attributionPolicy:
+                    "trusted-wire-required-for-upstream; missing-local-segments=>unattributed",
+                frameCorrelation: "websocket-message-to-bridge-chunk-best-effort",
+                correlationExact: false,
+            },
+            slowGapCountTotal: this.arrivalSlowGapCountTotal,
+            slowSampleCountTotal: this.arrivalSlowSampleCountTotal,
+            slowSamplesDropped: this.arrivalSlowSamplesDropped,
+            intentionalTransportDropCount: this.arrivalIntentionalTransportDropCount,
+            intentionalDropGapsExcluded: this.arrivalIntentionalDropGapsExcluded,
+            frameMetadataDropped: this.arrivalFrameMetadataDropped,
+            reconnectPhaseCountTotal: this.arrivalReconnectPhaseCountTotal,
+            reconnectPhasesDropped: this.arrivalReconnectPhasesDropped,
+            // The bounded phase ring includes connect/login/play/close events
+            // for the whole lifecycle, not only reconnect markers.  Keep the
+            // historical field names for consumers while making its scope
+            // explicit so counts cannot be mistaken for reconnect-only data.
+            phaseRingScope: "all-lifecycle-phases",
+            reconnectBoundary: {
+                attempted: this.wave > 0,
+                seededFromPreviousLifecycle: this.wave > 0 &&
+                    Number.isFinite(this.arrivalReconnectPriorDecodeEndAt),
+                priorDecodeEndAt: Number.isFinite(this.arrivalReconnectPriorDecodeEndAt)
+                    ? this.arrivalReconnectPriorDecodeEndAt : null,
+                disconnectAt: this.arrivalReconnectDropAt,
+                reconnectScheduledAt: this.arrivalReconnectScheduledAt,
+                firstDecodedAt: this.arrivalReconnectFirstDecodedAt,
+                reconnectGapMillis: this.arrivalReconnectGapMillis,
+                clockAnomaly: this.arrivalReconnectClockAnomaly,
+                firstDecodedAfterReconnect: this.wave > 0 &&
+                    this.arrivalFirstDecodedAfterReconnect === true,
+            },
+            classificationCounts: Object.fromEntries(this.arrivalClassificationCounts),
+            slowSamples: this.arrivalSlowSamples.map((sample) => ({
+                ...sample,
+                timestamps: { ...sample.timestamps },
+                segments: { ...sample.segments },
+                queue: { ...sample.queue },
+                clock: { ...sample.clock },
+            })),
+            reconnectPhases: this.arrivalReconnectPhases.map((phase) => ({ ...phase })),
+        };
     }
 
     async connect() {
         this.connectStartedAt = performance.now();
+        this.arrivalIntentionalDropPending = false;
+        this.arrivalReconnectRecoveryPending = this.wave > 0;
+        this.recordArrivalPhase("connect-begin", this.connectStartedAt);
         this.bridge.open(this.id, this.host, this.port);
         await waitFor(() => {
             this.checkError();
@@ -2610,6 +3123,7 @@ class BrowserMinecraftClient {
         }, `browser Relay client ${this.index + 1}`, 20000,
         () => JSON.stringify(this.diagnostics()));
         this.relayConnectedAt = performance.now();
+        this.recordArrivalPhase("transport-open", this.relayConnectedAt);
         this.sendPacket(0, Buffer.concat([
             encodeVarInt(this.profile.protocolVersion),
             encodeString(this.host),
@@ -2621,6 +3135,7 @@ class BrowserMinecraftClient {
             Buffer.from(this.profileId, "hex"),
         ]));
         this.handshakeSentAt = performance.now();
+        this.recordArrivalPhase("handshake-sent", this.handshakeSentAt);
     }
 
     hasImmediateInbound() {
@@ -2677,8 +3192,9 @@ class BrowserMinecraftClient {
 
     poll() {
         if (this.closed || this.pollingPaused) return;
+        const pollStartedAt = performance.now();
         try {
-            const polledAt = performance.now();
+            const polledAt = pollStartedAt;
             if (this.lastPollAt !== undefined) {
                 this.pollGapSamples++;
                 this.maxPollGapMillis = Math.max(
@@ -2692,12 +3208,18 @@ class BrowserMinecraftClient {
             this.recordPhases();
             let framesPolled = 0;
             let packetsRemaining = MAX_PACKETS_PER_POLL;
+            // Bytes already held in the protocol cumulation have no new
+            // bridge dequeue associated with them.  Clear the frame context
+            // before parsing that prefix, then attach metadata for each newly
+            // dequeued bridge chunk below.
+            this.clearArrivalFrame();
             const parsedBeforeInbound = this.parsePackets(packetsRemaining);
             packetsRemaining -= parsedBeforeInbound;
             let chunk;
             while (framesPolled < MAX_INBOUND_FRAMES_PER_POLL &&
                 packetsRemaining > 0 &&
                 (chunk = this.bridge.pollInbound(this.id)) !== null) {
+                this.setArrivalFrameFromBridge(polledAt);
                 const bytes = Buffer.from(chunk);
                 this.buffer = Buffer.concat([
                     this.buffer,
@@ -2726,11 +3248,15 @@ class BrowserMinecraftClient {
         catch (error) {
             this.failure ??= error;
         }
+        finally {
+            this.clearArrivalFrame();
+        }
     }
 
     parsePackets(maximumPackets = Number.POSITIVE_INFINITY) {
         let parsedPackets = 0;
         while (parsedPackets < maximumPackets) {
+            const decodeStartAt = performance.now();
             const outerLength = decodeVarInt(this.buffer, 0);
             if (outerLength === undefined) return parsedPackets;
             const frameStart = outerLength.bytesRead;
@@ -2775,7 +3301,48 @@ class BrowserMinecraftClient {
                 }
                 this.lastPlayPacketAt = packetAt;
             }
-            this.handlePacket(packetId.value, frame.subarray(packetId.bytesRead));
+            const phaseAtDecode = this.phase;
+            const reconnectRecoveryAtDecode = this.arrivalReconnectRecoveryPending;
+            if (reconnectRecoveryAtDecode) {
+                if (!this.arrivalFirstDecodedAfterReconnect) {
+                    this.arrivalFirstDecodedAfterReconnect = true;
+                    this.arrivalReconnectFirstDecodedAt = packetAt;
+                    const reconnectClock = {
+                        monotonic: true,
+                        clampedNegativeDeltas: false,
+                    };
+                    this.arrivalReconnectGapMillis = arrivalDelta(
+                        this.arrivalReconnectPriorDecodeEndAt,
+                        packetAt,
+                        reconnectClock,
+                    );
+                    this.arrivalReconnectClockAnomaly ||=
+                        reconnectClock.clampedNegativeDeltas;
+                    this.recordArrivalPhase("first-decoded-packet", packetAt);
+                    // The reconnect boundary ends at the first decoded
+                    // packet.  Keeping this pending until the first chunk
+                    // would label every later configuration/play gap as a
+                    // reconnect gap and hide its real local segment.
+                    this.arrivalReconnectRecoveryPending = false;
+                }
+            }
+            let dispatchError;
+            try {
+                this.handlePacket(packetId.value, frame.subarray(packetId.bytesRead));
+            }
+            catch (error) {
+                dispatchError = error;
+            }
+            const dispatchAt = performance.now();
+            this.recordArrivalPacket({
+                packetId: packetId.value,
+                phaseAtDecode,
+                decodeStartAt,
+                decodeEndAt: packetAt,
+                dispatchAt,
+                reconnectRecoveryAtDecode,
+            });
+            if (dispatchError !== undefined) throw dispatchError;
             if (this.failure !== undefined) throw this.failure;
         }
         return parsedPackets;
@@ -2806,6 +3373,8 @@ class BrowserMinecraftClient {
                 this.loginFinished = true;
                 this.loginFinishedAt ??= performance.now();
                 this.phase = "configuration";
+                this.recordArrivalPhase("login-done", this.loginFinishedAt);
+                this.recordArrivalPhase("configuration-begin", this.loginFinishedAt);
                 this.sendPacket(this.profile.login.serverboundLoginAcknowledged, Buffer.alloc(0));
                 this.sendPacket(this.profile.login.serverboundHello, encodeClientInformation());
             }
@@ -2882,6 +3451,8 @@ class BrowserMinecraftClient {
                 this.configurationFinishedAt ??= performance.now();
                 this.configurationCycles++;
                 this.phase = "play";
+                this.recordArrivalPhase("configuration-done", this.configurationFinishedAt);
+                this.recordArrivalPhase("play-enter", this.configurationFinishedAt);
                 this.sendPacket(this.profile.configuration.serverboundFinish, Buffer.alloc(0));
             }
             return;
@@ -2903,6 +3474,7 @@ class BrowserMinecraftClient {
         else if (packetId === this.profile.play.clientboundLogin) {
             this.playLoginPackets++;
             this.playLoginAt ??= performance.now();
+            this.recordArrivalPhase("play-login", this.playLoginAt);
             const initialDistances = decodeClientboundLoginDistances(payload);
             this.playLoginDistanceContracts++;
             this.playLoginChunkRadius = initialDistances.chunkRadius;
@@ -3064,9 +3636,20 @@ class BrowserMinecraftClient {
                 this.chunkBounds.maxZ = Math.max(this.chunkBounds.maxZ, z);
             }
         }
+        const firstChunk = this.firstChunkAt === undefined;
         this.firstChunkAt ??= packetAt;
+        if (firstChunk && !this.arrivalFirstChunkRecorded) {
+            this.arrivalFirstChunkRecorded = true;
+            this.recordArrivalPhase("first-chunk", packetAt);
+            this.arrivalReconnectRecoveryPending = false;
+        }
         if (this.minimumChunkTargetReached()) {
+            const minimumChunks = this.minimumChunksAt === undefined;
             this.minimumChunksAt ??= packetAt;
+            if (minimumChunks && !this.arrivalMinimumChunksRecorded) {
+                this.arrivalMinimumChunksRecorded = true;
+                this.recordArrivalPhase("minimum-chunks", packetAt);
+            }
         }
     }
 
@@ -3268,9 +3851,21 @@ class BrowserMinecraftClient {
 
     recordPhases() {
         const events = this.stats.connectPhases.filter((event) => event.id === this.id);
-        if (events.length > this.connectPhases.length) {
-            this.connectPhases = events.slice();
+        for (const event of events) {
+            if (event === null || typeof event !== "object" ||
+                this.arrivalSeenPhaseEvents.has(event)) continue;
+            this.arrivalSeenPhaseEvents.add(event);
+            const bridgeElapsed = Number(event.elapsedMillis);
+            const bridgeMonotonicAt = Number.isFinite(this.connectStartedAt) &&
+                Number.isFinite(bridgeElapsed)
+                ? this.connectStartedAt + Math.max(0, bridgeElapsed) : null;
+            this.recordArrivalPhase(event.phase, bridgeMonotonicAt, {
+                wallAt: Number.isFinite(event.at) ? event.at : null,
+                elapsedMillis: bridgeElapsed,
+                source: "BrowserWebSocketChannel.connect-phase",
+            });
         }
+        if (events.length > this.connectPhases.length) this.connectPhases = events.slice();
     }
 
     close(reason = "final-close") {
@@ -3279,15 +3874,27 @@ class BrowserMinecraftClient {
         this.stopPlayTickLoop();
         this.closedAt = performance.now();
         this.closeReason = reason;
+        this.recordArrivalPhase("close", this.closedAt, { detail: reason });
         try { this.bridge.close(this.id); } catch {}
     }
 
-    pausePollingForTransportDrop() {
+    pausePollingForTransportDrop(dropAt = performance.now()) {
         assert.equal(this.closed, false, "cannot pause a closed reconnect client");
         this.pollingPaused = true;
         this.playTickSuspended = true;
         this.nextPlayTickDueAt = undefined;
         this.lastPlayTickAt = undefined;
+        this.arrivalIntentionalDropPending = true;
+        this.arrivalIntentionalTransportDropCount++;
+        this.arrivalReconnectDropAt = Number.isFinite(dropAt) ? Number(dropAt) : null;
+        this.recordArrivalPhase("disconnect", dropAt, {
+            intentional: true,
+            source: "browser-full-path-harness",
+        });
+        this.recordArrivalPhase("synthetic-transport-drop", dropAt, {
+            intentional: true,
+            source: "browser-full-path-harness",
+        });
     }
 
     diagnostics() {
@@ -3338,6 +3945,7 @@ class BrowserMinecraftClient {
             outboundBytes: this.outboundBytes,
             decodedPackets: this.decodedPackets,
             maximumBufferedBytes: this.maximumBufferedBytes,
+            arrivalTimeline: this.arrivalTimelineResult(),
             performance: this.performanceResult(),
             closeReason: this.closeReason ?? null,
             pollingPaused: this.pollingPaused,
@@ -3636,6 +4244,7 @@ function browserRuntimeSnapshot(runtime) {
         flowResumes: runtime.stats.flowResumes,
         activeRelayTargetLeases: runtime.stats.activeRelayTargetLeases,
         relayTargetAttestationFailures: runtime.stats.relayTargetAttestationFailures,
+        arrivalTimeline: runtime.arrivalTelemetry?.evidence?.() ?? null,
     };
     for (const name of BROWSER_RUNTIME_CLEANUP_GAUGES) {
         if (Object.prototype.hasOwnProperty.call(runtime.stats, name)) {
@@ -4128,6 +4737,7 @@ function clientLivenessEvidence(client) {
         chunkBatch: client.chunkBatchResult(),
         timing: client.timingResult(),
         performance: client.performanceResult(),
+        arrivalTimeline: client.arrivalTimelineResult(),
         failure: client.failure === undefined ? null : String(client.failure),
         onlineEncryption: client.onlineEncryptionResult(),
     };
@@ -4601,16 +5211,22 @@ async function captureAbnormalTransportDrop(runtime, probes) {
             }));
         const chunks = [];
         const deadline = Date.now() + 5000;
-        while (runtime.bridge.hasPendingInbound(probe.id)) {
-            const chunk = runtime.bridge.pollInbound(probe.id);
-            if (chunk === null) {
-                if (Date.now() >= deadline) {
-                    throw new Error(`timed out draining channel ${probe.id} close tail`);
+        runtime.arrivalTelemetry?.syntheticSockets?.add(probe.entry.ws);
+        try {
+            while (runtime.bridge.hasPendingInbound(probe.id)) {
+                const chunk = runtime.bridge.pollInbound(probe.id);
+                if (chunk === null) {
+                    if (Date.now() >= deadline) {
+                        throw new Error(`timed out draining channel ${probe.id} close tail`);
+                    }
+                    await delay(0);
+                    continue;
                 }
-                await delay(0);
-                continue;
+                chunks.push(Buffer.from(chunk));
             }
-            chunks.push(Buffer.from(chunk));
+        }
+        finally {
+            runtime.arrivalTelemetry?.syntheticSockets?.delete(probe.entry.ws);
         }
         const drained = Buffer.concat(chunks);
         const tailOffset = drained.indexOf(probe.tail);
@@ -4723,6 +5339,17 @@ function browserFullPathPerformanceContract() {
         relayDrainMaxDurationMillis: RELAY_DRAIN_MAX_DURATION_MILLIS,
         relayDrainSendErrors: 0,
         relayDrainCleanupRequired: true,
+        arrivalTimeline: {
+            schemaVersion: ARRIVAL_TIMELINE_SCHEMA_VERSION,
+            slowThresholdMillis: ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS,
+            perClientSlowSampleLimit: ARRIVAL_TIMELINE_SAMPLE_LIMIT,
+            perClientReconnectPhaseLimit: ARRIVAL_TIMELINE_RECONNECT_PHASE_LIMIT,
+            frameMetadataRingLimit: ARRIVAL_TIMELINE_FRAME_RING_LIMIT,
+            wireAtPolicy: "null-when-unavailable",
+            attributionPolicy:
+                "trusted-wire-required-for-upstream; missing-local-segments=>unattributed",
+            strictGatesChanged: false,
+        },
         multiplayerPerformance: { ...MULTIPLAYER_PERFORMANCE_TARGET },
         pollScheduler: {
             schemaVersion: "gaius.browser-client-poll-scheduler.v1",
@@ -5102,6 +5729,17 @@ async function printConfiguration() {
             identities,
         },
         browserChannelSourceEvidence: browserChannelSource.evidence,
+        arrivalTimeline: {
+            schemaVersion: ARRIVAL_TIMELINE_SCHEMA_VERSION,
+            slowThresholdMillis: ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS,
+            perClientSlowSampleLimit: ARRIVAL_TIMELINE_SAMPLE_LIMIT,
+            perClientReconnectPhaseLimit: ARRIVAL_TIMELINE_RECONNECT_PHASE_LIMIT,
+            frameMetadataRingLimit: ARRIVAL_TIMELINE_FRAME_RING_LIMIT,
+            wireAtPolicy: "null-when-unavailable",
+            attributionPolicy:
+                "trusted-wire-required-for-upstream; missing-local-segments=>unattributed",
+            strictGatesChanged: false,
+        },
         performanceContract: browserFullPathPerformanceContract(),
     }));
 }
@@ -5147,9 +5785,72 @@ async function createBrowserRuntime(relayUrl, token) {
         urls: [],
         sockets: new Set(),
     };
+    const arrivalTelemetry = {
+        schemaVersion: ARRIVAL_TIMELINE_SCHEMA_VERSION,
+        independentExecution: false,
+        slowThresholdMillis: ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS,
+        binaryOnmessageFrames: 0,
+        binaryOnmessageBytes: 0,
+        bridgeDequeuedFrames: 0,
+        bridgeDequeuedBytes: 0,
+        frameMetadataDropped: 0,
+        syntheticDequeuedFrames: 0,
+        syntheticDequeuedBytes: 0,
+        syntheticSockets: new Set(),
+        evidence() {
+            return {
+                schemaVersion: this.schemaVersion,
+                independentExecution: this.independentExecution,
+                strictGatesChanged: false,
+                slowThresholdMillis: this.slowThresholdMillis,
+                limits: {
+                    frameMetadataRing: ARRIVAL_TIMELINE_FRAME_RING_LIMIT,
+                    perClientSlowSamples: ARRIVAL_TIMELINE_SAMPLE_LIMIT,
+                    perClientReconnectPhases: ARRIVAL_TIMELINE_RECONNECT_PHASE_LIMIT,
+                },
+                source: {
+                    wireTimestampAvailable: false,
+                    wireAtSource: "unavailable",
+                    onmessageTimestampAvailable: this.binaryOnmessageFrames > 0,
+                    bridgeEnqueueTimestampAvailable: false,
+                    bridgeDequeueTimestampAvailable: this.bridgeDequeuedFrames > 0,
+                    decodeTimestampAvailable: false,
+                    dispatchTimestampAvailable: false,
+                    wireAtPolicy: "null-when-unavailable",
+                    attributionPolicy:
+                        "trusted-wire-required-for-upstream; missing-local-segments=>unattributed",
+                    frameCorrelation: "websocket-message-to-bridge-chunk-best-effort",
+                    correlationExact: false,
+                },
+                binaryOnmessageFrames: this.binaryOnmessageFrames,
+                binaryOnmessageBytes: this.binaryOnmessageBytes,
+                bridgeDequeuedFrames: this.bridgeDequeuedFrames,
+                bridgeDequeuedBytes: this.bridgeDequeuedBytes,
+                frameMetadataDropped: this.frameMetadataDropped,
+                syntheticDequeuedFrames: this.syntheticDequeuedFrames,
+                syntheticDequeuedBytes: this.syntheticDequeuedBytes,
+                syntheticMarkerDequeuesExcluded: true,
+            };
+        },
+    };
     class BrowserWebSocket extends NodeWebSocket {
         constructor(url) {
             super(url, { origin });
+            const arrivalState = createArrivalSocketState();
+            Object.defineProperty(this, "__gaiusArrivalState", {
+                configurable: false,
+                enumerable: false,
+                value: arrivalState,
+                writable: false,
+            });
+            // Register before BrowserWebSocketChannel assigns ws.onmessage so
+            // this listener observes the raw binary delivery first.  It only
+            // updates primitive ring slots; protocol handling remains wholly
+            // owned by the bridge's original onmessage callback.
+            this.on("message", (data, isBinary) => {
+                recordArrivalSocketMessage(arrivalState, data, isBinary,
+                    arrivalTelemetry);
+            });
             wsStats.connections++;
             wsStats.urls.push(String(url));
             wsStats.sockets.add(this);
@@ -5203,10 +5904,23 @@ async function createBrowserRuntime(relayUrl, token) {
     assert.ok(bridge && stats, "BrowserWebSocketChannel JSBody did not initialize");
     assert.equal(typeof bridge.relayNodeRecordResolver, "function",
         "BrowserWebSocketChannel JSBody did not publish relayNodeRecord resolver state");
+    assert.equal(typeof bridge.pollInbound, "function",
+        "BrowserWebSocketChannel JSBody did not expose pollInbound");
+    const originalPollInbound = bridge.pollInbound;
+    bridge.pollInbound = (id) => {
+        const polledAt = performance.now();
+        const chunk = originalPollInbound.call(bridge, id);
+        if (chunk !== null) {
+            const entry = bridge.channels.get(Number(id));
+            recordArrivalBridgeDequeue(entry?.ws, polledAt, chunk, arrivalTelemetry);
+        }
+        return chunk;
+    };
     return {
         bridge,
         stats,
         wsStats,
+        arrivalTelemetry,
         browserChannelSourceEvidence: browserChannelSource.evidence,
         async close() {
             const sockets = [...wsStats.sockets];

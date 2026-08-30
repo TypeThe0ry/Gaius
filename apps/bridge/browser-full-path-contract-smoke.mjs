@@ -18,6 +18,55 @@ const multiplayerPath = fileURLToPath(new URL("./multiplayer-smoke.mjs", import.
 const verifyRuntimePath = fileURLToPath(
     new URL("./deploy/verify-runtime.sh", import.meta.url));
 const packagePath = fileURLToPath(new URL("./package.json", import.meta.url));
+const fullPathSourceText = await readFile(fullPathScript, "utf8");
+
+// Arrival timeline is diagnostic evidence only.  Keep these source-level
+// assertions here so a future scheduler refactor cannot silently turn the
+// timeline into a new gate, synthesize a wire timestamp, or grow an unbounded
+// retention structure.  The real runtime stress job remains the authority for
+// observed values; this smoke only protects the contract shape.
+assert.match(fullPathSourceText,
+    /ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS\s*=\s*250/u,
+    "arrival timeline diagnostic threshold drifted");
+assert.match(fullPathSourceText,
+    /ARRIVAL_TIMELINE_SAMPLE_LIMIT\s*=\s*64/u,
+    "arrival timeline per-client sample limit drifted");
+assert.match(fullPathSourceText,
+    /ARRIVAL_TIMELINE_RECONNECT_PHASE_LIMIT\s*=\s*64/u,
+    "arrival timeline reconnect phase limit drifted");
+assert.match(fullPathSourceText,
+    /ARRIVAL_TIMELINE_FRAME_RING_LIMIT\s*=\s*64/u,
+    "arrival timeline frame ring limit drifted");
+assert.match(fullPathSourceText,
+    /wireAtSource:\s*["']unavailable["']/u,
+    "arrival timeline must fail closed when wire time is unavailable");
+assert.match(fullPathSourceText,
+    /isBinary\s*!==\s*false\s*&&/u,
+    "arrival timeline must not count text Buffer frames as binary wire frames");
+assert.match(fullPathSourceText,
+    /return\s+["']unattributed-arrival-gap["']/u,
+    "arrival timeline must not infer upstream silence from missing timestamps");
+assert.match(fullPathSourceText,
+    /missing-local-segments=>unattributed/u,
+    "arrival timeline attribution policy drifted");
+assert.match(fullPathSourceText,
+    /strictGatesChanged:\s*false/u,
+    "arrival timeline must remain diagnostic-only");
+assert.match(fullPathSourceText,
+    /independentExecution:\s*false/u,
+    "live arrival timeline must not be labelled as an independent model");
+assert.match(fullPathSourceText,
+    /phaseRingScope:\s*["']all-lifecycle-phases["']/u,
+    "arrival phase ring scope must be explicit");
+assert.match(fullPathSourceText,
+    /arrivalIntentionalDropPending\s*=\s*false/u,
+    "arrival timeline intentional-drop state must reset for a fresh lifecycle");
+assert.match(fullPathSourceText,
+    /reconnectRecoveryAtDecode/u,
+    "arrival timeline must mark reconnect-boundary decode samples explicitly");
+assert.match(fullPathSourceText,
+    /CALLBACK_TAIL_SLOW_THRESHOLD_MILLIS\s*=\s*16\.7/u,
+    "strict callback tail gate drifted");
 
 const COMPATIBILITY_ENVIRONMENT = Object.freeze({
     GAIUS_BROWSER_FULL_PATH_ACCEPTANCE: "0",
