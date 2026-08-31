@@ -518,6 +518,9 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             relayRegistryPromise: null,
             activeDecoderEntryId: 0,
             activeDecoderSliceBytes: 0,
+            activeDecoderScopeIds: [],
+            activeDecoderScopeBytes: [],
+            activeDecoderScopeDepth: 0,
             // Queue accounting does not carry a socket id across the Java bridge. If a
             // re-entrant decoder scope from another channel is observed, owner-specific
             // O(1) updates are ambiguous and must fall back to the previous all-channel path.
@@ -3323,11 +3326,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               state.finishHighWatermark(entry, workDepth(entry), queuedBytes(entry));
               releaseDecoderCumulation(entry, 0);
               releaseDecodedSliceOwnership(entry);
-              if (state.activeDecoderEntryId === entry.id) {
-                state.activeDecoderEntryId = 0;
-                state.activeDecoderSliceBytes = 0;
-                state.activeDecoderOwnerAmbiguous = false;
-              }
+              discardDecoderScopes(entry.id);
               if (entry.inboundSliceHandle !== null) {
                 if (entry.inboundSliceUsesRaf &&
                     typeof globalThis.cancelAnimationFrame === 'function') {
@@ -3430,6 +3429,82 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               refreshHighWatermark();
               if (entry && queuedBytes(entry) > 0) state.stats.deferredPumps++;
             };
+            function syncDecoderScopeOwner() {
+              const ids = state.activeDecoderScopeIds;
+              const byteLengths = state.activeDecoderScopeBytes;
+              const depth = Math.min(ids.length, byteLengths.length);
+              if (ids.length !== byteLengths.length) {
+                ids.length = depth;
+                byteLengths.length = depth;
+                state.activeDecoderOwnerAmbiguous = true;
+              }
+              state.activeDecoderScopeDepth = depth;
+              if (depth <= 0) {
+                state.activeDecoderEntryId = 0;
+                state.activeDecoderSliceBytes = 0;
+                state.activeDecoderOwnerAmbiguous = false;
+                return;
+              }
+              state.activeDecoderEntryId = ids[depth - 1]|0;
+              state.activeDecoderSliceBytes = Math.max(
+                0,
+                Number(byteLengths[depth - 1]) || 0
+              );
+            }
+            function pushDecoderScope(entryId, byteLength) {
+              state.activeDecoderScopeIds.push(entryId|0);
+              state.activeDecoderScopeBytes.push(Math.max(0, Number(byteLength) || 0));
+              syncDecoderScopeOwner();
+            }
+            function finishDecoderScope(entryId) {
+              const ids = state.activeDecoderScopeIds;
+              const byteLengths = state.activeDecoderScopeBytes;
+              if (ids.length <= 0 || byteLengths.length <= 0) return false;
+              const owner = entryId|0;
+              const last = Math.min(ids.length, byteLengths.length) - 1;
+              if ((ids[last]|0) === owner) {
+                ids.length = last;
+                byteLengths.length = last;
+                syncDecoderScopeOwner();
+                return true;
+              }
+              state.activeDecoderOwnerAmbiguous = true;
+              let found = -1;
+              for (let index = last - 1; index >= 0; index--) {
+                if ((ids[index]|0) === owner) {
+                  found = index;
+                  break;
+                }
+              }
+              if (found < 0) {
+                syncDecoderScopeOwner();
+                return false;
+              }
+              for (let index = found; index < last; index++) {
+                ids[index] = ids[index + 1];
+                byteLengths[index] = byteLengths[index + 1];
+              }
+              ids.length = last;
+              byteLengths.length = last;
+              syncDecoderScopeOwner();
+              return true;
+            }
+            function discardDecoderScopes(entryId) {
+              const ids = state.activeDecoderScopeIds;
+              const byteLengths = state.activeDecoderScopeBytes;
+              const owner = entryId|0;
+              let write = 0;
+              const limit = Math.min(ids.length, byteLengths.length);
+              for (let read = 0; read < limit; read++) {
+                if ((ids[read]|0) === owner) continue;
+                ids[write] = ids[read];
+                byteLengths[write] = byteLengths[read];
+                write++;
+              }
+              ids.length = write;
+              byteLengths.length = write;
+              syncDecoderScopeOwner();
+            }
             state.recordDecodedSliceScheduled = function(id, bytes) {
               const entry = state.channels.get(id|0);
               if (!entry || entry.disposed) return;
@@ -3450,30 +3525,19 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                   state.activeDecoderEntryId !== entry.id) {
                 state.activeDecoderOwnerAmbiguous = true;
               }
-              state.activeDecoderEntryId = entry.id;
-              state.activeDecoderSliceBytes = byteLength;
+              pushDecoderScope(entry.id, byteLength);
               applyFlowControl(entry);
             };
             state.finishDecodedSliceScheduled = function(id) {
               const entry = state.channels.get(id|0);
               if (!entry || entry.disposed) return;
-              if (entry.decodedSliceBacklog > 0) {
+              const scopeFinished = finishDecoderScope(entry.id);
+              if (scopeFinished && entry.decodedSliceBacklog > 0) {
                 entry.decodedSliceBacklog--;
                 state.stats.decodedSliceBacklog = Math.max(
                   0,
                   state.stats.decodedSliceBacklog - 1
                 );
-              }
-              if (state.activeDecoderEntryId === entry.id) {
-                state.activeDecoderEntryId = 0;
-                state.activeDecoderSliceBytes = 0;
-              } else if (state.activeDecoderOwnerAmbiguous) {
-                // A mismatched finish proves that the single global owner slot can no longer
-                // identify the callback's channel. Clear the slot and retain fail-closed mode
-                // until this scope has unwound; never release another channel's cumulation.
-                state.activeDecoderEntryId = 0;
-                state.activeDecoderSliceBytes = 0;
-                state.activeDecoderOwnerAmbiguous = false;
               }
               applyFlowControl(entry);
               scheduleSlices(entry, false);

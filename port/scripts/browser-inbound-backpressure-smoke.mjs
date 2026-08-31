@@ -213,6 +213,14 @@ assert.equal(activeHighWatermarkMillis([100, 130], 200), 170,
   "incremental high-watermark duration model is inconsistent");
 assert.match(bridgeScript, /activeDecoderOwnerAmbiguous: false/,
   "decoder accounting lost its fail-closed owner ambiguity state");
+assert.match(bridgeScript, /activeDecoderScopeIds: \[\]/,
+  "decoder accounting lost its nested-scope owner stack");
+assert.match(bridgeScript, /activeDecoderScopeBytes: \[\]/,
+  "decoder accounting lost its nested-scope byte stack");
+assert.match(schedulerScript, /function syncDecoderScopeOwner\(\)[\s\S]*?function pushDecoderScope\(/,
+  "decoder scope owner state has no bounded synchronization helper");
+assert.match(schedulerScript, /function finishDecoderScope\(entryId\)[\s\S]*?function discardDecoderScopes\(/,
+  "decoder scope owner state has no finish/discard lifecycle helpers");
 const decodedSliceOwnershipSource = schedulerScript.slice(
   schedulerScript.indexOf("state.recordDecodedSliceScheduled = function("),
   schedulerScript.indexOf("state.recordDecodedPacketQueueScheduled = function("),
@@ -298,6 +306,68 @@ assert.deepEqual(modelInterleavedQueueFanout([
 assert.deepEqual(modelInterleavedQueueFanout([
   {pauseChanged: false, processed: false, activeDecoder: "B", ownerAmbiguous: true},
 ]), ["A", "B"]);
+function modelDecoderScopeLifecycle(actions) {
+  const scopes = [];
+  let ownerAmbiguous = false;
+  for (const action of actions) {
+    if (action.type === "begin") {
+      if (scopes.length > 0 && scopes[scopes.length - 1] !== action.owner) {
+        ownerAmbiguous = true;
+      }
+      scopes.push(action.owner);
+    } else if (action.type === "finish") {
+      let index = scopes.length - 1;
+      if (index >= 0 && scopes[index] === action.owner) {
+        scopes.pop();
+      } else {
+        ownerAmbiguous = true;
+        index = scopes.lastIndexOf(action.owner);
+        if (index >= 0) scopes.splice(index, 1);
+      }
+    } else if (action.type === "discard") {
+      for (let index = scopes.length - 1; index >= 0; index--) {
+        if (scopes[index] === action.owner) scopes.splice(index, 1);
+      }
+    }
+    if (scopes.length === 0) ownerAmbiguous = false;
+  }
+  return {
+    active: scopes.length > 0 ? scopes[scopes.length - 1] : 0,
+    depth: scopes.length,
+    ownerAmbiguous,
+  };
+}
+assert.deepEqual(modelDecoderScopeLifecycle([
+  {type: "begin", owner: "A"},
+  {type: "begin", owner: "B"},
+  {type: "finish", owner: "B"},
+  {type: "finish", owner: "A"},
+]), {active: 0, depth: 0, ownerAmbiguous: false});
+assert.deepEqual(modelDecoderScopeLifecycle([
+  {type: "begin", owner: "A"},
+  {type: "begin", owner: "B"},
+  {type: "finish", owner: "B"},
+  {type: "discard", owner: "A"},
+]), {active: 0, depth: 0, ownerAmbiguous: false});
+assert.deepEqual(modelDecoderScopeLifecycle([
+  {type: "begin", owner: "A"},
+  {type: "begin", owner: "B"},
+  {type: "finish", owner: "A"},
+  {type: "finish", owner: "B"},
+]), {active: 0, depth: 0, ownerAmbiguous: false});
+assert.deepEqual(modelDecoderScopeLifecycle([
+  {type: "begin", owner: "A"},
+  {type: "begin", owner: "B"},
+  {type: "discard", owner: "A"},
+  {type: "finish", owner: "B"},
+]), {active: 0, depth: 0, ownerAmbiguous: false});
+assert.deepEqual(modelDecoderScopeLifecycle([
+  {type: "begin", owner: "A"},
+  {type: "begin", owner: "B"},
+  {type: "finish", owner: "B"},
+  {type: "discard", owner: "A"},
+  {type: "begin", owner: "C"},
+]), {active: "C", depth: 1, ownerAmbiguous: false});
 const flowControlSource = schedulerScript.slice(
   schedulerScript.indexOf("function applyFlowControl(entry)"),
   schedulerScript.indexOf("function compactPending(entry)"),
