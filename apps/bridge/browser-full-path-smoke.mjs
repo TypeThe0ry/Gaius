@@ -3192,11 +3192,6 @@ class BrowserMinecraftClient {
             clampedNegativeDeltas: false,
         };
         const decodedGapMillis = arrivalDelta(previousDecodeEndAt, decodeEndAt, clock);
-        if (!Number.isFinite(decodedGapMillis) ||
-            decodedGapMillis < ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS) {
-            return;
-        }
-        this.arrivalSlowGapCountTotal++;
         const onmessageToDequeueMillis = arrivalDelta(
             this.arrivalCurrentOnmessageAt,
             this.arrivalCurrentBridgeDequeueAt,
@@ -3214,6 +3209,27 @@ class BrowserMinecraftClient {
         );
         const decodeMillis = arrivalDelta(decodeStartAt, decodeEndAt, clock);
         const decodeToDispatchMillis = arrivalDelta(decodeEndAt, dispatchAt, clock);
+        const segmentValues = [
+            ["onmessage-to-bridge-dequeue", onmessageToDequeueMillis],
+            ["poll-to-bridge-dequeue", pollToBridgeDequeueMillis],
+            ["poll-to-decode", pollToDecodeMillis],
+            ["decode", decodeMillis],
+            ["decode-to-dispatch", decodeToDispatchMillis],
+        ];
+        const triggerSegments = segmentValues
+            .filter(([, value]) => Number.isFinite(value) &&
+                value >= ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS)
+            .map(([name]) => name);
+        if ((!Number.isFinite(decodedGapMillis) ||
+            decodedGapMillis < ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS) &&
+            triggerSegments.length === 0) {
+            return;
+        }
+        this.arrivalSlowGapCountTotal++;
+        const slowTriggerMillis = Math.max(
+            Number.isFinite(decodedGapMillis) ? decodedGapMillis : 0,
+            ...segmentValues.map(([, value]) => Number.isFinite(value) ? value : 0),
+        );
         const intentional = this.arrivalIntentionalDropPending;
         if (reconnectRecoveryAtDecode === true) {
             this.arrivalFirstDecodedAfterReconnect = true;
@@ -3224,6 +3240,8 @@ class BrowserMinecraftClient {
             protocolVersion: this.profile?.protocolVersion,
             packetId,
             decodedGapMillis,
+            slowTriggerMillis,
+            triggerSegments,
             phaseAtDecode,
             intentional,
             // Snapshot this before handlePacket() can observe the first chunk
@@ -3266,6 +3284,8 @@ class BrowserMinecraftClient {
             phaseAtDecode,
             phaseAtReceive: this.phase,
             decodedGapMillis,
+            slowTriggerMillis,
+            triggerSegments,
             thresholdMillis: ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS,
             intentionalTransportDrop: false,
             timestamps: {
@@ -3328,7 +3348,8 @@ class BrowserMinecraftClient {
         this.arrivalSlowSampleCountTotal++;
         this.arrivalSlowSamples.push(sample);
         this.arrivalSlowSamples.sort((left, right) =>
-            right.decodedGapMillis - left.decodedGapMillis ||
+            (right.slowTriggerMillis ?? right.decodedGapMillis) -
+                (left.slowTriggerMillis ?? left.decodedGapMillis) ||
             left.sampleSequence - right.sampleSequence);
         if (this.arrivalSlowSamples.length > ARRIVAL_TIMELINE_SAMPLE_LIMIT) {
             this.arrivalSlowSamples.length = ARRIVAL_TIMELINE_SAMPLE_LIMIT;
