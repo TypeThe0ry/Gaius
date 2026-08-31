@@ -3060,6 +3060,12 @@ class BrowserMinecraftClient {
         this.arrivalPeriodicServerSyncGapsExcluded = 0;
         this.arrivalPhaseSequence = 0;
         this.arrivalSeenPhaseEvents = new WeakSet();
+        // connectPhases is append-only across lifecycles in the shared stats
+        // object. Keep an identity/length cursor so each poll only inspects
+        // entries appended since the previous poll instead of rescanning the
+        // entire history during long stress runs.
+        this.phaseScanSource = null;
+        this.phaseScanIndex = 0;
         // A replacement client may inherit only the previous lifecycle's last
         // decode timestamp as a diagnostic seed.  This lets the first decoded
         // packet after reconnect expose the full reconnect gap without sharing
@@ -4436,22 +4442,38 @@ class BrowserMinecraftClient {
     }
 
     recordPhases() {
-        const events = this.stats.connectPhases.filter((event) => event.id === this.id);
-        for (const event of events) {
-            if (event === null || typeof event !== "object" ||
-                this.arrivalSeenPhaseEvents.has(event)) continue;
-            this.arrivalSeenPhaseEvents.add(event);
-            const bridgeElapsed = Number(event.elapsedMillis);
-            const bridgeMonotonicAt = Number.isFinite(this.connectStartedAt) &&
-                Number.isFinite(bridgeElapsed)
-                ? this.connectStartedAt + Math.max(0, bridgeElapsed) : null;
-            this.recordArrivalPhase(event.phase, bridgeMonotonicAt, {
-                wallAt: Number.isFinite(event.at) ? event.at : null,
-                elapsedMillis: bridgeElapsed,
-                source: "BrowserWebSocketChannel.connect-phase",
-            });
+        const source = Array.isArray(this.stats.connectPhases)
+            ? this.stats.connectPhases : [];
+        const sourceReplaced = this.phaseScanSource !== source;
+        const sourceTruncated = source.length < this.phaseScanIndex;
+        if (sourceReplaced || sourceTruncated) {
+            // A replaced/truncated source invalidates the cursor. Rebuild the
+            // compatibility array from the current source while retaining the
+            // WeakSet so previously observed objects are not emitted twice.
+            this.phaseScanSource = source;
+            this.phaseScanIndex = 0;
+            this.connectPhases = [];
         }
-        if (events.length > this.connectPhases.length) this.connectPhases = events.slice();
+        for (let index = this.phaseScanIndex; index < source.length; index++) {
+            const event = source[index];
+            if (event === null || typeof event !== "object" || event.id !== this.id)
+                continue;
+            if (!this.arrivalSeenPhaseEvents.has(event)) {
+                this.arrivalSeenPhaseEvents.add(event);
+                const bridgeElapsed = Number(event.elapsedMillis);
+                const bridgeMonotonicAt = Number.isFinite(this.connectStartedAt) &&
+                    Number.isFinite(bridgeElapsed)
+                    ? this.connectStartedAt + Math.max(0, bridgeElapsed) : null;
+                this.recordArrivalPhase(event.phase, bridgeMonotonicAt, {
+                    wallAt: Number.isFinite(event.at) ? event.at : null,
+                    elapsedMillis: bridgeElapsed,
+                    source: "BrowserWebSocketChannel.connect-phase",
+                });
+            }
+            this.connectPhases.push(event);
+        }
+        this.phaseScanSource = source;
+        this.phaseScanIndex = source.length;
     }
 
     close(reason = "final-close") {

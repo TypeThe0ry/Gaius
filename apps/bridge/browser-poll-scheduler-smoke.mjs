@@ -112,6 +112,18 @@ const clientPollEnd = source.indexOf("\n    parsePackets(", clientPollStart);
 assert.ok(clientPollStart >= 0 && clientPollEnd > clientPollStart,
     "BrowserMinecraftClient.poll boundaries changed; inspect telemetry hooks");
 const clientPollSource = source.slice(clientPollStart, clientPollEnd);
+const phaseScanStart = source.indexOf("    recordPhases() {");
+const phaseScanEnd = source.indexOf("\n    close(", phaseScanStart);
+assert.ok(phaseScanStart >= 0 && phaseScanEnd > phaseScanStart,
+    "recordPhases boundaries changed; inspect incremental phase scan hooks");
+const phaseScanSource = source.slice(phaseScanStart, phaseScanEnd);
+assert.match(phaseScanSource, /phaseScanSource/u,
+    "recordPhases must retain source-array identity for incremental scanning");
+assert.match(phaseScanSource, /phaseScanIndex/u,
+    "recordPhases must retain an append cursor for incremental scanning");
+assert.doesNotMatch(phaseScanSource,
+    /this\.stats\.connectPhases\.filter\(\(event\) => event\.id === this\.id\)/u,
+    "recordPhases reverted to an O(history) filter on every poll");
 for (const marker of [
     "this.checkError()",
     "this.recordPhases()",
