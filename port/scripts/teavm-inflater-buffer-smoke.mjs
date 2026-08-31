@@ -59,7 +59,7 @@ assert.match(inflateSource,
   "heap output does not advance by the exact inflated count");
 assert.match(inflateSource,
   /buffer\.hasArray\(\) && !buffer\.isReadOnly\(\)/,
-  "read-only heap buffers can enter the writable output fast path");
+  "read-only heap buffers must not enter the writable output fast path");
 assert.match(inflateSource,
   /byte\[\] output = new byte\[buffer\.remaining\(\)\];\s*int count = inflater\.inflate\(output\);\s*buffer\.put\(output, 0, count\);/,
   "direct/read-only output fallback no longer preserves the copy path");
