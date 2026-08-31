@@ -50,6 +50,76 @@ const resetEnd = schedulerSource.indexOf("\n    }\n}", resetStart);
 assert.ok(resetStart >= 0 && resetEnd > resetStart,
     "BrowserPacketScheduler.reset() boundary changed; audit it before updating this smoke");
 const resetBody = schedulerSource.slice(resetStart, resetEnd);
+const ownerContract = {
+    ownerState: requireMatch(schedulerSource,
+        /private static Object packetProcessorOwner;[\s\S]*private static long packetProcessorGeneration;/u,
+        "owner/generation state is missing from PacketProcessor accounting"),
+    conflictState: requireMatch(schedulerSource,
+        /private static boolean packetProcessorOwnerConflict;[\s\S]*private static boolean packetProcessorAccountingValid/u,
+        "owner conflict must fail closed before sharing global accounting"),
+    ownerClaim: requireMatch(schedulerSource,
+        /public static boolean bindPacketProcessor\(Object owner\)/u,
+        "PacketProcessor owner claim entry point is missing"),
+    staleResetGuard: requireMatch(schedulerSource,
+        /public static void reset\(Object owner\)[\s\S]*packetProcessorOwnerConflict[\s\S]*stalePacketProcessorResets/u,
+        "owner-aware reset does not ignore conflicting/stale close events"),
+};
+
+const ownerResetStart = schedulerSource.indexOf(
+    "public static void reset(Object owner)");
+const ownerResetEnd = schedulerSource.indexOf(
+    "\n    public static boolean isPacketProcessorAccountingValid", ownerResetStart);
+assert.ok(ownerResetStart >= 0 && ownerResetEnd > ownerResetStart,
+    "owner-aware reset boundary changed; audit it before updating this smoke");
+const ownerResetBody = schedulerSource.slice(ownerResetStart, ownerResetEnd);
+const ownerResetCall = ownerResetBody.indexOf("\n        reset();");
+assert.ok(ownerResetCall > 0, "owner-aware reset lost its global reset call");
+const ownerResetGuard = {
+    conflictBeforeGlobalReset: requireMatch(
+        ownerResetBody.slice(0, ownerResetCall),
+        /packetProcessorOwnerConflict/u,
+        "owner conflict is checked after global reset"),
+    invalidBeforeGlobalReset: requireMatch(
+        ownerResetBody.slice(0, ownerResetCall),
+        /packetProcessorAccountingValid/u,
+        "invalid owner accounting is checked after global reset"),
+};
+
+const clientPacketBoundaryStart = clientNetworkSource.indexOf(
+    "public static void processClientPacketsAtScheduledFrameBoundary(");
+const clientPacketBoundaryEnd = clientNetworkSource.indexOf(
+    "\n    @JSBody(params = \"callback\"", clientPacketBoundaryStart);
+assert.ok(clientPacketBoundaryStart >= 0 && clientPacketBoundaryEnd > clientPacketBoundaryStart,
+    "client packet boundary method changed; audit owner fallback before updating this smoke");
+const clientPacketBoundaryBody = clientNetworkSource.slice(
+    clientPacketBoundaryStart, clientPacketBoundaryEnd);
+const ownerFallbackContract = {
+    ownerBind: requireMatch(
+        clientPacketBoundaryBody,
+        /boolean accountingValid = BrowserPacketScheduler\.bindPacketProcessor\(packetProcessor\);/u,
+        "scheduled packet boundary does not bind PacketProcessor ownership"),
+    conflictFallback: requireMatch(
+        clientPacketBoundaryBody,
+        /if \(!accountingValid \|\| queueBefore < 64 \|\| !isClientPacketFrameBoundaryDrainEnabled\(\)\)\s*\{\s*packetProcessor\.processQueuedPackets\(\);\s*return;/u,
+        "PacketProcessor owner conflict does not fall back to vanilla processing"),
+    ownerDrainClaim: requireMatch(
+        clientPacketBoundaryBody,
+        /tryBeginClientPacketDrain\(packetProcessor, pausedBefore\)/u,
+        "adaptive drain does not carry PacketProcessor owner"),
+    ownerInterrupt: requireMatch(
+        clientPacketBoundaryBody,
+        /interruptClientPacketDrain\(packetProcessor\)/u,
+        "owner-aware failure interruption is missing"),
+    ownerFinish: requireMatch(
+        clientPacketBoundaryBody,
+        /finishClientPacketDrain\(packetProcessor\)/u,
+        "owner-aware drain finalization is missing"),
+    vanillaCallCount: countMatches(
+        clientPacketBoundaryBody,
+        /packetProcessor\.processQueuedPackets\(\)/gu),
+};
+assert.equal(ownerFallbackContract.vanillaCallCount, 2,
+    "owner fallback must retain exactly one vanilla branch and one adaptive branch call");
 
 const closePatchStart = patcherSource.indexOf(
     "private static void patchPacketProcessorCloseAccounting");
@@ -103,6 +173,9 @@ const closeOrder = {
     closeHook: requireMatch(closePatchBody,
         /BrowserPacketScheduler[\s\S]*reset/u,
         "PacketProcessor.close is missing the runtime accounting reset hook"),
+    ownerPassed: requireMatch(closePatchBody,
+        /cleanup\.add\(new VarInsnNode\(Opcodes\.ALOAD, 0\)\);[\s\S]*"reset"[\s\S]*"\(Ljava\/lang\/Object;\)V"/u,
+        "PacketProcessor.close reset hook does not carry its owner"),
 };
 
 // A browser transport close must retire only its channel/transport entry.  It
@@ -283,6 +356,21 @@ class OwnerClaimModel {
             return false;
         }
         return true;
+    }
+
+    packetBoundaryMode(owner, queueDepth, enabled = true) {
+        const ownerAccepted = this.claim(owner);
+        const adaptive = ownerAccepted &&
+            this.accountingValid &&
+            this.adaptiveDrainEnabled &&
+            enabled === true &&
+            Number.isInteger(queueDepth) &&
+            queueDepth >= 64;
+        return {
+            mode: adaptive ? "adaptive" : "vanilla",
+            calls: 1,
+            adaptive,
+        };
     }
 }
 
@@ -488,6 +576,13 @@ function testBoundedOwnerClaimFailClosed() {
     assert.equal(scheduler.accountingValid, true);
     assert.equal(scheduler.queuedPackets, 72);
 
+    const adaptiveBoundary = scheduler.packetBoundaryMode(processorA, 256);
+    assert.deepEqual(adaptiveBoundary, {
+        mode: "adaptive",
+        calls: 1,
+        adaptive: true,
+    });
+
     // A second owner permanently invalidates the shared accounting lanes for
     // this runtime. No foreign event is allowed to alter A's queue state.
     assert.equal(scheduler.claim(processorB), false);
@@ -505,6 +600,13 @@ function testBoundedOwnerClaimFailClosed() {
     assert.equal(scheduler.foreignResets, 1);
     assert.equal(scheduler.foreignPacketQueued, 3);
     assert.equal(scheduler.foreignPacketProcessed, 3);
+
+    const conflictFallback = scheduler.packetBoundaryMode(processorB, 256);
+    assert.deepEqual(conflictFallback, {
+        mode: "vanilla",
+        calls: 1,
+        adaptive: false,
+    }, "owner conflict must choose the conservative one-call vanilla path");
 
     // A callback from the pre-conflict generation is stale and must not revive
     // accounting or alter the current generation state.
@@ -525,6 +627,9 @@ function testBoundedOwnerClaimFailClosed() {
         foreignPacketProcessed: scheduler.foreignPacketProcessed,
         foreignResets: scheduler.foreignResets,
         staleGenerationEvents: scheduler.staleGenerationEvents,
+        fallbackModeAfterConflict: conflictFallback.mode,
+        fallbackCallsAfterConflict: conflictFallback.calls,
+        adaptiveAfterConflict: conflictFallback.adaptive,
         foreignEventsIgnored: scheduler.foreignPacketQueued === 3 &&
             scheduler.foreignPacketProcessed === 3,
         closeForeignResetDidNotClearOwner: scheduler.queuedPackets === 72,
@@ -539,6 +644,9 @@ const boundedOwnerClaim = testBoundedOwnerClaimFailClosed();
 
 const staticContract = {
     schedulerGlobalFields,
+    ownerContract,
+    ownerResetGuard,
+    ownerFallbackContract,
     resetClearsRuntimeState,
     closeOrder,
     channelCloseIsolation,
@@ -574,7 +682,10 @@ const result = {
             boundedOwnerClaim.exactPacketQueuePaused === false &&
             boundedOwnerClaim.foreignEventsIgnored === true &&
             boundedOwnerClaim.closeForeignResetDidNotClearOwner === true &&
-            boundedOwnerClaim.staleGenerationEvents === 1,
+            boundedOwnerClaim.staleGenerationEvents === 1 &&
+            boundedOwnerClaim.fallbackModeAfterConflict === "vanilla" &&
+            boundedOwnerClaim.fallbackCallsAfterConflict === 1 &&
+            boundedOwnerClaim.adaptiveAfterConflict === false,
         unsupportedConcurrentProcessorIsolation: false,
         activeDrainConcurrentProcessorIsolation: false,
         publicRelayRuntimeProof: false,
@@ -582,13 +693,14 @@ const result = {
     interpretation: {
         confirmed: [
             "existing Java hook accounting is runtime-static and reset is tied to PacketProcessor.close",
+            "owner/generation claim and conflict fail-closed hooks are present in the patched source",
             "BrowserWebSocketChannel.doClose retires only its channel/socket",
             "supported one-processor runtime model preserves B after A channel close and reconnect",
             "bounded owner-claim model disables shared accounting on a second owner and ignores foreign/reset/stale-generation events",
             "Node relay/channel close tests are separate from Java PacketProcessor evidence",
         ],
         knownRisk: [
-            "if a future architecture puts two PacketProcessor instances in one JVM, close(A) clears B accounting",
+            "if a second PacketProcessor appears in one JVM, the product deliberately falls back to vanilla processing; per-owner adaptive accounting is not enabled",
             "an active drain claim/demand is also global in that unsupported topology",
             "a browser channel close does not purge already-decoded entries from the shared FIFO; the closed listener must be discarded by the normal packet path without resetting B",
         ],

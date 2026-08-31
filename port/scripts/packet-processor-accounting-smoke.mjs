@@ -31,6 +31,20 @@ assert.ok(!shouldProcessNext.includes("recordDecodedPacket"),
   "shouldProcessNext must not emit decoded packet completion");
 assert.match(scheduler, /private static int queuedPacketHandleDepth;/,
   "nested queued PLAY packet drain guard state is missing");
+for (const contract of [
+  "packetProcessorOwner",
+  "packetProcessorGeneration",
+  "packetProcessorOwnerConflict",
+  "packetProcessorAccountingValid",
+  "public static boolean bindPacketProcessor(Object owner)",
+  "public static boolean beginBatch(Object owner)",
+  "public static boolean shouldProcessNext(Object owner)",
+  "public static void packetQueued(Object owner)",
+  "public static void packetProcessed(Object owner)",
+  "public static void reset(Object owner)",
+]) {
+  assert.ok(scheduler.includes(contract), "missing owner accounting contract: " + contract);
+}
 assert.match(scheduler,
   /public static boolean isProcessingQueuedPacket\(\) \{\s*return queuedPacketHandleDepth > 0;/,
   "queued PLAY packet guard does not cover the complete nested handle scope");
@@ -146,8 +160,8 @@ const processTrace = processBytecode
   .replace(/([A-Za-z])\s+([A-Za-z])/g, "$1$2");
 
 assert.match(scheduleBytecode,
-  /Queue\.add[\s\S]{0,400}?\n\s*\d+:\s+dup[\s\S]{0,120}?\n\s*\d+:\s+ifeq[\s\S]{0,120}?\n\s*\d+:\s+invokestatic[\s\S]{0,400}?BrowserPacketScheduler\.packetQueued/,
-  "packetQueued is not conditional on successful Queue.add");
+  /Queue\.add[\s\S]{0,400}?\n\s*\d+:\s+dup[\s\S]{0,120}?\n\s*\d+:\s+ifeq[\s\S]{0,160}?\n\s*\d+:\s+aload_0[\s\S]{0,120}?\n\s*\d+:\s+invokestatic[\s\S]{0,400}?BrowserPacketScheduler\.packetQueued[\s\S]{0,160}?\(Ljava\/lang\/Object;\)V/,
+  "packetQueued is not owner-aware and conditional on successful Queue.add");
 assert.equal(
   (processBytecode.match(/BrowserPacketScheduler\.packetProcessed/g) || []).length,
   2,
@@ -156,8 +170,20 @@ assert.equal(
 assert.match(
   processTrace,
   /ListenerAndPacket\.packet\s*:[\s\S]{0,500}?BrowserPacketScheduler\.beginQueuedPacket\s*:[\s\S]{0,500}?ListenerAndPacket\.handle\s*:/,
-  "queued drain guard does not capture the exact packet immediately before handle",
+  "queued drain guard does not capture owner + exact packet immediately before handle",
 );
+assert.match(processBytecode,
+  /BrowserPacketScheduler\.beginBatch[\s\S]{0,240}?\(Ljava\/lang\/Object;\)Z/,
+  "processQueuedPackets does not claim an owner-aware batch");
+assert.match(processBytecode,
+  /BrowserPacketScheduler\.shouldProcessNext[\s\S]{0,240}?\(Ljava\/lang\/Object;\)Z/,
+  "processQueuedPackets does not use owner-aware batch budget");
+assert.match(processBytecode,
+  /BrowserPacketScheduler\.beginQueuedPacket[\s\S]{0,240}?\(Ljava\/lang\/Object;Ljava\/lang\/Object;\)V/,
+  "processQueuedPackets does not pass owner + packet");
+assert.match(bytecode,
+  /private void gaius\$vanillaProcessQueuedPackets\(\);|gaius\$vanillaProcessQueuedPackets/,
+  "PacketProcessor does not retain a vanilla fallback method");
 assert.match(processBytecode, /Exception table:[\s\S]*any/,
   "packetProcessed is not protected by a catch-all finally path");
 assert.ok(
@@ -165,5 +191,8 @@ assert.ok(
     && closeBytecode.indexOf("Queue.clear") < closeBytecode.indexOf("BrowserPacketScheduler.reset"),
   "close must clear PacketProcessor's real queue before resetting accounting",
 );
+assert.match(closeBytecode,
+  /BrowserPacketScheduler\.reset[\s\S]{0,160}?\(Ljava\/lang\/Object;\)V/,
+  "close reset does not carry the PacketProcessor owner");
 
 console.log("PacketProcessor decoded-packet accounting smoke passed");

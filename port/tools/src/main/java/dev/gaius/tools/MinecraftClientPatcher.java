@@ -10641,11 +10641,12 @@ public final class MinecraftClientPatcher {
         code.add(new TypeInsnNode(Opcodes.INSTANCEOF,
                 "net/minecraft/client/multiplayer/ClientPacketListener"));
         code.add(new JumpInsnNode(Opcodes.IFEQ, vanillaScheduling));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 "dev/gaius/browser/BrowserPacketScheduler",
                 "isProcessingQueuedPacket",
-                "()Z",
+                "(Ljava/lang/Object;)Z",
                 false));
         code.add(new JumpInsnNode(Opcodes.IFNE, queuedHandleReturn));
         for (String packetType : transitionPacketTypes) {
@@ -10655,11 +10656,12 @@ public final class MinecraftClientPatcher {
         }
         code.add(new JumpInsnNode(Opcodes.GOTO, forcedPlayQueue));
         code.add(transitionBacklogCheck);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 "dev/gaius/browser/BrowserPacketScheduler",
                 "hasPendingPackets",
-                "()Z",
+                "(Ljava/lang/Object;)Z",
                 false));
         code.add(new JumpInsnNode(Opcodes.IFEQ, inline));
         code.add(forcedPlayQueue);
@@ -10702,7 +10704,7 @@ public final class MinecraftClientPatcher {
                     && call.getOpcode() == Opcodes.INVOKESTATIC
                     && call.owner.equals("dev/gaius/browser/BrowserPacketScheduler")
                     && call.name.equals("isProcessingQueuedPacket")
-                    && call.desc.equals("()Z")
+                    && call.desc.equals("(Ljava/lang/Object;)Z")
                     && nextOpcode(call) instanceof JumpInsnNode branch
                     && branch.getOpcode() == Opcodes.IFNE
                     && branch.label == queuedHandleReturn) {
@@ -10712,7 +10714,7 @@ public final class MinecraftClientPatcher {
                     && call.getOpcode() == Opcodes.INVOKESTATIC
                     && call.owner.equals("dev/gaius/browser/BrowserPacketScheduler")
                     && call.name.equals("hasPendingPackets")
-                    && call.desc.equals("()Z")
+                    && call.desc.equals("(Ljava/lang/Object;)Z")
                     && nextOpcode(call) instanceof JumpInsnNode branch
                     && branch.getOpcode() == Opcodes.IFEQ
                     && branch.label == inline) {
@@ -10797,27 +10799,45 @@ public final class MinecraftClientPatcher {
         if (method == null) {
             throw new IOException("PacketProcessor browser slice patch point was not found");
         }
+        String vanillaFallbackName = "gaius$vanillaProcessQueuedPackets";
+        if (findNullable(node, vanillaFallbackName, "()V") != null) {
+            throw new IllegalStateException(
+                    "PacketProcessor already contains " + vanillaFallbackName);
+        }
+        MethodNode vanillaFallback = new MethodNode(
+                (method.access & ~(Opcodes.ACC_PUBLIC | Opcodes.ACC_PROTECTED))
+                        | Opcodes.ACC_PRIVATE | Opcodes.ACC_SYNTHETIC,
+                vanillaFallbackName,
+                method.desc,
+                method.signature,
+                method.exceptions == null ? null : method.exceptions.toArray(new String[0]));
+        method.accept(vanillaFallback);
+        node.methods.add(vanillaFallback);
         LabelNode loop = new LabelNode();
         LabelNode done = new LabelNode();
+        LabelNode vanilla = new LabelNode();
         LabelNode handleStart = new LabelNode();
         LabelNode handleEnd = new LabelNode();
         LabelNode handleFailure = new LabelNode();
         InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 "dev/gaius/browser/BrowserPacketScheduler",
                 "beginBatch",
-                "()V",
+                "(Ljava/lang/Object;)Z",
                 false));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, vanilla));
         code.add(loop);
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "closed", "Z"));
         code.add(new JumpInsnNode(Opcodes.IFNE, done));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 "dev/gaius/browser/BrowserPacketScheduler",
                 "shouldProcessNext",
-                "()Z",
+                "(Ljava/lang/Object;)Z",
                 false));
         code.add(new JumpInsnNode(Opcodes.IFEQ, done));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
@@ -10831,6 +10851,7 @@ public final class MinecraftClientPatcher {
         code.add(new VarInsnNode(Opcodes.ALOAD, 1));
         code.add(new JumpInsnNode(Opcodes.IFNULL, done));
         code.add(handleStart);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new VarInsnNode(Opcodes.ALOAD, 1));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL,
@@ -10842,7 +10863,7 @@ public final class MinecraftClientPatcher {
                 Opcodes.INVOKESTATIC,
                 "dev/gaius/browser/BrowserPacketScheduler",
                 "beginQueuedPacket",
-                "(Ljava/lang/Object;)V",
+                "(Ljava/lang/Object;Ljava/lang/Object;)V",
                 false));
         code.add(new VarInsnNode(Opcodes.ALOAD, 1));
         code.add(new MethodInsnNode(
@@ -10852,24 +10873,35 @@ public final class MinecraftClientPatcher {
                 "()V",
                 false));
         code.add(handleEnd);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 "dev/gaius/browser/BrowserPacketScheduler",
                 "packetProcessed",
-                "()V",
+                "(Ljava/lang/Object;)V",
                 false));
         code.add(new JumpInsnNode(Opcodes.GOTO, loop));
         code.add(handleFailure);
         code.add(new VarInsnNode(Opcodes.ASTORE, 2));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 "dev/gaius/browser/BrowserPacketScheduler",
                 "packetProcessed",
-                "()V",
+                "(Ljava/lang/Object;)V",
                 false));
         code.add(new VarInsnNode(Opcodes.ALOAD, 2));
         code.add(new InsnNode(Opcodes.ATHROW));
         code.add(done);
+        code.add(new InsnNode(Opcodes.RETURN));
+        code.add(vanilla);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                owner,
+                vanillaFallbackName,
+                "()V",
+                false));
         code.add(new InsnNode(Opcodes.RETURN));
         replace(method, code, 2, 3);
         method.tryCatchBlocks.add(new TryCatchBlockNode(
@@ -10901,11 +10933,12 @@ public final class MinecraftClientPatcher {
             InsnList accounting = new InsnList();
             accounting.add(new InsnNode(Opcodes.DUP));
             accounting.add(new JumpInsnNode(Opcodes.IFEQ, notQueued));
+            accounting.add(new VarInsnNode(Opcodes.ALOAD, 0));
             accounting.add(new MethodInsnNode(
                     Opcodes.INVOKESTATIC,
                     "dev/gaius/browser/BrowserPacketScheduler",
                     "packetQueued",
-                    "()V",
+                    "(Ljava/lang/Object;)V",
                     false));
             accounting.add(notQueued);
             schedule.instructions.insert(add, accounting);
@@ -10938,11 +10971,12 @@ public final class MinecraftClientPatcher {
                     "clear",
                     "()V",
                     true));
+            cleanup.add(new VarInsnNode(Opcodes.ALOAD, 0));
             cleanup.add(new MethodInsnNode(
                     Opcodes.INVOKESTATIC,
                     "dev/gaius/browser/BrowserPacketScheduler",
                     "reset",
-                    "()V",
+                    "(Ljava/lang/Object;)V",
                     false));
             close.instructions.insertBefore(instruction, cleanup);
             patched++;
@@ -10960,34 +10994,55 @@ public final class MinecraftClientPatcher {
         int reset = 0;
         int shouldProcess = 0;
         int beginQueued = 0;
+        int beginBatch = 0;
+        int legacySchedulerCalls = 0;
         for (MethodNode method : node.methods) {
             for (AbstractInsnNode instruction : method.instructions.toArray()) {
                 if (!(instruction instanceof MethodInsnNode call)
                         || !call.owner.equals("dev/gaius/browser/BrowserPacketScheduler")) {
                     continue;
                 }
-                if (call.name.equals("packetQueued") && call.desc.equals("()V")) {
-                    queued++;
-                } else if (call.name.equals("packetProcessed") && call.desc.equals("()V")) {
-                    processed++;
-                } else if (call.name.equals("reset") && call.desc.equals("()V")) {
-                    reset++;
-                } else if (call.name.equals("shouldProcessNext") && call.desc.equals("()Z")) {
-                    shouldProcess++;
-                } else if (call.name.equals("beginQueuedPacket")
+                if (call.name.equals("packetQueued")
                         && call.desc.equals("(Ljava/lang/Object;)V")) {
+                    queued++;
+                } else if (call.name.equals("packetProcessed")
+                        && call.desc.equals("(Ljava/lang/Object;)V")) {
+                    processed++;
+                } else if (call.name.equals("reset")
+                        && call.desc.equals("(Ljava/lang/Object;)V")) {
+                    reset++;
+                } else if (call.name.equals("shouldProcessNext")
+                        && call.desc.equals("(Ljava/lang/Object;)Z")) {
+                    shouldProcess++;
+                } else if (call.name.equals("beginBatch")
+                        && call.desc.equals("(Ljava/lang/Object;)Z")) {
+                    beginBatch++;
+                } else if (call.name.equals("beginQueuedPacket")
+                        && call.desc.equals("(Ljava/lang/Object;Ljava/lang/Object;)V")) {
                     beginQueued++;
+                } else if ((call.name.equals("packetQueued")
+                        || call.name.equals("packetProcessed")
+                        || call.name.equals("reset")
+                        || call.name.equals("shouldProcessNext")
+                        || call.name.equals("beginBatch")
+                        || call.name.equals("beginQueuedPacket"))
+                        && (call.desc.equals("()V")
+                        || call.desc.equals("()Z")
+                        || call.desc.equals("(Ljava/lang/Object;)V"))) {
+                    legacySchedulerCalls++;
                 }
             }
         }
         if (queued != 1 || processed != 2 || reset != 1 || shouldProcess != 1
-                || beginQueued != 1) {
+                || beginBatch != 1 || beginQueued != 1 || legacySchedulerCalls != 0) {
             throw new IllegalStateException(
                     "PacketProcessor accounting hooks changed: queued=" + queued
                             + ", processed=" + processed
                             + ", reset=" + reset
                             + ", shouldProcess=" + shouldProcess
-                            + ", beginQueued=" + beginQueued);
+                            + ", beginBatch=" + beginBatch
+                            + ", beginQueued=" + beginQueued
+                            + ", legacy=" + legacySchedulerCalls);
         }
         System.out.println("Instrumented exact decoded-packet queue accounting");
     }

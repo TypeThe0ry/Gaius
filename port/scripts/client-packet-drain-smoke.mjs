@@ -116,16 +116,16 @@ assert.doesNotMatch(rawPump, /processQueuedPackets/,
 const scheduledWrapper = between(networkSource,
   "public static void processClientPacketsAtScheduledFrameBoundary(", "@JSBody(params = \"callback\"");
 assert.match(scheduledWrapper,
-  /int queueBefore = BrowserPacketScheduler\.queuedPacketCount\(\);[\s\S]*if \(queueBefore < 64 \|\| !isClientPacketFrameBoundaryDrainEnabled\(\)\)[\s\S]*packetProcessor\.processQueuedPackets\(\);[\s\S]*return;/,
-  "below-threshold mode must skip the JS feature query and make one vanilla 16/2ms call");
+  /boolean accountingValid = BrowserPacketScheduler\.bindPacketProcessor\(packetProcessor\);[\s\S]*int queueBefore = BrowserPacketScheduler\.queuedPacketCount\(\);[\s\S]*if \(!accountingValid \|\| queueBefore < 64 \|\| !isClientPacketFrameBoundaryDrainEnabled\(\)[\s\S]*packetProcessor\.processQueuedPackets\(\);[\s\S]*return;/,
+  "owner conflict or below-threshold mode must use one vanilla PacketProcessor call");
 assert.match(scheduledWrapper,
   /pausedBefore \? "critical" : "pressure"/,
   "the exact paused queue does not retain its critical telemetry mode");
 assert.match(scheduledWrapper,
-  /tryBeginClientPacketDrain\(pausedBefore\)/,
-  "pressure mode does not claim the single scheduled call");
+  /tryBeginClientPacketDrain\(packetProcessor, pausedBefore\)/,
+  "pressure mode does not claim the single scheduled call with its owner");
 assert.match(scheduledWrapper,
-  /catch \(RuntimeException \| Error failure\)[\s\S]*interruptClientPacketDrain\(\)[\s\S]*finally \{[\s\S]*clientPacketDrainEpoch\(\)[\s\S]*clientPacketDrainHandlerCompletions\(\)[\s\S]*finishClientPacketDrain\(\)/,
+  /catch \(RuntimeException \| Error failure\)[\s\S]*interruptClientPacketDrain\(packetProcessor\)[\s\S]*finally \{[\s\S]*clientPacketDrainEpoch\(\)[\s\S]*clientPacketDrainHandlerCompletions\(\)[\s\S]*finishClientPacketDrain\(packetProcessor\)/,
   "failure/finish does not capture exact epoch/completions before releasing the claim");
 assert.equal((scheduledWrapper.match(/packetProcessor\.processQueuedPackets\(\)/g) || []).length, 2,
   "the wrapper must have exactly the vanilla branch and the claimed branch");

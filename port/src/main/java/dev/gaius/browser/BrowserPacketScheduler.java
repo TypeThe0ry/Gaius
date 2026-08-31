@@ -38,6 +38,18 @@ public final class BrowserPacketScheduler {
     private static int clientFrameSafeDrainTurns;
     private static int clientFrameVanillaDrainTurns;
     private static boolean clientFrameAccountingActive;
+    /**
+     * PacketProcessor accounting is deliberately single-owner. A browser client normally has one
+     * PacketProcessor fed by many channels, but reconnect/embedded topologies can briefly expose a
+     * second instance. Never let that second instance mutate the first one's static queue ledger.
+     */
+    private static Object packetProcessorOwner;
+    private static long packetProcessorGeneration;
+    private static boolean packetProcessorOwnerConflict;
+    private static boolean packetProcessorAccountingValid = true;
+    private static String packetProcessorFallbackReason = "unbound";
+    private static long stalePacketProcessorResets;
+    private static Object queuedPacketHandleOwner;
 
     private BrowserPacketScheduler() {
     }
@@ -75,6 +87,23 @@ public final class BrowserPacketScheduler {
                 clientFrameVanillaDrainTurns++;
             }
         }
+    }
+
+    /** Claims the one PacketProcessor owner before any queue accounting is touched. */
+    public static boolean bindPacketProcessor(Object owner) {
+        return claimPacketProcessorOwner(owner);
+    }
+
+    /**
+     * Owner-aware batch entry. A conflicting owner returns false so the patched PacketProcessor
+     * can execute its retained vanilla method instead of sharing adaptive state.
+     */
+    public static boolean beginBatch(Object owner) {
+        if (!claimPacketProcessorOwner(owner)) {
+            return false;
+        }
+        beginBatch();
+        return true;
     }
 
     /**
@@ -149,7 +178,27 @@ public final class BrowserPacketScheduler {
         return true;
     }
 
+    /** Stops the adaptive loop immediately if its PacketProcessor owner becomes stale/conflicted. */
+    public static boolean shouldProcessNext(Object owner) {
+        if (!isPacketProcessorAccountingValid(owner)) {
+            return false;
+        }
+        return shouldProcessNext();
+    }
+
     public static boolean hasPendingPackets() {
+        return queuedPackets > 0;
+    }
+
+    /**
+     * Owner-aware transition check. During a conflict it is conservative: transition packets stay
+     * on the PacketProcessor FIFO rather than being incorrectly inlined ahead of another owner.
+     */
+    public static boolean hasPendingPackets(Object owner) {
+        if (owner == null || packetProcessorOwnerConflict
+                || packetProcessorOwner != owner) {
+            return true;
+        }
         return queuedPackets > 0;
     }
 
@@ -176,10 +225,23 @@ public final class BrowserPacketScheduler {
         return true;
     }
 
+    public static boolean tryBeginClientPacketDrain(Object owner, boolean critical) {
+        if (!claimPacketProcessorOwner(owner)) {
+            return false;
+        }
+        return tryBeginClientPacketDrain(critical);
+    }
+
     /** Marks an exceptional or reset-aborted active drain without deriving success from queue depth. */
     public static void interruptClientPacketDrain() {
         if (clientPacketDrainActive) {
             clientPacketDrainStopReason = "interrupted";
+        }
+    }
+
+    public static void interruptClientPacketDrain(Object owner) {
+        if (owner == packetProcessorOwner) {
+            interruptClientPacketDrain();
         }
     }
 
@@ -196,6 +258,12 @@ public final class BrowserPacketScheduler {
         }
         clientPacketDrainActive = false;
         clientPacketDrainCritical = false;
+    }
+
+    public static void finishClientPacketDrain(Object owner) {
+        if (owner == packetProcessorOwner) {
+            finishClientPacketDrain();
+        }
     }
 
     public static String clientPacketDrainStopReason() {
@@ -237,6 +305,11 @@ public final class BrowserPacketScheduler {
         return queuedPacketHandleDepth > 0;
     }
 
+    public static boolean isProcessingQueuedPacket(Object owner) {
+        return owner != null && owner == queuedPacketHandleOwner
+                && queuedPacketHandleDepth > 0;
+    }
+
     /** Marks the exact ListenerAndPacket.handle scope; nesting must not clear the outer drain guard. */
     public static void beginQueuedPacket(Object packet) {
         if (queuedPacketHandleDepth == 0) {
@@ -248,8 +321,42 @@ public final class BrowserPacketScheduler {
         }
     }
 
+    public static void beginQueuedPacket(Object owner, Object packet) {
+        if (!claimPacketProcessorOwner(owner)) {
+            return;
+        }
+        if (queuedPacketHandleDepth == 0) {
+            queuedPacketHandleStartedNanos = System.nanoTime();
+            queuedPacketHandleRoot = packet;
+            queuedPacketHandleOwner = owner;
+        } else if (queuedPacketHandleOwner != owner) {
+            markPacketProcessorConflict("nested-owner-conflict");
+            return;
+        }
+        if (queuedPacketHandleDepth < Integer.MAX_VALUE) {
+            queuedPacketHandleDepth++;
+        }
+    }
+
     /** Called only after PacketProcessor successfully appends a decoded packet to its queue. */
     public static void packetQueued() {
+        if (queuedPackets < Integer.MAX_VALUE) {
+            queuedPackets++;
+        }
+        if (!packetQueuePaused && queuedPackets >= PACKET_QUEUE_HIGH_WATERMARK) {
+            packetQueuePaused = true;
+        }
+        BrowserWebSocketChannel.recordDecodedPacketQueue(
+                queuedPackets, packetQueuePaused, false, -1.0, null);
+    }
+
+    public static void packetQueued(Object owner) {
+        if (!claimPacketProcessorOwner(owner)) {
+            return;
+        }
+        if (!packetProcessorAccountingValid) {
+            return;
+        }
         if (queuedPackets < Integer.MAX_VALUE) {
             queuedPackets++;
         }
@@ -284,6 +391,69 @@ public final class BrowserPacketScheduler {
                 queuedPacketHandleStartedNanos = 0L;
                 queuedPacketHandleRoot = null;
             }
+        }
+        if (clientFrameAccountingActive && completedHandleNanos >= 0L) {
+            if (clientFramePacketCount < Integer.MAX_VALUE) {
+                clientFramePacketCount++;
+            }
+            if (Long.MAX_VALUE - clientFramePacketHandleNanos < completedHandleNanos) {
+                clientFramePacketHandleNanos = Long.MAX_VALUE;
+            } else {
+                clientFramePacketHandleNanos += completedHandleNanos;
+            }
+        }
+        if (clientPacketDrainActive && completedHandleNanos >= 0L
+                && clientPacketDrainHandlerCompletions < Integer.MAX_VALUE) {
+            clientPacketDrainHandlerCompletions++;
+        }
+        if (queuedPackets > 0) {
+            queuedPackets--;
+        }
+        if (packetQueuePaused && queuedPackets <= PACKET_QUEUE_LOW_WATERMARK) {
+            packetQueuePaused = false;
+        }
+        BrowserWebSocketChannel.recordDecodedPacketQueue(
+                queuedPackets, packetQueuePaused, true, handleMillis, handleType);
+    }
+
+    public static void packetProcessed(Object owner) {
+        boolean handlerOwner = owner != null && owner == queuedPacketHandleOwner;
+        if (!handlerOwner) {
+            return;
+        }
+        double handleMillis = -1.0;
+        String handleType = null;
+        long completedHandleNanos = -1L;
+        if (queuedPacketHandleDepth > 0) {
+            queuedPacketHandleDepth--;
+            if (queuedPacketHandleDepth == 0) {
+                long elapsedNanos = Math.max(
+                        0L, System.nanoTime() - queuedPacketHandleStartedNanos);
+                completedHandleNanos = elapsedNanos;
+                handleMillis = elapsedNanos / 1_000_000.0;
+                if (elapsedNanos > longestQueuedPacketHandleNanos
+                        || elapsedNanos >= 50_000_000L) {
+                    if (elapsedNanos > longestQueuedPacketHandleNanos) {
+                        longestQueuedPacketHandleNanos = elapsedNanos;
+                    }
+                    handleType = queuedPacketHandleRoot == null
+                            ? "unknown"
+                            : queuedPacketHandleRoot.getClass().getName();
+                }
+                queuedPacketHandleStartedNanos = 0L;
+                queuedPacketHandleRoot = null;
+                queuedPacketHandleOwner = null;
+            }
+        }
+        // A conflict intentionally stops all global queue/frame mutation. The handler scope above
+        // is still unwound so a later vanilla packet cannot be mistaken for nested queued work.
+        if (owner != packetProcessorOwner || !packetProcessorAccountingValid) {
+            if (queuedPacketHandleDepth == 0 && packetProcessorOwner == null) {
+                packetProcessorOwnerConflict = false;
+                packetProcessorAccountingValid = true;
+                packetProcessorFallbackReason = "unbound";
+            }
+            return;
         }
         if (clientFrameAccountingActive && completedHandleNanos >= 0L) {
             if (clientFramePacketCount < Integer.MAX_VALUE) {
@@ -354,5 +524,102 @@ public final class BrowserPacketScheduler {
         queuedPackets = 0;
         packetQueuePaused = false;
         BrowserWebSocketChannel.recordDecodedPacketQueue(0, false, false, -1.0, null);
+    }
+
+    /**
+     * Clears accounting only for the owner that established it. A stale close from another
+     * PacketProcessor is ignored, preventing reconnect teardown from clearing the live owner's
+     * queue/depth/frame state.
+     */
+    public static void reset(Object owner) {
+        if (owner == null || packetProcessorOwner == null
+                || owner != packetProcessorOwner
+                || packetProcessorOwnerConflict
+                || !packetProcessorAccountingValid) {
+            if (owner != null && (owner != packetProcessorOwner
+                    || packetProcessorOwnerConflict
+                    || !packetProcessorAccountingValid)) {
+                if (stalePacketProcessorResets < Long.MAX_VALUE) {
+                    stalePacketProcessorResets++;
+                }
+            }
+            return;
+        }
+        reset();
+        packetProcessorOwner = null;
+        packetProcessorGeneration = packetProcessorGeneration == Long.MAX_VALUE
+                ? 1L
+                : packetProcessorGeneration + 1L;
+        packetProcessorOwnerConflict = queuedPacketHandleDepth > 0;
+        packetProcessorAccountingValid = !packetProcessorOwnerConflict;
+        packetProcessorFallbackReason = packetProcessorOwnerConflict
+                ? "owner-close-during-handler" : "unbound";
+        if (!packetProcessorOwnerConflict) {
+            queuedPacketHandleOwner = null;
+        }
+    }
+
+    public static boolean isPacketProcessorAccountingValid(Object owner) {
+        return owner != null && owner == packetProcessorOwner
+                && packetProcessorAccountingValid && !packetProcessorOwnerConflict;
+    }
+
+    public static boolean packetProcessorOwnerConflict() {
+        return packetProcessorOwnerConflict;
+    }
+
+    public static boolean packetProcessorAccountingValid() {
+        return packetProcessorAccountingValid && !packetProcessorOwnerConflict;
+    }
+
+    public static long packetProcessorGeneration() {
+        return packetProcessorGeneration;
+    }
+
+    public static long stalePacketProcessorResets() {
+        return stalePacketProcessorResets;
+    }
+
+    public static String packetProcessorFallbackReason() {
+        return packetProcessorFallbackReason;
+    }
+
+    private static boolean claimPacketProcessorOwner(Object owner) {
+        if (owner == null) {
+            markPacketProcessorConflict("null-owner");
+            return false;
+        }
+        if (packetProcessorOwner == null) {
+            if (queuedPacketHandleDepth > 0 && queuedPacketHandleOwner != owner) {
+                markPacketProcessorConflict("owner-while-handler-active");
+                return false;
+            }
+            packetProcessorOwner = owner;
+            packetProcessorGeneration = packetProcessorGeneration == Long.MAX_VALUE
+                    ? 1L : packetProcessorGeneration + 1L;
+            packetProcessorOwnerConflict = false;
+            packetProcessorAccountingValid = true;
+            packetProcessorFallbackReason = "bound";
+            return true;
+        }
+        if (packetProcessorOwner != owner) {
+            markPacketProcessorConflict("packet-processor-owner-conflict");
+            return false;
+        }
+        return packetProcessorAccountingValid && !packetProcessorOwnerConflict;
+    }
+
+    private static void markPacketProcessorConflict(String reason) {
+        packetProcessorOwnerConflict = true;
+        packetProcessorAccountingValid = false;
+        packetProcessorFallbackReason = reason;
+        clientPacketDrainActive = false;
+        clientPacketDrainCritical = false;
+        clientPacketDrainRequestedPackets = 0;
+        clientPacketDrainBatchTargetPackets = 0;
+        clientPacketDrainRemainingDebt = 0;
+        packetQueuePaused = false;
+        BrowserWebSocketChannel.recordDecodedPacketQueue(
+                queuedPackets, false, false, -1.0, null);
     }
 }

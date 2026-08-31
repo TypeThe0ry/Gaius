@@ -5562,16 +5562,16 @@ def check_source_patches() -> None:
             and "public static native void invalidateClientPacketDrain(String reason);"
             in browser_client_network
             and "processClientPacketsAtScheduledFrameBoundary" in browser_client_network
-            and "queueBefore < 64 || !isClientPacketFrameBoundaryDrainEnabled()"
-            in browser_client_packet_boundary
+            and "!accountingValid || queueBefore < 64 || !isClientPacketFrameBoundaryDrainEnabled()"
+                in browser_client_packet_boundary
             and browser_client_packet_boundary.count(
                 "packetProcessor.processQueuedPackets()"
             ) == 2
-            and "tryBeginClientPacketDrain(pausedBefore)"
-            in browser_client_packet_boundary
+            and "tryBeginClientPacketDrain(packetProcessor, pausedBefore)"
+                in browser_client_packet_boundary
             and "finally" in browser_client_packet_boundary
-            and "BrowserPacketScheduler.finishClientPacketDrain()"
-            in browser_client_packet_boundary
+            and "BrowserPacketScheduler.finishClientPacketDrain(packetProcessor)"
+                in browser_client_packet_boundary
             and "scheduledPacketBoundaries != 1" in client_patcher
             and "method.instructions.set(scheduledPacketBoundary, frameBoundaryWrapper)"
             in client_patcher
@@ -5589,7 +5589,17 @@ def check_source_patches() -> None:
             and "clientPacketDrainStopReason" in browser_packet_scheduler
             and "CLIENT_PACKET_DRAIN_THRESHOLD = 64" in browser_packet_scheduler
             and "tryBeginClientPacketDrain(boolean critical)"
-            in browser_packet_scheduler
+                in browser_packet_scheduler
+            and "tryBeginClientPacketDrain(Object owner, boolean critical)"
+                in browser_packet_scheduler
+            and "beginBatch(Object owner)"
+                in browser_packet_scheduler
+            and "packetProcessorOwnerConflict"
+                in browser_packet_scheduler
+            and "packetProcessorAccountingValid"
+                in browser_packet_scheduler
+            and "public static void reset(Object owner)"
+                in browser_packet_scheduler
             and "clientPacketDrainCritical" in browser_packet_scheduler
             and "queuedPacketHandleDepth > 0" in browser_packet_scheduler
             and "clientFramePacketCount == 0" in browser_packet_scheduler

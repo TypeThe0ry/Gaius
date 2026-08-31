@@ -67,12 +67,14 @@ public final class BrowserClientNetwork {
      * original sixteen-packet/two-millisecond batch remains unchanged. Pressure and exact-pause
      * recovery both target queue depth 63, with the same two-millisecond deadline and a
      * 256-packet clock-failure ceiling. Exactly one PacketProcessor call occurs per scheduled
-     * runTick boundary.</p>
+     * runTick boundary. If a second PacketProcessor claims the static accounting epoch, the
+     * scheduler fails closed and the patched processor dispatches its retained vanilla method.</p>
      */
     public static void processClientPacketsAtScheduledFrameBoundary(
             PacketProcessor packetProcessor) {
+        boolean accountingValid = BrowserPacketScheduler.bindPacketProcessor(packetProcessor);
         int queueBefore = BrowserPacketScheduler.queuedPacketCount();
-        if (queueBefore < 64 || !isClientPacketFrameBoundaryDrainEnabled()) {
+        if (!accountingValid || queueBefore < 64 || !isClientPacketFrameBoundaryDrainEnabled()) {
             packetProcessor.processQueuedPackets();
             return;
         }
@@ -88,7 +90,7 @@ public final class BrowserClientNetwork {
         long startedNanos = System.nanoTime();
         String outcome = "claim-skipped";
         String failureType = null;
-        if (!BrowserPacketScheduler.tryBeginClientPacketDrain(pausedBefore)) {
+        if (!BrowserPacketScheduler.tryBeginClientPacketDrain(packetProcessor, pausedBefore)) {
             recordClientPacketDrainJavaSkipped("claim-frame-boundary");
             recordClientPacketFrameBoundaryDrain(
                     runTickSequence,
@@ -117,7 +119,7 @@ public final class BrowserClientNetwork {
         } catch (RuntimeException | Error failure) {
             outcome = "failure";
             failureType = failure.getClass().getName();
-            BrowserPacketScheduler.interruptClientPacketDrain();
+            BrowserPacketScheduler.interruptClientPacketDrain(packetProcessor);
             throw failure;
         } finally {
             // Capture the exact scheduler-owned batch identity/count before releasing the claim.
@@ -126,7 +128,7 @@ public final class BrowserClientNetwork {
             long drainEpoch = BrowserPacketScheduler.clientPacketDrainEpoch();
             int handlerCompletions =
                     BrowserPacketScheduler.clientPacketDrainHandlerCompletions();
-            BrowserPacketScheduler.finishClientPacketDrain();
+            BrowserPacketScheduler.finishClientPacketDrain(packetProcessor);
             recordClientPacketFrameBoundaryDrain(
                     runTickSequence,
                     drainEpoch,
