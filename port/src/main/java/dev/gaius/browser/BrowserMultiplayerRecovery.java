@@ -19,6 +19,9 @@ public final class BrowserMultiplayerRecovery {
         String address = serverData == null || serverData.ip == null
                 ? ""
                 : serverData.ip.trim();
+        if (isRemoteServerAddress(address) && ServerAddress.isValidAddress(address)) {
+            BrowserClientNetwork.enableClientPacketDrainForRemoteSession();
+        }
         beginConnectionAttempt(address);
     }
 

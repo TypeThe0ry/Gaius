@@ -26,6 +26,18 @@ public final class BrowserClientNetwork {
     }
 
     /**
+     * Enables the bounded pressure drain when a valid remote multiplayer session starts.
+     *
+     * <p>The URL/global opt-out is resolved first so a page can explicitly keep the vanilla
+     * packet budget. A pre-existing boolean supplied by an embedding page remains authoritative;
+     * only an unset value is promoted to the bounded remote-session path.</p>
+     */
+    public static void enableClientPacketDrainForRemoteSession() {
+        configureClientPacketDrain();
+        enableClientPacketDrainIfUnset();
+    }
+
+    /**
      * Runs one existing bounded Netty transport turn from an independent browser macrotask.
      *
      * <p>The callback deliberately stops at raw transport decode. Ordinary PLAY packets still
@@ -741,6 +753,12 @@ public final class BrowserClientNetwork {
             }
             """)
     private static native void configureClientPacketDrain();
+
+    @JSBody(script = """
+            if (typeof globalThis.__gaiusClientPacketDrainEnabled === 'boolean') return;
+            globalThis.__gaiusClientPacketDrainEnabled = true;
+            """)
+    private static native void enableClientPacketDrainIfUnset();
 
     @JSBody(script = """
             return globalThis.__gaiusClientPacketDrainEnabled === true;

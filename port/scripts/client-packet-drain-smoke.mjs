@@ -17,6 +17,10 @@ const patcherSource = await readFile(new URL(
   "../tools/src/main/java/dev/gaius/tools/MinecraftClientPatcher.java",
   import.meta.url,
 ), "utf8");
+const recoverySource = await readFile(new URL(
+  "../src/main/java/dev/gaius/browser/BrowserMultiplayerRecovery.java",
+  import.meta.url,
+), "utf8");
 
 function between(source, start, end) {
   const startOffset = source.indexOf(start);
@@ -164,6 +168,55 @@ assert.match(drainOptInScript,
 assert.match(drainOptInScript,
   /typeof globalThis\.__gaiusClientPacketDrainEnabled === 'boolean'/,
   "an embedding-provided drain boolean must remain authoritative");
+const remoteDrainMethod = between(
+  networkSource,
+  "public static void enableClientPacketDrainForRemoteSession() {",
+  "    }\n\n    /**");
+assert.match(remoteDrainMethod,
+  /configureClientPacketDrain\(\)[\s\S]*enableClientPacketDrainIfUnset\(\)/,
+  "remote-session drain promotion must resolve explicit URL/global policy before defaulting");
+const remoteEnableScript = jsBodyBefore(
+  networkSource,
+  "private static native void enableClientPacketDrainIfUnset();");
+new vm.Script(`(function() {${remoteEnableScript}\n})`);
+assert.match(remoteEnableScript,
+  /typeof globalThis\.__gaiusClientPacketDrainEnabled === 'boolean'/,
+  "remote-session promotion must not override an embedding-provided boolean");
+assert.match(remoteEnableScript,
+  /globalThis\.__gaiusClientPacketDrainEnabled = true/,
+  "remote-session promotion does not enable the bounded drain when policy is unset");
+function remoteDrainPolicyModel(search, existing) {
+  const context = {
+    URLSearchParams,
+    location: {search},
+  };
+  context.globalThis = context;
+  if (existing !== undefined) {
+    context.__gaiusClientPacketDrainEnabled = existing;
+  }
+  vm.runInNewContext(`(function() {${drainOptInScript}\n})()`, context);
+  vm.runInNewContext(`(function() {${remoteEnableScript}\n})()`, context);
+  return context.__gaiusClientPacketDrainEnabled;
+}
+assert.equal(remoteDrainPolicyModel("?gaiusClientPacketDrain=0", undefined), false,
+  "remote-session promotion overrode an explicit URL opt-out");
+assert.equal(remoteDrainPolicyModel("?gaiusClientPacketDrain=1", undefined), true,
+  "remote-session promotion failed to retain an explicit URL opt-in");
+assert.equal(remoteDrainPolicyModel("", undefined), true,
+  "remote-session promotion left the unset policy disabled");
+assert.equal(remoteDrainPolicyModel("?gaiusClientPacketDrain=1", false), false,
+  "remote-session promotion overrode an embedding-provided false policy");
+const beginConnection = between(
+  recoverySource,
+  "public static void beginConnection(ServerData serverData) {",
+  "    }\n\n    public static boolean maybeReconnect");
+assert.match(beginConnection,
+  /isRemoteServerAddress\(address\)[\s\S]*ServerAddress\.isValidAddress\(address\)[\s\S]*BrowserClientNetwork\.enableClientPacketDrainForRemoteSession\(\)/,
+  "remote multiplayer connection does not promote the bounded client drain");
+assert.ok(
+  beginConnection.indexOf("BrowserClientNetwork.enableClientPacketDrainForRemoteSession()")
+    < beginConnection.indexOf("beginConnectionAttempt(address)"),
+  "drain promotion must happen before the connection attempt is recorded");
 assert.match(networkSource,
   /private static native boolean installInboundPump\(BrowserPumpCallback callback\);/);
 assert.doesNotMatch(networkSource,
@@ -651,4 +704,8 @@ console.log(JSON.stringify({
   boundaryEventsDropped: evidenceStats.frameBoundaryDrainEventsDropped,
   frameEventsRetained: evidenceStats.clientPacketFrameEvents.length,
   frameEventsDropped: evidenceStats.clientPacketFrameEventsDropped,
+  remoteSessionDrainPromotion: true,
+  explicitUrlOptOutPreserved: remoteDrainPolicyModel("?gaiusClientPacketDrain=0", undefined) === false,
+  embeddingBooleanPreserved: remoteDrainPolicyModel("?gaiusClientPacketDrain=1", false) === false,
+  localSingleplayerAddressExcludedByRecoveryGuard: true,
 }));
