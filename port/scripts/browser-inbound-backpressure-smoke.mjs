@@ -228,7 +228,7 @@ const decodedSliceOwnershipSource = schedulerScript.slice(
 assert.ok(decodedSliceOwnershipSource.length > 0,
   "decoded slice ownership function was not extracted");
 assert.match(decodedSliceOwnershipSource,
-  /activeDecoderEntryId &&[\s\S]*activeDecoderOwnerAmbiguous = true/,
+  /activeDecoderScopeDepth > 0[\s\S]*activeDecoderOwnerAmbiguous = true/,
   "re-entrant decoder owners are not marked ambiguous");
 assert.match(schedulerScript,
   /state\.recordInlineDecodedPacketScheduled = function\(\) \{\s*if \(state\.activeDecoderOwnerAmbiguous\) return;/,
@@ -368,6 +368,12 @@ assert.deepEqual(modelDecoderScopeLifecycle([
   {type: "discard", owner: "A"},
   {type: "begin", owner: "C"},
 ]), {active: "C", depth: 1, ownerAmbiguous: false});
+assert.deepEqual(modelDecoderScopeLifecycle([
+  {type: "begin", owner: "A"},
+  {type: "begin", owner: "A"},
+  {type: "finish", owner: "A"},
+  {type: "finish", owner: "A"},
+]), {active: 0, depth: 0, ownerAmbiguous: false});
 const flowControlSource = schedulerScript.slice(
   schedulerScript.indexOf("function applyFlowControl(entry)"),
   schedulerScript.indexOf("function compactPending(entry)"),
@@ -1080,6 +1086,51 @@ context.__gaiusSingleplayerWorkers.set(overflowSessionId, {
 context.__gaiusLocalServerPorts.set(overflowSessionId, overflowPort1);
 bridge.open(overflowSocketId, `client-${overflowSessionId}.gaius-local`, 25565);
 const overflowEntry = bridge.channels.get(overflowSocketId);
+// Exercise the actual bridge owner state, not only the pure model above. A nested B scope must
+// force conservative fan-out, and disposing the abandoned A scope must unwind the ambiguity so a
+// fresh C scope can use the O(1) path again. Duplicate/late finishes must not underflow backlog.
+bridge.recordDecodedSlice(socketId, 128);
+bridge.recordDecodedSlice(overflowSocketId, 256);
+assert.equal(bridge.activeDecoderOwnerAmbiguous, true,
+  "nested decoder scopes did not enter fail-closed ambiguity");
+bridge.finishDecodedSlice(overflowSocketId);
+assert.equal(bridge.activeDecoderScopeDepth, 1,
+  "finishing the nested decoder scope lost the outer scope");
+assert.equal(bridge.activeDecoderEntryId, socketId,
+  "finishing the nested decoder scope did not restore the outer owner");
+assert.equal(bridge.activeDecoderOwnerAmbiguous, true,
+  "outer decoder scope incorrectly cleared owner ambiguity");
+bridge.discardInbound(bridge.channels.get(socketId));
+assert.equal(bridge.activeDecoderScopeDepth, 0,
+  "discarding an abandoned decoder scope left stack depth live");
+assert.equal(bridge.activeDecoderEntryId, 0,
+  "discarding an abandoned decoder scope left a stale owner");
+assert.equal(bridge.activeDecoderOwnerAmbiguous, false,
+  "discarding an abandoned decoder scope left ambiguity latched");
+bridge.recordDecodedSlice(overflowSocketId, 96);
+bridge.recordDecodedSlice(overflowSocketId, 192);
+assert.equal(bridge.activeDecoderOwnerAmbiguous, true,
+  "same-owner nested decoder scopes were not treated conservatively");
+bridge.finishDecodedSlice(overflowSocketId);
+assert.equal(bridge.activeDecoderScopeDepth, 1,
+  "same-owner nested finish lost its outer scope");
+assert.equal(bridge.activeDecoderOwnerAmbiguous, true,
+  "same-owner nested finish cleared ambiguity before the outer scope ended");
+bridge.finishDecodedSlice(overflowSocketId);
+assert.equal(bridge.activeDecoderScopeDepth, 0,
+  "same-owner decoder scopes did not fully unwind");
+assert.equal(bridge.activeDecoderOwnerAmbiguous, false,
+  "same-owner decoder ambiguity remained latched after unwind");
+bridge.recordDecodedSlice(overflowSocketId, 512);
+assert.equal(bridge.activeDecoderOwnerAmbiguous, false,
+  "fresh decoder scope could not recover O(1) ownership");
+const overflowBacklogBeforeDuplicateFinish = overflowEntry.decodedSliceBacklog;
+bridge.finishDecodedSlice(overflowSocketId);
+bridge.finishDecodedSlice(overflowSocketId);
+assert.equal(overflowEntry.decodedSliceBacklog,
+  Math.max(0, overflowBacklogBeforeDuplicateFinish - 1),
+  "duplicate decoder finish underflowed the per-channel backlog");
+bridge.discardInbound(overflowEntry);
 const decoderHardLimitBytes = 16 * 1024 * 1024;
 overflowEntry.decoderCumulationBytes = decoderHardLimitBytes;
 stats.decoderCumulationBytes += decoderHardLimitBytes;

@@ -3521,8 +3521,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 state.stats.maxDecoderCumulationBytes,
                 state.stats.decoderCumulationBytes
               );
-              if (state.activeDecoderEntryId &&
-                  state.activeDecoderEntryId !== entry.id) {
+              if (state.activeDecoderScopeDepth > 0) {
                 state.activeDecoderOwnerAmbiguous = true;
               }
               pushDecoderScope(entry.id, byteLength);
