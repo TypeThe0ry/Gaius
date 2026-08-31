@@ -400,6 +400,30 @@ public final class BrowserSingleplayerClient {
                 }
                 return snapshot;
               };
+              // BrowserWebSocketChannel keeps the global pump aggregate in the
+              // Worker heartbeat as a fixed side-band object. Do not route it
+              // through the generic 64-key scalar copier: that cap is useful
+              // for arbitrary stats but would silently drop pumpAll* fields.
+              const globalPumpTelemetryKeys = [
+                'pumpAllTurns',
+                'pumpAllChannelsVisited',
+                'pumpAllBudgetYields',
+                'pumpAllMaxTurnMillis',
+                'pumpAllMaxChannelsPerTurn',
+                'pumpAllLastTurnMillis',
+                'pumpAllLastChannelsVisited',
+              ];
+              const copyGlobalPumpTelemetry = function(value) {
+                const snapshot = {};
+                for (let keyIndex = 0; keyIndex < globalPumpTelemetryKeys.length; keyIndex++) {
+                  const key = globalPumpTelemetryKeys[keyIndex];
+                  const current = value && typeof value === 'object' ? value[key] : undefined;
+                  snapshot[key] = typeof current === 'number' && Number.isFinite(current)
+                    ? current
+                    : null;
+                }
+                return snapshot;
+              };
               worker.__gaiusTelemetryPending = new Map();
               worker.__gaiusTelemetrySequence = 0;
               worker.__gaiusTelemetrySent = 0;
@@ -428,6 +452,7 @@ public final class BrowserSingleplayerClient {
               worker.__gaiusTelemetryLastPongAt = 0;
               worker.__gaiusTelemetryChunkPriority = {};
               worker.__gaiusTelemetryNetwork = {};
+              worker.__gaiusTelemetryGlobalPump = {};
               worker.__gaiusTelemetryWorldgen = {};
               worker.__gaiusTelemetryStorage = {};
               const telemetryPercentile = function(histogram, count, fraction) {
@@ -493,6 +518,9 @@ public final class BrowserSingleplayerClient {
                   worker.__gaiusTelemetryChunkPriority
                 );
                 state.network = copyScalarTelemetry(worker.__gaiusTelemetryNetwork);
+                state.globalPump = copyGlobalPumpTelemetry(
+                  worker.__gaiusTelemetryGlobalPump
+                );
                 state.worldgen = copyScalarTelemetry(worker.__gaiusTelemetryWorldgen);
                 state.storage = copyScalarTelemetry(worker.__gaiusTelemetryStorage);
                 state.updatedAt = Date.now();
@@ -520,6 +548,7 @@ public final class BrowserSingleplayerClient {
                 worker.__gaiusTelemetryLastPongAt = Date.now();
                 worker.__gaiusTelemetryChunkPriority = {};
                 worker.__gaiusTelemetryNetwork = {};
+                worker.__gaiusTelemetryGlobalPump = {};
                 worker.__gaiusTelemetryWorldgen = {};
                 worker.__gaiusTelemetryStorage = {};
                 publishWorkerTelemetry();
@@ -640,6 +669,9 @@ public final class BrowserSingleplayerClient {
                   message.chunkPriority
                 );
                 worker.__gaiusTelemetryNetwork = copyScalarTelemetry(message.network);
+                worker.__gaiusTelemetryGlobalPump = copyGlobalPumpTelemetry(
+                  message.globalPump
+                );
                 worker.__gaiusTelemetryWorldgen = copyScalarTelemetry(message.worldgen);
                 worker.__gaiusTelemetryStorage = copyScalarTelemetry(message.storage);
                 publishWorkerTelemetry();

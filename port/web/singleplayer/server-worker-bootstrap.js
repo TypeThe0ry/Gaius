@@ -268,6 +268,19 @@ const networkTelemetryCounterKeys = Object.freeze([
   "integratedServerTaskBudgetExhaustions", "integratedServerTaskDeferredRetries",
   "integratedServerTaskRetryExhaustions",
 ]);
+// Global pump counters are populated by BrowserWebSocketChannel.pumpAll* and
+// live after the 64-key scalar network snapshot. Keep this list deliberately
+// fixed and shallow so the aggregate cannot be dropped when the network stats
+// object grows with additional transport diagnostics.
+const globalPumpTelemetryKeys = Object.freeze([
+  "pumpAllTurns",
+  "pumpAllChannelsVisited",
+  "pumpAllBudgetYields",
+  "pumpAllMaxTurnMillis",
+  "pumpAllMaxChannelsPerTurn",
+  "pumpAllLastTurnMillis",
+  "pumpAllLastChannelsVisited",
+]);
 const storageTelemetryCounterKeys = Object.freeze([
   "evictions", "cacheHits", "cacheMisses", "rejectedWrites", "writeErrors",
   "migratedRegions", "opfsFullWrites", "opfsFullWriteBytes", "opfsPatchWrites",
@@ -313,6 +326,25 @@ function snapshotScalarTelemetry(value, priorityKeys = []) {
     }
   }
   return snapshot;
+}
+
+function snapshotGlobalPumpTelemetry(value) {
+  const snapshot = Object.create(null);
+  for (const key of globalPumpTelemetryKeys) {
+    const current = value && typeof value === "object" ? value[key] : undefined;
+    snapshot[key] = typeof current === "number" && Number.isFinite(current)
+      ? current
+      : null;
+  }
+  return snapshot;
+}
+
+function globalPumpTelemetrySource() {
+  const bridge = root.__gaiusNettyBridge;
+  const bridgeStats = bridge && bridge.stats;
+  return bridgeStats && typeof bridgeStats === "object"
+    ? bridgeStats
+    : root.__gaiusNetworkStats;
 }
 
 function snapshotMeasurementTelemetry(value, baseline, priorityKeys, counterKeys) {
@@ -790,6 +822,11 @@ function handleControlMessage(event) {
         networkTelemetryPriorityKeys,
         networkTelemetryCounterKeys,
       ),
+      // Keep the bounded global-pump aggregate outside the capped scalar
+      // network object. These values are intentionally raw (not measurement
+      // deltas): turns/yields are cumulative process diagnostics while the
+      // max/last fields are gauges. Missing fields stay explicit nulls.
+      globalPump: snapshotGlobalPumpTelemetry(globalPumpTelemetrySource()),
       worldgen: snapshotScalarTelemetry(root.__gaiusWorldgenStats),
       storage: snapshotMeasurementTelemetry(
         storageStats,
