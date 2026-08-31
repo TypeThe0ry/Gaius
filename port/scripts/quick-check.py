@@ -2080,6 +2080,30 @@ def check_source_patches() -> None:
     browser_aes_cfb8 = BROWSER_AES_CFB8.read_text(errors="replace") if BROWSER_AES_CFB8.exists() else ""
     browser_http_proxy = BROWSER_HTTP_PROXY.read_text(errors="replace") if BROWSER_HTTP_PROXY.exists() else ""
     browser_client_network = BROWSER_CLIENT_NETWORK.read_text(errors="replace") if BROWSER_CLIENT_NETWORK.exists() else ""
+    browser_client_transport_start = browser_client_network.find(
+        "private static boolean pumpInbound()"
+    )
+    browser_client_frame_start = browser_client_network.find(
+        "public static void beginClientPacketFrame()"
+    )
+    browser_client_boundary_start = browser_client_network.find(
+        "public static void processClientPacketsAtScheduledFrameBoundary("
+    )
+    browser_client_js_start = browser_client_network.find(
+        '@JSBody(params = "callback"'
+    )
+    browser_client_transport_pump = (
+        browser_client_network[browser_client_transport_start:browser_client_frame_start]
+        if browser_client_transport_start >= 0
+        and browser_client_frame_start > browser_client_transport_start
+        else ""
+    )
+    browser_client_packet_boundary = (
+        browser_client_network[browser_client_boundary_start:browser_client_js_start]
+        if browser_client_boundary_start >= 0
+        and browser_client_js_start > browser_client_boundary_start
+        else ""
+    )
     browser_multiplayer_recovery = (
         BROWSER_MULTIPLAYER_RECOVERY.read_text(errors="replace")
         if BROWSER_MULTIPLAYER_RECOVERY.exists()
@@ -3438,9 +3462,10 @@ def check_source_patches() -> None:
             and "const control = {type: 'connect'" in netty_browser_channel
             and "copyBytes(ByteBuf buffer, int index, int length)" in netty_browser_channel
             and "pipeline.fireChannelRead(Unpooled.wrappedBuffer(bytes))" in netty_browser_channel
-            and "MAX_CHUNKS_PER_PUMP = 16" in netty_browser_channel
-            and "MAX_BYTES_PER_PUMP = 1024 * 1024" in netty_browser_channel
+            and "MAX_CHUNKS_PER_PUMP = 64" in netty_browser_channel
+            and "MAX_BYTES_PER_PUMP = 256 * 1024" in netty_browser_channel
             and "MAX_MILLIS_PER_PUMP = 2.0" in netty_browser_channel
+            and "const maximumInboundSliceBytes = 4 * 1024" in netty_browser_channel
             and "private boolean pumping;" in netty_browser_channel
             and "if (!open || pumping)" in netty_browser_channel
             and "pumping = true" in netty_browser_channel
@@ -3448,6 +3473,16 @@ def check_source_patches() -> None:
             and "bytesPumped < MAX_BYTES_PER_PUMP" in netty_browser_channel
             and "monotonicMillis() - pumpStarted >= MAX_MILLIS_PER_PUMP" in netty_browser_channel
             and "recordPump(" in netty_browser_channel
+            and "shouldBlockInboundSliceAdmission(entry)" in netty_browser_channel
+            and "state.exactPacketQueuePaused ||" in netty_browser_channel
+            and "workDepth(entry) > decodedSliceLowWatermark" in netty_browser_channel
+            and "if (shouldBlockInboundSliceAdmission(entry)) return;"
+                in netty_browser_channel
+            and "queuedPacketHandleSamples: 0" in netty_browser_channel
+            and "maxQueuedPacketHandleMillis: 0" in netty_browser_channel
+            and "slowQueuedPacketEvents: []" in netty_browser_channel
+            and "maximumSlowQueuedPacketEvents = 64" in netty_browser_channel
+            and "slowQueuedPacketThresholdMillis = 50" in netty_browser_channel
             and "ConcurrentHashMap" not in netty_browser_channel
             and "AtomicInteger" not in netty_browser_channel
             and "Collections.newSetFromMap" not in netty_browser_channel,
@@ -3460,9 +3495,15 @@ def check_source_patches() -> None:
             and "const maximumWebSocketBufferedBytes = 4 * 1024 * 1024" in netty_browser_channel
             and "const maximumOutboundQueueBytes = 16 * 1024 * 1024" in netty_browser_channel
             and "const maximumLocalBatchBytes = 16 * 1024" in netty_browser_channel
-            and "function requestFlush(entry, delayMillis)" in netty_browser_channel
+            and "function requestFlush(entry, delayMillis, continuation)" in netty_browser_channel
             and "entry.outboundFlushScheduled" in netty_browser_channel
-            and "entry.outboundFlushHandle = setTimeout(function()" in netty_browser_channel
+            and "const outboundContinuationScheduler" in netty_browser_channel
+            and "channel.port2.postMessage(0)" in netty_browser_channel
+            and "entry.outboundFlushKind = 'message-channel'" in netty_browser_channel
+            and "state.stats.outboundMessageChannelFlushes++" in netty_browser_channel
+            and "state.stats.outboundMessageChannelCallbacks++" in netty_browser_channel
+            and "requestFlush(entry, 0, true)" in netty_browser_channel
+            and "entry.outboundFlushHandle = setTimeout(run, delay)" in netty_browser_channel
             and "state.stats.localFlushes += localFlushBatches" in netty_browser_channel
             and "state.stats.localFlushFrames += localFlushFrames" in netty_browser_channel
             and "state.stats.localReceivedFrames++" in netty_browser_channel
@@ -3471,8 +3512,8 @@ def check_source_patches() -> None:
             and "const batch = new Uint8Array(localBatchBytes);" in netty_browser_channel
             and "batch.set(part, offset);" in netty_browser_channel
             and "entry.localPort.postMessage(batch.buffer, [batch.buffer])" in netty_browser_channel
-            and "setInboundPaused(entry, true)" in netty_browser_channel
-            and "setInboundPaused(entry, false)" in netty_browser_channel
+            and "state.setInboundPaused(entry, true, reason, depth, bytes)" in netty_browser_channel
+            and "state.setInboundPaused(entry, false, null, depth, bytes)" in netty_browser_channel
             and "{type: 'flow', paused: !!paused}" in netty_browser_channel
             and "webSocketBlocked(entry.ws)" in netty_browser_channel
             and "flush(entry);" in netty_browser_channel
@@ -3483,6 +3524,20 @@ def check_source_patches() -> None:
             and "peakInboundQueuedBytes" in netty_browser_channel
             and "peakPumpMillis" in netty_browser_channel
             and "deferredPumps" in netty_browser_channel,
+        ),
+        (
+            "Browser Netty flow control cannot deadlock on a partial inline packet",
+            "recordInlineDecodedPacket" in netty_browser_channel
+            and '"recordInlineDecodedPacket"' in client_patcher
+            and "decoderCumulationBytes >= decoderCumulationPauseBytes"
+                not in netty_browser_channel
+            and "decoderCumulationBytes <= maximumInboundSliceBytes"
+                not in netty_browser_channel
+            and "Browser decoder cumulation exceeded 16 MiB" in netty_browser_channel
+            and "Pausing the only TCP source until that tail shrinks is a self-deadlock"
+                in netty_browser_channel
+            and "shouldBlockInboundSliceAdmission(entry)" in netty_browser_channel
+            and "state.exactPacketQueuePaused ||" in netty_browser_channel,
         ),
         (
             "Browser Netty registration and connect complete before blocking client waits",
@@ -5459,26 +5514,93 @@ def check_source_patches() -> None:
             and "method.instructions.insert(code)" not in run_tick_state_section,
         ),
         (
-            "Minecraft patcher pumps browser channels without duplicating vanilla packet queue work",
-            "browserPackets.add(pumpBrowserChannels())" in client_patcher
+            "Minecraft patcher begins packet accounting and pumps raw browser channels before tick work",
+            "browserPackets.add(beginClientPacketFrame)" in client_patcher
+            and "browserPackets.add(installClientNetwork)" in client_patcher
+            and "browserPackets.add(pumpClientChannels)" in client_patcher
+            and "nextOpcode(beginClientPacketFrame) != installClientNetwork"
+            in client_patcher
+            and "nextOpcode(installClientNetwork) != pumpClientChannels"
+            in client_patcher
             and "private static InsnList processQueuedPacketsDuringBrowserTick()" not in client_patcher
             and "Minecraft browser channel pump hook point was not found" in client_patcher,
         ),
         (
-            "Browser transport callbacks never enter Java packet handlers directly",
+            "Browser transport callbacks schedule a bounded independent Java decode turn",
             "BrowserClientNetwork" in client_patcher
             and "bridge.inboundPump" in browser_client_network
-            and "installed = installInboundPump();" in browser_client_network
-            and "setTimeout(function()" not in browser_client_network
-            and "callback();" not in browser_client_network
-            and "BrowserWebSocketChannel" not in browser_client_network
+            and "BrowserClientNetwork::pumpInbound" in browser_client_network
+            and "installInboundPump(BrowserPumpCallback callback)"
+            in browser_client_network
+            and "clientPacketDrainCallback()" not in browser_client_network
+            and "new MessageChannel()" in browser_client_network
+            and "finish('watchdog')" in browser_client_network
+            and "pumpAllAndReportProgress()" in browser_client_network
+            and "BrowserWebSocketChannel.hasPumpableInput()" in browser_client_network
+            and "processQueuedPackets" not in browser_client_transport_pump
             and "public static void pumpNow()" not in browser_client_network
-            and "minecraft.packetProcessor().processQueuedPackets()" not in browser_client_network
+            and "public static boolean hasPumpableInput()" in netty_browser_channel
+            and "state.exactPacketQueuePaused" in netty_browser_channel
             and "state.inboundPump()" in netty_browser_channel,
         ),
         (
-            "Client game packets use a bounded batch outside the WebSocket callback",
+            "Client PLAY pressure replaces the one scheduled vanilla FIFO call without external Java re-entry",
+            "bridge.clientPacketDrain" in browser_client_network
+            and "const demand = clientPacketQueueDepth() >= 64"
+            in browser_client_network
+            and "if (bridge.clientPacketDrainDemand) return false"
+            in browser_client_network
+            and "stats.clientPacketDrainDemandSignals++" in browser_client_network
+            and "scheduleClientPacketDrain" not in browser_client_network
+            and "clientPacketDrainCallback()" not in browser_client_network
+            and "globalThis.__gaiusClientPacketDrainEnabled !== true"
+            in browser_client_network
+            and "clientPacketDrainDisabledRequests" in browser_client_network
+            and "bridge.invalidateClientPacketDrain = function(reason)"
+            in browser_client_network
+            and "public static native void invalidateClientPacketDrain(String reason);"
+            in browser_client_network
+            and "processClientPacketsAtScheduledFrameBoundary" in browser_client_network
+            and "queueBefore < 64 || !isClientPacketFrameBoundaryDrainEnabled()"
+            in browser_client_packet_boundary
+            and browser_client_packet_boundary.count(
+                "packetProcessor.processQueuedPackets()"
+            ) == 2
+            and "tryBeginClientPacketDrain(pausedBefore)"
+            in browser_client_packet_boundary
+            and "finally" in browser_client_packet_boundary
+            and "BrowserPacketScheduler.finishClientPacketDrain()"
+            in browser_client_packet_boundary
+            and "scheduledPacketBoundaries != 1" in client_patcher
+            and "method.instructions.set(scheduledPacketBoundary, frameBoundaryWrapper)"
+            in client_patcher
+            and "wrapperCalls != 1 || directPacketProcessorCalls != 0"
+            in client_patcher
+            and "CLIENT_PACKET_DRAIN_TARGET_QUEUE" in browser_packet_scheduler
+            and "CLIENT_PACKET_DRAIN_THRESHOLD - 1" in browser_packet_scheduler
+            and "CLIENT_PACKET_DRAIN_HARD_MAX_PACKETS = 256"
+            in browser_packet_scheduler
+            and "clientPacketDrainRequestedPackets = Math.max("
+            in browser_packet_scheduler
+            and "clientPacketDrainBatchTargetPackets = Math.min("
+            in browser_packet_scheduler
+            and "clientPacketDrainRemainingDebt" in browser_packet_scheduler
+            and "clientPacketDrainStopReason" in browser_packet_scheduler
+            and "CLIENT_PACKET_DRAIN_THRESHOLD = 64" in browser_packet_scheduler
+            and "tryBeginClientPacketDrain(boolean critical)"
+            in browser_packet_scheduler
+            and "clientPacketDrainCritical" in browser_packet_scheduler
+            and "queuedPacketHandleDepth > 0" in browser_packet_scheduler
+            and "clientFramePacketCount == 0" in browser_packet_scheduler
+            and 'BrowserClientNetwork.invalidateClientPacketDrain("packet-processor-reset")'
+            in browser_packet_scheduler
+            and "queuedPackets <= PACKET_QUEUE_LOW_WATERMARK"
+            in browser_packet_scheduler,
+        ),
+        (
+            "Ordinary PLAY packets use a guarded bounded batch outside the WebSocket callback",
             "ClientConfigurationPacketListenerImpl" in client_patcher
+            and "ClientPacketListener" in client_patcher
             and "patchPacketProcessorBrowserSlice" in client_patcher
             and "PacketProcessor browser slice patch point was not found" in client_patcher
             and '"packetsToBeHandled", "Ljava/util/Queue;"' in client_patcher
@@ -5486,12 +5608,25 @@ def check_source_patches() -> None:
             and '"dev/gaius/browser/BrowserPacketScheduler"' in client_patcher
             and '"beginBatch"' in client_patcher
             and '"shouldProcessNext"' in client_patcher
+            and '"beginQueuedPacket"' in client_patcher
+            and '"isProcessingQueuedPacket"' in client_patcher
+            and '"hasPendingPackets"' in client_patcher
+            and "queuedHandleReturn" in client_patcher
             and "MAX_PACKETS_PER_BATCH = 16" in browser_packet_scheduler
             and "MIN_WORKER_PACKETS_PER_BATCH = 4" in browser_packet_scheduler
             and "BrowserIntegratedServerMain.isWorkerServer()" in browser_packet_scheduler
             and "packetsProcessed >= minimumPackets" in browser_packet_scheduler
             and "BATCH_BUDGET_NANOS = 2_000_000L" in browser_packet_scheduler
-            and "System.nanoTime() >= deadlineNanos" in browser_packet_scheduler,
+            and "System.nanoTime() >= deadlineNanos" in browser_packet_scheduler
+            and "private static int queuedPacketHandleDepth" in browser_packet_scheduler
+            and "return queuedPacketHandleDepth > 0" in browser_packet_scheduler
+            and "queuedPacketHandleDepth++" in browser_packet_scheduler
+            and "queuedPacketHandleDepth--" in browser_packet_scheduler
+            and "queuedPacketHandleDepth = 0" in browser_packet_scheduler
+            and "queuedPacketHandleStartedNanos = System.nanoTime()"
+                in browser_packet_scheduler
+            and "elapsedNanos >= 50_000_000L" in browser_packet_scheduler
+            and "handleMillis, handleType" in browser_packet_scheduler,
         ),
         (
             "Browser resource reload scheduler defers multiplayer packets to the normal Java tick",
@@ -5525,8 +5660,17 @@ def check_source_patches() -> None:
             and "delegate.execute(command)" in browser_resource_reload_scheduler,
         ),
         (
-            "Browser resource-pack reloads send configuration keepalives immediately",
+            "Browser common keepalives retire decoder accounting and send immediately",
             "patchClientKeepAliveBrowser" in client_patcher
+            and '"handleKeepAlive"' in client_patcher
+            and '"(Lnet/minecraft/network/protocol/common/ClientboundKeepAlivePacket;)V"'
+                in client_patcher
+            and "keepAliveIdCalls != 1" in client_patcher
+            and "keepAliveConstructors != 1" in client_patcher
+            and "sendWhenCalls != 1" in client_patcher
+            and "packetThreadChecks != 0" in client_patcher
+            and "existingInlineAccountingCalls != 0" in client_patcher
+            and '"recordInlineDecodedPacket"' in client_patcher
             and 'method.name.startsWith("lambda$handleKeepAlive$")' in client_patcher
             and 'method.desc.equals("()Z")' in client_patcher
             and "ClientCommonPacketListenerImpl keepalive predicate was not found" in client_patcher
@@ -5562,13 +5706,19 @@ def check_source_patches() -> None:
             and "resource-pack thread check was not found" in client_patcher,
         ),
         (
-            "Browser resource-pack reloads handle client configuration packets inline",
+            "Browser protocol transitions preserve PLAY FIFO while common-control packets stay inline",
             "patchClientPacketUtilsBrowserInline" in client_patcher
             and '"net/minecraft/network/protocol/PacketUtils.class"' in client_patcher
             and '"PacketUtils client packet scheduler patch point was not found"' in client_patcher
             and '"net/minecraft/client/multiplayer/ClientConfigurationPacketListenerImpl"' in client_patcher
             and '"net/minecraft/network/protocol/game/ClientboundStartConfigurationPacket"' in client_patcher
             and '"net/minecraft/network/protocol/game/ClientboundLoginPacket"' in client_patcher
+            and '"net/minecraft/network/protocol/common/ClientboundResourcePackPushPacket"'
+                in client_patcher
+            and '"net/minecraft/network/protocol/common/ClientboundCustomPayloadPacket"'
+                in client_patcher
+            and '"hasPendingPackets"' in client_patcher
+            and "transitionBacklogCheck" in client_patcher
             and "handleLoginImmediateReadyHooked" in client_patcher
             and "ClientPacketListener immediate player-ready return changed" in client_patcher
             and "vanillaScheduling" in client_patcher,
