@@ -211,6 +211,20 @@ const activeHighWatermarkMillis = (starts, sampledAt) =>
   Math.max(0, sampledAt * starts.length - starts.reduce((sum, start) => sum + start, 0));
 assert.equal(activeHighWatermarkMillis([100, 130], 200), 170,
   "incremental high-watermark duration model is inconsistent");
+assert.match(bridgeScript, /activeDecoderOwnerAmbiguous: false/,
+  "decoder accounting lost its fail-closed owner ambiguity state");
+const decodedSliceOwnershipSource = schedulerScript.slice(
+  schedulerScript.indexOf("state.recordDecodedSliceScheduled = function("),
+  schedulerScript.indexOf("state.recordDecodedPacketQueueScheduled = function("),
+);
+assert.ok(decodedSliceOwnershipSource.length > 0,
+  "decoded slice ownership function was not extracted");
+assert.match(decodedSliceOwnershipSource,
+  /activeDecoderEntryId &&[\s\S]*activeDecoderOwnerAmbiguous = true/,
+  "re-entrant decoder owners are not marked ambiguous");
+assert.match(schedulerScript,
+  /state\.recordInlineDecodedPacketScheduled = function\(\) \{\s*if \(state\.activeDecoderOwnerAmbiguous\) return;/,
+  "inline packet accounting can release cumulation for an ambiguous owner");
 const decodedQueueAccountingSource = schedulerScript.slice(
   schedulerScript.indexOf("state.recordDecodedPacketQueueScheduled = function("),
   schedulerScript.indexOf("state.recordInlineDecodedPacketScheduled = function("),
@@ -224,10 +238,10 @@ assert.match(decodedQueueAccountingSource,
   /if \(exactQueuePauseChanged\) \{\s*state\.channels\.forEach\(function\(entry\)/,
   "exact queue transitions no longer fan out flow-control state to every channel");
 assert.match(decodedQueueAccountingSource,
-  /\} else if \(!processed && queueDepth > 0\) \{[\s\S]*?\n\s*const activeEntry = state\.activeDecoderEntryId[\s\S]*?state\.channels\.get\(state\.activeDecoderEntryId\|0\)/,
+  /\} else if \(!processed && queueDepth > 0\) \{[\s\S]*?\n\s*const activeEntry = !state\.activeDecoderOwnerAmbiguous &&\s*state\.activeDecoderEntryId[\s\S]*?state\.channels\.get\(state\.activeDecoderEntryId\|0\)/,
   "stable queue accounting lost the active-decoder fast path");
 assert.match(decodedQueueAccountingSource,
-  /\} else if \(!processed && queueDepth > 0\) \{[\s\S]*?\n\s*const activeEntry = state\.activeDecoderEntryId[\s\S]*?else \{[\s\S]*?state\.channels\.forEach\(function\(entry\)/,
+  /\} else if \(!processed && queueDepth > 0\) \{[\s\S]*?\n\s*const activeEntry = !state\.activeDecoderOwnerAmbiguous &&\s*state\.activeDecoderEntryId[\s\S]*?else \{[\s\S]*?state\.channels\.forEach\(function\(entry\)/,
   "missing or stale decoder owner does not fail closed to a channel fan-out");
 assert.equal(
   (decodedQueueAccountingSource.match(/state\.channels\.forEach\(function\(entry\)/g) || []).length,
@@ -238,8 +252,8 @@ assert.equal(
 // fan-out semantics explicit: only an exact pause edge is global, while a queued packet's
 // retained decoder cumulation needs one active-entry recheck. Missing/stale owners fall back to
 // the old all-channel behavior because the Java queue callback does not carry a channel ID.
-const decodedQueueFanout = ({pauseChanged, processed, activeDecoder}) => {
-  if (pauseChanged) return "all";
+const decodedQueueFanout = ({pauseChanged, processed, activeDecoder, ownerAmbiguous}) => {
+  if (pauseChanged || ownerAmbiguous) return "all";
   if (processed) return "none";
   return activeDecoder === "A" || activeDecoder === "B" ? "active" : "all";
 };
@@ -248,6 +262,12 @@ assert.equal(decodedQueueFanout({pauseChanged: true, processed: true, activeDeco
 assert.equal(decodedQueueFanout({pauseChanged: false, processed: false, activeDecoder: "A"}), "active");
 assert.equal(decodedQueueFanout({pauseChanged: false, processed: false, activeDecoder: "missing"}), "all");
 assert.equal(decodedQueueFanout({pauseChanged: false, processed: false, activeDecoder: "stale"}), "all");
+assert.equal(decodedQueueFanout({
+  pauseChanged: false,
+  processed: false,
+  activeDecoder: "B",
+  ownerAmbiguous: true,
+}), "all");
 assert.equal(decodedQueueFanout({pauseChanged: false, processed: true, activeDecoder: "A"}), "none");
 
 // Two-channel interleaving model: an owner is O(1) only while its decoder scope is live. A stale
@@ -274,6 +294,9 @@ assert.deepEqual(modelInterleavedQueueFanout([
 ]), ["A", "B"]);
 assert.deepEqual(modelInterleavedQueueFanout([
   {pauseChanged: false, processed: false, activeDecoder: "stale"},
+]), ["A", "B"]);
+assert.deepEqual(modelInterleavedQueueFanout([
+  {pauseChanged: false, processed: false, activeDecoder: "B", ownerAmbiguous: true},
 ]), ["A", "B"]);
 const flowControlSource = schedulerScript.slice(
   schedulerScript.indexOf("function applyFlowControl(entry)"),

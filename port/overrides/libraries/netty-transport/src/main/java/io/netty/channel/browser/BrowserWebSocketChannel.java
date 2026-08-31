@@ -518,6 +518,10 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             relayRegistryPromise: null,
             activeDecoderEntryId: 0,
             activeDecoderSliceBytes: 0,
+            // Queue accounting does not carry a socket id across the Java bridge. If a
+            // re-entrant decoder scope from another channel is observed, owner-specific
+            // O(1) updates are ambiguous and must fall back to the previous all-channel path.
+            activeDecoderOwnerAmbiguous: false,
             // The active high-watermark duration is the sum of each live episode's
             // (sampledAt - startedAt). Keep the count and start-time sum incrementally so
             // packet/slice accounting does not scan every multiplayer channel on each callback.
@@ -3322,6 +3326,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               if (state.activeDecoderEntryId === entry.id) {
                 state.activeDecoderEntryId = 0;
                 state.activeDecoderSliceBytes = 0;
+                state.activeDecoderOwnerAmbiguous = false;
               }
               if (entry.inboundSliceHandle !== null) {
                 if (entry.inboundSliceUsesRaf &&
@@ -3441,6 +3446,10 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 state.stats.maxDecoderCumulationBytes,
                 state.stats.decoderCumulationBytes
               );
+              if (state.activeDecoderEntryId &&
+                  state.activeDecoderEntryId !== entry.id) {
+                state.activeDecoderOwnerAmbiguous = true;
+              }
               state.activeDecoderEntryId = entry.id;
               state.activeDecoderSliceBytes = byteLength;
               applyFlowControl(entry);
@@ -3458,6 +3467,13 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               if (state.activeDecoderEntryId === entry.id) {
                 state.activeDecoderEntryId = 0;
                 state.activeDecoderSliceBytes = 0;
+              } else if (state.activeDecoderOwnerAmbiguous) {
+                // A mismatched finish proves that the single global owner slot can no longer
+                // identify the callback's channel. Clear the slot and retain fail-closed mode
+                // until this scope has unwound; never release another channel's cumulation.
+                state.activeDecoderEntryId = 0;
+                state.activeDecoderSliceBytes = 0;
+                state.activeDecoderOwnerAmbiguous = false;
               }
               applyFlowControl(entry);
               scheduleSlices(entry, false);
@@ -3514,7 +3530,8 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                     }
                   }
                 }
-              } else if (queueDepth > 0 && state.activeDecoderEntryId) {
+              } else if (queueDepth > 0 && state.activeDecoderEntryId &&
+                  !state.activeDecoderOwnerAmbiguous) {
                 const entry = state.channels.get(state.activeDecoderEntryId|0);
                 if (entry && !entry.disposed) {
                   // The decoder may have left the tail of the active slice for the next packet.
@@ -3540,7 +3557,8 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                   scheduleSlices(entry, false);
                 });
               } else if (!processed && queueDepth > 0) {
-                const activeEntry = state.activeDecoderEntryId
+                const activeEntry = !state.activeDecoderOwnerAmbiguous &&
+                    state.activeDecoderEntryId
                   ? state.channels.get(state.activeDecoderEntryId|0)
                   : null;
                 if (activeEntry && !activeEntry.disposed) {
@@ -3559,6 +3577,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               refreshHighWatermark();
             };
             state.recordInlineDecodedPacketScheduled = function() {
+              if (state.activeDecoderOwnerAmbiguous) return;
               const entry = state.channels.get(state.activeDecoderEntryId|0);
               if (!entry || entry.disposed) return;
               // A browser-inline handler proves that at least one complete packet was
