@@ -200,6 +200,92 @@ class SchedulerModel {
     }
 }
 
+// Candidate bounded owner-claim model for the first fail-closed product step.
+// This intentionally does not pretend to implement per-processor accounting:
+// one owner may feed many channels, while a second owner disables the shared
+// accounting lanes and ignores foreign events until a fresh runtime is made.
+class OwnerClaimModel {
+    constructor() {
+        this.owner = null;
+        this.generation = 0;
+        this.ownerConflict = false;
+        this.accountingValid = true;
+        this.adaptiveDrainEnabled = true;
+        this.exactPacketQueuePaused = false;
+        this.queuedPackets = 0;
+        this.foreignPacketQueued = 0;
+        this.foreignPacketProcessed = 0;
+        this.foreignResets = 0;
+        this.staleGenerationEvents = 0;
+    }
+
+    claim(owner) {
+        if (owner === null || owner === undefined) {
+            this.ownerConflict = true;
+            this.accountingValid = false;
+            this.adaptiveDrainEnabled = false;
+            this.exactPacketQueuePaused = false;
+            return false;
+        }
+        if (this.owner === null) {
+            this.owner = owner;
+            this.generation = this.generation === Number.MAX_SAFE_INTEGER
+                ? 1 : this.generation + 1;
+            return true;
+        }
+        if (this.owner === owner && !this.ownerConflict) return true;
+        this.ownerConflict = true;
+        this.accountingValid = false;
+        this.adaptiveDrainEnabled = false;
+        // A stale global pause must not block the other channels after the
+        // unsupported topology is detected. The real bridge must perform the
+        // equivalent exact-pause invalidation.
+        this.exactPacketQueuePaused = false;
+        return false;
+    }
+
+    queue(owner, count) {
+        assert.ok(Number.isInteger(count) && count >= 0);
+        if (!this.claim(owner)) {
+            this.foreignPacketQueued += count;
+            return false;
+        }
+        this.queuedPackets += count;
+        return true;
+    }
+
+    process(owner, count) {
+        assert.ok(Number.isInteger(count) && count >= 0);
+        if (!this.claim(owner)) {
+            this.foreignPacketProcessed += count;
+            return 0;
+        }
+        const processed = Math.min(count, this.queuedPackets);
+        this.queuedPackets -= processed;
+        return processed;
+    }
+
+    reset(owner, reason) {
+        if (owner !== this.owner || this.ownerConflict || !this.accountingValid) {
+            this.foreignResets++;
+            this.lastForeignResetReason = reason;
+            return false;
+        }
+        this.queuedPackets = 0;
+        this.exactPacketQueuePaused = false;
+        this.lastResetReason = reason;
+        return true;
+    }
+
+    acceptGeneration(generation) {
+        if (generation !== this.generation || this.ownerConflict) {
+            this.staleGenerationEvents++;
+            return false;
+        }
+        return true;
+    }
+}
+
 class PacketProcessorModel {
     constructor(name, scheduler) {
         this.name = name;
@@ -389,9 +475,67 @@ function testActiveDrainCloseRace() {
     };
 }
 
+function testBoundedOwnerClaimFailClosed() {
+    const scheduler = new OwnerClaimModel();
+    const processorA = "processor-A";
+    const processorB = "processor-B";
+
+    // One PacketProcessor may legitimately receive multiple browser channels.
+    assert.equal(scheduler.queue(processorA, 70), true);
+    assert.equal(scheduler.queue(processorA, 2), true);
+    const singleOwnerGeneration = scheduler.generation;
+    assert.equal(scheduler.ownerConflict, false);
+    assert.equal(scheduler.accountingValid, true);
+    assert.equal(scheduler.queuedPackets, 72);
+
+    // A second owner permanently invalidates the shared accounting lanes for
+    // this runtime. No foreign event is allowed to alter A's queue state.
+    assert.equal(scheduler.claim(processorB), false);
+    assert.equal(scheduler.ownerConflict, true);
+    assert.equal(scheduler.accountingValid, false);
+    assert.equal(scheduler.adaptiveDrainEnabled, false);
+    assert.equal(scheduler.exactPacketQueuePaused, false);
+
+    // Required race order: A queue -> B bind -> A close -> B queue/process.
+    assert.equal(scheduler.reset(processorA, "processor-A:close"), false);
+    assert.equal(scheduler.queuedPackets, 72);
+    assert.equal(scheduler.queue(processorB, 3), false);
+    assert.equal(scheduler.process(processorB, 3), 0);
+    assert.equal(scheduler.queuedPackets, 72);
+    assert.equal(scheduler.foreignResets, 1);
+    assert.equal(scheduler.foreignPacketQueued, 3);
+    assert.equal(scheduler.foreignPacketProcessed, 3);
+
+    // A callback from the pre-conflict generation is stale and must not revive
+    // accounting or alter the current generation state.
+    assert.equal(scheduler.acceptGeneration(singleOwnerGeneration), false);
+    assert.equal(scheduler.staleGenerationEvents, 1);
+
+    return {
+        topology: "bounded-owner-claim-fail-closed",
+        owner: scheduler.owner,
+        ownerGeneration: singleOwnerGeneration,
+        processorOwnersObserved: 2,
+        ownerConflict: scheduler.ownerConflict,
+        accountingValid: scheduler.accountingValid,
+        adaptiveDrainEnabled: scheduler.adaptiveDrainEnabled,
+        exactPacketQueuePaused: scheduler.exactPacketQueuePaused,
+        queueAfterForeignEvents: scheduler.queuedPackets,
+        foreignPacketQueued: scheduler.foreignPacketQueued,
+        foreignPacketProcessed: scheduler.foreignPacketProcessed,
+        foreignResets: scheduler.foreignResets,
+        staleGenerationEvents: scheduler.staleGenerationEvents,
+        foreignEventsIgnored: scheduler.foreignPacketQueued === 3 &&
+            scheduler.foreignPacketProcessed === 3,
+        closeForeignResetDidNotClearOwner: scheduler.queuedPackets === 72,
+        classification: "candidate-fail-closed-model-not-runtime-proof",
+    };
+}
+
 const supported = testSupportedSingleRuntime();
 const concurrent = testUnsupportedConcurrentProcessors();
 const activeRace = testActiveDrainCloseRace();
+const boundedOwnerClaim = testBoundedOwnerClaimFailClosed();
 
 const staticContract = {
     schedulerGlobalFields,
@@ -418,10 +562,19 @@ const result = {
         supportedSingleRuntime: supported,
         unsupportedConcurrentProcessors: concurrent,
         activeDrainCloseRace: activeRace,
+        boundedOwnerClaimFailClosed: boundedOwnerClaim,
     },
     gates: {
         supportedChannelCloseDoesNotResetAccounting: supported.isolation,
         supportedReconnectRetainsLiveProcessorAccounting: supported.queuedAfterReconnect === 130,
+        boundedOwnerClaimFailClosed:
+            boundedOwnerClaim.ownerConflict === true &&
+            boundedOwnerClaim.accountingValid === false &&
+            boundedOwnerClaim.adaptiveDrainEnabled === false &&
+            boundedOwnerClaim.exactPacketQueuePaused === false &&
+            boundedOwnerClaim.foreignEventsIgnored === true &&
+            boundedOwnerClaim.closeForeignResetDidNotClearOwner === true &&
+            boundedOwnerClaim.staleGenerationEvents === 1,
         unsupportedConcurrentProcessorIsolation: false,
         activeDrainConcurrentProcessorIsolation: false,
         publicRelayRuntimeProof: false,
@@ -431,6 +584,7 @@ const result = {
             "existing Java hook accounting is runtime-static and reset is tied to PacketProcessor.close",
             "BrowserWebSocketChannel.doClose retires only its channel/socket",
             "supported one-processor runtime model preserves B after A channel close and reconnect",
+            "bounded owner-claim model disables shared accounting on a second owner and ignores foreign/reset/stale-generation events",
             "Node relay/channel close tests are separate from Java PacketProcessor evidence",
         ],
         knownRisk: [
