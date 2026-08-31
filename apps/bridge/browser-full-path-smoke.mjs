@@ -3209,27 +3209,44 @@ class BrowserMinecraftClient {
         );
         const decodeMillis = arrivalDelta(decodeStartAt, decodeEndAt, clock);
         const decodeToDispatchMillis = arrivalDelta(decodeEndAt, dispatchAt, clock);
-        const segmentValues = [
-            ["onmessage-to-bridge-dequeue", onmessageToDequeueMillis],
-            ["poll-to-bridge-dequeue", pollToBridgeDequeueMillis],
-            ["poll-to-decode", pollToDecodeMillis],
-            ["decode", decodeMillis],
-            ["decode-to-dispatch", decodeToDispatchMillis],
-        ];
-        const triggerSegments = segmentValues
-            .filter(([, value]) => Number.isFinite(value) &&
-                value >= ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS)
-            .map(([name]) => name);
-        if ((!Number.isFinite(decodedGapMillis) ||
-            decodedGapMillis < ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS) &&
-            triggerSegments.length === 0) {
+        let triggerMask = 0;
+        let slowTriggerMillis = Number.isFinite(decodedGapMillis)
+            ? decodedGapMillis : 0;
+        if (Number.isFinite(onmessageToDequeueMillis) &&
+            onmessageToDequeueMillis >= ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS) {
+            triggerMask |= 1;
+            slowTriggerMillis = Math.max(slowTriggerMillis, onmessageToDequeueMillis);
+        }
+        if (Number.isFinite(pollToBridgeDequeueMillis) &&
+            pollToBridgeDequeueMillis >= ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS) {
+            triggerMask |= 2;
+            slowTriggerMillis = Math.max(slowTriggerMillis, pollToBridgeDequeueMillis);
+        }
+        if (Number.isFinite(pollToDecodeMillis) &&
+            pollToDecodeMillis >= ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS) {
+            triggerMask |= 4;
+            slowTriggerMillis = Math.max(slowTriggerMillis, pollToDecodeMillis);
+        }
+        if (Number.isFinite(decodeMillis) &&
+            decodeMillis >= ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS) {
+            triggerMask |= 8;
+            slowTriggerMillis = Math.max(slowTriggerMillis, decodeMillis);
+        }
+        if (Number.isFinite(decodeToDispatchMillis) &&
+            decodeToDispatchMillis >= ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS) {
+            triggerMask |= 16;
+            slowTriggerMillis = Math.max(slowTriggerMillis, decodeToDispatchMillis);
+        }
+        if (slowTriggerMillis < ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS) {
             return;
         }
         this.arrivalSlowGapCountTotal++;
-        const slowTriggerMillis = Math.max(
-            Number.isFinite(decodedGapMillis) ? decodedGapMillis : 0,
-            ...segmentValues.map(([, value]) => Number.isFinite(value) ? value : 0),
-        );
+        const triggerSegments = [];
+        if (triggerMask & 1) triggerSegments.push("onmessage-to-bridge-dequeue");
+        if (triggerMask & 2) triggerSegments.push("poll-to-bridge-dequeue");
+        if (triggerMask & 4) triggerSegments.push("poll-to-decode");
+        if (triggerMask & 8) triggerSegments.push("decode");
+        if (triggerMask & 16) triggerSegments.push("decode-to-dispatch");
         const intentional = this.arrivalIntentionalDropPending;
         if (reconnectRecoveryAtDecode === true) {
             this.arrivalFirstDecodedAfterReconnect = true;
