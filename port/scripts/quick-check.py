@@ -8897,7 +8897,7 @@ def check_overlay_bytecode() -> None:
     browser_websocket_channel = run_javap(netty_transport_overlay_cp, "io.netty.channel.browser.BrowserWebSocketChannel")
     browser_websocket_pump = method_section(
         browser_websocket_channel,
-        "private void pump();",
+        "private boolean pump();",
     )
     browser_inline_event_loop = run_javap(
         netty_transport_overlay_cp,
@@ -9435,7 +9435,7 @@ def check_overlay_bytecode() -> None:
             and "protected void doWrite" in browser_websocket_channel
             and "iconst_1" in browser_websocket_pump
             and (
-                "int 1048576" in browser_websocket_pump
+                "int 262144" in browser_websocket_pump
                 and "double 2.0d" in browser_websocket_pump
             )
             and "Field pumping:Z" in browser_websocket_pump
@@ -11103,11 +11103,15 @@ def check_overlay_bytecode() -> None:
             and "iconst_2" not in dynamic_uniforms_constructor,
         ),
         (
-            "Minecraft compiled overlay processes queued packets on every browser tick",
+            "Minecraft compiled overlay invokes the scheduled packet boundary on every browser tick",
             "BrowserWebSocketChannel.pumpAll" in minecraft_run_tick
-            and "PacketProcessor.processQueuedPackets" in minecraft_run_tick
+            and "BrowserClientNetwork.processClientPacketsAtScheduledFrameBoundary"
+                in minecraft_run_tick
+            and "PacketProcessor.processQueuedPackets" not in minecraft_run_tick
             and minecraft_run_tick.find("BrowserWebSocketChannel.pumpAll")
-                < minecraft_run_tick.find("PacketProcessor.processQueuedPackets"),
+                < minecraft_run_tick.find(
+                    "BrowserClientNetwork.processClientPacketsAtScheduledFrameBoundary"
+                ),
         ),
         (
             "Compiled packet queue drains a count- and time-bounded browser batch",
