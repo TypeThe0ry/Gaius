@@ -6379,8 +6379,11 @@ def check_source_patches() -> None:
             and "0xbf7a07e97df9e5c3L" in platform_smoke,
         ),
         (
-            "Client and integrated server pump idle browser packets before each tick",
-            client_patcher.count("browserPackets.add(pumpBrowserChannels())") == 2
+            "Client and integrated server account and pump browser packets before tick work",
+            client_patcher.count("browserPackets.add(beginClientPacketFrame)") == 1
+                and client_patcher.count("browserPackets.add(installClientNetwork)") == 1
+                and client_patcher.count("browserPackets.add(pumpClientChannels)") == 1
+                and client_patcher.count("browserPackets.add(pumpBrowserChannels())") == 1
                 and 'method.name.equals("processPacketsAndTick")' in client_patcher
             and "patchedRunServerTickYield" in client_patcher
             and "method.instructions.insert(instruction, browserWorldgenCheckpoint())"
