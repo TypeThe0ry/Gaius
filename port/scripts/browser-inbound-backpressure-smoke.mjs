@@ -185,6 +185,32 @@ assert.match(schedulerScript, /startedAtMillis: startedAtMillis,/);
 assert.match(schedulerScript, /endedAtMillis: endedAtMillis,/);
 assert.doesNotMatch(schedulerScript,
   /^\s*(?:sequence|startedAtMillis|endedAtMillis),\s*$/m);
+const highWatermarkSource = schedulerScript.slice(
+  schedulerScript.indexOf("function refreshHighWatermark()"),
+  schedulerScript.indexOf("function hasActiveChannels()"),
+);
+assert.ok(highWatermarkSource.length > 0,
+  "high-watermark accounting function was not extracted");
+assert.match(highWatermarkSource, /activeHighWatermarkStartCount/,
+  "high-watermark accounting lost its active-episode count");
+assert.match(highWatermarkSource, /activeHighWatermarkStartSumMillis/,
+  "high-watermark accounting lost its start-time accumulator");
+assert.match(highWatermarkSource, /sampledAt \* activeCount - startSum/,
+  "active high-watermark duration is not calculated from O(1) accumulators");
+assert.doesNotMatch(highWatermarkSource, /state\.channels\.forEach/,
+  "high-watermark refresh reverted to an O(N) channel scan");
+assert.match(schedulerScript,
+  /state\.activeHighWatermarkStartCount = Math\.min\([\s\S]*?\+ 1\s*\)/,
+  "high-watermark start does not update the active-episode count");
+assert.match(schedulerScript,
+  /state\.activeHighWatermarkStartCount = Math\.max\([\s\S]*?- 1\s*\)/,
+  "high-watermark finish does not update the active-episode count");
+// Keep the algebra explicit: two concurrent episodes started at 100 and 130 have 170 ms of
+// summed active duration at t=200, without needing to inspect either channel object.
+const activeHighWatermarkMillis = (starts, sampledAt) =>
+  Math.max(0, sampledAt * starts.length - starts.reduce((sum, start) => sum + start, 0));
+assert.equal(activeHighWatermarkMillis([100, 130], 200), 170,
+  "incremental high-watermark duration model is inconsistent");
 const decodedQueueAccountingSource = schedulerScript.slice(
   schedulerScript.indexOf("state.recordDecodedPacketQueueScheduled = function("),
   schedulerScript.indexOf("state.recordInlineDecodedPacketScheduled = function("),

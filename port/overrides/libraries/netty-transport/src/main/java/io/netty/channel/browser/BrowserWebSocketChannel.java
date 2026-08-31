@@ -518,6 +518,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             relayRegistryPromise: null,
             activeDecoderEntryId: 0,
             activeDecoderSliceBytes: 0,
+            // The active high-watermark duration is the sum of each live episode's
+            // (sampledAt - startedAt). Keep the count and start-time sum incrementally so
+            // packet/slice accounting does not scan every multiplayer channel on each callback.
+            activeHighWatermarkStartCount: 0,
+            activeHighWatermarkStartSumMillis: 0,
             exactPacketQueuePaused: false,
             gapProbeTimer: 0,
             gapProbeExpectedAt: 0,
@@ -2999,14 +3004,15 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             }
             function refreshHighWatermark() {
               const sampledAt = now();
-              let activeMillis = 0;
-              state.channels.forEach(function(entry) {
-                const episode = entry.highWatermarkEpisode;
-                if (episode && episode.startedAtMillis >= 0) {
-                  activeMillis += Math.max(0, sampledAt - episode.startedAtMillis);
-                }
-              });
-              state.stats.activeHighWatermarkMillis = activeMillis;
+              const activeCount = Math.max(
+                0,
+                Math.floor(Number(state.activeHighWatermarkStartCount) || 0)
+              );
+              const startSum = Number(state.activeHighWatermarkStartSumMillis);
+              state.stats.activeHighWatermarkMillis = activeCount > 0 &&
+                  Number.isFinite(startSum)
+                ? Math.max(0, sampledAt * activeCount - startSum)
+                : 0;
             }
             function boundedCount(value) {
               return Math.max(0, Math.floor(Number(value) || 0));
@@ -3039,6 +3045,12 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 startExactPacketQueuePaused: !!state.exactPacketQueuePaused
               };
               entry.highWatermarkStartedAt = startedAtMillis;
+              state.activeHighWatermarkStartCount = Math.min(
+                Number.MAX_SAFE_INTEGER,
+                (Number(state.activeHighWatermarkStartCount) || 0) + 1
+              );
+              state.activeHighWatermarkStartSumMillis =
+                (Number(state.activeHighWatermarkStartSumMillis) || 0) + startedAtMillis;
               state.stats.activeHighWatermarks++;
               refreshHighWatermark();
             };
@@ -3077,6 +3089,17 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               };
               entry.highWatermarkEpisode = null;
               entry.highWatermarkStartedAt = 0;
+              const startedAt = Number(episode.startedAtMillis);
+              state.activeHighWatermarkStartCount = Math.max(
+                0,
+                (Number(state.activeHighWatermarkStartCount) || 0) - 1
+              );
+              if (Number.isFinite(startedAt) && startedAt >= 0) {
+                state.activeHighWatermarkStartSumMillis = Math.max(
+                  0,
+                  (Number(state.activeHighWatermarkStartSumMillis) || 0) - startedAt
+                );
+              }
               state.stats.activeHighWatermarks = Math.max(
                 0,
                 state.stats.activeHighWatermarks - 1
