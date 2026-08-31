@@ -185,6 +185,70 @@ assert.match(schedulerScript, /startedAtMillis: startedAtMillis,/);
 assert.match(schedulerScript, /endedAtMillis: endedAtMillis,/);
 assert.doesNotMatch(schedulerScript,
   /^\s*(?:sequence|startedAtMillis|endedAtMillis),\s*$/m);
+const decodedQueueAccountingSource = schedulerScript.slice(
+  schedulerScript.indexOf("state.recordDecodedPacketQueueScheduled = function("),
+  schedulerScript.indexOf("state.recordInlineDecodedPacketScheduled = function("),
+);
+assert.ok(decodedQueueAccountingSource.length > 0,
+  "decoded queue accounting function was not extracted");
+assert.match(decodedQueueAccountingSource,
+  /const exactQueuePauseChanged =\s*wasPaused !== state\.exactPacketQueuePaused;/,
+  "decoded queue accounting lost its exact-pause transition edge");
+assert.match(decodedQueueAccountingSource,
+  /if \(exactQueuePauseChanged\) \{\s*state\.channels\.forEach\(function\(entry\)/,
+  "exact queue transitions no longer fan out flow-control state to every channel");
+assert.match(decodedQueueAccountingSource,
+  /\} else if \(!processed && queueDepth > 0\) \{[\s\S]*?\n\s*const activeEntry = state\.activeDecoderEntryId[\s\S]*?state\.channels\.get\(state\.activeDecoderEntryId\|0\)/,
+  "stable queue accounting lost the active-decoder fast path");
+assert.match(decodedQueueAccountingSource,
+  /\} else if \(!processed && queueDepth > 0\) \{[\s\S]*?\n\s*const activeEntry = state\.activeDecoderEntryId[\s\S]*?else \{[\s\S]*?state\.channels\.forEach\(function\(entry\)/,
+  "missing or stale decoder owner does not fail closed to a channel fan-out");
+assert.equal(
+  (decodedQueueAccountingSource.match(/state\.channels\.forEach\(function\(entry\)/g) || []).length,
+  2,
+  "decoded queue updates must retain only edge fan-out plus fail-closed owner fallback",
+);
+// The source gate above protects the generated JS shape; this model keeps the intended
+// fan-out semantics explicit: only an exact pause edge is global, while a queued packet's
+// retained decoder cumulation needs one active-entry recheck. Missing/stale owners fall back to
+// the old all-channel behavior because the Java queue callback does not carry a channel ID.
+const decodedQueueFanout = ({pauseChanged, processed, activeDecoder}) => {
+  if (pauseChanged) return "all";
+  if (processed) return "none";
+  return activeDecoder === "A" || activeDecoder === "B" ? "active" : "all";
+};
+assert.equal(decodedQueueFanout({pauseChanged: true, processed: false, activeDecoder: "A"}), "all");
+assert.equal(decodedQueueFanout({pauseChanged: true, processed: true, activeDecoder: "missing"}), "all");
+assert.equal(decodedQueueFanout({pauseChanged: false, processed: false, activeDecoder: "A"}), "active");
+assert.equal(decodedQueueFanout({pauseChanged: false, processed: false, activeDecoder: "missing"}), "all");
+assert.equal(decodedQueueFanout({pauseChanged: false, processed: false, activeDecoder: "stale"}), "all");
+assert.equal(decodedQueueFanout({pauseChanged: false, processed: true, activeDecoder: "A"}), "none");
+
+// Two-channel interleaving model: an owner is O(1) only while its decoder scope is live. A stale
+// or missing global active ID must conservatively revisit both channels so no pending input is
+// stranded by the owner-less Java callback.
+function modelInterleavedQueueFanout(events) {
+  const scheduled = new Set();
+  for (const event of events) {
+    const fanout = decodedQueueFanout(event);
+    if (fanout === "all") {
+      for (const channel of ["A", "B"]) scheduled.add(channel);
+    } else if (fanout === "active") {
+      scheduled.add(event.activeDecoder);
+    }
+  }
+  return [...scheduled].sort();
+}
+assert.deepEqual(modelInterleavedQueueFanout([
+  {pauseChanged: false, processed: false, activeDecoder: "A"},
+  {pauseChanged: false, processed: false, activeDecoder: "B"},
+]), ["A", "B"]);
+assert.deepEqual(modelInterleavedQueueFanout([
+  {pauseChanged: false, processed: false, activeDecoder: "missing"},
+]), ["A", "B"]);
+assert.deepEqual(modelInterleavedQueueFanout([
+  {pauseChanged: false, processed: false, activeDecoder: "stale"},
+]), ["A", "B"]);
 const flowControlSource = schedulerScript.slice(
   schedulerScript.indexOf("function applyFlowControl(entry)"),
   schedulerScript.indexOf("function compactPending(entry)"),

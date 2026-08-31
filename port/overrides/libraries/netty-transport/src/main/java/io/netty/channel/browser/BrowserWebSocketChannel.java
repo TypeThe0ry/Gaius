@@ -3444,6 +3444,8 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               const queueDepth = Math.max(0, Number(depth) || 0);
               const wasPaused = state.exactPacketQueuePaused;
               state.exactPacketQueuePaused = !!paused;
+              const exactQueuePauseChanged =
+                wasPaused !== state.exactPacketQueuePaused;
               state.stats.decodedPacketQueue = queueDepth;
               state.stats.maxDecodedPacketQueue = Math.max(
                 state.stats.maxDecodedPacketQueue,
@@ -3503,10 +3505,34 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 // PacketProcessor boundary. It never schedules or executes a PLAY handler here.
                 state.clientPacketDrain();
               }
-              state.channels.forEach(function(entry) {
-                applyFlowControl(entry);
-                scheduleSlices(entry, false);
-              });
+              // Queue accounting runs for every decoded packet.  In the normal unpaused path the
+              // global exact-queue state did not change, so walking every multiplayer channel
+              // here is pure O(N) overhead.  A queue transition still fans out to all channels so
+              // an exact high-watermark edge pauses/resumes every decoder.  When a packet was
+              // just queued, only the active decoder's cumulation changed; re-evaluate that one
+              // entry and leave unrelated channels alone until their own event or a global edge.
+              if (exactQueuePauseChanged) {
+                state.channels.forEach(function(entry) {
+                  applyFlowControl(entry);
+                  scheduleSlices(entry, false);
+                });
+              } else if (!processed && queueDepth > 0) {
+                const activeEntry = state.activeDecoderEntryId
+                  ? state.channels.get(state.activeDecoderEntryId|0)
+                  : null;
+                if (activeEntry && !activeEntry.disposed) {
+                  applyFlowControl(activeEntry);
+                  scheduleSlices(activeEntry, false);
+                } else {
+                  // Queue accounting has no channel owner in the Java bridge. If the active
+                  // decoder scope was cleared or became stale, preserve the previous correctness
+                  // contract instead of silently starving a different channel's pending input.
+                  state.channels.forEach(function(entry) {
+                    applyFlowControl(entry);
+                    scheduleSlices(entry, false);
+                  });
+                }
+              }
               refreshHighWatermark();
             };
             state.recordInlineDecodedPacketScheduled = function() {
