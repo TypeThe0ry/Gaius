@@ -130,8 +130,8 @@ assert.match(clientPacketBoundaryMethodSource,
   /queueBefore < 64 \|\| !isClientPacketFrameBoundaryDrainEnabled\(\)/,
   "below-threshold PLAY work no longer preserves the one vanilla scheduled call");
 assert.match(clientPacketBoundaryMethodSource,
-  /tryBeginClientPacketDrain\(pausedBefore\)[\s\S]*packetProcessor\.processQueuedPackets\(\)[\s\S]*finally[\s\S]*finishClientPacketDrain\(\)/,
-  "pressure PLAY work is not claimed/released at the scheduled runTick boundary");
+  /tryBeginClientPacketDrain\(packetProcessor, pausedBefore\)[\s\S]*packetProcessor\.processQueuedPackets\(\)[\s\S]*finally[\s\S]*finishClientPacketDrain\(packetProcessor\)/,
+  "pressure PLAY work is not owner-claimed/released at the scheduled runTick boundary");
 assert.equal(
   (clientPacketBoundaryMethodSource.match(/packetProcessor\.processQueuedPackets\(\)/g) || [])
     .length,
