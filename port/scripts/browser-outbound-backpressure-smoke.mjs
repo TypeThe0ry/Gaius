@@ -19,7 +19,12 @@ function jsBodyBefore(marker) {
   const scriptEnd = source.lastIndexOf('""")', markerOffset);
   assert.ok(markerOffset > 0 && annotationOffset > 0 && scriptEnd > scriptOffset,
     `JSBody could not be extracted for ${marker}`);
-  return source.slice(scriptOffset, scriptEnd).replaceAll("\\\\", "\\");
+  const body = source.slice(scriptOffset, scriptEnd).replaceAll("\\\\", "\\");
+  if (marker === "private static native void initBridge();") {
+    return "{\n" + body + "\n}\n{\n" +
+      jsBodyBefore("private static native void initBridgeTail();") + "\n}";
+  }
+  return body;
 }
 
 const bridgeScript = jsBodyBefore("private static native void initBridge();");
@@ -30,11 +35,20 @@ assert.match(source, /maximumOutboundFramesPerTurn = 32/);
 assert.match(source, /maximumOutboundBytesPerTurn = 256 \* 1024/);
 assert.match(source, /maximumOutboundMillisPerTurn = 2/);
 assert.match(source, /webSocketBackpressureRetryMs = 4/);
-assert.doesNotMatch(
-  outboundSchedulerScript,
-  /queueMicrotask/,
-  "outbound continuation must not use a microtask",
-);
+assert.match(outboundSchedulerScript, /queueMicrotask\(run\)/,
+  "initial outbound flush must avoid the zero-delay timer clamp");
+assert.match(outboundSchedulerScript, /requestFlush\(entry, 0, true\)/,
+  "budget continuation must retain a macrotask boundary");
+assert.match(outboundSchedulerScript, /const outboundContinuationScheduler/,
+  "budget continuation must have a low-latency MessageChannel scheduler");
+assert.match(outboundSchedulerScript, /channel\.port2\.postMessage\(0\)/,
+  "MessageChannel continuation must post a separate browser task");
+assert.match(outboundSchedulerScript, /outboundMessageChannelCallbacks\+\+/,
+  "MessageChannel continuation execution must remain observable");
+assert.match(outboundSchedulerScript, /!hasFlushableOutbound\(entry\)/,
+  "idle inbound polling must not manufacture empty outbound turns");
+assert.match(outboundSchedulerScript, /outboundFlushGeneration/,
+  "microtask cancellation must be generation guarded");
 
 function delay(millis) {
   return new Promise((resolve) => setTimeout(resolve, millis));
@@ -48,7 +62,7 @@ async function waitFor(predicate, label, timeoutMillis = 3000) {
   }
 }
 
-function createContext(WebSocketImpl, localPorts = new Map()) {
+function createContext(WebSocketImpl, localPorts = new Map(), localWorkers = new Map()) {
   const context = {
     AbortController,
     Array,
@@ -83,10 +97,12 @@ function createContext(WebSocketImpl, localPorts = new Map()) {
       search: "",
     },
     performance,
+    MessageChannel,
     queueMicrotask,
     setTimeout,
     WebSocket: WebSocketImpl,
     __gaiusLocalServerPorts: localPorts,
+    __gaiusSingleplayerWorkers: localWorkers,
   };
   context.globalThis = context;
   context.window = context;
@@ -116,7 +132,18 @@ async function runLocalMessagePortSmoke() {
   const sessionId = "6123456789abcdef0123456789abcdef";
   const socketId = 101;
   const {port1, port2} = new MessageChannel();
-  const context = createContext(UnexpectedWebSocket, new Map([[sessionId, port1]]));
+  const launchGeneration = "1";
+  port1.__gaiusLaunchGeneration = launchGeneration;
+  const localWorker = {
+    __gaiusTerminal: false,
+    __gaiusLaunchGeneration: launchGeneration,
+    __gaiusClientPort: port1,
+  };
+  const context = createContext(
+    UnexpectedWebSocket,
+    new Map([[sessionId, port1]]),
+    new Map([[sessionId, localWorker]]),
+  );
   const bridge = context.__gaiusNettyBridge;
   const stats = context.__gaiusNetworkStats;
   const received = [];
@@ -158,7 +185,7 @@ async function runLocalMessagePortSmoke() {
   expected.set(largeFrame, frameCount * frameBytes);
   assert.equal(bridge.send(socketId, largeFrame), true);
   assert.equal(stats.outboundTurns, turnsBeforeSend,
-    "local send ran synchronously instead of scheduling a macrotask");
+    "local send ran synchronously instead of scheduling an asynchronous flush");
   await delay(20);
   assert.equal(received.length, 0, "remote flow pause did not stop local data sends");
   assert.equal(entry.queuedBytes, expected.byteLength, "paused local queue lost bytes");
@@ -183,6 +210,14 @@ async function runLocalMessagePortSmoke() {
   assertBounded(stats, "local MessagePort");
   assert.equal(stats.maxOutboundTurnBytes, stats.outboundByteLimit,
     "oversized local write was not segmented at the strict turn byte limit");
+
+  const turnsBeforeIdlePolls = stats.outboundTurns;
+  for (let index = 0; index < 32; index++) {
+    assert.equal(bridge.pollInbound(socketId), null);
+    await delay(1);
+  }
+  assert.equal(stats.outboundTurns, turnsBeforeIdlePolls,
+    "idle inbound polling scheduled empty outbound callbacks");
 
   bridge.close(socketId);
   await waitFor(() => controls.some((message) => message && message.type === "close"),
@@ -256,8 +291,58 @@ async function runWebSocketSmoke() {
   socket.bufferedAmount = 0;
   await waitFor(() => entry.connected, "fake WebSocket connection");
 
+  const immediateProbe = new Uint8Array([0x26, 0x02, 0x77, 0x06]);
+  const turnsBeforeImmediateProbe = stats.outboundTurns;
+  const immediateFlushesBeforeProbe = stats.outboundImmediateFlushes;
+  assert.equal(bridge.send(socketId, immediateProbe), true);
+  assert.equal(stats.outboundTurns, turnsBeforeImmediateProbe,
+    "WebSocket send flushed synchronously");
+  await Promise.resolve();
+  assert.equal(stats.outboundTurns, turnsBeforeImmediateProbe + 1,
+    "initial WebSocket flush did not run in the first microtask checkpoint");
+  assert.equal(stats.outboundImmediateFlushes, immediateFlushesBeforeProbe + 1,
+    "initial WebSocket flush was not classified as immediate");
+  assert.equal(entry.queuedBytes, 0, "initial microtask did not drain a small write");
+  assert.deepEqual(socket.data.at(-1), immediateProbe,
+    "initial microtask changed WebSocket payload bytes");
+  socket.data = [];
+
+  const continuationFrameCount = 40;
+  const continuationFrameBytes = 4096;
+  const continuationMacrotasksBeforeBurst = stats.outboundContinuationMacrotasks;
+  const messageChannelFlushesBeforeBurst = stats.outboundMessageChannelFlushes;
+  for (let frameIndex = 0; frameIndex < continuationFrameCount; frameIndex++) {
+    const frame = new Uint8Array(continuationFrameBytes);
+    frame.fill((0x80 + frameIndex) & 0xff);
+    assert.equal(bridge.send(socketId, frame), true);
+  }
+  await Promise.resolve();
+  assert.equal(socket.data.length, stats.outboundFrameLimit,
+    "initial microtask did not stop at the strict frame budget");
+  assert.equal(entry.queuedFrames,
+    continuationFrameCount - stats.outboundFrameLimit,
+    "initial microtask did not retain the budget remainder");
+  assert.equal(stats.outboundContinuationMacrotasks,
+    continuationMacrotasksBeforeBurst + 1,
+    "budget remainder did not schedule exactly one macrotask continuation");
+  assert.equal(stats.outboundMessageChannelFlushes,
+    messageChannelFlushesBeforeBurst + 1,
+    "budget remainder did not use the low-latency MessageChannel continuation");
+  assert.equal(stats.outboundContinuationTimers, 0,
+    "non-backpressured budget continuation regressed to a clamped timer");
+  await Promise.resolve();
+  assert.equal(entry.queuedFrames,
+    continuationFrameCount - stats.outboundFrameLimit,
+    "budget continuation formed a microtask chain");
+  await waitFor(() => entry.queuedBytes === 0,
+    "non-backpressured MessageChannel continuation drain");
+  assert.equal(socket.data.length, continuationFrameCount,
+    "MessageChannel continuation lost WebSocket frames");
+  socket.data = [];
+
   socket.bufferedAmount = 4 * 1024 * 1024;
   const waitsBeforeData = stats.webSocketBackpressureWaits;
+  const turnsBeforeBurst = stats.outboundTurns;
   const frameCount = 80;
   const frameBytes = 4096;
   for (let frameIndex = 0; frameIndex < frameCount; frameIndex++) {
@@ -265,6 +350,13 @@ async function runWebSocketSmoke() {
     frame.fill(frameIndex & 0xff);
     assert.equal(bridge.send(socketId, frame), true);
   }
+  assert.equal(stats.outboundTurns, turnsBeforeBurst,
+    "burst send flushed synchronously");
+  await Promise.resolve();
+  assert.equal(stats.outboundTurns, turnsBeforeBurst + 1,
+    "burst did not execute exactly one initial microtask turn");
+  assert.equal(entry.queuedFrames, frameCount,
+    "backpressured initial microtask consumed queued frames");
   await waitFor(() => stats.webSocketBackpressureWaits > waitsBeforeData,
     "WebSocket data backpressure wait");
   assert.ok(stats.webSocketBackpressureWaits > waitsBeforeData,
@@ -285,8 +377,33 @@ async function runWebSocketSmoke() {
   assert.ok(stats.outboundYields >= 2, "WebSocket burst did not yield across macrotasks");
   assert.ok(stats.webSocketSends >= frameCount + 1,
     "WebSocket send telemetry omitted control or data frames");
+  assert.ok(stats.outboundContinuationMacrotasks >= 2,
+    "WebSocket burst continuation did not yield through macrotasks");
+  assert.ok(stats.outboundMessageChannelFlushes >= 2,
+    "WebSocket burst continuation did not use MessageChannel tasks");
+  assert.equal(stats.outboundContinuationTimers, 0,
+    "budget continuations unexpectedly used clamped timers");
+  assert.ok(stats.outboundTimerFlushes > 0,
+    "WebSocket backpressure did not use a timer retry");
+  assert.equal(stats.outboundFlushWaitSamples,
+    stats.outboundImmediateFlushes + stats.outboundTimerFlushes +
+      stats.outboundMessageChannelCallbacks,
+    "outbound flush wait accounting lost a scheduled callback");
   assertBounded(stats, "WebSocket");
+
+  const sentBeforeCloseRace = socket.data.length;
+  assert.equal(bridge.send(socketId, new Uint8Array([0xde, 0xad, 0xbe, 0xef])), true);
+  assert.equal(entry.outboundFlushKind, "microtask",
+    "close-race fixture did not have a pending initial microtask");
+  const generationBeforeClose = entry.outboundFlushGeneration;
   bridge.close(socketId);
+  await Promise.resolve();
+  assert.ok(entry.outboundFlushGeneration > generationBeforeClose,
+    "close did not invalidate the pending microtask generation");
+  assert.equal(entry.outboundFlushScheduled, false,
+    "stale close-race microtask remained scheduled");
+  assert.equal(socket.data.length, sentBeforeCloseRace,
+    "stale close-race microtask sent payload bytes after close");
   return {
     turns: stats.outboundTurns,
     yields: stats.outboundYields,
