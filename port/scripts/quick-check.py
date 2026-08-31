@@ -3742,7 +3742,11 @@ def check_source_patches() -> None:
         ),
         (
             "RelayNode keeps disabled tunnel tracing off the multiplayer packet hot path",
-            re.search(
+            'const traceTunnel = process.env.GAIUS_TRACE_TUNNEL === "1";' in bridge_main
+            and 'const relayFrameTimelineEnabled = process.env.GAIUS_RELAY_FRAME_TIMELINE === "1";' in bridge_main
+            and "relayFrameTimelinePerTunnelLimit = 64" in bridge_main
+            and "relayFrameTimelineGlobalLimit = 256" in bridge_main
+            and re.search(
                 r'if \(traceTunnel\) \{\s+traceTunnelEvent\(\s+'
                 r'`server data .*?toString\("hex"\)',
                 bridge_main,
@@ -3755,12 +3759,9 @@ def check_source_patches() -> None:
                 re.DOTALL,
             ) is not None
             and bridge_main.count('if (traceTunnel && protocolPhase === "play")') == 2
-            and re.search(
-                r'if \(traceTunnel\) \{\s+traceTunnelEvent\(\s+'
-                r'`proxied .*?response\.toString\("hex"\)',
-                bridge_main,
-                re.DOTALL,
-            ) is not None,
+            and "proxied ${keepAlivePhase} keepalive" in bridge_main
+            and 'response.toString("hex")' not in bridge_main
+            and "relayFrameTimelineSnapshot" in bridge_main,
         ),
         (
             "RelayNode arms stall-tick timers only for framed PLAY tunnels",
@@ -3784,7 +3785,7 @@ def check_source_patches() -> None:
             and "const clientFrameBuffer = new MinecraftFrameAccumulator(config.maximumFrameBytes)"
             in bridge_main
             and "appendClientFrameBuffer(frameClientData)" in bridge_main
-            and "while (clientFrameBuffer.byteLength > 0)" in bridge_main
+            and "while (packetFramingEnabled && clientFrameBuffer.byteLength > 0" in bridge_main
             and 'let protocolPhase = "login"' in bridge_main
             and "minecraftProfile.play.clientboundStartConfiguration" in bridge_main
             and "server started PLAY to CONFIGURATION transition" in bridge_main
