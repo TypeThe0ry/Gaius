@@ -25,6 +25,7 @@ import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.zip.DataFormatException;
 import java.util.zip.Deflater;
 import java.util.zip.Inflater;
 import java.util.zip.ZipEntry;
@@ -451,24 +452,171 @@ public final class PlatformSmoke {
                     compressedLength += written;
                 }
 
-                ByteBuffer compressedBuffer = ByteBuffer.wrap(compressed, 0, compressedLength);
-                ByteBuffer output = ByteBuffer.allocate(input.length);
-                inflater.setInput(compressedBuffer);
-                int inflated = inflater.inflate(output);
-                if (inflated != input.length
-                        || output.position() != input.length
-                        || !Arrays.equals(input, output.array())) {
+                byte[] baseline = inflateNetworkArrayBaseline(
+                        compressed,
+                        compressedLength,
+                        input.length);
+                byte[] actual;
+                if (round == 0) {
+                    actual = inflateNetworkHeapSlices(
+                            inflater,
+                            compressed,
+                            compressedLength,
+                            input.length);
+                } else {
+                    actual = inflateNetworkDirectBuffers(
+                            inflater,
+                            compressed,
+                            compressedLength,
+                            input.length);
+                }
+                if (!Arrays.equals(input, baseline) || !Arrays.equals(baseline, actual)) {
                     throw new AssertionError(
-                            "Browser network compression round-trip mismatch in round " + round);
+                            "Browser network ByteBuffer output diverged from the JVM byte-array "
+                                    + "baseline in round " + round);
                 }
 
                 deflater.reset();
                 inflater.reset();
             }
+
+            Inflater malformedInflater = new Inflater();
+            try {
+                byte[] malformedBacking = new byte[12];
+                int malformedOffset = 5;
+                Arrays.fill(malformedBacking, malformedOffset, malformedOffset + 6, (byte) 0);
+                ByteBuffer malformedRoot = ByteBuffer.wrap(malformedBacking);
+                malformedRoot.position(3);
+                malformedRoot.limit(11);
+                ByteBuffer malformedInput = malformedRoot.slice();
+                malformedInput.position(2);
+                malformedInput.limit(8);
+                malformedInflater.setInput(malformedInput);
+                if (malformedInput.position() != malformedInput.limit()) {
+                    throw new AssertionError("Malformed heap input did not advance to its limit");
+                }
+
+                ByteBuffer malformedOutput = ByteBuffer.allocate(32);
+                malformedOutput.position(7);
+                int outputStart = malformedOutput.position();
+                try {
+                    malformedInflater.inflate(malformedOutput);
+                    throw new AssertionError("Malformed browser network stream was accepted");
+                } catch (DataFormatException expected) {
+                    if (malformedOutput.position() != outputStart) {
+                        throw new AssertionError(
+                                "Malformed inflate advanced output without producing bytes");
+                    }
+                }
+            } finally {
+                malformedInflater.end();
+            }
         } finally {
             deflater.end();
             inflater.end();
         }
+    }
+
+    private static byte[] inflateNetworkArrayBaseline(
+            byte[] compressed,
+            int compressedLength,
+            int expectedLength) throws Exception {
+        Inflater baselineInflater = new Inflater();
+        try {
+            baselineInflater.setInput(compressed, 0, compressedLength);
+            byte[] output = new byte[expectedLength];
+            int inflated = baselineInflater.inflate(output, 0, output.length);
+            if (inflated != expectedLength) {
+                throw new AssertionError(
+                        "JVM byte-array inflater baseline length mismatch: "
+                                + inflated + " != " + expectedLength);
+            }
+            return output;
+        } finally {
+            baselineInflater.end();
+        }
+    }
+
+    private static byte[] inflateNetworkHeapSlices(
+            Inflater inflater,
+            byte[] compressed,
+            int compressedLength,
+            int expectedLength) throws Exception {
+        int inputRootOffset = 3;
+        int inputPosition = 2;
+        byte[] inputBacking = new byte[inputRootOffset + inputPosition + compressedLength + 4];
+        System.arraycopy(
+                compressed,
+                0,
+                inputBacking,
+                inputRootOffset + inputPosition,
+                compressedLength);
+        ByteBuffer inputRoot = ByteBuffer.wrap(inputBacking);
+        inputRoot.position(inputRootOffset);
+        inputRoot.limit(inputBacking.length - 4);
+        ByteBuffer compressedBuffer = inputRoot.slice();
+        compressedBuffer.position(inputPosition);
+        compressedBuffer.limit(inputPosition + compressedLength);
+        int compressedLimit = compressedBuffer.limit();
+        inflater.setInput(compressedBuffer);
+        if (compressedBuffer.position() != compressedLimit) {
+            throw new AssertionError("Heap sliced input did not advance to its limit");
+        }
+
+        int outputRootOffset = 4;
+        int outputPosition = 7;
+        byte[] outputBacking = new byte[outputRootOffset + outputPosition + expectedLength + 5];
+        ByteBuffer outputRoot = ByteBuffer.wrap(outputBacking);
+        outputRoot.position(outputRootOffset);
+        outputRoot.limit(outputBacking.length - 5);
+        ByteBuffer output = outputRoot.slice();
+        output.position(outputPosition);
+        output.limit(outputPosition + expectedLength);
+        int inflated = inflater.inflate(output);
+        if (inflated != expectedLength || output.position() != outputPosition + inflated) {
+            throw new AssertionError(
+                    "Heap sliced output position/count mismatch: "
+                            + output.position() + "/" + inflated);
+        }
+        int outputOffset = output.arrayOffset() + outputPosition;
+        return Arrays.copyOfRange(outputBacking, outputOffset, outputOffset + inflated);
+    }
+
+    private static byte[] inflateNetworkDirectBuffers(
+            Inflater inflater,
+            byte[] compressed,
+            int compressedLength,
+            int expectedLength) throws Exception {
+        int inputPosition = 5;
+        ByteBuffer compressedBuffer = ByteBuffer.allocateDirect(
+                inputPosition + compressedLength + 3);
+        compressedBuffer.position(inputPosition);
+        compressedBuffer.put(compressed, 0, compressedLength);
+        compressedBuffer.limit(inputPosition + compressedLength);
+        compressedBuffer.position(inputPosition);
+        int compressedLimit = compressedBuffer.limit();
+        inflater.setInput(compressedBuffer);
+        if (compressedBuffer.position() != compressedLimit) {
+            throw new AssertionError("Direct input fallback did not advance to its limit");
+        }
+
+        int outputPosition = 6;
+        ByteBuffer output = ByteBuffer.allocateDirect(outputPosition + expectedLength + 3);
+        output.position(outputPosition);
+        output.limit(outputPosition + expectedLength);
+        int inflated = inflater.inflate(output);
+        if (inflated != expectedLength || output.position() != outputPosition + inflated) {
+            throw new AssertionError(
+                    "Direct output fallback position/count mismatch: "
+                            + output.position() + "/" + inflated);
+        }
+
+        byte[] actual = new byte[inflated];
+        ByteBuffer verification = output.duplicate();
+        verification.position(outputPosition);
+        verification.limit(outputPosition + inflated);
+        verification.get(actual);
+        return actual;
     }
 
     private static void testNetworkPackedLongs() {
