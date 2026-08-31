@@ -18,6 +18,7 @@ public final class BrowserClientNetwork {
         if (installed) {
             return;
         }
+        configureClientPacketDrain();
         // Minecraft starts ticking before the first browser socket constructs its bridge.
         // Keep retrying from runTick until that bridge is available instead of permanently
         // missing the callback for a later multiplayer connection.
@@ -711,6 +712,33 @@ public final class BrowserClientNetwork {
             return true;
             """)
     private static native boolean installInboundPump(BrowserPumpCallback callback);
+
+    /**
+     * Enables the bounded client-tick packet drain only through an explicit page opt-in.
+     *
+     * <p>Keeping the default unset preserves the vanilla sixteen-packet path for existing pages,
+     * while a release URL can opt into the pressure drain without injecting test-only globals.
+     * A harness or embedding page that already supplied a boolean value always wins.</p>
+     */
+    @JSBody(script = """
+            if (typeof globalThis.__gaiusClientPacketDrainEnabled === 'boolean') return;
+            if (typeof URLSearchParams !== 'function' ||
+                typeof location === 'undefined') return;
+            let value = null;
+            try {
+              const params = new URLSearchParams(location.search || '');
+              value = params.get('gaiusClientPacketDrain');
+              if (value === null) value = params.get('clientPacketDrain');
+            } catch (ignored) {}
+            if (value === null) return;
+            const normalized = String(value).trim().toLowerCase();
+            if (normalized === '1' || normalized === 'true' || normalized === 'on') {
+              globalThis.__gaiusClientPacketDrainEnabled = true;
+            } else if (normalized === '0' || normalized === 'false' || normalized === 'off') {
+              globalThis.__gaiusClientPacketDrainEnabled = false;
+            }
+            """)
+    private static native void configureClientPacketDrain();
 
     @JSBody(script = """
             return globalThis.__gaiusClientPacketDrainEnabled === true;

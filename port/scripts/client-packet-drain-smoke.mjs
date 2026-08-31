@@ -152,6 +152,19 @@ assert.match(networkSource,
   /installInboundPump\(BrowserClientNetwork::pumpInbound\)/,
   "BrowserClientNetwork.install no longer supplies exactly the raw transport callback");
 assert.match(networkSource,
+  /configureClientPacketDrain\(\);[\s\S]*installInboundPump\(BrowserClientNetwork::pumpInbound\)/,
+  "client packet drain opt-in is not resolved before the raw pump is installed");
+const drainOptInScript = jsBodyBefore(
+  networkSource,
+  "private static native void configureClientPacketDrain();");
+new vm.Script(`(function() {${drainOptInScript}\n})`);
+assert.match(drainOptInScript,
+  /gaiusClientPacketDrain[\s\S]*URLSearchParams[\s\S]*__gaiusClientPacketDrainEnabled/,
+  "client packet drain lost its explicit URL opt-in parser");
+assert.match(drainOptInScript,
+  /typeof globalThis\.__gaiusClientPacketDrainEnabled === 'boolean'/,
+  "an embedding-provided drain boolean must remain authoritative");
+assert.match(networkSource,
   /private static native boolean installInboundPump\(BrowserPumpCallback callback\);/);
 assert.doesNotMatch(networkSource,
   /\bclientPacketDrainCallback\s*\(|\bscheduleClientPacketDrain\s*\(/,
