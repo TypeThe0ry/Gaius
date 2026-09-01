@@ -289,6 +289,7 @@ function createClient(id, bridge, stats) {
     const client = {
         id,
         connected: false,
+        initialSent: false,
         closedEarly: false,
         failure: undefined,
         buffer: Buffer.alloc(0),
@@ -314,8 +315,11 @@ function createClient(id, bridge, stats) {
         return accepted;
     };
     client.sendInitial = () => {
+        if (client.initialSent) return false;
+        client.initialSent = true;
         client.statusSentAt = performance.now();
         client.send(Buffer.concat([encodeStatusHandshake(), encodeStatusRequest()]));
+        return true;
     };
     client.sendPing = () => {
         if (client.closed || client.stopPinging || !bridge.channels.has(id) ||
@@ -440,6 +444,7 @@ async function waitForTargetBaseline(baselineManifest, label) {
 }
 
 let lastExternalResult;
+let lastExternalDiagnostics;
 
 async function main() {
     const { bridge, stats } = installBridge();
@@ -450,19 +455,91 @@ async function main() {
     // lost before the post-response manifest read.
     let peakObservedTargetActive = Number(baselineManifest.target?.activeConnections ?? 0);
     let peakObservedTargetManifest = baselineManifest;
-    let targetPollInFlight = false;
-    const targetPollTimer = setInterval(() => {
-        if (targetPollInFlight) return;
-        targetPollInFlight = true;
-        fetchManifest()
+    // STATUS is terminal for many Minecraft proxies: the target TCP stream can
+    // close before the 25ms polling interval observes the connection.  Sample
+    // the manifest at the exact relay-connected edge as well as on the bounded
+    // poller, otherwise a healthy short-lived connection is misclassified as
+    // a missing concurrency peak.
+    const targetManifestSamples = [];
+    const targetEdgeObservationLog = [];
+    const targetObservationLog = [];
+    const recordTargetObservation = (source, manifest, error) => {
+        const observedAtMillis = Number(performance.now().toFixed(3));
+        const keepEdgeObservation = source === "relay-connected-edge" &&
+            targetEdgeObservationLog.length < 32;
+        if (targetObservationLog.length >= 128) {
+            if (keepEdgeObservation) {
+                targetEdgeObservationLog.push({
+                    source,
+                    observedAtMillis,
+                    ...(manifest !== undefined
+                        ? {
+                            activeConnections: Number(manifest.target?.activeConnections ?? 0),
+                            totalConnections: Number(manifest.target?.totalConnections ?? 0),
+                            recentlyReachable: manifest.target?.recentlyReachable === true,
+                        }
+                        : { error: String(error?.message || error || "manifest fetch failed") }),
+                });
+            }
+            return;
+        }
+        if (manifest !== undefined) {
+            const observation = {
+                source,
+                observedAtMillis,
+                activeConnections: Number(manifest.target?.activeConnections ?? 0),
+                totalConnections: Number(manifest.target?.totalConnections ?? 0),
+                recentlyReachable: manifest.target?.recentlyReachable === true,
+            };
+            targetObservationLog.push(observation);
+            if (keepEdgeObservation) {
+                targetEdgeObservationLog.push(observation);
+            }
+        }
+        else {
+            const observation = {
+                source,
+                observedAtMillis,
+                error: String(error?.message || error || "manifest fetch failed"),
+            };
+            targetObservationLog.push(observation);
+            if (keepEdgeObservation) {
+                targetEdgeObservationLog.push(observation);
+            }
+        }
+    };
+    const sampleTargetManifest = () => {
+        const sample = fetchManifest()
             .then((manifest) => {
+                recordTargetObservation("relay-connected-edge", manifest);
                 const active = Number(manifest.target?.activeConnections ?? 0);
                 if (active > peakObservedTargetActive) {
                     peakObservedTargetActive = active;
                     peakObservedTargetManifest = manifest;
                 }
             })
-            .catch(() => {})
+            .catch((error) => {
+                recordTargetObservation("relay-connected-edge", undefined, error);
+            });
+        targetManifestSamples.push(sample);
+        return sample;
+    };
+    let targetPollInFlight = false;
+    const targetPollTimer = setInterval(() => {
+        if (targetPollInFlight) return;
+        targetPollInFlight = true;
+        fetchManifest()
+            .then((manifest) => {
+                recordTargetObservation("25ms-poller", manifest);
+                const active = Number(manifest.target?.activeConnections ?? 0);
+                if (active > peakObservedTargetActive) {
+                    peakObservedTargetActive = active;
+                    peakObservedTargetManifest = manifest;
+                }
+            })
+            .catch((error) => {
+                recordTargetObservation("25ms-poller", undefined, error);
+            })
             .finally(() => {
                 targetPollInFlight = false;
             });
@@ -482,7 +559,7 @@ async function main() {
                 client.consume();
                 if (!client.connected && phaseFor(stats, client.id, "relay-connected")) {
                     client.connected = true;
-                    client.sendInitial();
+                    void sampleTargetManifest();
                 }
                 if (enablePing && !client.closed && client.statusReceivedAt > 0 &&
                     performance.now() >= client.nextPingAt) {
@@ -501,20 +578,63 @@ async function main() {
             "all external RelayNode tunnels", 30000,
             () => ({ phases: stats.connectPhases, failures: clients.map((client) => client.failure) }),
         );
+        // Hold the STATUS request until every relay-connected edge is up. A
+        // Minecraft STATUS stream is terminal after its response, so sending
+        // each request immediately would serialize target leases and make a
+        // real four-tunnel overlap impossible to observe in the manifest.
+        await Promise.all(targetManifestSamples);
+        for (const client of clients) client.sendInitial();
         await waitFor(
             () => clients.every((client) => client.statusResponses >= 1),
             "all external Minecraft status responses", 30000,
             () => clients.map((client) => ({ id: client.id, statusResponses: client.statusResponses,
                 failure: client.failure, bufferBytes: client.buffer.byteLength })),
         );
+        // Let the edge samples settle before deciding whether the terminal
+        // STATUS stream reached the expected concurrency peak.
+        await Promise.all(targetManifestSamples);
         // STATUS ping is a terminal probe for many Minecraft proxies: after
         // returning the pong, the server is allowed to close the STATUS TCP
         // stream. Capture target activity before issuing that probe so a
         // normal status close cannot erase the peak-concurrency evidence.
-        const sampledPeakManifest = peakObservedTargetActive >=
-            Number(baselineManifest.target?.activeConnections ?? 0) + clients.length
-            ? peakObservedTargetManifest
-            : await waitForTargetConnections(baselineManifest, clients.length);
+        const expectedTargetActive =
+            Number(baselineManifest.target?.activeConnections ?? 0) + clients.length;
+        const captureDiagnostics = (stage) => {
+            lastExternalDiagnostics = {
+                stage,
+                target: {
+                    expectedActive: expectedTargetActive,
+                    peakObservedActive: peakObservedTargetActive,
+                    baselineActive: Number(baselineManifest.target?.activeConnections ?? 0),
+                    observations: targetObservationLog.slice(-64),
+                    edgeObservations: targetEdgeObservationLog.slice(-32),
+                },
+                clients: clients.map((client) => ({
+                    id: client.id,
+                    connected: client.connected,
+                    closed: client.closed,
+                    statusResponses: client.statusResponses,
+                    pingSent: client.pingSent,
+                    pingResponses: client.pingResponses,
+                    failure: client.failure,
+                    bufferBytes: client.buffer.byteLength,
+                })),
+                phases: stats.connectPhases.filter((event) =>
+                    clients.some((client) => client.id === event.id)),
+            };
+            return lastExternalDiagnostics;
+        };
+        let sampledPeakManifest;
+        try {
+            sampledPeakManifest = peakObservedTargetActive >= expectedTargetActive
+                ? peakObservedTargetManifest
+                : await waitForTargetConnections(baselineManifest, clients.length);
+        }
+        catch (error) {
+            error.message += `\nTarget concurrency diagnostics: ${JSON.stringify(
+                captureDiagnostics("target-concurrency-gate"), null, 2)}`;
+            throw error;
+        }
         const peakManifest = sampledPeakManifest;
         if (enablePing) {
             await waitFor(
@@ -623,6 +743,16 @@ async function main() {
                 afterSoakTargetActive: targetActive(afterSoakManifest),
                 afterCloseTargetActive: targetActive(afterCloseManifest),
                 peakObservedTargetActive,
+                targetConcurrencyEvidence: {
+                    expectedPeakActive: expectedTargetActive,
+                    observedPeakActive: peakObservedTargetActive,
+                    observations: targetObservationLog.slice(-64),
+                    edgeObservations: targetEdgeObservationLog.slice(-32),
+                    recentlyReachableObserved: targetObservationLog.some((sample) =>
+                        sample.recentlyReachable === true),
+                    peakTotalConnections: targetObservationLog.reduce((peak, sample) =>
+                        Math.max(peak, Number(sample.totalConnections ?? 0)), 0),
+                },
                 targetAttestationFailures: stats.relayTargetAttestationFailures,
                 dnsCache: {
                     baseline: dnsCacheBaseline,
@@ -767,6 +897,7 @@ catch (error) {
             browser: lastExternalResult.browser,
             gate: lastExternalResult.gate,
         },
+        diagnostics: lastExternalDiagnostics,
         error: String(error?.stack || error),
     }));
     process.exitCode = 1;

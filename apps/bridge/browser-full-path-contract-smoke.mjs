@@ -1500,6 +1500,13 @@ assert.match(externalMultiplayerSource, /function relayRuntimeSnapshot\(manifest
 assert.match(externalMultiplayerSource, /runtimeTelemetry/);
 assert.match(externalMultiplayerSource, /dnsLookupsShared/);
 assert.match(externalMultiplayerSource, /minimumSharedDnsLookups/);
+assert.match(externalMultiplayerSource, /Hold the STATUS request until every relay-connected edge is up/);
+assert.match(externalMultiplayerSource,
+    /await Promise\.all\(targetManifestSamples\);\s+for \(const client of clients\) client\.sendInitial\(\);/,
+    "external multiplayer smoke must establish target overlap before terminal STATUS requests",
+);
+assert.match(externalMultiplayerSource, /targetConcurrencyEvidence/);
+assert.match(externalMultiplayerSource, /edgeObservations/);
 assert.match(fullPathSource, /const relayRuntimeTelemetryRequired = !externalMode \|\| acceptanceMode/);
 assert.match(fullPathSource, /strict acceptance requires every external RelayNode runtime gauge/);
 assert.match(fullPathSource, /runtimeTelemetryRequired: relayRuntimeTelemetryRequired/);
