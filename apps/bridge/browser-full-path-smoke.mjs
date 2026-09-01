@@ -248,6 +248,14 @@ const POLL_SCHEDULER_WATCHDOG_MILLIS = 25;
 // continuation on a short timer instead of spinning setImmediate callbacks.
 // This is an idle backoff only; it does not alter any latency acceptance gate.
 const POLL_SCHEDULER_IDLE_BACKOFF_MILLIS = 1;
+// A due cursor is normally only one millisecond ahead of the completed poll.
+// On Windows, parking that cursor on a one-millisecond timer exposes the host
+// timer quantum as a visible 15--25 ms poll gap.  Spin a small, bounded number
+// of setImmediate turns while the next due cursor is close, then retain the
+// timer backstop for genuinely idle/far-future clients.  This is a harness
+// scheduling optimization; the strict 16.7/50/100 ms gates remain unchanged.
+const POLL_SCHEDULER_IDLE_IMMEDIATE_WINDOW_MILLIS = 2;
+const POLL_SCHEDULER_IDLE_IMMEDIATE_SPIN_LIMIT = 16;
 // Tick servicing shares the poll callback but has its own cursor and cap. A
 // large stress tier therefore cannot turn one scheduler callback into an
 // unbounded fan-out of outbound tick writes.
@@ -1824,6 +1832,7 @@ function createFairClientPollScheduler(getClients) {
     let turnsSinceTimerYield = 0;
     let heavyTurnCount = 0;
     let callbackRunning = false;
+    let idleImmediateSpins = 0;
     const dispatchCounts = new Map();
     const pollDurationByClient = new Map();
     const retainSlowCallbackSample = (sample) => {
@@ -2430,10 +2439,43 @@ function createFairClientPollScheduler(getClients) {
                 lastDueTicksBeforeIdle = countDuePlayTicks(clients, readinessAt);
                 maxDueTicks = Math.max(maxDueTicks, lastDueTicksBeforeIdle);
                 if (lastDueTicksBeforeIdle > 0) {
+                    idleImmediateSpins = 0;
                     nextContinuation = "immediate";
                     dueTickImmediateContinuations++;
                 }
-                else if (!readyAfterDispatch) nextContinuation = "idle";
+                else if (!readyAfterDispatch) {
+                    // Do not hand a one-millisecond due cursor to the host
+                    // timer queue: on Windows that queue is commonly
+                    // quantized to ~15 ms and turns into a user-visible poll
+                    // hitch.  A bounded immediate spin lets the due cursor
+                    // mature on a real macrotask boundary.  If the client set
+                    // is genuinely idle/far from due, fall back to the timer
+                    // backoff and reset the spin budget.
+                    let earliestPollDueAt = Infinity;
+                    for (const candidate of clients) {
+                        if (!isPollLive(candidate)) continue;
+                        const dueAt = readNextPollDueAt(candidate);
+                        if (Number.isFinite(dueAt)) {
+                            earliestPollDueAt = Math.min(earliestPollDueAt, dueAt);
+                        }
+                    }
+                    const dueInImmediateWindow = Number.isFinite(earliestPollDueAt) &&
+                        earliestPollDueAt >= readinessAt &&
+                        earliestPollDueAt - readinessAt <=
+                            POLL_SCHEDULER_IDLE_IMMEDIATE_WINDOW_MILLIS;
+                    if (dueInImmediateWindow &&
+                        idleImmediateSpins < POLL_SCHEDULER_IDLE_IMMEDIATE_SPIN_LIMIT) {
+                        idleImmediateSpins++;
+                        nextContinuation = "immediate";
+                    }
+                    else {
+                        idleImmediateSpins = 0;
+                        nextContinuation = "idle";
+                    }
+                }
+                else {
+                    idleImmediateSpins = 0;
+                }
                 timeAfterPollLoop = markPhase("post-poll");
             }
             if (dispatched === 0) {
@@ -2443,7 +2485,7 @@ function createFairClientPollScheduler(getClients) {
                 if (lastDueTicksBeforeIdle > 0 || lastDueTicksAfterService > 0) {
                     nextContinuation = "immediate";
                 }
-                else {
+                else if (!(nextContinuation === "immediate" && idleImmediateSpins > 0)) {
                     nextContinuation = "idle";
                 }
             }

@@ -33,6 +33,12 @@ assert.match(source, /const MAX_POLL_CALLBACK_WORK_MILLIS = 8/u);
 assert.match(source, /const POLL_SCHEDULER_TIMER_YIELD_TURNS = 256/u);
 assert.match(source, /const POLL_SCHEDULER_IDLE_BACKOFF_MILLIS = 1/u);
 assert.match(source,
+    /const POLL_SCHEDULER_IDLE_IMMEDIATE_WINDOW_MILLIS = 2/u,
+    "near-due poll cursors must have a bounded immediate window");
+assert.match(source,
+    /const POLL_SCHEDULER_IDLE_IMMEDIATE_SPIN_LIMIT = 16/u,
+    "near-due immediate spins must retain a hard limit");
+assert.match(source,
     /const MAX_PLAY_TICKS_PER_SCHEDULER_CALLBACK = MAX_CLIENTS_PER_POLL_CALLBACK/u);
 assert.match(source, /const CALLBACK_TAIL_SLOW_THRESHOLD_MILLIS = 16\.7/u);
 assert.match(source, /const CALLBACK_TAIL_SAMPLE_LIMIT = 64/u);
@@ -206,6 +212,12 @@ assert.match(schedulerSource, /isPollReady/u);
 assert.match(schedulerSource, /readPollFairnessFloor/u);
 assert.match(schedulerSource, /isPollFairlyEligible/u);
 assert.match(schedulerSource, /hasFairPollReady/u);
+assert.match(schedulerSource, /earliestPollDueAt/u,
+    "idle admission must inspect the earliest scheduler-owned due cursor");
+assert.match(schedulerSource, /dueInImmediateWindow/u,
+    "near-due poll cursors must bypass timer quantization with bounded immediates");
+assert.match(schedulerSource, /idleImmediateSpins/u,
+    "near-due immediate spin budget is missing");
 assert.match(schedulerSource, /visibleClientIdCollator/u,
     "client-id collator must be pre-warmed outside the callback hot path");
 assert.match(schedulerSource, /compareVisibleClientIds/u,
@@ -642,6 +654,32 @@ function makeModelClients({ dueAt = 100, pending = [] } = {}) {
         failure: undefined,
         dispatchCount: 0,
     }));
+}
+
+// Deterministic model for the near-due idle decision.  A one-millisecond due
+// cursor must use a bounded immediate spin so a Windows timer quantum cannot
+// manufacture a 15--25 ms poll gap; a far-future cursor still parks on the
+// normal idle timer backoff.
+function modelIdleContinuation({
+    now = 0,
+    earliestPollDueAt = Infinity,
+    readyAfterDispatch = false,
+    dueTicks = 0,
+    idleImmediateSpins = 0,
+} = {}) {
+    if (dueTicks > 0 || readyAfterDispatch) {
+        return { continuation: "immediate", idleImmediateSpins: 0 };
+    }
+    const dueInImmediateWindow = Number.isFinite(earliestPollDueAt) &&
+        earliestPollDueAt >= now &&
+        earliestPollDueAt - now <= 2;
+    if (dueInImmediateWindow && idleImmediateSpins < 16) {
+        return {
+            continuation: "immediate",
+            idleImmediateSpins: idleImmediateSpins + 1,
+        };
+    }
+    return { continuation: "idle", idleImmediateSpins: 0 };
 }
 
 // Deterministic model for the shared 20 Hz PLAY tick service. It permits one
@@ -1634,6 +1672,30 @@ assert.equal(modelHasImmediateInbound(Buffer.from([0x03, 0xaa])), false,
     assert.equal(idle.inspected, CLIENT_COUNT,
         "idle filter stopped before inspecting the visible client set");
 }
+
+assert.deepEqual(modelIdleContinuation({
+    now: 100,
+    earliestPollDueAt: 101,
+    idleImmediateSpins: 0,
+}), { continuation: "immediate", idleImmediateSpins: 1 },
+"near-due poll cursor was incorrectly parked on the quantized timer");
+assert.deepEqual(modelIdleContinuation({
+    now: 100,
+    earliestPollDueAt: 100,
+    idleImmediateSpins: 15,
+}), { continuation: "immediate", idleImmediateSpins: 16 },
+"the final bounded near-due immediate spin was not admitted");
+assert.deepEqual(modelIdleContinuation({
+    now: 100,
+    earliestPollDueAt: 101,
+    idleImmediateSpins: 16,
+}), { continuation: "idle", idleImmediateSpins: 0 },
+"near-due immediate spin budget exceeded its hard limit");
+assert.deepEqual(modelIdleContinuation({
+    now: 100,
+    earliestPollDueAt: 125,
+}), { continuation: "idle", idleImmediateSpins: 0 },
+"far-future poll cursor did not use idle backoff");
 
 // A queued inbound frame does not bypass nextPollDueAt.  This is the
 // starvation regression: a continuously busy client must wait for its fair
