@@ -45,6 +45,14 @@ assert.match(source,
 assert.match(source,
     /const CALLBACK_FINALIZATION_TAIL_SAMPLE_LIMIT = 64/u,
     "callback finalization-tail sample limit drifted");
+assert.match(source,
+    /const PLAY_TICK_TIMING_TELEMETRY_SCHEMA_VERSION\s*=\s*["']gaius\.browser-client-play-tick-timing\.v1["']/u,
+    "PLAY tick timing schema drifted");
+assert.match(source, /const PLAY_TICK_TIMING_SAMPLE_LIMIT = 64/u,
+    "PLAY tick timing ring limit drifted");
+assert.match(source,
+    /const PLAY_TICK_TIMING_RETENTION = ["']last-64-chronological["']/u,
+    "PLAY tick timing retention policy drifted");
 // Per-client poll phase evidence is deliberately a diagnostic ring.  Keep the
 // schema/caps visible at source level so a scheduler refactor cannot silently
 // turn it into an unbounded trace or alter the strict frame gate.
@@ -107,6 +115,34 @@ assert.match(source, /retainPollPhaseSample\(/u,
     "poll phase bounded retention helper is missing");
 assert.match(source, /pollPhaseTelemetryResult\(/u,
     "poll phase result serializer is missing");
+for (const field of [
+    "playTickTimingRing",
+    "playTickTimingSequence",
+    "recordPlayTickTiming(",
+    "playTickTimingResult(",
+    "playTickTimingSamplesTotal",
+    "playTickTimingSamplesDropped",
+]) {
+    assert.match(source, new RegExp(field.replace(/[().]/gu, "\\$&"), "u"),
+        `PLAY tick timing telemetry omitted ${field}`);
+}
+const playTickTimingRecordStart = source.indexOf("    recordPlayTickTiming({");
+const playTickTimingRecordEnd = source.indexOf("\n    playTickTimingResult()", playTickTimingRecordStart);
+assert.ok(playTickTimingRecordStart >= 0 &&
+    playTickTimingRecordEnd > playTickTimingRecordStart,
+    "PLAY tick timing record boundaries changed; inspect bounded telemetry");
+const playTickTimingRecordSource = source.slice(
+    playTickTimingRecordStart, playTickTimingRecordEnd);
+assert.match(playTickTimingRecordSource, /phase:\s*typeof this\.phase/u,
+    "PLAY tick timing sample omitted client phase");
+const playTickTimingStart = playTickTimingRecordEnd;
+const playTickTimingEnd = source.indexOf("\n    servicePlayTick(", playTickTimingStart);
+assert.ok(playTickTimingEnd > playTickTimingStart,
+    "PLAY tick timing result boundaries changed; inspect bounded telemetry");
+const playTickTimingSource = source.slice(playTickTimingStart, playTickTimingEnd);
+assert.match(playTickTimingSource,
+    /strictGatesChanged:\s*false[\s\S]*?diagnosticOnly:\s*true[\s\S]*?independentExecution:\s*false/u,
+    "PLAY tick timing evidence must remain diagnostic-only");
 const clientPollStart = source.indexOf("    poll(schedulerCallbackSequence");
 const clientPollEnd = source.indexOf("\n    parsePackets(", clientPollStart);
 assert.ok(clientPollStart >= 0 && clientPollEnd > clientPollStart,
@@ -206,6 +242,9 @@ assert.match(schedulerSource, /callbackFinalizationTail/u,
     "callback finalization-tail evidence is missing");
 assert.match(schedulerSource, /servicePlayTick/u);
 assert.match(schedulerSource, /MAX_PLAY_TICKS_PER_SCHEDULER_CALLBACK/u);
+assert.match(schedulerSource,
+    /candidate\.servicePlayTick\(\s*performance\.now\(\),\s*callbackSequenceNumber,\s*trigger,\s*callbackPhase\)/u,
+    "scheduler did not pass PLAY tick callback provenance");
 assert.match(schedulerSource, /isPlayTickDue/u,
     "scheduler must inspect unserviced PLAY tick deadlines before idling");
 assert.match(schedulerSource, /countDuePlayTicks/u,
@@ -231,11 +270,28 @@ assert.match(source, /hasPendingInbound\(\)\s*\{[\s\S]*?this\.buffer\.byteLength
 assert.match(source, /playTickActive/u);
 assert.match(source, /nextPlayTickDueAt/u);
 assert.match(source, /playTickSkippedPeriods/u);
-const tickStart = source.indexOf("    servicePlayTick(now = performance.now())");
+const tickStart = source.indexOf("    servicePlayTick(now = performance.now(),");
 const tickEnd = source.indexOf("\n    checkError()", tickStart);
 assert.ok(tickStart >= 0 && tickEnd > tickStart,
     "shared play-tick service boundaries changed; inspect before updating this smoke");
 const tickSource = source.slice(tickStart, tickEnd);
+for (const field of [
+    "dueAtMillis: dueAt",
+    "tickAtMillis: tickAt",
+    "previousGapMillis",
+    "schedulerCallbackSequence",
+    "trigger: schedulerTrigger",
+    "skipPeriods",
+]) {
+    assert.match(tickSource,
+        new RegExp(field.replace(/[().]/gu, "\\$&"), "u"),
+        `PLAY tick timing sample omitted ${field}`);
+}
+assert.match(source, /phase:\s*typeof this\.phase/u,
+    "PLAY tick timing sample omitted client phase");
+assert.match(tickSource,
+    /this\.recordPlayTickTiming\(\{[\s\S]*?skippedPeriodsTotal:\s*this\.playTickSkippedPeriods/u,
+    "PLAY tick timing sample lost cumulative skip-period context");
 assert.doesNotMatch(tickSource, /setInterval\s*\(/u,
     "play ticks must use the shared due-driven scheduler, not per-client intervals");
 assert.doesNotMatch(tickSource, /setTimeout\s*\(/u,
@@ -561,6 +617,46 @@ function modelPlayTickBatch(states, cursor, now, limit = BATCH_LIMIT) {
         if (modelPlayTick(state, now)) sent++;
     }
     return { cursor: nextCursor, serviced, sent };
+}
+
+// The production client keeps the last 64 successful PLAY tick timing records
+// per client.  This model checks the bounded chronological retention contract;
+// it deliberately has no effect on the cadence or any strict gate.
+const PLAY_TICK_TIMING_MODEL_SCHEMA_VERSION =
+    "gaius.browser-client-play-tick-timing.v1";
+const PLAY_TICK_TIMING_MODEL_LIMIT = 64;
+function retainPlayTickTimingSample(state, candidate) {
+    const finiteMillis = (value, allowNull = false) => {
+        if (allowNull && (value === null || value === undefined)) return null;
+        const number = Number(value);
+        return Number.isFinite(number) && number >= 0 ? number : null;
+    };
+    const nonNegativeInteger = (value) => Number.isSafeInteger(value) && value >= 0
+        ? value : 0;
+    const sample = {
+        schemaVersion: PLAY_TICK_TIMING_MODEL_SCHEMA_VERSION,
+        sequence: Number.isSafeInteger(candidate?.sequence) ? candidate.sequence : state.total + 1,
+        dueAtMillis: finiteMillis(candidate?.dueAtMillis),
+        tickAtMillis: finiteMillis(candidate?.tickAtMillis),
+        previousGapMillis: finiteMillis(candidate?.previousGapMillis, true),
+        schedulerCallbackSequence: Number.isSafeInteger(
+            candidate?.schedulerCallbackSequence) ? candidate.schedulerCallbackSequence : null,
+        trigger: typeof candidate?.trigger === "string" ? candidate.trigger : "direct",
+        skipPeriods: nonNegativeInteger(candidate?.skipPeriods),
+        phase: typeof candidate?.phase === "string" ? candidate.phase : null,
+    };
+    state.total++;
+    if (state.samples[state.nextIndex] !== undefined) state.dropped++;
+    state.samples[state.nextIndex] = sample;
+    state.nextIndex = (state.nextIndex + 1) % PLAY_TICK_TIMING_MODEL_LIMIT;
+    state.count = Math.min(PLAY_TICK_TIMING_MODEL_LIMIT, state.count + 1);
+}
+
+function orderedPlayTickTimingSamples(state) {
+    const firstIndex = state.count < PLAY_TICK_TIMING_MODEL_LIMIT
+        ? 0 : state.nextIndex;
+    return Array.from({ length: state.count }, (_, offset) =>
+        state.samples[(firstIndex + offset) % PLAY_TICK_TIMING_MODEL_LIMIT]);
 }
 
 function modelIsPlayTickDue(state, now) {
@@ -1125,6 +1221,66 @@ function retainPollPhaseSample(state, candidate) {
         "shared tick batch emitted more than its per-turn cap");
 }
 
+{
+    const ring = {
+        nextIndex: 0,
+        count: 0,
+        total: 0,
+        dropped: 0,
+        samples: new Array(PLAY_TICK_TIMING_MODEL_LIMIT),
+    };
+    retainPlayTickTimingSample(ring, {
+        sequence: 1,
+        dueAtMillis: 100,
+        tickAtMillis: 100.2,
+        previousGapMillis: null,
+        schedulerCallbackSequence: null,
+        trigger: "play-start",
+        skipPeriods: 0,
+        phase: "play",
+    });
+    for (let sequence = 2; sequence <= 65; sequence++) {
+        retainPlayTickTimingSample(ring, {
+            sequence,
+            dueAtMillis: sequence * 50,
+            tickAtMillis: sequence * 50 + 0.2,
+            previousGapMillis: 50,
+            schedulerCallbackSequence: sequence + 100,
+            trigger: "immediate",
+            skipPeriods: sequence === 65 ? 2 : 0,
+            phase: "play",
+        });
+    }
+    const ordered = orderedPlayTickTimingSamples(ring);
+    assert.equal(ring.total, 65,
+        "PLAY tick timing model did not count every successful tick");
+    assert.equal(ring.count, PLAY_TICK_TIMING_MODEL_LIMIT,
+        "PLAY tick timing model exceeded its hard per-client limit");
+    assert.equal(ordered.length, PLAY_TICK_TIMING_MODEL_LIMIT,
+        "PLAY tick timing model serializer escaped its hard limit");
+    assert.equal(ring.dropped, 1,
+        "PLAY tick timing model dropped-count did not track overwrite");
+    assert.deepEqual([ordered[0].sequence, ordered.at(-1).sequence], [2, 65],
+        "PLAY tick timing ring was not chronological after wraparound");
+    for (const sample of ordered) {
+        assert.equal(sample.schemaVersion, PLAY_TICK_TIMING_MODEL_SCHEMA_VERSION);
+        assert.ok(Number.isFinite(sample.dueAtMillis) &&
+            Number.isFinite(sample.tickAtMillis),
+        "PLAY tick timing sample lost due/tick timestamps");
+        assert.ok(sample.previousGapMillis === null ||
+            Number.isFinite(sample.previousGapMillis),
+        "PLAY tick timing sample lost the previous gap");
+        assert.ok(sample.schedulerCallbackSequence === null ||
+            Number.isSafeInteger(sample.schedulerCallbackSequence),
+        "PLAY tick timing sample lost scheduler callback provenance");
+        assert.equal(typeof sample.trigger, "string");
+        assert.ok(Number.isSafeInteger(sample.skipPeriods) && sample.skipPeriods >= 0);
+        assert.equal(sample.phase, "play");
+    }
+    assert.equal(ordered.at(-1).skipPeriods, 2,
+        "PLAY tick timing model lost skip-period evidence");
+}
+
 // A bounded tick batch must not park the continuation while peers still have
 // due PLAY ticks. With eight due clients and a four-client cap, the first turn
 // services four and the remaining four force an immediate next turn rather
@@ -1300,6 +1456,16 @@ console.log(JSON.stringify({
     callbackWorkBudgetMillis: CALLBACK_WORK_BUDGET_MILLIS,
     runMillis: RUN_MILLIS,
     strictPollGapTarget: { p99Millis: 16.7, p999Millis: 50, maxMillis: 100 },
+    playTickTiming: {
+        schemaVersion: PLAY_TICK_TIMING_MODEL_SCHEMA_VERSION,
+        sampleLimit: PLAY_TICK_TIMING_MODEL_LIMIT,
+        retention: "last-64-chronological",
+        diagnosticOnly: true,
+        strictGatesChanged: false,
+        modelSamplesTotal: 65,
+        modelRetainedSampleCount: PLAY_TICK_TIMING_MODEL_LIMIT,
+        modelDroppedSampleCount: 1,
+    },
     pollPhaseTelemetry: {
         schemaVersion: POLL_PHASE_SCHEMA_VERSION,
         segmentAccounting: POLL_PHASE_SEGMENT_ACCOUNTING,

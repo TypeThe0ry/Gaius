@@ -273,6 +273,14 @@ const CALLBACK_FINALIZATION_TAIL_TELEMETRY_SCHEMA_VERSION =
 const CALLBACK_FINALIZATION_TAIL_SLOW_THRESHOLD_MILLIS = 16.7;
 const CALLBACK_FINALIZATION_TAIL_SAMPLE_LIMIT = 64;
 const CALLBACK_FINALIZATION_TAIL_RETENTION = "longest-tail-desc-sequence-asc";
+// PLAY tick timing evidence is a bounded, diagnostic-only ring.  It retains
+// the last 64 successful tick sends per client so a p99/max gap can be
+// correlated with the due time and scheduler turn that preceded it without
+// changing cadence or any strict latency gate.
+const PLAY_TICK_TIMING_TELEMETRY_SCHEMA_VERSION =
+    "gaius.browser-client-play-tick-timing.v1";
+const PLAY_TICK_TIMING_SAMPLE_LIMIT = 64;
+const PLAY_TICK_TIMING_RETENTION = "last-64-chronological";
 // A callback-tail overrun often collapses to one synchronous client poll.
 // Retain a bounded scalar-only phase breakdown so the next run can distinguish
 // bridge dequeue/transform, inflate/parse, packet dispatch, and bookkeeping.
@@ -2213,7 +2221,8 @@ function createFairClientPollScheduler(getClients) {
                     playTickServiceCalls++;
                     const tickStartedAt = performance.now();
                     try {
-                        if (candidate.servicePlayTick(performance.now())) {
+                        if (candidate.servicePlayTick(
+                            performance.now(), callbackSequenceNumber, trigger, callbackPhase)) {
                             playTickDispatches++;
                             tickDispatchesThisCallback++;
                         }
@@ -3283,6 +3292,17 @@ class BrowserMinecraftClient {
         this.playTickGapSamples = 0;
         this.maxPlayTickGapMillis = 0;
         this.playTickGapHistogram = createLatencyHistogram();
+        // Keep per-client PLAY tick timing as a bounded chronological ring.
+        // This is attribution-only evidence for p99/max gaps; it does not
+        // participate in scheduling, cadence, or strict acceptance checks.
+        this.playTickTimingSequence = 0;
+        this.playTickTimingRing = {
+            nextIndex: 0,
+            count: 0,
+            total: 0,
+            dropped: 0,
+            samples: new Array(PLAY_TICK_TIMING_SAMPLE_LIMIT),
+        };
         // Reuse one accumulator per client so the normal (sub-threshold) poll
         // path does not allocate a trace object on every scheduler turn.  A
         // materialized sample is copied into the bounded ring only when the
@@ -4774,7 +4794,83 @@ class BrowserMinecraftClient {
         this.outboundBytes += wire.byteLength;
     }
 
-    servicePlayTick(now = performance.now()) {
+    recordPlayTickTiming({
+        dueAtMillis,
+        tickAtMillis,
+        previousGapMillis,
+        schedulerCallbackSequence = null,
+        trigger = "direct",
+        skipPeriods = 0,
+        skippedPeriodsTotal = this.playTickSkippedPeriods,
+        schedulerPhase = null,
+    }) {
+        const finiteMillis = (value, allowNull = false) => {
+            if (allowNull && (value === null || value === undefined)) return null;
+            const number = Number(value);
+            return Number.isFinite(number) && number >= 0 ? number : null;
+        };
+        const nonNegativeInteger = (value) => Number.isSafeInteger(value) && value >= 0
+            ? value : 0;
+        const ring = this.playTickTimingRing;
+        const sample = {
+            schemaVersion: PLAY_TICK_TIMING_TELEMETRY_SCHEMA_VERSION,
+            sequence: ++this.playTickTimingSequence,
+            clientId: this.id,
+            wave: this.wave,
+            dueAtMillis: finiteMillis(dueAtMillis),
+            tickAtMillis: finiteMillis(tickAtMillis),
+            previousGapMillis: finiteMillis(previousGapMillis, true),
+            schedulerCallbackSequence: Number.isSafeInteger(
+                schedulerCallbackSequence) ? schedulerCallbackSequence : null,
+            trigger: typeof trigger === "string" ? trigger : "direct",
+            skipPeriods: nonNegativeInteger(skipPeriods),
+            skippedPeriodsTotal: nonNegativeInteger(skippedPeriodsTotal),
+            phase: typeof this.phase === "string" ? this.phase : null,
+            schedulerPhase: typeof schedulerPhase === "string"
+                ? schedulerPhase : null,
+            strictThresholdMillis: 16.7,
+            strictGatesChanged: false,
+            diagnosticOnly: true,
+            independentExecution: false,
+        };
+        ring.total++;
+        const index = ring.nextIndex;
+        if (ring.samples[index] !== undefined) ring.dropped++;
+        ring.samples[index] = sample;
+        ring.nextIndex = (index + 1) % PLAY_TICK_TIMING_SAMPLE_LIMIT;
+        ring.count = Math.min(PLAY_TICK_TIMING_SAMPLE_LIMIT, ring.count + 1);
+    }
+
+    playTickTimingResult() {
+        const ring = this.playTickTimingRing;
+        const firstIndex = ring.count < PLAY_TICK_TIMING_SAMPLE_LIMIT
+            ? 0 : ring.nextIndex;
+        const samples = [];
+        for (let offset = 0; offset < ring.count; offset++) {
+            const sample = ring.samples[
+                (firstIndex + offset) % PLAY_TICK_TIMING_SAMPLE_LIMIT];
+            if (sample !== undefined) samples.push({ ...sample });
+        }
+        return {
+            schemaVersion: PLAY_TICK_TIMING_TELEMETRY_SCHEMA_VERSION,
+            sampleLimit: PLAY_TICK_TIMING_SAMPLE_LIMIT,
+            retention: PLAY_TICK_TIMING_RETENTION,
+            strictThresholdMillis: 16.7,
+            strictGatesChanged: false,
+            diagnosticOnly: true,
+            independentExecution: false,
+            samplesTotal: ring.total,
+            playTickTimingSamplesTotal: ring.total,
+            retainedSampleCount: samples.length,
+            samplesDropped: ring.dropped,
+            playTickTimingSamplesDropped: ring.dropped,
+            droppedSampleCount: ring.dropped,
+            samples,
+        };
+    }
+
+    servicePlayTick(now = performance.now(), schedulerCallbackSequence = null,
+        schedulerTrigger = "direct", schedulerPhase = null) {
         if (!this.playTickActive || this.closed || this.failure !== undefined ||
             this.phase !== "play") return false;
         if (this.pollingPaused) {
@@ -4794,13 +4890,15 @@ class BrowserMinecraftClient {
         if (!Number.isFinite(dueAt) || now < dueAt) return false;
         try {
             const tickAt = performance.now();
+            const previousGapMillis = this.lastPlayTickAt === undefined
+                ? null : tickAt - this.lastPlayTickAt;
             if (this.lastPlayTickAt !== undefined) {
                 this.playTickGapSamples++;
                 this.maxPlayTickGapMillis = Math.max(
                     this.maxPlayTickGapMillis,
-                    tickAt - this.lastPlayTickAt,
+                    previousGapMillis,
                 );
-                observeLatency(this.playTickGapHistogram, tickAt - this.lastPlayTickAt);
+                observeLatency(this.playTickGapHistogram, previousGapMillis);
             }
             this.lastPlayTickAt = tickAt;
             this.sendPacket(this.profile.play.serverboundClientTickEnd, Buffer.alloc(0));
@@ -4810,14 +4908,26 @@ class BrowserMinecraftClient {
             // re-anchor the next due time to the observed clock.
             const periodMillis = 50;
             const nextDueAt = dueAt + periodMillis;
+            let skipPeriods = 0;
             if (nextDueAt < tickAt) {
-                this.playTickSkippedPeriods += Math.max(1,
+                skipPeriods = Math.max(1,
                     Math.ceil((tickAt - nextDueAt) / periodMillis));
+                this.playTickSkippedPeriods += skipPeriods;
                 this.nextPlayTickDueAt = tickAt + periodMillis;
             }
             else {
                 this.nextPlayTickDueAt = nextDueAt;
             }
+            this.recordPlayTickTiming({
+                dueAtMillis: dueAt,
+                tickAtMillis: tickAt,
+                previousGapMillis,
+                schedulerCallbackSequence,
+                trigger: schedulerTrigger,
+                skipPeriods,
+                skippedPeriodsTotal: this.playTickSkippedPeriods,
+                schedulerPhase,
+            });
             return true;
         }
         catch (error) {
@@ -4833,7 +4943,7 @@ class BrowserMinecraftClient {
         this.nextPlayTickDueAt = performance.now();
         // Preserve the vanilla immediate first tick; subsequent ticks are
         // serviced by the shared fair poll scheduler.
-        this.servicePlayTick(performance.now());
+        this.servicePlayTick(performance.now(), null, "play-start", "play-start");
     }
 
     stopPlayTickLoop() {
@@ -5088,6 +5198,7 @@ class BrowserMinecraftClient {
             maxPlayTickGapMillis: Number(this.maxPlayTickGapMillis.toFixed(3)),
             maxPlayTickGapRawMillis: this.maxPlayTickGapMillis,
             playTickGapHistogram: latencyHistogramResult(this.playTickGapHistogram),
+            playTickTiming: this.playTickTimingResult(),
             maximumBufferedBytes: this.maximumBufferedBytes,
             inboundDrainBudget: {
                 maxFramesPerPoll: MAX_INBOUND_FRAMES_PER_POLL,
