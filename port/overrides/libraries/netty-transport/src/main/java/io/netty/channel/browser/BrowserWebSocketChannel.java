@@ -1926,6 +1926,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               entry.retireClosedHandle = 0;
             }
             entry.retireClosedPending = false;
+            // Mark the entry closed before asking the browser to close the socket.  Some
+            // WebSocket implementations can deliver `onclose` reentrantly; the error path
+            // must own retirement exactly once rather than racing that callback and marking
+            // the entry disposed before the shared retire helper can schedule its finalizer.
+            entry.closed = true;
             try { if (entry.ws) entry.ws.close(); } catch (ignored) {}
             if (typeof state.cancelOutboundFlush === 'function') {
               state.cancelOutboundFlush(entry);
@@ -1936,9 +1941,10 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             entry.localPort = null;
             discardOutboundData(entry);
             state.discardInbound(entry);
-            entry.disposed = true;
-            entry.closed = true;
             state.stopEventLoopGapProbeIfIdle();
+            // Reuse the identity-checked remote-close retirement path so an onerror/fail
+            // without a later Java tick still wakes the bounded Java channel cleanup.
+            state.retireClosedEntry(entry);
             }
             function sendControl(entry, message) {
             const target = entry.localPort || entry.ws;

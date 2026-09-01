@@ -36,6 +36,22 @@ assert.match(networkSource, /bridge\.exactPacketQueuePaused && !closeWake/);
 assert.match(networkSource, /bridge\.inboundPump = function\(reason\)/);
 assert.match(networkSource, /schedulePump\(String\(reason \|\| 'requested'\)\)/);
 
+const failStart = source.indexOf("function fail(entry, message)");
+const failEnd = source.indexOf("function sendControl(entry, message)", failStart);
+assert.ok(failStart >= 0 && failEnd > failStart, "missing transport fail body");
+const failBody = source.slice(failStart, failEnd);
+assert.match(failBody, /entry\.closed = true/);
+assert.match(failBody, /state\.retireClosedEntry\(entry\);/);
+assert.ok(
+  failBody.indexOf("entry.closed = true") < failBody.indexOf("entry.ws.close()"),
+  "fail must close the logical entry before the browser close callback can re-enter",
+);
+assert.equal(
+  failBody.includes("entry.disposed = true"),
+  false,
+  "fail must not mark the entry disposed before retireClosedEntry schedules its finalizer",
+);
+
 const onCloseStart = source.indexOf("ws.onclose = function(event)");
 const onCloseEnd = source.indexOf("};", onCloseStart);
 assert.ok(onCloseStart >= 0 && onCloseEnd > onCloseStart, "missing remote onclose body");
@@ -348,6 +364,12 @@ function createJavaLifecycleModel() {
     if (ownsCurrentEntry) signal("remote-close-retire");
   }
 
+  function fail(entry) {
+    if (!entry || entry.closed) return;
+    entry.closed = true;
+    finalize(entry);
+  }
+
   return {
     bridgeEntries,
     javaChannels,
@@ -356,6 +378,7 @@ function createJavaLifecycleModel() {
       exactPacketQueuePaused = !!value;
     },
     open,
+    fail,
     finalize,
     signal,
     runNext,
@@ -363,6 +386,35 @@ function createJavaLifecycleModel() {
       return timers.length;
     },
   };
+}
+
+// Transport error/fail must share the same identity-guarded retirement path as a clean
+// WebSocket onclose.  This covers the common browser sequence where onerror marks the entry
+// closed and the subsequent onclose is ignored, so no later Java tick is available to clean it.
+{
+  const model = createJavaLifecycleModel();
+  const entry = model.open(25, 1);
+  model.fail(entry);
+  model.fail(entry);
+  assert.equal(model.stats.closeWakeRequests, 1);
+  assert.equal(model.runNext(), true);
+  assert.equal(model.javaChannels.get(25).open, false);
+  assert.equal(model.stats.javaChannelsClosedByWake, 1);
+  assert.equal(model.pendingTimers, 0);
+}
+
+// A fail-triggered wake queued before a numeric-id replacement must observe the replacement and
+// leave its Java channel open, exactly like the clean-close generation race.
+{
+  const model = createJavaLifecycleModel();
+  const oldEntry = model.open(26, 1);
+  model.fail(oldEntry);
+  const replacement = model.open(26, 2);
+  assert.equal(model.runNext(), true);
+  assert.equal(model.bridgeEntries.get(26), replacement);
+  assert.equal(model.javaChannels.get(26).generation, 2);
+  assert.equal(model.javaChannels.get(26).open, true);
+  assert.equal(model.stats.javaChannelsClosedByWake, 0);
 }
 
 // No following Java tick: the identity-owned finalizer emits one close wake and removes the
@@ -438,5 +490,6 @@ console.log(JSON.stringify({
   javaChannelRetireWake: true,
   exactPauseCloseWakeBypass: true,
   staleReplacementWakeSafe: true,
+  failPathRetire: true,
   sourcePath: repository.pathname,
 }, null, 2));

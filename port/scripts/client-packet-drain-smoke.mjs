@@ -125,6 +125,14 @@ const resetLifecycle = between(schedulerSource,
 assert.match(resetLifecycle,
   /if \(!preserveActiveDrainEvidence\)[\s\S]*clientPacketDrainOwner = null[\s\S]*clientPacketDrainOwnerGeneration = 0L/,
   "non-active reset cleanup does not retire the drain owner ledger");
+const packetProcessorOwnerClaim = between(
+  schedulerSource,
+  "private static boolean claimPacketProcessorOwner(Object owner)",
+  "private static int countRetiredPacketProcessorOwners()",
+);
+assert.match(packetProcessorOwnerClaim,
+  /packetProcessorOwner == null[\s\S]*if \(clientPacketDrainActive\)[\s\S]*packetProcessorFallbackReason = "active-drain-owner-retiring"[\s\S]*return false/,
+  "a reentrant owner may not claim the empty slot while a retired active drain awaits finish");
 
 const packetProcessed = between(schedulerSource,
   "public static void packetProcessed()", "/** Mirrors PacketProcessor.close");
@@ -668,18 +676,36 @@ function activeDrainCloseModel() {
     handlerDepth: 0,
     handlerCompletions: 0,
     retiredOwners: new Set(),
+    packetProcessorFallbackReason: "unbound",
   };
   const nextGeneration = generation => generation === Number.MAX_SAFE_INTEGER
     ? 1 : generation + 1;
-  const claim = (owner, queuedPackets) => {
-    if (owner == null || state.clientPacketDrainActive || queuedPackets < 64
-        || state.retiredOwners.has(owner)) {
+  const bind = owner => {
+    if (owner == null || state.retiredOwners.has(owner)) {
       return false;
     }
     if (state.packetProcessorOwner === null) {
+      if (state.clientPacketDrainActive) {
+        state.packetProcessorFallbackReason = "active-drain-owner-retiring";
+        return false;
+      }
+      if (state.handlerDepth > 0 && state.handlerOwner !== owner) {
+        state.packetProcessorFallbackReason = "owner-while-handler-active";
+        return false;
+      }
       state.packetProcessorOwner = owner;
       state.packetProcessorGeneration = nextGeneration(state.packetProcessorGeneration);
-    } else if (state.packetProcessorOwner !== owner) {
+      state.packetProcessorFallbackReason = "bound";
+      return true;
+    }
+    if (state.packetProcessorOwner !== owner) {
+      state.packetProcessorFallbackReason = "packet-processor-owner-conflict";
+      return false;
+    }
+    return true;
+  };
+  const claim = (owner, queuedPackets) => {
+    if (!bind(owner) || state.clientPacketDrainActive || queuedPackets < 64) {
       return false;
     }
     state.queuedPackets = queuedPackets;
@@ -737,7 +763,7 @@ function activeDrainCloseModel() {
     state.clientPacketDrainOwnerGeneration = 0;
     return true;
   };
-  return {state, claim, reset, packetProcessed, finish};
+  return {state, bind, claim, reset, packetProcessed, finish};
 }
 
 const closeDrain = activeDrainCloseModel();
@@ -752,6 +778,13 @@ assert.equal(closeDrain.state.queuedPackets, 0,
   "reset did not clear the queued remainder in the lifecycle model");
 assert.equal(closeDrain.packetProcessed(closeOwner), true,
   "retired owner handler did not unwind after reset");
+const reentrantBindResult = closeDrain.bind(newFrameOwner);
+const reentrantBindRejected = reentrantBindResult === false;
+const reentrantBindFallbackReason = closeDrain.state.packetProcessorFallbackReason;
+assert.equal(reentrantBindResult, false,
+  "new owner rebound while retired active drain was awaiting outer finish");
+assert.equal(reentrantBindFallbackReason, "active-drain-owner-retiring",
+  "reentrant bind did not record the active-drain retirement fallback");
 assert.equal(closeDrain.finish(closeOwner), true,
   "retired owner could not release its exact active drain claim");
 assert.equal(closeDrain.state.clientPacketDrainActive, false,
@@ -849,6 +882,8 @@ console.log(JSON.stringify({
   activeDrainCloseResetRelease: true,
   activeDrainCloseHandlerCompletions: closeDrainHandlerCompletions,
   activeDrainCloseQueueAfterReset: closeDrainQueueAfterReset,
+  reentrantBindRejected,
+  reentrantBindFallbackReason,
   activeDrainCloseFreshFrameClaimed: true,
   activeDrainCloseForeignFinishRejected: true,
   activeDrainCloseStaleFinishRejected: true,

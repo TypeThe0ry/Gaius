@@ -691,6 +691,15 @@ public final class BrowserPacketScheduler {
             return false;
         }
         if (packetProcessorOwner == null) {
+            // A close/reset from inside the active drain handler intentionally leaves the
+            // drain claim live until the surrounding frame finally block releases it.  Do not
+            // let a reentrant/new PacketProcessor claim the empty owner slot in that window:
+            // the retired owner's finish would then fail its generation check and strand the
+            // global drain active forever.
+            if (clientPacketDrainActive) {
+                packetProcessorFallbackReason = "active-drain-owner-retiring";
+                return false;
+            }
             if (packetProcessorConflictPoisoned || packetProcessorOwnerConflict
                     || !packetProcessorAccountingValid) {
                 packetProcessorFallbackReason = "runtime-accounting-poisoned";

@@ -1426,8 +1426,11 @@ await waitFor(() => {
 }, "decoder hard-limit failure");
 assert.equal(overflowPoll, null,
   "decoder hard-limit overflow escaped into the Java pipeline");
-assert.match(bridge.pollError(overflowSocketId),
+const overflowError = bridge.pollError(overflowSocketId);
+assert.match(overflowError,
   /Browser decoder cumulation exceeded 16 MiB/);
+await waitFor(() => overflowEntry.disposed,
+  "decoder hard-limit finalization");
 assert.equal(overflowEntry.disposed, true,
   "decoder hard-limit failure did not dispose the channel");
 assert.equal(overflowEntry.decoderCumulationBytes, 0,
