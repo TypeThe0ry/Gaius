@@ -94,6 +94,38 @@ assert.match(schedulerReset,
 assert.doesNotMatch(schedulerReset,
   /!preserveActiveDrainEvidence\s*\|\|\s*queuedPacketHandleDepth\s*==\s*0/,
   "reset may not clear a live queued-handler scope merely because adaptive drain is inactive");
+const drainOwnerClaim = between(schedulerSource,
+  "public static boolean tryBeginClientPacketDrain(Object owner, boolean critical)",
+  "/** Marks an exceptional or reset-aborted active drain");
+assert.match(schedulerSource,
+  /private static Object clientPacketDrainOwner;[\s\S]*private static long clientPacketDrainOwnerGeneration;/,
+  "active drain is missing its identity/generation owner ledger");
+assert.match(drainOwnerClaim,
+  /tryBeginClientPacketDrain\(critical\)[\s\S]*clientPacketDrainOwner = owner[\s\S]*clientPacketDrainOwnerGeneration = packetProcessorGeneration/,
+  "an owner-aware drain does not capture the generation that claimed it");
+const drainOwnerFinish = between(schedulerSource,
+  "public static void finishClientPacketDrain(Object owner)",
+  "public static String clientPacketDrainStopReason()");
+assert.match(drainOwnerFinish,
+  /owner != clientPacketDrainOwner[\s\S]*clientPacketDrainOwnerGeneration <= 0L/,
+  "finish must reject a foreign or unbound drain owner");
+assert.match(drainOwnerFinish,
+  /packetProcessorGeneration == clientPacketDrainOwnerGeneration[\s\S]*isRetiredPacketProcessorOwner\(owner\)/,
+  "finish must validate both the live generation and the post-reset retired owner");
+const ownerPacketProcessed = between(schedulerSource,
+  "public static void packetProcessed(Object owner)", "/** Mirrors PacketProcessor.close");
+const ownerMismatchPacketProcessed = between(ownerPacketProcessed,
+  "if (owner != packetProcessorOwner || !packetProcessorAccountingValid)",
+  "if (queuedPacketHandleDepth == 0 && packetProcessorOwner == null");
+assert.match(ownerMismatchPacketProcessed,
+  /owner == clientPacketDrainOwner[\s\S]*clientPacketDrainActive[\s\S]*clientPacketDrainHandlerCompletions\+\+/,
+  "a completed handler after close/reset is not counted against its exact drain owner");
+const resetLifecycle = between(schedulerSource,
+  "public static void reset()", "public static void reset(Object owner)");
+assert.match(resetLifecycle,
+  /if \(!preserveActiveDrainEvidence\)[\s\S]*clientPacketDrainOwner = null[\s\S]*clientPacketDrainOwnerGeneration = 0L/,
+  "non-active reset cleanup does not retire the drain owner ledger");
+
 const packetProcessed = between(schedulerSource,
   "public static void packetProcessed()", "/** Mirrors PacketProcessor.close");
 assert.match(packetProcessed,
@@ -620,6 +652,129 @@ const activeDrainReset = queuedHandlerResetModel({drainActive: true});
 assert.equal(activeDrainReset.processingDuringHandler, true);
 assert.equal(activeDrainReset.completionCount, 1);
 
+// An owner can close its PacketProcessor from inside the active drain handler.  reset() clears the
+// queue but deliberately preserves the outer drain claim until packetProcessed() and the wrapper's
+// finally block unwind.  The owner/generation guard must release that exact retired claim without
+// allowing a stale callback to finish a newer frame.
+function activeDrainCloseModel() {
+  const state = {
+    packetProcessorOwner: null,
+    packetProcessorGeneration: 0,
+    clientPacketDrainActive: false,
+    clientPacketDrainOwner: null,
+    clientPacketDrainOwnerGeneration: 0,
+    queuedPackets: 0,
+    handlerOwner: null,
+    handlerDepth: 0,
+    handlerCompletions: 0,
+    retiredOwners: new Set(),
+  };
+  const nextGeneration = generation => generation === Number.MAX_SAFE_INTEGER
+    ? 1 : generation + 1;
+  const claim = (owner, queuedPackets) => {
+    if (owner == null || state.clientPacketDrainActive || queuedPackets < 64
+        || state.retiredOwners.has(owner)) {
+      return false;
+    }
+    if (state.packetProcessorOwner === null) {
+      state.packetProcessorOwner = owner;
+      state.packetProcessorGeneration = nextGeneration(state.packetProcessorGeneration);
+    } else if (state.packetProcessorOwner !== owner) {
+      return false;
+    }
+    state.queuedPackets = queuedPackets;
+    state.clientPacketDrainActive = true;
+    state.clientPacketDrainOwner = owner;
+    state.clientPacketDrainOwnerGeneration = state.packetProcessorGeneration;
+    state.handlerOwner = owner;
+    state.handlerDepth = 1;
+    state.handlerCompletions = 0;
+    return true;
+  };
+  const reset = owner => {
+    if (owner == null || state.packetProcessorOwner !== owner) {
+      return false;
+    }
+    state.queuedPackets = 0;
+    state.retiredOwners.add(owner);
+    state.packetProcessorOwner = null;
+    state.packetProcessorGeneration = nextGeneration(state.packetProcessorGeneration);
+    // The active drain owner/generation survive until the handler and outer finally unwind.
+    return true;
+  };
+  const packetProcessed = owner => {
+    if (owner !== state.handlerOwner || state.handlerDepth <= 0) {
+      return false;
+    }
+    state.handlerDepth--;
+    state.handlerOwner = null;
+    if (state.clientPacketDrainActive && owner === state.clientPacketDrainOwner) {
+      state.handlerCompletions++;
+    }
+    // reset() already discarded the queued remainder; do not invent completions for it.
+    if (state.queuedPackets > 0) {
+      state.queuedPackets--;
+    }
+    return true;
+  };
+  const finish = owner => {
+    if (owner == null || owner !== state.clientPacketDrainOwner
+        || state.clientPacketDrainOwnerGeneration <= 0) {
+      return false;
+    }
+    const savedGeneration = state.clientPacketDrainOwnerGeneration;
+    const nextAfterSaved = nextGeneration(savedGeneration);
+    const currentOwner = owner === state.packetProcessorOwner
+      && state.packetProcessorGeneration === savedGeneration;
+    const retiredOwnerAfterReset = state.packetProcessorOwner === null
+      && state.packetProcessorGeneration === nextAfterSaved
+      && state.retiredOwners.has(owner);
+    if (!currentOwner && !retiredOwnerAfterReset) {
+      return false;
+    }
+    state.clientPacketDrainActive = false;
+    state.clientPacketDrainOwner = null;
+    state.clientPacketDrainOwnerGeneration = 0;
+    return true;
+  };
+  return {state, claim, reset, packetProcessed, finish};
+}
+
+const closeDrain = activeDrainCloseModel();
+const closeOwner = {};
+const foreignOwner = {};
+const newFrameOwner = {};
+assert.equal(closeDrain.claim(closeOwner, 256), true,
+  "active drain model failed to claim the initial owner");
+assert.equal(closeDrain.reset(closeOwner), true,
+  "active drain model failed to retire the owner from an in-handler reset");
+assert.equal(closeDrain.state.queuedPackets, 0,
+  "reset did not clear the queued remainder in the lifecycle model");
+assert.equal(closeDrain.packetProcessed(closeOwner), true,
+  "retired owner handler did not unwind after reset");
+assert.equal(closeDrain.finish(closeOwner), true,
+  "retired owner could not release its exact active drain claim");
+assert.equal(closeDrain.state.clientPacketDrainActive, false,
+  "reset -> packetProcessed -> finish left the active drain stuck");
+assert.equal(closeDrain.state.handlerCompletions, 1,
+  "queue reset fabricated or lost the one handler completion");
+assert.equal(closeDrain.state.queuedPackets, 0,
+  "queue reset was incorrectly decremented as a packet completion");
+const closeDrainHandlerCompletions = closeDrain.state.handlerCompletions;
+const closeDrainQueueAfterReset = closeDrain.state.queuedPackets;
+assert.equal(closeDrain.claim(newFrameOwner, 256), true,
+  "a fresh owner could not claim a new frame after the old drain finished");
+assert.equal(closeDrain.finish(foreignOwner), false,
+  "a foreign owner finished a newer active drain");
+assert.equal(closeDrain.state.clientPacketDrainActive, true,
+  "foreign finish incorrectly cleared the newer active drain");
+assert.equal(closeDrain.finish(closeOwner), false,
+  "a stale retired owner finished a newer active drain");
+assert.equal(closeDrain.state.clientPacketDrainActive, true,
+  "stale finish incorrectly cleared the newer active drain");
+assert.equal(closeDrain.finish(newFrameOwner), true,
+  "the new frame owner could not finish its own generation");
+
 const vanillaDisabled = scheduledFrameModel(256, {enabled: false});
 assert.equal(vanillaDisabled.mode, "vanilla");
 assert.equal(vanillaDisabled.calls, 1);
@@ -691,6 +846,12 @@ console.log(JSON.stringify({
   midDrainResetQueueDepthReduction: midDrainReset.queueDepthReduction,
   inactiveDrainResetPreservesHandler: inactiveDrainReset.processingDuringHandler,
   inactiveDrainResetCompletions: inactiveDrainReset.completionCount,
+  activeDrainCloseResetRelease: true,
+  activeDrainCloseHandlerCompletions: closeDrainHandlerCompletions,
+  activeDrainCloseQueueAfterReset: closeDrainQueueAfterReset,
+  activeDrainCloseFreshFrameClaimed: true,
+  activeDrainCloseForeignFinishRejected: true,
+  activeDrainCloseStaleFinishRejected: true,
   vanillaMaximumPackets: vanillaDisabled.handled.length,
   budgetMillis: 2,
   passiveDemandSignals: stats.clientPacketDrainDemandSignals,

@@ -28,6 +28,14 @@ public final class BrowserPacketScheduler {
     private static String clientPacketDrainStopReason = "inactive";
     private static long clientPacketDrainEpoch;
     private static int clientPacketDrainHandlerCompletions;
+    /**
+     * Identity and PacketProcessor generation that claimed the active client drain.  The owner is
+     * retained across an in-handler close/reset so the surrounding runTick finally block can
+     * release the claim after the lifecycle owner has been retired.  It is never used to authorize
+     * a foreign owner or a later generation.
+     */
+    private static Object clientPacketDrainOwner;
+    private static long clientPacketDrainOwnerGeneration;
     private static int queuedPacketHandleDepth;
     private static long queuedPacketHandleStartedNanos;
     private static long longestQueuedPacketHandleNanos;
@@ -250,6 +258,8 @@ public final class BrowserPacketScheduler {
         }
         clientPacketDrainActive = true;
         clientPacketDrainCritical = critical;
+        clientPacketDrainOwner = null;
+        clientPacketDrainOwnerGeneration = 0L;
         clientPacketDrainEpoch = clientPacketDrainEpoch == Long.MAX_VALUE
                 ? 1L
                 : clientPacketDrainEpoch + 1L;
@@ -261,7 +271,12 @@ public final class BrowserPacketScheduler {
         if (!claimPacketProcessorOwner(owner)) {
             return false;
         }
-        return tryBeginClientPacketDrain(critical);
+        if (!tryBeginClientPacketDrain(critical)) {
+            return false;
+        }
+        clientPacketDrainOwner = owner;
+        clientPacketDrainOwnerGeneration = packetProcessorGeneration;
+        return true;
     }
 
     /** Marks an exceptional or reset-aborted active drain without deriving success from queue depth. */
@@ -290,10 +305,24 @@ public final class BrowserPacketScheduler {
         }
         clientPacketDrainActive = false;
         clientPacketDrainCritical = false;
+        clientPacketDrainOwner = null;
+        clientPacketDrainOwnerGeneration = 0L;
     }
 
     public static void finishClientPacketDrain(Object owner) {
-        if (owner == packetProcessorOwner) {
+        if (owner == null || owner != clientPacketDrainOwner
+                || clientPacketDrainOwnerGeneration <= 0L) {
+            return;
+        }
+        boolean currentOwner = owner == packetProcessorOwner
+                && packetProcessorGeneration == clientPacketDrainOwnerGeneration;
+        long nextGeneration = clientPacketDrainOwnerGeneration == Long.MAX_VALUE
+                ? 1L
+                : clientPacketDrainOwnerGeneration + 1L;
+        boolean retiredOwnerAfterReset = packetProcessorOwner == null
+                && packetProcessorGeneration == nextGeneration
+                && isRetiredPacketProcessorOwner(owner);
+        if (currentOwner || retiredOwnerAfterReset) {
             finishClientPacketDrain();
         }
     }
@@ -480,6 +509,16 @@ public final class BrowserPacketScheduler {
         // A conflict intentionally stops all global queue/frame mutation. The handler scope above
         // is still unwound so a later vanilla packet cannot be mistaken for nested queued work.
         if (owner != packetProcessorOwner || !packetProcessorAccountingValid) {
+            // PacketProcessor.close/reset may have retired the owner while this exact queued
+            // handler was still unwinding.  Count the handler that really completed, but do not
+            // decrement the queue: reset() already cleared the queue and the dropped remainder is
+            // reported as unattributed reduction by the frame-boundary evidence.
+            if (owner == clientPacketDrainOwner
+                    && clientPacketDrainActive
+                    && completedHandleNanos >= 0L
+                    && clientPacketDrainHandlerCompletions < Integer.MAX_VALUE) {
+                clientPacketDrainHandlerCompletions++;
+            }
             if (queuedPacketHandleDepth == 0 && packetProcessorOwner == null
                     && !packetProcessorConflictPoisoned) {
                 packetProcessorOwnerConflict = false;
@@ -548,6 +587,8 @@ public final class BrowserPacketScheduler {
         if (!preserveActiveDrainEvidence) {
             clientPacketDrainActive = false;
             clientPacketDrainCritical = false;
+            clientPacketDrainOwner = null;
+            clientPacketDrainOwnerGeneration = 0L;
             clientPacketDrainRequestedPackets = 0;
             clientPacketDrainBatchTargetPackets = 0;
             clientPacketDrainRemainingDebt = 0;
@@ -719,6 +760,8 @@ public final class BrowserPacketScheduler {
         clientPacketDrainBatchTargetPackets = 0;
         clientPacketDrainRemainingDebt = 0;
         packetQueuePaused = false;
+        clientPacketDrainOwner = null;
+        clientPacketDrainOwnerGeneration = 0L;
         BrowserWebSocketChannel.recordDecodedPacketQueue(
                 queuedPackets, false, false, -1.0, null);
     }

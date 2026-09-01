@@ -157,11 +157,11 @@ const clientNetworkInstallScript = jsBodyBeforeIn(
   "private static native boolean installInboundPump(",
 );
 const inboundPumpHandlerSource = clientNetworkInstallScript.slice(
-  clientNetworkInstallScript.indexOf("bridge.inboundPump = function()"),
+  clientNetworkInstallScript.indexOf("bridge.inboundPump = function(reason)"),
   clientNetworkInstallScript.indexOf("return true;",
-    clientNetworkInstallScript.indexOf("bridge.inboundPump = function()")),
+    clientNetworkInstallScript.indexOf("bridge.inboundPump = function(reason)")),
 );
-assert.match(inboundPumpHandlerSource, /schedulePump\('requested'\)/,
+assert.match(inboundPumpHandlerSource, /schedulePump\(String\(reason \|\| 'requested'\)\)/,
   "WebSocket delivery does not coalesce into the independent scheduler");
 assert.doesNotMatch(inboundPumpHandlerSource, /callback\(\)/,
   "a WebSocket callback synchronously entered Java packet decoding");
