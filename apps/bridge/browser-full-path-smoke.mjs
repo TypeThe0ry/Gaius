@@ -1999,6 +1999,12 @@ function createFairClientPollScheduler(getClients) {
             typeof client.servicePlayTick !== "function") {
             return false;
         }
+        // A transport drop clears nextPlayTickDueAt while leaving the client
+        // active.  Admit exactly one service call after polling resumes so
+        // servicePlayTick() can clear playTickSuspended and re-anchor the
+        // cadence; otherwise a due-only admission guard would strand the
+        // resumed client with an undefined deadline.
+        if (client.playTickSuspended === true) return true;
         const dueAt = Number(client.nextPlayTickDueAt);
         const current = Number(now);
         return Number.isFinite(dueAt) && Number.isFinite(current) && current >= dueAt;
@@ -2217,12 +2223,14 @@ function createFairClientPollScheduler(getClients) {
                     if (candidate === undefined || candidate === null || candidate.closed ||
                         candidate.pollingPaused ||
                         typeof candidate.servicePlayTick !== "function") continue;
+                    const tickNow = performance.now();
+                    if (!isPlayTickDue(candidate, tickNow)) continue;
                     tickServicesThisCallback++;
                     playTickServiceCalls++;
-                    const tickStartedAt = performance.now();
+                    const tickStartedAt = tickNow;
                     try {
                         if (candidate.servicePlayTick(
-                            performance.now(), callbackSequenceNumber, trigger, callbackPhase)) {
+                            tickNow, callbackSequenceNumber, trigger, callbackPhase)) {
                             playTickDispatches++;
                             tickDispatchesThisCallback++;
                         }

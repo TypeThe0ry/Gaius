@@ -243,10 +243,13 @@ assert.match(schedulerSource, /callbackFinalizationTail/u,
 assert.match(schedulerSource, /servicePlayTick/u);
 assert.match(schedulerSource, /MAX_PLAY_TICKS_PER_SCHEDULER_CALLBACK/u);
 assert.match(schedulerSource,
-    /candidate\.servicePlayTick\(\s*performance\.now\(\),\s*callbackSequenceNumber,\s*trigger,\s*callbackPhase\)/u,
+    /const tickNow = performance\.now\(\);[\s\S]*?if\s*\(!isPlayTickDue\(candidate,\s*tickNow\)\)\s*continue;[\s\S]*?candidate\.servicePlayTick\(\s*tickNow,\s*callbackSequenceNumber,\s*trigger,\s*callbackPhase\)/u,
     "scheduler did not pass PLAY tick callback provenance");
 assert.match(schedulerSource, /isPlayTickDue/u,
     "scheduler must inspect unserviced PLAY tick deadlines before idling");
+assert.match(schedulerSource,
+    /if\s*\(client\.playTickSuspended\s*===\s*true\)\s*return\s*true/u,
+    "scheduler due admission must wake a resumed suspended PLAY client");
 assert.match(schedulerSource, /countDuePlayTicks/u,
     "scheduler must count due PLAY ticks after the bounded tick batch");
 assert.match(schedulerSource, /lastDueTicksAfterService/u);
@@ -588,7 +591,12 @@ function makeModelClients({ dueAt = 100, pending = [] } = {}) {
 // inbound parsing.
 function modelPlayTick(state, now) {
     if (!state.active || state.closed || state.phase !== "play" ||
-        state.paused || now < state.nextDueAt) return false;
+        state.paused || state.pollingPaused) return false;
+    if (state.playTickSuspended === true) {
+        state.playTickSuspended = false;
+        state.nextDueAt = now;
+    }
+    if (!Number.isFinite(Number(state.nextDueAt)) || now < state.nextDueAt) return false;
     const dueAt = state.nextDueAt;
     state.ticks++;
     state.lastTickAt = now;
@@ -612,7 +620,9 @@ function modelPlayTickBatch(states, cursor, now, limit = BATCH_LIMIT) {
         attempts++) {
         const state = states[nextCursor];
         nextCursor = (nextCursor + 1) % states.length;
-        if (state === undefined || state.closed || state.paused || !state.active) continue;
+        if (state === undefined || state.closed || state.paused ||
+            state.pollingPaused || !state.active) continue;
+        if (!modelIsPlayTickDue(state, now)) continue;
         serviced++;
         if (modelPlayTick(state, now)) sent++;
     }
@@ -661,8 +671,10 @@ function orderedPlayTickTimingSamples(state) {
 
 function modelIsPlayTickDue(state, now) {
     if (state === undefined || state === null || state.closed || state.paused ||
+        state.pollingPaused ||
         state.failure !== undefined || state.phase !== "play" ||
         state.active !== true) return false;
+    if (state.playTickSuspended === true) return true;
     const dueAt = Number(state.nextDueAt);
     const current = Number(now);
     return Number.isFinite(dueAt) && Number.isFinite(current) && current >= dueAt;
@@ -1198,6 +1210,61 @@ function retainPollPhaseSample(state, candidate) {
         "boundary delayed tick was not serviced");
     assert.equal(boundaryTicks.skippedPeriods, 2,
         "exact-period delay must count from nextDueAt with ceil semantics");
+    const notDue = {
+        active: true,
+        closed: false,
+        phase: "play",
+        paused: false,
+        pollingPaused: false,
+        playTickSuspended: false,
+        nextDueAt: 100,
+        ticks: 0,
+        skippedPeriods: 0,
+    };
+    const notDueBatch = modelPlayTickBatch([notDue], 0, 0, BATCH_LIMIT);
+    assert.equal(notDueBatch.serviced, 0,
+        "not-due PLAY client was admitted to the service batch");
+    assert.equal(notDueBatch.sent, 0,
+        "not-due PLAY client emitted a tick");
+    const resumed = {
+        active: true,
+        closed: false,
+        phase: "play",
+        paused: false,
+        pollingPaused: false,
+        playTickSuspended: true,
+        nextDueAt: undefined,
+        ticks: 0,
+        skippedPeriods: 0,
+    };
+    assert.equal(modelIsPlayTickDue(resumed, 0), true,
+        "resumed suspended PLAY client was not admitted");
+    const resumedBatch = modelPlayTickBatch([resumed], 0, 0, BATCH_LIMIT);
+    assert.equal(resumedBatch.serviced, 1,
+        "resumed suspended PLAY client did not receive its recovery service");
+    assert.equal(resumedBatch.sent, 1,
+        "resumed suspended PLAY client did not emit its recovery tick");
+    assert.equal(resumed.playTickSuspended, false,
+        "recovery service did not clear PLAY suspension");
+    const pausedSuspended = {
+        active: true,
+        closed: false,
+        phase: "play",
+        paused: false,
+        pollingPaused: true,
+        playTickSuspended: true,
+        nextDueAt: undefined,
+        ticks: 0,
+        skippedPeriods: 0,
+    };
+    assert.equal(modelIsPlayTickDue(pausedSuspended, 0), false,
+        "transport-paused suspended PLAY client was admitted");
+    const pausedSuspendedBatch = modelPlayTickBatch(
+        [pausedSuspended], 0, 0, BATCH_LIMIT);
+    assert.equal(pausedSuspendedBatch.serviced, 0,
+        "transport-paused suspended PLAY client was serviced");
+    assert.equal(pausedSuspendedBatch.sent, 0,
+        "transport-paused suspended PLAY client emitted a tick");
     ticks.paused = true;
     assert.equal(modelPlayTick(ticks, 400), false,
         "paused client emitted a shared tick");
