@@ -2185,8 +2185,10 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 deliverInbound(entry, event.data);
               } else if (event.data && typeof event.data.arrayBuffer === 'function') {
                 event.data.arrayBuffer().then(function(buffer) {
+                  if (generation !== entry.webSocketGeneration || entry.closed) return;
                   deliverInbound(entry, buffer);
                 }, function(error) {
+                  if (generation !== entry.webSocketGeneration || entry.closed) return;
                   fail(entry, error && (error.message || error));
                 });
               }
@@ -2197,8 +2199,8 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               }
             };
             ws.onclose = function(event) {
-              clearCandidateTimeout(entry);
               if (generation !== entry.webSocketGeneration || entry.closed) return;
+              clearCandidateTimeout(entry);
               if (!entry.connected) {
                 entry.directNegotiating = false;
                 recordConnectPhase(

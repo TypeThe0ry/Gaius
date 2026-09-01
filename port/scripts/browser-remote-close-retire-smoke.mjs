@@ -59,6 +59,186 @@ const onCloseBody = source.slice(onCloseStart, onCloseEnd);
 assert.match(onCloseBody, /entry\.closed = true/);
 assert.match(onCloseBody, /entry\.connected = false/);
 assert.match(onCloseBody, /state\.retireClosedEntry\(entry\)/);
+const staleCloseGuardOffset = onCloseBody.indexOf(
+  "if (generation !== entry.webSocketGeneration || entry.closed) return;",
+);
+const staleCloseTimeoutClearOffset = onCloseBody.indexOf("clearCandidateTimeout(entry);");
+assert.ok(staleCloseGuardOffset >= 0,
+  "remote onclose lost its generation/closed guard");
+assert.ok(staleCloseTimeoutClearOffset > staleCloseGuardOffset,
+  "stale candidate onclose can clear the current candidate timeout before its generation guard");
+
+// A failed candidate closes asynchronously. Its old onclose can therefore run after failover has
+// installed a timeout for the next generation. The old callback must be a no-op; otherwise it
+// clears the new timer and leaves a permanently CONNECTING entry with no eventual cleanup.
+function candidateFailoverRaceModel({staleCloseClearsCurrentTimeout}) {
+  let clock = 0;
+  let sequence = 0;
+  let generation = 0;
+  let candidateTimeout = null;
+  let closed = false;
+  let finalized = false;
+  let newTimeoutFired = false;
+  const timers = [];
+
+  function schedule(fn, delay = 0) {
+    const task = {id: ++sequence, at: clock + delay, fn, canceled: false};
+    timers.push(task);
+    return task;
+  }
+
+  function clearCandidateTimeout() {
+    if (!candidateTimeout) return;
+    candidateTimeout.canceled = true;
+    candidateTimeout = null;
+  }
+
+  function finalize() {
+    finalized = true;
+    candidateTimeout = null;
+  }
+
+  function failAndRetire() {
+    closed = true;
+    clearCandidateTimeout();
+    schedule(finalize);
+  }
+
+  function onClose(candidateGeneration) {
+    if (staleCloseClearsCurrentTimeout) clearCandidateTimeout();
+    if (candidateGeneration !== generation || closed) return;
+    clearCandidateTimeout();
+    failAndRetire();
+  }
+
+  function openCandidate() {
+    const candidateGeneration = ++generation;
+    const timeout = schedule(() => {
+      if (candidateTimeout === timeout) candidateTimeout = null;
+      if (closed || candidateGeneration !== generation) return;
+      if (candidateGeneration === 1) {
+        // close() queues the old callback, while failover starts synchronously and arms gen 2.
+        schedule(() => onClose(candidateGeneration));
+        openCandidate();
+      } else {
+        newTimeoutFired = true;
+        failAndRetire();
+      }
+    }, 10);
+    candidateTimeout = timeout;
+  }
+
+  function runNext() {
+    timers.sort((left, right) => left.at - right.at || left.id - right.id);
+    const task = timers.shift();
+    if (!task) return false;
+    if (task.canceled) return true;
+    clock = Math.max(clock, task.at);
+    task.fn();
+    return true;
+  }
+
+  openCandidate();
+  while (!finalized && runNext()) {}
+  return {newTimeoutFired, finalized, generation, clock};
+}
+
+const legacyCandidateRace = candidateFailoverRaceModel({staleCloseClearsCurrentTimeout: true});
+assert.equal(legacyCandidateRace.newTimeoutFired, false,
+  "candidate race model no longer demonstrates the pre-fix timer loss");
+assert.equal(legacyCandidateRace.finalized, false,
+  "legacy stale onclose unexpectedly reached bounded candidate cleanup");
+const fixedCandidateRace = candidateFailoverRaceModel({staleCloseClearsCurrentTimeout: false});
+assert.equal(fixedCandidateRace.generation, 2,
+  "candidate timeout/failover did not advance to a fresh WebSocket generation");
+assert.equal(fixedCandidateRace.newTimeoutFired, true,
+  "new generation candidate timeout was cleared by stale old onclose");
+assert.equal(fixedCandidateRace.finalized, true,
+  "new generation timeout did not reach eventual bounded cleanup");
+
+// A WebSocket may expose a Blob even though binaryType was requested as ArrayBuffer (for example
+// through a relay/polyfill). arrayBuffer() resolves later, after candidate fallback can have
+// incremented entry.webSocketGeneration. Both promise callbacks must re-check generation and
+// closed state at execution time, not only the synchronous onmessage entry point.
+const blobArrayBufferStart = source.indexOf(
+  "event.data.arrayBuffer().then(function(buffer)",
+);
+const blobArrayBufferEnd = source.indexOf("});", blobArrayBufferStart);
+assert.ok(
+  blobArrayBufferStart >= 0 && blobArrayBufferEnd > blobArrayBufferStart,
+  "missing Blob arrayBuffer promise callbacks",
+);
+const blobArrayBufferBody = source.slice(blobArrayBufferStart, blobArrayBufferEnd);
+const blobGenerationGuard = "if (generation !== entry.webSocketGeneration || entry.closed) return;";
+assert.equal(
+  blobArrayBufferBody.split(blobGenerationGuard).length - 1,
+  2,
+  "Blob promise callbacks must both carry the generation/closed guard",
+);
+const blobSuccessGuardOffset = blobArrayBufferBody.indexOf(blobGenerationGuard);
+const blobSuccessDeliveryOffset = blobArrayBufferBody.indexOf("deliverInbound(entry, buffer)");
+const blobRejectStart = blobArrayBufferBody.indexOf("}, function(error)");
+const blobRejectGuardOffset = blobArrayBufferBody.indexOf(blobGenerationGuard, blobRejectStart);
+const blobRejectFailureOffset = blobArrayBufferBody.indexOf("fail(entry, error");
+assert.ok(
+  blobSuccessGuardOffset >= 0 && blobSuccessGuardOffset < blobSuccessDeliveryOffset,
+  "stale Blob resolve can deliver before its generation guard",
+);
+assert.ok(
+  blobRejectStart >= 0 && blobRejectGuardOffset > blobRejectStart &&
+    blobRejectGuardOffset < blobRejectFailureOffset,
+  "stale Blob rejection can fail the current entry before its generation guard",
+);
+
+function delayedBlobGenerationRaceModel({guardCallbacks}) {
+  const entry = {
+    webSocketGeneration: 1,
+    closed: false,
+    inbound: [],
+    failures: [],
+  };
+  const oldGeneration = entry.webSocketGeneration;
+  const delayedCallbacks = [
+    {kind: "resolve", generation: oldGeneration, value: "old-blob-buffer"},
+    {kind: "reject", generation: oldGeneration, value: "old-blob-error"},
+  ];
+
+  // Candidate 1 failed over to candidate 2. The entry remains live, but its generation changed.
+  entry.webSocketGeneration = 2;
+  for (const callback of delayedCallbacks) {
+    if (guardCallbacks && (
+      callback.generation !== entry.webSocketGeneration || entry.closed
+    )) {
+      continue;
+    }
+    if (callback.kind === "resolve") {
+      entry.inbound.push(callback.value);
+    } else {
+      entry.failures.push(callback.value);
+    }
+  }
+  return {
+    oldGeneration,
+    currentGeneration: entry.webSocketGeneration,
+    deliveredByOldGeneration: entry.inbound.length,
+    failedByOldGeneration: entry.failures.length,
+  };
+}
+
+const legacyBlobRace = delayedBlobGenerationRaceModel({guardCallbacks: false});
+assert.equal(legacyBlobRace.oldGeneration, 1);
+assert.equal(legacyBlobRace.currentGeneration, 2);
+assert.equal(legacyBlobRace.deliveredByOldGeneration, 1,
+  "Blob race model no longer demonstrates the pre-fix stale delivery");
+assert.equal(legacyBlobRace.failedByOldGeneration, 1,
+  "Blob race model no longer demonstrates the pre-fix stale failure");
+const fixedBlobRace = delayedBlobGenerationRaceModel({guardCallbacks: true});
+assert.equal(fixedBlobRace.oldGeneration, 1);
+assert.equal(fixedBlobRace.currentGeneration, 2);
+assert.equal(fixedBlobRace.deliveredByOldGeneration, 0,
+  "stale Blob resolve delivered bytes to the replacement generation");
+assert.equal(fixedBlobRace.failedByOldGeneration, 0,
+  "stale Blob rejection failed the replacement generation");
 
 const discardStart = source.lastIndexOf("state.discardInbound = function(entry)");
 const discardEnd = source.indexOf("};", discardStart);
@@ -490,6 +670,9 @@ console.log(JSON.stringify({
   javaChannelRetireWake: true,
   exactPauseCloseWakeBypass: true,
   staleReplacementWakeSafe: true,
+  blobGenerationGuard: true,
+  staleBlobResolveDropped: true,
+  staleBlobRejectDropped: true,
   failPathRetire: true,
   sourcePath: repository.pathname,
 }, null, 2));
