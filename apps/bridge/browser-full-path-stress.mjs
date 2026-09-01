@@ -226,6 +226,9 @@ for (const tier of tiers) {
         "side-map-authoritative-client-property-mirror-only");
     assert.equal(schedulerContract.immediateInboundPriority,
         "client-method-buffer-then-bridge");
+    assert.equal(schedulerContract.idleImmediateWindowMillis, 2);
+    assert.equal(schedulerContract.idleImmediateProbeBudgetMillis, 2);
+    assert.equal(schedulerContract.idleImmediateProbeSpinLimit, 16);
     assert.deepEqual(schedulerContract.callbackTail, {
         schemaVersion: "gaius.browser-client-poll-callback-tail.v1",
         slowThresholdMillis: 16.7,

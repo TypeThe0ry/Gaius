@@ -45,6 +45,9 @@ assert.match(source,
     /overdueWakePending && dispatched === 0/u,
     "overdue wake suppression must not discard a successful dispatch");
 assert.match(source,
+    /lastDueTicksBeforeIdle > 0 \|\| lastDueTicksAfterService > 0 \|\|\s*\n?\s*readyAfterDispatch/u,
+    "ready poll candidates must not be parked on the idle timer");
+assert.match(source,
     /probeElapsedMillis[\s\S]*POLL_SCHEDULER_IDLE_IMMEDIATE_PROBE_BUDGET_MILLIS/u,
     "near-due probe must enforce its absolute elapsed-time budget");
 assert.match(source,
@@ -1846,6 +1849,19 @@ assert.deepEqual(modelIdleContinuation({
     });
     assert.equal(dispatchedAfterWake.continuation, "immediate",
         "successful overdue wake incorrectly forced the peer batch to idle");
+    const readyWithoutDispatch = modelDeadlineProbeContinuation({
+        now: 250,
+        earliestPollDueAt: Infinity,
+        readyAfterDispatch: true,
+        dispatched: 0,
+        dueTicks: 0,
+    });
+    assert.deepEqual(readyWithoutDispatch, {
+        continuation: "immediate",
+        idleImmediateSpins: 0,
+        probeStartedAt: undefined,
+        overdueWakePending: false,
+    }, "fair-ready candidate was parked after a budgeted zero-dispatch turn");
 }
 
 // A queued inbound frame does not bypass nextPollDueAt.  This is the

@@ -520,6 +520,18 @@ function assertPollPhaseTelemetryContract(config, label) {
         `${label}: poll phase retention policy drifted`);
 }
 
+function assertPollSchedulerProbeContract(config, label) {
+    const scheduler = config?.performanceContract?.pollScheduler;
+    assert.ok(scheduler && typeof scheduler === "object",
+        `${label}: poll scheduler contract missing`);
+    assert.equal(scheduler.idleImmediateWindowMillis, 2,
+        `${label}: idle immediate window drifted`);
+    assert.equal(scheduler.idleImmediateProbeBudgetMillis, 2,
+        `${label}: idle probe budget drifted`);
+    assert.equal(scheduler.idleImmediateProbeSpinLimit, 16,
+        `${label}: idle probe spin limit drifted`);
+}
+
 function assertCallbackFinalizationTailContract(config, label) {
     const telemetry = config?.performanceContract?.callbackFinalizationTail ??
         config?.performanceContract?.pollScheduler?.callbackFinalizationTail;
@@ -608,6 +620,8 @@ for (const expected of expectedProfiles) {
         "unavailable",
         `${expected.id} arrival wire source contract drifted`);
     assertPollPhaseTelemetryContract(config, `${expected.id} compatible config`);
+    assertPollSchedulerProbeContract(config,
+        `${expected.id} compatible config`);
     assertCallbackFinalizationTailContract(config,
         `${expected.id} compatible config`);
     assertPeriodicServerSyncContract(config,
@@ -704,6 +718,8 @@ for (const expected of expectedProfiles) {
         assert.equal(stress.clients, tier);
         assert.equal(stress.performanceContract.mode, `stress-tier-${tier}`);
         assertPollPhaseTelemetryContract(stress,
+            `${expected.id} stress tier ${tier} config`);
+        assertPollSchedulerProbeContract(stress,
             `${expected.id} stress tier ${tier} config`);
         assertCallbackFinalizationTailContract(stress,
             `${expected.id} stress tier ${tier} config`);
@@ -889,6 +905,8 @@ for (const expected of expectedProfiles) {
     assert.deepEqual(strict.performanceContract.strictAcceptanceTarget,
         strict.strictAcceptanceTarget);
     assert.equal(strict.performanceContract.mode, "strict-acceptance");
+    assertPollSchedulerProbeContract(strict,
+        `${expected.id} strict config`);
     assertCallbackFinalizationTailContract(strict,
         `${expected.id} strict config`);
 }

@@ -2552,7 +2552,14 @@ function createFairClientPollScheduler(getClients) {
                 emptyCallbacks++;
                 // Keep a due PLAY client on the immediate path even when this
                 // callback had no inbound poll dispatches.
-                if (lastDueTicksBeforeIdle > 0 || lastDueTicksAfterService > 0) {
+                if (lastDueTicksBeforeIdle > 0 || lastDueTicksAfterService > 0 ||
+                    readyAfterDispatch) {
+                    // A fair poll candidate can become ready while the shared
+                    // callback is budgeted out by PLAY-tick work.  Keep that
+                    // candidate on the immediate path even when this turn
+                    // dispatched zero polls; otherwise the finalizer parks it
+                    // on the host's quantized idle timer and recreates the
+                    // 15--25 ms gap this scheduler is intended to remove.
                     nextContinuation = "immediate";
                 }
                 else if (!(nextContinuation === "immediate" &&
@@ -6947,6 +6954,12 @@ function browserFullPathPerformanceContract() {
             maxBatchClients: MAX_CLIENTS_PER_POLL_CALLBACK,
             callbackWorkBudgetMillis: MAX_POLL_CALLBACK_WORK_MILLIS,
             callbackBudgetCoversPlayTicks: true,
+            idleImmediateWindowMillis:
+                POLL_SCHEDULER_IDLE_IMMEDIATE_WINDOW_MILLIS,
+            idleImmediateProbeBudgetMillis:
+                POLL_SCHEDULER_IDLE_IMMEDIATE_PROBE_BUDGET_MILLIS,
+            idleImmediateProbeSpinLimit:
+                POLL_SCHEDULER_IDLE_IMMEDIATE_SPIN_LIMIT,
             maxPlayTicksPerSchedulerCallback:
                 MAX_PLAY_TICKS_PER_SCHEDULER_CALLBACK,
             maxVisibleDispatchSkew: MAX_VISIBLE_DISPATCH_SKEW,
