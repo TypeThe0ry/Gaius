@@ -10834,6 +10834,7 @@ public final class MinecraftClientPatcher {
     private static void patchPacketProcessorBrowserSlice(String jar, Path output) throws IOException {
         String owner = "net/minecraft/network/PacketProcessor";
         ClassNode node = read(jar, owner + ".class");
+        patchPacketProcessorLifecycle(node);
         MethodNode schedule = find(
                 node,
                 "scheduleIfPossible",
@@ -10959,6 +10960,53 @@ public final class MinecraftClientPatcher {
         writeComputeFrames(node, output);
     }
 
+    /**
+     * Binds PacketProcessor ownership at the real construction boundary.  The frame-boundary
+     * bind is intentionally a claim-only operation: a late callback from a closed processor must
+     * not clear its retired tombstone and resurrect the static accounting epoch.  Constructor
+     * reuse is the only explicit lifecycle operation that may release that tombstone.
+     */
+    private static void patchPacketProcessorLifecycle(ClassNode node) {
+        MethodNode constructor = find(node, "<init>", "(Ljava/lang/Thread;)V");
+        int existing = 0;
+        for (AbstractInsnNode instruction : constructor.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("dev/gaius/browser/BrowserPacketScheduler")
+                    && call.name.equals("bindPacketProcessorLifecycle")
+                    && call.desc.equals("(Ljava/lang/Object;)Z")) {
+                existing++;
+            }
+        }
+        if (existing != 0) {
+            throw new IllegalStateException(
+                    "PacketProcessor constructor already contains lifecycle ownership hook: "
+                            + existing);
+        }
+        int returns = 0;
+        for (AbstractInsnNode instruction : constructor.instructions.toArray()) {
+            if (instruction.getOpcode() != Opcodes.RETURN) {
+                continue;
+            }
+            InsnList hook = new InsnList();
+            hook.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            hook.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "dev/gaius/browser/BrowserPacketScheduler",
+                    "bindPacketProcessorLifecycle",
+                    "(Ljava/lang/Object;)Z",
+                    false));
+            hook.add(new InsnNode(Opcodes.POP));
+            constructor.instructions.insertBefore(instruction, hook);
+            returns++;
+        }
+        if (returns != 1) {
+            throw new IllegalStateException(
+                    "PacketProcessor constructor lifecycle return shape changed: " + returns);
+        }
+        constructor.maxStack = Math.max(constructor.maxStack, 1);
+    }
+
     private static void patchPacketProcessorQueuedAccounting(MethodNode schedule) {
         int patched = 0;
         for (AbstractInsnNode instruction : schedule.instructions.toArray()) {
@@ -11040,6 +11088,7 @@ public final class MinecraftClientPatcher {
         int shouldProcess = 0;
         int beginQueued = 0;
         int beginBatch = 0;
+        int lifecycle = 0;
         int legacySchedulerCalls = 0;
         for (MethodNode method : node.methods) {
             for (AbstractInsnNode instruction : method.instructions.toArray()) {
@@ -11065,6 +11114,9 @@ public final class MinecraftClientPatcher {
                 } else if (call.name.equals("beginQueuedPacket")
                         && call.desc.equals("(Ljava/lang/Object;Ljava/lang/Object;)V")) {
                     beginQueued++;
+                } else if (call.name.equals("bindPacketProcessorLifecycle")
+                        && call.desc.equals("(Ljava/lang/Object;)Z")) {
+                    lifecycle++;
                 } else if ((call.name.equals("packetQueued")
                         || call.name.equals("packetProcessed")
                         || call.name.equals("reset")
@@ -11079,7 +11131,8 @@ public final class MinecraftClientPatcher {
             }
         }
         if (queued != 1 || processed != 2 || reset != 1 || shouldProcess != 1
-                || beginBatch != 1 || beginQueued != 1 || legacySchedulerCalls != 0) {
+                || beginBatch != 1 || beginQueued != 1 || lifecycle != 1
+                || legacySchedulerCalls != 0) {
             throw new IllegalStateException(
                     "PacketProcessor accounting hooks changed: queued=" + queued
                             + ", processed=" + processed
@@ -11087,6 +11140,7 @@ public final class MinecraftClientPatcher {
                             + ", shouldProcess=" + shouldProcess
                             + ", beginBatch=" + beginBatch
                             + ", beginQueued=" + beginQueued
+                            + ", lifecycle=" + lifecycle
                             + ", legacy=" + legacySchedulerCalls);
         }
         System.out.println("Instrumented exact decoded-packet queue accounting");
