@@ -302,6 +302,59 @@ const ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS = 250;
 const ARRIVAL_TIMELINE_SAMPLE_LIMIT = 64;
 const ARRIVAL_TIMELINE_RECONNECT_PHASE_LIMIT = 64;
 const ARRIVAL_TIMELINE_FRAME_RING_LIMIT = 64;
+// Keep the event-level arrival trace additive and diagnostic-only.  It is a
+// bounded window used to explain a slow decoded-packet gap; it is not a
+// replacement for any strict callback/poll/tick gate.
+const ARRIVAL_TRACE_SCHEMA_VERSION =
+    "gaius.browser-client-arrival-trace.v1";
+const ARRIVAL_TRACE_EVENT_LIMIT = 64;
+const ARRIVAL_TRACE_POLL_EVENT_STRIDE = 256;
+const ARRIVAL_TRACE_FRAME_EVENT_STRIDE = 8;
+const ARRIVAL_TRACE_PACKET_BEGIN_EVENT_STRIDE = 16;
+const ARRIVAL_TRACE_PACKET_END_EVENT_STRIDE = 4;
+const ARRIVAL_TRACE_PACKET_ALWAYS_IDS = new Set([113]);
+// Event-level tracing is opt-in because every retained event is a small JS
+// object allocation.  Keep the normal acceptance/stress path free of this
+// diagnostic overhead; enable it only for a separate attribution run with
+// `GAIUS_BROWSER_FULL_PATH_TRACE=1`.
+const ARRIVAL_TRACE_ENABLED = process.env.GAIUS_BROWSER_FULL_PATH_TRACE === "1";
+// A trace-enabled run intentionally allocates and sorts diagnostic events in
+// the browser hot path.  Keep that evidence useful for attribution, but make
+// its strict-performance eligibility explicit so callers cannot mistake a
+// diagnostic pass for a clean release measurement.
+const ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE = !ARRIVAL_TRACE_ENABLED;
+const ARRIVAL_TRACE_EVENT_KINDS = Object.freeze([
+    "onmessage-enter",
+    "bridge-enqueue",
+    "bridge-dequeue",
+    "poll-ready",
+    "poll-begin",
+    "poll-end",
+    "decode-begin",
+    "decode-end",
+    "dispatch-begin",
+    "dispatch-end",
+    "phase",
+    "client-created",
+    "handshake-sent",
+    "disconnect",
+    "reconnect-scheduled",
+    "synthetic-transport-drop",
+    "connect-begin",
+    "transport-open",
+    "login-begin",
+    "login-done",
+    "configuration-begin",
+    "configuration-done",
+    "play-enter",
+    "play-login",
+    "first-onmessage",
+    "first-decoded-packet",
+    "first-chunk",
+    "minimum-chunks",
+    "close",
+]);
+const ARRIVAL_TRACE_EVENT_KIND_SET = new Set(ARRIVAL_TRACE_EVENT_KINDS);
 // 26.2 emits ClientboundSetTime (play packet id 113) on the vanilla
 // twenty-tick cadence.  A decoded gap near one second ending in that packet
 // is a useful cadence hint, not proof of a user-visible stall.  Keep this
@@ -1363,6 +1416,11 @@ try {
             mode: acceptanceMode
                 ? "strict-acceptance"
                 : stressMode ? `stress-tier-${stressTier}` : "compatible-smoke",
+            diagnostics: {
+                arrivalTraceEnabled: ARRIVAL_TRACE_ENABLED,
+                diagnosticOnly: ARRIVAL_TRACE_ENABLED,
+                strictEvidenceEligible: ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE,
+            },
             required: acceptanceMode
                 ? {
                     ...STRICT_ACCEPTANCE_TARGET,
@@ -1547,11 +1605,15 @@ try {
             schemaVersion: ARRIVAL_TIMELINE_SCHEMA_VERSION,
             independentExecution: false,
             strictGatesChanged: false,
+            diagnosticOnly: true,
+            strictEvidenceEligible: ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE,
             limits: {
                 perClientSlowSamples: ARRIVAL_TIMELINE_SAMPLE_LIMIT,
                 perClientReconnectPhases: ARRIVAL_TIMELINE_RECONNECT_PHASE_LIMIT,
                 frameMetadataRing: ARRIVAL_TIMELINE_FRAME_RING_LIMIT,
+                traceEvents: ARRIVAL_TRACE_EVENT_LIMIT,
             },
+            trace: arrivalTraceContract(),
             periodicServerSync: arrivalPeriodicServerSyncContract(),
             transport: browserRuntime.arrivalTelemetry?.evidence?.() ?? null,
             clients: allClients.map((client) => ({
@@ -2211,6 +2273,13 @@ function createFairClientPollScheduler(getClients) {
                     visited.add(candidate);
                     const pollNow = performance.now();
                     if (!isPollReady(candidate, pollNow)) continue;
+                    recordArrivalTrace(candidate.arrivalTraceRing, "poll-ready", {
+                        at: pollNow,
+                        phase: candidate.phase,
+                        source: "client",
+                        schedulerCallbackSequence: callbackSequenceNumber,
+                        pollSequence: candidate.pollPhaseSequence + 1,
+                    });
                     // A due client that has already received more turns than
                     // the least-served visible client must wait for the
                     // fairness floor.  This prevents a continuously busy
@@ -2679,6 +2748,7 @@ function createArrivalSocketState() {
         frameAtRing: new Float64Array(ARRIVAL_TIMELINE_FRAME_RING_LIMIT),
         frameBytesRing: new Uint32Array(ARRIVAL_TIMELINE_FRAME_RING_LIMIT),
         frameMetadataDropped: 0,
+        traceRing: createArrivalTraceRing(),
         lastDequeuedAt: null,
         lastDequeuedPollStartedAt: null,
         lastDequeuedOnmessageAt: null,
@@ -2711,6 +2781,12 @@ function recordArrivalSocketMessage(state, data, isBinary, telemetry) {
         0xffffffff,
         Math.max(0, binaryMessageBytes(data)),
     );
+    recordArrivalTrace(state.traceRing, "onmessage-enter", {
+        at,
+        source: "socket",
+        frameSequence: sequence,
+        frameBytes: state.frameBytesRing[slot],
+    });
     telemetry.binaryOnmessageFrames++;
     telemetry.binaryOnmessageBytes += state.frameBytesRing[slot];
 }
@@ -2744,6 +2820,12 @@ function recordArrivalBridgeDequeue(socket, polledAt, chunk, telemetry) {
         state.frameMetadataDropped++;
         telemetry.frameMetadataDropped++;
     }
+    recordArrivalTrace(state.traceRing, "bridge-dequeue", {
+        at: state.lastDequeuedAt,
+        source: "socket",
+        frameSequence: state.lastDequeuedFrameSequence,
+        frameBytes: state.lastDequeuedBytes,
+    });
     telemetry.bridgeDequeuedFrames++;
     telemetry.bridgeDequeuedBytes += state.lastDequeuedBytes ?? 0;
 }
@@ -2800,6 +2882,217 @@ function isPeriodicServerSyncArrival({
         Number.isFinite(decodedGapMillis) &&
         Math.abs(decodedGapMillis - ARRIVAL_PERIODIC_SERVER_SYNC_NOMINAL_GAP_MILLIS) <=
             ARRIVAL_PERIODIC_SERVER_SYNC_TOLERANCE_MILLIS;
+}
+
+function createArrivalTraceRing() {
+    return {
+        limit: ARRIVAL_TRACE_EVENT_LIMIT,
+        enabled: ARRIVAL_TRACE_ENABLED,
+        nextIndex: 0,
+        sequence: 0,
+        dropped: 0,
+        pollEventsSeen: 0,
+        pollEventsSuppressed: 0,
+        frameEventsSeen: 0,
+        events: new Array(ARRIVAL_TRACE_EVENT_LIMIT),
+    };
+}
+
+function traceInteger(value) {
+    return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function traceNumber(value) {
+    return Number.isFinite(value) && value >= 0 ? Number(value) : null;
+}
+
+function recordArrivalTrace(ring, kind, details = {}) {
+    if (ring === undefined || ring === null) return null;
+    if (ring.enabled !== true) return null;
+    const requestedKind = String(kind);
+    const traceKind = ARRIVAL_TRACE_EVENT_KIND_SET.has(requestedKind)
+        ? requestedKind : "phase";
+    const pollEvent = traceKind === "poll-ready" ||
+        traceKind === "poll-begin" || traceKind === "poll-end";
+    const pollSequence = traceInteger(details.pollSequence);
+    if (pollEvent) {
+        ring.pollEventsSeen++;
+        const sampled = details.force === true ||
+            (pollSequence !== null &&
+                pollSequence % ARRIVAL_TRACE_POLL_EVENT_STRIDE === 0);
+        if (!sampled) {
+            ring.pollEventsSuppressed++;
+            return null;
+        }
+    }
+    const frameEvent = traceKind === "onmessage-enter" ||
+        traceKind === "bridge-enqueue" || traceKind === "bridge-dequeue";
+    const frameSequence = traceInteger(details.frameSequence);
+    if (frameEvent) {
+        ring.frameEventsSeen++;
+        const sampleSequence = frameSequence ?? ring.frameEventsSeen;
+        if (details.force !== true &&
+            sampleSequence % ARRIVAL_TRACE_FRAME_EVENT_STRIDE !== 0) {
+            return null;
+        }
+    }
+    const packetSequence = traceInteger(details.packetSequence);
+    if (traceKind === "decode-begin" || traceKind === "dispatch-begin") {
+        if (packetSequence !== null && details.force !== true &&
+            packetSequence % ARRIVAL_TRACE_PACKET_BEGIN_EVENT_STRIDE !== 0) {
+            return null;
+        }
+    }
+    else if (traceKind === "decode-end" || traceKind === "dispatch-end") {
+        const packetId = traceInteger(details.packetId);
+        if (packetSequence !== null && details.force !== true &&
+            packetSequence % ARRIVAL_TRACE_PACKET_END_EVENT_STRIDE !== 0 &&
+            !ARRIVAL_TRACE_PACKET_ALWAYS_IDS.has(packetId)) {
+            return null;
+        }
+    }
+    const sequence = ++ring.sequence;
+    const index = ring.nextIndex;
+    if (ring.events[index] !== undefined) ring.dropped++;
+    const event = {
+        schemaVersion: ARRIVAL_TRACE_SCHEMA_VERSION,
+        sequence,
+        kind: traceKind,
+        at: traceNumber(details.at),
+        source: details.source === "socket" ? "socket" : "client",
+        frameSequence,
+        frameBytes: traceInteger(details.frameBytes),
+        packetSequence: traceInteger(details.packetSequence),
+        packetId: traceInteger(details.packetId),
+        phase: details.phase === undefined || details.phase === null
+            ? null : String(details.phase),
+        schedulerCallbackSequence: traceInteger(details.schedulerCallbackSequence),
+        pollSequence,
+        queueDepth: traceInteger(details.queueDepth),
+        bufferedBytes: traceInteger(details.bufferedBytes),
+        durationMillis: traceNumber(details.durationMillis),
+        intentional: details.intentional === true,
+    };
+    ring.events[index] = event;
+    ring.nextIndex = (index + 1) % ring.limit;
+    return event;
+}
+
+function orderedArrivalTraceEvents(ring) {
+    if (ring === undefined || ring === null) return [];
+    return ring.events.filter((event) => event !== undefined)
+        .sort((left, right) => left.sequence - right.sequence);
+}
+
+function arrivalTraceWindow(rings, startAt, endAt) {
+    const start = Number.isFinite(startAt) ? Number(startAt) : null;
+    const end = Number.isFinite(endAt) ? Number(endAt) : null;
+    const bounded = start !== null || end !== null;
+    const candidates = [];
+    let dropped = 0;
+    let pollEventsSuppressed = 0;
+    let timestampUnavailable = 0;
+    let ringOverflowAffectsWindow = false;
+    for (const ring of rings ?? []) {
+        if (ring === undefined || ring === null) continue;
+        dropped += ring.dropped;
+        pollEventsSuppressed += ring.pollEventsSuppressed;
+        const retainedEvents = orderedArrivalTraceEvents(ring);
+        const retainedTimes = retainedEvents.map((event) => event.at)
+            .filter((at) => Number.isFinite(at));
+        if (ring.dropped > 0 && (start === null || retainedTimes.length === 0 ||
+            Math.min(...retainedTimes) > start)) {
+            // `dropped` is cumulative.  It invalidates this particular window
+            // only when the oldest retained timestamp is newer than the
+            // window start (or when no timestamp can anchor the ring).
+            ringOverflowAffectsWindow = true;
+        }
+        for (const event of retainedEvents) {
+            if (bounded && event.at === null) {
+                timestampUnavailable++;
+                continue;
+            }
+            if (start !== null && event.at < start) continue;
+            if (end !== null && event.at > end) continue;
+            candidates.push(event);
+        }
+    }
+    candidates.sort((left, right) =>
+        (left.at ?? Number.POSITIVE_INFINITY) -
+            (right.at ?? Number.POSITIVE_INFINITY) ||
+        left.sequence - right.sequence || left.source.localeCompare(right.source));
+    const traceEvents = candidates.slice(0, ARRIVAL_TRACE_EVENT_LIMIT);
+    const retainedOverflow = Math.max(0, candidates.length - traceEvents.length);
+    const times = traceEvents
+        .map((event) => event.at)
+        .filter((at) => Number.isFinite(at));
+    let maxInterEventGapMillis = 0;
+    for (let index = 1; index < times.length; index++) {
+        maxInterEventGapMillis = Math.max(
+            maxInterEventGapMillis, Math.max(0, times[index] - times[index - 1]));
+    }
+    const eventCounts = Object.fromEntries(
+        ARRIVAL_TRACE_EVENT_KINDS.map((eventKind) => [eventKind, 0]));
+    for (const event of traceEvents) eventCounts[event.kind]++;
+    const totalDropped = dropped + retainedOverflow;
+    const enabled = (rings ?? []).some((ring) => ring?.enabled === true);
+    return {
+        schemaVersion: ARRIVAL_TRACE_SCHEMA_VERSION,
+        enabled,
+        diagnosticOnly: true,
+        strictEvidenceEligible: ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE,
+        strictGatesChanged: false,
+        limit: ARRIVAL_TRACE_EVENT_LIMIT,
+        gapStartAt: start,
+        gapEndAt: end,
+        gapMillis: start !== null && end !== null ? Math.max(0, end - start) : null,
+        firstEventAt: times.length > 0 ? times[0] : null,
+        lastEventAt: times.length > 0 ? times[times.length - 1] : null,
+        maxInterEventGapMillis,
+        eventCounts,
+        events: traceEvents,
+        dropped: totalDropped,
+        ringDropped: dropped,
+        ringOverflowAffectsWindow,
+        pollEventsSuppressed,
+        timestampUnavailableEvents: timestampUnavailable,
+        coverage: !enabled ? "disabled" :
+            bounded && timestampUnavailable > 0 ? "timestamp-incomplete" :
+                (ringOverflowAffectsWindow || retainedOverflow > 0)
+                    ? "ring-overflow" : "complete",
+        wireAtSource: ARRIVAL_WIRE_AT_SOURCE,
+        bridgeEnqueueTimestampAvailable: false,
+    };
+}
+
+function arrivalTraceContract() {
+    return {
+        schemaVersion: ARRIVAL_TRACE_SCHEMA_VERSION,
+        eventLimit: ARRIVAL_TRACE_EVENT_LIMIT,
+        pollEventStride: ARRIVAL_TRACE_POLL_EVENT_STRIDE,
+        frameEventStride: ARRIVAL_TRACE_FRAME_EVENT_STRIDE,
+        packetBeginEventStride: ARRIVAL_TRACE_PACKET_BEGIN_EVENT_STRIDE,
+        packetEndEventStride: ARRIVAL_TRACE_PACKET_END_EVENT_STRIDE,
+        enabled: ARRIVAL_TRACE_ENABLED,
+        diagnosticOnly: true,
+        strictEvidenceEligible: ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE,
+        strictGatesChanged: false,
+        wireAtSource: ARRIVAL_WIRE_AT_SOURCE,
+        bridgeEnqueueTimestampAvailable: false,
+        retention: "bounded-gap-window",
+    };
+}
+
+function arrivalTraceRingsForClient(client) {
+    const rings = [];
+    if (client?.arrivalTraceRing !== undefined) {
+        rings.push(client.arrivalTraceRing);
+    }
+    const socketRing = arrivalSocketStateForClient(client)?.traceRing;
+    if (socketRing !== undefined && socketRing !== client?.arrivalTraceRing) {
+        rings.push(socketRing);
+    }
+    return rings;
 }
 
 function classifyBrowserArrivalGap({
@@ -3056,6 +3349,7 @@ class BrowserMinecraftClient {
         this.arrivalSlowSamples = [];
         this.arrivalReconnectPhases = [];
         this.arrivalClassificationCounts = new Map();
+        this.arrivalTraceRing = createArrivalTraceRing();
         this.arrivalPeriodicServerSyncGapCountTotal = 0;
         this.arrivalPeriodicServerSyncGapsExcluded = 0;
         this.arrivalPhaseSequence = 0;
@@ -3125,6 +3419,12 @@ class BrowserMinecraftClient {
                 detail: String(details.detail).slice(0, 160),
             }),
         };
+        recordArrivalTrace(this.arrivalTraceRing, phase, {
+            at: entry.monotonicAt,
+            phase: entry.phase,
+            source: "client",
+            intentional: entry.intentional,
+        });
         this.arrivalReconnectPhaseCountTotal++;
         if (this.arrivalReconnectPhases.length >= ARRIVAL_TIMELINE_RECONNECT_PHASE_LIMIT) {
             this.arrivalReconnectPhases.shift();
@@ -3286,6 +3586,8 @@ class BrowserMinecraftClient {
             this.arrivalIntentionalDropGapsExcluded++;
             return;
         }
+        const traceWindow = arrivalTraceWindow(
+            arrivalTraceRingsForClient(this), previousDecodeEndAt, decodeEndAt);
         const sample = {
             schemaVersion: ARRIVAL_TIMELINE_SCHEMA_VERSION,
             wireAtSource: "unavailable",
@@ -3323,6 +3625,7 @@ class BrowserMinecraftClient {
                 decodeMillis,
                 decodeToDispatchMillis,
             },
+            traceWindow,
             queue: {
                 // The bridge stats object is runtime-global.  Use the channel
                 // entry for the primary value so one busy client cannot be
@@ -3384,6 +3687,13 @@ class BrowserMinecraftClient {
                 slowSamples: ARRIVAL_TIMELINE_SAMPLE_LIMIT,
                 reconnectPhases: ARRIVAL_TIMELINE_RECONNECT_PHASE_LIMIT,
                 frameMetadataRing: ARRIVAL_TIMELINE_FRAME_RING_LIMIT,
+                traceEvents: ARRIVAL_TRACE_EVENT_LIMIT,
+            },
+            trace: arrivalTraceContract(),
+            traceRing: {
+                enabled: this.arrivalTraceRing.enabled === true,
+                retainedEvents: orderedArrivalTraceEvents(this.arrivalTraceRing).length,
+                dropped: this.arrivalTraceRing.dropped,
             },
             source: {
                 wireTimestampAvailable: false,
@@ -3437,6 +3747,11 @@ class BrowserMinecraftClient {
                 ...sample,
                 timestamps: { ...sample.timestamps },
                 segments: { ...sample.segments },
+                traceWindow: sample.traceWindow === undefined ? null : {
+                    ...sample.traceWindow,
+                    eventCounts: { ...sample.traceWindow.eventCounts },
+                    events: sample.traceWindow.events.map((event) => ({ ...event })),
+                },
                 queue: { ...sample.queue },
                 clock: { ...sample.clock },
             })),
@@ -3464,6 +3779,7 @@ class BrowserMinecraftClient {
             Buffer.from([(this.port >>> 8) & 0xff, this.port & 0xff]),
             encodeVarInt(2),
         ]));
+        this.recordArrivalPhase("login-begin", performance.now());
         this.sendPacket(0, Buffer.concat([
             encodeString(this.username),
             Buffer.from(this.profileId, "hex"),
@@ -3730,6 +4046,14 @@ class BrowserMinecraftClient {
         const pollContext = this.resetPollPhaseContext(
             pollStartedAt, schedulerCallbackSequence, schedulerTrigger);
         this.pollPhasePollsTotal++;
+        recordArrivalTrace(this.arrivalTraceRing, "poll-begin", {
+            at: pollStartedAt,
+            phase: this.phase,
+            source: "client",
+            schedulerCallbackSequence,
+            pollSequence: pollContext.pollSequence,
+            bufferedBytes: this.buffer.byteLength,
+        });
         let checkErrorStartedAt;
         let recordPhasesStartedAt;
         let finalizeStartedAt;
@@ -3834,9 +4158,21 @@ class BrowserMinecraftClient {
                 finalizeStartedAt, finalizeEndedAt);
             this.clearArrivalFrame();
             pollContext.bufferAfter = this.buffer.byteLength;
+            const pollEndedAt = performance.now();
             pollContext.durationRawMillis = Math.max(0,
-                performance.now() - pollStartedAt);
+                pollEndedAt - pollStartedAt);
             if (this.failure !== undefined) pollContext.outcome = "error";
+            recordArrivalTrace(this.arrivalTraceRing, "poll-end", {
+                at: pollEndedAt,
+                phase: this.phase,
+                source: "client",
+                schedulerCallbackSequence,
+                pollSequence: pollContext.pollSequence,
+                bufferedBytes: this.buffer.byteLength,
+                durationMillis: pollContext.durationRawMillis,
+                force: pollContext.durationRawMillis >=
+                    ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS,
+            });
             // Prelude is the bounded check/phase bookkeeping before parsing.
             // Keep it as an explicit scalar instead of double-counting the
             // wall-clock interval (which also includes scheduler admission).
@@ -3861,6 +4197,17 @@ class BrowserMinecraftClient {
             const frameStart = outerLength.bytesRead;
             const frameEnd = frameStart + outerLength.value;
             if (frameEnd > this.buffer.byteLength) return parsedPackets;
+            // Only retain a decode-begin marker once a complete frame is
+            // available.  Empty-poll probes otherwise flood the 64-event ring
+            // and hide the useful events surrounding a slow packet gap.
+            recordArrivalTrace(this.arrivalTraceRing, "decode-begin", {
+                at: decodeStartAt,
+                phase: this.phase,
+                source: "client",
+                packetSequence: this.decodedPackets + 1,
+                pollSequence: pollContext?.pollSequence,
+                bufferedBytes: this.buffer.byteLength,
+            });
             let frame = this.buffer.subarray(frameStart, frameEnd);
             this.buffer = this.buffer.subarray(frameEnd);
             if (this.compressionThreshold !== undefined) {
@@ -3891,6 +4238,15 @@ class BrowserMinecraftClient {
             parsedPackets++;
             if (pollContext !== null) pollContext.work.packetsParsed++;
             const packetAt = performance.now();
+            recordArrivalTrace(this.arrivalTraceRing, "decode-end", {
+                at: packetAt,
+                phase: this.phase,
+                source: "client",
+                packetSequence: this.decodedPackets,
+                packetId: packetId.value,
+                pollSequence: pollContext?.pollSequence,
+                bufferedBytes: this.buffer.byteLength,
+            });
             if (this.lastInboundPacketAt !== undefined) {
                 this.inboundPacketGapSamples++;
                 this.maxInboundPacketGapMillis = Math.max(
@@ -3936,6 +4292,15 @@ class BrowserMinecraftClient {
                 }
             }
             let dispatchError;
+            recordArrivalTrace(this.arrivalTraceRing, "dispatch-begin", {
+                at: packetAt,
+                phase: phaseAtDecode,
+                source: "client",
+                packetSequence: this.decodedPackets,
+                packetId: packetId.value,
+                pollSequence: pollContext?.pollSequence,
+                bufferedBytes: this.buffer.byteLength,
+            });
             try {
                 this.handlePacket(packetId.value, frame.subarray(packetId.bytesRead));
             }
@@ -3943,6 +4308,17 @@ class BrowserMinecraftClient {
                 dispatchError = error;
             }
             const dispatchAt = performance.now();
+            recordArrivalTrace(this.arrivalTraceRing, "dispatch-end", {
+                at: dispatchAt,
+                phase: phaseAtDecode,
+                source: "client",
+                packetSequence: this.decodedPackets,
+                packetId: packetId.value,
+                pollSequence: pollContext?.pollSequence,
+                bufferedBytes: this.buffer.byteLength,
+                durationMillis: Math.max(0, dispatchAt - packetAt),
+                force: dispatchAt - packetAt >= ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS,
+            });
             if (pollContext !== null) {
                 const handlerMillis = this.addPollPhaseSegment(
                     pollContext, "handlerMillis", packetAt, dispatchAt);
@@ -6029,6 +6405,7 @@ function browserFullPathPerformanceContract() {
             perClientSlowSampleLimit: ARRIVAL_TIMELINE_SAMPLE_LIMIT,
             perClientReconnectPhaseLimit: ARRIVAL_TIMELINE_RECONNECT_PHASE_LIMIT,
             frameMetadataRingLimit: ARRIVAL_TIMELINE_FRAME_RING_LIMIT,
+            trace: arrivalTraceContract(),
             wireAtPolicy: "null-when-unavailable",
             attributionPolicy:
                 "trusted-wire-required-for-upstream; missing-local-segments=>unattributed",
@@ -6435,6 +6812,7 @@ async function printConfiguration() {
             perClientSlowSampleLimit: ARRIVAL_TIMELINE_SAMPLE_LIMIT,
             perClientReconnectPhaseLimit: ARRIVAL_TIMELINE_RECONNECT_PHASE_LIMIT,
             frameMetadataRingLimit: ARRIVAL_TIMELINE_FRAME_RING_LIMIT,
+            trace: arrivalTraceContract(),
             wireAtPolicy: "null-when-unavailable",
             attributionPolicy:
                 "trusted-wire-required-for-upstream; missing-local-segments=>unattributed",
@@ -6489,6 +6867,9 @@ async function createBrowserRuntime(relayUrl, token) {
         schemaVersion: ARRIVAL_TIMELINE_SCHEMA_VERSION,
         independentExecution: false,
         slowThresholdMillis: ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS,
+        traceSchemaVersion: ARRIVAL_TRACE_SCHEMA_VERSION,
+        traceEventLimit: ARRIVAL_TRACE_EVENT_LIMIT,
+        traceEnabled: ARRIVAL_TRACE_ENABLED,
         binaryOnmessageFrames: 0,
         binaryOnmessageBytes: 0,
         bridgeDequeuedFrames: 0,
@@ -6503,11 +6884,16 @@ async function createBrowserRuntime(relayUrl, token) {
                 independentExecution: this.independentExecution,
                 strictGatesChanged: false,
                 slowThresholdMillis: this.slowThresholdMillis,
+                traceSchemaVersion: this.traceSchemaVersion,
+                traceEventLimit: this.traceEventLimit,
+                traceEnabled: ARRIVAL_TRACE_ENABLED,
                 limits: {
                     frameMetadataRing: ARRIVAL_TIMELINE_FRAME_RING_LIMIT,
                     perClientSlowSamples: ARRIVAL_TIMELINE_SAMPLE_LIMIT,
                     perClientReconnectPhases: ARRIVAL_TIMELINE_RECONNECT_PHASE_LIMIT,
+                    traceEvents: ARRIVAL_TRACE_EVENT_LIMIT,
                 },
+                trace: arrivalTraceContract(),
                 source: {
                     wireTimestampAvailable: false,
                     wireAtSource: "unavailable",
