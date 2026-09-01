@@ -697,6 +697,10 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               eventLoopGapSamples: 0,
               eventLoopGapsOver500: 0,
               longestEventLoopGapMillis: 0,
+              remoteCloseRetireScheduled: 0,
+              remoteCloseRetireDeferred: 0,
+              remoteCloseRetireForced: 0,
+              remoteCloseRetireFinalized: 0,
               errors: 0
             }
             };
@@ -1917,6 +1921,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             clearLocalClaim(entry);
             clearRelayPreparation(entry);
             forgetLocalOwner(entry);
+            if (entry.retireClosedHandle) {
+              clearTimeout(entry.retireClosedHandle);
+              entry.retireClosedHandle = 0;
+            }
+            entry.retireClosedPending = false;
             try { if (entry.ws) entry.ws.close(); } catch (ignored) {}
             if (typeof state.cancelOutboundFlush === 'function') {
               state.cancelOutboundFlush(entry);
@@ -2243,6 +2252,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               clearLocalClaim(existing);
               clearRelayPreparation(existing);
               forgetLocalOwner(existing);
+              if (existing.retireClosedHandle) {
+                clearTimeout(existing.retireClosedHandle);
+                existing.retireClosedHandle = 0;
+              }
+              existing.retireClosedPending = false;
               state.discardInbound(existing);
               existing.disposed = true;
               existing.closed = true;
@@ -2305,6 +2319,9 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               errors: [],
               closed: false,
               disposed: false,
+              remoteClosedAt: 0,
+              retireClosedHandle: 0,
+              retireClosedPending: false,
               flowPaused: false,
               queuedBytes: 0,
               queuedFrames: 0,
@@ -2422,6 +2439,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             state.close = function(id) {
             const entry = state.channels.get(id|0);
             if (!entry) return;
+            if (entry.retireClosedHandle) {
+              clearTimeout(entry.retireClosedHandle);
+              entry.retireClosedHandle = 0;
+            }
+            entry.retireClosedPending = false;
             releaseTargetRelayLease(entry);
             clearLocalClaim(entry);
             clearRelayPreparation(entry);
@@ -3003,6 +3025,10 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             const maximumHighWatermarkEvents = 64;
             const maximumSlowQueuedPacketEvents = 64;
             const slowQueuedPacketThresholdMillis = 50;
+            // A remote close can race the final Java decoder handoff. Retire it after a short,
+            // bounded grace period so a missing next tick cannot leave a dead channel in the map.
+            const remoteCloseRetireGraceMillis = 5000;
+            const remoteCloseRetireRetryMillis = 16;
             function now() {
               return typeof performance !== 'undefined' && performance.now
                 ? performance.now()
@@ -3484,6 +3510,71 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               entry.inboundSliceSchedulerKind = '';
               entry.decodeFlowPaused = false;
               entry.flowPaused = false;
+            };
+            function hasRemoteCloseRetireWork(entry) {
+              if (!entry || entry.disposed) return false;
+              return entry.inboundHead < entry.inbound.length ||
+                entry.pendingInboundHead < entry.pendingInbound.length ||
+                !!entry.inboundSliceScheduled ||
+                entry.decodedSliceBacklog > 0 ||
+                (state.activeDecoderEntryId === (entry.id|0) &&
+                 state.activeDecoderScopeDepth > 0);
+            }
+            function finalizeRemoteCloseRetire(entry, forced) {
+              if (!entry || entry.disposed) return;
+              if (entry.retireClosedHandle) {
+                clearTimeout(entry.retireClosedHandle);
+                entry.retireClosedHandle = 0;
+              }
+              entry.retireClosedPending = false;
+              state.discardInbound(entry);
+              entry.disposed = true;
+              if (state.channels.get(entry.id|0) === entry) {
+                state.channels.delete(entry.id|0);
+              }
+              state.stats.remoteCloseRetireFinalized =
+                boundedCount(state.stats.remoteCloseRetireFinalized) + 1;
+              if (forced) {
+                state.stats.remoteCloseRetireForced =
+                  boundedCount(state.stats.remoteCloseRetireForced) + 1;
+              }
+              state.stopEventLoopGapProbeIfIdle();
+            }
+            state.retireClosedEntry = function(entry) {
+              if (!entry || entry.disposed) return;
+              const startedAt = Number(entry.remoteClosedAt) || now();
+              entry.remoteClosedAt = startedAt;
+              if (entry.retireClosedPending) return;
+              state.stats.remoteCloseRetireScheduled =
+                boundedCount(state.stats.remoteCloseRetireScheduled) + 1;
+              const retry = function() {
+                entry.retireClosedPending = false;
+                entry.retireClosedHandle = 0;
+                if (!entry || entry.disposed) return;
+                const elapsed = Math.max(0, now() - startedAt);
+                if (hasRemoteCloseRetireWork(entry) &&
+                    elapsed < remoteCloseRetireGraceMillis) {
+                  state.stats.remoteCloseRetireDeferred =
+                    boundedCount(state.stats.remoteCloseRetireDeferred) + 1;
+                  // Give the Java-side decoder one last bounded chance to drain buffered bytes
+                  // before retiring the closed transport. No new network data can arrive after
+                  // onclose, so this signal only advances already queued inbound work.
+                  signalInbound();
+                  entry.retireClosedPending = true;
+                  entry.retireClosedHandle = setTimeout(
+                    retry,
+                    remoteCloseRetireRetryMillis
+                  );
+                  return;
+                }
+                finalizeRemoteCloseRetire(
+                  entry,
+                  hasRemoteCloseRetireWork(entry) &&
+                    elapsed >= remoteCloseRetireGraceMillis
+                );
+              };
+              entry.retireClosedPending = true;
+              entry.retireClosedHandle = setTimeout(retry, 0);
             };
             state.deliverInbound = function(entry, buffer) {
               if (!entry || entry.closed) return;
