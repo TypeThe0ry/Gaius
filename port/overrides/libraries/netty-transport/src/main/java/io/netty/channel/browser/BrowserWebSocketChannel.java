@@ -587,7 +587,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               inboundMessageChannelCallbacks: 0,
               inboundContinuationMacrotasks: 0,
               inboundMessageChannelFailures: 0,
-              inboundMessageChannelStaleCallbacks: 0,
+              inboundContinuationStaleCallbacks: 0,
               inboundSliceScheduleWaitSamples: 0,
               maxInboundSliceScheduleWaitMillis: 0,
               maxInboundSliceQueue: 0,
@@ -3250,7 +3250,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                   incrementInboundContinuationStat('inboundMessageChannelCallbacks');
                   const callback = owner.inboundSliceMessageCallback;
                   if (typeof callback !== 'function') {
-                    incrementInboundContinuationStat('inboundMessageChannelStaleCallbacks');
+                    incrementInboundContinuationStat('inboundContinuationStaleCallbacks');
                     return;
                   }
                   callback(Number(event && event.data) || 0);
@@ -3304,10 +3304,32 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               entry.inboundSliceScheduled = true;
               entry.inboundSliceScheduledAt = scheduledAt;
               const run = function(deliveredGeneration) {
-                if (entry.disposed || !entry.inboundSliceScheduled ||
-                    entry.inboundSliceGeneration !== generation ||
-                    Number(deliveredGeneration) !== generation) {
-                  incrementInboundContinuationStat('inboundMessageChannelStaleCallbacks');
+                const generationMatches = entry.inboundSliceGeneration === generation;
+                const scheduled = !!entry.inboundSliceScheduled;
+                const deliveredGenerationMatches = Number(deliveredGeneration) === generation;
+                if (entry.disposed || !scheduled || !generationMatches ||
+                    !deliveredGenerationMatches) {
+                  incrementInboundContinuationStat('inboundContinuationStaleCallbacks');
+                  // A malformed token for the currently active generation must not leave the
+                  // entry permanently armed.  Close the current channel, advance the epoch, and
+                  // re-arm only the still-live pending input.  A retired/older callback remains a
+                  // pure no-op because discardInbound() already cleared its schedule state.
+                  if (!entry.disposed && scheduled && generationMatches &&
+                      !deliveredGenerationMatches) {
+                    entry.inboundSliceScheduled = false;
+                    entry.inboundSliceHandle = null;
+                    entry.inboundSliceUsesRaf = false;
+                    entry.inboundSliceScheduledAt = 0;
+                    entry.inboundSliceSchedulerKind = '';
+                    if (entry.inboundSliceMessageCallback === run) {
+                      entry.inboundSliceMessageCallback = null;
+                    }
+                    closeInboundSliceMessageChannel(entry);
+                    entry.inboundSliceGeneration = nextInboundSliceGeneration(
+                      entry.inboundSliceGeneration
+                    );
+                    scheduleSlices(entry, false);
+                  }
                   return;
                 }
                 state.stats.inboundSliceScheduleWaitSamples++;
@@ -3327,9 +3349,9 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               };
               if (immediate && typeof queueMicrotask === 'function') {
                 entry.inboundSliceSchedulerKind = 'microtask';
-                state.stats.inboundImmediateSchedules++;
                 try {
                   queueMicrotask(function() { run(generation); });
+                  state.stats.inboundImmediateSchedules++;
                   return;
                 } catch (error) {
                   entry.inboundSliceSchedulerKind = '';
@@ -3341,10 +3363,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                   maximumInboundContinuationStat,
                   Math.max(0, Number(state.stats.inboundMessageChannelSchedules) || 0) + 1
                 );
-                state.stats.inboundContinuationMacrotasks = Math.min(
-                  maximumInboundContinuationStat,
-                  Math.max(0, Number(state.stats.inboundContinuationMacrotasks) || 0) + 1
-                );
+                incrementInboundContinuationStat('inboundContinuationMacrotasks');
                 return;
               }
               if (typeof globalThis.requestAnimationFrame === 'function') {
@@ -3354,12 +3373,14 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 entry.inboundSliceHandle = globalThis.requestAnimationFrame(function() {
                   run(generation);
                 });
+                incrementInboundContinuationStat('inboundContinuationMacrotasks');
               } else {
                 entry.inboundSliceSchedulerKind = 'timer';
                 state.stats.inboundTimerSchedules++;
                 entry.inboundSliceHandle = setTimeout(function() {
                   run(generation);
                 }, 0);
+                incrementInboundContinuationStat('inboundContinuationMacrotasks');
               }
             }
             function pumpSlices(entry) {

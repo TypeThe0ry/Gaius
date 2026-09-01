@@ -64,7 +64,7 @@ assert.match(source, /inboundContinuationMacrotasks: 0/,
   "inbound continuation macrotask telemetry is missing");
 assert.match(source, /inboundMessageChannelFailures: 0/,
   "inbound continuation MessageChannel failure telemetry is missing");
-assert.match(source, /inboundMessageChannelStaleCallbacks: 0/,
+assert.match(source, /inboundContinuationStaleCallbacks: 0/,
   "inbound continuation stale-callback telemetry is missing");
 assert.match(source, /highWatermarkEventSequence: 0/);
 assert.match(source, /highWatermarkEvents: \[\]/);
@@ -214,7 +214,7 @@ vm.runInNewContext(`
     inboundMessageChannelCallbacks: 0,
     inboundContinuationMacrotasks: 0,
     inboundMessageChannelFailures: 0,
-    inboundMessageChannelStaleCallbacks: 0,
+    inboundContinuationStaleCallbacks: 0,
     inboundSliceScheduleWaitSamples: 0,
     maxInboundSliceScheduleWaitMillis: 0,
     inboundImmediateSchedules: 0,
@@ -259,14 +259,21 @@ assert.equal(inboundContinuationStats.testPumps, 1,
   "deterministic inbound continuation did not invoke its pump exactly once");
 const inboundContinuationHandler =
   inboundContinuationEntry.inboundSliceMessageChannel.port1.onmessage;
+const inboundContinuationCallbacksBeforeStale =
+  inboundContinuationStats.inboundMessageChannelCallbacks;
 const inboundContinuationStaleBefore =
-  inboundContinuationStats.inboundMessageChannelStaleCallbacks;
+  inboundContinuationStats.inboundContinuationStaleCallbacks;
 inboundContinuationHandler({data: inboundContinuationEntry.inboundSliceGeneration + 1});
 assert.equal(inboundContinuationStats.testPumps, 1,
   "stale inbound continuation re-entered the deterministic pump");
-assert.equal(inboundContinuationStats.inboundMessageChannelStaleCallbacks,
+assert.equal(inboundContinuationStats.inboundContinuationStaleCallbacks,
   inboundContinuationStaleBefore + 1,
   "stale inbound continuation generation was not rejected");
+const inboundContinuationPostedCallbacks =
+  inboundContinuationCallbacksBeforeStale;
+const inboundContinuationStaleDispatches =
+  inboundContinuationStats.inboundContinuationStaleCallbacks -
+  inboundContinuationStaleBefore;
 inboundContinuationEntry.inboundSliceMessageChannel.port1.close();
 inboundContinuationEntry.inboundSliceMessageChannel.port2.close();
 // TeaVM's @JSBody parser accepts explicit object keys here but rejects ES6
@@ -497,8 +504,17 @@ assert.match(scheduleSlicesSource,
   /postInboundSliceMessage\(entry, generation, run\)[\s\S]*entry\.inboundSliceSchedulerKind = 'message-channel'/,
   "bounded inbound continuation is not using the MessageChannel path");
 assert.match(scheduleSlicesSource,
-  /entry\.inboundSliceGeneration !== generation[\s\S]*Number\(deliveredGeneration\) !== generation/,
+  /requestAnimationFrame[\s\S]*incrementInboundContinuationStat\('inboundContinuationMacrotasks'\)/,
+  "requestAnimationFrame fallback is missing generic macrotask accounting");
+assert.match(scheduleSlicesSource,
+  /setTimeout\(function\(\) \{[\s\S]*?run\(generation\);[\s\S]*?\}, 0\)[\s\S]*incrementInboundContinuationStat\('inboundContinuationMacrotasks'\)/,
+  "timer fallback is missing generic macrotask accounting");
+assert.match(scheduleSlicesSource,
+  /const generationMatches = entry\.inboundSliceGeneration === generation[\s\S]*const deliveredGenerationMatches = Number\(deliveredGeneration\) === generation[\s\S]*!generationMatches[\s\S]*!deliveredGenerationMatches/,
   "inbound continuation callbacks lost their per-entry generation guard");
+assert.match(scheduleSlicesSource,
+  /!deliveredGenerationMatches[\s\S]*closeInboundSliceMessageChannel\(entry\)[\s\S]*entry\.inboundSliceGeneration = nextInboundSliceGeneration[\s\S]*scheduleSlices\(entry, false\)/,
+  "active inbound generation mismatch does not fail closed and re-arm pending input");
 assert.match(source,
   /state\.discardInbound = function\(entry\) \{[\s\S]*entry\.inboundSliceGeneration = nextInboundSliceGeneration\([\s\S]*closeInboundSliceMessageChannel\(entry\)/,
   "discardInbound does not invalidate and close a queued inbound continuation");
@@ -593,6 +609,151 @@ assert.equal(modelAdmissionBlocked({paused: true, exactPacketQueuePaused: false,
   "byte-only pause self-deadlocked pending bytes at the low watermark");
 assert.equal(modelAdmissionBlocked({paused: true, exactPacketQueuePaused: true, depth: 0}), true,
   "exact decoded-packet pause admitted more decoder work");
+
+function modelInboundContinuationFairness(entryCount, continuationsPerEntry) {
+  const entries = Array.from({length: entryCount}, (_, id) => ({
+    id,
+    remaining: continuationsPerEntry,
+    scheduled: false,
+    callbacks: 0,
+  }));
+  const ready = [];
+  const order = [];
+  const post = (entry) => {
+    if (!entry.scheduled && entry.remaining > 0) {
+      entry.scheduled = true;
+      ready.push(entry);
+    }
+  };
+  entries.forEach(post);
+  const maximumDispatches = entryCount * continuationsPerEntry;
+  while (ready.length > 0) {
+    const entry = ready.shift();
+    entry.scheduled = false;
+    if (entry.remaining <= 0) continue;
+    entry.remaining--;
+    entry.callbacks++;
+    order.push(entry.id);
+    post(entry);
+    assert.ok(order.length <= maximumDispatches,
+      "inbound continuation fairness model exceeded its bounded dispatch count");
+  }
+  const lastAt = new Map();
+  let maxServiceGap = 0;
+  order.forEach((id, index) => {
+    if (lastAt.has(id)) {
+      maxServiceGap = Math.max(maxServiceGap, index - lastAt.get(id) - 1);
+    }
+    lastAt.set(id, index);
+  });
+  return {
+    entryCount,
+    continuationsPerEntry,
+    order,
+    callbacks: entries.map((entry) => entry.callbacks),
+    maxServiceGap,
+  };
+}
+const inboundContinuationFairnessModel =
+  modelInboundContinuationFairness(16, 3);
+assert.deepEqual(inboundContinuationFairnessModel.order.slice(0, 16),
+  Array.from({length: 16}, (_, id) => id),
+  "inbound continuation fairness model did not service each entry once per round");
+assert.deepEqual(inboundContinuationFairnessModel.callbacks,
+  Array.from({length: 16}, () => 3),
+  "inbound continuation fairness model lost a callback");
+assert.ok(inboundContinuationFairnessModel.maxServiceGap <= 15,
+  "one inbound entry exceeded one fair 16-entry rotation");
+
+function modelDiscardBeforeDelivery() {
+  const nextGeneration = (value) => {
+    let generation = ((value + 1) >>> 0);
+    if (generation === 0) generation = 1;
+    return generation;
+  };
+  const createEntry = (id) => ({
+    id,
+    generation: 0,
+    scheduled: false,
+    disposed: false,
+    callback: null,
+    staleCallbacks: 0,
+    pumps: 0,
+  });
+  const schedule = (entry) => {
+    const generation = entry.generation = nextGeneration(entry.generation);
+    entry.scheduled = true;
+    const callback = (deliveredGeneration) => {
+      if (entry.disposed || !entry.scheduled ||
+          entry.generation !== generation || deliveredGeneration !== generation) {
+        entry.staleCallbacks++;
+        return;
+      }
+      entry.scheduled = false;
+      entry.callback = null;
+      entry.pumps++;
+    };
+    entry.callback = callback;
+    return {generation, callback};
+  };
+  const retired = createEntry(7);
+  const retiredTask = schedule(retired);
+  retired.generation = nextGeneration(retired.generation);
+  retired.scheduled = false;
+  retired.callback = null;
+  retired.disposed = true;
+  retiredTask.callback(retiredTask.generation);
+
+  const fresh = createEntry(7);
+  const freshTask = schedule(fresh);
+  retiredTask.callback(retiredTask.generation);
+  freshTask.callback(freshTask.generation);
+  return {
+    retiredStaleCallbacks: retired.staleCallbacks,
+    retiredPumps: retired.pumps,
+    freshStaleCallbacks: fresh.staleCallbacks,
+    freshPumps: fresh.pumps,
+  };
+}
+const inboundDiscardRaceModel = modelDiscardBeforeDelivery();
+assert.equal(inboundDiscardRaceModel.retiredPumps, 0,
+  "discarded inbound entry pumped after its queued callback was delivered");
+assert.ok(inboundDiscardRaceModel.retiredStaleCallbacks >= 1,
+  "discarded inbound entry did not record its stale callback");
+assert.equal(inboundDiscardRaceModel.freshPumps, 1,
+  "fresh entry with the same socket id was affected by the retired callback");
+assert.equal(inboundDiscardRaceModel.freshStaleCallbacks, 0,
+  "fresh inbound entry rejected its own current generation");
+
+function modelActiveGenerationMismatchRearm() {
+  let generation = 1;
+  let scheduled = true;
+  let rearmed = false;
+  let pumps = 0;
+  const expectedGeneration = generation;
+  const callback = (deliveredGeneration) => {
+    if (generation !== expectedGeneration || deliveredGeneration !== expectedGeneration) {
+      if (scheduled && generation === expectedGeneration &&
+          deliveredGeneration !== expectedGeneration) {
+        scheduled = false;
+        generation = (generation + 1) >>> 0;
+        scheduled = true;
+        rearmed = true;
+      }
+      return;
+    }
+    scheduled = false;
+    pumps++;
+  };
+  callback(expectedGeneration + 1);
+  return {generation, scheduled, rearmed, pumps};
+}
+const inboundActiveMismatchModel = modelActiveGenerationMismatchRearm();
+assert.ok(inboundActiveMismatchModel.rearmed &&
+  inboundActiveMismatchModel.scheduled,
+  "active inbound generation mismatch left the continuation disarmed");
+assert.equal(inboundActiveMismatchModel.pumps, 0,
+  "active inbound generation mismatch entered the pump before rearming");
 
 function createIndependentPumpHarness({
   readySlices,
@@ -1155,7 +1316,8 @@ assert.equal(stats.inboundMessageChannelCallbacks,
   stats.inboundMessageChannelSchedules,
   "inbound MessageChannel callback count did not match scheduled continuations");
 assert.equal(stats.inboundContinuationMacrotasks,
-  stats.inboundMessageChannelSchedules,
+  stats.inboundMessageChannelSchedules + stats.inboundRafSchedules +
+    stats.inboundTimerSchedules,
   "inbound continuation macrotask accounting drifted");
 assert.equal(stats.inboundMessageChannelFailures, 0,
   "inbound MessageChannel unexpectedly fell back after a construction/post failure");
@@ -1163,12 +1325,12 @@ assert.equal(stats.inboundRafSchedules, 0,
   "requestAnimationFrame remained on the primary inbound continuation path");
 assert.equal(stats.inboundTimerSchedules, 0,
   "MessageChannel-capable smoke unexpectedly used timer continuation");
-assert.equal(stats.inboundSliceScheduleWaitSamples,
+const inboundContinuationSchedules =
   stats.inboundImmediateSchedules + stats.inboundMessageChannelSchedules +
-    stats.inboundRafSchedules +
-    stats.inboundTimerSchedules,
-  "inbound schedule-wait telemetry lost a callback");
-assert.ok(inboundContinuationStats.inboundMessageChannelStaleCallbacks >= 1,
+  stats.inboundRafSchedules + stats.inboundTimerSchedules;
+assert.ok(stats.inboundSliceScheduleWaitSamples <= inboundContinuationSchedules,
+  "inbound schedule-wait telemetry exceeded callback schedules");
+assert.ok(inboundContinuationStats.inboundContinuationStaleCallbacks >= 1,
   "inbound continuation generation guard was never exercised");
 assert.ok(Number.isFinite(stats.maxInboundSliceScheduleWaitMillis) &&
   stats.maxInboundSliceScheduleWaitMillis < 500,
@@ -1177,7 +1339,7 @@ assert.ok(stats.longestEventLoopGapMillis < 500,
   `event loop gap reached ${stats.longestEventLoopGapMillis.toFixed(1)} ms`);
 assert.equal(stats.eventLoopGapsOver500, 0, "observed an event loop gap >=500 ms");
 assert.ok(Math.max(0, ...callbackDurations) < 500,
-  "requestAnimationFrame slice callback blocked for >=500 ms");
+  "inbound continuation callback blocked for >=500 ms");
 if (memorySamples.length >= 5) {
   const tail = memorySamples.slice(-5);
   const heapMonotonic = tail.every((sample, index) =>
@@ -1419,13 +1581,13 @@ console.log(JSON.stringify({
   inboundMessageChannelCallbacks: stats.inboundMessageChannelCallbacks,
   inboundContinuationMacrotasks: stats.inboundContinuationMacrotasks,
   inboundMessageChannelFailures: stats.inboundMessageChannelFailures,
-  inboundMessageChannelStaleCallbacks: stats.inboundMessageChannelStaleCallbacks,
+  inboundContinuationStaleCallbacks: stats.inboundContinuationStaleCallbacks,
   inboundContinuationModel: {
     schedules: inboundContinuationStats.inboundMessageChannelSchedules,
-    callbacks: inboundContinuationStats.inboundMessageChannelCallbacks,
+    callbacks: inboundContinuationPostedCallbacks,
     macrotasks: inboundContinuationStats.inboundContinuationMacrotasks,
     failures: inboundContinuationStats.inboundMessageChannelFailures,
-    staleCallbacks: inboundContinuationStats.inboundMessageChannelStaleCallbacks,
+    staleDispatches: inboundContinuationStaleDispatches,
     pumps: inboundContinuationStats.testPumps,
   },
   maxInboundSliceScheduleWaitMillis:
