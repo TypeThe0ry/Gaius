@@ -10596,6 +10596,8 @@ public final class MinecraftClientPatcher {
         LabelNode inline = new LabelNode();
         LabelNode queuedHandleReturn = new LabelNode();
         LabelNode vanillaScheduling = new LabelNode();
+        LabelNode playListener = new LabelNode();
+        LabelNode commonBacklogCheck = new LabelNode();
         String[] transitionPacketTypes = {
             "net/minecraft/network/protocol/game/ClientboundStartConfigurationPacket",
             "net/minecraft/network/protocol/game/ClientboundLoginPacket"
@@ -10632,15 +10634,17 @@ public final class MinecraftClientPatcher {
         code.add(new TypeInsnNode(Opcodes.INSTANCEOF,
                 "net/minecraft/client/multiplayer/ClientConfigurationPacketListenerImpl"));
         code.add(new JumpInsnNode(Opcodes.IFNE, inline));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new TypeInsnNode(Opcodes.INSTANCEOF,
+                "net/minecraft/client/multiplayer/ClientPacketListener"));
+        code.add(new JumpInsnNode(Opcodes.IFNE, playListener));
         for (String packetType : commonInlinePacketTypes) {
             code.add(new VarInsnNode(Opcodes.ALOAD, 0));
             code.add(new TypeInsnNode(Opcodes.INSTANCEOF, packetType));
             code.add(new JumpInsnNode(Opcodes.IFNE, inline));
         }
-        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
-        code.add(new TypeInsnNode(Opcodes.INSTANCEOF,
-                "net/minecraft/client/multiplayer/ClientPacketListener"));
-        code.add(new JumpInsnNode(Opcodes.IFEQ, vanillaScheduling));
+        code.add(new JumpInsnNode(Opcodes.GOTO, vanillaScheduling));
+        code.add(playListener);
         code.add(new VarInsnNode(Opcodes.ALOAD, 2));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
@@ -10654,7 +10658,28 @@ public final class MinecraftClientPatcher {
             code.add(new TypeInsnNode(Opcodes.INSTANCEOF, packetType));
             code.add(new JumpInsnNode(Opcodes.IFNE, transitionBacklogCheck));
         }
+        for (String packetType : commonInlinePacketTypes) {
+            code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            code.add(new TypeInsnNode(Opcodes.INSTANCEOF, packetType));
+            code.add(new JumpInsnNode(Opcodes.IFNE, commonBacklogCheck));
+        }
         code.add(new JumpInsnNode(Opcodes.GOTO, forcedPlayQueue));
+        code.add(commonBacklogCheck);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserPacketScheduler",
+                "hasPendingPackets",
+                "(Ljava/lang/Object;)Z",
+                false));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, inline));
+        code.add(new JumpInsnNode(Opcodes.GOTO, forcedPlayQueue));
+        /*
+         * The PLAY guard above must run before common packets can take the
+         * inline path.  This preserves FIFO when a control packet arrives
+         * while a decoded PLAY packet is already queued, while keeping the
+         * empty-queue fast path and the configuration listener bypass.
+         */
         code.add(transitionBacklogCheck);
         code.add(new VarInsnNode(Opcodes.ALOAD, 2));
         code.add(new MethodInsnNode(
@@ -10687,11 +10712,18 @@ public final class MinecraftClientPatcher {
         int configurationBranches = 0;
         int[] transitionPacketBranches = new int[transitionPacketTypes.length];
         int[] commonInlinePacketBranches = new int[commonInlinePacketTypes.length];
+        int[] commonPlayPacketBranches = new int[commonInlinePacketTypes.length];
         int clientPlayBranches = 0;
         int queuedDrainGuardCalls = 0;
         int transitionBacklogChecks = 0;
+        int commonBacklogChecks = 0;
         MethodInsnNode inlineHook = null;
+        LabelNode currentBlock = null;
         for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction instanceof LabelNode label) {
+                currentBlock = label;
+                continue;
+            }
             if (instruction instanceof MethodInsnNode call
                     && call.getOpcode() == Opcodes.INVOKESTATIC
                     && call.owner.equals("io/netty/channel/browser/BrowserWebSocketChannel")
@@ -10716,9 +10748,12 @@ public final class MinecraftClientPatcher {
                     && call.name.equals("hasPendingPackets")
                     && call.desc.equals("(Ljava/lang/Object;)Z")
                     && nextOpcode(call) instanceof JumpInsnNode branch
-                    && branch.getOpcode() == Opcodes.IFEQ
-                    && branch.label == inline) {
-                transitionBacklogChecks++;
+                    && branch.getOpcode() == Opcodes.IFEQ) {
+                if (currentBlock == transitionBacklogCheck) {
+                    transitionBacklogChecks++;
+                } else if (currentBlock == commonBacklogCheck && branch.label == inline) {
+                    commonBacklogChecks++;
+                }
             }
             if (!(instruction instanceof TypeInsnNode type)
                     || type.getOpcode() != Opcodes.INSTANCEOF
@@ -10732,13 +10767,19 @@ public final class MinecraftClientPatcher {
                 configurationBranches++;
             } else if (type.desc.equals(
                     "net/minecraft/client/multiplayer/ClientPacketListener")
-                    && branch.getOpcode() == Opcodes.IFEQ
-                    && branch.label == vanillaScheduling) {
+                    && branch.getOpcode() == Opcodes.IFNE
+                    && branch.label == playListener) {
                 clientPlayBranches++;
             } else if (branch.getOpcode() == Opcodes.IFNE && branch.label == inline) {
                 for (int index = 0; index < commonInlinePacketTypes.length; index++) {
                     if (type.desc.equals(commonInlinePacketTypes[index])) {
                         commonInlinePacketBranches[index]++;
+                    }
+                }
+            } else if (branch.getOpcode() == Opcodes.IFNE && branch.label == commonBacklogCheck) {
+                for (int index = 0; index < commonInlinePacketTypes.length; index++) {
+                    if (type.desc.equals(commonInlinePacketTypes[index])) {
+                        commonPlayPacketBranches[index]++;
                     }
                 }
             } else if (branch.getOpcode() == Opcodes.IFNE
@@ -10763,9 +10804,11 @@ public final class MinecraftClientPatcher {
                 || configurationBranches != 1
                 || !allExactlyOne(transitionPacketBranches)
                 || !allExactlyOne(commonInlinePacketBranches)
+                || !allExactlyOne(commonPlayPacketBranches)
                 || clientPlayBranches != 1
                 || queuedDrainGuardCalls != 1
                 || transitionBacklogChecks != 1
+                || commonBacklogChecks != 1
                 || queuedReturn == null
                 || queuedReturn.getOpcode() != Opcodes.RETURN
                 || forcedAbort != forcedPlayAbort
@@ -10777,9 +10820,11 @@ public final class MinecraftClientPatcher {
                             + ", configuration=" + configurationBranches
                             + ", transitionPackets=" + counts(transitionPacketBranches)
                             + ", commonInlinePackets=" + counts(commonInlinePacketBranches)
+                            + ", commonPlayPackets=" + counts(commonPlayPacketBranches)
                             + ", clientPlay=" + clientPlayBranches
                             + ", drainGuard=" + queuedDrainGuardCalls
-                            + ", transitionBacklog=" + transitionBacklogChecks);
+                            + ", transitionBacklog=" + transitionBacklogChecks
+                            + ", commonBacklog=" + commonBacklogChecks);
         }
         method.maxStack = Math.max(method.maxStack, 3);
         writeComputeFrames(node, output);
