@@ -90,6 +90,11 @@ const CALLBACK_FINALIZATION_TAIL_SLOW_THRESHOLD_MILLIS = 16.7;
 const CALLBACK_FINALIZATION_TAIL_SAMPLE_LIMIT = 64;
 const CALLBACK_FINALIZATION_TAIL_RETENTION = "longest-tail-desc-sequence-asc";
 const ARRIVAL_WIRE_AT_SOURCE = "unavailable";
+const ARRIVAL_TRACE_SCHEMA_VERSION =
+    "gaius.browser-client-arrival-trace.v1";
+const ARRIVAL_TRACE_EVENT_LIMIT = 64;
+const ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE =
+    process.env.GAIUS_BROWSER_FULL_PATH_TRACE !== "1";
 const ARRIVAL_PERIODIC_SERVER_SYNC_SCHEMA_VERSION =
     "gaius.browser-client-arrival-periodic-server-sync.v1";
 const ARRIVAL_PERIODIC_SERVER_SYNC_CLASSIFICATION = "periodic-server-sync";
@@ -285,18 +290,36 @@ for (const tier of tiers) {
     }
 }
 
-const ok = printConfigOnly || runs.every((run) =>
+// `ok` is the release-facing result for an executed stress run.  A trace-enabled
+// run is still useful diagnostic evidence, but it carries allocation/sorting
+// overhead in the browser hot path and therefore cannot satisfy clean strict
+// performance evidence. Keep the functional result separately so diagnostic
+// output remains useful while the process exits fail-closed for strict release.
+const functionalOk = printConfigOnly || runs.every((run) =>
     run.exitCode === 0 && !run.timedOut && run.parseError === null &&
     run.resultOk === true && run.resultValidationError === null);
+const strictAcceptancePassed = printConfigOnly
+    ? null
+    : functionalOk && ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE &&
+        runs.every((run) =>
+            run.result?.acceptance?.diagnostics?.strictEvidenceEligible === true);
+const ok = printConfigOnly || strictAcceptancePassed === true;
 console.log(JSON.stringify({
     schemaVersion: "browser-full-path-stress-result-v1",
     ok,
+    functionalOk,
+    strictAcceptancePassed,
     mode: printConfigOnly ? "print-config" : "stress",
     tiers,
     hardDeadlinesMillis: Object.fromEntries(tiers.map((tier) => [
         tier, HARD_DEADLINES_MILLIS[tier],
     ])),
     browserChannelSourceEvidence,
+    diagnostics: {
+        arrivalTraceEnabled: !ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE,
+        diagnosticOnly: !ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE,
+        strictEvidenceEligible: ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE,
+    },
     evidenceRoot: canonicalEvidenceRoot,
     configurations,
     runs,
@@ -332,6 +355,15 @@ function validateStressResult(result, tier, configuration) {
     assert.equal(result?.transport?.expectedConnections,
         configuration.stressTarget.clientLifecycles);
     assert.equal(result?.acceptance?.mode, `stress-tier-${tier}`);
+    assert.equal(result?.acceptance?.diagnostics?.arrivalTraceEnabled,
+        !ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE,
+        `stress tier ${tier} acceptance trace-enabled marker drifted`);
+    assert.equal(result?.acceptance?.diagnostics?.diagnosticOnly,
+        !ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE,
+        `stress tier ${tier} acceptance diagnostic marker drifted`);
+    assert.equal(result?.acceptance?.diagnostics?.strictEvidenceEligible,
+        ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE,
+        `stress tier ${tier} acceptance strict-evidence eligibility drifted`);
     assertStressSchedulerEvidence(result, tier, configuration);
     assertArrivalTimelineEvidence(result, tier);
     const observed = result?.acceptance?.observed;
@@ -1102,6 +1134,9 @@ function stressEnvironment(tier) {
     environment.GAIUS_VERSION_PROFILE_PATH = canonicalProfilePath;
     environment.GAIUS_BROWSER_FULL_PATH_STRESS = "1";
     environment.GAIUS_BROWSER_FULL_PATH_STRESS_TIER = String(tier);
+    if (process.env.GAIUS_BROWSER_FULL_PATH_TRACE === "1") {
+        environment.GAIUS_BROWSER_FULL_PATH_TRACE = "1";
+    }
     return environment;
 }
 
@@ -1312,6 +1347,13 @@ function assertArrivalTimelineEvidence(result, tier) {
         `stress tier ${tier} mislabelled live arrival evidence as independent`);
     assert.equal(topLevel?.strictGatesChanged, false,
         `stress tier ${tier} arrival timeline changed strict gates`);
+    assert.equal(topLevel?.diagnosticOnly, true,
+        `stress tier ${tier} arrival timeline lost diagnostic-only marker`);
+    assert.equal(topLevel?.strictEvidenceEligible,
+        ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE,
+        `stress tier ${tier} arrival strict-evidence eligibility drifted`);
+    assertArrivalTraceContract(topLevel?.trace,
+        `stress tier ${tier} top-level arrival timeline trace`);
     assertPeriodicServerSyncContract(topLevel?.periodicServerSync,
         `stress tier ${tier} top-level arrival timeline`);
     assert.equal(topLevel?.limits?.perClientSlowSamples, 64);
@@ -1330,6 +1372,10 @@ function assertArrivalTimelineEvidence(result, tier) {
     assert.equal(topLevel.transport?.source?.attributionPolicy,
         "trusted-wire-required-for-upstream; missing-local-segments=>unattributed",
         `stress tier ${tier} transport arrival attribution policy drifted`);
+    if (topLevel.transport?.trace !== undefined) {
+        assertArrivalTraceContract(topLevel.transport.trace,
+            `stress tier ${tier} transport arrival trace`);
+    }
     assertPeriodicServerSyncContract(topLevel.transport?.periodicServerSync,
         `stress tier ${tier} transport arrival timeline`);
     for (const [index, client] of result.clients.entries()) {
@@ -1342,6 +1388,8 @@ function assertArrivalTimelineEvidence(result, tier) {
             `stress tier ${tier} client lifecycle ${index + 1} omitted arrival schema`);
         assert.equal(timeline?.strictGatesChanged, false,
             `stress tier ${tier} client lifecycle ${index + 1} changed strict gates`);
+        assertArrivalTraceContract(timeline?.trace,
+            `stress tier ${tier} client lifecycle ${index + 1} trace`);
         assertPeriodicServerSyncContract(timeline?.periodicServerSync,
             `stress tier ${tier} client lifecycle ${index + 1}`);
         assert.equal(timeline?.source?.wireAtSource, "unavailable",
@@ -1353,6 +1401,10 @@ function assertArrivalTimelineEvidence(result, tier) {
         assert.ok(timeline.slowSamples.length <= 64,
             `stress tier ${tier} client lifecycle ${index + 1} exceeded slow sample cap`);
         for (const [sampleIndex, sample] of timeline.slowSamples.entries()) {
+            if (sample.traceWindow !== undefined && sample.traceWindow !== null) {
+                assertArrivalTraceWindow(sample.traceWindow,
+                    `stress tier ${tier} lifecycle ${index + 1} arrival sample ${sampleIndex}`);
+            }
             if (Object.prototype.hasOwnProperty.call(sample ?? {}, "wireAtSource")) {
                 assert.equal(sample.wireAtSource, ARRIVAL_WIRE_AT_SOURCE,
                     `stress tier ${tier} lifecycle ${index + 1} arrival sample ${sampleIndex} ` +
@@ -1424,6 +1476,66 @@ function assertArrivalTimelineEvidence(result, tier) {
             assert.ok(boundary.reconnectGapMillis >= 0,
                 `stress tier ${tier} reconnect lifecycle ${index + 1} negative reconnect gap`);
         }
+    }
+}
+
+function assertArrivalTraceContract(trace, label) {
+    assert.ok(trace && typeof trace === "object", `${label} omitted`);
+    assert.equal(trace.schemaVersion, ARRIVAL_TRACE_SCHEMA_VERSION,
+        `${label} schema drifted`);
+    assert.equal(trace.eventLimit, ARRIVAL_TRACE_EVENT_LIMIT,
+        `${label} event limit drifted`);
+    assert.equal(trace.enabled, !ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE,
+        `${label} enabled marker drifted from requested diagnostic mode`);
+    assert.equal(trace.diagnosticOnly, true,
+        `${label} was not diagnostic-only`);
+    assert.equal(trace.strictEvidenceEligible,
+        ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE,
+        `${label} strict-evidence eligibility drifted`);
+    assert.equal(trace.strictGatesChanged, false,
+        `${label} changed strict gates`);
+    assert.equal(trace.wireAtSource, ARRIVAL_WIRE_AT_SOURCE,
+        `${label} synthesized wire time`);
+    assert.equal(trace.bridgeEnqueueTimestampAvailable, false,
+        `${label} claimed bridge enqueue timestamps`);
+    assert.equal(typeof trace.enabled, "boolean",
+        `${label} enabled flag missing`);
+}
+
+function assertArrivalTraceWindow(window, label) {
+    assert.ok(window && typeof window === "object", `${label} omitted`);
+    assert.equal(window.schemaVersion, ARRIVAL_TRACE_SCHEMA_VERSION,
+        `${label} schema drifted`);
+    assert.equal(window.enabled, !ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE,
+        `${label} enabled marker drifted from requested diagnostic mode`);
+    assert.equal(window.diagnosticOnly, true,
+        `${label} was not diagnostic-only`);
+    assert.equal(window.strictEvidenceEligible,
+        ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE,
+        `${label} strict-evidence eligibility drifted`);
+    assert.equal(window.strictGatesChanged, false,
+        `${label} changed strict gates`);
+    assert.equal(window.wireAtSource, ARRIVAL_WIRE_AT_SOURCE,
+        `${label} synthesized wire time`);
+    assert.equal(window.bridgeEnqueueTimestampAvailable, false,
+        `${label} claimed bridge enqueue timestamps`);
+    assert.ok(Number.isSafeInteger(window.limit) &&
+        window.limit === ARRIVAL_TRACE_EVENT_LIMIT,
+    `${label} window limit drifted`);
+    assert.ok(Array.isArray(window.events) &&
+        window.events.length <= ARRIVAL_TRACE_EVENT_LIMIT,
+    `${label} exceeded bounded event limit`);
+    assert.ok(Number.isSafeInteger(window.dropped) && window.dropped >= 0,
+        `${label} dropped count invalid`);
+    assert.ok(Number.isSafeInteger(window.ringDropped) && window.ringDropped >= 0,
+        `${label} ring dropped count invalid`);
+    assert.ok(typeof window.coverage === "string",
+        `${label} coverage missing`);
+    for (const event of window.events) {
+        assert.equal(event.schemaVersion, ARRIVAL_TRACE_SCHEMA_VERSION,
+            `${label} event schema drifted`);
+        assert.ok(Number.isSafeInteger(event.sequence) && event.sequence > 0,
+            `${label} event sequence invalid`);
     }
 }
 

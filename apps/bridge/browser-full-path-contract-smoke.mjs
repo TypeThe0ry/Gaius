@@ -1025,8 +1025,8 @@ assert.match(stressRunner,
     /const functionalOk = printConfigOnly \|\| runs\.every\(\(run\) =>/u,
     "stress runner must retain a separate functional result");
 assert.match(stressRunner,
-    /const strictAcceptancePassed = printConfigOnly\s*\? null\s*:\s*functionalOk && ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE/u,
-    "stress runner must make trace-enabled runs ineligible for clean strict evidence");
+    /const strictAcceptancePassed = printConfigOnly\s*\? null\s*:\s*functionalOk\s*&&\s*ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE\s*&&\s*runs\.every\(\(run\) =>[\s\S]*?run\.result\?\.acceptance\?\.diagnostics\?\.strictEvidenceEligible === true/u,
+    "stress runner must require every executed run to carry strict evidence eligibility");
 assert.match(stressRunner,
     /const ok = printConfigOnly \|\| strictAcceptancePassed === true/u,
     "stress runner ok result must fail closed when strict evidence is ineligible");
