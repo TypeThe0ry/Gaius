@@ -47,9 +47,26 @@ public final class BrowserPacketScheduler {
     private static long packetProcessorGeneration;
     private static boolean packetProcessorOwnerConflict;
     private static boolean packetProcessorAccountingValid = true;
+    /**
+     * Once two PacketProcessor identities have shared this runtime, the static ledger is no
+     * longer recoverable by a close/rebind sequence.  Keep the runtime poisoned so a surviving
+     * foreign owner cannot re-enable adaptive accounting against a ledger that was already reset.
+     */
+    private static boolean packetProcessorConflictPoisoned;
     private static String packetProcessorFallbackReason = "unbound";
     private static long stalePacketProcessorResets;
+    private static long stalePacketProcessorEvents;
     private static Object queuedPacketHandleOwner;
+    /**
+     * Bounded tombstones for PacketProcessor instances that have already crossed close/reset.
+     * A late queue callback from one of these owners must not be allowed to claim a fresh static
+     * accounting epoch.  Neither the frame bind nor the constructor lifecycle bind removes a
+     * retired tombstone; a fresh PacketProcessor object must establish a new identity.
+     */
+    private static final int RETIRED_PACKET_PROCESSOR_OWNER_LIMIT = 16;
+    private static final Object[] retiredPacketProcessorOwners =
+            new Object[RETIRED_PACKET_PROCESSOR_OWNER_LIMIT];
+    private static int retiredPacketProcessorOwnerCursor;
 
     private BrowserPacketScheduler() {
     }
@@ -89,8 +106,23 @@ public final class BrowserPacketScheduler {
         }
     }
 
-    /** Claims the one PacketProcessor owner before any queue accounting is touched. */
+    /**
+     * Claims the one PacketProcessor owner before any queue accounting is touched.
+     *
+     * <p>This method is called at every scheduled client frame.  It is deliberately not a
+     * lifecycle reset point: a PacketProcessor that already crossed {@link #reset(Object)} stays
+     * retired, so a late frame/queue callback cannot resurrect its static accounting epoch.</p>
+     */
     public static boolean bindPacketProcessor(Object owner) {
+        return claimPacketProcessorOwner(owner);
+    }
+
+    /**
+     * Explicit PacketProcessor construction boundary.  The patched PacketProcessor constructor
+     * calls this once after its fields are initialized.  This is still claim-only: PacketProcessor
+     * close is one-shot in vanilla, so a retired owner must never be reactivated by any bind path.
+     */
+    public static boolean bindPacketProcessorLifecycle(Object owner) {
         return claimPacketProcessorOwner(owner);
     }
 
@@ -448,7 +480,8 @@ public final class BrowserPacketScheduler {
         // A conflict intentionally stops all global queue/frame mutation. The handler scope above
         // is still unwound so a later vanilla packet cannot be mistaken for nested queued work.
         if (owner != packetProcessorOwner || !packetProcessorAccountingValid) {
-            if (queuedPacketHandleDepth == 0 && packetProcessorOwner == null) {
+            if (queuedPacketHandleDepth == 0 && packetProcessorOwner == null
+                    && !packetProcessorConflictPoisoned) {
                 packetProcessorOwnerConflict = false;
                 packetProcessorAccountingValid = true;
                 packetProcessorFallbackReason = "unbound";
@@ -532,13 +565,21 @@ public final class BrowserPacketScheduler {
      * queue/depth/frame state.
      */
     public static void reset(Object owner) {
-        if (owner == null || packetProcessorOwner == null
-                || owner != packetProcessorOwner
-                || packetProcessorOwnerConflict
+        // A close from the active owner retires the epoch.  If a second live owner previously
+        // forced a conflict, keep the runtime poisoned after retirement: the static ledger has
+        // already lost ownership and must not be rebound against a surviving foreign queue.
+        if (owner == null || packetProcessorOwner == null || owner != packetProcessorOwner
+                || packetProcessorOwnerConflict || packetProcessorConflictPoisoned
                 || !packetProcessorAccountingValid) {
             if (owner != null && (owner != packetProcessorOwner
                     || packetProcessorOwnerConflict
+                    || packetProcessorConflictPoisoned
                     || !packetProcessorAccountingValid)) {
+                // A conflicted close must not clear the shared ledger.  Keep the runtime poisoned
+                // and leave the live owner bound so a foreign owner cannot rebind an empty epoch.
+                packetProcessorConflictPoisoned = packetProcessorOwnerConflict
+                        || packetProcessorConflictPoisoned;
+                packetProcessorAccountingValid = false;
                 if (stalePacketProcessorResets < Long.MAX_VALUE) {
                     stalePacketProcessorResets++;
                 }
@@ -546,10 +587,12 @@ public final class BrowserPacketScheduler {
             return;
         }
         reset();
+        rememberRetiredPacketProcessorOwner(owner);
         packetProcessorOwner = null;
         packetProcessorGeneration = packetProcessorGeneration == Long.MAX_VALUE
                 ? 1L
                 : packetProcessorGeneration + 1L;
+        packetProcessorConflictPoisoned = false;
         packetProcessorOwnerConflict = queuedPacketHandleDepth > 0;
         packetProcessorAccountingValid = !packetProcessorOwnerConflict;
         packetProcessorFallbackReason = packetProcessorOwnerConflict
@@ -580,6 +623,16 @@ public final class BrowserPacketScheduler {
         return stalePacketProcessorResets;
     }
 
+    /** Number of late callbacks rejected because their PacketProcessor was retired. */
+    public static long stalePacketProcessorEvents() {
+        return stalePacketProcessorEvents;
+    }
+
+    /** Number of bounded retired-owner tombstones currently retained. */
+    public static int retiredPacketProcessorOwnerCount() {
+        return countRetiredPacketProcessorOwners();
+    }
+
     public static String packetProcessorFallbackReason() {
         return packetProcessorFallbackReason;
     }
@@ -589,7 +642,19 @@ public final class BrowserPacketScheduler {
             markPacketProcessorConflict("null-owner");
             return false;
         }
+        if (isRetiredPacketProcessorOwner(owner)) {
+            if (stalePacketProcessorEvents < Long.MAX_VALUE) {
+                stalePacketProcessorEvents++;
+            }
+            packetProcessorFallbackReason = "retired-owner-event";
+            return false;
+        }
         if (packetProcessorOwner == null) {
+            if (packetProcessorConflictPoisoned || packetProcessorOwnerConflict
+                    || !packetProcessorAccountingValid) {
+                packetProcessorFallbackReason = "runtime-accounting-poisoned";
+                return false;
+            }
             if (queuedPacketHandleDepth > 0 && queuedPacketHandleOwner != owner) {
                 markPacketProcessorConflict("owner-while-handler-active");
                 return false;
@@ -609,9 +674,44 @@ public final class BrowserPacketScheduler {
         return packetProcessorAccountingValid && !packetProcessorOwnerConflict;
     }
 
+    private static int countRetiredPacketProcessorOwners() {
+        int count = 0;
+        for (Object retiredOwner : retiredPacketProcessorOwners) {
+            if (retiredOwner != null) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private static boolean isRetiredPacketProcessorOwner(Object owner) {
+        for (Object retiredOwner : retiredPacketProcessorOwners) {
+            if (retiredOwner == owner) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void rememberRetiredPacketProcessorOwner(Object owner) {
+        if (owner == null || isRetiredPacketProcessorOwner(owner)) {
+            return;
+        }
+        for (int index = 0; index < retiredPacketProcessorOwners.length; index++) {
+            if (retiredPacketProcessorOwners[index] == null) {
+                retiredPacketProcessorOwners[index] = owner;
+                return;
+            }
+        }
+        retiredPacketProcessorOwners[retiredPacketProcessorOwnerCursor] = owner;
+        retiredPacketProcessorOwnerCursor =
+                (retiredPacketProcessorOwnerCursor + 1) % retiredPacketProcessorOwners.length;
+    }
+
     private static void markPacketProcessorConflict(String reason) {
         packetProcessorOwnerConflict = true;
         packetProcessorAccountingValid = false;
+        packetProcessorConflictPoisoned = true;
         packetProcessorFallbackReason = reason;
         clientPacketDrainActive = false;
         clientPacketDrainCritical = false;

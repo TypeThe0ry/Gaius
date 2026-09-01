@@ -50,6 +50,9 @@ const resetEnd = schedulerSource.indexOf("\n    }\n}", resetStart);
 assert.ok(resetStart >= 0 && resetEnd > resetStart,
     "BrowserPacketScheduler.reset() boundary changed; audit it before updating this smoke");
 const resetBody = schedulerSource.slice(resetStart, resetEnd);
+const lifecycleBindNeverClearsRetired = !/clearRetiredPacketProcessorOwner/u.test(schedulerSource);
+assert.equal(lifecycleBindNeverClearsRetired, true,
+    "PacketProcessor lifecycle bind must not contain a retired-owner tombstone clear");
 const ownerContract = {
     ownerState: requireMatch(schedulerSource,
         /private static Object packetProcessorOwner;[\s\S]*private static long packetProcessorGeneration;/u,
@@ -63,6 +66,25 @@ const ownerContract = {
     staleResetGuard: requireMatch(schedulerSource,
         /public static void reset\(Object owner\)[\s\S]*packetProcessorOwnerConflict[\s\S]*stalePacketProcessorResets/u,
         "owner-aware reset does not ignore conflicting/stale close events"),
+    retiredOwnerLimit: requireMatch(schedulerSource,
+        /RETIRED_PACKET_PROCESSOR_OWNER_LIMIT\s*=\s*16/u,
+        "retired PacketProcessor owner tombstone limit is missing or unbounded"),
+    retiredOwnerTable: requireMatch(schedulerSource,
+        /private static final Object\[\] retiredPacketProcessorOwners\s*=\s*\n\s*new Object\[RETIRED_PACKET_PROCESSOR_OWNER_LIMIT\]/u,
+        "retired PacketProcessor owner tombstone table is missing"),
+    frameBindIsClaimOnly: requireMatch(schedulerSource,
+        /public static boolean bindPacketProcessor\(Object owner\)\s*\{\s*return claimPacketProcessorOwner\(owner\);\s*\}/u,
+        "per-frame PacketProcessor bind must not release a retired tombstone"),
+    lifecycleBindIsClaimOnly: requireMatch(schedulerSource,
+        /public static boolean bindPacketProcessorLifecycle\(Object owner\)\s*\{\s*return claimPacketProcessorOwner\(owner\);\s*\}/u,
+        "PacketProcessor lifecycle bind must claim without releasing a retired tombstone"),
+    lifecycleBindNeverClearsRetired,
+    constructorLifecycleHook: requireMatch(patcherSource,
+        /bindPacketProcessorLifecycle[\s\S]*PacketProcessor constructor lifecycle/u,
+        "PacketProcessor constructor does not establish the explicit lifecycle boundary"),
+    retiredEventFailClosed: requireMatch(schedulerSource,
+        /isRetiredPacketProcessorOwner\(owner\)[\s\S]*stalePacketProcessorEvents[\s\S]*retired-owner-event/u,
+        "late retired-owner callbacks can still rebind static accounting"),
 };
 
 const ownerResetStart = schedulerSource.indexOf(
@@ -75,14 +97,16 @@ const ownerResetBody = schedulerSource.slice(ownerResetStart, ownerResetEnd);
 const ownerResetCall = ownerResetBody.indexOf("\n        reset();");
 assert.ok(ownerResetCall > 0, "owner-aware reset lost its global reset call");
 const ownerResetGuard = {
-    conflictBeforeGlobalReset: requireMatch(
+    activeOwnershipBeforeGlobalReset: requireMatch(
         ownerResetBody.slice(0, ownerResetCall),
-        /packetProcessorOwnerConflict/u,
-        "owner conflict is checked after global reset"),
-    invalidBeforeGlobalReset: requireMatch(
-        ownerResetBody.slice(0, ownerResetCall),
-        /packetProcessorAccountingValid/u,
-        "invalid owner accounting is checked after global reset"),
+        /owner == null \|\| packetProcessorOwner == null \|\| owner != packetProcessorOwner/u,
+        "owner-aware reset does not reject foreign/null owners before global reset"),
+    conflictRejectedBeforeGlobalReset: /packetProcessorOwnerConflict|!packetProcessorAccountingValid/u
+        .test(ownerResetBody.slice(0, ownerResetCall)),
+    conflictedOwnerCanRetire: requireMatch(
+        ownerResetBody.slice(ownerResetCall),
+        /reset\(\);[\s\S]*rememberRetiredPacketProcessorOwner\(owner\)[\s\S]*packetProcessorOwner = null/u,
+        "active owner cannot retire and recover after a fail-closed conflict"),
 };
 
 const clientPacketBoundaryStart = clientNetworkSource.indexOf(
@@ -374,6 +398,124 @@ class OwnerClaimModel {
     }
 }
 
+// Lifecycle model for the bounded retired-owner tombstones.  Both the constructor lifecycle hook
+// and the per-frame/queue callback use the same claim-only rule, so a late event cannot resurrect
+// an owner that already crossed PacketProcessor.close/reset.
+class RetiredOwnerLifecycleModel {
+    constructor(limit = 16) {
+        this.limit = limit;
+        this.owner = null;
+        this.generation = 0;
+        this.conflict = false;
+        this.retired = [];
+        this.staleEvents = 0;
+        this.staleResets = 0;
+    }
+
+    remember(owner) {
+        if (owner === null || owner === undefined || this.retired.includes(owner)) return;
+        if (this.retired.length >= this.limit) this.retired.shift();
+        this.retired.push(owner);
+    }
+
+    claim(owner, _explicitBind = false) {
+        if (owner === null || owner === undefined) {
+            this.conflict = true;
+            return false;
+        }
+        if (this.retired.includes(owner)) {
+            this.staleEvents++;
+            return false;
+        }
+        if (this.owner === null) {
+            this.owner = owner;
+            this.generation++;
+            this.conflict = false;
+            return true;
+        }
+        if (this.owner === owner && !this.conflict) return true;
+        this.conflict = true;
+        return false;
+    }
+
+    reset(owner) {
+        if (owner !== this.owner || this.conflict) {
+            this.staleResets++;
+            this.remember(owner);
+            return false;
+        }
+        this.remember(owner);
+        this.owner = null;
+        this.generation++;
+        this.conflict = false;
+        return true;
+    }
+}
+
+function testRetiredOwnerLifecycle() {
+    const model = new RetiredOwnerLifecycleModel();
+    const ownerA = "processor-A";
+    const ownerB = "processor-B";
+    const ownerC = "processor-C";
+    const ownerD = "processor-D";
+    const ownerE = "processor-E";
+
+    assert.equal(model.claim(ownerA, true), true);
+    const generationA = model.generation;
+    assert.equal(model.reset(ownerA), true);
+    assert.equal(model.owner, null);
+    assert.equal(model.retired.includes(ownerA), true);
+
+    // An implicit late queue/handler callback must not resurrect A.
+    assert.equal(model.claim(ownerA, false), false);
+    assert.equal(model.staleEvents, 1);
+    assert.equal(model.owner, null);
+
+    // The constructor lifecycle hook is also claim-only.  Explicit lifecycle intent cannot
+    // resurrect an object whose PacketProcessor.close/reset boundary already retired it.
+    assert.equal(model.claim(ownerA, true), false);
+    assert.equal(model.staleEvents, 2);
+    assert.equal(model.retired.includes(ownerA), true);
+
+    // A new live owner can bind without being contaminated by A's late event.
+    assert.equal(model.claim(ownerB, true), true);
+    assert.equal(model.claim(ownerA, false), false);
+    assert.equal(model.owner, ownerB);
+    assert.equal(model.conflict, false);
+    assert.equal(model.reset(ownerB), true);
+
+    // Retired A and B remain blocked after C binds; explicit lifecycle intent does not clear
+    // either tombstone once the active owner has been shut down.
+    assert.equal(model.claim(ownerC, true), true);
+    assert.equal(model.claim(ownerA, false), false);
+    assert.equal(model.claim(ownerB, false), false);
+    assert.equal(model.staleEvents, 5);
+    assert.equal(model.owner, ownerC);
+    assert.equal(model.reset(ownerC), true);
+    assert.equal(model.claim(ownerA, true), false);
+    assert.equal(model.staleEvents, 6);
+    assert.equal(model.owner, null);
+    assert.equal(model.retired.includes(ownerA), true);
+
+    // A fresh owner can claim after the previous runtime retired; a genuinely concurrent second
+    // owner is still fail-closed.
+    assert.equal(model.claim(ownerD, true), true);
+    assert.equal(model.claim(ownerE, true), false);
+    assert.equal(model.conflict, true);
+
+    return {
+        tombstoneLimit: model.limit,
+        generationAfterAReset: generationA + 1,
+        staleEventsRejected: model.staleEvents,
+        retiredOwnerNeverRebinds: model.owner !== ownerA && model.owner === ownerD &&
+            model.retired.includes(ownerA),
+        staleOwnerCannotPolluteFreshOwner: model.owner === ownerD,
+        concurrentSecondOwnerFailClosed: model.conflict,
+        staleResets: model.staleResets,
+        classification: "bounded-retired-owner-lifecycle-model-not-runtime-proof",
+    };
+}
+
 class PacketProcessorModel {
     constructor(name, scheduler) {
         this.name = name;
@@ -637,10 +779,111 @@ function testBoundedOwnerClaimFailClosed() {
     };
 }
 
+// Explicitly model the unsafe overlap that a single static ledger must reject.  A and B each
+// retain an independent vanilla FIFO, while the scheduler has only one accounting owner.  Once B
+// has triggered conflict, closing A must not make B eligible for adaptive accounting: A's reset
+// may already have cleared the shared ledger while B's real FIFO is still live.
+function testConflictResetRebindFailClosed() {
+    const scheduler = new OwnerClaimModel();
+    const ownerA = "processor-A";
+    const ownerB = "processor-B";
+    const queues = new Map([[ownerA, 0], [ownerB, 0]]);
+
+    assert.equal(scheduler.queue(ownerA, 70), true);
+    queues.set(ownerA, 70);
+    assert.equal(scheduler.queue(ownerB, 70), false,
+        "second PacketProcessor must trigger owner conflict");
+    queues.set(ownerB, 70);
+    assert.equal(scheduler.ownerConflict, true);
+    assert.equal(scheduler.accountingValid, false);
+    assert.equal(scheduler.adaptiveDrainEnabled, false);
+    assert.equal(scheduler.queuedPackets, 70,
+        "foreign queue activity must not mutate the first owner's ledger");
+
+    // The active owner reset is itself rejected while conflict is live. This is the required
+    // fail-closed behavior until every overlapping owner has crossed its own lifecycle boundary.
+    const activeResetAccepted = scheduler.reset(ownerA, "processor-A:close-after-conflict");
+    assert.equal(activeResetAccepted, false,
+        "active owner reset must not clear a ledger while a foreign owner is live");
+    assert.equal(scheduler.queuedPackets, 70);
+
+    const rebindAccepted = scheduler.claim(ownerB);
+    assert.equal(rebindAccepted, false,
+        "foreign owner must remain rejected after active owner reset attempt");
+    const fallback = scheduler.packetBoundaryMode(ownerB, 256);
+    assert.deepEqual(fallback, {
+        mode: "vanilla",
+        calls: 1,
+        adaptive: false,
+    }, "B must stay on the one-call vanilla fallback after overlap");
+    assert.equal(scheduler.accountingValid, false);
+    assert.equal(scheduler.adaptiveDrainEnabled, false);
+    assert.equal(queues.get(ownerA), 70);
+    assert.equal(queues.get(ownerB), 70);
+
+    return {
+        processorOwners: 2,
+        ownerAQueue: queues.get(ownerA),
+        ownerBQueue: queues.get(ownerB),
+        ownerConflict: scheduler.ownerConflict,
+        activeResetAccepted,
+        rebindAccepted,
+        accountingValid: scheduler.accountingValid,
+        adaptiveDrainEnabled: scheduler.adaptiveDrainEnabled,
+        queueAfterResetAttempt: scheduler.queuedPackets,
+        fallbackMode: fallback.mode,
+        fallbackCalls: fallback.calls,
+        failClosed: activeResetAccepted === false && rebindAccepted === false &&
+            scheduler.accountingValid === false && scheduler.adaptiveDrainEnabled === false &&
+            fallback.mode === "vanilla",
+        classification: "overlapping-owner-reset-rebind-model-not-runtime-proof",
+    };
+}
+
+// A bounded tombstone ring is useful for recent callbacks, but it is not a strict proof across
+// repeated lifecycle churn.  This model retains every generation token so the required owner-1
+// through owner-9 late-callback case is explicit; the source gate below reports whether the Java
+// implementation has equivalent retention rather than silently treating the model as runtime
+// evidence.
+function testRetiredOwnerNineGenerationChurn() {
+    const retiredGenerations = new Set();
+    const owners = Array.from({length: 9}, (_, index) => `owner-${index + 1}`);
+    let activeOwner = null;
+    let generation = 0;
+    for (const owner of owners) {
+        assert.equal(retiredGenerations.has(owner), false,
+            `${owner} unexpectedly appeared retired before construction`);
+        activeOwner = owner;
+        generation++;
+        assert.equal(activeOwner, owner);
+        retiredGenerations.add(owner);
+        activeOwner = null;
+        generation++;
+    }
+    const lateOwner = owners[0];
+    const lateCallbackAccepted = !retiredGenerations.has(lateOwner);
+    assert.equal(lateCallbackAccepted, false,
+        "late callback from owner-1 must remain rejected after owner-9 churn");
+
+    return {
+        ownersCreated: owners.length,
+        ownersRetired: retiredGenerations.size,
+        finalGeneration: generation,
+        lateOwner,
+        lateCallbackAccepted,
+        lateCallbackRejected: lateCallbackAccepted === false,
+        retainedOwnerTokens: retiredGenerations.size,
+        classification: "strict-retired-generation-model-not-runtime-proof",
+    };
+}
+
 const supported = testSupportedSingleRuntime();
 const concurrent = testUnsupportedConcurrentProcessors();
 const activeRace = testActiveDrainCloseRace();
 const boundedOwnerClaim = testBoundedOwnerClaimFailClosed();
+const retiredOwnerLifecycle = testRetiredOwnerLifecycle();
+const conflictResetRebind = testConflictResetRebindFailClosed();
+const retiredOwnerNineGenerationChurn = testRetiredOwnerNineGenerationChurn();
 
 const staticContract = {
     schedulerGlobalFields,
@@ -671,6 +914,9 @@ const result = {
         unsupportedConcurrentProcessors: concurrent,
         activeDrainCloseRace: activeRace,
         boundedOwnerClaimFailClosed: boundedOwnerClaim,
+        retiredOwnerLifecycle,
+        conflictResetRebind,
+        retiredOwnerNineGenerationChurn,
     },
     gates: {
         supportedChannelCloseDoesNotResetAccounting: supported.isolation,
@@ -686,6 +932,19 @@ const result = {
             boundedOwnerClaim.fallbackModeAfterConflict === "vanilla" &&
             boundedOwnerClaim.fallbackCallsAfterConflict === 1 &&
             boundedOwnerClaim.adaptiveAfterConflict === false,
+        retiredOwnerLifecycleFailClosed:
+            retiredOwnerLifecycle.retiredOwnerNeverRebinds === true &&
+            retiredOwnerLifecycle.staleEventsRejected === 6 &&
+            retiredOwnerLifecycle.staleOwnerCannotPolluteFreshOwner === true &&
+            retiredOwnerLifecycle.concurrentSecondOwnerFailClosed === true,
+        conflictResetRebindFailClosed: conflictResetRebind.failClosed === true,
+        retiredOwnerNineGenerationChurnFailClosed:
+            retiredOwnerNineGenerationChurn.lateCallbackRejected === true &&
+            retiredOwnerNineGenerationChurn.ownersCreated === 9,
+        javaConflictResetGuardMatchesModel: ownerResetGuard.conflictRejectedBeforeGlobalReset,
+        javaRetiredOwnerRetentionCoversNineGenerations:
+            /RETIRED_PACKET_PROCESSOR_OWNER_LIMIT\s*=\s*(?:9|1\d|[2-9]\d+)/u.test(schedulerSource) &&
+            /new Object\[RETIRED_PACKET_PROCESSOR_OWNER_LIMIT\]/u.test(schedulerSource),
         unsupportedConcurrentProcessorIsolation: false,
         activeDrainConcurrentProcessorIsolation: false,
         publicRelayRuntimeProof: false,
@@ -697,12 +956,18 @@ const result = {
             "BrowserWebSocketChannel.doClose retires only its channel/socket",
             "supported one-processor runtime model preserves B after A channel close and reconnect",
             "bounded owner-claim model disables shared accounting on a second owner and ignores foreign/reset/stale-generation events",
+            "bounded retired-owner tombstones reject late callbacks, including explicit lifecycle binds",
+            "overlapping-owner reset/rebind model requires conflict to stay poisoned until foreign owner retirement",
+            "owner-1 through owner-9 generation-churn model rejects a late owner-1 callback",
             "Node relay/channel close tests are separate from Java PacketProcessor evidence",
         ],
         knownRisk: [
             "if a second PacketProcessor appears in one JVM, the product deliberately falls back to vanilla processing; per-owner adaptive accounting is not enabled",
             "an active drain claim/demand is also global in that unsupported topology",
             "a browser channel close does not purge already-decoded entries from the shared FIFO; the closed listener must be discarded by the normal packet path without resetting B",
+            "retired-owner lifecycle protection remains a bounded single-owner guard, not multi-Processor isolation",
+            "the Java fail-closed poison is runtime-scoped; after a conflict the static ledger remains unusable until the runtime/classloader is replaced",
+            "current Java retired-owner ring is bounded at 16 entries; arbitrary lifecycle churn beyond that still needs instance-bound generation tokens",
         ],
         notProven: [
             "this model is not a TeaVM/browser runtime proof",
