@@ -477,6 +477,16 @@ function configuration(profilePath, overrides = {}, argumentsList = ["--print-co
     }));
 }
 
+function stressConfiguration(profilePath, overrides = {},
+    argumentsList = ["--print-config", "--tier=8"]) {
+    return JSON.parse(execFileSync(process.execPath, [stressRunnerPath, ...argumentsList], {
+        cwd: bridgeDirectory,
+        env: sanitizedEnvironment(profilePath, overrides),
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+    }));
+}
+
 function assertPollPhaseTelemetryContract(config, label) {
     // Accept the historical nested location while requiring one canonical
     // object in the emitted performance contract.  This lets the scheduler
@@ -775,6 +785,35 @@ assert.equal(canonicalStressRunner.configurations[0].profile.protocolVersion, 77
 assert.equal(canonicalStressRunner.configurations[0].profile.worldVersion, 4903);
 assert.equal(canonicalStressRunner.configurations[0].clients, 16);
 
+// Print-only stress configuration must expose the trace mode without ever
+// claiming a completed strict run.  Exercise both modes here so a future
+// result-aggregation change cannot silently turn diagnostic evidence into a
+// release pass (or make trace-off config unusable).
+for (const [traceValue, expectedDiagnostics] of [
+    ["0", {
+        arrivalTraceEnabled: false,
+        diagnosticOnly: false,
+        strictEvidenceEligible: true,
+    }],
+    ["1", {
+        arrivalTraceEnabled: true,
+        diagnosticOnly: true,
+        strictEvidenceEligible: false,
+    }],
+]) {
+    const traceStressConfig = stressConfiguration("versions/26.2.json", {
+        GAIUS_BROWSER_FULL_PATH_TRACE: traceValue,
+    });
+    assert.equal(traceStressConfig.ok, true,
+        `trace=${traceValue} print-config unexpectedly failed`);
+    assert.equal(traceStressConfig.functionalOk, true,
+        `trace=${traceValue} print-config functional marker drifted`);
+    assert.equal(traceStressConfig.strictAcceptancePassed, null,
+        `trace=${traceValue} print-config claimed a completed strict run`);
+    assert.deepEqual(traceStressConfig.diagnostics, expectedDiagnostics,
+        `trace=${traceValue} print-config diagnostics drifted`);
+}
+
 expectConfigurationFailure("versions/26.2.json", {
     GAIUS_BROWSER_FULL_PATH_ACCEPTANCE: "1",
     GAIUS_BROWSER_FULL_PATH_STRESS: "1",
@@ -982,6 +1021,18 @@ assert.match(fullPathSource,
     /snapshot\.target\.activeConnections === 0/);
 assert.match(fullPathSource,
     /strict acceptance mode|strict acceptance/iu);
+assert.match(stressRunner,
+    /const functionalOk = printConfigOnly \|\| runs\.every\(\(run\) =>/u,
+    "stress runner must retain a separate functional result");
+assert.match(stressRunner,
+    /const strictAcceptancePassed = printConfigOnly\s*\? null\s*:\s*functionalOk && ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE/u,
+    "stress runner must make trace-enabled runs ineligible for clean strict evidence");
+assert.match(stressRunner,
+    /const ok = printConfigOnly \|\| strictAcceptancePassed === true/u,
+    "stress runner ok result must fail closed when strict evidence is ineligible");
+assert.match(stressRunner,
+    /strictAcceptancePassed,/u,
+    "stress runner must expose the strict acceptance result");
 assert.match(fullPathSource,
     /GAIUS_BROWSER_FULL_PATH_CLIENTS/);
 assert.match(fullPathSource,
