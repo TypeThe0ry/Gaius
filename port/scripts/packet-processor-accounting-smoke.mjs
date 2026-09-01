@@ -29,6 +29,15 @@ assert.ok(!shouldProcessNext.includes("queuedPackets"),
   "shouldProcessNext must not pre-decrement the decoded packet queue");
 assert.ok(!shouldProcessNext.includes("recordDecodedPacket"),
   "shouldProcessNext must not emit decoded packet completion");
+const lifecycleStart = scheduler.indexOf("public static boolean bindPacketProcessorLifecycle(Object owner)");
+const lifecycleEnd = scheduler.indexOf("\n    }", lifecycleStart);
+assert.ok(lifecycleStart >= 0 && lifecycleEnd > lifecycleStart,
+  "PacketProcessor lifecycle bind method is missing");
+const lifecycleBody = scheduler.slice(lifecycleStart, lifecycleEnd);
+assert.match(lifecycleBody, /return claimPacketProcessorOwner\(owner\);/u,
+  "PacketProcessor lifecycle bind must claim the owner");
+assert.doesNotMatch(lifecycleBody, /clearRetiredPacketProcessorOwner/u,
+  "PacketProcessor lifecycle bind must not resurrect a retired owner");
 assert.match(scheduler, /private static int queuedPacketHandleDepth;/,
   "nested queued PLAY packet drain guard state is missing");
 for (const contract of [
@@ -37,6 +46,7 @@ for (const contract of [
   "packetProcessorOwnerConflict",
   "packetProcessorAccountingValid",
   "public static boolean bindPacketProcessor(Object owner)",
+  "public static boolean bindPacketProcessorLifecycle(Object owner)",
   "public static boolean beginBatch(Object owner)",
   "public static boolean shouldProcessNext(Object owner)",
   "public static void packetQueued(Object owner)",
@@ -85,6 +95,7 @@ for (const contract of [
   "packetsToBeHandled",
   '"clear"',
   '"beginQueuedPacket"',
+  '"bindPacketProcessorLifecycle"',
   '"isProcessingQueuedPacket"',
   "ClientPacketListener",
   "ClientboundResourcePackPushPacket",
