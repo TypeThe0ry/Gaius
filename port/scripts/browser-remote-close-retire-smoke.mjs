@@ -9,6 +9,11 @@ const sourcePath = new URL(
   import.meta.url,
 );
 const source = readFileSync(sourcePath, "utf8");
+const networkSourcePath = new URL(
+  "../src/main/java/dev/gaius/browser/BrowserClientNetwork.java",
+  import.meta.url,
+);
+const networkSource = readFileSync(networkSourcePath, "utf8");
 
 // This smoke is deliberately a small deterministic model. It proves the lifecycle contract
 // without starting TeaVM, Chrome, or a network tunnel: a remote close must eventually retire a
@@ -21,6 +26,15 @@ assert.match(source, /retireClosedHandle: 0,/);
 assert.match(source, /retireClosedPending: false,/);
 assert.match(source, /state\.retireClosedEntry = function\(entry\)/);
 assert.match(source, /state\.retireClosedEntry\(entry\);/);
+assert.match(source, /function signalInbound\(reason\)/);
+assert.match(source, /state\.inboundPump\(String\(reason \|\| 'requested'\)\)/);
+assert.match(source, /const ownsCurrentEntry = state\.channels\.get\(entryId\) === entry/);
+assert.match(source, /if \(ownsCurrentEntry\) \{\s*state\.channels\.delete\(entryId\);/s);
+assert.match(source, /state\.inboundPump\('remote-close-retire'\)/);
+assert.match(networkSource, /const closeWake = String\(reason \|\| ''\) === 'remote-close-retire';/);
+assert.match(networkSource, /bridge\.exactPacketQueuePaused && !closeWake/);
+assert.match(networkSource, /bridge\.inboundPump = function\(reason\)/);
+assert.match(networkSource, /schedulePump\(String\(reason \|\| 'requested'\)\)/);
 
 const onCloseStart = source.indexOf("ws.onclose = function(event)");
 const onCloseEnd = source.indexOf("};", onCloseStart);
@@ -42,7 +56,7 @@ const finalizeStart = source.indexOf("function finalizeRemoteCloseRetire(entry, 
 assert.ok(finalizeStart >= 0 && finalizeStart < retireStart, "missing retire finalizer");
 const finalizeBody = source.slice(finalizeStart, retireEnd);
 assert.match(finalizeBody, /state\.discardInbound\(entry\)/);
-assert.match(finalizeBody, /state\.channels\.delete\(entry\.id\|0\)/);
+assert.match(finalizeBody, /state\.channels\.delete\((?:entry\.id\|0|entryId)\)/);
 assert.match(finalizeBody, /state\.stopEventLoopGapProbeIfIdle\(\)/);
 assert.match(discardBody, /entry\.inbound = \[\]/);
 assert.match(discardBody, /entry\.pendingInbound = \[\]/);
@@ -243,6 +257,174 @@ function createModel() {
   assert.equal(model.channels.size, 0);
 }
 
+// The Java channel registry is separate from the JS bridge map.  A finalizer must emit exactly
+// one close wake so a stale Java channel can take the existing bounded `pump()` close path even
+// when no normal Minecraft tick follows.  The wake is the only exception to exact-queue pause;
+// it closes transport state, never dispatches PLAY handlers or drains PacketProcessor.
+function createJavaLifecycleModel() {
+  let clock = 0;
+  let sequence = 0;
+  const timers = [];
+  const bridgeEntries = new Map();
+  const javaChannels = new Map();
+  const stats = {
+    ordinaryPumpBlocked: 0,
+    closeWakeRequests: 0,
+    closeWakeCallbacks: 0,
+    javaChannelsClosedByWake: 0,
+    playHandlersFromCloseWake: 0,
+    packetProcessorDrainsFromCloseWake: 0,
+  };
+  let exactPacketQueuePaused = false;
+
+  function schedule(fn, delay = 0) {
+    const task = { id: ++sequence, at: clock + delay, fn, canceled: false };
+    timers.push(task);
+    return task;
+  }
+
+  function runNext() {
+    timers.sort((left, right) => left.at - right.at || left.id - right.id);
+    const task = timers.shift();
+    if (!task) return false;
+    if (task.canceled) return true;
+    clock = Math.max(clock, task.at);
+    task.fn();
+    return true;
+  }
+
+  function hasPendingInbound(id) {
+    const entry = bridgeEntries.get(id);
+    return !!entry && !entry.disposed && entry.pendingInbound > 0;
+  }
+
+  function javaPump() {
+    for (const channel of javaChannels.values()) {
+      if (!channel.open) continue;
+      const entry = bridgeEntries.get(channel.id);
+      if ((!entry || entry.closed) && !hasPendingInbound(channel.id)) {
+        channel.open = false;
+        channel.active = false;
+        stats.javaChannelsClosedByWake++;
+      }
+    }
+  }
+
+  function signal(reason = "requested") {
+    const closeWake = String(reason) === "remote-close-retire";
+    if (exactPacketQueuePaused && !closeWake) {
+      stats.ordinaryPumpBlocked++;
+      return false;
+    }
+    if (closeWake) stats.closeWakeRequests++;
+    schedule(() => {
+      if (closeWake) stats.closeWakeCallbacks++;
+      javaPump();
+    });
+    return true;
+  }
+
+  function open(id, generation) {
+    const entry = {
+      id,
+      generation,
+      closed: false,
+      disposed: false,
+      pendingInbound: 0,
+    };
+    bridgeEntries.set(id, entry);
+    // A numeric socket id can be replaced in the bridge; the current Java channel is the one
+    // whose lifecycle must survive an old entry's delayed callback.
+    javaChannels.set(id, {id, generation, open: true, active: true});
+    return entry;
+  }
+
+  function finalize(entry) {
+    if (!entry || entry.disposed) return;
+    const ownsCurrentEntry = bridgeEntries.get(entry.id) === entry;
+    entry.pendingInbound = 0;
+    entry.disposed = true;
+    if (ownsCurrentEntry) bridgeEntries.delete(entry.id);
+    if (ownsCurrentEntry) signal("remote-close-retire");
+  }
+
+  return {
+    bridgeEntries,
+    javaChannels,
+    stats,
+    setExactPacketQueuePaused(value) {
+      exactPacketQueuePaused = !!value;
+    },
+    open,
+    finalize,
+    signal,
+    runNext,
+    get pendingTimers() {
+      return timers.length;
+    },
+  };
+}
+
+// No following Java tick: the identity-owned finalizer emits one close wake and removes the
+// Java channel from the registry through the existing closed(id)/hasPendingInbound(id) path.
+{
+  const model = createJavaLifecycleModel();
+  const entry = model.open(21, 1);
+  model.finalize(entry);
+  assert.equal(model.stats.closeWakeRequests, 1);
+  assert.equal(model.runNext(), true);
+  assert.equal(model.stats.closeWakeCallbacks, 1);
+  assert.equal(model.javaChannels.get(21).open, false);
+  assert.equal(model.javaChannels.get(21).active, false);
+  assert.equal(model.stats.javaChannelsClosedByWake, 1);
+  assert.equal(model.stats.playHandlersFromCloseWake, 0);
+  assert.equal(model.stats.packetProcessorDrainsFromCloseWake, 0);
+  assert.equal(model.pendingTimers, 0);
+}
+
+// Exact-packet pause still blocks ordinary inbound transport wakes, but the close-only wake is
+// admitted so a stale Java channel cannot survive forever behind a paused global queue.
+{
+  const model = createJavaLifecycleModel();
+  model.setExactPacketQueuePaused(true);
+  assert.equal(model.signal("requested"), false);
+  const entry = model.open(22, 1);
+  model.finalize(entry);
+  assert.equal(model.stats.closeWakeRequests, 1);
+  assert.equal(model.runNext(), true);
+  assert.equal(model.javaChannels.get(22).open, false);
+  assert.equal(model.stats.ordinaryPumpBlocked, 1);
+}
+
+// An old finalizer cannot delete or wake a replacement entry that reuses the bridge id.
+{
+  const model = createJavaLifecycleModel();
+  const oldEntry = model.open(23, 1);
+  oldEntry.closed = true;
+  const replacement = model.open(23, 2);
+  model.finalize(oldEntry);
+  assert.equal(model.stats.closeWakeRequests, 0);
+  assert.equal(model.bridgeEntries.get(23), replacement);
+  assert.equal(model.javaChannels.get(23).generation, 2);
+  assert.equal(model.javaChannels.get(23).open, true);
+  assert.equal(model.pendingTimers, 0);
+}
+
+// If a close wake was queued just before a replacement arrived, the wake may run but it must
+// observe the replacement as live and leave that Java channel open.
+{
+  const model = createJavaLifecycleModel();
+  const oldEntry = model.open(24, 1);
+  model.finalize(oldEntry);
+  const replacement = model.open(24, 2);
+  assert.equal(model.runNext(), true);
+  assert.equal(model.stats.closeWakeCallbacks, 1);
+  assert.equal(model.bridgeEntries.get(24), replacement);
+  assert.equal(model.javaChannels.get(24).generation, 2);
+  assert.equal(model.javaChannels.get(24).open, true);
+  assert.equal(model.stats.javaChannelsClosedByWake, 0);
+}
+
 console.log(JSON.stringify({
   schema: "gaius.browser-remote-close-retire-smoke.v1",
   status: "pass",
@@ -253,5 +435,8 @@ console.log(JSON.stringify({
   forcedCleanupBounded: true,
   duplicateCloseIdempotent: true,
   replacementGenerationSafe: true,
+  javaChannelRetireWake: true,
+  exactPauseCloseWakeBypass: true,
+  staleReplacementWakeSafe: true,
   sourcePath: repository.pathname,
 }, null, 2));

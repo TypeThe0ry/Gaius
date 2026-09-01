@@ -540,7 +540,8 @@ public final class BrowserClientNetwork {
                 stats.inboundPumpStaleCallbacks++;
                 return false;
               }
-              if (bridge.exactPacketQueuePaused) {
+              const closeWake = String(reason || '') === 'remote-close-retire';
+              if (bridge.exactPacketQueuePaused && !closeWake) {
                 stats.inboundPumpBlockedByExactQueue++;
                 report('exact-paused');
                 return false;
@@ -687,9 +688,9 @@ public final class BrowserClientNetwork {
                  mode: 'single-call-runTick-boundary'
               }));
             }
-            bridge.inboundPump = function() {
+            bridge.inboundPump = function(reason) {
               stats.inboundPumpRequested++;
-              schedulePump('requested');
+              schedulePump(String(reason || 'requested'));
             };
              bridge.clientPacketDrain = function() {
                stats.clientPacketDrainRequested++;

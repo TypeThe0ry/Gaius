@@ -3195,12 +3195,14 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               state.gapProbeTimer = 0;
               state.gapProbeExpectedAt = 0;
             };
-            function signalInbound() {
+            function signalInbound(reason) {
               const integratedPump = globalThis.__gaiusStartIntegratedServerPump;
               const integratedSignal = globalThis.__gaiusIntegratedServerNetworkSignal;
               if (typeof integratedPump === 'function') integratedPump();
               else if (typeof integratedSignal === 'function') integratedSignal();
-              if (typeof state.inboundPump === 'function') state.inboundPump();
+              if (typeof state.inboundPump === 'function') {
+                state.inboundPump(String(reason || 'requested'));
+              }
             }
             function applyFlowControl(entry) {
               if (!entry || entry.disposed) return;
@@ -3527,10 +3529,15 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 entry.retireClosedHandle = 0;
               }
               entry.retireClosedPending = false;
+              // Keep the identity check before deleting the bridge entry.  A delayed callback
+              // from an older generation must never wake the Java pump for a replacement that
+              // reused the same numeric socket id.
+              const entryId = entry.id|0;
+              const ownsCurrentEntry = state.channels.get(entryId) === entry;
               state.discardInbound(entry);
               entry.disposed = true;
-              if (state.channels.get(entry.id|0) === entry) {
-                state.channels.delete(entry.id|0);
+              if (ownsCurrentEntry) {
+                state.channels.delete(entryId);
               }
               state.stats.remoteCloseRetireFinalized =
                 boundedCount(state.stats.remoteCloseRetireFinalized) + 1;
@@ -3539,6 +3546,14 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                   boundedCount(state.stats.remoteCloseRetireForced) + 1;
               }
               state.stopEventLoopGapProbeIfIdle();
+              // JS retirement alone cannot remove the Java BrowserWebSocketChannel from its
+              // static channels[] registry.  One identity-guarded bounded pump gives a stale
+              // Java channel the existing `closed(id) && !hasPendingInbound(id)` close path.
+              // This wake is deliberately emitted only for the entry that was actually current
+              // and deleted; it never invokes PLAY handlers or bypasses packet FIFO.
+              if (ownsCurrentEntry && typeof state.inboundPump === 'function') {
+                state.inboundPump('remote-close-retire');
+              }
             }
             state.retireClosedEntry = function(entry) {
               if (!entry || entry.disposed) return;
