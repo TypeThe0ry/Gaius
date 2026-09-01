@@ -264,6 +264,16 @@ const CALLBACK_TAIL_TELEMETRY_SCHEMA_VERSION =
     "gaius.browser-client-poll-callback-tail.v1";
 const CALLBACK_TAIL_SLOW_THRESHOLD_MILLIS = 16.7;
 const CALLBACK_TAIL_SAMPLE_LIMIT = 64;
+// Scheduler gap telemetry is a bounded diagnostic ring for separating an
+// event-loop/callback gap from work performed inside the callback.  It is
+// deliberately independent of all acceptance gates: the 16.7 ms callback
+// threshold and 500 ms liveness limits remain unchanged.
+const SCHEDULER_GAP_TELEMETRY_SCHEMA_VERSION =
+    "gaius.browser-client-scheduler-gap.v1";
+const SCHEDULER_GAP_SLOW_THRESHOLD_MILLIS = 250;
+const SCHEDULER_GAP_STRICT_CALLBACK_THRESHOLD_MILLIS = 16.7;
+const SCHEDULER_GAP_SAMPLE_LIMIT = 64;
+const SCHEDULER_GAP_RETENTION = "largest-gap-or-callback-desc-sequence-asc";
 // Finalization telemetry starts at the existing callback work endpoint and
 // ends after the continuation has been scheduled.  It is deliberately
 // diagnostic-only: callbackDurationRawMillis remains the strict 16.7 ms gate
@@ -316,6 +326,7 @@ const ARRIVAL_TIMELINE_FRAME_RING_LIMIT = 64;
 const ARRIVAL_TRACE_SCHEMA_VERSION =
     "gaius.browser-client-arrival-trace.v1";
 const ARRIVAL_TRACE_EVENT_LIMIT = 64;
+const ARRIVAL_TRACE_FORCED_EVENT_LIMIT = 64;
 const ARRIVAL_TRACE_POLL_EVENT_STRIDE = 256;
 const ARRIVAL_TRACE_FRAME_EVENT_STRIDE = 8;
 const ARRIVAL_TRACE_PACKET_BEGIN_EVENT_STRIDE = 16;
@@ -342,6 +353,7 @@ const ARRIVAL_TRACE_EVENT_KINDS = Object.freeze([
     "decode-end",
     "dispatch-begin",
     "dispatch-end",
+    "arrival-gap-boundary",
     "phase",
     "client-created",
     "handshake-sent",
@@ -1780,6 +1792,15 @@ function createFairClientPollScheduler(getClients) {
     let lastFinalizationTail;
     let fairnessSkips = 0;
     let lastCallbackAt;
+    let lastCallbackSequence;
+    let lastCallbackTrigger;
+    let lastCallbackScheduledAt;
+    let lastCallbackFinishedAt;
+    let maxInterCallbackIdleGapRawMillis = 0;
+    let schedulerGapSamplesTotal = 0;
+    let schedulerGapSamplesDropped = 0;
+    let schedulerGapClockAnomalies = 0;
+    const schedulerGapSamples = [];
     let immediateSchedules = 0;
     let immediateCallbacks = 0;
     let timerSchedules = 0;
@@ -1809,6 +1830,22 @@ function createFairClientPollScheduler(getClients) {
         if (slowCallbackSamples.length > CALLBACK_TAIL_SAMPLE_LIMIT) {
             slowCallbackSamples.length = CALLBACK_TAIL_SAMPLE_LIMIT;
             slowCallbackSamplesDropped++;
+        }
+    };
+    const retainSchedulerGapSample = (sample) => {
+        schedulerGapSamples.push(sample);
+        schedulerGapSamples.sort((left, right) => {
+            const leftGap = Number(left.interCallbackIdleGapRawMillis) || 0;
+            const rightGap = Number(right.interCallbackIdleGapRawMillis) || 0;
+            if (leftGap !== rightGap) return rightGap - leftGap;
+            const leftDuration = Number(left.callbackDurationRawMillis) || 0;
+            const rightDuration = Number(right.callbackDurationRawMillis) || 0;
+            return rightDuration - leftDuration ||
+                left.callbackSequence - right.callbackSequence;
+        });
+        if (schedulerGapSamples.length > SCHEDULER_GAP_SAMPLE_LIMIT) {
+            schedulerGapSamples.length = SCHEDULER_GAP_SAMPLE_LIMIT;
+            schedulerGapSamplesDropped++;
         }
     };
     const retainSlowFinalizationTailSample = (sample) => {
@@ -2123,6 +2160,17 @@ function createFairClientPollScheduler(getClients) {
         callbackRunning = true;
         const callbackSequenceNumber = ++callbackSequence;
         const callbackStartedAt = performance.now();
+        const previousCallbackSequence = Number.isSafeInteger(lastCallbackSequence)
+            ? lastCallbackSequence : null;
+        const previousCallbackTrigger = lastCallbackTrigger ?? null;
+        const previousCallbackScheduledAtMillis =
+            Number.isFinite(lastCallbackScheduledAt)
+                ? lastCallbackScheduledAt : null;
+        const previousCallbackStartedAtMillis = Number.isFinite(lastCallbackAt)
+            ? lastCallbackAt : null;
+        const previousCallbackFinishedAtMillis =
+            Number.isFinite(lastCallbackFinishedAt)
+                ? lastCallbackFinishedAt : null;
         // One deadline covers both PLAY ticks and inbound polls.  Previously
         // ticks ran before the poll deadline was created, so a slow tick burst
         // could consume an entire macrotask and manufacture peer poll gaps.
@@ -2149,6 +2197,15 @@ function createFairClientPollScheduler(getClients) {
         let fairnessSkipsThisCallback = 0;
         let maxPerPollDurationMillis = 0;
         let nextContinuation = "immediate";
+        let interCallbackGapMillis = null;
+        let interCallbackIdleGapMillis = null;
+        // Keep scheduler-delay values in the run scope: finalization records
+        // the diagnostic sample from the sibling `finally` block, so a
+        // declaration inside the `try` block would be out of scope and turn
+        // the first real scheduler callback into a ReferenceError.
+        let scheduleDelayRawMillis = 0;
+        let scheduleDelayMillis = 0;
+        let callbackClockAnomaly = false;
         const markPhase = (phase) => {
             callbackPhase = phase;
             return performance.now();
@@ -2164,15 +2221,30 @@ function createFairClientPollScheduler(getClients) {
         const elapsedSinceStart = (timestamp) => Number.isFinite(timestamp)
             ? Math.max(0, timestamp - callbackStartedAt) : null;
         try {
+            if (lastCallbackFinishedAt !== undefined) {
+                const rawInterCallbackIdleGapMillis =
+                    callbackStartedAt - lastCallbackFinishedAt;
+                callbackClockAnomaly ||= rawInterCallbackIdleGapMillis < 0;
+                interCallbackIdleGapMillis = Math.max(
+                    0, rawInterCallbackIdleGapMillis);
+                maxInterCallbackIdleGapRawMillis = Math.max(
+                    maxInterCallbackIdleGapRawMillis,
+                    interCallbackIdleGapMillis);
+            }
             if (lastCallbackAt !== undefined) {
-                const interCallbackGapMillis = callbackStartedAt - lastCallbackAt;
+                const rawInterCallbackGapMillis =
+                    callbackStartedAt - lastCallbackAt;
+                callbackClockAnomaly ||= rawInterCallbackGapMillis < 0;
+                interCallbackGapMillis = Math.max(0, rawInterCallbackGapMillis);
                 maxInterCallbackGapRawMillis = Math.max(
                     maxInterCallbackGapRawMillis, interCallbackGapMillis);
                 maxInterCallbackGapMillis = Math.max(
                     maxInterCallbackGapMillis, interCallbackGapMillis);
             }
             lastCallbackAt = callbackStartedAt;
-            const scheduleDelayMillis = callbackStartedAt - scheduledAt;
+            scheduleDelayRawMillis = callbackStartedAt - scheduledAt;
+            callbackClockAnomaly ||= scheduleDelayRawMillis < 0;
+            scheduleDelayMillis = Math.max(0, scheduleDelayRawMillis);
             maxScheduleDelayRawMillis = Math.max(
                 maxScheduleDelayRawMillis, scheduleDelayMillis);
             maxScheduleDelayMillis = Math.max(maxScheduleDelayMillis, scheduleDelayMillis);
@@ -2475,6 +2547,70 @@ function createFairClientPollScheduler(getClients) {
                     nextContinuation: continuation,
                 });
             }
+            const schedulerGapTriggers = [];
+            if (interCallbackIdleGapMillis !== null &&
+                interCallbackIdleGapMillis >= SCHEDULER_GAP_SLOW_THRESHOLD_MILLIS) {
+                schedulerGapTriggers.push("inter-callback-gap");
+            }
+            if (scheduleDelayMillis >= SCHEDULER_GAP_SLOW_THRESHOLD_MILLIS) {
+                schedulerGapTriggers.push("scheduled-delay");
+            }
+            if (callbackDurationMillis >=
+                SCHEDULER_GAP_STRICT_CALLBACK_THRESHOLD_MILLIS) {
+                schedulerGapTriggers.push("callback-duration");
+            }
+            if (callbackBudgetReached) schedulerGapTriggers.push("budget-reached");
+            if (schedulerGapTriggers.length > 0) {
+                schedulerGapSamplesTotal++;
+                if (callbackClockAnomaly) schedulerGapClockAnomalies++;
+                retainSchedulerGapSample({
+                    schemaVersion: SCHEDULER_GAP_TELEMETRY_SCHEMA_VERSION,
+                    callbackSequence: callbackSequenceNumber,
+                    previousCallbackSequence,
+                    trigger,
+                    previousCallbackTrigger,
+                    scheduledAtMillis: scheduledAt,
+                    previousCallbackScheduledAtMillis,
+                    previousCallbackStartedAtMillis,
+                    previousCallbackFinishedAtMillis,
+                    callbackStartedAtMillis: callbackStartedAt,
+                    callbackFinishedAtMillis: callbackFinishedAt,
+                    scheduledDelayRawMillis: scheduleDelayRawMillis,
+                    scheduledDelayMillis: roundedMillis(scheduleDelayMillis),
+                    interCallbackGapRawMillis: interCallbackGapMillis,
+                    interCallbackGapMillis: interCallbackGapMillis === null
+                        ? null : roundedMillis(interCallbackGapMillis),
+                    interCallbackIdleGapRawMillis:
+                        interCallbackIdleGapMillis,
+                    interCallbackIdleGapMillis: interCallbackIdleGapMillis === null
+                        ? null : roundedMillis(interCallbackIdleGapMillis),
+                    callbackDurationRawMillis: callbackDurationMillis,
+                    callbackDurationMillis: roundedMillis(callbackDurationMillis),
+                    callbackPhase: callbackPhaseBeforeFinalize,
+                    nextContinuation: continuation,
+                    visibleClientCount: clients.length,
+                    dispatchedPolls: dispatched,
+                    tickServices: tickServicesThisCallback,
+                    dueTicksAfterService: lastDueTicksAfterService,
+                    dueTicksBeforeIdle: lastDueTicksBeforeIdle,
+                    budgetReached: callbackBudgetReached,
+                    budgetReachedPhase: callbackBudgetReachedPhase ?? null,
+                    budgetReachedAtMillis: callbackBudgetReachedAtMillis ?? null,
+                    triggerReasons: schedulerGapTriggers,
+                    slowGapThresholdMillis: SCHEDULER_GAP_SLOW_THRESHOLD_MILLIS,
+                    strictCallbackThresholdMillis:
+                        SCHEDULER_GAP_STRICT_CALLBACK_THRESHOLD_MILLIS,
+                    clockAnomaly: callbackClockAnomaly,
+                    diagnosticOnly: true,
+                    strictGatesChanged: false,
+                });
+            }
+            // The next callback's idle-gap measurement starts at the strict
+            // callback endpoint, not after telemetry sorting or scheduling.
+            lastCallbackFinishedAt = callbackFinishedAt;
+            lastCallbackSequence = callbackSequenceNumber;
+            lastCallbackTrigger = trigger;
+            lastCallbackScheduledAt = scheduledAt;
             if (!stopped) {
                 schedule(continuation);
             }
@@ -2667,6 +2803,28 @@ function createFairClientPollScheduler(getClients) {
                     droppedSampleCount: slowCallbackSamplesDropped,
                     retention: "longest-duration-desc-sequence-asc",
                     samples: slowCallbackSamples.map((sample) => ({ ...sample })),
+                },
+                schedulerGap: {
+                    schemaVersion: SCHEDULER_GAP_TELEMETRY_SCHEMA_VERSION,
+                    slowGapThresholdMillis: SCHEDULER_GAP_SLOW_THRESHOLD_MILLIS,
+                    strictCallbackThresholdMillis:
+                        SCHEDULER_GAP_STRICT_CALLBACK_THRESHOLD_MILLIS,
+                    sampleLimit: SCHEDULER_GAP_SAMPLE_LIMIT,
+                    retention: SCHEDULER_GAP_RETENTION,
+                    diagnosticOnly: true,
+                    strictGatesChanged: false,
+                    strictRawDurationGateMillis:
+                        SCHEDULER_GAP_STRICT_CALLBACK_THRESHOLD_MILLIS,
+                    samplesTotal: schedulerGapSamplesTotal,
+                    retainedSampleCount: schedulerGapSamples.length,
+                    samplesDropped: schedulerGapSamplesDropped,
+                    droppedSampleCount: schedulerGapSamplesDropped,
+                    clockAnomalies: schedulerGapClockAnomalies,
+                    maxInterCallbackIdleGapRawMillis,
+                    samples: schedulerGapSamples.map((sample) => ({
+                        ...sample,
+                        triggerReasons: [...sample.triggerReasons],
+                    })),
                 },
                 callbackFinalizationTail: {
                     schemaVersion:
@@ -2908,10 +3066,14 @@ function createArrivalTraceRing() {
         nextIndex: 0,
         sequence: 0,
         dropped: 0,
+        forcedNextIndex: 0,
+        forcedDropped: 0,
+        forcedBoundaryDropped: 0,
         pollEventsSeen: 0,
         pollEventsSuppressed: 0,
         frameEventsSeen: 0,
         events: new Array(ARRIVAL_TRACE_EVENT_LIMIT),
+        forcedEvents: new Array(ARRIVAL_TRACE_FORCED_EVENT_LIMIT),
     };
 }
 
@@ -2989,16 +3151,50 @@ function recordArrivalTrace(ring, kind, details = {}) {
         bufferedBytes: traceInteger(details.bufferedBytes),
         durationMillis: traceNumber(details.durationMillis),
         intentional: details.intentional === true,
+        forceRetained: details.force === true,
+        schedulerTrigger: typeof details.schedulerTrigger === "string"
+            ? details.schedulerTrigger.slice(0, 80) : null,
+        boundaryReason: typeof details.boundaryReason === "string"
+            ? details.boundaryReason.slice(0, 80) : null,
+        gapStartAt: traceNumber(details.gapStartAt),
+        gapEndAt: traceNumber(details.gapEndAt),
+        gapMillis: traceNumber(details.gapMillis),
+        decodedGapMillis: traceNumber(details.decodedGapMillis),
+        triggerSegments: Array.isArray(details.triggerSegments)
+            ? details.triggerSegments.slice(0, 5).map((segment) =>
+                String(segment).slice(0, 80)) : [],
     };
     ring.events[index] = event;
     ring.nextIndex = (index + 1) % ring.limit;
+    if (details.force === true && Array.isArray(ring.forcedEvents)) {
+        const forcedIndex = ring.forcedNextIndex;
+        const evicted = ring.forcedEvents[forcedIndex];
+        if (evicted !== undefined) {
+            ring.forcedDropped++;
+            if (evicted.kind === "arrival-gap-boundary") {
+                ring.forcedBoundaryDropped++;
+            }
+        }
+        ring.forcedEvents[forcedIndex] = event;
+        ring.forcedNextIndex =
+            (forcedIndex + 1) % ARRIVAL_TRACE_FORCED_EVENT_LIMIT;
+    }
     return event;
 }
 
 function orderedArrivalTraceEvents(ring) {
     if (ring === undefined || ring === null) return [];
-    return ring.events.filter((event) => event !== undefined)
-        .sort((left, right) => left.sequence - right.sequence);
+    const events = [];
+    const seen = new Set();
+    for (const event of [
+        ...(Array.isArray(ring.events) ? ring.events : []),
+        ...(Array.isArray(ring.forcedEvents) ? ring.forcedEvents : []),
+    ]) {
+        if (event === undefined || seen.has(event)) continue;
+        seen.add(event);
+        events.push(event);
+    }
+    return events.sort((left, right) => left.sequence - right.sequence);
 }
 
 function arrivalTraceWindow(rings, startAt, endAt) {
@@ -3007,17 +3203,22 @@ function arrivalTraceWindow(rings, startAt, endAt) {
     const bounded = start !== null || end !== null;
     const candidates = [];
     let dropped = 0;
+    let forcedEventsDropped = 0;
+    let forcedBoundaryDropped = 0;
     let pollEventsSuppressed = 0;
     let timestampUnavailable = 0;
     let ringOverflowAffectsWindow = false;
     for (const ring of rings ?? []) {
         if (ring === undefined || ring === null) continue;
         dropped += ring.dropped;
+        forcedEventsDropped += Number(ring.forcedDropped) || 0;
+        forcedBoundaryDropped += Number(ring.forcedBoundaryDropped) || 0;
         pollEventsSuppressed += ring.pollEventsSuppressed;
         const retainedEvents = orderedArrivalTraceEvents(ring);
         const retainedTimes = retainedEvents.map((event) => event.at)
             .filter((at) => Number.isFinite(at));
-        if (ring.dropped > 0 && (start === null || retainedTimes.length === 0 ||
+        if ((ring.dropped > 0 || ring.forcedDropped > 0) &&
+            (start === null || retainedTimes.length === 0 ||
             Math.min(...retainedTimes) > start)) {
             // `dropped` is cumulative.  It invalidates this particular window
             // only when the oldest retained timestamp is newer than the
@@ -3038,7 +3239,25 @@ function arrivalTraceWindow(rings, startAt, endAt) {
         (left.at ?? Number.POSITIVE_INFINITY) -
             (right.at ?? Number.POSITIVE_INFINITY) ||
         left.sequence - right.sequence || left.source.localeCompare(right.source));
-    const traceEvents = candidates.slice(0, ARRIVAL_TRACE_EVENT_LIMIT);
+    // A forced slow-boundary marker must survive ordinary sampled events.  It
+    // is still returned in chronological order after priority selection so
+    // consumers can read the window as a timeline.
+    const forcedBoundaryCandidates = candidates.filter((event) =>
+        event.kind === "arrival-gap-boundary" && event.forceRetained === true);
+    const forcedCandidates = candidates.filter((event) =>
+        event.forceRetained === true && event.kind !== "arrival-gap-boundary");
+    const ordinaryCandidates = candidates.filter((event) =>
+        event.forceRetained !== true);
+    const prioritizedCandidates = [
+        ...forcedBoundaryCandidates,
+        ...forcedCandidates,
+        ...ordinaryCandidates,
+    ];
+    const traceEvents = prioritizedCandidates.slice(0, ARRIVAL_TRACE_EVENT_LIMIT)
+        .sort((left, right) =>
+            (left.at ?? Number.POSITIVE_INFINITY) -
+                (right.at ?? Number.POSITIVE_INFINITY) ||
+            left.sequence - right.sequence || left.source.localeCompare(right.source));
     const retainedOverflow = Math.max(0, candidates.length - traceEvents.length);
     const times = traceEvents
         .map((event) => event.at)
@@ -3051,6 +3270,10 @@ function arrivalTraceWindow(rings, startAt, endAt) {
     const eventCounts = Object.fromEntries(
         ARRIVAL_TRACE_EVENT_KINDS.map((eventKind) => [eventKind, 0]));
     for (const event of traceEvents) eventCounts[event.kind]++;
+    const forcedBoundaryEventCount = traceEvents.filter((event) =>
+        event.kind === "arrival-gap-boundary" && event.forceRetained === true).length;
+    const forcedEventCount = traceEvents.filter((event) =>
+        event.forceRetained === true).length;
     const totalDropped = dropped + retainedOverflow;
     const enabled = (rings ?? []).some((ring) => ring?.enabled === true);
     return {
@@ -3070,6 +3293,15 @@ function arrivalTraceWindow(rings, startAt, endAt) {
         events: traceEvents,
         dropped: totalDropped,
         ringDropped: dropped,
+        forcedEventCount,
+        forcedEventsDropped,
+        forcedBoundaryEventCount,
+        forcedBoundaryDropped,
+        forcedBoundaryRetained: forcedBoundaryEventCount > 0,
+        forcedBoundaryCoverage: !enabled ? "disabled" :
+            forcedBoundaryEventCount > 0
+                ? forcedBoundaryDropped > 0 ? "retained-with-overflow" : "retained"
+                : forcedBoundaryDropped > 0 ? "dropped" : "not-observed",
         ringOverflowAffectsWindow,
         pollEventsSuppressed,
         timestampUnavailableEvents: timestampUnavailable,
@@ -3086,6 +3318,9 @@ function arrivalTraceContract() {
     return {
         schemaVersion: ARRIVAL_TRACE_SCHEMA_VERSION,
         eventLimit: ARRIVAL_TRACE_EVENT_LIMIT,
+        forcedEventLimit: ARRIVAL_TRACE_FORCED_EVENT_LIMIT,
+        boundaryEventKind: "arrival-gap-boundary",
+        forcedBoundaryPriority: true,
         pollEventStride: ARRIVAL_TRACE_POLL_EVENT_STRIDE,
         frameEventStride: ARRIVAL_TRACE_FRAME_EVENT_STRIDE,
         packetBeginEventStride: ARRIVAL_TRACE_PACKET_BEGIN_EVENT_STRIDE,
@@ -3096,7 +3331,7 @@ function arrivalTraceContract() {
         strictGatesChanged: false,
         wireAtSource: ARRIVAL_WIRE_AT_SOURCE,
         bridgeEnqueueTimestampAvailable: false,
-        retention: "bounded-gap-window",
+        retention: "bounded-gap-window-with-forced-boundary-priority",
     };
 }
 
@@ -3510,6 +3745,9 @@ class BrowserMinecraftClient {
         decodeEndAt,
         dispatchAt,
         reconnectRecoveryAtDecode = false,
+        schedulerCallbackSequence = null,
+        schedulerTrigger = null,
+        pollSequence = null,
     }) {
         this.arrivalObservedDecodedPacket = true;
         this.arrivalObservedDispatch ||= Number.isFinite(dispatchAt);
@@ -3614,6 +3852,27 @@ class BrowserMinecraftClient {
             this.arrivalIntentionalDropGapsExcluded++;
             return;
         }
+        // Keep the slow-gap boundary in the independent forced ring before
+        // ordinary window selection; this is diagnostic-only and does not
+        // affect any strict acceptance gate.
+        recordArrivalTrace(this.arrivalTraceRing, "arrival-gap-boundary", {
+            at: decodeEndAt,
+            phase: phaseAtDecode,
+            source: "client",
+            packetSequence: this.decodedPackets,
+            packetId,
+            schedulerCallbackSequence,
+            schedulerTrigger,
+            pollSequence,
+            gapStartAt: previousDecodeEndAt,
+            gapEndAt: decodeEndAt,
+            gapMillis: slowTriggerMillis,
+            decodedGapMillis,
+            boundaryReason: triggerSegments.length > 0
+                ? "arrival-slow-segment" : "decoded-gap",
+            triggerSegments,
+            force: true,
+        });
         const traceWindow = arrivalTraceWindow(
             arrivalTraceRingsForClient(this), previousDecodeEndAt, decodeEndAt);
         const sample = {
@@ -3630,6 +3889,11 @@ class BrowserMinecraftClient {
             packetId,
             phaseAtDecode,
             phaseAtReceive: this.phase,
+            schedulerCallbackSequence: Number.isSafeInteger(
+                schedulerCallbackSequence) ? schedulerCallbackSequence : null,
+            schedulerTrigger: typeof schedulerTrigger === "string"
+                ? schedulerTrigger : null,
+            pollSequence: Number.isSafeInteger(pollSequence) ? pollSequence : null,
             decodedGapMillis,
             slowTriggerMillis,
             triggerSegments,
@@ -3722,6 +3986,11 @@ class BrowserMinecraftClient {
                 enabled: this.arrivalTraceRing.enabled === true,
                 retainedEvents: orderedArrivalTraceEvents(this.arrivalTraceRing).length,
                 dropped: this.arrivalTraceRing.dropped,
+                forcedRetainedEvents: Array.isArray(this.arrivalTraceRing.forcedEvents)
+                    ? this.arrivalTraceRing.forcedEvents.filter((event) =>
+                        event !== undefined).length : 0,
+                forcedDropped: this.arrivalTraceRing.forcedDropped,
+                forcedBoundaryDropped: this.arrivalTraceRing.forcedBoundaryDropped,
             },
             source: {
                 wireTimestampAvailable: false,
@@ -4368,6 +4637,9 @@ class BrowserMinecraftClient {
                 decodeEndAt: packetAt,
                 dispatchAt,
                 reconnectRecoveryAtDecode,
+                schedulerCallbackSequence: pollContext?.schedulerCallbackSequence,
+                schedulerTrigger: pollContext?.schedulerTrigger,
+                pollSequence: pollContext?.pollSequence,
             });
             if (dispatchError !== undefined) throw dispatchError;
             if (this.failure !== undefined) throw this.failure;
@@ -6563,6 +6835,31 @@ function browserFullPathPerformanceContract() {
                 sampleLimit: CALLBACK_TAIL_SAMPLE_LIMIT,
                 retention: "longest-duration-desc-sequence-asc",
                 strictRawDurationGateMillis: 16.7,
+            },
+            schedulerGap: {
+                schemaVersion: SCHEDULER_GAP_TELEMETRY_SCHEMA_VERSION,
+                slowGapThresholdMillis: SCHEDULER_GAP_SLOW_THRESHOLD_MILLIS,
+                strictCallbackThresholdMillis:
+                    SCHEDULER_GAP_STRICT_CALLBACK_THRESHOLD_MILLIS,
+                sampleLimit: SCHEDULER_GAP_SAMPLE_LIMIT,
+                retention: SCHEDULER_GAP_RETENTION,
+                diagnosticOnly: true,
+                strictGatesChanged: false,
+                strictRawDurationGateMillis:
+                    SCHEDULER_GAP_STRICT_CALLBACK_THRESHOLD_MILLIS,
+                triggerKinds: [
+                    "inter-callback-gap",
+                    "scheduled-delay",
+                    "callback-duration",
+                    "budget-reached",
+                ],
+                clockAnomalyField: "clockAnomaly",
+                correlationFields: [
+                    "previousCallbackSequence",
+                    "previousCallbackStartedAtMillis",
+                    "previousCallbackFinishedAtMillis",
+                    "interCallbackGapRawMillis",
+                ],
             },
             callbackFinalizationTail: callbackFinalizationTailContract(),
             dueState: "side-map-authoritative-client-property-mirror-only",

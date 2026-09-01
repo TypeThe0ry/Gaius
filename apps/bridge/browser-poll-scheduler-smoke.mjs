@@ -228,6 +228,65 @@ assert.match(schedulerSource, /budgetReachedPhase/u);
 assert.match(schedulerSource, /terminalPhase/u);
 assert.match(schedulerSource, /strictFrameBudgetExcessMillis/u);
 assert.match(schedulerSource, /nextContinuation/u);
+assert.match(source,
+    /const SCHEDULER_GAP_TELEMETRY_SCHEMA_VERSION\s*=\s*["']gaius\.browser-client-scheduler-gap\.v1["']/u,
+    "scheduler gap telemetry schema drifted");
+assert.match(source, /const SCHEDULER_GAP_SLOW_THRESHOLD_MILLIS\s*=\s*250/u,
+    "scheduler gap diagnostic threshold drifted");
+assert.match(source,
+    /const SCHEDULER_GAP_STRICT_CALLBACK_THRESHOLD_MILLIS\s*=\s*16\.7/u,
+    "scheduler gap strict callback threshold drifted");
+assert.match(source, /const SCHEDULER_GAP_SAMPLE_LIMIT\s*=\s*64/u,
+    "scheduler gap sample limit drifted");
+assert.match(schedulerSource, /lastCallbackFinishedAt/u,
+    "scheduler gap evidence lost callback-finish boundary");
+assert.match(schedulerSource, /schedulerGapSamplesTotal/u,
+    "scheduler gap total counter is missing");
+assert.match(schedulerSource, /schedulerGapSamplesDropped/u,
+    "scheduler gap dropped counter is missing");
+assert.match(schedulerSource, /retainSchedulerGapSample\(/u,
+    "scheduler gap bounded retention helper is missing");
+assert.match(schedulerSource, /interCallbackIdleGapRawMillis/u,
+    "scheduler gap sample lost idle-gap split");
+assert.match(schedulerSource, /schedulerGap:\s*\{/u,
+    "scheduler gap evidence is not serialized");
+assert.match(schedulerSource,
+    /schedulerGap:[\s\S]*?diagnosticOnly:\s*true[\s\S]*?strictGatesChanged:\s*false/u,
+    "scheduler gap telemetry must remain diagnostic-only");
+assert.match(schedulerSource, /scheduled-delay/u,
+    "scheduler gap evidence lost scheduled-delay trigger");
+assert.match(schedulerSource, /previousCallbackSequence/u,
+    "scheduler gap evidence lost previous callback sequence");
+assert.match(schedulerSource, /previousCallbackStartedAtMillis/u,
+    "scheduler gap evidence lost previous callback start timestamp");
+assert.match(schedulerSource, /previousCallbackFinishedAtMillis/u,
+    "scheduler gap evidence lost previous callback finish timestamp");
+assert.match(schedulerSource, /interCallbackGapRawMillis/u,
+    "scheduler gap evidence lost start-to-start gap");
+assert.match(schedulerSource, /clockAnomaly/u,
+    "scheduler gap evidence lost clock anomaly marker");
+// The gap sample is finalized from the sibling `finally` block.  Keep its
+// delay values in `run()` scope so a future edit cannot hide a block-scoped
+// declaration inside `try` and trigger a runtime ReferenceError on callback.
+const schedulerDelayScopeOffset = schedulerSource.indexOf(
+    "let scheduleDelayRawMillis = 0;");
+const schedulerRunTryOffset = schedulerSource.indexOf(
+    "\n        try {", schedulerDelayScopeOffset);
+assert.ok(schedulerDelayScopeOffset >= 0 && schedulerRunTryOffset >
+    schedulerDelayScopeOffset,
+"scheduler delay evidence must be declared before the callback try block");
+assert.equal(schedulerSource.indexOf("const scheduleDelayMillis"), -1,
+    "scheduler delay must not be block-scoped inside try");
+assert.match(source, /ARRIVAL_TRACE_FORCED_EVENT_LIMIT\s*=\s*64/u,
+    "arrival forced trace ring limit drifted");
+assert.match(source, /["']arrival-gap-boundary["']/u,
+    "arrival gap boundary event kind is missing");
+assert.match(source, /forcedBoundaryDropped/u,
+    "arrival forced boundary overflow accounting is missing");
+assert.match(source, /forcedBoundaryCoverage/u,
+    "arrival forced boundary coverage is missing");
+assert.match(source, /force:\s*true/u,
+    "arrival forced boundary marker is not force-retained");
 assert.match(schedulerSource, /finalizeStartAt/u,
     "callback finalization-tail start timestamp is missing");
 assert.match(schedulerSource, /finalizeFinishAt/u,
@@ -814,6 +873,152 @@ function retainCallbackFinalizationTailSample(state, sample) {
             "finalization-tail ring ordering drifted");
         }
     }
+}
+
+// Scheduler-gap model: retain split callback-boundary evidence without
+// changing the strict callback gate.  The model mirrors the production
+// largest-gap/duration ordering and its bounded 64-entry diagnostic ring.
+const SCHEDULER_GAP_MODEL_LIMIT = 64;
+function clampSchedulerGapModel(value) {
+    const number = Number(value);
+    return {
+        millis: Number.isFinite(number) ? Math.max(0, number) : 0,
+        clockAnomaly: !Number.isFinite(number) || number < 0,
+    };
+}
+
+function retainSchedulerGapModel(state, candidate) {
+    const idle = clampSchedulerGapModel(candidate?.interCallbackIdleGapRawMillis);
+    const startToStart = clampSchedulerGapModel(candidate?.interCallbackGapRawMillis);
+    const scheduled = clampSchedulerGapModel(candidate?.scheduledDelayRawMillis);
+    const duration = clampSchedulerGapModel(candidate?.callbackDurationRawMillis);
+    const triggerKinds = [];
+    if (idle.millis >= 250 || startToStart.millis >= 250) {
+        triggerKinds.push("inter-callback-gap");
+    }
+    if (scheduled.millis >= 250) triggerKinds.push("scheduled-delay");
+    if (duration.millis >= 16.7) triggerKinds.push("callback-duration");
+    if (candidate?.budgetReached === true) triggerKinds.push("budget-reached");
+    if (triggerKinds.length === 0) return false;
+    state.total++;
+    state.samples.push({
+        callbackSequence: Number.isSafeInteger(candidate?.callbackSequence)
+            ? candidate.callbackSequence : state.total,
+        interCallbackIdleGapRawMillis: idle.millis,
+        interCallbackGapRawMillis: startToStart.millis,
+        scheduledDelayRawMillis: scheduled.millis,
+        callbackDurationRawMillis: duration.millis,
+        triggerKinds,
+        clockAnomaly: idle.clockAnomaly || startToStart.clockAnomaly ||
+            scheduled.clockAnomaly || duration.clockAnomaly,
+    });
+    state.samples.sort((left, right) =>
+        right.interCallbackIdleGapRawMillis - left.interCallbackIdleGapRawMillis ||
+        right.callbackDurationRawMillis - left.callbackDurationRawMillis ||
+        left.callbackSequence - right.callbackSequence);
+    if (state.samples.length > SCHEDULER_GAP_MODEL_LIMIT) {
+        state.samples.length = SCHEDULER_GAP_MODEL_LIMIT;
+        state.dropped++;
+    }
+    return true;
+}
+
+function createArrivalTraceModel() {
+    return {
+        normal: new Array(64),
+        forced: new Array(64),
+        normalNext: 0,
+        forcedNext: 0,
+        normalDropped: 0,
+        forcedDropped: 0,
+    };
+}
+
+function recordArrivalTraceModel(state, event, force = false) {
+    const record = { ...event, forceRetained: force };
+    const normalIndex = state.normalNext;
+    if (state.normal[normalIndex] !== undefined) state.normalDropped++;
+    state.normal[normalIndex] = record;
+    state.normalNext = (normalIndex + 1) % 64;
+    if (force) {
+        const forcedIndex = state.forcedNext;
+        if (state.forced[forcedIndex] !== undefined) state.forcedDropped++;
+        state.forced[forcedIndex] = record;
+        state.forcedNext = (forcedIndex + 1) % 64;
+    }
+}
+
+function prioritizedArrivalTraceModel(state) {
+    const unique = [];
+    const seen = new Set();
+    for (const event of [...state.normal, ...state.forced]) {
+        if (event === undefined || seen.has(event)) continue;
+        seen.add(event);
+        unique.push(event);
+    }
+    const forcedBoundary = unique.filter((event) =>
+        event.kind === "arrival-gap-boundary" && event.forceRetained === true);
+    const forced = unique.filter((event) =>
+        event.forceRetained === true && event.kind !== "arrival-gap-boundary");
+    const ordinary = unique.filter((event) => event.forceRetained !== true);
+    return [...forcedBoundary, ...forced, ...ordinary].slice(0, 64).sort((left, right) =>
+        left.sequence - right.sequence);
+}
+
+{
+    const gap = { total: 0, dropped: 0, samples: [] };
+    assert.equal(retainSchedulerGapModel(gap, {
+        callbackSequence: 1,
+        interCallbackIdleGapRawMillis: 0,
+        interCallbackGapRawMillis: 0,
+        scheduledDelayRawMillis: 300,
+        callbackDurationRawMillis: 1,
+    }), true, "scheduled callback delay did not enter gap evidence");
+    assert.deepEqual(gap.samples[0].triggerKinds, ["scheduled-delay"],
+        "scheduled-delay trigger was not retained");
+    for (let sequence = 2; sequence <= 65; sequence++) {
+        retainSchedulerGapModel(gap, {
+            callbackSequence: sequence,
+            interCallbackIdleGapRawMillis: 0,
+            interCallbackGapRawMillis: 0,
+            scheduledDelayRawMillis: 300,
+            callbackDurationRawMillis: 1,
+        });
+    }
+    assert.equal(gap.total, 65,
+        "scheduler gap total did not count every slow candidate");
+    assert.equal(gap.samples.length, SCHEDULER_GAP_MODEL_LIMIT,
+        "scheduler gap ring exceeded its hard limit");
+    assert.equal(gap.dropped, 1,
+        "scheduler gap dropped count did not track overflow");
+    const anomaly = { total: 0, dropped: 0, samples: [] };
+    assert.equal(retainSchedulerGapModel(anomaly, {
+        callbackSequence: 1,
+        interCallbackIdleGapRawMillis: -4,
+        interCallbackGapRawMillis: -3,
+        scheduledDelayRawMillis: 0,
+        callbackDurationRawMillis: 20,
+    }), true, "clock-anomaly callback was not retained");
+    assert.equal(anomaly.samples[0].interCallbackIdleGapRawMillis, 0,
+        "negative idle gap was not clamped");
+    assert.equal(anomaly.samples[0].interCallbackGapRawMillis, 0,
+        "negative start-to-start gap was not clamped");
+    assert.equal(anomaly.samples[0].clockAnomaly, true,
+        "negative callback clock was not marked anomalous");
+
+    const trace = createArrivalTraceModel();
+    recordArrivalTraceModel(trace, {
+        sequence: 1, kind: "arrival-gap-boundary",
+    }, true);
+    for (let sequence = 2; sequence <= 66; sequence++) {
+        recordArrivalTraceModel(trace, { sequence, kind: "decode-end" });
+    }
+    const prioritized = prioritizedArrivalTraceModel(trace);
+    assert.ok(prioritized.some((event) =>
+        event.kind === "arrival-gap-boundary" && event.forceRetained === true),
+    "forced arrival boundary was overwritten by ordinary trace events");
+    assert.equal(trace.forcedDropped, 0,
+        "forced boundary ring unexpectedly overflowed");
 }
 
 // Poll-phase diagnostic model.  The production client may parse/inflate a
@@ -1557,6 +1762,40 @@ console.log(JSON.stringify({
         measuredFrom: "callback-work-end-to-finalize-finish",
         totalAfterFinalizeFrom: "callback-start-to-finalize-finish",
         includesContinuationScheduling: true,
+    },
+    schedulerGap: {
+        schemaVersion: "gaius.browser-client-scheduler-gap.v1",
+        slowGapThresholdMillis: 250,
+        strictCallbackThresholdMillis: 16.7,
+        sampleLimit: 64,
+        retention: "largest-gap-or-callback-desc-sequence-asc",
+        diagnosticOnly: true,
+        strictGatesChanged: false,
+        strictRawDurationGateMillis: 16.7,
+        triggerKinds: [
+            "inter-callback-gap",
+            "scheduled-delay",
+            "callback-duration",
+            "budget-reached",
+        ],
+        clockAnomalyField: "clockAnomaly",
+        correlationFields: [
+            "previousCallbackSequence",
+            "previousCallbackStartedAtMillis",
+            "previousCallbackFinishedAtMillis",
+            "interCallbackGapRawMillis",
+        ],
+        modelSamplesTotal: 65,
+        modelRetainedSampleCount: 64,
+        modelDroppedSampleCount: 1,
+    },
+    arrivalTraceBoundary: {
+        boundaryEventKind: "arrival-gap-boundary",
+        forcedEventLimit: 64,
+        forcedBoundaryPriority: true,
+        modelBoundaryRetainedAfterOrdinaryOverflow: true,
+        diagnosticOnly: true,
+        strictGatesChanged: false,
     },
     arrivalPeriodicServerSync: {
         schemaVersion: ARRIVAL_PERIODIC_SERVER_SYNC_SCHEMA_VERSION,
