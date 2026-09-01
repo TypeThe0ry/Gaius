@@ -36,8 +36,17 @@ assert.match(source,
     /const POLL_SCHEDULER_IDLE_IMMEDIATE_WINDOW_MILLIS = 2/u,
     "near-due poll cursors must have a bounded immediate window");
 assert.match(source,
+    /const POLL_SCHEDULER_IDLE_IMMEDIATE_PROBE_BUDGET_MILLIS = 2/u,
+    "near-due immediate probes must have an absolute time budget");
+assert.match(source,
     /const POLL_SCHEDULER_IDLE_IMMEDIATE_SPIN_LIMIT = 16/u,
     "near-due immediate spins must retain a hard limit");
+assert.match(source,
+    /overdueWakePending && dispatched === 0/u,
+    "overdue wake suppression must not discard a successful dispatch");
+assert.match(source,
+    /probeElapsedMillis[\s\S]*POLL_SCHEDULER_IDLE_IMMEDIATE_PROBE_BUDGET_MILLIS/u,
+    "near-due probe must enforce its absolute elapsed-time budget");
 assert.match(source,
     /const MAX_PLAY_TICKS_PER_SCHEDULER_CALLBACK = MAX_CLIENTS_PER_POLL_CALLBACK/u);
 assert.match(source, /const CALLBACK_TAIL_SLOW_THRESHOLD_MILLIS = 16\.7/u);
@@ -679,6 +688,84 @@ function modelIdleContinuation({
         };
     }
     return { continuation: "idle", idleImmediateSpins: 0 };
+}
+
+// Deadline-aware model of the production near-due probe.  The 16-turn limit
+// is only a per-burst CPU guard; the 2 ms absolute budget is the real bound.
+// Once a burst rolls over, the model must remain on the immediate path while
+// the deadline probe is still inside its budget.  If the deadline is already
+// overdue when the budget expires, one immediate wake is retained so the due
+// client can dispatch instead of falling onto a quantized timer.
+function modelDeadlineProbeContinuation({
+    now = 0,
+    earliestPollDueAt = Infinity,
+    idleImmediateSpins = 0,
+    probeStartedAt,
+    overdueWakePending = false,
+    dispatched = 0,
+    dueTicks = 0,
+    readyAfterDispatch = false,
+} = {}) {
+    let nextSpins = idleImmediateSpins;
+    let nextProbeStartedAt = probeStartedAt;
+    let nextOverdueWakePending = overdueWakePending;
+    if (dueTicks > 0 || readyAfterDispatch) {
+        return {
+            continuation: "immediate",
+            idleImmediateSpins: 0,
+            probeStartedAt: undefined,
+            overdueWakePending: false,
+        };
+    }
+    if (overdueWakePending && dispatched === 0) {
+        return {
+            continuation: "idle",
+            idleImmediateSpins: 0,
+            probeStartedAt: undefined,
+            overdueWakePending: false,
+        };
+    }
+    const dueInWindow = Number.isFinite(earliestPollDueAt) &&
+        earliestPollDueAt - now <= 2;
+    if (!dueInWindow) {
+        return {
+            continuation: "idle",
+            idleImmediateSpins: 0,
+            probeStartedAt: undefined,
+            overdueWakePending: false,
+        };
+    }
+    if (!Number.isFinite(nextProbeStartedAt)) {
+        nextProbeStartedAt = now;
+        nextSpins = 0;
+    }
+    const elapsed = Math.max(0, now - nextProbeStartedAt);
+    if (elapsed < 2) {
+        if (nextSpins >= 16) nextSpins = 0;
+        return {
+            continuation: "immediate",
+            idleImmediateSpins: nextSpins + 1,
+            probeStartedAt: nextProbeStartedAt,
+            overdueWakePending: false,
+        };
+    }
+    if (earliestPollDueAt <= now) {
+        nextSpins = 0;
+        nextProbeStartedAt = undefined;
+        nextOverdueWakePending = true;
+        return {
+            continuation: "immediate",
+            idleImmediateSpins: nextSpins,
+            probeStartedAt: nextProbeStartedAt,
+            overdueWakePending: nextOverdueWakePending,
+        };
+    }
+    return {
+        continuation: "idle",
+        idleImmediateSpins: 0,
+        probeStartedAt: undefined,
+        overdueWakePending: false,
+    };
 }
 
 // Deterministic model for the shared 20 Hz PLAY tick service. It permits one
@@ -1700,6 +1787,66 @@ assert.deepEqual(modelIdleContinuation({
     earliestPollDueAt: 125,
 }), { continuation: "idle", idleImmediateSpins: 0 },
 "far-future poll cursor did not use idle backoff");
+
+// The deadline probe must not turn its per-burst guard into an early timer
+// fallback.  Sixteen very cheap immediate turns can finish well before the
+// due boundary; rolling the burst counter keeps the same absolute probe alive.
+{
+    const first = modelDeadlineProbeContinuation({
+        now: 100,
+        earliestPollDueAt: 101,
+    });
+    assert.deepEqual(first, {
+        continuation: "immediate",
+        idleImmediateSpins: 1,
+        probeStartedAt: 100,
+        overdueWakePending: false,
+    }, "near-due deadline probe did not start on immediate path");
+    const rollover = modelDeadlineProbeContinuation({
+        now: 100.4,
+        earliestPollDueAt: 101,
+        idleImmediateSpins: 16,
+        probeStartedAt: 100,
+    });
+    assert.equal(rollover.continuation, "immediate",
+        "per-burst spin guard incorrectly parked a still-live probe");
+    assert.equal(rollover.idleImmediateSpins, 1,
+        "per-burst spin counter did not roll over at its hard limit");
+    assert.equal(rollover.probeStartedAt, 100,
+        "burst rollover reset the absolute probe deadline");
+    const futureBudgetExpiry = modelDeadlineProbeContinuation({
+        now: 102.1,
+        earliestPollDueAt: 103,
+        idleImmediateSpins: 4,
+        probeStartedAt: 100,
+    });
+    assert.deepEqual(futureBudgetExpiry, {
+        continuation: "idle",
+        idleImmediateSpins: 0,
+        probeStartedAt: undefined,
+        overdueWakePending: false,
+    }, "far-side budget expiry did not return to idle timer");
+    const overdueWake = modelDeadlineProbeContinuation({
+        now: 102.1,
+        earliestPollDueAt: 102,
+        idleImmediateSpins: 4,
+        probeStartedAt: 100,
+    });
+    assert.deepEqual(overdueWake, {
+        continuation: "immediate",
+        idleImmediateSpins: 0,
+        probeStartedAt: undefined,
+        overdueWakePending: true,
+    }, "overdue deadline did not retain its final immediate wake");
+    const dispatchedAfterWake = modelDeadlineProbeContinuation({
+        now: 102.2,
+        earliestPollDueAt: 103.2,
+        overdueWakePending: true,
+        dispatched: 1,
+    });
+    assert.equal(dispatchedAfterWake.continuation, "immediate",
+        "successful overdue wake incorrectly forced the peer batch to idle");
+}
 
 // A queued inbound frame does not bypass nextPollDueAt.  This is the
 // starvation regression: a continuously busy client must wait for its fair

@@ -250,11 +250,16 @@ const POLL_SCHEDULER_WATCHDOG_MILLIS = 25;
 const POLL_SCHEDULER_IDLE_BACKOFF_MILLIS = 1;
 // A due cursor is normally only one millisecond ahead of the completed poll.
 // On Windows, parking that cursor on a one-millisecond timer exposes the host
-// timer quantum as a visible 15--25 ms poll gap.  Spin a small, bounded number
-// of setImmediate turns while the next due cursor is close, then retain the
-// timer backstop for genuinely idle/far-future clients.  This is a harness
-// scheduling optimization; the strict 16.7/50/100 ms gates remain unchanged.
+// timer quantum as a visible 15--25 ms poll gap.  Probe with setImmediate
+// turns while the next due cursor is close, but bound the probe by elapsed
+// time as well as a small per-burst turn count.  A real dispatch starts a
+// fresh probe for the next due cursor; a burst rollover does not reset the
+// absolute probe deadline.  An overdue cursor gets one final immediate wake
+// after that deadline so it can dispatch, then the timer backstop wins if it
+// still cannot be admitted.  This is a harness scheduling optimization; the
+// strict 16.7/50/100 ms gates remain unchanged.
 const POLL_SCHEDULER_IDLE_IMMEDIATE_WINDOW_MILLIS = 2;
+const POLL_SCHEDULER_IDLE_IMMEDIATE_PROBE_BUDGET_MILLIS = 2;
 const POLL_SCHEDULER_IDLE_IMMEDIATE_SPIN_LIMIT = 16;
 // Tick servicing shares the poll callback but has its own cursor and cap. A
 // large stress tier therefore cannot turn one scheduler callback into an
@@ -1833,6 +1838,8 @@ function createFairClientPollScheduler(getClients) {
     let heavyTurnCount = 0;
     let callbackRunning = false;
     let idleImmediateSpins = 0;
+    let idleImmediateProbeStartedAt;
+    let idleImmediateOverdueWakePending = false;
     const dispatchCounts = new Map();
     const pollDurationByClient = new Map();
     const retainSlowCallbackSample = (sample) => {
@@ -2438,8 +2445,19 @@ function createFairClientPollScheduler(getClients) {
                 const readyAfterDispatch = hasFairPollReady(clients, readinessAt);
                 lastDueTicksBeforeIdle = countDuePlayTicks(clients, readinessAt);
                 maxDueTicks = Math.max(maxDueTicks, lastDueTicksBeforeIdle);
+                const overdueWakePending = idleImmediateOverdueWakePending;
+                idleImmediateOverdueWakePending = false;
+                // A successful poll crossed the previous due boundary.  Do not
+                // charge the next due cursor against the old probe's elapsed
+                // time/turn budget; otherwise a continuously active client set
+                // is forced onto the quantized idle timer every few turns.
+                if (dispatched > 0) {
+                    idleImmediateSpins = 0;
+                    idleImmediateProbeStartedAt = undefined;
+                }
                 if (lastDueTicksBeforeIdle > 0) {
                     idleImmediateSpins = 0;
+                    idleImmediateProbeStartedAt = undefined;
                     nextContinuation = "immediate";
                     dueTickImmediateContinuations++;
                 }
@@ -2447,10 +2465,10 @@ function createFairClientPollScheduler(getClients) {
                     // Do not hand a one-millisecond due cursor to the host
                     // timer queue: on Windows that queue is commonly
                     // quantized to ~15 ms and turns into a user-visible poll
-                    // hitch.  A bounded immediate spin lets the due cursor
+                    // hitch.  A bounded immediate probe lets the due cursor
                     // mature on a real macrotask boundary.  If the client set
                     // is genuinely idle/far from due, fall back to the timer
-                    // backoff and reset the spin budget.
+                    // backoff and reset the elapsed-time probe.
                     let earliestPollDueAt = Infinity;
                     for (const candidate of clients) {
                         if (!isPollLive(candidate)) continue;
@@ -2471,18 +2489,62 @@ function createFairClientPollScheduler(getClients) {
                     const dueInImmediateWindow = Number.isFinite(earliestPollDueAt) &&
                         earliestPollDueAt - readinessAt <=
                             POLL_SCHEDULER_IDLE_IMMEDIATE_WINDOW_MILLIS;
-                    if (dueInImmediateWindow &&
-                        idleImmediateSpins < POLL_SCHEDULER_IDLE_IMMEDIATE_SPIN_LIMIT) {
-                        idleImmediateSpins++;
-                        nextContinuation = "immediate";
+                    if (overdueWakePending && dispatched === 0 &&
+                        lastDueTicksBeforeIdle === 0 &&
+                        lastDueTicksAfterService === 0) {
+                        // The previous probe budget expired with an already
+                        // overdue cursor.  Preserve exactly that one wake so
+                        // the due client gets a chance to dispatch, but do not
+                        // start a fresh probe when this wake still found no
+                        // fair candidate.
+                        idleImmediateSpins = 0;
+                        idleImmediateProbeStartedAt = undefined;
+                        nextContinuation = "idle";
+                    }
+                    else if (dueInImmediateWindow) {
+                        if (!Number.isFinite(idleImmediateProbeStartedAt)) {
+                            idleImmediateProbeStartedAt = readinessAt;
+                            idleImmediateSpins = 0;
+                        }
+                        const probeElapsedMillis = Math.max(
+                            0, readinessAt - idleImmediateProbeStartedAt);
+                        if (probeElapsedMillis <
+                            POLL_SCHEDULER_IDLE_IMMEDIATE_PROBE_BUDGET_MILLIS) {
+                            // The turn cap is per burst, not the lifetime of
+                            // this deadline probe.  Roll it over while the
+                            // absolute elapsed-time budget still remains.
+                            if (idleImmediateSpins >=
+                                POLL_SCHEDULER_IDLE_IMMEDIATE_SPIN_LIMIT) {
+                                idleImmediateSpins = 0;
+                            }
+                            idleImmediateSpins++;
+                            nextContinuation = "immediate";
+                        }
+                        else if (earliestPollDueAt <= readinessAt) {
+                            // Do not park an already-due cursor on a clamped
+                            // timer after the probe budget expires.  Admit one
+                            // immediate wake; if it still cannot dispatch, the
+                            // next idle decision uses the normal timer.
+                            idleImmediateSpins = 0;
+                            idleImmediateProbeStartedAt = undefined;
+                            idleImmediateOverdueWakePending = true;
+                            nextContinuation = "immediate";
+                        }
+                        else {
+                            idleImmediateSpins = 0;
+                            idleImmediateProbeStartedAt = undefined;
+                            nextContinuation = "idle";
+                        }
                     }
                     else {
                         idleImmediateSpins = 0;
+                        idleImmediateProbeStartedAt = undefined;
                         nextContinuation = "idle";
                     }
                 }
                 else {
                     idleImmediateSpins = 0;
+                    idleImmediateProbeStartedAt = undefined;
                 }
                 timeAfterPollLoop = markPhase("post-poll");
             }
@@ -2493,7 +2555,10 @@ function createFairClientPollScheduler(getClients) {
                 if (lastDueTicksBeforeIdle > 0 || lastDueTicksAfterService > 0) {
                     nextContinuation = "immediate";
                 }
-                else if (!(nextContinuation === "immediate" && idleImmediateSpins > 0)) {
+                else if (!(nextContinuation === "immediate" &&
+                    idleImmediateSpins > 0 &&
+                    Number.isFinite(idleImmediateProbeStartedAt)) &&
+                    !idleImmediateOverdueWakePending) {
                     nextContinuation = "idle";
                 }
             }
@@ -2829,6 +2894,12 @@ function createFairClientPollScheduler(getClients) {
                 maxBatchClients: MAX_CLIENTS_PER_POLL_CALLBACK,
                 intervalMillis: CLIENT_POLL_INTERVAL_MILLIS,
                 idleBackoffMillis: POLL_SCHEDULER_IDLE_BACKOFF_MILLIS,
+                idleImmediateWindowMillis:
+                    POLL_SCHEDULER_IDLE_IMMEDIATE_WINDOW_MILLIS,
+                idleImmediateProbeBudgetMillis:
+                    POLL_SCHEDULER_IDLE_IMMEDIATE_PROBE_BUDGET_MILLIS,
+                idleImmediateProbeSpinLimit:
+                    POLL_SCHEDULER_IDLE_IMMEDIATE_SPIN_LIMIT,
                 timerYieldTurns: POLL_SCHEDULER_TIMER_YIELD_TURNS,
                 timerYieldWorkMillis: POLL_SCHEDULER_TIMER_YIELD_WORK_MILLIS,
                 timerYieldPolicy: "turn-count-only-heavy-turns-observed",
