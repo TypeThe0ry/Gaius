@@ -2357,6 +2357,11 @@ function createFairClientPollScheduler(getClients) {
             // remain unchanged.
             lastDueTicksAfterService = countDuePlayTicks(clients);
             maxDueTicks = Math.max(maxDueTicks, lastDueTicksAfterService);
+            // Keep the post-dispatch readiness result visible to the finalizer
+            // even when the poll-loop block has already unwound.  A callback
+            // may spend its budget on PLAY ticks and dispatch zero polls while
+            // a fair candidate is nevertheless ready for the next turn.
+            let readyAfterDispatch = false;
             if (clients.length > 0) {
                 timeBeforePollLoop = markPhase("poll-loop");
                 if (cursor >= clients.length) cursor = 0;
@@ -2442,7 +2447,7 @@ function createFairClientPollScheduler(getClients) {
                 // on the idle backoff timer.  Otherwise retain immediate
                 // round-robin scheduling for queued work or another batch.
                 const readinessAt = performance.now();
-                const readyAfterDispatch = hasFairPollReady(clients, readinessAt);
+                readyAfterDispatch = hasFairPollReady(clients, readinessAt);
                 lastDueTicksBeforeIdle = countDuePlayTicks(clients, readinessAt);
                 maxDueTicks = Math.max(maxDueTicks, lastDueTicksBeforeIdle);
                 const overdueWakePending = idleImmediateOverdueWakePending;
