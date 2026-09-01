@@ -1433,6 +1433,10 @@ try {
         schemaVersion: "browser-full-path-result-v2",
         ok: true,
         acceptance: {
+            // All assertions above have completed before this object is built.  Keep the
+            // successful strict/compatible outcome explicit instead of forcing consumers to
+            // infer it from the top-level result.ok field.
+            ok: true,
             mode: acceptanceMode
                 ? "strict-acceptance"
                 : stressMode ? `stress-tier-${stressTier}` : "compatible-smoke",

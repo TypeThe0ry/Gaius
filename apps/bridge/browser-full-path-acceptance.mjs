@@ -622,6 +622,7 @@ function validateChildResult(profile, report, processState) {
     const acceptance = report.acceptance;
     const observed = acceptance?.observed;
     const actual = acceptance?.actual;
+    equal(acceptance?.ok, true, "acceptance result success");
     equal(acceptance?.mode, "strict-acceptance", "acceptance mode");
     exact(acceptance?.required, requiredChildAcceptance,
         "acceptance.required exact schema");
