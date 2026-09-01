@@ -2459,8 +2459,16 @@ function createFairClientPollScheduler(getClients) {
                             earliestPollDueAt = Math.min(earliestPollDueAt, dueAt);
                         }
                     }
+                    // Treat an already-overdue cursor as immediately eligible
+                    // too.  A callback can finish after the one-millisecond
+                    // due boundary (especially when the tick/poll budget was
+                    // reached); requiring `dueAt >= readinessAt` in that case
+                    // parks the next fair turn on the host's quantized idle
+                    // timer and creates the exact 15--25 ms gap this scheduler
+                    // is avoiding.  The bounded spin limit remains the hard
+                    // backstop for a stale/overdue cursor, so this cannot turn
+                    // an idle client set into an unbounded immediate loop.
                     const dueInImmediateWindow = Number.isFinite(earliestPollDueAt) &&
-                        earliestPollDueAt >= readinessAt &&
                         earliestPollDueAt - readinessAt <=
                             POLL_SCHEDULER_IDLE_IMMEDIATE_WINDOW_MILLIS;
                     if (dueInImmediateWindow &&

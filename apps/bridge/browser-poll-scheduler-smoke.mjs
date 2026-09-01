@@ -671,7 +671,6 @@ function modelIdleContinuation({
         return { continuation: "immediate", idleImmediateSpins: 0 };
     }
     const dueInImmediateWindow = Number.isFinite(earliestPollDueAt) &&
-        earliestPollDueAt >= now &&
         earliestPollDueAt - now <= 2;
     if (dueInImmediateWindow && idleImmediateSpins < 16) {
         return {
@@ -1691,6 +1690,11 @@ assert.deepEqual(modelIdleContinuation({
     idleImmediateSpins: 16,
 }), { continuation: "idle", idleImmediateSpins: 0 },
 "near-due immediate spin budget exceeded its hard limit");
+assert.deepEqual(modelIdleContinuation({
+    now: 100,
+    earliestPollDueAt: 99,
+}), { continuation: "immediate", idleImmediateSpins: 1 },
+"an overdue poll cursor was incorrectly parked on the quantized timer");
 assert.deepEqual(modelIdleContinuation({
     now: 100,
     earliestPollDueAt: 125,
