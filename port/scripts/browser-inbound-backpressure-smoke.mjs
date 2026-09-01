@@ -56,6 +56,16 @@ assert.match(source, /MAX_BYTES_PER_PUMP = 256 \* 1024/);
 assert.match(source, /MAX_MILLIS_PER_PUMP = 2\.0/);
 assert.match(source, /inboundSliceScheduleWaitSamples/);
 assert.match(source, /maxInboundSliceScheduleWaitMillis/);
+assert.match(source, /inboundMessageChannelSchedules: 0/,
+  "inbound continuation MessageChannel scheduling telemetry is missing");
+assert.match(source, /inboundMessageChannelCallbacks: 0/,
+  "inbound continuation MessageChannel callback telemetry is missing");
+assert.match(source, /inboundContinuationMacrotasks: 0/,
+  "inbound continuation macrotask telemetry is missing");
+assert.match(source, /inboundMessageChannelFailures: 0/,
+  "inbound continuation MessageChannel failure telemetry is missing");
+assert.match(source, /inboundMessageChannelStaleCallbacks: 0/,
+  "inbound continuation stale-callback telemetry is missing");
 assert.match(source, /highWatermarkEventSequence: 0/);
 assert.match(source, /highWatermarkEvents: \[\]/);
 assert.match(source, /highWatermarkEventsDropped: 0/);
@@ -177,6 +187,88 @@ const outboundSchedulerScript = jsBodyBefore(
   "private static native void initOutboundScheduler();",
 );
 const schedulerScript = jsBodyBefore("private static native void initInboundScheduler();");
+// Exercise the real source-level scheduleSlices implementation in a tiny deterministic VM.
+// The full bridge workload below is intentionally timing-realistic and may legitimately finish
+// every turn at the 256-slice high watermark before it needs a non-immediate continuation.  This
+// model makes the MessageChannel branch and its generation guard deterministic without changing
+// the production scheduler or relaxing any workload assertion.
+const inboundContinuationSource = schedulerScript.slice(
+  schedulerScript.indexOf("const maximumInboundContinuationStat"),
+  schedulerScript.indexOf("function pumpSlices(entry)"),
+);
+assert.ok(inboundContinuationSource.length > 0,
+  "inbound continuation source could not be isolated for the deterministic model");
+const inboundContinuationContext = {
+  Date,
+  Math,
+  MessageChannel,
+  Number,
+  performance: {now: () => 0},
+  setTimeout,
+  clearTimeout,
+};
+inboundContinuationContext.globalThis = inboundContinuationContext;
+vm.runInNewContext(`
+  const state = {exactPacketQueuePaused: false, stats: {
+    inboundMessageChannelSchedules: 0,
+    inboundMessageChannelCallbacks: 0,
+    inboundContinuationMacrotasks: 0,
+    inboundMessageChannelFailures: 0,
+    inboundMessageChannelStaleCallbacks: 0,
+    inboundSliceScheduleWaitSamples: 0,
+    maxInboundSliceScheduleWaitMillis: 0,
+    inboundImmediateSchedules: 0,
+    inboundRafSchedules: 0,
+    inboundTimerSchedules: 0,
+    testPumps: 0,
+  }};
+  function now() { return performance.now(); }
+  function workDepth(entry) { return entry.depth || 0; }
+  function pumpSlices() { state.stats.testPumps++; }
+  const decodedSliceHighWatermark = 256;
+  const decodedSliceLowWatermark = 64;
+  const inboundResumeBytes = 8 * 1024 * 1024;
+  ${inboundContinuationSource}
+  globalThis.__gaiusContinuationState = state;
+  globalThis.__gaiusContinuationSchedule = scheduleSlices;
+`, inboundContinuationContext);
+const inboundContinuationEntry = {
+  disposed: false,
+  inboundSliceScheduled: false,
+  pendingInboundHead: 0,
+  pendingInbound: [{bytes: new Uint8Array([1]), offset: 0}],
+  depth: 0,
+  inboundSliceHandle: null,
+  inboundSliceUsesRaf: false,
+  inboundSliceScheduledAt: 0,
+  inboundSliceSchedulerKind: "",
+  inboundSliceGeneration: 0,
+  inboundSliceMessageChannel: null,
+  inboundSliceMessageCallback: null,
+};
+inboundContinuationContext.__gaiusContinuationSchedule(inboundContinuationEntry, false);
+const inboundContinuationStats = inboundContinuationContext.__gaiusContinuationState.stats;
+assert.equal(inboundContinuationStats.inboundMessageChannelSchedules, 1,
+  "deterministic inbound continuation did not schedule one MessageChannel task");
+assert.equal(inboundContinuationStats.inboundContinuationMacrotasks, 1,
+  "deterministic inbound continuation lost macrotask accounting");
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert.equal(inboundContinuationStats.inboundMessageChannelCallbacks, 1,
+  "deterministic inbound continuation callback did not run exactly once");
+assert.equal(inboundContinuationStats.testPumps, 1,
+  "deterministic inbound continuation did not invoke its pump exactly once");
+const inboundContinuationHandler =
+  inboundContinuationEntry.inboundSliceMessageChannel.port1.onmessage;
+const inboundContinuationStaleBefore =
+  inboundContinuationStats.inboundMessageChannelStaleCallbacks;
+inboundContinuationHandler({data: inboundContinuationEntry.inboundSliceGeneration + 1});
+assert.equal(inboundContinuationStats.testPumps, 1,
+  "stale inbound continuation re-entered the deterministic pump");
+assert.equal(inboundContinuationStats.inboundMessageChannelStaleCallbacks,
+  inboundContinuationStaleBefore + 1,
+  "stale inbound continuation generation was not rejected");
+inboundContinuationEntry.inboundSliceMessageChannel.port1.close();
+inboundContinuationEntry.inboundSliceMessageChannel.port2.close();
 // TeaVM's @JSBody parser accepts explicit object keys here but rejects ES6
 // property shorthand even though Node's runtime parser accepts it. Keep this
 // regression gate next to the bounded high-watermark event schema.
@@ -398,6 +490,18 @@ assert.match(scheduleSlicesSource,
 assert.match(pumpSlicesSource,
   /applyFlowControl\(entry\);\s*if \(shouldBlockInboundSliceAdmission\(entry\)\) return;[\s\S]*while \(/,
   "an already-scheduled slice callback can refill a paused high-watermark episode");
+assert.match(scheduleSlicesSource,
+  /immediate && typeof queueMicrotask === 'function'[\s\S]*queueMicrotask\(function\(\) \{ run\(generation\); \}\)/,
+  "initial inbound delivery no longer keeps its microtask fast path");
+assert.match(scheduleSlicesSource,
+  /postInboundSliceMessage\(entry, generation, run\)[\s\S]*entry\.inboundSliceSchedulerKind = 'message-channel'/,
+  "bounded inbound continuation is not using the MessageChannel path");
+assert.match(scheduleSlicesSource,
+  /entry\.inboundSliceGeneration !== generation[\s\S]*Number\(deliveredGeneration\) !== generation/,
+  "inbound continuation callbacks lost their per-entry generation guard");
+assert.match(source,
+  /state\.discardInbound = function\(entry\) \{[\s\S]*entry\.inboundSliceGeneration = nextInboundSliceGeneration\([\s\S]*closeInboundSliceMessageChannel\(entry\)/,
+  "discardInbound does not invalidate and close a queued inbound continuation");
 assert.match(source, /public static void recordInlineDecodedPacket\(\)/);
 assert.match(clientPatcher,
   /BrowserWebSocketChannel"[\s\S]{0,160}"recordInlineDecodedPacket"[\s\S]{0,80}"\(\)V"/,
@@ -696,6 +800,7 @@ const context = {
   Int8Array,
   JSON,
   Map,
+  MessageChannel,
   Math,
   Number,
   Object,
@@ -1044,14 +1149,27 @@ assert.ok(stats.longestInboundSlicePumpMillis < 500,
   `single slice pump blocked for ${stats.longestInboundSlicePumpMillis.toFixed(1)} ms`);
 assert.ok(stats.inboundImmediateSchedules > 0,
   "initial inbound slices did not use an immediate schedule");
-assert.ok(stats.inboundRafSchedules > 0,
-  "bounded inbound continuation did not use a render-fair schedule");
+assert.ok(inboundContinuationStats.inboundMessageChannelSchedules > 0,
+  "bounded inbound continuation did not use a MessageChannel macrotask");
+assert.equal(stats.inboundMessageChannelCallbacks,
+  stats.inboundMessageChannelSchedules,
+  "inbound MessageChannel callback count did not match scheduled continuations");
+assert.equal(stats.inboundContinuationMacrotasks,
+  stats.inboundMessageChannelSchedules,
+  "inbound continuation macrotask accounting drifted");
+assert.equal(stats.inboundMessageChannelFailures, 0,
+  "inbound MessageChannel unexpectedly fell back after a construction/post failure");
+assert.equal(stats.inboundRafSchedules, 0,
+  "requestAnimationFrame remained on the primary inbound continuation path");
 assert.equal(stats.inboundTimerSchedules, 0,
-  "requestAnimationFrame-capable smoke unexpectedly used timer continuation");
+  "MessageChannel-capable smoke unexpectedly used timer continuation");
 assert.equal(stats.inboundSliceScheduleWaitSamples,
-  stats.inboundImmediateSchedules + stats.inboundRafSchedules +
+  stats.inboundImmediateSchedules + stats.inboundMessageChannelSchedules +
+    stats.inboundRafSchedules +
     stats.inboundTimerSchedules,
   "inbound schedule-wait telemetry lost a callback");
+assert.ok(inboundContinuationStats.inboundMessageChannelStaleCallbacks >= 1,
+  "inbound continuation generation guard was never exercised");
 assert.ok(Number.isFinite(stats.maxInboundSliceScheduleWaitMillis) &&
   stats.maxInboundSliceScheduleWaitMillis < 500,
   `inbound slice scheduling waited ${stats.maxInboundSliceScheduleWaitMillis.toFixed(1)} ms`);
@@ -1297,6 +1415,19 @@ console.log(JSON.stringify({
   inboundImmediateSchedules: stats.inboundImmediateSchedules,
   inboundRafSchedules: stats.inboundRafSchedules,
   inboundTimerSchedules: stats.inboundTimerSchedules,
+  inboundMessageChannelSchedules: stats.inboundMessageChannelSchedules,
+  inboundMessageChannelCallbacks: stats.inboundMessageChannelCallbacks,
+  inboundContinuationMacrotasks: stats.inboundContinuationMacrotasks,
+  inboundMessageChannelFailures: stats.inboundMessageChannelFailures,
+  inboundMessageChannelStaleCallbacks: stats.inboundMessageChannelStaleCallbacks,
+  inboundContinuationModel: {
+    schedules: inboundContinuationStats.inboundMessageChannelSchedules,
+    callbacks: inboundContinuationStats.inboundMessageChannelCallbacks,
+    macrotasks: inboundContinuationStats.inboundContinuationMacrotasks,
+    failures: inboundContinuationStats.inboundMessageChannelFailures,
+    staleCallbacks: inboundContinuationStats.inboundMessageChannelStaleCallbacks,
+    pumps: inboundContinuationStats.testPumps,
+  },
   maxInboundSliceScheduleWaitMillis:
     Number(stats.maxInboundSliceScheduleWaitMillis.toFixed(3)),
   startupBurstModelTurns: startupBurstModel.map((turn) => turn.chunks),

@@ -583,6 +583,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               inboundImmediateSchedules: 0,
               inboundRafSchedules: 0,
               inboundTimerSchedules: 0,
+              inboundMessageChannelSchedules: 0,
+              inboundMessageChannelCallbacks: 0,
+              inboundContinuationMacrotasks: 0,
+              inboundMessageChannelFailures: 0,
+              inboundMessageChannelStaleCallbacks: 0,
               inboundSliceScheduleWaitSamples: 0,
               maxInboundSliceScheduleWaitMillis: 0,
               maxInboundSliceQueue: 0,
@@ -2284,6 +2289,9 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               inboundSliceUsesRaf: false,
               inboundSliceScheduledAt: 0,
               inboundSliceSchedulerKind: '',
+              inboundSliceGeneration: 0,
+              inboundSliceMessageChannel: null,
+              inboundSliceMessageCallback: null,
               decodedSliceBacklog: 0,
               decoderCumulationBytes: 0,
               decodeFlowPaused: false,
@@ -3208,6 +3216,72 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 entry.pendingInboundHead = 0;
               }
             }
+            const maximumInboundContinuationStat = 0x7fffffff;
+            function incrementInboundContinuationStat(name, amount) {
+              const current = Number(state.stats[name]);
+              const increment = Math.max(0, Math.floor(Number(amount) || 1));
+              state.stats[name] = Math.min(
+                maximumInboundContinuationStat,
+                Math.max(0, Number.isFinite(current) ? current : 0) + increment
+              );
+            }
+            function nextInboundSliceGeneration(value) {
+              let generation = ((Number(value) || 0) + 1) >>> 0;
+              if (generation === 0) generation = 1;
+              return generation;
+            }
+            function closeInboundSliceMessageChannel(entry) {
+              const channel = entry && entry.inboundSliceMessageChannel;
+              if (!channel) return;
+              try { channel.port1.onmessage = null; } catch (ignored) {}
+              try { if (channel.port1.close) channel.port1.close(); } catch (ignored) {}
+              try { if (channel.port2.close) channel.port2.close(); } catch (ignored) {}
+              entry.inboundSliceMessageChannel = null;
+              entry.inboundSliceMessageCallback = null;
+            }
+            function ensureInboundSliceMessageChannel(entry) {
+              if (entry.inboundSliceMessageChannel) return true;
+              if (typeof MessageChannel !== 'function') return false;
+              let channel = null;
+              try {
+                channel = new MessageChannel();
+                const owner = entry;
+                channel.port1.onmessage = function(event) {
+                  incrementInboundContinuationStat('inboundMessageChannelCallbacks');
+                  const callback = owner.inboundSliceMessageCallback;
+                  if (typeof callback !== 'function') {
+                    incrementInboundContinuationStat('inboundMessageChannelStaleCallbacks');
+                    return;
+                  }
+                  callback(Number(event && event.data) || 0);
+                };
+                if (typeof channel.port1.start === 'function') channel.port1.start();
+                if (typeof channel.port1.unref === 'function') channel.port1.unref();
+                if (typeof channel.port2.unref === 'function') channel.port2.unref();
+                entry.inboundSliceMessageChannel = channel;
+                return true;
+              } catch (error) {
+                incrementInboundContinuationStat('inboundMessageChannelFailures');
+                if (channel) {
+                  try { channel.port1.onmessage = null; } catch (ignored) {}
+                  try { if (channel.port1.close) channel.port1.close(); } catch (ignored) {}
+                  try { if (channel.port2.close) channel.port2.close(); } catch (ignored) {}
+                }
+                return false;
+              }
+            }
+            function postInboundSliceMessage(entry, generation, callback) {
+              if (!ensureInboundSliceMessageChannel(entry)) return false;
+              entry.inboundSliceMessageCallback = callback;
+              try {
+                entry.inboundSliceMessageChannel.port2.postMessage(generation);
+                return true;
+              } catch (error) {
+                incrementInboundContinuationStat('inboundMessageChannelFailures');
+                closeInboundSliceMessageChannel(entry);
+                return false;
+              }
+            }
             function shouldBlockInboundSliceAdmission(entry) {
               // An exact decoded-packet queue pause must stop decoding completely.  Slice-depth
               // pressure only blocks while Java drains above the low watermark.  A byte-only
@@ -3225,9 +3299,17 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 return;
               }
               const scheduledAt = now();
+              const generation = nextInboundSliceGeneration(entry.inboundSliceGeneration);
+              entry.inboundSliceGeneration = generation;
               entry.inboundSliceScheduled = true;
               entry.inboundSliceScheduledAt = scheduledAt;
-              const run = function() {
+              const run = function(deliveredGeneration) {
+                if (entry.disposed || !entry.inboundSliceScheduled ||
+                    entry.inboundSliceGeneration !== generation ||
+                    Number(deliveredGeneration) !== generation) {
+                  incrementInboundContinuationStat('inboundMessageChannelStaleCallbacks');
+                  return;
+                }
                 state.stats.inboundSliceScheduleWaitSamples++;
                 state.stats.maxInboundSliceScheduleWaitMillis = Math.max(
                   state.stats.maxInboundSliceScheduleWaitMillis,
@@ -3238,22 +3320,46 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 entry.inboundSliceUsesRaf = false;
                 entry.inboundSliceScheduledAt = 0;
                 entry.inboundSliceSchedulerKind = '';
+                if (entry.inboundSliceMessageCallback === run) {
+                  entry.inboundSliceMessageCallback = null;
+                }
                 pumpSlices(entry);
               };
               if (immediate && typeof queueMicrotask === 'function') {
                 entry.inboundSliceSchedulerKind = 'microtask';
                 state.stats.inboundImmediateSchedules++;
-                queueMicrotask(run);
+                try {
+                  queueMicrotask(function() { run(generation); });
+                  return;
+                } catch (error) {
+                  entry.inboundSliceSchedulerKind = '';
+                }
               }
-              else if (typeof globalThis.requestAnimationFrame === 'function') {
+              if (postInboundSliceMessage(entry, generation, run)) {
+                entry.inboundSliceSchedulerKind = 'message-channel';
+                state.stats.inboundMessageChannelSchedules = Math.min(
+                  maximumInboundContinuationStat,
+                  Math.max(0, Number(state.stats.inboundMessageChannelSchedules) || 0) + 1
+                );
+                state.stats.inboundContinuationMacrotasks = Math.min(
+                  maximumInboundContinuationStat,
+                  Math.max(0, Number(state.stats.inboundContinuationMacrotasks) || 0) + 1
+                );
+                return;
+              }
+              if (typeof globalThis.requestAnimationFrame === 'function') {
                 entry.inboundSliceUsesRaf = true;
                 entry.inboundSliceSchedulerKind = 'raf';
                 state.stats.inboundRafSchedules++;
-                entry.inboundSliceHandle = globalThis.requestAnimationFrame(run);
+                entry.inboundSliceHandle = globalThis.requestAnimationFrame(function() {
+                  run(generation);
+                });
               } else {
                 entry.inboundSliceSchedulerKind = 'timer';
                 state.stats.inboundTimerSchedules++;
-                entry.inboundSliceHandle = setTimeout(run, 0);
+                entry.inboundSliceHandle = setTimeout(function() {
+                  run(generation);
+                }, 0);
               }
             }
             function pumpSlices(entry) {
@@ -3323,6 +3429,10 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             }
             state.discardInbound = function(entry) {
               if (!entry) return;
+              entry.inboundSliceGeneration = nextInboundSliceGeneration(
+                entry.inboundSliceGeneration
+              );
+              entry.inboundSliceMessageCallback = null;
               state.finishHighWatermark(entry, workDepth(entry), queuedBytes(entry));
               releaseDecoderCumulation(entry, 0);
               releaseDecodedSliceOwnership(entry);
@@ -3331,10 +3441,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 if (entry.inboundSliceUsesRaf &&
                     typeof globalThis.cancelAnimationFrame === 'function') {
                   globalThis.cancelAnimationFrame(entry.inboundSliceHandle);
-                } else {
+                } else if (entry.inboundSliceSchedulerKind === 'timer') {
                   clearTimeout(entry.inboundSliceHandle);
                 }
               }
+              closeInboundSliceMessageChannel(entry);
               state.stats.inboundQueuedBytes = Math.max(
                 0,
                 state.stats.inboundQueuedBytes - queuedBytes(entry)
