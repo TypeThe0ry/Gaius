@@ -284,6 +284,8 @@ for (const tier of tiers) {
             evidenceRoot: canonicalEvidenceRoot,
             ...processEvidence,
             resultOk: result?.ok ?? null,
+            strictEvidenceEligible:
+                result?.acceptance?.diagnostics?.strictEvidenceEligible ?? null,
             resultValidationError,
         });
         if (run.result !== null) results.push(run.result);
@@ -302,7 +304,7 @@ const strictAcceptancePassed = printConfigOnly
     ? null
     : functionalOk && ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE &&
         runs.every((run) =>
-            run.result?.acceptance?.diagnostics?.strictEvidenceEligible === true);
+            run.strictEvidenceEligible === true);
 const ok = printConfigOnly || strictAcceptancePassed === true;
 console.log(JSON.stringify({
     schemaVersion: "browser-full-path-stress-result-v1",
