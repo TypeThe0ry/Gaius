@@ -294,6 +294,45 @@ assert.match(schedulerSource, /schedulerGap:\s*\{/u,
 assert.match(schedulerSource,
     /schedulerGap:[\s\S]*?diagnosticOnly:\s*true[\s\S]*?strictGatesChanged:\s*false/u,
     "scheduler gap telemetry must remain diagnostic-only");
+assert.match(source,
+    /const SCHEDULER_SEGMENT_TELEMETRY_SCHEMA_VERSION\s*=\s*["']gaius\.browser-client-poll-scheduler-segments\.v1["']/u,
+    "scheduler segment telemetry schema drifted");
+assert.match(source,
+    /const SCHEDULER_SEGMENT_SLOW_THRESHOLD_MILLIS\s*=\s*16\.7/u,
+    "scheduler segment diagnostic threshold drifted");
+assert.match(source,
+    /const SCHEDULER_SEGMENT_SAMPLE_LIMIT\s*=\s*64/u,
+    "scheduler segment sample limit drifted");
+assert.match(source,
+    /const SCHEDULER_SEGMENT_TELEMETRY_ENABLED\s*=\s*ARRIVAL_TRACE_ENABLED/u,
+    "scheduler segment telemetry must share the opt-in diagnostic switch");
+assert.match(schedulerSource, /retainSchedulerSegmentSample\(/u,
+    "scheduler segment bounded retention helper is missing");
+assert.match(schedulerSource, /schedulerSegmentSamplesTotal/u,
+    "scheduler segment total counter is missing");
+assert.match(schedulerSource, /schedulerSegmentSamplesDropped/u,
+    "scheduler segment dropped counter is missing");
+assert.match(schedulerSource, /schedulerSegments:\s*\{/u,
+    "scheduler segment evidence is not serialized");
+for (const field of [
+    "schedulerAdmissionRawMillis",
+    "schedulerReadinessRawMillis",
+    "schedulerFairnessRawMillis",
+    "schedulerPostDispatchReadinessRawMillis",
+    "schedulerPostDispatchRawMillis",
+    "schedulerEvidenceRawMillis",
+    "schedulerFinalizationRawMillis",
+    "slowestSegmentRawMillis",
+]) {
+    assert.match(schedulerSource, new RegExp(field, "u"),
+        `scheduler segment evidence omitted ${field}`);
+}
+assert.match(schedulerSource,
+    /strictEvidenceEligible:\s*SCHEDULER_SEGMENT_STRICT_EVIDENCE_ELIGIBLE/u,
+    "scheduler segment trace must remain ineligible for strict evidence");
+assert.match(source,
+    /schedulerSegments:\s*schedulerSegmentTelemetryContract\(\)/u,
+    "performance contract omitted scheduler segment telemetry");
 assert.match(schedulerSource, /scheduled-delay/u,
     "scheduler gap evidence lost scheduled-delay trigger");
 assert.match(schedulerSource, /previousCallbackSequence/u,
@@ -1112,6 +1151,47 @@ function retainSchedulerGapModel(state, candidate) {
     return true;
 }
 
+// Scheduler segment model: diagnostic-only attribution for time spent around
+// candidate admission/readiness/fairness, post-dispatch work, evidence, and
+// finalization. It intentionally keeps the largest segment samples rather
+// than making any sample eligible to relax the strict callback/tick gates.
+const SCHEDULER_SEGMENT_MODEL_LIMIT = 64;
+const SCHEDULER_SEGMENT_MODEL_THRESHOLD_MILLIS = 16.7;
+function retainSchedulerSegmentModel(state, candidate) {
+    const segmentFields = [
+        "admissionRawMillis",
+        "readinessRawMillis",
+        "fairnessRawMillis",
+        "postDispatchReadinessRawMillis",
+        "postDispatchRawMillis",
+        "evidenceRawMillis",
+        "finalizationRawMillis",
+        "callbackDurationRawMillis",
+    ];
+    const values = segmentFields.map((field) => {
+        const number = Number(candidate?.[field]);
+        return Number.isFinite(number) && number >= 0 ? number : 0;
+    });
+    const slowestSegmentRawMillis = Math.max(...values);
+    if (slowestSegmentRawMillis < SCHEDULER_SEGMENT_MODEL_THRESHOLD_MILLIS) {
+        return false;
+    }
+    state.total++;
+    state.samples.push({
+        callbackSequence: Number.isSafeInteger(candidate?.callbackSequence)
+            ? candidate.callbackSequence : state.total,
+        slowestSegmentRawMillis,
+    });
+    state.samples.sort((left, right) =>
+        right.slowestSegmentRawMillis - left.slowestSegmentRawMillis ||
+        left.callbackSequence - right.callbackSequence);
+    if (state.samples.length > SCHEDULER_SEGMENT_MODEL_LIMIT) {
+        state.samples.length = SCHEDULER_SEGMENT_MODEL_LIMIT;
+        state.dropped++;
+    }
+    return true;
+}
+
 function createArrivalTraceModel() {
     return {
         normal: new Array(64),
@@ -1208,6 +1288,47 @@ function prioritizedArrivalTraceModel(state) {
     "forced arrival boundary was overwritten by ordinary trace events");
     assert.equal(trace.forcedDropped, 0,
         "forced boundary ring unexpectedly overflowed");
+}
+
+{
+    const segments = { total: 0, dropped: 0, samples: [] };
+    assert.equal(retainSchedulerSegmentModel(segments, {
+        callbackSequence: 1,
+        callbackDurationRawMillis: 16.699,
+    }), false, "fast scheduler segment entered the slow ring");
+    assert.deepEqual(segments, { total: 0, dropped: 0, samples: [] },
+        "fast scheduler segment changed diagnostic counters");
+    for (let sequence = 1; sequence <= 65; sequence++) {
+        retainSchedulerSegmentModel(segments, {
+            callbackSequence: sequence,
+            admissionRawMillis: sequence / 1000,
+            readinessRawMillis: 0,
+            fairnessRawMillis: 0,
+            postDispatchReadinessRawMillis: 0,
+            postDispatchRawMillis: 0,
+            evidenceRawMillis: 0,
+            finalizationRawMillis: 0,
+            callbackDurationRawMillis: 16.7 + sequence / 1000,
+        });
+    }
+    assert.equal(segments.total, 65,
+        "scheduler segment total did not count every slow candidate");
+    assert.equal(segments.samples.length, SCHEDULER_SEGMENT_MODEL_LIMIT,
+        "scheduler segment ring exceeded its hard limit");
+    assert.equal(segments.dropped, 1,
+        "scheduler segment dropped count did not track overflow");
+    assert.equal(segments.total,
+        segments.samples.length + segments.dropped,
+        "scheduler segment total/retained/dropped accounting diverged");
+    for (let index = 1; index < segments.samples.length; index++) {
+        const previous = segments.samples[index - 1];
+        const current = segments.samples[index];
+        assert.ok(previous.slowestSegmentRawMillis >
+            current.slowestSegmentRawMillis ||
+            previous.slowestSegmentRawMillis === current.slowestSegmentRawMillis &&
+                previous.callbackSequence <= current.callbackSequence,
+        "scheduler segment ring ordering drifted");
+    }
 }
 
 // Poll-phase diagnostic model.  The production client may parse/inflate a
@@ -2120,6 +2241,29 @@ console.log(JSON.stringify({
         measuredFrom: "callback-work-end-to-finalize-finish",
         totalAfterFinalizeFrom: "callback-start-to-finalize-finish",
         includesContinuationScheduling: true,
+    },
+    schedulerSegments: {
+        schemaVersion: "gaius.browser-client-poll-scheduler-segments.v1",
+        enabled: false,
+        slowThresholdMillis: 16.7,
+        sampleLimit: 64,
+        retention: "largest-segment-desc-sequence-asc",
+        measuredSegments: [
+            "admission",
+            "readiness",
+            "fairness",
+            "postDispatchReadiness",
+            "postDispatch",
+            "evidence",
+            "finalization",
+        ],
+        diagnosticOnly: true,
+        strictGatesChanged: false,
+        independentExecution: false,
+        strictEvidenceEligible: true,
+        modelSamplesTotal: 65,
+        modelRetainedSampleCount: SCHEDULER_SEGMENT_MODEL_LIMIT,
+        modelDroppedSampleCount: 1,
     },
     schedulerGap: {
         schemaVersion: "gaius.browser-client-scheduler-gap.v1",

@@ -355,6 +355,18 @@ const ARRIVAL_TRACE_ENABLED = process.env.GAIUS_BROWSER_FULL_PATH_TRACE === "1";
 // its strict-performance eligibility explicit so callers cannot mistake a
 // diagnostic pass for a clean release measurement.
 const ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE = !ARRIVAL_TRACE_ENABLED;
+// Scheduler segment attribution is opt-in for the same reason as the event
+// trace: each timestamp/readiness probe adds work to the shared Node loop.  A
+// trace run is diagnostic-only and is never eligible for strict evidence.
+const SCHEDULER_SEGMENT_TELEMETRY_SCHEMA_VERSION =
+    "gaius.browser-client-poll-scheduler-segments.v1";
+const SCHEDULER_SEGMENT_SLOW_THRESHOLD_MILLIS = 16.7;
+const SCHEDULER_SEGMENT_SAMPLE_LIMIT = 64;
+const SCHEDULER_SEGMENT_RETENTION =
+    "largest-segment-desc-sequence-asc";
+const SCHEDULER_SEGMENT_TELEMETRY_ENABLED = ARRIVAL_TRACE_ENABLED;
+const SCHEDULER_SEGMENT_STRICT_EVIDENCE_ELIGIBLE =
+    !SCHEDULER_SEGMENT_TELEMETRY_ENABLED;
 const ARRIVAL_TRACE_EVENT_KINDS = Object.freeze([
     "onmessage-enter",
     "bridge-enqueue",
@@ -1818,6 +1830,17 @@ function createFairClientPollScheduler(getClients) {
     let schedulerGapSamplesDropped = 0;
     let schedulerGapClockAnomalies = 0;
     const schedulerGapSamples = [];
+    let schedulerSegmentSamplesTotal = 0;
+    let schedulerSegmentSamplesDropped = 0;
+    const schedulerSegmentSamples = SCHEDULER_SEGMENT_TELEMETRY_ENABLED
+        ? [] : undefined;
+    let maxSchedulerAdmissionRawMillis = 0;
+    let maxSchedulerReadinessRawMillis = 0;
+    let maxSchedulerFairnessRawMillis = 0;
+    let maxSchedulerPostDispatchReadinessRawMillis = 0;
+    let maxSchedulerPostDispatchRawMillis = 0;
+    let maxSchedulerEvidenceRawMillis = 0;
+    let maxSchedulerFinalizationRawMillis = 0;
     let immediateSchedules = 0;
     let immediateCallbacks = 0;
     let timerSchedules = 0;
@@ -1866,6 +1889,18 @@ function createFairClientPollScheduler(getClients) {
         if (schedulerGapSamples.length > SCHEDULER_GAP_SAMPLE_LIMIT) {
             schedulerGapSamples.length = SCHEDULER_GAP_SAMPLE_LIMIT;
             schedulerGapSamplesDropped++;
+        }
+    };
+    const retainSchedulerSegmentSample = (sample) => {
+        if (!SCHEDULER_SEGMENT_TELEMETRY_ENABLED ||
+            schedulerSegmentSamples === undefined) return;
+        schedulerSegmentSamples.push(sample);
+        schedulerSegmentSamples.sort((left, right) =>
+            right.slowestSegmentRawMillis - left.slowestSegmentRawMillis ||
+            left.callbackSequence - right.callbackSequence);
+        if (schedulerSegmentSamples.length > SCHEDULER_SEGMENT_SAMPLE_LIMIT) {
+            schedulerSegmentSamples.length = SCHEDULER_SEGMENT_SAMPLE_LIMIT;
+            schedulerSegmentSamplesDropped++;
         }
     };
     const retainSlowFinalizationTailSample = (sample) => {
@@ -2230,6 +2265,15 @@ function createFairClientPollScheduler(getClients) {
         let scheduleDelayRawMillis = 0;
         let scheduleDelayMillis = 0;
         let callbackClockAnomaly = false;
+        let schedulerAdmissionRawMillis = 0;
+        let schedulerReadinessRawMillis = 0;
+        let schedulerFairnessRawMillis = 0;
+        let schedulerPostDispatchReadinessRawMillis = 0;
+        let schedulerPostDispatchRawMillis = 0;
+        let schedulerEvidenceRawMillis = 0;
+        let schedulerFinalizationRawMillis = 0;
+        let schedulerPollLoopStartedAt;
+        let schedulerFirstPollStartedAt;
         const markPhase = (phase) => {
             callbackPhase = phase;
             return performance.now();
@@ -2363,6 +2407,9 @@ function createFairClientPollScheduler(getClients) {
             maxDueTicks = Math.max(maxDueTicks, lastDueTicksAfterService);
             if (clients.length > 0) {
                 timeBeforePollLoop = markPhase("poll-loop");
+                if (SCHEDULER_SEGMENT_TELEMETRY_ENABLED) {
+                    schedulerPollLoopStartedAt = timeBeforePollLoop;
+                }
                 if (cursor >= clients.length) cursor = 0;
                 const batchLimit = Math.min(
                     MAX_CLIENTS_PER_POLL_CALLBACK, clients.length);
@@ -2385,7 +2432,15 @@ function createFairClientPollScheduler(getClients) {
                         visited.has(candidate)) continue;
                     visited.add(candidate);
                     const pollNow = performance.now();
-                    if (!isPollReady(candidate, pollNow)) continue;
+                    const readinessStartedAt =
+                        SCHEDULER_SEGMENT_TELEMETRY_ENABLED
+                            ? performance.now() : 0;
+                    const pollReady = isPollReady(candidate, pollNow);
+                    if (SCHEDULER_SEGMENT_TELEMETRY_ENABLED) {
+                        schedulerReadinessRawMillis += Math.max(
+                            0, performance.now() - readinessStartedAt);
+                    }
+                    if (!pollReady) continue;
                     recordArrivalTrace(candidate.arrivalTraceRing, "poll-ready", {
                         at: pollNow,
                         phase: candidate.phase,
@@ -2399,13 +2454,26 @@ function createFairClientPollScheduler(getClients) {
                     // client from consuming every callback while a peer is
                     // delayed by timer quantization or a transient I/O gap.
                     fairnessFloorScansThisCallback++;
+                    const fairnessStartedAt =
+                        SCHEDULER_SEGMENT_TELEMETRY_ENABLED
+                            ? performance.now() : 0;
                     const fairnessFloor = readPollFairnessFloor(clients);
-                    if (!isPollFairlyEligible(candidate, clients, fairnessFloor)) {
+                    const fairEligible = isPollFairlyEligible(
+                        candidate, clients, fairnessFloor);
+                    if (SCHEDULER_SEGMENT_TELEMETRY_ENABLED) {
+                        schedulerFairnessRawMillis += Math.max(
+                            0, performance.now() - fairnessStartedAt);
+                    }
+                    if (!fairEligible) {
                         fairnessSkips++;
                         fairnessSkipsThisCallback++;
                         continue;
                     }
                     const pollStartedAt = performance.now();
+                    if (SCHEDULER_SEGMENT_TELEMETRY_ENABLED &&
+                        schedulerFirstPollStartedAt === undefined) {
+                        schedulerFirstPollStartedAt = pollStartedAt;
+                    }
                     try {
                         // Supply scheduler provenance when the client accepts
                         // the optional arguments. JavaScript's extra-argument
@@ -2442,11 +2510,25 @@ function createFairClientPollScheduler(getClients) {
                         break;
                     }
                 }
+                if (SCHEDULER_SEGMENT_TELEMETRY_ENABLED &&
+                    schedulerPollLoopStartedAt !== undefined) {
+                    const admissionEndAt = schedulerFirstPollStartedAt ??
+                        performance.now();
+                    schedulerAdmissionRawMillis = Math.max(
+                        0, admissionEndAt - schedulerPollLoopStartedAt);
+                }
                 // If no candidate is currently ready, park the continuation
                 // on the idle backoff timer.  Otherwise retain immediate
                 // round-robin scheduling for queued work or another batch.
                 const readinessAt = performance.now();
+                const postDispatchReadinessStartedAt =
+                    SCHEDULER_SEGMENT_TELEMETRY_ENABLED
+                        ? performance.now() : 0;
                 readyAfterDispatch = hasFairPollReady(clients, readinessAt);
+                if (SCHEDULER_SEGMENT_TELEMETRY_ENABLED) {
+                    schedulerPostDispatchReadinessRawMillis += Math.max(
+                        0, performance.now() - postDispatchReadinessStartedAt);
+                }
                 lastDueTicksBeforeIdle = countDuePlayTicks(clients, readinessAt);
                 maxDueTicks = Math.max(maxDueTicks, lastDueTicksBeforeIdle);
                 const overdueWakePending = idleImmediateOverdueWakePending;
@@ -2551,6 +2633,11 @@ function createFairClientPollScheduler(getClients) {
                     idleImmediateProbeStartedAt = undefined;
                 }
                 timeAfterPollLoop = markPhase("post-poll");
+                if (SCHEDULER_SEGMENT_TELEMETRY_ENABLED &&
+                    schedulerPollLoopStartedAt !== undefined) {
+                    schedulerPostDispatchRawMillis = Math.max(
+                        0, timeAfterPollLoop - readinessAt);
+                }
             }
             if (dispatched === 0) {
                 emptyCallbacks++;
@@ -2583,6 +2670,11 @@ function createFairClientPollScheduler(getClients) {
             const callbackPhaseBeforeFinalize = callbackPhase;
             const callbackFinishedAt = performance.now();
             const callbackDurationMillis = callbackFinishedAt - callbackStartedAt;
+            if (SCHEDULER_SEGMENT_TELEMETRY_ENABLED &&
+                timeBeforeEvidenceOrFinalize !== undefined) {
+                schedulerEvidenceRawMillis = Math.max(
+                    0, callbackFinishedAt - timeBeforeEvidenceOrFinalize);
+            }
             // Keep the existing callback work endpoint untouched for strict
             // gates.  Finalization telemetry begins after that measurement so
             // its own clock read cannot inflate callbackDurationRawMillis.
@@ -2758,6 +2850,7 @@ function createFairClientPollScheduler(getClients) {
                 finalizeFinishAt - finalizeStartAt);
             const totalAfterFinalizeRawMillis = finiteNonNegativeMillis(
                 finalizeFinishAt - callbackStartedAt);
+            schedulerFinalizationRawMillis = finalizationTailRawMillis;
             maxFinalizationTailRawMillis = Math.max(
                 maxFinalizationTailRawMillis, finalizationTailRawMillis);
             maxFinalizationTailMillis = Math.max(
@@ -2792,6 +2885,93 @@ function createFairClientPollScheduler(getClients) {
                     slowThresholdMillis:
                         CALLBACK_FINALIZATION_TAIL_SLOW_THRESHOLD_MILLIS,
                 });
+            }
+            if (SCHEDULER_SEGMENT_TELEMETRY_ENABLED) {
+                const slowestSegmentRawMillis = Math.max(
+                    finiteNonNegativeMillis(schedulerAdmissionRawMillis),
+                    finiteNonNegativeMillis(schedulerReadinessRawMillis),
+                    finiteNonNegativeMillis(schedulerFairnessRawMillis),
+                    finiteNonNegativeMillis(
+                        schedulerPostDispatchReadinessRawMillis),
+                    finiteNonNegativeMillis(schedulerPostDispatchRawMillis),
+                    finiteNonNegativeMillis(schedulerEvidenceRawMillis),
+                    finiteNonNegativeMillis(schedulerFinalizationRawMillis),
+                    finiteNonNegativeMillis(callbackDurationMillis));
+                maxSchedulerAdmissionRawMillis = Math.max(
+                    maxSchedulerAdmissionRawMillis,
+                    finiteNonNegativeMillis(schedulerAdmissionRawMillis));
+                maxSchedulerReadinessRawMillis = Math.max(
+                    maxSchedulerReadinessRawMillis,
+                    finiteNonNegativeMillis(schedulerReadinessRawMillis));
+                maxSchedulerFairnessRawMillis = Math.max(
+                    maxSchedulerFairnessRawMillis,
+                    finiteNonNegativeMillis(schedulerFairnessRawMillis));
+                maxSchedulerPostDispatchReadinessRawMillis = Math.max(
+                    maxSchedulerPostDispatchReadinessRawMillis,
+                    finiteNonNegativeMillis(
+                        schedulerPostDispatchReadinessRawMillis));
+                maxSchedulerPostDispatchRawMillis = Math.max(
+                    maxSchedulerPostDispatchRawMillis,
+                    finiteNonNegativeMillis(schedulerPostDispatchRawMillis));
+                maxSchedulerEvidenceRawMillis = Math.max(
+                    maxSchedulerEvidenceRawMillis,
+                    finiteNonNegativeMillis(schedulerEvidenceRawMillis));
+                maxSchedulerFinalizationRawMillis = Math.max(
+                    maxSchedulerFinalizationRawMillis,
+                    finiteNonNegativeMillis(schedulerFinalizationRawMillis));
+                if (slowestSegmentRawMillis >=
+                    SCHEDULER_SEGMENT_SLOW_THRESHOLD_MILLIS) {
+                    schedulerSegmentSamplesTotal++;
+                    retainSchedulerSegmentSample({
+                        schemaVersion:
+                            SCHEDULER_SEGMENT_TELEMETRY_SCHEMA_VERSION,
+                        callbackSequence: callbackSequenceNumber,
+                        trigger,
+                        phase: callbackPhaseBeforeFinalize,
+                        startedAtMillis: callbackStartedAt,
+                        scheduledAtMillis: scheduledAt,
+                        callbackDurationRawMillis:
+                            finiteNonNegativeMillis(callbackDurationMillis),
+                        callbackDurationMillis: roundedMillis(
+                            callbackDurationMillis),
+                        admissionRawMillis: finiteNonNegativeMillis(
+                            schedulerAdmissionRawMillis),
+                        admissionMillis: roundedMillis(
+                            schedulerAdmissionRawMillis),
+                        readinessRawMillis: finiteNonNegativeMillis(
+                            schedulerReadinessRawMillis),
+                        readinessMillis: roundedMillis(
+                            schedulerReadinessRawMillis),
+                        fairnessRawMillis: finiteNonNegativeMillis(
+                            schedulerFairnessRawMillis),
+                        fairnessMillis: roundedMillis(
+                            schedulerFairnessRawMillis),
+                        postDispatchReadinessRawMillis: finiteNonNegativeMillis(
+                            schedulerPostDispatchReadinessRawMillis),
+                        postDispatchReadinessMillis: roundedMillis(
+                            schedulerPostDispatchReadinessRawMillis),
+                        postDispatchRawMillis: finiteNonNegativeMillis(
+                            schedulerPostDispatchRawMillis),
+                        postDispatchMillis: roundedMillis(
+                            schedulerPostDispatchRawMillis),
+                        evidenceRawMillis: finiteNonNegativeMillis(
+                            schedulerEvidenceRawMillis),
+                        evidenceMillis: roundedMillis(
+                            schedulerEvidenceRawMillis),
+                        finalizationRawMillis: finiteNonNegativeMillis(
+                            schedulerFinalizationRawMillis),
+                        finalizationMillis: roundedMillis(
+                            schedulerFinalizationRawMillis),
+                        slowestSegmentRawMillis,
+                        slowestSegmentMillis: roundedMillis(
+                            slowestSegmentRawMillis),
+                        strictFrameBudgetMillis: 16.7,
+                        diagnosticOnly: true,
+                        strictGatesChanged: false,
+                        strictEvidenceEligible:
+                            SCHEDULER_SEGMENT_STRICT_EVIDENCE_ELIGIBLE,
+                    });
+                }
             }
         }
     };
@@ -2966,6 +3146,55 @@ function createFairClientPollScheduler(getClients) {
                         ...sample,
                         triggerReasons: [...sample.triggerReasons],
                     })),
+                },
+                schedulerSegments: {
+                    schemaVersion: SCHEDULER_SEGMENT_TELEMETRY_SCHEMA_VERSION,
+                    enabled: SCHEDULER_SEGMENT_TELEMETRY_ENABLED,
+                    slowThresholdMillis:
+                        SCHEDULER_SEGMENT_SLOW_THRESHOLD_MILLIS,
+                    sampleLimit: SCHEDULER_SEGMENT_SAMPLE_LIMIT,
+                    retention: SCHEDULER_SEGMENT_RETENTION,
+                    diagnosticOnly: true,
+                    strictGatesChanged: false,
+                    strictEvidenceEligible:
+                        SCHEDULER_SEGMENT_STRICT_EVIDENCE_ELIGIBLE,
+                    measuredSegments: [
+                        "admission",
+                        "readiness",
+                        "fairness",
+                        "postDispatchReadiness",
+                        "postDispatch",
+                        "evidence",
+                        "finalization",
+                    ],
+                    maxAdmissionMillis: roundedMillis(
+                        maxSchedulerAdmissionRawMillis),
+                    maxAdmissionRawMillis: maxSchedulerAdmissionRawMillis,
+                    maxReadinessMillis: roundedMillis(
+                        maxSchedulerReadinessRawMillis),
+                    maxReadinessRawMillis: maxSchedulerReadinessRawMillis,
+                    maxFairnessMillis: roundedMillis(
+                        maxSchedulerFairnessRawMillis),
+                    maxFairnessRawMillis: maxSchedulerFairnessRawMillis,
+                    maxPostDispatchReadinessMillis: roundedMillis(
+                        maxSchedulerPostDispatchReadinessRawMillis),
+                    maxPostDispatchReadinessRawMillis:
+                        maxSchedulerPostDispatchReadinessRawMillis,
+                    maxPostDispatchMillis: roundedMillis(
+                        maxSchedulerPostDispatchRawMillis),
+                    maxPostDispatchRawMillis: maxSchedulerPostDispatchRawMillis,
+                    maxEvidenceMillis: roundedMillis(
+                        maxSchedulerEvidenceRawMillis),
+                    maxEvidenceRawMillis: maxSchedulerEvidenceRawMillis,
+                    maxFinalizationMillis: roundedMillis(
+                        maxSchedulerFinalizationRawMillis),
+                    maxFinalizationRawMillis: maxSchedulerFinalizationRawMillis,
+                    samplesTotal: schedulerSegmentSamplesTotal,
+                    retainedSampleCount: schedulerSegmentSamples?.length ?? 0,
+                    samplesDropped: schedulerSegmentSamplesDropped,
+                    droppedSampleCount: schedulerSegmentSamplesDropped,
+                    samples: schedulerSegmentSamples === undefined ? [] :
+                        schedulerSegmentSamples.map((sample) => ({ ...sample })),
                 },
                 callbackFinalizationTail: {
                     schemaVersion:
@@ -6881,6 +7110,30 @@ function callbackFinalizationTailContract() {
     };
 }
 
+function schedulerSegmentTelemetryContract() {
+    return {
+        schemaVersion: SCHEDULER_SEGMENT_TELEMETRY_SCHEMA_VERSION,
+        enabled: SCHEDULER_SEGMENT_TELEMETRY_ENABLED,
+        slowThresholdMillis: SCHEDULER_SEGMENT_SLOW_THRESHOLD_MILLIS,
+        sampleLimit: SCHEDULER_SEGMENT_SAMPLE_LIMIT,
+        retention: SCHEDULER_SEGMENT_RETENTION,
+        measuredSegments: [
+            "admission",
+            "readiness",
+            "fairness",
+            "postDispatchReadiness",
+            "postDispatch",
+            "evidence",
+            "finalization",
+        ],
+        diagnosticOnly: true,
+        strictGatesChanged: false,
+        independentExecution: false,
+        strictEvidenceEligible: SCHEDULER_SEGMENT_STRICT_EVIDENCE_ELIGIBLE,
+        enableControl: "GAIUS_BROWSER_FULL_PATH_TRACE=1",
+    };
+}
+
 function arrivalPeriodicServerSyncContract() {
     return {
         schemaVersion: ARRIVAL_PERIODIC_SERVER_SYNC_SCHEMA_VERSION,
@@ -6983,6 +7236,7 @@ function browserFullPathPerformanceContract() {
                 retention: "longest-duration-desc-sequence-asc",
                 strictRawDurationGateMillis: 16.7,
             },
+            schedulerSegments: schedulerSegmentTelemetryContract(),
             schedulerGap: {
                 schemaVersion: SCHEDULER_GAP_TELEMETRY_SCHEMA_VERSION,
                 slowGapThresholdMillis: SCHEDULER_GAP_SLOW_THRESHOLD_MILLIS,
