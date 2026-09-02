@@ -162,6 +162,84 @@ assert.equal(delayedReady[0].continuationHint, true,
 assert.ok(delayedReady.slice(1).some((turn) => turn.processed.includes(7)),
   "ready channel after idle slots was never serviced");
 
+/**
+ * Model the actual backing array shape separately from channel work. A null/closed slot is
+ * visited but does not increment openChannelsVisited, while an open-idle channel does. This
+ * keeps the test honest about the product's aggregate gate and catches sparse-ring regressions.
+ */
+function modelSlotPumpTurns(slots, idleMillis, perChannelMillis = 2) {
+  const remaining = slots.map((slot) => slot.work);
+  let cursor = 0;
+  const turns = [];
+  while (remaining.some((work, index) => slots[index].open && work > 0)) {
+    let visited = 0;
+    let openChannelsVisited = 0;
+    let elapsed = 0;
+    const processed = [];
+    let budgetYield = false;
+    while (visited < slots.length) {
+      if (openChannelsVisited > 0 && elapsed >= MAX_TOTAL_MILLIS) {
+        budgetYield = true;
+        break;
+      }
+      const index = cursor;
+      cursor = (cursor + 1) % slots.length;
+      visited++;
+      const slot = slots[index];
+      if (!slot.open) continue;
+      openChannelsVisited++;
+      if (remaining[index] > 0) {
+        remaining[index]--;
+        processed.push(index);
+        elapsed += perChannelMillis;
+      } else {
+        elapsed += idleMillis;
+      }
+    }
+    turns.push({
+      visited,
+      openChannelsVisited,
+      elapsed,
+      processed,
+      budgetYield,
+      continuationHint: processed.length > 0 || budgetYield,
+    });
+    if (turns.length > 1000) throw new Error("slot model did not drain");
+  }
+  return turns;
+}
+
+const nullHoleRing = modelSlotPumpTurns([
+  {open: false, work: 0},
+  {open: false, work: 0},
+  {open: false, work: 0},
+  {open: false, work: 0},
+  {open: false, work: 0},
+  {open: false, work: 0},
+  {open: true, work: 1},
+], 1);
+assert.equal(nullHoleRing[0].processed[0], 6,
+  "null/closed backing-array holes incorrectly consumed an open-channel budget turn");
+assert.equal(nullHoleRing[0].openChannelsVisited, 1,
+  "null/closed slots were counted as open channels");
+
+const openIdleRing = modelSlotPumpTurns([
+  {open: true, work: 0},
+  {open: true, work: 0},
+  {open: true, work: 0},
+  {open: true, work: 0},
+  {open: true, work: 0},
+  {open: true, work: 0},
+  {open: true, work: 0},
+  {open: true, work: 1},
+], 1);
+assert.equal(openIdleRing[0].processed.length, 0,
+  "open-idle channels should be able to consume the first aggregate budget turn");
+assert.equal(openIdleRing[0].budgetYield, true,
+  "open-idle aggregate scan did not advertise a continuation");
+assert.ok(openIdleRing.slice(1).some((turn) => turn.processed.includes(7)),
+  "ready channel after open-idle slots was never serviced");
+
 // Sustained work must continue rotating: no channel may wait for another channel's entire
 // backlog. The largest service gap is bounded by one full 16-channel rotation.
 const sustained = modelPumpTurns(new Array(16).fill(4), 2);
@@ -195,6 +273,14 @@ const overBudgetSingle = modelPumpTurns([1, 1], 7, 2);
 assert.equal(overBudgetSingle[0].processed.length, 1);
 assert.equal(overBudgetSingle[0].processed[0], 0);
 assert.equal(overBudgetSingle[1].processed[0], 1);
+assert.ok(overBudgetSingle[0].elapsed > MAX_TOTAL_MILLIS,
+  "the model hid a non-preemptible handoff overshoot");
+
+const nearBudgetOvershoot = modelPumpTurns([1, 1, 1], 1.9, 3);
+assert.equal(nearBudgetOvershoot[0].processed.length, 3,
+  "near-budget channels unexpectedly yielded before the third handoff");
+assert.ok(nearBudgetOvershoot[0].elapsed > MAX_TOTAL_MILLIS,
+  "near-budget non-preemptible handoffs were incorrectly treated as hard-preemptible");
 
 console.log(JSON.stringify({
   smoke: "browser-global-pump-fairness",
