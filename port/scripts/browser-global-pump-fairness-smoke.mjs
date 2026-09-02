@@ -19,6 +19,18 @@ assert.ok(pumpStart >= 0 && pumpEnd > pumpStart,
   "global pump method could not be extracted");
 const pump = source.slice(pumpStart, pumpEnd);
 
+// Extract the per-channel pump as well as the global ring scanner.  The global model treats a
+// channel call as non-preemptible, but this source-level check makes that assumption explicit:
+// the first non-empty handoff is allowed to finish before the cooperative time check can run.
+const channelPumpStart = source.indexOf("private boolean pump()");
+const channelPumpEnd = source.indexOf(
+  "private static Int8Array copyBytes",
+  channelPumpStart,
+);
+assert.ok(channelPumpStart >= 0 && channelPumpEnd > channelPumpStart,
+  "per-channel pump method could not be extracted");
+const channelPump = source.slice(channelPumpStart, channelPumpEnd);
+
 // The per-channel limits are an existing contract. The global scheduler must add a bound,
 // never replace or silently enlarge these limits.
 assert.match(source, /MAX_CHUNKS_PER_PUMP = 64/);
@@ -54,6 +66,24 @@ assert.doesNotMatch(pump, /Platform\.schedule|new Thread|CompletableFuture|setTi
   "global pump introduced asynchronous/thread work into the bounded Java turn");
 assert.doesNotMatch(pump, /for \(BrowserWebSocketChannel channel : channels\)/,
   "global pump reverted to an unbounded full-array foreach");
+
+const channelBudgetGuard = channelPump.indexOf(
+  "if (chunks > 0 && monotonicMillis() - pumpStarted >= MAX_MILLIS_PER_PUMP)",
+);
+const pollInboundIndex = channelPump.indexOf("Int8Array data = pollInbound(socketId)");
+const copyToJavaArrayIndex = channelPump.indexOf("byte[] bytes = data.copyToJavaArray()", pollInboundIndex);
+const fireChannelReadIndex = channelPump.indexOf("pipeline.fireChannelRead", copyToJavaArrayIndex);
+const chunksIncrementIndex = channelPump.indexOf("chunks++", fireChannelReadIndex);
+assert.ok(channelBudgetGuard >= 0, "per-channel pump lost its cooperative time guard");
+assert.ok(channelBudgetGuard < pollInboundIndex,
+  "per-channel time guard must run before the first inbound poll");
+assert.ok(pollInboundIndex < copyToJavaArrayIndex
+  && copyToJavaArrayIndex < fireChannelReadIndex
+  && fireChannelReadIndex < chunksIncrementIndex,
+"per-channel first-chunk order changed: poll -> copy -> fire -> count is required");
+const firstHandoffWindow = channelPump.slice(pollInboundIndex, fireChannelReadIndex);
+assert.doesNotMatch(firstHandoffWindow, /monotonicMillis\(\)/,
+  "first non-empty handoff unexpectedly became re-entrant/time-sliced");
 
 const MAX_TOTAL_MILLIS = 4;
 
@@ -282,11 +312,40 @@ assert.equal(nearBudgetOvershoot[0].processed.length, 3,
 assert.ok(nearBudgetOvershoot[0].elapsed > MAX_TOTAL_MILLIS,
   "near-budget non-preemptible handoffs were incorrectly treated as hard-preemptible");
 
+/**
+ * Model one channel's inner loop.  The guard runs between chunks, never in the middle of a
+ * poll/copy/pipeline handoff.  This is deliberately separate from the global ring model above
+ * so a future edit cannot make the aggregate test pass while changing the first-chunk boundary.
+ */
+function modelChannelPump(chunkCosts, perChannelBudget = 2) {
+  let elapsed = 0;
+  let processed = 0;
+  for (const cost of chunkCosts) {
+    if (processed > 0 && elapsed >= perChannelBudget) {
+      break;
+    }
+    elapsed += cost;
+    processed++;
+  }
+  return {elapsed, processed};
+}
+
+const firstChunkOvershoot = modelChannelPump([7, 1]);
+assert.deepEqual(firstChunkOvershoot, {elapsed: 7, processed: 1},
+  "a slow first chunk must complete before the per-channel guard yields");
+assert.ok(firstChunkOvershoot.elapsed > MAX_TOTAL_MILLIS,
+  "first-chunk overshoot was hidden instead of represented");
+const secondChunkOvershoot = modelChannelPump([1, 8]);
+assert.deepEqual(secondChunkOvershoot, {elapsed: 9, processed: 2},
+  "a second chunk may overshoot after the between-chunk guard permits it");
+
 console.log(JSON.stringify({
   smoke: "browser-global-pump-fairness",
   maxTotalMillis: MAX_TOTAL_MILLIS,
   sixteenBusyTurns: sixteenBusy.length,
   sixteenBusyMaxProcessed: Math.max(...sixteenBusy.map((turn) => turn.processed.length)),
   sparseTurns: sparse.length,
+  firstChunkOvershootMillis: firstChunkOvershoot.elapsed,
+  secondChunkOvershootMillis: secondChunkOvershoot.elapsed,
   result: "pass",
 }));
