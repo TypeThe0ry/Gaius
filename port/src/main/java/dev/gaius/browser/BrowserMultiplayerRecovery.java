@@ -19,24 +19,42 @@ public final class BrowserMultiplayerRecovery {
         String address = serverData == null || serverData.ip == null
                 ? ""
                 : serverData.ip.trim();
-        if (isRemoteServerAddress(address) && ServerAddress.isValidAddress(address)) {
+        boolean remote = isRemoteServerAddress(address) && ServerAddress.isValidAddress(address);
+        if (remote) {
             BrowserClientNetwork.enableClientPacketDrainForRemoteSession();
+        } else {
+            BrowserClientNetwork.endCurrentClientPacketDrainRemoteSession("", "non-remote");
+            BrowserClientNetwork.clearPendingClientPacketDrainRemoteSession("non-remote");
         }
+        // Record the attempt before creating the token so late disconnect/reconnect callbacks
+        // can be compared against the exact address and attempt generation.
         beginConnectionAttempt(address);
+        if (remote) {
+            BrowserClientNetwork.beginClientPacketDrainRemoteSession(address);
+        }
     }
 
     public static boolean maybeReconnect(
             Minecraft minecraft, ServerData serverData, String disconnectReason) {
-        if (minecraft == null || serverData == null) {
+        if (serverData == null) {
+            return false;
+        }
+        if (minecraft == null) {
             return false;
         }
         String address = serverData.ip == null ? "" : serverData.ip.trim();
-        if (!isRemoteServerAddress(address)
-                || !ServerAddress.isValidAddress(address)
+        boolean remote = isRemoteServerAddress(address) && ServerAddress.isValidAddress(address);
+        if (!remote
                 || !isTransientTimeoutReason(disconnectReason)
                 || !consumePreparedColdPackRetry(address)) {
+            if (remote) {
+                BrowserClientNetwork.endCurrentClientPacketDrainRemoteSession(
+                        address, "recovery-rejected");
+            }
+            BrowserClientNetwork.clearPendingClientPacketDrainRemoteSession("recovery-rejected");
             return false;
         }
+        String sessionToken = takePreparedRemoteSessionToken();
 
         Screen parent = minecraft.gaius$getScreen();
         ServerAddress parsedAddress = ServerAddress.parseString(address);
@@ -44,6 +62,15 @@ public final class BrowserMultiplayerRecovery {
         minecraft.execute(() -> {
             if (minecraft.level != null || minecraft.gaius$getScreen() != parent) {
                 report("cold-pack-timeout-retry-cancelled", address);
+                if (!sessionToken.isEmpty()) {
+                    BrowserClientNetwork.endClientPacketDrainRemoteSession(
+                            sessionToken, "retry-cancelled");
+                } else {
+                    BrowserClientNetwork.endCurrentClientPacketDrainRemoteSession(
+                            address, "retry-cancelled");
+                    BrowserClientNetwork.clearPendingClientPacketDrainRemoteSession(
+                            "retry-cancelled");
+                }
                 return;
             }
             report("cold-pack-timeout-retry-started", address);
@@ -70,6 +97,8 @@ public final class BrowserMultiplayerRecovery {
                 || !prepareColdPackRetry(address)) {
             return false;
         }
+        rememberPreparedRemoteSessionToken(
+                BrowserClientNetwork.currentClientPacketDrainRemoteSessionToken());
         report("cold-pack-timeout-retry-prepared", address);
         return true;
     }
@@ -199,6 +228,24 @@ public final class BrowserMultiplayerRecovery {
             """)
     private static native boolean consumePreparedColdPackRetry(String address);
 
+    @JSBody(params = "token", script = """
+            try {
+              const state = globalThis.__gaiusMultiplayerRecovery ||
+                (globalThis.__gaiusMultiplayerRecovery = {});
+              state.retrySessionToken = String(token || '');
+            } catch (ignored) {}
+            """)
+    private static native void rememberPreparedRemoteSessionToken(String token);
+
+    @JSBody(script = """
+            const state = globalThis.__gaiusMultiplayerRecovery;
+            if (!state) return '';
+            const token = String(state.retrySessionToken || '');
+            state.retrySessionToken = '';
+            return token;
+            """)
+    private static native String takePreparedRemoteSessionToken();
+
     @JSBody(script = """
             try {
               const state = globalThis.__gaiusMultiplayerRecovery;
@@ -287,6 +334,7 @@ public final class BrowserMultiplayerRecovery {
               state.activeAttempt = (state.activeAttempt|0) + 1;
               state.activeAddress = String(address || '').trim().toLowerCase();
               state.connectionStartedAt = Date.now();
+              state.retrySessionToken = '';
             } catch (ignored) {}
             """)
     private static native void beginConnectionAttempt(String address);

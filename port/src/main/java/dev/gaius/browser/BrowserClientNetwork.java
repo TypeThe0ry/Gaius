@@ -38,6 +38,182 @@ public final class BrowserClientNetwork {
     }
 
     /**
+     * Starts a generation-scoped remote drain session after the recovery layer has recorded the
+     * active connection attempt.  The session token is diagnostic/lifecycle state only: it does
+     * not change the existing URL/embedder opt-in precedence or any packet budget.
+     */
+    @JSBody(params = "address", script = """
+            const state = globalThis.__gaiusMultiplayerRecovery ||
+              (globalThis.__gaiusMultiplayerRecovery = {});
+            const normalizedAddress = String(address || state.activeAddress || '')
+              .trim().toLowerCase();
+            const attempt = Math.max(0, Number(state.activeAttempt) || 0);
+            const start = function(value, requestedAttempt) {
+              const bridge = globalThis.__gaiusNettyBridge;
+              if (!bridge) return false;
+              const stats = bridge.stats || globalThis.__gaiusNetworkStats || {};
+              const activeState = globalThis.__gaiusMultiplayerRecovery || state;
+              const normalized = String(value || activeState.activeAddress || '')
+                .trim().toLowerCase();
+              const activeAttempt = Math.max(
+                0, Number(requestedAttempt || activeState.activeAttempt) || 0);
+              const previous = bridge.clientPacketDrainSession;
+              if (previous && previous.active === true &&
+                  String(previous.address || '') === normalized &&
+                  Math.max(0, Number(previous.attempt) || 0) === activeAttempt) {
+                delete activeState.pendingClientPacketDrainSession;
+                return true;
+              }
+              let sequence = Number(bridge.clientPacketDrainSessionSequence) || 0;
+              sequence = sequence >= 2147483647 ? 1 : sequence + 1;
+              bridge.clientPacketDrainSessionSequence = sequence;
+              const token = normalized + '#' + String(activeAttempt) + '#' + String(sequence);
+              if (previous && previous.active) {
+                previous.active = false;
+                previous.endedAt = Date.now();
+                previous.endReason = 'superseded';
+              }
+              const session = {
+                token: token,
+                address: normalized,
+                attempt: activeAttempt,
+                pumpGeneration: Math.max(0, Number(bridge.inboundPumpGeneration) || 0),
+                source: 'remote-session',
+                active: true,
+                startedAt: Date.now(),
+                endedAt: 0,
+                endReason: ''
+              };
+              bridge.clientPacketDrainSession = session;
+              bridge.clientPacketDrainSessionToken = token;
+              bridge.clientPacketDrainDemand = false;
+              bridge.clientPacketDrainDemandToken = '';
+              bridge.clientPacketDrainPending = false;
+              stats.clientPacketDrainSessionBegins =
+                (Number(stats.clientPacketDrainSessionBegins) || 0) + 1;
+              stats.clientPacketDrainSessionSequence = sequence;
+              stats.clientPacketDrainSessionLastAttempt = activeAttempt;
+              stats.clientPacketDrainSessionLastAddress = normalized;
+              delete activeState.pendingClientPacketDrainSession;
+              return true;
+            };
+            state.beginClientPacketDrainRemoteSession = start;
+            if (!start(normalizedAddress, attempt)) {
+              state.pendingClientPacketDrainSession = {
+                address: normalizedAddress,
+                attempt: attempt,
+                active: true,
+                startedAt: Date.now()
+              };
+            }
+            """)
+    public static native void beginClientPacketDrainRemoteSession(String address);
+
+    /**
+     * Ends only the currently active token.  A late callback from an older connection is a
+     * no-op, so it cannot clear demand/pending state belonging to a newer reconnect attempt.
+     * An automatically promoted flag is retired with the session; an explicit URL/embedder flag
+     * remains authoritative and is left untouched.
+     */
+    @JSBody(params = {"token", "reason"}, script = """
+            const bridge = globalThis.__gaiusNettyBridge;
+            if (!bridge) return false;
+            const stats = bridge.stats || globalThis.__gaiusNetworkStats || {};
+            const session = bridge.clientPacketDrainSession;
+            const requested = String(token || '');
+            if (!session || !session.active || !requested || session.token !== requested) {
+              stats.clientPacketDrainSessionStaleEnds =
+                (Number(stats.clientPacketDrainSessionStaleEnds) || 0) + 1;
+              return false;
+            }
+            session.active = false;
+            session.endedAt = Date.now();
+            session.endReason = String(reason || 'ended');
+            bridge.clientPacketDrainSessionToken = '';
+            bridge.clientPacketDrainDemand = false;
+            bridge.clientPacketDrainDemandToken = '';
+            bridge.clientPacketDrainPending = false;
+            stats.clientPacketDrainSessionEnds =
+              (Number(stats.clientPacketDrainSessionEnds) || 0) + 1;
+            stats.clientPacketDrainSessionLastEndReason = session.endReason;
+            if (globalThis.__gaiusClientPacketDrainAutoEnabled === true &&
+                globalThis.__gaiusClientPacketDrainEnabled === true) {
+              delete globalThis.__gaiusClientPacketDrainEnabled;
+              delete globalThis.__gaiusClientPacketDrainAutoEnabled;
+            }
+            return true;
+            """)
+    public static native boolean endClientPacketDrainRemoteSession(String token, String reason);
+
+    /**
+     * Ends the active session for a matching address, or any active remote session when the
+     * address is empty (for a local-server/menu transition).  The address check keeps a late
+     * disconnect callback from retiring a newer connection that already owns the bridge.
+     */
+    @JSBody(params = {"address", "reason"}, script = """
+            const bridge = globalThis.__gaiusNettyBridge;
+            if (!bridge) return false;
+            const stats = bridge.stats || globalThis.__gaiusNetworkStats || {};
+            const session = bridge.clientPacketDrainSession;
+            const expected = String(address || '').trim().toLowerCase();
+            const actual = session ? String(session.address || '').trim().toLowerCase() : '';
+            if (!session || session.active !== true || (expected && actual !== expected)) {
+              stats.clientPacketDrainSessionStaleEnds =
+                (Number(stats.clientPacketDrainSessionStaleEnds) || 0) + 1;
+              return false;
+            }
+            session.active = false;
+            session.endedAt = Date.now();
+            session.endReason = String(reason || 'ended');
+            bridge.clientPacketDrainSessionToken = '';
+            bridge.clientPacketDrainDemand = false;
+            bridge.clientPacketDrainDemandToken = '';
+            bridge.clientPacketDrainPending = false;
+            stats.clientPacketDrainSessionEnds =
+              (Number(stats.clientPacketDrainSessionEnds) || 0) + 1;
+            stats.clientPacketDrainSessionLastEndReason = session.endReason;
+            if (globalThis.__gaiusClientPacketDrainAutoEnabled === true &&
+                globalThis.__gaiusClientPacketDrainEnabled === true) {
+              delete globalThis.__gaiusClientPacketDrainEnabled;
+              delete globalThis.__gaiusClientPacketDrainAutoEnabled;
+            }
+            const state = globalThis.__gaiusMultiplayerRecovery;
+            const pending = state && state.pendingClientPacketDrainSession;
+            const pendingAddress = pending
+              ? String(pending.address || '').trim().toLowerCase() : '';
+            if (pending && (!expected || pendingAddress === expected)) {
+              pending.active = false;
+              pending.endedAt = Date.now();
+              pending.endReason = session.endReason;
+              delete state.pendingClientPacketDrainSession;
+            }
+            return true;
+            """)
+    public static native boolean endCurrentClientPacketDrainRemoteSession(
+            String address, String reason);
+
+    /** Returns the active remote-session token, or an empty string when no session is active. */
+    @JSBody(script = """
+            const bridge = globalThis.__gaiusNettyBridge;
+            const session = bridge && bridge.clientPacketDrainSession;
+            return session && session.active ? String(session.token || '') : '';
+            """)
+    public static native String currentClientPacketDrainRemoteSessionToken();
+
+    /** Drops a bridge-missing pending descriptor when the active attempt changes to local. */
+    @JSBody(params = "reason", script = """
+            const state = globalThis.__gaiusMultiplayerRecovery;
+            if (!state || !state.pendingClientPacketDrainSession) return false;
+            const pending = state.pendingClientPacketDrainSession;
+            pending.active = false;
+            pending.endedAt = Date.now();
+            pending.endReason = String(reason || 'cleared');
+            delete state.pendingClientPacketDrainSession;
+            return true;
+            """)
+    public static native boolean clearPendingClientPacketDrainRemoteSession(String reason);
+
+    /**
      * Runs one existing bounded Netty transport turn from an independent browser macrotask.
      *
      * <p>The callback deliberately stops at raw transport decode. Ordinary PLAY packets still
@@ -280,6 +456,11 @@ public final class BrowserClientNetwork {
             bridge.clientPacketDrainScheduler = null;
             bridge.clientPacketDrainPending = false;
             bridge.clientPacketDrainDemand = false;
+            bridge.clientPacketDrainDemandToken =
+              typeof bridge.clientPacketDrainDemandToken === 'string'
+                ? bridge.clientPacketDrainDemandToken : '';
+            bridge.clientPacketDrainSessionSequence = Math.max(
+              0, Number(bridge.clientPacketDrainSessionSequence) || 0);
             stats.inboundPumpInstalled = (stats.inboundPumpInstalled|0) + 1;
             stats.inboundPumpRequested = stats.inboundPumpRequested|0;
             stats.inboundPumpScheduled = stats.inboundPumpScheduled|0;
@@ -350,6 +531,22 @@ public final class BrowserClientNetwork {
               const retiredDrainEventsDropped = stats.clientPacketDrainEvents.length - 64;
               stats.clientPacketDrainEvents.splice(0, retiredDrainEventsDropped);
               stats.clientPacketDrainEventsDropped += retiredDrainEventsDropped;
+            }
+            stats.clientPacketDrainSessionBegins =
+              Math.max(0, Number(stats.clientPacketDrainSessionBegins) || 0);
+            stats.clientPacketDrainSessionEnds =
+              Math.max(0, Number(stats.clientPacketDrainSessionEnds) || 0);
+            stats.clientPacketDrainSessionStaleEnds =
+              Math.max(0, Number(stats.clientPacketDrainSessionStaleEnds) || 0);
+            stats.clientPacketDrainSessionSequence = Math.max(
+              0, Number(stats.clientPacketDrainSessionSequence) || 0);
+            stats.clientPacketDrainSessionLastAttempt = Math.max(
+              0, Number(stats.clientPacketDrainSessionLastAttempt) || 0);
+            if (typeof stats.clientPacketDrainSessionLastAddress !== 'string') {
+              stats.clientPacketDrainSessionLastAddress = '';
+            }
+            if (typeof stats.clientPacketDrainSessionLastEndReason !== 'string') {
+              stats.clientPacketDrainSessionLastEndReason = '';
             }
             stats.clientPacketDrainDemandSignals =
               Math.max(0, Number(stats.clientPacketDrainDemandSignals) || 0);
@@ -685,6 +882,13 @@ public final class BrowserClientNetwork {
                  pending: false,
                  running: false,
                  demand: !!bridge.clientPacketDrainDemand,
+                 sessionActive: !!(bridge.clientPacketDrainSession &&
+                   bridge.clientPacketDrainSession.active),
+                 sessionAttempt: Math.max(0, Number(
+                   bridge.clientPacketDrainSession &&
+                   bridge.clientPacketDrainSession.attempt) || 0),
+                 sessionSequence: Math.max(0, Number(
+                   bridge.clientPacketDrainSessionSequence) || 0),
                  mode: 'single-call-runTick-boundary'
               }));
             }
@@ -704,12 +908,16 @@ public final class BrowserClientNetwork {
                const demand = clientPacketQueueDepth() >= 64;
                if (!demand) {
                  bridge.clientPacketDrainDemand = false;
+                 bridge.clientPacketDrainDemandToken = '';
                  stats.clientPacketDrainBelowThreshold++;
                  reportClientPacketDrain('below-threshold');
                  return false;
                }
                if (bridge.clientPacketDrainDemand) return false;
                bridge.clientPacketDrainDemand = true;
+               const session = bridge.clientPacketDrainSession;
+               bridge.clientPacketDrainDemandToken =
+                 session && session.active ? String(session.token || '') : '';
                stats.clientPacketDrainDemandSignals++;
                reportClientPacketDrain('frame-boundary-demand');
                return false;
@@ -717,6 +925,7 @@ public final class BrowserClientNetwork {
              bridge.invalidateClientPacketDrain = function(reason) {
                stats.clientPacketDrainInvalidations++;
                bridge.clientPacketDrainDemand = false;
+               bridge.clientPacketDrainDemandToken = '';
                bridge.clientPacketDrainPending = false;
                stats.clientPacketDrainLastInvalidationReason = String(
                  reason || 'invalidated'
@@ -724,6 +933,26 @@ public final class BrowserClientNetwork {
                reportClientPacketDrain('invalidated');
                return false;
              };
+            // ConnectScreen records the attempt before Netty constructs its first channel.  If
+            // that early call could not see a bridge, hand the pending token to the first pump
+            // installation, but only when address and attempt are still the active generation.
+            const recovery = globalThis.__gaiusMultiplayerRecovery;
+            const pendingSession = recovery && recovery.pendingClientPacketDrainSession;
+            const startRemoteSession = recovery &&
+              recovery.beginClientPacketDrainRemoteSession;
+            if (pendingSession && typeof startRemoteSession === 'function') {
+              const activeAddress = String(recovery.activeAddress || '').trim().toLowerCase();
+              const activeAttempt = Math.max(0, Number(recovery.activeAttempt) || 0);
+              const pendingAddress = String(pendingSession.address || '').trim().toLowerCase();
+              const pendingAttempt = Math.max(0, Number(pendingSession.attempt) || 0);
+              if (activeAddress === pendingAddress && activeAttempt === pendingAttempt) {
+                if (startRemoteSession(pendingAddress, pendingAttempt)) {
+                  delete recovery.pendingClientPacketDrainSession;
+                }
+              } else {
+                delete recovery.pendingClientPacketDrainSession;
+              }
+            }
             return true;
             """)
     private static native boolean installInboundPump(BrowserPumpCallback callback);
@@ -736,7 +965,12 @@ public final class BrowserClientNetwork {
      * A harness or embedding page that already supplied a boolean value always wins.</p>
      */
     @JSBody(script = """
-            if (typeof globalThis.__gaiusClientPacketDrainEnabled === 'boolean') return;
+            if (typeof globalThis.__gaiusClientPacketDrainEnabled === 'boolean') {
+              if (typeof globalThis.__gaiusClientPacketDrainAutoEnabled !== 'boolean') {
+                globalThis.__gaiusClientPacketDrainAutoEnabled = false;
+              }
+              return;
+            }
             if (typeof URLSearchParams !== 'function' ||
                 typeof location === 'undefined') return;
             let value = null;
@@ -749,15 +983,23 @@ public final class BrowserClientNetwork {
             const normalized = String(value).trim().toLowerCase();
             if (normalized === '1' || normalized === 'true' || normalized === 'on') {
               globalThis.__gaiusClientPacketDrainEnabled = true;
+              globalThis.__gaiusClientPacketDrainAutoEnabled = false;
             } else if (normalized === '0' || normalized === 'false' || normalized === 'off') {
               globalThis.__gaiusClientPacketDrainEnabled = false;
+              globalThis.__gaiusClientPacketDrainAutoEnabled = false;
             }
             """)
     private static native void configureClientPacketDrain();
 
     @JSBody(script = """
-            if (typeof globalThis.__gaiusClientPacketDrainEnabled === 'boolean') return;
+            if (typeof globalThis.__gaiusClientPacketDrainEnabled === 'boolean') {
+              if (typeof globalThis.__gaiusClientPacketDrainAutoEnabled !== 'boolean') {
+                globalThis.__gaiusClientPacketDrainAutoEnabled = false;
+              }
+              return;
+            }
             globalThis.__gaiusClientPacketDrainEnabled = true;
+            globalThis.__gaiusClientPacketDrainAutoEnabled = true;
             """)
     private static native void enableClientPacketDrainIfUnset();
 
@@ -909,7 +1151,11 @@ public final class BrowserClientNetwork {
               stats.frameBoundaryDrainEventsDropped =
                 bounded(stats.frameBoundaryDrainEventsDropped) + dropped;
             }
-            bridge.clientPacketDrainDemand = after >= 64;
+            const session = bridge.clientPacketDrainSession;
+            const sessionActive = !session || session.active === true;
+            bridge.clientPacketDrainDemand = after >= 64 && sessionActive;
+            bridge.clientPacketDrainDemandToken = sessionActive && session
+              ? String(session.token || '') : '';
             const root = typeof document !== 'undefined' ? document.documentElement : null;
             if (root) root.setAttribute('data-gaius-client-packet-frame-boundary', JSON.stringify({
               mode: 'single-call-runTick-boundary',
@@ -932,7 +1178,11 @@ public final class BrowserClientNetwork {
               queueDepthReduction: queueDepthReduction,
               unattributedQueueReduction: unattributedQueueReduction,
               queueAfter: after,
-              demand: !!bridge.clientPacketDrainDemand
+              demand: !!bridge.clientPacketDrainDemand,
+              sessionActive: !!(session && session.active),
+              sessionAttempt: Math.max(0, Number(session && session.attempt) || 0),
+              sessionSequence: Math.max(0, Number(
+                bridge.clientPacketDrainSessionSequence) || 0)
             }));
             """)
     private static native void recordClientPacketFrameBoundaryDrain(
