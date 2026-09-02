@@ -252,11 +252,26 @@ public final class BrowserClientNetwork {
         }
         pumping = true;
         try {
-            BrowserWebSocketChannel.pumpAll();
+            boolean continuationHint = BrowserWebSocketChannel.pumpAllAndReportProgress();
+            if (continuationHint && BrowserWebSocketChannel.hasPumpableInput()) {
+                requestInboundPumpContinuation();
+            }
         } finally {
             pumping = false;
         }
     }
+
+    /**
+     * Requests the existing browser wakeup scheduler without entering Java recursively.  A frame
+     * pump may stop at the aggregate transport budget while a later channel still has input; the
+     * MessageChannel/timer scheduler is the bounded continuation point for that remainder.
+     */
+    @JSBody(script = """
+            const bridge = globalThis.__gaiusNettyBridge;
+            if (!bridge || typeof bridge.inboundPump !== 'function') return;
+            bridge.inboundPump('frame-continuation');
+            """)
+    private static native void requestInboundPumpContinuation();
 
     /**
      * Starts the authoritative packet-accounting epoch before raw transport work for this tick.

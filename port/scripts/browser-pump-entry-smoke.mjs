@@ -75,8 +75,18 @@ const networkWrapper = block(
 );
 assert.match(networkWrapper, /if\s*\(pumping\)/);
 assert.match(networkWrapper, /recordJavaPumpSkipped\(\)/);
-assert.match(networkWrapper, /BrowserWebSocketChannel\.pumpAll\(\)/);
+assert.match(networkWrapper, /BrowserWebSocketChannel\.pumpAllAndReportProgress\(\)/);
+assert.match(networkWrapper, /BrowserWebSocketChannel\.hasPumpableInput\(\)/);
+assert.match(networkWrapper, /requestInboundPumpContinuation\(\)/);
 assert.match(networkWrapper, /finally\s*\{/);
+
+const continuationHelper = block(
+  network,
+  "/**\n     * Requests the existing browser wakeup scheduler",
+  "public static void beginClientPacketFrame()",
+);
+assert.match(continuationHelper, /bridge\.inboundPump\('frame-continuation'\)/);
+assert.match(continuationHelper, /typeof bridge\.inboundPump !== 'function'/);
 
 const asyncPump = block(
   network,
@@ -108,6 +118,7 @@ const result = {
   smoke: "browser-pump-entry",
   rawConnectionPump: false,
   frameBoundaryWrapper: true,
+  frameContinuationHint: true,
   clientRunTickHook: true,
   serverFrameHook: true,
   result: "pass",
