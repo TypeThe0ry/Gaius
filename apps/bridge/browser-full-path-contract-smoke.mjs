@@ -1489,6 +1489,64 @@ assert.match(relayMain, /const maximumServerFrameDrainMillis = 2/);
 assert.match(relayMain, /serverFrameTelemetry\.drainBudgetYields\+\+/);
 assert.match(relayMain, /serverFrameTelemetry\.maxDrainDurationMillis/);
 assert.match(relayMain, /if \(drainBudgetYielded\) \{\s+serverFrameDrainRescheduleRequested = true;/);
+// A ws send callback can arrive after the tunnel has started teardown.  Keep
+// that evidence in a bounded scalar without weakening the strict active/open
+// send-error gate.
+assert.match(relayMain, /sendErrorsAfterClose:\s*0/u,
+    "RelayNode must initialize the after-close send-error scalar");
+assert.match(relayMain,
+    /const incrementServerFrameSendErrorsAfterClose = \(\) => \{[\s\S]*?Math\.min\([\s\S]*?Number\.MAX_SAFE_INTEGER[\s\S]*?sendErrorsAfterClose \+ 1/u,
+    "RelayNode after-close send-error accounting must be bounded");
+assert.match(relayMain,
+    /serverFrameSendErrorsAfterClose:\s*serverFrameTelemetry\.sendErrorsAfterClose/u,
+    "RelayNode must expose after-close send-error evidence");
+assert.match(relayMain,
+    /const sendErrorAfterClose = tunnelCancelled \|\|\s+webSocket\.readyState !== WebSocket\.OPEN/u,
+    "RelayNode must classify send callbacks using teardown state");
+assert.match(relayMain,
+    /if \(sendErrorAfterClose\) \{\s+incrementServerFrameSendErrorsAfterClose\(\);/u,
+    "closed callback errors must be separated from strict send errors");
+assert.match(relayMain,
+    /else \{\s+serverFrameTelemetry\.sendErrors\+\+;/u,
+    "active/open callback errors must remain strict failures");
+assert.match(relayMain,
+    /if \(error && !tunnelCancelled &&\s+webSocket\.readyState === WebSocket\.OPEN\) \{\s+closeBoth/u,
+    "active/open callback errors must still close the tunnel");
+
+function classifyServerFrameSendError({readyState, tunnelCancelled}) {
+    return tunnelCancelled || readyState !== "OPEN";
+}
+
+const sendErrorClassificationCases = [
+    {readyState: "OPEN", tunnelCancelled: false, afterClose: false},
+    {readyState: "CLOSING", tunnelCancelled: false, afterClose: true},
+    {readyState: "CLOSED", tunnelCancelled: false, afterClose: true},
+    {readyState: "OPEN", tunnelCancelled: true, afterClose: true},
+];
+const classifiedSendErrorCases = sendErrorClassificationCases.map((entry) => ({
+    ...entry,
+    actualAfterClose: classifyServerFrameSendError(entry),
+}));
+assert.deepEqual(
+    classifiedSendErrorCases.map((entry) => entry.actualAfterClose),
+    classifiedSendErrorCases.map((entry) => entry.afterClose),
+    "send-error teardown classification model drifted",
+);
+assert.equal(
+    classifiedSendErrorCases.filter((entry) => !entry.actualAfterClose).length,
+    1,
+    "open send error must remain in strict accounting",
+);
+assert.equal(
+    classifiedSendErrorCases.filter((entry) => entry.actualAfterClose).length,
+    3,
+    "closed/cancelled send errors must be retained separately",
+);
+assert.equal(
+    classifiedSendErrorCases.length,
+    4,
+    "send-error evidence model dropped a teardown case",
+);
 assert.match(relayMain, /const publicDnsCache = new Map\(\)/);
 assert.match(relayMain, /const publicDnsCacheTtlMs = 5_000/);
 assert.match(relayMain, /httpServer\.on\("upgrade", \(request, socket, head\) => \{\s+\/\/ Minecraft status[\s\S]*?socket\.setNoDelay\(true\);\s+socket\.setKeepAlive\(true, 30_000\);/);
