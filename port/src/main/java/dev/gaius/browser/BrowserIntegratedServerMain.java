@@ -364,7 +364,7 @@ public final class BrowserIntegratedServerMain {
         }
         urgentPacketPumpActive = true;
         try {
-            BrowserWebSocketChannel.pumpAll();
+            BrowserClientNetwork.pumpBrowserChannelsAtFrameBoundary();
             current.packetProcessor().processQueuedPackets();
             return true;
         } finally {

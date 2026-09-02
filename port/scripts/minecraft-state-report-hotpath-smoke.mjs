@@ -74,6 +74,17 @@ const runTick = patcher.slice(runTickStart, patcher.indexOf("} else if (method.n
 assert.match(runTick, /pumpBrowserChannels\(\)/, "runTick must continue pumping browser network channels");
 assert.ok(runTick.indexOf("pumpBrowserChannels()") < runTick.indexOf("minecraftStateReport("),
   "state report must remain after the network pump");
+const pumpHelperStart = patcher.indexOf("private static MethodInsnNode pumpBrowserChannels()");
+const pumpHelperEnd = patcher.indexOf("\n    private static InsnList minecraftStateReport(", pumpHelperStart);
+assert.ok(pumpHelperStart >= 0 && pumpHelperEnd > pumpHelperStart,
+  "browser channel pump helper is missing");
+const pumpHelper = patcher.slice(pumpHelperStart, pumpHelperEnd);
+assert.match(pumpHelper, /dev\/gaius\/browser\/BrowserClientNetwork/,
+  "runTick pump must use the shared BrowserClientNetwork guard");
+assert.match(pumpHelper, /pumpBrowserChannelsAtFrameBoundary/,
+  "runTick pump must use the frame-boundary re-entry-safe wrapper");
+assert.doesNotMatch(pumpHelper, /io\/netty\/channel\/browser\/BrowserWebSocketChannel[\s\S]*pumpAll/,
+  "runTick must not call the raw BrowserWebSocketChannel pump directly");
 assert.match(runTick, /method\.instructions\.insertBefore\(\s*instruction,\s*minecraftStateReport\(/,
   "state report must remain on the existing runTick return hook");
 const stateHelperStart = patcher.indexOf("private static InsnList minecraftStateReport(");

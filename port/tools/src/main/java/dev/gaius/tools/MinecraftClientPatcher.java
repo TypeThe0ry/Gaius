@@ -9889,8 +9889,8 @@ public final class MinecraftClientPatcher {
     private static MethodInsnNode pumpBrowserChannels() {
         return new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
-                "io/netty/channel/browser/BrowserWebSocketChannel",
-                "pumpAll",
+                "dev/gaius/browser/BrowserClientNetwork",
+                "pumpBrowserChannelsAtFrameBoundary",
                 "()V",
                 false);
     }

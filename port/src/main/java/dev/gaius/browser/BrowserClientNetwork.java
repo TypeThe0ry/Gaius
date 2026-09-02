@@ -238,6 +238,27 @@ public final class BrowserClientNetwork {
     }
 
     /**
+     * Runs the client/server frame-boundary transport pump through the same re-entry guard as
+     * the asynchronous browser wakeup.  TeaVM continuations can resume a Java tick while a
+     * MessageChannel callback is still unwinding; calling {@code BrowserWebSocketChannel.pumpAll}
+     * directly from that second entry would otherwise make two callers share the global channel
+     * cursor and decoder telemetry.  A skipped nested call is intentionally fail-closed: the
+     * already-running pump owns the channels, and its continuation will schedule the next turn.
+     */
+    public static void pumpBrowserChannelsAtFrameBoundary() {
+        if (pumping) {
+            recordJavaPumpSkipped();
+            return;
+        }
+        pumping = true;
+        try {
+            BrowserWebSocketChannel.pumpAll();
+        } finally {
+            pumping = false;
+        }
+    }
+
+    /**
      * Starts the authoritative packet-accounting epoch before raw transport work for this tick.
      */
     public static void beginClientPacketFrame() {
