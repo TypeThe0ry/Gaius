@@ -1115,27 +1115,22 @@ function readTierArgument() {
 }
 
 function stressEnvironment(tier) {
-    const environment = { ...process.env };
-    const blockedExactNames = new Set([
-        "GAIUS_SMOKE_SERVER_JAR",
-        "GAIUS_SMOKE_DIALOG_ACTION_ID",
-        "GAIUS_SMOKE_DIALOG_INPUTS_FILE",
-        "GAIUS_SMOKE_DIALOG_INPUTS_JSON",
-        "GAIUS_PROFILE_ID",
-        "GAIUS_VERSION_PROFILE_PATH",
-        "GAIUS_BUILD_ROOT",
-        "GAIUS_DIST_DIRECTORY",
-        "GAIUS_TARGET_DIRECTORY",
-        "GAIUS_OVERLAY_DIRECTORY",
+    // Keep the child deterministic: the stress runner must not inherit a
+    // stale relay/public-target/profile override from the parent shell.  The
+    // Java/Node launch plumbing is still preserved explicitly, as is the
+    // platform baseline required by child_process and the vanilla server.
+    const preservedGaiusNames = new Set([
+        "GAIUS_JAVA",
+        "GAIUS_JAVA_HOME",
+        "GAIUS_JAVA_21",
+        "GAIUS_JAVA_25",
     ]);
-    for (const name of Object.keys(environment)) {
-        const normalized = name.toUpperCase();
-        if (normalized.startsWith("GAIUS_BROWSER_FULL_PATH_") ||
-            normalized.startsWith("GAIUS_EXTERNAL_") ||
-            blockedExactNames.has(normalized)) {
-            delete environment[name];
-        }
-    }
+    const environment = Object.fromEntries(Object.entries(process.env)
+        .filter(([name]) => {
+            const normalized = name.toUpperCase();
+            return !normalized.startsWith("GAIUS_") ||
+                preservedGaiusNames.has(normalized);
+        }));
     environment.GAIUS_VERSION_PROFILE_PATH = canonicalProfilePath;
     environment.GAIUS_BROWSER_FULL_PATH_STRESS = "1";
     environment.GAIUS_BROWSER_FULL_PATH_STRESS_TIER = String(tier);

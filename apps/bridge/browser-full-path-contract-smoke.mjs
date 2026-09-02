@@ -1439,9 +1439,11 @@ assert.match(stressRunner,
 assert.match(stressRunner,
     /environment\.GAIUS_VERSION_PROFILE_PATH = canonicalProfilePath/);
 assert.match(stressRunner,
-    /normalized\.startsWith\("GAIUS_EXTERNAL_"\)/);
+    /const preservedGaiusNames = new Set\(\[/,
+    "stress runner must define a fixed GAIUS_* allowlist");
 assert.match(stressRunner,
-    /blockedExactNames\.has\(normalized\)/);
+    /!normalized\.startsWith\("GAIUS_"\)/,
+    "stress runner must remove inherited non-allowlisted GAIUS_* variables");
 assert.match(stressRunner,
     /process\.kill\(-child\.pid, "SIGTERM"\)/);
 assert.match(stressRunner,
@@ -1687,6 +1689,75 @@ assert.deepEqual(environmentProbe.fixed, {
     origin: "http://127.0.0.1:8781",
     allowedHosts: "127.0.0.1",
 });
+
+// Stress runs must use the same GAIUS_* isolation rule as strict acceptance.
+// This is a print-config-only probe: it injects relay/DNS/capacity pollution
+// and proves the child still stays on the canonical local 26.2 tier-8 target.
+assert.match(stressRunner,
+    /preservedGaiusNames/,
+    "stress runner must declare its GAIUS allowlist");
+assert.match(stressRunner,
+    /!normalized\.startsWith\("GAIUS_"\)/,
+    "stress runner must remove inherited non-allowlisted GAIUS_* variables");
+const stressEnvironmentProbe = JSON.parse(execFileSync(process.execPath, [
+    stressRunnerPath, "--tier=8", "--print-config",
+], {
+    cwd: bridgeDirectory,
+    env: {
+        ...process.env,
+        GAIUS_RELAY_REGISTRY_URL: "https://poison.invalid/registry",
+        GAIUS_RELAY_PUBLIC_URL: "https://poison.invalid/relay",
+        GAIUS_RELAY_REGISTRY_TOKEN: "poison-token",
+        GAIUS_RELAY_NODE_ID: "poison-node",
+        GAIUS_TRACE_TUNNEL: "1",
+        GAIUS_RELAY_FRAME_TIMELINE: "1",
+        GAIUS_DNS_TEST_MODE: "poison-dns",
+        GAIUS_ALLOW_PRIVATE_TARGETS: "1",
+        GAIUS_MAXIMUM_CONNECTIONS: "poison-connections",
+        GAIUS_TARGET_AFFINITY_MS: "poison-affinity",
+        GAIUS_SMOKE_SERVER_JAR: "poison-server.jar",
+        GAIUS_BUILD_ROOT: "poison-build-root",
+    },
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+}));
+assert.equal(stressEnvironmentProbe.ok, true,
+    "stress runner pollution probe did not remain print-config green");
+assert.deepEqual(stressEnvironmentProbe.tiers, [8],
+    "stress runner pollution probe changed the requested tier");
+assert.equal(stressEnvironmentProbe.configurations.length, 1,
+    "stress runner pollution probe omitted its configuration");
+const stressProbeConfiguration = stressEnvironmentProbe.configurations[0];
+assert.equal(stressProbeConfiguration.profile.id, "26.2",
+    "stress runner pollution changed the profile id");
+assert.equal(stressProbeConfiguration.profile.protocolVersion, 776,
+    "stress runner pollution changed the protocol");
+assert.equal(stressProbeConfiguration.profile.worldVersion, 4903,
+    "stress runner pollution changed the world version");
+assert.equal(stressProbeConfiguration.profile.javaVersion, 25,
+    "stress runner pollution changed the Java policy");
+assert.equal(stressProbeConfiguration.profile.serverSha1,
+    "823e2250d24b3ddac457a60c92a6a941943fcd6a",
+    "stress runner pollution changed the server identity");
+assert.equal(stressProbeConfiguration.profile.expectedServerJarSha1,
+    "823e2250d24b3ddac457a60c92a6a941943fcd6a",
+    "stress runner pollution changed the expected server identity");
+assert.equal(stressProbeConfiguration.profile.canonicalProfilePath,
+    "port/versions/26.2.json",
+    "stress runner pollution changed the profile path");
+assert.equal(stressProbeConfiguration.performanceContract.externalRelay, null,
+    "stress runner inherited an external RelayNode target");
+assert.equal(stressProbeConfiguration.performanceContract.stressTarget.clients, 8,
+    "stress runner inherited a client-count override");
+assert.equal(stressProbeConfiguration.performanceContract.stressTarget.minimumChunkPackets,
+    257,
+    "stress runner inherited a chunk-count override");
+assert.equal(stressProbeConfiguration.performanceContract.stressTarget.soakMillis,
+    60000,
+    "stress runner inherited a soak override");
+assert.equal(stressProbeConfiguration.performanceContract.pollScheduler.callbackFinalizationTail
+    .strictGatesChanged, false,
+    "stress runner pollution changed strict callback gates");
 
 // Dynamic resolver contract: profile-specific candidates must win over a
 // generic candidate, and the returned major/source must satisfy each strict
