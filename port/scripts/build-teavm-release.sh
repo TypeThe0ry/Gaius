@@ -377,4 +377,26 @@ GAIUS_BUILD_ROOT="$build_root" GAIUS_DIST_DIRECTORY="$dist" \
   "$root/port/scripts/build-portable-html.py"
 GAIUS_DIST_DIRECTORY="$dist" GAIUS_COMPRESS_FILES=Gaius.html:Gaius.manifest.json \
   "$root/port/scripts/compress-dist.sh"
+# Do not publish a profile build whose portable artifact silently predates the
+# multiplayer bounded-drain bridge.  This is a release/artifact identity gate,
+# not a latency or stall threshold, and it runs only after the final HTML and
+# compressed classes have been written.  Keep the JSON evidence in the
+# profile-scoped build root so a failed release remains diagnosable.
+artifact_contract="$root/apps/bridge/browser-full-path-artifact-contract-smoke.mjs"
+if [[ ! -f "$artifact_contract" ]]; then
+  echo "Multiplayer artifact contract is missing: $artifact_contract" >&2
+  exit 1
+fi
+if ! command -v node >/dev/null 2>&1; then
+  echo "Node.js is required to verify the multiplayer portable artifact" >&2
+  exit 1
+fi
+artifact_contract_report="$build_root/browser-full-path-artifact-contract.json"
+if ! GAIUS_VERSION_PROFILE_PATH="$GAIUS_VERSION_PROFILE_PATH" \
+  GAIUS_DIST_DIRECTORY="$dist" \
+  node "$artifact_contract" >"$artifact_contract_report" 2>&1; then
+  echo "Multiplayer portable artifact contract failed; see $artifact_contract_report" >&2
+  cat "$artifact_contract_report" >&2 || true
+  exit 1
+fi
 release_completed=true
