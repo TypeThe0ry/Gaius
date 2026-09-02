@@ -97,6 +97,8 @@ public final class BrowserPacketScheduler {
     private static long packetProcessorAccessGeneration;
     private static long nextPacketProcessorGeneration = 1L;
     private static long packetProcessorLedgerSlotExhaustions;
+    /** Once all retired owner slots are consumed, keep adaptive accounting poisoned. */
+    private static boolean packetProcessorLedgerExhausted;
     private static long packetProcessorUnknownOwnerEvents;
     private static long pendingClientFrameSequence;
     private static boolean pendingClientFrame;
@@ -269,6 +271,7 @@ public final class BrowserPacketScheduler {
         if (packetProcessorLedgerSlotExhaustions < Long.MAX_VALUE) {
             packetProcessorLedgerSlotExhaustions++;
         }
+        packetProcessorLedgerExhausted = true;
         return null;
     }
 
@@ -1156,6 +1159,10 @@ public final class BrowserPacketScheduler {
         return ledger == null ? packetProcessorGeneration : ledger.generation;
     }
 
+    public static boolean packetProcessorLedgerExhausted() {
+        return packetProcessorLedgerExhausted;
+    }
+
     public static long stalePacketProcessorResets() {
         return stalePacketProcessorResets;
     }
@@ -1202,6 +1209,13 @@ public final class BrowserPacketScheduler {
             packetProcessorFallbackReason = "retired-owner-event";
             return null;
         }
+        if (packetProcessorLedgerExhausted) {
+            packetProcessorOwnerConflict = true;
+            packetProcessorAccountingValid = false;
+            packetProcessorConflictPoisoned = true;
+            packetProcessorFallbackReason = "ledger-slot-exhausted";
+            return null;
+        }
         if (packetProcessorConflictPoisoned || packetProcessorOwnerConflict
                 || (!packetProcessorAccountingValid && packetProcessorOwner != null)) {
             packetProcessorFallbackReason = "runtime-accounting-poisoned";
@@ -1219,9 +1233,11 @@ public final class BrowserPacketScheduler {
         if (ledger == null) {
             ledger = allocatePacketProcessorLedger(owner);
             if (ledger == null) {
+                packetProcessorLedgerExhausted = true;
                 packetProcessorFallbackReason = "ledger-slot-exhausted";
                 packetProcessorOwnerConflict = true;
                 packetProcessorAccountingValid = false;
+                packetProcessorConflictPoisoned = true;
                 return null;
             }
         }

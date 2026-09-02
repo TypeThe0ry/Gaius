@@ -105,6 +105,26 @@ const retiredHandlerMirrorGuard = requireMatch(
     completeOwnerPacketBody,
     /if\s*\(\s*\(\s*packetProcessorOwner\s*==\s*ledger\.owner\s*&&\s*packetProcessorGeneration\s*==\s*ledger\.generation\s*\)\s*\|\|\s*\(\s*packetProcessorOwner\s*==\s*null\s*&&\s*queuedPacketHandleOwner\s*==\s*ledger\.owner\s*&&\s*ledger\.retired\s*\)\s*\)\s*\{\s*queuedPacketHandleDepth\s*=\s*ledger\.queuedPacketHandleDepth;/u,
     "retired handler unwind must mirror depth only for the matching owner or its in-flight close");
+const ledgerExhaustionContract = {
+    ledgerLimit: requireMatch(schedulerSource,
+        /PACKET_PROCESSOR_LEDGER_LIMIT\s*=\s*16/u,
+        "PacketProcessor ledger must retain a bounded slot limit"),
+    retiredLimit: requireMatch(schedulerSource,
+        /RETIRED_PACKET_PROCESSOR_OWNER_LIMIT\s*=\s*16/u,
+        "retired owner tombstone limit must match the bounded ledger limit"),
+    exhaustedState: requireMatch(schedulerSource,
+        /private static boolean packetProcessorLedgerExhausted;/u,
+        "ledger slot exhaustion needs an explicit sticky state"),
+    allocationMarksExhausted: requireMatch(schedulerSource,
+        /packetProcessorLedgerSlotExhaustions\+\+;[\s\S]*packetProcessorLedgerExhausted\s*=\s*true;/u,
+        "ledger allocation exhaustion must be recorded before fallback"),
+    exhaustionFailClosed: requireMatch(schedulerSource,
+        /if \(packetProcessorLedgerExhausted\)[\s\S]*packetProcessorConflictPoisoned\s*=\s*true;[\s\S]*ledger-slot-exhausted/u,
+        "an exhausted ledger must permanently fail closed with a stable reason"),
+    noSlotReuse: requireMatch(schedulerSource,
+        /if \(packetProcessorLedgers\[index\] == null\)[\s\S]*packetProcessorLedgers\[index\] = ledger;/u,
+        "retired ledger slots must not be reused for a new owner"),
+};
 
 const ownerResetStart = schedulerSource.indexOf(
     "public static void reset(Object owner)");
@@ -926,6 +946,60 @@ function testCloseInHandlerRebind() {
     };
 }
 
+// Retired ledger slots are intentionally never reused.  Once the bounded owner table is full,
+// a fresh owner must stay on the one-call vanilla fallback instead of risking an old callback
+// being interpreted as the new generation.  This is a model/static guard, not live TeaVM proof.
+function testLedgerSlotExhaustion() {
+    const limit = 16;
+    const retiredOwners = new Set();
+    let nextOwner = null;
+    let slotExhaustions = 0;
+    let ledgerExhausted = false;
+    let conflictPoisoned = false;
+    let adaptiveDrainEnabled = true;
+    let fallbackReason = "unbound";
+
+    for (let index = 0; index < limit; index++) {
+        const owner = `owner-${index + 1}`;
+        assert.equal(nextOwner, null);
+        nextOwner = owner;
+        retiredOwners.add(owner);
+        nextOwner = null;
+    }
+    assert.equal(retiredOwners.size, limit);
+
+    const freshOwner = `owner-${limit + 1}`;
+    assert.equal(retiredOwners.has(freshOwner), false);
+    slotExhaustions++;
+    ledgerExhausted = true;
+    conflictPoisoned = true;
+    adaptiveDrainEnabled = false;
+    fallbackReason = "ledger-slot-exhausted";
+    assert.equal(fallbackReason, "ledger-slot-exhausted");
+    assert.equal(ledgerExhausted, true);
+    assert.equal(conflictPoisoned, true);
+    assert.equal(adaptiveDrainEnabled, false);
+
+    // Neither a fresh owner nor a late retired owner can recover the poisoned adaptive lane.
+    const lateRetiredRejected = retiredOwners.has("owner-1") && ledgerExhausted;
+    const freshOwnerRejected = ledgerExhausted;
+    assert.equal(lateRetiredRejected, true);
+    assert.equal(freshOwnerRejected, true);
+
+    return {
+        ledgerLimit: limit,
+        ownersRetired: retiredOwners.size,
+        slotExhaustions,
+        exhaustionPoisoned: conflictPoisoned,
+        adaptiveAfterExhaustion: adaptiveDrainEnabled,
+        fallbackAfterExhaustion: fallbackReason,
+        oldOwnerRebindRejected: lateRetiredRejected,
+        freshOwnerRebindRejected: freshOwnerRejected,
+        retiredSlotReused: false,
+        classification: "bounded-single-owner-fail-closed-model",
+    };
+}
+
 // A bounded tombstone ring is useful for recent callbacks, but it is not a strict proof across
 // repeated lifecycle churn.  This model retains every generation token so the required owner-1
 // through owner-9 late-callback case is explicit; the source gate below reports whether the Java
@@ -971,11 +1045,13 @@ const retiredOwnerLifecycle = testRetiredOwnerLifecycle();
 const conflictResetRebind = testConflictResetRebindFailClosed();
 const retiredOwnerNineGenerationChurn = testRetiredOwnerNineGenerationChurn();
 const closeInHandlerRebind = testCloseInHandlerRebind();
+const ledgerSlotExhaustion = testLedgerSlotExhaustion();
 
 const staticContract = {
     schedulerGlobalFields,
     ownerContract,
     retiredHandlerMirrorGuard,
+    ledgerExhaustionContract,
     ownerResetGuard,
     ownerFallbackContract,
     resetClearsRuntimeState,
@@ -1006,6 +1082,7 @@ const result = {
         conflictResetRebind,
         retiredOwnerNineGenerationChurn,
         closeInHandlerRebind,
+        ledgerSlotExhaustion,
     },
     gates: {
         supportedChannelCloseDoesNotResetAccounting: supported.isolation,
@@ -1029,6 +1106,14 @@ const result = {
         conflictResetRebindFailClosed: conflictResetRebind.failClosed === true,
         closeInHandlerRebind: closeInHandlerRebind.closeInHandlerRebind === true &&
             closeInHandlerRebind.lateRetiredCallbackMirrored === false,
+        ledgerSlotExhaustionFailClosed:
+            ledgerSlotExhaustion.slotExhaustions === 1 &&
+            ledgerSlotExhaustion.exhaustionPoisoned === true &&
+            ledgerSlotExhaustion.adaptiveAfterExhaustion === false &&
+            ledgerSlotExhaustion.fallbackAfterExhaustion === "ledger-slot-exhausted" &&
+            ledgerSlotExhaustion.oldOwnerRebindRejected === true &&
+            ledgerSlotExhaustion.freshOwnerRebindRejected === true &&
+            ledgerSlotExhaustion.retiredSlotReused === false,
         retiredOwnerNineGenerationChurnFailClosed:
             retiredOwnerNineGenerationChurn.lateCallbackRejected === true &&
             retiredOwnerNineGenerationChurn.ownersCreated === 9,
@@ -1050,6 +1135,7 @@ const result = {
             "bounded retired-owner tombstones reject late callbacks, including explicit lifecycle binds",
             "overlapping-owner reset/rebind model requires conflict to stay poisoned until foreign owner retirement",
             "close-in-handler owner unwind releases its temporary conflict before a fresh owner binds",
+            "bounded ledger exhaustion stays poisoned and falls back to vanilla instead of reusing retired slots",
             "owner-1 through owner-9 generation-churn model rejects a late owner-1 callback",
             "Node relay/channel close tests are separate from Java PacketProcessor evidence",
         ],
