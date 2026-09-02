@@ -63,6 +63,11 @@ const bridgeScript = extractBridgeScript(source);
 const outboundScript = extractJsBody(
     source, "private static native void initOutboundScheduler();",
 );
+const inboundScript = extractJsBody(
+    source, "private static native void initInboundScheduler();",
+);
+assert.match(inboundScript, /retireClosedEntry\s*=/,
+    "External bridge extraction omitted inbound retirement helpers");
 
 class InstrumentedWebSocket extends NodeWebSocket {
     static sockets = new Set();
@@ -94,6 +99,7 @@ function installBridge() {
     globalThis.__gaiusBridgeUrls = [{ name: "External RelayNode", url: relayUrl, priority: 100 }];
     new Function(bridgeScript)();
     new Function(outboundScript)();
+    new Function(inboundScript)();
     assert.ok(globalThis.__gaiusNettyBridge, "Browser bridge did not initialize");
     return {
         bridge: globalThis.__gaiusNettyBridge,
