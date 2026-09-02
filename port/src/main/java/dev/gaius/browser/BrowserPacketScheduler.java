@@ -14,6 +14,93 @@ public final class BrowserPacketScheduler {
     private static final int PACKET_QUEUE_LOW_WATERMARK = 64;
     private static final long BATCH_BUDGET_NANOS = 2_000_000L;
 
+    /**
+     * A TeaVM runtime normally owns one PacketProcessor, but reconnect and embedded deployments can
+     * briefly expose more than one processor in the same JavaScript realm.  Keep a small fixed
+     * ledger table instead of sharing queue/drain state or growing an unbounded identity map.
+     * Retired slots are intentionally not reused: a late callback from the old object must fail
+     * closed rather than being mistaken for a new generation.
+     */
+    private static final int PACKET_PROCESSOR_LEDGER_LIMIT = 16;
+
+    private static final class PacketProcessorLedger {
+        private Object owner;
+        private long generation;
+        private boolean retired;
+        private boolean accountingValid = true;
+        private String fallbackReason = "bound";
+
+        private int batchPacketLimit;
+        private int packetsRemaining;
+        private int minimumPackets;
+        private long deadlineNanos;
+        private int queuedPackets;
+        private boolean packetQueuePaused;
+        private boolean clientPacketDrainActive;
+        private boolean clientPacketDrainCritical;
+        private int clientPacketDrainRequestedPackets;
+        private int clientPacketDrainBatchTargetPackets;
+        private int clientPacketDrainRemainingDebt;
+        private String clientPacketDrainStopReason = "inactive";
+        private long clientPacketDrainEpoch;
+        private int clientPacketDrainHandlerCompletions;
+        private int queuedPacketHandleDepth;
+        private long queuedPacketHandleStartedNanos;
+        private long longestQueuedPacketHandleNanos;
+        private Object queuedPacketHandleRoot;
+
+        private long clientFrameSequence;
+        private int clientFramePacketCount;
+        private long clientFramePacketHandleNanos;
+        private int clientFrameSafeDrainTurns;
+        private int clientFrameVanillaDrainTurns;
+        private boolean clientFrameAccountingActive;
+
+        private void clearAfterReset(boolean preserveHandlerScope) {
+            boolean preserveActiveDrainEvidence = clientPacketDrainActive;
+            if (preserveActiveDrainEvidence) {
+                clientPacketDrainStopReason = "interrupted";
+                clientPacketDrainRemainingDebt = 0;
+            }
+            if (!preserveHandlerScope) {
+                queuedPacketHandleDepth = 0;
+                queuedPacketHandleStartedNanos = 0L;
+                longestQueuedPacketHandleNanos = 0L;
+                queuedPacketHandleRoot = null;
+            }
+            batchPacketLimit = 0;
+            packetsRemaining = 0;
+            minimumPackets = 0;
+            deadlineNanos = 0L;
+            clientFramePacketCount = 0;
+            clientFramePacketHandleNanos = 0L;
+            clientFrameSafeDrainTurns = 0;
+            clientFrameVanillaDrainTurns = 0;
+            clientFrameAccountingActive = false;
+            if (!preserveActiveDrainEvidence) {
+                clientPacketDrainActive = false;
+                clientPacketDrainCritical = false;
+                clientPacketDrainRequestedPackets = 0;
+                clientPacketDrainBatchTargetPackets = 0;
+                clientPacketDrainRemainingDebt = 0;
+                clientPacketDrainStopReason = "inactive";
+                clientPacketDrainHandlerCompletions = 0;
+            }
+            queuedPackets = 0;
+            packetQueuePaused = false;
+        }
+    }
+
+    private static final PacketProcessorLedger[] packetProcessorLedgers =
+            new PacketProcessorLedger[PACKET_PROCESSOR_LEDGER_LIMIT];
+    private static Object packetProcessorAccessOwner;
+    private static long packetProcessorAccessGeneration;
+    private static long nextPacketProcessorGeneration = 1L;
+    private static long packetProcessorLedgerSlotExhaustions;
+    private static long packetProcessorUnknownOwnerEvents;
+    private static long pendingClientFrameSequence;
+    private static boolean pendingClientFrame;
+
     private static int batchPacketLimit;
     private static int packetsRemaining;
     private static int minimumPackets;
@@ -79,7 +166,366 @@ public final class BrowserPacketScheduler {
     private BrowserPacketScheduler() {
     }
 
+    private static PacketProcessorLedger findPacketProcessorLedger(Object owner) {
+        if (owner == null) {
+            return null;
+        }
+        for (PacketProcessorLedger ledger : packetProcessorLedgers) {
+            if (ledger != null && ledger.owner == owner) {
+                return ledger;
+            }
+        }
+        return null;
+    }
+
+    private static PacketProcessorLedger currentPacketProcessorLedger() {
+        if (packetProcessorAccessOwner == null) {
+            return null;
+        }
+        PacketProcessorLedger ledger = findPacketProcessorLedger(packetProcessorAccessOwner);
+        if (ledger == null || ledger.retired
+                || ledger.generation != packetProcessorAccessGeneration) {
+            return null;
+        }
+        return ledger;
+    }
+
+    private static int activePacketProcessorLedgerCount() {
+        int count = 0;
+        for (PacketProcessorLedger ledger : packetProcessorLedgers) {
+            if (ledger != null && !ledger.retired) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /** Returns a conservative aggregate for the owner-less browser bridge callback. */
+    private static int aggregateQueuedPackets() {
+        long total = 0L;
+        int owners = 0;
+        for (PacketProcessorLedger ledger : packetProcessorLedgers) {
+            if (ledger != null && !ledger.retired && ledger.accountingValid) {
+                owners++;
+                total += Math.max(0, ledger.queuedPackets);
+            }
+        }
+        if (owners == 0) {
+            return Math.max(0, queuedPackets);
+        }
+        return total >= Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) total;
+    }
+
+    private static boolean aggregateQueuePaused() {
+        if (aggregateQueuedPackets() >= PACKET_QUEUE_HIGH_WATERMARK) {
+            return true;
+        }
+        for (PacketProcessorLedger ledger : packetProcessorLedgers) {
+            if (ledger != null && !ledger.retired && ledger.accountingValid
+                    && ledger.packetQueuePaused) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The current bridge API has no owner argument.  Publish a conservative aggregate so an
+     * owner reset cannot clear another live processor's queue/pause state.  The Java scheduler
+     * itself remains owner-scoped; an ambiguous bridge state is therefore safe but may pause more
+     * channels than necessary until the owner-aware bridge API is available.
+     */
+    private static void recordOwnerQueue(
+            PacketProcessorLedger ledger, boolean processed, double handleMillis, String handleType) {
+        BrowserWebSocketChannel.recordDecodedPacketQueue(
+                aggregateQueuedPackets(), aggregateQueuePaused(), processed, handleMillis, handleType);
+    }
+
+    private static long nextPacketProcessorGeneration() {
+        long generation = nextPacketProcessorGeneration;
+        nextPacketProcessorGeneration = generation == Long.MAX_VALUE ? 1L : generation + 1L;
+        return generation;
+    }
+
+    private static PacketProcessorLedger allocatePacketProcessorLedger(Object owner) {
+        for (int index = 0; index < packetProcessorLedgers.length; index++) {
+            if (packetProcessorLedgers[index] == null) {
+                PacketProcessorLedger ledger = new PacketProcessorLedger();
+                ledger.owner = owner;
+                ledger.generation = nextPacketProcessorGeneration();
+                packetProcessorLedgers[index] = ledger;
+                return ledger;
+            }
+        }
+        if (packetProcessorLedgerSlotExhaustions < Long.MAX_VALUE) {
+            packetProcessorLedgerSlotExhaustions++;
+        }
+        return null;
+    }
+
+    private static void selectPacketProcessorLedger(PacketProcessorLedger ledger) {
+        packetProcessorAccessOwner = ledger == null ? null : ledger.owner;
+        packetProcessorAccessGeneration = ledger == null ? 0L : ledger.generation;
+        packetProcessorOwner = packetProcessorAccessOwner;
+        packetProcessorGeneration = packetProcessorAccessGeneration;
+        packetProcessorOwnerConflict = false;
+        packetProcessorAccountingValid = ledger != null && ledger.accountingValid;
+        packetProcessorFallbackReason = ledger == null ? "unbound" : ledger.fallbackReason;
+        if (ledger != null) {
+            queuedPacketHandleDepth = ledger.queuedPacketHandleDepth;
+        }
+    }
+
+    private static PacketProcessorLedger packetProcessorLedger(Object owner) {
+        PacketProcessorLedger ledger = findPacketProcessorLedger(owner);
+        if (ledger == null || ledger.retired || !ledger.accountingValid
+                || packetProcessorOwnerConflict || packetProcessorConflictPoisoned
+                || (packetProcessorOwner != null && packetProcessorOwner != owner)) {
+            return null;
+        }
+        return ledger;
+    }
+
+    private static PacketProcessorLedger packetProcessorLedgerIncludingRetired(Object owner) {
+        return findPacketProcessorLedger(owner);
+    }
+
+    private static void noteUnknownPacketProcessorOwner(String reason) {
+        if (packetProcessorUnknownOwnerEvents < Long.MAX_VALUE) {
+            packetProcessorUnknownOwnerEvents++;
+        }
+        packetProcessorFallbackReason = reason;
+        packetProcessorOwnerConflict = true;
+        packetProcessorAccountingValid = false;
+    }
+
+    private static void startPendingOwnerFrame(PacketProcessorLedger ledger) {
+        if (ledger != null && pendingClientFrame) {
+            startOwnerClientFrame(ledger);
+        }
+    }
+
+    private static boolean shouldProcessNextOwner(PacketProcessorLedger ledger) {
+        if (ledger == null || ledger.retired || !ledger.accountingValid) {
+            return false;
+        }
+        if (ledger.packetsRemaining <= 0) {
+            if (ledger.clientPacketDrainActive) {
+                ledger.clientPacketDrainStopReason =
+                        ledger.clientPacketDrainRequestedPackets > CLIENT_PACKET_DRAIN_HARD_MAX_PACKETS
+                                ? "hard-cap" : "target";
+            }
+            return false;
+        }
+        int packetsProcessed = ledger.batchPacketLimit - ledger.packetsRemaining;
+        if (packetsProcessed >= ledger.minimumPackets
+                && System.nanoTime() >= ledger.deadlineNanos) {
+            if (ledger.clientPacketDrainActive) {
+                ledger.clientPacketDrainStopReason = "deadline";
+            }
+            return false;
+        }
+        ledger.packetsRemaining--;
+        return true;
+    }
+
+    private static boolean tryBeginOwnerClientPacketDrain(
+            PacketProcessorLedger ledger, boolean critical) {
+        if (ledger == null || ledger.retired || !ledger.accountingValid
+                || BrowserIntegratedServerMain.isWorkerServer()
+                || ledger.clientPacketDrainActive
+                || ledger.queuedPacketHandleDepth > 0
+                || ledger.queuedPackets < CLIENT_PACKET_DRAIN_THRESHOLD) {
+            return false;
+        }
+        ledger.clientPacketDrainActive = true;
+        ledger.clientPacketDrainCritical = critical;
+        ledger.clientPacketDrainEpoch = ledger.clientPacketDrainEpoch == Long.MAX_VALUE
+                ? 1L : ledger.clientPacketDrainEpoch + 1L;
+        ledger.clientPacketDrainHandlerCompletions = 0;
+        return true;
+    }
+
+    private static void interruptOwnerClientPacketDrain(PacketProcessorLedger ledger) {
+        if (ledger != null && ledger.clientPacketDrainActive) {
+            ledger.clientPacketDrainStopReason = "interrupted";
+        }
+    }
+
+    private static void finishOwnerClientPacketDrain(PacketProcessorLedger ledger) {
+        if (ledger == null || !ledger.clientPacketDrainActive) {
+            return;
+        }
+        ledger.clientPacketDrainRemainingDebt = Math.max(
+                0, ledger.queuedPackets - CLIENT_PACKET_DRAIN_TARGET_QUEUE);
+        if ("pending".equals(ledger.clientPacketDrainStopReason)) {
+            ledger.clientPacketDrainStopReason = ledger.clientPacketDrainRemainingDebt == 0
+                    ? "empty" : "interrupted";
+        }
+        ledger.clientPacketDrainActive = false;
+        ledger.clientPacketDrainCritical = false;
+    }
+
+    private static void markLedgerConflict(PacketProcessorLedger ledger, String reason) {
+        if (ledger == null) {
+            return;
+        }
+        ledger.accountingValid = false;
+        ledger.fallbackReason = reason;
+        interruptOwnerClientPacketDrain(ledger);
+        packetProcessorOwnerConflict = true;
+        packetProcessorAccountingValid = false;
+        packetProcessorConflictPoisoned = true;
+        packetProcessorFallbackReason = reason;
+    }
+
+    private static void resetOwnerLedger(PacketProcessorLedger ledger) {
+        if (ledger == null || ledger.retired) {
+            return;
+        }
+        boolean preserveHandlerScope = ledger.queuedPacketHandleDepth > 0;
+        Object owner = ledger.owner;
+        long generation = ledger.generation;
+        ledger.clearAfterReset(preserveHandlerScope);
+        ledger.retired = true;
+        ledger.accountingValid = false;
+        ledger.fallbackReason = "retired-owner";
+        rememberRetiredPacketProcessorOwner(owner);
+        BrowserClientNetwork.invalidateClientPacketDrain("packet-processor-reset");
+        // The legacy fields remain for worker/old entry points. Clear them at the same lifecycle
+        // boundary so a newly constructed processor can never observe the retired queue state.
+        batchPacketLimit = 0;
+        packetsRemaining = 0;
+        minimumPackets = 0;
+        deadlineNanos = 0L;
+        clientPacketDrainActive = false;
+        clientPacketDrainCritical = false;
+        clientPacketDrainOwner = null;
+        clientPacketDrainOwnerGeneration = 0L;
+        clientPacketDrainRequestedPackets = 0;
+        clientPacketDrainBatchTargetPackets = 0;
+        clientPacketDrainRemainingDebt = 0;
+        clientPacketDrainStopReason = preserveHandlerScope ? "interrupted" : "inactive";
+        clientPacketDrainHandlerCompletions = 0;
+        queuedPackets = 0;
+        packetQueuePaused = false;
+        clientFrameAccountingActive = false;
+        clientFramePacketCount = 0;
+        clientFramePacketHandleNanos = 0L;
+        queuedPacketHandleDepth = ledger.queuedPacketHandleDepth;
+        queuedPacketHandleOwner = preserveHandlerScope ? owner : null;
+        BrowserWebSocketChannel.recordDecodedPacketQueue(0, false, false, -1.0, null);
+        if (packetProcessorAccessOwner == owner
+                && packetProcessorAccessGeneration == generation) {
+            packetProcessorAccessOwner = null;
+            packetProcessorAccessGeneration = 0L;
+        }
+        if (packetProcessorOwner == owner
+                && packetProcessorGeneration == generation) {
+            packetProcessorOwner = null;
+            packetProcessorGeneration = generation == Long.MAX_VALUE ? 1L : generation + 1L;
+            packetProcessorOwnerConflict = preserveHandlerScope;
+            packetProcessorAccountingValid = !preserveHandlerScope;
+            packetProcessorFallbackReason = preserveHandlerScope
+                    ? "owner-close-during-handler" : "unbound";
+        }
+    }
+
+    private static void completeOwnerPacket(PacketProcessorLedger ledger) {
+        if (ledger == null || ledger.queuedPacketHandleDepth <= 0) {
+            return;
+        }
+        ledger.queuedPacketHandleDepth--;
+        // Keep the legacy depth mirror coherent even when close retired the owner while its
+        // handler was still unwinding.  The owner-aware path remains authoritative.
+        queuedPacketHandleDepth = ledger.queuedPacketHandleDepth;
+        long completedHandleNanos = -1L;
+        double handleMillis = -1.0;
+        String handleType = null;
+        if (ledger.queuedPacketHandleDepth == 0) {
+            long elapsedNanos = Math.max(
+                    0L, System.nanoTime() - ledger.queuedPacketHandleStartedNanos);
+            completedHandleNanos = elapsedNanos;
+            handleMillis = elapsedNanos / 1_000_000.0;
+            if (elapsedNanos > ledger.longestQueuedPacketHandleNanos
+                    || elapsedNanos >= 50_000_000L) {
+                if (elapsedNanos > ledger.longestQueuedPacketHandleNanos) {
+                    ledger.longestQueuedPacketHandleNanos = elapsedNanos;
+                }
+                handleType = ledger.queuedPacketHandleRoot == null
+                        ? "unknown" : ledger.queuedPacketHandleRoot.getClass().getName();
+            }
+            ledger.queuedPacketHandleStartedNanos = 0L;
+            ledger.queuedPacketHandleRoot = null;
+        }
+        if (completedHandleNanos >= 0L && ledger.clientFrameAccountingActive) {
+            if (ledger.clientFramePacketCount < Integer.MAX_VALUE) {
+                ledger.clientFramePacketCount++;
+            }
+            if (Long.MAX_VALUE - ledger.clientFramePacketHandleNanos < completedHandleNanos) {
+                ledger.clientFramePacketHandleNanos = Long.MAX_VALUE;
+            } else {
+                ledger.clientFramePacketHandleNanos += completedHandleNanos;
+            }
+        }
+        if (completedHandleNanos >= 0L && ledger.clientPacketDrainActive
+                && ledger.clientPacketDrainHandlerCompletions < Integer.MAX_VALUE) {
+            ledger.clientPacketDrainHandlerCompletions++;
+        }
+        if (!ledger.retired && ledger.accountingValid) {
+            if (ledger.queuedPackets > 0) {
+                ledger.queuedPackets--;
+            }
+            if (ledger.packetQueuePaused && ledger.queuedPackets <= PACKET_QUEUE_LOW_WATERMARK) {
+                ledger.packetQueuePaused = false;
+            }
+        }
+        if (ledger.queuedPacketHandleDepth == 0 && queuedPacketHandleOwner == ledger.owner) {
+            queuedPacketHandleOwner = null;
+        }
+        recordOwnerQueue(ledger, true, handleMillis, handleType);
+    }
+
+    private static void queueOwnerPacket(PacketProcessorLedger ledger) {
+        if (ledger == null || ledger.retired || !ledger.accountingValid) {
+            return;
+        }
+        if (ledger.queuedPackets < Integer.MAX_VALUE) {
+            ledger.queuedPackets++;
+        }
+        if (!ledger.packetQueuePaused && ledger.queuedPackets >= PACKET_QUEUE_HIGH_WATERMARK) {
+            ledger.packetQueuePaused = true;
+        }
+        recordOwnerQueue(ledger, false, -1.0, null);
+    }
+
+    private static void beginQueuedPacketOwner(PacketProcessorLedger ledger, Object packet) {
+        if (ledger == null || ledger.retired || !ledger.accountingValid) {
+            return;
+        }
+        if (queuedPacketHandleOwner != null && queuedPacketHandleOwner != ledger.owner) {
+            markLedgerConflict(ledger, "nested-owner-conflict");
+            return;
+        }
+        if (ledger.queuedPacketHandleDepth == 0) {
+            ledger.queuedPacketHandleStartedNanos = System.nanoTime();
+            ledger.queuedPacketHandleRoot = packet;
+            queuedPacketHandleOwner = ledger.owner;
+        }
+        if (ledger.queuedPacketHandleDepth < Integer.MAX_VALUE) {
+            ledger.queuedPacketHandleDepth++;
+        }
+        if (packetProcessorOwner == ledger.owner) {
+            queuedPacketHandleDepth = ledger.queuedPacketHandleDepth;
+        }
+    }
+
     public static void beginBatch() {
+        PacketProcessorLedger ledger = currentPacketProcessorLedger();
+        if (ledger != null) {
+            beginOwnerBatch(ledger);
+            return;
+        }
         boolean workerServer = BrowserIntegratedServerMain.isWorkerServer();
         if (clientPacketDrainActive && !workerServer) {
             // Pressure recovery is work-conserving within the same two-millisecond boundary.
@@ -139,10 +585,11 @@ public final class BrowserPacketScheduler {
      * can execute its retained vanilla method instead of sharing adaptive state.
      */
     public static boolean beginBatch(Object owner) {
-        if (!claimPacketProcessorOwner(owner)) {
+        PacketProcessorLedger ledger = claimPacketProcessorLedger(owner);
+        if (ledger == null) {
             return false;
         }
-        beginBatch();
+        beginOwnerBatch(ledger);
         return true;
     }
 
@@ -155,15 +602,48 @@ public final class BrowserPacketScheduler {
         if (BrowserIntegratedServerMain.isWorkerServer()) {
             return;
         }
-        flushClientFrameAccounting();
-        clientFrameSequence = clientFrameSequence == Long.MAX_VALUE
+        PacketProcessorLedger previous = currentPacketProcessorLedger();
+        if (previous != null) {
+            flushOwnerClientFrameAccounting(previous);
+        } else {
+            flushClientFrameAccounting();
+        }
+        pendingClientFrameSequence = pendingClientFrameSequence == Long.MAX_VALUE
                 ? 1L
-                : clientFrameSequence + 1L;
-        clientFramePacketCount = 0;
-        clientFramePacketHandleNanos = 0L;
-        clientFrameSafeDrainTurns = 0;
-        clientFrameVanillaDrainTurns = 0;
-        clientFrameAccountingActive = true;
+                : pendingClientFrameSequence + 1L;
+        pendingClientFrame = true;
+    }
+
+    private static void beginOwnerBatch(PacketProcessorLedger ledger) {
+        boolean workerServer = BrowserIntegratedServerMain.isWorkerServer();
+        if (ledger.clientPacketDrainActive && !workerServer) {
+            ledger.clientPacketDrainRequestedPackets = Math.max(
+                    1, ledger.queuedPackets - CLIENT_PACKET_DRAIN_TARGET_QUEUE);
+            ledger.clientPacketDrainBatchTargetPackets = Math.min(
+                    CLIENT_PACKET_DRAIN_HARD_MAX_PACKETS,
+                    ledger.clientPacketDrainRequestedPackets);
+            ledger.clientPacketDrainRemainingDebt = Math.max(
+                    0, ledger.queuedPackets - CLIENT_PACKET_DRAIN_TARGET_QUEUE);
+            ledger.clientPacketDrainStopReason = "pending";
+            ledger.batchPacketLimit = ledger.clientPacketDrainBatchTargetPackets;
+            ledger.minimumPackets = 1;
+        } else {
+            ledger.batchPacketLimit = MAX_PACKETS_PER_BATCH;
+            ledger.minimumPackets = workerServer
+                    ? MIN_WORKER_PACKETS_PER_BATCH
+                    : 1;
+        }
+        ledger.packetsRemaining = ledger.batchPacketLimit;
+        ledger.deadlineNanos = System.nanoTime() + BATCH_BUDGET_NANOS;
+        if (ledger.clientFrameAccountingActive && !workerServer) {
+            if (ledger.clientPacketDrainActive) {
+                if (ledger.clientFrameSafeDrainTurns < Integer.MAX_VALUE) {
+                    ledger.clientFrameSafeDrainTurns++;
+                }
+            } else if (ledger.clientFrameVanillaDrainTurns < Integer.MAX_VALUE) {
+                ledger.clientFrameVanillaDrainTurns++;
+            }
+        }
     }
 
     private static void flushClientFrameAccounting() {
@@ -179,23 +659,57 @@ public final class BrowserPacketScheduler {
                 clientFramePacketHandleNanos / 1_000_000.0);
     }
 
+    private static void flushOwnerClientFrameAccounting(PacketProcessorLedger ledger) {
+        if (!ledger.clientFrameAccountingActive || ledger.clientFramePacketCount == 0) {
+            return;
+        }
+        BrowserClientNetwork.recordClientPacketFrame(
+                ledger.clientFrameSequence,
+                ledger.clientFrameSafeDrainTurns,
+                ledger.clientFrameVanillaDrainTurns,
+                ledger.clientFramePacketCount,
+                ledger.clientFramePacketHandleNanos / 1_000_000.0);
+    }
+
+    private static void startOwnerClientFrame(PacketProcessorLedger ledger) {
+        flushOwnerClientFrameAccounting(ledger);
+        ledger.clientFrameSequence = pendingClientFrame
+                ? pendingClientFrameSequence
+                : ledger.clientFrameSequence == Long.MAX_VALUE
+                        ? 1L : ledger.clientFrameSequence + 1L;
+        ledger.clientFramePacketCount = 0;
+        ledger.clientFramePacketHandleNanos = 0L;
+        ledger.clientFrameSafeDrainTurns = 0;
+        ledger.clientFrameVanillaDrainTurns = 0;
+        ledger.clientFrameAccountingActive = true;
+        pendingClientFrame = false;
+    }
+
     public static long currentClientFrameSequence() {
-        return clientFrameSequence;
+        PacketProcessorLedger ledger = currentPacketProcessorLedger();
+        return ledger == null ? clientFrameSequence : ledger.clientFrameSequence;
     }
 
     public static int queuedPacketCount() {
-        return queuedPackets;
+        PacketProcessorLedger ledger = currentPacketProcessorLedger();
+        return ledger == null ? aggregateQueuedPackets() : ledger.queuedPackets;
     }
 
     public static int queuedPacketHandleDepth() {
-        return queuedPacketHandleDepth;
+        PacketProcessorLedger ledger = currentPacketProcessorLedger();
+        return ledger == null ? queuedPacketHandleDepth : ledger.queuedPacketHandleDepth;
     }
 
     public static boolean isPacketQueuePaused() {
-        return packetQueuePaused;
+        PacketProcessorLedger ledger = currentPacketProcessorLedger();
+        return ledger == null ? aggregateQueuePaused() : ledger.packetQueuePaused;
     }
 
     public static boolean shouldProcessNext() {
+        PacketProcessorLedger ledger = currentPacketProcessorLedger();
+        if (ledger != null) {
+            return shouldProcessNextOwner(ledger);
+        }
         if (packetsRemaining <= 0) {
             if (clientPacketDrainActive) {
                 clientPacketDrainStopReason =
@@ -220,14 +734,12 @@ public final class BrowserPacketScheduler {
 
     /** Stops the adaptive loop immediately if its PacketProcessor owner becomes stale/conflicted. */
     public static boolean shouldProcessNext(Object owner) {
-        if (!isPacketProcessorAccountingValid(owner)) {
-            return false;
-        }
-        return shouldProcessNext();
+        PacketProcessorLedger ledger = packetProcessorLedger(owner);
+        return shouldProcessNextOwner(ledger);
     }
 
     public static boolean hasPendingPackets() {
-        return queuedPackets > 0;
+        return aggregateQueuedPackets() > 0;
     }
 
     /**
@@ -235,11 +747,11 @@ public final class BrowserPacketScheduler {
      * on the PacketProcessor FIFO rather than being incorrectly inlined ahead of another owner.
      */
     public static boolean hasPendingPackets(Object owner) {
-        if (owner == null || packetProcessorOwnerConflict
-                || packetProcessorOwner != owner) {
+        PacketProcessorLedger ledger = packetProcessorLedger(owner);
+        if (ledger == null) {
             return true;
         }
-        return queuedPackets > 0;
+        return ledger.queuedPackets > 0;
     }
 
     /**
@@ -250,6 +762,10 @@ public final class BrowserPacketScheduler {
      * two-millisecond deadline and the original FIFO owner.</p>
      */
     public static boolean tryBeginClientPacketDrain(boolean critical) {
+        PacketProcessorLedger ledger = currentPacketProcessorLedger();
+        if (ledger != null) {
+            return tryBeginOwnerClientPacketDrain(ledger, critical);
+        }
         if (BrowserIntegratedServerMain.isWorkerServer()
                 || clientPacketDrainActive
                 || queuedPacketHandleDepth > 0
@@ -268,7 +784,8 @@ public final class BrowserPacketScheduler {
     }
 
     public static boolean tryBeginClientPacketDrain(Object owner, boolean critical) {
-        if (!claimPacketProcessorOwner(owner)) {
+        PacketProcessorLedger ledger = claimPacketProcessorLedger(owner);
+        if (ledger == null) {
             return false;
         }
         if (!tryBeginClientPacketDrain(critical)) {
@@ -281,19 +798,27 @@ public final class BrowserPacketScheduler {
 
     /** Marks an exceptional or reset-aborted active drain without deriving success from queue depth. */
     public static void interruptClientPacketDrain() {
+        PacketProcessorLedger ledger = currentPacketProcessorLedger();
+        if (ledger != null) {
+            interruptOwnerClientPacketDrain(ledger);
+            return;
+        }
         if (clientPacketDrainActive) {
             clientPacketDrainStopReason = "interrupted";
         }
     }
 
     public static void interruptClientPacketDrain(Object owner) {
-        if (owner == packetProcessorOwner) {
-            interruptClientPacketDrain();
-        }
+        interruptOwnerClientPacketDrain(packetProcessorLedgerIncludingRetired(owner));
     }
 
     /** Releases the client drain claim without changing the exact queue or its FIFO. */
     public static void finishClientPacketDrain() {
+        PacketProcessorLedger ledger = currentPacketProcessorLedger();
+        if (ledger != null) {
+            finishOwnerClientPacketDrain(ledger);
+            return;
+        }
         if (clientPacketDrainActive) {
             clientPacketDrainRemainingDebt = Math.max(
                     0, queuedPackets - CLIENT_PACKET_DRAIN_TARGET_QUEUE);
@@ -310,25 +835,29 @@ public final class BrowserPacketScheduler {
     }
 
     public static void finishClientPacketDrain(Object owner) {
-        if (owner == null || owner != clientPacketDrainOwner
-                || clientPacketDrainOwnerGeneration <= 0L) {
-            return;
-        }
+        PacketProcessorLedger ledger = packetProcessorLedgerIncludingRetired(owner);
+        boolean ownerScopedDrain = ledger != null && owner != null && owner == ledger.owner
+                && ledger.generation > 0L && ledger.clientPacketDrainActive;
         boolean currentOwner = owner == packetProcessorOwner
                 && packetProcessorGeneration == clientPacketDrainOwnerGeneration;
-        long nextGeneration = clientPacketDrainOwnerGeneration == Long.MAX_VALUE
-                ? 1L
-                : clientPacketDrainOwnerGeneration + 1L;
-        boolean retiredOwnerAfterReset = packetProcessorOwner == null
-                && packetProcessorGeneration == nextGeneration
+        boolean retiredOwnerAfterReset = ledger != null && ledger.retired
                 && isRetiredPacketProcessorOwner(owner);
-        if (currentOwner || retiredOwnerAfterReset) {
-            finishClientPacketDrain();
+        if (ledger == null || owner == null
+                || (owner != clientPacketDrainOwner && !ownerScopedDrain)
+                || (clientPacketDrainOwnerGeneration <= 0L && !ownerScopedDrain)
+                || (!ownerScopedDrain && !currentOwner && !retiredOwnerAfterReset)) {
+            return;
+        }
+        finishOwnerClientPacketDrain(ledger);
+        if (owner == clientPacketDrainOwner) {
+            clientPacketDrainOwner = null;
+            clientPacketDrainOwnerGeneration = 0L;
         }
     }
 
     public static String clientPacketDrainStopReason() {
-        return clientPacketDrainStopReason;
+        PacketProcessorLedger ledger = currentPacketProcessorLedger();
+        return ledger == null ? clientPacketDrainStopReason : ledger.clientPacketDrainStopReason;
     }
 
     public static int clientPacketDrainTargetQueue() {
@@ -340,25 +869,33 @@ public final class BrowserPacketScheduler {
     }
 
     public static int clientPacketDrainRequestedPackets() {
-        return clientPacketDrainRequestedPackets;
+        PacketProcessorLedger ledger = currentPacketProcessorLedger();
+        return ledger == null ? clientPacketDrainRequestedPackets
+                : ledger.clientPacketDrainRequestedPackets;
     }
 
     public static int clientPacketDrainBatchTargetPackets() {
-        return clientPacketDrainBatchTargetPackets;
+        PacketProcessorLedger ledger = currentPacketProcessorLedger();
+        return ledger == null ? clientPacketDrainBatchTargetPackets
+                : ledger.clientPacketDrainBatchTargetPackets;
     }
 
     public static int clientPacketDrainRemainingDebt() {
-        return clientPacketDrainRemainingDebt;
+        PacketProcessorLedger ledger = currentPacketProcessorLedger();
+        return ledger == null ? clientPacketDrainRemainingDebt : ledger.clientPacketDrainRemainingDebt;
     }
 
     /** Monotonic identity of the active/most recently completed claimed batch. */
     public static long clientPacketDrainEpoch() {
-        return clientPacketDrainEpoch;
+        PacketProcessorLedger ledger = currentPacketProcessorLedger();
+        return ledger == null ? clientPacketDrainEpoch : ledger.clientPacketDrainEpoch;
     }
 
     /** Exact outer queued-handler completions in this batch; queue clear/reset is never counted. */
     public static int clientPacketDrainHandlerCompletions() {
-        return clientPacketDrainHandlerCompletions;
+        PacketProcessorLedger ledger = currentPacketProcessorLedger();
+        return ledger == null ? clientPacketDrainHandlerCompletions
+                : ledger.clientPacketDrainHandlerCompletions;
     }
 
     /** Prevents a queued PLAY packet from scheduling itself again when its handler re-enters PacketUtils. */
@@ -367,12 +904,17 @@ public final class BrowserPacketScheduler {
     }
 
     public static boolean isProcessingQueuedPacket(Object owner) {
-        return owner != null && owner == queuedPacketHandleOwner
-                && queuedPacketHandleDepth > 0;
+        PacketProcessorLedger ledger = packetProcessorLedger(owner);
+        return ledger != null && ledger.queuedPacketHandleDepth > 0;
     }
 
     /** Marks the exact ListenerAndPacket.handle scope; nesting must not clear the outer drain guard. */
     public static void beginQueuedPacket(Object packet) {
+        PacketProcessorLedger ledger = currentPacketProcessorLedger();
+        if (ledger != null) {
+            beginQueuedPacketOwner(ledger, packet);
+            return;
+        }
         if (queuedPacketHandleDepth == 0) {
             queuedPacketHandleStartedNanos = System.nanoTime();
             queuedPacketHandleRoot = packet;
@@ -383,24 +925,20 @@ public final class BrowserPacketScheduler {
     }
 
     public static void beginQueuedPacket(Object owner, Object packet) {
-        if (!claimPacketProcessorOwner(owner)) {
+        PacketProcessorLedger ledger = packetProcessorLedger(owner);
+        if (ledger == null) {
             return;
         }
-        if (queuedPacketHandleDepth == 0) {
-            queuedPacketHandleStartedNanos = System.nanoTime();
-            queuedPacketHandleRoot = packet;
-            queuedPacketHandleOwner = owner;
-        } else if (queuedPacketHandleOwner != owner) {
-            markPacketProcessorConflict("nested-owner-conflict");
-            return;
-        }
-        if (queuedPacketHandleDepth < Integer.MAX_VALUE) {
-            queuedPacketHandleDepth++;
-        }
+        beginQueuedPacketOwner(ledger, packet);
     }
 
     /** Called only after PacketProcessor successfully appends a decoded packet to its queue. */
     public static void packetQueued() {
+        PacketProcessorLedger ledger = currentPacketProcessorLedger();
+        if (ledger != null) {
+            queueOwnerPacket(ledger);
+            return;
+        }
         if (queuedPackets < Integer.MAX_VALUE) {
             queuedPackets++;
         }
@@ -412,24 +950,16 @@ public final class BrowserPacketScheduler {
     }
 
     public static void packetQueued(Object owner) {
-        if (!claimPacketProcessorOwner(owner)) {
-            return;
-        }
-        if (!packetProcessorAccountingValid) {
-            return;
-        }
-        if (queuedPackets < Integer.MAX_VALUE) {
-            queuedPackets++;
-        }
-        if (!packetQueuePaused && queuedPackets >= PACKET_QUEUE_HIGH_WATERMARK) {
-            packetQueuePaused = true;
-        }
-        BrowserWebSocketChannel.recordDecodedPacketQueue(
-                queuedPackets, packetQueuePaused, false, -1.0, null);
+        queueOwnerPacket(packetProcessorLedger(owner));
     }
 
     /** Called after a queued packet's handle method returns or throws. */
     public static void packetProcessed() {
+        PacketProcessorLedger ledger = currentPacketProcessorLedger();
+        if (ledger != null) {
+            completeOwnerPacket(ledger);
+            return;
+        }
         double handleMillis = -1.0;
         String handleType = null;
         long completedHandleNanos = -1L;
@@ -478,44 +1008,18 @@ public final class BrowserPacketScheduler {
     }
 
     public static void packetProcessed(Object owner) {
-        boolean handlerOwner = owner != null && owner == queuedPacketHandleOwner;
-        if (!handlerOwner) {
+        PacketProcessorLedger ledger = packetProcessorLedgerIncludingRetired(owner);
+        if (ledger == null) {
+            noteUnknownPacketProcessorOwner("unknown-owner-event");
             return;
         }
-        double handleMillis = -1.0;
-        String handleType = null;
-        long completedHandleNanos = -1L;
-        if (queuedPacketHandleDepth > 0) {
-            queuedPacketHandleDepth--;
-            if (queuedPacketHandleDepth == 0) {
-                long elapsedNanos = Math.max(
-                        0L, System.nanoTime() - queuedPacketHandleStartedNanos);
-                completedHandleNanos = elapsedNanos;
-                handleMillis = elapsedNanos / 1_000_000.0;
-                if (elapsedNanos > longestQueuedPacketHandleNanos
-                        || elapsedNanos >= 50_000_000L) {
-                    if (elapsedNanos > longestQueuedPacketHandleNanos) {
-                        longestQueuedPacketHandleNanos = elapsedNanos;
-                    }
-                    handleType = queuedPacketHandleRoot == null
-                            ? "unknown"
-                            : queuedPacketHandleRoot.getClass().getName();
-                }
-                queuedPacketHandleStartedNanos = 0L;
-                queuedPacketHandleRoot = null;
-                queuedPacketHandleOwner = null;
-            }
-        }
-        // A conflict intentionally stops all global queue/frame mutation. The handler scope above
-        // is still unwound so a later vanilla packet cannot be mistaken for nested queued work.
+        completeOwnerPacket(ledger);
+        // Keep the legacy mismatch path explicit for runtimes that still report the owner-less
+        // fields while a callback is unwinding. The owner-scoped ledger was already completed
+        // above; this branch only preserves legacy diagnostics and never decrements another queue.
         if (owner != packetProcessorOwner || !packetProcessorAccountingValid) {
-            // PacketProcessor.close/reset may have retired the owner while this exact queued
-            // handler was still unwinding.  Count the handler that really completed, but do not
-            // decrement the queue: reset() already cleared the queue and the dropped remainder is
-            // reported as unattributed reduction by the frame-boundary evidence.
-            if (owner == clientPacketDrainOwner
-                    && clientPacketDrainActive
-                    && completedHandleNanos >= 0L
+            if (owner == clientPacketDrainOwner && clientPacketDrainActive
+                    && ledger.queuedPacketHandleDepth == 0
                     && clientPacketDrainHandlerCompletions < Integer.MAX_VALUE) {
                 clientPacketDrainHandlerCompletions++;
             }
@@ -525,34 +1029,16 @@ public final class BrowserPacketScheduler {
                 packetProcessorAccountingValid = true;
                 packetProcessorFallbackReason = "unbound";
             }
-            return;
         }
-        if (clientFrameAccountingActive && completedHandleNanos >= 0L) {
-            if (clientFramePacketCount < Integer.MAX_VALUE) {
-                clientFramePacketCount++;
-            }
-            if (Long.MAX_VALUE - clientFramePacketHandleNanos < completedHandleNanos) {
-                clientFramePacketHandleNanos = Long.MAX_VALUE;
-            } else {
-                clientFramePacketHandleNanos += completedHandleNanos;
-            }
-        }
-        if (clientPacketDrainActive && completedHandleNanos >= 0L
-                && clientPacketDrainHandlerCompletions < Integer.MAX_VALUE) {
-            clientPacketDrainHandlerCompletions++;
-        }
-        if (queuedPackets > 0) {
-            queuedPackets--;
-        }
-        if (packetQueuePaused && queuedPackets <= PACKET_QUEUE_LOW_WATERMARK) {
-            packetQueuePaused = false;
-        }
-        BrowserWebSocketChannel.recordDecodedPacketQueue(
-                queuedPackets, packetQueuePaused, true, handleMillis, handleType);
     }
 
     /** Mirrors PacketProcessor.close after it clears the backing queue. */
     public static void reset() {
+        PacketProcessorLedger ledger = currentPacketProcessorLedger();
+        if (ledger != null) {
+            resetOwnerLedger(ledger);
+            return;
+        }
         boolean preserveActiveDrainEvidence = clientPacketDrainActive;
         if (preserveActiveDrainEvidence) {
             // PacketProcessor.close can run from inside a queued handler. Preserve its scope and
@@ -606,46 +1092,38 @@ public final class BrowserPacketScheduler {
      * queue/depth/frame state.
      */
     public static void reset(Object owner) {
-        // A close from the active owner retires the epoch.  If a second live owner previously
-        // forced a conflict, keep the runtime poisoned after retirement: the static ledger has
-        // already lost ownership and must not be rebound against a surviving foreign queue.
-        if (owner == null || packetProcessorOwner == null || owner != packetProcessorOwner
-                || packetProcessorOwnerConflict || packetProcessorConflictPoisoned
-                || !packetProcessorAccountingValid) {
-            if (owner != null && (owner != packetProcessorOwner
-                    || packetProcessorOwnerConflict
-                    || packetProcessorConflictPoisoned
-                    || !packetProcessorAccountingValid)) {
-                // A conflicted close must not clear the shared ledger.  Keep the runtime poisoned
-                // and leave the live owner bound so a foreign owner cannot rebind an empty epoch.
-                packetProcessorConflictPoisoned = packetProcessorOwnerConflict
-                        || packetProcessorConflictPoisoned;
-                packetProcessorAccountingValid = false;
-                if (stalePacketProcessorResets < Long.MAX_VALUE) {
-                    stalePacketProcessorResets++;
-                }
+        PacketProcessorLedger ledger = packetProcessorLedgerIncludingRetired(owner);
+        if (ledger == null) {
+            noteUnknownPacketProcessorOwner("unknown-owner-reset");
+            if (stalePacketProcessorResets < Long.MAX_VALUE) {
+                stalePacketProcessorResets++;
             }
             return;
         }
-        reset();
-        rememberRetiredPacketProcessorOwner(owner);
-        packetProcessorOwner = null;
-        packetProcessorGeneration = packetProcessorGeneration == Long.MAX_VALUE
-                ? 1L
-                : packetProcessorGeneration + 1L;
-        packetProcessorConflictPoisoned = false;
-        packetProcessorOwnerConflict = queuedPacketHandleDepth > 0;
-        packetProcessorAccountingValid = !packetProcessorOwnerConflict;
-        packetProcessorFallbackReason = packetProcessorOwnerConflict
-                ? "owner-close-during-handler" : "unbound";
-        if (!packetProcessorOwnerConflict) {
-            queuedPacketHandleOwner = null;
+        if (ledger.retired) {
+            if (stalePacketProcessorResets < Long.MAX_VALUE) {
+                stalePacketProcessorResets++;
+            }
+            packetProcessorFallbackReason = "retired-owner-reset";
+            return;
         }
+        if (owner == null || owner != packetProcessorOwner || packetProcessorOwnerConflict
+                || packetProcessorConflictPoisoned || !packetProcessorAccountingValid) {
+            if (stalePacketProcessorResets < Long.MAX_VALUE) {
+                stalePacketProcessorResets++;
+            }
+            packetProcessorOwnerConflict = packetProcessorOwnerConflict
+                    || packetProcessorConflictPoisoned;
+            packetProcessorAccountingValid = false;
+            packetProcessorFallbackReason = "foreign-owner-reset";
+            return;
+        }
+        resetOwnerLedger(ledger);
     }
 
     public static boolean isPacketProcessorAccountingValid(Object owner) {
-        return owner != null && owner == packetProcessorOwner
-                && packetProcessorAccountingValid && !packetProcessorOwnerConflict;
+        PacketProcessorLedger ledger = packetProcessorLedger(owner);
+        return ledger != null;
     }
 
     public static boolean packetProcessorOwnerConflict() {
@@ -653,11 +1131,16 @@ public final class BrowserPacketScheduler {
     }
 
     public static boolean packetProcessorAccountingValid() {
+        PacketProcessorLedger ledger = currentPacketProcessorLedger();
+        if (ledger != null) {
+            return ledger.accountingValid && !ledger.retired;
+        }
         return packetProcessorAccountingValid && !packetProcessorOwnerConflict;
     }
 
     public static long packetProcessorGeneration() {
-        return packetProcessorGeneration;
+        PacketProcessorLedger ledger = currentPacketProcessorLedger();
+        return ledger == null ? packetProcessorGeneration : ledger.generation;
     }
 
     public static long stalePacketProcessorResets() {
@@ -675,7 +1158,8 @@ public final class BrowserPacketScheduler {
     }
 
     public static String packetProcessorFallbackReason() {
-        return packetProcessorFallbackReason;
+        PacketProcessorLedger ledger = currentPacketProcessorLedger();
+        return ledger == null ? packetProcessorFallbackReason : ledger.fallbackReason;
     }
 
     private static boolean claimPacketProcessorOwner(Object owner) {
@@ -683,45 +1167,61 @@ public final class BrowserPacketScheduler {
             markPacketProcessorConflict("null-owner");
             return false;
         }
+        if (packetProcessorOwner == null) {
+            if (clientPacketDrainActive) {
+                // A close/reset from inside the active drain handler intentionally leaves the
+                // drain claim live until the surrounding frame finally block releases it.  Do not
+                // let a reentrant/new PacketProcessor claim the empty owner slot in that window:
+                // the retired owner's finish would then fail its generation check and strand the
+                // global drain active forever.
+                packetProcessorFallbackReason = "active-drain-owner-retiring";
+                return false;
+            }
+        }
+        return claimPacketProcessorLedger(owner) != null;
+    }
+
+    private static PacketProcessorLedger claimPacketProcessorLedger(Object owner) {
         if (isRetiredPacketProcessorOwner(owner)) {
             if (stalePacketProcessorEvents < Long.MAX_VALUE) {
                 stalePacketProcessorEvents++;
             }
             packetProcessorFallbackReason = "retired-owner-event";
-            return false;
+            return null;
         }
-        if (packetProcessorOwner == null) {
-            // A close/reset from inside the active drain handler intentionally leaves the
-            // drain claim live until the surrounding frame finally block releases it.  Do not
-            // let a reentrant/new PacketProcessor claim the empty owner slot in that window:
-            // the retired owner's finish would then fail its generation check and strand the
-            // global drain active forever.
-            if (clientPacketDrainActive) {
-                packetProcessorFallbackReason = "active-drain-owner-retiring";
-                return false;
-            }
-            if (packetProcessorConflictPoisoned || packetProcessorOwnerConflict
-                    || !packetProcessorAccountingValid) {
-                packetProcessorFallbackReason = "runtime-accounting-poisoned";
-                return false;
-            }
-            if (queuedPacketHandleDepth > 0 && queuedPacketHandleOwner != owner) {
-                markPacketProcessorConflict("owner-while-handler-active");
-                return false;
-            }
-            packetProcessorOwner = owner;
-            packetProcessorGeneration = packetProcessorGeneration == Long.MAX_VALUE
-                    ? 1L : packetProcessorGeneration + 1L;
-            packetProcessorOwnerConflict = false;
-            packetProcessorAccountingValid = true;
-            packetProcessorFallbackReason = "bound";
-            return true;
+        if (packetProcessorConflictPoisoned || packetProcessorOwnerConflict
+                || (!packetProcessorAccountingValid && packetProcessorOwner != null)) {
+            packetProcessorFallbackReason = "runtime-accounting-poisoned";
+            return null;
         }
-        if (packetProcessorOwner != owner) {
+        PacketProcessorLedger ledger = findPacketProcessorLedger(owner);
+        if (packetProcessorOwner != null && packetProcessorOwner != owner) {
             markPacketProcessorConflict("packet-processor-owner-conflict");
-            return false;
+            return null;
         }
-        return packetProcessorAccountingValid && !packetProcessorOwnerConflict;
+        if (ledger == null && activePacketProcessorLedgerCount() > 0) {
+            markPacketProcessorConflict("packet-processor-owner-conflict");
+            return null;
+        }
+        if (ledger == null) {
+            ledger = allocatePacketProcessorLedger(owner);
+            if (ledger == null) {
+                packetProcessorFallbackReason = "ledger-slot-exhausted";
+                packetProcessorOwnerConflict = true;
+                packetProcessorAccountingValid = false;
+                return null;
+            }
+        }
+        if (ledger.retired || !ledger.accountingValid) {
+            if (stalePacketProcessorEvents < Long.MAX_VALUE) {
+                stalePacketProcessorEvents++;
+            }
+            packetProcessorFallbackReason = ledger.fallbackReason;
+            return null;
+        }
+        selectPacketProcessorLedger(ledger);
+        startPendingOwnerFrame(ledger);
+        return ledger;
     }
 
     private static int countRetiredPacketProcessorOwners() {
@@ -759,6 +1259,14 @@ public final class BrowserPacketScheduler {
     }
 
     private static void markPacketProcessorConflict(String reason) {
+        int queuedBeforeConflict = aggregateQueuedPackets();
+        for (PacketProcessorLedger ledger : packetProcessorLedgers) {
+            if (ledger != null && !ledger.retired) {
+                ledger.accountingValid = false;
+                ledger.fallbackReason = reason;
+                interruptOwnerClientPacketDrain(ledger);
+            }
+        }
         packetProcessorOwnerConflict = true;
         packetProcessorAccountingValid = false;
         packetProcessorConflictPoisoned = true;
@@ -772,6 +1280,6 @@ public final class BrowserPacketScheduler {
         clientPacketDrainOwner = null;
         clientPacketDrainOwnerGeneration = 0L;
         BrowserWebSocketChannel.recordDecodedPacketQueue(
-                queuedPackets, false, false, -1.0, null);
+                queuedBeforeConflict, false, false, -1.0, null);
     }
 }

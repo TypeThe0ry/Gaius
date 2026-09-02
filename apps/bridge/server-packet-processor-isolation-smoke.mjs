@@ -100,18 +100,18 @@ const ownerResetEnd = schedulerSource.indexOf(
 assert.ok(ownerResetStart >= 0 && ownerResetEnd > ownerResetStart,
     "owner-aware reset boundary changed; audit it before updating this smoke");
 const ownerResetBody = schedulerSource.slice(ownerResetStart, ownerResetEnd);
-const ownerResetCall = ownerResetBody.indexOf("\n        reset();");
-assert.ok(ownerResetCall > 0, "owner-aware reset lost its global reset call");
+const ownerResetCall = ownerResetBody.indexOf("\n        resetOwnerLedger(ledger);");
+assert.ok(ownerResetCall > 0, "owner-aware reset lost its owner-ledger reset call");
 const ownerResetGuard = {
     activeOwnershipBeforeGlobalReset: requireMatch(
         ownerResetBody.slice(0, ownerResetCall),
-        /owner == null \|\| packetProcessorOwner == null \|\| owner != packetProcessorOwner/u,
-        "owner-aware reset does not reject foreign/null owners before global reset"),
+        /owner == null \|\| owner != packetProcessorOwner/u,
+        "owner-aware reset does not reject foreign/null owners before owner-ledger reset"),
     conflictRejectedBeforeGlobalReset: /packetProcessorOwnerConflict|!packetProcessorAccountingValid/u
         .test(ownerResetBody.slice(0, ownerResetCall)),
     conflictedOwnerCanRetire: requireMatch(
         ownerResetBody.slice(ownerResetCall),
-        /reset\(\);[\s\S]*rememberRetiredPacketProcessorOwner\(owner\)[\s\S]*packetProcessorOwner = null/u,
+        /resetOwnerLedger\(ledger\);/u,
         "active owner cannot retire and recover after a fail-closed conflict"),
 };
 
