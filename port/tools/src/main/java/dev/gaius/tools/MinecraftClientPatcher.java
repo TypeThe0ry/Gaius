@@ -8559,13 +8559,6 @@ public final class MinecraftClientPatcher {
         code.add(new InsnNode(Opcodes.ARETURN));
         replace(connect, code, 4, 3);
 
-        MethodNode tick = find(node, "tick", "()V");
-        tick.instructions.insert(new MethodInsnNode(
-                Opcodes.INVOKESTATIC,
-                "io/netty/channel/browser/BrowserWebSocketChannel",
-                "pumpAll",
-                "()V",
-                false));
         writeComputeFrames(node, output);
     }
 
