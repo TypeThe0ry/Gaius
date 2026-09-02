@@ -679,12 +679,23 @@ public final class BrowserPacketScheduler {
         if (!ledger.clientFrameAccountingActive || ledger.clientFramePacketCount == 0) {
             return;
         }
-        BrowserClientNetwork.recordClientPacketFrame(
-                ledger.clientFrameSequence,
-                ledger.clientFrameSafeDrainTurns,
-                ledger.clientFrameVanillaDrainTurns,
-                ledger.clientFramePacketCount,
-                ledger.clientFramePacketHandleNanos / 1_000_000.0);
+        try {
+            BrowserClientNetwork.recordClientPacketFrame(
+                    ledger.clientFrameSequence,
+                    ledger.clientFrameSafeDrainTurns,
+                    ledger.clientFrameVanillaDrainTurns,
+                    ledger.clientFramePacketCount,
+                    ledger.clientFramePacketHandleNanos / 1_000_000.0);
+        } finally {
+            // beginClientFrame() can flush the previous owner before the pending frame is bound.
+            // Clear the committed epoch here so startOwnerClientFrame() cannot emit it twice and
+            // a late callback cannot append work to an already published sequence.
+            ledger.clientFramePacketCount = 0;
+            ledger.clientFramePacketHandleNanos = 0L;
+            ledger.clientFrameSafeDrainTurns = 0;
+            ledger.clientFrameVanillaDrainTurns = 0;
+            ledger.clientFrameAccountingActive = false;
+        }
     }
 
     private static void startOwnerClientFrame(PacketProcessorLedger ledger) {
