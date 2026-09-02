@@ -2217,6 +2217,10 @@ function createFairClientPollScheduler(getClients) {
         let fairnessSkipsThisCallback = 0;
         let maxPerPollDurationMillis = 0;
         let nextContinuation = "immediate";
+        // Keep the post-dispatch readiness result in callback scope: the
+        // finalizer must retain an immediate wake when a fair candidate is
+        // ready even though this turn dispatched zero polls.
+        let readyAfterDispatch = false;
         let interCallbackGapMillis = null;
         let interCallbackIdleGapMillis = null;
         // Keep scheduler-delay values in the run scope: finalization records
@@ -2357,11 +2361,6 @@ function createFairClientPollScheduler(getClients) {
             // remain unchanged.
             lastDueTicksAfterService = countDuePlayTicks(clients);
             maxDueTicks = Math.max(maxDueTicks, lastDueTicksAfterService);
-            // Keep the post-dispatch readiness result visible to the finalizer
-            // even when the poll-loop block has already unwound.  A callback
-            // may spend its budget on PLAY ticks and dispatch zero polls while
-            // a fair candidate is nevertheless ready for the next turn.
-            let readyAfterDispatch = false;
             if (clients.length > 0) {
                 timeBeforePollLoop = markPhase("poll-loop");
                 if (cursor >= clients.length) cursor = 0;
@@ -2622,7 +2621,12 @@ function createFairClientPollScheduler(getClients) {
             // 256-turn fairness cadence once no due tick remains.
             const dueTicksPending = lastDueTicksAfterService > 0 ||
                 lastDueTicksBeforeIdle > 0;
-            const continuation = dueTicksPending
+            // A fair poll candidate has the same immediate-wake priority as a
+            // due PLAY tick.  In particular, a zero-dispatch callback that
+            // spent its budget on tick work must not let the periodic
+            // timer-yield override a ready inbound poll.
+            const readyPollPending = readyAfterDispatch;
+            const continuation = dueTicksPending || readyPollPending
                 ? "immediate"
                 : needsTimerYield ? "timer-yield" : nextContinuation;
             if (callbackDurationMillis >= CALLBACK_TAIL_SLOW_THRESHOLD_MILLIS) {

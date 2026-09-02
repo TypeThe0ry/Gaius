@@ -252,6 +252,23 @@ assert.match(schedulerSource, /budgetReachedPhase/u);
 assert.match(schedulerSource, /terminalPhase/u);
 assert.match(schedulerSource, /strictFrameBudgetExcessMillis/u);
 assert.match(schedulerSource, /nextContinuation/u);
+// `readyAfterDispatch` crosses the poll-loop/finalizer boundary.  Keep one
+// callback-scoped declaration before the client block; a block-scoped
+// declaration here either throws in the finalizer or lets a ready zero-
+// dispatch turn fall through to the idle timer.
+const readyAfterDispatchDeclaration = schedulerSource.indexOf(
+    "let readyAfterDispatch = false;");
+const firstClientBlock = schedulerSource.indexOf(
+    "if (clients.length > 0) {", readyAfterDispatchDeclaration);
+assert.ok(readyAfterDispatchDeclaration >= 0 && firstClientBlock >
+    readyAfterDispatchDeclaration,
+"readyAfterDispatch must be declared before the client poll block");
+assert.equal((schedulerSource.match(/let readyAfterDispatch = false;/gu) ?? []).length,
+    1,
+"readyAfterDispatch must have exactly one callback-scoped declaration");
+assert.match(schedulerSource,
+    /if\s*\(dispatched === 0\)[\s\S]*?lastDueTicksAfterService > 0[\s\S]*?readyAfterDispatch[\s\S]*?nextContinuation = "immediate"/u,
+"zero-dispatch finalization must preserve readiness as an immediate continuation");
 assert.match(source,
     /const SCHEDULER_GAP_TELEMETRY_SCHEMA_VERSION\s*=\s*["']gaius\.browser-client-scheduler-gap\.v1["']/u,
     "scheduler gap telemetry schema drifted");
@@ -347,8 +364,8 @@ assert.match(schedulerSource,
     /const dueTicksPending\s*=\s*lastDueTicksAfterService\s*>\s*0\s*\|\|\s*\n\s*lastDueTicksBeforeIdle\s*>\s*0/u,
     "due PLAY tick state must be carried through the final continuation choice");
 assert.match(schedulerSource,
-    /const continuation\s*=\s*dueTicksPending\s*\n\s*\?\s*"immediate"\s*\n\s*:\s*needsTimerYield\s*\?/u,
-    "due PLAY ticks must take precedence over the periodic timer yield");
+    /const readyPollPending\s*=\s*readyAfterDispatch[\s\S]*?const continuation\s*=\s*dueTicksPending\s*\|\|\s*readyPollPending\s*\n\s*\?\s*"immediate"\s*\n\s*:\s*needsTimerYield\s*\?/u,
+    "due PLAY ticks and ready polls must take precedence over the periodic timer yield");
 assert.match(schedulerSource, /idleCallbacks/u);
 assert.match(schedulerSource, /POLL_SCHEDULER_IDLE_BACKOFF_MILLIS/u);
 assert.match(source, /this\.nextPollDueAt = performance\.now\(\)/u);
@@ -768,6 +785,51 @@ function modelDeadlineProbeContinuation({
         idleImmediateSpins: 0,
         probeStartedAt: undefined,
         overdueWakePending: false,
+    };
+}
+
+// Model the complete continuation choice made after a scheduler callback has
+// unwound.  In particular, readiness is measured in the poll loop but is
+// consumed by the outer zero-dispatch finalizer; this model keeps that
+// cross-block state explicit instead of only testing the inner deadline
+// probe.  The final timer-yield rule remains lower priority than due ticks,
+// and this model never changes a strict acceptance gate.
+function modelFinalizerContinuation({
+    dispatched = 0,
+    nextContinuation = "immediate",
+    readyAfterDispatch = false,
+    dueTicksBeforeIdle = 0,
+    dueTicksAfterService = 0,
+    idleImmediateSpins = 0,
+    idleImmediateProbeStartedAt,
+    overdueWakePending = false,
+    needsTimerYield = false,
+} = {}) {
+    let selectedContinuation = nextContinuation;
+    const dueTicksPending = dueTicksAfterService > 0 ||
+        dueTicksBeforeIdle > 0;
+    const readyPollPending = readyAfterDispatch;
+    if (dispatched === 0) {
+        if (dueTicksBeforeIdle > 0 || dueTicksAfterService > 0 ||
+            readyAfterDispatch) {
+            selectedContinuation = "immediate";
+        }
+        else if (!(selectedContinuation === "immediate" &&
+            idleImmediateSpins > 0 &&
+            Number.isFinite(idleImmediateProbeStartedAt)) &&
+            !overdueWakePending) {
+            selectedContinuation = "idle";
+        }
+    }
+    const continuation = dueTicksPending || readyPollPending
+        ? "immediate"
+        : needsTimerYield ? "timer-yield" : selectedContinuation;
+    return {
+        continuation,
+        selectedContinuation,
+        dueTicksPending,
+        readyPollPending,
+        strictGatesChanged: false,
     };
 }
 
@@ -1862,6 +1924,73 @@ assert.deepEqual(modelIdleContinuation({
         probeStartedAt: undefined,
         overdueWakePending: false,
     }, "fair-ready candidate was parked after a budgeted zero-dispatch turn");
+}
+
+// Full finalizer continuation regression.  A callback can dispatch no poll
+// while the post-dispatch readiness probe still sees a fair candidate.  That
+// state must win over an earlier/idle continuation and must survive the
+// finalizer without changing any strict gate.
+{
+    const fairReady = modelFinalizerContinuation({
+        dispatched: 0,
+        nextContinuation: "idle",
+        readyAfterDispatch: true,
+        dueTicksBeforeIdle: 0,
+        dueTicksAfterService: 0,
+        needsTimerYield: true,
+    });
+    assert.deepEqual(fairReady, {
+        continuation: "immediate",
+        selectedContinuation: "immediate",
+        dueTicksPending: false,
+        readyPollPending: true,
+        strictGatesChanged: false,
+    }, "ready zero-dispatch turn was overwritten by timer-yield finalization");
+
+    const idle = modelFinalizerContinuation({
+        dispatched: 0,
+        nextContinuation: "immediate",
+        readyAfterDispatch: false,
+        dueTicksBeforeIdle: 0,
+        dueTicksAfterService: 0,
+        idleImmediateSpins: 0,
+    });
+    assert.equal(idle.continuation, "idle",
+        "quiescent zero-dispatch turn did not use idle backoff");
+
+    const activeProbe = modelFinalizerContinuation({
+        dispatched: 0,
+        nextContinuation: "immediate",
+        readyAfterDispatch: false,
+        idleImmediateSpins: 1,
+        idleImmediateProbeStartedAt: 100,
+    });
+    assert.equal(activeProbe.continuation, "immediate",
+        "active near-due probe was cleared by zero-dispatch finalization");
+
+    const dueTickBeatsYield = modelFinalizerContinuation({
+        dispatched: 0,
+        nextContinuation: "idle",
+        readyAfterDispatch: false,
+        dueTicksAfterService: 1,
+        needsTimerYield: true,
+    });
+    assert.deepEqual(dueTickBeatsYield, {
+        continuation: "immediate",
+        selectedContinuation: "immediate",
+        dueTicksPending: true,
+        readyPollPending: false,
+        strictGatesChanged: false,
+    }, "due PLAY tick was not retained on the immediate continuation");
+
+    const periodicYield = modelFinalizerContinuation({
+        dispatched: 1,
+        nextContinuation: "immediate",
+        readyAfterDispatch: false,
+        needsTimerYield: true,
+    });
+    assert.equal(periodicYield.continuation, "timer-yield",
+        "timer-yield cadence changed for a dispatched callback");
 }
 
 // A queued inbound frame does not bypass nextPollDueAt.  This is the
