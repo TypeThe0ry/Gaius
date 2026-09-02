@@ -93,6 +93,19 @@ const ownerContract = {
         "late retired-owner callbacks can still rebind static accounting"),
 };
 
+const completeOwnerPacketStart = schedulerSource.indexOf(
+    "private static void completeOwnerPacket");
+const completeOwnerPacketEnd = schedulerSource.indexOf(
+    "\n    private static void queueOwnerPacket", completeOwnerPacketStart);
+assert.ok(completeOwnerPacketStart >= 0 && completeOwnerPacketEnd > completeOwnerPacketStart,
+    "completeOwnerPacket boundary changed; audit retired handler unwind before updating this smoke");
+const completeOwnerPacketBody = schedulerSource.slice(
+    completeOwnerPacketStart, completeOwnerPacketEnd);
+const retiredHandlerMirrorGuard = requireMatch(
+    completeOwnerPacketBody,
+    /if\s*\(\s*\(\s*packetProcessorOwner\s*==\s*ledger\.owner\s*&&\s*packetProcessorGeneration\s*==\s*ledger\.generation\s*\)\s*\|\|\s*\(\s*packetProcessorOwner\s*==\s*null\s*&&\s*queuedPacketHandleOwner\s*==\s*ledger\.owner\s*&&\s*ledger\.retired\s*\)\s*\)\s*\{\s*queuedPacketHandleDepth\s*=\s*ledger\.queuedPacketHandleDepth;/u,
+    "retired handler unwind must mirror depth only for the matching owner or its in-flight close");
+
 const ownerResetStart = schedulerSource.indexOf(
     "public static void reset(Object owner)");
 const ownerResetEnd = schedulerSource.indexOf(
@@ -846,6 +859,73 @@ function testConflictResetRebindFailClosed() {
     };
 }
 
+// A PacketProcessor.close may run from inside a queued handler.  In that window the owner is
+// retired and the global owner slot is intentionally empty until packetProcessed() unwinds the
+// handler.  The legacy depth mirror must follow that retired owner's completion, but a late
+// callback after a fresh owner binds must never overwrite the fresh mirror.
+function testCloseInHandlerRebind() {
+    const ownerA = "processor-A";
+    const ownerB = "processor-B";
+    const ledgerA = {owner: ownerA, generation: 1, queuedPacketHandleDepth: 1, retired: false};
+    let packetProcessorOwner = ownerA;
+    let packetProcessorGeneration = ledgerA.generation;
+    let queuedPacketHandleOwner = ownerA;
+    let queuedPacketHandleDepth = 1;
+    let packetProcessorOwnerConflict = false;
+    let packetProcessorAccountingValid = true;
+    const packetProcessorConflictPoisoned = false;
+
+    // Simulate reset(A) from inside the handler.  The owner slot is empty, but the handler scope
+    // remains owned by A so the final packetProcessed(A) can release it.
+    ledgerA.retired = true;
+    ledgerA.queuedPacketHandleDepth = 1;
+    packetProcessorOwner = null;
+    packetProcessorGeneration = 2;
+    packetProcessorOwnerConflict = true;
+    packetProcessorAccountingValid = false;
+
+    ledgerA.queuedPacketHandleDepth--;
+    const mirrorDuringRetiredUnwind =
+        (packetProcessorOwner === ledgerA.owner && packetProcessorGeneration === ledgerA.generation) ||
+        (packetProcessorOwner === null && queuedPacketHandleOwner === ledgerA.owner && ledgerA.retired);
+    assert.equal(mirrorDuringRetiredUnwind, true,
+        "close-in-handler completion must mirror the retired owner's remaining depth");
+    if (mirrorDuringRetiredUnwind) queuedPacketHandleDepth = ledgerA.queuedPacketHandleDepth;
+    if (queuedPacketHandleDepth === 0 && packetProcessorOwner === null &&
+            !packetProcessorConflictPoisoned) {
+        packetProcessorOwnerConflict = false;
+        packetProcessorAccountingValid = true;
+    }
+    assert.equal(queuedPacketHandleDepth, 0);
+    assert.equal(packetProcessorOwnerConflict, false,
+        "handler unwind must release the temporary conflict before a fresh owner binds");
+    assert.equal(packetProcessorAccountingValid, true);
+
+    // B binds after A's unwind.  A's late callback must not overwrite B's mirror.
+    packetProcessorOwner = ownerB;
+    packetProcessorGeneration = 3;
+    queuedPacketHandleOwner = ownerB;
+    queuedPacketHandleDepth = 2;
+    const legacyDepthBeforeLateA = queuedPacketHandleDepth;
+    const lateAReturnsToMirror =
+        (packetProcessorOwner === ledgerA.owner && packetProcessorGeneration === ledgerA.generation) ||
+        (packetProcessorOwner === null && queuedPacketHandleOwner === ledgerA.owner && ledgerA.retired);
+    assert.equal(lateAReturnsToMirror, false,
+        "retired owner callback must not mirror over a fresh owner");
+    if (lateAReturnsToMirror) queuedPacketHandleDepth = ledgerA.queuedPacketHandleDepth;
+    assert.equal(queuedPacketHandleDepth, legacyDepthBeforeLateA);
+
+    return {
+        closeInHandlerRebind: packetProcessorOwner === ownerB &&
+            packetProcessorOwnerConflict === false && packetProcessorAccountingValid === true &&
+            queuedPacketHandleDepth === 2,
+        retiredOwnerDepthAfterUnwind: ledgerA.queuedPacketHandleDepth,
+        freshOwnerDepthAfterLateRetiredCallback: queuedPacketHandleDepth,
+        lateRetiredCallbackMirrored: lateAReturnsToMirror,
+        classification: "close-in-handler-owner-unwind-model-not-runtime-proof",
+    };
+}
+
 // A bounded tombstone ring is useful for recent callbacks, but it is not a strict proof across
 // repeated lifecycle churn.  This model retains every generation token so the required owner-1
 // through owner-9 late-callback case is explicit; the source gate below reports whether the Java
@@ -890,10 +970,12 @@ const boundedOwnerClaim = testBoundedOwnerClaimFailClosed();
 const retiredOwnerLifecycle = testRetiredOwnerLifecycle();
 const conflictResetRebind = testConflictResetRebindFailClosed();
 const retiredOwnerNineGenerationChurn = testRetiredOwnerNineGenerationChurn();
+const closeInHandlerRebind = testCloseInHandlerRebind();
 
 const staticContract = {
     schedulerGlobalFields,
     ownerContract,
+    retiredHandlerMirrorGuard,
     ownerResetGuard,
     ownerFallbackContract,
     resetClearsRuntimeState,
@@ -923,6 +1005,7 @@ const result = {
         retiredOwnerLifecycle,
         conflictResetRebind,
         retiredOwnerNineGenerationChurn,
+        closeInHandlerRebind,
     },
     gates: {
         supportedChannelCloseDoesNotResetAccounting: supported.isolation,
@@ -944,6 +1027,8 @@ const result = {
             retiredOwnerLifecycle.staleOwnerCannotPolluteFreshOwner === true &&
             retiredOwnerLifecycle.concurrentSecondOwnerFailClosed === true,
         conflictResetRebindFailClosed: conflictResetRebind.failClosed === true,
+        closeInHandlerRebind: closeInHandlerRebind.closeInHandlerRebind === true &&
+            closeInHandlerRebind.lateRetiredCallbackMirrored === false,
         retiredOwnerNineGenerationChurnFailClosed:
             retiredOwnerNineGenerationChurn.lateCallbackRejected === true &&
             retiredOwnerNineGenerationChurn.ownersCreated === 9,
@@ -964,6 +1049,7 @@ const result = {
             "bounded owner-claim model disables shared accounting on a second owner and ignores foreign/reset/stale-generation events",
             "bounded retired-owner tombstones reject late callbacks, including explicit lifecycle binds",
             "overlapping-owner reset/rebind model requires conflict to stay poisoned until foreign owner retirement",
+            "close-in-handler owner unwind releases its temporary conflict before a fresh owner binds",
             "owner-1 through owner-9 generation-churn model rejects a late owner-1 callback",
             "Node relay/channel close tests are separate from Java PacketProcessor evidence",
         ],

@@ -447,7 +447,9 @@ public final class BrowserPacketScheduler {
         ledger.queuedPacketHandleDepth--;
         // Keep the legacy depth mirror coherent while this owner is current.  A late callback from
         // a retired owner must never overwrite the mirror belonging to a fresh PacketProcessor.
-        if (packetProcessorOwner == ledger.owner && packetProcessorGeneration == ledger.generation) {
+        if ((packetProcessorOwner == ledger.owner && packetProcessorGeneration == ledger.generation)
+                || (packetProcessorOwner == null && queuedPacketHandleOwner == ledger.owner
+                && ledger.retired)) {
             queuedPacketHandleDepth = ledger.queuedPacketHandleDepth;
         }
         long completedHandleNanos = -1L;
