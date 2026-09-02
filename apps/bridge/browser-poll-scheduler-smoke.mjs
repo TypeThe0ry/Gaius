@@ -71,6 +71,15 @@ assert.match(source, /const PLAY_TICK_TIMING_SAMPLE_LIMIT = 64/u,
 assert.match(source,
     /const PLAY_TICK_TIMING_RETENTION = ["']last-64-chronological["']/u,
     "PLAY tick timing retention policy drifted");
+assert.match(source,
+    /const PLAY_TICK_SLOW_SAMPLE_THRESHOLD_MILLIS = 60/u,
+    "slow PLAY tick diagnostic threshold drifted");
+assert.match(source,
+    /const PLAY_TICK_SLOW_SAMPLE_LIMIT = 64/u,
+    "slow PLAY tick diagnostic ring limit drifted");
+assert.match(source,
+    /const PLAY_TICK_SLOW_SAMPLE_RETENTION = ["']largest-gap-desc-sequence-asc["']/u,
+    "slow PLAY tick retention policy drifted");
 // Per-client poll phase evidence is deliberately a diagnostic ring.  Keep the
 // schema/caps visible at source level so a scheduler refactor cannot silently
 // turn it into an unbounded trace or alter the strict frame gate.
@@ -140,6 +149,12 @@ for (const field of [
     "playTickTimingResult(",
     "playTickTimingSamplesTotal",
     "playTickTimingSamplesDropped",
+    "PLAY_TICK_SLOW_SAMPLE_THRESHOLD_MILLIS",
+    "PLAY_TICK_SLOW_SAMPLE_LIMIT",
+    "PLAY_TICK_SLOW_SAMPLE_RETENTION",
+    "slowSamplesTotal",
+    "slowSamplesDropped",
+    "slowSamples",
 ]) {
     assert.match(source, new RegExp(field.replace(/[().]/gu, "\\$&"), "u"),
         `PLAY tick timing telemetry omitted ${field}`);
@@ -382,8 +397,16 @@ assert.match(schedulerSource, /callbackFinalizationTail/u,
 assert.match(schedulerSource, /servicePlayTick/u);
 assert.match(schedulerSource, /MAX_PLAY_TICKS_PER_SCHEDULER_CALLBACK/u);
 assert.match(schedulerSource,
-    /const tickNow = performance\.now\(\);[\s\S]*?if\s*\(!isPlayTickDue\(candidate,\s*tickNow\)\)\s*continue;[\s\S]*?candidate\.servicePlayTick\(\s*tickNow,\s*callbackSequenceNumber,\s*trigger,\s*callbackPhase\)/u,
+    /const tickNow = performance\.now\(\);[\s\S]*?if\s*\(!isPlayTickDue\(candidate,\s*tickNow\)\)\s*continue;[\s\S]*?candidate\.servicePlayTick\(\s*tickNow,\s*callbackSequenceNumber,\s*trigger,\s*callbackPhase(?:,\s*tickSchedulerContext)?\)/u,
     "scheduler did not pass PLAY tick callback provenance");
+assert.match(schedulerSource, /tickSchedulerContext/u,
+    "scheduler did not expose bounded tick attribution context");
+assert.match(schedulerSource, /budgetRemainingMillis/u,
+    "tick attribution context lost callback budget remaining");
+assert.match(schedulerSource, /callbackFinishedAtMillis/u,
+    "tick attribution context lost callback finish timestamp");
+assert.match(schedulerSource, /schedulerNextContinuation/u,
+    "tick attribution context lost selected continuation");
 assert.match(schedulerSource, /isPlayTickDue/u,
     "scheduler must inspect unserviced PLAY tick deadlines before idling");
 assert.match(schedulerSource,
@@ -954,6 +977,30 @@ function orderedPlayTickTimingSamples(state) {
         ? 0 : state.nextIndex;
     return Array.from({ length: state.count }, (_, offset) =>
         state.samples[(firstIndex + offset) % PLAY_TICK_TIMING_MODEL_LIMIT]);
+}
+
+// Model the production largest-gap ring used to retain callback provenance for
+// strict-threshold tick overruns.  It is deliberately separate from the
+// chronological ring and never participates in continuation or gate decisions.
+function retainPlayTickSlowSampleModel(state, candidate) {
+    const gap = Number(candidate?.previousGapMillis);
+    if (!Number.isFinite(gap) || gap < 60) return false;
+    state.total++;
+    state.samples.push({
+        ...candidate,
+        slowThresholdMillis: 60,
+        diagnosticOnly: true,
+        strictGatesChanged: false,
+        independentExecution: false,
+    });
+    state.samples.sort((left, right) =>
+        Number(right.previousGapMillis) - Number(left.previousGapMillis) ||
+        left.sequence - right.sequence);
+    if (state.samples.length > 64) {
+        state.samples.length = 64;
+        state.dropped++;
+    }
+    return true;
 }
 
 function modelIsPlayTickDue(state, now) {
@@ -1861,6 +1908,48 @@ function retainPollPhaseSample(state, candidate) {
     }
     assert.equal(ordered.at(-1).skipPeriods, 2,
         "PLAY tick timing model lost skip-period evidence");
+}
+
+// The slow-gap ring must retain the largest strict-threshold candidates even
+// after the chronological ring has wrapped.  Fast samples stay out of the
+// diagnostic ring, and overflow is explicit rather than silently overwriting
+// the evidence needed to correlate a callback sequence.
+{
+    const slow = { total: 0, dropped: 0, samples: [] };
+    assert.equal(retainPlayTickSlowSampleModel(slow, {
+        sequence: 1, previousGapMillis: 59.999,
+        schedulerCallbackSequence: 10, trigger: "immediate",
+    }), false, "sub-threshold tick gap entered the slow ring");
+    for (let sequence = 2; sequence <= 66; sequence++) {
+        retainPlayTickSlowSampleModel(slow, {
+            sequence,
+            previousGapMillis: 60 + sequence / 1000,
+            schedulerCallbackSequence: sequence + 100,
+            trigger: sequence % 2 === 0 ? "timer-yield" : "immediate",
+        });
+    }
+    assert.equal(slow.total, 65,
+        "slow tick ring did not count every threshold candidate");
+    assert.equal(slow.samples.length, 64,
+        "slow tick ring exceeded its hard limit");
+    assert.equal(slow.dropped, 1,
+        "slow tick ring dropped-count did not track overflow");
+    assert.equal(slow.samples[0].sequence, 66,
+        "slow tick ring did not retain the largest gap first");
+    assert.equal(slow.samples.at(-1).sequence, 3,
+        "slow tick ring did not evict the smallest retained gap");
+    assert.ok(slow.samples.every((sample) =>
+        sample.previousGapMillis >= 60 && sample.diagnosticOnly === true &&
+        sample.strictGatesChanged === false),
+    "slow tick ring retained invalid or gate-affecting evidence");
+    for (let index = 1; index < slow.samples.length; index++) {
+        const previous = slow.samples[index - 1];
+        const current = slow.samples[index];
+        assert.ok(previous.previousGapMillis > current.previousGapMillis ||
+            previous.previousGapMillis === current.previousGapMillis &&
+                previous.sequence <= current.sequence,
+        "slow tick ring ordering drifted from gap-desc/sequence-asc");
+    }
 }
 
 // A bounded tick batch must not park the continuation while peers still have

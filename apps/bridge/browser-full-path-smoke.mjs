@@ -304,6 +304,14 @@ const PLAY_TICK_TIMING_TELEMETRY_SCHEMA_VERSION =
     "gaius.browser-client-play-tick-timing.v1";
 const PLAY_TICK_TIMING_SAMPLE_LIMIT = 64;
 const PLAY_TICK_TIMING_RETENTION = "last-64-chronological";
+// Keep a second bounded ring for every tick gap at/above the strict p99
+// threshold.  The chronological ring is useful for cadence reconstruction,
+// but a long soak can evict the exact offending callback before evidence is
+// serialized.  This largest-gap ring is diagnostic-only and never changes the
+// strict tick gate or scheduling policy.
+const PLAY_TICK_SLOW_SAMPLE_THRESHOLD_MILLIS = 60;
+const PLAY_TICK_SLOW_SAMPLE_LIMIT = 64;
+const PLAY_TICK_SLOW_SAMPLE_RETENTION = "largest-gap-desc-sequence-asc";
 // A callback-tail overrun often collapses to one synchronous client poll.
 // Retain a bounded scalar-only phase breakdown so the next run can distinguish
 // bridge dequeue/transform, inflate/parse, packet dispatch, and bookkeeping.
@@ -2247,6 +2255,7 @@ function createFairClientPollScheduler(getClients) {
         let tickDispatchesThisCallback = 0;
         let tickServiceErrorsThisCallback = 0;
         let maxPerTickDurationMillis = 0;
+        const tickSchedulerContexts = ARRIVAL_TRACE_ENABLED ? [] : null;
         let pollCandidatesInspectedThisCallback = 0;
         let fairnessFloorScansThisCallback = 0;
         let fairnessSkipsThisCallback = 0;
@@ -2368,9 +2377,21 @@ function createFairClientPollScheduler(getClients) {
                     tickServicesThisCallback++;
                     playTickServiceCalls++;
                     const tickStartedAt = tickNow;
+                    const tickSchedulerContext = ARRIVAL_TRACE_ENABLED ? {
+                        callbackStartedAtMillis: callbackStartedAt,
+                        callbackScheduledAtMillis: scheduledAt,
+                        workDeadlineAtMillis: workDeadline,
+                        budgetRemainingMillis: Math.max(0, workDeadline - tickNow),
+                        tickAttempts: tickAttemptsThisCallback,
+                        tickServicesBefore: tickServicesThisCallback - 1,
+                        pollDispatchesBefore: dispatched,
+                        budgetReachedBefore: callbackBudgetReached,
+                    } : null;
+                    tickSchedulerContexts?.push(tickSchedulerContext);
                     try {
                         if (candidate.servicePlayTick(
-                            tickNow, callbackSequenceNumber, trigger, callbackPhase)) {
+                            tickNow, callbackSequenceNumber, trigger, callbackPhase,
+                            tickSchedulerContext)) {
                             playTickDispatches++;
                             tickDispatchesThisCallback++;
                         }
@@ -2721,6 +2742,29 @@ function createFairClientPollScheduler(getClients) {
             const continuation = dueTicksPending || readyPollPending
                 ? "immediate"
                 : needsTimerYield ? "timer-yield" : nextContinuation;
+            if (tickSchedulerContexts !== null) {
+                for (const context of tickSchedulerContexts) {
+                    if (context === null || typeof context !== "object") continue;
+                    context.callbackFinishedAtMillis = callbackFinishedAt;
+                    context.callbackDurationRawMillis = callbackDurationMillis;
+                    context.tickServicesAfter = tickServicesThisCallback;
+                    context.pollDispatchesAfter = dispatched;
+                    context.budgetReachedAfter = callbackBudgetReached;
+                    context.nextContinuation = continuation;
+                    for (const sample of [
+                        context.playTickSample, context.playTickSlowSample,
+                    ]) {
+                        if (sample === null || sample === undefined) continue;
+                        sample.schedulerCallbackFinishedAtMillis = callbackFinishedAt;
+                        sample.schedulerCallbackDurationRawMillis =
+                            callbackDurationMillis;
+                        sample.schedulerTickServicesAfter = tickServicesThisCallback;
+                        sample.schedulerPollDispatchesAfter = dispatched;
+                        sample.schedulerBudgetReachedAfter = callbackBudgetReached;
+                        sample.schedulerNextContinuation = continuation;
+                    }
+                }
+            }
             if (callbackDurationMillis >= CALLBACK_TAIL_SLOW_THRESHOLD_MILLIS) {
                 slowCallbackSamplesTotal++;
                 retainSlowCallbackSample({
@@ -3916,6 +3960,14 @@ class BrowserMinecraftClient {
             dropped: 0,
             samples: new Array(PLAY_TICK_TIMING_SAMPLE_LIMIT),
         };
+        // Preserve the largest slow tick gaps separately from the chronological
+        // ring.  This prevents a long soak/reconnect sequence from evicting the
+        // callback provenance for the exact samples that crossed the 60 ms
+        // strict p99 bucket.  The ring is evidence only; it is never consulted
+        // by the scheduler and cannot turn a strict failure into a pass.
+        this.playTickSlowSamplesTotal = 0;
+        this.playTickSlowSamplesDropped = 0;
+        this.playTickSlowSamples = [];
         // Reuse one accumulator per client so the normal (sub-threshold) poll
         // path does not allocate a trace object on every scheduler turn.  A
         // materialized sample is copied into the bounded ring only when the
@@ -5444,6 +5496,32 @@ class BrowserMinecraftClient {
         this.outboundBytes += wire.byteLength;
     }
 
+    retainPlayTickSlowSample(sample) {
+        const gap = Number(sample?.previousGapMillis);
+        if (!Number.isFinite(gap) || gap < PLAY_TICK_SLOW_SAMPLE_THRESHOLD_MILLIS) {
+            return undefined;
+        }
+        this.playTickSlowSamplesTotal++;
+        const retained = {
+            ...sample,
+            slowThresholdMillis: PLAY_TICK_SLOW_SAMPLE_THRESHOLD_MILLIS,
+            diagnosticOnly: true,
+            strictGatesChanged: false,
+            independentExecution: false,
+        };
+        this.playTickSlowSamples.push(retained);
+        this.playTickSlowSamples.sort((left, right) => {
+            const leftGap = Number(left.previousGapMillis) || 0;
+            const rightGap = Number(right.previousGapMillis) || 0;
+            return rightGap - leftGap || left.sequence - right.sequence;
+        });
+        if (this.playTickSlowSamples.length > PLAY_TICK_SLOW_SAMPLE_LIMIT) {
+            this.playTickSlowSamples.length = PLAY_TICK_SLOW_SAMPLE_LIMIT;
+            this.playTickSlowSamplesDropped++;
+        }
+        return retained;
+    }
+
     recordPlayTickTiming({
         dueAtMillis,
         tickAtMillis,
@@ -5453,6 +5531,7 @@ class BrowserMinecraftClient {
         skipPeriods = 0,
         skippedPeriodsTotal = this.playTickSkippedPeriods,
         schedulerPhase = null,
+        schedulerContext = null,
     }) {
         const finiteMillis = (value, allowNull = false) => {
             if (allowNull && (value === null || value === undefined)) return null;
@@ -5478,6 +5557,34 @@ class BrowserMinecraftClient {
             phase: typeof this.phase === "string" ? this.phase : null,
             schedulerPhase: typeof schedulerPhase === "string"
                 ? schedulerPhase : null,
+            schedulerCallbackStartedAtMillis: finiteMillis(
+                schedulerContext?.callbackStartedAtMillis),
+            schedulerCallbackScheduledAtMillis: finiteMillis(
+                schedulerContext?.callbackScheduledAtMillis),
+            schedulerWorkDeadlineAtMillis: finiteMillis(
+                schedulerContext?.workDeadlineAtMillis),
+            schedulerBudgetRemainingMillis: finiteMillis(
+                schedulerContext?.budgetRemainingMillis),
+            schedulerTickAttempts: nonNegativeInteger(
+                schedulerContext?.tickAttempts),
+            schedulerTickServicesBefore: nonNegativeInteger(
+                schedulerContext?.tickServicesBefore),
+            schedulerPollDispatchesBefore: nonNegativeInteger(
+                schedulerContext?.pollDispatchesBefore),
+            schedulerBudgetReachedBefore:
+                schedulerContext?.budgetReachedBefore === true,
+            schedulerCallbackFinishedAtMillis: finiteMillis(
+                schedulerContext?.callbackFinishedAtMillis),
+            schedulerCallbackDurationRawMillis: finiteMillis(
+                schedulerContext?.callbackDurationRawMillis),
+            schedulerTickServicesAfter: nonNegativeInteger(
+                schedulerContext?.tickServicesAfter),
+            schedulerPollDispatchesAfter: nonNegativeInteger(
+                schedulerContext?.pollDispatchesAfter),
+            schedulerBudgetReachedAfter:
+                schedulerContext?.budgetReachedAfter === true,
+            schedulerNextContinuation: typeof schedulerContext?.nextContinuation ===
+                "string" ? schedulerContext.nextContinuation : null,
             strictThresholdMillis: 16.7,
             strictGatesChanged: false,
             diagnosticOnly: true,
@@ -5489,6 +5596,11 @@ class BrowserMinecraftClient {
         ring.samples[index] = sample;
         ring.nextIndex = (index + 1) % PLAY_TICK_TIMING_SAMPLE_LIMIT;
         ring.count = Math.min(PLAY_TICK_TIMING_SAMPLE_LIMIT, ring.count + 1);
+        const slowSample = this.retainPlayTickSlowSample(sample);
+        if (schedulerContext !== null && typeof schedulerContext === "object") {
+            schedulerContext.playTickSample = sample;
+            schedulerContext.playTickSlowSample = slowSample ?? null;
+        }
     }
 
     playTickTimingResult() {
@@ -5516,11 +5628,18 @@ class BrowserMinecraftClient {
             playTickTimingSamplesDropped: ring.dropped,
             droppedSampleCount: ring.dropped,
             samples,
+            slowThresholdMillis: PLAY_TICK_SLOW_SAMPLE_THRESHOLD_MILLIS,
+            slowRetention: PLAY_TICK_SLOW_SAMPLE_RETENTION,
+            slowSamplesTotal: this.playTickSlowSamplesTotal,
+            slowRetainedSampleCount: this.playTickSlowSamples.length,
+            slowSamplesDropped: this.playTickSlowSamplesDropped,
+            slowDroppedSampleCount: this.playTickSlowSamplesDropped,
+            slowSamples: this.playTickSlowSamples.map((sample) => ({ ...sample })),
         };
     }
 
     servicePlayTick(now = performance.now(), schedulerCallbackSequence = null,
-        schedulerTrigger = "direct", schedulerPhase = null) {
+        schedulerTrigger = "direct", schedulerPhase = null, schedulerContext = null) {
         if (!this.playTickActive || this.closed || this.failure !== undefined ||
             this.phase !== "play") return false;
         if (this.pollingPaused) {
@@ -5577,6 +5696,7 @@ class BrowserMinecraftClient {
                 skipPeriods,
                 skippedPeriodsTotal: this.playTickSkippedPeriods,
                 schedulerPhase,
+                schedulerContext,
             });
             return true;
         }
@@ -7263,6 +7383,18 @@ function browserFullPathPerformanceContract() {
                 ],
             },
             callbackFinalizationTail: callbackFinalizationTailContract(),
+            playTickTiming: {
+                schemaVersion: PLAY_TICK_TIMING_TELEMETRY_SCHEMA_VERSION,
+                chronologicalSampleLimit: PLAY_TICK_TIMING_SAMPLE_LIMIT,
+                chronologicalRetention: PLAY_TICK_TIMING_RETENTION,
+                slowThresholdMillis: PLAY_TICK_SLOW_SAMPLE_THRESHOLD_MILLIS,
+                slowSampleLimit: PLAY_TICK_SLOW_SAMPLE_LIMIT,
+                slowRetention: PLAY_TICK_SLOW_SAMPLE_RETENTION,
+                diagnosticOnly: true,
+                strictGatesChanged: false,
+                independentExecution: false,
+                note: "largest slow-gap ring preserves callback provenance without changing cadence",
+            },
             dueState: "side-map-authoritative-client-property-mirror-only",
             immediateInboundPriority: "client-method-buffer-then-bridge",
         },
