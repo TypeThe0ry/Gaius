@@ -111,7 +111,7 @@ assert.match(clientNetwork,
   /BrowserWebSocketChannel\.pumpAllAndReportProgress\(\)/,
   "the independent callback does not execute the existing bounded transport pump");
 assert.match(clientNetwork,
-  /progressed && BrowserWebSocketChannel\.hasPumpableInput\(\)/,
+  /continuationHint && BrowserWebSocketChannel\.hasPumpableInput\(\)/,
   "the independent callback can spin without progress or stop before ready input drains");
 assert.match(packetScheduler,
   /CLIENT_PACKET_DRAIN_TARGET_QUEUE =\s*CLIENT_PACKET_DRAIN_THRESHOLD - 1/,
