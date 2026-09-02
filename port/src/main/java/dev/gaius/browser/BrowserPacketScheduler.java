@@ -237,6 +237,15 @@ public final class BrowserPacketScheduler {
      */
     private static void recordOwnerQueue(
             PacketProcessorLedger ledger, boolean processed, double handleMillis, String handleType) {
+        // A late callback from a retired owner may arrive after a fresh owner has claimed the
+        // runtime.  The bridge API is owner-less, so do not let that stale event overwrite the
+        // fresh owner's queue/pause telemetry.  During the short post-reset unwind there is no
+        // current owner yet; retaining that evidence is safe and lets the frame finalizer report
+        // the retired drain accurately.
+        if (ledger != null && ledger.retired && packetProcessorOwner != null
+                && packetProcessorOwner != ledger.owner) {
+            return;
+        }
         BrowserWebSocketChannel.recordDecodedPacketQueue(
                 aggregateQueuedPackets(), aggregateQueuePaused(), processed, handleMillis, handleType);
     }
@@ -436,9 +445,11 @@ public final class BrowserPacketScheduler {
             return;
         }
         ledger.queuedPacketHandleDepth--;
-        // Keep the legacy depth mirror coherent even when close retired the owner while its
-        // handler was still unwinding.  The owner-aware path remains authoritative.
-        queuedPacketHandleDepth = ledger.queuedPacketHandleDepth;
+        // Keep the legacy depth mirror coherent while this owner is current.  A late callback from
+        // a retired owner must never overwrite the mirror belonging to a fresh PacketProcessor.
+        if (packetProcessorOwner == ledger.owner && packetProcessorGeneration == ledger.generation) {
+            queuedPacketHandleDepth = ledger.queuedPacketHandleDepth;
+        }
         long completedHandleNanos = -1L;
         double handleMillis = -1.0;
         String handleType = null;
