@@ -230,8 +230,8 @@ public final class BrowserClientNetwork {
         }
         pumping = true;
         try {
-            boolean progressed = BrowserWebSocketChannel.pumpAllAndReportProgress();
-            return progressed && BrowserWebSocketChannel.hasPumpableInput();
+            boolean continuationHint = BrowserWebSocketChannel.pumpAllAndReportProgress();
+            return continuationHint && BrowserWebSocketChannel.hasPumpableInput();
         } finally {
             pumping = false;
         }

@@ -78,6 +78,15 @@ assert.match(networkWrapper, /recordJavaPumpSkipped\(\)/);
 assert.match(networkWrapper, /BrowserWebSocketChannel\.pumpAll\(\)/);
 assert.match(networkWrapper, /finally\s*\{/);
 
+const asyncPump = block(
+  network,
+  "private static boolean pumpInbound()",
+  "public static void pumpBrowserChannelsAtFrameBoundary()",
+);
+assert.match(asyncPump, /BrowserWebSocketChannel\.pumpAllAndReportProgress\(\)/);
+assert.match(asyncPump, /boolean continuationHint/);
+assert.match(asyncPump, /continuationHint\s*&&\s*BrowserWebSocketChannel\.hasPumpableInput\(\)/);
+
 const runTickHook = block(
   patcher,
   'method.name.equals("runTick") && method.desc.equals("(Z)V")',
