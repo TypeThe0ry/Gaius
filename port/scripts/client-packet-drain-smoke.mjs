@@ -153,7 +153,7 @@ for (const resetStatement of [
 const rawPump = between(networkSource,
   "private static boolean pumpInbound()", "public static void beginClientPacketFrame()");
 assert.match(rawPump, /BrowserWebSocketChannel\.pumpAllAndReportProgress\(\)/);
-assert.match(rawPump, /progressed && BrowserWebSocketChannel\.hasPumpableInput\(\)/);
+assert.match(rawPump, /continuationHint && BrowserWebSocketChannel\.hasPumpableInput\(\)/);
 assert.doesNotMatch(rawPump, /processQueuedPackets/,
   "raw transport callback synchronously handles ordinary PLAY packets");
 
