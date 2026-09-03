@@ -1227,6 +1227,52 @@ assert.match(fullPathSource,
 assert.match(fullPathSource,
     /client\.chunkBatchCountMismatches, 0/);
 assert.match(fullPathSource,
+    /chunkBatchInterruptedAtTransportDrop/);
+assert.match(fullPathSource,
+    /chunkBatchOpenAtTransportDrop/);
+assert.match(fullPathSource,
+    /chunkBatchPacketsAtTransportDrop/);
+// Deterministic reconnect-boundary model: an intentionally dropped lifecycle
+// may retain exactly one in-flight batch, but only when the boundary was
+// recorded and every completed batch was ACKed.  An unmarked natural tail, a
+// missing ACK, or more than one outstanding batch remains a hard failure.
+const chunkBatchLifecycleAllowed = ({
+    starts,
+    finished,
+    acknowledgements,
+    open,
+    interrupted,
+    openAtDrop,
+    closeReason,
+}) => {
+    if (interrupted) {
+        return openAtDrop === true && closeReason === "java-final-close" &&
+            starts >= finished && starts - finished === (open ? 1 : 0) &&
+            finished === acknowledgements;
+    }
+    return starts === finished && finished === acknowledgements && open === false;
+};
+assert.equal(chunkBatchLifecycleAllowed({
+    starts: 6, finished: 5, acknowledgements: 5, open: true,
+    interrupted: true, openAtDrop: true, closeReason: "java-final-close",
+}), true, "explicit transport-drop batch tail should be admissible");
+assert.equal(chunkBatchLifecycleAllowed({
+    starts: 6, finished: 6, acknowledgements: 6, open: false,
+    interrupted: true, openAtDrop: true, closeReason: "java-final-close",
+}), true, "a dropped batch that finishes before close should remain admissible");
+assert.equal(chunkBatchLifecycleAllowed({
+    starts: 6, finished: 5, acknowledgements: 5, open: true,
+    interrupted: false, openAtDrop: false, closeReason: "java-final-close",
+}), false, "unmarked natural batch tail must remain a hard failure");
+assert.equal(chunkBatchLifecycleAllowed({
+    starts: 7, finished: 5, acknowledgements: 5, open: true,
+    interrupted: true, openAtDrop: true, closeReason: "java-final-close",
+}), false, "more than one interrupted batch must remain a hard failure");
+assert.equal(chunkBatchLifecycleAllowed({
+    starts: 6, finished: 5, acknowledgements: 4, open: true,
+    interrupted: true, openAtDrop: true, closeReason: "java-final-close",
+}), false, "completed batches without ACK must remain a hard failure");
+assert.match(fullPathSource,
     /acknowledgement\.writeFloatBE\(desiredChunksPerTick, 0\)/);
 assert.match(fullPathSource,
     /function chunkTrackingCapacity\(viewDistance\)/);

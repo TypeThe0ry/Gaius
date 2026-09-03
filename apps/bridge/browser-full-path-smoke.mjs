@@ -1656,12 +1656,35 @@ try {
                 `${client.username} observed an impossible chunk-window capacity`);
             assert.ok(client.chunkBatchAcknowledgements > 0,
                 `${client.username} stress wave did not acknowledge a chunk batch`);
-            assert.equal(client.chunkBatchStarts, client.chunkBatchFinished,
-                `${client.username} stress wave retained an unfinished chunk batch`);
-            assert.equal(client.chunkBatchFinished, client.chunkBatchAcknowledgements,
-                `${client.username} stress wave omitted a chunk-batch ACK`);
-            assert.equal(client.chunkBatchOpen, false,
-                `${client.username} stress wave closed with an open chunk batch`);
+            const intentionallyInterrupted =
+                client.chunkBatchInterruptedAtTransportDrop === true;
+            if (intentionallyInterrupted) {
+                // The stress runner tears down the previous PLAY transport as
+                // soon as the distance target is reached.  A high-throughput
+                // server can therefore have one batch start in flight at the
+                // exact drop boundary.  Accept that one explicit tail only
+                // when the lifecycle recorded the boundary, was finalized by
+                // the Java close hook, and all completed batches were ACKed.
+                assert.equal(client.chunkBatchOpenAtTransportDrop, true,
+                    `${client.username} marked an interruption without an open batch`);
+                assert.equal(client.closeReason, "java-final-close",
+                    `${client.username} interrupted batch did not reach Java final close`);
+                assert.ok(client.chunkBatchStarts >= client.chunkBatchFinished,
+                    `${client.username} chunk-batch counters regressed at transport drop`);
+                assert.equal(client.chunkBatchStarts - client.chunkBatchFinished,
+                    client.chunkBatchOpen ? 1 : 0,
+                    `${client.username} retained more than one interrupted chunk batch`);
+                assert.equal(client.chunkBatchFinished, client.chunkBatchAcknowledgements,
+                    `${client.username} completed chunk batches omitted an ACK`);
+            }
+            else {
+                assert.equal(client.chunkBatchStarts, client.chunkBatchFinished,
+                    `${client.username} stress wave retained an unfinished chunk batch`);
+                assert.equal(client.chunkBatchFinished, client.chunkBatchAcknowledgements,
+                    `${client.username} stress wave omitted a chunk-batch ACK`);
+                assert.equal(client.chunkBatchOpen, false,
+                    `${client.username} stress wave closed with an open chunk batch`);
+            }
             assert.equal(client.chunkBatchProtocolErrors, 0,
                 `${client.username} stress wave reported chunk-batch protocol errors`);
             assert.equal(client.chunkBatchCountMismatches, 0,
@@ -4185,6 +4208,16 @@ class BrowserMinecraftClient {
         this.chunkBatchCountMismatches = 0;
         this.chunkBatchOpen = false;
         this.currentChunkBatchPackets = 0;
+        // A reconnect wave intentionally terminates the previous transport at
+        // an arbitrary PLAY boundary.  Keep an explicit, per-lifecycle marker
+        // when that boundary cuts through one chunk batch so strict validation
+        // can distinguish an intentional transport tail from a natural batch
+        // accounting failure.  This is evidence only; it never repairs or
+        // fabricates a missing server packet.
+        this.chunkBatchInterruptedAtTransportDrop = false;
+        this.chunkBatchOpenAtTransportDrop = false;
+        this.chunkBatchPacketsAtTransportDrop = 0;
+        this.chunkBatchTransportDropAt = undefined;
         this.chunkBatches = [];
         this.playTickPackets = 0;
         this.playTickActive = false;
@@ -5733,6 +5766,11 @@ class BrowserMinecraftClient {
             protocolErrors: this.chunkBatchProtocolErrors,
             countMismatches: this.chunkBatchCountMismatches,
             openAtSnapshot: this.chunkBatchOpen,
+            interruptedAtTransportDrop: this.chunkBatchInterruptedAtTransportDrop,
+            openAtTransportDrop: this.chunkBatchOpenAtTransportDrop,
+            packetsAtTransportDrop: this.chunkBatchPacketsAtTransportDrop,
+            transportDropAtMillis: Number.isFinite(this.chunkBatchTransportDropAt)
+                ? Number(this.chunkBatchTransportDropAt.toFixed(3)) : null,
             retainedBatches: this.chunkBatches.map((batch) => ({ ...batch })),
         };
     }
@@ -6097,6 +6135,17 @@ class BrowserMinecraftClient {
 
     pausePollingForTransportDrop(dropAt = performance.now()) {
         assert.equal(this.closed, false, "cannot pause a closed reconnect client");
+        // The forced reconnect is deliberately a mid-PLAY transport loss.  If
+        // the server was in the middle of a chunk batch, retain that fact on
+        // this old lifecycle.  At most one batch can be open because the
+        // packet handler rejects a repeated start before a finish.
+        if (!this.chunkBatchInterruptedAtTransportDrop) {
+            this.chunkBatchOpenAtTransportDrop = this.chunkBatchOpen;
+            this.chunkBatchPacketsAtTransportDrop = this.chunkBatchOpen
+                ? this.currentChunkBatchPackets : 0;
+            this.chunkBatchInterruptedAtTransportDrop = this.chunkBatchOpen;
+            this.chunkBatchTransportDropAt = this.chunkBatchOpen ? dropAt : undefined;
+        }
         this.pollingPaused = true;
         this.playTickSuspended = true;
         this.nextPlayTickDueAt = undefined;
