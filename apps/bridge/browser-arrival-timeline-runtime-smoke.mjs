@@ -156,6 +156,8 @@ function pollOne(bridge, id) {
 function assertPipelineTimingContract(source) {
     assert.match(source, /'pipeline-end'/u,
         "production arrival timeline lost the pipeline-end event kind");
+    assert.match(source, /'pipeline-complete'/u,
+        "production arrival timeline lost the pipeline-complete event kind");
     const pumpStart = source.indexOf("private boolean pump()");
     const pumpEnd = source.indexOf("private static Int8Array copyBytes", pumpStart);
     assert.ok(pumpStart >= 0 && pumpEnd > pumpStart,
@@ -166,8 +168,13 @@ function assertPipelineTimingContract(source) {
         "pipeline.fireChannelRead(Unpooled.wrappedBuffer(bytes))",
     );
     const end = pumpSource.indexOf('"pipeline-end"');
+    const complete = pumpSource.indexOf('"pipeline-complete"');
+    const readComplete = pumpSource.indexOf("pipeline.fireChannelReadComplete()");
+    const recordPump = pumpSource.indexOf("recordPump(");
     assert.ok(handoff >= 0 && handoff < fire && fire < end,
         "pipeline-end must be recorded after the synchronous pipeline handoff");
+    assert.ok(readComplete >= 0 && readComplete < complete && complete < recordPump,
+        "pipeline-complete must surround the synchronous read-complete boundary");
     assert.match(pumpSource, /double pipelineStarted = 0\.0;/u,
         "pipeline timing start must be scoped per decoded slice");
     assert.match(pumpSource,
@@ -177,8 +184,8 @@ function assertPipelineTimingContract(source) {
         /pipelineElapsed\s*=\s*Math\.max\([\s\S]*?monotonicMillis\(\)\s*-\s*pipelineStarted/u,
         "pipeline-end must carry a monotonic duration");
     assert.match(source,
-        /durationMillis:\s*normalizedKind\s*===\s*'pump-end'\s*\|\|[\s\S]*?normalizedKind\s*===\s*'pipeline-end'/u,
-        "pipeline-end duration must remain in the bounded arrival event");
+        /durationMillis:\s*normalizedKind\s*===\s*'pump-end'\s*\|\|[\s\S]*?normalizedKind\s*===\s*'pipeline-end'[\s\S]*?normalizedKind\s*===\s*'pipeline-complete'/u,
+        "pipeline boundary durations must remain in the bounded arrival event");
     assert.match(source, /perChannelLimit:\s*64/u,
         "pipeline timing must retain the per-channel bound");
     assert.match(source, /globalLimit:\s*256/u,
@@ -294,23 +301,29 @@ async function runCase(source, enabled) {
         bridge.recordArrivalJavaPump(
             1, "pipeline-end", 1, correlationChunk.byteLength, 1.25);
         bridge.recordArrivalJavaPump(
+            1, "pipeline-complete", 1, correlationChunk.byteLength, 0.75);
+        bridge.recordArrivalJavaPump(
             1, "pump-end", 1, correlationChunk.byteLength, 0.5);
         const kinds = stats.arrivalTimeline.events.map((event) => event.kind);
         assert.ok(kinds.includes("pump-begin"));
         assert.ok(kinds.includes("pipeline-handoff"));
         assert.ok(kinds.includes("pipeline-end"));
+        assert.ok(kinds.includes("pipeline-complete"));
         assert.ok(kinds.includes("pump-end"));
         const pipelineHandoff = stats.arrivalTimeline.events.find((event) =>
             event.kind === "pipeline-handoff");
         const pipelineEnd = stats.arrivalTimeline.events.find((event) =>
             event.kind === "pipeline-end");
+        const pipelineComplete = stats.arrivalTimeline.events.find((event) =>
+            event.kind === "pipeline-complete");
         const pumpEnd = stats.arrivalTimeline.events.find((event) =>
             event.kind === "pump-end");
-        assert.ok(pipelineHandoff && pipelineEnd && pumpEnd,
+        assert.ok(pipelineHandoff && pipelineEnd && pipelineComplete && pumpEnd,
             "pipeline timing event sequence is incomplete");
         assert.ok(pipelineHandoff.sequence < pipelineEnd.sequence &&
-            pipelineEnd.sequence < pumpEnd.sequence,
-        "pipeline-end must remain between handoff and pump-end");
+            pipelineEnd.sequence < pipelineComplete.sequence &&
+            pipelineComplete.sequence < pumpEnd.sequence,
+        "pipeline boundary events must remain ordered inside pump");
         assert.equal(pipelineEnd?.durationMillis, 1.25,
             "pipeline-end must retain the measured per-slice duration");
         assert.equal(pipelineEnd?.pumpSequence, pipelineHandoff?.pumpSequence,
@@ -319,6 +332,14 @@ async function runCase(source, enabled) {
             "pipeline-end lost its frame correlation");
         assert.equal(pipelineEnd?.frameBytes, pipelineHandoff?.frameBytes,
             "pipeline-end lost its frame byte metadata");
+        assert.equal(pipelineComplete?.durationMillis, 0.75,
+            "pipeline-complete must retain the measured read-complete duration");
+        assert.equal(pipelineComplete?.pumpSequence, pipelineHandoff?.pumpSequence,
+            "pipeline-complete lost its pump correlation");
+        assert.equal(pipelineComplete?.frameSequence, pipelineHandoff?.frameSequence,
+            "pipeline-complete lost its frame correlation");
+        assert.equal(pipelineComplete?.frameBytes, pipelineHandoff?.frameBytes,
+            "pipeline-complete lost its frame byte metadata");
     }
 
     const result = {

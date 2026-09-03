@@ -397,7 +397,24 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 }
             }
             if (chunks > 0) {
-                pipeline.fireChannelReadComplete();
+                double pipelineCompleteStarted = 0.0;
+                if (arrivalTimelineTracing) {
+                    pipelineCompleteStarted = monotonicMillis();
+                }
+                try {
+                    pipeline.fireChannelReadComplete();
+                } finally {
+                    if (arrivalTimelineTracing) {
+                        double pipelineCompleteElapsed = Math.max(
+                                0.0, monotonicMillis() - pipelineCompleteStarted);
+                        recordArrivalPumpBoundary(
+                                socketId,
+                                "pipeline-complete",
+                                chunks,
+                                bytesPumped,
+                                pipelineCompleteElapsed);
+                    }
+                }
                 recordPump(
                         socketId,
                         chunks,
@@ -3688,6 +3705,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               'pump-begin',
               'pipeline-handoff',
               'pipeline-end',
+              'pipeline-complete',
               'pump-end'
             ]);
             function arrivalTimelineEnabled() {
@@ -3905,7 +3923,8 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 queueDepth: arrivalTimelineQueueDepth(entry),
                 queuedBytes: queuedBytes(entry),
                 durationMillis: normalizedKind === 'pump-end' ||
-                  normalizedKind === 'pipeline-end' ? duration : 0,
+                  normalizedKind === 'pipeline-end' ||
+                  normalizedKind === 'pipeline-complete' ? duration : 0,
                 onmessageAt: lastDequeued && lastDequeued.onmessageAt,
                 bridgeEnqueueAt: lastDequeued && lastDequeued.bridgeEnqueueAt,
                 bridgeDequeueAt: lastDequeued && lastDequeued.bridgeDequeueAt,

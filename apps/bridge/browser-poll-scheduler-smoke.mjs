@@ -561,6 +561,9 @@ assert.match(channelSource,
     /recordArrivalPumpBoundary\([\s\S]*?socketId,\s*['"]pipeline-handoff['"]/u,
     "Java pipeline handoff marker is missing");
 assert.match(channelSource,
+    /recordArrivalPumpBoundary\([\s\S]*?socketId,\s*['"]pipeline-complete['"]/u,
+    "Java pipeline-complete marker is missing");
+assert.match(channelSource,
     /recordArrivalPumpBoundary\([\s\S]*?socketId,\s*['"]pump-end['"]/u,
     "Java pump-end handoff marker is missing");
 assert.match(channelSource,
