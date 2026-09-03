@@ -320,6 +320,11 @@ public final class BrowserPacketScheduler {
         packetProcessorFallbackReason = reason;
         packetProcessorOwnerConflict = true;
         packetProcessorAccountingValid = false;
+        // An owner-less/unknown callback during a retired-handler unwind is evidence that the
+        // lifecycle identity is no longer unambiguous.  Keep this poison sticky: the final
+        // packetProcessed(retiredOwner) is allowed to release its own handler scope, but must not
+        // mistake the unknown event for a clean close-in-handler -> fresh-owner transition.
+        packetProcessorConflictPoisoned = true;
     }
 
     private static void startPendingOwnerFrame(PacketProcessorLedger ledger) {

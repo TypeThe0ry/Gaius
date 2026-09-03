@@ -93,6 +93,35 @@ const ownerContract = {
         "late retired-owner callbacks can still rebind static accounting"),
 };
 
+const unknownOwnerStart = schedulerSource.indexOf(
+    "private static void noteUnknownPacketProcessorOwner(String reason)");
+const unknownOwnerEnd = schedulerSource.indexOf(
+    "\n    private static void startPendingOwnerFrame", unknownOwnerStart);
+assert.ok(unknownOwnerStart >= 0 && unknownOwnerEnd > unknownOwnerStart,
+    "unknown-owner callback boundary changed; audit sticky conflict handling before updating this smoke");
+const unknownOwnerBody = schedulerSource.slice(unknownOwnerStart, unknownOwnerEnd);
+const unknownOwnerPoisonGuard = {
+    unknownOwnerEventPoisons: requireMatch(
+        unknownOwnerBody,
+        /packetProcessorOwnerConflict\s*=\s*true;[\s\S]*packetProcessorAccountingValid\s*=\s*false;[\s\S]*packetProcessorConflictPoisoned\s*=\s*true;/u,
+        "unknown PacketProcessor owner events must poison the accounting epoch"),
+};
+
+const ownerPacketProcessedStart = schedulerSource.indexOf(
+    "public static void packetProcessed(Object owner)");
+const ownerPacketProcessedEnd = schedulerSource.indexOf(
+    "\n    /** Mirrors PacketProcessor.close", ownerPacketProcessedStart);
+assert.ok(ownerPacketProcessedStart >= 0 && ownerPacketProcessedEnd > ownerPacketProcessedStart,
+    "owner-aware packetProcessed boundary changed; audit retired-handler recovery before updating this smoke");
+const ownerPacketProcessedBody = schedulerSource.slice(
+    ownerPacketProcessedStart, ownerPacketProcessedEnd);
+const retiredUnwindPoisonGuard = {
+    recoveryRequiresNoPoison: requireMatch(
+        ownerPacketProcessedBody,
+        /queuedPacketHandleDepth\s*==\s*0[\s\S]*packetProcessorOwner\s*==\s*null[\s\S]*!packetProcessorConflictPoisoned/u,
+        "retired-owner unwind can restore valid accounting after an unknown-owner poison"),
+};
+
 const currentLedgerStart = schedulerSource.indexOf(
     "private static PacketProcessorLedger currentPacketProcessorLedger()");
 const currentLedgerEnd = schedulerSource.indexOf(
@@ -1034,6 +1063,76 @@ function testCloseInHandlerRebind() {
     };
 }
 
+// An unknown owner callback can interleave with the final packetProcessed(A) while A is already
+// retired by close-in-handler.  The retired A completion must still release A's handler depth,
+// but it must not clear the conflict/accounting-invalid bits set by the unknown B event.
+function testUnknownOwnerRetiredUnwindSticky() {
+    const ownerA = "processor-A";
+    const unknownOwnerB = "processor-B";
+    const ledgerA = {owner: ownerA, generation: 1, queuedPacketHandleDepth: 1, retired: true};
+    let packetProcessorOwner = null;
+    let packetProcessorOwnerConflict = true;
+    let packetProcessorAccountingValid = false;
+    let packetProcessorConflictPoisoned = false;
+    let queuedPacketHandleOwner = ownerA;
+    let queuedPacketHandleDepth = 1;
+    let unknownOwnerEvents = 0;
+
+    // Mirrors packetProcessed(B) -> noteUnknownPacketProcessorOwner(): B has no retained ledger,
+    // so it cannot touch A's queue/depth, but the lifecycle identity is now permanently ambiguous.
+    const retainedLedgerForB = null;
+    assert.equal(retainedLedgerForB, null,
+        `${unknownOwnerB} must not have a retained ledger in the unknown-owner interleave`);
+    unknownOwnerEvents++;
+    packetProcessorOwnerConflict = true;
+    packetProcessorAccountingValid = false;
+    packetProcessorConflictPoisoned = true;
+
+    // Mirrors packetProcessed(A) -> completeOwnerPacket(ledgerA). The explicit retired-owner path
+    // still unwinds A's handler and the legacy mirror, but the recovery branch is gated by poison.
+    ledgerA.queuedPacketHandleDepth--;
+    const retiredOwnerMirrored = packetProcessorOwner === null &&
+        queuedPacketHandleOwner === ledgerA.owner && ledgerA.retired;
+    assert.equal(retiredOwnerMirrored, true,
+        "retired A handler must still release its own depth after unknown B event");
+    if (retiredOwnerMirrored) queuedPacketHandleDepth = ledgerA.queuedPacketHandleDepth;
+    const recoveryAttempted = queuedPacketHandleDepth === 0 && packetProcessorOwner === null &&
+        !packetProcessorConflictPoisoned;
+    if (recoveryAttempted) {
+        packetProcessorOwnerConflict = false;
+        packetProcessorAccountingValid = true;
+    }
+    assert.equal(recoveryAttempted, false,
+        "retired A unwind must not clear a sticky poison raised by unknown B");
+    assert.equal(queuedPacketHandleDepth, 0);
+    assert.equal(packetProcessorOwnerConflict, true);
+    assert.equal(packetProcessorAccountingValid, false);
+    assert.equal(packetProcessorConflictPoisoned, true);
+
+    // A fresh owner must remain on the conservative fallback after this ambiguous interleave.
+    const freshOwnerAccepted = !packetProcessorConflictPoisoned &&
+        packetProcessorOwner === null;
+    assert.equal(freshOwnerAccepted, false,
+        "unknown-owner poison must reject a fresh owner until the runtime is replaced");
+
+    return {
+        unknownOwner: unknownOwnerB,
+        unknownOwnerEvents,
+        retiredOwnerMirrored,
+        retiredOwnerDepthAfterUnwind: ledgerA.queuedPacketHandleDepth,
+        recoveryAttempted,
+        ownerConflictAfterUnwind: packetProcessorOwnerConflict,
+        accountingValidAfterUnwind: packetProcessorAccountingValid,
+        conflictPoisonedAfterUnwind: packetProcessorConflictPoisoned,
+        freshOwnerAccepted,
+        failClosed: retiredOwnerMirrored && queuedPacketHandleDepth === 0 &&
+            recoveryAttempted === false && packetProcessorOwnerConflict === true &&
+            packetProcessorAccountingValid === false &&
+            packetProcessorConflictPoisoned === true && freshOwnerAccepted === false,
+        classification: "unknown-owner-retired-unwind-sticky-model-not-runtime-proof",
+    };
+}
+
 // Retired ledger slots are intentionally never reused.  Once the bounded owner table is full,
 // a fresh owner must stay on the one-call vanilla fallback instead of risking an old callback
 // being interpreted as the new generation.  This is a model/static guard, not live TeaVM proof.
@@ -1133,6 +1232,7 @@ const retiredOwnerLifecycle = testRetiredOwnerLifecycle();
 const conflictResetRebind = testConflictResetRebindFailClosed();
 const retiredOwnerNineGenerationChurn = testRetiredOwnerNineGenerationChurn();
 const closeInHandlerRebind = testCloseInHandlerRebind();
+const unknownOwnerRetiredUnwind = testUnknownOwnerRetiredUnwindSticky();
 const ledgerSlotExhaustion = testLedgerSlotExhaustion();
 
 const staticContract = {
@@ -1143,6 +1243,8 @@ const staticContract = {
     ownerResetGuard,
     ownerFallbackContract,
     currentLedgerGuard,
+    unknownOwnerPoisonGuard,
+    retiredUnwindPoisonGuard,
     resetClearsRuntimeState,
     closeOrder,
     channelCloseIsolation,
@@ -1171,6 +1273,7 @@ const result = {
         conflictResetRebind,
         retiredOwnerNineGenerationChurn,
         closeInHandlerRebind,
+        unknownOwnerRetiredUnwind,
         ledgerSlotExhaustion,
     },
     gates: {
@@ -1200,6 +1303,9 @@ const result = {
         closeInHandlerRebind: closeInHandlerRebind.closeInHandlerRebind === true &&
             closeInHandlerRebind.lateRetiredCallbackMirrored === false &&
             closeInHandlerRebind.ownerlessLedgerDuringRetiredUnwind === null,
+        unknownOwnerRetiredUnwindFailClosed: unknownOwnerRetiredUnwind.failClosed === true &&
+            unknownOwnerRetiredUnwind.unknownOwnerEvents === 1 &&
+            unknownOwnerRetiredUnwind.retiredOwnerDepthAfterUnwind === 0,
         ledgerSlotExhaustionFailClosed:
             ledgerSlotExhaustion.slotExhaustions === 1 &&
             ledgerSlotExhaustion.exhaustionPoisoned === true &&
@@ -1229,6 +1335,7 @@ const result = {
             "bounded retired-owner tombstones reject late callbacks, including explicit lifecycle binds",
             "overlapping-owner reset/rebind model requires conflict to stay poisoned until foreign owner retirement",
             "close-in-handler owner unwind releases its temporary conflict before a fresh owner binds",
+            "unknown-owner callback poison remains sticky through retired-handler unwind",
             "bounded ledger exhaustion stays poisoned and falls back to vanilla instead of reusing retired slots",
             "owner-1 through owner-9 generation-churn model rejects a late owner-1 callback",
             "Node relay/channel close tests are separate from Java PacketProcessor evidence",
