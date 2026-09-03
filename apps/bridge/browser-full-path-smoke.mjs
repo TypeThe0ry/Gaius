@@ -4285,6 +4285,12 @@ class BrowserMinecraftClient {
         // entire history during long stress runs.
         this.phaseScanSource = null;
         this.phaseScanIndex = 0;
+        // BrowserWebSocketChannel keeps this source as a bounded in-place ring.
+        // A length cursor alone misses the push+splice rollover case because
+        // the array identity and length both remain unchanged.  Retain the
+        // last event object so a rollover can be detected without rescanning
+        // already-published events into the compatibility list.
+        this.phaseScanCursorEvent = null;
         // A replacement client may inherit only the previous lifecycle's last
         // decode timestamp as a diagnostic seed.  This lets the first decoded
         // packet after reconnect expose the full reconnect gap without sharing
@@ -5980,19 +5986,29 @@ class BrowserMinecraftClient {
             ? this.stats.connectPhases : [];
         const sourceReplaced = this.phaseScanSource !== source;
         const sourceTruncated = source.length < this.phaseScanIndex;
+        const cursorIndex = !sourceReplaced && this.phaseScanCursorEvent !== null
+            ? source.indexOf(this.phaseScanCursorEvent) : -1;
+        const sourceRolled = !sourceReplaced && !sourceTruncated &&
+            this.phaseScanCursorEvent !== null && cursorIndex < 0;
         if (sourceReplaced || sourceTruncated) {
             // A replaced/truncated source invalidates the cursor. Rebuild the
             // compatibility array from the current source while retaining the
             // WeakSet so previously observed objects are not emitted twice.
             this.phaseScanSource = source;
             this.phaseScanIndex = 0;
+            this.phaseScanCursorEvent = null;
             this.connectPhases = [];
         }
-        for (let index = this.phaseScanIndex; index < source.length; index++) {
+        const scanStart = sourceReplaced || sourceTruncated ? 0
+            : sourceRolled ? 0
+            : this.phaseScanCursorEvent === null ? this.phaseScanIndex
+            : cursorIndex + 1;
+        for (let index = scanStart; index < source.length; index++) {
             const event = source[index];
             if (event === null || typeof event !== "object" || event.id !== this.id)
                 continue;
-            if (!this.arrivalSeenPhaseEvents.has(event)) {
+            const eventSeen = this.arrivalSeenPhaseEvents.has(event);
+            if (!eventSeen) {
                 this.arrivalSeenPhaseEvents.add(event);
                 const bridgeElapsed = Number(event.elapsedMillis);
                 const bridgeMonotonicAt = Number.isFinite(this.connectStartedAt) &&
@@ -6004,10 +6020,16 @@ class BrowserMinecraftClient {
                     source: "BrowserWebSocketChannel.connect-phase",
                 });
             }
-            this.connectPhases.push(event);
+            // Rebuilds publish every event currently present.  A same-array
+            // ring rollover publishes only newly observed objects; otherwise a
+            // full rescan would append the previous 256 events again.
+            if (sourceReplaced || sourceTruncated || !eventSeen)
+                this.connectPhases.push(event);
         }
         this.phaseScanSource = source;
         this.phaseScanIndex = source.length;
+        this.phaseScanCursorEvent = source.length > 0
+            ? source[source.length - 1] : null;
     }
 
     close(reason = "final-close") {

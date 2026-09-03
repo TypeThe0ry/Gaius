@@ -190,6 +190,16 @@ assert.match(phaseScanSource, /phaseScanSource/u,
     "recordPhases must retain source-array identity for incremental scanning");
 assert.match(phaseScanSource, /phaseScanIndex/u,
     "recordPhases must retain an append cursor for incremental scanning");
+assert.match(phaseScanSource, /phaseScanCursorEvent/u,
+    "recordPhases must retain an event-identity cursor for ring rollover");
+assert.match(phaseScanSource, /source\.indexOf\(this\.phaseScanCursorEvent\)/u,
+    "recordPhases must detect in-place ring rollover by event identity");
+assert.match(phaseScanSource,
+    /sourceRolled[\s\S]*?scanStart[\s\S]*?sourceRolled\s*\?\s*0/u,
+    "ring rollover must rescan the bounded ring without resetting the compatibility history");
+assert.match(phaseScanSource,
+    /if\s*\(sourceReplaced\s*\|\|\s*sourceTruncated\s*\|\|\s*!eventSeen\)\s*\n?\s*this\.connectPhases\.push\(event\)/u,
+    "ring rollover must not duplicate previously published phase events");
 assert.doesNotMatch(phaseScanSource,
     /this\.stats\.connectPhases\.filter\(\(event\) => event\.id === this\.id\)/u,
     "recordPhases reverted to an O(history) filter on every poll");
@@ -823,6 +833,46 @@ function makeModelClients({ dueAt = 100, pending = [] } = {}) {
         failure: undefined,
         dispatchCount: 0,
     }));
+}
+
+// Model the bounded BrowserWebSocketChannel phase ring.  The production
+// source mutates one array in place (push + splice) once it reaches 256
+// entries, so a length-only cursor can permanently skip a newly appended
+// relay-connected event.  This model keeps the event-identity cursor and
+// publishes each object at most once while still rebuilding on replacement.
+const PHASE_RING_MODEL_LIMIT = 256;
+function modelRecordPhases(model) {
+    const source = Array.isArray(model.stats.connectPhases)
+        ? model.stats.connectPhases : [];
+    const sourceReplaced = model.phaseScanSource !== source;
+    const sourceTruncated = source.length < model.phaseScanIndex;
+    const cursorIndex = !sourceReplaced && model.phaseScanCursorEvent !== null
+        ? source.indexOf(model.phaseScanCursorEvent) : -1;
+    const sourceRolled = !sourceReplaced && !sourceTruncated &&
+        model.phaseScanCursorEvent !== null && cursorIndex < 0;
+    if (sourceReplaced || sourceTruncated) {
+        model.phaseScanSource = source;
+        model.phaseScanIndex = 0;
+        model.phaseScanCursorEvent = null;
+        model.connectPhases = [];
+    }
+    const scanStart = sourceReplaced || sourceTruncated ? 0
+        : sourceRolled ? 0
+        : model.phaseScanCursorEvent === null ? model.phaseScanIndex
+        : cursorIndex + 1;
+    for (let index = scanStart; index < source.length; index++) {
+        const event = source[index];
+        if (event === null || typeof event !== "object" || event.id !== model.id)
+            continue;
+        const eventSeen = model.seen.has(event);
+        if (!eventSeen) model.seen.add(event);
+        if (sourceReplaced || sourceTruncated || !eventSeen)
+            model.connectPhases.push(event);
+    }
+    model.phaseScanSource = source;
+    model.phaseScanIndex = source.length;
+    model.phaseScanCursorEvent = source.length > 0
+        ? source[source.length - 1] : null;
 }
 
 // Deterministic model for the near-due idle decision.  A one-millisecond due
@@ -2331,6 +2381,58 @@ assert.deepEqual(modelIdleContinuation({
     assert.equal(result.idle, true, "retired client set did not choose idle backoff");
 }
 
+// In-place phase-ring rollover regression.  The array identity and length are
+// deliberately unchanged after push+splice; the event-identity cursor must
+// still discover the new relay-connected event exactly once without replaying
+// the previous ring into the compatibility history.
+{
+    const phaseModel = {
+        id: "client-0",
+        stats: { connectPhases: [] },
+        connectPhases: [],
+        seen: new WeakSet(),
+        phaseScanSource: null,
+        phaseScanIndex: 0,
+        phaseScanCursorEvent: null,
+    };
+    const phaseSource = phaseModel.stats.connectPhases;
+    for (let index = 0; index < PHASE_RING_MODEL_LIMIT; index++) {
+        phaseSource.push({
+            id: phaseModel.id,
+            phase: index === 127 ? "relay-connected" : `phase-${index}`,
+        });
+    }
+    modelRecordPhases(phaseModel);
+    assert.equal(phaseModel.connectPhases.length, PHASE_RING_MODEL_LIMIT,
+        "initial phase ring was not published in full");
+    assert.equal(phaseModel.connectPhases.filter((event) =>
+        event.phase === "relay-connected").length, 1,
+    "initial relay-connected phase count is wrong");
+    const phaseSourceIdentity = phaseSource;
+    const rolloverEvent = { id: phaseModel.id, phase: "relay-connected" };
+    phaseSource.push(rolloverEvent);
+    phaseSource.splice(0, 1);
+    assert.equal(phaseSource.length, PHASE_RING_MODEL_LIMIT,
+        "phase-ring model did not preserve its hard limit");
+    modelRecordPhases(phaseModel);
+    assert.strictEqual(phaseModel.phaseScanSource, phaseSourceIdentity,
+        "phase-ring rollover replaced the source array");
+    assert.equal(phaseModel.connectPhases.length, PHASE_RING_MODEL_LIMIT + 1,
+        "phase-ring rollover lost or duplicated a phase event");
+    assert.equal(phaseModel.connectPhases.filter((event) =>
+        event.phase === "relay-connected").length, 2,
+    "new relay-connected phase was not captured exactly once");
+    assert.equal(phaseModel.connectPhases.filter((event) =>
+        event === rolloverEvent).length, 1,
+    "rollover event was published more than once");
+    const publishedAfterRollover = phaseModel.connectPhases.length;
+    modelRecordPhases(phaseModel);
+    assert.equal(phaseModel.connectPhases.length, publishedAfterRollover,
+        "phase-ring poll duplicated events without a source mutation");
+    assert.strictEqual(phaseModel.phaseScanCursorEvent, rolloverEvent,
+        "phase-ring cursor did not advance to the newest event");
+}
+
 const results = [];
 for (const kind of ["hybrid", "immediate", "timer-0", "timer-1"]) {
     results.push(await runCandidate(kind));
@@ -2492,6 +2594,14 @@ console.log(JSON.stringify({
         wireAtSource: "unavailable",
         limits: { perChannelEvents: 64, globalEvents: 256 },
         verification: "source-static-only; no Java/TeaVM runtime",
+    },
+    phaseRingRollover: {
+        sourceIdentityPreserved: true,
+        limit: PHASE_RING_MODEL_LIMIT,
+        newRelayConnectedCapturedExactlyOnce: true,
+        priorEventsNotDuplicated: true,
+        diagnosticOnly: true,
+        strictGatesChanged: false,
     },
     results,
 }));
