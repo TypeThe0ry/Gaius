@@ -1321,7 +1321,8 @@ assert.doesNotMatch(fullPathSource,
     /setInterval\(\(\) => \{\s*for \(const client of currentClients\) client\.poll\(\)/,
     "full-path poll scheduler must not fan out every client in one timer callback");
 assert.match(fullPathSource,
-    /pollScheduler: pollScheduler\?\.evidence\(\) \?\? null/);
+    /const pollSchedulerEvidence = pollScheduler\?\.evidence\(\) \?\? null/,
+    "full-path result must capture bounded poll-scheduler evidence");
 assert.match(fullPathSource,
     /while \(framesPolled < MAX_INBOUND_FRAMES_PER_POLL[\s\S]*?packetsRemaining > 0/);
 assert.match(fullPathSource,

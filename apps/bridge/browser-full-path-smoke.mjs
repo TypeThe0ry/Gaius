@@ -23,7 +23,7 @@ import { createServer as createTcpServer } from "node:net";
 import { once } from "node:events";
 import { mkdtemp, mkdir, readFile, writeFile, lstat } from "node:fs/promises";
 import { monitorEventLoopDelay } from "node:perf_hooks";
-import { spawn } from "node:child_process";
+import { execFile as execFileCallback, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -287,6 +287,22 @@ const SCHEDULER_GAP_SLOW_THRESHOLD_MILLIS = 250;
 const SCHEDULER_GAP_STRICT_CALLBACK_THRESHOLD_MILLIS = 16.7;
 const SCHEDULER_GAP_SAMPLE_LIMIT = 64;
 const SCHEDULER_GAP_RETENTION = "largest-gap-or-callback-desc-sequence-asc";
+// Provenance and strict-performance fields are additive to the v2 result.
+// `acceptance.ok` remains the functional/liveness outcome; these fields make
+// it impossible to mistake that broad outcome for a tier-8 no-stall result.
+const FULL_PATH_PROVENANCE_SCHEMA_VERSION =
+    "gaius.browser-full-path-provenance.v1";
+const FULL_PATH_HARNESS_ID = "browser-full-path-node-harness";
+const FULL_PATH_HARNESS_SOURCE = "apps/bridge/browser-full-path-smoke.mjs";
+const FULL_PATH_HARNESS_RESULT_SCHEMA = "browser-full-path-result-v2";
+const FULL_PATH_TEAVM_IDENTIFIER = "teavm-output-not-executed";
+const FULL_PATH_STRICT_PERFORMANCE_SCHEMA_VERSION =
+    "gaius.browser-full-path-performance-strict.v1";
+const FULL_PATH_STRICT_PERFORMANCE_LIMITS = Object.freeze({
+    callbackMaxMillis: SCHEDULER_GAP_STRICT_CALLBACK_THRESHOLD_MILLIS,
+    pollMaxMillis: SCHEDULER_GAP_STRICT_CALLBACK_THRESHOLD_MILLIS,
+    tickMaxMillis: STRESS_LATENCY_DISTRIBUTION_TARGET.playTickGap.maxMillis,
+});
 // Finalization telemetry starts at the existing callback work endpoint and
 // ends after the continuation has been scheduled.  It is deliberately
 // diagnostic-only: callbackDurationRawMillis remains the strict 16.7 ms gate
@@ -497,6 +513,189 @@ const BROWSER_INBOUND_FLOW_WINDOW_SCHEMA =
 // or older runtime cannot inflate strict-result JSON without bound.
 const BROWSER_QUEUED_PACKET_SLOW_EVENT_LIMIT = 64;
 
+function runGitCommand(args) {
+    return new Promise((resolve) => {
+        execFileCallback("git", args, {
+            cwd: repository,
+            encoding: "utf8",
+            maxBuffer: 8 * 1024 * 1024,
+            windowsHide: true,
+        }, (error, stdout, stderr) => {
+            resolve({
+                ok: error === null,
+                stdout: String(stdout ?? ""),
+                stderr: String(stderr ?? ""),
+                error: error === null ? null : {
+                    code: error.code ?? null,
+                    message: String(error.message ?? error),
+                },
+            });
+        });
+    });
+}
+
+async function captureRepositoryGitEvidence() {
+    const capturedAt = new Date().toISOString();
+    const [rootResult, headResult, branchResult, statusResult] = await Promise.all([
+        runGitCommand(["rev-parse", "--show-toplevel"]),
+        runGitCommand(["rev-parse", "HEAD"]),
+        runGitCommand(["branch", "--show-current"]),
+        runGitCommand(["status", "--porcelain=v1", "--untracked-files=all"]),
+    ]);
+    const firstLine = (value) => String(value ?? "")
+        .replaceAll("\r\n", "\n")
+        .replaceAll("\r", "\n")
+        .split("\n")[0]
+        .trim();
+    const gitRoot = firstLine(rootResult.stdout) || null;
+    const head = firstLine(headResult.stdout).toLowerCase();
+    const branch = firstLine(branchResult.stdout) || null;
+    const statusOutput = String(statusResult.stdout ?? "")
+        .replaceAll("\r\n", "\n")
+        .replaceAll("\r", "\n");
+    const statusEntries = statusOutput.split("\n").filter((entry) => entry.length > 0);
+    const resolvedRepository = path.resolve(repository);
+    const resolvedGitRoot = gitRoot === null ? null : path.resolve(gitRoot);
+    const repositoryMatches = resolvedGitRoot !== null &&
+        resolvedGitRoot.toLowerCase() === resolvedRepository.toLowerCase();
+    const headAvailable = headResult.ok && /^[0-9a-f]{40,64}$/u.test(head);
+    const statusAvailable = statusResult.ok;
+    return {
+        schemaVersion: FULL_PATH_PROVENANCE_SCHEMA_VERSION,
+        capturedAt,
+        repository: resolvedRepository,
+        gitRoot,
+        repositoryMatches,
+        head: headAvailable ? head : null,
+        branch,
+        dirty: statusAvailable ? statusEntries.length > 0 : null,
+        statusAvailable,
+        statusEntryCount: statusAvailable ? statusEntries.length : null,
+        statusSha256: statusAvailable
+            ? createHash("sha256").update(statusOutput).digest("hex") : null,
+        available: repositoryMatches && headAvailable && statusAvailable,
+        commandErrors: {
+            root: rootResult.error,
+            head: headResult.error,
+            branch: branchResult.error,
+            status: statusResult.error,
+        },
+    };
+}
+
+function fullPathProvenanceFromGit(gitEvidence, phase) {
+    return {
+        schemaVersion: FULL_PATH_PROVENANCE_SCHEMA_VERSION,
+        phase,
+        capturedAt: gitEvidence?.capturedAt ?? new Date().toISOString(),
+        repository: {
+            path: path.resolve(repository),
+            gitRoot: gitEvidence?.gitRoot ?? null,
+            rootMatches: gitEvidence?.repositoryMatches === true,
+            head: gitEvidence?.head ?? null,
+            branch: gitEvidence?.branch ?? null,
+            dirty: gitEvidence?.dirty ?? null,
+            statusAvailable: gitEvidence?.statusAvailable === true,
+            statusEntryCount: gitEvidence?.statusEntryCount ?? null,
+            statusSha256: gitEvidence?.statusSha256 ?? null,
+            available: gitEvidence?.available === true,
+        },
+        harness: {
+            id: FULL_PATH_HARNESS_ID,
+            source: FULL_PATH_HARNESS_SOURCE,
+            sourcePath: repositoryRelativePath(fileURLToPath(import.meta.url)),
+            resultSchemaVersion: FULL_PATH_HARNESS_RESULT_SCHEMA,
+            runtime: "node",
+            nodeVersion: process.version,
+            platform: process.platform,
+            arch: process.arch,
+        },
+        teaVm: {
+            identifier: FULL_PATH_TEAVM_IDENTIFIER,
+            buildId: process.env.GAIUS_TEAVM_BUILD_ID?.trim() || null,
+            outputUsed: false,
+            buildRequired: false,
+            artifactPath: null,
+            artifactSha256: null,
+        },
+        commandErrors: gitEvidence?.commandErrors ?? null,
+    };
+}
+
+async function captureFullPathProvenance(phase) {
+    return fullPathProvenanceFromGit(
+        await captureRepositoryGitEvidence(), phase);
+}
+
+function maxClientPerformanceRawMillis(clients, field) {
+    let maximum = null;
+    for (const client of clients ?? []) {
+        if (typeof client?.performanceResult !== "function") continue;
+        const value = Number(client.performanceResult()?.[field]);
+        if (!Number.isFinite(value) || value < 0) continue;
+        maximum = maximum === null ? value : Math.max(maximum, value);
+    }
+    return maximum;
+}
+
+function strictDurationEvidence(rawMillis, limitMillis) {
+    const observedRawMillis = Number(rawMillis);
+    const measured = Number.isFinite(observedRawMillis) && observedRawMillis >= 0;
+    return {
+        limitMillis,
+        measured,
+        observedRawMillis: measured ? observedRawMillis : null,
+        observedMillis: measured ? Number(observedRawMillis.toFixed(3)) : null,
+        overrun: measured ? observedRawMillis > limitMillis : false,
+        withinLimit: measured && observedRawMillis <= limitMillis,
+    };
+}
+
+function fullPathPerformanceStrictEvidence({ pollScheduler, clients, provenance }) {
+    const callback = strictDurationEvidence(
+        pollScheduler?.maxCallbackDurationRawMillis,
+        FULL_PATH_STRICT_PERFORMANCE_LIMITS.callbackMaxMillis,
+    );
+    const poll = strictDurationEvidence(
+        pollScheduler?.maxClientPollDurationRawMillis,
+        FULL_PATH_STRICT_PERFORMANCE_LIMITS.pollMaxMillis,
+    );
+    const tick = strictDurationEvidence(
+        maxClientPerformanceRawMillis(clients, "maxPlayTickGapRawMillis"),
+        FULL_PATH_STRICT_PERFORMANCE_LIMITS.tickMaxMillis,
+    );
+    const eligibilityReasons = [];
+    if (!stressMode) eligibilityReasons.push("strict-performance-not-evaluated");
+    if (!ARRIVAL_TRACE_STRICT_EVIDENCE_ELIGIBLE) {
+        eligibilityReasons.push("diagnostic-trace-enabled");
+    }
+    if (provenance?.repository?.available !== true) {
+        eligibilityReasons.push("repository-provenance-unavailable");
+    }
+    const strictEvidenceEligible = eligibilityReasons.length === 0;
+    const measured = callback.measured && poll.measured && tick.measured;
+    const passed = strictEvidenceEligible && measured &&
+        callback.withinLimit && poll.withinLimit && tick.withinLimit;
+    return {
+        schemaVersion: FULL_PATH_STRICT_PERFORMANCE_SCHEMA_VERSION,
+        evaluated: stressMode,
+        strictEvidenceEligible,
+        eligibilityReasons,
+        passed,
+        thresholds: {
+            callbackMaxMillis: FULL_PATH_STRICT_PERFORMANCE_LIMITS.callbackMaxMillis,
+            pollMaxMillis: FULL_PATH_STRICT_PERFORMANCE_LIMITS.pollMaxMillis,
+            tickMaxMillis: FULL_PATH_STRICT_PERFORMANCE_LIMITS.tickMaxMillis,
+        },
+        callback,
+        poll,
+        tick,
+        distribution: stressMode ? stressLatencyDistributionContract() : null,
+        diagnosticOnly: false,
+        strictGatesChanged: false,
+    };
+}
+
 function parseStrictAcceptanceNumber(name, expected) {
     const raw = process.env[name];
     if (raw === undefined) return expected;
@@ -619,8 +818,10 @@ const smokeStartedAt = performance.now();
 
 let activeProfile;
 let lastInboundFlowAttempt = null;
+let runStartProvenance;
 
 async function runSmoke() {
+    runStartProvenance = await captureFullPathProvenance("run-start");
     activeProfile = await loadActiveVersionProfile();
     assertCanonicalProfile(activeProfile);
     const browserChannelSource = await loadBrowserChannelSourceEvidence();
@@ -1462,14 +1663,33 @@ try {
         }
     }
     const pollSchedulerEvidence = pollScheduler?.evidence() ?? null;
+    const resultProvenance = await captureFullPathProvenance("result");
+    resultProvenance.runStart = runStartProvenance ?? null;
+    resultProvenance.repository.headStableDuringRun =
+        runStartProvenance?.repository?.head !== null &&
+        runStartProvenance?.repository?.head !== undefined &&
+        resultProvenance.repository.head !== null &&
+        runStartProvenance.repository.head === resultProvenance.repository.head;
+    const performanceStrict = fullPathPerformanceStrictEvidence({
+        pollScheduler: pollSchedulerEvidence,
+        clients: allClients,
+        provenance: resultProvenance,
+    });
     const result = {
         schemaVersion: "browser-full-path-result-v2",
         ok: true,
+        provenance: resultProvenance,
+        performanceStrict,
         acceptance: {
             // All assertions above have completed before this object is built.  Keep the
             // successful strict/compatible outcome explicit instead of forcing consumers to
             // infer it from the top-level result.ok field.
             ok: true,
+            // This is deliberately separate from acceptance.ok.  The latter
+            // covers the functional/liveness contract; strict no-stall
+            // evidence is only eligible for a clean stress-tier run.
+            strictEvidenceEligible: performanceStrict.strictEvidenceEligible,
+            performanceStrict,
             mode: acceptanceMode
                 ? "strict-acceptance"
                 : stressMode ? `stress-tier-${stressTier}` : "compatible-smoke",
@@ -1605,6 +1825,7 @@ try {
             browserChannelSourceEvidence: browserChannelSource.evidence,
             browserJsBody: true,
             teaVmBuildRequired: false,
+            teaVmIdentifier: resultProvenance.teaVm.identifier,
             realWebSocketFraming: true,
             relayUrl: relayEndpoint.url,
             clients: clientCount,
@@ -1720,11 +1941,20 @@ catch (error) {
     const partialBrowserRuntime = browserRuntime === undefined
         ? undefined
         : browserRuntimeSnapshot(browserRuntime);
+    const failureProvenance = await captureFullPathProvenance("failure");
+    failureProvenance.runStart = runStartProvenance ?? null;
+    const failurePollScheduler = pollScheduler?.evidence() ?? null;
     await writeFile(path.join(workDirectory, "failure.json"), JSON.stringify({
         ok: false,
         profile: activeProfile.id,
         error: String(error?.stack || error),
         workDirectory,
+        provenance: failureProvenance,
+        performanceStrict: fullPathPerformanceStrictEvidence({
+            pollScheduler: failurePollScheduler,
+            clients: allClients,
+            provenance: failureProvenance,
+        }),
         partialEvidence: {
             clients: allClients.map((client) => clientLivenessEvidence(client)),
             activeClientIds: currentClients.map((client) => client.id),
@@ -1735,7 +1965,7 @@ catch (error) {
             session: sessionRuntimeSnapshot(sessionState),
             browserChannelSourceEvidence: browserChannelSourceEvidenceForOutput(),
             performanceContract: browserFullPathPerformanceContract(),
-            pollScheduler: pollScheduler?.evidence() ?? null,
+            pollScheduler: failurePollScheduler,
             capturedAtElapsedMillis: Number(
                 (performance.now() - smokeStartedAt).toFixed(3)),
         },
@@ -2336,7 +2566,6 @@ function createFairClientPollScheduler(getClients) {
                 // transient replacement race is retried on the next turn.
             }
             maxVisibleClients = Math.max(maxVisibleClients, clients.length);
-            recordVisibleDispatchEvidence(clients);
             // Reconnect waves replace the visible array. Drop scheduling state
             // for retired client objects so the due-map cannot retain channels
             // (or their bridge references) indefinitely.
@@ -3152,6 +3381,9 @@ function createFairClientPollScheduler(getClients) {
                 maxClientsPerCallback,
                 maxCallbackDurationMillis: roundedMillis(maxCallbackDurationMillis),
                 maxCallbackDurationRawMillis,
+                callbackOverrun: Number.isFinite(maxCallbackDurationRawMillis) &&
+                    maxCallbackDurationRawMillis >
+                        SCHEDULER_GAP_STRICT_CALLBACK_THRESHOLD_MILLIS,
                 callbackWorkBudgetMillis: MAX_POLL_CALLBACK_WORK_MILLIS,
                 callbackBudgetCoversPlayTicks: true,
                 callbackBudgetExhaustions,
@@ -3273,6 +3505,9 @@ function createFairClientPollScheduler(getClients) {
                 maxScheduleDelayRawMillis,
                 maxClientPollDurationMillis: roundedMillis(maxClientPollDurationMillis),
                 maxClientPollDurationRawMillis,
+                pollOverrun: Number.isFinite(maxClientPollDurationRawMillis) &&
+                    maxClientPollDurationRawMillis >
+                        FULL_PATH_STRICT_PERFORMANCE_LIMITS.pollMaxMillis,
                 immediateSchedules,
                 immediateCallbacks,
                 timerSchedules,
@@ -7723,6 +7958,7 @@ async function printConfiguration() {
     assertCanonicalProfile(activeProfile);
     const browserChannelSource = await loadBrowserChannelSourceEvidence();
     const wireProfile = resolveWireProfile(activeProfile);
+    const provenance = await captureFullPathProvenance("print-config");
     const identities = Array.from({ length: clientCount }, (_, index) =>
         createClientIdentity(index));
     console.log(JSON.stringify({
@@ -7746,6 +7982,12 @@ async function printConfiguration() {
         stressTier: stressTier ?? null,
         strictAcceptanceTarget: acceptanceMode ? STRICT_ACCEPTANCE_TARGET : null,
         stressTarget: stressMode ? stressTarget : null,
+        provenance,
+        performanceStrict: fullPathPerformanceStrictEvidence({
+            pollScheduler: null,
+            clients: [],
+            provenance,
+        }),
         identityContract: {
             explicitProfileUsernameMap: true,
             uniqueProfiles: new Set(identities.map(({ profileId }) => profileId)).size,
