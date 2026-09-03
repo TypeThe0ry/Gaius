@@ -265,6 +265,12 @@ const POLL_SCHEDULER_IDLE_IMMEDIATE_SPIN_LIMIT = 16;
 // large stress tier therefore cannot turn one scheduler callback into an
 // unbounded fan-out of outbound tick writes.
 const MAX_PLAY_TICKS_PER_SCHEDULER_CALLBACK = MAX_CLIENTS_PER_POLL_CALLBACK;
+// A periodic timer-yield is a fairness backstop, not a reason to park a
+// PLAY-tick cursor that is about to become due. Keep a small lead window so
+// a host timer quantum cannot turn an otherwise healthy 50 ms cadence into a
+// visible >60 ms tick gap. This is a continuation hint only; PLAY cadence
+// and all strict latency gates remain unchanged.
+const POLL_SCHEDULER_PLAY_TICK_TIMER_YIELD_GUARD_MILLIS = 16.7;
 // A scheduler callback must leave room for the browser event loop to service
 // rendering/input work.  This is an evidence limit for the stress validator;
 // the existing per-client poll/tick latency gates remain authoritative.
@@ -2098,6 +2104,7 @@ function createFairClientPollScheduler(getClients) {
     let lastDueTicksBeforeIdle = 0;
     let maxDueTicks = 0;
     let dueTickImmediateContinuations = 0;
+    let timerYieldSuppressedByPlayTickCount = 0;
     let watchdogFires = 0;
     let overlappingCallbacks = 0;
     let turnsSinceTimerYield = 0;
@@ -2350,6 +2357,31 @@ function createFairClientPollScheduler(getClients) {
             if (isPlayTickDue(client, now)) count++;
         }
         return count;
+    };
+    const hasPlayTickDueWithin = (clients, now = performance.now(),
+        guardMillis = POLL_SCHEDULER_PLAY_TICK_TIMER_YIELD_GUARD_MILLIS) => {
+        const current = Number(now);
+        const guard = Number(guardMillis);
+        if (!Number.isFinite(current) || !Number.isFinite(guard) || guard < 0) {
+            return false;
+        }
+        for (const client of clients) {
+            if (client === null || client === undefined || client.closed ||
+                client.pollingPaused || client.failure !== undefined ||
+                client.phase !== "play" ||
+                (client.playTickActive !== undefined && !client.playTickActive) ||
+                typeof client.servicePlayTick !== "function") {
+                continue;
+            }
+            if (client.playTickSuspended === true) return true;
+            const dueAt = Number(client.nextPlayTickDueAt);
+            if (Number.isFinite(dueAt)) {
+                const epsilon = Number.EPSILON * Math.max(
+                    1, Math.abs(current), Math.abs(dueAt), Math.abs(guard)) * 4;
+                if (dueAt - current <= guard + epsilon) return true;
+            }
+        }
+        return false;
     };
     let eventLoopDelayMonitor;
     try {
@@ -2973,7 +3005,18 @@ function createFairClientPollScheduler(getClients) {
             // spent its budget on tick work must not let the periodic
             // timer-yield override a ready inbound poll.
             const readyPollPending = readyAfterDispatch;
-            const continuation = dueTicksPending || readyPollPending
+            // The near-due scan is only relevant on the turns that would
+            // otherwise select the periodic timer-yield. Avoid walking every
+            // live client on the normal immediate path (which is the hot path
+            // under tier-8 fan-in).
+            const playTickDueSoon = needsTimerYield &&
+                hasPlayTickDueWithin(clients, callbackFinishedAt);
+            const timerYieldSuppressedByPlayTick = playTickDueSoon;
+            if (timerYieldSuppressedByPlayTick) {
+                timerYieldSuppressedByPlayTickCount++;
+            }
+            const continuation = dueTicksPending || readyPollPending ||
+                timerYieldSuppressedByPlayTick
                 ? "immediate"
                 : needsTimerYield ? "timer-yield" : nextContinuation;
             if (tickSchedulerContexts !== null) {
@@ -3041,6 +3084,9 @@ function createFairClientPollScheduler(getClients) {
                     visibleClientCount: clients.length,
                     dueTicksAfterService: lastDueTicksAfterService,
                     dueTicksBeforeIdle: lastDueTicksBeforeIdle,
+                    playTickDueSoon,
+                    playTickTimerYieldGuardMillis:
+                        POLL_SCHEDULER_PLAY_TICK_TIMER_YIELD_GUARD_MILLIS,
                     phaseTimingsMillis: {
                         beforeTickLoop: elapsedSinceStart(timeBeforeTickLoop),
                         afterTickLoop: elapsedSinceStart(timeAfterTickLoop),
@@ -3098,6 +3144,9 @@ function createFairClientPollScheduler(getClients) {
                     tickServices: tickServicesThisCallback,
                     dueTicksAfterService: lastDueTicksAfterService,
                     dueTicksBeforeIdle: lastDueTicksBeforeIdle,
+                    playTickDueSoon,
+                    playTickTimerYieldGuardMillis:
+                        POLL_SCHEDULER_PLAY_TICK_TIMER_YIELD_GUARD_MILLIS,
                     budgetReached: callbackBudgetReached,
                     budgetReachedPhase: callbackBudgetReachedPhase ?? null,
                     budgetReachedAtMillis: callbackBudgetReachedAtMillis ?? null,
@@ -3376,7 +3425,11 @@ function createFairClientPollScheduler(getClients) {
                     POLL_SCHEDULER_IDLE_IMMEDIATE_SPIN_LIMIT,
                 timerYieldTurns: POLL_SCHEDULER_TIMER_YIELD_TURNS,
                 timerYieldWorkMillis: POLL_SCHEDULER_TIMER_YIELD_WORK_MILLIS,
-                timerYieldPolicy: "turn-count-only-heavy-turns-observed",
+                playTickTimerYieldGuardMillis:
+                    POLL_SCHEDULER_PLAY_TICK_TIMER_YIELD_GUARD_MILLIS,
+                timerYieldSuppressedByPlayTickCount,
+                timerYieldPolicy:
+                    "turn-count-with-near-due-play-tick-immediate-guard",
                 watchdogMillis: POLL_SCHEDULER_WATCHDOG_MILLIS,
                 stopped,
                 callbacks: callbackCount,

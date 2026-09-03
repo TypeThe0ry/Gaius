@@ -52,6 +52,9 @@ assert.match(source,
     "near-due probe must enforce its absolute elapsed-time budget");
 assert.match(source,
     /const MAX_PLAY_TICKS_PER_SCHEDULER_CALLBACK = MAX_CLIENTS_PER_POLL_CALLBACK/u);
+assert.match(source,
+    /const POLL_SCHEDULER_PLAY_TICK_TIMER_YIELD_GUARD_MILLIS = 16\.7/u,
+    "near-due PLAY ticks must block periodic timer-yield quantization");
 assert.match(source, /const CALLBACK_TAIL_SLOW_THRESHOLD_MILLIS = 16\.7/u);
 assert.match(source, /const CALLBACK_TAIL_SAMPLE_LIMIT = 64/u);
 assert.match(source,
@@ -424,6 +427,8 @@ assert.match(schedulerSource,
     "scheduler due admission must wake a resumed suspended PLAY client");
 assert.match(schedulerSource, /countDuePlayTicks/u,
     "scheduler must count due PLAY ticks after the bounded tick batch");
+assert.match(schedulerSource, /hasPlayTickDueWithin/u,
+    "scheduler must inspect near-due PLAY tick deadlines before timer-yield");
 assert.match(schedulerSource, /lastDueTicksAfterService/u);
 assert.match(schedulerSource, /lastDueTicksBeforeIdle/u);
 assert.match(schedulerSource,
@@ -436,8 +441,14 @@ assert.match(schedulerSource,
     /const dueTicksPending\s*=\s*lastDueTicksAfterService\s*>\s*0\s*\|\|\s*\n\s*lastDueTicksBeforeIdle\s*>\s*0/u,
     "due PLAY tick state must be carried through the final continuation choice");
 assert.match(schedulerSource,
-    /const readyPollPending\s*=\s*readyAfterDispatch[\s\S]*?const continuation\s*=\s*dueTicksPending\s*\|\|\s*readyPollPending\s*\n\s*\?\s*"immediate"\s*\n\s*:\s*needsTimerYield\s*\?/u,
+    /const readyPollPending\s*=\s*readyAfterDispatch[\s\S]*?const continuation\s*=\s*dueTicksPending\s*\|\|\s*readyPollPending\s*\|\|\s*\n?\s*timerYieldSuppressedByPlayTick\s*\n?\s*\?\s*"immediate"\s*\n\s*:\s*needsTimerYield\s*\?/u,
     "due PLAY ticks and ready polls must take precedence over the periodic timer yield");
+assert.match(schedulerSource,
+    /const playTickDueSoon\s*=\s*needsTimerYield\s*&&\s*[\s\S]*?hasPlayTickDueWithin/u,
+    "near-due PLAY tick scan must stay off the normal immediate hot path");
+assert.match(schedulerSource,
+    /const timerYieldSuppressedByPlayTick\s*=\s*playTickDueSoon/u,
+    "near-due PLAY ticks must suppress the periodic timer yield");
 assert.match(schedulerSource, /idleCallbacks/u);
 assert.match(schedulerSource, /POLL_SCHEDULER_IDLE_BACKOFF_MILLIS/u);
 assert.match(source, /this\.nextPollDueAt = performance\.now\(\)/u);
@@ -978,6 +989,30 @@ function modelDeadlineProbeContinuation({
     };
 }
 
+const PLAY_TICK_TIMER_YIELD_GUARD_MODEL_MILLIS = 16.7;
+function modelHasPlayTickDueWithin(clients, now = 0,
+    guardMillis = PLAY_TICK_TIMER_YIELD_GUARD_MODEL_MILLIS) {
+    const current = Number(now);
+    const guard = Number(guardMillis);
+    if (!Number.isFinite(current) || !Number.isFinite(guard) || guard < 0) {
+        return false;
+    }
+    return clients.some((client) => {
+        if (client === null || client === undefined || client.closed ||
+            client.pollingPaused || client.failure !== undefined ||
+            client.phase !== "play" || client.playTickActive === false ||
+            client.servicePlayTick !== true) {
+            return false;
+        }
+        if (client.playTickSuspended === true) return true;
+        const dueAt = Number(client.nextPlayTickDueAt);
+        if (!Number.isFinite(dueAt)) return false;
+        const epsilon = Number.EPSILON * Math.max(
+            1, Math.abs(current), Math.abs(dueAt), Math.abs(guard)) * 4;
+        return dueAt - current <= guard + epsilon;
+    });
+}
+
 // Model the complete continuation choice made after a scheduler callback has
 // unwound.  In particular, readiness is measured in the poll loop but is
 // consumed by the outer zero-dispatch finalizer; this model keeps that
@@ -994,6 +1029,9 @@ function modelFinalizerContinuation({
     idleImmediateProbeStartedAt,
     overdueWakePending = false,
     needsTimerYield = false,
+    playTickDueSoon = false,
+    playTickClients,
+    now = 0,
 } = {}) {
     let selectedContinuation = nextContinuation;
     const dueTicksPending = dueTicksAfterService > 0 ||
@@ -1011,7 +1049,13 @@ function modelFinalizerContinuation({
             selectedContinuation = "idle";
         }
     }
-    const continuation = dueTicksPending || readyPollPending
+    const computedPlayTickDueSoon = Array.isArray(playTickClients)
+        ? modelHasPlayTickDueWithin(playTickClients, now)
+        : playTickDueSoon;
+    const timerYieldSuppressedByPlayTick = needsTimerYield &&
+        computedPlayTickDueSoon;
+    const continuation = dueTicksPending || readyPollPending ||
+        timerYieldSuppressedByPlayTick
         ? "immediate"
         : needsTimerYield ? "timer-yield" : selectedContinuation;
     return {
@@ -1019,6 +1063,8 @@ function modelFinalizerContinuation({
         selectedContinuation,
         dueTicksPending,
         readyPollPending,
+        playTickDueSoon: computedPlayTickDueSoon,
+        timerYieldSuppressedByPlayTick,
         strictGatesChanged: false,
     };
 }
@@ -2264,6 +2310,55 @@ assert.deepEqual(modelIdleContinuation({
     }, "fair-ready candidate was parked after a budgeted zero-dispatch turn");
 }
 
+// The near-due guard must mirror the production candidate filters and use an
+// inclusive boundary: a tick exactly 16.7 ms away is still protected, while a
+// tick just beyond the guard remains eligible for the fairness timer-yield.
+{
+    const playTickClient = (overrides = {}) => ({
+        phase: "play",
+        playTickActive: true,
+        playTickSuspended: false,
+        servicePlayTick: true,
+        closed: false,
+        pollingPaused: false,
+        failure: undefined,
+        nextPlayTickDueAt: 116.7,
+        ...overrides,
+    });
+    assert.equal(modelHasPlayTickDueWithin(
+        [playTickClient()], 100), true,
+        "16.7 ms PLAY-tick boundary did not suppress timer-yield");
+    assert.equal(modelHasPlayTickDueWithin(
+        [playTickClient({ nextPlayTickDueAt: 116.701 })], 100), false,
+        "tick just beyond the guard incorrectly suppressed timer-yield");
+    assert.equal(modelHasPlayTickDueWithin(
+        [playTickClient({ nextPlayTickDueAt: 200 })], 100), false,
+        "far-future PLAY tick changed timer-yield fairness");
+    assert.equal(modelHasPlayTickDueWithin(
+        [playTickClient({ playTickSuspended: true, nextPlayTickDueAt: 200 })], 100), true,
+        "suspended PLAY tick was not admitted immediately");
+    assert.equal(modelHasPlayTickDueWithin([
+        playTickClient({ closed: true }),
+        playTickClient({ pollingPaused: true }),
+        playTickClient({ failure: new Error("failed") }),
+        playTickClient({ phase: "configuration" }),
+        playTickClient({ playTickActive: false }),
+        playTickClient({ servicePlayTick: false }),
+    ], 100), false,
+    "retired/non-PLAY clients incorrectly triggered the near-due guard");
+    const computed = modelFinalizerContinuation({
+        dispatched: 1,
+        nextContinuation: "immediate",
+        needsTimerYield: true,
+        playTickClients: [playTickClient()],
+        now: 100,
+    });
+    assert.equal(computed.continuation, "immediate",
+        "finalizer did not use the filtered near-due PLAY-tick model");
+    assert.equal(computed.timerYieldSuppressedByPlayTick, true,
+        "finalizer did not record near-due timer-yield suppression");
+}
+
 // Full finalizer continuation regression.  A callback can dispatch no poll
 // while the post-dispatch readiness probe still sees a fair candidate.  That
 // state must win over an earlier/idle continuation and must survive the
@@ -2282,6 +2377,8 @@ assert.deepEqual(modelIdleContinuation({
         selectedContinuation: "immediate",
         dueTicksPending: false,
         readyPollPending: true,
+        playTickDueSoon: false,
+        timerYieldSuppressedByPlayTick: false,
         strictGatesChanged: false,
     }, "ready zero-dispatch turn was overwritten by timer-yield finalization");
 
@@ -2318,6 +2415,8 @@ assert.deepEqual(modelIdleContinuation({
         selectedContinuation: "immediate",
         dueTicksPending: true,
         readyPollPending: false,
+        playTickDueSoon: false,
+        timerYieldSuppressedByPlayTick: false,
         strictGatesChanged: false,
     }, "due PLAY tick was not retained on the immediate continuation");
 
@@ -2329,6 +2428,23 @@ assert.deepEqual(modelIdleContinuation({
     });
     assert.equal(periodicYield.continuation, "timer-yield",
         "timer-yield cadence changed for a dispatched callback");
+
+    const nearDuePlayTick = modelFinalizerContinuation({
+        dispatched: 1,
+        nextContinuation: "immediate",
+        readyAfterDispatch: false,
+        needsTimerYield: true,
+        playTickDueSoon: true,
+    });
+    assert.deepEqual(nearDuePlayTick, {
+        continuation: "immediate",
+        selectedContinuation: "immediate",
+        dueTicksPending: false,
+        readyPollPending: false,
+        playTickDueSoon: true,
+        timerYieldSuppressedByPlayTick: true,
+        strictGatesChanged: false,
+    }, "near-due PLAY tick was parked on periodic timer-yield");
 }
 
 // A queued inbound frame does not bypass nextPollDueAt.  This is the
@@ -2474,6 +2590,10 @@ console.log(JSON.stringify({
     clients: CLIENT_COUNT,
     batchLimit: BATCH_LIMIT,
     callbackWorkBudgetMillis: CALLBACK_WORK_BUDGET_MILLIS,
+    playTickTimerYieldGuardMillis:
+        PLAY_TICK_TIMER_YIELD_GUARD_MODEL_MILLIS,
+    timerYieldGuardPolicy:
+        "near-due-inclusive-boundary; strict-gates-unchanged",
     runMillis: RUN_MILLIS,
     strictPollGapTarget: { p99Millis: 16.7, p999Millis: 50, maxMillis: 100 },
     playTickTiming: {
