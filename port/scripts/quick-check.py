@@ -5566,8 +5566,16 @@ def check_source_patches() -> None:
             and "public static native void invalidateClientPacketDrain(String reason);"
             in browser_client_network
             and "processClientPacketsAtScheduledFrameBoundary" in browser_client_network
-            and "!accountingValid || queueBefore < 64 || !isClientPacketFrameBoundaryDrainEnabled()"
-                in browser_client_packet_boundary
+            and (
+                "!accountingValid || queueBefore < 64 || !isClientPacketFrameBoundaryDrainEnabled()"
+                    in browser_client_packet_boundary
+                or (
+                    "boolean drainEnabled = isClientPacketFrameBoundaryDrainEnabled()"
+                        in browser_client_packet_boundary
+                    and "!accountingValid || queueBefore < 64 || !drainEnabled"
+                        in browser_client_packet_boundary
+                )
+            )
             and browser_client_packet_boundary.count(
                 "packetProcessor.processQueuedPackets()"
             ) == 2

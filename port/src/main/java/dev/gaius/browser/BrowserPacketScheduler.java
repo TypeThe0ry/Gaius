@@ -16,10 +16,11 @@ public final class BrowserPacketScheduler {
 
     /**
      * A TeaVM runtime normally owns one PacketProcessor, but reconnect and embedded deployments can
-     * briefly expose more than one processor in the same JavaScript realm.  Keep a small fixed
+     * briefly expose more than one processor in the same JavaScript realm. Keep a small fixed
      * ledger table instead of sharing queue/drain state or growing an unbounded identity map.
-     * Retired slots are intentionally not reused: a late callback from the old object must fail
-     * closed rather than being mistaken for a new generation.
+     * Quiesced retired slots may be reused only at the explicit constructor lifecycle boundary;
+     * frame/callback paths never allocate an unknown owner. This prevents lifecycle churn from
+     * permanently disabling adaptive accounting while keeping late callbacks fail-closed.
      */
     private static final int PACKET_PROCESSOR_LEDGER_LIMIT = 16;
 
@@ -97,7 +98,7 @@ public final class BrowserPacketScheduler {
     private static long packetProcessorAccessGeneration;
     private static long nextPacketProcessorGeneration = 1L;
     private static long packetProcessorLedgerSlotExhaustions;
-    /** Once all retired owner slots are consumed, keep adaptive accounting poisoned. */
+    /** True after an allocation attempt found no safe null or quiesced-retired slot. */
     private static boolean packetProcessorLedgerExhausted;
     private static long packetProcessorUnknownOwnerEvents;
     private static long pendingClientFrameSequence;
@@ -276,14 +277,70 @@ public final class BrowserPacketScheduler {
                 ledger.owner = owner;
                 ledger.generation = nextPacketProcessorGeneration();
                 packetProcessorLedgers[index] = ledger;
+                packetProcessorLedgerExhausted = false;
                 return ledger;
             }
+        }
+        PacketProcessorLedger reusable = null;
+        for (PacketProcessorLedger ledger : packetProcessorLedgers) {
+            if (!isQuiescedRetiredLedger(ledger)
+                    || (reusable != null && ledger.generation >= reusable.generation)) {
+                continue;
+            }
+            reusable = ledger;
+        }
+        if (reusable != null) {
+            reusable.clearAfterReset(false);
+            reusable.owner = owner;
+            reusable.generation = nextPacketProcessorGeneration();
+            reusable.retired = false;
+            reusable.accountingValid = true;
+            reusable.fallbackReason = "bound";
+            reusable.clientPacketDrainEpoch = 0L;
+            reusable.clientFrameSequence = 0L;
+            packetProcessorLedgerExhausted = false;
+            return reusable;
         }
         if (packetProcessorLedgerSlotExhaustions < Long.MAX_VALUE) {
             packetProcessorLedgerSlotExhaustions++;
         }
         packetProcessorLedgerExhausted = true;
         return null;
+    }
+
+    /**
+     * A retired slot can be recycled only after every callback-visible scope has drained. The
+     * owner identity is still retained by the bounded tombstone ring before this check runs, so a
+     * stale callback cannot be mistaken for the new generation while the slot is being replaced.
+     */
+    private static boolean isQuiescedRetiredLedger(PacketProcessorLedger ledger) {
+        return ledger != null
+                && ledger.retired
+                && !ledger.accountingValid
+                && ledger.batchPacketLimit == 0
+                && ledger.packetsRemaining == 0
+                && ledger.minimumPackets == 0
+                && ledger.deadlineNanos == 0L
+                && ledger.queuedPackets == 0
+                && !ledger.packetQueuePaused
+                && !ledger.clientPacketDrainActive
+                && !ledger.clientPacketDrainCritical
+                && ledger.clientPacketDrainRequestedPackets == 0
+                && ledger.clientPacketDrainBatchTargetPackets == 0
+                && ledger.clientPacketDrainRemainingDebt == 0
+                && ledger.clientPacketDrainHandlerCompletions == 0
+                && ledger.queuedPacketHandleDepth == 0
+                && ledger.queuedPacketHandleStartedNanos == 0L
+                && ledger.queuedPacketHandleRoot == null
+                && !ledger.clientFrameAccountingActive
+                && ledger.clientFramePacketCount == 0
+                && ledger.clientFramePacketHandleNanos == 0L
+                && ledger.clientFrameSafeDrainTurns == 0
+                && ledger.clientFrameVanillaDrainTurns == 0
+                && queuedPacketHandleOwner == null
+                && clientPacketDrainOwner == null
+                && packetProcessorAccessOwner == null
+                && packetProcessorOwner == null;
     }
 
     private static void selectPacketProcessorLedger(PacketProcessorLedger ledger) {
@@ -595,18 +652,18 @@ public final class BrowserPacketScheduler {
     /**
      * Claims the one PacketProcessor owner before any queue accounting is touched.
      *
-     * <p>This method is called at every scheduled client frame.  It is deliberately not a
-     * lifecycle reset point: a PacketProcessor that already crossed {@link #reset(Object)} stays
-     * retired, so a late frame/queue callback cannot resurrect its static accounting epoch.</p>
+     * <p>This method is called at every scheduled client frame. It only selects an owner that was
+     * admitted by the constructor lifecycle hook; an unknown/retired frame owner cannot allocate a
+     * slot or resurrect an old static accounting epoch.</p>
      */
     public static boolean bindPacketProcessor(Object owner) {
-        return claimPacketProcessorOwner(owner);
+        return claimPacketProcessorFrameOwner(owner);
     }
 
     /**
-     * Explicit PacketProcessor construction boundary.  The patched PacketProcessor constructor
-     * calls this once after its fields are initialized.  This is still claim-only: PacketProcessor
-     * close is one-shot in vanilla, so a retired owner must never be reactivated by any bind path.
+     * Explicit PacketProcessor construction boundary. The patched PacketProcessor constructor
+     * calls this once after its fields are initialized. This is the only bind path allowed to
+     * allocate a fresh ledger or recycle a fully quiesced retired slot.
      */
     public static boolean bindPacketProcessorLifecycle(Object owner) {
         return claimPacketProcessorOwner(owner);
@@ -617,7 +674,7 @@ public final class BrowserPacketScheduler {
      * can execute its retained vanilla method instead of sharing adaptive state.
      */
     public static boolean beginBatch(Object owner) {
-        PacketProcessorLedger ledger = claimPacketProcessorLedger(owner);
+        PacketProcessorLedger ledger = claimPacketProcessorLedger(owner, false);
         if (ledger == null) {
             return false;
         }
@@ -827,7 +884,7 @@ public final class BrowserPacketScheduler {
     }
 
     public static boolean tryBeginClientPacketDrain(Object owner, boolean critical) {
-        PacketProcessorLedger ledger = claimPacketProcessorLedger(owner);
+        PacketProcessorLedger ledger = claimPacketProcessorLedger(owner, false);
         if (ledger == null) {
             return false;
         }
@@ -1255,9 +1312,19 @@ public final class BrowserPacketScheduler {
     }
 
     private static boolean claimPacketProcessorOwner(Object owner) {
+        return claimPacketProcessorLedger(owner, true) != null;
+    }
+
+    /** Frame callbacks may select only an already-constructed owner; they never allocate a slot. */
+    private static boolean claimPacketProcessorFrameOwner(Object owner) {
+        return claimPacketProcessorLedger(owner, false) != null;
+    }
+
+    private static PacketProcessorLedger claimPacketProcessorLedger(
+            Object owner, boolean allowLifecycleAllocation) {
         if (owner == null) {
             markPacketProcessorConflict("null-owner");
-            return false;
+            return null;
         }
         if (packetProcessorOwner == null) {
             if (clientPacketDrainActive) {
@@ -1267,25 +1334,14 @@ public final class BrowserPacketScheduler {
                 // the retired owner's finish would then fail its generation check and strand the
                 // global drain active forever.
                 packetProcessorFallbackReason = "active-drain-owner-retiring";
-                return false;
+                return null;
             }
         }
-        return claimPacketProcessorLedger(owner) != null;
-    }
-
-    private static PacketProcessorLedger claimPacketProcessorLedger(Object owner) {
         if (isRetiredPacketProcessorOwner(owner)) {
             if (stalePacketProcessorEvents < Long.MAX_VALUE) {
                 stalePacketProcessorEvents++;
             }
             packetProcessorFallbackReason = "retired-owner-event";
-            return null;
-        }
-        if (packetProcessorLedgerExhausted) {
-            packetProcessorOwnerConflict = true;
-            packetProcessorAccountingValid = false;
-            packetProcessorConflictPoisoned = true;
-            packetProcessorFallbackReason = "ledger-slot-exhausted";
             return null;
         }
         if (packetProcessorConflictPoisoned || packetProcessorOwnerConflict
@@ -1302,14 +1358,16 @@ public final class BrowserPacketScheduler {
             markPacketProcessorConflict("packet-processor-owner-conflict");
             return null;
         }
+        if (ledger == null && !allowLifecycleAllocation) {
+            packetProcessorFallbackReason = packetProcessorLedgerExhausted
+                    ? "ledger-slot-exhausted" : "unknown-owner";
+            return null;
+        }
         if (ledger == null) {
             ledger = allocatePacketProcessorLedger(owner);
             if (ledger == null) {
-                packetProcessorLedgerExhausted = true;
                 packetProcessorFallbackReason = "ledger-slot-exhausted";
-                packetProcessorOwnerConflict = true;
                 packetProcessorAccountingValid = false;
-                packetProcessorConflictPoisoned = true;
                 return null;
             }
         }

@@ -79,11 +79,17 @@ const ownerContract = {
         /private static final Object\[\] retiredPacketProcessorOwners\s*=\s*\n\s*new Object\[RETIRED_PACKET_PROCESSOR_OWNER_LIMIT\]/u,
         "retired PacketProcessor owner tombstone table is missing"),
     frameBindIsClaimOnly: requireMatch(schedulerSource,
-        /public static boolean bindPacketProcessor\(Object owner\)\s*\{\s*return claimPacketProcessorOwner\(owner\);\s*\}/u,
-        "per-frame PacketProcessor bind must not release a retired tombstone"),
-    lifecycleBindIsClaimOnly: requireMatch(schedulerSource,
+        /public static boolean bindPacketProcessor\(Object owner\)\s*\{\s*return claimPacketProcessorFrameOwner\(owner\);\s*\}/u,
+        "per-frame PacketProcessor bind must not allocate an unknown owner"),
+    lifecycleBindCanAllocate: requireMatch(schedulerSource,
         /public static boolean bindPacketProcessorLifecycle\(Object owner\)\s*\{\s*return claimPacketProcessorOwner\(owner\);\s*\}/u,
-        "PacketProcessor lifecycle bind must claim without releasing a retired tombstone"),
+        "PacketProcessor lifecycle bind must be the explicit allocation boundary"),
+    frameClaimRejectsUnknown: requireMatch(schedulerSource,
+        /private static boolean claimPacketProcessorFrameOwner\(Object owner\)\s*\{\s*return claimPacketProcessorLedger\(owner, false\)\s*!=\s*null;\s*\}/u,
+        "frame owner claims must stay allocation-free"),
+    lifecycleClaimAllowsAllocation: requireMatch(schedulerSource,
+        /private static boolean claimPacketProcessorOwner\(Object owner\)\s*\{\s*return claimPacketProcessorLedger\(owner, true\)\s*!=\s*null;\s*\}/u,
+        "lifecycle owner claims must admit fresh/reused ledgers"),
     lifecycleBindNeverClearsRetired,
     constructorLifecycleHook: requireMatch(patcherSource,
         /bindPacketProcessorLifecycle[\s\S]*PacketProcessor constructor lifecycle/u,
@@ -172,12 +178,15 @@ const ledgerExhaustionContract = {
     allocationMarksExhausted: requireMatch(schedulerSource,
         /packetProcessorLedgerSlotExhaustions\+\+;[\s\S]*packetProcessorLedgerExhausted\s*=\s*true;/u,
         "ledger allocation exhaustion must be recorded before fallback"),
-    exhaustionFailClosed: requireMatch(schedulerSource,
-        /if \(packetProcessorLedgerExhausted\)[\s\S]*packetProcessorConflictPoisoned\s*=\s*true;[\s\S]*ledger-slot-exhausted/u,
-        "an exhausted ledger must permanently fail closed with a stable reason"),
-    noSlotReuse: requireMatch(schedulerSource,
-        /if \(packetProcessorLedgers\[index\] == null\)[\s\S]*packetProcessorLedgers\[index\] = ledger;/u,
-        "retired ledger slots must not be reused for a new owner"),
+    exhaustionDiagnostic: requireMatch(schedulerSource,
+        /packetProcessorLedgerExhausted\s*=\s*true;[\s\S]*packetProcessorFallbackReason\s*=\s*"ledger-slot-exhausted"/u,
+        "an exhausted ledger must retain a stable diagnostic reason"),
+    quiescedReuseGuard: requireMatch(schedulerSource,
+        /private static boolean isQuiescedRetiredLedger\(PacketProcessorLedger ledger\)[\s\S]*ledger\.queuedPacketHandleDepth\s*==\s*0[\s\S]*ledger\.clientFramePacketCount\s*==\s*0[\s\S]*packetProcessorOwner\s*==\s*null/u,
+        "retired ledger reuse must require a fully quiesced global/owner state"),
+    retiredSlotReuse: requireMatch(schedulerSource,
+        /isQuiescedRetiredLedger\(ledger\)[\s\S]*reusable\.clearAfterReset\(false\)[\s\S]*reusable\.retired\s*=\s*false[\s\S]*reusable\.accountingValid\s*=\s*true/u,
+        "safe retired-slot reuse path is missing"),
 };
 
 const ownerResetStart = schedulerSource.indexOf(
@@ -1133,57 +1142,160 @@ function testUnknownOwnerRetiredUnwindSticky() {
     };
 }
 
-// Retired ledger slots are intentionally never reused.  Once the bounded owner table is full,
-// a fresh owner must stay on the one-call vanilla fallback instead of risking an old callback
-// being interpreted as the new generation.  This is a model/static guard, not live TeaVM proof.
-function testLedgerSlotExhaustion() {
+// A retired slot is reusable only after its handler/drain/frame scopes are quiescent. The model
+// also exercises the no-safe-slot window (for example close-in-handler) and verifies that a later
+// lifecycle retry recovers without poisoning a clean single-owner runtime. This remains a model /
+// static guard, not live TeaVM proof.
+function testLedgerSlotReuse() {
     const limit = 16;
-    const retiredOwners = new Set();
-    let nextOwner = null;
-    let slotExhaustions = 0;
-    let ledgerExhausted = false;
-    let conflictPoisoned = false;
-    let adaptiveDrainEnabled = true;
-    let fallbackReason = "unbound";
+    const createRuntime = () => {
+        const slots = Array.from({length: limit}, () => ({
+            owner: null,
+            generation: 0,
+            retired: false,
+            quiesced: false,
+        }));
+        const tombstones = new Set();
+        let generation = 0;
+        let activeOwner = null;
+        let slotExhaustions = 0;
+        let ledgerExhausted = false;
+        let conflictPoisoned = false;
+        let adaptiveDrainEnabled = true;
+        let fallbackReason = "unbound";
 
+        const find = (owner) => slots.find((slot) => slot.owner === owner) ?? null;
+        const claimLifecycle = (owner) => {
+            if (tombstones.has(owner) || conflictPoisoned) return null;
+            const existing = find(owner);
+            if (activeOwner !== null && activeOwner !== owner) {
+                conflictPoisoned = true;
+                adaptiveDrainEnabled = false;
+                fallbackReason = "packet-processor-owner-conflict";
+                return null;
+            }
+            if (existing !== null && !existing.retired) {
+                activeOwner = owner;
+                return existing;
+            }
+            const reusable = slots
+                .filter((slot) => slot.owner === null || (slot.retired && slot.quiesced))
+                .sort((left, right) => left.generation - right.generation)[0] ?? null;
+            if (reusable === null) {
+                slotExhaustions++;
+                ledgerExhausted = true;
+                adaptiveDrainEnabled = false;
+                fallbackReason = "ledger-slot-exhausted";
+                return null;
+            }
+            reusable.owner = owner;
+            reusable.generation = ++generation;
+            reusable.retired = false;
+            reusable.quiesced = false;
+            activeOwner = owner;
+            ledgerExhausted = false;
+            adaptiveDrainEnabled = true;
+            fallbackReason = "bound";
+            return reusable;
+        };
+        const claimFrame = (owner) => {
+            const slot = find(owner);
+            return slot !== null && !slot.retired && activeOwner === owner ? slot : null;
+        };
+        const retire = (owner, quiesced = true) => {
+            const slot = find(owner);
+            assert.ok(slot !== null && activeOwner === owner,
+                `cannot retire inactive owner ${owner}`);
+            slot.retired = true;
+            slot.quiesced = quiesced;
+            tombstones.add(owner);
+            activeOwner = null;
+        };
+        const markQuiesced = (owner) => {
+            const slot = find(owner);
+            assert.ok(slot !== null && slot.retired,
+                `missing retired owner ${owner}`);
+            slot.quiesced = true;
+        };
+        return {
+            slots,
+            tombstones,
+            claimLifecycle,
+            claimFrame,
+            retire,
+            markQuiesced,
+            get state() {
+                return {
+                    slotExhaustions,
+                    ledgerExhausted,
+                    conflictPoisoned,
+                    adaptiveDrainEnabled,
+                    fallbackReason,
+                    activeOwner,
+                };
+            },
+        };
+    };
+
+    const runtime = createRuntime();
     for (let index = 0; index < limit; index++) {
         const owner = `owner-${index + 1}`;
-        assert.equal(nextOwner, null);
-        nextOwner = owner;
-        retiredOwners.add(owner);
-        nextOwner = null;
+        assert.ok(runtime.claimLifecycle(owner), `initial lifecycle claim failed for ${owner}`);
+        runtime.retire(owner);
     }
-    assert.equal(retiredOwners.size, limit);
+    const ownerOneSlot = runtime.slots.find((slot) => slot.owner === "owner-1");
+    assert.ok(ownerOneSlot !== undefined);
+    const ownerOneGeneration = ownerOneSlot.generation;
+    assert.ok(runtime.claimLifecycle(`owner-${limit + 1}`));
+    const reusedSlot = runtime.slots.find((slot) => slot.owner === `owner-${limit + 1}`);
+    assert.ok(reusedSlot !== undefined);
+    assert.ok(reusedSlot.generation > ownerOneGeneration);
+    assert.equal(runtime.claimFrame("owner-1"), null,
+        "a late frame callback from a retired owner rebound after slot reuse");
+    assert.equal(runtime.state.slotExhaustions, 0,
+        "quiesced retired slots unexpectedly exhausted before reuse");
+    assert.equal(runtime.state.adaptiveDrainEnabled, true);
 
-    const freshOwner = `owner-${limit + 1}`;
-    assert.equal(retiredOwners.has(freshOwner), false);
-    slotExhaustions++;
-    ledgerExhausted = true;
-    conflictPoisoned = true;
-    adaptiveDrainEnabled = false;
-    fallbackReason = "ledger-slot-exhausted";
-    assert.equal(fallbackReason, "ledger-slot-exhausted");
-    assert.equal(ledgerExhausted, true);
-    assert.equal(conflictPoisoned, true);
-    assert.equal(adaptiveDrainEnabled, false);
+    // A close-in-handler owner leaves its own slot non-quiescent. Reuse must wait for the explicit
+    // owner completion, but other quiesced retired slots remain eligible.
+    runtime.retire(`owner-${limit + 1}`, false);
+    const blockedSlot = runtime.slots.find((slot) => slot.owner === `owner-${limit + 1}`);
+    assert.ok(blockedSlot !== undefined && blockedSlot.quiesced === false);
+    assert.ok(runtime.claimLifecycle("owner-18"));
+    const owner18Slot = runtime.slots.find((slot) => slot.owner === "owner-18");
+    assert.notEqual(owner18Slot, blockedSlot,
+        "close-in-handler retired slot was reused before handler unwind");
 
-    // Neither a fresh owner nor a late retired owner can recover the poisoned adaptive lane.
-    const lateRetiredRejected = retiredOwners.has("owner-1") && ledgerExhausted;
-    const freshOwnerRejected = ledgerExhausted;
-    assert.equal(lateRetiredRejected, true);
-    assert.equal(freshOwnerRejected, true);
+    const blocked = createRuntime();
+    for (let index = 0; index < limit; index++) {
+        const owner = `blocked-${index + 1}`;
+        assert.ok(blocked.claimLifecycle(owner));
+        blocked.retire(owner, false);
+    }
+    assert.equal(blocked.claimLifecycle("blocked-fresh"), null);
+    assert.equal(blocked.state.ledgerExhausted, true);
+    assert.equal(blocked.state.conflictPoisoned, false,
+        "temporary no-safe-slot exhaustion poisoned a clean runtime");
+    assert.equal(blocked.state.adaptiveDrainEnabled, false);
+    assert.equal(blocked.state.fallbackReason, "ledger-slot-exhausted");
+    blocked.markQuiesced("blocked-1");
+    assert.ok(blocked.claimLifecycle("blocked-fresh"));
+    assert.equal(blocked.state.ledgerExhausted, false);
+    assert.equal(blocked.state.adaptiveDrainEnabled, true);
 
     return {
         ledgerLimit: limit,
-        ownersRetired: retiredOwners.size,
-        slotExhaustions,
-        exhaustionPoisoned: conflictPoisoned,
-        adaptiveAfterExhaustion: adaptiveDrainEnabled,
-        fallbackAfterExhaustion: fallbackReason,
-        oldOwnerRebindRejected: lateRetiredRejected,
-        freshOwnerRebindRejected: freshOwnerRejected,
-        retiredSlotReused: false,
-        classification: "bounded-single-owner-fail-closed-model",
+        ownersRetired: limit,
+        slotExhaustions: blocked.state.slotExhaustions,
+        exhaustionPoisoned: blocked.state.conflictPoisoned,
+        adaptiveAfterExhaustion: blocked.state.adaptiveDrainEnabled,
+        fallbackAfterExhaustion: "ledger-slot-exhausted",
+        exhaustionRecovered: blocked.state.activeOwner === "blocked-fresh",
+        oldOwnerRebindRejected: runtime.claimFrame("owner-1") === null,
+        freshOwnerRebindAccepted: runtime.state.activeOwner === "owner-18",
+        retiredSlotReused: reusedSlot === ownerOneSlot,
+        nonQuiescedSlotReused: owner18Slot === blockedSlot,
+        classification: "quiesced-retired-slot-reuse-model",
     };
 }
 
@@ -1233,7 +1345,7 @@ const conflictResetRebind = testConflictResetRebindFailClosed();
 const retiredOwnerNineGenerationChurn = testRetiredOwnerNineGenerationChurn();
 const closeInHandlerRebind = testCloseInHandlerRebind();
 const unknownOwnerRetiredUnwind = testUnknownOwnerRetiredUnwindSticky();
-const ledgerSlotExhaustion = testLedgerSlotExhaustion();
+const ledgerSlotReuse = testLedgerSlotReuse();
 
 const staticContract = {
     schedulerGlobalFields,
@@ -1274,7 +1386,7 @@ const result = {
         retiredOwnerNineGenerationChurn,
         closeInHandlerRebind,
         unknownOwnerRetiredUnwind,
-        ledgerSlotExhaustion,
+        ledgerSlotReuse,
     },
     gates: {
         supportedChannelCloseDoesNotResetAccounting: supported.isolation,
@@ -1306,14 +1418,16 @@ const result = {
         unknownOwnerRetiredUnwindFailClosed: unknownOwnerRetiredUnwind.failClosed === true &&
             unknownOwnerRetiredUnwind.unknownOwnerEvents === 1 &&
             unknownOwnerRetiredUnwind.retiredOwnerDepthAfterUnwind === 0,
-        ledgerSlotExhaustionFailClosed:
-            ledgerSlotExhaustion.slotExhaustions === 1 &&
-            ledgerSlotExhaustion.exhaustionPoisoned === true &&
-            ledgerSlotExhaustion.adaptiveAfterExhaustion === false &&
-            ledgerSlotExhaustion.fallbackAfterExhaustion === "ledger-slot-exhausted" &&
-            ledgerSlotExhaustion.oldOwnerRebindRejected === true &&
-            ledgerSlotExhaustion.freshOwnerRebindRejected === true &&
-            ledgerSlotExhaustion.retiredSlotReused === false,
+        ledgerSlotReuseSafety:
+            ledgerSlotReuse.slotExhaustions === 1 &&
+            ledgerSlotReuse.exhaustionPoisoned === false &&
+            ledgerSlotReuse.adaptiveAfterExhaustion === true &&
+            ledgerSlotReuse.fallbackAfterExhaustion === "ledger-slot-exhausted" &&
+            ledgerSlotReuse.exhaustionRecovered === true &&
+            ledgerSlotReuse.oldOwnerRebindRejected === true &&
+            ledgerSlotReuse.freshOwnerRebindAccepted === true &&
+            ledgerSlotReuse.retiredSlotReused === true &&
+            ledgerSlotReuse.nonQuiescedSlotReused === false,
         retiredOwnerNineGenerationChurnFailClosed:
             retiredOwnerNineGenerationChurn.lateCallbackRejected === true &&
             retiredOwnerNineGenerationChurn.ownersCreated === 9,
@@ -1336,7 +1450,7 @@ const result = {
             "overlapping-owner reset/rebind model requires conflict to stay poisoned until foreign owner retirement",
             "close-in-handler owner unwind releases its temporary conflict before a fresh owner binds",
             "unknown-owner callback poison remains sticky through retired-handler unwind",
-            "bounded ledger exhaustion stays poisoned and falls back to vanilla instead of reusing retired slots",
+            "quiesced retired ledger slots are reused only at lifecycle boundaries and recover after a temporary no-safe-slot window",
             "owner-1 through owner-9 generation-churn model rejects a late owner-1 callback",
             "Node relay/channel close tests are separate from Java PacketProcessor evidence",
         ],
@@ -1344,9 +1458,9 @@ const result = {
             "if a second PacketProcessor appears in one JVM, the product deliberately falls back to vanilla processing; per-owner adaptive accounting is not enabled",
             "an active drain claim/demand is also global in that unsupported topology",
             "a browser channel close does not purge already-decoded entries from the shared FIFO; the closed listener must be discarded by the normal packet path without resetting B",
-            "retired-owner lifecycle protection remains a bounded single-owner guard, not multi-Processor isolation",
-            "the Java fail-closed poison is runtime-scoped; after a conflict the static ledger remains unusable until the runtime/classloader is replaced",
-            "current Java retired-owner ring is bounded at 16 entries; arbitrary lifecycle churn beyond that still needs instance-bound generation tokens",
+            "retired-owner lifecycle protection remains a bounded single-owner guard; frame callbacks never allocate unknown owners",
+            "the Java fail-closed poison is runtime-scoped after a true owner conflict; temporary slot exhaustion can recover once a retired slot is quiescent",
+            "current Java retired-owner ring is bounded at 16 entries; an evicted stale lifecycle callback remains a conservative poison, while frame callbacks cannot allocate",
         ],
         notProven: [
             "this model is not a TeaVM/browser runtime proof",
