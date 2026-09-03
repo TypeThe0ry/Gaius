@@ -12,7 +12,11 @@ const isolatedBenchmarkEnvironment = {
   ...process.env,
   GAIUS_VERSION_PROFILE_PATH: "versions/26.2.json",
   GAIUS_BUILD_ROOT: "port/target/26.2",
-  GAIUS_DIST_DIRECTORY: "port/web/dist/26.2",
+  // Allow the caller to point the smoke at an independently hashed release
+  // dist (for example a cluster artifact) while retaining the profile/build
+  // identity contract below.  The default remains the repository profile
+  // directory and still fails closed when its manifest is stale.
+  GAIUS_DIST_DIRECTORY: process.env.GAIUS_DIST_DIRECTORY || "port/web/dist/26.2",
   GAIUS_OVERLAY_DIRECTORY: "port/work/overlays/26.2",
 };
 const configuration = JSON.parse(execFileSync(
