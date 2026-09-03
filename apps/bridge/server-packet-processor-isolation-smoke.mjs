@@ -217,7 +217,7 @@ const ownerFallbackContract = {
         "scheduled packet boundary does not bind PacketProcessor ownership"),
     conflictFallback: requireMatch(
         clientPacketBoundaryBody,
-        /if \(!accountingValid \|\| queueBefore < 64 \|\| !isClientPacketFrameBoundaryDrainEnabled\(\)\)\s*\{\s*packetProcessor\.processQueuedPackets\(\);\s*return;/u,
+        /if \(!accountingValid \|\| queueBefore < 64 \|\| !(?:drainEnabled|isClientPacketFrameBoundaryDrainEnabled\(\))\)\s*\{[\s\S]*?packetProcessor\.processQueuedPackets\(\);\s*return;/u,
         "PacketProcessor owner conflict does not fall back to vanilla processing"),
     ownerDrainClaim: requireMatch(
         clientPacketBoundaryBody,
