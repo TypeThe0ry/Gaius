@@ -1943,6 +1943,11 @@ catch (error) {
         : browserRuntimeSnapshot(browserRuntime);
     const failureProvenance = await captureFullPathProvenance("failure");
     failureProvenance.runStart = runStartProvenance ?? null;
+    failureProvenance.repository.headStableDuringRun =
+        runStartProvenance?.repository?.head !== null &&
+        runStartProvenance?.repository?.head !== undefined &&
+        failureProvenance.repository.head !== null &&
+        runStartProvenance.repository.head === failureProvenance.repository.head;
     const failurePollScheduler = pollScheduler?.evidence() ?? null;
     await writeFile(path.join(workDirectory, "failure.json"), JSON.stringify({
         ok: false,
