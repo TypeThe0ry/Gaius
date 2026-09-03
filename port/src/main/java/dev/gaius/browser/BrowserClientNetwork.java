@@ -387,7 +387,12 @@ public final class BrowserClientNetwork {
             // only rebuild when the bridge object or one of its required hooks has changed.
             // Binding the marker back to the object identity prevents a copied marker on a
             // replacement bridge from authorizing closures that still capture the old bridge.
+            // Keep the scheduler identity in the marker as well: an embedding page can replace
+            // the scheduler object on the same bridge while retaining the bridge marker.  In
+            // that case the old closures must be retired and rebuilt instead of being accepted by
+            // the cheap same-bridge fast path.
             const installedForThisBridge = bridge.__gaiusInboundPumpInstalledBy === bridge &&
+              bridge.__gaiusInboundPumpInstalledScheduler === bridge.inboundPumpScheduler &&
               typeof bridge.inboundPump === 'function' &&
               typeof bridge.clientPacketDrain === 'function' &&
               typeof bridge.invalidateClientPacketDrain === 'function' &&
@@ -1006,6 +1011,7 @@ public final class BrowserClientNetwork {
               }
             }
             bridge.__gaiusInboundPumpInstalledBy = bridge;
+            bridge.__gaiusInboundPumpInstalledScheduler = scheduler;
             return true;
             """)
     private static native boolean installInboundPump(BrowserPumpCallback callback);
@@ -1026,12 +1032,19 @@ public final class BrowserClientNetwork {
             }
             if (typeof URLSearchParams !== 'function' ||
                 typeof location === 'undefined') return;
+            // The URL is normally immutable for the lifetime of a page.  Remember the exact
+            // search string after one parse so runTick's per-frame install retry does not allocate
+            // a new URLSearchParams object on every frame.  If an embedder changes the query via
+            // history/navigation, a different string deliberately causes one fresh parse.
+            const search = String(location.search || '');
+            if (globalThis.__gaiusClientPacketDrainConfiguredSearch === search) return;
             let value = null;
             try {
-              const params = new URLSearchParams(location.search || '');
+              const params = new URLSearchParams(search);
               value = params.get('gaiusClientPacketDrain');
               if (value === null) value = params.get('clientPacketDrain');
             } catch (ignored) {}
+            globalThis.__gaiusClientPacketDrainConfiguredSearch = search;
             if (value === null) return;
             const normalized = String(value).trim().toLowerCase();
             if (normalized === '1' || normalized === 'true' || normalized === 'on') {
