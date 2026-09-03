@@ -61,6 +61,9 @@ assert.match(schedulerSource,
   /clientPacketDrainClaimSkipReason\(Object owner\)[\s\S]*"worker-server"[\s\S]*"null-owner"[\s\S]*"owner-conflict"[\s\S]*"retired-owner"[\s\S]*"active-drain"[\s\S]*"handler-depth"[\s\S]*"threshold-race"[\s\S]*"claim-race"/,
   "claim-skipped diagnostics lost a bounded owner/re-entry reason classifier");
 assert.match(schedulerSource,
+  /clientPacketDrainClaimSkipReason\(Object owner\)[\s\S]*packetProcessorConflictPoisoned[\s\S]*packetProcessorOwnerConflict[\s\S]*packetProcessorAccountingValid[\s\S]*"owner-conflict"/,
+  "poisoned global accounting can be misreported as a threshold race");
+assert.match(schedulerSource,
   /tryBeginClientPacketDrain\(boolean critical\)[\s\S]*clientPacketDrainEpoch == Long\.MAX_VALUE[\s\S]*clientPacketDrainEpoch \+ 1L[\s\S]*clientPacketDrainHandlerCompletions = 0/,
   "claimed drains do not receive one fresh completion-accounting epoch");
 assert.match(schedulerSource,

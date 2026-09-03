@@ -864,6 +864,10 @@ public final class BrowserPacketScheduler {
         if (ledger.retired) {
             return "retired-owner";
         }
+        if (packetProcessorConflictPoisoned || packetProcessorOwnerConflict
+                || !packetProcessorAccountingValid) {
+            return "owner-conflict";
+        }
         if (packetProcessorOwner != owner || packetProcessorGeneration != ledger.generation
                 || !ledger.accountingValid) {
             return "owner-conflict";
