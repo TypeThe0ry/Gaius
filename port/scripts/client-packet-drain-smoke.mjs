@@ -174,6 +174,9 @@ assert.match(scheduledWrapper,
 assert.match(scheduledWrapper,
   /String claimSkipReason[\s\S]*clientPacketDrainClaimSkipReason\(packetProcessor\)[\s\S]*recordClientPacketDrainJavaSkipped\(claimSkipReason\)/,
   "claim-skipped path does not retain the precise owner/re-entry reason");
+assert.match(networkSource,
+  /lastSkipReason:[\s\S]*clientPacketDrainLastSkipReason[\s\S]*skipReasons:/,
+  "client packet drain DOM report does not expose the latest bounded skip reason");
 assert.match(scheduledWrapper,
   /catch \(RuntimeException \| Error failure\)[\s\S]*interruptClientPacketDrain\(packetProcessor\)[\s\S]*finally \{[\s\S]*clientPacketDrainEpoch\(\)[\s\S]*clientPacketDrainHandlerCompletions\(\)[\s\S]*finishClientPacketDrain\(packetProcessor\)/,
   "failure/finish does not capture exact epoch/completions before releasing the claim");

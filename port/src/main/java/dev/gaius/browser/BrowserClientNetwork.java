@@ -570,6 +570,9 @@ public final class BrowserClientNetwork {
             stats.clientPacketDrainJavaStarted = stats.clientPacketDrainJavaStarted|0;
             stats.clientPacketDrainJavaCompleted = stats.clientPacketDrainJavaCompleted|0;
             stats.clientPacketDrainJavaSkipped = stats.clientPacketDrainJavaSkipped|0;
+            stats.clientPacketDrainLastSkipReason =
+              typeof stats.clientPacketDrainLastSkipReason === 'string'
+                ? stats.clientPacketDrainLastSkipReason : 'none';
             stats.clientPacketDrainClaimSkippedActiveDrain =
               stats.clientPacketDrainClaimSkippedActiveDrain|0;
             stats.clientPacketDrainClaimSkippedHandlerDepth =
@@ -953,6 +956,7 @@ public final class BrowserClientNetwork {
                 callbacks: stats.clientPacketDrainCallbacks|0,
                 completed: stats.clientPacketDrainJavaCompleted|0,
                 skipped: stats.clientPacketDrainJavaSkipped|0,
+                lastSkipReason: String(stats.clientPacketDrainLastSkipReason || 'none'),
                 skipReasons: {
                   activeDrain: stats.clientPacketDrainClaimSkippedActiveDrain|0,
                   handlerDepth: stats.clientPacketDrainClaimSkippedHandlerDepth|0,
