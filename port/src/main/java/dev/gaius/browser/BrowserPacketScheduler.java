@@ -839,6 +839,47 @@ public final class BrowserPacketScheduler {
         return true;
     }
 
+    /**
+     * Returns a bounded, owner-scoped reason for a failed frame-boundary drain claim.
+     *
+     * <p>The reason is diagnostic only; it deliberately does not claim, mutate, or reset a
+     * PacketProcessor ledger.  The caller must invoke this after {@link
+     * #tryBeginClientPacketDrain(Object, boolean)} returns {@code false}.  Keeping the classifier
+     * side-effect free means a nested handler or a stale owner cannot be made current merely by
+     * asking why the claim was skipped.</p>
+     */
+    public static String clientPacketDrainClaimSkipReason(Object owner) {
+        if (BrowserIntegratedServerMain.isWorkerServer()) {
+            return "worker-server";
+        }
+        if (owner == null) {
+            return "null-owner";
+        }
+        PacketProcessorLedger ledger = packetProcessorLedgerIncludingRetired(owner);
+        if (ledger == null) {
+            return packetProcessorConflictPoisoned || packetProcessorOwnerConflict
+                    || !packetProcessorAccountingValid
+                    ? "owner-conflict" : "unknown-owner";
+        }
+        if (ledger.retired) {
+            return "retired-owner";
+        }
+        if (packetProcessorOwner != owner || packetProcessorGeneration != ledger.generation
+                || !ledger.accountingValid) {
+            return "owner-conflict";
+        }
+        if (ledger.clientPacketDrainActive) {
+            return "active-drain";
+        }
+        if (ledger.queuedPacketHandleDepth > 0) {
+            return "handler-depth";
+        }
+        if (ledger.queuedPackets < CLIENT_PACKET_DRAIN_THRESHOLD) {
+            return "threshold-race";
+        }
+        return "claim-race";
+    }
+
     /** Marks an exceptional or reset-aborted active drain without deriving success from queue depth. */
     public static void interruptClientPacketDrain() {
         PacketProcessorLedger ledger = currentPacketProcessorLedger();

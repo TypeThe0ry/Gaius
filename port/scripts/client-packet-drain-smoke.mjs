@@ -58,6 +58,9 @@ assert.match(schedulerSource,
   /tryBeginClientPacketDrain\(boolean critical\)[\s\S]*clientPacketDrainActive[\s\S]*queuedPacketHandleDepth > 0[\s\S]*queuedPackets < CLIENT_PACKET_DRAIN_THRESHOLD[\s\S]*clientPacketDrainCritical = critical/,
   "the frame-boundary claim is not fail-closed or loses its exact critical mode");
 assert.match(schedulerSource,
+  /clientPacketDrainClaimSkipReason\(Object owner\)[\s\S]*"worker-server"[\s\S]*"null-owner"[\s\S]*"owner-conflict"[\s\S]*"retired-owner"[\s\S]*"active-drain"[\s\S]*"handler-depth"[\s\S]*"threshold-race"[\s\S]*"claim-race"/,
+  "claim-skipped diagnostics lost a bounded owner/re-entry reason classifier");
+assert.match(schedulerSource,
   /tryBeginClientPacketDrain\(boolean critical\)[\s\S]*clientPacketDrainEpoch == Long\.MAX_VALUE[\s\S]*clientPacketDrainEpoch \+ 1L[\s\S]*clientPacketDrainHandlerCompletions = 0/,
   "claimed drains do not receive one fresh completion-accounting epoch");
 assert.match(schedulerSource,
@@ -168,6 +171,9 @@ assert.match(scheduledWrapper,
 assert.match(scheduledWrapper,
   /tryBeginClientPacketDrain\(packetProcessor, pausedBefore\)/,
   "pressure mode does not claim the single scheduled call with its owner");
+assert.match(scheduledWrapper,
+  /String claimSkipReason[\s\S]*clientPacketDrainClaimSkipReason\(packetProcessor\)[\s\S]*recordClientPacketDrainJavaSkipped\(claimSkipReason\)/,
+  "claim-skipped path does not retain the precise owner/re-entry reason");
 assert.match(scheduledWrapper,
   /catch \(RuntimeException \| Error failure\)[\s\S]*interruptClientPacketDrain\(packetProcessor\)[\s\S]*finally \{[\s\S]*clientPacketDrainEpoch\(\)[\s\S]*clientPacketDrainHandlerCompletions\(\)[\s\S]*finishClientPacketDrain\(packetProcessor\)/,
   "failure/finish does not capture exact epoch/completions before releasing the claim");

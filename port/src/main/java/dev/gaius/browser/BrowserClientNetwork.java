@@ -318,7 +318,12 @@ public final class BrowserClientNetwork {
         String outcome = "claim-skipped";
         String failureType = null;
         if (!BrowserPacketScheduler.tryBeginClientPacketDrain(packetProcessor, pausedBefore)) {
-            recordClientPacketDrainJavaSkipped("claim-frame-boundary");
+            // Keep this branch non-recursive and vanilla-compatible, but preserve the exact
+            // owner-scoped reason so a sustained claim skip can be distinguished from a harmless
+            // handler re-entry or a threshold race in the next frame's diagnostics.
+            String claimSkipReason =
+                    BrowserPacketScheduler.clientPacketDrainClaimSkipReason(packetProcessor);
+            recordClientPacketDrainJavaSkipped(claimSkipReason);
             recordClientPacketFrameBoundaryDrain(
                     runTickSequence,
                     0L,
@@ -565,6 +570,18 @@ public final class BrowserClientNetwork {
             stats.clientPacketDrainJavaStarted = stats.clientPacketDrainJavaStarted|0;
             stats.clientPacketDrainJavaCompleted = stats.clientPacketDrainJavaCompleted|0;
             stats.clientPacketDrainJavaSkipped = stats.clientPacketDrainJavaSkipped|0;
+            stats.clientPacketDrainClaimSkippedActiveDrain =
+              stats.clientPacketDrainClaimSkippedActiveDrain|0;
+            stats.clientPacketDrainClaimSkippedHandlerDepth =
+              stats.clientPacketDrainClaimSkippedHandlerDepth|0;
+            stats.clientPacketDrainClaimSkippedOwnerConflict =
+              stats.clientPacketDrainClaimSkippedOwnerConflict|0;
+            stats.clientPacketDrainClaimSkippedThresholdRace =
+              stats.clientPacketDrainClaimSkippedThresholdRace|0;
+            stats.clientPacketDrainClaimSkippedRetiredOwner =
+              stats.clientPacketDrainClaimSkippedRetiredOwner|0;
+            stats.clientPacketDrainClaimSkippedUnknown =
+              stats.clientPacketDrainClaimSkippedUnknown|0;
             stats.clientPacketDrainJavaFailures = stats.clientPacketDrainJavaFailures|0;
             stats.clientPacketDrainRescheduled = stats.clientPacketDrainRescheduled|0;
             stats.clientPacketDrainBelowThreshold =
@@ -936,6 +953,14 @@ public final class BrowserClientNetwork {
                 callbacks: stats.clientPacketDrainCallbacks|0,
                 completed: stats.clientPacketDrainJavaCompleted|0,
                 skipped: stats.clientPacketDrainJavaSkipped|0,
+                skipReasons: {
+                  activeDrain: stats.clientPacketDrainClaimSkippedActiveDrain|0,
+                  handlerDepth: stats.clientPacketDrainClaimSkippedHandlerDepth|0,
+                  ownerConflict: stats.clientPacketDrainClaimSkippedOwnerConflict|0,
+                  thresholdRace: stats.clientPacketDrainClaimSkippedThresholdRace|0,
+                  retiredOwner: stats.clientPacketDrainClaimSkippedRetiredOwner|0,
+                  unknown: stats.clientPacketDrainClaimSkippedUnknown|0
+                },
                 failures: stats.clientPacketDrainJavaFailures|0,
                 rescheduled: stats.clientPacketDrainRescheduled|0,
                 enabled: globalThis.__gaiusClientPacketDrainEnabled === true,
@@ -1361,9 +1386,29 @@ public final class BrowserClientNetwork {
     @JSBody(params = "reason", script = """
             const stats = globalThis.__gaiusNetworkStats;
             if (stats) {
+              const normalized = String(reason || 'unknown');
               stats.clientPacketDrainJavaSkipped =
                 (stats.clientPacketDrainJavaSkipped|0) + 1;
-              stats.clientPacketDrainLastSkipReason = String(reason || 'unknown');
+              stats.clientPacketDrainLastSkipReason = normalized;
+              if (normalized === 'active-drain') {
+                stats.clientPacketDrainClaimSkippedActiveDrain =
+                  (stats.clientPacketDrainClaimSkippedActiveDrain|0) + 1;
+              } else if (normalized === 'handler-depth') {
+                stats.clientPacketDrainClaimSkippedHandlerDepth =
+                  (stats.clientPacketDrainClaimSkippedHandlerDepth|0) + 1;
+              } else if (normalized === 'owner-conflict') {
+                stats.clientPacketDrainClaimSkippedOwnerConflict =
+                  (stats.clientPacketDrainClaimSkippedOwnerConflict|0) + 1;
+              } else if (normalized === 'threshold-race') {
+                stats.clientPacketDrainClaimSkippedThresholdRace =
+                  (stats.clientPacketDrainClaimSkippedThresholdRace|0) + 1;
+              } else if (normalized === 'retired-owner') {
+                stats.clientPacketDrainClaimSkippedRetiredOwner =
+                  (stats.clientPacketDrainClaimSkippedRetiredOwner|0) + 1;
+              } else {
+                stats.clientPacketDrainClaimSkippedUnknown =
+                  (stats.clientPacketDrainClaimSkippedUnknown|0) + 1;
+              }
             }
             """)
     private static native void recordClientPacketDrainJavaSkipped(String reason);
