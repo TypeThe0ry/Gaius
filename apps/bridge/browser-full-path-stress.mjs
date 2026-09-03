@@ -499,8 +499,14 @@ function assertStressSchedulerEvidence(result, tier, configuration) {
     // Runtime evidence names this observed quantity after the service path
     // (`maxPlayTickServicesPerCallback`); keep the contract's descriptive
     // `maxPlayTicksPerSchedulerCallback` name separate from the measured field.
-    assert.equal(scheduler.maxPlayTickServicesPerCallback,
-        configuration.performanceContract.pollScheduler.maxPlayTicksPerSchedulerCallback);
+    // The configured value is a hard upper bound, not a requirement to batch
+    // exactly four ticks: timer phase skew can legitimately leave only one
+    // client due in a callback.  The strict callback/poll duration gates below
+    // still reject an over-budget turn, while this assertion rejects only a
+    // real cap breach.
+    assert.ok(scheduler.maxPlayTickServicesPerCallback <=
+        configuration.performanceContract.pollScheduler.maxPlayTicksPerSchedulerCallback,
+        `stress tier ${tier} observed PLAY tick batch exceeded configured cap`);
     assert.equal(scheduler.maxPlayTickServicesPerCallbackLimit,
         configuration.performanceContract.pollScheduler.maxPlayTicksPerSchedulerCallback);
     assert.equal(scheduler.stopped, true,
