@@ -375,13 +375,21 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 byte[] bytes = data.copyToJavaArray();
                 if (bytes.length > 0) {
                     recordDecodedSlice(socketId, bytes.length);
+                    double pipelineStarted = 0.0;
                     try {
                         if (arrivalTimelineTracing) {
                             recordArrivalPumpBoundary(
                                     socketId, "pipeline-handoff", 0, bytes.length, 0.0);
+                            pipelineStarted = monotonicMillis();
                         }
                         pipeline.fireChannelRead(Unpooled.wrappedBuffer(bytes));
                     } finally {
+                        if (arrivalTimelineTracing) {
+                            double pipelineElapsed = Math.max(
+                                    0.0, monotonicMillis() - pipelineStarted);
+                            recordArrivalPumpBoundary(
+                                    socketId, "pipeline-end", 1, bytes.length, pipelineElapsed);
+                        }
                         finishDecodedSlice(socketId);
                     }
                     chunks++;
@@ -3679,6 +3687,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               'bridge-dequeue',
               'pump-begin',
               'pipeline-handoff',
+              'pipeline-end',
               'pump-end'
             ]);
             function arrivalTimelineEnabled() {
@@ -3895,7 +3904,8 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 pumpSequence: pumpSequence,
                 queueDepth: arrivalTimelineQueueDepth(entry),
                 queuedBytes: queuedBytes(entry),
-                durationMillis: normalizedKind === 'pump-end' ? duration : 0,
+                durationMillis: normalizedKind === 'pump-end' ||
+                  normalizedKind === 'pipeline-end' ? duration : 0,
                 onmessageAt: lastDequeued && lastDequeued.onmessageAt,
                 bridgeEnqueueAt: lastDequeued && lastDequeued.bridgeEnqueueAt,
                 bridgeDequeueAt: lastDequeued && lastDequeued.bridgeDequeueAt,

@@ -81,9 +81,16 @@ assert.ok(pollInboundIndex < copyToJavaArrayIndex
   && copyToJavaArrayIndex < fireChannelReadIndex
   && fireChannelReadIndex < chunksIncrementIndex,
 "per-channel first-chunk order changed: poll -> copy -> fire -> count is required");
-const firstHandoffWindow = channelPump.slice(pollInboundIndex, fireChannelReadIndex);
-assert.doesNotMatch(firstHandoffWindow, /monotonicMillis\(\)/,
-  "first non-empty handoff unexpectedly became re-entrant/time-sliced");
+// Diagnostic pipeline timing is intentionally allowed in this window, but the first handoff
+// must remain one synchronous operation: no nested inbound poll/pump or asynchronous scheduler
+// may run before the current buffer reaches the Netty pipeline.
+const firstHandoffWindow = channelPump.slice(copyToJavaArrayIndex, fireChannelReadIndex);
+const timingCalls = firstHandoffWindow.match(/monotonicMillis\(\)/g) || [];
+assert.ok(timingCalls.length <= 1,
+  "first non-empty handoff added more than one timing sample before fireChannelRead");
+assert.doesNotMatch(firstHandoffWindow,
+  /(?:\bpump(?:AllAndReportProgress)?\s*\(|\bpollInbound\s*\(|\bdeliverInbound\s*\(|Platform\.schedule|setTimeout|setInterval|MessageChannel|new\s+Thread|CompletableFuture)/,
+  "first non-empty handoff became re-entrant or asynchronously scheduled");
 
 const MAX_TOTAL_MILLIS = 4;
 
