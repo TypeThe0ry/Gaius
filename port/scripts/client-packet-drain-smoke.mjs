@@ -166,7 +166,7 @@ assert.doesNotMatch(rawPump, /processQueuedPackets/,
 const scheduledWrapper = between(networkSource,
   "public static void processClientPacketsAtScheduledFrameBoundary(", "@JSBody(params = \"callback\"");
 assert.match(scheduledWrapper,
-  /boolean accountingValid = BrowserPacketScheduler\.bindPacketProcessor\(packetProcessor\);[\s\S]*int queueBefore = BrowserPacketScheduler\.queuedPacketCount\(\);[\s\S]*boolean drainEnabled = isClientPacketFrameBoundaryDrainEnabled\(\);[\s\S]*if \(!accountingValid \|\| queueBefore < 64 \|\| !drainEnabled\)[\s\S]*if \(!accountingValid && queueBefore >= 64 && drainEnabled\)[\s\S]*clientPacketDrainClaimSkipReason\(packetProcessor\)[\s\S]*recordClientPacketDrainJavaSkipped[\s\S]*packetProcessor\.processQueuedPackets\(\);[\s\S]*return;/,
+  /boolean accountingValid = BrowserPacketScheduler\.bindPacketProcessor\(packetProcessor\);[\s\S]*int queueBefore = BrowserPacketScheduler\.queuedPacketCount\(\);[\s\S]*boolean drainEnabled = isClientPacketFrameBoundaryDrainEnabled\(\);[\s\S]*if \(!accountingValid \|\| queueBefore < 64 \|\| !drainEnabled\)[\s\S]*if \(!accountingValid && queueBefore >= 64 && drainEnabled\)[\s\S]*recordClientPacketDrainJavaSkipped[\s\S]*clientPacketDrainClaimSkipReason\(packetProcessor\)[\s\S]*packetProcessor\.processQueuedPackets\(\);[\s\S]*return;/,
   "owner conflict or below-threshold mode must use one vanilla PacketProcessor call and retain bind-failure reason evidence");
 assert.match(scheduledWrapper,
   /pausedBefore \? "critical" : "pressure"/,
