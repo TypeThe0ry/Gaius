@@ -186,7 +186,18 @@ public final class BrowserPacketScheduler {
         }
         PacketProcessorLedger ledger = findPacketProcessorLedger(packetProcessorAccessOwner);
         if (ledger == null || ledger.retired
-                || ledger.generation != packetProcessorAccessGeneration) {
+                || ledger.generation != packetProcessorAccessGeneration
+                // Owner-less compatibility entry points must never observe a ledger after its
+                // accounting epoch has been invalidated.  Owner-aware callbacks deliberately use
+                // packetProcessorLedgerIncludingRetired(owner) instead so an in-flight handler
+                // can still unwind a retired ledger without rebinding the static compatibility
+                // state.
+                || !ledger.accountingValid
+                || packetProcessorOwnerConflict
+                || packetProcessorConflictPoisoned
+                || !packetProcessorAccountingValid
+                || packetProcessorOwner != packetProcessorAccessOwner
+                || packetProcessorGeneration != packetProcessorAccessGeneration) {
             return null;
         }
         return ledger;

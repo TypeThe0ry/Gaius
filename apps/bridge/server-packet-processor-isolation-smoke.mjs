@@ -93,6 +93,31 @@ const ownerContract = {
         "late retired-owner callbacks can still rebind static accounting"),
 };
 
+const currentLedgerStart = schedulerSource.indexOf(
+    "private static PacketProcessorLedger currentPacketProcessorLedger()");
+const currentLedgerEnd = schedulerSource.indexOf(
+    "\n    private static int activePacketProcessorLedgerCount", currentLedgerStart);
+assert.ok(currentLedgerStart >= 0 && currentLedgerEnd > currentLedgerStart,
+    "currentPacketProcessorLedger boundary changed; audit ownerless compatibility fallback");
+const currentLedgerBody = schedulerSource.slice(currentLedgerStart, currentLedgerEnd);
+const currentLedgerGuard = {
+    invalidLedgerRejected: requireMatch(currentLedgerBody,
+        /!ledger\.accountingValid/u,
+        "ownerless compatibility lookup can still return an invalid ledger"),
+    ownerConflictRejected: requireMatch(currentLedgerBody,
+        /packetProcessorOwnerConflict/u,
+        "ownerless compatibility lookup can still return a conflicting ledger"),
+    poisonRejected: requireMatch(currentLedgerBody,
+        /packetProcessorConflictPoisoned/u,
+        "ownerless compatibility lookup can still return a poisoned ledger"),
+    staticAccountingInvalidRejected: requireMatch(currentLedgerBody,
+        /!packetProcessorAccountingValid/u,
+        "ownerless compatibility lookup can ignore the runtime accounting-valid bit"),
+    retiredOwnerAwarePathPreserved: requireMatch(schedulerSource,
+        /public static void packetProcessed\(Object owner\)[\s\S]*?packetProcessorLedgerIncludingRetired\(owner\)[\s\S]*?completeOwnerPacket\(ledger\)/u,
+        "owner-aware retired packet unwind no longer bypasses the ownerless lookup guard"),
+};
+
 const completeOwnerPacketStart = schedulerSource.indexOf(
     "private static void completeOwnerPacket");
 const completeOwnerPacketEnd = schedulerSource.indexOf(
@@ -344,7 +369,10 @@ class OwnerClaimModel {
     constructor() {
         this.owner = null;
         this.generation = 0;
+        this.accessOwner = null;
+        this.accessGeneration = 0;
         this.ownerConflict = false;
+        this.conflictPoisoned = false;
         this.accountingValid = true;
         this.adaptiveDrainEnabled = true;
         this.exactPacketQueuePaused = false;
@@ -358,6 +386,7 @@ class OwnerClaimModel {
     claim(owner) {
         if (owner === null || owner === undefined) {
             this.ownerConflict = true;
+            this.conflictPoisoned = true;
             this.accountingValid = false;
             this.adaptiveDrainEnabled = false;
             this.exactPacketQueuePaused = false;
@@ -367,10 +396,17 @@ class OwnerClaimModel {
             this.owner = owner;
             this.generation = this.generation === Number.MAX_SAFE_INTEGER
                 ? 1 : this.generation + 1;
+            this.accessOwner = owner;
+            this.accessGeneration = this.generation;
             return true;
         }
-        if (this.owner === owner && !this.ownerConflict) return true;
+        if (this.owner === owner && !this.ownerConflict) {
+            this.accessOwner = owner;
+            this.accessGeneration = this.generation;
+            return true;
+        }
         this.ownerConflict = true;
+        this.conflictPoisoned = true;
         this.accountingValid = false;
         this.adaptiveDrainEnabled = false;
         // A stale global pause must not block the other channels after the
@@ -378,6 +414,31 @@ class OwnerClaimModel {
         // equivalent exact-pause invalidation.
         this.exactPacketQueuePaused = false;
         return false;
+    }
+
+    // Mirrors currentPacketProcessorLedger(): owner-less compatibility callers may only receive
+    // a ledger while the access identity, ledger validity, and runtime poison/conflict bits all
+    // describe the same live epoch. Owner-aware callbacks intentionally use their explicit owner
+    // lookup instead, so a retired handler can still unwind after this returns null.
+    compatibilityLedger() {
+        if (this.accessOwner === null || this.owner === null ||
+                !this.accountingValid || this.ownerConflict || this.conflictPoisoned ||
+                this.owner !== this.accessOwner || this.generation !== this.accessGeneration) {
+            return null;
+        }
+        return {owner: this.owner, generation: this.generation};
+    }
+
+    ownerlessPacketBoundaryMode(queueDepth, enabled = true) {
+        const ledger = this.compatibilityLedger();
+        const adaptive = ledger !== null && enabled === true &&
+            this.adaptiveDrainEnabled && Number.isInteger(queueDepth) && queueDepth >= 64;
+        return {
+            mode: adaptive ? "adaptive" : "vanilla",
+            calls: 1,
+            adaptive,
+            ledgerReturned: ledger !== null,
+        };
     }
 
     queue(owner, count) {
@@ -763,11 +824,19 @@ function testBoundedOwnerClaimFailClosed() {
         calls: 1,
         adaptive: true,
     });
+    const ownerlessBeforeConflict = scheduler.ownerlessPacketBoundaryMode(256);
+    assert.deepEqual(ownerlessBeforeConflict, {
+        mode: "adaptive",
+        calls: 1,
+        adaptive: true,
+        ledgerReturned: true,
+    }, "ownerless compatibility must use a valid live ledger before conflict");
 
     // A second owner permanently invalidates the shared accounting lanes for
     // this runtime. No foreign event is allowed to alter A's queue state.
     assert.equal(scheduler.claim(processorB), false);
     assert.equal(scheduler.ownerConflict, true);
+    assert.equal(scheduler.conflictPoisoned, true);
     assert.equal(scheduler.accountingValid, false);
     assert.equal(scheduler.adaptiveDrainEnabled, false);
     assert.equal(scheduler.exactPacketQueuePaused, false);
@@ -788,6 +857,13 @@ function testBoundedOwnerClaimFailClosed() {
         calls: 1,
         adaptive: false,
     }, "owner conflict must choose the conservative one-call vanilla path");
+    const ownerlessFallback = scheduler.ownerlessPacketBoundaryMode(256);
+    assert.deepEqual(ownerlessFallback, {
+        mode: "vanilla",
+        calls: 1,
+        adaptive: false,
+        ledgerReturned: false,
+    }, "ownerless compatibility must not receive the invalid/conflicting ledger");
 
     // A callback from the pre-conflict generation is stale and must not revive
     // accounting or alter the current generation state.
@@ -800,6 +876,7 @@ function testBoundedOwnerClaimFailClosed() {
         ownerGeneration: singleOwnerGeneration,
         processorOwnersObserved: 2,
         ownerConflict: scheduler.ownerConflict,
+        conflictPoisoned: scheduler.conflictPoisoned,
         accountingValid: scheduler.accountingValid,
         adaptiveDrainEnabled: scheduler.adaptiveDrainEnabled,
         exactPacketQueuePaused: scheduler.exactPacketQueuePaused,
@@ -811,6 +888,9 @@ function testBoundedOwnerClaimFailClosed() {
         fallbackModeAfterConflict: conflictFallback.mode,
         fallbackCallsAfterConflict: conflictFallback.calls,
         adaptiveAfterConflict: conflictFallback.adaptive,
+        ownerlessLedgerBeforeConflict: ownerlessBeforeConflict.ledgerReturned,
+        ownerlessLedgerAfterConflict: ownerlessFallback.ledgerReturned,
+        ownerlessFallbackModeAfterConflict: ownerlessFallback.mode,
         foreignEventsIgnored: scheduler.foreignPacketQueued === 3 &&
             scheduler.foreignPacketProcessed === 3,
         closeForeignResetDidNotClearOwner: scheduler.queuedPackets === 72,
@@ -904,6 +984,13 @@ function testCloseInHandlerRebind() {
     packetProcessorOwnerConflict = true;
     packetProcessorAccountingValid = false;
 
+    // The owner-less lookup must be closed while A is retired/invalid, but the explicit
+    // packetProcessed(A) path still owns the ledger needed to unwind the in-flight handler.
+    const ownerlessLedgerDuringRetiredUnwind =
+        ledgerA.retired && !packetProcessorAccountingValid ? null : ledgerA;
+    assert.equal(ownerlessLedgerDuringRetiredUnwind, null,
+        "ownerless compatibility must not expose a retired/invalid ledger during unwind");
+
     ledgerA.queuedPacketHandleDepth--;
     const mirrorDuringRetiredUnwind =
         (packetProcessorOwner === ledgerA.owner && packetProcessorGeneration === ledgerA.generation) ||
@@ -941,6 +1028,7 @@ function testCloseInHandlerRebind() {
             queuedPacketHandleDepth === 2,
         retiredOwnerDepthAfterUnwind: ledgerA.queuedPacketHandleDepth,
         freshOwnerDepthAfterLateRetiredCallback: queuedPacketHandleDepth,
+        ownerlessLedgerDuringRetiredUnwind,
         lateRetiredCallbackMirrored: lateAReturnsToMirror,
         classification: "close-in-handler-owner-unwind-model-not-runtime-proof",
     };
@@ -1054,6 +1142,7 @@ const staticContract = {
     ledgerExhaustionContract,
     ownerResetGuard,
     ownerFallbackContract,
+    currentLedgerGuard,
     resetClearsRuntimeState,
     closeOrder,
     channelCloseIsolation,
@@ -1090,6 +1179,7 @@ const result = {
         boundedOwnerClaimFailClosed:
             boundedOwnerClaim.ownerConflict === true &&
             boundedOwnerClaim.accountingValid === false &&
+            boundedOwnerClaim.conflictPoisoned === true &&
             boundedOwnerClaim.adaptiveDrainEnabled === false &&
             boundedOwnerClaim.exactPacketQueuePaused === false &&
             boundedOwnerClaim.foreignEventsIgnored === true &&
@@ -1097,7 +1187,10 @@ const result = {
             boundedOwnerClaim.staleGenerationEvents === 1 &&
             boundedOwnerClaim.fallbackModeAfterConflict === "vanilla" &&
             boundedOwnerClaim.fallbackCallsAfterConflict === 1 &&
-            boundedOwnerClaim.adaptiveAfterConflict === false,
+            boundedOwnerClaim.adaptiveAfterConflict === false &&
+            boundedOwnerClaim.ownerlessLedgerBeforeConflict === true &&
+            boundedOwnerClaim.ownerlessLedgerAfterConflict === false &&
+            boundedOwnerClaim.ownerlessFallbackModeAfterConflict === "vanilla",
         retiredOwnerLifecycleFailClosed:
             retiredOwnerLifecycle.retiredOwnerNeverRebinds === true &&
             retiredOwnerLifecycle.staleEventsRejected === 6 &&
@@ -1105,7 +1198,8 @@ const result = {
             retiredOwnerLifecycle.concurrentSecondOwnerFailClosed === true,
         conflictResetRebindFailClosed: conflictResetRebind.failClosed === true,
         closeInHandlerRebind: closeInHandlerRebind.closeInHandlerRebind === true &&
-            closeInHandlerRebind.lateRetiredCallbackMirrored === false,
+            closeInHandlerRebind.lateRetiredCallbackMirrored === false &&
+            closeInHandlerRebind.ownerlessLedgerDuringRetiredUnwind === null,
         ledgerSlotExhaustionFailClosed:
             ledgerSlotExhaustion.slotExhaustions === 1 &&
             ledgerSlotExhaustion.exhaustionPoisoned === true &&
