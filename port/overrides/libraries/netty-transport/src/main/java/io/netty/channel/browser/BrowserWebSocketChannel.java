@@ -2227,17 +2227,17 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 return;
               }
               if (event.data instanceof ArrayBuffer) {
-                const arrivalToken = typeof state.recordArrivalMessage === 'function'
+                const binaryArrivalToken = typeof state.recordArrivalMessage === 'function'
                   ? state.recordArrivalMessage(entry, 'websocket', event.data)
                   : null;
-                deliverInbound(entry, event.data, arrivalToken);
+                deliverInbound(entry, event.data, binaryArrivalToken);
               } else if (event.data && typeof event.data.arrayBuffer === 'function') {
-                const arrivalToken = typeof state.recordArrivalMessage === 'function'
+                const blobArrivalToken = typeof state.recordArrivalMessage === 'function'
                   ? state.recordArrivalMessage(entry, 'websocket-blob', event.data)
                   : null;
                 event.data.arrayBuffer().then(function(buffer) {
                   if (generation !== entry.webSocketGeneration || entry.closed) return;
-                  deliverInbound(entry, buffer, arrivalToken);
+                  deliverInbound(entry, buffer, blobArrivalToken);
                 }, function(error) {
                   if (generation !== entry.webSocketGeneration || entry.closed) return;
                   fail(entry, error && (error.message || error));
