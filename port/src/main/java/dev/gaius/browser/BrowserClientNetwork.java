@@ -15,13 +15,13 @@ public final class BrowserClientNetwork {
     }
 
     public static void install() {
-        if (installed) {
-            return;
-        }
+        // Minecraft.runTick calls this on every client frame.  Keep the Java entry cheap and
+        // let the JS bridge decide whether the current bridge object is already installed.  A
+        // boolean-only guard permanently binds the callback to the first bridge: if a reconnect
+        // or worker handoff replaces __gaiusNettyBridge, the new bridge would never receive an
+        // inbound pump.  installInboundPump() is idempotent for the same bridge and retires a
+        // stale scheduler when the bridge identity changes.
         configureClientPacketDrain();
-        // Minecraft starts ticking before the first browser socket constructs its bridge.
-        // Keep retrying from runTick until that bridge is available instead of permanently
-        // missing the callback for a later multiplayer connection.
         installed = installInboundPump(BrowserClientNetwork::pumpInbound);
     }
 
@@ -379,6 +379,19 @@ public final class BrowserClientNetwork {
             const bridge = globalThis.__gaiusNettyBridge;
             if (!bridge) return false;
             const stats = bridge.stats || globalThis.__gaiusNetworkStats || {};
+            // runTick invokes BrowserClientNetwork.install() every frame.  Do not tear down a
+            // healthy scheduler (or cancel its pending MessageChannel callback) on every frame;
+            // only rebuild when the bridge object or one of its required hooks has changed.
+            // Binding the marker back to the object identity prevents a copied marker on a
+            // replacement bridge from authorizing closures that still capture the old bridge.
+            const installedForThisBridge = bridge.__gaiusInboundPumpInstalledBy === bridge &&
+              typeof bridge.inboundPump === 'function' &&
+              typeof bridge.clientPacketDrain === 'function' &&
+              typeof bridge.invalidateClientPacketDrain === 'function' &&
+              bridge.inboundPumpScheduler &&
+              bridge.inboundPumpScheduler.version === 2 &&
+              bridge.inboundPumpScheduler.__gaiusRetired !== true;
+            if (installedForThisBridge) return true;
             const clock = function() {
               return typeof performance !== 'undefined' && performance.now
                 ? performance.now()
@@ -989,6 +1002,7 @@ public final class BrowserClientNetwork {
                 delete recovery.pendingClientPacketDrainSession;
               }
             }
+            bridge.__gaiusInboundPumpInstalledBy = bridge;
             return true;
             """)
     private static native boolean installInboundPump(BrowserPumpCallback callback);
