@@ -40,8 +40,11 @@ const installMethod = network.slice(installMethodStart, installMethodEnd);
 assert.doesNotMatch(installMethod, /if\s*\(installed\)\s*\{\s*return;/,
   "install() must not permanently bind the first bridge object");
 assert.match(installMethod,
-  /configureClientPacketDrain\(\);[\s\S]*installed\s*=\s*installInboundPump\(/,
+  /configureClientPacketDrain\(\);[\s\S]*installed\s*=\s*installInboundPump\(PUMP_CALLBACK\)/,
   "install() must resolve drain configuration before bridge installation");
+assert.match(network,
+  /private static final BrowserPumpCallback PUMP_CALLBACK = BrowserClientNetwork::pumpInbound;/,
+  "per-frame bridge retries must reuse one cached JSFunctor");
 
 const jsBodyStart = network.indexOf("@JSBody(params = \"callback\", script = \"\"\"");
 const jsBodyEnd = network.indexOf("    private static native boolean installInboundPump", jsBodyStart);

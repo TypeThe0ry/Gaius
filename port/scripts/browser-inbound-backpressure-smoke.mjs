@@ -98,8 +98,11 @@ assert.match(source,
   /wasPaused && !state\.exactPacketQueuePaused[\s\S]*decodedPacketQueueResumes\+\+;[\s\S]*signalInbound\(\);/,
   "exact-queue resume does not wake already-buffered raw transport input");
 assert.match(clientNetwork,
-  /installInboundPump\(BrowserClientNetwork::pumpInbound\)/,
-  "the browser bridge does not install exactly one raw-transport Java callback");
+  /private static final BrowserPumpCallback PUMP_CALLBACK = BrowserClientNetwork::pumpInbound;/,
+  "the browser bridge does not cache its raw-transport Java callback");
+assert.match(clientNetwork,
+  /installInboundPump\(PUMP_CALLBACK\)/,
+  "the browser bridge does not install exactly one cached raw-transport callback");
 assert.match(clientNetwork,
   /private static native boolean installInboundPump\(BrowserPumpCallback callback\);/,
   "the browser bridge retained a second client PLAY callback parameter");

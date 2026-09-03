@@ -193,10 +193,13 @@ for (const trimVariable of [
     1, `install JSBody lost its unique ${trimVariable} ring-trim declaration`);
 }
 assert.match(networkSource,
-  /installInboundPump\(BrowserClientNetwork::pumpInbound\)/,
-  "BrowserClientNetwork.install no longer supplies exactly the raw transport callback");
+  /private static final BrowserPumpCallback PUMP_CALLBACK = BrowserClientNetwork::pumpInbound;/,
+  "BrowserClientNetwork.install no longer caches the raw transport callback");
 assert.match(networkSource,
-  /configureClientPacketDrain\(\);[\s\S]*installInboundPump\(BrowserClientNetwork::pumpInbound\)/,
+  /installInboundPump\(PUMP_CALLBACK\)/,
+  "BrowserClientNetwork.install no longer supplies exactly the cached raw transport callback");
+assert.match(networkSource,
+  /configureClientPacketDrain\(\);[\s\S]*installInboundPump\(PUMP_CALLBACK\)/,
   "client packet drain opt-in is not resolved before the raw pump is installed");
 const drainOptInScript = jsBodyBefore(
   networkSource,

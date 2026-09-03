@@ -8,6 +8,7 @@ import org.teavm.jso.JSObject;
 
 /** Keeps browser transport decoding live without running PLAY handlers on a WebSocket callback. */
 public final class BrowserClientNetwork {
+    private static final BrowserPumpCallback PUMP_CALLBACK = BrowserClientNetwork::pumpInbound;
     private static boolean installed;
     private static boolean pumping;
 
@@ -22,7 +23,9 @@ public final class BrowserClientNetwork {
         // inbound pump.  installInboundPump() is idempotent for the same bridge and retires a
         // stale scheduler when the bridge identity changes.
         configureClientPacketDrain();
-        installed = installInboundPump(BrowserClientNetwork::pumpInbound);
+        // Cache the JSFunctor so the per-frame retry path allocates no callback wrapper.  The
+        // bridge-side identity guard decides whether this cached callback is actually rebound.
+        installed = installInboundPump(PUMP_CALLBACK);
     }
 
     /**
