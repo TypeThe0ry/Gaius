@@ -1671,9 +1671,12 @@ try {
                     `${client.username} interrupted batch did not reach Java final close`);
                 assert.ok(client.chunkBatchStarts >= client.chunkBatchFinished,
                     `${client.username} chunk-batch counters regressed at transport drop`);
-                assert.equal(client.chunkBatchStarts - client.chunkBatchFinished,
-                    client.chunkBatchOpen ? 1 : 0,
+                const outstanding = client.chunkBatchStarts - client.chunkBatchFinished;
+                assert.ok(outstanding >= 0 && outstanding <= 1,
                     `${client.username} retained more than one interrupted chunk batch`);
+                assert.equal(outstanding,
+                    client.chunkBatchOpenAtTransportDrop ? 1 : 0,
+                    `${client.username} interrupted chunk batch boundary disagreed with counters`);
                 assert.equal(client.chunkBatchFinished, client.chunkBatchAcknowledgements,
                     `${client.username} completed chunk batches omitted an ACK`);
             }

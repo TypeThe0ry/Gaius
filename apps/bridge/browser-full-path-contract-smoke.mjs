@@ -1247,7 +1247,7 @@ const chunkBatchLifecycleAllowed = ({
 }) => {
     if (interrupted) {
         return openAtDrop === true && closeReason === "java-final-close" &&
-            starts >= finished && starts - finished === (open ? 1 : 0) &&
+            starts >= finished && starts - finished === 1 && open === true &&
             finished === acknowledgements;
     }
     return starts === finished && finished === acknowledgements && open === false;
@@ -1259,7 +1259,7 @@ assert.equal(chunkBatchLifecycleAllowed({
 assert.equal(chunkBatchLifecycleAllowed({
     starts: 6, finished: 6, acknowledgements: 6, open: false,
     interrupted: true, openAtDrop: true, closeReason: "java-final-close",
-}), true, "a dropped batch that finishes before close should remain admissible");
+}), false, "an interrupted marker without an outstanding batch must fail closed");
 assert.equal(chunkBatchLifecycleAllowed({
     starts: 6, finished: 5, acknowledgements: 5, open: true,
     interrupted: false, openAtDrop: false, closeReason: "java-final-close",
@@ -1272,6 +1272,14 @@ assert.equal(chunkBatchLifecycleAllowed({
     starts: 6, finished: 5, acknowledgements: 4, open: true,
     interrupted: true, openAtDrop: true, closeReason: "java-final-close",
 }), false, "completed batches without ACK must remain a hard failure");
+assert.equal(chunkBatchLifecycleAllowed({
+    starts: 6, finished: 5, acknowledgements: 5, open: true,
+    interrupted: true, openAtDrop: false, closeReason: "java-final-close",
+}), false, "interrupted marker without an immutable open-at-drop snapshot must fail closed");
+assert.equal(chunkBatchLifecycleAllowed({
+    starts: 6, finished: 5, acknowledgements: 5, open: true,
+    interrupted: true, openAtDrop: true, closeReason: "transport-drop",
+}), false, "interrupted marker without Java final close must fail closed");
 assert.match(fullPathSource,
     /acknowledgement\.writeFloatBE\(desiredChunksPerTick, 0\)/);
 assert.match(fullPathSource,
