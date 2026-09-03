@@ -406,6 +406,9 @@ public final class BrowserClientNetwork {
                 : Date.now();
             };
             let scheduler = bridge.inboundPumpScheduler;
+            const installedScheduler = bridge.__gaiusInboundPumpInstalledScheduler;
+            const schedulerIdentityDrift = !!(installedScheduler &&
+              installedScheduler !== scheduler);
             const observedBridgeGeneration = Number(bridge.inboundPumpGeneration);
             const observedSchedulerGeneration = Number(scheduler && scheduler.generation);
             const observedBridgeGenerationValid =
@@ -421,42 +424,48 @@ public final class BrowserClientNetwork {
             const activeGenerationDrift = !!(scheduler && scheduler.pending &&
               observedBridgeGenerationValid && observedSchedulerGenerationValid &&
               observedBridgeGeneration !== observedSchedulerGeneration);
+            const retireScheduler = function(stale) {
+              if (!stale || stale.__gaiusRetired === true) return;
+              stale.__gaiusRetired = true;
+              const retiredPending = stale.pending;
+              if (retiredPending && retiredPending.watchdog) {
+                try { clearTimeout(retiredPending.watchdog); } catch (ignored) {}
+                retiredPending.watchdog = 0;
+              }
+              stale.pending = null;
+              // Invalidate a queued diagnostics microtask from a retired scheduler before
+              // replacing it; transport callbacks use a separate token/queue and are untouched.
+              let retiredGeneration =
+                ((Number(stale.reportGeneration) || 0) + 1) >>> 0;
+              if (retiredGeneration === 0) retiredGeneration = 1;
+              stale.reportGeneration = retiredGeneration;
+              stale.reportPending = false;
+              stale.reportDirty = false;
+              if (stale.channel) {
+                try { stale.channel.port1.onmessage = null; } catch (ignored) {}
+                try { if (stale.channel.port1.close) stale.channel.port1.close(); }
+                catch (ignored) {}
+                try { if (stale.channel.port2.close) stale.channel.port2.close(); }
+                catch (ignored) {}
+              }
+            };
             if (!scheduler || scheduler.version !== 2 || scheduler.__gaiusRetired === true ||
-                activeGenerationInvalid || activeGenerationDrift) {
+                schedulerIdentityDrift || activeGenerationInvalid || activeGenerationDrift) {
               const replacementBridgeGeneration = Number(bridge.inboundPumpGeneration);
               const retiredSchedulerGeneration = Number(scheduler && scheduler.generation);
               const replacementBaseGeneration = Math.max(
                 Number.isFinite(replacementBridgeGeneration) && replacementBridgeGeneration > 0
                   ? replacementBridgeGeneration : 0,
                 Number.isFinite(retiredSchedulerGeneration) && retiredSchedulerGeneration > 0
-                  ? retiredSchedulerGeneration : 0
+                  ? retiredSchedulerGeneration : 0,
+                Number.isFinite(Number(installedScheduler && installedScheduler.generation)) &&
+                    Number(installedScheduler.generation) > 0
+                  ? Number(installedScheduler.generation) : 0
               );
               let nextGeneration = (replacementBaseGeneration + 1) >>> 0;
               if (nextGeneration === 0) nextGeneration = 1;
-              if (scheduler) {
-                scheduler.__gaiusRetired = true;
-                const retiredPending = scheduler.pending;
-                if (retiredPending && retiredPending.watchdog) {
-                  try { clearTimeout(retiredPending.watchdog); } catch (ignored) {}
-                  retiredPending.watchdog = 0;
-                }
-                scheduler.pending = null;
-                // Invalidate a queued diagnostics microtask from a retired scheduler before
-                // replacing it; transport callbacks use a separate token/queue and are untouched.
-                let retiredGeneration =
-                  ((Number(scheduler.reportGeneration) || 0) + 1) >>> 0;
-                if (retiredGeneration === 0) retiredGeneration = 1;
-                scheduler.reportGeneration = retiredGeneration;
-                scheduler.reportPending = false;
-                scheduler.reportDirty = false;
-              }
-              if (scheduler && scheduler.channel) {
-                try { scheduler.channel.port1.onmessage = null; } catch (ignored) {}
-                try { if (scheduler.channel.port1.close) scheduler.channel.port1.close(); }
-                catch (ignored) {}
-                try { if (scheduler.channel.port2.close) scheduler.channel.port2.close(); }
-                catch (ignored) {}
-              }
+              retireScheduler(scheduler);
+              if (installedScheduler !== scheduler) retireScheduler(installedScheduler);
               scheduler = {
                 version: 2,
                 // Pump generation changes whenever this scheduler is replaced.  A

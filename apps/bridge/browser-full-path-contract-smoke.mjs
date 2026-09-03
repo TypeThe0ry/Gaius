@@ -39,8 +39,11 @@ assert.match(browserClientNetworkSource,
     /function schedulePump[\s\S]*?globalThis\.__gaiusNettyBridge !== bridge/u,
     "stale scheduler calls must reject a replaced bridge object");
 assert.match(browserClientNetworkSource,
-    /scheduler\.__gaiusRetired = true[\s\S]*?retiredPending\.watchdog/u,
+    /retireScheduler\s*=\s*function\(stale\)[\s\S]*?stale\.__gaiusRetired = true[\s\S]*?retiredPending\.watchdog/u,
     "scheduler replacement must retire and clean the old pending watchdog");
+assert.match(browserClientNetworkSource,
+    /schedulerIdentityDrift[\s\S]*?retireScheduler\(installedScheduler\)/u,
+    "same-bridge scheduler replacement must retire the previously installed scheduler");
 assert.match(browserClientNetworkSource,
     /scheduler\.version !== 2 \|\| scheduler\.__gaiusRetired === true/u,
     "retired scheduler objects must be replaced if reattached");

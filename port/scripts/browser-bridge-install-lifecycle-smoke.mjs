@@ -63,6 +63,9 @@ assert.match(installScript,
   /bridge\.inboundPumpScheduler\.version === 2[\s\S]*__gaiusRetired !== true/,
   "same-object guard does not verify the scheduler generation state");
 assert.match(installScript,
+  /schedulerIdentityDrift[\s\S]*retireScheduler\(installedScheduler\)/,
+  "same-object scheduler replacement does not retire the previously installed scheduler");
+assert.match(installScript,
   /__gaiusInboundPumpInstalledScheduler\s*===\s*bridge\.inboundPumpScheduler/,
   "same-object guard does not verify scheduler object identity");
 assert.match(installScript, /bridge\.__gaiusInboundPumpInstalledBy\s*=\s*bridge/,
@@ -100,13 +103,19 @@ function hook(name) {
 function ensureInstalled(bridge, stats) {
   if (!bridge) return false;
   const scheduler = bridge.inboundPumpScheduler;
+  const installedScheduler = bridge.__gaiusInboundPumpInstalledScheduler;
   const installedForThisBridge = bridge.__gaiusInboundPumpInstalledBy === bridge &&
-    bridge.__gaiusInboundPumpInstalledScheduler === scheduler &&
+    installedScheduler === scheduler &&
     typeof bridge.inboundPump === "function" &&
     typeof bridge.clientPacketDrain === "function" &&
     typeof bridge.invalidateClientPacketDrain === "function" &&
     scheduler && scheduler.version === 2 && scheduler.__gaiusRetired !== true;
   if (installedForThisBridge) return true;
+  if (installedScheduler && installedScheduler !== scheduler) {
+    installedScheduler.__gaiusRetired = true;
+    installedScheduler.pending = null;
+  }
+  if (scheduler && scheduler.__gaiusRetired === true) scheduler.pending = null;
   bridge.inboundPumpScheduler = {
     version: 2,
     generation: (Number(scheduler?.generation) || 0) + 1,
@@ -144,6 +153,7 @@ const replacedScheduler = {
   pending: null,
   __gaiusRetired: false,
 };
+const previousScheduler = firstBridge.__gaiusInboundPumpInstalledScheduler;
 firstBridge.inboundPumpScheduler = replacedScheduler;
 const installationCountBeforeSchedulerReplacement = stats.inboundPumpInstalled;
 assert.equal(ensureInstalled(firstBridge, stats), true,
@@ -153,6 +163,12 @@ assert.equal(stats.inboundPumpInstalled, installationCountBeforeSchedulerReplace
 assert.equal(firstBridge.__gaiusInboundPumpInstalledScheduler,
   firstBridge.inboundPumpScheduler,
   "scheduler replacement did not publish the repaired scheduler marker");
+assert.equal(previousScheduler.__gaiusRetired, true,
+  "same-bridge scheduler replacement left the old scheduler live");
+assert.equal(previousScheduler.pending, null,
+  "same-bridge scheduler replacement left a stale pending callback");
+assert.equal(replacedScheduler.__gaiusRetired, false,
+  "the replacement scheduler was incorrectly retired while being installed");
 
 const secondBridge = {stats};
 assert.equal(ensureInstalled(secondBridge, stats), true,
