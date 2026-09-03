@@ -92,6 +92,7 @@ public final class BrowserClientNetwork {
               bridge.clientPacketDrainDemand = false;
               bridge.clientPacketDrainDemandToken = '';
               bridge.clientPacketDrainPending = false;
+              stats.clientPacketDrainLastSkipReason = 'none';
               stats.clientPacketDrainSessionBegins =
                 (Number(stats.clientPacketDrainSessionBegins) || 0) + 1;
               stats.clientPacketDrainSessionSequence = sequence;
@@ -301,7 +302,12 @@ public final class BrowserClientNetwork {
             PacketProcessor packetProcessor) {
         boolean accountingValid = BrowserPacketScheduler.bindPacketProcessor(packetProcessor);
         int queueBefore = BrowserPacketScheduler.queuedPacketCount();
-        if (!accountingValid || queueBefore < 64 || !isClientPacketFrameBoundaryDrainEnabled()) {
+        boolean drainEnabled = isClientPacketFrameBoundaryDrainEnabled();
+        if (!accountingValid || queueBefore < 64 || !drainEnabled) {
+            if (!accountingValid && queueBefore >= 64 && drainEnabled) {
+                recordClientPacketDrainJavaSkipped(
+                        BrowserPacketScheduler.clientPacketDrainClaimSkipReason(packetProcessor));
+            }
             packetProcessor.processQueuedPackets();
             return;
         }

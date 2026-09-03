@@ -166,8 +166,8 @@ assert.doesNotMatch(rawPump, /processQueuedPackets/,
 const scheduledWrapper = between(networkSource,
   "public static void processClientPacketsAtScheduledFrameBoundary(", "@JSBody(params = \"callback\"");
 assert.match(scheduledWrapper,
-  /boolean accountingValid = BrowserPacketScheduler\.bindPacketProcessor\(packetProcessor\);[\s\S]*int queueBefore = BrowserPacketScheduler\.queuedPacketCount\(\);[\s\S]*if \(!accountingValid \|\| queueBefore < 64 \|\| !isClientPacketFrameBoundaryDrainEnabled\(\)[\s\S]*packetProcessor\.processQueuedPackets\(\);[\s\S]*return;/,
-  "owner conflict or below-threshold mode must use one vanilla PacketProcessor call");
+  /boolean accountingValid = BrowserPacketScheduler\.bindPacketProcessor\(packetProcessor\);[\s\S]*int queueBefore = BrowserPacketScheduler\.queuedPacketCount\(\);[\s\S]*boolean drainEnabled = isClientPacketFrameBoundaryDrainEnabled\(\);[\s\S]*if \(!accountingValid \|\| queueBefore < 64 \|\| !drainEnabled\)[\s\S]*if \(!accountingValid && queueBefore >= 64 && drainEnabled\)[\s\S]*clientPacketDrainClaimSkipReason\(packetProcessor\)[\s\S]*recordClientPacketDrainJavaSkipped[\s\S]*packetProcessor\.processQueuedPackets\(\);[\s\S]*return;/,
+  "owner conflict or below-threshold mode must use one vanilla PacketProcessor call and retain bind-failure reason evidence");
 assert.match(scheduledWrapper,
   /pausedBefore \? "critical" : "pressure"/,
   "the exact paused queue does not retain its critical telemetry mode");
@@ -180,6 +180,9 @@ assert.match(scheduledWrapper,
 assert.match(networkSource,
   /lastSkipReason:[\s\S]*clientPacketDrainLastSkipReason[\s\S]*skipReasons:[\s\S]*workerServer:[\s\S]*nullOwner:[\s\S]*claimRace:/,
   "client packet drain DOM report does not expose the latest bounded skip reason or all classifier buckets");
+assert.match(networkSource,
+  /clientPacketDrainSession = session;[\s\S]*clientPacketDrainLastSkipReason = 'none';/,
+  "a new remote drain session can inherit a stale skip reason from the previous connection");
 assert.match(scheduledWrapper,
   /catch \(RuntimeException \| Error failure\)[\s\S]*interruptClientPacketDrain\(packetProcessor\)[\s\S]*finally \{[\s\S]*clientPacketDrainEpoch\(\)[\s\S]*clientPacketDrainHandlerCompletions\(\)[\s\S]*finishClientPacketDrain\(packetProcessor\)/,
   "failure/finish does not capture exact epoch/completions before releasing the claim");
