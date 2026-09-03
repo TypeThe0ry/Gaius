@@ -4842,7 +4842,8 @@ def check_source_patches() -> None:
         (
             "Browser bridge accepts a null WebSocket send callback as success",
             "if (error) {" in bridge_main
-            and "error && webSocket.readyState === WebSocket.OPEN" in bridge_main
+            and "error && !tunnelCancelled" in bridge_main
+            and "webSocket.readyState === WebSocket.OPEN" in bridge_main
             and "error !== undefined" not in bridge_main,
         ),
         (
@@ -4856,7 +4857,7 @@ def check_source_patches() -> None:
             and "patchConnectionBrowserWebSocket" in client_patcher
             and "io/netty/channel/browser/BrowserWebSocketChannel" in client_patcher
             and "disableResolver" in client_patcher
-            and "pumpAll" in client_patcher,
+            and "pumpBrowserChannelsAtFrameBoundary" in client_patcher,
         ),
         (
             "Minecraft patcher ignores transient null entities from multiplayer render iteration",
@@ -5542,7 +5543,10 @@ def check_source_patches() -> None:
             and "public static void pumpNow()" not in browser_client_network
             and "public static boolean hasPumpableInput()" in netty_browser_channel
             and "state.exactPacketQueuePaused" in netty_browser_channel
-            and "state.inboundPump()" in netty_browser_channel,
+            # The bridge passes a reason string on wake; require a guarded
+            # callable invocation rather than the obsolete zero-argument spelling.
+            and "typeof state.inboundPump === 'function'" in netty_browser_channel
+            and "state.inboundPump(" in netty_browser_channel,
         ),
         (
             "Client PLAY pressure replaces the one scheduled vanilla FIFO call without external Java re-entry",
@@ -6401,7 +6405,7 @@ def check_source_patches() -> None:
                 in client_patcher
             and "method.instructions.insert(browserPackets)" in client_patcher
             and '"io/netty/channel/browser/BrowserWebSocketChannel"' in client_patcher
-            and '"pumpAll"' in client_patcher,
+            and "pumpBrowserChannelsAtFrameBoundary" in client_patcher,
         ),
         (
             "Worker input wakeup retains wrong-thread pending work",
@@ -9503,8 +9507,9 @@ def check_overlay_bytecode() -> None:
             and "connect:(Ljava/net/InetAddress;I)" not in connection_connect,
         ),
         (
-            "Connection.tick pumps browser WebSocket channels",
-            "io/netty/channel/browser/BrowserWebSocketChannel.pumpAll:()V" in connection_tick,
+            "Connection.tick does not duplicate the frame-boundary browser pump",
+            "io/netty/channel/browser/BrowserWebSocketChannel.pumpAll:()V" not in connection_tick
+            and "BrowserClientNetwork.pumpBrowserChannelsAtFrameBoundary" not in connection_tick,
         ),
         (
             "ServerAddressResolver leaves multiplayer hosts unresolved for bridge DNS",
@@ -11114,11 +11119,11 @@ def check_overlay_bytecode() -> None:
         ),
         (
             "Minecraft compiled overlay invokes the scheduled packet boundary on every browser tick",
-            "BrowserWebSocketChannel.pumpAll" in minecraft_run_tick
+            "BrowserClientNetwork.pumpBrowserChannelsAtFrameBoundary" in minecraft_run_tick
             and "BrowserClientNetwork.processClientPacketsAtScheduledFrameBoundary"
                 in minecraft_run_tick
             and "PacketProcessor.processQueuedPackets" not in minecraft_run_tick
-            and minecraft_run_tick.find("BrowserWebSocketChannel.pumpAll")
+            and minecraft_run_tick.find("BrowserClientNetwork.pumpBrowserChannelsAtFrameBoundary")
                 < minecraft_run_tick.find(
                     "BrowserClientNetwork.processClientPacketsAtScheduledFrameBoundary"
                 ),
@@ -11499,11 +11504,13 @@ def check_overlay_bytecode() -> None:
             and minecraft_run_server.find("BrowserWorldgenScheduler.checkpoint")
                 > minecraft_run_server.find("processPacketsAndTick:(Z)V")
             and "BrowserWorldgenScheduler.checkpoint" not in minecraft_process_packets_and_tick
-            and "BrowserWebSocketChannel.pumpAll" in minecraft_process_packets_and_tick
+            and "BrowserClientNetwork.pumpBrowserChannelsAtFrameBoundary"
+                in minecraft_process_packets_and_tick
             and "BrowserIntegratedServerMain.tickIntegratedServerDistances"
                 in minecraft_process_packets_and_tick
             and "PacketProcessor.processQueuedPackets" in minecraft_process_packets_and_tick
-            and minecraft_process_packets_and_tick.find("BrowserWebSocketChannel.pumpAll")
+            and minecraft_process_packets_and_tick.find(
+                "BrowserClientNetwork.pumpBrowserChannelsAtFrameBoundary")
                 < minecraft_process_packets_and_tick.find(
                     "BrowserIntegratedServerMain.tickIntegratedServerDistances")
             and minecraft_process_packets_and_tick.find(
@@ -11592,7 +11599,8 @@ def check_overlay_bytecode() -> None:
             and "TModernRuntimeSupport.yieldToEventLoop:(I)V"
                 in worldgen_yield_reentrant
             and "Method drainUrgentPackets:()Z" in browser_pump_urgent_packets
-            and "BrowserWebSocketChannel.pumpAll" in browser_drain_urgent_packets
+            and "BrowserClientNetwork.pumpBrowserChannelsAtFrameBoundary"
+                in browser_drain_urgent_packets
             and "MinecraftServer.packetProcessor" in browser_drain_urgent_packets
             and "PacketProcessor.processQueuedPackets" in browser_drain_urgent_packets,
         ),
