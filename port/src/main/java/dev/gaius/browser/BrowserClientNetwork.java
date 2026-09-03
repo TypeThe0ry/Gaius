@@ -583,6 +583,12 @@ public final class BrowserClientNetwork {
               stats.clientPacketDrainClaimSkippedThresholdRace|0;
             stats.clientPacketDrainClaimSkippedRetiredOwner =
               stats.clientPacketDrainClaimSkippedRetiredOwner|0;
+            stats.clientPacketDrainClaimSkippedWorkerServer =
+              stats.clientPacketDrainClaimSkippedWorkerServer|0;
+            stats.clientPacketDrainClaimSkippedNullOwner =
+              stats.clientPacketDrainClaimSkippedNullOwner|0;
+            stats.clientPacketDrainClaimSkippedClaimRace =
+              stats.clientPacketDrainClaimSkippedClaimRace|0;
             stats.clientPacketDrainClaimSkippedUnknown =
               stats.clientPacketDrainClaimSkippedUnknown|0;
             stats.clientPacketDrainJavaFailures = stats.clientPacketDrainJavaFailures|0;
@@ -963,6 +969,9 @@ public final class BrowserClientNetwork {
                   ownerConflict: stats.clientPacketDrainClaimSkippedOwnerConflict|0,
                   thresholdRace: stats.clientPacketDrainClaimSkippedThresholdRace|0,
                   retiredOwner: stats.clientPacketDrainClaimSkippedRetiredOwner|0,
+                  workerServer: stats.clientPacketDrainClaimSkippedWorkerServer|0,
+                  nullOwner: stats.clientPacketDrainClaimSkippedNullOwner|0,
+                  claimRace: stats.clientPacketDrainClaimSkippedClaimRace|0,
                   unknown: stats.clientPacketDrainClaimSkippedUnknown|0
                 },
                 failures: stats.clientPacketDrainJavaFailures|0,
@@ -1409,6 +1418,15 @@ public final class BrowserClientNetwork {
               } else if (normalized === 'retired-owner') {
                 stats.clientPacketDrainClaimSkippedRetiredOwner =
                   (stats.clientPacketDrainClaimSkippedRetiredOwner|0) + 1;
+              } else if (normalized === 'worker-server') {
+                stats.clientPacketDrainClaimSkippedWorkerServer =
+                  (stats.clientPacketDrainClaimSkippedWorkerServer|0) + 1;
+              } else if (normalized === 'null-owner') {
+                stats.clientPacketDrainClaimSkippedNullOwner =
+                  (stats.clientPacketDrainClaimSkippedNullOwner|0) + 1;
+              } else if (normalized === 'claim-race') {
+                stats.clientPacketDrainClaimSkippedClaimRace =
+                  (stats.clientPacketDrainClaimSkippedClaimRace|0) + 1;
               } else {
                 stats.clientPacketDrainClaimSkippedUnknown =
                   (stats.clientPacketDrainClaimSkippedUnknown|0) + 1;
