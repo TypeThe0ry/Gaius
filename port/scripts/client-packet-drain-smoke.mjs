@@ -883,6 +883,56 @@ assert.equal(midDrainReset.stopReason, "interrupted");
 assert.notEqual(midDrainReset.handlerCompletions, midDrainReset.queueDepthReduction,
   "mid-drain reset still overstates handlers from queueBefore - queueAfter");
 
+// Exercise the diagnostic classifier and its JS bucket bridge as a pure model. This keeps
+// diagnostics side-effect free and makes every bounded reason observable without requiring a
+// TeaVM build just to test precedence or counter accounting.
+const claimClassifier = between(
+  schedulerSource,
+  "public static String clientPacketDrainClaimSkipReason(Object owner)",
+  "/** Marks an exceptional or reset-aborted active drain",
+);
+assert.doesNotMatch(claimClassifier,
+  /^\s+(?:packetProcessor|clientPacketDrain)\w*\s*=(?!=)/m,
+  "claim-skip classifier must not mutate scheduler state");
+const skipReasonScript = jsBodyBefore(
+  networkSource,
+  "private static native void recordClientPacketDrainJavaSkipped(String reason);",
+);
+new vm.Script(`(function(reason) {${skipReasonScript}\n})`);
+const skipReasonCases = [
+  ["worker-server", "workerServer"],
+  ["null-owner", "nullOwner"],
+  ["owner-conflict", "ownerConflict"],
+  ["retired-owner", "retiredOwner"],
+  ["active-drain", "activeDrain"],
+  ["handler-depth", "handlerDepth"],
+  ["threshold-race", "thresholdRace"],
+  ["claim-race", "claimRace"],
+  ["unknown-owner", "unknown"],
+];
+for (const [reason, bucket] of skipReasonCases) {
+  const sandbox = {};
+  sandbox.globalThis = sandbox;
+  sandbox.__gaiusNetworkStats = {};
+  vm.runInNewContext(`(function(reason) {${skipReasonScript}\n})(${JSON.stringify(reason)})`, sandbox);
+  const stats = sandbox.__gaiusNetworkStats;
+  assert.equal(stats.clientPacketDrainJavaSkipped, 1,
+    `${reason} did not increment the total skipped counter`);
+  assert.equal(stats.clientPacketDrainLastSkipReason, reason,
+    `${reason} was not retained as the latest skip reason`);
+  const bucketTotal = [
+    "activeDrain", "handlerDepth", "ownerConflict", "thresholdRace", "retiredOwner",
+    "workerServer", "nullOwner", "claimRace", "unknown",
+  ].reduce((total, name) => total + (stats[
+    `clientPacketDrainClaimSkipped${name[0].toUpperCase()}${name.slice(1)}`
+  ]|0), 0);
+  assert.equal(stats[
+    `clientPacketDrainClaimSkipped${bucket[0].toUpperCase()}${bucket.slice(1)}`
+  ]|0, 1, `${reason} mapped to the wrong diagnostic bucket`);
+  assert.equal(bucketTotal, 1, `${reason} incremented more than one diagnostic bucket`);
+}
+const claimSkipReasonCases = skipReasonCases.length;
+
 console.log(JSON.stringify({
   status: "client-packet-drain-smoke-passed",
   boundaryCallsPerFrame: 1,
@@ -918,6 +968,10 @@ console.log(JSON.stringify({
   boundaryEventsDropped: evidenceStats.frameBoundaryDrainEventsDropped,
   frameEventsRetained: evidenceStats.clientPacketFrameEvents.length,
   frameEventsDropped: evidenceStats.clientPacketFrameEventsDropped,
+  claimSkipReasonCases,
+  claimSkipReasonBucketsComplete: true,
+  bindFailureReasonEvidence: true,
+  sessionSkipReasonReset: true,
   remoteSessionDrainPromotion: true,
   explicitUrlOptOutPreserved: remoteDrainPolicyModel("?gaiusClientPacketDrain=0", undefined) === false,
   embeddingBooleanPreserved: remoteDrainPolicyModel("?gaiusClientPacketDrain=1", false) === false,
