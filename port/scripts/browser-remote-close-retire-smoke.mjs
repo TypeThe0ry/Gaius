@@ -176,7 +176,9 @@ assert.equal(
   "Blob promise callbacks must both carry the generation/closed guard",
 );
 const blobSuccessGuardOffset = blobArrayBufferBody.indexOf(blobGenerationGuard);
-const blobSuccessDeliveryOffset = blobArrayBufferBody.indexOf("deliverInbound(entry, buffer)");
+const blobSuccessDeliveryOffset = blobArrayBufferBody.search(
+  /deliverInbound\(entry,\s*buffer(?:,\s*arrivalToken)?\)/u,
+);
 const blobRejectStart = blobArrayBufferBody.indexOf("}, function(error)");
 const blobRejectGuardOffset = blobArrayBufferBody.indexOf(blobGenerationGuard, blobRejectStart);
 const blobRejectFailureOffset = blobArrayBufferBody.indexOf("fail(entry, error");
@@ -245,7 +247,11 @@ const discardEnd = source.indexOf("};", discardStart);
 assert.ok(discardStart >= 0 && discardEnd > discardStart, "missing final discardInbound body");
 const discardBody = source.slice(discardStart, discardEnd);
 const retireStart = source.indexOf("state.retireClosedEntry = function(entry)");
-const retireEnd = source.indexOf("state.deliverInbound = function(entry, buffer)", retireStart);
+const retireBodyTail = /state\.deliverInbound = function\(entry, buffer(?:, arrivalToken)?\)/u.exec(
+  source.slice(retireStart),
+);
+const retireEnd = retireBodyTail === null
+  ? -1 : retireStart + retireBodyTail.index;
 assert.ok(retireStart >= 0 && retireEnd > retireStart, "missing retire implementation");
 const retireBody = source.slice(retireStart, retireEnd);
 const finalizeStart = source.indexOf("function finalizeRemoteCloseRetire(entry, forced)");

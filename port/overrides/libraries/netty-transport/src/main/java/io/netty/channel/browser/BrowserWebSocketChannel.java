@@ -45,9 +45,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             new BrowserWebSocketChannel[INITIAL_CHANNEL_CAPACITY];
     private static int nextSocketId = 1;
     private static int nextPumpChannelIndex;
-
     private final ChannelConfig config = new DefaultChannelConfig(this);
     private final int socketId;
+    // Sample the diagnostic switch once per channel after the bridge is initialized.  The
+    // default-off pump path then has no per-pump JS bridge crossings or diagnostic allocations.
+    private boolean arrivalTimelineTracing;
     private boolean open = true;
     private boolean active;
     private boolean pumping;
@@ -66,6 +68,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
         addChannel(this);
         initBridge();
         initBridgeTail();
+        arrivalTimelineTracing = readArrivalTimelineEnabled();
         initOutboundScheduler();
         initInboundScheduler();
     }
@@ -356,6 +359,9 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
 
             ChannelPipeline pipeline = pipeline();
             double pumpStarted = monotonicMillis();
+            if (arrivalTimelineTracing) {
+                recordArrivalPumpBoundary(socketId, "pump-begin", 0, 0, 0.0);
+            }
             int chunks = 0;
             int bytesPumped = 0;
             while (chunks < MAX_CHUNKS_PER_PUMP && bytesPumped < MAX_BYTES_PER_PUMP) {
@@ -370,6 +376,10 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 if (bytes.length > 0) {
                     recordDecodedSlice(socketId, bytes.length);
                     try {
+                        if (arrivalTimelineTracing) {
+                            recordArrivalPumpBoundary(
+                                    socketId, "pipeline-handoff", 0, bytes.length, 0.0);
+                        }
                         pipeline.fireChannelRead(Unpooled.wrappedBuffer(bytes));
                     } finally {
                         finishDecodedSlice(socketId);
@@ -385,6 +395,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                         chunks,
                         bytesPumped,
                         Math.max(0.0, monotonicMillis() - pumpStarted));
+            }
+            if (arrivalTimelineTracing) {
+                double pumpElapsed = Math.max(0.0, monotonicMillis() - pumpStarted);
+                recordArrivalPumpBoundary(
+                        socketId, "pump-end", chunks, bytesPumped, pumpElapsed);
             }
 
             error = pollError(socketId);
@@ -531,6 +546,12 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             activeHighWatermarkStartCount: 0,
             activeHighWatermarkStartSumMillis: 0,
             exactPacketQueuePaused: false,
+            // Arrival tracing is a diagnostic-only opt-in.  Capture the switch once while the
+            // bridge is created so toggling a page global halfway through a queued frame cannot
+            // make the parallel arrival metadata arrays lose alignment.
+            arrivalTimelineEnabled: globalThis.__gaiusBrowserArrivalTimeline === true,
+            arrivalTimelineSequence: 0,
+            arrivalPumpSequence: 0,
             gapProbeTimer: 0,
             gapProbeExpectedAt: 0,
             stats: {
@@ -697,6 +718,23 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               eventLoopGapSamples: 0,
               eventLoopGapsOver500: 0,
               longestEventLoopGapMillis: 0,
+              arrivalTimeline: {
+                schemaVersion: 'gaius.browser-client-arrival-timeline.v1',
+                enabled: globalThis.__gaiusBrowserArrivalTimeline === true,
+                diagnosticOnly: true,
+                independentExecution: false,
+                strictEvidenceEligible: false,
+                strictGatesChanged: false,
+                wireAtSource: 'unavailable',
+                bridgeEnqueueTimestampAvailable: true,
+                retention: 'bounded-scalar-ring',
+                perChannelLimit: 64,
+                globalLimit: 256,
+                total: 0,
+                dropped: 0,
+                perChannelDropped: 0,
+                events: []
+              },
               remoteCloseRetireScheduled: 0,
               remoteCloseRetireDeferred: 0,
               remoteCloseRetireForced: 0,
@@ -1805,7 +1843,10 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               }
               if (message instanceof ArrayBuffer || ArrayBuffer.isView(message)) {
                 entry.localActivity = true;
-                deliverInbound(entry, message);
+                const arrivalToken = typeof state.recordArrivalMessage === 'function'
+                  ? state.recordArrivalMessage(entry, 'local-port', message)
+                  : null;
+                deliverInbound(entry, message, arrivalToken);
               }
             };
             localPort.onmessageerror = function() {
@@ -1969,7 +2010,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             }
             }
             function deliverInbound(entry, buffer) {
-            state.deliverInbound(entry, buffer);
+            state.deliverInbound(
+              entry,
+              buffer,
+              arguments.length > 2 ? arguments[2] : null
+            );
             }
             function discardOutboundData(entry) {
             state.discardOutboundData(entry);
@@ -2182,11 +2227,17 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 return;
               }
               if (event.data instanceof ArrayBuffer) {
-                deliverInbound(entry, event.data);
+                const arrivalToken = typeof state.recordArrivalMessage === 'function'
+                  ? state.recordArrivalMessage(entry, 'websocket', event.data)
+                  : null;
+                deliverInbound(entry, event.data, arrivalToken);
               } else if (event.data && typeof event.data.arrayBuffer === 'function') {
+                const arrivalToken = typeof state.recordArrivalMessage === 'function'
+                  ? state.recordArrivalMessage(entry, 'websocket-blob', event.data)
+                  : null;
                 event.data.arrayBuffer().then(function(buffer) {
                   if (generation !== entry.webSocketGeneration || entry.closed) return;
-                  deliverInbound(entry, buffer);
+                  deliverInbound(entry, buffer, arrivalToken);
                 }, function(error) {
                   if (generation !== entry.webSocketGeneration || entry.closed) return;
                   fail(entry, error && (error.message || error));
@@ -2302,6 +2353,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               outboundFlushKind: '',
               inbound: [],
               inboundHead: 0,
+              arrivalInboundMeta: [],
               inboundBytes: 0,
               pendingInbound: [],
               pendingInboundHead: 0,
@@ -2338,6 +2390,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               candidateIndex: 0,
               currentCandidate: null,
               webSocketGeneration: 0,
+              arrivalFrameSequence: 0,
+              arrivalTimelineEvents: [],
+              arrivalPumpSequence: 0,
+              arrivalPumpStartedAt: 0,
+              arrivalLastDequeuedMeta: null,
               connectStartedAt: 0,
               directNegotiating: false,
               relayPreparationStarted: false,
@@ -3442,6 +3499,15 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 frame.offset += byteLength;
                 entry.pendingInboundBytes = Math.max(0, entry.pendingInboundBytes - byteLength);
                 entry.inbound.push(chunk);
+                if (arrivalTimelineEnabled()) {
+                  entry.arrivalInboundMeta.push({
+                    frameSequence: frame.arrivalFrameSequence,
+                    frameBytes: frame.arrivalFrameBytes,
+                    onmessageAt: frame.arrivalMessageAt,
+                    bridgeEnqueueAt: frame.arrivalEnqueueAt,
+                    source: frame.arrivalSource
+                  });
+                }
                 entry.inboundBytes += byteLength;
                 slices++;
                 state.stats.inboundSlices++;
@@ -3509,6 +3575,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               );
               entry.inbound = [];
               entry.inboundHead = 0;
+              entry.arrivalInboundMeta = [];
               entry.inboundBytes = 0;
               entry.pendingInbound = [];
               entry.pendingInboundHead = 0;
@@ -3520,6 +3587,8 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               entry.inboundSliceSchedulerKind = '';
               entry.decodeFlowPaused = false;
               entry.flowPaused = false;
+              entry.arrivalLastDequeuedMeta = null;
+              entry.arrivalPumpStartedAt = 0;
             };
             function hasRemoteCloseRetireWork(entry) {
               if (!entry || entry.disposed) return false;
@@ -3599,7 +3668,247 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               entry.retireClosedPending = true;
               entry.retireClosedHandle = setTimeout(retry, 0);
             };
+            const arrivalTimelineSchemaVersion = 'gaius.browser-client-arrival-timeline.v1';
+            const arrivalTimelineWireAtSource = 'unavailable';
+            const arrivalTimelinePerChannelLimit = 64;
+            const arrivalTimelineGlobalLimit = 256;
+            const arrivalTimelineMaximumInteger = 0x7fffffff;
+            const arrivalTimelineKinds = new Set([
+              'onmessage-enter',
+              'bridge-enqueue',
+              'bridge-dequeue',
+              'pump-begin',
+              'pipeline-handoff',
+              'pump-end'
+            ]);
+            function arrivalTimelineEnabled() {
+              return state.arrivalTimelineEnabled === true;
+            }
+            function arrivalTimelineInteger(value) {
+              const number = Number(value);
+              if (!Number.isFinite(number)) return 0;
+              return Math.min(
+                arrivalTimelineMaximumInteger,
+                Math.max(0, Math.floor(number))
+              );
+            }
+            function arrivalTimelineNullableInteger(value) {
+              const number = Number(value);
+              if (!Number.isFinite(number) || number < 0) return null;
+              return Math.min(
+                arrivalTimelineMaximumInteger,
+                Math.floor(number)
+              );
+            }
+            function arrivalTimelineNumber(value) {
+              const number = Number(value);
+              return Number.isFinite(number) ? Math.max(0, number) : null;
+            }
+            function arrivalTimelineSource(value) {
+              return value === 'websocket' || value === 'websocket-blob' ||
+                  value === 'local-port' || value === 'java'
+                ? value
+                : 'unknown';
+            }
+            function arrivalTimelineKind(value) {
+              return arrivalTimelineKinds.has(value) ? value : 'unknown';
+            }
+            function arrivalTimelineDelta(endAt, startAt) {
+              if (startAt === null || startAt === undefined) {
+                return {millis: 0, clockAnomaly: false};
+              }
+              const end = Number(endAt);
+              const start = Number(startAt);
+              if (!Number.isFinite(end) || !Number.isFinite(start)) {
+                return {millis: 0, clockAnomaly: true};
+              }
+              const delta = end - start;
+              return {
+                millis: Number.isFinite(delta) && delta >= 0 ? delta : 0,
+                clockAnomaly: !Number.isFinite(delta) || delta < 0
+              };
+            }
+            function arrivalTimelineQueueDepth(entry) {
+              if (!entry) return 0;
+              return Math.max(
+                0,
+                (entry.inbound.length - entry.inboundHead) +
+                  (entry.pendingInbound.length - entry.pendingInboundHead)
+              );
+            }
+            function nextArrivalTimelineSequence() {
+              let sequence = arrivalTimelineInteger(state.arrivalTimelineSequence);
+              sequence = sequence >= arrivalTimelineMaximumInteger ? 1 : sequence + 1;
+              state.arrivalTimelineSequence = sequence;
+              return sequence;
+            }
+            function nextArrivalFrameSequence(entry) {
+              let sequence = arrivalTimelineInteger(entry.arrivalFrameSequence);
+              sequence = sequence >= arrivalTimelineMaximumInteger ? 1 : sequence + 1;
+              entry.arrivalFrameSequence = sequence;
+              return sequence;
+            }
+            function arrivalTimelineRecord(entry, kind, details) {
+              if (!arrivalTimelineEnabled() || !entry || entry.disposed) return null;
+              const timeline = state.stats && state.stats.arrivalTimeline;
+              if (!timeline) return null;
+              const at = arrivalTimelineNumber(details && details.at);
+              const eventAt = at === null ? now() : at;
+              const durationMillis = arrivalTimelineNumber(
+                details && details.durationMillis);
+              const event = {
+                schemaVersion: arrivalTimelineSchemaVersion,
+                sequence: nextArrivalTimelineSequence(),
+                kind: arrivalTimelineKind(kind),
+                at: eventAt,
+                monotonicAt: eventAt,
+                wallAt: Date.now(),
+                channelId: entry.id|0,
+                webSocketGeneration: arrivalTimelineInteger(entry.webSocketGeneration),
+                source: arrivalTimelineSource(details && details.source),
+                frameSequence: arrivalTimelineNullableInteger(
+                  details && details.frameSequence),
+                frameBytes: arrivalTimelineNullableInteger(
+                  details && details.frameBytes),
+                packetSequence: null,
+                packetId: null,
+                phase: 'transport',
+                pumpSequence: arrivalTimelineNullableInteger(
+                  details && details.pumpSequence !== undefined
+                    ? details.pumpSequence : entry.arrivalPumpSequence
+                ),
+                queueDepth: arrivalTimelineInteger(
+                  details && details.queueDepth !== undefined
+                    ? details.queueDepth : arrivalTimelineQueueDepth(entry)
+                ),
+                queuedBytes: arrivalTimelineInteger(
+                  details && details.queuedBytes !== undefined
+                    ? details.queuedBytes : queuedBytes(entry)
+                ),
+                bufferedBytes: arrivalTimelineInteger(
+                  details && details.bufferedBytes !== undefined
+                    ? details.bufferedBytes : queuedBytes(entry)
+                ),
+                durationMillis: durationMillis === null ? 0 : durationMillis,
+                intentional: false,
+                wireAt: null,
+                wireAtSource: arrivalTimelineWireAtSource,
+                onmessageAt: arrivalTimelineNumber(details && details.onmessageAt),
+                bridgeEnqueueAt: arrivalTimelineNumber(
+                  details && details.bridgeEnqueueAt
+                ),
+                bridgeDequeueAt: arrivalTimelineNumber(
+                  details && details.bridgeDequeueAt
+                ),
+                pollAt: arrivalTimelineNumber(details && details.pollAt),
+                pipelineHandoffAt: arrivalTimelineNumber(
+                  details && details.pipelineHandoffAt
+                ),
+                clockAnomaly: details && details.clockAnomaly === true
+              };
+              if (entry.arrivalTimelineEvents.length >= arrivalTimelinePerChannelLimit) {
+                entry.arrivalTimelineEvents.shift();
+                timeline.perChannelDropped = Math.min(
+                  arrivalTimelineMaximumInteger,
+                  arrivalTimelineInteger(timeline.perChannelDropped) + 1
+                );
+              }
+              entry.arrivalTimelineEvents.push(event);
+              if (timeline.events.length >= arrivalTimelineGlobalLimit) {
+                timeline.events.shift();
+                timeline.dropped = Math.min(
+                  arrivalTimelineMaximumInteger,
+                  arrivalTimelineInteger(timeline.dropped) + 1
+                );
+              }
+              timeline.events.push(event);
+              timeline.total = Math.min(
+                arrivalTimelineMaximumInteger,
+                arrivalTimelineInteger(timeline.total) + 1
+              );
+              timeline.enabled = true;
+              return event;
+            }
+            function arrivalTimelineByteLength(data) {
+              if (typeof ArrayBuffer !== 'undefined' && data instanceof ArrayBuffer) {
+                return arrivalTimelineInteger(data.byteLength);
+              }
+              if (typeof ArrayBuffer !== 'undefined' && ArrayBuffer.isView(data)) {
+                return arrivalTimelineInteger(data.byteLength);
+              }
+              if (data && Number.isFinite(Number(data.size))) {
+                return arrivalTimelineInteger(data.size);
+              }
+              return 0;
+            }
+            state.recordArrivalMessage = function(entry, source, data) {
+              if (!arrivalTimelineEnabled() || !entry || entry.disposed) return null;
+              const at = now();
+              const frameSequence = nextArrivalFrameSequence(entry);
+              const frameBytes = arrivalTimelineByteLength(data);
+              const frameSource = arrivalTimelineSource(source);
+              const token = {
+                at: at,
+                frameSequence: frameSequence,
+                frameBytes: frameBytes,
+                source: frameSource
+              };
+              arrivalTimelineRecord(entry, 'onmessage-enter', {
+                at: at,
+                source: frameSource,
+                frameSequence: frameSequence,
+                frameBytes: frameBytes,
+                queueDepth: arrivalTimelineQueueDepth(entry),
+                queuedBytes: queuedBytes(entry),
+                onmessageAt: at
+              });
+              return token;
+            };
+            state.recordArrivalJavaPump = function(id, kind, chunks, bytes, millis) {
+              if (!arrivalTimelineEnabled()) return;
+              const entry = state.channels.get(id|0);
+              if (!entry || entry.disposed) return;
+              const normalizedKind = arrivalTimelineKind(kind);
+              const at = now();
+              let pumpSequence = entry.arrivalPumpSequence;
+              if (normalizedKind === 'pump-begin') {
+                let nextPumpSequence = arrivalTimelineInteger(state.arrivalPumpSequence);
+                nextPumpSequence = nextPumpSequence >= arrivalTimelineMaximumInteger
+                  ? 1 : nextPumpSequence + 1;
+                state.arrivalPumpSequence = nextPumpSequence;
+                pumpSequence = nextPumpSequence;
+                entry.arrivalPumpSequence = pumpSequence;
+                entry.arrivalPumpStartedAt = at;
+                entry.arrivalLastDequeuedMeta = null;
+              }
+              const lastDequeued = entry.arrivalLastDequeuedMeta;
+              const rawMillis = Number(millis);
+              const duration = Number.isFinite(rawMillis) && rawMillis >= 0
+                ? rawMillis
+                : arrivalTimelineDelta(at, entry.arrivalPumpStartedAt).millis;
+              arrivalTimelineRecord(entry, normalizedKind, {
+                at: at,
+                source: 'java',
+                frameSequence: lastDequeued && lastDequeued.frameSequence,
+                frameBytes: bytes > 0
+                  ? bytes : lastDequeued && lastDequeued.frameBytes,
+                pumpSequence: pumpSequence,
+                queueDepth: arrivalTimelineQueueDepth(entry),
+                queuedBytes: queuedBytes(entry),
+                durationMillis: normalizedKind === 'pump-end' ? duration : 0,
+                onmessageAt: lastDequeued && lastDequeued.onmessageAt,
+                bridgeEnqueueAt: lastDequeued && lastDequeued.bridgeEnqueueAt,
+                bridgeDequeueAt: lastDequeued && lastDequeued.bridgeDequeueAt,
+                pipelineHandoffAt: normalizedKind === 'pipeline-handoff' ? at : null,
+                clockAnomaly: !Number.isFinite(rawMillis) || rawMillis < 0
+              });
+              if (normalizedKind === 'pump-end') {
+                entry.arrivalPumpStartedAt = 0;
+                entry.arrivalLastDequeuedMeta = null;
+              }
+            };
             state.deliverInbound = function(entry, buffer) {
+              const arrivalToken = arguments.length > 2 ? arguments[2] : null;
               if (!entry || entry.closed) return;
               const source = buffer instanceof ArrayBuffer
                 ? new Uint8Array(buffer)
@@ -3608,7 +3917,30 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 state.failInbound(entry, 'Browser transport inbound queue exceeded 64 MiB');
                 return;
               }
-              entry.pendingInbound.push({bytes: source, offset: 0});
+              const arrivalEnabled = arrivalTimelineEnabled();
+              const enqueueAt = arrivalEnabled ? now() : 0;
+              const token = arrivalEnabled && arrivalToken &&
+                  typeof arrivalToken === 'object' ? arrivalToken : null;
+              const frame = {bytes: source, offset: 0};
+              // Keep values used by the post-admission marker in the outer scope.  The
+              // diagnostic block is optional, but when enabled the enqueue record must not
+              // reference block-scoped locals.
+              const frameBytes = source.byteLength;
+              const messageAt = arrivalEnabled
+                ? arrivalTimelineNumber(token && token.at) : null;
+              if (arrivalEnabled) {
+                const frameSequence = arrivalTimelineInteger(token && token.frameSequence);
+                const sourceKind = arrivalTimelineSource(token && token.source);
+                frame.arrivalFrameSequence = frameSequence;
+                frame.arrivalFrameBytes = frameBytes;
+                frame.arrivalMessageAt = messageAt;
+                frame.arrivalSource = sourceKind;
+                frame.arrivalEnqueueAt = enqueueAt;
+                const messageToEnqueue = arrivalTimelineDelta(enqueueAt, messageAt);
+                frame.arrivalClockAnomaly = messageToEnqueue.clockAnomaly;
+                frame.arrivalMessageToEnqueueMillis = messageToEnqueue.millis;
+              }
+              entry.pendingInbound.push(frame);
               entry.pendingInboundBytes += source.byteLength;
               state.stats.inboundQueuedBytes += source.byteLength;
               state.stats.peakInboundQueuedBytes = Math.max(
@@ -3620,6 +3952,20 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               if (entry.localPort) {
                 state.stats.localReceivedFrames++;
                 state.stats.localReceivedBytes += source.byteLength;
+              }
+              if (arrivalEnabled) {
+                arrivalTimelineRecord(entry, 'bridge-enqueue', {
+                  at: enqueueAt,
+                  source: token && token.source,
+                  frameSequence: frame.arrivalFrameSequence,
+                  frameBytes: frameBytes,
+                  queueDepth: arrivalTimelineQueueDepth(entry),
+                  queuedBytes: queuedBytes(entry),
+                  durationMillis: frame.arrivalMessageToEnqueueMillis,
+                  onmessageAt: messageAt,
+                  bridgeEnqueueAt: enqueueAt,
+                  clockAnomaly: frame.arrivalClockAnomaly
+                });
               }
               applyFlowControl(entry);
               scheduleSlices(entry, true);
@@ -3642,6 +3988,10 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 state.failInbound(entry, 'Browser decoder cumulation exceeded 16 MiB');
                 return null;
               }
+              const chunkIndex = entry.inboundHead;
+              const arrivalMeta = arrivalTimelineEnabled()
+                ? entry.arrivalInboundMeta[chunkIndex] : null;
+              const dequeueAt = arrivalTimelineEnabled() ? now() : 0;
               const chunk = entry.inbound[entry.inboundHead++];
               entry.inboundBytes = Math.max(0, entry.inboundBytes - chunk.byteLength);
               state.stats.inboundQueuedBytes = Math.max(
@@ -3651,10 +4001,45 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               if (entry.inboundHead >= entry.inbound.length) {
                 entry.inbound = [];
                 entry.inboundHead = 0;
+                if (arrivalTimelineEnabled()) entry.arrivalInboundMeta = [];
               } else if (entry.inboundHead >= 1024 &&
                          entry.inboundHead * 2 >= entry.inbound.length) {
                 entry.inbound = entry.inbound.slice(entry.inboundHead);
+                if (arrivalTimelineEnabled()) {
+                  entry.arrivalInboundMeta = entry.arrivalInboundMeta.slice(entry.inboundHead);
+                }
                 entry.inboundHead = 0;
+              }
+              if (arrivalTimelineEnabled()) {
+                const enqueueAt = arrivalTimelineNumber(
+                  arrivalMeta && arrivalMeta.bridgeEnqueueAt);
+                const dequeueDelay = arrivalTimelineDelta(dequeueAt, enqueueAt);
+                entry.arrivalLastDequeuedMeta = {
+                  frameSequence: arrivalTimelineInteger(
+                    arrivalMeta && arrivalMeta.frameSequence),
+                  frameBytes: arrivalTimelineInteger(
+                    arrivalMeta && arrivalMeta.frameBytes) || chunk.byteLength,
+                  onmessageAt: arrivalTimelineNumber(
+                    arrivalMeta && arrivalMeta.onmessageAt),
+                  bridgeEnqueueAt: enqueueAt,
+                  bridgeDequeueAt: dequeueAt,
+                  source: arrivalTimelineSource(arrivalMeta && arrivalMeta.source),
+                  clockAnomaly: dequeueDelay.clockAnomaly
+                };
+                arrivalTimelineRecord(entry, 'bridge-dequeue', {
+                  at: dequeueAt,
+                  source: arrivalMeta && arrivalMeta.source,
+                  frameSequence: entry.arrivalLastDequeuedMeta.frameSequence,
+                  frameBytes: entry.arrivalLastDequeuedMeta.frameBytes,
+                  queueDepth: arrivalTimelineQueueDepth(entry),
+                  queuedBytes: queuedBytes(entry),
+                  durationMillis: dequeueDelay.millis,
+                  onmessageAt: entry.arrivalLastDequeuedMeta.onmessageAt,
+                  bridgeEnqueueAt: enqueueAt,
+                  bridgeDequeueAt: dequeueAt,
+                  pollAt: dequeueAt,
+                  clockAnomaly: dequeueDelay.clockAnomaly
+                });
               }
               applyFlowControl(entry);
               scheduleSlices(entry, false);
@@ -4010,6 +4395,21 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             }
             """)
     private static native void finishDecodedSlice(int id);
+
+    @JSBody(script = """
+            const bridge = globalThis.__gaiusNettyBridge;
+            return !!(bridge && bridge.arrivalTimelineEnabled === true);
+            """)
+    private static native boolean readArrivalTimelineEnabled();
+
+    @JSBody(params = {"id", "kind", "chunks", "bytes", "millis"}, script = """
+            const bridge = globalThis.__gaiusNettyBridge;
+            if (bridge && typeof bridge.recordArrivalJavaPump === 'function') {
+              bridge.recordArrivalJavaPump(id, kind, chunks, bytes, millis);
+            }
+            """)
+    private static native void recordArrivalPumpBoundary(
+            int id, String kind, int chunks, int bytes, double millis);
 
     @JSBody(params = {"id", "chunks", "bytes", "millis"}, script = """
             globalThis.__gaiusNettyBridge.recordPump(id, chunks, bytes, millis);

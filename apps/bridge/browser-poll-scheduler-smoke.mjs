@@ -495,6 +495,81 @@ assert.match(source, /browserGlobalPumpTelemetryEvidence/u);
 assert.match(source, /BROWSER_GLOBAL_PUMP_MAX_TOTAL_MILLIS = 4/u);
 assert.match(channelSource, /MAX_TOTAL_MILLIS_PER_PUMP\s*=\s*4\.0/u,
     "Java global pump aggregate budget marker changed");
+// Arrival timing is a bounded, diagnostic-only bridge trace.  Keep these
+// source contracts here because this smoke never instantiates TeaVM/Netty:
+// a green scheduler model must not silently lose the production handoff
+// markers or turn the diagnostic ring into an unbounded payload trace.
+assert.match(channelSource,
+    /arrivalTimelineEnabled:\s*globalThis\.__gaiusBrowserArrivalTimeline === true/u,
+    "arrival timeline must be opt-in at bridge creation");
+assert.match(channelSource,
+    /private boolean arrivalTimelineTracing;/u,
+    "arrival timeline switch must be cached on the Java side");
+assert.match(channelSource,
+    /if\s*\(arrivalTimelineTracing\)\s*\{[\s\S]*?recordArrivalPumpBoundary/u,
+    "default-off pump path must avoid diagnostic bridge calls");
+assert.match(channelSource,
+    /private static native boolean readArrivalTimelineEnabled\(\)/u,
+    "arrival timeline switch read marker is missing");
+assert.match(channelSource,
+    /arrivalTimeline:\s*\{[\s\S]*?schemaVersion:\s*['"]gaius\.browser-client-arrival-timeline\.v1['"]/u,
+    "arrival timeline schema marker is missing");
+assert.match(channelSource, /perChannelLimit:\s*64/u,
+    "arrival timeline per-channel cap drifted");
+assert.match(channelSource, /globalLimit:\s*256/u,
+    "arrival timeline global cap drifted");
+assert.match(channelSource,
+    /entry\.arrivalTimelineEvents\.length\s*>=\s*arrivalTimelinePerChannelLimit/u,
+    "arrival timeline per-channel ring is not bounded at write");
+assert.match(channelSource,
+    /timeline\.events\.length\s*>=\s*arrivalTimelineGlobalLimit/u,
+    "arrival timeline global ring is not bounded at write");
+assert.match(channelSource, /perChannelDropped:\s*0/u,
+    "arrival timeline per-channel overflow counter is missing");
+assert.match(channelSource, /dropped:\s*0/u,
+    "arrival timeline global overflow counter is missing");
+assert.match(channelSource, /strictGatesChanged:\s*false/u,
+    "arrival timeline must not change strict gates");
+assert.match(channelSource, /wireAtSource:\s*['"]unavailable['"]/u,
+    "arrival timeline must declare wireAt unavailable");
+assert.match(channelSource, /wireAt:\s*null/u,
+    "arrival timeline must not fabricate a server wire timestamp");
+assert.match(channelSource,
+    /if\s*\(event\.data instanceof ArrayBuffer\)\s*\{[\s\S]*?recordArrivalMessage/u,
+    "binary WebSocket onmessage path lost its arrival marker");
+assert.match(channelSource,
+    /if\s*\(message instanceof ArrayBuffer \|\| ArrayBuffer\.isView\(message\)\)[\s\S]*?recordArrivalMessage/u,
+    "binary local-port path lost its arrival marker");
+assert.match(channelSource,
+    /state\.deliverInbound = function\(entry, buffer\)/u,
+    "arrival bridge enqueue marker is missing");
+assert.match(channelSource,
+    /const arrivalToken = arguments\.length > 2 \? arguments\[2\] : null;/u,
+    "arrival token was dropped before bridge enqueue");
+assert.match(channelSource, /entry\.arrivalInboundMeta\.push\(/u,
+    "arrival metadata was not carried through slice admission");
+assert.match(channelSource,
+    /entry\.pendingInbound\.push\(frame\)[\s\S]*?arrivalTimelineRecord\(entry,\s*['"]bridge-enqueue['"]/u,
+    "bridge enqueue marker is not after pending-frame admission");
+assert.match(channelSource,
+    /state\.pollInboundScheduled = function\(id, requestFlush\)[\s\S]*?arrivalTimelineRecord\(entry,\s*['"]bridge-dequeue['"]/u,
+    "bridge dequeue marker is not tied to poll dequeue");
+assert.match(channelSource,
+    /recordArrivalPumpBoundary\(socketId,\s*['"]pump-begin['"]/u,
+    "Java pump-begin handoff marker is missing");
+assert.match(channelSource,
+    /recordArrivalPumpBoundary\([\s\S]*?socketId,\s*['"]pipeline-handoff['"]/u,
+    "Java pipeline handoff marker is missing");
+assert.match(channelSource,
+    /recordArrivalPumpBoundary\([\s\S]*?socketId,\s*['"]pump-end['"]/u,
+    "Java pump-end handoff marker is missing");
+assert.match(channelSource,
+    /private static native void recordArrivalPumpBoundary\(/u,
+    "arrival pump bridge method is missing");
+assert.match(channelSource, /function arrivalTimelineDelta\(/u,
+    "arrival timeline clock-delta helper is missing");
+assert.match(channelSource, /clockAnomaly:/u,
+    "arrival timeline clock anomaly field is missing");
 
 const CLIENT_COUNT = 8;
 const BATCH_LIMIT = 4;
@@ -2404,6 +2479,16 @@ console.log(JSON.stringify({
             canonical: "periodic-server-sync",
             nonCanonical: "unknown-arrival-gap",
         },
+    },
+    productionArrivalTimeline: {
+        schemaVersion: "gaius.browser-client-arrival-timeline.v1",
+        enabled: false,
+        diagnosticOnly: true,
+        strictEvidenceEligible: false,
+        strictGatesChanged: false,
+        wireAtSource: "unavailable",
+        limits: { perChannelEvents: 64, globalEvents: 256 },
+        verification: "source-static-only; no Java/TeaVM runtime",
     },
     results,
 }));
