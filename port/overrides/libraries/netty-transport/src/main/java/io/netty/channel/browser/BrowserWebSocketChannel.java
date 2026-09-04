@@ -2155,6 +2155,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             }
             entry.ws = ws;
             entry.currentCandidate = candidate;
+            // Keep the Blob fallback ordered even when arrayBuffer() completion is
+            // asynchronous.  Standard browsers use ArrayBuffer because of the
+            // binaryType assignment above; this chain is only for implementations
+            // that still surface binary WebSocket messages as Blob instances.
+            entry.blobArrivalChain = Promise.resolve();
             ws.binaryType = 'arraybuffer';
             const armCandidateTimeout = function(timeoutMs) {
               clearCandidateTimeout(entry);
@@ -2283,13 +2288,37 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 const blobArrivalToken = typeof state.recordArrivalMessage === 'function'
                   ? state.recordArrivalMessage(entry, 'websocket-blob', event.data)
                   : null;
-                event.data.arrayBuffer().then(function(buffer) {
-                  if (generation !== entry.webSocketGeneration || entry.closed) return;
-                  deliverInbound(entry, buffer, blobArrivalToken);
-                }, function(error) {
-                  if (generation !== entry.webSocketGeneration || entry.closed) return;
-                  fail(entry, error && (error.message || error));
-                });
+                const blob = event.data;
+                const previousBlobChain = entry.blobArrivalChain &&
+                  typeof entry.blobArrivalChain.then === 'function'
+                  ? entry.blobArrivalChain
+                  : Promise.resolve();
+                // WebSocket message events are ordered, but Blob conversion
+                // completion is not a wire-order guarantee.  Serialize only this
+                // compatibility path; ArrayBuffer messages remain on the hot path.
+                entry.blobArrivalChain = previousBlobChain
+                  .catch(function(previousError) {
+                    if (generation === entry.webSocketGeneration &&
+                        !entry.closed && entry.ws === ws) {
+                      fail(entry, previousError &&
+                        (previousError.message || previousError));
+                    }
+                  })
+                  .then(function() {
+                    if (generation !== entry.webSocketGeneration ||
+                        entry.closed || entry.ws !== ws) return null;
+                    return blob.arrayBuffer();
+                  })
+                  .then(function(buffer) {
+                    if (buffer == null || generation !== entry.webSocketGeneration ||
+                        entry.closed || entry.ws !== ws) return;
+                    deliverInbound(entry, buffer, blobArrivalToken);
+                  })
+                  .catch(function(error) {
+                    if (generation !== entry.webSocketGeneration ||
+                        entry.closed || entry.ws !== ws) return;
+                    fail(entry, error && (error.message || error));
+                  });
               }
             };
             ws.onerror = function() {
@@ -2438,6 +2467,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               candidateIndex: 0,
               currentCandidate: null,
               webSocketGeneration: 0,
+              blobArrivalChain: Promise.resolve(),
               arrivalFrameSequence: 0,
               arrivalTimelineEvents: [],
               arrivalPumpSequence: 0,
