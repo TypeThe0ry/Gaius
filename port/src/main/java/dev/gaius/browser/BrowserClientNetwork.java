@@ -207,12 +207,25 @@ public final class BrowserClientNetwork {
     /** Drops a bridge-missing pending descriptor when the active attempt changes to local. */
     @JSBody(params = "reason", script = """
             const state = globalThis.__gaiusMultiplayerRecovery;
-            if (!state || !state.pendingClientPacketDrainSession) return false;
-            const pending = state.pendingClientPacketDrainSession;
+            const pending = state && state.pendingClientPacketDrainSession;
+            if (!pending) return false;
             pending.active = false;
             pending.endedAt = Date.now();
             pending.endReason = String(reason || 'cleared');
             delete state.pendingClientPacketDrainSession;
+            // A remote attempt can be recorded before BrowserWebSocketChannel has installed its
+            // bridge.  If that attempt is then switched back to a local/menu path, there is no
+            // bridge for endCurrentClientPacketDrainRemoteSession() to retire.  Remove only the
+            // automatic promotion made by enableClientPacketDrainIfUnset(); an explicit
+            // URL/embedder flag (autoEnabled=false) remains authoritative.
+            const bridge = globalThis.__gaiusNettyBridge;
+            const session = bridge && bridge.clientPacketDrainSession;
+            if (globalThis.__gaiusClientPacketDrainAutoEnabled === true &&
+                globalThis.__gaiusClientPacketDrainEnabled === true &&
+                (!session || session.active !== true)) {
+              delete globalThis.__gaiusClientPacketDrainEnabled;
+              delete globalThis.__gaiusClientPacketDrainAutoEnabled;
+            }
             return true;
             """)
     public static native boolean clearPendingClientPacketDrainRemoteSession(String reason);

@@ -167,14 +167,22 @@ assert.equal(jsContext.__gaiusNettyBridge.stats.clientPacketDrainSessionBegins, 
 // session.  This uses a fresh descriptor so the assertion is independent of the previous handoff.
 delete jsContext.__gaiusNettyBridge;
 jsContext.__gaiusMultiplayerRecovery.activeAttempt = 9;
+jsContext.__gaiusClientPacketDrainEnabled = true;
+jsContext.__gaiusClientPacketDrainAutoEnabled = true;
 beginJsBody("ellan.top:16888");
 assert.ok(jsContext.__gaiusMultiplayerRecovery.pendingClientPacketDrainSession);
 assert.equal(clearPendingJsBody("non-remote"), true);
 assert.equal(jsContext.__gaiusMultiplayerRecovery.pendingClientPacketDrainSession, undefined);
+assert.equal(jsContext.__gaiusClientPacketDrainEnabled, undefined,
+  "bridge-missing local transition left the automatic drain flag armed");
+assert.equal(jsContext.__gaiusClientPacketDrainAutoEnabled, undefined,
+  "bridge-missing local transition left autoEnabled armed");
 jsContext.__gaiusNettyBridge = {
   inboundPumpGeneration: 4,
   stats: {},
 };
+jsContext.__gaiusClientPacketDrainEnabled = true;
+jsContext.__gaiusClientPacketDrainAutoEnabled = false;
 jsContext.__gaiusMultiplayerRecovery.activeAttempt = 7;
 beginJsBody("ellan.top:16888");
 const jsTokenA = jsContext.__gaiusNettyBridge.clientPacketDrainSessionToken;
