@@ -261,7 +261,25 @@ assert.equal(inboundContinuationStats.inboundMessageChannelSchedules, 1,
   "deterministic inbound continuation did not schedule one MessageChannel task");
 assert.equal(inboundContinuationStats.inboundContinuationMacrotasks, 1,
   "deterministic inbound continuation lost macrotask accounting");
-await new Promise((resolve) => setTimeout(resolve, 0));
+// MessageChannel callbacks and timer callbacks are separate macrotask queues in Node. A single
+// zero-delay timer can run before the posted port message on a busy CI worker, which would turn a
+// healthy scheduler into a flaky smoke failure. Wait for the one expected callback with a bounded
+// deadline instead of changing the production scheduler or hiding a missing callback.
+await new Promise((resolve, reject) => {
+  const deadline = Date.now() + 1000;
+  const waitForCallback = () => {
+    if (inboundContinuationStats.inboundMessageChannelCallbacks >= 1) {
+      resolve();
+      return;
+    }
+    if (Date.now() >= deadline) {
+      reject(new Error("deterministic inbound continuation callback timed out"));
+      return;
+    }
+    setTimeout(waitForCallback, 1);
+  };
+  waitForCallback();
+});
 assert.equal(inboundContinuationStats.inboundMessageChannelCallbacks, 1,
   "deterministic inbound continuation callback did not run exactly once");
 assert.equal(inboundContinuationStats.testPumps, 1,
