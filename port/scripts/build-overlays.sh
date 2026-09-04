@@ -282,6 +282,8 @@ jar --update \
   --file "$authlib_output" \
   -C "$authlib_patch_classes" com/mojang/authlib/minecraft/client/MinecraftClient.class \
   -C "$authlib_patch_classes" com/mojang/authlib/minecraft/MinecraftProfileTexture.class \
+  -C "$authlib_patch_classes" 'com/mojang/authlib/yggdrasil/YggdrasilServicesKeyInfo$KeyData.class' \
+  -C "$authlib_patch_classes" 'com/mojang/authlib/yggdrasil/YggdrasilServicesKeyInfo$KeySetResponse.class' \
   -C "$authlib_patch_classes" com/mojang/authlib/yggdrasil/response/MinecraftTexturesPayload.class \
   -C "$authlib_patch_classes" com/mojang/authlib/yggdrasil/YggdrasilMinecraftSessionService.class
 

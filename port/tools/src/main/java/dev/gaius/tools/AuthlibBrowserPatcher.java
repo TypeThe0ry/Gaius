@@ -23,6 +23,10 @@ public final class AuthlibBrowserPatcher {
             "com/mojang/authlib/minecraft/MinecraftProfileTexture.class";
     private static final String TEXTURES_PAYLOAD_ENTRY =
             "com/mojang/authlib/yggdrasil/response/MinecraftTexturesPayload.class";
+    private static final String KEY_SET_RESPONSE_ENTRY =
+            "com/mojang/authlib/yggdrasil/YggdrasilServicesKeyInfo$KeySetResponse.class";
+    private static final String KEY_DATA_ENTRY =
+            "com/mojang/authlib/yggdrasil/YggdrasilServicesKeyInfo$KeyData.class";
 
     private AuthlibBrowserPatcher() {
     }
@@ -36,6 +40,8 @@ public final class AuthlibBrowserPatcher {
         byte[] sessionInput;
         byte[] textureInput;
         byte[] texturesPayloadInput;
+        byte[] keySetResponseInput;
+        byte[] keyDataInput;
         try (ZipFile jar = new ZipFile(args[0])) {
             var entry = jar.getEntry(ENTRY);
             if (entry == null) {
@@ -64,6 +70,20 @@ public final class AuthlibBrowserPatcher {
             }
             try (var stream = jar.getInputStream(texturesPayloadEntry)) {
                 texturesPayloadInput = stream.readAllBytes();
+            }
+            var keySetResponseEntry = jar.getEntry(KEY_SET_RESPONSE_ENTRY);
+            if (keySetResponseEntry == null) {
+                throw new IllegalStateException(KEY_SET_RESPONSE_ENTRY + " not found in " + args[0]);
+            }
+            try (var stream = jar.getInputStream(keySetResponseEntry)) {
+                keySetResponseInput = stream.readAllBytes();
+            }
+            var keyDataEntry = jar.getEntry(KEY_DATA_ENTRY);
+            if (keyDataEntry == null) {
+                throw new IllegalStateException(KEY_DATA_ENTRY + " not found in " + args[0]);
+            }
+            try (var stream = jar.getInputStream(keyDataEntry)) {
+                keyDataInput = stream.readAllBytes();
             }
         }
 
@@ -283,5 +303,98 @@ public final class AuthlibBrowserPatcher {
                 .resolve("yggdrasil/response/MinecraftTexturesPayload.class");
         Files.createDirectories(payloadOutput.getParent());
         Files.write(payloadOutput, payloadWriter.toByteArray());
+
+        ClassNode keySetResponseNode = new ClassNode();
+        new ClassReader(keySetResponseInput).accept(keySetResponseNode, 0);
+        ensureNoArgsConstructor(
+                keySetResponseNode,
+                keySetResponseNode.methods.stream()
+                        .anyMatch(method -> method.name.equals("<init>") && method.desc.equals("()V"))
+                        ? null
+                        : keySetResponseNoArgsBody(),
+                3);
+        ClassWriter keySetResponseWriter = new ClassWriter(0);
+        keySetResponseNode.accept(keySetResponseWriter);
+        Path keySetResponseOutput = output.getParent().getParent().getParent()
+                .resolve("yggdrasil/YggdrasilServicesKeyInfo$KeySetResponse.class");
+        Files.createDirectories(keySetResponseOutput.getParent());
+        Files.write(keySetResponseOutput, keySetResponseWriter.toByteArray());
+
+        ClassNode keyDataNode = new ClassNode();
+        new ClassReader(keyDataInput).accept(keyDataNode, 0);
+        ensureNoArgsConstructor(
+                keyDataNode,
+                keyDataNode.methods.stream()
+                        .anyMatch(method -> method.name.equals("<init>") && method.desc.equals("()V"))
+                        ? null
+                        : keyDataNoArgsBody(),
+                2);
+        ClassWriter keyDataWriter = new ClassWriter(0);
+        keyDataNode.accept(keyDataWriter);
+        Path keyDataOutput = output.getParent().getParent().getParent()
+                .resolve("yggdrasil/YggdrasilServicesKeyInfo$KeyData.class");
+        Files.createDirectories(keyDataOutput.getParent());
+        Files.write(keyDataOutput, keyDataWriter.toByteArray());
+    }
+
+    private static void ensureNoArgsConstructor(
+            ClassNode node, InsnList body, int maxStack) {
+        if (body == null) {
+            return;
+        }
+        MethodNode noArgsConstructor = new MethodNode(
+                Opcodes.ACC_PUBLIC,
+                "<init>",
+                "()V",
+                null,
+                null);
+        noArgsConstructor.instructions.add(body);
+        noArgsConstructor.instructions.add(new org.objectweb.asm.tree.InsnNode(Opcodes.RETURN));
+        noArgsConstructor.maxStack = maxStack;
+        noArgsConstructor.maxLocals = 1;
+        node.methods.add(noArgsConstructor);
+    }
+
+    private static InsnList keySetResponseNoArgsBody() {
+        InsnList body = new InsnList();
+        body.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        body.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "java/util/Collections",
+                "emptyList",
+                "()Ljava/util/List;",
+                false));
+        body.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "java/util/Collections",
+                "emptyList",
+                "()Ljava/util/List;",
+                false));
+        body.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                KEY_SET_RESPONSE_ENTRY.substring(0, KEY_SET_RESPONSE_ENTRY.length() - ".class".length()),
+                "<init>",
+                "(Ljava/util/List;Ljava/util/List;)V",
+                false));
+        return body;
+    }
+
+    private static InsnList keyDataNoArgsBody() {
+        InsnList body = new InsnList();
+        body.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        body.add(new org.objectweb.asm.tree.InsnNode(Opcodes.ICONST_0));
+        body.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "java/nio/ByteBuffer",
+                "allocate",
+                "(I)Ljava/nio/ByteBuffer;",
+                false));
+        body.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                KEY_DATA_ENTRY.substring(0, KEY_DATA_ENTRY.length() - ".class".length()),
+                "<init>",
+                "(Ljava/nio/ByteBuffer;)V",
+                false));
+        return body;
     }
 }
