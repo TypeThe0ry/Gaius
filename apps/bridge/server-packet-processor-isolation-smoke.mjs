@@ -244,8 +244,8 @@ const ownerFallbackContract = {
         clientPacketBoundaryBody,
         /packetProcessor\.processQueuedPackets\(\)/gu),
 };
-assert.equal(ownerFallbackContract.vanillaCallCount, 2,
-    "owner fallback must retain exactly one vanilla branch and one adaptive branch call");
+assert.equal(ownerFallbackContract.vanillaCallCount, 3,
+    "owner fallback must retain one ordinary branch, one transient-race fallback, and one adaptive branch call");
 
 const closePatchStart = patcherSource.indexOf(
     "private static void patchPacketProcessorCloseAccounting");
