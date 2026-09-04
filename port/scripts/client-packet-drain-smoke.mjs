@@ -101,6 +101,23 @@ assert.match(schedulerReset,
 assert.doesNotMatch(schedulerReset,
   /!preserveActiveDrainEvidence\s*\|\|\s*queuedPacketHandleDepth\s*==\s*0/,
   "reset may not clear a live queued-handler scope merely because adaptive drain is inactive");
+const ownerReset = between(schedulerSource,
+  "private static void resetOwnerLedger(PacketProcessorLedger ledger)",
+  "private static void completeOwnerPacket");
+assert.match(ownerReset,
+  /boolean preserveActiveDrainEvidence = ledger\.clientPacketDrainActive/,
+  "owner reset does not snapshot the active drain before retiring its ledger");
+assert.match(ownerReset,
+  /if \(preserveActiveDrainEvidence\)[\s\S]*clientPacketDrainActive = ledger\.clientPacketDrainActive[\s\S]*clientPacketDrainOwner = owner[\s\S]*clientPacketDrainOwnerGeneration = generation[\s\S]*clientPacketDrainEpoch = ledger\.clientPacketDrainEpoch/,
+  "in-handler owner reset drops the legacy drain mirror before the final owner unwind");
+assert.match(ownerReset,
+  /else \{[\s\S]*clientPacketDrainActive = false[\s\S]*clientPacketDrainOwner = null[\s\S]*clientPacketDrainOwnerGeneration = 0L/,
+  "inactive owner reset does not clear the legacy drain mirror");
+assert.match(between(schedulerSource,
+  "public static void finishClientPacketDrain(Object owner)",
+  "public static String clientPacketDrainStopReason()"),
+  /finishOwnerClientPacketDrain\(ledger\)[\s\S]*if \(owner == clientPacketDrainOwner\)[\s\S]*clientPacketDrainActive = false[\s\S]*clientPacketDrainOwner = null/,
+  "retired owner finish does not release the preserved legacy drain mirror");
 const drainOwnerClaim = between(schedulerSource,
   "public static boolean tryBeginClientPacketDrain(Object owner, boolean critical)",
   "/** Marks an exceptional or reset-aborted active drain");

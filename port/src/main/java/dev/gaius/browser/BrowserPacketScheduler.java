@@ -469,6 +469,7 @@ public final class BrowserPacketScheduler {
             return;
         }
         boolean preserveHandlerScope = ledger.queuedPacketHandleDepth > 0;
+        boolean preserveActiveDrainEvidence = ledger.clientPacketDrainActive;
         Object owner = ledger.owner;
         long generation = ledger.generation;
         ledger.clearAfterReset(preserveHandlerScope);
@@ -483,15 +484,33 @@ public final class BrowserPacketScheduler {
         packetsRemaining = 0;
         minimumPackets = 0;
         deadlineNanos = 0L;
-        clientPacketDrainActive = false;
-        clientPacketDrainCritical = false;
-        clientPacketDrainOwner = null;
-        clientPacketDrainOwnerGeneration = 0L;
-        clientPacketDrainRequestedPackets = 0;
-        clientPacketDrainBatchTargetPackets = 0;
-        clientPacketDrainRemainingDebt = 0;
-        clientPacketDrainStopReason = preserveHandlerScope ? "interrupted" : "inactive";
-        clientPacketDrainHandlerCompletions = 0;
+        // Keep the legacy mirror live while an owner-scoped drain is unwinding through the
+        // surrounding runTick finally block.  Clearing this mirror here lets a reentrant/new
+        // PacketProcessor claim the empty owner slot before finishClientPacketDrain(owner) can
+        // release the retired ledger, which strands the drain claim and loses its final evidence.
+        // A reset without an active drain retains the old cleanup behavior.
+        if (preserveActiveDrainEvidence) {
+            clientPacketDrainActive = ledger.clientPacketDrainActive;
+            clientPacketDrainCritical = ledger.clientPacketDrainCritical;
+            clientPacketDrainOwner = owner;
+            clientPacketDrainOwnerGeneration = generation;
+            clientPacketDrainRequestedPackets = ledger.clientPacketDrainRequestedPackets;
+            clientPacketDrainBatchTargetPackets = ledger.clientPacketDrainBatchTargetPackets;
+            clientPacketDrainRemainingDebt = ledger.clientPacketDrainRemainingDebt;
+            clientPacketDrainStopReason = ledger.clientPacketDrainStopReason;
+            clientPacketDrainEpoch = ledger.clientPacketDrainEpoch;
+            clientPacketDrainHandlerCompletions = ledger.clientPacketDrainHandlerCompletions;
+        } else {
+            clientPacketDrainActive = false;
+            clientPacketDrainCritical = false;
+            clientPacketDrainOwner = null;
+            clientPacketDrainOwnerGeneration = 0L;
+            clientPacketDrainRequestedPackets = 0;
+            clientPacketDrainBatchTargetPackets = 0;
+            clientPacketDrainRemainingDebt = 0;
+            clientPacketDrainStopReason = preserveHandlerScope ? "interrupted" : "inactive";
+            clientPacketDrainHandlerCompletions = 0;
+        }
         queuedPackets = 0;
         packetQueuePaused = false;
         clientFrameAccountingActive = false;
@@ -995,6 +1014,15 @@ public final class BrowserPacketScheduler {
         }
         finishOwnerClientPacketDrain(ledger);
         if (owner == clientPacketDrainOwner) {
+            // resetOwnerLedger() intentionally keeps this mirror until the owner-scoped finally
+            // finishes.  Clear it only after the retired ledger has accepted that final finish.
+            clientPacketDrainActive = false;
+            clientPacketDrainCritical = false;
+            clientPacketDrainRequestedPackets = 0;
+            clientPacketDrainBatchTargetPackets = 0;
+            clientPacketDrainRemainingDebt = ledger.clientPacketDrainRemainingDebt;
+            clientPacketDrainStopReason = ledger.clientPacketDrainStopReason;
+            clientPacketDrainHandlerCompletions = ledger.clientPacketDrainHandlerCompletions;
             clientPacketDrainOwner = null;
             clientPacketDrainOwnerGeneration = 0L;
         }
