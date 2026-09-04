@@ -74,8 +74,10 @@ const overlays = readFileSync(overlaysPath, "utf8");
 
 const keySetInternal = "com/mojang/authlib/yggdrasil/YggdrasilServicesKeyInfo$KeySetResponse";
 const keyDataInternal = "com/mojang/authlib/yggdrasil/YggdrasilServicesKeyInfo$KeyData";
+const keyInfoInternal = "com/mojang/authlib/yggdrasil/YggdrasilServicesKeyInfo";
 const keySetEntry = `${keySetInternal}.class`;
 const keyDataEntry = `${keyDataInternal}.class`;
+const keyInfoEntry = `${keyInfoInternal}.class`;
 
 function requireText(text, marker, label) {
   assert.ok(text.includes(marker), `${label} is missing marker: ${marker}`);
@@ -86,6 +88,7 @@ function requireText(text, marker, label) {
 for (const marker of [
   `KEY_SET_RESPONSE_ENTRY =\n            "${keySetEntry}"`,
   `KEY_DATA_ENTRY =\n            "${keyDataEntry}"`,
+  `KEY_INFO_ENTRY =\n            "${keyInfoEntry}"`,
   "ensureNoArgsConstructor(",
   '"java/util/Collections"',
   '"emptyList"',
@@ -93,8 +96,12 @@ for (const marker of [
   '"allocate"',
   '"(Ljava/util/List;Ljava/util/List;)V"',
   '"(Ljava/nio/ByteBuffer;)V"',
+  '"dev/gaius/browser/BrowserCrypto"',
+  '"parseRsaPublicKey"',
+  '"([B)Ljava/security/PublicKey;"',
   `resolve("yggdrasil/YggdrasilServicesKeyInfo$KeySetResponse.class")`,
   `resolve("yggdrasil/YggdrasilServicesKeyInfo$KeyData.class")`,
+  `resolve("yggdrasil/YggdrasilServicesKeyInfo.class")`,
 ]) {
   requireText(patcher, marker, "AuthlibBrowserPatcher.java");
 }
@@ -102,6 +109,7 @@ for (const marker of [
 for (const marker of [
   `-C "$authlib_patch_classes" 'com/mojang/authlib/yggdrasil/YggdrasilServicesKeyInfo$KeyData.class'`,
   `-C "$authlib_patch_classes" 'com/mojang/authlib/yggdrasil/YggdrasilServicesKeyInfo$KeySetResponse.class'`,
+  `-C "$authlib_patch_classes" com/mojang/authlib/yggdrasil/YggdrasilServicesKeyInfo.class`,
 ]) {
   requireText(overlays, marker, "build-overlays.sh");
 }
@@ -309,12 +317,60 @@ function inspectClass(directory, internalName, canonicalDescriptor) {
   };
 }
 
+function inspectKeyInfoClass(directory) {
+  const path = findClassFile(directory, keyInfoInternal);
+  assert.ok(path, `${keyInfoInternal}.class not found under ${directory}`);
+  const parsed = parseClass(readFileSync(path), relative(root, path));
+  assert.equal(parsed.thisClass, keyInfoInternal, `${path} has unexpected this_class`);
+  const parseMethod = parsed.methods.find(method =>
+    method.name === "parse" && method.descriptor ===
+      "([B)Lcom/mojang/authlib/yggdrasil/ServicesKeyInfo;");
+  assert.ok(parseMethod, `${path} has no services-key parse method`);
+  const browserParse = parsed.methodRefs.some(ref =>
+    ref.owner === "dev/gaius/browser/BrowserCrypto"
+      && ref.name === "parseRsaPublicKey"
+      && ref.descriptor === "([B)Ljava/security/PublicKey;");
+  assert.ok(browserParse, `${path} parse does not call BrowserCrypto.parseRsaPublicKey`);
+  const canonical = parsed.methodRefs.some(ref =>
+    ref.owner === keyInfoInternal && ref.name === "<init>"
+      && ref.descriptor === "(Ljava/security/PublicKey;)V");
+  assert.ok(canonical, `${path} parse has no PublicKey canonical constructor reference`);
+  const code = parseMethod.code?.bytes ?? Buffer.alloc(0);
+  let browserInvoke = false;
+  let canonicalInvoke = false;
+  for (let index = 0; index + 2 < code.length; index++) {
+    if (![0xb7, 0xb8].includes(code[index])) continue;
+    const constantPoolIndex = code.readUInt16BE(index + 1);
+    const ref = parsed.methodRefs.find(candidate => candidate.index === constantPoolIndex);
+    if (!ref) continue;
+    if (code[index] === 0xb8 && ref.owner === "dev/gaius/browser/BrowserCrypto"
+        && ref.name === "parseRsaPublicKey"
+        && ref.descriptor === "([B)Ljava/security/PublicKey;") {
+      browserInvoke = true;
+    }
+    if (code[index] === 0xb7 && ref.owner === keyInfoInternal
+        && ref.name === "<init>"
+        && ref.descriptor === "(Ljava/security/PublicKey;)V") {
+      canonicalInvoke = true;
+    }
+  }
+  assert.ok(browserInvoke, `${path} parse bytecode lacks BrowserCrypto invokestatic`);
+  assert.ok(canonicalInvoke, `${path} parse bytecode lacks canonical invokespecial`);
+  return {
+    path,
+    browserCryptoParse: true,
+    canonicalConstructor: true,
+    codeBytes: code.length,
+  };
+}
+
 const result = {
   schema: "gaius.authlib-keyset-constructor-smoke.v1",
   ok: true,
   static: {
     patcher: patcherPath,
     overlays: overlaysPath,
+    keyInfoEntry,
     keySetEntry,
     keyDataEntry,
     jarEntriesQuoted: true,
@@ -325,6 +381,7 @@ const result = {
 if (classDir) {
   result.classEvidence = {
     classDir,
+    keyInfo: inspectKeyInfoClass(classDir),
     keySetResponse: inspectClass(classDir, keySetInternal, "(Ljava/util/List;Ljava/util/List;)V"),
     keyData: inspectClass(classDir, keyDataInternal, "(Ljava/nio/ByteBuffer;)V"),
   };

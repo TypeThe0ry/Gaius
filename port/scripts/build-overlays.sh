@@ -281,6 +281,7 @@ java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
 jar --update \
   --file "$authlib_output" \
   -C "$authlib_patch_classes" com/mojang/authlib/minecraft/client/MinecraftClient.class \
+  -C "$authlib_patch_classes" com/mojang/authlib/yggdrasil/YggdrasilServicesKeyInfo.class \
   -C "$authlib_patch_classes" com/mojang/authlib/minecraft/MinecraftProfileTexture.class \
   -C "$authlib_patch_classes" 'com/mojang/authlib/yggdrasil/YggdrasilServicesKeyInfo$KeyData.class' \
   -C "$authlib_patch_classes" 'com/mojang/authlib/yggdrasil/YggdrasilServicesKeyInfo$KeySetResponse.class' \

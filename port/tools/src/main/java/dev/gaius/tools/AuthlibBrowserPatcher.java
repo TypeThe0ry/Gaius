@@ -23,6 +23,8 @@ public final class AuthlibBrowserPatcher {
             "com/mojang/authlib/minecraft/MinecraftProfileTexture.class";
     private static final String TEXTURES_PAYLOAD_ENTRY =
             "com/mojang/authlib/yggdrasil/response/MinecraftTexturesPayload.class";
+    private static final String KEY_INFO_ENTRY =
+            "com/mojang/authlib/yggdrasil/YggdrasilServicesKeyInfo.class";
     private static final String KEY_SET_RESPONSE_ENTRY =
             "com/mojang/authlib/yggdrasil/YggdrasilServicesKeyInfo$KeySetResponse.class";
     private static final String KEY_DATA_ENTRY =
@@ -40,6 +42,7 @@ public final class AuthlibBrowserPatcher {
         byte[] sessionInput;
         byte[] textureInput;
         byte[] texturesPayloadInput;
+        byte[] keyInfoInput;
         byte[] keySetResponseInput;
         byte[] keyDataInput;
         try (ZipFile jar = new ZipFile(args[0])) {
@@ -70,6 +73,13 @@ public final class AuthlibBrowserPatcher {
             }
             try (var stream = jar.getInputStream(texturesPayloadEntry)) {
                 texturesPayloadInput = stream.readAllBytes();
+            }
+            var keyInfoEntry = jar.getEntry(KEY_INFO_ENTRY);
+            if (keyInfoEntry == null) {
+                throw new IllegalStateException(KEY_INFO_ENTRY + " not found in " + args[0]);
+            }
+            try (var stream = jar.getInputStream(keyInfoEntry)) {
+                keyInfoInput = stream.readAllBytes();
             }
             var keySetResponseEntry = jar.getEntry(KEY_SET_RESPONSE_ENTRY);
             if (keySetResponseEntry == null) {
@@ -303,6 +313,48 @@ public final class AuthlibBrowserPatcher {
                 .resolve("yggdrasil/response/MinecraftTexturesPayload.class");
         Files.createDirectories(payloadOutput.getParent());
         Files.write(payloadOutput, payloadWriter.toByteArray());
+
+        ClassNode keyInfoNode = new ClassNode();
+        new ClassReader(keyInfoInput).accept(keyInfoNode, 0);
+        MethodNode parseKeyInfo = keyInfoNode.methods.stream()
+                .filter(method -> method.name.equals("parse")
+                        && method.desc.equals("([B)Lcom/mojang/authlib/yggdrasil/ServicesKeyInfo;"))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(
+                        "authlib services key parse method was not found"));
+        parseKeyInfo.instructions.clear();
+        parseKeyInfo.tryCatchBlocks.clear();
+        parseKeyInfo.localVariables = null;
+        parseKeyInfo.visibleTypeAnnotations = null;
+        parseKeyInfo.invisibleTypeAnnotations = null;
+        InsnList browserKeyParse = new InsnList();
+        browserKeyParse.add(new org.objectweb.asm.tree.TypeInsnNode(
+                Opcodes.NEW,
+                KEY_INFO_ENTRY.substring(0, KEY_INFO_ENTRY.length() - ".class".length())));
+        browserKeyParse.add(new org.objectweb.asm.tree.InsnNode(Opcodes.DUP));
+        browserKeyParse.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        browserKeyParse.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserCrypto",
+                "parseRsaPublicKey",
+                "([B)Ljava/security/PublicKey;",
+                false));
+        browserKeyParse.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                KEY_INFO_ENTRY.substring(0, KEY_INFO_ENTRY.length() - ".class".length()),
+                "<init>",
+                "(Ljava/security/PublicKey;)V",
+                false));
+        browserKeyParse.add(new org.objectweb.asm.tree.InsnNode(Opcodes.ARETURN));
+        parseKeyInfo.instructions.add(browserKeyParse);
+        parseKeyInfo.maxStack = 3;
+        parseKeyInfo.maxLocals = 1;
+        ClassWriter keyInfoWriter = new ClassWriter(0);
+        keyInfoNode.accept(keyInfoWriter);
+        Path keyInfoOutput = output.getParent().getParent().getParent()
+                .resolve("yggdrasil/YggdrasilServicesKeyInfo.class");
+        Files.createDirectories(keyInfoOutput.getParent());
+        Files.write(keyInfoOutput, keyInfoWriter.toByteArray());
 
         ClassNode keySetResponseNode = new ClassNode();
         new ClassReader(keySetResponseInput).accept(keySetResponseNode, 0);
