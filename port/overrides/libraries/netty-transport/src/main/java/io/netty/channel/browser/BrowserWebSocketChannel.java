@@ -47,6 +47,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
     private static int nextPumpChannelIndex;
     private final ChannelConfig config = new DefaultChannelConfig(this);
     private final int socketId;
+    /**
+     * Slot held in the static channel registry. Keeping the identity lets close/remove stay
+     * constant-time even after the backing array has grown and accumulated sparse holes.
+     */
+    private int channelSlot = -1;
     // Sample the diagnostic switch once per channel after the bridge is initialized.  The
     // default-off pump path then has no per-pump JS bridge crossings or diagnostic allocations.
     private boolean arrivalTimelineTracing;
@@ -512,6 +517,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             for (int index = 0; index < channels.length; index++) {
                 if (channels[index] == null) {
                     channels[index] = channel;
+                    channel.channelSlot = index;
                     return;
                 }
             }
@@ -523,9 +529,18 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
     }
 
     private static void removeChannel(BrowserWebSocketChannel channel) {
+        int slot = channel.channelSlot;
+        if (slot >= 0 && slot < channels.length && channels[slot] == channel) {
+            channels[slot] = null;
+            channel.channelSlot = -1;
+            return;
+        }
+        // Keep a defensive recovery scan for an impossible/stale slot rather than silently
+        // leaving a closed channel in the registry. The normal lifecycle path is O(1).
         for (int index = 0; index < channels.length; index++) {
             if (channels[index] == channel) {
                 channels[index] = null;
+                channel.channelSlot = -1;
                 return;
             }
         }

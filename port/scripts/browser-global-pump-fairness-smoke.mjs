@@ -62,6 +62,13 @@ assert.match(source, /public static void pumpAll\(\) \{\s*pumpAllAndReportProgre
   "legacy pumpAll entry point no longer uses the bounded global pump");
 assert.match(source, /public static boolean hasPumpableInput\(\)/,
   "global pump lost the ready-input predicate used by the follow-up scheduler");
+assert.match(source, /private int channelSlot = -1;/,
+  "browser channel registry lost its O(1) lifecycle slot");
+assert.match(source, /channels\[index\] = channel;\s*channel\.channelSlot = index;/s,
+  "channel registration does not record the assigned slot");
+assert.match(source,
+  /int slot = channel\.channelSlot;[\s\S]*?channels\[slot\] = null;[\s\S]*?channel\.channelSlot = -1;/,
+  "channel removal does not clear the recorded slot in its fast path");
 assert.doesNotMatch(pump, /Platform\.schedule|new Thread|CompletableFuture|setTimeout|MessageChannel/,
   "global pump introduced asynchronous/thread work into the bounded Java turn");
 assert.doesNotMatch(pump, /for \(BrowserWebSocketChannel channel : channels\)/,
