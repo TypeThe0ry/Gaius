@@ -1685,6 +1685,14 @@ assert.match(acceptanceRunner,
 assert.match(acceptanceRunner,
     /requiredChildAcceptance/);
 assert.match(acceptanceRunner,
+    /relayDrainMaxDurationMillis: 16\.7/);
+assert.match(acceptanceRunner,
+    /relayDrainSendErrors: 0/);
+assert.match(acceptanceRunner,
+    /relayDrainCleanupRequired: true/);
+assert.match(acceptanceRunner,
+    /multiplayerPerformance: \{ \.\.\.multiplayerPerformanceTarget \}/);
+assert.match(acceptanceRunner,
     /stableSerialize\(actual\) === stableSerialize\(wanted\)/);
 assert.match(acceptanceRunner,
     /queuedBytesAfterClose/);
