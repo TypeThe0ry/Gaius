@@ -198,17 +198,58 @@ assert.ok(ownerResetStart >= 0 && ownerResetEnd > ownerResetStart,
 const ownerResetBody = schedulerSource.slice(ownerResetStart, ownerResetEnd);
 const ownerResetCall = ownerResetBody.indexOf("\n        resetOwnerLedger(ledger);");
 assert.ok(ownerResetCall > 0, "owner-aware reset lost its owner-ledger reset call");
+const quarantineStart = schedulerSource.indexOf(
+    "private static boolean canQuarantineConflictedOwner(");
+const quarantineEnd = schedulerSource.indexOf(
+    "\n    private static void completeOwnerPacket", quarantineStart);
+assert.ok(quarantineStart >= 0 && quarantineEnd > quarantineStart,
+    "conflicted-owner quarantine helper boundary changed; audit it before updating this smoke");
+const quarantineBody = schedulerSource.slice(quarantineStart, quarantineEnd);
+const claimOwnerStart = schedulerSource.indexOf(
+    "private static PacketProcessorLedger claimPacketProcessorLedger(");
+const claimOwnerEnd = schedulerSource.indexOf(
+    "\n    private static int countRetiredPacketProcessorOwners", claimOwnerStart);
+assert.ok(claimOwnerStart >= 0 && claimOwnerEnd > claimOwnerStart,
+    "PacketProcessor owner-claim boundary changed; audit poison handling before updating this smoke");
+const claimOwnerBody = schedulerSource.slice(claimOwnerStart, claimOwnerEnd);
+const ownerResetBeforeCall = ownerResetBody.slice(0, ownerResetCall);
 const ownerResetGuard = {
     activeOwnershipBeforeGlobalReset: requireMatch(
-        ownerResetBody.slice(0, ownerResetCall),
+        ownerResetBeforeCall,
         /owner == null \|\| owner != packetProcessorOwner/u,
         "owner-aware reset does not reject foreign/null owners before owner-ledger reset"),
+    foreignResetRejectedBeforeGlobalReset: /owner == null \|\| owner != packetProcessorOwner/u
+        .test(ownerResetBeforeCall),
     conflictRejectedBeforeGlobalReset: /packetProcessorOwnerConflict|!packetProcessorAccountingValid/u
-        .test(ownerResetBody.slice(0, ownerResetCall)),
-    conflictedOwnerCanRetire: requireMatch(
-        ownerResetBody.slice(ownerResetCall),
+        .test(ownerResetBeforeCall),
+    conflictedOwnerQuarantine: requireMatch(
+        ownerResetBeforeCall,
+        /if \(canQuarantineConflictedOwner\(ledger, owner\)\)\s*\{\s*quarantineConflictedOwnerLedger\(ledger\);\s*return;\s*\}/u,
+        "exact conflicted owner must enter the bounded quarantine path before normal reset rejection"),
+    quarantineOwnerIdentity: requireMatch(
+        quarantineBody,
+        /ledger\.owner != owner[\s\S]*packetProcessorOwner != owner[\s\S]*packetProcessorGeneration != ledger\.generation/u,
+        "conflicted-owner quarantine must require exact owner identity and generation"),
+    quarantineNoValidPeer: requireMatch(
+        quarantineBody,
+        /for \(PacketProcessorLedger other : packetProcessorLedgers\)[\s\S]*other != ledger[\s\S]*!other\.retired[\s\S]*other\.accountingValid/u,
+        "conflicted-owner quarantine must not clear a different valid live ledger"),
+    quarantineRetiresLedger: requireMatch(
+        quarantineBody,
         /resetOwnerLedger\(ledger\);/u,
-        "active owner cannot retire and recover after a fail-closed conflict"),
+        "conflicted-owner quarantine must reuse the existing quiescent retirement path"),
+    quarantineKeepsPoison: requireMatch(
+        quarantineBody,
+        /packetProcessorOwnerConflict = true;[\s\S]*packetProcessorAccountingValid = false;[\s\S]*packetProcessorConflictPoisoned = true;/u,
+        "conflicted-owner quarantine must leave the runtime poisoned and adaptive accounting disabled"),
+    quarantinePreservesHandlerScope: requireMatch(
+        schedulerSource,
+        /private static void resetOwnerLedger\(PacketProcessorLedger ledger\)[\s\S]*boolean preserveHandlerScope = ledger\.queuedPacketHandleDepth > 0;[\s\S]*ledger\.clearAfterReset\(preserveHandlerScope\);/u,
+        "conflicted-owner quarantine must preserve an in-flight handler scope through retirement"),
+    poisonRejectsFreshClaim: requireMatch(
+        claimOwnerBody,
+        /if \(packetProcessorConflictPoisoned \|\| packetProcessorOwnerConflict[\s\S]*packetProcessorFallbackReason = "runtime-accounting-poisoned";[\s\S]*return null;/u,
+        "a fresh owner must remain rejected while the conflict poison is sticky"),
 };
 
 const clientPacketBoundaryStart = clientNetworkSource.indexOf(
@@ -334,9 +375,9 @@ const relayPerChannelState = {
         "existing Node client close model is missing its stale-continuation check"),
 };
 
-// Existing tests cover bounded accounting and Node relay close/reconnect, but
-// no existing test models two PacketProcessor owners and a close race.  Keep
-// this as a coverage fact, not as a failure: the new model below is the guard.
+// Existing tests cover bounded accounting and Node relay close/reconnect.  The models below
+// additionally keep the unsupported two-owner close race and exact-owner quarantine contract
+// explicit; neither is live TeaVM evidence.
 const existingCoverage = {
     packetProcessorSingleOwnerBytecode: /PacketProcessor patched bytecode/u.test(
         accountingSmokeSource),
@@ -419,6 +460,10 @@ class OwnerClaimModel {
         this.foreignPacketProcessed = 0;
         this.foreignResets = 0;
         this.staleGenerationEvents = 0;
+        this.retiredOwner = null;
+        this.handlerDepth = 0;
+        this.quarantined = false;
+        this.quiesced = false;
     }
 
     claim(owner) {
@@ -430,12 +475,22 @@ class OwnerClaimModel {
             this.exactPacketQueuePaused = false;
             return false;
         }
+        if (this.conflictPoisoned) {
+            this.ownerConflict = true;
+            this.accountingValid = false;
+            this.adaptiveDrainEnabled = false;
+            this.exactPacketQueuePaused = false;
+            return false;
+        }
         if (this.owner === null) {
             this.owner = owner;
             this.generation = this.generation === Number.MAX_SAFE_INTEGER
                 ? 1 : this.generation + 1;
             this.accessOwner = owner;
             this.accessGeneration = this.generation;
+            this.retiredOwner = null;
+            this.quarantined = false;
+            this.quiesced = false;
             return true;
         }
         if (this.owner === owner && !this.ownerConflict) {
@@ -501,10 +556,25 @@ class OwnerClaimModel {
     }
 
     reset(owner, reason) {
-        if (owner !== this.owner || this.ownerConflict || !this.accountingValid) {
+        if (owner !== this.owner) {
             this.foreignResets++;
             this.lastForeignResetReason = reason;
             return false;
+        }
+        if (this.ownerConflict || this.conflictPoisoned || !this.accountingValid) {
+            this.retiredOwner = this.owner;
+            this.owner = null;
+            this.accessOwner = null;
+            this.accessGeneration = 0;
+            this.queuedPackets = 0;
+            this.exactPacketQueuePaused = false;
+            this.quarantined = true;
+            this.quiesced = this.handlerDepth === 0;
+            this.ownerConflict = true;
+            this.accountingValid = false;
+            this.adaptiveDrainEnabled = false;
+            this.lastResetReason = reason;
+            return true;
         }
         this.queuedPackets = 0;
         this.exactPacketQueuePaused = false;
@@ -513,7 +583,7 @@ class OwnerClaimModel {
     }
 
     acceptGeneration(generation) {
-        if (generation !== this.generation || this.ownerConflict) {
+        if (generation !== this.generation || this.ownerConflict || this.conflictPoisoned) {
             this.staleGenerationEvents++;
             return false;
         }
@@ -533,6 +603,21 @@ class OwnerClaimModel {
             calls: 1,
             adaptive,
         };
+    }
+
+    beginHandler(owner) {
+        if (!this.claim(owner)) return false;
+        this.handlerDepth++;
+        return true;
+    }
+
+    packetProcessed(owner) {
+        if (owner !== this.retiredOwner || !this.quarantined || this.handlerDepth <= 0) {
+            return false;
+        }
+        this.handlerDepth--;
+        this.quiesced = this.handlerDepth === 0;
+        return true;
     }
 }
 
@@ -879,12 +964,20 @@ function testBoundedOwnerClaimFailClosed() {
     assert.equal(scheduler.adaptiveDrainEnabled, false);
     assert.equal(scheduler.exactPacketQueuePaused, false);
 
-    // Required race order: A queue -> B bind -> A close -> B queue/process.
-    assert.equal(scheduler.reset(processorA, "processor-A:close"), false);
-    assert.equal(scheduler.queuedPackets, 72);
+    // A foreign reset remains ignored, while the exact conflicted owner can quarantine its own
+    // ledger.  Quarantine clears only A's accounting and never reopens the poisoned runtime.
+    const foreignResetAccepted = scheduler.reset(processorB, "processor-B:stale-close");
+    assert.equal(foreignResetAccepted, false);
+    const queueBeforeExactReset = scheduler.queuedPackets;
+    const exactResetAccepted = scheduler.reset(processorA, "processor-A:close");
+    assert.equal(exactResetAccepted, true);
+    assert.equal(scheduler.quarantined, true);
+    assert.equal(scheduler.quiesced, true);
+    assert.equal(scheduler.conflictPoisoned, true);
+    assert.equal(scheduler.queuedPackets, 0);
     assert.equal(scheduler.queue(processorB, 3), false);
     assert.equal(scheduler.process(processorB, 3), 0);
-    assert.equal(scheduler.queuedPackets, 72);
+    assert.equal(scheduler.queuedPackets, 0);
     assert.equal(scheduler.foreignResets, 1);
     assert.equal(scheduler.foreignPacketQueued, 3);
     assert.equal(scheduler.foreignPacketProcessed, 3);
@@ -919,9 +1012,13 @@ function testBoundedOwnerClaimFailClosed() {
         adaptiveDrainEnabled: scheduler.adaptiveDrainEnabled,
         exactPacketQueuePaused: scheduler.exactPacketQueuePaused,
         queueAfterForeignEvents: scheduler.queuedPackets,
+        queueBeforeExactReset,
         foreignPacketQueued: scheduler.foreignPacketQueued,
         foreignPacketProcessed: scheduler.foreignPacketProcessed,
         foreignResets: scheduler.foreignResets,
+        foreignResetAccepted,
+        exactResetAccepted,
+        conflictedOwnerQuarantined: scheduler.quarantined && scheduler.quiesced,
         staleGenerationEvents: scheduler.staleGenerationEvents,
         fallbackModeAfterConflict: conflictFallback.mode,
         fallbackCallsAfterConflict: conflictFallback.calls,
@@ -931,15 +1028,16 @@ function testBoundedOwnerClaimFailClosed() {
         ownerlessFallbackModeAfterConflict: ownerlessFallback.mode,
         foreignEventsIgnored: scheduler.foreignPacketQueued === 3 &&
             scheduler.foreignPacketProcessed === 3,
-        closeForeignResetDidNotClearOwner: scheduler.queuedPackets === 72,
+        closeForeignResetDidNotClearOwner: foreignResetAccepted === false &&
+            queueBeforeExactReset === 72,
         classification: "candidate-fail-closed-model-not-runtime-proof",
     };
 }
 
 // Explicitly model the unsafe overlap that a single static ledger must reject.  A and B each
 // retain an independent vanilla FIFO, while the scheduler has only one accounting owner.  Once B
-// has triggered conflict, closing A must not make B eligible for adaptive accounting: A's reset
-// may already have cleared the shared ledger while B's real FIFO is still live.
+// has triggered conflict, closing A may quarantine only A: B's real FIFO remains live, but the
+// sticky poison must keep B on the conservative vanilla path.
 function testConflictResetRebindFailClosed() {
     const scheduler = new OwnerClaimModel();
     const ownerA = "processor-A";
@@ -957,16 +1055,26 @@ function testConflictResetRebindFailClosed() {
     assert.equal(scheduler.queuedPackets, 70,
         "foreign queue activity must not mutate the first owner's ledger");
 
-    // The active owner reset is itself rejected while conflict is live. This is the required
-    // fail-closed behavior until every overlapping owner has crossed its own lifecycle boundary.
+    // A foreign reset cannot clear A.  The exact owner can quarantine its own invalid ledger after
+    // the conflict; this only retires A and leaves the runtime poison active.
+    const foreignResetAccepted = scheduler.reset(ownerB, "processor-B:foreign-close");
+    assert.equal(foreignResetAccepted, false,
+        "foreign owner reset must not clear the conflicted owner's ledger");
     const activeResetAccepted = scheduler.reset(ownerA, "processor-A:close-after-conflict");
-    assert.equal(activeResetAccepted, false,
-        "active owner reset must not clear a ledger while a foreign owner is live");
-    assert.equal(scheduler.queuedPackets, 70);
+    assert.equal(activeResetAccepted, true,
+        "exact conflicted owner reset must quarantine its own invalid ledger");
+    assert.equal(scheduler.quarantined, true);
+    assert.equal(scheduler.quiesced, true);
+    assert.equal(scheduler.conflictPoisoned, true);
+    assert.equal(scheduler.queuedPackets, 0);
+    queues.set(ownerA, 0);
 
     const rebindAccepted = scheduler.claim(ownerB);
     assert.equal(rebindAccepted, false,
-        "foreign owner must remain rejected after active owner reset attempt");
+        "foreign owner must remain rejected after exact owner quarantine");
+    const freshOwnerAccepted = scheduler.claim("processor-C");
+    assert.equal(freshOwnerAccepted, false,
+        "fresh owner must not clear the sticky runtime poison");
     const fallback = scheduler.packetBoundaryMode(ownerB, 256);
     assert.deepEqual(fallback, {
         mode: "vanilla",
@@ -975,7 +1083,7 @@ function testConflictResetRebindFailClosed() {
     }, "B must stay on the one-call vanilla fallback after overlap");
     assert.equal(scheduler.accountingValid, false);
     assert.equal(scheduler.adaptiveDrainEnabled, false);
-    assert.equal(queues.get(ownerA), 70);
+    assert.equal(queues.get(ownerA), 0);
     assert.equal(queues.get(ownerB), 70);
 
     return {
@@ -984,16 +1092,79 @@ function testConflictResetRebindFailClosed() {
         ownerBQueue: queues.get(ownerB),
         ownerConflict: scheduler.ownerConflict,
         activeResetAccepted,
+        foreignResetAccepted,
+        conflictedOwnerQuarantined: scheduler.quarantined && scheduler.quiesced,
         rebindAccepted,
+        freshOwnerAccepted,
         accountingValid: scheduler.accountingValid,
         adaptiveDrainEnabled: scheduler.adaptiveDrainEnabled,
         queueAfterResetAttempt: scheduler.queuedPackets,
         fallbackMode: fallback.mode,
         fallbackCalls: fallback.calls,
-        failClosed: activeResetAccepted === false && rebindAccepted === false &&
+        failClosed: activeResetAccepted === true && foreignResetAccepted === false &&
+            scheduler.quarantined === true && scheduler.quiesced === true &&
+            freshOwnerAccepted === false && rebindAccepted === false &&
             scheduler.accountingValid === false && scheduler.adaptiveDrainEnabled === false &&
             fallback.mode === "vanilla",
         classification: "overlapping-owner-reset-rebind-model-not-runtime-proof",
+    };
+}
+
+// A close can occur while a queued handler is still unwinding.  Quarantine must retire the
+// owner's accounting immediately but retain the handler depth until the final packetProcessed
+// callback; only then is the ledger quiescent.  The poison remains sticky throughout.
+function testConflictOwnerQuarantineInFlight() {
+    const scheduler = new OwnerClaimModel();
+    const ownerA = "processor-A";
+    const ownerB = "processor-B";
+    const ownerC = "processor-C";
+
+    assert.equal(scheduler.beginHandler(ownerA), true);
+    assert.equal(scheduler.handlerDepth, 1);
+    assert.equal(scheduler.claim(ownerB), false,
+        "foreign owner must poison the runtime without taking A's handler scope");
+    const foreignResetAccepted = scheduler.reset(ownerB, "processor-B:foreign-close");
+    assert.equal(foreignResetAccepted, false,
+        "foreign reset must not quarantine A's in-flight owner");
+
+    const resetAccepted = scheduler.reset(ownerA, "processor-A:close-in-handler");
+    assert.equal(resetAccepted, true);
+    assert.equal(scheduler.owner, null);
+    assert.equal(scheduler.retiredOwner, ownerA);
+    assert.equal(scheduler.quarantined, true);
+    assert.equal(scheduler.quiesced, false,
+        "in-flight handler must keep the quarantined ledger non-quiescent");
+    assert.equal(scheduler.handlerDepth, 1,
+        "quarantine must retain the in-flight handler depth");
+    assert.equal(scheduler.conflictPoisoned, true);
+    assert.equal(scheduler.accountingValid, false);
+
+    const processed = scheduler.packetProcessed(ownerA);
+    assert.equal(processed, true,
+        "final owner packetProcessed callback must unwind the retired handler");
+    assert.equal(scheduler.handlerDepth, 0);
+    assert.equal(scheduler.quiesced, true);
+    assert.equal(scheduler.conflictPoisoned, true,
+        "handler unwind must not clear the sticky poison");
+    const freshOwnerAccepted = scheduler.claim(ownerC);
+    assert.equal(freshOwnerAccepted, false,
+        "fresh owner must remain rejected after in-flight quarantine");
+
+    return {
+        resetAccepted,
+        foreignResetAccepted,
+        retiredOwner: scheduler.retiredOwner,
+        handlerDepthAfterReset: 1,
+        handlerDepthAfterPacketProcessed: scheduler.handlerDepth,
+        quiescedAfterReset: false,
+        quiescedAfterPacketProcessed: scheduler.quiesced,
+        conflictPoisonedAfterUnwind: scheduler.conflictPoisoned,
+        freshOwnerAccepted,
+        noInFlightHandlerLoss: processed && scheduler.handlerDepth === 0,
+        failClosed: resetAccepted && processed && scheduler.quiesced &&
+            scheduler.conflictPoisoned && scheduler.accountingValid === false &&
+            freshOwnerAccepted === false,
+        classification: "conflicted-owner-quarantine-model-not-runtime-proof",
     };
 }
 
@@ -1342,6 +1513,7 @@ const activeRace = testActiveDrainCloseRace();
 const boundedOwnerClaim = testBoundedOwnerClaimFailClosed();
 const retiredOwnerLifecycle = testRetiredOwnerLifecycle();
 const conflictResetRebind = testConflictResetRebindFailClosed();
+const conflictOwnerQuarantine = testConflictOwnerQuarantineInFlight();
 const retiredOwnerNineGenerationChurn = testRetiredOwnerNineGenerationChurn();
 const closeInHandlerRebind = testCloseInHandlerRebind();
 const unknownOwnerRetiredUnwind = testUnknownOwnerRetiredUnwindSticky();
@@ -1383,6 +1555,7 @@ const result = {
         boundedOwnerClaimFailClosed: boundedOwnerClaim,
         retiredOwnerLifecycle,
         conflictResetRebind,
+        conflictOwnerQuarantine,
         retiredOwnerNineGenerationChurn,
         closeInHandlerRebind,
         unknownOwnerRetiredUnwind,
@@ -1412,6 +1585,15 @@ const result = {
             retiredOwnerLifecycle.staleOwnerCannotPolluteFreshOwner === true &&
             retiredOwnerLifecycle.concurrentSecondOwnerFailClosed === true,
         conflictResetRebindFailClosed: conflictResetRebind.failClosed === true,
+        conflictOwnerQuarantine: conflictOwnerQuarantine.failClosed === true &&
+            conflictOwnerQuarantine.noInFlightHandlerLoss === true &&
+            ownerResetGuard.conflictedOwnerQuarantine === true &&
+            ownerResetGuard.quarantineOwnerIdentity === true &&
+            ownerResetGuard.quarantineNoValidPeer === true &&
+            ownerResetGuard.quarantineRetiresLedger === true &&
+            ownerResetGuard.quarantineKeepsPoison === true &&
+            ownerResetGuard.quarantinePreservesHandlerScope === true &&
+            ownerResetGuard.poisonRejectsFreshClaim === true,
         closeInHandlerRebind: closeInHandlerRebind.closeInHandlerRebind === true &&
             closeInHandlerRebind.lateRetiredCallbackMirrored === false &&
             closeInHandlerRebind.ownerlessLedgerDuringRetiredUnwind === null,
@@ -1431,7 +1613,8 @@ const result = {
         retiredOwnerNineGenerationChurnFailClosed:
             retiredOwnerNineGenerationChurn.lateCallbackRejected === true &&
             retiredOwnerNineGenerationChurn.ownersCreated === 9,
-        javaConflictResetGuardMatchesModel: ownerResetGuard.conflictRejectedBeforeGlobalReset,
+        javaConflictResetGuardMatchesModel: ownerResetGuard.foreignResetRejectedBeforeGlobalReset &&
+            ownerResetGuard.conflictedOwnerQuarantine,
         javaRetiredOwnerRetentionCoversNineGenerations:
             /RETIRED_PACKET_PROCESSOR_OWNER_LIMIT\s*=\s*(?:9|1\d|[2-9]\d+)/u.test(schedulerSource) &&
             /new Object\[RETIRED_PACKET_PROCESSOR_OWNER_LIMIT\]/u.test(schedulerSource),
@@ -1447,7 +1630,7 @@ const result = {
             "supported one-processor runtime model preserves B after A channel close and reconnect",
             "bounded owner-claim model disables shared accounting on a second owner and ignores foreign/reset/stale-generation events",
             "bounded retired-owner tombstones reject late callbacks, including explicit lifecycle binds",
-            "overlapping-owner reset/rebind model requires conflict to stay poisoned until foreign owner retirement",
+            "overlapping-owner reset/rebind model quarantines the exact owner but keeps conflict poison until runtime replacement",
             "close-in-handler owner unwind releases its temporary conflict before a fresh owner binds",
             "unknown-owner callback poison remains sticky through retired-handler unwind",
             "quiesced retired ledger slots are reused only at lifecycle boundaries and recover after a temporary no-safe-slot window",
@@ -1459,7 +1642,7 @@ const result = {
             "an active drain claim/demand is also global in that unsupported topology",
             "a browser channel close does not purge already-decoded entries from the shared FIFO; the closed listener must be discarded by the normal packet path without resetting B",
             "retired-owner lifecycle protection remains a bounded single-owner guard; frame callbacks never allocate unknown owners",
-            "the Java fail-closed poison is runtime-scoped after a true owner conflict; temporary slot exhaustion can recover once a retired slot is quiescent",
+            "the Java fail-closed poison is runtime-scoped after a true owner conflict; clean slot exhaustion can recover once a retired slot is quiescent, but conflict poison requires runtime replacement",
             "current Java retired-owner ring is bounded at 16 entries; an evicted stale lifecycle callback remains a conservative poison, while frame callbacks cannot allocate",
         ],
         notProven: [

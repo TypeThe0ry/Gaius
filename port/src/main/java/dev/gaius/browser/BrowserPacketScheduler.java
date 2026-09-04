@@ -535,6 +535,46 @@ public final class BrowserPacketScheduler {
         }
     }
 
+    /**
+     * A conflict poisons the runtime for adaptive accounting, but the owner that established the
+     * epoch still has to get a close path.  Restrict quarantine to the exact current owner and to
+     * a ledger that has no other valid live peer; a late/foreign close must remain a no-op.
+     */
+    private static boolean canQuarantineConflictedOwner(
+            PacketProcessorLedger ledger, Object owner) {
+        if (ledger == null || ledger.retired || owner == null
+                || ledger.owner != owner
+                || packetProcessorOwner != owner
+                || packetProcessorGeneration != ledger.generation
+                || !(packetProcessorOwnerConflict || packetProcessorConflictPoisoned
+                || !packetProcessorAccountingValid || !ledger.accountingValid)) {
+            return false;
+        }
+        for (PacketProcessorLedger other : packetProcessorLedgers) {
+            if (other != null && other != ledger && !other.retired && other.accountingValid) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Retires one exact conflicted owner without reopening the poisoned accounting epoch.  The
+     * regular reset path deliberately cannot clear conflict bits; this helper only makes the
+     * owner slot quiesce so late callbacks stay tombstoned and the runtime replacement boundary
+     * remains the only way to restore adaptive accounting.
+     */
+    private static void quarantineConflictedOwnerLedger(PacketProcessorLedger ledger) {
+        String reason = ledger == null ? null : ledger.fallbackReason;
+        resetOwnerLedger(ledger);
+        packetProcessorOwnerConflict = true;
+        packetProcessorAccountingValid = false;
+        packetProcessorConflictPoisoned = true;
+        packetProcessorFallbackReason = reason == null || reason.isEmpty()
+                ? "conflicted-owner-quarantined"
+                : reason + "-quarantined";
+    }
+
     private static void completeOwnerPacket(PacketProcessorLedger ledger) {
         if (ledger == null || ledger.queuedPacketHandleDepth <= 0) {
             return;
@@ -1278,6 +1318,10 @@ public final class BrowserPacketScheduler {
                 stalePacketProcessorResets++;
             }
             packetProcessorFallbackReason = "retired-owner-reset";
+            return;
+        }
+        if (canQuarantineConflictedOwner(ledger, owner)) {
+            quarantineConflictedOwnerLedger(ledger);
             return;
         }
         if (owner == null || owner != packetProcessorOwner || packetProcessorOwnerConflict
