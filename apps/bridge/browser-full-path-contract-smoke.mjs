@@ -334,6 +334,24 @@ assert.match(fullPathSourceText,
     /ARRIVAL_TIMELINE_FRAME_RING_LIMIT\s*=\s*64/u,
     "arrival timeline frame ring limit drifted");
 assert.match(fullPathSourceText,
+    /ARRIVAL_PRODUCTION_TIMELINE_EVENT_LIMIT\s*=\s*256/u,
+    "production bridge timeline limit drifted");
+assert.match(fullPathSourceText,
+    /globalThis\.__gaiusBrowserArrivalTimeline\s*=\s*ARRIVAL_TRACE_ENABLED;[\s\S]*?new Function\(init\)\(\);/u,
+    "production bridge timeline switch must latch before bridge JSBody init");
+assert.match(fullPathSourceText,
+    /function productionBridgeArrivalTimelineEvidence\(stats\)\s*\{/u,
+    "production bridge timeline evidence copier missing");
+assert.match(fullPathSourceText,
+    /arrivalTimelineProductionBridge\s*:/u,
+    "full-path transport must export production bridge timeline separately");
+assert.match(fullPathSourceText,
+    /productionBridge\s*:\s*productionBridgeArrivalTimelineEvidence\(browserRuntime\.stats\)/u,
+    "top-level arrival report must retain production bridge evidence");
+assert.match(fullPathSourceText,
+    /eventFields\s*=\s*\[[\s\S]*?bridgeEnqueueAt[\s\S]*?pipelineHandoffAt/u,
+    "production bridge evidence must use a fixed scalar event allowlist");
+assert.match(fullPathSourceText,
     /wireAtSource:\s*["']unavailable["']/u,
     "arrival timeline must fail closed when wire time is unavailable");
 assert.match(fullPathSourceText,

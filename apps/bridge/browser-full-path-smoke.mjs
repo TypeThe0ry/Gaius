@@ -363,6 +363,7 @@ const ARRIVAL_TIMELINE_SLOW_THRESHOLD_MILLIS = 250;
 const ARRIVAL_TIMELINE_SAMPLE_LIMIT = 64;
 const ARRIVAL_TIMELINE_RECONNECT_PHASE_LIMIT = 64;
 const ARRIVAL_TIMELINE_FRAME_RING_LIMIT = 64;
+const ARRIVAL_PRODUCTION_TIMELINE_EVENT_LIMIT = 256;
 // Keep the event-level arrival trace additive and diagnostic-only.  It is a
 // bounded window used to explain a slow decoded-packet gap; it is not a
 // replacement for any strict callback/poll/tick gate.
@@ -1884,7 +1885,13 @@ try {
                 browserRuntimeSnapshot(browserRuntime)),
             browserGlobalPumpTelemetryAfterClose:
                 browserGlobalPumpTelemetryEvidence(finalBrowserRuntimeSnapshot),
+            // Backward-compatible alias for the Node harness timeline.  The
+            // production bridge timeline is exported separately below so the
+            // two evidence sources cannot be mistaken for one another.
             arrivalTimeline: browserRuntime.arrivalTelemetry?.evidence?.() ?? null,
+            arrivalTimelineHarness: browserRuntime.arrivalTelemetry?.evidence?.() ?? null,
+            arrivalTimelineProductionBridge:
+                productionBridgeArrivalTimelineEvidence(browserRuntime.stats),
         },
         profile: {
             id: activeProfile.id,
@@ -1922,10 +1929,14 @@ try {
                 perClientReconnectPhases: ARRIVAL_TIMELINE_RECONNECT_PHASE_LIMIT,
                 frameMetadataRing: ARRIVAL_TIMELINE_FRAME_RING_LIMIT,
                 traceEvents: ARRIVAL_TRACE_EVENT_LIMIT,
+                productionBridgeEvents: ARRIVAL_PRODUCTION_TIMELINE_EVENT_LIMIT,
             },
             trace: arrivalTraceContract(),
             periodicServerSync: arrivalPeriodicServerSyncContract(),
             transport: browserRuntime.arrivalTelemetry?.evidence?.() ?? null,
+            transportHarness: browserRuntime.arrivalTelemetry?.evidence?.() ?? null,
+            productionBridge:
+                productionBridgeArrivalTimelineEvidence(browserRuntime.stats),
             clients: allClients.map((client) => ({
                 id: client.id,
                 wave: client.wave,
@@ -6419,6 +6430,77 @@ function sessionRuntimeSnapshot(state) {
     };
 }
 
+// Keep the production Java/TeaVM bridge timeline separate from the Node
+// harness arrival timeline.  The bridge stores transport events in a bounded
+// scalar ring; copy only the documented scalar allowlist so a future runtime
+// field (or packet payload) cannot leak into a diagnostic report.
+function productionBridgeArrivalTimelineEvidence(stats) {
+    const timeline = stats?.arrivalTimeline;
+    if (!timeline || typeof timeline !== "object") return null;
+    const eventFields = [
+        "schemaVersion", "sequence", "kind", "at", "monotonicAt", "wallAt",
+        "channelId", "webSocketGeneration", "source", "frameSequence", "frameBytes",
+        "packetSequence", "packetId", "phase", "pumpSequence", "queueDepth",
+        "queuedBytes", "bufferedBytes", "durationMillis", "intentional", "wireAt",
+        "wireAtSource", "onmessageAt", "bridgeEnqueueAt", "bridgeDequeueAt",
+        "pollAt", "pipelineHandoffAt", "clockAnomaly",
+    ];
+    const copyEvent = (event) => {
+        const copy = {};
+        for (const field of eventFields) {
+            const value = event?.[field];
+            if (value === null || typeof value === "string" ||
+                typeof value === "boolean") {
+                copy[field] = value;
+            }
+            else if (typeof value === "number") {
+                copy[field] = Number.isFinite(value) ? value : null;
+            }
+            else {
+                copy[field] = null;
+            }
+        }
+        return copy;
+    };
+    const events = Array.isArray(timeline.events)
+        ? timeline.events.slice(-ARRIVAL_PRODUCTION_TIMELINE_EVENT_LIMIT).map(copyEvent)
+        : [];
+    const observedKinds = new Set(events.map((event) => event.kind));
+    const enabled = timeline.enabled === true;
+    return {
+        source: "production-browser-websocket-channel",
+        schemaVersion: typeof timeline.schemaVersion === "string"
+            ? timeline.schemaVersion : null,
+        enabled,
+        diagnosticOnly: timeline.diagnosticOnly === true,
+        independentExecution: timeline.independentExecution === true,
+        strictEvidenceEligible: timeline.strictEvidenceEligible === true,
+        strictGatesChanged: timeline.strictGatesChanged === true,
+        wireAtSource: timeline.wireAtSource === "unavailable"
+            ? "unavailable" : null,
+        // A capability flag is useful only when the corresponding bounded
+        // events were actually observed in this run.
+        bridgeEnqueueTimestampAvailable: enabled &&
+            observedKinds.has("bridge-enqueue"),
+        bridgeDequeueTimestampAvailable: enabled &&
+            observedKinds.has("bridge-dequeue"),
+        retention: typeof timeline.retention === "string"
+            ? timeline.retention : null,
+        perChannelLimit: Number.isInteger(timeline.perChannelLimit)
+            ? timeline.perChannelLimit : null,
+        globalLimit: Number.isInteger(timeline.globalLimit)
+            ? timeline.globalLimit : null,
+        total: Number.isFinite(Number(timeline.total))
+            ? Math.max(0, Number(timeline.total)) : 0,
+        dropped: Number.isFinite(Number(timeline.dropped))
+            ? Math.max(0, Number(timeline.dropped)) : 0,
+        perChannelDropped: Number.isFinite(Number(timeline.perChannelDropped))
+            ? Math.max(0, Number(timeline.perChannelDropped)) : 0,
+        observedEvents: events.length,
+        events,
+    };
+}
+
 function browserRuntimeSnapshot(runtime) {
     const activeEntries = [...runtime.bridge.channels.values()];
     const sampledAt = performance.now();
@@ -6519,6 +6601,8 @@ function browserRuntimeSnapshot(runtime) {
         activeRelayTargetLeases: runtime.stats.activeRelayTargetLeases,
         relayTargetAttestationFailures: runtime.stats.relayTargetAttestationFailures,
         arrivalTimeline: runtime.arrivalTelemetry?.evidence?.() ?? null,
+        productionBridgeArrivalTimeline:
+            productionBridgeArrivalTimelineEvidence(runtime.stats),
     };
     for (const name of BROWSER_RUNTIME_CLEANUP_GAUGES) {
         if (Object.prototype.hasOwnProperty.call(runtime.stats, name)) {
@@ -8305,6 +8389,11 @@ async function createBrowserRuntime(relayUrl, token) {
         token,
         priority: 100,
     }];
+    // The production BrowserWebSocketChannel snapshots this switch while its
+    // bridge is created.  Keep the diagnostic bridge timeline opt-in and set it
+    // before evaluating any production JSBody; the existing harness timeline
+    // remains a separate evidence stream.
+    globalThis.__gaiusBrowserArrivalTimeline = ARRIVAL_TRACE_ENABLED;
     new Function(init)();
     new Function(initTail)();
     new Function(outbound)();
@@ -8312,6 +8401,10 @@ async function createBrowserRuntime(relayUrl, token) {
     const bridge = globalThis.__gaiusNettyBridge;
     const stats = globalThis.__gaiusNetworkStats;
     assert.ok(bridge && stats, "BrowserWebSocketChannel JSBody did not initialize");
+    assert.equal(bridge.arrivalTimelineEnabled, ARRIVAL_TRACE_ENABLED,
+        "production bridge arrival timeline switch did not latch before init");
+    assert.equal(stats.arrivalTimeline?.enabled, ARRIVAL_TRACE_ENABLED,
+        "production bridge arrival timeline stats switch drifted after init");
     assert.equal(typeof bridge.relayNodeRecordResolver, "function",
         "BrowserWebSocketChannel JSBody did not publish relayNodeRecord resolver state");
     assert.equal(typeof bridge.pollInbound, "function",
