@@ -76,9 +76,13 @@ const requiredChildAcceptance = Object.freeze({
     profiles: [...profiles],
     relayRuntimeGaugesZero: [...relayRuntimeGauges],
     relayRuntimeConnectionGauges: [...relayRuntimeConnectionGauges],
+    relayDrainMaxDurationMillis: 16.7,
+    relayDrainSendErrors: 0,
+    relayDrainCleanupRequired: true,
     browserCleanupGaugesZero: [...browserCleanupGauges],
     syntheticMarkerLabel: "synthetic-inbound-marker",
     runtimeJavaPolicy,
+    multiplayerPerformance: { ...multiplayerPerformanceTarget },
 });
 const strictParameters = Object.freeze({
     GAIUS_BROWSER_FULL_PATH_ACCEPTANCE: "1",
