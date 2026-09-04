@@ -47,6 +47,7 @@ const DEFAULTS = Object.freeze({
   pagePath: "/index.html",
   clientCount: 4,
   soakMs: 15_000,
+  clientStartDelayMs: 0,
   startupTimeoutMs: 180_000,
   reconnectTimeoutMs: 180_000,
   pollMs: 1_000,
@@ -95,6 +96,12 @@ function parseArgs(argv = process.argv.slice(2), env = process.env) {
     pagePath: normalizePagePath(env.GAIUS_PAGE),
     clientCount: boundedNumber(env.GAIUS_CLIENTS, DEFAULTS.clientCount, 1, MAX_CLIENTS),
     soakMs: boundedNumber(env.GAIUS_SOAK_MS, DEFAULTS.soakMs, 1_000, 600_000),
+    clientStartDelayMs: boundedNumber(
+      env.GAIUS_CLIENT_START_DELAY_MS,
+      DEFAULTS.clientStartDelayMs,
+      0,
+      60_000,
+    ),
     startupTimeoutMs: boundedNumber(
       env.GAIUS_START_TIMEOUT_MS,
       DEFAULTS.startupTimeoutMs,
@@ -183,6 +190,14 @@ function parseArgs(argv = process.argv.slice(2), env = process.env) {
       case "--soak-ms":
         config.soakMs = boundedNumber(valueFor(name), DEFAULTS.soakMs, 1_000, 600_000);
         break;
+      case "--client-start-delay-ms":
+        config.clientStartDelayMs = boundedNumber(
+          valueFor(name),
+          DEFAULTS.clientStartDelayMs,
+          0,
+          60_000,
+        );
+        break;
       case "--start-timeout-ms":
         config.startupTimeoutMs = boundedNumber(valueFor(name), DEFAULTS.startupTimeoutMs, 30_000, 900_000);
         break;
@@ -223,6 +238,7 @@ function usage() {
     "Options:",
     "  --clients N                 independent headed targets (1..8; default 4)",
     "  --soak-ms N                soak duration per phase (default 15000)",
+    "  --client-start-delay-ms N  delay between initial headed target launches (default 0)",
     "  --reconnect-waves N        page reconnect waves (default 1)",
     "  --start-timeout-ms N       initial PLAY deadline",
     "  --reconnect-timeout-ms N   reconnect PLAY deadline",
@@ -262,6 +278,7 @@ function configForOutput(config) {
     pagePath: config.pagePath,
     clientCount: config.clientCount,
     soakMs: config.soakMs,
+    clientStartDelayMs: config.clientStartDelayMs,
     startupTimeoutMs: config.startupTimeoutMs,
     reconnectTimeoutMs: config.reconnectTimeoutMs,
     pollMs: config.pollMs,
@@ -1404,6 +1421,14 @@ function runSelfTest(config) {
   if (parsed.searchParams.get("bridgeToken") !== "secret-token") throw new Error("self-test URL token placement failed");
   const redacted = redactUrl(url);
   if (redacted.includes("secret-token")) throw new Error("self-test URL redaction failed");
+  const delayed = parseArgs(["--client-start-delay-ms", "1234"], {});
+  if (delayed.clientStartDelayMs !== 1234) {
+    throw new Error("self-test client start delay parsing failed");
+  }
+  const clampedDelay = parseArgs(["--client-start-delay-ms", "999999"], {});
+  if (clampedDelay.clientStartDelayMs !== 60_000) {
+    throw new Error("self-test client start delay bound failed");
+  }
   const eligibility = strictEligibility(fake);
   if (eligibility.releaseEligible !== false || eligibility.releasePass !== false) {
     throw new Error("self-test strict release gate must remain false");
@@ -1459,6 +1484,7 @@ function runSelfTest(config) {
       "isolated headed mode metadata",
       "loopback URL policy and reconnect wave",
       "secret redaction",
+      "bounded initial headed-client launch staggering",
       "strict release eligibility hard-false",
       "post-PLAY cumulative-gauge phase metrics",
     ],
@@ -1491,6 +1517,9 @@ async function run(config) {
       // A setup failure is retained on that client; it does not prevent the
       // other independent contexts from being created.
       await createClient(cdp, config, output, index, resources);
+      if (config.clientStartDelayMs > 0 && index + 1 < config.clientCount) {
+        await sleep(config.clientStartDelayMs);
+      }
     }
     const initialWave = output.clients.map((client) => client.waves[0]).filter(Boolean);
     if (initialWave.length) {
