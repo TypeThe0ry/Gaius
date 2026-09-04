@@ -352,6 +352,12 @@ assert.match(fullPathSourceText,
     /eventFields\s*=\s*\[[\s\S]*?bridgeEnqueueAt[\s\S]*?pipelineHandoffAt/u,
     "production bridge evidence must use a fixed scalar event allowlist");
 assert.match(fullPathSourceText,
+    /function productionBridgeArrivalTimelineEvidence\(stats\)[\s\S]*?executionContext:\s*["']node-jsbody-harness["']/u,
+    "production bridge evidence must identify the Node JSBody harness context");
+assert.match(fullPathSourceText,
+    /function productionBridgeArrivalTimelineEvidence\(stats\)[\s\S]*?teaVmArtifactBound:\s*false/u,
+    "Node JSBody bridge evidence must not claim TeaVM artifact binding");
+assert.match(fullPathSourceText,
     /wireAtSource:\s*["']unavailable["']/u,
     "arrival timeline must fail closed when wire time is unavailable");
 assert.match(fullPathSourceText,

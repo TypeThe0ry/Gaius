@@ -6469,6 +6469,11 @@ function productionBridgeArrivalTimelineEvidence(stats) {
     const enabled = timeline.enabled === true;
     return {
         source: "production-browser-websocket-channel",
+        // This copier runs in the Node JSBody harness.  Keep the execution
+        // context explicit so its production-shaped bridge evidence cannot be
+        // mistaken for a live TeaVM/Chrome capture.
+        executionContext: "node-jsbody-harness",
+        teaVmArtifactBound: false,
         schemaVersion: typeof timeline.schemaVersion === "string"
             ? timeline.schemaVersion : null,
         enabled,
