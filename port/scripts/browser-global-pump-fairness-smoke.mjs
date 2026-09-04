@@ -62,6 +62,22 @@ assert.match(source, /public static void pumpAll\(\) \{\s*pumpAllAndReportProgre
   "legacy pumpAll entry point no longer uses the bounded global pump");
 assert.match(source, /public static boolean hasPumpableInput\(\)/,
   "global pump lost the ready-input predicate used by the follow-up scheduler");
+assert.match(source,
+  /int bridgeState = aggregatePendingInputState\(\);[\s\S]*?if \(bridgeState >= 0\)[\s\S]*?bridgeState != 0/s,
+  "pending-input readiness does not prefer the dense bridge aggregate");
+assert.match(source,
+  /int bridgeState = aggregatePumpableInputState\(\);[\s\S]*?if \(bridgeState >= 0\)[\s\S]*?bridgeState != 0/s,
+  "pumpable-input readiness does not prefer the dense bridge aggregate");
+assert.match(source, /private static native int aggregatePendingInputState\(\);/,
+  "pending-input aggregate helper is missing");
+assert.match(source, /private static native int aggregatePumpableInputState\(\);/,
+  "pumpable-input aggregate helper is missing");
+assert.match(source,
+  /aggregatePendingInputState[\s\S]*?return -1;[\s\S]*?bridge\.channels\.forEach[\s\S]*?pendingInboundHead < entry\.pendingInbound\.length[\s\S]*?private static native int aggregatePendingInputState\(\);/s,
+  "pending-input aggregate helper lost the dense-map/fallback contract");
+assert.match(source,
+  /aggregatePumpableInputState[\s\S]*?return -1;[\s\S]*?bridge\.channels\.forEach[\s\S]*?bridge\.exactPacketQueuePaused !== true[\s\S]*?entry\.inboundHead < entry\.inbound\.length[\s\S]*?private static native int aggregatePumpableInputState\(\);/s,
+  "pumpable-input aggregate helper lost the pause-aware dense-map contract");
 assert.match(source, /private int channelSlot = -1;/,
   "browser channel registry lost its O(1) lifecycle slot");
 assert.match(source, /channels\[index\] = channel;\s*channel\.channelSlot = index;/s,
@@ -288,6 +304,88 @@ assert.ok(sparseCapacityRing[0].visited > 0 && sparseCapacityRing[0].visited < 2
 assert.ok(sparseCapacityRing.slice(1).some((turn) => turn.processed.includes(2047)),
   "ready channel behind a high-capacity hole ring was never serviced");
 
+/**
+ * Readiness predicates use the bridge's dense live-channel Map instead of the Java backing array.
+ * The model keeps the old array result as an oracle while recording how many entries each path
+ * must inspect.  A distant ready channel must remain visible, but historical holes must not turn
+ * every continuation into an O(capacity) scan.
+ */
+function modelAggregateReadiness(slots, exactPacketQueuePaused = false) {
+  const backing = slots.slice();
+  const live = backing.filter((entry) => entry !== null && !entry.disposed);
+  const pending = (entry) => entry.inboundHead < entry.inbound.length ||
+    entry.pendingInboundHead < entry.pendingInbound.length;
+  const pumpable = (entry) => !entry.disposed && !exactPacketQueuePaused &&
+    entry.inboundHead < entry.inbound.length;
+  let backingVisits = 0;
+  let denseVisits = 0;
+  let pendingBacking = false;
+  for (const entry of backing) {
+    backingVisits++;
+    if (entry && !entry.disposed && pending(entry)) {
+      pendingBacking = true;
+      break;
+    }
+  }
+  let pendingDense = false;
+  for (const entry of live) {
+    denseVisits++;
+    if (pending(entry)) {
+      pendingDense = true;
+      break;
+    }
+  }
+  let pumpableDense = false;
+  let pumpableVisits = 0;
+  for (const entry of live) {
+    pumpableVisits++;
+    if (pumpable(entry)) {
+      pumpableDense = true;
+      break;
+    }
+  }
+  return {
+    pendingBacking,
+    pendingDense,
+    pumpableDense,
+    backingVisits,
+    denseVisits,
+    pumpableVisits,
+    liveCount: live.length,
+  };
+}
+
+const sparseReadinessSlots = [
+  ...Array.from({length: 2047}, () => null),
+  {
+    disposed: false,
+    inbound: [new Uint8Array([1])],
+    inboundHead: 0,
+    pendingInbound: [],
+    pendingInboundHead: 0,
+  },
+];
+const sparseReadiness = modelAggregateReadiness(sparseReadinessSlots);
+assert.equal(sparseReadiness.pendingBacking, true,
+  "sparse readiness oracle failed to find the distant pending channel");
+assert.equal(sparseReadiness.pendingDense, true,
+  "dense pending readiness missed the distant live channel");
+assert.equal(sparseReadiness.pumpableDense, true,
+  "dense pumpable readiness missed the distant live channel");
+assert.equal(sparseReadiness.liveCount, 1,
+  "sparse readiness model unexpectedly retained historical holes as live entries");
+assert.ok(sparseReadiness.backingVisits > 2000,
+  "sparse readiness oracle did not exercise historical backing-array capacity");
+assert.equal(sparseReadiness.denseVisits, 1,
+  "dense pending readiness did not visit only the live Map entry");
+assert.equal(sparseReadiness.pumpableVisits, 1,
+  "dense pumpable readiness did not visit only the live Map entry");
+const pausedReadiness = modelAggregateReadiness(sparseReadinessSlots, true);
+assert.equal(pausedReadiness.pendingDense, true,
+  "exact queue pause incorrectly hid pending bytes from the pending predicate");
+assert.equal(pausedReadiness.pumpableDense, false,
+  "exact queue pause failed to suppress pumpable readiness");
+
 const openIdleRing = modelSlotPumpTurns([
   {open: true, work: 0},
   {open: true, work: 0},
@@ -380,6 +478,8 @@ console.log(JSON.stringify({
   sixteenBusyTurns: sixteenBusy.length,
   sixteenBusyMaxProcessed: Math.max(...sixteenBusy.map((turn) => turn.processed.length)),
   sparseTurns: sparse.length,
+  sparseReadinessDenseVisits: sparseReadiness.denseVisits,
+  sparseReadinessBackingVisits: sparseReadiness.backingVisits,
   firstChunkOvershootMillis: firstChunkOvershoot.elapsed,
   secondChunkOvershootMillis: secondChunkOvershoot.elapsed,
   result: "pass",

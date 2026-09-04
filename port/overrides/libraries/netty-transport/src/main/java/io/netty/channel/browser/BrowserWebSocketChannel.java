@@ -137,6 +137,10 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
 
     /** Returns whether a browser transport has data waiting for the Java pipeline. */
     public static boolean hasPendingInput() {
+        int bridgeState = aggregatePendingInputState();
+        if (bridgeState >= 0) {
+            return bridgeState != 0;
+        }
         for (BrowserWebSocketChannel channel : channels) {
             if (channel != null && channel.open && hasPendingInbound(channel.socketId)) {
                 return true;
@@ -147,6 +151,10 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
 
     /** Returns whether an unpaused channel has a ready slice for the Java decoder. */
     public static boolean hasPumpableInput() {
+        int bridgeState = aggregatePumpableInputState();
+        if (bridgeState >= 0) {
+            return bridgeState != 0;
+        }
         for (BrowserWebSocketChannel channel : channels) {
             if (channel != null && channel.open && hasPumpableInbound(channel.socketId)) {
                 return true;
@@ -4337,6 +4345,56 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             };
             """)
     private static native void initInboundScheduler();
+
+    /**
+     * Reads aggregate readiness from the bridge's dense live-channel map.  The Java registry is a
+     * sparse, grow-only backing array, so using it for a readiness predicate would make every
+     * continuation pay for historical connect/close churn.  A negative result means that this
+     * bridge generation does not expose the aggregate helper and requests the conservative Java
+     * fallback above.
+     */
+    @JSBody(script = """
+            const bridge = globalThis.__gaiusNettyBridge;
+            if (!bridge || !bridge.channels ||
+                    typeof bridge.channels.forEach !== 'function') {
+                return -1;
+            }
+            let ready = false;
+            bridge.channels.forEach(function(entry) {
+                if (ready || !entry || entry.disposed ||
+                        !Array.isArray(entry.inbound) ||
+                        !Array.isArray(entry.pendingInbound)) {
+                    return;
+                }
+                if (entry.inboundHead < entry.inbound.length ||
+                        entry.pendingInboundHead < entry.pendingInbound.length) {
+                    ready = true;
+                }
+            });
+            return ready ? 1 : 0;
+            """)
+    private static native int aggregatePendingInputState();
+
+    @JSBody(script = """
+            const bridge = globalThis.__gaiusNettyBridge;
+            if (!bridge || !bridge.channels ||
+                    typeof bridge.channels.forEach !== 'function') {
+                return -1;
+            }
+            let ready = false;
+            bridge.channels.forEach(function(entry) {
+                if (ready || !entry || entry.disposed ||
+                        !Array.isArray(entry.inbound)) {
+                    return;
+                }
+                if (bridge.exactPacketQueuePaused !== true &&
+                        entry.inboundHead < entry.inbound.length) {
+                    ready = true;
+                }
+            });
+            return ready ? 1 : 0;
+            """)
+    private static native int aggregatePumpableInputState();
 
     @JSBody(params = {"id", "host", "port"}, script = """
             globalThis.__gaiusNettyBridge.open(id, host, port);
