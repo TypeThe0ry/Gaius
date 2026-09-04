@@ -28,13 +28,19 @@ import process from "node:process";
 import WebSocket from "../../apps/bridge/node_modules/ws/wrapper.mjs";
 
 const DRIVER_NAME = "gaius-headed-chrome-multiplayer-cdp-driver";
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const MAX_CLIENTS = 8;
 const MAX_RECONNECT_WAVES = 4;
 const MAX_SAMPLES_PER_CLIENT = 512;
 const MAX_EVENT_ITEMS = 64;
 const MAX_EXCEPTION_ITEMS = 32;
 const MAX_DIAGNOSTIC_ITEMS = 64;
+const PHASE_METRIC_KEYS = Object.freeze([
+  ["eventLoopGapMs", "bridge", "longestEventLoopGapMillis"],
+  ["clientFrameDrainMs", "bridge", "clientFrameMaxDrainDurationMillis"],
+  ["networkPollMs", "counters", "networkPollMaxMillis"],
+  ["clientTickMs", "counters", "clientTickMaxMillis"],
+]);
 
 const DEFAULTS = Object.freeze({
   serverHost: "192.168.1.62",
@@ -814,6 +820,8 @@ function newWave(client, wave) {
     soakElapsedMs: null,
     sampleCount: 0,
     diagnosticEvaluationTimeouts: 0,
+    playObservedAtMs: null,
+    playBaseline: null,
   };
   client.currentWave = wave;
   client.waves.push(state);
@@ -1004,6 +1012,11 @@ function updateMilestones(client, sample, output) {
   if (!wave) return;
   if (playing && !wave.playAt) {
     wave.playAt = now();
+    wave.playObservedAtMs = Number(sample.driver?.capturedAtMs) || wave.playAt;
+    // Bridge/counter values are cumulative gauges. Capture their value at the
+    // first observed PLAY sample so the final report can separate bootstrap
+    // stalls from newly observed post-PLAY stalls.
+    wave.playBaseline = metricSnapshot(sample);
     wave.phase = "play";
     if (client.firstPlayAt === null) client.firstPlayAt = wave.playAt;
   }
@@ -1030,6 +1043,65 @@ function addSample(client, wave, sample, evaluationStartedAt, evaluationEndedAt,
   wave.sampleCount++;
   client.lastSample = record;
   if (successful) client.diagnostics.evaluationSuccesses++;
+}
+
+function metricNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(0, number) : null;
+}
+
+function metricSnapshot(sample) {
+  const snapshot = {};
+  for (const [name, group, key] of PHASE_METRIC_KEYS) {
+    snapshot[name] = metricNumber(sample?.[group]?.[key]);
+  }
+  return snapshot;
+}
+
+function successfulWaveSamples(client, wave) {
+  const startAt = Number.isFinite(Number(wave.playAt))
+    ? Number(wave.playAt)
+    : Number(wave.startedAtMs) || 0;
+  return client.samples.filter((sample) => {
+    if (sample?.driver?.wave !== wave.wave || sample?.driverError) return false;
+    const capturedAt = Number(sample?.driver?.capturedAtMs);
+    return Number.isFinite(capturedAt) && capturedAt >= startAt;
+  });
+}
+
+function summarizePhaseMetrics(client, wave) {
+  const samples = successfulWaveSamples(client, wave);
+  const baseline = wave.playBaseline || null;
+  const metrics = {};
+  for (const [name, group, key] of PHASE_METRIC_KEYS) {
+    const values = samples
+      .map((sample) => metricNumber(sample?.[group]?.[key]))
+      .filter((value) => value !== null);
+    const rawMax = maxOrNull(values);
+    const baselineValue = metricNumber(baseline?.[name]);
+    metrics[name] = {
+      rawMax,
+      // This is a delta from a cumulative runtime gauge, not a replacement for
+      // the release gate. Zero means no larger value was observed after PLAY.
+      newMaxFromPlay: rawMax === null || baselineValue === null
+        ? null
+        : Math.max(0, rawMax - baselineValue),
+    };
+  }
+  return {
+    sampleCount: samples.length,
+    firstCapturedAtMs: samples.length
+      ? Number(samples[0].driver.capturedAtMs)
+      : null,
+    lastCapturedAtMs: samples.length
+      ? Number(samples.at(-1).driver.capturedAtMs)
+      : null,
+    playObservedAtMs: Number.isFinite(Number(wave.playObservedAtMs))
+      ? Number(wave.playObservedAtMs)
+      : null,
+    baseline,
+    metrics,
+  };
 }
 
 async function sampleClient(cdp, client, output) {
@@ -1240,6 +1312,11 @@ function summarizeClient(client) {
     maxNetworkPollMs: maxOrNull(pollTimes),
     maxClientTickMs: maxOrNull(tickTimes),
     maxObservedLoopOrDrainMs: maxOrNull([...loopGaps, ...drainTimes, ...pollTimes, ...tickTimes]),
+    phaseMetrics: client.waves.map((wave) => ({
+      wave: wave.wave,
+      playObservedAtMs: wave.playObservedAtMs,
+      postPlay: wave.playAt ? summarizePhaseMetrics(client, wave) : null,
+    })),
     diagnostics: {...client.diagnostics},
     waves: client.waves.map((wave) => ({...wave})),
     final: client.lastSample,
@@ -1335,6 +1412,46 @@ function runSelfTest(config) {
   if (output.mode.syntheticInput || output.strictEligibility.releaseEligible) {
     throw new Error("self-test diagnostic mode contract failed");
   }
+  const phaseClient = newClient(0);
+  const phaseWave = newWave(phaseClient, 0);
+  phaseWave.startedAtMs = 1_000;
+  phaseWave.playAt = 2_000;
+  phaseWave.playObservedAtMs = 2_100;
+  phaseWave.playBaseline = {
+    eventLoopGapMs: 100,
+    clientFrameDrainMs: 4,
+    networkPollMs: 3,
+    clientTickMs: 5,
+  };
+  phaseClient.samples = [
+    {
+      driver: {wave: 0, capturedAtMs: 1_500},
+      bridge: {longestEventLoopGapMillis: 999},
+      counters: {networkPollMaxMillis: 999, clientTickMaxMillis: 999},
+    },
+    {
+      driver: {wave: 0, capturedAtMs: 2_200},
+      bridge: {
+        longestEventLoopGapMillis: 120,
+        clientFrameMaxDrainDurationMillis: 6,
+      },
+      counters: {networkPollMaxMillis: 5, clientTickMaxMillis: 8},
+    },
+    {
+      driver: {wave: 0, capturedAtMs: 2_300},
+      bridge: {
+        longestEventLoopGapMillis: 135,
+        clientFrameMaxDrainDurationMillis: 7,
+      },
+      counters: {networkPollMaxMillis: 6, clientTickMaxMillis: 9},
+    },
+  ];
+  const phaseMetrics = summarizeClient(phaseClient).phaseMetrics[0].postPlay;
+  if (phaseMetrics.sampleCount !== 2 ||
+      phaseMetrics.metrics.eventLoopGapMs.rawMax !== 135 ||
+      phaseMetrics.metrics.eventLoopGapMs.newMaxFromPlay !== 35) {
+    throw new Error("self-test post-PLAY phase metric separation failed");
+  }
   return {
     ok: true,
     driver: DRIVER_NAME,
@@ -1343,6 +1460,7 @@ function runSelfTest(config) {
       "loopback URL policy and reconnect wave",
       "secret redaction",
       "strict release eligibility hard-false",
+      "post-PLAY cumulative-gauge phase metrics",
     ],
     configuration: configForOutput(fake),
     strictEligibility: eligibility,
