@@ -324,28 +324,40 @@ public final class BrowserClientNetwork {
         String outcome = "claim-skipped";
         String failureType = null;
         if (!BrowserPacketScheduler.tryBeginClientPacketDrain(packetProcessor, pausedBefore)) {
-            // Keep this branch non-recursive and vanilla-compatible, but preserve the exact
-            // owner-scoped reason so a sustained claim skip can be distinguished from a harmless
-            // handler re-entry or a threshold race in the next frame's diagnostics.
+            // Keep re-entrant handler/active-drain paths non-recursive, but do not silently drop
+            // a frame when the owner claim loses a transient race.  The existing patched
+            // PacketProcessor method has a bounded ordinary FIFO path when no adaptive claim is
+            // active, so threshold/claim races can make one vanilla-compatible pass now without
+            // clobbering an outer adaptive drain.
             String claimSkipReason =
                     BrowserPacketScheduler.clientPacketDrainClaimSkipReason(packetProcessor);
+            boolean vanillaFallback =
+                    "threshold-race".equals(claimSkipReason)
+                            || "claim-race".equals(claimSkipReason);
             recordClientPacketDrainJavaSkipped(claimSkipReason);
+            if (vanillaFallback) {
+                packetProcessor.processQueuedPackets();
+            }
+            int queueAfter = BrowserPacketScheduler.queuedPacketCount();
+            int handleDepthAfter = BrowserPacketScheduler.queuedPacketHandleDepth();
+            boolean pausedAfter = BrowserPacketScheduler.isPacketQueuePaused();
+            double elapsedMillis = Math.max(0L, System.nanoTime() - startedNanos) / 1_000_000.0;
             recordClientPacketFrameBoundaryDrain(
                     runTickSequence,
                     0L,
                     queueBefore,
-                    BrowserPacketScheduler.queuedPacketCount(),
+                    queueAfter,
                     0,
                     handleDepthBefore,
-                    BrowserPacketScheduler.queuedPacketHandleDepth(),
+                    handleDepthAfter,
                     pausedBefore,
-                    BrowserPacketScheduler.isPacketQueuePaused(),
-                    0.0,
-                    "claim-skipped",
+                    pausedAfter,
+                    elapsedMillis,
+                    vanillaFallback ? "vanilla-fallback" : "claim-skipped",
                     targetQueue,
                     requestedPackets,
                     batchTargetPackets,
-                    Math.max(0, BrowserPacketScheduler.queuedPacketCount() - targetQueue),
+                    Math.max(0, queueAfter - targetQueue),
                     mode,
                     "claim-skipped",
                     null);
@@ -656,6 +668,8 @@ public final class BrowserClientNetwork {
               Math.max(0, Number(stats.frameBoundaryDrainCompleted) || 0);
             stats.frameBoundaryDrainFailures =
               Math.max(0, Number(stats.frameBoundaryDrainFailures) || 0);
+            stats.frameBoundaryDrainVanillaFallback =
+              Math.max(0, Number(stats.frameBoundaryDrainVanillaFallback) || 0);
             stats.frameBoundaryDrainSkippedNested =
               Math.max(0, Number(stats.frameBoundaryDrainSkippedNested) || 0);
             stats.frameBoundaryDrainSkippedClaim =
@@ -1127,7 +1141,7 @@ public final class BrowserClientNetwork {
             """)
     private static native boolean isClientPacketFrameBoundaryDrainEnabled();
 
-    /** Records one pressure-triggered safe drain; no Java handler is entered from this hook. */
+    /** Records one pressure-triggered frame-boundary drain or a bounded vanilla fallback. */
     @JSBody(params = {
             "runTickSequence", "drainEpoch", "queueBefore", "queueAfter",
             "handlerCompletions", "handleDepthBefore", "handleDepthAfter",
@@ -1163,7 +1177,8 @@ public final class BrowserClientNetwork {
             const batchTarget = bounded(batchTargetPackets);
             const debt = bounded(remainingDebt);
             stats.frameBoundaryDrainAttempts = bounded(stats.frameBoundaryDrainAttempts) + 1;
-            if (result !== 'nested-skipped' && result !== 'claim-skipped') {
+            if (result !== 'nested-skipped' && result !== 'claim-skipped' &&
+                result !== 'vanilla-fallback') {
               stats.frameBoundaryDrainClaims = bounded(stats.frameBoundaryDrainClaims) + 1;
             }
             if (result === 'completed') {
@@ -1176,6 +1191,11 @@ public final class BrowserClientNetwork {
             } else if (result === 'claim-skipped') {
               stats.frameBoundaryDrainSkippedClaim =
                 bounded(stats.frameBoundaryDrainSkippedClaim) + 1;
+            } else if (result === 'vanilla-fallback') {
+              stats.frameBoundaryDrainSkippedClaim =
+                bounded(stats.frameBoundaryDrainSkippedClaim) + 1;
+              stats.frameBoundaryDrainVanillaFallback =
+                bounded(stats.frameBoundaryDrainVanillaFallback) + 1;
             } else if (result === 'minecraft-skipped') {
               stats.frameBoundaryDrainSkippedMinecraft =
                 bounded(stats.frameBoundaryDrainSkippedMinecraft) + 1;
@@ -1262,6 +1282,7 @@ public final class BrowserClientNetwork {
               flowPausedAfter: !!pausedAfter,
               mode: drainMode,
               outcome: result,
+              vanillaFallback: result === 'vanilla-fallback',
               failureType: failureType == null ? '' : String(failureType)
             });
             if (events.length > 64) {
@@ -1283,6 +1304,7 @@ public final class BrowserClientNetwork {
               claims: bounded(stats.frameBoundaryDrainClaims),
               completed: bounded(stats.frameBoundaryDrainCompleted),
               failures: bounded(stats.frameBoundaryDrainFailures),
+              vanillaFallbacks: bounded(stats.frameBoundaryDrainVanillaFallback),
               packets: bounded(stats.frameBoundaryDrainPacketsProcessed),
               maxPacketsPerTurn: bounded(stats.frameBoundaryDrainMaxPacketsPerTurn),
               maxMillis: bounded(stats.frameBoundaryDrainMaxMillis),

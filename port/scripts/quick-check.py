@@ -5578,7 +5578,13 @@ def check_source_patches() -> None:
             )
             and browser_client_packet_boundary.count(
                 "packetProcessor.processQueuedPackets()"
-            ) == 2
+            ) == 3
+            and '"threshold-race".equals(claimSkipReason)' in browser_client_packet_boundary
+            and '"claim-race".equals(claimSkipReason)' in browser_client_packet_boundary
+            and "if (vanillaFallback)" in browser_client_packet_boundary
+            and 'vanillaFallback ? "vanilla-fallback" : "claim-skipped"'
+                in browser_client_packet_boundary
+            and "frameBoundaryDrainVanillaFallback" in browser_client_network
             and "tryBeginClientPacketDrain(packetProcessor, pausedBefore)"
                 in browser_client_packet_boundary
             and "finally" in browser_client_packet_boundary

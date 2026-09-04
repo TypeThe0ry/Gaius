@@ -41,7 +41,8 @@ function jsBodyBefore(source, marker) {
 }
 
 // One PacketProcessor call at Minecraft's scheduled runTick boundary chooses one of three
-// bounded modes. It must never be supplemented by a second catch-up call in the same frame.
+// bounded modes. A transient claim race may select the ordinary bounded FIFO path, but it must
+// still be one call on that execution path, never a second catch-up call in the same frame.
 assert.match(schedulerSource, /MAX_PACKETS_PER_BATCH = 16/);
 assert.match(schedulerSource, /CLIENT_PACKET_DRAIN_THRESHOLD = 64/);
 assert.match(schedulerSource,
@@ -137,7 +138,7 @@ const packetProcessorOwnerClaim = between(
   "private static int countRetiredPacketProcessorOwners()",
 );
 assert.match(packetProcessorOwnerClaim,
-  /packetProcessorOwner == null[\s\S]*if \(clientPacketDrainActive\)[\s\S]*packetProcessorFallbackReason = "active-drain-owner-retiring"[\s\S]*return false/,
+  /packetProcessorOwner == null[\s\S]*if \(clientPacketDrainActive\)[\s\S]*packetProcessorFallbackReason = "active-drain-owner-retiring"[\s\S]*return (?:false|null)/,
   "a reentrant owner may not claim the empty slot while a retired active drain awaits finish");
 
 const packetProcessed = between(schedulerSource,
@@ -177,6 +178,12 @@ assert.match(scheduledWrapper,
 assert.match(scheduledWrapper,
   /String claimSkipReason[\s\S]*clientPacketDrainClaimSkipReason\(packetProcessor\)[\s\S]*recordClientPacketDrainJavaSkipped\(claimSkipReason\)/,
   "claim-skipped path does not retain the precise owner/re-entry reason");
+assert.match(scheduledWrapper,
+  /boolean vanillaFallback[\s\S]*"threshold-race"\.equals\(claimSkipReason\)[\s\S]*"claim-race"\.equals\(claimSkipReason\)[\s\S]*if \(vanillaFallback\) \{[\s\S]*packetProcessor\.processQueuedPackets\(\);[\s\S]*\}/,
+  "threshold/claim races must use one bounded ordinary FIFO fallback");
+assert.doesNotMatch(scheduledWrapper,
+  /vanillaFallback[\s\S]*"active-drain"|vanillaFallback[\s\S]*"handler-depth"/,
+  "active-drain and handler-depth re-entry must not recurse through PacketProcessor");
 assert.match(networkSource,
   /lastSkipReason:[\s\S]*clientPacketDrainLastSkipReason[\s\S]*skipReasons:[\s\S]*workerServer:[\s\S]*nullOwner:[\s\S]*claimRace:/,
   "client packet drain DOM report does not expose the latest bounded skip reason or all classifier buckets");
@@ -186,8 +193,8 @@ assert.match(networkSource,
 assert.match(scheduledWrapper,
   /catch \(RuntimeException \| Error failure\)[\s\S]*interruptClientPacketDrain\(packetProcessor\)[\s\S]*finally \{[\s\S]*clientPacketDrainEpoch\(\)[\s\S]*clientPacketDrainHandlerCompletions\(\)[\s\S]*finishClientPacketDrain\(packetProcessor\)/,
   "failure/finish does not capture exact epoch/completions before releasing the claim");
-assert.equal((scheduledWrapper.match(/packetProcessor\.processQueuedPackets\(\)/g) || []).length, 2,
-  "the wrapper must have exactly the vanilla branch and the claimed branch");
+assert.equal((scheduledWrapper.match(/packetProcessor\.processQueuedPackets\(\)/g) || []).length, 3,
+  "the wrapper must have one call per execution path: initial vanilla, safe race fallback, claimed drain");
 assert.doesNotMatch(scheduledWrapper, /Minecraft\.getInstance|Platform\.schedule|MessageChannel|setTimeout/,
   "the scheduled wrapper moved away from its supplied vanilla PacketProcessor boundary");
 assert.match(scheduledWrapper,
@@ -545,6 +552,24 @@ assert.equal(evidenceStats.frameBoundaryDrainLastUnattributedQueueReduction, 252
 assert.equal(evidenceStats.frameBoundaryDrainMaxPacketsPerTurn, 193,
   "mid-drain reset was overcounted as a 256-packet handler turn");
 
+// A safe claim-race fallback is still a claim skip (so the skip bucket increments), but it is
+// explicitly not an adaptive claim.  Its ordinary FIFO work is reported as unattributed to the
+// adaptive handler-completion ledger rather than being silently reported as zero queue progress.
+const claimsBeforeVanillaFallback = evidenceStats.frameBoundaryDrainClaims;
+recordBoundary(68, 0, 80, 64, 0, 0, 0, false, false, 0.15,
+  "claim-skipped", 63, 17, 17, 1, "pressure", "vanilla-fallback", null);
+lastBoundary = evidenceStats.frameBoundaryDrainEvents.at(-1);
+assert.equal(evidenceStats.frameBoundaryDrainClaims, claimsBeforeVanillaFallback,
+  "vanilla fallback was miscounted as an adaptive drain claim");
+assert.equal(evidenceStats.frameBoundaryDrainSkippedClaim, 1,
+  "vanilla fallback lost its failed adaptive-claim evidence");
+assert.equal(evidenceStats.frameBoundaryDrainVanillaFallback, 1,
+  "vanilla fallback did not increment its dedicated counter");
+assert.equal(lastBoundary.outcome, "vanilla-fallback");
+assert.equal(lastBoundary.vanillaFallback, true);
+assert.equal(lastBoundary.queueDepthReduction, 16);
+assert.equal(lastBoundary.unattributedQueueReduction, 16);
+
 const frameRecordScript = jsBodyBefore(networkSource,
   "public static native void recordClientPacketFrame(");
 new vm.Script(`(function(runTickSequence, safeDrainTurns, vanillaDrainTurns,
@@ -637,6 +662,51 @@ function scheduledFrameModel(initialDepth, {enabled = true, paused = false,
     unattributedQueueReduction: Math.max(
       0, initialDepth - fifo.length - handled.length),
   };
+}
+
+// A failed adaptive claim has two classes of outcome.  Transient queue/claim races are safe to
+// service through the already-patched ordinary 16-packet FIFO path; active-drain and handler-depth
+// are re-entrant and must leave the outer owner/handler state untouched.
+function claimSkipFrameModel(reason, initialDepth = 80) {
+  const safeRace = reason === "threshold-race" || reason === "claim-race";
+  const reentrant = reason === "active-drain" || reason === "handler-depth";
+  assert.ok(safeRace || reentrant, `unmodelled claim-skip reason: ${reason}`);
+  if (reentrant) {
+    return {
+      reason,
+      calls: 0,
+      adaptiveClaimActive: reason === "active-drain",
+      handled: [],
+      remaining: initialDepth,
+      handlerDepth: reason === "handler-depth" ? 1 : 0,
+    };
+  }
+  const ordinary = scheduledFrameModel(initialDepth, {enabled: false});
+  return {
+    reason,
+    calls: ordinary.calls,
+    adaptiveClaimActive: false,
+    handled: ordinary.handled,
+    remaining: ordinary.remaining,
+    handlerDepth: 0,
+  };
+}
+
+for (const reason of ["threshold-race", "claim-race", "active-drain", "handler-depth"]) {
+  const frame = claimSkipFrameModel(reason);
+  assert.ok(frame.calls <= 1, `${reason} issued more than one PacketProcessor call`);
+  assert.equal(new Set(frame.handled).size, frame.handled.length,
+    `${reason} duplicated a FIFO packet`);
+  if (reason === "threshold-race" || reason === "claim-race") {
+    assert.equal(frame.calls, 1, `${reason} silently dropped the scheduled FIFO turn`);
+    assert.deepEqual(frame.handled, Array.from({length: 16}, (_, index) => index),
+      `${reason} changed ordinary FIFO order`);
+    assert.equal(frame.adaptiveClaimActive, false,
+      `${reason} incorrectly retained an adaptive drain claim`);
+  } else {
+    assert.equal(frame.calls, 0, `${reason} recursively entered PacketProcessor`);
+    assert.equal(frame.remaining, 80, `${reason} mutated the outer FIFO state`);
+  }
 }
 
 // A close/reset from inside a queued handler must preserve the handler guard even when the
@@ -968,6 +1038,8 @@ console.log(JSON.stringify({
   boundaryEventsDropped: evidenceStats.frameBoundaryDrainEventsDropped,
   frameEventsRetained: evidenceStats.clientPacketFrameEvents.length,
   frameEventsDropped: evidenceStats.clientPacketFrameEventsDropped,
+  claimSkipFallbackModel: true,
+  vanillaFallbackEvents: evidenceStats.frameBoundaryDrainVanillaFallback,
   claimSkipReasonCases,
   claimSkipReasonBucketsComplete: true,
   bindFailureReasonEvidence: true,

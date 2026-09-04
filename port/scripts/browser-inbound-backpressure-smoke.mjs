@@ -140,16 +140,22 @@ const clientPacketBoundaryMethodSource = clientNetwork.slice(
   clientNetwork.indexOf('@JSBody(params = "callback"'),
 );
 assert.match(clientPacketBoundaryMethodSource,
-  /queueBefore < 64 \|\| !isClientPacketFrameBoundaryDrainEnabled\(\)/,
+  /boolean drainEnabled = isClientPacketFrameBoundaryDrainEnabled\(\)[\s\S]*!accountingValid \|\| queueBefore < 64 \|\| !drainEnabled/,
   "below-threshold PLAY work no longer preserves the one vanilla scheduled call");
 assert.match(clientPacketBoundaryMethodSource,
   /tryBeginClientPacketDrain\(packetProcessor, pausedBefore\)[\s\S]*packetProcessor\.processQueuedPackets\(\)[\s\S]*finally[\s\S]*finishClientPacketDrain\(packetProcessor\)/,
   "pressure PLAY work is not owner-claimed/released at the scheduled runTick boundary");
+assert.match(clientPacketBoundaryMethodSource,
+  /boolean vanillaFallback[\s\S]*"threshold-race"\.equals\(claimSkipReason\)[\s\S]*"claim-race"\.equals\(claimSkipReason\)[\s\S]*if \(vanillaFallback\) \{[\s\S]*packetProcessor\.processQueuedPackets\(\);[\s\S]*\}/,
+  "transient claim races must make one bounded ordinary FIFO pass");
+assert.doesNotMatch(clientPacketBoundaryMethodSource,
+  /vanillaFallback[\s\S]*"active-drain"|vanillaFallback[\s\S]*"handler-depth"/,
+  "active-drain/handler-depth must not recurse through the PacketProcessor");
 assert.equal(
   (clientPacketBoundaryMethodSource.match(/packetProcessor\.processQueuedPackets\(\)/g) || [])
     .length,
-  2,
-  "the scheduled wrapper must contain only its vanilla and claimed branches",
+  3,
+  "the scheduled wrapper must contain one call per vanilla, safe-race, and claimed branch",
 );
 assert.doesNotMatch(clientNetwork,
   /\bclientPacketDrainCallback\s*\(|\bscheduleClientPacketDrain\s*\(/,
