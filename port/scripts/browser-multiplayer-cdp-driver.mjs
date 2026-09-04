@@ -626,8 +626,21 @@ async function launchChrome(config) {
     "about:blank",
   ], {stdio: "ignore", windowsHide: false});
   try {
-    chrome.once("error", () => {});
-    const version = await waitForJson(`http://127.0.0.1:${debuggingPort}/json/version`, 30_000);
+    const spawnFailure = new Promise((_, reject) => {
+      chrome.once("error", (error) => {
+        reject(new Error(`Chrome spawn failed (${config.chromePath}): ${error?.message || error}`));
+      });
+    });
+    const processExit = new Promise((_, reject) => {
+      chrome.once("exit", (code, signal) => {
+        reject(new Error(`Chrome exited before CDP became ready (code=${code ?? "null"}, signal=${signal || "none"})`));
+      });
+    });
+    const version = await Promise.race([
+      waitForJson(`http://127.0.0.1:${debuggingPort}/json/version`, 30_000),
+      spawnFailure,
+      processExit,
+    ]);
     if (!version.webSocketDebuggerUrl) throw new Error("Chrome did not expose webSocketDebuggerUrl");
     return {chrome, temporaryProfile, debuggingPort, version};
   } catch (error) {
