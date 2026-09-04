@@ -1002,9 +1002,9 @@ public final class BrowserClientNetwork {
                 cancelled: stats.clientPacketDrainCancelled|0,
                 watchdog: stats.clientPacketDrainWatchdogCallbacks|0,
                 queueDepth: clientPacketQueueDepth(),
-                 generation: 0,
-                 pending: false,
-                 running: false,
+                 generation: Math.max(0, Number(scheduler && scheduler.generation) || 0),
+                 pending: !!(scheduler && scheduler.pending),
+                 running: !!(scheduler && scheduler.running),
                  demand: !!bridge.clientPacketDrainDemand,
                  sessionActive: !!(bridge.clientPacketDrainSession &&
                    bridge.clientPacketDrainSession.active),

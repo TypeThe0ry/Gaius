@@ -353,6 +353,7 @@ assert.match(installScript,
 // every legacy external scheduler/callback counter stays exactly zero.
 let javaPumpCalls = 0;
 let demandDomReports = 0;
+const demandDomPayloads = [];
 const stats = {decodedPacketQueue: 80};
 const bridge = {stats};
 const context = {
@@ -366,8 +367,11 @@ const context = {
   __gaiusClientPacketDrainEnabled: true,
   document: {
     documentElement: {
-      setAttribute(name) {
-        if (name === "data-gaius-client-packet-drain") demandDomReports++;
+      setAttribute(name, value) {
+        if (name === "data-gaius-client-packet-drain") {
+          demandDomReports++;
+          demandDomPayloads.push(JSON.parse(value));
+        }
       },
     },
   },
@@ -383,6 +387,12 @@ assert.equal(bridge.clientPacketDrain(), false);
 assert.equal(bridge.clientPacketDrainDemand, true);
 assert.equal(stats.clientPacketDrainDemandSignals, 1);
 assert.equal(demandDomReports, 1);
+assert.ok(demandDomPayloads[0].generation > 0,
+  "client packet drain DOM report lost the live scheduler generation");
+assert.equal(demandDomPayloads[0].pending, false,
+  "passive demand report incorrectly claims a callback is pending");
+assert.equal(demandDomPayloads[0].running, false,
+  "passive demand report incorrectly claims a callback is running");
 assert.equal(bridge.clientPacketDrain(), false);
 assert.equal(stats.clientPacketDrainDemandSignals, 1,
   "a sustained pressure window allocated a second demand edge");
