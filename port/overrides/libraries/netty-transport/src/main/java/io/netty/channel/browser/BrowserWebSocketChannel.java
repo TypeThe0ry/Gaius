@@ -104,7 +104,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             while (channelsVisited < channelCount) {
                 // Always inspect at least one slot. This preserves error/close handling for a
                 // newly signalled channel even if the clock is already at the aggregate limit.
-                if (openChannelsVisited > 0
+                if (channelsVisited > 0
                         && monotonicMillis() - startedAt >= MAX_TOTAL_MILLIS_PER_PUMP) {
                     budgetExhausted = true;
                     break;

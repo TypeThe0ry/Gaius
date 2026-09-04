@@ -48,7 +48,7 @@ assert.match(pump, /final int channelCount = channels\.length;/);
 assert.match(pump, /int index = nextPumpChannelIndex;/);
 assert.match(pump, /while \(channelsVisited < channelCount\)/);
 assert.match(pump,
-  /openChannelsVisited > 0[\s\S]*monotonicMillis\(\) - startedAt >= MAX_TOTAL_MILLIS_PER_PUMP/,
+  /channelsVisited > 0[\s\S]*monotonicMillis\(\) - startedAt >= MAX_TOTAL_MILLIS_PER_PUMP/,
   "global pump lacks its aggregate time gate after the first inspected slot");
 assert.match(pump, /int openChannelsVisited = 0;/);
 assert.match(pump, /openChannelsVisited\+\+;/);
@@ -201,10 +201,11 @@ assert.ok(delayedReady.slice(1).some((turn) => turn.processed.includes(7)),
 
 /**
  * Model the actual backing array shape separately from channel work. A null/closed slot is
- * visited but does not increment openChannelsVisited, while an open-idle channel does. This
- * keeps the test honest about the product's aggregate gate and catches sparse-ring regressions.
+ * visited but does not increment openChannelsVisited, while an open-idle channel does. The
+ * aggregate budget is keyed to visited slots; slotMillis lets the sparse-capacity case model the
+ * non-zero lookup cost of a large hole ring without pretending a null slot is an open channel.
  */
-function modelSlotPumpTurns(slots, idleMillis, perChannelMillis = 2) {
+function modelSlotPumpTurns(slots, idleMillis, perChannelMillis = 2, slotMillis = 0) {
   const remaining = slots.map((slot) => slot.work);
   let cursor = 0;
   const turns = [];
@@ -215,7 +216,7 @@ function modelSlotPumpTurns(slots, idleMillis, perChannelMillis = 2) {
     const processed = [];
     let budgetYield = false;
     while (visited < slots.length) {
-      if (openChannelsVisited > 0 && elapsed >= MAX_TOTAL_MILLIS) {
+      if (visited > 0 && elapsed >= MAX_TOTAL_MILLIS) {
         budgetYield = true;
         break;
       }
@@ -223,6 +224,9 @@ function modelSlotPumpTurns(slots, idleMillis, perChannelMillis = 2) {
       cursor = (cursor + 1) % slots.length;
       visited++;
       const slot = slots[index];
+      // A sparse backing-array lookup still consumes a small, non-zero amount of native work.
+      // The product budget must therefore be keyed to visited slots, not only open channels.
+      elapsed += slotMillis;
       if (!slot.open) continue;
       openChannelsVisited++;
       if (remaining[index] > 0) {
@@ -259,6 +263,23 @@ assert.equal(nullHoleRing[0].processed[0], 6,
   "null/closed backing-array holes incorrectly consumed an open-channel budget turn");
 assert.equal(nullHoleRing[0].openChannelsVisited, 1,
   "null/closed slots were counted as open channels");
+
+// After enough connect/close churn the Java backing array can be much larger than the number of
+// live channels. A simulated per-slot lookup cost must still hit the 4 ms aggregate budget after
+// the first inspected slot; otherwise an all-hole ring performs an unbounded O(capacity) scan in
+// one browser turn. The ready channel remains reachable through the round-robin continuation.
+const sparseCapacityRing = modelSlotPumpTurns([
+  ...Array.from({length: 2047}, () => ({open: false, work: 0})),
+  {open: true, work: 1},
+], 0, 2, 0.25);
+assert.equal(sparseCapacityRing[0].processed.length, 0,
+  "high-capacity hole scan unexpectedly processed a distant ready channel in one turn");
+assert.equal(sparseCapacityRing[0].budgetYield, true,
+  "high-capacity hole scan ignored the aggregate budget after visiting slots");
+assert.ok(sparseCapacityRing[0].visited > 0 && sparseCapacityRing[0].visited < 2048,
+  "high-capacity hole scan did not stop after a bounded number of visited slots");
+assert.ok(sparseCapacityRing.slice(1).some((turn) => turn.processed.includes(2047)),
+  "ready channel behind a high-capacity hole ring was never serviced");
 
 const openIdleRing = modelSlotPumpTurns([
   {open: true, work: 0},
