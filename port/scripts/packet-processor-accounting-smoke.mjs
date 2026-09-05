@@ -160,6 +160,24 @@ const processStart = bytecode.indexOf("public void processQueuedPackets();", sch
 const closeStart = bytecode.indexOf("public void close();", processStart);
 assert.ok(scheduleStart >= 0 && processStart > scheduleStart && closeStart > processStart,
   "PacketProcessor javap method boundaries were not found");
+const constructorStart = bytecode.indexOf(
+  "public net.minecraft.network.PacketProcessor(java.lang.Thread);",
+);
+const constructorEnd = bytecode.indexOf(
+  "public boolean isSameThread();",
+  constructorStart,
+);
+assert.ok(constructorStart >= 0 && constructorEnd > constructorStart,
+  "PacketProcessor constructor javap boundary was not found");
+const constructorTrace = bytecode
+  .slice(constructorStart, constructorEnd)
+  .replace(/\s+/g, " ")
+  .replace(/([A-Za-z])\s+([A-Za-z])/g, "$1$2");
+assert.match(
+  constructorTrace,
+  /BrowserPacketScheduler\.bindPacketProcessorLifecycle:\(Ljava\/lang\/Object;\)Z.*?pop.*?return/u,
+  "PacketProcessor constructor does not bind lifecycle owner before return",
+);
 const scheduleBytecode = bytecode.slice(scheduleStart, processStart);
 const processBytecode = bytecode.slice(processStart, closeStart);
 const closeBytecode = bytecode.slice(closeStart);
