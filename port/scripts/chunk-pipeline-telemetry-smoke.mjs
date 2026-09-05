@@ -126,8 +126,10 @@ for (const contract of [
   "state.resetAt",
   "state.rttSampleCount",
   "copyScalarTelemetry",
+  "copyGlobalPumpTelemetry",
   "state.chunkPriority",
   "state.network",
+  "state.globalPump",
   "__gaiusResetTelemetry",
 ]) {
   assert.ok(singleplayer.includes(contract), "missing Worker telemetry contract: " + contract);
@@ -142,6 +144,9 @@ for (const contract of [
   "root.__gaiusNetworkStats",
   "copied >= 64",
   "Number.isFinite(current)",
+  "globalPumpTelemetryKeys",
+  "snapshotGlobalPumpTelemetry",
+  "globalPump: snapshotGlobalPumpTelemetry",
 ]) {
   assert.ok(workerBootstrap.includes(contract),
     "Worker heartbeat is missing scalar snapshot contract: " + contract);
@@ -152,6 +157,18 @@ const heartbeatBranch = workerBootstrap.slice(
 );
 assert.ok(!heartbeatBranch.includes("...root.__gaiusChunkPriorityStats"),
   "Worker heartbeat must not spread an unbounded chunk telemetry object");
+for (const field of [
+  "pumpAllTurns",
+  "pumpAllChannelsVisited",
+  "pumpAllBudgetYields",
+  "pumpAllMaxTurnMillis",
+  "pumpAllMaxChannelsPerTurn",
+  "pumpAllLastTurnMillis",
+  "pumpAllLastChannelsVisited",
+]) {
+  assert.ok(workerBootstrap.includes(field),
+    "Worker heartbeat omitted fixed global-pump field: " + field);
+}
 
 for (const contract of [
   'const SLOW_SAMPLE_SCHEMA_VERSION = 2',

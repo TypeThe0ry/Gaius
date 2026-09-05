@@ -56,6 +56,13 @@ for (const contract of [
   "beginClientHandoff(sessionId, launchGeneration)",
   "globalThis.__gaiusSingleplayerHandoffGeneration",
   "singleplayer:handoff-disconnect-ignored",
+  "const resolvedWorkerUrl = new URL(",
+  "pageUrl.searchParams.get('gaiusMobAiTelemetry') === '1'",
+  "resolvedWorkerUrl.searchParams.set('gaiusMobAiTelemetry', '1')",
+  "globalThis.__gaiusSingleplayerWorkerUrl ||",
+  "configuredWorkerUrl.protocol !== 'blob:'",
+  "type: 'diagnostic-config'",
+  "gaiusMobAiTelemetry: true",
 ]) {
   assert.ok(source.includes(contract), `missing session contract: ${contract}`);
 }
@@ -283,13 +290,16 @@ function createLaunchRuntime(failureMode, options = {}) {
     }
   }
   class TestWorker {
-    constructor() {
+    constructor(url) {
       if (failureMode === "constructor") throw new Error("constructor failed");
+      this.url = url;
       this.terminated = false;
+      this.messages = [];
       this.messageListeners = [];
       createdWorkers.push(this);
     }
-    postMessage() {
+    postMessage(message) {
+      this.messages.push(message);
       if (failureMode === "postMessage") throw new Error("postMessage failed");
     }
     terminate() {
@@ -325,7 +335,7 @@ function createLaunchRuntime(failureMode, options = {}) {
     clearTimeout: runtimeClearTimeout,
     console,
     crypto: {getRandomValues: (bytes) => bytes.fill(7)},
-    location: new URL("https://client.example/Gaius.html"),
+    location: new URL(options.locationHref || "https://client.example/Gaius.html"),
     navigator: {hardwareConcurrency: 8},
     setInterval,
     setTimeout: runtimeSetTimeout,
@@ -336,6 +346,9 @@ function createLaunchRuntime(failureMode, options = {}) {
     __gaiusStoragePrefix: "gaius.fs.v2:26.2:",
     __gaiusStorageOpfsDirectory: "regions-v2-26.2",
   };
+  if (options.workerUrl !== undefined) {
+    context.__gaiusSingleplayerWorkerUrl = options.workerUrl;
+  }
   context.globalThis = context;
   vm.runInNewContext(
     `globalThis.launchWorker = function(worldId, newWorld, renderDistance, ` +
@@ -357,6 +370,61 @@ function createLaunchRuntime(failureMode, options = {}) {
     "Worker constructor failure leaked the local-port map entry");
   assert.equal(runtime.context.__gaiusSingleplayerWorkers.size, 0,
     "Worker constructor failure leaked the worker map entry");
+}
+
+{
+  const runtime = createLaunchRuntime(null, {
+    locationHref: "https://client.example/Gaius.html?gaiusMobAiTelemetry=1",
+    captureTimers: true,
+  });
+  const sessionId = runtime.context.launchWorker("world", true, 6, 4);
+  assert.ok(sessionId, "telemetry query fixture did not launch a Worker");
+  const worker = runtime.createdWorkers[0];
+  assert.equal(worker.messages[0]?.type, "diagnostic-config",
+    "Mob AI telemetry opt-in was not sent to the Worker before startup");
+  assert.equal(worker.url.searchParams.get("gaiusMobAiTelemetry"), "1",
+    "Mob AI telemetry query was not propagated to the Worker URL");
+  assert.equal(worker.url.searchParams.get("v"), "dev",
+    "Worker URL lost its build cache token while propagating telemetry");
+  for (const timer of runtime.capturedTimers) timer.cleared = true;
+  worker.terminate();
+}
+
+{
+  const runtime = createLaunchRuntime(null, {
+    locationHref: "https://client.example/Gaius.html?gaiusMobAiTelemetry=1",
+    workerUrl: "https://client.example/custom-worker.js?v=custom",
+    captureTimers: true,
+  });
+  const sessionId = runtime.context.launchWorker("world", true, 6, 4);
+  assert.ok(sessionId, "custom Worker URL fixture did not launch");
+  const worker = runtime.createdWorkers[0];
+  assert.equal(worker.messages[0]?.type, "diagnostic-config",
+    "Mob AI telemetry opt-in was not sent for a configured Worker URL");
+  assert.equal(worker.url.searchParams.get("gaiusMobAiTelemetry"), "1",
+    "Mob AI telemetry query was not propagated to a configured Worker URL");
+  assert.equal(worker.url.searchParams.get("v"), "custom",
+    "configured Worker URL lost its cache token while propagating telemetry");
+  for (const timer of runtime.capturedTimers) timer.cleared = true;
+  worker.terminate();
+}
+
+{
+  const blobWorkerUrl = "blob:https://client.example/opaque-worker";
+  const runtime = createLaunchRuntime(null, {
+    locationHref: "https://client.example/Gaius.html?gaiusMobAiTelemetry=1",
+    workerUrl: blobWorkerUrl,
+    captureTimers: true,
+  });
+  const sessionId = runtime.context.launchWorker("world", true, 6, 4);
+  assert.ok(sessionId, "Blob Worker URL fixture did not launch");
+  const worker = runtime.createdWorkers[0];
+  assert.equal(worker.url, blobWorkerUrl,
+    "diagnostic query rewriting changed the opaque Blob Worker URL");
+  assert.equal(worker.messages[0]?.type, "diagnostic-config",
+    "Blob Worker did not receive the pre-start Mob AI telemetry opt-in");
+  for (const timer of runtime.capturedTimers) timer.cleared = true;
+  worker.terminate();
 }
 
 {

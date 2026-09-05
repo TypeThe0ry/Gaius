@@ -405,6 +405,49 @@ public final class BrowserWorldgenScheduler {
         }
     }
 
+    /**
+     * Cooperative checkpoint for the vanilla {@code Mob.serverAiStep} pipeline.
+     *
+     * <p>Mob sensing, goal selection, navigation, and custom AI all run on the
+     * integrated server's browser Worker.  The patcher calls this only between
+     * those existing vanilla stages; it does not alter goal ordering or skip a
+     * stage.  Keeping the hook separate from the generic pulse gives the
+     * diagnostics an opt-in, bounded counter while the release path remains a
+     * single scheduler call when telemetry is disabled.
+     */
+    public static void mobAiPulse() {
+        recordMobAiPulse();
+        pulse();
+    }
+
+    /**
+     * Entity-tick fallback for profiles where TeaVM folds or drops Mob's
+     * override methods.  LivingEntity.tick is the common live boundary for
+     * every Mob instance; the instanceof guard keeps players and other
+     * living entities out of the Mob-AI checkpoint path.
+     */
+    public static void mobEntityPulse(Object entity) {
+        if (entity instanceof net.minecraft.world.entity.Mob) {
+            mobAiPulse();
+        }
+    }
+
+    @JSBody(script = """
+            try {
+              if (globalThis.__gaiusMobAiTelemetry !== true) return;
+              const stats = globalThis.__gaiusWorldgenStats ||
+                (globalThis.__gaiusWorldgenStats = {});
+              stats.mobAiPulses = (Number(stats.mobAiPulses) || 0) + 1;
+              stats.mobAiMaxPulses = Math.max(
+                Number(stats.mobAiMaxPulses) || 0,
+                stats.mobAiPulses
+              );
+            } catch (_) {
+              // Optional diagnostics must never perturb the AI or scheduler.
+            }
+            """)
+    private static native void recordMobAiPulse();
+
     private static void requestYield(int reason, int observedQueueDepth) {
         if (yieldActive) {
             yieldReentrantContinuation();

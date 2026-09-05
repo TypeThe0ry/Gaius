@@ -2,7 +2,8 @@
 
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
-import {mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
+import {existsSync} from "node:fs";
+import {copyFile, mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
 import {homedir, tmpdir} from "node:os";
 import path from "node:path";
 import {fileURLToPath} from "node:url";
@@ -112,6 +113,21 @@ function jsBodyBefore(declaration) {
   return browserOpenGl.slice(scriptStart, scriptEnd);
 }
 
+// TeaVM 0.15 rejects repeated top-level lexical binding names in one @JSBody
+// even when ECMAScript block scoping would otherwise make the source valid.
+// Keep this method-specific gate so the expensive release build cannot finish
+// with an invalid emitted client after a nested failure path adds a duplicate.
+const clientWaitBody = jsBodyBefore(
+  "private static native int clientWaitSyncJs(int sync, int flags, int timeout);");
+const clientWaitLexicalNames = [...clientWaitBody.matchAll(
+  /\b(?:const|let)\s+([A-Za-z_$][\w$]*)/g,
+)].map((match) => match[1]);
+const clientWaitDuplicateLexicals = [...new Set(clientWaitLexicalNames.filter(
+  (name, index) => clientWaitLexicalNames.indexOf(name) !== index,
+))];
+assert.deepEqual(clientWaitDuplicateLexicals, [],
+  "clientWaitSyncJs repeats lexical names rejected by TeaVM's @JSBody parser");
+
 for (const contract of [
   "BROWSER_GPU_RETIRE_SLOTS = 8",
   "gaius$pollRetireSlot",
@@ -130,6 +146,15 @@ assert.ok(!patcher.includes("Failed to wait for frame completion"),
 
 for (const contract of [
   "gpuFenceTimeouts",
+  "gpuFenceNativeWaitCalls",
+  "gpuFenceNativeTimeouts",
+  "gpuFenceCoalescedWaits",
+  "gpuFenceCoalescedTimeouts",
+  "gpuFenceFlushOnlyCalls",
+  "gpuFenceExplicitFlushes",
+  "gpuFenceSuppressedRepeatFlushes",
+  "gpuFenceTimeoutBurst",
+  "globalThis.queueMicrotask",
   "gpuRetireBacklogMax",
   "gpuWaitFailures",
   "gpuContextLosses",
@@ -145,6 +170,10 @@ for (const contract of [
 }
 assert.ok(browserOpenGl.includes("clientWaitSync(object,safeFlags,0)"),
   "WebGL fence wait is not a nonblocking zero-timeout poll");
+assert.ok(clientWaitBody.includes("safeFlags===0 || retireOwned"),
+  "flagged timeout coalescing is not scoped to internal retire-owned fences");
+assert.ok(!clientWaitBody.includes("gl.flush()"),
+  "retire timeout cache still emits per-hit explicit WebGL flushes");
 assert.ok(browserOpenGl.includes("return 0x911D"),
   "missing sync/context loss does not return WAIT_FAILED");
 assert.ok(!browserOpenGl.includes(
@@ -154,6 +183,32 @@ assert.ok(browserOpenGl.includes("this.gpuRetireRecent.length>120"),
   "GPU retire telemetry is not bounded to 120 frames");
 
 const javaTools = selectJavaTools();
+
+async function copyUnsignedClientJar(source, destination) {
+  const jar = path.join(
+    path.dirname(javaTools.javac),
+    process.platform === "win32" ? "jar.exe" : "jar",
+  );
+  assert.ok(existsSync(jar), `missing JDK jar tool for signer-isolated verifier: ${jar}`);
+  const unpacked = await mkdtemp(path.join(path.dirname(destination), "unsigned-client-"));
+  try {
+    run(jar, ["--extract", "--file", source], {cwd: unpacked});
+    const metaInf = path.join(unpacked, "META-INF");
+    for (const entry of ["MOJANGCS.SF", "MOJANGCS.RSA", "MOJANGCS.DSA", "MOJANGCS.EC"]) {
+      await rm(path.join(metaInf, entry), {force: true});
+    }
+    run(jar, ["--create", "--file", destination, "-C", unpacked, "."]);
+    const remainingSignatures = run(jar, ["--list", "--file", destination])
+      .split(/\r?\n/)
+      .filter((entry) => /^META-INF\/[^/]+\.(?:SF|RSA|DSA|EC)$/i.test(entry));
+    assert.deepEqual(remainingSignatures, [],
+      "temporary verifier client jar retained package-signing metadata");
+  } finally {
+    await rm(unpacked, {recursive: true, force: true});
+  }
+  return destination;
+}
+
 const temporaryRoot = await mkdtemp(path.join(tmpdir(), "gaius-gpu-retire-smoke-"));
 try {
   const patcherClasses = path.join(temporaryRoot, "patcher-classes");
@@ -161,6 +216,7 @@ try {
   const browserClasses = path.join(temporaryRoot, "browser-classes");
   const harnessClasses = path.join(temporaryRoot, "harness-classes");
   const harnessSourceDirectory = path.join(temporaryRoot, "src/dev/gaius/smoke");
+  const unsignedBaseClient = path.join(temporaryRoot, "client-named-unsigned.jar");
   await Promise.all([
     mkdir(patcherClasses, {recursive: true}),
     mkdir(patchedClasses, {recursive: true}),
@@ -168,6 +224,7 @@ try {
     mkdir(harnessClasses, {recursive: true}),
     mkdir(harnessSourceDirectory, {recursive: true}),
   ]);
+  await copyUnsignedClientJar(baseClient, unsignedBaseClient);
 
   const asm = path.join(
     homedir(),
@@ -200,10 +257,18 @@ try {
   // without this conversion javac silently drops the later jars (notably
   // Brigadier), making the BrowserOpenGL compile fail for a missing Message.
   if (process.platform === "win32") {
+    const workMarker = `/port/work/${version}/`;
     runtimeClasspath = runtimeClasspath
       .split(":")
       .filter(Boolean)
-      .map((entry) => entry.replace(/^\/([a-z])\//i, "$1:/"))
+      .map((entry) => {
+        const nativeEntry = entry.replace(/^\/([a-z])\//i, "$1:/");
+        const normalized = nativeEntry.replaceAll("\\", "/");
+        const markerOffset = normalized.toLowerCase().indexOf(workMarker.toLowerCase());
+        return markerOffset === -1
+          ? nativeEntry
+          : path.join(repositoryRoot, ...normalized.slice(markerOffset + 1).split("/"));
+      })
       .join(path.delimiter);
   }
   const teaVmJars = ["teavm-interop", "teavm-jso", "teavm-jso-apis"].map(
@@ -226,7 +291,11 @@ try {
     browserOpenGlSource,
   ], {stdio: ["ignore", "pipe", "pipe"]});
 
-  const patchedClasspath = [patchedClasses, baseClient].join(path.delimiter);
+  // The patcher emits replacement classes into a directory.  Loading those
+  // beside a signed Mojang jar trips the JVM package-signer check before the
+  // verifier reaches the patched methods.  Use a job-local unsigned copy so
+  // this remains a bytecode/runtime verifier, rather than a signer artifact.
+  const patchedClasspath = [patchedClasses, unsignedBaseClient].join(path.delimiter);
   const encoderBytecode = run(javaTools.javap, [
     "-classpath", patchedClasspath,
     "-p", "-c", "-verbose",
@@ -331,7 +400,7 @@ public final class GpuRetirePatchedClassVerifier {
   const verifyClasspath = [
     patchedClasses,
     browserClasses,
-    baseClient,
+    unsignedBaseClient,
     lwjglOpenGl,
     lwjglCore,
     ...teaVmJars,
@@ -358,9 +427,27 @@ const TIMEOUT_EXPIRED = 0x911B;
 const CONDITION_SATISFIED = 0x911C;
 const WAIT_FAILED = 0x911D;
 
-const initializeGpuFenceLifecycle = new Function(jsBodyBefore(
+const initializeGpuFenceLifecycleBody = jsBodyBefore(
   "private static native void initializeGpuFenceLifecycleJs(",
-));
+);
+const timeoutCacheStart = initializeGpuFenceLifecycleBody.indexOf(
+  "state.gpuCacheFenceTimeout=function",
+);
+const timeoutCacheEnd = initializeGpuFenceLifecycleBody.indexOf(
+  "state.gpuOldestFenceAge=function",
+  timeoutCacheStart,
+);
+assert.ok(timeoutCacheStart >= 0 && timeoutCacheEnd > timeoutCacheStart,
+  "missing bounded GPU timeout cache helper");
+const timeoutCacheBody = initializeGpuFenceLifecycleBody.slice(
+  timeoutCacheStart,
+  timeoutCacheEnd,
+);
+assert.doesNotMatch(timeoutCacheBody, /setTimeout|MessageChannel|requestAnimationFrame/,
+  "GPU timeout cache checkpoint can cross the current microtask boundary");
+assert.match(timeoutCacheBody, /globalThis\.queueMicrotask/,
+  "GPU timeout cache is not cleared by a queueMicrotask checkpoint");
+const initializeGpuFenceLifecycle = new Function(initializeGpuFenceLifecycleBody);
 const browserMarkNextFenceRetireOwned = new Function(jsBodyBefore(
   "public static native void markNextFenceRetireOwned();",
 ));
@@ -373,9 +460,24 @@ assert.ok(
   "retire ownership token is not consumed before every fence creation exit",
 );
 const browserFenceSync = new Function("condition", "flags", fenceSyncBody);
-const browserClientWaitSync = new Function("sync", "flags", "timeout", jsBodyBefore(
+const browserClientWaitSyncBody = jsBodyBefore(
   "private static native int clientWaitSyncJs(int sync, int flags, int timeout);",
-));
+);
+assert.equal(
+  browserClientWaitSyncBody.match(/gpuCacheFenceTimeout\(id,object\)/g)?.length,
+  1,
+  "GPU timeout cache has an unexpected write path",
+);
+const timeoutCacheWrite = browserClientWaitSyncBody.indexOf(
+  "state.gpuCacheFenceTimeout(id,object)",
+);
+assert.ok(
+  browserClientWaitSyncBody.lastIndexOf("if (status===0x911B)", timeoutCacheWrite) >= 0,
+  "GPU timeout cache is populated without a native TIMEOUT_EXPIRED status",
+);
+const browserClientWaitSync = new Function(
+  "sync", "flags", "timeout", browserClientWaitSyncBody,
+);
 const browserDeleteSync = new Function("sync", jsBodyBefore(
   "private static native void deleteSyncJs(int sync);",
 ));
@@ -386,6 +488,9 @@ const webGlWaitCalls = [];
 const webGlDeleted = [];
 const webGlWaitStatuses = [];
 let webGlParameterReads = 0;
+let webGlFlushCalls = 0;
+let webGlFlushFailure = null;
+let webGlLoseContextOnFlush = false;
 const mockGl = {
   MAX_CLIENT_WAIT_TIMEOUT_WEBGL: 0x9247,
   lost: false,
@@ -409,6 +514,15 @@ const mockGl = {
   clientWaitSync(object, flags, timeout) {
     webGlWaitCalls.push({object, flags, timeout});
     return webGlWaitStatuses.shift() ?? ALREADY_SIGNALED;
+  },
+  flush() {
+    webGlFlushCalls++;
+    if (webGlLoseContextOnFlush) this.lost = true;
+    if (webGlFlushFailure) {
+      const failure = webGlFlushFailure;
+      webGlFlushFailure = null;
+      throw failure;
+    }
   },
   deleteSync(object) {
     webGlDeleted.push(object.id);
@@ -468,31 +582,217 @@ try {
   state.gpuBeginRetireFrame(0, 8);
   browserMarkNextFenceRetireOwned();
   const firstFence = browserFenceSync(0x9117, 0);
-  webGlWaitStatuses.push(TIMEOUT_EXPIRED, CONDITION_SATISFIED);
+  const firstFenceNativeCalls = webGlWaitCalls.length;
+  const firstFenceFlushCalls = webGlFlushCalls;
+  webGlWaitStatuses.push(TIMEOUT_EXPIRED, CONDITION_SATISFIED, ALREADY_SIGNALED);
   assert.equal(browserClientWaitSync(firstFence, 1, 1_000_000), TIMEOUT_EXPIRED);
   assert.equal(webGlParameterReads, parameterReadsBeforePolling,
     "GPU fence poll performed a synchronous WebGL parameter read");
   assert.equal(webGlWaitCalls.at(-1).timeout, 0,
     "BrowserOpenGL passed a blocking timeout to WebGL");
+  assert.equal(webGlWaitCalls.length, firstFenceNativeCalls + 1,
+    "the first timeout was not a native WebGL wait");
   assert.equal(state.syncs.has(firstFence), true, "timeout discarded the WebGL sync");
   assert.equal(webGlDeleted.length, 1, "timeout deleted the WebGL sync");
+  assert.equal(browserClientWaitSync(firstFence, 1, 1_000_000), TIMEOUT_EXPIRED,
+    "same-burst duplicate did not preserve the logical timeout");
+  assert.equal(webGlWaitCalls.length, firstFenceNativeCalls + 1,
+    "same-burst duplicate performed another native WebGL wait");
+  assert.equal(webGlFlushCalls, firstFenceFlushCalls,
+    "retire-owned same-burst duplicate performed a redundant explicit flush");
+  assert.equal(mockWindow.__gaiusGLStats.gpuFenceWaits, 2,
+    "coalescing changed logical GPU wait telemetry");
+  assert.equal(mockWindow.__gaiusGLStats.gpuFenceTimeouts, 2,
+    "coalescing changed logical GPU timeout telemetry");
+  assert.equal(mockWindow.__gaiusGLStats.gpuFenceNativeWaitCalls, 1);
+  assert.equal(mockWindow.__gaiusGLStats.gpuFenceNativeTimeouts, 1);
+  assert.equal(mockWindow.__gaiusGLStats.gpuFenceCoalescedWaits, 1);
+  assert.equal(mockWindow.__gaiusGLStats.gpuFenceCoalescedTimeouts, 1);
+  assert.equal(mockWindow.__gaiusGLStats.gpuFenceFlushOnlyCalls, 0);
+  assert.equal(mockWindow.__gaiusGLStats.gpuFenceExplicitFlushes, 0);
+  assert.equal(mockWindow.__gaiusGLStats.gpuFenceSuppressedRepeatFlushes, 1);
+  await Promise.resolve();
   assert.equal(browserClientWaitSync(firstFence, 1, 1_000_000), CONDITION_SATISFIED);
+  assert.equal(webGlWaitCalls.length, firstFenceNativeCalls + 2,
+    "microtask checkpoint did not expire the timeout cache");
+  assert.equal(browserClientWaitSync(firstFence, 1, 1_000_000), ALREADY_SIGNALED,
+    "successful wait status was cached instead of polling natively");
+  assert.equal(webGlWaitCalls.length, firstFenceNativeCalls + 3,
+    "successful wait was incorrectly coalesced");
   browserDeleteSync(firstFence);
   assert.equal(state.syncs.has(firstFence), false, "signaled sync was not cleared");
   assert.deepEqual(webGlDeleted, [1, 2], "signaled sync was not deleted exactly once");
   assert.equal(mockWindow.__gaiusGLStats.gpuEarlyResourceReuse, 0,
     "signaled retirement was reported as early reuse");
 
+  const flagsZeroFence = browserFenceSync(0x9117, 0);
+  const flagsZeroNativeCalls = webGlWaitCalls.length;
+  const flagsZeroFlushCalls = webGlFlushCalls;
+  webGlWaitStatuses.push(TIMEOUT_EXPIRED, CONDITION_SATISFIED);
+  assert.equal(browserClientWaitSync(flagsZeroFence, 0, 0), TIMEOUT_EXPIRED);
+  assert.equal(browserClientWaitSync(flagsZeroFence, 0, 0), TIMEOUT_EXPIRED,
+    "flags=0 same-burst timeout did not coalesce");
+  assert.equal(webGlWaitCalls.length, flagsZeroNativeCalls + 1,
+    "flags=0 same-burst timeout performed another native wait");
+  assert.equal(webGlFlushCalls, flagsZeroFlushCalls,
+    "flags=0 same-burst timeout unexpectedly flushed WebGL");
+  assert.equal(browserClientWaitSync(flagsZeroFence, 0, 1), TIMEOUT_EXPIRED,
+    "telemetry-only requested timeout changed the burst result");
+  assert.equal(webGlWaitCalls.length, flagsZeroNativeCalls + 1,
+    "telemetry-only requested timeout performed another native wait");
+  assert.equal(webGlFlushCalls, flagsZeroFlushCalls,
+    "flags=0 timeout path flushed WebGL");
+  assert.equal(browserClientWaitSync(flagsZeroFence, 1, 1), CONDITION_SATISFIED,
+    "application-owned flagged duplicate changed the native wait result");
+  assert.equal(webGlWaitCalls.length, flagsZeroNativeCalls + 2,
+    "application-owned flagged duplicate reused a flags=0 cached timeout");
+  assert.equal(webGlFlushCalls, flagsZeroFlushCalls,
+    "application-owned flagged duplicate used a non-native explicit flush");
+  browserDeleteSync(flagsZeroFence);
+  await Promise.resolve();
+
+  const waitFailedFence = browserFenceSync(0x9117, 0);
+  const waitFailedNativeCalls = webGlWaitCalls.length;
+  webGlWaitStatuses.push(WAIT_FAILED, WAIT_FAILED);
+  assert.equal(browserClientWaitSync(waitFailedFence, 0, 0), WAIT_FAILED);
+  assert.equal(browserClientWaitSync(waitFailedFence, 0, 0), WAIT_FAILED);
+  assert.equal(webGlWaitCalls.length, waitFailedNativeCalls + 2,
+    "WAIT_FAILED was cached instead of polling natively");
+  browserDeleteSync(waitFailedFence);
+
+  const applicationFlaggedFence = browserFenceSync(0x9117, 0);
+  const applicationFlaggedNativeCalls = webGlWaitCalls.length;
+  webGlWaitStatuses.push(TIMEOUT_EXPIRED, CONDITION_SATISFIED);
+  assert.equal(browserClientWaitSync(applicationFlaggedFence, 1, 0), TIMEOUT_EXPIRED);
+  assert.equal(state.gpuFenceTimeoutBurst.has(applicationFlaggedFence), false,
+    "application-owned flagged timeout entered the retire-only cache");
+  assert.equal(browserClientWaitSync(applicationFlaggedFence, 1, 0), CONDITION_SATISFIED,
+    "application-owned flagged wait was not polled natively");
+  assert.equal(webGlWaitCalls.length, applicationFlaggedNativeCalls + 2,
+    "application-owned flagged wait was coalesced");
+  browserDeleteSync(applicationFlaggedFence);
+  await Promise.resolve();
+
+  const deleteCachedFence = browserFenceSync(0x9117, 0);
+  const deleteCachedNativeCalls = webGlWaitCalls.length;
+  webGlWaitStatuses.push(TIMEOUT_EXPIRED);
+  assert.equal(browserClientWaitSync(deleteCachedFence, 0, 0), TIMEOUT_EXPIRED);
+  assert.equal(state.gpuFenceTimeoutBurst.has(deleteCachedFence), true,
+    "native timeout was not cached for delete cleanup test");
+  browserDeleteSync(deleteCachedFence);
+  assert.equal(state.gpuFenceTimeoutBurst.has(deleteCachedFence), false,
+    "delete retained a burst timeout cache entry");
+  assert.equal(browserClientWaitSync(deleteCachedFence, 0, 0), WAIT_FAILED,
+    "deleted sync did not fail closed");
+  assert.equal(webGlWaitCalls.length, deleteCachedNativeCalls + 1,
+    "deleted sync touched native WebGL wait");
+  await Promise.resolve();
+
+  const originalQueueMicrotask = globalThis.queueMicrotask;
+  let queuedCheckpoints = 0;
+  globalThis.queueMicrotask = (callback) => {
+    queuedCheckpoints++;
+    originalQueueMicrotask(callback);
+  };
+  const firstMultiFence = browserFenceSync(0x9117, 0);
+  const secondMultiFence = browserFenceSync(0x9117, 0);
+  const multiNativeCalls = webGlWaitCalls.length;
+  try {
+    webGlWaitStatuses.push(TIMEOUT_EXPIRED, TIMEOUT_EXPIRED);
+    assert.equal(browserClientWaitSync(firstMultiFence, 0, 0), TIMEOUT_EXPIRED);
+    assert.equal(browserClientWaitSync(secondMultiFence, 0, 0), TIMEOUT_EXPIRED);
+    assert.equal(queuedCheckpoints, 1,
+      "multiple sync timeouts queued more than one burst checkpoint");
+    assert.equal(browserClientWaitSync(firstMultiFence, 0, 0), TIMEOUT_EXPIRED);
+    assert.equal(browserClientWaitSync(secondMultiFence, 0, 0), TIMEOUT_EXPIRED);
+    assert.equal(webGlWaitCalls.length, multiNativeCalls + 2,
+      "multi-sync duplicates were not coalesced independently");
+    await Promise.resolve();
+    assert.equal(state.gpuFenceTimeoutBurst.size, 0,
+      "multi-sync checkpoint did not clear the full burst cache");
+  } finally {
+    globalThis.queueMicrotask = originalQueueMicrotask;
+  }
+  browserDeleteSync(firstMultiFence);
+  browserDeleteSync(secondMultiFence);
+
+  const noMicrotaskFence = browserFenceSync(0x9117, 0);
+  const noMicrotaskNativeCalls = webGlWaitCalls.length;
+  globalThis.queueMicrotask = undefined;
+  try {
+    webGlWaitStatuses.push(TIMEOUT_EXPIRED, TIMEOUT_EXPIRED);
+    assert.equal(browserClientWaitSync(noMicrotaskFence, 0, 0), TIMEOUT_EXPIRED);
+    assert.equal(browserClientWaitSync(noMicrotaskFence, 0, 0), TIMEOUT_EXPIRED);
+    assert.equal(webGlWaitCalls.length, noMicrotaskNativeCalls + 2,
+      "missing queueMicrotask API still coalesced native waits");
+    assert.equal(state.gpuFenceTimeoutBurst.has(noMicrotaskFence), false,
+      "missing queueMicrotask API retained a timeout cache entry");
+  } finally {
+    globalThis.queueMicrotask = originalQueueMicrotask;
+  }
+  browserDeleteSync(noMicrotaskFence);
+
+  const throwingMicrotaskFence = browserFenceSync(0x9117, 0);
+  const throwingMicrotaskNativeCalls = webGlWaitCalls.length;
+  globalThis.queueMicrotask = () => {
+    throw new Error("synthetic queueMicrotask failure");
+  };
+  try {
+    webGlWaitStatuses.push(TIMEOUT_EXPIRED, TIMEOUT_EXPIRED);
+    assert.equal(browserClientWaitSync(throwingMicrotaskFence, 0, 0), TIMEOUT_EXPIRED);
+    assert.equal(browserClientWaitSync(throwingMicrotaskFence, 0, 0), TIMEOUT_EXPIRED);
+    assert.equal(webGlWaitCalls.length, throwingMicrotaskNativeCalls + 2,
+      "throwing queueMicrotask API still coalesced native waits");
+    assert.equal(state.gpuFenceTimeoutBurst.has(throwingMicrotaskFence), false,
+      "throwing queueMicrotask API retained a timeout cache entry");
+  } finally {
+    globalThis.queueMicrotask = originalQueueMicrotask;
+  }
+  assert.ok(mockWindow.__gaiusGLStats.gpuFenceCoalesceScheduleFailures >= 2,
+    "queueMicrotask scheduling failures were not recorded");
+  browserDeleteSync(throwingMicrotaskFence);
+
+  const synchronousMicrotaskFence = browserFenceSync(0x9117, 0);
+  const synchronousMicrotaskNativeCalls = webGlWaitCalls.length;
+  globalThis.queueMicrotask = (callback) => callback();
+  try {
+    webGlWaitStatuses.push(TIMEOUT_EXPIRED, TIMEOUT_EXPIRED);
+    assert.equal(browserClientWaitSync(synchronousMicrotaskFence, 0, 0), TIMEOUT_EXPIRED);
+    assert.equal(browserClientWaitSync(synchronousMicrotaskFence, 0, 0), TIMEOUT_EXPIRED);
+    assert.equal(webGlWaitCalls.length, synchronousMicrotaskNativeCalls + 2,
+      "synchronous queueMicrotask monkey patch created a cross-checkpoint cache");
+    assert.equal(state.gpuFenceTimeoutBurst.has(synchronousMicrotaskFence), false,
+      "synchronous queueMicrotask monkey patch retained a timeout cache entry");
+  } finally {
+    globalThis.queueMicrotask = originalQueueMicrotask;
+  }
+  browserDeleteSync(synchronousMicrotaskFence);
+
+  const missingNativeCalls = webGlWaitCalls.length;
+  const missingFlushCalls = webGlFlushCalls;
+  assert.equal(browserClientWaitSync(0x7fffffff, 1, 0), WAIT_FAILED,
+    "missing sync did not fail closed");
+  assert.equal(webGlWaitCalls.length, missingNativeCalls,
+    "missing sync touched native WebGL wait");
+  assert.equal(webGlFlushCalls, missingFlushCalls,
+    "missing sync flushed WebGL");
+
   state.gpuBeginRetireFrame(0, 8);
   browserMarkNextFenceRetireOwned();
   const lostFence = browserFenceSync(0x9117, 0);
+  const lostFenceNativeCalls = webGlWaitCalls.length;
+  const deletedBeforeLostPoll = webGlDeleted.length;
+  webGlWaitStatuses.push(TIMEOUT_EXPIRED);
+  assert.equal(browserClientWaitSync(lostFence, 1, 0), TIMEOUT_EXPIRED);
   mockGl.lost = true;
-  assert.doesNotThrow(() => webGlListeners.get("webglcontextlost")?.({
-    preventDefault() {},
-  }));
-  assert.equal(browserClientWaitSync(lostFence, 1, 0), WAIT_FAILED);
+  assert.equal(browserClientWaitSync(lostFence, 1, 0), WAIT_FAILED,
+    "context loss after a cached retire wait returned a stale timeout");
+  assert.equal(webGlWaitCalls.length, lostFenceNativeCalls + 1,
+    "context loss after cached retire wait performed another native wait");
+  assert.equal(state.gpuFenceTimeoutBurst.size, 0,
+    "context loss retained timeout cache entries");
   assert.equal(state.syncs.has(lostFence), true, "context loss discarded the WebGL sync");
-  assert.deepEqual(webGlDeleted, [1, 2], "context loss deleted a WebGL sync");
+  assert.equal(webGlDeleted.length, deletedBeforeLostPoll, "context loss deleted a WebGL sync");
   assert.equal(mockWindow.__gaiusGLStats.gpuContextLossWaits, 1);
   // Context loss is a quarantine boundary: the WebGL object remains unusable
   // until the scheduled page reload, so polling the old sync must continue to
@@ -500,7 +800,7 @@ try {
   mockGl.lost = false;
   assert.equal(browserClientWaitSync(lostFence, 0, 0), WAIT_FAILED,
     "quarantined context unexpectedly resumed fence polling");
-  assert.equal(webGlDeleted.length, 2,
+  assert.equal(webGlDeleted.length, deletedBeforeLostPoll,
     "context-loss polling touched a WebGL sync after quarantine");
 
   // Start a fresh mock context for the remaining retirement-ring assertions.

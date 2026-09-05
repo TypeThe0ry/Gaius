@@ -358,11 +358,42 @@ public final class BrowserSingleplayerClient {
                 globalThis.__gaiusBootTimings.buildToken
                 ? String(globalThis.__gaiusBootTimings.buildToken)
                 : 'dev';
-              const workerUrl = globalThis.__gaiusSingleplayerWorkerUrl || new URL(
+              const resolvedWorkerUrl = new URL(
                 'singleplayer-server-worker.js?v=' + encodeURIComponent(buildToken),
                 location.href
               );
+              let workerUrl = globalThis.__gaiusSingleplayerWorkerUrl ||
+                resolvedWorkerUrl;
+              try {
+                const pageUrl = new URL(location.href);
+                if (pageUrl.searchParams.get('gaiusMobAiTelemetry') === '1') {
+                  if (!globalThis.__gaiusSingleplayerWorkerUrl) {
+                    resolvedWorkerUrl.searchParams.set('gaiusMobAiTelemetry', '1');
+                    workerUrl = resolvedWorkerUrl;
+                  } else {
+                    const configuredWorkerUrl = new URL(
+                      String(workerUrl),
+                      location.href
+                    );
+                    // Blob URLs are opaque object handles; adding a query to
+                    // one would create a different, invalid object URL.
+                    if (configuredWorkerUrl.protocol !== 'blob:') {
+                      configuredWorkerUrl.searchParams.set('gaiusMobAiTelemetry', '1');
+                      workerUrl = configuredWorkerUrl;
+                    }
+                  }
+                }
+              } catch (ignored) {}
               worker = new Worker(workerUrl, {name: 'Gaius Integrated Server'});
+              try {
+                const diagnosticUrl = new URL(location.href);
+                if (diagnosticUrl.searchParams.get('gaiusMobAiTelemetry') === '1') {
+                  worker.postMessage({
+                    type: 'diagnostic-config',
+                    gaiusMobAiTelemetry: true,
+                  });
+                }
+              } catch (ignored) {}
               worker.__gaiusLaunchGeneration = launchGeneration;
               worker.__gaiusHandoffPending = true;
               worker.__gaiusClientAttached = false;

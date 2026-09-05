@@ -146,6 +146,29 @@ assert.ok(
   jsBody("deleteVertexArray").includes("state.releaseVaoShiftedIndexRefs(vao)"),
   "VAO deletion does not release shifted-index reverse references",
 );
+const shiftedInsertionTrim = shiftedIndexBody.indexOf(
+  "if (!this.trimShiftedIndexCache(output.byteLength))",
+);
+const shiftedInsertionAllocation = shiftedIndexBody.indexOf(
+  "buffer=gl.createBuffer()",
+  shiftedInsertionTrim,
+);
+assert.ok(
+  shiftedInsertionTrim >= 0 && shiftedInsertionAllocation > shiftedInsertionTrim,
+  "derived index insertion does not trim the live byte budget before GPU allocation",
+);
+assert.ok(
+  shiftedIndexBody.includes("if (!budgetChanged && incoming===0 && live<=limit) return true"),
+  "zero-incoming shifted-index maintenance has no stable-budget O(1) fast path",
+);
+assert.ok(
+  shiftedIndexBody.includes("if (this.shiftedIndexCacheMruEntry===entry) return"),
+  "repeated global-MRU hits still reorder the shifted-index Map",
+);
+assert.ok(
+  initializationBody.includes("if (refs.has(vao) && entries.has(entry)) return"),
+  "repeated shifted-index VAO associations still mutate both ref Sets",
+);
 
 function flushFrame() {
   const callbacks = frameCallbacks.splice(0);
@@ -399,6 +422,109 @@ assert.ok(entryD);
 assert.equal(entryB.deleted, true, "least-recently-used derived entry survived");
 assert.equal(entryA.deleted, false, "recently touched derived entry was evicted");
 assertBudgets();
+
+// A stable global-MRU hit must remain O(1): budget resolution is allowed, but
+// Map reorder, ref-set insertion, and byte-budget telemetry publication are not.
+const repeatHitIterations = 100_000;
+let repeatedMapSets = 0;
+let repeatedMapDeletes = 0;
+let repeatedEntryRefAdds = 0;
+let repeatedVaoRefAdds = 0;
+let repeatedTelemetryPublishes = 0;
+const originalMapSet = state.shiftedIndexCache.set;
+const originalMapDelete = state.shiftedIndexCache.delete;
+const originalEntryRefAdd = entryD.vaoRefs.add;
+const originalVaoRefAdd = vao.shiftedIndexEntries.add;
+const originalTelemetryUpdate = state.updateShiftedIndexTelemetry;
+state.shiftedIndexCache.set = function (...args) {
+  repeatedMapSets++;
+  return originalMapSet.apply(this, args);
+};
+state.shiftedIndexCache.delete = function (...args) {
+  repeatedMapDeletes++;
+  return originalMapDelete.apply(this, args);
+};
+entryD.vaoRefs.add = function (...args) {
+  repeatedEntryRefAdds++;
+  return originalEntryRefAdd.apply(this, args);
+};
+vao.shiftedIndexEntries.add = function (...args) {
+  repeatedVaoRefAdds++;
+  return originalVaoRefAdd.apply(this, args);
+};
+state.updateShiftedIndexTelemetry = function (...args) {
+  repeatedTelemetryPublishes++;
+  return originalTelemetryUpdate.apply(this, args);
+};
+try {
+  for (let iteration = 0; iteration < repeatHitIterations; iteration++) {
+    assert.strictEqual(
+      state.cacheShiftedIndexBuffer(vao, gl.UNSIGNED_BYTE, 0, 2, 4),
+      entryD,
+      "stable global-MRU lookup missed the derived cache",
+    );
+  }
+} finally {
+  state.shiftedIndexCache.set = originalMapSet;
+  state.shiftedIndexCache.delete = originalMapDelete;
+  entryD.vaoRefs.add = originalEntryRefAdd;
+  vao.shiftedIndexEntries.add = originalVaoRefAdd;
+  state.updateShiftedIndexTelemetry = originalTelemetryUpdate;
+}
+assert.equal(repeatedMapSets, 0, "global-MRU hits repeated Map.set maintenance");
+assert.equal(repeatedMapDeletes, 0, "global-MRU hits repeated Map.delete maintenance");
+assert.equal(repeatedEntryRefAdds, 0, "global-MRU hits repeated entry ref insertion");
+assert.equal(repeatedVaoRefAdds, 0, "global-MRU hits repeated VAO ref insertion");
+assert.equal(repeatedTelemetryPublishes, 0,
+  "stable zero-incoming trim published byte-budget telemetry per draw");
+assert.equal(state.shiftedIndexCache.size, 3,
+  "stable global-MRU hits changed the live cache cardinality");
+assert.equal(state.shiftedIndexCacheTotalBytes, 6,
+  "stable global-MRU hits changed the live cache byte count");
+
+// A runtime budget shrink is observed by the very next lookup and converges
+// before returning even when that lookup hits the current global MRU.
+window.__gaiusBaseVertexDerivedBufferBudgetBytes = 4;
+assert.strictEqual(
+  state.cacheShiftedIndexBuffer(vao, gl.UNSIGNED_BYTE, 0, 2, 4),
+  entryD,
+  "budget-shrink lookup lost the retained MRU entry",
+);
+assert.equal(state.shiftedIndexCacheBudgetToken, 4,
+  "runtime shifted-index budget change was not synchronized on lookup");
+assert.equal(stats.baseVertexIndexBudgetBytes, 4,
+  "runtime shifted-index budget telemetry was not synchronized on lookup");
+assert.equal(state.shiftedIndexCacheTotalBytes, 4,
+  "runtime shifted-index budget shrink did not immediately converge live bytes");
+assert.equal(entryC.deleted, true,
+  "runtime shrink did not evict the oldest remaining derived entry");
+assert.equal(entryA.deleted, false,
+  "runtime shrink evicted the touched A entry instead of C");
+assert.equal(entryD.deleted, false,
+  "runtime shrink evicted the current global MRU entry");
+assertBudgets();
+
+// A source-buffer version change invalidates every surviving derived entry and
+// removes both sides of all VAO/cache-key references.
+const sourceVersionBeforeInvalidation = state.bufferVersions.get(sourceId) || 0;
+state.bumpBufferVersion(sourceId);
+assert.equal(state.bufferVersions.get(sourceId), sourceVersionBeforeInvalidation + 1);
+assert.equal(entryA.deleted, true, "buffer version change retained derived entry A");
+assert.equal(entryD.deleted, true, "buffer version change retained derived entry D");
+assert.equal(entryA.vaoRefs.size, 0, "buffer version change retained A VAO refs");
+assert.equal(entryD.vaoRefs.size, 0, "buffer version change retained D VAO refs");
+assert.equal(vao.shiftedIndexEntries.size, 0,
+  "buffer version change retained VAO-to-entry refs");
+assert.equal(vao.shiftedIndexFastCache.size, 0,
+  "buffer version change retained fast-cache refs");
+assert.equal(vao.shiftedIndexLast, null,
+  "buffer version change retained the last-cache ref");
+assert.equal(state.shiftedIndexCacheKeys.has(sourceId), false,
+  "buffer version change retained the source-to-cache-key index");
+assert.equal(state.shiftedIndexCache.size, 0,
+  "buffer version change retained global shifted-index entries");
+assert.equal(state.shiftedIndexCacheTotalBytes, 0,
+  "buffer version change retained derived GPU bytes");
 deleteBuffer(sourceId);
 assert.equal(vao.shiftedIndexFastCache.size, 0, "source delete retained fast-cache entries");
 assert.equal(vao.shiftedIndexLast, null, "source delete retained the last-cache entry");
@@ -476,6 +602,7 @@ console.log("Base-vertex cache budget smoke passed");
 console.log(JSON.stringify({
   uploadIterations,
   deriveIterations,
+  repeatHitIterations,
   shadow: {
     budgetBytes: stats.bufferShadowBudgetBytes,
     liveBytes: stats.bufferShadowLiveBytes,

@@ -2,7 +2,7 @@
 
 All notable changes to Gaius are documented here.
 
-## [0.0.2] - 2026-09-05
+## [0.0.3] - 2026-09-05
 
 ### Added
 
@@ -19,7 +19,7 @@ All notable changes to Gaius are documented here.
 
 ### Release Notes
 
-- The `v0.0.2` release is produced by the dual-profile GitHub Actions matrix and
+- The `v0.0.3` release is produced by the dual-profile GitHub Actions matrix and
   includes a profile manifest, SHA256 checksums, and the optional Paper plugin.
 - The browser client remains experimental; runtime compatibility still depends
   on the selected Minecraft server, Chrome/Chromium, and an available relay or

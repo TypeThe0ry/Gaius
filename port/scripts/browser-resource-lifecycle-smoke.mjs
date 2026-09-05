@@ -179,6 +179,121 @@ assert.equal(calls.deleteTexture, lifecycleIterations);
 assert.equal(calls.deleteProgram, lifecycleIterations);
 assert.equal(calls.unbindProgram, lifecycleIterations);
 
+const noteMappedBufferMap = compile("noteMappedBufferMapJs", ["bytes", "count"]);
+const noteMappedNamedBufferMap = compile(
+  "noteMappedNamedBufferMapJs", ["bytes", "count"],
+);
+const noteMappedBufferFlush = compile("noteMappedBufferFlushJs", ["bytes"]);
+const noteMappedNamedBufferFlush = compile("noteMappedNamedBufferFlushJs", ["bytes"]);
+const noteMappedBufferUnmap = compile(
+  "noteMappedBufferUnmapJs", ["uploaded", "bytes", "count"],
+);
+const noteMappedNamedBufferUnmap = compile(
+  "noteMappedNamedBufferUnmapJs", ["uploaded", "bytes", "count"],
+);
+const noteMappedBufferForcedRelease = compile(
+  "noteMappedBufferForcedReleaseJs", ["released", "bytes", "count"],
+);
+const noteMappableRingCurrentBuffer = compile("noteMappableRingCurrentBuffer", []);
+const noteMappableRingAwaitResult = compile("noteMappableRingAwaitResult", ["ready"]);
+
+const mappedStats = {};
+window.__gaiusGLStats = mappedStats;
+noteMappedBufferMap(64, 1);
+noteMappedNamedBufferMap(128, 2);
+noteMappedBufferFlush(16);
+noteMappedNamedBufferFlush(32);
+noteMappedBufferUnmap(true, 64, 1);
+noteMappedNamedBufferUnmap(false, 0, 0);
+noteMappedBufferMap(256, 1);
+noteMappedNamedBufferMap(512, 2);
+noteMappedBufferForcedRelease(2, 768, 0);
+
+assert.equal(mappedStats.mappedBufferMapCalls, 2);
+assert.equal(mappedStats.mappedBufferMapBytes, 320);
+assert.equal(mappedStats.mappedNamedBufferMapCalls, 2);
+assert.equal(mappedStats.mappedNamedBufferMapBytes, 640);
+assert.equal(mappedStats.mappedBufferFlushCalls, 1);
+assert.equal(mappedStats.mappedBufferFlushBytes, 16);
+assert.equal(mappedStats.mappedNamedBufferFlushCalls, 1);
+assert.equal(mappedStats.mappedNamedBufferFlushBytes, 32);
+assert.equal(mappedStats.mappedBufferUnmapCalls, 1);
+assert.equal(mappedStats.mappedBufferUnmapUploadCalls, 1);
+assert.equal(mappedStats.mappedBufferUnmapUploadBytes, 64);
+assert.equal(mappedStats.mappedNamedBufferUnmapCalls, 1);
+assert.equal(mappedStats.mappedNamedBufferUnmapUploadCalls ?? 0, 0,
+  "explicitly flushed named mapping uploaded again during unmap");
+assert.equal(mappedStats.mappedNamedBufferUnmapUploadBytes ?? 0, 0,
+  "explicitly flushed named mapping reported unmap-upload bytes");
+assert.equal(mappedStats.mappedBufferForcedReleases, 2);
+assert.equal(mappedStats.mappedBufferForcedReleaseBytes, 768);
+assert.equal(mappedStats.mappedBufferRegions, 0);
+assert.equal(mappedStats.mappedBufferPeakRegions, 2);
+const mappedAllocations = mappedStats.mappedBufferMapCalls
+  + mappedStats.mappedNamedBufferMapCalls;
+const mappedReleases = mappedStats.mappedBufferUnmapCalls
+  + mappedStats.mappedNamedBufferUnmapCalls
+  + mappedStats.mappedBufferForcedReleases;
+assert.equal(mappedAllocations, mappedReleases,
+  "mapped-buffer telemetry lifecycle did not balance");
+assert.equal(
+  mappedStats.mappedBufferMapBytes + mappedStats.mappedNamedBufferMapBytes,
+  64 + 128 + mappedStats.mappedBufferForcedReleaseBytes,
+  "mapped-buffer telemetry release-byte model did not balance",
+);
+
+noteMappableRingCurrentBuffer();
+noteMappableRingAwaitResult(true);
+noteMappableRingCurrentBuffer();
+noteMappableRingAwaitResult(false);
+noteMappableRingCurrentBuffer();
+noteMappableRingAwaitResult(true);
+assert.equal(mappedStats.mappableRingCurrentBufferCalls, 3);
+assert.equal(mappedStats.mappableRingFenceChecks, 3);
+assert.equal(mappedStats.mappableRingFenceReady, 2);
+assert.equal(mappedStats.mappableRingFencePending, 1);
+const mappableRingObserved = Object.freeze({
+  currentCalls: mappedStats.mappableRingCurrentBufferCalls,
+  checks: mappedStats.mappableRingFenceChecks,
+  ready: mappedStats.mappableRingFenceReady,
+  pending: mappedStats.mappableRingFencePending,
+});
+
+const callLimit = 2_147_483_647;
+const byteLimit = Number.MAX_SAFE_INTEGER;
+mappedStats.mappedBufferMapCalls = callLimit;
+mappedStats.mappedBufferMapBytes = byteLimit;
+noteMappedBufferMap(byteLimit, 1);
+assert.equal(mappedStats.mappedBufferMapCalls, callLimit);
+assert.equal(mappedStats.mappedBufferMapBytes, byteLimit);
+mappedStats.mappableRingCurrentBufferCalls = callLimit;
+mappedStats.mappableRingFenceChecks = callLimit;
+mappedStats.mappableRingFencePending = callLimit;
+noteMappableRingCurrentBuffer();
+noteMappableRingAwaitResult(false);
+assert.equal(mappedStats.mappableRingCurrentBufferCalls, callLimit);
+assert.equal(mappedStats.mappableRingFenceChecks, callLimit);
+assert.equal(mappedStats.mappableRingFencePending, callLimit);
+
+for (const method of [
+  "noteMappedBufferMapJs",
+  "noteMappedNamedBufferMapJs",
+  "noteMappedBufferFlushJs",
+  "noteMappedNamedBufferFlushJs",
+  "noteMappedBufferUnmapJs",
+  "noteMappedNamedBufferUnmapJs",
+  "noteMappedBufferForcedReleaseJs",
+  "noteMappableRingCurrentBuffer",
+  "noteMappableRingAwaitResult",
+]) {
+  const body = jsBody(method);
+  assert.doesNotMatch(body,
+    /\b(?:new\s+(?:Array|Map|Set)|push\s*\(|setTimeout|setInterval|requestAnimationFrame|reason)\b/,
+    `${method} introduced unbounded or asynchronous telemetry state`);
+  assert.match(body, /(?:2147483647|9007199254740991)/,
+    `${method} is missing a scalar saturation bound`);
+}
+
 const deleteBufferBody = jsBody("deleteBufferJs");
 assert.doesNotMatch(
   deleteBufferBody,
@@ -194,12 +309,22 @@ assert.match(source, /MAP_WRITE_BIT\s*=\s*0x0002/);
 assert.match(source, /MAP_FLUSH_EXPLICIT_BIT\s*=\s*0x0010/);
 assert.match(source,
   /return \(access & MAP_WRITE_BIT\) != 0\s*&& \(access & MAP_FLUSH_EXPLICIT_BIT\) == 0;/);
-assert.equal(source.match(/if \(mapped\.uploadOnUnmap\(\)\)/g)?.length, 2,
-  "target and named mapped buffers do not share explicit-flush ownership");
+assert.equal(source.match(/boolean uploadOnUnmap = mapped\.uploadOnUnmap\(\);/g)?.length, 2,
+  "target and named mapped buffers do not capture explicit-flush ownership");
+assert.equal(source.match(/if \(uploadOnUnmap\)/g)?.length, 2,
+  "target and named mapped buffers do not share explicit-flush upload behavior");
 assert.match(source,
   /ByteBuffer slice = copy\.slice\(\)\.order\(buffer\.order\(\)\);\s*return Int8Array\.fromJavaBuffer\(slice\);/s,
   "mapped-buffer sub-range uploads must export a true sliced ByteBuffer view");
 assert.match(source, /stats\.mappedBufferRegions=count\|0;/);
+assert.match(source,
+  /noteMappedBufferUnmapJs\(\s*uploadOnUnmap, \(double\) \(uploadOnUnmap \? mappedBytes : 0\),/s);
+assert.match(source,
+  /noteMappedNamedBufferUnmapJs\(\s*uploadOnUnmap, \(double\) \(uploadOnUnmap \? mappedBytes : 0\),/s);
+assert.match(source,
+  /noteMappedBufferForcedReleaseJs\(\s*released, \(double\) releasedBytes,/s);
+assert.match(source,
+  /noteMappedBufferForcedReleaseJs\(\s*staleMappings\.size\(\), \(double\) releasedBytes, 0\);/s);
 
 console.log("Browser resource lifecycle smoke passed");
 console.log(JSON.stringify({
@@ -213,4 +338,15 @@ console.log(JSON.stringify({
   registriesAtBaseline: true,
   mappedRegionGuardsVerified: true,
   mappedSubrangeViewVerified: true,
+  mappedTelemetry: {
+    allocations: mappedAllocations,
+    releases: mappedReleases,
+    peakLive: mappedStats.mappedBufferPeakRegions,
+    targetFlushBytes: mappedStats.mappedBufferFlushBytes,
+    namedFlushBytes: mappedStats.mappedNamedBufferFlushBytes,
+    targetUnmapUploadBytes: mappedStats.mappedBufferUnmapUploadBytes,
+    namedUnmapUploadBytes: mappedStats.mappedNamedBufferUnmapUploadBytes ?? 0,
+    forcedReleaseBytes: mappedStats.mappedBufferForcedReleaseBytes,
+  },
+  mappableRing: mappableRingObserved,
 }, null, 2));

@@ -50,11 +50,106 @@ frame-time series and telemetry snapshot are release artifacts; rounded summary
 numbers alone are not sufficient evidence.
 
 Uncapped FPS evidence has an additional runtime proof requirement. The report
-must contain at least two measured frame-pacing samples and a final snapshot
-with `swapInterval=0`, `uncappedYieldCount>0`, `fairYieldCount>0`,
-`vsyncYieldCount=0`, and `presentToRafCount=0`. The fair-yield counter proves
-that the uncapped loop periodically returns control to input, networking, and
-audio task sources instead of running an uninterrupted microtask chain.
+must contain at least two **complete** measured frame-pacing samples and a
+complete final snapshot with `swapInterval=0`, `uncappedYieldCount>0`,
+`messageChannelYieldCount>0`, `fairYieldCount=0`, `schedulerYieldCount=0`,
+`timerYieldCount=0`, `vsyncYieldCount=0`, `hiddenYieldCount=0`, and
+`presentToRafCount=0`. The only permitted incomplete sample is a leading reset
+sentinel with `swapInterval=null` and every required counter present as a safe
+integer equal to zero. That sentinel is retained as a diagnostic but excluded
+from the minimum-sample, monotonicity, and accounting proof. Any other
+incomplete sample—including an all-zero sentinel after the first complete
+sample, or a null snapshot carrying hidden/timer activity—fails the window. An
+incomplete final snapshot remains inconclusive.
+
+The strict release parent does not trust the child's derived pacing summary by
+itself. `report.samples` must contain the raw, successful, sub-500 ms measured
+samples (objects with strictly increasing nonnegative safe-integer timestamps), and
+`report.telemetry` must contain the raw final snapshot. The parent repeats the
+benchmark's timestamp merge and `runtimeInvariants.framePacing` + `frame`
+mapping, reruns the same evaluator,
+and requires the recomputed verdict, sample accounting, integrity fields, and
+final snapshot to match the child report exactly. Summary-only reports, error
+samples, stalled sampling calls, and good summaries paired with bad raw data
+are release failures.
+
+Every raw sample, final scalar, settlement sample/final, and cleanup scalar
+carries the reset-created `measurementId` and `measurementEpochId`. The two IDs
+must be identical, nonempty, and exactly equal across the complete evidence
+chain. Both `frame` and `runtimeInvariants.framePacing` must independently carry
+the IDs and every required field with exact values; one source cannot silently
+overwrite contradictory or incomplete evidence from the other. The derived
+summary records `epochMismatchCount=0` for a passing run.
+
+`telemetry.capturedAt` must be a nonnegative safe integer later than the last
+raw sample timestamp. Each final, settlement, and cleanup scalar also records
+`controllerRequestedAt`, browser `capturedAt`, `controllerReceivedAt`, and
+`evaluationLatencyMillis`. These are safe integers ordered request <= capture
+<= response, latency is exactly response minus request, and the response must
+arrive within the configured settlement timeout plus one poll interval. The
+settlement additionally records exact controller start/completion/elapsed
+times; an evaluation that returns after that finite grace is retained as
+failure evidence rather than being accepted late. Settlement scalar requests
+are serialized: the first request is not earlier than controller start, every
+later request is not earlier than the previous response (equality is allowed),
+and request timestamps never move backwards. Overlapping controller ranges are
+invalid even when each scalar's individual request/capture/response tuple looks
+valid.
+
+Every complete snapshot must contain nonnegative safe-integer counters, and all
+cumulative counters must be monotonic nondecreasing across the window. The
+accounting identities are checked per snapshot:
+
+- `yieldRequestCount == uncappedYieldCount + vsyncYieldCount`
+- `yieldRequestCount == visibleYieldCount + hiddenYieldCount`
+- `yieldCompletionCount == messageChannelYieldCount + schedulerYieldCount + timerYieldCount`
+- `pendingYieldCount == yieldRequestCount - yieldCompletionCount`, with pending
+  in `0..1`, zero duplicate callbacks, and `maxPendingYieldCount` exactly `0`
+  before the first request or exactly `1` after any request (the asynchronous
+  request increments pending before a continuation can complete)
+- for the visible uncapped window, including settlement and cleanup,
+  `swapInterval == requiredSwapInterval == 0` and
+  `uncappedYieldCount - messageChannelYieldCount == pendingYieldCount`, with no
+  hidden, VSync, rAF, fair-scheduler, scheduler, or timer completions
+
+This permits one legitimately in-flight `MessageChannel` continuation at a
+snapshot boundary (for example requests `100`, completions `99`, pending `1`)
+while rejecting mismatched, reset, fractional, negative, overlapping, or mixed
+task-path telemetry. These exact-once gates prove TeaVM continuation health.
+The Browser gates separately check the observed FPS, input, and networking
+windows for regressions; they do not prove browser task-source round-robin
+fairness. Audio correctness remains an independent manual gate until underrun,
+callback-gap, and audible-timing telemetry is part of the release contract.
+
+The final snapshot is followed, in the same active measurement epoch, by a
+bounded `framePacingSettlement`. If the final snapshot has one pending
+continuation, the harness polls a lightweight pacing scalar every 5--10 ms for
+at most 150--250 ms and must observe at least one additional MessageChannel
+completion. A final snapshot with no pending continuation may settle on the
+first later scalar capture. Settlement timestamps must strictly follow the
+final telemetry timestamp; cumulative counters must not decrease; pending must
+remain in `0..1`; and all fallback, watchdog, rebuild, cancellation, duplicate,
+hidden, VSync, rAF, scheduler, and timer counters must remain zero. A dead
+MessageChannel therefore cannot masquerade as success: its 100 ms watchdog or
+timer fallback is captured before the settlement timeout and fails the gate.
+
+Settlement is not the end of the accounting window. After leave-world cleanup,
+the harness captures a final lightweight `cleanupTelemetry` scalar in the same
+measurement epoch. Its `cutoffYieldRequestCount` is exactly the settlement
+final's `yieldRequestCount`; its timestamp is strictly later than settlement;
+all cumulative counters remain monotonic and satisfy the same per-snapshot and
+visible-uncapped identities; and every alternate, health, watchdog, rebuild,
+cancellation, and duplicate counter remains zero. Cleanup may itself observe
+one newly pending continuation, but both `messageChannelYieldCount` and
+`yieldCompletionCount` must be at least the finite cutoff. This closes the case
+where settlement began with pending zero, a new request appeared in its first
+poll, and a later watchdog would otherwise fall outside the evidence window.
+The strict parent recomputes this cutoff closure from raw `cleanupTelemetry`.
+The diagnostic `cleanupTelemetry.framePacingClosure`, the cleanup top-level
+dual-source scalar, and `telemetry.cleanupFramePacing` are all schema-14 raw
+evidence and must normalize to the same canonical object; the result must also
+match the child summary canonically. A forged or stale nested closure therefore
+fails instead of being ignored.
 
 The scheduler health counters must also be present and remain zero throughout
 the measured window: `messageChannelCreateFailureCount`,

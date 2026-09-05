@@ -212,6 +212,18 @@ const state = {
   shouldShadowBufferTarget() {
     return true;
   },
+  markBufferShadowRequired(buffer) {
+    this.shadowRequiredBuffers.add(buffer | 0);
+  },
+  ensureBufferShadow(buffer) {
+    const current = this.bufferBytes.get(buffer | 0);
+    if (current) return current;
+    const physical = bufferStorage.get(buffer | 0);
+    if (!physical) return null;
+    const copy = copyBytes(physical);
+    this.bufferBytes.set(buffer | 0, copy);
+    return copy;
+  },
   shadowBufferDataForTarget(_target, buffer, data, size) {
     this.bufferBytes.set(buffer, data ? copyBytes(data) : new Uint8Array(size));
   },

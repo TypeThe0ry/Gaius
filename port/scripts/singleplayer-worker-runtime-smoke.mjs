@@ -1880,6 +1880,7 @@ if (isMainThread && !runtimeSelfTest) {
   const events = [];
   let finished = false;
   const skipMining = process.env.GAIUS_SMOKE_SKIP_MINING === "1";
+  const mobAiStress = process.env.GAIUS_SMOKE_MOB_AI_STRESS === "1";
   const stopAtFirstChunk = process.env.GAIUS_SMOKE_STOP_AT_FIRST_CHUNK === "1";
   const roamSteps = Number(process.env.GAIUS_SMOKE_ROAM_STEPS || "0");
   const roamStepBlocks = Number(process.env.GAIUS_SMOKE_ROAM_STEP_BLOCKS || "8");
@@ -2064,6 +2065,28 @@ if (isMainThread && !runtimeSelfTest) {
   let protocolReady = false;
   let distanceSyncReady = false;
   let configuredDistanceReady = false;
+  let mobAiStressScheduled = false;
+  const scheduleMobAiStress = () => {
+    if (!mobAiStress || mobAiStressScheduled) return;
+    mobAiStressScheduled = true;
+    const mobCommands = [
+      "time set day",
+      "summon minecraft:cow ~2 ~ ~",
+      "summon minecraft:pig ~4 ~ ~",
+      "summon minecraft:sheep ~6 ~ ~",
+      "summon minecraft:chicken ~8 ~ ~",
+      "summon minecraft:cow ~2 ~ ~2",
+      "summon minecraft:pig ~4 ~ ~2",
+      "summon minecraft:sheep ~6 ~ ~2",
+      "summon minecraft:chicken ~8 ~ ~2",
+      "summon minecraft:cow ~2 ~ ~4",
+      "summon minecraft:pig ~4 ~ ~4",
+      "summon minecraft:sheep ~6 ~ ~4",
+      "summon minecraft:chicken ~8 ~ ~4",
+    ];
+    for (const command of mobCommands) protocol.sendChatCommand(command);
+    events.push({type: "mob-ai-stress-scheduled", commands: mobCommands});
+  };
   let regionStorageWrites = 0;
   let nonEmptyRegionStorageWrites = 0;
   let eventLoopProbeId = 0;
@@ -2906,6 +2929,7 @@ if (isMainThread && !runtimeSelfTest) {
       configurationTimeline: timing.configurationTimeline,
       playTimeline: timing.playTimeline,
       skipMining,
+      mobAiStress,
       requireBlockDrop,
       jsonOnly,
       stopAtFirstChunk,
@@ -3231,6 +3255,7 @@ if (isMainThread && !runtimeSelfTest) {
         return;
       }
       configuredDistanceReady = true;
+      scheduleMobAiStress();
       protocol.startRoam();
       maybeStop();
     } else if (message && message.type === "stopped" && isCompletionReady() &&
@@ -3634,6 +3659,7 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
     snapshot,
     startLogin,
     startRoam,
+    sendChatCommand,
     closeTransport,
   };
 
@@ -4330,6 +4356,16 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
     flushSends();
   }
 
+  function sendChatCommand(command) {
+    const normalized = String(command || "").trim();
+    if (!normalized) throw new Error("Cannot send an empty chat command");
+    send(encodePacket(
+      serverboundPlay.chatCommand,
+      encodeString(normalized),
+      state.compressionThreshold,
+    ));
+  }
+
   function snapshot() {
     return {
       phase: state.phase,
@@ -4722,6 +4758,11 @@ function installWorkerGlobals() {
   globalThis.MessagePort = MessagePort;
   globalThis.self = globalThis;
   globalThis.__gaiusSlowProbeTelemetryEnabled = true;
+  // Mob AI checkpoints stay silent in normal release runs.  The diagnostic
+  // smoke can opt in so its telemetry-pong snapshots prove that the patched
+  // Mob.serverAiStep stages are actually being reached without changing AI
+  // ordering or the 500 ms stall gate.
+  globalThis.__gaiusMobAiTelemetry = process.env.GAIUS_SMOKE_MOB_AI_TELEMETRY === "1";
   const worldgenSliceMillis = Number(process.env.GAIUS_SMOKE_WORLDGEN_SLICE_MS || "");
   if (Number.isFinite(worldgenSliceMillis) && worldgenSliceMillis > 0) {
     globalThis.__gaiusWorldgenSliceMillis = worldgenSliceMillis;

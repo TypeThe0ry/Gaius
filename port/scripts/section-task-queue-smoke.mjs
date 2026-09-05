@@ -2,7 +2,8 @@
 
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
-import {mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
+import {existsSync} from "node:fs";
+import {copyFile, mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import path from "node:path";
 import {fileURLToPath, pathToFileURL} from "node:url";
@@ -61,6 +62,29 @@ function run(command, args, options = {}) {
     timeout: 60_000,
     ...options,
   });
+}
+
+async function copyUnsignedOverlayJar(source, destination, javaTools) {
+  const jar = path.join(path.dirname(javaTools.javac),
+    process.platform === "win32" ? "jar.exe" : "jar");
+  assert.ok(existsSync(jar), `missing JDK jar tool for signer-isolated queue harness: ${jar}`);
+  const unpacked = await mkdtemp(path.join(path.dirname(destination), "unsigned-overlay-"));
+  try {
+    run(jar, ["--extract", "--file", source], {cwd: unpacked, timeout: 180_000});
+    const metaInf = path.join(unpacked, "META-INF");
+    for (const entry of ["MOJANGCS.SF", "MOJANGCS.RSA", "MOJANGCS.DSA", "MOJANGCS.EC"]) {
+      await rm(path.join(metaInf, entry), {force: true});
+    }
+    run(jar, ["--create", "--file", destination, "-C", unpacked, "."],
+      {timeout: 180_000});
+    const remainingSignatures = run(jar, ["--list", "--file", destination])
+      .split(/\r?\n/)
+      .filter((entry) => /^META-INF\/[^/]+\.(?:SF|RSA|DSA|EC)$/i.test(entry));
+    assert.deepEqual(remainingSignatures, [],
+      "temporary queue harness overlay retained package-signing metadata");
+  } finally {
+    await rm(unpacked, {recursive: true, force: true});
+  }
 }
 
 function method(bytecode, signature, nextSignature) {
@@ -569,6 +593,9 @@ try {
   await mkdir(sourceDirectory, {recursive: true});
   await mkdir(classesDirectory, {recursive: true});
   await writeFile(sourceFile, harnessSource, "utf8");
+  const unsignedOverlayJar = path.join(temporaryRoot, "client-named-unsigned.jar");
+  const javaTools = selectJavaTools();
+  await copyUnsignedOverlayJar(overlayJar, unsignedOverlayJar, javaTools);
   let minecraftClasspath = (await readFile(
     `${repositoryRoot}/port/work/${version}/classpath.txt`,
     "utf8",
@@ -579,10 +606,21 @@ try {
   if (process.platform === "win32") {
     minecraftClasspath = minecraftClasspath
       .split(":")
-      .map((entry) => entry.replace(/^\/c\//i, "C:/"))
+      .map((entry) => {
+        const normalized = entry.replaceAll("\\", "/");
+        const repositoryRelative = normalized.toLowerCase().indexOf("/port/work/");
+        if (repositoryRelative >= 0) {
+          return path.join(repositoryRoot, normalized.slice(repositoryRelative + 1));
+        }
+        return nativePath(entry);
+      })
       .join(path.delimiter);
   }
-  const compileClasspath = [overlayJar, minecraftClasspath].join(path.delimiter);
+  // The harness declares classes in the same Minecraft package as the
+  // patched overlay.  A signed Mojang jar plus unsigned harness classes makes
+  // the JVM reject the package before main() runs, so execute against a
+  // job-local unsigned copy while retaining the signed jar for javap checks.
+  const compileClasspath = [unsignedOverlayJar, minecraftClasspath].join(path.delimiter);
   run(javaTools.javac, [
     "-proc:none",
     "-classpath", compileClasspath,

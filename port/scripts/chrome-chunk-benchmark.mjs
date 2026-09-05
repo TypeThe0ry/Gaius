@@ -20,6 +20,9 @@ import {
   evaluateUncappedFramePacing,
   evaluateRuntimeInvariants,
   mergeMonotonicSamples,
+  mergeFramePacingTelemetrySources,
+  normalizeFramePacingEvidenceSnapshot,
+  normalizeFramePacingSettlementEvidence,
   nearestRankPercentile,
   parsePsRssOutput,
   parseOptionsText,
@@ -45,6 +48,13 @@ const performanceContractPath = resolve(fileURLToPath(
   new URL("./performance-contract.json", import.meta.url),
 ));
 const performanceContract = JSON.parse(await readFile(performanceContractPath, "utf8"));
+const uncappedEvidenceRules = performanceContract.environment?.uncappedEvidence || {};
+const framePacingSettlementPollMillis = Number(
+  uncappedEvidenceRules.settlementPollIntervalMillis,
+) || 8;
+const framePacingSettlementTimeoutMillis = Number(
+  uncappedEvidenceRules.settlementTimeoutMillis,
+) || 200;
 const portRoot = resolve(fileURLToPath(new URL("../", import.meta.url)));
 const repositoryRoot = resolve(portRoot, "..");
 const nativePath = (value) => {
@@ -2673,13 +2683,16 @@ async function resetMeasurement(session) {
     + "?globalThis.crypto.randomUUID():"
     + "String(Date.now())+'-'+Math.random().toString(16).slice(2);"
     + "globalThis.__gaiusBenchmarkMeasurementId=measurementId;"
+    + "globalThis.__gaiusBenchmarkMeasurementEpochId=measurementId;"
     + "globalThis.__gaiusWorkerMessageTelemetry=null;"
     + "const gameplayAuthority=globalThis.__gaiusGameplayAuthorityProbe;"
     + "if(gameplayAuthority&&typeof gameplayAuthority.reset==='function')gameplayAuthority.reset();"
-    + "globalThis.__gaiusFrameTelemetry={enabled:true,lastFrameAt:performance.now(),"
+    + "globalThis.__gaiusFrameTelemetry={enabled:true,measurementId,measurementEpochId:measurementId,lastFrameAt:performance.now(),"
     + "startedAt:performance.now(),frameCount:0,totalFrameMillis:0,longestFrameMillis:0,"
     + "freezeCount:0,hiddenFrameCount:0,visibleFrameCount:0,swapInterval:null,"
-    + "uncappedYieldCount:0,vsyncYieldCount:0,presentToRafCount:0,fairYieldCount:0,"
+    + "uncappedYieldCount:0,vsyncYieldCount:0,visibleYieldCount:0,hiddenYieldCount:0,"
+    + "presentToRafCount:0,"
+    + "messageChannelYieldCount:0,fairYieldCount:0,schedulerYieldCount:0,timerYieldCount:0,"
     + "messageChannelCreateFailureCount:0,messageChannelPostFailureCount:0,"
     + "messageChannelRebuildCount:0,cancelledMessageTaskCount:0,watchdogYieldCount:0,"
     + "yieldRequestCount:0,"
@@ -2756,7 +2769,7 @@ async function resetMeasurement(session) {
     + "at:Date.now(),statusMessage:String(event.statusMessage||'')});"
     + "if(active&&active.contextLosses.length>64)active.contextLosses.splice(0,"
     + "active.contextLosses.length-64);},true);}"
-    + "return {measurementId,distances:workers&&typeof workers.values==='function'"
+    + "return {measurementId,measurementEpochId:measurementId,distances:workers&&typeof workers.values==='function'"
     + "?Array.from(workers.values()).filter(worker=>worker&&!worker.__gaiusTerminal)"
     + ".map(worker=>String(worker.__gaiusDistances||'')):[]};"
     + "})()");
@@ -2797,6 +2810,8 @@ async function samplePage(session, drainFrames = true) {
       + "const worker=globalThis.__gaiusWorkerMessageTelemetry||{};"
       + "const network=globalThis.__gaiusNetworkStats||{};"
       + "const frame=globalThis.__gaiusFrameTelemetry||{};"
+      + "const measurementId=String(globalThis.__gaiusBenchmarkMeasurementId||frame.measurementId||'');"
+      + "const measurementEpochId=String(globalThis.__gaiusBenchmarkMeasurementEpochId||frame.measurementEpochId||'');"
       + "const ring=frame.frameTimes;"
       + "const capacity=ring&&ring.length?ring.length:0;"
       + "const totalFrameCount=Number(frame.frameCount)||0;"
@@ -2853,6 +2868,7 @@ async function samplePage(session, drainFrames = true) {
       + "const resourceEntries=performance.getEntriesByType('resource');"
       + "return {"
       + "now:performance.now(),"
+      + "measurementId,measurementEpochId,"
       + "visibilityState:document.visibilityState,hasFocus:document.hasFocus(),"
       + "workloadActive:globalThis.__gaiusBenchmarkWorkloadActive===true,"
       + "devicePixelRatio:Number(devicePixelRatio)||1,"
@@ -2874,20 +2890,30 @@ async function samplePage(session, drainFrames = true) {
       + "loadedChunkCount:Number.isFinite(loadedChunkCount)?loadedChunkCount:null,"
       + "chunk:player&&Number.isFinite(player.x)&&Number.isFinite(player.z)"
       + "?{x:Math.floor(player.x/16),z:Math.floor(player.z/16)}:null,"
-      + "frame:{frameCount:Number(frame.frameCount)||0,totalFrameMillis:Number(frame.totalFrameMillis)||0,"
+      + "frame:{measurementId,measurementEpochId,frameCount:Number(frame.frameCount)||0,totalFrameMillis:Number(frame.totalFrameMillis)||0,"
       + "longestFrameMillis:Number(frame.longestFrameMillis)||0,"
       + "freezeCount:Number(frame.freezeCount)||0,hiddenFrameCount:Number(frame.hiddenFrameCount)||0,"
       + "visibleFrameCount:Number(frame.visibleFrameCount)||0,frameTimes,"
       + "swapInterval:typeof frame.swapInterval==='number'&&Number.isFinite(frame.swapInterval)?frame.swapInterval:null,"
       + "uncappedYieldCount:typeof frame.uncappedYieldCount==='number'&&Number.isFinite(frame.uncappedYieldCount)?frame.uncappedYieldCount:null,"
       + "vsyncYieldCount:typeof frame.vsyncYieldCount==='number'&&Number.isFinite(frame.vsyncYieldCount)?frame.vsyncYieldCount:null,"
+      + "visibleYieldCount:typeof frame.visibleYieldCount==='number'&&Number.isFinite(frame.visibleYieldCount)?frame.visibleYieldCount:null,"
+      + "hiddenYieldCount:typeof frame.hiddenYieldCount==='number'&&Number.isFinite(frame.hiddenYieldCount)?frame.hiddenYieldCount:null,"
       + "presentToRafCount:typeof frame.presentToRafCount==='number'&&Number.isFinite(frame.presentToRafCount)?frame.presentToRafCount:null,"
+      + "messageChannelYieldCount:typeof frame.messageChannelYieldCount==='number'&&Number.isFinite(frame.messageChannelYieldCount)?frame.messageChannelYieldCount:null,"
       + "fairYieldCount:typeof frame.fairYieldCount==='number'&&Number.isFinite(frame.fairYieldCount)?frame.fairYieldCount:null,"
+      + "schedulerYieldCount:typeof frame.schedulerYieldCount==='number'&&Number.isFinite(frame.schedulerYieldCount)?frame.schedulerYieldCount:null,"
+      + "timerYieldCount:typeof frame.timerYieldCount==='number'&&Number.isFinite(frame.timerYieldCount)?frame.timerYieldCount:null,"
       + "messageChannelCreateFailureCount:typeof frame.messageChannelCreateFailureCount==='number'&&Number.isFinite(frame.messageChannelCreateFailureCount)?frame.messageChannelCreateFailureCount:null,"
       + "messageChannelPostFailureCount:typeof frame.messageChannelPostFailureCount==='number'&&Number.isFinite(frame.messageChannelPostFailureCount)?frame.messageChannelPostFailureCount:null,"
       + "messageChannelRebuildCount:typeof frame.messageChannelRebuildCount==='number'&&Number.isFinite(frame.messageChannelRebuildCount)?frame.messageChannelRebuildCount:null,"
       + "cancelledMessageTaskCount:typeof frame.cancelledMessageTaskCount==='number'&&Number.isFinite(frame.cancelledMessageTaskCount)?frame.cancelledMessageTaskCount:null,"
       + "watchdogYieldCount:typeof frame.watchdogYieldCount==='number'&&Number.isFinite(frame.watchdogYieldCount)?frame.watchdogYieldCount:null,"
+      + "yieldRequestCount:typeof frame.yieldRequestCount==='number'&&Number.isFinite(frame.yieldRequestCount)?frame.yieldRequestCount:null,"
+      + "yieldCompletionCount:typeof frame.yieldCompletionCount==='number'&&Number.isFinite(frame.yieldCompletionCount)?frame.yieldCompletionCount:null,"
+      + "pendingYieldCount:typeof frame.pendingYieldCount==='number'&&Number.isFinite(frame.pendingYieldCount)?frame.pendingYieldCount:null,"
+      + "maxPendingYieldCount:typeof frame.maxPendingYieldCount==='number'&&Number.isFinite(frame.maxPendingYieldCount)?frame.maxPendingYieldCount:null,"
+      + "duplicateYieldCallbackCount:typeof frame.duplicateYieldCallbackCount==='number'&&Number.isFinite(frame.duplicateYieldCallbackCount)?frame.duplicateYieldCallbackCount:null,"
       + "lostFrameTimes:shouldDrain?Math.max(0,delta-available):0},"
       + "pipeline:{pendingTasks:Number(pipeline.pendingTasks)||0,"
       + "queueCapacity:Number(pipeline.queueCapacity)||0,"
@@ -2980,6 +3006,8 @@ async function sampleFor(
 async function finalTelemetry(session) {
   const telemetry = await evaluate(session, "(() => {"
     + "const frame=globalThis.__gaiusFrameTelemetry||{};"
+    + "const measurementId=String(globalThis.__gaiusBenchmarkMeasurementId||frame.measurementId||'');"
+    + "const measurementEpochId=String(globalThis.__gaiusBenchmarkMeasurementEpochId||frame.measurementEpochId||'');"
     + "const pipeline=globalThis.__gaiusChunkPipelineTelemetry||{};"
     + "const probe=globalThis.__gaiusBenchmarkProbe||{};"
     + "const worker=globalThis.__gaiusWorkerMessageTelemetry||{};"
@@ -2996,6 +3024,7 @@ async function finalTelemetry(session) {
     + "else if(typeof item==='boolean'||typeof item==='string'||item===null)result[key]=item;}"
     + "return result;};"
     + "const targeting=globalThis.__gaiusTargetingTelemetry||{};"
+    + "const network=globalThis.__gaiusNetworkStats||{};"
     + "const targetingSnapshot=scalarSnapshot(targeting);"
     + "const observedFrame=Number(targeting.lastObservationFrame);"
     + "const visibleFrame=Number(frame.visibleFrameCount);"
@@ -3048,9 +3077,9 @@ async function finalTelemetry(session) {
     + "pipeline.loadedChunks,worker.chunkPriority?.loadedChunkCount,"
     + "worker.chunkPriority?.loadedChunks];"
     + "const loadedChunkCount=loadedChunkCandidates.map(Number).find(Number.isFinite);"
-    + "return {capturedAt:Date.now(),"
+    + "return {capturedAt:Date.now(),measurementId,measurementEpochId,"
     + "loadedChunkCount:Number.isFinite(loadedChunkCount)?loadedChunkCount:null,"
-    + "frame:{frameCount:Number(frame.frameCount)||0,"
+    + "frame:{measurementId,measurementEpochId,frameCount:Number(frame.frameCount)||0,"
     + "startedAt:Number(frame.startedAt)||0,endedAt:performance.now(),"
     + "totalFrameMillis:Number(frame.totalFrameMillis)||0,"
     + "longestFrameMillis:Number(frame.longestFrameMillis)||0,"
@@ -3059,13 +3088,23 @@ async function finalTelemetry(session) {
     + "swapInterval:typeof frame.swapInterval==='number'&&Number.isFinite(frame.swapInterval)?frame.swapInterval:null,"
     + "uncappedYieldCount:typeof frame.uncappedYieldCount==='number'&&Number.isFinite(frame.uncappedYieldCount)?frame.uncappedYieldCount:null,"
     + "vsyncYieldCount:typeof frame.vsyncYieldCount==='number'&&Number.isFinite(frame.vsyncYieldCount)?frame.vsyncYieldCount:null,"
+    + "visibleYieldCount:typeof frame.visibleYieldCount==='number'&&Number.isFinite(frame.visibleYieldCount)?frame.visibleYieldCount:null,"
+    + "hiddenYieldCount:typeof frame.hiddenYieldCount==='number'&&Number.isFinite(frame.hiddenYieldCount)?frame.hiddenYieldCount:null,"
     + "presentToRafCount:typeof frame.presentToRafCount==='number'&&Number.isFinite(frame.presentToRafCount)?frame.presentToRafCount:null,"
+    + "messageChannelYieldCount:typeof frame.messageChannelYieldCount==='number'&&Number.isFinite(frame.messageChannelYieldCount)?frame.messageChannelYieldCount:null,"
     + "fairYieldCount:typeof frame.fairYieldCount==='number'&&Number.isFinite(frame.fairYieldCount)?frame.fairYieldCount:null,"
+    + "schedulerYieldCount:typeof frame.schedulerYieldCount==='number'&&Number.isFinite(frame.schedulerYieldCount)?frame.schedulerYieldCount:null,"
+    + "timerYieldCount:typeof frame.timerYieldCount==='number'&&Number.isFinite(frame.timerYieldCount)?frame.timerYieldCount:null,"
     + "messageChannelCreateFailureCount:typeof frame.messageChannelCreateFailureCount==='number'&&Number.isFinite(frame.messageChannelCreateFailureCount)?frame.messageChannelCreateFailureCount:null,"
     + "messageChannelPostFailureCount:typeof frame.messageChannelPostFailureCount==='number'&&Number.isFinite(frame.messageChannelPostFailureCount)?frame.messageChannelPostFailureCount:null,"
     + "messageChannelRebuildCount:typeof frame.messageChannelRebuildCount==='number'&&Number.isFinite(frame.messageChannelRebuildCount)?frame.messageChannelRebuildCount:null,"
     + "cancelledMessageTaskCount:typeof frame.cancelledMessageTaskCount==='number'&&Number.isFinite(frame.cancelledMessageTaskCount)?frame.cancelledMessageTaskCount:null,"
     + "watchdogYieldCount:typeof frame.watchdogYieldCount==='number'&&Number.isFinite(frame.watchdogYieldCount)?frame.watchdogYieldCount:null,"
+    + "yieldRequestCount:typeof frame.yieldRequestCount==='number'&&Number.isFinite(frame.yieldRequestCount)?frame.yieldRequestCount:null,"
+    + "yieldCompletionCount:typeof frame.yieldCompletionCount==='number'&&Number.isFinite(frame.yieldCompletionCount)?frame.yieldCompletionCount:null,"
+    + "pendingYieldCount:typeof frame.pendingYieldCount==='number'&&Number.isFinite(frame.pendingYieldCount)?frame.pendingYieldCount:null,"
+    + "maxPendingYieldCount:typeof frame.maxPendingYieldCount==='number'&&Number.isFinite(frame.maxPendingYieldCount)?frame.maxPendingYieldCount:null,"
+    + "duplicateYieldCallbackCount:typeof frame.duplicateYieldCallbackCount==='number'&&Number.isFinite(frame.duplicateYieldCallbackCount)?frame.duplicateYieldCallbackCount:null,"
     + "sampleCapacity:Number(frame.sampleCapacity)||0,sampleWriteIndex:Number(frame.sampleWriteIndex)||0,"
     + "sampleCount:Number(frame.sampleCount)||0,drainedFrameCount:drained,"
     + "frameTimes:frame.frameTimes?Array.from(frame.frameTimes):[],"
@@ -3112,7 +3151,12 @@ async function finalTelemetry(session) {
     + "minecraftEvents,"
     + "gameplayAuthority:gameplayAuthority&&typeof gameplayAuthority.finish==='function'"
     + "?gameplayAuthority.finish():null,"
-    + "state:minecraftState"
+    // Keep the final state payload scalar-only.  The live state object is
+    // updated by the render loop and may carry nested/cross-referenced values;
+    // returning it by value can block CDP during shutdown and make telemetry
+    // collection look like a runtime stall.  The bounded scalar snapshot is
+    // sufficient for analyze() and preserves loadedChunkCount above.
+    + "state:scalarSnapshot(minecraftState)"
     + "};"
     + "})()", 15_000);
   const frame = telemetry.frame || {};
@@ -3134,6 +3178,191 @@ async function finalTelemetry(session) {
     lostSamples: recovered.lostSamples,
   };
   return telemetry;
+}
+
+async function captureFramePacingScalar(session) {
+  const requiredFields = Array.isArray(uncappedEvidenceRules.requiredFields)
+    ? uncappedEvidenceRules.requiredFields : [];
+  const controllerRequestedAt = Date.now();
+  const value = await evaluate(session, "(() => {"
+    + "const frame=globalThis.__gaiusFrameTelemetry||{};"
+    + `const fields=${JSON.stringify(requiredFields)};`
+    + "const measurementId=String(globalThis.__gaiusBenchmarkMeasurementId||frame.measurementId||'');"
+    + "const measurementEpochId=String(globalThis.__gaiusBenchmarkMeasurementEpochId||frame.measurementEpochId||'');"
+    + "const pacing={measurementId,measurementEpochId};"
+    + "for(const field of fields){const value=frame[field];"
+    + "pacing[field]=typeof value==='number'&&Number.isFinite(value)?value:null;}"
+    + "return {capturedAt:Date.now(),...pacing,frame:{...pacing},"
+    + "runtimeInvariants:{framePacing:{...pacing}}};"
+    + "})()", 5000);
+  const controllerReceivedAt = Date.now();
+  return {
+    ...value,
+    controllerRequestedAt,
+    controllerReceivedAt,
+    evaluationLatencyMillis: controllerReceivedAt - controllerRequestedAt,
+    deadlineExceeded: false,
+  };
+}
+
+async function captureOrderedFramePacingScalar(session, afterCapturedAt, deadline) {
+  while (true) {
+    const snapshot = await captureFramePacingScalar(session);
+    const hardDeadline = deadline + framePacingSettlementPollMillis;
+    snapshot.deadlineExceeded = snapshot.controllerReceivedAt > hardDeadline;
+    if (Number.isSafeInteger(snapshot?.capturedAt)
+        && snapshot.capturedAt >= 0
+        && snapshot.capturedAt > afterCapturedAt) {
+      return snapshot;
+    }
+    if (snapshot.controllerReceivedAt >= hardDeadline) {
+      return {...snapshot, deadlineExceeded: true, timestampDidNotAdvance: true};
+    }
+    await sleep(framePacingSettlementPollMillis);
+  }
+}
+
+async function captureFinalTelemetryAfterSamples(session, samples) {
+  const lastSampleAt = samples.at(-1)?.at;
+  if (!Number.isSafeInteger(lastSampleAt) || lastSampleAt < 0) {
+    throw new Error("The final raw frame-pacing sample has no safe timestamp");
+  }
+  const deadline = Date.now() + framePacingSettlementTimeoutMillis;
+  while (true) {
+    const telemetry = await finalTelemetry(session);
+    if (Number.isSafeInteger(telemetry?.capturedAt)
+        && telemetry.capturedAt >= 0
+        && telemetry.capturedAt > lastSampleAt) {
+      const framePacing = await captureOrderedFramePacingScalar(
+        session,
+        telemetry.capturedAt,
+        Date.now() + framePacingSettlementTimeoutMillis,
+      );
+      telemetry.fullSnapshotCapturedAt = telemetry.capturedAt;
+      telemetry.capturedAt = framePacing.capturedAt;
+      telemetry.measurementId = framePacing.measurementId;
+      telemetry.measurementEpochId = framePacing.measurementEpochId;
+      telemetry.controllerRequestedAt = framePacing.controllerRequestedAt;
+      telemetry.controllerReceivedAt = framePacing.controllerReceivedAt;
+      telemetry.evaluationLatencyMillis = framePacing.evaluationLatencyMillis;
+      telemetry.deadlineExceeded = framePacing.deadlineExceeded;
+      telemetry.frame = telemetry.frame || {};
+      telemetry.runtimeInvariants = telemetry.runtimeInvariants || {};
+      telemetry.runtimeInvariants.framePacing = {};
+      telemetry.frame.measurementId = framePacing.measurementId;
+      telemetry.frame.measurementEpochId = framePacing.measurementEpochId;
+      telemetry.runtimeInvariants.framePacing.measurementId = framePacing.measurementId;
+      telemetry.runtimeInvariants.framePacing.measurementEpochId = framePacing.measurementEpochId;
+      for (const field of uncappedEvidenceRules.requiredFields || []) {
+        telemetry.frame[field] = framePacing[field];
+        telemetry.runtimeInvariants.framePacing[field] = framePacing[field];
+      }
+      return telemetry;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `Final telemetry timestamp did not advance beyond raw sample ${String(lastSampleAt)}`,
+      );
+    }
+    await sleep(framePacingSettlementPollMillis);
+  }
+}
+
+async function settleFramePacing(session, initialTelemetry) {
+  const initialSources = mergeFramePacingTelemetrySources({
+    frame: initialTelemetry?.frame,
+    runtime: initialTelemetry?.runtimeInvariants?.framePacing,
+    requiredFields: uncappedEvidenceRules.requiredFields,
+    label: "final",
+  });
+  const initial = initialSources.merged;
+  const initialCapturedAt = initialTelemetry?.capturedAt;
+  const initialPendingYieldCount = initial.pendingYieldCount;
+  const requiredMessageChannelCompletionDelta = initialPendingYieldCount === 1 ? 1 : 0;
+  const controllerStartedAt = Date.now();
+  const deadline = controllerStartedAt + framePacingSettlementTimeoutMillis;
+  const samples = [];
+  let previousCapturedAt = initialCapturedAt;
+  let messageChannelCompletionDelta = 0;
+  let yieldCompletionDelta = 0;
+  let settled = false;
+  let deadlineExceeded = false;
+  do {
+    const snapshot = await captureOrderedFramePacingScalar(
+      session,
+      previousCapturedAt,
+      deadline,
+    );
+    samples.push(snapshot);
+    previousCapturedAt = snapshot.capturedAt;
+    messageChannelCompletionDelta = Number(snapshot.messageChannelYieldCount)
+      - Number(initial.messageChannelYieldCount);
+    yieldCompletionDelta = Number(snapshot.yieldCompletionCount)
+      - Number(initial.yieldCompletionCount);
+    settled = requiredMessageChannelCompletionDelta === 0
+      || (messageChannelCompletionDelta >= requiredMessageChannelCompletionDelta
+        && yieldCompletionDelta >= requiredMessageChannelCompletionDelta);
+    deadlineExceeded = snapshot.deadlineExceeded === true
+      || snapshot.controllerReceivedAt > deadline + framePacingSettlementPollMillis;
+    if (settled || deadlineExceeded || Date.now() >= deadline) break;
+    await sleep(framePacingSettlementPollMillis);
+  } while (true);
+  const final = samples.at(-1) || null;
+  const controllerCompletedAt = Date.now();
+  deadlineExceeded = deadlineExceeded
+    || controllerCompletedAt > deadline + framePacingSettlementPollMillis;
+  if (deadlineExceeded) settled = false;
+  return {
+    schemaVersion: Number(uncappedEvidenceRules.settlementSchemaVersion) || 1,
+    measurementId: initial.measurementId ?? null,
+    measurementEpochId: initial.measurementEpochId ?? null,
+    initialCapturedAt,
+    capturedAt: final?.capturedAt ?? null,
+    controllerStartedAt,
+    controllerCompletedAt,
+    controllerElapsedMillis: controllerCompletedAt - controllerStartedAt,
+    pollIntervalMillis: framePacingSettlementPollMillis,
+    timeoutMillis: framePacingSettlementTimeoutMillis,
+    initialPendingYieldCount,
+    requiredMessageChannelCompletionDelta,
+    messageChannelCompletionDelta,
+    yieldCompletionDelta,
+    settled,
+    timedOut: !settled,
+    deadlineExceeded,
+    samples,
+    final: final == null ? null : structuredClone(final),
+  };
+}
+
+async function captureCleanupFramePacingClosure(session, cleanupTelemetry, settlement) {
+  const afterCapturedAt = settlement?.capturedAt;
+  const cutoffYieldRequestCount = settlement?.final?.yieldRequestCount;
+  const snapshot = await captureOrderedFramePacingScalar(
+    session,
+    afterCapturedAt,
+    Date.now() + framePacingSettlementTimeoutMillis,
+  );
+  const closure = {...snapshot, cutoffYieldRequestCount};
+  cleanupTelemetry.fullSnapshotCapturedAt = cleanupTelemetry.capturedAt;
+  cleanupTelemetry.capturedAt = closure.capturedAt;
+  cleanupTelemetry.measurementId = closure.measurementId;
+  cleanupTelemetry.measurementEpochId = closure.measurementEpochId;
+  cleanupTelemetry.controllerRequestedAt = closure.controllerRequestedAt;
+  cleanupTelemetry.controllerReceivedAt = closure.controllerReceivedAt;
+  cleanupTelemetry.evaluationLatencyMillis = closure.evaluationLatencyMillis;
+  cleanupTelemetry.deadlineExceeded = closure.deadlineExceeded;
+  cleanupTelemetry.cutoffYieldRequestCount = cutoffYieldRequestCount;
+  cleanupTelemetry.frame = {
+    ...(cleanupTelemetry.frame || {}),
+    ...closure.frame,
+  };
+  cleanupTelemetry.runtimeInvariants = cleanupTelemetry.runtimeInvariants || {};
+  cleanupTelemetry.runtimeInvariants.framePacing = {
+    ...closure.runtimeInvariants.framePacing,
+  };
+  cleanupTelemetry.framePacingClosure = structuredClone(closure);
+  return cleanupTelemetry;
 }
 
 async function collectFailureDiagnostics(session) {
@@ -3521,16 +3750,62 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
   const stabilityWorker = telemetry.worker || {};
 
   const options = parseOptionsText(telemetry.environment?.optionsText);
+  const uncappedRequirements = environmentRules.uncappedEvidence || {};
+  const sampleFramePacingSources = validSamples.map((sample, index) =>
+    normalizeFramePacingEvidenceSnapshot(sample, {
+      requiredFields: uncappedRequirements.requiredFields,
+      label: `sample[${index}]`,
+      requireDualSources: true,
+    }));
+  const finalFramePacingSources = normalizeFramePacingEvidenceSnapshot({
+    ...telemetry,
+    frame: performanceFrame,
+  }, {
+    requiredFields: uncappedRequirements.requiredFields,
+    label: "final",
+    requireDualSources: true,
+  });
+  const settlementFramePacingSources = normalizeFramePacingSettlementEvidence(
+    telemetry.framePacingSettlement,
+    {
+      requiredFields: uncappedRequirements.requiredFields,
+      label: "settlement",
+      requireDualSources: true,
+    },
+  );
+  const cleanupFramePacingSources = normalizeFramePacingEvidenceSnapshot(
+    telemetry.cleanupFramePacing,
+    {
+      requiredFields: uncappedRequirements.requiredFields,
+      label: "cleanup",
+      requireDualSources: true,
+    },
+  );
   const framePacingEvidence = evaluateUncappedFramePacing({
-    samples: validSamples
-      .map((sample) => ({
-        ...(sample.runtimeInvariants?.framePacing || {}),
-        ...Object.fromEntries(Object.entries(sample.frame || {})
-          .filter(([, value]) => value != null)),
-      }))
-      .filter((sample) => sample && typeof sample === "object"),
-    final: performanceFrame,
-    requirements: environmentRules.uncappedEvidence || {},
+    samples: sampleFramePacingSources.map(({merged}) => merged),
+    final: finalFramePacingSources.merged,
+    settlement: settlementFramePacingSources.settlement,
+    cleanup: cleanupFramePacingSources.merged,
+    measurementEpochId: context.expectedMeasurementEpochId,
+    requireEpochClosure: true,
+    sourceOverlapMismatches: [
+      ...sampleFramePacingSources.flatMap(({overlapMismatches}) => overlapMismatches),
+      ...sampleFramePacingSources.flatMap(({sourceCompletenessFailures}) =>
+        sourceCompletenessFailures),
+      ...finalFramePacingSources.overlapMismatches,
+      ...finalFramePacingSources.sourceCompletenessFailures,
+      ...settlementFramePacingSources.overlapMismatches,
+      ...settlementFramePacingSources.sourceCompletenessFailures,
+      ...cleanupFramePacingSources.overlapMismatches,
+      ...cleanupFramePacingSources.sourceCompletenessFailures,
+    ],
+    timing: {
+      lastSampleAt: validSamples.at(-1)?.at ?? null,
+      finalCapturedAt: telemetry.capturedAt ?? null,
+      settlementCapturedAt: telemetry.framePacingSettlement?.capturedAt ?? null,
+      cleanupCapturedAt: telemetry.cleanupFramePacing?.capturedAt ?? null,
+    },
+    requirements: uncappedRequirements,
   });
   const rafIntervals = Array.from(performanceProbe.rafIntervals || [], Number)
     .filter((current) => Number.isFinite(current) && current > 0);
@@ -4702,6 +4977,12 @@ try {
       "--disable-background-networking",
       "--disable-background-timer-throttling",
       "--disable-renderer-backgrounding",
+      // Keep a suite-owned headed window's compositor/RAF active even when the
+      // Codex desktop is in front of it.  Without these flags Chrome can mark
+      // the page hidden/occluded and the benchmark's waitForPaint() never
+      // settles, producing a false startup hang before any game evidence.
+      "--disable-backgrounding-occluded-windows",
+      "--disable-features=CalculateNativeWinOcclusion",
       // Synthetic CDP clicks must never put a visible benchmark tab into OS-level
       // pointer lock; keep the operator's real cursor independent of the test.
       "--disable-pointer-lock",
@@ -4860,7 +5141,11 @@ try {
   const performanceTask = (async () => {
     await sampleFor(session, frameMeasurementMillis, samples);
     samples.push(await samplePage(session));
-    performanceTelemetry = await finalTelemetry(session);
+    performanceTelemetry = await captureFinalTelemetryAfterSamples(session, samples);
+    performanceTelemetry.framePacingSettlement = await settleFramePacing(
+      session,
+      performanceTelemetry,
+    );
   })();
   const heapTask = heapMillis > 0
     ? collectHeapTrend(session, heapMillis, heapSampleMillis, heapIntervalMillis)
@@ -4932,7 +5217,12 @@ try {
       browserSessionError,
     ),
   ]);
-  const cleanupTelemetry = await finalTelemetry(session);
+  let cleanupTelemetry = await finalTelemetry(session);
+  cleanupTelemetry = await captureCleanupFramePacingClosure(
+    session,
+    cleanupTelemetry,
+    performanceTelemetry.framePacingSettlement,
+  );
   const telemetry = {
     ...stabilityTelemetry,
     capturedAt: performanceTelemetry.capturedAt,
@@ -4946,6 +5236,8 @@ try {
     performanceWorker: performanceTelemetry.worker,
     performanceNetwork: performanceTelemetry.network,
     runtimeInvariants: performanceTelemetry.runtimeInvariants,
+    framePacingSettlement: performanceTelemetry.framePacingSettlement,
+    cleanupFramePacing: cleanupTelemetry.framePacingClosure,
     stabilityRuntimeInvariants: stabilityTelemetry.runtimeInvariants,
     cleanupRuntimeInvariants: cleanupTelemetry.runtimeInvariants,
     cleanupMemory: cleanupTelemetry.memory,
@@ -4992,6 +5284,7 @@ try {
       measurementStartedAt,
       measurementEndedAt,
       expectedWorkerMeasurementId: reset.measurementId,
+      expectedMeasurementEpochId: reset.measurementEpochId,
       worldEntryTimings,
       warmupSamples,
       runEventStartedAt: benchmarkStartedAt,
@@ -5038,6 +5331,8 @@ try {
       sampleMillis,
       startupTimeoutMillis,
       strictChecks: !smoke,
+      measurementId: reset.measurementId,
+      measurementEpochId: reset.measurementEpochId,
     },
     performanceEvidence: analysis.performanceEvidence,
     failureEvidence: analysis.failureEvidence,

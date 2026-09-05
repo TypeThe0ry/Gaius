@@ -5,7 +5,14 @@ import {createHash} from "node:crypto";
 import {mkdir, readFile, writeFile} from "node:fs/promises";
 import {basename, dirname, isAbsolute, relative, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
-import {summarizeAcceptanceEvidence} from "./performance-metrics.mjs";
+import {
+  evaluateUncappedFramePacing,
+  mergeFramePacingTelemetrySources,
+  mergeMonotonicSamples,
+  normalizeFramePacingEvidenceSnapshot,
+  normalizeFramePacingSettlementEvidence,
+  summarizeAcceptanceEvidence,
+} from "./performance-metrics.mjs";
 
 const scriptsRoot = fileURLToPath(new URL(".", import.meta.url));
 const repositoryRoot = resolve(scriptsRoot, "../..");
@@ -116,8 +123,18 @@ const REQUIRED_UNCAPPED_TELEMETRY_FIELDS = [
   "swapInterval",
   "uncappedYieldCount",
   "vsyncYieldCount",
+  "visibleYieldCount",
+  "hiddenYieldCount",
   "presentToRafCount",
+  "messageChannelYieldCount",
   "fairYieldCount",
+  "schedulerYieldCount",
+  "timerYieldCount",
+  "yieldRequestCount",
+  "yieldCompletionCount",
+  "pendingYieldCount",
+  "maxPendingYieldCount",
+  "duplicateYieldCallbackCount",
   "messageChannelCreateFailureCount",
   "messageChannelPostFailureCount",
   "messageChannelRebuildCount",
@@ -131,9 +148,245 @@ const UNCAPPED_HEALTH_LIMITS = [
   ["cancelledMessageTaskCount", "maximumCancelledMessageTaskCount"],
   ["watchdogYieldCount", "maximumWatchdogYieldCount"],
 ];
+const UNCAPPED_COUNTER_FIELDS = REQUIRED_UNCAPPED_TELEMETRY_FIELDS
+  .filter((field) => field !== "swapInterval");
+const UNCAPPED_INTEGRITY_FIELDS = [
+  "sampleCompletenessViolationCount",
+  "unsafeCounterValueCount",
+  "counterDecreaseCount",
+  "snapshotInvariantFailureCount",
+  "visibleUncappedInvariantFailureCount",
+  "sourceOverlapMismatchCount",
+  "epochMismatchCount",
+  "controllerTimingViolationCount",
+  "settlementCounterDecreaseCount",
+  "settlementInvariantFailureCount",
+  "settlementFallbackOrHealthFailureCount",
+  "cleanupCounterDecreaseCount",
+  "cleanupInvariantFailureCount",
+  "cleanupFallbackOrHealthFailureCount",
+  "cleanupClosureFailureCount",
+];
 
 function hasFiniteNumber(value) {
   return typeof value === "number" && Number.isFinite(value);
+}
+
+function isNonnegativeSafeInteger(value) {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
+function recomputeChildUncappedEvidence(report, requirements) {
+  const failures = [];
+  const minimumSamples = Number(requirements?.minimumSamples);
+  const rawSamples = report?.samples;
+  if (!Array.isArray(rawSamples)) {
+    failures.push("release child report is missing raw report.samples frame-pacing evidence");
+  }
+  const samples = Array.isArray(rawSamples) ? rawSamples : [];
+  const invalidRawSampleIndexes = [];
+  const invalidRawTimestampIndexes = [];
+  const nonIncreasingRawTimestampIndexes = [];
+  const errorRawSampleIndexes = [];
+  const stalledRawSampleIndexes = [];
+  let previousRawTimestamp = null;
+  for (let index = 0; index < samples.length; index++) {
+    const sample = samples[index];
+    if (!sample || typeof sample !== "object" || Array.isArray(sample)) {
+      invalidRawSampleIndexes.push(index);
+      continue;
+    }
+    if (!Number.isSafeInteger(sample.at) || sample.at < 0) {
+      invalidRawTimestampIndexes.push(index);
+    } else {
+      if (previousRawTimestamp != null && sample.at <= previousRawTimestamp) {
+        nonIncreasingRawTimestampIndexes.push(index);
+      }
+      previousRawTimestamp = sample.at;
+    }
+    if (Object.hasOwn(sample, "error")) errorRawSampleIndexes.push(index);
+    if (!hasFiniteNumber(sample.evaluationLatencyMillis)
+        || sample.evaluationLatencyMillis < 0
+        || sample.evaluationLatencyMillis >= 500) {
+      stalledRawSampleIndexes.push(index);
+    }
+  }
+  if (invalidRawSampleIndexes.length > 0) {
+    failures.push(
+      `release child report has non-object raw samples at indexes ${invalidRawSampleIndexes.join(", ")}`,
+    );
+  }
+  if (invalidRawTimestampIndexes.length > 0) {
+    failures.push(
+      "release child report raw sample timestamps are missing or unsafe at indexes "
+        + invalidRawTimestampIndexes.join(", "),
+    );
+  }
+  if (nonIncreasingRawTimestampIndexes.length > 0) {
+    failures.push(
+      "release child report raw sample timestamps are not strictly increasing at indexes "
+        + nonIncreasingRawTimestampIndexes.join(", "),
+    );
+  }
+  if (errorRawSampleIndexes.length > 0) {
+    failures.push(
+      `release child report has errored raw samples at indexes ${errorRawSampleIndexes.join(", ")}`,
+    );
+  }
+  if (stalledRawSampleIndexes.length > 0) {
+    failures.push(
+      "release child report raw sample latency is missing, unsafe, or at least 500 ms at indexes "
+        + stalledRawSampleIndexes.join(", "),
+    );
+  }
+
+  // Keep this mapping byte-for-byte equivalent to chrome-chunk-benchmark's
+  // analyze() path. The release parent must derive pacing evidence from raw
+  // samples rather than trusting a child-authored summary.
+  const validSamples = mergeMonotonicSamples(samples.filter((sample) =>
+    sample && typeof sample === "object" && !sample.error));
+  if (validSamples.length !== samples.length) {
+    failures.push(
+      "release child report raw samples were dropped or merged before frame-pacing evaluation",
+    );
+  }
+  if (!Number.isSafeInteger(minimumSamples)
+      || validSamples.length < minimumSamples) {
+    failures.push(
+      `release child report has only ${validSamples.length} merged raw frame-pacing samples; `
+        + `${String(minimumSamples)} required`,
+    );
+  }
+  const telemetry = report?.telemetry;
+  if (!telemetry || typeof telemetry !== "object" || Array.isArray(telemetry)) {
+    failures.push("release child report is missing raw report.telemetry final evidence");
+  }
+  const performanceFrame = telemetry?.frame;
+  const runtimeFramePacing = telemetry?.runtimeInvariants?.framePacing;
+  if ((!performanceFrame || typeof performanceFrame !== "object" || Array.isArray(performanceFrame))
+      && (!runtimeFramePacing || typeof runtimeFramePacing !== "object"
+        || Array.isArray(runtimeFramePacing))) {
+    failures.push("release child report is missing a raw final frame-pacing telemetry snapshot");
+  }
+  const requiredFields = Array.isArray(requirements?.requiredFields)
+    ? requirements.requiredFields : REQUIRED_UNCAPPED_TELEMETRY_FIELDS;
+  const sampleSources = validSamples.map((sample, index) =>
+    normalizeFramePacingEvidenceSnapshot(sample, {
+      requiredFields,
+      label: `sample[${index}]`,
+      requireDualSources: true,
+    }));
+  const finalSources = normalizeFramePacingEvidenceSnapshot({
+    ...telemetry,
+    frame: performanceFrame,
+    runtimeInvariants: {framePacing: runtimeFramePacing},
+  }, {
+    requiredFields,
+    label: "final",
+    requireDualSources: true,
+  });
+  const settlementSources = normalizeFramePacingSettlementEvidence(
+    telemetry?.framePacingSettlement,
+    {requiredFields, label: "settlement", requireDualSources: true},
+  );
+  const cleanupTelemetry = report?.cleanupTelemetry;
+  if (!cleanupTelemetry || typeof cleanupTelemetry !== "object"
+      || Array.isArray(cleanupTelemetry)) {
+    failures.push("release child report is missing raw cleanupTelemetry pacing closure");
+  }
+  const cleanupSources = normalizeFramePacingEvidenceSnapshot(cleanupTelemetry, {
+    requiredFields,
+    label: "cleanupTelemetry",
+    requireDualSources: true,
+  });
+  const cleanupClosure = cleanupTelemetry?.framePacingClosure;
+  if (!cleanupClosure || typeof cleanupClosure !== "object" || Array.isArray(cleanupClosure)) {
+    failures.push(
+      "release child report is missing raw cleanupTelemetry.framePacingClosure evidence",
+    );
+  }
+  const cleanupClosureSources = normalizeFramePacingEvidenceSnapshot(cleanupClosure, {
+    requiredFields,
+    label: "cleanupTelemetry.framePacingClosure",
+    requireDualSources: true,
+  });
+  const telemetryCleanupSources = normalizeFramePacingEvidenceSnapshot(
+    telemetry?.cleanupFramePacing,
+    {requiredFields, label: "telemetry.cleanupFramePacing", requireDualSources: true},
+  );
+  const sourceOverlapMismatches = [
+    ...sampleSources.flatMap(({overlapMismatches}) => overlapMismatches),
+    ...sampleSources.flatMap(({sourceCompletenessFailures}) => sourceCompletenessFailures),
+    ...finalSources.overlapMismatches,
+    ...finalSources.sourceCompletenessFailures,
+    ...settlementSources.overlapMismatches,
+    ...settlementSources.sourceCompletenessFailures,
+    ...cleanupSources.overlapMismatches,
+    ...cleanupSources.sourceCompletenessFailures,
+    ...cleanupClosureSources.overlapMismatches,
+    ...cleanupClosureSources.sourceCompletenessFailures,
+    ...telemetryCleanupSources.overlapMismatches,
+    ...telemetryCleanupSources.sourceCompletenessFailures,
+  ];
+  if (sourceOverlapMismatches.length > 0) {
+    failures.push(
+      `release child raw frame-pacing sources disagree in ${sourceOverlapMismatches.length} required field(s)`,
+    );
+  }
+  const settlement = telemetry?.framePacingSettlement;
+  if (!settlement || typeof settlement !== "object" || Array.isArray(settlement)) {
+    failures.push("release child report is missing raw framePacingSettlement evidence");
+  }
+  const lastSampleAt = validSamples.at(-1)?.at ?? null;
+  const finalCapturedAt = telemetry?.capturedAt ?? null;
+  const settlementCapturedAt = settlement?.capturedAt ?? null;
+  const cleanupCapturedAt = cleanupTelemetry?.capturedAt ?? null;
+  if (!isNonnegativeSafeInteger(finalCapturedAt) || !(finalCapturedAt > lastSampleAt)) {
+    failures.push("release child final telemetry.capturedAt must be after the last raw sample");
+  }
+  if (!isNonnegativeSafeInteger(settlementCapturedAt)
+      || !(settlementCapturedAt > finalCapturedAt)) {
+    failures.push("release child settlement.capturedAt must be after final telemetry");
+  }
+  if (!isNonnegativeSafeInteger(cleanupCapturedAt)
+      || !(cleanupCapturedAt > settlementCapturedAt)) {
+    failures.push("release child cleanupTelemetry.capturedAt must be after settlement");
+  }
+  if (canonicalJson(cleanupSources.merged) !== canonicalJson(telemetryCleanupSources.merged)) {
+    failures.push(
+      "release child telemetry.cleanupFramePacing does not match raw cleanupTelemetry closure",
+    );
+  }
+  if (canonicalJson(cleanupSources.merged) !== canonicalJson(cleanupClosureSources.merged)
+      || canonicalJson(cleanupClosureSources.merged)
+        !== canonicalJson(telemetryCleanupSources.merged)) {
+    failures.push(
+      "release child raw cleanupTelemetry.framePacingClosure does not match cleanupTelemetry and telemetry.cleanupFramePacing",
+    );
+  }
+  const measurementId = report?.configuration?.measurementId;
+  const measurementEpochId = report?.configuration?.measurementEpochId;
+  if (typeof measurementId !== "string" || measurementId.length === 0
+      || measurementId !== measurementEpochId) {
+    failures.push("release child configuration is missing an exact measurement epoch identity");
+  }
+  const recomputed = evaluateUncappedFramePacing({
+    samples: sampleSources.map(({merged}) => merged),
+    final: finalSources.merged,
+    settlement: settlementSources.settlement,
+    cleanup: cleanupSources.merged,
+    measurementEpochId,
+    requireEpochClosure: true,
+    sourceOverlapMismatches,
+    timing: {
+      lastSampleAt,
+      finalCapturedAt,
+      settlementCapturedAt,
+      cleanupCapturedAt,
+    },
+    requirements: requirements || {},
+  });
+  return {failures, recomputed, validRawSampleCount: validSamples.length};
 }
 
 function uniqueStrings(values) {
@@ -300,8 +553,8 @@ function profileFrom(contractValue, name) {
 
 export function validateContractShape(contractValue) {
   const schemaVersion = Number(contractValue?.schemaVersion);
-  if (!Number.isSafeInteger(schemaVersion) || schemaVersion <= 0) {
-    throw new Error("performance contract schemaVersion must be a positive integer");
+  if (schemaVersion !== 14) {
+    throw new Error("performance contract schemaVersion must be exactly 14");
   }
   const releaseEvidence = contractValue.releaseEvidence;
   if (!releaseEvidence || typeof releaseEvidence !== "object") {
@@ -318,10 +571,18 @@ export function validateContractShape(contractValue) {
   }
   if (!Number.isFinite(Number(uncappedEvidence.requiredSwapInterval))
       || Number(uncappedEvidence.requiredSwapInterval) !== 0
-      || !Number.isFinite(Number(uncappedEvidence.minimumUncappedYieldCount))
-      || Number(uncappedEvidence.minimumUncappedYieldCount) < 1
-      || !Number.isFinite(Number(uncappedEvidence.minimumFairYieldCount))
-      || Number(uncappedEvidence.minimumFairYieldCount) < 1
+      || !Number.isSafeInteger(uncappedEvidence.minimumSamples)
+      || Number(uncappedEvidence.minimumSamples) < 2
+      || !Number.isSafeInteger(uncappedEvidence.minimumUncappedYieldCount)
+      || uncappedEvidence.minimumUncappedYieldCount < 1
+      || !Number.isSafeInteger(uncappedEvidence.minimumMessageChannelYieldCount)
+      || uncappedEvidence.minimumMessageChannelYieldCount < 1
+      || !Number.isFinite(Number(uncappedEvidence.maximumFairYieldCount))
+      || Number(uncappedEvidence.maximumFairYieldCount) !== 0
+      || !Number.isFinite(Number(uncappedEvidence.maximumSchedulerYieldCount))
+      || Number(uncappedEvidence.maximumSchedulerYieldCount) !== 0
+      || !Number.isFinite(Number(uncappedEvidence.maximumTimerYieldCount))
+      || Number(uncappedEvidence.maximumTimerYieldCount) !== 0
       || !Number.isFinite(Number(uncappedEvidence.maximumVsyncYieldCount))
       || Number(uncappedEvidence.maximumVsyncYieldCount) !== 0
       || !Number.isFinite(Number(uncappedEvidence.maximumPresentToRafCount))
@@ -330,6 +591,34 @@ export function validateContractShape(contractValue) {
         !Number.isFinite(Number(uncappedEvidence[limitField]))
         || Number(uncappedEvidence[limitField]) !== 0)) {
     throw new Error("environment.uncappedEvidence has unsafe release requirements");
+  }
+  const settlementPoll = uncappedEvidence.settlementPollIntervalMillis;
+  const settlementPollMin = uncappedEvidence.settlementPollIntervalMillisMin;
+  const settlementPollMax = uncappedEvidence.settlementPollIntervalMillisMax;
+  const settlementTimeout = uncappedEvidence.settlementTimeoutMillis;
+  const settlementTimeoutMin = uncappedEvidence.settlementTimeoutMillisMin;
+  const settlementTimeoutMax = uncappedEvidence.settlementTimeoutMillisMax;
+  if (uncappedEvidence.requireFramePacingSettlement !== true
+      || uncappedEvidence.settlementSchemaVersion !== 1
+      || !Number.isSafeInteger(settlementPoll)
+      || !Number.isSafeInteger(settlementPollMin)
+      || !Number.isSafeInteger(settlementPollMax)
+      || settlementPollMin < 5
+      || settlementPollMax > 10
+      || settlementPollMin > settlementPollMax
+      || settlementPoll < settlementPollMin
+      || settlementPoll > settlementPollMax
+      || !Number.isSafeInteger(settlementTimeout)
+      || !Number.isSafeInteger(settlementTimeoutMin)
+      || !Number.isSafeInteger(settlementTimeoutMax)
+      || settlementTimeoutMin < 150
+      || settlementTimeoutMax > 250
+      || settlementTimeoutMin > settlementTimeoutMax
+      || settlementTimeout < settlementTimeoutMin
+      || settlementTimeout > settlementTimeoutMax) {
+    throw new Error(
+      "environment.uncappedEvidence frame-pacing settlement requirements are unsafe",
+    );
   }
   const hardTargetProfiles = uniqueStrings(releaseEvidence.hardTargetProfiles);
   const stabilityProfiles = uniqueStrings(releaseEvidence.stabilityProfiles);
@@ -639,13 +928,14 @@ export function validateChildReport(report, {
     if (!evidence || typeof evidence !== "object") {
       failures.push("release child report is missing analysis.performanceEvidence");
     } else {
-      if (evidence.framePacing?.verdict !== "pass") {
-        failures.push("release child report did not prove uncapped frame pacing was exercised");
-      }
       const requirements = uncappedEvidence || {
         requiredSwapInterval: 0,
+        minimumSamples: 2,
         minimumUncappedYieldCount: 1,
-        minimumFairYieldCount: 1,
+        minimumMessageChannelYieldCount: 1,
+        maximumFairYieldCount: 0,
+        maximumSchedulerYieldCount: 0,
+        maximumTimerYieldCount: 0,
         maximumVsyncYieldCount: 0,
         maximumPresentToRafCount: 0,
         maximumMessageChannelCreateFailureCount: 0,
@@ -653,11 +943,109 @@ export function validateChildReport(report, {
         maximumMessageChannelRebuildCount: 0,
         maximumCancelledMessageTaskCount: 0,
         maximumWatchdogYieldCount: 0,
+        requireFramePacingSettlement: true,
+        settlementSchemaVersion: 1,
+        settlementPollIntervalMillis: 8,
+        settlementPollIntervalMillisMin: 5,
+        settlementPollIntervalMillisMax: 10,
+        settlementTimeoutMillis: 200,
+        settlementTimeoutMillisMin: 150,
+        settlementTimeoutMillisMax: 250,
         requiredFields: REQUIRED_UNCAPPED_TELEMETRY_FIELDS,
       };
-      const observed = evidence.framePacing.observed;
+      const reportedFramePacing = evidence.framePacing
+        && typeof evidence.framePacing === "object"
+        ? evidence.framePacing : {};
+      if (reportedFramePacing.verdict !== "pass") {
+        failures.push("release child report did not prove uncapped frame pacing was exercised");
+      }
+      const rawValidation = recomputeChildUncappedEvidence(report, requirements);
+      failures.push(...rawValidation.failures);
+      if (rawValidation.recomputed.verdict !== "pass") {
+        failures.push(
+          `release child raw frame-pacing evidence recomputed as ${rawValidation.recomputed.verdict}`,
+        );
+      }
+      if (canonicalJson(rawValidation.recomputed) !== canonicalJson(reportedFramePacing)) {
+        failures.push(
+          "release child derived frame-pacing summary does not match raw samples and final telemetry",
+        );
+      }
+      const observed = reportedFramePacing.observed;
+      const finalFramePacing = reportedFramePacing.final;
       const requiredFields = Array.isArray(requirements.requiredFields)
         ? requirements.requiredFields : REQUIRED_UNCAPPED_TELEMETRY_FIELDS;
+      const measuredSampleCount = reportedFramePacing.measuredSampleCount;
+      if (!Number.isSafeInteger(measuredSampleCount)
+          || measuredSampleCount < Number(requirements.minimumSamples)) {
+        failures.push(
+          `release child report has only ${String(measuredSampleCount)} complete frame-pacing samples; `
+          + `${requirements.minimumSamples} required`,
+        );
+      }
+      if (!isNonnegativeSafeInteger(observed?.completeSampleCount)
+          || observed.completeSampleCount !== measuredSampleCount
+          || !isNonnegativeSafeInteger(observed?.incompleteSampleCount)
+          || !isNonnegativeSafeInteger(observed?.allowedResetSentinelSampleCount)
+          || !isNonnegativeSafeInteger(observed?.sampleCompletenessViolationCount)
+          || observed.incompleteSampleCount !== observed.allowedResetSentinelSampleCount
+            + observed.sampleCompletenessViolationCount
+          || reportedFramePacing.incompleteSampleCount !== observed.incompleteSampleCount
+          || reportedFramePacing.allowedResetSentinelSampleCount
+            !== observed.allowedResetSentinelSampleCount
+          || reportedFramePacing.sampleCompletenessViolationCount
+            !== observed.sampleCompletenessViolationCount) {
+        failures.push("release child report frame-pacing sample accounting is invalid");
+      }
+      const finalMissingFields = requiredFields.filter((field) =>
+        !hasFiniteNumber(finalFramePacing?.[field]));
+      if (finalMissingFields.length > 0) {
+        failures.push(
+          `release child report final frame-pacing snapshot is missing: ${finalMissingFields.join(", ")}`,
+        );
+      } else {
+        const unsafeFinalCounters = UNCAPPED_COUNTER_FIELDS.filter((field) =>
+          !isNonnegativeSafeInteger(finalFramePacing[field]));
+        if (unsafeFinalCounters.length > 0) {
+          failures.push(
+            `release child report final frame-pacing counters are unsafe: ${unsafeFinalCounters.join(", ")}`,
+          );
+        }
+        const requests = finalFramePacing.yieldRequestCount;
+        const completions = finalFramePacing.yieldCompletionCount;
+        const pending = finalFramePacing.pendingYieldCount;
+        const finalConsistent = requests === finalFramePacing.uncappedYieldCount
+            + finalFramePacing.vsyncYieldCount
+          && requests === finalFramePacing.visibleYieldCount + finalFramePacing.hiddenYieldCount
+          && completions === finalFramePacing.messageChannelYieldCount
+            + finalFramePacing.schedulerYieldCount + finalFramePacing.timerYieldCount
+          && pending === requests - completions
+          && pending >= 0 && pending <= 1
+          && finalFramePacing.maxPendingYieldCount === (requests > 0 ? 1 : 0)
+          && finalFramePacing.duplicateYieldCallbackCount === 0
+          && finalFramePacing.swapInterval === Number(requirements.requiredSwapInterval)
+          && finalFramePacing.hiddenYieldCount === 0
+          && finalFramePacing.vsyncYieldCount === 0
+          && finalFramePacing.presentToRafCount === 0
+          && finalFramePacing.fairYieldCount === 0
+          && finalFramePacing.schedulerYieldCount === 0
+          && finalFramePacing.timerYieldCount === 0
+          && finalFramePacing.uncappedYieldCount
+            - finalFramePacing.messageChannelYieldCount === pending;
+        if (!finalConsistent) {
+          failures.push("release child report final frame-pacing continuation accounting is inconsistent");
+        }
+      }
+      for (const field of UNCAPPED_INTEGRITY_FIELDS) {
+        if (!isNonnegativeSafeInteger(observed?.[field]) || observed[field] !== 0) {
+          failures.push(`release child report frame-pacing ${field}=${String(observed?.[field])}`);
+        }
+      }
+      if (observed?.finalComplete !== true
+          || !Array.isArray(reportedFramePacing.finalMissingFields)
+          || reportedFramePacing.finalMissingFields.length !== 0) {
+        failures.push("release child report did not prove a complete final frame-pacing snapshot");
+      }
       const missingFields = requiredFields.filter((field) => {
         const observedFields = field === "swapInterval"
           ? ["swapIntervalMin", "swapIntervalMax"] : [`${field}Max`];
@@ -676,9 +1064,21 @@ export function validateChildReport(report, {
           && Number(observed.uncappedYieldCountMax) < Number(requirements.minimumUncappedYieldCount)) {
         failures.push("release child report did not prove uncappedYieldCount>0");
       }
-      if (hasFiniteNumber(observed?.fairYieldCountMax)
-          && Number(observed.fairYieldCountMax) < Number(requirements.minimumFairYieldCount)) {
-        failures.push("release child report did not prove fairYieldCount>0");
+      if (hasFiniteNumber(observed?.messageChannelYieldCountMax)
+          && Number(observed.messageChannelYieldCountMax)
+            < Number(requirements.minimumMessageChannelYieldCount)) {
+        failures.push("release child report did not prove messageChannelYieldCount>0");
+      }
+      for (const [field, limitField] of [
+        ["fairYieldCount", "maximumFairYieldCount"],
+        ["schedulerYieldCount", "maximumSchedulerYieldCount"],
+        ["timerYieldCount", "maximumTimerYieldCount"],
+      ]) {
+        const observedValue = observed?.[`${field}Max`];
+        if (hasFiniteNumber(observedValue)
+            && Number(observedValue) > Number(requirements[limitField])) {
+          failures.push(`release child report recorded ${field}=${observedValue}`);
+        }
       }
       if ((hasFiniteNumber(observed?.vsyncYieldCountMax)
             && Number(observed.vsyncYieldCountMax) > Number(requirements.maximumVsyncYieldCount))

@@ -15,6 +15,7 @@ import org.objectweb.asm.tree.IntInsnNode;
 import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.FieldNode;
 import org.objectweb.asm.tree.IincInsnNode;
+import org.objectweb.asm.tree.InvokeDynamicInsnNode;
 import org.objectweb.asm.tree.JumpInsnNode;
 import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.TypeInsnNode;
@@ -148,6 +149,8 @@ public final class MinecraftClientPatcher {
                 "com/mojang/blaze3d/platform/DebugMemoryUntracker.class"));
         patchMinecraftServer(args[0], root.resolve(
                 "net/minecraft/server/MinecraftServer.class"));
+        patchMobBrowserAiCooperation(args[0], root.resolve(
+                "net/minecraft/world/entity/Mob.class"));
         patchChunkMapBrowserInitialViewDistance(args[0], root.resolve(
                 "net/minecraft/server/level/ChunkMap.class"));
         patchChunkTaskPriorityQueueBrowserNearestFirst(args[0], root.resolve(
@@ -291,6 +294,12 @@ public final class MinecraftClientPatcher {
                 "com/mojang/blaze3d/audio/Listener.class"));
         patchGlslPreprocessor(args[0], root.resolve(
                 "com/mojang/blaze3d/preprocessor/GlslPreprocessor.class"));
+        if ("26.2".equals(minecraftVersion)) {
+            patchMappableRingBufferTelemetry(args[0], root.resolve(
+                    "net/minecraft/client/renderer/MappableRingBuffer.class"));
+            patchStagedVertexBufferGpuPoolCache(args[0], root.resolve(
+                    "net/minecraft/client/renderer/StagedVertexBuffer$GpuBufferPool.class"));
+        }
         patchGlDevice(args[0], root);
         patchGlConstWebGLTextureFormats(args[0], root.resolve(
                 "com/mojang/blaze3d/opengl/GlConst.class"));
@@ -2138,6 +2147,822 @@ public final class MinecraftClientPatcher {
         method.maxLocals = 2;
         node.methods.add(method);
         write(node, output);
+    }
+
+    /**
+     * Observes 26.2's ignored MappableRingBuffer fence result without changing the wait,
+     * close, slot-clear or buffer-return control flow.
+     */
+    private static void patchMappableRingBufferTelemetry(String jar, Path output)
+            throws IOException {
+        String owner = "net/minecraft/client/renderer/MappableRingBuffer";
+        String fence = "com/mojang/blaze3d/buffers/GpuFence";
+        String buffer = "com/mojang/blaze3d/buffers/GpuBuffer";
+        String telemetry = "org/lwjgl/opengl/BrowserOpenGL";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode currentBuffer = find(node, "currentBuffer", "()L" + buffer + ";");
+        java.util.List<AbstractInsnNode> executable = new java.util.ArrayList<>();
+        for (AbstractInsnNode instruction : currentBuffer.instructions.toArray()) {
+            if (instruction.getOpcode() >= 0) {
+                executable.add(instruction);
+            }
+        }
+        if (executable.size() != 26
+                || !(executable.get(0) instanceof VarInsnNode loadThis)
+                || loadThis.getOpcode() != Opcodes.ALOAD
+                || loadThis.var != 0
+                || !(executable.get(1) instanceof FieldInsnNode fencesField)
+                || fencesField.getOpcode() != Opcodes.GETFIELD
+                || !fencesField.owner.equals(owner)
+                || !fencesField.name.equals("fences")
+                || !fencesField.desc.equals("[L" + fence + ";")
+                || !(executable.get(2) instanceof VarInsnNode currentOwner)
+                || currentOwner.getOpcode() != Opcodes.ALOAD
+                || currentOwner.var != 0
+                || !(executable.get(3) instanceof FieldInsnNode currentField)
+                || currentField.getOpcode() != Opcodes.GETFIELD
+                || !currentField.owner.equals(owner)
+                || !currentField.name.equals("current")
+                || !currentField.desc.equals("I")
+                || executable.get(4).getOpcode() != Opcodes.AALOAD
+                || !(executable.get(5) instanceof VarInsnNode storeFence)
+                || storeFence.getOpcode() != Opcodes.ASTORE
+                || storeFence.var != 1
+                || !(executable.get(6) instanceof VarInsnNode testFence)
+                || testFence.getOpcode() != Opcodes.ALOAD
+                || testFence.var != 1
+                || !(executable.get(7) instanceof JumpInsnNode nullFence)
+                || nullFence.getOpcode() != Opcodes.IFNULL
+                || !(executable.get(8) instanceof VarInsnNode awaitOwner)
+                || awaitOwner.getOpcode() != Opcodes.ALOAD
+                || awaitOwner.var != 1
+                || !(executable.get(9) instanceof LdcInsnNode timeout)
+                || !Long.valueOf(Long.MAX_VALUE).equals(timeout.cst)
+                || !(executable.get(10) instanceof MethodInsnNode awaitCompletion)
+                || awaitCompletion.getOpcode() != Opcodes.INVOKEINTERFACE
+                || !awaitCompletion.owner.equals(fence)
+                || !awaitCompletion.name.equals("awaitCompletion")
+                || !awaitCompletion.desc.equals("(J)Z")
+                || executable.get(11).getOpcode() != Opcodes.POP
+                || !(executable.get(12) instanceof VarInsnNode closeOwner)
+                || closeOwner.getOpcode() != Opcodes.ALOAD
+                || closeOwner.var != 1
+                || !(executable.get(13) instanceof MethodInsnNode close)
+                || close.getOpcode() != Opcodes.INVOKEINTERFACE
+                || !close.owner.equals(fence)
+                || !close.name.equals("close")
+                || !close.desc.equals("()V")
+                || !(executable.get(14) instanceof VarInsnNode clearOwner)
+                || clearOwner.getOpcode() != Opcodes.ALOAD
+                || clearOwner.var != 0
+                || !(executable.get(15) instanceof FieldInsnNode clearFences)
+                || clearFences.getOpcode() != Opcodes.GETFIELD
+                || !clearFences.owner.equals(owner)
+                || !clearFences.name.equals("fences")
+                || !clearFences.desc.equals("[L" + fence + ";")
+                || !(executable.get(16) instanceof VarInsnNode clearCurrentOwner)
+                || clearCurrentOwner.getOpcode() != Opcodes.ALOAD
+                || clearCurrentOwner.var != 0
+                || !(executable.get(17) instanceof FieldInsnNode clearCurrent)
+                || clearCurrent.getOpcode() != Opcodes.GETFIELD
+                || !clearCurrent.owner.equals(owner)
+                || !clearCurrent.name.equals("current")
+                || !clearCurrent.desc.equals("I")
+                || executable.get(18).getOpcode() != Opcodes.ACONST_NULL
+                || executable.get(19).getOpcode() != Opcodes.AASTORE
+                || nextOpcode(nullFence.label) != executable.get(20)
+                || !(executable.get(20) instanceof VarInsnNode returnOwner)
+                || returnOwner.getOpcode() != Opcodes.ALOAD
+                || returnOwner.var != 0
+                || !(executable.get(21) instanceof FieldInsnNode buffersField)
+                || buffersField.getOpcode() != Opcodes.GETFIELD
+                || !buffersField.owner.equals(owner)
+                || !buffersField.name.equals("buffers")
+                || !buffersField.desc.equals("[L" + buffer + ";")
+                || !(executable.get(22) instanceof VarInsnNode returnCurrentOwner)
+                || returnCurrentOwner.getOpcode() != Opcodes.ALOAD
+                || returnCurrentOwner.var != 0
+                || !(executable.get(23) instanceof FieldInsnNode returnCurrent)
+                || returnCurrent.getOpcode() != Opcodes.GETFIELD
+                || !returnCurrent.owner.equals(owner)
+                || !returnCurrent.name.equals("current")
+                || !returnCurrent.desc.equals("I")
+                || executable.get(24).getOpcode() != Opcodes.AALOAD
+                || executable.get(25).getOpcode() != Opcodes.ARETURN) {
+            throw new IllegalStateException(owner + ".currentBuffer exact 26.2 shape changed");
+        }
+        int awaitCalls = 0;
+        int returns = 0;
+        for (AbstractInsnNode instruction : currentBuffer.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.owner.equals(fence)
+                    && call.name.equals("awaitCompletion")
+                    && call.desc.equals("(J)Z")) {
+                awaitCalls++;
+            }
+            if (instruction.getOpcode() == Opcodes.ARETURN) {
+                returns++;
+            }
+        }
+        if (awaitCalls != 1 || returns != 1) {
+            throw new IllegalStateException(
+                    owner + ".currentBuffer await/return count changed: "
+                            + awaitCalls + "/" + returns);
+        }
+
+        InsnList entryTelemetry = new InsnList();
+        entryTelemetry.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                telemetry,
+                "noteMappableRingCurrentBuffer",
+                "()V",
+                false));
+        currentBuffer.instructions.insertBefore(executable.get(0), entryTelemetry);
+
+        InsnList resultTelemetry = new InsnList();
+        resultTelemetry.add(new InsnNode(Opcodes.DUP));
+        resultTelemetry.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                telemetry,
+                "noteMappableRingAwaitResult",
+                "(Z)V",
+                false));
+        currentBuffer.instructions.insert(awaitCompletion, resultTelemetry);
+
+        writeComputeFrames(node, output);
+        System.out.println(
+                "Instrumented 26.2 MappableRingBuffer.currentBuffer fence-result telemetry");
+    }
+
+    /**
+     * Retains only signalled StagedVertexBuffer pool entries across browser frames. The vanilla
+     * used-to-fence-to-pending path remains byte-for-byte intact; the helper owns only the
+     * available list and applies its bounded count, byte and idle-frame policy after selection.
+     */
+    private static void patchStagedVertexBufferGpuPoolCache(String jar, Path output)
+            throws IOException {
+        String owner = "net/minecraft/client/renderer/StagedVertexBuffer$GpuBufferPool";
+        String buffer = "com/mojang/blaze3d/buffers/GpuBuffer";
+        String helper = "dev/gaius/browser/BrowserGpuBufferPoolCache";
+        String helperDescriptor = "L" + helper + ";";
+        String cacheField = "gaius$browserCache";
+        ClassNode node = read(jar, owner + ".class");
+        String[] expectedFieldNames = {
+            "BUFFER_SIZE_INCREMENT", "MAX_REUSE_SIZE_FACTOR", "label", "usage",
+            "available", "usedThisFrame", "pendingRecycle"
+        };
+        String[] expectedFieldDescriptors = {
+            "I", "I", "Ljava/util/function/Supplier;", "I",
+            "Ljava/util/List;", "Ljava/util/List;", "Ljava/util/List;"
+        };
+        int[] expectedFieldAccess = {
+            Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_FINAL,
+            Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_FINAL,
+            Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL,
+            Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL,
+            Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL,
+            Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL,
+            Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL
+        };
+        if (node.fields.size() != expectedFieldNames.length) {
+            throw new IllegalStateException(
+                    owner + " raw field count changed: " + node.fields.size());
+        }
+        for (int index = 0; index < expectedFieldNames.length; index++) {
+            FieldNode field = node.fields.get(index);
+            if (!field.name.equals(expectedFieldNames[index])
+                    || !field.desc.equals(expectedFieldDescriptors[index])
+                    || field.access != expectedFieldAccess[index]) {
+                throw new IllegalStateException(
+                        owner + " raw field shape changed at " + index + ": "
+                                + field.name + field.desc + " access=" + field.access);
+            }
+        }
+        if (!Integer.valueOf(262144).equals(node.fields.get(0).value)
+                || !Integer.valueOf(4).equals(node.fields.get(1).value)) {
+            throw new IllegalStateException(owner + " raw pool constants changed");
+        }
+
+        String pendingOwner = owner + "$PendingRecycle";
+        ClassNode pendingNode = read(jar, pendingOwner + ".class");
+        if ((pendingNode.access & Opcodes.ACC_FINAL) == 0 || pendingNode.fields.size() != 2) {
+            throw new IllegalStateException(pendingOwner + " raw class/field shape changed");
+        }
+        FieldNode pendingBuffers = pendingNode.fields.get(0);
+        FieldNode pendingFence = pendingNode.fields.get(1);
+        int privateFinal = Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL;
+        if (!pendingBuffers.name.equals("buffers")
+                || !pendingBuffers.desc.equals("Ljava/util/List;")
+                || pendingBuffers.access != privateFinal
+                || !pendingFence.name.equals("fence")
+                || !pendingFence.desc.equals("Lcom/mojang/blaze3d/buffers/GpuFence;")
+                || pendingFence.access != privateFinal) {
+            throw new IllegalStateException(pendingOwner + " raw fields changed");
+        }
+        MethodNode pendingTryRecycle = find(
+                pendingNode, "tryRecycle", "()Ljava/util/List;");
+        MethodInsnNode pendingAwait = null;
+        for (AbstractInsnNode instruction : pendingTryRecycle.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals("com/mojang/blaze3d/buffers/GpuFence")
+                    && call.name.equals("awaitCompletion")
+                    && call.desc.equals("(J)Z")) {
+                if (pendingAwait != null) {
+                    throw new IllegalStateException(pendingOwner + " has multiple fence waits");
+                }
+                pendingAwait = call;
+            }
+        }
+        AbstractInsnNode awaitTimeout = pendingAwait == null
+                ? null : previousOpcode(pendingAwait);
+        AbstractInsnNode awaitFence = awaitTimeout == null
+                ? null : previousOpcode(awaitTimeout);
+        AbstractInsnNode awaitOwner = awaitFence == null
+                ? null : previousOpcode(awaitFence);
+        AbstractInsnNode awaitBranch = pendingAwait == null ? null : nextOpcode(pendingAwait);
+        if (pendingAwait == null
+                || awaitTimeout == null
+                || awaitTimeout.getOpcode() != Opcodes.LCONST_0
+                || !(awaitFence instanceof FieldInsnNode fenceField)
+                || fenceField.getOpcode() != Opcodes.GETFIELD
+                || !fenceField.owner.equals(pendingOwner)
+                || !fenceField.name.equals("fence")
+                || !(awaitOwner instanceof VarInsnNode ownerLoad)
+                || ownerLoad.getOpcode() != Opcodes.ALOAD
+                || ownerLoad.var != 0
+                || !(awaitBranch instanceof JumpInsnNode branch)
+                || branch.getOpcode() != Opcodes.IFEQ) {
+            throw new IllegalStateException(pendingOwner + " awaitCompletion(0) gate changed");
+        }
+        AbstractInsnNode falseNull = nextOpcode(branch.label);
+        AbstractInsnNode falseReturn = falseNull == null ? null : nextOpcode(falseNull);
+        AbstractInsnNode trueOwner = nextOpcode(branch);
+        AbstractInsnNode trueFence = trueOwner == null ? null : nextOpcode(trueOwner);
+        AbstractInsnNode trueClose = trueFence == null ? null : nextOpcode(trueFence);
+        AbstractInsnNode trueBufferOwner = trueClose == null ? null : nextOpcode(trueClose);
+        AbstractInsnNode trueBuffers = trueBufferOwner == null
+                ? null : nextOpcode(trueBufferOwner);
+        AbstractInsnNode trueReturn = trueBuffers == null ? null : nextOpcode(trueBuffers);
+        if (falseNull == null || falseNull.getOpcode() != Opcodes.ACONST_NULL
+                || falseReturn == null || falseReturn.getOpcode() != Opcodes.ARETURN
+                || !(trueOwner instanceof VarInsnNode trueOwnerLoad)
+                || trueOwnerLoad.getOpcode() != Opcodes.ALOAD || trueOwnerLoad.var != 0
+                || !(trueFence instanceof FieldInsnNode trueFenceField)
+                || !trueFenceField.owner.equals(pendingOwner)
+                || !trueFenceField.name.equals("fence")
+                || !(trueClose instanceof MethodInsnNode closeCall)
+                || !closeCall.owner.equals("com/mojang/blaze3d/buffers/GpuFence")
+                || !closeCall.name.equals("close") || !closeCall.desc.equals("()V")
+                || !(trueBufferOwner instanceof VarInsnNode trueBufferOwnerLoad)
+                || trueBufferOwnerLoad.getOpcode() != Opcodes.ALOAD
+                || trueBufferOwnerLoad.var != 0
+                || !(trueBuffers instanceof FieldInsnNode trueBuffersField)
+                || !trueBuffersField.owner.equals(pendingOwner)
+                || !trueBuffersField.name.equals("buffers")
+                || trueReturn == null || trueReturn.getOpcode() != Opcodes.ARETURN
+                || nextOpcode(falseReturn) != null) {
+            throw new IllegalStateException(
+                    pendingOwner + " false-null/true-close-buffer CFG changed");
+        }
+        MethodNode pendingClose = find(pendingNode, "close", "()V");
+        int pendingCloseForEach = 0;
+        int pendingFenceCloses = 0;
+        int pendingCloseReturns = 0;
+        java.util.List<String> pendingCloseOwnerFields = new java.util.ArrayList<>();
+        for (AbstractInsnNode instruction : pendingClose.instructions.toArray()) {
+            if (instruction instanceof FieldInsnNode closeField
+                    && closeField.getOpcode() == Opcodes.GETFIELD
+                    && closeField.owner.equals(pendingOwner)) {
+                pendingCloseOwnerFields.add(closeField.name);
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.owner.equals("java/util/List")
+                    && call.name.equals("forEach")
+                    && call.desc.equals("(Ljava/util/function/Consumer;)V")) {
+                pendingCloseForEach++;
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.owner.equals("com/mojang/blaze3d/buffers/GpuFence")
+                    && call.name.equals("close") && call.desc.equals("()V")) {
+                pendingFenceCloses++;
+            }
+            if (instruction.getOpcode() == Opcodes.RETURN) {
+                pendingCloseReturns++;
+            }
+        }
+        if (pendingCloseForEach != 1 || pendingFenceCloses != 1
+                || pendingCloseReturns != 1
+                || !pendingCloseOwnerFields.equals(java.util.List.of("buffers", "fence"))) {
+            throw new IllegalStateException(pendingOwner + ".close owner cleanup changed");
+        }
+        if (node.fields.stream().anyMatch(field -> field.name.equals(cacheField))) {
+            throw new IllegalStateException(owner + " already contains " + cacheField);
+        }
+        node.fields.add(new FieldNode(
+                Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL,
+                cacheField,
+                helperDescriptor,
+                null,
+                null));
+
+        MethodNode constructor = find(node, "<init>", "(Ljava/util/function/Supplier;I)V");
+        AbstractInsnNode constructorReturn = null;
+        int constructorReturns = 0;
+        for (AbstractInsnNode instruction : constructor.instructions.toArray()) {
+            if (instruction.getOpcode() == Opcodes.RETURN) {
+                constructorReturn = instruction;
+                constructorReturns++;
+            }
+        }
+        if (constructorReturns != 1) {
+            throw new IllegalStateException(
+                    owner + " constructor return shape changed: " + constructorReturns);
+        }
+        InsnList initializeCache = new InsnList();
+        initializeCache.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        initializeCache.add(new TypeInsnNode(Opcodes.NEW, helper));
+        initializeCache.add(new InsnNode(Opcodes.DUP));
+        initializeCache.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        initializeCache.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "available", "Ljava/util/List;"));
+        initializeCache.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        initializeCache.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "label", "Ljava/util/function/Supplier;"));
+        initializeCache.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        initializeCache.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "usage", "I"));
+        initializeCache.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                helper,
+                "<init>",
+                "(Ljava/util/List;Ljava/util/function/Supplier;I)V",
+                false));
+        initializeCache.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, cacheField, helperDescriptor));
+        constructor.instructions.insertBefore(constructorReturn, initializeCache);
+
+        MethodNode acquire = find(
+                node,
+                "acquire",
+                "(Lcom/mojang/blaze3d/systems/GpuDevice;I)L" + buffer + ";");
+        MethodInsnNode roundToward = null;
+        MethodInsnNode rawTakeBest = null;
+        for (AbstractInsnNode instruction : acquire.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("net/minecraft/util/Mth")
+                    && call.name.equals("roundToward")
+                    && call.desc.equals("(II)I")) {
+                if (roundToward != null) {
+                    throw new IllegalStateException(owner + ".acquire has multiple roundToward calls");
+                }
+                roundToward = call;
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                    && call.owner.equals(owner)
+                    && call.name.equals("takeBestAvailable")
+                    && call.desc.equals("(II)L" + buffer + ";")) {
+                if (rawTakeBest != null) {
+                    throw new IllegalStateException(owner + ".acquire has multiple takeBest calls");
+                }
+                rawTakeBest = call;
+            }
+        }
+        AbstractInsnNode roundIncrement = roundToward == null
+                ? null : previousOpcode(roundToward);
+        AbstractInsnNode roundRequest = roundIncrement == null
+                ? null : previousOpcode(roundIncrement);
+        AbstractInsnNode roundedStore = roundToward == null ? null : nextOpcode(roundToward);
+        AbstractInsnNode maximumMultiply = rawTakeBest == null
+                ? null : previousOpcode(rawTakeBest);
+        AbstractInsnNode maximumFactor = maximumMultiply == null
+                ? null : previousOpcode(maximumMultiply);
+        AbstractInsnNode maximumMinimum = maximumFactor == null
+                ? null : previousOpcode(maximumFactor);
+        AbstractInsnNode minimumLoad = maximumMinimum == null
+                ? null : previousOpcode(maximumMinimum);
+        AbstractInsnNode takeBestOwner = minimumLoad == null
+                ? null : previousOpcode(minimumLoad);
+        if (!(roundIncrement instanceof LdcInsnNode increment)
+                || !Integer.valueOf(262144).equals(increment.cst)
+                || !(roundRequest instanceof VarInsnNode requestLoad)
+                || requestLoad.getOpcode() != Opcodes.ILOAD || requestLoad.var != 2
+                || !(roundedStore instanceof VarInsnNode rounded)
+                || rounded.getOpcode() != Opcodes.ISTORE || rounded.var != 3
+                || maximumMultiply == null || maximumMultiply.getOpcode() != Opcodes.IMUL
+                || maximumFactor == null || maximumFactor.getOpcode() != Opcodes.ICONST_4
+                || !(maximumMinimum instanceof VarInsnNode maximumMinimumLoad)
+                || maximumMinimumLoad.getOpcode() != Opcodes.ILOAD
+                || maximumMinimumLoad.var != 3
+                || !(minimumLoad instanceof VarInsnNode minimumValueLoad)
+                || minimumValueLoad.getOpcode() != Opcodes.ILOAD || minimumValueLoad.var != 3
+                || !(takeBestOwner instanceof VarInsnNode takeBestOwnerLoad)
+                || takeBestOwnerLoad.getOpcode() != Opcodes.ALOAD || takeBestOwnerLoad.var != 0) {
+            throw new IllegalStateException(
+                    owner + ".acquire 262144 rounding/minimum*4 comparator shape changed");
+        }
+        AbstractInsnNode acquireStart = acquire.instructions.getFirst();
+        while (acquireStart != null && acquireStart.getOpcode() < 0) {
+            acquireStart = acquireStart.getNext();
+        }
+        if (acquireStart == null) {
+            throw new IllegalStateException(owner + ".acquire has no executable instructions");
+        }
+        InsnList beforeAcquire = new InsnList();
+        beforeAcquire.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        beforeAcquire.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, cacheField, helperDescriptor));
+        beforeAcquire.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, helper, "beforeAcquire", "()V", false));
+        acquire.instructions.insertBefore(acquireStart, beforeAcquire);
+
+        InsnList afterRecycleSweep = new InsnList();
+        afterRecycleSweep.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        afterRecycleSweep.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, cacheField, helperDescriptor));
+        afterRecycleSweep.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        afterRecycleSweep.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                helper,
+                "afterRecycleSweep",
+                "(I)V",
+                false));
+        acquire.instructions.insert(roundedStore, afterRecycleSweep);
+
+        MethodInsnNode createBuffer = null;
+        MethodInsnNode usedAdd = null;
+        for (AbstractInsnNode instruction : acquire.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.owner.equals("com/mojang/blaze3d/systems/GpuDevice")
+                    && call.name.equals("createBuffer")
+                    && call.desc.equals(
+                    "(Ljava/util/function/Supplier;IJ)L" + buffer + ";")) {
+                if (createBuffer != null) {
+                    throw new IllegalStateException(owner + ".acquire has multiple createBuffer calls");
+                }
+                createBuffer = call;
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals("java/util/List")
+                    && call.name.equals("add")
+                    && call.desc.equals("(Ljava/lang/Object;)Z")) {
+                AbstractInsnNode value = previousOpcode(call);
+                AbstractInsnNode field = value == null ? null : previousOpcode(value);
+                if (field instanceof FieldInsnNode ownerField
+                        && ownerField.owner.equals(owner)
+                        && ownerField.name.equals("usedThisFrame")) {
+                    if (usedAdd != null) {
+                        throw new IllegalStateException(owner + ".acquire has multiple used-list adds");
+                    }
+                    usedAdd = call;
+                }
+            }
+        }
+        if (createBuffer == null || usedAdd == null) {
+            throw new IllegalStateException(owner + ".acquire creation/use shape changed");
+        }
+        AbstractInsnNode createdStore = nextOpcode(createBuffer);
+        if (!(createdStore instanceof VarInsnNode store)
+                || store.getOpcode() != Opcodes.ASTORE
+                || store.var != 4) {
+            throw new IllegalStateException(owner + ".acquire create result local changed");
+        }
+        InsnList recordCreate = new InsnList();
+        recordCreate.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        recordCreate.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, cacheField, helperDescriptor));
+        recordCreate.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        recordCreate.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                helper,
+                "recordCreate",
+                "(L" + buffer + ";)V",
+                false));
+        acquire.instructions.insert(createdStore, recordCreate);
+
+        AbstractInsnNode usedAddPop = nextOpcode(usedAdd);
+        if (usedAddPop == null || usedAddPop.getOpcode() != Opcodes.POP) {
+            throw new IllegalStateException(owner + ".acquire used-list add no longer discards boolean");
+        }
+        AbstractInsnNode acquireReturn = nextOpcode(usedAddPop);
+        if (!(acquireReturn instanceof VarInsnNode load)
+                || load.getOpcode() != Opcodes.ALOAD
+                || load.var != 4
+                || nextOpcode(acquireReturn) == null
+                || nextOpcode(acquireReturn).getOpcode() != Opcodes.ARETURN) {
+            throw new IllegalStateException(owner + ".acquire return shape changed");
+        }
+        InsnList afterAcquire = new InsnList();
+        afterAcquire.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        afterAcquire.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, cacheField, helperDescriptor));
+        afterAcquire.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        afterAcquire.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        afterAcquire.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                helper,
+                "afterAcquire",
+                "(L" + buffer + ";I)V",
+                false));
+        acquire.instructions.insert(usedAddPop, afterAcquire);
+
+        MethodNode recycleLambda = null;
+        for (MethodNode method : node.methods) {
+            for (AbstractInsnNode instruction : method.instructions.toArray()) {
+                if (instruction instanceof MethodInsnNode call
+                        && call.owner.equals(owner + "$PendingRecycle")
+                        && call.name.equals("tryRecycle")
+                        && call.desc.equals("()Ljava/util/List;")) {
+                    if (recycleLambda != null && recycleLambda != method) {
+                        throw new IllegalStateException(owner + " has multiple recycle lambdas");
+                    }
+                    recycleLambda = method;
+                }
+            }
+        }
+        if (recycleLambda == null || !recycleLambda.desc.endsWith(")Z")) {
+            throw new IllegalStateException(owner + " recycle lambda shape changed");
+        }
+        VarInsnNode recycledStore = null;
+        MethodInsnNode addAll = null;
+        for (AbstractInsnNode instruction : recycleLambda.instructions.toArray()) {
+            if (instruction instanceof VarInsnNode variable
+                    && variable.getOpcode() == Opcodes.ASTORE
+                    && variable.var == 2) {
+                if (recycledStore != null) {
+                    throw new IllegalStateException(owner + " recycle result local stored twice");
+                }
+                recycledStore = variable;
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals("java/util/List")
+                    && call.name.equals("addAll")
+                    && call.desc.equals("(Ljava/util/Collection;)Z")) {
+                if (addAll != null) {
+                    throw new IllegalStateException(owner + " recycle lambda has multiple addAll calls");
+                }
+                addAll = call;
+            }
+        }
+        if (recycledStore == null || addAll == null) {
+            throw new IllegalStateException(owner + " recycle lambda result/addAll shape changed");
+        }
+        InsnList recycleResult = new InsnList();
+        recycleResult.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        recycleResult.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, cacheField, helperDescriptor));
+        recycleResult.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        recycleResult.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                helper,
+                "recycleResult",
+                "(Ljava/util/List;)V",
+                false));
+        recycleLambda.instructions.insert(recycledStore, recycleResult);
+
+        AbstractInsnNode addAllValue = previousOpcode(addAll);
+        AbstractInsnNode addAllField = addAllValue == null ? null : previousOpcode(addAllValue);
+        AbstractInsnNode addAllOwner = addAllField == null ? null : previousOpcode(addAllField);
+        AbstractInsnNode addAllPop = nextOpcode(addAll);
+        if (!(addAllValue instanceof VarInsnNode valueLoad)
+                || valueLoad.getOpcode() != Opcodes.ALOAD
+                || valueLoad.var != 2
+                || !(addAllField instanceof FieldInsnNode field)
+                || field.getOpcode() != Opcodes.GETFIELD
+                || !field.owner.equals(owner)
+                || !field.name.equals("available")
+                || !(addAllOwner instanceof VarInsnNode addAllOwnerLoad)
+                || addAllOwnerLoad.getOpcode() != Opcodes.ALOAD
+                || addAllOwnerLoad.var != 0
+                || addAllPop == null
+                || addAllPop.getOpcode() != Opcodes.POP) {
+            throw new IllegalStateException(owner + " recycle available.addAll stack shape changed");
+        }
+        recycleLambda.instructions.remove(addAllOwner);
+        recycleLambda.instructions.remove(addAllField);
+        recycleLambda.instructions.remove(addAllValue);
+        recycleLambda.instructions.remove(addAll);
+        recycleLambda.instructions.remove(addAllPop);
+
+        MethodNode takeBest = find(node, "takeBestAvailable", "(II)L" + buffer + ";");
+        int removePatches = 0;
+        for (AbstractInsnNode instruction : takeBest.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKEINTERFACE
+                    || !call.owner.equals("java/util/List")
+                    || !call.name.equals("remove")
+                    || !call.desc.equals("(I)Ljava/lang/Object;")) {
+                continue;
+            }
+            AbstractInsnNode indexLoad = previousOpcode(call);
+            AbstractInsnNode listField = indexLoad == null ? null : previousOpcode(indexLoad);
+            if (!(listField instanceof FieldInsnNode takeBestField)
+                    || takeBestField.getOpcode() != Opcodes.GETFIELD
+                    || !takeBestField.owner.equals(owner)
+                    || !takeBestField.name.equals("available")) {
+                throw new IllegalStateException(owner + ".takeBestAvailable remove receiver changed");
+            }
+            takeBestField.name = cacheField;
+            takeBestField.desc = helperDescriptor;
+            call.setOpcode(Opcodes.INVOKEVIRTUAL);
+            call.owner = helper;
+            call.name = "removeAt";
+            call.desc = "(I)L" + buffer + ";";
+            call.itf = false;
+            removePatches++;
+        }
+        if (removePatches != 2) {
+            throw new IllegalStateException(
+                    owner + ".takeBestAvailable remove count changed: " + removePatches);
+        }
+
+        MethodNode endFrame = find(
+                node, "endFrame", "(Lcom/mojang/blaze3d/systems/GpuDevice;)V");
+        java.util.List<FieldInsnNode> endFrameAvailable = new java.util.ArrayList<>();
+        java.util.List<String> endFrameOwnerFields = new java.util.ArrayList<>();
+        int pendingAdds = 0;
+        int usedClears = 0;
+        int rawEndFrameReturns = 0;
+        for (AbstractInsnNode instruction : endFrame.instructions.toArray()) {
+            if (instruction instanceof FieldInsnNode endFrameField
+                    && endFrameField.getOpcode() == Opcodes.GETFIELD
+                    && endFrameField.owner.equals(owner)) {
+                endFrameOwnerFields.add(endFrameField.name);
+                if (endFrameField.name.equals("available")) {
+                    endFrameAvailable.add(endFrameField);
+                }
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals("java/util/List")
+                    && call.name.equals("add")
+                    && call.desc.equals("(Ljava/lang/Object;)Z")) {
+                pendingAdds++;
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals("java/util/List")
+                    && call.name.equals("clear")
+                    && call.desc.equals("()V")) {
+                usedClears++;
+            }
+            if (instruction.getOpcode() == Opcodes.RETURN) {
+                rawEndFrameReturns++;
+            }
+        }
+        java.util.List<String> expectedEndFrameFields = java.util.List.of(
+                "usedThisFrame", "pendingRecycle", "usedThisFrame", "usedThisFrame",
+                "available", "available", "available");
+        if (endFrameAvailable.size() != 3
+                || pendingAdds != 1
+                || usedClears != 2
+                || rawEndFrameReturns != 1
+                || !endFrameOwnerFields.equals(expectedEndFrameFields)) {
+            throw new IllegalStateException(
+                    owner + ".endFrame available/pending shape changed: available="
+                            + endFrameAvailable.size() + ", adds=" + pendingAdds
+                            + ", clears=" + usedClears + ", fields=" + endFrameOwnerFields
+                            + ", returns=" + rawEndFrameReturns);
+        }
+        AbstractInsnNode availableBlockStart = previousOpcode(endFrameAvailable.get(0));
+        AbstractInsnNode availableIsEmpty = nextOpcode(endFrameAvailable.get(0));
+        AbstractInsnNode availableBranch = availableIsEmpty == null
+                ? null : nextOpcode(availableIsEmpty);
+        AbstractInsnNode availableForEachOwner = availableBranch == null
+                ? null : nextOpcode(availableBranch);
+        AbstractInsnNode availableForEachField = availableForEachOwner == null
+                ? null : nextOpcode(availableForEachOwner);
+        AbstractInsnNode availableConsumer = availableForEachField == null
+                ? null : nextOpcode(availableForEachField);
+        AbstractInsnNode availableForEach = availableConsumer == null
+                ? null : nextOpcode(availableConsumer);
+        AbstractInsnNode availableClearOwner = availableForEach == null
+                ? null : nextOpcode(availableForEach);
+        FieldInsnNode finalAvailableField = endFrameAvailable.get(endFrameAvailable.size() - 1);
+        AbstractInsnNode availableClear = nextOpcode(finalAvailableField);
+        AbstractInsnNode afterAvailableClear = availableClear == null
+                ? null : nextOpcode(availableClear);
+        if (!(availableBlockStart instanceof VarInsnNode startLoad)
+                || startLoad.getOpcode() != Opcodes.ALOAD
+                || startLoad.var != 0
+                || !(availableIsEmpty instanceof MethodInsnNode isEmptyCall)
+                || isEmptyCall.getOpcode() != Opcodes.INVOKEINTERFACE
+                || !isEmptyCall.owner.equals("java/util/List")
+                || !isEmptyCall.name.equals("isEmpty")
+                || !isEmptyCall.desc.equals("()Z")
+                || !(availableBranch instanceof JumpInsnNode emptyBranch)
+                || emptyBranch.getOpcode() != Opcodes.IFNE
+                || !(availableForEachOwner instanceof VarInsnNode forEachOwnerLoad)
+                || forEachOwnerLoad.getOpcode() != Opcodes.ALOAD
+                || forEachOwnerLoad.var != 0
+                || availableForEachField != endFrameAvailable.get(1)
+                || !(availableConsumer instanceof InvokeDynamicInsnNode)
+                || !(availableForEach instanceof MethodInsnNode forEachCall)
+                || forEachCall.getOpcode() != Opcodes.INVOKEINTERFACE
+                || !forEachCall.owner.equals("java/util/List")
+                || !forEachCall.name.equals("forEach")
+                || !forEachCall.desc.equals("(Ljava/util/function/Consumer;)V")
+                || !(availableClearOwner instanceof VarInsnNode clearOwnerLoad)
+                || clearOwnerLoad.getOpcode() != Opcodes.ALOAD
+                || clearOwnerLoad.var != 0
+                || finalAvailableField != nextOpcode(availableClearOwner)
+                || !(availableClear instanceof MethodInsnNode clearCall)
+                || clearCall.getOpcode() != Opcodes.INVOKEINTERFACE
+                || !clearCall.owner.equals("java/util/List")
+                || !clearCall.name.equals("clear")
+                || !clearCall.desc.equals("()V")
+                || afterAvailableClear == null
+                || afterAvailableClear.getOpcode() != Opcodes.RETURN
+                || nextOpcode(emptyBranch.label) != afterAvailableClear) {
+            throw new IllegalStateException(owner + ".endFrame available close/clear block changed");
+        }
+        AbstractInsnNode afterAvailableBlock = availableClear.getNext();
+        for (AbstractInsnNode cursor = availableBlockStart; cursor != afterAvailableBlock; ) {
+            AbstractInsnNode next = cursor.getNext();
+            endFrame.instructions.remove(cursor);
+            cursor = next;
+        }
+        AbstractInsnNode endFrameReturn = null;
+        int endFrameReturns = 0;
+        for (AbstractInsnNode instruction : endFrame.instructions.toArray()) {
+            if (instruction.getOpcode() == Opcodes.RETURN) {
+                endFrameReturn = instruction;
+                endFrameReturns++;
+            }
+        }
+        if (endFrameReturns != 1) {
+            throw new IllegalStateException(owner + ".endFrame return shape changed");
+        }
+        InsnList retainAvailable = new InsnList();
+        retainAvailable.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        retainAvailable.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, cacheField, helperDescriptor));
+        retainAvailable.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        retainAvailable.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "pendingRecycle", "Ljava/util/List;"));
+        retainAvailable.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE, "java/util/List", "size", "()I", true));
+        retainAvailable.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, helper, "endFrame", "(I)V", false));
+        endFrame.instructions.insertBefore(endFrameReturn, retainAvailable);
+
+        MethodNode close = find(node, "close", "()V");
+        int closeForEach = 0;
+        int closeClears = 0;
+        AbstractInsnNode closeReturn = null;
+        java.util.List<String> closeOwnerFields = new java.util.ArrayList<>();
+        for (AbstractInsnNode instruction : close.instructions.toArray()) {
+            if (instruction instanceof FieldInsnNode closeField
+                    && closeField.getOpcode() == Opcodes.GETFIELD
+                    && closeField.owner.equals(owner)) {
+                closeOwnerFields.add(closeField.name);
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals("java/util/List")
+                    && call.name.equals("forEach")
+                    && call.desc.equals("(Ljava/util/function/Consumer;)V")) {
+                closeForEach++;
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals("java/util/List")
+                    && call.name.equals("clear")
+                    && call.desc.equals("()V")) {
+                closeClears++;
+            }
+            if (instruction.getOpcode() == Opcodes.RETURN) {
+                if (closeReturn != null) {
+                    throw new IllegalStateException(owner + ".close has multiple returns");
+                }
+                closeReturn = instruction;
+            }
+        }
+        java.util.List<String> expectedCloseFields = java.util.List.of(
+                "available", "usedThisFrame", "pendingRecycle",
+                "available", "usedThisFrame", "pendingRecycle");
+        if (closeForEach != 3
+                || closeClears != 3
+                || closeReturn == null
+                || !closeOwnerFields.equals(expectedCloseFields)) {
+            throw new IllegalStateException(
+                    owner + ".close owner cleanup shape changed: forEach=" + closeForEach
+                            + ", clears=" + closeClears + ", fields=" + closeOwnerFields);
+        }
+        InsnList ownerClosed = new InsnList();
+        ownerClosed.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        ownerClosed.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, cacheField, helperDescriptor));
+        ownerClosed.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, helper, "ownerClosed", "()V", false));
+        close.instructions.insertBefore(closeReturn, ownerClosed);
+
+        writeComputeFrames(node, output);
+        System.out.println(
+                "Instrumented 26.2 StagedVertexBuffer GPU pool cache: count=4 bytes=1048576 idle=3");
     }
 
     private static void patchGlDevice(String jar, Path outputRoot) throws IOException {
@@ -6604,8 +7429,8 @@ public final class MinecraftClientPatcher {
                         + "Lnet/minecraft/client/renderer/RenderBuffers;"
                         + "Lnet/minecraft/client/renderer/chunk/SectionCompiler;"
                         + "Ljava/util/function/Consumer;)V");
-        int vertexHeap = 0;
-        int indexHeap = 0;
+        int constructorVertexHeap = 0;
+        int constructorIndexHeap = 0;
         int staging = 0;
         for (AbstractInsnNode instruction : constructor.instructions.toArray()) {
             if (!(instruction instanceof LdcInsnNode constant)
@@ -6614,19 +7439,120 @@ public final class MinecraftClientPatcher {
             }
             if (value == 134217728) {
                 constant.cst = BROWSER_SECTION_VERTEX_HEAP_BYTES;
-                vertexHeap++;
+                constructorVertexHeap++;
             } else if (value == 33554432) {
                 constant.cst = BROWSER_SECTION_INDEX_HEAP_BYTES;
-                indexHeap++;
+                constructorIndexHeap++;
             } else if (value == 102760448) {
                 constant.cst = BROWSER_SECTION_STAGING_BYTES;
                 staging++;
             }
         }
-        if (vertexHeap != 1 || indexHeap != 1 || staging != 2) {
+        if (constructorVertexHeap != 1 || constructorIndexHeap != 1 || staging != 2) {
             throw new IllegalStateException(
-                    "Current section renderer buffer budget constants changed: vertex="
-                            + vertexHeap + ", index=" + indexHeap + ", staging=" + staging);
+                    "Current section renderer constructor budget constants changed: vertex="
+                            + constructorVertexHeap + ", index=" + constructorIndexHeap
+                            + ", staging=" + staging);
+        }
+
+        String uberOwner = "com/mojang/blaze3d/vertex/UberGpuBuffer";
+        String uberConstructorDescriptor =
+                "(Ljava/lang/String;IIILcom/mojang/blaze3d/vertex/StagingBuffer;)V";
+        MethodNode heapFactory = find(
+                node,
+                "lambda$new$0",
+                "(Lnet/minecraft/client/renderer/chunk/ChunkSectionLayer;)"
+                        + "Lnet/minecraft/client/renderer/chunk/"
+                        + "SectionRenderDispatcher$SectionUberBuffers;");
+        int uberConstructors = 0;
+        int vertexHeap = 0;
+        int indexHeap = 0;
+        for (AbstractInsnNode instruction : heapFactory.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKESPECIAL
+                    || !call.owner.equals(uberOwner)
+                    || !call.name.equals("<init>")
+                    || !call.desc.equals(uberConstructorDescriptor)) {
+                continue;
+            }
+            uberConstructors++;
+            AbstractInsnNode allocation = findPreviousNew(call, uberOwner);
+            java.util.List<AbstractInsnNode> shape = new java.util.ArrayList<>();
+            for (AbstractInsnNode cursor = allocation;
+                    cursor != null;
+                    cursor = nextOpcode(cursor)) {
+                shape.add(cursor);
+                if (cursor == call) {
+                    break;
+                }
+            }
+            AbstractInsnNode stagingLoad = previousOpcode(call);
+            AbstractInsnNode dispatcherLoad = stagingLoad == null
+                    ? null : previousOpcode(stagingLoad);
+            if ((shape.size() != 10 && shape.size() != 11)
+                    || shape.get(shape.size() - 1) != call
+                    || !(shape.get(0) instanceof TypeInsnNode allocationType)
+                    || allocationType.getOpcode() != Opcodes.NEW
+                    || !allocationType.desc.equals(uberOwner)
+                    || shape.get(1).getOpcode() != Opcodes.DUP
+                    || !(shape.get(2) instanceof VarInsnNode layerLoad)
+                    || layerLoad.getOpcode() != Opcodes.ALOAD
+                    || layerLoad.var != 1
+                    || !(shape.get(3) instanceof MethodInsnNode labelCall)
+                    || labelCall.getOpcode() != Opcodes.INVOKEVIRTUAL
+                    || !labelCall.owner.equals(
+                            "net/minecraft/client/renderer/chunk/ChunkSectionLayer")
+                    || !labelCall.name.equals("label")
+                    || !labelCall.desc.equals("()Ljava/lang/String;")
+                    || !(shape.get(4) instanceof IntInsnNode usage)
+                    || usage.getOpcode() != Opcodes.BIPUSH
+                    || !(shape.get(5) instanceof LdcInsnNode capacity)
+                    || !(capacity.cst instanceof Integer)
+                    || !(dispatcherLoad instanceof VarInsnNode dispatcherOwnerLoad)
+                    || dispatcherOwnerLoad.getOpcode() != Opcodes.ALOAD
+                    || dispatcherOwnerLoad.var != 0
+                    || !(stagingLoad instanceof FieldInsnNode stagingField)
+                    || stagingField.getOpcode() != Opcodes.GETFIELD
+                    || !stagingField.owner.equals(node.name)
+                    || !stagingField.name.equals("stagingBuffer")
+                    || !stagingField.desc.equals(
+                            "Lcom/mojang/blaze3d/vertex/StagingBuffer;")) {
+                throw new IllegalStateException(
+                        "Current section renderer lambda UberGpuBuffer constructor shape changed");
+            }
+            if (usage.operand == 32
+                    && shape.size() == 11
+                    && Integer.valueOf(134217728).equals(capacity.cst)
+                    && shape.get(6) instanceof VarInsnNode vertexFormatLoad
+                    && vertexFormatLoad.getOpcode() == Opcodes.ALOAD
+                    && vertexFormatLoad.var == 2
+                    && shape.get(7) instanceof MethodInsnNode vertexSizeCall
+                    && vertexSizeCall.getOpcode() == Opcodes.INVOKEVIRTUAL
+                    && vertexSizeCall.owner.equals("com/mojang/blaze3d/vertex/VertexFormat")
+                    && vertexSizeCall.name.equals("getVertexSize")
+                    && vertexSizeCall.desc.equals("()I")) {
+                capacity.cst = BROWSER_SECTION_VERTEX_HEAP_BYTES;
+                vertexHeap++;
+            } else if (usage.operand == 64
+                    && shape.size() == 10
+                    && Integer.valueOf(33554432).equals(capacity.cst)
+                    && shape.get(6) instanceof IntInsnNode indexStride
+                    && indexStride.getOpcode() == Opcodes.BIPUSH
+                    && indexStride.operand == 8
+                    && shape.get(7) == dispatcherLoad) {
+                capacity.cst = BROWSER_SECTION_INDEX_HEAP_BYTES;
+                indexHeap++;
+            } else {
+                throw new IllegalStateException(
+                        "Current section renderer lambda UberGpuBuffer usage changed: "
+                                + usage.operand + "/" + capacity.cst);
+            }
+        }
+        if (uberConstructors != 2 || vertexHeap != 1 || indexHeap != 1) {
+            throw new IllegalStateException(
+                    "Current section renderer lambda heap budgets changed: constructors="
+                            + uberConstructors + ", vertex=" + vertexHeap
+                            + ", index=" + indexHeap);
         }
         System.out.println("Reduced current section renderer browser allocation units");
     }
@@ -10551,14 +11477,6 @@ public final class MinecraftClientPatcher {
         writeComputeFrames(node, output);
     }
 
-    /**
-     * Browser WebSocket callbacks already share the client page's event loop. Treating them as
-     * foreign Java threads makes configuration packets requeue forever while a resource reload
-     * owns the normal client tick. Inline the configuration listener, the payloadless PLAY packet
-     * that enters configuration, and the PLAY login packet that creates the replacement level
-     * after configuration completes. Ordinary game packets stay queued so terrain handling is
-     * still sliced by the client tick.
-     */
     private static boolean allExactlyOne(int[] values) {
         for (int value : values) {
             if (value != 1) {
@@ -10567,6 +11485,7 @@ public final class MinecraftClientPatcher {
         }
         return true;
     }
+
     private static String counts(int[] values) {
         StringBuilder result = new StringBuilder("[");
         for (int index = 0; index < values.length; index++) {
@@ -10578,6 +11497,18 @@ public final class MinecraftClientPatcher {
         return result.append(']').toString();
     }
 
+    /**
+     * Browser WebSocket callbacks already share the client page's event loop. Treating
+     * configuration packets as foreign Java threads makes them requeue forever while a resource
+     * reload owns the normal client tick, but treating PLAY packets as same-thread lets chunk and
+     * entity handlers monopolize the decoder turn. Inline configuration transitions and the
+     * small common-control handlers whose ordering/liveness contract is independent of terrain.
+     * Force ordinary ClientPacketListener traffic through PacketProcessor even when its Java
+     * thread identity matches, so the bounded client-tick packet slice is the authoritative PLAY
+     * work queue. The drain guard is mandatory: a queued ListenerAndPacket re-enters this method
+     * and must return from this thread check so the enclosing packet handler continues without
+     * consulting a Java thread identity that has no useful meaning in TeaVM.
+     */
     private static void patchClientPacketUtilsBrowserInline(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "net/minecraft/network/protocol/PacketUtils.class");
         MethodNode method = find(node, "ensureRunningOnSameThread",
@@ -13782,6 +14713,24 @@ public final class MinecraftClientPatcher {
                 false);
     }
 
+    private static MethodInsnNode browserWorldgenMobAiPulse() {
+        return new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserWorldgenScheduler",
+                "mobAiPulse",
+                "()V",
+                false);
+    }
+
+    private static MethodInsnNode browserWorldgenMobEntityPulse() {
+        return new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserWorldgenScheduler",
+                "mobEntityPulse",
+                "(Ljava/lang/Object;)V",
+                false);
+    }
+
     /**
      * Instruments a task-layer entry without touching the deep synchronous
      * worldgen methods.  Normal returns are explicit so the scope closes before
@@ -16070,6 +17019,118 @@ public final class MinecraftClientPatcher {
             throw new IllegalStateException("MinecraftServer browser patch points were not found");
         }
         writeComputeFrames(node, output);
+    }
+
+    /**
+     * Keeps the vanilla Mob.serverAiStep ordering intact while making each
+     * expensive AI stage yieldable on the browser Worker.  Vanilla calls the
+     * two selector variants in mutually exclusive branches, so there are seven
+     * stable stage boundaries in the method: sensing, four selector calls,
+     * navigation, and custom mob AI.  The hook is deliberately inserted after
+     * each call; no goal is skipped, reordered, or executed on another thread.
+     */
+    private static void patchMobBrowserAiCooperation(String jar, Path output)
+            throws IOException {
+        String owner = "net/minecraft/world/entity/Mob";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode method = find(node, "serverAiStep", "()V");
+        int checkpoints = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKEVIRTUAL) {
+                continue;
+            }
+            boolean stage = (call.owner.equals(
+                    "net/minecraft/world/entity/ai/sensing/Sensing")
+                    && call.name.equals("tick")
+                    && call.desc.equals("()V"))
+                    || (call.owner.equals("net/minecraft/world/entity/ai/goal/GoalSelector")
+                    && ((call.name.equals("tick") && call.desc.equals("()V"))
+                    || (call.name.equals("tickRunningGoals")
+                    && call.desc.equals("(Z)V"))))
+                    || (call.owner.equals(
+                    "net/minecraft/world/entity/ai/navigation/PathNavigation")
+                    && call.name.equals("tick")
+                    && call.desc.equals("()V"))
+                    || (call.owner.equals(owner)
+                    && call.name.equals("customServerAiStep")
+                    && call.desc.equals(
+                    "(Lnet/minecraft/server/level/ServerLevel;)V"));
+            if (stage) {
+                method.instructions.insert(call, browserWorldgenMobAiPulse());
+                checkpoints++;
+            }
+        }
+        if (checkpoints != 7) {
+            throw new IllegalStateException(
+                    "Mob.serverAiStep AI stage shape changed: " + checkpoints
+                            + " (expected 7 checkpoints)");
+        }
+        // TeaVM can legitimately prove the protected serverAiStep body
+        // unreachable in a server-only entrypoint even though the class is
+        // present in the shared client-named jar.  Keep one explicit
+        // boundary at Mob.aiStep as well: this is the method reached from
+        // LivingEntity.tick for every live mob, and it gives the Worker a
+        // cooperative turn boundary even when the optimizer folds the
+        // inner serverAiStep method.  The two calls sit immediately around
+        // the vanilla super call, so no AI stage is reordered or skipped.
+        MethodNode aiStep = find(node, "aiStep", "()V");
+        MethodInsnNode livingAiStep = null;
+        for (AbstractInsnNode instruction : aiStep.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESPECIAL
+                    && call.owner.equals("net/minecraft/world/entity/LivingEntity")
+                    && call.name.equals("aiStep")
+                    && call.desc.equals("()V")) {
+                if (livingAiStep != null) {
+                    throw new IllegalStateException(
+                            "Mob.aiStep super-call shape changed: multiple LivingEntity.aiStep calls");
+                }
+                livingAiStep = call;
+            }
+        }
+        if (livingAiStep == null) {
+            throw new IllegalStateException(
+                    "Mob.aiStep super-call shape changed: LivingEntity.aiStep not found");
+        }
+        aiStep.instructions.insertBefore(livingAiStep, browserWorldgenMobAiPulse());
+        aiStep.instructions.insert(livingAiStep, browserWorldgenMobAiPulse());
+
+        // Mob.aiStep and Mob.tick overrides can both be folded out of a
+        // server-only TeaVM entry point.  LivingEntity.tick is the common
+        // live-entity boundary, so use a typed fallback there and keep the
+        // Mob-specific hook out of the hot override.  The guard in
+        // mobEntityPulse() excludes players and other non-Mob entities.
+        String livingOwner = "net/minecraft/world/entity/LivingEntity";
+        ClassNode livingNode = read(jar, livingOwner + ".class");
+        MethodNode livingTickMethod = find(livingNode, "tick", "()V");
+        MethodInsnNode entityTick = null;
+        for (AbstractInsnNode instruction : livingTickMethod.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESPECIAL
+                    && call.owner.equals("net/minecraft/world/entity/Entity")
+                    && call.name.equals("tick")
+                    && call.desc.equals("()V")) {
+                if (entityTick != null) {
+                    throw new IllegalStateException(
+                            "LivingEntity.tick super-call shape changed: multiple Entity.tick calls");
+                }
+                entityTick = call;
+            }
+        }
+        if (entityTick == null) {
+            throw new IllegalStateException(
+                    "LivingEntity.tick super-call shape changed: Entity.tick not found");
+        }
+        InsnList entity = new InsnList();
+        entity.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        entity.add(browserWorldgenMobEntityPulse());
+        livingTickMethod.instructions.insert(entityTick, entity);
+        writeComputeFrames(livingNode, output.resolveSibling("LivingEntity.class"));
+        writeComputeFrames(node, output);
+        System.out.println(
+                "Instrumented Mob.serverAiStep browser AI checkpoints=" + checkpoints
+                        + ", Mob.aiStep boundaries=2, LivingEntity.tick Mob fallback=1");
     }
 
     private static void patchPlayerSpawnFinderBrowser(String jar, Path output)

@@ -30,8 +30,17 @@ assert(typeof relayUrl === "string" && relayUrl.length > 0,
 const relayHostname = new URL(relayUrl).hostname;
 const relayAddress = process.env.GAIUS_PUBLIC_RELAY_EDGE_IP
     ?? await syntheticDnsFallback(relayHostname, timeoutMs);
+// A diagnostic edge-IP URL can sit behind a virtual-host proxy.  Keep the
+// transport address in the URL while allowing the caller to supply the
+// canonical HTTP/WebSocket Host header used by that proxy.  The default is
+// the URL hostname, so normal DNS/TLS behavior is unchanged.
+const relayHostHeader = process.env.GAIUS_PUBLIC_RELAY_HOST_HEADER
+    ?? new URL(relayUrl).host;
+assert(typeof relayHostHeader === "string" && relayHostHeader.trim().length > 0,
+    "GAIUS_PUBLIC_RELAY_HOST_HEADER must be non-empty when supplied");
 const manifestUrl = relayManifestUrl(relayUrl, target);
-const before = await fetchManifest(manifestUrl, origin, timeoutMs, relayAddress);
+const before = await fetchManifest(
+    manifestUrl, origin, timeoutMs, relayAddress, relayHostHeader);
 assert(before.ok === true && before.protocolVersion === 1,
     "public RelayNode manifest is incompatible");
 assert(before.requiresToken === false,
@@ -44,7 +53,8 @@ assert(before.availableConnections > 0,
     "public RelayNode has no available tunnel capacity");
 
 const beforeActive = before.target?.activeConnections ?? 0;
-const webSocket = await openRelay(relayUrl, origin, timeoutMs, relayAddress);
+const webSocket = await openRelay(
+    relayUrl, origin, timeoutMs, relayAddress, relayHostHeader);
 const controls = [];
 let during;
 let connectedControl;
@@ -119,7 +129,8 @@ const status = await new Promise((resolve, reject) => {
     }));
 
     async function sendStatusRequest() {
-        during = await fetchManifest(manifestUrl, origin, timeoutMs, relayAddress);
+        during = await fetchManifest(
+            manifestUrl, origin, timeoutMs, relayAddress, relayHostHeader);
         assert((during.target?.activeConnections ?? 0) >= beforeActive + 1,
             "RelayNode target affinity did not report the temporary tunnel");
         const handshake = Buffer.concat([
@@ -140,12 +151,13 @@ webSocket.close(1000, "public relay smoke complete");
 await closed;
 
 const leaseReleased = await waitForLeaseRelease(
-    manifestUrl, origin, beforeActive, timeoutMs, relayAddress);
+    manifestUrl, origin, beforeActive, timeoutMs, relayAddress, relayHostHeader);
 assert(leaseReleased, "RelayNode did not release the target tunnel after WebSocket close");
 
 console.log(JSON.stringify({
     ok: true,
     relayUrl,
+    relayHostHeader,
     relayName: before.name,
     target: `${target.host}:${target.port}`,
     handshakeHost,
@@ -182,12 +194,15 @@ function resolveSmokeMinecraftProfile(value) {
     return profile;
 }
 
-async function openRelay(url, requestOrigin, timeout, address) {
+async function openRelay(url, requestOrigin, timeout, address, hostHeader) {
     return new Promise((resolve, reject) => {
         let settled = false;
         const timer = setTimeout(() => finish(
             new Error(`WebSocket connection timed out after ${timeout}ms`)), timeout);
-        const options = {origin: requestOrigin};
+        const options = {
+            origin: requestOrigin,
+            headers: {host: hostHeader},
+        };
         if (address !== undefined) {
             options.lookup = lookupAddress(address);
         }
@@ -231,7 +246,7 @@ function isSyntheticAddress(address) {
     return octets.length === 4 && octets[0] === 198 && (octets[1] === 18 || octets[1] === 19);
 }
 
-async function fetchManifest(url, requestOrigin, timeout, address) {
+async function fetchManifest(url, requestOrigin, timeout, address, hostHeader) {
     const parsed = new URL(url);
     const request = parsed.protocol === "https:" ? httpsRequest : httpRequest;
     return new Promise((resolve, reject) => {
@@ -239,6 +254,7 @@ async function fetchManifest(url, requestOrigin, timeout, address) {
             headers: {
                 accept: "application/json",
                 origin: requestOrigin,
+                host: hostHeader,
             },
         };
         if (address !== undefined) options.lookup = lookupAddress(address);
@@ -275,10 +291,11 @@ async function fetchManifest(url, requestOrigin, timeout, address) {
 }
 
 async function waitForLeaseRelease(
-    url, requestOrigin, maximumActive, timeout, address) {
+    url, requestOrigin, maximumActive, timeout, address, hostHeader) {
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
-        const manifest = await fetchManifest(url, requestOrigin, timeout, address);
+        const manifest = await fetchManifest(
+            url, requestOrigin, timeout, address, hostHeader);
         if ((manifest.target?.activeConnections ?? 0) <= maximumActive) return true;
         await delay(100);
     }

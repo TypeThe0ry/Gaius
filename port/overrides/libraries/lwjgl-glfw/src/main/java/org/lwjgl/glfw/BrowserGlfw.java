@@ -634,29 +634,6 @@ public final class BrowserGlfw {
                 setTimeout(() => finish('timer'), 0);
               }
             };
-            const scheduleFairYield=() => {
-              if (telemetryEnabled) {
-                telemetry.fairYieldCount=(telemetry.fairYieldCount||0)+1;
-              }
-              // Prefer the Web Scheduling API when available. Unlike a zero-delay timer,
-              // scheduler.yield() does not inherit Chrome's background/minimum timer clamp,
-              // so fairness does not add a several-millisecond bubble to every fourth frame.
-              // Keep the timer as a compatibility fallback for older browsers and test hosts.
-              const browserScheduler=root.scheduler;
-              if (browserScheduler && typeof browserScheduler.yield==='function') {
-                try {
-                  const result=browserScheduler.yield();
-                  if (result && typeof result.then==='function') {
-                    result.then(
-                      () => finish('scheduler'),
-                      () => setTimeout(() => finish('timer'), 0)
-                    );
-                    return;
-                  }
-                } catch (ignored) {}
-              }
-              setTimeout(() => finish('timer'), 0);
-            };
             if (hidden) {
               setTimeout(() => finish('timer'), 50);
             } else if (synchronizedToDisplay && typeof requestAnimationFrame==='function') {
@@ -677,10 +654,11 @@ public final class BrowserGlfw {
               });
             } else {
               watchdog=setTimeout(() => finish('watchdog'), 100);
-              const sequence=(Number(root.__gaiusUncappedYieldSequence)||0)+1;
-              root.__gaiusUncappedYieldSequence=sequence;
-              if ((sequence & 3)===0) scheduleFairYield();
-              else postTask();
+              // Keep every visible uncapped present on the same MessageChannel task path.
+              // Mixing scheduler.yield() into every fourth present makes Chromium defer that
+              // continuation behind compositor arbitration, producing a stable 3:1 cadence
+              // and periodic multi-refresh frame bubbles on high-refresh displays.
+              postTask();
             }
             """)
     private static native void scheduleFrameYield(boolean hidden, int interval, FrameYieldCallback resume);

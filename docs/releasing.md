@@ -6,7 +6,7 @@ Git object store free of files above its 100 MiB limit.
 
 The public release version is stored in the root `VERSION` file. Keep the
 RelayNode package and server-plugin project version aligned with it. Tags use
-the form `v<version>`; for example, `VERSION=0.0.2` produces tag `v0.0.2`.
+the form `v<version>`; for example, `VERSION=0.0.3` produces tag `v0.0.3`.
 
 Before cloning or updating a release checkout, run:
 

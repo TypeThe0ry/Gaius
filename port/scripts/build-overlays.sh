@@ -33,6 +33,14 @@ config="$root/port/config.json"
 source "$root/port/scripts/version-profile.sh"
 gaius_load_version_profile "$root"
 gaius_select_java_home
+# `gaius_select_java_home` stores a Windows-native path when `cygpath` is
+# available.  Re-add its Unix view to PATH so Git Bash can resolve jar/java
+# launchers consistently.
+if command -v cygpath >/dev/null 2>&1; then
+  GAIUS_JAVA_HOME_UNIX="$(cygpath -u "$GAIUS_JAVA_HOME")"
+  PATH="$GAIUS_JAVA_HOME_UNIX/bin:$PATH"
+  export PATH
+fi
 version="$GAIUS_MINECRAFT_VERSION"
 teavm_version="$(jq -er '.teaVMVersion' "$config")"
 work="$root/port/work/$version"
@@ -43,6 +51,40 @@ maven_repository="$(gaius_maven_repository "$root")"
 maven_repository_for_java="$(gaius_maven_repository_for_java "$root")"
 export GAIUS_MAVEN_REPOSITORY="$maven_repository"
 asm_version="9.8"
+
+# javac on Windows uses `;` as the classpath separator. Git Bash does not
+# rewrite a colon-separated classpath whose first entry is already `C:/...`.
+java_classpath_separator=":"
+java_maven_repository="$maven_repository"
+java_work_classpath="$(cat "$root/port/work/${GAIUS_MINECRAFT_VERSION}/classpath.txt" 2>/dev/null || true)"
+java_client_jar="$root/port/work/${GAIUS_MINECRAFT_VERSION}/client-named.jar"
+java_asm_jar="$maven_repository/org/ow2/asm/asm/$asm_version/asm-$asm_version.jar"
+java_asm_tree_jar="$maven_repository/org/ow2/asm/asm-tree/$asm_version/asm-tree-$asm_version.jar"
+if command -v cygpath >/dev/null 2>&1; then
+  java_classpath_separator=";"
+  java_maven_repository="$maven_repository_for_java"
+  java_work_classpath="$(cygpath -mp "$java_work_classpath")"
+  java_client_jar="$(cygpath -m "$java_client_jar")"
+  java_asm_jar="$(cygpath -m "$maven_repository/org/ow2/asm/asm/$asm_version/asm-$asm_version.jar")"
+  java_asm_tree_jar="$(cygpath -m "$maven_repository/org/ow2/asm/asm-tree/$asm_version/asm-tree-$asm_version.jar")"
+fi
+
+# Normalize tool-side `java -classpath A:B` calls for Windows.  Keeping this
+# in one shim covers the many patcher invocations below.
+if command -v cygpath >/dev/null 2>&1; then
+  java() {
+    if [[ "${1:-}" == "-classpath" && -n "${2:-}" ]]; then
+      local native_classpath
+      # The argument can contain a mixture of Git-Bash `/c/...` entries and
+      # already-native `C:/...` entries.  `cygpath -mp` treats drive-letter
+      # colons as separators, so normalize each entry before joining with `;`.
+      native_classpath="$(python -c 'import re,sys; s=sys.argv[1]; print(";".join(re.sub(r"^/([A-Za-z])/", lambda m: m.group(1).upper()+":/", p) for p in re.split(r":(?=(?:/|[A-Za-z]:/))", s)))' "$2")"
+      command java -classpath "$native_classpath" "${@:3}"
+    else
+      command java "$@"
+    fi
+  }
+fi
 
 # A fresh checkout has no generated POM yet, but the overlays must be built
 # before that POM can be generated. Bootstrap the exact compile-time JARs
@@ -108,12 +150,12 @@ if [[ "${#sources[@]}" -eq 0 ]]; then
   exit 1
 fi
 
-classpath="$upstream"
+classpath="$(if command -v cygpath >/dev/null 2>&1; then cygpath -m "$upstream"; else printf '%s' "$upstream"; fi)"
 for artifact in teavm-interop teavm-jso teavm-jso-apis teavm-core teavm-platform; do
-  classpath="$classpath:$maven_repository/org/teavm/$artifact/$teavm_version/$artifact-$teavm_version.jar"
+  classpath="$classpath${java_classpath_separator}${java_maven_repository}/org/teavm/$artifact/$teavm_version/$artifact-$teavm_version.jar"
 done
-classpath="$classpath:$maven_repository/com/jcraft/jzlib/1.1.3/jzlib-1.1.3.jar"
-classpath="$classpath:$(cat "$work/classpath.txt")"
+classpath="$classpath${java_classpath_separator}${java_maven_repository}/com/jcraft/jzlib/1.1.3/jzlib-1.1.3.jar"
+classpath="$classpath${java_classpath_separator}$java_work_classpath"
 
 javac --release 21 -proc:none -classpath "$classpath" -d "$classes" "${sources[@]}"
 cp "$upstream" "$output"
@@ -131,9 +173,10 @@ build_library_overlay() {
     return 0
   fi
   local output_classes="$overlay_work/library-classes/$name"
-  local compile_classpath="$source_jar:$work/client-named.jar:$(cat "$work/classpath.txt")"
+  local java_source_jar="$(if command -v cygpath >/dev/null 2>&1; then cygpath -m "$source_jar"; else printf '%s' "$source_jar"; fi)"
+  local compile_classpath="$java_source_jar${java_classpath_separator}$java_client_jar${java_classpath_separator}$java_work_classpath"
   for artifact in teavm-interop teavm-jso teavm-jso-apis teavm-platform; do
-    compile_classpath="$compile_classpath:$maven_repository/org/teavm/$artifact/$teavm_version/$artifact-$teavm_version.jar"
+    compile_classpath="$compile_classpath${java_classpath_separator}${java_maven_repository}/org/teavm/$artifact/$teavm_version/$artifact-$teavm_version.jar"
   done
   local library_sources=()
 
@@ -219,7 +262,7 @@ asm_tree_jar="$maven_repository/org/ow2/asm/asm-tree/$asm_version/asm-tree-$asm_
 mkdir -p "$tool_classes"
 find "$tool_classes" -type f -delete
 javac --release 21 -proc:none \
-  -classpath "$asm_jar:$asm_tree_jar" \
+  -classpath "$java_asm_jar${java_classpath_separator}$java_asm_tree_jar" \
   -d "$tool_classes" \
   "$root/port/tools/src/main/java/dev/gaius/tools/"*.java
 
@@ -281,8 +324,8 @@ java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
 jar --update \
   --file "$authlib_output" \
   -C "$authlib_patch_classes" com/mojang/authlib/minecraft/client/MinecraftClient.class \
-  -C "$authlib_patch_classes" com/mojang/authlib/yggdrasil/YggdrasilServicesKeyInfo.class \
   -C "$authlib_patch_classes" com/mojang/authlib/minecraft/MinecraftProfileTexture.class \
+  -C "$authlib_patch_classes" com/mojang/authlib/yggdrasil/YggdrasilServicesKeyInfo.class \
   -C "$authlib_patch_classes" 'com/mojang/authlib/yggdrasil/YggdrasilServicesKeyInfo$KeyData.class' \
   -C "$authlib_patch_classes" 'com/mojang/authlib/yggdrasil/YggdrasilServicesKeyInfo$KeySetResponse.class' \
   -C "$authlib_patch_classes" com/mojang/authlib/yggdrasil/response/MinecraftTexturesPayload.class \
@@ -766,9 +809,9 @@ if [[ -d "$client_version_override_root" ]]; then
   done < <(find "$client_version_override_root" -type f -name '*.java' -print | sort)
 fi
 echo "Compiling ${#client_override_sources[@]} Minecraft $version browser overrides"
-client_override_classpath="$work/client-named.jar:$(cat "$work/classpath.txt")"
+client_override_classpath="$java_client_jar${java_classpath_separator}$java_work_classpath"
 for artifact in teavm-interop teavm-jso teavm-jso-apis; do
-  client_override_classpath="$client_override_classpath:$maven_repository/org/teavm/$artifact/$teavm_version/$artifact-$teavm_version.jar"
+  client_override_classpath="$client_override_classpath${java_classpath_separator}${java_maven_repository}/org/teavm/$artifact/$teavm_version/$artifact-$teavm_version.jar"
 done
 javac --release 21 -proc:none \
   -classpath "$client_override_classpath" \

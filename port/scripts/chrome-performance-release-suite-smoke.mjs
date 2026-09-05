@@ -13,11 +13,20 @@ import {
   validateContractShape,
   validateChildReport,
 } from "./chrome-performance-release-suite.mjs";
-import {summarizeAcceptanceEvidence} from "./performance-metrics.mjs";
+import {
+  evaluateUncappedFramePacing,
+  mergeFramePacingTelemetrySources,
+  mergeMonotonicSamples,
+  normalizeFramePacingEvidenceSnapshot,
+  normalizeFramePacingSettlementEvidence,
+  summarizeAcceptanceEvidence,
+} from "./performance-metrics.mjs";
 import {
   acceptanceFixtureIdentity,
+  acceptanceMeasurementEpochId,
   acceptanceFixtureProfile,
   legacyReleaseManifestFixtureIdentity,
+  makeAcceptanceFramePacingSettlement,
   makeManifestIdentityFixture,
   makeAcceptanceFixtureReport,
   releaseManifestFixtureIdentity,
@@ -98,17 +107,59 @@ for (const required of [
   "worldgenTelemetryMode",
   "runtimeInvariantContract",
   "uncappedYieldCount",
+  "visibleYieldCount",
+  "hiddenYieldCount",
   "presentToRafCount",
+  "messageChannelYieldCount",
   "fairYieldCount",
+  "schedulerYieldCount",
+  "timerYieldCount",
+  "yieldRequestCount",
+  "yieldCompletionCount",
+  "pendingYieldCount",
+  "maxPendingYieldCount",
+  "duplicateYieldCallbackCount",
   "messageChannelCreateFailureCount",
   "messageChannelPostFailureCount",
   "messageChannelRebuildCount",
   "cancelledMessageTaskCount",
   "watchdogYieldCount",
-  "minimumFairYieldCount",
+  "minimumMessageChannelYieldCount",
+  "minimumSamples",
+  "maximumFairYieldCount",
+  "maximumSchedulerYieldCount",
+  "maximumTimerYieldCount",
   "maximumWatchdogYieldCount",
   "REQUIRED_UNCAPPED_TELEMETRY_FIELDS",
   "hasFiniteNumber",
+  "isNonnegativeSafeInteger",
+  "counterDecreaseCount",
+  "sampleCompletenessViolationCount",
+  "allowedResetSentinelSampleCount",
+  "snapshotInvariantFailureCount",
+  "framePacingSettlement",
+  "mergeFramePacingTelemetrySources",
+  "normalizeFramePacingEvidenceSnapshot",
+  "normalizeFramePacingSettlementEvidence",
+  "sourceOverlapMismatchCount",
+  "measurementEpochId",
+  "cleanupTelemetry",
+  "cleanupCapturedAt",
+  "requireEpochClosure: true",
+  "epochMismatchCount",
+  "controllerTimingViolationCount",
+  "cleanupTelemetry.framePacingClosure",
+  "cleanupClosureFailureCount",
+  "settlementCounterDecreaseCount",
+  "settlementFallbackOrHealthFailureCount",
+  "recomputeChildUncappedEvidence",
+  "report?.samples",
+  "report?.telemetry",
+  "evaluationLatencyMillis",
+  "raw sample timestamps are missing or unsafe",
+  "raw sample timestamps are not strictly increasing",
+  "raw samples were dropped or merged",
+  "derived frame-pacing summary does not match raw samples",
   "buildIdentity.coherent",
   "failureEvidence",
   "manifestSha256",
@@ -136,6 +187,12 @@ for (const required of [
   "active version profile is not a supported headed Chrome release capability",
   "--headless is disabled for strict headed Chrome release evidence",
   "natural-observation",
+  "captureCleanupFramePacingClosure",
+  "controllerRequestedAt",
+  "controllerReceivedAt",
+  "controllerElapsedMillis",
+  "cutoffYieldRequestCount",
+  "measurementEpochId",
 ]) {
   assert.ok(benchmarkSource.includes(required), `benchmark is missing ${required}`);
 }
@@ -200,14 +257,17 @@ const fixtureUnsupportedProfile = {
   driverSupported: false,
 };
 const fixtureContract = {
-  schemaVersion: 17,
+  schemaVersion: 14,
   measurement: {soakMs: 1_800_000},
   environment: {
     uncappedEvidence: {
       requiredSwapInterval: 0,
       minimumSamples: 2,
       minimumUncappedYieldCount: 1,
-      minimumFairYieldCount: 1,
+      minimumMessageChannelYieldCount: 1,
+      maximumFairYieldCount: 0,
+      maximumSchedulerYieldCount: 0,
+      maximumTimerYieldCount: 0,
       maximumVsyncYieldCount: 0,
       maximumPresentToRafCount: 0,
       maximumMessageChannelCreateFailureCount: 0,
@@ -215,12 +275,30 @@ const fixtureContract = {
       maximumMessageChannelRebuildCount: 0,
       maximumCancelledMessageTaskCount: 0,
       maximumWatchdogYieldCount: 0,
+      requireFramePacingSettlement: true,
+      settlementSchemaVersion: 1,
+      settlementPollIntervalMillis: 8,
+      settlementPollIntervalMillisMin: 5,
+      settlementPollIntervalMillisMax: 10,
+      settlementTimeoutMillis: 200,
+      settlementTimeoutMillisMin: 150,
+      settlementTimeoutMillisMax: 250,
       requiredFields: [
         "swapInterval",
         "uncappedYieldCount",
         "vsyncYieldCount",
+        "visibleYieldCount",
+        "hiddenYieldCount",
         "presentToRafCount",
+        "messageChannelYieldCount",
         "fairYieldCount",
+        "schedulerYieldCount",
+        "timerYieldCount",
+        "yieldRequestCount",
+        "yieldCompletionCount",
+        "pendingYieldCount",
+        "maxPendingYieldCount",
+        "duplicateYieldCallbackCount",
         "messageChannelCreateFailureCount",
         "messageChannelPostFailureCount",
         "messageChannelRebuildCount",
@@ -268,6 +346,59 @@ const fixtureContract = {
   },
 };
 assert.doesNotThrow(() => validateContractShape(fixtureContract));
+assert.throws(
+  () => validateContractShape({...fixtureContract, schemaVersion: 15}),
+  /schemaVersion must be exactly 14/,
+  "strict release contract must not drift from pacing evidence schema 14",
+);
+assert.throws(() => validateContractShape({
+  ...fixtureContract,
+  environment: {
+    ...fixtureContract.environment,
+    uncappedEvidence: {...fixtureContract.environment.uncappedEvidence, minimumSamples: 1},
+  },
+}), /unsafe release requirements/,
+"strict release contract must require at least two complete pacing samples");
+for (const [field, value] of [
+  ["minimumUncappedYieldCount", 1.5],
+  ["minimumMessageChannelYieldCount", 1.5],
+  ["minimumUncappedYieldCount", "1"],
+  ["minimumMessageChannelYieldCount", "1"],
+]) {
+  assert.throws(() => validateContractShape({
+    ...fixtureContract,
+    environment: {
+      ...fixtureContract.environment,
+      uncappedEvidence: {
+        ...fixtureContract.environment.uncappedEvidence,
+        [field]: value,
+      },
+    },
+  }), /unsafe release requirements/,
+  `strict release contract must reject malformed ${field}=${JSON.stringify(value)}`);
+}
+for (const [field, value] of [
+  ["requireFramePacingSettlement", false],
+  ["settlementSchemaVersion", 1.5],
+  ["settlementPollIntervalMillis", 4],
+  ["settlementPollIntervalMillisMin", 4],
+  ["settlementPollIntervalMillisMax", 11],
+  ["settlementTimeoutMillis", 100],
+  ["settlementTimeoutMillisMin", 149],
+  ["settlementTimeoutMillisMax", 251],
+]) {
+  assert.throws(() => validateContractShape({
+    ...fixtureContract,
+    environment: {
+      ...fixtureContract.environment,
+      uncappedEvidence: {
+        ...fixtureContract.environment.uncappedEvidence,
+        [field]: value,
+      },
+    },
+  }), /settlement requirements are unsafe/,
+  `strict release contract must reject malformed ${field}=${JSON.stringify(value)}`);
+}
 const fixtureUncappedEvidence = fixtureContract.environment.uncappedEvidence;
 const fixtureIdentity = acceptanceFixtureIdentity;
 
@@ -296,9 +427,130 @@ function childReport(overrides = {}) {
       profile: fixtureContract.profiles["hard-a"],
       contractSchemaVersion: fixtureContract.schemaVersion,
       buildIdentity: fixtureIdentity,
+      uncappedEvidence: fixtureUncappedEvidence,
     }),
     ...overrides,
   };
+}
+
+function recomputeFixtureFramePacing(report) {
+  const validSamples = mergeMonotonicSamples(report.samples.filter((sample) => !sample.error));
+  const sampleSources = validSamples.map((sample, index) =>
+    normalizeFramePacingEvidenceSnapshot(sample, {
+      requiredFields: fixtureUncappedEvidence.requiredFields,
+      label: `sample[${index}]`,
+      requireDualSources: true,
+    }));
+  const finalSources = normalizeFramePacingEvidenceSnapshot(report.telemetry, {
+    requiredFields: fixtureUncappedEvidence.requiredFields,
+    label: "final",
+    requireDualSources: true,
+  });
+  const settlementSources = normalizeFramePacingSettlementEvidence(
+    report.telemetry.framePacingSettlement,
+    {
+      requiredFields: fixtureUncappedEvidence.requiredFields,
+      label: "settlement",
+      requireDualSources: true,
+    },
+  );
+  const cleanupSources = normalizeFramePacingEvidenceSnapshot(report.cleanupTelemetry, {
+    requiredFields: fixtureUncappedEvidence.requiredFields,
+    label: "cleanup",
+    requireDualSources: true,
+  });
+  report.analysis.performanceEvidence.framePacing = evaluateUncappedFramePacing({
+    samples: sampleSources.map(({merged}) => merged),
+    final: finalSources.merged,
+    settlement: settlementSources.settlement,
+    cleanup: cleanupSources.merged,
+    measurementEpochId: report.configuration.measurementEpochId,
+    requireEpochClosure: true,
+    sourceOverlapMismatches: [
+      ...sampleSources.flatMap(({overlapMismatches}) => overlapMismatches),
+      ...sampleSources.flatMap(({sourceCompletenessFailures}) => sourceCompletenessFailures),
+      ...finalSources.overlapMismatches,
+      ...finalSources.sourceCompletenessFailures,
+      ...settlementSources.overlapMismatches,
+      ...settlementSources.sourceCompletenessFailures,
+      ...cleanupSources.overlapMismatches,
+      ...cleanupSources.sourceCompletenessFailures,
+    ],
+    timing: {
+      lastSampleAt: validSamples.at(-1)?.at ?? null,
+      finalCapturedAt: report.telemetry.capturedAt ?? null,
+      settlementCapturedAt: report.telemetry.framePacingSettlement?.capturedAt ?? null,
+      cleanupCapturedAt: report.cleanupTelemetry?.capturedAt ?? null,
+    },
+    requirements: fixtureUncappedEvidence,
+  });
+}
+
+function setFixtureCleanupClosure(report, pacing, {
+  capturedAt = 5,
+  cutoffYieldRequestCount = pacing.yieldRequestCount,
+} = {}) {
+  const scalar = Object.fromEntries([
+    "measurementId",
+    "measurementEpochId",
+    ...fixtureUncappedEvidence.requiredFields,
+  ].map((field) => [field, pacing[field]]));
+  const cleanup = {
+    ...scalar,
+    capturedAt,
+    controllerRequestedAt: capturedAt,
+    controllerReceivedAt: capturedAt + 1,
+    evaluationLatencyMillis: 1,
+    deadlineExceeded: false,
+    cutoffYieldRequestCount,
+    frame: {...scalar},
+    runtimeInvariants: {framePacing: {...scalar}},
+  };
+  report.cleanupTelemetry = structuredClone(cleanup);
+  report.cleanupTelemetry.framePacingClosure = structuredClone(cleanup);
+  report.telemetry.cleanupFramePacing = structuredClone(cleanup);
+}
+
+function mutateDualPacingSnapshot(snapshot, changes) {
+  Object.assign(snapshot, changes);
+  if (snapshot.frame && typeof snapshot.frame === "object") Object.assign(snapshot.frame, changes);
+  if (snapshot.runtimeInvariants?.framePacing) {
+    Object.assign(snapshot.runtimeInvariants.framePacing, changes);
+  }
+}
+
+function mutateAllCleanupPacingRepresentations(report, changes) {
+  mutateDualPacingSnapshot(report.cleanupTelemetry, changes);
+  mutateDualPacingSnapshot(report.cleanupTelemetry.framePacingClosure, changes);
+  mutateDualPacingSnapshot(report.telemetry.cleanupFramePacing, changes);
+}
+
+function setFixtureSettlementControllerSamples(report, timings, {
+  controllerStartedAt = 3,
+} = {}) {
+  const settlement = report.telemetry.framePacingSettlement;
+  const samples = timings.map(({capturedAt, controllerRequestedAt, controllerReceivedAt}) => {
+    const sample = structuredClone(settlement.final);
+    Object.assign(sample, {
+      capturedAt,
+      controllerRequestedAt,
+      controllerReceivedAt,
+      evaluationLatencyMillis: controllerReceivedAt - controllerRequestedAt,
+      deadlineExceeded: false,
+    });
+    return sample;
+  });
+  const final = samples.at(-1);
+  settlement.samples = samples;
+  settlement.final = structuredClone(final);
+  settlement.capturedAt = final.capturedAt;
+  settlement.controllerStartedAt = controllerStartedAt;
+  settlement.controllerCompletedAt = final.controllerReceivedAt;
+  settlement.controllerElapsedMillis = settlement.controllerCompletedAt - controllerStartedAt;
+  setFixtureCleanupClosure(report, final, {
+    capturedAt: Math.max(final.capturedAt, final.controllerReceivedAt) + 1,
+    cutoffYieldRequestCount: final.yieldRequestCount,
+  });
 }
 
 const completeAcceptance = summarizeAcceptanceEvidence({
@@ -366,6 +618,390 @@ assert.equal(validateChildReport(childReport(), {
   expectedBuildIdentity: fixtureIdentity,
   uncappedEvidence: fixtureUncappedEvidence,
 }).valid, true);
+const summaryOnlyPacingChild = childReport();
+delete summaryOnlyPacingChild.samples;
+delete summaryOnlyPacingChild.telemetry;
+const summaryOnlyPacingValidation = validateChildReport(summaryOnlyPacingChild, {
+  profileName: "hard-a",
+  profile: fixtureContract.profiles["hard-a"],
+  contractSchemaVersion: fixtureContract.schemaVersion,
+  expectedBuildIdentity: fixtureIdentity,
+  uncappedEvidence: fixtureUncappedEvidence,
+});
+assert.equal(summaryOnlyPacingValidation.valid, false,
+  "strict release must reject a summary-only frame-pacing pass claim");
+assert.match(summaryOnlyPacingValidation.failures.join("\n"), /raw report\.samples|raw report\.telemetry/);
+
+const rawBadDerivedGoodChild = childReport();
+Object.assign(rawBadDerivedGoodChild.samples[1].frame, {
+  visibleYieldCount: 7,
+  hiddenYieldCount: 1,
+  messageChannelYieldCount: 7,
+  timerYieldCount: 1,
+});
+const rawBadDerivedGoodValidation = validateChildReport(rawBadDerivedGoodChild, {
+  profileName: "hard-a",
+  profile: fixtureContract.profiles["hard-a"],
+  contractSchemaVersion: fixtureContract.schemaVersion,
+  expectedBuildIdentity: fixtureIdentity,
+  uncappedEvidence: fixtureUncappedEvidence,
+});
+assert.equal(rawBadDerivedGoodValidation.valid, false,
+  "strict release must reject bad raw pacing hidden behind a forged passing summary");
+assert.match(rawBadDerivedGoodValidation.failures.join("\n"),
+  /raw frame-pacing evidence recomputed as fail|derived frame-pacing summary/);
+
+for (const [label, mutateRaw, expected] of [
+  ["errored raw sample", (report) => { report.samples[0].error = "forged sample error"; },
+    /errored raw samples/],
+  ["stalled raw sample", (report) => { report.samples[0].evaluationLatencyMillis = 500; },
+    /raw sample latency/],
+  ["non-object raw sample", (report) => { report.samples[0] = null; },
+    /non-object raw samples/],
+  ["unsafe raw timestamp", (report) => {
+    report.samples[0].at = null;
+    report.samples[0].frame.hiddenYieldCount = 1;
+    report.samples[0].frame.timerYieldCount = 1;
+  }, /raw sample timestamps/],
+  ["duplicate raw timestamp", (report) => { report.samples[1].at = report.samples[0].at; },
+    /dropped or merged/],
+]) {
+  const candidate = childReport();
+  mutateRaw(candidate);
+  const validation = validateChildReport(candidate, {
+    profileName: "hard-a",
+    profile: fixtureContract.profiles["hard-a"],
+    contractSchemaVersion: fixtureContract.schemaVersion,
+    expectedBuildIdentity: fixtureIdentity,
+    uncappedEvidence: fixtureUncappedEvidence,
+  });
+  assert.equal(validation.valid, false, `strict release must reject ${label}`);
+  assert.match(validation.failures.join("\n"), expected, `${label}: raw evidence failure`);
+}
+
+const validateStrictPacingFixture = (report) => validateChildReport(report, {
+  profileName: "hard-a",
+  profile: fixtureContract.profiles["hard-a"],
+  contractSchemaVersion: fixtureContract.schemaVersion,
+  expectedBuildIdentity: fixtureIdentity,
+  uncappedEvidence: fixtureUncappedEvidence,
+});
+
+const pendingSettlementChild = childReport();
+const pendingInitial = {
+  ...pendingSettlementChild.telemetry.frame,
+  uncappedYieldCount: 9,
+  visibleYieldCount: 9,
+  yieldRequestCount: 9,
+  pendingYieldCount: 1,
+};
+const pendingCompleted = {
+  ...pendingInitial,
+  messageChannelYieldCount: 9,
+  yieldCompletionCount: 9,
+  pendingYieldCount: 0,
+};
+pendingSettlementChild.telemetry.frame = {...pendingInitial};
+pendingSettlementChild.telemetry.runtimeInvariants.framePacing = {...pendingInitial};
+pendingSettlementChild.telemetry.framePacingSettlement = makeAcceptanceFramePacingSettlement(
+  pendingInitial,
+  {initialCapturedAt: 3, capturedAt: 4, final: pendingCompleted},
+);
+setFixtureCleanupClosure(pendingSettlementChild, pendingCompleted);
+recomputeFixtureFramePacing(pendingSettlementChild);
+const pendingSettlementValidation = validateStrictPacingFixture(pendingSettlementChild);
+assert.equal(pendingSettlementValidation.valid, true,
+  `strict release must accept one proved in-flight completion: ${pendingSettlementValidation.failures.join("; ")}`);
+
+for (const [label, mutateRaw, expected] of [
+  ["sample source overlap mismatch", (report) => {
+    report.samples[0].runtimeInvariants.framePacing.timerYieldCount = 1;
+  }, /sources disagree|raw frame-pacing evidence recomputed as fail/],
+  ["final source overlap mismatch", (report) => {
+    report.telemetry.runtimeInvariants.framePacing.messageChannelYieldCount = 7;
+  }, /sources disagree|raw frame-pacing evidence recomputed as fail/],
+  ["final timestamp not after sample", (report) => {
+    report.telemetry.capturedAt = report.samples.at(-1).at;
+    report.telemetry.framePacingSettlement.initialCapturedAt = report.telemetry.capturedAt;
+  }, /final telemetry\.capturedAt|raw frame-pacing evidence recomputed as fail/],
+  ["settlement timestamp not after final", (report) => {
+    report.telemetry.framePacingSettlement.capturedAt = report.telemetry.capturedAt;
+    report.telemetry.framePacingSettlement.samples[0].capturedAt = report.telemetry.capturedAt;
+  }, /settlement\.capturedAt|raw frame-pacing evidence recomputed as fail/],
+  ["raw max pending peak forged to zero", (report) => {
+    report.samples[0].frame.maxPendingYieldCount = 0;
+    report.samples[0].runtimeInvariants.framePacing.maxPendingYieldCount = 0;
+  }, /raw frame-pacing evidence recomputed as fail|derived frame-pacing summary/],
+  ["settlement cumulative counter decrease", (report) => {
+    const settlement = report.telemetry.framePacingSettlement;
+    for (const field of [
+      "uncappedYieldCount", "visibleYieldCount", "messageChannelYieldCount",
+      "yieldRequestCount", "yieldCompletionCount",
+    ]) {
+      mutateDualPacingSnapshot(settlement.samples[0], {[field]: 7});
+      mutateDualPacingSnapshot(settlement.final, {[field]: 7});
+    }
+  }, /raw frame-pacing evidence recomputed as fail|derived frame-pacing summary/],
+  ["dead MessageChannel watchdog fallback", (report) => {
+    const settlement = report.telemetry.framePacingSettlement;
+    const watchdogFinal = {
+      ...pendingInitial,
+      timerYieldCount: 1,
+      yieldCompletionCount: 9,
+      pendingYieldCount: 0,
+      watchdogYieldCount: 1,
+    };
+    Object.assign(settlement, {
+      messageChannelCompletionDelta: 0,
+      yieldCompletionDelta: 1,
+      settled: false,
+      timedOut: true,
+      samples: [{capturedAt: 4, ...watchdogFinal}],
+      final: watchdogFinal,
+    });
+  }, /raw frame-pacing evidence recomputed as fail|derived frame-pacing summary/],
+]) {
+  const candidate = label === "dead MessageChannel watchdog fallback"
+    ? structuredClone(pendingSettlementChild) : childReport();
+  mutateRaw(candidate);
+  const validation = validateStrictPacingFixture(candidate);
+  assert.equal(validation.valid, false, `strict release must reject ${label}`);
+  assert.match(validation.failures.join("\n"), expected, `${label}: strict raw pacing failure`);
+}
+
+const initialZeroNewPendingChild = childReport();
+const initialZeroSnapshot = {...initialZeroNewPendingChild.telemetry.frame};
+const newPendingSnapshot = {
+  ...initialZeroSnapshot,
+  uncappedYieldCount: 9,
+  visibleYieldCount: 9,
+  yieldRequestCount: 9,
+  messageChannelYieldCount: 8,
+  yieldCompletionCount: 8,
+  pendingYieldCount: 1,
+  maxPendingYieldCount: 1,
+};
+initialZeroNewPendingChild.telemetry.framePacingSettlement =
+  makeAcceptanceFramePacingSettlement(initialZeroSnapshot, {
+    initialCapturedAt: 3,
+    capturedAt: 4,
+    final: newPendingSnapshot,
+  });
+const pendingClosedSnapshot = {
+  ...newPendingSnapshot,
+  messageChannelYieldCount: 9,
+  yieldCompletionCount: 9,
+  pendingYieldCount: 0,
+};
+setFixtureCleanupClosure(initialZeroNewPendingChild, pendingClosedSnapshot, {
+  cutoffYieldRequestCount: 9,
+});
+recomputeFixtureFramePacing(initialZeroNewPendingChild);
+const initialZeroNewPendingValidation = validateStrictPacingFixture(initialZeroNewPendingChild);
+assert.equal(initialZeroNewPendingValidation.valid, true,
+  `cleanup must close a continuation requested during settlement: ${initialZeroNewPendingValidation.failures.join("; ")}`);
+
+const cleanupPendingOneChild = childReport();
+const cleanupPendingOneSnapshot = {
+  ...cleanupPendingOneChild.telemetry.framePacingSettlement.final,
+  uncappedYieldCount: 9,
+  visibleYieldCount: 9,
+  yieldRequestCount: 9,
+  messageChannelYieldCount: 8,
+  yieldCompletionCount: 8,
+  pendingYieldCount: 1,
+  maxPendingYieldCount: 1,
+};
+setFixtureCleanupClosure(cleanupPendingOneChild, cleanupPendingOneSnapshot, {
+  cutoffYieldRequestCount: 8,
+});
+recomputeFixtureFramePacing(cleanupPendingOneChild);
+const cleanupPendingOneValidation = validateStrictPacingFixture(cleanupPendingOneChild);
+assert.equal(cleanupPendingOneValidation.valid, true,
+  `cleanup may retain one post-cutoff continuation: ${cleanupPendingOneValidation.failures.join("; ")}`);
+
+const epochAndCleanupAdversarialFixtures = [
+  ["raw sample epoch mismatch", (report) => {
+    mutateDualPacingSnapshot(report.samples[0], {
+      measurementId: "wrong-epoch",
+      measurementEpochId: "wrong-epoch",
+    });
+  }],
+  ["raw sample dual-source epoch disagreement", (report) => {
+    report.samples[0].runtimeInvariants.framePacing.measurementEpochId = "runtime-wrong-epoch";
+  }],
+  ["final epoch mismatch", (report) => {
+    report.telemetry.measurementId = "wrong-final-epoch";
+    report.telemetry.measurementEpochId = "wrong-final-epoch";
+    mutateDualPacingSnapshot(report.telemetry, {
+      measurementId: "wrong-final-epoch",
+      measurementEpochId: "wrong-final-epoch",
+    });
+  }],
+  ["settlement metadata epoch mismatch", (report) => {
+    report.telemetry.framePacingSettlement.measurementEpochId = "wrong-settlement-epoch";
+  }],
+  ["settlement sample epoch mismatch", (report) => {
+    mutateDualPacingSnapshot(report.telemetry.framePacingSettlement.samples[0], {
+      measurementId: "wrong-settlement-sample",
+      measurementEpochId: "wrong-settlement-sample",
+    });
+  }],
+  ["settlement final epoch mismatch", (report) => {
+    mutateDualPacingSnapshot(report.telemetry.framePacingSettlement.final, {
+      measurementId: "wrong-settlement-final",
+      measurementEpochId: "wrong-settlement-final",
+    });
+  }],
+  ["cleanup epoch mismatch", (report) => {
+    mutateDualPacingSnapshot(report.cleanupTelemetry, {
+      measurementId: "wrong-cleanup-epoch",
+      measurementEpochId: "wrong-cleanup-epoch",
+    });
+  }],
+  ["late final controller response", (report) => {
+    Object.assign(report.telemetry, {
+      controllerReceivedAt: 500,
+      evaluationLatencyMillis: 498,
+      deadlineExceeded: true,
+    });
+  }],
+  ["late settlement scalar response", (report) => {
+    const sample = report.telemetry.framePacingSettlement.samples[0];
+    Object.assign(sample, {
+      controllerReceivedAt: 500,
+      evaluationLatencyMillis: 497,
+      deadlineExceeded: true,
+    });
+    report.telemetry.framePacingSettlement.final = structuredClone(sample);
+  }],
+  ["late settlement controller completion", (report) => {
+    Object.assign(report.telemetry.framePacingSettlement, {
+      controllerCompletedAt: 500,
+      controllerElapsedMillis: 497,
+      deadlineExceeded: true,
+    });
+  }],
+  ["settlement controller ranges overlap", (report) => {
+    setFixtureSettlementControllerSamples(report, [
+      {capturedAt: 4, controllerRequestedAt: 3, controllerReceivedAt: 4},
+      {capturedAt: 5, controllerRequestedAt: 3, controllerReceivedAt: 5},
+    ]);
+  }],
+  ["settlement controller request moves backwards", (report) => {
+    setFixtureSettlementControllerSamples(report, [
+      {capturedAt: 4, controllerRequestedAt: 4, controllerReceivedAt: 4},
+      {capturedAt: 5, controllerRequestedAt: 3, controllerReceivedAt: 5},
+    ]);
+  }],
+  ["settlement changes to swap interval one", (report) => {
+    for (const sample of report.telemetry.framePacingSettlement.samples) {
+      mutateDualPacingSnapshot(sample, {swapInterval: 1});
+    }
+    mutateDualPacingSnapshot(report.telemetry.framePacingSettlement.final, {swapInterval: 1});
+  }],
+  ["cleanup changes to swap interval one", (report) => {
+    mutateAllCleanupPacingRepresentations(report, {swapInterval: 1});
+  }],
+  ["cleanup timestamp before settlement", (report) => {
+    report.cleanupTelemetry.capturedAt = report.telemetry.framePacingSettlement.capturedAt;
+  }],
+  ["cleanup counter decrease", (report) => {
+    mutateDualPacingSnapshot(report.cleanupTelemetry, {
+      uncappedYieldCount: 7,
+      visibleYieldCount: 7,
+      messageChannelYieldCount: 7,
+      yieldRequestCount: 7,
+      yieldCompletionCount: 7,
+    });
+  }],
+  ["chained pending continuation reaches watchdog", (report) => {
+    mutateDualPacingSnapshot(report.cleanupTelemetry, {
+      uncappedYieldCount: 9,
+      visibleYieldCount: 9,
+      yieldRequestCount: 9,
+      yieldCompletionCount: 9,
+      messageChannelYieldCount: 8,
+      timerYieldCount: 1,
+      pendingYieldCount: 0,
+      maxPendingYieldCount: 1,
+      watchdogYieldCount: 1,
+    });
+  }],
+  ["initial zero then new pending lacks cleanup closure", (report) => {
+    const initial = {...report.telemetry.frame};
+    const pending = {
+      ...initial,
+      uncappedYieldCount: 9,
+      visibleYieldCount: 9,
+      yieldRequestCount: 9,
+      pendingYieldCount: 1,
+    };
+    report.telemetry.framePacingSettlement = makeAcceptanceFramePacingSettlement(initial, {
+      initialCapturedAt: 3,
+      capturedAt: 4,
+      final: pending,
+    });
+  }],
+  ["cleanup pending peak forged to zero", (report) => {
+    mutateDualPacingSnapshot(report.cleanupTelemetry, {
+      uncappedYieldCount: 9,
+      visibleYieldCount: 9,
+      yieldRequestCount: 9,
+      pendingYieldCount: 1,
+      maxPendingYieldCount: 0,
+    });
+  }],
+  ["cleanup timer path", (report) => {
+    mutateDualPacingSnapshot(report.cleanupTelemetry, {
+      uncappedYieldCount: 9,
+      visibleYieldCount: 8,
+      hiddenYieldCount: 1,
+      yieldRequestCount: 9,
+      yieldCompletionCount: 9,
+      messageChannelYieldCount: 8,
+      timerYieldCount: 1,
+      maxPendingYieldCount: 1,
+    });
+  }],
+];
+assert.equal(epochAndCleanupAdversarialFixtures.length, 20,
+  "schema-14 pacing evidence must retain exactly twenty raw adversarial fixtures here");
+for (const [label, mutateRaw] of epochAndCleanupAdversarialFixtures) {
+  const candidate = childReport();
+  mutateRaw(candidate);
+  const validation = validateStrictPacingFixture(candidate);
+  assert.equal(validation.valid, false, `strict release must reject ${label}`);
+  assert.match(validation.failures.join("\n"),
+    /raw frame-pacing evidence|derived frame-pacing summary|epoch|cleanup|controller|sources disagree/,
+    `${label}: strict epoch/cleanup failure`);
+  if (label.startsWith("settlement controller")
+      || label.endsWith("swap interval one")) {
+    assert.match(validation.failures.join("\n"), /raw frame-pacing evidence recomputed as fail/,
+      `${label}: strict parent must independently recompute the raw failure`);
+  }
+}
+
+const forgedCleanupSummaryChild = childReport();
+forgedCleanupSummaryChild.analysis.performanceEvidence.framePacing.cleanup.cutoffConsistent = false;
+const forgedCleanupSummaryValidation = validateStrictPacingFixture(forgedCleanupSummaryChild);
+assert.equal(forgedCleanupSummaryValidation.valid, false,
+  "strict release must reject a forged cleanup summary that disagrees with raw cleanupTelemetry");
+assert.match(forgedCleanupSummaryValidation.failures.join("\n"), /derived frame-pacing summary/);
+
+const forgedNestedCleanupClosureChild = childReport();
+mutateDualPacingSnapshot(
+  forgedNestedCleanupClosureChild.cleanupTelemetry.framePacingClosure,
+  {swapInterval: 1},
+);
+const forgedNestedCleanupClosureValidation = validateStrictPacingFixture(
+  forgedNestedCleanupClosureChild,
+);
+assert.equal(forgedNestedCleanupClosureValidation.valid, false,
+  "strict release must reject a forged nested cleanupTelemetry.framePacingClosure");
+assert.match(forgedNestedCleanupClosureValidation.failures.join("\n"),
+  /framePacingClosure|sources disagree/);
+
 const forgedWorkerDistanceChild = childReport();
 forgedWorkerDistanceChild.analysis.environment.distanceContract.optionsPreference = "8:6";
 const forgedWorkerDistanceValidation = validateChildReport(forgedWorkerDistanceChild, {
@@ -442,6 +1078,32 @@ assert.equal(validateChildReport(missingHealthChild, {
   uncappedEvidence: fixtureUncappedEvidence,
 }).valid, false, "strict release must reject missing scheduler health telemetry");
 
+const leadingResetSentinelChild = childReport();
+const leadingResetPacing = Object.fromEntries([
+  "measurementId",
+  "measurementEpochId",
+  ...fixtureUncappedEvidence.requiredFields,
+].map((field) => [field, field === "measurementId" || field === "measurementEpochId"
+  ? acceptanceMeasurementEpochId : (field === "swapInterval" ? null : 0)]));
+leadingResetSentinelChild.samples.unshift({
+  at: 0,
+  evaluationLatencyMillis: 1,
+  measurementId: acceptanceMeasurementEpochId,
+  measurementEpochId: acceptanceMeasurementEpochId,
+  frame: {...leadingResetPacing},
+  runtimeInvariants: {framePacing: {...leadingResetPacing}},
+});
+recomputeFixtureFramePacing(leadingResetSentinelChild);
+const leadingResetSentinelValidation = validateChildReport(leadingResetSentinelChild, {
+  profileName: "hard-a",
+  profile: fixtureContract.profiles["hard-a"],
+  contractSchemaVersion: fixtureContract.schemaVersion,
+  expectedBuildIdentity: fixtureIdentity,
+  uncappedEvidence: fixtureUncappedEvidence,
+});
+assert.equal(leadingResetSentinelValidation.valid, true,
+  `strict release must allow a proved leading all-zero reset sentinel: ${leadingResetSentinelValidation.failures.join("; ")}`);
+
 const failedHealthChild = childReport();
 failedHealthChild.analysis.performanceEvidence.framePacing.observed.messageChannelPostFailureCountMax = 1;
 const failedHealthValidation = validateChildReport(failedHealthChild, {
@@ -453,6 +1115,83 @@ const failedHealthValidation = validateChildReport(failedHealthChild, {
 });
 assert.equal(failedHealthValidation.valid, false, "strict release must reject nonzero scheduler health telemetry");
 assert.match(failedHealthValidation.failures.join("\n"), /messageChannelPostFailureCount/);
+
+const oldCadenceChild = childReport();
+oldCadenceChild.analysis.performanceEvidence.framePacing.observed.fairYieldCountMax = 1;
+oldCadenceChild.analysis.performanceEvidence.framePacing.observed.schedulerYieldCountMax = 1;
+const oldCadenceValidation = validateChildReport(oldCadenceChild, {
+  profileName: "hard-a",
+  profile: fixtureContract.profiles["hard-a"],
+  contractSchemaVersion: fixtureContract.schemaVersion,
+  expectedBuildIdentity: fixtureIdentity,
+  uncappedEvidence: fixtureUncappedEvidence,
+});
+assert.equal(oldCadenceValidation.valid, false,
+  "strict release must reject the retired fixed scheduler.yield cadence");
+assert.match(oldCadenceValidation.failures.join("\n"), /fairYieldCount|schedulerYieldCount/);
+
+for (const [label, mutate, expected] of [
+  ["one complete sample", (frame) => {
+    frame.measuredSampleCount = 1;
+    frame.observed.completeSampleCount = 1;
+  }, /complete frame-pacing samples/],
+  ["100-to-1 completion mismatch", (frame) => {
+    Object.assign(frame.final, {
+      uncappedYieldCount: 100,
+      visibleYieldCount: 100,
+      yieldRequestCount: 100,
+      yieldCompletionCount: 1,
+      messageChannelYieldCount: 1,
+      pendingYieldCount: 0,
+    });
+  }, /continuation accounting/],
+  ["negative counter", (frame) => {
+    frame.final.messageChannelYieldCount = -1;
+  }, /counters are unsafe/],
+  ["two pending continuations", (frame) => {
+    Object.assign(frame.final, {
+      uncappedYieldCount: 100,
+      visibleYieldCount: 100,
+      yieldRequestCount: 100,
+      yieldCompletionCount: 98,
+      messageChannelYieldCount: 98,
+      pendingYieldCount: 2,
+      maxPendingYieldCount: 2,
+    });
+  }, /continuation accounting/],
+  ["counter reset", (frame) => {
+    frame.observed.counterDecreaseCount = 1;
+  }, /counterDecreaseCount/],
+  ["mid-stream incomplete sample", (frame) => {
+    frame.incompleteSampleCount = 1;
+    frame.observed.incompleteSampleCount = 1;
+    frame.observed.allowedResetSentinelSampleCount = 0;
+    frame.observed.sampleCompletenessViolationCount = 1;
+  }, /sampleCompletenessViolationCount/],
+  ["missing historical pending peak", (frame) => {
+    frame.final.maxPendingYieldCount = 0;
+  }, /continuation accounting/],
+  ["hidden timer path", (frame) => {
+    Object.assign(frame.final, {
+      hiddenYieldCount: 1,
+      visibleYieldCount: 7,
+      timerYieldCount: 1,
+      messageChannelYieldCount: 7,
+    });
+  }, /continuation accounting/],
+]) {
+  const candidate = childReport();
+  mutate(candidate.analysis.performanceEvidence.framePacing);
+  const validation = validateChildReport(candidate, {
+    profileName: "hard-a",
+    profile: fixtureContract.profiles["hard-a"],
+    contractSchemaVersion: fixtureContract.schemaVersion,
+    expectedBuildIdentity: fixtureIdentity,
+    uncappedEvidence: fixtureUncappedEvidence,
+  });
+  assert.equal(validation.valid, false, `strict release must reject ${label}`);
+  assert.match(validation.failures.join("\n"), expected, `${label}: failure evidence`);
+}
 for (const [label, overrides, expected] of [
   ["forged profile", {configuration: {
     ...childReport().configuration,
@@ -709,4 +1448,7 @@ assert.equal(smokeConfiguration.gating, false);
 assert.equal(smokeConfiguration.profiles[0].releaseEvidence, false);
 
 await rm(fixtureRoot, {recursive: true, force: true});
-console.log("Chrome performance release-suite smoke passed");
+console.log(
+  "Chrome performance release-suite smoke passed",
+  `(schema14 pacing adversarial fixtures=${epochAndCleanupAdversarialFixtures.length + 2})`,
+);

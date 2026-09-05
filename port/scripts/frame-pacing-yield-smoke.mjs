@@ -9,8 +9,6 @@ const sourcePath = new URL(
   import.meta.url,
 );
 const source = await readFile(sourcePath, "utf8");
-const UNCAPPED_FAIR_YIELD_CADENCE = 4;
-
 function jsBodyBefore(marker) {
   const markerOffset = source.indexOf(marker);
   const annotationOffset = source.lastIndexOf(
@@ -46,10 +44,8 @@ assert.match(source, /scheduler=\{tasks:new Map\(\),channel:null,nextTaskId:1\}/
   "MessageChannel continuations are not stored as cancellable tokens");
 assert.match(source, /scheduler\.tasks\.delete\(taskId\)/,
   "watchdog recovery cannot remove a stalled MessageChannel continuation");
-assert.match(source, /setTimeout\(\(\) => finish\('timer'\), 0\)/,
-  "uncapped pacing has no real timer task for browser fairness");
-assert.match(source, /\(sequence & 3\)===0/,
-  "uncapped pacing fairness cadence changed from once per 4 frames");
+assert.doesNotMatch(source, /scheduleFairYield|__gaiusUncappedYieldSequence|\(sequence & 3\)/,
+  "uncapped pacing still mixes a fixed scheduler.yield cadence into MessageChannel presents");
 assert.doesNotMatch(source, /scheduler=\{queue:\[\],channel:null\}/,
   "frame pacing still retains an unbounded callback queue");
 assert.doesNotMatch(
@@ -196,6 +192,15 @@ function createThrowingMessageChannelClass(stats) {
   };
 }
 
+function createConstructorThrowingMessageChannelClass(stats) {
+  return class ConstructorThrowingMessageChannel {
+    constructor() {
+      stats.created++;
+      throw new Error("synthetic MessageChannel constructor failure");
+    }
+  };
+}
+
 function percentile(values, fraction) {
   const sorted = [...values].sort((left, right) => left - right);
   return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * fraction))];
@@ -317,15 +322,14 @@ async function simulateUncappedYield(frameCount = 1440) {
   const frameTimes = presentTimes.slice(1).map((at, index) => at - presentTimes[index]);
   const averageFps = 1000 / (frameTimes.reduce((total, value) => total + value, 0) / frameTimes.length);
   const onePercentLow = onePercentLowFps(frameTimes);
-  const fairYieldCount = Math.floor(frameCount / UNCAPPED_FAIR_YIELD_CADENCE);
   assert.equal(browser.rafRequests, 0, "uncapped pacing unexpectedly waited for rAF");
   assert.equal(telemetry.swapInterval, 0);
   assert.equal(telemetry.uncappedYieldCount, frameCount);
   assert.equal(telemetry.vsyncYieldCount || 0, 0);
   assert.equal(telemetry.presentToRafCount || 0, 0);
-  assert.equal(telemetry.messageChannelYieldCount, frameCount - fairYieldCount);
-  assert.equal(telemetry.timerYieldCount, fairYieldCount);
-  assert.equal(telemetry.fairYieldCount, fairYieldCount);
+  assert.equal(telemetry.messageChannelYieldCount, frameCount);
+  assert.equal(telemetry.timerYieldCount || 0, 0);
+  assert.equal(telemetry.fairYieldCount || 0, 0);
   assert.equal(telemetry.schedulerYieldCount || 0, 0);
   assert.equal(telemetry.yieldRequestCount, frameCount);
   assert.equal(telemetry.yieldCompletionCount, frameCount);
@@ -343,15 +347,15 @@ async function simulateUncappedYield(frameCount = 1440) {
   return {averageFps, onePercentLow};
 }
 
-async function simulateSchedulerFairYield(frameCount = 64) {
+async function simulateSchedulerIsolation(frameCount = 64) {
   const browser = new VirtualBrowser({refreshRate: 60, timerClamp: 4, messageDelay: 0.01});
   const telemetry = {enabled: true};
   const window = {__gaiusFrameTelemetry: telemetry};
-  window.scheduler = {
-    yield: () => ({
-      then: resolve => browser.schedule(browser.now + browser.messageDelay, resolve, "scheduler"),
-    }),
-  };
+  let schedulerYieldAttempts = 0;
+  window.scheduler = {yield: () => {
+    schedulerYieldAttempts++;
+    return {then: resolve => browser.schedule(browser.now + browser.messageDelay, resolve, "scheduler")};
+  }};
   const context = vm.createContext({
     Date: {now: () => browser.now},
     clearTimeout: handle => browser.clearTimeout(handle),
@@ -372,14 +376,12 @@ async function simulateSchedulerFairYield(frameCount = 64) {
   present();
   browser.runUntil(() => completed === frameCount);
 
-  const fairYieldCount = Math.floor(frameCount / UNCAPPED_FAIR_YIELD_CADENCE);
-  assert.equal(telemetry.fairYieldCount, fairYieldCount,
-    "scheduler.yield fairness cadence changed unexpectedly");
-  assert.equal(telemetry.schedulerYieldCount, fairYieldCount,
-    "Web Scheduling API fairness path was not used");
-  assert.equal(telemetry.timerYieldCount || 0, 0,
-    "scheduler.yield unexpectedly fell back to a clamped timer");
-  assert.equal(telemetry.messageChannelYieldCount, frameCount - fairYieldCount);
+  assert.equal(schedulerYieldAttempts, 0,
+    "visible uncapped pacing unexpectedly entered the browser scheduler.yield path");
+  assert.equal(telemetry.fairYieldCount || 0, 0);
+  assert.equal(telemetry.schedulerYieldCount || 0, 0);
+  assert.equal(telemetry.timerYieldCount || 0, 0);
+  assert.equal(telemetry.messageChannelYieldCount, frameCount);
   assert.equal(telemetry.pendingYieldCount, 0);
   assert.equal(telemetry.yieldCompletionCount, frameCount);
 }
@@ -410,8 +412,7 @@ async function simulateDeadMessageChannel(frameCount = 2048) {
   present();
   browser.runUntil(() => completed === frameCount);
 
-  const fairYieldCount = Math.floor(frameCount / UNCAPPED_FAIR_YIELD_CADENCE);
-  const messageAttempts = frameCount - fairYieldCount;
+  const messageAttempts = frameCount;
   const scheduler = window.__gaiusFrameYieldScheduler;
   assert.equal(telemetry.yieldRequestCount, frameCount);
   assert.equal(telemetry.yieldCompletionCount, frameCount);
@@ -419,7 +420,7 @@ async function simulateDeadMessageChannel(frameCount = 2048) {
   assert.equal(telemetry.cancelledMessageTaskCount, messageAttempts);
   assert.equal(telemetry.messageChannelRebuildCount, messageAttempts);
   assert.equal(telemetry.watchdogYieldCount, messageAttempts);
-  assert.equal(telemetry.fairYieldCount, fairYieldCount);
+  assert.equal(telemetry.fairYieldCount || 0, 0);
   assert.equal(scheduler.tasks.size, 0,
     "dead MessageChannel retained completed TeaVM continuations");
   assert.equal(scheduler.channel, null,
@@ -455,8 +456,7 @@ async function simulateThrowingMessageChannel(frameCount = 128) {
   present();
   browser.runUntil(() => completed === frameCount);
 
-  const fairYieldCount = Math.floor(frameCount / UNCAPPED_FAIR_YIELD_CADENCE);
-  const failedPosts = frameCount - fairYieldCount;
+  const failedPosts = frameCount;
   const scheduler = window.__gaiusFrameYieldScheduler;
   assert.equal(telemetry.yieldCompletionCount, frameCount);
   assert.equal(telemetry.pendingYieldCount, 0);
@@ -471,6 +471,44 @@ async function simulateThrowingMessageChannel(frameCount = 128) {
   assert.equal(channelStats.created, failedPosts);
   assert.equal(channelStats.closed, failedPosts);
   assert.equal(channelStats.posts, failedPosts);
+}
+
+async function simulateUnavailableMessageChannel({constructorThrows = false} = {}) {
+  const browser = new VirtualBrowser({refreshRate: 60, timerClamp: 4});
+  const telemetry = {enabled: true};
+  const window = {__gaiusFrameTelemetry: telemetry};
+  const channelStats = {created: 0};
+  const MessageChannel = constructorThrows
+    ? createConstructorThrowingMessageChannelClass(channelStats)
+    : undefined;
+  const context = vm.createContext({
+    Date: {now: () => browser.now},
+    clearTimeout: handle => browser.clearTimeout(handle),
+    Map,
+    Math,
+    MessageChannel,
+    Number,
+    performance: {now: () => browser.now},
+    requestAnimationFrame: callback => browser.requestAnimationFrame(callback),
+    setTimeout: (callback, delay) => browser.setTimeout(callback, delay),
+    window,
+  });
+  const scheduleYield = vm.runInContext(`(hidden, interval, resume) => {${frameYieldScript}}`, context);
+  let completed = 0;
+  scheduleYield(false, 0, () => completed++);
+  browser.runUntil(() => completed === 1);
+
+  assert.equal(telemetry.yieldRequestCount, 1);
+  assert.equal(telemetry.yieldCompletionCount, 1);
+  assert.equal(telemetry.timerYieldCount, 1);
+  assert.equal(telemetry.messageChannelYieldCount || 0, 0);
+  assert.equal(telemetry.messageChannelCreateFailureCount || 0, constructorThrows ? 1 : 0);
+  assert.equal(telemetry.messageChannelPostFailureCount || 0, 0);
+  assert.equal(telemetry.pendingYieldCount, 0);
+  assert.equal(telemetry.maxPendingYieldCount, 1);
+  assert.equal(telemetry.duplicateYieldCallbackCount, 0);
+  assert.equal(window.__gaiusFrameYieldScheduler.tasks.size, 0);
+  assert.equal(channelStats.created, constructorThrows ? 1 : 0);
 }
 
 function simulateFixedTimer(frameCount = 720) {
@@ -618,9 +656,11 @@ async function simulateOverlappingYields() {
 const visiblePresents = await simulateVisibleYield(120);
 const highRefreshPresents = await simulateVisibleYield(144);
 const uncapped = await simulateUncappedYield();
-await simulateSchedulerFairYield();
+await simulateSchedulerIsolation();
 await simulateDeadMessageChannel();
 await simulateThrowingMessageChannel();
+await simulateUnavailableMessageChannel();
+await simulateUnavailableMessageChannel({constructorThrows: true});
 await simulateHiddenYield();
 await simulateStalledRafYield();
 await simulateStalledMessageYield();

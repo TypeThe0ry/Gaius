@@ -4,6 +4,24 @@ import {MessageChannel, Worker} from "node:worker_threads";
 
 const bootstrapPath = new URL("../web/singleplayer/server-worker-bootstrap.js", import.meta.url);
 const bootstrap = await readFile(bootstrapPath, "utf8");
+assert.ok(bootstrap.includes('message.type === "diagnostic-config"'),
+  "Worker bootstrap lost the pre-start diagnostic config message");
+assert.ok(bootstrap.includes("root.__gaiusMobAiTelemetry = true"),
+  "Worker bootstrap does not enable Mob AI telemetry from diagnostic config");
+for (const field of [
+  "pumpAllTurns",
+  "pumpAllChannelsVisited",
+  "pumpAllBudgetYields",
+  "pumpAllMaxTurnMillis",
+  "pumpAllMaxChannelsPerTurn",
+  "pumpAllLastTurnMillis",
+  "pumpAllLastChannelsVisited",
+]) {
+  assert.ok(bootstrap.includes(field),
+    `Worker bootstrap lost global-pump telemetry field: ${field}`);
+}
+assert.ok(bootstrap.includes("globalPump: snapshotGlobalPumpTelemetry"),
+  "Worker heartbeat did not expose the fixed globalPump side-band");
 const sessionId = "5123456789abcdef0123456789abcdef";
 const storageConfig = Object.freeze({
   profileId: "26.2",
@@ -352,6 +370,15 @@ const telemetryPong = await waitForTelemetry(17);
 assert.equal(telemetryPong.sequence, 17, "heartbeat sequence was not preserved");
 assert.equal(telemetryPong.measurementId, "measurement-a");
 assert.ok(telemetryPong.workerResetAt > 0, "Worker did not expose its measurement reset time");
+assert.deepEqual({...telemetryPong.globalPump}, {
+  pumpAllTurns: null,
+  pumpAllChannelsVisited: null,
+  pumpAllBudgetYields: null,
+  pumpAllMaxTurnMillis: null,
+  pumpAllMaxChannelsPerTurn: null,
+  pumpAllLastTurnMillis: null,
+  pumpAllLastChannelsVisited: null,
+}, "Worker heartbeat did not expose a fixed globalPump shape");
 assert.deepEqual({...telemetryPong.chunkPriority}, {
   playerUpdates: 0,
   pops: 0,
@@ -441,6 +468,37 @@ assert.equal(repeatedNewMeasurementPong.workerResetAt, newMeasurementPong.worker
   "repeated new measurement ping reset more than once");
 assert.equal(repeatedNewMeasurementPong.worldgen.slices, 1);
 assert.equal(repeatedNewMeasurementPong.chunkPriority.pops, 1);
+
+// Deliberately put more than the generic 64 scalar slots ahead of pumpAll*.
+// The network snapshot must stay capped, while the fixed side-band remains
+// complete and numeric.
+const capProbeNetwork = {};
+for (let index = 0; index < 70; index++) {
+  capProbeNetwork[`capProbe${index}`] = index;
+}
+Object.assign(capProbeNetwork, {
+  pumpAllTurns: 77,
+  pumpAllChannelsVisited: 123,
+  pumpAllBudgetYields: 9,
+  pumpAllMaxTurnMillis: 3.5,
+  pumpAllMaxChannelsPerTurn: 8,
+  pumpAllLastTurnMillis: 1.25,
+  pumpAllLastChannelsVisited: 7,
+});
+worker.postMessage({type: "mutate-telemetry", network: capProbeNetwork});
+worker.postMessage({type: "telemetry-ping", sessionId, sequence: 21, measurementId: "measurement-b"});
+const cappedNetworkPong = await waitForTelemetry(21);
+assert.equal(cappedNetworkPong.network.pumpAllTurns, undefined,
+  "generic network snapshot leaked a capped global-pump field");
+assert.deepEqual({...cappedNetworkPong.globalPump}, {
+  pumpAllTurns: 77,
+  pumpAllChannelsVisited: 123,
+  pumpAllBudgetYields: 9,
+  pumpAllMaxTurnMillis: 3.5,
+  pumpAllMaxChannelsPerTurn: 8,
+  pumpAllLastTurnMillis: 1.25,
+  pumpAllLastChannelsVisited: 7,
+}, "fixed globalPump side-band was truncated with network scalars");
 
 const duplicateChannel = new MessageChannel();
 const duplicateMessages = [];

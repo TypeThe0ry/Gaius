@@ -150,6 +150,179 @@ function componentResult(checks, externalSmokeRequired = []) {
   };
 }
 
+export const REQUIRED_UNCAPPED_FRAME_PACING_FIELDS = Object.freeze([
+  "swapInterval",
+  "uncappedYieldCount",
+  "vsyncYieldCount",
+  "visibleYieldCount",
+  "hiddenYieldCount",
+  "presentToRafCount",
+  "messageChannelYieldCount",
+  "fairYieldCount",
+  "schedulerYieldCount",
+  "timerYieldCount",
+  "yieldRequestCount",
+  "yieldCompletionCount",
+  "pendingYieldCount",
+  "maxPendingYieldCount",
+  "duplicateYieldCallbackCount",
+  "messageChannelCreateFailureCount",
+  "messageChannelPostFailureCount",
+  "messageChannelRebuildCount",
+  "cancelledMessageTaskCount",
+  "watchdogYieldCount",
+]);
+
+export const FRAME_PACING_MEASUREMENT_ID_FIELDS = Object.freeze([
+  "measurementId",
+  "measurementEpochId",
+]);
+
+const FRAME_PACING_SNAPSHOT_METADATA_FIELDS = Object.freeze([
+  "capturedAt",
+  "controllerRequestedAt",
+  "controllerReceivedAt",
+  "evaluationLatencyMillis",
+  "deadlineExceeded",
+  "cutoffYieldRequestCount",
+]);
+
+export function mergeFramePacingTelemetrySources({
+  frame = null,
+  runtime = null,
+  requiredFields = REQUIRED_UNCAPPED_FRAME_PACING_FIELDS,
+  label = "frame-pacing",
+} = {}) {
+  const frameSource = frame && typeof frame === "object" ? frame : {};
+  const runtimeSource = runtime && typeof runtime === "object" ? runtime : {};
+  const merged = {};
+  const overlapMismatches = [];
+  for (const field of [...requiredFields, ...FRAME_PACING_MEASUREMENT_ID_FIELDS]) {
+    const frameHas = Object.hasOwn(frameSource, field);
+    const runtimeHas = Object.hasOwn(runtimeSource, field);
+    if (frameHas && runtimeHas && !Object.is(frameSource[field], runtimeSource[field])) {
+      overlapMismatches.push({
+        label,
+        field,
+        frame: frameSource[field],
+        runtime: runtimeSource[field],
+      });
+    }
+    if (runtimeHas) merged[field] = runtimeSource[field];
+    if (frameHas) merged[field] = frameSource[field];
+  }
+  return {merged, overlapMismatches};
+}
+
+/**
+ * Produces the exact scalar object consumed by both the benchmark child and the
+ * release parent. Strict release evidence has two independently serialized
+ * sources (`frame` and `runtimeInvariants.framePacing`); neither source may be
+ * absent or omit a required counter/epoch field.
+ */
+export function normalizeFramePacingEvidenceSnapshot(snapshot, {
+  requiredFields = REQUIRED_UNCAPPED_FRAME_PACING_FIELDS,
+  label = "frame-pacing",
+  requireDualSources = false,
+} = {}) {
+  const value = snapshot && typeof snapshot === "object" && !Array.isArray(snapshot)
+    ? snapshot : {};
+  const frame = value.frame && typeof value.frame === "object" && !Array.isArray(value.frame)
+    ? value.frame : null;
+  const runtime = value.runtimeInvariants?.framePacing
+    && typeof value.runtimeInvariants.framePacing === "object"
+    && !Array.isArray(value.runtimeInvariants.framePacing)
+    ? value.runtimeInvariants.framePacing : null;
+  const expectedSourceFields = [...requiredFields, ...FRAME_PACING_MEASUREMENT_ID_FIELDS];
+  const sourceCompletenessFailures = [];
+  if (requireDualSources) {
+    for (const [sourceName, source] of [["frame", frame], ["runtime", runtime]]) {
+      if (source == null) {
+        sourceCompletenessFailures.push({label, source: sourceName, field: "<source>"});
+        continue;
+      }
+      for (const field of expectedSourceFields) {
+        if (!Object.hasOwn(source, field)) {
+          sourceCompletenessFailures.push({label, source: sourceName, field});
+        }
+      }
+    }
+    for (const field of FRAME_PACING_MEASUREMENT_ID_FIELDS) {
+      if (!Object.hasOwn(value, field)) {
+        sourceCompletenessFailures.push({label, source: "top-level", field});
+      }
+    }
+  }
+  const sources = frame != null || runtime != null
+    ? mergeFramePacingTelemetrySources({frame, runtime, requiredFields, label})
+    : {
+        merged: Object.fromEntries(expectedSourceFields
+          .filter((field) => Object.hasOwn(value, field))
+          .map((field) => [field, value[field]])),
+        overlapMismatches: [],
+      };
+  const merged = {...sources.merged};
+  const overlapMismatches = [...sources.overlapMismatches];
+  for (const field of expectedSourceFields) {
+    if (Object.hasOwn(value, field) && Object.hasOwn(merged, field)
+        && !Object.is(value[field], merged[field])) {
+      overlapMismatches.push({
+        label,
+        field,
+        source: "top-level",
+        topLevel: value[field],
+        merged: merged[field],
+      });
+    }
+  }
+  for (const field of FRAME_PACING_SNAPSHOT_METADATA_FIELDS) {
+    if (Object.hasOwn(value, field)) merged[field] = value[field];
+  }
+  return {
+    merged,
+    overlapMismatches,
+    sourceCompletenessFailures,
+  };
+}
+
+export function normalizeFramePacingSettlementEvidence(settlement, {
+  requiredFields = REQUIRED_UNCAPPED_FRAME_PACING_FIELDS,
+  label = "settlement",
+  requireDualSources = false,
+} = {}) {
+  const value = settlement && typeof settlement === "object" && !Array.isArray(settlement)
+    ? settlement : null;
+  if (value == null) {
+    return {settlement: null, overlapMismatches: [], sourceCompletenessFailures: []};
+  }
+  const sampleResults = (Array.isArray(value.samples) ? value.samples : []).map((sample, index) =>
+    normalizeFramePacingEvidenceSnapshot(sample, {
+      requiredFields,
+      label: `${label}.samples[${index}]`,
+      requireDualSources,
+    }));
+  const finalResult = normalizeFramePacingEvidenceSnapshot(value.final, {
+    requiredFields,
+    label: `${label}.final`,
+    requireDualSources,
+  });
+  return {
+    settlement: {
+      ...value,
+      samples: sampleResults.map(({merged}) => merged),
+      final: finalResult.merged,
+    },
+    overlapMismatches: [
+      ...sampleResults.flatMap(({overlapMismatches}) => overlapMismatches),
+      ...finalResult.overlapMismatches,
+    ],
+    sourceCompletenessFailures: [
+      ...sampleResults.flatMap(({sourceCompletenessFailures}) => sourceCompletenessFailures),
+      ...finalResult.sourceCompletenessFailures,
+    ],
+  };
+}
+
 /**
  * Proves that a measured run used the uncapped scheduler, rather than merely
  * carrying an Unlimited/VSync-off option in options.txt.
@@ -157,6 +330,12 @@ function componentResult(checks, externalSmokeRequired = []) {
 export function evaluateUncappedFramePacing({
   samples = [],
   final = null,
+  settlement = null,
+  cleanup = null,
+  measurementEpochId = null,
+  requireEpochClosure = false,
+  sourceOverlapMismatches = [],
+  timing = null,
   requirements = {},
 } = {}) {
   const finiteTelemetryValue = (value) =>
@@ -168,10 +347,15 @@ export function evaluateUncappedFramePacing({
     1,
     Math.floor(Number(requirements.minimumUncappedYieldCount) || 1),
   );
-  const minimumFairYieldCount = Math.max(
+  const minimumMessageChannelYieldCount = Math.max(
     1,
-    Math.floor(Number(requirements.minimumFairYieldCount) || 1),
+    Math.floor(Number(requirements.minimumMessageChannelYieldCount) || 1),
   );
+  const yieldPathLimits = {
+    fairYieldCount: Math.max(0, Math.floor(Number(requirements.maximumFairYieldCount) || 0)),
+    schedulerYieldCount: Math.max(0, Math.floor(Number(requirements.maximumSchedulerYieldCount) || 0)),
+    timerYieldCount: Math.max(0, Math.floor(Number(requirements.maximumTimerYieldCount) || 0)),
+  };
   const maximumVsyncYieldCount = Math.max(
     0,
     Math.floor(Number(requirements.maximumVsyncYieldCount) || 0),
@@ -202,19 +386,37 @@ export function evaluateUncappedFramePacing({
       Math.floor(Number(requirements.maximumWatchdogYieldCount) || 0),
     ),
   };
-  const requiredFields = [
-    "swapInterval",
-    "uncappedYieldCount",
-    "vsyncYieldCount",
-    "presentToRafCount",
-    "fairYieldCount",
-    ...Object.keys(healthLimits),
-  ];
-  const entries = (Array.isArray(samples) ? samples : [])
-    .filter((sample) => sample && typeof sample === "object")
+  const requireSettlement = requirements.requireFramePacingSettlement === true;
+  const requiredSettlementSchemaVersion = Number.isSafeInteger(
+    requirements.settlementSchemaVersion,
+  ) ? requirements.settlementSchemaVersion : 1;
+  const settlementPollIntervalMillisMin = Number.isFinite(
+    Number(requirements.settlementPollIntervalMillisMin),
+  ) ? Number(requirements.settlementPollIntervalMillisMin) : 5;
+  const settlementPollIntervalMillisMax = Number.isFinite(
+    Number(requirements.settlementPollIntervalMillisMax),
+  ) ? Number(requirements.settlementPollIntervalMillisMax) : 10;
+  const settlementTimeoutMillisMin = Number.isFinite(
+    Number(requirements.settlementTimeoutMillisMin),
+  ) ? Number(requirements.settlementTimeoutMillisMin) : 150;
+  const settlementTimeoutMillisMax = Number.isFinite(
+    Number(requirements.settlementTimeoutMillisMax),
+  ) ? Number(requirements.settlementTimeoutMillisMax) : 250;
+  const configuredSettlementPollIntervalMillis = Number.isSafeInteger(
+    requirements.settlementPollIntervalMillis,
+  ) ? requirements.settlementPollIntervalMillis : 8;
+  const configuredSettlementTimeoutMillis = Number.isSafeInteger(
+    requirements.settlementTimeoutMillis,
+  ) ? requirements.settlementTimeoutMillis : 200;
+  const requiredFields = [...REQUIRED_UNCAPPED_FRAME_PACING_FIELDS];
+  const counterFields = requiredFields.filter((field) => field !== "swapInterval");
+  const monotonicCounterFields = counterFields.filter((field) => field !== "pendingYieldCount");
+  const isSafeCounter = (value) => Number.isSafeInteger(value) && value >= 0;
+  const rawSampleValues = Array.isArray(samples) ? samples : [];
+  const rawEntries = rawSampleValues
     .map((sample) => Object.fromEntries(requiredFields.map((field) => [
       field,
-      finiteTelemetryValue(sample[field]),
+      finiteTelemetryValue(sample?.[field]),
     ])));
   const finalEntry = final && typeof final === "object"
     ? Object.fromEntries(requiredFields.map((field) => [
@@ -222,11 +424,39 @@ export function evaluateUncappedFramePacing({
       finiteTelemetryValue(final[field]),
     ]))
     : null;
-  const missingFields = [...new Set([
-    ...entries.flatMap((entry) => requiredFields.filter((field) => entry[field] == null)),
-    ...(finalEntry ? requiredFields.filter((field) => finalEntry[field] == null) : requiredFields),
-  ])];
-  const allEntries = finalEntry ? [...entries, finalEntry] : entries;
+  const missingFieldsFor = (entry) => requiredFields.filter((field) => entry?.[field] == null);
+  const sampleMissingFields = [...new Set(rawEntries.flatMap(missingFieldsFor))];
+  const entries = [];
+  const sampleCompletenessViolations = [];
+  let allowedResetSentinelSampleCount = 0;
+  let sawCompleteSample = false;
+  for (let index = 0; index < rawEntries.length; index++) {
+    const entry = rawEntries[index];
+    const missing = missingFieldsFor(entry);
+    if (missing.length === 0) {
+      sawCompleteSample = true;
+      entries.push(entry);
+      continue;
+    }
+    const rawSample = rawSampleValues[index];
+    const isLeadingResetSentinel = !sawCompleteSample
+      && rawSample != null
+      && typeof rawSample === "object"
+      && Object.hasOwn(rawSample, "swapInterval")
+      && rawSample.swapInterval === null
+      && counterFields.every((field) => isSafeCounter(entry[field]) && entry[field] === 0);
+    if (isLeadingResetSentinel) {
+      allowedResetSentinelSampleCount++;
+    } else {
+      sampleCompletenessViolations.push({index, missing});
+    }
+  }
+  const incompleteSampleCount = rawEntries.length - entries.length;
+  const finalMissingFields = finalEntry ? missingFieldsFor(finalEntry) : [...requiredFields];
+  const finalComplete = finalEntry != null && finalMissingFields.length === 0;
+  const missingFields = [...finalMissingFields];
+  const allEntries = finalComplete ? [...entries, finalEntry] : entries;
+  const completeWindow = entries.length >= minimumSamples && finalComplete;
   const extrema = (field, direction) => {
     const values = allEntries.map((entry) => entry[field]).filter((value) => value != null);
     if (values.length === 0) return null;
@@ -237,26 +467,505 @@ export function evaluateUncappedFramePacing({
     swapIntervalMax: extrema("swapInterval", "max"),
     uncappedYieldCountMax: extrema("uncappedYieldCount", "max"),
     vsyncYieldCountMax: extrema("vsyncYieldCount", "max"),
+    visibleYieldCountMax: extrema("visibleYieldCount", "max"),
+    hiddenYieldCountMax: extrema("hiddenYieldCount", "max"),
     presentToRafCountMax: extrema("presentToRafCount", "max"),
+    messageChannelYieldCountMax: extrema("messageChannelYieldCount", "max"),
     fairYieldCountMax: extrema("fairYieldCount", "max"),
+    schedulerYieldCountMax: extrema("schedulerYieldCount", "max"),
+    timerYieldCountMax: extrema("timerYieldCount", "max"),
+    yieldRequestCountMax: extrema("yieldRequestCount", "max"),
+    yieldCompletionCountMax: extrema("yieldCompletionCount", "max"),
+    pendingYieldCountMin: extrema("pendingYieldCount", "min"),
+    pendingYieldCountMax: extrema("pendingYieldCount", "max"),
+    maxPendingYieldCountMax: extrema("maxPendingYieldCount", "max"),
+    duplicateYieldCallbackCountMax: extrema("duplicateYieldCallbackCount", "max"),
     messageChannelCreateFailureCountMax: extrema("messageChannelCreateFailureCount", "max"),
     messageChannelPostFailureCountMax: extrema("messageChannelPostFailureCount", "max"),
     messageChannelRebuildCountMax: extrema("messageChannelRebuildCount", "max"),
     cancelledMessageTaskCountMax: extrema("cancelledMessageTaskCount", "max"),
     watchdogYieldCountMax: extrema("watchdogYieldCount", "max"),
   };
+  const unsafeCounterValues = [];
+  for (let index = 0; index < allEntries.length; index++) {
+    for (const field of counterFields) {
+      if (!isSafeCounter(allEntries[index][field])) {
+        unsafeCounterValues.push({index, field, value: allEntries[index][field]});
+      }
+    }
+  }
+  const counterDecreases = [];
+  for (let index = 1; index < allEntries.length; index++) {
+    for (const field of monotonicCounterFields) {
+      if (allEntries[index][field] < allEntries[index - 1][field]) {
+        counterDecreases.push({
+          index,
+          field,
+          previous: allEntries[index - 1][field],
+          current: allEntries[index][field],
+        });
+      }
+    }
+  }
+  const snapshotIsConsistent = (entry) => entry.yieldRequestCount
+      === entry.uncappedYieldCount + entry.vsyncYieldCount
+    && entry.yieldRequestCount === entry.visibleYieldCount + entry.hiddenYieldCount
+    && entry.yieldCompletionCount === entry.messageChannelYieldCount
+      + entry.schedulerYieldCount + entry.timerYieldCount
+    && entry.pendingYieldCount === entry.yieldRequestCount - entry.yieldCompletionCount
+    && entry.pendingYieldCount >= 0
+    && entry.pendingYieldCount <= 1
+    && entry.maxPendingYieldCount === (entry.yieldRequestCount > 0 ? 1 : 0)
+    && entry.duplicateYieldCallbackCount === 0;
+  const visibleUncappedIsConsistent = (entry) => entry.swapInterval === requiredSwapInterval
+    && entry.hiddenYieldCount === 0
+    && entry.vsyncYieldCount === 0
+    && entry.presentToRafCount === 0
+    && entry.fairYieldCount === 0
+    && entry.schedulerYieldCount === 0
+    && entry.timerYieldCount === 0
+    && entry.uncappedYieldCount - entry.messageChannelYieldCount === entry.pendingYieldCount;
+  const normalizedSourceOverlapMismatches = Array.isArray(sourceOverlapMismatches)
+    ? sourceOverlapMismatches.slice(0, 64) : [];
+  const timingEvidence = {
+    lastSampleAt: timing?.lastSampleAt ?? null,
+    finalCapturedAt: timing?.finalCapturedAt ?? null,
+    settlementCapturedAt: timing?.settlementCapturedAt ?? null,
+    cleanupCapturedAt: timing?.cleanupCapturedAt ?? null,
+  };
+  const requiredTimingValues = requireEpochClosure
+    ? Object.values(timingEvidence)
+    : [timingEvidence.lastSampleAt, timingEvidence.finalCapturedAt,
+      timingEvidence.settlementCapturedAt];
+  const timingFieldsComplete = requiredTimingValues
+    .every((value) => Number.isSafeInteger(value) && value >= 0);
+  const timingConsistent = timingFieldsComplete
+    && timingEvidence.finalCapturedAt > timingEvidence.lastSampleAt
+    && timingEvidence.settlementCapturedAt > timingEvidence.finalCapturedAt
+    && (!requireEpochClosure
+      || timingEvidence.cleanupCapturedAt > timingEvidence.settlementCapturedAt);
+
+  const rawSettlementSamples = Array.isArray(settlement?.samples) ? settlement.samples : [];
+  const settlementEntries = rawSettlementSamples.map((sample) =>
+    Object.fromEntries(requiredFields.map((field) => [
+      field,
+      finiteTelemetryValue(sample?.[field]),
+    ])));
+  const settlementFinalEntry = settlement?.final && typeof settlement.final === "object"
+    ? Object.fromEntries(requiredFields.map((field) => [
+        field,
+        finiteTelemetryValue(settlement.final[field]),
+      ]))
+    : null;
+  const settlementMissingFields = [...new Set([
+    ...settlementEntries.flatMap(missingFieldsFor),
+    ...missingFieldsFor(settlementFinalEntry),
+  ])];
+  const settlementSequence = finalComplete
+    ? [finalEntry, ...settlementEntries, ...(settlementFinalEntry ? [settlementFinalEntry] : [])]
+    : [...settlementEntries, ...(settlementFinalEntry ? [settlementFinalEntry] : [])];
+  const settlementUnsafeCounters = [];
+  const settlementCounterDecreases = [];
+  const settlementInvariantFailures = [];
+  const settlementVisiblePathFailures = [];
+  const settlementHealthFailures = [];
+  for (let index = 0; index < settlementSequence.length; index++) {
+    const entry = settlementSequence[index];
+    for (const field of counterFields) {
+      if (!isSafeCounter(entry[field])) {
+        settlementUnsafeCounters.push({index, field, value: entry[field]});
+      }
+    }
+    if (!snapshotIsConsistent(entry)) settlementInvariantFailures.push(index);
+    if (!visibleUncappedIsConsistent(entry)) settlementVisiblePathFailures.push(index);
+    for (const field of Object.keys(healthLimits)) {
+      if (entry[field] !== 0) {
+        settlementHealthFailures.push({index, field, value: entry[field]});
+      }
+    }
+    if (index > 0) {
+      for (const field of monotonicCounterFields) {
+        if (entry[field] < settlementSequence[index - 1][field]) {
+          settlementCounterDecreases.push({
+            index,
+            field,
+            previous: settlementSequence[index - 1][field],
+            current: entry[field],
+          });
+        }
+      }
+    }
+  }
+  const settlementTimestampViolations = [];
+  let previousSettlementCapturedAt = timingEvidence.finalCapturedAt;
+  for (let index = 0; index < rawSettlementSamples.length; index++) {
+    const capturedAt = rawSettlementSamples[index]?.capturedAt;
+    if (!Number.isSafeInteger(capturedAt) || capturedAt < 0
+        || !Number.isSafeInteger(previousSettlementCapturedAt)
+        || capturedAt <= previousSettlementCapturedAt) {
+      settlementTimestampViolations.push({index, capturedAt, previous: previousSettlementCapturedAt});
+    }
+    if (Number.isSafeInteger(capturedAt)) previousSettlementCapturedAt = capturedAt;
+  }
+  const settlementFinalMatchesLastSample = settlementFinalEntry != null
+    && settlementEntries.length > 0
+    && requiredFields.every((field) => Object.is(
+      settlementFinalEntry[field],
+      settlementEntries.at(-1)[field],
+    ))
+    && (!requireEpochClosure || [
+      ...FRAME_PACING_MEASUREMENT_ID_FIELDS,
+      "capturedAt",
+      "controllerRequestedAt",
+      "controllerReceivedAt",
+      "evaluationLatencyMillis",
+      "deadlineExceeded",
+    ].every((field) => Object.is(settlement?.final?.[field], rawSettlementSamples.at(-1)?.[field])));
+  const settlementInitialPending = finalEntry?.pendingYieldCount ?? null;
+  const expectedSettlementCompletionDelta = settlementInitialPending === 1 ? 1 : 0;
+  const settlementMessageDelta = settlementFinalEntry && finalEntry
+    ? settlementFinalEntry.messageChannelYieldCount - finalEntry.messageChannelYieldCount : null;
+  const settlementCompletionDelta = settlementFinalEntry && finalEntry
+    ? settlementFinalEntry.yieldCompletionCount - finalEntry.yieldCompletionCount : null;
+  const settlementMaximumSampleCount = Number.isSafeInteger(settlement?.pollIntervalMillis)
+      && settlement.pollIntervalMillis > 0
+      && Number.isSafeInteger(settlement?.timeoutMillis)
+      && settlement.timeoutMillis >= 0
+    ? Math.ceil(settlement.timeoutMillis / settlement.pollIntervalMillis) + 1 : 0;
+  const settlementElapsedMillis = Number.isSafeInteger(settlement?.capturedAt)
+      && Number.isSafeInteger(settlement?.initialCapturedAt)
+    ? settlement.capturedAt - settlement.initialCapturedAt : null;
+  const controllerTimingViolations = [];
+  const maximumControllerScalarMillis = configuredSettlementTimeoutMillis
+    + configuredSettlementPollIntervalMillis;
+  const validateControllerScalarTiming = (value, label) => {
+    const requestedAt = value?.controllerRequestedAt;
+    const receivedAt = value?.controllerReceivedAt;
+    const capturedAt = value?.capturedAt;
+    const latency = value?.evaluationLatencyMillis;
+    const valid = Number.isSafeInteger(requestedAt) && requestedAt >= 0
+      && Number.isSafeInteger(receivedAt) && receivedAt >= requestedAt
+      && Number.isSafeInteger(capturedAt) && capturedAt >= requestedAt && capturedAt <= receivedAt
+      && Number.isSafeInteger(latency) && latency >= 0
+      && latency === receivedAt - requestedAt
+      && latency <= maximumControllerScalarMillis
+      && value?.deadlineExceeded === false;
+    if (!valid) {
+      controllerTimingViolations.push({
+        label,
+        controllerRequestedAt: requestedAt ?? null,
+        controllerReceivedAt: receivedAt ?? null,
+        capturedAt: capturedAt ?? null,
+        evaluationLatencyMillis: latency ?? null,
+        deadlineExceeded: value?.deadlineExceeded ?? null,
+      });
+    }
+  };
+  if (requireEpochClosure) {
+    validateControllerScalarTiming(final, "final");
+    rawSettlementSamples.forEach((sample, index) =>
+      validateControllerScalarTiming(sample, `settlement.samples[${index}]`));
+    validateControllerScalarTiming(settlement?.final, "settlement.final");
+    if (final?.controllerRequestedAt < timingEvidence.lastSampleAt) {
+      controllerTimingViolations.push({
+        label: "final-after-last-sample",
+        controllerRequestedAt: final?.controllerRequestedAt ?? null,
+        lastSampleAt: timingEvidence.lastSampleAt,
+      });
+    }
+  }
+  let previousSettlementControllerRequestedAt = null;
+  let previousSettlementControllerReceivedAt = null;
+  if (requireEpochClosure) {
+    rawSettlementSamples.forEach((sample, index) => {
+      const requestedAt = sample?.controllerRequestedAt;
+      const receivedAt = sample?.controllerReceivedAt;
+      const minimumRequestedAt = index === 0
+        ? settlement?.controllerStartedAt : previousSettlementControllerReceivedAt;
+      if (!Number.isSafeInteger(minimumRequestedAt)
+          || !Number.isSafeInteger(requestedAt)
+          || requestedAt < minimumRequestedAt) {
+        controllerTimingViolations.push({
+          label: index === 0
+            ? "settlement-first-request-before-controller-start"
+            : "settlement-controller-ranges-overlap",
+          index,
+          controllerRequestedAt: requestedAt ?? null,
+          minimumControllerRequestedAt: minimumRequestedAt ?? null,
+          previousControllerReceivedAt: previousSettlementControllerReceivedAt,
+        });
+      }
+      if (index > 0 && (!Number.isSafeInteger(previousSettlementControllerRequestedAt)
+          || !Number.isSafeInteger(requestedAt)
+          || requestedAt < previousSettlementControllerRequestedAt)) {
+        controllerTimingViolations.push({
+          label: "settlement-controller-request-decreased",
+          index,
+          controllerRequestedAt: requestedAt ?? null,
+          previousControllerRequestedAt: previousSettlementControllerRequestedAt,
+        });
+      }
+      previousSettlementControllerRequestedAt = requestedAt;
+      previousSettlementControllerReceivedAt = receivedAt;
+    });
+  }
+  const settlementControllerSamplesSerial = !requireEpochClosure
+    || controllerTimingViolations.every(({label}) => !String(label).startsWith("settlement-"));
+  const settlementControllerMetadataConsistent = !requireEpochClosure || (
+    Number.isSafeInteger(settlement?.controllerStartedAt)
+    && settlement.controllerStartedAt >= 0
+    && Number.isSafeInteger(settlement?.controllerCompletedAt)
+    && settlement.controllerCompletedAt >= settlement.controllerStartedAt
+    && settlement.controllerStartedAt >= final?.controllerReceivedAt
+    && Number.isSafeInteger(settlement?.controllerElapsedMillis)
+    && settlement.controllerElapsedMillis
+      === settlement.controllerCompletedAt - settlement.controllerStartedAt
+    && settlement.controllerElapsedMillis <= maximumControllerScalarMillis
+    && settlement?.deadlineExceeded === false
+    && settlementControllerSamplesSerial
+    && rawSettlementSamples.every((sample) =>
+      sample.controllerRequestedAt >= settlement.controllerStartedAt
+      && sample.controllerReceivedAt <= settlement.controllerCompletedAt)
+  );
+  const settlementMetadataConsistent = settlement != null
+    && settlement.schemaVersion === requiredSettlementSchemaVersion
+    && Number.isSafeInteger(settlement.pollIntervalMillis)
+    && settlement.pollIntervalMillis === configuredSettlementPollIntervalMillis
+    && settlement.pollIntervalMillis >= settlementPollIntervalMillisMin
+    && settlement.pollIntervalMillis <= settlementPollIntervalMillisMax
+    && Number.isSafeInteger(settlement.timeoutMillis)
+    && settlement.timeoutMillis === configuredSettlementTimeoutMillis
+    && settlement.timeoutMillis >= settlementTimeoutMillisMin
+    && settlement.timeoutMillis <= settlementTimeoutMillisMax
+    && settlement.initialCapturedAt === timingEvidence.finalCapturedAt
+    && settlement.capturedAt === timingEvidence.settlementCapturedAt
+    && settlement.capturedAt === rawSettlementSamples.at(-1)?.capturedAt
+    && rawSettlementSamples.length <= settlementMaximumSampleCount
+    && settlementElapsedMillis >= 0
+    && settlementElapsedMillis <= settlement.timeoutMillis + settlement.pollIntervalMillis
+    && settlement.initialPendingYieldCount === settlementInitialPending
+    && settlement.requiredMessageChannelCompletionDelta === expectedSettlementCompletionDelta
+    && settlement.messageChannelCompletionDelta === settlementMessageDelta
+    && settlement.yieldCompletionDelta === settlementCompletionDelta
+    && settlement.settled === true
+    && settlement.timedOut === false
+    && settlementControllerMetadataConsistent;
+  const settlementCompletionProved = expectedSettlementCompletionDelta === 0
+    ? settlementMessageDelta >= 0 && settlementCompletionDelta >= 0
+    : settlementMessageDelta >= 1 && settlementCompletionDelta >= 1;
+  const settlementComplete = settlement != null
+    && rawSettlementSamples.length > 0
+    && settlementMissingFields.length === 0
+    && settlementFinalMatchesLastSample;
+  const settlementPassed = settlementComplete
+    && settlementMetadataConsistent
+    && settlementCompletionProved
+    && settlementUnsafeCounters.length === 0
+    && settlementCounterDecreases.length === 0
+    && settlementInvariantFailures.length === 0
+    && settlementVisiblePathFailures.length === 0
+    && settlementHealthFailures.length === 0
+    && settlementTimestampViolations.length === 0
+    && controllerTimingViolations.length === 0;
+  const settlementEvidence = {
+    required: requireSettlement,
+    schemaVersion: settlement?.schemaVersion ?? null,
+    measurementId: settlement?.measurementId ?? null,
+    measurementEpochId: settlement?.measurementEpochId ?? null,
+    initialCapturedAt: settlement?.initialCapturedAt ?? null,
+    capturedAt: settlement?.capturedAt ?? null,
+    pollIntervalMillis: settlement?.pollIntervalMillis ?? null,
+    timeoutMillis: settlement?.timeoutMillis ?? null,
+    controllerStartedAt: settlement?.controllerStartedAt ?? null,
+    controllerCompletedAt: settlement?.controllerCompletedAt ?? null,
+    controllerElapsedMillis: settlement?.controllerElapsedMillis ?? null,
+    deadlineExceeded: settlement?.deadlineExceeded ?? null,
+    pollCount: rawSettlementSamples.length,
+    maximumPollCount: settlementMaximumSampleCount,
+    elapsedMillis: settlementElapsedMillis,
+    initialPendingYieldCount: settlementInitialPending,
+    requiredMessageChannelCompletionDelta: expectedSettlementCompletionDelta,
+    messageChannelCompletionDelta: settlementMessageDelta,
+    yieldCompletionDelta: settlementCompletionDelta,
+    settled: settlement?.settled === true,
+    timedOut: settlement?.timedOut === true,
+    missingFields: settlementMissingFields,
+    unsafeCounterValueCount: settlementUnsafeCounters.length,
+    counterDecreaseCount: settlementCounterDecreases.length,
+    snapshotInvariantFailureCount: settlementInvariantFailures.length,
+    visibleUncappedInvariantFailureCount: settlementVisiblePathFailures.length,
+    healthFailureCount: settlementHealthFailures.length,
+    healthFailures: settlementHealthFailures.slice(0, 16),
+    timestampViolationCount: settlementTimestampViolations.length,
+    controllerTimingViolationCount: controllerTimingViolations.length,
+    controllerTimingViolations: controllerTimingViolations.slice(0, 16),
+    controllerSamplesSerial: settlementControllerSamplesSerial,
+    controllerMetadataConsistent: settlementControllerMetadataConsistent,
+    finalMatchesLastSample: settlementFinalMatchesLastSample,
+    metadataConsistent: settlementMetadataConsistent,
+    completionProved: settlementCompletionProved,
+    finalControllerTiming: settlement?.final ? {
+      capturedAt: settlement.final.capturedAt ?? null,
+      controllerRequestedAt: settlement.final.controllerRequestedAt ?? null,
+      controllerReceivedAt: settlement.final.controllerReceivedAt ?? null,
+      evaluationLatencyMillis: settlement.final.evaluationLatencyMillis ?? null,
+      deadlineExceeded: settlement.final.deadlineExceeded ?? null,
+    } : null,
+    final: settlementFinalEntry,
+  };
+  const expectedMeasurementEpochId = typeof measurementEpochId === "string"
+      && measurementEpochId.length > 0
+    ? measurementEpochId : null;
+  const epochMismatches = [];
+  const validateMeasurementEpoch = (value, label) => {
+    const currentMeasurementId = value?.measurementId;
+    const currentEpochId = value?.measurementEpochId;
+    if (typeof currentMeasurementId !== "string" || currentMeasurementId.length === 0
+        || typeof currentEpochId !== "string" || currentEpochId.length === 0
+        || currentMeasurementId !== currentEpochId
+        || expectedMeasurementEpochId == null
+        || currentEpochId !== expectedMeasurementEpochId) {
+      epochMismatches.push({
+        label,
+        measurementId: currentMeasurementId ?? null,
+        measurementEpochId: currentEpochId ?? null,
+        expectedMeasurementEpochId,
+      });
+    }
+  };
+  if (requireEpochClosure) {
+    rawSampleValues.forEach((sample, index) =>
+      validateMeasurementEpoch(sample, `samples[${index}]`));
+    validateMeasurementEpoch(final, "final");
+    validateMeasurementEpoch(settlement, "settlement");
+    rawSettlementSamples.forEach((sample, index) =>
+      validateMeasurementEpoch(sample, `settlement.samples[${index}]`));
+    validateMeasurementEpoch(settlement?.final, "settlement.final");
+    validateMeasurementEpoch(cleanup, "cleanup");
+  }
+
+  const cleanupEntry = cleanup && typeof cleanup === "object"
+    ? Object.fromEntries(requiredFields.map((field) => [
+        field,
+        finiteTelemetryValue(cleanup[field]),
+      ]))
+    : null;
+  const cleanupMissingFields = cleanupEntry ? missingFieldsFor(cleanupEntry) : [...requiredFields];
+  const cleanupUnsafeCounters = cleanupEntry == null ? [...counterFields] : counterFields
+    .filter((field) => !isSafeCounter(cleanupEntry[field]));
+  const cleanupCounterDecreases = [];
+  if (cleanupEntry != null && settlementFinalEntry != null) {
+    for (const field of monotonicCounterFields) {
+      if (cleanupEntry[field] < settlementFinalEntry[field]) {
+        cleanupCounterDecreases.push({
+          field,
+          previous: settlementFinalEntry[field],
+          current: cleanupEntry[field],
+        });
+      }
+    }
+  }
+  const cleanupSnapshotConsistent = cleanupEntry != null && snapshotIsConsistent(cleanupEntry);
+  const cleanupVisiblePathConsistent = cleanupEntry != null
+    && visibleUncappedIsConsistent(cleanupEntry);
+  const cleanupHealthFailures = cleanupEntry == null ? Object.keys(healthLimits) : Object.keys(healthLimits)
+    .filter((field) => cleanupEntry[field] !== 0);
+  const cleanupCutoffYieldRequestCount = cleanup?.cutoffYieldRequestCount;
+  const cleanupCutoffConsistent = cleanupEntry != null
+    && settlementFinalEntry != null
+    && isSafeCounter(cleanupCutoffYieldRequestCount)
+    && cleanupCutoffYieldRequestCount === settlementFinalEntry.yieldRequestCount
+    && cleanupEntry.messageChannelYieldCount >= cleanupCutoffYieldRequestCount
+    && cleanupEntry.yieldCompletionCount >= cleanupCutoffYieldRequestCount;
+  const cleanupTimestampConsistent = Number.isSafeInteger(cleanup?.capturedAt)
+    && cleanup.capturedAt >= 0
+    && cleanup.capturedAt === timingEvidence.cleanupCapturedAt
+    && cleanup.capturedAt > timingEvidence.settlementCapturedAt;
+  const timingViolationsBeforeCleanup = controllerTimingViolations.length;
+  if (requireEpochClosure) {
+    validateControllerScalarTiming(cleanup, "cleanup");
+    if (cleanup?.controllerRequestedAt < settlement?.controllerCompletedAt) {
+      controllerTimingViolations.push({
+        label: "cleanup-after-settlement-controller",
+        controllerRequestedAt: cleanup?.controllerRequestedAt ?? null,
+        settlementControllerCompletedAt: settlement?.controllerCompletedAt ?? null,
+      });
+    }
+  }
+  const cleanupControllerTimingViolationCount = controllerTimingViolations.length
+    - timingViolationsBeforeCleanup;
+  const cleanupComplete = cleanupEntry != null && cleanupMissingFields.length === 0;
+  const cleanupPassed = cleanupComplete
+    && cleanupUnsafeCounters.length === 0
+    && cleanupCounterDecreases.length === 0
+    && cleanupSnapshotConsistent
+    && cleanupVisiblePathConsistent
+    && cleanupHealthFailures.length === 0
+    && cleanupCutoffConsistent
+    && cleanupTimestampConsistent
+    && cleanupControllerTimingViolationCount === 0;
+  const cleanupEvidence = {
+    required: requireEpochClosure,
+    measurementId: cleanup?.measurementId ?? null,
+    measurementEpochId: cleanup?.measurementEpochId ?? null,
+    capturedAt: cleanup?.capturedAt ?? null,
+    controllerRequestedAt: cleanup?.controllerRequestedAt ?? null,
+    controllerReceivedAt: cleanup?.controllerReceivedAt ?? null,
+    evaluationLatencyMillis: cleanup?.evaluationLatencyMillis ?? null,
+    deadlineExceeded: cleanup?.deadlineExceeded ?? null,
+    cutoffYieldRequestCount: cleanupCutoffYieldRequestCount ?? null,
+    missingFields: cleanupMissingFields,
+    unsafeCounterValueCount: cleanupUnsafeCounters.length,
+    unsafeCounterFields: cleanupUnsafeCounters.slice(0, 16),
+    counterDecreaseCount: cleanupCounterDecreases.length,
+    counterDecreases: cleanupCounterDecreases.slice(0, 16),
+    snapshotInvariantFailureCount: cleanupSnapshotConsistent ? 0 : 1,
+    visibleUncappedInvariantFailureCount: cleanupVisiblePathConsistent ? 0 : 1,
+    healthFailureCount: cleanupHealthFailures.length,
+    healthFailures: cleanupHealthFailures.slice(0, 16),
+    cutoffConsistent: cleanupCutoffConsistent,
+    timestampConsistent: cleanupTimestampConsistent,
+    controllerTimingViolationCount: cleanupControllerTimingViolationCount,
+    final: cleanupEntry,
+  };
+  const snapshotInvariantFailures = allEntries
+    .map((entry, index) => ({entry, index}))
+    .filter(({entry}) => !snapshotIsConsistent(entry));
+  const visibleUncappedInvariantFailures = allEntries
+    .map((entry, index) => ({entry, index}))
+    .filter(({entry}) => !visibleUncappedIsConsistent(entry));
+  observed.completeSampleCount = entries.length;
+  observed.incompleteSampleCount = incompleteSampleCount;
+  observed.allowedResetSentinelSampleCount = allowedResetSentinelSampleCount;
+  observed.sampleCompletenessViolationCount = sampleCompletenessViolations.length;
+  observed.unsafeCounterValueCount = unsafeCounterValues.length;
+  observed.counterDecreaseCount = counterDecreases.length;
+  observed.snapshotInvariantFailureCount = snapshotInvariantFailures.length;
+  observed.visibleUncappedInvariantFailureCount = visibleUncappedInvariantFailures.length;
+  observed.sourceOverlapMismatchCount = normalizedSourceOverlapMismatches.length;
+  observed.epochMismatchCount = epochMismatches.length;
+  observed.controllerTimingViolationCount = controllerTimingViolations.length;
+  observed.settlementCounterDecreaseCount = settlementCounterDecreases.length;
+  observed.settlementInvariantFailureCount = settlementInvariantFailures.length;
+  observed.settlementFallbackOrHealthFailureCount = settlementVisiblePathFailures.length
+    + settlementHealthFailures.length;
+  observed.cleanupCounterDecreaseCount = cleanupCounterDecreases.length;
+  observed.cleanupInvariantFailureCount = (cleanupSnapshotConsistent ? 0 : 1)
+    + (cleanupVisiblePathConsistent ? 0 : 1);
+  observed.cleanupFallbackOrHealthFailureCount = cleanupHealthFailures.length;
+  observed.cleanupClosureFailureCount = cleanupPassed ? 0 : 1;
+  observed.finalComplete = finalComplete;
   const healthChecks = Object.entries(healthLimits).map(([field, maximum]) => {
     const observedValue = observed[`${field}Max`];
     const hasNonzeroFailure = observedValue != null && observedValue > maximum;
-    const missing = missingFields.includes(field);
     return {
       name: `no-${field}-during-measurement`,
-      verdict: hasNonzeroFailure ? "fail" : (missing ? "inconclusive" : "pass"),
+      verdict: hasNonzeroFailure ? "fail" : (completeWindow ? "pass" : "inconclusive"),
       expected: {[field]: maximum},
       actual: observedValue,
       reason: hasNonzeroFailure
         ? `${field} was ${observedValue}; expected at most ${maximum}`
-        : (missing ? `${field} cannot be verified without complete runtime telemetry` : null),
+        : (completeWindow ? null : `${field} cannot be verified without a complete measurement window`),
     };
   });
   const checks = [
@@ -266,99 +975,282 @@ export function evaluateUncappedFramePacing({
       expected: {minimumSamples},
       actual: entries.length,
       reason: entries.length >= minimumSamples
-        ? null : `only ${entries.length} frame-pacing sample(s) were captured; ${minimumSamples} required`,
+        ? null : `only ${entries.length} complete frame-pacing sample(s) were captured; ${minimumSamples} required`,
     },
     {
-      name: "required-runtime-fields",
-      verdict: missingFields.length > 0 ? "inconclusive" : "pass",
+      name: "frame-pacing-source-overlap-exact",
+      verdict: normalizedSourceOverlapMismatches.length > 0 ? "fail" : "pass",
+      expected: {overlappingRequiredFields: "Object.is exact"},
+      actual: {
+        mismatchCount: normalizedSourceOverlapMismatches.length,
+        mismatches: normalizedSourceOverlapMismatches,
+      },
+      reason: normalizedSourceOverlapMismatches.length > 0
+        ? "frame and runtimeInvariants.framePacing disagree on overlapping required fields" : null,
+    },
+    {
+      name: "frame-pacing-measurement-epoch-continuity",
+      verdict: !requireEpochClosure
+        ? "not-required" : (epochMismatches.length === 0 ? "pass" : "fail"),
+      expected: {
+        measurementId: expectedMeasurementEpochId,
+        measurementEpochId: expectedMeasurementEpochId,
+        exactAcrossWindowSettlementAndCleanup: true,
+      },
+      actual: {
+        mismatchCount: epochMismatches.length,
+        mismatches: epochMismatches.slice(0, 16),
+      },
+      reason: requireEpochClosure && epochMismatches.length > 0
+        ? "frame-pacing evidence crossed, omitted, or forged a measurement epoch" : null,
+    },
+    {
+      name: "frame-pacing-measurement-timestamps",
+      verdict: timingFieldsComplete ? (timingConsistent ? "pass" : "fail")
+        : (requireSettlement ? "inconclusive" : "not-required"),
+      expected: {
+        lastSampleBeforeFinal: true,
+        finalBeforeSettlement: true,
+        settlementBeforeCleanup: requireEpochClosure,
+        nonnegativeSafeIntegerTimestamps: true,
+      },
+      actual: timingEvidence,
+      reason: timingFieldsComplete
+        ? (timingConsistent ? null
+          : `frame-pacing timestamps do not order sample < final < settlement${requireEpochClosure ? " < cleanup" : ""}`)
+        : (requireSettlement ? "frame-pacing measurement timestamps are incomplete" : null),
+    },
+    {
+      name: "frame-pacing-settlement",
+      verdict: settlement == null
+        ? (requireSettlement ? "inconclusive" : "not-required")
+        : (settlementPassed ? "pass" : "fail"),
+      expected: {
+        schemaVersion: requiredSettlementSchemaVersion,
+        pollIntervalMillis: [settlementPollIntervalMillisMin, settlementPollIntervalMillisMax],
+        timeoutMillis: [settlementTimeoutMillisMin, settlementTimeoutMillisMax],
+        pendingYieldCountMax: 1,
+        healthFallbackWatchdogCounters: 0,
+        completionDeltaWhenInitiallyPending: 1,
+      },
+      actual: settlementEvidence,
+      reason: settlement == null
+        ? (requireSettlement ? "frame-pacing settlement evidence is missing" : null)
+        : (settlementPassed ? null
+          : "frame-pacing settlement did not prove a healthy MessageChannel continuation"),
+    },
+    {
+      name: "frame-pacing-cleanup-cutoff-closure",
+      verdict: !requireEpochClosure
+        ? "not-required" : (cleanupPassed ? "pass" : "fail"),
+      expected: {
+        timestampAfterSettlement: true,
+        sameMeasurementEpoch: true,
+        cutoff: "settlement.final.yieldRequestCount",
+        messageChannelAndCompletionAtLeastCutoff: true,
+        pendingYieldCount: "0..1",
+        healthFallbackWatchdogCounters: 0,
+      },
+      actual: cleanupEvidence,
+      reason: requireEpochClosure && !cleanupPassed
+        ? "cleanup telemetry did not close the settlement cutoff through a healthy MessageChannel epoch" : null,
+    },
+    {
+      name: "final-required-runtime-fields",
+      verdict: finalMissingFields.length > 0 ? "inconclusive" : "pass",
       expected: requiredFields,
-      actual: requiredFields.filter((field) => !missingFields.includes(field)),
-      reason: missingFields.length > 0
-        ? `runtime frame-pacing telemetry is missing: ${missingFields.join(", ")}` : null,
+      actual: requiredFields.filter((field) => !finalMissingFields.includes(field)),
+      reason: finalMissingFields.length > 0
+        ? `final runtime frame-pacing telemetry is missing: ${finalMissingFields.join(", ")}` : null,
+    },
+    {
+      name: "sample-completeness",
+      verdict: sampleCompletenessViolations.length > 0
+        ? "fail" : (completeWindow ? "pass" : "inconclusive"),
+      expected: {
+        incompleteSamples: "leading swapInterval=null all-zero reset sentinel only",
+      },
+      actual: {
+        incompleteSampleCount,
+        allowedResetSentinelSampleCount,
+        violationCount: sampleCompletenessViolations.length,
+        violations: sampleCompletenessViolations.slice(0, 16),
+      },
+      reason: sampleCompletenessViolations.length > 0
+        ? "an incomplete frame-pacing sample appeared after measurement began or was not an all-zero reset sentinel"
+        : (completeWindow ? null : "sample completeness needs a complete measurement window"),
+    },
+    {
+      name: "nonnegative-safe-integer-counters",
+      verdict: unsafeCounterValues.length > 0
+        ? "fail" : (completeWindow ? "pass" : "inconclusive"),
+      expected: {nonnegativeSafeIntegers: counterFields},
+      actual: {violationCount: unsafeCounterValues.length, violations: unsafeCounterValues.slice(0, 16)},
+      reason: unsafeCounterValues.length > 0
+        ? "frame-pacing counters must be nonnegative safe integers"
+        : (completeWindow ? null : "counter integrity needs a complete measurement window"),
+    },
+    {
+      name: "monotonic-cumulative-counters",
+      verdict: counterDecreases.length > 0
+        ? "fail" : (completeWindow ? "pass" : "inconclusive"),
+      expected: {monotonicNondecreasing: monotonicCounterFields},
+      actual: {violationCount: counterDecreases.length, violations: counterDecreases.slice(0, 16)},
+      reason: counterDecreases.length > 0
+        ? "frame-pacing cumulative counters decreased or reset during the measurement window"
+        : (completeWindow ? null : "counter monotonicity needs a complete measurement window"),
+    },
+    {
+      name: "per-snapshot-continuation-accounting",
+      verdict: snapshotInvariantFailures.length > 0
+        ? "fail" : (completeWindow ? "pass" : "inconclusive"),
+      expected: {
+        requests: "uncapped+vsync and visible+hidden",
+        completions: "message+scheduler+timer",
+        pending: "requests-completions in 0..1",
+        maxPending: "request>0 ? 1 : 0",
+        duplicateCallbacks: 0,
+      },
+      actual: {violationCount: snapshotInvariantFailures.length},
+      reason: snapshotInvariantFailures.length > 0
+        ? "frame continuation accounting identities failed in at least one complete snapshot"
+        : (completeWindow ? null : "continuation accounting needs a complete measurement window"),
+    },
+    {
+      name: "visible-uncapped-message-channel-only",
+      verdict: visibleUncappedInvariantFailures.length > 0
+        ? "fail" : (completeWindow ? "pass" : "inconclusive"),
+      expected: {
+        hiddenYieldCount: 0,
+        vsyncYieldCount: 0,
+        presentToRafCount: 0,
+        fairYieldCount: 0,
+        schedulerYieldCount: 0,
+        timerYieldCount: 0,
+        relation: "uncapped-message=pending",
+      },
+      actual: {violationCount: visibleUncappedInvariantFailures.length},
+      reason: visibleUncappedInvariantFailures.length > 0
+        ? "visible uncapped continuation evidence included a hidden, rAF, scheduler, or timer path"
+        : (completeWindow ? null : "visible uncapped routing needs a complete measurement window"),
     },
     {
       name: "final-runtime-evidence-is-consistent",
-      verdict: missingFields.length > 0
+      verdict: finalMissingFields.length > 0
         ? "inconclusive"
         : (finalEntry
+          && counterFields.every((field) => isSafeCounter(finalEntry[field]))
+          && snapshotIsConsistent(finalEntry)
+          && visibleUncappedIsConsistent(finalEntry)
           && finalEntry.swapInterval === requiredSwapInterval
           && finalEntry.uncappedYieldCount >= minimumUncappedYieldCount
+          && finalEntry.messageChannelYieldCount >= minimumMessageChannelYieldCount
           && finalEntry.vsyncYieldCount <= maximumVsyncYieldCount
           && finalEntry.presentToRafCount <= maximumPresentToRafCount
-          && finalEntry.fairYieldCount >= minimumFairYieldCount
+          && Object.entries(yieldPathLimits).every(([field, maximum]) => finalEntry[field] <= maximum)
           && Object.entries(healthLimits).every(([field, maximum]) => finalEntry[field] <= maximum)
           ? "pass" : "fail"),
       expected: {
         swapInterval: requiredSwapInterval,
         minimumUncappedYieldCount,
-        minimumFairYieldCount,
+        minimumMessageChannelYieldCount,
+        ...Object.fromEntries(Object.entries(yieldPathLimits)
+          .map(([field, maximum]) => [`maximum${field[0].toUpperCase()}${field.slice(1)}`, maximum])),
         maximumVsyncYieldCount,
         maximumPresentToRafCount,
         ...Object.fromEntries(Object.entries(healthLimits)
           .map(([field, maximum]) => [`maximum${field[0].toUpperCase()}${field.slice(1)}`, maximum])),
       },
       actual: finalEntry,
-      reason: missingFields.length > 0
+      reason: finalMissingFields.length > 0
         ? "the final frame-pacing snapshot is incomplete"
         : (finalEntry
+          && counterFields.every((field) => isSafeCounter(finalEntry[field]))
+          && snapshotIsConsistent(finalEntry)
+          && visibleUncappedIsConsistent(finalEntry)
           && finalEntry.swapInterval === requiredSwapInterval
           && finalEntry.uncappedYieldCount >= minimumUncappedYieldCount
+          && finalEntry.messageChannelYieldCount >= minimumMessageChannelYieldCount
           && finalEntry.vsyncYieldCount <= maximumVsyncYieldCount
           && finalEntry.presentToRafCount <= maximumPresentToRafCount
-          && finalEntry.fairYieldCount >= minimumFairYieldCount
+          && Object.entries(yieldPathLimits).every(([field, maximum]) => finalEntry[field] <= maximum)
           && Object.entries(healthLimits).every(([field, maximum]) => finalEntry[field] <= maximum)
           ? null : "the final frame-pacing snapshot does not satisfy uncapped evidence"),
     },
     {
       name: "swap-interval-zero-during-measurement",
-      verdict: missingFields.length > 0
-        ? "inconclusive"
-        : (observed.swapIntervalMin === requiredSwapInterval
-            && observed.swapIntervalMax === requiredSwapInterval ? "pass" : "fail"),
+      verdict: observed.swapIntervalMin != null
+          && (observed.swapIntervalMin !== requiredSwapInterval
+            || observed.swapIntervalMax !== requiredSwapInterval)
+        ? "fail" : (completeWindow ? "pass" : "inconclusive"),
       expected: {swapInterval: requiredSwapInterval},
       actual: {min: observed.swapIntervalMin, max: observed.swapIntervalMax},
-      reason: missingFields.length > 0
-        ? "swapInterval cannot be verified without complete runtime telemetry"
-        : (observed.swapIntervalMin === requiredSwapInterval
+      reason: observed.swapIntervalMin === requiredSwapInterval
             && observed.swapIntervalMax === requiredSwapInterval
           ? null
-          : `measured swapInterval range was ${observed.swapIntervalMin}..${observed.swapIntervalMax}`),
+          : (observed.swapIntervalMin == null
+            ? "swapInterval cannot be verified without a complete measurement window"
+            : `measured swapInterval range was ${observed.swapIntervalMin}..${observed.swapIntervalMax}`),
     },
     {
       name: "uncapped-scheduler-exercised",
-      verdict: missingFields.length > 0
+      verdict: !completeWindow
         ? "inconclusive"
         : (observed.uncappedYieldCountMax >= minimumUncappedYieldCount ? "pass" : "fail"),
       expected: {minimumUncappedYieldCount},
       actual: observed.uncappedYieldCountMax,
-      reason: missingFields.length > 0
-        ? "uncapped scheduler execution cannot be verified without complete runtime telemetry"
+      reason: !completeWindow
+        ? "uncapped scheduler execution cannot be verified without a complete measurement window"
         : (observed.uncappedYieldCountMax >= minimumUncappedYieldCount
           ? null
           : `uncappedYieldCount was ${observed.uncappedYieldCountMax}; expected at least ${minimumUncappedYieldCount}`),
     },
     {
-      name: "fair-browser-yield-exercised",
-      verdict: missingFields.length > 0
+      name: "message-channel-yield-exercised",
+      verdict: !completeWindow
         ? "inconclusive"
-        : (observed.fairYieldCountMax >= minimumFairYieldCount ? "pass" : "fail"),
-      expected: {minimumFairYieldCount},
-      actual: observed.fairYieldCountMax,
-      reason: missingFields.length > 0
-        ? "fair browser yielding cannot be verified without complete runtime telemetry"
-        : (observed.fairYieldCountMax >= minimumFairYieldCount
+        : (observed.messageChannelYieldCountMax >= minimumMessageChannelYieldCount ? "pass" : "fail"),
+      expected: {minimumMessageChannelYieldCount},
+      actual: observed.messageChannelYieldCountMax,
+      reason: !completeWindow
+        ? "MessageChannel continuation execution cannot be verified without a complete measurement window"
+        : (observed.messageChannelYieldCountMax >= minimumMessageChannelYieldCount
           ? null
-          : `fairYieldCount was ${observed.fairYieldCountMax}; expected at least ${minimumFairYieldCount}`),
+          : `messageChannelYieldCount was ${observed.messageChannelYieldCountMax}; expected at least ${minimumMessageChannelYieldCount}`),
+    },
+    {
+      name: "uncapped-yield-path-excludes-alternates",
+      verdict: !completeWindow
+        ? "inconclusive"
+        : (finalEntry
+          && visibleUncappedIsConsistent(finalEntry)
+          && Object.entries(yieldPathLimits).every(([field, maximum]) => finalEntry[field] <= maximum)
+          ? "pass" : "fail"),
+      expected: {
+        ...Object.fromEntries(Object.entries(yieldPathLimits)
+          .map(([field, maximum]) => [`maximum${field[0].toUpperCase()}${field.slice(1)}`, maximum])),
+      },
+      actual: finalEntry ? {
+        uncappedYieldCount: finalEntry.uncappedYieldCount,
+        messageChannelYieldCount: finalEntry.messageChannelYieldCount,
+        ...Object.fromEntries(Object.keys(yieldPathLimits).map((field) => [field, finalEntry[field]])),
+      } : null,
+      reason: !completeWindow
+        ? "the visible uncapped continuation path cannot be verified without a complete measurement window"
+        : (finalEntry
+          && visibleUncappedIsConsistent(finalEntry)
+          && Object.entries(yieldPathLimits).every(([field, maximum]) => finalEntry[field] <= maximum)
+          ? null : "visible uncapped presents did not complete exclusively through MessageChannel tasks"),
     },
     {
       name: "no-vsync-yields-during-measurement",
-      verdict: missingFields.length > 0
-        ? "inconclusive"
-        : (observed.vsyncYieldCountMax <= maximumVsyncYieldCount ? "pass" : "fail"),
+      verdict: observed.vsyncYieldCountMax != null
+          && observed.vsyncYieldCountMax > maximumVsyncYieldCount
+        ? "fail" : (completeWindow ? "pass" : "inconclusive"),
       expected: {maximumVsyncYieldCount},
       actual: observed.vsyncYieldCountMax,
-      reason: missingFields.length > 0
-        ? "VSync yield count cannot be verified without complete runtime telemetry"
+      reason: !completeWindow && observed.vsyncYieldCountMax == null
+        ? "VSync yield count cannot be verified without a complete measurement window"
         : (observed.vsyncYieldCountMax <= maximumVsyncYieldCount
           ? null
           : `vsyncYieldCount was ${observed.vsyncYieldCountMax}; expected at most ${maximumVsyncYieldCount}`),
@@ -366,13 +1258,13 @@ export function evaluateUncappedFramePacing({
     ...healthChecks,
     {
       name: "no-raf-yields-during-measurement",
-      verdict: missingFields.length > 0
-        ? "inconclusive"
-        : (observed.presentToRafCountMax <= maximumPresentToRafCount ? "pass" : "fail"),
+      verdict: observed.presentToRafCountMax != null
+          && observed.presentToRafCountMax > maximumPresentToRafCount
+        ? "fail" : (completeWindow ? "pass" : "inconclusive"),
       expected: {maximumPresentToRafCount},
       actual: observed.presentToRafCountMax,
-      reason: missingFields.length > 0
-        ? "rAF yield count cannot be verified without complete runtime telemetry"
+      reason: !completeWindow && observed.presentToRafCountMax == null
+        ? "rAF yield count cannot be verified without a complete measurement window"
         : (observed.presentToRafCountMax <= maximumPresentToRafCount
           ? null
           : `presentToRafCount was ${observed.presentToRafCountMax}; expected at most ${maximumPresentToRafCount}`),
@@ -387,16 +1279,48 @@ export function evaluateUncappedFramePacing({
     checks,
     requiredFields,
     missingFields,
+    finalMissingFields,
+    sampleMissingFields,
+    incompleteSampleCount,
+    allowedResetSentinelSampleCount,
+    sampleCompletenessViolationCount: sampleCompletenessViolations.length,
+    sourceOverlapMismatchCount: normalizedSourceOverlapMismatches.length,
+    sourceOverlapMismatches: normalizedSourceOverlapMismatches,
+    epochMismatchCount: epochMismatches.length,
+    epochMismatches: epochMismatches.slice(0, 64),
+    measurementEpochId: expectedMeasurementEpochId,
     measuredSampleCount: entries.length,
     requiredSampleCount: minimumSamples,
     observed,
     final: finalEntry,
+    finalControllerTiming: final && typeof final === "object" ? {
+      capturedAt: final.capturedAt ?? null,
+      controllerRequestedAt: final.controllerRequestedAt ?? null,
+      controllerReceivedAt: final.controllerReceivedAt ?? null,
+      evaluationLatencyMillis: final.evaluationLatencyMillis ?? null,
+      deadlineExceeded: final.deadlineExceeded ?? null,
+    } : null,
+    timing: timingEvidence,
+    settlement: settlementEvidence,
+    cleanup: cleanupEvidence,
     requirements: {
       requiredSwapInterval,
+      minimumSamples,
       minimumUncappedYieldCount,
-      minimumFairYieldCount,
+      minimumMessageChannelYieldCount,
+      ...Object.fromEntries(Object.entries(yieldPathLimits)
+        .map(([field, maximum]) => [`maximum${field[0].toUpperCase()}${field.slice(1)}`, maximum])),
       maximumVsyncYieldCount,
       maximumPresentToRafCount,
+      requireFramePacingSettlement: requireSettlement,
+      requireMeasurementEpochClosure: requireEpochClosure,
+      settlementSchemaVersion: requiredSettlementSchemaVersion,
+      settlementPollIntervalMillis: configuredSettlementPollIntervalMillis,
+      settlementPollIntervalMillisMin,
+      settlementPollIntervalMillisMax,
+      settlementTimeoutMillis: configuredSettlementTimeoutMillis,
+      settlementTimeoutMillisMin,
+      settlementTimeoutMillisMax,
       ...Object.fromEntries(Object.entries(healthLimits)
         .map(([field, maximum]) => [`maximum${field[0].toUpperCase()}${field.slice(1)}`, maximum])),
     },
@@ -990,13 +1914,28 @@ export function evaluateRuntimeInvariants({
   };
   gpuChecks.push(timeoutCheck);
 
-  const requests = evidence(framePacing, ["yieldRequestCount"], "latest");
-  const completions = evidence(framePacing, ["yieldCompletionCount"], "latest");
-  const pendingTelemetry = evidence(framePacing, ["pendingYieldCount"], "latest");
+  const continuationCounterFields = [
+    "yieldRequestCount",
+    "yieldCompletionCount",
+    "pendingYieldCount",
+    "uncappedYieldCount",
+    "vsyncYieldCount",
+    "visibleYieldCount",
+    "hiddenYieldCount",
+    "presentToRafCount",
+    "messageChannelYieldCount",
+    "fairYieldCount",
+    "schedulerYieldCount",
+    "timerYieldCount",
+  ];
+  const continuationCounters = Object.fromEntries(continuationCounterFields.map((field) => [
+    field,
+    evidence(framePacing, [field], "latest"),
+  ]));
   const maxPending = evidence(framePacing, ["maxPendingYieldCount"], "maxima");
   const duplicateCallbacks = evidence(framePacing, ["duplicateYieldCallbackCount"]);
   let continuationCheck;
-  if (!requests.available || !completions.available || !pendingTelemetry.available
+  if (Object.values(continuationCounters).some((item) => !item.available)
       || !maxPending.available || !duplicateCallbacks.available) {
     continuationCheck = {
       name: "frame-continuation-exact-once",
@@ -1013,15 +1952,32 @@ export function evaluateRuntimeInvariants({
       reason: "frame continuation request/completion telemetry is missing",
     };
   } else {
-    const computedPending = requests.value - completions.value;
+    const values = Object.fromEntries(Object.entries(continuationCounters)
+      .map(([field, item]) => [field, item.value]));
+    const computedPending = values.yieldRequestCount - values.yieldCompletionCount;
     const pendingLimit = finiteNumber(frameRules.pendingYieldCountMax, 1);
     const duplicateLimit = finiteNumber(frameRules.duplicateYieldCallbackCountMax, 0);
-    const passed = requests.value > 0 && completions.value <= requests.value
+    const allSafeCounters = [...Object.values(values), maxPending.value, duplicateCallbacks.value]
+      .every((value) => Number.isSafeInteger(value) && value >= 0);
+    const passed = allSafeCounters
+      && values.yieldRequestCount > 0
+      && values.yieldRequestCount === values.uncappedYieldCount + values.vsyncYieldCount
+      && values.yieldRequestCount === values.visibleYieldCount + values.hiddenYieldCount
+      && values.yieldCompletionCount === values.messageChannelYieldCount
+        + values.schedulerYieldCount + values.timerYieldCount
       && computedPending >= 0
-      && pendingTelemetry.value === computedPending
-      && pendingTelemetry.value <= pendingLimit
-      && maxPending.value <= pendingLimit
-      && duplicateCallbacks.value <= duplicateLimit;
+      && values.pendingYieldCount === computedPending
+      && values.pendingYieldCount <= pendingLimit
+      && maxPending.value === (values.yieldRequestCount > 0 ? 1 : 0)
+      && duplicateCallbacks.value <= duplicateLimit
+      && values.hiddenYieldCount === 0
+      && values.vsyncYieldCount === 0
+      && values.presentToRafCount === 0
+      && values.fairYieldCount === 0
+      && values.schedulerYieldCount === 0
+      && values.timerYieldCount === 0
+      && values.uncappedYieldCount - values.messageChannelYieldCount
+        === values.pendingYieldCount;
     continuationCheck = {
       name: "frame-continuation-exact-once",
       verdict: passed ? "pass" : "fail",
@@ -1033,17 +1989,16 @@ export function evaluateRuntimeInvariants({
         duplicateCallbacksMax: duplicateLimit,
       },
       actual: {
-        requests: requests.value,
-        completions: completions.value,
+        ...values,
+        requests: values.yieldRequestCount,
+        completions: values.yieldCompletionCount,
         computedPending,
-        pending: pendingTelemetry.value,
+        pending: values.pendingYieldCount,
         maxPending: maxPending.value,
         duplicateCallbacks: duplicateCallbacks.value,
       },
       source: [
-        requests.source,
-        completions.source,
-        pendingTelemetry.source,
+        ...Object.values(continuationCounters).map((item) => item.source),
         maxPending.source,
         duplicateCallbacks.source,
       ].join(","),

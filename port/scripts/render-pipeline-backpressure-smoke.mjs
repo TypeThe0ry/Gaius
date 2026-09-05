@@ -4,8 +4,8 @@ import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
 import {existsSync} from "node:fs";
 import {mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
-import {tmpdir} from "node:os";
-import {basename, join} from "node:path";
+import {homedir, tmpdir} from "node:os";
+import {basename, delimiter, join} from "node:path";
 import {fileURLToPath, pathToFileURL} from "node:url";
 
 const scriptsDirectory = fileURLToPath(new URL(".", import.meta.url));
@@ -62,6 +62,12 @@ if (version !== "26.2") {
 const overlayRoot = nativePath(process.env.GAIUS_OVERLAY_DIRECTORY ||
   `${repositoryRoot}/port/work/overlays${process.env.GAIUS_BUILD_ROOT || process.env.GAIUS_VERSION_PROFILE_PATH ? `/${version}` : ""}`);
 const overlayJar = `${overlayRoot}/client-named-${version}-gaius.jar`;
+const rawClientJar = join(repositoryRoot, "port/work/26.2/client-named.jar");
+const toolsSource = join(repositoryRoot, "port/tools/src/main/java/dev/gaius/tools");
+const asmRoot = join(homedir(), ".m2/repository/org/ow2/asm");
+const asm = join(asmRoot, "asm/9.8/asm-9.8.jar");
+const asmTree = join(asmRoot, "asm-tree/9.8/asm-tree-9.8.jar");
+const asmAnalysis = join(asmRoot, "asm-analysis/9.8/asm-analysis-9.8.jar");
 
 function javaTool(name) {
   for (const home of [process.env.GAIUS_JAVA_HOME, process.env.JAVA_HOME]
@@ -129,6 +135,7 @@ assert.ok(
 
 for (const contract of [
   "patchCurrentUberGpuBufferUploadBudget(node)",
+  "patchCurrentSectionRenderDispatcherBufferBudgets(node)",
   '"shouldUploadNext"',
   '"finishUploadBuffer"',
   '"releaseUploadBuffer"',
@@ -139,6 +146,23 @@ for (const contract of [
   "patchCurrentSectionTaskQueueBrowserPriorities",
 ]) {
   assert.ok(patcher.includes(contract), `missing render bytecode patch contract: ${contract}`);
+}
+for (const contract of [
+  '"lambda$new$0"',
+  '"(Ljava/lang/String;IIILcom/mojang/blaze3d/vertex/StagingBuffer;)V"',
+  "constructorVertexHeap != 1 || constructorIndexHeap != 1 || staging != 2",
+  "uberConstructors != 2 || vertexHeap != 1 || indexHeap != 1",
+  "usage.operand == 32",
+  "Integer.valueOf(134217728).equals(capacity.cst)",
+  "capacity.cst = BROWSER_SECTION_VERTEX_HEAP_BYTES",
+  "usage.operand == 64",
+  "Integer.valueOf(33554432).equals(capacity.cst)",
+  "capacity.cst = BROWSER_SECTION_INDEX_HEAP_BYTES",
+  '"Current section renderer lambda UberGpuBuffer constructor shape changed"',
+  '"Current section renderer lambda heap budgets changed: constructors="',
+]) {
+  assert.ok(patcher.includes(contract),
+    `missing fail-closed SectionRenderDispatcher heap-budget contract: ${contract}`);
 }
 for (const contract of [
   "patchSectionRenderEmergencyUpload",
@@ -160,12 +184,16 @@ for (const contract of [
   assert.ok(patcher262.includes(contract), `missing 26.2 progress patch contract: ${contract}`);
 }
 
-function javap(className) {
+function javapFrom(classpath, className) {
   return execFileSync(
     javaTool("javap"),
-    ["-classpath", overlayJar, "-p", "-c", className],
+    ["-classpath", classpath, "-p", "-c", className],
     {cwd: scriptsDirectory, encoding: "utf8", maxBuffer: 32 * 1024 * 1024},
   );
+}
+
+function javap(className) {
+  return javapFrom(overlayJar, className);
 }
 
 function method(bytecode, signature, nextSignature) {
@@ -173,6 +201,151 @@ function method(bytecode, signature, nextSignature) {
   assert.notEqual(start, -1, `missing bytecode method: ${signature}`);
   const end = nextSignature ? bytecode.indexOf(nextSignature, start + signature.length) : -1;
   return bytecode.slice(start, end === -1 ? bytecode.length : end);
+}
+
+function bytecodeInstructions(bytecode) {
+  return [...bytecode.matchAll(/^\s*(\d+):\s+(.+)$/gm)]
+    .map((match) => ({offset: Number(match[1]), instruction: match[2].trim()}));
+}
+
+const bufferBudgetPatchRoot = await mkdtemp(join(tmpdir(), "gaius-section-buffer-budget-"));
+try {
+  const classesDirectory = join(bufferBudgetPatchRoot, "classes");
+  const patchesDirectory = join(bufferBudgetPatchRoot, "patches");
+  const verifierSource = join(bufferBudgetPatchRoot, "GaiusSectionBufferBudgetVerifier.java");
+  await Promise.all([
+    mkdir(classesDirectory, {recursive: true}),
+    mkdir(patchesDirectory, {recursive: true}),
+  ]);
+  for (const required of [rawClientJar, asm, asmTree, asmAnalysis]) {
+    assert.ok(existsSync(required), `missing SectionRenderDispatcher budget smoke input: ${required}`);
+  }
+  const patcherClasspath = [asm, asmTree].join(delimiter);
+  execFileSync(javaTool("javac"), [
+    "--release", "21", "-proc:none", "-classpath", patcherClasspath,
+    "-d", classesDirectory, join(toolsSource, "MinecraftClientPatcher.java"),
+  ], {cwd: scriptsDirectory, encoding: "utf8", timeout: 60_000});
+  execFileSync(javaTool("java"), [
+    "-classpath", [classesDirectory, patcherClasspath].join(delimiter),
+    "dev.gaius.tools.MinecraftClientPatcher", rawClientJar, patchesDirectory, "26.2",
+  ], {cwd: scriptsDirectory, encoding: "utf8", timeout: 60_000});
+
+  const patchedDispatcher = javapFrom(
+    [patchesDirectory, rawClientJar].join(delimiter),
+    "net.minecraft.client.renderer.chunk.SectionRenderDispatcher",
+  );
+  const patchedConstructor = method(
+    patchedDispatcher,
+    "public net.minecraft.client.renderer.chunk.SectionRenderDispatcher(",
+    "public void setCompiler",
+  );
+  assert.doesNotMatch(patchedConstructor, /\/\/ int (?:134217728|33554432|102760448)\b/,
+    "patched SectionRenderDispatcher constructor retained a desktop heap/staging budget");
+  const constructorInstructions = bytecodeInstructions(patchedConstructor);
+  const stagingCreateIndex = constructorInstructions.findIndex(({instruction}) =>
+    instruction.includes("StagingBuffer.create:"));
+  assert.ok(stagingCreateIndex > 0 &&
+    /^ldc(?:_w)?\s+.*\/\/ int 16777216\b/.test(
+      constructorInstructions[stagingCreateIndex - 1].instruction),
+  "SectionRenderDispatcher staging buffer allocation is not 16 MiB");
+  const stagingLocalStoreIndex = constructorInstructions.findIndex(({instruction}, index) =>
+    /^istore\s+7\b/.test(instruction) && index > 0);
+  assert.ok(stagingLocalStoreIndex > 0 &&
+    /^ldc(?:_w)?\s+.*\/\/ int 16777216\b/.test(
+      constructorInstructions[stagingLocalStoreIndex - 1].instruction),
+  "SectionRenderDispatcher staging budget mirror is not 16 MiB");
+
+  const patchedHeapFactory = method(
+    patchedDispatcher,
+    "private net.minecraft.client.renderer.chunk.SectionRenderDispatcher$SectionUberBuffers "
+      + "lambda$new$0(net.minecraft.client.renderer.chunk.ChunkSectionLayer);",
+  );
+  assert.doesNotMatch(patchedHeapFactory, /\/\/ int (?:134217728|33554432)\b/,
+    "lambda$new$0 retained a 128/32 MiB desktop UberGpuBuffer heap");
+  const heapInstructions = bytecodeInstructions(patchedHeapFactory);
+  const heapConstructors = heapInstructions
+    .map(({instruction}, index) => ({instruction, index}))
+    .filter(({instruction}) => instruction.includes(
+      'UberGpuBuffer."<init>":(Ljava/lang/String;IIILcom/mojang/blaze3d/vertex/StagingBuffer;)V'));
+  assert.equal(heapConstructors.length, 2,
+    "lambda$new$0 must construct exactly one vertex and one index UberGpuBuffer");
+  const vertexCall = heapConstructors[0].index;
+  const indexCall = heapConstructors[1].index;
+  assert.match(heapInstructions[vertexCall - 10]?.instruction || "", /new\s+.*UberGpuBuffer/,
+    "vertex heap constructor allocation moved");
+  assert.equal(heapInstructions[vertexCall - 9]?.instruction, "dup",
+    "vertex heap constructor DUP moved");
+  assert.match(heapInstructions[vertexCall - 7]?.instruction || "", /ChunkSectionLayer\.label/,
+    "vertex heap label argument changed");
+  assert.match(heapInstructions[vertexCall - 6]?.instruction || "", /^bipush\s+32$/,
+    "vertex heap usage must remain 32");
+  assert.match(heapInstructions[vertexCall - 5]?.instruction || "",
+    /^ldc(?:_w)?\s+.*\/\/ int 16777216\b/,
+    "vertex UberGpuBuffer heap is not 16 MiB");
+  assert.match(heapInstructions[vertexCall - 3]?.instruction || "", /VertexFormat\.getVertexSize/,
+    "vertex heap stride no longer comes from VertexFormat.getVertexSize");
+  assert.match(heapInstructions[vertexCall - 1]?.instruction || "", /Field stagingBuffer:/,
+    "vertex heap no longer uses the dispatcher staging buffer");
+
+  assert.match(heapInstructions[indexCall - 9]?.instruction || "", /new\s+.*UberGpuBuffer/,
+    "index heap constructor allocation moved");
+  assert.equal(heapInstructions[indexCall - 8]?.instruction, "dup",
+    "index heap constructor DUP moved");
+  assert.match(heapInstructions[indexCall - 6]?.instruction || "", /ChunkSectionLayer\.label/,
+    "index heap label argument changed");
+  assert.match(heapInstructions[indexCall - 5]?.instruction || "", /^bipush\s+64$/,
+    "index heap usage must remain 64");
+  assert.match(heapInstructions[indexCall - 4]?.instruction || "",
+    /^ldc(?:_w)?\s+.*\/\/ int 4194304\b/,
+    "index UberGpuBuffer heap is not 4 MiB");
+  assert.match(heapInstructions[indexCall - 3]?.instruction || "", /^bipush\s+8$/,
+    "index heap stride must remain 8");
+  assert.match(heapInstructions[indexCall - 1]?.instruction || "", /Field stagingBuffer:/,
+    "index heap no longer uses the dispatcher staging buffer");
+
+  await writeFile(verifierSource, `
+import java.nio.file.Files;
+import java.nio.file.Path;
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.Opcodes;
+import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.analysis.Analyzer;
+import org.objectweb.asm.tree.analysis.BasicVerifier;
+
+public final class GaiusSectionBufferBudgetVerifier {
+    public static void main(String[] args) throws Exception {
+        ClassNode node = new ClassNode();
+        new ClassReader(Files.readAllBytes(Path.of(args[0]))).accept(node, 0);
+        int verified = 0;
+        for (MethodNode method : node.methods) {
+            if ((method.access & (Opcodes.ACC_ABSTRACT | Opcodes.ACC_NATIVE)) != 0) {
+                continue;
+            }
+            new Analyzer<>(new BasicVerifier()).analyze(node.name, method);
+            verified++;
+        }
+        if (verified == 0) throw new IllegalStateException("no methods verified");
+        System.out.println("BASIC_VERIFIER_OK " + node.name + " methods=" + verified);
+    }
+}
+`, "utf8");
+  const verifierClasspath = [asm, asmTree, asmAnalysis].join(delimiter);
+  execFileSync(javaTool("javac"), [
+    "--release", "21", "-proc:none", "-classpath", verifierClasspath,
+    "-d", classesDirectory, verifierSource,
+  ], {cwd: scriptsDirectory, encoding: "utf8", timeout: 30_000});
+  const verifierOutput = execFileSync(javaTool("java"), [
+    "-classpath", [classesDirectory, verifierClasspath].join(delimiter),
+    "GaiusSectionBufferBudgetVerifier",
+    join(patchesDirectory,
+      "net/minecraft/client/renderer/chunk/SectionRenderDispatcher.class"),
+  ], {cwd: scriptsDirectory, encoding: "utf8", timeout: 30_000});
+  assert.match(verifierOutput,
+    /BASIC_VERIFIER_OK net\/minecraft\/client\/renderer\/chunk\/SectionRenderDispatcher/,
+    "ASM BasicVerifier rejected the patched SectionRenderDispatcher");
+} finally {
+  await rm(bufferBudgetPatchRoot, {recursive: true, force: true});
 }
 
 const uber = javap("com.mojang.blaze3d.vertex.UberGpuBuffer");

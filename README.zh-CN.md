@@ -2,7 +2,7 @@
 
 [English](README.md) | **简体中文**
 
-Gaius Client `0.0.2` 是 Minecraft Java Edition `26.2` 的实验性浏览器移植，
+Gaius Client `0.0.3` 是 Minecraft Java Edition `26.2` 的实验性浏览器移植，
 同时保留 `1.21.11` 兼容 profile。每个 profile 都通过 TeaVM 和浏览器平台覆盖层
 运行原始 Java 客户端路径，并不是使用 TypeScript 重新实现 Minecraft 游戏逻辑。
 
@@ -32,14 +32,14 @@ Gaius 是独立软件，与 Mojang Studios、Microsoft 或 Minecraft 没有隶�
 
 ## 下载
 
-`v0.0.2` Release 页面为每个支持的 profile 提供可移植浏览器客户端和可选的
+`v0.0.3` Release 页面为每个支持的 profile 提供可移植浏览器客户端和可选的
 Paper 插件：
 
-- [下载 Minecraft 26.2 客户端（`Gaius-26.2.html`）](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.2/Gaius-26.2.html)
-- [下载保留的 Minecraft 1.21.11 客户端（`Gaius-1.21.11.html`）](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.2/Gaius-1.21.11.html)
-- [下载可选 Paper 插件](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.2/gaius-server-plugin-0.0.2.jar)
-- [下载 `SHA256SUMS`](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.2/SHA256SUMS)
-- [打开 `v0.0.2` Release 页面](https://github.com/TypeThe0ry/Gaius/releases/tag/v0.0.2)
+- [下载 Minecraft 26.2 客户端（`Gaius-26.2.html`）](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.3/Gaius-26.2.html)
+- [下载保留的 Minecraft 1.21.11 客户端（`Gaius-1.21.11.html`）](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.3/Gaius-1.21.11.html)
+- [下载可选 Paper 插件](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.3/gaius-server-plugin-0.0.3.jar)
+- [下载 `SHA256SUMS`](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.3/SHA256SUMS)
+- [打开 `v0.0.3` Release 页面](https://github.com/TypeThe0ry/Gaius/releases/tag/v0.0.3)
 
 每个 `Gaius-<profile>.html` 都是前端独立的单人游戏包。下载后可以直接在 Chrome
 中打开，单人模式不需要由 Gaius 托管网页服务器。多人模式仍需要兼容的 Gaius

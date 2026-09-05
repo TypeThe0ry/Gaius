@@ -206,6 +206,7 @@ BROWSER_FUTURE_PUMP = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browse
 BROWSER_GZIP = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserGzip.java"
 BROWSER_RENDER_SCHEDULER = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserRenderScheduler.java"
 PERFORMANCE_CONTRACT = PORT / "scripts" / "performance-contract.json"
+PERFORMANCE_METRICS = PORT / "scripts" / "performance-metrics.mjs"
 CHROME_CHUNK_BENCHMARK = PORT / "scripts" / "chrome-chunk-benchmark.mjs"
 CHROME_PERFORMANCE_RELEASE_SUITE = (
     PORT / "scripts" / "chrome-performance-release-suite.mjs"
@@ -2049,6 +2050,11 @@ def check_source_patches() -> None:
         performance_contract = json.loads(performance_contract_text)
     except (TypeError, json.JSONDecodeError):
         performance_contract = {}
+    performance_metrics = (
+        PERFORMANCE_METRICS.read_text(errors="replace")
+        if PERFORMANCE_METRICS.exists()
+        else ""
+    )
     chrome_chunk_benchmark = (
         CHROME_CHUNK_BENCHMARK.read_text(errors="replace")
         if CHROME_CHUNK_BENCHMARK.exists()
@@ -5160,6 +5166,13 @@ def check_source_patches() -> None:
             and "synchronizedToDisplay && typeof requestAnimationFrame==='function'" in glfw_text
             and "uncappedYieldCount" in glfw_text
             and "vsyncYieldCount" in glfw_text
+            and "visibleYieldCount" in glfw_text
+            and "hiddenYieldCount" in glfw_text
+            and "yieldRequestCount" in glfw_text
+            and "yieldCompletionCount" in glfw_text
+            and "pendingYieldCount" in glfw_text
+            and "maxPendingYieldCount" in glfw_text
+            and "duplicateYieldCallbackCount" in glfw_text
             and "telemetry.swapInterval=Number(interval)||0" in glfw_text
             and "scheduler={tasks:new Map(),channel:null,nextTaskId:1}" in glfw_text
             and "scheduler.tasks.delete(taskId)" in glfw_text
@@ -5168,7 +5181,10 @@ def check_source_patches() -> None:
             and "messageChannelCreateFailureCount" in glfw_text
             and "messageChannelPostFailureCount" in glfw_text
             and "setTimeout(() => finish('timer'), 0)" in glfw_text
-            and "(sequence & 3)===0" in glfw_text
+            and "postTask();" in glfw_text
+            and "scheduleFairYield" not in glfw_text
+            and "__gaiusUncappedYieldSequence" not in glfw_text
+            and "(sequence & 3)===0" not in glfw_text
             and "scheduler={queue:[],channel:null}" not in glfw_text
             and "requestAnimationFrame" in glfw_text
             and "setTimeout(() => finish('timer'), 50)" in glfw_text
@@ -5423,7 +5439,7 @@ def check_source_patches() -> None:
         ),
         (
             "Chrome release performance contract gates full-window FPS, visual output, and memory",
-            performance_contract.get("schemaVersion") == 11
+            performance_contract.get("schemaVersion") == 14
             and ACTIVE_WORLDGEN_TELEMETRY_MODE in WORLDGEN_TELEMETRY_MODES
             and performance_contract.get("runtimeInvariants", {})
                 .get("worldgen", {}).get("telemetryMode") in WORLDGEN_TELEMETRY_MODES
@@ -5439,17 +5455,50 @@ def check_source_patches() -> None:
                 .get("worldgen", {}).get("p99SliceElapsedMillisMax") == 14
             and performance_contract.get("runtimeInvariants", {})
                 .get("worldgen", {}).get("p99YieldDelayMillisMax") == 16.7
+            and performance_contract.get("runtimeInvariants", {})
+                .get("framePacing", {}).get("counterSchemaVersion") == 2
             and performance_contract.get("heartbeat", {}).get("rttP99MaxMs") == 50
             and performance_contract.get("environment", {})
                 .get("uncappedEvidence", {}).get("requiredSwapInterval") == 0
             and performance_contract.get("environment", {})
-                .get("uncappedEvidence", {}).get("minimumFairYieldCount") == 1
+                .get("uncappedEvidence", {}).get("minimumSamples") == 2
+            and performance_contract.get("environment", {})
+                .get("uncappedEvidence", {}).get("minimumUncappedYieldCount") == 1
+            and performance_contract.get("environment", {})
+                .get("uncappedEvidence", {}).get("minimumMessageChannelYieldCount") == 1
+            and performance_contract.get("environment", {})
+                .get("uncappedEvidence", {}).get("maximumFairYieldCount") == 0
+            and performance_contract.get("environment", {})
+                .get("uncappedEvidence", {}).get("maximumSchedulerYieldCount") == 0
+            and performance_contract.get("environment", {})
+                .get("uncappedEvidence", {}).get("maximumTimerYieldCount") == 0
             and performance_contract.get("environment", {})
                 .get("uncappedEvidence", {}).get(
                     "maximumMessageChannelPostFailureCount"
                 ) == 0
             and performance_contract.get("environment", {})
                 .get("uncappedEvidence", {}).get("maximumWatchdogYieldCount") == 0
+            and performance_contract.get("environment", {})
+                .get("uncappedEvidence", {}).get("requireFramePacingSettlement") is True
+            and performance_contract.get("environment", {})
+                .get("uncappedEvidence", {}).get("settlementSchemaVersion") == 1
+            and performance_contract.get("environment", {})
+                .get("uncappedEvidence", {}).get("settlementPollIntervalMillis") == 8
+            and performance_contract.get("environment", {})
+                .get("uncappedEvidence", {}).get("settlementTimeoutMillis") == 200
+            and all(
+                field in performance_contract.get("environment", {})
+                    .get("uncappedEvidence", {}).get("requiredFields", [])
+                for field in (
+                    "visibleYieldCount",
+                    "hiddenYieldCount",
+                    "yieldRequestCount",
+                    "yieldCompletionCount",
+                    "pendingYieldCount",
+                    "maxPendingYieldCount",
+                    "duplicateYieldCallbackCount",
+                )
+            )
             and "stats.p99YieldDelayMillis" in browser_worldgen_scheduler
             and "const frameMeasurementMillis = Math.max(performanceMillis, heapMillis);"
                 in chrome_chunk_benchmark
@@ -5460,7 +5509,34 @@ def check_source_patches() -> None:
             and "cdpCommandTimeoutMillis" in chrome_chunk_benchmark
             and "typeof frame.swapInterval==='number'" in chrome_chunk_benchmark
             and "messageChannelPostFailureCount" in chrome_chunk_benchmark
+            and "messageChannelYieldCount" in chrome_chunk_benchmark
+            and "schedulerYieldCount" in chrome_chunk_benchmark
+            and "timerYieldCount" in chrome_chunk_benchmark
             and "fairYieldCount" in chrome_chunk_benchmark
+            and "visibleYieldCount:0,hiddenYieldCount:0" in chrome_chunk_benchmark
+            and "yieldRequestCount" in chrome_chunk_benchmark
+            and "yieldCompletionCount" in chrome_chunk_benchmark
+            and "pendingYieldCount" in chrome_chunk_benchmark
+            and "maxPendingYieldCount" in chrome_chunk_benchmark
+            and "duplicateYieldCallbackCount" in chrome_chunk_benchmark
+            and "mergeFramePacingTelemetrySources" in chrome_chunk_benchmark
+            and "normalizeFramePacingEvidenceSnapshot" in chrome_chunk_benchmark
+            and "normalizeFramePacingSettlementEvidence" in chrome_chunk_benchmark
+            and "captureFinalTelemetryAfterSamples" in chrome_chunk_benchmark
+            and "settleFramePacing" in chrome_chunk_benchmark
+            and "captureCleanupFramePacingClosure" in chrome_chunk_benchmark
+            and "framePacingSettlement" in chrome_chunk_benchmark
+            and "measurementEpochId" in chrome_chunk_benchmark
+            and "controllerRequestedAt" in chrome_chunk_benchmark
+            and "controllerReceivedAt" in chrome_chunk_benchmark
+            and "controllerElapsedMillis" in chrome_chunk_benchmark
+            and "cutoffYieldRequestCount" in chrome_chunk_benchmark
+            and "cleanupFramePacing" in chrome_chunk_benchmark
+            and "cleanupTelemetry.framePacingClosure" in chrome_performance_release_suite
+            and "cleanupClosureSources" in chrome_performance_release_suite
+            and "entry.swapInterval === requiredSwapInterval" in performance_metrics
+            and "settlement-controller-ranges-overlap" in performance_metrics
+            and "settlement-controller-request-decreased" in performance_metrics
             and "schemaVersion: performanceContract.schemaVersion" in chrome_chunk_benchmark,
         ),
         (
@@ -5470,6 +5546,29 @@ def check_source_patches() -> None:
             and "hardTargetProfiles" in chrome_performance_release_suite
             and "stabilityProfiles" in chrome_performance_release_suite
             and "driverSupported === false" in chrome_performance_release_suite
+            and "sampleCompletenessViolationCount" in chrome_performance_release_suite
+            and "allowedResetSentinelSampleCount" in chrome_performance_release_suite
+            and "recomputeChildUncappedEvidence" in chrome_performance_release_suite
+            and "report?.samples" in chrome_performance_release_suite
+            and "report?.telemetry" in chrome_performance_release_suite
+            and "evaluationLatencyMillis" in chrome_performance_release_suite
+            and "raw sample timestamps are missing or unsafe"
+                in chrome_performance_release_suite
+            and "raw sample timestamps are not strictly increasing"
+                in chrome_performance_release_suite
+            and "raw samples were dropped or merged"
+                in chrome_performance_release_suite
+            and "derived frame-pacing summary does not match raw samples"
+                in chrome_performance_release_suite
+            and "measurementEpochId" in chrome_performance_release_suite
+            and "cleanupTelemetry" in chrome_performance_release_suite
+            and "cleanupCapturedAt" in chrome_performance_release_suite
+            and "requireEpochClosure: true" in chrome_performance_release_suite
+            and "epochMismatchCount" in chrome_performance_release_suite
+            and "controllerTimingViolationCount" in chrome_performance_release_suite
+            and "cleanupClosureFailureCount" in chrome_performance_release_suite
+            and "finalFramePacing.maxPendingYieldCount === (requests > 0 ? 1 : 0)"
+                in chrome_performance_release_suite
             and "release-suite.json" in chrome_performance_release_suite
             and "Chrome performance release-suite smoke passed"
                 in chrome_performance_release_suite_smoke,
@@ -5543,8 +5642,10 @@ def check_source_patches() -> None:
             and "public static void pumpNow()" not in browser_client_network
             and "public static boolean hasPumpableInput()" in netty_browser_channel
             and "state.exactPacketQueuePaused" in netty_browser_channel
-            # The bridge passes a reason string on wake; require a guarded
-            # callable invocation rather than the obsolete zero-argument spelling.
+            # The bridge passes a reason string on wake (for example
+            # state.inboundPump('remote-close-retire')); assert a guarded
+            # callable invocation rather than the obsolete zero-argument
+            # spelling.
             and "typeof state.inboundPump === 'function'" in netty_browser_channel
             and "state.inboundPump(" in netty_browser_channel,
         ),
@@ -5748,6 +5849,11 @@ def check_source_patches() -> None:
                 in client_patcher
             and '"hasPendingPackets"' in client_patcher
             and "transitionBacklogCheck" in client_patcher
+            and "LabelNode playListener = new LabelNode();" in client_patcher
+            and "LabelNode commonBacklogCheck = new LabelNode();" in client_patcher
+            and "commonPlayPacketBranches" in client_patcher
+            and "commonBacklogChecks != 1" in client_patcher
+            and "common packet" in client_patcher
             and "handleLoginImmediateReadyHooked" in client_patcher
             and "ClientPacketListener immediate player-ready return changed" in client_patcher
             and "vanillaScheduling" in client_patcher,
@@ -8925,7 +9031,7 @@ def check_overlay_bytecode() -> None:
     browser_websocket_channel = run_javap(netty_transport_overlay_cp, "io.netty.channel.browser.BrowserWebSocketChannel")
     browser_websocket_pump = method_section(
         browser_websocket_channel,
-        "private boolean pump();",
+        "private void pump();",
     )
     browser_inline_event_loop = run_javap(
         netty_transport_overlay_cp,
@@ -9463,7 +9569,7 @@ def check_overlay_bytecode() -> None:
             and "protected void doWrite" in browser_websocket_channel
             and "iconst_1" in browser_websocket_pump
             and (
-                "int 262144" in browser_websocket_pump
+                "int 1048576" in browser_websocket_pump
                 and "double 2.0d" in browser_websocket_pump
             )
             and "Field pumping:Z" in browser_websocket_pump
@@ -10923,6 +11029,13 @@ def check_overlay_bytecode() -> None:
             and "synchronizedToDisplay" in browser_glfw_constants
             and "uncappedYieldCount" in browser_glfw_constants
             and "vsyncYieldCount" in browser_glfw_constants
+            and "visibleYieldCount" in browser_glfw_constants
+            and "hiddenYieldCount" in browser_glfw_constants
+            and "yieldRequestCount" in browser_glfw_constants
+            and "yieldCompletionCount" in browser_glfw_constants
+            and "pendingYieldCount" in browser_glfw_constants
+            and "maxPendingYieldCount" in browser_glfw_constants
+            and "duplicateYieldCallbackCount" in browser_glfw_constants
             and "telemetry.swapInterval=Number(interval)||0" in browser_glfw_constants
             and "scheduler={tasks:new Map(),channel:null,nextTaskId:1}"
                 in browser_glfw_constants
@@ -10932,7 +11045,10 @@ def check_overlay_bytecode() -> None:
             and "messageChannelCreateFailureCount" in browser_glfw_constants
             and "messageChannelPostFailureCount" in browser_glfw_constants
             and "setTimeout(() => finish('timer'), 0)" in browser_glfw_constants
-            and "(sequence & 3)===0" in browser_glfw_constants
+            and "postTask();" in browser_glfw_constants
+            and "scheduleFairYield" not in browser_glfw_constants
+            and "__gaiusUncappedYieldSequence" not in browser_glfw_constants
+            and "(sequence & 3)===0" not in browser_glfw_constants
             and "scheduler={queue:[],channel:null}" not in browser_glfw_constants,
         ),
         (

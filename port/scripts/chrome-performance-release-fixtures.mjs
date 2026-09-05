@@ -1,4 +1,126 @@
+import {
+  evaluateUncappedFramePacing,
+  mergeFramePacingTelemetrySources,
+  normalizeFramePacingEvidenceSnapshot,
+  normalizeFramePacingSettlementEvidence,
+  REQUIRED_UNCAPPED_FRAME_PACING_FIELDS,
+} from "./performance-metrics.mjs";
+
 const fixtureHash = (character) => character.repeat(64);
+export const acceptanceMeasurementEpochId = "fixture-measurement-epoch";
+
+const acceptanceUncappedRequirements = {
+  requiredSwapInterval: 0,
+  minimumSamples: 2,
+  minimumUncappedYieldCount: 1,
+  minimumMessageChannelYieldCount: 1,
+  maximumFairYieldCount: 0,
+  maximumSchedulerYieldCount: 0,
+  maximumTimerYieldCount: 0,
+  maximumVsyncYieldCount: 0,
+  maximumPresentToRafCount: 0,
+  maximumMessageChannelCreateFailureCount: 0,
+  maximumMessageChannelPostFailureCount: 0,
+  maximumMessageChannelRebuildCount: 0,
+  maximumCancelledMessageTaskCount: 0,
+  maximumWatchdogYieldCount: 0,
+  requireFramePacingSettlement: true,
+  settlementSchemaVersion: 1,
+  settlementPollIntervalMillis: 8,
+  settlementPollIntervalMillisMin: 5,
+  settlementPollIntervalMillisMax: 10,
+  settlementTimeoutMillis: 200,
+  settlementTimeoutMillisMin: 150,
+  settlementTimeoutMillisMax: 250,
+  requiredFields: [...REQUIRED_UNCAPPED_FRAME_PACING_FIELDS],
+};
+
+function acceptanceFramePacingSnapshot(count) {
+  return {
+    measurementId: acceptanceMeasurementEpochId,
+    measurementEpochId: acceptanceMeasurementEpochId,
+    swapInterval: 0,
+    uncappedYieldCount: count,
+    vsyncYieldCount: 0,
+    visibleYieldCount: count,
+    hiddenYieldCount: 0,
+    presentToRafCount: 0,
+    messageChannelYieldCount: count,
+    fairYieldCount: 0,
+    schedulerYieldCount: 0,
+    timerYieldCount: 0,
+    yieldRequestCount: count,
+    yieldCompletionCount: count,
+    pendingYieldCount: 0,
+    maxPendingYieldCount: count > 0 ? 1 : 0,
+    duplicateYieldCallbackCount: 0,
+    messageChannelCreateFailureCount: 0,
+    messageChannelPostFailureCount: 0,
+    messageChannelRebuildCount: 0,
+    cancelledMessageTaskCount: 0,
+    watchdogYieldCount: 0,
+  };
+}
+
+function withDualFramePacingSources(snapshot, {
+  capturedAt,
+  controllerRequestedAt = capturedAt - 1,
+  controllerReceivedAt = capturedAt + 1,
+  cutoffYieldRequestCount,
+} = {}) {
+  const pacing = {...snapshot};
+  const result = {
+    ...pacing,
+    capturedAt,
+    controllerRequestedAt,
+    controllerReceivedAt,
+    evaluationLatencyMillis: controllerReceivedAt - controllerRequestedAt,
+    deadlineExceeded: false,
+    frame: {...pacing},
+    runtimeInvariants: {framePacing: {...pacing}},
+  };
+  if (cutoffYieldRequestCount != null) {
+    result.cutoffYieldRequestCount = cutoffYieldRequestCount;
+  }
+  return result;
+}
+
+export function makeAcceptanceFramePacingSettlement(initial, {
+  initialCapturedAt = 3,
+  capturedAt = 4,
+  final = initial,
+} = {}) {
+  const requiredMessageChannelCompletionDelta = initial.pendingYieldCount === 1 ? 1 : 0;
+  const messageChannelCompletionDelta = final.messageChannelYieldCount
+    - initial.messageChannelYieldCount;
+  const yieldCompletionDelta = final.yieldCompletionCount - initial.yieldCompletionCount;
+  const settled = requiredMessageChannelCompletionDelta === 0
+    || (messageChannelCompletionDelta >= 1 && yieldCompletionDelta >= 1);
+  const finalScalar = withDualFramePacingSources(final, {capturedAt});
+  const controllerStartedAt = finalScalar.controllerRequestedAt;
+  const controllerCompletedAt = finalScalar.controllerReceivedAt;
+  return {
+    schemaVersion: 1,
+    measurementId: acceptanceMeasurementEpochId,
+    measurementEpochId: acceptanceMeasurementEpochId,
+    initialCapturedAt,
+    capturedAt,
+    controllerStartedAt,
+    controllerCompletedAt,
+    controllerElapsedMillis: controllerCompletedAt - controllerStartedAt,
+    pollIntervalMillis: 8,
+    timeoutMillis: 200,
+    initialPendingYieldCount: initial.pendingYieldCount,
+    requiredMessageChannelCompletionDelta,
+    messageChannelCompletionDelta,
+    yieldCompletionDelta,
+    settled,
+    timedOut: !settled,
+    deadlineExceeded: false,
+    samples: [finalScalar],
+    final: structuredClone(finalScalar),
+  };
+}
 
 export const acceptanceFixtureIdentity = {
   manifestSha256: fixtureHash("a"),
@@ -93,8 +215,9 @@ export const acceptanceFixtureProfile = {
 export function makeAcceptanceFixtureReport({
   profileName = "hard-a",
   profile = acceptanceFixtureProfile,
-  contractSchemaVersion = 17,
+  contractSchemaVersion = 14,
   buildIdentity = acceptanceFixtureIdentity,
+  uncappedEvidence = acceptanceUncappedRequirements,
   analysisOverrides = {},
 } = {}) {
   const releaseEvidence = profile.releaseEvidence === true;
@@ -125,12 +248,95 @@ export function makeAcceptanceFixtureReport({
     truncatedCount: 0,
     releaseEligible: false,
   };
+  const samples = [4, 8].map((count, index) => {
+    const framePacing = acceptanceFramePacingSnapshot(count);
+    return {
+    at: index + 1,
+    evaluationLatencyMillis: 1,
+    measurementId: acceptanceMeasurementEpochId,
+    measurementEpochId: acceptanceMeasurementEpochId,
+    frame: {...framePacing},
+    runtimeInvariants: {framePacing: {...framePacing}},
+    };
+  });
+  const finalFramePacing = acceptanceFramePacingSnapshot(8);
+  const settlement = makeAcceptanceFramePacingSettlement(finalFramePacing);
+  const telemetry = {
+    capturedAt: 3,
+    measurementId: acceptanceMeasurementEpochId,
+    measurementEpochId: acceptanceMeasurementEpochId,
+    controllerRequestedAt: 2,
+    controllerReceivedAt: 3,
+    evaluationLatencyMillis: 1,
+    deadlineExceeded: false,
+    frame: {...finalFramePacing},
+    runtimeInvariants: {framePacing: {...finalFramePacing}},
+    framePacingSettlement: settlement,
+  };
+  const cleanupFramePacing = withDualFramePacingSources(settlement.final, {
+    capturedAt: 5,
+    controllerRequestedAt: 5,
+    controllerReceivedAt: 6,
+    cutoffYieldRequestCount: settlement.final.yieldRequestCount,
+  });
+  telemetry.cleanupFramePacing = structuredClone(cleanupFramePacing);
+  const cleanupTelemetry = structuredClone(cleanupFramePacing);
+  cleanupTelemetry.framePacingClosure = structuredClone(cleanupFramePacing);
+  const sampleSources = samples.map((sample, index) =>
+    normalizeFramePacingEvidenceSnapshot(sample, {
+      requiredFields: uncappedEvidence.requiredFields,
+      label: `sample[${index}]`,
+      requireDualSources: true,
+    }));
+  const finalSources = normalizeFramePacingEvidenceSnapshot(telemetry, {
+    requiredFields: uncappedEvidence.requiredFields,
+    label: "final",
+    requireDualSources: true,
+  });
+  const settlementSources = normalizeFramePacingSettlementEvidence(settlement, {
+    requiredFields: uncappedEvidence.requiredFields,
+    label: "settlement",
+    requireDualSources: true,
+  });
+  const cleanupSources = normalizeFramePacingEvidenceSnapshot(cleanupTelemetry, {
+    requiredFields: uncappedEvidence.requiredFields,
+    label: "cleanup",
+    requireDualSources: true,
+  });
+  const framePacingEvidence = evaluateUncappedFramePacing({
+    samples: sampleSources.map(({merged}) => merged),
+    final: finalSources.merged,
+    settlement: settlementSources.settlement,
+    cleanup: cleanupSources.merged,
+    measurementEpochId: acceptanceMeasurementEpochId,
+    requireEpochClosure: true,
+    sourceOverlapMismatches: [
+      ...sampleSources.flatMap(({overlapMismatches}) => overlapMismatches),
+      ...sampleSources.flatMap(({sourceCompletenessFailures}) => sourceCompletenessFailures),
+      ...finalSources.overlapMismatches,
+      ...finalSources.sourceCompletenessFailures,
+      ...settlementSources.overlapMismatches,
+      ...settlementSources.sourceCompletenessFailures,
+      ...cleanupSources.overlapMismatches,
+      ...cleanupSources.sourceCompletenessFailures,
+    ],
+    timing: {
+      lastSampleAt: 2,
+      finalCapturedAt: 3,
+      settlementCapturedAt: 4,
+      cleanupCapturedAt: 5,
+    },
+    requirements: uncappedEvidence,
+  });
   return {
     schemaVersion: contractSchemaVersion,
     passed: true,
     verdict,
     profileName,
     buildIdentity,
+    telemetry,
+    cleanupTelemetry,
+    samples,
     configuration: {
       profileName,
       contractSchemaVersion,
@@ -139,6 +345,8 @@ export function makeAcceptanceFixtureReport({
       gating: releaseEvidence,
       releaseEvidence,
       strictChecks: true,
+      measurementId: acceptanceMeasurementEpochId,
+      measurementEpochId: acceptanceMeasurementEpochId,
       buildIdentity,
       workerDistanceContract: {
         mode: "natural-observation",
@@ -270,22 +478,7 @@ export function makeAcceptanceFixtureReport({
         },
       },
       performanceEvidence: {
-        framePacing: {
-          verdict: "pass",
-          observed: {
-            swapIntervalMin: 0,
-            swapIntervalMax: 0,
-            uncappedYieldCountMax: 8,
-            vsyncYieldCountMax: 0,
-            presentToRafCountMax: 0,
-            fairYieldCountMax: 2,
-            messageChannelCreateFailureCountMax: 0,
-            messageChannelPostFailureCountMax: 0,
-            messageChannelRebuildCountMax: 0,
-            cancelledMessageTaskCountMax: 0,
-            watchdogYieldCountMax: 0,
-          },
-        },
+        framePacing: framePacingEvidence,
       },
       ...analysisOverrides,
     },

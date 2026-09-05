@@ -1,6 +1,17 @@
 "use strict";
 
 const root = globalThis;
+// Manual Chrome diagnostics may opt into the Mob AI pulse counter by adding
+// `gaiusMobAiTelemetry=1` to the launcher URL.  Production pages leave this
+// unset, so the checkpoint remains a cheap scheduler call with no telemetry
+// object churn.
+try {
+  const diagnosticUrl = new URL(String(root.location?.href || ""), "http://gaius.invalid/");
+  root.__gaiusMobAiTelemetry = root.__gaiusMobAiTelemetry === true ||
+    diagnosticUrl.searchParams.get("gaiusMobAiTelemetry") === "1";
+} catch (_) {
+  root.__gaiusMobAiTelemetry = false;
+}
 if (typeof Error === "function" && (!Error.stackTraceLimit || Error.stackTraceLimit < 100)) {
   Error.stackTraceLimit = 100;
 }
@@ -390,7 +401,24 @@ function observeTelemetryMeasurement(value) {
   // These two objects are telemetry-only.  Replacing them (rather than
   // clearing the network bridge) keeps the scheduler's live references and
   // queue/backpressure decisions intact while dropping startup samples.
+  // Mob-AI pulses are deliberately carried across measurement windows: the
+  // LivingEntity checkpoint is a high-frequency runtime signal and resetting
+  // it here made a healthy hook look inactive in the final snapshot.  Other
+  // worldgen counters remain windowed as before.
+  const previousWorldgenStats = root.__gaiusWorldgenStats;
+  const previousMobAiPulses = root.__gaiusMobAiTelemetry === true
+    ? Number(previousWorldgenStats?.mobAiPulses) || 0
+    : 0;
+  const previousMobAiMaxPulses = root.__gaiusMobAiTelemetry === true
+    ? Number(previousWorldgenStats?.mobAiMaxPulses) || 0
+    : 0;
   root.__gaiusWorldgenStats = {};
+  if (previousMobAiPulses > 0) {
+    root.__gaiusWorldgenStats.mobAiPulses = previousMobAiPulses;
+  }
+  if (previousMobAiMaxPulses > 0) {
+    root.__gaiusWorldgenStats.mobAiMaxPulses = previousMobAiMaxPulses;
+  }
   root.__gaiusChunkPriorityStats = createChunkPriorityTelemetryStats();
 
   // Network and storage objects contain scheduler-visible gauges.  Leave the
@@ -433,6 +461,16 @@ function markStartup(phase, startedAt) {
 
 root.onmessage = async (event) => {
   const message = event.data;
+  // The portable launcher uses a Blob URL, which cannot safely carry a
+  // diagnostic query parameter.  Accept the opt-in before the start handshake
+  // so Mob-AI telemetry is available in both external-script and portable
+  // Worker deployments without changing the normal release path.
+  if (message && message.type === "diagnostic-config") {
+    if (message.gaiusMobAiTelemetry === true) {
+      root.__gaiusMobAiTelemetry = true;
+    }
+    return;
+  }
   if (message && message.type === "stop") {
     requestStop();
     return;
@@ -827,7 +865,10 @@ function handleControlMessage(event) {
       // deltas): turns/yields are cumulative process diagnostics while the
       // max/last fields are gauges. Missing fields stay explicit nulls.
       globalPump: snapshotGlobalPumpTelemetry(globalPumpTelemetrySource()),
-      worldgen: snapshotScalarTelemetry(root.__gaiusWorldgenStats),
+      worldgen: snapshotScalarTelemetry(root.__gaiusWorldgenStats, [
+        "mobAiPulses",
+        "mobAiMaxPulses",
+      ]),
       storage: snapshotMeasurementTelemetry(
         storageStats,
         telemetryStorageBaseline,

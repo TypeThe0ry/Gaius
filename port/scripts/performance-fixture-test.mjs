@@ -28,15 +28,26 @@ const contract = JSON.parse(await readFile(contractPath, "utf8"));
 const benchmarkSource = await readFile(benchmarkPath, "utf8");
 const completed = [];
 
-assert.equal(contract.schemaVersion, 11, "performance contract schema must include scheduler health evidence rules");
+assert.equal(contract.schemaVersion, 14,
+  "performance contract schema must require fail-closed MessageChannel settlement evidence");
 assert.deepEqual(
   contract.environment.uncappedEvidence.requiredFields,
   [
     "swapInterval",
     "uncappedYieldCount",
     "vsyncYieldCount",
+    "visibleYieldCount",
+    "hiddenYieldCount",
     "presentToRafCount",
+    "messageChannelYieldCount",
     "fairYieldCount",
+    "schedulerYieldCount",
+    "timerYieldCount",
+    "yieldRequestCount",
+    "yieldCompletionCount",
+    "pendingYieldCount",
+    "maxPendingYieldCount",
+    "duplicateYieldCallbackCount",
     "messageChannelCreateFailureCount",
     "messageChannelPostFailureCount",
     "messageChannelRebuildCount",
@@ -45,15 +56,158 @@ assert.deepEqual(
   ],
   "uncapped release evidence fields must be explicit",
 );
+assert.equal(contract.environment.uncappedEvidence.requireFramePacingSettlement, true);
+assert.equal(contract.environment.uncappedEvidence.settlementSchemaVersion, 1);
+assert.equal(contract.environment.uncappedEvidence.settlementPollIntervalMillis, 8);
+assert.equal(contract.environment.uncappedEvidence.settlementTimeoutMillis, 200);
+
+const pacingFields = contract.environment.uncappedEvidence.requiredFields;
+const isCompletePacingSnapshot = (value) => value && typeof value === "object"
+  && pacingFields.every((field) => typeof value[field] === "number"
+    && Number.isFinite(value[field]));
+const makeFixtureSettlement = (initial) => {
+  if (!isCompletePacingSnapshot(initial)) return null;
+  const final = {...initial};
+  if (initial.pendingYieldCount === 1) {
+    final.messageChannelYieldCount += 1;
+    final.yieldCompletionCount += 1;
+    final.pendingYieldCount = 0;
+  }
+  const requiredDelta = initial.pendingYieldCount === 1 ? 1 : 0;
+  const messageDelta = final.messageChannelYieldCount - initial.messageChannelYieldCount;
+  const completionDelta = final.yieldCompletionCount - initial.yieldCompletionCount;
+  const settled = requiredDelta === 0 || (messageDelta >= 1 && completionDelta >= 1);
+  return {
+    schemaVersion: 1,
+    initialCapturedAt: 2,
+    capturedAt: 3,
+    pollIntervalMillis: 8,
+    timeoutMillis: 200,
+    initialPendingYieldCount: initial.pendingYieldCount,
+    requiredMessageChannelCompletionDelta: requiredDelta,
+    messageChannelCompletionDelta: messageDelta,
+    yieldCompletionDelta: completionDelta,
+    settled,
+    timedOut: !settled,
+    samples: [{capturedAt: 3, ...final}],
+    final,
+  };
+};
 
 for (const testCase of fixtures.uncappedPacingCases) {
+  const settlement = makeFixtureSettlement(testCase.final);
   const result = evaluateUncappedFramePacing({
     samples: testCase.samples,
     final: testCase.final,
+    settlement,
+    timing: settlement == null ? null : {
+      lastSampleAt: 1,
+      finalCapturedAt: 2,
+      settlementCapturedAt: 3,
+    },
     requirements: contract.environment.uncappedEvidence,
   });
   assert.equal(result.verdict, testCase.expectedVerdict, `${testCase.name}: verdict`);
+  if (testCase.name === "early-null-sample-then-complete-window-passes") {
+    assert.equal(result.incompleteSampleCount, 1);
+    assert.equal(result.allowedResetSentinelSampleCount, 1);
+    assert.equal(result.sampleCompletenessViolationCount, 0);
+  }
+  if (testCase.name === "mid-stream-incomplete-hidden-timer-sample-fails") {
+    assert.equal(result.sampleCompletenessViolationCount, 1);
+  }
+  if (testCase.name === "max-pending-zero-after-request-fails") {
+    assert.ok(result.observed.snapshotInvariantFailureCount > 0);
+  }
   completed.push(testCase.name);
+}
+assert.ok(completed.includes("one-in-flight-message-channel-continuation-passes"));
+assert.ok(completed.includes("early-null-sample-then-complete-window-passes"));
+for (const requiredNegativeCase of [
+  "request-completion-100-to-1-mismatch-fails",
+  "negative-counter-fails",
+  "pending-two-fails",
+  "counter-decrease-or-reset-fails",
+  "hidden-pending-timer-path-fails-visible-window",
+  "mid-stream-incomplete-hidden-timer-sample-fails",
+  "max-pending-zero-after-request-fails",
+  "mid-stream-all-zero-reset-sentinel-fails",
+]) {
+  assert.ok(completed.includes(requiredNegativeCase), `${requiredNegativeCase}: missing fixture`);
+}
+
+{
+  const initial = {
+    ...fixtures.uncappedPacingCases.find((item) =>
+      item.name === "one-in-flight-message-channel-continuation-passes").final,
+  };
+  const settlement = makeFixtureSettlement(initial);
+  const healthy = evaluateUncappedFramePacing({
+    samples: [
+      {...initial, uncappedYieldCount: 50, visibleYieldCount: 50,
+        messageChannelYieldCount: 50, yieldRequestCount: 50,
+        yieldCompletionCount: 50, pendingYieldCount: 0},
+      initial,
+    ],
+    final: initial,
+    settlement,
+    timing: {lastSampleAt: 1, finalCapturedAt: 2, settlementCapturedAt: 3},
+    requirements: contract.environment.uncappedEvidence,
+  });
+  assert.equal(healthy.verdict, "pass", "one pending MessageChannel callback must settle cleanly");
+  assert.equal(healthy.settlement.completionProved, true);
+
+  const watchdogFinal = {
+    ...initial,
+    messageChannelYieldCount: initial.messageChannelYieldCount,
+    timerYieldCount: 1,
+    yieldCompletionCount: initial.yieldCompletionCount + 1,
+    pendingYieldCount: 0,
+    watchdogYieldCount: 1,
+  };
+  const deadChannelSettlement = {
+    ...settlement,
+    messageChannelCompletionDelta: 0,
+    yieldCompletionDelta: 1,
+    settled: false,
+    timedOut: true,
+    samples: [{capturedAt: 3, ...watchdogFinal}],
+    final: watchdogFinal,
+  };
+  const deadChannel = evaluateUncappedFramePacing({
+    samples: [initial, initial],
+    final: initial,
+    settlement: deadChannelSettlement,
+    timing: {lastSampleAt: 1, finalCapturedAt: 2, settlementCapturedAt: 3},
+    requirements: contract.environment.uncappedEvidence,
+  });
+  assert.equal(deadChannel.verdict, "fail", "watchdog fallback must not fake settlement");
+  assert.ok(deadChannel.settlement.healthFailureCount > 0);
+
+  const overlap = evaluateUncappedFramePacing({
+    samples: [initial, initial],
+    final: initial,
+    settlement,
+    sourceOverlapMismatches: [{label: "sample[0]", field: "timerYieldCount", frame: 0, runtime: 1}],
+    timing: {lastSampleAt: 1, finalCapturedAt: 2, settlementCapturedAt: 3},
+    requirements: contract.environment.uncappedEvidence,
+  });
+  assert.equal(overlap.verdict, "fail", "overlapping pacing sources must agree exactly");
+
+  const badTiming = evaluateUncappedFramePacing({
+    samples: [initial, initial],
+    final: initial,
+    settlement,
+    timing: {lastSampleAt: 2, finalCapturedAt: 2, settlementCapturedAt: 3},
+    requirements: contract.environment.uncappedEvidence,
+  });
+  assert.equal(badTiming.verdict, "fail", "final telemetry must follow the last raw sample");
+  completed.push(
+    "frame-pacing-settlement-pending-one",
+    "frame-pacing-settlement-watchdog-fails",
+    "frame-pacing-source-overlap-fails",
+    "frame-pacing-timestamp-order-fails",
+  );
 }
 
 {
@@ -74,7 +228,10 @@ for (const testCase of fixtures.uncappedPacingCases) {
         uncappedYieldCountMax: 10,
         vsyncYieldCountMax: 0,
         presentToRafCountMax: 0,
-        fairYieldCountMax: 2,
+        messageChannelYieldCountMax: 10,
+        fairYieldCountMax: 0,
+        schedulerYieldCountMax: 0,
+        timerYieldCountMax: 0,
         messageChannelCreateFailureCountMax: 0,
         messageChannelPostFailureCountMax: 0,
         messageChannelRebuildCountMax: 0,
@@ -667,6 +824,15 @@ const passingRuntimeSnapshot = {
     pendingYieldCount: 1,
     maxPendingYieldCount: 1,
     duplicateYieldCallbackCount: 0,
+    uncappedYieldCount: 1000,
+    vsyncYieldCount: 0,
+    visibleYieldCount: 1000,
+    hiddenYieldCount: 0,
+    presentToRafCount: 0,
+    messageChannelYieldCount: 999,
+    fairYieldCount: 0,
+    schedulerYieldCount: 0,
+    timerYieldCount: 0,
   },
 };
 let passingRuntimeInvariants;
@@ -985,8 +1151,18 @@ completed.push("runtime-invariant-external-smoke-evidence");
     "evaluateUncappedFramePacing",
     "buildPerformanceEvidence",
     "uncappedYieldCount",
+    "visibleYieldCount",
+    "hiddenYieldCount",
     "presentToRafCount",
+    "messageChannelYieldCount",
     "fairYieldCount",
+    "schedulerYieldCount",
+    "timerYieldCount",
+    "yieldRequestCount",
+    "yieldCompletionCount",
+    "pendingYieldCount",
+    "maxPendingYieldCount",
+    "duplicateYieldCallbackCount",
     "messageChannelCreateFailureCount",
     "messageChannelPostFailureCount",
     "messageChannelRebuildCount",
@@ -1002,6 +1178,10 @@ completed.push("runtime-invariant-external-smoke-evidence");
     "__gaiusGLStats",
     "runtimeInvariants:{glStats,targeting:targetingSnapshot",
     "network:scalarSnapshot(network)",
+    "mergeFramePacingTelemetrySources",
+    "captureFinalTelemetryAfterSamples",
+    "settleFramePacing",
+    "framePacingSettlement",
     "collectContinuousVisualOutput",
     "cdpCommandTimeoutMillis",
     "maximumStateStallMillis",

@@ -12,7 +12,7 @@ GAIUS_VERSION_PROFILE_PATH=versions/1.21.11.json \
   ../../port/mvnw -B -ntp -f pom.xml package
 ```
 
-Copy `target/gaius-server-plugin-0.0.2.jar` into the Paper server's
+Copy `target/gaius-server-plugin-0.0.3.jar` into the Paper server's
 `plugins/` directory. The default WebSocket endpoint is
 `ws://server.example:8081/tunnel`. Use a TLS reverse proxy and `wss://` when the
 browser page is served over HTTPS. Set `access-token` and restrict

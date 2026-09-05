@@ -79,6 +79,264 @@ function occurrences(haystack, needle) {
   return haystack.split(needle).length - 1;
 }
 
+function assertClientPlayPacketQueueContract(packetUtilsBytecode, profileId) {
+  const contract = method(packetUtilsBytecode,
+    "void ensureRunningOnSameThread(net.minecraft.network.protocol.Packet<T>, T, net.minecraft.network.PacketProcessor)",
+    "public static <T extends net.minecraft.network.PacketListener> net.minecraft.ReportedException");
+  const transitionPackets = [
+    "ClientboundStartConfigurationPacket",
+    "ClientboundLoginPacket",
+  ];
+  const commonInlinePackets = [
+    "ClientboundPingPacket",
+    "ClientboundCustomPayloadPacket",
+    "ClientboundResourcePackPushPacket",
+    "ClientboundResourcePackPopPacket",
+    "ClientboundCookieRequestPacket",
+    "ClientboundStoreCookiePacket",
+    "ClientboundCustomReportDetailsPacket",
+    "ClientboundServerLinksPacket",
+    "ClientboundShowDialogPacket",
+    "ClientboundClearDialogPacket",
+    "ClientboundTransferPacket",
+  ];
+  const instructions = bytecodeInstructions(contract);
+  const byOffset = new Map(instructions.map((instruction) =>
+    [instruction.offset, instruction.instruction]));
+  const indexOfInstruction = (predicate, start = 0) => {
+    const index = instructions.findIndex((entry, candidate) => candidate >= start && predicate(entry));
+    assert.ok(index >= 0, `${profileId} PacketUtils bytecode instruction is missing`);
+    return index;
+  };
+  const branchAfterInstanceof = (packetName, occurrence) => {
+    const matches = [];
+    for (let index = 0; index < instructions.length; index++) {
+      if (!instructions[index].instruction.includes("instanceof") ||
+          !instructions[index].instruction.includes(packetName)) {
+        continue;
+      }
+      const next = instructions[index + 1]?.instruction.match(/^(ifne|ifeq)\s+(\d+)/);
+      if (next) matches.push({index, opcode: next[1], target: Number(next[2])});
+    }
+    assert.equal(matches.length, 2,
+      `${profileId} ${packetName} must have one non-PLAY and one guarded PLAY classifier`);
+    return matches[occurrence];
+  };
+  const inlineIndex = indexOfInstruction((entry) =>
+    entry.instruction.includes("BrowserWebSocketChannel.recordInlineDecodedPacket"));
+  const inlineTarget = instructions[inlineIndex].offset;
+  const configurationIndex = indexOfInstruction((entry) =>
+    entry.instruction.includes("ClientConfigurationPacketListenerImpl"));
+  assert.match(instructions[configurationIndex + 1]?.instruction || "", /^ifne\s+/,
+    `${profileId} configuration listener does not use the inline boundary`);
+  assert.equal(Number(instructions[configurationIndex + 1].instruction.match(/^(?:ifne)\s+(\d+)/)[1]),
+    inlineTarget,
+    `${profileId} configuration listener no longer uses the inline boundary`);
+  const playIndex = indexOfInstruction((entry) =>
+    entry.instruction.includes("instanceof") &&
+    entry.instruction.includes("ClientPacketListener") &&
+    !entry.instruction.includes("ClientConfigurationPacketListenerImpl"));
+  const playBranch = instructions[playIndex + 1]?.instruction.match(/^ifne\s+(\d+)/);
+  assert.ok(playBranch, `${profileId} PLAY listener guard must branch to the guarded path`);
+  const playTarget = Number(playBranch[1]);
+  const playTargetIndex = instructions.findIndex((entry) => entry.offset === playTarget);
+  assert.ok(playTargetIndex > playIndex,
+    `${profileId} PLAY listener guard must precede common inline classification`);
+  const drainIndex = indexOfInstruction((entry) =>
+    entry.instruction.includes("BrowserPacketScheduler.isProcessingQueuedPacket"));
+  assert.ok(drainIndex > playTargetIndex,
+    `${profileId} queued-drain guard must execute after entering the PLAY path`);
+  const drainBranch = instructions[drainIndex + 1]?.instruction.match(/^ifne\s+(\d+)/);
+  assert.ok(drainBranch, `${profileId} PacketUtils queued-drain guard branch is missing`);
+  const queuedReturnTarget = Number(drainBranch[1]);
+  assert.equal(byOffset.get(queuedReturnTarget), "return",
+    `${profileId} queued PLAY handler re-enters vanilla thread identity instead of returning`);
+  const commonBranches = commonInlinePackets.map((packet) => ({
+    packet,
+    first: branchAfterInstanceof(packet, 0),
+    second: branchAfterInstanceof(packet, 1),
+  }));
+  const commonInlineTargets = new Set(commonBranches.map(({first}) => {
+    assert.equal(first.opcode, "ifne");
+    return first.target;
+  }));
+  assert.deepEqual([...commonInlineTargets], [inlineTarget],
+    `${profileId} non-PLAY common packets must retain the inline fast path`);
+  const commonBacklogTargets = new Set(commonBranches.map(({second}) => {
+    assert.equal(second.opcode, "ifne");
+    return second.target;
+  }));
+  assert.equal(commonBacklogTargets.size, 1,
+    `${profileId} PLAY common packets must share one backlog gate`);
+  const commonBacklogTarget = [...commonBacklogTargets][0];
+  assert.ok(commonBacklogTarget > playTarget,
+    `${profileId} PLAY common packet gate must be after the owner guard`);
+  const transitionBranches = transitionPackets.map((packet) => {
+    const index = indexOfInstruction((entry) =>
+      entry.instruction.includes("instanceof") && entry.instruction.includes(packet));
+    const branch = instructions[index + 1]?.instruction.match(/^ifne\s+(\d+)/);
+    assert.ok(branch, `${profileId} transition classifier ${packet} is missing`);
+    return {packet, target: Number(branch[1])};
+  });
+  const transitionBacklogTargets = new Set(transitionBranches.map(({target}) => target));
+  assert.equal(transitionBacklogTargets.size, 1,
+    `${profileId} transition packets must share one backlog gate`);
+  const transitionBacklogTarget = [...transitionBacklogTargets][0];
+  const pendingCallIndices = [];
+  for (let index = 0; index < instructions.length; index++) {
+    if (instructions[index].instruction.includes("BrowserPacketScheduler.hasPendingPackets")) {
+      pendingCallIndices.push(index);
+    }
+  }
+  assert.equal(pendingCallIndices.length, 2,
+    `${profileId} PacketUtils must have separate common and transition FIFO backlog checks`);
+  const assertBacklogBlock = (target, label) => {
+    const targetIndex = instructions.findIndex((entry) => entry.offset === target);
+    assert.ok(targetIndex >= 0, `${profileId} ${label} backlog target is missing`);
+    const pendingIndex = indexOfInstruction((entry) =>
+      entry.instruction.includes("BrowserPacketScheduler.hasPendingPackets"), targetIndex);
+    assert.ok(pendingIndex > targetIndex,
+      `${profileId} ${label} backlog gate is not reachable from its classifier`);
+    const branch = instructions[pendingIndex + 1]?.instruction.match(/^ifeq\s+(\d+)/);
+    assert.ok(branch, `${profileId} ${label} backlog gate must branch on an empty owner queue`);
+    assert.equal(Number(branch[1]), inlineTarget,
+      `${profileId} ${label} empty backlog must use the inline boundary`);
+    return pendingIndex;
+  };
+  const commonPendingIndex = assertBacklogBlock(commonBacklogTarget, "common");
+  const transitionPendingIndex = assertBacklogBlock(transitionBacklogTarget, "transition");
+  assert.ok(commonPendingIndex < transitionPendingIndex,
+    `${profileId} common and transition backlog blocks must remain ordered`);
+  const forcedSchedule = indexOfInstruction((entry) =>
+    entry.instruction.includes("PacketProcessor.scheduleIfPossible"));
+  const forcedAbort = indexOfInstruction((entry) =>
+    entry.instruction.includes("RunningOnDifferentThreadException.RUNNING_ON_DIFFERENT_THREAD"),
+    forcedSchedule);
+  const forcedThrow = indexOfInstruction((entry) => entry.instruction === "athrow", forcedAbort);
+  const vanillaThreadCheck = indexOfInstruction((entry) =>
+    entry.instruction.includes("PacketProcessor.isSameThread"));
+  const vanillaSchedule = indexOfInstruction((entry) =>
+    entry.instruction.includes("PacketProcessor.scheduleIfPossible"), forcedSchedule + 1);
+  const ordered = [configurationIndex, playIndex, ...commonBranches.map(({first}) => first.index),
+    drainIndex, ...transitionBranches.map(({packet}) => indexOfInstruction((entry) =>
+      entry.instruction.includes("instanceof") && entry.instruction.includes(packet), playTargetIndex)),
+    ...commonBranches.map(({second}) => second.index), commonPendingIndex, transitionPendingIndex,
+    forcedSchedule, forcedAbort, forcedThrow, inlineIndex, vanillaThreadCheck, vanillaSchedule];
+  assert.ok(ordered.every((value, index) => value >= 0 &&
+    (index === 0 || value > ordered[index - 1])),
+  `${profileId} PacketUtils does not force PLAY traffic through PacketProcessor before vanilla same-thread return`);
+  assert.equal(occurrences(contract, "PacketProcessor.scheduleIfPossible"), 2,
+    `${profileId} PacketUtils must contain one forced PLAY queue and one vanilla foreign-thread queue`);
+  assert.equal(occurrences(contract, "BrowserWebSocketChannel.recordInlineDecodedPacket"), 1,
+    `${profileId} PacketUtils must retire exactly one shared inline packet boundary`);
+  for (const packet of transitionPackets) {
+    assert.equal(occurrences(contract, packet), 1,
+      `${profileId} PacketUtils must keep one exact ${packet} transition classifier`);
+  }
+  for (const packet of commonInlinePackets) {
+    assert.equal(occurrences(contract, packet), 2,
+      `${profileId} PacketUtils must classify ${packet} in both non-PLAY and guarded PLAY paths`);
+  }
+  assert.equal(occurrences(contract, "ClientPacketListener"), 1,
+    `${profileId} PacketUtils must have exactly one PLAY-listener force-queue branch`);
+  assert.equal(occurrences(contract, "BrowserPacketScheduler.isProcessingQueuedPacket"), 1,
+    `${profileId} PacketUtils must bypass force-queue exactly while draining it`);
+  assert.equal(occurrences(contract, "BrowserPacketScheduler.hasPendingPackets"), 2,
+    `${profileId} PacketUtils must preserve queued PLAY FIFO for common and transition packets`);
+}
+
+function assertKeepAliveImmediateSendContract(listenerBytecode, profileId) {
+  const keepAlive = method(listenerBytecode,
+    "public void handleKeepAlive(net.minecraft.network.protocol.common.ClientboundKeepAlivePacket);",
+    "public void handlePing(net.minecraft.network.protocol.common.ClientboundPingPacket);");
+  const accounting = keepAlive.indexOf("BrowserWebSocketChannel.recordInlineDecodedPacket");
+  const packetId = keepAlive.indexOf("ClientboundKeepAlivePacket.getId:()J");
+  const response = keepAlive.indexOf("ServerboundKeepAlivePacket.\"<init>\":(J)V");
+  const sendWhen = keepAlive.indexOf("Method sendWhen:");
+  assert.ok(accounting >= 0 && accounting < packetId && packetId < response &&
+    response < sendWhen,
+  `${profileId} keepalive does not retire decoder accounting before immediate sendWhen`);
+  assert.equal(occurrences(keepAlive, "BrowserWebSocketChannel.recordInlineDecodedPacket"), 1,
+    `${profileId} keepalive must retire exactly one inline decoder boundary`);
+  assert.equal(occurrences(keepAlive, "Method sendWhen:"), 1,
+    `${profileId} keepalive must retain exactly one immediate sendWhen path`);
+  assert.equal(occurrences(keepAlive, "PacketUtils.ensureRunningOnSameThread"), 0,
+    `${profileId} keepalive unexpectedly entered the ordinary PLAY PacketUtils queue`);
+
+  const predicateSignature = listenerBytecode.match(
+    /private static boolean lambda\$handleKeepAlive\$\d+\(\);/)?.[0];
+  assert.ok(predicateSignature, `${profileId} keepalive predicate signature is missing`);
+  const predicate = method(listenerBytecode, predicateSignature, "private static java.util.List");
+  assert.deepEqual(bytecodeInstructions(predicate).map(({instruction}) => instruction),
+    ["iconst_1", "ireturn"],
+    `${profileId} keepalive predicate is not the exact immediate-send constant`);
+  assert.doesNotMatch(predicate, /RenderSystem\.isFrozenAtPollEvents/,
+    `${profileId} keepalive predicate still waits for the desktop render poll gate`);
+
+  const sendWhenContract = method(listenerBytecode,
+    "private void sendWhen(net.minecraft.network.protocol.Packet<? extends net.minecraft.network.ServerboundPacketListener>, java.util.function.BooleanSupplier, java.time.Duration);",
+    "private net.minecraft.client.gui.screens.Screen addOrUpdatePackPrompt");
+  const sendWhenInstructions = bytecodeInstructions(sendWhenContract);
+  const supplierIndex = sendWhenInstructions.findIndex(({instruction}) =>
+    instruction.includes("BooleanSupplier.getAsBoolean:()Z"));
+  assert.ok(supplierIndex >= 0 &&
+    /^ifeq\s+\d+/.test(sendWhenInstructions[supplierIndex + 1]?.instruction || "") &&
+    sendWhenInstructions[supplierIndex + 2]?.instruction === "aload_0" &&
+    sendWhenInstructions[supplierIndex + 3]?.instruction === "aload_1" &&
+    sendWhenInstructions[supplierIndex + 4]?.instruction.includes(
+      "Method send:(Lnet/minecraft/network/protocol/Packet;)V"),
+  `${profileId} sendWhen true branch no longer synchronously sends the keepalive response`);
+  assert.equal(occurrences(sendWhenContract, "BooleanSupplier.getAsBoolean:()Z"), 1,
+    `${profileId} sendWhen must evaluate one keepalive liveness predicate`);
+  assert.equal(occurrences(sendWhenContract,
+    "Method send:(Lnet/minecraft/network/protocol/Packet;)V"), 1,
+  `${profileId} sendWhen must contain one direct send path`);
+  assert.equal(occurrences(sendWhenContract, "java/util/List.add:(Ljava/lang/Object;)Z"), 1,
+    `${profileId} sendWhen deferred fallback was unexpectedly removed`);
+}
+
+function assertPacketProcessorQueueContract(packetProcessorBytecode, profileId) {
+  const contract = method(packetProcessorBytecode,
+    "public void processQueuedPackets();", "public void close();");
+  assert.match(contract, /BrowserPacketScheduler\.beginBatch[^\n]*\(Ljava\/lang\/Object;\)Z/,
+    `${profileId} PacketProcessor does not claim an owner-aware batch`);
+  assert.match(contract, /BrowserPacketScheduler\.shouldProcessNext[^\n]*\(Ljava\/lang\/Object;\)Z/,
+    `${profileId} PacketProcessor does not use owner-aware batch accounting`);
+  const packetAccessor = contract.indexOf("ListenerAndPacket.packet");
+  const beginGuard = contract.indexOf("BrowserPacketScheduler.beginQueuedPacket");
+  const handle = contract.indexOf("ListenerAndPacket.handle");
+  assert.ok(packetAccessor >= 0 && packetAccessor < beginGuard && beginGuard < handle,
+    `${profileId} PacketProcessor does not bind timing/recursion guard to the exact packet handle`);
+  assert.equal(occurrences(contract, "BrowserPacketScheduler.beginQueuedPacket"), 1,
+    `${profileId} PacketProcessor must enter one queued packet guard per poll`);
+  assert.equal(occurrences(contract, "BrowserPacketScheduler.packetProcessed"), 2,
+    `${profileId} PacketProcessor normal/exception exits must each retire one queued packet`);
+  assert.match(contract, /Exception table:[\s\S]*any/,
+    `${profileId} PacketProcessor handle scope lacks a catch-all retirement path`);
+  const instructions = bytecodeInstructions(contract);
+  const beginInstruction = instructions.find(({instruction}) =>
+    instruction.includes("BrowserPacketScheduler.beginQueuedPacket"));
+  assert.ok(beginInstruction?.instruction.includes(
+    "(Ljava/lang/Object;Ljava/lang/Object;)V"),
+    `${profileId} PacketProcessor does not pass owner + exact Packet object into telemetry`);
+  assert.match(packetProcessorBytecode,
+    /private void gaius\$vanillaProcessQueuedPackets\(\);/,
+    `${profileId} PacketProcessor has no retained vanilla fallback`);
+}
+
+function assertPacketProcessorLifecycleContract(packetProcessorBytecode, profileId) {
+  const contract = method(packetProcessorBytecode,
+    "public net.minecraft.network.PacketProcessor(java.lang.Thread);",
+    "public boolean isSameThread();");
+  assert.equal(occurrences(contract, "BrowserPacketScheduler.bindPacketProcessorLifecycle"), 1,
+    `${profileId} PacketProcessor constructor must bind the explicit lifecycle owner exactly once`);
+  assert.match(contract,
+    /invokestatic[^\n]*BrowserPacketScheduler\.bindPacketProcessorLifecycle[^\n]*\(Ljava\/lang\/Object;\)Z/,
+    `${profileId} PacketProcessor constructor lifecycle bind descriptor changed`);
+  assert.match(contract, /pop\s*\n\s*\d+:\s+return/,
+    `${profileId} PacketProcessor constructor must discard lifecycle bind status before return`);
+}
+
 function bytecodeInstructions(methodBytecode) {
   return methodBytecode.split(/\r?\n/).flatMap(line => {
     const match = line.match(/^\s*(\d+):\s+(.*)$/);
@@ -372,6 +630,26 @@ const clientPatcherSource = await readFile(
   join(toolsSource, "MinecraftClientPatcher.java"),
   "utf8",
 );
+const schedulerSource = await readFile(
+  join(repositoryRoot, "port/src/main/java/dev/gaius/browser/BrowserWorldgenScheduler.java"),
+  "utf8",
+);
+for (const contract of [
+  "patchMobBrowserAiCooperation(args[0], root.resolve(",
+  '"net/minecraft/world/entity/Mob.class"',
+  "browserWorldgenMobAiPulse()",
+  "browserWorldgenMobEntityPulse()",
+  '"Mob.serverAiStep AI stage shape changed: "',
+]) {
+  assert.ok(clientPatcherSource.includes(contract),
+    `missing Mob.serverAiStep cooperation contract: ${contract}`);
+}
+assert.match(schedulerSource, /public static void mobAiPulse\(\)/,
+  "scheduler is missing the Mob AI cooperative checkpoint");
+assert.match(schedulerSource, /public static void mobEntityPulse\(Object entity\)/,
+  "scheduler is missing the LivingEntity Mob fallback checkpoint");
+assert.match(schedulerSource, /__gaiusMobAiTelemetry/,
+  "Mob AI telemetry must remain opt-in and bounded");
 for (const helper of forbiddenDeepWorldgenPatchHelpers) {
   assert.equal(browserPatcherSource.includes(helper), false,
     `${helper} must not exist under the synchronous deep-worldgen policy`);
@@ -515,6 +793,114 @@ try {
   assert.deepEqual(graphicsPresetDistanceConstants(generic121Apply, "simulationDistance"),
     ["bipush 6", "bipush 12", "bipush 12"],
     "1.21.11 FAST simulation distance was changed by the 26.2 overlay path");
+
+  const patchedPacketUtils = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
+    "net.minecraft.network.protocol.PacketUtils"], {
+    encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30_000,
+  });
+  const patched121PacketUtils = execFileSync(javap, [
+    "-classpath", generic121Jar, "-p", "-c", "net.minecraft.network.protocol.PacketUtils",
+  ], {
+    encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30_000,
+  });
+  assertClientPlayPacketQueueContract(patchedPacketUtils, "26.2");
+  assertClientPlayPacketQueueContract(patched121PacketUtils, "1.21.11");
+  const patchedCommonListener = execFileSync(javap, [
+    "-classpath", clientJar, "-p", "-c",
+    "net.minecraft.client.multiplayer.ClientCommonPacketListenerImpl",
+  ], {encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000});
+  const patched121CommonListener = execFileSync(javap, [
+    "-classpath", generic121Jar, "-p", "-c",
+    "net.minecraft.client.multiplayer.ClientCommonPacketListenerImpl",
+  ], {encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000});
+  assertKeepAliveImmediateSendContract(patchedCommonListener, "26.2");
+  assertKeepAliveImmediateSendContract(patched121CommonListener, "1.21.11");
+  const patchedPacketProcessor = execFileSync(javap, [
+    "-classpath", clientJar, "-p", "-c", "net.minecraft.network.PacketProcessor",
+  ], {encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30_000});
+  const patched121PacketProcessor = execFileSync(javap, [
+    "-classpath", generic121Jar, "-p", "-c", "net.minecraft.network.PacketProcessor",
+  ], {encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30_000});
+  assertPacketProcessorQueueContract(patchedPacketProcessor, "26.2");
+  assertPacketProcessorQueueContract(patched121PacketProcessor, "1.21.11");
+  assertPacketProcessorLifecycleContract(patchedPacketProcessor, "26.2");
+  assertPacketProcessorLifecycleContract(patched121PacketProcessor, "1.21.11");
+
+  const rawMob = execFileSync(javap, ["-classpath", rawClientJar, "-p", "-c",
+    "net.minecraft.world.entity.Mob"], {
+    encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
+  });
+  const patchedMob = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
+    "net.minecraft.world.entity.Mob"], {
+    encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
+  });
+  const patched121Mob = execFileSync(javap, ["-classpath", generic121Jar, "-p", "-c",
+    "net.minecraft.world.entity.Mob"], {
+    encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
+  });
+  const rawMobAi = method(rawMob,
+    "protected final void serverAiStep();", "protected void customServerAiStep");
+  const patchedMobAi = method(patchedMob,
+    "protected final void serverAiStep();", "protected void customServerAiStep");
+  const patched121MobAi = method(patched121Mob,
+    "protected final void serverAiStep();", "protected void customServerAiStep");
+  const rawMobAiStep = method(rawMob,
+    "public void aiStep();", "protected final void serverAiStep");
+  const patchedMobAiStep = method(patchedMob,
+    "public void aiStep();", "protected final void serverAiStep");
+  const patched121MobAiStep = method(patched121Mob,
+    "public void aiStep();", "protected final void serverAiStep");
+  const rawMobTick = method(rawMob,
+    "public void tick();", "protected void updateControlFlags");
+  const patchedMobTick = method(patchedMob,
+    "public void tick();", "protected void updateControlFlags");
+  const patched121MobTick = method(patched121Mob,
+    "public void tick();", "protected void updateControlFlags");
+  const rawLivingEntity = execFileSync(javap, ["-classpath", rawClientJar, "-p", "-c",
+    "net.minecraft.world.entity.LivingEntity"], {
+    encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
+  });
+  const patchedLivingEntity = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
+    "net.minecraft.world.entity.LivingEntity"], {
+    encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
+  });
+  const patched121LivingEntity = execFileSync(javap, ["-classpath", generic121Jar, "-p", "-c",
+    "net.minecraft.world.entity.LivingEntity"], {
+    encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
+  });
+  const rawLivingTick = method(rawLivingEntity,
+    "public void tick();", "protected void updateFallFlying");
+  const patchedLivingTick = method(patchedLivingEntity,
+    "public void tick();", "protected void updateFallFlying");
+  const patched121LivingTick = method(patched121LivingEntity,
+    "public void tick();", "protected void updateFallFlying");
+  assert.doesNotMatch(rawMobAi, /BrowserWorldgenScheduler\.mobAiPulse/,
+    "raw Mob.serverAiStep unexpectedly contains browser scheduler hooks");
+  assert.doesNotMatch(rawMobAiStep, /BrowserWorldgenScheduler\.mobAiPulse/,
+    "raw Mob.aiStep unexpectedly contains browser scheduler hooks");
+  assert.doesNotMatch(rawMobTick, /BrowserWorldgenScheduler\.mobAiPulse/,
+    "raw Mob.tick unexpectedly contains browser scheduler hooks");
+  assert.doesNotMatch(rawLivingTick, /BrowserWorldgenScheduler\.mobEntityPulse/,
+    "raw LivingEntity.tick unexpectedly contains browser scheduler hooks");
+  assert.equal(occurrences(patchedMobAi, "BrowserWorldgenScheduler.mobAiPulse"), 7,
+    "26.2 Mob.serverAiStep must checkpoint all seven vanilla AI stage boundaries");
+  assert.equal(occurrences(patched121MobAi, "BrowserWorldgenScheduler.mobAiPulse"), 7,
+    "1.21.11 Mob.serverAiStep must checkpoint all seven vanilla AI stage boundaries");
+  assert.equal(occurrences(patchedMobAiStep, "BrowserWorldgenScheduler.mobAiPulse"), 2,
+    "26.2 Mob.aiStep must retain a cooperative boundary around the vanilla super call");
+  assert.equal(occurrences(patched121MobAiStep, "BrowserWorldgenScheduler.mobAiPulse"), 2,
+    "1.21.11 Mob.aiStep must retain a cooperative boundary around the vanilla super call");
+  assert.equal(occurrences(patchedMobTick, "BrowserWorldgenScheduler.mobAiPulse"), 0,
+    "26.2 Mob.tick must remain unmodified after moving the fallback to LivingEntity");
+  assert.equal(occurrences(patched121MobTick, "BrowserWorldgenScheduler.mobAiPulse"), 0,
+    "1.21.11 Mob.tick must remain unmodified after moving the fallback to LivingEntity");
+  assert.equal(occurrences(patchedLivingTick, "BrowserWorldgenScheduler.mobEntityPulse"), 1,
+    "26.2 LivingEntity.tick must retain the profile-generic Mob fallback boundary");
+  assert.equal(occurrences(patched121LivingTick, "BrowserWorldgenScheduler.mobEntityPulse"), 1,
+    "1.21.11 LivingEntity.tick must retain the profile-generic Mob fallback boundary");
+  assert.equal(occurrences(patchedMobAi, "BrowserWorldgenScheduler.mobAiPulse"),
+    occurrences(patched121MobAi, "BrowserWorldgenScheduler.mobAiPulse"),
+    "Mob AI cooperation must remain profile-generic");
 
   const deepWorldgenBytecode = execFileSync(javap, [
     "-classpath", clientJar, "-p", "-c", ...synchronousDeepWorldgenClasses,
