@@ -2,7 +2,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-Gaius Client `0.0.1` is an experimental browser port of Minecraft Java
+Gaius Client `0.0.2` is an experimental browser port of Minecraft Java
 Edition `26.2`, with the `1.21.11` profile retained for compatibility. Each
 profile uses the original Java client path with TeaVM and browser-specific
 platform overlays; this is not a TypeScript recreation of Minecraft gameplay.
@@ -37,14 +37,14 @@ opening the generated browser bundle.
 
 ## Download
 
-The `v0.0.1` release page contains one portable browser client per supported
+The `v0.0.2` release page contains one portable browser client per supported
 profile and the optional Paper plugin:
 
-- [Download the Minecraft 26.2 client (`Gaius-26.2.html`)](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.1/Gaius-26.2.html)
-- [Download the retained Minecraft 1.21.11 client (`Gaius-1.21.11.html`)](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.1/Gaius-1.21.11.html)
-- [Download the optional Paper plugin](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.1/gaius-server-plugin-0.0.1.jar)
-- [Download `SHA256SUMS`](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.1/SHA256SUMS)
-- [Open the `v0.0.1` release page](https://github.com/TypeThe0ry/Gaius/releases/tag/v0.0.1)
+- [Download the Minecraft 26.2 client (`Gaius-26.2.html`)](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.2/Gaius-26.2.html)
+- [Download the retained Minecraft 1.21.11 client (`Gaius-1.21.11.html`)](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.2/Gaius-1.21.11.html)
+- [Download the optional Paper plugin](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.2/gaius-server-plugin-0.0.2.jar)
+- [Download `SHA256SUMS`](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.2/SHA256SUMS)
+- [Open the `v0.0.2` release page](https://github.com/TypeThe0ry/Gaius/releases/tag/v0.0.2)
 
 Each `Gaius-<profile>.html` is a frontend-only single-player package. It can be
 downloaded and opened locally in Chrome; it does not require a Gaius-hosted web

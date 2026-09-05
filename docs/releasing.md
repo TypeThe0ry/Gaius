@@ -6,7 +6,7 @@ Git object store free of files above its 100 MiB limit.
 
 The public release version is stored in the root `VERSION` file. Keep the
 RelayNode package and server-plugin project version aligned with it. Tags use
-the form `v<version>`; for example, `VERSION=0.0.1` produces tag `v0.0.1`.
+the form `v<version>`; for example, `VERSION=0.0.2` produces tag `v0.0.2`.
 
 Before cloning or updating a release checkout, run:
 
@@ -81,7 +81,7 @@ covered by the repository's Git LFS attributes:
 | `port/web/dist/<profile>/` | Static-host deployment input for that profile's launcher |
 | `apps/server-plugin/target/gaius-server-plugin-<version>.jar` | Optional Paper bridge plugin |
 
-For version `0.0.1`, stage both profile assets outside Git's tracked source
+For the version in `VERSION`, stage both profile assets outside Git's tracked source
 tree, then create a checksum file:
 
 ```sh

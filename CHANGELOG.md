@@ -2,6 +2,29 @@
 
 All notable changes to Gaius are documented here.
 
+## [0.0.2] - 2026-09-05
+
+### Added
+
+- Minecraft Java `26.2` as the primary browser client profile while retaining
+  the `1.21.11` compatibility profile.
+- Profile-scoped dual-version release builds, artifact identity records, and
+  release checks for both portable clients.
+
+### Improved
+
+- Multiplayer packet scheduling, bounded browser inbound and outbound drains,
+  RelayNode frame handling, stale-owner isolation, reconnect cleanup, and
+  browser-side diagnostics.
+
+### Release Notes
+
+- The `v0.0.2` release is produced by the dual-profile GitHub Actions matrix and
+  includes a profile manifest, SHA256 checksums, and the optional Paper plugin.
+- The browser client remains experimental; runtime compatibility still depends
+  on the selected Minecraft server, Chrome/Chromium, and an available relay or
+  compatible server plugin.
+
 ## [0.0.1] - 2026-08-09
 
 ### Added
