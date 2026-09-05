@@ -44,6 +44,10 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
     private static final int MAX_OUTBOUND_WRITES_PER_PUMP = 32;
     private static final int MAX_OUTBOUND_BYTES_PER_PUMP = 256 * 1024;
     private static final double MAX_OUTBOUND_MILLIS_PER_PUMP = 2.0;
+    // The bridge retries a blocked socket after a short timer. Keep normal budget
+    // continuations low-latency, but do not spin a sendSocket(false) retry at 0 ms
+    // while the browser-side queue is still blocked.
+    private static final int OUTBOUND_BACKPRESSURE_RETRY_DELAY_MILLIS = 4;
     private static final EventLoop INLINE_EVENT_LOOP = new BrowserInlineEventLoop();
     private static BrowserWebSocketChannel[] channels =
             new BrowserWebSocketChannel[INITIAL_CHANNEL_CAPACITY];
@@ -304,7 +308,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             if (writes >= MAX_OUTBOUND_WRITES_PER_PUMP
                     || (writes > 0 && bytesWritten >= MAX_OUTBOUND_BYTES_PER_PUMP)
                     || (writes > 0 && monotonicMillis() - startedAt >= MAX_OUTBOUND_MILLIS_PER_PUMP)) {
-                scheduleOutboundRetry();
+                scheduleOutboundContinuation();
                 return;
             }
             int chunkLength = Math.min(
@@ -475,7 +479,15 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
         return Int8Array.fromJavaArray(bytes);
     }
 
+    private void scheduleOutboundContinuation() {
+        scheduleOutboundTask(0);
+    }
+
     private void scheduleOutboundRetry() {
+        scheduleOutboundTask(OUTBOUND_BACKPRESSURE_RETRY_DELAY_MILLIS);
+    }
+
+    private void scheduleOutboundTask(int delayMillis) {
         if (!open || !active || outboundRetryScheduled) {
             return;
         }
@@ -485,7 +497,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             if (open && active) {
                 unsafe().flush();
             }
-        }, 0);
+        }, delayMillis);
     }
 
     private static String host(SocketAddress remote) {

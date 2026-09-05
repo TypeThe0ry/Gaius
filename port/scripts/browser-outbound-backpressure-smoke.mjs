@@ -35,6 +35,20 @@ assert.match(source, /maximumOutboundFramesPerTurn = 32/);
 assert.match(source, /maximumOutboundBytesPerTurn = 256 \* 1024/);
 assert.match(source, /maximumOutboundMillisPerTurn = 2/);
 assert.match(source, /webSocketBackpressureRetryMs = 4/);
+assert.match(source, /OUTBOUND_BACKPRESSURE_RETRY_DELAY_MILLIS = 4/,
+  "Java outbound backpressure retry must align with the bridge 4 ms timer");
+assert.match(source,
+  /MAX_OUTBOUND_MILLIS_PER_PUMP\)\) \{\s*scheduleOutboundContinuation\(\);\s*return;/s,
+  "normal outbound budget exhaustion must keep the low-latency continuation path");
+assert.match(source,
+  /if \(!sendSocket\(socketId, chunk\)\) \{[\s\S]{0,900}?scheduleOutboundRetry\(\);/s,
+  "sendSocket(false) must use the backpressured retry path");
+assert.match(source,
+  /private void scheduleOutboundContinuation\(\) \{\s*scheduleOutboundTask\(0\);\s*\}/s,
+  "normal outbound continuation must remain zero-delay");
+assert.match(source,
+  /private void scheduleOutboundRetry\(\) \{\s*scheduleOutboundTask\(OUTBOUND_BACKPRESSURE_RETRY_DELAY_MILLIS\);\s*\}/s,
+  "backpressured outbound retry must use the bounded delay");
 assert.match(outboundSchedulerScript, /queueMicrotask\(run\)/,
   "initial outbound flush must avoid the zero-delay timer clamp");
 assert.match(outboundSchedulerScript, /requestFlush\(entry, 0, true\)/,
