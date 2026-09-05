@@ -90,8 +90,11 @@ assert.doesNotMatch(pump, /Platform\.schedule|new Thread|CompletableFuture|setTi
 assert.doesNotMatch(pump, /for \(BrowserWebSocketChannel channel : channels\)/,
   "global pump reverted to an unbounded full-array foreach");
 
+// Each polled transport frame consumes cooperative work, including a zero-byte frame.  The
+// guard intentionally keys off framesPolled rather than decoded chunks so an empty-frame burst
+// cannot spin indefinitely before the first timing checkpoint.
 const channelBudgetGuard = channelPump.indexOf(
-  "if (chunks > 0 && monotonicMillis() - pumpStarted >= MAX_MILLIS_PER_PUMP)",
+  "if (framesPolled > 0 && monotonicMillis() - pumpStarted >= MAX_MILLIS_PER_PUMP)",
 );
 const pollInboundIndex = channelPump.indexOf("Int8Array data = pollInbound(socketId)");
 const copyToJavaArrayIndex = channelPump.indexOf("byte[] bytes = data.copyToJavaArray()", pollInboundIndex);
@@ -100,6 +103,10 @@ const chunksIncrementIndex = channelPump.indexOf("chunks++", fireChannelReadInde
 assert.ok(channelBudgetGuard >= 0, "per-channel pump lost its cooperative time guard");
 assert.ok(channelBudgetGuard < pollInboundIndex,
   "per-channel time guard must run before the first inbound poll");
+const framesIncrementIndex = channelPump.indexOf("framesPolled++", pollInboundIndex);
+assert.ok(pollInboundIndex < framesIncrementIndex
+  && framesIncrementIndex < copyToJavaArrayIndex,
+  "per-channel frame count must increment immediately after poll and before payload inspection");
 assert.ok(pollInboundIndex < copyToJavaArrayIndex
   && copyToJavaArrayIndex < fireChannelReadIndex
   && fireChannelReadIndex < chunksIncrementIndex,

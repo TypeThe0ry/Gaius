@@ -30,6 +30,10 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
     // relay frames are cheap enough to batch more deeply; the 2 ms check still runs between every
     // handoff and the byte cap keeps a turn bounded even when all slices are cheap.
     private static final int MAX_CHUNKS_PER_PUMP = 64;
+    // A zero-byte bridge frame does not produce a decoder slice, so it must still consume a
+    // poll slot.  Otherwise an adversarial/buggy peer can make the Java pump spin forever without
+    // reaching either the chunk or elapsed-time budget.
+    private static final int MAX_FRAMES_POLLED_PER_PUMP = 64;
     private static final int MAX_BYTES_PER_PUMP = 256 * 1024;
     private static final double MAX_MILLIS_PER_PUMP = 2.0;
     // A server/client runtime can own many browser channels (one per multiplayer player).  The
@@ -376,15 +380,21 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 recordArrivalPumpBoundary(socketId, "pump-begin", 0, 0, 0.0);
             }
             int chunks = 0;
+            int framesPolled = 0;
             int bytesPumped = 0;
-            while (chunks < MAX_CHUNKS_PER_PUMP && bytesPumped < MAX_BYTES_PER_PUMP) {
-                if (chunks > 0 && monotonicMillis() - pumpStarted >= MAX_MILLIS_PER_PUMP) {
+            while (framesPolled < MAX_FRAMES_POLLED_PER_PUMP
+                    && chunks < MAX_CHUNKS_PER_PUMP
+                    && bytesPumped < MAX_BYTES_PER_PUMP) {
+                if (framesPolled > 0 && monotonicMillis() - pumpStarted >= MAX_MILLIS_PER_PUMP) {
                     break;
                 }
                 Int8Array data = pollInbound(socketId);
                 if (data == null) {
                     break;
                 }
+                // Count every transport frame, including an empty one, before inspecting its
+                // payload.  Empty frames are protocol no-ops but remain bounded work.
+                framesPolled++;
                 byte[] bytes = data.copyToJavaArray();
                 if (bytes.length > 0) {
                     recordDecodedSlice(socketId, bytes.length);
@@ -450,7 +460,10 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             } else if (isSocketClosed(socketId) && !hasPendingInbound(socketId)) {
                 close();
             }
-            return chunks > 0;
+            // If a bounded turn consumed only empty frames, advertise a continuation while more
+            // bridge input remains.  The caller pairs this hint with hasPumpableInput(), so an
+            // exhausted empty-frame tail does not create an idle loop.
+            return chunks > 0 || (framesPolled > 0 && hasPendingInbound(socketId));
         } finally {
             pumping = false;
         }
@@ -2680,11 +2693,19 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             entry.pendingInboundBytes = 0;
             entry.flowPaused = false;
             };
+            const fallbackInboundQueueFrames = 4096;
+            function fallbackInboundFrameCount(entry) {
+            return Math.max(0, entry.inbound.length - entry.inboundHead);
+            }
             state.deliverInbound = function(entry, buffer) {
             if (!entry || entry.closed) return;
             const bytes = buffer instanceof ArrayBuffer
               ? new Uint8Array(buffer)
               : new Uint8Array(buffer.buffer, buffer.byteOffset || 0, buffer.byteLength || 0);
+            if (fallbackInboundFrameCount(entry) >= fallbackInboundQueueFrames) {
+              state.failInbound(entry, 'Browser transport inbound queue exceeded frame limit');
+              return;
+            }
             entry.inbound.push(bytes);
             entry.inboundBytes += bytes.byteLength;
             state.stats.inboundQueuedBytes += bytes.byteLength;
@@ -3159,6 +3180,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             // The elapsed-time guard is necessarily checked after that first handoff, so cap the
             // non-preemptible unit itself rather than pretending the 2 ms turn budget can stop it.
             const maximumInboundSliceBytes = 4 * 1024;
+            // Empty WebSocket frames have no bytes to trip the byte watermark and therefore need
+            // an independent per-turn work bound.  This counts every frame/slice work item,
+            // including zero-byte frames, before inspecting its payload.
+            const maximumInboundFramesPerPump = 256;
+            const maximumInboundQueueFrames = 4096;
             const decodedSliceHighWatermark = 256;
             const decodedSliceLowWatermark = 64;
             const decoderCumulationPauseBytes = 12 * 1024 * 1024;
@@ -3179,6 +3205,13 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             }
             function sliceCount(entry) {
               return Math.max(0, entry.inbound.length - entry.inboundHead);
+            }
+            function queuedFrameCount(entry) {
+              return Math.max(
+                0,
+                (entry.inbound.length - entry.inboundHead) +
+                  (entry.pendingInbound.length - entry.pendingInboundHead)
+              );
             }
             function queuedBytes(entry) {
               return Math.max(0, entry.inboundBytes + entry.pendingInboundBytes);
@@ -3563,10 +3596,15 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               if (shouldBlockInboundSliceAdmission(entry)) return;
               const startedAt = now();
               let slices = 0;
+              let framesProcessed = 0;
               while (entry.pendingInboundHead < entry.pendingInbound.length &&
-                     workDepth(entry) < decodedSliceHighWatermark) {
-                if (slices > 0 && now() - startedAt >= inboundSliceBudgetMillis) break;
+                     workDepth(entry) < decodedSliceHighWatermark &&
+                     framesProcessed < maximumInboundFramesPerPump) {
+                if (framesProcessed > 0 && now() - startedAt >= inboundSliceBudgetMillis) break;
                 const frame = entry.pendingInbound[entry.pendingInboundHead];
+                // Count the work item before the empty-frame fast path.  Otherwise an unbounded
+                // run of zero-byte frames can bypass both the time and slice budgets.
+                framesProcessed++;
                 const remaining = frame.bytes.byteLength - frame.offset;
                 if (remaining <= 0) {
                   entry.pendingInboundHead++;
@@ -3995,6 +4033,10 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               const source = buffer instanceof ArrayBuffer
                 ? new Uint8Array(buffer)
                 : new Uint8Array(buffer.buffer, buffer.byteOffset || 0, buffer.byteLength || 0);
+              if (queuedFrameCount(entry) >= maximumInboundQueueFrames) {
+                state.failInbound(entry, 'Browser transport inbound queue exceeded frame limit');
+                return;
+              }
               if (queuedBytes(entry) + source.byteLength > maximumInboundQueueBytes) {
                 state.failInbound(entry, 'Browser transport inbound queue exceeded 64 MiB');
                 return;
