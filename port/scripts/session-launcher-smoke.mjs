@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import vm from "node:vm";
 
-const htmlPath = new URL("../web/dist/index.html", import.meta.url);
+// Exercise tracked launcher source even in pointer-only CI checkouts.
+const htmlPath = new URL("../web/launcher/index.template.html", import.meta.url);
 const html = fs.readFileSync(htmlPath, "utf8");
 const blockStart = html.indexOf("    function createGaiusProxyUrl(target, kind)");
 const blockEnd = html.indexOf("\n\n    const gaiusDiagMode", blockStart);
