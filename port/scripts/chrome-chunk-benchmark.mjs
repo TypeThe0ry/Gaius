@@ -510,6 +510,11 @@ const benchmarkOptionsText = [
   `simulationDistance:${expectedSimulationDistance}`,
   "entityDistanceScaling:0.5",
   `maxFps:${Number(environmentContract.maxFps || 260)}`,
+  // Keep long stationary benchmark phases from entering the AFK throttle.
+  // MINIMIZED means only an actually minimized window is throttled; AFK would
+  // cap a stationary foreground run at 30 FPS after one minute.
+  // StringRepresentable serializes this enum as lowercase "minimized".
+  'inactivityFpsLimit:"minimized"',
   "renderClouds:\"false\"",
   "cloudRange:32",
   "ao:false",
@@ -3954,11 +3959,19 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
   const expectedMaxFps = Number(environmentRules.maxFps || 260);
   const unlimitedSentinel = Number(environmentRules.unlimitedSentinel || expectedMaxFps);
   const expectedGraphicsPreset = String(environmentRules.graphicsPreset || "fast").toLowerCase();
+  const expectedInactivityFpsLimit = "minimized";
   if (Number(options.maxFps) !== expectedMaxFps
       || String(options.graphicsPreset).toLowerCase() !== expectedGraphicsPreset) {
     environmentIssues.push("Video Settings were not Unlimited with the Fast preset");
   }
   if (options.enableVsync !== false) environmentIssues.push("VSync was not disabled");
+  const actualInactivityFpsLimit = String(options.inactivityFpsLimit || "").toLowerCase();
+  if (actualInactivityFpsLimit !== expectedInactivityFpsLimit) {
+    environmentIssues.push(
+      `inactivityFpsLimit was ${options.inactivityFpsLimit || "missing"}; `
+        + "expected minimized to avoid AFK throttling",
+    );
+  }
   const runtimeGameFps = Number(telemetry.environment?.fps?.gameFps);
   const optionsSeeded = context.profileGateResult?.seeded === true;
   if (!optionsSeeded) {
@@ -3967,6 +3980,7 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
   const configuredUncapped = optionsSeeded
     && Number(options.maxFps) === unlimitedSentinel
     && options.enableVsync === false
+    && actualInactivityFpsLimit === expectedInactivityFpsLimit
     && Number.isFinite(runtimeGameFps)
     && runtimeGameFps > 0
     && Number(performanceFrame.frameCount || 0) > 0;
@@ -4064,6 +4078,8 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
       unlimitedSentinel,
       runtimeGameFps: Number.isFinite(runtimeGameFps) ? runtimeGameFps : null,
       vsync: options.enableVsync,
+      inactivityFpsLimit: options.inactivityFpsLimit || null,
+      expectedInactivityFpsLimit: "minimized",
       evidence: framePacingEvidence,
     },
     foregroundRequired,
