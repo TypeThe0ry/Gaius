@@ -9031,7 +9031,7 @@ def check_overlay_bytecode() -> None:
     browser_websocket_channel = run_javap(netty_transport_overlay_cp, "io.netty.channel.browser.BrowserWebSocketChannel")
     browser_websocket_pump = method_section(
         browser_websocket_channel,
-        "private void pump();",
+        "private boolean pump();",
     )
     browser_inline_event_loop = run_javap(
         netty_transport_overlay_cp,
@@ -9569,7 +9569,7 @@ def check_overlay_bytecode() -> None:
             and "protected void doWrite" in browser_websocket_channel
             and "iconst_1" in browser_websocket_pump
             and (
-                "int 1048576" in browser_websocket_pump
+                "int 262144" in browser_websocket_pump
                 and "double 2.0d" in browser_websocket_pump
             )
             and "Field pumping:Z" in browser_websocket_pump

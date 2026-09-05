@@ -22,6 +22,9 @@ All notable changes to Gaius are documented here.
   failure diagnostics without racing automatic closed-channel retirement.
 - Exercise the tracked launcher template in source checks instead of reading
   a generated LFS bundle that is only a pointer in lightweight CI checkouts.
+- Align the compiled Netty pump check with its progress-returning boolean
+  signature and tightened 256 KiB byte budget. The obsolete void/1 MiB check
+  incorrectly rejected both successfully compiled `v0.0.3` profiles.
 - Run singleplayer storage, world reload, Worker bootstrap, MessagePort
   ownership, and profile isolation regressions before costly release builds.
 - Validate the requested release tag before compilation and retain TeaVM

@@ -102,6 +102,7 @@ jobs:
             --require-local
 
       - name: Build the profile-scoped TeaVM release
+        id: compile
         run: |
           set -euo pipefail
           mkdir -p release-evidence
@@ -167,6 +168,9 @@ jobs:
           retention-days: 14
 
       - name: Upload profile-scoped browser artifacts
+        # Preserve completed builds for diagnosis even if a later runtime
+        # check fails. A failed job still blocks the publish dependency.
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: gaius-dist-${{ matrix.profile }}
