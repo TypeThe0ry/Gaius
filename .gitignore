@@ -43,6 +43,7 @@ port/overrides/libraries/*
 !port/overrides/libraries/gson/**
 
 # Local dependencies, environment files, coverage, and editor state.
+/work/
 node_modules/
 .pnpm-store/
 .npm/

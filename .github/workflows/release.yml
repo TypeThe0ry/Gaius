@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish, for example v0.0.3"
+        description: "Release tag to publish, for example v0.1.0"
         required: true
-        default: v0.0.3
+        default: v0.1.0
         type: string
 
 permissions:
@@ -17,11 +17,37 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  preflight:
+    name: Check release source before compiling
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          lfs: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Verify tag, metadata, and local session lifecycle
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$RELEASE_TAG" = "v$(tr -d '[:space:]' < VERSION)"
+          node tools/check-release-metadata.mjs
+          node tools/check-relay-registry.mjs
+          node tools/check-singleplayer-lifecycle.mjs
+          python3 port/scripts/test-index-template.py
+          python3 port/scripts/test-postprocess-index-shell.py
+          python3 port/scripts/test-portable-artifact-identity.py
+
   # Build every supported Minecraft profile from its local-only Mojang inputs.
   # The matrix keeps Java 21 and Java 25 isolated; no profile writes the legacy
   # shared dist directory or another profile's generated Maven state.
   build-profile:
     name: Build Minecraft ${{ matrix.profile }} (JDK ${{ matrix.java }})
+    needs: preflight
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
@@ -76,7 +102,11 @@ jobs:
             --require-local
 
       - name: Build the profile-scoped TeaVM release
-        run: bash port/scripts/build-version-release.sh "$GAIUS_VERSION_PROFILE_PATH"
+        run: |
+          set -euo pipefail
+          mkdir -p release-evidence
+          bash port/scripts/build-version-release.sh "$GAIUS_VERSION_PROFILE_PATH" 2>&1 \
+            | tee release-evidence/build.log
 
       - name: Verify profile artifact identity and runtime smoke
         env:
@@ -86,13 +116,14 @@ jobs:
           GAIUS_SMOKE_MAX_GAMEPLAY_STALL_MS: "500"
         run: |
           set -euo pipefail
-          python3 port/scripts/quick-check.py
+          python3 port/scripts/quick-check.py 2>&1 | tee release-evidence/quick-check.log
           node port/scripts/gson-type-token-smoke.mjs \
             --profile "$GAIUS_VERSION_PROFILE_PATH" \
             --overlay "$GAIUS_OVERLAY_DIRECTORY"
           GAIUS_SMOKE_SELF_TEST=1 \
             node port/scripts/singleplayer-worker-runtime-smoke.mjs
-          node port/scripts/singleplayer-worker-runtime-smoke.mjs
+          node port/scripts/singleplayer-worker-runtime-smoke.mjs 2>&1 \
+            | tee release-evidence/worker-runtime.log
           manifest="$GAIUS_DIST_DIRECTORY/Gaius.manifest.json"
           test -s "$manifest"
           jq -e \
@@ -125,6 +156,15 @@ jobs:
             test -s "$GAIUS_DIST_DIRECTORY/$artifact"
             ! head -c 64 "$GAIUS_DIST_DIRECTORY/$artifact" | grep -Fq 'version https://git-lfs.github.com/spec/v1'
           done
+
+      - name: Preserve build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gaius-build-evidence-${{ matrix.profile }}
+          path: release-evidence/
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload profile-scoped browser artifacts
         uses: actions/upload-artifact@v4
@@ -234,6 +274,10 @@ jobs:
             printf -- '- Minecraft Java 26.2: Gaius-26.2.html\n'
             printf '\nEach browser asset is accompanied by its profile manifest and SHA256SUMS.\n'
             printf 'The optional Paper plugin is built from the repository source.\n\n'
+            printf 'Singleplayer runs in a browser-local Worker with profile-isolated world storage.\n'
+            printf 'Multiplayer uses the optional server plugin or a WebSocket-to-TCP RelayNode.\n'
+            printf 'External transport test target: t40.sjcmc.cn:14803 through wss://ellan.site/tunnel.\n'
+            printf 'The public probe checks STATUS, target attestation, and tunnel cleanup; it does not certify LOGIN/PLAY or every server. See the workflow result for probe availability.\n\n'
             printf 'This is independent software and is not affiliated with Mojang Studios or Microsoft. Review the repository licensing and attribution notes before redistribution.\n'
           } > release-notes.md
 

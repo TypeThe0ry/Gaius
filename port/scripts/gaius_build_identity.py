@@ -33,6 +33,7 @@ SOURCE_DIRECTORIES = (
     "port/wasm/hotpath",
 )
 SOURCE_FILES = (
+    "VERSION",
     "port/config.json",
     "port/web/singleplayer/index.html",
     "port/web/singleplayer/server-worker-bootstrap.js",

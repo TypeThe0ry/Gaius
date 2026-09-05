@@ -31,6 +31,22 @@ def replace_required(text: str, old: str, new: str, label: str) -> str:
     raise RuntimeError(f"index.html patch point was not found: {label}")
 
 
+def patch_release_version(text: str) -> str:
+    version = (Path(__file__).resolve().parents[2] / "VERSION").read_text(
+        encoding="utf-8"
+    ).strip()
+    if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", version):
+        raise RuntimeError("VERSION must contain a release version")
+    text, count = re.subn(
+        r'(<span id="gaius-shell-version">)[^<]*(</span>)',
+        lambda match: f"{match[1]}VERSION {version}{match[2]}",
+        text,
+    )
+    if count != 1:
+        raise RuntimeError("launcher must contain exactly one release version label")
+    return text
+
+
 def migrate_raf_frame_samples(text: str) -> str:
     """Replace the legacy shifting FPS sample array with a bounded ring."""
     text = text.replace(
@@ -658,7 +674,7 @@ def apply_gaius_client_shell(text: str) -> str:
     shell_markup = '''  <div id="gaius-shell-header" data-gaius-shell="v2" aria-hidden="true">
     <div id="gaius-shell-brand"><strong>GAIUS</strong><span>CLIENT</span></div>
     <span id="gaius-shell-mode">BROWSER CLIENT</span>
-    <span id="gaius-shell-version">VERSION 0.0.1</span>
+    <span id="gaius-shell-version">VERSION DEV</span>
   </div>
 '''
     brand_pattern = re.compile(
@@ -2960,6 +2976,7 @@ def patch_index(
 
     text = patch_storage_persistence(text, selected_profile)
     text = apply_gaius_client_shell(text)
+    text = patch_release_version(text)
 
     if text != original:
         index.write_text(text, encoding="utf-8")

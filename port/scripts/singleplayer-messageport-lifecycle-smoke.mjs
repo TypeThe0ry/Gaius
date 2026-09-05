@@ -22,6 +22,7 @@ function extractJsBody(marker) {
 const bridgeScript = "{\n" + extractJsBody("private static native void initBridge();") + "\n}\n{\n" +
   extractJsBody("private static native void initBridgeTail();") + "\n}";
 const outboundSchedulerScript = extractJsBody("private static native void initOutboundScheduler();");
+const inboundSchedulerScript = extractJsBody("private static native void initInboundScheduler();");
 
 const sessionA = "0123456789abcdef0123456789abcdef";
 const sessionB = "1123456789abcdef0123456789abcdef";
@@ -78,6 +79,9 @@ function createRuntime() {
   context.window = context;
   vm.runInNewContext(`(function() {${bridgeScript}\n})();`, context);
   vm.runInNewContext(`(function() {${outboundSchedulerScript}\n})();`, context);
+  // Match the channel constructor: failed/superseded local claims retire via
+  // the inbound scheduler, just like remote channels. Do not stub retirement.
+  vm.runInNewContext(`(function() {${inboundSchedulerScript}\n})();`, context);
   return context;
 }
 
@@ -192,12 +196,19 @@ function localHost(sessionId) {
   const timeoutSession = "4123456789abcdef0123456789abcdef";
   installWorker(runtime, timeoutSession, "1");
   runtime.__gaiusNettyBridge.open(6, localHost(timeoutSession), 25565);
+  // Retirement may run before waitFor's next timer. Retain the actual entry
+  // to inspect its diagnostic without racing removal from the channel map.
+  const pendingEntry = runtime.__gaiusNettyBridge.channels.get(6);
   await waitFor(() => runtime.__gaiusNetworkStats.localClaimTimeouts === 1,
     "missing port timeout");
-  const error = runtime.__gaiusNettyBridge.pollError(6);
+  const error = pendingEntry.errors[0];
   assert.match(error, /did not register within 80 ms/);
   assert.doesNotMatch(error, /is unavailable/,
     "legacy immediate MessagePort failure remained active");
+  await waitFor(() => !runtime.__gaiusNettyBridge.channels.has(6),
+    "timed-out claim retirement");
+  assert.equal(pendingEntry.disposed, true,
+    "timed-out local claim retained a live transport entry");
 }
 
 {
@@ -218,6 +229,7 @@ function localHost(sessionId) {
   runtime.__gaiusSingleplayerHandoff = generationSession;
   runtime.__gaiusSingleplayerHandoffGeneration = "1";
   runtime.__gaiusNettyBridge.open(7, localHost(generationSession), 25565);
+  const staleEntry = runtime.__gaiusNettyBridge.channels.get(7);
 
   const newChannel = new MessageChannel();
   newChannel.port1.__gaiusLaunchGeneration = "2";
@@ -233,7 +245,7 @@ function localHost(sessionId) {
   runtime.__gaiusSingleplayerHandoffGeneration = "2";
   await waitFor(() => runtime.__gaiusNetworkStats.errors > 0,
     "stale generation attach rejection");
-  assert.match(runtime.__gaiusNettyBridge.pollError(7), /generation changed/,
+  assert.match(staleEntry.errors[0], /generation changed/,
     "stale local entry did not fail on generation mismatch");
   assert.equal(runtime.__gaiusSingleplayerWorkers.get(generationSession), newWorker,
     "stale local entry replaced the new Worker map value");

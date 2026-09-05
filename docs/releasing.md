@@ -6,7 +6,7 @@ Git object store free of files above its 100 MiB limit.
 
 The public release version is stored in the root `VERSION` file. Keep the
 RelayNode package and server-plugin project version aligned with it. Tags use
-the form `v<version>`; for example, `VERSION=0.0.3` produces tag `v0.0.3`.
+the form `v<version>`; for example, `VERSION=0.1.0` produces tag `v0.1.0`.
 
 Before cloning or updating a release checkout, run:
 
@@ -16,6 +16,33 @@ git lfs pull
 ```
 
 ## Build and Verify
+
+Run the fast source checks before compiling:
+
+```sh
+node tools/check-release-metadata.mjs
+node tools/check-relay-registry.mjs
+node tools/check-singleplayer-lifecycle.mjs
+npm ci --prefix apps/bridge
+npm run smoke --prefix apps/bridge
+npm run smoke:profiles --prefix apps/bridge
+```
+
+The singleplayer lifecycle checks cover storage, reload hydration, Worker
+bootstrap, MessagePort ownership and retirement, and profile isolation. They
+are source-level fixtures; compiled Worker and browser results are separate.
+For the public multiplayer transport probe, the default server is
+`t40.sjcmc.cn:14803` through `wss://ellan.site/tunnel`:
+
+```sh
+for profile in 1.21.11 26.2; do
+  GAIUS_PUBLIC_RELAY_MINECRAFT_VERSION="$profile" \
+    npm run smoke:public --prefix apps/bridge
+done
+```
+
+These probes check STATUS, target attestation, and tunnel release, not LOGIN
+or PLAY. Keep their actual scope in release notes.
 
 From a clean source checkout, build each supported Minecraft profile in its
 own state and output roots. The wrapper never changes `port/config.json` and
@@ -106,15 +133,16 @@ Publish the tag and assets with GitHub CLI after reviewing the staged diff:
 ```sh
 version="$(tr -d '[:space:]' < VERSION)"
 git tag -a "v$version" -m "Gaius Client 1.21.11 + 26.2 v$version"
-git push origin main "v$version"
-gh release create "v$version" \
-  --title "Gaius Client 1.21.11 + 26.2 v$version" \
-  --generate-notes \
-  "port/target/release-v$version"/Gaius-*.html \
-  "port/target/release-v$version"/Gaius-*.manifest.json \
-  "port/target/release-v$version"/gaius-server-plugin-*.jar \
-  "port/target/release-v$version/SHA256SUMS"
+git push origin HEAD
+git push origin "v$version"
+gh workflow run release.yml --ref "$(git branch --show-current)" -f "tag=v$version"
 ```
+
+The workflow verifies the tag and source checks before building both profiles,
+then verifies artifact identity and Worker runtime, builds the plugin, and
+publishes checksummed assets. TeaVM build logs are retained even on failure.
+Wait for the existing release run to finish before dispatching another run.
+Never move an already pushed release tag to include later fixes.
 
 The release page should identify the browser package, optional plugin, SHA256
 checksums, supported client version, and any known runtime limitations.

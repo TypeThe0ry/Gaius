@@ -13,7 +13,7 @@ import {
 const registryPath = new URL("../../relay-nodes.json", import.meta.url);
 const registry = JSON.parse(await readFile(registryPath, "utf8"));
 const relayUrl = process.env.GAIUS_PUBLIC_RELAY_URL ?? registry.nodes?.[0]?.url;
-const target = parseTarget(process.env.GAIUS_PUBLIC_RELAY_TARGET ?? "ellan.top:25565");
+const target = parseTarget(process.env.GAIUS_PUBLIC_RELAY_TARGET ?? "t40.sjcmc.cn:14803");
 const handshakeHost = process.env.GAIUS_PUBLIC_RELAY_HANDSHAKE_HOST ?? target.host;
 const minecraftProfile = resolveSmokeMinecraftProfile(
     process.env.GAIUS_PUBLIC_RELAY_MINECRAFT_VERSION ??

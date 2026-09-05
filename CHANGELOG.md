@@ -2,6 +2,29 @@
 
 All notable changes to Gaius are documented here.
 
+## [0.1.0] - 2026-09-05
+
+### Release
+
+- Prepare the dual-profile release for Minecraft Java `1.21.11` (protocol
+  `774`, JDK 21) and `26.2` (protocol `776`, JDK 25), with independent browser
+  packages, manifests, checksums, and the optional Paper bridge plugin.
+- Keep `t40.sjcmc.cn:14803` as the external multiplayer test target through
+  `wss://ellan.site/tunnel`. Status/attestation and lease-release checks are
+  transport evidence; they do not assert a complete LOGIN/PLAY session.
+
+### Fixed
+
+- Generate the launcher's displayed release version from `VERSION` instead
+  of the stale `0.0.1` label, and include it in the build input identity.
+- Initialize the real inbound scheduler in the local MessagePort lifecycle
+  smoke, matching the production channel constructor. Inspect asynchronous
+  failure diagnostics without racing automatic closed-channel retirement.
+- Run singleplayer storage, world reload, Worker bootstrap, MessagePort
+  ownership, and profile isolation regressions before costly release builds.
+- Validate the requested release tag before compilation and retain TeaVM
+  build diagnostics on failed CI runs.
+
 ## [0.0.3] - 2026-09-05
 
 ### Added

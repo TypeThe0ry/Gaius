@@ -20,7 +20,7 @@ const channelSourceUrl = new URL(
 );
 const relayUrl = process.env.GAIUS_EXTERNAL_RELAY_URL ?? "wss://ellan.site/tunnel";
 const target = parseTarget(
-    process.env.GAIUS_EXTERNAL_TARGET ?? "ellan.top:16888",
+    process.env.GAIUS_EXTERNAL_TARGET ?? "t40.sjcmc.cn:14803",
 );
 const profile = process.env.GAIUS_VERSION_PROFILE_PATH?.includes("1.21.11")
     ? { id: "1.21.11", protocol: 774 }

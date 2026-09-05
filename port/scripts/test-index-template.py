@@ -63,6 +63,10 @@ def exercise_profile(profile_path: Path, directory: Path) -> None:
     if first.returncode != 0:
         raise AssertionError(first.stderr or first.stdout)
     first_bytes = output.read_bytes()
+    release_version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    require(first_bytes.decode("utf-8"),
+            f'<span id="gaius-shell-version">VERSION {release_version}</span>',
+            profile_id)
 
     second = subprocess.run(
         command,

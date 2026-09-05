@@ -2,13 +2,14 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-Gaius Client `0.0.3` is an experimental browser port of Minecraft Java
+Gaius Client `0.1.0` is an experimental browser port of Minecraft Java
 Edition `26.2`, with the `1.21.11` profile retained for compatibility. Each
 profile uses the original Java client path with TeaVM and browser-specific
 platform overlays; this is not a TypeScript recreation of Minecraft gameplay.
 
-**Status:** experimental public release. The downloadable client is intended
-for evaluation and local single-player use. Browser, server, resource-pack,
+**Status:** public release `0.1.0`; the browser port continues to evolve.
+The downloadable client supports browser-local singleplayer and RelayNode
+multiplayer routing. Browser, server, resource-pack,
 world-generation, rendering, and performance compatibility are not guaranteed.
 Use a current Chrome or Chromium browser for the primary target experience.
 
@@ -37,14 +38,14 @@ opening the generated browser bundle.
 
 ## Download
 
-The `v0.0.3` release page contains one portable browser client per supported
+The `v0.1.0` release page contains one portable browser client per supported
 profile and the optional Paper plugin:
 
-- [Download the Minecraft 26.2 client (`Gaius-26.2.html`)](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.3/Gaius-26.2.html)
-- [Download the retained Minecraft 1.21.11 client (`Gaius-1.21.11.html`)](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.3/Gaius-1.21.11.html)
-- [Download the optional Paper plugin](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.3/gaius-server-plugin-0.0.3.jar)
-- [Download `SHA256SUMS`](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.3/SHA256SUMS)
-- [Open the `v0.0.3` release page](https://github.com/TypeThe0ry/Gaius/releases/tag/v0.0.3)
+- [Download the Minecraft 26.2 client (`Gaius-26.2.html`)](https://github.com/TypeThe0ry/Gaius/releases/download/v0.1.0/Gaius-26.2.html)
+- [Download the retained Minecraft 1.21.11 client (`Gaius-1.21.11.html`)](https://github.com/TypeThe0ry/Gaius/releases/download/v0.1.0/Gaius-1.21.11.html)
+- [Download the optional Paper plugin](https://github.com/TypeThe0ry/Gaius/releases/download/v0.1.0/gaius-server-plugin-0.1.0.jar)
+- [Download `SHA256SUMS`](https://github.com/TypeThe0ry/Gaius/releases/download/v0.1.0/SHA256SUMS)
+- [Open the `v0.1.0` release page](https://github.com/TypeThe0ry/Gaius/releases/tag/v0.1.0)
 
 Each `Gaius-<profile>.html` is a frontend-only single-player package. It can be
 downloaded and opened locally in Chrome; it does not require a Gaius-hosted web
@@ -90,6 +91,12 @@ behave the same as an HTTP origin.
   source and runnable release stay in one repository.
 
 ## Multiplayer Routing and RelayNode
+
+The release transport checks use `t40.sjcmc.cn:14803` through
+`wss://ellan.site/tunnel` for both protocol profiles. Enter the server address
+in **Multiplayer**; the WSS URL is the relay, not the Minecraft server address.
+Status/target-attestation checks verify reachability and tunnel cleanup, and
+do not by themselves prove login or gameplay compatibility.
 
 A browser cannot open the raw TCP socket required by a Minecraft Java server.
 Gaius therefore carries each Minecraft byte stream over WebSocket to either an

@@ -45,6 +45,13 @@ jobs:
       - name: Validate release metadata and screenshots
         run: node tools/check-release-metadata.mjs
 
+      - name: Validate launcher version and artifact identity
+        run: |
+          set -euo pipefail
+          python3 port/scripts/test-index-template.py
+          python3 port/scripts/test-postprocess-index-shell.py
+          python3 port/scripts/test-portable-artifact-identity.py
+
   bridge-smoke:
     runs-on: ubuntu-latest
     steps:
@@ -107,6 +114,9 @@ jobs:
           node port/scripts/chunk-layer-barrier-smoke.mjs
           node port/scripts/gson-type-token-external-overlay-smoke.mjs
           node port/scripts/worldgen-scheduler-smoke.mjs
+
+      - name: Validate singleplayer storage and session lifecycle
+        run: node tools/check-singleplayer-lifecycle.mjs
 
   patcher-bytecode-smoke:
     runs-on: ubuntu-latest
