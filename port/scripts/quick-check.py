@@ -328,6 +328,7 @@ BUILD_IDENTITY_SOURCE_DIRECTORIES = (
     "port/wasm/hotpath",
 )
 BUILD_IDENTITY_SOURCE_FILES = (
+    "VERSION",
     "port/config.json",
     "port/web/singleplayer/index.html",
     "port/web/singleplayer/server-worker-bootstrap.js",

@@ -369,13 +369,13 @@ public final class BrowserWorldgenScheduler {
             return;
         }
 
-        if (networkPreemptionPending) {
+        if (isWorkerRuntime() && networkPreemptionPending) {
             networkWaitPulses++;
             if (progressPulsesInSlice >= MIN_PROGRESS_PULSES_BEFORE_NETWORK_PREEMPTION) {
                 requestYield(YIELD_NETWORK, Math.max(1, networkQueueDepth()));
                 return;
             }
-        } else if (--pulsesUntilNetworkCheck <= 0) {
+        } else if (isWorkerRuntime() && --pulsesUntilNetworkCheck <= 0) {
             pulsesUntilNetworkCheck = NETWORK_CHECK_INTERVAL;
             int queueDepth = networkQueueDepth();
             if (queueDepth > 0 || hasPendingNetworkInput()) {
@@ -486,12 +486,18 @@ public final class BrowserWorldgenScheduler {
 
             double completedBudgetMillis = currentBudgetMillis;
             double overrunMillis = Math.max(0.0, sliceElapsedMillis - completedBudgetMillis);
-            int queueDepthBefore = Math.max(observedQueueDepth, networkQueueDepth());
-            boolean pendingBefore = queueDepthBefore > 0 || hasPendingNetworkInput();
+            // Only the integrated server Worker owns this network pressure signal.  A client
+            // invocation can see the shared bridge queue, but that queue is drained by the
+            // client packet path and must not relabel a deadline yield or shrink its budget.
+            int queueDepthBefore = isWorkerRuntime()
+                    ? Math.max(observedQueueDepth, networkQueueDepth())
+                    : 0;
+            boolean pendingBefore = isWorkerRuntime()
+                    && (queueDepthBefore > 0 || hasPendingNetworkInput());
             if (pendingBefore && queueDepthBefore == 0) {
                 queueDepthBefore = 1;
             }
-            if (pendingBefore) {
+            if (pendingBefore && isWorkerRuntime()) {
                 BrowserIntegratedServerMain.pumpUrgentPackets();
             }
 
@@ -502,12 +508,13 @@ public final class BrowserWorldgenScheduler {
             double resumedAt = nowMillis();
             double yieldDelayMillis = Math.max(0.0, resumedAt - yieldStartedAt);
 
-            int queueDepthAfter = networkQueueDepth();
-            boolean pendingAfter = queueDepthAfter > 0 || hasPendingNetworkInput();
+            int queueDepthAfter = isWorkerRuntime() ? networkQueueDepth() : 0;
+            boolean pendingAfter = isWorkerRuntime()
+                    && (queueDepthAfter > 0 || hasPendingNetworkInput());
             if (pendingAfter && queueDepthAfter == 0) {
                 queueDepthAfter = 1;
             }
-            if (pendingAfter) {
+            if (pendingAfter && isWorkerRuntime()) {
                 BrowserIntegratedServerMain.pumpUrgentPackets();
                 queueDepthAfter = networkQueueDepth();
                 if (queueDepthAfter == 0 && hasPendingNetworkInput()) {
@@ -968,6 +975,9 @@ public final class BrowserWorldgenScheduler {
             return Math.min(2147483647, Math.max(packets, slices, byteUnits));
             """)
     private static native int networkQueueDepth();
+
+    @JSBody(script = "return typeof WorkerGlobalScope !== 'undefined' && globalThis instanceof WorkerGlobalScope;")
+    private static native boolean isWorkerRuntime();
 
     @JSBody(params = {
             "networkWaitPulses",

@@ -1,0 +1,180 @@
+name: Build playability artifacts
+
+on:
+  push:
+    branches: [gaius-migration-2026-08-14]
+    paths:
+      - .github/workflows/playability-build.yml
+      - port/src/main/java/dev/gaius/browser/BrowserWorldgenScheduler.java
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Minecraft profile(s) to build"
+        required: true
+        default: "26.2"
+        type: choice
+        options:
+          - "26.2"
+          - 1.21.11
+          - both
+
+permissions:
+  contents: read
+
+concurrency:
+  group: playability-build-${{ github.ref }}-${{ inputs.profile }}
+  cancel-in-progress: false
+
+jobs:
+  select-profile:
+    name: Select requested profile matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - id: matrix
+        shell: bash
+        env:
+          REQUESTED_PROFILE: ${{ inputs.profile || 'both' }}
+        run: |
+          set -euo pipefail
+          case "$REQUESTED_PROFILE" in
+            26.2)
+              matrix='[{"profile":"26.2","java":"25","protocol":"776","world":"4903","worldgenTelemetryMode":"task-pulsed"}]'
+              ;;
+            1.21.11)
+              matrix='[{"profile":"1.21.11","java":"21","protocol":"774","world":"4671","worldgenTelemetryMode":"checkpoint-only"}]'
+              ;;
+            both)
+              matrix='[{"profile":"1.21.11","java":"21","protocol":"774","world":"4671","worldgenTelemetryMode":"checkpoint-only"},{"profile":"26.2","java":"25","protocol":"776","world":"4903","worldgenTelemetryMode":"task-pulsed"}]'
+              ;;
+            *)
+              echo "Unsupported profile: $REQUESTED_PROFILE" >&2
+              exit 2
+              ;;
+          esac
+          {
+            echo 'matrix<<MATRIX_EOF'
+            echo "$matrix"
+            echo 'MATRIX_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+  build-profile:
+    name: Build Minecraft ${{ matrix.profile }} (JDK ${{ matrix.java }})
+    needs: select-profile
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.select-profile.outputs.matrix) }}
+    env:
+      GAIUS_VERSION_PROFILE_PATH: versions/${{ matrix.profile }}.json
+      GAIUS_BUILD_ROOT: port/target/${{ matrix.profile }}
+      GAIUS_OVERLAY_DIRECTORY: port/work/overlays/${{ matrix.profile }}
+      GAIUS_DIST_DIRECTORY: port/web/dist/${{ matrix.profile }}
+      GAIUS_TARGET_DIRECTORY: port/web/dist/${{ matrix.profile }}
+      MAVEN_OPTS: -Xms2g -Xmx14g -XX:+UseG1GC -XX:MaxGCPauseMillis=500
+    steps:
+      - name: Check out workflow ref with Git LFS
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          lfs: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/bridge/package-lock.json
+
+      - name: Set up profile JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+
+      - name: Fetch and verify local Minecraft inputs
+        run: |
+          set -euo pipefail
+          git lfs install --local
+          ./port/scripts/fetch-version.sh
+          ./port/scripts/remap-client.sh
+          node port/scripts/check-version-profile.mjs \
+            --profile "$GAIUS_VERSION_PROFILE_PATH" \
+            --require-local
+
+      - name: Build profile-scoped TeaVM release
+        id: compile
+        run: |
+          set -euo pipefail
+          mkdir -p release-evidence
+          bash port/scripts/build-version-release.sh "$GAIUS_VERSION_PROFILE_PATH" 2>&1 \
+            | tee release-evidence/build.log
+
+      - name: Verify artifact identity and runtime smoke
+        env:
+          GAIUS_SMOKE_MAX_GAMEPLAY_STALL_MS: "500"
+        run: |
+          set -euo pipefail
+          python3 port/scripts/quick-check.py 2>&1 | tee release-evidence/quick-check.log
+          node port/scripts/gson-type-token-smoke.mjs \
+            --profile "$GAIUS_VERSION_PROFILE_PATH" \
+            --overlay "$GAIUS_OVERLAY_DIRECTORY"
+          GAIUS_SMOKE_SELF_TEST=1 \
+            node port/scripts/singleplayer-worker-runtime-smoke.mjs
+          node port/scripts/singleplayer-worker-runtime-smoke.mjs 2>&1 \
+            | tee release-evidence/worker-runtime.log
+          manifest="$GAIUS_DIST_DIRECTORY/Gaius.manifest.json"
+          test -s "$manifest"
+          jq -e \
+            --arg profile "${{ matrix.profile }}" \
+            --arg protocol "${{ matrix.protocol }}" \
+            --arg world "${{ matrix.world }}" \
+            --arg worldgen "${{ matrix.worldgenTelemetryMode }}" \
+            '(.profile == $profile)
+             and (.profilePath == ("versions/" + $profile + ".json"))
+             and ((.worldVersion | tostring) == $world)
+             and (.worldgenTelemetryMode == $worldgen)
+             and (.storage == .buildIdentity.storage)
+             and (.buildIdentity.profile.id == $profile)
+             and (.buildIdentity.profile.path == ("versions/" + $profile + ".json"))
+             and ((.buildIdentity.profile.protocolVersion | tostring) == $protocol)
+             and ((.buildIdentity.profile.worldVersion | tostring) == $world)
+             and ((.buildIdentity.protocol.minecraftProtocolVersion | tostring) == $protocol)
+             and ((.buildIdentity.worldVersion | tostring) == $world)
+             and (.buildIdentity.worldgenTelemetryMode == $worldgen)
+             and (.buildIdentity.profile.worldgenTelemetryMode == $worldgen)
+             and (.buildIdentity.storage == {
+               schema: 2,
+               databaseName: ("gaius-fs-v2-" + $profile),
+               prefix: ("gaius.fs.v2:" + $profile + ":"),
+               opfsDirectory: ("regions-v2-" + $profile)
+             })
+             and (.buildIdentity.profile.storage == .buildIdentity.storage)' \
+            "$manifest"
+          for artifact in Gaius.html Gaius.html.gz Gaius.manifest.json classes.js classes.js.gz singleplayer-server.js singleplayer-server.js.gz; do
+            test -s "$GAIUS_DIST_DIRECTORY/$artifact"
+            ! head -c 64 "$GAIUS_DIST_DIRECTORY/$artifact" | grep -Fq 'version https://git-lfs.github.com/spec/v1'
+          done
+
+      - name: Preserve build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playability-build-evidence-${{ matrix.profile }}
+          path: release-evidence/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload profile-scoped browser artifacts
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playability-dist-${{ matrix.profile }}
+          path: port/web/dist/${{ matrix.profile }}/
+          if-no-files-found: error
+          retention-days: 7

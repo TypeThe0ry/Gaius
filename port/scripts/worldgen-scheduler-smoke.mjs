@@ -134,6 +134,17 @@ assert.ok(worldgen.includes("BrowserPacketScheduler.hasPendingPackets()"),
   "worldgen does not observe already-decoded packets");
 assert.ok(worldgen.includes("decodedPacketQueue") && worldgen.includes("inboundQueuedBytes"),
   "adaptive pressure does not include transport and decoded queue depth");
+assert.ok(worldgen.includes("if (isWorkerRuntime() && networkPreemptionPending)")
+    && worldgen.includes("else if (isWorkerRuntime() && --pulsesUntilNetworkCheck <= 0)"),
+  "network preemption is not restricted to the integrated-server Worker");
+assert.ok(worldgen.includes("int queueDepthBefore = isWorkerRuntime()")
+    && worldgen.includes("int queueDepthAfter = isWorkerRuntime() ? networkQueueDepth() : 0")
+    && worldgen.includes("boolean networkPreemption = reason == YIELD_NETWORK || pendingBefore || pendingAfter;"),
+  "client deadline pressure isolation or Worker network classification is missing");
+assert.ok(worldgen.includes("pendingBefore && isWorkerRuntime()")
+    && worldgen.includes("pendingAfter && isWorkerRuntime()"),
+  "client scheduler can still invoke the server-thread urgent packet pump");
+
 assert.ok(!worldgen.includes("new Thread") && !worldgen.includes("Executor")
     && !worldgen.includes("CompletableFuture"),
   "worldgen scheduler introduces parallel server-state execution");
