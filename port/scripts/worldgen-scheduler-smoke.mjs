@@ -438,6 +438,59 @@ assert.doesNotThrow(() => recordSchedulerTaskLabel("poisoned"),
 delete globalThis.__gaiusWorldgenSchedulerMarker;
 delete globalThis.__gaiusSlowProbeTelemetryEnabled;
 
+const beginChunkHolderProbe = new Function(
+  jsBody("public static native double beginChunkHolderProbe();"),
+);
+const recordChunkHolderProbeJs = new Function(
+  "status", "x", "z", "needsGeneration", "startedAt", "endedAt", "durationMillis", "result",
+  jsBody("private static native void recordChunkHolderProbeJs("),
+);
+const originalPerformanceNow = performance.now;
+try {
+  performance.now = () => { throw new Error("disabled probe clock must not be read"); };
+  globalThis.__gaiusSlowProbeTelemetryEnabled = false;
+  delete globalThis.__gaiusWorldgenStats;
+  assert.equal(beginChunkHolderProbe(), -1,
+    "disabled holder probe must return its sentinel without reading the clock");
+  recordChunkHolderProbeJs("disabled", 0, 0, false, -1, 0, 0, false);
+  assert.equal(globalThis.__gaiusWorldgenStats, undefined,
+    "disabled holder probe allocated telemetry state");
+
+  performance.now = () => 41.5;
+  globalThis.__gaiusSlowProbeTelemetryEnabled = true;
+  globalThis.__gaiusSlowProbeHolderCapacity = 3;
+  delete globalThis.__gaiusWorldgenStats;
+  assert.equal(beginChunkHolderProbe(), 41.5,
+    "enabled holder probe did not use performance.now");
+  for (let index = 0; index < 20; index++) {
+    recordChunkHolderProbeJs(`status-${index}`, index, -index, index % 2 === 0,
+      100 + index, 105 + index, 5, index !== 19);
+  }
+  const holderStats = globalThis.__gaiusWorldgenStats;
+  assert.equal(holderStats.chunkHolderProbe.capacity, 16,
+    "holder probe capacity did not enforce the lower bound");
+  assert.equal(holderStats.chunkHolderProbe.entries.length, 16,
+    "holder probe ring did not remain bounded");
+  assert.equal(holderStats.chunkHolderProbe.count, 16,
+    "holder probe ring count did not clamp at capacity");
+  assert.ok(holderStats.chunkHolderProbe.entries.some(entry => entry.status === "status-19"),
+    "holder probe ring did not retain the newest sample");
+  assert.equal(holderStats.chunkHolderProbeFalseResults, 1,
+    "holder probe did not count a false result");
+  globalThis.__gaiusSlowProbeHolderCapacity = 999;
+  recordChunkHolderProbeJs("capacity-high", 0, 0, false, 200, 201, 1, true);
+  assert.equal(globalThis.__gaiusWorldgenStats.chunkHolderProbe.capacity, 512,
+    "holder probe capacity did not enforce the upper bound");
+} finally {
+  performance.now = originalPerformanceNow;
+  delete globalThis.__gaiusSlowProbeTelemetryEnabled;
+  delete globalThis.__gaiusSlowProbeHolderCapacity;
+  delete globalThis.__gaiusWorldgenStats;
+}
+assert.match(jsBody("private static native double nowMillis();"),
+  /performance\.now[\s\S]*Date\.now/,
+  "holder probe end clock must use the scheduler clock source");
+
 const distanceBudget = new Function(
   "fallback",
   jsBody("private static native int configuredDistanceManagerUpdateBudget(int fallback)"),

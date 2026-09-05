@@ -383,6 +383,10 @@ public final class Minecraft262BrowserPatcher {
         code.add(start);
         code.add(new InsnNode(Opcodes.ICONST_0));
         code.add(new VarInsnNode(Opcodes.ISTORE, 7));
+        // A cancelled holder never enters the timed call; seed the probe token with its
+        // disabled sentinel so the shared cleanup path can retain the original CFG.
+        code.add(new LdcInsnNode(-1.0D));
+        code.add(new VarInsnNode(Opcodes.DSTORE, 10));
 
         // Initialize the cursor only for a new status.  On resume, the saved x/z pair
         // already points at the next holder and the status arguments are unchanged.
@@ -491,10 +495,24 @@ public final class Minecraft262BrowserPatcher {
         code.add(new TypeInsnNode(Opcodes.CHECKCAST, GENERATION_HOLDER));
         code.add(new VarInsnNode(Opcodes.ASTORE, 6));
 
+        // Each holder gets a fresh token.  Without this reset, a later cancelled holder
+        // could reuse the previous holder's enabled token and emit a false sample.
+        code.add(new LdcInsnNode(-1.0D));
+        code.add(new VarInsnNode(Opcodes.DSTORE, 10));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new FieldInsnNode(
                 Opcodes.GETFIELD, owner, "markedForCancellation", "Z"));
         code.add(new JumpInsnNode(Opcodes.IFNE, cancel));
+        // Keep the timing probe entirely outside the release telemetry path: the target call
+        // still has its original result and exception behavior, while the scheduler helper
+        // drops the sample when slow-probe telemetry is disabled.
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                WORLDGEN_SCHEDULER,
+                "beginChunkHolderProbe",
+                "()D",
+                false));
+        code.add(new VarInsnNode(Opcodes.DSTORE, 10));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new VarInsnNode(Opcodes.ALOAD, 1));
         code.add(new VarInsnNode(Opcodes.ILOAD, 2));
@@ -506,9 +524,46 @@ public final class Minecraft262BrowserPatcher {
                 "(" + statusDescriptor + "Z" + holderDescriptor + ")Z",
                 false));
         code.add(new JumpInsnNode(Opcodes.IFEQ, cancel));
+        // The original call result is consumed by the existing branch.  A successful
+        // submission is represented explicitly for the opt-in probe after that branch.
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, BROWSER_LAYER_X, "I"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, BROWSER_LAYER_Z, "I"));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        code.add(new VarInsnNode(Opcodes.DLOAD, 10));
+        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                WORLDGEN_SCHEDULER,
+                "endChunkHolderProbe",
+                "(Ljava/lang/Object;IIZDZ)V",
+                false));
         code.add(new JumpInsnNode(Opcodes.GOTO, successful));
 
         code.add(cancel);
+        // Cancellation and a rejected holder intentionally share this cleanup label.  The
+        // The sentinel token makes this call a no-op for cancellation.  A holder rejected by
+        // scheduleChunkInLayer retains its real start token and is recorded with result=false.
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, BROWSER_LAYER_X, "I"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, BROWSER_LAYER_Z, "I"));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        code.add(new VarInsnNode(Opcodes.DLOAD, 10));
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                WORLDGEN_SCHEDULER,
+                "endChunkHolderProbe",
+                "(Ljava/lang/Object;IIZDZ)V",
+                false));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new InsnNode(Opcodes.ICONST_0));
         code.add(new FieldInsnNode(
@@ -598,7 +653,7 @@ public final class Minecraft262BrowserPatcher {
                 Opcodes.PUTFIELD, owner, BROWSER_LAYER_ACTIVE, "Z"));
         code.add(new VarInsnNode(Opcodes.ALOAD, 9));
         code.add(new InsnNode(Opcodes.ATHROW));
-        replace(method, code, 5, 10);
+        replace(method, code, 5, 15);
         method.tryCatchBlocks.add(new TryCatchBlockNode(
                 start, tryEnd, handler, "java/lang/Throwable"));
     }

@@ -615,6 +615,15 @@ const browserPatcherSource = await readFile(
 );
 assert.match(browserPatcherSource, /BROWSER_HOLDERS_PER_TURN = 16/,
   "26.2 holder batching must retain the reviewed 16-holder upper bound");
+assert.match(browserPatcherSource,
+  /Each holder gets a fresh token[\s\S]*?DSTORE, 10[\s\S]*?GETFIELD, owner, "markedForCancellation"/,
+  "26.2 holder probe must reset its token before every cancellation check");
+assert.match(browserPatcherSource,
+  /scheduleChunkInLayer[\s\S]*?Opcodes\.IFEQ, cancel[\s\S]*?ICONST_1[\s\S]*?endChunkHolderProbe/,
+  "26.2 accepted holder probe path is missing");
+assert.match(browserPatcherSource,
+  /code\.add\(cancel\);[\s\S]*?ICONST_0[\s\S]*?endChunkHolderProbe/,
+  "26.2 rejected/cancelled holder probe path is missing");
 for (const forbidden of [
   "BROWSER_LAYER_YIELD",
   "CHUNK_GENERATION_YIELD",

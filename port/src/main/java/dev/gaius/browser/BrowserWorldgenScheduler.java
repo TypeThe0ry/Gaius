@@ -112,6 +112,57 @@ public final class BrowserWorldgenScheduler {
                 Math.max(0, processed));
     }
 
+    /** Returns a probe timestamp, or -1 when the opt-in probe is disabled. */
+    @JSBody(script = """
+            if (globalThis.__gaiusSlowProbeTelemetryEnabled !== true) return -1;
+            return (typeof performance !== 'undefined' && performance.now)
+              ? performance.now() : Date.now();
+            """)
+    public static native double beginChunkHolderProbe();
+
+    /** Records opt-in holder timings; callers must avoid status conversion when token is -1. */
+    public static void endChunkHolderProbe(
+            Object status, int x, int z, boolean needsGeneration, double startedAt, boolean result) {
+        if (startedAt < 0.0) return;
+        double endedAt = nowMillis();
+        recordChunkHolderProbeJs(String.valueOf(status), x, z, needsGeneration,
+                startedAt, endedAt, Math.max(0.0, endedAt - startedAt), result);
+    }
+
+    @JSBody(params = {"status", "x", "z", "needsGeneration", "startedAt", "endedAt", "durationMillis", "result"}, script = """
+            if (globalThis.__gaiusSlowProbeTelemetryEnabled !== true) return;
+            const root = globalThis.__gaiusWorldgenStats ||
+              (globalThis.__gaiusWorldgenStats = {});
+            const capacity = Math.max(16, Math.min(512, Math.floor(
+              Number(globalThis.__gaiusSlowProbeHolderCapacity) || 256)));
+            let ring = root.chunkHolderProbe;
+            if (!ring || ring.capacity !== capacity) {
+              ring = root.chunkHolderProbe = {capacity, entries: [], writeIndex: 0, count: 0};
+            }
+            const entry = {
+              status: String(status), x: x | 0, z: z | 0,
+              needsGeneration: !!needsGeneration,
+              startAt: Number(startedAt) || 0,
+              endAt: Number(endedAt) || 0,
+              durationMillis: Math.max(0, Number(durationMillis) || 0),
+              result: !!result
+            };
+            if (ring.entries.length < ring.capacity) ring.entries.push(entry);
+            else ring.entries[ring.writeIndex] = entry;
+            ring.writeIndex = (ring.writeIndex + 1) % ring.capacity;
+            ring.count = Math.min(ring.capacity, ring.count + 1);
+            root.chunkHolderProbeSamples = (Number(root.chunkHolderProbeSamples) || 0) + 1;
+            root.chunkHolderProbeMaxDurationMillis = Math.max(
+              Number(root.chunkHolderProbeMaxDurationMillis) || 0, entry.durationMillis);
+            if (!entry.result) {
+              root.chunkHolderProbeFalseResults =
+                (Number(root.chunkHolderProbeFalseResults) || 0) + 1;
+            }
+            """)
+    private static native void recordChunkHolderProbeJs(
+            String status, int x, int z, boolean needsGeneration,
+            double startedAt, double endedAt, double durationMillis, boolean result);
+
     /** Keeps the remaining vanilla distance-manager loops cooperative on the server thread. */
     public static void pulseDistanceManager() {
         recordDistanceManagerPulse();
