@@ -44,13 +44,34 @@ assert.equal(context.globalThis.__gaiusServerTickTelemetry.schemaVersion, 1);
 assert.equal(context.globalThis.__gaiusServerTickTelemetry.tickCount, 2);
 assert.equal(context.globalThis.__gaiusServerTickTelemetry.lastTickIntervalMillis, 20);
 assert.equal(context.globalThis.__gaiusServerTickTelemetry.maxTickIntervalMillis, 20);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.intervalOver100MillisCount, 0);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.intervalOver500MillisCount, 0);
 assert.equal(context.globalThis.__gaiusServerTickTelemetry.lastTickDurationMillis, 5);
 assert.equal(context.globalThis.__gaiusServerTickTelemetry.maxTickDurationMillis, 17.5);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.tickWorkOver500MillisCount, 0);
+
+// Thresholds are strict: exact 100/500 ms samples do not count, while 501 ms does.
+begin.call(context, 220);
+end.call(context, 720);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.intervalOver100MillisCount, 0);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.intervalOver500MillisCount, 0);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.tickWorkOver500MillisCount, 0);
+begin.call(context, 720);
+end.call(context, 1220);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.intervalOver100MillisCount, 1);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.intervalOver500MillisCount, 0);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.tickWorkOver500MillisCount, 0);
+begin.call(context, 1221);
+end.call(context, 1722);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.intervalOver100MillisCount, 2);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.intervalOver500MillisCount, 1);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.tickWorkOver500MillisCount, 1);
 
 waitBegin.call(context, 0);
 waitEnd.call(context, 2);
 assert.equal(context.globalThis.__gaiusServerTickTelemetry.waitPhaseCount, 1);
 assert.equal(context.globalThis.__gaiusServerTickTelemetry.completedWaitPhaseCount, 1);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.waitPhaseOver500MillisCount, 0);
 waitBegin.call(context, 300);
 context.globalThis.__gaiusServerTickTelemetry = {};
 waitEnd.call(context, 9);
@@ -66,6 +87,24 @@ assert.equal(context.globalThis.__gaiusServerTickTelemetry.lastWaitPhaseDuration
 assert.equal(context.globalThis.__gaiusServerTickTelemetry.maxWaitPhaseDurationMillis, 12.5);
 assert.equal(context.globalThis.__gaiusServerTickTelemetry.totalWaitPhaseDurationMillis, 17.5);
 assert.equal(context.globalThis.__gaiusServerTickTelemetry.waitPhaseOpen, false);
+
+waitBegin.call(context, 300);
+waitEnd.call(context, 800);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.waitPhaseOver500MillisCount, 0);
+waitBegin.call(context, 900);
+waitEnd.call(context, 1401);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.waitPhaseOver500MillisCount, 1);
+waitEnd.call(context, 9999);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.waitPhaseOver500MillisCount, 1);
+
+// A replaced telemetry object starts fresh counters on its first valid sample.
+context.globalThis.__gaiusServerTickTelemetry = {};
+begin.call(context, 2000);
+begin.call(context, 2601);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.intervalOver100MillisCount, 1);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.intervalOver500MillisCount, 1);
+end.call(context, 3102);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.tickWorkOver500MillisCount, 1);
 
 // Malformed diagnostic state is fail-open and must not escape into server code.
 context.globalThis.__gaiusServerTickTelemetry = null;

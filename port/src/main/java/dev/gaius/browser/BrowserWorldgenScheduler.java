@@ -276,6 +276,12 @@ public final class BrowserWorldgenScheduler {
               if (Number.isFinite(previous) && previous > 0 && now >= previous) {
                 const interval = now - previous;
                 stats.intervalCount = (Number(stats.intervalCount) || 0) + 1;
+                stats.intervalOver100MillisCount =
+                  (Number(stats.intervalOver100MillisCount) || 0) +
+                  (interval > 100 ? 1 : 0);
+                stats.intervalOver500MillisCount =
+                  (Number(stats.intervalOver500MillisCount) || 0) +
+                  (interval > 500 ? 1 : 0);
                 stats.lastTickIntervalMillis = interval;
                 stats.maxTickIntervalMillis = Math.max(
                   Number(stats.maxTickIntervalMillis) || 0, interval);
@@ -299,6 +305,9 @@ public final class BrowserWorldgenScheduler {
               if (Number.isFinite(started) && started > 0 && ended >= started) {
                 const duration = ended - started;
                 stats.completedTickCount = (Number(stats.completedTickCount) || 0) + 1;
+                stats.tickWorkOver500MillisCount =
+                  (Number(stats.tickWorkOver500MillisCount) || 0) +
+                  (duration > 500 ? 1 : 0);
                 stats.lastTickDurationMillis = duration;
                 stats.maxTickDurationMillis = Math.max(
                   Number(stats.maxTickDurationMillis) || 0, duration);
@@ -338,6 +347,9 @@ public final class BrowserWorldgenScheduler {
                 const duration = ended - started;
                 stats.completedWaitPhaseCount =
                   (Number(stats.completedWaitPhaseCount) || 0) + 1;
+                stats.waitPhaseOver500MillisCount =
+                  (Number(stats.waitPhaseOver500MillisCount) || 0) +
+                  (duration > 500 ? 1 : 0);
                 stats.lastWaitPhaseDurationMillis = duration;
                 stats.maxWaitPhaseDurationMillis = Math.max(
                   Number(stats.maxWaitPhaseDurationMillis) || 0, duration);

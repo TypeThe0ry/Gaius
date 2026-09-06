@@ -13,6 +13,12 @@ All notable changes to Gaius are documented here.
   `wss://ellan.site/tunnel`. Status/attestation and lease-release checks are
   transport evidence; they do not assert a complete LOGIN/PLAY session.
 
+### Added
+
+- Opt-in counters for server tick intervals over 100/500 ms and tick work or
+  wait phases over 500 ms, so measurement windows can expose stalls hidden by
+  average TPS. These diagnostics do not change gameplay scheduling.
+
 ### Fixed
 
 - Return Minecraft `26.2` chunk-generation batches to the server dispatcher
