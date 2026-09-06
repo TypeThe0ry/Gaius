@@ -1937,6 +1937,7 @@ function runErrorSerializationSelfSmoke() {
 const runtimeSelfTest = isMainThread && process.env.GAIUS_SMOKE_SELF_TEST === "1";
 
 if (runtimeSelfTest) {
+  const {runProbeFixture} = await import("./singleplayer-worker-runtime-probe-fixture.mjs");
   const selfTestOutput = JSON.stringify({
     ...runNetworkValidationSelfSmoke(),
     telemetrySnapshots: runTelemetrySnapshotSelfSmoke(),
@@ -1944,6 +1945,7 @@ if (runtimeSelfTest) {
     errorSerialization: runErrorSerializationSelfSmoke(),
     timeoutEvidence: runWorkerEventLoopEvidenceSelfSmoke(),
     postReadySoak: runPostReadySoakSelfSmoke(),
+    miningProbe: runProbeFixture(),
   }) + "\n";
   try {
     await writeChunkAndDrain(process.stdout, selfTestOutput, {
@@ -3704,6 +3706,11 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
     blockActionSequence: 0,
     blockActionProbeCount: 0,
     blockActionProbeTimer: undefined,
+    blockActionProbeDeadlineTimer: undefined,
+    blockActionProbeDeadlineAt: undefined,
+    blockActionProbeWaitReason: undefined,
+    transportClosed: false,
+    probeFailed: false,
     blockActionStopTimer: undefined,
     blockActionAckTimer: undefined,
     blockActionRetryTimer: undefined,
@@ -3812,10 +3819,16 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
   }
 
   function closeTransport() {
+    if (state.transportClosed) {
+      return;
+    }
+    state.transportClosed = true;
+    state.probeFailed = true;
     clearTimeout(state.roamHeartbeatTimer);
     clearTimeout(state.roamSettleTimer);
     clearTimeout(state.roamStepTimer);
     clearTimeout(state.blockActionProbeTimer);
+    clearTimeout(state.blockActionProbeDeadlineTimer);
     clearTimeout(state.blockActionStopTimer);
     clearTimeout(state.blockActionAckTimer);
     clearTimeout(state.blockActionRetryTimer);
@@ -3975,6 +3988,11 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
         maybeCompleteRoamStep(chunkPosition);
         maybeScheduleRoam();
         maybeScheduleMining();
+        if (!options.requireBlockDrop && state.miningScheduled && !state.blockActionCandidateConfirmed &&
+            state.blockActionProbeTimer === undefined &&
+            state.blockActionProbeDeadlineTimer !== undefined) {
+          probeNextBlock();
+        }
       } else if (packetId.value === clientboundPlay.playerPosition) {
         const previousPosition = state.playerPosition;
         state.playerPosition = decodePlayerPosition(payload);
@@ -4062,7 +4080,7 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
   }
 
   function maybeScheduleMining() {
-    if (state.miningScheduled || state.chunkPackets === 0) {
+    if (state.transportClosed || state.probeFailed || state.miningScheduled || state.chunkPackets === 0) {
       return;
     }
     if (state.roamSteps > 0 && !state.roamCompleted) {
@@ -4079,22 +4097,52 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
     }
     state.miningScheduled = true;
     state.blockActionCandidates = createBlockCandidates(state.playerPosition);
+    // Bound candidate discovery without truncating the initial 3 s delay and
+    // all 16 probes at 750 ms each. Confirmed mining retains its ACK/drop gates.
+    state.blockActionProbeDeadlineAt = Date.now() + 30000;
+    state.blockActionProbeDeadlineTimer = setTimeout(() => {
+      state.blockActionProbeDeadlineTimer = undefined;
+      if (state.transportClosed || state.probeFailed || state.blockActionCandidateConfirmed || state.miningCompleted) return;
+      rejectProbeDeadline();
+    }, 30000);
     // Let world generation and network traffic go idle first. The old transport
     // lost this exact case because no later read event pulled the action packet.
     if (options.requireBlockDrop) {
-      setTimeout(prepareDeterministicDropProbe, 500);
+      state.blockActionProbeTimer = setTimeout(() => {
+        state.blockActionProbeTimer = undefined;
+        prepareDeterministicDropProbe();
+      }, 500);
     } else {
-      setTimeout(probeNextBlock, 3000);
+      state.blockActionProbeTimer = setTimeout(() => {
+        state.blockActionProbeTimer = undefined;
+        probeNextBlock();
+      }, 3000);
     }
   }
 
   function prepareDeterministicDropProbe() {
-    const target = {
-      x: Math.floor(state.playerPosition.x) + 2,
-      y: Math.floor(state.playerPosition.y) + 1,
-      z: Math.floor(state.playerPosition.z),
-    };
+    if (state.transportClosed || state.probeFailed || state.blockActionCandidateConfirmed) return;
+    const baseX = Math.floor(state.playerPosition.x);
+    const baseZ = Math.floor(state.playerPosition.z);
+    state.blockActionCandidates = [[2, 0], [-2, 0], [0, 2], [0, -2]]
+      .map(([x, z]) => ({x: baseX + x, y: Math.floor(state.playerPosition.y) + 1, z: baseZ + z}));
+    const target = state.blockActionCandidates.find((candidate) => state.uniqueChunkPositions.has(
+        chunkKeyForBlock(candidate.x, candidate.z)));
+    if (!target) {
+      state.blockActionProbeWaitReason = "deterministic-target-awaiting-chunk";
+      const remaining = Math.max(0, (state.blockActionProbeDeadlineAt || 0) - Date.now());
+      if (remaining === 0) {
+        rejectProbeDeadline();
+        return;
+      }
+      state.blockActionProbeTimer = setTimeout(() => {
+        state.blockActionProbeTimer = undefined;
+        prepareDeterministicDropProbe();
+      }, Math.min(100, remaining));
+      return;
+    }
     state.blockActionCandidates = [target];
+    state.blockActionProbeWaitReason = undefined;
     state.blockActionTarget = target;
     state.blockActionProbedTargets.push(target);
     state.blockActionProbeCount++;
@@ -4112,8 +4160,9 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
     // generation, wait for the resulting block update instead of allowing a later player-action
     // packet to overtake the command and turn this into a false mining failure.
     state.blockActionProbeTimer = setTimeout(() => {
-      if (!state.blockActionCandidateConfirmed) {
-        ready.reject(new Error("Prepared probe block was not observed within 10 seconds"));
+      state.blockActionProbeTimer = undefined;
+      if (!state.transportClosed && !state.probeFailed && !state.blockActionCandidateConfirmed) {
+        failBlockProbe("prepared-block-unconfirmed", "Prepared probe block was not observed within 10 seconds");
       }
     }, 10000);
   }
@@ -4251,17 +4300,63 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
     setTimeout(sendNextRoamStep, 250);
   }
 
+  function failBlockProbe(reason, message) {
+    if (state.transportClosed || state.probeFailed || state.miningCompleted) return;
+    state.probeFailed = true;
+    state.blockActionProbeWaitReason = reason;
+    for (const timer of ["blockActionProbeTimer", "blockActionProbeDeadlineTimer",
+        "blockActionStopTimer", "blockActionAckTimer", "blockActionRetryTimer"]) {
+      clearTimeout(state[timer]);
+      state[timer] = undefined;
+    }
+    ready.reject(new Error(message));
+  }
+
+  function rejectProbeDeadline() {
+    const covered = state.blockActionCandidates.some((candidate) =>
+      state.uniqueChunkPositions.has(chunkKeyForBlock(candidate.x, candidate.z)));
+    failBlockProbe(covered
+      ? "probe-deadline-no-authoritative-confirmation" : "probe-deadline-no-loaded-candidate",
+    covered
+      ? "Loaded candidates produced no authoritative block confirmation before probe deadline"
+      : "No loaded chunk candidate became available before probe deadline");
+  }
+
   function probeNextBlock() {
-    if (state.blockActionCandidateIndex >= state.blockActionCandidates.length) {
-      ready.reject(new Error("No reachable solid block produced break progress"));
+    if (state.transportClosed || state.probeFailed || state.blockActionCandidateConfirmed || state.miningCompleted) {
       return;
     }
-    state.blockActionTarget =
-      state.blockActionCandidates[state.blockActionCandidateIndex++];
+    const remaining = Math.max(0, (state.blockActionProbeDeadlineAt || 0) - Date.now());
+    if (remaining === 0) {
+      rejectProbeDeadline();
+      return;
+    }
+    const target = state.blockActionCandidates.find((candidate) =>
+      !state.blockActionProbedTargets.some((probed) => sameBlockPos(probed, candidate)) &&
+      state.uniqueChunkPositions.has(chunkKeyForBlock(candidate.x, candidate.z)));
+    if (!target) {
+      const hasUnloaded = state.blockActionCandidates.some((candidate) =>
+        !state.blockActionProbedTargets.some((probed) => sameBlockPos(probed, candidate)) &&
+        !state.uniqueChunkPositions.has(chunkKeyForBlock(candidate.x, candidate.z)));
+      if (hasUnloaded && remaining > 0) {
+        state.blockActionProbeWaitReason = "awaiting-candidate-chunk";
+        state.blockActionProbeTimer = setTimeout(() => {
+          state.blockActionProbeTimer = undefined;
+          probeNextBlock();
+        }, Math.min(100, remaining));
+        return;
+      }
+      failBlockProbe("all-loaded-candidates-tried", "No loaded candidate produced break progress");
+      return;
+    }
+    state.blockActionCandidateIndex = state.blockActionCandidates.indexOf(target) + 1;
+    state.blockActionTarget = target;
+    state.blockActionProbeWaitReason = undefined;
     state.blockActionProbedTargets.push(state.blockActionTarget);
     state.blockActionProbeCount++;
     sendPlayerAction(0);
     state.blockActionProbeTimer = setTimeout(() => {
+      state.blockActionProbeTimer = undefined;
       if (state.blockActionCandidateConfirmed) {
         return;
       }
@@ -4270,10 +4365,13 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
   }
 
   function startConfirmedBlockAction(target) {
+    if (state.transportClosed || state.probeFailed || state.miningCompleted) return;
     state.blockActionCandidateConfirmed = true;
     state.blockActionTarget = {x: target.x, y: target.y, z: target.z};
     state.targetBlockStateId = target.stateId;
+    state.blockActionProbeWaitReason = undefined;
     clearTimeout(state.blockActionProbeTimer);
+    state.blockActionProbeTimer = undefined;
     state.miningStartedAt = Date.now();
     sendPlayerAction(0);
     state.blockActionStopTimer = setTimeout(() => {
@@ -4296,6 +4394,9 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
   }
 
   function sendPlayerAction(action) {
+    if (state.transportClosed || state.probeFailed) {
+      return undefined;
+    }
     const sequence = ++state.blockActionSequence;
     state.blockActionSentAt.set(sequence, Date.now());
     send(encodePacket(
@@ -4312,6 +4413,7 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
   }
 
   function completeBlockAction() {
+    if (state.transportClosed || state.probeFailed || state.miningCompleted) return;
     if (state.targetAirUpdates < 1 || state.targetStableAt === undefined) {
       return;
     }
@@ -4332,11 +4434,13 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
     }
     if (options.requireBlockDrop && !state.persistenceMarkerScheduled) {
       state.persistenceMarkerScheduled = true;
+      // Keep the persistence marker in the same received chunk as the probe.
+      const markerZ = state.blockActionTarget.z + ((state.blockActionTarget.z & 15) === 15 ? -1 : 1);
       send(encodePacket(
         serverboundPlay.chatCommand,
         encodeString(
           `setblock ${state.blockActionTarget.x} ${state.blockActionTarget.y} ` +
-          `${state.blockActionTarget.z + 1} minecraft:gold_block`
+          `${markerZ} minecraft:gold_block`
         ),
         state.compressionThreshold
       ));
@@ -4352,6 +4456,7 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
     state.blockActionLatencyMs = Date.now() - state.miningStartedAt;
     state.miningCompleted = true;
     clearTimeout(state.blockActionProbeTimer);
+    clearTimeout(state.blockActionProbeDeadlineTimer);
     clearTimeout(state.blockActionStopTimer);
     clearTimeout(state.blockActionAckTimer);
     clearTimeout(state.blockActionRetryTimer);
@@ -4486,6 +4591,22 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
       blockActionTarget: state.blockActionTarget,
       blockUpdates: state.blockUpdates.slice(),
       blockActionProbeCount: state.blockActionProbeCount,
+      blockActionProbeDeadlineAt: state.blockActionProbeDeadlineAt,
+      blockActionProbeWaitReason: state.blockActionProbeWaitReason,
+      blockActionProbeTargets: state.blockActionProbedTargets.slice(),
+      blockActionCandidateCoverage: (() => {
+        const loaded = state.blockActionCandidates.filter((candidate) =>
+          state.uniqueChunkPositions.has(chunkKeyForBlock(candidate.x, candidate.z)));
+        return {
+          totalCandidates: state.blockActionCandidates.length,
+          loadedCandidates: loaded.length,
+          unloadedCandidates: state.blockActionCandidates.length - loaded.length,
+          pendingUnloadedCandidates: state.blockActionCandidates.filter((candidate) =>
+            !state.blockActionProbedTargets.some((probed) => sameBlockPos(probed, candidate)) &&
+            !state.uniqueChunkPositions.has(chunkKeyForBlock(candidate.x, candidate.z))).length,
+          loadedChunkKeys: [...state.uniqueChunkPositions].sort(),
+        };
+      })(),
       blockActionLatencyMs: state.blockActionLatencyMs,
       blockActionHoldMs: options.blockActionHoldMs,
       blockActionStopSequence: state.blockActionStopSequence,
