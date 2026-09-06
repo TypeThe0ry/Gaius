@@ -103,8 +103,34 @@ public final class BrowserHttpProxy {
 
     @JSBody(params = {"target", "kind"}, script = """
             const params = new URLSearchParams(location.search || '');
-            const configured = params.get('bridge') || params.get('relay') ||
+            const explicitBridge = params.get('bridge') || params.get('relay') ||
               globalThis.__gaiusBridgeUrl;
+            let activeRelay = null;
+            // HTTP requests such as server resource packs are issued after the TCP
+            // channel has selected and attested a relay. Reuse that live candidate so
+            // the HTTP side follows the same target tunnel instead of racing the
+            // localhost development fallback.
+            const nettyBridge = globalThis.__gaiusNettyBridge;
+            if (!explicitBridge && nettyBridge && nettyBridge.channels instanceof Map) {
+              const activeRelays = new Map();
+              nettyBridge.channels.forEach(function(entry) {
+                if (!entry || !entry.connected || !entry.currentCandidate ||
+                    entry.currentCandidate.direct) return;
+                const candidate = entry.currentCandidate;
+                if (typeof candidate.url === 'string' && candidate.url.trim()) {
+                  const url = candidate.url.trim();
+                  const previous = activeRelays.get(url);
+                  if (!previous || (!previous.token && candidate.token)) {
+                    activeRelays.set(url, candidate);
+                  }
+                }
+              });
+              // A browser may have a status/list channel and a play channel alive at
+              // the same time. Do not guess between different active relays: an
+              // ambiguous selection must use the configured/default route instead.
+              if (activeRelays.size === 1) activeRelay = activeRelays.values().next().value;
+            }
+            const configured = explicitBridge || (activeRelay && activeRelay.url);
             let bridge;
             if (configured && String(configured).trim()) {
               bridge = new URL(String(configured).trim(), location.href);
@@ -130,7 +156,7 @@ public final class BrowserHttpProxy {
             bridge.search = '';
             bridge.searchParams.set('url', String(target));
             const token = params.get('bridgeToken') || params.get('relayToken') ||
-              globalThis.__gaiusBridgeToken;
+              globalThis.__gaiusBridgeToken || (activeRelay && activeRelay.token);
             if (token && String(token).length) bridge.searchParams.set('token', String(token));
             return bridge.href;
             """)

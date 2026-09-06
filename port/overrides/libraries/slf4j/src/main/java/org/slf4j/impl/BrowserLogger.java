@@ -25,19 +25,53 @@ final class BrowserLogger extends MarkerIgnoringBase {
         if (args == null || args.length == 0) {
             return format;
         }
+        int argumentLimit = args.length;
+        Throwable trailingThrowable = args[args.length - 1] instanceof Throwable
+                ? (Throwable) args[args.length - 1] : null;
+        if (trailingThrowable != null) {
+            argumentLimit--;
+        }
         StringBuilder sb = new StringBuilder();
         int argIndex = 0;
         int i = 0;
         while (i < format.length()) {
             char c = format.charAt(i);
             if (c == '{' && i + 1 < format.length() && format.charAt(i + 1) == '}') {
-                sb.append(argIndex < args.length ? String.valueOf(args[argIndex]) : "{}");
+                sb.append(argIndex < argumentLimit ? String.valueOf(args[argIndex]) : "{}");
                 argIndex++;
                 i += 2;
             } else {
                 sb.append(c);
                 i++;
             }
+        }
+        if (trailingThrowable != null) {
+            sb.append("\n").append(formatThrowable(trailingThrowable));
+        }
+        return sb.toString();
+    }
+
+    /** Keeps the browser console payload String-only while retaining the useful Throwable cause. */
+    private static String formatThrowable(Throwable throwable) {
+        StringBuilder sb = new StringBuilder();
+        Throwable current = throwable;
+        for (int depth = 0; current != null && depth < 4 && sb.length() < 4096; depth++) {
+            if (depth > 0) {
+                sb.append("\nCaused by: ");
+            }
+            sb.append(current.getClass().getName());
+            String message = current.getMessage();
+            if (message != null && !message.isEmpty()) {
+                sb.append(": ").append(message);
+            }
+            StackTraceElement[] stack = current.getStackTrace();
+            for (int index = 0; index < stack.length && sb.length() < 4096 && index < 32; index++) {
+                sb.append("\n\tat ").append(stack[index]);
+            }
+            current = current.getCause();
+        }
+        if (sb.length() > 4096) {
+            sb.setLength(4096);
         }
         return sb.toString();
     }
@@ -62,28 +96,28 @@ final class BrowserLogger extends MarkerIgnoringBase {
     public void trace(String format, Object arg) { log(TRACE_INT, "TRACE", format, arg); }
     public void trace(String format, Object arg1, Object arg2) { log(TRACE_INT, "TRACE", format, arg1, arg2); }
     public void trace(String format, Object... arguments) { log(TRACE_INT, "TRACE", format, arguments); }
-    public void trace(String msg, Throwable t) { log(TRACE_INT, "TRACE", msg + " - " + t); }
+    public void trace(String msg, Throwable t) { log(TRACE_INT, "TRACE", msg, t); }
 
     public boolean isDebugEnabled() { return false; }
     public void debug(String msg) { log(DEBUG_INT, "DEBUG", msg); }
     public void debug(String format, Object arg) { log(DEBUG_INT, "DEBUG", format, arg); }
     public void debug(String format, Object arg1, Object arg2) { log(DEBUG_INT, "DEBUG", format, arg1, arg2); }
     public void debug(String format, Object... arguments) { log(DEBUG_INT, "DEBUG", format, arguments); }
-    public void debug(String msg, Throwable t) { log(DEBUG_INT, "DEBUG", msg + " - " + t); }
+    public void debug(String msg, Throwable t) { log(DEBUG_INT, "DEBUG", msg, t); }
 
     public boolean isInfoEnabled() { return true; }
     public void info(String msg) { log(INFO_INT, "INFO", msg); }
     public void info(String format, Object arg) { log(INFO_INT, "INFO", format, arg); }
     public void info(String format, Object arg1, Object arg2) { log(INFO_INT, "INFO", format, arg1, arg2); }
     public void info(String format, Object... arguments) { log(INFO_INT, "INFO", format, arguments); }
-    public void info(String msg, Throwable t) { log(INFO_INT, "INFO", msg + " - " + t); }
+    public void info(String msg, Throwable t) { log(INFO_INT, "INFO", msg, t); }
 
     public boolean isWarnEnabled() { return true; }
     public void warn(String msg) { log(WARN_INT, "WARN", msg); }
     public void warn(String format, Object arg) { log(WARN_INT, "WARN", format, arg); }
     public void warn(String format, Object arg1, Object arg2) { log(WARN_INT, "WARN", format, arg1, arg2); }
     public void warn(String format, Object... arguments) { log(WARN_INT, "WARN", format, arguments); }
-    public void warn(String msg, Throwable t) { log(WARN_INT, "WARN", msg + " - " + t); }
+    public void warn(String msg, Throwable t) { log(WARN_INT, "WARN", msg, t); }
 
     public boolean isErrorEnabled() { return true; }
     public void error(String msg) { log(ERROR_INT, "ERROR", msg); }

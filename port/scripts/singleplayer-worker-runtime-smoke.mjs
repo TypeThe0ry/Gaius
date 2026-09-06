@@ -515,6 +515,61 @@ function copyObjectSnapshot(value) {
   return value !== null && typeof value === "object" ? {...value} : null;
 }
 
+const MAX_SERIALIZED_ERROR_DEPTH = 4;
+const MAX_SERIALIZED_ERROR_TEXT = 1024;
+const MAX_SERIALIZED_ERROR_ARGUMENTS = 8;
+
+function safeErrorText(value) {
+  try {
+    return String(value).slice(0, MAX_SERIALIZED_ERROR_TEXT);
+  } catch {
+    return "<unstringifiable>";
+  }
+}
+
+function isErrorLike(value) {
+  try {
+    return value instanceof Error || (value !== null && typeof value === "object" &&
+      ("stack" in value || "cause" in value));
+  } catch {
+    return false;
+  }
+}
+
+// Error fields such as message, stack, and cause are commonly non-enumerable.  Keep
+// the diagnostic path bounded and cycle-safe while retaining the original failure gate.
+function serializeError(value, depth = 0, seen = new WeakSet()) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "object" && typeof value !== "function") {
+    return String(value).slice(0, MAX_SERIALIZED_ERROR_TEXT);
+  }
+  if (seen.has(value)) return {type: "cycle"};
+  if (depth >= MAX_SERIALIZED_ERROR_DEPTH) return {type: "depth-limit"};
+  seen.add(value);
+  const text = (field) => {
+    try {
+      const fieldValue = value[field];
+      return fieldValue === undefined || fieldValue === null
+        ? undefined : String(fieldValue).slice(0, MAX_SERIALIZED_ERROR_TEXT);
+    } catch {
+      return "<unreadable>";
+    }
+  };
+  const result = {type: text("name") || "Error"};
+  const message = text("message");
+  const stack = text("stack");
+  if (message !== undefined) result.message = message;
+  if (stack !== undefined) result.stack = stack;
+  try {
+    if (value.cause !== undefined) {
+      result.cause = serializeError(value.cause, depth + 1, seen);
+    }
+  } catch {
+    result.cause = {type: "unreadable"};
+  }
+  return result;
+}
+
 function highResolutionEpochMillis() {
   return performance.timeOrigin + performance.now();
 }
@@ -1840,6 +1895,45 @@ function runPostReadySoakSelfSmoke() {
   };
 }
 
+function runErrorSerializationSelfSmoke() {
+  const cause = new Error("inner parser cause");
+  const outer = new Error("structure load failed", {cause});
+  const serialized = serializeError(outer);
+  if (serialized.type !== "Error" || serialized.message !== "structure load failed" ||
+      serialized.cause?.message !== "inner parser cause" ||
+      typeof serialized.stack !== "string") {
+    throw new Error("Error serialization lost non-enumerable fields or cause");
+  }
+  const cyclic = new Error("cyclic");
+  Object.defineProperty(cyclic, "cause", {value: cyclic, enumerable: false});
+  if (serializeError(cyclic).cause?.type !== "cycle") {
+    throw new Error("Error serialization did not break a cyclic cause");
+  }
+  let deep = new Error("depth-0");
+  for (let index = 1; index < MAX_SERIALIZED_ERROR_DEPTH + 3; index++) {
+    deep = new Error(`depth-${index}`, {cause: deep});
+  }
+  const deepSerialized = serializeError(deep);
+  let cursor = deepSerialized;
+  for (let index = 0; index < MAX_SERIALIZED_ERROR_DEPTH - 1; index++) cursor = cursor.cause;
+  if (cursor?.cause?.type !== "depth-limit") {
+    throw new Error("Error serialization depth bound regressed");
+  }
+  const huge = new Error("x".repeat(MAX_SERIALIZED_ERROR_TEXT + 100));
+  if (huge && serializeError(huge).message.length !== MAX_SERIALIZED_ERROR_TEXT) {
+    throw new Error("Error serialization text bound regressed");
+  }
+  const hostile = new Proxy({}, {
+    get() { throw new Error("hostile getter"); },
+    has() { throw new Error("hostile has trap"); },
+    getPrototypeOf() { throw new Error("hostile prototype trap"); },
+  });
+  if (isErrorLike(hostile) || serializeError(hostile) === null) {
+    throw new Error("hostile error-like proxy escaped the bounded serializer");
+  }
+  return {ok: true, cause: true, cycleBounded: true, depthBounded: true, textBounded: true};
+}
+
 const runtimeSelfTest = isMainThread && process.env.GAIUS_SMOKE_SELF_TEST === "1";
 
 if (runtimeSelfTest) {
@@ -1847,6 +1941,7 @@ if (runtimeSelfTest) {
     ...runNetworkValidationSelfSmoke(),
     telemetrySnapshots: runTelemetrySnapshotSelfSmoke(),
     slowProbe: runSlowProbeSelfSmoke(),
+    errorSerialization: runErrorSerializationSelfSmoke(),
     timeoutEvidence: runWorkerEventLoopEvidenceSelfSmoke(),
     postReadySoak: runPostReadySoakSelfSmoke(),
   }) + "\n";
@@ -3321,9 +3416,14 @@ if (isMainThread && !runtimeSelfTest) {
   installWorkerGcObserver();
   const originalConsoleError = console.error.bind(console);
   console.error = (...args) => {
+    const boundedArguments = args.slice(0, MAX_SERIALIZED_ERROR_ARGUMENTS);
+    const errorArgument = boundedArguments.find(isErrorLike);
     parentPort.postMessage({
       type: "node-console-error",
-      detail: args.map((value) => String(value)).join(" "),
+      detail: boundedArguments.map(safeErrorText).join(" ")
+        .slice(0, MAX_SERIALIZED_ERROR_TEXT * 4),
+      error: serializeError(errorArgument),
+      arguments: boundedArguments.map((value) => serializeError(value)),
       stack: new Error("console-error-stack").stack,
     });
     originalConsoleError(...args);
