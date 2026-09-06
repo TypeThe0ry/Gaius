@@ -23,6 +23,9 @@ All notable changes to Gaius are documented here.
 
 ### Fixed
 
+- Start Minecraft 1.21.11 chunk-holder continuations inside a TeaVM thread,
+  preserving the runtime context needed when future completion resumes work
+  that can suspend. Keep the existing synchronous world-generation boundaries.
 - Include pending transport frames in inbound flow-control watermarks, so a
   drained decoder slice queue does not resume the relay while thousands of
   small frames remain queued. Preserve the 4096-frame and 64 MiB hard limits.

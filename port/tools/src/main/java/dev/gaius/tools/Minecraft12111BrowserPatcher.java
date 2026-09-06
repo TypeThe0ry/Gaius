@@ -760,20 +760,20 @@ public final class Minecraft12111BrowserPatcher {
                 "<init>",
                 "(Ljava/util/concurrent/CompletableFuture;)V",
                 false));
-        code.add(new InsnNode(Opcodes.ICONST_0));
+        // Completing the future can resume a suspending continuation. A raw timer
+        // lacks the TeaVM native thread context required by that continuation.
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 "org/teavm/platform/Platform",
-                "schedule",
-                "(Lorg/teavm/platform/PlatformRunnable;I)I",
+                "startThread",
+                "(Lorg/teavm/platform/PlatformRunnable;)V",
                 false));
-        code.add(new InsnNode(Opcodes.POP));
         code.add(new JumpInsnNode(Opcodes.GOTO, normalReturn));
 
         code.add(normalReturn);
         code.add(tryEnd);
         code.add(new InsnNode(Opcodes.RETURN));
-        // A holder or Platform.schedule failure must not leave a live cursor or a
+        // A holder or Platform.startThread failure must not leave a live cursor or a
         // never-completing browser future attached to the task.
         code.add(handler);
         code.add(new VarInsnNode(Opcodes.ASTORE, 9));

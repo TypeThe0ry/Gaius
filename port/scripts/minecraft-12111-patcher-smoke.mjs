@@ -433,8 +433,8 @@ try {
   });
   assert.doesNotMatch(bytecode, /BrowserWorldgenScheduler/,
     "1.21.11 ChunkGenerationTask must remain scheduler-call free");
-  assert.match(bytecode, /Platform\.schedule/,
-    "1.21.11 ChunkGenerationTask must schedule holder continuations");
+  assert.match(bytecode, /Platform\.startThread/,
+    "1.21.11 ChunkGenerationTask must bootstrap holder continuations in a TeaVM thread");
   assert.match(bytecode, /Field net\/minecraft\/world\/level\/ChunkPos\.x:I/,
     "1.21.11 patched bytecode must use ChunkPos.x field");
   assert.match(bytecode, /Field net\/minecraft\/world\/level\/ChunkPos\.z:I/,
@@ -487,7 +487,7 @@ try {
   assert.match(scheduleInstructions[batchBackedges[0].index - 1]?.instruction ?? "",
     /(?:bipush\s+16|ldc(?:_w)?\s+.*\/\/ int 16)/,
     "1.21.11 batch backedge must enforce the 16-holder upper bound");
-  assert.ok(scheduleLayer.indexOf("scheduleChunkInLayer") < scheduleLayer.indexOf("Platform.schedule"),
+  assert.ok(scheduleLayer.indexOf("scheduleChunkInLayer") < scheduleLayer.indexOf("Platform.startThread"),
     "1.21.11 must submit holders before publishing its batch continuation");
   assert.equal(occurrences(scheduleLayer, "BrowserWorldgenScheduler"), 0);
   console.log("Minecraft 1.21.11 checkpoint-only holder cursor smoke passed", JSON.stringify({
