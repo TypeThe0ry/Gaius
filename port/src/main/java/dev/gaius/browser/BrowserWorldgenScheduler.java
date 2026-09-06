@@ -164,6 +164,8 @@ public final class BrowserWorldgenScheduler {
                 x: entry.x,
                 z: entry.z,
                 needsGeneration: entry.needsGeneration,
+                startAt: entry.startAt,
+                endAt: entry.endAt,
                 durationMillis: entry.durationMillis,
                 result: entry.result
               });

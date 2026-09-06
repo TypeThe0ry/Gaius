@@ -482,8 +482,9 @@ try {
   assert.equal(beginChunkHolderProbe(), 41.5,
     "enabled holder probe did not use performance.now");
   for (let index = 0; index < 20; index++) {
+    const duration = index === 2 ? 17 : 5;
     recordChunkHolderProbeJs(`status-${index}`, index, -index, index % 2 === 0,
-      100 + index, 105 + index, 5, index !== 19);
+      100 + index, 100 + index + duration, duration, index !== 19);
   }
   const holderStats = globalThis.__gaiusWorldgenStats;
   assert.equal(holderStats.chunkHolderProbe.capacity, 16,
@@ -496,8 +497,11 @@ try {
     "holder probe ring did not retain the newest sample");
   assert.equal(holderStats.chunkHolderProbeFalseResults, 1,
     "holder probe did not count a false result");
-  assert.equal(JSON.parse(holderStats.chunkHolderProbeMaxContext).status, "status-19",
-    "holder probe max context was not retained at the latest maximum");
+  assert.deepEqual(JSON.parse(holderStats.chunkHolderProbeMaxContext), {
+    status: "status-2", x: 2, z: -2, needsGeneration: true,
+    startAt: 102, endAt: 119, durationMillis: 17, result: true,
+  },
+    "holder probe maximum was lost while the bounded ring wrapped");
   assert.ok(holderStats.chunkHolderProbeMaxContext.length <= 1024,
     "holder probe max context exceeded its character bound");
   globalThis.__gaiusSlowProbeHolderCapacity = 999;
@@ -505,16 +509,18 @@ try {
   assert.equal(globalThis.__gaiusWorldgenStats.chunkHolderProbe.capacity, 512,
     "holder probe capacity did not enforce the upper bound");
   assert.equal(JSON.parse(globalThis.__gaiusWorldgenStats.chunkHolderProbeMaxContext).status,
-    "status-19",
+    "status-2",
     "shorter holder probe overwrote the maximum context");
-  recordChunkHolderProbeJs("new-maximum", 4, -5, true, 300, 311, 11, false);
+  recordChunkHolderProbeJs("new-maximum", 4, -5, true, 300, 323, 23, false);
   const maximumContext = JSON.parse(globalThis.__gaiusWorldgenStats.chunkHolderProbeMaxContext);
   assert.deepEqual(maximumContext, {
     status: "new-maximum",
     x: 4,
     z: -5,
     needsGeneration: true,
-    durationMillis: 11,
+    startAt: 300,
+    endAt: 323,
+    durationMillis: 23,
     result: false,
   }, "holder probe maximum context fields were not captured");
   recordChunkHolderProbeJs("control-\n-\t-\"-" + "x".repeat(120), 8, 9, false,
