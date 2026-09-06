@@ -4182,7 +4182,14 @@ def check_source_patches() -> None:
             and "__gaiusClientAttached" in browser_singleplayer_client
             and "singleplayer:client-attached" in netty_browser_channel
             and "globalThis.__gaiusSingleplayerHandoff = '';" in netty_browser_channel
-            and "Integrated server client did not attach within 60 seconds" in browser_singleplayer_client
+            and "STARTUP_INITIAL_DEADLINE_MS = 60000" in browser_singleplayer_client
+            and "STARTUP_PROGRESS_GRACE_MS = 30000" in browser_singleplayer_client
+            and "STARTUP_ABSOLUTE_DEADLINE_MS = 180000" in browser_singleplayer_client
+            and "armStartupWatchdog()" in browser_singleplayer_client
+            and "__gaiusStartupSeenPhases" in browser_singleplayer_client
+            and "rememberStartupFailure(detail)" in browser_singleplayer_client
+            and "Integrated server startup watchdog expired:" in browser_singleplayer_client
+            and "Integrated server client did not attach within 60 seconds" not in browser_singleplayer_client
             and "async function" not in browser_singleplayer_client
             and "for (const" not in browser_singleplayer_client
             and "for (const" not in netty_browser_channel
