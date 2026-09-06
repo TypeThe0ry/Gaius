@@ -6128,14 +6128,17 @@ def check_source_patches() -> None:
             and "takePermit(thread)" in teavm_lock_support,
         ),
         (
-            "Built-in structure NBT uses synchronous vanilla gzip",
+            "Built-in structure NBT uses synchronous gzip with direct byte-array reads",
             "patchStructureTemplateManagerBrowserGzip" in client_patcher
             and '"readStructure"' in client_patcher
             and '"dev/gaius/browser/BrowserGzip"' in client_patcher
             and "InputStream input" in browser_gzip
             and "async function" not in browser_gzip
             and "await " not in browser_gzip
-            and "NbtIo.readCompressed(input" in browser_gzip
+            and "try (GZIPInputStream gzip = new GZIPInputStream(input))" in browser_gzip
+            and "NbtIo.read(new ByteArrayDataInput(output.toByteArray())" in browser_gzip
+            and "DataInputStream.readUTF(this)" in browser_gzip
+            and "implements DataInput" in browser_gzip
             and "NbtAccounter.unlimitedHeap()" in browser_gzip
             and file_matches(SERVER_WORKER_JS, rb"new DecompressionStream\('gzip'\)")
             and not file_matches(
@@ -11801,10 +11804,12 @@ def check_overlay_bytecode() -> None:
             and "Method execute" not in blockable_event_loop_schedule,
         ),
         (
-            "Compiled structure templates retain synchronous NBT parsing behind vanilla gzip",
+            "Compiled structure templates retain synchronous NBT parsing with direct byte-array reads",
             "BrowserGzip.readCompressedNbt" in structure_template_read_stream
             and "NbtIo.readCompressed" not in structure_template_read_stream
-            and "NbtIo.readCompressed:(Ljava/io/InputStream;Lnet/minecraft/nbt/NbtAccounter;)"
+            and "java/util/zip/GZIPInputStream" in browser_gzip_read_nbt
+            and "BrowserGzip$ByteArrayDataInput" in browser_gzip_read_nbt
+            and "NbtIo.read:(Ljava/io/DataInput;Lnet/minecraft/nbt/NbtAccounter;)"
                 in browser_gzip_read_nbt,
         ),
         (
