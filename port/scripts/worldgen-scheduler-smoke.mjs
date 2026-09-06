@@ -113,8 +113,8 @@ assert.ok(patcher262.includes("browserWorldgenBeginTaskWork()")
 assert.ok(clientPatcher.includes("method.tryCatchBlocks.add(new TryCatchBlockNode(")
     && clientPatcher.includes("java/lang/Throwable"),
   "MinecraftServer.pollTask exception cleanup is not protected by a finally handler");
-assert.equal(worldgen.split("BrowserIntegratedServerMain.pumpUrgentPackets()").length - 1, 2,
-  "worldgen does not drain one bounded packet batch before and after a yield");
+assert.equal(worldgen.split("BrowserIntegratedServerMain.pumpUrgentPackets()").length - 1, 0,
+  "worldgen yield must not synchronously re-enter packet handlers");
 assert.ok(worldgen.includes("boolean yieldActive") && worldgen.includes("deferredYield"),
   "worldgen yield has no reentrancy gate");
 assert.ok(worldgen.includes("pulsesInTurn >= MAX_PULSES_PER_TURN"),
@@ -141,9 +141,12 @@ assert.ok(worldgen.includes("int queueDepthBefore = isWorkerRuntime()")
     && worldgen.includes("int queueDepthAfter = isWorkerRuntime() ? networkQueueDepth() : 0")
     && worldgen.includes("boolean networkPreemption = reason == YIELD_NETWORK || pendingBefore || pendingAfter;"),
   "client deadline pressure isolation or Worker network classification is missing");
-assert.ok(worldgen.includes("pendingBefore && isWorkerRuntime()")
-    && worldgen.includes("pendingAfter && isWorkerRuntime()"),
-  "client scheduler can still invoke the server-thread urgent packet pump");
+assert.ok(worldgen.includes("boolean pendingBefore = isWorkerRuntime()")
+    && worldgen.includes("boolean pendingAfter = isWorkerRuntime()")
+    && worldgen.includes("queueDepthBefore")
+    && worldgen.includes("queueDepthAfter")
+    && worldgen.includes("normal packet/poll boundaries drain the retained input"),
+  "worldgen must retain pending network pressure without synchronously pumping packets");
 
 assert.ok(!worldgen.includes("new Thread") && !worldgen.includes("Executor")
     && !worldgen.includes("CompletableFuture"),
@@ -903,6 +906,13 @@ class DeterministicScheduler {
     return processed;
   }
 
+  // Packet handlers run only at the ordinary integrated-server boundary.  A
+  // worldgen yield deliberately leaves this queue untouched; the next boundary
+  // drains it after the generation scope has returned.
+  pumpAtServerBoundary(limit = 16) {
+    return this.pump(limit);
+  }
+
   recordCheckpointOnlyYield(networkWaitPulses, yieldDelay, queueBefore, queueAfter) {
     this.checkpointOnlyYields++;
     this.checkpointOnlyYieldDelays.push(yieldDelay);
@@ -953,8 +963,6 @@ class DeterministicScheduler {
       const elapsed = sliceElapsed;
       const overrun = Math.max(0, elapsed - completedBudget);
       const queueBefore = this.networkQueue.length;
-      if (queueBefore > 0) this.pump();
-
       const yieldStartedAt = this.time;
       const delay = this.nextYieldDelay;
       this.nextYieldDelay = 0.25;
@@ -968,7 +976,6 @@ class DeterministicScheduler {
         this.injectReentrantRequest = false;
         this.requestYield("checkpoint");
       }
-      if (this.networkQueue.length > 0) this.pump();
       const queueAfter = this.networkQueue.length;
       const yieldDelay = this.time - yieldStartedAt;
       const madeProgress = this.progressPulses > 0;
@@ -1112,6 +1119,7 @@ for (let guard = 0; guard < 20_000 && simulation.worldCompleted < targetWorldPul
   const simulationToken = simulation.beginTaskWork();
   simulation.workPulse(0.35);
   simulation.endTaskWork(simulationToken);
+  simulation.pumpAtServerBoundary();
 }
 while ((simulation.networkQueue.length > 0 || simulation.scheduled.length > 0)
     && simulation.time < 2_000) {
@@ -1156,8 +1164,40 @@ assert.equal(simulation.scheduled.length, 0, "scheduled deterministic events lea
 assert.equal(simulation.yieldActive, false, "yield remained active after simulation shutdown");
 assert.equal(simulation.deferredYield, false, "deferred yield remained queued after shutdown");
 
+// FinishConfiguration must not be dispatched from inside a generation yield:
+// its waitForEntities path can wait on the outer generation completion future.
+// The input remains pending and is handled once the normal server boundary is
+// reached, exactly once.
+const suspendedGeneration = new DeterministicScheduler(8);
+suspendedGeneration.time = 1;
+suspendedGeneration.beginServerWorkTurn();
+const suspendedToken = suspendedGeneration.beginTaskWork();
+suspendedGeneration.networkQueue.push({
+  at: suspendedGeneration.time,
+  type: "finish-configuration",
+  availablePulse: suspendedGeneration.totalPulses,
+});
+suspendedGeneration.requestYield("deadline");
+assert.equal(suspendedGeneration.processed.length, 0,
+  "finish-configuration handler ran synchronously inside the generation yield");
+assert.equal(suspendedGeneration.networkQueue.length, 1,
+  "pending input was lost while generation yielded");
+// The instrumented pending-future return is followed by the real NORMAL scope
+// close when the generation method returns; use the model's actual close path
+// before allowing packet dispatch.
+suspendedGeneration.endTaskWork(suspendedToken);
+assert.equal(suspendedGeneration.taskWorkDepth, 0,
+  "generation scope did not close before the server boundary");
+assert.equal(suspendedGeneration.pumpAtServerBoundary(), 1,
+  "server boundary did not process retained finish-configuration input");
+assert.equal(suspendedGeneration.processed.length, 1,
+  "finish-configuration input was not processed after generation returned");
+assert.equal(suspendedGeneration.pumpAtServerBoundary(), 0,
+  "finish-configuration input was processed more than once");
+assert.equal(suspendedToken, 1, "generation regression fixture lost its normal task token");
+
 // A 1.21-style server turn can reach checkpoint with no task pulse at all.
-// Checkpoint-only yields must still pump/yield, but may not consume an
+// Checkpoint-only yields must still yield to the event loop, but may not consume an
 // adaptive slice or manufacture no-progress slice telemetry.
 const pureCheckpoint = new DeterministicScheduler(8);
 pureCheckpoint.injectReentry = false;
@@ -1214,7 +1254,8 @@ assert.equal(activeCheckpoint.currentBudget, 8,
   "active no-progress checkpoint changed the 8 ms adaptive budget");
 
 // A packet present before the yield and one arriving during the event-loop
-// continuation both remain pumpable even when no worldgen pulse occurs.
+// continuation remain queued; neither handler may run inside the checkpoint
+// continuation. The next integrated-server boundary drains both exactly once.
 const checkpointNetwork = new DeterministicScheduler(8);
 checkpointNetwork.injectReentry = false;
 checkpointNetwork.networkQueue.push({
@@ -1225,13 +1266,19 @@ checkpointNetwork.networkQueue.push({
 });
 checkpointNetwork.schedule(0.1, "post-pump");
 checkpointNetwork.requestYield("checkpoint");
-assert.equal(checkpointNetwork.processed.length, 2,
-  "checkpoint-only yield skipped pre/post urgent packet pumps");
-assert.equal(checkpointNetwork.checkpointOnlyMaxQueueDepth, 1,
+assert.equal(checkpointNetwork.processed.length, 0,
+  "checkpoint-only yield synchronously ran a packet handler");
+assert.equal(checkpointNetwork.checkpointOnlyMaxQueueDepth, 2,
   "checkpoint-only telemetry missed packet queue pressure");
+assert.equal(checkpointNetwork.pumpAtServerBoundary(), 2,
+  "server boundary did not drain retained checkpoint input");
+assert.equal(checkpointNetwork.processed.length, 2,
+  "retained checkpoint input was not processed exactly once");
+assert.equal(checkpointNetwork.pumpAtServerBoundary(), 0,
+  "checkpoint input was processed more than once");
 
 // A callback pulse produced while yieldActive is true converts the checkpoint
-// into an ordinary progress-bearing slice after the pumps complete.
+// into an ordinary progress-bearing slice after the event-loop continuation.
 const callbackCheckpoint = new DeterministicScheduler(8);
 callbackCheckpoint.injectReentry = true;
 callbackCheckpoint.requestYield("checkpoint");

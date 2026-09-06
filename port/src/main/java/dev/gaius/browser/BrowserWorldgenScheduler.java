@@ -679,10 +679,11 @@ public final class BrowserWorldgenScheduler {
             if (pendingBefore && queueDepthBefore == 0) {
                 queueDepthBefore = 1;
             }
-            if (pendingBefore && isWorkerRuntime()) {
-                BrowserIntegratedServerMain.pumpUrgentPackets();
-            }
-
+            // Keep packet handlers outside this suspended generation continuation. A finish-
+            // configuration handler can wait for entity readiness which depends on this very
+            // task returning and completing its chunk future. Synchronously draining here
+            // would make that handler wait on its own outer stack. Incoming messages already
+            // wake the server; its normal packet/poll boundaries drain the retained input.
             // A zero-delay continuation yields to MessagePort and heartbeat callbacks without
             // relying on the browser's clamp-prone positive timers.
             double yieldStartedAt = nowMillis();
@@ -696,17 +697,9 @@ public final class BrowserWorldgenScheduler {
             if (pendingAfter && queueDepthAfter == 0) {
                 queueDepthAfter = 1;
             }
-            if (pendingAfter && isWorkerRuntime()) {
-                BrowserIntegratedServerMain.pumpUrgentPackets();
-                queueDepthAfter = networkQueueDepth();
-                if (queueDepthAfter == 0 && hasPendingNetworkInput()) {
-                    queueDepthAfter = 1;
-                }
-            }
-
             // A checkpoint is a server-turn boundary, not evidence that a
-            // worldgen slice completed.  Decide this only after both urgent
-            // packet pumps and the event-loop continuation: a callback may
+            // worldgen slice completed.  Decide this only after both pending
+            // input observations and the event-loop continuation: a callback may
             // have produced a pulse while yieldActive was true, in which case
             // the checkpoint is an ordinary progress-bearing slice.
             boolean madeProgress = progressPulsesInSlice > 0;
