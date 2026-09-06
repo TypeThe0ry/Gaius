@@ -283,7 +283,7 @@ public final class Minecraft262BrowserPatcher {
         // thenRun callback re-enters runGenerationTask after the macrotask completes.
         // The vanilla fresh path calls scheduleNextLayer and then reaches the original
         // task-layer pulse/backedge.  A newly published batch future must be returned before
-        // that pulse: otherwise a fast Platform.schedule callback can complete it and the
+        // that pulse: otherwise a fast Platform.startThread callback can complete it and the
         // method can continue inline through the same Java invocation.
         LabelNode activeResume = new LabelNode();
         method.instructions.insertBefore(originalBackedge, activeResume);
@@ -784,9 +784,11 @@ public final class Minecraft262BrowserPatcher {
         code.add(new LdcInsnNode(BROWSER_HOLDERS_PER_TURN));
         code.add(new JumpInsnNode(Opcodes.IF_ICMPLT, resume));
         code.add(scheduleYield);
-        // One future per bounded batch. The helper is dispatched through Platform.schedule(0),
-        // which is required to remain a true macrotask; cancellation still completes normally
-        // so runUntilWait re-enters its vanilla releaseClaim branch.
+        // One future per bounded batch. The helper must enter a TeaVM native-thread
+        // continuation before completing the future: Platform.schedule(0) invokes a
+        // PlatformRunnable from a raw timer callback, so a thenRun continuation that
+        // suspends would have no current TeaVM thread. startThread keeps the same
+        // macrotask boundary while installing the continuation context.
         code.add(new TypeInsnNode(Opcodes.NEW, "java/util/concurrent/CompletableFuture"));
         code.add(new InsnNode(Opcodes.DUP));
         code.add(new MethodInsnNode(
@@ -804,11 +806,9 @@ public final class Minecraft262BrowserPatcher {
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESPECIAL, CHUNK_GENERATION_YIELD, "<init>",
                 "(Ljava/util/concurrent/CompletableFuture;)V", false));
-        code.add(new InsnNode(Opcodes.ICONST_0));
         code.add(new MethodInsnNode(
-                Opcodes.INVOKESTATIC, "org/teavm/platform/Platform", "schedule",
-                "(Lorg/teavm/platform/PlatformRunnable;I)I", false));
-        code.add(new InsnNode(Opcodes.POP));
+                Opcodes.INVOKESTATIC, "org/teavm/platform/Platform", "startThread",
+                "(Lorg/teavm/platform/PlatformRunnable;)V", false));
         code.add(new JumpInsnNode(Opcodes.GOTO, normalReturn));
 
         code.add(normalReturn);

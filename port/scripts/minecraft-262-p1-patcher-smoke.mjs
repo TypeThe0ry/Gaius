@@ -23,6 +23,11 @@ const requestedProfile = process.env.GAIUS_MINECRAFT_VERSION
 if (requestedProfile !== "26.2") {
   throw new Error(`Minecraft 26.2 P1 patcher smoke is 26.2-only; got ${requestedProfile}`);
 }
+execFileSync(process.execPath, [join(repositoryRoot,
+  "port/scripts/teavm-platform-start-thread-smoke.mjs")], {
+  encoding: "utf8",
+  stdio: "inherit",
+});
 const rawClientJar = join(repositoryRoot, "port/work/26.2/client-named.jar");
 const raw121ClientJar = join(repositoryRoot, "port/work/1.21.11/client-named.jar");
 const toolsSource = join(repositoryRoot, "port/tools/src/main/java/dev/gaius/tools");
@@ -652,7 +657,8 @@ for (const required of [
   "CHUNK_GENERATION_YIELD",
   "BrowserChunkGenerationYield",
   "browserLayerYield",
-  "Platform.schedule",
+  '"startThread"',
+  '"(Lorg/teavm/platform/PlatformRunnable;)V"',
   "writeChunkGenerationYieldHelper",
 ]) {
   assert.equal(browserPatcherSource.includes(required), true,
@@ -1110,8 +1116,8 @@ try {
   assert.match(scheduleLayerInstructions[batchBackedges[0].index + 1]?.instruction ?? "",
     /^new\s+.*CompletableFuture/,
     "scheduleLayer full batch must create a future and return to its dispatcher");
-  assert.equal(occurrences(scheduleLayer, "Platform.schedule"), 1,
-    "scheduleLayer must dispatch exactly one asynchronous completion per batch");
+  assert.equal(occurrences(scheduleLayer, "Platform.startThread"), 1,
+    "scheduleLayer must bootstrap exactly one asynchronous TeaVM thread per batch");
   const runServer = method(bytecode, "protected void runServer", "private void");
   const tickStart = runServer.indexOf("BrowserWorldgenScheduler.beginServerWorkTurn");
   const tickTelemetryStart = runServer.indexOf(

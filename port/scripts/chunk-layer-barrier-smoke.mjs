@@ -269,6 +269,10 @@ for (const patcher of patchers) {
       'Opcodes.NEW, "java/util/concurrent/CompletableFuture"',
       '"org/teavm/platform/Platform"',
   ], `${patcher.profile} bounded holder batch`);
+  if (patcher.scheduler) {
+    assert.match(scheduleLayer, /"startThread"/,
+      `${patcher.profile} continuation must use TeaVM native-thread bootstrap`);
+  }
   assert.match(scheduleLayer,
       /Opcodes\.PUTFIELD, owner, BROWSER_LAYER_ACTIVE, "Z"[\s\S]*Opcodes\.GOTO, scheduleYield/,
       `${patcher.profile} final holder does not retain the final continuation barrier`);

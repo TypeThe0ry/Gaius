@@ -5969,10 +5969,11 @@ def check_source_patches() -> None:
             and "BROWSER_LAYER_YIELD" in minecraft_262_browser_patcher
             and "CHUNK_GENERATION_YIELD" in minecraft_262_browser_patcher
             and "BrowserChunkGenerationYield" in minecraft_262_browser_patcher
-            and "Platform.schedule" in minecraft_262_browser_patcher
+            and '"startThread"' in minecraft_262_browser_patcher
+            and '"(Lorg/teavm/platform/PlatformRunnable;)V"' in minecraft_262_browser_patcher
             and "writeChunkGenerationYieldHelper" in minecraft_262_browser_patcher
             and minecraft_262_browser_patcher.count(
-                'Opcodes.INVOKESTATIC, "org/teavm/platform/Platform", "schedule"'
+                'Opcodes.INVOKESTATIC, "org/teavm/platform/Platform", "startThread"'
             ) == 1
             and "BrowserWorldgenScheduler" in minecraft_262_browser_patcher
             and "browserWorldgenCheckpoint" in client_patcher
@@ -12154,7 +12155,7 @@ def check_overlay_bytecode() -> None:
                     and "browserLayerYield" in generation_schedule_layer
                     and "BrowserChunkGenerationYield" in generation_schedule_layer
                     and generation_schedule_layer.count(
-                        "org/teavm/platform/Platform.schedule"
+                        "org/teavm/platform/Platform.startThread"
                     ) == 1
                     and "java/util/concurrent/CompletableFuture" in generation_schedule_layer
                     and "// int 16" in generation_schedule_layer

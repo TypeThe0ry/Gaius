@@ -385,7 +385,7 @@ public final class GaiusChunkLayerBytecodeVerifier {
                 "scheduleLayer non-final coordinate path must reach the batch guard");
         AbstractInsnNode futureStart = firstExecutable(finalYieldJump.label);
         FieldInsnNode yieldPut = null;
-        MethodInsnNode platformSchedule = null;
+        MethodInsnNode platformStartThread = null;
         for (AbstractInsnNode instruction = futureStart; instruction != null;
                 instruction = nextExecutable(instruction)) {
             if (instruction instanceof FieldInsnNode field
@@ -394,15 +394,14 @@ public final class GaiusChunkLayerBytecodeVerifier {
             if (instruction instanceof MethodInsnNode call
                     && call.getOpcode() == Opcodes.INVOKESTATIC
                     && call.owner.equals("org/teavm/platform/Platform")
-                    && call.name.equals("schedule")) {
-                platformSchedule = call;
+                    && call.name.equals("startThread")
+                    && call.desc.equals("(Lorg/teavm/platform/PlatformRunnable;)V")) {
+                platformStartThread = call;
                 break;
             }
         }
-        require(yieldPut != null && platformSchedule != null,
-                "scheduleLayer final continuation must publish and schedule its future");
-        require(previousExecutable(platformSchedule).getOpcode() == Opcodes.ICONST_0,
-                "scheduleLayer continuation delay must remain zero");
+        require(yieldPut != null && platformStartThread != null,
+                "scheduleLayer final continuation must publish and start its TeaVM thread");
 
         JumpInsnNode cancellation = null;
         JumpInsnNode holderRejected = null;
@@ -475,8 +474,7 @@ public final class GaiusChunkLayerBytecodeVerifier {
         }
         require(yieldField, "26.2 ChunkGenerationTask lost browserLayerYield");
         boolean helperCall = false;
-        boolean platformSchedule = false;
-        boolean zeroDelay = false;
+        boolean platformStartThread = false;
         for (MethodNode method : node.methods) {
             for (AbstractInsnNode instruction : method.instructions) {
                 if (instruction instanceof MethodInsnNode call
@@ -486,15 +484,15 @@ public final class GaiusChunkLayerBytecodeVerifier {
                 }
                 if (instruction instanceof MethodInsnNode call
                         && call.owner.equals("org/teavm/platform/Platform")
-                        && call.name.equals("schedule")) {
-                    platformSchedule = true;
-                    zeroDelay = previousExecutable(instruction).getOpcode() == Opcodes.ICONST_0;
+                        && call.name.equals("startThread")
+                        && call.desc.equals("(Lorg/teavm/platform/PlatformRunnable;)V")) {
+                    platformStartThread = true;
                 }
             }
         }
         require(helperCall, "26.2 bytecode lost BrowserChunkGenerationYield helper");
-        require(platformSchedule && zeroDelay,
-                "26.2 pending continuation must use Platform.schedule(0)");
+        require(platformStartThread,
+                "26.2 pending continuation must use Platform.startThread(PlatformRunnable)");
         System.out.println("PENDING_LAYER_YIELD_OK " + node.name);
     }
 
