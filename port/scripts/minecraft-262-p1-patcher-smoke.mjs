@@ -107,6 +107,23 @@ function occurrences(haystack, needle) {
   return haystack.split(needle).length - 1;
 }
 
+function assertDedicatedServerGameTypeContract(bytecode, profile, initSignature) {
+  const init = method(bytecode,
+    initSignature,
+    "public net.minecraft.world.level.GameType gameMode();");
+  assert.equal(occurrences(init, "WorldData.setGameType"), 0,
+    `${profile} initServer still overwrites the persisted WorldData game type`);
+  const gameMode = method(bytecode,
+    "public net.minecraft.world.level.GameType gameMode();",
+    "public void setGameMode(net.minecraft.world.level.GameType);");
+  assert.equal(occurrences(gameMode, "WorldData.setGameType"), 0,
+    `${profile} gameMode getter unexpectedly mutates WorldData`);
+  const setGameMode = method(bytecode,
+    "public void setGameMode(net.minecraft.world.level.GameType);");
+  assert.equal(occurrences(setGameMode, "WorldData.setGameType"), 1,
+    `${profile} explicit setGameMode mutation was removed`);
+}
+
 function assertClientPlayPacketQueueContract(packetUtilsBytecode, profileId) {
   const contract = method(packetUtilsBytecode,
     "void ensureRunningOnSameThread(net.minecraft.network.protocol.Packet<T>, T, net.minecraft.network.PacketProcessor)",
@@ -756,6 +773,21 @@ try {
   execFileSync(jar, ["--update", "--file", clientJar, "-C", clientPatches, "."], {
     encoding: "utf8", timeout: 30_000,
   });
+  const rawDedicatedServer = execFileSync(javap, ["-classpath", rawClientJar, "-p", "-c",
+    "net.minecraft.server.dedicated.DedicatedServer"], {
+      encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000,
+    });
+  const patchedDedicatedServer = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
+    "net.minecraft.server.dedicated.DedicatedServer"], {
+      encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000,
+    });
+  const rawInit = method(rawDedicatedServer,
+    "protected boolean initServer() throws java.io.IOException;",
+    "public net.minecraft.world.level.GameType gameMode();");
+  assert.equal(occurrences(rawInit, "WorldData.setGameType"), 1,
+    "26.2 raw initServer game type override shape changed");
+  assertDedicatedServerGameTypeContract(patchedDedicatedServer, "26.2",
+    "protected boolean initServer() throws java.io.IOException;");
   execFileSync(java, ["-classpath", [classes, classpath].join(delimiter),
     "dev.gaius.tools.Minecraft262BrowserPatcher", clientJar, browserPatches], {
     encoding: "utf8", timeout: 30_000,
@@ -870,6 +902,21 @@ try {
   execFileSync(jar, ["--update", "--file", generic121Jar, "-C", generic121Patches, "."], {
     encoding: "utf8", timeout: 30_000,
   });
+  const raw121DedicatedServer = execFileSync(javap, ["-classpath", raw121ClientJar, "-p", "-c",
+    "net.minecraft.server.dedicated.DedicatedServer"], {
+      encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000,
+    });
+  const patched121DedicatedServer = execFileSync(javap, ["-classpath", generic121Jar, "-p", "-c",
+    "net.minecraft.server.dedicated.DedicatedServer"], {
+      encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000,
+    });
+  const raw121Init = method(raw121DedicatedServer,
+    "public boolean initServer() throws java.io.IOException;",
+    "public net.minecraft.world.level.GameType gameMode();");
+  assert.equal(occurrences(raw121Init, "WorldData.setGameType"), 1,
+    "1.21.11 raw initServer game type override shape changed");
+  assertDedicatedServerGameTypeContract(patched121DedicatedServer, "1.21.11",
+    "public boolean initServer() throws java.io.IOException;");
   const generic121Graphics = execFileSync(javap, ["-classpath", generic121Jar, "-p", "-c",
     "net.minecraft.client.GraphicsPreset"], {
     encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30_000,

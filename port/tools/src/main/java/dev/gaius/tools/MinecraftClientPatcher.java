@@ -9118,6 +9118,7 @@ public final class MinecraftClientPatcher {
         String properties = "net/minecraft/server/dedicated/DedicatedServerProperties";
         ClassNode node = read(jar, owner + ".class");
         MethodNode init = find(node, "initServer", "()Z");
+        removeDedicatedServerGameTypeOverride(init, properties);
         tryRemoveBooleanFieldBlock(
                 init, properties, "managementServerEnabled", 2, Opcodes.IFEQ);
         removeBooleanFieldBlock(init, properties, "enableQuery", 1, Opcodes.IFEQ);
@@ -9173,6 +9174,66 @@ public final class MinecraftClientPatcher {
         removeNullableFieldBlock(
                 exit, owner, "jsonRpcServer", "Lnet/minecraft/server/jsonrpc/ManagementServer;");
         writeComputeFrames(node, output);
+    }
+
+    /**
+     * Keep the game type serialized by CreateWorldScreen's WorldData.  The
+     * browser worker writes a dedicated server.properties file, but that file
+     * must not replace the selected game type while DedicatedServer initializes
+     * an already-created world.
+     */
+    private static void removeDedicatedServerGameTypeOverride(
+            MethodNode init, String properties) {
+        int removed = 0;
+        for (AbstractInsnNode instruction : init.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKEINTERFACE
+                    || !call.owner.equals("net/minecraft/world/level/storage/WorldData")
+                    || !call.name.equals("setGameType")
+                    || !call.desc.equals("(Lnet/minecraft/world/level/GameType;)V")) {
+                continue;
+            }
+            AbstractInsnNode gameType = previousRealInstruction(call);
+            AbstractInsnNode propertyGet = previousRealInstruction(gameType);
+            AbstractInsnNode propertyField = previousRealInstruction(propertyGet);
+            AbstractInsnNode propertiesObject = previousRealInstruction(propertyField);
+            AbstractInsnNode worldDataField = previousRealInstruction(propertiesObject);
+            AbstractInsnNode receiver = previousRealInstruction(worldDataField);
+            if (!(gameType instanceof TypeInsnNode cast)
+                    || cast.getOpcode() != Opcodes.CHECKCAST
+                    || !cast.desc.equals("net/minecraft/world/level/GameType")
+                    || !(propertyGet instanceof MethodInsnNode get)
+                    || get.getOpcode() != Opcodes.INVOKEVIRTUAL
+                    || !get.owner.equals("net/minecraft/server/dedicated/Settings$MutableValue")
+                    || !get.name.equals("get")
+                    || !get.desc.equals("()Ljava/lang/Object;")
+                    || !(propertyField instanceof FieldInsnNode field)
+                    || field.getOpcode() != Opcodes.GETFIELD
+                    || !field.owner.equals(properties)
+                    || !field.name.equals("gameMode")
+                    || !(propertiesObject instanceof VarInsnNode propertyReceiver)
+                    || propertyReceiver.getOpcode() != Opcodes.ALOAD
+                    || !(worldDataField instanceof FieldInsnNode dataField)
+                    || dataField.getOpcode() != Opcodes.GETFIELD
+                    || !dataField.name.equals("worldData")
+                    || !(receiver instanceof VarInsnNode worldReceiver)
+                    || worldReceiver.getOpcode() != Opcodes.ALOAD) {
+                continue;
+            }
+            // Keep the original receiver/value evaluation and discard both
+            // references.  This preserves the method's existing CFG/frame
+            // shape while removing only the WorldData mutation.
+            InsnList discard = new InsnList();
+            discard.add(new InsnNode(Opcodes.POP));
+            discard.add(new InsnNode(Opcodes.POP));
+            init.instructions.insertBefore(call, discard);
+            init.instructions.remove(call);
+            removed++;
+        }
+        if (removed != 1) {
+            throw new IllegalStateException(
+                    "DedicatedServer game type override patch point changed: " + removed);
+        }
     }
 
     private static void patchDedicatedSettingsBrowser(String jar, Path output)
