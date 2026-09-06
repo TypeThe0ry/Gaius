@@ -11739,7 +11739,7 @@ def check_overlay_bytecode() -> None:
             and "taskWorkDepth" in worldgen_end_task
             and "TModernRuntimeSupport.yieldToEventLoop:(I)V" in worldgen_request_yield
             and "java/lang/Thread.sleep:(J)V" not in worldgen_request_yield
-            and "BrowserIntegratedServerMain.pumpUrgentPackets" in worldgen_request_yield
+            and "BrowserIntegratedServerMain.pumpUrgentPackets" not in worldgen_request_yield
             and "Method networkQueueDepth:()I" in worldgen_request_yield
             and "java/lang/Thread.currentThread:()Ljava/lang/Thread;"
                 not in worldgen_request_yield
