@@ -46,6 +46,18 @@ assert.deepEqual(bytes.get(2).slice(0,864),expected); assert.equal(readbacks,1);
 const scratch = state.bufferCopyScratch;
 run("copyBufferSubData", ["sourceTarget","targetTarget","sourceOffset","targetOffset","size"], [C.COPY_READ_BUFFER,C.COPY_WRITE_BUFFER,200,2000,32]);
 assert.equal(state.bufferCopyScratch,scratch,'small copies reuse scratch');
+// Chrome mining reproduction: 36 unsigned-short indices were staged at a
+// nonzero ring-buffer offset. The rejected 72-byte copy left no visible cracks.
+bytes.get(2).fill(0,0,72);
+const miningIndices=bytes.get(1).slice(15888,15960);
+const miningErrorsBefore=nativeErrors;
+gl.copyBufferSubData(C.COPY_READ_BUFFER,C.COPY_WRITE_BUFFER,15888,0,72);
+assert.equal(nativeErrors,miningErrorsBefore+1);
+assert.deepEqual(bytes.get(2).slice(0,72),new Uint8Array(72));
+run("copyBufferSubData", ["sourceTarget","targetTarget","sourceOffset","targetOffset","size"], [C.COPY_READ_BUFFER,C.COPY_WRITE_BUFFER,15888,0,72]);
+assert.deepEqual(bytes.get(2).slice(0,72),miningIndices,'mining overlay indices must reach the element buffer');
+assert.equal(nativeErrors,miningErrorsBefore+1,'mining copy must avoid another invalid native transfer');
+assert.equal(state.bufferCopyScratch,scratch,'mining copy must reuse bounded scratch');
 state.bufferBytes.set(1,bytes.get(1).slice()); state.bufferShadowTotalBytes=262144; const before=readbacks;
 run("copyBufferSubData", ["sourceTarget","targetTarget","sourceOffset","targetOffset","size"], [C.COPY_READ_BUFFER,C.COPY_WRITE_BUFFER,12000,1000,64]); assert.equal(readbacks,before);
 assert.deepEqual(bytes.get(2).slice(1000,1064),bytes.get(1).slice(12000,12064));
