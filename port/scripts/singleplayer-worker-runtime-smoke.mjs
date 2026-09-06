@@ -2934,6 +2934,15 @@ if (isMainThread && !runtimeSelfTest) {
       protocolReady: protocolReadyAt > 0,
       protocolReadyAt,
       postReadySoak: postReadySoakEvidence(),
+      // A timed-out Worker may no longer answer a telemetry barrier. Preserve
+      // the last received snapshots without delaying termination or presenting
+      // them as freshly sampled at the timeout instant.
+      auxiliaryTelemetrySource: "last-received-before-timeout",
+      chunkPriorityStats: copyObjectSnapshot(latestChunkPriorityStats),
+      networkStats: copyObjectSnapshot(latestNetworkStats),
+      networkStatsMeta: copyObjectSnapshot(latestNetworkStatsMeta),
+      worldgenStats: copyObjectSnapshot(latestWorldgenStats),
+      storageStats: copyObjectSnapshot(latestStorageStats),
       ...(serverTickTelemetryEnabled ? {
         serverTickStats: latestServerTickStats,
         serverTickWindow: serverTickWindow(serverTickWindowStart, latestServerTickWindowEnd),
