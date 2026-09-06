@@ -23,6 +23,9 @@ All notable changes to Gaius are documented here.
 
 ### Fixed
 
+- Include pending transport frames in inbound flow-control watermarks, so a
+  drained decoder slice queue does not resume the relay while thousands of
+  small frames remain queued. Preserve the 4096-frame and 64 MiB hard limits.
 - Give Mob AI checkpoints a separate 8 ms cooperation window, measured from
   the actual continuation resume time. Mob work does not own the worldgen
   task clock; routing every AI stage through its two-pulse network preemption

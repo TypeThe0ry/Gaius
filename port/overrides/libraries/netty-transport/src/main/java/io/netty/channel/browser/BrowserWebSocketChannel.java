@@ -3247,6 +3247,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             const maximumInboundQueueFrames = 4096;
             const decodedSliceHighWatermark = 256;
             const decodedSliceLowWatermark = 64;
+            // Raw WebSocket frames can be split into many decoded slices. Keep frame admission
+            // pressure separate from slice pressure so a backlog of tiny pending frames cannot
+            // resume the remote producer after only the decoded-slice queue drains.
+            const inboundFrameHighWatermark = 1024;
+            const inboundFrameLowWatermark = 256;
             const decoderCumulationPauseBytes = 12 * 1024 * 1024;
             const maximumDecoderCumulationBytes = 16 * 1024 * 1024;
             const inboundSliceBudgetMillis = 2.0;
@@ -3299,7 +3304,8 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               const startedAtMillis = now();
               const sequence = boundedCount(state.stats.highWatermarkEventSequence) + 1;
               const normalizedReason = reason === 'inbound-bytes' ||
-                  reason === 'exact-packet-queue'
+                  reason === 'exact-packet-queue' ||
+                  reason === 'inbound-frame-depth'
                 ? reason
                 : 'inbound-slice-depth';
               state.stats.highWatermarkEventSequence = sequence;
@@ -3443,12 +3449,16 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             function applyFlowControl(entry) {
               if (!entry || entry.disposed) return;
               const depth = workDepth(entry);
+              const frames = queuedFrameCount(entry);
               const bytes = queuedBytes(entry);
-              if (depth >= decodedSliceHighWatermark || bytes >= inboundPauseBytes ||
+              if (frames >= inboundFrameHighWatermark ||
+                  depth >= decodedSliceHighWatermark || bytes >= inboundPauseBytes ||
                   state.exactPacketQueuePaused) {
                 const reason = state.exactPacketQueuePaused
                   ? 'exact-packet-queue'
-                  : depth >= decodedSliceHighWatermark
+                  : frames >= inboundFrameHighWatermark
+                    ? 'inbound-frame-depth'
+                    : depth >= decodedSliceHighWatermark
                     ? 'inbound-slice-depth'
                     : 'inbound-bytes';
                 if (!entry.decodeFlowPaused) {
@@ -3459,6 +3469,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 return;
               }
               if (entry.decodeFlowPaused && !state.exactPacketQueuePaused &&
+                  frames <= inboundFrameLowWatermark &&
                   depth <= decodedSliceLowWatermark && bytes <= inboundResumeBytes) {
                 // Decoder cumulation can be the unfinished tail of a length-prefixed packet.
                 // Pausing the only TCP source until that tail shrinks is a self-deadlock: it

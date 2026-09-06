@@ -49,6 +49,8 @@ function jsBodyBeforeIn(javaSource, marker) {
 assert.match(source, /maximumInboundSliceBytes = 4 \* 1024/);
 assert.match(source, /decodedSliceHighWatermark = 256/);
 assert.match(source, /decodedSliceLowWatermark = 64/);
+assert.match(source, /inboundFrameHighWatermark = 1024/);
+assert.match(source, /inboundFrameLowWatermark = 256/);
 assert.match(source, /decoderCumulationPauseBytes = 12 \* 1024 \* 1024/);
 assert.match(source, /maximumDecoderCumulationBytes = 16 \* 1024 \* 1024/);
 assert.match(source, /MAX_CHUNKS_PER_PUMP = 64/);
@@ -932,6 +934,7 @@ async function waitFor(predicate, label, timeoutMillis = 5000) {
 
 const highWatermarkReasons = new Set([
   "inbound-slice-depth",
+  "inbound-frame-depth",
   "inbound-bytes",
   "exact-packet-queue",
 ]);
@@ -1047,6 +1050,86 @@ port2.on("message", (message) => {
 context.__gaiusLocalServerPorts.set(sessionId, port1);
 bridge.open(socketId, `client-${sessionId}.gaius-local`, 25565);
 
+// A burst of tiny transport frames must remain flow-paused after the decoded-slice queue drains.
+// Exercise the extracted bridge/scheduler functions directly so the frame high/low watermarks
+// are checked against the actual pending+ready queue, rather than a model of the algorithm.
+const backlogSessionId = "9123456789abcdef0123456789abcdef";
+const backlogSocketId = 96;
+const backlogFrameCount = 1100;
+const backlogFlows = [];
+const {port1: backlogPort1, port2: backlogPort2} = new MessageChannel();
+backlogPort1.__gaiusLaunchGeneration = launchGeneration;
+context.__gaiusSingleplayerWorkers.set(backlogSessionId, {
+  __gaiusTerminal: false,
+  __gaiusLaunchGeneration: launchGeneration,
+  __gaiusClientPort: backlogPort1,
+});
+context.__gaiusLocalServerPorts.set(backlogSessionId, backlogPort1);
+backlogPort2.on("message", (message) => {
+  if (message && message.type === "flow") backlogFlows.push(message);
+});
+bridge.open(backlogSocketId, `client-${backlogSessionId}.gaius-local`, 25565);
+const backlogEntry = bridge.channels.get(backlogSocketId);
+for (let index = 0; index < backlogFrameCount; index++) {
+  const frame = new Uint8Array([index & 0xff]);
+  backlogPort2.postMessage(frame.buffer, [frame.buffer]);
+}
+await waitFor(() => stats.receivedFrames >= backlogFrameCount,
+  "tiny-frame backlog admission");
+await waitFor(() => backlogEntry.flowPaused === true,
+  "tiny-frame frame-watermark pause");
+const backlogQueuedFrames = () =>
+  (backlogEntry.inbound.length - backlogEntry.inboundHead) +
+  (backlogEntry.pendingInbound.length - backlogEntry.pendingInboundHead);
+assert.ok(backlogQueuedFrames() >= 1024,
+  "tiny-frame backlog did not retain the independent frame queue pressure");
+let backlogDrained = 0;
+let backlogChecksum = 0;
+const backlogDrainDeadline = Date.now() + 5000;
+while (backlogQueuedFrames() > 256) {
+  assert.equal(backlogEntry.flowPaused, true,
+    "pending frames resumed the producer before reaching the frame low watermark");
+  const chunk = bridge.pollInbound(backlogSocketId);
+  if (chunk) {
+    assert.equal(chunk.byteLength, 1, "tiny-frame backlog changed frame boundaries");
+    assert.equal(chunk[0] & 0xff, backlogDrained & 0xff,
+      "tiny-frame backlog reordered payload bytes");
+    backlogChecksum += chunk[0] & 0xff;
+    backlogDrained++;
+  } else {
+    await delay(0);
+  }
+  assert.ok(Date.now() < backlogDrainDeadline, "tiny-frame backlog failed to drain");
+}
+assert.ok(backlogDrained > 0, "tiny-frame backlog did not expose ready slices");
+assert.equal(backlogEntry.flowPaused, true,
+  "frame-watermark flow resumed before queued frames reached its low watermark");
+while (backlogQueuedFrames() > 0) {
+  const chunk = bridge.pollInbound(backlogSocketId);
+  if (chunk) {
+    assert.equal(chunk.byteLength, 1, "tiny-frame backlog changed frame boundaries");
+    assert.equal(chunk[0] & 0xff, backlogDrained & 0xff,
+      "tiny-frame backlog reordered payload bytes");
+    backlogChecksum += chunk[0] & 0xff;
+    backlogDrained++;
+  } else {
+    await delay(0);
+  }
+  assert.ok(Date.now() < backlogDrainDeadline, "tiny-frame backlog final drain failed");
+}
+await waitFor(() => backlogEntry.flowPaused === false,
+  "tiny-frame frame-watermark resume");
+assert.equal(backlogQueuedFrames(), 0, "tiny-frame backlog lost queue drain accounting");
+assert.equal(backlogDrained, backlogFrameCount, "tiny-frame backlog lost frames");
+assert.equal(backlogChecksum,
+  Array.from({length: backlogFrameCount}, (_unused, index) => index & 0xff)
+    .reduce((sum, value) => sum + value, 0),
+  "tiny-frame backlog reordered or lost payload bytes");
+bridge.close(backlogSocketId);
+backlogPort1.close();
+backlogPort2.close();
+
+const largeFrameStartCount = stats.receivedFrames;
 for (let offset = 0; offset < frameBytes; offset += wireFrameBytes) {
   const fragment = new Uint8Array(wireFrameBytes);
   for (let index = 0; index < fragment.length; index++) {
@@ -1055,7 +1138,7 @@ for (let offset = 0; offset < frameBytes; offset += wireFrameBytes) {
   port2.postMessage(fragment.buffer, [fragment.buffer]);
 }
 
-await waitFor(() => stats.receivedFrames === frameBytes / wireFrameBytes,
+await waitFor(() => stats.receivedFrames === largeFrameStartCount + frameBytes / wireFrameBytes,
   "all 8 MiB protocol-frame fragments");
 await waitFor(() => stats.maxInboundSliceQueue === 256, "256-slice high watermark");
 await waitFor(() => flowControls.some((message) => message.paused === true),
@@ -1572,6 +1655,7 @@ const runtimeHighWatermarkReasons = Array.from(new Set(
 assert.deepEqual(runtimeHighWatermarkReasons, [
   "exact-packet-queue",
   "inbound-bytes",
+  "inbound-frame-depth",
   "inbound-slice-depth",
 ], "runtime flow control did not exercise every exact high-watermark reason");
 
