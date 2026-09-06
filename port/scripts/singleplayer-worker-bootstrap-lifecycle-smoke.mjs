@@ -54,7 +54,14 @@ globalThis.location = new URL("file:///Downloads/singleplayer-server-worker.js")
 globalThis.postMessage = (message, transfer) => parentPort.postMessage(message, transfer || []);
 globalThis.close = () => parentPort.postMessage({type: "harness-close"});
 globalThis.importScripts = () => {};
-globalThis.main = () => {};
+// This is the actual bootstrap launch boundary.  The event records the value
+// seen by main(), rather than proving the diagnostic-config branch by source
+// text alone.  The parent sends diagnostic-config before start below, so a
+// true value here proves the pre-start dispatch order and the live handler.
+globalThis.main = () => parentPort.postMessage({
+  type: "main-start-observed",
+  serverTickTelemetryEnabled: globalThis.__gaiusServerTickTelemetryEnabled === true,
+});
 globalThis.__gaiusStartIntegratedServerPump = () => {};
 globalThis.setIntegratedServerDistances = (viewDistance, simulationDistance) => {
   parentPort.postMessage({
@@ -368,7 +375,11 @@ invalidGenerationChannel.port2.close();
 await invalidGenerationWorker.terminate();
 
 // Configuration sent before start must survive the bootstrap handshake.
-worker.postMessage({type: "diagnostic-config", gaiusSlowProbeTelemetry: true});
+worker.postMessage({
+  type: "diagnostic-config",
+  gaiusSlowProbeTelemetry: true,
+  gaiusServerTickTelemetry: true,
+});
 
 worker.postMessage({
   type: "start",
@@ -395,6 +406,9 @@ activeChannel.port2.start();
 worker.postMessage({type: "attach-port", sessionId, port: activeChannel.port1},
   [activeChannel.port1]);
 await waitFor("port-attached");
+const mainStartObserved = await waitFor("main-start-observed");
+assert.equal(mainStartObserved.serverTickTelemetryEnabled, true,
+  "bootstrap main() did not observe server tick telemetry enabled by pre-start diagnostic-config");
 await waitFor("runtime-ready");
 
 async function requestDiagnosticSnapshot() {

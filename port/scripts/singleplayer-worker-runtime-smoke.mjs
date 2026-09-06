@@ -3521,6 +3521,9 @@ if (isMainThread && !runtimeSelfTest) {
       finish(code === 0 ? 1 : code);
     }
   });
+  if (serverTickTelemetryEnabled) {
+    worker.postMessage({type: "diagnostic-config", gaiusServerTickTelemetry: true});
+  }
   worker.postMessage({
     type: "start",
     worldId: "gaius-node-runtime-smoke",
@@ -3533,7 +3536,6 @@ if (isMainThread && !runtimeSelfTest) {
     storageDatabaseName: storageConfig.storageDatabaseName,
     storagePrefix: storageConfig.storagePrefix,
     storageOpfsDirectory: storageConfig.storageOpfsDirectory,
-    gaiusServerTickTelemetry: serverTickTelemetryEnabled,
     renderDistance: 8,
     simulationDistance: 5,
     distanceRampIntervalMillis: distanceRampIntervalMillis === undefined
