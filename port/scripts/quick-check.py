@@ -5957,17 +5957,23 @@ def check_source_patches() -> None:
                 for marker in (
                     "ChunkGenerationTask.runUntilWait",
                     "ChunkGenerationTask.waitForScheduledLayer",
-                    "patchRunUntilWaitActiveGate",
-                    "activeResume",
+                    "patchRunUntilWaitYieldGate",
+                    "freshReturn",
+                    "noFreshYield",
+                    "method.instructions.insertBefore(activeResume, freshReturn)",
                     "replaceChunkGenerationScheduleLayer(",
                     "BROWSER_HOLDERS_PER_TURN = 16",
                     "ChunkGenerationTask.canLoadWithoutGeneration",
                 )
             )
-            and "BROWSER_LAYER_YIELD" not in minecraft_262_browser_patcher
-            and "CHUNK_GENERATION_YIELD" not in minecraft_262_browser_patcher
-            and "BrowserChunkGenerationYield" not in minecraft_262_browser_patcher
-            and "Platform.schedule" not in minecraft_262_browser_patcher
+            and "BROWSER_LAYER_YIELD" in minecraft_262_browser_patcher
+            and "CHUNK_GENERATION_YIELD" in minecraft_262_browser_patcher
+            and "BrowserChunkGenerationYield" in minecraft_262_browser_patcher
+            and "Platform.schedule" in minecraft_262_browser_patcher
+            and "writeChunkGenerationYieldHelper" in minecraft_262_browser_patcher
+            and minecraft_262_browser_patcher.count(
+                'Opcodes.INVOKESTATIC, "org/teavm/platform/Platform", "schedule"'
+            ) == 1
             and "BrowserWorldgenScheduler" in minecraft_262_browser_patcher
             and "browserWorldgenCheckpoint" in client_patcher
             and "browserWorldgenBeginTaskWork" in client_patcher
@@ -12145,14 +12151,24 @@ def check_overlay_bytecode() -> None:
                     ) == 1
                     and "browserLayerX" in generation_schedule_layer
                     and "browserLayerZ" in generation_schedule_layer
-                    and "browserLayerYield" not in generation_schedule_layer
-                    and "BrowserChunkGenerationYield" not in generation_schedule_layer
-                    and "org/teavm/platform/Platform.schedule" not in generation_schedule_layer
-                    and "java/util/concurrent/CompletableFuture" not in generation_schedule_layer
+                    and "browserLayerYield" in generation_schedule_layer
+                    and "BrowserChunkGenerationYield" in generation_schedule_layer
+                    and generation_schedule_layer.count(
+                        "org/teavm/platform/Platform.schedule"
+                    ) == 1
+                    and "java/util/concurrent/CompletableFuture" in generation_schedule_layer
                     and "// int 16" in generation_schedule_layer
                     and "if_icmplt" in generation_schedule_layer
                     and "Exception table:" in generation_schedule_layer
                     and "Field browserLayerActive" in generation_schedule_layer
+                    and "Field browserLayerYield" in generation_run_until_wait
+                    and "Method java/util/concurrent/CompletableFuture.isDone:()Z"
+                        in generation_run_until_wait
+                    and 0 <= generation_run_until_wait.find(
+                        "Field browserLayerYield"
+                    ) < generation_run_until_wait.find(
+                        "BrowserWorldgenScheduler.pulse"
+                    )
                     and generation_can_load_without_generation.count(
                         "BrowserWorldgenScheduler.pulse"
                     ) == 2
