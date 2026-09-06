@@ -966,6 +966,15 @@ try {
   });
   assert.doesNotMatch(deepWorldgenBytecode, /BrowserWorldgenScheduler/,
     "deep worldgen bytecode must contain zero scheduler calls");
+  const noiseChunkBytecode = execFileSync(javap, [
+    "-classpath", clientJar, "-p", "-c", "net.minecraft.world.level.levelgen.NoiseChunk",
+  ], {encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30_000});
+  assert.equal(occurrences(noiseChunkBytecode, "BrowserNoiseGraphMapper.mapRouter:"), 1,
+    "NoiseChunk router must use one per-invocation graph mapper");
+  assert.equal(occurrences(noiseChunkBytecode, "BrowserNoiseGraphMapper.map:"), 7,
+    "NoiseChunk density and climate wrapping must deduplicate before recursion");
+  assert.doesNotMatch(noiseChunkBytecode, /(?:DensityFunction|NoiseRouter)\.mapAll:/,
+    "NoiseChunk wrapping still uses repeated recursive traversal");
 
   const bytecode = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
     "net.minecraft.server.level.ChunkGenerationTask",

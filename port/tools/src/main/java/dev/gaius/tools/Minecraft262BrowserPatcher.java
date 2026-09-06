@@ -6,6 +6,7 @@ import java.nio.file.Path;
 import java.util.zip.ZipFile;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.Handle;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
@@ -14,6 +15,7 @@ import org.objectweb.asm.tree.FieldNode;
 import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.IntInsnNode;
+import org.objectweb.asm.tree.InvokeDynamicInsnNode;
 import org.objectweb.asm.tree.JumpInsnNode;
 import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.LdcInsnNode;
@@ -75,6 +77,7 @@ public final class Minecraft262BrowserPatcher {
         patchStagingBuffer(jar, root);
         patchUberGpuBufferNodeCleanup(jar, root);
         patchTemplateSource(jar, root);
+        patchNoiseChunkGraphMapper(jar, root);
         patchRemoteFriendList(jar, root);
         patchNativeModuleLister(jar, root);
         patchMacosUtil(jar, root);
@@ -86,6 +89,88 @@ public final class Minecraft262BrowserPatcher {
         patchIdentifierResolveAgainst(jar, root);
         patchCopyOnWriteFileSystem(jar, root);
         patchCopyOnWriteProvider(jar, root);
+    }
+
+    private static void patchNoiseChunkGraphMapper(String jar, Path root) throws IOException {
+        String owner = "net/minecraft/world/level/levelgen/NoiseChunk";
+        Path output = root.resolve(owner + ".class");
+        ClassNode node;
+        if (Files.exists(output)) {
+            node = new ClassNode();
+            new ClassReader(Files.readAllBytes(output)).accept(node, 0);
+        } else {
+            node = read(jar, owner + ".class");
+        }
+        int routerRewrites = 0;
+        int densityRewrites = 0;
+        for (MethodNode method : node.methods) {
+            for (AbstractInsnNode instruction : method.instructions.toArray()) {
+                if (!(instruction instanceof MethodInsnNode call)
+                        || (call.getOpcode() != Opcodes.INVOKEINTERFACE
+                            && call.getOpcode() != Opcodes.INVOKEVIRTUAL)
+                        || !call.owner.equals("net/minecraft/world/level/levelgen/NoiseRouter")
+                        || !call.name.equals("mapAll")) {
+                    if (instruction instanceof MethodInsnNode call2
+                            && (call2.getOpcode() == Opcodes.INVOKEINTERFACE
+                                || call2.getOpcode() == Opcodes.INVOKEVIRTUAL)
+                            && call2.owner.equals("net/minecraft/world/level/levelgen/DensityFunction")
+                            && call2.name.equals("mapAll")) {
+                        requireNoiseChunkWrapVisitor(method, call2, owner);
+                        call2.setOpcode(Opcodes.INVOKESTATIC);
+                        call2.owner = "net/minecraft/world/level/levelgen/BrowserNoiseGraphMapper";
+                        call2.name = "map";
+                        call2.desc = "(Lnet/minecraft/world/level/levelgen/DensityFunction;"
+                                + "Lnet/minecraft/world/level/levelgen/DensityFunction$Visitor;)"
+                                + "Lnet/minecraft/world/level/levelgen/DensityFunction;";
+                        call2.itf = false;
+                        densityRewrites++;
+                    }
+                    continue;
+                }
+                requireNoiseChunkWrapVisitor(method, call, owner);
+                call.setOpcode(Opcodes.INVOKESTATIC);
+                call.owner = "net/minecraft/world/level/levelgen/BrowserNoiseGraphMapper";
+                call.name = "mapRouter";
+                call.desc = "(Lnet/minecraft/world/level/levelgen/NoiseRouter;"
+                        + "Lnet/minecraft/world/level/levelgen/DensityFunction$Visitor;)"
+                        + "Lnet/minecraft/world/level/levelgen/NoiseRouter;";
+                call.itf = false;
+                routerRewrites++;
+            }
+        }
+        if (routerRewrites != 1 || densityRewrites != 7) {
+            throw new IllegalStateException(
+                    "NoiseChunk graph mapper callsites changed: router=" + routerRewrites
+                            + ", density=" + densityRewrites + " (expected 1,7)");
+        }
+        System.out.println("NoiseChunk graph mapper rewrites: router=" + routerRewrites
+                + ", density=" + densityRewrites);
+        // Receiver becomes the first static argument: stack shape and existing
+        // control flow are unchanged, including all preceding overlay patches.
+        write(node, output);
+    }
+
+    private static void requireNoiseChunkWrapVisitor(
+            MethodNode method, MethodInsnNode call, String owner) {
+        AbstractInsnNode previous = previousOpcode(call);
+        if (!(previous instanceof InvokeDynamicInsnNode factory)
+                || !factory.desc.equals("(L" + owner + ";)"
+                        + "Lnet/minecraft/world/level/levelgen/DensityFunction$Visitor;")
+                || factory.bsmArgs.length < 2
+                || !(factory.bsmArgs[1] instanceof Handle target)
+                || !target.getOwner().equals(owner)
+                || !target.getName().equals("wrap")
+                || !target.getDesc().equals(
+                        "(Lnet/minecraft/world/level/levelgen/DensityFunction;)"
+                                + "Lnet/minecraft/world/level/levelgen/DensityFunction;")) {
+            throw new IllegalStateException(
+                    "NoiseChunk graph mapping visitor changed in " + method.name);
+        }
+        String result = call.owner;
+        if (!call.desc.equals("(Lnet/minecraft/world/level/levelgen/DensityFunction$Visitor;)L"
+                + result + ";")) {
+            throw new IllegalStateException("NoiseChunk mapAll descriptor changed in " + method.name);
+        }
     }
 
     private static void patchChunkGenerationCooperation(String jar, Path root)

@@ -133,6 +133,12 @@ jobs:
             --profile "$GAIUS_VERSION_PROFILE_PATH" \
             --require-local
 
+      - name: Verify Minecraft 26.2 noise graph mapping
+        if: matrix.profile == '26.2'
+        run: |
+          node port/scripts/noise-graph-mapper-smoke.mjs
+          node port/scripts/noise-graph-mapper-smoke.mjs --real
+
       - name: Build profile-scoped TeaVM release
         id: compile
         run: |
