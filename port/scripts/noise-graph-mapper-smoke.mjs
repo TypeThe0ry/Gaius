@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
-import {mkdir, mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
-import {tmpdir} from 'node:os';
+import {mkdir, mkdtemp, readFile, readdir, rm, writeFile} from 'node:fs/promises';
+import {homedir, tmpdir} from 'node:os';
 import {delimiter, join, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
-const positional = process.argv.slice(2).filter(value => value !== '--real');
+const positional = process.argv.slice(2).filter(value => value !== '--real' && value !== '--teavm');
 const helper = resolve(positional[0] || join(root,
   'port/overrides/client/src/versions/26.2/java/net/minecraft/world/level/levelgen/BrowserNoiseGraphMapper.java'));
 const fixture = resolve(positional[1] || join(root, 'port/scripts/fixtures/NoiseGraphMapperFixture.java'));
@@ -101,6 +101,42 @@ public final class NoiseRouter {
     await writeFile(path, content);
     files.push(path);
   }
+  if (process.argv.includes('--teavm')) {
+    const repository = process.env.M2_REPO || join(homedir(), '.m2', 'repository');
+    const jars = [];
+    for (const artifact of await readdir(join(repository, 'org', 'teavm'))) {
+      const directory = join(repository, 'org', 'teavm', artifact, '0.15.0');
+      try {
+        for (const name of await readdir(directory)) {
+          if (name.endsWith('.jar') && !name.includes('-sources') && !name.includes('-javadoc')) jars.push(join(directory, name));
+        }
+      } catch { /* only installed TeaVM 0.15 artifacts */ }
+    }
+    assert.ok(jars.some(name => name.includes('teavm-tooling')), 'TeaVM tooling is required for --teavm');
+    const compiler = join(temp, 'CompileNoiseFixture.java');
+    await writeFile(compiler, `import java.io.File; import org.teavm.backend.javascript.JSModuleType; import org.teavm.tooling.TeaVMTool;
+public class CompileNoiseFixture { public static void main(String[] args) throws Exception {
+TeaVMTool tool = new TeaVMTool(); tool.setMainClass("net.minecraft.world.level.levelgen.NoiseGraphMapperFixture");
+tool.setTargetDirectory(new File(args[0])); tool.setTargetFileName("fixture.cjs"); tool.setJsModuleType(JSModuleType.COMMON_JS);
+tool.setObfuscated(false); tool.setClassLoader(ClassLoader.getSystemClassLoader()); tool.generate();
+for (var problem : tool.getProblemProvider().getSevereProblems()) System.err.println(problem.getText());
+if (!tool.getProblemProvider().getSevereProblems().isEmpty()) throw new AssertionError("TeaVM compilation failed"); }}
+`);
+    const javaSuffix = process.platform === 'win32' ? '.exe' : '';
+    const cp = [temp, ...jars].join(delimiter);
+    execFileSync(process.env.JAVA_HOME ? join(process.env.JAVA_HOME, 'bin', `javac${javaSuffix}`) : 'javac',
+      ['--release', '21', '-cp', cp, '-d', temp, ...files, compiler], {stdio: 'pipe'});
+    const java = process.env.JAVA_HOME ? join(process.env.JAVA_HOME, 'bin', `java${javaSuffix}`) : 'java';
+    execFileSync(java, ['-cp', cp, 'CompileNoiseFixture', temp], {encoding: 'utf8', timeout: 120000});
+    const runner = join(temp, 'run.cjs');
+    await writeFile(runner, `require('./fixture.cjs').main([], function(error) { if (error) { console.error(error); process.exit(1); }
+console.log('TEAVM_NOISE_GRAPH_MAPPER_OK'); process.exit(0); });
+`);
+    const output = execFileSync(process.execPath, [runner], {encoding: 'utf8', timeout: 15000});
+    assert.match(output, /^NOISE_GRAPH_MAPPER_OK compute=26\.0 min=26\.0 max=26\.0 apply=4 noise=1\s*$/m);
+    assert.match(output, /TEAVM_NOISE_GRAPH_MAPPER_OK/);
+    console.log('TEAVM_NOISE_GRAPH_MAPPER_OK');
+  } else {
   const javaSuffix = process.platform === 'win32' ? '.exe' : '';
   execFileSync(process.env.JAVA_HOME ? join(process.env.JAVA_HOME, 'bin', `javac${javaSuffix}`) : 'javac',
     ['--release', '21', '-d', temp, ...files], {stdio: 'pipe'});
@@ -109,6 +145,7 @@ public final class NoiseRouter {
     {encoding: 'utf8', timeout: 15000});
   assert.match(output.trim(), /^NOISE_GRAPH_MAPPER_OK compute=/);
   console.log(output.trim());
+  }
 } finally {
   await rm(temp, {recursive: true, force: true});
 }
