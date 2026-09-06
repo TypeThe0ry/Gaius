@@ -102,6 +102,9 @@ jobs:
           set -euo pipefail
           mvn -B -q dependency:get -Dartifact=org.teavm:teavm-core:0.15.0 -Dtransitive=false
           mvn -B -q dependency:get -Dartifact=org.teavm:teavm-relocated-libs-rhino:0.15.0 -Dtransitive=false
+          mvn -B -q dependency:get -Dartifact=org.teavm:teavm-tooling:0.15.0
+          mvn -B -q dependency:get -Dartifact=org.teavm:teavm-classlib:0.15.0
+          node port/scripts/browser-gzip-coroutine-smoke.mjs
           node port/scripts/teavm-jsbody-parser-smoke.mjs \
             port/src/main/java/dev/gaius/browser/BrowserWorldgenScheduler.java \
             port/src/main/java/dev/gaius/browser/BrowserHttpProxy.java \
