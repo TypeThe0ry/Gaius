@@ -9,8 +9,12 @@ try {
   const diagnosticUrl = new URL(String(root.location?.href || ""), "http://gaius.invalid/");
   root.__gaiusMobAiTelemetry = root.__gaiusMobAiTelemetry === true ||
     diagnosticUrl.searchParams.get("gaiusMobAiTelemetry") === "1";
+  root.__gaiusServerTickTelemetryEnabled =
+    root.__gaiusServerTickTelemetryEnabled === true ||
+    diagnosticUrl.searchParams.get("gaiusServerTickTelemetry") === "1";
 } catch (_) {
   root.__gaiusMobAiTelemetry = false;
+  root.__gaiusServerTickTelemetryEnabled = false;
 }
 if (typeof Error === "function" && (!Error.stackTraceLimit || Error.stackTraceLimit < 100)) {
   Error.stackTraceLimit = 100;
@@ -413,6 +417,7 @@ function observeTelemetryMeasurement(value) {
     ? Number(previousWorldgenStats?.mobAiMaxPulses) || 0
     : 0;
   root.__gaiusWorldgenStats = {};
+  root.__gaiusServerTickTelemetry = {};
   if (previousMobAiPulses > 0) {
     root.__gaiusWorldgenStats.mobAiPulses = previousMobAiPulses;
   }
@@ -468,6 +473,9 @@ root.onmessage = async (event) => {
   if (message && message.type === "diagnostic-config") {
     if (message.gaiusMobAiTelemetry === true) {
       root.__gaiusMobAiTelemetry = true;
+    }
+    if (message.gaiusServerTickTelemetry === true) {
+      root.__gaiusServerTickTelemetryEnabled = true;
     }
     return;
   }
@@ -868,6 +876,18 @@ function handleControlMessage(event) {
       worldgen: snapshotScalarTelemetry(root.__gaiusWorldgenStats, [
         "mobAiPulses",
         "mobAiMaxPulses",
+      ]),
+      serverTick: snapshotScalarTelemetry(root.__gaiusServerTickTelemetry, [
+        "schemaVersion",
+        "tickCount",
+        "intervalCount",
+        "completedTickCount",
+        "lastTickIntervalMillis",
+        "maxTickIntervalMillis",
+        "totalTickIntervalMillis",
+        "lastTickDurationMillis",
+        "maxTickDurationMillis",
+        "totalTickDurationMillis",
       ]),
       storage: snapshotMeasurementTelemetry(
         storageStats,

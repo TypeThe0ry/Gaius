@@ -63,6 +63,10 @@ for (const contract of [
   "configuredWorkerUrl.protocol !== 'blob:'",
   "type: 'diagnostic-config'",
   "gaiusMobAiTelemetry: true",
+  "gaiusServerTickTelemetry",
+  "message.serverTick",
+  "worker.__gaiusTelemetryServerTick",
+  "state.serverTick = copyScalarTelemetry(worker.__gaiusTelemetryServerTick)",
 ]) {
   assert.ok(source.includes(contract), `missing session contract: ${contract}`);
 }

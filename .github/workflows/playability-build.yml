@@ -97,6 +97,22 @@ jobs:
           java-version: ${{ matrix.java }}
           cache: maven
 
+      - name: Check changed browser JavaScript with the TeaVM parser
+        run: |
+          set -euo pipefail
+          mvn -B -q dependency:get -Dartifact=org.teavm:teavm-core:0.15.0 -Dtransitive=false
+          mvn -B -q dependency:get -Dartifact=org.teavm:teavm-relocated-libs-rhino:0.15.0 -Dtransitive=false
+          node port/scripts/teavm-jsbody-parser-smoke.mjs \
+            port/src/main/java/dev/gaius/browser/BrowserWorldgenScheduler.java \
+            port/src/main/java/dev/gaius/browser/BrowserHttpProxy.java \
+            port/src/main/java/dev/gaius/browser/BrowserSingleplayerClient.java \
+            port/src/main/java/dev/gaius/browser/BrowserBlockBreakingTelemetry.java \
+            port/src/main/java/dev/gaius/browser/BrowserGuiEntityTelemetry.java \
+            port/overrides/libraries/slf4j/src/main/java/org/slf4j/impl/BrowserLogger.java
+          node port/scripts/block-breaking-telemetry-smoke.mjs
+          node port/scripts/server-tick-telemetry-smoke.mjs
+          node port/scripts/singleplayer-client-session-smoke.mjs
+
       - name: Fetch and verify local Minecraft inputs
         run: |
           set -euo pipefail

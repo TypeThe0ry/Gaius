@@ -299,6 +299,9 @@ public final class MinecraftClientPatcher {
                     "net/minecraft/client/renderer/MappableRingBuffer.class"));
             patchStagedVertexBufferGpuPoolCache(args[0], root.resolve(
                     "net/minecraft/client/renderer/StagedVertexBuffer$GpuBufferPool.class"));
+            patchInventoryAvatarRenderTelemetry(args[0], root);
+            patchGuiEntitySubmitTelemetry(args[0], root.resolve(
+                    "net/minecraft/client/gui/GuiGraphicsExtractor.class"));
         }
         patchGlDevice(args[0], root);
         patchGlConstWebGLTextureFormats(args[0], root.resolve(
@@ -1507,6 +1510,137 @@ public final class MinecraftClientPatcher {
         replaceGuiItemRenderStateDebugName(method);
         method.maxStack = Math.max(method.maxStack, 6);
         writeComputeFrames(node, outputRoot.resolve(entry));
+    }
+
+    /** Adds opt-in probes at the real 26.2 inventory -> avatar renderer boundary. */
+    private static void patchInventoryAvatarRenderTelemetry(String jar, Path outputRoot)
+            throws IOException {
+        ClassNode inventory = read(jar, "net/minecraft/client/gui/screens/inventory/InventoryScreen.class");
+        MethodNode extract = find(inventory, "extractRenderState",
+                "(Lnet/minecraft/world/entity/LivingEntity;)"
+                        + "Lnet/minecraft/client/renderer/entity/state/EntityRenderState;");
+        int rendererCalls = 0;
+        int stateCalls = 0;
+        for (AbstractInsnNode instruction = extract.instructions.getFirst();
+                instruction != null; instruction = instruction.getNext()) {
+            if (!(instruction instanceof MethodInsnNode call)) {
+                continue;
+            }
+            if (call.owner.equals("net/minecraft/client/renderer/entity/EntityRenderDispatcher")
+                    && call.name.equals("getRenderer")) {
+                InsnList probe = new InsnList();
+                probe.add(new InsnNode(Opcodes.DUP));
+                probe.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                        "dev/gaius/browser/BrowserGuiEntityTelemetry", "renderer",
+                        "(Ljava/lang/Object;)V", false));
+                extract.instructions.insert(call, probe);
+                rendererCalls++;
+            } else if (call.owner.equals("net/minecraft/client/renderer/entity/EntityRenderer")
+                    && call.name.equals("createRenderState")) {
+                InsnList probe = new InsnList();
+                probe.add(new InsnNode(Opcodes.DUP));
+                probe.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                        "dev/gaius/browser/BrowserGuiEntityTelemetry", "state",
+                        "(Ljava/lang/Object;)V", false));
+                extract.instructions.insert(call, probe);
+                stateCalls++;
+            }
+        }
+        if (rendererCalls != 1 || stateCalls != 1) {
+            throw new IllegalStateException("26.2 inventory avatar telemetry points changed: renderer="
+                    + rendererCalls + " state=" + stateCalls);
+        }
+        writeComputeFrames(inventory, outputRoot.resolve(
+                "net/minecraft/client/gui/screens/inventory/InventoryScreen.class"));
+
+        ClassNode avatar = read(jar, "net/minecraft/client/renderer/entity/player/AvatarRenderer.class");
+        MethodNode avatarExtract = find(avatar, "extractRenderState",
+                "(Lnet/minecraft/world/entity/Avatar;"
+                        + "Lnet/minecraft/client/renderer/entity/state/AvatarRenderState;F)V");
+        int skinCalls = 0;
+        for (AbstractInsnNode instruction = avatarExtract.instructions.getFirst();
+                instruction != null; instruction = instruction.getNext()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.owner.equals("net/minecraft/client/entity/ClientAvatarEntity")
+                    && call.name.equals("getSkin")) {
+                InsnList probe = new InsnList();
+                probe.add(new InsnNode(Opcodes.DUP));
+                probe.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                        "dev/gaius/browser/BrowserGuiEntityTelemetry", "skin",
+                        "(Ljava/lang/Object;)V", false));
+                avatarExtract.instructions.insert(call, probe);
+                skinCalls++;
+            }
+        }
+        if (skinCalls != 1) {
+            throw new IllegalStateException("26.2 avatar skin telemetry point changed: " + skinCalls);
+        }
+
+        MethodNode texture = find(avatar, "getTextureLocation",
+                "(Lnet/minecraft/client/renderer/entity/state/AvatarRenderState;)"
+                        + "Lnet/minecraft/resources/Identifier;");
+        InsnList stateProbe = new InsnList();
+        stateProbe.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        stateProbe.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserGuiEntityTelemetry", "avatarState",
+                "(Ljava/lang/Object;)V", false));
+        texture.instructions.insert(stateProbe);
+        int textureReturns = 0;
+        for (AbstractInsnNode instruction = texture.instructions.getFirst();
+                instruction != null; instruction = instruction.getNext()) {
+            if (instruction.getOpcode() == Opcodes.ARETURN) {
+                InsnList probe = new InsnList();
+                probe.add(new InsnNode(Opcodes.DUP));
+                probe.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                        "dev/gaius/browser/BrowserGuiEntityTelemetry", "texture",
+                        "(Ljava/lang/Object;)V", false));
+                texture.instructions.insertBefore(instruction, probe);
+                textureReturns++;
+            }
+        }
+        if (textureReturns != 1) {
+            throw new IllegalStateException("26.2 avatar texture return point changed: " + textureReturns);
+        }
+        writeComputeFrames(avatar, outputRoot.resolve(
+                "net/minecraft/client/renderer/entity/player/AvatarRenderer.class"));
+    }
+
+    private static void patchGuiEntitySubmitTelemetry(String jar, Path output)
+            throws IOException {
+        // patchGuiGraphicsBrowserItemCache runs earlier and writes this same class.
+        // Consume that output so the entity probe cannot erase the item-cache patch.
+        ClassNode node = Files.exists(output)
+                ? read(output)
+                : read(jar, "net/minecraft/client/gui/GuiGraphicsExtractor.class");
+        MethodNode entity = find(node, "entity",
+                "(Lnet/minecraft/client/renderer/entity/state/EntityRenderState;F"
+                        + "Lorg/joml/Vector3fc;Lorg/joml/Quaternionfc;Lorg/joml/Quaternionfc;IIII)V");
+        InsnList probe = new InsnList();
+        probe.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserGuiEntityTelemetry", "submit", "()V", false));
+        insertAtStart(entity, probe);
+        entity.maxStack = Math.max(entity.maxStack, 1);
+        writeComputeFrames(node, output);
+        ClassNode result = read(output);
+        boolean hasEntityProbe = result.methods.stream()
+                .filter(method -> method.name.equals("entity") && method.desc.equals(entity.desc))
+                .flatMap(method -> java.util.stream.StreamSupport.stream(
+                        java.util.Spliterators.spliteratorUnknownSize(
+                                method.instructions.iterator(), 0), false))
+                .anyMatch(instruction -> instruction instanceof MethodInsnNode call
+                        && call.owner.equals("dev/gaius/browser/BrowserGuiEntityTelemetry")
+                        && call.name.equals("submit"));
+        boolean hasItemCache = result.methods.stream()
+                .flatMap(method -> java.util.stream.StreamSupport.stream(
+                        java.util.Spliterators.spliteratorUnknownSize(
+                                method.instructions.iterator(), 0), false))
+                .anyMatch(instruction -> instruction instanceof MethodInsnNode call
+                        && call.owner.equals("dev/gaius/browser/BrowserGuiItemCache")
+                        && call.name.equals("guiState"));
+        if (!hasEntityProbe || !hasItemCache) {
+            throw new IllegalStateException("GuiGraphicsExtractor composition lost: entityProbe="
+                    + hasEntityProbe + " itemCache=" + hasItemCache);
+        }
     }
 
     private static void replaceGuiItemRenderStateDebugName(MethodNode method) {
@@ -5183,7 +5317,19 @@ public final class MinecraftClientPatcher {
             throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/multiplayer/ClientLevel.class");
         patchClientLevelBrowserAnimateTickBudget(node);
+        patchClientLevelBrowserBlockBreakingTelemetry(node);
         write(node, output);
+    }
+
+    private static void patchClientLevelBrowserBlockBreakingTelemetry(ClassNode node) {
+        MethodNode method = find(node, "destroyBlockProgress",
+                "(ILnet/minecraft/core/BlockPos;I)V");
+        InsnList call = new InsnList();
+        call.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        call.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserBlockBreakingTelemetry",
+                "recordDestroyProgress", "(I)V", false));
+        method.instructions.insert(call);
     }
 
     private static void patchClientLevelBrowserAnimateTickBudget(ClassNode node) {
@@ -5211,7 +5357,48 @@ public final class MinecraftClientPatcher {
         patchLevelRendererBrowserPrepareChunkRenders(node);
         patchLevelRendererBrowserSectionCompileThrottle(node);
         patchLevelRendererBrowserBlockOutlineOpacity(node);
+        patchLevelRendererBrowserBlockBreakingTelemetry(node);
         writeComputeFrames(node, output);
+    }
+
+    private static void patchLevelRendererBrowserBlockBreakingTelemetry(ClassNode node) {
+        MethodNode method = node.methods.stream()
+                .filter(candidate -> candidate.name.equals("submitBlockDestroyAnimation")
+                        && candidate.desc.equals("(Lcom/mojang/blaze3d/vertex/PoseStack;"
+                                + "Lnet/minecraft/client/renderer/SubmitNodeCollector;"
+                                + "Lnet/minecraft/client/renderer/state/level/LevelRenderState;)V"))
+                .findFirst()
+                .orElseGet(() -> node.methods.stream()
+                        .filter(candidate -> candidate.name.equals("destroyBlockProgress")
+                                && candidate.desc.equals("(ILnet/minecraft/core/BlockPos;I)V"))
+                        .findFirst()
+                        .orElseThrow(() -> new IllegalStateException(
+                                "LevelRenderer block-breaking render method was not found")));
+        InsnList call = new InsnList();
+        call.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserBlockBreakingTelemetry",
+                "recordSubmitPass", "()V", false));
+        method.instructions.insert(call);
+        int actualSubmits = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode submit
+                    && submit.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && submit.owner.equals("net/minecraft/client/renderer/SubmitNodeCollector")
+                    && submit.name.equals("submitBreakingBlockModel")
+                    && submit.desc.equals("(Lcom/mojang/blaze3d/vertex/PoseStack;"
+                            + "Ljava/util/List;I)V")) {
+                InsnList actual = new InsnList();
+                actual.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                        "dev/gaius/browser/BrowserBlockBreakingTelemetry",
+                        "recordActualSubmit", "()V", false));
+                method.instructions.insertBefore(submit, actual);
+                actualSubmits++;
+            }
+        }
+        if (method.name.equals("submitBlockDestroyAnimation") && actualSubmits != 1) {
+            throw new IllegalStateException(
+                    "LevelRenderer breaking-model submit shape changed: " + actualSubmits);
+        }
     }
 
     private static void patchEntityRenderDispatcherBrowserNullEntityGuard(String jar, Path output)
@@ -5649,6 +5836,7 @@ public final class MinecraftClientPatcher {
                 node,
                 "extract",
                 "(Lnet/minecraft/client/DeltaTracker;Lnet/minecraft/client/Camera;F)V");
+        patchCurrentLevelExtractorBlockBreakingTelemetry(node);
         int patched = 0;
         for (AbstractInsnNode instruction : extract.instructions.toArray()) {
             if (!(instruction instanceof MethodInsnNode add)
@@ -5740,6 +5928,44 @@ public final class MinecraftClientPatcher {
         }
         writeComputeFrames(node, output);
         System.out.println("Patched current section extraction with dirty-preserving backpressure");
+    }
+
+    private static void patchCurrentLevelExtractorBlockBreakingTelemetry(ClassNode node) {
+        MethodNode method = node.methods.stream()
+                .filter(candidate -> candidate.name.equals("extractBlockDestroyAnimation")
+                        && candidate.desc.equals("(Lnet/minecraft/client/Camera;"
+                                + "Lnet/minecraft/client/renderer/state/level/LevelRenderState;)V"))
+                .findFirst()
+                .orElse(null);
+        if (method == null) {
+            return;
+        }
+        InsnList entry = new InsnList();
+        entry.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserBlockBreakingTelemetry",
+                "recordExtraction", "()V", false));
+        method.instructions.insert(entry);
+
+        int added = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode add)
+                    || add.getOpcode() != Opcodes.INVOKEINTERFACE
+                    || !add.owner.equals("java/util/List")
+                    || !add.name.equals("add")
+                    || !add.desc.equals("(Ljava/lang/Object;)Z")) {
+                continue;
+            }
+            InsnList emitted = new InsnList();
+            emitted.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                    "dev/gaius/browser/BrowserBlockBreakingTelemetry",
+                    "recordEmitted", "()V", false));
+            method.instructions.insertBefore(add, emitted);
+            added++;
+        }
+        if (added != 1) {
+            throw new IllegalStateException(
+                    "Block-breaking extraction list shape changed: " + added);
+        }
     }
 
     private static AbstractInsnNode findPreviousNew(
@@ -14815,6 +15041,24 @@ public final class MinecraftClientPatcher {
                 false);
     }
 
+    private static MethodInsnNode browserServerTickTelemetryBegin() {
+        return new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserWorldgenScheduler",
+                "beginServerTickTelemetry",
+                "()V",
+                false);
+    }
+
+    private static MethodInsnNode browserServerTickTelemetryEnd() {
+        return new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserWorldgenScheduler",
+                "endServerTickTelemetry",
+                "()V",
+                false);
+    }
+
     private static void requireWorldgenSchedulerCalls(
             String label, MethodNode method, int expectedCalls) {
         int pulses = 0;
@@ -16694,6 +16938,7 @@ public final class MinecraftClientPatcher {
         boolean patchedInitialSpawn = false;
         boolean patchedRunServerReady = false;
         boolean patchedRunServerTickYield = false;
+        boolean patchedRunServerTickTelemetry = false;
         boolean patchedRunServerStopDiagnostics = false;
         boolean patchedRunServerBrowserCatchupReset = false;
         boolean patchedRunServerStoppedSignal = false;
@@ -16969,9 +17214,12 @@ public final class MinecraftClientPatcher {
                         // Start the scheduler clock immediately before active tick work, then
                         // checkpoint after that work. This excludes the inter-tick idle gap
                         // without resetting the cumulative budget between chunk tasks.
+                        method.instructions.insertBefore(instruction, browserServerTickTelemetryBegin());
                         method.instructions.insertBefore(instruction, browserWorldgenBeginServerWorkTurn());
+                        method.instructions.insert(instruction, browserServerTickTelemetryEnd());
                         method.instructions.insert(instruction, browserWorldgenCheckpoint());
                         patchedRunServerTickYield = true;
+                        patchedRunServerTickTelemetry = true;
                         break;
                     }
                 }
@@ -17007,6 +17255,7 @@ public final class MinecraftClientPatcher {
                 || !patchedInitialSpawn
                 || !patchedRunServerReady
                 || !patchedRunServerTickYield
+                || !patchedRunServerTickTelemetry
                 || !patchedRunServerStopDiagnostics
                 || !patchedRunServerBrowserCatchupReset
                 || !patchedRunServerStoppedSignal

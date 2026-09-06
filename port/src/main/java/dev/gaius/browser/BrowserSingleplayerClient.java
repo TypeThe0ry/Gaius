@@ -366,9 +366,15 @@ public final class BrowserSingleplayerClient {
                 resolvedWorkerUrl;
               try {
                 const pageUrl = new URL(location.href);
-                if (pageUrl.searchParams.get('gaiusMobAiTelemetry') === '1') {
+                if (pageUrl.searchParams.get('gaiusMobAiTelemetry') === '1' ||
+                    pageUrl.searchParams.get('gaiusServerTickTelemetry') === '1') {
                   if (!globalThis.__gaiusSingleplayerWorkerUrl) {
-                    resolvedWorkerUrl.searchParams.set('gaiusMobAiTelemetry', '1');
+                    if (pageUrl.searchParams.get('gaiusMobAiTelemetry') === '1') {
+                      resolvedWorkerUrl.searchParams.set('gaiusMobAiTelemetry', '1');
+                    }
+                    if (pageUrl.searchParams.get('gaiusServerTickTelemetry') === '1') {
+                      resolvedWorkerUrl.searchParams.set('gaiusServerTickTelemetry', '1');
+                    }
                     workerUrl = resolvedWorkerUrl;
                   } else {
                     const configuredWorkerUrl = new URL(
@@ -378,7 +384,12 @@ public final class BrowserSingleplayerClient {
                     // Blob URLs are opaque object handles; adding a query to
                     // one would create a different, invalid object URL.
                     if (configuredWorkerUrl.protocol !== 'blob:') {
-                      configuredWorkerUrl.searchParams.set('gaiusMobAiTelemetry', '1');
+                      if (pageUrl.searchParams.get('gaiusMobAiTelemetry') === '1') {
+                        configuredWorkerUrl.searchParams.set('gaiusMobAiTelemetry', '1');
+                      }
+                      if (pageUrl.searchParams.get('gaiusServerTickTelemetry') === '1') {
+                        configuredWorkerUrl.searchParams.set('gaiusServerTickTelemetry', '1');
+                      }
                       workerUrl = configuredWorkerUrl;
                     }
                   }
@@ -387,11 +398,22 @@ public final class BrowserSingleplayerClient {
               worker = new Worker(workerUrl, {name: 'Gaius Integrated Server'});
               try {
                 const diagnosticUrl = new URL(location.href);
-                if (diagnosticUrl.searchParams.get('gaiusMobAiTelemetry') === '1') {
-                  worker.postMessage({
-                    type: 'diagnostic-config',
-                    gaiusMobAiTelemetry: true,
-                  });
+                if (diagnosticUrl.searchParams.get('gaiusMobAiTelemetry') === '1' ||
+                    diagnosticUrl.searchParams.get('gaiusServerTickTelemetry') === '1') {
+                  if (diagnosticUrl.searchParams.get('gaiusMobAiTelemetry') === '1') {
+                    worker.postMessage({
+                      type: 'diagnostic-config',
+                      gaiusMobAiTelemetry: true,
+                      gaiusServerTickTelemetry:
+                        diagnosticUrl.searchParams.get('gaiusServerTickTelemetry') === '1',
+                    });
+                  } else {
+                    worker.postMessage({
+                      type: 'diagnostic-config',
+                      gaiusMobAiTelemetry: false,
+                      gaiusServerTickTelemetry: true,
+                    });
+                  }
                 }
               } catch (ignored) {}
               worker.__gaiusLaunchGeneration = launchGeneration;
@@ -485,6 +507,7 @@ public final class BrowserSingleplayerClient {
               worker.__gaiusTelemetryNetwork = {};
               worker.__gaiusTelemetryGlobalPump = {};
               worker.__gaiusTelemetryWorldgen = {};
+              worker.__gaiusTelemetryServerTick = {};
               worker.__gaiusTelemetryStorage = {};
               const telemetryPercentile = function(histogram, count, fraction) {
                 if (!histogram || count <= 0) return 0;
@@ -553,6 +576,7 @@ public final class BrowserSingleplayerClient {
                   worker.__gaiusTelemetryGlobalPump
                 );
                 state.worldgen = copyScalarTelemetry(worker.__gaiusTelemetryWorldgen);
+                state.serverTick = copyScalarTelemetry(worker.__gaiusTelemetryServerTick);
                 state.storage = copyScalarTelemetry(worker.__gaiusTelemetryStorage);
                 state.updatedAt = Date.now();
               };
@@ -581,6 +605,7 @@ public final class BrowserSingleplayerClient {
                 worker.__gaiusTelemetryNetwork = {};
                 worker.__gaiusTelemetryGlobalPump = {};
                 worker.__gaiusTelemetryWorldgen = {};
+                worker.__gaiusTelemetryServerTick = {};
                 worker.__gaiusTelemetryStorage = {};
                 publishWorkerTelemetry();
               };
@@ -704,6 +729,7 @@ public final class BrowserSingleplayerClient {
                   message.globalPump
                 );
                 worker.__gaiusTelemetryWorldgen = copyScalarTelemetry(message.worldgen);
+                worker.__gaiusTelemetryServerTick = copyScalarTelemetry(message.serverTick);
                 worker.__gaiusTelemetryStorage = copyScalarTelemetry(message.storage);
                 publishWorkerTelemetry();
               };

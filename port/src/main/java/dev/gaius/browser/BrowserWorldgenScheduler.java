@@ -137,7 +137,7 @@ public final class BrowserWorldgenScheduler {
               Number(globalThis.__gaiusSlowProbeHolderCapacity) || 256)));
             let ring = root.chunkHolderProbe;
             if (!ring || ring.capacity !== capacity) {
-              ring = root.chunkHolderProbe = {capacity, entries: [], writeIndex: 0, count: 0};
+              ring = root.chunkHolderProbe = {capacity: capacity, entries: [], writeIndex: 0, count: 0};
             }
             const entry = {
               status: String(status), x: x | 0, z: z | 0,
@@ -232,6 +232,63 @@ public final class BrowserWorldgenScheduler {
                 false,
                 activeWorkElapsedMillis);
     }
+
+    /** Starts an opt-in measurement of one integrated-server tick. */
+    public static void beginServerTickTelemetry() {
+        recordServerTickBegin(nowMillis());
+    }
+
+    /** Completes the opt-in measurement started immediately before a tick. */
+    public static void endServerTickTelemetry() {
+        recordServerTickEnd(nowMillis());
+    }
+
+    @JSBody(params = "startedAt", script = """
+            try {
+              if (globalThis.__gaiusServerTickTelemetryEnabled !== true) return;
+              const stats = globalThis.__gaiusServerTickTelemetry ||
+                (globalThis.__gaiusServerTickTelemetry = {});
+              const now = Number(startedAt) || 0;
+              const previous = Number(stats.lastTickStartedAtMillis);
+              stats.schemaVersion = 1;
+              stats.tickCount = (Number(stats.tickCount) || 0) + 1;
+              if (Number.isFinite(previous) && previous > 0 && now >= previous) {
+                const interval = now - previous;
+                stats.intervalCount = (Number(stats.intervalCount) || 0) + 1;
+                stats.lastTickIntervalMillis = interval;
+                stats.maxTickIntervalMillis = Math.max(
+                  Number(stats.maxTickIntervalMillis) || 0, interval);
+                stats.totalTickIntervalMillis =
+                  (Number(stats.totalTickIntervalMillis) || 0) + interval;
+              }
+              stats.lastTickStartedAtMillis = now;
+            } catch (_) {
+              // Optional diagnostics must never perturb server ticks.
+            }
+            """)
+    private static native void recordServerTickBegin(double startedAt);
+
+    @JSBody(params = "endedAt", script = """
+            try {
+              if (globalThis.__gaiusServerTickTelemetryEnabled !== true) return;
+              const stats = globalThis.__gaiusServerTickTelemetry ||
+                (globalThis.__gaiusServerTickTelemetry = {});
+              const started = Number(stats.lastTickStartedAtMillis);
+              const ended = Number(endedAt) || 0;
+              if (Number.isFinite(started) && started > 0 && ended >= started) {
+                const duration = ended - started;
+                stats.completedTickCount = (Number(stats.completedTickCount) || 0) + 1;
+                stats.lastTickDurationMillis = duration;
+                stats.maxTickDurationMillis = Math.max(
+                  Number(stats.maxTickDurationMillis) || 0, duration);
+                stats.totalTickDurationMillis =
+                  (Number(stats.totalTickDurationMillis) || 0) + duration;
+              }
+            } catch (_) {
+              // Optional diagnostics must never perturb server ticks.
+            }
+            """)
+    private static native void recordServerTickEnd(double endedAt);
 
     /**
      * Enters a world-generation task scope.  Scopes are deliberately nestable:

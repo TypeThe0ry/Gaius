@@ -735,6 +735,54 @@ try {
     encoding: "utf8", timeout: 30_000,
   });
 
+  // Verify the client crack overlay probe was inserted into the actual ASM
+  // methods, rather than merely checking source names or patcher strings.
+  const patchedClientLevel = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
+    "net.minecraft.client.multiplayer.ClientLevel"], {
+      encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
+    });
+  const patchedLevelExtractor = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
+    "net.minecraft.client.renderer.extract.LevelExtractor"], {
+      encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
+    });
+  const patchedLevelRenderer = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
+    "net.minecraft.client.renderer.LevelRenderer"], {
+      encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
+    });
+  assert.equal(occurrences(method(patchedClientLevel,
+    "public void destroyBlockProgress(int, net.minecraft.core.BlockPos, int);",
+    "private void"), "BrowserBlockBreakingTelemetry.recordDestroyProgress"), 1,
+  "ASM patch did not instrument ClientLevel.destroyBlockProgress");
+  if (patchedLevelExtractor.includes("private void extractBlockDestroyAnimation(")) {
+    assert.equal(occurrences(method(patchedLevelExtractor,
+      "private void extractBlockDestroyAnimation(", "private void extractBlockOutline("),
+      "BrowserBlockBreakingTelemetry.recordExtraction"), 1,
+    "ASM patch did not instrument LevelExtractor extraction");
+    assert.equal(occurrences(method(patchedLevelExtractor,
+      "private void extractBlockDestroyAnimation(", "private void extractBlockOutline("),
+      "BrowserBlockBreakingTelemetry.recordEmitted"), 1,
+    "ASM patch did not instrument breaking-state emission");
+  }
+  const breakingMethod = patchedLevelRenderer.includes(
+    "private void submitBlockDestroyAnimation(")
+    ? "private void submitBlockDestroyAnimation("
+    : "public void destroyBlockProgress(";
+  assert.ok(patchedLevelRenderer.includes(breakingMethod),
+    "patched LevelRenderer has no block-breaking render method");
+  const patchedBreakingMethod = method(patchedLevelRenderer, breakingMethod,
+    "private void submitBlockOutline(");
+  assert.equal(occurrences(patchedBreakingMethod,
+    "BrowserBlockBreakingTelemetry.recordSubmitPass"), 1,
+  "ASM patch did not instrument LevelRenderer submit pass");
+  if (breakingMethod.startsWith("private void submitBlockDestroyAnimation(")) {
+    assert.equal(occurrences(patchedBreakingMethod,
+      "SubmitNodeCollector.submitBreakingBlockModel"), 1,
+    "LevelRenderer breaking-model callsite is missing");
+    assert.equal(occurrences(patchedBreakingMethod,
+      "BrowserBlockBreakingTelemetry.recordActualSubmit"), 1,
+    "ASM patch did not instrument actual breaking-model submission");
+  }
+
   const verifierClasspath = [asm, asmTree, asmAnalysis].join(delimiter);
   execFileSync(javac, [
     "--release", "21", "-proc:none", "-classpath", verifierClasspath,
@@ -1035,14 +1083,27 @@ try {
     "scheduleLayer must not synthesize a future continuation");
   const runServer = method(bytecode, "protected void runServer", "private void");
   const tickStart = runServer.indexOf("BrowserWorldgenScheduler.beginServerWorkTurn");
+  const tickTelemetryStart = runServer.indexOf(
+    "BrowserWorldgenScheduler.beginServerTickTelemetry",
+  );
   const processTick = runServer.indexOf("processPacketsAndTick");
+  const tickTelemetryEnd = runServer.indexOf(
+    "BrowserWorldgenScheduler.endServerTickTelemetry",
+  );
   const tickCheckpoint = runServer.indexOf("BrowserWorldgenScheduler.checkpoint");
   assert.equal(occurrences(runServer, "BrowserWorldgenScheduler.beginServerWorkTurn"), 1,
     "runServer must reset the scheduler clock exactly once per tick");
   assert.equal(occurrences(runServer, "BrowserWorldgenScheduler.checkpoint"), 1,
     "runServer must checkpoint exactly once per tick");
+  assert.equal(occurrences(runServer, "BrowserWorldgenScheduler.beginServerTickTelemetry"), 1,
+    "runServer must begin one opt-in server tick measurement per tick");
+  assert.equal(occurrences(runServer, "BrowserWorldgenScheduler.endServerTickTelemetry"), 1,
+    "runServer must end one opt-in server tick measurement per tick");
   assert.ok(tickStart >= 0 && processTick > tickStart && tickCheckpoint > processTick,
     "server tick must reset before processPacketsAndTick and checkpoint after it");
+  assert.ok(tickTelemetryStart >= 0 && tickTelemetryStart < processTick
+      && tickTelemetryEnd > processTick,
+    "server tick telemetry must bracket processPacketsAndTick");
   const pollTask = method(bytecode, "protected boolean pollTask();", "private boolean pollTaskInternal");
   assert.equal(occurrences(pollTask, "BrowserWorldgenScheduler.beginTaskWork"), 1,
     "MinecraftServer.pollTask must enter one active-work task scope");
