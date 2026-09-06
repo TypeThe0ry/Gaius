@@ -3703,7 +3703,11 @@ if (isMainThread && !runtimeSelfTest) {
       cpuProfileSession.connect();
       cpuProfileMetadata = {phase: data.phase, path: data.path};
       cpuProfileStarted = inspectorPost(cpuProfileSession, "Profiler.enable")
-        .then(() => inspectorPost(cpuProfileSession, "Profiler.start"));
+        .then(async () => {
+          cpuProfileMetadata.startBeforeWorkerMillis = performance.now();
+          await inspectorPost(cpuProfileSession, "Profiler.start");
+          cpuProfileMetadata.startAfterWorkerMillis = performance.now();
+        });
       return;
     }
     if (data && data.type === "node-cpu-profile-stop") {
@@ -3763,8 +3767,25 @@ async function stopWorkerCpuProfile(session, started, metadata) {
       throw new Error("Worker CPU profile stop arrived before start");
     }
     await started;
+    const stopBeforeWorkerMillis = performance.now();
     const result = await inspectorPost(session, "Profiler.stop");
+    const stopAfterWorkerMillis = performance.now();
     fs.writeFileSync(metadata.path, JSON.stringify(result.profile));
+    // The profiler and performance.now() use different origins. Command brackets
+    // bound their offset; consumers must retain the uncertainty when matching a
+    // sampled CPU interval to a worldgen probe's Worker timestamps.
+    const timing = {
+      schema: "gaius.worker-cpu-profile-clock.v1",
+      profilePath: metadata.path,
+      workerTimeOriginMillis: performance.timeOrigin,
+      startBeforeWorkerMillis: metadata.startBeforeWorkerMillis,
+      startAfterWorkerMillis: metadata.startAfterWorkerMillis,
+      stopBeforeWorkerMillis,
+      stopAfterWorkerMillis,
+      profileStartMicros: result.profile.startTime,
+      profileEndMicros: result.profile.endTime,
+    };
+    fs.writeFileSync(metadata.path + ".timing.json", JSON.stringify(timing, null, 2));
     parentPort.postMessage({
       type: "node-cpu-profile-written",
       phase: metadata.phase,
@@ -3773,6 +3794,7 @@ async function stopWorkerCpuProfile(session, started, metadata) {
       samples: result.profile.samples?.length || 0,
       startTime: result.profile.startTime,
       endTime: result.profile.endTime,
+      timing,
     });
   } catch (error) {
     parentPort.postMessage({
