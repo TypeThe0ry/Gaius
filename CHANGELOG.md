@@ -23,6 +23,13 @@ All notable changes to Gaius are documented here.
 
 ### Fixed
 
+- Give Mob AI checkpoints a separate 8 ms cooperation window, measured from
+  the actual continuation resume time. Mob work does not own the worldgen
+  task clock; routing every AI stage through its two-pulse network preemption
+  path introduced repeated waits. AI stages and the existing continuation
+  cleanup remain unchanged. Full rebuilt-profile playability checks are pending.
+- Preserve the singleplayer world's selected game mode when starting the
+  server Worker instead of replacing it with the dedicated-server default.
 - Index ZIP resource names once per open archive and limit resource listing to
   matching prefixes, preserving archive order, overlay paths, and lazy reads.
   This removes repeated full-archive scans observed during multiplayer loading;

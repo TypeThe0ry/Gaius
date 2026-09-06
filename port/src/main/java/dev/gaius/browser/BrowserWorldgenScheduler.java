@@ -68,6 +68,9 @@ public final class BrowserWorldgenScheduler {
     // contract; this per-yield value keeps checkpoint-only telemetry scoped to
     // the checkpoint that produced it.
     private static int maxReentrantYieldDepthInYield;
+    // Mob AI is not wrapped in a worldgen task scope, so its CPU time cannot use
+    // the task active-work clock.  Keep a separate monotonic hook window instead.
+    private static double mobAiNextYieldAtMillis;
     private static boolean networkPreemptionPending;
     private static boolean yieldActive;
     private static boolean deferredYield;
@@ -599,7 +602,15 @@ public final class BrowserWorldgenScheduler {
      */
     public static void mobAiPulse() {
         recordMobAiPulse();
-        pulse();
+        double now = nowMillis();
+        if (now < mobAiNextYieldAtMillis) {
+            return;
+        }
+        mobAiNextYieldAtMillis = now + DEFAULT_SLICE_MILLIS;
+        requestYield(YIELD_DEADLINE, networkQueueDepth());
+        // requestYield resumes the same continuation after the event-loop turn.
+        // Start the next Mob window from the actual resume time, not the old call time.
+        mobAiNextYieldAtMillis = nowMillis() + DEFAULT_SLICE_MILLIS;
     }
 
     /**

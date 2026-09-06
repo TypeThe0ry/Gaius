@@ -60,6 +60,22 @@ const constants = {
   distanceManagerMax: numericConstant("MAX_DISTANCE_MANAGER_UPDATE_BUDGET"),
 };
 
+const mobPulseStart = worldgen.indexOf("public static void mobAiPulse()");
+const mobPulseEnd = worldgen.indexOf("/**\n     * Entity-tick fallback", mobPulseStart);
+assert.ok(mobPulseStart >= 0 && mobPulseEnd > mobPulseStart,
+  "missing bounded Mob AI pulse implementation");
+const mobPulse = worldgen.slice(mobPulseStart, mobPulseEnd);
+assert.ok(mobPulse.includes("recordMobAiPulse();")
+    && mobPulse.includes("mobAiNextYieldAtMillis")
+    && mobPulse.includes("now < mobAiNextYieldAtMillis")
+    && mobPulse.includes("now + DEFAULT_SLICE_MILLIS")
+    && mobPulse.includes("requestYield(YIELD_DEADLINE, networkQueueDepth());")
+    && mobPulse.includes("mobAiNextYieldAtMillis = nowMillis() + DEFAULT_SLICE_MILLIS;"),
+  "Mob AI pulse is missing its independent monotonic yield window");
+assert.doesNotMatch(mobPulse, /pulse\(\);/,
+  "Mob AI pulse must not re-enter the worldgen pulse/network preemption path");
+
+
 assert.ok(worldgen.includes("TModernRuntimeSupport.yieldToEventLoop(0)"),
   "worldgen yield still requests a clamp-prone positive timer");
 assert.ok(worldgen.includes("public static void beginServerWorkTurn()")
@@ -1578,10 +1594,58 @@ function selectJavac() {
   throw new Error("worldgen scheduler smoke requires javac 21 or newer");
 }
 
+function selectJava() {
+  const javac = selectJavac();
+  const javaName = process.platform === "win32" ? "java.exe" : "java";
+  const java = path.join(path.dirname(javac), javaName);
+  const probe = spawnSync(java, ["-version"], {encoding: "utf8"});
+  if (probe.status !== 0) {
+    throw new Error(`matching Java runtime unavailable: ${java}`);
+  }
+  return java;
+}
+
 async function minimalJavaCompile() {
   const root = await mkdtemp(path.join(tmpdir(), "gaius-worldgen-scheduler-"));
   const files = new Map([
     ["dev/gaius/browser/BrowserWorldgenScheduler.java", worldgen],
+    ["dev/gaius/browser/MobAiWindowHarness.java", `
+package dev.gaius.browser;
+public final class MobAiWindowHarness {
+    private static double clock;
+    private static double mobAiNextYieldAtMillis;
+    private static int records;
+    private static int yields;
+    private static boolean yieldActive;
+    private static final int YIELD_DEADLINE = 0;
+    private static final double DEFAULT_SLICE_MILLIS = 8.0;
+    private static double nowMillis() { return clock; }
+    private static int networkQueueDepth() { return 0; }
+    private static void recordMobAiPulse() { records++; }
+    private static void requestYield(int reason, int depth) {
+        yields++;
+        if (!yieldActive) {
+            yieldActive = true;
+            clock += 1.0;
+            mobAiPulse();
+            clock += 99.0;
+            yieldActive = false;
+        }
+    }
+${mobPulse.replace("public static void mobAiPulse()", "static void mobAiPulse()")}
+    public static void main(String[] args) {
+        mobAiPulse();
+        if (records != 2 || yields != 1) throw new AssertionError("initial window/reentrant pulse");
+        clock = 101.0; mobAiPulse();
+        if (records != 3 || yields != 1) throw new AssertionError("sub-window yielded");
+        clock = 108.0; mobAiPulse();
+        if (records != 5 || yields != 2) throw new AssertionError("window boundary");
+        clock = 215.0; mobAiPulse();
+        if (records != 6 || yields != 2) throw new AssertionError("post-resume window");
+        System.out.println("MOB_AI_WINDOW_OK records=" + records + " yields=" + yields);
+    }
+}
+`],
     ["dev/gaius/browser/BrowserPacketScheduler.java", `
 package dev.gaius.browser;
 final class BrowserPacketScheduler {
@@ -1642,6 +1706,12 @@ public @interface JSBody {
       "-d", classes,
       ...[...files.keys()].map(relative => path.join(root, "src", relative)),
     ], {encoding: "utf8", timeout: 30_000});
+    const harnessOutput = execFileSync(selectJava(), [
+      "-cp", classes, "dev.gaius.browser.MobAiWindowHarness",
+    ], {encoding: "utf8", timeout: 30_000});
+    assert.match(harnessOutput, /MOB_AI_WINDOW_OK records=6 yields=2/,
+      "production Mob AI pulse did not pass its executable Java fixture");
+    process.stdout.write(harnessOutput);
   } finally {
     await rm(root, {recursive: true, force: true});
   }
