@@ -150,6 +150,7 @@ jobs:
       - name: Verify artifact identity and runtime smoke
         env:
           GAIUS_SMOKE_MAX_GAMEPLAY_STALL_MS: "500"
+          GAIUS_SMOKE_SERVER_TICK_TELEMETRY: "1"
         run: |
           set -euo pipefail
           python3 port/scripts/quick-check.py 2>&1 | tee release-evidence/quick-check.log
