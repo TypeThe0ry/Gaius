@@ -23,6 +23,10 @@ All notable changes to Gaius are documented here.
 
 ### Fixed
 
+- Batch adjacent ordinary PLAY packets into bounded 16 KiB WebSocket messages
+  within the relay's existing 32-packet drain budget. Preserve packet order,
+  send ownership, keepalive and configuration boundaries, and expose separate
+  packet and WebSocket message counters.
 - Start Minecraft 1.21.11 chunk-holder continuations inside a TeaVM thread,
   preserving the runtime context needed when future completion resumes work
   that can suspend. Keep the existing synchronous world-generation boundaries.

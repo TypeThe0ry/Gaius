@@ -1157,19 +1157,30 @@ async function testFramedPlayKeepAlive(bridgePort, fixturePort) {
         "server framed WebSocket low-water drain",
     );
     await waitFor(
-        () => serverFrames.length >= serverFramesBeforeBackpressure + backpressureFrameCount,
-        "server framed WebSocket messages after low-water drain",
+        () => Buffer.concat(serverFrames.slice(serverFramesBeforeBackpressure)).byteLength >=
+            backpressureBurst.byteLength,
+        "server framed WebSocket bytes after low-water drain",
     );
     const drainedServerFrames = serverFrames.slice(serverFramesBeforeBackpressure);
-    if (drainedServerFrames.length !== backpressureFrameCount ||
-        !Buffer.concat(drainedServerFrames).equals(backpressureBurst)) {
+    const drainedServerBytes = Buffer.concat(drainedServerFrames);
+    if (drainedServerFrames.length <= 0 ||
+        drainedServerFrames.length >= backpressureFrameCount ||
+        !drainedServerBytes.equals(backpressureBurst)) {
         throw new Error(`RelayNode did not preserve framed server bytes across backpressure: ` +
             `frames=${drainedServerFrames.length}/${backpressureFrameCount} ` +
-            `bytes=${Buffer.concat(drainedServerFrames).byteLength}/${backpressureBurst.byteLength}`);
+            `bytes=${drainedServerBytes.byteLength}/${backpressureBurst.byteLength}`);
     }
     const drainedServerHash = createHash("sha256")
-        .update(Buffer.concat(drainedServerFrames))
+        .update(drainedServerBytes)
         .digest("hex");
+    console.log(JSON.stringify({
+        kind: "relay-batching-burst",
+        protocol: minecraftProfile.protocolVersion,
+        minecraftPackets: backpressureFrameCount,
+        webSocketMessages: drainedServerFrames.length,
+        bytes: drainedServerBytes.byteLength,
+        sha256: drainedServerHash,
+    }));
     if (drainedServerHash !== backpressureExpectedHash ||
         (drainedServerRuntime.serverFrameBytesSent ?? 0) -
             (serverBackpressureBefore.serverFrameBytesSent ?? 0) !== backpressureBurst.byteLength ||
