@@ -6096,10 +6096,21 @@ def check_source_patches() -> None:
                     'Opcodes.GETFIELD, CHUNK_POS, "x", "I"',
                     'Opcodes.GETFIELD, CHUNK_POS, "z", "I"',
                     '"org/teavm/platform/Platform"',
-                    '"schedule"',
+                    '"startThread"',
+                    '"org/teavm/platform/PlatformRunnable"',
+                    '"(Lorg/teavm/platform/PlatformRunnable;)V"',
                     '"Ljava/util/concurrent/CompletableFuture;"',
                 )
             )
+            # The class still legitimately contains scheduleLayer/scheduleNextLayer
+            # method names. Inspect every Platform static call instead of matching
+            # source line wrapping, and reject any raw Platform.schedule fallback.
+            and re.findall(
+                r'\bOpcodes\.INVOKESTATIC\s*,\s*'
+                r'"org/teavm/platform/Platform"\s*,\s*"([^"]+)"\s*,\s*'
+                r'"([^"]+)"',
+                minecraft_12111_browser_patcher,
+            ) == [("startThread", "(Lorg/teavm/platform/PlatformRunnable;)V")]
             and "BrowserWorldgenScheduler" not in minecraft_12111_browser_patcher
             and '"pulse"' not in minecraft_12111_browser_patcher
             and '"checkpoint"' not in minecraft_12111_browser_patcher
