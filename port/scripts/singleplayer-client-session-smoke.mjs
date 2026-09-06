@@ -67,6 +67,22 @@ for (const contract of [
   "message.serverTick",
   "worker.__gaiusTelemetryServerTick",
   "state.serverTick = copyScalarTelemetry(worker.__gaiusTelemetryServerTick)",
+  "private static final int READY_POLL_LIMIT = 7_200",
+  "const STARTUP_INITIAL_DEADLINE_MS = 60000",
+  "const STARTUP_PROGRESS_GRACE_MS = 30000",
+  "const STARTUP_ABSOLUTE_DEADLINE_MS = 180000",
+  "globalThis.__gaiusSingleplayerFailures",
+  "const rememberStartupFailure = function(detail)",
+  "const recordStartupProgress = function(kind, detail, counters)",
+  "const recordTelemetryProgress = function(message)",
+  "const armStartupWatchdog = function()",
+  "A heartbeat proves transport only",
+  "private static native String reportAttachFailure(",
+  "return String(remembered && remembered.detail ? remembered.detail : detail)",
+  "worker.__gaiusStartupSeenPhases",
+  "Math.max(",
+  "future-pump-waiting",
+  "startup.future-pump.tasks",
 ]) {
   assert.ok(source.includes(contract), `missing session contract: ${contract}`);
 }
@@ -109,7 +125,7 @@ assert.ok(attachFailure.indexOf("cancelClientHandoff(sessionId, launchGeneration
   attachFailure.indexOf("requestWorkerStop(sessionId, launchGeneration)"),
   "attach failure did not clear handoff before targeted Worker stop");
 assert.ok(attachFailure.indexOf("requestWorkerStop(sessionId, launchGeneration)") <
-  attachFailure.indexOf("minecraft.gaius$setScreen(new TitleScreen())"),
+  attachFailure.indexOf("minecraft.gaius$setScreen(new DisconnectedScreen("),
   "attach failure did not stop its Worker before returning to the title screen");
 
 const ports = new Map();
@@ -191,7 +207,7 @@ function extractBody(marker) {
     "private static native int localWorkerState(String sessionId, String launchGeneration);",
   );
   const reportScript = extractBody(
-    "private static native void reportAttachFailure(\n            String sessionId,\n            String launchGeneration,\n            String detail);",
+    "private static native String reportAttachFailure(\n            String sessionId,\n            String launchGeneration,\n            String detail);",
   );
   const cancelScript = extractBody(
     "private static native void cancelClientHandoff(String sessionId, String launchGeneration);",
@@ -260,7 +276,9 @@ const launchStart = source.indexOf('"""', launchAnnotation) + 3;
 const launchScriptEnd = source.lastIndexOf('""")', launchEnd);
 assert.ok(launchEnd > 0 && launchAnnotation > 0 && launchScriptEnd > launchStart,
   "launchWorker JSBody could not be extracted");
-const launchScript = source.slice(launchStart, launchScriptEnd);
+// Java text blocks preserve a regex backslash as `\\d`; normalize that one
+// Java escape for the VM fixture, which executes the extracted JS directly.
+const launchScript = source.slice(launchStart, launchScriptEnd).replace(/\\\\d/g, "\\d");
 
 function createLaunchRuntime(failureMode, options = {}) {
   const channels = [];
@@ -462,6 +480,120 @@ function createLaunchRuntime(failureMode, options = {}) {
   worker.terminate();
 }
 
+// Startup watchdog: no progress expires the 60 s initial bound, while a
+// strictly advancing startup counter renews only the bounded 30 s grace.
+{
+  const runtime = createLaunchRuntime(null, {captureTimers: true});
+  const sessionId = runtime.context.launchWorker("world", true, 6, 4);
+  const worker = runtime.createdWorkers[0];
+  assert.ok(worker.__gaiusHandoffTimeout, "startup watchdog was not armed");
+  worker.__gaiusStartupInactivityDeadlineAt = 0;
+  worker.__gaiusStartupAbsoluteDeadlineAt = Date.now() + 180000;
+  worker.__gaiusHandoffTimeout.callback();
+  assert.equal(worker.terminated, true,
+    "watchdog did not terminate a no-progress Worker");
+  assert.equal(runtime.context.__gaiusSingleplayerWorkers.has(sessionId), false,
+    "watchdog left the failed Worker in the active map");
+  const failureKey = sessionId + ":" + worker.__gaiusLaunchGeneration;
+  const failure = runtime.context.__gaiusSingleplayerFailures.get(failureKey);
+  assert.ok(failure && /watchdog expired/.test(failure.detail),
+    "watchdog failure was not retained after Worker deletion");
+}
+
+{
+  const runtime = createLaunchRuntime(null, {captureTimers: true});
+  const sessionId = runtime.context.launchWorker("world", true, 6, 4);
+  const worker = runtime.createdWorkers[0];
+  const now = Date.now();
+  worker.__gaiusStartupStartedAt = now - 1000;
+  worker.__gaiusStartupInactivityDeadlineAt = now + 59000;
+  worker.__gaiusStartupAbsoluteDeadlineAt = now + 120000;
+  const before = worker.__gaiusStartupInactivityDeadlineAt;
+  worker.onmessage({data: {type: "server-startup-progress", detail: "block-states-cached=29184"}});
+  const renewed = worker.__gaiusStartupInactivityDeadlineAt;
+  assert.ok(renewed >= before,
+    "first startup progress shortened the initial 60 second window");
+  worker.onmessage({data: {type: "server-startup-progress", detail: "block-states-cached=29184"}});
+  assert.equal(worker.__gaiusStartupInactivityDeadlineAt, renewed,
+    "repeated identical startup progress incorrectly renewed the grace");
+  worker.__gaiusStartupInactivityDeadlineAt = Date.now() + 1000;
+  worker.__gaiusTelemetryPending.set(2, Date.now());
+  worker.onmessage({data: {
+    type: "telemetry-pong",
+    sessionId,
+    sequence: 2,
+    measurementId: "",
+    network: {packets: 0},
+  }});
+  assert.ok(worker.__gaiusStartupInactivityDeadlineAt <= Date.now() + 1100,
+    "initial zero telemetry counter incorrectly renewed the grace");
+  worker.__gaiusStartupInactivityDeadlineAt = Date.now() + 1000;
+  worker.__gaiusTelemetryPending.set(3, Date.now());
+  worker.onmessage({data: {
+    type: "telemetry-pong",
+    sessionId,
+    sequence: 3,
+    measurementId: "",
+    network: {packets: 1},
+  }});
+  const counterRenewed = worker.__gaiusStartupInactivityDeadlineAt;
+  assert.ok(counterRenewed > Date.now() + 500,
+    "first telemetry counter did not renew the inactivity grace");
+  worker.__gaiusStartupInactivityDeadlineAt = Date.now() + 1000;
+  worker.onmessage({data: {
+    type: "server-startup-progress",
+    detail: "future-pump-waiting polls=11 tasks=0 emptyYields=11 queue=0",
+  }});
+  const futureWaitDeadline = worker.__gaiusStartupInactivityDeadlineAt;
+  worker.onmessage({data: {
+    type: "server-startup-progress",
+    detail: "future-pump-waiting polls=12 tasks=0 emptyYields=12 queue=0",
+  }});
+  assert.equal(worker.__gaiusStartupInactivityDeadlineAt, futureWaitDeadline,
+    "stuck future-pump polls incorrectly renewed the grace");
+  worker.__gaiusStartupInactivityDeadlineAt = Date.now() + 1000;
+  worker.onmessage({data: {
+    type: "server-startup-progress",
+    detail: "future-pump-waiting polls=13 tasks=1 emptyYields=13 queue=0",
+  }});
+  assert.ok(worker.__gaiusStartupInactivityDeadlineAt > Date.now() + 20000,
+    "completed future-pump task did not renew the grace");
+  worker.__gaiusStartupInactivityDeadlineAt = Date.now() + 1000;
+  const duplicatePhaseDeadline = worker.__gaiusStartupInactivityDeadlineAt;
+  worker.onmessage({data: {type: "server-startup-progress", detail: "block-states-cached=29184"}});
+  assert.equal(worker.__gaiusStartupInactivityDeadlineAt, duplicatePhaseDeadline,
+    "alternating duplicate phase incorrectly renewed the grace");
+  worker.__gaiusTelemetryPending.set(1, Date.now());
+  worker.onmessage({data: {
+    type: "telemetry-pong",
+    sessionId,
+    sequence: 1,
+    measurementId: "",
+    chunkPriority: {},
+    network: {},
+    globalPump: {},
+    worldgen: {},
+    serverTick: {},
+    storage: {},
+  }});
+  assert.ok(worker.__gaiusStartupInactivityDeadlineAt <= Date.now() + 1100,
+    "heartbeat-only activity incorrectly renewed the grace");
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  worker.__gaiusStartupInactivityDeadlineAt = Date.now() + 1000;
+  worker.onmessage({data: {type: "server-startup-progress", detail: "block-states-cached=29696"}});
+  assert.ok(worker.__gaiusStartupInactivityDeadlineAt > Date.now() + 20000,
+    "increasing startup counter did not renew the grace");
+  worker.__gaiusStartupAbsoluteDeadlineAt = Date.now() + 100;
+  worker.onmessage({data: {type: "server-startup-progress", detail: "block-states-cached=30208"}});
+  assert.ok(worker.__gaiusStartupInactivityDeadlineAt <= worker.__gaiusStartupAbsoluteDeadlineAt,
+    "progress grace exceeded the absolute startup deadline");
+  worker.__gaiusStartupAbsoluteDeadlineAt = 0;
+  worker.__gaiusStartupInactivityDeadlineAt = 0;
+  worker.__gaiusHandoffTimeout.callback();
+  assert.equal(runtime.context.__gaiusSingleplayerWorkers.has(sessionId), false,
+    "absolute startup deadline did not terminate the fixture Worker");
+}
+
 {
   const runtime = createLaunchRuntime(null, {captureTimers: true});
   const oldSessionId = runtime.context.launchWorker("world", true, 6, 4);
@@ -485,6 +617,10 @@ function createLaunchRuntime(failureMode, options = {}) {
   const lateTimeout = oldWorker.__gaiusHandoffTimeout;
   assert.ok(lateTimeout && typeof lateTimeout.callback === "function",
     "old Worker handoff timeout was not captured");
+  // The fixture invokes the watchdog callback immediately; make that
+  // invocation represent an actually expired bounded deadline.
+  oldWorker.__gaiusStartupAbsoluteDeadlineAt = 0;
+  oldWorker.__gaiusStartupInactivityDeadlineAt = 0;
   lateTimeout.callback();
   assert.equal(runtime.context.__gaiusSingleplayerWorkers.get(oldSessionId), newWorker,
     "late old handoff timeout removed the replacement Worker");

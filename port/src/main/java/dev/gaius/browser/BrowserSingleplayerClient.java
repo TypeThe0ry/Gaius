@@ -2,10 +2,12 @@ package dev.gaius.browser;
 
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.ConnectScreen;
+import net.minecraft.client.gui.screens.DisconnectedScreen;
 import net.minecraft.client.gui.screens.TitleScreen;
 import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.client.multiplayer.resolver.ServerAddress;
 import net.minecraft.server.WorldStem;
+import net.minecraft.network.chat.Component;
 import net.minecraft.world.level.storage.LevelStorageSource;
 import org.teavm.jso.JSBody;
 import org.teavm.platform.Platform;
@@ -14,7 +16,8 @@ import org.teavm.platform.Platform;
 public final class BrowserSingleplayerClient {
     private static final int LOCAL_SERVER_PORT = 25565;
     private static final int READY_POLL_MILLIS = 25;
-    private static final int READY_POLL_LIMIT = 2_400;
+    /** Java-side safety bound; the JS watchdog normally fails earlier on inactivity. */
+    private static final int READY_POLL_LIMIT = 7_200;
     /** Returned by the JS readiness probe when its poll belongs to an older launch. */
     private static final int STALE_WORKER_STATE = -2;
 
@@ -95,15 +98,20 @@ public final class BrowserSingleplayerClient {
         if (state < 0 || pollCount >= READY_POLL_LIMIT) {
             String detail = state < 0
                     ? "Integrated server stopped before client attach"
-                    : "Integrated server startup timed out before client attach";
-            reportAttachFailure(sessionId, launchGeneration, detail);
+                    : "Integrated server startup exceeded the 180 second safety deadline";
+            String effectiveDetail = reportAttachFailure(sessionId, launchGeneration, detail);
             // This is an attach failure, not a normal disconnect.  Clear this
             // handoff and stop only the Worker that belongs to this poller;
             // the regular no-argument stop path deliberately protects a
             // pending handoff from a delayed disconnect.
             cancelClientHandoff(sessionId, launchGeneration);
             requestWorkerStop(sessionId, launchGeneration);
-            minecraft.gaius$setScreen(new TitleScreen());
+            minecraft.gaius$setScreen(new DisconnectedScreen(
+                    new TitleScreen(),
+                    Component.literal("Singleplayer startup failed"),
+                    Component.literal(effectiveDetail == null || effectiveDetail.isEmpty()
+                            ? detail
+                            : effectiveDetail)));
             return;
         }
         Platform.schedule(
@@ -205,20 +213,28 @@ public final class BrowserSingleplayerClient {
             const worker = workers && typeof workers.get === 'function'
               ? workers.get(key)
               : null;
-            if (!key || !expectedGeneration || !worker ||
-                String(worker.__gaiusLaunchGeneration || '') !== expectedGeneration) {
+            const failures = globalThis.__gaiusSingleplayerFailures;
+            const failureKey = key + ':' + expectedGeneration;
+            const remembered = failures && typeof failures.get === 'function'
+              ? failures.get(failureKey)
+              : null;
+            if (!key || !expectedGeneration ||
+                (worker && String(worker.__gaiusLaunchGeneration || '') !== expectedGeneration) ||
+                (!worker && !remembered)) {
               return;
             }
             const events = globalThis.__gaiusMinecraftEvents ||
               (globalThis.__gaiusMinecraftEvents = []);
             events.push({
               event: 'singleplayer:client-attach-failed',
-              detail: key + ': ' + String(detail),
+              detail: key + ': ' + String(
+                remembered && remembered.detail ? remembered.detail : detail),
               at: Date.now()
             });
             if (events.length > 500) events.splice(0, events.length - 500);
+            return String(remembered && remembered.detail ? remembered.detail : detail);
             """)
-    private static native void reportAttachFailure(
+    private static native String reportAttachFailure(
             String sessionId,
             String launchGeneration,
             String detail);
@@ -580,6 +596,129 @@ public final class BrowserSingleplayerClient {
                 state.storage = copyScalarTelemetry(worker.__gaiusTelemetryStorage);
                 state.updatedAt = Date.now();
               };
+              const STARTUP_INITIAL_DEADLINE_MS = 60000;
+              const STARTUP_PROGRESS_GRACE_MS = 30000;
+              const STARTUP_ABSOLUTE_DEADLINE_MS = 180000;
+              worker.__gaiusStartupStartedAt = Date.now();
+              worker.__gaiusStartupAbsoluteDeadlineAt =
+                worker.__gaiusStartupStartedAt + STARTUP_ABSOLUTE_DEADLINE_MS;
+              worker.__gaiusStartupInactivityDeadlineAt =
+                worker.__gaiusStartupStartedAt + STARTUP_INITIAL_DEADLINE_MS;
+              worker.__gaiusStartupLastProgressAt = worker.__gaiusStartupStartedAt;
+              worker.__gaiusStartupLastProgressKind = 'launch';
+              worker.__gaiusStartupLastProgressDetail = '';
+              worker.__gaiusStartupProgressCounters = Object.create(null);
+              worker.__gaiusStartupSeenPhases = Object.create(null);
+              worker.__gaiusStartupSeenPhases.launch = true;
+              const rememberStartupFailure = function(detail) {
+                const failures = globalThis.__gaiusSingleplayerFailures ||
+                  (globalThis.__gaiusSingleplayerFailures = new Map());
+                const key = sessionId + ':' + launchGeneration;
+                const telemetry = globalThis.__gaiusWorkerMessageTelemetry;
+                failures.set(key, {
+                  sessionId: sessionId,
+                  launchGeneration: launchGeneration,
+                  detail: String(detail),
+                  at: Date.now(),
+                  phase: worker.__gaiusStartupLastProgressKind || 'unknown',
+                  lastProgressAt: worker.__gaiusStartupLastProgressAt || 0,
+                  lastProgressDetail: worker.__gaiusStartupLastProgressDetail || '',
+                  telemetry: telemetry && telemetry.sessionId === sessionId
+                    ? telemetry
+                    : null,
+                });
+                while (failures.size > 32) {
+                  failures.delete(failures.keys().next().value);
+                }
+              };
+              const recordStartupProgress = function(kind, detail, counters) {
+                if (worker.__gaiusTerminal || worker.__gaiusClientAttached) return false;
+                const progressKind = String(kind || 'unknown');
+                const progressDetail = String(detail || '');
+                const phaseFirstSeen = !worker.__gaiusStartupSeenPhases[progressKind];
+                worker.__gaiusStartupSeenPhases[progressKind] = true;
+                let advanced = false;
+                const values = counters && typeof counters === 'object' ? counters : {};
+                const names = Object.keys(values);
+                for (let index = 0; index < names.length; index++) {
+                  const name = names[index];
+                  const value = Number(values[name]);
+                  if (!Number.isFinite(value)) continue;
+                  const previous = worker.__gaiusStartupProgressCounters[name];
+                  if (previous === undefined) {
+                    worker.__gaiusStartupProgressCounters[name] = value;
+                    if (value > 0) advanced = true;
+                  } else if (value > previous) {
+                    worker.__gaiusStartupProgressCounters[name] = value;
+                    advanced = true;
+                  }
+                }
+                // A phase-only message counts once when first observed.  A
+                // counter-bearing message advances only on a numeric increase;
+                // alternating duplicate phases cannot keep the watchdog alive.
+                if (names.length === 0 && phaseFirstSeen) advanced = true;
+                if (!advanced) return false;
+                const now = Date.now();
+                worker.__gaiusStartupLastProgressAt = now;
+                worker.__gaiusStartupLastProgressKind = progressKind;
+                worker.__gaiusStartupLastProgressDetail = progressDetail;
+                worker.__gaiusStartupInactivityDeadlineAt = Math.min(
+                  Math.max(
+                    worker.__gaiusStartupInactivityDeadlineAt,
+                    now + STARTUP_PROGRESS_GRACE_MS,
+                  ),
+                  worker.__gaiusStartupAbsoluteDeadlineAt,
+                );
+                publishWorkerTelemetry();
+                return true;
+              };
+              const startupNumericCounters = function(value, prefix, output) {
+                if (!value || typeof value !== 'object') return;
+                const keys = Object.keys(value);
+                for (let index = 0; index < keys.length; index++) {
+                  const key = keys[index];
+                  const current = Number(value[key]);
+                  if (!Number.isFinite(current) || !/(count|chunks?|slices?|progress|cached|registered|batches?|updates?|pulses?|entries|packets?|bytes|tasks?|runs?|signals?|schedules?)/i.test(key)) continue;
+                  output[prefix + '.' + key] = current;
+                }
+              };
+              const recordTelemetryProgress = function(message) {
+                const counters = {};
+                startupNumericCounters(message && message.chunkPriority, 'chunk', counters);
+                startupNumericCounters(message && message.network, 'network', counters);
+                startupNumericCounters(message && message.globalPump, 'pump', counters);
+                startupNumericCounters(message && message.worldgen, 'worldgen', counters);
+                startupNumericCounters(message && message.serverTick, 'tick', counters);
+                startupNumericCounters(message && message.storage, 'storage', counters);
+                if (Object.keys(counters).length === 0) return;
+                recordStartupProgress('telemetry-counter', '', counters);
+              };
+              const armStartupWatchdog = function() {
+                if (worker.__gaiusHandoffTimeout) clearTimeout(worker.__gaiusHandoffTimeout);
+                const check = function() {
+                  if (worker.__gaiusTerminal || worker.__gaiusClientAttached) return;
+                  const now = Date.now();
+                  if (now >= worker.__gaiusStartupAbsoluteDeadlineAt ||
+                      now >= worker.__gaiusStartupInactivityDeadlineAt) {
+                    terminateFailedWorker(
+                      'Integrated server startup watchdog expired: ' +
+                      (worker.__gaiusStartupLastProgressKind || 'no progress') +
+                      (worker.__gaiusStartupLastProgressDetail
+                        ? ' (' + worker.__gaiusStartupLastProgressDetail + ')'
+                        : '')
+                    );
+                    return;
+                  }
+                  armStartupWatchdog();
+                };
+                worker.__gaiusHandoffTimeout = setTimeout(check, Math.max(
+                  1,
+                  Math.min(
+                    worker.__gaiusStartupInactivityDeadlineAt,
+                    worker.__gaiusStartupAbsoluteDeadlineAt,
+                  ) - Date.now(),
+                ));
+              };
               const resetWorkerTelemetry = function(measurementId) {
                 worker.__gaiusTelemetryPending.clear();
                 worker.__gaiusTelemetrySent = 0;
@@ -731,6 +870,9 @@ public final class BrowserSingleplayerClient {
                 worker.__gaiusTelemetryWorldgen = copyScalarTelemetry(message.worldgen);
                 worker.__gaiusTelemetryServerTick = copyScalarTelemetry(message.serverTick);
                 worker.__gaiusTelemetryStorage = copyScalarTelemetry(message.storage);
+                // A heartbeat proves transport only.  Startup grace is extended
+                // only when a telemetry counter advances or a phase changes.
+                recordTelemetryProgress(message);
                 publishWorkerTelemetry();
               };
               worker.__gaiusStopTelemetry = stopWorkerTelemetry;
@@ -749,6 +891,7 @@ public final class BrowserSingleplayerClient {
               };
               const terminateFailedWorker = function(detail) {
                 if (worker.__gaiusTerminal) return;
+                rememberStartupFailure(detail);
                 clearHandoffLease();
                 worker.__gaiusTerminal = true;
                 stopWorkerTelemetry();
@@ -785,6 +928,31 @@ public final class BrowserSingleplayerClient {
                   (globalThis.__gaiusMinecraftEvents = []);
                 events.push({event: 'singleplayer:worker', detail: message, at: Date.now()});
                 if (events.length > 500) events.splice(0, events.length - 500);
+                if (message && message.type === 'server-startup-progress') {
+                  const counters = {};
+                  const detailText = String(message.detail || '');
+                  if (/^future-pump-waiting\\b/.test(detailText)) {
+                    const taskMatch = /\\btasks=(\\d+)/.exec(detailText);
+                    if (taskMatch) counters['startup.future-pump.tasks'] = Number(taskMatch[1]);
+                  } else {
+                    const pattern = /([A-Za-z][A-Za-z0-9_-]*)=(\\d+)/g;
+                    let match;
+                    while ((match = pattern.exec(detailText)) !== null) {
+                      counters['startup.' + match[1]] = Number(match[2]);
+                    }
+                  }
+                  const phaseMatch = /^([A-Za-z][A-Za-z0-9_-]*)/.exec(detailText);
+                  const progressKind = phaseMatch
+                    ? 'startup-detail:' + phaseMatch[1]
+                    : 'server-startup-progress';
+                  recordStartupProgress(progressKind, detailText, counters);
+                } else if (message && message.type === 'runtime-ready') {
+                  recordStartupProgress('runtime-ready', message.detail, {});
+                } else if (message && message.type === 'server-listener-ready') {
+                  recordStartupProgress('server-listener-ready', message.detail, {});
+                } else if (message && message.type === 'server-distances-ramping') {
+                  recordStartupProgress('server-distances-ramping', message.detail, {});
+                }
                 if (message && message.type === 'runtime-ready') {
                   worker.__gaiusRuntimeReady = true;
                   startWorkerTelemetry();
@@ -833,12 +1001,7 @@ public final class BrowserSingleplayerClient {
                   terminateFailedWorker(String(message.detail || message.type));
                 }
               };
-              worker.__gaiusHandoffTimeout = setTimeout(function() {
-                if (worker.__gaiusTerminal || worker.__gaiusClientAttached) return;
-                terminateFailedWorker(
-                  'Integrated server client did not attach within 60 seconds'
-                );
-              }, 60000);
+              armStartupWatchdog();
               worker.onerror = function(event) {
                 const detail = event && event.message ? event.message : 'worker error';
                 const events = globalThis.__gaiusMinecraftEvents ||
