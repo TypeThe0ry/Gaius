@@ -30,6 +30,9 @@ let result = proxyUrl({channels: [{connected: true, currentCandidate:
   {url: "wss://ellan.site/tunnel", token: "relay-token", direct: false}}]});
 assert.equal(result.origin, "https://ellan.site");
 assert.equal(result.pathname, "/proxy/resource-pack");
+assert.equal(result.searchParams.get("stream"), "1");
+assert.equal(new URL(call("https://textures.minecraft.net/texture/test", "texture"))
+  .searchParams.has("stream"), false);
 assert.equal(result.searchParams.get("token"), "relay-token");
 
 result = proxyUrl({channels: [

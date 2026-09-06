@@ -155,6 +155,7 @@ public final class BrowserHttpProxy {
             bridge.hash = '';
             bridge.search = '';
             bridge.searchParams.set('url', String(target));
+            if (kind === 'resource-pack') bridge.searchParams.set('stream', '1');
             const token = params.get('bridgeToken') || params.get('relayToken') ||
               globalThis.__gaiusBridgeToken || (activeRelay && activeRelay.token);
             if (token && String(token).length) bridge.searchParams.set('token', String(token));
