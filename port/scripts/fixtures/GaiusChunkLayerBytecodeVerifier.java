@@ -385,7 +385,7 @@ public final class GaiusChunkLayerBytecodeVerifier {
                 "scheduleLayer non-final coordinate path must reach the batch guard");
         AbstractInsnNode futureStart = firstExecutable(finalYieldJump.label);
         FieldInsnNode yieldPut = null;
-        MethodInsnNode platformStartThread = null;
+        MethodInsnNode platformSchedule = null;
         for (AbstractInsnNode instruction = futureStart; instruction != null;
                 instruction = nextExecutable(instruction)) {
             if (instruction instanceof FieldInsnNode field
@@ -394,14 +394,16 @@ public final class GaiusChunkLayerBytecodeVerifier {
             if (instruction instanceof MethodInsnNode call
                     && call.getOpcode() == Opcodes.INVOKESTATIC
                     && call.owner.equals("org/teavm/platform/Platform")
-                    && call.name.equals("startThread")
-                    && call.desc.equals("(Lorg/teavm/platform/PlatformRunnable;)V")) {
-                platformStartThread = call;
+                    && call.name.equals("schedule")
+                    && call.desc.equals("(Lorg/teavm/platform/PlatformRunnable;I)I")) {
+                platformSchedule = call;
                 break;
             }
         }
-        require(yieldPut != null && platformStartThread != null,
-                "scheduleLayer final continuation must publish and start its TeaVM thread");
+        require(yieldPut != null && platformSchedule != null,
+                "scheduleLayer final continuation must publish and schedule its TeaVM thread");
+        require(previousExecutable(platformSchedule).getOpcode() == Opcodes.ICONST_0,
+                "scheduleLayer final continuation must use zero-delay Platform.schedule");
 
         JumpInsnNode cancellation = null;
         JumpInsnNode holderRejected = null;
