@@ -58,6 +58,7 @@ const smokeState = globalThis.__gaiusSingleplayerWorkerSmoke = {
   loginProfileId: null,
   serverDistances: null,
   removedWorldFiles: 0,
+  diagnosticSnapshots: [],
 };
 
 runButton.addEventListener("click", () => {
@@ -120,11 +121,18 @@ async function runSmoke() {
     stopped = deferred();
     distancesActive = deferred();
     const failed = deferred();
+    const diagnosticResponses = [];
+    const diagnosticWaiters = [];
     worker = new Worker(workerUrl, {name: "Gaius singleplayer smoke server"});
 
     worker.onmessage = (event) => {
       const message = event.data || {};
       record("worker", message.type || "message", message.detail || "");
+      if (message.type === "diagnostic-snapshot") {
+        const waiter = diagnosticWaiters.shift();
+        if (waiter) waiter.resolve(message);
+        else diagnosticResponses.push(message);
+      }
       if (message.type === "server-created") {
         setTimeout(() => {
           worker.postMessage({
@@ -185,6 +193,36 @@ async function runSmoke() {
     smokeState.chunkBatchAckCount = protocol.chunkBatchAckCount;
     smokeState.knownPackRequests = protocol.knownPackRequests;
     smokeState.loginProfileId = protocol.loginProfileId;
+    // Exercise the real Worker control channel without enabling continuous
+    // probes. Disabled snapshots intentionally contain no telemetry details.
+    worker.postMessage({type: "diagnostic-snapshot"});
+    const disabledSnapshot = await withTimeout(
+      nextDiagnosticSnapshot(diagnosticResponses, diagnosticWaiters),
+      5000,
+      "disabled diagnostic snapshot"
+    );
+    requireCondition(disabledSnapshot.enabled === false,
+      "Diagnostic snapshot leaked while slow probe was disabled");
+    worker.postMessage({type: "diagnostic-config", gaiusSlowProbeTelemetry: true});
+    worker.postMessage({type: "diagnostic-snapshot"});
+    const enabledSnapshot = await withTimeout(
+      nextDiagnosticSnapshot(diagnosticResponses, diagnosticWaiters),
+      5000,
+      "enabled diagnostic snapshot"
+    );
+    requireCondition(enabledSnapshot.enabled === true,
+      "Diagnostic snapshot did not enable");
+    requireDiagnosticSnapshot(enabledSnapshot);
+    worker.postMessage({type: "diagnostic-config", gaiusSlowProbeTelemetry: false});
+    worker.postMessage({type: "diagnostic-snapshot"});
+    const reDisabledSnapshot = await withTimeout(
+      nextDiagnosticSnapshot(diagnosticResponses, diagnosticWaiters),
+      5000,
+      "re-disabled diagnostic snapshot"
+    );
+    requireCondition(reDisabledSnapshot.enabled === false,
+      "Diagnostic snapshot did not disable");
+    smokeState.diagnosticSnapshots = [disabledSnapshot, enabledSnapshot, reDisabledSnapshot];
     setState("running", "PLAY and chunk data passed; stopping server cleanly");
     protocol.closeTransport();
     worker.postMessage({type: "stop"});
@@ -216,6 +254,11 @@ async function runSmoke() {
       loginProfileId: smokeState.loginProfileId,
       serverDistances: smokeState.serverDistances,
       removedWorldFiles: smokeState.removedWorldFiles,
+      diagnosticSnapshots: smokeState.diagnosticSnapshots.map((snapshot) => ({
+        enabled: snapshot.enabled,
+        keys: Object.keys(snapshot),
+        serializedLength: JSON.stringify(snapshot).length,
+      })),
     }));
   } catch (error) {
     smokeState.error = String(error && (error.stack || error.message) || error);
@@ -247,6 +290,43 @@ async function runSmoke() {
     }
   } finally {
     runButton.disabled = false;
+  }
+}
+
+function nextDiagnosticSnapshot(responses, waiters) {
+  if (responses.length > 0) return Promise.resolve(responses.shift());
+  const pending = deferred();
+  waiters.push(pending);
+  return pending.promise;
+}
+
+function requireDiagnosticSnapshot(snapshot) {
+  requireCondition(JSON.stringify(snapshot).length <= 4 * 4096 + 256,
+    "Diagnostic snapshot exceeded bounded response length");
+  for (const key of [
+    "worldgenSchedulerMarker",
+    "futurePumpTelemetry",
+    "worldgenStats",
+    "serverTickTelemetry",
+  ]) {
+    const value = snapshot[key];
+    requireCondition(value && typeof value === "object" && !Array.isArray(value),
+      "Diagnostic snapshot field is not a shallow object: " + key);
+    for (const [field, nested] of Object.entries(value)) {
+      requireCondition(nested === null || typeof nested !== "object",
+        "Diagnostic snapshot included nested telemetry: " + key);
+      if (typeof nested === "number") {
+        requireCondition(Number.isFinite(nested),
+          "Diagnostic snapshot included a non-finite value: " + key);
+      }
+      if (typeof nested === "string") {
+        const maxLength = ["maxSliceContext", "maxTaskContext", "chunkHolderProbeMaxContext"].includes(field)
+          ? 1024
+          : 256;
+        requireCondition(nested.length <= maxLength,
+          "Diagnostic snapshot string exceeded bound: " + key);
+      }
+    }
   }
 }
 
@@ -699,6 +779,12 @@ function deferred() {
     reject = promiseReject;
   });
   return {promise, resolve, reject};
+}
+
+function requireCondition(condition, message) {
+  if (!condition) {
+    throw new Error(message);
+  }
 }
 
 function withTimeout(promise, timeoutMs, label) {

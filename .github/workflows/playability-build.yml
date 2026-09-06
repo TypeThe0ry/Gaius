@@ -105,6 +105,9 @@ jobs:
           mvn -B -q dependency:get -Dartifact=org.teavm:teavm-tooling:0.15.0
           mvn -B -q dependency:get -Dartifact=org.teavm:teavm-classlib:0.15.0
           node port/scripts/browser-gzip-coroutine-smoke.mjs
+          node port/scripts/teavm-macrotask-yield-smoke.mjs
+          node port/scripts/singleplayer-worker-bootstrap-lifecycle-smoke.mjs
+          node port/scripts/worldgen-scheduler-smoke.mjs
           node port/scripts/teavm-jsbody-parser-smoke.mjs \
             port/src/main/java/dev/gaius/browser/BrowserWorldgenScheduler.java \
             port/src/main/java/dev/gaius/browser/BrowserHttpProxy.java \

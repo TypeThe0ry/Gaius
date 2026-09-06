@@ -8,6 +8,8 @@ import org.teavm.classlib.java.lang.reflect.TType;
 import org.teavm.interop.Async;
 import org.teavm.interop.AsyncCallback;
 import org.teavm.jso.JSBody;
+import org.teavm.jso.JSFunctor;
+import org.teavm.jso.JSObject;
 import org.teavm.platform.Platform;
 import org.teavm.platform.PlatformRunnable;
 
@@ -111,9 +113,55 @@ public final class TModernRuntimeSupport {
         if (delayMillis > 0) {
             Platform.schedule(resume, delayMillis);
         } else {
-            Platform.postpone(resume);
+            postMacrotask(() -> resume.run());
         }
     }
+
+    @JSFunctor
+    private interface ResumeCallback extends JSObject {
+        void run();
+    }
+
+    // Platform.postpone uses setTimeout(0), which is still subject to nested
+    // timer clamping. A MessagePort turn gives other Worker messages a chance
+    // to run without imposing that delay on every cooperative work slice.
+    @JSBody(params = "callback", script = """
+            let state = globalThis.__gaiusMacrotaskScheduler;
+            if (!state) {
+              state = {channel: null, pending: new Map(), sequence: 0, failed: false};
+              globalThis.__gaiusMacrotaskScheduler = state;
+              try {
+                state.channel = new MessageChannel();
+                state.channel.port1.onmessage = function(event) {
+                  const resume = state.pending.get(event.data);
+                  if (!resume) return;
+                  state.pending.delete(event.data);
+                  resume();
+                };
+              } catch (_) {
+                state.failed = true;
+              }
+            }
+            if (state.failed) {
+              setTimeout(callback, 0);
+              return;
+            }
+            const id = ++state.sequence;
+            state.pending.set(id, callback);
+            try {
+              state.channel.port2.postMessage(id);
+            } catch (_) {
+              state.failed = true;
+              try { state.channel.port1.close(); } catch (ignored) {}
+              try { state.channel.port2.close(); } catch (ignored) {}
+              const callbacks = Array.from(state.pending.values());
+              state.pending.clear();
+              for (let index = 0; index < callbacks.length; index++) {
+                setTimeout(callbacks[index], 0);
+              }
+            }
+            """)
+    private static native void postMacrotask(ResumeCallback callback);
 
     public static TType genericSuperclass(TClass<?> type) {
         return type.getSuperclass();

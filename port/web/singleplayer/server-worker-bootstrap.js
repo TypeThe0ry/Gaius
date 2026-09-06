@@ -12,9 +12,12 @@ try {
   root.__gaiusServerTickTelemetryEnabled =
     root.__gaiusServerTickTelemetryEnabled === true ||
     diagnosticUrl.searchParams.get("gaiusServerTickTelemetry") === "1";
+  root.__gaiusSlowProbeTelemetryEnabled =
+    root.__gaiusSlowProbeTelemetryEnabled === true;
 } catch (_) {
   root.__gaiusMobAiTelemetry = false;
   root.__gaiusServerTickTelemetryEnabled = false;
+  root.__gaiusSlowProbeTelemetryEnabled = false;
 }
 if (typeof Error === "function" && (!Error.stackTraceLimit || Error.stackTraceLimit < 100)) {
   Error.stackTraceLimit = 100;
@@ -320,7 +323,12 @@ function snapshotScalarTelemetry(value, priorityKeys = []) {
     if (copied >= 64 || Object.prototype.hasOwnProperty.call(snapshot, key)) {
       return;
     }
-    const current = value[key];
+    let current;
+    try {
+      current = value[key];
+    } catch (_) {
+      return;
+    }
     if (typeof current === "number") {
       if (Number.isFinite(current)) {
         snapshot[key] = current;
@@ -350,6 +358,37 @@ function snapshotGlobalPumpTelemetry(value) {
     snapshot[key] = typeof current === "number" && Number.isFinite(current)
       ? current
       : null;
+  }
+  return snapshot;
+}
+
+// Slow-probe snapshots are requested explicitly and must stay small enough
+// for a diagnostic message to cross the Worker boundary predictably. Reuse
+// the scalar-only copier, then bound strings and the serialized object. This
+// never walks nested values or evaluates data supplied by the runtime.
+const diagnosticSnapshotMaxChars = 4096;
+const diagnosticSnapshotMaxStringLength = 256;
+const diagnosticSnapshotContextMaxStringLength = 1024;
+
+function snapshotDiagnosticTelemetry(value, priorityKeys = []) {
+  const snapshot = snapshotScalarTelemetry(value, priorityKeys);
+  for (const key of Object.keys(snapshot)) {
+    if (typeof snapshot[key] === "string") {
+      const maxLength = ["maxSliceContext", "maxTaskContext", "chunkHolderProbeMaxContext"]
+        .includes(key)
+        ? diagnosticSnapshotContextMaxStringLength
+        : diagnosticSnapshotMaxStringLength;
+      snapshot[key] = snapshot[key].slice(0, maxLength);
+    }
+  }
+  if (JSON.stringify(snapshot).length <= diagnosticSnapshotMaxChars) {
+    return snapshot;
+  }
+  // Object.keys() preserves the priority-first insertion order produced by
+  // snapshotScalarTelemetry. Drop the tail until the byte bound is met.
+  const keys = Object.keys(snapshot);
+  while (keys.length > 0 && JSON.stringify(snapshot).length > diagnosticSnapshotMaxChars) {
+    delete snapshot[keys.pop()];
   }
   return snapshot;
 }
@@ -476,6 +515,12 @@ root.onmessage = async (event) => {
     }
     if (message.gaiusServerTickTelemetry === true) {
       root.__gaiusServerTickTelemetryEnabled = true;
+    }
+    const slowProbeEnabled = typeof message.gaiusSlowProbeTelemetry === "boolean"
+      ? message.gaiusSlowProbeTelemetry
+      : message.slowProbeTelemetryEnabled;
+    if (typeof slowProbeEnabled === "boolean") {
+      root.__gaiusSlowProbeTelemetryEnabled = slowProbeEnabled;
     }
     return;
   }
@@ -846,6 +891,15 @@ function handleControlMessage(event) {
   if (!message) {
     return;
   }
+  if (message.type === "diagnostic-config") {
+    const slowProbeEnabled = typeof message.gaiusSlowProbeTelemetry === "boolean"
+      ? message.gaiusSlowProbeTelemetry
+      : message.slowProbeTelemetryEnabled;
+    if (typeof slowProbeEnabled === "boolean") {
+      root.__gaiusSlowProbeTelemetryEnabled = slowProbeEnabled;
+    }
+    return;
+  }
   if (message.type === "telemetry-ping") {
     const measurementId = typeof message.measurementId === "string"
       ? message.measurementId
@@ -895,6 +949,31 @@ function handleControlMessage(event) {
         [],
         storageTelemetryCounterKeys,
       ),
+    });
+    return;
+  }
+  if (message.type === "diagnostic-snapshot") {
+    if (root.__gaiusSlowProbeTelemetryEnabled !== true) {
+      postMessage({type: "diagnostic-snapshot", enabled: false});
+      return;
+    }
+    postMessage({
+      type: "diagnostic-snapshot",
+      enabled: true,
+      worldgenSchedulerMarker: snapshotDiagnosticTelemetry(
+        root.__gaiusWorldgenSchedulerMarker,
+        ["maxSliceContext", "maxTaskContext"],
+      ),
+      futurePumpTelemetry: snapshotDiagnosticTelemetry(
+        root.__gaiusFuturePumpTelemetry,
+      ),
+      worldgenStats: snapshotDiagnosticTelemetry(root.__gaiusWorldgenStats, [
+        "chunkHolderProbeMaxContext",
+        "chunkHolderProbeMaxDurationMillis",
+        "chunkHolderProbeSamples",
+        "chunkHolderProbeFalseResults",
+      ]),
+      serverTickTelemetry: snapshotDiagnosticTelemetry(root.__gaiusServerTickTelemetry),
     });
     return;
   }

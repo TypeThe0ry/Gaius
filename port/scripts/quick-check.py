@@ -6096,19 +6096,15 @@ def check_source_patches() -> None:
             and "takePermit(thread)" in teavm_lock_support,
         ),
         (
-            "Built-in structure NBT uses asynchronous native browser gzip",
+            "Built-in structure NBT uses synchronous vanilla gzip",
             "patchStructureTemplateManagerBrowserGzip" in client_patcher
             and '"readStructure"' in client_patcher
             and '"dev/gaius/browser/BrowserGzip"' in client_patcher
-            and "DecompressionStream('gzip')" in browser_gzip
             and "InputStream input" in browser_gzip
-            and "input.readAllBytes()" in browser_gzip
-            and "Thread.sleep(0L)" in browser_gzip
-            and browser_gzip.count("@JSByRef byte[]") == 2
             and "async function" not in browser_gzip
             and "await " not in browser_gzip
-            and "NbtIo.read(data, accounter)" in browser_gzip
-            and "NbtIo.readCompressed(input, accounter)" in browser_gzip
+            and "NbtIo.readCompressed(input" in browser_gzip
+            and "NbtAccounter.unlimitedHeap()" in browser_gzip
             and file_matches(SERVER_WORKER_JS, rb"new DecompressionStream\('gzip'\)")
             and not file_matches(
                 SERVER_WORKER_JS,
@@ -11773,13 +11769,9 @@ def check_overlay_bytecode() -> None:
             and "Method execute" not in blockable_event_loop_schedule,
         ),
         (
-            "Compiled structure templates retain NBT parsing behind native gzip",
+            "Compiled structure templates retain synchronous NBT parsing behind vanilla gzip",
             "BrowserGzip.readCompressedNbt" in structure_template_read_stream
             and "NbtIo.readCompressed" not in structure_template_read_stream
-            and "java/io/InputStream.readAllBytes:()[B" in browser_gzip_read_nbt
-            and "java/lang/Thread.sleep:(J)V" in browser_gzip_read_nbt
-            and "NbtIo.read:(Ljava/io/DataInput;Lnet/minecraft/nbt/NbtAccounter;)"
-                in browser_gzip_read_nbt
             and "NbtIo.readCompressed:(Ljava/io/InputStream;Lnet/minecraft/nbt/NbtAccounter;)"
                 in browser_gzip_read_nbt,
         ),

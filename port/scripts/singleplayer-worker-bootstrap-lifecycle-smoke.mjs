@@ -22,6 +22,8 @@ for (const field of [
 }
 assert.ok(bootstrap.includes("globalPump: snapshotGlobalPumpTelemetry"),
   "Worker heartbeat did not expose the fixed globalPump side-band");
+assert.ok(bootstrap.includes('message.type === "diagnostic-snapshot"'),
+  "Worker bootstrap lost the diagnostic snapshot message");
 const sessionId = "5123456789abcdef0123456789abcdef";
 const storageConfig = Object.freeze({
   profileId: "26.2",
@@ -139,6 +141,41 @@ globalThis.__gaiusWorldgenStats = {
   healthy: true,
   nested: {mustNotCross: true},
 };
+for (let index = 0; index < 70; index++) {
+  globalThis.__gaiusWorldgenStats["prefix" + index] = index;
+}
+globalThis.__gaiusWorldgenStats.chunkHolderProbeMaxDurationMillis = 3028;
+globalThis.__gaiusWorldgenStats.chunkHolderProbeSamples = 80;
+globalThis.__gaiusWorldgenStats.chunkHolderProbeMaxContext =
+  JSON.stringify({status: "holder", x: 1, z: 2, needsGeneration: true,
+    durationMillis: 3028, result: true});
+globalThis.__gaiusWorldgenSchedulerMarker = {
+  schemaVersion: 1,
+  maxSliceContext: "ctx-" + "x".repeat(900),
+  finite: 42,
+  nonfinite: Infinity,
+  nested: {mustNotCross: true},
+  callable: () => "must-not-cross",
+};
+globalThis.__gaiusWorldgenSchedulerMarker.maxTaskContext =
+  JSON.stringify({taskLabel: "ChunkGenerationTask.runUntilWait", taskScopeWallMillis: 3028});
+globalThis.__gaiusFuturePumpTelemetry = {
+  polls: 7,
+  emptyYields: 2,
+  nested: {mustNotCross: true},
+  nonfinite: NaN,
+  callable: function forbidden() {},
+};
+globalThis.__gaiusServerTickTelemetry = {
+  schemaVersion: 1,
+  tickCount: 11,
+  nested: {mustNotCross: true},
+  nonfinite: -Infinity,
+};
+Object.defineProperty(globalThis.__gaiusWorldgenSchedulerMarker, "throws", {
+  enumerable: true,
+  get() { throw new Error("diagnostic getter probe"); },
+});
 if (testConfig.assetFailure) {
   globalThis.DecompressionStream = function() {};
   globalThis.fetch = () => Promise.reject(new Error("deterministic asset failure"));
@@ -330,6 +367,9 @@ assertNoWorkerErrors(invalidGenerationEvents,
 invalidGenerationChannel.port2.close();
 await invalidGenerationWorker.terminate();
 
+// Configuration sent before start must survive the bootstrap handshake.
+worker.postMessage({type: "diagnostic-config", gaiusSlowProbeTelemetry: true});
+
 worker.postMessage({
   type: "start",
   sessionId,
@@ -356,6 +396,61 @@ worker.postMessage({type: "attach-port", sessionId, port: activeChannel.port1},
   [activeChannel.port1]);
 await waitFor("port-attached");
 await waitFor("runtime-ready");
+
+async function requestDiagnosticSnapshot() {
+  const before = events.length;
+  worker.postMessage({type: "diagnostic-snapshot"});
+  const deadline = Date.now() + 1000;
+  while (true) {
+    const event = events.slice(before).find((message) =>
+      message?.type === "diagnostic-snapshot");
+    if (event) return event;
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for diagnostic snapshot");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+const preStartEnabledSnapshot = await requestDiagnosticSnapshot();
+assert.equal(preStartEnabledSnapshot.enabled, true,
+  "pre-start diagnostic config did not survive Worker startup");
+for (const key of [
+  "worldgenSchedulerMarker",
+  "futurePumpTelemetry",
+  "worldgenStats",
+  "serverTickTelemetry",
+]) {
+  assert.ok(preStartEnabledSnapshot[key] && typeof preStartEnabledSnapshot[key] === "object",
+    `enabled diagnostic snapshot omitted ${key}`);
+  assert.equal(Object.values(preStartEnabledSnapshot[key]).some((value) =>
+    value && typeof value === "object"), false,
+  `enabled diagnostic snapshot crossed nested value in ${key}`);
+  assert.equal(Object.values(preStartEnabledSnapshot[key]).some((value) =>
+    typeof value === "number" && !Number.isFinite(value)), false,
+  `enabled diagnostic snapshot crossed non-finite value in ${key}`);
+}
+assert.ok(preStartEnabledSnapshot.worldgenSchedulerMarker.maxSliceContext.length >= 512,
+  "maxSliceContext was truncated below the diagnostic context minimum");
+assert.ok(preStartEnabledSnapshot.worldgenSchedulerMarker.maxTaskContext,
+  "maxTaskContext was dropped despite diagnostic priority");
+assert.ok(preStartEnabledSnapshot.worldgenStats.chunkHolderProbeMaxContext,
+  "chunkHolderProbeMaxContext was dropped despite diagnostic priority");
+assert.equal(preStartEnabledSnapshot.worldgenStats.chunkHolderProbeMaxDurationMillis, 3028,
+  "chunk holder maximum duration did not survive the diagnostic priority cap");
+assert.ok(JSON.stringify(preStartEnabledSnapshot.worldgenSchedulerMarker).length <= 4096,
+  "scheduler marker exceeded its bounded serialized length");
+assert.ok(JSON.stringify(preStartEnabledSnapshot.futurePumpTelemetry).length <= 4096,
+  "future pump telemetry exceeded its bounded serialized length");
+assert.ok(JSON.stringify(preStartEnabledSnapshot.worldgenStats).length <= 4096,
+  "worldgen stats exceeded its bounded serialized length");
+assert.ok(JSON.stringify(preStartEnabledSnapshot.serverTickTelemetry).length <= 4096,
+  "server tick telemetry exceeded its bounded serialized length");
+
+worker.postMessage({type: "diagnostic-config", gaiusSlowProbeTelemetry: false});
+const disabledDiagnosticSnapshot = await requestDiagnosticSnapshot();
+assert.deepEqual(disabledDiagnosticSnapshot, {
+  type: "diagnostic-snapshot",
+  enabled: false,
+}, "disabled diagnostic snapshot leaked details after shutdown");
 
 worker.postMessage({type: "distances", renderDistance: 5, simulationDistance: 3});
 const activeDistanceApply = await waitFor("test-distances-applied");

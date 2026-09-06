@@ -477,10 +477,34 @@ try {
     "holder probe ring did not retain the newest sample");
   assert.equal(holderStats.chunkHolderProbeFalseResults, 1,
     "holder probe did not count a false result");
+  assert.equal(JSON.parse(holderStats.chunkHolderProbeMaxContext).status, "status-19",
+    "holder probe max context was not retained at the latest maximum");
+  assert.ok(holderStats.chunkHolderProbeMaxContext.length <= 1024,
+    "holder probe max context exceeded its character bound");
   globalThis.__gaiusSlowProbeHolderCapacity = 999;
   recordChunkHolderProbeJs("capacity-high", 0, 0, false, 200, 201, 1, true);
   assert.equal(globalThis.__gaiusWorldgenStats.chunkHolderProbe.capacity, 512,
     "holder probe capacity did not enforce the upper bound");
+  assert.equal(JSON.parse(globalThis.__gaiusWorldgenStats.chunkHolderProbeMaxContext).status,
+    "status-19",
+    "shorter holder probe overwrote the maximum context");
+  recordChunkHolderProbeJs("new-maximum", 4, -5, true, 300, 311, 11, false);
+  const maximumContext = JSON.parse(globalThis.__gaiusWorldgenStats.chunkHolderProbeMaxContext);
+  assert.deepEqual(maximumContext, {
+    status: "new-maximum",
+    x: 4,
+    z: -5,
+    needsGeneration: true,
+    durationMillis: 11,
+    result: false,
+  }, "holder probe maximum context fields were not captured");
+  recordChunkHolderProbeJs("control-\n-\t-\"-" + "x".repeat(120), 8, 9, false,
+    400, 500, 100, true);
+  const escapedMaximumContext = globalThis.__gaiusWorldgenStats.chunkHolderProbeMaxContext;
+  assert.ok(escapedMaximumContext.length <= 1024,
+    "holder probe context exceeded its character bound after JSON escaping");
+  assert.equal(JSON.parse(escapedMaximumContext).durationMillis, 100,
+    "holder probe escaped status context was not valid JSON");
 } finally {
   performance.now = originalPerformanceNow;
   delete globalThis.__gaiusSlowProbeTelemetryEnabled;

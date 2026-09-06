@@ -140,7 +140,7 @@ public final class BrowserWorldgenScheduler {
               ring = root.chunkHolderProbe = {capacity: capacity, entries: [], writeIndex: 0, count: 0};
             }
             const entry = {
-              status: String(status), x: x | 0, z: z | 0,
+              status: String(status).slice(0, 120), x: x | 0, z: z | 0,
               needsGeneration: !!needsGeneration,
               startAt: Number(startedAt) || 0,
               endAt: Number(endedAt) || 0,
@@ -152,8 +152,19 @@ public final class BrowserWorldgenScheduler {
             ring.writeIndex = (ring.writeIndex + 1) % ring.capacity;
             ring.count = Math.min(ring.capacity, ring.count + 1);
             root.chunkHolderProbeSamples = (Number(root.chunkHolderProbeSamples) || 0) + 1;
+            const previousMaxDuration = Number(root.chunkHolderProbeMaxDurationMillis) || 0;
             root.chunkHolderProbeMaxDurationMillis = Math.max(
-              Number(root.chunkHolderProbeMaxDurationMillis) || 0, entry.durationMillis);
+              previousMaxDuration, entry.durationMillis);
+            if (entry.durationMillis >= previousMaxDuration) {
+              root.chunkHolderProbeMaxContext = JSON.stringify({
+                status: entry.status,
+                x: entry.x,
+                z: entry.z,
+                needsGeneration: entry.needsGeneration,
+                durationMillis: entry.durationMillis,
+                result: entry.result
+              });
+            }
             if (!entry.result) {
               root.chunkHolderProbeFalseResults =
                 (Number(root.chunkHolderProbeFalseResults) || 0) + 1;
