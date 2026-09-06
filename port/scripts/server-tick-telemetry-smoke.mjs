@@ -8,10 +8,15 @@ const source = fs.readFileSync(
 );
 
 function extract(parameter, method) {
+  const methodMarker = `private static native void ${method}`;
+  const methodPosition = source.indexOf(methodMarker);
+  assert.ok(methodPosition >= 0, `${method} declaration was not found`);
+  const annotationPosition = source.lastIndexOf("@JSBody(", methodPosition);
+  const declaration = source.slice(annotationPosition, methodPosition);
   const pattern = new RegExp(
-    `@JSBody\\(params = "${parameter}", script = """([\\s\\S]*?)"""\\)\\s+private static native void ${method}`,
+    `@JSBody\\(params = "${parameter}", script = """([\\s\\S]*?)"""\\)\\s*$`,
   );
-  const match = source.match(pattern);
+  const match = declaration.match(pattern);
   assert.ok(match, `${method} JSBody was not found`);
   return vm.runInContext(`(function(${parameter}) {${match[1]}\n})`, context);
 }
@@ -20,10 +25,14 @@ const context = {globalThis: {}, Number, Math};
 vm.createContext(context);
 const begin = extract("startedAt", "recordServerTickBegin");
 const end = extract("endedAt", "recordServerTickEnd");
+const waitBegin = extract("startedAt", "recordServerWaitBegin");
+const waitEnd = extract("endedAt", "recordServerWaitEnd");
 
 // Disabled is the release default and must not allocate or mutate telemetry.
 begin.call(context, 10);
 end.call(context, 15);
+waitBegin.call(context, 20);
+waitEnd.call(context, 25);
 assert.deepEqual(context.globalThis, {});
 
 context.globalThis.__gaiusServerTickTelemetryEnabled = true;
@@ -38,9 +47,33 @@ assert.equal(context.globalThis.__gaiusServerTickTelemetry.maxTickIntervalMillis
 assert.equal(context.globalThis.__gaiusServerTickTelemetry.lastTickDurationMillis, 5);
 assert.equal(context.globalThis.__gaiusServerTickTelemetry.maxTickDurationMillis, 17.5);
 
+waitBegin.call(context, 0);
+waitEnd.call(context, 2);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.waitPhaseCount, 1);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.completedWaitPhaseCount, 1);
+waitBegin.call(context, 300);
+context.globalThis.__gaiusServerTickTelemetry = {};
+waitEnd.call(context, 9);
+assert.deepEqual(context.globalThis.__gaiusServerTickTelemetry, {});
+waitBegin.call(context, 200);
+waitEnd.call(context, 212.5);
+waitEnd.call(context, 999);
+waitBegin.call(context, 220);
+waitEnd.call(context, 225);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.waitPhaseCount, 2);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.completedWaitPhaseCount, 2);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.lastWaitPhaseDurationMillis, 5);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.maxWaitPhaseDurationMillis, 12.5);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.totalWaitPhaseDurationMillis, 17.5);
+assert.equal(context.globalThis.__gaiusServerTickTelemetry.waitPhaseOpen, false);
+
 // Malformed diagnostic state is fail-open and must not escape into server code.
 context.globalThis.__gaiusServerTickTelemetry = null;
 assert.doesNotThrow(() => begin("not-a-number"));
 assert.doesNotThrow(() => end("not-a-number"));
+context.globalThis.__gaiusServerTickTelemetry = undefined;
+assert.doesNotThrow(() => waitBegin("not-a-number"));
+assert.doesNotThrow(() => waitEnd("not-a-number"));
+assert.equal(context.globalThis.__gaiusServerTickTelemetry, undefined);
 
 console.log("SERVER_TICK_TELEMETRY_OK", JSON.stringify(context.globalThis.__gaiusServerTickTelemetry));

@@ -254,6 +254,16 @@ public final class BrowserWorldgenScheduler {
         recordServerTickEnd(nowMillis());
     }
 
+    /** Starts the opt-in measurement of the runServer waitUntilNextTick phase. */
+    public static void beginServerWaitTelemetry() {
+        recordServerWaitBegin(nowMillis());
+    }
+
+    /** Completes the opt-in measurement of the runServer waitUntilNextTick phase. */
+    public static void endServerWaitTelemetry() {
+        recordServerWaitEnd(nowMillis());
+    }
+
     @JSBody(params = "startedAt", script = """
             try {
               if (globalThis.__gaiusServerTickTelemetryEnabled !== true) return;
@@ -300,6 +310,47 @@ public final class BrowserWorldgenScheduler {
             }
             """)
     private static native void recordServerTickEnd(double endedAt);
+
+    @JSBody(params = "startedAt", script = """
+            try {
+              if (globalThis.__gaiusServerTickTelemetryEnabled !== true) return;
+              const started = Number(startedAt);
+              if (!Number.isFinite(started)) return;
+              const stats = globalThis.__gaiusServerTickTelemetry ||
+                (globalThis.__gaiusServerTickTelemetry = {});
+              stats.waitPhaseCount = (Number(stats.waitPhaseCount) || 0) + 1;
+              stats.lastWaitPhaseStartedAtMillis = started;
+              stats.waitPhaseOpen = true;
+            } catch (_) {
+              // Optional diagnostics must never perturb server ticks.
+            }
+            """)
+    private static native void recordServerWaitBegin(double startedAt);
+
+    @JSBody(params = "endedAt", script = """
+            try {
+              if (globalThis.__gaiusServerTickTelemetryEnabled !== true) return;
+              const stats = globalThis.__gaiusServerTickTelemetry;
+              if (!stats || stats.waitPhaseOpen !== true) return;
+              const started = Number(stats.lastWaitPhaseStartedAtMillis);
+              const ended = Number(endedAt);
+              if (Number.isFinite(started) && Number.isFinite(ended) && ended >= started) {
+                const duration = ended - started;
+                stats.completedWaitPhaseCount =
+                  (Number(stats.completedWaitPhaseCount) || 0) + 1;
+                stats.lastWaitPhaseDurationMillis = duration;
+                stats.maxWaitPhaseDurationMillis = Math.max(
+                  Number(stats.maxWaitPhaseDurationMillis) || 0, duration);
+                stats.totalWaitPhaseDurationMillis =
+                  (Number(stats.totalWaitPhaseDurationMillis) || 0) + duration;
+              }
+              stats.waitPhaseOpen = false;
+              delete stats.lastWaitPhaseStartedAtMillis;
+            } catch (_) {
+              // Optional diagnostics must never perturb server ticks.
+            }
+            """)
+    private static native void recordServerWaitEnd(double endedAt);
 
     /**
      * Enters a world-generation task scope.  Scopes are deliberately nestable:

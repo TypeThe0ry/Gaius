@@ -75,6 +75,29 @@ function method(bytecode, signature, nextSignature) {
   return bytecode.slice(start, end === -1 ? bytecode.length : end);
 }
 
+function assertRunServerWaitTelemetryOrder(runServer, profileId) {
+  const tickCheckpoint = runServer.indexOf("BrowserWorldgenScheduler.checkpoint");
+  const tickTelemetryEnd = runServer.indexOf(
+    "BrowserWorldgenScheduler.endServerTickTelemetry",
+  );
+  const waitTelemetryStart = runServer.indexOf(
+    "BrowserWorldgenScheduler.beginServerWaitTelemetry",
+  );
+  const waitCall = runServer.indexOf("Method waitUntilNextTick:()V");
+  const waitTelemetryEnd = runServer.indexOf(
+    "BrowserWorldgenScheduler.endServerWaitTelemetry",
+  );
+  assert.equal(occurrences(runServer, "BrowserWorldgenScheduler.beginServerWaitTelemetry"), 1,
+    `${profileId} runServer must begin one opt-in wait-phase measurement per tick`);
+  assert.equal(occurrences(runServer, "BrowserWorldgenScheduler.endServerWaitTelemetry"), 1,
+    `${profileId} runServer must end one opt-in wait-phase measurement per tick`);
+  assert.ok(tickCheckpoint >= 0 && tickTelemetryEnd > tickCheckpoint
+      && waitTelemetryStart > tickTelemetryEnd
+      && waitCall > waitTelemetryStart
+      && waitTelemetryEnd > waitCall,
+    `${profileId} wait telemetry must bracket waitUntilNextTick after tick telemetry`);
+}
+
 function occurrences(haystack, needle) {
   return haystack.split(needle).length - 1;
 }
@@ -843,6 +866,13 @@ try {
     "net.minecraft.client.GraphicsPreset"], {
     encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30_000,
   });
+  const generic121MinecraftServer = execFileSync(javap, [
+    "-classpath", generic121Jar, "-p", "-c", "net.minecraft.server.MinecraftServer",
+  ], {encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000});
+  const generic121RunServer = method(
+    generic121MinecraftServer, "protected void runServer();",
+  );
+  assertRunServerWaitTelemetryOrder(generic121RunServer, "1.21.11");
   const generic121Apply = graphicsPresetApply(generic121Graphics);
   assert.deepEqual(graphicsPresetDistanceConstants(generic121Apply, "renderDistance"),
     ["bipush 8", "bipush 16", "bipush 32"],
@@ -1100,6 +1130,13 @@ try {
     "BrowserWorldgenScheduler.endServerTickTelemetry",
   );
   const tickCheckpoint = runServer.indexOf("BrowserWorldgenScheduler.checkpoint");
+  const waitTelemetryStart = runServer.indexOf(
+    "BrowserWorldgenScheduler.beginServerWaitTelemetry",
+  );
+  const waitCall = runServer.indexOf("Method waitUntilNextTick:()V");
+  const waitTelemetryEnd = runServer.indexOf(
+    "BrowserWorldgenScheduler.endServerWaitTelemetry",
+  );
   assert.equal(occurrences(runServer, "BrowserWorldgenScheduler.beginServerWorkTurn"), 1,
     "runServer must reset the scheduler clock exactly once per tick");
   assert.equal(occurrences(runServer, "BrowserWorldgenScheduler.checkpoint"), 1,
@@ -1108,11 +1145,21 @@ try {
     "runServer must begin one opt-in server tick measurement per tick");
   assert.equal(occurrences(runServer, "BrowserWorldgenScheduler.endServerTickTelemetry"), 1,
     "runServer must end one opt-in server tick measurement per tick");
+  assert.equal(occurrences(runServer, "BrowserWorldgenScheduler.beginServerWaitTelemetry"), 1,
+    "runServer must begin one opt-in wait-phase measurement per tick");
+  assert.equal(occurrences(runServer, "BrowserWorldgenScheduler.endServerWaitTelemetry"), 1,
+    "runServer must end one opt-in wait-phase measurement per tick");
   assert.ok(tickStart >= 0 && processTick > tickStart && tickCheckpoint > processTick,
     "server tick must reset before processPacketsAndTick and checkpoint after it");
   assert.ok(tickTelemetryStart >= 0 && tickTelemetryStart < processTick
       && tickTelemetryEnd > processTick,
     "server tick telemetry must bracket processPacketsAndTick");
+  assert.ok(waitTelemetryStart >= 0 && waitCall > waitTelemetryStart
+      && waitTelemetryEnd > waitCall,
+    "wait telemetry must bracket the actual waitUntilNextTick call");
+  assert.ok(tickCheckpoint < tickTelemetryEnd && tickTelemetryEnd < waitTelemetryStart,
+    "wait telemetry must start after the tick checkpoint/telemetry end boundary");
+  assertRunServerWaitTelemetryOrder(runServer, "26.2");
   const pollTask = method(bytecode, "protected boolean pollTask();", "private boolean pollTaskInternal");
   assert.equal(occurrences(pollTask, "BrowserWorldgenScheduler.beginTaskWork"), 1,
     "MinecraftServer.pollTask must enter one active-work task scope");

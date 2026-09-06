@@ -15059,6 +15059,24 @@ public final class MinecraftClientPatcher {
                 false);
     }
 
+    private static MethodInsnNode browserServerWaitTelemetryBegin() {
+        return new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserWorldgenScheduler",
+                "beginServerWaitTelemetry",
+                "()V",
+                false);
+    }
+
+    private static MethodInsnNode browserServerWaitTelemetryEnd() {
+        return new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserWorldgenScheduler",
+                "endServerWaitTelemetry",
+                "()V",
+                false);
+    }
+
     private static void requireWorldgenSchedulerCalls(
             String label, MethodNode method, int expectedCalls) {
         int pulses = 0;
@@ -16939,6 +16957,7 @@ public final class MinecraftClientPatcher {
         boolean patchedRunServerReady = false;
         boolean patchedRunServerTickYield = false;
         boolean patchedRunServerTickTelemetry = false;
+        boolean patchedRunServerWaitTelemetry = false;
         boolean patchedRunServerStopDiagnostics = false;
         boolean patchedRunServerBrowserCatchupReset = false;
         boolean patchedRunServerStoppedSignal = false;
@@ -17223,6 +17242,25 @@ public final class MinecraftClientPatcher {
                         break;
                     }
                 }
+                int waitUntilNextTickCalls = 0;
+                for (var instruction : method.instructions.toArray()) {
+                    if (!(instruction instanceof MethodInsnNode call)
+                            || call.getOpcode() != Opcodes.INVOKEVIRTUAL
+                            || !call.owner.equals(owner)
+                            || !call.name.equals("waitUntilNextTick")
+                            || !call.desc.equals("()V")) {
+                        continue;
+                    }
+                    method.instructions.insertBefore(call, browserServerWaitTelemetryBegin());
+                    method.instructions.insert(call, browserServerWaitTelemetryEnd());
+                    waitUntilNextTickCalls++;
+                }
+                if (waitUntilNextTickCalls != 1) {
+                    throw new IllegalStateException(
+                            "MinecraftServer runServer waitUntilNextTick shape changed: "
+                                    + waitUntilNextTickCalls);
+                }
+                patchedRunServerWaitTelemetry = true;
                 patchedRunServerStopDiagnostics = hookMinecraftServerStopDiagnostics(method);
                 patchedRunServerBrowserCatchupReset = patchMinecraftServerBrowserCatchupReset(method, owner);
                 int stoppedSignals = 0;
@@ -17256,6 +17294,7 @@ public final class MinecraftClientPatcher {
                 || !patchedRunServerReady
                 || !patchedRunServerTickYield
                 || !patchedRunServerTickTelemetry
+                || !patchedRunServerWaitTelemetry
                 || !patchedRunServerStopDiagnostics
                 || !patchedRunServerBrowserCatchupReset
                 || !patchedRunServerStoppedSignal
