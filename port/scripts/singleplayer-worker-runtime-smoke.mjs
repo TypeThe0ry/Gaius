@@ -1639,6 +1639,7 @@ function snapshotTelemetryPong(message) {
     chunkPriorityStats: copyObjectSnapshot(message.chunkPriority),
     networkStats: copyObjectSnapshot(message.network),
     worldgenStats: copyObjectSnapshot(message.worldgen),
+    serverTickStats: copyObjectSnapshot(message.serverTick),
     storageStats: copyObjectSnapshot(message.storage),
   };
 }
@@ -1665,11 +1666,93 @@ function recentTelemetryAuxiliarySnapshot(samples, field, fallback) {
   return copyObjectSnapshot(fallback);
 }
 
+function serverTickWindow(start, end) {
+  const fields = [
+    "intervalCount",
+    "totalTickIntervalMillis",
+    "completedTickCount",
+    "totalTickDurationMillis",
+    "completedWaitPhaseCount",
+    "totalWaitPhaseDurationMillis",
+  ];
+  if (start === null || end === null || start === undefined || end === undefined) {
+    return {available: false, reason: "missing"};
+  }
+  const delta = {};
+  for (const field of fields) {
+    const finish = end[field];
+    const begin = start[field];
+    if (typeof finish !== "number" || typeof begin !== "number" ||
+        !Number.isFinite(finish) || !Number.isFinite(begin)) {
+      return {available: false, reason: "missing-counter", field};
+    }
+    delta[field] = finish - begin;
+    if (delta[field] < 0) {
+      return {available: false, reason: "counter-reset", field};
+    }
+  }
+  const elapsedMillis = end.sampledAtMillis - start.sampledAtMillis;
+  if (!Number.isFinite(start.sampledAtMillis) || !Number.isFinite(end.sampledAtMillis) ||
+      elapsedMillis <= 0) {
+    return {available: false, reason: "invalid-sample-window"};
+  }
+  return {
+    available: true,
+    schemaVersion: Number(end.schemaVersion) || null,
+    intervalCount: delta.intervalCount,
+    completedTickCount: delta.completedTickCount,
+    elapsedMillis,
+    totalTickIntervalMillis: delta.totalTickIntervalMillis,
+    totalTickDurationMillis: delta.totalTickDurationMillis,
+    completedWaitPhaseCount: delta.completedWaitPhaseCount,
+    totalWaitPhaseDurationMillis: delta.totalWaitPhaseDurationMillis,
+    observedTps: delta.intervalCount * 1000 / elapsedMillis,
+  };
+}
+
+function runServerTickWindowSelfSmoke() {
+  const base = {
+    schemaVersion: 1, sampledAtMillis: 6000, intervalCount: 100, totalTickIntervalMillis: 5000,
+    completedTickCount: 100, totalTickDurationMillis: 1200,
+    completedWaitPhaseCount: 100, totalWaitPhaseDurationMillis: 3800,
+  };
+  const twenty = serverTickWindow(base, {
+    ...base, sampledAtMillis: 11000, intervalCount: 200, totalTickIntervalMillis: 10000,
+    completedTickCount: 200, totalTickDurationMillis: 2400,
+    completedWaitPhaseCount: 200, totalWaitPhaseDurationMillis: 7600,
+  });
+  if (!twenty.available || twenty.observedTps !== 20 || twenty.elapsedMillis !== 5000 ||
+      twenty.completedWaitPhaseCount !== 100 || twenty.totalWaitPhaseDurationMillis !== 3800) {
+    throw new Error("20 TPS server tick window self-smoke failed");
+  }
+  const seven = serverTickWindow(base, {
+    ...base, sampledAtMillis: 11000, intervalCount: 135, totalTickIntervalMillis: 10000,
+    completedTickCount: 135, totalTickDurationMillis: 6500,
+    completedWaitPhaseCount: 135, totalWaitPhaseDurationMillis: 7300,
+  });
+  if (!seven.available || Math.abs(seven.observedTps - 7) > 1e-9 ||
+      seven.completedWaitPhaseCount !== 35) {
+    throw new Error("7 TPS server tick window self-smoke failed");
+  }
+  if (serverTickWindow(null, base).reason !== "missing" ||
+      serverTickWindow({...base, intervalCount: null}, base).reason !== "missing-counter" ||
+      serverTickWindow({...base, intervalCount: "100"}, base).reason !== "missing-counter" ||
+      serverTickWindow({...base, intervalCount: 300}, base).reason !== "counter-reset") {
+    throw new Error("missing/reset server tick window self-smoke failed");
+  }
+  const stalled = serverTickWindow(base, {...base, sampledAtMillis: 11000});
+  if (!stalled.available || stalled.observedTps !== 0 || stalled.elapsedMillis !== 5000) {
+    throw new Error("unfinished long tick must remain in the wall-time TPS window");
+  }
+  return {ok: true, twentyTps: true, sevenTps: true, missingUnavailable: true, resetRejected: true};
+}
+
 function runTelemetrySnapshotSelfSmoke() {
   const oldWindow = {
     chunkPriorityStats: {window: "old"},
     networkStats: {window: "old"},
     worldgenStats: {window: "old"},
+    serverTickStats: {window: "old"},
     storageStats: {window: "old"},
   };
   const stalePong = {
@@ -1677,6 +1760,7 @@ function runTelemetrySnapshotSelfSmoke() {
     chunkPriority: {window: "stale"},
     network: {window: "stale"},
     worldgen: {window: "stale"},
+    serverTick: {window: "stale"},
     storage: {window: "stale"},
   };
   const afterStale = updateLatestTelemetrySnapshots(
@@ -1692,6 +1776,7 @@ function runTelemetrySnapshotSelfSmoke() {
     chunkPriority: {window: "reset"},
     network: {window: "reset"},
     worldgen: {window: "reset"},
+    serverTick: {window: "reset"},
     storage: {window: "reset"},
   };
   const afterReset = updateLatestTelemetrySnapshots(
@@ -1703,6 +1788,7 @@ function runTelemetrySnapshotSelfSmoke() {
     "chunkPriorityStats",
     "networkStats",
     "worldgenStats",
+    "serverTickStats",
     "storageStats",
   ]) {
     if (afterReset[field]?.window !== "reset") {
@@ -1941,6 +2027,7 @@ if (runtimeSelfTest) {
   const selfTestOutput = JSON.stringify({
     ...runNetworkValidationSelfSmoke(),
     telemetrySnapshots: runTelemetrySnapshotSelfSmoke(),
+    serverTickWindow: runServerTickWindowSelfSmoke(),
     slowProbe: runSlowProbeSelfSmoke(),
     errorSerialization: runErrorSerializationSelfSmoke(),
     timeoutEvidence: runWorkerEventLoopEvidenceSelfSmoke(),
@@ -1977,6 +2064,7 @@ if (isMainThread && !runtimeSelfTest) {
   const events = [];
   let finished = false;
   const skipMining = process.env.GAIUS_SMOKE_SKIP_MINING === "1";
+  const serverTickTelemetryEnabled = process.env.GAIUS_SMOKE_SERVER_TICK_TELEMETRY === "1";
   const mobAiStress = process.env.GAIUS_SMOKE_MOB_AI_STRESS === "1";
   const stopAtFirstChunk = process.env.GAIUS_SMOKE_STOP_AT_FIRST_CHUNK === "1";
   const roamSteps = Number(process.env.GAIUS_SMOKE_ROAM_STEPS || "0");
@@ -2213,6 +2301,9 @@ if (isMainThread && !runtimeSelfTest) {
   let latestNetworkStats = null;
   let latestNetworkStatsMeta = null;
   let latestWorldgenStats = null;
+  let latestServerTickStats = null;
+  let latestServerTickWindowEnd = null;
+  let serverTickWindowStart = null;
   let latestStorageStats = null;
   let lastWorldgenTraceAt = 0;
   const snapshotFromSlowProbeSample = (sample) => ({
@@ -2515,6 +2606,11 @@ if (isMainThread && !runtimeSelfTest) {
         "worldgenStats",
         latestWorldgenStats,
       ),
+      serverTickStats: recentTelemetryAuxiliarySnapshot(
+        samples,
+        "serverTickStats",
+        latestServerTickStats,
+      ),
       storageStats: recentTelemetryAuxiliarySnapshot(
         samples,
         "storageStats",
@@ -2713,6 +2809,7 @@ if (isMainThread && !runtimeSelfTest) {
       preStopTelemetryBarrier.chunkPriorityStats,
     );
     latestWorldgenStats = copyObjectSnapshot(preStopTelemetryBarrier.worldgenStats);
+    latestServerTickStats = copyObjectSnapshot(preStopTelemetryBarrier.serverTickStats);
     latestStorageStats = copyObjectSnapshot(preStopTelemetryBarrier.storageStats);
     await finishCpuProfileBeforeShutdown();
     if (finished) {
@@ -2837,6 +2934,10 @@ if (isMainThread && !runtimeSelfTest) {
       protocolReady: protocolReadyAt > 0,
       protocolReadyAt,
       postReadySoak: postReadySoakEvidence(),
+      ...(serverTickTelemetryEnabled ? {
+        serverTickStats: latestServerTickStats,
+        serverTickWindow: serverTickWindow(serverTickWindowStart, latestServerTickWindowEnd),
+      } : {}),
       slowProbeEvidence: timeoutEventLoopEvidence.slowProbeEvidence,
       workerEventLoopLatency: timeoutEventLoopEvidence.workerEventLoopLatency,
     });
@@ -2912,6 +3013,10 @@ if (isMainThread && !runtimeSelfTest) {
         postStopped: postStopTelemetryBarrier,
       },
       worldgenStats: latestWorldgenStats,
+      ...(serverTickTelemetryEnabled ? {
+        serverTickStats: latestServerTickStats,
+        serverTickWindow: serverTickWindow(serverTickWindowStart, latestServerTickWindowEnd),
+      } : {}),
       storageStats: latestStorageStats,
     };
     events.push(protocolFinalEvent);
@@ -3104,6 +3209,7 @@ if (isMainThread && !runtimeSelfTest) {
           };
         }
         latestWorldgenStats = latest.worldgenStats;
+        latestServerTickStats = latest.serverTickStats;
         latestStorageStats = latest.storageStats;
       }
       pending.resolve({
@@ -3138,6 +3244,15 @@ if (isMainThread && !runtimeSelfTest) {
         message.worldgenStats !== undefined
         ? copyObjectSnapshot(message.worldgenStats)
         : latestWorldgenStats;
+      if (serverTickTelemetryEnabled && message.serverTickStats !== null &&
+          message.serverTickStats !== undefined) {
+        latestServerTickStats = copyObjectSnapshot(message.serverTickStats);
+        latestServerTickWindowEnd = copyObjectSnapshot(message.serverTickStats);
+        if (serverTickWindowStart === null && protocolReadyAt > 0 &&
+            Number(message.workerStartEpochMs) >= protocolReadyAt) {
+          serverTickWindowStart = copyObjectSnapshot(message.serverTickStats);
+        }
+      }
       latestStorageStats = message.storageStats !== null &&
         message.storageStats !== undefined
         ? copyObjectSnapshot(message.storageStats)
@@ -3418,6 +3533,7 @@ if (isMainThread && !runtimeSelfTest) {
     storageDatabaseName: storageConfig.storageDatabaseName,
     storagePrefix: storageConfig.storagePrefix,
     storageOpfsDirectory: storageConfig.storageOpfsDirectory,
+    gaiusServerTickTelemetry: serverTickTelemetryEnabled,
     renderDistance: 8,
     simulationDistance: 5,
     distanceRampIntervalMillis: distanceRampIntervalMillis === undefined
@@ -3514,6 +3630,10 @@ if (isMainThread && !runtimeSelfTest) {
       const worldgenStats = globalThis.__gaiusWorldgenStats
         ? {...globalThis.__gaiusWorldgenStats}
         : null;
+      const serverTickStats = globalThis.__gaiusServerTickTelemetryEnabled === true &&
+        globalThis.__gaiusServerTickTelemetry
+        ? {...globalThis.__gaiusServerTickTelemetry, sampledAtMillis: workerStartMonoMs}
+        : null;
       const storageStats = globalThis.__gaiusStorageStats
         ? {...globalThis.__gaiusStorageStats}
         : null;
@@ -3555,6 +3675,7 @@ if (isMainThread && !runtimeSelfTest) {
         chunkPriorityStats,
         networkStats,
         worldgenStats,
+        serverTickStats,
         storageStats,
       });
       return;
