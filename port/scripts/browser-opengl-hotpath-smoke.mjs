@@ -200,6 +200,7 @@ const state = {
   boundBuffers: new Map(),
   bufferBytes: new Map(),
   bufferSizes: new Map(),
+  bufferWebglTypes: new Map(),
   bufferVersionBumps: 0,
   bufferShadowDrops: 0,
   buffers: objects,
@@ -262,6 +263,11 @@ globalThis.window = {
   __gaiusGLStats: {},
   __gaiusWebGL: gl,
 };
+
+const typeHelperStart = source.indexOf("window.__gaiusGL.noteBufferWebglType=function");
+const typeHelperEnd = source.indexOf("window.__gaiusGL.crossKindBufferCopy=function", typeHelperStart);
+assert.ok(typeHelperStart >= 0 && typeHelperEnd > typeHelperStart);
+Function(source.slice(typeHelperStart, typeHelperEnd))();
 
 run("drawBuffersJs", ["buffers"], [new Int32Array([0x8ce0, 0x8ce1])]);
 assert.deepEqual([...calls.drawBuffers.at(-1)], [0x8ce0, 0x8ce1]);

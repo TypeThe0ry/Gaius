@@ -93,6 +93,7 @@ public final class BrowserOpenGL {
               window.__gaiusGL={next:1,textures:new Map(),buffers:new Map(),shaders:new Map(),
                 programs:new Map(),framebuffers:new Map(),vaos:new Map(),samplers:new Map(),syncs:new Map(),
                 bufferSizes:new Map(),bufferBytes:new Map(),bufferVersions:new Map(),boundBuffers:new Map(),
+                bufferWebglTypes:new Map(),bufferCopyScratch:null,bufferCopyScratchBytes:0,
                 bufferShadowTouch:new Map(),bufferShadowClock:0,bufferShadowTotalBytes:0,
                 bufferShadowPeakBytes:0,
                 shadowRequiredBuffers:new Set(),
@@ -893,6 +894,79 @@ public final class BrowserOpenGL {
                 if (target===0x8C2A) return true;
                 if (target===gl.ARRAY_BUFFER) return this.bufferNeedsArrayShadow(buffer|0);
                 return false;
+              };
+              // WebGL classifies a buffer on its first bind. ELEMENT_ARRAY_BUFFER
+              // establishes the index class; even an initial COPY bind means other data.
+              window.__gaiusGL.noteBufferWebglType=function(target,buffer) {
+                const id=buffer|0;
+                if (!id) return;
+                const gl=window.__gaiusWebGL;
+                const type=target===gl.ELEMENT_ARRAY_BUFFER ? 1 : 2;
+                const previous=this.bufferWebglTypes.get(id)|0;
+                if (!previous) this.bufferWebglTypes.set(id,type);
+              };
+              window.__gaiusGL.crossKindBufferCopy=function(
+                  sourceTarget,targetTarget,sourceBuffer,targetBuffer,sourceOffset,targetOffset,size) {
+                const gl=window.__gaiusWebGL;
+                const length=Number(size);
+                const start=Number(sourceOffset);
+                const targetStart=Number(targetOffset);
+                const sourceKnown=Number(this.bufferSizes.get(sourceBuffer|0));
+                const targetKnown=Number(this.bufferSizes.get(targetBuffer|0));
+                if (!this.buffers.has(sourceBuffer|0) || !this.buffers.has(targetBuffer|0)) return false;
+                if (!Number.isFinite(start) || start<0 || !Number.isFinite(targetStart)
+                    || targetStart<0 || !Number.isFinite(length) || length<0
+                    || !Number.isFinite(sourceKnown) || !Number.isFinite(targetKnown)
+                    || start+length>sourceKnown || targetStart+length>targetKnown
+                    || (sourceBuffer|0)===(targetBuffer|0)
+                      && start<targetStart+length && targetStart<start+length) return false;
+                if (!length) return true;
+                const max=8*1024*1024;
+                const source=this.bufferBytes.get(sourceBuffer|0);
+                const targetShadow=this.bufferBytes.get(targetBuffer|0);
+                let readback=false;
+                for (let done=0; done<length; done+=max) {
+                  const part=Math.min(max,length-done);
+                  let bytes;
+                  if (source && source.byteLength===sourceKnown
+                      && source.byteLength >= start+done+part) {
+                    bytes=source.subarray(start+done,start+done+part);
+                  } else {
+                    if (!this.bufferCopyScratch || this.bufferCopyScratch.byteLength<part) {
+                      this.bufferCopyScratch=new Uint8Array(part);
+                      this.bufferCopyScratchBytes=part;
+                    }
+                    bytes=this.bufferCopyScratch.subarray(0,part);
+                    const previousRead=this.boundBuffers.get(sourceTarget)|0;
+                    const previousObject=previousRead ? this.buffers.get(previousRead) : null;
+                    const object=this.buffers.get(sourceBuffer|0);
+                    if (!object || !gl.getBufferSubData) return false;
+                    try {
+                      if (previousRead!==(sourceBuffer|0)) gl.bindBuffer(sourceTarget,object);
+                      gl.getBufferSubData(sourceTarget,start+done,bytes);
+                      readback=true;
+                    } finally {
+                      if (previousRead!==(sourceBuffer|0)) gl.bindBuffer(sourceTarget,previousObject);
+                    }
+                  }
+                  gl.bufferSubData(targetTarget,targetStart+done,bytes);
+                  if (targetShadow && targetShadow.byteLength===targetKnown)
+                    targetShadow.set(bytes,targetStart+done);
+                }
+                if (targetShadow && targetShadow.byteLength===targetKnown
+                    && targetStart>=0 && targetStart+length<=targetKnown) {
+                  this.touchBufferShadow(targetBuffer|0,targetShadow.byteLength);
+                  this.bumpBufferVersion(targetBuffer|0);
+                } else {
+                  if (!this.dropBufferShadow(targetBuffer|0,'cross-kind-copy'))
+                    this.bumpBufferVersion(targetBuffer|0);
+                }
+                const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+                stats.crossKindBufferCopies=(stats.crossKindBufferCopies||0)+1;
+                stats.crossKindBufferCopyBytes=(stats.crossKindBufferCopyBytes||0)+length;
+                if (readback)
+                  stats.crossKindBufferCopyReadbacks=(stats.crossKindBufferCopyReadbacks||0)+1;
+                return true;
               };
               window.__gaiusGL.shadowBufferDataForTarget=function(target,buffer,data,size) {
                 if (this.shouldShadowBufferTarget(target,buffer)) {
@@ -4312,6 +4386,7 @@ public final class BrowserOpenGL {
             state.forgetPhysicalElementBuffer(object);
             if (object) window.__gaiusWebGL.deleteBuffer(object); state.buffers.delete(buffer);
             state.bufferSizes.delete(buffer);
+            state.bufferWebglTypes.delete(buffer|0);
             state.deleteBufferShadow(buffer);
             if (state.shadowRequiredBuffers) state.shadowRequiredBuffers.delete(buffer|0);
             if (state.misalignedBufferRefs) state.misalignedBufferRefs.delete(buffer|0);
@@ -4367,6 +4442,7 @@ public final class BrowserOpenGL {
               const nextId=buffer|0;
               if ((vao.elementArrayBuffer|0)===nextId) {
                 state.bindPhysicalElementBuffer(vao,vao.elementArrayBufferObject || null);
+                if (buffer) state.noteBufferWebglType(target,buffer);
                 if (current!==nextId) state.boundBuffers.set(target,nextId);
                 return;
               }
@@ -4375,16 +4451,19 @@ public final class BrowserOpenGL {
               state.replaceVaoBufferRef(vao,vao.elementArrayBuffer|0,nextId);
               vao.elementArrayBuffer=nextId;
               vao.elementArrayBufferObject=object || null;
+              if (buffer) state.noteBufferWebglType(target,buffer);
               if (current!==nextId) state.boundBuffers.set(target,nextId);
               return;
             }
             if (target!==gl.ELEMENT_ARRAY_BUFFER && current===(buffer|0)) {
+              if (buffer) state.noteBufferWebglType(target,buffer);
               return;
             }
             if (buffer && target===0x8C2A) {
               state.markBufferShadowRequired(buffer,'target:'+target);
             }
             gl.bindBuffer(target,buffer===0?null:state.buffers.get(buffer));
+            if (buffer) state.noteBufferWebglType(target,buffer);
             state.boundBuffers.set(target,buffer);
             """)
     public static native void bindBuffer(int target, int buffer);
@@ -4470,6 +4549,7 @@ public final class BrowserOpenGL {
             const bindingMatches=previousId===(buffer|0);
             if (!bindingMatches) gl.bindBuffer(gl.COPY_WRITE_BUFFER,state.buffers.get(buffer));
             gl.bufferData(gl.COPY_WRITE_BUFFER,actual,usage);
+            if (buffer) state.noteBufferWebglType(gl.COPY_WRITE_BUFFER,buffer);
             state.noteBufferUpload(0,actual,'storage');
             if (buffer) {
               state.bufferSizes.set(buffer,actual);
@@ -4498,6 +4578,7 @@ public final class BrowserOpenGL {
             const bindingMatches=previousId===(buffer|0);
             if (!bindingMatches) gl.bindBuffer(gl.COPY_WRITE_BUFFER,state.buffers.get(buffer));
             gl.bufferData(gl.COPY_WRITE_BUFFER,upload,usage);
+            if (buffer) state.noteBufferWebglType(gl.COPY_WRITE_BUFFER,buffer);
             state.noteBufferUpload(sourceBytes,actual,'data');
             if (buffer) {
               state.bufferSizes.set(buffer,actual);
@@ -4523,6 +4604,7 @@ public final class BrowserOpenGL {
             const bindingMatches=previousId===(buffer|0);
             if (!bindingMatches) gl.bindBuffer(gl.COPY_WRITE_BUFFER,state.buffers.get(buffer));
             gl.bufferSubData(gl.COPY_WRITE_BUFFER,Number(offset),data);
+            if (buffer) state.noteBufferWebglType(gl.COPY_WRITE_BUFFER,buffer);
             state.noteBufferUpload(data ? data.byteLength : 0,data ? data.byteLength : 0,'subData');
             if (buffer && data) {
               const start=Number(offset);
@@ -6195,6 +6277,7 @@ public final class BrowserOpenGL {
                 && Number(previous.size)===range) return;
             window.__gaiusWebGL.bindBufferRange(
               target,index,buffer===0?null:state.buffers.get(buffer),Number(offset),range);
+            if (buffer) state.noteBufferWebglType(target,buffer);
             if (!previous) {
               previous={};
               state.indexedBufferBindings.set(key,previous);
@@ -6220,6 +6303,7 @@ public final class BrowserOpenGL {
                 && (previous.buffer|0)===(buffer|0)) return;
             window.__gaiusWebGL.bindBufferBase(
               target,index,buffer===0?null:state.buffers.get(buffer));
+            if (buffer) state.noteBufferWebglType(target,buffer);
             if (!previous) {
               previous={};
               state.indexedBufferBindings.set(key,previous);
@@ -6234,10 +6318,24 @@ public final class BrowserOpenGL {
             if (sourceTarget===gl.ELEMENT_ARRAY_BUFFER || targetTarget===gl.ELEMENT_ARRAY_BUFFER) {
               state.ensureLogicalElementBuffer(state.getVaoEmu());
             }
-            gl.copyBufferSubData(
-              sourceTarget,targetTarget,Number(sourceOffset),Number(targetOffset),Number(size));
             const sourceBuffer=state.boundBuffers.get(sourceTarget)|0;
             const targetBuffer=state.boundBuffers.get(targetTarget)|0;
+            const sourceType=(state.bufferWebglTypes
+              && state.bufferWebglTypes.get(sourceBuffer)|0) || 2;
+            const targetType=(state.bufferWebglTypes
+              && state.bufferWebglTypes.get(targetBuffer)|0) || 2;
+            const crossKind=sourceBuffer && targetBuffer && sourceType!==targetType;
+            if (crossKind) {
+              // WebGL rejects element-array <-> other-data copies even when both
+              // objects are correctly bound to COPY_READ/COPY_WRITE.  Use the
+              // WebGL buffer read/write APIs for this bounded compatibility case.
+              const copied=state.crossKindBufferCopy(
+                sourceTarget,targetTarget,sourceBuffer,targetBuffer,
+                sourceOffset,targetOffset,size);
+              if (copied) return;
+            }
+            gl.copyBufferSubData(
+              sourceTarget,targetTarget,Number(sourceOffset),Number(targetOffset),Number(size));
             const source=state.bufferBytes.get(sourceBuffer);
             const start=Number(sourceOffset);
             const targetStart=Number(targetOffset);
@@ -6291,6 +6389,30 @@ public final class BrowserOpenGL {
             const writeBindingMatches=previousWriteId===(targetBuffer|0);
             if (!readBindingMatches) gl.bindBuffer(gl.COPY_READ_BUFFER,state.buffers.get(sourceBuffer));
             if (!writeBindingMatches) gl.bindBuffer(gl.COPY_WRITE_BUFFER,state.buffers.get(targetBuffer));
+            if (state.noteBufferWebglType) {
+              if (sourceBuffer) state.noteBufferWebglType(gl.COPY_READ_BUFFER,sourceBuffer);
+              if (targetBuffer) state.noteBufferWebglType(gl.COPY_WRITE_BUFFER,targetBuffer);
+            }
+            const sourceType=(state.bufferWebglTypes
+              && state.bufferWebglTypes.get(sourceBuffer)|0) || 2;
+            const targetType=(state.bufferWebglTypes
+              && state.bufferWebglTypes.get(targetBuffer)|0) || 2;
+            if (sourceBuffer && targetBuffer && sourceType!==targetType) {
+              try {
+                const copied=state.crossKindBufferCopy(
+                    gl.COPY_READ_BUFFER,gl.COPY_WRITE_BUFFER,
+                    sourceBuffer,targetBuffer,sourceOffset,targetOffset,size);
+                if (copied) {
+                  if (!readBindingMatches) gl.bindBuffer(gl.COPY_READ_BUFFER,previousRead);
+                  if (!writeBindingMatches) gl.bindBuffer(gl.COPY_WRITE_BUFFER,previousWrite);
+                  return;
+                }
+              } catch (error) {
+                if (!readBindingMatches) gl.bindBuffer(gl.COPY_READ_BUFFER,previousRead);
+                if (!writeBindingMatches) gl.bindBuffer(gl.COPY_WRITE_BUFFER,previousWrite);
+                throw error;
+              }
+            }
             gl.copyBufferSubData(
               gl.COPY_READ_BUFFER,gl.COPY_WRITE_BUFFER,Number(sourceOffset),Number(targetOffset),Number(size));
             if (targetBuffer) {

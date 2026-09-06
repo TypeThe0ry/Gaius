@@ -108,10 +108,14 @@ jobs:
             port/src/main/java/dev/gaius/browser/BrowserSingleplayerClient.java \
             port/src/main/java/dev/gaius/browser/BrowserBlockBreakingTelemetry.java \
             port/src/main/java/dev/gaius/browser/BrowserGuiEntityTelemetry.java \
-            port/overrides/libraries/slf4j/src/main/java/org/slf4j/impl/BrowserLogger.java
+            port/overrides/libraries/slf4j/src/main/java/org/slf4j/impl/BrowserLogger.java \
+            port/overrides/libraries/lwjgl-opengl/src/main/java/org/lwjgl/opengl/BrowserOpenGL.java
           node port/scripts/block-breaking-telemetry-smoke.mjs
           node port/scripts/server-tick-telemetry-smoke.mjs
           node port/scripts/singleplayer-client-session-smoke.mjs
+          node port/scripts/browser-opengl-cross-kind-copy-smoke.mjs
+          node port/scripts/browser-opengl-hotpath-smoke.mjs
+          node port/scripts/browser-buffer-shadow-policy-smoke.mjs
 
       - name: Fetch and verify local Minecraft inputs
         run: |
