@@ -2211,6 +2211,7 @@ if (isMainThread && !runtimeSelfTest) {
   };
   let latestChunkPriorityStats = null;
   let latestNetworkStats = null;
+  let latestNetworkStatsMeta = null;
   let latestWorldgenStats = null;
   let latestStorageStats = null;
   let lastWorldgenTraceAt = 0;
@@ -2337,6 +2338,7 @@ if (isMainThread && !runtimeSelfTest) {
       stage,
       resolve: wait.resolve,
       timer: 0,
+      sentAt: Date.now(),
     };
     pendingTelemetryPongs.set(sequence, pending);
     const settle = (result) => {
@@ -3038,6 +3040,7 @@ if (isMainThread && !runtimeSelfTest) {
       detail: error.stack || String(error),
       chunkPriorityStats: latestChunkPriorityStats,
       networkStats: latestNetworkStats,
+      networkStatsMeta: latestNetworkStatsMeta,
       worldgenStats: latestWorldgenStats,
       storageStats: latestStorageStats,
       distanceRampIntervalMillis: configuredDistanceRampIntervalMillis,
@@ -3092,6 +3095,14 @@ if (isMainThread && !runtimeSelfTest) {
         );
         latestChunkPriorityStats = latest.chunkPriorityStats;
         latestNetworkStats = latest.networkStats;
+        if (message.network !== null && message.network !== undefined) {
+          latestNetworkStatsMeta = {
+            source: "telemetry-pong",
+            sequence,
+            sentAt: pending.sentAt,
+            receivedAt: Date.now(),
+          };
+        }
         latestWorldgenStats = latest.worldgenStats;
         latestStorageStats = latest.storageStats;
       }
@@ -3114,6 +3125,15 @@ if (isMainThread && !runtimeSelfTest) {
       latestNetworkStats = message.networkStats !== null && message.networkStats !== undefined
         ? copyObjectSnapshot(message.networkStats)
         : latestNetworkStats;
+      if (message.networkStats !== null && message.networkStats !== undefined) {
+        const probe = eventLoopProbeStartedAt.get(message.probeId);
+        latestNetworkStatsMeta = {
+          source: "node-event-loop-pong",
+          probeId: message.probeId,
+          sentAt: probe?.parentSendEpochMs,
+          receivedAt: Date.now(),
+        };
+      }
       latestWorldgenStats = message.worldgenStats !== null &&
         message.worldgenStats !== undefined
         ? copyObjectSnapshot(message.worldgenStats)
@@ -3663,6 +3683,7 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
   let buffered = new Uint8Array(0);
   let packetWork = Promise.resolve();
   let remotePaused = false;
+  let transportCloseRequested = false;
   let loginStarted = false;
   const pendingSends = [];
   const state = {
@@ -3711,6 +3732,15 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
     blockActionProbeWaitReason: undefined,
     transportClosed: false,
     probeFailed: false,
+    sendEnqueuedCount: 0,
+    sendEnqueuedBytes: 0,
+    sendFlushedCount: 0,
+    sendFlushedBytes: 0,
+    sendLastEnqueuedAt: undefined,
+    sendLastFlushedAt: undefined,
+    transportCloseRequestedAt: undefined,
+    transportCloseReceivedAt: undefined,
+    transportCloseReason: undefined,
     blockActionStopTimer: undefined,
     blockActionAckTimer: undefined,
     blockActionRetryTimer: undefined,
@@ -3773,14 +3803,7 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
   port.onmessage = (event) => {
     const message = event.data;
     if (isControlMessage(message)) {
-      if (message.type === "flow") {
-        remotePaused = Boolean(message.paused);
-        if (!remotePaused) {
-          flushSends();
-        }
-      } else if (message.type === "close" && state.chunkPackets === 0) {
-        ready.reject(new Error("Local server transport closed before PLAY chunk data arrived"));
-      }
+      handleTransportControl(message);
       return;
     }
     if (!(message instanceof ArrayBuffer) && !ArrayBuffer.isView(message)) {
@@ -3797,6 +3820,31 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
     ready.reject(new Error("Local server MessagePort could not decode a message"));
   };
   port.start();
+
+  function handleTransportControl(message) {
+    if (message.type === "flow") {
+      remotePaused = Boolean(message.paused);
+      if (!remotePaused) flushSends();
+      return;
+    }
+    if (message.type !== "close") return;
+    if (state.transportClosed) {
+      if (transportCloseRequested && state.transportCloseReceivedAt === undefined) {
+        state.transportCloseReceivedAt = Date.now();
+        state.transportCloseReason = "local-close-ack";
+      }
+      return;
+    }
+    const closeWasRequested = transportCloseRequested;
+    closeTransport(false);
+    state.transportCloseReceivedAt = Date.now();
+    state.transportCloseReason = closeWasRequested ? "local-close-ack" : "remote-close";
+    if (!closeWasRequested) {
+      ready.reject(new Error(state.chunkPackets === 0
+        ? "Local server transport closed before PLAY chunk data arrived"
+        : "Local server transport closed after PLAY chunk data arrived"));
+    }
+  }
 
   function startLogin() {
     if (loginStarted) {
@@ -3818,9 +3866,13 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
     send(encodePacket(0, hello));
   }
 
-  function closeTransport() {
+  function closeTransport(sendClose = true) {
     if (state.transportClosed) {
       return;
+    }
+    if (sendClose) {
+      transportCloseRequested = true;
+      state.transportCloseRequestedAt = Date.now();
     }
     state.transportClosed = true;
     state.probeFailed = true;
@@ -3835,10 +3887,8 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
     clearTimeout(state.blockDropTimer);
     clearTimeout(state.blockReboundTimer);
     try {
-      port.postMessage({type: "close"});
-    } finally {
-      port.close();
-    }
+      if (sendClose) port.postMessage({type: "close"});
+    } finally { port.close(); }
   }
 
   function drainFrames() {
@@ -4557,6 +4607,12 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
   }
 
   function send(bytes, onSent) {
+    if (state.transportClosed) {
+      return;
+    }
+    state.sendEnqueuedCount++;
+    state.sendEnqueuedBytes += bytes.byteLength;
+    state.sendLastEnqueuedAt = Date.now();
     pendingSends.push({bytes, onSent});
     flushSends();
   }
@@ -4645,14 +4701,31 @@ function createProtocolClient(port, sessionId, expectedProfileId, options = {}) 
       chunkBatchAckDelayMs: options.chunkBatchAckDelayMs,
       chunkBatchDesiredRate: options.chunkBatchDesiredRate,
       receivedPacketIds: state.receivedPacketIds,
+      transport: {
+        remotePaused,
+        pendingSends: pendingSends.length,
+        enqueuedCount: state.sendEnqueuedCount,
+        enqueuedBytes: state.sendEnqueuedBytes,
+        flushedCount: state.sendFlushedCount,
+        flushedBytes: state.sendFlushedBytes,
+        lastEnqueuedAt: state.sendLastEnqueuedAt,
+        lastFlushedAt: state.sendLastFlushedAt,
+        closeRequestedAt: state.transportCloseRequestedAt,
+        closeReceivedAt: state.transportCloseReceivedAt,
+        closeReason: state.transportCloseReason,
+        closed: state.transportClosed,
+      },
     };
   }
 
   function flushSends() {
-    while (!remotePaused && pendingSends.length > 0) {
+    while (!state.transportClosed && !remotePaused && pendingSends.length > 0) {
       const {bytes, onSent} = pendingSends.shift();
       const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
       port.postMessage(buffer, [buffer]);
+      state.sendFlushedCount++;
+      state.sendFlushedBytes += bytes.byteLength;
+      state.sendLastFlushedAt = Date.now();
       onSent?.();
     }
   }
