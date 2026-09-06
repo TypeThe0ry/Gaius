@@ -18,9 +18,15 @@ All notable changes to Gaius are documented here.
 - Opt-in counters for server tick intervals over 100/500 ms and tick work or
   wait phases over 500 ms, so measurement windows can expose stalls hidden by
   average TPS. These diagnostics do not change gameplay scheduling.
+- Retain one payload-free inbound frame-limit failure snapshot before channel
+  cleanup, so queue depth and flow-control state remain available after disconnect.
 
 ### Fixed
 
+- Index ZIP resource names once per open archive and limit resource listing to
+  matching prefixes, preserving archive order, overlay paths, and lazy reads.
+  This removes repeated full-archive scans observed during multiplayer loading;
+  rebuilt browser loading and playability acceptance remain pending.
 - Return Minecraft `26.2` chunk-generation batches to the server dispatcher
   through pending futures after at most 16 holders, preserving layer dependency
   ordering and cancellation cleanup. Browser yields alone previously resumed

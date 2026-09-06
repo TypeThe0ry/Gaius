@@ -247,6 +247,7 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/server/packs/VanillaPackResourcesBuilder.class"));
         patchFilePackResourcesBrowserAtlasOverlays(args[0], root.resolve(
                 "net/minecraft/server/packs/FilePackResources$FileResourcesSupplier.class"));
+        patchFilePackResourcesBrowserIndex(args[0], root);
         patchSingleFileBrowserAtlasFallback(args[0], root.resolve(
                 "net/minecraft/client/renderer/texture/atlas/sources/SingleFile.class"));
         patchIndexedAssetSourceBrowserNoop(args[0], root.resolve(
@@ -16693,6 +16694,94 @@ public final class MinecraftClientPatcher {
         code.add(new InsnNode(Opcodes.ARETURN));
         replace(method, code, 1, 0);
         write(node, output);
+    }
+
+    private static void patchFilePackResourcesBrowserIndex(String jar, Path root) throws IOException {
+        String owner = "net/minecraft/server/packs/FilePackResources";
+        String sharedOwner = owner + "$SharedZipFileAccess";
+        String helper = "dev/gaius/browser/BrowserZipResourceIndex";
+        String indexDescriptor = "L" + helper + ";";
+        ClassNode node = read(jar, owner + ".class");
+        ClassNode shared = read(jar, sharedOwner + ".class");
+        MethodNode list = find(node, "listResources",
+                "(Lnet/minecraft/server/packs/PackType;Ljava/lang/String;Ljava/lang/String;"
+                        + "Lnet/minecraft/server/packs/PackResources$ResourceOutput;)V");
+        MethodInsnNode enumerationCall = null;
+        VarInsnNode enumerationStore = null;
+        int zipLocal = -1;
+        int prefixLocal = -1;
+        for (AbstractInsnNode instruction : list.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode call)) continue;
+            if (call.owner.equals("java/util/zip/ZipFile") && call.name.equals("entries")
+                    && call.desc.equals("()Ljava/util/Enumeration;")) {
+                AbstractInsnNode load = previousOpcode(call);
+                AbstractInsnNode store = nextOpcode(call);
+                if (enumerationCall != null || !(load instanceof VarInsnNode zip)
+                        || zip.getOpcode() != Opcodes.ALOAD || !(store instanceof VarInsnNode entries)
+                        || entries.getOpcode() != Opcodes.ASTORE) {
+                    throw new IllegalStateException("Unexpected file pack ZIP enumeration shape");
+                }
+                enumerationCall = call;
+                enumerationStore = entries;
+                zipLocal = zip.var;
+            }
+            if (call.owner.equals("java/lang/String") && call.name.equals("startsWith")
+                    && call.desc.equals("(Ljava/lang/String;)Z")) {
+                AbstractInsnNode load = previousOpcode(call);
+                if (prefixLocal != -1 || !(load instanceof VarInsnNode prefix)
+                        || prefix.getOpcode() != Opcodes.ALOAD) {
+                    throw new IllegalStateException("Unexpected file pack prefix predicate shape");
+                }
+                prefixLocal = prefix.var;
+            }
+        }
+        if (enumerationCall == null || prefixLocal == -1) {
+            throw new IllegalStateException("File pack ZIP enumeration or prefix predicate missing");
+        }
+        VarInsnNode prefixStore = null;
+        for (AbstractInsnNode instruction = enumerationStore.getNext(); instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof VarInsnNode store && store.getOpcode() == Opcodes.ASTORE
+                    && store.var == prefixLocal) {
+                prefixStore = store;
+                break;
+            }
+        }
+        if (prefixStore == null) throw new IllegalStateException("File pack full prefix store missing");
+
+        // Delay enumeration until the full overlay/type/namespace/path prefix is available.
+        // Keep vanilla's validation, relative path conversion and lazy input suppliers intact.
+        list.instructions.insertBefore(enumerationCall, new InsnNode(Opcodes.POP));
+        list.instructions.set(enumerationCall, new InsnNode(Opcodes.ACONST_NULL));
+        shared.fields.add(new FieldNode(0, "browserResourceIndex", indexDescriptor, null, null));
+        InsnList query = new InsnList();
+        query.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        query.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "zipFileAccess", "L" + sharedOwner + ";"));
+        query.add(new InsnNode(Opcodes.DUP));
+        query.add(new FieldInsnNode(Opcodes.GETFIELD, sharedOwner, "browserResourceIndex", indexDescriptor));
+        query.add(new VarInsnNode(Opcodes.ALOAD, zipLocal));
+        query.add(new MethodInsnNode(Opcodes.INVOKESTATIC, helper, "forZip",
+                "(" + indexDescriptor + "Ljava/util/zip/ZipFile;)" + indexDescriptor, false));
+        query.add(new InsnNode(Opcodes.DUP_X1));
+        query.add(new FieldInsnNode(Opcodes.PUTFIELD, sharedOwner, "browserResourceIndex", indexDescriptor));
+        query.add(new VarInsnNode(Opcodes.ALOAD, prefixLocal));
+        query.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, helper, "entries",
+                "(Ljava/lang/String;)Ljava/util/List;", false));
+        query.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "java/util/Collections", "enumeration",
+                "(Ljava/util/Collection;)Ljava/util/Enumeration;", false));
+        query.add(new VarInsnNode(Opcodes.ASTORE, enumerationStore.var));
+        list.instructions.insert(prefixStore, query);
+        list.maxStack = Math.max(list.maxStack, 3);
+
+        MethodNode close = find(shared, "close", "()V");
+        InsnList clear = new InsnList();
+        clear.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        clear.add(new InsnNode(Opcodes.ACONST_NULL));
+        clear.add(new FieldInsnNode(Opcodes.PUTFIELD, sharedOwner, "browserResourceIndex", indexDescriptor));
+        close.instructions.insert(clear);
+        close.maxStack = Math.max(close.maxStack, 2);
+        write(node, root.resolve(owner + ".class"));
+        write(shared, root.resolve(sharedOwner + ".class"));
     }
 
     private static void patchFilePackResourcesBrowserAtlasOverlays(String jar, Path output)

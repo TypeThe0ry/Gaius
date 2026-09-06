@@ -1503,6 +1503,49 @@ assertHighWatermarkEvent(bytePauseEvent, "discard-completed byte watermark");
 assert.equal(bytePauseEvent.reason, "inbound-bytes");
 assert.equal(bytePauseEvent.channelId, bytePauseSocketId);
 
+// Frame-cap failures must retain only bounded queue/accounting state before discard.  The
+// payload is never retained, and a late delivery after fail must not rebuild the queue.
+const frameLimitSessionId = "8123456789abcdef0123456789abcdef";
+const frameLimitSocketId = 95;
+const {port1: frameLimitPort1, port2: frameLimitPort2} = new MessageChannel();
+frameLimitPort1.__gaiusLaunchGeneration = launchGeneration;
+context.__gaiusSingleplayerWorkers.set(frameLimitSessionId, {
+  __gaiusTerminal: false,
+  __gaiusLaunchGeneration: launchGeneration,
+  __gaiusClientPort: frameLimitPort1,
+});
+context.__gaiusLocalServerPorts.set(frameLimitSessionId, frameLimitPort1);
+bridge.open(frameLimitSocketId, `client-${frameLimitSessionId}.gaius-local`, 25565);
+const frameLimitEntry = bridge.channels.get(frameLimitSocketId);
+stats.lastInboundFailure = null;
+for (let index = 0; index < 4097; index++) {
+  bridge.deliverInbound(frameLimitEntry, new Uint8Array([index & 0xff]).buffer);
+}
+const frameLimitFailure = stats.lastInboundFailure;
+assert.ok(frameLimitFailure, "frame-limit failure snapshot was not recorded");
+assert.equal(frameLimitFailure.reason, "frame-limit");
+assert.equal(frameLimitFailure.channelId, frameLimitSocketId);
+assert.equal(frameLimitFailure.totalFrames, 4096,
+  "frame-limit snapshot did not capture pre-cleanup queue depth");
+assert.equal(frameLimitFailure.totalBytes, 4096,
+  "frame-limit snapshot did not capture pre-cleanup queue bytes");
+assert.equal(frameLimitFailure.inboundFrames + frameLimitFailure.pendingFrames,
+  frameLimitFailure.totalFrames);
+assert.equal(frameLimitFailure.inboundBytes + frameLimitFailure.pendingBytes,
+  frameLimitFailure.totalBytes);
+assert.equal(frameLimitEntry.inbound.length, 0,
+  "frame-limit cleanup retained inbound frames");
+assert.equal(frameLimitEntry.pendingInbound.length, 0,
+  "frame-limit cleanup retained pending frames");
+const retainedFrameLimitFailure = JSON.stringify(frameLimitFailure);
+bridge.deliverInbound(frameLimitEntry, new Uint8Array([0]).buffer);
+assert.equal(JSON.stringify(stats.lastInboundFailure), retainedFrameLimitFailure,
+  "late delivery changed the retained frame-limit snapshot");
+assert.equal(frameLimitEntry.inbound.length + frameLimitEntry.pendingInbound.length, 0,
+  "late delivery rebuilt a failed inbound queue");
+bridge.close(frameLimitSocketId);
+frameLimitPort2.close();
+
 bridge.close(socketId);
 port2.close();
 assert.equal(bridge.channels.size, 0, "closed channel remained registered");

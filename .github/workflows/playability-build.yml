@@ -105,6 +105,7 @@ jobs:
           mvn -B -q dependency:get -Dartifact=org.teavm:teavm-tooling:0.15.0
           mvn -B -q dependency:get -Dartifact=org.teavm:teavm-classlib:0.15.0
           node port/scripts/browser-gzip-coroutine-smoke.mjs
+          node port/scripts/browser-zip-resource-index-smoke.mjs
           node port/scripts/teavm-macrotask-yield-smoke.mjs
           node port/scripts/singleplayer-worker-bootstrap-lifecycle-smoke.mjs
           node port/scripts/worldgen-scheduler-smoke.mjs
@@ -114,6 +115,7 @@ jobs:
             port/src/main/java/dev/gaius/browser/BrowserSingleplayerClient.java \
             port/src/main/java/dev/gaius/browser/BrowserBlockBreakingTelemetry.java \
             port/src/main/java/dev/gaius/browser/BrowserGuiEntityTelemetry.java \
+            port/overrides/libraries/netty-transport/src/main/java/io/netty/channel/browser/BrowserWebSocketChannel.java \
             port/overrides/libraries/slf4j/src/main/java/org/slf4j/impl/BrowserLogger.java \
             port/overrides/libraries/lwjgl-opengl/src/main/java/org/lwjgl/opengl/BrowserOpenGL.java
           node port/scripts/block-breaking-telemetry-smoke.mjs
@@ -138,6 +140,15 @@ jobs:
         run: |
           node port/scripts/noise-graph-mapper-smoke.mjs
           node port/scripts/noise-graph-mapper-smoke.mjs --real
+
+      - name: Verify patched ZIP resource listing
+        env:
+          GAIUS_MINECRAFT_VERSION: ${{ matrix.profile }}
+        run: |
+          set -euo pipefail
+          mvn -B -q dependency:get -Dartifact=org.ow2.asm:asm:9.8 -Dtransitive=false
+          mvn -B -q dependency:get -Dartifact=org.ow2.asm:asm-tree:9.8 -Dtransitive=false
+          node port/scripts/browser-zip-resource-patcher-smoke.mjs
 
       - name: Build profile-scoped TeaVM release
         id: compile

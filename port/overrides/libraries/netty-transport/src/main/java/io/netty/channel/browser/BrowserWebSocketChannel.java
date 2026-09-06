@@ -669,6 +669,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               sentBytes: 0,
               receivedFrames: 0,
               receivedBytes: 0,
+              lastInboundFailure: null,
               queuedBytes: 0,
               inboundQueuedBytes: 0,
               peakInboundQueuedBytes: 0,
@@ -2031,6 +2032,53 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             entry.errors.push(String(message || 'Browser bridge error'));
             if (entry.errors.length > 16) entry.errors.splice(0, entry.errors.length - 16);
             state.stats.errors++;
+            if (String(message || '') === 'Browser transport inbound queue exceeded frame limit') {
+              const inboundFrames = Math.max(0, entry.inbound.length - entry.inboundHead);
+              const pendingFrames = Math.max(
+                0,
+                entry.pendingInbound.length - entry.pendingInboundHead
+              );
+              const inboundBytes = Math.max(0, Number(entry.inboundBytes) || 0);
+              const pendingBytes = Math.max(0, Number(entry.pendingInboundBytes) || 0);
+              state.stats.lastInboundFailure = {
+                reason: 'frame-limit',
+                channelId: entry.id|0,
+                inboundFrames: inboundFrames,
+                pendingFrames: pendingFrames,
+                totalFrames: inboundFrames + pendingFrames,
+                inboundBytes: inboundBytes,
+                pendingBytes: pendingBytes,
+                totalBytes: inboundBytes + pendingBytes,
+                exactPacketQueuePaused: !!state.exactPacketQueuePaused,
+                decodeFlowPaused: !!entry.decodeFlowPaused,
+                flowPaused: !!entry.flowPaused,
+                inboundSliceScheduled: !!entry.inboundSliceScheduled,
+                inboundPumpBlockedByExactQueue: Math.max(
+                  0,
+                  Number(state.stats.inboundPumpBlockedByExactQueue) || 0
+                ),
+                inboundPumpJavaStarted: Math.max(
+                  0,
+                  Number(state.stats.inboundPumpJavaStarted) || 0
+                ),
+                inboundPumpJavaCompleted: Math.max(
+                  0,
+                  Number(state.stats.inboundPumpJavaCompleted) || 0
+                ),
+                pumpCalls: Math.max(0, Number(state.stats.pumpCalls) || 0),
+                decodedPacketQueue: Math.max(
+                  0,
+                  Number(state.stats.decodedPacketQueue) || 0
+                ),
+                decodedSliceBacklog: Math.max(
+                  0,
+                  Number(state.stats.decodedSliceBacklog) || 0
+                ),
+                flowPauseCount: Math.max(0, Number(state.stats.flowPauses) || 0),
+                recordedAtMillis: typeof performance !== 'undefined' && performance.now
+                  ? performance.now() : Date.now()
+              };
+            }
             releaseTargetRelayLease(entry);
             clearLocalClaim(entry);
             clearRelayPreparation(entry);
