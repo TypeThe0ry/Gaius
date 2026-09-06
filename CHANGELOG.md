@@ -15,6 +15,11 @@ All notable changes to Gaius are documented here.
 
 ### Fixed
 
+- Return Minecraft `26.2` chunk-generation batches to the server dispatcher
+  through pending futures after at most 16 holders, preserving layer dependency
+  ordering and cancellation cleanup. Browser yields alone previously resumed
+  the same server call stack. Moving-world TPS and Mob playability acceptance
+  remain pending the rebuilt browser artifact.
 - Generate the launcher's displayed release version from `VERSION` instead
   of the stale `0.0.1` label, and include it in the build input identity.
 - Initialize the real inbound scheduler in the local MessagePort lifecycle

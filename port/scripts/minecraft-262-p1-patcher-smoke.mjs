@@ -647,7 +647,7 @@ assert.match(browserPatcherSource,
 assert.match(browserPatcherSource,
   /code\.add\(cancel\);[\s\S]*?ICONST_0[\s\S]*?endChunkHolderProbe/,
   "26.2 rejected/cancelled holder probe path is missing");
-for (const forbidden of [
+for (const required of [
   "BROWSER_LAYER_YIELD",
   "CHUNK_GENERATION_YIELD",
   "BrowserChunkGenerationYield",
@@ -655,8 +655,8 @@ for (const forbidden of [
   "Platform.schedule",
   "writeChunkGenerationYieldHelper",
 ]) {
-  assert.equal(browserPatcherSource.includes(forbidden), false,
-    `26.2 patcher must not retain artificial yield path: ${forbidden}`);
+  assert.equal(browserPatcherSource.includes(required), true,
+    `26.2 patcher must return a pending batch continuation: ${required}`);
 }
 const clientPatcherSource = await readFile(
   join(toolsSource, "MinecraftClientPatcher.java"),
@@ -817,10 +817,12 @@ try {
   ], {encoding: "utf8", timeout: 30_000});
   assert.match(verifierOutput, /BASIC_VERIFIER_OK .*ChunkGenerationTask\.class/,
     "ASM BasicVerifier did not validate ChunkGenerationTask");
-  assert.match(verifierOutput, /NO_ARTIFICIAL_LAYER_YIELD_OK .*ChunkGenerationTask/,
-    "ASM CFG verifier did not reject artificial 26.2 layer yield paths");
-  assert.match(verifierOutput, /NO_HELPER_CLASS_OK 26\.2/,
-    "26.2 patcher still emitted the artificial yield helper");
+  assert.match(verifierOutput, /PENDING_LAYER_YIELD_OK .*ChunkGenerationTask/,
+    "ASM CFG verifier did not validate the pending batch continuation");
+  assert.match(verifierOutput, /BASIC_VERIFIER_OK .*BrowserChunkGenerationYield\.class/,
+    "26.2 continuation helper was not verified");
+  assert.match(verifierOutput, /PENDING_HELPER_JVM_OK normalCompletion=1 duplicateContinuation=0/,
+    "26.2 emitted continuation helper was not executed on the JVM");
   assert.match(verifierOutput, /CFG_VERIFIER_OK net\/minecraft\/server\/level\/ChunkGenerationTask/,
     "ASM CFG verifier did not validate the chunk layer barrier");
   assert.match(verifierOutput,
@@ -1052,31 +1054,23 @@ try {
   });
   assert.equal(runUntilWaitBackedges.length, 1,
     "ChunkGenerationTask.runUntilWait must retain one loop backedge");
-  assert.doesNotMatch(runUntilWait,
-    /Field browserLayerYield|BrowserChunkGenerationYield|Platform\.schedule/,
-    "runUntilWait still contains an artificial yield path");
+  assert.match(runUntilWait, /Field browserLayerYield/,
+    "runUntilWait must return its pending batch future to the server dispatcher");
+  assert.match(runUntilWait, /CompletableFuture.isDone/,
+    "runUntilWait must wait for the batch macrotask before resuming");
   const activeFieldIndex = runUntilWaitInstructions.findIndex(entry =>
     entry.instruction.includes("Field browserLayerActive"));
   const firstScheduleNextIndex = runUntilWaitInstructions.findIndex(entry =>
     entry.instruction.includes("Method scheduleNextLayer:()V"));
   const firstLayerWaitIndex = runUntilWaitInstructions.findIndex(entry =>
     entry.instruction.includes("Method waitForScheduledLayer:"));
-  const activeResumeGoto = runUntilWaitInstructions
-    .map((entry, index) => ({entry, index}))
-    .find(({entry, index}) => {
-    if (index <= firstScheduleNextIndex || index >= firstLayerWaitIndex) return false;
-    const match = entry.instruction.match(/^goto(?:_w)?\s+(\d+)\s*$/);
-    return match && Number(match[1]) > entry.offset;
-  });
-  assert.ok(activeResumeGoto
-      && activeFieldIndex >= 0
+  const activePendingReturn = runUntilWaitInstructions.findIndex((entry, index) =>
+    index > firstScheduleNextIndex && index < firstLayerWaitIndex &&
+      entry.instruction === "areturn");
+  assert.ok(activePendingReturn >= 0 && activeFieldIndex >= 0
       && activeFieldIndex < firstScheduleNextIndex
-      && firstScheduleNextIndex < activeResumeGoto.index
-      && activeResumeGoto.index < firstLayerWaitIndex,
-  "active cursor must schedule next layer and forward to the vanilla edge before wait");
-  assert.equal(activeResumeGoto?.entry.instruction.match(/^goto(?:_w)?\s+(\d+)/)?.[1],
-    String(runUntilWaitInstructions[runUntilWaitBackedges[0].index - 1].offset),
-    "active branch must target the original backedge prologue");
+      && firstScheduleNextIndex < activePendingReturn,
+  "active cursor must return its pending future before waiting on layer dependencies");
   assert.match(runUntilWaitInstructions[runUntilWaitBackedges[0].index - 1].instruction,
     /BrowserWorldgenScheduler\.pulse/,
     "original runUntilWait backedge lost its scheduler pulse");
@@ -1100,9 +1094,8 @@ try {
   const scheduleLayerExceptionCleanup = scheduleLayer.slice(scheduleLayer.lastIndexOf("astore"));
   assert.match(scheduleLayerExceptionCleanup, /Field browserLayerActive/,
     "scheduleLayer exception path must clear active cursor state");
-  assert.doesNotMatch(scheduleLayerExceptionCleanup,
-    /Field browserLayerYield|BrowserChunkGenerationYield|Platform\.schedule/,
-    "scheduleLayer exception path still contains artificial continuation state");
+  assert.match(scheduleLayerExceptionCleanup, /athrow/,
+    "scheduleLayer must propagate holder or scheduling failures");
   const scheduleLayerInstructions = bytecodeInstructions(scheduleLayer);
   const batchBackedges = scheduleLayerInstructions.flatMap((entry, index) => {
     const match = entry.instruction.match(/^if_icmplt\s+(\d+)\s*$/);
@@ -1115,11 +1108,10 @@ try {
     /(?:bipush\s+16|ldc(?:_w)?\s+.*\/\/ int 16)/,
     "scheduleLayer batch backedge must enforce the 16-holder upper bound");
   assert.match(scheduleLayerInstructions[batchBackedges[0].index + 1]?.instruction ?? "",
-    /^goto(?:_w)?\s+\d+$/,
-    "scheduleLayer full batch must return through the original task continuation");
-  assert.doesNotMatch(scheduleLayer,
-    /Field browserLayerYield|BrowserChunkGenerationYield|Platform\.schedule|CompletableFuture/,
-    "scheduleLayer must not synthesize a future continuation");
+    /^new\s+.*CompletableFuture/,
+    "scheduleLayer full batch must create a future and return to its dispatcher");
+  assert.equal(occurrences(scheduleLayer, "Platform.schedule"), 1,
+    "scheduleLayer must dispatch exactly one asynchronous completion per batch");
   const runServer = method(bytecode, "protected void runServer", "private void");
   const tickStart = runServer.indexOf("BrowserWorldgenScheduler.beginServerWorkTurn");
   const tickTelemetryStart = runServer.indexOf(

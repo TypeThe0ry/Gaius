@@ -1,14 +1,51 @@
 import java.util.zip.ZipFile;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.tree.*;
 import org.objectweb.asm.tree.analysis.Analyzer;
 import org.objectweb.asm.tree.analysis.BasicValue;
 import org.objectweb.asm.tree.analysis.BasicVerifier;
 
 public final class GaiusChunkLayerBytecodeVerifier {
+    private static final class HelperLoader extends ClassLoader {
+        Class<?> define(byte[] bytes) {
+            return defineClass(null, bytes, 0, bytes.length);
+        }
+    }
+
+    /** Execute the emitted helper; this does not stand in for a live server cancellation test. */
+    private static void executePendingHelper(ZipFile jar) throws Exception {
+        HelperLoader loader = new HelperLoader();
+        ClassWriter stub = new ClassWriter(0);
+        stub.visit(Opcodes.V21, Opcodes.ACC_PUBLIC | Opcodes.ACC_ABSTRACT | Opcodes.ACC_INTERFACE,
+                "org/teavm/platform/PlatformRunnable", null, "java/lang/Object", null);
+        stub.visitMethod(Opcodes.ACC_PUBLIC | Opcodes.ACC_ABSTRACT, "run", "()V", null, null).visitEnd();
+        stub.visitEnd();
+        loader.define(stub.toByteArray());
+        Class<?> helper;
+        try (var input = jar.getInputStream(jar.getEntry(
+                "dev/gaius/browser/BrowserChunkGenerationYield.class"))) {
+            helper = loader.define(input.readAllBytes());
+        }
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        AtomicInteger continuations = new AtomicInteger();
+        future.thenRun(continuations::incrementAndGet);
+        Object callback = helper.getConstructor(CompletableFuture.class).newInstance(future);
+        require(!future.isDone() && continuations.get() == 0,
+                "helper construction must not complete a batch inline");
+        helper.getMethod("run").invoke(callback);
+        require(future.isDone() && !future.isCompletedExceptionally() && continuations.get() == 1,
+                "batch helper must normally complete its future and invoke the continuation once");
+        helper.getMethod("run").invoke(callback);
+        require(continuations.get() == 1, "duplicate helper dispatch repeated the continuation");
+        System.out.println("PENDING_HELPER_JVM_OK normalCompletion=1 duplicateContinuation=0");
+    }
+
     private static final String BROWSER_WORLDGEN_SCHEDULER =
             "dev/gaius/browser/BrowserWorldgenScheduler";
     private static final String SCHEDULE_CHUNK_IN_LAYER_DESCRIPTOR =
@@ -103,6 +140,33 @@ public final class GaiusChunkLayerBytecodeVerifier {
                 && BROWSER_WORLDGEN_SCHEDULER.equals(call.owner)
                 && call.name.equals("pulse")
                 && call.desc.equals("()V");
+    }
+
+    private static boolean hasFreshReturnBeforePulse(MethodNode method) {
+        for (AbstractInsnNode pulse : method.instructions) {
+            if (!isBrowserWorldgenPulse(pulse)) continue;
+            int pulseIndex = method.instructions.indexOf(pulse);
+            for (AbstractInsnNode first = method.instructions.getFirst(); first != null;
+                    first = first.getNext()) {
+                if (!(first instanceof FieldInsnNode field)
+                        || field.getOpcode() != Opcodes.GETFIELD
+                        || !field.name.equals("browserLayerYield")) continue;
+                if (method.instructions.indexOf(first) >= pulseIndex) continue;
+                boolean sawNullBranch = false;
+                for (AbstractInsnNode cursor = nextExecutable(field);
+                        cursor != null && method.instructions.indexOf(cursor) < pulseIndex;
+                        cursor = nextExecutable(cursor)) {
+                    if (cursor instanceof JumpInsnNode jump
+                            && jump.getOpcode() == Opcodes.IFNULL) {
+                        sawNullBranch = true;
+                    }
+                    if (sawNullBranch && cursor.getOpcode() == Opcodes.ARETURN) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
     }
 
     private static boolean everyPathHitsPulse(AbstractInsnNode instruction,
@@ -400,26 +464,38 @@ public final class GaiusChunkLayerBytecodeVerifier {
         System.out.println("CFG_VERIFIER_OK " + node.name);
     }
 
-    private static void verifyNoArtificialLayerYield(ClassNode node) {
+    private static void verifyPendingLayerYield(ClassNode node) {
+        boolean yieldField = false;
         for (FieldNode field : node.fields) {
-            require(!field.name.equals("browserLayerYield"),
-                    "26.2 ChunkGenerationTask must not contain browserLayerYield");
-        }
-        for (MethodNode method : node.methods) {
-            for (AbstractInsnNode instruction : method.instructions) {
-                if (instruction instanceof FieldInsnNode field) {
-                    require(!field.name.equals("browserLayerYield"),
-                            "26.2 bytecode still references browserLayerYield");
-                }
-                if (!(instruction instanceof MethodInsnNode call)) continue;
-                require(!call.owner.equals("dev/gaius/browser/BrowserChunkGenerationYield"),
-                        "26.2 bytecode still references BrowserChunkGenerationYield");
-                require(!(call.owner.equals("org/teavm/platform/Platform")
-                                && call.name.equals("schedule")),
-                        "26.2 bytecode still invokes Platform.schedule");
+            if (field.name.equals("browserLayerYield")) {
+                yieldField = true;
+                require(field.desc.equals("Ljava/util/concurrent/CompletableFuture;"),
+                        "26.2 browserLayerYield descriptor changed");
             }
         }
-        System.out.println("NO_ARTIFICIAL_LAYER_YIELD_OK " + node.name);
+        require(yieldField, "26.2 ChunkGenerationTask lost browserLayerYield");
+        boolean helperCall = false;
+        boolean platformSchedule = false;
+        boolean zeroDelay = false;
+        for (MethodNode method : node.methods) {
+            for (AbstractInsnNode instruction : method.instructions) {
+                if (instruction instanceof MethodInsnNode call
+                        && call.owner.equals("dev/gaius/browser/BrowserChunkGenerationYield")
+                        && call.name.equals("<init>")) {
+                    helperCall = true;
+                }
+                if (instruction instanceof MethodInsnNode call
+                        && call.owner.equals("org/teavm/platform/Platform")
+                        && call.name.equals("schedule")) {
+                    platformSchedule = true;
+                    zeroDelay = previousExecutable(instruction).getOpcode() == Opcodes.ICONST_0;
+                }
+            }
+        }
+        require(helperCall, "26.2 bytecode lost BrowserChunkGenerationYield helper");
+        require(platformSchedule && zeroDelay,
+                "26.2 pending continuation must use Platform.schedule(0)");
+        System.out.println("PENDING_LAYER_YIELD_OK " + node.name);
     }
 
     private static void verifyActiveCleanupBlock(LabelNode label, String target) {
@@ -441,7 +517,7 @@ public final class GaiusChunkLayerBytecodeVerifier {
     }
 
     private static void verifyLayerBarrierCfg262(ClassNode node) {
-        verifyNoArtificialLayerYield(node);
+        verifyPendingLayerYield(node);
         MethodNode run = method(node, "runUntilWait");
 
         List<FieldInsnNode> activeGets = new ArrayList<>();
@@ -466,21 +542,39 @@ public final class GaiusChunkLayerBytecodeVerifier {
                         && activeSchedule.name.equals("scheduleNextLayer"),
                 "26.2 active gate must schedule the current layer before re-entry");
 
-        JumpInsnNode activeResume = null;
+        FieldInsnNode activeYieldGet = null;
         for (AbstractInsnNode instruction = nextExecutable(activeSchedule);
                 instruction != null && instruction != activeBranch.label;
                 instruction = nextExecutable(instruction)) {
-            if (instruction instanceof JumpInsnNode jump
-                    && jump.getOpcode() == Opcodes.GOTO) {
-                activeResume = jump;
+            if (instruction instanceof FieldInsnNode field
+                    && field.getOpcode() == Opcodes.GETFIELD
+                    && field.name.equals("browserLayerYield")) {
+                activeYieldGet = field;
                 break;
             }
             require(!(instruction instanceof MethodInsnNode call
                             && call.name.equals("waitForScheduledLayer")),
-                    "26.2 active branch reaches vanilla wait before re-entry");
+                    "26.2 active branch reaches vanilla wait before pending return");
         }
-        require(activeResume != null,
-                "26.2 active branch lost forward re-entry edge");
+        require(activeYieldGet != null,
+                "26.2 active branch lost pending future read");
+        AbstractInsnNode activeYieldBranch = nextExecutable(activeYieldGet);
+        require(activeYieldBranch instanceof JumpInsnNode jump
+                        && jump.getOpcode() == Opcodes.IFNULL,
+                "26.2 active branch lost null-future test");
+        boolean activeReturned = false;
+        for (AbstractInsnNode instruction = nextExecutable(activeYieldBranch);
+                instruction != activeBranch.label && instruction != null;
+                instruction = nextExecutable(instruction)) {
+            require(!isBrowserWorldgenPulse(instruction),
+                    "26.2 active branch pulsed before returning pending future");
+            if (instruction.getOpcode() == Opcodes.ARETURN) {
+                activeReturned = true;
+                break;
+            }
+        }
+        require(activeReturned,
+                "26.2 active branch must return pending future before re-entry");
 
         List<JumpInsnNode> runBackedges = new ArrayList<>();
         for (AbstractInsnNode instruction : run.instructions) {
@@ -494,15 +588,11 @@ public final class GaiusChunkLayerBytecodeVerifier {
         require(runBackedges.size() == 1,
                 "26.2 runUntilWait must retain exactly one vanilla backward edge");
         JumpInsnNode vanillaBackedge = runBackedges.get(0);
-        require(activeResume.label != vanillaBackedge.label
-                        && run.instructions.indexOf(activeResume.label)
-                                < run.instructions.indexOf(vanillaBackedge),
-                "26.2 active resume must target the original edge prologue");
         AbstractInsnNode pulseBeforeBackedge = previousExecutable(vanillaBackedge);
         require(isBrowserWorldgenPulse(pulseBeforeBackedge),
                 "26.2 original runUntilWait edge lost its scheduler pulse");
-        require(firstExecutable(activeResume.label) == pulseBeforeBackedge,
-                "26.2 active branch must jump to the pulse before the vanilla edge");
+        require(hasFreshReturnBeforePulse(run),
+                "26.2 fresh scheduleNextLayer path must return pending future before pulse");
 
         AbstractInsnNode vanillaWait = firstCall(activeBranch.label, null);
         require(vanillaWait instanceof MethodInsnNode call
@@ -572,10 +662,13 @@ public final class GaiusChunkLayerBytecodeVerifier {
                         && layerBackedge.label == resumeBranch.label,
                 "26.2 scheduleLayer re-entry edge must resume the holder body");
         AbstractInsnNode fullBatchReturn = nextExecutable(batchGuard);
-        require(fullBatchReturn instanceof JumpInsnNode jump
+        require((fullBatchReturn instanceof JumpInsnNode jump
                         && jump.getOpcode() == Opcodes.GOTO
                         && layer.instructions.indexOf(jump.label)
-                                > layer.instructions.indexOf(jump),
+                                > layer.instructions.indexOf(jump))
+                || (fullBatchReturn instanceof TypeInsnNode type
+                        && type.getOpcode() == Opcodes.NEW
+                        && type.desc.equals("java/util/concurrent/CompletableFuture")),
                 "26.2 full holder batch must return with its active cursor");
 
         JumpInsnNode cancellation = null;
@@ -694,9 +787,10 @@ public final class GaiusChunkLayerBytecodeVerifier {
             if (profile.equals("1.21.11")) {
                 verify(jar, "dev/gaius/browser/BrowserChunkGenerationYield.class", profile);
             } else {
-                require(jar.getEntry("dev/gaius/browser/BrowserChunkGenerationYield.class") == null,
-                        "26.2 overlay must not emit BrowserChunkGenerationYield.class");
-                System.out.println("NO_HELPER_CLASS_OK 26.2");
+                require(jar.getEntry("dev/gaius/browser/BrowserChunkGenerationYield.class") != null,
+                        "26.2 overlay must emit BrowserChunkGenerationYield.class");
+                verify(jar, "dev/gaius/browser/BrowserChunkGenerationYield.class", profile);
+                executePendingHelper(jar);
             }
         }
     }
