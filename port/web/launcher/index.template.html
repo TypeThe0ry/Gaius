@@ -1252,7 +1252,7 @@
       const previousFrameAt = fps.rafLastFrameAt;
       if (Number.isFinite(previousFrameAt) && previousFrameAt > 0) {
         const frameMs = now - previousFrameAt;
-        if (frameMs > 0 && frameMs <= 1000 && fps.rafMetricsWorldEnteredAt) {
+        if (Number.isFinite(frameMs) && frameMs > 0 && fps.rafMetricsWorldEnteredAt) {
           let samples = fps.rafFrameTimes;
           if (!(samples instanceof Float32Array) || samples.length !== 4096) {
             samples = new Float32Array(4096);

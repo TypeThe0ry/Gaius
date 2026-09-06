@@ -275,7 +275,47 @@ await assert.rejects(
   /valid Java profile/,
 );
 
+// Run the launcher's actual rAF observer: long gameplay stalls must contribute
+// to the same samples used for average FPS, 1% low, and the longest frame.
+const fpsStart = html.indexOf("    requestAnimationFrame(function gaiusFpsTick(now)");
+const fpsEnd = html.indexOf("\n\n    setInterval(() => {", fpsStart);
+assert.ok(fpsStart >= 0 && fpsEnd > fpsStart, "launcher FPS observer was not found");
+let nextFrame;
+const fpsWindow = {
+  __gaiusFps: {frames: 0, lastSampleAt: 0},
+  __gaiusMinecraftState: {level: true},
+};
+vm.runInNewContext(html.slice(fpsStart, fpsEnd), {
+  window: fpsWindow,
+  requestAnimationFrame(callback) { nextFrame = callback; },
+  maybeDegradeResolutionForFps() {},
+  Float32Array,
+});
+for (const at of [10, 26, 42, 6042]) nextFrame(at);
+const fps = fpsWindow.__gaiusFps;
+assert.deepEqual(Array.from(fps.rafFrameTimes.subarray(0, fps.rafFrameCount)), [16, 16, 6000]);
+assert.equal(fps.rafLongestFrameMs, 6000);
+assert.equal(fps.rafAverageFps, 0.5);
+assert.equal(fps.rafOnePercentLow, 0.2);
+
+// Menu time must not turn into a gameplay stall when another world starts.
+fpsWindow.__gaiusMinecraftState.level = false;
+nextFrame(12042);
+assert.equal(fps.rafFrameCount, 3);
+fpsWindow.__gaiusMinecraftState.level = true;
+nextFrame(18042);
+assert.equal(fps.rafFrameCount, 0);
+assert.equal(fps.rafLongestFrameMs, 0);
+for (let index = 1; index <= 4200; index++) nextFrame(18042 + index * 16);
+assert.equal(fps.rafFrameCount, 4096);
+assert.equal(fps.rafLongestFrameMs, 16);
+assert.equal(fps.rafAverageFps, 62.5);
+assert.equal(fps.rafOnePercentLow, 62.5);
+
 console.log(JSON.stringify({
+  multiSecondGameplayStallRetained: true,
+  worldFrameSamplesReset: true,
+  frameSampleStorageBounded: true,
   offlineNameGate: true,
   rememberedNamePrefill: true,
   profileResolution: true,
