@@ -6031,7 +6031,14 @@ def check_source_patches() -> None:
                 in modern_runtime_support
             and "TThread.setCurrentThread(thread)" in modern_runtime_support
             and "Platform.schedule(resume, delayMillis)" in modern_runtime_support
-            and "Platform.postpone(resume)" in modern_runtime_support
+            and "postMacrotask(() -> resume.run())" in modern_runtime_support
+            and "private static native void postMacrotask(ResumeCallback callback);"
+                in modern_runtime_support
+            and "new MessageChannel()" in modern_runtime_support
+            and "pending: new Map()" in modern_runtime_support
+            and "state.channel.port1.onmessage" in modern_runtime_support
+            and "state.pending.delete(event.data)" in modern_runtime_support
+            and "setTimeout(callback, 0)" in modern_runtime_support
             and "Thread.sleep(" not in browser_worldgen_scheduler
             and "patchChunkGenerationTaskBrowserYield" not in client_patcher
             and "browserWorldgenBeginServerWorkTurn()" in client_patcher
