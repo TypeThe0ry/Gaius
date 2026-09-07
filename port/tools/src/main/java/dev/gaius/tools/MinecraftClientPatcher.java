@@ -17113,6 +17113,7 @@ public final class MinecraftClientPatcher {
         boolean patchedRunServerStoppedSignal = false;
         boolean patchedSpinRegistration = false;
         boolean patchedSaveBeforeWorldInitialization = false;
+        boolean patchedStructurePreload = false;
         boolean patchedBrowserPacketPump = false;
         boolean patchedBrowserWaitingPacketPump = false;
         boolean patchedBrowserMetricsRecorder = false;
@@ -17199,6 +17200,18 @@ public final class MinecraftClientPatcher {
                 method.instructions.insert(guard);
                 method.maxStack = Math.max(method.maxStack, 1);
                 patchedSaveBeforeWorldInitialization = true;
+            } else if (method.name.equals("loadLevel") && method.desc.equals("()V")) {
+                InsnList preload = new InsnList();
+                preload.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                preload.add(new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "dev/gaius/browser/BrowserStructurePreloader",
+                        "preload",
+                        "(Lnet/minecraft/server/MinecraftServer;)V",
+                        false));
+                method.instructions.insert(preload);
+                method.maxStack = Math.max(method.maxStack, 1);
+                patchedStructurePreload = true;
             } else if (method.name.equals("prepareLevels") && method.desc.equals("()V")) {
                 InsnList code = new InsnList();
                 code.add(new VarInsnNode(Opcodes.ALOAD, 0));
@@ -17450,6 +17463,7 @@ public final class MinecraftClientPatcher {
                 || !patchedRunServerStoppedSignal
                 || !patchedSpinRegistration
                 || !patchedSaveBeforeWorldInitialization
+                || !patchedStructurePreload
                 || !patchedBrowserPacketPump
                 || !patchedBrowserWaitingPacketPump
                 || !patchedBrowserMetricsRecorder

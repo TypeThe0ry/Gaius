@@ -510,6 +510,15 @@ root.onmessage = async (event) => {
   // so Mob-AI telemetry is available in both external-script and portable
   // Worker deployments without changing the normal release path.
   if (message && message.type === "diagnostic-config") {
+    if (!startAccepted && Array.isArray(message.gaiusStructurePreloadIds)) {
+      root.__gaiusStructurePreloadIds = message.gaiusStructurePreloadIds
+        .filter(id => typeof id === "string" && id.length <= 256 &&
+          /^[a-z0-9_.-]+:[a-z0-9_./-]+$/.test(id))
+        .slice(0, 64);
+      const preloadBudget = Number(message.gaiusStructurePreloadBudgetMillis);
+      root.__gaiusStructurePreloadBudgetMillis = Number.isFinite(preloadBudget) &&
+        preloadBudget > 0 ? Math.min(preloadBudget, 30000) : 5000;
+    }
     if (message.gaiusMobAiTelemetry === true) {
       root.__gaiusMobAiTelemetry = true;
     }
@@ -974,6 +983,7 @@ function handleControlMessage(event) {
         "chunkHolderProbeFalseResults",
       ]),
       serverTickTelemetry: snapshotDiagnosticTelemetry(root.__gaiusServerTickTelemetry),
+      structurePreload: snapshotDiagnosticTelemetry(root.__gaiusWorldgenStats?.structurePreload),
     });
     return;
   }

@@ -61,6 +61,8 @@ globalThis.importScripts = () => {};
 globalThis.main = () => parentPort.postMessage({
   type: "main-start-observed",
   serverTickTelemetryEnabled: globalThis.__gaiusServerTickTelemetryEnabled === true,
+  structurePreloadIds: globalThis.__gaiusStructurePreloadIds || [],
+  structurePreloadBudgetMillis: globalThis.__gaiusStructurePreloadBudgetMillis,
 });
 globalThis.__gaiusStartIntegratedServerPump = () => {};
 globalThis.setIntegratedServerDistances = (viewDistance, simulationDistance) => {
@@ -254,6 +256,12 @@ globalThis.indexedDB = {
 };
 ${bootstrap}
 parentPort.on("message", (message) => {
+  if (message?.type === "test-preload-config") {
+    parentPort.postMessage({type: "test-preload-config-result",
+      ids: globalThis.__gaiusStructurePreloadIds || [],
+      budget: globalThis.__gaiusStructurePreloadBudgetMillis});
+    return;
+  }
   if (message?.type === "mutate-telemetry") {
     Object.assign(globalThis.__gaiusWorldgenStats, message.worldgen || {});
     Object.assign(globalThis.__gaiusChunkPriorityStats, message.chunkPriority || {});
@@ -379,6 +387,9 @@ worker.postMessage({
   type: "diagnostic-config",
   gaiusSlowProbeTelemetry: true,
   gaiusServerTickTelemetry: true,
+  gaiusStructurePreloadIds: ["minecraft:village/plains/houses/plains_small_house_1",
+    "INVALID", 42, ...Array.from({length: 70}, (_, i) => `test:template_${i}`)],
+  gaiusStructurePreloadBudgetMillis: 999999,
 });
 
 worker.postMessage({
@@ -409,6 +420,19 @@ await waitFor("port-attached");
 const mainStartObserved = await waitFor("main-start-observed");
 assert.equal(mainStartObserved.serverTickTelemetryEnabled, true,
   "bootstrap main() did not observe server tick telemetry enabled by pre-start diagnostic-config");
+assert.equal(mainStartObserved.structurePreloadIds.length, 64,
+  "preload config must filter invalid identifiers and cap accepted IDs");
+assert.equal(mainStartObserved.structurePreloadIds[0],
+  "minecraft:village/plains/houses/plains_small_house_1");
+assert.equal(mainStartObserved.structurePreloadIds[63], "test:template_62");
+assert.equal(mainStartObserved.structurePreloadBudgetMillis, 30000);
+worker.postMessage({type: "diagnostic-config", gaiusStructurePreloadIds: ["test:too_late"],
+  gaiusStructurePreloadBudgetMillis: 1});
+worker.postMessage({type: "test-preload-config"});
+const retainedPreloadConfig = await waitFor("test-preload-config-result");
+assert.deepEqual(retainedPreloadConfig.ids, mainStartObserved.structurePreloadIds,
+  "late diagnostic messages must not change startup preload selection");
+assert.equal(retainedPreloadConfig.budget, 30000);
 await waitFor("runtime-ready");
 
 async function requestDiagnosticSnapshot() {

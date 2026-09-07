@@ -295,3 +295,34 @@ Do not optimise based on a single aggregate FPS number.
 - Changes must preserve real Chrome gameplay: first chunks, movement, block
   break/place authority, terrain/material rendering, and audio all remain
   regression checks.
+
+An average of 20 TPS does not establish smooth simulation. Catch-up ticks can
+hide long pauses in an aggregate. The worker smoke's `serverTickWindow.hitchCounts`
+reports differences in interval, tick-work, and wait-phase counters for the
+measured window. Missing or reset counters are `null`, never zero. Pair these
+counts with visible entity movement and message-delay evidence.
+
+## Optional structure-template preloading experiment
+
+The browser server can warm explicitly selected template IDs through its own
+`StructureTemplateManager` before level creation. This is disabled by default.
+Repeat the `gaiusStructurePreload` page query parameter for each measured ID;
+`gaiusStructurePreloadBudgetMillis` sets a cumulative budget (default 5000 ms,
+maximum 30000 ms). For example, a diagnostic page can use
+`?gaiusStructurePreload=minecraft:trial_chambers/chamber/assembly`.
+
+For the Node worker smoke, set `GAIUS_SMOKE_STRUCTURE_PRELOAD_IDS` to a JSON
+array of IDs and optionally `GAIUS_SMOKE_STRUCTURE_PRELOAD_BUDGET_MS`. Configuration
+must arrive before the worker accepts `start`; later changes are ignored.
+At most 64 IDs are accepted. The helper yields between entries when a native
+TeaVM continuation exists. It skips the experiment in ordinary JS callbacks.
+The time budget is checked between entries and cannot interrupt one synchronous
+template parse. Missing templates, failed entries, remaining entries and the
+stop reason are available in the diagnostic snapshot's `structurePreload` field.
+
+Preloading moves work into startup and uses the manager's existing cache; it
+does not by itself reduce total work or prove improved gameplay. Compare the
+same seed, distances and traversal with the experiment off and on, include the
+extra startup cost, and retain all normal release gates above. The helper smoke
+(`node port/scripts/browser-structure-preloader-smoke.mjs`) checks its control
+flow using real TeaVM continuations; full profile and Chrome tests remain required.

@@ -414,6 +414,16 @@ public final class BrowserSingleplayerClient {
               worker = new Worker(workerUrl, {name: 'Gaius Integrated Server'});
               try {
                 const diagnosticUrl = new URL(location.href);
+                const structurePreloadIds = diagnosticUrl.searchParams
+                  .getAll('gaiusStructurePreload').slice(0, 64);
+                if (structurePreloadIds.length > 0) {
+                  worker.postMessage({
+                    type: 'diagnostic-config',
+                    gaiusStructurePreloadIds: structurePreloadIds,
+                    gaiusStructurePreloadBudgetMillis:
+                      Number(diagnosticUrl.searchParams.get('gaiusStructurePreloadBudgetMillis')),
+                  });
+                }
                 if (diagnosticUrl.searchParams.get('gaiusMobAiTelemetry') === '1' ||
                     diagnosticUrl.searchParams.get('gaiusServerTickTelemetry') === '1') {
                   if (diagnosticUrl.searchParams.get('gaiusMobAiTelemetry') === '1') {

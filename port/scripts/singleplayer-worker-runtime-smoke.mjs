@@ -1696,6 +1696,16 @@ function serverTickWindow(start, end) {
       elapsedMillis <= 0) {
     return {available: false, reason: "invalid-sample-window"};
   }
+  // A catch-up burst can average 20 TPS while entities still freeze for seconds.
+  // Preserve interval/work/wait hitches for this exact window, not cumulative maxima.
+  const hitchCounts = {};
+  for (const field of ["intervalOver100MillisCount", "intervalOver500MillisCount",
+    "tickWorkOver500MillisCount", "waitPhaseOver500MillisCount"]) {
+    const begin = start[field];
+    const finish = end[field];
+    hitchCounts[field] = Number.isInteger(begin) && Number.isInteger(finish) &&
+      begin >= 0 && finish >= begin ? finish - begin : null;
+  }
   return {
     available: true,
     schemaVersion: Number(end.schemaVersion) || null,
@@ -1707,6 +1717,7 @@ function serverTickWindow(start, end) {
     completedWaitPhaseCount: delta.completedWaitPhaseCount,
     totalWaitPhaseDurationMillis: delta.totalWaitPhaseDurationMillis,
     observedTps: delta.intervalCount * 1000 / elapsedMillis,
+    hitchCounts,
   };
 }
 
@@ -1744,7 +1755,20 @@ function runServerTickWindowSelfSmoke() {
   if (!stalled.available || stalled.observedTps !== 0 || stalled.elapsedMillis !== 5000) {
     throw new Error("unfinished long tick must remain in the wall-time TPS window");
   }
-  return {ok: true, twentyTps: true, sevenTps: true, missingUnavailable: true, resetRejected: true};
+  const hitches = serverTickWindow({...base, intervalOver500MillisCount: 4,
+    tickWorkOver500MillisCount: 2, waitPhaseOver500MillisCount: 3}, {
+    ...base, sampledAtMillis: 11000, intervalCount: 200,
+    intervalOver500MillisCount: 7, tickWorkOver500MillisCount: 3,
+    waitPhaseOver500MillisCount: 1,
+  });
+  if (hitches.observedTps !== 20 || hitches.hitchCounts.intervalOver500MillisCount !== 3 ||
+      hitches.hitchCounts.tickWorkOver500MillisCount !== 1 ||
+      hitches.hitchCounts.waitPhaseOver500MillisCount !== null ||
+      hitches.hitchCounts.intervalOver100MillisCount !== null) {
+    throw new Error("average TPS must retain hitches and mark unavailable/reset counts null");
+  }
+  return {ok: true, twentyTps: true, sevenTps: true, missingUnavailable: true,
+    resetRejected: true, hitchWindowDeltas: true};
 }
 
 function runTelemetrySnapshotSelfSmoke() {
@@ -2065,6 +2089,12 @@ if (isMainThread && !runtimeSelfTest) {
   let finished = false;
   const skipMining = process.env.GAIUS_SMOKE_SKIP_MINING === "1";
   const serverTickTelemetryEnabled = process.env.GAIUS_SMOKE_SERVER_TICK_TELEMETRY === "1";
+  const structurePreloadIds = process.env.GAIUS_SMOKE_STRUCTURE_PRELOAD_IDS
+    ? JSON.parse(process.env.GAIUS_SMOKE_STRUCTURE_PRELOAD_IDS) : null;
+  if (structurePreloadIds !== null && (!Array.isArray(structurePreloadIds) ||
+      structurePreloadIds.some(id => typeof id !== "string"))) {
+    throw new Error("GAIUS_SMOKE_STRUCTURE_PRELOAD_IDS must be a JSON string array");
+  }
   const mobAiStress = process.env.GAIUS_SMOKE_MOB_AI_STRESS === "1";
   const stopAtFirstChunk = process.env.GAIUS_SMOKE_STOP_AT_FIRST_CHUNK === "1";
   const roamSteps = Number(process.env.GAIUS_SMOKE_ROAM_STEPS || "0");
@@ -3532,6 +3562,14 @@ if (isMainThread && !runtimeSelfTest) {
   });
   if (serverTickTelemetryEnabled) {
     worker.postMessage({type: "diagnostic-config", gaiusServerTickTelemetry: true});
+  }
+  if (structurePreloadIds !== null) {
+    worker.postMessage({
+      type: "diagnostic-config",
+      gaiusStructurePreloadIds: structurePreloadIds,
+      gaiusStructurePreloadBudgetMillis:
+        Number(process.env.GAIUS_SMOKE_STRUCTURE_PRELOAD_BUDGET_MS),
+    });
   }
   worker.postMessage({
     type: "start",
