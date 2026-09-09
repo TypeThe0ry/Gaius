@@ -1972,7 +1972,7 @@ def patch_index(
         '      ).href;\n'
     )
     text, singleplayer_count = re.subn(
-        r'      const singleplayerBuildToken = "[^"]+" \+\n'
+        r'      const singleplayerBuildToken = (?:"[^"]+"|fallbackBuildToken) \+\n'
         r'        \(urlParams\.get\("fresh"\) === "1" \|\| urlParams\.get\("cache"\) === "0"\n'
         r'          \? "-fresh-" \+ Date\.now\(\)\n'
         r'          : ""\);\n'

@@ -3514,10 +3514,6 @@
         buildToken += "-fresh-" + Date.now();
       }
       bootTimings.buildToken = buildToken;
-      const singleplayerBuildToken = fallbackBuildToken +
-        (urlParams.get("fresh") === "1" || urlParams.get("cache") === "0"
-          ? "-fresh-" + Date.now()
-          : "");
       // Portable Gaius.html embeds these payloads as Blob URLs. Keep those
       // URLs; replacing them with file:/// sibling paths makes the downloaded
       // single-file client exit before its Worker can start.
