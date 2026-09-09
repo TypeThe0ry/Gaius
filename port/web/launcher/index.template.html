@@ -3514,7 +3514,7 @@
         buildToken += "-fresh-" + Date.now();
       }
       bootTimings.buildToken = buildToken;
-      const singleplayerBuildToken = "dev" +
+      const singleplayerBuildToken = fallbackBuildToken +
         (urlParams.get("fresh") === "1" || urlParams.get("cache") === "0"
           ? "-fresh-" + Date.now()
           : "");
