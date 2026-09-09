@@ -835,6 +835,64 @@ public final class BrowserGlfw {
                 rememberPointerLockError(error);
               }
             };
+            const rememberKeyboardLockError = error => {
+              window.__gaiusKeyboardLockPending = false;
+              window.__gaiusKeyboardLockHeld = false;
+              window.__gaiusKeyboardLockLastError = String(error && (error.message || error.name) || error);
+            };
+            const requestKeyboardLockIfWanted = () => {
+              const keyboard = navigator.keyboard;
+              if (!document.fullscreenElement || !keyboard || !keyboard.lock || window.__gaiusKeyboardLockHeld || window.__gaiusKeyboardLockPending) {
+                return;
+              }
+              window.__gaiusKeyboardLockPending = true;
+              try {
+                // Browser accelerators are captured only in API fullscreen.
+                // preventDefault alone cannot protect a windowed Ctrl+W.
+                // Locking KeyW also covers Ctrl+W while leaving browser
+                // accelerators such as Ctrl+R and Ctrl+L available.
+                const result = keyboard.lock(['KeyW']);
+                if (result && result.then) {
+                  result.then(() => {
+                    window.__gaiusKeyboardLockPending = false;
+                    window.__gaiusKeyboardLockHeld = !!document.fullscreenElement;
+                  }, rememberKeyboardLockError);
+                } else {
+                  window.__gaiusKeyboardLockPending = false;
+                  window.__gaiusKeyboardLockHeld = true;
+                }
+              } catch (error) {
+                rememberKeyboardLockError(error);
+              }
+            };
+            const requestGameFullscreen = () => {
+              const root = document.documentElement;
+              if (!window.__gaiusWantPointerLock || document.fullscreenElement ||
+                  !navigator.keyboard || !navigator.keyboard.lock || !root.requestFullscreen) {
+                requestKeyboardLockIfWanted();
+                requestPointerLockIfWanted();
+                return;
+              }
+              if (window.__gaiusFullscreenPending) return;
+              window.__gaiusFullscreenPending = true;
+              const ready = () => {
+                window.__gaiusFullscreenPending = false;
+                requestKeyboardLockIfWanted();
+                requestPointerLockIfWanted();
+              };
+              const failed = error => {
+                window.__gaiusFullscreenPending = false;
+                rememberKeyboardLockError(error);
+                requestPointerLockIfWanted();
+              };
+              try { Promise.resolve(root.requestFullscreen()).then(ready, failed); }
+              catch (error) { failed(error); }
+            };
+            addEventListener('fullscreenchange', () => {
+              window.__gaiusKeyboardLockHeld = false;
+              if (document.fullscreenElement) requestKeyboardLockIfWanted();
+              else if (navigator.keyboard && navigator.keyboard.unlock) navigator.keyboard.unlock();
+            });
             const codeMap = {
               Space:32,Apostrophe:39,Comma:44,Minus:45,Period:46,Slash:47,
               Digit0:48,Digit1:49,Digit2:50,Digit3:51,Digit4:52,Digit5:53,Digit6:54,Digit7:55,Digit8:56,Digit9:57,
@@ -884,6 +942,16 @@ public final class BrowserGlfw {
               window.__gaiusCursorY=locked?(window.__gaiusCursorY||0)+e.movementY:e.clientY-r.top;
               return [window.__gaiusCursorX, window.__gaiusCursorY];
             };
+            // Ctrl+W is a valid sprint + forward chord in Minecraft.  Chrome
+            // reserves the same chord for closing a tab. API fullscreen and
+            // Keyboard Lock above provide accelerator capture; this guard
+            // only suppresses defaults for events delivered to the page.
+            // The normal handler still forwards both key events to GLFW.
+            addEventListener('keydown', e => {
+              if (e.ctrlKey && !e.altKey && !e.metaKey && e.code === 'KeyW') {
+                e.preventDefault();
+              }
+            }, {capture:true, passive:false});
             const urlNumber = name => {
               try {
                 const value = new URLSearchParams(location.search).get(name);
@@ -941,7 +1009,11 @@ public final class BrowserGlfw {
             addEventListener('keydown', e => {
               const key=codeMap[e.code]===undefined?-1:codeMap[e.code]; window.__gaiusGlfwKeys[key]=true;
               pushEvent([1,key,e.keyCode,e.repeat?2:1,mods(e),0,0]);
-              if (e.key && e.key.length>0 && e.key.length<=2) pushEvent([2,e.key.codePointAt(0),mods(e),0,0,0,0]);
+              const altGraph=typeof e.getModifierState==='function' && e.getModifierState('AltGraph');
+              const printable=typeof e.key==='string' &&
+                (e.key.length===1 || (e.key.length===2 && e.key.codePointAt(0)>65535)) &&
+                !e.metaKey && (!e.ctrlKey || altGraph);
+              if (printable) pushEvent([2,e.key.codePointAt(0),mods(e),0,0,0,0]);
               if (document.activeElement===canvas()) e.preventDefault();
             });
             addEventListener('keyup', e => {
@@ -956,7 +1028,7 @@ public final class BrowserGlfw {
               pushMouseMove([4,0,0,0,0,p[0],p[1]]);
               window.__gaiusGlfwButtons[button]=true;
               pushEvent([3,button,1,mods(e),0,p[0],p[1]]);
-              requestPointerLockIfWanted();
+              if (e.target === c) requestGameFullscreen();
             });
             addEventListener('mouseup', e => {
               const p = updateCursorFromMouseEvent(e);
@@ -978,7 +1050,14 @@ public final class BrowserGlfw {
             addEventListener('resize', () => {
               window.__gaiusApplyCanvasResolution(innerWidth, innerHeight, true);
             });
-            addEventListener('beforeunload', () => pushEvent([8,0,0,0,0,0,0]));
+            addEventListener('beforeunload', () => {
+              if (navigator.keyboard && navigator.keyboard.unlock) {
+                try { navigator.keyboard.unlock(); } catch (ignored) {}
+              }
+              window.__gaiusKeyboardLockHeld = false;
+              window.__gaiusKeyboardLockPending = false;
+              pushEvent([8,0,0,0,0,0,0]);
+            });
             """)
     private static native void installDomBridge();
 

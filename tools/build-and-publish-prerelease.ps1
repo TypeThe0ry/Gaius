@@ -37,6 +37,45 @@ if (-not $SkipBuild) {
         & bash (Join-Path $root 'port/scripts/build-version-release.sh') $profile; if ($LASTEXITCODE) { throw "build-version-release failed for $profile" }
     }
 }
+
+function Assert-ProfileArtifactsCurrent([string]$profile) {
+    $profilePath = "versions/$profile.json"
+    if (-not (Test-Path (Join-Path $root "port/$profilePath"))) {
+        throw "Missing profile: $profilePath"
+    }
+    $env:GAIUS_VERSION_PROFILE_PATH = $profilePath
+    $env:GAIUS_BUILD_ROOT = "port/target/$profile"
+    $env:GAIUS_OVERLAY_DIRECTORY = "port/work/overlays/$profile"
+    $env:GAIUS_DIST_DIRECTORY = "port/web/dist/$profile"
+    $dist = Join-Path $root $env:GAIUS_DIST_DIRECTORY
+    $roles = @(
+        @('client', 'classes.js'),
+        @('singleplayer-worker', 'singleplayer-server.js'),
+        @('wasm-hotpath', 'gaius-hotpath.wasm'),
+        @('worker-bootstrap', 'singleplayer-server-worker.js'),
+        @('vanilla-assets', 'vanilla-assets.pack.gz'),
+        @('relay-registry', 'relay-nodes.json')
+    )
+    foreach ($entry in $roles) {
+        $artifact = Join-Path $dist $entry[1]
+        if (-not (Test-Path $artifact)) { throw "Missing $profile artifact: $artifact" }
+        & python (Join-Path $root 'port/scripts/gaius_build_identity.py') verify `
+            --root $root --role $entry[0] --artifact $artifact *> $null
+        if ($LASTEXITCODE) {
+            throw "Stale or invalid $profile artifact identity: $artifact. Rebuild without -SkipBuild."
+        }
+    }
+    $contract = Join-Path $root 'apps/bridge/browser-full-path-artifact-contract-smoke.mjs'
+    $report = Join-Path $env:GAIUS_BUILD_ROOT 'browser-full-path-artifact-contract-prerelease.json'
+    node $contract *> $report
+    if ($LASTEXITCODE) {
+        throw "Portable artifact contract failed for $profile; see $report"
+    }
+}
+
+foreach ($profile in $Profiles) {
+    Assert-ProfileArtifactsCurrent $profile
+}
 $stage = Join-Path $root "port/target/local-prerelease/$Tag"
 if (Test-Path $stage) { throw "Refusing to overwrite staging directory: $stage" }
 New-Item -ItemType Directory -Force $stage | Out-Null

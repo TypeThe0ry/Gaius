@@ -56,7 +56,7 @@ public final class BrowserFilePersistence {
             "entityShadows:false",
             "bobView:false",
             "menuBackgroundBlurriness:0",
-            "panoramaSpeed:0.0",
+            "panoramaSpeed:1.0",
             "screenEffectScale:0.0",
             "fovEffectScale:0.0",
             "darknessEffectScale:0.0",

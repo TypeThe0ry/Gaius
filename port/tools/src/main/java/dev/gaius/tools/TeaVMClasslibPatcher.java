@@ -336,6 +336,40 @@ public final class TeaVMClasslibPatcher {
         patchThrowableGetSuppressed(jar, root);
         patchDefaultFileSystemProviderStreams(jar, root);
         patchZipFileRawInflaterPadding(jar, root);
+        patchFormatterPercentArgument(jar, root);
+    }
+
+    /**
+     * TeaVM 0.15's Formatter configures an implicit argument index before
+     * formatValue handles %%; Java Formatter treats %% as a literal and it
+     * must not consume an argument.
+     */
+    private static void patchFormatterPercentArgument(String jarPath, Path root) throws IOException {
+        String className = "org/teavm/classlib/java/util/TFormatter$FormatWriter";
+        ClassNode node = readClass(jarPath, className);
+        MethodNode method = node.methods.stream()
+                .filter(candidate -> candidate.name.equals("configureFormat")
+                        && candidate.desc.equals("()V"))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(
+                        "TFormatter$FormatWriter.configureFormat was not found"));
+        LabelNode continueLabel = new LabelNode();
+        InsnList prefix = new InsnList();
+        prefix.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        prefix.add(new FieldInsnNode(
+                Opcodes.GETFIELD, className, "format", "Ljava/lang/String;"));
+        prefix.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        prefix.add(new FieldInsnNode(Opcodes.GETFIELD, className, "index", "I"));
+        prefix.add(new InsnNode(Opcodes.ICONST_1));
+        prefix.add(new InsnNode(Opcodes.ISUB));
+        prefix.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, "java/lang/String", "charAt", "(I)C", false));
+        prefix.add(new IntInsnNode(Opcodes.BIPUSH, '%'));
+        prefix.add(new JumpInsnNode(Opcodes.IF_ICMPNE, continueLabel));
+        prefix.add(new InsnNode(Opcodes.RETURN));
+        prefix.add(continueLabel);
+        method.instructions.insert(prefix);
+        writeClass(root, className, node);
     }
 
     private static void patchDefaultFileSystemProviderStreams(String jarPath, Path root) throws IOException {

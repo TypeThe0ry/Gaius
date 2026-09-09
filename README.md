@@ -62,6 +62,11 @@ server-side Gaius plugin or a reachable RelayNode.
 4. Select **Singleplayer** for the browser-local integrated server, or open
    **Multiplayer** and enter a Java server address.
 
+The current source defaults **Sprint** to **R** to avoid Chrome's **Ctrl+W**
+close-tab shortcut. Existing saved key bindings are preserved: if Sprint still
+uses Ctrl, change it in **Options → Controls → Key Binds**, or double-tap W.
+This source change is not included in previously downloaded release files.
+
 For a source checkout, the normal development launcher is served over HTTP:
 
 ```sh

@@ -2479,12 +2479,17 @@ def patch_index(
             "      setStatus(\"running\", \"浏览器存储已就绪（\" + (window.__gaiusFsBackend || \"unknown\") + \"），正在加载 classes.js…\", 24, \"加载 1.21.11 TeaVM 主程序…\");\n"
             "      await loadScript(\"classes.js?v=\" + encodeURIComponent(buildToken));\n",
             "      setStatus(\"running\", \"浏览器存储已就绪（\" + (window.__gaiusFsBackend || \"unknown\") + \"），正在加载 classes.js…\", 24, \"加载 1.21.11 TeaVM 主程序…\");\n"
-            "      await waitForPaint();\n"
-            "      bootTimings.beforeClassesPaint = performance.now();\n"
-            "      await (window.__gaiusPortableAssetsReady || Promise.resolve());\n"
+            "      // Start the large TeaVM bundle and both asset sources in parallel.\n"
             "      const classesUrl = window.__gaiusClassesUrl ||\n"
             "        (\"classes.js?v=\" + encodeURIComponent(buildToken));\n"
-            "      await loadScript(classesUrl);\n",
+            "      const classesReady = loadScript(classesUrl);\n"
+            "      const portableReady = window.__gaiusPortableAssetsReady || Promise.resolve();\n"
+            "      const vanillaReady = window.__gaiusVanillaAssetsReady || Promise.resolve();\n"
+            "      await waitForPaint();\n"
+            "      bootTimings.beforeClassesPaint = performance.now();\n"
+            "      setBootProgress(Math.max(bootProgressValue, 30), \"Loading game assets...\");\n"
+            "      await Promise.all([portableReady, vanillaReady, classesReady]);\n"
+            "      bootTimings.vanillaAssetsReady = performance.now();\n",
             "paint before classes",
         )
 

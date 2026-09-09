@@ -3541,11 +3541,15 @@
       // decoded.  Neither operation depends on the other until main(args),
       // so serialising them added the full download/decode time to the first
       // menu frame on a cold browser profile.
+      const portableReady = window.__gaiusPortableAssetsReady || Promise.resolve();
+      const vanillaReady = window.__gaiusVanillaAssetsReady || Promise.resolve();
+      // Portable HTML creates the classes/server Blob URLs asynchronously.
+      // Resolve that payload before choosing classesUrl; otherwise a direct
+      // file:// launch races and falls back to a nonexistent sibling file.
+      if (window.__gaiusPortableBuild === true) await portableReady;
       const classesUrl = window.__gaiusClassesUrl ||
         ("classes.js?v=" + encodeURIComponent(buildToken));
       const classesReady = loadScript(classesUrl);
-      const portableReady = window.__gaiusPortableAssetsReady || Promise.resolve();
-      const vanillaReady = window.__gaiusVanillaAssetsReady || Promise.resolve();
       await waitForPaint();
       bootTimings.beforeClassesPaint = performance.now();
       setBootProgress(Math.max(bootProgressValue, 30), "Loading game assets...");

@@ -126,18 +126,26 @@ public final class MinecraftClientPatcher {
         patchMemoryDebug(args[0], root.resolve(
                 "net/minecraft/client/gui/components/debug/"
                         + "DebugEntryMemory$AllocationRateCalculator.class"));
+        if ("26.2".equals(minecraftVersion)) {
+            patchDebugScreenOverlayBrowserNoChunk(args[0], root.resolve(
+                    "net/minecraft/client/gui/components/DebugScreenOverlay.class"));
+        }
         patchMainBrowserStorageMount(args[0], root.resolve("net/minecraft/client/main/Main.class"));
         patchMinecraft(args[0], root);
         patchWorldStemBrowserSave(args[0], root.resolve(
                 "net/minecraft/server/WorldStem.class"));
         patchCommandEncoderLegacyTextureUpload(args[0], root.resolve(
                 "com/mojang/blaze3d/systems/CommandEncoder.class"));
-        patchLoadingOverlayBrowserForeground(args[0], root.resolve(
-                "net/minecraft/client/gui/screens/LoadingOverlay.class"));
+        // Keep Minecraft's LoadingOverlay for in-game resource reloads.
+        // The launcher HTML owns only the first-start branded shell.
         patchPauseScreenBrowserSingleplayer(args[0], root.resolve(
                 "net/minecraft/client/gui/screens/PauseScreen.class"));
         patchOptionsBrowserLowSimulationDistance(args[0], root.resolve(
                 "net/minecraft/client/Options.class"));
+        if ("26.2".equals(minecraftVersion)) {
+            patchTextureUtilBrowserSolidify(args[0], root.resolve(
+                    "com/mojang/blaze3d/platform/TextureUtil.class"));
+        }
         patchBrowserInputCallbacks(args[0], root);
         patchGuiGraphicsBrowserItemCache(args[0], root);
         patchGuiRenderTelemetry(args[0], root);
@@ -181,8 +189,10 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/world/level/levelgen/synth/ImprovedNoise.class"));
         patchPerlinNoiseBrowserDoubleWrap(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/synth/PerlinNoise.class"));
+        boolean deepWorldgenCheckpoints = "26.2".equals(minecraftVersion);
         patchNoiseBasedChunkGeneratorBrowserSynchronous(args[0], root.resolve(
-                "net/minecraft/world/level/levelgen/NoiseBasedChunkGenerator.class"));
+                "net/minecraft/world/level/levelgen/NoiseBasedChunkGenerator.class"),
+                deepWorldgenCheckpoints);
         patchNoiseChunkBrowserSynchronous(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/NoiseChunk.class"));
         patchNoiseInterpolatorBrowserLerp(args[0], root.resolve(
@@ -194,24 +204,34 @@ public final class MinecraftClientPatcher {
         patchDensityFunctionsPureTransformersBrowserDirect(args[0], root);
         patchWorldgenRecordHashCodeCaches(args[0], root);
         patchClimateRTreeBrowserSynchronous(args[0], root.resolve(
-                "net/minecraft/world/level/biome/Climate$RTree$SubTree.class"));
+                "net/minecraft/world/level/biome/Climate$RTree$SubTree.class"),
+                deepWorldgenCheckpoints);
         patchClimateRTreeNodeBrowserDoubleDistance(args[0], root.resolve(
                 "net/minecraft/world/level/biome/Climate$RTree$Node.class"));
         patchSurfaceSystemBrowserSynchronous(args[0], root.resolve(
-                "net/minecraft/world/level/levelgen/SurfaceSystem.class"));
+                "net/minecraft/world/level/levelgen/SurfaceSystem.class"),
+                deepWorldgenCheckpoints);
         patchSurfaceRulesContextBrowserReusableBiomeSupplier(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/SurfaceRules$Context.class"));
         patchSurfaceRulesLazyConditionBrowserPrimitiveCache(args[0], root);
         patchSurfaceRulesSequenceBrowserIndexed(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/SurfaceRules$SequenceRule.class"));
         patchChunkGeneratorBrowserSynchronous(args[0], root.resolve(
-                "net/minecraft/world/level/chunk/ChunkGenerator.class"));
+                "net/minecraft/world/level/chunk/ChunkGenerator.class"),
+                deepWorldgenCheckpoints);
+        if (deepWorldgenCheckpoints) {
+            patchJigsawPlacementBrowserDeepCheckpoints(args[0], root.resolve(
+                    "net/minecraft/world/level/levelgen/structure/pools/JigsawPlacement$Placer.class"));
+        }
         patchWorldCarverBrowserSynchronous(args[0], root.resolve(
-                "net/minecraft/world/level/levelgen/carver/WorldCarver.class"));
+                "net/minecraft/world/level/levelgen/carver/WorldCarver.class"),
+                deepWorldgenCheckpoints);
         patchLightEngineBrowserSynchronous(args[0], root.resolve(
-                "net/minecraft/world/level/lighting/LightEngine.class"));
+                "net/minecraft/world/level/lighting/LightEngine.class"),
+                deepWorldgenCheckpoints);
         patchLevelChunkSectionBrowserSynchronous(args[0], root.resolve(
-                "net/minecraft/world/level/chunk/LevelChunkSection.class"));
+                "net/minecraft/world/level/chunk/LevelChunkSection.class"),
+                deepWorldgenCheckpoints);
         patchFriendlyByteBufBrowserLongArray(args[0], root.resolve(
                 "net/minecraft/network/FriendlyByteBuf.class"));
         patchSimpleBitStorageBrowserUnpack(args[0], root.resolve(
@@ -230,8 +250,10 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/world/level/chunk/storage/RegionFileVersion.class"));
         patchPersistentEntityUuidBrowserRecovery(args[0], root.resolve(
                 "net/minecraft/world/level/entity/PersistentEntitySectionManager.class"));
-        patchServerLevelBrowserSafeDefaults(args[0], root.resolve(
-                "net/minecraft/server/level/ServerLevel.class"));
+        patchNaturalSpawnerGenerationSpawnTelemetry(args[0], root.resolve(
+                "net/minecraft/world/level/NaturalSpawner.class"), minecraftVersion);
+        // Preserve both vanilla generation-time creature packs and per-tick
+        // spawning, including the hostile-mob gamerule filter.
         patchChaseClient(args[0], root.resolve(
                 "net/minecraft/server/chase/ChaseClient.class"));
         patchLanServerPinger(args[0], root.resolve(
@@ -352,6 +374,7 @@ public final class MinecraftClientPatcher {
             throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/Options.class");
         int patched = 0;
+        int sprintDefaults = 0;
         for (MethodNode method : node.methods) {
             if (!method.name.equals("<init>")) {
                 continue;
@@ -376,10 +399,41 @@ public final class MinecraftClientPatcher {
                     break;
                 }
             }
+            boolean inSprintKey = false;
+            for (AbstractInsnNode instruction = method.instructions.getFirst();
+                    instruction != null;
+                    instruction = instruction.getNext()) {
+                if (instruction instanceof LdcInsnNode constant
+                        && "key.sprint".equals(constant.cst)) {
+                    inSprintKey = true;
+                    continue;
+                }
+                if (!inSprintKey) {
+                    continue;
+                }
+                if (instruction instanceof IntInsnNode intConstant
+                        && intConstant.getOpcode() == Opcodes.SIPUSH
+                        && intConstant.operand == 341) {
+                    intConstant.operand = 82;
+                    sprintDefaults++;
+                    break;
+                }
+                if (instruction instanceof LdcInsnNode constant
+                        && constant.cst instanceof Integer value
+                        && value.intValue() == 341) {
+                    method.instructions.set(instruction, new IntInsnNode(Opcodes.BIPUSH, 82));
+                    sprintDefaults++;
+                    break;
+                }
+            }
         }
         if (patched != 1) {
             throw new IllegalStateException(
                     "Options simulation-distance range patch point was not found");
+        }
+        if (sprintDefaults != 1) {
+            throw new IllegalStateException(
+                    "Options sprint default key patch point was not found: " + sprintDefaults);
         }
         MethodNode save = find(node, "save", "()V");
         int distanceSyncs = 0;
@@ -410,6 +464,33 @@ public final class MinecraftClientPatcher {
         }
         save.maxStack = Math.max(save.maxStack, 1);
         write(node, output);
+    }
+
+    /** 26.2 browser texture path: keep TextureUtil's public ABI and forward to the bulk helper. */
+    private static void patchTextureUtilBrowserSolidify(String jar, Path output)
+            throws IOException {
+        ClassNode node = read(jar, "com/mojang/blaze3d/platform/TextureUtil.class");
+        MethodNode method = find(
+                node,
+                "solidify",
+                "(Lcom/mojang/blaze3d/platform/NativeImage;)V");
+        if (method == null || (method.access & Opcodes.ACC_STATIC) == 0) {
+            throw new IllegalStateException("TextureUtil.solidify ABI changed");
+        }
+        method.instructions.clear();
+        method.tryCatchBlocks.clear();
+        method.localVariables = null;
+        method.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        method.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserTextureSolidifier",
+                "solidifyBulk",
+                "(Lcom/mojang/blaze3d/platform/NativeImage;)V",
+                false));
+        method.instructions.add(new InsnNode(Opcodes.RETURN));
+        method.maxStack = 1;
+        method.maxLocals = 1;
+        writeComputeFrames(node, output);
     }
 
     private static void patchMainBrowserStorageMount(String jar, Path output) throws IOException {
@@ -1218,67 +1299,28 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchScreenBrowserFastMenus(String jar, Path output) throws IOException {
+        /*
+         * Preserve the vanilla animated panorama and menu background.  The
+         * previous browser optimisation replaced these methods with a solid
+         * fill, which removed the original title-screen motion and made the
+         * launcher feel frozen.  Menu blurriness is already disabled in the
+         * browser defaults, so keeping the original render path is both
+         * visually correct and bounded to the normal texture draw calls.
+         * Options.menuBackgroundBlurriness stays at zero in browser defaults,
+         * so the restored animation remains crisp without the blur pass.
+         */
         ClassNode node = read(jar, "net/minecraft/client/gui/screens/Screen.class");
         boolean extractedGui = node.methods.stream()
                 .anyMatch(method -> method.name.equals("extractPanorama"));
         String graphics = extractedGui
                 ? "net/minecraft/client/gui/GuiGraphicsExtractor"
                 : "net/minecraft/client/gui/GuiGraphics";
-
-        MethodNode panorama = find(
-                node,
+        find(node,
                 extractedGui ? "extractPanorama" : "renderPanorama",
                 "(L" + graphics + ";F)V");
-        InsnList panoramaCode = new InsnList();
-        panoramaCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
-        panoramaCode.add(new InsnNode(Opcodes.ICONST_0));
-        panoramaCode.add(new InsnNode(Opcodes.ICONST_0));
-        panoramaCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        panoramaCode.add(new FieldInsnNode(
-                Opcodes.GETFIELD,
-                "net/minecraft/client/gui/screens/Screen",
-                "width",
-                "I"));
-        panoramaCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        panoramaCode.add(new FieldInsnNode(
-                Opcodes.GETFIELD,
-                "net/minecraft/client/gui/screens/Screen",
-                "height",
-                "I"));
-        panoramaCode.add(new LdcInsnNode(0xFF101820));
-        panoramaCode.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL,
-                graphics,
-                "fill",
-                "(IIIII)V",
-                false));
-        panoramaCode.add(new InsnNode(Opcodes.RETURN));
-        replace(panorama, panoramaCode, 6, 3);
-
-        MethodNode menuBackground = find(
-                node,
+        find(node,
                 extractedGui ? "extractMenuBackground" : "renderMenuBackground",
                 "(L" + graphics + ";IIII)V");
-        InsnList menuCode = new InsnList();
-        menuCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
-        menuCode.add(new VarInsnNode(Opcodes.ILOAD, 2));
-        menuCode.add(new VarInsnNode(Opcodes.ILOAD, 3));
-        menuCode.add(new VarInsnNode(Opcodes.ILOAD, 2));
-        menuCode.add(new VarInsnNode(Opcodes.ILOAD, 4));
-        menuCode.add(new InsnNode(Opcodes.IADD));
-        menuCode.add(new VarInsnNode(Opcodes.ILOAD, 3));
-        menuCode.add(new VarInsnNode(Opcodes.ILOAD, 5));
-        menuCode.add(new InsnNode(Opcodes.IADD));
-        menuCode.add(new LdcInsnNode(0xC0101820));
-        menuCode.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL,
-                graphics,
-                "fill",
-                "(IIIII)V",
-                false));
-        menuCode.add(new InsnNode(Opcodes.RETURN));
-        replace(menuBackground, menuCode, 6, 6);
-
         write(node, output);
     }
 
@@ -10026,6 +10068,25 @@ public final class MinecraftClientPatcher {
         write(node, output);
     }
 
+    /**
+     * The 26.2 F3 overlay requests an integrated-server chunk future while
+     * building debug text. The browser server lives in a separate Worker,
+     * so leave that optional server sample unavailable. Keep the ordinary
+     * client-cache lookup for the debug entries that can display its data.
+     */
+    private static void patchDebugScreenOverlayBrowserNoChunk(
+            String jar, Path output) throws IOException {
+        ClassNode node = read(jar,
+                "net/minecraft/client/gui/components/DebugScreenOverlay.class");
+        MethodNode method = find(node, "getServerChunk",
+                "()Lnet/minecraft/world/level/chunk/LevelChunk;");
+        InsnList code = new InsnList();
+        code.add(new InsnNode(Opcodes.ACONST_NULL));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(method, code, 1, 1);
+        write(node, output);
+    }
+
     private static void patchMinecraft(String jar, Path outputRoot) throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/Minecraft.class");
         boolean hasNoRender = node.fields.stream().anyMatch(field ->
@@ -12831,7 +12892,6 @@ public final class MinecraftClientPatcher {
         ClassNode node = read(jar, "net/minecraft/client/multiplayer/ClientPacketListener.class");
         boolean handleLoginHooked = false;
         boolean handleLoginImmediateReadyHooked = false;
-        boolean handleLoginDifficultyHooked = false;
         boolean startWaitingHooked = false;
         boolean levelChunkHooked = false;
         boolean batchStartHooked = false;
@@ -12849,18 +12909,6 @@ public final class MinecraftClientPatcher {
                 method.instructions.insert(minecraftEvent("client.handleLogin"));
                 method.maxStack = Math.max(method.maxStack, 1);
                 handleLoginHooked = true;
-                for (var instruction = method.instructions.getFirst();
-                        instruction != null;
-                        instruction = instruction.getNext()) {
-                    if (instruction instanceof FieldInsnNode field
-                            && field.getOpcode() == Opcodes.GETSTATIC
-                            && field.owner.equals("net/minecraft/world/Difficulty")
-                            && field.name.equals("NORMAL")
-                            && field.desc.equals("Lnet/minecraft/world/Difficulty;")) {
-                        field.name = "PEACEFUL";
-                        handleLoginDifficultyHooked = true;
-                    }
-                }
                 int returnHooks = 0;
                 for (AbstractInsnNode instruction : method.instructions.toArray()) {
                     if (instruction.getOpcode() != Opcodes.RETURN) {
@@ -12973,7 +13021,6 @@ public final class MinecraftClientPatcher {
 
         if (!handleLoginHooked
                 || !handleLoginImmediateReadyHooked
-                || !handleLoginDifficultyHooked
                 || !startWaitingHooked
                 || !levelChunkHooked
                 || !batchStartHooked
@@ -13169,16 +13216,6 @@ public final class MinecraftClientPatcher {
                 root.resolve("net/minecraft/client/multiplayer/LevelLoadTracker$WaitingForPlayerChunk.class"));
     }
 
-    private static void patchServerLevelBrowserSafeDefaults(String jar, Path output) throws IOException {
-        ClassNode node = read(jar, "net/minecraft/server/level/ServerLevel.class");
-        MethodNode method = find(node, "isSpawningMonsters", "()Z");
-        InsnList code = new InsnList();
-        code.add(new InsnNode(Opcodes.ICONST_0));
-        code.add(new InsnNode(Opcodes.IRETURN));
-        replace(method, code, 1, 1);
-        write(node, output);
-    }
-
     private static void patchChunkGeneratorStructureStateBrowserFastRings(
             String jar, Path output) throws IOException {
         String owner = "net/minecraft/world/level/chunk/ChunkGeneratorStructureState";
@@ -13219,7 +13256,7 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchNoiseBasedChunkGeneratorBrowserSynchronous(
-            String jar, Path output) throws IOException {
+            String jar, Path output, boolean deepWorldgenCheckpoints) throws IOException {
         ClassNode node = read(jar, "net/minecraft/world/level/levelgen/NoiseBasedChunkGenerator.class");
         MethodNode method = find(
                 node,
@@ -13231,6 +13268,10 @@ public final class MinecraftClientPatcher {
                         + "Lnet/minecraft/world/level/chunk/ChunkAccess;");
         cacheNoiseBasedChunkGeneratorDoFillConstants(method);
         requireWorldgenSchedulerCalls("NoiseBasedChunkGenerator.doFill", method, 0);
+        if (deepWorldgenCheckpoints) {
+            patchDeepWorldgenPulseBackEdges(
+                    method, "NoiseBasedChunkGenerator.doFill");
+        }
         MethodNode applyCarvers = find(
                 node,
                 "applyCarvers",
@@ -13241,6 +13282,10 @@ public final class MinecraftClientPatcher {
                         + "Lnet/minecraft/world/level/chunk/ChunkAccess;)V");
         requireWorldgenSchedulerCalls(
                 "NoiseBasedChunkGenerator.applyCarvers", applyCarvers, 0);
+        if (deepWorldgenCheckpoints) {
+            patchDeepWorldgenPulseBackEdges(
+                    applyCarvers, "NoiseBasedChunkGenerator.applyCarvers");
+        }
         writeComputeFrames(node, output);
     }
 
@@ -13898,8 +13943,8 @@ public final class MinecraftClientPatcher {
         write(node, output);
     }
 
-    private static void patchSurfaceSystemBrowserSynchronous(String jar, Path output)
-            throws IOException {
+    private static void patchSurfaceSystemBrowserSynchronous(
+            String jar, Path output, boolean deepWorldgenCheckpoints) throws IOException {
         ClassNode node = read(jar, "net/minecraft/world/level/levelgen/SurfaceSystem.class");
         String legacyDescriptor =
                 "(Lnet/minecraft/world/level/levelgen/RandomState;"
@@ -13933,7 +13978,12 @@ public final class MinecraftClientPatcher {
             throw new IllegalStateException("SurfaceSystem.buildSurface method was not found");
         }
         requireWorldgenSchedulerCalls("SurfaceSystem.buildSurface", method, 0);
-        write(node, output);
+        if (deepWorldgenCheckpoints) {
+            patchDeepWorldgenPulseBackEdges(method, "SurfaceSystem.buildSurface");
+            writeComputeFrames(node, output);
+        } else {
+            write(node, output);
+        }
     }
 
     private static void patchSurfaceRulesContextBrowserReusableBiomeSupplier(
@@ -14808,8 +14858,8 @@ public final class MinecraftClientPatcher {
         replace(method, code, 5, 6);
     }
 
-    private static void patchClimateRTreeBrowserSynchronous(String jar, Path output)
-            throws IOException {
+    private static void patchClimateRTreeBrowserSynchronous(
+            String jar, Path output, boolean deepWorldgenCheckpoints) throws IOException {
         ClassNode node = read(jar, "net/minecraft/world/level/biome/Climate$RTree$SubTree.class");
         MethodNode method = find(
                 node,
@@ -14818,7 +14868,24 @@ public final class MinecraftClientPatcher {
                         + "Lnet/minecraft/world/level/biome/Climate$DistanceMetric;)"
                         + "Lnet/minecraft/world/level/biome/Climate$RTree$Leaf;");
         requireWorldgenSchedulerCalls("Climate.RTree.SubTree.search", method, 0);
-        write(node, output);
+        if (!deepWorldgenCheckpoints) {
+            write(node, output);
+            return;
+        }
+
+        int checkpoints = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (!(instruction instanceof IincInsnNode increment) || increment.var != 9) {
+                continue;
+            }
+            method.instructions.insert(instruction, browserWorldgenDeepPulse());
+            checkpoints++;
+        }
+        if (checkpoints != 1) {
+            throw new IllegalStateException(
+                    "Climate RTree subtree search loop shape changed: checkpoints=" + checkpoints);
+        }
+        writeComputeFrames(node, output);
     }
 
     private static void patchClimateRTreeNodeBrowserDoubleDistance(
@@ -14887,8 +14954,8 @@ public final class MinecraftClientPatcher {
         writeComputeFrames(node, output);
     }
 
-    private static void patchChunkGeneratorBrowserSynchronous(String jar, Path output)
-            throws IOException {
+    private static void patchChunkGeneratorBrowserSynchronous(
+            String jar, Path output, boolean deepWorldgenCheckpoints) throws IOException {
         ClassNode node = read(jar, "net/minecraft/world/level/chunk/ChunkGenerator.class");
         MethodNode decoration = find(
                 node,
@@ -14897,6 +14964,10 @@ public final class MinecraftClientPatcher {
                         + "Lnet/minecraft/world/level/chunk/ChunkAccess;"
                         + "Lnet/minecraft/world/level/StructureManager;)V");
         requireWorldgenSchedulerCalls("ChunkGenerator.applyBiomeDecoration", decoration, 0);
+        if (deepWorldgenCheckpoints) {
+            patchDeepWorldgenPulseBackEdges(
+                    decoration, "ChunkGenerator.applyBiomeDecoration");
+        }
 
         String structureSetDescriptor =
                 "(Lnet/minecraft/world/level/StructureManager;"
@@ -14925,6 +14996,27 @@ public final class MinecraftClientPatcher {
             throw new IllegalStateException("ChunkGenerator createStructures lambda was not found");
         }
         requireWorldgenSchedulerCalls("ChunkGenerator.createStructures", structureSets, 0);
+        if (deepWorldgenCheckpoints) {
+            int checkpoints = 0;
+            for (AbstractInsnNode instruction : structureSets.instructions.toArray()) {
+                if (!(instruction instanceof MethodInsnNode call)
+                        || call.getOpcode() != Opcodes.INVOKEVIRTUAL
+                        || !call.owner.equals("net/minecraft/world/level/chunk/ChunkGenerator")
+                        || !call.name.equals("tryGenerateStructure")) {
+                    continue;
+                }
+                structureSets.instructions.insertBefore(
+                        instruction, browserWorldgenDeepPulse());
+                checkpoints++;
+            }
+            if (checkpoints < 2) {
+                throw new IllegalStateException(
+                        "ChunkGenerator structure selection call shape changed: checkpoints="
+                                + checkpoints);
+            }
+            patchDeepWorldgenPulseBackEdges(
+                    structureSets, "ChunkGenerator.createStructures");
+        }
 
         MethodNode references = find(
                 node,
@@ -14933,11 +15025,46 @@ public final class MinecraftClientPatcher {
                         + "Lnet/minecraft/world/level/StructureManager;"
                         + "Lnet/minecraft/world/level/chunk/ChunkAccess;)V");
         requireWorldgenSchedulerCalls("ChunkGenerator.createReferences", references, 0);
-        write(node, output);
+        if (deepWorldgenCheckpoints) {
+            writeComputeFrames(node, output);
+        } else {
+            write(node, output);
+        }
     }
 
-    private static void patchWorldCarverBrowserSynchronous(String jar, Path output)
-            throws IOException {
+    private static void patchJigsawPlacementBrowserDeepCheckpoints(
+            String jar, Path output) throws IOException {
+        String owner = "net/minecraft/world/level/levelgen/structure/pools/JigsawPlacement$Placer";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode method = find(
+                node,
+                "tryPlacingChildren",
+                "(Lnet/minecraft/world/level/levelgen/structure/PoolElementStructurePiece;"
+                        + "Lorg/apache/commons/lang3/mutable/MutableObject;IZ"
+                        + "Lnet/minecraft/world/level/LevelHeightAccessor;"
+                        + "Lnet/minecraft/world/level/levelgen/RandomState;"
+                        + "Lnet/minecraft/world/level/levelgen/structure/pools/alias/PoolAliasLookup;"
+                        + "Lnet/minecraft/world/level/levelgen/structure/templatesystem/LiquidSettings;)V");
+        int checkpoints = 0;
+        AbstractInsnNode[] instructions = method.instructions.toArray();
+        for (int index = 0; index < instructions.length; index++) {
+            AbstractInsnNode instruction = instructions[index];
+            if (!(instruction instanceof JumpInsnNode jump)
+                    || method.instructions.indexOf(jump.label) >= index) {
+                continue;
+            }
+            method.instructions.insertBefore(instruction, browserWorldgenDeepPulse());
+            checkpoints++;
+        }
+        if (checkpoints == 0) {
+            throw new IllegalStateException(
+                    "Jigsaw placement child loop shape changed: no back-edge checkpoint");
+        }
+        writeComputeFrames(node, output);
+    }
+
+    private static void patchWorldCarverBrowserSynchronous(
+            String jar, Path output, boolean deepWorldgenCheckpoints) throws IOException {
         ClassNode node = read(jar, "net/minecraft/world/level/levelgen/carver/WorldCarver.class");
         MethodNode method = find(
                 node,
@@ -14949,21 +15076,32 @@ public final class MinecraftClientPatcher {
                         + "Lnet/minecraft/world/level/chunk/CarvingMask;"
                         + "Lnet/minecraft/world/level/levelgen/carver/WorldCarver$CarveSkipChecker;)Z");
         requireWorldgenSchedulerCalls("WorldCarver.carveEllipsoid", method, 0);
-        write(node, output);
+        if (deepWorldgenCheckpoints) {
+            patchDeepWorldgenPulseBackEdges(method, "WorldCarver.carveEllipsoid");
+            writeComputeFrames(node, output);
+        } else {
+            write(node, output);
+        }
     }
 
-    private static void patchLightEngineBrowserSynchronous(String jar, Path output)
-            throws IOException {
+    private static void patchLightEngineBrowserSynchronous(
+            String jar, Path output, boolean deepWorldgenCheckpoints) throws IOException {
         ClassNode node = read(jar, "net/minecraft/world/level/lighting/LightEngine.class");
         MethodNode increases = find(node, "propagateIncreases", "()I");
         MethodNode decreases = find(node, "propagateDecreases", "()I");
         requireWorldgenSchedulerCalls("LightEngine.propagateIncreases", increases, 0);
         requireWorldgenSchedulerCalls("LightEngine.propagateDecreases", decreases, 0);
-        write(node, output);
+        if (deepWorldgenCheckpoints) {
+            patchDeepWorldgenPulseBackEdges(increases, "LightEngine.propagateIncreases");
+            patchDeepWorldgenPulseBackEdges(decreases, "LightEngine.propagateDecreases");
+            writeComputeFrames(node, output);
+        } else {
+            write(node, output);
+        }
     }
 
     private static void patchLevelChunkSectionBrowserSynchronous(
-            String jar, Path output) throws IOException {
+            String jar, Path output, boolean deepWorldgenCheckpoints) throws IOException {
         ClassNode node = read(jar, "net/minecraft/world/level/chunk/LevelChunkSection.class");
         MethodNode method = find(
                 node,
@@ -14971,7 +15109,12 @@ public final class MinecraftClientPatcher {
                 "(Lnet/minecraft/world/level/biome/BiomeResolver;"
                         + "Lnet/minecraft/world/level/biome/Climate$Sampler;III)V");
         requireWorldgenSchedulerCalls("LevelChunkSection.fillBiomesFromNoise", method, 0);
-        write(node, output);
+        if (deepWorldgenCheckpoints) {
+            patchDeepWorldgenPulseBackEdges(method, "LevelChunkSection.fillBiomesFromNoise");
+            writeComputeFrames(node, output);
+        } else {
+            write(node, output);
+        }
     }
 
     private static MethodInsnNode browserWorldgenCheckpoint() {
@@ -14981,6 +15124,43 @@ public final class MinecraftClientPatcher {
                 "checkpoint",
                 "()V",
                 false);
+    }
+
+    private static MethodInsnNode browserWorldgenDeepCheckpoint() {
+        return new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserWorldgenDeepCheckpoint",
+                "checkpoint",
+                "()V",
+                false);
+    }
+
+    private static MethodInsnNode browserWorldgenDeepPulse() {
+        return new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserWorldgenDeepCheckpoint",
+                "pulse",
+                "()V",
+                false);
+    }
+
+    /** Inserts budget-aware pulses at all backwards control-flow edges in one deep loop. */
+    private static int patchDeepWorldgenPulseBackEdges(MethodNode method, String label) {
+        int pulses = 0;
+        AbstractInsnNode[] instructions = method.instructions.toArray();
+        for (int index = 0; index < instructions.length; index++) {
+            AbstractInsnNode instruction = instructions[index];
+            if (!(instruction instanceof JumpInsnNode jump)
+                    || method.instructions.indexOf(jump.label) >= index) {
+                continue;
+            }
+            method.instructions.insertBefore(jump, browserWorldgenDeepPulse());
+            pulses++;
+        }
+        if (pulses == 0) {
+            throw new IllegalStateException(label + " has no deep worldgen loop back-edge");
+        }
+        return pulses;
     }
 
     private static MethodInsnNode browserWorldgenBeginTaskWork() {
@@ -15019,6 +15199,112 @@ public final class MinecraftClientPatcher {
                 false);
     }
 
+    private static InsnList browserGenerationSpawnEntityAddedCode(int tokenLocal) {
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ILOAD, tokenLocal));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserGenerationSpawnTelemetry",
+                "entityAdded",
+                "(I)V",
+                false));
+        return code;
+    }
+
+    private static InsnList browserGenerationSpawnFinishCode(String method, int tokenLocal) {
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ILOAD, tokenLocal));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserGenerationSpawnTelemetry",
+                method,
+                "(I)V",
+                false));
+        return code;
+    }
+
+    private static void patchNaturalSpawnerGenerationSpawnTelemetry(
+            String jar, Path output, String minecraftVersion) throws IOException {
+        String owner = "net/minecraft/world/level/NaturalSpawner";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode method = find(
+                node,
+                "spawnMobsForChunkGeneration",
+                "(Lnet/minecraft/world/level/ServerLevelAccessor;"
+                        + "Lnet/minecraft/core/Holder;"
+                        + "Lnet/minecraft/world/level/ChunkPos;"
+                        + "Lnet/minecraft/util/RandomSource;)V");
+        int tokenLocal = method.maxLocals++;
+        LabelNode start = new LabelNode();
+        LabelNode end = new LabelNode();
+        LabelNode handler = new LabelNode();
+        int throwableLocal = method.maxLocals++;
+        InsnList entry = new InsnList();
+        entry.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        entry.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "net/minecraft/world/level/ServerLevelAccessor",
+                "getLevel",
+                "()Lnet/minecraft/server/level/ServerLevel;",
+                true));
+        entry.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        if ("26.2".equals(minecraftVersion)) {
+            entry.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                    "net/minecraft/world/level/ChunkPos", "x", "()I", false));
+        } else {
+            entry.add(new FieldInsnNode(Opcodes.GETFIELD,
+                    "net/minecraft/world/level/ChunkPos", "x", "I"));
+        }
+        entry.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        if ("26.2".equals(minecraftVersion)) {
+            entry.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                    "net/minecraft/world/level/ChunkPos", "z", "()I", false));
+        } else {
+            entry.add(new FieldInsnNode(Opcodes.GETFIELD,
+                    "net/minecraft/world/level/ChunkPos", "z", "I"));
+        }
+        entry.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserGenerationSpawnTelemetry", "begin",
+                "(Ljava/lang/Object;II)I", false));
+        entry.add(new VarInsnNode(Opcodes.ISTORE, tokenLocal));
+        entry.add(start);
+        method.instructions.insertBefore(method.instructions.getFirst(), entry);
+        int added = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals("net/minecraft/world/level/ServerLevelAccessor")
+                    && call.name.equals("addFreshEntityWithPassengers")
+                    && call.desc.equals("(Lnet/minecraft/world/entity/Entity;)V")) {
+                method.instructions.insert(call, browserGenerationSpawnEntityAddedCode(tokenLocal));
+                added++;
+            }
+        }
+        int returns = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction.getOpcode() == Opcodes.RETURN) {
+                method.instructions.insertBefore(instruction,
+                        browserGenerationSpawnFinishCode("complete", tokenLocal));
+                returns++;
+            }
+        }
+        if (returns == 0 || added == 0) {
+            throw new IllegalStateException("NaturalSpawner telemetry anchors missing: returns="
+                    + returns + ", entityAdds=" + added);
+        }
+        InsnList cleanup = new InsnList();
+        cleanup.add(end);
+        cleanup.add(handler);
+        cleanup.add(new VarInsnNode(Opcodes.ASTORE, throwableLocal));
+        cleanup.add(browserGenerationSpawnFinishCode("failed", tokenLocal));
+        cleanup.add(new VarInsnNode(Opcodes.ALOAD, throwableLocal));
+        cleanup.add(new InsnNode(Opcodes.ATHROW));
+        method.instructions.add(cleanup);
+        method.tryCatchBlocks.add(new TryCatchBlockNode(start, end, handler, "java/lang/Throwable"));
+        writeComputeFrames(node, output);
+        System.out.println("Instrumented NaturalSpawner generation spawn telemetry ("
+                + minecraftVersion + "): returns=" + returns + ", entityAdds=" + added);
+    }
     /**
      * Instruments a task-layer entry without touching the deep synchronous
      * worldgen methods.  Normal returns are explicit so the scope closes before
@@ -18157,14 +18443,16 @@ public final class MinecraftClientPatcher {
                     "recordChunkBatchSent",
                     "(I)V",
                     false));
-            sendNextChunks.instructions.insert(batchFinishedSend, record);
+            // Record before invoking send: the browser transport may synchronously re-enter
+            // the ACK path while send() is dispatching the finished-batch packet.
+            sendNextChunks.instructions.insertBefore(batchFinishedSend, record);
             records++;
         }
         if (records != 1) {
             throw new IllegalStateException(
                     "PlayerChunkSender chunk-batch size point changed: " + records);
         }
-        sendNextChunks.maxStack = Math.max(sendNextChunks.maxStack, 2);
+        sendNextChunks.maxStack = Math.max(sendNextChunks.maxStack, 3);
         writeComputeFrames(node, output);
     }
 

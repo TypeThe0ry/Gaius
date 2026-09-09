@@ -172,40 +172,21 @@ if [[ -n "$asset_index_id" && -f "$asset_index" ]]; then
     | [.key, .value.hash]
     | @tsv
   ' "$asset_index" | tr -d '\r' >"$browser_sound_manifest"
-  while IFS= read -r sound_directory; do
-    if [[ -n "$sound_directory" ]]; then
-      mkdir -p "$sound_directory"
-    fi
-  done < <(
-    awk -F '\t' -v root="$generated_assets/" '
-      {
-        path = $1
-        sub("/[^/]+$", "", path)
-        print root path
-      }
-    ' "$browser_sound_manifest" | sort -u
-  )
-  browser_sound_names=()
-  while IFS=$'\t' read -r logical_path hash; do
-    if [[ -z "$logical_path" || -z "$hash" ]]; then
-      continue
-    fi
-    source="$work/assets/objects/${hash:0:2}/$hash"
-    if [[ ! -f "$source" ]]; then
-      echo "WARNING: missing browser sound asset object for $logical_path ($hash)" >&2
-      continue
-    fi
-    target="$generated_assets/$logical_path"
-    # Ensure each parent exists even when the manifest contains a path whose
-    # directory was not emitted by the batched mkdir/xargs pass (Windows Git
-    # Bash can otherwise race filesystem translation for long argument lists).
-    mkdir -p "$(dirname "$target")"
-    cp "$source" "$target"
-    printf 'assets/%s\n' "$logical_path" >>"$resource_list"
-    sound_name="${logical_path#minecraft/sounds/}"
-    browser_sound_names+=("${sound_name%.ogg}")
-    copied_sound_assets=$((copied_sound_assets + 1))
-  done <"$browser_sound_manifest"
+  # Stage the content-addressed sound objects in one Python process.  The
+  # helper preserves manifest/resource/name order and keeps the old warning
+  # and skip behavior for an absent object.
+  browser_sound_names="$build_root/browser-sound-names.json"
+  sound_stage_result="$("$root/port/scripts/run-python.sh" \
+    "$root/port/scripts/stage-browser-sounds.py" \
+    --manifest "$browser_sound_manifest" \
+    --objects "$work/assets/objects" \
+    --output "$generated_assets" \
+    --resource-list "$resource_list" \
+    --sound-names "$browser_sound_names" \
+    --missing warn)"
+  printf '%s\n' "$sound_stage_result" >"$build_root/browser-sound-stage.json"
+  copied_sound_assets="$(jq -er '.copied' "$build_root/browser-sound-stage.json")"
+  echo "Staged browser sounds: $copied_sound_assets copied"
 
   # Mojang ships the Unicode fallback as indexed assets rather than client-jar
   # entries. Embed it so browser resource packs can safely override default.json.
@@ -265,7 +246,6 @@ if [[ -n "$asset_index_id" && -f "$asset_index" ]]; then
     if [[ -f "$sounds_json_source" ]]; then
       sounds_json_target="$generated_assets/minecraft/sounds.json"
       allowed_sounds_json="$build_root/browser-sound-names.json"
-      printf '%s\n' "${browser_sound_names[@]}" | jq -R . | jq -s . >"$allowed_sounds_json"
       mkdir -p "$(dirname "$sounds_json_target")"
       jq --slurpfile allowed "$allowed_sounds_json" '
         def sound_name:
@@ -316,7 +296,8 @@ awk '
   "$resource_list" \
   "$overlay_directory/client-named-$version-gaius.jar" \
   "$generated_resources" \
-  "$vanilla_asset_pack"
+  "$vanilla_asset_pack" \
+  "$asset_index"
 echo "Generated browser resource list: $(wc -l <"$resource_list" | tr -d ' ') entries"
 echo "Embedded TeaVM resource subset: $(wc -l <"$embedded_resource_list" | tr -d ' ') entries"
 echo "Mapped browser sound assets: $copied_sound_assets"

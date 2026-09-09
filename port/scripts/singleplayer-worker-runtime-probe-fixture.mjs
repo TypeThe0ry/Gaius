@@ -4,7 +4,8 @@ import vm from "node:vm";
 import {resolve} from "node:path";
 import {fileURLToPath} from "node:url";
 
-const source = fs.readFileSync(new URL("./singleplayer-worker-runtime-smoke.mjs", import.meta.url), "utf8");
+const source = fs.readFileSync(new URL("./singleplayer-worker-runtime-smoke.mjs", import.meta.url), "utf8")
+  .replace(/\r\n/g, "\n");
 // These functions are direct siblings in the source. Keep their actual bodies,
 // including timer callbacks, rather than copying the selection algorithm.
 function extract(name) {

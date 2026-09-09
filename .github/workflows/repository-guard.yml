@@ -51,6 +51,17 @@ jobs:
           python3 port/scripts/test-index-template.py
           python3 port/scripts/test-postprocess-index-shell.py
           python3 port/scripts/test-portable-artifact-identity.py
+          python3 port/scripts/test-vanilla-background-assets.py
+          python3 port/scripts/test-stage-browser-sounds.py
+          node port/scripts/browser-keyboard-capture-smoke.mjs
+          node port/scripts/browser-input-character-smoke.mjs
+          node port/scripts/generation-spawn-telemetry-smoke.mjs
+          node port/scripts/server-tick-window-smoke.mjs
+          node port/scripts/client-distance-gate-smoke.mjs
+          node port/scripts/chrome-cdp-timeout-smoke.mjs
+          node port/scripts/chrome-input-chord-smoke.mjs
+          node port/scripts/world-mode-selection-smoke.mjs
+          node port/scripts/chrome-world-seed-smoke.mjs
 
   bridge-smoke:
     runs-on: ubuntu-latest
@@ -98,6 +109,35 @@ jobs:
         with:
           distribution: temurin
           java-version: 21
+
+      - name: Validate TeaVM Formatter percent regression
+        run: |
+          set -euo pipefail
+          ./port/mvnw --batch-mode --no-transfer-progress \
+            org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
+            -Dartifact=org.teavm:teavm-tooling:0.15.0
+          ./port/mvnw --batch-mode --no-transfer-progress \
+            org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
+            -Dartifact=org.teavm:teavm-classlib:0.15.0
+          for artifact in asm asm-tree asm-analysis; do
+            ./port/mvnw --batch-mode --no-transfer-progress \
+              org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
+              "-Dartifact=org.ow2.asm:${artifact}:9.8" -Dtransitive=false
+          done
+          node port/scripts/formatter-percent-smoke.mjs
+
+      - name: Validate TeaVM JSBody syntax before full compilation
+        run: |
+          set -euo pipefail
+          for artifact in teavm-core teavm-relocated-libs-rhino; do
+            ./port/mvnw --batch-mode --no-transfer-progress \
+              org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
+              "-Dartifact=org.teavm:${artifact}:0.15.0" -Dtransitive=false
+          done
+          node port/scripts/teavm-jsbody-parser-smoke.mjs \
+            port/src/main/java/dev/gaius/browser/BrowserGenerationSpawnTelemetry.java \
+            port/src/main/java/dev/gaius/browser/BrowserWorldgenScheduler.java \
+            port/overrides/libraries/lwjgl-glfw/src/main/java/org/lwjgl/glfw/BrowserGlfw.java
 
       - name: Validate bounded Worker stall telemetry
         run: |

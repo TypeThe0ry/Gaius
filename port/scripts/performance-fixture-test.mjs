@@ -922,10 +922,10 @@ completed.push("runtime-invariant-external-smoke-evidence");
     profile: contract.profiles["steady-6-4"],
     environment: {valid: true, issues: []},
     frames: {
-      averageFps: 120,
-      onePercentLowFps: 60,
+      averageFps: 200,
+      onePercentLowFps: 200,
       coverageRatio: 1,
-      p99FrameMs: 16.7,
+      p99FrameMs: 5,
       longestFrameMs: 50,
       sampleCount: 36000,
       rawFrameCount: 36000,
@@ -948,10 +948,10 @@ completed.push("runtime-invariant-external-smoke-evidence");
     profile: contract.profiles["steady-6-4"],
     environment: {valid: true, issues: []},
     frames: {
-      averageFps: 120,
-      onePercentLowFps: 60,
+      averageFps: 200,
+      onePercentLowFps: 200,
       coverageRatio: 1,
-      p99FrameMs: 16.7,
+      p99FrameMs: 5,
       longestFrameMs: 50,
       sampleCount: 36000,
       rawFrameCount: 36000,
@@ -977,10 +977,10 @@ completed.push("runtime-invariant-external-smoke-evidence");
     profile: contract.profiles["traversal-6-4"],
     environment: {valid: true, issues: []},
     frames: {
-      averageFps: 119.999,
-      onePercentLowFps: 60,
+      averageFps: 199.999,
+      onePercentLowFps: 200,
       coverageRatio: 1,
-      p99FrameMs: 16.7,
+      p99FrameMs: 5,
       longestFrameMs: 50,
       sampleCount: 36000,
       rawFrameCount: 36000,
@@ -992,7 +992,7 @@ completed.push("runtime-invariant-external-smoke-evidence");
     stability: {verdict: "pass", reasons: []},
     runtimeInvariants: passingRuntimeInvariants,
   });
-  assert.equal(evaluation.overall, "fail", "traversal profile rejects sub-120 average FPS");
+  assert.equal(evaluation.overall, "fail", "traversal profile rejects sub-200 average FPS");
   completed.push("traversal-profile-fps-failure");
 }
 
@@ -1001,14 +1001,14 @@ completed.push("runtime-invariant-external-smoke-evidence");
     profile: contract.profiles["steady-6-4"],
     environment: {valid: true, issues: []},
     frames: {
-      averageFps: 120,
-      averageFpsRaw: 119.9996,
-      onePercentLowFps: 60,
-      onePercentLowFpsRaw: 59.9996,
+      averageFps: 200,
+      averageFpsRaw: 199.9996,
+      onePercentLowFps: 200,
+      onePercentLowFpsRaw: 199.9996,
       coverageRatio: 1,
       coverageRatioRaw: 1,
-      p99FrameMs: 16.7,
-      p99FrameMsRaw: 16.7,
+      p99FrameMs: 5,
+      p99FrameMsRaw: 5,
       longestFrameMs: 50,
       longestFrameMsRaw: 50,
       sampleCount: 36000,
@@ -1047,10 +1047,10 @@ completed.push("runtime-invariant-external-smoke-evidence");
     profile: contract.profiles["soak-sp-6-4"],
     environment: {valid: true, issues: []},
     frames: {
-      averageFps: 120,
-      onePercentLowFps: 60,
+      averageFps: 200,
+      onePercentLowFps: 200,
       coverageRatio: 1,
-      p99FrameMs: 16.7,
+      p99FrameMs: 5,
       longestFrameMs: 50,
       sampleCount: 36000,
       rawFrameCount: 36000,
@@ -1091,10 +1091,10 @@ completed.push("runtime-invariant-external-smoke-evidence");
     profile: contract.profiles["steady-6-4"],
     environment: {valid: true, issues: []},
     frames: {
-      averageFps: 120,
-      onePercentLowFps: 60,
+      averageFps: 200,
+      onePercentLowFps: 200,
       coverageRatio: 1,
-      p99FrameMs: 16.7,
+      p99FrameMs: 5,
       longestFrameMs: 50,
       sampleCount: 36000,
       rawFrameCount: 36000,
@@ -1206,8 +1206,8 @@ completed.push("runtime-invariant-external-smoke-evidence");
   assert.equal(soak.soakMs, 1800000, "stability soak must remain thirty minutes");
   assert.ok(benchmarkSource.includes("Math.max(performanceMillis, heapMillis)"),
     "soak FPS evidence must cover the full thirty-minute stability run");
-  assert.equal(soak.gates.averageFpsMin, 120);
-  assert.equal(soak.gates.onePercentLowFpsMin, 60);
+  assert.equal(soak.gates.averageFpsMin, 200);
+  assert.equal(soak.gates.onePercentLowFpsMin, 200);
   assert.deepEqual(contract.releaseEvidence.requiredMemoryProfiles, ["soak-sp-6-4"]);
   assert.equal(soak.gates.memory, true);
   assert.equal(soak.soakMs, contract.measurement.soakMs);

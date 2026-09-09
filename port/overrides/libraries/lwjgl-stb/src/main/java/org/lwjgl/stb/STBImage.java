@@ -272,6 +272,14 @@ public final class STBImage {
         int source = 0;
         int target = 0;
         int rowBytes = (width * bitDepth * sourceChannels(colorType) + 7) / 8;
+        if (bitDepth == 8 && colorType == 6) {
+            for (int y = 0; y < height; y++) {
+                System.arraycopy(data, source, rgba, target, rowBytes);
+                source += rowBytes;
+                target += rowBytes;
+            }
+            return rgba;
+        }
         for (int y = 0; y < height; y++) {
             int rowStart = source;
             BitReader bits = new BitReader(data, rowStart);

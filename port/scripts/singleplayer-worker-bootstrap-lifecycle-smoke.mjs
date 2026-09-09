@@ -181,6 +181,14 @@ globalThis.__gaiusServerTickTelemetry = {
   nested: {mustNotCross: true},
   nonfinite: -Infinity,
 };
+globalThis.__gaiusServerDistanceTelemetry = {
+  configuredViewDistance: 6,
+  activeViewDistance: 2,
+  acknowledgedChunkCount: 8,
+  reason: "awaiting-active-radius-ack",
+  nested: {mustNotCross: true},
+  nonfinite: Infinity,
+};
 Object.defineProperty(globalThis.__gaiusWorldgenSchedulerMarker, "throws", {
   enumerable: true,
   get() { throw new Error("diagnostic getter probe"); },
@@ -512,6 +520,12 @@ assert.deepEqual({...telemetryPong.globalPump}, {
   pumpAllLastTurnMillis: null,
   pumpAllLastChannelsVisited: null,
 }, "Worker heartbeat did not expose a fixed globalPump shape");
+assert.deepEqual({...telemetryPong.serverDistance}, {
+  configuredViewDistance: 6,
+  activeViewDistance: 2,
+  acknowledgedChunkCount: 8,
+  reason: "awaiting-active-radius-ack",
+}, "Worker distance snapshot must preserve gauges without resetting or copying nested values");
 assert.deepEqual({...telemetryPong.chunkPriority}, {
   playerUpdates: 0,
   pops: 0,

@@ -914,6 +914,10 @@ function handleControlMessage(event) {
       ? message.measurementId
       : String(message.measurementId == null ? "" : message.measurementId);
     const receivedAtEpoch = Date.now();
+    // This is the Worker-local monotonic sample clock.  It travels with the
+    // server counters so browser-side windows do not have to infer timing
+    // from the page or from the cumulative tick-duration fields.
+    const sampledAtMillis = performance.now();
     refreshStorageStats();
     observeTelemetryMeasurement(measurementId);
     postMessage({
@@ -936,22 +940,37 @@ function handleControlMessage(event) {
       // deltas): turns/yields are cumulative process diagnostics while the
       // max/last fields are gauges. Missing fields stay explicit nulls.
       globalPump: snapshotGlobalPumpTelemetry(globalPumpTelemetrySource()),
+      serverDistance: snapshotScalarTelemetry(root.__gaiusServerDistanceTelemetry),
       worldgen: snapshotScalarTelemetry(root.__gaiusWorldgenStats, [
         "mobAiPulses",
         "mobAiMaxPulses",
       ]),
-      serverTick: snapshotScalarTelemetry(root.__gaiusServerTickTelemetry, [
-        "schemaVersion",
-        "tickCount",
-        "intervalCount",
-        "completedTickCount",
-        "lastTickIntervalMillis",
-        "maxTickIntervalMillis",
-        "totalTickIntervalMillis",
-        "lastTickDurationMillis",
-        "maxTickDurationMillis",
-        "totalTickDurationMillis",
-      ]),
+      serverTick: root.__gaiusServerTickTelemetryEnabled === true &&
+        root.__gaiusServerTickTelemetry
+        ? {
+          ...snapshotScalarTelemetry(root.__gaiusServerTickTelemetry, [
+            "schemaVersion",
+            "tickCount",
+            "intervalCount",
+            "completedTickCount",
+            "intervalOver100MillisCount",
+            "intervalOver500MillisCount",
+            "lastTickIntervalMillis",
+            "maxTickIntervalMillis",
+            "totalTickIntervalMillis",
+            "lastTickDurationMillis",
+            "maxTickDurationMillis",
+            "totalTickDurationMillis",
+            "completedWaitPhaseCount",
+            "lastWaitPhaseDurationMillis",
+            "maxWaitPhaseDurationMillis",
+            "totalWaitPhaseDurationMillis",
+            "tickWorkOver500MillisCount",
+            "waitPhaseOver500MillisCount",
+          ]),
+          sampledAtMillis,
+        }
+        : null,
       storage: snapshotMeasurementTelemetry(
         storageStats,
         telemetryStorageBaseline,

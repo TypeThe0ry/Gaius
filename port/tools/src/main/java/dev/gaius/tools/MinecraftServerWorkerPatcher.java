@@ -64,7 +64,7 @@ public final class MinecraftServerWorkerPatcher {
         if (jsonRpcPatched) {
             System.out.println("Disabled the dedicated JSON-RPC management server for the browser Worker");
         }
-        System.out.println("Patched worldgen PriorityConsecutiveExecutor with bounded cooperative run loop");
+        System.out.println("Patched worldgen PriorityConsecutiveExecutor with single-task cooperative turns");
     }
 
     private static void patchChunkTaskDispatcher(ClassNode node) {
@@ -120,9 +120,6 @@ public final class MinecraftServerWorkerPatcher {
         InsnList code = new InsnList();
         LabelNode vanilla = new LabelNode();
         LabelNode worldgenStart = new LabelNode();
-        LabelNode worldgenLoop = new LabelNode();
-        LabelNode worldgenTimeCheck = new LabelNode();
-        LabelNode worldgenYield = new LabelNode();
         LabelNode worldgenDone = new LabelNode();
         LabelNode vanillaStart = new LabelNode();
         LabelNode vanillaDone = new LabelNode();
@@ -139,41 +136,16 @@ public final class MinecraftServerWorkerPatcher {
                 "(Ljava/lang/Object;)Z", false));
         code.add(new JumpInsnNode(Opcodes.IFEQ, vanilla));
 
-        code.add(new IntInsnNode(Opcodes.BIPUSH, 16));
-        code.add(new VarInsnNode(Opcodes.ISTORE, 1));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKESTATIC, "java/lang/System", "nanoTime", "()J", false));
-        code.add(new VarInsnNode(Opcodes.LSTORE, 3));
+        // A worldgen runnable can suspend through ChunkGenerationTask.runUntilWait().
+        // Execute one dispatcher task and return the executor turn immediately.  The
+        // existing setSleeping/registerForExecution pair schedules a later turn when the
+        // queue still has work; continuing this loop here would drain resumed generation
+        // futures inside the same MinecraftServer tick.
         code.add(worldgenStart);
-        code.add(worldgenLoop);
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL, ABSTRACT_EXECUTOR, "pollTask", "()Z", false));
         code.add(new JumpInsnNode(Opcodes.IFEQ, worldgenDone));
-        code.add(new IincInsnNode(1, -1));
-        code.add(new VarInsnNode(Opcodes.ILOAD, 1));
-        code.add(new JumpInsnNode(Opcodes.IFNE, worldgenTimeCheck));
-        code.add(new JumpInsnNode(Opcodes.GOTO, worldgenYield));
-        code.add(worldgenTimeCheck);
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKESTATIC, "java/lang/System", "nanoTime", "()J", false));
-        code.add(new VarInsnNode(Opcodes.LLOAD, 3));
-        code.add(new InsnNode(Opcodes.LSUB));
-        code.add(new LdcInsnNode(4_000_000L));
-        code.add(new InsnNode(Opcodes.LCMP));
-        code.add(new JumpInsnNode(Opcodes.IFLT, worldgenLoop));
-        code.add(worldgenYield);
-        code.add(new IntInsnNode(Opcodes.BIPUSH, 16));
-        code.add(new VarInsnNode(Opcodes.ISTORE, 1));
-        code.add(new InsnNode(Opcodes.ICONST_0));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKESTATIC,
-                "org/teavm/classlib/java/lang/TModernRuntimeSupport",
-                "yieldToEventLoop", "(I)V", false));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKESTATIC, "java/lang/System", "nanoTime", "()J", false));
-        code.add(new VarInsnNode(Opcodes.LSTORE, 3));
-        code.add(new JumpInsnNode(Opcodes.GOTO, worldgenLoop));
         code.add(worldgenDone);
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(

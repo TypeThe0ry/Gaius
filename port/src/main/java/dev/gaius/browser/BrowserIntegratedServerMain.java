@@ -23,7 +23,6 @@ import org.teavm.jso.JSExport;
 public final class BrowserIntegratedServerMain {
     private static final int INITIAL_VIEW_DISTANCE = 1;
     private static final int INITIAL_SIMULATION_DISTANCE = 1;
-    private static final long DEFAULT_DISTANCE_RAMP_INTERVAL_MILLIS = 750L;
     private static final long STORAGE_FLUSH_ACK_TIMEOUT_MILLIS = 5000L;
     private static final long INDEXED_DB_FALLBACK_HYDRATION_TIMEOUT_MILLIS = 12000L;
     private static final int INDEXED_DB_FALLBACK_REHYDRATION_BUDGET_BYTES = 64 * 1024 * 1024;
@@ -42,7 +41,6 @@ public final class BrowserIntegratedServerMain {
     private static int appliedSimulationDistance = Integer.MIN_VALUE;
     private static boolean configuredDistancesActive;
     private static boolean distanceAdvancePending;
-    private static long nextDistanceAdvanceAtMillis;
     private static boolean urgentPacketPumpActive;
     private static final AtomicBoolean NETWORK_INPUT_TASK_SCHEDULED = new AtomicBoolean();
     private static boolean networkInputBurstActive;
@@ -128,7 +126,6 @@ public final class BrowserIntegratedServerMain {
         appliedSimulationDistance = Integer.MIN_VALUE;
         configuredDistancesActive = false;
         distanceAdvancePending = false;
-        nextDistanceAdvanceAtMillis = 0L;
         urgentPacketPumpActive = false;
         NETWORK_INPUT_TASK_SCHEDULED.set(false);
         networkInputBurstActive = false;
@@ -142,6 +139,7 @@ public final class BrowserIntegratedServerMain {
         indexedDbFallbackHydrationFailure = null;
         sentChunkBatches.clear();
         acknowledgedChunkCount = 0;
+        recordDistanceRampTelemetry("reset");
         configurePlayerList(minecraftServer.getPlayerList());
         setIntegratedServerDistances(workerViewDistance(), workerSimulationDistance());
         BrowserStartupScheduler.complete();
@@ -166,15 +164,14 @@ public final class BrowserIntegratedServerMain {
         configuredViewDistance = clampDistance(viewDistance, 6);
         configuredSimulationDistance = clampDistance(simulationDistance, 4);
         if (configuredDistancesActive) {
-            activeViewDistance = Math.min(activeViewDistance, configuredViewDistance);
-            activeSimulationDistance = Math.min(
-                    activeSimulationDistance,
-                    configuredSimulationDistance);
-            if (distancesFullyApplied()) {
-                distanceAdvancePending = false;
-            }
+            // Once the first real batch ACK activates the session, settings changes
+            // apply immediately. Vanilla tracking/backpressure remains authoritative.
+            activeViewDistance = configuredViewDistance;
+            activeSimulationDistance = configuredSimulationDistance;
+            distanceAdvancePending = false;
         }
         applyActiveDistances();
+        recordDistanceRampTelemetry("configured");
     }
 
     private static void applyActiveDistances() {
@@ -241,16 +238,15 @@ public final class BrowserIntegratedServerMain {
         }
     }
 
-    /**
-     * Advances one distance ring after the client has consumed the preceding chunk batch.
-     * This keeps unexplored-area generation behind the browser client's real packet throughput.
-     */
+    /** Records real batch accounting; activation no longer uses a synthetic ring gate. */
     public static void recordChunkBatchSent(int batchSize) {
         if (isWorkerRuntime() && batchSize > 0) {
             sentChunkBatches.addLast(batchSize);
+            recordDistanceRampTelemetry("sent");
         }
     }
 
+    /** Applies the configured distances after the first matching batch ACK. */
     public static void acknowledgeChunkBatch() {
         if (!isWorkerRuntime()) {
             return;
@@ -258,93 +254,33 @@ public final class BrowserIntegratedServerMain {
         Integer batchSize = sentChunkBatches.pollFirst();
         if (batchSize == null) {
             reportRuntimeEvent("chunk-batch-ack-without-send", "queued=0");
+            recordDistanceRampTelemetry("ack-without-send");
             return;
         }
         acknowledgedChunkCount += batchSize;
         if (!configuredDistancesActive) {
             configuredDistancesActive = true;
-            activeViewDistance = Math.min(configuredViewDistance, INITIAL_VIEW_DISTANCE + 1);
-            activeSimulationDistance = INITIAL_SIMULATION_DISTANCE;
-            nextDistanceAdvanceAtMillis = System.currentTimeMillis()
-                    + distanceRampIntervalMillis();
+            activeViewDistance = configuredViewDistance;
+            activeSimulationDistance = configuredSimulationDistance;
             distanceAdvancePending = false;
             applyActiveDistances();
+            recordDistanceRampTelemetry("ack-initial-activation");
             return;
         }
-        if (distancesFullyApplied()) {
-            distanceAdvancePending = false;
-            return;
-        }
-        if (!activeViewDistanceAcknowledged()) {
-            distanceAdvancePending = true;
-            return;
-        }
-        long now = System.currentTimeMillis();
-        if (now < nextDistanceAdvanceAtMillis) {
-            distanceAdvancePending = true;
-            return;
-        }
+        // ACKs remain real accounting/backpressure observations. They no longer
+        // gate another private distance ring or synthesize a completion signal.
         distanceAdvancePending = false;
-        advanceConfiguredDistances();
-        nextDistanceAdvanceAtMillis = now + distanceRampIntervalMillis();
+        recordDistanceRampTelemetry("ack-configured");
     }
 
-    /** Applies a deferred distance ring only after the preceding ring has had CPU time. */
+    /** Patcher compatibility hook; vanilla tracking owns later distance changes. */
     public static void tickIntegratedServerDistances() {
-        if (!isWorkerRuntime() || !distanceAdvancePending || distancesFullyApplied()) {
-            return;
+        if (isWorkerRuntime() && configuredDistancesActive) {
+            distanceAdvancePending = false;
         }
-        if (!activeViewDistanceAcknowledged()) {
-            return;
-        }
-        long now = System.currentTimeMillis();
-        if (now < nextDistanceAdvanceAtMillis) {
-            return;
-        }
-        distanceAdvancePending = false;
-        advanceConfiguredDistances();
-        nextDistanceAdvanceAtMillis = now + distanceRampIntervalMillis();
     }
 
-    private static void advanceConfiguredDistances() {
-        if (!isWorkerRuntime() || !configuredDistancesActive) {
-            return;
-        }
-        int nextView = Math.min(configuredViewDistance, activeViewDistance + 1);
-        int nextSimulation = Math.min(
-                configuredSimulationDistance,
-                activeSimulationDistance + 1);
-        if (nextView == activeViewDistance && nextSimulation == activeSimulationDistance) {
-            return;
-        }
-        activeViewDistance = nextView;
-        activeSimulationDistance = nextSimulation;
-        applyActiveDistances();
-    }
-
-    private static boolean distancesFullyApplied() {
-        return activeViewDistance >= configuredViewDistance
-                && activeSimulationDistance >= configuredSimulationDistance;
-    }
-
-    private static boolean activeViewDistanceAcknowledged() {
-        int diameter = Math.max(1, activeViewDistance * 2 - 1);
-        return acknowledgedChunkCount >= diameter * diameter;
-    }
-
-    @JSBody(params = "fallback", script = """
-            const configured = Number(globalThis.__gaiusDistanceRampIntervalMillis);
-            return Number.isFinite(configured) && configured >= 100 && configured <= 2000
-              ? Math.round(configured)
-              : fallback;
-            """)
-    private static native double configuredDistanceRampIntervalMillis(double fallback);
-
-    private static long distanceRampIntervalMillis() {
-        return (long) configuredDistanceRampIntervalMillis(
-                DEFAULT_DISTANCE_RAMP_INTERVAL_MILLIS);
-    }
-
+    /** Compatibility predicate retained for existing patcher call sites. */
     public static boolean isWorkerServer() {
         return isWorkerRuntime();
     }
@@ -692,6 +628,78 @@ public final class BrowserIntegratedServerMain {
             }
             """)
     private static native void recordDistanceApplyDuration(int kind, double durationMillis);
+
+    /** Keeps one opt-in diagnostic snapshot for the staged server-distance ramp. */
+    private static void recordDistanceRampTelemetry(String reason) {
+        if (!isWorkerRuntime() || !distanceRampTelemetryEnabled()) {
+            return;
+        }
+        // No synthetic ACK cardinality gate is used by this policy.
+        int requiredChunkCount = 0;
+        int queuedEntries = 0;
+        for (Integer batch : sentChunkBatches) {
+            if (batch != null && batch > 0) {
+                queuedEntries += batch;
+            }
+        }
+        recordDistanceRampTelemetrySnapshot(
+                reason,
+                configuredViewDistance,
+                configuredSimulationDistance,
+                activeViewDistance,
+                activeSimulationDistance,
+                configuredDistancesActive,
+                distanceAdvancePending,
+                acknowledgedChunkCount,
+                sentChunkBatches.size(),
+                queuedEntries,
+                requiredChunkCount);
+    }
+
+    @JSBody(params = {
+            "reason", "configuredView", "configuredSimulation", "activeView",
+            "activeSimulation", "configuredActive", "advancePending", "acknowledged",
+            "sentQueueLength", "sentQueueEntries", "requiredChunkCount"
+    }, script = """
+            try {
+              if (globalThis.__gaiusServerTickTelemetryEnabled !== true &&
+                  globalThis.__gaiusSlowProbeTelemetryEnabled !== true) return;
+              globalThis.__gaiusServerDistanceTelemetry = {
+                schemaVersion: 1,
+                reason: String(reason || ''),
+                configuredViewDistance: configuredView | 0,
+                configuredSimulationDistance: configuredSimulation | 0,
+                activeViewDistance: activeView | 0,
+                activeSimulationDistance: activeSimulation | 0,
+                configuredDistancesActive: configuredActive === true,
+                distanceAdvancePending: advancePending === true,
+                acknowledgedChunkCount: Math.max(0, acknowledged | 0),
+                sentQueueLength: Math.max(0, sentQueueLength | 0),
+                sentQueueEntries: Math.max(0, sentQueueEntries | 0),
+                requiredChunkCount: Math.max(0, requiredChunkCount | 0),
+                updatedAt: typeof performance !== 'undefined' && performance.now
+                  ? performance.now() : Date.now()
+              };
+            } catch (ignored) {
+              // Diagnostic telemetry is fail-open.
+            }
+            """)
+    private static native void recordDistanceRampTelemetrySnapshot(
+            String reason,
+            int configuredView,
+            int configuredSimulation,
+            int activeView,
+            int activeSimulation,
+            boolean configuredActive,
+            boolean advancePending,
+            int acknowledged,
+            int sentQueueLength,
+            int sentQueueEntries,
+            int requiredChunkCount);
+
+    @JSBody(script = "return globalThis.__gaiusServerTickTelemetryEnabled === true || "
+            + "globalThis.__gaiusSlowProbeTelemetryEnabled === true;")
+    private static native boolean distanceRampTelemetryEnabled();
 
     /** Vanilla's minimum of two forces 25 chunks before a browser player can enter. */
     public static int minimumServerViewDistance() {

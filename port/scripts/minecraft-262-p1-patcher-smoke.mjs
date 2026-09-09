@@ -80,6 +80,17 @@ function method(bytecode, signature, nextSignature) {
   return bytecode.slice(start, end === -1 ? bytecode.length : end);
 }
 
+function assertDeepWorldgenPulseInMethod(bytecode, signature, minimum, label) {
+  const body = method(bytecode, signature);
+  assert.ok(occurrences(body, "BrowserWorldgenDeepCheckpoint.pulse") >= minimum,
+    `${label} must contain at least ${minimum} budget-aware deep worldgen pulses`);
+}
+
+function assertDeepWorldgenPulse(bytecode, minimum, label) {
+  assert.ok(occurrences(bytecode, "BrowserWorldgenDeepCheckpoint.pulse") >= minimum,
+    `${label} must contain at least ${minimum} budget-aware deep worldgen pulses`);
+}
+
 function assertRunServerWaitTelemetryOrder(runServer, profileId) {
   const tickCheckpoint = runServer.indexOf("BrowserWorldgenScheduler.checkpoint");
   const tickTelemetryEnd = runServer.indexOf(
@@ -389,6 +400,52 @@ function bytecodeInstructions(methodBytecode) {
   });
 }
 
+function constructorBytecode(bytecode, signature) {
+  const start = bytecode.indexOf(signature);
+  assert.notEqual(start, -1, `missing Options constructor: ${signature}`);
+  const codeStart = bytecode.indexOf("\n    Code:", start);
+  assert.ok(codeStart >= 0, `missing Code block for Options constructor: ${signature}`);
+  const tail = bytecode.slice(codeStart + "\n    Code:".length);
+  const nextMethod = tail.search(/\n  (?=(?:public|private|protected|static|final|native|synchronized)\s)/);
+  return bytecode.slice(start, codeStart + "\n    Code:".length
+    + (nextMethod < 0 ? tail.length : nextMethod));
+}
+
+function assertDefaultSprintKeyMapping(optionsBytecode, profileId, expectedKeyCode) {
+  const constructor = constructorBytecode(optionsBytecode,
+    "public net.minecraft.client.Options(net.minecraft.client.Minecraft, java.io.File);");
+  const instructions = bytecodeInstructions(constructor);
+  const sprintLiteral = /String key\.sprint/;
+  const sprintMappings = instructions.flatMap((entry, index) => {
+    if (!sprintLiteral.test(entry.instruction.trim())) return [];
+    const following = instructions.slice(index + 1, index + 5);
+    return following.some(({instruction}) =>
+      new RegExp(`^(?:sipush|bipush)\\s+${expectedKeyCode}$`).test(instruction.trim())) ? [index] : [];
+  });
+  assert.equal(sprintMappings.length, 1,
+    `${profileId} Options constructor must create exactly one key.sprint mapping for ${expectedKeyCode}`);
+  const sprintIndex = sprintMappings[0];
+  const sprint = instructions.slice(sprintIndex, sprintIndex + 16);
+  const indexOf = (pattern, label) => {
+    const index = sprint.findIndex(({instruction}) => pattern.test(instruction));
+    assert.ok(index >= 0, `${profileId} key.sprint mapping is missing ${label}`);
+    return index;
+  };
+  const keyCodeIndex = indexOf(new RegExp(`^(?:sipush|bipush)\\s+${expectedKeyCode}$`),
+    `expected keycode ${expectedKeyCode}`);
+  const categoryIndex = indexOf(/KeyMapping\$Category\.MOVEMENT/, "MOVEMENT category");
+  const toggleOptionIndex = indexOf(/getfield .*toggleSprint:/,
+    "toggleSprint option supplier");
+  const supplierIndex = indexOf(/invokedynamic .*getAsBoolean:/, "toggle supplier");
+  const toggleConstructorIndex = indexOf(/invokespecial .*ToggleKeyMapping\.\"<init>\"/,
+    "ToggleKeyMapping constructor");
+  const fieldIndex = indexOf(/putfield .*keySprint:/, "keySprint field store");
+  assert.ok(keyCodeIndex < categoryIndex && categoryIndex < toggleOptionIndex
+      && toggleOptionIndex < supplierIndex && supplierIndex < toggleConstructorIndex
+      && toggleConstructorIndex < fieldIndex,
+  `${profileId} key.sprint constructor argument order changed`);
+}
+
 function graphicsPresetApply(bytecode) {
   return method(bytecode,
     "public void apply(net.minecraft.client.Minecraft);",
@@ -692,6 +749,8 @@ const schedulerSource = await readFile(
 for (const contract of [
   "patchMobBrowserAiCooperation(args[0], root.resolve(",
   '"net/minecraft/world/entity/Mob.class"',
+  "patchDebugScreenOverlayBrowserNoChunk(args[0], root.resolve(",
+  '"net/minecraft/client/gui/components/DebugScreenOverlay.class"',
   "browserWorldgenMobAiPulse()",
   "browserWorldgenMobEntityPulse()",
   '"Mob.serverAiStep AI stage shape changed: "',
@@ -699,6 +758,8 @@ for (const contract of [
   assert.ok(clientPatcherSource.includes(contract),
     `missing Mob.serverAiStep cooperation contract: ${contract}`);
 }
+assert.equal(clientPatcherSource.includes("patchServerLevelBrowserSafeDefaults"), false,
+  "the old hostile-mob suppression helper must stay removed");
 assert.match(schedulerSource, /public static void mobAiPulse\(\)/,
   "scheduler is missing the Mob AI cooperative checkpoint");
 assert.match(schedulerSource, /public static void mobEntityPulse\(Object entity\)/,
@@ -767,12 +828,141 @@ try {
     join(toolsSource, "Minecraft262BrowserPatcher.java"),
   ], {encoding: "utf8", timeout: 30_000});
   execFileSync(java, ["-classpath", [classes, classpath].join(delimiter),
-    "dev.gaius.tools.MinecraftClientPatcher", clientJar, clientPatches], {
+    "dev.gaius.tools.MinecraftClientPatcher", clientJar, clientPatches, "26.2"], {
     encoding: "utf8", timeout: 30_000,
   });
   execFileSync(jar, ["--update", "--file", clientJar, "-C", clientPatches, "."], {
     encoding: "utf8", timeout: 30_000,
   });
+
+  const rawOptions262 = execFileSync(javap, ["-classpath", rawClientJar, "-p", "-c",
+    "net.minecraft.client.Options"], {
+      encoding: "utf8", maxBuffer: 24 * 1024 * 1024, timeout: 30_000,
+    });
+  const patchedOptions262 = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
+    "net.minecraft.client.Options"], {
+    encoding: "utf8", maxBuffer: 24 * 1024 * 1024, timeout: 30_000,
+  });
+  assertDefaultSprintKeyMapping(rawOptions262, "26.2 raw", 341);
+  assertDefaultSprintKeyMapping(patchedOptions262, "26.2 patched", 82);
+
+  const patchedScreen262 = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
+    "net.minecraft.client.gui.screens.Screen"], {
+      encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
+    });
+  const panorama262 = method(patchedScreen262,
+    "protected void extractPanorama(net.minecraft.client.gui.GuiGraphicsExtractor, float);",
+    "protected void extractMenuBackground(net.minecraft.client.gui.GuiGraphicsExtractor);");
+  assert.match(panorama262, /GameRenderer\.panorama/,
+    "26.2 menu panorama must keep the vanilla animated renderer");
+  assert.match(panorama262, /Panorama\.extractRenderState/,
+    "26.2 menu panorama extraction call was removed");
+  const menuBackground262 = method(patchedScreen262,
+    "protected void extractMenuBackground(net.minecraft.client.gui.GuiGraphicsExtractor, int, int, int, int);",
+    "public static void extractMenuBackgroundTexture");
+  assert.match(menuBackground262, /extractMenuBackgroundTexture/,
+    "26.2 menu background must keep its texture draw path");
+  const patchedNaturalSpawner262 = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
+    "net.minecraft.world.level.NaturalSpawner"], {
+      encoding: "utf8", maxBuffer: 12 * 1024 * 1024, timeout: 30_000,
+    });
+  const spawnGeneration262 = method(patchedNaturalSpawner262,
+    "public static void spawnMobsForChunkGeneration(net.minecraft.world.level.ServerLevelAccessor, net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome>, net.minecraft.world.level.ChunkPos, net.minecraft.util.RandomSource);",
+    "private static net.minecraft.core.BlockPos getTopNonCollidingPos");
+  assert.ok(bytecodeInstructions(spawnGeneration262).length > 1,
+    "26.2 generation-time spawning must retain the vanilla implementation");
+  for (const operation of ["getCreatureProbability", "finalizeSpawn", "addFreshEntityWithPassengers"]) {
+    assert.ok(spawnGeneration262.includes(operation),
+      "26.2 generation-time spawning lost " + operation);
+  }
+  for (const operation of ["BrowserGenerationSpawnTelemetry.begin",
+    "BrowserGenerationSpawnTelemetry.entityAdded",
+    "BrowserGenerationSpawnTelemetry.complete",
+    "BrowserGenerationSpawnTelemetry.failed"]) {
+    assert.ok(spawnGeneration262.includes(operation),
+      "26.2 generation-spawn telemetry lost " + operation);
+  }
+  const patchedServerLevel262 = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
+    "net.minecraft.server.level.ServerLevel"], {
+      encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000,
+    });
+  const spawningMonsters262 = method(patchedServerLevel262,
+    "public boolean isSpawningMonsters();", "public void close() throws java.io.IOException;");
+  assert.match(spawningMonsters262, /SPAWN_MONSTERS/,
+    "26.2 hostile-mob gamerule filtering was removed");
+  assert.doesNotMatch(spawningMonsters262, /Code:\s*0:\s*iconst_0\s+1:\s*ireturn/,
+    "26.2 ServerLevel.isSpawningMonsters must not be hard-disabled");
+  const patchedDebugScreenOverlay262 = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
+    "net.minecraft.client.gui.components.DebugScreenOverlay"], {
+      encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
+    });
+  const serverChunk262 = method(patchedDebugScreenOverlay262,
+    "private net.minecraft.world.level.chunk.LevelChunk getServerChunk();",
+    "private net.minecraft.world.level.chunk.LevelChunk getClientChunk();");
+  assert.deepEqual(bytecodeInstructions(serverChunk262).map(({instruction}) => instruction),
+    ["aconst_null", "areturn"],
+    "26.2 F3 server-chunk lookup must not synchronously resume world generation");
+  const clientChunk262 = method(patchedDebugScreenOverlay262,
+    "private net.minecraft.world.level.chunk.LevelChunk getClientChunk();",
+    "public boolean showDebugScreen();");
+  assert.notDeepEqual(bytecodeInstructions(clientChunk262).map(({instruction}) => instruction),
+    ["aconst_null", "areturn"],
+    "26.2 F3 client-chunk lookup must remain available to vanilla debug entries");
+
+  // The 26.2 deep-worldgen path uses the adapter only at the synchronous
+  // loops that can outrun holder-boundary pulses.  Assert the actual patched
+  // bytecode so a source-only marker cannot mask a missing runtime callsite.
+  const patchedChunkGenerator = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
+    "net.minecraft.world.level.chunk.ChunkGenerator"], {
+    encoding: "utf8", maxBuffer: 12 * 1024 * 1024, timeout: 30_000,
+  });
+  const patchedClimateTree = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
+    "net.minecraft.world.level.biome.Climate$RTree$SubTree"], {
+    encoding: "utf8", maxBuffer: 12 * 1024 * 1024, timeout: 30_000,
+  });
+  const patchedJigsawPlacer = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
+    "net.minecraft.world.level.levelgen.structure.pools.JigsawPlacement$Placer"], {
+    encoding: "utf8", maxBuffer: 12 * 1024 * 1024, timeout: 30_000,
+  });
+  const patchedNoiseGenerator = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
+    "net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator"], {
+    encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000,
+  });
+  const patchedSurfaceSystem = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
+    "net.minecraft.world.level.levelgen.SurfaceSystem"], {
+    encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000,
+  });
+  const patchedWorldCarver = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
+    "net.minecraft.world.level.levelgen.carver.WorldCarver"], {
+    encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000,
+  });
+  const patchedLightEngine = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
+    "net.minecraft.world.level.lighting.LightEngine"], {
+    encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000,
+  });
+  const patchedChunkSection = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
+    "net.minecraft.world.level.chunk.LevelChunkSection"], {
+    encoding: "utf8", maxBuffer: 12 * 1024 * 1024, timeout: 30_000,
+  });
+  assertDeepWorldgenPulseInMethod(patchedChunkGenerator,
+    "public void createStructures(", 1, "26.2 ChunkGenerator.createStructures");
+  assertDeepWorldgenPulseInMethod(patchedClimateTree,
+    "protected net.minecraft.world.level.biome.Climate$RTree$Leaf<T> search(",
+    1, "26.2 Climate.RTree.SubTree.search");
+  assert.ok(occurrences(patchedJigsawPlacer, "BrowserWorldgenDeepCheckpoint.pulse") >= 1,
+    "26.2 JigsawPlacement.Placer must contain a budget-aware deep worldgen pulse");
+  assert.doesNotMatch(patchedChunkGenerator, /BrowserWorldgenDeepCheckpoint\.checkpoint/,
+    "26.2 ChunkGenerator must not retain unconditional deep checkpoints");
+  assert.doesNotMatch(patchedClimateTree, /BrowserWorldgenDeepCheckpoint\.checkpoint/,
+    "26.2 Climate.RTree.SubTree must not retain unconditional deep checkpoints");
+  assert.doesNotMatch(patchedJigsawPlacer, /BrowserWorldgenDeepCheckpoint\.checkpoint/,
+    "26.2 JigsawPlacement.Placer must not retain unconditional deep checkpoints");
+  assertDeepWorldgenPulse(patchedNoiseGenerator, 4,
+    "26.2 NoiseBasedChunkGenerator");
+  assertDeepWorldgenPulse(patchedSurfaceSystem, 1, "26.2 SurfaceSystem");
+  assertDeepWorldgenPulse(patchedWorldCarver, 1, "26.2 WorldCarver");
+  assertDeepWorldgenPulse(patchedLightEngine, 2, "26.2 LightEngine");
+  assertDeepWorldgenPulse(patchedChunkSection, 1, "26.2 LevelChunkSection");
   const rawDedicatedServer = execFileSync(javap, ["-classpath", rawClientJar, "-p", "-c",
     "net.minecraft.server.dedicated.DedicatedServer"], {
       encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000,
@@ -902,6 +1092,74 @@ try {
   execFileSync(jar, ["--update", "--file", generic121Jar, "-C", generic121Patches, "."], {
     encoding: "utf8", timeout: 30_000,
   });
+  const rawOptions121 = execFileSync(javap, ["-classpath", raw121ClientJar, "-p", "-c",
+    "net.minecraft.client.Options"], {
+      encoding: "utf8", maxBuffer: 24 * 1024 * 1024, timeout: 30_000,
+    });
+  const patchedOptions121 = execFileSync(javap, ["-classpath", generic121Jar, "-p", "-c",
+    "net.minecraft.client.Options"], {
+      encoding: "utf8", maxBuffer: 24 * 1024 * 1024, timeout: 30_000,
+    });
+  assertDefaultSprintKeyMapping(rawOptions121, "1.21.11 raw", 341);
+  assertDefaultSprintKeyMapping(patchedOptions121, "1.21.11 patched", 82);
+  const patched121Screen = execFileSync(javap, ["-classpath", generic121Jar, "-p", "-c",
+    "net.minecraft.client.gui.screens.Screen"], {
+      encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
+    });
+  const panorama121 = method(patched121Screen,
+    "protected void renderPanorama(net.minecraft.client.gui.GuiGraphics, float);",
+    "protected void renderMenuBackground(net.minecraft.client.gui.GuiGraphics);");
+  assert.match(panorama121, /GameRenderer\.getPanorama/,
+    "1.21.11 menu panorama must keep the vanilla animated renderer");
+  assert.match(panorama121, /PanoramaRenderer\.render/,
+    "1.21.11 menu panorama render call was removed");
+  const menuBackground121 = method(patched121Screen,
+    "protected void renderMenuBackground(net.minecraft.client.gui.GuiGraphics, int, int, int, int);",
+    "public static void renderMenuBackgroundTexture");
+  assert.match(menuBackground121, /renderMenuBackgroundTexture/,
+    "1.21.11 menu background must keep its texture draw path");
+  const patched121NaturalSpawner = execFileSync(javap, ["-classpath", generic121Jar, "-p", "-c",
+    "net.minecraft.world.level.NaturalSpawner"], {
+      encoding: "utf8", maxBuffer: 12 * 1024 * 1024, timeout: 30_000,
+    });
+  const spawnGeneration121 = method(patched121NaturalSpawner,
+    "public static void spawnMobsForChunkGeneration(net.minecraft.world.level.ServerLevelAccessor, net.minecraft.core.Holder<net.minecraft.world.level.biome.Biome>, net.minecraft.world.level.ChunkPos, net.minecraft.util.RandomSource);",
+    "private static net.minecraft.core.BlockPos getTopNonCollidingPos");
+  assert.ok(bytecodeInstructions(spawnGeneration121).length > 1,
+    "1.21.11 generation-time spawning must retain the vanilla implementation");
+  for (const operation of ["getCreatureProbability", "finalizeSpawn", "addFreshEntityWithPassengers"]) {
+    assert.ok(spawnGeneration121.includes(operation),
+      "1.21.11 generation-time spawning lost " + operation);
+  }
+  for (const operation of ["BrowserGenerationSpawnTelemetry.begin",
+    "BrowserGenerationSpawnTelemetry.entityAdded",
+    "BrowserGenerationSpawnTelemetry.complete",
+    "BrowserGenerationSpawnTelemetry.failed"]) {
+    assert.ok(spawnGeneration121.includes(operation),
+      "1.21.11 generation-spawn telemetry lost " + operation);
+  }
+  const patched121ServerLevel = execFileSync(javap, ["-classpath", generic121Jar, "-p", "-c",
+    "net.minecraft.server.level.ServerLevel"], {
+      encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000,
+    });
+  const spawningMonsters121 = method(patched121ServerLevel,
+    "public boolean isSpawningMonsters();", "public void close() throws java.io.IOException;");
+  assert.match(spawningMonsters121, /SPAWN_MONSTERS/,
+    "1.21.11 hostile-mob gamerule filtering was removed");
+  assert.doesNotMatch(spawningMonsters121, /Code:\s*0:\s*iconst_0\s+1:\s*ireturn/,
+    "1.21.11 ServerLevel.isSpawningMonsters must not be hard-disabled");
+  const patched121ChunkGenerator = execFileSync(javap, ["-classpath", generic121Jar, "-p", "-c",
+    "net.minecraft.world.level.chunk.ChunkGenerator"], {
+    encoding: "utf8", maxBuffer: 12 * 1024 * 1024, timeout: 30_000,
+  });
+  const patched121ClimateTree = execFileSync(javap, ["-classpath", generic121Jar, "-p", "-c",
+    "net.minecraft.world.level.biome.Climate$RTree$SubTree"], {
+    encoding: "utf8", maxBuffer: 12 * 1024 * 1024, timeout: 30_000,
+  });
+  assert.doesNotMatch(patched121ChunkGenerator, /BrowserWorldgenDeepCheckpoint\.checkpoint/,
+    "1.21.11 ChunkGenerator must keep the 26.2 deep checkpoint path isolated");
+  assert.doesNotMatch(patched121ClimateTree, /BrowserWorldgenDeepCheckpoint\.checkpoint/,
+    "1.21.11 Climate.RTree.SubTree must keep the 26.2 deep checkpoint path isolated");
   const raw121DedicatedServer = execFileSync(javap, ["-classpath", raw121ClientJar, "-p", "-c",
     "net.minecraft.server.dedicated.DedicatedServer"], {
       encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000,

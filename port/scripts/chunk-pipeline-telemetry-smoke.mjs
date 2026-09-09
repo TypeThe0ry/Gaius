@@ -258,9 +258,9 @@ const newChunksProfile = parsedPerformanceContract.profiles["traversal-6-4"];
 assert.equal(newChunksProfile.warmupMs, 30_000, "new-chunk warmup must remain 30 seconds");
 assert.equal(newChunksProfile.durationMs, 300_000,
   "new-chunk performance sample must remain five minutes");
-assert.equal(newChunksProfile.gates.averageFpsMin, 120,
+assert.equal(newChunksProfile.gates.averageFpsMin, 200,
   "new-chunk average FPS gate regressed");
-assert.equal(newChunksProfile.gates.onePercentLowFpsMin, 60,
+assert.equal(newChunksProfile.gates.onePercentLowFpsMin, 200,
   "new-chunk 1% low gate regressed");
 assert.equal(newChunksProfile.gates.freezeCountMax, 0,
   "new-chunk >=500 ms freeze gate regressed");

@@ -603,6 +603,7 @@ public final class BrowserSingleplayerClient {
                 );
                 state.worldgen = copyScalarTelemetry(worker.__gaiusTelemetryWorldgen);
                 state.serverTick = copyScalarTelemetry(worker.__gaiusTelemetryServerTick);
+                state.serverDistance = copyScalarTelemetry(worker.__gaiusTelemetryServerDistance);
                 state.storage = copyScalarTelemetry(worker.__gaiusTelemetryStorage);
                 state.updatedAt = Date.now();
               };
@@ -879,6 +880,7 @@ public final class BrowserSingleplayerClient {
                 );
                 worker.__gaiusTelemetryWorldgen = copyScalarTelemetry(message.worldgen);
                 worker.__gaiusTelemetryServerTick = copyScalarTelemetry(message.serverTick);
+                worker.__gaiusTelemetryServerDistance = copyScalarTelemetry(message.serverDistance);
                 worker.__gaiusTelemetryStorage = copyScalarTelemetry(message.storage);
                 // A heartbeat proves transport only.  Startup grace is extended
                 // only when a telemetry counter advances or a phase changes.

@@ -50,6 +50,24 @@ async function runScenario({
       if (type === "click") profileSwitchListener = listener;
     },
   } : null;
+  let nameConfirmListener;
+  const nameOverlay = switchFromTitle ? {
+    hidden: true,
+    contains() { return true; },
+    addEventListener() {},
+  } : null;
+  const nameInput = switchFromTitle ? {
+    value: rememberedName || "",
+    focus() {},
+    select() {},
+  } : null;
+  const nameConfirm = switchFromTitle ? {
+    disabled: false,
+    addEventListener(type, listener) {
+      if (type === "click") nameConfirmListener = listener;
+    },
+  } : null;
+  const nameCancel = switchFromTitle ? {disabled: false, addEventListener() {}} : null;
   const location = {
     href: `http://127.0.0.1:8781/dist/index.html${search}`,
     protocol: "http:",
@@ -63,8 +81,11 @@ async function runScenario({
     innerWidth: 1280,
     innerHeight: 720,
     __gaiusSession: injected,
-    __gaiusMinecraftState: switchFromTitle ? {screen: "TitleScreen"} : undefined,
+    __gaiusMinecraftState: switchFromTitle
+      ? {screen: "TitleScreen", running: true, noRender: false, overlay: null}
+      : undefined,
     __gaiusReleaseRuntimeLease: switchFromTitle ? () => runtimeLeaseReleases++ : undefined,
+    addEventListener() {},
   };
   const context = {
     URL,
@@ -120,6 +141,18 @@ async function runScenario({
       return 1;
     },
     window,
+    // The extracted launcher block normally runs after these DOM bindings
+    // are declared by index.template.html.  Keep the source-level fixture
+    // faithful when the optional title-screen name editor is absent.
+    nameOverlay,
+    nameInput,
+    nameError: null,
+    nameCancel,
+    nameConfirm,
+    document: {
+      activeElement: null,
+      contains() { return false; },
+    },
   };
   window.window = window;
   vm.runInNewContext(
@@ -138,6 +171,8 @@ async function runScenario({
   if (switchFromTitle) {
     assert.equal(typeof profileSwitchListener, "function");
     profileSwitchListener({preventDefault() {}});
+    assert.equal(typeof nameConfirmListener, "function");
+    nameConfirmListener({preventDefault() {}});
   }
   return {
     args,

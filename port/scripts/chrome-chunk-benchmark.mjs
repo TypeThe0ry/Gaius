@@ -11,6 +11,10 @@ import {tmpdir} from "node:os";
 import {basename, extname, isAbsolute, relative, resolve, sep} from "node:path";
 import {fileURLToPath} from "node:url";
 import {
+  browserServerTickWindow,
+  collectInitialServerTickSamples,
+} from "./server-tick-window.mjs";
+import {
   aggregateChromeProcessRss,
   combineMemorySnapshots,
   buildPerformanceEvidence,
@@ -41,6 +45,8 @@ import {
 
 const args = process.argv.slice(2);
 const smoke = args.includes("--smoke");
+const probeF3 = args.includes("--probe-f3");
+const traceF3Exceptions = args.includes("--trace-f3-exceptions");
 // A distance pin is a test fixture only.  The default benchmark observes the
 // product's real Worker launch chain and must never rewrite its messages.
 const pinWorkerDistance = args.includes("--pin-worker-distance");
@@ -347,6 +353,17 @@ const startupTimeoutMillis = duration(
   60_000,
 );
 const playerName = value("--player", "GaiusBench");
+const requestedWorldMode = value("--world-mode", "creative").toLowerCase();
+if (!["survival", "creative", "hardcore"].includes(requestedWorldMode)) {
+  throw new Error("--world-mode must be survival, creative, or hardcore");
+}
+const worldSeedRequested = args.includes("--world-seed");
+const worldSeed = value("--world-seed", null);
+if (worldSeedRequested &&
+    (worldSeed == null || worldSeed.length === 0 || worldSeed.length > 32 ||
+      /[\r\n]/.test(worldSeed))) {
+  throw new Error("--world-seed must be a non-empty value of at most 32 characters without CR/LF");
+}
 const configuredBuildRoot = process.env.GAIUS_BUILD_ROOT
   ? resolveRepositoryPortPath(process.env.GAIUS_BUILD_ROOT)
   : (isolatedEnvironment ? resolve(portRoot, "target", activeProfileId) : resolve(portRoot, "target"));
@@ -533,7 +550,7 @@ const benchmarkOptionsText = [
   "entityShadows:false",
   "bobView:false",
   "menuBackgroundBlurriness:0",
-  "panoramaSpeed:0.0",
+  "panoramaSpeed:1.0",
   "screenEffectScale:0.0",
   "fovEffectScale:0.0",
   "darknessEffectScale:0.0",
@@ -569,6 +586,8 @@ if (args.includes("--help")) {
     "  --output PATH                 JSON report path",
     "  --smoke                       Short plumbing check without hard performance thresholds",
     "  --pin-worker-distance         Diagnostic-only Worker distance harness override (never release evidence)",
+    "  --probe-f3                    After strict world readiness, toggle F3 twice and capture bounded evidence",
+    "  --trace-f3-exceptions         With --probe-f3, enable bounded CDP native exception capture (diagnostic only)",
     "  --print-config                Print resolved benchmark configuration and exit",
   ].join("\n"));
   process.exit(0);
@@ -1000,6 +1019,7 @@ class CdpSession {
     this.nextId = 1;
     this.pending = new Map();
     this.listeners = new Map();
+    this.terminalError = null;
   }
 
   async open() {
@@ -1058,13 +1078,26 @@ class CdpSession {
   }
 
   send(method, params = {}, sessionId = null) {
+    if (!this.socket || this.socket.readyState !== 1) {
+      return Promise.reject(this.terminalError || new Error("Chrome DevTools WebSocket is not open"));
+    }
     const id = this.nextId++;
     return new Promise((resolveSend, rejectSend) => {
       const timeout = setTimeout(() => {
         if (!this.pending.delete(id)) return;
-        rejectSend(new Error(
+        const timeoutError = new Error(
           `${method} timed out after ${cdpCommandTimeoutMillis} ms`,
-        ));
+        );
+        rejectSend(timeoutError);
+        // An attached Worker can terminate during Save/Quit while the page
+        // remains responsive. Preserve the page connection and let the caller
+        // report the failed Worker sample and detach its target session.
+        if (sessionId) return;
+        this.terminalError = timeoutError;
+        // Do not spend another timeout on every cleanup key when this page
+        // has stopped responding. Closing rejects concurrent pending calls;
+        // the outer finally then terminates only the owned Chrome process.
+        this.close();
       }, cdpCommandTimeoutMillis);
       this.pending.set(id, {method, resolve: resolveSend, reject: rejectSend, timeout});
       const message = {id, method, params};
@@ -1147,6 +1180,7 @@ function configureBenchmarkUrl(rawUrl) {
   configured.searchParams.set("autoDpr", environmentContract.autoDpr === false ? "0" : "1");
   configured.searchParams.set("perfHud", "0");
   configured.searchParams.set("glStats", "1");
+  configured.searchParams.set("gaiusServerTickTelemetry", "1");
   // The launcher defaults the mesh buffer-shadow budget to 1 GiB (single 256 MiB),
   // which lets the WebGL shadow grow past the contract's 64 MiB budget and stall a
   // frame on one large shadow copy. Pin the runtime budget to the contract so the
@@ -1222,6 +1256,7 @@ function keyDefinition(code) {
     Escape: {key: "Escape", virtualKey: 27},
     Tab: {key: "Tab", virtualKey: 9},
     Enter: {key: "Enter", virtualKey: 13},
+    F3: {key: "F3", virtualKey: 114},
     Backspace: {key: "Backspace", virtualKey: 8},
     Digit1: {key: "1", virtualKey: 49},
     Digit2: {key: "2", virtualKey: 50},
@@ -1241,7 +1276,7 @@ function keyDefinition(code) {
 const benchmarkKeyCodes = [
   "KeyW", "KeyA", "KeyS", "KeyD", "Space",
   "ControlLeft", "ControlRight", "ShiftLeft", "ShiftRight",
-  "AltLeft", "AltRight", "Escape", "Tab", "Enter", "Backspace",
+  "AltLeft", "AltRight", "Escape", "Tab", "Enter", "F3", "Backspace",
   "Digit1", "Digit2", "Digit3", "Digit4", "Digit5",
   "Digit6", "Digit7", "Digit8", "Digit9",
 ];
@@ -1249,9 +1284,16 @@ const benchmarkKeyCodes = [
 async function dispatchKey(session, code, type) {
   const definition = keyDefinition(code);
   if (!definition) throw new Error("Unsupported benchmark key " + code);
+  const held = session.benchmarkHeldKeys ||= new Set();
+  if (type === "keyDown") held.add(code);
+  else if (type === "keyUp") held.delete(code);
+  const modifiers = (held.has("AltLeft") || held.has("AltRight") ? 1 : 0)
+    | (held.has("ControlLeft") || held.has("ControlRight") ? 2 : 0)
+    | (held.has("ShiftLeft") || held.has("ShiftRight") ? 8 : 0);
   await session.send("Input.dispatchKeyEvent", {
     type,
     code,
+    modifiers,
     key: definition.key,
     windowsVirtualKeyCode: definition.virtualKey,
     nativeVirtualKeyCode: definition.virtualKey,
@@ -1270,7 +1312,9 @@ async function releaseInputCapture(session) {
     } catch (ignored) {
     }
   }
-  for (const button of ["left", "middle", "right", "back", "forward"]) {
+  // Chrome treats back/forward releases as history navigation even without
+  // a preceding press. Release only the buttons this game test actually uses.
+  for (const button of ["left", "middle", "right"]) {
     try {
       await session.send("Input.dispatchMouseEvent", {
         type: "mouseReleased",
@@ -1358,8 +1402,25 @@ async function findButton(session, label, timeoutMillis = 45_000) {
 async function clickButton(session, label, timeoutMillis = 45_000) {
   const button = await findButton(session, label, timeoutMillis);
   if (!button) return false;
+  recordEvent({at: Date.now(), source: "ui click", text: label, button});
   await click(session, button.x, button.y);
   return true;
+}
+
+async function selectWorldMode(session) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const button = await findButton(session, "Game Mode", 5000);
+    if (!button) throw new Error("Create-world game mode control is missing");
+    const selected = button.text.split(":").at(-1).trim().toLowerCase();
+    if (selected === requestedWorldMode) return button.text;
+    recordEvent({at: Date.now(), source: "world mode", text: button.text});
+    await click(session, button.x, button.y);
+    await waitFor(session, "(() => {const widgets=window.__gaiusMinecraftState?.screenWidgets||[];"
+      + "return widgets.some(w=>w.visible!==false&&String(w.text||'').startsWith('Game Mode')"
+      + "&&String(w.text)!==" + JSON.stringify(button.text) + ");})()", 5000,
+      "the game-mode control to update after a click");
+  }
+  throw new Error("Create-world mode did not reach " + requestedWorldMode);
 }
 
 async function clickFirstWorld(session) {
@@ -1389,6 +1450,133 @@ async function clickFirstWorld(session) {
   await sleep(100);
   await click(session, entry.x, entry.y, 2);
   return true;
+}
+
+async function configureWorldSeed(session, seed) {
+  let tab = await findButton(session, "World", 3_000);
+  let usedWorldTabShortcut = false;
+  let worldTabShortcutHeld = false;
+  try {
+    if (tab && tab.text.trim().toLowerCase() === "world") {
+      await click(session, tab.x, tab.y);
+    } else {
+      const canUseWorldTabShortcut = await evaluate(session, "(() => {"
+        + "const state=window.__gaiusMinecraftState||{};"
+        + "const widgets=Array.isArray(state.screenWidgets)?state.screenWidgets:[];"
+        + "return String(state.screen||'').includes('CreateWorldScreen')&&"
+        + "widgets.some(widget=>widget&&widget.visible!==false&&"
+        + "/MenuTabBar|TabNavigationBar/.test(String(widget.type||'')));"
+        + "})()");
+      if (canUseWorldTabShortcut !== true) {
+        throw new Error("--world-seed requires the visible World tab or CreateWorldScreen TabNavigationBar");
+      }
+      usedWorldTabShortcut = true;
+      await dispatchKey(session, "ControlLeft", "keyDown");
+      worldTabShortcutHeld = true;
+      await dispatchKey(session, "Digit2", "keyDown");
+      await dispatchKey(session, "Digit2", "keyUp");
+      await sleep(100);
+    }
+  const seedPredicate = "widget&&widget.visible!==false&&widget.active!==false"
+    + "&&(String(widget.type||'').endsWith('CreateWorldScreen$WorldTab$1')"
+    + "||(/EditBox$/.test(String(widget.type||''))&&/seed/i.test(String(widget.text||''))))";
+  await waitFor(session, "(() => {const widgets=window.__gaiusMinecraftState?.screenWidgets||[];"
+    + "return widgets.filter(widget=>" + seedPredicate + ").length===1;})()",
+    5000, "the World tab seed input to replace the world-name input");
+  const widget = await evaluate(session, "(() => {"
+    + "const state=window.__gaiusMinecraftState||{};"
+    + "const widgets=Array.isArray(state.screenWidgets)?state.screenWidgets:[];"
+    + "const matches=widgets.filter(widget=>" + seedPredicate
+    + "&&Number.isFinite(Number(widget.x))&&Number.isFinite(Number(widget.y))"
+    + "&&Number.isFinite(Number(widget.width))&&Number.isFinite(Number(widget.height)));"
+    + "return matches.length===1?matches[0]:{count:matches.length};"
+    + "})()");
+  if (!widget || widget.count !== undefined) {
+    throw new Error("--world-seed requires exactly one visible active World EditBox; found "
+      + String(widget?.count ?? 0));
+  }
+  const canvas = await evaluate(session, "(() => {"
+    + "const canvas=document.querySelector('canvas');"
+    + "const rect=canvas&&canvas.getBoundingClientRect();"
+    + "const size=window.__gaiusMinecraftState?.screenSize;"
+    + "return rect&&size&&Number(size.width)>0&&Number(size.height)>0"
+    + "?{left:rect.left,top:rect.top,scaleX:rect.width/Number(size.width),scaleY:rect.height/Number(size.height)}:null;"
+    + "})()");
+  if (!canvas) throw new Error("--world-seed could not determine the canvas scale");
+  const x = Math.round(canvas.left + (Number(widget.x) + Number(widget.width) / 2) * canvas.scaleX);
+  const y = Math.round(canvas.top + (Number(widget.y) + Number(widget.height) / 2) * canvas.scaleY);
+  const focusPredicate = "(() => {"
+    + "const widgets=window.__gaiusMinecraftState?.screenWidgets||[];"
+    + "const matches=widgets.filter(widget=>" + seedPredicate + ");"
+    + "return matches.length===1&&matches[0].focused===true;"
+    + "})()";
+  await session.send("Input.dispatchMouseEvent", {
+    type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1,
+  });
+  await session.send("Input.dispatchMouseEvent", {
+    type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1,
+  });
+  await waitFor(session, focusPredicate, 3_000, "the World seed EditBox focus before input");
+  // BrowserGlfw forwards DOM keydown characters to the canvas EditBox;
+  // Input.insertText bypasses that bridge, while synthetic Ctrl+A can itself
+  // be observed as an inserted "a".  Clear the 32-character input using End
+  // plus bounded backspaces,
+  // then send the requested seed through the same keydown/up path as a user.
+  await session.send("Input.dispatchKeyEvent", {
+    type: "keyDown", code: "End", key: "End", modifiers: 0,
+    windowsVirtualKeyCode: 35, nativeVirtualKeyCode: 35,
+  });
+  await session.send("Input.dispatchKeyEvent", {
+    type: "keyUp", code: "End", key: "End", modifiers: 0,
+    windowsVirtualKeyCode: 35, nativeVirtualKeyCode: 35,
+  });
+  for (let index = 0; index < 32; index++) {
+    await session.send("Input.dispatchKeyEvent", {
+      type: "keyDown", code: "Backspace", key: "Backspace", modifiers: 0,
+      windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8,
+    });
+    await session.send("Input.dispatchKeyEvent", {
+      type: "keyUp", code: "Backspace", key: "Backspace", modifiers: 0,
+      windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8,
+    });
+  }
+  for (const character of Array.from(seed)) {
+    const code = /^[a-z]$/i.test(character)
+      ? "Key" + character.toUpperCase()
+      : /^[0-9]$/.test(character) ? "Digit" + character : "Unidentified";
+    await session.send("Input.dispatchKeyEvent", {
+      type: "keyDown", code, key: character,
+      text: character, unmodifiedText: character, modifiers: 0,
+    });
+    await session.send("Input.dispatchKeyEvent", {
+      type: "keyUp", code, key: character, modifiers: 0,
+    });
+  }
+  // The input bridge can update Java before UI telemetry observes focus.
+  // Poll the same unique widget after input; do not re-click because that can
+  // hide dropped seed characters behind a superficially focused control.
+  await waitFor(session, focusPredicate, 3_000, "the World seed EditBox focus after input");
+  await mkdir(resolve(outputPath, ".."), {recursive: true});
+  let screenshotPath = outputPath + ".create-world-seed.png";
+  try {
+    const screenshot = await session.send("Page.captureScreenshot", {format: "png"});
+    await writeFile(screenshotPath, Buffer.from(screenshot.data, "base64"));
+  } catch (error) {
+    screenshotPath = null;
+  }
+  return {
+    configuredSeed: seed,
+    effectiveSeed: null,
+    acceptance: "unverified",
+    widget,
+    screenshotPath,
+    usedWorldTabShortcut,
+  };
+  } finally {
+    if (worldTabShortcutHeld) {
+      await dispatchKey(session, "ControlLeft", "keyUp").catch(() => {});
+    }
+  }
 }
 
 async function passProfileGate(session) {
@@ -1577,6 +1765,7 @@ async function enterWorld(session) {
   await sleep(500);
   let worldLoadStartedAt;
   let createdNewWorld = false;
+  let worldSeedEvidence = null;
   worldLoadStartedAt = Date.now();
   const selectionScreen = String(await evaluate(
     session,
@@ -1607,9 +1796,10 @@ async function enterWorld(session) {
   }
   if (createdNewWorld) {
     await sleep(500);
-    await clickButton(session, "Game Mode", 3000);
-    await sleep(150);
-    await clickButton(session, "Game Mode", 3000);
+    await selectWorldMode(session);
+    if (worldSeedRequested) {
+      worldSeedEvidence = await configureWorldSeed(session, worldSeed);
+    }
     worldLoadStartedAt = Date.now();
     if (!await clickButton(session, "Create New World")) {
       throw new Error("Create-world confirmation button was not exposed by UI telemetry");
@@ -1622,6 +1812,12 @@ async function enterWorld(session) {
     "an active singleplayer world",
   );
   const activeAt = Date.now();
+  const observedWorldMode = String(await evaluate(session,
+    "window.__gaiusMinecraftState?.player?.gameMode||''")).toLowerCase();
+  const expectedGameType = requestedWorldMode === "hardcore" ? "survival" : requestedWorldMode;
+  if (observedWorldMode !== expectedGameType) {
+    throw new Error(`Loaded game mode ${observedWorldMode || 'unknown'} does not match requested ${requestedWorldMode}`);
+  }
   return {
     startedAt,
     titleReadyAt,
@@ -1631,6 +1827,9 @@ async function enterWorld(session) {
     worldInteractiveMillis: activeAt - worldLoadStartedAt,
     totalMillis: activeAt - startedAt,
     createdNewWorld,
+    requestedWorldMode,
+    observedWorldMode,
+    worldSeedEvidence: worldSeedRequested ? (worldSeedEvidence || null) : null,
     alreadyActive: false,
   };
 }
@@ -1878,6 +2077,183 @@ async function collectVisualOutput(session, phase) {
   return samples;
 }
 
+async function runF3Probe(session) {
+  const evidence = {
+    enabled: true,
+    schemaVersion: 2,
+    sampleWindowMillis: 2_000,
+    sampleIntervalMillis: 250,
+    startedAt: Date.now(),
+    phases: [],
+    nativeDebugger: {
+      requested: traceF3Exceptions,
+      enabled: false,
+      maxPauses: 8,
+      pauses: [],
+      cleanupError: null,
+    },
+  };
+  let debuggerPaused = false;
+  let debuggerEnabled = false;
+  let debuggerWatchdog = null;
+  let debuggerLimitDisabled = false;
+  const resumeDebugger = () => {
+    if (debuggerPaused) return;
+    debuggerPaused = true;
+    void session.send("Debugger.resume").catch(() => {}).finally(() => {
+      debuggerPaused = false;
+    });
+  };
+  const onDebuggerPaused = async (params) => {
+    const nativeDebugger = evidence.nativeDebugger;
+    if (nativeDebugger.pauses.length >= nativeDebugger.maxPauses) {
+      resumeDebugger();
+      if (!debuggerLimitDisabled) {
+        debuggerLimitDisabled = true;
+        void session.send("Debugger.setPauseOnExceptions", {state: "none"}).catch(() => {});
+      }
+      return;
+    }
+    const exception = params?.data;
+    let wrapperStack = null;
+    const wrapperFrame = Array.isArray(params?.callFrames)
+      ? params.callFrames.find((frame) => frame.functionName === "N")
+      : null;
+    if (wrapperFrame?.callFrameId) {
+      try {
+        const evaluated = await session.send("Debugger.evaluateOnCallFrame", {
+          callFrameId: wrapperFrame.callFrameId,
+          expression: "String(err && err.stack)",
+          returnByValue: true,
+        });
+        wrapperStack = evaluated?.result?.result?.value || null;
+      } catch (_) {
+        // The frame may disappear as the exception resumes; stack evidence is best effort.
+      }
+    }
+    nativeDebugger.pauses.push({
+      at: Date.now(),
+      reason: params?.reason || null,
+      description: exception?.description || params?.exceptionDetails?.text || null,
+      wrapperStack,
+      url: exception?.url || null,
+      callFrames: Array.isArray(params?.callFrames)
+        ? params.callFrames.slice(0, 24).map((frame) => ({
+          functionName: frame.functionName || "",
+          scriptId: frame.location?.scriptId || null,
+          url: frame.url || null,
+          lineNumber: Number.isFinite(frame.location?.lineNumber)
+            ? frame.location.lineNumber + 1 : null,
+          columnNumber: Number.isFinite(frame.location?.columnNumber)
+            ? frame.location.columnNumber + 1 : null,
+        }))
+        : [],
+    });
+    resumeDebugger();
+  };
+  const enableNativeDebugger = async () => {
+    if (activeProfileId !== "26.2") {
+      throw new Error("--trace-f3-exceptions is bound to the verified 26.2 F3 classes.js artifact");
+    }
+    const classesText = await readFile(resolve(distRoot, "classes.js"), "utf8");
+    if (!classesText.includes("let N=err=>")) {
+      throw new Error("verified F3 exception wrapper N=err=> was not found in classes.js");
+    }
+    session.on("Debugger.paused", onDebuggerPaused);
+    await session.send("Debugger.enable");
+    debuggerEnabled = true;
+    const breakpoint = await session.send("Debugger.setBreakpointByUrl", {
+      urlRegex: "classes\\.js\\?v=7eb510a7c947e87c(?:$|&)",
+      lineNumber: 40,
+      columnNumber: 16,
+      condition: "typeof err === 'object' && err !== null && err instanceof TypeError && /constructor/.test(String(err.message))",
+    });
+    evidence.nativeDebugger.breakpoint = {
+      breakpointId: breakpoint?.breakpointId || null,
+      urlRegex: "classes.js?v=7eb510a7c947e87c",
+      lineNumber: 41,
+      columnNumber: 17,
+      condition: "TypeError constructor message",
+    };
+    evidence.nativeDebugger.enabled = true;
+    debuggerWatchdog = setTimeout(() => {
+      void session.send("Debugger.setPauseOnExceptions", {state: "none"}).catch(() => {});
+      resumeDebugger();
+    }, 15_000);
+  };
+  const disableNativeDebugger = async () => {
+    if (debuggerWatchdog) clearTimeout(debuggerWatchdog);
+    try {
+      if (debuggerEnabled) {
+        const breakpointId = evidence.nativeDebugger.breakpoint?.breakpointId;
+        if (breakpointId) {
+          await session.send("Debugger.removeBreakpoint", {breakpointId});
+        }
+        await session.send("Debugger.setPauseOnExceptions", {state: "none"});
+        resumeDebugger();
+        await session.send("Debugger.disable");
+      }
+    } catch (error) {
+      evidence.nativeDebugger.cleanupError = String(
+        error && (error.message || error) || error,
+      );
+    }
+  };
+  const samplePhase = async (name) => {
+    const phase = {
+      name,
+      startedAt: Date.now(),
+      screenshot: null,
+      samples: [],
+    };
+    phase.screenshot = await captureVisualOutputSample(
+      session,
+      `f3-${name}`,
+      1,
+      true,
+    );
+    const deadline = Date.now() + evidence.sampleWindowMillis;
+    do {
+      const page = await samplePage(session, false);
+      phase.samples.push({
+        at: Date.now(),
+        frameCount: Number(page?.frame?.frameCount) || 0,
+        visibleFrameCount: Number(page?.frame?.visibleFrameCount) || 0,
+        workerLifecycle: page?.workerLifecycle || null,
+        worker: page?.worker || null,
+        loadedChunkCount: page?.loadedChunkCount ?? null,
+        running: page?.running ?? null,
+        screen: page?.screen ?? null,
+      });
+      if (Date.now() >= deadline) break;
+      await sleep(Math.min(evidence.sampleIntervalMillis, deadline - Date.now()));
+    } while (Date.now() < deadline);
+    phase.endedAt = Date.now();
+    return phase;
+  };
+  try {
+    evidence.phases.push(await samplePhase("before"));
+    if (traceF3Exceptions) await enableNativeDebugger();
+    await dispatchKey(session, "F3", "keyDown");
+    await dispatchKey(session, "F3", "keyUp");
+    evidence.phases.push(await samplePhase("enabled"));
+    await dispatchKey(session, "F3", "keyDown");
+    await dispatchKey(session, "F3", "keyUp");
+    evidence.phases.push(await samplePhase("after"));
+    evidence.completedAt = Date.now();
+  } catch (error) {
+    evidence.error = String(error && (error.stack || error.message) || error);
+    evidence.completedAt = Date.now();
+  } finally {
+    if (debuggerEnabled || evidence.nativeDebugger.enabled) await disableNativeDebugger();
+  }
+  await writeFile(
+    outputPath + ".f3-probe.json",
+    JSON.stringify(evidence, null, 2) + "\n",
+  );
+  return evidence;
+}
+
 async function collectContinuousVisualOutput(session, durationMillis) {
   const samples = [];
   const startedAt = Date.now();
@@ -1955,6 +2331,21 @@ async function observeWorldReadiness(session) {
       visibleFrameCount: Number(frame.visibleFrameCount) || 0,
       frameAgeMillis: Number.isFinite(lastFrameAt) ? Math.max(0, now - lastFrameAt) : null,
       documentVisibility: document.visibilityState,
+      inputCapture: {
+        documentFocused: document.hasFocus(),
+        pointerLocked: !!document.pointerLockElement
+          && document.pointerLockElement === document.getElementById('mc-canvas'),
+        pointerLockElement: document.pointerLockElement?.id || null,
+        wantsPointerLock: window.__gaiusWantPointerLock === true,
+        pointerLockError: window.__gaiusPointerLockLastError || null,
+        fullscreen: !!document.fullscreenElement,
+        keyboardLockHeld: window.__gaiusKeyboardLockHeld === true,
+        keyboardLockPending: window.__gaiusKeyboardLockPending === true,
+        keyboardLockError: window.__gaiusKeyboardLockLastError || null,
+        inputStats: window.__gaiusInputStats || null,
+        queuedEvents: Math.max(0, (window.__gaiusGlfwEvents?.length || 0)
+          - (window.__gaiusGlfwEventHead || 0)),
+      },
     };
   })()`);
 }
@@ -1963,6 +2354,8 @@ async function aimTowardTerrain(session, initialPoint) {
   let point = {...initialPoint};
   for (let attempt = 0; attempt < 5; attempt++) {
     const observed = await observeWorldReadiness(session);
+    recordEvent({at: Date.now(), source: 'startup input', text: 'before aim ' + attempt,
+      inputCapture: observed.inputCapture, player: observed.player});
     if (observed.hitIsSolidBlock) break;
     const pitch = Number(observed.player?.pitch);
     if (Number.isFinite(pitch) && pitch >= 55) break;
@@ -1975,17 +2368,32 @@ async function aimTowardTerrain(session, initialPoint) {
     });
     await sleep(100);
   }
+  const observed = await observeWorldReadiness(session);
+  recordEvent({at: Date.now(), source: 'startup input', text: 'after aim',
+    inputCapture: observed.inputCapture, player: observed.player});
   return point;
 }
 
-async function waitForStrictWorldReadiness(session, deadlineAt) {
+async function waitForStrictWorldReadiness(session, deadlineAt, aimPoint) {
   const observations = [];
   const visualSamples = [];
   let visualAttempt = 0;
   let lastVisualAttemptAt = 0;
   let summary = summarizeWorldReadiness([], startupContract);
+  let lastAimAt = Date.now();
+  let aimRetries = 0;
   while (Date.now() < deadlineAt) {
     const observed = await observeWorldReadiness(session);
+    // Initial spawn corrections can reset the camera after the first aim.
+    // Retry real mouse input after terrain is ready; never substitute a hit
+    // or lower the readiness requirement when the crosshair points at air.
+    if (aimPoint && observed.baseReady && !observed.hitIsSolidBlock
+        && aimRetries < 6 && Date.now() - lastAimAt >= 2000) {
+      aimRetries++;
+      aimPoint = await aimTowardTerrain(session, aimPoint);
+      lastAimAt = Date.now();
+      continue;
+    }
     const previous = observations.at(-1);
     const frameAdvanced = !previous
       || observed.visibleFrameCount > Number(previous.visibleFrameCount || 0);
@@ -2811,6 +3219,7 @@ async function samplePage(session, drainFrames = true) {
     const value = await evaluate(session, "(() => {"
       + "const state=globalThis.__gaiusMinecraftState||{};"
       + "const player=state.player||null;"
+      + "const clientDistance=state.clientDistance||{};"
       + "const pipeline=globalThis.__gaiusChunkPipelineTelemetry||{};"
       + "const worker=globalThis.__gaiusWorkerMessageTelemetry||{};"
       + "const network=globalThis.__gaiusNetworkStats||{};"
@@ -2935,6 +3344,7 @@ async function samplePage(session, drainFrames = true) {
       + "lastTaskMillis:Number(pipeline.lastTaskMillis)||0,"
       + "lastUploadPassMillis:Number(pipeline.lastUploadPassMillis)||0},"
       + "worker:Object.assign({},worker),"
+      + "clientDistance:scalarSnapshot(clientDistance),"
       + "workerLifecycle:{count:workerStates.length,"
       + "activeCount:workerStates.filter(item=>!item.terminal).length,"
       + "terminalCount:workerStates.filter(item=>item.terminal).length,states:workerStates},"
@@ -2989,6 +3399,31 @@ async function samplePage(session, drainFrames = true) {
       error: String(error && (error.stack || error.message) || error),
     };
   }
+}
+
+async function sampleBrowserServerTick(session) {
+  const value = await evaluate(session, "(() => {"
+    + "const source=globalThis.__gaiusWorkerMessageTelemetry||{};"
+    + "const tick=source.serverTick;"
+    + "const worker={"
+    + "sessionId:typeof source.sessionId==='string'?source.sessionId:null,"
+    + "measurementId:typeof source.measurementId==='string'?source.measurementId:null,"
+    + "updatedAt:typeof source.updatedAt==='number'&&Number.isFinite(source.updatedAt)?source.updatedAt:null,"
+    + "serverTick:tick&&typeof tick==='object'?Object.assign({},tick):null};"
+    + "return {at:Date.now(),worker};"
+    + "})()", 5000);
+  return value && typeof value === "object"
+    ? value
+    : {at: Date.now(), worker: {}};
+}
+
+function mergeBrowserServerTickSamples(mainSamples, initialSamples) {
+  return [...mainSamples, ...initialSamples].sort((left, right) => {
+    const leftAt = Number(left?.at);
+    const rightAt = Number(right?.at);
+    if (leftAt !== rightAt) return leftAt - rightAt;
+    return 0;
+  });
 }
 
 async function sampleFor(
@@ -3687,6 +4122,74 @@ function max(samples, selector) {
   return samples.reduce((maximum, sample) => Math.max(maximum, Number(selector(sample)) || 0), 0);
 }
 
+function summarizeClientDistance(samples, expectedRenderDistance, expectedSimulationDistance) {
+  const minimumEffectiveRenderDistance = Math.max(4, Number(expectedRenderDistance));
+  const minimumEffectiveSimulationDistance = Math.max(1, Number(expectedSimulationDistance));
+  const sampledAtToleranceMillis = 5_000;
+  const normalized = samples.map((sample) => {
+    const value = sample?.clientDistance;
+    if (!value || typeof value !== "object") return {missing: true, at: Number(sample?.at)};
+    const result = {};
+    for (const field of [
+      "rawRenderDistance", "effectiveRenderDistance", "rawSimulationDistance",
+      "serverSimulationDistance", "sampledAtMillis",
+    ]) {
+      const number = Number(value[field]);
+      result[field] = Number.isFinite(number) ? number : null;
+    }
+    result.at = Number.isFinite(Number(sample?.at)) ? Number(sample.at) : null;
+    return result;
+  });
+  let consecutive = 0;
+  let maximumConsecutive = 0;
+  const invalidSamples = [];
+  let firstStableAt = null;
+  let lastStableAt = null;
+  let stableStartIndex = null;
+  let stableEndIndex = null;
+  for (let index = 0; index < normalized.length; index += 1) {
+    const item = normalized[index];
+    const valid = !item.missing
+      && item.rawRenderDistance === Number(expectedRenderDistance)
+      && item.rawSimulationDistance === Number(expectedSimulationDistance)
+      && item.effectiveRenderDistance >= minimumEffectiveRenderDistance
+      && item.serverSimulationDistance >= minimumEffectiveSimulationDistance
+      && item.sampledAtMillis !== null
+      && item.at !== null
+      && Math.abs(item.sampledAtMillis - item.at) <= sampledAtToleranceMillis;
+    if (valid) {
+      consecutive += 1;
+      maximumConsecutive = Math.max(maximumConsecutive, consecutive);
+      if (consecutive === 1 && firstStableAt === null) {
+        firstStableAt = item.at;
+        stableStartIndex = index;
+      }
+      lastStableAt = item.at;
+      stableEndIndex = index;
+    } else {
+      invalidSamples.push({index, reason: item.missing ? "missing-clientDistance" : "distance-or-timestamp-invalid"});
+      consecutive = 0;
+    }
+  }
+  const hasFreshTelemetry = normalized.length > 0 && invalidSamples.length === 0;
+  const passed = normalized.length >= 3 && hasFreshTelemetry
+    && maximumConsecutive === normalized.length;
+  return {
+    available: hasFreshTelemetry,
+    passed,
+    reason: passed ? null
+      : invalidSamples.some((item) => item.reason === "missing-clientDistance")
+        ? "clientDistance telemetry was missing in the performance window"
+        : normalized.length < 3
+          ? "fewer than three clientDistance samples covered the performance window"
+          : "clientDistance telemetry was invalid or regressed in the performance window",
+    sampleCount: normalized.length, consecutiveSamples: maximumConsecutive,
+    invalidSamples, minimumEffectiveRenderDistance, minimumEffectiveSimulationDistance,
+    sampledAtToleranceMillis,
+    firstStableAt, lastStableAt, stableStartIndex, stableEndIndex, samples: normalized,
+  };
+}
+
 function analyze(samples, stabilitySamples, telemetry, heapSamples, events, strict, context) {
   const profile = context.profile || benchmarkProfile;
   const gates = profile.gates || {};
@@ -3869,6 +4372,11 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
     ? `${Number(workerStartMessages.at(-1).renderDistance)}:${Number(
       workerStartMessages.at(-1).simulationDistance,
     )}` : null;
+  const clientDistanceGate = summarizeClientDistance(
+    validSamples,
+    expectedRenderDistance,
+    expectedSimulationDistance,
+  );
   const effectiveDistance = Number.isFinite(optionsRenderDistance)
       && Number.isFinite(optionsSimulationDistance) && naturalServerDistance
     ? `${Math.min(optionsRenderDistance, Number(workerStartMessages.at(-1).renderDistance))}:${Math.min(
@@ -3910,7 +4418,10 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
   const expectedWidth = Number(expectedViewport.width || 1280);
   const expectedHeight = Number(expectedViewport.height || 720);
   const expectedDpr = Number(expectedViewport.deviceScaleFactor || 1);
-  if (Number(telemetry.environment?.devicePixelRatio) !== expectedDpr
+  // Chrome can expose 1.0000000149011612 for an emulated scale of 1.
+  // Keep actual viewport/canvas dimensions exact; allow only numeric DPR noise.
+  const observedDpr = Number(telemetry.environment?.devicePixelRatio);
+  if (!Number.isFinite(observedDpr) || Math.abs(observedDpr - expectedDpr) > 1e-6
       || Number(telemetry.environment?.viewport?.width) !== expectedWidth
       || Number(telemetry.environment?.viewport?.height) !== expectedHeight) {
     environmentIssues.push("DPR or viewport did not match the selected contract");
@@ -3943,6 +4454,13 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
   if (optionsPreferenceDistance !== expectedDistanceLabel) {
     environmentIssues.push(
       `options.txt render/simulation preference was not exactly ${expectedDistanceLabel}`,
+    );
+  }
+  if (!clientDistanceGate.passed) {
+    environmentIssues.push(
+      `runtime effective client distance was not proven (need fresh clientDistance telemetry, `
+        + `effective render >=${clientDistanceGate.minimumEffectiveRenderDistance}, `
+        + `raw/server simulation >=${clientDistanceGate.minimumEffectiveSimulationDistance})`,
     );
   }
   if (pinWorkerDistance) {
@@ -4047,6 +4565,8 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
       optionsPreference: optionsPreferenceDistance,
       effectiveDistanceModel: "min(client-options-preference,worker-server-distance)",
       effectiveDistance,
+      clientDistanceSource: "BrowserOpenGL clientDistance telemetry",
+      clientDistanceGate,
       activeWorkerDistances: [...distances],
       naturalWorkerDistances: [...naturalWorkerDistances],
       naturalServerDistance,
@@ -4923,12 +5443,39 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
 let staticServer;
 let chrome;
 let session;
+let f3ProbeEvidence = null;
 let browserSession;
 let browserSessionError = null;
 let profileDirectory;
 let stopTravel = async () => {};
 let debuggingPort = attachPort;
 let chromeOutput = "";
+const waitForChildExit = (child, timeoutMillis) => new Promise((resolveExit) => {
+  if (!child || child.exitCode !== null || child.signalCode !== null) {
+    resolveExit({exited: true, code: child?.exitCode ?? null, signal: child?.signalCode ?? null});
+    return;
+  }
+  let settled = false;
+  const finish = (value) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    child.removeListener("exit", onExit);
+    child.removeListener("error", onError);
+    resolveExit(value);
+  };
+  const onExit = (code, signal) => finish({exited: true, code, signal});
+  const onError = (error) => finish({
+    exited: child.exitCode !== null || child.signalCode !== null,
+    code: child.exitCode, signal: child.signalCode, error: String(error),
+  });
+  const timer = setTimeout(
+    () => finish({exited: false, code: child.exitCode, signal: child.signalCode}),
+    Math.max(0, Number(timeoutMillis) || 0),
+  );
+  child.once("exit", onExit);
+  child.once("error", onError);
+});
 const events = [];
 const stickyFatalEvents = [];
 const immediateFatalPattern = /---- Minecraft Crash Report ----|Game crashed!|renderer crash|worker crash|bootstrap-crash|out of memory|allocation failed|\bOOM\b/i;
@@ -5099,6 +5646,7 @@ try {
   const worldReadiness = await waitForStrictWorldReadiness(
     session,
     semanticWorldEntryTimings.worldLoadStartedAt + startupTimeoutMillis,
+    center,
   );
   if (worldReadiness.verdict !== "pass") {
     throw new Error(
@@ -5129,6 +5677,9 @@ try {
       text: gameplayProbe?.reason || "live gameplay authority probe was not installed",
     });
   }
+  if (probeF3) {
+    f3ProbeEvidence = await runF3Probe(session);
+  }
 
   await resetMeasurement(session);
   const warmupSamples = [];
@@ -5137,6 +5688,11 @@ try {
   if (benchmarkProfile.workload === "traverse") {
     stopTravel = await startTravel(session, center);
   }
+  const warmupWorker = [...warmupSamples].reverse()
+    .map((sample) => sample?.worker)
+    .find((worker) => worker && typeof worker.sessionId === "string" &&
+      typeof worker.measurementId === "string" &&
+      worker.serverTick && Number.isFinite(worker.serverTick.sampledAtMillis));
   const reset = await resetMeasurement(session);
   if (!reset.distances.includes(expectedDistanceLabel)) {
     recordEvent({
@@ -5152,11 +5708,44 @@ try {
   let performanceTelemetry;
   let workerDistanceEvidence;
   let gameplayExercise;
+  let initialTickSampling = {
+    available: false,
+    reason: "pending",
+    samples: [],
+  };
+  let measurementSamples = samples;
   const measurementStartedAt = Date.now();
   const processRssDurationMillis = frameMeasurementMillis;
+  const initialTickTask = warmupWorker
+    ? collectInitialServerTickSamples([], {
+      read: async () => {
+        try {
+          return await sampleBrowserServerTick(session);
+        } catch (error) {
+          return {at: Date.now(), worker: {}, error: String(error?.message || error)};
+        }
+      },
+      sleep,
+      expectedSessionId: warmupWorker.sessionId,
+      expectedMeasurementId: reset.measurementId,
+    })
+    : Promise.resolve({available: false, reason: "missing-warmup-worker", samples: []});
   const performanceTask = (async () => {
     await sampleFor(session, frameMeasurementMillis, samples);
     samples.push(await samplePage(session));
+    initialTickSampling = await initialTickTask;
+    measurementSamples = mergeBrowserServerTickSamples(
+      samples,
+      initialTickSampling.samples,
+    );
+    await mkdir(resolve(outputPath, ".."), {recursive: true});
+    await writeFile(outputPath + ".samples.json", JSON.stringify({
+      schemaVersion: 1, stage: "sampling-completed", acceptance: "unassessed",
+      buildIdentity: benchmarkBuildIdentity, measurementStartedAt,
+      sampledThrough: samples.at(-1)?.at, samples,
+      initialTickSampling,
+      serverTickWindow: browserServerTickWindow(measurementSamples),
+    }, null, 2) + "\n");
     performanceTelemetry = await captureFinalTelemetryAfterSamples(session, samples);
     performanceTelemetry.framePacingSettlement = await settleFramePacing(
       session,
@@ -5178,7 +5767,9 @@ try {
     browserSessionError,
   );
   const gameplayTask = benchmarkProfile.gates?.gameplayAuthority
-    ? exerciseGameplayAuthority(session, center, stopTravel)
+    // This runs inside the traversal measurement window. Pausing its travel
+    // controller would release W and turn the FPS run into a stationary test.
+    ? exerciseGameplayAuthority(session, center)
     : Promise.resolve({verdict: "not-required"});
   let continuousVisualSamples;
   [, heapSamples, continuousVisualSamples, processRssSamples, gameplayExercise] = await Promise.all([
@@ -5198,7 +5789,35 @@ try {
     });
   }
   const stabilityTelemetry = performanceTelemetry;
-  const measurementEndedAt = Date.now();
+  // Match the end of the window to the snapshot being evaluated. Screenshot,
+  // RSS and frame-pacing settlement work can finish later than this snapshot;
+  // their completion time must not make a healthy captured heartbeat stale.
+  const measurementEndedAt = Number(performanceTelemetry.capturedAt);
+  // Close outstanding measurement yields while that epoch is still alive.
+  // World teardown and memory cleanup remain separately observed below.
+  const framePacingClosureTelemetry = await captureCleanupFramePacingClosure(
+    session,
+    await finalTelemetry(session),
+    performanceTelemetry.framePacingSettlement,
+  );
+  // Preserve the measured window even if leaving the world later fails.
+  // This is raw diagnostic evidence, never a substitute for the final verdict.
+  await mkdir(resolve(outputPath, ".."), {recursive: true});
+  await writeFile(outputPath + ".measurement.json", JSON.stringify({
+    schemaVersion: 1,
+    stage: "before-world-exit",
+    acceptance: "unassessed",
+    buildIdentity: benchmarkBuildIdentity,
+    measurementStartedAt,
+    measurementEndedAt,
+    worldEntryTimings,
+    samples,
+    initialTickSampling,
+    performanceTelemetry,
+    framePacingClosureTelemetry,
+    gameplayExercise,
+    serverTickWindow: browserServerTickWindow(measurementSamples),
+  }, null, 2) + "\n");
   await stopTravel();
   stopTravel = async () => {};
   visualOutputSamples.push(...await collectVisualOutput(session, "post-measurement"));
@@ -5208,7 +5827,9 @@ try {
     // transition was delayed, Minecraft can otherwise keep the browser canvas in a captured
     // selection state and never expose its pause screen to cleanup.
     await releaseInputCapture(session);
+    recordEvent({at: Date.now(), source: "world exit", text: "start"});
     await leaveWorld(session);
+    recordEvent({at: Date.now(), source: "world exit", text: "completed"});
     leftWorld = true;
   } catch (error) {
     recordEvent({
@@ -5233,6 +5854,12 @@ try {
       browserSessionError,
     ),
   ]);
+  // Persist failures caught by heap samplers before another CDP read can fail.
+  await writeFile(outputPath + ".cleanup-samples.json", JSON.stringify({
+    schemaVersion: 1, stage: "post-world-exit-sampling", acceptance: "unassessed",
+    leftWorld, cleanupHeapSamples, cleanupProcessRssSamples,
+    cdpTerminalError: session.terminalError?.message || null,
+  }, null, 2) + "\n");
   let cleanupTelemetry = await finalTelemetry(session);
   cleanupTelemetry = await captureCleanupFramePacingClosure(
     session,
@@ -5353,6 +5980,8 @@ try {
     performanceEvidence: analysis.performanceEvidence,
     failureEvidence: analysis.failureEvidence,
     analysis,
+    initialTickSampling,
+    serverTickWindow: browserServerTickWindow(measurementSamples),
     telemetry,
     samples,
     stabilitySamples,
@@ -5362,7 +5991,9 @@ try {
     processRssSamples,
     cleanupProcessRssSamples,
     visualOutputSamples,
+    f3Probe: f3ProbeEvidence,
     cleanupTelemetry,
+    framePacingClosureTelemetry,
     browserMemoryBaseline,
     browserMemoryBaselineSources: browserMemoryBaselineSnapshot,
     profileGateResult,
@@ -5465,15 +6096,65 @@ try {
   }
   if (session) session.close();
   if (browserSession) browserSession.close();
+  let chromeExit = null;
   if (chrome && !keepChrome) {
-    chrome.kill("SIGTERM");
-    await sleep(500);
-    if (!chrome.killed) chrome.kill("SIGKILL");
+    try {
+      if (chrome.exitCode === null && chrome.signalCode === null) chrome.kill("SIGTERM");
+      chromeExit = await waitForChildExit(chrome, 3000);
+      if (!chromeExit.exited) {
+        try { chrome.kill("SIGKILL"); } catch (ignored) {}
+        chromeExit = await waitForChildExit(chrome, 5000);
+      }
+    } catch (cleanupError) {
+      chromeExit = {exited: false, code: chrome.exitCode, signal: chrome.signalCode,
+        error: String(cleanupError)};
+    }
   }
   if (staticServer) {
     await new Promise((resolveClose) => staticServer.server.close(resolveClose));
   }
   if (profileDirectory && !keepChrome) {
-    await rm(profileDirectory, {recursive: true, force: true});
+    const cleanup = {
+      schemaVersion: 1,
+      generatedAt: new Date().toISOString(),
+      profileDirectory,
+      chromeExit,
+      removed: false,
+      attempts: 0,
+      lastError: null,
+      residualProfile: false,
+    };
+    for (let attempt = 1; attempt <= 12; attempt += 1) {
+      cleanup.attempts = attempt;
+      try {
+        await rm(profileDirectory, {recursive: true, force: true, maxRetries: 0});
+        cleanup.removed = true;
+        break;
+      } catch (cleanupError) {
+        cleanup.lastError = String(cleanupError && (cleanupError.stack || cleanupError.message)
+          || cleanupError);
+        if (attempt < 12) await sleep(250);
+      }
+    }
+    cleanup.residualProfile = await stat(profileDirectory).then(() => true).catch(() => false);
+    if (cleanup.residualProfile) {
+      const residualEvent = {
+        at: Date.now(),
+        source: "benchmark cleanup",
+        text: `Chrome profile remained after bounded cleanup: ${profileDirectory}`,
+        profileDirectory,
+        cleanup,
+      };
+      recordEvent(residualEvent);
+      console.error(residualEvent.text);
+    }
+    try {
+      await writeFile(
+        outputPath + ".cleanup.json",
+        JSON.stringify(cleanup, null, 2) + "\n",
+      );
+    } catch (cleanupError) {
+      console.error(`Could not persist Chrome cleanup report: ${String(cleanupError)}`);
+    }
   }
 }

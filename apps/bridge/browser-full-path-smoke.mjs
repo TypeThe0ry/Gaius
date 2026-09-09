@@ -71,6 +71,17 @@ const acceptServerPrompts = externalMode ||
     process.env.GAIUS_BROWSER_FULL_PATH_ACCEPT_SERVER_PROMPTS === "1" ||
     process.env.GAIUS_BROWSER_FULL_PATH_ACCEPT_DIALOGS === "1";
 const requestedDialogAction = process.env.GAIUS_SMOKE_DIALOG_ACTION_ID;
+const requestedDialogActionSequence = (process.env.GAIUS_SMOKE_DIALOG_ACTION_IDS ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+if (requestedDialogAction !== undefined && requestedDialogActionSequence.length > 0) {
+    throw new Error(
+        "Set only one of GAIUS_SMOKE_DIALOG_ACTION_ID or " +
+        "GAIUS_SMOKE_DIALOG_ACTION_IDS",
+    );
+}
+let requestedDialogActionSequenceIndex = 0;
 const dialogInputValues = await loadDialogInputValues();
 const commandLineArguments = process.argv.slice(2);
 const printConfigOnly = commandLineArguments.includes("--print-config");
@@ -9149,6 +9160,23 @@ function uniqueStrings(values) {
 }
 
 function selectDialogAction(actionIds) {
+    if (requestedDialogActionSequence.length > 0) {
+        const sequenceIndex = requestedDialogActionSequenceIndex++;
+        const sequenceAction = requestedDialogActionSequence[sequenceIndex];
+        if (sequenceAction === undefined) {
+            throw new Error(
+                `No dialog action configured for dynamic dialog ${sequenceIndex + 1}; ` +
+                "extend GAIUS_SMOKE_DIALOG_ACTION_IDS",
+            );
+        }
+        if (!actionIds.includes(sequenceAction)) {
+            throw new Error(
+                `Requested dialog action ${sequenceAction} was not offered by the server ` +
+                `(dynamic dialog ${sequenceIndex + 1})`,
+            );
+        }
+        return sequenceAction;
+    }
     if (requestedDialogAction !== undefined) {
         if (!actionIds.includes(requestedDialogAction)) {
             throw new Error(`Requested dialog action ${requestedDialogAction} was not offered by the server`);

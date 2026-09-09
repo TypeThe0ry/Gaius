@@ -5155,6 +5155,19 @@ def check_source_patches() -> None:
             and "get('preserveDrawingBuffer') === '1'" in glfw_text,
         ),
         (
+            "BrowserGlfw gates reserved-key capture on API fullscreen",
+            "e.ctrlKey && !e.altKey && !e.metaKey && e.code === 'KeyW'" in glfw_text
+            and "addEventListener('keydown', e =>" in glfw_text
+            and "keyboard.lock" in glfw_text
+            and "keyboard.lock(['KeyW'])" in glfw_text
+            and "requestKeyboardLockIfWanted" in glfw_text
+            and "!document.fullscreenElement" in glfw_text
+            and "root.requestFullscreen()" in glfw_text
+            and "addEventListener('fullscreenchange'" in glfw_text
+            and "{capture:true, passive:false}" in glfw_text
+            and "e.preventDefault();" in glfw_text,
+        ),
+        (
             "BrowserGlfw records game FPS from swapBuffers",
             "public static void swapBuffers(long window)" in glfw_text
             and "private static native boolean swapBuffersJs()" in glfw_text
@@ -5452,9 +5465,9 @@ def check_source_patches() -> None:
             and performance_contract.get("runtimeInvariants", {})
                 .get("worldgen", {}).get("telemetryMode") in WORLDGEN_TELEMETRY_MODES
             and performance_contract.get("profiles", {})
-                .get("steady-6-4", {}).get("gates", {}).get("averageFpsMin") == 120
+                .get("steady-6-4", {}).get("gates", {}).get("averageFpsMin") == 200
             and performance_contract.get("profiles", {})
-                .get("steady-6-4", {}).get("gates", {}).get("onePercentLowFpsMin") == 60
+                .get("steady-6-4", {}).get("gates", {}).get("onePercentLowFpsMin") == 200
             and performance_contract.get("profiles", {})
                 .get("traversal-6-4", {}).get("gates", {}).get("longestFrameMsMax") == 50
             and performance_contract.get("runtimeInvariants", {})
@@ -5599,7 +5612,7 @@ def check_source_patches() -> None:
             and "push.operand == 667" in client_patcher,
         ),
         (
-            "Minecraft patcher uses static browser menu backgrounds for FPS",
+            "Minecraft patcher preserves the animated browser menu panorama",
             "patchScreenBrowserFastMenus" in client_patcher
             and "patchTitleScreenBrowserFastMenus" in client_patcher
             and "Gaius is independent and is not affiliated with Mojang or Microsoft." in client_patcher
@@ -5611,8 +5624,9 @@ def check_source_patches() -> None:
             and "renderMenuBackground" in client_patcher
             and "realmsNotificationsEnabled" in client_patcher
             and "GuiGraphics" in client_patcher
-            and "fill" in client_patcher
-            and "PanoramaRenderer.render" not in client_patcher[client_patcher.find("patchScreenBrowserFastMenus"):client_patcher.find("patchTitleScreenBrowserFastMenus")],
+            and "menuBackgroundBlurriness" in client_patcher
+            and "previous browser optimisation replaced" in client_patcher
+            and "write(node, output);" in client_patcher,
         ),
         (
             "Minecraft patcher reports browser state after runTick mutations",
@@ -6964,7 +6978,7 @@ def check_source_patches() -> None:
             and 'graphicsPreset:\\"fast\\"' in browser_file_persistence
             and 'renderClouds:\\"false\\"' in browser_file_persistence
             and "menuBackgroundBlurriness:0" in browser_file_persistence
-            and "panoramaSpeed:0.0" in browser_file_persistence
+            and "panoramaSpeed:1.0" in browser_file_persistence
             and "screenEffectScale:0.0" in browser_file_persistence
             and "maxAnisotropyBit:1" in browser_file_persistence
             and "textureFiltering:0" in browser_file_persistence
@@ -11313,24 +11327,22 @@ def check_overlay_bytecode() -> None:
             and "shouldReportMinecraftState" in browser_opengl,
         ),
         (
-            "Screen browser menus use static fill instead of dynamic panorama textures",
+            "Screen browser menus retain dynamic panorama and texture backgrounds",
             (
                 (
-                    "net/minecraft/client/gui/GuiGraphicsExtractor.fill:(IIIII)V"
-                    in screen_render_panorama
-                    and "net/minecraft/client/gui/GuiGraphicsExtractor.fill:(IIIII)V"
-                    in screen_render_menu_background
+                    "net/minecraft/client/renderer/GameRenderer.panorama" in screen_render_panorama
+                    and "net/minecraft/client/renderer/Panorama.extractRenderState" in screen_render_panorama
                 )
                 if is_current_named
                 else (
-                    "net/minecraft/client/gui/GuiGraphics.fill:(IIIII)V"
-                    in screen_render_panorama
-                    and "net/minecraft/client/gui/GuiGraphics.fill:(IIIII)V"
-                    in screen_render_menu_background
+                    "net/minecraft/client/renderer/GameRenderer.getPanorama" in screen_render_panorama
+                    and "net/minecraft/client/renderer/Panorama.render" in screen_render_panorama
                 )
             )
-            and "PanoramaRenderer.render" not in screen_render_panorama
-            and "renderMenuBackgroundTexture" not in screen_render_menu_background
+            and (
+                "extractMenuBackgroundTexture" in screen_render_menu_background
+                or "renderMenuBackgroundTexture" in screen_render_menu_background
+            )
             and "iconst_0" in title_realms_enabled
             and "ireturn" in title_realms_enabled,
         ),
@@ -12389,7 +12401,7 @@ def check_overlay_bytecode() -> None:
             and 'graphicsPreset:"fast"' in browser_file_persistence_constants
             and 'renderClouds:"false"' in browser_file_persistence_constants
             and "menuBackgroundBlurriness:0" in browser_file_persistence_constants
-            and "panoramaSpeed:0.0" in browser_file_persistence_constants
+            and "panoramaSpeed:1.0" in browser_file_persistence_constants
             and "screenEffectScale:0.0" in browser_file_persistence_constants
             and "maxAnisotropyBit:1" in browser_file_persistence_constants
             and "textureFiltering:0" in browser_file_persistence_constants

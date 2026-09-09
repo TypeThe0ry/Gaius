@@ -116,6 +116,10 @@ browser_font_assets=(
   "minecraft/font/unifont_jp.zip"
   "minecraft/font/unifont_pua.zip"
 )
+browser_background_assets=()
+while IFS= read -r logical_path; do
+  browser_background_assets+=("$logical_path")
+done < <(jq -r '.objects | keys[] | select(startswith("minecraft/textures/gui/title/background/"))' "$asset_index" | tr -d '\r')
 browser_sound_assets=(
   "minecraft/sounds/ui/toast/in.ogg"
   "minecraft/sounds/ui/toast/out.ogg"
@@ -165,7 +169,7 @@ download_browser_asset() {
 export asset_index assets
 export -f gaius_hash_file gaius_sha1_file gaius_sha256_file
 export -f curl_with_retries download_verified download_browser_asset
-printf '%s\n' "${browser_sound_metadata_assets[@]}" "${browser_sound_assets[@]}" "${browser_font_assets[@]}" |
+printf '%s\n' "${browser_sound_metadata_assets[@]}" "${browser_sound_assets[@]}" "${browser_font_assets[@]}" "${browser_background_assets[@]}" |
   xargs -n 1 -P "${GAIUS_FETCH_PARALLEL:-16}" bash -c 'download_browser_asset "$0"'
 
 echo "Fetched and verified:"

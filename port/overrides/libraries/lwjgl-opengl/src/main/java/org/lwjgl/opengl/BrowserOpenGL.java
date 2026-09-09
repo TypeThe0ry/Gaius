@@ -6844,6 +6844,10 @@ public final class BrowserOpenGL {
         String selectedItem = null;
         int selectedCount = 0;
         String playerMode = null;
+        int rawRenderDistance = -1;
+        int effectiveRenderDistance = -1;
+        int rawSimulationDistance = -1;
+        int serverSimulationDistance = -1;
         String hitClass = className(hitResult);
         String hitType = null;
         String hitBlockPos = null;
@@ -6903,6 +6907,19 @@ public final class BrowserOpenGL {
             } catch (Throwable ignored) {
                 // Telemetry must never break the game loop.
             }
+        }
+        try {
+            Minecraft minecraft = Minecraft.getInstance();
+            if (minecraft != null && minecraft.options != null) {
+                rawRenderDistance = minecraft.options.renderDistance().get();
+                effectiveRenderDistance = minecraft.options.getEffectiveRenderDistance();
+                rawSimulationDistance = minecraft.options.simulationDistance().get();
+                if (minecraft.level != null) {
+                    serverSimulationDistance = minecraft.level.getServerSimulationDistance();
+                }
+            }
+        } catch (Throwable ignored) {
+            // Distance telemetry must never break the game loop.
         }
         if (level instanceof ClientLevel clientLevel) {
             try {
@@ -6991,6 +7008,8 @@ public final class BrowserOpenGL {
                 loadedChunkCount, playerCollisionKnown, playerCollisionFree,
                 playerMode, selectedSlot, selectedItem, selectedCount,
                 hitClass, hitType, hitBlockPos, hitDirection, hitBlockState, hitEntity,
+                rawRenderDistance, effectiveRenderDistance, rawSimulationDistance,
+                serverSimulationDistance,
                 noRender, running, pause);
     }
 
@@ -7103,6 +7122,8 @@ public final class BrowserOpenGL {
             "loadedChunkCount", "playerCollisionKnown", "playerCollisionFree",
             "playerMode", "selectedSlot", "selectedItem", "selectedCount",
             "hitClass", "hitType", "hitBlockPos", "hitDirection", "hitBlockState", "hitEntity",
+            "rawRenderDistance", "effectiveRenderDistance", "rawSimulationDistance",
+            "serverSimulationDistance",
             "noRender", "running", "pause"
     }, script = """
             var playerState = null;
@@ -7157,6 +7178,14 @@ public final class BrowserOpenGL {
               "gameMode": playerMode,
               "hit": hitState,
               "worldSelection": window.__gaiusWorldSelection || null,
+              "clientDistance": {
+                "rawRenderDistance": rawRenderDistance >= 0 ? rawRenderDistance : null,
+                "effectiveRenderDistance": effectiveRenderDistance >= 0 ? effectiveRenderDistance : null,
+                "rawSimulationDistance": rawSimulationDistance >= 0 ? rawSimulationDistance : null,
+                "serverSimulationDistance": serverSimulationDistance >= 0
+                  ? serverSimulationDistance : null,
+                "sampledAtMillis": Date.now()
+              },
               "noRender": noRender,
               "running": running,
               "pause": pause,
@@ -7171,6 +7200,9 @@ public final class BrowserOpenGL {
             String playerMode, int selectedSlot, String selectedItem, int selectedCount,
             String hitClass, String hitType, String hitBlockPos, String hitDirection, String hitBlockState,
             String hitEntity,
+            int rawRenderDistance, int effectiveRenderDistance,
+            int rawSimulationDistance,
+            int serverSimulationDistance,
             boolean noRender, boolean running, boolean pause);
 
     @JSBody(params = {"type"}, script = """

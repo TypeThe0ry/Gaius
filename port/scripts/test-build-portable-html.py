@@ -24,6 +24,7 @@ class BuildPortableHTMLTest(unittest.TestCase):
         )
         self.assertIn("if (window.__gaiusPortableBuild !== true)", template)
         self.assertIn("file:/// sibling paths", template)
+        self.assertIn("if (window.__gaiusPortableBuild === true) await portableReady;", template)
 
     def test_atomic_write_replaces_complete_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

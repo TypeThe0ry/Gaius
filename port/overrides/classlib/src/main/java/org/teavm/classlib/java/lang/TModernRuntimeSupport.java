@@ -163,6 +163,11 @@ public final class TModernRuntimeSupport {
             """)
     private static native void postMacrotask(ResumeCallback callback);
 
+    public static void postRunnableMacrotask(Runnable callback) {
+        ResumeCallback jsCallback = callback::run;
+        postMacrotask(jsCallback);
+    }
+
     public static TType genericSuperclass(TClass<?> type) {
         return type.getSuperclass();
     }

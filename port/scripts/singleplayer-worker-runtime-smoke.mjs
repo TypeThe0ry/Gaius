@@ -1,3 +1,5 @@
+
+import {serverTickWindow} from "./server-tick-window.mjs";
 import fs from "node:fs";
 import {createHash} from "node:crypto";
 import {Session as InspectorSession} from "node:inspector";
@@ -1006,6 +1008,9 @@ function buildSlowProbeEvidenceSnapshot({
       slowProbeSamplesBeforeProtocolReady,
       slowProbeSamplesAfterProtocolReady,
     );
+  const phaseView = (samples) => Array.isArray(samples)
+    ? samples.slice().sort(compareSlowProbeSamples).slice(0, MAX_SLOW_SAMPLES_PER_SCOPE)
+    : [];
   // Count candidates lost by the authoritative global Top-64 contract.  The
   // before/after arrays remain attribution views and are not used to infer
   // global retention.
@@ -1047,6 +1052,10 @@ function buildSlowProbeEvidenceSnapshot({
       roundTrip: "parent monotonic: parent-receive - parent-send",
     },
     samples: slowProbeSamples,
+    phaseViews: {
+      beforeProtocolReady: phaseView(slowProbeSamplesBeforeProtocolReady),
+      afterProtocolReady: phaseView(slowProbeSamplesAfterProtocolReady),
+    },
   };
 }
 
@@ -1580,6 +1589,56 @@ function runSlowProbeSelfSmoke() {
       boundedEvidence.retainedGlobalAfterProtocolReady !== 0) {
     throw new Error("slow probe total/dropped/top-64 evidence self-smoke failed");
   }
+  const phaseViewBefore = Array.from({length: MAX_SLOW_SAMPLES_PER_SCOPE}, (_, index) => ({
+    ...lastBacklog,
+    probeId: 1000 + index,
+    roundTripMs: MAX_SLOW_SAMPLES_PER_SCOPE - index,
+    afterProtocolReady: false,
+  }));
+  const phaseViewAfter = Array.from({length: MAX_SLOW_SAMPLES_PER_SCOPE}, (_, index) => ({
+    ...lastBacklog,
+    probeId: 2000 + index,
+    roundTripMs: MAX_SLOW_SAMPLES_PER_SCOPE - index + 100,
+    afterProtocolReady: true,
+  }));
+  const phaseViewEvidence = buildSlowProbeEvidenceSnapshot({
+    slowProbeSamplesBeforeProtocolReady: phaseViewBefore,
+    slowProbeSamplesAfterProtocolReady: phaseViewAfter,
+    slowProbeSamplesGlobal: globalRetained,
+    slowProbeCandidateCount: phaseViewBefore.length + phaseViewAfter.length,
+    slowProbeTopKRetentionDroppedCount: 0,
+    slowProbeSnapshotBlockCapDroppedCount: 0,
+    slowProbeSnapshotBlocksBeforeProtocolReady: new Map(),
+    slowProbeSnapshotBlocksAfterProtocolReady: new Map(),
+    slowProbeSnapshotErrorCount: 0,
+    slowProbeClockAnomalyCount: 0,
+    slowProbeClockAnomalies: [],
+  });
+  if (phaseViewEvidence.samples.length !== MAX_SLOW_SAMPLES ||
+      phaseViewEvidence.phaseViews.beforeProtocolReady.length !== MAX_SLOW_SAMPLES_PER_SCOPE ||
+      phaseViewEvidence.phaseViews.afterProtocolReady.length !== MAX_SLOW_SAMPLES_PER_SCOPE ||
+      phaseViewEvidence.phaseViews.beforeProtocolReady[0].probeId !== 1000 ||
+      phaseViewEvidence.phaseViews.afterProtocolReady[0].probeId !== 2000 ||
+      phaseViewEvidence.phaseViews.afterProtocolReady.at(-1).probeId !== 2031) {
+    throw new Error("slow probe phase-view retention self-smoke failed");
+  }
+  const emptyPhaseViewEvidence = buildSlowProbeEvidenceSnapshot({
+    slowProbeSamplesBeforeProtocolReady: [],
+    slowProbeSamplesAfterProtocolReady: [],
+    slowProbeSamplesGlobal: [],
+    slowProbeCandidateCount: 0,
+    slowProbeTopKRetentionDroppedCount: 0,
+    slowProbeSnapshotBlockCapDroppedCount: 0,
+    slowProbeSnapshotBlocksBeforeProtocolReady: new Map(),
+    slowProbeSnapshotBlocksAfterProtocolReady: new Map(),
+    slowProbeSnapshotErrorCount: 0,
+    slowProbeClockAnomalyCount: 0,
+    slowProbeClockAnomalies: [],
+  });
+  if (emptyPhaseViewEvidence.phaseViews.beforeProtocolReady.length !== 0 ||
+      emptyPhaseViewEvidence.phaseViews.afterProtocolReady.length !== 0) {
+    throw new Error("empty slow probe phase-view self-smoke failed");
+  }
 
   const capState = createSlowProbeBlockState();
   let capCaptureCount = 0;
@@ -1666,60 +1725,6 @@ function recentTelemetryAuxiliarySnapshot(samples, field, fallback) {
   return copyObjectSnapshot(fallback);
 }
 
-function serverTickWindow(start, end) {
-  const fields = [
-    "intervalCount",
-    "totalTickIntervalMillis",
-    "completedTickCount",
-    "totalTickDurationMillis",
-    "completedWaitPhaseCount",
-    "totalWaitPhaseDurationMillis",
-  ];
-  if (start === null || end === null || start === undefined || end === undefined) {
-    return {available: false, reason: "missing"};
-  }
-  const delta = {};
-  for (const field of fields) {
-    const finish = end[field];
-    const begin = start[field];
-    if (typeof finish !== "number" || typeof begin !== "number" ||
-        !Number.isFinite(finish) || !Number.isFinite(begin)) {
-      return {available: false, reason: "missing-counter", field};
-    }
-    delta[field] = finish - begin;
-    if (delta[field] < 0) {
-      return {available: false, reason: "counter-reset", field};
-    }
-  }
-  const elapsedMillis = end.sampledAtMillis - start.sampledAtMillis;
-  if (!Number.isFinite(start.sampledAtMillis) || !Number.isFinite(end.sampledAtMillis) ||
-      elapsedMillis <= 0) {
-    return {available: false, reason: "invalid-sample-window"};
-  }
-  // A catch-up burst can average 20 TPS while entities still freeze for seconds.
-  // Preserve interval/work/wait hitches for this exact window, not cumulative maxima.
-  const hitchCounts = {};
-  for (const field of ["intervalOver100MillisCount", "intervalOver500MillisCount",
-    "tickWorkOver500MillisCount", "waitPhaseOver500MillisCount"]) {
-    const begin = start[field];
-    const finish = end[field];
-    hitchCounts[field] = Number.isInteger(begin) && Number.isInteger(finish) &&
-      begin >= 0 && finish >= begin ? finish - begin : null;
-  }
-  return {
-    available: true,
-    schemaVersion: Number(end.schemaVersion) || null,
-    intervalCount: delta.intervalCount,
-    completedTickCount: delta.completedTickCount,
-    elapsedMillis,
-    totalTickIntervalMillis: delta.totalTickIntervalMillis,
-    totalTickDurationMillis: delta.totalTickDurationMillis,
-    completedWaitPhaseCount: delta.completedWaitPhaseCount,
-    totalWaitPhaseDurationMillis: delta.totalWaitPhaseDurationMillis,
-    observedTps: delta.intervalCount * 1000 / elapsedMillis,
-    hitchCounts,
-  };
-}
 
 function runServerTickWindowSelfSmoke() {
   const base = {
