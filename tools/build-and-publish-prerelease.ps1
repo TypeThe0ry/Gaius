@@ -53,8 +53,6 @@ $plugin = Join-Path $root "apps/server-plugin/target/gaius-server-plugin-$versio
 if (Test-Path $plugin) { Copy-Item $plugin (Join-Path $stage (Split-Path $plugin -Leaf)) }
 [ordered]@{ tag=$Tag; version=$version; sourceHead=$head; sourceBranch=$TargetBranch; dirty=[bool]$status; generatedAt=(Get-Date).ToUniversalTime().ToString('o'); profiles=@($Profiles); relay='t40.sjcmc.cn:14803 via wss://ellan.site/tunnel' } |
     ConvertTo-Json -Depth 4 | Set-Content (Join-Path $stage 'prerelease.manifest.json') -Encoding utf8
-$hashLines = foreach ($file in Get-ChildItem $stage -File | Sort-Object Name) { "$( (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant() )  $($file.Name)" }
-$hashLines | Set-Content (Join-Path $stage 'SHA256SUMS') -Encoding ascii
 $notesPath = Join-Path $stage 'RELEASE-NOTES.md'
 @"
 Gaius Client local prerelease $Tag
@@ -66,6 +64,8 @@ Multiplayer target: t40.sjcmc.cn:14803 via wss://ellan.site/tunnel.
 Compiled and uploaded by tools/build-and-publish-prerelease.ps1; GitHub Actions is not involved.
 See prerelease.manifest.json and SHA256SUMS for provenance.
 "@ | Set-Content $notesPath -Encoding utf8
+$hashLines = foreach ($file in Get-ChildItem $stage -File | Sort-Object Name) { "$( (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant() )  $($file.Name)" }
+$hashLines | Set-Content (Join-Path $stage 'SHA256SUMS') -Encoding ascii
 $repo = 'TypeThe0ry/Gaius'
 gh release view $Tag --repo $repo *> $null
 $exists = ($LASTEXITCODE -eq 0)
