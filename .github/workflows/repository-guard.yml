@@ -51,7 +51,7 @@ jobs:
           python3 port/scripts/test-index-template.py
           python3 port/scripts/test-postprocess-index-shell.py
           python3 port/scripts/test-portable-artifact-identity.py
-          python3 port/scripts/test-stage-browser-sounds.py
+          python3 port/scripts/test-vanilla-resource-order.py
 
   bridge-smoke:
     runs-on: ubuntu-latest
