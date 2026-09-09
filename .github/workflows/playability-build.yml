@@ -161,6 +161,9 @@ jobs:
       - name: Verify artifact identity and runtime smoke
         env:
           GAIUS_SMOKE_MAX_GAMEPLAY_STALL_MS: "500"
+          # Distance changes are activated by the first real chunk-batch ACK;
+          # the runtime smoke must not expect the removed synthetic ring ramp.
+          GAIUS_SMOKE_DISTANCE_RAMP_MS: "750"
           GAIUS_SMOKE_SERVER_TICK_TELEMETRY: "1"
         run: |
           set -euo pipefail
