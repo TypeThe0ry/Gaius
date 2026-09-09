@@ -51,7 +51,7 @@ jobs:
           python3 port/scripts/test-index-template.py
           python3 port/scripts/test-postprocess-index-shell.py
           python3 port/scripts/test-portable-artifact-identity.py
-          python3 port/scripts/test-vanilla-background-assets.py
+          python3 port/scripts/test-stage-browser-sounds.py
           python3 port/scripts/test-stage-browser-sounds.py
           node port/scripts/browser-keyboard-capture-smoke.mjs
           node port/scripts/browser-input-character-smoke.mjs
@@ -113,17 +113,17 @@ jobs:
       - name: Validate TeaVM Formatter percent regression
         run: |
           set -euo pipefail
-          # This fixture is profile-independent; the guard intentionally runs
-          # on JDK 21 even though the 26.2 release build uses JDK 25.
-          unset GAIUS_VERSION_PROFILE_PATH GAIUS_BUILD_ROOT GAIUS_OVERLAY_DIRECTORY GAIUS_DIST_DIRECTORY
-          ./port/mvnw --batch-mode --no-transfer-progress \
+          # The Maven wrapper loads the default 26.2 profile and therefore
+          # enforces JDK 25. This fixture only needs TeaVM jars; invoke Maven
+          # with the runner JDK directly and leave profile selection untouched.
+          mvn --batch-mode --no-transfer-progress \
             org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
             -Dartifact=org.teavm:teavm-tooling:0.15.0
-          ./port/mvnw --batch-mode --no-transfer-progress \
+          mvn --batch-mode --no-transfer-progress \
             org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
             -Dartifact=org.teavm:teavm-classlib:0.15.0
           for artifact in asm asm-tree asm-analysis; do
-            ./port/mvnw --batch-mode --no-transfer-progress \
+            mvn --batch-mode --no-transfer-progress \
               org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
               "-Dartifact=org.ow2.asm:${artifact}:9.8" -Dtransitive=false
           done
