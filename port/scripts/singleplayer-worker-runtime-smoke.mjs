@@ -2228,21 +2228,13 @@ if (isMainThread && !runtimeSelfTest) {
   const sessionId = "0123456789abcdef0123456789abcdef";
   const clientProfileId = "00000000000040008000000000000002";
   const expectedStagedDistances = `1/1->${targetRenderDistance}/${targetSimulationDistance}`;
-  const expectedTransitions = [];
-  let expectedViewDistance = Math.min(targetRenderDistance, 2);
-  let expectedSimulationDistance = 1;
-  expectedTransitions.push(`${expectedViewDistance}/${expectedSimulationDistance}`);
-  while (expectedViewDistance < targetRenderDistance ||
-      expectedSimulationDistance < targetSimulationDistance) {
-    expectedViewDistance = Math.min(targetRenderDistance, expectedViewDistance + 1);
-    expectedSimulationDistance = Math.min(
-      targetSimulationDistance,
-      expectedSimulationDistance + 1,
-    );
-    expectedTransitions.push(`${expectedViewDistance}/${expectedSimulationDistance}`);
-  }
-  const expectedDistances = expectedTransitions.at(-1);
-  const expectedDistanceRamp = expectedTransitions.slice(0, -1);
+  // Distance updates are ACK-driven now.  The Worker stages the requested
+  // pair and vanilla PlayerList owns subsequent changes; there is no private
+  // synthetic 2/1 -> ... ring to wait for.  Keep the transition contract
+  // explicit so runtime smoke fails if an obsolete ramp is reintroduced.
+  const expectedDistances = `${targetRenderDistance}/${targetSimulationDistance}`;
+  const expectedTransitions = [expectedDistances];
+  const expectedDistanceRamp = [];
   const distanceRamp = [];
   const distanceTransitionTimeline = [];
   const protocol = createProtocolClient(port2, sessionId, clientProfileId, {
@@ -3497,32 +3489,14 @@ if (isMainThread && !runtimeSelfTest) {
         return;
       }
       const actualTransitions = distanceTransitionTimeline.map((entry) => entry.detail);
-      const configuredInterval = configuredDistanceRampIntervalMillis;
-      const ackCausal = distanceTransitionTimeline.every((entry, index) =>
-        entry.ackCountAtTransition > (index === 0
-          ? 0
-          : distanceTransitionTimeline[index - 1].ackCountAtTransition) &&
-        protocol.chunkBatchAckTimeline[entry.ackCountAtTransition - 1]?.sentAtMs <=
-          entry.receivedAtMs);
-      const intervalValid = distanceTransitionTimeline.every((entry, index) =>
-        index === 0 || entry.receivedAtMs - distanceTransitionTimeline[index - 1].receivedAtMs >=
-          configuredInterval - 50);
-      const ringBackpressureValid = distanceTransitionTimeline.every((entry) => {
-        const nextViewDistance = Number(String(entry.detail).split("/", 1)[0]);
-        if (nextViewDistance <= 2) return entry.chunkPacketCountAtTransition >= 1;
-        const previousDiameter = (nextViewDistance - 1) * 2 - 1;
-        return entry.chunkPacketCountAtTransition >= previousDiameter * previousDiameter;
-      });
       if (JSON.stringify(actualTransitions) !== JSON.stringify(expectedTransitions) ||
-          !ackCausal || !intervalValid || !ringBackpressureValid) {
+          distanceRamp.length !== 0) {
         events.push({
           type: "distance-ramp-causality-mismatch",
           expectedTransitions,
           actualTransitions,
-          configuredInterval,
-          ackCausal,
-          intervalValid,
-          ringBackpressureValid,
+          expectedDistanceRamp,
+          actualDistanceRamp: distanceRamp,
           distanceTransitionTimeline,
           chunkBatchAckTimeline: protocol.chunkBatchAckTimeline,
         });
