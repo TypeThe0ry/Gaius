@@ -4088,13 +4088,17 @@ def check_source_patches() -> None:
             and "recordChunkBatchSent" in browser_integrated_server_main
             and "acknowledgeChunkBatch" in browser_integrated_server_main
             and "sentChunkBatches" in browser_integrated_server_main
-            and "activeViewDistanceAcknowledged" in browser_integrated_server_main
-            and "DEFAULT_DISTANCE_RAMP_INTERVAL_MILLIS = 750L" in browser_integrated_server_main
-            and "distanceRampIntervalMillis()" in browser_integrated_server_main
-            and "__gaiusDistanceRampIntervalMillis" in browser_integrated_server_main
+            # Distance activation is driven by real chunk-batch accounting.  The
+            # old private ring/cardinality gate was intentionally removed: the
+            # vanilla ChunkMap remains authoritative after the first ACK.
+            and "ack-initial-activation" in browser_integrated_server_main
+            and "ack-configured" in browser_integrated_server_main
+            and "No synthetic ACK cardinality gate is used by this policy."
+                in browser_integrated_server_main
             and "distanceAdvancePending" in browser_integrated_server_main
             and "tickIntegratedServerDistances" in browser_integrated_server_main
-            and "advanceConfiguredDistances" in browser_integrated_server_main
+            and "Patcher compatibility hook; vanilla tracking owns later distance changes."
+                in browser_integrated_server_main
             and "patchServerGamePacketListenerBrowserWorker" in client_patcher
             and "patchPlayerChunkSenderBrowserWorker" in client_patcher
             and '"recordChunkBatchSent"' in client_patcher
@@ -5805,8 +5809,9 @@ def check_source_patches() -> None:
             "Browser resource-pack preparation yields between bounded batches",
             "BrowserResourceReloadScheduler.defer" in browser_resource_reload_profiler
             and "FRAME_WORK_BUDGET_NANOS = 11_000_000L" in browser_resource_reload_scheduler
-            and "Platform.schedule(BrowserResourceReloadScheduler::runAfterYield, 0)"
-            in browser_resource_reload_scheduler
+            and "scheduleMacrotask(BrowserResourceReloadScheduler::runAfterYield)"
+                in browser_resource_reload_scheduler
+            and "TModernRuntimeSupport.postRunnableMacrotask" in browser_resource_reload_scheduler
             and "requestAnimationFrame" not in browser_resource_reload_scheduler
             and "MAX_SUBMISSIONS_PER_BATCH" in browser_resource_reload_scheduler
             and "delegate.execute(command)" in browser_resource_reload_scheduler,
@@ -11728,23 +11733,11 @@ def check_overlay_bytecode() -> None:
             and "java/util/Deque.pollFirst" in browser_acknowledge_chunk_batch
             and "chunk-batch-ack-without-send" in browser_acknowledge_chunk_batch
             and "acknowledgedChunkCount" in browser_acknowledge_chunk_batch
-            and "Method activeViewDistanceAcknowledged:()Z"
-                in browser_acknowledge_chunk_batch
             and "configuredDistancesActive" in browser_acknowledge_chunk_batch
-            and "Math.min" in browser_acknowledge_chunk_batch
-            and "System.currentTimeMillis" in browser_acknowledge_chunk_batch
-            and "distanceAdvancePending" in browser_acknowledge_chunk_batch
+            and "ack-initial-activation" in browser_acknowledge_chunk_batch
+            and "ack-configured" in browser_acknowledge_chunk_batch
             and "applyActiveDistances" in browser_acknowledge_chunk_batch
-            and "advanceConfiguredDistances" in browser_acknowledge_chunk_batch
             and "distanceAdvancePending" in browser_tick_distances
-            and "Method activeViewDistanceAcknowledged:()Z" in browser_tick_distances
-            and "System.currentTimeMillis" in browser_tick_distances
-            and "advanceConfiguredDistances" in browser_tick_distances
-            and "activeViewDistance" in browser_active_view_acknowledged
-            and "acknowledgedChunkCount" in browser_active_view_acknowledged
-            and "Math.max" in browser_active_view_acknowledged
-            and "activeViewDistance" in browser_advance_distances
-            and "applyActiveDistances" in browser_advance_distances
             and "BrowserIntegratedServerMain.advanceConfiguredDistances"
                 not in minecraft_run_server,
         ),
