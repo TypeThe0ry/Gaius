@@ -51,7 +51,7 @@ jobs:
           python3 port/scripts/test-index-template.py
           python3 port/scripts/test-postprocess-index-shell.py
           python3 port/scripts/test-portable-artifact-identity.py
-          python3 port/scripts/test-stage-browser-sounds.py
+          python3 port/scripts/test-vanilla-background-assets.py
           node port/scripts/browser-keyboard-capture-smoke.mjs
           node port/scripts/browser-input-character-smoke.mjs
           node port/scripts/generation-spawn-telemetry-smoke.mjs
@@ -146,10 +146,13 @@ jobs:
         run: |
           set -euo pipefail
           node --check port/scripts/singleplayer-worker-runtime-smoke.mjs
+          node --check port/scripts/server-tick-window.mjs
+          node --check port/scripts/server-tick-window-smoke.mjs
           node --check port/scripts/singleplayer-worker-slow-sample-smoke.mjs
           node --check port/scripts/singleplayer-worker-runtime-output.mjs
           node --check port/scripts/singleplayer-worker-runtime-output-smoke.mjs
           node port/scripts/singleplayer-worker-runtime-output-smoke.mjs
+          node port/scripts/server-tick-window-smoke.mjs
           GAIUS_SMOKE_SELF_TEST=1 \
             node port/scripts/singleplayer-worker-runtime-smoke.mjs
           node port/scripts/singleplayer-worker-slow-sample-smoke.mjs
