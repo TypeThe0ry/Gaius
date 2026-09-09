@@ -52,7 +52,6 @@ jobs:
           python3 port/scripts/test-postprocess-index-shell.py
           python3 port/scripts/test-portable-artifact-identity.py
           python3 port/scripts/test-stage-browser-sounds.py
-          python3 port/scripts/test-stage-browser-sounds.py
           node port/scripts/browser-keyboard-capture-smoke.mjs
           node port/scripts/browser-input-character-smoke.mjs
           node port/scripts/generation-spawn-telemetry-smoke.mjs
@@ -132,6 +131,7 @@ jobs:
       - name: Validate TeaVM JSBody syntax before full compilation
         run: |
           set -euo pipefail
+          export GAIUS_VERSION_PROFILE_PATH=versions/1.21.11.json
           for artifact in teavm-core teavm-relocated-libs-rhino; do
             ./port/mvnw --batch-mode --no-transfer-progress \
               org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
