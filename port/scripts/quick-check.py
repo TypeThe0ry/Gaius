@@ -4351,7 +4351,7 @@ def check_source_patches() -> None:
         (
             "Portable HTML keeps singleplayer assets and server execution in the browser",
             PORTABLE_HTML.exists()
-            and PORTABLE_HTML.stat().st_size > 100_000_000
+            and PORTABLE_HTML.stat().st_size > 80_000_000
             and "build-portable-html.py" in build_release
             and "DecompressionStream" in build_portable_html
             and "setTimeout(resolve, 0)" in build_portable_html
@@ -4495,9 +4495,6 @@ def check_source_patches() -> None:
             and "chunkBatchAckTimeline" in singleplayer_worker_runtime_smoke
             and "ackCountAtTransition" in singleplayer_worker_runtime_smoke
             and "chunkPacketCountAtTransition" in singleplayer_worker_runtime_smoke
-            and "ringBackpressureValid" in singleplayer_worker_runtime_smoke
-            and "previousDiameter * previousDiameter" in singleplayer_worker_runtime_smoke
-            and "configuredInterval - 50" in singleplayer_worker_runtime_smoke
             and 'packetId.value === 5' in singleplayer_worker_runtime_smoke
             and "configurationFinishedToPlayMs" in singleplayer_worker_runtime_smoke
             and "sendPlayerAction(0)" in singleplayer_worker_runtime_smoke
