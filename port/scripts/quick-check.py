@@ -11341,7 +11341,17 @@ def check_overlay_bytecode() -> None:
                 if is_current_named
                 else (
                     "net/minecraft/client/renderer/GameRenderer.getPanorama" in screen_render_panorama
-                    and "net/minecraft/client/renderer/Panorama.render" in screen_render_panorama
+                    # 1.21.11's mapped client names the renderer
+                    # ``PanoramaRenderer`` (the older quick-check looked for
+                    # the shortened ``Panorama`` owner).  Keep this check
+                    # bound to the real vanilla dynamic panorama call rather
+                    # than accepting a solid/fill fallback.
+                    and (
+                        "net/minecraft/client/renderer/PanoramaRenderer.render"
+                        in screen_render_panorama
+                        or "net/minecraft/client/renderer/Panorama.render"
+                        in screen_render_panorama
+                    )
                 )
             )
             and (

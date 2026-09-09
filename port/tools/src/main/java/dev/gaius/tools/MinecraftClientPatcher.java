@@ -301,6 +301,13 @@ public final class MinecraftClientPatcher {
                 "com/mojang/blaze3d/platform/ClientShutdownWatchdog.class"));
         patchScreenBrowserFastMenus(args[0], root.resolve(
                 "net/minecraft/client/gui/screens/Screen.class"));
+        // Keep the actual resource-reload completion path intact while hiding
+        // only the foreground LoadingOverlay once a joined world is live.
+        // This is required for both the legacy mapped 1.21.11 profile and the
+        // current named 26.2 profile; the helper is deliberately separate
+        // from Minecraft#getOverlay so reload exceptions still reach vanilla.
+        patchLoadingOverlayBrowserForeground(args[0], root.resolve(
+                "net/minecraft/client/gui/screens/LoadingOverlay.class"));
         patchLevelLoadingScreenBrowserFastProgress(args[0], root.resolve(
                 "net/minecraft/client/gui/screens/LevelLoadingScreen.class"));
         patchTitleScreenBrowserFastMenus(args[0], root.resolve(
