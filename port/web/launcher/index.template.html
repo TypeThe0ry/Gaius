@@ -672,21 +672,58 @@
       z-index: 30;
       min-height: 36px;
       padding: 0 12px;
-      border: 2px solid var(--gaius-shell-line);
+      border: 2px solid #727272;
+      border-top-color: #d0d0d0;
+      border-left-color: #d0d0d0;
       border-radius: 0;
-      background: rgba(11, 17, 22, 0.96);
-      color: var(--gaius-shell-text);
-      font: 700 12px/1 Arial, Helvetica, sans-serif;
+      background: #555;
+      color: #fff;
+      font: 700 12px/1 "Courier New", monospace;
       letter-spacing: 0;
+      text-shadow: 1px 1px #222;
+      image-rendering: pixelated;
     }
 
     #profile-switch:hover,
     #profile-switch:focus-visible {
-      border-color: var(--gaius-shell-accent);
-      background: var(--gaius-shell-panel-strong);
-      outline: 2px solid var(--gaius-shell-text);
+      border-color: #fff;
+      border-top-color: #fff;
+      border-left-color: #fff;
+      background: #6b6b6b;
+      outline: 2px solid #fff;
       outline-offset: 2px;
     }
+
+    #profile-switch:active {
+      border-top-color: #727272;
+      border-left-color: #727272;
+      border-right-color: #d0d0d0;
+      border-bottom-color: #d0d0d0;
+    }
+
+    /* Minecraft-style name editor: title-screen only, never an in-world HUD. */
+    #mc-name-overlay[hidden] { display: none; }
+    #mc-name-overlay {
+      position: fixed; inset: 0; z-index: 80; display: grid; place-items: center;
+      padding: 24px; box-sizing: border-box; background: rgba(0, 0, 0, 0.64);
+      font-family: Arial, Helvetica, sans-serif;
+    }
+    #mc-name-panel {
+      width: min(420px, 100%); box-sizing: border-box; padding: 20px 22px 18px;
+      border: 2px solid #727272; border-top-color: #d0d0d0; border-left-color: #d0d0d0;
+      background: #2b2b2b; color: #fff; box-shadow: 0 0 0 2px #111, 0 12px 38px rgba(0, 0, 0, 0.65);
+    }
+    #mc-name-title { margin: 0 0 8px; color: #fff; font-size: 20px; line-height: 1.25; font-weight: 700; text-shadow: 2px 2px #111; }
+    #mc-name-current { margin: 0 0 16px; color: #c8c8c8; font-size: 12px; line-height: 1.45; }
+    #mc-name-panel label { display: block; margin: 0 0 6px; color: #fff; font-size: 12px; font-weight: 700; }
+    #mc-name-input { width: 100%; min-height: 38px; box-sizing: border-box; padding: 8px 10px; border: 2px solid #111; background: #181818; color: #fff; font: 14px/1.2 Arial, Helvetica, sans-serif; outline: 1px solid #727272; }
+    #mc-name-input:focus { outline: 2px solid #fff; outline-offset: 1px; }
+    #mc-name-error { min-height: 18px; margin: 8px 0 14px; color: #ff8080; font-size: 12px; line-height: 1.4; }
+    .mc-name-actions { display: flex; justify-content: flex-end; gap: 10px; }
+    .mc-name-actions button { min-width: 92px; min-height: 34px; padding: 0 14px; border: 2px solid #727272; border-top-color: #d0d0d0; border-left-color: #d0d0d0; background: #555; color: #fff; font: 700 12px/1 "Courier New", monospace; cursor: pointer; text-shadow: 1px 1px #222; image-rendering: pixelated; }
+    .mc-name-actions button:hover, .mc-name-actions button:focus-visible { background: #6b6b6b; outline: 2px solid #fff; outline-offset: 2px; }
+    .mc-name-actions button:active { border-top-color: #727272; border-left-color: #727272; border-right-color: #d0d0d0; border-bottom-color: #d0d0d0; }
+    .mc-name-actions button:disabled { cursor: wait; opacity: 0.6; }
 
     @media (max-width: 600px) {
       #gaius-shell-header {
@@ -762,6 +799,19 @@
     </form>
   </div>
   <button id="profile-switch" type="button" hidden>Change player name</button>
+  <div id="mc-name-overlay" hidden role="dialog" aria-modal="true" aria-labelledby="mc-name-title">
+    <div id="mc-name-panel">
+      <h2 id="mc-name-title">Change player name</h2>
+      <p id="mc-name-current">Changes apply to the next session.</p>
+      <label for="mc-name-input">Player name</label>
+      <input id="mc-name-input" type="text" maxlength="16" pattern="[A-Za-z0-9_]{1,16}" autocomplete="username" spellcheck="false">
+      <p id="mc-name-error" role="alert"></p>
+      <div class="mc-name-actions">
+        <button id="mc-name-cancel" type="button">Cancel</button>
+        <button id="mc-name-confirm" type="button">Done</button>
+      </div>
+    </div>
+  </div>
   <pre id="status" data-state="running" hidden>Starting Gaius Client template...</pre>
   <div id="gaius-error-actions" hidden>
     <button id="gaius-retry" type="button">Retry startup</button>
@@ -789,6 +839,12 @@
     const profileName = document.getElementById("profile-name");
     const profileError = document.getElementById("profile-error");
     const profileSwitch = document.getElementById("profile-switch");
+    const nameOverlay = document.getElementById("mc-name-overlay");
+    const nameInput = document.getElementById("mc-name-input");
+    const nameError = document.getElementById("mc-name-error");
+    const nameCancel = document.getElementById("mc-name-cancel");
+    const nameConfirm = document.getElementById("mc-name-confirm");
+    let nameOverlayPreviousFocus = null;
     const bootProgress = document.getElementById("boot-progress");
     const bootProgressBar = document.getElementById("boot-progress-bar");
     const bootProgressText = document.getElementById("boot-progress-text");
@@ -1095,6 +1151,9 @@
     let bootProgressLabel = "Initializing...";
     let bootLastProgressAt = performance.now();
     let bootWarnedStall = false;
+    // The branded shell owns only the first client startup. After the first
+    // usable main menu, world loading and resource reloads stay vanilla.
+    window.__gaiusInitialBootPending = true;
 
     function setBootProgress(value, label) {
       const next = Math.max(0, Math.min(100, Number(value) || 0));
@@ -1322,11 +1381,30 @@
     setInterval(() => {
       if (statusBox.dataset.state !== "running") return;
 	      const state = window.__gaiusMinecraftState;
+	      const screenName = state && state.screen ? String(state.screen) : "";
+	      const titleScreenReady = screenName === "TitleScreen"
+	        || screenName.endsWith(".TitleScreen");
+	      const titleScreenUsable = titleScreenReady
+        && state.running === true
+        && state.noRender !== true
+        && !state.overlay;
+      if (titleScreenUsable) {
+	        // The launcher handoff is complete at the first usable main menu.
+	        // World creation/join/reload must use Minecraft's own animation.
+	        window.__gaiusInitialBootPending = false;
+	        hideBootOverlay();
+	        return;
+	      }
 	      if (state && state.level) {
+	        window.__gaiusInitialBootPending = false;
 	        setBootProgress(100, "World ready");
 	        hideBootOverlay();
 	        return;
 	      }
+	      if (window.__gaiusInitialBootPending !== true) {
+        hideBootOverlay();
+        return;
+      }
 	      if (state && (state.overlay || state.screen)) {
 	        const overlay = state.overlay ? String(state.overlay).split(".").pop() : "";
 	        const screen = state.screen ? String(state.screen).split(".").pop() : "";
@@ -1470,7 +1548,73 @@
       });
     }
 
+    function isUsableGaiusTitleScreen(state) {
+      if (!state || state.running !== true || state.noRender === true || state.overlay) return false;
+      const screen = state.screen ? String(state.screen).split(".").pop() : "";
+      return screen === "TitleScreen";
+    }
+
+    function isNameEditorTitleScreen(state) {
+      return isUsableGaiusTitleScreen(state)
+        && String(window.__gaiusSessionMode || "offline").toLowerCase() !== "online";
+    }
+
+    function closeGaiusNameOverlay() {
+      if (!nameOverlay || nameOverlay.hidden) return;
+      nameOverlay.hidden = true;
+      if (nameError) nameError.textContent = "";
+      const previous = nameOverlayPreviousFocus;
+      nameOverlayPreviousFocus = null;
+      if (previous && typeof previous.focus === "function" && document.contains(previous)) previous.focus();
+    }
+
+    function openGaiusNameOverlay() {
+      if (!nameOverlay || !isNameEditorTitleScreen(window.__gaiusMinecraftState)) return;
+      nameOverlayPreviousFocus = document.activeElement;
+      let current = "";
+      try { current = localStorage.getItem("gaius.playerName") || ""; } catch (error) {
+        console.warn("Could not read the saved Gaius player name", error);
+      }
+      if (nameInput) nameInput.value = current;
+      if (nameError) nameError.textContent = "";
+      nameOverlay.hidden = false;
+      requestAnimationFrame(() => {
+        if (!nameOverlay.hidden && nameInput) { nameInput.focus(); nameInput.select(); }
+      });
+    }
+
+    function confirmGaiusNameOverlay() {
+      if (!nameInput || !nameOverlay || nameOverlay.hidden) return;
+      if (!isNameEditorTitleScreen(window.__gaiusMinecraftState)) {
+        closeGaiusNameOverlay();
+        return;
+      }
+      const username = nameInput.value.trim();
+      if (!/^[A-Za-z0-9_]{1,16}$/.test(username)) {
+        if (nameError) nameError.textContent = "Use 1-16 letters, numbers, or underscores.";
+        nameInput.focus();
+        return;
+      }
+      try {
+        localStorage.setItem("gaius.playerName", username);
+      } catch (error) {
+        if (nameError) nameError.textContent = "Could not save the player name.";
+        return;
+      }
+      try {
+        sessionStorage.setItem("gaius.pendingPlayerName", username);
+      } catch (error) {
+        if (nameError) nameError.textContent = "Could not prepare the next session.";
+        return;
+      }
+      if (nameConfirm) nameConfirm.disabled = true;
+      if (nameCancel) nameCancel.disabled = true;
+      closeGaiusNameOverlay();
+      changeGaiusPlayerName();
+    }
+
     function changeGaiusPlayerName() {
+      closeGaiusNameOverlay();
       if (profileSwitch) profileSwitch.disabled = true;
       try {
         sessionStorage.removeItem("gaius.session");
@@ -1494,14 +1638,68 @@
     function updateGaiusProfileSwitch() {
       if (!profileSwitch) return;
       const state = window.__gaiusMinecraftState;
-      const screen = state && state.screen
-        ? String(state.screen).split(".").pop()
-        : "";
-      profileSwitch.hidden = !profileGate || !profileGate.hidden || screen !== "TitleScreen";
+      const usableTitle = isNameEditorTitleScreen(state);
+      profileSwitch.hidden = !profileGate || !profileGate.hidden || !usableTitle;
+      if (!usableTitle) closeGaiusNameOverlay();
     }
 
     if (profileSwitch) {
-      profileSwitch.addEventListener("click", changeGaiusPlayerName);
+      profileSwitch.addEventListener("click", openGaiusNameOverlay);
+      if (nameCancel) nameCancel.addEventListener("click", closeGaiusNameOverlay);
+      if (nameConfirm) nameConfirm.addEventListener("click", confirmGaiusNameOverlay);
+      function isNameOverlayEvent(event) {
+        return !!(nameOverlay && !nameOverlay.hidden
+          && event.target && nameOverlay.contains(event.target));
+      }
+
+      function handleNameOverlayKeydown(event) {
+        if (!isNameOverlayEvent(event)) return false;
+        event.stopPropagation();
+        if (event.key === "Escape") {
+          event.preventDefault();
+          closeGaiusNameOverlay();
+          return true;
+        }
+        if (event.key === "Enter" && event.target === nameInput) {
+          event.preventDefault();
+          confirmGaiusNameOverlay();
+          return true;
+        }
+        if (event.key !== "Tab") return true;
+        const focusables = [nameInput, nameCancel, nameConfirm].filter(
+          element => element && !element.disabled
+        );
+        if (!focusables.length) return true;
+        const currentIndex = focusables.indexOf(document.activeElement);
+        const nextIndex = (currentIndex + (event.shiftKey ? -1 : 1) + focusables.length) % focusables.length;
+        event.preventDefault();
+        focusables[nextIndex].focus();
+        return true;
+      }
+
+      if (nameOverlay) {
+        nameOverlay.addEventListener("click", event => {
+          if (event.target === nameOverlay) closeGaiusNameOverlay();
+        });
+        // Capture keyboard events before GLFW/window listeners can forward them to the canvas.
+        window.addEventListener("keydown", event => {
+          if (handleNameOverlayKeydown(event)) event.stopImmediatePropagation();
+        }, true);
+        for (const eventType of ["keyup", "keypress"]) {
+          window.addEventListener(eventType, event => {
+            if (isNameOverlayEvent(event)) {
+              event.stopImmediatePropagation();
+            }
+          }, true);
+        }
+        // Bubble-stage fallback for embedders that do not dispatch window capture.
+        nameOverlay.addEventListener("keydown", event => {
+          handleNameOverlayKeydown(event);
+        });
+        for (const eventType of ["keyup", "keypress"]) {
+          nameOverlay.addEventListener(eventType, event => event.stopPropagation());
+        }
+      }
       setInterval(updateGaiusProfileSwitch, 250);
       updateGaiusProfileSwitch();
     }
@@ -1549,13 +1747,24 @@
         sessionStorage.setItem("gaius.session", JSON.stringify(session));
       }
       if (!online && !username) {
-        let rememberedName = "";
+        let pendingName = "";
         try {
-          rememberedName = localStorage.getItem("gaius.playerName") || "";
+          pendingName = sessionStorage.getItem("gaius.pendingPlayerName") || "";
+          if (pendingName) sessionStorage.removeItem("gaius.pendingPlayerName");
         } catch (error) {
-          console.warn("Could not read the remembered Gaius player name", error);
+          console.warn("Could not read the pending Gaius player name", error);
         }
-        username = await requestGaiusPlayerName(rememberedName);
+        if (/^[A-Za-z0-9_]{1,16}$/.test(pendingName)) {
+          username = pendingName;
+        } else {
+          let rememberedName = "";
+          try {
+            rememberedName = localStorage.getItem("gaius.playerName") || "";
+          } catch (error) {
+            console.warn("Could not read the remembered Gaius player name", error);
+          }
+          username = await requestGaiusPlayerName(rememberedName);
+        }
         session.username = username;
         session.uuid = uuid;
         sessionStorage.setItem("gaius.session", JSON.stringify(session));
@@ -3309,29 +3518,39 @@
         (urlParams.get("fresh") === "1" || urlParams.get("cache") === "0"
           ? "-fresh-" + Date.now()
           : "");
-      window.__gaiusSingleplayerWorkerUrl = new URL(
-        "singleplayer-server-worker.js?v=" + encodeURIComponent(singleplayerBuildToken),
-        location.href
-      ).href;
-      window.__gaiusSingleplayerServerUrl = new URL(
-        "singleplayer-server.js?v=" + encodeURIComponent(singleplayerBuildToken),
-        location.href
-      ).href;
-      window.__gaiusSingleplayerServerGzipUrl = new URL(
-        "singleplayer-server.js.gz?v=" + encodeURIComponent(singleplayerBuildToken),
-        location.href
-      ).href;
+      // Portable Gaius.html embeds these payloads as Blob URLs. Keep those
+      // URLs; replacing them with file:/// sibling paths makes the downloaded
+      // single-file client exit before its Worker can start.
+      if (window.__gaiusPortableBuild !== true) {
+        window.__gaiusSingleplayerWorkerUrl = new URL(
+          "singleplayer-server-worker.js?v=" + encodeURIComponent(singleplayerBuildToken),
+          location.href
+        ).href;
+        window.__gaiusSingleplayerServerUrl = new URL(
+          "singleplayer-server.js?v=" + encodeURIComponent(singleplayerBuildToken),
+          location.href
+        ).href;
+        window.__gaiusSingleplayerServerGzipUrl = new URL(
+          "singleplayer-server.js.gz?v=" + encodeURIComponent(singleplayerBuildToken),
+          location.href
+        ).href;
+      }
       bootTimings.classesStart = performance.now();
       setStatus("running", "Browser storage is ready (" + (window.__gaiusFsBackend || "unknown") + "); loading classes.js...", 24, "Loading the template client runtime...");
-      await waitForPaint();
-      bootTimings.beforeClassesPaint = performance.now();
-      await (window.__gaiusPortableAssetsReady || Promise.resolve());
-      setBootProgress(Math.max(bootProgressValue, 30), "Loading game assets...");
-      await window.__gaiusVanillaAssetsReady;
-      bootTimings.vanillaAssetsReady = performance.now();
+      // Fetch the large TeaVM bundle while the vanilla asset pack is being
+      // decoded.  Neither operation depends on the other until main(args),
+      // so serialising them added the full download/decode time to the first
+      // menu frame on a cold browser profile.
       const classesUrl = window.__gaiusClassesUrl ||
         ("classes.js?v=" + encodeURIComponent(buildToken));
-      await loadScript(classesUrl);
+      const classesReady = loadScript(classesUrl);
+      const portableReady = window.__gaiusPortableAssetsReady || Promise.resolve();
+      const vanillaReady = window.__gaiusVanillaAssetsReady || Promise.resolve();
+      await waitForPaint();
+      bootTimings.beforeClassesPaint = performance.now();
+      setBootProgress(Math.max(bootProgressValue, 30), "Loading game assets...");
+      await Promise.all([portableReady, vanillaReady, classesReady]);
+      bootTimings.vanillaAssetsReady = performance.now();
       if (typeof main !== "function") {
         setStatus("error", "The TeaVM build did not expose main(args).");
 	      } else {
