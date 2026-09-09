@@ -113,6 +113,9 @@ jobs:
       - name: Validate TeaVM Formatter percent regression
         run: |
           set -euo pipefail
+          # This fixture is profile-independent; the guard intentionally runs
+          # on JDK 21 even though the 26.2 release build uses JDK 25.
+          unset GAIUS_VERSION_PROFILE_PATH GAIUS_BUILD_ROOT GAIUS_OVERLAY_DIRECTORY GAIUS_DIST_DIRECTORY
           ./port/mvnw --batch-mode --no-transfer-progress \
             org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
             -Dartifact=org.teavm:teavm-tooling:0.15.0
