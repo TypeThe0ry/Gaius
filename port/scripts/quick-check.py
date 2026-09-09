@@ -4479,7 +4479,8 @@ def check_source_patches() -> None:
             and "GAIUS_SMOKE_SIMULATION_DISTANCE" in singleplayer_worker_runtime_smoke
             and "expectedStagedDistances = `1/1->${targetRenderDistance}/${targetSimulationDistance}`"
                 in singleplayer_worker_runtime_smoke
-            and "expectedTransitions.slice(0, -1)" in singleplayer_worker_runtime_smoke
+            and "const expectedTransitions = [expectedDistances]" in singleplayer_worker_runtime_smoke
+            and "const expectedDistanceRamp = []" in singleplayer_worker_runtime_smoke
             and 'message.type === "server-distances-ramping"' in singleplayer_worker_runtime_smoke
             and "GAIUS_SMOKE_DISTANCE_RAMP_MS" in singleplayer_worker_runtime_smoke
             and "expectedDistanceRamp" in singleplayer_worker_runtime_smoke

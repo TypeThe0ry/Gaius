@@ -2230,8 +2230,8 @@ if (isMainThread && !runtimeSelfTest) {
   const expectedStagedDistances = `1/1->${targetRenderDistance}/${targetSimulationDistance}`;
   // Distance updates are ACK-driven now.  The Worker stages the requested
   // pair and vanilla PlayerList owns subsequent changes; there is no private
-  // synthetic 2/1 -> ... ring to wait for.  Keep the transition contract
-  // explicit so runtime smoke fails if an obsolete ramp is reintroduced.
+  // Distance changes are ACK-driven.  Keep the transition contract explicit
+  // so runtime smoke fails if an obsolete synthetic ramp is reintroduced.
   const expectedDistances = `${targetRenderDistance}/${targetSimulationDistance}`;
   const expectedTransitions = [expectedDistances];
   const expectedDistanceRamp = [];
