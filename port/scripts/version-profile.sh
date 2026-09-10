@@ -86,11 +86,12 @@ gaius_load_version_profile() {
   export GAIUS_STORAGE_PREFIX GAIUS_STORAGE_OPFS_DIRECTORY
 }
 
-# Build-state paths are version-scoped when GAIUS_BUILD_ROOT is supplied.  The
-# legacy defaults intentionally remain unchanged so existing 26.2 commands
-# continue to publish to port/target and port/web/dist.  Release automation can
-# therefore build both profiles in separate invocations without changing
-# port/config.json or clobbering another profile's generated files:
+# Build-state paths are profile-scoped by default.  A caller may still provide
+# explicit roots for a disposable build, but a normal invocation must not
+# recreate the old shared port/target, port/work/overlays, or port/web/dist
+# outputs.  Release automation can therefore build both profiles in separate
+# invocations without changing port/config.json or clobbering another
+# profile's generated files:
 #
 #   GAIUS_VERSION_PROFILE_PATH=versions/1.21.11.json \
 #   GAIUS_BUILD_ROOT=port/target/1.21.11 \
@@ -98,9 +99,8 @@ gaius_load_version_profile() {
 #   GAIUS_DIST_DIRECTORY=port/web/dist/1.21.11 \
 #   port/scripts/build-teavm-release.sh
 #
-# Keep these as functions instead of exporting default values.  A child script
-# must be able to distinguish the historical default from an explicitly
-# isolated build root.
+# Keep these as functions instead of exporting default values so child scripts
+# can resolve the same profile-scoped roots.
 gaius_resolve_path() {
   local root="$1"
   local value="$2"
@@ -141,10 +141,8 @@ gaius_build_root() {
   local root="$1"
   if [[ -n "${GAIUS_BUILD_ROOT:-}" ]]; then
     gaius_resolve_path "$root" "$GAIUS_BUILD_ROOT"
-  elif [[ -n "${GAIUS_VERSION_PROFILE_PATH:-}" ]]; then
-    printf '%s\n' "$root/port/target/$GAIUS_MINECRAFT_VERSION"
   else
-    printf '%s\n' "$root/port/target"
+    printf '%s\n' "$root/port/target/$GAIUS_MINECRAFT_VERSION"
   fi
 }
 
@@ -152,10 +150,8 @@ gaius_dist_directory() {
   local root="$1"
   if [[ -n "${GAIUS_DIST_DIRECTORY:-}" ]]; then
     gaius_resolve_path "$root" "$GAIUS_DIST_DIRECTORY"
-  elif [[ -n "${GAIUS_BUILD_ROOT:-}" || -n "${GAIUS_VERSION_PROFILE_PATH:-}" ]]; then
-    printf '%s\n' "$root/port/web/dist/$GAIUS_MINECRAFT_VERSION"
   else
-    printf '%s\n' "$root/port/web/dist"
+    printf '%s\n' "$root/port/web/dist/$GAIUS_MINECRAFT_VERSION"
   fi
 }
 
@@ -163,10 +159,8 @@ gaius_overlay_directory() {
   local root="$1"
   if [[ -n "${GAIUS_OVERLAY_DIRECTORY:-}" ]]; then
     gaius_resolve_path "$root" "$GAIUS_OVERLAY_DIRECTORY"
-  elif [[ -n "${GAIUS_BUILD_ROOT:-}" || -n "${GAIUS_VERSION_PROFILE_PATH:-}" ]]; then
-    printf '%s\n' "$root/port/work/overlays/$GAIUS_MINECRAFT_VERSION"
   else
-    printf '%s\n' "$root/port/work/overlays"
+    printf '%s\n' "$root/port/work/overlays/$GAIUS_MINECRAFT_VERSION"
   fi
 }
 

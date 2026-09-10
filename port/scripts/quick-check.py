@@ -4903,6 +4903,7 @@ def check_source_patches() -> None:
             and "patchResolvedServerAddressBrowserUnresolved" in client_patcher
             and "getHostString" in client_patcher
             and "patchConnectionBrowserWebSocket" in client_patcher
+            and "patchCompressionDecoderBrowser" in client_patcher
             and "io/netty/channel/browser/BrowserWebSocketChannel" in client_patcher
             and "disableResolver" in client_patcher
             and "pumpBrowserChannelsAtFrameBoundary" in client_patcher,
