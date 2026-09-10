@@ -1,19 +1,51 @@
 "use strict";
 
-const PROTOCOL_VERSION = 774;
 const SERVER_PORT = 25565;
 const PROFILE_ID = "00000000000040008000000000000002";
 const SMOKE_TIMEOUT_MS = 240000;
 const STOP_TIMEOUT_MS = 30000;
-const DB_NAME = "gaius-fs-v1";
 const STORE_NAME = "files";
+const PLAY_PROTOCOLS = Object.freeze({
+  774: Object.freeze({
+    clientbound: Object.freeze({
+      disconnect: 32,
+      keepAlive: 43,
+      levelChunkWithLight: 44,
+      login: 48,
+      ping: 59,
+    }),
+    serverbound: Object.freeze({
+      chunkBatchReceived: 10,
+      keepAlive: 27,
+      playerLoaded: 43,
+      pong: 44,
+    }),
+  }),
+  776: Object.freeze({
+    clientbound: Object.freeze({
+      disconnect: 32,
+      keepAlive: 44,
+      levelChunkWithLight: 45,
+      login: 49,
+      ping: 61,
+    }),
+    serverbound: Object.freeze({
+      chunkBatchReceived: 11,
+      keepAlive: 28,
+      playerLoaded: 44,
+      pong: 45,
+    }),
+  }),
+});
 
 const runButton = document.getElementById("run");
 const statusNode = document.getElementById("status");
 const logNode = document.getElementById("log");
 const smokeState = globalThis.__gaiusSingleplayerWorkerSmoke = {
   state: "idle",
-  protocolVersion: PROTOCOL_VERSION,
+  versionProfile: null,
+  protocolVersion: null,
+  storage: null,
   events: [],
   compressionThreshold: null,
   loginFinished: false,
@@ -21,10 +53,12 @@ const smokeState = globalThis.__gaiusSingleplayerWorkerSmoke = {
   playPackets: 0,
   playLoginPackets: 0,
   chunkPackets: 0,
+  chunkBatchAckCount: 0,
   knownPackRequests: 0,
   loginProfileId: null,
   serverDistances: null,
   removedWorldFiles: 0,
+  diagnosticSnapshots: [],
 };
 
 runButton.addEventListener("click", () => {
@@ -48,6 +82,7 @@ async function runSmoke() {
   let stopped;
   let distancesActive;
   let worldId;
+  let storage;
   try {
     requireBrowserFeature("Worker", globalThis.Worker);
     requireBrowserFeature("MessageChannel", globalThis.MessageChannel);
@@ -59,20 +94,45 @@ async function runSmoke() {
     smokeState.sessionId = sessionId;
     smokeState.worldId = worldId;
 
+    const activeVersionProfile = await loadActiveVersionProfile();
+    const activeProtocolVersion = Number(activeVersionProfile.protocolVersion);
+    const activePlayProtocol = PLAY_PROTOCOLS[activeProtocolVersion];
+    if (!activePlayProtocol) {
+      throw new Error(
+        "No browser smoke PLAY packet table exists for protocol " + activeProtocolVersion
+      );
+    }
+    smokeState.versionProfile = activeVersionProfile.id;
+    smokeState.protocolVersion = activeProtocolVersion;
+    storage = storageConfigForProfile(activeVersionProfile);
+    smokeState.storage = storage;
+
     const version = new URLSearchParams(location.search).get("v") || "worker-smoke-v1";
     const workerUrl = new URL("../dist/singleplayer-server-worker.js", location.href);
     workerUrl.searchParams.set("v", version);
     const channel = new MessageChannel();
     clientPort = channel.port1;
-    const protocol = createProtocolClient(clientPort, sessionId);
+    const protocol = createProtocolClient(
+      clientPort,
+      sessionId,
+      activeProtocolVersion,
+      activePlayProtocol
+    );
     stopped = deferred();
     distancesActive = deferred();
     const failed = deferred();
+    const diagnosticResponses = [];
+    const diagnosticWaiters = [];
     worker = new Worker(workerUrl, {name: "Gaius singleplayer smoke server"});
 
     worker.onmessage = (event) => {
       const message = event.data || {};
       record("worker", message.type || "message", message.detail || "");
+      if (message.type === "diagnostic-snapshot") {
+        const waiter = diagnosticWaiters.shift();
+        if (waiter) waiter.resolve(message);
+        else diagnosticResponses.push(message);
+      }
       if (message.type === "server-created") {
         setTimeout(() => {
           worker.postMessage({
@@ -102,8 +162,15 @@ async function runSmoke() {
     worker.postMessage({
       type: "start",
       sessionId,
+      launchGeneration: "1",
       worldId,
       newWorld: true,
+      profileId: storage.profileId,
+      worldVersion: storage.worldVersion,
+      storageSchema: storage.storageSchema,
+      storageDatabaseName: storage.storageDatabaseName,
+      storagePrefix: storage.storagePrefix,
+      storageOpfsDirectory: storage.storageOpfsDirectory,
       renderDistance: 8,
       simulationDistance: 5,
       port: channel.port2,
@@ -123,8 +190,39 @@ async function runSmoke() {
     smokeState.playPackets = protocol.playPackets;
     smokeState.playLoginPackets = protocol.playLoginPackets;
     smokeState.chunkPackets = protocol.chunkPackets;
+    smokeState.chunkBatchAckCount = protocol.chunkBatchAckCount;
     smokeState.knownPackRequests = protocol.knownPackRequests;
     smokeState.loginProfileId = protocol.loginProfileId;
+    // Exercise the real Worker control channel without enabling continuous
+    // probes. Disabled snapshots intentionally contain no telemetry details.
+    worker.postMessage({type: "diagnostic-snapshot"});
+    const disabledSnapshot = await withTimeout(
+      nextDiagnosticSnapshot(diagnosticResponses, diagnosticWaiters),
+      5000,
+      "disabled diagnostic snapshot"
+    );
+    requireCondition(disabledSnapshot.enabled === false,
+      "Diagnostic snapshot leaked while slow probe was disabled");
+    worker.postMessage({type: "diagnostic-config", gaiusSlowProbeTelemetry: true});
+    worker.postMessage({type: "diagnostic-snapshot"});
+    const enabledSnapshot = await withTimeout(
+      nextDiagnosticSnapshot(diagnosticResponses, diagnosticWaiters),
+      5000,
+      "enabled diagnostic snapshot"
+    );
+    requireCondition(enabledSnapshot.enabled === true,
+      "Diagnostic snapshot did not enable");
+    requireDiagnosticSnapshot(enabledSnapshot);
+    worker.postMessage({type: "diagnostic-config", gaiusSlowProbeTelemetry: false});
+    worker.postMessage({type: "diagnostic-snapshot"});
+    const reDisabledSnapshot = await withTimeout(
+      nextDiagnosticSnapshot(diagnosticResponses, diagnosticWaiters),
+      5000,
+      "re-disabled diagnostic snapshot"
+    );
+    requireCondition(reDisabledSnapshot.enabled === false,
+      "Diagnostic snapshot did not disable");
+    smokeState.diagnosticSnapshots = [disabledSnapshot, enabledSnapshot, reDisabledSnapshot];
     setState("running", "PLAY and chunk data passed; stopping server cleanly");
     protocol.closeTransport();
     worker.postMessage({type: "stop"});
@@ -138,20 +236,29 @@ async function runSmoke() {
     worker = undefined;
     clientPort = undefined;
 
-    smokeState.removedWorldFiles = await removeSmokeWorld(worldId);
+    smokeState.removedWorldFiles = await removeSmokeWorld(
+      worldId,
+      storage.storageDatabaseName,
+    );
     smokeState.finishedAt = Date.now();
     setState("passed", "Gaius singleplayer Worker smoke passed");
     record("result", "passed", JSON.stringify({
-      protocolVersion: PROTOCOL_VERSION,
+      protocolVersion: activeProtocolVersion,
       compressionThreshold: smokeState.compressionThreshold,
       configurationPackets: smokeState.configurationPackets,
       playPackets: smokeState.playPackets,
       playLoginPackets: smokeState.playLoginPackets,
       chunkPackets: smokeState.chunkPackets,
+      chunkBatchAckCount: smokeState.chunkBatchAckCount,
       knownPackRequests: smokeState.knownPackRequests,
       loginProfileId: smokeState.loginProfileId,
       serverDistances: smokeState.serverDistances,
       removedWorldFiles: smokeState.removedWorldFiles,
+      diagnosticSnapshots: smokeState.diagnosticSnapshots.map((snapshot) => ({
+        enabled: snapshot.enabled,
+        keys: Object.keys(snapshot),
+        serializedLength: JSON.stringify(snapshot).length,
+      })),
     }));
   } catch (error) {
     smokeState.error = String(error && (error.stack || error.message) || error);
@@ -171,9 +278,12 @@ async function runSmoke() {
     if (clientPort) {
       clientPort.close();
     }
-    if (worldId) {
+    if (worldId && storage) {
       try {
-        smokeState.removedWorldFiles = await removeSmokeWorld(worldId);
+        smokeState.removedWorldFiles = await removeSmokeWorld(
+          worldId,
+          storage.storageDatabaseName,
+        );
       } catch (cleanupError) {
         record("cleanup", "failed", String(cleanupError));
       }
@@ -183,9 +293,47 @@ async function runSmoke() {
   }
 }
 
-function createProtocolClient(port, sessionId) {
+function nextDiagnosticSnapshot(responses, waiters) {
+  if (responses.length > 0) return Promise.resolve(responses.shift());
+  const pending = deferred();
+  waiters.push(pending);
+  return pending.promise;
+}
+
+function requireDiagnosticSnapshot(snapshot) {
+  requireCondition(JSON.stringify(snapshot).length <= 4 * 4096 + 256,
+    "Diagnostic snapshot exceeded bounded response length");
+  for (const key of [
+    "worldgenSchedulerMarker",
+    "futurePumpTelemetry",
+    "worldgenStats",
+    "serverTickTelemetry",
+  ]) {
+    const value = snapshot[key];
+    requireCondition(value && typeof value === "object" && !Array.isArray(value),
+      "Diagnostic snapshot field is not a shallow object: " + key);
+    for (const [field, nested] of Object.entries(value)) {
+      requireCondition(nested === null || typeof nested !== "object",
+        "Diagnostic snapshot included nested telemetry: " + key);
+      if (typeof nested === "number") {
+        requireCondition(Number.isFinite(nested),
+          "Diagnostic snapshot included a non-finite value: " + key);
+      }
+      if (typeof nested === "string") {
+        const maxLength = ["maxSliceContext", "maxTaskContext", "chunkHolderProbeMaxContext"].includes(field)
+          ? 1024
+          : 256;
+        requireCondition(nested.length <= maxLength,
+          "Diagnostic snapshot string exceeded bound: " + key);
+      }
+    }
+  }
+}
+
+function createProtocolClient(port, sessionId, protocolVersion, playProtocol) {
   const ready = deferred();
   const host = "client-" + sessionId + ".gaius-local";
+  const {clientbound: clientboundPlay, serverbound: serverboundPlay} = playProtocol;
   let buffered = new Uint8Array(0);
   let packetWork = Promise.resolve();
   let remotePaused = false;
@@ -204,6 +352,9 @@ function createProtocolClient(port, sessionId) {
     loginProfileId: undefined,
     playerLoadedSent: false,
     chunkBatchAckSent: false,
+    chunkBatchAckCount: 0,
+    chunkBatchAckTimer: undefined,
+    lastAckedChunkPackets: 0,
     playReady: ready.promise,
     startLogin,
     closeTransport,
@@ -244,7 +395,7 @@ function createProtocolClient(port, sessionId) {
     loginStarted = true;
     record("protocol", "handshake", host + ":" + SERVER_PORT);
     const handshake = concatenateMany([
-      encodeVarInt(PROTOCOL_VERSION),
+      encodeVarInt(protocolVersion),
       encodeString(host),
       new Uint8Array([(SERVER_PORT >>> 8) & 0xff, SERVER_PORT & 0xff]),
       encodeVarInt(2),
@@ -349,32 +500,59 @@ function createProtocolClient(port, sessionId) {
       }
     } else if (state.phase === "play") {
       state.playPackets++;
-      if (packetId.value === 32) {
+      if (packetId.value === clientboundPlay.disconnect) {
         throw new Error("Official server disconnected after entering PLAY");
       }
-      if (packetId.value === 43) {
-        send(encodePacket(27, payload, state.compressionThreshold));
-      } else if (packetId.value === 59) {
-        send(encodePacket(44, payload, state.compressionThreshold));
-      } else if (packetId.value === 48) {
+      if (packetId.value === clientboundPlay.keepAlive) {
+        send(encodePacket(serverboundPlay.keepAlive, payload, state.compressionThreshold));
+      } else if (packetId.value === clientboundPlay.ping) {
+        send(encodePacket(serverboundPlay.pong, payload, state.compressionThreshold));
+      } else if (packetId.value === clientboundPlay.login) {
         state.playLoginPackets++;
         record("protocol", "play-login", String(state.playLoginPackets));
         if (!state.playerLoadedSent) {
           state.playerLoadedSent = true;
-          send(encodePacket(43, new Uint8Array(0), state.compressionThreshold));
+          send(encodePacket(
+            serverboundPlay.playerLoaded,
+            new Uint8Array(0),
+            state.compressionThreshold
+          ));
         }
-      } else if (packetId.value === 44) {
+      } else if (packetId.value === clientboundPlay.levelChunkWithLight) {
         state.chunkPackets++;
         record("protocol", "chunk", String(state.chunkPackets));
-        if (!state.chunkBatchAckSent) {
-          state.chunkBatchAckSent = true;
-          send(encodePacket(10, encodeFloat(10), state.compressionThreshold));
-        }
+        maybeScheduleChunkBatchAck();
       }
       if (state.playLoginPackets > 0 && state.chunkPackets > 0) {
         ready.resolve();
       }
     }
+  }
+
+  function maybeScheduleChunkBatchAck() {
+    if (state.chunkBatchAckTimer !== undefined ||
+        state.chunkPackets <= state.lastAckedChunkPackets) {
+      return;
+    }
+    state.chunkBatchAckTimer = setTimeout(() => {
+      state.chunkBatchAckTimer = undefined;
+      if (state.chunkPackets <= state.lastAckedChunkPackets) {
+        return;
+      }
+      state.lastAckedChunkPackets = state.chunkPackets;
+      state.chunkBatchAckSent = true;
+      state.chunkBatchAckCount++;
+      record(
+        "protocol",
+        "chunk-batch-ack",
+        state.chunkBatchAckCount + ":" + state.lastAckedChunkPackets
+      );
+      send(encodePacket(
+        serverboundPlay.chunkBatchReceived,
+        encodeFloat(10),
+        state.compressionThreshold
+      ));
+    }, 200);
   }
 
   function send(bytes) {
@@ -391,6 +569,48 @@ function createProtocolClient(port, sessionId) {
   }
 
   return state;
+}
+
+async function loadActiveVersionProfile() {
+  const response = await fetch("../dist/classes.js.build.json", {cache: "no-store"});
+  if (!response.ok) {
+    throw new Error("Could not load the active client build identity: " + response.status);
+  }
+  const buildIdentity = await response.json();
+  if (!buildIdentity || buildIdentity.kind !== "gaius-build-identity" ||
+      buildIdentity.role !== "client") {
+    throw new Error("The active client build identity is invalid");
+  }
+  const activeVersionProfile = buildIdentity.profile;
+  if (!activeVersionProfile || typeof activeVersionProfile.id !== "string" ||
+      !Number.isSafeInteger(Number(activeVersionProfile.protocolVersion))) {
+    throw new Error("The active client version profile is invalid");
+  }
+  return activeVersionProfile;
+}
+
+function storageConfigForProfile(profile) {
+  const profileId = String(profile?.id || "");
+  const worldVersion = Number(profile?.worldVersion);
+  const storage = profile?.storage || {};
+  const result = {
+    profileId,
+    worldVersion,
+    storageSchema: Number(storage.schema),
+    storageDatabaseName: String(storage.databaseName || ""),
+    storagePrefix: String(storage.prefix || ""),
+    storageOpfsDirectory: String(storage.opfsDirectory || ""),
+  };
+  if (!result.profileId || !Number.isSafeInteger(result.worldVersion) ||
+      result.worldVersion <= 0 || result.storageSchema !== 2 ||
+      result.storageDatabaseName !== `gaius-fs-v2-${result.profileId}` ||
+      result.storagePrefix !== `gaius.fs.v2:${result.profileId}:` ||
+      result.storageOpfsDirectory !== `regions-v2-${result.profileId}`) {
+    throw new Error(
+      "The active client version profile has an invalid schema-2 storage namespace",
+    );
+  }
+  return Object.freeze(result);
 }
 
 function encodePacket(id, payload, compressionThreshold) {
@@ -503,8 +723,8 @@ function randomSessionId() {
   return value;
 }
 
-async function removeSmokeWorld(worldId) {
-  const database = await openDatabase();
+async function removeSmokeWorld(worldId, storageDatabaseName) {
+  const database = await openDatabase(storageDatabaseName);
   const prefix = "/gaius/saves/" + worldId;
   let removed = 0;
   await new Promise((resolve, reject) => {
@@ -531,9 +751,9 @@ async function removeSmokeWorld(worldId) {
   return removed;
 }
 
-function openDatabase() {
+function openDatabase(storageDatabaseName) {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 1);
+    const request = indexedDB.open(storageDatabaseName, 2);
     request.onupgradeneeded = () => {
       const database = request.result;
       if (!database.objectStoreNames.contains(STORE_NAME)) {
@@ -561,6 +781,12 @@ function deferred() {
   return {promise, resolve, reject};
 }
 
+function requireCondition(condition, message) {
+  if (!condition) {
+    throw new Error(message);
+  }
+}
+
 function withTimeout(promise, timeoutMs, label) {
   return Promise.race([
     promise,
@@ -586,12 +812,16 @@ function resetState() {
   smokeState.finishedAt = undefined;
   smokeState.error = undefined;
   smokeState.events.length = 0;
+  smokeState.versionProfile = null;
+  smokeState.protocolVersion = null;
+  smokeState.storage = null;
   smokeState.compressionThreshold = null;
   smokeState.loginFinished = false;
   smokeState.configurationPackets = 0;
   smokeState.playPackets = 0;
   smokeState.playLoginPackets = 0;
   smokeState.chunkPackets = 0;
+  smokeState.chunkBatchAckCount = 0;
   smokeState.knownPackRequests = 0;
   smokeState.loginProfileId = null;
   smokeState.serverDistances = null;

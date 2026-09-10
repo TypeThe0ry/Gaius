@@ -48,7 +48,12 @@ INTEGRATED_SERVER_EXPORT_PATTERN = re.compile(
 )
 
 RUNTIME_THREAD_START_PATTERN = re.compile(
-    r"(?P<runtime>[A-Za-z_$][A-Za-z0-9_$]*)\.\$rt_startThread\s*="
+    r"(?P<call>[A-Za-z_$][A-Za-z0-9_$]*\.\$rt_startThread)\s*="
+)
+
+MINIFIED_RUNTIME_THREAD_START_PATTERN = re.compile(
+    r"(?P<call>[A-Za-z_$][A-Za-z0-9_$]*\.[A-Za-z_$][A-Za-z0-9_$]*)"
+    r"\(\(\)=>\{f\.call\(null,javaArgs\);\},callback\);"
 )
 
 
@@ -63,61 +68,114 @@ def patched_to_long(match: re.Match[str]) -> str:
     )
 
 
-def integrated_server_pump_shim(exports: str, runtime: str) -> str:
+def integrated_server_pump_shim(exports: str, runtime_start_call: str) -> str:
     return f"""
 {INTEGRATED_SERVER_PUMP_MARKER}
 let $gaiusIntegratedServerPumpRunning = false;
 let $gaiusIntegratedServerPumpPending = false;
+let $gaiusIntegratedServerPumpDispatchScheduled = false;
+let $gaiusIntegratedServerPumpRetryTimer = 0;
+let $gaiusIntegratedServerPumpRetryCount = 0;
+const $gaiusIntegratedServerPumpMaxRetries = 4;
 const $gaiusScheduleIntegratedServerPump = typeof queueMicrotask === 'function'
     ? queueMicrotask
     : callback => Promise.resolve().then(callback);
+const $gaiusScheduleIntegratedServerPumpRetry = (callback, delay) => {{
+    if (typeof setTimeout === 'function') return setTimeout(callback, delay);
+    $gaiusScheduleIntegratedServerPump(callback);
+    return 1;
+}};
 {exports}.__gaiusStartIntegratedServerPump = () => {{
     const stats = globalThis.__gaiusNetworkStats;
     if (stats) {{
         stats.integratedServerPumpRequests =
-            (stats.integratedServerPumpRequests || 0) + 1;
+            Number(stats.integratedServerPumpRequests) || 0;
+        stats.integratedServerPumpStarts =
+            Number(stats.integratedServerPumpStarts) || 0;
+        stats.integratedServerPumpFailures =
+            Number(stats.integratedServerPumpFailures) || 0;
+        stats.integratedServerPumpCoalesced =
+            Number(stats.integratedServerPumpCoalesced) || 0;
+        stats.integratedServerPumpRetrySchedules =
+            Number(stats.integratedServerPumpRetrySchedules) || 0;
+        stats.integratedServerPumpRetryExhaustions =
+            Number(stats.integratedServerPumpRetryExhaustions) || 0;
+        stats.integratedServerPumpRequests =
+            stats.integratedServerPumpRequests + 1;
     }}
-    if ($gaiusIntegratedServerPumpRunning) {{
+    if ($gaiusIntegratedServerPumpRunning ||
+        $gaiusIntegratedServerPumpDispatchScheduled ||
+        $gaiusIntegratedServerPumpRetryTimer) {{
         $gaiusIntegratedServerPumpPending = true;
         if (stats) {{
             stats.integratedServerPumpCoalesced =
-                (stats.integratedServerPumpCoalesced || 0) + 1;
+                stats.integratedServerPumpCoalesced + 1;
         }}
         return;
     }}
-    const run = () => {{
+    $gaiusIntegratedServerPumpRetryCount = 0;
+    let run;
+    const fail = error => {{
+        $gaiusIntegratedServerPumpRunning = false;
+        $gaiusIntegratedServerPumpPending = true;
+        globalThis.__gaiusIntegratedServerPumpError =
+            String(error && (error.stack || error) || error);
+        if (stats) {{
+            stats.integratedServerPumpFailures =
+                stats.integratedServerPumpFailures + 1;
+        }}
+        if ($gaiusIntegratedServerPumpRetryCount <
+            $gaiusIntegratedServerPumpMaxRetries) {{
+            $gaiusIntegratedServerPumpRetryCount++;
+            if (stats) {{
+                stats.integratedServerPumpRetrySchedules =
+                    stats.integratedServerPumpRetrySchedules + 1;
+            }}
+            const delay = Math.min(
+                8,
+                1 << Math.min(3, $gaiusIntegratedServerPumpRetryCount - 1)
+            );
+            $gaiusIntegratedServerPumpRetryTimer =
+                $gaiusScheduleIntegratedServerPumpRetry(() => {{
+                    $gaiusIntegratedServerPumpRetryTimer = 0;
+                    if ($gaiusIntegratedServerPumpPending) run();
+                }}, delay);
+        }} else {{
+            $gaiusIntegratedServerPumpPending = false;
+            if (stats) {{
+                stats.integratedServerPumpRetryExhaustions =
+                    stats.integratedServerPumpRetryExhaustions + 1;
+            }}
+        }}
+    }};
+    run = () => {{
         $gaiusIntegratedServerPumpPending = false;
         $gaiusIntegratedServerPumpRunning = true;
         if (stats) {{
             stats.integratedServerPumpStarts =
-                (stats.integratedServerPumpStarts || 0) + 1;
+                stats.integratedServerPumpStarts + 1;
         }}
         try {{
-            {runtime}.$rt_startThread(
+            {runtime_start_call}(
                 () => {exports}.pumpIntegratedServerNetworkInput(),
                 result => {{
-                    $gaiusIntegratedServerPumpRunning = false;
                     if (result instanceof Error) {{
-                        globalThis.__gaiusIntegratedServerPumpError =
-                            String(result.stack || result);
-                        if (stats) {{
-                            stats.integratedServerPumpFailures =
-                                (stats.integratedServerPumpFailures || 0) + 1;
-                        }}
+                        fail(result);
+                        return;
                     }}
+                    $gaiusIntegratedServerPumpRunning = false;
+                    $gaiusIntegratedServerPumpRetryCount = 0;
                     if ($gaiusIntegratedServerPumpPending) {{
-                        $gaiusScheduleIntegratedServerPump(run);
+                        $gaiusIntegratedServerPumpDispatchScheduled = true;
+                        $gaiusScheduleIntegratedServerPump(() => {{
+                            $gaiusIntegratedServerPumpDispatchScheduled = false;
+                            if ($gaiusIntegratedServerPumpPending) run();
+                        }});
                     }}
                 }}
             );
         }} catch (error) {{
-            $gaiusIntegratedServerPumpRunning = false;
-            globalThis.__gaiusIntegratedServerPumpError =
-                String(error && (error.stack || error) || error);
-            if (stats) {{
-                stats.integratedServerPumpFailures =
-                    (stats.integratedServerPumpFailures || 0) + 1;
-            }}
+            fail(error);
         }}
     }};
     run();
@@ -143,11 +201,14 @@ def write_text_atomically(target: Path, text: str) -> None:
             os.fsync(temporary.fileno())
         os.replace(temporary_name, target)
         temporary_name = None
-        directory_fd = os.open(target.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        # Windows cannot open a directory for fsync; the replace above is still
+        # atomic, so durability of the directory entry is best-effort there.
+        if os.name != "nt":
+            directory_fd = os.open(target.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     finally:
         if temporary_name is not None:
             try:
@@ -208,6 +269,8 @@ def main(argv: list[str]) -> int:
             f"Patched TeaVM JS finite-safe long conversion in {target} (1 occurrence)."
         )
 
+    # ADVANCED output may still retain whitespace when diagnostics disable
+    # minification. Match the semantic export instead of one formatted spelling.
     worker_export = INTEGRATED_SERVER_EXPORT_PATTERN.search(patched)
     if worker_export is not None:
         if INTEGRATED_SERVER_PUMP_MARKER in patched:
@@ -216,6 +279,8 @@ def main(argv: list[str]) -> int:
             )
         else:
             runtime = RUNTIME_THREAD_START_PATTERN.search(patched)
+            if runtime is None:
+                runtime = MINIFIED_RUNTIME_THREAD_START_PATTERN.search(patched)
             if runtime is None:
                 print(
                     f"TeaVM native thread starter was not found in {target}; "
@@ -226,7 +291,7 @@ def main(argv: list[str]) -> int:
             insert_at = worker_export.end()
             shim = integrated_server_pump_shim(
                 worker_export.group("exports"),
-                runtime.group("runtime"),
+                runtime.group("call"),
             )
             patched = patched[:insert_at] + shim + patched[insert_at:]
             messages.append(f"Injected TeaVM server Worker coroutine input pump in {target}.")

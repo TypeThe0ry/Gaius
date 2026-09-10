@@ -1,7 +1,6 @@
 package net.minecraft;
 
 import java.util.LinkedHashMap;
-import java.util.Locale;
 import java.util.Map;
 import java.util.function.Supplier;
 
@@ -38,6 +37,14 @@ public class SystemReport {
         }
     }
 
+    public void setDetail(String name, CrashReportDetail<Object> value) {
+        try {
+            setDetail(name, String.valueOf(value.call()));
+        } catch (Throwable throwable) {
+            setDetail(name, "ERR");
+        }
+    }
+
     public static float sizeInMiB(long bytes) {
         return (float) bytes / BYTES_PER_MEBIBYTE;
     }
@@ -50,7 +57,7 @@ public class SystemReport {
     public String toLineSeparatedString() {
         StringBuilder output = new StringBuilder();
         entries.forEach((name, value) -> output
-                .append(String.format(Locale.ROOT, "%s: %s%n", name, value)));
+                .append(name).append(": ").append(value).append('\n'));
         return output.toString();
     }
 }

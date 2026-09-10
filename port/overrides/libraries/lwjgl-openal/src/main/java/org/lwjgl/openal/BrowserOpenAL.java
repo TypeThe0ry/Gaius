@@ -55,8 +55,28 @@ public final class BrowserOpenAL {
     private static final int AL_GAIN = 0x100A;
     private static final int AL_PITCH = 0x1003;
     private static final int AL_POSITION = 0x1004;
+    private static final int AL_DIRECTION = 0x1005;
+    private static final int AL_VELOCITY = 0x1006;
     private static final int AL_LOOPING = 0x1007;
     private static final int AL_BUFFER = 0x1009;
+    private static final int AL_SOURCE_RELATIVE = 0x0202;
+    private static final int AL_MIN_GAIN = 0x100D;
+    private static final int AL_MAX_GAIN = 0x100E;
+    private static final int AL_ORIENTATION = 0x100F;
+    private static final int AL_CONE_INNER_ANGLE = 0x1001;
+    private static final int AL_CONE_OUTER_ANGLE = 0x1002;
+    private static final int AL_CONE_OUTER_GAIN = 0x1022;
+    private static final int AL_REFERENCE_DISTANCE = 0x1020;
+    private static final int AL_ROLLOFF_FACTOR = 0x1021;
+    private static final int AL_MAX_DISTANCE = 0x1023;
+    private static final int AL_DISTANCE_MODEL = 0xD000;
+    private static final int AL_NONE = 0x0000;
+    private static final int AL_INVERSE_DISTANCE = 0xD001;
+    private static final int AL_INVERSE_DISTANCE_CLAMPED = 0xD002;
+    private static final int AL_LINEAR_DISTANCE = 0xD003;
+    private static final int AL_LINEAR_DISTANCE_CLAMPED = 0xD004;
+    private static final int AL_EXPONENT_DISTANCE = 0xD005;
+    private static final int AL_EXPONENT_DISTANCE_CLAMPED = 0xD006;
     private static final int AL_SOURCE_STATE = 0x1010;
     private static final int AL_BUFFERS_QUEUED = 0x1015;
     private static final int AL_BUFFERS_PROCESSED = 0x1016;
@@ -64,6 +84,25 @@ public final class BrowserOpenAL {
     private static final int AL_BITS = 0x2002;
     private static final int AL_CHANNELS = 0x2003;
     private static final int AL_SIZE = 0x2004;
+    private static final int ALC_MAJOR_VERSION = 0x1000;
+    private static final int ALC_MINOR_VERSION = 0x1001;
+    private static final int ALC_ATTRIBUTES_SIZE = 0x1002;
+    private static final int ALC_ALL_ATTRIBUTES = 0x1003;
+    private static final int ALC_FREQUENCY = 0x1007;
+    private static final int ALC_REFRESH = 0x1008;
+    private static final int ALC_SYNC = 0x1009;
+    private static final int ALC_MONO_SOURCES = 0x1010;
+    private static final int ALC_STEREO_SOURCES = 0x1011;
+    private static final int ALC_CONNECTED = 0x0313;
+    private static final int ALC_NUM_HRTF_SPECIFIERS_SOFT = 0x1994;
+    private static final int[] ALC_ATTRIBUTES = {
+            ALC_FREQUENCY, 48_000,
+            ALC_REFRESH, 60,
+            ALC_SYNC, 0,
+            ALC_MONO_SOURCES, 30,
+            ALC_STEREO_SOURCES, 8,
+            0
+    };
 
     private BrowserOpenAL() {
     }
@@ -73,12 +112,26 @@ public final class BrowserOpenAL {
               return;
             }
             const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+            const DEFAULT_FORWARD = [0, 0, -1];
+            const DEFAULT_UP = [0, 1, 0];
             const state = {
               next: 1,
               context: null,
               buffers: new Map(),
               sources: new Map(),
               resumeHooked: false,
+              masterGainNode: null,
+              directionalAudio: false,
+              listener: {
+                gain: 1,
+                position: [0, 0, 0],
+                velocity: [0, 0, 0],
+                forward: [0, 0, -1],
+                up: [0, 1, 0],
+                normalizedForward: [0, 0, -1],
+                normalizedUp: [0, 1, 0]
+              },
+              distanceModel: 0xD002,
               stats: {
                 initialized: true,
                 backend: 'WebAudio',
@@ -90,18 +143,148 @@ public final class BrowserOpenAL {
                 queuedBuffers: 0,
                 unqueuedBuffers: 0,
                 activeSources: 0,
+                webAudioNodesCreated: 0,
+                webAudioNodesDisposed: 0,
+                webAudioConnections: 0,
+                webAudioDisconnects: 0,
+                webAudioNaturalEnds: 0,
+                directionalAudio: false,
+                panningModel: 'equalpower',
+                hrtfFallbacks: 0,
                 lastFormat: 0,
                 lastFrequency: 0,
                 lastUploadBytes: 0,
                 contextState: AudioContextClass ? 'created-lazily' : 'unavailable'
               }
             };
+            function setParam(param, value) {
+              if (!param) return;
+              try {
+                if (state.context && typeof param.setValueAtTime === 'function') {
+                  param.setValueAtTime(Number(value) || 0, state.context.currentTime);
+                } else {
+                  param.value = Number(value) || 0;
+                }
+              } catch (ignored) {
+                try { param.value = Number(value) || 0; } catch (ignoredAgain) {}
+              }
+            }
+            function finiteNumber(value, fallback) {
+              const number = Number(value);
+              return Number.isFinite(number) ? number : fallback;
+            }
+            function setVector(target, x, y, z, fallbackX, fallbackY, fallbackZ) {
+              target[0] = finiteNumber(x, fallbackX === undefined ? 0 : fallbackX);
+              target[1] = finiteNumber(y, fallbackY === undefined ? 0 : fallbackY);
+              target[2] = finiteNumber(z, fallbackZ === undefined ? 0 : fallbackZ);
+              return target;
+            }
+            function normalizedVector(value, fallback, target) {
+              const x = finiteNumber(value && value[0], fallback[0]);
+              const y = finiteNumber(value && value[1], fallback[1]);
+              const z = finiteNumber(value && value[2], fallback[2]);
+              const length = Math.hypot(x, y, z);
+              const output = target || [0, 0, 0];
+              if (!(length > 0.000001)) {
+                output[0] = fallback[0];
+                output[1] = fallback[1];
+                output[2] = fallback[2];
+                return output;
+              }
+              output[0] = x / length;
+              output[1] = y / length;
+              output[2] = z / length;
+              return output;
+            }
+            function validDistanceModel(model) {
+              model = model|0;
+              if (model === 0x0000
+                  || model === 0xD001
+                  || model === 0xD002
+                  || model === 0xD003
+                  || model === 0xD004
+                  || model === 0xD005
+                  || model === 0xD006) {
+                return model;
+              }
+              return 0xD002;
+            }
+            function effectiveDistanceModel(source) {
+              return validDistanceModel(source && source.distanceModel != null
+                ? source.distanceModel : state.distanceModel);
+            }
+            function distanceModelName(model) {
+              model = validDistanceModel(model);
+              if (model === 0xD003 || model === 0xD004) return 'linear';
+              if (model === 0xD005 || model === 0xD006) return 'exponential';
+              return 'inverse';
+            }
+            function applyPanningModel(panner) {
+              if (!panner) return;
+              const requested = state.directionalAudio ? 'HRTF' : 'equalpower';
+              try {
+                panner.panningModel = requested;
+                const applied = String(panner.panningModel || requested);
+                state.stats.panningModel = applied;
+                if (state.directionalAudio && applied.toUpperCase() !== 'HRTF') {
+                  state.stats.hrtfFallbacks++;
+                }
+              } catch (error) {
+                state.stats.lastError = String(error && (error.message || error));
+                if (requested !== 'equalpower') {
+                  try { panner.panningModel = 'equalpower'; } catch (ignored) {}
+                  state.stats.panningModel = 'equalpower';
+                  state.stats.hrtfFallbacks++;
+                }
+              }
+            }
+            function applyListener() {
+              const ctx = state.context;
+              if (!ctx || !ctx.listener) return;
+              const listener = ctx.listener;
+              const p = state.listener.position;
+              const v = state.listener.velocity;
+              const f = normalizedVector(
+                state.listener.forward, DEFAULT_FORWARD, state.listener.normalizedForward);
+              const u = normalizedVector(
+                state.listener.up, DEFAULT_UP, state.listener.normalizedUp);
+              try {
+                if (listener.positionX) {
+                  setParam(listener.positionX, p[0]);
+                  setParam(listener.positionY, p[1]);
+                  setParam(listener.positionZ, p[2]);
+                } else if (listener.setPosition) {
+                  listener.setPosition(p[0], p[1], p[2]);
+                }
+                if (listener.forwardX) {
+                  setParam(listener.forwardX, f[0]);
+                  setParam(listener.forwardY, f[1]);
+                  setParam(listener.forwardZ, f[2]);
+                  setParam(listener.upX, u[0]);
+                  setParam(listener.upY, u[1]);
+                  setParam(listener.upZ, u[2]);
+                } else if (listener.setOrientation) {
+                  listener.setOrientation(f[0], f[1], f[2], u[0], u[1], u[2]);
+                }
+                if (listener.velocityX) {
+                  setParam(listener.velocityX, v[0]);
+                  setParam(listener.velocityY, v[1]);
+                  setParam(listener.velocityZ, v[2]);
+                } else if (listener.setVelocity) {
+                  listener.setVelocity(v[0], v[1], v[2]);
+                }
+              } catch (error) {
+                state.stats.lastError = String(error && (error.message || error));
+              }
+              if (state.masterGainNode) setParam(state.masterGainNode.gain, state.listener.gain);
+            }
             function ensureContext() {
               if (!AudioContextClass) return null;
               if (!state.context) {
                 try {
                   state.context = new AudioContextClass();
                   state.stats.contextState = state.context.state || 'unknown';
+                  applyListener();
                 } catch (error) {
                   state.stats.contextState = 'failed';
                   state.stats.lastError = String(error && (error.message || error));
@@ -130,24 +313,233 @@ public final class BrowserOpenAL {
                 looping: false,
                 relative: false,
                 position: [0, 0, 0],
+                direction: [0, 0, -1],
+                normalizedDirection: [0, 0, -1],
+                velocity: [0, 0, 0],
+                referenceDistance: 1,
+                rolloffFactor: 1,
+                maxDistance: 10000,
+                coneInnerAngle: 360,
+                coneOuterAngle: 360,
+                coneOuterGain: 0,
+                minGain: 0,
+                maxGain: 1,
+                distanceModel: null,
                 buffer: 0,
                 queue: [],
                 scheduled: [],
+                resumeOffset: 0,
+                resumeQueueIndex: 0,
                 state: 0x1011,
+                active: false,
                 gainNode: null,
                 panner: null
               };
             }
+            function applyPanner(source) {
+              const panner = source && source.panner;
+              if (!panner) return;
+              try {
+                const model = effectiveDistanceModel(source);
+                const referenceDistance = Math.max(0.0001,
+                  finiteNumber(source.referenceDistance, 1));
+                const maxDistance = Math.max(referenceDistance,
+                  finiteNumber(source.maxDistance, 10000));
+                panner.distanceModel = distanceModelName(model);
+                panner.refDistance = referenceDistance;
+                panner.rolloffFactor = model === 0x0000 ? 0
+                  : Math.max(0, finiteNumber(source.rolloffFactor, 1));
+                panner.maxDistance = maxDistance;
+                panner.coneInnerAngle = Math.max(0, Math.min(360,
+                  finiteNumber(source.coneInnerAngle, 360)));
+                panner.coneOuterAngle = Math.max(0, Math.min(360,
+                  finiteNumber(source.coneOuterAngle, 360)));
+                panner.coneOuterGain = Math.max(0, Math.min(1,
+                  finiteNumber(source.coneOuterGain, 0)));
+                const p = source.position || [0, 0, 0];
+                const d = normalizedVector(
+                  source.direction, DEFAULT_FORWARD, source.normalizedDirection);
+                const v = source.velocity || [0, 0, 0];
+                if (panner.positionX) {
+                  setParam(panner.positionX, finiteNumber(p[0], 0));
+                  setParam(panner.positionY, finiteNumber(p[1], 0));
+                  setParam(panner.positionZ, finiteNumber(p[2], 0));
+                } else if (panner.setPosition) {
+                  panner.setPosition(finiteNumber(p[0], 0), finiteNumber(p[1], 0),
+                    finiteNumber(p[2], 0));
+                }
+                if (panner.orientationX) {
+                  setParam(panner.orientationX, d[0]);
+                  setParam(panner.orientationY, d[1]);
+                  setParam(panner.orientationZ, d[2]);
+                } else if (panner.setOrientation) {
+                  panner.setOrientation(d[0], d[1], d[2]);
+                }
+                if (panner.velocityX) {
+                  setParam(panner.velocityX, finiteNumber(v[0], 0));
+                  setParam(panner.velocityY, finiteNumber(v[1], 0));
+                  setParam(panner.velocityZ, finiteNumber(v[2], 0));
+                }
+              } catch (error) {
+                state.stats.lastError = String(error && (error.message || error));
+              }
+            }
+            function ensureSourceGraph(source) {
+              const ctx = ensureContext();
+              if (!ctx || !source) return false;
+              if (!state.masterGainNode) {
+                state.masterGainNode = ctx.createGain();
+                trackNodeCreated(state.masterGainNode, 'master-gain');
+                connectTrackedNode(state.masterGainNode, ctx.destination);
+                applyListener();
+              }
+              if (!source.gainNode) {
+                source.gainNode = ctx.createGain();
+                trackNodeCreated(source.gainNode, 'source-gain');
+                connectTrackedNode(source.gainNode, state.masterGainNode);
+              }
+              setParam(source.gainNode.gain,
+                Math.max(Number(source.minGain) || 0,
+                  Math.min(Number(source.maxGain) || 1, Math.max(0, Number(source.gain) || 0))));
+              if (!source.relative && !source.panner) {
+                source.panner = ctx.createPanner();
+                trackNodeCreated(source.panner, 'source-panner');
+                applyPanningModel(source.panner);
+                connectTrackedNode(source.panner, source.gainNode);
+              }
+              if (source.panner) applyPanner(source);
+              return true;
+            }
+            function trackNodeCreated(node, kind) {
+              if (!node || node.__gaiusTrackedNode) return node;
+              node.__gaiusTrackedNode = true;
+              node.__gaiusNodeKind = String(kind || 'audio-node');
+              node.__gaiusDisposed = false;
+              node.__gaiusConnected = false;
+              state.stats.webAudioNodesCreated++;
+              return node;
+            }
+            function disconnectTrackedNode(node) {
+              if (!node || !node.__gaiusConnected) return;
+              try { node.disconnect(); } catch (ignored) {}
+              node.__gaiusConnected = false;
+              state.stats.webAudioDisconnects++;
+            }
+            function connectTrackedNode(node, destination) {
+              if (!node || !destination) return false;
+              disconnectTrackedNode(node);
+              node.connect(destination);
+              node.__gaiusConnected = true;
+              state.stats.webAudioConnections++;
+              return true;
+            }
+            function disposeTrackedNode(node, stopFirst) {
+              if (!node || node.__gaiusDisposed) return;
+              if (stopFirst) {
+                try { node.stop(); } catch (ignored) {}
+              }
+              disconnectTrackedNode(node);
+              node.__gaiusDisposed = true;
+              state.stats.webAudioNodesDisposed++;
+            }
+            function disposeScheduledEntry(entry) {
+              if (!entry) return;
+              const node = entry.node;
+              entry.node = null;
+              entry.ended = true;
+              if (node) node.onended = null;
+              disposeTrackedNode(node, true);
+            }
+            function setSourceActive(source, active) {
+              if (!source || !!source.active === !!active) return;
+              source.active = !!active;
+              state.stats.activeSources = Math.max(
+                0, state.stats.activeSources + (source.active ? 1 : -1));
+            }
+            function retireScheduledEntry(source, entry) {
+              if (!source || !entry || entry.ended) return;
+              const node = entry.node;
+              entry.node = null;
+              entry.ended = true;
+              if (node) node.onended = null;
+              disposeTrackedNode(node, false);
+              state.stats.webAudioNaturalEnds++;
+              if (entry.queued) {
+                const allEnded = !source.scheduled || source.scheduled.every(function(candidate) {
+                  return !candidate || candidate.ended;
+                });
+                if (allEnded && source.state === 0x1012) {
+                  source.state = 0x1014;
+                  setSourceActive(source, false);
+                }
+                return;
+              }
+              const index = source.scheduled ? source.scheduled.indexOf(entry) : -1;
+              if (index >= 0) source.scheduled.splice(index, 1);
+              if (source.state === 0x1012 && (!source.scheduled || source.scheduled.length === 0)) {
+                source.state = 0x1014;
+                setSourceActive(source, false);
+              }
+            }
+            function connectNode(source, node) {
+              if (!ensureSourceGraph(source)) return false;
+              const destination = source.relative ? source.gainNode : source.panner;
+              if (!destination) return false;
+              return connectTrackedNode(node, destination);
+            }
+            function reconnectSource(source) {
+              if (!source) return;
+              ensureSourceGraph(source);
+              if (!source.relative && source.panner) applyPanner(source);
+              if (!source.scheduled) return;
+              for (var reconnectIndex = 0; reconnectIndex < source.scheduled.length; reconnectIndex++) {
+                const entry = source.scheduled[reconnectIndex];
+                if (entry && entry.node) connectNode(source, entry.node);
+              }
+            }
             function stopNodes(source) {
               if (!source || !source.scheduled) return;
-                            for (var stopIndex = 0; stopIndex < source.scheduled.length; stopIndex++) {
-                                var entry = source.scheduled[stopIndex];
-                if (entry && entry.node) {
-                  try { entry.node.stop(); } catch (ignored) {}
-                }
+              for (var stopIndex = 0; stopIndex < source.scheduled.length; stopIndex++) {
+                disposeScheduledEntry(source.scheduled[stopIndex]);
               }
               source.scheduled = [];
-              state.stats.activeSources = Math.max(0, state.stats.activeSources - 1);
+              setSourceActive(source, false);
+            }
+            function capturePausePosition(source) {
+              source.resumeOffset = 0;
+              source.resumeQueueIndex = 0;
+              const ctx = state.context;
+              if (!ctx || !source.scheduled || source.scheduled.length === 0) return;
+              const now = Number(ctx.currentTime) || 0;
+              let selectedIndex = -1;
+              for (let index = 0; index < source.scheduled.length; index++) {
+                const candidate = source.scheduled[index];
+                if (candidate && !candidate.ended && candidate.endTime > now + 0.0005) {
+                  selectedIndex = index;
+                  break;
+                }
+              }
+              if (selectedIndex < 0) return;
+              const entry = source.scheduled[selectedIndex];
+              const duration = Math.max(0.001, Number(entry.mediaDuration) || 0.001);
+              const pitch = Math.max(0.01, Number(entry.pitch) || Number(source.pitch) || 1);
+              const elapsed = Math.max(0, now - (Number(entry.startTime) || now)) * pitch;
+              let offset = Math.max(0, (Number(entry.startOffset) || 0) + elapsed);
+              if (entry.loop) {
+                offset %= duration;
+              } else {
+                offset = Math.min(offset, Math.max(0, duration - 0.0005));
+              }
+              source.resumeOffset = offset;
+              source.resumeQueueIndex = source.buffer ? 0 : selectedIndex;
+            }
+            function disposeSourceGraph(source) {
+              if (!source) return;
+              stopNodes(source);
+              disposeTrackedNode(source.panner, false);
+              disposeTrackedNode(source.gainNode, false);
+              source.panner = null;
+              source.gainNode = null;
             }
             function processedCount(source) {
               if (!source || !source.scheduled || source.scheduled.length === 0) return 0;
@@ -157,7 +549,7 @@ public final class BrowserOpenAL {
                             var count = 0;
                             for (var processedIndex = 0; processedIndex < source.scheduled.length; processedIndex++) {
                                 var entry = source.scheduled[processedIndex];
-                if (entry && entry.endTime <= now + 0.005) count++;
+                if (entry && (entry.ended || entry.endTime <= now + 0.005)) count++;
               }
               return Math.min(count, source.queue ? source.queue.length : count);
             }
@@ -168,6 +560,7 @@ public final class BrowserOpenAL {
               const ctx = state.context;
               if (!ctx || !source.scheduled || source.scheduled.length === 0) {
                 source.state = 0x1014;
+                setSourceActive(source, false);
                 return source.state;
               }
               const now = ctx.currentTime || 0;
@@ -176,56 +569,110 @@ public final class BrowserOpenAL {
                 if (entry && entry.endTime > now + 0.005) return 0x1012;
               }
               source.state = 0x1014;
+              setSourceActive(source, false);
               return source.state;
             }
             function connectSourceNode(source, node) {
-              const ctx = ensureContext();
-              if (!ctx) return false;
-              if (!source.gainNode) {
-                source.gainNode = ctx.createGain();
-                source.gainNode.gain.value = Math.max(0, Number(source.gain) || 0);
-                source.gainNode.connect(ctx.destination);
-              }
-              node.playbackRate.value = Math.max(0.01, Number(source.pitch) || 1);
-              node.connect(source.gainNode);
+              if (!connectNode(source, node)) return false;
+              setParam(node.playbackRate, Math.max(0.01, Number(source.pitch) || 1));
               return true;
             }
-            function scheduleBuffer(source, bufferId, startAt, loop) {
+            function scheduleBuffer(source, bufferId, startAt, loop, offsetSeconds) {
               const ctx = ensureContext();
               const buffer = state.buffers.get(bufferId|0);
               if (!ctx || !buffer || !buffer.audio) return startAt;
               const node = ctx.createBufferSource();
+              trackNodeCreated(node, 'buffer-source');
               node.buffer = buffer.audio;
               node.loop = !!loop;
-              if (!connectSourceNode(source, node)) return startAt;
-              const when = Math.max(ctx.currentTime, Number(startAt) || ctx.currentTime);
-              try {
-                node.start(when);
-              } catch (error) {
-                state.stats.lastError = String(error && (error.message || error));
+              if (!connectSourceNode(source, node)) {
+                disposeTrackedNode(node, true);
                 return startAt;
               }
-              const duration = Math.max(0.001, buffer.audio.duration / Math.max(0.01, Number(source.pitch) || 1));
-              source.scheduled.push({bufferId: bufferId|0, node: node, endTime: loop ? Number.MAX_VALUE : when + duration});
+              const when = Math.max(ctx.currentTime, Number(startAt) || ctx.currentTime);
+              const mediaDuration = Math.max(0.001, Number(buffer.audio.duration) || 0.001);
+              const pitch = Math.max(0.01, Number(source.pitch) || 1);
+              let offset = Math.max(0, Number(offsetSeconds) || 0);
+              if (loop) {
+                offset %= mediaDuration;
+              } else {
+                offset = Math.min(offset, Math.max(0, mediaDuration - 0.0005));
+              }
+              const duration = Math.max(0.001, (mediaDuration - offset) / pitch);
+              const queued = !loop && !source.buffer && !!(source.queue && source.queue.length);
+              const entry = {bufferId: bufferId|0, node: node,
+                startTime: when, startOffset: offset, mediaDuration: mediaDuration,
+                pitch: pitch, loop: !!loop,
+                endTime: loop ? Number.MAX_VALUE : when + duration,
+                queued: queued, ended: false};
+              source.scheduled.push(entry);
+              node.onended = function() { retireScheduledEntry(source, entry); };
+              try {
+                node.start(when, offset);
+              } catch (error) {
+                state.stats.lastError = String(error && (error.message || error));
+                const index = source.scheduled.indexOf(entry);
+                if (index >= 0) source.scheduled.splice(index, 1);
+                disposeScheduledEntry(entry);
+                return startAt;
+              }
               return when + duration;
             }
             state.ensureContext = ensureContext;
+            state.setParam = setParam;
+            state.finiteNumber = finiteNumber;
+            state.setVector = setVector;
+            state.validDistanceModel = validDistanceModel;
+            state.effectiveDistanceModel = effectiveDistanceModel;
             state.freshSource = freshSource;
             state.stopNodes = stopNodes;
+            state.capturePausePosition = capturePausePosition;
+            state.disposeScheduledEntry = disposeScheduledEntry;
+            state.setSourceActive = setSourceActive;
+            state.retireScheduledEntry = retireScheduledEntry;
+            state.disposeSourceGraph = disposeSourceGraph;
             state.processedCount = processedCount;
             state.refreshState = refreshState;
             state.scheduleBuffer = scheduleBuffer;
+            state.applyListener = applyListener;
+            state.applyPanningModel = applyPanningModel;
+            state.applyPanner = applyPanner;
+            state.reconnectSource = reconnectSource;
             window.__gaiusOpenAL = state;
             window.__gaiusAudioStats = state.stats;
             """)
     public static native void init();
 
+    @JSBody(params = "enabled", script = """
+            const state = window.__gaiusOpenAL;
+            if (!state) return;
+            state.directionalAudio = !!enabled;
+            state.stats.directionalAudio = state.directionalAudio;
+            state.sources.forEach(function(source) {
+              if (source && source.panner) state.applyPanningModel(source.panner);
+            });
+            """)
+    public static native void setDirectionalAudio(boolean enabled);
+
     @JSBody(script = """
             if (!window.__gaiusOpenAL) return;
             const state = window.__gaiusOpenAL;
-            state.sources.forEach(function(source) { state.stopNodes(source); });
+            state.sources.forEach(function(source) { state.disposeSourceGraph(source); });
             state.sources.clear();
             state.buffers.clear();
+            if (state.masterGainNode) {
+              const master = state.masterGainNode;
+              state.masterGainNode = null;
+              if (!master.__gaiusDisposed) {
+                if (master.__gaiusConnected) {
+                  try { master.disconnect(); } catch (ignored) {}
+                  master.__gaiusConnected = false;
+                  state.stats.webAudioDisconnects++;
+                }
+                master.__gaiusDisposed = true;
+                state.stats.webAudioNodesDisposed++;
+              }
+            }
             state.stats.sources = 0;
             state.stats.buffers = 0;
             state.stats.activeSources = 0;
@@ -236,12 +683,80 @@ public final class BrowserOpenAL {
         return 0;
     }
 
-    public static int getInteger(int parameter) {
+    public static boolean alcIsExtensionPresent(long device, CharSequence extension) {
+        return extension != null && ALC_EXTENSIONS.contains(extension.toString());
+    }
+
+    public static boolean alcIsExtensionPresent(long device, ByteBuffer extension) {
+        if (extension == null) {
+            return false;
+        }
+        ByteBuffer copy = extension.duplicate();
+        StringBuilder name = new StringBuilder(copy.remaining());
+        while (copy.hasRemaining()) {
+            int value = copy.get() & 0xFF;
+            if (value == 0) {
+                break;
+            }
+            name.append((char) value);
+        }
+        return alcIsExtensionPresent(device, name);
+    }
+
+    public static int alcGetInteger(long device, int parameter) {
         return switch (parameter) {
-            case AL_GAIN, AL_PITCH -> 1;
+            case ALC_MAJOR_VERSION, ALC_MINOR_VERSION, ALC_CONNECTED -> 1;
+            case ALC_ATTRIBUTES_SIZE -> ALC_ATTRIBUTES.length;
+            case ALC_FREQUENCY -> 48_000;
+            case ALC_REFRESH -> 60;
+            case ALC_MONO_SOURCES -> 30;
+            case ALC_STEREO_SOURCES -> 8;
+            case ALC_SYNC, ALC_NUM_HRTF_SPECIFIERS_SOFT -> 0;
             default -> 0;
         };
     }
+
+    public static void alcGetIntegerv(long device, int parameter, IntBuffer values) {
+        if (values == null) {
+            return;
+        }
+        IntBuffer copy = values.duplicate();
+        if (parameter == ALC_ALL_ATTRIBUTES) {
+            for (int value : ALC_ATTRIBUTES) {
+                if (!copy.hasRemaining()) {
+                    break;
+                }
+                copy.put(value);
+            }
+        } else if (copy.hasRemaining()) {
+            copy.put(alcGetInteger(device, parameter));
+        }
+    }
+
+    public static void alcGetIntegerv(long device, int parameter, int[] values) {
+        if (values == null || values.length == 0) {
+            return;
+        }
+        if (parameter == ALC_ALL_ATTRIBUTES) {
+            System.arraycopy(ALC_ATTRIBUTES, 0, values, 0, Math.min(values.length, ALC_ATTRIBUTES.length));
+        } else {
+            values[0] = alcGetInteger(device, parameter);
+        }
+    }
+
+    public static int getInteger(int parameter) {
+        return switch (parameter) {
+            case AL_GAIN, AL_PITCH -> 1;
+            case AL_DISTANCE_MODEL -> getDistanceModelJs();
+            default -> 0;
+        };
+    }
+
+    @JSBody(script = """
+            const state = window.__gaiusOpenAL;
+            return state ? state.distanceModel|0 : 0xD002;
+            """)
+    private static native int getDistanceModelJs();
 
     public static float getFloat(int parameter) {
         return getInteger(parameter);
@@ -322,7 +837,7 @@ public final class BrowserOpenAL {
             if (!state) return;
             source = source|0;
             const src = state.sources.get(source);
-            if (src) state.stopNodes(src);
+            if (src) state.disposeSourceGraph(src);
             state.sources.delete(source);
             state.stats.sources = state.sources.size;
             """)
@@ -334,10 +849,12 @@ public final class BrowserOpenAL {
     public static native boolean isSource(int source);
 
     public static void sourcef(int source, int parameter, float value) {
+        init();
         sourcefJs(source, parameter, value);
     }
 
     public static void source3f(int source, int parameter, float x, float y, float z) {
+        init();
         source3fJs(source, parameter, x, y, z);
     }
 
@@ -362,12 +879,46 @@ public final class BrowserOpenAL {
             const src = state.sources.get(source|0);
             if (!src) return;
             parameter = parameter|0;
-            value = Number(value) || 0;
+            value = Number(value);
+            if (!Number.isFinite(value)) value = 0;
             if (parameter === 0x100A) {
               src.gain = Math.max(0, value);
-              if (src.gainNode) src.gainNode.gain.value = src.gain;
+              if (src.gainNode) state.setParam(src.gainNode.gain,
+                Math.max(src.minGain, Math.min(src.maxGain, src.gain)));
             } else if (parameter === 0x1003) {
               src.pitch = Math.max(0.01, value);
+              if (src.scheduled) {
+                for (var pitchIndex = 0; pitchIndex < src.scheduled.length; pitchIndex++) {
+                  var pitchEntry = src.scheduled[pitchIndex];
+                  if (pitchEntry && pitchEntry.node) state.setParam(pitchEntry.node.playbackRate, src.pitch);
+                }
+              }
+            } else if (parameter === 0x1001) {
+              src.coneInnerAngle = value;
+              state.applyPanner(src);
+            } else if (parameter === 0x1002) {
+              src.coneOuterAngle = value;
+              state.applyPanner(src);
+            } else if (parameter === 0x1022) {
+              src.coneOuterGain = value;
+              state.applyPanner(src);
+            } else if (parameter === 0x100D) {
+              src.minGain = Math.max(0, Math.min(1, value));
+              if (src.gainNode) state.setParam(src.gainNode.gain,
+                Math.max(src.minGain, Math.min(src.maxGain, src.gain)));
+            } else if (parameter === 0x100E) {
+              src.maxGain = Math.max(src.minGain, Math.min(1, value));
+              if (src.gainNode) state.setParam(src.gainNode.gain,
+                Math.max(src.minGain, Math.min(src.maxGain, src.gain)));
+            } else if (parameter === 0x1020) {
+              src.referenceDistance = Math.max(0.0001, value);
+              state.applyPanner(src);
+            } else if (parameter === 0x1021) {
+              src.rolloffFactor = Math.max(0, value);
+              state.applyPanner(src);
+            } else if (parameter === 0x1023) {
+              src.maxDistance = Math.max(0.0001, value);
+              state.applyPanner(src);
             } else {
               src[parameter] = value;
             }
@@ -380,14 +931,23 @@ public final class BrowserOpenAL {
             const src = state.sources.get(source|0);
             if (!src) return;
             if ((parameter|0) === 0x1004) {
-              src.position = [Number(x)||0, Number(y)||0, Number(z)||0];
+              state.setVector(src.position, x, y, z);
+              state.applyPanner(src);
+            } else if ((parameter|0) === 0x1005) {
+              state.setVector(src.direction, x, y, z);
+              state.applyPanner(src);
+            } else if ((parameter|0) === 0x1006) {
+              state.setVector(src.velocity, x, y, z);
+              state.applyPanner(src);
             } else {
-              src[parameter|0] = [Number(x)||0, Number(y)||0, Number(z)||0];
+              const value = src[parameter|0] || [0, 0, 0];
+              src[parameter|0] = state.setVector(value, x, y, z);
             }
             """)
     private static native void source3fJs(int source, int parameter, float x, float y, float z);
 
     public static void sourcei(int source, int parameter, int value) {
+        init();
         sourceiJs(source, parameter, value);
     }
 
@@ -427,10 +987,22 @@ public final class BrowserOpenAL {
             value = value|0;
             if (parameter === 0x1007) {
               src.looping = value !== 0;
+              if (src.scheduled) {
+                for (var loopIndex = 0; loopIndex < src.scheduled.length; loopIndex++) {
+                  var loopEntry = src.scheduled[loopIndex];
+                  if (loopEntry && loopEntry.node) loopEntry.node.loop = src.looping;
+                }
+              }
             } else if (parameter === 0x1009) {
               src.buffer = value;
+              src.resumeOffset = 0;
+              src.resumeQueueIndex = 0;
             } else if (parameter === 0x0202) {
               src.relative = value !== 0;
+              state.reconnectSource(src);
+            } else if (parameter === 0xD000) {
+              src.distanceModel = state.validDistanceModel(value);
+              state.applyPanner(src);
             } else {
               src[parameter] = value;
             }
@@ -471,6 +1043,9 @@ public final class BrowserOpenAL {
             if (parameter === 0x1015) return (src.queue ? src.queue.length : 0)|0;
             if (parameter === 0x1016) return state.processedCount(src)|0;
             if (parameter === 0x1009) return (src.buffer || 0)|0;
+            if (parameter === 0x0202) return src.relative ? 1 : 0;
+            if (parameter === 0x1007) return src.looping ? 1 : 0;
+            if (parameter === 0xD000) return state.effectiveDistanceModel(src)|0;
             return (src[parameter] || 0)|0;
             """)
     private static native int getSourceiJs(int source, int parameter);
@@ -504,6 +1079,14 @@ public final class BrowserOpenAL {
             const src = state.sources.get(source|0);
             if (!src) return;
             src.queue.push(buffer|0);
+            if (src.state === 0x1012) {
+              let at = state.context ? state.context.currentTime : 0;
+              if (src.scheduled && src.scheduled.length) {
+                const tail = src.scheduled[src.scheduled.length - 1];
+                if (tail && Number.isFinite(tail.endTime)) at = Math.max(at, tail.endTime);
+              }
+              state.scheduleBuffer(src, buffer|0, at, false);
+            }
             state.stats.queuedBuffers++;
             """)
     private static native void sourceQueueBufferJs(int source, int buffer);
@@ -539,21 +1122,31 @@ public final class BrowserOpenAL {
             const processed = state.processedCount(src);
             if (processed <= 0 && state.refreshState(src) === 0x1012) return 0;
             const id = src.queue.shift() || 0;
-            if (src.scheduled && src.scheduled.length > 0) src.scheduled.shift();
+            if (src.scheduled && src.scheduled.length > 0) {
+              state.disposeScheduledEntry(src.scheduled.shift());
+            }
+            if (src.resumeQueueIndex > 0) {
+              src.resumeQueueIndex--;
+            } else {
+              src.resumeOffset = 0;
+            }
             state.stats.unqueuedBuffers++;
             return id|0;
             """)
     private static native int sourceUnqueueBufferJs(int source);
 
     public static void sourcePlay(int source) {
+        init();
         sourcePlayJs(source);
     }
 
     public static void sourcePause(int source) {
+        init();
         sourcePauseJs(source);
     }
 
     public static void sourceStop(int source) {
+        init();
         sourceStopJs(source);
     }
 
@@ -624,19 +1217,33 @@ public final class BrowserOpenAL {
             const src = state.sources.get(source|0);
             if (!src) return;
             state.ensureContext();
+            const wasPaused = src.state === 0x1013;
+            const resumeOffset = wasPaused ? Math.max(0, Number(src.resumeOffset) || 0) : 0;
+            const resumeQueueIndex = wasPaused
+              ? Math.max(0, Math.min(src.queue ? src.queue.length : 0,
+                  Number(src.resumeQueueIndex) || 0)) : 0;
             state.stopNodes(src);
             src.scheduled = [];
             if (src.buffer) {
-              state.scheduleBuffer(src, src.buffer|0, 0, src.looping);
+              state.scheduleBuffer(src, src.buffer|0, 0, src.looping, resumeOffset);
             } else if (src.queue && src.queue.length) {
                             var at = state.context ? state.context.currentTime : 0;
-                            for (var queueIndex = 0; queueIndex < src.queue.length; queueIndex++) {
-                                at = state.scheduleBuffer(src, src.queue[queueIndex]|0, at, false);
+                            for (var processedIndex = 0; processedIndex < resumeQueueIndex; processedIndex++) {
+                              src.scheduled.push({bufferId: src.queue[processedIndex]|0, node: null,
+                                startTime: at, startOffset: 0, mediaDuration: 0,
+                                pitch: Math.max(0.01, Number(src.pitch) || 1), loop: false,
+                                endTime: at, queued: true, ended: true});
+                            }
+                            for (var queueIndex = resumeQueueIndex; queueIndex < src.queue.length; queueIndex++) {
+                                at = state.scheduleBuffer(src, src.queue[queueIndex]|0, at, false,
+                                  queueIndex === resumeQueueIndex ? resumeOffset : 0);
               }
             }
-            src.state = 0x1012;
+            src.resumeOffset = 0;
+            src.resumeQueueIndex = 0;
+            src.state = src.scheduled && src.scheduled.length ? 0x1012 : 0x1014;
             state.stats.sourcePlays++;
-            state.stats.activeSources = Math.max(state.stats.activeSources, 1);
+            state.setSourceActive(src, src.state === 0x1012);
             if (state.context) state.stats.contextState = state.context.state || 'unknown';
             """)
     private static native void sourcePlayJs(int source);
@@ -646,6 +1253,8 @@ public final class BrowserOpenAL {
             if (!state) return;
             const src = state.sources.get(source|0);
             if (!src) return;
+            if (state.refreshState(src) !== 0x1012) return;
+            state.capturePausePosition(src);
             state.stopNodes(src);
             src.state = 0x1013;
             """)
@@ -657,6 +1266,8 @@ public final class BrowserOpenAL {
             const src = state.sources.get(source|0);
             if (!src) return;
             state.stopNodes(src);
+            src.resumeOffset = 0;
+            src.resumeQueueIndex = 0;
             src.state = 0x1014;
             state.stats.sourceStops++;
             """)
@@ -839,22 +1450,94 @@ public final class BrowserOpenAL {
     private static native int getBufferiJs(int buffer, int parameter);
 
     public static void listenerf(int parameter, float value) {
+        init();
+        listenerfJs(parameter, value);
     }
 
+    @JSBody(params = {"parameter", "value"}, script = """
+            const state = window.__gaiusOpenAL;
+            if (!state) return;
+            if ((parameter|0) === 0x100A) {
+              state.listener.gain = Math.max(0, Number(value) || 0);
+              state.applyListener();
+            }
+            """)
+    private static native void listenerfJs(int parameter, float value);
+
     public static void listeneri(int parameter, int value) {
+        listenerf(parameter, value);
     }
 
     public static void listener3f(int parameter, float x, float y, float z) {
+        init();
+        listener3fJs(parameter, x, y, z);
     }
 
+    @JSBody(params = {"parameter", "x", "y", "z"}, script = """
+            const state = window.__gaiusOpenAL;
+            if (!state) return;
+            if ((parameter|0) === 0x1004) {
+              state.setVector(state.listener.position, x, y, z);
+            } else if ((parameter|0) === 0x1006) {
+              state.setVector(state.listener.velocity, x, y, z);
+            }
+            state.applyListener();
+            """)
+    private static native void listener3fJs(int parameter, float x, float y, float z);
+
     public static void listenerfv(int parameter, FloatBuffer values) {
+        if (values == null) return;
+        FloatBuffer copy = values.duplicate();
+        if ((parameter == AL_ORIENTATION && copy.remaining() >= 6)
+                || (parameter != AL_ORIENTATION && copy.remaining() >= 3)) {
+            if (parameter == AL_ORIENTATION) {
+                listenerOrientation(copy.get(), copy.get(), copy.get(), copy.get(), copy.get(), copy.get());
+            } else {
+                listener3f(parameter, copy.get(), copy.get(), copy.get());
+            }
+        }
     }
 
     public static void listenerfv(int parameter, float[] values) {
+        if (values == null) return;
+        if (parameter == AL_ORIENTATION && values.length >= 6) {
+            listenerOrientation(values[0], values[1], values[2], values[3], values[4], values[5]);
+        } else if (values.length >= 3) {
+            listener3f(parameter, values[0], values[1], values[2]);
+        }
     }
 
-    public static void distanceModel(int model) {
+    public static void listenerOrientation(
+            float forwardX, float forwardY, float forwardZ,
+            float upX, float upY, float upZ) {
+        init();
+        listenerOrientationJs(forwardX, forwardY, forwardZ, upX, upY, upZ);
     }
+
+    @JSBody(params = {"forwardX", "forwardY", "forwardZ", "upX", "upY", "upZ"}, script = """
+            const state = window.__gaiusOpenAL;
+            if (!state) return;
+            state.setVector(
+              state.listener.forward, forwardX, forwardY, forwardZ, 0, 0, -1);
+            state.setVector(state.listener.up, upX, upY, upZ, 0, 1, 0);
+            state.applyListener();
+            """)
+    private static native void listenerOrientationJs(
+            float forwardX, float forwardY, float forwardZ,
+            float upX, float upY, float upZ);
+
+    public static void distanceModel(int model) {
+        init();
+        distanceModelJs(model);
+    }
+
+    @JSBody(params = {"model"}, script = """
+            const state = window.__gaiusOpenAL;
+            if (!state) return;
+            state.distanceModel = state.validDistanceModel(model);
+            state.sources.forEach(function(source) { state.applyPanner(source); });
+            """)
+    private static native void distanceModelJs(int model);
 
     public static void dopplerFactor(float value) {
     }

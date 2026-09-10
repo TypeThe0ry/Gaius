@@ -2,13 +2,14 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-Gaius Client `0.0.1` is an experimental browser port of Minecraft Java
-Edition `1.21.11`. It uses the original Java client path with TeaVM and
-browser-specific platform overlays. It is not a TypeScript recreation of
-Minecraft gameplay.
+Gaius Client `0.1.0` is an experimental browser port of Minecraft Java
+Edition `26.2`, with the `1.21.11` profile retained for compatibility. Each
+profile uses the original Java client path with TeaVM and browser-specific
+platform overlays; this is not a TypeScript recreation of Minecraft gameplay.
 
-**Status:** experimental public release. The downloadable client is intended
-for evaluation and local single-player use. Browser, server, resource-pack,
+**Status:** public release `0.1.0`; the browser port continues to evolve.
+The downloadable client supports browser-local singleplayer and RelayNode
+multiplayer routing. Browser, server, resource-pack,
 world-generation, rendering, and performance compatibility are not guaranteed.
 Use a current Chrome or Chromium browser for the primary target experience.
 
@@ -37,27 +38,34 @@ opening the generated browser bundle.
 
 ## Download
 
-The `v0.0.1` release page contains the portable browser client and the optional
-Paper plugin:
+The `v0.1.0` release page contains one portable browser client per supported
+profile and the optional Paper plugin:
 
-- [Download `Gaius.html`](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.1/Gaius.html)
-- [Download the optional Paper plugin](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.1/gaius-server-plugin-0.0.1.jar)
-- [Download `SHA256SUMS`](https://github.com/TypeThe0ry/Gaius/releases/download/v0.0.1/SHA256SUMS)
-- [Open the `v0.0.1` release page](https://github.com/TypeThe0ry/Gaius/releases/tag/v0.0.1)
+- [Download the Minecraft 26.2 client (`Gaius-26.2.html`)](https://github.com/TypeThe0ry/Gaius/releases/download/v0.1.0/Gaius-26.2.html)
+- [Download the retained Minecraft 1.21.11 client (`Gaius-1.21.11.html`)](https://github.com/TypeThe0ry/Gaius/releases/download/v0.1.0/Gaius-1.21.11.html)
+- [Download the optional Paper plugin](https://github.com/TypeThe0ry/Gaius/releases/download/v0.1.0/gaius-server-plugin-0.1.0.jar)
+- [Download `SHA256SUMS`](https://github.com/TypeThe0ry/Gaius/releases/download/v0.1.0/SHA256SUMS)
+- [Open the `v0.1.0` release page](https://github.com/TypeThe0ry/Gaius/releases/tag/v0.1.0)
 
-`Gaius.html` is the frontend-only single-player package. It can be downloaded
-and opened locally in Chrome; it does not require a Gaius-hosted web server for
-single-player. Multiplayer still requires either a compatible server-side Gaius
-plugin or a reachable RelayNode.
+Each `Gaius-<profile>.html` is a frontend-only single-player package. It can be
+downloaded and opened locally in Chrome; it does not require a Gaius-hosted web
+server for single-player. Multiplayer still requires either a compatible
+server-side Gaius plugin or a reachable RelayNode.
 
 ## Browser Quick Start
 
-1. Download `Gaius.html` from the release above.
+1. Download the client for the Minecraft profile of the server you want to
+   join (`Gaius-26.2.html` for the primary profile, or `Gaius-1.21.11.html`).
 2. Open it in Chrome or Chromium. Allow audio after the first user gesture if
    the browser requests permission.
 3. Enter a player name before joining a world or server.
 4. Select **Singleplayer** for the browser-local integrated server, or open
    **Multiplayer** and enter a Java server address.
+
+The current source defaults **Sprint** to **R** to avoid Chrome's **Ctrl+W**
+close-tab shortcut. Existing saved key bindings are preserved: if Sprint still
+uses Ctrl, change it in **Options → Controls → Key Binds**, or double-tap W.
+This source change is not included in previously downloaded release files.
 
 For a source checkout, the normal development launcher is served over HTTP:
 
@@ -65,27 +73,35 @@ For a source checkout, the normal development launcher is served over HTTP:
 python3 port/scripts/serve-dist.py --host 127.0.0.1 --port 8781
 ```
 
-Open <http://127.0.0.1:8781/dist/> in Chrome after building the client. Do not
-open the generated `/dist/` files from an arbitrary path and assume that every
-browser security policy will behave the same as an HTTP origin.
+Open <http://127.0.0.1:8781/dist/26.2/> (or `/dist/1.21.11/`) in Chrome after
+building the corresponding profile. Do not open generated `/dist/<profile>/`
+files from an arbitrary path and assume that every browser security policy will
+behave the same as an HTTP origin.
 
 ## Current Features
 
-- Minecraft Java Edition `1.21.11` client path compiled to the browser with
-  TeaVM.
+- Minecraft Java Edition `26.2` and retained `1.21.11` client paths compiled to
+  the browser with TeaVM.
 - WebGL rendering and browser Web Audio integration through the Gaius browser
   platform layer.
 - Browser-local single-player with the integrated server running in a Worker.
 - IndexedDB-backed local world storage, with client and server communication
   over a `MessageChannel`.
-- Portable `Gaius.html` output containing the browser launcher and generated
-  runtime payloads.
+- Profile-scoped portable `Gaius.html` outputs (published as
+  `Gaius-<profile>.html`) containing the browser launcher and generated runtime
+  payloads.
 - Multiplayer status and join routing through a WebSocket-to-TCP RelayNode.
 - Optional Paper plugin for a server-side WebSocket endpoint.
 - Git LFS tracking for the generated browser release and smoke bundles, so the
   source and runnable release stay in one repository.
 
 ## Multiplayer Routing and RelayNode
+
+The release transport checks use `t40.sjcmc.cn:14803` through
+`wss://ellan.site/tunnel` for both protocol profiles. Enter the server address
+in **Multiplayer**; the WSS URL is the relay, not the Minecraft server address.
+Status/target-attestation checks verify reachability and tunnel cleanup, and
+do not by themselves prove login or gameplay compatibility.
 
 A browser cannot open the raw TCP socket required by a Minecraft Java server.
 Gaius therefore carries each Minecraft byte stream over WebSocket to either an
@@ -143,9 +159,10 @@ RelayNode is a transport bridge between browser WebSocket frames and a Java
 server TCP stream. It is not a general Minecraft protocol-version translator:
 the client and destination server must still agree on a compatible protocol.
 Most game bytes are forwarded unchanged. Encrypted online-mode traffic remains
-opaque to the RelayNode. For supported unencrypted `1.21.11` flows, narrowly
-scoped keepalive, configuration-reentry, and resource-pack proxy behavior can
-prevent browser reload stalls without turning the node into a game server.
+opaque to the RelayNode. For supported unencrypted `1.21.11` and `26.2` flows,
+narrowly scoped keepalive, configuration-reentry, and resource-pack proxy
+behavior can prevent browser reload stalls without turning the node into a game
+server.
 
 Every server-list status ping, login attempt, reconnect, and player session has
 its own WebSocket and its own TCP socket. Multiple players may select the same
@@ -215,7 +232,7 @@ player's browser tab.
 | --- | --- |
 | `port/` | TeaVM port, browser overlays, bytecode patchers, build scripts, and launcher |
 | `port/web/` | Browser launcher, Worker bootstrap, smoke pages, and generated release input |
-| `port/web/dist/` | Generated client, Worker, Wasm, compressed payloads, and portable `Gaius.html` |
+| `port/web/dist/<profile>/` | Profile-scoped generated client, Worker, Wasm, compressed payloads, and portable `Gaius.html` |
 | `apps/bridge/` | Self-hostable RelayNode, registry process, routing logic, and smoke tests |
 | `apps/server-plugin/` | Optional Paper plugin for a server-side Gaius endpoint |
 | `packages/` | Checked-in browser protocol and local-world support modules |
@@ -230,49 +247,65 @@ local.
 
 ## Build From Source
 
-Requirements: JDK 21, a current Node.js LTS release, Python 3, `curl`, `jq`,
-`unzip`, `shasum`, and Git LFS. The build defaults to a 14 GiB Java heap;
-24 GiB or more of physical memory is recommended, with memory-heavy apps closed.
+Requirements: JDK 21 for the retained `1.21.11` profile and JDK 25 or newer
+for the primary `26.2` profile, plus a current Node.js LTS release, Python 3,
+`curl`, `jq`, `unzip`, `shasum`, and Git LFS. The build defaults to a 14 GiB
+Java heap; 24 GiB or more of physical memory is recommended, with memory-heavy
+apps closed.
 
-Acquire the local-only Minecraft inputs and build the browser release:
+Acquire the local-only Minecraft inputs and build both profile releases. The
+wrapper selects profile-scoped `port/target/<profile>`, `port/work/overlays/<profile>`,
+and `port/web/dist/<profile>` roots and selects the required JDK:
 
 ```sh
 git lfs install
 git lfs pull
-./port/scripts/fetch-version.sh
-./port/scripts/remap-client.sh
-./port/scripts/build-teavm-release.sh
+for profile in 1.21.11 26.2; do
+  export GAIUS_VERSION_PROFILE_PATH="versions/${profile}.json"
+  ./port/scripts/fetch-version.sh
+  ./port/scripts/remap-client.sh
+  bash port/scripts/build-version-release.sh "$profile"
+done
 ```
 
-The generated portable client is `port/web/dist/Gaius.html`. Never hand-edit
-files in `port/web/dist/`; rebuild them from the launcher and platform source.
-More TeaVM details are in [`port/README.md`](port/README.md).
+The generated portable clients are `port/web/dist/<profile>/Gaius.html`. Never
+hand-edit files in `port/web/dist/`; rebuild them from the launcher and platform
+source. More TeaVM details are in [`port/README.md`](port/README.md).
 
 ## Tests and Checks
 
-Run checks relevant to the code you change. A full browser-port verification
-sequence is:
+After the profile builds above, run the profile-scoped artifact checks relevant
+to the code you changed:
 
 ```sh
-./port/scripts/build-platform-smoke.sh
-./port/scripts/build-teavm-release.sh
-python3 port/scripts/quick-check.py
-node port/scripts/singleplayer-worker-runtime-smoke.mjs
+for profile in 1.21.11 26.2; do
+  export GAIUS_VERSION_PROFILE_PATH="versions/${profile}.json"
+  export GAIUS_BUILD_ROOT="port/target/${profile}"
+  export GAIUS_OVERLAY_DIRECTORY="port/work/overlays/${profile}"
+  export GAIUS_DIST_DIRECTORY="port/web/dist/${profile}"
+  python3 port/scripts/quick-check.py
+  node port/scripts/singleplayer-worker-runtime-smoke.mjs
+done
 git diff --check
 ```
 
 RelayNode changes should also run:
 
 ```sh
-cd apps/bridge
-npm run smoke
-npm run smoke:public
+for profile in 1.21.11 26.2; do
+  GAIUS_SMOKE_MINECRAFT_VERSION="$profile" npm run smoke --prefix apps/bridge
+done
+npm run smoke:profiles --prefix apps/bridge
+for profile in 1.21.11 26.2; do
+  GAIUS_PUBLIC_RELAY_MINECRAFT_VERSION="$profile" npm run smoke:public --prefix apps/bridge
+done
 ```
 
 Paper plugin changes should run:
 
 ```sh
-(cd apps/server-plugin && ../../port/mvnw test)
+GAIUS_VERSION_PROFILE_PATH=versions/1.21.11.json \
+  ./port/mvnw -B -ntp -f apps/server-plugin/pom.xml test
 ```
 
 Static checks do not replace a Chrome runtime check. For rendering, input,
@@ -346,4 +379,3 @@ For project-level licensing and attribution review, see the
 - [RelayNode registry guide](docs/relay-nodes.md)
 - [Performance targets](docs/performance-targets.md)
 - [Platform-gap notes](docs/teavm-platform-gap.md)
-- [EAG 26 audit](docs/eag26-audit.md)

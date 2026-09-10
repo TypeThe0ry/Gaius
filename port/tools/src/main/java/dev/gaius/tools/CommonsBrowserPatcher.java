@@ -45,6 +45,20 @@ public final class CommonsBrowserPatcher {
                 "(Ljava/nio/file/Path;Z[Ljava/nio/file/LinkOption;)V"));
         replaceFalse(find(node, "isPosix",
                 "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Z"));
+        MethodNode withPosix = find(node, "withPosixFileAttributes",
+                "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;Z"
+                        + "Lorg/apache/commons/io/function/IOFunction;)Ljava/lang/Object;");
+        InsnList withoutPosix = new InsnList();
+        withoutPosix.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        withoutPosix.add(new InsnNode(Opcodes.ACONST_NULL));
+        withoutPosix.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "org/apache/commons/io/function/IOFunction",
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                true));
+        withoutPosix.add(new InsnNode(Opcodes.ARETURN));
+        replace(withPosix, withoutPosix);
         MethodNode setReadOnly = find(node, "setReadOnly",
                 "(Ljava/nio/file/Path;Z[Ljava/nio/file/LinkOption;)Ljava/nio/file/Path;");
         InsnList returnPath = new InsnList();

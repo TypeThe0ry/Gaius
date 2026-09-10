@@ -34,9 +34,21 @@ public final class GaiusServerBridgePlugin extends JavaPlugin {
                 accessToken == null ? "" : accessToken,
                 allowedOrigins,
                 getLogger());
-        gateway.start();
+        try {
+            gateway.start();
+            gateway.awaitReady();
+        } catch (RuntimeException | Error exception) {
+            GaiusWebSocketGateway failedGateway = gateway;
+            gateway = null;
+            try {
+                failedGateway.shutdown();
+            } catch (Throwable cleanupFailure) {
+                exception.addSuppressed(cleanupFailure);
+            }
+            throw exception;
+        }
         getLogger().info(
-                "Gaius WebSocket transport listening on " + listenAddress + ":" + webSocketPort
+                "Gaius WebSocket transport listening on " + listenAddress + ":" + gateway.getPort()
                         + " and forwarding only to " + minecraftHost + ":" + getServer().getPort());
     }
 

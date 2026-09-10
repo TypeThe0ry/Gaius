@@ -1,10 +1,18 @@
 import { concatBytes, decodeLong, decodeString, encodeLong, encodeString, encodeUnsignedShort, } from "./binary.js";
-import { DEFAULT_MINECRAFT_PORT, MINECRAFT_1_21_11 } from "./constants.js";
+import { DEFAULT_MINECRAFT_PORT, MINECRAFT_1_21_11, resolveMinecraftProtocol, } from "./constants.js";
 import { encodePacket } from "./framing.js";
 import { encodeVarInt } from "./varint.js";
-export function createStatusHandshake(host, port = DEFAULT_MINECRAFT_PORT, protocolVersion = MINECRAFT_1_21_11.protocolVersion) {
+export function createStatusHandshake(host, port = DEFAULT_MINECRAFT_PORT, protocol = MINECRAFT_1_21_11) {
     if (host.length === 0 || host.length > 255) {
         throw new RangeError("Minecraft host must contain between 1 and 255 chars");
+    }
+    // Keep accepting a raw protocol number for callers that talk to a custom
+    // server, while allowing the shared version profiles to select 774/776.
+    const protocolVersion = typeof protocol === "number"
+        ? protocol
+        : resolveMinecraftProtocol(protocol).protocolVersion;
+    if (!Number.isSafeInteger(protocolVersion) || protocolVersion < 0) {
+        throw new RangeError(`Minecraft protocol version must be a non-negative integer, got ${protocolVersion}`);
     }
     return encodePacket(0, concatBytes(encodeVarInt(protocolVersion), encodeString(host), encodeUnsignedShort(port), encodeVarInt(1)));
 }

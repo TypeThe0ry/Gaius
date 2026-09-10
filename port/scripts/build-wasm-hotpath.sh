@@ -2,8 +2,10 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$root/port/scripts/version-profile.sh"
+gaius_load_version_profile "$root"
 source_file="$root/port/wasm/hotpath/gaius_hotpath.c"
-dist="${GAIUS_DIST_DIRECTORY:-$root/port/web/dist}"
+dist="$(gaius_dist_directory "$root")"
 output="$dist/gaius-hotpath.wasm"
 
 generate_directly() {

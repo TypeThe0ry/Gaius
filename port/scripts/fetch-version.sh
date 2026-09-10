@@ -2,22 +2,29 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
-config="$root/port/config.json"
-version="$(jq -er '.minecraftVersion' "$config")"
+source "$root/port/scripts/version-profile.sh"
+gaius_load_version_profile "$root"
+version="$GAIUS_MINECRAFT_VERSION"
 work="$root/port/work/$version"
 metadata="$work/version.json"
 libraries="$work/libraries"
 assets="$work/assets"
+client_input="$work/client-original.jar"
 
 mkdir -p "$work" "$libraries"
 
 manifest_url="https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
+curl_with_retries() {
+  curl --fail --silent --show-error --location --http1.1 \
+    --retry 10 --retry-all-errors --retry-delay 2 --connect-timeout 20 "$@"
+}
+
 version_url="$(
-  curl -fsSL "$manifest_url" |
+  curl_with_retries "$manifest_url" |
     jq -er --arg version "$version" \
       '.versions[] | select(.id == $version) | .url'
 )"
-curl -fsSL -o "$metadata" "$version_url"
+curl_with_retries -o "$metadata" "$version_url"
 
 download_from_metadata() {
   local key="$1"
@@ -34,20 +41,20 @@ download_verified() {
   local output="$3"
   expected_sha1="$(printf '%s' "$expected_sha1" | tr -d '\r\n')"
   if [[ -f "$output" ]] &&
-    [[ "$(shasum -a 1 "$output" | awk '{print $1}' | tr -d '\r\n')" == "$expected_sha1" ]]; then
+    [[ "$(gaius_sha1_file "$output")" == "$expected_sha1" ]]; then
     return
   fi
 
   mkdir -p "$(dirname "$output")"
   local temporary="$output.part"
-  if ! curl -fsSL --http1.1 --retry 5 --retry-delay 1 -o "$temporary" "$url"; then
+  if ! curl_with_retries --continue-at - -o "$temporary" "$url"; then
     rm -f "$temporary"
     return 1
   fi
   local actual_sha1
   # Git Bash on Windows can emit CRLF while jq/curl output is LF-only. Normalize
   # both sides before comparing so an identical digest is not rejected.
-  actual_sha1="$(shasum -a 1 "$temporary" | awk '{print $1}' | tr -d '\r\n')"
+  actual_sha1="$(gaius_sha1_file "$temporary")"
   if [[ "$actual_sha1" != "$expected_sha1" ]]; then
     echo "SHA-1 mismatch for $url" >&2
     echo "expected: $expected_sha1" >&2
@@ -57,9 +64,11 @@ download_verified() {
   mv "$temporary" "$output"
 }
 
-echo "Fetching Minecraft $version client and official mappings"
-download_from_metadata client "$work/client-obfuscated.jar"
-download_from_metadata client_mappings "$work/client-mappings.txt"
+echo "Fetching Minecraft $version client ($GAIUS_CLIENT_DISTRIBUTION)"
+download_from_metadata client "$client_input"
+if [[ "$GAIUS_CLIENT_DISTRIBUTION" == "obfuscated-with-mappings" ]]; then
+  download_from_metadata client_mappings "$work/client-mappings.txt"
+fi
 
 echo "Fetching Java libraries"
 jq -r '
@@ -75,7 +84,18 @@ jq -r '
 find "$libraries" -type f -name '*.jar' -print | sort |
   paste -sd ':' - >"$work/classpath.txt"
 
-unzip -p "$work/client-obfuscated.jar" version.json >"$work/client-version.json"
+if command -v unzip >/dev/null 2>&1; then
+  unzip -p "$client_input" version.json >"$work/client-version.json"
+else
+  python3 - "$client_input" version.json >"$work/client-version.json" <<'PY'
+import sys
+import zipfile
+
+archive, member = sys.argv[1:]
+with zipfile.ZipFile(archive) as bundle:
+    sys.stdout.buffer.write(bundle.read(member))
+PY
+fi
 
 asset_index_id="$(jq -er '.assetIndex.id // .assets' "$metadata" | tr -d '\r\n')"
 asset_index_url="$(jq -er '.assetIndex.url' "$metadata" | tr -d '\r\n')"
@@ -96,6 +116,10 @@ browser_font_assets=(
   "minecraft/font/unifont_jp.zip"
   "minecraft/font/unifont_pua.zip"
 )
+browser_background_assets=()
+while IFS= read -r logical_path; do
+  browser_background_assets+=("$logical_path")
+done < <(jq -r '.objects | keys[] | select(startswith("minecraft/textures/gui/title/background/"))' "$asset_index" | tr -d '\r')
 browser_sound_assets=(
   "minecraft/sounds/ui/toast/in.ogg"
   "minecraft/sounds/ui/toast/out.ogg"
@@ -143,15 +167,23 @@ download_browser_asset() {
     "$assets/objects/${hash:0:2}/$hash"
 }
 export asset_index assets
-export -f download_verified download_browser_asset
-printf '%s\n' "${browser_sound_metadata_assets[@]}" "${browser_sound_assets[@]}" "${browser_font_assets[@]}" |
+export -f gaius_hash_file gaius_sha1_file gaius_sha256_file
+export -f curl_with_retries download_verified download_browser_asset
+printf '%s\n' "${browser_sound_metadata_assets[@]}" "${browser_sound_assets[@]}" "${browser_font_assets[@]}" "${browser_background_assets[@]}" |
   xargs -n 1 -P "${GAIUS_FETCH_PARALLEL:-16}" bash -c 'download_browser_asset "$0"'
 
 echo "Fetched and verified:"
-echo "  client:   $work/client-obfuscated.jar"
-echo "  mappings: $work/client-mappings.txt"
+echo "  client:   $client_input"
+if [[ "$GAIUS_CLIENT_DISTRIBUTION" == "obfuscated-with-mappings" ]]; then
+  echo "  mappings: $work/client-mappings.txt"
+else
+  echo "  mappings: not required for the named client distribution"
+fi
 echo "  libraries: $(find "$libraries" -type f -name '*.jar' | wc -l | tr -d ' ')"
 echo "  browser sound assets: ${#browser_sound_assets[@]} playable, ${#browser_sound_metadata_assets[@]} metadata"
 echo "  browser Unicode font assets: ${#browser_font_assets[@]}"
 jq '{id, protocol_version, world_version, java_version, pack_version}' \
   "$work/client-version.json"
+node "$root/port/scripts/check-version-profile.mjs" \
+  --profile "$GAIUS_VERSION_PROFILE" \
+  --require-local

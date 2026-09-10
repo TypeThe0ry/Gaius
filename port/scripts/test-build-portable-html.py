@@ -18,6 +18,14 @@ SPEC.loader.exec_module(PORTABLE)
 
 
 class BuildPortableHTMLTest(unittest.TestCase):
+    def test_launcher_keeps_embedded_portable_worker_urls(self) -> None:
+        template = (SCRIPT.parent.parent / "web" / "launcher" / "index.template.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("if (window.__gaiusPortableBuild !== true)", template)
+        self.assertIn("file:/// sibling paths", template)
+        self.assertIn("if (window.__gaiusPortableBuild === true) await portableReady;", template)
+
     def test_atomic_write_replaces_complete_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "Gaius.html"

@@ -6,6 +6,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import net.minecraft.CrashReportDetail;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.item.TrackingItemStackRenderState;
 import net.minecraft.world.entity.LivingEntity;
@@ -50,6 +51,7 @@ public final class BrowserGuiItemCache {
                     return size() > MODEL_IDENTITY_CACHE_SIZE;
                 }
             };
+    private static final CrashReportDetail<String> ITEM_DEBUG_DETAIL = () -> "browser:item";
     private static int statePoolIndex;
 
     private BrowserGuiItemCache() {
@@ -57,6 +59,10 @@ public final class BrowserGuiItemCache {
 
     public static void resetPool() {
         statePoolIndex = 0;
+    }
+
+    public static CrashReportDetail<String> itemDebugDetail() {
+        return ITEM_DEBUG_DETAIL;
     }
 
     public static TrackingItemStackRenderState guiState(

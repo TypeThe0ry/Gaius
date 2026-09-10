@@ -1,11 +1,13 @@
 package dev.gaius.browser;
 
+import org.teavm.classlib.java.lang.TModernRuntimeSupport;
 import org.teavm.jso.JSBody;
 
 /** Keeps large one-time client and server initialization batches cooperative in browsers. */
 public final class BrowserStartupScheduler {
     private static final int BLOCK_REGISTRATION_BATCH = 64;
     private static final int BLOCK_STATE_CACHE_BATCH = 512;
+    private static final int REGISTRY_BOOTSTRAP_BATCH = 8;
     private static final int DATAPACK_RESOURCE_BATCH = 64;
 
     private static int registeredBlocks;
@@ -42,7 +44,10 @@ public final class BrowserStartupScheduler {
             return;
         }
         bootstrappedRegistries++;
-        checkpoint("registries-bootstrapped=" + bootstrappedRegistries);
+        report("registries-bootstrapped=" + bootstrappedRegistries);
+        if (bootstrappedRegistries % REGISTRY_BOOTSTRAP_BATCH == 0) {
+            yieldToBrowser();
+        }
     }
 
     public static void datapackResourceDecoded() {
@@ -78,11 +83,11 @@ public final class BrowserStartupScheduler {
 
     private static void checkpoint(String detail) {
         report(detail);
-        try {
-            Thread.sleep(0L);
-        } catch (InterruptedException exception) {
-            Thread.currentThread().interrupt();
-        }
+        yieldToBrowser();
+    }
+
+    private static void yieldToBrowser() {
+        TModernRuntimeSupport.yieldToEventLoop(0);
     }
 
     @JSBody(script = """

@@ -1,0 +1,34 @@
+{
+  "id": "26.2",
+  "releaseType": "release",
+  "protocolVersion": 776,
+  "worldVersion": 4903,
+  "javaVersion": 25,
+  "classFileVersion": 69,
+  "clientDistribution": "named",
+  "worldgenTelemetryMode": "task-pulsed",
+  "packVersions": {
+    "resource": {
+      "major": 88,
+      "minor": 0
+    },
+    "data": {
+      "major": 107,
+      "minor": 1
+    }
+  },
+  "storage": {
+    "schema": 2,
+    "databaseName": "gaius-fs-v2-26.2",
+    "prefix": "gaius.fs.v2:26.2:",
+    "opfsDirectory": "regions-v2-26.2"
+  },
+  "official": {
+    "releaseTime": "2026-06-16T12:03:33+00:00",
+    "clientSha1": "2dc72797acbc1b63fc16a11c4ac393605f453754",
+    "clientMappingsSha1": null,
+    "serverSha1": "823e2250d24b3ddac457a60c92a6a941943fcd6a",
+    "assetIndexId": "32",
+    "assetIndexSha1": "e6ac246e2a151ff254110f4ddb1a944ed184d140"
+  }
+}

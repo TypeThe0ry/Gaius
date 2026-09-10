@@ -9,4 +9,8 @@ public final class TDateModernSupport {
     public static TDate from(Instant instant) {
         return new TDate(instant.toEpochMilli());
     }
+
+    public static Instant toInstant(TDate date) {
+        return Instant.ofEpochMilli(date.getTime());
+    }
 }

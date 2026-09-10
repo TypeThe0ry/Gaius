@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import {
     constants as cryptoConstants,
     createCipheriv,
@@ -12,27 +13,47 @@ import { createServer as createHttpServer } from "node:http";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
+import path from "node:path";
 import { deflateSync, inflateSync } from "node:zlib";
 import { WebSocket } from "./node_modules/ws/wrapper.mjs";
 import { parseConnectRequest } from "./dist/policy.js";
+import {
+    decodeClientboundLoginDistances,
+    MINECRAFT_1_21_11,
+    MINECRAFT_26_2,
+} from "./dist/protocol.js";
 
 const host = "127.0.0.1";
 const origin = "http://127.0.0.1:8781";
 const bridgeToken = "relay-smoke-token";
 const directory = fileURLToPath(new URL(".", import.meta.url));
+const repository = fileURLToPath(new URL("../../", import.meta.url));
+const requestedSmokeVersion = process.env.GAIUS_SMOKE_MINECRAFT_VERSION ??
+        process.env.GAIUS_SMOKE_PROTOCOL_VERSION;
+const activeVersionProfile = await loadActiveVersionProfile(requestedSmokeVersion);
 const minecraftHost = process.env.GAIUS_SMOKE_MINECRAFT_HOST;
-const minecraftPort = Number(process.env.GAIUS_SMOKE_MINECRAFT_PORT ?? "25565");
+const minecraftPort = parseMinecraftPort(process.env.GAIUS_SMOKE_MINECRAFT_PORT ?? "25565");
 const minecraftSessionUrl = process.env.GAIUS_SMOKE_SESSION_URL;
 const minecraftAccessToken = process.env.GAIUS_SMOKE_ACCESS_TOKEN ?? "gaius-smoke-token";
 const minecraftProfileId = process.env.GAIUS_SMOKE_PROFILE_ID ??
         "00000000000040008000000000000002";
 const minecraftUsername = process.env.GAIUS_SMOKE_USERNAME ?? "GaiusSmoke";
+const minecraftProfile = resolveSmokeMinecraftProfile(
+        requestedSmokeVersion ?? activeVersionProfile.id);
+if (activeVersionProfile.id !== minecraftProfile.name) {
+    throw new Error(`Smoke profile ${activeVersionProfile.id} does not match ` +
+        `Minecraft protocol profile ${minecraftProfile.name}`);
+}
 const dnsTransientHost = "dns-transient.gaius.test";
 const dnsPermanentHost = "dns-permanent.gaius.test";
 const srvTransientHost = "srv-transient.gaius.test";
 const minecraftPlaySoakMs = Math.max(
         0,
         Number.parseInt(process.env.GAIUS_SMOKE_PLAY_SOAK_MS ?? "0", 10) || 0);
+const minecraftClientViewDistance = parseBoundedInteger(
+        "GAIUS_SMOKE_CLIENT_VIEW_DISTANCE", 6, 2, 32);
+const minecraftDesiredChunksPerTick = parseBoundedFloat(
+        "GAIUS_SMOKE_DESIRED_CHUNKS_PER_TICK", 64, 0.01, 64);
 const acceptServerPrompts =
         process.env.GAIUS_SMOKE_ACCEPT_SERVER_PROMPTS === "1" ||
         process.env.GAIUS_SMOKE_ACCEPT_DIALOGS === "1";
@@ -86,8 +107,10 @@ const resourcePackFixture = createHttpServer((request, response) => {
         "content-length": String(resourcePackPayload.byteLength),
     });
     if (resourcePackAttempts < 3) {
-        response.write(resourcePackPayload.subarray(0, 1024 * 1024));
-        response.destroy();
+        // End the response cleanly after a short body while retaining the
+        // full Content-Length. This specifically exercises the RelayNode's
+        // declared-length check rather than relying only on a socket reset.
+        response.end(resourcePackPayload.subarray(0, 1024 * 1024));
         return;
     }
     response.end(resourcePackPayload);
@@ -99,6 +122,7 @@ await new Promise((resolve, reject) => {
 const resourcePackFixturePort = resourcePackFixture.address().port;
 
 let fixtureSocket;
+let fixtureTcpBytes = 0;
 let echoEnabled = true;
 let proxiedKeepAlives = 0;
 let proxiedPlayKeepAlives = 0;
@@ -107,6 +131,7 @@ fixture.on("connection", (socket) => {
     fixtureSocket = socket;
     socket.setNoDelay(true);
     socket.on("data", (chunk) => {
+        fixtureTcpBytes += chunk.byteLength;
         if (isVanillaKeepAlive(chunk)) {
             proxiedKeepAlives++;
             return;
@@ -247,12 +272,26 @@ try {
             !manifest.capabilities.includes("configuration-reentry") ||
             !manifest.capabilities.includes("target-affinity") ||
             !manifest.capabilities.includes("target-attestation") ||
+            !manifest.capabilities.includes("runtime-telemetry") ||
             manifest.targetAffinityMs < 1000 ||
             !manifest.capabilities.includes("resource-pack-proxy") ||
             !manifest.capabilities.includes("resource-pack-cache") ||
             manifest.resourcePackCache?.entries !== 1 ||
-            manifest.resourcePackCache?.bytes !== resourcePackPayload.byteLength) {
+            manifest.resourcePackCache?.bytes !== resourcePackPayload.byteLength ||
+            manifest.runtime?.activeClientStallTimers !== 0 ||
+            !Number.isSafeInteger(manifest.runtime?.rssBytes) ||
+            !Number.isSafeInteger(manifest.runtime?.cpuUserMicros) ||
+            !Number.isSafeInteger(manifest.runtime?.cpuSystemMicros) ||
+            !Number.isSafeInteger(manifest.runtime?.publicDnsCacheEntries) ||
+            !Number.isSafeInteger(manifest.runtime?.publicDnsCacheHits) ||
+            !Number.isSafeInteger(manifest.runtime?.publicDnsCacheMisses) ||
+            !Number.isSafeInteger(manifest.runtime?.publicDnsCacheInflightJoins)) {
         throw new Error("Translator node manifest did not describe the tunnel capability");
+    }
+    if (manifest.activeConnections !== 0 ||
+            manifest.runtime?.activeTunnelLeases !== 0 ||
+            manifest.runtime?.activeTransportWebSockets !== 0) {
+        throw new Error("Translator node baseline retained a logical or physical tunnel");
     }
     const deniedTargetResponse = await fetchTargetManifest(
             bridgePort, fixturePort, undefined);
@@ -320,6 +359,11 @@ try {
             targetActive.target?.totalConnections !== 1) {
         throw new Error("Translator node did not publish active target affinity");
     }
+    if (targetActive.activeConnections !== 1 ||
+            targetActive.runtime?.activeTunnelLeases !== 1 ||
+            targetActive.runtime?.activeTransportWebSockets !== 1) {
+        throw new Error("Translator node did not publish the active logical/physical tunnel");
+    }
 
     const healthResponse = await fetch(`http://${host}:${bridgePort}/health`, {
         headers: {origin},
@@ -330,7 +374,33 @@ try {
         throw new Error("Translator node health did not report the active tunnel");
     }
 
-    const upload = patternedBuffer(4 * 1024 * 1024, 0x31);
+    // Keepalive rewriting is profile-gated. Establish the selected packet
+    // table before sending the fixture keepalive; an unprofiled/raw tunnel
+    // must never fall back to the 1.21.11 ids.
+    const profileHandshake = encodePacket(0, Buffer.concat([
+        encodeVarInt(minecraftProfile.protocolVersion),
+        encodeString("ellan.top"),
+        Buffer.from([(fixturePort >>> 8) & 0xff, fixturePort & 0xff]),
+        encodeVarInt(1),
+    ]));
+    const echoedBeforeHandshake = echoedBytes;
+    webSocket.send(profileHandshake);
+    await waitFor(
+            () => echoedBytes === echoedBeforeHandshake + profileHandshake.byteLength,
+            "profile handshake echo",
+    );
+    echoed.length = 0;
+    echoedBytes = 0;
+
+    const uploadChannel = Buffer.from("minecraft:brand", "utf8");
+    const uploadPayload = Buffer.concat([
+        Buffer.from([uploadChannel.byteLength]),
+        uploadChannel,
+        patternedBuffer(4 * 1024 * 1024 - 1 - uploadChannel.byteLength, 0x31),
+    ]);
+    const upload = encodePacket(
+            minecraftProfile.play.serverboundCustomPayload,
+            uploadPayload);
     webSocket.send(upload);
     await waitFor(() => echoedBytes === upload.byteLength, "4 MiB tunnel echo");
     if (!Buffer.concat(echoed, echoedBytes).equals(upload)) {
@@ -338,9 +408,10 @@ try {
     }
 
     const keepAlive = Buffer.from("0a00040000000000000001", "hex");
+    const echoedBeforeKeepAlive = echoedBytes;
     fixtureSocket.write(keepAlive);
     await waitFor(() => proxiedKeepAlives === 1, "proxied vanilla keepalive");
-    if (echoedBytes !== upload.byteLength) {
+    if (echoedBytes !== echoedBeforeKeepAlive) {
         throw new Error("Translator node forwarded a proxied keepalive to the browser");
     }
 
@@ -380,13 +451,24 @@ try {
     fixtureSocket.destroy();
     fixtureSocket = undefined;
 
-    const targetRecent = await (await fetchTargetManifest(
-            bridgePort, fixturePort, bridgeToken)).json();
-    if (targetRecent.target?.activeConnections !== 0 ||
-            targetRecent.target?.recentlyReachable !== true ||
-            targetRecent.target?.totalConnections !== 1) {
-        throw new Error("Translator node did not retain recent target affinity after close");
+    // The client WebSocket close event can win the RelayNode process' matching
+    // close callback. Wait for the server-side route release instead of racing
+    // a single manifest fetch on slower CI runners.
+    const targetRecent = await waitForTargetRoute(
+            bridgePort, fixturePort, bridgeToken, 0, "recent target release");
+    if (targetRecent.activeConnections !== 0 ||
+            targetRecent.recentlyReachable !== true ||
+            targetRecent.totalConnections !== 1) {
+        throw new Error("Translator node did not retain recent target affinity after close: " +
+            JSON.stringify(targetRecent));
     }
+    const afterCloseRuntime = await waitForRelayRuntime(
+        bridgePort,
+        bridgeToken,
+        (runtime) => runtime.activeTunnelLeases === 0 &&
+            runtime.activeTransportWebSockets === 0,
+        "logical and physical tunnel cleanup",
+    );
 
     const sharedTargetLifecycle = await testSharedTargetLifecycle(bridgePort, bridgeToken);
     await testFramedPlayKeepAlive(bridgePort, fixturePort);
@@ -402,6 +484,11 @@ try {
             : undefined;
     console.log(JSON.stringify({
         ok: true,
+        profile: {
+            id: minecraftProfile.name,
+            protocolVersion: minecraftProfile.protocolVersion,
+            profilePath: activeVersionProfile.path,
+        },
         echoBytes: echoedBytes,
         pausedBytes: 0,
         resumedBytes: floodedBytes,
@@ -422,7 +509,9 @@ try {
             requiresToken: manifest.requiresToken,
             targetAffinityMs: manifest.targetAffinityMs,
             targetActiveConnections: targetActive.target.activeConnections,
-            targetRecentlyReachable: targetRecent.target.recentlyReachable,
+            targetRecentlyReachable: targetRecent.recentlyReachable,
+            activeTunnelLeasesAfterClose: afterCloseRuntime.activeTunnelLeases,
+            activeTransportWebSocketsAfterClose: afterCloseRuntime.activeTransportWebSockets,
         },
         ...(minecraftLogin === undefined ? {} : { minecraftLogin }),
     }));
@@ -458,6 +547,63 @@ function fetchTargetManifest(bridgePort, targetPort, token) {
         headers.authorization = `Bearer ${token}`;
     }
     return fetch(url, {headers});
+}
+
+async function fetchRelayRuntime(bridgePort, token) {
+    const response = await fetch(`http://${host}:${bridgePort}/relay-node/v1`, {
+        headers: {
+            origin,
+            authorization: `Bearer ${token}`,
+        },
+    });
+    if (!response.ok) {
+        throw new Error(`RelayNode runtime manifest returned ${response.status}`);
+    }
+    const manifest = await response.json();
+    return manifest.runtime ?? {};
+}
+
+async function waitForRelayRuntime(bridgePort, token, predicate, label, timeoutMs = 10000) {
+    const deadline = Date.now() + timeoutMs;
+    let runtime;
+    while (Date.now() < deadline) {
+        runtime = await fetchRelayRuntime(bridgePort, token);
+        if (predicate(runtime)) return runtime;
+        await delay(10);
+    }
+    throw new Error(`${label} timed out: ${JSON.stringify(runtime ?? {})}`);
+}
+
+async function waitForFixtureBackpressureDrain(
+        bridgePort,
+        token,
+        baselineBytes,
+        expectedPayloadBytes,
+        baselineSyntheticWrites,
+        syntheticTickBytes,
+        label,
+        timeoutMs = 10000) {
+    const deadline = Date.now() + timeoutMs;
+    let runtime;
+    while (Date.now() < deadline) {
+        runtime = await fetchRelayRuntime(bridgePort, token);
+        const syntheticWrites = Math.max(
+                0,
+                (runtime.syntheticPlayTickWrites ?? 0) - baselineSyntheticWrites);
+        const expectedBytes = expectedPayloadBytes + syntheticWrites * syntheticTickBytes;
+        if ((runtime.pendingSyntheticPlayTicks ?? 0) === 0 &&
+                syntheticWrites > 0 &&
+                fixtureTcpBytes - baselineBytes >= expectedBytes) {
+            return runtime;
+        }
+        await delay(10);
+    }
+    throw new Error(`${label} timed out: ${JSON.stringify({
+        runtime: runtime ?? {},
+        fixtureTcpBytes,
+        baselineBytes,
+        expectedPayloadBytes,
+    })}`);
 }
 
 async function testSharedTargetLifecycle(bridgePort, token) {
@@ -750,19 +896,122 @@ function patternedBuffer(length, seed) {
     return bytes;
 }
 
+function nativePath(value) {
+    const text = String(value ?? "").trim().replaceAll("\\", "/");
+    if (process.platform === "win32" && /^\/[A-Za-z](?:\/|$)/u.test(text)) {
+        return `${text[1].toUpperCase()}:${text.slice(2)}`;
+    }
+    return text;
+}
+
+function resolveRepositoryPath(value) {
+    const normalized = nativePath(value);
+    return path.isAbsolute(normalized)
+        ? path.resolve(normalized)
+        : path.resolve(repository, normalized);
+}
+
+function pathInside(parent, child) {
+    const relative = path.relative(path.resolve(parent), path.resolve(child));
+    return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) &&
+        !path.isAbsolute(relative));
+}
+
+async function loadActiveVersionProfile(requestedProfileSelector) {
+    const config = JSON.parse(await readFile(path.join(repository, "port", "config.json"), "utf8"));
+    let selected = nativePath(
+            process.env.GAIUS_VERSION_PROFILE_PATH ?? config.versionProfile ?? "");
+    if (process.env.GAIUS_VERSION_PROFILE_PATH === undefined &&
+            requestedProfileSelector !== undefined) {
+        selected = `versions/${resolveSmokeMinecraftProfile(requestedProfileSelector).name}.json`;
+    }
+    if (/^\d+(?:\.\d+)+$/u.test(selected)) selected = `versions/${selected}.json`;
+    let profilePath;
+    if (path.isAbsolute(selected)) {
+        profilePath = path.resolve(selected);
+    }
+    else if (selected.startsWith("port/")) {
+        profilePath = path.resolve(repository, selected);
+    }
+    else if (selected.startsWith("versions/")) {
+        profilePath = path.resolve(repository, "port", selected);
+    }
+    else {
+        profilePath = path.resolve(repository, selected);
+    }
+    const versionsDirectory = path.join(repository, "port", "versions");
+    if (!pathInside(versionsDirectory, profilePath) || !profilePath.endsWith(".json")) {
+        throw new Error(`Active version profile must be inside port/versions: ${profilePath}`);
+    }
+    const profile = JSON.parse(await readFile(profilePath, "utf8"));
+    if (typeof profile.id !== "string" || !Number.isInteger(profile.protocolVersion)) {
+        throw new Error(`Active version profile is invalid: ${profilePath}`);
+    }
+    return {...profile, path: profilePath};
+}
+
+function parseMinecraftPort(value) {
+    const port = Number(value);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new Error(`GAIUS_SMOKE_MINECRAFT_PORT must be an integer from 1 to 65535: ${value}`);
+    }
+    return port;
+}
+
+function parseBoundedInteger(name, defaultValue, minimum, maximum) {
+    const raw = process.env[name];
+    if (raw === undefined) return defaultValue;
+    if (!/^(?:0|[1-9][0-9]*)$/u.test(raw)) {
+        throw new Error(`${name} must be an integer from ${minimum} to ${maximum}`);
+    }
+    const value = Number(raw);
+    if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+        throw new Error(`${name} must be an integer from ${minimum} to ${maximum}`);
+    }
+    return value;
+}
+
+function parseBoundedFloat(name, defaultValue, minimum, maximum) {
+    const raw = process.env[name];
+    if (raw === undefined) return defaultValue;
+    if (!/^(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)$/u.test(raw)) {
+        throw new Error(`${name} must be a finite number from ${minimum} to ${maximum}`);
+    }
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value < minimum || value > maximum) {
+        throw new Error(`${name} must be a finite number from ${minimum} to ${maximum}`);
+    }
+    return value;
+}
+
+function resolveSmokeMinecraftProfile(value) {
+    const key = String(value ?? "").trim();
+    const profile = [MINECRAFT_1_21_11, MINECRAFT_26_2]
+            .find((candidate) => candidate.name === key ||
+                    String(candidate.protocolVersion) === key);
+    if (profile === undefined) {
+        throw new Error(
+                `Unsupported smoke Minecraft version ${value}; expected 1.21.11/774 or 26.2/776`);
+    }
+    return profile;
+}
+
 function isVanillaKeepAlive(chunk) {
     return chunk.byteLength === 11 && chunk[0] === 0x0a &&
-        chunk[1] === 0x00 && chunk[2] === 0x04;
+        chunk[1] === 0x00 &&
+        chunk[2] === minecraftProfile.configuration.clientboundKeepAlive;
 }
 
 function isPlayKeepAlive(chunk) {
     return chunk.byteLength === 11 && chunk[0] === 0x0a &&
-        chunk[1] === 0x00 && chunk[2] === 0x1b;
+        chunk[1] === 0x00 &&
+        chunk[2] === minecraftProfile.play.serverboundKeepAlive;
 }
 
 function isClientTickEnd(chunk) {
     return chunk.byteLength === 3 && chunk[0] === 0x02 &&
-        chunk[1] === 0x00 && chunk[2] === 0x0c;
+        chunk[1] === 0x00 &&
+        chunk[2] === minecraftProfile.play.serverboundClientTickEnd;
 }
 
 async function testFramedPlayKeepAlive(bridgePort, fixturePort) {
@@ -786,21 +1035,258 @@ async function testFramedPlayKeepAlive(bridgePort, fixturePort) {
             "framed tunnel connection");
     await waitFor(() => fixtureSocket !== undefined, "framed fixture connection");
 
-    socket.send(Buffer.from("1000860609656c6c616e2e746f7063dd02", "hex"));
-    const splitClientFrames = Buffer.from("020003020003", "hex");
+    socket.send(encodePacket(0, Buffer.concat([
+        encodeVarInt(minecraftProfile.protocolVersion),
+        encodeString("ellan.top"),
+        Buffer.from("dd02", "hex"),
+        encodeVarInt(2),
+    ])));
+    const splitClientFrames = Buffer.concat([
+        encodePacket(minecraftProfile.configuration.serverboundFinish, Buffer.alloc(0), 256),
+        encodePacket(minecraftProfile.configuration.serverboundFinish, Buffer.alloc(0), 256),
+    ]);
     socket.send(splitClientFrames.subarray(0, 4));
     socket.send(splitClientFrames.subarray(4));
     await waitFor(() => proxiedPlayTicks >= 1, "synthetic initial play tick");
-    socket.send(Buffer.from("02000c", "hex"));
+    // Regression: one upstream TCP write can contain several complete framed
+    // packets. Pause the browser reader so RelayNode's WebSocket high-water
+    // guard must stop the parser inside that same data callback, then prove
+    // that the retained complete frames drain on a scheduled turn before TCP
+    // read resumes.
+    const serverBackpressureBefore = await fetchRelayRuntime(bridgePort, bridgeToken);
+    const backpressureChannel = Buffer.from("minecraft:brand", "utf8");
+    // Fill well below the 4 MiB high-water mark first, then write a separate
+    // tail large enough to cross it. The tail therefore starts on a frame
+    // boundary and must leave several complete frames retained when parsing
+    // pauses; this avoids accepting a partial-frame-only false positive.
+    const backpressurePrefixFrameCount = 512;
+    const backpressureTailFrameCount = 4096;
+    const backpressureFrameCount =
+        backpressurePrefixFrameCount + backpressureTailFrameCount;
+    // Keep frames smaller than the usual TCP data callback.  That makes the
+    // high-water assertion deterministic: when ws crosses 4 MiB, the pause is
+    // recorded inside the tail callback.  TCP callback boundaries may leave a
+    // partial frame or complete frames in the accumulator; the integration
+    // gate uses the cumulative pause evidence and the final byte/hash checks.
+    const backpressurePayloadBytes = 2 * 1024;
+    const backpressureFrames = Array.from({ length: backpressureFrameCount }, (_, index) => encodePacket(
+        minecraftProfile.play.clientboundCustomPayload,
+        Buffer.concat([
+            Buffer.from([backpressureChannel.byteLength]),
+            backpressureChannel,
+            patternedBuffer(
+                backpressurePayloadBytes - 1 - backpressureChannel.byteLength,
+                0x71 + index,
+            ),
+        ]),
+    ));
+    const backpressureBurst = Buffer.concat(backpressureFrames);
+    const backpressurePrefixBurst = Buffer.concat(
+        backpressureFrames.slice(0, backpressurePrefixFrameCount));
+    const backpressureTailBurst = Buffer.concat(
+        backpressureFrames.slice(backpressurePrefixFrameCount));
+    const backpressureExpectedHash = createHash("sha256")
+        .update(backpressureBurst)
+        .digest("hex");
+    const serverFramesBeforeBackpressure = serverFrames.length;
+    const pausedReader = socket._socket;
+    if (pausedReader === undefined || typeof pausedReader.pause !== "function" ||
+        typeof pausedReader.resume !== "function") {
+        throw new Error("WebSocket smoke transport did not expose a pausable reader");
+    }
+    pausedReader.pause();
+    try {
+        fixtureSocket.write(backpressurePrefixBurst);
+        const prefixRuntime = await waitForRelayRuntime(
+            bridgePort,
+            bridgeToken,
+            (runtime) =>
+                (runtime.serverFramePauses ?? 0) ===
+                    (serverBackpressureBefore.serverFramePauses ?? 0) &&
+                (runtime.serverFrameBufferedBytes ??
+                    runtime.serverFrameBackpressure?.bufferedFrameBytes ?? 0) === 0 &&
+                (runtime.serverFramesSent ?? 0) -
+                    (serverBackpressureBefore.serverFramesSent ?? 0) ===
+                    backpressurePrefixFrameCount,
+            "server framed WebSocket below-water prefix",
+        );
+        fixtureSocket.write(backpressureTailBurst);
+        const pausedRuntime = await waitForRelayRuntime(
+            bridgePort,
+            bridgeToken,
+            (runtime) =>
+                (runtime.serverFramePauses ?? 0) >
+                    (serverBackpressureBefore.serverFramePauses ?? 0) &&
+                (runtime.serverFrameDataCallbacksAtPause ?? 0) >
+                    (prefixRuntime.serverFrameDataCallbacks ?? 0) &&
+                (runtime.serverFramesAfterPause ?? 0) ===
+                    (serverBackpressureBefore.serverFramesAfterPause ?? 0),
+            "server framed WebSocket high-water pause",
+        );
+        if ((pausedRuntime.serverFramesAfterPause ?? 0) !==
+                (serverBackpressureBefore.serverFramesAfterPause ?? 0) ||
+            (pausedRuntime.serverFrameDataCallbacksAtPause ?? 0) <=
+                (prefixRuntime.serverFrameDataCallbacks ?? 0)) {
+            throw new Error(
+                "RelayNode parser advanced after TCP pause or did not record a tail pause",
+            );
+        }
+    }
+    finally {
+        pausedReader.resume();
+    }
+    const drainedServerRuntime = await waitForRelayRuntime(
+        bridgePort,
+        bridgeToken,
+        (runtime) =>
+            (runtime.serverFrameResumes ?? 0) >
+                (serverBackpressureBefore.serverFrameResumes ?? 0) &&
+            (runtime.serverFrameBufferedBytes ??
+                runtime.serverFrameBackpressure?.bufferedFrameBytes ?? 0) === 0 &&
+            (runtime.serverFramesSent ?? 0) -
+                (serverBackpressureBefore.serverFramesSent ?? 0) === backpressureFrameCount &&
+            (runtime.serverFrameScheduledDrains ?? 0) >
+                (serverBackpressureBefore.serverFrameScheduledDrains ?? 0) &&
+            (runtime.serverFrameDrainCompletions ?? 0) >
+                (serverBackpressureBefore.serverFrameDrainCompletions ?? 0) &&
+            (runtime.serverFrameBufferedCompleteFrames ?? 0) === 0 &&
+            (runtime.serverFrameDataCallbacksAtDrainStart ?? -1) ===
+                (runtime.serverFrameDataCallbacksAtPause ?? -2) &&
+            (runtime.serverFrameDataCallbacksAtDrainCompletion ?? -1) ===
+                (runtime.serverFrameDataCallbacksAtPause ?? -2),
+        "server framed WebSocket low-water drain",
+    );
+    await waitFor(
+        () => Buffer.concat(serverFrames.slice(serverFramesBeforeBackpressure)).byteLength >=
+            backpressureBurst.byteLength,
+        "server framed WebSocket bytes after low-water drain",
+    );
+    const drainedServerFrames = serverFrames.slice(serverFramesBeforeBackpressure);
+    const drainedServerBytes = Buffer.concat(drainedServerFrames);
+    if (drainedServerFrames.length <= 0 ||
+        drainedServerFrames.length >= backpressureFrameCount ||
+        !drainedServerBytes.equals(backpressureBurst)) {
+        throw new Error(`RelayNode did not preserve framed server bytes across backpressure: ` +
+            `frames=${drainedServerFrames.length}/${backpressureFrameCount} ` +
+            `bytes=${drainedServerBytes.byteLength}/${backpressureBurst.byteLength}`);
+    }
+    const drainedServerHash = createHash("sha256")
+        .update(drainedServerBytes)
+        .digest("hex");
+    console.log(JSON.stringify({
+        kind: "relay-batching-burst",
+        protocol: minecraftProfile.protocolVersion,
+        minecraftPackets: backpressureFrameCount,
+        webSocketMessages: drainedServerFrames.length,
+        bytes: drainedServerBytes.byteLength,
+        sha256: drainedServerHash,
+    }));
+    if (drainedServerHash !== backpressureExpectedHash ||
+        (drainedServerRuntime.serverFrameBytesSent ?? 0) -
+            (serverBackpressureBefore.serverFrameBytesSent ?? 0) !== backpressureBurst.byteLength ||
+        (drainedServerRuntime.serverFrameScheduledDrains ?? 0) <=
+            (serverBackpressureBefore.serverFrameScheduledDrains ?? 0) ||
+        (drainedServerRuntime.serverFrameDataCallbacksAtDrainStart ?? -1) !==
+            (drainedServerRuntime.serverFrameDataCallbacksAtPause ?? -2) ||
+        (drainedServerRuntime.serverFrameDataCallbacksAtDrainCompletion ?? -1) !==
+            (drainedServerRuntime.serverFrameDataCallbacksAtPause ?? -2) ||
+        (drainedServerRuntime.serverFrameBufferedCompleteFrames ?? 0) !== 0 ||
+        (drainedServerRuntime.serverFramesAfterPause ?? 0) !==
+            (serverBackpressureBefore.serverFramesAfterPause ?? 0) ||
+        (drainedServerRuntime.serverFrameSendErrors ?? 0) !==
+            (serverBackpressureBefore.serverFrameSendErrors ?? 0) ||
+        (drainedServerRuntime.serverFrameCleanupBytes ?? 0) !==
+            (serverBackpressureBefore.serverFrameCleanupBytes ?? 0) ||
+        (drainedServerRuntime.serverFrameBufferedUnderflows ?? 0) !==
+            (serverBackpressureBefore.serverFrameBufferedUnderflows ?? 0) ||
+        (drainedServerRuntime.activeServerFrameDrainHandleUnderflows ?? 0) !==
+            (serverBackpressureBefore.activeServerFrameDrainHandleUnderflows ?? 0) ||
+        (drainedServerRuntime.serverFrameMaxBufferedAmount ?? 0) <= 0 ||
+        (drainedServerRuntime.serverFrameMaxBufferedBytes ??
+            drainedServerRuntime.serverFrameBackpressure?.maxBufferedFrameBytes ?? 0) <= 0) {
+        throw new Error("RelayNode server framed backpressure telemetry or SHA mismatch");
+    }
+    // Pause the backend reader and fill RelayNode's TCP write queue with one
+    // legal, bounded PLAY custom-payload frame. This makes write() return
+    // false deterministically instead of relying on a timing-only pause.
+    const backpressureBefore = await fetchRelayRuntime(bridgePort, bridgeToken);
+    const customChannel = Buffer.from("minecraft:brand", "utf8");
+    const largePayloadBytes = 4 * 1024 * 1024;
+    const largeCustomPayload = Buffer.concat([
+        Buffer.from([customChannel.byteLength]),
+        customChannel,
+        Buffer.alloc(largePayloadBytes - 1 - customChannel.byteLength, 0x5a),
+    ]);
+    const largeClientFrame = encodePacket(
+            minecraftProfile.play.serverboundCustomPayload,
+            largeCustomPayload);
+    const largeClientBurst = Buffer.concat([
+        largeClientFrame,
+        largeClientFrame,
+        largeClientFrame,
+    ]);
+    const fixtureBytesBeforeBackpressure = fixtureTcpBytes;
+    const syntheticWritesBeforeBackpressure =
+        backpressureBefore.syntheticPlayTickWrites ?? 0;
+    const syntheticTickFrame = encodePacket(
+            minecraftProfile.play.serverboundClientTickEnd,
+            Buffer.alloc(0),
+            256);
+    fixtureSocket.pause();
+    echoEnabled = false;
+    try {
+        for (let index = 0; index < 8; index++) {
+            socket.send(largeClientBurst);
+        }
+        await waitForRelayRuntime(
+                bridgePort,
+                bridgeToken,
+                (runtime) =>
+                    (runtime.syntheticPlayTickBackpressureEvents ?? 0) >
+                        (backpressureBefore.syntheticPlayTickBackpressureEvents ?? 0) &&
+                    (runtime.pendingSyntheticPlayTicks ?? 0) === 1 &&
+                    (runtime.maxPendingSyntheticPlayTicks ?? 0) <= 1,
+                "deterministic synthetic PLAY tick backpressure",
+        );
+    }
+    finally {
+        fixtureSocket.resume();
+    }
+    const drainedRuntime = await waitForFixtureBackpressureDrain(
+            bridgePort,
+            bridgeToken,
+            fixtureBytesBeforeBackpressure,
+            largeClientBurst.byteLength * 8,
+            syntheticWritesBeforeBackpressure,
+            syntheticTickFrame.byteLength,
+            "synthetic PLAY tick drain",
+    );
+    if ((drainedRuntime.syntheticPlayTickWrites ?? 0) <= syntheticWritesBeforeBackpressure) {
+        throw new Error("Synthetic PLAY tick backpressure drained without a retry write");
+    }
+    // Do not re-enable fixture echo until every queued large frame and the
+    // drain-triggered synthetic tick have reached the fixture reader. Otherwise
+    // trailing probe bytes can be echoed back into the framed client parser.
+    echoEnabled = true;
+    socket.send(encodePacket(
+            minecraftProfile.play.serverboundClientTickEnd,
+            Buffer.alloc(0),
+            256));
     await waitFor(() => proxiedPlayTicks >= 3, "proxied observed play ticks at vanilla cadence");
-    const playKeepAlive = Buffer.from("0a002b0000000000000002", "hex");
+    const playKeepAlive = encodePacket(
+            minecraftProfile.play.clientboundKeepAlive,
+            Buffer.from("0000000000000002", "hex"),
+            256);
     // Packet boundaries are independent from TCP chunks, so split this frame.
     fixtureSocket.write(playKeepAlive.subarray(0, 4));
     await delay(5);
     fixtureSocket.write(playKeepAlive.subarray(4));
     await waitFor(() => proxiedPlayKeepAlives === 1, "proxied framed play keepalive");
 
-    const startConfiguration = Buffer.from("020074", "hex");
+    const startConfiguration = encodePacket(
+            minecraftProfile.play.clientboundStartConfiguration,
+            Buffer.alloc(0),
+            256);
     fixtureSocket.write(startConfiguration);
     await waitFor(
             () => serverFrames.some((frame) => frame.equals(startConfiguration)),
@@ -811,18 +1297,32 @@ async function testFramedPlayKeepAlive(bridgePort, fixturePort) {
         throw new Error("Translator node injected PLAY ticks while reconfiguration was pending");
     }
 
-    socket.send(Buffer.from("02000f", "hex"));
+    // The server is already in CONFIGURATION as soon as Start Configuration
+    // arrives, even before the browser sends its acknowledgement.
+    fixtureSocket.write(configurationKeepAliveFrame(minecraftProfile, 4));
+    await waitFor(
+            () => proxiedKeepAlives === 2,
+            "proxied keepalive during reconfiguration transition",
+    );
+
+    socket.send(encodePacket(
+            minecraftProfile.play.serverboundConfigurationAcknowledged,
+            Buffer.alloc(0),
+            256));
     await delay(20);
-    const configurationKeepAlive = Buffer.from("0a00040000000000000003", "hex");
+    const configurationKeepAlive = configurationKeepAliveFrame(minecraftProfile, 3);
     fixtureSocket.write(configurationKeepAlive);
-    await waitFor(() => proxiedKeepAlives === 2, "proxied reconfiguration keepalive");
+    await waitFor(() => proxiedKeepAlives === 3, "proxied reconfiguration keepalive");
     const ticksDuringConfiguration = proxiedPlayTicks;
     await delay(200);
     if (proxiedPlayTicks !== ticksDuringConfiguration) {
         throw new Error("Translator node injected PLAY ticks during CONFIGURATION");
     }
 
-    socket.send(Buffer.from("020003", "hex"));
+    socket.send(encodePacket(
+            minecraftProfile.configuration.serverboundFinish,
+            Buffer.alloc(0),
+            256));
     await waitFor(
             () => proxiedPlayTicks > ticksDuringConfiguration,
             "re-armed play ticks after reconfiguration");
@@ -832,6 +1332,28 @@ async function testFramedPlayKeepAlive(bridgePort, fixturePort) {
     await once(socket, "close");
     fixtureSocket.destroy();
     fixtureSocket = undefined;
+    await waitForRelayRuntime(
+            bridgePort,
+            bridgeToken,
+        (runtime) => (runtime.activeClientStallTimers ?? 0) === 0 &&
+                (runtime.pendingSyntheticPlayTicks ?? 0) === 0 &&
+            (runtime.serverFrameBufferedBytes ??
+                    runtime.serverFrameBackpressure?.bufferedFrameBytes ?? 0) === 0 &&
+                (runtime.serverFrameBufferedCompleteFrames ?? 0) === 0 &&
+                (runtime.serverFrameCleanupBytes ?? 0) ===
+                    (serverBackpressureBefore.serverFrameCleanupBytes ?? 0) &&
+                (runtime.serverFrameBufferedUnderflows ?? 0) ===
+                    (serverBackpressureBefore.serverFrameBufferedUnderflows ?? 0) &&
+                (runtime.activeServerFrameDrainHandles ?? 0) === 0,
+            "closed PLAY stall state",
+    );
+}
+
+function configurationKeepAliveFrame(profile, value) {
+    return encodePacket(
+            profile.configuration.clientboundKeepAlive,
+            Buffer.from(`000000000000000${value}`, "hex"),
+            256);
 }
 
 async function writePatterned(socket, length, hash) {
@@ -856,6 +1378,9 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
     let cipher;
     let decipher;
     let encryptionRequest = false;
+    let rsaSecretEncrypted = false;
+    let rsaChallengeEncrypted = false;
+    let aesCfb8Enabled = false;
     let sessionJoin = false;
     let compressionThreshold;
     let phase = "login";
@@ -877,7 +1402,22 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
     const resourcePackTargets = [];
     let playPackets = 0;
     let playLoginPackets = 0;
+    let playLoginDistanceContracts = 0;
     let chunkPackets = 0;
+    const uniqueChunkPositions = new Set();
+    let duplicateChunkPackets = 0;
+    let observedChunkCacheCenter = null;
+    let observedChunkCacheRadius = null;
+    let observedSimulationDistance = null;
+    let chunkCacheCenterUpdates = 0;
+    let chunkCacheRadiusUpdates = 0;
+    let simulationDistanceUpdates = 0;
+    let chunkBatchStarts = 0;
+    let chunkBatchFinished = 0;
+    let chunkBatchAcknowledgements = 0;
+    let chunkBatchCountMismatches = 0;
+    let chunkBatchOpen = false;
+    let currentChunkBatchPackets = 0;
     let playerLoadedSent = false;
     let protocolFailure;
     let expectedClose = false;
@@ -943,10 +1483,12 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
                     bytes: payload.byteLength,
                 });
                 if (recentPackets.length > 24) recentPackets.shift();
-                if (phase === "login" && packetId.value === 0) {
+                if (phase === "login" &&
+                        packetId.value === minecraftProfile.login.clientboundDisconnect) {
                     throw new Error("Minecraft server rejected the smoke login");
                 }
-                if (phase === "login" && packetId.value === 1) {
+                if (phase === "login" &&
+                        packetId.value === minecraftProfile.login.clientboundEncryptionRequest) {
                     if (session.sessionUrl === undefined) {
                         throw new Error(
                                 "Minecraft server requested online-mode encryption without a smoke session service");
@@ -956,29 +1498,37 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
                         protocolFailure = error;
                     });
                 }
-                else if (phase === "login" && packetId.value === 3) {
+                else if (phase === "login" &&
+                        packetId.value === minecraftProfile.login.clientboundCompression) {
                     const threshold = decodeVarInt(packet, packetId.bytesRead);
                     if (threshold === undefined || threshold.value < 0) {
                         throw new Error("Minecraft server sent an invalid compression threshold");
                     }
                     compressionThreshold = threshold.value;
                 }
-                else if (phase === "login" && packetId.value === 2) {
+                else if (phase === "login" &&
+                        packetId.value === minecraftProfile.login.clientboundLoginFinished) {
                     loginFinished = true;
                     phase = "configuration";
-                    sendMinecraftPacket(3, Buffer.alloc(0));
-                    sendMinecraftPacket(0, encodeClientInformation());
+                    sendMinecraftPacket(
+                            minecraftProfile.login.serverboundLoginAcknowledged,
+                            Buffer.alloc(0));
+                    sendMinecraftPacket(
+                            minecraftProfile.login.serverboundHello,
+                            encodeClientInformation());
                 }
                 else if (phase === "configuration") {
                     configurationPackets++;
-                    if (packetId.value === 2) {
+                    if (packetId.value === minecraftProfile.configuration.clientboundDisconnect) {
                         throw new Error("Minecraft server disconnected during configuration");
                     }
-                    if (packetId.value === 14) {
+                    if (packetId.value === minecraftProfile.configuration.clientboundKnownPacks) {
                         knownPackRequests++;
-                        sendMinecraftPacket(7, encodeVarInt(0));
+                        sendMinecraftPacket(
+                                minecraftProfile.configuration.serverboundSelectKnownPacks,
+                                encodeVarInt(0));
                     }
-                    else if (packetId.value === 9) {
+                    else if (packetId.value === minecraftProfile.configuration.clientboundResourcePackPush) {
                         if (payload.byteLength < 16) {
                             throw new Error("Resource-pack push omitted its UUID");
                         }
@@ -1005,10 +1555,12 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
                         // This protocol smoke verifies the transport and configuration
                         // handshake. Browser resource downloading is covered separately.
                         for (const action of [3, 4, 0]) {
-                            sendMinecraftPacket(6, Buffer.concat([packId, encodeVarInt(action)]));
+                            sendMinecraftPacket(
+                                    minecraftProfile.configuration.serverboundResourcePack,
+                                    Buffer.concat([packId, encodeVarInt(action)]));
                         }
                     }
-                    else if (packetId.value === 18) {
+                    else if (packetId.value === minecraftProfile.configuration.clientboundShowDialog) {
                         showDialogPackets++;
                         showDialogPayload ??= payload.toString("base64");
                         const dialog = decodeNetworkNbt(payload);
@@ -1028,11 +1580,13 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
                             throw new Error(`Minecraft server repeated dialog action ${actionId}`);
                         }
                         const inputValues = resolveDialogInputValues(prompt.inputs);
-                        sendMinecraftPacket(8, encodeCustomClickAction(actionId, inputValues));
+                        sendMinecraftPacket(
+                                minecraftProfile.configuration.serverboundCustomClickAction,
+                                encodeCustomClickAction(actionId, inputValues));
                         acceptedDialogActions.add(actionId);
                         showDialogAccepts++;
                     }
-                    else if (packetId.value === 19) {
+                    else if (packetId.value === minecraftProfile.configuration.clientboundCodeOfConduct) {
                         const codeOfConduct = decodeString(payload, 0);
                         if (codeOfConduct.nextOffset !== payload.byteLength ||
                                 codeOfConduct.value.length === 0) {
@@ -1047,49 +1601,143 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
                                     "GAIUS_SMOKE_ACCEPT_SERVER_PROMPTS=1 to model explicit acceptance");
                         }
                         // This models the explicit acceptance performed by the vanilla UI.
-                        sendMinecraftPacket(9, Buffer.alloc(0));
+                        sendMinecraftPacket(
+                                minecraftProfile.configuration.serverboundAcceptCodeOfConduct,
+                                Buffer.alloc(0));
                         codeOfConductAccepts++;
                     }
-                    else if (packetId.value === 3) {
+                    else if (packetId.value === minecraftProfile.configuration.clientboundFinish) {
                         configurationFinished = true;
                         configurationCycles++;
                         phase = "play";
-                        sendMinecraftPacket(3, Buffer.alloc(0));
+                        sendMinecraftPacket(
+                                minecraftProfile.configuration.serverboundFinish,
+                                Buffer.alloc(0));
                     }
-                    else if (packetId.value === 4) {
-                        sendMinecraftPacket(4, payload);
+                    else if (packetId.value === minecraftProfile.configuration.clientboundKeepAlive) {
+                        sendMinecraftPacket(
+                                minecraftProfile.configuration.serverboundKeepAlive,
+                                payload);
                     }
-                    else if (packetId.value === 5) {
-                        sendMinecraftPacket(5, payload);
+                    else if (packetId.value === minecraftProfile.configuration.clientboundPing) {
+                        sendMinecraftPacket(
+                                minecraftProfile.configuration.serverboundPong,
+                                payload);
                     }
                 }
                 else if (phase === "play") {
                     playPackets++;
-                    if (packetId.value === 32) {
+                    if (packetId.value === minecraftProfile.play.clientboundDisconnect) {
                         throw new Error("Minecraft server disconnected after entering PLAY");
                     }
-                    if (packetId.value === 43) {
-                        sendMinecraftPacket(27, payload);
+                    if (packetId.value === minecraftProfile.play.clientboundKeepAlive) {
+                        sendMinecraftPacket(
+                                minecraftProfile.play.serverboundKeepAlive,
+                                payload);
                     }
-                    else if (packetId.value === 59) {
-                        sendMinecraftPacket(44, payload);
+                    else if (packetId.value === minecraftProfile.play.clientboundPing) {
+                        sendMinecraftPacket(
+                                minecraftProfile.play.serverboundPong,
+                                payload);
                     }
-                    else if (packetId.value === 48) {
+                    else if (packetId.value === minecraftProfile.play.clientboundLogin) {
                         playLoginPackets++;
+                        const initialDistances = decodeClientboundLoginDistances(payload);
+                        playLoginDistanceContracts++;
+                        observedChunkCacheRadius = initialDistances.chunkRadius;
+                        observedSimulationDistance = initialDistances.simulationDistance;
+                        chunkCacheRadiusUpdates++;
+                        simulationDistanceUpdates++;
                         if (!playerLoadedSent) {
                             playerLoadedSent = true;
-                            sendMinecraftPacket(43, Buffer.alloc(0));
+                            sendMinecraftPacket(
+                                    minecraftProfile.play.serverboundPlayerLoaded,
+                                    Buffer.alloc(0));
                         }
                     }
-                    else if (packetId.value === 44) {
-                        chunkPackets++;
+                    else if (packetId.value ===
+                            minecraftProfile.play.clientboundSetChunkCacheCenter) {
+                        const x = decodeVarInt(payload, 0);
+                        const z = x === undefined
+                                ? undefined : decodeVarInt(payload, x.bytesRead);
+                        if (x === undefined || z === undefined ||
+                                x.bytesRead + z.bytesRead !== payload.byteLength) {
+                            throw new Error("Malformed PLAY chunk-cache center");
+                        }
+                        observedChunkCacheCenter = {
+                            x: x.value | 0,
+                            z: z.value | 0,
+                        };
+                        chunkCacheCenterUpdates++;
                     }
-                    else if (packetId.value === 116) {
+                    else if (packetId.value ===
+                            minecraftProfile.play.clientboundSetChunkCacheRadius) {
+                        const radius = decodeVarInt(payload, 0);
+                        if (radius === undefined || radius.bytesRead !== payload.byteLength ||
+                                radius.value < 2 || radius.value > 32) {
+                            throw new Error("Malformed PLAY chunk-cache radius");
+                        }
+                        observedChunkCacheRadius = radius.value;
+                        chunkCacheRadiusUpdates++;
+                    }
+                    else if (packetId.value ===
+                            minecraftProfile.play.clientboundSetSimulationDistance) {
+                        const distance = decodeVarInt(payload, 0);
+                        if (distance === undefined ||
+                                distance.bytesRead !== payload.byteLength ||
+                                distance.value < 2 || distance.value > 32) {
+                            throw new Error("Malformed PLAY simulation distance");
+                        }
+                        observedSimulationDistance = distance.value;
+                        simulationDistanceUpdates++;
+                    }
+                    else if (packetId.value ===
+                            minecraftProfile.play.clientboundChunkBatchStart) {
+                        if (payload.byteLength !== 0 || chunkBatchOpen) {
+                            throw new Error("Malformed or repeated PLAY chunk-batch start");
+                        }
+                        chunkBatchStarts++;
+                        chunkBatchOpen = true;
+                        currentChunkBatchPackets = 0;
+                    }
+                    else if (packetId.value ===
+                            minecraftProfile.play.clientboundChunkBatchFinished) {
+                        const advertised = decodeVarInt(payload, 0);
+                        if (!chunkBatchOpen || advertised === undefined || advertised.value < 0 ||
+                                advertised.bytesRead !== payload.byteLength) {
+                            throw new Error("Malformed PLAY chunk-batch finish");
+                        }
+                        chunkBatchFinished++;
+                        chunkBatchOpen = false;
+                        if (advertised.value !== currentChunkBatchPackets) {
+                            chunkBatchCountMismatches++;
+                        }
+                        const acknowledgement = Buffer.allocUnsafe(4);
+                        acknowledgement.writeFloatBE(minecraftDesiredChunksPerTick, 0);
+                        sendMinecraftPacket(
+                                minecraftProfile.play.serverboundChunkBatchReceived,
+                                acknowledgement);
+                        chunkBatchAcknowledgements++;
+                        currentChunkBatchPackets = 0;
+                    }
+                    else if (packetId.value === minecraftProfile.play.clientboundChunk) {
+                        if (payload.byteLength < 8) {
+                            throw new Error("PLAY chunk packet omitted coordinates");
+                        }
+                        const key = `${payload.readInt32BE(0)},${payload.readInt32BE(4)}`;
+                        chunkPackets++;
+                        if (chunkBatchOpen) currentChunkBatchPackets++;
+                        if (uniqueChunkPositions.has(key)) duplicateChunkPackets++;
+                        else uniqueChunkPositions.add(key);
+                    }
+                    else if (packetId.value === minecraftProfile.play.clientboundStartConfiguration) {
                         if (payload.byteLength !== 0) {
                             throw new Error("PLAY start-configuration packet was not payloadless");
                         }
                         reconfigurationRequests++;
-                        sendMinecraftPacket(15, Buffer.alloc(0));
+                        sendMinecraftPacket(
+                                minecraftProfile.play.serverboundConfigurationAcknowledged,
+                                Buffer.alloc(0));
                         phase = "configuration";
                     }
                 }
@@ -1110,6 +1758,9 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
             phase,
             encryptionRequest,
             sessionJoin,
+            rsaSecretEncrypted,
+            rsaChallengeEncrypted,
+            aesCfb8Enabled,
             compressionThreshold: compressionThreshold ?? null,
             loginFinished,
             configurationPackets,
@@ -1128,7 +1779,22 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
             resourcePackTargets,
             playPackets,
             playLoginPackets,
+            playLoginDistanceContracts,
             chunkPackets,
+            uniqueChunkPositions: uniqueChunkPositions.size,
+            duplicateChunkPackets,
+            observedChunkCacheCenter,
+            observedChunkCacheRadius,
+            observedSimulationDistance,
+            chunkCacheCenterUpdates,
+            chunkCacheRadiusUpdates,
+            simulationDistanceUpdates,
+            chunkBatchStarts,
+            chunkBatchFinished,
+            chunkBatchAcknowledgements,
+            chunkBatchCountMismatches,
+            chunkBatchOpen,
+            currentChunkBatchPackets,
             bufferedBytes: buffered.byteLength,
             packetCounts,
             recentPackets,
@@ -1177,13 +1843,16 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
         };
         const encryptedSecret = publicEncrypt(rsaKey, secret);
         const encryptedChallenge = publicEncrypt(rsaKey, challenge.value);
+        rsaSecretEncrypted = encryptedSecret.byteLength > 0;
+        rsaChallengeEncrypted = encryptedChallenge.byteLength > 0;
         const keyPayload = Buffer.concat([
             encodeByteArray(encryptedSecret),
             encodeByteArray(encryptedChallenge),
         ]);
-        socket.send(encodePacket(1, keyPayload));
+        socket.send(encodePacket(minecraftProfile.login.serverboundKey, keyPayload));
         cipher = createCipheriv("aes-128-cfb8", secret, secret);
         decipher = createDecipheriv("aes-128-cfb8", secret, secret);
+        aesCfb8Enabled = true;
     }
 
     socket.send(JSON.stringify({ type: "connect", host: serverHost, port: serverPort, token }));
@@ -1193,7 +1862,7 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
     }, "Minecraft TCP connection", 10000, loginDiagnostics);
 
     const handshake = Buffer.concat([
-        encodeVarInt(774),
+        encodeVarInt(minecraftProfile.protocolVersion),
         encodeString(serverHost),
         Buffer.from([(serverPort >>> 8) & 0xff, serverPort & 0xff]),
         encodeVarInt(2),
@@ -1227,6 +1896,17 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
     return {
         server: `${serverHost}:${serverPort}`,
         onlineMode: encryptionRequest,
+        rsa: {
+            requested: encryptionRequest,
+            secretEncrypted: rsaSecretEncrypted,
+            challengeEncrypted: rsaChallengeEncrypted,
+            padding: "RSA_PKCS1_PADDING",
+        },
+        aes: {
+            cipher: "aes-128-cfb8",
+            enabled: aesCfb8Enabled,
+            iv: "shared-secret",
+        },
         sessionJoin,
         compressionThreshold: compressionThreshold ?? null,
         loginFinished,
@@ -1245,7 +1925,32 @@ async function testMinecraftLogin(bridgePort, serverHost, serverPort, session, t
         resourcePackTargets,
         playPackets,
         playLoginPackets,
+        playLoginDistanceContracts,
         chunkPackets,
+        uniqueChunkPositions: uniqueChunkPositions.size,
+        duplicateChunkPackets,
+        chunkWindow: {
+            clientViewDistance: minecraftClientViewDistance,
+            observedChunkCacheCenter,
+            observedChunkCacheRadius,
+            observedSimulationDistance,
+            chunkCacheCenterUpdates,
+            chunkCacheRadiusUpdates,
+            simulationDistanceUpdates,
+        },
+        chunkBatch: {
+            starts: chunkBatchStarts,
+            finished: chunkBatchFinished,
+            acknowledgements: chunkBatchAcknowledgements,
+            countMismatches: chunkBatchCountMismatches,
+            openAtClose: chunkBatchOpen,
+            clientboundStartPacketId: minecraftProfile.play.clientboundChunkBatchStart,
+            clientboundFinishedPacketId: minecraftProfile.play.clientboundChunkBatchFinished,
+            serverboundAcknowledgementPacketId:
+                    minecraftProfile.play.serverboundChunkBatchReceived,
+            desiredChunksPerTick: minecraftDesiredChunksPerTick,
+            acknowledgementEncoding: "float32-be",
+        },
         playSoakMs: minecraftPlaySoakMs,
     };
 }
@@ -1269,79 +1974,146 @@ function minecraftServerHash(serverId, secret, publicKey) {
 
 async function testLocalTunnelPair(bridgePort, token) {
     const sessionId = "0123456789abcdef0123456789abcdef";
-    const client = new WebSocket(`ws://${host}:${bridgePort}/tunnel`, {
-        headers: { origin },
-    });
-    const server = new WebSocket(`ws://${host}:${bridgePort}/tunnel`, {
-        headers: { origin },
-    });
-    await Promise.all([once(client, "open"), once(server, "open")]);
+    const openPair = async () => {
+        const client = new WebSocket(`ws://${host}:${bridgePort}/tunnel`, {
+            headers: { origin },
+        });
+        const server = new WebSocket(`ws://${host}:${bridgePort}/tunnel`, {
+            headers: { origin },
+        });
+        await Promise.all([once(client, "open"), once(server, "open")]);
+        const clientControls = [];
+        const serverControls = [];
+        const clientFrames = [];
+        const serverFrames = [];
+        let clientBytes = 0;
+        let serverBytes = 0;
+        client.on("message", (data, binary) => {
+            if (binary) {
+                const bytes = Buffer.from(data);
+                clientFrames.push(bytes);
+                clientBytes += bytes.byteLength;
+            }
+            else {
+                clientControls.push(JSON.parse(data.toString("utf8")));
+            }
+        });
+        server.on("message", (data, binary) => {
+            if (binary) {
+                const bytes = Buffer.from(data);
+                serverFrames.push(bytes);
+                serverBytes += bytes.byteLength;
+            }
+            else {
+                serverControls.push(JSON.parse(data.toString("utf8")));
+            }
+        });
+        client.send(JSON.stringify({
+            type: "connect",
+            host: `client-${sessionId}.gaius-local`,
+            port: 25565,
+            token,
+        }));
+        server.send(JSON.stringify({
+            type: "connect",
+            host: `server-${sessionId}.gaius-local`,
+            port: 25565,
+            token,
+        }));
+        await waitFor(
+                () => clientControls.some((message) => message.type === "connected") &&
+                    serverControls.some((message) => message.type === "connected"),
+                "paired local server tunnel");
+        return {
+            client,
+            server,
+            clientFrames,
+            serverFrames,
+            get clientBytes() { return clientBytes; },
+            get serverBytes() { return serverBytes; },
+        };
+    };
 
-    const clientControls = [];
-    const serverControls = [];
-    const clientFrames = [];
-    const serverFrames = [];
-    let clientBytes = 0;
-    let serverBytes = 0;
-    client.on("message", (data, binary) => {
-        if (binary) {
-            const bytes = Buffer.from(data);
-            clientFrames.push(bytes);
-            clientBytes += bytes.byteLength;
-        }
-        else {
-            clientControls.push(JSON.parse(data.toString("utf8")));
-        }
-    });
-    server.on("message", (data, binary) => {
-        if (binary) {
-            const bytes = Buffer.from(data);
-            serverFrames.push(bytes);
-            serverBytes += bytes.byteLength;
-        }
-        else {
-            serverControls.push(JSON.parse(data.toString("utf8")));
-        }
-    });
-
-    client.send(JSON.stringify({
-        type: "connect",
-        host: `client-${sessionId}.gaius-local`,
-        port: 25565,
-        token,
-    }));
-    server.send(JSON.stringify({
-        type: "connect",
-        host: `server-${sessionId}.gaius-local`,
-        port: 25565,
-        token,
-    }));
-    await waitFor(
-            () => clientControls.some((message) => message.type === "connected") &&
-                serverControls.some((message) => message.type === "connected"),
-            "paired local server tunnel");
+    const firstPair = await openPair();
+    await waitForLocalTunnelSessions(bridgePort, token, 1,
+            "one active local tunnel session after pairing");
 
     const clientPayload = patternedBuffer(2 * 1024 * 1024, 0x53);
-    client.send(clientPayload);
-    await waitFor(() => serverBytes === clientPayload.byteLength, "local client-to-server payload");
-    if (!Buffer.concat(serverFrames, serverBytes).equals(clientPayload)) {
+    firstPair.client.send(clientPayload);
+    await waitFor(() => firstPair.serverBytes === clientPayload.byteLength,
+            "local client-to-server payload");
+    if (!Buffer.concat(firstPair.serverFrames).equals(clientPayload)) {
         throw new Error("Local client-to-server bytes did not match");
     }
 
     const serverPayload = patternedBuffer(2 * 1024 * 1024, 0x71);
-    server.send(serverPayload);
-    await waitFor(() => clientBytes === serverPayload.byteLength, "local server-to-client payload");
-    if (!Buffer.concat(clientFrames, clientBytes).equals(serverPayload)) {
+    firstPair.server.send(serverPayload);
+    await waitFor(() => firstPair.clientBytes === serverPayload.byteLength,
+            "local server-to-client payload");
+    if (!Buffer.concat(firstPair.clientFrames).equals(serverPayload)) {
         throw new Error("Local server-to-client bytes did not match");
     }
 
-    client.close();
-    await Promise.all([once(client, "close"), once(server, "close")]);
+    firstPair.client.close();
+    await Promise.all([once(firstPair.client, "close"), once(firstPair.server, "close")]);
+    await waitForLocalTunnelSessions(bridgePort, token, 0,
+            "local tunnel session cleanup after peer close");
+
+    // Reuse the exact same session id after both sides closed. The old
+    // implementation cleared only the initiating role and left a closed peer
+    // in the map, so this pair was rejected as a duplicate and leaked state.
+    const reconnectPair = await openPair();
+    await waitForLocalTunnelSessions(bridgePort, token, 1,
+            "one active local tunnel session after same-session reconnect");
+    const reconnectClientPayload = Buffer.from("same-session-reconnect-client", "utf8");
+    const reconnectServerPayload = Buffer.from("same-session-reconnect-server", "utf8");
+    reconnectPair.client.send(reconnectClientPayload);
+    await waitFor(() => reconnectPair.serverBytes === reconnectClientPayload.byteLength,
+            "same-session reconnect client-to-server payload");
+    if (!Buffer.concat(reconnectPair.serverFrames).equals(reconnectClientPayload)) {
+        throw new Error("Same-session reconnect client-to-server bytes did not match");
+    }
+    reconnectPair.server.send(reconnectServerPayload);
+    await waitFor(() => reconnectPair.clientBytes === reconnectServerPayload.byteLength,
+            "same-session reconnect server-to-client payload");
+    if (!Buffer.concat(reconnectPair.clientFrames).equals(reconnectServerPayload)) {
+        throw new Error("Same-session reconnect server-to-client bytes did not match");
+    }
+    reconnectPair.server.close();
+    await Promise.all([once(reconnectPair.server, "close"), once(reconnectPair.client, "close")]);
+    const finalRuntime = await waitForLocalTunnelSessions(bridgePort, token, 0,
+            "final local tunnel session cleanup");
     return {
         paired: true,
-        clientToServerBytes: serverBytes,
-        serverToClientBytes: clientBytes,
+        clientToServerBytes: firstPair.serverBytes,
+        serverToClientBytes: firstPair.clientBytes,
+        sameSessionReconnect: true,
+        reconnectClientToServerBytes: reconnectPair.serverBytes,
+        reconnectServerToClientBytes: reconnectPair.clientBytes,
+        activeLocalTunnelSessions: finalRuntime.activeLocalTunnelSessions,
     };
+}
+
+async function waitForLocalTunnelSessions(bridgePort, token, expected, label) {
+    const deadline = Date.now() + 10000;
+    let lastRuntime;
+    while (Date.now() < deadline) {
+        const response = await fetch(`http://${host}:${bridgePort}/relay-node/v1`, {
+            headers: {
+                origin,
+                authorization: `Bearer ${token}`,
+            },
+        });
+        if (!response.ok) {
+            throw new Error(`RelayNode runtime manifest returned ${response.status} while waiting for ${label}`);
+        }
+        lastRuntime = (await response.json()).runtime;
+        if (lastRuntime?.activeLocalTunnelSessions === expected) {
+            return lastRuntime;
+        }
+        await delay(10);
+    }
+    throw new Error(`Timed out waiting for ${label}: ${JSON.stringify(lastRuntime)}`);
 }
 
 function encodePacket(id, payload, compressionThreshold) {
@@ -1718,7 +2490,7 @@ function encodeDialogCompound(values) {
 function encodeClientInformation() {
     return Buffer.concat([
         encodeString("en_us"),
-        Buffer.from([6]),
+        Buffer.from([minecraftClientViewDistance]),
         encodeVarInt(0),
         Buffer.from([1, 0x7f]),
         encodeVarInt(1),

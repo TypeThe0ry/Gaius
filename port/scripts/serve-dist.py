@@ -2,7 +2,7 @@
 """Serve the browser dist with precompressed asset support.
 
 Python's built-in http.server is convenient, but it ignores classes.js.gz/br.
-For the 1.21.11 client that means repeatedly transferring a very large JS file
+For a supported client that means repeatedly transferring a very large JS file
 when testing locally or when a simple static host is used. This handler serves
 *.br or *.gz variants when the browser advertises support and the compressed
 file exists, while still falling back to the plain file.

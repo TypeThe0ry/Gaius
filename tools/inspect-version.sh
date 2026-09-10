@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version="${1:-1.21.11}"
+version="${1:-26.2}"
 download_client="${2:-}"
 manifest_url="https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 

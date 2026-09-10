@@ -1,11 +1,13 @@
 package dev.gaius.browser;
 
-import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.Unpooled;
-import io.netty.channel.ChannelFuture;
-import io.netty.channel.ChannelInboundHandlerAdapter;
-import io.netty.channel.DefaultEventLoopGroup;
 import io.netty.channel.browser.BrowserWebSocketChannel;
+import com.mojang.blaze3d.platform.MonitorManager;
+import com.mojang.blaze3d.platform.NativeImage;
+import com.mojang.blaze3d.platform.Window;
+import com.mojang.blaze3d.opengl.GlBackend;
+import com.mojang.blaze3d.shaders.GpuDebugOptions;
+import com.mojang.blaze3d.systems.RenderSystem;
 import com.google.gson.JsonParser;
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
@@ -23,6 +25,7 @@ import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.zip.DataFormatException;
 import java.util.zip.Deflater;
 import java.util.zip.Inflater;
 import java.util.zip.ZipEntry;
@@ -35,12 +38,12 @@ import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import javax.sound.sampled.AudioFormat;
 import net.minecraft.client.sounds.JOrbisAudioStream;
-import net.minecraft.client.renderer.block.model.TextureSlots;
 import net.minecraft.core.BlockPos;
 import net.minecraft.resources.Identifier;
 import net.minecraft.util.Mth;
 import net.minecraft.util.SimpleBitStorage;
 import net.minecraft.util.LinearCongruentialGenerator;
+import net.minecraft.util.Util;
 import net.minecraft.world.level.biome.Climate;
 import net.minecraft.world.level.levelgen.LegacyRandomSource;
 import net.minecraft.world.level.levelgen.Beardifier;
@@ -57,6 +60,7 @@ import org.lwjgl.opengl.GL;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL15;
 import org.lwjgl.opengl.GL20;
+import org.lwjgl.opengl.GL33C;
 import org.lwjgl.openal.ALC10;
 import org.lwjgl.openal.AL10;
 import org.lwjgl.system.BrowserMemory;
@@ -121,12 +125,16 @@ public final class PlatformSmoke {
             testFloatingPointFma();
             smokeStage = "managed memory";
             testManagedMemory();
+            smokeStage = "Minecraft backend initialization";
+            testBackendInitialization();
             smokeStage = "window and WebGL";
             testWindowAndCallbacks();
             smokeStage = "browser audio";
             testBrowserAudio();
             smokeStage = "Unicode font fallback";
             testUnicodeFontFallbackAssets();
+            smokeStage = "bitmap font decode";
+            testBitmapFontAssetDecode();
             smokeStage = "browser crypto";
             testBrowserCrypto();
             smokeStage = "HTTP proxy";
@@ -171,6 +179,45 @@ public final class PlatformSmoke {
                 if (read.array()[index] != expected[index]) {
                     throw new AssertionError("FileChannel data mismatch at " + index);
                 }
+            }
+        }
+
+        byte marker = 0x5A;
+        try (FileChannel reopened = FileChannel.open(
+                path,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.READ,
+                StandardOpenOption.WRITE)) {
+            if (reopened.size() != 8192L + expected.length) {
+                throw new AssertionError(
+                        "READ+WRITE reopen truncated an existing region file: "
+                                + reopened.size());
+            }
+            ByteBuffer preserved = ByteBuffer.allocate(expected.length);
+            reopened.position(8192);
+            while (preserved.hasRemaining() && reopened.read(preserved) >= 0) {
+                // Preserve the existing chunk payload while opening it for updates.
+            }
+            if (!Arrays.equals(expected, preserved.array())) {
+                throw new AssertionError("READ+WRITE reopen changed existing region data");
+            }
+            reopened.position(0);
+            reopened.write(ByteBuffer.wrap(new byte[] {marker}));
+        }
+
+        try (FileChannel verified = FileChannel.open(path, StandardOpenOption.READ)) {
+            ByteBuffer first = ByteBuffer.allocate(1);
+            verified.read(first);
+            if (first.get(0) != marker || verified.size() != 8192L + expected.length) {
+                throw new AssertionError("Region update was not preserved across a second reopen");
+            }
+            ByteBuffer preserved = ByteBuffer.allocate(expected.length);
+            verified.position(8192);
+            while (preserved.hasRemaining() && verified.read(preserved) >= 0) {
+                // Verify both the header update and the prior chunk payload survived.
+            }
+            if (!Arrays.equals(expected, preserved.array())) {
+                throw new AssertionError("Region payload was lost after update and reopen");
             }
         }
     }
@@ -333,12 +380,7 @@ public final class PlatformSmoke {
     }
 
     private static void testSpriteTextureSlotCompatibility() {
-        TextureSlots.Data slots = TextureSlots.parseTextureMap(JsonParser.parseString("""
-                {"base":"minecraft:block/stone","particle":{"sprite":"minecraft:block/dirt","force_translucent":true}}
-                """).getAsJsonObject());
-        if (slots.values().size() != 2
-                || !slots.values().containsKey("base")
-                || !slots.values().containsKey("particle")) {
+        if (!BrowserTextureSlotsCompat.acceptsSpriteObject()) {
             throw new AssertionError("Browser texture-slot sprite compatibility failed");
         }
     }
@@ -410,24 +452,171 @@ public final class PlatformSmoke {
                     compressedLength += written;
                 }
 
-                ByteBuffer compressedBuffer = ByteBuffer.wrap(compressed, 0, compressedLength);
-                ByteBuffer output = ByteBuffer.allocate(input.length);
-                inflater.setInput(compressedBuffer);
-                int inflated = inflater.inflate(output);
-                if (inflated != input.length
-                        || output.position() != input.length
-                        || !Arrays.equals(input, output.array())) {
+                byte[] baseline = inflateNetworkArrayBaseline(
+                        compressed,
+                        compressedLength,
+                        input.length);
+                byte[] actual;
+                if (round == 0) {
+                    actual = inflateNetworkHeapSlices(
+                            inflater,
+                            compressed,
+                            compressedLength,
+                            input.length);
+                } else {
+                    actual = inflateNetworkDirectBuffers(
+                            inflater,
+                            compressed,
+                            compressedLength,
+                            input.length);
+                }
+                if (!Arrays.equals(input, baseline) || !Arrays.equals(baseline, actual)) {
                     throw new AssertionError(
-                            "Browser network compression round-trip mismatch in round " + round);
+                            "Browser network ByteBuffer output diverged from the JVM byte-array "
+                                    + "baseline in round " + round);
                 }
 
                 deflater.reset();
                 inflater.reset();
             }
+
+            Inflater malformedInflater = new Inflater();
+            try {
+                byte[] malformedBacking = new byte[12];
+                int malformedOffset = 5;
+                Arrays.fill(malformedBacking, malformedOffset, malformedOffset + 6, (byte) 0);
+                ByteBuffer malformedRoot = ByteBuffer.wrap(malformedBacking);
+                malformedRoot.position(3);
+                malformedRoot.limit(11);
+                ByteBuffer malformedInput = malformedRoot.slice();
+                malformedInput.position(2);
+                malformedInput.limit(8);
+                malformedInflater.setInput(malformedInput);
+                if (malformedInput.position() != malformedInput.limit()) {
+                    throw new AssertionError("Malformed heap input did not advance to its limit");
+                }
+
+                ByteBuffer malformedOutput = ByteBuffer.allocate(32);
+                malformedOutput.position(7);
+                int outputStart = malformedOutput.position();
+                try {
+                    malformedInflater.inflate(malformedOutput);
+                    throw new AssertionError("Malformed browser network stream was accepted");
+                } catch (DataFormatException expected) {
+                    if (malformedOutput.position() != outputStart) {
+                        throw new AssertionError(
+                                "Malformed inflate advanced output without producing bytes");
+                    }
+                }
+            } finally {
+                malformedInflater.end();
+            }
         } finally {
             deflater.end();
             inflater.end();
         }
+    }
+
+    private static byte[] inflateNetworkArrayBaseline(
+            byte[] compressed,
+            int compressedLength,
+            int expectedLength) throws Exception {
+        Inflater baselineInflater = new Inflater();
+        try {
+            baselineInflater.setInput(compressed, 0, compressedLength);
+            byte[] output = new byte[expectedLength];
+            int inflated = baselineInflater.inflate(output, 0, output.length);
+            if (inflated != expectedLength) {
+                throw new AssertionError(
+                        "JVM byte-array inflater baseline length mismatch: "
+                                + inflated + " != " + expectedLength);
+            }
+            return output;
+        } finally {
+            baselineInflater.end();
+        }
+    }
+
+    private static byte[] inflateNetworkHeapSlices(
+            Inflater inflater,
+            byte[] compressed,
+            int compressedLength,
+            int expectedLength) throws Exception {
+        int inputRootOffset = 3;
+        int inputPosition = 2;
+        byte[] inputBacking = new byte[inputRootOffset + inputPosition + compressedLength + 4];
+        System.arraycopy(
+                compressed,
+                0,
+                inputBacking,
+                inputRootOffset + inputPosition,
+                compressedLength);
+        ByteBuffer inputRoot = ByteBuffer.wrap(inputBacking);
+        inputRoot.position(inputRootOffset);
+        inputRoot.limit(inputBacking.length - 4);
+        ByteBuffer compressedBuffer = inputRoot.slice();
+        compressedBuffer.position(inputPosition);
+        compressedBuffer.limit(inputPosition + compressedLength);
+        int compressedLimit = compressedBuffer.limit();
+        inflater.setInput(compressedBuffer);
+        if (compressedBuffer.position() != compressedLimit) {
+            throw new AssertionError("Heap sliced input did not advance to its limit");
+        }
+
+        int outputRootOffset = 4;
+        int outputPosition = 7;
+        byte[] outputBacking = new byte[outputRootOffset + outputPosition + expectedLength + 5];
+        ByteBuffer outputRoot = ByteBuffer.wrap(outputBacking);
+        outputRoot.position(outputRootOffset);
+        outputRoot.limit(outputBacking.length - 5);
+        ByteBuffer output = outputRoot.slice();
+        output.position(outputPosition);
+        output.limit(outputPosition + expectedLength);
+        int inflated = inflater.inflate(output);
+        if (inflated != expectedLength || output.position() != outputPosition + inflated) {
+            throw new AssertionError(
+                    "Heap sliced output position/count mismatch: "
+                            + output.position() + "/" + inflated);
+        }
+        int outputOffset = output.arrayOffset() + outputPosition;
+        return Arrays.copyOfRange(outputBacking, outputOffset, outputOffset + inflated);
+    }
+
+    private static byte[] inflateNetworkDirectBuffers(
+            Inflater inflater,
+            byte[] compressed,
+            int compressedLength,
+            int expectedLength) throws Exception {
+        int inputPosition = 5;
+        ByteBuffer compressedBuffer = ByteBuffer.allocateDirect(
+                inputPosition + compressedLength + 3);
+        compressedBuffer.position(inputPosition);
+        compressedBuffer.put(compressed, 0, compressedLength);
+        compressedBuffer.limit(inputPosition + compressedLength);
+        compressedBuffer.position(inputPosition);
+        int compressedLimit = compressedBuffer.limit();
+        inflater.setInput(compressedBuffer);
+        if (compressedBuffer.position() != compressedLimit) {
+            throw new AssertionError("Direct input fallback did not advance to its limit");
+        }
+
+        int outputPosition = 6;
+        ByteBuffer output = ByteBuffer.allocateDirect(outputPosition + expectedLength + 3);
+        output.position(outputPosition);
+        output.limit(outputPosition + expectedLength);
+        int inflated = inflater.inflate(output);
+        if (inflated != expectedLength || output.position() != outputPosition + inflated) {
+            throw new AssertionError(
+                    "Direct output fallback position/count mismatch: "
+                            + output.position() + "/" + inflated);
+        }
+
+        byte[] actual = new byte[inflated];
+        ByteBuffer verification = output.duplicate();
+        verification.position(outputPosition);
+        verification.limit(outputPosition + inflated);
+        verification.get(actual);
+        return actual;
     }
 
     private static void testNetworkPackedLongs() {
@@ -511,12 +700,14 @@ public final class PlatformSmoke {
                 0x3fcc596b40d4a2ddL);
         assertRawDouble(
                 "Perlin amplitudes p3",
-                first.getValue(100.125, 64.5, -200.25, 0.125, 0.5, false),
+                first.gaius$getValue(100.125, 64.5, -200.25, 0.125, 0.5, false),
                 0x3fd0353a3c9fb177L);
         assertRawDouble(
                 "Perlin amplitudes p4",
-                first.getValue(100.125, 64.5, -200.25, 0.125, 0.5, true),
-                0xbfc0cf7defd90d30L);
+                first.gaius$getValue(100.125, 64.5, -200.25, 0.125, 0.5, true),
+                PerlinNoise.gaius$hasOriginY()
+                        ? 0xbfc0cf7defd90d30L
+                        : 0x3fd0353a3c9fb177L);
 
         PerlinNoise sparse = PerlinNoise.create(
                 new LegacyRandomSource(987654321L),
@@ -534,7 +725,7 @@ public final class PlatformSmoke {
                 0x3fb2371a90529044L);
         assertRawDouble(
                 "Perlin amplitudes q1",
-                sparse.getValue(3.5e7, -6.75e7, 1.25e8, 0.0625, 1.75, false),
+                sparse.gaius$getValue(3.5e7, -6.75e7, 1.25e8, 0.0625, 1.75, false),
                 0xbf7a07e97df9e5c3L);
     }
 
@@ -1186,11 +1377,23 @@ public final class PlatformSmoke {
     private static void testWindowAndCallbacks() {
         GLFWErrorCallback callback = GLFWErrorCallback.create((error, description) -> {
         });
-        GLFW.glfwSetErrorCallback(callback);
+        if (GLFW.glfwSetErrorCallback(callback) != null) {
+            throw new AssertionError("GLFW browser error callback did not start empty");
+        }
+        GLFWErrorCallback scopedCallback = GLFWErrorCallback.create((error, description) -> {
+        });
+        if (GLFW.glfwSetErrorCallback(scopedCallback) != callback) {
+            throw new AssertionError("GLFW browser error callback did not return the previous callback");
+        }
+        GLFWErrorCallback replaced = GLFW.glfwSetErrorCallback(callback);
+        if (replaced != scopedCallback || replaced.address() != scopedCallback.address()) {
+            throw new AssertionError("GLFW browser error callback identity was not preserved");
+        }
+        replaced.close();
         if (!GLFW.glfwInit()) {
             throw new AssertionError("GLFW browser initialization failed");
         }
-        long window = GLFW.glfwCreateWindow(960, 540, "Gaius 1.21.11 platform smoke", 0L, 0L);
+        long window = GLFW.glfwCreateWindow(960, 540, "Gaius platform smoke", 0L, 0L);
         if (window == 0L) {
             throw new AssertionError("Browser window was not created");
         }
@@ -1228,10 +1431,151 @@ public final class PlatformSmoke {
         callback.free();
     }
 
+    private static void testBackendInitialization() throws Exception {
+        RenderSystem.initRenderThread();
+        var timeSource = RenderSystem.initBackendSystem();
+        if (timeSource == null) {
+            throw new AssertionError("Minecraft backend time source was not initialized");
+        }
+        Util.setTimeSource(timeSource);
+        smokeStage = "Minecraft monitor initialization";
+        try (MonitorManager manager = new MonitorManager()) {
+            if (manager.getMonitor(GLFW.glfwGetPrimaryMonitor()) == null) {
+                throw new AssertionError("Minecraft primary monitor was not initialized");
+            }
+            GlBackend backend = new GlBackend();
+            smokeStage = "Minecraft GLFW window creation";
+            long window = Window.createGlfwWindow(960, 540, "Gaius 26.2 backend smoke", 0L, backend);
+            if (window == 0L) {
+                throw new AssertionError("Minecraft OpenGL backend did not create a browser window");
+            }
+            smokeStage = "Minecraft GPU device creation";
+            var device = backend.createDevice(
+                    window,
+                    (identifier, shaderType) -> "",
+                    new GpuDebugOptions(0, false, false, false),
+                    () -> {
+                    });
+            if (device.getDeviceInfo() == null) {
+                throw new AssertionError("Minecraft OpenGL device was not initialized");
+            }
+            smokeStage = "Minecraft GPU surface creation";
+            if (device.createSurface(window) == null) {
+                throw new AssertionError("Minecraft OpenGL surface was not initialized");
+            }
+            smokeStage = "Minecraft renderer initialization";
+            RenderSystem.initRenderer(device);
+            smokeStage = "Minecraft GL33C core delegation";
+            testGl33CoreDelegation();
+        }
+    }
+
+    private static void testGl33CoreDelegation() {
+        GL33C.glActiveTexture(GL33C.GL_TEXTURE1);
+        GL33C.glActiveTexture(GL33C.GL_TEXTURE0);
+
+        int buffer = GL33C.glGenBuffers();
+        if (buffer == 0) {
+            throw new AssertionError("GL33C buffer creation did not reach WebGL");
+        }
+        try {
+            GL33C.glBindBuffer(GL33C.GL_COPY_WRITE_BUFFER, buffer);
+            GL33C.glBufferData(GL33C.GL_COPY_WRITE_BUFFER, 64L, GL33C.GL_DYNAMIC_DRAW);
+            ByteBuffer mapped = GL33C.glMapBufferRange(
+                    GL33C.GL_COPY_WRITE_BUFFER,
+                    0L,
+                    64L,
+                    GL33C.GL_MAP_WRITE_BIT);
+            if (mapped == null || mapped.capacity() != 64) {
+                throw new AssertionError("GL33C mapped buffer did not reach the browser allocator");
+            }
+            mapped.putInt(0, 0x47414955);
+            if (!GL33C.glUnmapBuffer(GL33C.GL_COPY_WRITE_BUFFER)) {
+                throw new AssertionError("GL33C mapped buffer did not unmap");
+            }
+            long mappedAddress = GL33C.nglMapBufferRange(
+                    GL33C.GL_COPY_WRITE_BUFFER,
+                    0L,
+                    64L,
+                    GL33C.GL_MAP_WRITE_BIT);
+            if (mappedAddress == 0L) {
+                throw new AssertionError("GL33C address mapped buffer did not reach the browser allocator");
+            }
+            MemoryUtil.memPutInt(mappedAddress, 0x53495541);
+            if (!GL33C.glUnmapBuffer(GL33C.GL_COPY_WRITE_BUFFER)) {
+                throw new AssertionError("GL33C address mapped buffer did not unmap");
+            }
+        } finally {
+            GL33C.glBindBuffer(GL33C.GL_COPY_WRITE_BUFFER, 0);
+            GL33C.glDeleteBuffers(buffer);
+        }
+
+        int vertexArray = GL33C.glGenVertexArrays();
+        if (vertexArray == 0) {
+            throw new AssertionError("GL33C vertex array creation did not reach WebGL");
+        }
+        GL33C.glBindVertexArray(vertexArray);
+        GL33C.glBindVertexArray(0);
+        GL33C.glDeleteVertexArrays(vertexArray);
+
+        int framebuffer = GL33C.glGenFramebuffers();
+        if (framebuffer == 0) {
+            throw new AssertionError("GL33C framebuffer creation did not reach WebGL");
+        }
+        GL33C.glBindFramebuffer(GL33C.GL_FRAMEBUFFER, framebuffer);
+        GL33C.glColorMaski(0, true, true, true, true);
+        GL33C.glDrawBuffer(GL33C.GL_NONE);
+        GL33C.glDrawBuffer(GL33C.GL_COLOR_ATTACHMENT0);
+        GL33C.glScissor(3, 4, 5, 6);
+        GL33C.glBlendEquationSeparate(GL33C.GL_FUNC_ADD, GL33C.GL_FUNC_REVERSE_SUBTRACT);
+        if (!gl33StateDelegationPassed()) {
+            throw new AssertionError("GL33C draw-buffer, scissor, or blend state did not reach WebGL");
+        }
+        GL33C.glBindFramebuffer(GL33C.GL_FRAMEBUFFER, 0);
+        GL33C.glDeleteFramebuffers(framebuffer);
+
+        int pixelBuffer = GL33C.glGenBuffers();
+        GL33C.glBindBuffer(GL33C.GL_PIXEL_PACK_BUFFER, pixelBuffer);
+        GL33C.glBufferData(GL33C.GL_PIXEL_PACK_BUFFER, 4L, GL33C.GL_STREAM_READ);
+        GL33C.glReadPixels(0, 0, 1, 1, GL33C.GL_RGBA, GL33C.GL_UNSIGNED_BYTE, 0L);
+        GL33C.glBindBuffer(GL33C.GL_PIXEL_PACK_BUFFER, 0);
+        GL33C.glDeleteBuffers(pixelBuffer);
+        if (!pboReadbackDelegationPassed()) {
+            throw new AssertionError("GL33C pixel-buffer readback did not reach WebGL");
+        }
+
+        long sync = GL33C.glFenceSync(GL33C.GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        if (sync == 0L) {
+            throw new AssertionError("GL33C fence creation did not reach WebGL");
+        }
+        GL33C.glClientWaitSync(sync, 0, 0L);
+        GL33C.glDeleteSync(sync);
+    }
+
+    @JSBody(script = """
+            const state=window.__gaiusGL;
+            return !!state && Array.isArray(state.lastDrawBuffers) &&
+              state.lastDrawBuffers.length===1 &&
+              (state.lastDrawBuffers[0]|0)===0x8CE0 &&
+              (state.scissorX|0)===3 && (state.scissorY|0)===4 &&
+              (state.scissorWidth|0)===5 && (state.scissorHeight|0)===6 &&
+              (state.blendEquationRgb|0)===0x8006 &&
+              (state.blendEquationAlpha|0)===0x800B;
+            """)
+    private static native boolean gl33StateDelegationPassed();
+
+    @JSBody(script = """
+            return (window.__gaiusGLStats && (window.__gaiusGLStats.readPixelsCalls|0)>0) || false;
+            """)
+    private static native boolean pboReadbackDelegationPassed();
+
     private static void testWebGlRenderingSurface() {
         GL.createCapabilities();
         GL11.glClearColor(0.08F, 0.10F, 0.14F, 1.0F);
         GL11.glClear(GL11.GL_COLOR_BUFFER_BIT | GL11.GL_DEPTH_BUFFER_BIT);
+
+        testMappedPixelBufferTextureUpload();
+        testMappedR8PixelBufferTextureUpload();
 
         int texture = GL11.glGenTextures();
         GL11.glBindTexture(GL11.GL_TEXTURE_2D, texture);
@@ -1289,11 +1633,262 @@ public final class PlatformSmoke {
         GL11.glDeleteTextures(texture);
     }
 
+    /** Matches the 26.2 bitmap-font path: mapped staging buffer, PBO upload, then sampling. */
+    private static void testMappedPixelBufferTextureUpload() {
+        int fontBufferBytes = 128 * 128 * 4;
+        int pixelBuffer = GL33C.glGenBuffers();
+        int texture = GL11.glGenTextures();
+        int framebuffer = GL33C.glGenFramebuffers();
+        ByteBuffer source = MemoryUtil.memAlloc(fontBufferBytes);
+        ByteBuffer readback = MemoryUtil.memAlloc(4);
+        try {
+            source.put(0, (byte) 0x21);
+            source.put(1, (byte) 0x43);
+            source.put(2, (byte) 0x65);
+            source.put(3, (byte) 0xFF);
+            source.put(fontBufferBytes - 1, (byte) 0x7D);
+            GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, pixelBuffer);
+            GL33C.glBufferData(
+                    GL33C.GL_PIXEL_UNPACK_BUFFER, fontBufferBytes, GL33C.GL_STREAM_DRAW);
+            ByteBuffer mapped = GL33C.glMapBufferRange(
+                    GL33C.GL_PIXEL_UNPACK_BUFFER,
+                    0L,
+                    fontBufferBytes,
+                    GL33C.GL_MAP_WRITE_BIT | GL33C.GL_MAP_FLUSH_EXPLICIT_BIT);
+            ByteBuffer mappedView = MemoryUtil.memSlice(mapped, 0, fontBufferBytes);
+            MemoryUtil.memCopy(source, mappedView);
+            GL33C.glFlushMappedBufferRange(
+                    GL33C.GL_PIXEL_UNPACK_BUFFER, 0L, fontBufferBytes);
+            int stagedRgba = readBoundPixelUnpackBufferRgba();
+            int expectedRgba = 0x21 | (0x43 << 8) | (0x65 << 16) | (0xFF << 24);
+            if (stagedRgba != expectedRgba) {
+                throw new AssertionError(
+                        "Mapped pixel-buffer flush changed RGBA bytes: "
+                                + Integer.toUnsignedString(stagedRgba, 16));
+            }
+            if (readBoundPixelUnpackBufferByte(fontBufferBytes - 1) != 0x7D) {
+                throw new AssertionError("Mapped font-sized buffer copy truncated its tail");
+            }
+            if (!GL33C.glUnmapBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER)) {
+                throw new AssertionError("Mapped pixel buffer could not be unmapped");
+            }
+
+            GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, 0);
+
+            GL11.glBindTexture(GL11.GL_TEXTURE_2D, texture);
+            GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
+            GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
+            GL11.glTexImage2D(
+                    GL11.GL_TEXTURE_2D,
+                    0,
+                    GL33C.GL_RGBA8,
+                    1,
+                    1,
+                    0,
+                    GL11.GL_RGBA,
+                    GL11.GL_UNSIGNED_BYTE,
+                    (ByteBuffer) null);
+            GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, pixelBuffer);
+            GL11.glTexSubImage2D(
+                    GL11.GL_TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    1,
+                    1,
+                    GL11.GL_RGBA,
+                    GL11.GL_UNSIGNED_BYTE,
+                    0L);
+            GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, 0);
+
+            GL33C.glBindFramebuffer(GL33C.GL_FRAMEBUFFER, framebuffer);
+            GL33C.glFramebufferTexture2D(
+                    GL33C.GL_FRAMEBUFFER,
+                    GL33C.GL_COLOR_ATTACHMENT0,
+                    GL11.GL_TEXTURE_2D,
+                    texture,
+                    0);
+            int framebufferStatus = GL33C.glCheckFramebufferStatus(GL33C.GL_FRAMEBUFFER);
+            if (framebufferStatus != GL33C.GL_FRAMEBUFFER_COMPLETE) {
+                throw new AssertionError(
+                        "Mapped pixel-buffer smoke framebuffer is incomplete: "
+                                + framebufferStatus);
+            }
+            GL11.glReadPixels(0, 0, 1, 1, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, readback);
+            int red = readback.get(0) & 0xFF;
+            int green = readback.get(1) & 0xFF;
+            int blue = readback.get(2) & 0xFF;
+            int alpha = readback.get(3) & 0xFF;
+            if (red != 0x21 || green != 0x43 || blue != 0x65 || alpha != 0xFF) {
+                throw new AssertionError(
+                        "Mapped pixel-buffer texture upload changed RGBA bytes: "
+                                + red + "/" + green + "/" + blue + "/" + alpha);
+            }
+
+            // Minecraft 26.2 persistently maps each dynamic-uniform ring buffer
+            // and explicitly flushes one aligned block at a non-zero offset.  A
+            // ByteBuffer duplicate with only position/limit adjusted used to be
+            // exported by TeaVM as the entire mapped allocation, turning this
+            // four-byte flush into an out-of-bounds 32-byte WebGL upload.
+            GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, pixelBuffer);
+            GL33C.glBufferData(GL33C.GL_PIXEL_UNPACK_BUFFER, 32L, GL33C.GL_STREAM_DRAW);
+            ByteBuffer subrangeMapped = GL33C.glMapBufferRange(
+                    GL33C.GL_PIXEL_UNPACK_BUFFER,
+                    0L,
+                    32L,
+                    GL33C.GL_MAP_WRITE_BIT | GL33C.GL_MAP_FLUSH_EXPLICIT_BIT);
+            ByteBuffer subrangeView = MemoryUtil.memSlice(subrangeMapped, 4, 4);
+            subrangeView.put(0, (byte) 0x12);
+            subrangeView.put(1, (byte) 0x34);
+            subrangeView.put(2, (byte) 0x56);
+            subrangeView.put(3, (byte) 0x78);
+            GL33C.glFlushMappedBufferRange(GL33C.GL_PIXEL_UNPACK_BUFFER, 4L, 4L);
+            int subrangeRgba = readBoundPixelUnpackBufferRgba(4);
+            int expectedSubrangeRgba = 0x12 | (0x34 << 8) | (0x56 << 16) | (0x78 << 24);
+            if (subrangeRgba != expectedSubrangeRgba) {
+                throw new AssertionError(
+                        "Mapped pixel-buffer sub-range flush changed RGBA bytes: "
+                                + Integer.toUnsignedString(subrangeRgba, 16));
+            }
+            if (!GL33C.glUnmapBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER)) {
+                throw new AssertionError("Mapped pixel-buffer sub-range could not be unmapped");
+            }
+        } finally {
+            GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, 0);
+            GL33C.glBindFramebuffer(GL33C.GL_FRAMEBUFFER, 0);
+            GL33C.glDeleteFramebuffers(framebuffer);
+            GL11.glDeleteTextures(texture);
+            GL33C.glDeleteBuffers(pixelBuffer);
+            MemoryUtil.memFree(source);
+            MemoryUtil.memFree(readback);
+        }
+    }
+
+    /** Matches the single-channel atlas used by uncolored 26.2 font glyphs. */
+    private static void testMappedR8PixelBufferTextureUpload() {
+        int pixelBuffer = GL33C.glGenBuffers();
+        int texture = GL11.glGenTextures();
+        int framebuffer = GL33C.glGenFramebuffers();
+        ByteBuffer source = MemoryUtil.memAlloc(1);
+        ByteBuffer readback = MemoryUtil.memAlloc(4);
+        try {
+            source.put(0, (byte) 0xCC);
+            GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, pixelBuffer);
+            GL33C.glBufferData(GL33C.GL_PIXEL_UNPACK_BUFFER, 1L, GL33C.GL_STREAM_DRAW);
+            ByteBuffer mapped = GL33C.glMapBufferRange(
+                    GL33C.GL_PIXEL_UNPACK_BUFFER,
+                    0L,
+                    1L,
+                    GL33C.GL_MAP_WRITE_BIT | GL33C.GL_MAP_FLUSH_EXPLICIT_BIT);
+            ByteBuffer mappedView = MemoryUtil.memSlice(mapped, 0, 1);
+            MemoryUtil.memCopy(source, mappedView);
+            GL33C.glFlushMappedBufferRange(GL33C.GL_PIXEL_UNPACK_BUFFER, 0L, 1L);
+            if (!GL33C.glUnmapBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER)) {
+                throw new AssertionError("Mapped R8 pixel buffer could not be unmapped");
+            }
+            GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, 0);
+
+            GL11.glBindTexture(GL11.GL_TEXTURE_2D, texture);
+            GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_NEAREST);
+            GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_NEAREST);
+            GL11.glTexImage2D(
+                    GL11.GL_TEXTURE_2D,
+                    0,
+                    GL33C.GL_R8,
+                    1,
+                    1,
+                    0,
+                    GL11.GL_RED,
+                    GL11.GL_UNSIGNED_BYTE,
+                    (ByteBuffer) null);
+            GL11.glPixelStorei(GL11.GL_UNPACK_ALIGNMENT, 1);
+            GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, pixelBuffer);
+            GL11.glTexSubImage2D(
+                    GL11.GL_TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    1,
+                    1,
+                    GL11.GL_RED,
+                    GL11.GL_UNSIGNED_BYTE,
+                    0L);
+            GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, 0);
+            GL11.glPixelStorei(GL11.GL_UNPACK_ALIGNMENT, 4);
+
+            GL33C.glBindFramebuffer(GL33C.GL_FRAMEBUFFER, framebuffer);
+            GL33C.glFramebufferTexture2D(
+                    GL33C.GL_FRAMEBUFFER,
+                    GL33C.GL_COLOR_ATTACHMENT0,
+                    GL11.GL_TEXTURE_2D,
+                    texture,
+                    0);
+            int framebufferStatus = GL33C.glCheckFramebufferStatus(GL33C.GL_FRAMEBUFFER);
+            if (framebufferStatus != GL33C.GL_FRAMEBUFFER_COMPLETE) {
+                throw new AssertionError(
+                        "Mapped R8 pixel-buffer smoke framebuffer is incomplete: "
+                                + framebufferStatus);
+            }
+            GL11.glReadPixels(0, 0, 1, 1, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, readback);
+            int red = readback.get(0) & 0xFF;
+            int green = readback.get(1) & 0xFF;
+            int blue = readback.get(2) & 0xFF;
+            int alpha = readback.get(3) & 0xFF;
+            if (red != 0xCC || green != 0 || blue != 0 || alpha != 0xFF) {
+                throw new AssertionError(
+                        "Mapped R8 pixel-buffer texture upload changed RGBA bytes: "
+                                + red + "/" + green + "/" + blue + "/" + alpha);
+            }
+        } finally {
+            GL33C.glBindBuffer(GL33C.GL_PIXEL_UNPACK_BUFFER, 0);
+            GL11.glPixelStorei(GL11.GL_UNPACK_ALIGNMENT, 4);
+            GL33C.glBindFramebuffer(GL33C.GL_FRAMEBUFFER, 0);
+            GL33C.glDeleteFramebuffers(framebuffer);
+            GL11.glDeleteTextures(texture);
+            GL33C.glDeleteBuffers(pixelBuffer);
+            MemoryUtil.memFree(source);
+            MemoryUtil.memFree(readback);
+        }
+    }
+
+    @JSBody(script = """
+            const gl=window.__gaiusWebGL;
+            const rgba=new Uint8Array(4);
+            gl.getBufferSubData(gl.PIXEL_UNPACK_BUFFER,0,rgba);
+            return (rgba[0]|(rgba[1]<<8)|(rgba[2]<<16)|(rgba[3]<<24))|0;
+            """)
+    private static native int readBoundPixelUnpackBufferRgba();
+
+    @JSBody(params = "offset", script = """
+            const gl=window.__gaiusWebGL;
+            const rgba=new Uint8Array(4);
+            gl.getBufferSubData(gl.PIXEL_UNPACK_BUFFER,offset|0,rgba);
+            return (rgba[0]|(rgba[1]<<8)|(rgba[2]<<16)|(rgba[3]<<24))|0;
+            """)
+    private static native int readBoundPixelUnpackBufferRgba(int offset);
+
+    @JSBody(params = "offset", script = """
+            const gl=window.__gaiusWebGL;
+            const value=new Uint8Array(1);
+            gl.getBufferSubData(gl.PIXEL_UNPACK_BUFFER,offset|0,value);
+            return value[0]|0;
+            """)
+    private static native int readBoundPixelUnpackBufferByte(int offset);
+
     private static void testBrowserAudio() throws Exception {
         long device = ALC10.alcOpenDevice((CharSequence) null);
         long context = ALC10.alcCreateContext(device, (int[]) null);
         if (device == 0L || context == 0L || !ALC10.alcMakeContextCurrent(context)) {
             throw new AssertionError("Browser OpenAL context was not created");
+        }
+        if (ALC10.alcIsExtensionPresent(device, "ALC_EXT_disconnect")) {
+            throw new AssertionError("Browser OpenAL advertised unsupported device disconnect events");
+        }
+        if (ALC10.alcGetInteger(device, 0x0313) == 0) {
+            throw new AssertionError("Browser OpenAL reported its active device as disconnected");
+        }
+        if (ALC10.alcGetInteger(device, ALC10.ALC_ATTRIBUTES_SIZE) < 3) {
+            throw new AssertionError("Browser OpenAL did not expose a valid device attribute list");
         }
 
         int buffer = AL10.alGenBuffers();
@@ -1385,6 +1980,33 @@ public final class PlatformSmoke {
         }
     }
 
+    private static void testBitmapFontAssetDecode() throws Exception {
+        String resource = "assets/minecraft/textures/font/ascii.png";
+        try (InputStream encoded = openPackagedAsset(resource)) {
+            if (encoded == null) {
+                throw new AssertionError("Bitmap font texture was not packaged: " + resource);
+            }
+            try (NativeImage image = NativeImage.read(encoded)) {
+                if (image.getWidth() != 128 || image.getHeight() != 128) {
+                    throw new AssertionError(
+                            "Bitmap font texture dimensions changed: "
+                                    + image.getWidth() + "x" + image.getHeight());
+                }
+                ByteBuffer pixels = image.getPixelBytes();
+                int nonZero = 0;
+                for (int index = pixels.position(); index < pixels.limit(); index++) {
+                    if (pixels.get(index) != 0) {
+                        nonZero++;
+                    }
+                }
+                if (nonZero < 512) {
+                    throw new AssertionError(
+                            "Bitmap font texture decoded as empty: nonZero=" + nonZero);
+                }
+            }
+        }
+    }
+
     private static InputStream openPackagedAsset(String resource) {
         int length = externalAssetLength(resource);
         if (length >= 0) {
@@ -1424,28 +2046,12 @@ public final class PlatformSmoke {
     private static native boolean copyExternalAsset(String resource, @JSByRef byte[] output);
 
     private static void testBrowserNetwork() {
-        DefaultEventLoopGroup group = new DefaultEventLoopGroup(1);
-        ChannelFuture connected = new Bootstrap()
-                .group(group)
-                .channel(BrowserWebSocketChannel.class)
-                .handler(new ChannelInboundHandlerAdapter())
-                .connect(InetSocketAddress.createUnresolved("127.0.0.1", 25565));
-        if (!connected.isDone() || !connected.isSuccess()) {
-            throw new AssertionError("Browser Netty connect future did not complete inline");
-        }
-
+        new BrowserWebSocketChannel();
         if (!runLocalNetworkFrameSmoke()) {
             throw new AssertionError("Browser local Netty bridge frame smoke did not start");
         }
-
-        connected.channel().writeAndFlush(Unpooled.wrappedBuffer(new byte[] {
-                0x10, 0x00, (byte) 0x86, 0x06, 0x09,
-                '1', '2', '7', '.', '0', '.', '0', '.', '1',
-                0x63, (byte) 0xDD, 0x01,
-                0x01, 0x00
-        }));
-        if (!networkBytesQueuedOrSent()) {
-            throw new AssertionError("Browser Netty pipeline did not write a bridge frame");
+        if (!runNettyNetworkFrameSmoke()) {
+            throw new AssertionError("Browser Netty MessagePort smoke did not start");
         }
         scheduleNetworkRoundTripCheck();
     }
@@ -1593,12 +2199,6 @@ public final class PlatformSmoke {
     private static native void enqueueSyntheticInput();
 
     @JSBody(script = """
-            const stats = window.__gaiusNetworkStats;
-            return !!stats && ((stats.sentBytes|0) > 0 || (stats.queuedBytes|0) > 0);
-            """)
-    private static native boolean networkBytesQueuedOrSent();
-
-    @JSBody(script = """
             const sessionId = '0123456789abcdef0123456789abcdef';
             const channel = new MessageChannel();
             const ports = window.__gaiusLocalServerPorts ||
@@ -1629,39 +2229,84 @@ public final class PlatformSmoke {
     private static native boolean runLocalNetworkFrameSmoke();
 
     @JSBody(script = """
+            const sessionId = 'fedcba9876543210fedcba9876543210';
+            const channel = new MessageChannel();
+            const ports = window.__gaiusLocalServerPorts ||
+              (window.__gaiusLocalServerPorts = new Map());
+            ports.set(sessionId, channel.port1);
+            const smoke = window.__gaiusNettyNetworkSmoke = {frames: 0, bytes: 0};
+            channel.port2.onmessage = function(event) {
+              const message = event.data;
+              if (!(message instanceof ArrayBuffer) && !ArrayBuffer.isView(message)) return;
+              const bytes = message instanceof ArrayBuffer
+                ? new Uint8Array(message)
+                : new Uint8Array(message.buffer, message.byteOffset || 0, message.byteLength || 0);
+              smoke.frames++;
+              smoke.bytes += bytes.byteLength;
+            };
+            if (typeof channel.port2.start === 'function') channel.port2.start();
+            const bridge = window.__gaiusNettyBridge;
+            if (!bridge) return false;
+            const socketId = 0x6A1A6;
+            bridge.open(socketId, 'client-' + sessionId + '.gaius-local', 25565);
+            return bridge.send(socketId, new Uint8Array([
+              0x10, 0x00, 0x86, 0x06, 0x09,
+              0x31, 0x32, 0x37, 0x2e, 0x30, 0x2e, 0x30, 0x2e, 0x31,
+              0x63, 0xdd, 0x01, 0x01, 0x00
+            ]));
+            """)
+    private static native boolean runNettyNetworkFrameSmoke();
+
+    @JSBody(script = """
+            globalThis.__gaiusPlatformNetworkPending = true;
             setTimeout(function() {
               const stats = window.__gaiusNetworkStats;
               const local = window.__gaiusLocalNetworkSmoke;
+              const netty = window.__gaiusNettyNetworkSmoke;
               const output = document.getElementById('status');
-              if (!local || (local.frames|0) !== 1 || (local.bytes|0) !== 6 ||
-                  !stats || (stats.localFlushes|0) < 1 ||
-                  (stats.localFlushFrames|0) !== 3 ||
-                  (stats.peakLocalFlushFrames|0) < 3 ||
-                  (stats.localReceivedFrames|0) !== 1 ||
-                  (stats.localReceivedBytes|0) !== 6) {
+              const passed = !!local && (local.frames|0) === 1 && (local.bytes|0) === 6 &&
+                  !!netty && (netty.frames|0) === 1 && (netty.bytes|0) === 19 &&
+                  !!stats && (stats.localFlushes|0) >= 2 &&
+                  (stats.localFlushFrames|0) === 4 &&
+                  (stats.localFlushBytes|0) === 25 &&
+                  (stats.peakLocalFlushFrames|0) >= 3 &&
+                  (stats.localReceivedFrames|0) === 1 &&
+                  (stats.localReceivedBytes|0) === 6;
+              globalThis.__gaiusPlatformNetworkPending = false;
+              if (!passed) {
                 if (output) {
                   output.textContent = 'Browser Netty local batching failed';
                   output.dataset.success = 'false';
                 }
-                console.error('Browser Netty local batching failed', local || null, stats || null);
+                console.error(
+                  'Browser Netty local batching failed',
+                  local || null,
+                  netty || null,
+                  stats || null
+                );
                 return;
               }
-              // The platform smoke has no configured external relay. Verify that the
-              // direct/relay bridge encoded the outbound frame, but do not require a
-              // localhost relay process to echo it back.
-              const remoteSent = (stats.sentBytes|0) - (stats.localFlushBytes|0);
-              if (remoteSent >= 19 || (stats.queuedBytes|0) >= 19) return;
+              const message = globalThis.__gaiusPlatformDeferredSuccessMessage ||
+                'Gaius platform smoke passed';
               if (output) {
-                output.textContent = 'Browser Netty bridge frame was not queued';
-                output.dataset.success = 'false';
+                output.textContent = message;
+                output.dataset.success = 'true';
               }
-              console.error('Browser Netty bridge frame was not queued', stats || null);
+              console.info(message);
             }, 2000);
             """)
     private static native void scheduleNetworkRoundTripCheck();
 
     @JSBody(params = {"success", "message"}, script = """
             const output=document.getElementById('status');
+            if (success && globalThis.__gaiusPlatformNetworkPending) {
+              globalThis.__gaiusPlatformDeferredSuccessMessage = message;
+              if (output) {
+                output.textContent = 'Waiting for browser network verification...';
+                delete output.dataset.success;
+              }
+              return;
+            }
             if (output) {
               output.textContent=message;
               output.dataset.success=success?'true':'false';

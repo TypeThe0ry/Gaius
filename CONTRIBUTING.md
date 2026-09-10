@@ -7,9 +7,10 @@ can be verified.
 
 ## Development Setup
 
-Install Git LFS, JDK 21, Node.js 22 or newer, Python 3, `curl`, `jq`, `unzip`,
-and `shasum`. After cloning, fetch the large checked-in release objects before
-working with generated browser files:
+Install Git LFS, JDK 21 (for `1.21.11`) and JDK 25 or newer (for `26.2`),
+Node.js 22 or newer, Python 3, `curl`, `jq`, `unzip`, and `shasum`. After
+cloning, fetch the large checked-in release objects before working with
+generated browser files:
 
 ```sh
 git lfs install
@@ -20,8 +21,8 @@ The game inputs are local-only and are not supplied by this repository. Obtain
 them through the supported local workflow, then perform the first remap:
 
 ```sh
-./port/scripts/fetch-version.sh
-./port/scripts/remap-client.sh
+GAIUS_VERSION_PROFILE_PATH=versions/26.2.json ./port/scripts/fetch-version.sh
+GAIUS_VERSION_PROFILE_PATH=versions/26.2.json ./port/scripts/remap-client.sh
 ```
 
 The full client compilation defaults to a 14 GiB Java heap. Use a machine with
@@ -33,13 +34,14 @@ For a source checkout that already has the local inputs, the normal browser
 release commands are:
 
 ```sh
-./port/scripts/build-platform-smoke.sh
-./port/scripts/build-teavm-release.sh
-python3 port/scripts/quick-check.py
+GAIUS_VERSION_PROFILE_PATH=versions/26.2.json \
+  bash port/scripts/build-version-release.sh 26.2
+GAIUS_VERSION_PROFILE_PATH=versions/26.2.json \
+  python3 port/scripts/quick-check.py
 ```
 
-The build produces the runnable package under `port/web/dist/`. Do not edit
-generated files there by hand; change their source and rebuild instead.
+The build produces the runnable package under `port/web/dist/<profile>/`. Do not
+edit generated files there by hand; change their source and rebuild instead.
 
 ## Repository Boundaries
 
@@ -64,34 +66,41 @@ Run the checks that cover the area you changed. For a full browser-port change,
 use this order:
 
 ```sh
-./port/scripts/build-platform-smoke.sh
-./port/scripts/build-teavm-release.sh
-python3 port/scripts/quick-check.py
-node port/scripts/singleplayer-worker-runtime-smoke.mjs
+for profile in 1.21.11 26.2; do
+  GAIUS_VERSION_PROFILE_PATH="versions/${profile}.json" \
+    bash port/scripts/build-version-release.sh "$profile"
+  GAIUS_VERSION_PROFILE_PATH="versions/${profile}.json" \
+    python3 port/scripts/quick-check.py
+  GAIUS_VERSION_PROFILE_PATH="versions/${profile}.json" \
+    node port/scripts/singleplayer-worker-runtime-smoke.mjs
+done
 git diff --check
 ```
 
-For the Paper plugin:
+For the Paper plugin (which targets the retained 1.21.11/JDK-21 profile):
 
 ```sh
-(cd apps/server-plugin && ../../port/mvnw test)
+GAIUS_VERSION_PROFILE_PATH=versions/1.21.11.json \
+  ./port/mvnw -B -ntp -f apps/server-plugin/pom.xml test
 ```
 
-For RelayNode changes, run `cd apps/bridge && npm run smoke`; it verifies the
-manifest, required token, TCP forwarding, flow control, and local-tunnel
-pairing. Use `npm run smoke:public` only against a relay endpoint you are
-authorized to test. A passing static check does not replace a Chrome runtime
-check: serve `port/web/` locally, open the `/dist/` launcher in Chrome, enter a
-local world, and verify input, terrain rendering, sound, and a short movement
-through chunk boundaries. For multiplayer changes, also verify server-list
-status and a connection through the intended plugin or relay path.
+For RelayNode changes, run the smoke suite for both supported profiles; it
+verifies the manifest, required token, TCP forwarding, flow control, and
+local-tunnel pairing. Use `npm run smoke:public` only against a relay endpoint
+you are authorized to test. A passing static check does not replace a Chrome
+runtime check: serve `port/web/` locally, open `/dist/<profile>/` in Chrome,
+enter a local world, and verify input, terrain rendering, sound, and a short
+movement through chunk boundaries. For multiplayer changes, also verify
+server-list status and a connection through the intended plugin or relay path.
 
 Record the exact commands and environment in the pull request. Do not report a
 check as passing unless it was actually run. For release-sized files, confirm
 the checksum of each artifact with:
 
 ```sh
-shasum -a 256 port/web/dist/Gaius.html
+for profile in 1.21.11 26.2; do
+  shasum -a 256 "port/web/dist/${profile}/Gaius.html"
+done
 ```
 
 ## Pull Requests

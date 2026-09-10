@@ -23,7 +23,13 @@ public final class GsonTypeTokenClientPatcher {
     }
 
     public static void main(String[] args) throws IOException {
+        if (args.length != 3) {
+            throw new IllegalArgumentException(
+                    "usage: GsonTypeTokenClientPatcher <client-overlay.jar> "
+                            + "<patch-output> <version-libraries>");
+        }
         Path root = Path.of(args[1]);
+        Path versionLibraries = Path.of(args[2]);
 
         ClassNode options = read(args[0], "net/minecraft/client/Options.class");
         replaceAnonymousTypeTokenConstruction(
@@ -42,25 +48,38 @@ public final class GsonTypeTokenClientPatcher {
                 "net/minecraft/client/resources/sounds/SoundEventRegistration");
         write(sounds, root.resolve("net/minecraft/client/sounds/SoundManager.class"));
 
-        Path clientJar = Path.of(args[0]);
-        Path gsonJar = clientJar.getParent().resolve(
-                "libraries/com/google/code/gson/gson/2.13.2/gson-2.13.2.jar");
+        Path gsonJar = findJar(versionLibraries,
+                "com/google/code/gson/gson");
         GsonBrowserPatcher.main(new String[] {
                 gsonJar.toString(),
                 root.resolve("com/google/gson/reflect/TypeToken.class").toString()
         });
 
-        Path overlayRoot = clientJar.getParent();
-        Path guavaJar = overlayRoot.resolve(
-                "libraries/com/google/guava/guava/33.5.0-jre/guava-33.5.0-jre.jar");
-        Path dataFixerJar = overlayRoot.getParent().resolve(
-                "1.21.11/libraries/com/mojang/datafixerupper/9.0.19/"
-                        + "datafixerupper-9.0.19.jar");
+        Path guavaJar = findJar(versionLibraries,
+                "com/google/guava/guava");
+        Path dataFixerJar = findJar(versionLibraries,
+                "com/mojang/datafixerupper");
         GuavaTypeTokenBrowserPatcher.main(new String[] {
                 guavaJar.toString(), dataFixerJar.toString(), root.toString()
         });
 
         System.out.println("Patched browser Gson TypeToken initializers");
+    }
+
+    /** Resolves a library JAR under the version library tree without hard-coded versions. */
+    private static Path findJar(Path overlayLibraries, String relativeDirectory)
+            throws IOException {
+        Path directory = overlayLibraries.resolve(relativeDirectory);
+        if (!Files.isDirectory(directory)) {
+            throw new IOException("Library directory is missing: " + directory);
+        }
+        try (var stream = Files.walk(directory)) {
+            return stream
+                    .filter(path -> path.getFileName().toString().endsWith(".jar"))
+                    .findFirst()
+                    .orElseThrow(() -> new IOException(
+                            "No JAR found under " + directory));
+        }
     }
 
     private static void replaceAnonymousTypeTokenConstruction(

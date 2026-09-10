@@ -5,12 +5,20 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { setTimeout as delay } from "node:timers/promises";
 import { WebSocket } from "ws";
+import {
+    MINECRAFT_1_21_11,
+    MINECRAFT_26_2,
+} from "./dist/protocol.js";
 
 const registryPath = new URL("../../relay-nodes.json", import.meta.url);
 const registry = JSON.parse(await readFile(registryPath, "utf8"));
 const relayUrl = process.env.GAIUS_PUBLIC_RELAY_URL ?? registry.nodes?.[0]?.url;
-const target = parseTarget(process.env.GAIUS_PUBLIC_RELAY_TARGET ?? "ellan.top:25565");
+const target = parseTarget(process.env.GAIUS_PUBLIC_RELAY_TARGET ?? "t40.sjcmc.cn:14803");
 const handshakeHost = process.env.GAIUS_PUBLIC_RELAY_HANDSHAKE_HOST ?? target.host;
+const minecraftProfile = resolveSmokeMinecraftProfile(
+    process.env.GAIUS_PUBLIC_RELAY_MINECRAFT_VERSION ??
+    process.env.GAIUS_PUBLIC_RELAY_PROTOCOL_VERSION ??
+    MINECRAFT_1_21_11.name);
 const origin = process.env.GAIUS_PUBLIC_RELAY_ORIGIN ?? "null";
 const timeoutMs = parsePositiveInteger(
     process.env.GAIUS_PUBLIC_RELAY_TIMEOUT_MS ?? "15000",
@@ -22,8 +30,17 @@ assert(typeof relayUrl === "string" && relayUrl.length > 0,
 const relayHostname = new URL(relayUrl).hostname;
 const relayAddress = process.env.GAIUS_PUBLIC_RELAY_EDGE_IP
     ?? await syntheticDnsFallback(relayHostname, timeoutMs);
+// A diagnostic edge-IP URL can sit behind a virtual-host proxy.  Keep the
+// transport address in the URL while allowing the caller to supply the
+// canonical HTTP/WebSocket Host header used by that proxy.  The default is
+// the URL hostname, so normal DNS/TLS behavior is unchanged.
+const relayHostHeader = process.env.GAIUS_PUBLIC_RELAY_HOST_HEADER
+    ?? new URL(relayUrl).host;
+assert(typeof relayHostHeader === "string" && relayHostHeader.trim().length > 0,
+    "GAIUS_PUBLIC_RELAY_HOST_HEADER must be non-empty when supplied");
 const manifestUrl = relayManifestUrl(relayUrl, target);
-const before = await fetchManifest(manifestUrl, origin, timeoutMs, relayAddress);
+const before = await fetchManifest(
+    manifestUrl, origin, timeoutMs, relayAddress, relayHostHeader);
 assert(before.ok === true && before.protocolVersion === 1,
     "public RelayNode manifest is incompatible");
 assert(before.requiresToken === false,
@@ -36,7 +53,8 @@ assert(before.availableConnections > 0,
     "public RelayNode has no available tunnel capacity");
 
 const beforeActive = before.target?.activeConnections ?? 0;
-const webSocket = await openRelay(relayUrl, origin, timeoutMs, relayAddress);
+const webSocket = await openRelay(
+    relayUrl, origin, timeoutMs, relayAddress, relayHostHeader);
 const controls = [];
 let during;
 let connectedControl;
@@ -111,11 +129,12 @@ const status = await new Promise((resolve, reject) => {
     }));
 
     async function sendStatusRequest() {
-        during = await fetchManifest(manifestUrl, origin, timeoutMs, relayAddress);
+        during = await fetchManifest(
+            manifestUrl, origin, timeoutMs, relayAddress, relayHostHeader);
         assert((during.target?.activeConnections ?? 0) >= beforeActive + 1,
             "RelayNode target affinity did not report the temporary tunnel");
         const handshake = Buffer.concat([
-            encodeVarInt(774),
+            encodeVarInt(minecraftProfile.protocolVersion),
             encodeString(handshakeHost),
             Buffer.from([target.port >> 8, target.port & 0xff]),
             encodeVarInt(1),
@@ -132,12 +151,13 @@ webSocket.close(1000, "public relay smoke complete");
 await closed;
 
 const leaseReleased = await waitForLeaseRelease(
-    manifestUrl, origin, beforeActive, timeoutMs, relayAddress);
+    manifestUrl, origin, beforeActive, timeoutMs, relayAddress, relayHostHeader);
 assert(leaseReleased, "RelayNode did not release the target tunnel after WebSocket close");
 
 console.log(JSON.stringify({
     ok: true,
     relayUrl,
+    relayHostHeader,
     relayName: before.name,
     target: `${target.host}:${target.port}`,
     handshakeHost,
@@ -162,12 +182,27 @@ console.log(JSON.stringify({
     remotePeer: `${connectedControl.remoteAddress}:${connectedControl.remotePort}`,
 }));
 
-async function openRelay(url, requestOrigin, timeout, address) {
+function resolveSmokeMinecraftProfile(value) {
+    const key = String(value ?? "").trim();
+    const profile = [MINECRAFT_1_21_11, MINECRAFT_26_2]
+        .find((candidate) => candidate.name === key ||
+            String(candidate.protocolVersion) === key);
+    if (profile === undefined) {
+        throw new Error(
+            `Unsupported public smoke Minecraft version ${value}; expected 1.21.11/774 or 26.2/776`);
+    }
+    return profile;
+}
+
+async function openRelay(url, requestOrigin, timeout, address, hostHeader) {
     return new Promise((resolve, reject) => {
         let settled = false;
         const timer = setTimeout(() => finish(
             new Error(`WebSocket connection timed out after ${timeout}ms`)), timeout);
-        const options = {origin: requestOrigin};
+        const options = {
+            origin: requestOrigin,
+            headers: {host: hostHeader},
+        };
         if (address !== undefined) {
             options.lookup = lookupAddress(address);
         }
@@ -211,7 +246,7 @@ function isSyntheticAddress(address) {
     return octets.length === 4 && octets[0] === 198 && (octets[1] === 18 || octets[1] === 19);
 }
 
-async function fetchManifest(url, requestOrigin, timeout, address) {
+async function fetchManifest(url, requestOrigin, timeout, address, hostHeader) {
     const parsed = new URL(url);
     const request = parsed.protocol === "https:" ? httpsRequest : httpRequest;
     return new Promise((resolve, reject) => {
@@ -219,6 +254,7 @@ async function fetchManifest(url, requestOrigin, timeout, address) {
             headers: {
                 accept: "application/json",
                 origin: requestOrigin,
+                host: hostHeader,
             },
         };
         if (address !== undefined) options.lookup = lookupAddress(address);
@@ -255,10 +291,11 @@ async function fetchManifest(url, requestOrigin, timeout, address) {
 }
 
 async function waitForLeaseRelease(
-    url, requestOrigin, maximumActive, timeout, address) {
+    url, requestOrigin, maximumActive, timeout, address, hostHeader) {
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
-        const manifest = await fetchManifest(url, requestOrigin, timeout, address);
+        const manifest = await fetchManifest(
+            url, requestOrigin, timeout, address, hostHeader);
         if ((manifest.target?.activeConnections ?? 0) <= maximumActive) return true;
         await delay(100);
     }

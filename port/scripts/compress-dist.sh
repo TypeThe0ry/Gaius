@@ -2,7 +2,9 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
-dist="${GAIUS_DIST_DIRECTORY:-$root/port/web/dist}"
+source "$root/port/scripts/version-profile.sh"
+gaius_load_version_profile "$root"
+dist="$(gaius_dist_directory "$root")"
 
 if [[ ! -d "$dist" ]]; then
   echo "Missing dist directory: $dist" >&2

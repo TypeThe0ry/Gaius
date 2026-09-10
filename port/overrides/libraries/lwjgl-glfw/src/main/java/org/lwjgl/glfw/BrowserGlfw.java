@@ -4,7 +4,11 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryUtil;
+import org.teavm.interop.Async;
+import org.teavm.interop.AsyncCallback;
 import org.teavm.jso.JSBody;
+import org.teavm.jso.JSFunctor;
+import org.teavm.jso.JSObject;
 
 /**
  * Browser implementation behind the original LWJGL GLFW API.
@@ -17,7 +21,7 @@ public final class BrowserGlfw {
     private static final long WINDOW = 1L;
     private static final long MONITOR = 2L;
 
-    private static GLFWErrorCallbackI errorCallback;
+    private static GLFWErrorCallback errorCallback;
     private static GLFWMonitorCallbackI monitorCallback;
     private static GLFWWindowPosCallbackI windowPosCallback;
     private static GLFWWindowSizeCallbackI windowSizeCallback;
@@ -35,6 +39,7 @@ public final class BrowserGlfw {
     private static GLFWDropCallbackI dropCallback;
 
     private static boolean shouldClose;
+    private static int swapInterval;
     private static double cursorX;
     private static double cursorY;
     private static ByteBuffer videoModeMemory;
@@ -137,6 +142,10 @@ public final class BrowserGlfw {
 
     public static long getPrimaryMonitor() {
         return MONITOR;
+    }
+
+    public static String getMonitorName(long monitor) {
+        return "Browser Display";
     }
 
     public static void getMonitorPos(long monitor, int[] x, int[] y) {
@@ -407,6 +416,7 @@ public final class BrowserGlfw {
             let now;
             if (telemetry && telemetry.enabled) {
               now=(typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+              if (!Number.isFinite(telemetry.startedAt)) telemetry.startedAt=now;
               const previous=telemetry.lastFrameAt;
               if (Number.isFinite(previous) && previous > 0) {
                 const frameElapsed=Math.max(0, now-previous);
@@ -420,7 +430,31 @@ public final class BrowserGlfw {
                 telemetry.frameCount=(telemetry.frameCount||0)+1;
                 telemetry.totalFrameMillis=(telemetry.totalFrameMillis||0)+frameElapsed;
                 telemetry.longestFrameMillis=Math.max(telemetry.longestFrameMillis||0, frameElapsed);
+                if (frameElapsed >= 500) {
+                  telemetry.freezeCount=(telemetry.freezeCount||0)+1;
+                }
+                let samples=telemetry.frameTimes;
+                if (!(samples instanceof Float32Array)) {
+                  const requested=Number(telemetry.sampleCapacity);
+                  const capacity=Number.isFinite(requested)
+                    ? Math.max(1024, Math.min(65536, Math.floor(requested)))
+                    : 65536;
+                  samples=new Float32Array(capacity);
+                  telemetry.frameTimes=samples;
+                  telemetry.sampleCapacity=capacity;
+                  telemetry.sampleWriteIndex=0;
+                  telemetry.sampleCount=0;
+                }
+                const writeIndex=(Number(telemetry.sampleWriteIndex)||0)%samples.length;
+                samples[writeIndex]=frameElapsed;
+                telemetry.sampleWriteIndex=(writeIndex+1)%samples.length;
+                telemetry.sampleCount=Math.min(
+                  samples.length,
+                  (Number(telemetry.sampleCount)||0)+1
+                );
               }
+              if (hidden) telemetry.hiddenFrameCount=(telemetry.hiddenFrameCount||0)+1;
+              else telemetry.visibleFrameCount=(telemetry.visibleFrameCount||0)+1;
               telemetry.lastFrameAt=now;
             }
             fps.gameFrames=(fps.gameFrames||0)+1;
@@ -448,15 +482,194 @@ public final class BrowserGlfw {
             """)
     private static native boolean swapBuffersJs();
 
+    @Async
+    private static native void yieldAfterPresent(boolean hidden, int interval);
+
+    private static void yieldAfterPresent(boolean hidden, int interval, AsyncCallback<Void> callback) {
+        scheduleFrameYield(hidden, interval, () -> callback.complete(null));
+    }
+
+    @JSBody(params = {"hidden", "interval", "resume"}, script = """
+            const root=typeof window!=='undefined' ? window : globalThis;
+            const telemetry=root.__gaiusFrameTelemetry;
+            const telemetryEnabled=!!(telemetry && telemetry.enabled);
+            const synchronizedToDisplay=Number(interval)!==0;
+            const clock=() => (typeof performance!=='undefined' && performance.now)
+              ? performance.now()
+              : Date.now();
+            const requestedAt=telemetryEnabled ? clock() : 0;
+            if (telemetryEnabled) {
+              telemetry.yieldRequestCount=(telemetry.yieldRequestCount||0)+1;
+              telemetry.pendingYieldCount=Math.max(
+                0,Number(telemetry.pendingYieldCount)||0)+1;
+              telemetry.maxPendingYieldCount=Math.max(
+                Number(telemetry.maxPendingYieldCount)||0,
+                telemetry.pendingYieldCount);
+              telemetry.duplicateYieldCallbackCount=
+                Number(telemetry.duplicateYieldCallbackCount)||0;
+              telemetry.swapInterval=Number(interval)||0;
+              if (synchronizedToDisplay) {
+                telemetry.vsyncYieldCount=(telemetry.vsyncYieldCount||0)+1;
+              } else {
+                telemetry.uncappedYieldCount=(telemetry.uncappedYieldCount||0)+1;
+              }
+              if (hidden) telemetry.hiddenYieldCount=(telemetry.hiddenYieldCount||0)+1;
+              else telemetry.visibleYieldCount=(telemetry.visibleYieldCount||0)+1;
+            }
+            let resumed=false;
+            let watchdog=-1;
+            let activeMessageScheduler=null;
+            let activeMessageTaskId=0;
+            const retireMessageChannel=scheduler => {
+              const channel=scheduler && scheduler.channel;
+              if (!channel) return;
+              try { channel.port1.onmessage=null; } catch (ignored) {}
+              try { if (channel.port1.close) channel.port1.close(); } catch (ignored) {}
+              try { if (channel.port2.close) channel.port2.close(); } catch (ignored) {}
+              scheduler.channel=null;
+              if (telemetryEnabled) {
+                telemetry.messageChannelRebuildCount=
+                  (Number(telemetry.messageChannelRebuildCount)||0)+1;
+              }
+            };
+            const detachMessageTask=failed => {
+              const scheduler=activeMessageScheduler;
+              const taskId=activeMessageTaskId;
+              activeMessageScheduler=null;
+              activeMessageTaskId=0;
+              if (!scheduler || !taskId || !(scheduler.tasks instanceof Map)) return;
+              const removed=scheduler.tasks.delete(taskId);
+              if (removed && telemetryEnabled) {
+                telemetry.cancelledMessageTaskCount=
+                  (Number(telemetry.cancelledMessageTaskCount)||0)+1;
+              }
+              if (failed) retireMessageChannel(scheduler);
+            };
+            const finish=source => {
+              if (resumed) {
+                if (telemetryEnabled) {
+                  telemetry.duplicateYieldCallbackCount=
+                    (Number(telemetry.duplicateYieldCallbackCount)||0)+1;
+                }
+                return;
+              }
+              resumed=true;
+              if (watchdog >= 0) clearTimeout(watchdog);
+              if (source==='message') {
+                activeMessageScheduler=null;
+                activeMessageTaskId=0;
+              } else {
+                detachMessageTask(source==='watchdog');
+              }
+              if (telemetryEnabled) {
+                telemetry.pendingYieldCount=Math.max(
+                  0,(Number(telemetry.pendingYieldCount)||0)-1);
+                const delay=Math.max(0, clock()-requestedAt);
+                telemetry.yieldCompletionCount=(telemetry.yieldCompletionCount||0)+1;
+                telemetry.lastYieldResumeDelayMillis=delay;
+                telemetry.totalYieldResumeDelayMillis=(telemetry.totalYieldResumeDelayMillis||0)+delay;
+                telemetry.longestYieldResumeDelayMillis=Math.max(
+                  telemetry.longestYieldResumeDelayMillis||0,
+                  delay
+                );
+                if (source==='message') {
+                  telemetry.messageChannelYieldCount=(telemetry.messageChannelYieldCount||0)+1;
+                } else if (source==='scheduler') {
+                  telemetry.schedulerYieldCount=(telemetry.schedulerYieldCount||0)+1;
+                } else {
+                  telemetry.timerYieldCount=(telemetry.timerYieldCount||0)+1;
+                  if (source==='watchdog') {
+                    telemetry.watchdogYieldCount=(telemetry.watchdogYieldCount||0)+1;
+                  }
+                }
+              }
+              resume();
+            };
+            const postTask=() => {
+              let scheduler=root.__gaiusFrameYieldScheduler;
+              if (!scheduler || !(scheduler.tasks instanceof Map)) {
+                if (scheduler && scheduler.channel) retireMessageChannel(scheduler);
+                scheduler={tasks:new Map(),channel:null,nextTaskId:1};
+                root.__gaiusFrameYieldScheduler=scheduler;
+              }
+              if (!scheduler.channel) {
+                if (typeof MessageChannel==='function') {
+                  try {
+                    const channel=new MessageChannel();
+                    channel.port1.onmessage=event => {
+                      const taskId=Number(event && event.data)||0;
+                      const task=scheduler.tasks.get(taskId);
+                      if (!task) return;
+                      scheduler.tasks.delete(taskId);
+                      task();
+                    };
+                    scheduler.channel=channel;
+                  } catch (ignored) {
+                    if (telemetryEnabled) {
+                      telemetry.messageChannelCreateFailureCount=
+                        (Number(telemetry.messageChannelCreateFailureCount)||0)+1;
+                    }
+                  }
+                }
+              }
+              if (scheduler.channel) {
+                let taskId=(Number(scheduler.nextTaskId)||1)>>>0;
+                if (taskId===0) taskId=1;
+                scheduler.nextTaskId=(taskId+1)>>>0;
+                activeMessageScheduler=scheduler;
+                activeMessageTaskId=taskId;
+                scheduler.tasks.set(taskId,() => finish('message'));
+                try {
+                  scheduler.channel.port2.postMessage(taskId);
+                } catch (ignored) {
+                  detachMessageTask(false);
+                  retireMessageChannel(scheduler);
+                  if (telemetryEnabled) {
+                    telemetry.messageChannelPostFailureCount=
+                      (Number(telemetry.messageChannelPostFailureCount)||0)+1;
+                  }
+                  setTimeout(() => finish('timer'), 0);
+                }
+              } else {
+                setTimeout(() => finish('timer'), 0);
+              }
+            };
+            if (hidden) {
+              setTimeout(() => finish('timer'), 50);
+            } else if (synchronizedToDisplay && typeof requestAnimationFrame==='function') {
+              watchdog=setTimeout(() => finish('watchdog'), 100);
+              requestAnimationFrame(() => {
+                if (resumed) return;
+                if (telemetryEnabled) {
+                  const delay=Math.max(0, clock()-requestedAt);
+                  telemetry.presentToRafCount=(telemetry.presentToRafCount||0)+1;
+                  telemetry.lastPresentToRafMillis=delay;
+                  telemetry.totalPresentToRafMillis=(telemetry.totalPresentToRafMillis||0)+delay;
+                  telemetry.longestPresentToRafMillis=Math.max(
+                    telemetry.longestPresentToRafMillis||0,
+                    delay
+                  );
+                }
+                postTask();
+              });
+            } else {
+              watchdog=setTimeout(() => finish('watchdog'), 100);
+              // Keep every visible uncapped present on the same MessageChannel task path.
+              // Mixing scheduler.yield() into every fourth present makes Chromium defer that
+              // continuation behind compositor arbitration, producing a stable 3:1 cadence
+              // and periodic multi-refresh frame bubbles on high-refresh displays.
+              postTask();
+            }
+            """)
+    private static native void scheduleFrameYield(boolean hidden, int interval, FrameYieldCallback resume);
+
     public static void swapBuffers(long window) {
         boolean hidden = swapBuffersJs();
-        // TeaVM's Thread.yield() only suspends after a long time slice. Yield on
-        // every presented frame so an unlimited game loop cannot starve Chrome's
-        // paint, input, audio, and MessagePort tasks for roughly 100 ms at a time.
-        sleepForBrowserMillis(hidden ? 50L : 1L);
+        yieldAfterPresent(hidden, swapInterval);
     }
 
     public static void swapInterval(int interval) {
+        swapInterval = interval;
     }
 
     public static int getError(PointerBuffer description) {
@@ -464,8 +677,15 @@ public final class BrowserGlfw {
     }
 
     public static GLFWErrorCallback setErrorCallback(GLFWErrorCallbackI callback) {
-        errorCallback = callback;
-        return null;
+        GLFWErrorCallback previous = errorCallback;
+        if (callback == null) {
+            errorCallback = null;
+        } else if (callback instanceof GLFWErrorCallback glfwCallback) {
+            errorCallback = glfwCallback;
+        } else {
+            errorCallback = GLFWErrorCallback.create(callback);
+        }
+        return previous;
     }
 
     public static GLFWMonitorCallback setMonitorCallback(GLFWMonitorCallbackI callback) {
@@ -571,6 +791,11 @@ public final class BrowserGlfw {
         }
     }
 
+    @JSFunctor
+    private interface FrameYieldCallback extends JSObject {
+        void run();
+    }
+
     @JSBody(script = """
             if (window.__gaiusGlfwInstalled) return;
             window.__gaiusGlfwInstalled = true;
@@ -610,6 +835,64 @@ public final class BrowserGlfw {
                 rememberPointerLockError(error);
               }
             };
+            const rememberKeyboardLockError = error => {
+              window.__gaiusKeyboardLockPending = false;
+              window.__gaiusKeyboardLockHeld = false;
+              window.__gaiusKeyboardLockLastError = String(error && (error.message || error.name) || error);
+            };
+            const requestKeyboardLockIfWanted = () => {
+              const keyboard = navigator.keyboard;
+              if (!document.fullscreenElement || !keyboard || !keyboard.lock || window.__gaiusKeyboardLockHeld || window.__gaiusKeyboardLockPending) {
+                return;
+              }
+              window.__gaiusKeyboardLockPending = true;
+              try {
+                // Browser accelerators are captured only in API fullscreen.
+                // preventDefault alone cannot protect a windowed Ctrl+W.
+                // Locking KeyW also covers Ctrl+W while leaving browser
+                // accelerators such as Ctrl+R and Ctrl+L available.
+                const result = keyboard.lock(['KeyW']);
+                if (result && result.then) {
+                  result.then(() => {
+                    window.__gaiusKeyboardLockPending = false;
+                    window.__gaiusKeyboardLockHeld = !!document.fullscreenElement;
+                  }, rememberKeyboardLockError);
+                } else {
+                  window.__gaiusKeyboardLockPending = false;
+                  window.__gaiusKeyboardLockHeld = true;
+                }
+              } catch (error) {
+                rememberKeyboardLockError(error);
+              }
+            };
+            const requestGameFullscreen = () => {
+              const root = document.documentElement;
+              if (!window.__gaiusWantPointerLock || document.fullscreenElement ||
+                  !navigator.keyboard || !navigator.keyboard.lock || !root.requestFullscreen) {
+                requestKeyboardLockIfWanted();
+                requestPointerLockIfWanted();
+                return;
+              }
+              if (window.__gaiusFullscreenPending) return;
+              window.__gaiusFullscreenPending = true;
+              const ready = () => {
+                window.__gaiusFullscreenPending = false;
+                requestKeyboardLockIfWanted();
+                requestPointerLockIfWanted();
+              };
+              const failed = error => {
+                window.__gaiusFullscreenPending = false;
+                rememberKeyboardLockError(error);
+                requestPointerLockIfWanted();
+              };
+              try { Promise.resolve(root.requestFullscreen()).then(ready, failed); }
+              catch (error) { failed(error); }
+            };
+            addEventListener('fullscreenchange', () => {
+              window.__gaiusKeyboardLockHeld = false;
+              if (document.fullscreenElement) requestKeyboardLockIfWanted();
+              else if (navigator.keyboard && navigator.keyboard.unlock) navigator.keyboard.unlock();
+            });
             const codeMap = {
               Space:32,Apostrophe:39,Comma:44,Minus:45,Period:46,Slash:47,
               Digit0:48,Digit1:49,Digit2:50,Digit3:51,Digit4:52,Digit5:53,Digit6:54,Digit7:55,Digit8:56,Digit9:57,
@@ -659,6 +942,16 @@ public final class BrowserGlfw {
               window.__gaiusCursorY=locked?(window.__gaiusCursorY||0)+e.movementY:e.clientY-r.top;
               return [window.__gaiusCursorX, window.__gaiusCursorY];
             };
+            // Ctrl+W is a valid sprint + forward chord in Minecraft.  Chrome
+            // reserves the same chord for closing a tab. API fullscreen and
+            // Keyboard Lock above provide accelerator capture; this guard
+            // only suppresses defaults for events delivered to the page.
+            // The normal handler still forwards both key events to GLFW.
+            addEventListener('keydown', e => {
+              if (e.ctrlKey && !e.altKey && !e.metaKey && e.code === 'KeyW') {
+                e.preventDefault();
+              }
+            }, {capture:true, passive:false});
             const urlNumber = name => {
               try {
                 const value = new URLSearchParams(location.search).get(name);
@@ -716,7 +1009,11 @@ public final class BrowserGlfw {
             addEventListener('keydown', e => {
               const key=codeMap[e.code]===undefined?-1:codeMap[e.code]; window.__gaiusGlfwKeys[key]=true;
               pushEvent([1,key,e.keyCode,e.repeat?2:1,mods(e),0,0]);
-              if (e.key && e.key.length>0 && e.key.length<=2) pushEvent([2,e.key.codePointAt(0),mods(e),0,0,0,0]);
+              const altGraph=typeof e.getModifierState==='function' && e.getModifierState('AltGraph');
+              const printable=typeof e.key==='string' &&
+                (e.key.length===1 || (e.key.length===2 && e.key.codePointAt(0)>65535)) &&
+                !e.metaKey && (!e.ctrlKey || altGraph);
+              if (printable) pushEvent([2,e.key.codePointAt(0),mods(e),0,0,0,0]);
               if (document.activeElement===canvas()) e.preventDefault();
             });
             addEventListener('keyup', e => {
@@ -731,7 +1028,7 @@ public final class BrowserGlfw {
               pushMouseMove([4,0,0,0,0,p[0],p[1]]);
               window.__gaiusGlfwButtons[button]=true;
               pushEvent([3,button,1,mods(e),0,p[0],p[1]]);
-              requestPointerLockIfWanted();
+              if (e.target === c) requestGameFullscreen();
             });
             addEventListener('mouseup', e => {
               const p = updateCursorFromMouseEvent(e);
@@ -753,7 +1050,14 @@ public final class BrowserGlfw {
             addEventListener('resize', () => {
               window.__gaiusApplyCanvasResolution(innerWidth, innerHeight, true);
             });
-            addEventListener('beforeunload', () => pushEvent([8,0,0,0,0,0,0]));
+            addEventListener('beforeunload', () => {
+              if (navigator.keyboard && navigator.keyboard.unlock) {
+                try { navigator.keyboard.unlock(); } catch (ignored) {}
+              }
+              window.__gaiusKeyboardLockHeld = false;
+              window.__gaiusKeyboardLockPending = false;
+              pushEvent([8,0,0,0,0,0,0]);
+            });
             """)
     private static native void installDomBridge();
 

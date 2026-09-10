@@ -9,9 +9,18 @@ by applying them from this tracked script after every successful TeaVM build.
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
 import sys
 from pathlib import Path
+
+
+def native_external_path(value: str) -> Path:
+    """Accept Git-Bash /c/... paths when Python runs on Windows."""
+    if os.name == "nt" and re.match(r"^/[A-Za-z](?:/|$)", value):
+        value = f"{value[1].upper()}:{value[2:]}"
+    return Path(value).expanduser()
 
 
 def replace_required(text: str, old: str, new: str, label: str) -> str:
@@ -20,6 +29,113 @@ def replace_required(text: str, old: str, new: str, label: str) -> str:
     if new in text:
         return text
     raise RuntimeError(f"index.html patch point was not found: {label}")
+
+
+def patch_release_version(text: str) -> str:
+    version = (Path(__file__).resolve().parents[2] / "VERSION").read_text(
+        encoding="utf-8"
+    ).strip()
+    if not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", version):
+        raise RuntimeError("VERSION must contain a release version")
+    text, count = re.subn(
+        r'(<span id="gaius-shell-version">)[^<]*(</span>)',
+        lambda match: f"{match[1]}VERSION {version}{match[2]}",
+        text,
+    )
+    if count != 1:
+        raise RuntimeError("launcher must contain exactly one release version label")
+    return text
+
+
+def migrate_raf_frame_samples(text: str) -> str:
+    """Replace the legacy shifting FPS sample array with a bounded ring."""
+    text = text.replace(
+        "        fps.rafFrameTimes = [];\n"
+        "        fps.rafLastFrameAt = 0;\n",
+        "        fps.rafFrameTimes = new Float32Array(4096);\n"
+        "        fps.rafFrameWriteIndex = 0;\n"
+        "        fps.rafFrameCount = 0;\n"
+        "        fps.rafLastFrameAt = 0;\n",
+    )
+    text = text.replace(
+        "          const samples = fps.rafFrameTimes || (fps.rafFrameTimes = []);\n"
+        "          samples.push(frameMs);\n"
+        "          if (samples.length > 2048) samples.splice(0, samples.length - 2048);\n",
+        "          let samples = fps.rafFrameTimes;\n"
+        "          if (!(samples instanceof Float32Array) || samples.length !== 4096) {\n"
+        "            samples = new Float32Array(4096);\n"
+        "            fps.rafFrameTimes = samples;\n"
+        "            fps.rafFrameWriteIndex = 0;\n"
+        "            fps.rafFrameCount = 0;\n"
+        "          }\n"
+        "          const writeIndex = (Number(fps.rafFrameWriteIndex) || 0) % samples.length;\n"
+        "          samples[writeIndex] = frameMs;\n"
+        "          fps.rafFrameWriteIndex = (writeIndex + 1) % samples.length;\n"
+        "          fps.rafFrameCount = Math.min(samples.length, (Number(fps.rafFrameCount) || 0) + 1);\n",
+    )
+    text = text.replace(
+        "        const samples = fps.rafFrameTimes || [];\n"
+        "        if (samples.length > 0) {\n"
+        "          const ordered = samples.slice().sort((left, right) => left - right);\n",
+        "        const samples = fps.rafFrameTimes;\n"
+        "        const sampleCount = samples instanceof Float32Array\n"
+        "          ? Math.min(samples.length, Number(fps.rafFrameCount) || 0)\n"
+        "          : 0;\n"
+        "        if (sampleCount > 0) {\n"
+        "          const ordered = Array.from(samples.subarray(0, sampleCount))\n"
+        "            .sort((left, right) => left - right);\n",
+    )
+    text = text.replace(
+        "          const totalMs = ordered.reduce((sum, value) => sum + value, 0);\n"
+        "          const onePercentIndex = Math.min(ordered.length - 1, Math.ceil(ordered.length * 0.99) - 1);\n"
+        "          fps.rafAverageFps = Math.round((ordered.length * 1000 / totalMs) * 10) / 10;\n"
+        "          fps.rafOnePercentLow = Math.round((1000 / ordered[onePercentIndex]) * 10) / 10;\n",
+        "          const totalMs = ordered.reduce((sum, value) => sum + value, 0);\n"
+        "          const slowestCount = Math.max(1, Math.ceil(ordered.length * 0.01));\n"
+        "          let slowestTotalMs = 0;\n"
+        "          for (let index = ordered.length - slowestCount; index < ordered.length; index++) {\n"
+        "            slowestTotalMs += ordered[index];\n"
+        "          }\n"
+        "          fps.rafAverageFps = Math.round((ordered.length * 1000 / totalMs) * 10) / 10;\n"
+        "          fps.rafOnePercentLow = Math.round((slowestCount * 1000 / slowestTotalMs) * 10) / 10;\n",
+    )
+    return text
+
+
+def migrate_text_shader_diagnostics(text: str) -> str:
+    """Teach the lightmap diagnostic about the Minecraft 26.2 text shader."""
+    sample_call = (
+        '.replace("vertexColor = Color * sample_lightmap(Sampler2, UV2);", '
+        '"vertexColor = Color;")'
+    )
+    legacy_call = (
+        '.replace("vertexColor = Color * texelFetch(Sampler2, UV2 / 16, 0);", '
+        '"vertexColor = Color;")'
+    )
+    legacy_count = text.count(legacy_call)
+    sample_count = text.count(sample_call)
+    if ("installLightweightTextShaderPatch" in text
+            and "__gaiusTextShaderTelemetry" not in text):
+        raise RuntimeError("index.html text diagnostic is missing bounded telemetry")
+    if legacy_count == 0:
+        return text
+    if sample_count == legacy_count:
+        return text
+    if sample_count != 0:
+        raise RuntimeError("index.html has a partially migrated text lightmap diagnostic")
+    for indentation in ("              ", "                "):
+        old = indentation + legacy_call
+        new = (
+            indentation + sample_call + "\n"
+            + indentation
+            + '.replace("vertexColor = Color * sample_lightmap(Sampler2, UV2)", '
+            + '"vertexColor = Color")\n'
+            + old
+        )
+        text = text.replace(old, new, 1)
+    if text.count(sample_call) != legacy_count:
+        raise RuntimeError("index.html text lightmap diagnostic migration was incomplete")
+    return text
 
 
 def content_token(*paths: Path) -> str:
@@ -34,8 +150,756 @@ def content_token(*paths: Path) -> str:
                 digest.update(chunk)
     return digest.hexdigest()[:16] if found else "dev"
 
+GAIUS_SHELL_MARKER = 'data-gaius-shell="v2"'
 
-def patch_index(index: Path, classes_js: Path) -> bool:
+GAIUS_SHELL_CSS = r'''
+    /* Gaius Client shell v2: browser launcher controls only. */
+    :root {
+      --gaius-shell-bg: #0b1116;
+      --gaius-shell-panel: #111a21;
+      --gaius-shell-panel-strong: #17232c;
+      --gaius-shell-line: #31414c;
+      --gaius-shell-muted: #9aaab4;
+      --gaius-shell-text: #f1f5f7;
+      --gaius-shell-accent: #9bd36a;
+      --gaius-shell-accent-strong: #c3ec8f;
+      --gaius-shell-danger: #f08a7b;
+    }
+
+    html,
+    body {
+      background: var(--gaius-shell-bg);
+      color: var(--gaius-shell-text);
+    }
+
+    #mc-canvas {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      background: #05080a;
+    }
+
+    #boot-screen {
+      z-index: 10;
+      background: var(--gaius-shell-bg);
+    }
+
+    #boot-screen::before {
+      position: absolute;
+      inset: 18px;
+      content: "";
+      border: 1px solid rgba(155, 211, 106, 0.18);
+      pointer-events: none;
+    }
+
+    #gaius-shell-header {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 12;
+      display: flex;
+      align-items: center;
+      min-height: 56px;
+      box-sizing: border-box;
+      padding: 0 24px;
+      border-bottom: 2px solid var(--gaius-shell-line);
+      background: var(--gaius-shell-bg);
+      pointer-events: none;
+      transition: opacity 140ms linear, visibility 140ms linear;
+    }
+
+    #gaius-shell-brand {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      font: 800 15px/1 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+    }
+
+    #gaius-shell-brand strong {
+      color: var(--gaius-shell-accent-strong);
+      font-size: 19px;
+    }
+
+    #gaius-shell-mode,
+    #gaius-shell-version {
+      color: var(--gaius-shell-muted);
+      font: 700 11px/1 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    #gaius-shell-mode {
+      margin-left: auto;
+      margin-right: 18px;
+      color: var(--gaius-shell-accent);
+    }
+
+    #gaius-shell-footer {
+      position: fixed;
+      left: 24px;
+      right: 24px;
+      bottom: 18px;
+      z-index: 12;
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      color: var(--gaius-shell-muted);
+      font: 11px/1.4 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+      pointer-events: none;
+      transition: opacity 140ms linear, visibility 140ms linear;
+    }
+
+    #gaius-shell-footer strong {
+      color: var(--gaius-shell-text);
+      font-weight: 700;
+    }
+
+    html[data-gaius-shell-view="canvas"] #gaius-shell-header,
+    html[data-gaius-shell-view="canvas"] #gaius-shell-footer {
+      visibility: hidden;
+      opacity: 0;
+    }
+
+    #boot-brand {
+      top: 40%;
+      z-index: 11;
+      max-width: calc(100vw - 32px);
+      color: var(--gaius-shell-text);
+      font: 900 72px/0.84 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+      text-shadow: 0 4px 0 #27343b;
+    }
+
+    #boot-brand span {
+      margin-top: 14px;
+      color: var(--gaius-shell-accent);
+      font-size: 12px;
+      font-weight: 700;
+      line-height: 1;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    #boot-progress {
+      top: 58%;
+      z-index: 11;
+      width: min(480px, calc(100vw - 48px));
+      height: 14px;
+      padding: 2px;
+      border: 2px solid var(--gaius-shell-text);
+      border-radius: 0;
+      background: transparent;
+    }
+
+    #boot-progress-bar {
+      min-width: 2px;
+      background: var(--gaius-shell-accent);
+      transition: width 160ms linear;
+    }
+
+    #boot-progress-text {
+      top: calc(58% + 28px);
+      z-index: 11;
+      color: var(--gaius-shell-muted);
+      font: 700 12px/1.4 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+      text-align: center;
+      text-shadow: none;
+    }
+
+    #status {
+      top: calc(58% + 62px);
+      z-index: 11;
+      width: min(660px, calc(100vw - 48px));
+      max-height: 22vh;
+      box-sizing: border-box;
+      padding: 0;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      color: var(--gaius-shell-muted);
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      letter-spacing: 0;
+      text-align: center;
+    }
+
+    #status[data-state="error"] {
+      max-height: 25vh;
+      overflow: auto;
+      padding: 12px 14px;
+      border: 2px solid var(--gaius-shell-danger);
+      border-left-width: 5px;
+      background: var(--gaius-shell-panel);
+      color: var(--gaius-shell-text);
+      text-align: left;
+    }
+
+    #gaius-error-actions {
+      position: fixed;
+      top: calc(58% + 190px);
+      left: 50%;
+      z-index: 12;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 8px;
+      width: min(660px, calc(100vw - 48px));
+      transform: translateX(-50%);
+    }
+
+    #gaius-error-actions[hidden],
+    #gaius-error-details[hidden] {
+      display: none;
+    }
+
+    #gaius-error-actions button {
+      min-height: 36px;
+      box-sizing: border-box;
+      padding: 0 14px;
+      border: 2px solid var(--gaius-shell-line);
+      border-radius: 0;
+      background: var(--gaius-shell-panel-strong);
+      color: var(--gaius-shell-text);
+      font: 700 12px/1 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+      cursor: pointer;
+    }
+
+    #gaius-error-actions button:first-child {
+      border-color: var(--gaius-shell-accent);
+      background: var(--gaius-shell-accent);
+      color: #0b1116;
+    }
+
+    #gaius-error-actions button:hover,
+    #gaius-error-actions button:focus-visible {
+      outline: 2px solid var(--gaius-shell-text);
+      outline-offset: 2px;
+    }
+
+    #gaius-error-actions button:disabled {
+      cursor: wait;
+      opacity: 0.65;
+    }
+
+    #gaius-error-details {
+      position: fixed;
+      top: calc(58% + 238px);
+      left: 50%;
+      z-index: 12;
+      width: min(660px, calc(100vw - 48px));
+      max-height: 20vh;
+      box-sizing: border-box;
+      margin: 0;
+      padding: 10px 12px;
+      overflow: auto;
+      border: 1px solid var(--gaius-shell-line);
+      background: #080d11;
+      color: var(--gaius-shell-muted);
+      font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      letter-spacing: 0;
+      transform: translateX(-50%);
+      white-space: pre-wrap;
+    }
+
+    #profile-gate {
+      z-index: 14;
+      padding: 32px 16px;
+      background: var(--gaius-shell-bg);
+      color: var(--gaius-shell-text);
+    }
+
+    #profile-form {
+      width: min(440px, calc(100vw - 32px));
+      box-sizing: border-box;
+      padding: 30px 32px 26px;
+      border: 2px solid var(--gaius-shell-line);
+      border-radius: 0;
+      background: var(--gaius-shell-panel);
+      box-shadow: 8px 8px 0 #06090c;
+    }
+
+    #profile-title {
+      margin: 0;
+      color: var(--gaius-shell-text);
+      font: 900 52px/0.9 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+      text-align: left;
+    }
+
+    #profile-kicker {
+      margin: 10px 0 28px;
+      color: var(--gaius-shell-accent);
+      font: 700 11px/1.4 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    #profile-subtitle {
+      margin: -16px 0 24px;
+      color: var(--gaius-shell-muted);
+      font: 13px/1.45 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+    }
+
+    #profile-form label {
+      margin-bottom: 8px;
+      color: var(--gaius-shell-text);
+      font: 700 12px/1.2 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+    }
+
+    #profile-name {
+      height: 46px;
+      border: 2px solid #5a6b76;
+      border-radius: 0;
+      background: #0a1014;
+      color: var(--gaius-shell-text);
+      font: 18px/1 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+    }
+
+    #profile-name:focus {
+      border-color: var(--gaius-shell-accent);
+      box-shadow: 0 0 0 2px rgba(155, 211, 106, 0.18);
+    }
+
+    #profile-submit {
+      height: 46px;
+      margin-top: 14px;
+      border: 2px solid var(--gaius-shell-accent);
+      border-radius: 0;
+      background: var(--gaius-shell-accent);
+      color: #0b1116;
+      font: 800 14px/1 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+
+    #profile-submit:hover,
+    #profile-submit:focus-visible {
+      background: var(--gaius-shell-accent-strong);
+      outline: 2px solid var(--gaius-shell-text);
+      outline-offset: 2px;
+    }
+
+    #profile-error {
+      min-height: 18px;
+      margin: 9px 0 0;
+      color: var(--gaius-shell-danger);
+      font: 12px/1.4 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+    }
+
+    #profile-legal {
+      margin: 22px 0 0;
+      color: var(--gaius-shell-muted);
+      font: 11px/1.5 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+      text-align: left;
+    }
+
+    #profile-switch {
+      top: 16px;
+      right: 16px;
+      left: auto;
+      z-index: 30;
+      min-height: 36px;
+      padding: 0 12px;
+      border: 2px solid var(--gaius-shell-line);
+      border-radius: 0;
+      background: rgba(11, 17, 22, 0.96);
+      color: var(--gaius-shell-text);
+      font: 700 12px/1 Arial, Helvetica, sans-serif;
+      letter-spacing: 0;
+    }
+
+    #profile-switch:hover,
+    #profile-switch:focus-visible {
+      border-color: var(--gaius-shell-accent);
+      background: var(--gaius-shell-panel-strong);
+      outline: 2px solid var(--gaius-shell-text);
+      outline-offset: 2px;
+    }
+
+    @media (max-width: 600px) {
+      #gaius-shell-header {
+        min-height: 48px;
+        padding: 0 16px;
+      }
+
+      #gaius-shell-version {
+        display: none;
+      }
+
+      #gaius-shell-footer {
+        left: 16px;
+        right: 16px;
+        bottom: 12px;
+      }
+
+      #gaius-shell-footer span:last-child {
+        display: none;
+      }
+
+      #boot-brand {
+        font-size: 46px;
+      }
+
+      #profile-form {
+        padding: 24px 20px 22px;
+      }
+
+      #profile-title {
+        font-size: 44px;
+      }
+
+      #gaius-error-actions {
+        top: calc(58% + 160px);
+      }
+
+      #gaius-error-details {
+        top: calc(58% + 208px);
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      #gaius-shell-header,
+      #gaius-shell-footer,
+      #boot-brand,
+      #boot-progress-bar {
+        animation: none;
+        transition: none;
+      }
+    }
+'''
+
+GAIUS_SHELL_SCRIPT = r'''  <script>
+    (function installGaiusClientShellV2() {
+      const root = document.documentElement;
+      const bootScreen = document.getElementById("boot-screen");
+      const profileGate = document.getElementById("profile-gate");
+      const statusBox = document.getElementById("status");
+      const shellMode = document.getElementById("gaius-shell-mode");
+      const errorActions = document.getElementById("gaius-error-actions");
+      const retryButton = document.getElementById("gaius-retry");
+      const detailsButton = document.getElementById("gaius-error-toggle");
+      const detailsBox = document.getElementById("gaius-error-details");
+      if (!root || !statusBox) return;
+
+      function bootDiagnostics() {
+        const diagnostics = [];
+        const bootError = window.__gaiusBootError;
+        if (bootError && bootError.stack) diagnostics.push(String(bootError.stack));
+        const extra = window.__gaiusBootErrorDetails;
+        if (Array.isArray(extra)) {
+          for (const line of extra) diagnostics.push(String(line));
+        }
+        return diagnostics.join("\n");
+      }
+
+      function renderShell() {
+        const profileOpen = !!(profileGate && !profileGate.hidden);
+        const bootOpen = !!(bootScreen && !bootScreen.hidden);
+        const failed = statusBox.dataset.state === "error";
+        const view = profileOpen ? "profile" : (failed ? "error" : (bootOpen ? "boot" : "canvas"));
+        root.dataset.gaiusShellView = view;
+        if (shellMode) {
+          const sessionMode = String(window.__gaiusSessionMode || "").toLowerCase();
+          shellMode.textContent = sessionMode === "online"
+            ? "ONLINE SESSION"
+            : (location.protocol === "file:" ? "PORTABLE HTML" : "BROWSER CLIENT");
+        }
+        if (errorActions) errorActions.hidden = !failed;
+        if (detailsButton) {
+          detailsButton.hidden = !failed;
+          detailsButton.textContent = detailsBox && detailsBox.dataset.open === "1"
+            ? "Hide diagnostics"
+            : "Show diagnostics";
+        }
+        if (detailsBox) {
+          detailsBox.textContent = bootDiagnostics() || "No additional diagnostics were captured.";
+          detailsBox.hidden = !failed || detailsBox.dataset.open !== "1";
+        }
+      }
+
+      function retryGaiusStartup() {
+        if (retryButton) {
+          retryButton.disabled = true;
+          retryButton.textContent = "Restarting...";
+        }
+        const next = new URL(location.href);
+        next.searchParams.set("retry", String(Date.now()));
+        location.replace(next.href);
+      }
+
+      if (retryButton) retryButton.addEventListener("click", retryGaiusStartup);
+      if (detailsButton && detailsBox) {
+        detailsButton.addEventListener("click", () => {
+          detailsBox.dataset.open = detailsBox.dataset.open === "1" ? "0" : "1";
+          renderShell();
+        });
+      }
+
+      const observer = new MutationObserver(renderShell);
+      observer.observe(statusBox, {attributes: true, childList: true, subtree: true});
+      if (bootScreen) observer.observe(bootScreen, {attributes: true});
+      if (profileGate) observer.observe(profileGate, {attributes: true});
+      window.__gaiusShell = {
+        version: 2,
+        refresh: renderShell,
+        retry: retryGaiusStartup
+      };
+      renderShell();
+    })();
+  </script>
+'''
+
+def apply_gaius_client_shell(text: str) -> str:
+    """Install the stable browser-client shell without changing game contracts."""
+    if GAIUS_SHELL_MARKER in text:
+        return text
+
+    text = replace_required(
+        text,
+        "  </style>\n",
+        GAIUS_SHELL_CSS + "  </style>\n",
+        "Gaius Client shell v2 CSS",
+    )
+
+    shell_markup = '''  <div id="gaius-shell-header" data-gaius-shell="v2" aria-hidden="true">
+    <div id="gaius-shell-brand"><strong>GAIUS</strong><span>CLIENT</span></div>
+    <span id="gaius-shell-mode">BROWSER CLIENT</span>
+    <span id="gaius-shell-version">VERSION DEV</span>
+  </div>
+'''
+    brand_pattern = re.compile(
+        r'(?m)^  <div id="boot-brand"[^>]*>.*?</div>\n',
+        flags=re.DOTALL,
+    )
+    text, brand_count = brand_pattern.subn(
+        lambda match: match.group(0) + shell_markup,
+        text,
+        count=1,
+    )
+    if brand_count != 1:
+        raise RuntimeError("index.html patch point was not found: Gaius shell header")
+
+    profile_title = '''      <h1 id="profile-title">GAIUS</h1>
+      <p id="profile-kicker">Browser client | offline and online play</p>
+      <p id="profile-subtitle">Choose a player name to continue.</p>
+'''
+    title_pattern = re.compile(
+        r'(?m)^      <h1 id="profile-title">.*?</h1>\n',
+        flags=re.DOTALL,
+    )
+    text, title_count = title_pattern.subn(profile_title, text, count=1)
+    if title_count != 1:
+        raise RuntimeError("index.html patch point was not found: Gaius profile heading")
+
+    status_pattern = re.compile(
+        r'(?ms)^  <pre id="status"[^>]*>.*?</pre>\n',
+    )
+    error_markup = '''  <div id="gaius-error-actions" hidden>
+    <button id="gaius-retry" type="button">Retry startup</button>
+    <button id="gaius-error-toggle" type="button">Show diagnostics</button>
+  </div>
+  <pre id="gaius-error-details" hidden></pre>
+  <div id="gaius-shell-footer" data-gaius-shell="v2" aria-hidden="true">
+    <span><strong>Gaius Client</strong> | independent browser software</span>
+    <span>HTML runtime | local storage enabled</span>
+  </div>
+'''
+    text, status_count = status_pattern.subn(
+        lambda match: match.group(0) + error_markup,
+        text,
+        count=1,
+    )
+    if status_count != 1:
+        raise RuntimeError("index.html patch point was not found: Gaius error actions")
+
+    text = text.replace(
+        "Gaius is an independent project and is not affiliated with Mojang Studios or Microsoft.",
+        "Gaius is an independent browser client. It is not affiliated with Mojang Studios or Microsoft.",
+        1,
+    )
+    text = text.replace(
+        'script.onerror = () => reject(new Error("无法加载 " + src));',
+        'script.onerror = () => reject(new Error("Could not load " + src));',
+        1,
+    )
+    text = replace_required(
+        text,
+        "</body>\n",
+        GAIUS_SHELL_SCRIPT + "</body>\n",
+        "Gaius Client shell v2 controller",
+    )
+    return text
+
+
+def validate_storage_profile(profile: dict) -> dict:
+    profile_id = profile.get("id")
+    if not isinstance(profile_id, str) or not profile_id:
+        raise RuntimeError("version profile id must be a non-empty string")
+    world_version = profile.get("worldVersion")
+    if not isinstance(world_version, int) or isinstance(world_version, bool) or world_version < 0:
+        raise RuntimeError(f"version profile {profile_id} has an invalid worldVersion")
+    storage = profile.get("storage")
+    if not isinstance(storage, dict):
+        raise RuntimeError(f"version profile {profile_id} storage must be an object")
+    schema = storage.get("schema")
+    if not isinstance(schema, int) or isinstance(schema, bool) or schema != 2:
+        raise RuntimeError(
+            f"version profile {profile_id} storage.schema must be exactly 2 "
+            f"(received {schema!r})"
+        )
+    expected = {
+        "databaseName": f"gaius-fs-v2-{profile_id}",
+        "prefix": f"gaius.fs.v2:{profile_id}:",
+        "opfsDirectory": f"regions-v2-{profile_id}",
+    }
+    for key, expected_value in expected.items():
+        value = storage.get(key)
+        if not isinstance(value, str) or not value:
+            raise RuntimeError(f"version profile {profile_id} storage.{key} must be non-empty")
+        if value != expected_value:
+            raise RuntimeError(
+                f"version profile {profile_id} storage.{key} must be exactly "
+                f"{expected_value!r} (received {value!r})"
+            )
+    return storage
+
+
+def load_profile_for_version(minecraft_version: str) -> dict:
+    root = Path(__file__).resolve().parents[2]
+    versions_directory = (root / "port" / "versions").resolve()
+    candidates: list[Path] = []
+    configured = os.environ.get("GAIUS_VERSION_PROFILE_PATH", "").strip()
+    if configured:
+        configured_path = native_external_path(configured.replace("\\", "/"))
+        if not configured_path.is_absolute():
+            configured_path = root / "port" / configured_path
+        candidates.append(configured_path)
+    config_path = root / "port" / "config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        relative = config.get("versionProfile")
+        if isinstance(relative, str) and relative:
+            candidates.append(root / "port" / relative)
+    except (OSError, ValueError, TypeError):
+        pass
+    candidates.extend(sorted(versions_directory.glob("*.json")))
+    seen: set[Path] = set()
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate in seen or not candidate.is_file():
+            continue
+        seen.add(candidate)
+        try:
+            profile = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if isinstance(profile, dict) and profile.get("id") == minecraft_version:
+            validate_storage_profile(profile)
+            return profile
+    raise RuntimeError(f"version profile is missing for {minecraft_version}")
+
+
+def patch_storage_persistence(text: str, profile: dict) -> str:
+    """Apply the profile storage namespace without touching legacy data."""
+    storage = validate_storage_profile(profile)
+    schema = int(storage["schema"])
+    prefix = json.dumps(storage["prefix"], ensure_ascii=True)
+    database_name = json.dumps(storage["databaseName"], ensure_ascii=True)
+    opfs_directory = json.dumps(storage["opfsDirectory"], ensure_ascii=True)
+
+    # The persistence bootstrap is generated into dist/index.html. Restrict
+    # replacements to that IIFE so unrelated launcher variables named `prefix`
+    # cannot be changed accidentally.
+    marker = "(function installPersistentFsBootstrap() {"
+    start = text.find(marker)
+    if start >= 0:
+        end = text.find("</script>", start)
+        if end < 0:
+            raise RuntimeError("index.html persistence bootstrap is unterminated")
+        end += len("</script>")
+        block = text[start:end]
+        block, prefix_count = re.subn(
+            r'(\b(?:const|let|var)\s+prefix\s*=\s*)["\'][^"\']*["\']\s*;',
+            rf'\g<1>{prefix};',
+            block,
+            count=1,
+        )
+        block, database_count = re.subn(
+            r'(\b(?:const|let|var)\s+dbName\s*=\s*)["\'][^"\']*["\']\s*;',
+            rf'\g<1>{database_name};',
+            block,
+            count=1,
+        )
+        block, opfs_count = re.subn(
+            r'(\b(?:const|let|var)\s+opfsDirectory\s*=\s*)["\'][^"\']*["\']\s*;',
+            rf'\g<1>{opfs_directory};',
+            block,
+            count=1,
+        )
+        if opfs_count == 0 and database_count:
+            block = re.sub(
+                r'(?m)^(\s*(?:const|let|var)\s+dbName\s*=.*\n)',
+                rf'\1      const opfsDirectory = {opfs_directory};\n',
+                block,
+                count=1,
+            )
+        block = re.sub(
+            r'(indexedDB\.open\(\s*dbName\s*,\s*)\d+(\s*\))',
+            rf'\g<1>{schema}\g<2>',
+            block,
+        )
+        text = text[:start] + block + text[end:]
+        if prefix_count == 0 or database_count == 0:
+            # A future bootstrap may use profile globals instead of local
+            # constants. The globals below remain the authoritative contract.
+            pass
+
+    globals_block = (
+        '  <script data-gaius-storage-profile="v2">\n'
+        f'    window.__gaiusProfileId = {json.dumps(profile["id"], ensure_ascii=True)};\n'
+        f'    window.__gaiusWorldVersion = {int(profile["worldVersion"])};\n'
+        f'    window.__gaiusStorageSchema = {schema};\n'
+        f'    window.__gaiusStorageDatabaseName = {database_name};\n'
+        f'    window.__gaiusStoragePrefix = {prefix};\n'
+        f'    window.__gaiusStorageOpfsDirectory = {opfs_directory};\n'
+        '  </script>\n'
+    )
+    script_pattern = re.compile(
+        r'  <script data-gaius-storage-profile="v2">.*?</script>\n',
+        flags=re.DOTALL,
+    )
+    # These globals are consumed by the persistence bootstrap itself and by
+    # BrowserFilePersistence during Java class initialization.  Put them before
+    # that IIFE rather than at the end of <body>; an async boot can otherwise
+    # observe an unconfigured profile before the trailing script executes.
+    text = script_pattern.sub("", text)
+    persistence = text.find(marker)
+    insertion = text.rfind("<script", 0, persistence) if persistence >= 0 else -1
+    if insertion < 0:
+        raise RuntimeError("index.html persistence bootstrap script was not found")
+    text = text[:insertion] + globals_block + text[insertion:]
+    return text
+
+
+
+def patch_index(
+    index: Path,
+    classes_js: Path,
+    minecraft_version: str = "1.21.11",
+    asset_index_id: str | None = None,
+    profile: dict | None = None,
+) -> bool:
+    asset_index_id = asset_index_id or minecraft_version
     build_token = content_token(classes_js)
     vanilla_assets_token = content_token(index.parent / "vanilla-assets.pack.gz")
     singleplayer_token = content_token(
@@ -44,6 +908,17 @@ def patch_index(index: Path, classes_js: Path) -> bool:
     )
     text = index.read_text(encoding="utf-8")
     original = text
+    text = migrate_text_shader_diagnostics(text)
+    selected_profile = profile or load_profile_for_version(minecraft_version)
+    # The historical replacement templates below are intentionally written
+    # against IndexedDB version 1. Normalize an already profile-patched page
+    # before applying those idempotent migrations; patch_storage_persistence()
+    # restores the selected profile schema at the end.
+    text = re.sub(
+        r"indexedDB\.open\(\s*dbName\s*,\s*\d+\s*\)",
+        "indexedDB.open(dbName, 1)",
+        text,
+    )
 
     vanilla_assets_loader = '''    const vanillaAssetsToken = "__VANILLA_ASSETS_TOKEN__";
     function hasGaiusVanillaAssetsMagic(bytes) {
@@ -158,10 +1033,11 @@ def patch_index(index: Path, classes_js: Path) -> bool:
             raise RuntimeError("index.html patch point was not found: vanilla asset token")
 
     text = text.replace('<html lang="zh-CN">', '<html lang="en">', 1)
-    text = text.replace(
-        '<title>Gaius Minecraft 1.21.11</title>',
-        '<title>Gaius Client 1.21.11</title>',
-        1,
+    text = re.sub(
+        r'<title>Gaius (?:Minecraft|Client) [^<]+</title>',
+        f'<title>Gaius Client {minecraft_version}</title>',
+        text,
+        count=1,
     )
 
     text = text.replace(
@@ -208,7 +1084,9 @@ def patch_index(index: Path, classes_js: Path) -> bool:
         "      const inWorld = !!window.__gaiusMinecraftState?.level;\n"
         "      if (inWorld && !fps.rafMetricsWorldEnteredAt) {\n"
         "        fps.rafMetricsWorldEnteredAt = now;\n"
-        "        fps.rafFrameTimes = [];\n"
+        "        fps.rafFrameTimes = new Float32Array(4096);\n"
+        "        fps.rafFrameWriteIndex = 0;\n"
+        "        fps.rafFrameCount = 0;\n"
         "        fps.rafLastFrameAt = 0;\n"
         "        fps.rafLongestFrameMs = 0;\n"
         "      } else if (!inWorld) {\n"
@@ -218,9 +1096,17 @@ def patch_index(index: Path, classes_js: Path) -> bool:
         "      if (Number.isFinite(previousFrameAt) && previousFrameAt > 0) {\n"
         "        const frameMs = now - previousFrameAt;\n"
         "        if (frameMs > 0 && frameMs <= 1000 && fps.rafMetricsWorldEnteredAt) {\n"
-        "          const samples = fps.rafFrameTimes || (fps.rafFrameTimes = []);\n"
-        "          samples.push(frameMs);\n"
-        "          if (samples.length > 2048) samples.splice(0, samples.length - 2048);\n"
+        "          let samples = fps.rafFrameTimes;\n"
+        "          if (!(samples instanceof Float32Array) || samples.length !== 4096) {\n"
+        "            samples = new Float32Array(4096);\n"
+        "            fps.rafFrameTimes = samples;\n"
+        "            fps.rafFrameWriteIndex = 0;\n"
+        "            fps.rafFrameCount = 0;\n"
+        "          }\n"
+        "          const writeIndex = (Number(fps.rafFrameWriteIndex) || 0) % samples.length;\n"
+        "          samples[writeIndex] = frameMs;\n"
+        "          fps.rafFrameWriteIndex = (writeIndex + 1) % samples.length;\n"
+        "          fps.rafFrameCount = Math.min(samples.length, (Number(fps.rafFrameCount) || 0) + 1);\n"
         "          fps.rafLongestFrameMs = Math.max(fps.rafLongestFrameMs || 0, frameMs);\n"
         "        }\n"
         "      }\n"
@@ -229,9 +1115,13 @@ def patch_index(index: Path, classes_js: Path) -> bool:
         "      const elapsed = now - fps.lastSampleAt;\n"
         "      if (elapsed >= 1000) {\n"
         "        fps.rafFps = Math.round((fps.frames * 1000 / elapsed) * 10) / 10;\n"
-        "        const samples = fps.rafFrameTimes || [];\n"
-        "        if (samples.length > 0) {\n"
-        "          const ordered = samples.slice().sort((left, right) => left - right);\n"
+        "        const samples = fps.rafFrameTimes;\n"
+        "        const sampleCount = samples instanceof Float32Array\n"
+        "          ? Math.min(samples.length, Number(fps.rafFrameCount) || 0)\n"
+        "          : 0;\n"
+        "        if (sampleCount > 0) {\n"
+        "          const ordered = Array.from(samples.subarray(0, sampleCount))\n"
+        "            .sort((left, right) => left - right);\n"
         "          const totalMs = ordered.reduce((sum, value) => sum + value, 0);\n"
         "          const onePercentIndex = Math.min(ordered.length - 1, Math.ceil(ordered.length * 0.99) - 1);\n"
         "          fps.rafAverageFps = Math.round((ordered.length * 1000 / totalMs) * 10) / 10;\n"
@@ -261,7 +1151,9 @@ def patch_index(index: Path, classes_js: Path) -> bool:
         "      const inWorld = !!window.__gaiusMinecraftState?.level;\n"
         "      if (inWorld && !fps.rafMetricsWorldEnteredAt) {\n"
         "        fps.rafMetricsWorldEnteredAt = now;\n"
-        "        fps.rafFrameTimes = [];\n"
+        "        fps.rafFrameTimes = new Float32Array(4096);\n"
+        "        fps.rafFrameWriteIndex = 0;\n"
+        "        fps.rafFrameCount = 0;\n"
         "        fps.rafLastFrameAt = 0;\n"
         "        fps.rafLongestFrameMs = 0;\n"
         "      } else if (!inWorld) {\n"
@@ -271,9 +1163,17 @@ def patch_index(index: Path, classes_js: Path) -> bool:
         "      if (Number.isFinite(previousFrameAt) && previousFrameAt > 0) {\n"
         "        const frameMs = now - previousFrameAt;\n"
         "        if (frameMs > 0 && frameMs <= 1000 && fps.rafMetricsWorldEnteredAt) {\n"
-        "          const samples = fps.rafFrameTimes || (fps.rafFrameTimes = []);\n"
-        "          samples.push(frameMs);\n"
-        "          if (samples.length > 2048) samples.splice(0, samples.length - 2048);\n"
+        "          let samples = fps.rafFrameTimes;\n"
+        "          if (!(samples instanceof Float32Array) || samples.length !== 4096) {\n"
+        "            samples = new Float32Array(4096);\n"
+        "            fps.rafFrameTimes = samples;\n"
+        "            fps.rafFrameWriteIndex = 0;\n"
+        "            fps.rafFrameCount = 0;\n"
+        "          }\n"
+        "          const writeIndex = (Number(fps.rafFrameWriteIndex) || 0) % samples.length;\n"
+        "          samples[writeIndex] = frameMs;\n"
+        "          fps.rafFrameWriteIndex = (writeIndex + 1) % samples.length;\n"
+        "          fps.rafFrameCount = Math.min(samples.length, (Number(fps.rafFrameCount) || 0) + 1);\n"
         "          fps.rafLongestFrameMs = Math.max(fps.rafLongestFrameMs || 0, frameMs);\n"
         "        }\n"
         "      }\n"
@@ -285,9 +1185,13 @@ def patch_index(index: Path, classes_js: Path) -> bool:
         "        fps.rafFps = Math.round((fps.frames * 1000 / elapsed) * 10) / 10;\n"
         "        fps.fps = fps.rafFps;\n",
         "        fps.rafFps = Math.round((fps.frames * 1000 / elapsed) * 10) / 10;\n"
-        "        const samples = fps.rafFrameTimes || [];\n"
-        "        if (samples.length > 0) {\n"
-        "          const ordered = samples.slice().sort((left, right) => left - right);\n"
+        "        const samples = fps.rafFrameTimes;\n"
+        "        const sampleCount = samples instanceof Float32Array\n"
+        "          ? Math.min(samples.length, Number(fps.rafFrameCount) || 0)\n"
+        "          : 0;\n"
+        "        if (sampleCount > 0) {\n"
+        "          const ordered = Array.from(samples.subarray(0, sampleCount))\n"
+        "            .sort((left, right) => left - right);\n"
         "          const totalMs = ordered.reduce((sum, value) => sum + value, 0);\n"
         "          const onePercentIndex = Math.min(ordered.length - 1, Math.ceil(ordered.length * 0.99) - 1);\n"
         "          fps.rafAverageFps = Math.round((ordered.length * 1000 / totalMs) * 10) / 10;\n"
@@ -295,6 +1199,7 @@ def patch_index(index: Path, classes_js: Path) -> bool:
         "        }\n"
         "        fps.fps = fps.rafFps;\n",
     )
+    text = migrate_raf_frame_samples(text)
     text = text.replace(
         "      const lowTarget = Math.max(45, Math.min(targetFps * 0.55, targetFps - 50));\n"
         "      const recoveredTarget = Math.max(90, Math.min(targetFps, lowTarget + 30));\n",
@@ -1067,7 +1972,7 @@ def patch_index(index: Path, classes_js: Path) -> bool:
         '      ).href;\n'
     )
     text, singleplayer_count = re.subn(
-        r'      const singleplayerBuildToken = "[^"]+" \+\n'
+        r'      const singleplayerBuildToken = (?:"[^"]+"|fallbackBuildToken) \+\n'
         r'        \(urlParams\.get\("fresh"\) === "1" \|\| urlParams\.get\("cache"\) === "0"\n'
         r'          \? "-fresh-" \+ Date\.now\(\)\n'
         r'          : ""\);\n'
@@ -1104,9 +2009,11 @@ def patch_index(index: Path, classes_js: Path) -> bool:
             "fs ready timing",
         )
 
-    # Do not hydrate region files into the title-screen filesystem. World
-    # metadata remains available for the world picker; the selected world's
-    # complete data is loaded by the dedicated integrated-server Worker.
+    # Do not hydrate region files into the title-screen filesystem. The small
+    # world metadata needed while opening a saved world remains available for
+    # the client (notably data/minecraft/world_gen_settings.dat); the selected
+    # world's complete data is loaded by the dedicated integrated-server
+    # Worker.
     if "function isClientBootstrapPath(path)" not in text:
         text = replace_required(
             text,
@@ -1119,11 +2026,25 @@ def patch_index(index: Path, classes_js: Path) -> bool:
             "        if (worldSeparator < 0 || worldSeparator + 1 >= path.length) return false;\n"
             "        const relative = path.slice(worldSeparator + 1);\n"
             "        return relative === \"level.dat\" || relative === \"level.dat_old\" ||\n"
-            "          relative === \"icon.png\";\n"
+            "          relative === \"icon.png\" ||\n"
+            "          relative === \"data/minecraft/world_gen_settings.dat\";\n"
             "      }\n\n"
             "      function openDatabase() {\n",
             "client IndexedDB bootstrap filter",
         )
+    elif 'relative === "data/minecraft/world_gen_settings.dat"' not in text:
+        # Migrate an already-postprocessed launcher from the old metadata
+        # allowlist. This keeps the patch effective on an existing dist tree;
+        # the guard above alone would otherwise leave world-gen settings out
+        # forever after the first postprocess pass.
+        text = replace_required(
+            text,
+            '          relative === "icon.png";\n',
+            '          relative === "icon.png" ||\n'
+            '          relative === "data/minecraft/world_gen_settings.dat";\n',
+            "client IndexedDB bootstrap world-gen metadata migration",
+        )
+    if '              files[normalize(value.path)] = value.value;\n' in text:
         text = replace_required(
             text,
             '            if (value && typeof value.path === "string" && typeof value.value === "string") {\n'
@@ -1135,6 +2056,7 @@ def patch_index(index: Path, classes_js: Path) -> bool:
             "            }\n",
             "client IndexedDB read filter",
         )
+    if "              files[path] = value;\n              migrated++;\n" in text:
         text = replace_required(
             text,
             "              files[path] = value;\n"
@@ -1143,6 +2065,7 @@ def patch_index(index: Path, classes_js: Path) -> bool:
             "              migrated++;\n",
             "client IndexedDB migration filter",
         )
+    if '                files[normalize(key.substring(prefix.length))] = value;\n' in text:
         text = replace_required(
             text,
             '              if (typeof value === "string") {\n'
@@ -1556,12 +2479,17 @@ def patch_index(index: Path, classes_js: Path) -> bool:
             "      setStatus(\"running\", \"浏览器存储已就绪（\" + (window.__gaiusFsBackend || \"unknown\") + \"），正在加载 classes.js…\", 24, \"加载 1.21.11 TeaVM 主程序…\");\n"
             "      await loadScript(\"classes.js?v=\" + encodeURIComponent(buildToken));\n",
             "      setStatus(\"running\", \"浏览器存储已就绪（\" + (window.__gaiusFsBackend || \"unknown\") + \"），正在加载 classes.js…\", 24, \"加载 1.21.11 TeaVM 主程序…\");\n"
-            "      await waitForPaint();\n"
-            "      bootTimings.beforeClassesPaint = performance.now();\n"
-            "      await (window.__gaiusPortableAssetsReady || Promise.resolve());\n"
+            "      // Start the large TeaVM bundle and both asset sources in parallel.\n"
             "      const classesUrl = window.__gaiusClassesUrl ||\n"
             "        (\"classes.js?v=\" + encodeURIComponent(buildToken));\n"
-            "      await loadScript(classesUrl);\n",
+            "      const classesReady = loadScript(classesUrl);\n"
+            "      const portableReady = window.__gaiusPortableAssetsReady || Promise.resolve();\n"
+            "      const vanillaReady = window.__gaiusVanillaAssetsReady || Promise.resolve();\n"
+            "      await waitForPaint();\n"
+            "      bootTimings.beforeClassesPaint = performance.now();\n"
+            "      setBootProgress(Math.max(bootProgressValue, 30), \"Loading game assets...\");\n"
+            "      await Promise.all([portableReady, vanillaReady, classesReady]);\n"
+            "      bootTimings.vanillaAssetsReady = performance.now();\n",
             "paint before classes",
         )
 
@@ -2022,19 +2950,110 @@ def patch_index(index: Path, classes_js: Path) -> bool:
     for source, replacement in english_launcher_text.items():
         text = text.replace(source, replacement)
 
+    text = re.sub(
+        r'Starting Gaius Client [A-Za-z0-9._+-]+\.\.\.',
+        f'Starting Gaius Client {minecraft_version}...',
+        text,
+        count=1,
+    )
+    text = re.sub(
+        r'Loading the [A-Za-z0-9._+-]+ client runtime\.\.\.',
+        f'Loading the {minecraft_version} client runtime...',
+        text,
+        count=1,
+    )
+    text, version_argument_count = re.subn(
+        r'("--version", ")[^"]+("\s*,)',
+        rf'\g<1>{minecraft_version}\g<2>',
+        text,
+        count=1,
+    )
+    if version_argument_count != 1:
+        raise RuntimeError("index.html patch point was not found: Minecraft version argument")
+    text, asset_index_argument_count = re.subn(
+        r'("--assetIndex", ")[^"]+("\s*,)',
+        rf'\g<1>{asset_index_id}\g<2>',
+        text,
+        count=1,
+    )
+    if asset_index_argument_count != 1:
+        raise RuntimeError("index.html patch point was not found: asset index argument")
+
+    text = patch_storage_persistence(text, selected_profile)
+    text = apply_gaius_client_shell(text)
+    text = patch_release_version(text)
+
     if text != original:
         index.write_text(text, encoding="utf-8")
         return True
     return False
 
 
+def version_defaults() -> tuple[str, str]:
+    minecraft_version = os.environ.get("GAIUS_MINECRAFT_VERSION", "").strip()
+    asset_index_id = os.environ.get("GAIUS_ASSET_INDEX_ID", "").strip()
+    metadata_path = os.environ.get("GAIUS_VERSION_METADATA", "").strip()
+    if not minecraft_version:
+        try:
+            root = Path(__file__).resolve().parents[2]
+            config = json.loads((root / "port" / "config.json").read_text(encoding="utf-8"))
+            relative_profile = (
+                os.environ.get("GAIUS_VERSION_PROFILE_PATH")
+                or config.get("versionProfile")
+            )
+            profile = json.loads(
+                (root / "port" / relative_profile).read_text(encoding="utf-8")
+            )
+            minecraft_version = str(profile.get("id") or "").strip()
+            if not metadata_path:
+                metadata_path = str(root / "port" / "work" / minecraft_version / "version.json")
+        except (OSError, ValueError, TypeError, AttributeError):
+            minecraft_version = ""
+    if not minecraft_version:
+        minecraft_version = "1.21.11"
+    if not asset_index_id and metadata_path:
+        try:
+            metadata = json.loads(native_external_path(metadata_path).read_text(encoding="utf-8"))
+            asset_index_id = str(
+                metadata.get("assetIndex", {}).get("id") or metadata.get("assets") or ""
+            ).strip()
+        except (OSError, ValueError, TypeError):
+            asset_index_id = ""
+    return minecraft_version, asset_index_id or minecraft_version
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 3:
-        print("usage: postprocess-index-html.py <index.html> <classes.js>", file=sys.stderr)
+    if len(argv) not in (3, 4, 5):
+        print(
+            "usage: postprocess-index-html.py <index.html> <classes.js> "
+            "[<minecraft-version> [<asset-index-id>]]",
+            file=sys.stderr,
+        )
         return 2
 
     index = Path(argv[1])
     classes_js = Path(argv[2])
+    minecraft_version, asset_index_id = version_defaults()
+    explicit_asset_index = len(argv) == 5
+    if len(argv) in (4, 5):
+        minecraft_version = argv[3].strip()
+        asset_index_id = argv[4].strip() if explicit_asset_index else ""
+    try:
+        profile = load_profile_for_version(minecraft_version)
+    except RuntimeError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    if not explicit_asset_index:
+        official = profile.get("official")
+        profile_asset_index = official.get("assetIndexId") if isinstance(official, dict) else None
+        if isinstance(profile_asset_index, (str, int)) and str(profile_asset_index):
+            asset_index_id = str(profile_asset_index)
+    if not asset_index_id:
+        asset_index_id = minecraft_version
+    identifier = re.compile(r"^[A-Za-z0-9._+-]+$")
+    if not identifier.fullmatch(minecraft_version) or not identifier.fullmatch(asset_index_id):
+        print("invalid Minecraft version or asset index identifier", file=sys.stderr)
+        return 2
     if not index.exists():
         print(f"missing index.html: {index}", file=sys.stderr)
         return 1
@@ -2042,7 +3061,7 @@ def main(argv: list[str]) -> int:
         print(f"missing classes.js: {classes_js}", file=sys.stderr)
         return 1
 
-    changed = patch_index(index, classes_js)
+    changed = patch_index(index, classes_js, minecraft_version, asset_index_id, profile)
     status = "Patched" if changed else "Index already patched"
     print(f"{status}: {index}")
     return 0

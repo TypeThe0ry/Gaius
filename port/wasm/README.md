@@ -1,8 +1,8 @@
 # Gaius Wasm hot-path modules
 
 This directory is for performance-critical batch helpers used by the browser
-port while the official Minecraft 1.21.11 Java client remains compiled through
-TeaVM.
+port while the supported official Minecraft Java profiles remain compiled
+through TeaVM.
 
 Rules for adding Wasm work:
 
@@ -24,9 +24,11 @@ Current module:
 Build:
 
 ```sh
-./port/scripts/build-wasm-hotpath.sh
+GAIUS_VERSION_PROFILE_PATH=versions/26.2.json \
+  ./port/scripts/build-wasm-hotpath.sh
 ```
 
 Output:
 
-- `port/web/dist/gaius-hotpath.wasm`
+- Profile-isolated release builds write
+  `port/web/dist/<profile>/gaius-hotpath.wasm`.

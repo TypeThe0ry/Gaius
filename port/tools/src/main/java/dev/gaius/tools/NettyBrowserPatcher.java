@@ -36,6 +36,8 @@ public final class NettyBrowserPatcher {
                 commonRoot.resolve("io/netty/util/internal/PlatformDependent.class"));
         patchPlatform0(Path.of(args[0]),
                 commonRoot.resolve("io/netty/util/internal/PlatformDependent0.class"));
+        patchRefCnt(Path.of(args[0]),
+                commonRoot.resolve("io/netty/util/internal/RefCnt.class"));
         patchNetUtil(Path.of(args[0]),
                 commonRoot.resolve("io/netty/util/NetUtil.class"),
                 commonRoot.resolve("io/netty/util/NetUtilInitializations.class"));
@@ -49,6 +51,8 @@ public final class NettyBrowserPatcher {
                 commonRoot.resolve("io/netty/util/Recycler.class"));
         patchBuffer(Path.of(args[1]),
                 bufferRoot.resolve("io/netty/buffer/ByteBufUtil.class"));
+        patchHeapByteBufUtil(Path.of(args[1]),
+                bufferRoot.resolve("io/netty/buffer/HeapByteBufUtil.class"));
         patchAbstractByteBufAllocator(Path.of(args[1]),
                 bufferRoot.resolve("io/netty/buffer/AbstractByteBufAllocator.class"));
         patchReferenceCountedBuffer(Path.of(args[1]),
@@ -77,7 +81,7 @@ public final class NettyBrowserPatcher {
 
     private static void patchPlatform(Path jar, Path output) throws IOException {
         ClassNode node = read(jar, PLATFORM);
-        replace(node, "<clinit>", "()V", platformInitializer());
+        replace(node, "<clinit>", "()V", platformInitializer(node));
         replaceConstant(node, "initializeVarHandle", "()Z", Opcodes.ICONST_0, Opcodes.IRETURN);
         replaceConstant(node, "byteArrayBaseOffset", "()J", Opcodes.LCONST_0, Opcodes.LRETURN);
         replaceConstant(node, "hasDirectBufferNoCleanerConstructor", "()Z",
@@ -131,6 +135,80 @@ public final class NettyBrowserPatcher {
             }
         }
         write(node, output);
+    }
+
+    private static void patchRefCnt(Path jar, Path output) throws IOException {
+        String entry = "io/netty/util/internal/RefCnt.class";
+        try (ZipFile input = new ZipFile(jar.toFile())) {
+            if (input.getEntry(entry) == null) {
+                return;
+            }
+        }
+
+        ClassNode node = read(jar, entry);
+        String owner = "io/netty/util/internal/RefCnt";
+        String atomic = owner + "$AtomicRefCnt";
+
+        InsnList constructor = new InsnList();
+        constructor.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+        constructor.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false));
+        constructor.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+        constructor.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC, atomic, "init", "(L" + owner + ";)V", false));
+        constructor.add(new InsnNode(Opcodes.RETURN));
+        replace(node, "<init>", "()V", constructor);
+
+        for (String descriptor : new String[] {
+                "(L" + owner + ";)I",
+                "(L" + owner + ";)V",
+                "(L" + owner + ";I)V",
+                "(L" + owner + ";)Z",
+                "(L" + owner + ";I)Z"
+        }) {
+            String name;
+            if (descriptor.endsWith(")I")) {
+                name = "refCnt";
+            } else if (descriptor.endsWith(";I)V")) {
+                name = "retain";
+            } else if (descriptor.endsWith(";I)Z")) {
+                name = "release";
+            } else if (descriptor.endsWith(")Z")) {
+                name = "release";
+            } else {
+                name = "retain";
+            }
+            replaceRefCntDelegate(node, atomic, name, descriptor);
+        }
+        replaceRefCntDelegate(
+                node, atomic, "isLiveNonVolatile", "(L" + owner + ";)Z");
+        replaceRefCntDelegate(node, atomic, "setRefCnt", "(L" + owner + ";I)V");
+        replaceRefCntDelegate(node, atomic, "resetRefCnt", "(L" + owner + ";)V");
+
+        InsnList initializer = new InsnList();
+        putInt(initializer, owner, "REF_CNT_IMPL", 2);
+        initializer.add(new InsnNode(Opcodes.RETURN));
+        replace(node, "<clinit>", "()V", initializer);
+        write(node, output);
+        System.out.println("Patched Netty RefCnt to the browser-safe atomic implementation");
+    }
+
+    private static void replaceRefCntDelegate(
+            ClassNode node, String targetOwner, String name, String descriptor) {
+        MethodNode method = find(node, name, descriptor);
+        InsnList code = new InsnList();
+        int local = 0;
+        for (org.objectweb.asm.Type argument
+                : org.objectweb.asm.Type.getArgumentTypes(descriptor)) {
+            code.add(new org.objectweb.asm.tree.VarInsnNode(
+                    argument.getOpcode(Opcodes.ILOAD), local));
+            local += argument.getSize();
+        }
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC, targetOwner, name, descriptor, false));
+        code.add(new InsnNode(
+                org.objectweb.asm.Type.getReturnType(descriptor).getOpcode(Opcodes.IRETURN)));
+        replace(method, code);
     }
 
     private static void patchPlatform0(Path jar, Path output) throws IOException {
@@ -653,6 +731,15 @@ public final class NettyBrowserPatcher {
     private static void patchReferenceCountedBuffer(Path jar, Path output) throws IOException {
         ClassNode node = read(jar, "io/netty/buffer/AbstractReferenceCountedByteBuf.class");
         String owner = "io/netty/buffer/AbstractReferenceCountedByteBuf";
+        boolean usesRefCntHelper = node.fields.stream().anyMatch(field ->
+                field.name.equals("refCnt")
+                        && field.desc.equals("Lio/netty/util/internal/RefCnt;"));
+        if (usesRefCntHelper) {
+            // Netty 4.2.15 selects RefCnt.AtomicRefCnt when the patched
+            // PlatformDependent reports both Unsafe and VarHandle unavailable.
+            System.out.println("Verified Netty RefCnt atomic browser fallback");
+            return;
+        }
         InsnList code = new InsnList();
         code.add(new LdcInsnNode(org.objectweb.asm.Type.getObjectType(owner)));
         code.add(new LdcInsnNode("refCnt"));
@@ -790,6 +877,85 @@ public final class NettyBrowserPatcher {
         write(node, output);
     }
 
+    /**
+     * Removes Netty 4.2's signature-polymorphic VarHandle branches from the
+     * heap-buffer helpers. TeaVM analyzes both sides of a runtime
+     * {@code hasVarHandle()} guard, even though {@link #patchPlatform} forces
+     * that method to return false. Keeping the dead branch therefore exposes
+     * descriptors such as {@code VarHandle.get(byte[], int):int/long}, which
+     * Java source cannot represent as overloads and TeaVM cannot resolve.
+     *
+     * <p>Every affected Netty method starts with exactly this shape:</p>
+     *
+     * <pre>
+     * PlatformDependent.hasVarHandle();
+     * ifeq portablePath;
+     * ... VarHandleByteBufferAccess ...
+     * portablePath:
+     * ... byte-array implementation ...
+     * </pre>
+     *
+     * <p>Delete the guarded prefix so reachability begins at the already
+     * supplied portable implementation. This preserves Netty's byte order and
+     * bounds behaviour instead of emulating the accessors in the classlib.</p>
+     */
+    private static void patchHeapByteBufUtil(Path jar, Path output) throws IOException {
+        String owner = "io/netty/buffer/HeapByteBufUtil";
+        ClassNode node = read(jar, owner + ".class");
+        int patched = 0;
+        for (MethodNode method : node.methods) {
+            var first = firstExecutable(method.instructions.getFirst());
+            if (!(first instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKESTATIC
+                    || !call.owner.equals("io/netty/util/internal/PlatformDependent")
+                    || !call.name.equals("hasVarHandle")
+                    || !call.desc.equals("()Z")) {
+                continue;
+            }
+            var next = firstExecutable(first.getNext());
+            if (!(next instanceof JumpInsnNode branch)
+                    || branch.getOpcode() != Opcodes.IFEQ) {
+                throw new IllegalStateException(
+                        owner + "." + method.name + method.desc
+                                + " has an unexpected VarHandle guard");
+            }
+
+            var instruction = method.instructions.getFirst();
+            while (instruction != branch.label) {
+                if (instruction == null) {
+                    throw new IllegalStateException(
+                            owner + "." + method.name + method.desc
+                                    + " has no portable VarHandle fallback");
+                }
+                var following = instruction.getNext();
+                method.instructions.remove(instruction);
+                instruction = following;
+            }
+            if (method.localVariables != null) {
+                method.localVariables.clear();
+            }
+            patched++;
+        }
+        if (patched == 0) {
+            throw new IllegalStateException(
+                    owner + " contains no guarded VarHandle accessors");
+        }
+        write(node, output);
+        System.out.println(
+                "Forced " + patched + " Netty heap-buffer accessors onto portable byte arrays");
+    }
+
+    private static org.objectweb.asm.tree.AbstractInsnNode firstExecutable(
+            org.objectweb.asm.tree.AbstractInsnNode instruction) {
+        while (instruction != null
+                && (instruction.getType() == org.objectweb.asm.tree.AbstractInsnNode.LABEL
+                        || instruction.getType() == org.objectweb.asm.tree.AbstractInsnNode.LINE
+                        || instruction.getType() == org.objectweb.asm.tree.AbstractInsnNode.FRAME)) {
+            instruction = instruction.getNext();
+        }
+        return instruction;
+    }
+
     private static void replaceAsciiStringConstructor(ClassNode node) {
         MethodNode decode = find(node, "decodeString",
                 "(Lio/netty/buffer/ByteBuf;IILjava/nio/charset/Charset;)Ljava/lang/String;");
@@ -816,61 +982,81 @@ public final class NettyBrowserPatcher {
         throw new IllegalStateException("ASCII String constructor was not found");
     }
 
-    private static InsnList platformInitializer() {
+    private static InsnList platformInitializer(ClassNode node) {
         String owner = "io/netty/util/internal/PlatformDependent";
         InsnList code = new InsnList();
-        putBoolean(code, owner, "$assertionsDisabled", true);
-        code.add(new LdcInsnNode(org.objectweb.asm.Type.getObjectType(owner)));
-        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
-                "io/netty/util/internal/logging/InternalLoggerFactory", "getInstance",
-                "(Ljava/lang/Class;)Lio/netty/util/internal/logging/InternalLogger;", false));
-        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, "logger",
-                "Lio/netty/util/internal/logging/InternalLogger;"));
-        putBoolean(code, owner, "CAN_ENABLE_TCP_NODELAY_BY_DEFAULT", true);
-        putNewString(code, "java/lang/UnsupportedOperationException",
-                "Native memory is unavailable in the browser");
-        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, "UNSAFE_UNAVAILABILITY_CAUSE",
-                "Ljava/lang/Throwable;"));
-        putLong(code, owner, "MAX_DIRECT_MEMORY", 2147483647L);
-        putLong(code, owner, "BYTE_ARRAY_BASE_OFFSET", 0L);
-        putNewString(code, "java/io/File", ".");
-        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, "TMPDIR", "Ljava/io/File;"));
-        putInt(code, owner, "BIT_MODE", 32);
-        putString(code, owner, "NORMALIZED_ARCH", "wasm32");
-        putString(code, owner, "NORMALIZED_OS", "browser");
-        putBoolean(code, owner, "IS_WINDOWS", false);
-        putBoolean(code, owner, "IS_OSX", false);
-        putBoolean(code, owner, "IS_J9_JVM", false);
-        putBoolean(code, owner, "IS_IVKVM_DOT_NET", false);
-        putInt(code, owner, "ADDRESS_SIZE", 4);
-        putBoolean(code, owner, "BIG_ENDIAN_NATIVE_ORDER", false);
-        putNew(code, "io/netty/util/internal/PlatformDependent$1");
-        code.add(new InsnNode(Opcodes.DUP));
-        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, "NOOP",
-                "Lio/netty/util/internal/Cleaner;"));
-        code.add(new InsnNode(Opcodes.DUP));
-        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, "DIRECT_CLEANER",
-                "Lio/netty/util/internal/Cleaner;"));
-        code.add(new InsnNode(Opcodes.DUP));
-        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, "LEGACY_CLEANER",
-                "Lio/netty/util/internal/Cleaner;"));
-        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, "CLEANER",
-                "Lio/netty/util/internal/Cleaner;"));
-        putBoolean(code, owner, "USE_DIRECT_BUFFER_NO_CLEANER", false);
-        code.add(new InsnNode(Opcodes.ACONST_NULL));
-        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, "DIRECT_MEMORY_COUNTER",
-                "Ljava/util/concurrent/atomic/AtomicLong;"));
-        putLong(code, owner, "DIRECT_MEMORY_LIMIT", 2147483647L);
-        putBoolean(code, owner, "HAS_ALLOCATE_UNINIT_ARRAY", false);
-        putBoolean(code, owner, "MAYBE_SUPER_USER", false);
-        putBoolean(code, owner, "EXPLICIT_NO_PREFER_DIRECT", true);
-        putBoolean(code, owner, "DIRECT_BUFFER_PREFERRED", false);
-        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "java/util/Collections", "emptySet",
-                "()Ljava/util/Set;", false));
-        code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, "LINUX_OS_CLASSIFIERS",
-                "Ljava/util/Set;"));
-        putBoolean(code, owner, "JFR", false);
-        putBoolean(code, owner, "VAR_HANDLE", false);
+        putBooleanIfPresent(node, code, owner, "$assertionsDisabled", true);
+        if (hasField(node, "logger", "Lio/netty/util/internal/logging/InternalLogger;")) {
+            code.add(new LdcInsnNode(org.objectweb.asm.Type.getObjectType(owner)));
+            code.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                    "io/netty/util/internal/logging/InternalLoggerFactory", "getInstance",
+                    "(Ljava/lang/Class;)Lio/netty/util/internal/logging/InternalLogger;", false));
+            code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, "logger",
+                    "Lio/netty/util/internal/logging/InternalLogger;"));
+        }
+        putBooleanIfPresent(
+                node, code, owner, "CAN_ENABLE_TCP_NODELAY_BY_DEFAULT", true);
+        if (hasField(node, "UNSAFE_UNAVAILABILITY_CAUSE", "Ljava/lang/Throwable;")) {
+            putNewString(code, "java/lang/UnsupportedOperationException",
+                    "Native memory is unavailable in the browser");
+            code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, "UNSAFE_UNAVAILABILITY_CAUSE",
+                    "Ljava/lang/Throwable;"));
+        }
+        putLongIfPresent(node, code, owner, "MAX_DIRECT_MEMORY", 2147483647L);
+        putLongIfPresent(node, code, owner, "BYTE_ARRAY_BASE_OFFSET", 0L);
+        if (hasField(node, "TMPDIR", "Ljava/io/File;")) {
+            putNewString(code, "java/io/File", ".");
+            code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, "TMPDIR", "Ljava/io/File;"));
+        }
+        putIntIfPresent(node, code, owner, "BIT_MODE", 32);
+        putStringIfPresent(node, code, owner, "NORMALIZED_ARCH", "wasm32");
+        putStringIfPresent(node, code, owner, "NORMALIZED_OS", "browser");
+        putBooleanIfPresent(node, code, owner, "IS_WINDOWS", false);
+        putBooleanIfPresent(node, code, owner, "IS_OSX", false);
+        putBooleanIfPresent(node, code, owner, "IS_J9_JVM", false);
+        putBooleanIfPresent(node, code, owner, "IS_IVKVM_DOT_NET", false);
+        putIntIfPresent(node, code, owner, "ADDRESS_SIZE", 4);
+        putBooleanIfPresent(node, code, owner, "BIG_ENDIAN_NATIVE_ORDER", false);
+
+        boolean hasCleaner = node.fields.stream().anyMatch(field ->
+                field.desc.equals("Lio/netty/util/internal/Cleaner;")
+                        && (field.name.equals("NOOP")
+                                || field.name.equals("DIRECT_CLEANER")
+                                || field.name.equals("LEGACY_CLEANER")
+                                || field.name.equals("CLEANER")));
+        if (hasCleaner) {
+            putNew(code, "io/netty/util/internal/PlatformDependent$1");
+            code.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ASTORE, 0));
+            for (String field : new String[] {
+                    "NOOP", "DIRECT_CLEANER", "LEGACY_CLEANER", "CLEANER"
+            }) {
+                if (hasField(node, field, "Lio/netty/util/internal/Cleaner;")) {
+                    code.add(new org.objectweb.asm.tree.VarInsnNode(Opcodes.ALOAD, 0));
+                    code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, field,
+                            "Lio/netty/util/internal/Cleaner;"));
+                }
+            }
+        }
+        putBooleanIfPresent(node, code, owner, "USE_DIRECT_BUFFER_NO_CLEANER", false);
+        if (hasField(node, "DIRECT_MEMORY_COUNTER",
+                "Ljava/util/concurrent/atomic/AtomicLong;")) {
+            code.add(new InsnNode(Opcodes.ACONST_NULL));
+            code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, "DIRECT_MEMORY_COUNTER",
+                    "Ljava/util/concurrent/atomic/AtomicLong;"));
+        }
+        putLongIfPresent(node, code, owner, "DIRECT_MEMORY_LIMIT", 2147483647L);
+        putBooleanIfPresent(node, code, owner, "HAS_ALLOCATE_UNINIT_ARRAY", false);
+        putBooleanIfPresent(node, code, owner, "MAYBE_SUPER_USER", false);
+        putBooleanIfPresent(node, code, owner, "EXPLICIT_NO_PREFER_DIRECT", true);
+        putBooleanIfPresent(node, code, owner, "DIRECT_BUFFER_PREFERRED", false);
+        if (hasField(node, "LINUX_OS_CLASSIFIERS", "Ljava/util/Set;")) {
+            code.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                    "java/util/Collections", "emptySet", "()Ljava/util/Set;", false));
+            code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, "LINUX_OS_CLASSIFIERS",
+                    "Ljava/util/Set;"));
+        }
+        putBooleanIfPresent(node, code, owner, "JFR", false);
+        putBooleanIfPresent(node, code, owner, "VAR_HANDLE", false);
         code.add(new InsnNode(Opcodes.RETURN));
         return code;
     }
@@ -959,9 +1145,28 @@ public final class NettyBrowserPatcher {
         code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, field, "I"));
     }
 
+    private static boolean hasField(ClassNode node, String name, String descriptor) {
+        return node.fields.stream().anyMatch(
+                field -> field.name.equals(name) && field.desc.equals(descriptor));
+    }
+
+    private static void putIntIfPresent(
+            ClassNode node, InsnList code, String owner, String field, int value) {
+        if (hasField(node, field, "I")) {
+            putInt(code, owner, field, value);
+        }
+    }
+
     private static void putBoolean(InsnList code, String owner, String field, boolean value) {
         code.add(new InsnNode(value ? Opcodes.ICONST_1 : Opcodes.ICONST_0));
         code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, field, "Z"));
+    }
+
+    private static void putBooleanIfPresent(
+            ClassNode node, InsnList code, String owner, String field, boolean value) {
+        if (hasField(node, field, "Z")) {
+            putBoolean(code, owner, field, value);
+        }
     }
 
     private static void putLong(InsnList code, String owner, String field, long value) {
@@ -969,9 +1174,23 @@ public final class NettyBrowserPatcher {
         code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, field, "J"));
     }
 
+    private static void putLongIfPresent(
+            ClassNode node, InsnList code, String owner, String field, long value) {
+        if (hasField(node, field, "J")) {
+            putLong(code, owner, field, value);
+        }
+    }
+
     private static void putString(InsnList code, String owner, String field, String value) {
         code.add(new LdcInsnNode(value));
         code.add(new FieldInsnNode(Opcodes.PUTSTATIC, owner, field, "Ljava/lang/String;"));
+    }
+
+    private static void putStringIfPresent(
+            ClassNode node, InsnList code, String owner, String field, String value) {
+        if (hasField(node, field, "Ljava/lang/String;")) {
+            putString(code, owner, field, value);
+        }
     }
 
     private static void putNewString(InsnList code, String type, String value) {

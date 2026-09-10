@@ -15,6 +15,7 @@ import org.objectweb.asm.tree.IntInsnNode;
 import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.FieldNode;
 import org.objectweb.asm.tree.IincInsnNode;
+import org.objectweb.asm.tree.InvokeDynamicInsnNode;
 import org.objectweb.asm.tree.JumpInsnNode;
 import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.TypeInsnNode;
@@ -23,18 +24,25 @@ import org.objectweb.asm.tree.VarInsnNode;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.TryCatchBlockNode;
 
 /** Removes desktop-only diagnostics from the official browser client graph. */
 public final class MinecraftClientPatcher {
-    private static final int BROWSER_SECTION_SCHEDULE_BUDGET = 4;
+    private static final double BROWSER_SECTION_QUEUE_DISTANCE_EPSILON = 1.0E-6D;
+    private static final double BROWSER_SECTION_QUEUE_REBUILD_DISTANCE = 16.0D;
     private static final int BROWSER_SECTION_UPLOAD_BUDGET = 8;
     private static final int BROWSER_SECTION_CLOSE_BUDGET = 16;
+    private static final int BROWSER_SECTION_VERTEX_HEAP_BYTES = 16 * 1024 * 1024;
+    private static final int BROWSER_SECTION_INDEX_HEAP_BYTES = 4 * 1024 * 1024;
+    private static final int BROWSER_SECTION_STAGING_BYTES = 16 * 1024 * 1024;
+    private static final int BROWSER_GPU_RETIRE_SLOTS = 8;
 
     private MinecraftClientPatcher() {
     }
 
     public static void main(String[] args) throws IOException {
         Path root = Path.of(args[1]);
+        String minecraftVersion = args.length >= 3 ? args[2] : "1.21.11";
         patchNativeModuleLister(
                 args[0], root.resolve("net/minecraft/util/NativeModuleLister.class"));
         patchJvmProfiler(
@@ -43,6 +51,8 @@ public final class MinecraftClientPatcher {
                 args[0], root.resolve("net/minecraft/server/network/EventLoopGroupHolder.class"));
         patchServerMainBrowser(
                 args[0], root.resolve("net/minecraft/server/Main.class"));
+        patchWorldLoaderBrowserStartupTelemetry(
+                args[0], root.resolve("net/minecraft/server/WorldLoader.class"));
         patchBlocksBrowserStartupYield(
                 args[0], root.resolve("net/minecraft/world/level/block/Blocks.class"));
         patchBlockStateBaseBrowserStartupYield(args[0], root.resolve(
@@ -67,6 +77,8 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/client/multiplayer/resolver/ResolvedServerAddress$1.class"));
         patchConnectionBrowserWebSocket(args[0], root.resolve(
                 "net/minecraft/network/Connection.class"));
+        patchCompressionDecoderBrowser(args[0], root.resolve(
+                "net/minecraft/network/Connection.class"));
         patchClientPacketUtilsBrowserInline(args[0], root.resolve(
                 "net/minecraft/network/protocol/PacketUtils.class"));
         patchConnectScreenBrowserRecovery(args[0], root.resolve(
@@ -87,10 +99,11 @@ public final class MinecraftClientPatcher {
                 args[0],
                 root.resolve("net/minecraft/client/resources/model/ModelManager.class"),
                 root.resolve("net/minecraft/client/gui/font/FontManager.class"));
-        patchAtlasManagerReloadTaskLabels(args[0], root.resolve(
-                "net/minecraft/client/resources/model/AtlasManager$AtlasEntry.class"));
+        patchAtlasManagerReloadTaskLabels(args[0], root);
         patchUnihexProviderBrowserBulkParser(args[0], root.resolve(
                 "net/minecraft/client/gui/font/providers/UnihexProvider$Definition.class"));
+        patchUnihexProviderBrowserAccess(args[0], root.resolve(
+                "net/minecraft/client/gui/font/providers/UnihexProvider.class"));
         patchNetworkEncoderMatchers(args[0], root);
         patchClassTreeIdRegistry(args[0], root.resolve("net/minecraft/util/ClassTreeIdRegistry.class"));
         patchSynchedEntityDataClassInitialization(
@@ -100,8 +113,7 @@ public final class MinecraftClientPatcher {
         patchGlx(args[0], root.resolve("com/mojang/blaze3d/platform/GLX.class"));
         patchGlDebugBrowserNoCallback(args[0], root.resolve(
                 "com/mojang/blaze3d/opengl/GlDebug.class"));
-        patchRenderSystemBrowserDeadlineCompensation(args[0], root.resolve(
-                "com/mojang/blaze3d/systems/RenderSystem.class"));
+        patchRenderSystemBrowserDeadlineCompensation(args[0], root);
         patchFramerateLimitTrackerBrowserNoThrottle(args[0], root.resolve(
                 "com/mojang/blaze3d/platform/FramerateLimitTracker.class"));
         patchTracyZoneFiller(
@@ -116,17 +128,28 @@ public final class MinecraftClientPatcher {
         patchMemoryDebug(args[0], root.resolve(
                 "net/minecraft/client/gui/components/debug/"
                         + "DebugEntryMemory$AllocationRateCalculator.class"));
+        if ("26.2".equals(minecraftVersion)) {
+            patchDebugScreenOverlayBrowserNoChunk(args[0], root.resolve(
+                    "net/minecraft/client/gui/components/DebugScreenOverlay.class"));
+        }
         patchMainBrowserStorageMount(args[0], root.resolve("net/minecraft/client/main/Main.class"));
-        patchMinecraft(args[0], root.resolve("net/minecraft/client/Minecraft.class"));
-        patchLoadingOverlayBrowserForeground(args[0], root.resolve(
-                "net/minecraft/client/gui/screens/LoadingOverlay.class"));
+        patchMinecraft(args[0], root);
+        patchWorldStemBrowserSave(args[0], root.resolve(
+                "net/minecraft/server/WorldStem.class"));
+        patchCommandEncoderLegacyTextureUpload(args[0], root.resolve(
+                "com/mojang/blaze3d/systems/CommandEncoder.class"));
+        // Keep Minecraft's LoadingOverlay for in-game resource reloads.
+        // The launcher HTML owns only the first-start branded shell.
         patchPauseScreenBrowserSingleplayer(args[0], root.resolve(
                 "net/minecraft/client/gui/screens/PauseScreen.class"));
         patchOptionsBrowserLowSimulationDistance(args[0], root.resolve(
                 "net/minecraft/client/Options.class"));
+        if ("26.2".equals(minecraftVersion)) {
+            patchTextureUtilBrowserSolidify(args[0], root.resolve(
+                    "com/mojang/blaze3d/platform/TextureUtil.class"));
+        }
         patchBrowserInputCallbacks(args[0], root);
-        patchGuiGraphicsBrowserItemCache(args[0], root.resolve(
-                "net/minecraft/client/gui/GuiGraphics.class"));
+        patchGuiGraphicsBrowserItemCache(args[0], root);
         patchGuiRenderTelemetry(args[0], root);
         patchDynamicUniformsBrowserInitialCapacity(args[0], root.resolve(
                 "net/minecraft/client/renderer/DynamicUniforms.class"));
@@ -136,6 +159,8 @@ public final class MinecraftClientPatcher {
                 "com/mojang/blaze3d/platform/DebugMemoryUntracker.class"));
         patchMinecraftServer(args[0], root.resolve(
                 "net/minecraft/server/MinecraftServer.class"));
+        patchMobBrowserAiCooperation(args[0], root.resolve(
+                "net/minecraft/world/entity/Mob.class"));
         patchChunkMapBrowserInitialViewDistance(args[0], root.resolve(
                 "net/minecraft/server/level/ChunkMap.class"));
         patchChunkTaskPriorityQueueBrowserNearestFirst(args[0], root.resolve(
@@ -143,8 +168,7 @@ public final class MinecraftClientPatcher {
         patchPlayerSpawnFinderBrowser(args[0], root.resolve(
                 "net/minecraft/server/level/PlayerSpawnFinder.class"));
         patchPrepareSpawnTaskBrowser(args[0], root);
-        patchStructureTemplateManagerBrowserGzip(args[0], root.resolve(
-                "net/minecraft/world/level/levelgen/structure/templatesystem/StructureTemplateManager.class"));
+        patchStructureTemplateManagerBrowserGzip(args[0], root);
         patchServerCommonPacketListenerBrowserWorker(args[0], root.resolve(
                 "net/minecraft/server/network/ServerCommonPacketListenerImpl.class"));
         patchServerGamePacketListenerBrowserWorker(args[0], root.resolve(
@@ -167,9 +191,11 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/world/level/levelgen/synth/ImprovedNoise.class"));
         patchPerlinNoiseBrowserDoubleWrap(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/synth/PerlinNoise.class"));
-        patchNoiseBasedChunkGeneratorBrowserYield(args[0], root.resolve(
-                "net/minecraft/world/level/levelgen/NoiseBasedChunkGenerator.class"));
-        patchNoiseChunkBrowserYield(args[0], root.resolve(
+        boolean deepWorldgenCheckpoints = "26.2".equals(minecraftVersion);
+        patchNoiseBasedChunkGeneratorBrowserSynchronous(args[0], root.resolve(
+                "net/minecraft/world/level/levelgen/NoiseBasedChunkGenerator.class"),
+                deepWorldgenCheckpoints);
+        patchNoiseChunkBrowserSynchronous(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/NoiseChunk.class"));
         patchNoiseInterpolatorBrowserLerp(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/NoiseChunk$NoiseInterpolator.class"));
@@ -179,25 +205,35 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/world/level/levelgen/NoiseChunk$CacheOnce.class"));
         patchDensityFunctionsPureTransformersBrowserDirect(args[0], root);
         patchWorldgenRecordHashCodeCaches(args[0], root);
-        patchClimateRTreeBrowserYield(args[0], root.resolve(
-                "net/minecraft/world/level/biome/Climate$RTree$SubTree.class"));
+        patchClimateRTreeBrowserSynchronous(args[0], root.resolve(
+                "net/minecraft/world/level/biome/Climate$RTree$SubTree.class"),
+                deepWorldgenCheckpoints);
         patchClimateRTreeNodeBrowserDoubleDistance(args[0], root.resolve(
                 "net/minecraft/world/level/biome/Climate$RTree$Node.class"));
-        patchSurfaceSystemBrowserYield(args[0], root.resolve(
-                "net/minecraft/world/level/levelgen/SurfaceSystem.class"));
+        patchSurfaceSystemBrowserSynchronous(args[0], root.resolve(
+                "net/minecraft/world/level/levelgen/SurfaceSystem.class"),
+                deepWorldgenCheckpoints);
         patchSurfaceRulesContextBrowserReusableBiomeSupplier(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/SurfaceRules$Context.class"));
         patchSurfaceRulesLazyConditionBrowserPrimitiveCache(args[0], root);
         patchSurfaceRulesSequenceBrowserIndexed(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/SurfaceRules$SequenceRule.class"));
-        patchChunkGeneratorBrowserYield(args[0], root.resolve(
-                "net/minecraft/world/level/chunk/ChunkGenerator.class"));
-        patchWorldCarverBrowserYield(args[0], root.resolve(
-                "net/minecraft/world/level/levelgen/carver/WorldCarver.class"));
-        patchLightEngineBrowserYield(args[0], root.resolve(
-                "net/minecraft/world/level/lighting/LightEngine.class"));
-        patchLevelChunkSectionBrowserBiomeYield(args[0], root.resolve(
-                "net/minecraft/world/level/chunk/LevelChunkSection.class"));
+        patchChunkGeneratorBrowserSynchronous(args[0], root.resolve(
+                "net/minecraft/world/level/chunk/ChunkGenerator.class"),
+                deepWorldgenCheckpoints);
+        if (deepWorldgenCheckpoints) {
+            patchJigsawPlacementBrowserDeepCheckpoints(args[0], root.resolve(
+                    "net/minecraft/world/level/levelgen/structure/pools/JigsawPlacement$Placer.class"));
+        }
+        patchWorldCarverBrowserSynchronous(args[0], root.resolve(
+                "net/minecraft/world/level/levelgen/carver/WorldCarver.class"),
+                deepWorldgenCheckpoints);
+        patchLightEngineBrowserSynchronous(args[0], root.resolve(
+                "net/minecraft/world/level/lighting/LightEngine.class"),
+                deepWorldgenCheckpoints);
+        patchLevelChunkSectionBrowserSynchronous(args[0], root.resolve(
+                "net/minecraft/world/level/chunk/LevelChunkSection.class"),
+                deepWorldgenCheckpoints);
         patchFriendlyByteBufBrowserLongArray(args[0], root.resolve(
                 "net/minecraft/network/FriendlyByteBuf.class"));
         patchSimpleBitStorageBrowserUnpack(args[0], root.resolve(
@@ -216,8 +252,10 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/world/level/chunk/storage/RegionFileVersion.class"));
         patchPersistentEntityUuidBrowserRecovery(args[0], root.resolve(
                 "net/minecraft/world/level/entity/PersistentEntitySectionManager.class"));
-        patchServerLevelBrowserSafeDefaults(args[0], root.resolve(
-                "net/minecraft/server/level/ServerLevel.class"));
+        patchNaturalSpawnerGenerationSpawnTelemetry(args[0], root.resolve(
+                "net/minecraft/world/level/NaturalSpawner.class"), minecraftVersion);
+        // Preserve both vanilla generation-time creature packs and per-tick
+        // spawning, including the hostile-mob gamerule filter.
         patchChaseClient(args[0], root.resolve(
                 "net/minecraft/server/chase/ChaseClient.class"));
         patchLanServerPinger(args[0], root.resolve(
@@ -227,11 +265,13 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/client/renderer/texture/SkinTextureDownloader.class"));
         patchUtilJarFileSystem(args[0], root.resolve("net/minecraft/util/Util.class"));
         patchUtilRunNamedBrowserOutput(root.resolve("net/minecraft/util/Util.class"));
+        patchUtilBlockUntilDoneBrowserOutput(root.resolve("net/minecraft/util/Util.class"));
         patchResourceKeyRegistryRoot(args[0], root.resolve("net/minecraft/resources/ResourceKey.class"));
         patchVanillaPackResourcesBuilder(args[0], root.resolve(
                 "net/minecraft/server/packs/VanillaPackResourcesBuilder.class"));
         patchFilePackResourcesBrowserAtlasOverlays(args[0], root.resolve(
                 "net/minecraft/server/packs/FilePackResources$FileResourcesSupplier.class"));
+        patchFilePackResourcesBrowserIndex(args[0], root);
         patchSingleFileBrowserAtlasFallback(args[0], root.resolve(
                 "net/minecraft/client/renderer/texture/atlas/sources/SingleFile.class"));
         patchIndexedAssetSourceBrowserNoop(args[0], root.resolve(
@@ -250,7 +290,8 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/world/level/block/state/pattern/BlockPatternBuilder.class"));
         patchChunkPosSpliterator(args[0], root.resolve(
                 "net/minecraft/world/level/ChunkPos$2.class"));
-        patchDetectedVersion(args[0], root.resolve("net/minecraft/DetectedVersion.class"));
+        patchDetectedVersion(
+                args[0], root.resolve("net/minecraft/DetectedVersion.class"), minecraftVersion);
         patchSingleplayerCrypto(args[0], root);
         patchSingleplayerLogin(args[0], root.resolve(
                 "net/minecraft/server/network/ServerLoginPacketListenerImpl.class"));
@@ -262,6 +303,13 @@ public final class MinecraftClientPatcher {
                 "com/mojang/blaze3d/platform/ClientShutdownWatchdog.class"));
         patchScreenBrowserFastMenus(args[0], root.resolve(
                 "net/minecraft/client/gui/screens/Screen.class"));
+        // Keep the actual resource-reload completion path intact while hiding
+        // only the foreground LoadingOverlay once a joined world is live.
+        // This is required for both the legacy mapped 1.21.11 profile and the
+        // current named 26.2 profile; the helper is deliberately separate
+        // from Minecraft#getOverlay so reload exceptions still reach vanilla.
+        patchLoadingOverlayBrowserForeground(args[0], root.resolve(
+                "net/minecraft/client/gui/screens/LoadingOverlay.class"));
         patchLevelLoadingScreenBrowserFastProgress(args[0], root.resolve(
                 "net/minecraft/client/gui/screens/LevelLoadingScreen.class"));
         patchTitleScreenBrowserFastMenus(args[0], root.resolve(
@@ -278,18 +326,24 @@ public final class MinecraftClientPatcher {
                 "com/mojang/blaze3d/audio/Listener.class"));
         patchGlslPreprocessor(args[0], root.resolve(
                 "com/mojang/blaze3d/preprocessor/GlslPreprocessor.class"));
-        patchGlDevice(args[0], root.resolve(
-                "com/mojang/blaze3d/opengl/GlDevice.class"));
+        if ("26.2".equals(minecraftVersion)) {
+            patchMappableRingBufferTelemetry(args[0], root.resolve(
+                    "net/minecraft/client/renderer/MappableRingBuffer.class"));
+            patchStagedVertexBufferGpuPoolCache(args[0], root.resolve(
+                    "net/minecraft/client/renderer/StagedVertexBuffer$GpuBufferPool.class"));
+            patchInventoryAvatarRenderTelemetry(args[0], root);
+            patchGuiEntitySubmitTelemetry(args[0], root.resolve(
+                    "net/minecraft/client/gui/GuiGraphicsExtractor.class"));
+        }
+        patchGlDevice(args[0], root);
         patchGlConstWebGLTextureFormats(args[0], root.resolve(
                 "com/mojang/blaze3d/opengl/GlConst.class"));
-        patchTextureFormatWebGLColorAspect(args[0], root.resolve(
-                "com/mojang/blaze3d/textures/TextureFormat.class"));
+        patchTextureFormatWebGLColorAspect(args[0], root);
         patchGlStateManagerTextureBinding(args[0], root.resolve(
                 "com/mojang/blaze3d/opengl/GlStateManager.class"));
         patchGlRenderPipelineDrawMetadata(args[0], root.resolve(
                 "com/mojang/blaze3d/opengl/GlRenderPipeline.class"));
-        patchGlCommandEncoder(args[0], root.resolve(
-                "com/mojang/blaze3d/opengl/GlCommandEncoder.class"));
+        patchGlCommandEncoder(args[0], root);
         patchGameRendererBrowserAutoScreenshot(args[0], root.resolve(
                 "net/minecraft/client/renderer/GameRenderer.class"));
         patchParticleGroupBrowserTickSafety(args[0], root.resolve(
@@ -300,6 +354,8 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/client/multiplayer/MultiPlayerGameMode.class"));
         patchLevelRendererBrowserBlockBreakProgress(args[0], root.resolve(
                 "net/minecraft/client/renderer/LevelRenderer.class"));
+        patchCurrentLevelExtractorBrowserSectionCompileThrottle(args[0], root.resolve(
+                "net/minecraft/client/renderer/extract/LevelExtractor.class"));
         patchEntityRenderDispatcherBrowserNullEntityGuard(args[0], root.resolve(
                 "net/minecraft/client/renderer/entity/EntityRenderDispatcher.class"));
         patchRenderSectionRegionBrowserDirectSectionCoordinates(args[0], root.resolve(
@@ -308,8 +364,11 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/client/renderer/chunk/SectionCompiler.class"));
         patchSectionRenderDispatcherBrowserThrottles(args[0], root.resolve(
                 "net/minecraft/client/renderer/chunk/SectionRenderDispatcher.class"));
-        patchFaceBakeryBrowserFloatTolerance(args[0], root.resolve(
-                "net/minecraft/client/renderer/block/model/FaceBakery.class"));
+        patchCurrentSectionTaskQueueBrowserPriorities(args[0], root.resolve(
+                "net/minecraft/client/renderer/chunk/SectionTaskDynamicQueue.class"));
+        patchUberGpuBufferBrowserTelemetry(args[0], root.resolve(
+                "com/mojang/blaze3d/vertex/UberGpuBuffer.class"));
+        patchFaceBakeryBrowserFloatTolerance(args[0], root);
         patchLevelLoadTrackerBrowserTimeout(args[0], root);
         patchClientPacketListenerLoadingDiagnostics(args[0], root.resolve(
                 "net/minecraft/client/multiplayer/ClientPacketListener.class"));
@@ -324,6 +383,7 @@ public final class MinecraftClientPatcher {
             throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/Options.class");
         int patched = 0;
+        int sprintDefaults = 0;
         for (MethodNode method : node.methods) {
             if (!method.name.equals("<init>")) {
                 continue;
@@ -348,10 +408,41 @@ public final class MinecraftClientPatcher {
                     break;
                 }
             }
+            boolean inSprintKey = false;
+            for (AbstractInsnNode instruction = method.instructions.getFirst();
+                    instruction != null;
+                    instruction = instruction.getNext()) {
+                if (instruction instanceof LdcInsnNode constant
+                        && "key.sprint".equals(constant.cst)) {
+                    inSprintKey = true;
+                    continue;
+                }
+                if (!inSprintKey) {
+                    continue;
+                }
+                if (instruction instanceof IntInsnNode intConstant
+                        && intConstant.getOpcode() == Opcodes.SIPUSH
+                        && intConstant.operand == 341) {
+                    intConstant.operand = 82;
+                    sprintDefaults++;
+                    break;
+                }
+                if (instruction instanceof LdcInsnNode constant
+                        && constant.cst instanceof Integer value
+                        && value.intValue() == 341) {
+                    method.instructions.set(instruction, new IntInsnNode(Opcodes.BIPUSH, 82));
+                    sprintDefaults++;
+                    break;
+                }
+            }
         }
         if (patched != 1) {
             throw new IllegalStateException(
                     "Options simulation-distance range patch point was not found");
+        }
+        if (sprintDefaults != 1) {
+            throw new IllegalStateException(
+                    "Options sprint default key patch point was not found: " + sprintDefaults);
         }
         MethodNode save = find(node, "save", "()V");
         int distanceSyncs = 0;
@@ -384,10 +475,42 @@ public final class MinecraftClientPatcher {
         write(node, output);
     }
 
+    /** 26.2 browser texture path: keep TextureUtil's public ABI and forward to the bulk helper. */
+    private static void patchTextureUtilBrowserSolidify(String jar, Path output)
+            throws IOException {
+        ClassNode node = read(jar, "com/mojang/blaze3d/platform/TextureUtil.class");
+        MethodNode method = find(
+                node,
+                "solidify",
+                "(Lcom/mojang/blaze3d/platform/NativeImage;)V");
+        if (method == null || (method.access & Opcodes.ACC_STATIC) == 0) {
+            throw new IllegalStateException("TextureUtil.solidify ABI changed");
+        }
+        method.instructions.clear();
+        method.tryCatchBlocks.clear();
+        method.localVariables = null;
+        method.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        method.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserTextureSolidifier",
+                "solidifyBulk",
+                "(Lcom/mojang/blaze3d/platform/NativeImage;)V",
+                false));
+        method.instructions.add(new InsnNode(Opcodes.RETURN));
+        method.maxStack = 1;
+        method.maxLocals = 1;
+        writeComputeFrames(node, output);
+    }
+
     private static void patchMainBrowserStorageMount(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/main/Main.class");
         MethodNode main = find(node, "main", "([Ljava/lang/String;)V");
         boolean lazyDataFixerOptimizationHooked = false;
+        boolean bootstrapPhaseHooked = false;
+        boolean clientBootstrapPhaseHooked = false;
+        boolean bootstrapValidationPhaseHooked = false;
+        boolean dataFixerJoinPhaseHooked = false;
+        boolean renderThreadPhaseHooked = false;
         AbstractInsnNode startupCompletionPoint = null;
         for (AbstractInsnNode instruction : main.instructions.toArray()) {
             if (!(instruction instanceof MethodInsnNode call)) {
@@ -405,6 +528,27 @@ public final class MinecraftClientPatcher {
                 call.owner = "dev/gaius/browser/BrowserLazyDataFixer";
                 call.name = "skipEagerOptimization";
                 lazyDataFixerOptimizationHooked = true;
+            } else if (call.owner.equals("net/minecraft/server/Bootstrap")
+                    && call.name.equals("bootStrap") && call.desc.equals("()V")) {
+                main.instructions.insert(call, browserStartupPhase("bootstrap-complete"));
+                bootstrapPhaseHooked = true;
+            } else if (call.owner.equals("net/minecraft/client/ClientBootstrap")
+                    && call.name.equals("bootstrap") && call.desc.equals("()V")) {
+                main.instructions.insert(call, browserStartupPhase("client-bootstrap-complete"));
+                clientBootstrapPhaseHooked = true;
+            } else if (call.owner.equals("net/minecraft/server/Bootstrap")
+                    && call.name.equals("validate") && call.desc.equals("()V")) {
+                main.instructions.insert(call, browserStartupPhase("bootstrap-validated"));
+                bootstrapValidationPhaseHooked = true;
+            } else if (call.owner.equals("java/util/concurrent/CompletableFuture")
+                    && call.name.equals("join") && call.desc.equals("()Ljava/lang/Object;")) {
+                main.instructions.insert(
+                        call, browserStartupPhase("datafixer-optimization-complete"));
+                dataFixerJoinPhaseHooked = true;
+            } else if (call.owner.equals("com/mojang/blaze3d/systems/RenderSystem")
+                    && call.name.equals("initRenderThread") && call.desc.equals("()V")) {
+                main.instructions.insert(call, browserStartupPhase("render-thread-ready"));
+                renderThreadPhaseHooked = true;
             } else if (call.getOpcode() == Opcodes.INVOKESPECIAL
                     && call.owner.equals("net/minecraft/client/Minecraft")
                     && call.name.equals("<init>")
@@ -420,6 +564,11 @@ public final class MinecraftClientPatcher {
         }
         if (!lazyDataFixerOptimizationHooked) {
             throw new IllegalStateException("Main eager data fixer optimization hook point was not found");
+        }
+        if (!bootstrapPhaseHooked || !clientBootstrapPhaseHooked
+                || !bootstrapValidationPhaseHooked || !dataFixerJoinPhaseHooked
+                || !renderThreadPhaseHooked) {
+            throw new IllegalStateException("Main browser startup phase hook points were not found");
         }
         if (startupCompletionPoint == null) {
             throw new IllegalStateException(
@@ -440,10 +589,29 @@ public final class MinecraftClientPatcher {
         write(node, output);
     }
 
-    private static void patchAtlasManagerReloadTaskLabels(String jar, Path output)
+    private static InsnList browserStartupPhase(String phase) {
+        InsnList checkpoint = new InsnList();
+        checkpoint.add(new LdcInsnNode(phase));
+        checkpoint.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserStartupScheduler",
+                "phase",
+                "(Ljava/lang/String;)V",
+                false));
+        return checkpoint;
+    }
+
+    private static void patchAtlasManagerReloadTaskLabels(String jar, Path outputRoot)
             throws IOException {
-        ClassNode node = read(
-                jar, "net/minecraft/client/resources/model/AtlasManager$AtlasEntry.class");
+        String legacyEntry =
+                "net/minecraft/client/resources/model/AtlasManager$AtlasEntry.class";
+        String currentEntry =
+                "net/minecraft/client/resources/model/sprite/AtlasManager$AtlasEntry.class";
+        String entry;
+        try (ZipFile input = new ZipFile(jar)) {
+            entry = input.getEntry(currentEntry) != null ? currentEntry : legacyEntry;
+        }
+        ClassNode node = read(jar, entry);
         MethodNode scheduleLoad = find(node, "scheduleLoad", "(Lnet/minecraft/server/packs/"
                 + "resources/ResourceManager;Ljava/util/concurrent/Executor;I)"
                 + "Ljava/util/concurrent/CompletableFuture;");
@@ -459,7 +627,7 @@ public final class MinecraftClientPatcher {
         label.add(new VarInsnNode(Opcodes.ASTORE, 2));
         scheduleLoad.instructions.insert(label);
         scheduleLoad.maxStack = Math.max(scheduleLoad.maxStack, 2);
-        write(node, output);
+        write(node, outputRoot.resolve(entry));
     }
 
     private static void patchFramerateLimitTrackerBrowserNoThrottle(String jar, Path output)
@@ -480,8 +648,16 @@ public final class MinecraftClientPatcher {
         write(node, output);
     }
 
-    private static void patchRenderSystemBrowserDeadlineCompensation(String jar, Path output)
+    private static void patchRenderSystemBrowserDeadlineCompensation(String jar, Path outputRoot)
             throws IOException {
+        String currentEntry = "net/minecraft/client/FramerateLimiter.class";
+        try (ZipFile input = new ZipFile(jar)) {
+            if (input.getEntry(currentEntry) != null) {
+                patchCurrentFramerateLimiter(
+                        jar, outputRoot.resolve(currentEntry));
+                return;
+            }
+        }
         String owner = "com/mojang/blaze3d/systems/RenderSystem";
         String helperName = "browserCompensateFrameTime";
         ClassNode node = read(jar, owner + ".class");
@@ -554,6 +730,88 @@ public final class MinecraftClientPatcher {
         helper.instructions.add(returnNow);
         helper.instructions.add(new VarInsnNode(Opcodes.DLOAD, 2));
         helper.instructions.add(new InsnNode(Opcodes.DRETURN));
+        helper.maxStack = 6;
+        helper.maxLocals = 5;
+        node.methods.add(helper);
+        writeComputeFrames(node, outputRoot.resolve(owner + ".class"));
+    }
+
+    private static void patchCurrentFramerateLimiter(String jar, Path output) throws IOException {
+        String owner = "net/minecraft/client/FramerateLimiter";
+        String helperName = "browserCompensateFrameTime";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode limit = find(node, "limitDisplayFPS", "(I)V");
+        FieldInsnNode finalTimestampStore = null;
+        for (AbstractInsnNode instruction = limit.instructions.getFirst(); instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof FieldInsnNode field
+                    && field.getOpcode() == Opcodes.PUTSTATIC
+                    && field.owner.equals(owner)
+                    && field.name.equals("lastFrameTime")
+                    && field.desc.equals("J")) {
+                finalTimestampStore = field;
+            }
+        }
+        if (finalTimestampStore == null) {
+            throw new IllegalStateException(
+                    "FramerateLimiter final timestamp store was not found");
+        }
+        AbstractInsnNode nowCall = previousOpcode(finalTimestampStore);
+        if (!(nowCall instanceof MethodInsnNode call)
+                || call.getOpcode() != Opcodes.INVOKESTATIC
+                || !call.owner.equals("java/lang/System")
+                || !call.name.equals("nanoTime")
+                || !call.desc.equals("()J")) {
+            throw new IllegalStateException(
+                    "FramerateLimiter final current-time call changed");
+        }
+        InsnList compensate = new InsnList();
+        compensate.add(new VarInsnNode(Opcodes.LLOAD, 3));
+        compensate.add(new VarInsnNode(Opcodes.ILOAD, 0));
+        compensate.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                owner,
+                helperName,
+                "(JI)J",
+                false));
+        limit.instructions.insertBefore(nowCall, compensate);
+        limit.instructions.remove(nowCall);
+        limit.maxStack = Math.max(limit.maxStack, 4);
+
+        MethodNode helper = new MethodNode(
+                Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC,
+                helperName,
+                "(JI)J",
+                null,
+                null);
+        LabelNode returnNow = new LabelNode();
+        helper.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "java/lang/System",
+                "nanoTime",
+                "()J",
+                false));
+        helper.instructions.add(new VarInsnNode(Opcodes.LSTORE, 3));
+        helper.instructions.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        helper.instructions.add(new JumpInsnNode(Opcodes.IFLE, returnNow));
+        helper.instructions.add(new VarInsnNode(Opcodes.LLOAD, 3));
+        helper.instructions.add(new VarInsnNode(Opcodes.LLOAD, 0));
+        helper.instructions.add(new InsnNode(Opcodes.LCMP));
+        helper.instructions.add(new JumpInsnNode(Opcodes.IFLT, returnNow));
+        helper.instructions.add(new VarInsnNode(Opcodes.LLOAD, 3));
+        helper.instructions.add(new VarInsnNode(Opcodes.LLOAD, 0));
+        helper.instructions.add(new InsnNode(Opcodes.LSUB));
+        helper.instructions.add(new LdcInsnNode(1_000_000_000L));
+        helper.instructions.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        helper.instructions.add(new InsnNode(Opcodes.I2L));
+        helper.instructions.add(new InsnNode(Opcodes.LDIV));
+        helper.instructions.add(new InsnNode(Opcodes.LCMP));
+        helper.instructions.add(new JumpInsnNode(Opcodes.IFGE, returnNow));
+        helper.instructions.add(new VarInsnNode(Opcodes.LLOAD, 0));
+        helper.instructions.add(new InsnNode(Opcodes.LRETURN));
+        helper.instructions.add(returnNow);
+        helper.instructions.add(new VarInsnNode(Opcodes.LLOAD, 3));
+        helper.instructions.add(new InsnNode(Opcodes.LRETURN));
         helper.maxStack = 6;
         helper.maxLocals = 5;
         node.methods.add(helper);
@@ -732,9 +990,21 @@ public final class MinecraftClientPatcher {
         write(node, output);
     }
 
-    private static void patchFaceBakeryBrowserFloatTolerance(String jar, Path output)
+    private static void patchFaceBakeryBrowserFloatTolerance(String jar, Path root)
             throws IOException {
-        ClassNode node = read(jar, "net/minecraft/client/renderer/block/model/FaceBakery.class");
+        String oldEntry = "net/minecraft/client/renderer/block/model/FaceBakery.class";
+        String currentEntry = "net/minecraft/client/resources/model/cuboid/FaceBakery.class";
+        String entry;
+        try (ZipFile input = new ZipFile(jar)) {
+            if (input.getEntry(oldEntry) != null) {
+                entry = oldEntry;
+            } else if (input.getEntry(currentEntry) != null) {
+                entry = currentEntry;
+            } else {
+                throw new IllegalStateException("FaceBakery browser target was not found");
+            }
+        }
+        ClassNode node = read(jar, entry);
         MethodNode method = find(node, "findVertex", "([Lorg/joml/Vector3fc;IFFF)I");
 
         InsnList code = new InsnList();
@@ -775,7 +1045,7 @@ public final class MinecraftClientPatcher {
         code.add(new InsnNode(Opcodes.IRETURN));
 
         replace(method, code, 4, 7);
-        write(node, output);
+        write(node, root.resolve(entry));
     }
 
     private static void addFloatAbsGreaterThanEpsilonJump(
@@ -802,8 +1072,14 @@ public final class MinecraftClientPatcher {
 
     private static void patchWorldSelectionListTelemetry(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/gui/screens/worldselection/WorldSelectionList.class");
-        MethodNode renderWidget = find(node, "renderWidget",
-                "(Lnet/minecraft/client/gui/GuiGraphics;IIF)V");
+        boolean extractedGui = node.methods.stream()
+                .anyMatch(method -> method.name.equals("extractWidgetRenderState"));
+        MethodNode renderWidget = find(
+                node,
+                extractedGui ? "extractWidgetRenderState" : "renderWidget",
+                extractedGui
+                        ? "(Lnet/minecraft/client/gui/GuiGraphicsExtractor;IIF)V"
+                        : "(Lnet/minecraft/client/gui/GuiGraphics;IIF)V");
         InsnList code = new InsnList();
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
@@ -840,7 +1116,7 @@ public final class MinecraftClientPatcher {
                         foundNormalPreset = true;
                     }
                 }
-            } else if (method.name.equals("lambda$openFresh$4")
+            } else if (method.name.startsWith("lambda$openFresh$")
                     && method.desc.equals("(Lnet/minecraft/server/WorldLoader$DataLoadContext;)"
                             + "Lnet/minecraft/world/level/levelgen/WorldGenSettings;")) {
                 for (var instruction = method.instructions.getFirst();
@@ -917,7 +1193,13 @@ public final class MinecraftClientPatcher {
                 || !foundNormalDimensions
                 || !patchedAllowCommands
                 || !patchedInitialAllowCommands) {
-            throw new IllegalStateException("CreateWorldScreen browser default world patch points were not found");
+            throw new IllegalStateException(
+                    "CreateWorldScreen browser default world patch points were not found: normalPreset="
+                            + foundNormalPreset
+                            + ", defaultOptions=" + foundDefaultOptions
+                            + ", normalDimensions=" + foundNormalDimensions
+                            + ", allowCommands=" + patchedAllowCommands
+                            + ", initialAllowCommands=" + patchedInitialAllowCommands);
         }
         write(node, output);
     }
@@ -985,6 +1267,8 @@ public final class MinecraftClientPatcher {
             }
             constructor.instructions.remove(randomOwner);
             constructor.instructions.remove(randomField);
+            call.owner = "java/util/UUID";
+            call.name = "randomUUID";
             call.desc = "()Ljava/util/UUID;";
             replacements++;
         }
@@ -992,72 +1276,75 @@ public final class MinecraftClientPatcher {
             throw new IllegalStateException(
                     "Expected one Entity constructor UUID random replacement, got " + replacements);
         }
+        verifyBrowserUuidCalls(constructor, 1);
         writeComputeFrames(node, output);
     }
 
+    private static void verifyBrowserUuidCalls(MethodNode method, int expectedRandomUuidCalls) {
+        int randomUuidCalls = 0;
+        for (AbstractInsnNode instruction : method.instructions) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKESTATIC) {
+                continue;
+            }
+            if (call.owner.equals("net/minecraft/util/Mth")
+                    && call.name.equals("createInsecureUUID")
+                    && call.desc.equals("()Ljava/util/UUID;")) {
+                throw new IllegalStateException(
+                        "Browser patch introduced missing Mth.createInsecureUUID() in "
+                                + method.name + method.desc);
+            }
+            if (call.owner.equals("java/util/UUID")
+                    && call.name.equals("randomUUID")
+                    && call.desc.equals("()Ljava/util/UUID;")) {
+                randomUuidCalls++;
+            }
+        }
+        if (randomUuidCalls != expectedRandomUuidCalls) {
+            throw new IllegalStateException(
+                    "Expected " + expectedRandomUuidCalls + " UUID.randomUUID calls in "
+                            + method.name + method.desc + ", got " + randomUuidCalls);
+        }
+    }
+
     private static void patchScreenBrowserFastMenus(String jar, Path output) throws IOException {
+        /*
+         * Preserve the vanilla animated panorama and menu background.  The
+         * previous browser optimisation replaced these methods with a solid
+         * fill, which removed the original title-screen motion and made the
+         * launcher feel frozen.  Menu blurriness is already disabled in the
+         * browser defaults, so keeping the original render path is both
+         * visually correct and bounded to the normal texture draw calls.
+         * Options.menuBackgroundBlurriness stays at zero in browser defaults,
+         * so the restored animation remains crisp without the blur pass.
+         */
         ClassNode node = read(jar, "net/minecraft/client/gui/screens/Screen.class");
-
-        MethodNode panorama = find(node, "renderPanorama",
-                "(Lnet/minecraft/client/gui/GuiGraphics;F)V");
-        InsnList panoramaCode = new InsnList();
-        panoramaCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
-        panoramaCode.add(new InsnNode(Opcodes.ICONST_0));
-        panoramaCode.add(new InsnNode(Opcodes.ICONST_0));
-        panoramaCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        panoramaCode.add(new FieldInsnNode(
-                Opcodes.GETFIELD,
-                "net/minecraft/client/gui/screens/Screen",
-                "width",
-                "I"));
-        panoramaCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        panoramaCode.add(new FieldInsnNode(
-                Opcodes.GETFIELD,
-                "net/minecraft/client/gui/screens/Screen",
-                "height",
-                "I"));
-        panoramaCode.add(new LdcInsnNode(0xFF101820));
-        panoramaCode.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL,
-                "net/minecraft/client/gui/GuiGraphics",
-                "fill",
-                "(IIIII)V",
-                false));
-        panoramaCode.add(new InsnNode(Opcodes.RETURN));
-        replace(panorama, panoramaCode, 6, 3);
-
-        MethodNode menuBackground = find(node, "renderMenuBackground",
-                "(Lnet/minecraft/client/gui/GuiGraphics;IIII)V");
-        InsnList menuCode = new InsnList();
-        menuCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
-        menuCode.add(new VarInsnNode(Opcodes.ILOAD, 2));
-        menuCode.add(new VarInsnNode(Opcodes.ILOAD, 3));
-        menuCode.add(new VarInsnNode(Opcodes.ILOAD, 2));
-        menuCode.add(new VarInsnNode(Opcodes.ILOAD, 4));
-        menuCode.add(new InsnNode(Opcodes.IADD));
-        menuCode.add(new VarInsnNode(Opcodes.ILOAD, 3));
-        menuCode.add(new VarInsnNode(Opcodes.ILOAD, 5));
-        menuCode.add(new InsnNode(Opcodes.IADD));
-        menuCode.add(new LdcInsnNode(0xC0101820));
-        menuCode.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL,
-                "net/minecraft/client/gui/GuiGraphics",
-                "fill",
-                "(IIIII)V",
-                false));
-        menuCode.add(new InsnNode(Opcodes.RETURN));
-        replace(menuBackground, menuCode, 6, 6);
-
+        boolean extractedGui = node.methods.stream()
+                .anyMatch(method -> method.name.equals("extractPanorama"));
+        String graphics = extractedGui
+                ? "net/minecraft/client/gui/GuiGraphicsExtractor"
+                : "net/minecraft/client/gui/GuiGraphics";
+        find(node,
+                extractedGui ? "extractPanorama" : "renderPanorama",
+                "(L" + graphics + ";F)V");
+        find(node,
+                extractedGui ? "extractMenuBackground" : "renderMenuBackground",
+                "(L" + graphics + ";IIII)V");
         write(node, output);
     }
 
     private static void patchLevelLoadingScreenBrowserFastProgress(
             String jar, Path output) throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/gui/screens/LevelLoadingScreen.class");
+        boolean extractedGui = node.methods.stream()
+                .anyMatch(method -> method.name.equals("extractChunksForRendering"));
+        String graphics = extractedGui
+                ? "net/minecraft/client/gui/GuiGraphicsExtractor"
+                : "net/minecraft/client/gui/GuiGraphics";
         MethodNode renderChunks = find(
                 node,
-                "renderChunks",
-                "(Lnet/minecraft/client/gui/GuiGraphics;IIIILnet/minecraft/server/level/progress/"
+                extractedGui ? "extractChunksForRendering" : "renderChunks",
+                "(L" + graphics + ";IIIILnet/minecraft/server/level/progress/"
                         + "ChunkLoadStatusView;)V");
         InsnList code = new InsnList();
         code.add(new InsnNode(Opcodes.RETURN));
@@ -1133,8 +1420,15 @@ public final class MinecraftClientPatcher {
 
     private static void patchAbstractButtonBrowserFastSprite(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/gui/components/AbstractButton.class");
-        MethodNode method = find(node, "renderDefaultSprite",
-                "(Lnet/minecraft/client/gui/GuiGraphics;)V");
+        boolean extractedGui = node.methods.stream()
+                .anyMatch(candidate -> candidate.name.equals("extractDefaultSprite"));
+        String graphics = extractedGui
+                ? "net/minecraft/client/gui/GuiGraphicsExtractor"
+                : "net/minecraft/client/gui/GuiGraphics";
+        MethodNode method = find(
+                node,
+                extractedGui ? "extractDefaultSprite" : "renderDefaultSprite",
+                "(L" + graphics + ";)V");
         InsnList code = new InsnList();
         code.add(new VarInsnNode(Opcodes.ALOAD, 1));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
@@ -1184,7 +1478,7 @@ public final class MinecraftClientPatcher {
         code.add(new LdcInsnNode(0xD02A3440));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL,
-                "net/minecraft/client/gui/GuiGraphics",
+                graphics,
                 "fill",
                 "(IIIII)V",
                 false));
@@ -1193,9 +1487,17 @@ public final class MinecraftClientPatcher {
         write(node, output);
     }
 
-    private static void patchGuiGraphicsBrowserItemCache(String jar, Path output) throws IOException {
-        ClassNode node = read(jar, "net/minecraft/client/gui/GuiGraphics.class");
-        MethodNode method = find(node, "renderItem",
+    private static void patchGuiGraphicsBrowserItemCache(String jar, Path outputRoot)
+            throws IOException {
+        String legacyEntry = "net/minecraft/client/gui/GuiGraphics.class";
+        String currentEntry = "net/minecraft/client/gui/GuiGraphicsExtractor.class";
+        String entry;
+        try (ZipFile input = new ZipFile(jar)) {
+            entry = input.getEntry(currentEntry) != null ? currentEntry : legacyEntry;
+        }
+        String owner = entry.substring(0, entry.length() - ".class".length());
+        ClassNode node = read(jar, entry);
+        MethodNode method = find(node, entry.equals(currentEntry) ? "item" : "renderItem",
                 "(Lnet/minecraft/world/entity/LivingEntity;Lnet/minecraft/world/level/Level;"
                         + "Lnet/minecraft/world/item/ItemStack;III)V");
         AbstractInsnNode start = null;
@@ -1231,7 +1533,7 @@ public final class MinecraftClientPatcher {
         replacement.add(new VarInsnNode(Opcodes.ALOAD, 0));
         replacement.add(new FieldInsnNode(
                 Opcodes.GETFIELD,
-                "net/minecraft/client/gui/GuiGraphics",
+                owner,
                 "minecraft",
                 "Lnet/minecraft/client/Minecraft;"));
         replacement.add(new VarInsnNode(Opcodes.ALOAD, 3));
@@ -1259,7 +1561,138 @@ public final class MinecraftClientPatcher {
         }
         replaceGuiItemRenderStateDebugName(method);
         method.maxStack = Math.max(method.maxStack, 6);
+        writeComputeFrames(node, outputRoot.resolve(entry));
+    }
+
+    /** Adds opt-in probes at the real 26.2 inventory -> avatar renderer boundary. */
+    private static void patchInventoryAvatarRenderTelemetry(String jar, Path outputRoot)
+            throws IOException {
+        ClassNode inventory = read(jar, "net/minecraft/client/gui/screens/inventory/InventoryScreen.class");
+        MethodNode extract = find(inventory, "extractRenderState",
+                "(Lnet/minecraft/world/entity/LivingEntity;)"
+                        + "Lnet/minecraft/client/renderer/entity/state/EntityRenderState;");
+        int rendererCalls = 0;
+        int stateCalls = 0;
+        for (AbstractInsnNode instruction = extract.instructions.getFirst();
+                instruction != null; instruction = instruction.getNext()) {
+            if (!(instruction instanceof MethodInsnNode call)) {
+                continue;
+            }
+            if (call.owner.equals("net/minecraft/client/renderer/entity/EntityRenderDispatcher")
+                    && call.name.equals("getRenderer")) {
+                InsnList probe = new InsnList();
+                probe.add(new InsnNode(Opcodes.DUP));
+                probe.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                        "dev/gaius/browser/BrowserGuiEntityTelemetry", "renderer",
+                        "(Ljava/lang/Object;)V", false));
+                extract.instructions.insert(call, probe);
+                rendererCalls++;
+            } else if (call.owner.equals("net/minecraft/client/renderer/entity/EntityRenderer")
+                    && call.name.equals("createRenderState")) {
+                InsnList probe = new InsnList();
+                probe.add(new InsnNode(Opcodes.DUP));
+                probe.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                        "dev/gaius/browser/BrowserGuiEntityTelemetry", "state",
+                        "(Ljava/lang/Object;)V", false));
+                extract.instructions.insert(call, probe);
+                stateCalls++;
+            }
+        }
+        if (rendererCalls != 1 || stateCalls != 1) {
+            throw new IllegalStateException("26.2 inventory avatar telemetry points changed: renderer="
+                    + rendererCalls + " state=" + stateCalls);
+        }
+        writeComputeFrames(inventory, outputRoot.resolve(
+                "net/minecraft/client/gui/screens/inventory/InventoryScreen.class"));
+
+        ClassNode avatar = read(jar, "net/minecraft/client/renderer/entity/player/AvatarRenderer.class");
+        MethodNode avatarExtract = find(avatar, "extractRenderState",
+                "(Lnet/minecraft/world/entity/Avatar;"
+                        + "Lnet/minecraft/client/renderer/entity/state/AvatarRenderState;F)V");
+        int skinCalls = 0;
+        for (AbstractInsnNode instruction = avatarExtract.instructions.getFirst();
+                instruction != null; instruction = instruction.getNext()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.owner.equals("net/minecraft/client/entity/ClientAvatarEntity")
+                    && call.name.equals("getSkin")) {
+                InsnList probe = new InsnList();
+                probe.add(new InsnNode(Opcodes.DUP));
+                probe.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                        "dev/gaius/browser/BrowserGuiEntityTelemetry", "skin",
+                        "(Ljava/lang/Object;)V", false));
+                avatarExtract.instructions.insert(call, probe);
+                skinCalls++;
+            }
+        }
+        if (skinCalls != 1) {
+            throw new IllegalStateException("26.2 avatar skin telemetry point changed: " + skinCalls);
+        }
+
+        MethodNode texture = find(avatar, "getTextureLocation",
+                "(Lnet/minecraft/client/renderer/entity/state/AvatarRenderState;)"
+                        + "Lnet/minecraft/resources/Identifier;");
+        InsnList stateProbe = new InsnList();
+        stateProbe.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        stateProbe.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserGuiEntityTelemetry", "avatarState",
+                "(Ljava/lang/Object;)V", false));
+        texture.instructions.insert(stateProbe);
+        int textureReturns = 0;
+        for (AbstractInsnNode instruction = texture.instructions.getFirst();
+                instruction != null; instruction = instruction.getNext()) {
+            if (instruction.getOpcode() == Opcodes.ARETURN) {
+                InsnList probe = new InsnList();
+                probe.add(new InsnNode(Opcodes.DUP));
+                probe.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                        "dev/gaius/browser/BrowserGuiEntityTelemetry", "texture",
+                        "(Ljava/lang/Object;)V", false));
+                texture.instructions.insertBefore(instruction, probe);
+                textureReturns++;
+            }
+        }
+        if (textureReturns != 1) {
+            throw new IllegalStateException("26.2 avatar texture return point changed: " + textureReturns);
+        }
+        writeComputeFrames(avatar, outputRoot.resolve(
+                "net/minecraft/client/renderer/entity/player/AvatarRenderer.class"));
+    }
+
+    private static void patchGuiEntitySubmitTelemetry(String jar, Path output)
+            throws IOException {
+        // patchGuiGraphicsBrowserItemCache runs earlier and writes this same class.
+        // Consume that output so the entity probe cannot erase the item-cache patch.
+        ClassNode node = Files.exists(output)
+                ? read(output)
+                : read(jar, "net/minecraft/client/gui/GuiGraphicsExtractor.class");
+        MethodNode entity = find(node, "entity",
+                "(Lnet/minecraft/client/renderer/entity/state/EntityRenderState;F"
+                        + "Lorg/joml/Vector3fc;Lorg/joml/Quaternionfc;Lorg/joml/Quaternionfc;IIII)V");
+        InsnList probe = new InsnList();
+        probe.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserGuiEntityTelemetry", "submit", "()V", false));
+        insertAtStart(entity, probe);
+        entity.maxStack = Math.max(entity.maxStack, 1);
         writeComputeFrames(node, output);
+        ClassNode result = read(output);
+        boolean hasEntityProbe = result.methods.stream()
+                .filter(method -> method.name.equals("entity") && method.desc.equals(entity.desc))
+                .flatMap(method -> java.util.stream.StreamSupport.stream(
+                        java.util.Spliterators.spliteratorUnknownSize(
+                                method.instructions.iterator(), 0), false))
+                .anyMatch(instruction -> instruction instanceof MethodInsnNode call
+                        && call.owner.equals("dev/gaius/browser/BrowserGuiEntityTelemetry")
+                        && call.name.equals("submit"));
+        boolean hasItemCache = result.methods.stream()
+                .flatMap(method -> java.util.stream.StreamSupport.stream(
+                        java.util.Spliterators.spliteratorUnknownSize(
+                                method.instructions.iterator(), 0), false))
+                .anyMatch(instruction -> instruction instanceof MethodInsnNode call
+                        && call.owner.equals("dev/gaius/browser/BrowserGuiItemCache")
+                        && call.name.equals("guiState"));
+        if (!hasEntityProbe || !hasItemCache) {
+            throw new IllegalStateException("GuiGraphicsExtractor composition lost: entityProbe="
+                    + hasEntityProbe + " itemCache=" + hasItemCache);
+        }
     }
 
     private static void replaceGuiItemRenderStateDebugName(MethodNode method) {
@@ -1302,8 +1735,42 @@ public final class MinecraftClientPatcher {
             replacements++;
             break;
         }
-        if (replacements != 1) {
-            throw new IllegalStateException("Expected one GUI item debug-name replacement, got " + replacements);
+        if (replacements == 1) {
+            return;
+        }
+
+        int lazyDetailReplacements = 0;
+        for (var instruction = method.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (!(instruction instanceof org.objectweb.asm.tree.InvokeDynamicInsnNode dynamic)
+                    || !dynamic.desc.equals("(Lnet/minecraft/world/item/ItemStack;)"
+                            + "Lnet/minecraft/CrashReportDetail;")) {
+                continue;
+            }
+            AbstractInsnNode stackLoadInstruction = previousRealInstruction(instruction);
+            if (!(stackLoadInstruction instanceof VarInsnNode stackLoad)
+                    || stackLoad.getOpcode() != Opcodes.ALOAD
+                    || stackLoad.var != 3) {
+                throw new IllegalStateException(
+                        "GUI item lazy debug detail no longer captures item stack local 3");
+            }
+            method.instructions.insertBefore(stackLoadInstruction, new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "dev/gaius/browser/BrowserGuiItemCache",
+                    "itemDebugDetail",
+                    "()Lnet/minecraft/CrashReportDetail;",
+                    false));
+            method.instructions.remove(stackLoadInstruction);
+            AbstractInsnNode next = instruction.getNext();
+            method.instructions.remove(instruction);
+            instruction = next == null ? null : next.getPrevious();
+            lazyDetailReplacements++;
+        }
+        if (lazyDetailReplacements != 3) {
+            throw new IllegalStateException(
+                    "Expected one eager or three lazy GUI item debug-name replacements, got "
+                            + replacements + " eager and " + lazyDetailReplacements + " lazy");
         }
     }
 
@@ -1369,16 +1836,21 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchGuiRenderTelemetry(String jar, Path root) throws IOException {
-        patchGuiRenderStateTelemetry(jar, root.resolve(
-                "net/minecraft/client/gui/render/state/GuiRenderState.class"));
+        patchGuiRenderStateTelemetry(jar, root);
         patchGuiRendererTelemetry(jar, root.resolve(
-                "net/minecraft/client/gui/render/GuiRenderer.class"));
+                "net/minecraft/client/gui/render/GuiRenderer.class"), root);
     }
 
-    private static void patchGuiRenderStateTelemetry(String jar, Path output) throws IOException {
-        ClassNode node = read(jar, "net/minecraft/client/gui/render/state/GuiRenderState.class");
+    private static void patchGuiRenderStateTelemetry(String jar, Path outputRoot) throws IOException {
+        String legacyEntry = "net/minecraft/client/gui/render/state/GuiRenderState.class";
+        String currentEntry = "net/minecraft/client/renderer/state/gui/GuiRenderState.class";
+        String entry;
+        try (ZipFile input = new ZipFile(jar)) {
+            entry = input.getEntry(currentEntry) != null ? currentEntry : legacyEntry;
+        }
+        ClassNode node = read(jar, entry);
         insertAtStart(find(node, "reset", "()V"), browserGuiItemPoolResetCode());
-        writeComputeFrames(node, output);
+        writeComputeFrames(node, outputRoot.resolve(entry));
     }
 
     private static InsnList browserGuiItemPoolResetCode() {
@@ -1392,13 +1864,19 @@ public final class MinecraftClientPatcher {
         return code;
     }
 
-    private static void patchGuiRendererTelemetry(String jar, Path output) throws IOException {
+    private static void patchGuiRendererTelemetry(String jar, Path output, Path outputRoot)
+            throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/gui/render/GuiRenderer.class");
+        boolean currentGuiPipeline = node.methods.stream()
+                .anyMatch(method -> method.name.equals("render") && method.desc.equals("()V"));
 
-        MethodNode render = find(node, "render", "(Lcom/mojang/blaze3d/buffers/GpuBufferSlice;)V");
+        String renderDescriptor = currentGuiPipeline
+                ? "()V"
+                : "(Lcom/mojang/blaze3d/buffers/GpuBufferSlice;)V";
+        MethodNode render = find(node, "render", renderDescriptor);
         insertAtStart(render, staticCall("reportGuiRenderStart", "()V"));
 
-        MethodNode draw = find(node, "draw", "(Lcom/mojang/blaze3d/buffers/GpuBufferSlice;)V");
+        MethodNode draw = find(node, "draw", renderDescriptor);
         InsnList drawPlan = new InsnList();
         drawPlan.add(new VarInsnNode(Opcodes.ALOAD, 0));
         drawPlan.add(new FieldInsnNode(
@@ -1412,18 +1890,22 @@ public final class MinecraftClientPatcher {
                 "size",
                 "()I",
                 true));
-        drawPlan.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        drawPlan.add(new FieldInsnNode(
-                Opcodes.GETFIELD,
-                "net/minecraft/client/gui/render/GuiRenderer",
-                "meshesToDraw",
-                "Ljava/util/List;"));
-        drawPlan.add(new MethodInsnNode(
-                Opcodes.INVOKEINTERFACE,
-                "java/util/List",
-                "size",
-                "()I",
-                true));
+        if (currentGuiPipeline) {
+            drawPlan.add(new InsnNode(Opcodes.ICONST_0));
+        } else {
+            drawPlan.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            drawPlan.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    "net/minecraft/client/gui/render/GuiRenderer",
+                    "meshesToDraw",
+                    "Ljava/util/List;"));
+            drawPlan.add(new MethodInsnNode(
+                    Opcodes.INVOKEINTERFACE,
+                    "java/util/List",
+                    "size",
+                    "()I",
+                    true));
+        }
         drawPlan.add(new VarInsnNode(Opcodes.ALOAD, 0));
         drawPlan.add(new FieldInsnNode(
                 Opcodes.GETFIELD,
@@ -1438,12 +1920,24 @@ public final class MinecraftClientPatcher {
                 false));
         insertAtStart(draw, drawPlan);
 
-        MethodNode itemLambda = find(node, "lambda$prepareItemElements$3",
-                "(Lorg/apache/commons/lang3/mutable/MutableBoolean;II"
-                        + "Lorg/apache/commons/lang3/mutable/MutableBoolean;"
-                        + "Lcom/mojang/blaze3d/vertex/PoseStack;"
-                        + "Lnet/minecraft/client/gui/render/state/GuiItemRenderState;)V");
-        freezeGuiAnimatedItemAtlasHit(itemLambda);
+        if (currentGuiPipeline) {
+            String itemAtlasEntry = "net/minecraft/client/gui/render/GuiItemAtlas.class";
+            ClassNode itemAtlas = read(jar, itemAtlasEntry);
+            MethodNode getOrUpdate = find(
+                    itemAtlas,
+                    "getOrUpdate",
+                    "(Lnet/minecraft/client/renderer/item/TrackingItemStackRenderState;)"
+                            + "Lnet/minecraft/client/gui/render/GuiItemAtlas$SlotView;");
+            freezeGuiAnimatedItemAtlasHit(getOrUpdate);
+            writeComputeFrames(itemAtlas, outputRoot.resolve(itemAtlasEntry));
+        } else {
+            MethodNode itemLambda = find(node, "lambda$prepareItemElements$3",
+                    "(Lorg/apache/commons/lang3/mutable/MutableBoolean;II"
+                            + "Lorg/apache/commons/lang3/mutable/MutableBoolean;"
+                            + "Lcom/mojang/blaze3d/vertex/PoseStack;"
+                            + "Lnet/minecraft/client/gui/render/state/GuiItemRenderState;)V");
+            freezeGuiAnimatedItemAtlasHit(itemLambda);
+        }
 
         writeComputeFrames(node, output);
     }
@@ -1841,7 +2335,823 @@ public final class MinecraftClientPatcher {
         write(node, output);
     }
 
-    private static void patchGlDevice(String jar, Path output) throws IOException {
+    /**
+     * Observes 26.2's ignored MappableRingBuffer fence result without changing the wait,
+     * close, slot-clear or buffer-return control flow.
+     */
+    private static void patchMappableRingBufferTelemetry(String jar, Path output)
+            throws IOException {
+        String owner = "net/minecraft/client/renderer/MappableRingBuffer";
+        String fence = "com/mojang/blaze3d/buffers/GpuFence";
+        String buffer = "com/mojang/blaze3d/buffers/GpuBuffer";
+        String telemetry = "org/lwjgl/opengl/BrowserOpenGL";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode currentBuffer = find(node, "currentBuffer", "()L" + buffer + ";");
+        java.util.List<AbstractInsnNode> executable = new java.util.ArrayList<>();
+        for (AbstractInsnNode instruction : currentBuffer.instructions.toArray()) {
+            if (instruction.getOpcode() >= 0) {
+                executable.add(instruction);
+            }
+        }
+        if (executable.size() != 26
+                || !(executable.get(0) instanceof VarInsnNode loadThis)
+                || loadThis.getOpcode() != Opcodes.ALOAD
+                || loadThis.var != 0
+                || !(executable.get(1) instanceof FieldInsnNode fencesField)
+                || fencesField.getOpcode() != Opcodes.GETFIELD
+                || !fencesField.owner.equals(owner)
+                || !fencesField.name.equals("fences")
+                || !fencesField.desc.equals("[L" + fence + ";")
+                || !(executable.get(2) instanceof VarInsnNode currentOwner)
+                || currentOwner.getOpcode() != Opcodes.ALOAD
+                || currentOwner.var != 0
+                || !(executable.get(3) instanceof FieldInsnNode currentField)
+                || currentField.getOpcode() != Opcodes.GETFIELD
+                || !currentField.owner.equals(owner)
+                || !currentField.name.equals("current")
+                || !currentField.desc.equals("I")
+                || executable.get(4).getOpcode() != Opcodes.AALOAD
+                || !(executable.get(5) instanceof VarInsnNode storeFence)
+                || storeFence.getOpcode() != Opcodes.ASTORE
+                || storeFence.var != 1
+                || !(executable.get(6) instanceof VarInsnNode testFence)
+                || testFence.getOpcode() != Opcodes.ALOAD
+                || testFence.var != 1
+                || !(executable.get(7) instanceof JumpInsnNode nullFence)
+                || nullFence.getOpcode() != Opcodes.IFNULL
+                || !(executable.get(8) instanceof VarInsnNode awaitOwner)
+                || awaitOwner.getOpcode() != Opcodes.ALOAD
+                || awaitOwner.var != 1
+                || !(executable.get(9) instanceof LdcInsnNode timeout)
+                || !Long.valueOf(Long.MAX_VALUE).equals(timeout.cst)
+                || !(executable.get(10) instanceof MethodInsnNode awaitCompletion)
+                || awaitCompletion.getOpcode() != Opcodes.INVOKEINTERFACE
+                || !awaitCompletion.owner.equals(fence)
+                || !awaitCompletion.name.equals("awaitCompletion")
+                || !awaitCompletion.desc.equals("(J)Z")
+                || executable.get(11).getOpcode() != Opcodes.POP
+                || !(executable.get(12) instanceof VarInsnNode closeOwner)
+                || closeOwner.getOpcode() != Opcodes.ALOAD
+                || closeOwner.var != 1
+                || !(executable.get(13) instanceof MethodInsnNode close)
+                || close.getOpcode() != Opcodes.INVOKEINTERFACE
+                || !close.owner.equals(fence)
+                || !close.name.equals("close")
+                || !close.desc.equals("()V")
+                || !(executable.get(14) instanceof VarInsnNode clearOwner)
+                || clearOwner.getOpcode() != Opcodes.ALOAD
+                || clearOwner.var != 0
+                || !(executable.get(15) instanceof FieldInsnNode clearFences)
+                || clearFences.getOpcode() != Opcodes.GETFIELD
+                || !clearFences.owner.equals(owner)
+                || !clearFences.name.equals("fences")
+                || !clearFences.desc.equals("[L" + fence + ";")
+                || !(executable.get(16) instanceof VarInsnNode clearCurrentOwner)
+                || clearCurrentOwner.getOpcode() != Opcodes.ALOAD
+                || clearCurrentOwner.var != 0
+                || !(executable.get(17) instanceof FieldInsnNode clearCurrent)
+                || clearCurrent.getOpcode() != Opcodes.GETFIELD
+                || !clearCurrent.owner.equals(owner)
+                || !clearCurrent.name.equals("current")
+                || !clearCurrent.desc.equals("I")
+                || executable.get(18).getOpcode() != Opcodes.ACONST_NULL
+                || executable.get(19).getOpcode() != Opcodes.AASTORE
+                || nextOpcode(nullFence.label) != executable.get(20)
+                || !(executable.get(20) instanceof VarInsnNode returnOwner)
+                || returnOwner.getOpcode() != Opcodes.ALOAD
+                || returnOwner.var != 0
+                || !(executable.get(21) instanceof FieldInsnNode buffersField)
+                || buffersField.getOpcode() != Opcodes.GETFIELD
+                || !buffersField.owner.equals(owner)
+                || !buffersField.name.equals("buffers")
+                || !buffersField.desc.equals("[L" + buffer + ";")
+                || !(executable.get(22) instanceof VarInsnNode returnCurrentOwner)
+                || returnCurrentOwner.getOpcode() != Opcodes.ALOAD
+                || returnCurrentOwner.var != 0
+                || !(executable.get(23) instanceof FieldInsnNode returnCurrent)
+                || returnCurrent.getOpcode() != Opcodes.GETFIELD
+                || !returnCurrent.owner.equals(owner)
+                || !returnCurrent.name.equals("current")
+                || !returnCurrent.desc.equals("I")
+                || executable.get(24).getOpcode() != Opcodes.AALOAD
+                || executable.get(25).getOpcode() != Opcodes.ARETURN) {
+            throw new IllegalStateException(owner + ".currentBuffer exact 26.2 shape changed");
+        }
+        int awaitCalls = 0;
+        int returns = 0;
+        for (AbstractInsnNode instruction : currentBuffer.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.owner.equals(fence)
+                    && call.name.equals("awaitCompletion")
+                    && call.desc.equals("(J)Z")) {
+                awaitCalls++;
+            }
+            if (instruction.getOpcode() == Opcodes.ARETURN) {
+                returns++;
+            }
+        }
+        if (awaitCalls != 1 || returns != 1) {
+            throw new IllegalStateException(
+                    owner + ".currentBuffer await/return count changed: "
+                            + awaitCalls + "/" + returns);
+        }
+
+        InsnList entryTelemetry = new InsnList();
+        entryTelemetry.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                telemetry,
+                "noteMappableRingCurrentBuffer",
+                "()V",
+                false));
+        currentBuffer.instructions.insertBefore(executable.get(0), entryTelemetry);
+
+        InsnList resultTelemetry = new InsnList();
+        resultTelemetry.add(new InsnNode(Opcodes.DUP));
+        resultTelemetry.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                telemetry,
+                "noteMappableRingAwaitResult",
+                "(Z)V",
+                false));
+        currentBuffer.instructions.insert(awaitCompletion, resultTelemetry);
+
+        writeComputeFrames(node, output);
+        System.out.println(
+                "Instrumented 26.2 MappableRingBuffer.currentBuffer fence-result telemetry");
+    }
+
+    /**
+     * Retains only signalled StagedVertexBuffer pool entries across browser frames. The vanilla
+     * used-to-fence-to-pending path remains byte-for-byte intact; the helper owns only the
+     * available list and applies its bounded count, byte and idle-frame policy after selection.
+     */
+    private static void patchStagedVertexBufferGpuPoolCache(String jar, Path output)
+            throws IOException {
+        String owner = "net/minecraft/client/renderer/StagedVertexBuffer$GpuBufferPool";
+        String buffer = "com/mojang/blaze3d/buffers/GpuBuffer";
+        String helper = "dev/gaius/browser/BrowserGpuBufferPoolCache";
+        String helperDescriptor = "L" + helper + ";";
+        String cacheField = "gaius$browserCache";
+        ClassNode node = read(jar, owner + ".class");
+        String[] expectedFieldNames = {
+            "BUFFER_SIZE_INCREMENT", "MAX_REUSE_SIZE_FACTOR", "label", "usage",
+            "available", "usedThisFrame", "pendingRecycle"
+        };
+        String[] expectedFieldDescriptors = {
+            "I", "I", "Ljava/util/function/Supplier;", "I",
+            "Ljava/util/List;", "Ljava/util/List;", "Ljava/util/List;"
+        };
+        int[] expectedFieldAccess = {
+            Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_FINAL,
+            Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_FINAL,
+            Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL,
+            Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL,
+            Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL,
+            Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL,
+            Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL
+        };
+        if (node.fields.size() != expectedFieldNames.length) {
+            throw new IllegalStateException(
+                    owner + " raw field count changed: " + node.fields.size());
+        }
+        for (int index = 0; index < expectedFieldNames.length; index++) {
+            FieldNode field = node.fields.get(index);
+            if (!field.name.equals(expectedFieldNames[index])
+                    || !field.desc.equals(expectedFieldDescriptors[index])
+                    || field.access != expectedFieldAccess[index]) {
+                throw new IllegalStateException(
+                        owner + " raw field shape changed at " + index + ": "
+                                + field.name + field.desc + " access=" + field.access);
+            }
+        }
+        if (!Integer.valueOf(262144).equals(node.fields.get(0).value)
+                || !Integer.valueOf(4).equals(node.fields.get(1).value)) {
+            throw new IllegalStateException(owner + " raw pool constants changed");
+        }
+
+        String pendingOwner = owner + "$PendingRecycle";
+        ClassNode pendingNode = read(jar, pendingOwner + ".class");
+        if ((pendingNode.access & Opcodes.ACC_FINAL) == 0 || pendingNode.fields.size() != 2) {
+            throw new IllegalStateException(pendingOwner + " raw class/field shape changed");
+        }
+        FieldNode pendingBuffers = pendingNode.fields.get(0);
+        FieldNode pendingFence = pendingNode.fields.get(1);
+        int privateFinal = Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL;
+        if (!pendingBuffers.name.equals("buffers")
+                || !pendingBuffers.desc.equals("Ljava/util/List;")
+                || pendingBuffers.access != privateFinal
+                || !pendingFence.name.equals("fence")
+                || !pendingFence.desc.equals("Lcom/mojang/blaze3d/buffers/GpuFence;")
+                || pendingFence.access != privateFinal) {
+            throw new IllegalStateException(pendingOwner + " raw fields changed");
+        }
+        MethodNode pendingTryRecycle = find(
+                pendingNode, "tryRecycle", "()Ljava/util/List;");
+        MethodInsnNode pendingAwait = null;
+        for (AbstractInsnNode instruction : pendingTryRecycle.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals("com/mojang/blaze3d/buffers/GpuFence")
+                    && call.name.equals("awaitCompletion")
+                    && call.desc.equals("(J)Z")) {
+                if (pendingAwait != null) {
+                    throw new IllegalStateException(pendingOwner + " has multiple fence waits");
+                }
+                pendingAwait = call;
+            }
+        }
+        AbstractInsnNode awaitTimeout = pendingAwait == null
+                ? null : previousOpcode(pendingAwait);
+        AbstractInsnNode awaitFence = awaitTimeout == null
+                ? null : previousOpcode(awaitTimeout);
+        AbstractInsnNode awaitOwner = awaitFence == null
+                ? null : previousOpcode(awaitFence);
+        AbstractInsnNode awaitBranch = pendingAwait == null ? null : nextOpcode(pendingAwait);
+        if (pendingAwait == null
+                || awaitTimeout == null
+                || awaitTimeout.getOpcode() != Opcodes.LCONST_0
+                || !(awaitFence instanceof FieldInsnNode fenceField)
+                || fenceField.getOpcode() != Opcodes.GETFIELD
+                || !fenceField.owner.equals(pendingOwner)
+                || !fenceField.name.equals("fence")
+                || !(awaitOwner instanceof VarInsnNode ownerLoad)
+                || ownerLoad.getOpcode() != Opcodes.ALOAD
+                || ownerLoad.var != 0
+                || !(awaitBranch instanceof JumpInsnNode branch)
+                || branch.getOpcode() != Opcodes.IFEQ) {
+            throw new IllegalStateException(pendingOwner + " awaitCompletion(0) gate changed");
+        }
+        AbstractInsnNode falseNull = nextOpcode(branch.label);
+        AbstractInsnNode falseReturn = falseNull == null ? null : nextOpcode(falseNull);
+        AbstractInsnNode trueOwner = nextOpcode(branch);
+        AbstractInsnNode trueFence = trueOwner == null ? null : nextOpcode(trueOwner);
+        AbstractInsnNode trueClose = trueFence == null ? null : nextOpcode(trueFence);
+        AbstractInsnNode trueBufferOwner = trueClose == null ? null : nextOpcode(trueClose);
+        AbstractInsnNode trueBuffers = trueBufferOwner == null
+                ? null : nextOpcode(trueBufferOwner);
+        AbstractInsnNode trueReturn = trueBuffers == null ? null : nextOpcode(trueBuffers);
+        if (falseNull == null || falseNull.getOpcode() != Opcodes.ACONST_NULL
+                || falseReturn == null || falseReturn.getOpcode() != Opcodes.ARETURN
+                || !(trueOwner instanceof VarInsnNode trueOwnerLoad)
+                || trueOwnerLoad.getOpcode() != Opcodes.ALOAD || trueOwnerLoad.var != 0
+                || !(trueFence instanceof FieldInsnNode trueFenceField)
+                || !trueFenceField.owner.equals(pendingOwner)
+                || !trueFenceField.name.equals("fence")
+                || !(trueClose instanceof MethodInsnNode closeCall)
+                || !closeCall.owner.equals("com/mojang/blaze3d/buffers/GpuFence")
+                || !closeCall.name.equals("close") || !closeCall.desc.equals("()V")
+                || !(trueBufferOwner instanceof VarInsnNode trueBufferOwnerLoad)
+                || trueBufferOwnerLoad.getOpcode() != Opcodes.ALOAD
+                || trueBufferOwnerLoad.var != 0
+                || !(trueBuffers instanceof FieldInsnNode trueBuffersField)
+                || !trueBuffersField.owner.equals(pendingOwner)
+                || !trueBuffersField.name.equals("buffers")
+                || trueReturn == null || trueReturn.getOpcode() != Opcodes.ARETURN
+                || nextOpcode(falseReturn) != null) {
+            throw new IllegalStateException(
+                    pendingOwner + " false-null/true-close-buffer CFG changed");
+        }
+        MethodNode pendingClose = find(pendingNode, "close", "()V");
+        int pendingCloseForEach = 0;
+        int pendingFenceCloses = 0;
+        int pendingCloseReturns = 0;
+        java.util.List<String> pendingCloseOwnerFields = new java.util.ArrayList<>();
+        for (AbstractInsnNode instruction : pendingClose.instructions.toArray()) {
+            if (instruction instanceof FieldInsnNode closeField
+                    && closeField.getOpcode() == Opcodes.GETFIELD
+                    && closeField.owner.equals(pendingOwner)) {
+                pendingCloseOwnerFields.add(closeField.name);
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.owner.equals("java/util/List")
+                    && call.name.equals("forEach")
+                    && call.desc.equals("(Ljava/util/function/Consumer;)V")) {
+                pendingCloseForEach++;
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.owner.equals("com/mojang/blaze3d/buffers/GpuFence")
+                    && call.name.equals("close") && call.desc.equals("()V")) {
+                pendingFenceCloses++;
+            }
+            if (instruction.getOpcode() == Opcodes.RETURN) {
+                pendingCloseReturns++;
+            }
+        }
+        if (pendingCloseForEach != 1 || pendingFenceCloses != 1
+                || pendingCloseReturns != 1
+                || !pendingCloseOwnerFields.equals(java.util.List.of("buffers", "fence"))) {
+            throw new IllegalStateException(pendingOwner + ".close owner cleanup changed");
+        }
+        if (node.fields.stream().anyMatch(field -> field.name.equals(cacheField))) {
+            throw new IllegalStateException(owner + " already contains " + cacheField);
+        }
+        node.fields.add(new FieldNode(
+                Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL,
+                cacheField,
+                helperDescriptor,
+                null,
+                null));
+
+        MethodNode constructor = find(node, "<init>", "(Ljava/util/function/Supplier;I)V");
+        AbstractInsnNode constructorReturn = null;
+        int constructorReturns = 0;
+        for (AbstractInsnNode instruction : constructor.instructions.toArray()) {
+            if (instruction.getOpcode() == Opcodes.RETURN) {
+                constructorReturn = instruction;
+                constructorReturns++;
+            }
+        }
+        if (constructorReturns != 1) {
+            throw new IllegalStateException(
+                    owner + " constructor return shape changed: " + constructorReturns);
+        }
+        InsnList initializeCache = new InsnList();
+        initializeCache.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        initializeCache.add(new TypeInsnNode(Opcodes.NEW, helper));
+        initializeCache.add(new InsnNode(Opcodes.DUP));
+        initializeCache.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        initializeCache.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "available", "Ljava/util/List;"));
+        initializeCache.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        initializeCache.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "label", "Ljava/util/function/Supplier;"));
+        initializeCache.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        initializeCache.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "usage", "I"));
+        initializeCache.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                helper,
+                "<init>",
+                "(Ljava/util/List;Ljava/util/function/Supplier;I)V",
+                false));
+        initializeCache.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, cacheField, helperDescriptor));
+        constructor.instructions.insertBefore(constructorReturn, initializeCache);
+
+        MethodNode acquire = find(
+                node,
+                "acquire",
+                "(Lcom/mojang/blaze3d/systems/GpuDevice;I)L" + buffer + ";");
+        MethodInsnNode roundToward = null;
+        MethodInsnNode rawTakeBest = null;
+        for (AbstractInsnNode instruction : acquire.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("net/minecraft/util/Mth")
+                    && call.name.equals("roundToward")
+                    && call.desc.equals("(II)I")) {
+                if (roundToward != null) {
+                    throw new IllegalStateException(owner + ".acquire has multiple roundToward calls");
+                }
+                roundToward = call;
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                    && call.owner.equals(owner)
+                    && call.name.equals("takeBestAvailable")
+                    && call.desc.equals("(II)L" + buffer + ";")) {
+                if (rawTakeBest != null) {
+                    throw new IllegalStateException(owner + ".acquire has multiple takeBest calls");
+                }
+                rawTakeBest = call;
+            }
+        }
+        AbstractInsnNode roundIncrement = roundToward == null
+                ? null : previousOpcode(roundToward);
+        AbstractInsnNode roundRequest = roundIncrement == null
+                ? null : previousOpcode(roundIncrement);
+        AbstractInsnNode roundedStore = roundToward == null ? null : nextOpcode(roundToward);
+        AbstractInsnNode maximumMultiply = rawTakeBest == null
+                ? null : previousOpcode(rawTakeBest);
+        AbstractInsnNode maximumFactor = maximumMultiply == null
+                ? null : previousOpcode(maximumMultiply);
+        AbstractInsnNode maximumMinimum = maximumFactor == null
+                ? null : previousOpcode(maximumFactor);
+        AbstractInsnNode minimumLoad = maximumMinimum == null
+                ? null : previousOpcode(maximumMinimum);
+        AbstractInsnNode takeBestOwner = minimumLoad == null
+                ? null : previousOpcode(minimumLoad);
+        if (!(roundIncrement instanceof LdcInsnNode increment)
+                || !Integer.valueOf(262144).equals(increment.cst)
+                || !(roundRequest instanceof VarInsnNode requestLoad)
+                || requestLoad.getOpcode() != Opcodes.ILOAD || requestLoad.var != 2
+                || !(roundedStore instanceof VarInsnNode rounded)
+                || rounded.getOpcode() != Opcodes.ISTORE || rounded.var != 3
+                || maximumMultiply == null || maximumMultiply.getOpcode() != Opcodes.IMUL
+                || maximumFactor == null || maximumFactor.getOpcode() != Opcodes.ICONST_4
+                || !(maximumMinimum instanceof VarInsnNode maximumMinimumLoad)
+                || maximumMinimumLoad.getOpcode() != Opcodes.ILOAD
+                || maximumMinimumLoad.var != 3
+                || !(minimumLoad instanceof VarInsnNode minimumValueLoad)
+                || minimumValueLoad.getOpcode() != Opcodes.ILOAD || minimumValueLoad.var != 3
+                || !(takeBestOwner instanceof VarInsnNode takeBestOwnerLoad)
+                || takeBestOwnerLoad.getOpcode() != Opcodes.ALOAD || takeBestOwnerLoad.var != 0) {
+            throw new IllegalStateException(
+                    owner + ".acquire 262144 rounding/minimum*4 comparator shape changed");
+        }
+        AbstractInsnNode acquireStart = acquire.instructions.getFirst();
+        while (acquireStart != null && acquireStart.getOpcode() < 0) {
+            acquireStart = acquireStart.getNext();
+        }
+        if (acquireStart == null) {
+            throw new IllegalStateException(owner + ".acquire has no executable instructions");
+        }
+        InsnList beforeAcquire = new InsnList();
+        beforeAcquire.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        beforeAcquire.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, cacheField, helperDescriptor));
+        beforeAcquire.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, helper, "beforeAcquire", "()V", false));
+        acquire.instructions.insertBefore(acquireStart, beforeAcquire);
+
+        InsnList afterRecycleSweep = new InsnList();
+        afterRecycleSweep.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        afterRecycleSweep.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, cacheField, helperDescriptor));
+        afterRecycleSweep.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        afterRecycleSweep.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                helper,
+                "afterRecycleSweep",
+                "(I)V",
+                false));
+        acquire.instructions.insert(roundedStore, afterRecycleSweep);
+
+        MethodInsnNode createBuffer = null;
+        MethodInsnNode usedAdd = null;
+        for (AbstractInsnNode instruction : acquire.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.owner.equals("com/mojang/blaze3d/systems/GpuDevice")
+                    && call.name.equals("createBuffer")
+                    && call.desc.equals(
+                    "(Ljava/util/function/Supplier;IJ)L" + buffer + ";")) {
+                if (createBuffer != null) {
+                    throw new IllegalStateException(owner + ".acquire has multiple createBuffer calls");
+                }
+                createBuffer = call;
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals("java/util/List")
+                    && call.name.equals("add")
+                    && call.desc.equals("(Ljava/lang/Object;)Z")) {
+                AbstractInsnNode value = previousOpcode(call);
+                AbstractInsnNode field = value == null ? null : previousOpcode(value);
+                if (field instanceof FieldInsnNode ownerField
+                        && ownerField.owner.equals(owner)
+                        && ownerField.name.equals("usedThisFrame")) {
+                    if (usedAdd != null) {
+                        throw new IllegalStateException(owner + ".acquire has multiple used-list adds");
+                    }
+                    usedAdd = call;
+                }
+            }
+        }
+        if (createBuffer == null || usedAdd == null) {
+            throw new IllegalStateException(owner + ".acquire creation/use shape changed");
+        }
+        AbstractInsnNode createdStore = nextOpcode(createBuffer);
+        if (!(createdStore instanceof VarInsnNode store)
+                || store.getOpcode() != Opcodes.ASTORE
+                || store.var != 4) {
+            throw new IllegalStateException(owner + ".acquire create result local changed");
+        }
+        InsnList recordCreate = new InsnList();
+        recordCreate.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        recordCreate.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, cacheField, helperDescriptor));
+        recordCreate.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        recordCreate.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                helper,
+                "recordCreate",
+                "(L" + buffer + ";)V",
+                false));
+        acquire.instructions.insert(createdStore, recordCreate);
+
+        AbstractInsnNode usedAddPop = nextOpcode(usedAdd);
+        if (usedAddPop == null || usedAddPop.getOpcode() != Opcodes.POP) {
+            throw new IllegalStateException(owner + ".acquire used-list add no longer discards boolean");
+        }
+        AbstractInsnNode acquireReturn = nextOpcode(usedAddPop);
+        if (!(acquireReturn instanceof VarInsnNode load)
+                || load.getOpcode() != Opcodes.ALOAD
+                || load.var != 4
+                || nextOpcode(acquireReturn) == null
+                || nextOpcode(acquireReturn).getOpcode() != Opcodes.ARETURN) {
+            throw new IllegalStateException(owner + ".acquire return shape changed");
+        }
+        InsnList afterAcquire = new InsnList();
+        afterAcquire.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        afterAcquire.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, cacheField, helperDescriptor));
+        afterAcquire.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        afterAcquire.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        afterAcquire.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                helper,
+                "afterAcquire",
+                "(L" + buffer + ";I)V",
+                false));
+        acquire.instructions.insert(usedAddPop, afterAcquire);
+
+        MethodNode recycleLambda = null;
+        for (MethodNode method : node.methods) {
+            for (AbstractInsnNode instruction : method.instructions.toArray()) {
+                if (instruction instanceof MethodInsnNode call
+                        && call.owner.equals(owner + "$PendingRecycle")
+                        && call.name.equals("tryRecycle")
+                        && call.desc.equals("()Ljava/util/List;")) {
+                    if (recycleLambda != null && recycleLambda != method) {
+                        throw new IllegalStateException(owner + " has multiple recycle lambdas");
+                    }
+                    recycleLambda = method;
+                }
+            }
+        }
+        if (recycleLambda == null || !recycleLambda.desc.endsWith(")Z")) {
+            throw new IllegalStateException(owner + " recycle lambda shape changed");
+        }
+        VarInsnNode recycledStore = null;
+        MethodInsnNode addAll = null;
+        for (AbstractInsnNode instruction : recycleLambda.instructions.toArray()) {
+            if (instruction instanceof VarInsnNode variable
+                    && variable.getOpcode() == Opcodes.ASTORE
+                    && variable.var == 2) {
+                if (recycledStore != null) {
+                    throw new IllegalStateException(owner + " recycle result local stored twice");
+                }
+                recycledStore = variable;
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals("java/util/List")
+                    && call.name.equals("addAll")
+                    && call.desc.equals("(Ljava/util/Collection;)Z")) {
+                if (addAll != null) {
+                    throw new IllegalStateException(owner + " recycle lambda has multiple addAll calls");
+                }
+                addAll = call;
+            }
+        }
+        if (recycledStore == null || addAll == null) {
+            throw new IllegalStateException(owner + " recycle lambda result/addAll shape changed");
+        }
+        InsnList recycleResult = new InsnList();
+        recycleResult.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        recycleResult.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, cacheField, helperDescriptor));
+        recycleResult.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        recycleResult.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                helper,
+                "recycleResult",
+                "(Ljava/util/List;)V",
+                false));
+        recycleLambda.instructions.insert(recycledStore, recycleResult);
+
+        AbstractInsnNode addAllValue = previousOpcode(addAll);
+        AbstractInsnNode addAllField = addAllValue == null ? null : previousOpcode(addAllValue);
+        AbstractInsnNode addAllOwner = addAllField == null ? null : previousOpcode(addAllField);
+        AbstractInsnNode addAllPop = nextOpcode(addAll);
+        if (!(addAllValue instanceof VarInsnNode valueLoad)
+                || valueLoad.getOpcode() != Opcodes.ALOAD
+                || valueLoad.var != 2
+                || !(addAllField instanceof FieldInsnNode field)
+                || field.getOpcode() != Opcodes.GETFIELD
+                || !field.owner.equals(owner)
+                || !field.name.equals("available")
+                || !(addAllOwner instanceof VarInsnNode addAllOwnerLoad)
+                || addAllOwnerLoad.getOpcode() != Opcodes.ALOAD
+                || addAllOwnerLoad.var != 0
+                || addAllPop == null
+                || addAllPop.getOpcode() != Opcodes.POP) {
+            throw new IllegalStateException(owner + " recycle available.addAll stack shape changed");
+        }
+        recycleLambda.instructions.remove(addAllOwner);
+        recycleLambda.instructions.remove(addAllField);
+        recycleLambda.instructions.remove(addAllValue);
+        recycleLambda.instructions.remove(addAll);
+        recycleLambda.instructions.remove(addAllPop);
+
+        MethodNode takeBest = find(node, "takeBestAvailable", "(II)L" + buffer + ";");
+        int removePatches = 0;
+        for (AbstractInsnNode instruction : takeBest.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKEINTERFACE
+                    || !call.owner.equals("java/util/List")
+                    || !call.name.equals("remove")
+                    || !call.desc.equals("(I)Ljava/lang/Object;")) {
+                continue;
+            }
+            AbstractInsnNode indexLoad = previousOpcode(call);
+            AbstractInsnNode listField = indexLoad == null ? null : previousOpcode(indexLoad);
+            if (!(listField instanceof FieldInsnNode takeBestField)
+                    || takeBestField.getOpcode() != Opcodes.GETFIELD
+                    || !takeBestField.owner.equals(owner)
+                    || !takeBestField.name.equals("available")) {
+                throw new IllegalStateException(owner + ".takeBestAvailable remove receiver changed");
+            }
+            takeBestField.name = cacheField;
+            takeBestField.desc = helperDescriptor;
+            call.setOpcode(Opcodes.INVOKEVIRTUAL);
+            call.owner = helper;
+            call.name = "removeAt";
+            call.desc = "(I)L" + buffer + ";";
+            call.itf = false;
+            removePatches++;
+        }
+        if (removePatches != 2) {
+            throw new IllegalStateException(
+                    owner + ".takeBestAvailable remove count changed: " + removePatches);
+        }
+
+        MethodNode endFrame = find(
+                node, "endFrame", "(Lcom/mojang/blaze3d/systems/GpuDevice;)V");
+        java.util.List<FieldInsnNode> endFrameAvailable = new java.util.ArrayList<>();
+        java.util.List<String> endFrameOwnerFields = new java.util.ArrayList<>();
+        int pendingAdds = 0;
+        int usedClears = 0;
+        int rawEndFrameReturns = 0;
+        for (AbstractInsnNode instruction : endFrame.instructions.toArray()) {
+            if (instruction instanceof FieldInsnNode endFrameField
+                    && endFrameField.getOpcode() == Opcodes.GETFIELD
+                    && endFrameField.owner.equals(owner)) {
+                endFrameOwnerFields.add(endFrameField.name);
+                if (endFrameField.name.equals("available")) {
+                    endFrameAvailable.add(endFrameField);
+                }
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals("java/util/List")
+                    && call.name.equals("add")
+                    && call.desc.equals("(Ljava/lang/Object;)Z")) {
+                pendingAdds++;
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals("java/util/List")
+                    && call.name.equals("clear")
+                    && call.desc.equals("()V")) {
+                usedClears++;
+            }
+            if (instruction.getOpcode() == Opcodes.RETURN) {
+                rawEndFrameReturns++;
+            }
+        }
+        java.util.List<String> expectedEndFrameFields = java.util.List.of(
+                "usedThisFrame", "pendingRecycle", "usedThisFrame", "usedThisFrame",
+                "available", "available", "available");
+        if (endFrameAvailable.size() != 3
+                || pendingAdds != 1
+                || usedClears != 2
+                || rawEndFrameReturns != 1
+                || !endFrameOwnerFields.equals(expectedEndFrameFields)) {
+            throw new IllegalStateException(
+                    owner + ".endFrame available/pending shape changed: available="
+                            + endFrameAvailable.size() + ", adds=" + pendingAdds
+                            + ", clears=" + usedClears + ", fields=" + endFrameOwnerFields
+                            + ", returns=" + rawEndFrameReturns);
+        }
+        AbstractInsnNode availableBlockStart = previousOpcode(endFrameAvailable.get(0));
+        AbstractInsnNode availableIsEmpty = nextOpcode(endFrameAvailable.get(0));
+        AbstractInsnNode availableBranch = availableIsEmpty == null
+                ? null : nextOpcode(availableIsEmpty);
+        AbstractInsnNode availableForEachOwner = availableBranch == null
+                ? null : nextOpcode(availableBranch);
+        AbstractInsnNode availableForEachField = availableForEachOwner == null
+                ? null : nextOpcode(availableForEachOwner);
+        AbstractInsnNode availableConsumer = availableForEachField == null
+                ? null : nextOpcode(availableForEachField);
+        AbstractInsnNode availableForEach = availableConsumer == null
+                ? null : nextOpcode(availableConsumer);
+        AbstractInsnNode availableClearOwner = availableForEach == null
+                ? null : nextOpcode(availableForEach);
+        FieldInsnNode finalAvailableField = endFrameAvailable.get(endFrameAvailable.size() - 1);
+        AbstractInsnNode availableClear = nextOpcode(finalAvailableField);
+        AbstractInsnNode afterAvailableClear = availableClear == null
+                ? null : nextOpcode(availableClear);
+        if (!(availableBlockStart instanceof VarInsnNode startLoad)
+                || startLoad.getOpcode() != Opcodes.ALOAD
+                || startLoad.var != 0
+                || !(availableIsEmpty instanceof MethodInsnNode isEmptyCall)
+                || isEmptyCall.getOpcode() != Opcodes.INVOKEINTERFACE
+                || !isEmptyCall.owner.equals("java/util/List")
+                || !isEmptyCall.name.equals("isEmpty")
+                || !isEmptyCall.desc.equals("()Z")
+                || !(availableBranch instanceof JumpInsnNode emptyBranch)
+                || emptyBranch.getOpcode() != Opcodes.IFNE
+                || !(availableForEachOwner instanceof VarInsnNode forEachOwnerLoad)
+                || forEachOwnerLoad.getOpcode() != Opcodes.ALOAD
+                || forEachOwnerLoad.var != 0
+                || availableForEachField != endFrameAvailable.get(1)
+                || !(availableConsumer instanceof InvokeDynamicInsnNode)
+                || !(availableForEach instanceof MethodInsnNode forEachCall)
+                || forEachCall.getOpcode() != Opcodes.INVOKEINTERFACE
+                || !forEachCall.owner.equals("java/util/List")
+                || !forEachCall.name.equals("forEach")
+                || !forEachCall.desc.equals("(Ljava/util/function/Consumer;)V")
+                || !(availableClearOwner instanceof VarInsnNode clearOwnerLoad)
+                || clearOwnerLoad.getOpcode() != Opcodes.ALOAD
+                || clearOwnerLoad.var != 0
+                || finalAvailableField != nextOpcode(availableClearOwner)
+                || !(availableClear instanceof MethodInsnNode clearCall)
+                || clearCall.getOpcode() != Opcodes.INVOKEINTERFACE
+                || !clearCall.owner.equals("java/util/List")
+                || !clearCall.name.equals("clear")
+                || !clearCall.desc.equals("()V")
+                || afterAvailableClear == null
+                || afterAvailableClear.getOpcode() != Opcodes.RETURN
+                || nextOpcode(emptyBranch.label) != afterAvailableClear) {
+            throw new IllegalStateException(owner + ".endFrame available close/clear block changed");
+        }
+        AbstractInsnNode afterAvailableBlock = availableClear.getNext();
+        for (AbstractInsnNode cursor = availableBlockStart; cursor != afterAvailableBlock; ) {
+            AbstractInsnNode next = cursor.getNext();
+            endFrame.instructions.remove(cursor);
+            cursor = next;
+        }
+        AbstractInsnNode endFrameReturn = null;
+        int endFrameReturns = 0;
+        for (AbstractInsnNode instruction : endFrame.instructions.toArray()) {
+            if (instruction.getOpcode() == Opcodes.RETURN) {
+                endFrameReturn = instruction;
+                endFrameReturns++;
+            }
+        }
+        if (endFrameReturns != 1) {
+            throw new IllegalStateException(owner + ".endFrame return shape changed");
+        }
+        InsnList retainAvailable = new InsnList();
+        retainAvailable.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        retainAvailable.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, cacheField, helperDescriptor));
+        retainAvailable.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        retainAvailable.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "pendingRecycle", "Ljava/util/List;"));
+        retainAvailable.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE, "java/util/List", "size", "()I", true));
+        retainAvailable.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, helper, "endFrame", "(I)V", false));
+        endFrame.instructions.insertBefore(endFrameReturn, retainAvailable);
+
+        MethodNode close = find(node, "close", "()V");
+        int closeForEach = 0;
+        int closeClears = 0;
+        AbstractInsnNode closeReturn = null;
+        java.util.List<String> closeOwnerFields = new java.util.ArrayList<>();
+        for (AbstractInsnNode instruction : close.instructions.toArray()) {
+            if (instruction instanceof FieldInsnNode closeField
+                    && closeField.getOpcode() == Opcodes.GETFIELD
+                    && closeField.owner.equals(owner)) {
+                closeOwnerFields.add(closeField.name);
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals("java/util/List")
+                    && call.name.equals("forEach")
+                    && call.desc.equals("(Ljava/util/function/Consumer;)V")) {
+                closeForEach++;
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals("java/util/List")
+                    && call.name.equals("clear")
+                    && call.desc.equals("()V")) {
+                closeClears++;
+            }
+            if (instruction.getOpcode() == Opcodes.RETURN) {
+                if (closeReturn != null) {
+                    throw new IllegalStateException(owner + ".close has multiple returns");
+                }
+                closeReturn = instruction;
+            }
+        }
+        java.util.List<String> expectedCloseFields = java.util.List.of(
+                "available", "usedThisFrame", "pendingRecycle",
+                "available", "usedThisFrame", "pendingRecycle");
+        if (closeForEach != 3
+                || closeClears != 3
+                || closeReturn == null
+                || !closeOwnerFields.equals(expectedCloseFields)) {
+            throw new IllegalStateException(
+                    owner + ".close owner cleanup shape changed: forEach=" + closeForEach
+                            + ", clears=" + closeClears + ", fields=" + closeOwnerFields);
+        }
+        InsnList ownerClosed = new InsnList();
+        ownerClosed.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        ownerClosed.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, cacheField, helperDescriptor));
+        ownerClosed.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, helper, "ownerClosed", "()V", false));
+        close.instructions.insertBefore(closeReturn, ownerClosed);
+
+        writeComputeFrames(node, output);
+        System.out.println(
+                "Instrumented 26.2 StagedVertexBuffer GPU pool cache: count=4 bytes=1048576 idle=3");
+    }
+
+    private static void patchGlDevice(String jar, Path outputRoot) throws IOException {
         ClassNode node = read(jar, "com/mojang/blaze3d/opengl/GlDevice.class");
         String owner = "com/mojang/blaze3d/opengl/GlDevice";
         boolean patchedCapability = false;
@@ -1866,7 +3176,19 @@ public final class MinecraftClientPatcher {
                 }
             }
         }
-        MethodNode maxTextureSize = find(node, "getMaxSupportedTextureSize", "()I");
+        MethodNode maxTextureSize = node.methods.stream()
+                .filter(method -> method.name.equals("getMaxSupportedTextureSize")
+                        && method.desc.equals("()I"))
+                .findFirst()
+                .orElse(null);
+        ClassNode maxTextureOwner = node;
+        String maxTextureEntry = owner + ".class";
+        if (maxTextureSize == null) {
+            String heuristicsOwner = "com/mojang/blaze3d/opengl/GlHeuristics";
+            maxTextureOwner = read(jar, heuristicsOwner + ".class");
+            maxTextureSize = find(maxTextureOwner, "getMaxSupportedTextureSize", "()I");
+            maxTextureEntry = heuristicsOwner + ".class";
+        }
         InsnList code = new InsnList();
         code.add(new IntInsnNode(Opcodes.SIPUSH, 3379));
         code.add(new MethodInsnNode(
@@ -1887,13 +3209,23 @@ public final class MinecraftClientPatcher {
         if (!patchedCapability) {
             throw new IllegalStateException("GlDevice capability patch point was not found");
         }
-        write(node, output);
+        write(node, outputRoot.resolve(owner + ".class"));
+        if (maxTextureOwner != node) {
+            write(maxTextureOwner, outputRoot.resolve(maxTextureEntry));
+        }
     }
 
     private static void patchGlConstWebGLTextureFormats(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "com/mojang/blaze3d/opengl/GlConst.class");
-        MethodNode method = find(node, "toGlInternalId",
-                "(Lcom/mojang/blaze3d/textures/TextureFormat;)I");
+        boolean gpuFormat = node.methods.stream()
+                .anyMatch(candidate -> candidate.name.equals("toGlInternalId")
+                        && candidate.desc.equals("(Lcom/mojang/blaze3d/GpuFormat;)I"));
+        MethodNode method = find(
+                node,
+                "toGlInternalId",
+                gpuFormat
+                        ? "(Lcom/mojang/blaze3d/GpuFormat;)I"
+                        : "(Lcom/mojang/blaze3d/textures/TextureFormat;)I");
         boolean patched = false;
         for (var instruction = method.instructions.getFirst();
                 instruction != null;
@@ -1913,8 +3245,37 @@ public final class MinecraftClientPatcher {
         write(node, output);
     }
 
-    private static void patchTextureFormatWebGLColorAspect(String jar, Path output) throws IOException {
-        ClassNode node = read(jar, "com/mojang/blaze3d/textures/TextureFormat.class");
+    private static void patchTextureFormatWebGLColorAspect(String jar, Path root) throws IOException {
+        String oldEntry = "com/mojang/blaze3d/textures/TextureFormat.class";
+        try (ZipFile input = new ZipFile(jar)) {
+            if (input.getEntry(oldEntry) == null) {
+                String currentEntry = "com/mojang/blaze3d/GpuFormat.class";
+                if (input.getEntry(currentEntry) == null) {
+                    throw new IllegalStateException("Neither TextureFormat nor GpuFormat was found");
+                }
+                ClassNode current = read(jar, currentEntry);
+                MethodNode hasColorAspect = find(current, "hasColorAspect", "()Z");
+                boolean checksDepth = false;
+                boolean checksStencil = false;
+                for (AbstractInsnNode instruction : hasColorAspect.instructions) {
+                    if (instruction instanceof MethodInsnNode call
+                            && call.owner.equals("com/mojang/blaze3d/GpuFormat")
+                            && call.desc.equals("()Z")) {
+                        checksDepth |= call.name.equals("hasDepthAspect");
+                        checksStencil |= call.name.equals("hasStencilAspect");
+                    }
+                }
+                if (!checksDepth || !checksStencil) {
+                    throw new IllegalStateException(
+                            "GpuFormat.hasColorAspect no longer excludes depth and stencil formats");
+                }
+                System.out.println(
+                        "Verified current GpuFormat color/depth/stencil aspect semantics");
+                return;
+            }
+        }
+
+        ClassNode node = read(jar, oldEntry);
         MethodNode method = find(node, "hasColorAspect", "()Z");
         InsnList code = new InsnList();
         LabelNode depth = new LabelNode();
@@ -1931,7 +3292,7 @@ public final class MinecraftClientPatcher {
         code.add(new InsnNode(Opcodes.ICONST_0));
         code.add(new InsnNode(Opcodes.IRETURN));
         replace(method, code, 2, 1);
-        writeComputeFrames(node, output);
+        writeComputeFrames(node, root.resolve(oldEntry));
     }
 
     private static void patchGlStateManagerTextureBinding(String jar, Path output) throws IOException {
@@ -2008,7 +3369,67 @@ public final class MinecraftClientPatcher {
         String pipeline = "com/mojang/blaze3d/pipeline/RenderPipeline";
         String vertexFormat = "com/mojang/blaze3d/vertex/VertexFormat";
         String mode = "com/mojang/blaze3d/vertex/VertexFormat$Mode";
+        String primitiveTopology = "com/mojang/blaze3d/PrimitiveTopology";
         ClassNode node = read(jar, owner + ".class");
+        ClassNode pipelineNode = read(jar, pipeline + ".class");
+        boolean multiBufferPipeline = pipelineNode.methods.stream()
+                .anyMatch(method -> method.name.equals("getVertexFormatBindings")
+                        && method.desc.equals("()[L" + vertexFormat + ";"));
+        if (multiBufferPipeline) {
+            find(node, "info", "()L" + pipeline + ";");
+            find(pipelineNode, "getPrimitiveTopology", "()L" + primitiveTopology + ";");
+            node.fields.add(new FieldNode(
+                    Opcodes.ACC_FINAL | Opcodes.ACC_SYNTHETIC,
+                    "gaius$primitiveTopology",
+                    "I",
+                    null,
+                    null));
+
+            MethodNode constructor = find(
+                    node,
+                    "<init>",
+                    "(L" + pipeline + ";Lcom/mojang/blaze3d/opengl/GlProgram;)V");
+            AbstractInsnNode constructorReturn = null;
+            for (AbstractInsnNode instruction = constructor.instructions.getFirst();
+                    instruction != null; instruction = instruction.getNext()) {
+                if (instruction.getOpcode() == Opcodes.RETURN) {
+                    if (constructorReturn != null) {
+                        throw new IllegalStateException(
+                                "GlRenderPipeline constructor has multiple returns");
+                    }
+                    constructorReturn = instruction;
+                }
+            }
+            if (constructorReturn == null) {
+                throw new IllegalStateException("GlRenderPipeline constructor return was not found");
+            }
+
+            InsnList initialize = new InsnList();
+            initialize.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            initialize.add(new VarInsnNode(Opcodes.ALOAD, 1));
+            initialize.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    pipeline,
+                    "getPrimitiveTopology",
+                    "()L" + primitiveTopology + ";",
+                    false));
+            initialize.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "com/mojang/blaze3d/opengl/GlConst",
+                    "toGl",
+                    "(L" + primitiveTopology + ";)I",
+                    false));
+            initialize.add(new FieldInsnNode(
+                    Opcodes.PUTFIELD,
+                    owner,
+                    "gaius$primitiveTopology",
+                    "I"));
+            constructor.instructions.insertBefore(constructorReturn, initialize);
+            constructor.maxStack = Math.max(constructor.maxStack, 2);
+            writeComputeFrames(node, output);
+            System.out.println("Cached current multi-buffer render pipeline topology");
+            return;
+        }
         node.fields.add(new FieldNode(
                 Opcodes.ACC_FINAL | Opcodes.ACC_SYNTHETIC,
                 "gaius$vertexFormat",
@@ -2079,13 +3500,18 @@ public final class MinecraftClientPatcher {
         writeComputeFrames(node, output);
     }
 
-    private static void patchGlCommandEncoder(String jar, Path output) throws IOException {
+    private static void patchGlCommandEncoder(String jar, Path outputRoot) throws IOException {
         ClassNode node = read(jar, "com/mojang/blaze3d/opengl/GlCommandEncoder.class");
         String owner = "com/mojang/blaze3d/opengl/GlCommandEncoder";
         String pass = "com/mojang/blaze3d/opengl/GlRenderPass";
         String renderSystem = "com/mojang/blaze3d/systems/RenderSystem";
         String slice = "Lcom/mojang/blaze3d/buffers/GpuBufferSlice;";
         String buffer = "Lcom/mojang/blaze3d/buffers/GpuBuffer;";
+        Path output = outputRoot.resolve(owner + ".class");
+
+        if (findNullable(node, "submit", "()V") != null) {
+            patchCurrentGlCommandEncoderGpuRetire(jar, node, owner, outputRoot);
+        }
 
         MethodNode helper = new MethodNode(
                 Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_SYNTHETIC,
@@ -2135,6 +3561,20 @@ public final class MinecraftClientPatcher {
                 false));
         trySetup.instructions.insert(call);
         trySetup.maxStack = Math.max(trySetup.maxStack, 3);
+
+        String currentDrawDescriptor =
+                "(L" + pass + ";IIILcom/mojang/blaze3d/IndexType;"
+                        + "Lcom/mojang/blaze3d/opengl/GlRenderPipeline;II)V";
+        MethodNode currentDrawFromBuffers = node.methods.stream()
+                .filter(method -> method.name.equals("drawFromBuffers")
+                        && method.desc.equals(currentDrawDescriptor))
+                .findFirst()
+                .orElse(null);
+        if (currentDrawFromBuffers != null) {
+            replaceCurrentGlCommandDraw(currentDrawFromBuffers, owner, pass);
+            writeComputeFrames(node, output);
+            return;
+        }
 
         MethodNode drawFromBuffers = find(
                 node,
@@ -2246,6 +3686,619 @@ public final class MinecraftClientPatcher {
         writeComputeFrames(node, output);
     }
 
+    private static void patchCurrentGlCommandEncoderGpuRetire(
+            String jar, ClassNode node, String owner, Path outputRoot) throws IOException {
+        FieldNode maxSubmits = node.fields.stream()
+                .filter(field -> field.name.equals("MAX_SUBMITS_IN_FLIGHT")
+                        && field.desc.equals("I"))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(
+                        "Current GlCommandEncoder submit limit field was not found"));
+        if (maxSubmits.value != null
+                && (!(maxSubmits.value instanceof Integer value) || value != 2)) {
+            throw new IllegalStateException(
+                    "Current GlCommandEncoder submit limit changed: " + maxSubmits.value);
+        }
+        maxSubmits.value = BROWSER_GPU_RETIRE_SLOTS;
+
+        MethodNode constructor = find(
+                node,
+                "<init>",
+                "(Lcom/mojang/blaze3d/opengl/GlDevice;)V");
+        FieldInsnNode fencesStore = null;
+        for (AbstractInsnNode instruction : constructor.instructions) {
+            if (instruction instanceof FieldInsnNode field
+                    && field.getOpcode() == Opcodes.PUTFIELD
+                    && field.owner.equals(owner)
+                    && field.name.equals("fences")
+                    && field.desc.equals("[J")) {
+                fencesStore = field;
+                break;
+            }
+        }
+        if (fencesStore == null) {
+            throw new IllegalStateException(
+                    "Current GlCommandEncoder fences initialization was not found");
+        }
+        AbstractInsnNode newArray = previousOpcode(fencesStore);
+        AbstractInsnNode oldSize = newArray == null ? null : previousOpcode(newArray);
+        if (newArray == null || newArray.getOpcode() != Opcodes.NEWARRAY
+                || !(newArray instanceof IntInsnNode array)
+                || array.operand != Opcodes.T_LONG
+                || oldSize == null || oldSize.getOpcode() != Opcodes.ICONST_2) {
+            throw new IllegalStateException(
+                    "Current GlCommandEncoder fences array shape changed");
+        }
+        constructor.instructions.set(
+                oldSize, new IntInsnNode(Opcodes.BIPUSH, BROWSER_GPU_RETIRE_SLOTS));
+        FieldInsnNode transientMemoryStore = null;
+        for (AbstractInsnNode instruction : constructor.instructions) {
+            if (instruction instanceof FieldInsnNode field
+                    && field.getOpcode() == Opcodes.PUTFIELD
+                    && field.owner.equals(owner)
+                    && field.name.equals("transientMemory")
+                    && field.desc.equals("Lcom/mojang/blaze3d/opengl/GlTransientMemory;")) {
+                transientMemoryStore = field;
+                break;
+            }
+        }
+        if (transientMemoryStore == null) {
+            throw new IllegalStateException(
+                    "Current GlCommandEncoder transient memory initialization was not found");
+        }
+        constructor.instructions.insertBefore(
+                transientMemoryStore,
+                new TypeInsnNode(
+                        Opcodes.CHECKCAST,
+                        "com/mojang/blaze3d/opengl/GlTransientMemory"));
+
+        MethodNode currentSubmitSlot = find(node, "currentSubmitSlot", "()I");
+        InsnList currentSlotCode = new InsnList();
+        currentSlotCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        currentSlotCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "currentSubmitIndex", "J"));
+        currentSlotCode.add(new LdcInsnNode((long) BROWSER_GPU_RETIRE_SLOTS));
+        currentSlotCode.add(new InsnNode(Opcodes.LREM));
+        currentSlotCode.add(new InsnNode(Opcodes.L2I));
+        currentSlotCode.add(new InsnNode(Opcodes.IRETURN));
+        replace(currentSubmitSlot, currentSlotCode, 4, 1);
+
+        MethodNode backlog = new MethodNode(
+                Opcodes.ACC_PRIVATE,
+                "gaius$retireBacklog",
+                "()I",
+                null,
+                null);
+        backlog.instructions.add(new InsnNode(Opcodes.ICONST_0));
+        backlog.instructions.add(new VarInsnNode(Opcodes.ISTORE, 1));
+        for (int slot = 0; slot < BROWSER_GPU_RETIRE_SLOTS; slot++) {
+            LabelNode empty = new LabelNode();
+            backlog.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            backlog.instructions.add(new FieldInsnNode(
+                    Opcodes.GETFIELD, owner, "fences", "[J"));
+            backlog.instructions.add(new IntInsnNode(Opcodes.BIPUSH, slot));
+            backlog.instructions.add(new InsnNode(Opcodes.LALOAD));
+            backlog.instructions.add(new InsnNode(Opcodes.LCONST_0));
+            backlog.instructions.add(new InsnNode(Opcodes.LCMP));
+            backlog.instructions.add(new JumpInsnNode(Opcodes.IFEQ, empty));
+            backlog.instructions.add(new IincInsnNode(1, 1));
+            backlog.instructions.add(empty);
+        }
+        backlog.instructions.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        backlog.instructions.add(new InsnNode(Opcodes.IRETURN));
+        backlog.maxStack = 4;
+        backlog.maxLocals = 2;
+        node.methods.add(backlog);
+
+        MethodNode poll = new MethodNode(
+                Opcodes.ACC_PRIVATE,
+                "gaius$pollRetireSlot",
+                "(IJ)Z",
+                null,
+                null);
+        LabelNode pollFence = new LabelNode();
+        LabelNode signaled = new LabelNode();
+        LabelNode pending = new LabelNode();
+        poll.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        poll.instructions.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "fences", "[J"));
+        poll.instructions.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        poll.instructions.add(new InsnNode(Opcodes.LALOAD));
+        poll.instructions.add(new VarInsnNode(Opcodes.LSTORE, 4));
+        poll.instructions.add(new VarInsnNode(Opcodes.LLOAD, 4));
+        poll.instructions.add(new InsnNode(Opcodes.LCONST_0));
+        poll.instructions.add(new InsnNode(Opcodes.LCMP));
+        poll.instructions.add(new JumpInsnNode(Opcodes.IFNE, pollFence));
+        poll.instructions.add(new InsnNode(Opcodes.ICONST_1));
+        poll.instructions.add(new InsnNode(Opcodes.IRETURN));
+        poll.instructions.add(pollFence);
+        poll.instructions.add(new VarInsnNode(Opcodes.LLOAD, 4));
+        poll.instructions.add(new InsnNode(Opcodes.ICONST_1));
+        poll.instructions.add(new VarInsnNode(Opcodes.LLOAD, 2));
+        poll.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "com/mojang/blaze3d/opengl/GlStateManager",
+                "_glClientWaitSync",
+                "(JIJ)I",
+                false));
+        poll.instructions.add(new VarInsnNode(Opcodes.ISTORE, 6));
+        poll.instructions.add(new VarInsnNode(Opcodes.ILOAD, 6));
+        poll.instructions.add(new LdcInsnNode(37146));
+        poll.instructions.add(new JumpInsnNode(Opcodes.IF_ICMPEQ, signaled));
+        poll.instructions.add(new VarInsnNode(Opcodes.ILOAD, 6));
+        poll.instructions.add(new LdcInsnNode(37148));
+        poll.instructions.add(new JumpInsnNode(Opcodes.IF_ICMPEQ, signaled));
+        poll.instructions.add(new JumpInsnNode(Opcodes.GOTO, pending));
+        poll.instructions.add(signaled);
+        poll.instructions.add(new VarInsnNode(Opcodes.LLOAD, 4));
+        poll.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/opengl/GL33C",
+                "glDeleteSync",
+                "(J)V",
+                false));
+        poll.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        poll.instructions.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "fences", "[J"));
+        poll.instructions.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        poll.instructions.add(new InsnNode(Opcodes.LCONST_0));
+        poll.instructions.add(new InsnNode(Opcodes.LASTORE));
+        poll.instructions.add(new InsnNode(Opcodes.ICONST_1));
+        poll.instructions.add(new InsnNode(Opcodes.IRETURN));
+        poll.instructions.add(pending);
+        poll.instructions.add(new InsnNode(Opcodes.ICONST_0));
+        poll.instructions.add(new InsnNode(Opcodes.IRETURN));
+        poll.maxStack = 5;
+        poll.maxLocals = 7;
+        node.methods.add(poll);
+
+        MethodNode submit = find(node, "submit", "()V");
+        InsnList submitCode = new InsnList();
+        LabelNode slotAvailable = new LabelNode();
+        LabelNode fenceCreated = new LabelNode();
+        submitCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        submitCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, owner, "gaius$retireBacklog", "()I", false));
+        submitCode.add(new IntInsnNode(Opcodes.BIPUSH, BROWSER_GPU_RETIRE_SLOTS));
+        submitCode.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/opengl/BrowserOpenGL",
+                "beginGpuRetireFrame",
+                "(II)V",
+                false));
+        submitCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        submitCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, owner, "currentSubmitSlot", "()I", false));
+        submitCode.add(new VarInsnNode(Opcodes.ISTORE, 1));
+        submitCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        submitCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "fences", "[J"));
+        submitCode.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        submitCode.add(new InsnNode(Opcodes.LALOAD));
+        submitCode.add(new InsnNode(Opcodes.LCONST_0));
+        submitCode.add(new InsnNode(Opcodes.LCMP));
+        submitCode.add(new JumpInsnNode(Opcodes.IFEQ, slotAvailable));
+        submitCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        submitCode.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        submitCode.add(new InsnNode(Opcodes.LCONST_0));
+        submitCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, owner, "gaius$pollRetireSlot", "(IJ)Z", false));
+        submitCode.add(new JumpInsnNode(Opcodes.IFNE, slotAvailable));
+        addGpuRetireFrameEnd(submitCode, owner, true);
+        submitCode.add(new InsnNode(Opcodes.RETURN));
+        submitCode.add(slotAvailable);
+        submitCode.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/opengl/BrowserOpenGL",
+                "markNextFenceRetireOwned",
+                "()V",
+                false));
+        submitCode.add(new LdcInsnNode(37143));
+        submitCode.add(new InsnNode(Opcodes.ICONST_0));
+        submitCode.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/opengl/GL33C",
+                "glFenceSync",
+                "(II)J",
+                false));
+        submitCode.add(new VarInsnNode(Opcodes.LSTORE, 2));
+        submitCode.add(new VarInsnNode(Opcodes.LLOAD, 2));
+        submitCode.add(new InsnNode(Opcodes.LCONST_0));
+        submitCode.add(new InsnNode(Opcodes.LCMP));
+        submitCode.add(new JumpInsnNode(Opcodes.IFNE, fenceCreated));
+        addGpuRetireFrameEnd(submitCode, owner, true);
+        submitCode.add(new InsnNode(Opcodes.RETURN));
+        submitCode.add(fenceCreated);
+        submitCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        submitCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "fences", "[J"));
+        submitCode.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        submitCode.add(new VarInsnNode(Opcodes.LLOAD, 2));
+        submitCode.add(new InsnNode(Opcodes.LASTORE));
+        submitCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        submitCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                "transientMemory",
+                "Lcom/mojang/blaze3d/opengl/GlTransientMemory;"));
+        submitCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "com/mojang/blaze3d/opengl/GlTransientMemory",
+                "rotate",
+                "()V",
+                false));
+        submitCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        submitCode.add(new InsnNode(Opcodes.DUP));
+        submitCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "currentSubmitIndex", "J"));
+        submitCode.add(new InsnNode(Opcodes.LCONST_1));
+        submitCode.add(new InsnNode(Opcodes.LADD));
+        submitCode.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, "currentSubmitIndex", "J"));
+        addGpuRetireFrameEnd(submitCode, owner, false);
+        submitCode.add(new InsnNode(Opcodes.RETURN));
+        replace(submit, submitCode, 5, 4);
+
+        MethodNode awaitSubmit = find(node, "awaitSubmit", "(JJ)Z");
+        InsnList awaitCode = new InsnList();
+        LabelNode submitted = new LabelNode();
+        LabelNode inRetireWindow = new LabelNode();
+        awaitCode.add(new VarInsnNode(Opcodes.LLOAD, 1));
+        awaitCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        awaitCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "currentSubmitIndex", "J"));
+        awaitCode.add(new InsnNode(Opcodes.LCMP));
+        awaitCode.add(new JumpInsnNode(Opcodes.IFLT, submitted));
+        awaitCode.add(new InsnNode(Opcodes.ICONST_0));
+        awaitCode.add(new InsnNode(Opcodes.IRETURN));
+        awaitCode.add(submitted);
+        awaitCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        awaitCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "currentSubmitIndex", "J"));
+        awaitCode.add(new VarInsnNode(Opcodes.LLOAD, 1));
+        awaitCode.add(new InsnNode(Opcodes.LSUB));
+        awaitCode.add(new LdcInsnNode((long) BROWSER_GPU_RETIRE_SLOTS));
+        awaitCode.add(new InsnNode(Opcodes.LCMP));
+        awaitCode.add(new JumpInsnNode(Opcodes.IFLE, inRetireWindow));
+        awaitCode.add(new InsnNode(Opcodes.ICONST_1));
+        awaitCode.add(new InsnNode(Opcodes.IRETURN));
+        awaitCode.add(inRetireWindow);
+        awaitCode.add(new VarInsnNode(Opcodes.LLOAD, 1));
+        awaitCode.add(new LdcInsnNode((long) BROWSER_GPU_RETIRE_SLOTS));
+        awaitCode.add(new InsnNode(Opcodes.LREM));
+        awaitCode.add(new InsnNode(Opcodes.L2I));
+        awaitCode.add(new VarInsnNode(Opcodes.ISTORE, 5));
+        awaitCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        awaitCode.add(new VarInsnNode(Opcodes.ILOAD, 5));
+        awaitCode.add(new VarInsnNode(Opcodes.LLOAD, 3));
+        awaitCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, owner, "gaius$pollRetireSlot", "(IJ)Z", false));
+        awaitCode.add(new InsnNode(Opcodes.IRETURN));
+        replace(awaitSubmit, awaitCode, 4, 6);
+
+        MethodNode close = find(node, "close", "()V");
+        InsnList closeCode = new InsnList();
+        closeCode.add(new InsnNode(Opcodes.ICONST_1));
+        closeCode.add(new VarInsnNode(Opcodes.ISTORE, 1));
+        for (int slot = 0; slot < BROWSER_GPU_RETIRE_SLOTS; slot++) {
+            LabelNode retired = new LabelNode();
+            closeCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            closeCode.add(new IntInsnNode(Opcodes.BIPUSH, slot));
+            closeCode.add(new InsnNode(Opcodes.LCONST_0));
+            closeCode.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL, owner, "gaius$pollRetireSlot", "(IJ)Z", false));
+            closeCode.add(new JumpInsnNode(Opcodes.IFNE, retired));
+            closeCode.add(new InsnNode(Opcodes.ICONST_0));
+            closeCode.add(new VarInsnNode(Opcodes.ISTORE, 1));
+            closeCode.add(retired);
+        }
+        LabelNode closeDeferred = new LabelNode();
+        LabelNode closeDone = new LabelNode();
+        closeCode.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        closeCode.add(new JumpInsnNode(Opcodes.IFEQ, closeDeferred));
+        closeCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        closeCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                "transientMemory",
+                "Lcom/mojang/blaze3d/opengl/GlTransientMemory;"));
+        closeCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "com/mojang/blaze3d/opengl/GlTransientMemory",
+                "close",
+                "()V",
+                false));
+        closeCode.add(new InsnNode(Opcodes.ICONST_0));
+        closeCode.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/opengl/BrowserOpenGL",
+                "gpuRetireClose",
+                "(I)V",
+                false));
+        closeCode.add(new JumpInsnNode(Opcodes.GOTO, closeDone));
+        closeCode.add(closeDeferred);
+        closeCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        closeCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, owner, "gaius$retireBacklog", "()I", false));
+        closeCode.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/opengl/BrowserOpenGL",
+                "gpuRetireClose",
+                "(I)V",
+                false));
+        closeCode.add(closeDone);
+        closeCode.add(new InsnNode(Opcodes.RETURN));
+        replace(close, closeCode, 4, 2);
+
+        patchCurrentGlTransientMemoryRotations(jar, outputRoot);
+        System.out.println(
+                "Patched current GlCommandEncoder with " + BROWSER_GPU_RETIRE_SLOTS
+                        + "-slot asynchronous GPU retire");
+    }
+
+    private static void addGpuRetireFrameEnd(
+            InsnList code, String owner, boolean backpressure) {
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, owner, "gaius$retireBacklog", "()I", false));
+        code.add(new InsnNode(backpressure ? Opcodes.ICONST_1 : Opcodes.ICONST_0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/opengl/BrowserOpenGL",
+                "endGpuRetireFrame",
+                "(IZ)V",
+                false));
+    }
+
+    private static void patchCurrentGlTransientMemoryRotations(
+            String jar, Path outputRoot) throws IOException {
+        String owner = "com/mojang/blaze3d/opengl/GlTransientMemory$PersistentMapping";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode constructor = find(
+                node,
+                "<init>",
+                "(Lcom/mojang/blaze3d/opengl/GlDevice;"
+                        + "Lcom/mojang/blaze3d/opengl/GlCommandEncoder;)V");
+        FieldInsnNode rotationsStore = null;
+        for (AbstractInsnNode instruction : constructor.instructions) {
+            if (instruction instanceof FieldInsnNode field
+                    && field.getOpcode() == Opcodes.PUTFIELD
+                    && field.owner.equals(owner)
+                    && field.name.equals("rotations")
+                    && field.desc.equals(
+                            "[Lcom/mojang/blaze3d/opengl/"
+                                    + "GlTransientMemory$PersistentMapping$Rotation;")) {
+                rotationsStore = field;
+                break;
+            }
+        }
+        if (rotationsStore == null) {
+            throw new IllegalStateException(
+                    "Current persistent transient rotation array was not found");
+        }
+        AbstractInsnNode newArray = previousOpcode(rotationsStore);
+        AbstractInsnNode oldSize = newArray == null ? null : previousOpcode(newArray);
+        if (newArray == null || newArray.getOpcode() != Opcodes.ANEWARRAY
+                || oldSize == null || oldSize.getOpcode() != Opcodes.ICONST_2) {
+            throw new IllegalStateException(
+                    "Current persistent transient rotation array shape changed");
+        }
+        constructor.instructions.set(
+                oldSize, new IntInsnNode(Opcodes.BIPUSH, BROWSER_GPU_RETIRE_SLOTS));
+        writeComputeFrames(node, outputRoot.resolve(owner + ".class"));
+        patchCurrentGlTransientMemoryFallback(jar, outputRoot);
+    }
+
+    private static void patchCurrentGlTransientMemoryFallback(
+            String jar, Path outputRoot) throws IOException {
+        String owner = "com/mojang/blaze3d/opengl/GlTransientMemory$Fallback";
+        String base = "com/mojang/blaze3d/opengl/GlTransientMemory";
+        String rotationsField = "gaius$retireRotations";
+        ClassNode node = read(jar, owner + ".class");
+        node.fields.add(new FieldNode(
+                Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL,
+                rotationsField,
+                "[Ljava/lang/Runnable;",
+                null,
+                null));
+
+        MethodNode constructor = find(
+                node,
+                "<init>",
+                "(Lcom/mojang/blaze3d/opengl/GlDevice;"
+                        + "Lcom/mojang/blaze3d/opengl/GlCommandEncoder;)V");
+        AbstractInsnNode constructorReturn = null;
+        for (AbstractInsnNode instruction : constructor.instructions) {
+            if (instruction.getOpcode() == Opcodes.RETURN) {
+                constructorReturn = instruction;
+                break;
+            }
+        }
+        if (constructorReturn == null) {
+            throw new IllegalStateException(
+                    "Current fallback transient constructor return was not found");
+        }
+        InsnList initialize = new InsnList();
+        initialize.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        initialize.add(new IntInsnNode(Opcodes.BIPUSH, BROWSER_GPU_RETIRE_SLOTS));
+        initialize.add(new TypeInsnNode(Opcodes.ANEWARRAY, "java/lang/Runnable"));
+        initialize.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, rotationsField, "[Ljava/lang/Runnable;"));
+        constructor.instructions.insertBefore(constructorReturn, initialize);
+
+        MethodNode rotate = find(node, "rotate", "()V");
+        InsnList rotateCode = new InsnList();
+        LabelNode noPrevious = new LabelNode();
+        rotateCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        rotateCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                base,
+                "encoder",
+                "Lcom/mojang/blaze3d/opengl/GlCommandEncoder;"));
+        rotateCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "com/mojang/blaze3d/opengl/GlCommandEncoder",
+                "currentSubmitSlot",
+                "()I",
+                false));
+        rotateCode.add(new VarInsnNode(Opcodes.ISTORE, 1));
+        rotateCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        rotateCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, rotationsField, "[Ljava/lang/Runnable;"));
+        rotateCode.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        rotateCode.add(new InsnNode(Opcodes.AALOAD));
+        rotateCode.add(new VarInsnNode(Opcodes.ASTORE, 2));
+        rotateCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        rotateCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, rotationsField, "[Ljava/lang/Runnable;"));
+        rotateCode.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        rotateCode.add(new InsnNode(Opcodes.ACONST_NULL));
+        rotateCode.add(new InsnNode(Opcodes.AASTORE));
+        rotateCode.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        rotateCode.add(new JumpInsnNode(Opcodes.IFNULL, noPrevious));
+        rotateCode.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        rotateCode.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/lang/Runnable",
+                "run",
+                "()V",
+                true));
+        rotateCode.add(noPrevious);
+        rotateCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        rotateCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, rotationsField, "[Ljava/lang/Runnable;"));
+        rotateCode.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        rotateCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        rotateCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                "blockAllocator",
+                "Lcom/mojang/blaze3d/util/TransientBlockAllocator;"));
+        rotateCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "com/mojang/blaze3d/util/TransientBlockAllocator",
+                "rotate",
+                "()Ljava/lang/Runnable;",
+                false));
+        rotateCode.add(new InsnNode(Opcodes.AASTORE));
+        rotateCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        rotateCode.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL, base, "rotate", "()V", false));
+        rotateCode.add(new InsnNode(Opcodes.RETURN));
+        replace(rotate, rotateCode, 4, 3);
+
+        MethodNode close = find(node, "close", "()V");
+        InsnList closeCode = new InsnList();
+        for (int slot = 0; slot < BROWSER_GPU_RETIRE_SLOTS; slot++) {
+            LabelNode empty = new LabelNode();
+            closeCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            closeCode.add(new FieldInsnNode(
+                    Opcodes.GETFIELD, owner, rotationsField, "[Ljava/lang/Runnable;"));
+            closeCode.add(new IntInsnNode(Opcodes.BIPUSH, slot));
+            closeCode.add(new InsnNode(Opcodes.AALOAD));
+            closeCode.add(new VarInsnNode(Opcodes.ASTORE, 1));
+            closeCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            closeCode.add(new FieldInsnNode(
+                    Opcodes.GETFIELD, owner, rotationsField, "[Ljava/lang/Runnable;"));
+            closeCode.add(new IntInsnNode(Opcodes.BIPUSH, slot));
+            closeCode.add(new InsnNode(Opcodes.ACONST_NULL));
+            closeCode.add(new InsnNode(Opcodes.AASTORE));
+            closeCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+            closeCode.add(new JumpInsnNode(Opcodes.IFNULL, empty));
+            closeCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+            closeCode.add(new MethodInsnNode(
+                    Opcodes.INVOKEINTERFACE,
+                    "java/lang/Runnable",
+                    "run",
+                    "()V",
+                    true));
+            closeCode.add(empty);
+        }
+        closeCode.add(new InsnNode(Opcodes.RETURN));
+        replace(close, closeCode, 4, 2);
+        writeComputeFrames(node, outputRoot.resolve(owner + ".class"));
+    }
+
+    private static void replaceCurrentGlCommandDraw(
+            MethodNode method, String owner, String pass) {
+        method.instructions.clear();
+        method.tryCatchBlocks.clear();
+        if (method.localVariables != null) {
+            method.localVariables.clear();
+        }
+
+        InsnList draw = method.instructions;
+        draw.add(new VarInsnNode(Opcodes.ALOAD, 6));
+        draw.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "com/mojang/blaze3d/opengl/GlRenderPipeline",
+                "gaius$primitiveTopology",
+                "I"));
+        draw.add(new VarInsnNode(Opcodes.ISTORE, 9));
+        draw.add(new InsnNode(Opcodes.ICONST_0));
+        draw.add(new VarInsnNode(Opcodes.ISTORE, 10));
+        draw.add(new InsnNode(Opcodes.ICONST_0));
+        draw.add(new VarInsnNode(Opcodes.ISTORE, 11));
+        draw.add(new InsnNode(Opcodes.ICONST_0));
+        draw.add(new VarInsnNode(Opcodes.ISTORE, 12));
+
+        LabelNode nonIndexed = new LabelNode();
+        draw.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        draw.add(new JumpInsnNode(Opcodes.IFNULL, nonIndexed));
+        draw.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        draw.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                pass,
+                "indexBuffer",
+                "Lcom/mojang/blaze3d/buffers/GpuBuffer;"));
+        draw.add(new TypeInsnNode(
+                Opcodes.CHECKCAST,
+                "com/mojang/blaze3d/opengl/GlBuffer"));
+        draw.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "com/mojang/blaze3d/opengl/GlBuffer",
+                "handle",
+                "()I",
+                false));
+        draw.add(new VarInsnNode(Opcodes.ISTORE, 12));
+        draw.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        draw.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "com/mojang/blaze3d/IndexType",
+                "bytes",
+                "I"));
+        draw.add(new VarInsnNode(Opcodes.ISTORE, 11));
+        draw.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        draw.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "com/mojang/blaze3d/opengl/GlConst",
+                "toGl",
+                "(Lcom/mojang/blaze3d/IndexType;)I",
+                false));
+        draw.add(new VarInsnNode(Opcodes.ISTORE, 10));
+        draw.add(nonIndexed);
+
+        draw.add(new VarInsnNode(Opcodes.ILOAD, 9));
+        draw.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        draw.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        draw.add(new VarInsnNode(Opcodes.ILOAD, 4));
+        draw.add(new VarInsnNode(Opcodes.ILOAD, 10));
+        draw.add(new VarInsnNode(Opcodes.ILOAD, 11));
+        draw.add(new VarInsnNode(Opcodes.ILOAD, 7));
+        draw.add(new VarInsnNode(Opcodes.ILOAD, 12));
+        draw.add(new VarInsnNode(Opcodes.ILOAD, 8));
+        draw.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/opengl/BrowserOpenGL",
+                "drawFromBuffers",
+                "(IIIIIIIII)V",
+                false));
+        draw.add(new InsnNode(Opcodes.RETURN));
+        method.maxStack = 9;
+        method.maxLocals = 13;
+        System.out.println("Patched current GlCommandEncoder draw path for WebGL");
+    }
+
     private static void bindDefaultSlice(
             MethodNode method, String renderSystem, String pass,
             String getter, String uniformName, String sliceDescriptor) {
@@ -2308,14 +4361,30 @@ public final class MinecraftClientPatcher {
         String owner = "com/mojang/blaze3d/audio/Library";
         String poolDescriptor = "Lcom/mojang/blaze3d/audio/Library$ChannelPool;";
         String countingPool = "com/mojang/blaze3d/audio/Library$CountingChannelPool";
+        boolean trackedDevices = node.methods.stream()
+                .anyMatch(method -> method.name.equals("createDeviceTracker")
+                        && method.desc.equals("()Lcom/mojang/blaze3d/audio/DeviceTracker;"));
 
-        MethodNode init = find(node, "init", "(Ljava/lang/String;Z)V");
+        MethodNode init = find(
+                node,
+                "init",
+                trackedDevices
+                        ? "(Ljava/lang/String;Lcom/mojang/blaze3d/audio/DeviceList;Z)V"
+                        : "(Ljava/lang/String;Z)V");
+        int initLocals = init.maxLocals;
         InsnList initCode = new InsnList();
         initCode.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 "org/lwjgl/openal/BrowserOpenAL",
                 "init",
                 "()V",
+                false));
+        initCode.add(new VarInsnNode(Opcodes.ILOAD, trackedDevices ? 3 : 2));
+        initCode.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/openal/BrowserOpenAL",
+                "setDirectionalAudio",
+                "(Z)V",
                 false));
         initCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
         initCode.add(new TypeInsnNode(Opcodes.NEW, countingPool));
@@ -2349,47 +4418,77 @@ public final class MinecraftClientPatcher {
         initCode.add(new InsnNode(Opcodes.LCONST_1));
         initCode.add(new FieldInsnNode(
                 Opcodes.PUTFIELD, owner, "context", "J"));
+        if (trackedDevices) {
+            initCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            initCode.add(new LdcInsnNode("Gaius Browser OpenAL"));
+            initCode.add(new FieldInsnNode(
+                    Opcodes.PUTFIELD, owner, "currentDeviceName", "Ljava/lang/String;"));
+        }
         initCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
         initCode.add(new InsnNode(Opcodes.ICONST_0));
         initCode.add(new FieldInsnNode(
                 Opcodes.PUTFIELD, owner, "supportsDisconnections", "Z"));
         initCode.add(new InsnNode(Opcodes.RETURN));
-        replace(init, initCode, 4, 3);
-
-        MethodNode getDefaultDeviceName = find(
-                node, "getDefaultDeviceName", "()Ljava/lang/String;");
-        InsnList defaultName = new InsnList();
-        defaultName.add(new LdcInsnNode("Gaius Browser OpenAL"));
-        defaultName.add(new InsnNode(Opcodes.ARETURN));
-        replace(getDefaultDeviceName, defaultName, 1, 0);
+        replace(init, initCode, 4, initLocals);
 
         MethodNode getCurrentDeviceName = find(
-                node, "getCurrentDeviceName", "()Ljava/lang/String;");
+                node,
+                trackedDevices ? "currentDeviceName" : "getCurrentDeviceName",
+                "()Ljava/lang/String;");
         InsnList currentName = new InsnList();
         currentName.add(new VarInsnNode(Opcodes.ALOAD, 0));
         currentName.add(new FieldInsnNode(
-                Opcodes.GETFIELD, owner, "defaultDeviceName", "Ljava/lang/String;"));
+                Opcodes.GETFIELD,
+                owner,
+                trackedDevices ? "currentDeviceName" : "defaultDeviceName",
+                "Ljava/lang/String;"));
         currentName.add(new InsnNode(Opcodes.ARETURN));
         replace(getCurrentDeviceName, currentName, 1, 1);
 
-        MethodNode hasDefaultDeviceChanged = find(
-                node, "hasDefaultDeviceChanged", "()Z");
-        InsnList falseResult = new InsnList();
-        falseResult.add(new InsnNode(Opcodes.ICONST_0));
-        falseResult.add(new InsnNode(Opcodes.IRETURN));
-        replace(hasDefaultDeviceChanged, falseResult, 1, 1);
+        if (trackedDevices) {
+            MethodNode createDeviceTracker = find(
+                    node,
+                    "createDeviceTracker",
+                    "()Lcom/mojang/blaze3d/audio/DeviceTracker;");
+            InsnList tracker = new InsnList();
+            tracker.add(new TypeInsnNode(
+                    Opcodes.NEW, "dev/gaius/browser/BrowserDeviceTracker"));
+            tracker.add(new InsnNode(Opcodes.DUP));
+            tracker.add(new MethodInsnNode(
+                    Opcodes.INVOKESPECIAL,
+                    "dev/gaius/browser/BrowserDeviceTracker",
+                    "<init>",
+                    "()V",
+                    false));
+            tracker.add(new InsnNode(Opcodes.ARETURN));
+            replace(createDeviceTracker, tracker, 2, 0);
+        } else {
+            MethodNode getDefaultDeviceName = find(
+                    node, "getDefaultDeviceName", "()Ljava/lang/String;");
+            InsnList defaultName = new InsnList();
+            defaultName.add(new LdcInsnNode("Gaius Browser OpenAL"));
+            defaultName.add(new InsnNode(Opcodes.ARETURN));
+            replace(getDefaultDeviceName, defaultName, 1, 0);
 
-        MethodNode getAvailableSoundDevices = find(
-                node, "getAvailableSoundDevices", "()Ljava/util/List;");
-        InsnList emptyList = new InsnList();
-        emptyList.add(new MethodInsnNode(
-                Opcodes.INVOKESTATIC,
-                "java/util/Collections",
-                "emptyList",
-                "()Ljava/util/List;",
-                false));
-        emptyList.add(new InsnNode(Opcodes.ARETURN));
-        replace(getAvailableSoundDevices, emptyList, 1, 1);
+            MethodNode hasDefaultDeviceChanged = find(
+                    node, "hasDefaultDeviceChanged", "()Z");
+            InsnList falseResult = new InsnList();
+            falseResult.add(new InsnNode(Opcodes.ICONST_0));
+            falseResult.add(new InsnNode(Opcodes.IRETURN));
+            replace(hasDefaultDeviceChanged, falseResult, 1, 1);
+
+            MethodNode getAvailableSoundDevices = find(
+                    node, "getAvailableSoundDevices", "()Ljava/util/List;");
+            InsnList emptyList = new InsnList();
+            emptyList.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "java/util/Collections",
+                    "emptyList",
+                    "()Ljava/util/List;",
+                    false));
+            emptyList.add(new InsnNode(Opcodes.ARETURN));
+            replace(getAvailableSoundDevices, emptyList, 1, 1);
+        }
 
         MethodNode isCurrentDeviceDisconnected = find(
                 node, "isCurrentDeviceDisconnected", "()Z");
@@ -2463,6 +4562,7 @@ public final class MinecraftClientPatcher {
     private static void patchBrowserAudioListener(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "com/mojang/blaze3d/audio/Listener.class");
         String owner = "com/mojang/blaze3d/audio/Listener";
+        String transform = "com/mojang/blaze3d/audio/ListenerTransform";
         MethodNode setTransform = find(
                 node,
                 "setTransform",
@@ -2475,19 +4575,67 @@ public final class MinecraftClientPatcher {
                 owner,
                 "transform",
                 "Lcom/mojang/blaze3d/audio/ListenerTransform;"));
+        code.add(new LdcInsnNode(0x1004));
+        appendListenerVector(code, transform, "position");
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/openal/BrowserOpenAL",
+                "listener3f",
+                "(IFFF)V",
+                false));
+        appendListenerVector(code, transform, "forward");
+        appendListenerVector(code, transform, "up");
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "org/lwjgl/openal/BrowserOpenAL",
+                "listenerOrientation",
+                "(FFFFFF)V",
+                false));
         code.add(new InsnNode(Opcodes.RETURN));
-        replace(setTransform, code, 2, 2);
+        replace(setTransform, code, 7, 2);
         write(node, output);
+    }
+
+    private static void appendListenerVector(
+            InsnList code, String transformOwner, String accessor) {
+        for (String component : new String[] {"x", "y", "z"}) {
+            code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    transformOwner,
+                    accessor,
+                    "()Lnet/minecraft/world/phys/Vec3;",
+                    false));
+            code.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    "net/minecraft/world/phys/Vec3",
+                    component,
+                    "D"));
+            code.add(new InsnNode(Opcodes.D2F));
+        }
     }
 
     private static void patchClientShutdownWatchdog(String jar, Path output) throws IOException {
         ClassNode node = read(
                 jar, "com/mojang/blaze3d/platform/ClientShutdownWatchdog.class");
-        MethodNode start = find(
-                node, "startShutdownWatchdog", "(Ljava/io/File;J)V");
+        MethodNode start = null;
+        for (MethodNode candidate : node.methods) {
+            if (!candidate.name.equals("startShutdownWatchdog")
+                    || Type.getReturnType(candidate.desc).getSort() != Type.VOID) {
+                continue;
+            }
+            if (start != null) {
+                throw new IllegalStateException("Multiple client shutdown watchdog methods found");
+            }
+            start = candidate;
+        }
+        if (start == null) {
+            throw new IllegalStateException("Client shutdown watchdog method was not found");
+        }
+        int maxLocals = start.maxLocals;
         InsnList code = new InsnList();
         code.add(new InsnNode(Opcodes.RETURN));
-        replace(start, code, 0, 3);
+        replace(start, code, 0, maxLocals);
         write(node, output);
     }
 
@@ -2765,75 +4913,107 @@ public final class MinecraftClientPatcher {
         code.add(done);
         code.add(new InsnNode(Opcodes.RETURN));
         replace(method, code, 2, 1);
+        patchGameRendererBrowserFrameBudget(node);
         patchGameRendererBrowserInventoryWorldRenderThrottle(node);
         patchGameRendererBrowserTargetingAfterCamera(node);
         writeComputeFrames(node, output);
     }
 
-    private static void patchGameRendererBrowserTargetingAfterCamera(ClassNode node) {
-        MethodNode method = find(
+    private static void patchGameRendererBrowserFrameBudget(ClassNode node) {
+        MethodNode render = find(
                 node,
-                "renderLevel",
-                "(Lnet/minecraft/client/DeltaTracker;)V");
-        int patched = 0;
-        for (AbstractInsnNode instruction = method.instructions.getFirst();
-                instruction != null;
-                instruction = instruction.getNext()) {
-            if (!(instruction instanceof MethodInsnNode call)
-                    || call.getOpcode() != Opcodes.INVOKEVIRTUAL
-                    || !call.owner.equals("net/minecraft/client/renderer/GameRenderer")
-                    || !call.name.equals("extractCamera")
-                    || !call.desc.equals("(F)V")) {
-                continue;
-            }
+                "render",
+                "(Lnet/minecraft/client/DeltaTracker;Z)V");
+        render.instructions.insert(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserRenderScheduler",
+                "beginFrame",
+                "()V",
+                false));
+        System.out.println("Patched GameRenderer frame-scoped browser upload budget");
+    }
 
-            InsnList stabilize = new InsnList();
-            stabilize.add(new VarInsnNode(Opcodes.ALOAD, 0));
-            stabilize.add(new FieldInsnNode(
-                    Opcodes.GETFIELD,
-                    "net/minecraft/client/renderer/GameRenderer",
-                    "minecraft",
-                    "Lnet/minecraft/client/Minecraft;"));
-            stabilize.add(new InsnNode(Opcodes.DUP));
-            stabilize.add(new FieldInsnNode(
-                    Opcodes.GETFIELD,
-                    "net/minecraft/client/Minecraft",
-                    "hitResult",
-                    "Lnet/minecraft/world/phys/HitResult;"));
-            stabilize.add(new VarInsnNode(Opcodes.ALOAD, 0));
-            stabilize.add(new FieldInsnNode(
-                    Opcodes.GETFIELD,
-                    "net/minecraft/client/renderer/GameRenderer",
-                    "minecraft",
-                    "Lnet/minecraft/client/Minecraft;"));
-            stabilize.add(new VarInsnNode(Opcodes.ALOAD, 0));
-            stabilize.add(new FieldInsnNode(
-                    Opcodes.GETFIELD,
-                    "net/minecraft/client/renderer/GameRenderer",
-                    "mainCamera",
-                    "Lnet/minecraft/client/Camera;"));
-            stabilize.add(new MethodInsnNode(
-                    Opcodes.INVOKESTATIC,
-                    "dev/gaius/browser/BrowserTargeting",
-                    "stabilizeBlockHit",
-                    "(Lnet/minecraft/world/phys/HitResult;"
-                            + "Lnet/minecraft/client/Minecraft;"
-                            + "Lnet/minecraft/client/Camera;)"
-                            + "Lnet/minecraft/world/phys/HitResult;",
-                    false));
-            stabilize.add(new FieldInsnNode(
-                    Opcodes.PUTFIELD,
-                    "net/minecraft/client/Minecraft",
-                    "hitResult",
-                    "Lnet/minecraft/world/phys/HitResult;"));
-            method.instructions.insert(instruction, stabilize);
-            patched++;
-            break;
+    private static void patchGameRendererBrowserTargetingAfterCamera(ClassNode node) {
+        MethodNode method = null;
+        MethodInsnNode cameraExtraction = null;
+        for (MethodNode candidate : node.methods) {
+            for (AbstractInsnNode instruction = candidate.instructions.getFirst();
+                    instruction != null;
+                    instruction = instruction.getNext()) {
+                if (!(instruction instanceof MethodInsnNode call)
+                        || call.getOpcode() != Opcodes.INVOKEVIRTUAL
+                        || !call.owner.equals("net/minecraft/client/renderer/GameRenderer")
+                        || !call.name.equals("extractCamera")
+                        || !(call.desc.equals("(F)V")
+                                || call.desc.equals("(Lnet/minecraft/client/DeltaTracker;FF)V"))) {
+                    continue;
+                }
+                if (cameraExtraction != null) {
+                    throw new IllegalStateException(
+                            "GameRenderer has multiple camera extraction patch points");
+                }
+                method = candidate;
+                cameraExtraction = call;
+            }
         }
-        if (patched != 1) {
+        if (method == null || cameraExtraction == null) {
             throw new IllegalStateException(
                     "GameRenderer post-camera block targeting patch point was not found");
         }
+
+        if (cameraExtraction.desc.equals("(Lnet/minecraft/client/DeltaTracker;FF)V")) {
+            // Current Minecraft already runs GameRenderer.update -> Minecraft.pick ->
+            // GameRenderer.extract once per rendered frame. A second post-camera raycast
+            // duplicates the hottest targeting work and can desynchronize
+            // crosshairPickEntity from hitResult.
+            System.out.println("Verified current vanilla single-raycast block targeting");
+            return;
+        }
+
+        InsnList stabilize = new InsnList();
+        stabilize.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        stabilize.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/GameRenderer",
+                "minecraft",
+                "Lnet/minecraft/client/Minecraft;"));
+        stabilize.add(new InsnNode(Opcodes.DUP));
+        stabilize.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/Minecraft",
+                "hitResult",
+                "Lnet/minecraft/world/phys/HitResult;"));
+        stabilize.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        stabilize.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/GameRenderer",
+                "minecraft",
+                "Lnet/minecraft/client/Minecraft;"));
+        stabilize.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        stabilize.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/GameRenderer",
+                "mainCamera",
+                "Lnet/minecraft/client/Camera;"));
+        stabilize.add(new VarInsnNode(
+                Opcodes.FLOAD,
+                2));
+        stabilize.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserTargeting",
+                "stabilizeBlockHit",
+                "(Lnet/minecraft/world/phys/HitResult;"
+                        + "Lnet/minecraft/client/Minecraft;"
+                        + "Lnet/minecraft/client/Camera;F)"
+                        + "Lnet/minecraft/world/phys/HitResult;",
+                false));
+        stabilize.add(new FieldInsnNode(
+                Opcodes.PUTFIELD,
+                "net/minecraft/client/Minecraft",
+                "hitResult",
+                "Lnet/minecraft/world/phys/HitResult;"));
+        method.instructions.insert(cameraExtraction, stabilize);
+        System.out.println("Patched block targeting after " + method.name + method.desc);
     }
 
     private static void patchGameRendererBrowserInventoryWorldRenderThrottle(ClassNode node) {
@@ -2892,11 +5072,12 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/client/renderer/GameRenderer",
                 "minecraft",
                 "Lnet/minecraft/client/Minecraft;"));
-        throttle.add(new FieldInsnNode(
-                Opcodes.GETFIELD,
+        throttle.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
                 "net/minecraft/client/Minecraft",
-                "screen",
-                "Lnet/minecraft/client/gui/screens/Screen;"));
+                "gaius$getScreen",
+                "()Lnet/minecraft/client/gui/screens/Screen;",
+                false));
         throttle.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 "org/lwjgl/opengl/BrowserOpenGL",
@@ -2925,11 +5106,12 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/client/renderer/GameRenderer",
                 "minecraft",
                 "Lnet/minecraft/client/Minecraft;"));
-        code.add(new FieldInsnNode(
-                Opcodes.GETFIELD,
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
                 "net/minecraft/client/Minecraft",
-                "screen",
-                "Lnet/minecraft/client/gui/screens/Screen;"));
+                "gaius$getScreen",
+                "()Lnet/minecraft/client/gui/screens/Screen;",
+                false));
         code.add(new TypeInsnNode(
                 Opcodes.INSTANCEOF,
                 "net/minecraft/client/gui/screens/LevelLoadingScreen"));
@@ -2965,11 +5147,12 @@ public final class MinecraftClientPatcher {
                 "minecraft",
                 "Lnet/minecraft/client/Minecraft;"));
         code.add(new InsnNode(Opcodes.ACONST_NULL));
-        code.add(new FieldInsnNode(
-                Opcodes.PUTFIELD,
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
                 "net/minecraft/client/Minecraft",
-                "screen",
-                "Lnet/minecraft/client/gui/screens/Screen;"));
+                "gaius$setScreen",
+                "(Lnet/minecraft/client/gui/screens/Screen;)V",
+                false));
         code.add(minecraftEvent("client.levelReady.closeLoadingScreenFromWorldRender"));
         code.add(done);
         return code;
@@ -3032,6 +5215,7 @@ public final class MinecraftClientPatcher {
         LabelNode loop = new LabelNode();
         LabelNode tick = new LabelNode();
         LabelNode alive = new LabelNode();
+        LabelNode remove = new LabelNode();
         LabelNode done = new LabelNode();
 
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
@@ -3107,6 +5291,41 @@ public final class MinecraftClientPatcher {
                 "()Z",
                 false));
         code.add(new JumpInsnNode(Opcodes.IFNE, alive));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/particle/Particle",
+                "getParticleLimit",
+                "()Ljava/util/Optional;",
+                false));
+        code.add(new InsnNode(Opcodes.ACONST_NULL));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/Optional",
+                "orElse",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                false));
+        code.add(new TypeInsnNode(
+                Opcodes.CHECKCAST,
+                "net/minecraft/core/particles/ParticleLimit"));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 3));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        code.add(new JumpInsnNode(Opcodes.IFNULL, remove));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/particle/ParticleGroup",
+                "engine",
+                "Lnet/minecraft/client/particle/ParticleEngine;"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        code.add(new InsnNode(Opcodes.ICONST_M1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/particle/ParticleEngine",
+                "updateCount",
+                "(Lnet/minecraft/core/particles/ParticleLimit;I)V",
+                false));
+        code.add(remove);
         code.add(new VarInsnNode(Opcodes.ALOAD, 1));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEINTERFACE,
@@ -3118,40 +5337,51 @@ public final class MinecraftClientPatcher {
         code.add(new JumpInsnNode(Opcodes.GOTO, loop));
         code.add(done);
         code.add(new InsnNode(Opcodes.RETURN));
-        replace(method, code, 2, 3);
+        replace(method, code, 3, 4);
     }
 
     private static void patchParticleGroupAddNullGuard(ClassNode node) {
-        MethodNode method = find(node, "add",
-                "(Lnet/minecraft/client/particle/Particle;)V");
-        InsnList code = new InsnList();
-        LabelNode done = new LabelNode();
-        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
-        code.add(new JumpInsnNode(Opcodes.IFNULL, done));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new FieldInsnNode(
-                Opcodes.GETFIELD,
-                "net/minecraft/client/particle/ParticleGroup",
-                "particles",
-                "Ljava/util/Queue;"));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKEINTERFACE,
-                "java/util/Queue",
-                "add",
-                "(Ljava/lang/Object;)Z",
-                true));
-        code.add(new InsnNode(Opcodes.POP));
-        code.add(done);
-        code.add(new InsnNode(Opcodes.RETURN));
-        replace(method, code, 2, 2);
+        String voidDescriptor = "(Lnet/minecraft/client/particle/Particle;)V";
+        String booleanDescriptor = "(Lnet/minecraft/client/particle/Particle;)Z";
+        MethodNode method = node.methods.stream()
+                .filter(candidate -> candidate.name.equals("add")
+                        && (candidate.desc.equals(voidDescriptor)
+                                || candidate.desc.equals(booleanDescriptor)))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(
+                        "ParticleGroup.add browser null-guard target was not found"));
+        LabelNode nonNull = new LabelNode();
+        InsnList guard = new InsnList();
+        guard.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        guard.add(new JumpInsnNode(Opcodes.IFNONNULL, nonNull));
+        if (method.desc.equals(booleanDescriptor)) {
+            guard.add(new InsnNode(Opcodes.ICONST_0));
+            guard.add(new InsnNode(Opcodes.IRETURN));
+        } else {
+            guard.add(new InsnNode(Opcodes.RETURN));
+        }
+        guard.add(nonNull);
+        method.instructions.insert(guard);
+        method.maxStack = Math.max(method.maxStack, 1);
     }
 
     private static void patchClientLevelBrowserBlockBreakEffects(String jar, Path output)
             throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/multiplayer/ClientLevel.class");
         patchClientLevelBrowserAnimateTickBudget(node);
+        patchClientLevelBrowserBlockBreakingTelemetry(node);
         write(node, output);
+    }
+
+    private static void patchClientLevelBrowserBlockBreakingTelemetry(ClassNode node) {
+        MethodNode method = find(node, "destroyBlockProgress",
+                "(ILnet/minecraft/core/BlockPos;I)V");
+        InsnList call = new InsnList();
+        call.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        call.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserBlockBreakingTelemetry",
+                "recordDestroyProgress", "(I)V", false));
+        method.instructions.insert(call);
     }
 
     private static void patchClientLevelBrowserAnimateTickBudget(ClassNode node) {
@@ -3179,7 +5409,48 @@ public final class MinecraftClientPatcher {
         patchLevelRendererBrowserPrepareChunkRenders(node);
         patchLevelRendererBrowserSectionCompileThrottle(node);
         patchLevelRendererBrowserBlockOutlineOpacity(node);
+        patchLevelRendererBrowserBlockBreakingTelemetry(node);
         writeComputeFrames(node, output);
+    }
+
+    private static void patchLevelRendererBrowserBlockBreakingTelemetry(ClassNode node) {
+        MethodNode method = node.methods.stream()
+                .filter(candidate -> candidate.name.equals("submitBlockDestroyAnimation")
+                        && candidate.desc.equals("(Lcom/mojang/blaze3d/vertex/PoseStack;"
+                                + "Lnet/minecraft/client/renderer/SubmitNodeCollector;"
+                                + "Lnet/minecraft/client/renderer/state/level/LevelRenderState;)V"))
+                .findFirst()
+                .orElseGet(() -> node.methods.stream()
+                        .filter(candidate -> candidate.name.equals("destroyBlockProgress")
+                                && candidate.desc.equals("(ILnet/minecraft/core/BlockPos;I)V"))
+                        .findFirst()
+                        .orElseThrow(() -> new IllegalStateException(
+                                "LevelRenderer block-breaking render method was not found")));
+        InsnList call = new InsnList();
+        call.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserBlockBreakingTelemetry",
+                "recordSubmitPass", "()V", false));
+        method.instructions.insert(call);
+        int actualSubmits = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode submit
+                    && submit.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && submit.owner.equals("net/minecraft/client/renderer/SubmitNodeCollector")
+                    && submit.name.equals("submitBreakingBlockModel")
+                    && submit.desc.equals("(Lcom/mojang/blaze3d/vertex/PoseStack;"
+                            + "Ljava/util/List;I)V")) {
+                InsnList actual = new InsnList();
+                actual.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                        "dev/gaius/browser/BrowserBlockBreakingTelemetry",
+                        "recordActualSubmit", "()V", false));
+                method.instructions.insertBefore(submit, actual);
+                actualSubmits++;
+            }
+        }
+        if (method.name.equals("submitBlockDestroyAnimation") && actualSubmits != 1) {
+            throw new IllegalStateException(
+                    "LevelRenderer breaking-model submit shape changed: " + actualSubmits);
+        }
     }
 
     private static void patchEntityRenderDispatcherBrowserNullEntityGuard(String jar, Path output)
@@ -3201,11 +5472,14 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchLevelRendererBrowserPrepareChunkRenders(ClassNode node) {
-        MethodNode method = find(
-                node,
-                "prepareChunkRenders",
-                "(Lorg/joml/Matrix4fc;DDD)"
-                        + "Lnet/minecraft/client/renderer/chunk/ChunkSectionsToRender;");
+        String returnType = "Lnet/minecraft/client/renderer/chunk/ChunkSectionsToRender;";
+        MethodNode method = node.methods.stream()
+                .filter(candidate -> candidate.name.equals("prepareChunkRenders")
+                        && (candidate.desc.equals("(Lorg/joml/Matrix4fc;DDD)" + returnType)
+                                || candidate.desc.equals("(Lorg/joml/Matrix4fc;)" + returnType)))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(
+                        "LevelRenderer.prepareChunkRenders browser target was not found"));
         MethodInsnNode millisCall = null;
         MethodInsnNode[] layerValuesCalls = new MethodInsnNode[2];
         int layerValuesCallCount = 0;
@@ -3412,12 +5686,20 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchLevelRendererBrowserBlockOutlineOpacity(ClassNode node) {
-        MethodNode method = find(
-                node,
-                "renderBlockOutline",
-                "(Lnet/minecraft/client/renderer/MultiBufferSource$BufferSource;"
-                        + "Lcom/mojang/blaze3d/vertex/PoseStack;Z"
-                        + "Lnet/minecraft/client/renderer/state/LevelRenderState;)V");
+        MethodNode method = node.methods.stream()
+                .filter(candidate -> (candidate.name.equals("renderBlockOutline")
+                                && candidate.desc.equals(
+                                        "(Lnet/minecraft/client/renderer/MultiBufferSource$BufferSource;"
+                                                + "Lcom/mojang/blaze3d/vertex/PoseStack;Z"
+                                                + "Lnet/minecraft/client/renderer/state/LevelRenderState;)V"))
+                        || (candidate.name.equals("submitBlockOutline")
+                                && candidate.desc.equals(
+                                        "(Lcom/mojang/blaze3d/vertex/PoseStack;"
+                                                + "Lnet/minecraft/client/renderer/SubmitNodeCollector;"
+                                                + "Lnet/minecraft/client/renderer/state/level/LevelRenderState;)V")))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(
+                        "LevelRenderer block outline opacity target was not found"));
         boolean patchedOpacity = false;
         for (var instruction = method.instructions.getFirst();
                 instruction != null;
@@ -3441,10 +5723,18 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchLevelRendererBrowserSectionCompileThrottle(ClassNode node) {
-        MethodNode method = find(
-                node,
-                "compileSections",
-                "(Lnet/minecraft/client/Camera;)V");
+        MethodNode currentMethod = node.methods.stream()
+                .filter(candidate -> candidate.name.equals("compileSections")
+                        && candidate.desc.equals(
+                                "(Lnet/minecraft/client/renderer/state/level/CameraRenderState;)V"))
+                .findFirst()
+                .orElse(null);
+        if (currentMethod != null) {
+            patchCurrentLevelRendererSectionCompileThrottle(currentMethod);
+            return;
+        }
+
+        MethodNode method = find(node, "compileSections", "(Lnet/minecraft/client/Camera;)V");
         boolean disabledSyncCompile = false;
         boolean throttledAsyncSchedule = false;
 
@@ -3503,9 +5793,13 @@ public final class MinecraftClientPatcher {
                         "size",
                         "()I",
                         true));
-                guard.add(new IntInsnNode(Opcodes.BIPUSH, BROWSER_SECTION_SCHEDULE_BUDGET));
-                guard.add(new JumpInsnNode(Opcodes.IF_ICMPLT, allowAdd));
-                guard.add(new JumpInsnNode(Opcodes.GOTO, afterAdd));
+                guard.add(new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "dev/gaius/browser/BrowserRenderScheduler",
+                        "canScheduleSection",
+                        "(I)Z",
+                        false));
+                guard.add(new JumpInsnNode(Opcodes.IFEQ, afterAdd));
                 guard.add(allowAdd);
                 method.instructions.insertBefore(loadList, guard);
                 method.instructions.insert(pop, afterAdd);
@@ -3522,12 +5816,256 @@ public final class MinecraftClientPatcher {
         method.maxStack = Math.max(method.maxStack, 3);
     }
 
+    private static void patchCurrentLevelRendererSectionCompileThrottle(MethodNode method) {
+        MethodInsnNode syncCall = null;
+        MethodInsnNode asyncCall = null;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || !call.owner.equals(
+                            "net/minecraft/client/renderer/chunk/SectionRenderDispatcher$RenderSection")) {
+                continue;
+            }
+            if (call.name.equals("compileSync")
+                    && call.desc.equals(
+                            "(Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;)V")) {
+                syncCall = call;
+            } else if (call.name.equals("compileAsync")
+                    && call.desc.equals(
+                            "(Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;)V")) {
+                asyncCall = call;
+            }
+        }
+        if (syncCall == null || asyncCall == null) {
+            throw new IllegalStateException(
+                    "Current LevelRenderer section compile calls were not found");
+        }
+
+        boolean disabledSyncCompile = false;
+        for (AbstractInsnNode cursor = syncCall;
+                (cursor = previousOpcode(cursor)) != null;) {
+            if (!(cursor instanceof JumpInsnNode jump) || jump.getOpcode() != Opcodes.IFEQ) {
+                continue;
+            }
+            AbstractInsnNode condition = previousOpcode(jump);
+            if (condition instanceof VarInsnNode load && load.getOpcode() == Opcodes.ILOAD) {
+                method.instructions.set(load, new InsnNode(Opcodes.ICONST_0));
+                disabledSyncCompile = true;
+                break;
+            }
+        }
+        if (!disabledSyncCompile) {
+            throw new IllegalStateException(
+                    "Current LevelRenderer synchronous compile branch was not found");
+        }
+
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.owner.equals("dev/gaius/browser/BrowserRenderScheduler")
+                    && call.name.equals("canScheduleSection")) {
+                throw new IllegalStateException(
+                        "Current compileSections must not drop an extracted dirty section");
+            }
+        }
+        System.out.println("Patched current section compiles to remain asynchronous");
+    }
+
+    /**
+     * Applies backpressure before 26.2 clears SectionDirtyState. Skipped sections therefore stay
+     * dirty and are extracted again on the next frame instead of disappearing from the pipeline.
+     */
+    private static void patchCurrentLevelExtractorBrowserSectionCompileThrottle(
+            String jar,
+            Path output) throws IOException {
+        String entry = "net/minecraft/client/renderer/extract/LevelExtractor.class";
+        try (ZipFile input = new ZipFile(jar)) {
+            if (input.getEntry(entry) == null) {
+                return;
+            }
+        }
+
+        ClassNode node = read(jar, entry);
+        MethodNode extract = find(
+                node,
+                "extract",
+                "(Lnet/minecraft/client/DeltaTracker;Lnet/minecraft/client/Camera;F)V");
+        patchCurrentLevelExtractorBlockBreakingTelemetry(node);
+        int patched = 0;
+        for (AbstractInsnNode instruction : extract.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode add)
+                    || add.getOpcode() != Opcodes.INVOKEINTERFACE
+                    || !add.owner.equals("java/util/List")
+                    || !add.name.equals("add")
+                    || !add.desc.equals("(Ljava/lang/Object;)Z")) {
+                continue;
+            }
+            AbstractInsnNode creation = previousOpcode(add);
+            if (!(creation instanceof MethodInsnNode constructor)
+                    || constructor.getOpcode() != Opcodes.INVOKESPECIAL
+                    || !constructor.owner.equals(
+                            "net/minecraft/client/renderer/state/level/SectionUpdateRenderState")
+                    || !constructor.name.equals("<init>")) {
+                continue;
+            }
+            AbstractInsnNode allocation = findPreviousNew(creation, constructor.owner);
+            AbstractInsnNode listFieldInstruction = previousOpcode(allocation);
+            if (!(listFieldInstruction instanceof FieldInsnNode listField)
+                    || listField.getOpcode() != Opcodes.GETFIELD
+                    || !listField.owner.equals(
+                            "net/minecraft/client/renderer/state/level/LevelRenderState")
+                    || !listField.name.equals("sectionUpdateRenderStates")
+                    || !listField.desc.equals("Ljava/util/List;")) {
+                throw new IllegalStateException(
+                        "Current section update list load shape changed");
+            }
+            AbstractInsnNode levelStateFieldInstruction = previousOpcode(listField);
+            AbstractInsnNode thisLoadInstruction = previousOpcode(levelStateFieldInstruction);
+            if (!(levelStateFieldInstruction instanceof FieldInsnNode levelStateField)
+                    || levelStateField.getOpcode() != Opcodes.GETFIELD
+                    || !levelStateField.owner.equals(node.name)
+                    || !levelStateField.name.equals("levelRenderState")
+                    || !(thisLoadInstruction instanceof VarInsnNode thisLoad)
+                    || thisLoad.getOpcode() != Opcodes.ALOAD
+                    || thisLoad.var != 0) {
+                throw new IllegalStateException(
+                        "Current section update list owner load shape changed");
+            }
+
+            AbstractInsnNode setNotDirty = nextOpcode(add);
+            while (setNotDirty != null
+                    && (!(setNotDirty instanceof MethodInsnNode call)
+                            || !call.owner.equals(
+                                    "net/minecraft/client/SectionUpdateTracker$SectionDirtyState")
+                            || !call.name.equals("setNotDirty")
+                            || !call.desc.equals("()V"))) {
+                setNotDirty = nextOpcode(setNotDirty);
+            }
+            if (setNotDirty == null) {
+                throw new IllegalStateException(
+                        "Current section dirty clear after update extraction was not found");
+            }
+
+            LabelNode retryNextFrame = new LabelNode();
+            InsnList guard = new InsnList();
+            guard.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            guard.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    node.name,
+                    "levelRenderState",
+                    "Lnet/minecraft/client/renderer/state/level/LevelRenderState;"));
+            guard.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    "net/minecraft/client/renderer/state/level/LevelRenderState",
+                    "sectionUpdateRenderStates",
+                    "Ljava/util/List;"));
+            guard.add(new MethodInsnNode(
+                    Opcodes.INVOKEINTERFACE,
+                    "java/util/List",
+                    "size",
+                    "()I",
+                    true));
+            guard.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "dev/gaius/browser/BrowserRenderScheduler",
+                    "canScheduleSection",
+                    "(I)Z",
+                    false));
+            guard.add(new JumpInsnNode(Opcodes.IFEQ, retryNextFrame));
+            extract.instructions.insertBefore(thisLoad, guard);
+            extract.instructions.insert(setNotDirty, retryNextFrame);
+            patched++;
+        }
+        if (patched != 1) {
+            throw new IllegalStateException(
+                    "Current section dirty-preserving throttle changed: " + patched);
+        }
+        writeComputeFrames(node, output);
+        System.out.println("Patched current section extraction with dirty-preserving backpressure");
+    }
+
+    private static void patchCurrentLevelExtractorBlockBreakingTelemetry(ClassNode node) {
+        MethodNode method = node.methods.stream()
+                .filter(candidate -> candidate.name.equals("extractBlockDestroyAnimation")
+                        && candidate.desc.equals("(Lnet/minecraft/client/Camera;"
+                                + "Lnet/minecraft/client/renderer/state/level/LevelRenderState;)V"))
+                .findFirst()
+                .orElse(null);
+        if (method == null) {
+            return;
+        }
+        InsnList entry = new InsnList();
+        entry.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserBlockBreakingTelemetry",
+                "recordExtraction", "()V", false));
+        method.instructions.insert(entry);
+
+        int added = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode add)
+                    || add.getOpcode() != Opcodes.INVOKEINTERFACE
+                    || !add.owner.equals("java/util/List")
+                    || !add.name.equals("add")
+                    || !add.desc.equals("(Ljava/lang/Object;)Z")) {
+                continue;
+            }
+            InsnList emitted = new InsnList();
+            emitted.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                    "dev/gaius/browser/BrowserBlockBreakingTelemetry",
+                    "recordEmitted", "()V", false));
+            method.instructions.insertBefore(add, emitted);
+            added++;
+        }
+        if (added != 1) {
+            throw new IllegalStateException(
+                    "Block-breaking extraction list shape changed: " + added);
+        }
+    }
+
+    private static AbstractInsnNode findPreviousNew(
+            AbstractInsnNode instruction,
+            String owner) {
+        for (AbstractInsnNode cursor = previousOpcode(instruction);
+                cursor != null;
+                cursor = previousOpcode(cursor)) {
+            if (cursor instanceof TypeInsnNode type
+                    && type.getOpcode() == Opcodes.NEW
+                    && type.desc.equals(owner)) {
+                return cursor;
+            }
+        }
+        throw new IllegalStateException("Constructor allocation was not found for " + owner);
+    }
+
     private static void patchSectionRenderDispatcherBrowserThrottles(String jar, Path output)
             throws IOException {
         ClassNode node = read(
                 jar,
                 "net/minecraft/client/renderer/chunk/SectionRenderDispatcher.class");
         patchSectionRenderDispatcherBrowserExecutor(node);
+        MethodNode currentUpload = node.methods.stream()
+                .filter(candidate -> candidate.name.equals("uploadTerrainBuffersToGpu")
+                        && candidate.desc.equals("()V"))
+                .findFirst()
+                .orElse(null);
+        if (currentUpload != null) {
+            patchCurrentSectionRenderDispatcherBufferBudgets(node);
+            patchCurrentSectionRenderDispatcherTelemetry(currentUpload);
+            int uploadCalls = 0;
+            for (AbstractInsnNode instruction : currentUpload.instructions) {
+                if (instruction instanceof MethodInsnNode call
+                        && call.owner.equals("com/mojang/blaze3d/vertex/UberGpuBuffer")
+                        && call.name.equals("uploadStagedAllocations")) {
+                    uploadCalls++;
+                }
+            }
+            if (uploadCalls != 2) {
+                throw new IllegalStateException(
+                        "Current terrain upload batching shape changed: " + uploadCalls);
+            }
+            System.out.println(
+                    "Verified current staged terrain uploads behind the browser compile budget");
+            writeComputeFrames(node, output);
+            return;
+        }
         MethodNode method = find(node, "uploadAllPendingUploads", "()V");
         InsnList code = new InsnList();
         LabelNode uploadLoop = new LabelNode();
@@ -3535,6 +6073,13 @@ public final class MinecraftClientPatcher {
         LabelNode closeLoop = new LabelNode();
         LabelNode closeDone = new LabelNode();
 
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserRenderScheduler",
+                "beginUploadPass",
+                "(I)V",
+                false));
         code.add(new InsnNode(Opcodes.ICONST_0));
         code.add(new VarInsnNode(Opcodes.ISTORE, 1));
         code.add(uploadLoop);
@@ -3602,6 +6147,12 @@ public final class MinecraftClientPatcher {
         code.add(new IincInsnNode(3, 1));
         code.add(new JumpInsnNode(Opcodes.GOTO, closeLoop));
         code.add(closeDone);
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserRenderScheduler",
+                "endUploadPass",
+                "()V",
+                false));
         code.add(new InsnNode(Opcodes.RETURN));
 
         replace(method, code, 3, 5);
@@ -3609,6 +6160,93 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchSectionRenderDispatcherBrowserExecutor(ClassNode node) {
+        String currentConstructorDescriptor =
+                "(Lnet/minecraft/TracingExecutor;"
+                        + "Lnet/minecraft/client/renderer/RenderBuffers;"
+                        + "Lnet/minecraft/client/renderer/chunk/SectionCompiler;"
+                        + "Ljava/util/function/Consumer;)V";
+        boolean current = node.methods.stream()
+                .anyMatch(candidate -> candidate.name.equals("<init>")
+                        && candidate.desc.equals(currentConstructorDescriptor));
+        if (current) {
+            MethodNode schedule = find(
+                    node,
+                    "schedule",
+                    "(Lnet/minecraft/client/renderer/chunk/"
+                            + "SectionRenderDispatcher$RenderSection$SectionTask;)V");
+            MethodNode runTask = find(node, "runTask", "()V");
+            MethodInsnNode scheduleCall = findTracingExecutorCall(schedule);
+            MethodInsnNode continuationCall = findTracingExecutorCall(runTask);
+
+            InsnList scheduleContext = new InsnList();
+            scheduleContext.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            scheduleContext.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            scheduleContext.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    node.name,
+                    "getCompileQueueSize",
+                    "()I",
+                    false));
+            schedule.instructions.insertBefore(scheduleCall, scheduleContext);
+            schedule.instructions.set(scheduleCall, new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "dev/gaius/browser/BrowserRenderScheduler",
+                    "scheduleDispatcher",
+                    "(Ljava/util/concurrent/Executor;Ljava/lang/Runnable;Ljava/lang/Object;I)V",
+                    false));
+
+            runTask.instructions.insertBefore(
+                    continuationCall,
+                    new VarInsnNode(Opcodes.ALOAD, 0));
+            runTask.instructions.set(continuationCall, new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "dev/gaius/browser/BrowserRenderScheduler",
+                    "rememberDispatcherContinuation",
+                    "(Ljava/util/concurrent/Executor;Ljava/lang/Runnable;Ljava/lang/Object;)V",
+                    false));
+
+            int finishedReturns = 0;
+            for (AbstractInsnNode instruction : runTask.instructions.toArray()) {
+                if (instruction.getOpcode() != Opcodes.RETURN) {
+                    continue;
+                }
+                InsnList finish = new InsnList();
+                finish.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                finish.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                finish.add(new MethodInsnNode(
+                        Opcodes.INVOKEVIRTUAL,
+                        node.name,
+                        "getCompileQueueSize",
+                        "()I",
+                        false));
+                finish.add(new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "dev/gaius/browser/BrowserRenderScheduler",
+                        "finishDispatcherRun",
+                        "(Ljava/lang/Object;I)V",
+                        false));
+                runTask.instructions.insertBefore(instruction, finish);
+                finishedReturns++;
+            }
+            if (finishedReturns != 3) {
+                throw new IllegalStateException(
+                        "Current section runner return shape changed: " + finishedReturns);
+            }
+
+            MethodNode dispose = find(node, "dispose", "()V");
+            InsnList release = new InsnList();
+            release.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            release.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "dev/gaius/browser/BrowserRenderScheduler",
+                    "disposeDispatcher",
+                    "(Ljava/lang/Object;)V",
+                    false));
+            dispose.instructions.insertBefore(dispose.instructions.getFirst(), release);
+            System.out.println("Patched current section renderer with one lifecycle-owned runner");
+            return;
+        }
+
         MethodNode constructor = find(
                 node,
                 "<init>",
@@ -3664,6 +6302,1879 @@ public final class MinecraftClientPatcher {
         }
     }
 
+    private static MethodInsnNode findTracingExecutorCall(MethodNode method) {
+        MethodInsnNode found = null;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKEVIRTUAL
+                    || !call.owner.equals("net/minecraft/TracingExecutor")
+                    || !call.name.equals("execute")
+                    || !call.desc.equals("(Ljava/lang/Runnable;)V")) {
+                continue;
+            }
+            if (found != null) {
+                throw new IllegalStateException(
+                        method.name + method.desc + " has multiple TracingExecutor calls");
+            }
+            found = call;
+        }
+        if (found == null) {
+            throw new IllegalStateException(
+                    method.name + method.desc + " TracingExecutor call was not found");
+        }
+        return found;
+    }
+
+    private static void patchCurrentSectionTaskQueueBrowserPriorities(String jar, Path output)
+            throws IOException {
+        String entry = "net/minecraft/client/renderer/chunk/SectionTaskDynamicQueue.class";
+        try (ZipFile input = new ZipFile(jar)) {
+            if (input.getEntry(entry) == null) {
+                return;
+            }
+        }
+        ClassNode node = read(jar, entry);
+        MethodNode poll = findNullable(
+                node,
+                "poll",
+                "(Lnet/minecraft/world/phys/Vec3;)"
+                        + "Lnet/minecraft/client/renderer/chunk/"
+                        + "SectionRenderDispatcher$RenderSection$SectionTask;");
+        if (poll == null) {
+            return;
+        }
+        String owner = "net/minecraft/client/renderer/chunk/SectionTaskDynamicQueue";
+        String task = "net/minecraft/client/renderer/chunk/"
+                + "SectionRenderDispatcher$RenderSection$SectionTask";
+        String compileTask = "net/minecraft/client/renderer/chunk/"
+                + "SectionRenderDispatcher$RenderSection$CompileTask";
+        String taskDescriptor = "L" + task + ";";
+        String queueDescriptor = "Ljava/util/ArrayList;";
+        String cameraDescriptor = "Lnet/minecraft/world/phys/Vec3;";
+
+        FieldNode tasks = node.fields.stream()
+                .filter(field -> field.name.equals("tasks")
+                        && field.desc.equals("Ljava/util/List;"))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(
+                        "Current section task list field shape changed"));
+        tasks.desc = queueDescriptor;
+        tasks.signature = "Ljava/util/ArrayList<" + taskDescriptor + ">;";
+        node.fields.add(new FieldNode(
+                Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL,
+                "browserDirtyTasks",
+                queueDescriptor,
+                "Ljava/util/ArrayList<" + taskDescriptor + ">;",
+                null));
+        node.fields.add(new FieldNode(
+                Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL,
+                "browserTaskOrder",
+                "Ljava/util/IdentityHashMap;",
+                "Ljava/util/IdentityHashMap<" + taskDescriptor + "[J>;",
+                null));
+        node.fields.add(new FieldNode(
+                Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL,
+                "browserScratchTasks",
+                "Ljava/util/ArrayList;",
+                "Ljava/util/ArrayList<" + taskDescriptor + ">;",
+                null));
+        node.fields.add(new FieldNode(
+                Opcodes.ACC_PRIVATE, "browserCamera", cameraDescriptor, null, null));
+        node.fields.add(new FieldNode(
+                Opcodes.ACC_PRIVATE, "browserNextOrder", "J", null, null));
+        MethodNode constructor = find(node, "<init>", "()V");
+        InsnList constructorCode = new InsnList();
+        constructorCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        constructorCode.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false));
+        constructorCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        constructorCode.add(new InsnNode(Opcodes.ICONST_2));
+        constructorCode.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, "recompileQuota", "I"));
+        addSectionTaskArrayListInitialization(
+                constructorCode, owner, "tasks", queueDescriptor);
+        addSectionTaskArrayListInitialization(
+                constructorCode, owner, "browserDirtyTasks", queueDescriptor);
+        constructorCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        constructorCode.add(new TypeInsnNode(Opcodes.NEW, "java/util/IdentityHashMap"));
+        constructorCode.add(new InsnNode(Opcodes.DUP));
+        constructorCode.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                "java/util/IdentityHashMap",
+                "<init>",
+                "()V",
+                false));
+        constructorCode.add(new FieldInsnNode(
+                Opcodes.PUTFIELD,
+                owner,
+                "browserTaskOrder",
+                "Ljava/util/IdentityHashMap;"));
+        constructorCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        constructorCode.add(new TypeInsnNode(Opcodes.NEW, "java/util/ArrayList"));
+        constructorCode.add(new InsnNode(Opcodes.DUP));
+        constructorCode.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL, "java/util/ArrayList", "<init>", "()V", false));
+        constructorCode.add(new FieldInsnNode(
+                Opcodes.PUTFIELD,
+                owner,
+                "browserScratchTasks",
+                "Ljava/util/ArrayList;"));
+        constructorCode.add(new InsnNode(Opcodes.RETURN));
+        replace(constructor, constructorCode, 5, 1);
+
+        MethodNode add = find(node, "add", "(" + taskDescriptor + ")V");
+        InsnList addCode = new InsnList();
+        addCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        addCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "browserNextOrder", "J"));
+        addCode.add(new VarInsnNode(Opcodes.LSTORE, 2));
+        addCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        addCode.add(new VarInsnNode(Opcodes.LLOAD, 2));
+        addCode.add(new InsnNode(Opcodes.LCONST_1));
+        addCode.add(new InsnNode(Opcodes.LADD));
+        addCode.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, "browserNextOrder", "J"));
+        addCode.add(new InsnNode(Opcodes.ICONST_5));
+        addCode.add(new IntInsnNode(Opcodes.NEWARRAY, Opcodes.T_LONG));
+        addCode.add(new VarInsnNode(Opcodes.ASTORE, 4));
+        addCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        addCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                task,
+                "getRenderOrigin",
+                "()Lnet/minecraft/core/BlockPos;",
+                false));
+        addCode.add(new VarInsnNode(Opcodes.ASTORE, 5));
+        int coordinateIndex = 0;
+        for (String coordinate : new String[] {"getX", "getY", "getZ"}) {
+            addCode.add(new VarInsnNode(Opcodes.ALOAD, 4));
+            addCode.add(new InsnNode(Opcodes.ICONST_0 + coordinateIndex++));
+            addCode.add(new VarInsnNode(Opcodes.ALOAD, 5));
+            addCode.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    "net/minecraft/core/BlockPos",
+                    coordinate,
+                    "()I",
+                    false));
+            addCode.add(new InsnNode(Opcodes.I2L));
+            addCode.add(new InsnNode(Opcodes.LASTORE));
+        }
+        addCode.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        addCode.add(new InsnNode(Opcodes.ICONST_3));
+        addCode.add(new VarInsnNode(Opcodes.LLOAD, 2));
+        addCode.add(new InsnNode(Opcodes.LASTORE));
+        addCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        addCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                "browserTaskOrder",
+                "Ljava/util/IdentityHashMap;"));
+        addCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        addCode.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        addCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/IdentityHashMap",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                false));
+        addCode.add(new InsnNode(Opcodes.POP));
+        addCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        addCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        addCode.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserUpdateDistance",
+                "(" + taskDescriptor + ")V",
+                false));
+        addCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        addCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        addCode.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                owner,
+                "browserIsDirtyCompile",
+                "(" + taskDescriptor + ")Z",
+                false));
+        LabelNode addRegular = new LabelNode();
+        LabelNode addSelected = new LabelNode();
+        addCode.add(new JumpInsnNode(Opcodes.IFEQ, addRegular));
+        addCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        addCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "browserDirtyTasks", queueDescriptor));
+        addCode.add(new JumpInsnNode(Opcodes.GOTO, addSelected));
+        addCode.add(addRegular);
+        addCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        addCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "tasks", queueDescriptor));
+        addCode.add(addSelected);
+        addCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        addCode.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserHeapAdd",
+                "(" + queueDescriptor + taskDescriptor + ")V",
+                false));
+        addCode.add(new InsnNode(Opcodes.RETURN));
+        replace(add, addCode, 6, 6);
+
+        InsnList pollCode = new InsnList();
+        LabelNode rebuildCamera = new LabelNode();
+        LabelNode heapsReady = new LabelNode();
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        pollCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "browserCamera", cameraDescriptor));
+        pollCode.add(new JumpInsnNode(Opcodes.IFNULL, rebuildCamera));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        pollCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "browserCamera", cameraDescriptor));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        pollCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/world/phys/Vec3",
+                "distanceToSqr",
+                "(Lnet/minecraft/world/phys/Vec3;)D",
+                false));
+        pollCode.add(new VarInsnNode(Opcodes.DSTORE, 2));
+        pollCode.add(new VarInsnNode(Opcodes.DLOAD, 2));
+        pollCode.add(new LdcInsnNode(
+                BROWSER_SECTION_QUEUE_REBUILD_DISTANCE
+                        * BROWSER_SECTION_QUEUE_REBUILD_DISTANCE));
+        pollCode.add(new InsnNode(Opcodes.DCMPG));
+        pollCode.add(new JumpInsnNode(Opcodes.IFGE, rebuildCamera));
+        pollCode.add(new JumpInsnNode(Opcodes.GOTO, heapsReady));
+        pollCode.add(rebuildCamera);
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        pollCode.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, "browserCamera", cameraDescriptor));
+        addSectionTaskQueueHelperCall(
+                pollCode, owner, "tasks", "browserRebuild", "(" + queueDescriptor + ")V");
+        addSectionTaskQueueHelperCall(
+                pollCode,
+                owner,
+                "browserDirtyTasks",
+                "browserRebuild",
+                "(" + queueDescriptor + ")V");
+        pollCode.add(new InsnNode(Opcodes.DCONST_0));
+        pollCode.add(new VarInsnNode(Opcodes.DSTORE, 2));
+        pollCode.add(heapsReady);
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        pollCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "browserDirtyTasks", queueDescriptor));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        pollCode.add(new VarInsnNode(Opcodes.DLOAD, 2));
+        pollCode.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserTakeNearest",
+                "(" + queueDescriptor + cameraDescriptor + "D)" + taskDescriptor,
+                false));
+        pollCode.add(new VarInsnNode(Opcodes.ASTORE, 4));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        pollCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "tasks", queueDescriptor));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        pollCode.add(new VarInsnNode(Opcodes.DLOAD, 2));
+        pollCode.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserTakeNearest",
+                "(" + queueDescriptor + cameraDescriptor + "D)" + taskDescriptor,
+                false));
+        pollCode.add(new VarInsnNode(Opcodes.ASTORE, 5));
+        LabelNode chooseRegular = new LabelNode();
+        LabelNode chooseDirty = new LabelNode();
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        pollCode.add(new JumpInsnNode(Opcodes.IFNULL, chooseRegular));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        pollCode.add(new JumpInsnNode(Opcodes.IFNULL, chooseDirty));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        pollCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "recompileQuota", "I"));
+        pollCode.add(new JumpInsnNode(Opcodes.IFLE, chooseRegular));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        pollCode.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserDistanceFrom",
+                "(" + taskDescriptor + cameraDescriptor + ")D",
+                false));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        pollCode.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserDistanceFrom",
+                "(" + taskDescriptor + cameraDescriptor + ")D",
+                false));
+        pollCode.add(new InsnNode(Opcodes.DCMPG));
+        pollCode.add(new JumpInsnNode(Opcodes.IFLT, chooseDirty));
+        pollCode.add(chooseRegular);
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        pollCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "browserDirtyTasks", queueDescriptor));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        pollCode.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserRequeue",
+                "(" + queueDescriptor + taskDescriptor + ")V",
+                false));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        pollCode.add(new InsnNode(Opcodes.ICONST_2));
+        pollCode.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, "recompileQuota", "I"));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        pollCode.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserFinishTask",
+                "(" + taskDescriptor + ")" + taskDescriptor,
+                false));
+        pollCode.add(new InsnNode(Opcodes.ARETURN));
+        pollCode.add(chooseDirty);
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        pollCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "tasks", queueDescriptor));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        pollCode.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserRequeue",
+                "(" + queueDescriptor + taskDescriptor + ")V",
+                false));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        pollCode.add(new InsnNode(Opcodes.DUP));
+        pollCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "recompileQuota", "I"));
+        pollCode.add(new InsnNode(Opcodes.ICONST_1));
+        pollCode.add(new InsnNode(Opcodes.ISUB));
+        pollCode.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, "recompileQuota", "I"));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        pollCode.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        pollCode.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserFinishTask",
+                "(" + taskDescriptor + ")" + taskDescriptor,
+                false));
+        pollCode.add(new InsnNode(Opcodes.ARETURN));
+        replace(poll, pollCode, 6, 6);
+
+        MethodNode size = find(node, "size", "()I");
+        InsnList sizeCode = new InsnList();
+        sizeCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        sizeCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "tasks", queueDescriptor));
+        sizeCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, "java/util/ArrayList", "size", "()I", false));
+        sizeCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        sizeCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "browserDirtyTasks", queueDescriptor));
+        sizeCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, "java/util/ArrayList", "size", "()I", false));
+        sizeCode.add(new InsnNode(Opcodes.IADD));
+        sizeCode.add(new InsnNode(Opcodes.IRETURN));
+        replace(size, sizeCode, 2, 1);
+
+        MethodNode clear = find(node, "clear", "()V");
+        InsnList clearCode = new InsnList();
+        addSectionTaskQueueHelperCall(
+                clearCode,
+                owner,
+                "tasks",
+                "browserCancelAndClear",
+                "(" + queueDescriptor + ")V");
+        addSectionTaskQueueHelperCall(
+                clearCode,
+                owner,
+                "browserDirtyTasks",
+                "browserCancelAndClear",
+                "(" + queueDescriptor + ")V");
+        clearCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        clearCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                "browserTaskOrder",
+                "Ljava/util/IdentityHashMap;"));
+        clearCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/IdentityHashMap",
+                "clear",
+                "()V",
+                false));
+        clearCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        clearCode.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "browserScratchTasks", "Ljava/util/ArrayList;"));
+        clearCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, "java/util/ArrayList", "clear", "()V", false));
+        clearCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        clearCode.add(new InsnNode(Opcodes.LCONST_0));
+        clearCode.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, "browserNextOrder", "J"));
+        clearCode.add(new InsnNode(Opcodes.RETURN));
+        replace(clear, clearCode, 3, 1);
+
+        MethodNode removeByIndex = find(
+                node, "removeTaskByIndex", "(I)" + taskDescriptor);
+        node.methods.remove(removeByIndex);
+        addSectionTaskQueueHelpers(
+                node, owner, task, compileTask, taskDescriptor, queueDescriptor, cameraDescriptor);
+        writeComputeFrames(node, output);
+        System.out.println(
+                "Patched current section queue with linear-rebuild dirty/regular heaps");
+    }
+
+    private static void addSectionTaskArrayListInitialization(
+            InsnList code, String owner, String field, String queueDescriptor) {
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new TypeInsnNode(Opcodes.NEW, "java/util/ArrayList"));
+        code.add(new InsnNode(Opcodes.DUP));
+        code.add(new IntInsnNode(Opcodes.BIPUSH, 11));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                "java/util/ArrayList",
+                "<init>",
+                "(I)V",
+                false));
+        code.add(new FieldInsnNode(Opcodes.PUTFIELD, owner, field, queueDescriptor));
+    }
+
+    private static void addSectionTaskQueueHelperCall(
+            InsnList code,
+            String owner,
+            String field,
+            String method,
+            String descriptor) {
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, field, "Ljava/util/ArrayList;"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL, owner, method, descriptor, false));
+    }
+
+    private static void addSectionTaskQueueHelpers(
+            ClassNode node,
+            String owner,
+            String task,
+            String compileTask,
+            String taskDescriptor,
+            String queueDescriptor,
+            String cameraDescriptor) {
+        MethodNode dirty = new MethodNode(
+                Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC,
+                "browserIsDirtyCompile",
+                "(" + taskDescriptor + ")Z",
+                null,
+                null);
+        LabelNode notDirty = new LabelNode();
+        dirty.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        dirty.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, task, "isRecompile", "()Z", false));
+        dirty.instructions.add(new JumpInsnNode(Opcodes.IFEQ, notDirty));
+        dirty.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        dirty.instructions.add(new TypeInsnNode(Opcodes.INSTANCEOF, compileTask));
+        dirty.instructions.add(new InsnNode(Opcodes.IRETURN));
+        dirty.instructions.add(notDirty);
+        dirty.instructions.add(new InsnNode(Opcodes.ICONST_0));
+        dirty.instructions.add(new InsnNode(Opcodes.IRETURN));
+        dirty.maxStack = 1;
+        dirty.maxLocals = 1;
+        node.methods.add(dirty);
+
+        MethodNode distance = new MethodNode(
+                Opcodes.ACC_PRIVATE,
+                "browserDistance",
+                "(" + taskDescriptor + ")D",
+                null,
+                null);
+        distance.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        distance.instructions.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                "browserTaskOrder",
+                "Ljava/util/IdentityHashMap;"));
+        distance.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        distance.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/IdentityHashMap",
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                false));
+        distance.instructions.add(new TypeInsnNode(Opcodes.CHECKCAST, "[J"));
+        distance.instructions.add(new InsnNode(Opcodes.ICONST_4));
+        distance.instructions.add(new InsnNode(Opcodes.LALOAD));
+        distance.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "java/lang/Double",
+                "longBitsToDouble",
+                "(J)D",
+                false));
+        distance.instructions.add(new InsnNode(Opcodes.DRETURN));
+        distance.maxStack = 2;
+        distance.maxLocals = 2;
+        node.methods.add(distance);
+
+        MethodNode updateDistance = new MethodNode(
+                Opcodes.ACC_PRIVATE,
+                "browserUpdateDistance",
+                "(" + taskDescriptor + ")V",
+                null,
+                null);
+        updateDistance.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        updateDistance.instructions.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                "browserTaskOrder",
+                "Ljava/util/IdentityHashMap;"));
+        updateDistance.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        updateDistance.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/IdentityHashMap",
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                false));
+        updateDistance.instructions.add(new TypeInsnNode(Opcodes.CHECKCAST, "[J"));
+        updateDistance.instructions.add(new VarInsnNode(Opcodes.ASTORE, 2));
+        updateDistance.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        updateDistance.instructions.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "browserCamera", cameraDescriptor));
+        LabelNode updateHasCamera = new LabelNode();
+        LabelNode updateStore = new LabelNode();
+        updateDistance.instructions.add(new JumpInsnNode(Opcodes.IFNONNULL, updateHasCamera));
+        updateDistance.instructions.add(new InsnNode(Opcodes.DCONST_0));
+        updateDistance.instructions.add(new VarInsnNode(Opcodes.DSTORE, 3));
+        updateDistance.instructions.add(new JumpInsnNode(Opcodes.GOTO, updateStore));
+        updateDistance.instructions.add(updateHasCamera);
+        updateDistance.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        updateDistance.instructions.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "browserCamera", cameraDescriptor));
+        int updateCoordinateIndex = 0;
+        for (int ignored = 0; ignored < 3; ignored++) {
+            updateDistance.instructions.add(new VarInsnNode(Opcodes.ALOAD, 2));
+            updateDistance.instructions.add(new InsnNode(
+                    Opcodes.ICONST_0 + updateCoordinateIndex++));
+            updateDistance.instructions.add(new InsnNode(Opcodes.LALOAD));
+            updateDistance.instructions.add(new InsnNode(Opcodes.L2I));
+            updateDistance.instructions.add(new InsnNode(Opcodes.I2D));
+            updateDistance.instructions.add(new LdcInsnNode(0.5D));
+            updateDistance.instructions.add(new InsnNode(Opcodes.DADD));
+        }
+        updateDistance.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/world/phys/Vec3",
+                "distanceToSqr",
+                "(DDD)D",
+                false));
+        updateDistance.instructions.add(new VarInsnNode(Opcodes.DSTORE, 3));
+        updateDistance.instructions.add(updateStore);
+        updateDistance.instructions.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        updateDistance.instructions.add(new InsnNode(Opcodes.ICONST_4));
+        updateDistance.instructions.add(new VarInsnNode(Opcodes.DLOAD, 3));
+        updateDistance.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "java/lang/Double",
+                "doubleToRawLongBits",
+                "(D)J",
+                false));
+        updateDistance.instructions.add(new InsnNode(Opcodes.LASTORE));
+        updateDistance.instructions.add(new InsnNode(Opcodes.RETURN));
+        updateDistance.maxStack = 9;
+        updateDistance.maxLocals = 5;
+        node.methods.add(updateDistance);
+
+        MethodNode distanceFrom = new MethodNode(
+                Opcodes.ACC_PRIVATE,
+                "browserDistanceFrom",
+                "(" + taskDescriptor + cameraDescriptor + ")D",
+                null,
+                null);
+        distanceFrom.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        distanceFrom.instructions.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                "browserTaskOrder",
+                "Ljava/util/IdentityHashMap;"));
+        distanceFrom.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        distanceFrom.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/IdentityHashMap",
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                false));
+        distanceFrom.instructions.add(new TypeInsnNode(Opcodes.CHECKCAST, "[J"));
+        distanceFrom.instructions.add(new VarInsnNode(Opcodes.ASTORE, 3));
+        distanceFrom.instructions.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        int currentCoordinateIndex = 0;
+        for (int ignored = 0; ignored < 3; ignored++) {
+            distanceFrom.instructions.add(new VarInsnNode(Opcodes.ALOAD, 3));
+            distanceFrom.instructions.add(new InsnNode(
+                    Opcodes.ICONST_0 + currentCoordinateIndex++));
+            distanceFrom.instructions.add(new InsnNode(Opcodes.LALOAD));
+            distanceFrom.instructions.add(new InsnNode(Opcodes.L2I));
+            distanceFrom.instructions.add(new InsnNode(Opcodes.I2D));
+            distanceFrom.instructions.add(new LdcInsnNode(0.5D));
+            distanceFrom.instructions.add(new InsnNode(Opcodes.DADD));
+        }
+        distanceFrom.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/world/phys/Vec3",
+                "distanceToSqr",
+                "(DDD)D",
+                false));
+        distanceFrom.instructions.add(new InsnNode(Opcodes.DRETURN));
+        distanceFrom.maxStack = 9;
+        distanceFrom.maxLocals = 4;
+        node.methods.add(distanceFrom);
+
+        MethodNode order = new MethodNode(
+                Opcodes.ACC_PRIVATE,
+                "browserOrder",
+                "(" + taskDescriptor + ")J",
+                null,
+                null);
+        order.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        order.instructions.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                "browserTaskOrder",
+                "Ljava/util/IdentityHashMap;"));
+        order.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        order.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/IdentityHashMap",
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                false));
+        order.instructions.add(new TypeInsnNode(Opcodes.CHECKCAST, "[J"));
+        order.instructions.add(new InsnNode(Opcodes.ICONST_3));
+        order.instructions.add(new InsnNode(Opcodes.LALOAD));
+        order.instructions.add(new InsnNode(Opcodes.LRETURN));
+        order.maxStack = 2;
+        order.maxLocals = 2;
+        node.methods.add(order);
+
+        MethodNode compare = new MethodNode(
+                Opcodes.ACC_PRIVATE,
+                "browserCompare",
+                "(Ljava/lang/Object;Ljava/lang/Object;)I",
+                null,
+                null);
+        compare.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        compare.instructions.add(new TypeInsnNode(Opcodes.CHECKCAST, task));
+        compare.instructions.add(new VarInsnNode(Opcodes.ASTORE, 3));
+        compare.instructions.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        compare.instructions.add(new TypeInsnNode(Opcodes.CHECKCAST, task));
+        compare.instructions.add(new VarInsnNode(Opcodes.ASTORE, 4));
+        compare.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        compare.instructions.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        compare.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserDistance",
+                "(" + taskDescriptor + ")D",
+                false));
+        compare.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        compare.instructions.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        compare.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserDistance",
+                "(" + taskDescriptor + ")D",
+                false));
+        compare.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC, "java/lang/Double", "compare", "(DD)I", false));
+        compare.instructions.add(new VarInsnNode(Opcodes.ISTORE, 5));
+        LabelNode compareOrder = new LabelNode();
+        compare.instructions.add(new VarInsnNode(Opcodes.ILOAD, 5));
+        compare.instructions.add(new JumpInsnNode(Opcodes.IFEQ, compareOrder));
+        compare.instructions.add(new VarInsnNode(Opcodes.ILOAD, 5));
+        compare.instructions.add(new InsnNode(Opcodes.IRETURN));
+        compare.instructions.add(compareOrder);
+        compare.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        compare.instructions.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        compare.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserOrder",
+                "(" + taskDescriptor + ")J",
+                false));
+        compare.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        compare.instructions.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        compare.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserOrder",
+                "(" + taskDescriptor + ")J",
+                false));
+        compare.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC, "java/lang/Long", "compare", "(JJ)I", false));
+        compare.instructions.add(new InsnNode(Opcodes.IRETURN));
+        compare.maxStack = 5;
+        compare.maxLocals = 6;
+        node.methods.add(compare);
+
+        MethodNode heapAdd = new MethodNode(
+                Opcodes.ACC_PRIVATE,
+                "browserHeapAdd",
+                "(" + queueDescriptor + taskDescriptor + ")V",
+                null,
+                null);
+        heapAdd.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        heapAdd.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, "java/util/ArrayList", "size", "()I", false));
+        heapAdd.instructions.add(new VarInsnNode(Opcodes.ISTORE, 3));
+        heapAdd.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        heapAdd.instructions.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        heapAdd.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/ArrayList",
+                "add",
+                "(Ljava/lang/Object;)Z",
+                false));
+        heapAdd.instructions.add(new InsnNode(Opcodes.POP));
+        heapAdd.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        heapAdd.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        heapAdd.instructions.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        heapAdd.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserSiftUp",
+                "(" + queueDescriptor + "I)V",
+                false));
+        heapAdd.instructions.add(new InsnNode(Opcodes.RETURN));
+        heapAdd.maxStack = 3;
+        heapAdd.maxLocals = 4;
+        node.methods.add(heapAdd);
+
+        MethodNode heapPoll = new MethodNode(
+                Opcodes.ACC_PRIVATE,
+                "browserHeapPoll",
+                "(" + queueDescriptor + ")" + taskDescriptor,
+                null,
+                null);
+        heapPoll.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        heapPoll.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, "java/util/ArrayList", "size", "()I", false));
+        heapPoll.instructions.add(new InsnNode(Opcodes.ICONST_1));
+        heapPoll.instructions.add(new InsnNode(Opcodes.ISUB));
+        heapPoll.instructions.add(new VarInsnNode(Opcodes.ISTORE, 2));
+        LabelNode heapPollEmpty = new LabelNode();
+        LabelNode heapPollDone = new LabelNode();
+        heapPoll.instructions.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        heapPoll.instructions.add(new JumpInsnNode(Opcodes.IFLT, heapPollEmpty));
+        heapPoll.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        heapPoll.instructions.add(new InsnNode(Opcodes.ICONST_0));
+        heapPoll.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/ArrayList",
+                "get",
+                "(I)Ljava/lang/Object;",
+                false));
+        heapPoll.instructions.add(new TypeInsnNode(Opcodes.CHECKCAST, task));
+        heapPoll.instructions.add(new VarInsnNode(Opcodes.ASTORE, 3));
+        heapPoll.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        heapPoll.instructions.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        heapPoll.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/ArrayList",
+                "remove",
+                "(I)Ljava/lang/Object;",
+                false));
+        heapPoll.instructions.add(new TypeInsnNode(Opcodes.CHECKCAST, task));
+        heapPoll.instructions.add(new VarInsnNode(Opcodes.ASTORE, 4));
+        heapPoll.instructions.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        heapPoll.instructions.add(new JumpInsnNode(Opcodes.IFLE, heapPollDone));
+        heapPoll.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        heapPoll.instructions.add(new InsnNode(Opcodes.ICONST_0));
+        heapPoll.instructions.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        heapPoll.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/ArrayList",
+                "set",
+                "(ILjava/lang/Object;)Ljava/lang/Object;",
+                false));
+        heapPoll.instructions.add(new InsnNode(Opcodes.POP));
+        heapPoll.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        heapPoll.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        heapPoll.instructions.add(new InsnNode(Opcodes.ICONST_0));
+        heapPoll.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserSiftDown",
+                "(" + queueDescriptor + "I)V",
+                false));
+        heapPoll.instructions.add(heapPollDone);
+        heapPoll.instructions.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        heapPoll.instructions.add(new InsnNode(Opcodes.ARETURN));
+        heapPoll.instructions.add(heapPollEmpty);
+        heapPoll.instructions.add(new InsnNode(Opcodes.ACONST_NULL));
+        heapPoll.instructions.add(new InsnNode(Opcodes.ARETURN));
+        heapPoll.maxStack = 3;
+        heapPoll.maxLocals = 5;
+        node.methods.add(heapPoll);
+
+        MethodNode siftUp = new MethodNode(
+                Opcodes.ACC_PRIVATE,
+                "browserSiftUp",
+                "(" + queueDescriptor + "I)V",
+                null,
+                null);
+        siftUp.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        siftUp.instructions.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        siftUp.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/ArrayList",
+                "get",
+                "(I)Ljava/lang/Object;",
+                false));
+        siftUp.instructions.add(new TypeInsnNode(Opcodes.CHECKCAST, task));
+        siftUp.instructions.add(new VarInsnNode(Opcodes.ASTORE, 3));
+        LabelNode siftUpLoop = new LabelNode();
+        LabelNode siftUpDone = new LabelNode();
+        siftUp.instructions.add(siftUpLoop);
+        siftUp.instructions.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        siftUp.instructions.add(new JumpInsnNode(Opcodes.IFLE, siftUpDone));
+        siftUp.instructions.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        siftUp.instructions.add(new InsnNode(Opcodes.ICONST_1));
+        siftUp.instructions.add(new InsnNode(Opcodes.ISUB));
+        siftUp.instructions.add(new InsnNode(Opcodes.ICONST_1));
+        siftUp.instructions.add(new InsnNode(Opcodes.IUSHR));
+        siftUp.instructions.add(new VarInsnNode(Opcodes.ISTORE, 4));
+        siftUp.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        siftUp.instructions.add(new VarInsnNode(Opcodes.ILOAD, 4));
+        siftUp.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/ArrayList",
+                "get",
+                "(I)Ljava/lang/Object;",
+                false));
+        siftUp.instructions.add(new TypeInsnNode(Opcodes.CHECKCAST, task));
+        siftUp.instructions.add(new VarInsnNode(Opcodes.ASTORE, 5));
+        siftUp.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        siftUp.instructions.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        siftUp.instructions.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        siftUp.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserCompare",
+                "(Ljava/lang/Object;Ljava/lang/Object;)I",
+                false));
+        siftUp.instructions.add(new JumpInsnNode(Opcodes.IFGE, siftUpDone));
+        siftUp.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        siftUp.instructions.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        siftUp.instructions.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        siftUp.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/ArrayList",
+                "set",
+                "(ILjava/lang/Object;)Ljava/lang/Object;",
+                false));
+        siftUp.instructions.add(new InsnNode(Opcodes.POP));
+        siftUp.instructions.add(new VarInsnNode(Opcodes.ILOAD, 4));
+        siftUp.instructions.add(new VarInsnNode(Opcodes.ISTORE, 2));
+        siftUp.instructions.add(new JumpInsnNode(Opcodes.GOTO, siftUpLoop));
+        siftUp.instructions.add(siftUpDone);
+        siftUp.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        siftUp.instructions.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        siftUp.instructions.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        siftUp.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/ArrayList",
+                "set",
+                "(ILjava/lang/Object;)Ljava/lang/Object;",
+                false));
+        siftUp.instructions.add(new InsnNode(Opcodes.POP));
+        siftUp.instructions.add(new InsnNode(Opcodes.RETURN));
+        siftUp.maxStack = 3;
+        siftUp.maxLocals = 6;
+        node.methods.add(siftUp);
+
+        MethodNode siftDown = new MethodNode(
+                Opcodes.ACC_PRIVATE,
+                "browserSiftDown",
+                "(" + queueDescriptor + "I)V",
+                null,
+                null);
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        siftDown.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, "java/util/ArrayList", "size", "()I", false));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ISTORE, 3));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        siftDown.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/ArrayList",
+                "get",
+                "(I)Ljava/lang/Object;",
+                false));
+        siftDown.instructions.add(new TypeInsnNode(Opcodes.CHECKCAST, task));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ASTORE, 4));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        siftDown.instructions.add(new InsnNode(Opcodes.ICONST_1));
+        siftDown.instructions.add(new InsnNode(Opcodes.IUSHR));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ISTORE, 5));
+        LabelNode siftDownLoop = new LabelNode();
+        LabelNode siftDownDone = new LabelNode();
+        LabelNode siftDownChildReady = new LabelNode();
+        siftDown.instructions.add(siftDownLoop);
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ILOAD, 5));
+        siftDown.instructions.add(new JumpInsnNode(Opcodes.IF_ICMPGE, siftDownDone));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        siftDown.instructions.add(new InsnNode(Opcodes.ICONST_1));
+        siftDown.instructions.add(new InsnNode(Opcodes.ISHL));
+        siftDown.instructions.add(new InsnNode(Opcodes.ICONST_1));
+        siftDown.instructions.add(new InsnNode(Opcodes.IADD));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ISTORE, 6));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ILOAD, 6));
+        siftDown.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/ArrayList",
+                "get",
+                "(I)Ljava/lang/Object;",
+                false));
+        siftDown.instructions.add(new TypeInsnNode(Opcodes.CHECKCAST, task));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ASTORE, 7));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ILOAD, 6));
+        siftDown.instructions.add(new InsnNode(Opcodes.ICONST_1));
+        siftDown.instructions.add(new InsnNode(Opcodes.IADD));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ISTORE, 8));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ILOAD, 8));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        siftDown.instructions.add(new JumpInsnNode(Opcodes.IF_ICMPGE, siftDownChildReady));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ILOAD, 8));
+        siftDown.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/ArrayList",
+                "get",
+                "(I)Ljava/lang/Object;",
+                false));
+        siftDown.instructions.add(new TypeInsnNode(Opcodes.CHECKCAST, task));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ASTORE, 9));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ALOAD, 9));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ALOAD, 7));
+        siftDown.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserCompare",
+                "(Ljava/lang/Object;Ljava/lang/Object;)I",
+                false));
+        siftDown.instructions.add(new JumpInsnNode(Opcodes.IFGE, siftDownChildReady));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ILOAD, 8));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ISTORE, 6));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ALOAD, 9));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ASTORE, 7));
+        siftDown.instructions.add(siftDownChildReady);
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ALOAD, 7));
+        siftDown.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserCompare",
+                "(Ljava/lang/Object;Ljava/lang/Object;)I",
+                false));
+        siftDown.instructions.add(new JumpInsnNode(Opcodes.IFLE, siftDownDone));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ALOAD, 7));
+        siftDown.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/ArrayList",
+                "set",
+                "(ILjava/lang/Object;)Ljava/lang/Object;",
+                false));
+        siftDown.instructions.add(new InsnNode(Opcodes.POP));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ILOAD, 6));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ISTORE, 2));
+        siftDown.instructions.add(new JumpInsnNode(Opcodes.GOTO, siftDownLoop));
+        siftDown.instructions.add(siftDownDone);
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        siftDown.instructions.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        siftDown.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/ArrayList",
+                "set",
+                "(ILjava/lang/Object;)Ljava/lang/Object;",
+                false));
+        siftDown.instructions.add(new InsnNode(Opcodes.POP));
+        siftDown.instructions.add(new InsnNode(Opcodes.RETURN));
+        siftDown.maxStack = 3;
+        siftDown.maxLocals = 10;
+        node.methods.add(siftDown);
+
+        MethodNode rebuild = new MethodNode(
+                Opcodes.ACC_PRIVATE,
+                "browserRebuild",
+                "(" + queueDescriptor + ")V",
+                null,
+                null);
+        rebuild.instructions.add(new InsnNode(Opcodes.ICONST_0));
+        rebuild.instructions.add(new VarInsnNode(Opcodes.ISTORE, 2));
+        LabelNode updateLoop = new LabelNode();
+        LabelNode updateDone = new LabelNode();
+        rebuild.instructions.add(updateLoop);
+        rebuild.instructions.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        rebuild.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        rebuild.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/ArrayList",
+                "size",
+                "()I",
+                false));
+        rebuild.instructions.add(new JumpInsnNode(Opcodes.IF_ICMPGE, updateDone));
+        rebuild.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        rebuild.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        rebuild.instructions.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        rebuild.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/ArrayList",
+                "get",
+                "(I)Ljava/lang/Object;",
+                false));
+        rebuild.instructions.add(new TypeInsnNode(Opcodes.CHECKCAST, task));
+        rebuild.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserUpdateDistance",
+                "(" + taskDescriptor + ")V",
+                false));
+        rebuild.instructions.add(new IincInsnNode(2, 1));
+        rebuild.instructions.add(new JumpInsnNode(Opcodes.GOTO, updateLoop));
+        rebuild.instructions.add(updateDone);
+        rebuild.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        rebuild.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, "java/util/ArrayList", "size", "()I", false));
+        rebuild.instructions.add(new InsnNode(Opcodes.ICONST_1));
+        rebuild.instructions.add(new InsnNode(Opcodes.IUSHR));
+        rebuild.instructions.add(new InsnNode(Opcodes.ICONST_1));
+        rebuild.instructions.add(new InsnNode(Opcodes.ISUB));
+        rebuild.instructions.add(new VarInsnNode(Opcodes.ISTORE, 2));
+        LabelNode heapifyLoop = new LabelNode();
+        LabelNode heapifyDone = new LabelNode();
+        rebuild.instructions.add(heapifyLoop);
+        rebuild.instructions.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        rebuild.instructions.add(new JumpInsnNode(Opcodes.IFLT, heapifyDone));
+        rebuild.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        rebuild.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        rebuild.instructions.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        rebuild.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserSiftDown",
+                "(" + queueDescriptor + "I)V",
+                false));
+        rebuild.instructions.add(new IincInsnNode(2, -1));
+        rebuild.instructions.add(new JumpInsnNode(Opcodes.GOTO, heapifyLoop));
+        rebuild.instructions.add(heapifyDone);
+        rebuild.instructions.add(new InsnNode(Opcodes.RETURN));
+        rebuild.maxStack = 3;
+        rebuild.maxLocals = 3;
+        node.methods.add(rebuild);
+
+        // A squared triangle-inequality bound keeps selection exact without sqrt while the
+        // heap remains ordered around its last camera anchor.
+        MethodNode takeNearest = new MethodNode(
+                Opcodes.ACC_PRIVATE,
+                "browserTakeNearest",
+                "(" + queueDescriptor + cameraDescriptor + "D)" + taskDescriptor,
+                null,
+                null);
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        takeNearest.instructions.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "browserScratchTasks", "Ljava/util/ArrayList;"));
+        takeNearest.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, "java/util/ArrayList", "clear", "()V", false));
+        takeNearest.instructions.add(new InsnNode(Opcodes.ACONST_NULL));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ASTORE, 5));
+        takeNearest.instructions.add(new LdcInsnNode(Double.MAX_VALUE));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.DSTORE, 6));
+        LabelNode takeLoop = new LabelNode();
+        LabelNode takeLive = new LabelNode();
+        LabelNode takeInspect = new LabelNode();
+        LabelNode takeUpdate = new LabelNode();
+        LabelNode takeContinue = new LabelNode();
+        LabelNode takeDone = new LabelNode();
+        takeNearest.instructions.add(takeLoop);
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        takeNearest.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/ArrayList",
+                "isEmpty",
+                "()Z",
+                false));
+        takeNearest.instructions.add(new JumpInsnNode(Opcodes.IFNE, takeDone));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        takeNearest.instructions.add(new InsnNode(Opcodes.ICONST_0));
+        takeNearest.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/ArrayList",
+                "get",
+                "(I)Ljava/lang/Object;",
+                false));
+        takeNearest.instructions.add(new TypeInsnNode(Opcodes.CHECKCAST, task));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ASTORE, 8));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 8));
+        takeNearest.instructions.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                task,
+                "isCancelled",
+                "Ljava/util/concurrent/atomic/AtomicBoolean;"));
+        takeNearest.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/concurrent/atomic/AtomicBoolean",
+                "get",
+                "()Z",
+                false));
+        takeNearest.instructions.add(new JumpInsnNode(Opcodes.IFEQ, takeLive));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        takeNearest.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserHeapPoll",
+                "(" + queueDescriptor + ")" + taskDescriptor,
+                false));
+        takeNearest.instructions.add(new InsnNode(Opcodes.POP));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        takeNearest.instructions.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                "browserTaskOrder",
+                "Ljava/util/IdentityHashMap;"));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 8));
+        takeNearest.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/IdentityHashMap",
+                "remove",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                false));
+        takeNearest.instructions.add(new InsnNode(Opcodes.POP));
+        takeNearest.instructions.add(new JumpInsnNode(Opcodes.GOTO, takeLoop));
+        takeNearest.instructions.add(takeLive);
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 8));
+        takeNearest.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserDistance",
+                "(" + taskDescriptor + ")D",
+                false));
+        takeNearest.instructions.add(new LdcInsnNode(0.5D));
+        takeNearest.instructions.add(new InsnNode(Opcodes.DMUL));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.DLOAD, 3));
+        takeNearest.instructions.add(new InsnNode(Opcodes.DSUB));
+        takeNearest.instructions.add(new LdcInsnNode(BROWSER_SECTION_QUEUE_DISTANCE_EPSILON));
+        takeNearest.instructions.add(new InsnNode(Opcodes.DSUB));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.DSTORE, 9));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        takeNearest.instructions.add(new JumpInsnNode(Opcodes.IFNULL, takeInspect));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.DLOAD, 9));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.DLOAD, 6));
+        takeNearest.instructions.add(new InsnNode(Opcodes.DCMPG));
+        takeNearest.instructions.add(new JumpInsnNode(Opcodes.IFGT, takeDone));
+        takeNearest.instructions.add(takeInspect);
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        takeNearest.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserHeapPoll",
+                "(" + queueDescriptor + ")" + taskDescriptor,
+                false));
+        takeNearest.instructions.add(new InsnNode(Opcodes.POP));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        takeNearest.instructions.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "browserScratchTasks", "Ljava/util/ArrayList;"));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 8));
+        takeNearest.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/ArrayList",
+                "add",
+                "(Ljava/lang/Object;)Z",
+                false));
+        takeNearest.instructions.add(new InsnNode(Opcodes.POP));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 8));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        takeNearest.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserDistanceFrom",
+                "(" + taskDescriptor + cameraDescriptor + ")D",
+                false));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.DSTORE, 11));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.DLOAD, 11));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.DLOAD, 6));
+        takeNearest.instructions.add(new InsnNode(Opcodes.DCMPG));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ISTORE, 13));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ILOAD, 13));
+        takeNearest.instructions.add(new JumpInsnNode(Opcodes.IFLT, takeUpdate));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ILOAD, 13));
+        takeNearest.instructions.add(new JumpInsnNode(Opcodes.IFGT, takeContinue));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 8));
+        takeNearest.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserOrder",
+                "(" + taskDescriptor + ")J",
+                false));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        takeNearest.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserOrder",
+                "(" + taskDescriptor + ")J",
+                false));
+        takeNearest.instructions.add(new InsnNode(Opcodes.LCMP));
+        takeNearest.instructions.add(new JumpInsnNode(Opcodes.IFGE, takeContinue));
+        takeNearest.instructions.add(takeUpdate);
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 8));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ASTORE, 5));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.DLOAD, 11));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.DSTORE, 6));
+        takeNearest.instructions.add(takeContinue);
+        takeNearest.instructions.add(new JumpInsnNode(Opcodes.GOTO, takeLoop));
+        takeNearest.instructions.add(takeDone);
+        takeNearest.instructions.add(new InsnNode(Opcodes.ICONST_0));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ISTORE, 13));
+        LabelNode restoreLoop = new LabelNode();
+        LabelNode restoreDone = new LabelNode();
+        LabelNode skipBest = new LabelNode();
+        takeNearest.instructions.add(restoreLoop);
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ILOAD, 13));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        takeNearest.instructions.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "browserScratchTasks", "Ljava/util/ArrayList;"));
+        takeNearest.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, "java/util/ArrayList", "size", "()I", false));
+        takeNearest.instructions.add(new JumpInsnNode(Opcodes.IF_ICMPGE, restoreDone));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        takeNearest.instructions.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "browserScratchTasks", "Ljava/util/ArrayList;"));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ILOAD, 13));
+        takeNearest.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/ArrayList",
+                "get",
+                "(I)Ljava/lang/Object;",
+                false));
+        takeNearest.instructions.add(new TypeInsnNode(Opcodes.CHECKCAST, task));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ASTORE, 8));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 8));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        takeNearest.instructions.add(new JumpInsnNode(Opcodes.IF_ACMPEQ, skipBest));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 8));
+        takeNearest.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserHeapAdd",
+                "(" + queueDescriptor + taskDescriptor + ")V",
+                false));
+        takeNearest.instructions.add(skipBest);
+        takeNearest.instructions.add(new IincInsnNode(13, 1));
+        takeNearest.instructions.add(new JumpInsnNode(Opcodes.GOTO, restoreLoop));
+        takeNearest.instructions.add(restoreDone);
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        takeNearest.instructions.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "browserScratchTasks", "Ljava/util/ArrayList;"));
+        takeNearest.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, "java/util/ArrayList", "clear", "()V", false));
+        takeNearest.instructions.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        takeNearest.instructions.add(new InsnNode(Opcodes.ARETURN));
+        takeNearest.maxStack = 5;
+        takeNearest.maxLocals = 14;
+        node.methods.add(takeNearest);
+
+        MethodNode requeue = new MethodNode(
+                Opcodes.ACC_PRIVATE,
+                "browserRequeue",
+                "(" + queueDescriptor + taskDescriptor + ")V",
+                null,
+                null);
+        LabelNode requeueDone = new LabelNode();
+        requeue.instructions.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        requeue.instructions.add(new JumpInsnNode(Opcodes.IFNULL, requeueDone));
+        requeue.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        requeue.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        requeue.instructions.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        requeue.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                owner,
+                "browserHeapAdd",
+                "(" + queueDescriptor + taskDescriptor + ")V",
+                false));
+        requeue.instructions.add(requeueDone);
+        requeue.instructions.add(new InsnNode(Opcodes.RETURN));
+        requeue.maxStack = 2;
+        requeue.maxLocals = 3;
+        node.methods.add(requeue);
+
+        MethodNode finishTask = new MethodNode(
+                Opcodes.ACC_PRIVATE,
+                "browserFinishTask",
+                "(" + taskDescriptor + ")" + taskDescriptor,
+                null,
+                null);
+        LabelNode finishDone = new LabelNode();
+        finishTask.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        finishTask.instructions.add(new JumpInsnNode(Opcodes.IFNULL, finishDone));
+        finishTask.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        finishTask.instructions.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                "browserTaskOrder",
+                "Ljava/util/IdentityHashMap;"));
+        finishTask.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        finishTask.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/IdentityHashMap",
+                "remove",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                false));
+        finishTask.instructions.add(new InsnNode(Opcodes.POP));
+        finishTask.instructions.add(finishDone);
+        finishTask.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        finishTask.instructions.add(new InsnNode(Opcodes.ARETURN));
+        finishTask.maxStack = 2;
+        finishTask.maxLocals = 2;
+        node.methods.add(finishTask);
+
+        MethodNode cancelAndClear = new MethodNode(
+                Opcodes.ACC_PRIVATE,
+                "browserCancelAndClear",
+                "(" + queueDescriptor + ")V",
+                null,
+                null);
+        cancelAndClear.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        cancelAndClear.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "java/util/ArrayList",
+                "toArray",
+                "()[Ljava/lang/Object;",
+                false));
+        cancelAndClear.instructions.add(new VarInsnNode(Opcodes.ASTORE, 2));
+        cancelAndClear.instructions.add(new InsnNode(Opcodes.ICONST_0));
+        cancelAndClear.instructions.add(new VarInsnNode(Opcodes.ISTORE, 3));
+        LabelNode cancelLoop = new LabelNode();
+        LabelNode cancelDone = new LabelNode();
+        cancelAndClear.instructions.add(cancelLoop);
+        cancelAndClear.instructions.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        cancelAndClear.instructions.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        cancelAndClear.instructions.add(new InsnNode(Opcodes.ARRAYLENGTH));
+        cancelAndClear.instructions.add(new JumpInsnNode(Opcodes.IF_ICMPGE, cancelDone));
+        cancelAndClear.instructions.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        cancelAndClear.instructions.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        cancelAndClear.instructions.add(new InsnNode(Opcodes.AALOAD));
+        cancelAndClear.instructions.add(new TypeInsnNode(Opcodes.CHECKCAST, task));
+        cancelAndClear.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, task, "cancel", "()V", false));
+        cancelAndClear.instructions.add(new IincInsnNode(3, 1));
+        cancelAndClear.instructions.add(new JumpInsnNode(Opcodes.GOTO, cancelLoop));
+        cancelAndClear.instructions.add(cancelDone);
+        cancelAndClear.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        cancelAndClear.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, "java/util/ArrayList", "clear", "()V", false));
+        cancelAndClear.instructions.add(new InsnNode(Opcodes.RETURN));
+        cancelAndClear.maxStack = 2;
+        cancelAndClear.maxLocals = 4;
+        node.methods.add(cancelAndClear);
+    }
+
+    private static void patchCurrentSectionRenderDispatcherBufferBudgets(ClassNode node) {
+        MethodNode constructor = find(
+                node,
+                "<init>",
+                "(Lnet/minecraft/TracingExecutor;"
+                        + "Lnet/minecraft/client/renderer/RenderBuffers;"
+                        + "Lnet/minecraft/client/renderer/chunk/SectionCompiler;"
+                        + "Ljava/util/function/Consumer;)V");
+        int constructorVertexHeap = 0;
+        int constructorIndexHeap = 0;
+        int staging = 0;
+        for (AbstractInsnNode instruction : constructor.instructions.toArray()) {
+            if (!(instruction instanceof LdcInsnNode constant)
+                    || !(constant.cst instanceof Integer value)) {
+                continue;
+            }
+            if (value == 134217728) {
+                constant.cst = BROWSER_SECTION_VERTEX_HEAP_BYTES;
+                constructorVertexHeap++;
+            } else if (value == 33554432) {
+                constant.cst = BROWSER_SECTION_INDEX_HEAP_BYTES;
+                constructorIndexHeap++;
+            } else if (value == 102760448) {
+                constant.cst = BROWSER_SECTION_STAGING_BYTES;
+                staging++;
+            }
+        }
+        if (constructorVertexHeap != 1 || constructorIndexHeap != 1 || staging != 2) {
+            throw new IllegalStateException(
+                    "Current section renderer constructor budget constants changed: vertex="
+                            + constructorVertexHeap + ", index=" + constructorIndexHeap
+                            + ", staging=" + staging);
+        }
+
+        String uberOwner = "com/mojang/blaze3d/vertex/UberGpuBuffer";
+        String uberConstructorDescriptor =
+                "(Ljava/lang/String;IIILcom/mojang/blaze3d/vertex/StagingBuffer;)V";
+        MethodNode heapFactory = find(
+                node,
+                "lambda$new$0",
+                "(Lnet/minecraft/client/renderer/chunk/ChunkSectionLayer;)"
+                        + "Lnet/minecraft/client/renderer/chunk/"
+                        + "SectionRenderDispatcher$SectionUberBuffers;");
+        int uberConstructors = 0;
+        int vertexHeap = 0;
+        int indexHeap = 0;
+        for (AbstractInsnNode instruction : heapFactory.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKESPECIAL
+                    || !call.owner.equals(uberOwner)
+                    || !call.name.equals("<init>")
+                    || !call.desc.equals(uberConstructorDescriptor)) {
+                continue;
+            }
+            uberConstructors++;
+            AbstractInsnNode allocation = findPreviousNew(call, uberOwner);
+            java.util.List<AbstractInsnNode> shape = new java.util.ArrayList<>();
+            for (AbstractInsnNode cursor = allocation;
+                    cursor != null;
+                    cursor = nextOpcode(cursor)) {
+                shape.add(cursor);
+                if (cursor == call) {
+                    break;
+                }
+            }
+            AbstractInsnNode stagingLoad = previousOpcode(call);
+            AbstractInsnNode dispatcherLoad = stagingLoad == null
+                    ? null : previousOpcode(stagingLoad);
+            if ((shape.size() != 10 && shape.size() != 11)
+                    || shape.get(shape.size() - 1) != call
+                    || !(shape.get(0) instanceof TypeInsnNode allocationType)
+                    || allocationType.getOpcode() != Opcodes.NEW
+                    || !allocationType.desc.equals(uberOwner)
+                    || shape.get(1).getOpcode() != Opcodes.DUP
+                    || !(shape.get(2) instanceof VarInsnNode layerLoad)
+                    || layerLoad.getOpcode() != Opcodes.ALOAD
+                    || layerLoad.var != 1
+                    || !(shape.get(3) instanceof MethodInsnNode labelCall)
+                    || labelCall.getOpcode() != Opcodes.INVOKEVIRTUAL
+                    || !labelCall.owner.equals(
+                            "net/minecraft/client/renderer/chunk/ChunkSectionLayer")
+                    || !labelCall.name.equals("label")
+                    || !labelCall.desc.equals("()Ljava/lang/String;")
+                    || !(shape.get(4) instanceof IntInsnNode usage)
+                    || usage.getOpcode() != Opcodes.BIPUSH
+                    || !(shape.get(5) instanceof LdcInsnNode capacity)
+                    || !(capacity.cst instanceof Integer)
+                    || !(dispatcherLoad instanceof VarInsnNode dispatcherOwnerLoad)
+                    || dispatcherOwnerLoad.getOpcode() != Opcodes.ALOAD
+                    || dispatcherOwnerLoad.var != 0
+                    || !(stagingLoad instanceof FieldInsnNode stagingField)
+                    || stagingField.getOpcode() != Opcodes.GETFIELD
+                    || !stagingField.owner.equals(node.name)
+                    || !stagingField.name.equals("stagingBuffer")
+                    || !stagingField.desc.equals(
+                            "Lcom/mojang/blaze3d/vertex/StagingBuffer;")) {
+                throw new IllegalStateException(
+                        "Current section renderer lambda UberGpuBuffer constructor shape changed");
+            }
+            if (usage.operand == 32
+                    && shape.size() == 11
+                    && Integer.valueOf(134217728).equals(capacity.cst)
+                    && shape.get(6) instanceof VarInsnNode vertexFormatLoad
+                    && vertexFormatLoad.getOpcode() == Opcodes.ALOAD
+                    && vertexFormatLoad.var == 2
+                    && shape.get(7) instanceof MethodInsnNode vertexSizeCall
+                    && vertexSizeCall.getOpcode() == Opcodes.INVOKEVIRTUAL
+                    && vertexSizeCall.owner.equals("com/mojang/blaze3d/vertex/VertexFormat")
+                    && vertexSizeCall.name.equals("getVertexSize")
+                    && vertexSizeCall.desc.equals("()I")) {
+                capacity.cst = BROWSER_SECTION_VERTEX_HEAP_BYTES;
+                vertexHeap++;
+            } else if (usage.operand == 64
+                    && shape.size() == 10
+                    && Integer.valueOf(33554432).equals(capacity.cst)
+                    && shape.get(6) instanceof IntInsnNode indexStride
+                    && indexStride.getOpcode() == Opcodes.BIPUSH
+                    && indexStride.operand == 8
+                    && shape.get(7) == dispatcherLoad) {
+                capacity.cst = BROWSER_SECTION_INDEX_HEAP_BYTES;
+                indexHeap++;
+            } else {
+                throw new IllegalStateException(
+                        "Current section renderer lambda UberGpuBuffer usage changed: "
+                                + usage.operand + "/" + capacity.cst);
+            }
+        }
+        if (uberConstructors != 2 || vertexHeap != 1 || indexHeap != 1) {
+            throw new IllegalStateException(
+                    "Current section renderer lambda heap budgets changed: constructors="
+                            + uberConstructors + ", vertex=" + vertexHeap
+                            + ", index=" + indexHeap);
+        }
+        System.out.println("Reduced current section renderer browser allocation units");
+    }
+
+    private static void patchCurrentSectionRenderDispatcherTelemetry(MethodNode upload) {
+        InsnList begin = new InsnList();
+        begin.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        begin.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/renderer/chunk/SectionRenderDispatcher",
+                "getCompileQueueSize",
+                "()I",
+                false));
+        begin.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserRenderScheduler",
+                "beginUploadPass",
+                "(I)V",
+                false));
+        upload.instructions.insert(begin);
+
+        int returns = 0;
+        int terminalThrows = 0;
+        for (AbstractInsnNode instruction : upload.instructions.toArray()) {
+            int opcode = instruction.getOpcode();
+            if (opcode != Opcodes.RETURN && opcode != Opcodes.ATHROW) {
+                continue;
+            }
+            InsnList end = new InsnList();
+            end.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "dev/gaius/browser/BrowserRenderScheduler",
+                    "endUploadPass",
+                    "()V",
+                    false));
+            upload.instructions.insertBefore(instruction, end);
+            if (opcode == Opcodes.RETURN) {
+                returns++;
+            } else {
+                terminalThrows++;
+            }
+        }
+        if (returns != 1 || terminalThrows != 1) {
+            throw new IllegalStateException(
+                    "Current terrain upload telemetry control flow changed: returns="
+                            + returns + ", throws=" + terminalThrows);
+        }
+        upload.maxStack = Math.max(upload.maxStack, 1);
+        System.out.println("Instrumented current section compile and upload telemetry");
+    }
+
+    private static void patchUberGpuBufferBrowserTelemetry(String jar, Path output)
+            throws IOException {
+        String entry = "com/mojang/blaze3d/vertex/UberGpuBuffer.class";
+        try (ZipFile input = new ZipFile(jar)) {
+            if (input.getEntry(entry) == null) {
+                return;
+            }
+        }
+        ClassNode node = read(jar, entry);
+        patchCurrentUberGpuBufferUploadBudget(node);
+        patchUberGpuBufferBrowserLifecycle(node);
+        MethodNode addAllocation = find(
+                node,
+                "addAllocation",
+                "(Ljava/lang/Object;Lcom/mojang/blaze3d/vertex/"
+                        + "UberGpuBuffer$UploadCallback;Ljava/nio/ByteBuffer;)Z");
+        MethodNode uploadAllocations = find(
+                node,
+                "uploadStagedAllocations",
+                "(Lcom/mojang/blaze3d/systems/GpuDevice;"
+                        + "Lcom/mojang/blaze3d/vertex/StagingBuffer$Uploader;)Z");
+        int addReturns = instrumentUberGpuBufferBacklogReturns(node, addAllocation);
+        int uploadReturns = instrumentUberGpuBufferBacklogReturns(node, uploadAllocations);
+        if (addReturns != 2 || uploadReturns != 1) {
+            throw new IllegalStateException(
+                    "UberGpuBuffer telemetry return shape changed: add="
+                            + addReturns + ", upload=" + uploadReturns);
+        }
+        writeComputeFrames(node, output);
+        System.out.println("Instrumented staged terrain upload backlog telemetry");
+    }
+
+    private static void patchCurrentUberGpuBufferUploadBudget(ClassNode node) {
+        MethodNode upload = find(
+                node,
+                "uploadStagedAllocations",
+                "(Lcom/mojang/blaze3d/systems/GpuDevice;"
+                        + "Lcom/mojang/blaze3d/vertex/StagingBuffer$Uploader;)Z");
+        MethodInsnNode initialFree = null;
+        MethodInsnNode keySet = null;
+        MethodInsnNode entrySet = null;
+        MethodInsnNode stagedClear = null;
+        MethodInsnNode skippedClear = null;
+        for (AbstractInsnNode instruction : upload.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode call)) {
+                continue;
+            }
+            if (call.owner.equals(node.name)
+                    && call.name.equals("freeAllocation")
+                    && call.desc.equals("(Ljava/lang/Object;)V")) {
+                if (initialFree == null) {
+                    initialFree = call;
+                }
+            } else if (call.owner.equals(
+                            "it/unimi/dsi/fastutil/objects/Object2ObjectOpenHashMap")
+                    && call.name.equals("keySet")) {
+                keySet = call;
+            } else if (call.owner.equals(
+                            "it/unimi/dsi/fastutil/objects/Object2ObjectOpenHashMap")
+                    && call.name.equals("entrySet")) {
+                entrySet = call;
+            } else if (call.owner.equals(
+                            "it/unimi/dsi/fastutil/objects/Object2ObjectOpenHashMap")
+                    && call.name.equals("clear")) {
+                stagedClear = call;
+            } else if (call.owner.equals(
+                            "it/unimi/dsi/fastutil/objects/ObjectOpenHashSet")
+                    && call.name.equals("clear")) {
+                skippedClear = call;
+            }
+        }
+        if (initialFree == null || keySet == null || entrySet == null
+                || stagedClear == null || skippedClear == null) {
+            throw new IllegalStateException("Current UberGpuBuffer upload structure changed");
+        }
+
+        JumpInsnNode initialLoopExit = null;
+        for (AbstractInsnNode instruction = keySet;
+                instruction != null && instruction != initialFree;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.name.equals("hasNext")
+                    && call.desc.equals("()Z")
+                    && nextOpcode(call) instanceof JumpInsnNode jump
+                    && jump.getOpcode() == Opcodes.IFEQ) {
+                initialLoopExit = jump;
+                break;
+            }
+        }
+        AbstractInsnNode initialMapLoad = previousOpcode(previousOpcode(keySet));
+        if (initialLoopExit == null
+                || !(initialMapLoad instanceof VarInsnNode load)
+                || load.getOpcode() != Opcodes.ALOAD
+                || load.var != 0) {
+            throw new IllegalStateException("Current UberGpuBuffer initial free loop changed");
+        }
+        upload.instructions.insertBefore(
+                initialMapLoad,
+                new JumpInsnNode(Opcodes.GOTO, initialLoopExit.label));
+
+        VarInsnNode entryIteratorStore = null;
+        MethodInsnNode entryHasNext = null;
+        for (AbstractInsnNode instruction = entrySet.getNext();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (entryIteratorStore == null
+                    && instruction instanceof VarInsnNode store
+                    && store.getOpcode() == Opcodes.ASTORE) {
+                entryIteratorStore = store;
+                continue;
+            }
+            if (entryIteratorStore != null
+                    && instruction instanceof MethodInsnNode call
+                    && call.name.equals("hasNext")
+                    && call.desc.equals("()Z")) {
+                entryHasNext = call;
+                break;
+            }
+        }
+        if (entryIteratorStore == null
+                || entryHasNext == null
+                || !(nextOpcode(entryHasNext) instanceof JumpInsnNode entryLoopExit)
+                || entryLoopExit.getOpcode() != Opcodes.IFEQ) {
+            throw new IllegalStateException("Current UberGpuBuffer staged entry loop changed");
+        }
+
+        LabelNode entryLoop = null;
+        AbstractInsnNode iteratorLoad = previousOpcode(entryHasNext);
+        for (AbstractInsnNode cursor = iteratorLoad.getPrevious(); cursor != null;
+                cursor = cursor.getPrevious()) {
+            if (cursor instanceof LabelNode label) {
+                entryLoop = label;
+                break;
+            }
+            if (cursor.getOpcode() >= 0) {
+                break;
+            }
+        }
+        if (entryLoop == null) {
+            throw new IllegalStateException("Current UberGpuBuffer staged loop label changed");
+        }
+
+        InsnList budgetGuard = new InsnList();
+        budgetGuard.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        budgetGuard.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserRenderScheduler",
+                "shouldUploadNext",
+                "(Ljava/lang/Object;)Z",
+                false));
+        budgetGuard.add(new JumpInsnNode(Opcodes.IFEQ, entryLoopExit.label));
+        upload.instructions.insert(entryLoopExit, budgetGuard);
+
+        VarInsnNode entryStore = null;
+        for (AbstractInsnNode instruction = entryHasNext.getNext();
+                instruction != null && instruction != entryLoopExit.label;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof VarInsnNode store
+                    && store.getOpcode() == Opcodes.ASTORE) {
+                entryStore = store;
+                break;
+            }
+        }
+        if (entryStore == null) {
+            throw new IllegalStateException("Current UberGpuBuffer staged entry local changed");
+        }
+        InsnList freeSelected = new InsnList();
+        freeSelected.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        freeSelected.add(new VarInsnNode(Opcodes.ALOAD, entryStore.var));
+        freeSelected.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Map$Entry",
+                "getKey",
+                "()Ljava/lang/Object;",
+                true));
+        freeSelected.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                node.name,
+                "freeAllocation",
+                "(Ljava/lang/Object;)V",
+                false));
+        upload.instructions.insert(entryStore, freeSelected);
+
+        LabelNode processedEntry = new LabelNode();
+        InsnList removeProcessed = new InsnList();
+        removeProcessed.add(processedEntry);
+        removeProcessed.add(new VarInsnNode(Opcodes.ALOAD, entryIteratorStore.var));
+        removeProcessed.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/Iterator",
+                "remove",
+                "()V",
+                true));
+        removeProcessed.add(new JumpInsnNode(Opcodes.GOTO, entryLoop));
+        upload.instructions.insertBefore(entryLoopExit.label, removeProcessed);
+
+        int redirectedCompletions = 0;
+        for (AbstractInsnNode instruction : upload.instructions.toArray()) {
+            if (instruction instanceof JumpInsnNode jump
+                    && jump.label == entryLoop
+                    && upload.instructions.indexOf(jump) > upload.instructions.indexOf(entryStore)
+                    && upload.instructions.indexOf(jump) < upload.instructions.indexOf(processedEntry)) {
+                jump.label = processedEntry;
+                redirectedCompletions++;
+            }
+        }
+        if (redirectedCompletions != 5) {
+            throw new IllegalStateException(
+                    "Current UberGpuBuffer staged completion shape changed: "
+                            + redirectedCompletions);
+        }
+
+        AbstractInsnNode stagedClearReceiver = previousOpcode(previousOpcode(stagedClear));
+        if (!(stagedClearReceiver instanceof VarInsnNode clearReceiverLoad)
+                || clearReceiverLoad.getOpcode() != Opcodes.ALOAD
+                || clearReceiverLoad.var != 0) {
+            throw new IllegalStateException("Current UberGpuBuffer staged clear receiver changed");
+        }
+        InsnList preservePending = new InsnList();
+        preservePending.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        preservePending.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        preservePending.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                node.name,
+                "stagedAllocations",
+                "Lit/unimi/dsi/fastutil/objects/Object2ObjectOpenHashMap;"));
+        preservePending.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        preservePending.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                node.name,
+                "skippedStagedAllocations",
+                "Lit/unimi/dsi/fastutil/objects/ObjectOpenHashSet;"));
+        preservePending.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserRenderScheduler",
+                "finishUploadBuffer",
+                "(Ljava/lang/Object;Ljava/util/Map;Ljava/util/Set;)V",
+                false));
+        upload.instructions.insertBefore(stagedClearReceiver, preservePending);
+        upload.instructions.set(stagedClear, new InsnNode(Opcodes.POP));
+        upload.instructions.set(skippedClear, new InsnNode(Opcodes.POP));
+        upload.maxStack = Math.max(upload.maxStack, 4);
+        System.out.println("Patched current staged terrain uploads with a resumable frame budget");
+    }
+
+    private static void patchUberGpuBufferBrowserLifecycle(ClassNode node) {
+        MethodNode close = find(node, "close", "()V");
+        InsnList release = new InsnList();
+        release.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        release.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserRenderScheduler",
+                "releaseUploadBuffer",
+                "(Ljava/lang/Object;)V",
+                false));
+        close.instructions.insertBefore(close.instructions.getFirst(), release);
+    }
+
+    private static int instrumentUberGpuBufferBacklogReturns(
+            ClassNode owner,
+            MethodNode method) {
+        int patched = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction.getOpcode() != Opcodes.IRETURN) {
+                continue;
+            }
+            InsnList telemetry = new InsnList();
+            telemetry.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            telemetry.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            telemetry.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    owner.name,
+                    "stagedAllocations",
+                    "Lit/unimi/dsi/fastutil/objects/Object2ObjectOpenHashMap;"));
+            telemetry.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    "it/unimi/dsi/fastutil/objects/Object2ObjectOpenHashMap",
+                    "size",
+                    "()I",
+                    false));
+            telemetry.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "dev/gaius/browser/BrowserRenderScheduler",
+                    "recordUploadBacklogResult",
+                    "(ZLjava/lang/Object;I)Z",
+                    false));
+            method.instructions.insertBefore(instruction, telemetry);
+            patched++;
+        }
+        method.maxStack = Math.max(method.maxStack, 3);
+        return patched;
+    }
+
     private static MethodInsnNode deferBrowserRenderExecutor() {
         return new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
@@ -3677,10 +8188,37 @@ public final class MinecraftClientPatcher {
         ClassNode node = read(jar,
                 "net/minecraft/client/gui/screens/multiplayer/"
                         + "ServerSelectionList$OnlineServerEntry.class");
-        MethodNode render = node.methods.stream()
-                .filter(method -> method.name.equals("renderContent"))
-                .findFirst()
-                .orElseThrow();
+        MethodNode render = null;
+        for (MethodNode candidate : node.methods) {
+            boolean hasThreadPool = false;
+            boolean hasSubmit = false;
+            for (AbstractInsnNode instruction : candidate.instructions.toArray()) {
+                if (instruction instanceof FieldInsnNode field
+                        && field.getOpcode() == Opcodes.GETSTATIC
+                        && field.owner.equals(
+                                "net/minecraft/client/gui/screens/multiplayer/ServerSelectionList")
+                        && field.name.equals("THREAD_POOL")) {
+                    hasThreadPool = true;
+                } else if (instruction instanceof MethodInsnNode call
+                        && call.owner.equals("java/util/concurrent/ThreadPoolExecutor")
+                        && call.name.equals("submit")
+                        && call.desc.equals(
+                                "(Ljava/lang/Runnable;)Ljava/util/concurrent/Future;")) {
+                    hasSubmit = true;
+                }
+            }
+            if (!hasThreadPool || !hasSubmit) {
+                continue;
+            }
+            if (render != null) {
+                throw new IllegalStateException(
+                        "Multiple multiplayer server ping executor methods were found");
+            }
+            render = candidate;
+        }
+        if (render == null) {
+            throw new IllegalStateException("Multiplayer server ping executor method was not found");
+        }
         boolean fieldRemoved = false;
         boolean submitReplaced = false;
         for (var instruction = render.instructions.getFirst();
@@ -3807,13 +8345,14 @@ public final class MinecraftClientPatcher {
         write(node, output);
     }
 
-    private static void patchDetectedVersion(String jar, Path output) throws IOException {
+    private static void patchDetectedVersion(String jar, Path output, String minecraftVersion)
+            throws IOException {
         ClassNode node = read(jar, "net/minecraft/DetectedVersion.class");
         MethodNode detect = find(
                 node, "tryDetectVersion", "()Lnet/minecraft/WorldVersion;");
         InsnList code = new InsnList();
-        code.add(new LdcInsnNode("1.21.11"));
-        code.add(new LdcInsnNode("1.21.11"));
+        code.add(new LdcInsnNode(minecraftVersion));
+        code.add(new LdcInsnNode(minecraftVersion));
         code.add(new InsnNode(Opcodes.ICONST_1));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
@@ -3991,6 +8530,11 @@ public final class MinecraftClientPatcher {
         }
 
         boolean bootstrapCheckpointPatched = false;
+        boolean bootstrapValidatedPatched = false;
+        boolean settingsCheckpointPatched = false;
+        boolean packRepositoryCheckpointPatched = false;
+        boolean worldLoadConfigCheckpointPatched = false;
+        boolean worldLoadStartedPatched = false;
         boolean datapackCheckpointPatched = false;
         for (AbstractInsnNode instruction = main.instructions.getFirst();
                 instruction != null;
@@ -4013,6 +8557,62 @@ public final class MinecraftClientPatcher {
                         false));
                 main.instructions.insert(call, checkpoint);
                 bootstrapCheckpointPatched = true;
+                continue;
+            }
+            if (!bootstrapValidatedPatched
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("net/minecraft/server/Bootstrap")
+                    && call.name.equals("validate")
+                    && call.desc.equals("()V")) {
+                main.instructions.insert(call, serverStartupPhase("bootstrap-validated"));
+                bootstrapValidatedPatched = true;
+                continue;
+            }
+            if (!settingsCheckpointPatched
+                    && call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                    && call.owner.equals("net/minecraft/server/dedicated/DedicatedServerSettings")
+                    && call.name.equals("forceSave")
+                    && call.desc.equals("()V")) {
+                main.instructions.insert(call, serverStartupPhase("server-settings-ready"));
+                settingsCheckpointPatched = true;
+                continue;
+            }
+            if (!packRepositoryCheckpointPatched
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("net/minecraft/server/packs/repository/ServerPacksSource")
+                    && call.name.equals("createPackRepository")) {
+                AbstractInsnNode store = nextOpcode(call);
+                if (!(store instanceof VarInsnNode variable)
+                        || variable.getOpcode() != Opcodes.ASTORE) {
+                    throw new IllegalStateException(
+                            "Server pack repository checkpoint shape changed");
+                }
+                main.instructions.insert(store, serverStartupPhase("server-pack-repository-ready"));
+                packRepositoryCheckpointPatched = true;
+                continue;
+            }
+            if (!worldLoadConfigCheckpointPatched
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals(owner)
+                    && call.name.equals("loadOrCreateConfig")) {
+                AbstractInsnNode store = nextOpcode(call);
+                if (!(store instanceof VarInsnNode variable)
+                        || variable.getOpcode() != Opcodes.ASTORE) {
+                    throw new IllegalStateException(
+                            "Server world load config checkpoint shape changed");
+                }
+                main.instructions.insert(store, serverStartupPhase("server-world-load-config-ready"));
+                worldLoadConfigCheckpointPatched = true;
+                continue;
+            }
+            if (!worldLoadStartedPatched
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("net/minecraft/util/Util")
+                    && call.name.equals("blockUntilDone")
+                    && call.desc.equals("(Ljava/util/function/Function;)"
+                            + "Ljava/util/concurrent/CompletableFuture;")) {
+                main.instructions.insertBefore(call, serverStartupPhase("server-world-load-started"));
+                worldLoadStartedPatched = true;
                 continue;
             }
             if (!datapackCheckpointPatched
@@ -4041,11 +8641,20 @@ public final class MinecraftClientPatcher {
                 datapackCheckpointPatched = true;
             }
         }
-        if (!bootstrapCheckpointPatched || !datapackCheckpointPatched) {
+        if (!bootstrapCheckpointPatched
+                || !bootstrapValidatedPatched
+                || !settingsCheckpointPatched
+                || !packRepositoryCheckpointPatched
+                || !worldLoadConfigCheckpointPatched
+                || !worldLoadStartedPatched
+                || !datapackCheckpointPatched) {
             throw new IllegalStateException("Server startup checkpoints were not found");
         }
+        main.maxStack = Math.max(main.maxStack, 8);
 
-        String factoryDescriptor = "(Lnet/minecraft/world/level/storage/LevelStorageSource$LevelStorageAccess;"
+        patchServerWorldLoaderCooperativeExecutor(node);
+
+        String legacyFactoryDescriptor = "(Lnet/minecraft/world/level/storage/LevelStorageSource$LevelStorageAccess;"
                 + "Lnet/minecraft/server/packs/repository/PackRepository;"
                 + "Lnet/minecraft/server/WorldStem;"
                 + "Lnet/minecraft/server/dedicated/DedicatedServerSettings;"
@@ -4057,15 +8666,60 @@ public final class MinecraftClientPatcher {
                 + "Ljoptsimple/OptionSpec;"
                 + "Ljoptsimple/OptionSpec;"
                 + "Ljava/lang/Thread;)Lnet/minecraft/server/dedicated/DedicatedServer;";
-        MethodNode factory = find(node, "lambda$main$3", factoryDescriptor);
+        String currentFactoryDescriptor =
+                "(Lnet/minecraft/world/level/storage/LevelStorageSource$LevelStorageAccess;"
+                        + "Lnet/minecraft/server/packs/repository/PackRepository;"
+                        + "Lnet/minecraft/server/WorldStem;"
+                        + "Lnet/minecraft/server/dedicated/DedicatedServerSettings;"
+                        + "Lnet/minecraft/server/Services;"
+                        + "Lnet/minecraft/server/jsonrpc/ManagementServer;"
+                        + "Lnet/minecraft/server/notifications/NotificationManager;"
+                        + "Ljoptsimple/OptionSet;"
+                        + "Ljoptsimple/OptionSpec;"
+                        + "Ljoptsimple/OptionSpec;"
+                        + "Ljoptsimple/OptionSpec;"
+                        + "Ljoptsimple/OptionSpec;"
+                        + "Ljoptsimple/OptionSpec;"
+                        + "Ljava/lang/Thread;)Lnet/minecraft/server/dedicated/DedicatedServer;";
+        MethodNode factory = null;
+        for (MethodNode method : node.methods) {
+            if (!method.name.startsWith("lambda$main$")
+                    || !Type.getReturnType(method.desc).getDescriptor()
+                            .equals("Lnet/minecraft/server/dedicated/DedicatedServer;")) {
+                continue;
+            }
+            if (factory != null) {
+                throw new IllegalStateException("Multiple dedicated-server factory lambdas found");
+            }
+            factory = method;
+        }
+        if (factory == null
+                || (!factory.desc.equals(legacyFactoryDescriptor)
+                        && !factory.desc.equals(currentFactoryDescriptor))) {
+            throw new IllegalStateException("Unsupported dedicated-server factory descriptor: "
+                    + (factory == null ? "missing" : factory.desc));
+        }
         String server = "net/minecraft/server/dedicated/DedicatedServer";
+        boolean currentFactory = factory.desc.equals(currentFactoryDescriptor);
+        int optionSetLocal = currentFactory ? 7 : 5;
+        int firstOptionLocal = currentFactory ? 8 : 6;
+        int serverThreadLocal = currentFactory ? 13 : 11;
+        int serverLocal = currentFactory ? 14 : 12;
         InsnList code = new InsnList();
         code.add(new TypeInsnNode(Opcodes.NEW, server));
         code.add(new InsnNode(Opcodes.DUP));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 11));
+        code.add(new VarInsnNode(Opcodes.ALOAD, serverThreadLocal));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new VarInsnNode(Opcodes.ALOAD, 1));
         code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        if (currentFactory) {
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "java/util/Optional",
+                    "empty",
+                    "()Ljava/util/Optional;",
+                    false));
+        }
         code.add(new VarInsnNode(Opcodes.ALOAD, 3));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
@@ -4074,22 +8728,47 @@ public final class MinecraftClientPatcher {
                 "()Lcom/mojang/datafixers/DataFixer;",
                 false));
         code.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        if (currentFactory) {
+            code.add(new VarInsnNode(Opcodes.ALOAD, 5));
+            code.add(new VarInsnNode(Opcodes.ALOAD, 6));
+        }
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESPECIAL,
                 server,
                 "<init>",
-                "(Ljava/lang/Thread;"
-                        + "Lnet/minecraft/world/level/storage/LevelStorageSource$LevelStorageAccess;"
-                        + "Lnet/minecraft/server/packs/repository/PackRepository;"
-                        + "Lnet/minecraft/server/WorldStem;"
-                        + "Lnet/minecraft/server/dedicated/DedicatedServerSettings;"
-                        + "Lcom/mojang/datafixers/DataFixer;"
-                        + "Lnet/minecraft/server/Services;)V",
+                currentFactory
+                        ? "(Ljava/lang/Thread;"
+                                + "Lnet/minecraft/world/level/storage/LevelStorageSource$LevelStorageAccess;"
+                                + "Lnet/minecraft/server/packs/repository/PackRepository;"
+                                + "Lnet/minecraft/server/WorldStem;"
+                                + "Ljava/util/Optional;"
+                                + "Lnet/minecraft/server/dedicated/DedicatedServerSettings;"
+                                + "Lcom/mojang/datafixers/DataFixer;"
+                                + "Lnet/minecraft/server/Services;"
+                                + "Lnet/minecraft/server/jsonrpc/ManagementServer;"
+                                + "Lnet/minecraft/server/notifications/NotificationManager;)V"
+                        : "(Ljava/lang/Thread;"
+                                + "Lnet/minecraft/world/level/storage/LevelStorageSource$LevelStorageAccess;"
+                                + "Lnet/minecraft/server/packs/repository/PackRepository;"
+                                + "Lnet/minecraft/server/WorldStem;"
+                                + "Lnet/minecraft/server/dedicated/DedicatedServerSettings;"
+                                + "Lcom/mojang/datafixers/DataFixer;"
+                                + "Lnet/minecraft/server/Services;)V",
                 false));
-        code.add(new VarInsnNode(Opcodes.ASTORE, 12));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 12));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 5));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 6));
+        code.add(new VarInsnNode(Opcodes.ASTORE, serverLocal));
+        if (currentFactory) {
+            code.add(new VarInsnNode(Opcodes.ALOAD, 6));
+            code.add(new VarInsnNode(Opcodes.ALOAD, serverLocal));
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    "net/minecraft/server/notifications/NotificationManager",
+                    "setServer",
+                    "(Lnet/minecraft/server/dedicated/DedicatedServer;)V",
+                    false));
+        }
+        code.add(new VarInsnNode(Opcodes.ALOAD, serverLocal));
+        code.add(new VarInsnNode(Opcodes.ALOAD, optionSetLocal));
+        code.add(new VarInsnNode(Opcodes.ALOAD, firstOptionLocal));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL,
                 "joptsimple/OptionSet",
@@ -4101,9 +8780,9 @@ public final class MinecraftClientPatcher {
                 Opcodes.INVOKEVIRTUAL, "java/lang/Integer", "intValue", "()I", false));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL, server, "setPort", "(I)V", false));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 12));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 5));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 7));
+        code.add(new VarInsnNode(Opcodes.ALOAD, serverLocal));
+        code.add(new VarInsnNode(Opcodes.ALOAD, optionSetLocal));
+        code.add(new VarInsnNode(Opcodes.ALOAD, firstOptionLocal + 1));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL,
                 "joptsimple/OptionSet",
@@ -4112,9 +8791,9 @@ public final class MinecraftClientPatcher {
                 false));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL, server, "setDemo", "(Z)V", false));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 12));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 5));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 8));
+        code.add(new VarInsnNode(Opcodes.ALOAD, serverLocal));
+        code.add(new VarInsnNode(Opcodes.ALOAD, optionSetLocal));
+        code.add(new VarInsnNode(Opcodes.ALOAD, firstOptionLocal + 2));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL,
                 "joptsimple/OptionSet",
@@ -4128,10 +8807,194 @@ public final class MinecraftClientPatcher {
                 "setId",
                 "(Ljava/lang/String;)V",
                 false));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 12));
+        code.add(new VarInsnNode(Opcodes.ALOAD, serverLocal));
         code.add(new InsnNode(Opcodes.ARETURN));
-        replace(factory, code, 9, 13);
+        replace(factory, code, currentFactory ? 12 : 9, serverLocal + 1);
         writeComputeFrames(node, output);
+    }
+
+    /**
+     * A browser Worker has one JavaScript execution thread, so Minecraft's background executor
+     * cannot provide real parallelism here. Route WorldLoader's background stages through the
+     * queue supplied by Util.blockUntilDone instead. This avoids deeply nested direct-executor
+     * continuations and gives every registry stage an explicit cooperative resume point.
+     */
+    private static void patchServerWorldLoaderCooperativeExecutor(ClassNode node) {
+        MethodNode target = null;
+        MethodInsnNode backgroundExecutor = null;
+        for (MethodNode method : node.methods) {
+            if (!method.name.startsWith("lambda$main$")
+                    || (method.access & Opcodes.ACC_STATIC) == 0
+                    || !Type.getReturnType(method.desc).getDescriptor()
+                            .equals("Ljava/util/concurrent/CompletableFuture;")) {
+                continue;
+            }
+            MethodInsnNode candidateBackground = null;
+            boolean worldLoaderCall = false;
+            for (AbstractInsnNode instruction : method.instructions.toArray()) {
+                if (!(instruction instanceof MethodInsnNode call)) {
+                    continue;
+                }
+                if (call.getOpcode() == Opcodes.INVOKESTATIC
+                        && call.owner.equals("net/minecraft/util/Util")
+                        && call.name.equals("backgroundExecutor")
+                        && call.desc.equals("()Lnet/minecraft/TracingExecutor;")) {
+                    candidateBackground = call;
+                } else if (call.getOpcode() == Opcodes.INVOKESTATIC
+                        && call.owner.equals("net/minecraft/server/WorldLoader")
+                        && call.name.equals("load")
+                        && call.desc.endsWith("Ljava/util/concurrent/CompletableFuture;")) {
+                    worldLoaderCall = true;
+                }
+            }
+            if (!worldLoaderCall || candidateBackground == null) {
+                continue;
+            }
+            if (target != null) {
+                throw new IllegalStateException(
+                        "Multiple server WorldLoader executor lambdas were found");
+            }
+            target = method;
+            backgroundExecutor = candidateBackground;
+        }
+        if (target == null || backgroundExecutor == null) {
+            throw new IllegalStateException(
+                    "Server WorldLoader background executor patch point was not found");
+        }
+
+        Type[] arguments = Type.getArgumentTypes(target.desc);
+        if (arguments.length == 0
+                || !arguments[arguments.length - 1].getDescriptor()
+                        .equals("Ljava/util/concurrent/Executor;")) {
+            throw new IllegalStateException(
+                    "Server WorldLoader lambda no longer ends with its cooperative executor: "
+                            + target.desc);
+        }
+        int executorLocal = 0;
+        for (int index = 0; index < arguments.length - 1; index++) {
+            executorLocal += arguments[index].getSize();
+        }
+        target.instructions.set(
+                backgroundExecutor,
+                new VarInsnNode(Opcodes.ALOAD, executorLocal));
+
+        MethodInsnNode worldLoaderCall = null;
+        for (AbstractInsnNode instruction : target.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("net/minecraft/server/WorldLoader")
+                    && call.name.equals("load")) {
+                worldLoaderCall = call;
+                break;
+            }
+        }
+        if (worldLoaderCall == null) {
+            throw new IllegalStateException("Server WorldLoader call disappeared during patching");
+        }
+        target.instructions.insertBefore(
+                worldLoaderCall,
+                serverStartupPhase("world-loader-cooperative-executor"));
+        target.maxStack = Math.max(target.maxStack, 8);
+    }
+
+    private static InsnList serverStartupPhase(String phase) {
+        InsnList checkpoint = new InsnList();
+        checkpoint.add(new LdcInsnNode(phase));
+        checkpoint.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserStartupScheduler",
+                "phase",
+                "(Ljava/lang/String;)V",
+                false));
+        return checkpoint;
+    }
+
+    private static void patchWorldLoaderBrowserStartupTelemetry(String jar, Path output)
+            throws IOException {
+        String owner = "net/minecraft/server/WorldLoader";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode load = find(node, "load",
+                "(Lnet/minecraft/server/WorldLoader$InitConfig;"
+                        + "Lnet/minecraft/server/WorldLoader$WorldDataSupplier;"
+                        + "Lnet/minecraft/server/WorldLoader$ResultFactory;"
+                        + "Ljava/util/concurrent/Executor;Ljava/util/concurrent/Executor;)"
+                        + "Ljava/util/concurrent/CompletableFuture;");
+        load.instructions.insert(serverStartupPhase("world-loader-started"));
+
+        boolean worldgenRegistryPatched = false;
+        boolean dimensionRegistryPatched = false;
+        boolean serverResourcesPatched = false;
+        boolean resultPatched = false;
+        for (MethodNode method : node.methods) {
+            for (AbstractInsnNode instruction : method.instructions.toArray()) {
+                if (!(instruction instanceof MethodInsnNode call)) {
+                    continue;
+                }
+                if (call.getOpcode() == Opcodes.INVOKESTATIC
+                        && call.owner.equals("net/minecraft/resources/RegistryDataLoader")
+                        && call.name.equals("load")) {
+                    FieldInsnNode registryList = previousFieldInstruction(call,
+                            "net/minecraft/resources/RegistryDataLoader");
+                    if (registryList == null) {
+                        continue;
+                    }
+                    if (!worldgenRegistryPatched
+                            && registryList.name.equals("WORLDGEN_REGISTRIES")) {
+                        method.instructions.insertBefore(
+                                call,
+                                serverStartupPhase("world-loader-worldgen-registries-started"));
+                        worldgenRegistryPatched = true;
+                    } else if (!dimensionRegistryPatched
+                            && registryList.name.equals("DIMENSION_REGISTRIES")) {
+                        method.instructions.insertBefore(
+                                call,
+                                serverStartupPhase("world-loader-dimension-registries-started"));
+                        dimensionRegistryPatched = true;
+                    }
+                } else if (!serverResourcesPatched
+                        && call.getOpcode() == Opcodes.INVOKESTATIC
+                        && call.owner.equals("net/minecraft/server/ReloadableServerResources")
+                        && call.name.equals("loadResources")) {
+                    method.instructions.insertBefore(
+                            call,
+                            serverStartupPhase("world-loader-server-resources-started"));
+                    serverResourcesPatched = true;
+                } else if (!resultPatched
+                        && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                        && call.owner.equals("net/minecraft/server/WorldLoader$ResultFactory")
+                        && call.name.equals("create")) {
+                    method.instructions.insertBefore(
+                            call,
+                            serverStartupPhase("world-loader-server-resources-ready"));
+                    resultPatched = true;
+                }
+            }
+            method.maxStack = Math.max(method.maxStack, 16);
+        }
+        if (!worldgenRegistryPatched
+                || !dimensionRegistryPatched
+                || !serverResourcesPatched
+                || !resultPatched) {
+            throw new IOException("WorldLoader startup telemetry patch points changed: worldgen="
+                    + worldgenRegistryPatched + ", dimensions=" + dimensionRegistryPatched
+                    + ", resources=" + serverResourcesPatched + ", result=" + resultPatched);
+        }
+        writeComputeFrames(node, output);
+    }
+
+    private static FieldInsnNode previousFieldInstruction(
+            AbstractInsnNode start, String owner) {
+        int remaining = 12;
+        for (AbstractInsnNode instruction = start.getPrevious();
+                instruction != null && remaining-- > 0;
+                instruction = instruction.getPrevious()) {
+            if (instruction instanceof FieldInsnNode field
+                    && field.getOpcode() == Opcodes.GETSTATIC
+                    && field.owner.equals(owner)) {
+                return field;
+            }
+        }
+        return null;
     }
 
     private static void patchBlocksBrowserStartupYield(String jar, Path output)
@@ -4198,10 +9061,24 @@ public final class MinecraftClientPatcher {
             throws IOException {
         String owner = "net/minecraft/core/registries/BuiltInRegistries";
         ClassNode node = read(jar, owner + ".class");
-        MethodNode createContentsEntry = find(
-                node,
-                "lambda$createContents$49",
-                "(Lnet/minecraft/resources/Identifier;Ljava/util/function/Supplier;)V");
+        String entryDescriptor =
+                "(Lnet/minecraft/resources/Identifier;Ljava/util/function/Supplier;)V";
+        MethodNode createContentsEntry = null;
+        for (MethodNode method : node.methods) {
+            if (!method.name.startsWith("lambda$createContents$")
+                    || !method.desc.equals(entryDescriptor)) {
+                continue;
+            }
+            if (createContentsEntry != null) {
+                throw new IllegalStateException(
+                        "Multiple BuiltInRegistries createContents entry lambdas found");
+            }
+            createContentsEntry = method;
+        }
+        if (createContentsEntry == null) {
+            throw new IllegalStateException(
+                    "BuiltInRegistries createContents entry lambda was not found");
+        }
         int patchedReturns = 0;
         for (AbstractInsnNode instruction = createContentsEntry.instructions.getFirst();
                 instruction != null;
@@ -4292,7 +9169,9 @@ public final class MinecraftClientPatcher {
         String properties = "net/minecraft/server/dedicated/DedicatedServerProperties";
         ClassNode node = read(jar, owner + ".class");
         MethodNode init = find(node, "initServer", "()Z");
-        removeBooleanFieldBlock(init, properties, "managementServerEnabled", 2, Opcodes.IFEQ);
+        removeDedicatedServerGameTypeOverride(init, properties);
+        tryRemoveBooleanFieldBlock(
+                init, properties, "managementServerEnabled", 2, Opcodes.IFEQ);
         removeBooleanFieldBlock(init, properties, "enableQuery", 1, Opcodes.IFEQ);
         removeBooleanFieldBlock(init, properties, "enableRcon", 1, Opcodes.IFEQ);
         removeMethodConditionBlock(
@@ -4348,6 +9227,66 @@ public final class MinecraftClientPatcher {
         writeComputeFrames(node, output);
     }
 
+    /**
+     * Keep the game type serialized by CreateWorldScreen's WorldData.  The
+     * browser worker writes a dedicated server.properties file, but that file
+     * must not replace the selected game type while DedicatedServer initializes
+     * an already-created world.
+     */
+    private static void removeDedicatedServerGameTypeOverride(
+            MethodNode init, String properties) {
+        int removed = 0;
+        for (AbstractInsnNode instruction : init.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKEINTERFACE
+                    || !call.owner.equals("net/minecraft/world/level/storage/WorldData")
+                    || !call.name.equals("setGameType")
+                    || !call.desc.equals("(Lnet/minecraft/world/level/GameType;)V")) {
+                continue;
+            }
+            AbstractInsnNode gameType = previousRealInstruction(call);
+            AbstractInsnNode propertyGet = previousRealInstruction(gameType);
+            AbstractInsnNode propertyField = previousRealInstruction(propertyGet);
+            AbstractInsnNode propertiesObject = previousRealInstruction(propertyField);
+            AbstractInsnNode worldDataField = previousRealInstruction(propertiesObject);
+            AbstractInsnNode receiver = previousRealInstruction(worldDataField);
+            if (!(gameType instanceof TypeInsnNode cast)
+                    || cast.getOpcode() != Opcodes.CHECKCAST
+                    || !cast.desc.equals("net/minecraft/world/level/GameType")
+                    || !(propertyGet instanceof MethodInsnNode get)
+                    || get.getOpcode() != Opcodes.INVOKEVIRTUAL
+                    || !get.owner.equals("net/minecraft/server/dedicated/Settings$MutableValue")
+                    || !get.name.equals("get")
+                    || !get.desc.equals("()Ljava/lang/Object;")
+                    || !(propertyField instanceof FieldInsnNode field)
+                    || field.getOpcode() != Opcodes.GETFIELD
+                    || !field.owner.equals(properties)
+                    || !field.name.equals("gameMode")
+                    || !(propertiesObject instanceof VarInsnNode propertyReceiver)
+                    || propertyReceiver.getOpcode() != Opcodes.ALOAD
+                    || !(worldDataField instanceof FieldInsnNode dataField)
+                    || dataField.getOpcode() != Opcodes.GETFIELD
+                    || !dataField.name.equals("worldData")
+                    || !(receiver instanceof VarInsnNode worldReceiver)
+                    || worldReceiver.getOpcode() != Opcodes.ALOAD) {
+                continue;
+            }
+            // Keep the original receiver/value evaluation and discard both
+            // references.  This preserves the method's existing CFG/frame
+            // shape while removing only the WorldData mutation.
+            InsnList discard = new InsnList();
+            discard.add(new InsnNode(Opcodes.POP));
+            discard.add(new InsnNode(Opcodes.POP));
+            init.instructions.insertBefore(call, discard);
+            init.instructions.remove(call);
+            removed++;
+        }
+        if (removed != 1) {
+            throw new IllegalStateException(
+                    "DedicatedServer game type override patch point changed: " + removed);
+        }
+    }
+
     private static void patchDedicatedSettingsBrowser(String jar, Path output)
             throws IOException {
         ClassNode node = read(jar, "net/minecraft/server/dedicated/Settings.class");
@@ -4379,6 +9318,19 @@ public final class MinecraftClientPatcher {
             String fieldName,
             int setupInstructionCount,
             int jumpOpcode) {
+        if (!tryRemoveBooleanFieldBlock(
+                method, owner, fieldName, setupInstructionCount, jumpOpcode)) {
+            throw new IllegalStateException(
+                    method.name + " browser block field was not found: " + fieldName);
+        }
+    }
+
+    private static boolean tryRemoveBooleanFieldBlock(
+            MethodNode method,
+            String owner,
+            String fieldName,
+            int setupInstructionCount,
+            int jumpOpcode) {
         FieldInsnNode marker = null;
         for (var instruction = method.instructions.getFirst();
                 instruction != null;
@@ -4392,10 +9344,10 @@ public final class MinecraftClientPatcher {
             }
         }
         if (marker == null) {
-            throw new IllegalStateException(
-                    method.name + " browser block field was not found: " + fieldName);
+            return false;
         }
         removeConditionalBlock(method, marker, setupInstructionCount, jumpOpcode);
+        return true;
     }
 
     private static void removeMethodConditionBlock(
@@ -4703,6 +9655,12 @@ public final class MinecraftClientPatcher {
                 "(Ljava/lang/Object;)Z",
                 true));
         code.add(new InsnNode(Opcodes.POP));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserIntegratedServerMain",
+                "markServerListenerReady",
+                "()V",
+                false));
         code.add(new InsnNode(Opcodes.RETURN));
         replace(method, code, 5, 3);
         writeComputeFrames(node, output);
@@ -4866,13 +9824,37 @@ public final class MinecraftClientPatcher {
         code.add(new InsnNode(Opcodes.ARETURN));
         replace(connect, code, 4, 3);
 
-        MethodNode tick = find(node, "tick", "()V");
-        tick.instructions.insert(new MethodInsnNode(
-                Opcodes.INVOKESTATIC,
-                "io/netty/channel/browser/BrowserWebSocketChannel",
-                "pumpAll",
-                "()V",
-                false));
+        writeComputeFrames(node, output);
+    }
+
+    /**
+     * Uses the cooperative browser decoder for the compression handler while retaining the
+     * vanilla Connection.setupCompression lifecycle and setThreshold contract.
+     */
+    private static void patchCompressionDecoderBrowser(String jar, Path output)
+            throws IOException {
+        ClassNode node = read(jar, "net/minecraft/network/Connection.class");
+        MethodNode setup = find(node, "setupCompression", "(IZ)V");
+        int replacements = 0;
+        for (AbstractInsnNode instruction : setup.instructions.toArray()) {
+            if (instruction instanceof TypeInsnNode type
+                    && type.getOpcode() == Opcodes.NEW
+                    && type.desc.equals("net/minecraft/network/CompressionDecoder")) {
+                type.desc = "dev/gaius/browser/BrowserCompressionDecoder";
+                replacements++;
+            } else if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESPECIAL
+                    && call.owner.equals("net/minecraft/network/CompressionDecoder")
+                    && call.name.equals("<init>")
+                    && call.desc.equals("(IZ)V")) {
+                call.owner = "dev/gaius/browser/BrowserCompressionDecoder";
+                replacements++;
+            }
+        }
+        if (replacements != 2) {
+            throw new IllegalStateException(
+                    "CompressionDecoder browser constructor patch point changed: " + replacements);
+        }
         writeComputeFrames(node, output);
     }
 
@@ -4927,6 +9909,36 @@ public final class MinecraftClientPatcher {
         code.add(new MethodInsnNode(Opcodes.INVOKEINTERFACE, "java/lang/Runnable", "run", "()V", true));
         code.add(new InsnNode(Opcodes.RETURN));
         replace(method, code, 1, 2);
+        writeComputeFrames(node, output);
+    }
+
+    /** Replaces Minecraft's browser-incompatible timed queue spin with a cooperative pump. */
+    private static void patchUtilBlockUntilDoneBrowserOutput(Path output) throws IOException {
+        ClassNode node = new ClassNode();
+        new ClassReader(Files.readAllBytes(output)).accept(node, 0);
+        MethodNode method = find(node, "blockUntilDone",
+                "(Ljava/util/function/Function;Ljava/util/function/Predicate;)Ljava/lang/Object;");
+        int patched = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKEINTERFACE
+                    || !call.owner.equals("java/util/concurrent/BlockingQueue")
+                    || !call.name.equals("poll")
+                    || !call.desc.equals("(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;")) {
+                continue;
+            }
+            call.setOpcode(Opcodes.INVOKESTATIC);
+            call.owner = "dev/gaius/browser/BrowserFuturePump";
+            call.name = "poll";
+            call.desc = "(Ljava/util/concurrent/BlockingQueue;JLjava/util/concurrent/TimeUnit;)"
+                    + "Ljava/lang/Object;";
+            call.itf = false;
+            patched++;
+        }
+        if (patched != 1) {
+            throw new IOException("Util.blockUntilDone timed queue poll patch count changed: "
+                    + patched);
+        }
         writeComputeFrames(node, output);
     }
 
@@ -5016,21 +10028,30 @@ public final class MinecraftClientPatcher {
 
     private static void patchInputConstants(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "com/mojang/blaze3d/platform/InputConstants.class");
+        boolean hasRawMouseSupportHandle = node.fields.stream().anyMatch(field ->
+                field.name.equals("GLFW_RAW_MOUSE_MOTION_SUPPORTED")
+                        && field.desc.equals("Ljava/lang/invoke/MethodHandle;"));
+        boolean hasRawMouseMotionConstant = node.fields.stream().anyMatch(field ->
+                field.name.equals("GLFW_RAW_MOUSE_MOTION") && field.desc.equals("I"));
         for (MethodNode method : node.methods) {
             if (method.name.equals("<clinit>")) {
                 InsnList code = new InsnList();
-                code.add(new InsnNode(Opcodes.ACONST_NULL));
-                code.add(new FieldInsnNode(
-                        Opcodes.PUTSTATIC,
-                        "com/mojang/blaze3d/platform/InputConstants",
-                        "GLFW_RAW_MOUSE_MOTION_SUPPORTED",
-                        "Ljava/lang/invoke/MethodHandle;"));
-                code.add(new InsnNode(Opcodes.ICONST_0));
-                code.add(new FieldInsnNode(
-                        Opcodes.PUTSTATIC,
-                        "com/mojang/blaze3d/platform/InputConstants",
-                        "GLFW_RAW_MOUSE_MOTION",
-                        "I"));
+                if (hasRawMouseSupportHandle) {
+                    code.add(new InsnNode(Opcodes.ACONST_NULL));
+                    code.add(new FieldInsnNode(
+                            Opcodes.PUTSTATIC,
+                            "com/mojang/blaze3d/platform/InputConstants",
+                            "GLFW_RAW_MOUSE_MOTION_SUPPORTED",
+                            "Ljava/lang/invoke/MethodHandle;"));
+                }
+                if (hasRawMouseMotionConstant) {
+                    code.add(new InsnNode(Opcodes.ICONST_0));
+                    code.add(new FieldInsnNode(
+                            Opcodes.PUTSTATIC,
+                            "com/mojang/blaze3d/platform/InputConstants",
+                            "GLFW_RAW_MOUSE_MOTION",
+                            "I"));
+                }
                 code.add(new FieldInsnNode(
                         Opcodes.GETSTATIC,
                         "com/mojang/blaze3d/platform/InputConstants$Type",
@@ -5087,12 +10108,34 @@ public final class MinecraftClientPatcher {
         write(node, output);
     }
 
-    private static void patchMinecraft(String jar, Path output) throws IOException {
+    /**
+     * The 26.2 F3 overlay requests an integrated-server chunk future while
+     * building debug text. The browser server lives in a separate Worker,
+     * so leave that optional server sample unavailable. Keep the ordinary
+     * client-cache lookup for the debug entries that can display its data.
+     */
+    private static void patchDebugScreenOverlayBrowserNoChunk(
+            String jar, Path output) throws IOException {
+        ClassNode node = read(jar,
+                "net/minecraft/client/gui/components/DebugScreenOverlay.class");
+        MethodNode method = find(node, "getServerChunk",
+                "()Lnet/minecraft/world/level/chunk/LevelChunk;");
+        InsnList code = new InsnList();
+        code.add(new InsnNode(Opcodes.ACONST_NULL));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(method, code, 1, 1);
+        write(node, output);
+    }
+
+    private static void patchMinecraft(String jar, Path outputRoot) throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/Minecraft.class");
+        boolean hasNoRender = node.fields.stream().anyMatch(field ->
+                field.name.equals("noRender") && field.desc.equals("Z"));
         boolean found = false;
         boolean stateHooked = false;
         boolean throwableHooked = false;
         boolean browserChannelPumpHooked = false;
+        boolean clientPacketFrameBoundaryHooked = false;
         boolean singleplayerWorkerHooked = false;
         boolean singleplayerWorkerStopHooked = false;
         boolean singleplayerWorkerReturnHooked = false;
@@ -5117,8 +10160,7 @@ public final class MinecraftClientPatcher {
             }
             if (method.name.equals("run") && method.desc.equals("()V")) {
                 throwableHooked = hookMinecraftRunCatchDiagnostics(method);
-            } else if (method.name.equals("lambda$fillUptime$40")
-                    && method.desc.equals("()Ljava/lang/String;")) {
+            } else if (isJvmUptimeLambda(method)) {
                 InsnList code = new InsnList();
                 code.add(new LdcInsnNode("Browser runtime"));
                 code.add(new InsnNode(Opcodes.ARETURN));
@@ -5126,20 +10168,83 @@ public final class MinecraftClientPatcher {
                 found = true;
             } else if (method.name.equals("runTick") && method.desc.equals("(Z)V")) {
                 InsnList browserPackets = new InsnList();
-                browserPackets.add(new MethodInsnNode(
+                MethodInsnNode beginClientPacketFrame = new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "dev/gaius/browser/BrowserClientNetwork",
+                        "beginClientPacketFrame",
+                        "()V",
+                        false);
+                MethodInsnNode installClientNetwork = new MethodInsnNode(
                         Opcodes.INVOKESTATIC,
                         "dev/gaius/browser/BrowserClientNetwork",
                         "install",
                         "()V",
-                        false));
-                browserPackets.add(pumpBrowserChannels());
+                        false);
+                MethodInsnNode pumpClientChannels = pumpBrowserChannels();
+                browserPackets.add(beginClientPacketFrame);
+                browserPackets.add(installClientNetwork);
+                browserPackets.add(pumpClientChannels);
                 method.instructions.insert(browserPackets);
+                if (nextOpcode(beginClientPacketFrame) != installClientNetwork
+                        || nextOpcode(installClientNetwork) != pumpClientChannels) {
+                    throw new IllegalStateException(
+                            "Minecraft runTick browser packet frame/pump order changed");
+                }
+                int scheduledPacketBoundaries = 0;
+                MethodInsnNode scheduledPacketBoundary = null;
+                for (AbstractInsnNode instruction : method.instructions.toArray()) {
+                    if (instruction instanceof MethodInsnNode call
+                            && call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                            && call.owner.equals("net/minecraft/network/PacketProcessor")
+                            && call.name.equals("processQueuedPackets")
+                            && call.desc.equals("()V")) {
+                        scheduledPacketBoundaries++;
+                        scheduledPacketBoundary = call;
+                    }
+                }
+                if (scheduledPacketBoundaries != 1 || scheduledPacketBoundary == null) {
+                    throw new IllegalStateException(
+                            "Minecraft runTick scheduled PacketProcessor boundary changed: "
+                                    + scheduledPacketBoundaries);
+                }
+                MethodInsnNode frameBoundaryWrapper = new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "dev/gaius/browser/BrowserClientNetwork",
+                        "processClientPacketsAtScheduledFrameBoundary",
+                        "(Lnet/minecraft/network/PacketProcessor;)V",
+                        false);
+                method.instructions.set(scheduledPacketBoundary, frameBoundaryWrapper);
+                int wrapperCalls = 0;
+                int directPacketProcessorCalls = 0;
+                for (AbstractInsnNode instruction : method.instructions.toArray()) {
+                    if (!(instruction instanceof MethodInsnNode call)) {
+                        continue;
+                    }
+                    if (call.getOpcode() == Opcodes.INVOKESTATIC
+                            && call.owner.equals("dev/gaius/browser/BrowserClientNetwork")
+                            && call.name.equals("processClientPacketsAtScheduledFrameBoundary")
+                            && call.desc.equals("(Lnet/minecraft/network/PacketProcessor;)V")) {
+                        wrapperCalls++;
+                    } else if (call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                            && call.owner.equals("net/minecraft/network/PacketProcessor")
+                            && call.name.equals("processQueuedPackets")
+                            && call.desc.equals("()V")) {
+                        directPacketProcessorCalls++;
+                    }
+                }
+                if (wrapperCalls != 1 || directPacketProcessorCalls != 0) {
+                    throw new IllegalStateException(
+                            "Minecraft runTick packet boundary replacement changed: wrapper="
+                                    + wrapperCalls + ", direct=" + directPacketProcessorCalls);
+                }
                 browserChannelPumpHooked = true;
+                clientPacketFrameBoundaryHooked = true;
                 for (var instruction = method.instructions.getFirst();
                         instruction != null;
                         instruction = instruction.getNext()) {
                     if (instruction.getOpcode() == Opcodes.RETURN) {
-                        method.instructions.insertBefore(instruction, minecraftStateReport());
+                        method.instructions.insertBefore(
+                                instruction, minecraftStateReport(hasNoRender));
                         stateHooked = true;
                     }
                 }
@@ -5151,16 +10256,21 @@ public final class MinecraftClientPatcher {
                 code.add(new InsnNode(Opcodes.IRETURN));
                 replace(method, code, 1, 2);
             } else if (method.name.equals("doWorldLoad")
-                    && method.desc.equals(
-                            "(Lnet/minecraft/world/level/storage/LevelStorageSource$LevelStorageAccess;"
-                                    + "Lnet/minecraft/server/packs/repository/PackRepository;"
-                                    + "Lnet/minecraft/server/WorldStem;Z)V")) {
+                    && (method.desc.equals(
+                                    "(Lnet/minecraft/world/level/storage/LevelStorageSource$LevelStorageAccess;"
+                                            + "Lnet/minecraft/server/packs/repository/PackRepository;"
+                                            + "Lnet/minecraft/server/WorldStem;Z)V")
+                            || method.desc.equals(
+                                    "(Lnet/minecraft/world/level/storage/LevelStorageSource$LevelStorageAccess;"
+                                            + "Lnet/minecraft/server/packs/repository/PackRepository;"
+                                            + "Lnet/minecraft/server/WorldStem;Ljava/util/Optional;Z)V"))) {
+                int newWorldLocal = method.desc.contains("Ljava/util/Optional;") ? 5 : 4;
                 LabelNode vanillaIntegratedServer = new LabelNode();
                 InsnList worker = new InsnList();
                 worker.add(new VarInsnNode(Opcodes.ALOAD, 0));
                 worker.add(new VarInsnNode(Opcodes.ALOAD, 1));
                 worker.add(new VarInsnNode(Opcodes.ALOAD, 3));
-                worker.add(new VarInsnNode(Opcodes.ILOAD, 4));
+                worker.add(new VarInsnNode(Opcodes.ILOAD, newWorldLocal));
                 worker.add(new MethodInsnNode(
                         Opcodes.INVOKESTATIC,
                         "dev/gaius/browser/BrowserSingleplayerClient",
@@ -5188,21 +10298,30 @@ public final class MinecraftClientPatcher {
                     && method.desc.equals("(Lnet/minecraft/network/chat/Component;)V")) {
                 singleplayerWorkerReturnHooked = replaceLocalServerCheck(method);
             } else if (method.name.equals("crash")
-                    && method.desc.equals(
-                            "(Lnet/minecraft/client/Minecraft;Ljava/io/File;"
-                                    + "Lnet/minecraft/CrashReport;)V")) {
+                    && (method.desc.equals(
+                                    "(Lnet/minecraft/client/Minecraft;Ljava/io/File;"
+                                            + "Lnet/minecraft/CrashReport;)V")
+                            || method.desc.equals(
+                                    "(Lnet/minecraft/client/Minecraft;Ljava/io/File;"
+                                            + "Lnet/minecraft/CrashReport;I)V"))) {
+                boolean hasExitCode = method.desc.endsWith(";I)V");
                 InsnList code = new InsnList();
                 code.add(new VarInsnNode(Opcodes.ALOAD, 1));
                 code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+                if (hasExitCode) {
+                    code.add(new VarInsnNode(Opcodes.ILOAD, 3));
+                }
                 code.add(new MethodInsnNode(
                         Opcodes.INVOKESTATIC,
                         "net/minecraft/client/Minecraft",
                         "saveReport",
-                        "(Ljava/io/File;Lnet/minecraft/CrashReport;)I",
+                        hasExitCode
+                                ? "(Ljava/io/File;Lnet/minecraft/CrashReport;I)I"
+                                : "(Ljava/io/File;Lnet/minecraft/CrashReport;)I",
                         false));
                 code.add(new InsnNode(Opcodes.POP));
                 code.add(new InsnNode(Opcodes.RETURN));
-                replace(method, code, 2, 3);
+                replace(method, code, hasExitCode ? 3 : 2, hasExitCode ? 4 : 3);
                 browserCrashHooked = true;
             } else if (method.name.equals("getOverlay")
                     && method.desc.equals("()Lnet/minecraft/client/gui/screens/Overlay;")) {
@@ -5234,6 +10353,11 @@ public final class MinecraftClientPatcher {
                 foregroundResourceReloadHooked = true;
             }
         }
+        if (!foregroundResourceReloadHooked) {
+            patchGuiForegroundResourceReload(
+                    jar, outputRoot.resolve("net/minecraft/client/gui/Gui.class"));
+            foregroundResourceReloadHooked = true;
+        }
         if (!found) {
             throw new IllegalStateException("Minecraft uptime lambda was not found");
         }
@@ -5242,6 +10366,10 @@ public final class MinecraftClientPatcher {
         }
         if (!browserChannelPumpHooked) {
             throw new IllegalStateException("Minecraft browser channel pump hook point was not found");
+        }
+        if (!clientPacketFrameBoundaryHooked) {
+            throw new IllegalStateException(
+                    "Minecraft client packet frame-boundary hook point was not found");
         }
         if (!throwableHooked) {
             throw new IllegalStateException("Minecraft run throwable diagnostic hook point was not found");
@@ -5266,6 +10394,376 @@ public final class MinecraftClientPatcher {
             throw new IllegalStateException(
                     "Minecraft foreground resource reload overlay hook point was not found");
         }
+        addMinecraftUiBridges(node);
+        write(node, outputRoot.resolve("net/minecraft/client/Minecraft.class"));
+    }
+
+    private static void addMinecraftUiBridges(ClassNode node) {
+        String owner = "net/minecraft/client/Minecraft";
+        String screenDescriptor = "()Lnet/minecraft/client/gui/screens/Screen;";
+        node.methods.removeIf(method -> method.name.equals("gaius$getScreen")
+                && method.desc.equals(screenDescriptor));
+        MethodNode bridge = new MethodNode(
+                Opcodes.ACC_PUBLIC,
+                "gaius$getScreen",
+                screenDescriptor,
+                null,
+                null);
+        bridge.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        boolean directScreen = node.fields.stream().anyMatch(field -> field.name.equals("screen")
+                && field.desc.equals("Lnet/minecraft/client/gui/screens/Screen;"));
+        if (directScreen) {
+            bridge.instructions.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    owner,
+                    "screen",
+                    "Lnet/minecraft/client/gui/screens/Screen;"));
+        } else {
+            bridge.instructions.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    owner,
+                    "gui",
+                    "Lnet/minecraft/client/gui/Gui;"));
+            bridge.instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    "net/minecraft/client/gui/Gui",
+                    "screen",
+                    screenDescriptor,
+                    false));
+        }
+        bridge.instructions.add(new InsnNode(Opcodes.ARETURN));
+        bridge.maxStack = 1;
+        bridge.maxLocals = 1;
+        node.methods.add(bridge);
+
+        String setScreenDescriptor = "(Lnet/minecraft/client/gui/screens/Screen;)V";
+        node.methods.removeIf(method -> method.name.equals("gaius$setScreen")
+                && method.desc.equals(setScreenDescriptor));
+        MethodNode setScreen = new MethodNode(
+                Opcodes.ACC_PUBLIC,
+                "gaius$setScreen",
+                setScreenDescriptor,
+                null,
+                null);
+        setScreen.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        if (directScreen) {
+            setScreen.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+            setScreen.instructions.add(new FieldInsnNode(
+                    Opcodes.PUTFIELD,
+                    owner,
+                    "screen",
+                    "Lnet/minecraft/client/gui/screens/Screen;"));
+        } else {
+            setScreen.instructions.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    owner,
+                    "gui",
+                    "Lnet/minecraft/client/gui/Gui;"));
+            setScreen.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+            setScreen.instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    "net/minecraft/client/gui/Gui",
+                    "setScreen",
+                    setScreenDescriptor,
+                    false));
+        }
+        setScreen.instructions.add(new InsnNode(Opcodes.RETURN));
+        setScreen.maxStack = 2;
+        setScreen.maxLocals = 2;
+        node.methods.add(setScreen);
+
+        boolean directOverlay = node.fields.stream().anyMatch(field -> field.name.equals("overlay")
+                && field.desc.equals("Lnet/minecraft/client/gui/screens/Overlay;"));
+        String overlayDescriptor = "()Lnet/minecraft/client/gui/screens/Overlay;";
+        node.methods.removeIf(method -> method.name.equals("gaius$getOverlay")
+                && method.desc.equals(overlayDescriptor));
+        MethodNode getOverlay = new MethodNode(
+                Opcodes.ACC_PUBLIC,
+                "gaius$getOverlay",
+                overlayDescriptor,
+                null,
+                null);
+        getOverlay.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        if (directOverlay) {
+            getOverlay.instructions.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    owner,
+                    "overlay",
+                    "Lnet/minecraft/client/gui/screens/Overlay;"));
+        } else {
+            getOverlay.instructions.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    owner,
+                    "gui",
+                    "Lnet/minecraft/client/gui/Gui;"));
+            getOverlay.instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    "net/minecraft/client/gui/Gui",
+                    "overlay",
+                    overlayDescriptor,
+                    false));
+        }
+        getOverlay.instructions.add(new InsnNode(Opcodes.ARETURN));
+        getOverlay.maxStack = 1;
+        getOverlay.maxLocals = 1;
+        node.methods.add(getOverlay);
+
+        String setOverlayDescriptor = "(Lnet/minecraft/client/gui/screens/Overlay;)V";
+        node.methods.removeIf(method -> method.name.equals("gaius$setOverlay")
+                && method.desc.equals(setOverlayDescriptor));
+        MethodNode setOverlay = new MethodNode(
+                Opcodes.ACC_PUBLIC,
+                "gaius$setOverlay",
+                setOverlayDescriptor,
+                null,
+                null);
+        setOverlay.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        if (directOverlay) {
+            setOverlay.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+            setOverlay.instructions.add(new FieldInsnNode(
+                    Opcodes.PUTFIELD,
+                    owner,
+                    "overlay",
+                    "Lnet/minecraft/client/gui/screens/Overlay;"));
+        } else {
+            setOverlay.instructions.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    owner,
+                    "gui",
+                    "Lnet/minecraft/client/gui/Gui;"));
+            setOverlay.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+            setOverlay.instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    "net/minecraft/client/gui/Gui",
+                    "setOverlay",
+                    setOverlayDescriptor,
+                    false));
+        }
+        setOverlay.instructions.add(new InsnNode(Opcodes.RETURN));
+        setOverlay.maxStack = 2;
+        setOverlay.maxLocals = 2;
+        node.methods.add(setOverlay);
+    }
+
+    private static void patchWorldStemBrowserSave(String jar, Path output) throws IOException {
+        String owner = "net/minecraft/server/WorldStem";
+        String storage = "net/minecraft/world/level/storage/LevelStorageSource$LevelStorageAccess";
+        ClassNode node = read(jar, owner + ".class");
+        String descriptor = "(L" + storage + ";)V";
+        node.methods.removeIf(method -> method.name.equals("gaius$saveDataTag")
+                && method.desc.equals(descriptor));
+        MethodNode bridge = new MethodNode(
+                Opcodes.ACC_PUBLIC,
+                "gaius$saveDataTag",
+                descriptor,
+                null,
+                null);
+        bridge.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        MethodNode currentWorldData = findNullable(
+                node,
+                "worldDataAndGenSettings",
+                "()Lnet/minecraft/world/level/storage/LevelDataAndDimensions$WorldDataAndGenSettings;");
+        if (currentWorldData != null) {
+            bridge.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            bridge.instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    owner,
+                    currentWorldData.name,
+                    currentWorldData.desc,
+                    false));
+            bridge.instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    "net/minecraft/world/level/storage/LevelDataAndDimensions$WorldDataAndGenSettings",
+                    "data",
+                    "()Lnet/minecraft/world/level/storage/WorldData;",
+                    false));
+            bridge.instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    storage,
+                    "saveDataTag",
+                    "(Lnet/minecraft/world/level/storage/WorldData;)V",
+                    false));
+            // 26.2 splits world gen settings into data/minecraft/world_gen_settings.dat,
+            // which the server Worker reads back when loading the level. Write it too,
+            // otherwise the Worker falls back to random settings and the dimension
+            // registry lacks the overworld stem.
+            bridge.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            bridge.instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    owner,
+                    "registries",
+                    "()Lnet/minecraft/core/LayeredRegistryAccess;",
+                    false));
+            bridge.instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    "net/minecraft/core/LayeredRegistryAccess",
+                    "compositeAccess",
+                    "()Lnet/minecraft/core/RegistryAccess$Frozen;",
+                    false));
+            bridge.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+            bridge.instructions.add(new FieldInsnNode(
+                    Opcodes.GETSTATIC,
+                    "net/minecraft/world/level/storage/LevelResource",
+                    "ROOT",
+                    "Lnet/minecraft/world/level/storage/LevelResource;"));
+            bridge.instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    storage,
+                    "getLevelPath",
+                    "(Lnet/minecraft/world/level/storage/LevelResource;)Ljava/nio/file/Path;",
+                    false));
+            bridge.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            bridge.instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    owner,
+                    currentWorldData.name,
+                    currentWorldData.desc,
+                    false));
+            bridge.instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    "net/minecraft/world/level/storage/LevelDataAndDimensions$WorldDataAndGenSettings",
+                    "genSettings",
+                    "()Lnet/minecraft/world/level/levelgen/WorldGenSettings;",
+                    false));
+            bridge.instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "net/minecraft/world/level/storage/LevelStorageSource",
+                    "writeWorldGenSettings",
+                    "(Lnet/minecraft/core/RegistryAccess;Ljava/nio/file/Path;"
+                            + "Lnet/minecraft/world/level/levelgen/WorldGenSettings;)V",
+                    false));
+        } else {
+            MethodNode legacyWorldData = findNullable(
+                    node,
+                    "worldData",
+                    "()Lnet/minecraft/world/level/storage/WorldData;");
+            if (legacyWorldData == null) {
+                throw new IOException("WorldStem world-data accessor was not found");
+            }
+            bridge.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            bridge.instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    owner,
+                    "registries",
+                    "()Lnet/minecraft/core/LayeredRegistryAccess;",
+                    false));
+            bridge.instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    "net/minecraft/core/LayeredRegistryAccess",
+                    "compositeAccess",
+                    "()Lnet/minecraft/core/RegistryAccess$Frozen;",
+                    false));
+            bridge.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            bridge.instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    owner,
+                    legacyWorldData.name,
+                    legacyWorldData.desc,
+                    false));
+            bridge.instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    storage,
+                    "saveDataTag",
+                    "(Lnet/minecraft/core/RegistryAccess;Lnet/minecraft/world/level/storage/WorldData;)V",
+                    false));
+        }
+        bridge.instructions.add(new InsnNode(Opcodes.RETURN));
+        bridge.maxStack = 4;
+        bridge.maxLocals = 2;
+        node.methods.add(bridge);
+        writeComputeFrames(node, output);
+    }
+
+    private static void patchCommandEncoderLegacyTextureUpload(String jar, Path output)
+            throws IOException {
+        String owner = "com/mojang/blaze3d/systems/CommandEncoder";
+        ClassNode node = read(jar, owner + ".class");
+        String legacyDescriptor = "(Lcom/mojang/blaze3d/textures/GpuTexture;Ljava/nio/ByteBuffer;"
+                + "Lcom/mojang/blaze3d/platform/NativeImage$Format;IIIIII)V";
+        if (findNullable(node, "writeToTexture", legacyDescriptor) != null) {
+            write(node, output);
+            return;
+        }
+        String currentDescriptor = "(Lcom/mojang/blaze3d/textures/GpuTexture;Ljava/nio/ByteBuffer;"
+                + "IIIIII)V";
+        if (findNullable(node, "writeToTexture", currentDescriptor) == null) {
+            throw new IOException("CommandEncoder byte-buffer texture upload was not found");
+        }
+        MethodNode bridge = new MethodNode(
+                Opcodes.ACC_PUBLIC,
+                "writeToTexture",
+                legacyDescriptor,
+                null,
+                null);
+        bridge.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        bridge.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        bridge.instructions.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        for (int local = 4; local <= 9; local++) {
+            bridge.instructions.add(new VarInsnNode(Opcodes.ILOAD, local));
+        }
+        bridge.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                owner,
+                "writeToTexture",
+                currentDescriptor,
+                false));
+        bridge.instructions.add(new InsnNode(Opcodes.RETURN));
+        bridge.maxStack = 9;
+        bridge.maxLocals = 10;
+        node.methods.add(bridge);
+        writeComputeFrames(node, output);
+    }
+
+    private static boolean isJvmUptimeLambda(MethodNode method) {
+        if (!method.name.startsWith("lambda$fillUptime$")
+                || !method.desc.equals("()Ljava/lang/String;")) {
+            return false;
+        }
+        for (AbstractInsnNode instruction = method.instructions.getFirst(); instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("java/lang/management/ManagementFactory")
+                    && call.name.equals("getRuntimeMXBean")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void patchGuiForegroundResourceReload(String jar, Path output)
+            throws IOException {
+        String owner = "net/minecraft/client/gui/Gui";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode method = find(
+                node, "overlay", "()Lnet/minecraft/client/gui/screens/Overlay;");
+        LabelNode returnOverlay = new LabelNode();
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                "overlay",
+                "Lnet/minecraft/client/gui/screens/Overlay;"));
+        code.add(new InsnNode(Opcodes.DUP));
+        code.add(new TypeInsnNode(
+                Opcodes.INSTANCEOF,
+                "net/minecraft/client/gui/screens/LoadingOverlay"));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, returnOverlay));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "minecraft", "Lnet/minecraft/client/Minecraft;"));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                "net/minecraft/client/Minecraft",
+                "level",
+                "Lnet/minecraft/client/multiplayer/ClientLevel;"));
+        code.add(new JumpInsnNode(Opcodes.IFNULL, returnOverlay));
+        code.add(new InsnNode(Opcodes.POP));
+        code.add(new InsnNode(Opcodes.ACONST_NULL));
+        code.add(returnOverlay);
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(method, code, 2, 1);
         write(node, output);
     }
 
@@ -5309,7 +10807,7 @@ public final class MinecraftClientPatcher {
             clearForegroundOverlay.add(new MethodInsnNode(
                     Opcodes.INVOKEVIRTUAL,
                     "net/minecraft/client/Minecraft",
-                    "setOverlay",
+                    "gaius$setOverlay",
                     "(Lnet/minecraft/client/gui/screens/Overlay;)V",
                     false));
             clearForegroundOverlay.add(keepOverlay);
@@ -5361,7 +10859,7 @@ public final class MinecraftClientPatcher {
     private static void patchBrowserMouseHandler(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/MouseHandler.class");
 
-        MethodNode move = find(node, "lambda$setup$3", "(JDD)V");
+        MethodNode move = findInputSetupDispatch(node, "onMove", "(JDD)V");
         InsnList moveCode = new InsnList();
         moveCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
         moveCode.add(new VarInsnNode(Opcodes.LLOAD, 1));
@@ -5376,7 +10874,7 @@ public final class MinecraftClientPatcher {
         moveCode.add(new InsnNode(Opcodes.RETURN));
         replace(move, moveCode, 7, 7);
 
-        MethodNode button = find(node, "lambda$setup$5", "(JIII)V");
+        MethodNode button = findInputSetupDispatch(node, "onButton", "(JIII)V");
         InsnList buttonCode = new InsnList();
         buttonCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
         buttonCode.add(new VarInsnNode(Opcodes.LLOAD, 1));
@@ -5400,7 +10898,7 @@ public final class MinecraftClientPatcher {
         buttonCode.add(new InsnNode(Opcodes.RETURN));
         replace(button, buttonCode, 6, 6);
 
-        MethodNode scroll = find(node, "lambda$setup$7", "(JDD)V");
+        MethodNode scroll = findInputSetupDispatch(node, "onScroll", "(JDD)V");
         InsnList scrollCode = new InsnList();
         scrollCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
         scrollCode.add(new VarInsnNode(Opcodes.LLOAD, 1));
@@ -5499,9 +10997,12 @@ public final class MinecraftClientPatcher {
             }
             if (!overlayGatePatched
                     && instruction instanceof MethodInsnNode call
-                    && call.owner.equals("net/minecraft/client/Minecraft")
-                    && call.name.equals("getOverlay")
+                    && ((call.owner.equals("net/minecraft/client/Minecraft")
+                                    && call.name.equals("getOverlay"))
+                            || (call.owner.equals("net/minecraft/client/gui/Gui")
+                                    && call.name.equals("overlay")))
                     && call.desc.equals("()Lnet/minecraft/client/gui/screens/Overlay;")) {
+                boolean guiOwnsScreen = call.owner.equals("net/minecraft/client/gui/Gui");
                 AbstractInsnNode maybeIfNull = nextRealInstruction(instruction);
                 AbstractInsnNode maybeGoto = nextRealInstruction(maybeIfNull);
                 if (!(maybeIfNull instanceof JumpInsnNode ifNull)
@@ -5527,11 +11028,25 @@ public final class MinecraftClientPatcher {
                         "net/minecraft/client/MouseHandler",
                         "minecraft",
                         "Lnet/minecraft/client/Minecraft;"));
-                gate.add(new FieldInsnNode(
-                        Opcodes.GETFIELD,
-                        "net/minecraft/client/Minecraft",
-                        "screen",
-                        "Lnet/minecraft/client/gui/screens/Screen;"));
+                if (guiOwnsScreen) {
+                    gate.add(new FieldInsnNode(
+                            Opcodes.GETFIELD,
+                            "net/minecraft/client/Minecraft",
+                            "gui",
+                            "Lnet/minecraft/client/gui/Gui;"));
+                    gate.add(new MethodInsnNode(
+                            Opcodes.INVOKEVIRTUAL,
+                            "net/minecraft/client/gui/Gui",
+                            "screen",
+                            "()Lnet/minecraft/client/gui/screens/Screen;",
+                            false));
+                } else {
+                    gate.add(new FieldInsnNode(
+                            Opcodes.GETFIELD,
+                            "net/minecraft/client/Minecraft",
+                            "screen",
+                            "Lnet/minecraft/client/gui/screens/Screen;"));
+                }
                 gate.add(new JumpInsnNode(Opcodes.IFNONNULL, allow));
                 gate.add(popAndBlock);
                 gate.add(new InsnNode(Opcodes.POP));
@@ -5552,10 +11067,80 @@ public final class MinecraftClientPatcher {
         writeComputeFrames(node, output);
     }
 
+    private static MethodNode findInputSetupDispatch(
+            ClassNode node, String targetName, String... descriptors) throws IOException {
+        MethodNode match = null;
+        for (MethodNode method : node.methods) {
+            boolean descriptorMatches = false;
+            for (String descriptor : descriptors) {
+                if (method.desc.equals(descriptor)) {
+                    descriptorMatches = true;
+                    break;
+                }
+            }
+            if (!method.name.startsWith("lambda$setup$") || !descriptorMatches) {
+                continue;
+            }
+            boolean dispatchesViaClient = false;
+            String lambdaTarget = null;
+            for (AbstractInsnNode instruction = method.instructions.getFirst(); instruction != null;
+                    instruction = instruction.getNext()) {
+                if (instruction instanceof MethodInsnNode call
+                        && call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                        && call.owner.equals("net/minecraft/client/Minecraft")
+                        && call.name.equals("execute")
+                        && call.desc.equals("(Ljava/lang/Runnable;)V")) {
+                    dispatchesViaClient = true;
+                } else if (instruction instanceof org.objectweb.asm.tree.InvokeDynamicInsnNode dynamic) {
+                    for (Object argument : dynamic.bsmArgs) {
+                        if (argument instanceof org.objectweb.asm.Handle handle
+                                && handle.getOwner().equals(node.name)) {
+                            lambdaTarget = handle.getName();
+                        }
+                    }
+                }
+            }
+            if (!dispatchesViaClient || lambdaTarget == null) {
+                continue;
+            }
+            MethodNode target = null;
+            for (MethodNode candidate : node.methods) {
+                if (candidate.name.equals(lambdaTarget)) {
+                    target = candidate;
+                    break;
+                }
+            }
+            if (target == null) {
+                continue;
+            }
+            boolean callsTarget = false;
+            for (AbstractInsnNode instruction = target.instructions.getFirst(); instruction != null;
+                    instruction = instruction.getNext()) {
+                if (instruction instanceof MethodInsnNode call
+                        && call.owner.equals(node.name)
+                        && call.name.equals(targetName)) {
+                    callsTarget = true;
+                    break;
+                }
+            }
+            if (!callsTarget) {
+                continue;
+            }
+            if (match != null) {
+                throw new IOException("Multiple input setup dispatchers found for " + targetName);
+            }
+            match = method;
+        }
+        if (match == null) {
+            throw new IOException("Input setup dispatcher was not found for " + targetName);
+        }
+        return match;
+    }
+
     private static void patchBrowserKeyboardHandler(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/KeyboardHandler.class");
 
-        MethodNode key = find(node, "lambda$setup$6", "(JIIII)V");
+        MethodNode key = findInputSetupDispatch(node, "keyPress", "(JIIII)V");
         InsnList keyCode = new InsnList();
         keyCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
         keyCode.add(new VarInsnNode(Opcodes.LLOAD, 1));
@@ -5580,19 +11165,22 @@ public final class MinecraftClientPatcher {
         keyCode.add(new InsnNode(Opcodes.RETURN));
         replace(key, keyCode, 8, 7);
 
-        MethodNode character = find(node, "lambda$setup$8", "(JII)V");
+        MethodNode character = findInputSetupDispatch(node, "charTyped", "(JII)V", "(JI)V");
+        boolean characterHasModifiers = character.desc.equals("(JII)V");
         InsnList charCode = new InsnList();
         charCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
         charCode.add(new VarInsnNode(Opcodes.LLOAD, 1));
         charCode.add(new TypeInsnNode(Opcodes.NEW, "net/minecraft/client/input/CharacterEvent"));
         charCode.add(new InsnNode(Opcodes.DUP));
         charCode.add(new VarInsnNode(Opcodes.ILOAD, 3));
-        charCode.add(new VarInsnNode(Opcodes.ILOAD, 4));
+        if (characterHasModifiers) {
+            charCode.add(new VarInsnNode(Opcodes.ILOAD, 4));
+        }
         charCode.add(new MethodInsnNode(
                 Opcodes.INVOKESPECIAL,
                 "net/minecraft/client/input/CharacterEvent",
                 "<init>",
-                "(II)V",
+                characterHasModifiers ? "(II)V" : "(I)V",
                 false));
         charCode.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL,
@@ -5601,7 +11189,7 @@ public final class MinecraftClientPatcher {
                 "(JLnet/minecraft/client/input/CharacterEvent;)V",
                 false));
         charCode.add(new InsnNode(Opcodes.RETURN));
-        replace(character, charCode, 6, 5);
+        replace(character, charCode, 6, characterHasModifiers ? 5 : 4);
 
         writeComputeFrames(node, output);
     }
@@ -5609,13 +11197,13 @@ public final class MinecraftClientPatcher {
     private static MethodInsnNode pumpBrowserChannels() {
         return new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
-                "io/netty/channel/browser/BrowserWebSocketChannel",
-                "pumpAll",
+                "dev/gaius/browser/BrowserClientNetwork",
+                "pumpBrowserChannelsAtFrameBoundary",
                 "()V",
                 false);
     }
 
-    private static InsnList minecraftStateReport() {
+    private static InsnList minecraftStateReport(boolean hasNoRender) {
         InsnList code = new InsnList();
         LabelNode skipped = new LabelNode();
         code.add(new MethodInsnNode(
@@ -5626,17 +11214,19 @@ public final class MinecraftClientPatcher {
                 false));
         code.add(new JumpInsnNode(Opcodes.IFEQ, skipped));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new FieldInsnNode(
-                Opcodes.GETFIELD,
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
                 "net/minecraft/client/Minecraft",
-                "screen",
-                "Lnet/minecraft/client/gui/screens/Screen;"));
+                "gaius$getScreen",
+                "()Lnet/minecraft/client/gui/screens/Screen;",
+                false));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new FieldInsnNode(
-                Opcodes.GETFIELD,
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
                 "net/minecraft/client/Minecraft",
-                "overlay",
-                "Lnet/minecraft/client/gui/screens/Overlay;"));
+                "gaius$getOverlay",
+                "()Lnet/minecraft/client/gui/screens/Overlay;",
+                false));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new FieldInsnNode(
@@ -5668,12 +11258,16 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/client/Minecraft",
                 "hitResult",
                 "Lnet/minecraft/world/phys/HitResult;"));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new FieldInsnNode(
-                Opcodes.GETFIELD,
-                "net/minecraft/client/Minecraft",
-                "noRender",
-                "Z"));
+        if (hasNoRender) {
+            code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            code.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    "net/minecraft/client/Minecraft",
+                    "noRender",
+                    "Z"));
+        } else {
+            code.add(new InsnNode(Opcodes.ICONST_0));
+        }
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new FieldInsnNode(
                 Opcodes.GETFIELD,
@@ -5748,7 +11342,77 @@ public final class MinecraftClientPatcher {
     private static void patchClientKeepAliveBrowser(String jar, Path output) throws IOException {
         ClassNode node = read(jar,
                 "net/minecraft/client/multiplayer/ClientCommonPacketListenerImpl.class");
-        MethodNode predicate = find(node, "lambda$handleKeepAlive$1", "()Z");
+        MethodNode keepAlive = find(
+                node,
+                "handleKeepAlive",
+                "(Lnet/minecraft/network/protocol/common/ClientboundKeepAlivePacket;)V");
+        int keepAliveIdCalls = 0;
+        int keepAliveConstructors = 0;
+        int sendWhenCalls = 0;
+        int packetThreadChecks = 0;
+        int existingInlineAccountingCalls = 0;
+        for (AbstractInsnNode instruction : keepAlive.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode call)) {
+                continue;
+            }
+            if (call.owner.equals(
+                    "net/minecraft/network/protocol/common/ClientboundKeepAlivePacket")
+                    && call.name.equals("getId")
+                    && call.desc.equals("()J")) {
+                keepAliveIdCalls++;
+            } else if (call.owner.equals(
+                    "net/minecraft/network/protocol/common/ServerboundKeepAlivePacket")
+                    && call.name.equals("<init>")
+                    && call.desc.equals("(J)V")) {
+                keepAliveConstructors++;
+            } else if (call.owner.equals(node.name)
+                    && call.name.equals("sendWhen")
+                    && call.desc.equals("(Lnet/minecraft/network/protocol/Packet;"
+                            + "Ljava/util/function/BooleanSupplier;Ljava/time/Duration;)V")) {
+                sendWhenCalls++;
+            } else if (call.owner.equals("net/minecraft/network/protocol/PacketUtils")
+                    && call.name.equals("ensureRunningOnSameThread")) {
+                packetThreadChecks++;
+            } else if (call.owner.equals("io/netty/channel/browser/BrowserWebSocketChannel")
+                    && call.name.equals("recordInlineDecodedPacket")
+                    && call.desc.equals("()V")) {
+                existingInlineAccountingCalls++;
+            }
+        }
+        if (keepAliveIdCalls != 1
+                || keepAliveConstructors != 1
+                || sendWhenCalls != 1
+                || packetThreadChecks != 0
+                || existingInlineAccountingCalls != 0) {
+            throw new IOException(
+                    "ClientCommonPacketListenerImpl keepalive direct-send CFG changed: id="
+                            + keepAliveIdCalls
+                            + ", constructors=" + keepAliveConstructors
+                            + ", sendWhen=" + sendWhenCalls
+                            + ", packetThreadChecks=" + packetThreadChecks
+                            + ", inlineAccounting=" + existingInlineAccountingCalls);
+        }
+        InsnList keepAliveAccounting = new InsnList();
+        keepAliveAccounting.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "io/netty/channel/browser/BrowserWebSocketChannel",
+                "recordInlineDecodedPacket",
+                "()V",
+                false));
+        keepAlive.instructions.insert(keepAliveAccounting);
+
+        MethodNode predicate = null;
+        for (MethodNode method : node.methods) {
+            if (!method.name.startsWith("lambda$handleKeepAlive$")
+                    || !method.desc.equals("()Z")) {
+                continue;
+            }
+            if (predicate != null) {
+                throw new IOException(
+                        "Multiple ClientCommonPacketListenerImpl keepalive predicates found");
+            }
+            predicate = method;
+        }
         if (predicate == null) {
             throw new IOException("ClientCommonPacketListenerImpl keepalive predicate was not found");
         }
@@ -6202,13 +11866,37 @@ public final class MinecraftClientPatcher {
         writeComputeFrames(node, output);
     }
 
+    private static boolean allExactlyOne(int[] values) {
+        for (int value : values) {
+            if (value != 1) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static String counts(int[] values) {
+        StringBuilder result = new StringBuilder("[");
+        for (int index = 0; index < values.length; index++) {
+            if (index > 0) {
+                result.append(',');
+            }
+            result.append(values[index]);
+        }
+        return result.append(']').toString();
+    }
+
     /**
-     * Browser WebSocket callbacks already share the client page's event loop. Treating them as
-     * foreign Java threads makes configuration packets requeue forever while a resource reload
-     * owns the normal client tick. Inline the configuration listener, the payloadless PLAY packet
-     * that enters configuration, and the PLAY login packet that creates the replacement level
-     * after configuration completes. Ordinary game packets stay queued so terrain handling is
-     * still sliced by the client tick.
+     * Browser WebSocket callbacks already share the client page's event loop. Treating
+     * configuration packets as foreign Java threads makes them requeue forever while a resource
+     * reload owns the normal client tick, but treating PLAY packets as same-thread lets chunk and
+     * entity handlers monopolize the decoder turn. Inline configuration transitions and the
+     * small common-control handlers whose ordering/liveness contract is independent of terrain.
+     * Force ordinary ClientPacketListener traffic through PacketProcessor even when its Java
+     * thread identity matches, so the bounded client-tick packet slice is the authoritative PLAY
+     * work queue. The drain guard is mandatory: a queued ListenerAndPacket re-enters this method
+     * and must return from this thread check so the enclosing packet handler continues without
+     * consulting a Java thread identity that has no useful meaning in TeaVM.
      */
     private static void patchClientPacketUtilsBrowserInline(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "net/minecraft/network/protocol/PacketUtils.class");
@@ -6219,25 +11907,239 @@ public final class MinecraftClientPatcher {
             throw new IOException("PacketUtils client packet scheduler patch point was not found");
         }
         LabelNode inline = new LabelNode();
+        LabelNode queuedHandleReturn = new LabelNode();
         LabelNode vanillaScheduling = new LabelNode();
+        LabelNode playListener = new LabelNode();
+        LabelNode commonBacklogCheck = new LabelNode();
+        String[] transitionPacketTypes = {
+            "net/minecraft/network/protocol/game/ClientboundStartConfigurationPacket",
+            "net/minecraft/network/protocol/game/ClientboundLoginPacket"
+        };
+        String[] commonInlinePacketTypes = {
+            "net/minecraft/network/protocol/common/ClientboundPingPacket",
+            "net/minecraft/network/protocol/common/ClientboundCustomPayloadPacket",
+            "net/minecraft/network/protocol/common/ClientboundResourcePackPushPacket",
+            "net/minecraft/network/protocol/common/ClientboundResourcePackPopPacket",
+            "net/minecraft/network/protocol/cookie/ClientboundCookieRequestPacket",
+            "net/minecraft/network/protocol/common/ClientboundStoreCookiePacket",
+            "net/minecraft/network/protocol/common/ClientboundCustomReportDetailsPacket",
+            "net/minecraft/network/protocol/common/ClientboundServerLinksPacket",
+            "net/minecraft/network/protocol/common/ClientboundShowDialogPacket",
+            "net/minecraft/network/protocol/common/ClientboundClearDialogPacket",
+            "net/minecraft/network/protocol/common/ClientboundTransferPacket"
+        };
+        LabelNode transitionBacklogCheck = new LabelNode();
+        LabelNode forcedPlayQueue = new LabelNode();
+        MethodInsnNode forcedPlaySchedule = new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/network/PacketProcessor",
+                "scheduleIfPossible",
+                "(Lnet/minecraft/network/PacketListener;"
+                        + "Lnet/minecraft/network/protocol/Packet;)V",
+                false);
+        FieldInsnNode forcedPlayAbort = new FieldInsnNode(
+                Opcodes.GETSTATIC,
+                "net/minecraft/server/RunningOnDifferentThreadException",
+                "RUNNING_ON_DIFFERENT_THREAD",
+                "Lnet/minecraft/server/RunningOnDifferentThreadException;");
         InsnList code = new InsnList();
         code.add(new VarInsnNode(Opcodes.ALOAD, 1));
         code.add(new TypeInsnNode(Opcodes.INSTANCEOF,
                 "net/minecraft/client/multiplayer/ClientConfigurationPacketListenerImpl"));
         code.add(new JumpInsnNode(Opcodes.IFNE, inline));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
         code.add(new TypeInsnNode(Opcodes.INSTANCEOF,
-                "net/minecraft/network/protocol/game/ClientboundStartConfigurationPacket"));
-        code.add(new JumpInsnNode(Opcodes.IFNE, inline));
+                "net/minecraft/client/multiplayer/ClientPacketListener"));
+        code.add(new JumpInsnNode(Opcodes.IFNE, playListener));
+        for (String packetType : commonInlinePacketTypes) {
+            code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            code.add(new TypeInsnNode(Opcodes.INSTANCEOF, packetType));
+            code.add(new JumpInsnNode(Opcodes.IFNE, inline));
+        }
+        code.add(new JumpInsnNode(Opcodes.GOTO, vanillaScheduling));
+        code.add(playListener);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserPacketScheduler",
+                "isProcessingQueuedPacket",
+                "(Ljava/lang/Object;)Z",
+                false));
+        code.add(new JumpInsnNode(Opcodes.IFNE, queuedHandleReturn));
+        for (String packetType : transitionPacketTypes) {
+            code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            code.add(new TypeInsnNode(Opcodes.INSTANCEOF, packetType));
+            code.add(new JumpInsnNode(Opcodes.IFNE, transitionBacklogCheck));
+        }
+        for (String packetType : commonInlinePacketTypes) {
+            code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            code.add(new TypeInsnNode(Opcodes.INSTANCEOF, packetType));
+            code.add(new JumpInsnNode(Opcodes.IFNE, commonBacklogCheck));
+        }
+        code.add(new JumpInsnNode(Opcodes.GOTO, forcedPlayQueue));
+        code.add(commonBacklogCheck);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserPacketScheduler",
+                "hasPendingPackets",
+                "(Ljava/lang/Object;)Z",
+                false));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, inline));
+        code.add(new JumpInsnNode(Opcodes.GOTO, forcedPlayQueue));
+        /*
+         * The PLAY guard above must run before common packets can take the
+         * inline path.  This preserves FIFO when a control packet arrives
+         * while a decoded PLAY packet is already queued, while keeping the
+         * empty-queue fast path and the configuration listener bypass.
+         */
+        code.add(transitionBacklogCheck);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserPacketScheduler",
+                "hasPendingPackets",
+                "(Ljava/lang/Object;)Z",
+                false));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, inline));
+        code.add(forcedPlayQueue);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new TypeInsnNode(Opcodes.INSTANCEOF,
-                "net/minecraft/network/protocol/game/ClientboundLoginPacket"));
-        code.add(new JumpInsnNode(Opcodes.IFEQ, vanillaScheduling));
+        code.add(forcedPlaySchedule);
+        code.add(forcedPlayAbort);
+        code.add(new InsnNode(Opcodes.ATHROW));
+        code.add(queuedHandleReturn);
+        code.add(new InsnNode(Opcodes.RETURN));
         code.add(inline);
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "io/netty/channel/browser/BrowserWebSocketChannel",
+                "recordInlineDecodedPacket",
+                "()V",
+                false));
         code.add(new InsnNode(Opcodes.RETURN));
         code.add(vanillaScheduling);
         method.instructions.insert(code);
-        method.maxStack = Math.max(method.maxStack, 1);
+        int inlineHooks = 0;
+        int configurationBranches = 0;
+        int[] transitionPacketBranches = new int[transitionPacketTypes.length];
+        int[] commonInlinePacketBranches = new int[commonInlinePacketTypes.length];
+        int[] commonPlayPacketBranches = new int[commonInlinePacketTypes.length];
+        int clientPlayBranches = 0;
+        int queuedDrainGuardCalls = 0;
+        int transitionBacklogChecks = 0;
+        int commonBacklogChecks = 0;
+        MethodInsnNode inlineHook = null;
+        LabelNode currentBlock = null;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction instanceof LabelNode label) {
+                currentBlock = label;
+                continue;
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("io/netty/channel/browser/BrowserWebSocketChannel")
+                    && call.name.equals("recordInlineDecodedPacket")
+                    && call.desc.equals("()V")) {
+                inlineHooks++;
+                inlineHook = call;
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("dev/gaius/browser/BrowserPacketScheduler")
+                    && call.name.equals("isProcessingQueuedPacket")
+                    && call.desc.equals("(Ljava/lang/Object;)Z")
+                    && nextOpcode(call) instanceof JumpInsnNode branch
+                    && branch.getOpcode() == Opcodes.IFNE
+                    && branch.label == queuedHandleReturn) {
+                queuedDrainGuardCalls++;
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("dev/gaius/browser/BrowserPacketScheduler")
+                    && call.name.equals("hasPendingPackets")
+                    && call.desc.equals("(Ljava/lang/Object;)Z")
+                    && nextOpcode(call) instanceof JumpInsnNode branch
+                    && branch.getOpcode() == Opcodes.IFEQ) {
+                if (currentBlock == transitionBacklogCheck) {
+                    transitionBacklogChecks++;
+                } else if (currentBlock == commonBacklogCheck && branch.label == inline) {
+                    commonBacklogChecks++;
+                }
+            }
+            if (!(instruction instanceof TypeInsnNode type)
+                    || type.getOpcode() != Opcodes.INSTANCEOF
+                    || !(nextOpcode(type) instanceof JumpInsnNode branch)) {
+                continue;
+            }
+            if (type.desc.equals(
+                    "net/minecraft/client/multiplayer/ClientConfigurationPacketListenerImpl")
+                    && branch.getOpcode() == Opcodes.IFNE
+                    && branch.label == inline) {
+                configurationBranches++;
+            } else if (type.desc.equals(
+                    "net/minecraft/client/multiplayer/ClientPacketListener")
+                    && branch.getOpcode() == Opcodes.IFNE
+                    && branch.label == playListener) {
+                clientPlayBranches++;
+            } else if (branch.getOpcode() == Opcodes.IFNE && branch.label == inline) {
+                for (int index = 0; index < commonInlinePacketTypes.length; index++) {
+                    if (type.desc.equals(commonInlinePacketTypes[index])) {
+                        commonInlinePacketBranches[index]++;
+                    }
+                }
+            } else if (branch.getOpcode() == Opcodes.IFNE && branch.label == commonBacklogCheck) {
+                for (int index = 0; index < commonInlinePacketTypes.length; index++) {
+                    if (type.desc.equals(commonInlinePacketTypes[index])) {
+                        commonPlayPacketBranches[index]++;
+                    }
+                }
+            } else if (branch.getOpcode() == Opcodes.IFNE
+                    && branch.label == transitionBacklogCheck) {
+                for (int index = 0; index < transitionPacketTypes.length; index++) {
+                    if (type.desc.equals(transitionPacketTypes[index])) {
+                        transitionPacketBranches[index]++;
+                    }
+                }
+            }
+        }
+        AbstractInsnNode inlineStart = nextOpcode(inline);
+        AbstractInsnNode inlineReturn = inlineHook == null ? null : nextOpcode(inlineHook);
+        AbstractInsnNode queuedReturn = nextOpcode(queuedHandleReturn);
+        AbstractInsnNode vanillaStart = nextOpcode(vanillaScheduling);
+        AbstractInsnNode forcedAbort = nextOpcode(forcedPlaySchedule);
+        AbstractInsnNode forcedThrow = forcedAbort == null ? null : nextOpcode(forcedAbort);
+        if (inlineHooks != 1
+                || inlineStart != inlineHook
+                || inlineReturn == null
+                || inlineReturn.getOpcode() != Opcodes.RETURN
+                || configurationBranches != 1
+                || !allExactlyOne(transitionPacketBranches)
+                || !allExactlyOne(commonInlinePacketBranches)
+                || !allExactlyOne(commonPlayPacketBranches)
+                || clientPlayBranches != 1
+                || queuedDrainGuardCalls != 1
+                || transitionBacklogChecks != 1
+                || commonBacklogChecks != 1
+                || queuedReturn == null
+                || queuedReturn.getOpcode() != Opcodes.RETURN
+                || forcedAbort != forcedPlayAbort
+                || forcedThrow == null
+                || forcedThrow.getOpcode() != Opcodes.ATHROW
+                || vanillaStart == inlineHook) {
+            throw new IllegalStateException(
+                    "PacketUtils inline decoder accounting CFG changed: hooks=" + inlineHooks
+                            + ", configuration=" + configurationBranches
+                            + ", transitionPackets=" + counts(transitionPacketBranches)
+                            + ", commonInlinePackets=" + counts(commonInlinePacketBranches)
+                            + ", commonPlayPackets=" + counts(commonPlayPacketBranches)
+                            + ", clientPlay=" + clientPlayBranches
+                            + ", drainGuard=" + queuedDrainGuardCalls
+                            + ", transitionBacklog=" + transitionBacklogChecks
+                            + ", commonBacklog=" + commonBacklogChecks);
+        }
+        method.maxStack = Math.max(method.maxStack, 3);
         writeComputeFrames(node, output);
     }
 
@@ -6245,28 +12147,56 @@ public final class MinecraftClientPatcher {
     private static void patchPacketProcessorBrowserSlice(String jar, Path output) throws IOException {
         String owner = "net/minecraft/network/PacketProcessor";
         ClassNode node = read(jar, owner + ".class");
+        patchPacketProcessorLifecycle(node);
+        MethodNode schedule = find(
+                node,
+                "scheduleIfPossible",
+                "(Lnet/minecraft/network/PacketListener;"
+                        + "Lnet/minecraft/network/protocol/Packet;)V");
+        patchPacketProcessorQueuedAccounting(schedule);
         MethodNode method = find(node, "processQueuedPackets", "()V");
         if (method == null) {
             throw new IOException("PacketProcessor browser slice patch point was not found");
         }
+        String vanillaFallbackName = "gaius$vanillaProcessQueuedPackets";
+        if (findNullable(node, vanillaFallbackName, "()V") != null) {
+            throw new IllegalStateException(
+                    "PacketProcessor already contains " + vanillaFallbackName);
+        }
+        MethodNode vanillaFallback = new MethodNode(
+                (method.access & ~(Opcodes.ACC_PUBLIC | Opcodes.ACC_PROTECTED))
+                        | Opcodes.ACC_PRIVATE | Opcodes.ACC_SYNTHETIC,
+                vanillaFallbackName,
+                method.desc,
+                method.signature,
+                method.exceptions == null ? null : method.exceptions.toArray(new String[0]));
+        method.accept(vanillaFallback);
+        node.methods.add(vanillaFallback);
         LabelNode loop = new LabelNode();
         LabelNode done = new LabelNode();
+        LabelNode vanilla = new LabelNode();
+        LabelNode handleStart = new LabelNode();
+        LabelNode handleEnd = new LabelNode();
+        LabelNode handleFailure = new LabelNode();
         InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 "dev/gaius/browser/BrowserPacketScheduler",
                 "beginBatch",
-                "()V",
+                "(Ljava/lang/Object;)Z",
                 false));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, vanilla));
         code.add(loop);
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "closed", "Z"));
         code.add(new JumpInsnNode(Opcodes.IFNE, done));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 "dev/gaius/browser/BrowserPacketScheduler",
                 "shouldProcessNext",
-                "()Z",
+                "(Ljava/lang/Object;)Z",
                 false));
         code.add(new JumpInsnNode(Opcodes.IFEQ, done));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
@@ -6279,6 +12209,21 @@ public final class MinecraftClientPatcher {
         code.add(new VarInsnNode(Opcodes.ASTORE, 1));
         code.add(new VarInsnNode(Opcodes.ALOAD, 1));
         code.add(new JumpInsnNode(Opcodes.IFNULL, done));
+        code.add(handleStart);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/network/PacketProcessor$ListenerAndPacket",
+                "packet",
+                "()Lnet/minecraft/network/protocol/Packet;",
+                false));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserPacketScheduler",
+                "beginQueuedPacket",
+                "(Ljava/lang/Object;Ljava/lang/Object;)V",
+                false));
         code.add(new VarInsnNode(Opcodes.ALOAD, 1));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL,
@@ -6286,11 +12231,232 @@ public final class MinecraftClientPatcher {
                 "handle",
                 "()V",
                 false));
+        code.add(handleEnd);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserPacketScheduler",
+                "packetProcessed",
+                "(Ljava/lang/Object;)V",
+                false));
         code.add(new JumpInsnNode(Opcodes.GOTO, loop));
+        code.add(handleFailure);
+        code.add(new VarInsnNode(Opcodes.ASTORE, 2));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserPacketScheduler",
+                "packetProcessed",
+                "(Ljava/lang/Object;)V",
+                false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new InsnNode(Opcodes.ATHROW));
         code.add(done);
         code.add(new InsnNode(Opcodes.RETURN));
-        replace(method, code, 2, 2);
+        code.add(vanilla);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                owner,
+                vanillaFallbackName,
+                "()V",
+                false));
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(method, code, 2, 3);
+        method.tryCatchBlocks.add(new TryCatchBlockNode(
+                handleStart,
+                handleEnd,
+                handleFailure,
+                null));
+        patchPacketProcessorCloseAccounting(node, owner);
+        verifyPacketProcessorAccounting(node);
         writeComputeFrames(node, output);
+    }
+
+    /**
+     * Binds PacketProcessor ownership at the real construction boundary.  The frame-boundary
+     * bind is intentionally a claim-only operation: a late callback from a closed processor must
+     * not clear its retired tombstone and resurrect the static accounting epoch.  Constructor
+     * reuse is the only explicit lifecycle operation that may release that tombstone.
+     */
+    private static void patchPacketProcessorLifecycle(ClassNode node) {
+        MethodNode constructor = find(node, "<init>", "(Ljava/lang/Thread;)V");
+        int existing = 0;
+        for (AbstractInsnNode instruction : constructor.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("dev/gaius/browser/BrowserPacketScheduler")
+                    && call.name.equals("bindPacketProcessorLifecycle")
+                    && call.desc.equals("(Ljava/lang/Object;)Z")) {
+                existing++;
+            }
+        }
+        if (existing != 0) {
+            throw new IllegalStateException(
+                    "PacketProcessor constructor already contains lifecycle ownership hook: "
+                            + existing);
+        }
+        int returns = 0;
+        for (AbstractInsnNode instruction : constructor.instructions.toArray()) {
+            if (instruction.getOpcode() != Opcodes.RETURN) {
+                continue;
+            }
+            InsnList hook = new InsnList();
+            hook.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            hook.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "dev/gaius/browser/BrowserPacketScheduler",
+                    "bindPacketProcessorLifecycle",
+                    "(Ljava/lang/Object;)Z",
+                    false));
+            hook.add(new InsnNode(Opcodes.POP));
+            constructor.instructions.insertBefore(instruction, hook);
+            returns++;
+        }
+        if (returns != 1) {
+            throw new IllegalStateException(
+                    "PacketProcessor constructor lifecycle return shape changed: " + returns);
+        }
+        constructor.maxStack = Math.max(constructor.maxStack, 1);
+    }
+
+    private static void patchPacketProcessorQueuedAccounting(MethodNode schedule) {
+        int patched = 0;
+        for (AbstractInsnNode instruction : schedule.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode add)
+                    || add.getOpcode() != Opcodes.INVOKEINTERFACE
+                    || !add.owner.equals("java/util/Queue")
+                    || !add.name.equals("add")
+                    || !add.desc.equals("(Ljava/lang/Object;)Z")) {
+                continue;
+            }
+            AbstractInsnNode discard = nextOpcode(add);
+            if (discard == null || discard.getOpcode() != Opcodes.POP) {
+                throw new IllegalStateException(
+                        "PacketProcessor.scheduleIfPossible Queue.add result is no longer discarded");
+            }
+            LabelNode notQueued = new LabelNode();
+            InsnList accounting = new InsnList();
+            accounting.add(new InsnNode(Opcodes.DUP));
+            accounting.add(new JumpInsnNode(Opcodes.IFEQ, notQueued));
+            accounting.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            accounting.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "dev/gaius/browser/BrowserPacketScheduler",
+                    "packetQueued",
+                    "(Ljava/lang/Object;)V",
+                    false));
+            accounting.add(notQueued);
+            schedule.instructions.insert(add, accounting);
+            patched++;
+        }
+        if (patched != 1) {
+            throw new IllegalStateException(
+                    "PacketProcessor.scheduleIfPossible Queue.add telemetry changed: " + patched);
+        }
+        schedule.maxStack = Math.max(schedule.maxStack, 4);
+    }
+
+    private static void patchPacketProcessorCloseAccounting(ClassNode node, String owner) {
+        MethodNode close = find(node, "close", "()V");
+        int patched = 0;
+        for (AbstractInsnNode instruction : close.instructions.toArray()) {
+            if (instruction.getOpcode() != Opcodes.RETURN) {
+                continue;
+            }
+            InsnList cleanup = new InsnList();
+            cleanup.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            cleanup.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    owner,
+                    "packetsToBeHandled",
+                    "Ljava/util/Queue;"));
+            cleanup.add(new MethodInsnNode(
+                    Opcodes.INVOKEINTERFACE,
+                    "java/util/Queue",
+                    "clear",
+                    "()V",
+                    true));
+            cleanup.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            cleanup.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "dev/gaius/browser/BrowserPacketScheduler",
+                    "reset",
+                    "(Ljava/lang/Object;)V",
+                    false));
+            close.instructions.insertBefore(instruction, cleanup);
+            patched++;
+        }
+        if (patched != 1) {
+            throw new IllegalStateException(
+                    "PacketProcessor.close cleanup return shape changed: " + patched);
+        }
+        close.maxStack = Math.max(close.maxStack, 1);
+    }
+
+    private static void verifyPacketProcessorAccounting(ClassNode node) {
+        int queued = 0;
+        int processed = 0;
+        int reset = 0;
+        int shouldProcess = 0;
+        int beginQueued = 0;
+        int beginBatch = 0;
+        int lifecycle = 0;
+        int legacySchedulerCalls = 0;
+        for (MethodNode method : node.methods) {
+            for (AbstractInsnNode instruction : method.instructions.toArray()) {
+                if (!(instruction instanceof MethodInsnNode call)
+                        || !call.owner.equals("dev/gaius/browser/BrowserPacketScheduler")) {
+                    continue;
+                }
+                if (call.name.equals("packetQueued")
+                        && call.desc.equals("(Ljava/lang/Object;)V")) {
+                    queued++;
+                } else if (call.name.equals("packetProcessed")
+                        && call.desc.equals("(Ljava/lang/Object;)V")) {
+                    processed++;
+                } else if (call.name.equals("reset")
+                        && call.desc.equals("(Ljava/lang/Object;)V")) {
+                    reset++;
+                } else if (call.name.equals("shouldProcessNext")
+                        && call.desc.equals("(Ljava/lang/Object;)Z")) {
+                    shouldProcess++;
+                } else if (call.name.equals("beginBatch")
+                        && call.desc.equals("(Ljava/lang/Object;)Z")) {
+                    beginBatch++;
+                } else if (call.name.equals("beginQueuedPacket")
+                        && call.desc.equals("(Ljava/lang/Object;Ljava/lang/Object;)V")) {
+                    beginQueued++;
+                } else if (call.name.equals("bindPacketProcessorLifecycle")
+                        && call.desc.equals("(Ljava/lang/Object;)Z")) {
+                    lifecycle++;
+                } else if ((call.name.equals("packetQueued")
+                        || call.name.equals("packetProcessed")
+                        || call.name.equals("reset")
+                        || call.name.equals("shouldProcessNext")
+                        || call.name.equals("beginBatch")
+                        || call.name.equals("beginQueuedPacket"))
+                        && (call.desc.equals("()V")
+                        || call.desc.equals("()Z")
+                        || call.desc.equals("(Ljava/lang/Object;)V"))) {
+                    legacySchedulerCalls++;
+                }
+            }
+        }
+        if (queued != 1 || processed != 2 || reset != 1 || shouldProcess != 1
+                || beginBatch != 1 || beginQueued != 1 || lifecycle != 1
+                || legacySchedulerCalls != 0) {
+            throw new IllegalStateException(
+                    "PacketProcessor accounting hooks changed: queued=" + queued
+                            + ", processed=" + processed
+                            + ", reset=" + reset
+                            + ", shouldProcess=" + shouldProcess
+                            + ", beginBatch=" + beginBatch
+                            + ", beginQueued=" + beginQueued
+                            + ", lifecycle=" + lifecycle
+                            + ", legacy=" + legacySchedulerCalls);
+        }
+        System.out.println("Instrumented exact decoded-packet queue accounting");
     }
 
     /** Adds diagnostics around each vanilla resource reload listener without reordering it. */
@@ -6387,11 +12553,32 @@ public final class MinecraftClientPatcher {
         if (modelReload == null) {
             throw new IOException("ModelManager reload task label patch point was not found");
         }
-        String[] modelLabels = {
-                "ModelManager.specialBlockModels",
-                "ModelManager.discoverModelDependencies",
-                "ModelManager.buildModelGroups",
-        };
+        int modelContinuationCount = 0;
+        for (AbstractInsnNode instruction = modelReload.instructions.getFirst(); instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.owner.equals("java/util/concurrent/CompletableFuture")
+                    && call.name.equals("thenApplyAsync")) {
+                modelContinuationCount++;
+            }
+        }
+        String[] modelLabels;
+        if (modelContinuationCount == 3) {
+            modelLabels = new String[] {
+                    "ModelManager.specialBlockModels",
+                    "ModelManager.discoverModelDependencies",
+                    "ModelManager.buildModelGroups",
+            };
+        } else if (modelContinuationCount == 2) {
+            modelLabels = new String[] {
+                    "ModelManager.discoverModelDependencies",
+                    "ModelManager.buildModelGroups",
+            };
+        } else {
+            throw new IOException(
+                    "Unsupported ModelManager async continuation count: "
+                            + modelContinuationCount);
+        }
         int modelContinuation = 0;
         for (AbstractInsnNode instruction = modelReload.instructions.getFirst(); instruction != null;
                 instruction = instruction.getNext()) {
@@ -6496,6 +12683,29 @@ public final class MinecraftClientPatcher {
         writeComputeFrames(node, output);
     }
 
+    private static void patchUnihexProviderBrowserAccess(String jar, Path output)
+            throws IOException {
+        ClassNode node = read(jar,
+                "net/minecraft/client/gui/font/providers/UnihexProvider.class");
+        MethodNode constructor = find(
+                node,
+                "<init>",
+                "(Lnet/minecraft/client/gui/font/CodepointMap;)V");
+        MethodNode unpack = find(
+                node,
+                "unpackBitsToBytes",
+                "(Ljava/nio/IntBuffer;"
+                        + "Lnet/minecraft/client/gui/font/providers/UnihexProvider$LineData;II)V");
+        if (constructor == null || unpack == null) {
+            throw new IOException("UnihexProvider browser access points were not found");
+        }
+        constructor.access = (constructor.access & ~(Opcodes.ACC_PRIVATE | Opcodes.ACC_PROTECTED))
+                | Opcodes.ACC_PUBLIC;
+        unpack.access = (unpack.access & ~(Opcodes.ACC_PRIVATE | Opcodes.ACC_PROTECTED))
+                | Opcodes.ACC_PUBLIC;
+        write(node, output);
+    }
+
     private static void addUnihexOverrideBridge(
             ClassNode node, String bridgeName, String accessorName, String accessorDescriptor) {
         MethodNode bridge = new MethodNode(
@@ -6542,7 +12752,9 @@ public final class MinecraftClientPatcher {
             boolean match = (call.owner.equals("java/util/Collection") && call.name.equals("forEach"))
                     || (call.owner.equals("java/util/List") && call.name.equals("forEach"))
                     || (call.owner.equals("java/util/Map") && call.name.equals("forEach"))
-                    || (call.owner.equals("net/minecraft/client/resources/model/AtlasManager")
+                    || ((call.owner.equals("net/minecraft/client/resources/model/AtlasManager")
+                                    || call.owner.equals(
+                                            "net/minecraft/client/resources/model/sprite/AtlasManager"))
                             && call.name.equals("forEach"));
             if (!match) {
                 continue;
@@ -6629,15 +12841,15 @@ public final class MinecraftClientPatcher {
         AbstractInsnNode thirdFuture = previousOpcode(factory);
         AbstractInsnNode secondFuture = previousOpcode(thirdFuture);
         AbstractInsnNode firstFuture = previousOpcode(secondFuture);
-        if (!(firstFuture instanceof VarInsnNode first && first.getOpcode() == Opcodes.ALOAD && first.var == 8)
-                || !(secondFuture instanceof VarInsnNode second && second.getOpcode() == Opcodes.ALOAD && second.var == 9)
-                || !(thirdFuture instanceof VarInsnNode third && third.getOpcode() == Opcodes.ALOAD && third.var == 10)) {
+        if (!(firstFuture instanceof VarInsnNode first && first.getOpcode() == Opcodes.ALOAD)
+                || !(secondFuture instanceof VarInsnNode second && second.getOpcode() == Opcodes.ALOAD)
+                || !(thirdFuture instanceof VarInsnNode third && third.getOpcode() == Opcodes.ALOAD)) {
             throw new IOException("ModelManager dependency continuation captures changed");
         }
         InsnList replacement = new InsnList();
-        replacement.add(new VarInsnNode(Opcodes.ALOAD, 8));
-        replacement.add(new VarInsnNode(Opcodes.ALOAD, 9));
-        replacement.add(new VarInsnNode(Opcodes.ALOAD, 10));
+        replacement.add(new VarInsnNode(Opcodes.ALOAD, first.var));
+        replacement.add(new VarInsnNode(Opcodes.ALOAD, second.var));
+        replacement.add(new VarInsnNode(Opcodes.ALOAD, third.var));
         replacement.add(new VarInsnNode(Opcodes.ALOAD, 2));
         replacement.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
@@ -6720,7 +12932,6 @@ public final class MinecraftClientPatcher {
         ClassNode node = read(jar, "net/minecraft/client/multiplayer/ClientPacketListener.class");
         boolean handleLoginHooked = false;
         boolean handleLoginImmediateReadyHooked = false;
-        boolean handleLoginDifficultyHooked = false;
         boolean startWaitingHooked = false;
         boolean levelChunkHooked = false;
         boolean batchStartHooked = false;
@@ -6738,18 +12949,6 @@ public final class MinecraftClientPatcher {
                 method.instructions.insert(minecraftEvent("client.handleLogin"));
                 method.maxStack = Math.max(method.maxStack, 1);
                 handleLoginHooked = true;
-                for (var instruction = method.instructions.getFirst();
-                        instruction != null;
-                        instruction = instruction.getNext()) {
-                    if (instruction instanceof FieldInsnNode field
-                            && field.getOpcode() == Opcodes.GETSTATIC
-                            && field.owner.equals("net/minecraft/world/Difficulty")
-                            && field.name.equals("NORMAL")
-                            && field.desc.equals("Lnet/minecraft/world/Difficulty;")) {
-                        field.name = "PEACEFUL";
-                        handleLoginDifficultyHooked = true;
-                    }
-                }
                 int returnHooks = 0;
                 for (AbstractInsnNode instruction : method.instructions.toArray()) {
                     if (instruction.getOpcode() != Opcodes.RETURN) {
@@ -6862,7 +13061,6 @@ public final class MinecraftClientPatcher {
 
         if (!handleLoginHooked
                 || !handleLoginImmediateReadyHooked
-                || !handleLoginDifficultyHooked
                 || !startWaitingHooked
                 || !levelChunkHooked
                 || !batchStartHooked
@@ -7058,25 +13256,29 @@ public final class MinecraftClientPatcher {
                 root.resolve("net/minecraft/client/multiplayer/LevelLoadTracker$WaitingForPlayerChunk.class"));
     }
 
-    private static void patchServerLevelBrowserSafeDefaults(String jar, Path output) throws IOException {
-        ClassNode node = read(jar, "net/minecraft/server/level/ServerLevel.class");
-        MethodNode method = find(node, "isSpawningMonsters", "()Z");
-        InsnList code = new InsnList();
-        code.add(new InsnNode(Opcodes.ICONST_0));
-        code.add(new InsnNode(Opcodes.IRETURN));
-        replace(method, code, 1, 1);
-        write(node, output);
-    }
-
     private static void patchChunkGeneratorStructureStateBrowserFastRings(
             String jar, Path output) throws IOException {
         String owner = "net/minecraft/world/level/chunk/ChunkGeneratorStructureState";
         ClassNode node = read(jar, owner + ".class");
-        MethodNode method = find(
-                node,
-                "lambda$generateRingPositions$5",
+        String descriptor =
                 "(IILnet/minecraft/core/HolderSet;Lnet/minecraft/util/RandomSource;)"
-                        + "Lnet/minecraft/world/level/ChunkPos;");
+                        + "Lnet/minecraft/world/level/ChunkPos;";
+        MethodNode method = null;
+        for (MethodNode candidate : node.methods) {
+            if (!candidate.name.startsWith("lambda$generateRingPositions$")
+                    || !candidate.desc.equals(descriptor)) {
+                continue;
+            }
+            if (method != null) {
+                throw new IllegalStateException(
+                        "Multiple ChunkGeneratorStructureState ring-position lambdas found");
+            }
+            method = candidate;
+        }
+        if (method == null) {
+            throw new IllegalStateException(
+                    "ChunkGeneratorStructureState ring-position lambda was not found");
+        }
         InsnList code = new InsnList();
         code.add(new TypeInsnNode(Opcodes.NEW, "net/minecraft/world/level/ChunkPos"));
         code.add(new InsnNode(Opcodes.DUP));
@@ -7093,8 +13295,8 @@ public final class MinecraftClientPatcher {
         write(node, output);
     }
 
-    private static void patchNoiseBasedChunkGeneratorBrowserYield(
-            String jar, Path output) throws IOException {
+    private static void patchNoiseBasedChunkGeneratorBrowserSynchronous(
+            String jar, Path output, boolean deepWorldgenCheckpoints) throws IOException {
         ClassNode node = read(jar, "net/minecraft/world/level/levelgen/NoiseBasedChunkGenerator.class");
         MethodNode method = find(
                 node,
@@ -7105,12 +13307,11 @@ public final class MinecraftClientPatcher {
                         + "Lnet/minecraft/world/level/chunk/ChunkAccess;II)"
                         + "Lnet/minecraft/world/level/chunk/ChunkAccess;");
         cacheNoiseBasedChunkGeneratorDoFillConstants(method);
-        int checkpoints = insertPulseAfterLoopCounter(method, 23, -1);
-        if (checkpoints != 1) {
-            throw new IllegalStateException(
-                    "NoiseBasedChunkGenerator browser yield point was not found: " + checkpoints);
+        requireWorldgenSchedulerCalls("NoiseBasedChunkGenerator.doFill", method, 0);
+        if (deepWorldgenCheckpoints) {
+            patchDeepWorldgenPulseBackEdges(
+                    method, "NoiseBasedChunkGenerator.doFill");
         }
-        requireWorldgenLoopPulses("NoiseBasedChunkGenerator.doFill", method);
         MethodNode applyCarvers = find(
                 node,
                 "applyCarvers",
@@ -7119,7 +13320,12 @@ public final class MinecraftClientPatcher {
                         + "Lnet/minecraft/world/level/biome/BiomeManager;"
                         + "Lnet/minecraft/world/level/StructureManager;"
                         + "Lnet/minecraft/world/level/chunk/ChunkAccess;)V");
-        requireWorldgenLoopPulses("NoiseBasedChunkGenerator.applyCarvers", applyCarvers);
+        requireWorldgenSchedulerCalls(
+                "NoiseBasedChunkGenerator.applyCarvers", applyCarvers, 0);
+        if (deepWorldgenCheckpoints) {
+            patchDeepWorldgenPulseBackEdges(
+                    applyCarvers, "NoiseBasedChunkGenerator.applyCarvers");
+        }
         writeComputeFrames(node, output);
     }
 
@@ -7558,7 +13764,21 @@ public final class MinecraftClientPatcher {
                 "[D"));
         constructor.instructions.insertBefore(constructorReturn, initializeAmplitudes);
 
-        MethodNode getValue = find(node, "getValue", "(DDDDDZ)D");
+        MethodNode getValue = null;
+        for (MethodNode candidate : node.methods) {
+            if (!candidate.name.equals("getValue")
+                    || (!candidate.desc.equals("(DDDDDZ)D")
+                            && !candidate.desc.equals("(DDDDD)D"))) {
+                continue;
+            }
+            if (getValue != null) {
+                throw new IllegalStateException("Multiple PerlinNoise detailed getValue methods found");
+            }
+            getValue = candidate;
+        }
+        if (getValue == null) {
+            throw new IllegalStateException("PerlinNoise detailed getValue method was not found");
+        }
         int amplitudeReads = 0;
         for (AbstractInsnNode instruction = getValue.instructions.getFirst();
                 instruction != null;
@@ -7602,6 +13822,43 @@ public final class MinecraftClientPatcher {
                 false));
         code.add(new InsnNode(Opcodes.DRETURN));
         replace(method, code, 2, 2);
+
+        MethodNode compatibilityValue = new MethodNode(
+                Opcodes.ACC_PUBLIC,
+                "gaius$getValue",
+                "(DDDDDZ)D",
+                null,
+                null);
+        compatibilityValue.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        for (int local = 1; local <= 9; local += 2) {
+            compatibilityValue.instructions.add(new VarInsnNode(Opcodes.DLOAD, local));
+        }
+        if (getValue.desc.endsWith("Z)D")) {
+            compatibilityValue.instructions.add(new VarInsnNode(Opcodes.ILOAD, 11));
+        }
+        compatibilityValue.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                owner,
+                getValue.name,
+                getValue.desc,
+                false));
+        compatibilityValue.instructions.add(new InsnNode(Opcodes.DRETURN));
+        compatibilityValue.maxStack = getValue.desc.endsWith("Z)D") ? 12 : 11;
+        compatibilityValue.maxLocals = 12;
+        node.methods.add(compatibilityValue);
+
+        MethodNode hasOriginY = new MethodNode(
+                Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+                "gaius$hasOriginY",
+                "()Z",
+                null,
+                null);
+        hasOriginY.instructions.add(new InsnNode(
+                getValue.desc.endsWith("Z)D") ? Opcodes.ICONST_1 : Opcodes.ICONST_0));
+        hasOriginY.instructions.add(new InsnNode(Opcodes.IRETURN));
+        hasOriginY.maxStack = 1;
+        hasOriginY.maxLocals = 0;
+        node.methods.add(hasOriginY);
         writeComputeFrames(node, output);
     }
 
@@ -7726,20 +13983,47 @@ public final class MinecraftClientPatcher {
         write(node, output);
     }
 
-    private static void patchSurfaceSystemBrowserYield(String jar, Path output) throws IOException {
+    private static void patchSurfaceSystemBrowserSynchronous(
+            String jar, Path output, boolean deepWorldgenCheckpoints) throws IOException {
         ClassNode node = read(jar, "net/minecraft/world/level/levelgen/SurfaceSystem.class");
-        MethodNode method = find(
-                node,
-                "buildSurface",
+        String legacyDescriptor =
                 "(Lnet/minecraft/world/level/levelgen/RandomState;"
                         + "Lnet/minecraft/world/level/biome/BiomeManager;"
                         + "Lnet/minecraft/core/Registry;Z"
                         + "Lnet/minecraft/world/level/levelgen/WorldGenerationContext;"
                         + "Lnet/minecraft/world/level/chunk/ChunkAccess;"
                         + "Lnet/minecraft/world/level/levelgen/NoiseChunk;"
-                        + "Lnet/minecraft/world/level/levelgen/SurfaceRules$RuleSource;)V");
-        requireWorldgenLoopPulses("SurfaceSystem.buildSurface", method);
-        write(node, output);
+                        + "Lnet/minecraft/world/level/levelgen/SurfaceRules$RuleSource;)V";
+        String currentDescriptor =
+                "(Lnet/minecraft/world/level/levelgen/RandomState;"
+                        + "Lnet/minecraft/world/level/biome/BiomeManager;Z"
+                        + "Lnet/minecraft/world/level/levelgen/WorldGenerationContext;"
+                        + "Lnet/minecraft/world/level/chunk/ChunkAccess;"
+                        + "Lnet/minecraft/world/level/levelgen/NoiseChunk;"
+                        + "Lnet/minecraft/world/level/levelgen/SurfaceRules$RuleSource;"
+                        + "Ljava/util/Set;)V";
+        MethodNode method = null;
+        for (MethodNode candidate : node.methods) {
+            if (!candidate.name.equals("buildSurface")
+                    || (!candidate.desc.equals(legacyDescriptor)
+                            && !candidate.desc.equals(currentDescriptor))) {
+                continue;
+            }
+            if (method != null) {
+                throw new IllegalStateException("Multiple SurfaceSystem.buildSurface methods found");
+            }
+            method = candidate;
+        }
+        if (method == null) {
+            throw new IllegalStateException("SurfaceSystem.buildSurface method was not found");
+        }
+        requireWorldgenSchedulerCalls("SurfaceSystem.buildSurface", method, 0);
+        if (deepWorldgenCheckpoints) {
+            patchDeepWorldgenPulseBackEdges(method, "SurfaceSystem.buildSurface");
+            writeComputeFrames(node, output);
+        } else {
+            write(node, output);
+        }
     }
 
     private static void patchSurfaceRulesContextBrowserReusableBiomeSupplier(
@@ -7748,6 +14032,9 @@ public final class MinecraftClientPatcher {
         String helper = "dev/gaius/browser/BrowserSurfaceBiomeSupplier";
         String helperDescriptor = "L" + helper + ";";
         ClassNode node = read(jar, owner + ".class");
+        boolean currentContext = node.methods.stream()
+                .anyMatch(method -> method.name.equals("updateY")
+                        && method.desc.equals("(IIII)V"));
         node.fields.add(new FieldNode(0, "browserUpdateXZ", "I", null, null));
         node.fields.add(new FieldNode(0, "browserUpdateY", "I", null, null));
         node.fields.add(new FieldNode(
@@ -7757,16 +14044,22 @@ public final class MinecraftClientPatcher {
                 null,
                 null));
 
-        MethodNode constructor = find(
-                node,
-                "<init>",
-                "(Lnet/minecraft/world/level/levelgen/SurfaceSystem;"
+        String constructorDescriptor = currentContext
+                ? "(Lnet/minecraft/world/level/levelgen/SurfaceSystem;"
+                        + "Lnet/minecraft/world/level/levelgen/RandomState;"
+                        + "Lnet/minecraft/world/level/chunk/ChunkAccess;"
+                        + "Lnet/minecraft/world/level/levelgen/NoiseChunk;"
+                        + "Ljava/util/function/Function;"
+                        + "Lnet/minecraft/world/level/levelgen/WorldGenerationContext;"
+                        + "Ljava/util/Set;)V"
+                : "(Lnet/minecraft/world/level/levelgen/SurfaceSystem;"
                         + "Lnet/minecraft/world/level/levelgen/RandomState;"
                         + "Lnet/minecraft/world/level/chunk/ChunkAccess;"
                         + "Lnet/minecraft/world/level/levelgen/NoiseChunk;"
                         + "Ljava/util/function/Function;"
                         + "Lnet/minecraft/core/Registry;"
-                        + "Lnet/minecraft/world/level/levelgen/WorldGenerationContext;)V");
+                        + "Lnet/minecraft/world/level/levelgen/WorldGenerationContext;)V";
+        MethodNode constructor = find(node, "<init>", constructorDescriptor);
         int returns = 0;
         for (AbstractInsnNode instruction : constructor.instructions.toArray()) {
             if (instruction.getOpcode() != Opcodes.RETURN) {
@@ -7809,7 +14102,48 @@ public final class MinecraftClientPatcher {
         appendIntFieldIncrement(updateXZCounters, owner, "browserUpdateY");
         updateXZ.instructions.insertBefore(updateXZ.instructions.getFirst(), updateXZCounters);
 
-        MethodNode updateY = find(node, "updateY", "(IIIIII)V");
+        MethodNode updateY = find(node, "updateY", currentContext ? "(IIII)V" : "(IIIIII)V");
+        if (currentContext) {
+            InsnList updateYCounter = new InsnList();
+            appendIntFieldIncrement(updateYCounter, owner, "browserUpdateY");
+            updateYCounter.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            updateYCounter.add(new FieldInsnNode(
+                    Opcodes.GETFIELD, owner, "browserBiomeSupplier", helperDescriptor));
+            updateYCounter.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            updateYCounter.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "blockX", "I"));
+            updateYCounter.add(new VarInsnNode(Opcodes.ILOAD, 4));
+            updateYCounter.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            updateYCounter.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "blockZ", "I"));
+            updateYCounter.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL, helper, "reset", "(III)V", false));
+            updateY.instructions.insertBefore(updateY.instructions.getFirst(), updateYCounter);
+            MethodNode getBiome = find(
+                    node,
+                    "getBiome",
+                    "()Lnet/minecraft/core/Holder;");
+            LabelNode cached = new LabelNode();
+            InsnList getBiomeCode = new InsnList();
+            getBiomeCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            getBiomeCode.add(new FieldInsnNode(
+                    Opcodes.GETFIELD, owner, "biome", "Lnet/minecraft/core/Holder;"));
+            getBiomeCode.add(new JumpInsnNode(Opcodes.IFNONNULL, cached));
+            getBiomeCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            getBiomeCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            getBiomeCode.add(new FieldInsnNode(
+                    Opcodes.GETFIELD, owner, "browserBiomeSupplier", helperDescriptor));
+            getBiomeCode.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL, helper, "get", "()Lnet/minecraft/core/Holder;", false));
+            getBiomeCode.add(new FieldInsnNode(
+                    Opcodes.PUTFIELD, owner, "biome", "Lnet/minecraft/core/Holder;"));
+            getBiomeCode.add(cached);
+            getBiomeCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            getBiomeCode.add(new FieldInsnNode(
+                    Opcodes.GETFIELD, owner, "biome", "Lnet/minecraft/core/Holder;"));
+            getBiomeCode.add(new InsnNode(Opcodes.ARETURN));
+            replace(getBiome, getBiomeCode, 2, 1);
+            writeComputeFrames(node, output);
+            return;
+        }
         InsnList code = new InsnList();
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new InsnNode(Opcodes.DUP));
@@ -8042,27 +14376,40 @@ public final class MinecraftClientPatcher {
             "net/minecraft/util/CubicSpline$Multipoint"
         };
 
-        for (String owner : owners) {
-            Path output = root.resolve(owner + ".class");
-            ClassNode node = Files.isRegularFile(output)
-                    ? read(output)
-                    : read(jar, owner + ".class");
-            cacheImmutableRecordHashCode(node, owner);
-            writeComputeFrames(node, output);
+        try (ZipFile input = new ZipFile(jar)) {
+            for (String owner : owners) {
+                Path output = root.resolve(owner + ".class");
+                if (!Files.isRegularFile(output) && input.getEntry(owner + ".class") == null) {
+                    System.out.println("Skipping removed worldgen hash cache target " + owner);
+                    continue;
+                }
+                ClassNode node = Files.isRegularFile(output)
+                        ? read(output)
+                        : read(jar, owner + ".class");
+                cacheImmutableRecordHashCode(node, owner);
+                writeComputeFrames(node, output);
+            }
         }
     }
 
     private static void cacheImmutableRecordHashCode(ClassNode node, String owner) {
-        if ((node.access & Opcodes.ACC_RECORD) == 0) {
-            throw new IllegalStateException("Worldgen hash cache target is not a record: " + owner);
+        boolean record = (node.access & Opcodes.ACC_RECORD) != 0;
+        boolean finalImmutableClass = (node.access & Opcodes.ACC_FINAL) != 0
+                && node.fields.stream()
+                        .filter(field -> (field.access & Opcodes.ACC_STATIC) == 0)
+                        .allMatch(field -> (field.access & Opcodes.ACC_FINAL) != 0);
+        if (!record && !finalImmutableClass) {
+            throw new IllegalStateException(
+                    "Worldgen hash cache target is not immutable: " + owner);
         }
         if (node.fields.stream().anyMatch(field -> field.name.startsWith("browserHashCode"))) {
             throw new IllegalStateException("Worldgen hash cache fields already exist: " + owner);
         }
 
         MethodNode hashCode = find(node, "hashCode", "()I");
-        if (hashCode == null || (hashCode.access & Opcodes.ACC_FINAL) == 0) {
-            throw new IllegalStateException("Final worldgen record hashCode was not found: " + owner);
+        if ((hashCode.access & Opcodes.ACC_FINAL) == 0
+                && (node.access & Opcodes.ACC_FINAL) == 0) {
+            throw new IllegalStateException("Final worldgen hashCode was not found: " + owner);
         }
         AbstractInsnNode[] originalInstructions = hashCode.instructions.toArray();
         int returns = 0;
@@ -8223,20 +14570,23 @@ public final class MinecraftClientPatcher {
         writeComputeFrames(node, output);
     }
 
-    private static void patchNoiseChunkBrowserYield(String jar, Path output) throws IOException {
+    private static void patchNoiseChunkBrowserSynchronous(String jar, Path output)
+            throws IOException {
         String owner = "net/minecraft/world/level/levelgen/NoiseChunk";
         ClassNode node = read(jar, owner + ".class");
         convertNoiseChunkCountersToInt(node, false);
         addNoiseInterpolatorArrayCache(node, owner);
-        requireWorldgenLoopPulses("NoiseChunk.fillSlice", find(node, "fillSlice", "(ZI)V"));
-        requireWorldgenLoopPulses(
+        MethodNode fillSlice = find(node, "fillSlice", "(ZI)V");
+        requireWorldgenSchedulerCalls("NoiseChunk.fillSlice", fillSlice, 0);
+        requireWorldgenSchedulerCalls(
                 "NoiseChunk.fillAllDirectly",
                 find(
                         node,
                         "fillAllDirectly",
-                        "([DLnet/minecraft/world/level/levelgen/DensityFunction;)V"));
-        requireWorldgenLoopPulses(
-                "NoiseChunk.selectCellYZ", find(node, "selectCellYZ", "(II)V"));
+                        "([DLnet/minecraft/world/level/levelgen/DensityFunction;)V"),
+                0);
+        requireWorldgenSchedulerCalls(
+                "NoiseChunk.selectCellYZ", find(node, "selectCellYZ", "(II)V"), 0);
         replaceNoiseInterpolatorUpdate(node, owner, "updateForY", "cellStartBlockY", "inCellY", false);
         replaceNoiseInterpolatorUpdate(node, owner, "updateForX", "cellStartBlockX", "inCellX", false);
         replaceNoiseInterpolatorUpdate(node, owner, "updateForZ", "cellStartBlockZ", "inCellZ", true);
@@ -8548,7 +14898,8 @@ public final class MinecraftClientPatcher {
         replace(method, code, 5, 6);
     }
 
-    private static void patchClimateRTreeBrowserYield(String jar, Path output) throws IOException {
+    private static void patchClimateRTreeBrowserSynchronous(
+            String jar, Path output, boolean deepWorldgenCheckpoints) throws IOException {
         ClassNode node = read(jar, "net/minecraft/world/level/biome/Climate$RTree$SubTree.class");
         MethodNode method = find(
                 node,
@@ -8556,8 +14907,25 @@ public final class MinecraftClientPatcher {
                 "([JLnet/minecraft/world/level/biome/Climate$RTree$Leaf;"
                         + "Lnet/minecraft/world/level/biome/Climate$DistanceMetric;)"
                         + "Lnet/minecraft/world/level/biome/Climate$RTree$Leaf;");
-        requireWorldgenLoopPulses("Climate.RTree.SubTree.search", method);
-        write(node, output);
+        requireWorldgenSchedulerCalls("Climate.RTree.SubTree.search", method, 0);
+        if (!deepWorldgenCheckpoints) {
+            write(node, output);
+            return;
+        }
+
+        int checkpoints = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (!(instruction instanceof IincInsnNode increment) || increment.var != 9) {
+                continue;
+            }
+            method.instructions.insert(instruction, browserWorldgenDeepPulse());
+            checkpoints++;
+        }
+        if (checkpoints != 1) {
+            throw new IllegalStateException(
+                    "Climate RTree subtree search loop shape changed: checkpoints=" + checkpoints);
+        }
+        writeComputeFrames(node, output);
     }
 
     private static void patchClimateRTreeNodeBrowserDoubleDistance(
@@ -8626,19 +14994,117 @@ public final class MinecraftClientPatcher {
         writeComputeFrames(node, output);
     }
 
-    private static void patchChunkGeneratorBrowserYield(String jar, Path output) throws IOException {
+    private static void patchChunkGeneratorBrowserSynchronous(
+            String jar, Path output, boolean deepWorldgenCheckpoints) throws IOException {
         ClassNode node = read(jar, "net/minecraft/world/level/chunk/ChunkGenerator.class");
-        MethodNode method = find(
+        MethodNode decoration = find(
                 node,
                 "applyBiomeDecoration",
                 "(Lnet/minecraft/world/level/WorldGenLevel;"
                         + "Lnet/minecraft/world/level/chunk/ChunkAccess;"
                         + "Lnet/minecraft/world/level/StructureManager;)V");
-        requireWorldgenLoopPulses("ChunkGenerator.applyBiomeDecoration", method);
-        write(node, output);
+        requireWorldgenSchedulerCalls("ChunkGenerator.applyBiomeDecoration", decoration, 0);
+        if (deepWorldgenCheckpoints) {
+            patchDeepWorldgenPulseBackEdges(
+                    decoration, "ChunkGenerator.applyBiomeDecoration");
+        }
+
+        String structureSetDescriptor =
+                "(Lnet/minecraft/world/level/StructureManager;"
+                        + "Lnet/minecraft/core/SectionPos;"
+                        + "Lnet/minecraft/world/level/chunk/ChunkAccess;"
+                        + "Lnet/minecraft/world/level/chunk/ChunkGeneratorStructureState;"
+                        + "Lnet/minecraft/world/level/ChunkPos;"
+                        + "Lnet/minecraft/core/RegistryAccess;"
+                        + "Lnet/minecraft/world/level/levelgen/RandomState;"
+                        + "Lnet/minecraft/world/level/levelgen/structure/templatesystem/"
+                        + "StructureTemplateManager;"
+                        + "Lnet/minecraft/resources/ResourceKey;"
+                        + "Lnet/minecraft/core/Holder;)V";
+        MethodNode structureSets = null;
+        for (MethodNode candidate : node.methods) {
+            if (candidate.name.startsWith("lambda$createStructures$")
+                    && candidate.desc.equals(structureSetDescriptor)) {
+                if (structureSets != null) {
+                    throw new IllegalStateException(
+                            "ChunkGenerator has multiple createStructures lambdas");
+                }
+                structureSets = candidate;
+            }
+        }
+        if (structureSets == null) {
+            throw new IllegalStateException("ChunkGenerator createStructures lambda was not found");
+        }
+        requireWorldgenSchedulerCalls("ChunkGenerator.createStructures", structureSets, 0);
+        if (deepWorldgenCheckpoints) {
+            int checkpoints = 0;
+            for (AbstractInsnNode instruction : structureSets.instructions.toArray()) {
+                if (!(instruction instanceof MethodInsnNode call)
+                        || call.getOpcode() != Opcodes.INVOKEVIRTUAL
+                        || !call.owner.equals("net/minecraft/world/level/chunk/ChunkGenerator")
+                        || !call.name.equals("tryGenerateStructure")) {
+                    continue;
+                }
+                structureSets.instructions.insertBefore(
+                        instruction, browserWorldgenDeepPulse());
+                checkpoints++;
+            }
+            if (checkpoints < 2) {
+                throw new IllegalStateException(
+                        "ChunkGenerator structure selection call shape changed: checkpoints="
+                                + checkpoints);
+            }
+            patchDeepWorldgenPulseBackEdges(
+                    structureSets, "ChunkGenerator.createStructures");
+        }
+
+        MethodNode references = find(
+                node,
+                "createReferences",
+                "(Lnet/minecraft/world/level/WorldGenLevel;"
+                        + "Lnet/minecraft/world/level/StructureManager;"
+                        + "Lnet/minecraft/world/level/chunk/ChunkAccess;)V");
+        requireWorldgenSchedulerCalls("ChunkGenerator.createReferences", references, 0);
+        if (deepWorldgenCheckpoints) {
+            writeComputeFrames(node, output);
+        } else {
+            write(node, output);
+        }
     }
 
-    private static void patchWorldCarverBrowserYield(String jar, Path output) throws IOException {
+    private static void patchJigsawPlacementBrowserDeepCheckpoints(
+            String jar, Path output) throws IOException {
+        String owner = "net/minecraft/world/level/levelgen/structure/pools/JigsawPlacement$Placer";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode method = find(
+                node,
+                "tryPlacingChildren",
+                "(Lnet/minecraft/world/level/levelgen/structure/PoolElementStructurePiece;"
+                        + "Lorg/apache/commons/lang3/mutable/MutableObject;IZ"
+                        + "Lnet/minecraft/world/level/LevelHeightAccessor;"
+                        + "Lnet/minecraft/world/level/levelgen/RandomState;"
+                        + "Lnet/minecraft/world/level/levelgen/structure/pools/alias/PoolAliasLookup;"
+                        + "Lnet/minecraft/world/level/levelgen/structure/templatesystem/LiquidSettings;)V");
+        int checkpoints = 0;
+        AbstractInsnNode[] instructions = method.instructions.toArray();
+        for (int index = 0; index < instructions.length; index++) {
+            AbstractInsnNode instruction = instructions[index];
+            if (!(instruction instanceof JumpInsnNode jump)
+                    || method.instructions.indexOf(jump.label) >= index) {
+                continue;
+            }
+            method.instructions.insertBefore(instruction, browserWorldgenDeepPulse());
+            checkpoints++;
+        }
+        if (checkpoints == 0) {
+            throw new IllegalStateException(
+                    "Jigsaw placement child loop shape changed: no back-edge checkpoint");
+        }
+        writeComputeFrames(node, output);
+    }
+
+    private static void patchWorldCarverBrowserSynchronous(
+            String jar, Path output, boolean deepWorldgenCheckpoints) throws IOException {
         ClassNode node = read(jar, "net/minecraft/world/level/levelgen/carver/WorldCarver.class");
         MethodNode method = find(
                 node,
@@ -8649,51 +15115,46 @@ public final class MinecraftClientPatcher {
                         + "Lnet/minecraft/world/level/levelgen/Aquifer;DDDDD"
                         + "Lnet/minecraft/world/level/chunk/CarvingMask;"
                         + "Lnet/minecraft/world/level/levelgen/carver/WorldCarver$CarveSkipChecker;)Z");
-        requireWorldgenLoopPulses("WorldCarver.carveEllipsoid", method);
-        write(node, output);
+        requireWorldgenSchedulerCalls("WorldCarver.carveEllipsoid", method, 0);
+        if (deepWorldgenCheckpoints) {
+            patchDeepWorldgenPulseBackEdges(method, "WorldCarver.carveEllipsoid");
+            writeComputeFrames(node, output);
+        } else {
+            write(node, output);
+        }
     }
 
-    private static void patchLightEngineBrowserYield(String jar, Path output) throws IOException {
+    private static void patchLightEngineBrowserSynchronous(
+            String jar, Path output, boolean deepWorldgenCheckpoints) throws IOException {
         ClassNode node = read(jar, "net/minecraft/world/level/lighting/LightEngine.class");
         MethodNode increases = find(node, "propagateIncreases", "()I");
         MethodNode decreases = find(node, "propagateDecreases", "()I");
-        requireWorldgenLoopPulses("LightEngine.propagateIncreases", increases);
-        requireWorldgenLoopPulses("LightEngine.propagateDecreases", decreases);
-        write(node, output);
+        requireWorldgenSchedulerCalls("LightEngine.propagateIncreases", increases, 0);
+        requireWorldgenSchedulerCalls("LightEngine.propagateDecreases", decreases, 0);
+        if (deepWorldgenCheckpoints) {
+            patchDeepWorldgenPulseBackEdges(increases, "LightEngine.propagateIncreases");
+            patchDeepWorldgenPulseBackEdges(decreases, "LightEngine.propagateDecreases");
+            writeComputeFrames(node, output);
+        } else {
+            write(node, output);
+        }
     }
 
-    private static void patchLevelChunkSectionBrowserBiomeYield(
-            String jar, Path output) throws IOException {
+    private static void patchLevelChunkSectionBrowserSynchronous(
+            String jar, Path output, boolean deepWorldgenCheckpoints) throws IOException {
         ClassNode node = read(jar, "net/minecraft/world/level/chunk/LevelChunkSection.class");
         MethodNode method = find(
                 node,
                 "fillBiomesFromNoise",
                 "(Lnet/minecraft/world/level/biome/BiomeResolver;"
                         + "Lnet/minecraft/world/level/biome/Climate$Sampler;III)V");
-        int checkpoints = insertPulseAfterLoopCounter(method, 9, 1);
-        if (checkpoints != 1) {
-            throw new IllegalStateException(
-                    "LevelChunkSection browser biome yield point was not found: " + checkpoints);
+        requireWorldgenSchedulerCalls("LevelChunkSection.fillBiomesFromNoise", method, 0);
+        if (deepWorldgenCheckpoints) {
+            patchDeepWorldgenPulseBackEdges(method, "LevelChunkSection.fillBiomesFromNoise");
+            writeComputeFrames(node, output);
+        } else {
+            write(node, output);
         }
-        write(node, output);
-    }
-
-    private static int insertPulseAfterLoopCounter(
-            MethodNode method, int localVariable, int increment) {
-        int checkpoints = 0;
-        for (var instruction = method.instructions.getFirst();
-                instruction != null;
-                instruction = instruction.getNext()) {
-            if (instruction instanceof IincInsnNode counter
-                    && counter.var == localVariable
-                    && counter.incr == increment
-                    && nextRealInstruction(instruction) instanceof JumpInsnNode jump
-                    && jump.getOpcode() == Opcodes.GOTO) {
-                method.instructions.insert(instruction, browserWorldgenPulse());
-                checkpoints++;
-            }
-        }
-        return checkpoints;
     }
 
     private static MethodInsnNode browserWorldgenCheckpoint() {
@@ -8705,35 +15166,321 @@ public final class MinecraftClientPatcher {
                 false);
     }
 
-    private static void requireWorldgenLoopPulses(String label, MethodNode method) {
-        int pulses = insertWorldgenPulseOnLoopBackedges(method);
-        if (pulses == 0) {
-            throw new IllegalStateException(label + " browser loop backedges were not found");
-        }
+    private static MethodInsnNode browserWorldgenDeepCheckpoint() {
+        return new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserWorldgenDeepCheckpoint",
+                "checkpoint",
+                "()V",
+                false);
     }
 
-    private static int insertWorldgenPulseOnLoopBackedges(MethodNode method) {
+    private static MethodInsnNode browserWorldgenDeepPulse() {
+        return new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserWorldgenDeepCheckpoint",
+                "pulse",
+                "()V",
+                false);
+    }
+
+    /** Inserts budget-aware pulses at all backwards control-flow edges in one deep loop. */
+    private static int patchDeepWorldgenPulseBackEdges(MethodNode method, String label) {
         int pulses = 0;
-        for (var instruction = method.instructions.getFirst();
-                instruction != null;
-                instruction = instruction.getNext()) {
-            if (instruction instanceof JumpInsnNode jump
-                    && method.instructions.indexOf(jump.label)
-                            < method.instructions.indexOf(instruction)) {
-                method.instructions.insertBefore(instruction, browserWorldgenPulse());
-                pulses++;
+        AbstractInsnNode[] instructions = method.instructions.toArray();
+        for (int index = 0; index < instructions.length; index++) {
+            AbstractInsnNode instruction = instructions[index];
+            if (!(instruction instanceof JumpInsnNode jump)
+                    || method.instructions.indexOf(jump.label) >= index) {
+                continue;
             }
+            method.instructions.insertBefore(jump, browserWorldgenDeepPulse());
+            pulses++;
+        }
+        if (pulses == 0) {
+            throw new IllegalStateException(label + " has no deep worldgen loop back-edge");
         }
         return pulses;
     }
 
-    private static MethodInsnNode browserWorldgenPulse() {
+    private static MethodInsnNode browserWorldgenBeginTaskWork() {
         return new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 "dev/gaius/browser/BrowserWorldgenScheduler",
-                "pulse",
+                "beginTaskWork",
+                "(Ljava/lang/String;)I",
+                false);
+    }
+
+    private static MethodInsnNode browserWorldgenEndTaskWork() {
+        return new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserWorldgenScheduler",
+                "endTaskWork",
+                "(I)V",
+                false);
+    }
+
+    private static MethodInsnNode browserWorldgenMobAiPulse() {
+        return new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserWorldgenScheduler",
+                "mobAiPulse",
                 "()V",
                 false);
+    }
+
+    private static MethodInsnNode browserWorldgenMobEntityPulse() {
+        return new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserWorldgenScheduler",
+                "mobEntityPulse",
+                "(Ljava/lang/Object;)V",
+                false);
+    }
+
+    private static InsnList browserGenerationSpawnEntityAddedCode(int tokenLocal) {
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ILOAD, tokenLocal));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserGenerationSpawnTelemetry",
+                "entityAdded",
+                "(I)V",
+                false));
+        return code;
+    }
+
+    private static InsnList browserGenerationSpawnFinishCode(String method, int tokenLocal) {
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ILOAD, tokenLocal));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserGenerationSpawnTelemetry",
+                method,
+                "(I)V",
+                false));
+        return code;
+    }
+
+    private static void patchNaturalSpawnerGenerationSpawnTelemetry(
+            String jar, Path output, String minecraftVersion) throws IOException {
+        String owner = "net/minecraft/world/level/NaturalSpawner";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode method = find(
+                node,
+                "spawnMobsForChunkGeneration",
+                "(Lnet/minecraft/world/level/ServerLevelAccessor;"
+                        + "Lnet/minecraft/core/Holder;"
+                        + "Lnet/minecraft/world/level/ChunkPos;"
+                        + "Lnet/minecraft/util/RandomSource;)V");
+        int tokenLocal = method.maxLocals++;
+        LabelNode start = new LabelNode();
+        LabelNode end = new LabelNode();
+        LabelNode handler = new LabelNode();
+        int throwableLocal = method.maxLocals++;
+        InsnList entry = new InsnList();
+        entry.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        entry.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "net/minecraft/world/level/ServerLevelAccessor",
+                "getLevel",
+                "()Lnet/minecraft/server/level/ServerLevel;",
+                true));
+        entry.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        if ("26.2".equals(minecraftVersion)) {
+            entry.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                    "net/minecraft/world/level/ChunkPos", "x", "()I", false));
+        } else {
+            entry.add(new FieldInsnNode(Opcodes.GETFIELD,
+                    "net/minecraft/world/level/ChunkPos", "x", "I"));
+        }
+        entry.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        if ("26.2".equals(minecraftVersion)) {
+            entry.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                    "net/minecraft/world/level/ChunkPos", "z", "()I", false));
+        } else {
+            entry.add(new FieldInsnNode(Opcodes.GETFIELD,
+                    "net/minecraft/world/level/ChunkPos", "z", "I"));
+        }
+        entry.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserGenerationSpawnTelemetry", "begin",
+                "(Ljava/lang/Object;II)I", false));
+        entry.add(new VarInsnNode(Opcodes.ISTORE, tokenLocal));
+        entry.add(start);
+        method.instructions.insertBefore(method.instructions.getFirst(), entry);
+        int added = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals("net/minecraft/world/level/ServerLevelAccessor")
+                    && call.name.equals("addFreshEntityWithPassengers")
+                    && call.desc.equals("(Lnet/minecraft/world/entity/Entity;)V")) {
+                method.instructions.insert(call, browserGenerationSpawnEntityAddedCode(tokenLocal));
+                added++;
+            }
+        }
+        int returns = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction.getOpcode() == Opcodes.RETURN) {
+                method.instructions.insertBefore(instruction,
+                        browserGenerationSpawnFinishCode("complete", tokenLocal));
+                returns++;
+            }
+        }
+        if (returns == 0 || added == 0) {
+            throw new IllegalStateException("NaturalSpawner telemetry anchors missing: returns="
+                    + returns + ", entityAdds=" + added);
+        }
+        InsnList cleanup = new InsnList();
+        cleanup.add(end);
+        cleanup.add(handler);
+        cleanup.add(new VarInsnNode(Opcodes.ASTORE, throwableLocal));
+        cleanup.add(browserGenerationSpawnFinishCode("failed", tokenLocal));
+        cleanup.add(new VarInsnNode(Opcodes.ALOAD, throwableLocal));
+        cleanup.add(new InsnNode(Opcodes.ATHROW));
+        method.instructions.add(cleanup);
+        method.tryCatchBlocks.add(new TryCatchBlockNode(start, end, handler, "java/lang/Throwable"));
+        writeComputeFrames(node, output);
+        System.out.println("Instrumented NaturalSpawner generation spawn telemetry ("
+                + minecraftVersion + "): returns=" + returns + ", entityAdds=" + added);
+    }
+    /**
+     * Instruments a task-layer entry without touching the deep synchronous
+     * worldgen methods.  Normal returns are explicit so the scope closes before
+     * {@code pollTask} hands control back to {@code waitUntilNextTick}; the
+     * per-invocation token is loaded at every close, and the catch-all is a
+     * Java-bytecode finally for exceptions which escape existing handlers.
+     */
+    private static void instrumentBrowserTaskScope(
+            MethodNode method, String target, int returnOpcode) {
+        instrumentBrowserTaskScope(method, target, returnOpcode, null);
+    }
+
+    /**
+     * Adds a task-scope token and a caller-supplied entry operation.  The
+     * optional operation is placed after the token store but inside the
+     * catch-all range, so generic pollTask keeps its urgent packet pump while
+     * every exceptional path still closes the exact invocation that began.
+     */
+    private static void instrumentBrowserTaskScope(
+            MethodNode method,
+            String target,
+            int returnOpcode,
+            InsnList afterTokenEntry) {
+        if (method.instructions.getFirst() == null) {
+            throw new IllegalStateException(target + " has no instructions");
+        }
+
+        LabelNode start = new LabelNode();
+        LabelNode end = new LabelNode();
+        LabelNode handler = new LabelNode();
+        int taskScopeLocal = method.maxLocals++;
+        int throwableLocal = method.maxLocals++;
+        InsnList entry = new InsnList();
+        entry.add(new LdcInsnNode(target));
+        entry.add(browserWorldgenBeginTaskWork());
+        entry.add(new VarInsnNode(Opcodes.ISTORE, taskScopeLocal));
+        // Start the catch range only after beginTaskWork has returned its
+        // token.  Any generic entry pump after this point is therefore closed
+        // with the same token if it throws.
+        entry.add(start);
+        if (afterTokenEntry != null) {
+            entry.add(afterTokenEntry);
+        }
+        method.instructions.insertBefore(method.instructions.getFirst(), entry);
+
+        int returns = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction.getOpcode() != returnOpcode) {
+                continue;
+            }
+            InsnList close = new InsnList();
+            close.add(new VarInsnNode(Opcodes.ILOAD, taskScopeLocal));
+            close.add(browserWorldgenEndTaskWork());
+            method.instructions.insertBefore(instruction, close);
+            returns++;
+        }
+        if (returns == 0) {
+            throw new IllegalStateException(target + " has no normal return for task scope");
+        }
+
+        InsnList cleanup = new InsnList();
+        cleanup.add(end);
+        cleanup.add(handler);
+        cleanup.add(new VarInsnNode(Opcodes.ASTORE, throwableLocal));
+        cleanup.add(new VarInsnNode(Opcodes.ILOAD, taskScopeLocal));
+        cleanup.add(browserWorldgenEndTaskWork());
+        cleanup.add(new VarInsnNode(Opcodes.ALOAD, throwableLocal));
+        cleanup.add(new InsnNode(Opcodes.ATHROW));
+        method.instructions.add(cleanup);
+        method.tryCatchBlocks.add(new TryCatchBlockNode(
+                start, end, handler, "java/lang/Throwable"));
+        method.maxStack = Math.max(method.maxStack, 1);
+        System.out.println("Instrumented " + target + " active-work scope: returns=" + returns);
+    }
+
+    private static MethodInsnNode browserWorldgenBeginServerWorkTurn() {
+        return new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserWorldgenScheduler",
+                "beginServerWorkTurn",
+                "()V",
+                false);
+    }
+
+    private static MethodInsnNode browserServerTickTelemetryBegin() {
+        return new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserWorldgenScheduler",
+                "beginServerTickTelemetry",
+                "()V",
+                false);
+    }
+
+    private static MethodInsnNode browserServerTickTelemetryEnd() {
+        return new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserWorldgenScheduler",
+                "endServerTickTelemetry",
+                "()V",
+                false);
+    }
+
+    private static MethodInsnNode browserServerWaitTelemetryBegin() {
+        return new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserWorldgenScheduler",
+                "beginServerWaitTelemetry",
+                "()V",
+                false);
+    }
+
+    private static MethodInsnNode browserServerWaitTelemetryEnd() {
+        return new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserWorldgenScheduler",
+                "endServerWaitTelemetry",
+                "()V",
+                false);
+    }
+
+    private static void requireWorldgenSchedulerCalls(
+            String label, MethodNode method, int expectedCalls) {
+        int pulses = 0;
+        for (var instruction : method.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("dev/gaius/browser/BrowserWorldgenScheduler")
+                    && call.desc.equals("()V")) {
+                pulses++;
+            }
+        }
+        if (pulses != expectedCalls) {
+            throw new IllegalStateException(
+                    label + " browser scheduler calls changed: " + pulses
+                            + " (expected " + expectedCalls + ")");
+        }
     }
 
     private static void patchRegionFileVersionBrowserNoCompression(String jar, Path output) throws IOException {
@@ -9513,15 +16260,29 @@ public final class MinecraftClientPatcher {
     private static void patchBufferBuilderBrowserFastVertex(String jar, Path output) throws IOException {
         String owner = "com/mojang/blaze3d/vertex/BufferBuilder";
         ClassNode node = read(jar, owner + ".class");
-        addBrowserBeginElementOffset(node, owner);
-        patchBufferBuilderBrowserGuiWriters(node, owner);
+        boolean semanticElementIds = node.methods.stream()
+                .anyMatch(method -> method.name.equals("beginElement")
+                        && method.desc.equals("(I)J"));
+        addBrowserBeginElementOffset(node, owner, semanticElementIds);
+        patchBufferBuilderBrowserGuiWriters(node, owner, semanticElementIds);
         MethodNode method = find(node, "addVertex", "(FFFIFFIIFFF)V");
         LabelNode fallback = new LabelNode();
+        LabelNode fastPath = new LabelNode();
         InsnList code = new InsnList();
 
-        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "fastFormat", "Z"));
-        code.add(new JumpInsnNode(Opcodes.IFEQ, fallback));
+        if (semanticElementIds) {
+            code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "blockFormat", "Z"));
+            code.add(new JumpInsnNode(Opcodes.IFNE, fastPath));
+            code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "entityFormat", "Z"));
+            code.add(new JumpInsnNode(Opcodes.IFEQ, fallback));
+            code.add(fastPath);
+        } else {
+            code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "fastFormat", "Z"));
+            code.add(new JumpInsnNode(Opcodes.IFEQ, fallback));
+        }
 
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
@@ -9544,7 +16305,11 @@ public final class MinecraftClientPatcher {
         code.add(new VarInsnNode(Opcodes.FLOAD, 10));
         code.add(new VarInsnNode(Opcodes.FLOAD, 11));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "fullFormat", "Z"));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                semanticElementIds ? "entityFormat" : "fullFormat",
+                "Z"));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 "org/lwjgl/system/BrowserMemory",
@@ -9673,11 +16438,18 @@ public final class MinecraftClientPatcher {
         String meshOwner = "com/mojang/blaze3d/vertex/MeshData";
         String helperOwner = "dev/gaius/browser/BrowserMeshUpload";
         ClassNode node = read(jar, owner + ".class");
-        MethodNode method = find(
-                node,
-                "uploadMeshLayer",
+        String uploadDescriptor =
                 "(Lnet/minecraft/client/renderer/chunk/ChunkSectionLayer;"
-                        + "Lcom/mojang/blaze3d/vertex/MeshData;J)V");
+                        + "Lcom/mojang/blaze3d/vertex/MeshData;J)V";
+        MethodNode method = node.methods.stream()
+                .filter(candidate -> candidate.name.equals("uploadMeshLayer")
+                        && candidate.desc.equals(uploadDescriptor))
+                .findFirst()
+                .orElse(null);
+        if (method == null) {
+            verifyCurrentSectionMeshSingleViewUpload(jar, meshOwner);
+            return;
+        }
 
         InsnList begin = new InsnList();
         begin.add(new VarInsnNode(Opcodes.ALOAD, 2));
@@ -9725,31 +16497,72 @@ public final class MinecraftClientPatcher {
         writeComputeFrames(node, output);
     }
 
-    private static void patchBufferBuilderBrowserGuiWriters(ClassNode node, String owner) {
-        patchBufferBuilderFloatPosition(node, owner);
-        patchBufferBuilderMatrixPosition(node, owner);
-        patchBufferBuilderSetColor(node, owner);
-        patchBufferBuilderSetUv(node, owner);
-        patchBufferBuilderSetOverlayOrLight(node, owner, "setOverlay");
-        patchBufferBuilderSetOverlayOrLight(node, owner, "setLight");
-        patchBufferBuilderUvShort(node, owner);
-        patchBufferBuilderSetNormal(node, owner);
+    private static void verifyCurrentSectionMeshSingleViewUpload(String jar, String meshOwner)
+            throws IOException {
+        String compileTask =
+                "net/minecraft/client/renderer/chunk/"
+                        + "SectionRenderDispatcher$RenderSection$CompileTask";
+        ClassNode node = read(jar, compileTask + ".class");
+        MethodNode method = find(
+                node,
+                "doTask",
+                "(Lnet/minecraft/client/renderer/SectionBufferBuilderPack;)"
+                        + "Lnet/minecraft/client/renderer/chunk/"
+                        + "SectionRenderDispatcher$RenderSection$SectionTask$SectionTaskResult;");
+        int vertexViews = 0;
+        int indexViews = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKEVIRTUAL
+                    || !call.owner.equals(meshOwner)
+                    || !call.desc.equals("()Ljava/nio/ByteBuffer;")) {
+                continue;
+            }
+            if (call.name.equals("vertexBuffer")) {
+                vertexViews++;
+            } else if (call.name.equals("indexBuffer")) {
+                indexViews++;
+            }
+        }
+        if (vertexViews != 1 || indexViews != 1) {
+            throw new IllegalStateException(
+                    "Current section upload expected one vertex and one index view, found "
+                            + vertexViews + " and " + indexViews);
+        }
+        System.out.println("Verified current single-view section mesh upload");
     }
 
-    private static void addBrowserBeginElementOffset(ClassNode node, String owner) {
+    private static void patchBufferBuilderBrowserGuiWriters(
+            ClassNode node, String owner, boolean semanticElementIds) {
+        patchBufferBuilderFloatPosition(node, owner, semanticElementIds);
+        patchBufferBuilderMatrixPosition(node, owner, semanticElementIds);
+        patchBufferBuilderSetColor(node, owner, semanticElementIds);
+        patchBufferBuilderSetUv(node, owner, semanticElementIds);
+        patchBufferBuilderSetOverlayOrLight(node, owner, "setOverlay", semanticElementIds);
+        patchBufferBuilderSetOverlayOrLight(node, owner, "setLight", semanticElementIds);
+        patchBufferBuilderUvShort(node, owner, semanticElementIds);
+        patchBufferBuilderSetNormal(node, owner, semanticElementIds);
+    }
+
+    private static void addBrowserBeginElementOffset(
+            ClassNode node, String owner, boolean semanticElementIds) {
         String element = "com/mojang/blaze3d/vertex/VertexFormatElement";
         MethodNode method = new MethodNode(
                 Opcodes.ACC_PRIVATE,
                 "browserBeginElementOffset",
-                "(L" + element + ";)I",
+                semanticElementIds ? "(I)I" : "(L" + element + ";)I",
                 null,
                 null);
         LabelNode present = new LabelNode();
         InsnList code = method.instructions;
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new VarInsnNode(semanticElementIds ? Opcodes.ILOAD : Opcodes.ALOAD, 1));
         code.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL, owner, "beginElement", "(L" + element + ";)J", false));
+                Opcodes.INVOKEVIRTUAL,
+                owner,
+                "beginElement",
+                semanticElementIds ? "(I)J" : "(L" + element + ";)J",
+                false));
         code.add(new VarInsnNode(Opcodes.LSTORE, 2));
         code.add(new VarInsnNode(Opcodes.LLOAD, 2));
         code.add(new LdcInsnNode(Long.valueOf(-1L)));
@@ -9758,6 +16571,20 @@ public final class MinecraftClientPatcher {
         code.add(new InsnNode(Opcodes.ICONST_M1));
         code.add(new InsnNode(Opcodes.IRETURN));
         code.add(present);
+        if (semanticElementIds) {
+            code.add(new VarInsnNode(Opcodes.LLOAD, 2));
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "org/lwjgl/system/BrowserMemory",
+                    "dataOffset",
+                    "(J)I",
+                    false));
+            code.add(new InsnNode(Opcodes.IRETURN));
+            method.maxStack = 4;
+            method.maxLocals = 4;
+            node.methods.add(method);
+            return;
+        }
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new FieldInsnNode(
                 Opcodes.GETFIELD, owner, "buffer", "Lcom/mojang/blaze3d/vertex/ByteBufferBuilder;"));
@@ -9804,9 +16631,10 @@ public final class MinecraftClientPatcher {
         code.add(new InsnNode(Opcodes.IADD));
     }
 
-    private static void patchBufferBuilderFloatPosition(ClassNode node, String owner) {
+    private static void patchBufferBuilderFloatPosition(
+            ClassNode node, String owner, boolean semanticElementIds) {
         MethodNode method = find(node, "addVertex", "(FFF)Lcom/mojang/blaze3d/vertex/VertexConsumer;");
-        InsnList code = beginBufferBuilderVertexPosition(owner);
+        InsnList code = beginBufferBuilderVertexPosition(owner, 4, semanticElementIds);
         code.add(new VarInsnNode(Opcodes.FLOAD, 1));
         code.add(new VarInsnNode(Opcodes.FLOAD, 2));
         code.add(new VarInsnNode(Opcodes.FLOAD, 3));
@@ -9818,16 +16646,17 @@ public final class MinecraftClientPatcher {
                 false));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new InsnNode(Opcodes.ARETURN));
-        replace(method, code, 6, 4);
+        replace(method, code, 6, semanticElementIds ? 5 : 4);
     }
 
-    private static void patchBufferBuilderMatrixPosition(ClassNode node, String owner) {
+    private static void patchBufferBuilderMatrixPosition(
+            ClassNode node, String owner, boolean semanticElementIds) {
         MethodNode method = findOrCreateMethod(
                 node,
                 Opcodes.ACC_PUBLIC,
                 "addVertex",
                 "(Lorg/joml/Matrix4fc;FFF)Lcom/mojang/blaze3d/vertex/VertexConsumer;");
-        InsnList code = beginBufferBuilderVertexPosition(owner);
+        InsnList code = beginBufferBuilderVertexPosition(owner, 5, semanticElementIds);
         code.add(new VarInsnNode(Opcodes.ALOAD, 1));
         code.add(new VarInsnNode(Opcodes.FLOAD, 2));
         code.add(new VarInsnNode(Opcodes.FLOAD, 3));
@@ -9840,10 +16669,11 @@ public final class MinecraftClientPatcher {
                 false));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new InsnNode(Opcodes.ARETURN));
-        replace(method, code, 7, 5);
+        replace(method, code, 7, semanticElementIds ? 6 : 5);
     }
 
-    private static InsnList beginBufferBuilderVertexPosition(String owner) {
+    private static InsnList beginBufferBuilderVertexPosition(
+            String owner, int offsetLocal, boolean semanticElementIds) {
         InsnList code = new InsnList();
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
@@ -9852,7 +16682,33 @@ public final class MinecraftClientPatcher {
                 "beginVertex",
                 "()J",
                 false));
-        code.add(new InsnNode(Opcodes.POP2));
+        if (semanticElementIds) {
+            code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            code.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    owner,
+                    "elements",
+                    "[Lcom/mojang/blaze3d/vertex/VertexFormatElement;"));
+            code.add(new InsnNode(Opcodes.ICONST_0));
+            code.add(new InsnNode(Opcodes.AALOAD));
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    "com/mojang/blaze3d/vertex/VertexFormatElement",
+                    "offset",
+                    "()I",
+                    false));
+            code.add(new InsnNode(Opcodes.I2L));
+            code.add(new InsnNode(Opcodes.LADD));
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "org/lwjgl/system/BrowserMemory",
+                    "dataOffset",
+                    "(J)I",
+                    false));
+            code.add(new VarInsnNode(Opcodes.ISTORE, offsetLocal));
+        } else {
+            code.add(new InsnNode(Opcodes.POP2));
+        }
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new FieldInsnNode(
@@ -9865,29 +16721,36 @@ public final class MinecraftClientPatcher {
                 owner,
                 "elementsToFill",
                 "I"));
-        loadBrowserCurrentVertexTarget(code, owner);
-        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "offsetsByElement", "[I"));
-        code.add(new FieldInsnNode(
-                Opcodes.GETSTATIC,
-                "com/mojang/blaze3d/vertex/VertexFormatElement",
-                "POSITION",
-                "Lcom/mojang/blaze3d/vertex/VertexFormatElement;"));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL,
-                "com/mojang/blaze3d/vertex/VertexFormatElement",
-                "id",
-                "()I",
-                false));
-        code.add(new InsnNode(Opcodes.IALOAD));
-        code.add(new InsnNode(Opcodes.IADD));
+        if (semanticElementIds) {
+            loadBrowserData(code, owner);
+            code.add(new VarInsnNode(Opcodes.ILOAD, offsetLocal));
+        } else {
+            loadBrowserCurrentVertexTarget(code, owner);
+            code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "offsetsByElement", "[I"));
+            code.add(new FieldInsnNode(
+                    Opcodes.GETSTATIC,
+                    "com/mojang/blaze3d/vertex/VertexFormatElement",
+                    "POSITION",
+                    "Lcom/mojang/blaze3d/vertex/VertexFormatElement;"));
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    "com/mojang/blaze3d/vertex/VertexFormatElement",
+                    "id",
+                    "()I",
+                    false));
+            code.add(new InsnNode(Opcodes.IALOAD));
+            code.add(new InsnNode(Opcodes.IADD));
+        }
         return code;
     }
 
-    private static void patchBufferBuilderSetColor(ClassNode node, String owner) {
+    private static void patchBufferBuilderSetColor(
+            ClassNode node, String owner, boolean semanticElementIds) {
         MethodNode method = find(node, "setColor", "(I)Lcom/mojang/blaze3d/vertex/VertexConsumer;");
         InsnList code = new InsnList();
-        LabelNode done = beginBrowserElementWrite(code, owner, "COLOR", 2);
+        LabelNode done = beginBrowserElementWrite(
+                code, owner, "COLOR", 2, semanticElementIds);
         code.add(new VarInsnNode(Opcodes.ILOAD, 1));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
@@ -9901,10 +16764,12 @@ public final class MinecraftClientPatcher {
         replace(method, code, 4, 3);
     }
 
-    private static void patchBufferBuilderSetUv(ClassNode node, String owner) {
+    private static void patchBufferBuilderSetUv(
+            ClassNode node, String owner, boolean semanticElementIds) {
         MethodNode method = find(node, "setUv", "(FF)Lcom/mojang/blaze3d/vertex/VertexConsumer;");
         InsnList code = new InsnList();
-        LabelNode done = beginBrowserElementWrite(code, owner, "UV0", 3);
+        LabelNode done = beginBrowserElementWrite(
+                code, owner, "UV0", 3, semanticElementIds);
         code.add(new VarInsnNode(Opcodes.FLOAD, 1));
         code.add(new VarInsnNode(Opcodes.FLOAD, 2));
         code.add(new MethodInsnNode(
@@ -9919,11 +16784,13 @@ public final class MinecraftClientPatcher {
         replace(method, code, 4, 4);
     }
 
-    private static void patchBufferBuilderSetOverlayOrLight(ClassNode node, String owner, String methodName) {
+    private static void patchBufferBuilderSetOverlayOrLight(
+            ClassNode node, String owner, String methodName, boolean semanticElementIds) {
         MethodNode method = find(node, methodName, "(I)Lcom/mojang/blaze3d/vertex/VertexConsumer;");
         String element = methodName.equals("setOverlay") ? "UV1" : "UV2";
         InsnList code = new InsnList();
-        LabelNode done = beginBrowserElementWrite(code, owner, element, 2);
+        LabelNode done = beginBrowserElementWrite(
+                code, owner, element, 2, semanticElementIds);
         code.add(new VarInsnNode(Opcodes.ILOAD, 1));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
@@ -9937,17 +16804,23 @@ public final class MinecraftClientPatcher {
         replace(method, code, 4, 3);
     }
 
-    private static void patchBufferBuilderUvShort(ClassNode node, String owner) {
+    private static void patchBufferBuilderUvShort(
+            ClassNode node, String owner, boolean semanticElementIds) {
         MethodNode method = find(node, "uvShort",
-                "(SSLcom/mojang/blaze3d/vertex/VertexFormatElement;)Lcom/mojang/blaze3d/vertex/VertexConsumer;");
+                semanticElementIds
+                        ? "(SSI)Lcom/mojang/blaze3d/vertex/VertexConsumer;"
+                        : "(SSLcom/mojang/blaze3d/vertex/VertexFormatElement;)"
+                                + "Lcom/mojang/blaze3d/vertex/VertexConsumer;");
         InsnList code = new InsnList();
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        code.add(new VarInsnNode(semanticElementIds ? Opcodes.ILOAD : Opcodes.ALOAD, 3));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL,
                 owner,
                 "browserBeginElementOffset",
-                "(Lcom/mojang/blaze3d/vertex/VertexFormatElement;)I",
+                semanticElementIds
+                        ? "(I)I"
+                        : "(Lcom/mojang/blaze3d/vertex/VertexFormatElement;)I",
                 false));
         code.add(new VarInsnNode(Opcodes.ISTORE, 4));
         LabelNode done = new LabelNode();
@@ -9970,10 +16843,12 @@ public final class MinecraftClientPatcher {
         replace(method, code, 4, 5);
     }
 
-    private static void patchBufferBuilderSetNormal(ClassNode node, String owner) {
+    private static void patchBufferBuilderSetNormal(
+            ClassNode node, String owner, boolean semanticElementIds) {
         MethodNode method = find(node, "setNormal", "(FFF)Lcom/mojang/blaze3d/vertex/VertexConsumer;");
         InsnList code = new InsnList();
-        LabelNode done = beginBrowserElementWrite(code, owner, "NORMAL", 4);
+        LabelNode done = beginBrowserElementWrite(
+                code, owner, "NORMAL", 4, semanticElementIds);
         code.add(new VarInsnNode(Opcodes.FLOAD, 1));
         code.add(new VarInsnNode(Opcodes.FLOAD, 2));
         code.add(new VarInsnNode(Opcodes.FLOAD, 3));
@@ -9990,18 +16865,28 @@ public final class MinecraftClientPatcher {
     }
 
     private static LabelNode beginBrowserElementWrite(
-            InsnList code, String owner, String elementName, int offsetLocal) {
+            InsnList code,
+            String owner,
+            String elementName,
+            int offsetLocal,
+            boolean semanticElementIds) {
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new FieldInsnNode(
-                Opcodes.GETSTATIC,
-                "com/mojang/blaze3d/vertex/VertexFormatElement",
-                elementName,
-                "Lcom/mojang/blaze3d/vertex/VertexFormatElement;"));
+        if (semanticElementIds) {
+            code.add(new InsnNode(Opcodes.ICONST_0 + bufferBuilderSemanticId(elementName)));
+        } else {
+            code.add(new FieldInsnNode(
+                    Opcodes.GETSTATIC,
+                    "com/mojang/blaze3d/vertex/VertexFormatElement",
+                    elementName,
+                    "Lcom/mojang/blaze3d/vertex/VertexFormatElement;"));
+        }
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL,
                 owner,
                 "browserBeginElementOffset",
-                "(Lcom/mojang/blaze3d/vertex/VertexFormatElement;)I",
+                semanticElementIds
+                        ? "(I)I"
+                        : "(Lcom/mojang/blaze3d/vertex/VertexFormatElement;)I",
                 false));
         code.add(new VarInsnNode(Opcodes.ISTORE, offsetLocal));
         LabelNode done = new LabelNode();
@@ -10011,6 +16896,28 @@ public final class MinecraftClientPatcher {
         loadBrowserData(code, owner);
         code.add(new VarInsnNode(Opcodes.ILOAD, offsetLocal));
         return done;
+    }
+
+    private static int bufferBuilderSemanticId(String elementName) {
+        if (elementName.equals("POSITION")) {
+            return 0;
+        }
+        if (elementName.equals("COLOR")) {
+            return 1;
+        }
+        if (elementName.equals("UV0")) {
+            return 2;
+        }
+        if (elementName.equals("UV1")) {
+            return 3;
+        }
+        if (elementName.equals("UV2")) {
+            return 4;
+        }
+        if (elementName.equals("NORMAL")) {
+            return 5;
+        }
+        throw new IllegalArgumentException("Unknown BufferBuilder semantic " + elementName);
     }
 
     private static void loadBrowserData(InsnList code, String owner) {
@@ -10082,8 +16989,8 @@ public final class MinecraftClientPatcher {
         code.add(new VarInsnNode(Opcodes.ALOAD, 2));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
-                "net/minecraft/util/Mth",
-                "createInsecureUUID",
+                "java/util/UUID",
+                "randomUUID",
                 "()Ljava/util/UUID;",
                 false));
         code.add(new MethodInsnNode(
@@ -10139,6 +17046,7 @@ public final class MinecraftClientPatcher {
         code.add(new InsnNode(Opcodes.IRETURN));
 
         replace(method, code, 3, 4);
+        verifyBrowserUuidCalls(method, 1);
         writeComputeFrames(node, output);
     }
 
@@ -10173,6 +17081,94 @@ public final class MinecraftClientPatcher {
         code.add(new InsnNode(Opcodes.ARETURN));
         replace(method, code, 1, 0);
         write(node, output);
+    }
+
+    private static void patchFilePackResourcesBrowserIndex(String jar, Path root) throws IOException {
+        String owner = "net/minecraft/server/packs/FilePackResources";
+        String sharedOwner = owner + "$SharedZipFileAccess";
+        String helper = "dev/gaius/browser/BrowserZipResourceIndex";
+        String indexDescriptor = "L" + helper + ";";
+        ClassNode node = read(jar, owner + ".class");
+        ClassNode shared = read(jar, sharedOwner + ".class");
+        MethodNode list = find(node, "listResources",
+                "(Lnet/minecraft/server/packs/PackType;Ljava/lang/String;Ljava/lang/String;"
+                        + "Lnet/minecraft/server/packs/PackResources$ResourceOutput;)V");
+        MethodInsnNode enumerationCall = null;
+        VarInsnNode enumerationStore = null;
+        int zipLocal = -1;
+        int prefixLocal = -1;
+        for (AbstractInsnNode instruction : list.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode call)) continue;
+            if (call.owner.equals("java/util/zip/ZipFile") && call.name.equals("entries")
+                    && call.desc.equals("()Ljava/util/Enumeration;")) {
+                AbstractInsnNode load = previousOpcode(call);
+                AbstractInsnNode store = nextOpcode(call);
+                if (enumerationCall != null || !(load instanceof VarInsnNode zip)
+                        || zip.getOpcode() != Opcodes.ALOAD || !(store instanceof VarInsnNode entries)
+                        || entries.getOpcode() != Opcodes.ASTORE) {
+                    throw new IllegalStateException("Unexpected file pack ZIP enumeration shape");
+                }
+                enumerationCall = call;
+                enumerationStore = entries;
+                zipLocal = zip.var;
+            }
+            if (call.owner.equals("java/lang/String") && call.name.equals("startsWith")
+                    && call.desc.equals("(Ljava/lang/String;)Z")) {
+                AbstractInsnNode load = previousOpcode(call);
+                if (prefixLocal != -1 || !(load instanceof VarInsnNode prefix)
+                        || prefix.getOpcode() != Opcodes.ALOAD) {
+                    throw new IllegalStateException("Unexpected file pack prefix predicate shape");
+                }
+                prefixLocal = prefix.var;
+            }
+        }
+        if (enumerationCall == null || prefixLocal == -1) {
+            throw new IllegalStateException("File pack ZIP enumeration or prefix predicate missing");
+        }
+        VarInsnNode prefixStore = null;
+        for (AbstractInsnNode instruction = enumerationStore.getNext(); instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof VarInsnNode store && store.getOpcode() == Opcodes.ASTORE
+                    && store.var == prefixLocal) {
+                prefixStore = store;
+                break;
+            }
+        }
+        if (prefixStore == null) throw new IllegalStateException("File pack full prefix store missing");
+
+        // Delay enumeration until the full overlay/type/namespace/path prefix is available.
+        // Keep vanilla's validation, relative path conversion and lazy input suppliers intact.
+        list.instructions.insertBefore(enumerationCall, new InsnNode(Opcodes.POP));
+        list.instructions.set(enumerationCall, new InsnNode(Opcodes.ACONST_NULL));
+        shared.fields.add(new FieldNode(0, "browserResourceIndex", indexDescriptor, null, null));
+        InsnList query = new InsnList();
+        query.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        query.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "zipFileAccess", "L" + sharedOwner + ";"));
+        query.add(new InsnNode(Opcodes.DUP));
+        query.add(new FieldInsnNode(Opcodes.GETFIELD, sharedOwner, "browserResourceIndex", indexDescriptor));
+        query.add(new VarInsnNode(Opcodes.ALOAD, zipLocal));
+        query.add(new MethodInsnNode(Opcodes.INVOKESTATIC, helper, "forZip",
+                "(" + indexDescriptor + "Ljava/util/zip/ZipFile;)" + indexDescriptor, false));
+        query.add(new InsnNode(Opcodes.DUP_X1));
+        query.add(new FieldInsnNode(Opcodes.PUTFIELD, sharedOwner, "browserResourceIndex", indexDescriptor));
+        query.add(new VarInsnNode(Opcodes.ALOAD, prefixLocal));
+        query.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, helper, "entries",
+                "(Ljava/lang/String;)Ljava/util/List;", false));
+        query.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "java/util/Collections", "enumeration",
+                "(Ljava/util/Collection;)Ljava/util/Enumeration;", false));
+        query.add(new VarInsnNode(Opcodes.ASTORE, enumerationStore.var));
+        list.instructions.insert(prefixStore, query);
+        list.maxStack = Math.max(list.maxStack, 3);
+
+        MethodNode close = find(shared, "close", "()V");
+        InsnList clear = new InsnList();
+        clear.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        clear.add(new InsnNode(Opcodes.ACONST_NULL));
+        clear.add(new FieldInsnNode(Opcodes.PUTFIELD, sharedOwner, "browserResourceIndex", indexDescriptor));
+        close.instructions.insert(clear);
+        close.maxStack = Math.max(close.maxStack, 2);
+        write(node, root.resolve(owner + ".class"));
+        write(shared, root.resolve(sharedOwner + ".class"));
     }
 
     private static void patchFilePackResourcesBrowserAtlasOverlays(String jar, Path output)
@@ -10436,16 +17432,53 @@ public final class MinecraftClientPatcher {
         boolean patchedInitialSpawn = false;
         boolean patchedRunServerReady = false;
         boolean patchedRunServerTickYield = false;
+        boolean patchedRunServerTickTelemetry = false;
+        boolean patchedRunServerWaitTelemetry = false;
         boolean patchedRunServerStopDiagnostics = false;
         boolean patchedRunServerBrowserCatchupReset = false;
         boolean patchedRunServerStoppedSignal = false;
         boolean patchedSpinRegistration = false;
         boolean patchedSaveBeforeWorldInitialization = false;
+        boolean patchedStructurePreload = false;
         boolean patchedBrowserPacketPump = false;
         boolean patchedBrowserWaitingPacketPump = false;
         boolean patchedBrowserMetricsRecorder = false;
+        boolean patchedCooperativeServerExecutor = false;
         for (MethodNode method : node.methods) {
-            if (method.name.equals("spin")
+            if (method.name.equals("<init>")) {
+                for (var instruction = method.instructions.getFirst();
+                        instruction != null;
+                        instruction = instruction.getNext()) {
+                    if (!(instruction instanceof MethodInsnNode call)
+                            || call.getOpcode() != Opcodes.INVOKESTATIC
+                            || !call.owner.equals("net/minecraft/util/Util")
+                            || !call.name.equals("backgroundExecutor")
+                            || !call.desc.equals("()Lnet/minecraft/TracingExecutor;")) {
+                        continue;
+                    }
+                    AbstractInsnNode next = nextOpcode(call);
+                    if (!(next instanceof FieldInsnNode field)
+                            || field.getOpcode() != Opcodes.PUTFIELD
+                            || !field.owner.equals(owner)
+                            || !field.name.equals("executor")
+                            || !field.desc.equals("Ljava/util/concurrent/Executor;")) {
+                        throw new IllegalStateException(
+                                "MinecraftServer background executor assignment shape changed");
+                    }
+                    method.instructions.insert(call, new MethodInsnNode(
+                            Opcodes.INVOKESTATIC,
+                            "dev/gaius/browser/BrowserCooperativeExecutor",
+                            "defer",
+                            "(Ljava/util/concurrent/Executor;)Ljava/util/concurrent/Executor;",
+                            false));
+                    method.maxStack = Math.max(method.maxStack, 1);
+                    if (patchedCooperativeServerExecutor) {
+                        throw new IllegalStateException(
+                                "Multiple MinecraftServer cooperative executor patch points found");
+                    }
+                    patchedCooperativeServerExecutor = true;
+                }
+            } else if (method.name.equals("spin")
                     && method.desc.equals("(Ljava/util/function/Function;)"
                             + "Lnet/minecraft/server/MinecraftServer;")) {
                 for (var instruction = method.instructions.getFirst();
@@ -10493,6 +17526,18 @@ public final class MinecraftClientPatcher {
                 method.instructions.insert(guard);
                 method.maxStack = Math.max(method.maxStack, 1);
                 patchedSaveBeforeWorldInitialization = true;
+            } else if (method.name.equals("loadLevel") && method.desc.equals("()V")) {
+                InsnList preload = new InsnList();
+                preload.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                preload.add(new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "dev/gaius/browser/BrowserStructurePreloader",
+                        "preload",
+                        "(Lnet/minecraft/server/MinecraftServer;)V",
+                        false));
+                method.instructions.insert(preload);
+                method.maxStack = Math.max(method.maxStack, 1);
+                patchedStructurePreload = true;
             } else if (method.name.equals("prepareLevels") && method.desc.equals("()V")) {
                 InsnList code = new InsnList();
                 code.add(new VarInsnNode(Opcodes.ALOAD, 0));
@@ -10602,12 +17647,18 @@ public final class MinecraftClientPatcher {
                 method.maxStack = Math.max(method.maxStack, 1);
                 patchedBrowserPacketPump = true;
             } else if (method.name.equals("pollTask") && method.desc.equals("()Z")) {
-                method.instructions.insert(new MethodInsnNode(
+                InsnList taskEntry = new InsnList();
+                taskEntry.add(new MethodInsnNode(
                         Opcodes.INVOKESTATIC,
                         "dev/gaius/browser/BrowserIntegratedServerMain",
                         "pumpUrgentPacketsIfPending",
                         "()V",
                         false));
+                instrumentBrowserTaskScope(
+                        method,
+                        "MinecraftServer.pollTask",
+                        Opcodes.IRETURN,
+                        taskEntry);
                 patchedBrowserWaitingPacketPump = true;
             } else if (method.name.equals("createProfiler")
                     && method.desc.equals("()Lnet/minecraft/util/profiling/ProfilerFiller;")) {
@@ -10667,11 +17718,38 @@ public final class MinecraftClientPatcher {
                             && call.owner.equals(owner)
                             && call.name.equals("processPacketsAndTick")
                             && call.desc.equals("(Z)V")) {
-                        method.instructions.insertBefore(instruction, browserWorldgenCheckpoint());
+                        // The server's waitUntilNextTick runs after processPacketsAndTick.
+                        // Start the scheduler clock immediately before active tick work, then
+                        // checkpoint after that work. This excludes the inter-tick idle gap
+                        // without resetting the cumulative budget between chunk tasks.
+                        method.instructions.insertBefore(instruction, browserServerTickTelemetryBegin());
+                        method.instructions.insertBefore(instruction, browserWorldgenBeginServerWorkTurn());
+                        method.instructions.insert(instruction, browserServerTickTelemetryEnd());
+                        method.instructions.insert(instruction, browserWorldgenCheckpoint());
                         patchedRunServerTickYield = true;
+                        patchedRunServerTickTelemetry = true;
                         break;
                     }
                 }
+                int waitUntilNextTickCalls = 0;
+                for (var instruction : method.instructions.toArray()) {
+                    if (!(instruction instanceof MethodInsnNode call)
+                            || call.getOpcode() != Opcodes.INVOKEVIRTUAL
+                            || !call.owner.equals(owner)
+                            || !call.name.equals("waitUntilNextTick")
+                            || !call.desc.equals("()V")) {
+                        continue;
+                    }
+                    method.instructions.insertBefore(call, browserServerWaitTelemetryBegin());
+                    method.instructions.insert(call, browserServerWaitTelemetryEnd());
+                    waitUntilNextTickCalls++;
+                }
+                if (waitUntilNextTickCalls != 1) {
+                    throw new IllegalStateException(
+                            "MinecraftServer runServer waitUntilNextTick shape changed: "
+                                    + waitUntilNextTickCalls);
+                }
+                patchedRunServerWaitTelemetry = true;
                 patchedRunServerStopDiagnostics = hookMinecraftServerStopDiagnostics(method);
                 patchedRunServerBrowserCatchupReset = patchMinecraftServerBrowserCatchupReset(method, owner);
                 int stoppedSignals = 0;
@@ -10704,17 +17782,133 @@ public final class MinecraftClientPatcher {
                 || !patchedInitialSpawn
                 || !patchedRunServerReady
                 || !patchedRunServerTickYield
+                || !patchedRunServerTickTelemetry
+                || !patchedRunServerWaitTelemetry
                 || !patchedRunServerStopDiagnostics
                 || !patchedRunServerBrowserCatchupReset
                 || !patchedRunServerStoppedSignal
                 || !patchedSpinRegistration
                 || !patchedSaveBeforeWorldInitialization
+                || !patchedStructurePreload
                 || !patchedBrowserPacketPump
                 || !patchedBrowserWaitingPacketPump
-                || !patchedBrowserMetricsRecorder) {
+                || !patchedBrowserMetricsRecorder
+                || !patchedCooperativeServerExecutor) {
             throw new IllegalStateException("MinecraftServer browser patch points were not found");
         }
         writeComputeFrames(node, output);
+    }
+
+    /**
+     * Keeps the vanilla Mob.serverAiStep ordering intact while making each
+     * expensive AI stage yieldable on the browser Worker.  Vanilla calls the
+     * two selector variants in mutually exclusive branches, so there are seven
+     * stable stage boundaries in the method: sensing, four selector calls,
+     * navigation, and custom mob AI.  The hook is deliberately inserted after
+     * each call; no goal is skipped, reordered, or executed on another thread.
+     */
+    private static void patchMobBrowserAiCooperation(String jar, Path output)
+            throws IOException {
+        String owner = "net/minecraft/world/entity/Mob";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode method = find(node, "serverAiStep", "()V");
+        int checkpoints = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKEVIRTUAL) {
+                continue;
+            }
+            boolean stage = (call.owner.equals(
+                    "net/minecraft/world/entity/ai/sensing/Sensing")
+                    && call.name.equals("tick")
+                    && call.desc.equals("()V"))
+                    || (call.owner.equals("net/minecraft/world/entity/ai/goal/GoalSelector")
+                    && ((call.name.equals("tick") && call.desc.equals("()V"))
+                    || (call.name.equals("tickRunningGoals")
+                    && call.desc.equals("(Z)V"))))
+                    || (call.owner.equals(
+                    "net/minecraft/world/entity/ai/navigation/PathNavigation")
+                    && call.name.equals("tick")
+                    && call.desc.equals("()V"))
+                    || (call.owner.equals(owner)
+                    && call.name.equals("customServerAiStep")
+                    && call.desc.equals(
+                    "(Lnet/minecraft/server/level/ServerLevel;)V"));
+            if (stage) {
+                method.instructions.insert(call, browserWorldgenMobAiPulse());
+                checkpoints++;
+            }
+        }
+        if (checkpoints != 7) {
+            throw new IllegalStateException(
+                    "Mob.serverAiStep AI stage shape changed: " + checkpoints
+                            + " (expected 7 checkpoints)");
+        }
+        // TeaVM can legitimately prove the protected serverAiStep body
+        // unreachable in a server-only entrypoint even though the class is
+        // present in the shared client-named jar.  Keep one explicit
+        // boundary at Mob.aiStep as well: this is the method reached from
+        // LivingEntity.tick for every live mob, and it gives the Worker a
+        // cooperative turn boundary even when the optimizer folds the
+        // inner serverAiStep method.  The two calls sit immediately around
+        // the vanilla super call, so no AI stage is reordered or skipped.
+        MethodNode aiStep = find(node, "aiStep", "()V");
+        MethodInsnNode livingAiStep = null;
+        for (AbstractInsnNode instruction : aiStep.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESPECIAL
+                    && call.owner.equals("net/minecraft/world/entity/LivingEntity")
+                    && call.name.equals("aiStep")
+                    && call.desc.equals("()V")) {
+                if (livingAiStep != null) {
+                    throw new IllegalStateException(
+                            "Mob.aiStep super-call shape changed: multiple LivingEntity.aiStep calls");
+                }
+                livingAiStep = call;
+            }
+        }
+        if (livingAiStep == null) {
+            throw new IllegalStateException(
+                    "Mob.aiStep super-call shape changed: LivingEntity.aiStep not found");
+        }
+        aiStep.instructions.insertBefore(livingAiStep, browserWorldgenMobAiPulse());
+        aiStep.instructions.insert(livingAiStep, browserWorldgenMobAiPulse());
+
+        // Mob.aiStep and Mob.tick overrides can both be folded out of a
+        // server-only TeaVM entry point.  LivingEntity.tick is the common
+        // live-entity boundary, so use a typed fallback there and keep the
+        // Mob-specific hook out of the hot override.  The guard in
+        // mobEntityPulse() excludes players and other non-Mob entities.
+        String livingOwner = "net/minecraft/world/entity/LivingEntity";
+        ClassNode livingNode = read(jar, livingOwner + ".class");
+        MethodNode livingTickMethod = find(livingNode, "tick", "()V");
+        MethodInsnNode entityTick = null;
+        for (AbstractInsnNode instruction : livingTickMethod.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESPECIAL
+                    && call.owner.equals("net/minecraft/world/entity/Entity")
+                    && call.name.equals("tick")
+                    && call.desc.equals("()V")) {
+                if (entityTick != null) {
+                    throw new IllegalStateException(
+                            "LivingEntity.tick super-call shape changed: multiple Entity.tick calls");
+                }
+                entityTick = call;
+            }
+        }
+        if (entityTick == null) {
+            throw new IllegalStateException(
+                    "LivingEntity.tick super-call shape changed: Entity.tick not found");
+        }
+        InsnList entity = new InsnList();
+        entity.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        entity.add(browserWorldgenMobEntityPulse());
+        livingTickMethod.instructions.insert(entityTick, entity);
+        writeComputeFrames(livingNode, output.resolveSibling("LivingEntity.class"));
+        writeComputeFrames(node, output);
+        System.out.println(
+                "Instrumented Mob.serverAiStep browser AI checkpoints=" + checkpoints
+                        + ", Mob.aiStep boundaries=2, LivingEntity.tick Mob fallback=1");
     }
 
     private static void patchPlayerSpawnFinderBrowser(String jar, Path output)
@@ -10749,11 +17943,6 @@ public final class MinecraftClientPatcher {
                 null,
                 null);
         LabelNode heightmapFallback = new LabelNode();
-        fixupLoadedSpawn.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        fixupLoadedSpawn.instructions.add(new TypeInsnNode(
-                Opcodes.NEW,
-                "net/minecraft/world/level/ChunkPos"));
-        fixupLoadedSpawn.instructions.add(new InsnNode(Opcodes.DUP));
         fixupLoadedSpawn.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
         fixupLoadedSpawn.instructions.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
@@ -10761,11 +17950,35 @@ public final class MinecraftClientPatcher {
                 "containing",
                 "(Lnet/minecraft/core/Position;)Lnet/minecraft/core/BlockPos;",
                 false));
+        fixupLoadedSpawn.instructions.add(new VarInsnNode(Opcodes.ASTORE, 2));
+        fixupLoadedSpawn.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        fixupLoadedSpawn.instructions.add(new TypeInsnNode(
+                Opcodes.NEW,
+                "net/minecraft/world/level/ChunkPos"));
+        fixupLoadedSpawn.instructions.add(new InsnNode(Opcodes.DUP));
+        fixupLoadedSpawn.instructions.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        fixupLoadedSpawn.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/core/Vec3i",
+                "getX",
+                "()I",
+                false));
+        fixupLoadedSpawn.instructions.add(new InsnNode(Opcodes.ICONST_4));
+        fixupLoadedSpawn.instructions.add(new InsnNode(Opcodes.ISHR));
+        fixupLoadedSpawn.instructions.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        fixupLoadedSpawn.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/core/Vec3i",
+                "getZ",
+                "()I",
+                false));
+        fixupLoadedSpawn.instructions.add(new InsnNode(Opcodes.ICONST_4));
+        fixupLoadedSpawn.instructions.add(new InsnNode(Opcodes.ISHR));
         fixupLoadedSpawn.instructions.add(new MethodInsnNode(
                 Opcodes.INVOKESPECIAL,
                 "net/minecraft/world/level/ChunkPos",
                 "<init>",
-                "(Lnet/minecraft/core/BlockPos;)V",
+                "(II)V",
                 false));
         fixupLoadedSpawn.instructions.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
@@ -10815,7 +18028,7 @@ public final class MinecraftClientPatcher {
                 false));
         fixupLoadedSpawn.instructions.add(new InsnNode(Opcodes.ARETURN));
         fixupLoadedSpawn.maxStack = 4;
-        fixupLoadedSpawn.maxLocals = 2;
+        fixupLoadedSpawn.maxLocals = 3;
         node.methods.add(fixupLoadedSpawn);
         write(node, output);
     }
@@ -10962,11 +18175,37 @@ public final class MinecraftClientPatcher {
         write(ready, root.resolve(readyOwner + ".class"));
     }
 
-    private static void patchStructureTemplateManagerBrowserGzip(String jar, Path output)
+    private static void patchStructureTemplateManagerBrowserGzip(String jar, Path outputRoot)
             throws IOException {
-        String owner = "net/minecraft/world/level/levelgen/structure/templatesystem/StructureTemplateManager";
+        String legacyOwner =
+                "net/minecraft/world/level/levelgen/structure/templatesystem/StructureTemplateManager";
+        String currentOwner =
+                "net/minecraft/world/level/levelgen/structure/templatesystem/loader/TemplateSource";
+        boolean currentLoader;
+        try (ZipFile input = new ZipFile(jar)) {
+            currentLoader = input.getEntry(currentOwner + ".class") != null;
+        }
+        String owner = currentLoader ? currentOwner : legacyOwner;
         String template = "net/minecraft/world/level/levelgen/structure/templatesystem/StructureTemplate";
         ClassNode node = read(jar, owner + ".class");
+        if (currentLoader) {
+            MethodNode method = find(
+                    node,
+                    "readStructure",
+                    "(Ljava/io/InputStream;)Lnet/minecraft/nbt/CompoundTag;");
+            InsnList code = new InsnList();
+            code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "dev/gaius/browser/BrowserGzip",
+                    "readCompressedNbt",
+                    "(Ljava/io/InputStream;)Lnet/minecraft/nbt/CompoundTag;",
+                    false));
+            code.add(new InsnNode(Opcodes.ARETURN));
+            replace(method, code, 1, 1);
+            write(node, outputRoot.resolve(owner + ".class"));
+            return;
+        }
         MethodNode method = find(
                 node,
                 "readStructure",
@@ -10988,7 +18227,7 @@ public final class MinecraftClientPatcher {
                 false));
         code.add(new InsnNode(Opcodes.ARETURN));
         replace(method, code, 2, 2);
-        write(node, output);
+        write(node, outputRoot.resolve(owner + ".class"));
     }
 
     private static void replaceIntArgumentBeforeCall(
@@ -11244,14 +18483,16 @@ public final class MinecraftClientPatcher {
                     "recordChunkBatchSent",
                     "(I)V",
                     false));
-            sendNextChunks.instructions.insert(batchFinishedSend, record);
+            // Record before invoking send: the browser transport may synchronously re-enter
+            // the ACK path while send() is dispatching the finished-batch packet.
+            sendNextChunks.instructions.insertBefore(batchFinishedSend, record);
             records++;
         }
         if (records != 1) {
             throw new IllegalStateException(
                     "PlayerChunkSender chunk-batch size point changed: " + records);
         }
-        sendNextChunks.maxStack = Math.max(sendNextChunks.maxStack, 2);
+        sendNextChunks.maxStack = Math.max(sendNextChunks.maxStack, 3);
         writeComputeFrames(node, output);
     }
 
@@ -11274,8 +18515,6 @@ public final class MinecraftClientPatcher {
                 "(Lnet/minecraft/server/level/progress/LevelLoadListener$Stage;I)V",
                 true));
 
-        code.add(new TypeInsnNode(Opcodes.NEW, "net/minecraft/world/level/ChunkPos"));
-        code.add(new InsnNode(Opcodes.DUP));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL,
@@ -11301,11 +18540,32 @@ public final class MinecraftClientPatcher {
                 "findSpawnPosition",
                 "()Lnet/minecraft/core/BlockPos;",
                 false));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 7));
+        code.add(new TypeInsnNode(Opcodes.NEW, "net/minecraft/world/level/ChunkPos"));
+        code.add(new InsnNode(Opcodes.DUP));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 7));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/core/Vec3i",
+                "getX",
+                "()I",
+                false));
+        code.add(new InsnNode(Opcodes.ICONST_4));
+        code.add(new InsnNode(Opcodes.ISHR));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 7));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/core/Vec3i",
+                "getZ",
+                "()I",
+                false));
+        code.add(new InsnNode(Opcodes.ICONST_4));
+        code.add(new InsnNode(Opcodes.ISHR));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESPECIAL,
                 "net/minecraft/world/level/ChunkPos",
                 "<init>",
-                "(Lnet/minecraft/core/BlockPos;)V",
+                "(II)V",
                 false));
         code.add(new VarInsnNode(Opcodes.ASTORE, 5));
 
@@ -11394,7 +18654,34 @@ public final class MinecraftClientPatcher {
                 "(Lnet/minecraft/server/level/progress/LevelLoadListener$Stage;)V",
                 true));
         code.add(new InsnNode(Opcodes.RETURN));
-        replace(method, code, 9, 7);
+        replace(method, code, 9, 8);
+        verifyChunkPosIntConstructor(method, 1);
+    }
+
+    private static void verifyChunkPosIntConstructor(
+            MethodNode method, int expectedIntConstructors) {
+        int intConstructors = 0;
+        for (AbstractInsnNode instruction : method.instructions) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKESPECIAL
+                    || !call.owner.equals("net/minecraft/world/level/ChunkPos")
+                    || !call.name.equals("<init>")) {
+                continue;
+            }
+            if (call.desc.equals("(Lnet/minecraft/core/BlockPos;)V")) {
+                throw new IllegalStateException(
+                        "Browser patch introduced removed ChunkPos(BlockPos) in "
+                                + method.name + method.desc);
+            }
+            if (call.desc.equals("(II)V")) {
+                intConstructors++;
+            }
+        }
+        if (intConstructors != expectedIntConstructors) {
+            throw new IllegalStateException(
+                    "Expected " + expectedIntConstructors + " ChunkPos(int,int) calls in "
+                            + method.name + method.desc + ", got " + intConstructors);
+        }
     }
 
     private static boolean patchMinecraftServerBrowserCatchupReset(MethodNode method, String owner) {
@@ -12432,11 +19719,12 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/client/multiplayer/ClientPacketListener",
                 "minecraft",
                 "Lnet/minecraft/client/Minecraft;"));
-        code.add(new FieldInsnNode(
-                Opcodes.GETFIELD,
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
                 "net/minecraft/client/Minecraft",
-                "screen",
-                "Lnet/minecraft/client/gui/screens/Screen;"));
+                "gaius$getScreen",
+                "()Lnet/minecraft/client/gui/screens/Screen;",
+                false));
         code.add(new TypeInsnNode(
                 Opcodes.INSTANCEOF,
                 "net/minecraft/client/gui/screens/LevelLoadingScreen"));
@@ -12448,11 +19736,12 @@ public final class MinecraftClientPatcher {
                 "minecraft",
                 "Lnet/minecraft/client/Minecraft;"));
         code.add(new InsnNode(Opcodes.ACONST_NULL));
-        code.add(new FieldInsnNode(
-                Opcodes.PUTFIELD,
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
                 "net/minecraft/client/Minecraft",
-                "screen",
-                "Lnet/minecraft/client/gui/screens/Screen;"));
+                "gaius$setScreen",
+                "(Lnet/minecraft/client/gui/screens/Screen;)V",
+                false));
         code.add(minecraftEvent("client.levelReady.closeLoadingScreen"));
         code.add(done);
         return code;
@@ -12523,6 +19812,13 @@ public final class MinecraftClientPatcher {
                 .findFirst()
                 .orElseThrow(() -> new IllegalStateException(
                         node.name + "." + name + descriptor + " was not found"));
+    }
+
+    private static MethodNode findNullable(ClassNode node, String name, String descriptor) {
+        return node.methods.stream()
+                .filter(method -> method.name.equals(name) && method.desc.equals(descriptor))
+                .findFirst()
+                .orElse(null);
     }
 
     private static AbstractInsnNode nextOpcode(AbstractInsnNode instruction) {

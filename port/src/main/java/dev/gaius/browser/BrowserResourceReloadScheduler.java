@@ -3,8 +3,8 @@ package dev.gaius.browser;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.concurrent.Executor;
+import org.teavm.classlib.java.lang.TModernRuntimeSupport;
 import org.teavm.jso.JSBody;
-import org.teavm.platform.Platform;
 
 /**
  * Keeps large resource-pack reloads cooperative with the browser event loop.
@@ -15,7 +15,7 @@ import org.teavm.platform.Platform;
  */
 public final class BrowserResourceReloadScheduler {
     // Large server packs can otherwise exceed proxy/backend configuration timeouts.
-    // Eleven milliseconds keeps each browser task below a 60 Hz frame budget.
+    // Checked between commands; a single command can exceed this slice budget.
     private static final long FRAME_WORK_BUDGET_NANOS = 11_000_000L;
     private static final int MAX_SUBMISSIONS_PER_BATCH = 384;
     private static final Deque<Runnable> QUEUE = new ArrayDeque<>();
@@ -52,11 +52,15 @@ public final class BrowserResourceReloadScheduler {
         // preparation batches at the display refresh rate and dominated startup. A
         // zero-delay browser task still yields to input, networking, and rendering,
         // while allowing the next batch to run as soon as the browser is ready.
-        Platform.schedule(BrowserResourceReloadScheduler::runAfterYield, 0);
+        scheduleMacrotask(BrowserResourceReloadScheduler::runAfterYield);
     }
 
     @JSBody(script = "return typeof WorkerGlobalScope !== 'undefined' && globalThis instanceof WorkerGlobalScope;")
     private static native boolean isWorkerRuntime();
+
+    private static void scheduleMacrotask(Runnable command) {
+        TModernRuntimeSupport.postRunnableMacrotask(command);
+    }
 
     private static void runAfterYield() {
         long startedAt = System.nanoTime();

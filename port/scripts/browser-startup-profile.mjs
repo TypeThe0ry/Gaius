@@ -4,13 +4,28 @@ import {spawn} from "node:child_process";
 import {mkdtemp, mkdir, rm, writeFile} from "node:fs/promises";
 import {createServer} from "node:net";
 import {tmpdir} from "node:os";
-import {dirname, resolve} from "node:path";
+import {basename, dirname, resolve} from "node:path";
 
-const defaultChrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+const defaultChrome = process.platform === "win32"
+  ? "C:/Program Files/Google/Chrome/Application/chrome.exe"
+  : process.platform === "darwin"
+    ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    : "google-chrome";
 const targetUrl = process.argv[2] || "http://127.0.0.1:8781/dist/?targetFps=120";
-const outputPrefix = resolve(process.argv[3] || "port/target/client-startup-current");
+const nativePath = (value) => {
+  if (!value) return value;
+  const text = String(value);
+  return process.platform === "win32" && /^\/[A-Za-z](?:\/|$)/.test(text)
+    ? `${text[1].toUpperCase()}:${text.slice(2)}` : text;
+};
+const profileId = basename(nativePath(
+  process.env.GAIUS_VERSION_PROFILE_PATH || "versions/26.2.json",
+).replaceAll("\\", "/")).replace(/\.json$/, "");
+const defaultOutputRoot = nativePath(process.env.GAIUS_BUILD_ROOT) ||
+  (process.env.GAIUS_VERSION_PROFILE_PATH ? `port/target/${profileId}` : "port/target");
+const outputPrefix = resolve(nativePath(process.argv[3] || `${defaultOutputRoot}/client-startup-current`));
 const timeoutMillis = Math.max(30_000, Number(process.env.GAIUS_PROFILE_TIMEOUT_MS || "180000"));
-const chromeBinary = process.env.GAIUS_CHROME_BIN || defaultChrome;
+const chromeBinary = nativePath(process.env.GAIUS_CHROME_BIN) || defaultChrome;
 const playerName = process.env.GAIUS_PROFILE_PLAYER || "GaiusProfile";
 const cpuProfiling = process.env.GAIUS_CPU_PROFILE !== "false";
 

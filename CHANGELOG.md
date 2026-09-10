@@ -2,6 +2,91 @@
 
 All notable changes to Gaius are documented here.
 
+## [0.1.0] - 2026-09-05
+
+### Release
+
+- Prepare the dual-profile release for Minecraft Java `1.21.11` (protocol
+  `774`, JDK 21) and `26.2` (protocol `776`, JDK 25), with independent browser
+  packages, manifests, checksums, and the optional Paper bridge plugin.
+- Keep `t40.sjcmc.cn:14803` as the external multiplayer test target through
+  `wss://ellan.site/tunnel`. Status/attestation and lease-release checks are
+  transport evidence; they do not assert a complete LOGIN/PLAY session.
+
+### Added
+
+- Opt-in counters for server tick intervals over 100/500 ms and tick work or
+  wait phases over 500 ms, so measurement windows can expose stalls hidden by
+  average TPS. These diagnostics do not change gameplay scheduling.
+- Retain one payload-free inbound frame-limit failure snapshot before channel
+  cleanup, so queue depth and flow-control state remain available after disconnect.
+
+### Fixed
+
+- Batch adjacent ordinary PLAY packets into bounded 16 KiB WebSocket messages
+  within the relay's existing 32-packet drain budget. Preserve packet order,
+  send ownership, keepalive and configuration boundaries, and expose separate
+  packet and WebSocket message counters.
+- Start Minecraft 1.21.11 chunk-holder continuations inside a TeaVM thread,
+  preserving the runtime context needed when future completion resumes work
+  that can suspend. Keep the existing synchronous world-generation boundaries.
+- Include pending transport frames in inbound flow-control watermarks, so a
+  drained decoder slice queue does not resume the relay while thousands of
+  small frames remain queued. Preserve the 4096-frame and 64 MiB hard limits.
+- Give Mob AI checkpoints a separate 8 ms cooperation window, measured from
+  the actual continuation resume time. Mob work does not own the worldgen
+  task clock; routing every AI stage through its two-pulse network preemption
+  path introduced repeated waits. AI stages and the existing continuation
+  cleanup remain unchanged. Full rebuilt-profile playability checks are pending.
+- Preserve the singleplayer world's selected game mode when starting the
+  server Worker instead of replacing it with the dedicated-server default.
+- Index ZIP resource names once per open archive and limit resource listing to
+  matching prefixes, preserving archive order, overlay paths, and lazy reads.
+  This removes repeated full-archive scans observed during multiplayer loading;
+  rebuilt browser loading and playability acceptance remain pending.
+- Return Minecraft `26.2` chunk-generation batches to the server dispatcher
+  through pending futures after at most 16 holders, preserving layer dependency
+  ordering and cancellation cleanup. Browser yields alone previously resumed
+  the same server call stack. Moving-world TPS and Mob playability acceptance
+  remain pending the rebuilt browser artifact.
+- Generate the launcher's displayed release version from `VERSION` instead
+  of the stale `0.0.1` label, and include it in the build input identity.
+- Initialize the real inbound scheduler in the local MessagePort lifecycle
+  smoke, matching the production channel constructor. Inspect asynchronous
+  failure diagnostics without racing automatic closed-channel retirement.
+- Exercise the tracked launcher template in source checks instead of reading
+  a generated LFS bundle that is only a pointer in lightweight CI checkouts.
+- Align the compiled Netty pump check with its progress-returning boolean
+  signature and tightened 256 KiB byte budget. The obsolete void/1 MiB check
+  incorrectly rejected both successfully compiled `v0.0.3` profiles.
+- Run singleplayer storage, world reload, Worker bootstrap, MessagePort
+  ownership, and profile isolation regressions before costly release builds.
+- Validate the requested release tag before compilation and retain TeaVM
+  build diagnostics on failed CI runs.
+
+## [0.0.3] - 2026-09-05
+
+### Added
+
+- Minecraft Java `26.2` as the primary browser client profile while retaining
+  the `1.21.11` compatibility profile.
+- Profile-scoped dual-version release builds, artifact identity records, and
+  release checks for both portable clients.
+
+### Improved
+
+- Multiplayer packet scheduling, bounded browser inbound and outbound drains,
+  RelayNode frame handling, stale-owner isolation, reconnect cleanup, and
+  browser-side diagnostics.
+
+### Release Notes
+
+- The `v0.0.3` release is produced by the dual-profile GitHub Actions matrix and
+  includes a profile manifest, SHA256 checksums, and the optional Paper plugin.
+- The browser client remains experimental; runtime compatibility still depends
+  on the selected Minecraft server, Chrome/Chromium, and an available relay or
+  compatible server plugin.
+
 ## [0.0.1] - 2026-08-09
 
 ### Added

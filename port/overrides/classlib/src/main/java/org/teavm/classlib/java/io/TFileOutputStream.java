@@ -21,6 +21,7 @@ public class TFileOutputStream extends OutputStream {
     private VirtualFileAccessor accessor;
     private String path;
     private boolean dirty;
+    private boolean materializedRetained;
 
     public TFileOutputStream(TFile file) throws FileNotFoundException {
         this(file, false);
@@ -36,6 +37,14 @@ public class TFileOutputStream extends OutputStream {
 
     public TFileOutputStream(TFile file, boolean append) throws FileNotFoundException {
         BrowserFilePersistence.mount();
+        String absolutePath = file.getAbsolutePath();
+        try {
+            BrowserFilePersistence.materializeForOpen(absolutePath);
+        } catch (IOException exception) {
+            FileNotFoundException failure = new FileNotFoundException(absolutePath);
+            failure.initCause(exception);
+            throw failure;
+        }
         if (file.getName().isEmpty()) {
             throw new FileNotFoundException("Invalid file name");
         }
@@ -72,7 +81,7 @@ public class TFileOutputStream extends OutputStream {
                 throw failure;
             }
         }
-        path = file.getAbsolutePath();
+        initialize(absolutePath, accessor, !append);
     }
 
     public static void truncateIfRequested(VirtualFileAccessor accessor, boolean truncate) throws IOException {
@@ -84,12 +93,42 @@ public class TFileOutputStream extends OutputStream {
 
     public TFileOutputStream(VirtualFileAccessor accessor) {
         this.accessor = accessor;
-        this.path = null;
     }
 
     public TFileOutputStream(String path, VirtualFileAccessor accessor) {
-        this.accessor = accessor;
+        initialize(path, accessor, false);
+    }
+
+    public TFileOutputStream(String path, VirtualFileAccessor accessor, boolean truncated)
+            throws IOException {
+        try {
+            truncateIfRequested(accessor, truncated);
+        } catch (IOException failure) {
+            try {
+                accessor.close();
+            } catch (IOException closeFailure) {
+                failure.addSuppressed(closeFailure);
+            }
+            throw failure;
+        }
+        initialize(path, accessor, truncated);
+    }
+
+    private void initialize(String path, VirtualFileAccessor opened, boolean dirty) {
+        this.accessor = opened;
         this.path = path;
+        this.dirty = dirty;
+        try {
+            materializedRetained = BrowserFilePersistence.retainMaterializedChunkFile(path);
+        } catch (RuntimeException | Error failure) {
+            accessor = null;
+            try {
+                opened.close();
+            } catch (IOException closeFailure) {
+                failure.addSuppressed(closeFailure);
+            }
+            throw failure;
+        }
     }
 
     @Override
@@ -112,12 +151,36 @@ public class TFileOutputStream extends OutputStream {
 
     @Override
     public void close() throws IOException {
-        if (accessor != null) {
-            accessor.flush();
-            persistIfDirty();
-            accessor.close();
+        VirtualFileAccessor opened = accessor;
+        if (opened == null) {
+            return;
         }
-        accessor = null;
+        IOException failure = null;
+        try {
+            opened.flush();
+            persistIfDirty();
+        } catch (IOException exception) {
+            failure = exception;
+        }
+        try {
+            opened.close();
+        } catch (IOException exception) {
+            if (failure == null) {
+                failure = exception;
+            } else {
+                failure.addSuppressed(exception);
+            }
+        } finally {
+            accessor = null;
+            if (materializedRetained) {
+                materializedRetained = false;
+                BrowserFilePersistence.releaseMaterializedChunkFile(
+                        path, failure == null && !dirty);
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
     }
 
     @Override
@@ -149,7 +212,9 @@ public class TFileOutputStream extends OutputStream {
         if (offset < size) {
             bytes = Arrays.copyOf(bytes, offset);
         }
-        BrowserFilePersistence.persist(path, bytes);
+        if (!BrowserFilePersistence.persist(path, bytes)) {
+            throw new IOException("Could not persist browser file " + path);
+        }
         dirty = false;
     }
 

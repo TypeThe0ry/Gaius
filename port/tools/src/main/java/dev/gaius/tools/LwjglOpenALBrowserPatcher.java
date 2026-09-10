@@ -85,24 +85,25 @@ public final class LwjglOpenALBrowserPatcher {
                         "alcGetCurrentContext()J",
                         "alcGetContextsDevice(J)J" -> replaceConstant(method, Type.LONG_TYPE, 1L);
                 case "alcCloseDevice(J)Z",
-                        "alcMakeContextCurrent(J)Z",
-                        "alcIsExtensionPresent(JLjava/lang/CharSequence;)Z",
-                        "alcIsExtensionPresent(JLjava/nio/ByteBuffer;)Z" ->
+                        "alcMakeContextCurrent(J)Z" ->
                         replaceConstant(method, Type.BOOLEAN_TYPE, 1);
+                case "alcIsExtensionPresent(JLjava/lang/CharSequence;)Z",
+                        "alcIsExtensionPresent(JLjava/nio/ByteBuffer;)Z" ->
+                        delegate(method, "alcIsExtensionPresent");
                 case "alcGetError(J)I",
-                        "alcGetInteger(JI)I",
                         "nalcGetEnumValue(JJ)I",
                         "alcGetEnumValue(JLjava/nio/ByteBuffer;)I",
                         "alcGetEnumValue(JLjava/lang/CharSequence;)I" ->
                         replaceConstant(method, Type.INT_TYPE, 0);
+                case "alcGetInteger(JI)I" -> delegate(method, "alcGetInteger");
                 case "alcGetString(JI)Ljava/lang/String;" ->
                         replaceString(method, "Gaius Browser OpenAL");
                 case "alcProcessContext(J)V",
                         "alcSuspendContext(J)V",
                         "alcDestroyContext(J)V",
-                        "nalcGetIntegerv(JIIJ)V",
-                        "alcGetIntegerv(JILjava/nio/IntBuffer;)V",
-                        "alcGetIntegerv(JI[I)V" -> replaceVoid(method);
+                        "nalcGetIntegerv(JIIJ)V" -> replaceVoid(method);
+                case "alcGetIntegerv(JILjava/nio/IntBuffer;)V",
+                        "alcGetIntegerv(JI[I)V" -> delegate(method, "alcGetIntegerv");
                 default -> replaceDefault(method);
             }
             replacements++;

@@ -49,8 +49,16 @@ def checked_resource_names(resource_list: Path) -> list[str]:
     return names
 
 
-def build(resource_list: Path, client_jar: Path, generated_resources: Path, output: Path) -> None:
+def build(resource_list: Path, client_jar: Path, generated_resources: Path, output: Path,
+          asset_index: Path | None = None) -> None:
     names = checked_resource_names(resource_list)
+    indexed_backgrounds = {}
+    if asset_index is not None:
+        objects = json.loads(asset_index.read_text(encoding="utf-8"))["objects"]
+        indexed_backgrounds = {
+            "assets/" + name: entry for name, entry in objects.items()
+            if name.startswith("minecraft/textures/gui/title/background/")
+        }
     payload = bytearray()
     index: dict[str, list[int]] = {}
     from_jar = 0
@@ -60,7 +68,15 @@ def build(resource_list: Path, client_jar: Path, generated_resources: Path, outp
     with zipfile.ZipFile(client_jar) as client:
         jar_names = set(client.namelist())
         for name in names:
-            if name in jar_names:
+            if name in indexed_backgrounds:
+                entry = indexed_backgrounds[name]
+                digest = entry["hash"]
+                source = asset_index.parent.parent / "objects" / digest[:2] / digest
+                content = source.read_bytes()
+                if len(content) != entry["size"] or hashlib.sha1(content).hexdigest() != digest:
+                    raise RuntimeError(f"invalid indexed background asset: {name}")
+                from_generated += 1
+            elif name in jar_names:
                 content = client.read(name)
                 from_jar += 1
             else:
@@ -105,10 +121,10 @@ def build(resource_list: Path, client_jar: Path, generated_resources: Path, outp
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 5:
+    if len(argv) not in (5, 6):
         print(
             "usage: build-vanilla-assets-pack.py "
-            "<resource-list> <client-jar> <generated-resources> <output.pack.gz>",
+            "<resource-list> <client-jar> <generated-resources> <output.pack.gz> [asset-index]",
             file=sys.stderr,
         )
         return 2
