@@ -140,6 +140,17 @@ def main() -> int:
             raise AssertionError("launcher still uses a Mojang boot brand")
         if generated.count('data-gaius-shell="v2"') != 2:
             raise AssertionError("Gaius shell marker is not installed exactly twice")
+        if generated.count("const singleplayerBuildToken =") != 1:
+            raise AssertionError("singleplayer build token must be declared exactly once")
+        for assignment in (
+            "window.__gaiusSingleplayerWorkerUrl = new URL(",
+            "window.__gaiusSingleplayerServerUrl = new URL(",
+            "window.__gaiusSingleplayerServerGzipUrl = new URL(",
+        ):
+            if generated.count(assignment) != 1:
+                raise AssertionError(
+                    f"singleplayer URL assignment must occur exactly once: {assignment}"
+                )
         if "background: linear-gradient" in generated:
             raise AssertionError("shell must not use a decorative gradient background")
         if "samples.splice(0" in generated:

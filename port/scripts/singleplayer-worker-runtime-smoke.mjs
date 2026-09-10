@@ -203,11 +203,10 @@ const profileId = basename(versionProfileRelative.replaceAll("\\", "/"))
 const versionProfilePath = isAbsolute(versionProfileRelative)
   ? versionProfileRelative
   : rootDirectory + "port/" + versionProfileRelative;
-const isolated = Boolean(process.env.GAIUS_BUILD_ROOT || process.env.GAIUS_VERSION_PROFILE_PATH);
 const distDirectory = nativePath(process.env.GAIUS_DIST_DIRECTORY ||
-  (isolated ? rootDirectory + "port/web/dist/" + profileId : rootDirectory + "port/web/dist"));
+  rootDirectory + "port/web/dist/" + profileId);
 const buildDirectory = nativePath(process.env.GAIUS_BUILD_ROOT ||
-  (isolated ? rootDirectory + "port/target/" + profileId : rootDirectory + "port/target"));
+  rootDirectory + "port/target/" + profileId);
 const bootstrapPath = nativePath(process.env.GAIUS_SMOKE_BOOTSTRAP_PATH ||
   distDirectory + "/singleplayer-server-worker.js");
 if (!isAbsolute(versionProfileRelative)

@@ -1953,52 +1953,55 @@ def patch_index(
         if count == 0:
             raise RuntimeError("index.html patch point was not found: stable build token")
 
+    # Keep this block as one canonical unit. The launcher template deliberately
+    # keeps portable Blob URLs intact, while the generated profile adds the
+    # content hash used for normal HTTP/file launches. Replacing the complete
+    # region on every pass is simpler and safer than recognizing every
+    # historical form of the block. The old mixed form left the template's
+    # conditional URL block beside the generated block, which declared
+    # `singleplayerBuildToken` twice in the same async scope and made portable
+    # releases fail before the game could start.
     singleplayer_build_block = (
         f'      const singleplayerBuildToken = "{singleplayer_token}" +\n'
         '        (urlParams.get("fresh") === "1" || urlParams.get("cache") === "0"\n'
         '          ? "-fresh-" + Date.now()\n'
         '          : "");\n'
-        '      window.__gaiusSingleplayerWorkerUrl = new URL(\n'
-        '        "singleplayer-server-worker.js?v=" + encodeURIComponent(singleplayerBuildToken),\n'
-        '        location.href\n'
-        '      ).href;\n'
-        '      window.__gaiusSingleplayerServerUrl = new URL(\n'
-        '        "singleplayer-server.js?v=" + encodeURIComponent(singleplayerBuildToken),\n'
-        '        location.href\n'
-        '      ).href;\n'
-        '      window.__gaiusSingleplayerServerGzipUrl = new URL(\n'
-        '        "singleplayer-server.js.gz?v=" + encodeURIComponent(singleplayerBuildToken),\n'
-        '        location.href\n'
-        '      ).href;\n'
+        '      // Portable Gaius.html embeds these payloads as Blob URLs. Keep those\n'
+        '      // URLs; replacing them with file:/// sibling paths makes the downloaded\n'
+        '      // single-file client exit before its Worker can start.\n'
+        '      if (window.__gaiusPortableBuild !== true) {\n'
+        '        window.__gaiusSingleplayerWorkerUrl = new URL(\n'
+        '          "singleplayer-server-worker.js?v=" + encodeURIComponent(singleplayerBuildToken),\n'
+        '          location.href\n'
+        '        ).href;\n'
+        '        window.__gaiusSingleplayerServerUrl = new URL(\n'
+        '          "singleplayer-server.js?v=" + encodeURIComponent(singleplayerBuildToken),\n'
+        '          location.href\n'
+        '        ).href;\n'
+        '        window.__gaiusSingleplayerServerGzipUrl = new URL(\n'
+        '          "singleplayer-server.js.gz?v=" + encodeURIComponent(singleplayerBuildToken),\n'
+        '          location.href\n'
+        '        ).href;\n'
+        '      }\n'
     )
-    text, singleplayer_count = re.subn(
-        r'      const singleplayerBuildToken = (?:"[^"]+"|fallbackBuildToken) \+\n'
-        r'        \(urlParams\.get\("fresh"\) === "1" \|\| urlParams\.get\("cache"\) === "0"\n'
-        r'          \? "-fresh-" \+ Date\.now\(\)\n'
-        r'          : ""\);\n'
-        r'      window\.__gaiusSingleplayerWorkerUrl = new URL\(\n'
-        r'        "singleplayer-server-worker\.js\?v=" \+ encodeURIComponent\(singleplayerBuildToken\),\n'
-        r'        location\.href\n'
-        r'      \)\.href;\n'
-        r'      window\.__gaiusSingleplayerServerUrl = new URL\(\n'
-        r'        "singleplayer-server\.js\?v=" \+ encodeURIComponent\(singleplayerBuildToken\),\n'
-        r'        location\.href\n'
-        r'      \)\.href;\n'
-        r'(?:      window\.__gaiusSingleplayerServerGzipUrl = new URL\(\n'
-        r'        "singleplayer-server\.js\.gz\?v=" \+ encodeURIComponent\(singleplayerBuildToken\),\n'
-        r'        location\.href\n'
-        r'      \)\.href;\n)?',
-        singleplayer_build_block,
-        text,
-        count=1,
+    singleplayer_anchor = '      bootTimings.buildToken = buildToken;\n'
+    classes_anchor = '      bootTimings.classesStart = performance.now();'
+    singleplayer_start = text.find(singleplayer_anchor)
+    singleplayer_end = (
+        text.find(classes_anchor, singleplayer_start + len(singleplayer_anchor))
+        if singleplayer_start >= 0
+        else -1
     )
-    if singleplayer_count == 0:
-        text = replace_required(
-            text,
-            '      bootTimings.buildToken = buildToken;\n',
-            '      bootTimings.buildToken = buildToken;\n' + singleplayer_build_block,
-            "singleplayer content build token",
+    if singleplayer_start < 0 or singleplayer_end < 0:
+        raise RuntimeError(
+            "index.html patch point was not found: singleplayer content build token"
         )
+    singleplayer_insert_at = singleplayer_start + len(singleplayer_anchor)
+    text = (
+        text[:singleplayer_insert_at]
+        + singleplayer_build_block
+        + text[singleplayer_end:]
+    )
 
     if "bootTimings.fsReady" not in text:
         text = replace_required(
