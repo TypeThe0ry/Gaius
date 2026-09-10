@@ -137,6 +137,7 @@ OPENAL_PATCHER = PORT / "tools" / "src" / "main" / "java" / "dev" / "gaius" / "t
 NETTY_BROWSER_CHANNEL = PORT / "overrides" / "libraries" / "netty-transport" / "src" / "main" / "java" / "io" / "netty" / "channel" / "browser" / "BrowserWebSocketChannel.java"
 NETTY_BROWSER_EVENT_LOOP = PORT / "overrides" / "libraries" / "netty-transport" / "src" / "main" / "java" / "io" / "netty" / "channel" / "browser" / "BrowserInlineEventLoop.java"
 NETTY_BROWSER_PATCHER = PORT / "tools" / "src" / "main" / "java" / "dev" / "gaius" / "tools" / "NettyBrowserPatcher.java"
+BROWSER_COMPRESSION_DECODER = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserCompressionDecoder.java"
 BRIDGE_CONFIG = ROOT / "apps" / "bridge" / "dist" / "config.js"
 BRIDGE_MAIN = ROOT / "apps" / "bridge" / "dist" / "main.js"
 BRIDGE_POLICY = ROOT / "apps" / "bridge" / "dist" / "policy.js"
@@ -1997,6 +1998,15 @@ def check_source_patches() -> None:
     glfw_text = GLFW_BRIDGE.read_text(errors="replace") if GLFW_BRIDGE.exists() else ""
     glfw_patcher = GLFW_PATCHER.read_text(errors="replace") if GLFW_PATCHER.exists() else ""
     client_patcher = CLIENT_PATCHER.read_text(errors="replace") if CLIENT_PATCHER.exists() else ""
+    browser_compression_decoder = (
+        BROWSER_COMPRESSION_DECODER.read_text(errors="replace")
+        if BROWSER_COMPRESSION_DECODER.exists() else ""
+    )
+    browser_sources = browser_compression_decoder
+    browser_compression_production_smoke = (
+        (PORT / "scripts" / "browser-compression-decoder-production-smoke.mjs").read_text(errors="replace")
+        if (PORT / "scripts" / "browser-compression-decoder-production-smoke.mjs").exists() else ""
+    )
     minecraft_262_browser_patcher = (
         MINECRAFT_262_BROWSER_PATCHER.read_text(errors="replace")
         if MINECRAFT_262_BROWSER_PATCHER.exists()
@@ -3493,6 +3503,28 @@ def check_source_patches() -> None:
             and "ConcurrentHashMap" not in netty_browser_channel
             and "AtomicInteger" not in netty_browser_channel
             and "Collections.newSetFromMap" not in netty_browser_channel,
+        ),
+        (
+            "Browser compression uses a generation-scoped cooperative decoder",
+            "BrowserCompressionDecoder" in browser_sources
+            and "extends CompressionDecoder" in browser_sources
+            and "OUTPUT_QUANTUM_BYTES = 16 * 1024" in browser_sources
+            and "TURN_BUDGET_BYTES = 32 * 1024" in browser_sources
+            and "MAX_QUEUE_FRAMES = 8" in browser_sources
+            and "Platform.schedule" in browser_sources
+            and "generation" in browser_sources
+            and "inflater made no progress" in browser_sources
+            and "declared output length reached before zlib end" in browser_sources
+            and "patchCompressionDecoderBrowser" in client_patcher
+            and "dev/gaius/browser/BrowserCompressionDecoder" in client_patcher,
+        ),
+        (
+            "Browser compression production smoke is source-bound and exercises failure cleanup",
+            "productCooperativeDecodeImplemented: true" in browser_compression_production_smoke
+            and "java-source-bound-js-production" in browser_compression_production_smoke
+            and "malformedFailClosed" in browser_compression_production_smoke
+            and "generationOutputFrames" in browser_compression_production_smoke
+            and "browser-compression-decoder-production-smoke.mjs" in bridge_package,
         ),
         (
             "Browser Netty channel batches local stream writes while bounding both queues",

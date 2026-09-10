@@ -173,6 +173,7 @@ jobs:
             --overlay "$GAIUS_OVERLAY_DIRECTORY"
           GAIUS_SMOKE_SELF_TEST=1 \
             node port/scripts/singleplayer-worker-runtime-smoke.mjs
+          node port/scripts/browser-compression-decoder-production-smoke.mjs
           node port/scripts/singleplayer-worker-runtime-smoke.mjs 2>&1 \
             | tee release-evidence/worker-runtime.log
           manifest="$GAIUS_DIST_DIRECTORY/Gaius.manifest.json"

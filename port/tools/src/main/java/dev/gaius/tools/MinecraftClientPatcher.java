@@ -77,6 +77,8 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/client/multiplayer/resolver/ResolvedServerAddress$1.class"));
         patchConnectionBrowserWebSocket(args[0], root.resolve(
                 "net/minecraft/network/Connection.class"));
+        patchCompressionDecoderBrowser(args[0], root.resolve(
+                "net/minecraft/network/Connection.class"));
         patchClientPacketUtilsBrowserInline(args[0], root.resolve(
                 "net/minecraft/network/protocol/PacketUtils.class"));
         patchConnectScreenBrowserRecovery(args[0], root.resolve(
@@ -9822,6 +9824,37 @@ public final class MinecraftClientPatcher {
         code.add(new InsnNode(Opcodes.ARETURN));
         replace(connect, code, 4, 3);
 
+        writeComputeFrames(node, output);
+    }
+
+    /**
+     * Uses the cooperative browser decoder for the compression handler while retaining the
+     * vanilla Connection.setupCompression lifecycle and setThreshold contract.
+     */
+    private static void patchCompressionDecoderBrowser(String jar, Path output)
+            throws IOException {
+        ClassNode node = read(jar, "net/minecraft/network/Connection.class");
+        MethodNode setup = find(node, "setupCompression", "(IZ)V");
+        int replacements = 0;
+        for (AbstractInsnNode instruction : setup.instructions.toArray()) {
+            if (instruction instanceof TypeInsnNode type
+                    && type.getOpcode() == Opcodes.NEW
+                    && type.desc.equals("net/minecraft/network/CompressionDecoder")) {
+                type.desc = "dev/gaius/browser/BrowserCompressionDecoder";
+                replacements++;
+            } else if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESPECIAL
+                    && call.owner.equals("net/minecraft/network/CompressionDecoder")
+                    && call.name.equals("<init>")
+                    && call.desc.equals("(IZ)V")) {
+                call.owner = "dev/gaius/browser/BrowserCompressionDecoder";
+                replacements++;
+            }
+        }
+        if (replacements != 2) {
+            throw new IllegalStateException(
+                    "CompressionDecoder browser constructor patch point changed: " + replacements);
+        }
         writeComputeFrames(node, output);
     }
 
