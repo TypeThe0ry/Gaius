@@ -18,6 +18,9 @@ public class TInetAddress implements Serializable {
         if (host == null || host.isEmpty() || host.equalsIgnoreCase("localhost")) {
             return getLoopbackAddress();
         }
+        if (host.endsWith(".gaius-local")) {
+            return new TInet4Address(host, new byte[] {0, 0, 0, 0});
+        }
         byte[] parsed = parseIpv4(host);
         if (parsed == null) {
             throw new TUnknownHostException(
@@ -69,6 +72,15 @@ public class TInetAddress implements Serializable {
     }
 
     public String getHostAddress() {
+        // Synthetic integrated-server names are transport identities, not DNS
+        // addresses.  They intentionally carry a 0.0.0.0 byte payload so the
+        // TeaVM classlib can construct an Inet4Address without a resolver, but
+        // exposing that payload here destroys the name when vanilla converts
+        // InetSocketAddress -> InetAddress -> host address.  Keep the typed
+        // name all the way to BrowserWebSocketChannel.open().
+        if (hostName != null && hostName.endsWith(".gaius-local")) {
+            return hostName;
+        }
         if (address.length == 4) {
             return (address[0] & 255) + "." + (address[1] & 255) + "."
                     + (address[2] & 255) + "." + (address[3] & 255);

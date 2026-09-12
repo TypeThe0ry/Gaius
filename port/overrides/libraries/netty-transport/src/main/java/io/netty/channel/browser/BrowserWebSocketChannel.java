@@ -79,8 +79,20 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             nextSocketId = 1;
         }
         addChannel(this);
-        initBridge();
-        initBridgeTail();
+        // Keep a tiny browser-visible breadcrumb around bridge construction.  The portable
+        // launcher can then distinguish "channel constructor never ran" from an exception in
+        // one of the two large JSBody initialisers without relying on a debugger attached to the
+        // generated TeaVM bundle.
+        recordBridgeInitPhase("constructor-before-init");
+        try {
+            initBridge();
+            recordBridgeInitPhase("init-complete");
+            initBridgeTail();
+            recordBridgeInitPhase("tail-complete");
+        } catch (RuntimeException | Error error) {
+            recordBridgeInitFailure(error);
+            throw error;
+        }
         arrivalTimelineTracing = readArrivalTimelineEnabled();
         initOutboundScheduler();
         initInboundScheduler();
@@ -504,7 +516,19 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
         if (remote instanceof InetSocketAddress address) {
             String host = address.getHostString();
             if (host != null && !host.isEmpty()) {
-                return normalizeRemoteHost(host, address.getPort());
+                String normalized = normalizeRemoteHost(host, address.getPort());
+                // TeaVM's unresolved InetSocketAddress fallback uses 0.0.0.0 when
+                // the browser-side resolver cannot retain the synthetic local host.
+                // Recover only the integrated-server endpoint; ordinary remote
+                // connections must keep their typed host unchanged.
+                if (address.getPort() == 25565
+                        && ("0.0.0.0".equals(normalized) || "localhost".equalsIgnoreCase(normalized))) {
+                    String localHost = localSessionHost();
+                    if (localHost != null && !localHost.isEmpty()) {
+                        return localHost;
+                    }
+                }
+                return normalized;
             }
             if (address.getAddress() != null) {
                 return address.getAddress().getHostAddress();
@@ -512,6 +536,36 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
         }
         throw new ChannelException("Unsupported browser remote address: " + remote);
     }
+
+    /** Returns the current integrated-server client host, or an empty string when none is active. */
+    @JSBody(script = """
+            const direct = String(globalThis.__gaiusServerSessionId || '').trim();
+            if (/^[a-f0-9]{32}$/.test(direct)) return 'client-' + direct + '.gaius-local';
+            const workers = globalThis.__gaiusSingleplayerWorkers;
+            let workerHost = '';
+            if (workers && typeof workers.forEach === 'function') {
+              workers.forEach(function(worker, key) {
+                const session = String(key || '').trim();
+                if (!workerHost && /^[a-f0-9]{32}$/.test(session) &&
+                    worker && !worker.__gaiusTerminal) {
+                  workerHost = 'client-' + session + '.gaius-local';
+                }
+              });
+            }
+            if (workerHost) return workerHost;
+            const ports = globalThis.__gaiusLocalServerPorts;
+            let portHost = '';
+            if (ports && typeof ports.keys === 'function') {
+              ports.forEach(function(value, key) {
+                const session = String(key || '').trim();
+                if (!portHost && /^[a-f0-9]{32}$/.test(session)) {
+                  portHost = 'client-' + session + '.gaius-local';
+                }
+              });
+            }
+            return portHost;
+            """)
+    private static native String localSessionHost();
 
     /**
      * Minecraft's browser-side address parsing can retain the typed port in an unresolved
@@ -1607,6 +1661,28 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             };
             """)
     private static native void initBridge();
+
+    @JSBody(params = "phase", script = """
+            const trace = globalThis.__gaiusNettyBridgeInitTrace ||
+              (globalThis.__gaiusNettyBridgeInitTrace = []);
+            trace.push({phase: String(phase || ''), at: Date.now()});
+            if (trace.length > 32) trace.splice(0, trace.length - 32);
+            """)
+    private static native void recordBridgeInitPhase(String phase);
+
+    @JSBody(params = "error", script = """
+            const trace = globalThis.__gaiusNettyBridgeInitTrace ||
+              (globalThis.__gaiusNettyBridgeInitTrace = []);
+            trace.push({
+              phase: 'init-failed',
+              at: Date.now(),
+              error: String(error && (error.stack || error.message) || error)
+            });
+            if (trace.length > 32) trace.splice(0, trace.length - 32);
+            globalThis.__gaiusNettyBridgeInitError =
+              String(error && (error.stack || error.message) || error);
+            """)
+    private static native void recordBridgeInitFailure(Throwable error);
 
     @JSBody(script = """
             const state = globalThis.__gaiusNettyBridgeBootstrapState;
