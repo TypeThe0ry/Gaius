@@ -71,8 +71,8 @@ The `1.21.11` profile requires JDK 21 and `26.2` requires JDK 25 or newer;
 set `GAIUS_JAVA_HOME` or `JAVA_HOME` to the matching JDK before each loop
 iteration. The commands above are release gates to run, not claims about
 every checkout. Record their actual results in the release notes or release
-checklist. The GitHub release workflow runs the same profile matrix on
-separate runners and uploads one artifact per profile.
+checklist. Release bundles are compiled and verified on the maintainer's
+machine. GitHub Actions does not compile TeaVM release artifacts.
 
 For a lightweight source-only hygiene check, run:
 
@@ -95,10 +95,9 @@ mock UI captures.
 
 ## Publish Artifacts
 
-The release workflow generates the following profile-scoped files and uploads
-them as CI/GitHub Release artifacts. They are not automatically added to Git;
-if a release maintainer deliberately checks them in, `port/web/dist/**` is
-covered by the repository's Git LFS attributes:
+The local release build generates the following profile-scoped files. They are
+not automatically added to Git; if a release maintainer deliberately checks
+them in, `port/web/dist/**` is covered by the repository's Git LFS attributes:
 
 | Artifact | Use |
 | --- | --- |
@@ -128,21 +127,25 @@ source port/scripts/version-profile.sh
 done > SHA256SUMS)
 ```
 
-Publish the tag and assets with GitHub CLI after reviewing the staged diff:
+Publish the locally verified tag and assets with GitHub CLI after reviewing
+the staged files and `SHA256SUMS`:
 
 ```sh
 version="$(tr -d '[:space:]' < VERSION)"
 git tag -a "v$version" -m "Gaius Client 1.21.11 + 26.2 v$version"
-git push origin HEAD
+git push origin main
 git push origin "v$version"
-gh workflow run release.yml --ref "$(git branch --show-current)" -f "tag=v$version"
+gh release create "v$version" "$release_dir"/* \
+  --repo TypeThe0ry/Gaius \
+  --title "Gaius $version" \
+  --notes-file RELEASE_NOTES.md
 ```
 
-The workflow verifies the tag and source checks before building both profiles,
-then verifies artifact identity and Worker runtime, builds the plugin, and
-publishes checksummed assets. TeaVM build logs are retained even on failure.
-Wait for the existing release run to finish before dispatching another run.
-Never move an already pushed release tag to include later fixes.
+Download every uploaded asset to a fresh directory, verify it against the
+published `SHA256SUMS`, and repeat the Chrome launch and single-player and
+multiplayer acceptance checks on the downloaded HTML files. Never move an
+already published release tag to include later fixes; create a new version
+instead.
 
 The release page should identify the browser package, optional plugin, SHA256
 checksums, supported client version, and any known runtime limitations.

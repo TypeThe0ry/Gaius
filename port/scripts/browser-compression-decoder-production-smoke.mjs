@@ -24,6 +24,18 @@ for (const marker of [
 ]) assert.ok(java.includes(marker), `missing Java decoder marker: ${marker}`);
 assert.ok(patcher.includes("patchCompressionDecoderBrowser"), "patcher hook missing");
 assert.ok(patcher.includes("dev/gaius/browser/BrowserCompressionDecoder"), "constructor replacement missing");
+const websocketPatchCall = patcher.indexOf("patchConnectionBrowserWebSocket(args[0]");
+const compressionPatchCall = patcher.indexOf("patchCompressionDecoderBrowser(root.resolve(");
+assert.ok(websocketPatchCall >= 0 && compressionPatchCall > websocketPatchCall,
+  "Connection compression patch must run after the browser WebSocket patch");
+const compressionPatchMethod = patcher.slice(
+  patcher.indexOf("private static void patchCompressionDecoderBrowser"),
+  patcher.indexOf("private static void patchGlx", patcher.indexOf("private static void patchCompressionDecoderBrowser")),
+);
+assert.match(compressionPatchMethod, /ClassNode node = read\(connectionClass\);/,
+  "Connection compression patch must continue from the already patched class file");
+assert.doesNotMatch(compressionPatchMethod, /ClassNode node = read\(jar,/,
+  "Connection compression patch must not reload and overwrite the original JAR class");
 
 const MAX_UNCOMPRESSED = 8 * 1024 * 1024;
 const MAX_COMPRESSED = 2 * 1024 * 1024;
