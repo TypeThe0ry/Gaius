@@ -9826,6 +9826,111 @@ public final class MinecraftClientPatcher {
         code.add(new InsnNode(Opcodes.ARETURN));
         replace(connect, code, 4, 3);
 
+        // The integrated-server entry point does not call the remote
+        // Connection.connect(InetSocketAddress, ... ) helper above.  It calls
+        // connectToLocalServer(SocketAddress), whose vanilla implementation
+        // explicitly selects LocalChannel and the in-memory frame codec.  In a
+        // browser the server lives in a Worker and the only usable transport is
+        // the MessagePort-backed BrowserWebSocketChannel.  Patch this method as
+        // well; otherwise the client never reaches the page-side bridge and the
+        // Worker listener correctly reports "ready" while the client receives a
+        // LocalChannel connection-refused screen.
+        MethodNode local = find(node, "connectToLocalServer",
+                "(Ljava/net/SocketAddress;)Lnet/minecraft/network/Connection;");
+        InsnList localCode = new InsnList();
+        localCode.add(new TypeInsnNode(Opcodes.NEW, "net/minecraft/network/Connection"));
+        localCode.add(new InsnNode(Opcodes.DUP));
+        localCode.add(new FieldInsnNode(
+                Opcodes.GETSTATIC,
+                "net/minecraft/network/protocol/PacketFlow",
+                "CLIENTBOUND",
+                "Lnet/minecraft/network/protocol/PacketFlow;"));
+        localCode.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                "net/minecraft/network/Connection",
+                "<init>",
+                "(Lnet/minecraft/network/protocol/PacketFlow;)V",
+                false));
+        localCode.add(new VarInsnNode(Opcodes.ASTORE, 1));
+        localCode.add(new TypeInsnNode(Opcodes.NEW, "io/netty/bootstrap/Bootstrap"));
+        localCode.add(new InsnNode(Opcodes.DUP));
+        localCode.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                "io/netty/bootstrap/Bootstrap",
+                "<init>",
+                "()V",
+                false));
+        localCode.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "net/minecraft/server/network/EventLoopGroupHolder",
+                "local",
+                "()Lnet/minecraft/server/network/EventLoopGroupHolder;",
+                false));
+        localCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/server/network/EventLoopGroupHolder",
+                "eventLoopGroup",
+                "()Lio/netty/channel/EventLoopGroup;",
+                false));
+        localCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "io/netty/bootstrap/Bootstrap",
+                "group",
+                "(Lio/netty/channel/EventLoopGroup;)Lio/netty/bootstrap/AbstractBootstrap;",
+                false));
+        localCode.add(new TypeInsnNode(Opcodes.CHECKCAST, "io/netty/bootstrap/Bootstrap"));
+        localCode.add(new TypeInsnNode(Opcodes.NEW, "net/minecraft/network/Connection$1"));
+        localCode.add(new InsnNode(Opcodes.DUP));
+        localCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        localCode.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                "net/minecraft/network/Connection$1",
+                "<init>",
+                "(Lnet/minecraft/network/Connection;)V",
+                false));
+        localCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "io/netty/bootstrap/Bootstrap",
+                "handler",
+                "(Lio/netty/channel/ChannelHandler;)Lio/netty/bootstrap/AbstractBootstrap;",
+                false));
+        localCode.add(new TypeInsnNode(Opcodes.CHECKCAST, "io/netty/bootstrap/Bootstrap"));
+        localCode.add(new LdcInsnNode(Type.getObjectType(
+                "io/netty/channel/browser/BrowserWebSocketChannel")));
+        localCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "io/netty/bootstrap/Bootstrap",
+                "channel",
+                "(Ljava/lang/Class;)Lio/netty/bootstrap/AbstractBootstrap;",
+                false));
+        localCode.add(new TypeInsnNode(Opcodes.CHECKCAST, "io/netty/bootstrap/Bootstrap"));
+        localCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "io/netty/bootstrap/Bootstrap",
+                "disableResolver",
+                "()Lio/netty/bootstrap/Bootstrap;",
+                false));
+        localCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        localCode.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "io/netty/bootstrap/Bootstrap",
+                "connect",
+                "(Ljava/net/SocketAddress;)Lio/netty/channel/ChannelFuture;",
+                false));
+        localCode.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "io/netty/channel/ChannelFuture",
+                "syncUninterruptibly",
+                "()Lio/netty/channel/ChannelFuture;",
+                true));
+        localCode.add(new InsnNode(Opcodes.POP));
+        localCode.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        localCode.add(new InsnNode(Opcodes.ARETURN));
+        // The local method originally has one argument and one temporary.  The
+        // replacement uses slot 1 for the Connection and never needs the old
+        // local variables or exception table.
+        replace(local, localCode, 5, 2);
+
         writeComputeFrames(node, output);
     }
 

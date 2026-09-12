@@ -715,7 +715,174 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
       window.__gaiusBridgeUrls = embeddedRelayNodes.concat(configuredRelayNodes);
       window.__gaiusPortableManifest = portableManifest;
       window.__gaiusPortableBuild = true;
+      const portableBridgeTrace = window.__gaiusPortableBridgeTrace ||
+        (window.__gaiusPortableBridgeTrace = []);
+      const portablePendingLocalPorts = window.__gaiusPortablePendingLocalPorts ||
+        (window.__gaiusPortablePendingLocalPorts = new Map());
+      const tracePortableBridge = (event, detail) => {{
+        portableBridgeTrace.push(Object.assign({{event, at: Date.now()}}, detail || {{}}));
+        if (portableBridgeTrace.length > 256) portableBridgeTrace.splice(0, portableBridgeTrace.length - 256);
+      }};
+      const consumePortablePendingLocalPorts = () => {{
+        const bridge = window.__gaiusNettyBridge || window.__gaiusNettyBridgeBootstrapState;
+        if (!bridge || typeof bridge.registerLocalPort !== "function") return false;
+        let consumed = false;
+        portablePendingLocalPorts.forEach((pending, sessionId) => {{
+          if (!pending || !pending.port) {{
+            portablePendingLocalPorts.delete(sessionId);
+            return;
+          }}
+          let result = false;
+          try {{
+            result = bridge.registerLocalPort(
+              String(sessionId), pending.port, String(pending.launchGeneration || ""));
+          }} catch (error) {{
+            tracePortableBridge("registerLocalPort-throw", {{
+              sessionId: String(sessionId),
+              launchGeneration: String(pending.launchGeneration || ""),
+              error: String(error && (error.stack || error.message) || error),
+            }});
+          }}
+          tracePortableBridge("registerLocalPort-result", {{
+            sessionId: String(sessionId),
+            launchGeneration: String(pending.launchGeneration || ""),
+            result: !!result,
+            bridgeReady: true,
+          }});
+          if (result) {{
+            portablePendingLocalPorts.delete(sessionId);
+            consumed = true;
+          }}
+        }});
+        return consumed;
+      }};
+      // Keep the generated transport untouched, but normalize the one
+      // integrated-server wildcard endpoint at the bridge boundary.  Some
+      // TeaVM socket paths resolve the synthetic local name to 0.0.0.0 before
+      // invoking the JS bridge; the page registry already contains the active
+      // session and its MessagePort by this point.
+      const installLocalBridgeHostPatch = () => {{
+        const wrap = (bridge) => {{
+          if (!bridge || typeof bridge.open !== "function") return false;
+          if (bridge.__gaiusLocalHostPatch) return true;
+          const originalOpen = bridge.open;
+          bridge.open = function(id, host, port) {{
+            let effectiveHost = host;
+            if ((String(host) === "0.0.0.0" || String(host).toLowerCase() === "localhost") && Number(port) === 25565) {{
+              let session = "";
+              const workers = window.__gaiusSingleplayerWorkers;
+              if (workers && typeof workers.forEach === "function") workers.forEach((worker, key) => {{
+                if (!session && /^[a-f0-9]{{32}}$/.test(String(key || "")) && worker && !worker.__gaiusTerminal) session = String(key);
+              }});
+              const direct = String(window.__gaiusServerSessionId || "");
+              if (!session && /^[a-f0-9]{{32}}$/.test(direct)) session = direct;
+              if (!session) {{
+                const ports = window.__gaiusLocalServerPorts;
+                if (ports && typeof ports.forEach === "function") ports.forEach((value, key) => {{ if (!session && /^[a-f0-9]{{32}}$/.test(String(key || ""))) session = String(key); }});
+              }}
+              if (session) effectiveHost = "client-" + session + ".gaius-local";
+            }}
+            tracePortableBridge("bridge-open", {{id,host:String(host),port:Number(port),effectiveHost:String(effectiveHost),session:String(window.__gaiusServerSessionId||""),workers:window.__gaiusSingleplayerWorkers?.size||0,ports:window.__gaiusLocalServerPorts?.size||0}});
+            return originalOpen.call(this, id, effectiveHost, port);
+          }};
+          bridge.__gaiusLocalHostPatch = true;
+          return true;
+        }};
+        let bridge = window.__gaiusNettyBridge;
+        if (!bridge && window.__gaiusNettyBridgeBootstrapState && typeof window.__gaiusNettyBridgeBootstrapState.open === "function") {{
+          try {{ window.__gaiusNettyBridge = window.__gaiusNettyBridgeBootstrapState; bridge = window.__gaiusNettyBridge; }} catch (_) {{}}
+        }}
+        if (wrap(bridge)) {{
+          tracePortableBridge("bridge-init", {{bridgeReady: true}});
+          consumePortablePendingLocalPorts();
+          return true;
+        }}
+        const bootstrapState = window.__gaiusNettyBridgeBootstrapState;
+        if (wrap(bootstrapState)) {{
+          tracePortableBridge("bridge-bootstrap", {{bridgeReady: true}});
+          consumePortablePendingLocalPorts();
+          return true;
+        }}
+        if (!window.__gaiusPortableBridgeAccessorInstalled) {{
+          try {{
+            const descriptor = Object.getOwnPropertyDescriptor(window, "__gaiusNettyBridge");
+            if (!descriptor || descriptor.configurable) {{
+              let value = descriptor ? (descriptor.get ? descriptor.get.call(window) : descriptor.value) : undefined;
+              Object.defineProperty(window, "__gaiusNettyBridge", {{
+                configurable: true, enumerable: descriptor ? descriptor.enumerable : true,
+                get() {{ return value; }},
+                set(next) {{ value = next; wrap(next); }}
+              }});
+              window.__gaiusPortableBridgeAccessorInstalled = true;
+            }}
+          }} catch (_) {{}}
+        }}
+        const ready = !!wrap(window.__gaiusNettyBridge);
+        if (ready) consumePortablePendingLocalPorts();
+        return ready;
+      }};
+      installLocalBridgeHostPatch();
+      setInterval(() => {{ installLocalBridgeHostPatch(); consumePortablePendingLocalPorts(); }}, 10);
       window.__gaiusVanillaAssetsCompressedPromise = compressedBlob(embedded.vanilla);
+      // The page must transfer the embedded server bytes to its Worker. A
+      // page-created blob:null URL cannot be fetched from a dedicated Worker
+      // when the launcher is opened directly via file://.
+      window.__gaiusSingleplayerServerGzipDataPromise = compressedBlob(embedded.server)
+        .then((blob) => blob.arrayBuffer());
+      // Bridge the generated Java launcher without recompiling TeaVM: defer
+      // only the integrated-server start message until the transferable gzip
+      // buffer is ready. The original MessagePort remains untransferred until
+      // the native postMessage call below.
+      if (typeof Worker === "function" && Worker.prototype &&
+          typeof Worker.prototype.postMessage === "function") {{
+        const nativeWorkerPostMessage = Worker.prototype.postMessage;
+        Worker.prototype.postMessage = function(message, transfer) {{
+          if (window.__gaiusPortableBuild === true && message &&
+              message.type === "start" &&
+              window.__gaiusSingleplayerServerGzipDataPromise &&
+              typeof window.__gaiusSingleplayerServerGzipDataPromise.then === "function") {{
+            const worker = this;
+            const originalTransfer = Array.isArray(transfer) ? transfer.slice() : [];
+            const sessionId = String(message.sessionId || "");
+            const launchGeneration = String(message.launchGeneration || "");
+            const pagePort = worker && worker.__gaiusClientPort;
+            if (/^[a-f0-9]{{32}}$/.test(sessionId) && pagePort && /^[1-9][0-9]*$/.test(launchGeneration)) {{
+              const ports = window.__gaiusLocalServerPorts ||
+                (window.__gaiusLocalServerPorts = new Map());
+              const existing = ports.get(sessionId);
+              if (!existing) ports.set(sessionId, pagePort);
+              window.__gaiusServerSessionId = sessionId;
+              window.__gaiusServerLaunchGeneration = launchGeneration;
+              portablePendingLocalPorts.set(sessionId, {{port: pagePort, launchGeneration}});
+              tracePortableBridge("start-pre-register", {{
+                sessionId, launchGeneration, hasPagePort: true,
+                existingPort: !!existing, pending: portablePendingLocalPorts.size,
+              }});
+              consumePortablePendingLocalPorts();
+            }} else {{
+              tracePortableBridge("start-pre-register", {{
+                sessionId, launchGeneration, hasPagePort: !!pagePort,
+                pending: portablePendingLocalPorts.size,
+              }});
+            }}
+            window.__gaiusSingleplayerServerGzipDataPromise.then((buffer) => {{
+              const payload = Object.assign({{}}, message, {{
+                serverScriptGzipData: buffer,
+                serverScriptGzipUrl: null,
+              }});
+              const transferList = originalTransfer.slice();
+              if (buffer instanceof ArrayBuffer) transferList.push(buffer);
+              nativeWorkerPostMessage.call(worker, payload, transferList);
+              tracePortableBridge("start-post-register", {{sessionId, launchGeneration, transferred: true}});
+            }}, () => {{
+              nativeWorkerPostMessage.call(worker, message, originalTransfer);
+              tracePortableBridge("start-post-register", {{sessionId, launchGeneration, transferred: false}});
+            }});
+            return;
+          }}
+          return nativeWorkerPostMessage.call(this, message, transfer);
+        }};
+      }}
       window.__gaiusPortableAssetsReady = (async () => {{
         const [classesBlob, wasmBlob] = await Promise.all([
           decompress(embedded.classes, "text/javascript"),
