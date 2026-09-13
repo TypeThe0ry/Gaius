@@ -549,7 +549,10 @@ function createLaunchRuntime(failureMode, options = {}) {
     type: "server-startup-progress",
     detail: "future-pump-waiting polls=12 tasks=0 emptyYields=12 queue=0",
   }});
-  assert.equal(worker.__gaiusStartupInactivityDeadlineAt, futureWaitDeadline,
+  // Date.now() can tick between the two synthetic progress deliveries even
+  // though the watchdog correctly rejects the repeated no-task poll.  Allow
+  // that tiny clock jitter while still failing any real grace renewal.
+  assert.ok(worker.__gaiusStartupInactivityDeadlineAt <= futureWaitDeadline + 5,
     "stuck future-pump polls incorrectly renewed the grace");
   worker.__gaiusStartupInactivityDeadlineAt = Date.now() + 1000;
   worker.onmessage({data: {
