@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -33,6 +34,10 @@ public class VanillaPackResources implements PackResources {
     private final String[] resources;
     private final Set<String> resourceSet;
     private final Map<String, ListedResource[]> listedResourceCache = new HashMap<>();
+    private final Map<String, byte[]> externalResourceCache = new LinkedHashMap<>(128, 0.75f, true);
+    private int externalResourceCacheBytes;
+    private static final int EXTERNAL_CACHE_MAX_BYTES = 32 * 1024 * 1024;
+    private static final int EXTERNAL_CACHE_MAX_ENTRY_BYTES = 2 * 1024 * 1024;
 
     VanillaPackResources(
             PackLocationInfo location,
@@ -147,9 +152,9 @@ public class VanillaPackResources implements PackResources {
         return openClasspathResource(resource);
     }
 
-    private static IoSupplier<InputStream> openClasspathResource(String resource) {
+    private IoSupplier<InputStream> openClasspathResource(String resource) {
         return () -> {
-            byte[] external = readExternalResource(resource);
+            byte[] external = readExternalResourceCached(resource);
             if (external != null) {
                 return new ByteArrayInputStream(external);
             }
@@ -181,13 +186,34 @@ public class VanillaPackResources implements PackResources {
         return VanillaPackResources.class.getClassLoader().getResourceAsStream(normalized);
     }
 
-    private static byte[] readExternalResource(String resource) {
+    private byte[] readExternalResourceCached(String resource) {
+        byte[] cached = externalResourceCache.get(resource);
+        if (cached != null) {
+            return cached;
+        }
         int length = externalResourceLength(resource);
-        if (length < 0) {
+        if (length < 0 || length > EXTERNAL_CACHE_MAX_ENTRY_BYTES) {
             return null;
         }
         byte[] output = new byte[length];
-        return copyExternalResource(resource, output) ? output : null;
+        if (!copyExternalResource(resource, output)) {
+            return null;
+        }
+        externalResourceCache.put(resource, output);
+        externalResourceCacheBytes += output.length;
+        trimExternalResourceCache();
+        return output;
+    }
+
+    private void trimExternalResourceCache() {
+        while (externalResourceCacheBytes > EXTERNAL_CACHE_MAX_BYTES
+                && !externalResourceCache.isEmpty()) {
+            java.util.Iterator<Map.Entry<String, byte[]>> iterator = externalResourceCache.entrySet().iterator();
+            Map.Entry<String, byte[]> eldest = iterator.next();
+            byte[] bytes = eldest.getValue();
+            externalResourceCacheBytes -= bytes == null ? 0 : bytes.length;
+            iterator.remove();
+        }
     }
 
     @JSBody(params = "resource", script = """

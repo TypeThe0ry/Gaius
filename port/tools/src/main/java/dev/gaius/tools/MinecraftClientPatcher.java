@@ -77,8 +77,6 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/client/multiplayer/resolver/ResolvedServerAddress$1.class"));
         patchConnectionBrowserWebSocket(args[0], root.resolve(
                 "net/minecraft/network/Connection.class"));
-        // Continue from the already patched Connection.class. Reading the original JAR here
-        // would overwrite the browser WebSocket connect patch applied immediately above.
         patchCompressionDecoderBrowser(root.resolve(
                 "net/minecraft/network/Connection.class"));
         patchClientPacketUtilsBrowserInline(args[0], root.resolve(
@@ -9940,6 +9938,9 @@ public final class MinecraftClientPatcher {
      */
     private static void patchCompressionDecoderBrowser(Path connectionClass)
             throws IOException {
+        // Continue from the Connection.class already rewritten by
+        // patchConnectionBrowserWebSocket, including connectToLocalServer.
+        // Reading the input JAR here would silently discard that transport patch.
         ClassNode node = read(connectionClass);
         MethodNode setup = find(node, "setupCompression", "(IZ)V");
         int replacements = 0;

@@ -703,8 +703,18 @@ async function main() {
         const measuredRtt = enablePing ? pingRtt : statusRtt;
         const measuredRttSummary = latencySummary(measuredRtt);
         const pingResponseGapSummary = latencySummary(pingResponseGaps);
+        // Many Minecraft status endpoints intentionally close the TCP stream
+        // immediately after the status response (and the first pong).  Once
+        // every probe is terminal there is no open stream on which to collect
+        // a 1-second ping cadence; treating that expected close as a missing
+        // 15-s sample window made a healthy RelayNode fail this transport
+        // smoke before PLAY was even involved.
+        const terminalStatusStreams = enablePing && clients.every((client) =>
+            client.closed || !bridge.channels.has(client.id));
         const minimumPingResponsesPerClient = enablePing
-            ? Math.max(3, Math.floor(soakMillis / pingIntervalMillis) - 1)
+            ? (terminalStatusStreams
+                ? 1
+                : Math.max(3, Math.floor(soakMillis / pingIntervalMillis) - 1))
             : 0;
         const targetActive = (manifest) => Number(manifest.target?.activeConnections ?? 0);
         const runtimeSnapshots = [runtimeBaseline, runtimePeak, runtimeAfterSoak,
@@ -794,6 +804,7 @@ async function main() {
             gate: {
                 statusResponses: clients.every((client) => client.statusResponses >= 1),
                 pingLoss: pingSent - pingResponses,
+                terminalStatusStreams,
                 rttSource: enablePing ? "status-ping" : "status-response",
                 p99RttMillis: measuredRttSummary.p99Millis,
                 maxRttMillis: measuredRttSummary.maxMillis,

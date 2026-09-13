@@ -58,8 +58,8 @@ for (const contract of [
   "uploadProgressEpoch",
   "compileRunsDuringUploadThisFrame",
   "shouldContinueDrain(completed, System.nanoTime() - startedAt)",
-  "completed < MAX_TASKS_PER_FRAME",
-  "completed == 0 || elapsedNanos < FRAME_WORK_BUDGET_NANOS",
+  "completed < effectiveMaxTasksPerFrame()",
+  "completed == 0 || elapsedNanos < effectiveFrameWorkBudgetNanos()",
   "QUEUE.addLast(command)",
   "backpressureEvents",
   "currentHighWaterMillis",
@@ -196,8 +196,9 @@ for (const contract of [
     "missing bounded Worker slow-probe evidence contract: " + contract);
 }
 
-const shouldContinueDrain = (completed, elapsedNanos) =>
-  completed < 8 && (completed === 0 || elapsedNanos < 2_000_000);
+const shouldContinueDrain = (completed, elapsedNanos, fast = false) =>
+  completed < (fast ? 16 : 8) &&
+    (completed === 0 || elapsedNanos < (fast ? 4_000_000 : 2_000_000));
 let cheapTasks = 0;
 let elapsedNanos = 0;
 while (shouldContinueDrain(cheapTasks, elapsedNanos)) {
@@ -212,6 +213,13 @@ while (shouldContinueDrain(expensiveTasks, elapsedNanos)) {
   elapsedNanos += 3_000_000;
 }
 assert.equal(expensiveTasks, 1, "an expensive section task did not yield after one task");
+let fastTasks = 0;
+elapsedNanos = 0;
+while (shouldContinueDrain(fastTasks, elapsedNanos, true)) {
+  fastTasks++;
+  elapsedNanos += 100_000;
+}
+assert.equal(fastTasks, 16, "fast desktop profile did not drain its bounded warmup budget");
 
 const extractorPatch = patcher.slice(
   patcher.indexOf("patchCurrentLevelExtractorBrowserSectionCompileThrottle"),
