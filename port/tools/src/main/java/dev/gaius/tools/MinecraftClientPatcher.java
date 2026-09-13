@@ -77,7 +77,7 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/client/multiplayer/resolver/ResolvedServerAddress$1.class"));
         patchConnectionBrowserWebSocket(args[0], root.resolve(
                 "net/minecraft/network/Connection.class"));
-        patchCompressionDecoderBrowser(args[0], root.resolve(
+        patchCompressionDecoderBrowser(root.resolve(
                 "net/minecraft/network/Connection.class"));
         patchClientPacketUtilsBrowserInline(args[0], root.resolve(
                 "net/minecraft/network/protocol/PacketUtils.class"));
@@ -9936,16 +9936,12 @@ public final class MinecraftClientPatcher {
      * Uses the cooperative browser decoder for the compression handler while retaining the
      * vanilla Connection.setupCompression lifecycle and setThreshold contract.
      */
-    private static void patchCompressionDecoderBrowser(String jar, Path output)
+    private static void patchCompressionDecoderBrowser(Path connectionClass)
             throws IOException {
-        // Connection.class is patched twice in this pass: the browser transport
-        // patch above rewrites connect/connectToLocalServer, then this method
-        // swaps CompressionDecoder.  Read the already-emitted class when it is
-        // present; rereading the input jar here would silently discard the local
-        // WebSocket connectToLocalServer patch.
-        ClassNode node = Files.exists(output)
-                ? read(output)
-                : read(jar, "net/minecraft/network/Connection.class");
+        // Continue from the Connection.class already rewritten by
+        // patchConnectionBrowserWebSocket, including connectToLocalServer.
+        // Reading the input JAR here would silently discard that transport patch.
+        ClassNode node = read(connectionClass);
         MethodNode setup = find(node, "setupCompression", "(IZ)V");
         int replacements = 0;
         for (AbstractInsnNode instruction : setup.instructions.toArray()) {
@@ -9967,7 +9963,7 @@ public final class MinecraftClientPatcher {
             throw new IllegalStateException(
                     "CompressionDecoder browser constructor patch point changed: " + replacements);
         }
-        writeComputeFrames(node, output);
+        writeComputeFrames(node, connectionClass);
     }
 
     private static void patchGlx(String jar, Path output) throws IOException {
