@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gaius Minecraft 1.21.11</title>
+<style>
+:root{color-scheme:dark;font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}body{margin:0;background:#08111f;color:#e5f2ff}main{max-width:900px;margin:0 auto;padding:32px 20px}h1{margin:0 0 8px}p{color:#abc1d8}.card{background:#10243a;border:1px solid #244b6d;border-radius:12px;padding:20px;margin:18px 0}.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}label{display:grid;gap:6px;flex:1 1 280px}input{padding:10px;border-radius:8px;border:1px solid #376487;background:#071321;color:#fff;font:inherit}button,.launch{display:inline-block;padding:10px 15px;border:0;border-radius:8px;background:#36b37e;color:#06130e;font-weight:700;text-decoration:none;cursor:pointer}.secondary{background:#2f5d86;color:#eaf6ff}.small{font-size:13px;color:#9cb5ca}code{color:#9ee7ff}</style>
+</head>
+<body><main>
+<h1>Gaius Minecraft 1.21.11</h1><p>选择客户端版本，填写 Minecraft 服务器地址。RelayNode 默认使用 <code>wss://ellan.site/tunnel</code>，也可改成你自己的节点。</p>
+<section class="card"><div class="row"><label>RelayNode URL<input id="relay" value="wss://ellan.site/tunnel" autocomplete="url"></label><label>目标服务器 host:port<input id="target" value="t40.sjcmc.cn:14803" autocomplete="off"></label></div><p class="small">配置只保存在当前浏览器 localStorage，不写入公开页面，也不包含 token。</p></section>
+<section class="card"><h2>启动版本</h2><div class="row"><a class="launch" data-profile="1.21.11" href="https://github.com/TypeThe0ry/Gaius/releases/latest/download/Gaius-1.21.11.html">Minecraft 1.21.11</a><a class="launch" data-profile="26.2" href="../26.2/">Minecraft 26.2</a></div><p id="hint" class="small"></p></section>
+<section class="card"><h2>RelayNode 状态</h2><pre id="status">正在读取 relay-nodes.json…</pre></section>
+</main><script>
+const relay=document.querySelector('#relay'),target=document.querySelector('#target'),hint=document.querySelector('#hint');
+for(const el of [relay,target]){const k='gaius.pages.'+el.id;const v=localStorage.getItem(k);if(v)el.value=v;el.addEventListener('input',()=>localStorage.setItem(k,el.value.trim()));}
+for(const a of document.querySelectorAll('.launch'))a.addEventListener('click',e=>{const u=new URL(a.href,location.href);u.searchParams.set('relay',relay.value.trim());u.searchParams.set('bridge',relay.value.trim());u.searchParams.set('server',target.value.trim());u.searchParams.set('directPlugin','0');a.href=u.href;hint.textContent='已配置 '+a.dataset.profile+'：'+target.value.trim()+' via '+relay.value.trim();});
+fetch('../relay-nodes.json',{cache:'no-store'}).then(r=>r.json()).then(x=>{document.querySelector('#status').textContent=JSON.stringify(x,null,2);}).catch(e=>{document.querySelector('#status').textContent='relay-nodes.json 读取失败：'+e;});
+</script></body></html>
+
+
