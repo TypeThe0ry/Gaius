@@ -278,7 +278,11 @@ assert.ok(launchEnd > 0 && launchAnnotation > 0 && launchScriptEnd > launchStart
   "launchWorker JSBody could not be extracted");
 // Java text blocks preserve a regex backslash as `\\d`; normalize that one
 // Java escape for the VM fixture, which executes the extracted JS directly.
-const launchScript = source.slice(launchStart, launchScriptEnd).replace(/\\\\d/g, "\\d");
+// Java text blocks carry escaped regex boundaries (\\b/\\d). Normalize both
+// forms before evaluating the extracted browser script so the fixture mirrors
+// the generated JavaScript rather than treating \b as a literal backslash+b.
+const launchScript = source.slice(launchStart, launchScriptEnd)
+  .replace(/\\\\([bd])/g, "\\$1");
 
 function createLaunchRuntime(failureMode, options = {}) {
   const channels = [];
@@ -549,7 +553,10 @@ function createLaunchRuntime(failureMode, options = {}) {
     type: "server-startup-progress",
     detail: "future-pump-waiting polls=12 tasks=0 emptyYields=12 queue=0",
   }});
-  assert.equal(worker.__gaiusStartupInactivityDeadlineAt, futureWaitDeadline,
+  // Date.now() can tick between the two synthetic progress deliveries even
+  // though the watchdog correctly rejects the repeated no-task poll.  Allow
+  // that tiny clock jitter while still failing any real grace renewal.
+  assert.ok(worker.__gaiusStartupInactivityDeadlineAt <= futureWaitDeadline + 5,
     "stuck future-pump polls incorrectly renewed the grace");
   worker.__gaiusStartupInactivityDeadlineAt = Date.now() + 1000;
   worker.onmessage({data: {

@@ -19,11 +19,16 @@ public final class BrowserCompressionDecoder extends CompressionDecoder {
     public static final int MAXIMUM_UNCOMPRESSED_LENGTH = 8 * 1024 * 1024;
     public static final int OUTPUT_QUANTUM_BYTES = 16 * 1024;
     public static final int TURN_BUDGET_BYTES = 32 * 1024;
-    public static final int MAX_QUEUE_FRAMES = 8;
-    public static final int MAX_QUEUE_BYTES = 16 * 1024 * 1024;
+    /** Soft high-water mark: keep accepting a burst, but force cooperative draining. */
+    public static final int SOFT_QUEUE_FRAMES = 32;
+    public static final int SOFT_QUEUE_BYTES = 8 * 1024 * 1024;
+    /** Hard admission bound: protects the browser heap without rejecting normal bursts. */
+    public static final int MAX_QUEUE_FRAMES = 64;
+    public static final int MAX_QUEUE_BYTES = 32 * 1024 * 1024;
 
     private final Deque<Frame> queue = new ArrayDeque<>();
     private Frame active;
+    private Frame deferred;
     private boolean scheduled;
     private boolean closed;
     private boolean failed;
@@ -79,9 +84,19 @@ public final class BrowserCompressionDecoder extends CompressionDecoder {
             fail(context, "compressed payload length out of bounds: " + payloadLength);
             return;
         }
-        if (queue.size() + (active == null ? 0 : 1) >= MAX_QUEUE_FRAMES
-                || retainedBytes + declaredLength > MAX_QUEUE_BYTES) {
-            fail(context, "browser compression queue high-water");
+        if (deferred != null) {
+            // Keep at most one complete frame outside the FIFO while the hard watermark is
+            // active. ByteToMessageDecoder will retry this cumulation after the pump drains.
+            input.readerIndex(frameStart);
+            return;
+        }
+        int queuedFrames = queuedFrameCount();
+        int nextRetainedBytes = retainedBytes + declaredLength;
+        if (queuedFrames >= MAX_QUEUE_FRAMES || nextRetainedBytes > MAX_QUEUE_BYTES) {
+            byte[] payload = new byte[payloadLength];
+            input.readBytes(payload);
+            deferred = new Frame(declaredLength, payload);
+            schedule(context, generation);
             return;
         }
         byte[] payload = new byte[payloadLength];
@@ -183,6 +198,7 @@ public final class BrowserCompressionDecoder extends CompressionDecoder {
                     return;
                 }
                 emit(context, active);
+                resumeAdmissionIfReady(context);
             }
         }
         if (active != null || !queue.isEmpty()) {
@@ -208,6 +224,23 @@ public final class BrowserCompressionDecoder extends CompressionDecoder {
     private void fireReadComplete(ChannelHandlerContext context) {
         readCompletePending = false;
         context.fireChannelReadComplete();
+    }
+
+    private int queuedFrameCount() {
+        return queue.size() + (active == null ? 0 : 1);
+    }
+
+    private void resumeAdmissionIfReady(ChannelHandlerContext context) {
+        if (deferred == null || queuedFrameCount() >= SOFT_QUEUE_FRAMES
+                || retainedBytes >= SOFT_QUEUE_BYTES || closed || failed) {
+            return;
+        }
+        Frame frame = deferred;
+        deferred = null;
+        queue.addLast(frame);
+        retainedBytes += frame.declaredLength;
+        schedule(context, generation);
+        context.read();
     }
 
     private void fail(ChannelHandlerContext context, String message) {
@@ -237,6 +270,10 @@ public final class BrowserCompressionDecoder extends CompressionDecoder {
                 frame.inflater.end();
             }
         }
+        if (deferred != null && deferred.inflater != null) {
+            deferred.inflater.end();
+        }
+        deferred = null;
         retainedBytes = 0;
         readCompletePending = false;
     }

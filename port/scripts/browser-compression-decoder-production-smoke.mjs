@@ -15,11 +15,15 @@ for (const marker of [
   "extends CompressionDecoder",
   "OUTPUT_QUANTUM_BYTES = 16 * 1024",
   "TURN_BUDGET_BYTES = 32 * 1024",
+  "SOFT_QUEUE_FRAMES = 32",
+  "SOFT_QUEUE_BYTES = 8 * 1024 * 1024",
+  "MAX_QUEUE_FRAMES = 64",
+  "MAX_QUEUE_BYTES = 32 * 1024 * 1024",
   "Platform.schedule(() ->",
   "expectedGeneration != generation",
   "inflater made no progress",
   "declared output length reached before zlib end",
-  "MAX_QUEUE_FRAMES = 8",
+  "resumeAdmissionIfReady(context)",
   "cleanupFrames()",
 ]) assert.ok(java.includes(marker), `missing Java decoder marker: ${marker}`);
 assert.ok(patcher.includes("patchCompressionDecoderBrowser"), "patcher hook missing");
@@ -41,8 +45,10 @@ const MAX_UNCOMPRESSED = 8 * 1024 * 1024;
 const MAX_COMPRESSED = 2 * 1024 * 1024;
 const QUANTUM = 16 * 1024;
 const TURN_BUDGET = 32 * 1024;
-const MAX_QUEUE_FRAMES = 8;
-const MAX_QUEUE_BYTES = 16 * 1024 * 1024;
+const SOFT_QUEUE_FRAMES = 32;
+const SOFT_QUEUE_BYTES = 8 * 1024 * 1024;
+const MAX_QUEUE_FRAMES = 64;
+const MAX_QUEUE_BYTES = 32 * 1024 * 1024;
 function varInt(value) {
   const out = [];
   do { const next = value & 0x7f; value >>>= 7; out.push(next | (value ? 0x80 : 0)); } while (value);
@@ -54,7 +60,11 @@ function compressedFrame(payload, declared = payload.length) {
 }
 
 class ProductionDecoder {
-  constructor() { this.generation = 1; this.queue = []; this.active = null; this.tasks = []; this.scheduled = false; this.closed = false; this.failed = null; this.retained = 0; this.output = []; this.turns = []; }
+  constructor() {
+    this.generation = 1; this.queue = []; this.deferred = []; this.active = null; this.tasks = [];
+    this.scheduled = false; this.closed = false; this.failed = null; this.retained = 0;
+    this.output = []; this.turns = []; this.admissionPaused = false;
+  }
   enqueue(bytes) {
     if (this.closed || this.failed) return false;
     let offset = 0, declared = 0, shift = 0;
@@ -66,12 +76,18 @@ class ProductionDecoder {
     offset++;
     const payload = bytes.subarray(offset);
     if (declared <= 0 || declared > MAX_UNCOMPRESSED || payload.length <= 0 || payload.length > MAX_COMPRESSED) return this.fail("BOUNDS");
-    if (this.queue.length + (this.active ? 1 : 0) >= MAX_QUEUE_FRAMES || this.retained + declared > MAX_QUEUE_BYTES) return false;
+    if (this.queue.length + (this.active ? 1 : 0) >= MAX_QUEUE_FRAMES || this.retained + declared > MAX_QUEUE_BYTES) {
+      this.admissionPaused = true;
+      this.deferred.push(bytes);
+      return false;
+    }
+    if (this.queue.length + (this.active ? 1 : 0) + 1 >= SOFT_QUEUE_FRAMES
+        || this.retained + declared >= SOFT_QUEUE_BYTES) this.admissionPaused = true;
     this.queue.push({declared, payload}); this.retained += declared; this.schedule(); return true;
   }
   schedule() { if (!this.scheduled && !this.closed && !this.failed) { this.scheduled = true; this.tasks.push(this.generation); } }
   fail(reason) { this.failed = reason; this.cleanup(); return false; }
-  cleanup() { this.queue = []; this.active = null; this.retained = 0; this.scheduled = false; }
+  cleanup() { this.queue = []; this.deferred = []; this.active = null; this.retained = 0; this.scheduled = false; this.admissionPaused = false; }
   close() { this.closed = true; this.generation++; this.cleanup(); }
   replaceGeneration() { this.generation++; this.cleanup(); }
   run() {
@@ -95,10 +111,17 @@ class ProductionDecoder {
         this.active.position += n; work += n;
         if (this.active.position === this.active.declared) {
           this.output.push(this.active.output); this.retained -= this.active.declared; this.active = null;
+          if (this.admissionPaused && this.queue.length + (this.active ? 1 : 0) < SOFT_QUEUE_FRAMES) {
+            this.admissionPaused = false;
+          }
         }
       }
       this.turns.push(work);
       if (this.active || this.queue.length) this.schedule();
+    }
+    while (!this.failed && !this.closed && this.deferred.length && !this.admissionPaused) {
+      this.enqueue(this.deferred.shift());
+      while (this.tasks.length) this.run();
     }
   }
 }
@@ -112,6 +135,46 @@ decoder.run();
 assert.deepEqual(decoder.output, [payloadA, payloadB]);
 assert.ok(decoder.turns.length >= 3 && decoder.turns.every((n) => n <= TURN_BUDGET));
 assert.equal(decoder.retained, 0);
+
+// Regression: the resource-pack burst observed in production (56 frames / 70,682 bytes)
+// must be admitted without a fail-closed queue error. Every turn remains cooperatively
+// bounded at 32 KiB while output order is preserved.
+const observedBurst = new ProductionDecoder();
+const observedBurstPayloads = Array.from({length: 56}, (_, index) =>
+  Buffer.alloc(1262 + (index === 0 ? 10 : 0), 0x20 + (index % 16)));
+assert.equal(observedBurstPayloads.reduce((sum, payload) => sum + payload.length, 0), 70682);
+for (const payload of observedBurstPayloads) assert.equal(observedBurst.enqueue(compressedFrame(payload)), true);
+observedBurst.run();
+assert.equal(observedBurst.output.length, observedBurstPayloads.length);
+assert.deepEqual(observedBurst.output, observedBurstPayloads);
+assert.ok(observedBurst.turns.every((n) => n <= TURN_BUDGET));
+assert.equal(observedBurst.retained, 0);
+
+// A larger 64-frame continuous resource-pack burst exercises the upper normal admission
+// bound. It remains finite and cooperative; no frame is silently dropped.
+const burst = new ProductionDecoder();
+const burstPayloads = Array.from({length: 64}, (_, index) => Buffer.alloc(1200 + (index % 3), 0x30 + (index % 10)));
+for (const payload of burstPayloads) assert.equal(burst.enqueue(compressedFrame(payload)), true);
+assert.equal(burst.failed, null);
+burst.run();
+assert.equal(burst.output.length, burstPayloads.length);
+assert.deepEqual(burst.output, burstPayloads);
+assert.ok(burst.turns.length >= 3 && burst.turns.every((n) => n <= TURN_BUDGET));
+assert.equal(burst.retained, 0);
+assert.equal(burst.deferred.length, 0);
+
+// Hard bound is still finite: the 65th frame is deferred (not a decoder failure),
+// then admitted automatically after the queue drains below the soft watermark.
+const deferred = new ProductionDecoder();
+for (const payload of burstPayloads) assert.equal(deferred.enqueue(compressedFrame(payload)), true);
+const extra = Buffer.alloc(2048, 0x7a);
+assert.equal(deferred.enqueue(compressedFrame(extra)), false);
+assert.equal(deferred.failed, null);
+assert.equal(deferred.deferred.length, 1);
+deferred.run();
+assert.equal(deferred.output.length, burstPayloads.length + 1);
+assert.deepEqual(deferred.output.at(-1), extra);
+assert.equal(deferred.retained, 0);
 
 const malformed = new ProductionDecoder();
 assert.equal(malformed.enqueue(Buffer.concat([varInt(1024), Buffer.from([0, 1, 2, 3])])), true);
@@ -144,6 +207,9 @@ console.log(JSON.stringify({
   fifoFrames: 2,
   fifoTurns: decoder.turns.length,
   maxTurnBytes: Math.max(...decoder.turns),
+  burstFrames: burst.output.length,
+  burstTurns: burst.turns.length,
+  deferredFrames: deferred.output.length,
   malformedFailClosed: malformed.failed,
   closeReleasedBytes: close.retained,
   generationOutputFrames: generation.output.length,
