@@ -104,7 +104,11 @@ Compiled and uploaded by tools/build-and-publish-prerelease.ps1; GitHub Actions 
 See prerelease.manifest.json and SHA256SUMS for provenance.
 "@ | Set-Content $notesPath -Encoding utf8
 $hashLines = foreach ($file in Get-ChildItem $stage -File | Sort-Object Name) { "$( (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant() )  $($file.Name)" }
-$hashLines | Set-Content (Join-Path $stage 'SHA256SUMS') -Encoding ascii
+# sha256sum(1) expects one LF-delimited record per line.  Set-Content emits CRLF on
+# Windows, which made the published manifest fail strict `sha256sum -c` verification.
+$hashPath = Join-Path $stage 'SHA256SUMS'
+$ascii = [System.Text.Encoding]::ASCII
+[System.IO.File]::WriteAllText($hashPath, (($hashLines -join "`n") + "`n"), $ascii)
 $repo = 'TypeThe0ry/Gaius'
 gh release view $Tag --repo $repo *> $null
 $exists = ($LASTEXITCODE -eq 0)
