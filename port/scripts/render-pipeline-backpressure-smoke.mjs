@@ -429,7 +429,7 @@ for (const taskName of ["CompileTask", "ResortTransparencyTask"]) {
 }
 
 const uploadBudgetCheck = scheduler.indexOf(
-  "if (currentUploadDrainCount >= MAX_UPLOAD_ALLOCATIONS_PER_FRAME)",
+  "if (currentUploadDrainCount >= effectiveMaxUploadAllocationsPerFrame())",
   scheduler.indexOf("public static boolean shouldUploadNext"),
 );
 const emergencyDrainCheck = scheduler.indexOf(

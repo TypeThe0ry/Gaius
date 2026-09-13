@@ -26,6 +26,8 @@ public final class BrowserRenderScheduler {
     private static final long MAX_UPLOAD_RETRY_NANOS = 5_000_000_000L;
     private static final long UPLOAD_RETRY_SWEEP_INTERVAL_NANOS = 1_000_000_000L;
     private static final long UPLOAD_RETRY_TOMBSTONE_IDLE_NANOS = 5_000_000_000L;
+    private static boolean fastProfileInitialized;
+    private static boolean fastProfile;
     private static final Deque<Runnable> QUEUE = new ArrayDeque<>();
     private static final Map<Object, Integer> UPLOAD_BACKLOGS = new IdentityHashMap<>();
     private static final Map<Object, Integer> UPLOAD_FRAME_DRAIN_COUNTS = new IdentityHashMap<>();
@@ -103,6 +105,38 @@ public final class BrowserRenderScheduler {
     private static long uberNodeCleanupDeadlineNanos;
 
     private BrowserRenderScheduler() {
+    }
+
+    private static boolean fastProfile() {
+        if (!fastProfileInitialized) {
+            fastProfile = detectFastProfile();
+            fastProfileInitialized = true;
+        }
+        return fastProfile;
+    }
+
+    private static int effectiveMaxTasksPerFrame() {
+        return fastProfile() ? 16 : MAX_TASKS_PER_FRAME;
+    }
+
+    private static int effectiveQueueHighWater() {
+        return fastProfile() ? 24 : QUEUE_HIGH_WATER;
+    }
+
+    private static long effectiveFrameWorkBudgetNanos() {
+        return fastProfile() ? 4_000_000L : FRAME_WORK_BUDGET_NANOS;
+    }
+
+    private static int effectiveMaxUploadAllocationsPerFrame() {
+        return fastProfile() ? 16 : MAX_UPLOAD_ALLOCATIONS_PER_FRAME;
+    }
+
+    private static int effectiveCompileRunsDuringUploadPerFrame() {
+        return fastProfile() ? 2 : MAX_COMPILE_RUNS_DURING_UPLOAD_PER_FRAME;
+    }
+
+    private static long effectiveUploadWorkBudgetNanos() {
+        return fastProfile() ? 4_000_000L : UPLOAD_WORK_BUDGET_NANOS;
     }
 
     public static Executor defer(Executor ignored) {
@@ -223,7 +257,8 @@ public final class BrowserRenderScheduler {
         updateHighWaterState();
         int planned = Math.max(0, alreadyPlanned);
         int queuedWork = Math.max(Math.max(pendingTasks(), compileBacklog), uploadBacklog);
-        boolean allowed = planned < 4 && queuedWork + planned < QUEUE_HIGH_WATER;
+        boolean allowed = planned < (fastProfile() ? 8 : 4)
+                && queuedWork + planned < effectiveQueueHighWater();
         if (!allowed) {
             backpressureEvents++;
         }
@@ -259,7 +294,8 @@ public final class BrowserRenderScheduler {
             totalUploadPassNanos += lastUploadPassNanos;
             longestUploadPassNanos = Math.max(longestUploadPassNanos, lastUploadPassNanos);
         }
-        if (uploadBacklog > 0 && currentUploadDrainCount >= MAX_UPLOAD_ALLOCATIONS_PER_FRAME) {
+        if (uploadBacklog > 0
+                && currentUploadDrainCount >= effectiveMaxUploadAllocationsPerFrame()) {
             markUploadBudgetExhausted(false);
         } else if (uploadBacklog > 0
                 && uploadDrainDeadlineNanos != 0L
@@ -275,7 +311,8 @@ public final class BrowserRenderScheduler {
         ensureUploadFrameBudget();
         emergencyUploadRequests++;
         long now = System.nanoTime();
-        boolean hardLimitReached = currentUploadDrainCount >= MAX_UPLOAD_ALLOCATIONS_PER_FRAME;
+        boolean hardLimitReached =
+                currentUploadDrainCount >= effectiveMaxUploadAllocationsPerFrame();
         boolean timeLimitReached = uploadDrainDeadlineNanos != 0L
                 && now >= uploadDrainDeadlineNanos;
         if (emergencyUploadGrantedThisFrame || hardLimitReached || timeLimitReached) {
@@ -383,13 +420,13 @@ public final class BrowserRenderScheduler {
         }
         ensureUploadFrameBudget();
         long now = System.nanoTime();
-        if (currentUploadDrainCount >= MAX_UPLOAD_ALLOCATIONS_PER_FRAME) {
+        if (currentUploadDrainCount >= effectiveMaxUploadAllocationsPerFrame()) {
             emergencyUploadEntriesRemaining = 0;
             markUploadBudgetExhausted(false);
             return false;
         }
         if (uploadDrainDeadlineNanos == 0L) {
-            uploadDrainDeadlineNanos = now + UPLOAD_WORK_BUDGET_NANOS;
+            uploadDrainDeadlineNanos = now + effectiveUploadWorkBudgetNanos();
         } else if (now >= uploadDrainDeadlineNanos) {
             emergencyUploadEntriesRemaining = 0;
             markUploadBudgetExhausted(true);
@@ -411,7 +448,8 @@ public final class BrowserRenderScheduler {
             }
         }
         activeUploadBuffers = Math.max(1, activeUploadBuffers);
-        int fairShare = Math.max(1, MAX_UPLOAD_ALLOCATIONS_PER_FRAME / activeUploadBuffers);
+        int fairShare = Math.max(
+                1, effectiveMaxUploadAllocationsPerFrame() / activeUploadBuffers);
         int bufferDrainCount = UPLOAD_FRAME_DRAIN_COUNTS.getOrDefault(buffer, 0);
         if (activeUploadBuffers > 1 && bufferDrainCount >= fairShare) {
             uploadFairShareDeferrals++;
@@ -585,7 +623,7 @@ public final class BrowserRenderScheduler {
         try {
             if (uploadBacklog > 0
                     && compileRunsDuringUploadThisFrame
-                    >= MAX_COMPILE_RUNS_DURING_UPLOAD_PER_FRAME) {
+                    >= effectiveCompileRunsDuringUploadPerFrame()) {
                 state.requested = true;
                 deferDispatcherUntilNextFrame(state);
                 dispatcherUploadDeferrals++;
@@ -656,7 +694,7 @@ public final class BrowserRenderScheduler {
                     completedTasks++;
                     totalTaskNanos += lastTaskNanos;
                     longestTaskNanos = Math.max(longestTaskNanos, lastTaskNanos);
-                    if (lastTaskNanos > FRAME_WORK_BUDGET_NANOS) {
+                    if (lastTaskNanos > effectiveFrameWorkBudgetNanos()) {
                         overBudgetTasks++;
                     }
                     updateHighWaterState();
@@ -679,8 +717,8 @@ public final class BrowserRenderScheduler {
     }
 
     static boolean shouldContinueDrain(int completed, long elapsedNanos) {
-        return completed < MAX_TASKS_PER_FRAME
-                && (completed == 0 || elapsedNanos < FRAME_WORK_BUDGET_NANOS);
+        return completed < effectiveMaxTasksPerFrame()
+                && (completed == 0 || elapsedNanos < effectiveFrameWorkBudgetNanos());
     }
 
     private static void ensureUploadFrameBudget() {
@@ -719,7 +757,7 @@ public final class BrowserRenderScheduler {
                 : 0L;
         publishTelemetryJs(
                 pendingTasks(),
-                QUEUE_HIGH_WATER,
+                effectiveQueueHighWater(),
                 runningTask,
                 peakQueuedTasks,
                 compileBacklog,
@@ -751,8 +789,8 @@ public final class BrowserRenderScheduler {
                 currentUploadDrainCount,
                 lastUploadDrainCount,
                 peakUploadDrainCount,
-                MAX_UPLOAD_ALLOCATIONS_PER_FRAME,
-                nanosToMillis(UPLOAD_WORK_BUDGET_NANOS),
+                effectiveMaxUploadAllocationsPerFrame(),
+                nanosToMillis(effectiveUploadWorkBudgetNanos()),
                 uploadBudgetExhaustedThisFrame,
                 uploadBudgetExhaustions,
                 uploadEntryBudgetExhaustions,
@@ -792,7 +830,7 @@ public final class BrowserRenderScheduler {
     }
 
     private static void updateHighWaterState() {
-        boolean atHighWater = pendingTasks() >= QUEUE_HIGH_WATER;
+        boolean atHighWater = pendingTasks() >= effectiveQueueHighWater();
         if (atHighWater == highWaterActive) {
             return;
         }
@@ -812,6 +850,14 @@ public final class BrowserRenderScheduler {
     private static double nanosToMillis(long nanos) {
         return nanos / 1_000_000.0;
     }
+
+    @JSBody(script = """
+            const query = String(globalThis.location && globalThis.location.search || '');
+            if (query.includes('gaiusRenderFast=1')) return true;
+            const cores = Number(globalThis.navigator && globalThis.navigator.hardwareConcurrency || 0);
+            return cores >= 8 && !query.includes('gaiusRenderFast=0');
+            """)
+    private static native boolean detectFastProfile();
 
     @JSBody(params = {
             "pendingTasks", "queueCapacity", "taskRunning", "peakPendingTasks",

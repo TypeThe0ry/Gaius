@@ -869,6 +869,38 @@ function releaseLocalSession(reason) {
 }
 
 async function prepareServerScript(message, startupStarted) {
+  // Portable file:// pages transfer the embedded gzip bytes directly. A Blob
+  // URL created in the page is opaque to a dedicated Worker and fetch(blob:)
+  // fails in Chrome, so prefer the transferable payload when present.
+  if (message.serverScriptGzipData) {
+    if (typeof DecompressionStream !== "function") {
+      throw new Error("This browser cannot decompress the portable singleplayer server");
+    }
+    const bytes = message.serverScriptGzipData instanceof ArrayBuffer
+      ? new Uint8Array(message.serverScriptGzipData)
+      : ArrayBuffer.isView(message.serverScriptGzipData)
+        ? new Uint8Array(
+            message.serverScriptGzipData.buffer,
+            message.serverScriptGzipData.byteOffset,
+            message.serverScriptGzipData.byteLength,
+          )
+        : null;
+    if (!bytes || bytes.byteLength === 0) {
+      throw new Error("Portable singleplayer server transfer is empty");
+    }
+    markStartup("runtime-transferred", startupStarted);
+    const compressed = new Blob([bytes], {type: "application/gzip"});
+    const decompressed = compressed.stream().pipeThrough(
+      new DecompressionStream("gzip"),
+    );
+    const scriptBlob = await new Response(decompressed).blob();
+    const temporaryUrl = URL.createObjectURL(new Blob(
+      [scriptBlob],
+      {type: "text/javascript"},
+    ));
+    markStartup("runtime-decompressed", startupStarted);
+    return {url: temporaryUrl, temporaryUrl};
+  }
   if (message.serverScriptGzipUrl) {
     if (typeof DecompressionStream !== "function") {
       throw new Error("This browser cannot decompress the portable singleplayer server");
