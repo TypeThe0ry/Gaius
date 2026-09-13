@@ -278,7 +278,11 @@ assert.ok(launchEnd > 0 && launchAnnotation > 0 && launchScriptEnd > launchStart
   "launchWorker JSBody could not be extracted");
 // Java text blocks preserve a regex backslash as `\\d`; normalize that one
 // Java escape for the VM fixture, which executes the extracted JS directly.
-const launchScript = source.slice(launchStart, launchScriptEnd).replace(/\\\\d/g, "\\d");
+// Java text blocks carry escaped regex boundaries (\\b/\\d). Normalize both
+// forms before evaluating the extracted browser script so the fixture mirrors
+// the generated JavaScript rather than treating \b as a literal backslash+b.
+const launchScript = source.slice(launchStart, launchScriptEnd)
+  .replace(/\\\\([bd])/g, "\\$1");
 
 function createLaunchRuntime(failureMode, options = {}) {
   const channels = [];
