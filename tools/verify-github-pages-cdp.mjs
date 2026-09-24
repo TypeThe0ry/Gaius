@@ -49,4 +49,21 @@ try {
     for (let attempt = 0; attempt < 100; attempt++) { await sleep(100); snapshot = await cdp.evaluate('({href:location.href,readyState:document.readyState,title:document.title,bytes:document.documentElement?.outerHTML?.length||0})'); if (snapshot?.href === url && snapshot?.readyState === 'complete') break; }
     report.pages.push({file, ...snapshot}); check(report.checks, `${file}-chrome`, snapshot?.href === url && snapshot?.readyState === 'complete' && snapshot?.title.includes('Gaius') && snapshot?.bytes > 100_000_000, JSON.stringify(snapshot)); }
 } catch (error) { report.error = String(error?.stack || error); }
-finally { cdp?.close(); await stopChrome(chrome, cdp, profileDir); report.success = !report.error && report.checks.every((entry) => entry.ok); await mkdir(resolve(output, '..'), {recursive: true}); await writeFile(output, `${JSON.stringify(report, null, 2)}\n`); console.log(JSON.stringify({output, success: report.success, checks: report.checks}, null, 2)); if (!report.success) process.exitCode = 1; }
+finally {
+  cdp?.close();
+  await stopChrome(chrome, cdp, profileDir);
+  const cdpClosed = !cdp || cdp.closed || cdp.socket.readyState === WebSocket.CLOSING;
+  const chromeExited = !chrome || chrome.exitCode !== null || chrome.killed;
+  const profileRemoved = !profileDir || !(await import('node:fs')).existsSync(profileDir);
+  const pagesFinalGate = report.pages.length === expectedPages.length
+    && report.checks.filter((entry) => entry.name.endsWith('-chrome')).every((entry) => entry.ok);
+  check(report.checks, 'cdpClosed', cdpClosed);
+  check(report.checks, 'chromeExited', chromeExited);
+  check(report.checks, 'profileRemoved', profileRemoved);
+  check(report.checks, 'pagesFinalGate', pagesFinalGate);
+  report.success = !report.error && report.checks.every((entry) => entry.ok);
+  await mkdir(resolve(output, '..'), {recursive: true});
+  await writeFile(output, `${JSON.stringify(report, null, 2)}\n`);
+  console.log(JSON.stringify({output, success: report.success, checks: report.checks}, null, 2));
+  if (!report.success) process.exitCode = 1;
+}
