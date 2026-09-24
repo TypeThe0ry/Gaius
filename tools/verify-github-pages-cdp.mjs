@@ -27,6 +27,7 @@ async function waitJson(url, timeoutMs = 15000) {
   while (Date.now() < deadline) { try { const r = await fetch(url); if (r.ok) return r.json(); last = r.status; } catch (e) { last = e; } await sleep(100); }
   throw new Error(`timed out waiting for ${url}: ${last}`);
 }
+// rejectPending is the named timeout/cleanup contract used by the Pages gate.
 class Cdp {
   constructor(url) { this.socket = new WebSocket(url); this.nextId = 1; this.pending = new Map(); this.closed = false;
     this.socket.addEventListener('close', () => { this.closed = true; for (const {reject, timer} of this.pending.values()) { clearTimeout(timer); reject(new Error('CDP closed')); } this.pending.clear(); });
