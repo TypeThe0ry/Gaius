@@ -831,6 +831,17 @@ jar --update \
   --file "$client_output" \
   -C "$client_patch_classes" .
 if [[ "$version" == "26.2" ]]; then
+  # 26.2-only diagnostic hook: map prepared chunk sections to successful draws.
+  # Opt-in at runtime via globalThis.__gaiusChunkDrawTelemetryEnabled; this
+  # does not touch terrain selection, upload budgets, textures, or mipmaps.
+  java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
+    dev.gaius.tools.MinecraftChunkDrawTelemetryPatcher \
+    "$version" \
+    "$client_output" \
+    "$client_patch_classes"
+  jar --update \
+    --file "$client_output" \
+    -C "$client_patch_classes" .
   java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
     dev.gaius.tools.Minecraft262BrowserPatcher \
     "$client_output" \

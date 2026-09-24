@@ -116,27 +116,27 @@ public final class BrowserRenderScheduler {
     }
 
     private static int effectiveMaxTasksPerFrame() {
-        return fastProfile() ? 16 : MAX_TASKS_PER_FRAME;
+        return fastProfile() ? 32 : 8;
     }
 
     private static int effectiveQueueHighWater() {
-        return fastProfile() ? 24 : QUEUE_HIGH_WATER;
+        return fastProfile() ? 64 : 16;
     }
 
     private static long effectiveFrameWorkBudgetNanos() {
-        return fastProfile() ? 4_000_000L : FRAME_WORK_BUDGET_NANOS;
+        return fastProfile() ? 6_000_000L : 3_000_000L;
     }
 
     private static int effectiveMaxUploadAllocationsPerFrame() {
-        return fastProfile() ? 16 : MAX_UPLOAD_ALLOCATIONS_PER_FRAME;
+        return fastProfile() ? 32 : 16;
     }
 
     private static int effectiveCompileRunsDuringUploadPerFrame() {
-        return fastProfile() ? 2 : MAX_COMPILE_RUNS_DURING_UPLOAD_PER_FRAME;
+        return fastProfile() ? 4 : 2;
     }
 
     private static long effectiveUploadWorkBudgetNanos() {
-        return fastProfile() ? 4_000_000L : UPLOAD_WORK_BUDGET_NANOS;
+        return fastProfile() ? 6_000_000L : 3_000_000L;
     }
 
     public static Executor defer(Executor ignored) {
@@ -855,7 +855,7 @@ public final class BrowserRenderScheduler {
             const query = String(globalThis.location && globalThis.location.search || '');
             if (query.includes('gaiusRenderFast=1')) return true;
             const cores = Number(globalThis.navigator && globalThis.navigator.hardwareConcurrency || 0);
-            return cores >= 8 && !query.includes('gaiusRenderFast=0');
+            return cores >= 4 && !query.includes('gaiusRenderFast=0');
             """)
     private static native boolean detectFastProfile();
 

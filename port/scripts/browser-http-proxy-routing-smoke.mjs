@@ -75,13 +75,13 @@ result = routeTarget("https://jihulab.com/-/project/356228/uploads/"
   channels: [{connected: true, currentCandidate:
     {url: "wss://ellan.site/tunnel", token: "relay-token", direct: false}}],
 });
-// The JS proxy body is intentionally generic. The Java proxyResourcePack entry
-// selects the pinned mirror before this body is reached; keep a source-level
-// assertion here so the routing smoke also protects that production fast path.
-assert.match(source, /PINNED_RESOURCE_PACK_SOURCE/);
-assert.match(source, /https:\/\/typethe0ry\.github\.io\/Gaius\/resource-packs\//);
-assert.match(source, /008381d7a89976709aa86bb71dee06dc50bb3961\.zip/);
+// Every pack, including the previously pinned source, must use the relay.
+assert.doesNotMatch(source, /PINNED_RESOURCE_PACK|github\.io\/Gaius\/resource-packs/);
+assert.match(source, /return proxy\(target, "resource-pack"\)/);
 assert.match(source, /browserSafeResourcePackHeaders/);
 assert.equal(result.origin, "https://ellan.site");
+assert.equal(result.pathname, "/proxy/resource-pack");
+assert.equal(result.searchParams.get("url"), "https://jihulab.com/-/project/356228/uploads/"
+  + "e409655d230380173547e68c5ef026d4/resource_pack.zip");
 
 console.log("browser-http-proxy-routing-smoke: PASS");

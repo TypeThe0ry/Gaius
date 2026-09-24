@@ -70,6 +70,7 @@ public final class MinecraftServerWorkerPatcher {
         System.out.println("Patched worldgen PriorityConsecutiveExecutor with deferred single-task turns");
     }
 
+
     private static void patchChunkTaskDispatcher(ClassNode node) {
         boolean patched = false;
         for (MethodNode method : node.methods) {

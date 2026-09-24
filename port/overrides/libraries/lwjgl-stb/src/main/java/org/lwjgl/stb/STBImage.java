@@ -123,6 +123,19 @@ public final class STBImage {
     }
 
     private static void writePixels(DecodedPng image, ByteBuffer output, int outputChannels) {
+        if (outputChannels == STBI_rgb_alpha) {
+            // PNG decoding already produces RGBA. Bulk copies avoid one TeaVM
+            // ByteBuffer dispatch per component, preserving row orientation.
+            if (!flipVertically) {
+                output.put(image.rgba);
+            } else {
+                int rowBytes = image.width * 4;
+                for (int y = image.height - 1; y >= 0; y--) {
+                    output.put(image.rgba, y * rowBytes, rowBytes);
+                }
+            }
+            return;
+        }
         for (int y = 0; y < image.height; y++) {
             int sourceY = flipVertically ? image.height - 1 - y : y;
             int row = sourceY * image.width * 4;

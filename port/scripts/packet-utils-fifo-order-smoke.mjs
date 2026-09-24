@@ -13,6 +13,10 @@ const start = source.indexOf("private static void patchClientPacketUtilsBrowserI
 const end = source.indexOf("private static void patchPacketProcessorBrowserSlice", start);
 assert.ok(start >= 0 && end > start, "PacketUtils patch method is missing");
 const method = source.slice(start, end);
+// A polled packet must be handled before the next queue item. Re-adding it at
+// the tail under worldgen pressure reorders movement and chunk acknowledgments.
+assert.ok(!source.includes('"shouldDeferQueuedPacket"'),
+  "PacketProcessor must not requeue a polled movement packet behind later packets");
 
 const commonPackets = Object.freeze([
   "ClientboundPingPacket",
@@ -28,8 +32,18 @@ const commonPackets = Object.freeze([
   "ClientboundTransferPacket",
 ]);
 
-function dispatchModel({listener, packet, queuedPackets, processingQueuedPacket = false}) {
+function dispatchModel({
+  listener,
+  packet,
+  queuedPackets,
+  processingQueuedPacket = false,
+  workerServer = false,
+}) {
   const common = commonPackets.includes(packet);
+  if (workerServer) {
+    if (processingQueuedPacket) return {path: "queued-return", order: []};
+    return {path: "schedule", order: [...queuedPackets, packet]};
+  }
   if (listener === "configuration") return {path: "inline", order: [packet]};
   if (listener === "play") {
     if (processingQueuedPacket) return {path: "queued-return", order: []};
@@ -93,10 +107,46 @@ const configuration = dispatchModel({
 });
 assert.equal(configuration.path, "inline", "configuration listener bypass must remain unchanged");
 
+const workerServerPacket = dispatchModel({
+  listener: "server-play",
+  packet: "ServerboundMovePlayerPacket",
+  queuedPackets: ["SERVER-A"],
+  workerServer: true,
+});
+assert.equal(workerServerPacket.path, "schedule",
+  "Worker server packets must not execute inside the raw decoder");
+assert.deepEqual(workerServerPacket.order, ["SERVER-A", "ServerboundMovePlayerPacket"],
+  "Worker server force-queue must retain exact FIFO order");
+
+const workerServerReentry = dispatchModel({
+  listener: "server-play",
+  packet: "ServerboundMovePlayerPacket",
+  queuedPackets: ["SERVER-B"],
+  processingQueuedPacket: true,
+  workerServer: true,
+});
+assert.equal(workerServerReentry.path, "queued-return",
+  "Worker server queued-handler re-entry must return for the same owner");
+assert.deepEqual(workerServerReentry.order, [],
+  "Worker server queued-handler re-entry must not append a duplicate packet");
+
+const nonWorkerServerPacket = dispatchModel({
+  listener: "server-play",
+  packet: "ServerboundMovePlayerPacket",
+  queuedPackets: [],
+});
+assert.equal(nonWorkerServerPacket.path, "vanilla",
+  "non-Worker server packets must retain vanilla thread dispatch");
+
 // Source-level guard: every common classifier must have a guarded PLAY target
 // (commonBacklogCheck) as well as the non-PLAY inline target.  The generated
 // bytecode smoke verifies the actual CFG and target offsets for both profiles.
 assert.match(method, /LabelNode playListener = new LabelNode\(\);/);
+assert.match(method, /LabelNode clientDispatch = new LabelNode\(\);/);
+assert.match(method, /LabelNode workerServerQueueGuard = new LabelNode\(\);/);
+assert.match(method,
+  /BrowserIntegratedServerMain",\s*"isWorkerServer",\s*"\(\)Z"[\s\S]*?Opcodes\.IFEQ, clientDispatch[\s\S]*?workerServerQueueGuard[\s\S]*?"isProcessingQueuedPacket"[\s\S]*?Opcodes\.IFNE, queuedHandleReturn[\s\S]*?Opcodes\.GOTO, forcedPlayQueue/,
+  "Worker server dispatch must use the owner guard before the shared FIFO schedule block");
 assert.match(method, /LabelNode commonBacklogCheck = new LabelNode\(\);/);
 assert.match(method, /code\.add\(new JumpInsnNode\(Opcodes\.IFNE, playListener\)\);/);
 assert.match(method, /code\.add\(new MethodInsnNode\([\s\S]*?"isProcessingQueuedPacket"[\s\S]*?\)\);/);
@@ -104,6 +154,8 @@ assert.match(method, /code\.add\(new JumpInsnNode\(Opcodes\.IFNE, commonBacklogC
 assert.match(method, /int commonBacklogChecks = 0;/);
 assert.match(method, /commonPlayPacketBranches/);
 assert.match(method, /commonBacklogChecks != 1/);
+assert.match(method, /workerServerChecks != 1/);
+assert.match(method, /workerServerDrainGuardCalls != 1/);
 assert.equal((method.match(/"hasPendingPackets"/g) || []).length, 3,
   "the patch must keep separate common and transition backlog gates plus one verifier");
 
@@ -116,6 +168,9 @@ const result = {
   reentrantPath: reentrantCommon.path,
   transitionOrder: transition.order,
   configurationPath: configuration.path,
+  workerServerOrder: workerServerPacket.order,
+  workerServerReentryPath: workerServerReentry.path,
+  nonWorkerServerPath: nonWorkerServerPacket.path,
   commonPacketCount: commonPackets.length,
   sourceGuard: "play-owner-before-common-inline",
 };

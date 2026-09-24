@@ -23,6 +23,12 @@ public final class BrowserClientNetwork {
         // inbound pump.  installInboundPump() is idempotent for the same bridge and retires a
         // stale scheduler when the bridge identity changes.
         configureClientPacketDrain();
+        // Singleplayer uses the same page-side PacketProcessor as multiplayer: the integrated
+        // server feeds chunk packets through the local browser bridge, so leaving the pressure
+        // drain opt-in only for remote sessions lets decoded chunk packets accumulate behind the
+        // vanilla sixteen-packet frame budget. Promote the bounded drain for every unset client
+        // bridge; an explicit URL/embedder boolean still remains authoritative.
+        enableClientPacketDrainIfUnset();
         // Cache the JSFunctor so the per-frame retry path allocates no callback wrapper.  The
         // bridge-side identity guard decides whether this cached callback is actually rebound.
         installed = installInboundPump(PUMP_CALLBACK);

@@ -17,7 +17,7 @@ public final class BrowserWorldgenDeepCheckpoint {
      * short enough to break up the observed 26.2 noise/carver loops, while the scheduler owns
      * the actual deadline, network-pressure, and hard-cap decisions.
      */
-    private static final int PULSE_SAMPLE_MASK = 255;
+    private static final int PULSE_SAMPLE_MASK = 31;
     private static int pulseSampleCounter;
 
     private BrowserWorldgenDeepCheckpoint() {

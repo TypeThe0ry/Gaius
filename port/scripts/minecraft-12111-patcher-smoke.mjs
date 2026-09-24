@@ -397,11 +397,11 @@ try {
     ["bipush 6", "bipush 12", "bipush 12"],
     "1.21.11 raw FAST simulation distance shape changed");
   assert.deepEqual(graphicsPresetDistanceConstants(patchedGraphicsApply, "renderDistance"),
-    ["bipush 6", "bipush 16", "bipush 32"],
-    "1.21.11 FAST render distance was not overlaid to 6");
+    ["bipush 8", "bipush 16", "bipush 32"],
+    "1.21.11 FAST render distance was reduced from vanilla 8");
   assert.deepEqual(graphicsPresetDistanceConstants(patchedGraphicsApply, "simulationDistance"),
-    ["bipush 4", "bipush 12", "bipush 12"],
-    "1.21.11 FAST simulation distance was not overlaid to 4");
+    ["bipush 6", "bipush 12", "bipush 12"],
+    "1.21.11 FAST simulation distance was reduced from vanilla 6");
   assert.equal(graphicsPresetCustomReturn(patchedGraphicsApply),
     graphicsPresetCustomReturn(rawGraphicsApply),
     "1.21.11 CUSTOM graphics preset arm changed");

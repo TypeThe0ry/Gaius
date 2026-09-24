@@ -13,13 +13,7 @@ import {
 } from './terrain-visual-metrics.mjs';
 
 const sleep = (milliseconds) => new Promise((done) => setTimeout(done, milliseconds));
-const expectedResourcePack = Object.freeze({
-  originalUrl: 'https://jihulab.com/-/project/356228/uploads/e409655d230380173547e68c5ef026d4/resource_pack.zip',
-  fixedMirrorUrl: 'https://typethe0ry.github.io/Gaius/resource-packs/008381d7a89976709aa86bb71dee06dc50bb3961.zip',
-  bytes: 61_102_872,
-  sha1: '008381d7a89976709aa86bb71dee06dc50bb3961',
-  sha256: 'ee96a1fe577a90f1c2a3f686cdec060a3cbf0f127ae8e0585cb79dd93e69e172',
-});
+import { expectedResourcePack } from './resource-pack-expectation.mjs';
 const cdpResourcePackBufferBytes = 96 * 1024 * 1024;
 const cdpTotalNetworkBufferBytes = 256 * 1024 * 1024;
 
@@ -268,6 +262,9 @@ async function evaluateWithRetry(cdp, expression, report, label, {
 }
 
 function appendConsoleEntry(report, entry) {
+  if (/\[GAIUS_THROWABLE\]|java\.lang\.OutOfMemoryError|Browser native memory budget exceeded/.test(entry.text || '')) {
+    boundedAppend(report.logs.fatalRuntimeErrors ||= [], entry, 100);
+  }
   // Resource-pack progress emits thousands of lines in a few milliseconds. Keep a bounded
   // sample of that flood while preserving the newest disconnect/error diagnostics.
   const progress = /Progress for pack \d+: \d+ bytes/.test(entry.text || '');
@@ -320,6 +317,76 @@ async function click(cdp, x, y, name, report) {
   }
   report.actions.push({ at: new Date().toISOString(), name, x, y, via: 'CDP Input.dispatchMouseEvent' });
   await sleep(500);
+}
+
+function dialogControlPoint(state, canvas, kind, label) {
+  const widgets = (state.screenWidgets || []).filter(widget =>
+    widget.visible !== false && widget.active !== false);
+  const widget = kind === 'password'
+    ? widgets.find(entry => /EditBox$/.test(String(entry.type || '')))
+    : widgets.find(entry => /Button/.test(String(entry.type || ''))
+      && String(entry.text || '').replace(/\u00a7./g, '').trim() === label);
+  const size = state.screenSize;
+  if (!widget || !size?.width || !size?.height || !canvas?.width || !canvas?.height) {
+    throw new Error(`Missing measurable dialog control: ${kind} ${label || ''}`);
+  }
+  const x = canvas.left + (widget.x + widget.width / 2) * canvas.width / size.width;
+  const y = canvas.top + (widget.y + widget.height / 2) * canvas.height / size.height;
+  if (!Number.isFinite(x) || !Number.isFinite(y)
+      || x < canvas.left || x >= canvas.left + canvas.width
+      || y < canvas.top || y >= canvas.top + canvas.height) {
+    throw new Error(`Dialog control is outside the canvas: ${kind}`);
+  }
+  return { x, y };
+}
+
+function fallbackLoginControlPoint(state, canvas, kind) {
+  const size = state.screenSize;
+  if (String(state.screenTitle || '').trim() !== '\u767b\u5f55'
+      || !size?.width || !size?.height || !canvas?.width || !canvas?.height) {
+    throw new Error(`Missing measurable dialog control: ${kind}`);
+  }
+  // MultiButtonDialogScreen exposes its ScrollableLayout but not nested controls.
+  const logical = kind === 'password' ? { x: 210, y: 113 } : { x: 137, y: 143 };
+  return {
+    x: canvas.left + logical.x * canvas.width / size.width,
+    y: canvas.top + logical.y * canvas.height / size.height,
+  };
+}
+
+async function clickLoginControl(cdp, kind, name, report) {
+  const layout = await evaluateWithRetry(cdp, `(() => ({
+    state: window.__gaiusMinecraftState || {},
+    canvas: document.querySelector('canvas')?.getBoundingClientRect().toJSON()
+  }))()`, report, name);
+  if (!String(layout.state.screen || '').includes('MultiButtonDialogScreen')) {
+    throw new Error(`Login dialog changed before ${name}`);
+  }
+  report.actions.push({ at: new Date().toISOString(), name: `${name}-layout`,
+    screen: layout.state.screen, title: layout.state.screenTitle,
+    size: layout.state.screenSize, widgets: layout.state.screenWidgets,
+    canvas: layout.canvas });
+  const coordinateOverride = process.env[kind === 'password' ? 'LOGIN_FIELD_POINT' : 'LOGIN_BUTTON_POINT'];
+  let point;
+  if (coordinateOverride) {
+    const values = coordinateOverride.split(',').map(Number);
+    if (values.length !== 2 || !values.every(Number.isFinite)) {
+      throw new Error('Login point override must be x,y');
+    }
+    point = { x: values[0], y: values[1] };
+    report.actions.push({ at: new Date().toISOString(), name: `${name}-explicit-point`, ...point });
+  } else {
+    try {
+      point = dialogControlPoint(layout.state, layout.canvas, kind, '\u767b\u5f55');
+    } catch (error) {
+      point = fallbackLoginControlPoint(layout.state, layout.canvas, kind);
+      report.actions.push({
+        at: new Date().toISOString(), name: `${name}-nested-layout-fallback`, ...point,
+        reason: String(error?.message || error),
+      });
+    }
+  }
+  await click(cdp, point.x, point.y, name, report);
 }
 
 async function typeText(cdp, value, report) {
@@ -402,8 +469,9 @@ function expectedResourcePackProxy(relay) {
 function resourcePackUrlMatchesExpected(value, relay) {
   try {
     const actual = new URL(String(value || ''));
-    const fixedMirror = new URL(expectedResourcePack.fixedMirrorUrl);
-    if (actual.href === fixedMirror.href) return true;
+    const fixedMirror = expectedResourcePack.fixedMirrorUrl
+      ? new URL(expectedResourcePack.fixedMirrorUrl) : null;
+    if (fixedMirror && actual.href === fixedMirror.href) return true;
     const expected = new URL(expectedResourcePackProxy(relay));
     const parameterNames = [...new Set(actual.searchParams.keys())].sort();
     return actual.protocol === expected.protocol
@@ -442,7 +510,8 @@ function verifiedExpectedResourcePackTransaction(entry, relay) {
     && entry.loadingFinished === true
     && Number(entry.encodedDataLength) > 0
     && !entry.loadingFailed
-    && Number(entry.declaredContentLength) === expectedResourcePack.bytes
+    && (entry.declaredContentLength == null
+      || Number(entry.declaredContentLength) === expectedResourcePack.bytes)
     && body?.base64Encoded === true
     && Number(body?.bytes) === expectedResourcePack.bytes
     && body?.sha1 === expectedResourcePack.sha1
@@ -522,6 +591,12 @@ function summarizeResourcePack(transactions, relay) {
 function acceptanceGates(report) {
   const state = report.final?.state;
   const bridge = report.final?.bridgeStats;
+  const observedChunkPeak = Math.max(
+    Number(state?.loadedChunkCount) || 0,
+    ...(Array.isArray(report.samples)
+      ? report.samples.map((sample) => Number(sample?.loadedChunkCount) || 0)
+      : []),
+  );
   // Acceptance is always derived from the raw final bridge snapshot. The
   // convenience/compatibility fields written beside it are not trust roots.
   const observed = observedEndpoints(report.final);
@@ -529,12 +604,15 @@ function acceptanceGates(report) {
   const boundConnection = matchingRelayConnection(connections, report.expected.target, report.expected.relay);
   return {
     clientLevel: state?.level === 'net.minecraft.client.multiplayer.ClientLevel',
-    chunksLoaded: Number(state?.loadedChunkCount) > 0,
+    // A server can legitimately move the player to a death/reconfiguration
+    // screen after terrain rendered; retain the peak raw sample as evidence.
+    chunksLoaded: observedChunkPeak > 0,
     relayConnected: Number(bridge?.connected) >= 1,
     relaySucceeded: Number(bridge?.relayNodeSuccesses) >= 1,
     relayAttestationClean: Number(bridge?.relayTargetAttestationFailures) === 0,
     relayErrorsClean: Number(bridge?.errors) === 0,
     runtimeExceptionsClean: report.logs.exceptions.length === 0,
+    fatalRuntimeErrorsClean: (report.logs.fatalRuntimeErrors || []).length === 0,
     evaluateExceptionsClean: report.logs.evaluateExceptions.length === 0,
     eventHandlerErrorsClean: report.logs.cdpEventErrors.length === 0,
     networkErrorsClean: Number(report.final?.net?.errors) === 0,
@@ -554,13 +632,26 @@ function acceptanceGates(report) {
   };
 }
 
-async function captureScreenshot(cdp, report, screenshotDirectory, suffix, label) {
+async function captureScreenshot(cdp, report, screenshotDirectory, suffix, label, navigationStarted = null) {
   const path = resolve(screenshotDirectory, `join-terrain-${report.profile}-${suffix}-${label}.png`);
   const response = await cdp.send('Page.captureScreenshot', { format: 'png', fromSurface: true });
   if (!response.data) throw new Error(`Chrome returned an empty screenshot for ${label}`);
   const buffer = Buffer.from(response.data, 'base64');
   if (buffer.length === 0) throw new Error(`Chrome returned a zero-byte screenshot for ${label}`);
   const visual = analyzeTerrainPng(buffer);
+  if (Number.isFinite(navigationStarted) && /^terrain-/.test(label)
+      && terrainVisualPass(visual) && report.startupPerformance?.durationMillis == null) {
+    const durationMillis = performance.now() - navigationStarted;
+    report.startupPerformance = {
+      start: 'CDP navigation to portable multiplayer artifact requested',
+      end: 'first terrain screenshot passing visual checks',
+      durationMillis, limitMillis: 15000,
+      passed: durationMillis <= 15000 && report.profiling?.diagnosticOnly !== true,
+      latencyAcceptanceEligible: report.profiling?.diagnosticOnly !== true,
+      observation: 'wall-clock upper bound including startup, server dialogs and CDP screenshot overhead',
+      screenshotPath: path,
+    };
+  }
   await writeFile(path, buffer);
   const sha256 = createHash('sha256').update(buffer).digest('hex');
   report.screenshots.push(path);
@@ -600,6 +691,24 @@ async function stopChrome(chrome, cdp, report) {
 }
 
 async function runStaticSelfTest() {
+  const loginState = { screenSize: { width: 427, height: 242 }, screenWidgets: [
+    { type: 'EditBox', x: 100, y: 80, width: 200, height: 20, active: true },
+    { type: 'Button$Plain', text: '\u767b\u5f55', x: 80, y: 130, width: 100, height: 20 },
+  ] };
+  const canvas = { left: 7, top: 11, width: 854, height: 484 };
+  assert.deepEqual(dialogControlPoint(loginState, canvas, 'password'), { x: 407, y: 191 });
+  assert.deepEqual(dialogControlPoint(loginState, canvas, 'button', '\u767b\u5f55'), { x: 267, y: 291 });
+  assert.throws(() => dialogControlPoint({ ...loginState, screenWidgets: [] }, canvas, 'password'));
+  const nestedLoginState = {
+    screenTitle: '\u767b\u5f55',
+    screenSize: { width: 427, height: 240 },
+    screenWidgets: [{ type: 'ScrollableLayout$Container', active: true, visible: true }],
+  };
+  const nestedCanvas = { left: 0, top: 0, width: 854, height: 480 };
+  assert.deepEqual(fallbackLoginControlPoint(nestedLoginState, nestedCanvas, 'password'),
+    { x: 420, y: 226 });
+  assert.deepEqual(fallbackLoginControlPoint(nestedLoginState, nestedCanvas, 'button'),
+    { x: 274, y: 286 });
   const terrainVisual = analyzeTerrainPng(createTerrainVisualFixture());
   const skyHudVisual = analyzeTerrainPng(createTerrainVisualFixture({ skyOnly: true }));
   assert.equal(terrainVisualPass(terrainVisual), true);
@@ -614,7 +723,7 @@ async function runStaticSelfTest() {
     'wss://relay.example/tunnel'), false);
   assert.equal(resourcePackUrlMatchesExpected(
     expectedResourcePack.fixedMirrorUrl,
-    'wss://relay.example/tunnel'), true);
+    'wss://relay.example/tunnel'), Boolean(expectedResourcePack.fixedMirrorUrl));
   assert.equal(resourcePackUrlMatchesExpected(
     `${expectedResourcePack.fixedMirrorUrl}?cache-bust=1`,
     'wss://relay.example/tunnel'), false);
@@ -675,6 +784,10 @@ async function runStaticSelfTest() {
     relayNodeSuccesses: 1,
   }]);
   assert.ok(Object.values(acceptanceGates(fixture)).every(Boolean));
+  const oomFixture = structuredClone(fixture);
+  oomFixture.logs.console = [];
+  appendConsoleEntry(oomFixture, { type: 'error', text: '[GAIUS_THROWABLE] java.lang.OutOfMemoryError' });
+  assert.equal(acceptanceGates(oomFixture).fatalRuntimeErrorsClean, false);
   const splitConnection = structuredClone(fixture);
   splitConnection.final.bridgeStats.relayNodes = {
     'wss://wrong.example/tunnel': { successes: 1 },
@@ -709,6 +822,10 @@ async function runStaticSelfTest() {
     bodyVerification: { base64Encoded: true, ...expectedResourcePack },
   }]]);
   assert.equal(summarizeResourcePack(exactPackFixture, fixture.expected.relay).succeeded, true);
+  exactPackFixture.get('pack').declaredContentLength = null;
+  assert.equal(summarizeResourcePack(exactPackFixture, fixture.expected.relay).succeeded, true,
+    'chunked responses still require independently verified body size and both hashes');
+  exactPackFixture.get('pack').declaredContentLength = expectedResourcePack.bytes;
   exactPackFixture.get('pack').method = 'OPTIONS';
   assert.equal(summarizeResourcePack(exactPackFixture, fixture.expected.relay).succeeded, false);
   exactPackFixture.get('pack').method = 'GET';
@@ -755,7 +872,7 @@ async function main() {
 
   const artifact = resolve(process.env.ARTIFACT);
   const profile = inferProfile(artifact);
-  const target = process.env.TARGET || 't40.sjcmc.cn:14803';
+  const target = process.env.TARGET || '183.247.170.218:14803';
   const relay = process.env.RELAY || 'wss://ellan.site/tunnel';
   const packChoice = String(process.env.PACK_CHOICE || 'Yes').trim();
   const acceptanceSeconds = envInteger('ACCEPTANCE_SECONDS', 180, 10);
@@ -799,6 +916,7 @@ async function main() {
     samples: [],
     logs: {
       exceptions: [],
+      fatalRuntimeErrors: [],
       evaluateExceptions: [],
       evaluateTimeouts: [],
       resourcePackProgressCount: 0,
@@ -809,6 +927,7 @@ async function main() {
       requests: [],
       responses: [],
       network: [],
+      websocketFrames: [],
       console: [],
       chromeStdout: '',
       chromeStderr: '',
@@ -861,6 +980,7 @@ async function main() {
   });
 
   let cdp;
+  let cpuProfilingStarted = false;
   const requestUrls = new Map();
   const resourcePackTransactions = new Map();
   const pendingResourcePackBodyVerifications = [];
@@ -876,6 +996,20 @@ async function main() {
       boundedAppend(report.logs.cdpEventErrors, String(error?.stack || error), 100);
     });
     await cdp.open();
+
+    if (process.env.TRACE_WEBSOCKET === '1') {
+      // Opt-in diagnostic capture, bounded to the initial handshake only.
+      for (const direction of ['Sent', 'Received']) {
+        cdp.on(`Network.webSocketFrame${direction}`, (event) => {
+          boundedAppend(report.logs.websocketFrames, {
+            direction, requestId: event.requestId, timestamp: event.timestamp,
+            opcode: event.response.opcode,
+            payload: event.response.payloadData.slice(0, 16384),
+            truncated: event.response.payloadData.length > 16384,
+          }, 64);
+        });
+      }
+    }
 
     cdp.on('Runtime.exceptionThrown', (event) => boundedAppend(
       report.logs.exceptions,
@@ -968,7 +1102,7 @@ async function main() {
         resourcePack.finishedAt = new Date().toISOString();
         resourcePack.encodedDataLength = event.encodedDataLength ?? null;
         if (resourcePack.method === 'GET'
-            && resourcePackUrlMatchesExpected(resourcePack.url, relay)
+            && /\/proxy\/resource-pack(?:\?|$)/i.test(resourcePack.url)
             && resourcePack.bodyVerification === undefined
             && resourcePack.bodyVerificationPending !== true) {
           resourcePack.bodyVerificationPending = true;
@@ -1034,12 +1168,22 @@ async function main() {
 
     const launchUrl = `file:///${artifact.replaceAll('\\', '/')}?server=${encodeURIComponent(target)}`
       + `&username=${encodeURIComponent(username)}&offlineDeveloperMode=1`
-      + `&relay=${encodeURIComponent(relay)}&bridge=${encodeURIComponent(relay)}`;
-    report.launchUrl = launchUrl;
-    await cdp.send('Page.navigate', { url: launchUrl });
+      + `&relay=${encodeURIComponent(relay)}&bridge=${encodeURIComponent(relay)}`
+      + (process.env.DISABLE_RELAY_REGISTRIES === '1' ? '&relayRegistry=0' : '');
+    report.launchUrl = launchUrl + (process.env.PROFILE_RELOAD === '1' ? '&diag=reload' : '');
+    if (process.env.PROFILE_RELOAD === '1') {
+      report.profiling = {diagnosticOnly: true, latencyAcceptanceEligible: false};
+      await cdp.send('Profiler.enable');
+      await cdp.send('Profiler.setSamplingInterval', {interval: 1000});
+      await cdp.send('Profiler.start');
+      cpuProfilingStarted = true;
+    }
+    const navigationStarted = performance.now();
+    report.startupPerformance = { durationMillis: null, limitMillis: 15000, passed: false };
+    await cdp.send('Page.navigate', { url: report.launchUrl });
 
     let lastScreenKey = '';
-    let rulesDone = false;
+    const completedRuleScreens = new Set();
     let accountDone = false;
     let loginDone = false;
     let packDone = false;
@@ -1067,6 +1211,10 @@ async function main() {
           events: (window.__gaiusMinecraftEvents || []).slice(-12),
           net: window.__gaiusNetworkStats || null,
           bridgeStats: window.__gaiusNettyBridge?.stats || null,
+          resourceReloadTimings: window.__gaiusResourceReloadTimings || [],
+          resourceReloadSections: window.__gaiusResourceReloadSections || [],
+          glStats: window.__gaiusGLStats || null,
+          chunkDrawTelemetry: window.__gaiusChunkDrawTelemetry || null,
           bridge: window.__gaiusNettyBridgeInitTrace || [],
           bridgeError: window.__gaiusNettyBridgeInitError || null
         };
@@ -1093,6 +1241,10 @@ async function main() {
       }
 
       lastTrustedSnapshot = snapshot;
+      report.resourceReloadTimings = snapshot.resourceReloadTimings || [];
+      report.resourceReloadSections = snapshot.resourceReloadSections || [];
+      report.glStats = snapshot.glStats;
+      report.chunkDrawTelemetry = snapshot.chunkDrawTelemetry;
 
       report.samples.push({
         second,
@@ -1134,20 +1286,26 @@ async function main() {
         }
         if (second <= terrainFirstSecond + 12) {
           try {
-            await captureScreenshot(cdp, report, screenshotDirectory, suffix, `terrain-${second}`);
+            await captureScreenshot(cdp, report, screenshotDirectory, suffix, `terrain-${second}`, navigationStarted);
           } catch (error) {
             boundedAppend(report.logs.screenshotErrors, {
               at: new Date().toISOString(), label: `terrain-${second}`, error: String(error?.stack || error),
             }, 100);
           }
         }
-        if (second >= terrainFirstSecond + 12) break;
+        if (report.resourcePack.succeeded && second >= terrainFirstSecond + 12) break;
       }
 
-      if (!rulesDone && String(snapshot.screen || '').includes('MultiButtonDialogScreen')
-          && String(snapshot.title || '').includes('服务器规则')) {
-        rulesDone = true;
-        try { await captureScreenshot(cdp, report, screenshotDirectory, suffix, 'rules-top'); } catch {}
+      const ruleTitle = String(snapshot.title || '');
+      if (!completedRuleScreens.has(ruleTitle)
+          && String(snapshot.screen || '').includes('MultiButtonDialogScreen')
+          && /(服务器规则|守则)/.test(ruleTitle)) {
+        completedRuleScreens.add(ruleTitle);
+        const ruleScreenIndex = completedRuleScreens.size;
+        try {
+          await captureScreenshot(cdp, report, screenshotDirectory, suffix,
+            `rules-${ruleScreenIndex}-top`);
+        } catch {}
         for (let index = 0; index < 9; index++) {
           await cdp.send('Input.dispatchMouseEvent', {
             type: 'mouseMoved', x: 640, y: 300, button: 'none',
@@ -1157,9 +1315,13 @@ async function main() {
           });
           await sleep(300);
         }
-        try { await captureScreenshot(cdp, report, screenshotDirectory, suffix, 'rules-bottom'); } catch {}
+        try {
+          await captureScreenshot(cdp, report, screenshotDirectory, suffix,
+            `rules-${ruleScreenIndex}-bottom`);
+        } catch {}
         report.actions.push({
           at: new Date().toISOString(), name: 'scrollRulesBottom', count: 9,
+          ruleScreenIndex, title: ruleTitle,
           via: 'CDP Input.dispatchMouseEvent',
         });
         await click(cdp, 286, 398, 'rulesCheckbox', report);
@@ -1183,9 +1345,9 @@ async function main() {
           && String(snapshot.title || '').trim() === '登录') {
         loginDone = true;
         try { await captureScreenshot(cdp, report, screenshotDirectory, suffix, 'login'); } catch {}
-        await click(cdp, 420, 304, 'loginPasswordField', report);
+        await clickLoginControl(cdp, 'password', 'loginPasswordField', report);
         await typeText(cdp, password, report);
-        await click(cdp, 426, 365, 'loginButton', report);
+        await clickLoginControl(cdp, 'button', 'loginButton', report);
         continue;
       }
 
@@ -1274,6 +1436,14 @@ async function main() {
     console.error(report.error);
   } finally {
     await Promise.allSettled(pendingResourcePackBodyVerifications);
+    if (cpuProfilingStarted) {
+      try {
+        const {profile: cpuProfile} = await cdp.send('Profiler.stop', {}, 10000);
+        report.profiling.path = `${output}.cpuprofile`;
+        await writeFile(report.profiling.path, JSON.stringify(cpuProfile));
+        report.profiling.samples = cpuProfile.samples?.length || 0;
+      } catch (error) { report.profiling.error = String(error?.message || error); }
+    }
     await stopChrome(chrome, cdp, report);
     const profileCleanup = await removeChromeProfile(profileDir);
     report.cleanup.profileRemoved = profileCleanup.removed;

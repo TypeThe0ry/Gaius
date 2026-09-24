@@ -68,10 +68,13 @@ public final class Minecraft262BrowserPatcher {
         patchVulkanBackend(jar, root);
         patchGlDeviceCapabilities(jar, root);
         patchFramerateLimiter(jar, root);
+        // Preserve configured mipmap levels and texture resolution; throughput fixes stay in
+        // scheduling rather than lowering the graphics preset.
         patchGraphicsPresetBrowserDistances(jar, root);
-        patchAtlasManagerBrowserMipmapCap(jar, root);
         patchChunkGenerationCooperation(jar, root);
         patchDistanceManagerCooperation(jar, root);
+        patchChunkMapMovementCooperation(jar, root);
+        patchChunkTrackingViewDifferenceCooperation(jar, root);
         patchServerChunkBroadcastCooperation(jar, root);
         patchRegionFileStorageCache(jar, root);
         patchGlBufferMappedViewRanges(jar, root);
@@ -94,48 +97,6 @@ public final class Minecraft262BrowserPatcher {
         patchCopyOnWriteFileSystem(jar, root);
         patchCopyOnWriteProvider(jar, root);
         patchDownloadQueueBrowserCooperativeExecutor(jar, root);
-    }
-
-    /** Caps browser atlas mip generation to avoid a 33% native-memory spike on large packs. */
-    private static void patchAtlasManagerBrowserMipmapCap(String jar, Path root)
-            throws IOException {
-        String owner = "net/minecraft/client/resources/model/sprite/AtlasManager";
-        ClassNode node = read(jar, owner + ".class");
-        MethodNode constructor = find(
-                node,
-                "<init>",
-                "(Lnet/minecraft/client/renderer/texture/TextureManager;I)V");
-        int constructorStores = 0;
-        for (AbstractInsnNode instruction : constructor.instructions.toArray()) {
-            if (!(instruction instanceof FieldInsnNode field)
-                    || field.getOpcode() != Opcodes.PUTFIELD
-                    || !field.owner.equals(owner)
-                    || !field.name.equals("maxMipmapLevels")
-                    || !field.desc.equals("I")) {
-                continue;
-            }
-            AbstractInsnNode value = previousOpcode(field);
-            if (!(value instanceof VarInsnNode load)
-                    || load.getOpcode() != Opcodes.ILOAD
-                    || load.var != 2) {
-                throw new IllegalStateException(
-                        owner + " constructor mipmap assignment shape changed");
-            }
-            constructor.instructions.set(value, new InsnNode(Opcodes.ICONST_0));
-            constructorStores++;
-        }
-        requireOne(owner + " constructor browser mipmap cap", constructorStores);
-
-        MethodNode update = find(node, "updateMaxMipLevel", "(I)V");
-        InsnList updateCode = new InsnList();
-        updateCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        updateCode.add(new InsnNode(Opcodes.ICONST_0));
-        updateCode.add(new FieldInsnNode(
-                Opcodes.PUTFIELD, owner, "maxMipmapLevels", "I"));
-        updateCode.add(new InsnNode(Opcodes.RETURN));
-        replace(update, updateCode, 2, update.maxLocals);
-        writeComputeFrames(node, root.resolve(owner + ".class"));
-        System.out.println("Capped 26.2 browser atlas mipmaps at level zero");
     }
 
     /**
@@ -1583,6 +1544,177 @@ public final class Minecraft262BrowserPatcher {
         System.out.println("Made Minecraft 26.2 changed-chunk broadcasts cooperative");
     }
 
+    /**
+     * Keeps player movement/tracking cooperative while the browser worldgen queue is under
+     * pressure.  Vanilla 26.2 walks every tracked entity synchronously and then performs the
+     * complete chunk-view difference in one call.  A flight packet can therefore monopolize the
+     * integrated server and leave pending chunk tracking until the next tick.  Pulse only at
+     * proven loop/backedge and difference boundaries; never change the tracking view ordering.
+     */
+    private static void patchChunkMapMovementCooperation(String jar, Path root)
+            throws IOException {
+        String owner = "net/minecraft/server/level/ChunkMap";
+        // build-overlays runs after the client patcher.  Preserve the already patched class
+        // (notably the initial view-distance rewrite) instead of re-reading the vanilla jar.
+        Path output = root.resolve(owner + ".class");
+        ClassNode node;
+        if (Files.exists(output)) {
+            node = new ClassNode();
+            new ClassReader(Files.readAllBytes(output)).accept(node, 0);
+        } else {
+            node = read(jar, owner + ".class");
+        }
+
+        MethodNode move = find(node, "move", "(Lnet/minecraft/server/level/ServerPlayer;)V");
+        int backedges = 0;
+        for (AbstractInsnNode instruction : move.instructions.toArray()) {
+            if (!(instruction instanceof JumpInsnNode jump)
+                    || move.instructions.indexOf(jump.label)
+                            >= move.instructions.indexOf(instruction)) {
+                continue;
+            }
+            backedges++;
+            AbstractInsnNode previous = previousOpcode(jump);
+            if (!(previous instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKESTATIC
+                    || !call.owner.equals(WORLDGEN_SCHEDULER)
+                    || !call.name.equals("pulse")
+                    || !call.desc.equals("()V")) {
+                move.instructions.insertBefore(
+                        jump,
+                        new MethodInsnNode(
+                                Opcodes.INVOKESTATIC,
+                                WORLDGEN_SCHEDULER,
+                                "pulse",
+                                "()V",
+                                false));
+            }
+        }
+        requireOne("ChunkMap.move tracking loop", backedges);
+
+        MethodNode apply = find(
+                node,
+                "applyChunkTrackingView",
+                "(Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/server/level/ChunkTrackingView;)V");
+        int differences = 0;
+        for (AbstractInsnNode instruction : apply.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKESTATIC
+                    || !call.owner.equals("net/minecraft/server/level/ChunkTrackingView")
+                    || !call.name.equals("difference")
+                    || !call.desc.equals(
+                            "(Lnet/minecraft/server/level/ChunkTrackingView;"
+                                    + "Lnet/minecraft/server/level/ChunkTrackingView;"
+                                    + "Ljava/util/function/Consumer;"
+                                    + "Ljava/util/function/Consumer;)V")) {
+                continue;
+            }
+            differences++;
+            AbstractInsnNode next = call.getNext();
+            if (!(next instanceof MethodInsnNode pulse)
+                    || pulse.getOpcode() != Opcodes.INVOKESTATIC
+                    || !pulse.owner.equals(WORLDGEN_SCHEDULER)
+                    || !pulse.name.equals("pulse")
+                    || !pulse.desc.equals("()V")) {
+                apply.instructions.insert(call, new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        WORLDGEN_SCHEDULER,
+                        "pulse",
+                        "()V",
+                        false));
+            }
+        }
+        requireOne("ChunkMap.applyChunkTrackingView difference", differences);
+        patchChunkTrackingLambda(
+                node,
+                "lambda$applyChunkTrackingView$0",
+                "(Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/world/level/ChunkPos;)V",
+                "markChunkPendingToSend",
+                "(Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/world/level/ChunkPos;)V",
+                Opcodes.INVOKEVIRTUAL);
+        patchChunkTrackingLambda(
+                node,
+                "lambda$applyChunkTrackingView$1",
+                "(Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/world/level/ChunkPos;)V",
+                "dropChunk",
+                "(Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/world/level/ChunkPos;)V",
+                Opcodes.INVOKESTATIC);
+        writeComputeFrames(node, output);
+        System.out.println("Made Minecraft 26.2 ChunkMap movement/tracking cooperative");
+    }
+
+    /**
+     * Yields while the view difference is enumerated.  ChunkMap.move() delegates the actual
+     * rectangular add/drop walk to this static interface helper, so a pulse after the call is
+     * too late: the entire (old view union new view) rectangle has already run on the Worker.
+     * Keep the exact vanilla row-major ordering and only add scheduler checkpoints at the two
+     * existing loop backedges.  The callbacks remain untouched, which preserves the pending
+     * chunk set and PlayerChunkSender ordering while allowing a long view transition to return
+     * to the browser event loop.
+     */
+    private static void patchChunkTrackingViewDifferenceCooperation(String jar, Path root)
+            throws IOException {
+        String owner = "net/minecraft/server/level/ChunkTrackingView";
+        Path output = root.resolve(owner + ".class");
+        ClassNode node;
+        if (Files.exists(output)) {
+            node = new ClassNode();
+            new ClassReader(Files.readAllBytes(output)).accept(node, 0);
+        } else {
+            node = read(jar, owner + ".class");
+        }
+
+        MethodNode difference = find(
+                node,
+                "difference",
+                "(Lnet/minecraft/server/level/ChunkTrackingView;"
+                        + "Lnet/minecraft/server/level/ChunkTrackingView;"
+                        + "Ljava/util/function/Consumer;"
+                        + "Ljava/util/function/Consumer;)V");
+        requireWorldgenLoopPulses(
+                owner + ".difference",
+                difference,
+                2,
+                "pulse");
+        writeComputeFrames(node, output);
+        System.out.println("Made Minecraft 26.2 ChunkTrackingView difference cooperative");
+    }
+
+    private static void patchChunkTrackingLambda(
+            ClassNode node,
+            String methodName,
+            String methodDescriptor,
+            String targetName,
+            String targetDescriptor,
+            int targetOpcode) {
+        MethodNode method = find(node, methodName, methodDescriptor);
+        int calls = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != targetOpcode
+                    || !call.owner.equals("net/minecraft/server/level/ChunkMap")
+                    || !call.name.equals(targetName)
+                    || !call.desc.equals(targetDescriptor)) {
+                continue;
+            }
+            calls++;
+            AbstractInsnNode next = call.getNext();
+            if (!(next instanceof MethodInsnNode pulse)
+                    || pulse.getOpcode() != Opcodes.INVOKESTATIC
+                    || !pulse.owner.equals(WORLDGEN_SCHEDULER)
+                    || !pulse.name.equals("pulse")
+                    || !pulse.desc.equals("()V")) {
+                method.instructions.insert(call, new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        WORLDGEN_SCHEDULER,
+                        "pulse",
+                        "()V",
+                        false));
+            }
+        }
+        requireOne("ChunkMap." + methodName + " " + targetName, calls);
+    }
+
     private static void patchUberGpuBufferNodeCleanup(String jar, Path root)
             throws IOException {
         String owner = "com/mojang/blaze3d/vertex/UberGpuBuffer";
@@ -1967,15 +2099,13 @@ public final class Minecraft262BrowserPatcher {
     }
 
     /**
-     * Keeps the 26.2 FAST preset inside the browser profile's low-distance budget.
+     * Verifies that the 26.2 FAST preset keeps the vanilla 8/6 distances.
      *
-     * <p>This is deliberately a bytecode overlay rather than a change to Options or the
-     * singleplayer distance contract.  The vanilla method is an ordinal switch: only the
-     * ordinal-zero FAST arm contains the render/simulation option writes with the 8/6
-     * constants.  Match that arm, both option getter calls, their receiver/field shape, and
-     * the boxed integer stores before changing exactly those two BIPUSH instructions.  A
-     * missing, duplicated, or reshaped target fails closed instead of replacing unrelated
-     * integer constants in the preset method.</p>
+     * <p>The browser patcher used to overwrite these two constants with a smaller distance
+     * budget.  That silently reduced world visibility and simulation coverage, so this pass is
+     * intentionally validation-only: it locates the ordinal-zero FAST arm, checks both option
+     * getter calls and their receiver/field shape, and fails closed if Mojang changes the
+     * bytecode.  No graphics, texture, or mipmap value is rewritten.</p>
      */
     private static void patchGraphicsPresetBrowserDistances(String jar, Path root)
             throws IOException {
@@ -2058,12 +2188,9 @@ public final class Minecraft262BrowserPatcher {
                 owner,
                 "simulationDistance",
                 6);
-        renderDistance.operand = 6;
-        simulationDistance.operand = 4;
-
         write(node, root.resolve(owner + ".class"));
         System.out.println(
-                "Bounded Minecraft 26.2 FAST graphics preset distances to render=6 simulation=4");
+                "Preserved Minecraft 26.2 FAST graphics preset distances at render=8 simulation=6");
     }
 
     private static IntInsnNode findGraphicsPresetDistanceConstant(

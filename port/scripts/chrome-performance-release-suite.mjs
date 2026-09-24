@@ -691,7 +691,7 @@ export function validateContractShape(contractValue) {
     const profile = profileFrom(contractValue, name);
     return `${Number(profile.renderDistance)}/${Number(profile.simulationDistance)}`;
   }));
-  for (const requiredDistance of ["6/4", "8/4", "12/4"]) {
+  for (const requiredDistance of ["8/6", "12/6"]) {
     if (!matrixDistances.has(requiredDistance)) {
       throw new Error(`Uncapped matrix is missing the ${requiredDistance} distance pair`);
     }

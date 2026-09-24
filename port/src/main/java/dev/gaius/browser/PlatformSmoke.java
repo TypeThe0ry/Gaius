@@ -2139,10 +2139,9 @@ public final class PlatformSmoke {
         URL pinnedResourcePack = BrowserHttpProxy.proxyResourcePack(new URL(
                 "https://jihulab.com/-/project/356228/uploads/"
                         + "e409655d230380173547e68c5ef026d4/resource_pack.zip"));
-        if (!"https://typethe0ry.github.io/Gaius/resource-packs/"
-                .concat("008381d7a89976709aa86bb71dee06dc50bb3961.zip")
-                .equals(pinnedResourcePack.toExternalForm())) {
-            throw new AssertionError("Pinned browser resource-pack mirror is invalid");
+        if (!pinnedResourcePack.toExternalForm().contains("/proxy/resource-pack?")
+                || !pinnedResourcePack.toExternalForm().contains("jihulab.com")) {
+            throw new AssertionError("Server resource-pack relay route is invalid");
         }
         URL authentication = BrowserHttpProxy.proxyAuthentication(
                 new URL("https://sessionserver.mojang.com/session/minecraft/join"));
@@ -2178,9 +2177,9 @@ public final class PlatformSmoke {
                         "X-Minecraft-Version", "1.21.11",
                         "X-Minecraft-UUID", "00000000-0000-0000-0000-000000000000"));
         if (!"application/octet-stream".equals(mirrorHeaders.get("Accept"))
-                || mirrorHeaders.containsKey("X-Minecraft-Version")
-                || mirrorHeaders.containsKey("X-Minecraft-UUID")) {
-            throw new AssertionError("Pinned resource-pack mirror headers are not CORS-simple");
+                || !"1.21.11".equals(mirrorHeaders.get("X-Minecraft-Version"))
+                || !mirrorHeaders.containsKey("X-Minecraft-UUID")) {
+            throw new AssertionError("Resource-pack relay metadata headers are missing");
         }
     }
 

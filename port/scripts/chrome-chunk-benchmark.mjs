@@ -157,21 +157,21 @@ const activeStoragePrefix = activeStorageConfig.prefix;
 // profile (or a profile whose identity/capability fields do not match).
 const supportedReleaseDistanceCapabilities = Object.freeze({
   "26.2": Object.freeze({
-    capability: "headed-chrome-worker-distance-6-4",
+    capability: "headed-chrome-worker-distance-8-6",
     clientDistribution: "named",
     protocolVersion: 776,
     worldVersion: 4903,
     worldgenTelemetryMode: "task-pulsed",
-    workerDistance: "6:4",
+    workerDistance: "8:6",
     workerDistanceMode: "natural-observation",
   }),
   "1.21.11": Object.freeze({
-    capability: "headed-chrome-worker-distance-6-4",
+    capability: "headed-chrome-worker-distance-8-6",
     clientDistribution: "obfuscated-with-mappings",
     protocolVersion: 774,
     worldVersion: 4671,
     worldgenTelemetryMode: "checkpoint-only",
-    workerDistance: "6:4",
+    workerDistance: "8:6",
     workerDistanceMode: "natural-observation",
   }),
 });
@@ -521,8 +521,8 @@ const benchmarkOptionsText = [
   "operatorItemsTab:true",
   // Apply the graphics preset before the distance overrides: 26.2's preset
   // bundles its own render/simulation distance, so applying it after those
-  // lines overwrote the seeded 6/4 with the preset's 8/6.
-  `graphicsPreset:${JSON.stringify(String(environmentContract.graphicsPreset || "fast"))}`,
+  // lines overwrote the seeded profile distance with the preset's vanilla 8/6.
+  `graphicsPreset:${JSON.stringify(String(environmentContract.graphicsPreset || "fancy"))}`,
   `renderDistance:${expectedRenderDistance}`,
   `simulationDistance:${expectedSimulationDistance}`,
   "entityDistanceScaling:0.5",
@@ -532,16 +532,16 @@ const benchmarkOptionsText = [
   // cap a stationary foreground run at 30 FPS after one minute.
   // StringRepresentable serializes this enum as lowercase "minimized".
   'inactivityFpsLimit:"minimized"',
-  "renderClouds:\"false\"",
+  "renderClouds:\"true\"",
   "cloudRange:32",
-  "ao:false",
-  "cutoutLeaves:false",
-  "vignette:false",
-  "improvedTransparency:false",
+  "ao:true",
+  "cutoutLeaves:true",
+  "vignette:true",
+  "improvedTransparency:true",
   "weatherRadius:3",
   "chunkSectionFadeInTime:0.0",
   "prioritizeChunkUpdates:0",
-  "mipmapLevels:0",
+  "mipmapLevels:4",
   "maxAnisotropyBit:1",
   "textureFiltering:0",
   "biomeBlendRadius:0",
@@ -4470,17 +4470,17 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
   }
   if (strict && profile.releaseEvidence === true && !releaseDistanceProfileCompatible) {
     environmentIssues.push(
-      `strict 6/4 release evidence requires a supported headed Chrome capability; `
+      `strict ${expectedDistanceLabel} release evidence requires a supported headed Chrome capability; `
         + `${releaseDistanceCapability.reason} (active profile ${activeStorageProfileId})`,
     );
   }
   const expectedMaxFps = Number(environmentRules.maxFps || 260);
   const unlimitedSentinel = Number(environmentRules.unlimitedSentinel || expectedMaxFps);
-  const expectedGraphicsPreset = String(environmentRules.graphicsPreset || "fast").toLowerCase();
+  const expectedGraphicsPreset = String(environmentRules.graphicsPreset || "fancy").toLowerCase();
   const expectedInactivityFpsLimit = "minimized";
   if (Number(options.maxFps) !== expectedMaxFps
       || String(options.graphicsPreset).toLowerCase() !== expectedGraphicsPreset) {
-    environmentIssues.push("Video Settings were not Unlimited with the Fast preset");
+    environmentIssues.push("Video Settings were not Unlimited with the Fancy preset");
   }
   if (options.enableVsync !== false) environmentIssues.push("VSync was not disabled");
   const actualInactivityFpsLimit = String(options.inactivityFpsLimit || "").toLowerCase();
@@ -5404,7 +5404,7 @@ function analyze(samples, stabilitySamples, telemetry, heapSamples, events, stri
       : (strict
           ? (releaseEvidence
               ? "All independent gates must pass. Fail, invalid, and inconclusive are non-zero outcomes."
-              : "Diagnostic stress profile only; a pass is not evidence for the 6/4 release target.")
+              : `Diagnostic stress profile only; a pass is not evidence for the ${expectedDistanceLabel} release target.`)
           : "Smoke mode only checks plumbing and stability; it is never release evidence."),
     checks,
     contractEvaluation,

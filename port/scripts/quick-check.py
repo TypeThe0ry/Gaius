@@ -5426,7 +5426,7 @@ def check_source_patches() -> None:
             "patchDynamicUniformsBrowserInitialCapacity" in client_patcher
             and "net/minecraft/client/renderer/DynamicUniforms.class" in client_patcher
             and "net/minecraft/client/renderer/DynamicUniformStorage" in client_patcher
-            and "int[] browserCapacities = {128, 128}" in client_patcher
+            and "int[] browserCapacities = {32767, 32767}" in client_patcher
             and "Opcodes.SIPUSH" in client_patcher
             and "previousRealInstruction(call)" in client_patcher,
         ),
@@ -5839,7 +5839,7 @@ def check_source_patches() -> None:
         (
             "Browser resource-pack preparation yields between bounded batches",
             "BrowserResourceReloadScheduler.defer" in browser_resource_reload_profiler
-            and "FRAME_WORK_BUDGET_NANOS = 11_000_000L" in browser_resource_reload_scheduler
+            and "FRAME_WORK_BUDGET_NANOS = 25_000_000L" in browser_resource_reload_scheduler
             and "scheduleMacrotask(BrowserResourceReloadScheduler::runAfterYield)"
                 in browser_resource_reload_scheduler
             and "TModernRuntimeSupport.postRunnableMacrotask" in browser_resource_reload_scheduler
@@ -5865,14 +5865,9 @@ def check_source_patches() -> None:
             and "Opcodes.ICONST_1" in client_patcher,
         ),
         (
-            "Verified remote server packs complete configuration before the browser reload",
-            "patchEarlyBrowserServerPackSuccess" in client_patcher
-            and '"net/minecraft/client/resources/server/DownloadedPackSource$6"' in client_patcher
-            and '"browserEarlyApplied"' in client_patcher
-            and '"DOWNLOADED"' in client_patcher
-            and '"SUCCESSFULLY_LOADED"' in client_patcher
-            and '"APPLIED"' in client_patcher
-            and "DownloadedPackSource response sender constructor was not found" in client_patcher,
+            "Remote server packs retain vanilla load-complete reporting",
+            "patchEarlyBrowserServerPackSuccess" not in client_patcher
+            and '"browserEarlyApplied"' not in client_patcher,
         ),
         (
             "Joined multiplayer worlds stay visible and interactive during pack reloads",
@@ -7011,8 +7006,8 @@ def check_source_patches() -> None:
             and "simulationDistance:4" in browser_file_persistence
             and "entityDistanceScaling:0.5" in browser_file_persistence
             and "maxFps:260" in browser_file_persistence
-            and 'graphicsPreset:\\"fast\\"' in browser_file_persistence
-            and 'renderClouds:\\"false\\"' in browser_file_persistence
+            and 'graphicsPreset:\\"fancy\\"' in browser_file_persistence
+            and 'renderClouds:\\"true\\"' in browser_file_persistence
             and "menuBackgroundBlurriness:0" in browser_file_persistence
             and "panoramaSpeed:1.0" in browser_file_persistence
             and "screenEffectScale:0.0" in browser_file_persistence
@@ -8590,13 +8585,9 @@ def check_overlay_bytecode() -> None:
         browser_integrated_server_main_class,
         "private static boolean drainUrgentPackets();",
     )
-    browser_drain_scheduled_network_input = method_section(
-        browser_integrated_server_main_class,
-        "private static boolean drainScheduledNetworkInput();",
-    )
     browser_drain_urgent_packets_from_server_loop = method_section(
         browser_integrated_server_main_class,
-        "private static boolean drainUrgentPacketsFromServerLoop(net.minecraft.server.MinecraftServer);",
+        "private static boolean drainUrgentPacketsFromServerLoop(net.minecraft.server.MinecraftServer, int);",
     )
     browser_pump_pending_packets = method_section(
         browser_integrated_server_main_class,
@@ -8616,7 +8607,7 @@ def check_overlay_bytecode() -> None:
     )
     browser_run_scheduled_network_input = method_section(
         browser_integrated_server_main_class,
-        "private static void runScheduledNetworkInput();",
+        "private static void runScheduledNetworkInput(net.minecraft.server.MinecraftServer, int);",
     )
     blockable_event_loop_schedule = method_section(
         blockable_event_loop,
@@ -9363,17 +9354,12 @@ def check_overlay_bytecode() -> None:
             and "BrowserResourceReloadProfiler.label" in font_manager,
         ),
         (
-            "Remote pack bytecode reports verified downloads early without hiding reload failures",
-            "java/util/HashSet.\"<init>\"" in downloaded_pack_response_constructor
-            and "browserEarlyApplied" in downloaded_pack_response_constructor
-            and downloaded_pack_report_update.count("Connection.send") == 2
-            and 0
-            <= downloaded_pack_report_update.find("PackLoadFeedback$Update.DOWNLOADED")
-            < downloaded_pack_report_update.find("Set.add")
-            < downloaded_pack_report_update.find("Action.SUCCESSFULLY_LOADED")
-            and "Set.remove" in downloaded_pack_report_final
-            and "PackLoadFeedback$FinalResult.APPLIED" in downloaded_pack_report_final
-            and "return" in downloaded_pack_report_final,
+            "Remote pack bytecode reports success only from final reload feedback",
+            "browserEarlyApplied" not in downloaded_pack_response_constructor
+            and downloaded_pack_report_update.count("Connection.send") == 1
+            and "Action.SUCCESSFULLY_LOADED" not in downloaded_pack_report_update
+            and "Action.SUCCESSFULLY_LOADED" in downloaded_pack_report_final
+            and "Action.FAILED_RELOAD" in downloaded_pack_report_final,
         ),
         (
             "Cold server-pack timeout recovery is present in compiled client bytecode",
@@ -11338,7 +11324,7 @@ def check_overlay_bytecode() -> None:
         (
             "DynamicUniforms constructor uses browser initial UBO capacities",
             "Dynamic Transforms UBO" in dynamic_uniforms_constructor
-            and dynamic_uniforms_constructor.count("sipush        128") >= 2
+            and dynamic_uniforms_constructor.count("sipush        32767") >= 2
             and "Chunk Sections UBO" in dynamic_uniforms_constructor
             and "iconst_2" not in dynamic_uniforms_constructor,
         ),
@@ -11828,13 +11814,13 @@ def check_overlay_bytecode() -> None:
             and "PacketProcessor.processQueuedPackets" in browser_drain_urgent_packets_from_server_loop,
         ),
         (
-            "Scheduled network input uses its lifecycle permit without a TeaVM thread-wrapper check",
-            "MinecraftServer.isRunning" in browser_drain_scheduled_network_input
-            and "NETWORK_INPUT_TASK_SCHEDULED" in browser_drain_scheduled_network_input
-            and "activeNetworkInputTask" in browser_drain_scheduled_network_input
-            and "Method drainUrgentPacketsFromServerLoop:(Lnet/minecraft/server/MinecraftServer;)Z"
-                in browser_drain_scheduled_network_input
-            and "java/lang/Thread.currentThread" not in browser_drain_scheduled_network_input,
+            "Scheduled network input uses owner-generation lifecycle capability",
+            "Method isCurrentNetworkInputOwner" in browser_run_scheduled_network_input
+            and "NETWORK_INPUT_TASK_SCHEDULED" in browser_run_scheduled_network_input
+            and "networkInputReschedulePending" in browser_run_scheduled_network_input
+            and "Method drainUrgentPacketsFromServerLoop:(Lnet/minecraft/server/MinecraftServer;I)Z"
+                in browser_run_scheduled_network_input
+            and "java/lang/Thread.currentThread" not in browser_run_scheduled_network_input,
         ),
         (
             "Integrated server pumps pending input while awaiting chunk futures",
@@ -11863,7 +11849,10 @@ def check_overlay_bytecode() -> None:
             and "MinecraftServer.schedule" in browser_schedule_network_input
             and "MinecraftServer.execute" not in browser_schedule_network_input
             and "LockSupport.unpark" in browser_schedule_network_input
-            and "Method drainScheduledNetworkInput:()Z" in browser_run_scheduled_network_input
+            and "Method isCurrentNetworkInputOwner" in browser_run_scheduled_network_input
+            and "network-pump-stale-generation" in browser_run_scheduled_network_input
+            and "network-pump-permit-missing" in browser_run_scheduled_network_input
+            and "network-pump-busy" in browser_run_scheduled_network_input
             and "Method reportRuntimeEvent" in browser_run_scheduled_network_input
             and "BrowserIntegratedServerMain.beginScheduledNetworkInputTask" not in browser_run_scheduled_network_input
             and "java/util/Queue.add" in blockable_event_loop_schedule
@@ -11875,17 +11864,12 @@ def check_overlay_bytecode() -> None:
             and "Method execute" not in blockable_event_loop_schedule,
         ),
         (
-            "BlockableEventLoop dispatches the private network task with an identity lease",
-            "BrowserIntegratedServerMain.beginScheduledNetworkInputTask"
-                in blockable_event_loop_do_run_task
-            and "java/lang/Runnable.run" in blockable_event_loop_do_run_task
-            and blockable_event_loop_do_run_task.find(
-                "BrowserIntegratedServerMain.beginScheduledNetworkInputTask"
-            )
-                < blockable_event_loop_do_run_task.find("java/lang/Runnable.run")
-            and blockable_event_loop_do_run_task.count(
-                "BrowserIntegratedServerMain.endScheduledNetworkInputTask"
-            ) >= 2,
+            "BlockableEventLoop retains vanilla Runnable dispatch without a network-task lease",
+            blockable_event_loop_do_run_task.count("java/lang/Runnable.run") == 1
+            and "BrowserIntegratedServerMain.beginScheduledNetworkInputTask"
+                not in blockable_event_loop_do_run_task
+            and "BrowserIntegratedServerMain.endScheduledNetworkInputTask"
+                not in blockable_event_loop_do_run_task,
         ),
         (
             "Compiled structure templates retain synchronous NBT parsing with direct byte-array reads",
@@ -12470,8 +12454,8 @@ def check_overlay_bytecode() -> None:
             and "simulationDistance:4" in browser_file_persistence_constants
             and "entityDistanceScaling:0.5" in browser_file_persistence_constants
             and "maxFps:260" in browser_file_persistence_constants
-            and 'graphicsPreset:"fast"' in browser_file_persistence_constants
-            and 'renderClouds:"false"' in browser_file_persistence_constants
+            and 'graphicsPreset:"fancy"' in browser_file_persistence_constants
+            and 'renderClouds:"true"' in browser_file_persistence_constants
             and "menuBackgroundBlurriness:0" in browser_file_persistence_constants
             and "panoramaSpeed:1.0" in browser_file_persistence_constants
             and "screenEffectScale:0.0" in browser_file_persistence_constants

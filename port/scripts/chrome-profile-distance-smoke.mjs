@@ -31,15 +31,15 @@ const configuration = JSON.parse(execFileSync(
 ));
 
 assert.equal(configuration.profileName, "steady-6-4");
-assert.equal(configuration.expectedRenderDistance, 6);
-assert.equal(configuration.expectedSimulationDistance, 4);
+assert.equal(configuration.expectedRenderDistance, 8);
+assert.equal(configuration.expectedSimulationDistance, 6);
 assert.equal(configuration.workerDistanceMode, "natural-observation");
 assert.equal(configuration.workerDistancePin, false);
 assert.equal(configuration.workerDistanceContract.mode, "natural-observation");
 assert.equal(configuration.workerDistanceContract.releaseEligible, true);
 assert.equal(configuration.workerDistanceContract.releaseTargetProfile, "26.2");
 assert.equal(configuration.workerDistanceContract.activeProfileId, "26.2");
-assert.equal(configuration.workerDistanceContract.expectedStartDistance, "6:4");
+assert.equal(configuration.workerDistanceContract.expectedStartDistance, "8:6");
 assert.equal(
   configuration.workerDistanceContract.effectiveDistanceModel,
   "min(client-options-preference,worker-server-distance)",
@@ -164,7 +164,7 @@ assert.ok(harnessEvidenceCollector >= 0, "benchmark report must expose harnessOv
 assert.match(
   gateSource,
   /seeded:persisted\|\|fsPut\|\|localStoragePut/,
-  "profile gate must require a verifiable 6/4 seed path",
+  "profile gate must require a verifiable 8/6 seed path",
 );
 
-console.log("Chrome steady-6-4 profile distance smoke passed (render=6 simulation=4)");
+console.log("Chrome steady-6-4 profile distance smoke passed (render=8 simulation=6)");

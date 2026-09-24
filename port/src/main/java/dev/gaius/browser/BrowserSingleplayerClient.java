@@ -503,6 +503,41 @@ public final class BrowserSingleplayerClient {
                 }
                 return snapshot;
               };
+              // Keep the nested PlayerChunkSender state intact across the
+              // Worker -> page heartbeat.  The generic scalar copier is
+              // intentionally shallow and would otherwise drop `chunkSender`.
+              const chunkSenderTelemetryKeys = [
+                'telemetryVersion', 'pending', 'selected', 'unacknowledgedBatches',
+                'playerChunkX', 'playerChunkZ', 'maxPending',
+                'maxUnacknowledgedBatches', 'entryCount', 'selectedCount',
+                'batchCount', 'readySelectedChunks',
+              ];
+              const copyChunkSenderTelemetry = function(value) {
+                const snapshot = {};
+                if (!value || typeof value !== 'object') return snapshot;
+                for (let keyIndex = 0; keyIndex < chunkSenderTelemetryKeys.length; keyIndex++) {
+                  const key = chunkSenderTelemetryKeys[keyIndex];
+                  const current = value[key];
+                  if (typeof current === 'number' && Number.isFinite(current)) {
+                    snapshot[key] = current;
+                  } else if (typeof current === 'boolean' ||
+                      typeof current === 'string' || current === null) {
+                    snapshot[key] = current;
+                  }
+                }
+                if (value.last && typeof value.last === 'object') {
+                  snapshot.last = copyChunkSenderTelemetry(value.last);
+                }
+                return snapshot;
+              };
+              const copyWorldgenTelemetry = function(value) {
+                const snapshot = copyScalarTelemetry(value);
+                if (value && typeof value === 'object' && value.chunkSender &&
+                    typeof value.chunkSender === 'object') {
+                  snapshot.chunkSender = copyChunkSenderTelemetry(value.chunkSender);
+                }
+                return snapshot;
+              };
               worker.__gaiusTelemetryPending = new Map();
               worker.__gaiusTelemetrySequence = 0;
               worker.__gaiusTelemetrySent = 0;
@@ -601,7 +636,7 @@ public final class BrowserSingleplayerClient {
                 state.globalPump = copyGlobalPumpTelemetry(
                   worker.__gaiusTelemetryGlobalPump
                 );
-                state.worldgen = copyScalarTelemetry(worker.__gaiusTelemetryWorldgen);
+                 state.worldgen = copyWorldgenTelemetry(worker.__gaiusTelemetryWorldgen);
                 state.serverTick = copyScalarTelemetry(worker.__gaiusTelemetryServerTick);
                 state.serverDistance = copyScalarTelemetry(worker.__gaiusTelemetryServerDistance);
                 state.storage = copyScalarTelemetry(worker.__gaiusTelemetryStorage);
@@ -878,7 +913,7 @@ public final class BrowserSingleplayerClient {
                 worker.__gaiusTelemetryGlobalPump = copyGlobalPumpTelemetry(
                   message.globalPump
                 );
-                worker.__gaiusTelemetryWorldgen = copyScalarTelemetry(message.worldgen);
+                 worker.__gaiusTelemetryWorldgen = copyWorldgenTelemetry(message.worldgen);
                 worker.__gaiusTelemetryServerTick = copyScalarTelemetry(message.serverTick);
                 worker.__gaiusTelemetryServerDistance = copyScalarTelemetry(message.serverDistance);
                 worker.__gaiusTelemetryStorage = copyScalarTelemetry(message.storage);
@@ -1036,8 +1071,8 @@ public final class BrowserSingleplayerClient {
                 storageOpfsDirectory: globalThis.__gaiusStorageOpfsDirectory || null,
                 bridgeUrl: globalThis.__gaiusBridgeUrl || null,
                 bridgeToken: globalThis.__gaiusBridgeToken || null,
-                renderDistance: Math.max(2, Math.min(32, Number(renderDistance) || 6)),
-                simulationDistance: Math.max(2, Math.min(32, Number(simulationDistance) || 4)),
+                renderDistance: Math.max(2, Math.min(32, Number(renderDistance) || 8)),
+                simulationDistance: Math.max(2, Math.min(32, Number(simulationDistance) || 6)),
                 worldgenSliceMillis: 8,
                 distanceRampIntervalMillis: 250,
                 serverScriptUrl: globalThis.__gaiusSingleplayerServerUrl || null,
@@ -1313,8 +1348,8 @@ public final class BrowserSingleplayerClient {
     @JSBody(params = {"renderDistance", "simulationDistance"}, script = """
             const workers = globalThis.__gaiusSingleplayerWorkers;
             if (!workers || typeof workers.values !== 'function') return;
-            const view = Math.max(2, Math.min(32, Number(renderDistance) || 6));
-            const simulation = Math.max(2, Math.min(32, Number(simulationDistance) || 4));
+            const view = Math.max(2, Math.min(32, Number(renderDistance) || 8));
+            const simulation = Math.max(2, Math.min(32, Number(simulationDistance) || 6));
             const key = view + ':' + simulation;
             workers.forEach(function(worker) {
               if (!worker || worker.__gaiusTerminal || worker.__gaiusDistances === key) return;

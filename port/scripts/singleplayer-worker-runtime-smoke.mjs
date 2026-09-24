@@ -88,21 +88,18 @@ const NETWORK_SLOW_SAMPLE_FIELDS = Object.freeze([
   "integratedServerInputPending",
   "integratedServerPumpRequests",
   "integratedServerPumpStarts",
-  "integratedServerPumpRetrySchedules",
-  "integratedServerPumpRetryExhaustions",
   "integratedServerTaskSchedules",
   "integratedServerTaskRuns",
-  "integratedServerTaskSignals",
-  "integratedServerTaskUnparks",
-  "integratedServerTaskCoalesced",
   "integratedServerTaskFollowups",
   "integratedServerPumpFailures",
   "integratedServerTaskScheduleFailures",
   "integratedServerTaskLifecycleDrops",
-  "integratedServerTaskWrongThread",
   "integratedServerTaskBudgetExhaustions",
   "integratedServerTaskDeferredRetries",
   "integratedServerTaskRetryExhaustions",
+  "integratedServerTaskStaleGenerations",
+  "integratedServerTaskPermitMissing",
+  "integratedServerTaskPumpBusy",
   "integratedServerDistanceMaxViewApplyMillis",
   "integratedServerDistanceMaxSimulationApplyMillis",
   "errors",
@@ -320,6 +317,9 @@ const requiredNetworkTaskTelemetryFields = Object.freeze([
   "integratedServerTaskBudgetExhaustions",
   "integratedServerTaskDeferredRetries",
   "integratedServerTaskRetryExhaustions",
+  "integratedServerTaskStaleGenerations",
+  "integratedServerTaskPermitMissing",
+  "integratedServerTaskPumpBusy",
   "integratedServerTaskPending",
   "integratedServerInputPending",
 ]);
@@ -493,6 +493,9 @@ function validateNetworkTaskTelemetry(stats, options = {}) {
     }
     if (options.requireHealthy && fieldValues.integratedServerTaskWrongThread !== 0) {
       healthErrors.push("integrated server task wrong-thread runs are non-zero");
+    }
+    if (options.requireHealthy && fieldValues.integratedServerTaskPermitMissing !== 0) {
+      healthErrors.push("integrated server task permit-missing runs are non-zero");
     }
     if (options.requireHealthy && fieldValues.integratedServerTaskRetryExhaustions !== 0) {
       healthErrors.push("integrated server task deferred retries exhausted");

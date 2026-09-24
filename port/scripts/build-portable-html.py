@@ -389,16 +389,18 @@ def compare_gzip_with_raw(raw_path: Path, compressed_path: Path) -> tuple[str, s
     raw_hash = sha256_file(raw_path)
     compressed_hash = sha256_file(compressed_path)
     try:
-        with raw_path.open("rb") as raw, gzip.open(compressed_path, "rb") as compressed:
-            while True:
-                raw_chunk = raw.read(1024 * 1024)
-                compressed_chunk = compressed.read(1024 * 1024)
-                if raw_chunk != compressed_chunk:
-                    raise RuntimeError(
-                        "classes.js.gz does not expand to the current classes.js"
-                    )
-                if not raw_chunk:
-                    break
+        # GzipFile.read(size) is allowed to return a short chunk even when
+        # more decompressed bytes remain. Comparing fixed-size reads from the
+        # raw and gzip streams therefore produces false mismatches at arbitrary
+        # buffer boundaries. Read both complete byte streams for an exact
+        # identity check; this runs only during packaging and avoids accepting
+        # a stale or truncated compressed asset.
+        raw_bytes = raw_path.read_bytes()
+        compressed_bytes = gzip.open(compressed_path, "rb").read()
+        if raw_bytes != compressed_bytes:
+            raise RuntimeError(
+                "classes.js.gz does not expand to the current classes.js"
+            )
     except (EOFError, OSError) as exc:
         raise RuntimeError(f"classes.js.gz is not a complete gzip: {compressed_path}") from exc
     return raw_hash, compressed_hash

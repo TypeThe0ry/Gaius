@@ -89,8 +89,6 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/client/multiplayer/ClientCommonPacketListenerImpl.class"));
         patchDownloadedPackSourceBrowserRecovery(args[0], root.resolve(
                 "net/minecraft/client/resources/server/DownloadedPackSource.class"));
-        patchEarlyBrowserServerPackSuccess(args[0], root.resolve(
-                "net/minecraft/client/resources/server/DownloadedPackSource$6.class"));
         patchResourceReloadProfiling(args[0], root.resolve(
                 "net/minecraft/server/packs/resources/SimpleReloadInstance.class"));
         patchSimpleJsonResourceReloadListenerBrowserStartupYield(args[0], root.resolve(
@@ -100,6 +98,8 @@ public final class MinecraftClientPatcher {
                 root.resolve("net/minecraft/client/resources/model/ModelManager.class"),
                 root.resolve("net/minecraft/client/gui/font/FontManager.class"));
         patchAtlasManagerReloadTaskLabels(args[0], root);
+        patchBitmapFontImageSharing(args[0], root);
+        patchFontProviderSelectionIndex(args[0], root);
         patchUnihexProviderBrowserBulkParser(args[0], root.resolve(
                 "net/minecraft/client/gui/font/providers/UnihexProvider$Definition.class"));
         patchUnihexProviderBrowserAccess(args[0], root.resolve(
@@ -118,9 +118,9 @@ public final class MinecraftClientPatcher {
                 "com/mojang/blaze3d/platform/FramerateLimitTracker.class"));
         patchTracyZoneFiller(
                 args[0], root.resolve("net/minecraft/util/profiling/TracyZoneFiller.class"));
+        patchTracingExecutorBrowser(args[0], root.resolve("net/minecraft/TracingExecutor.class"));
         patchBlockableEventLoopBrowser(args[0], root.resolve(
                 "net/minecraft/util/thread/BlockableEventLoop.class"));
-        patchTracingExecutorBrowser(args[0], root.resolve("net/minecraft/TracingExecutor.class"));
         patchMacosUtil(
                 args[0], root.resolve("com/mojang/blaze3d/platform/MacosUtil.class"));
         patchInputConstants(
@@ -175,7 +175,8 @@ public final class MinecraftClientPatcher {
         patchServerGamePacketListenerBrowserWorker(args[0], root.resolve(
                 "net/minecraft/server/network/ServerGamePacketListenerImpl.class"));
         patchPlayerChunkSenderBrowserWorker(args[0], root.resolve(
-                "net/minecraft/server/network/PlayerChunkSender.class"));
+                "net/minecraft/server/network/PlayerChunkSender.class"),
+                "26.2".equals(minecraftVersion));
         patchServerPlayerGameModeBrowserWorker(args[0], root.resolve(
                 "net/minecraft/server/level/ServerPlayerGameMode.class"));
         patchChunkGeneratorStructureStateBrowserFastRings(args[0], root.resolve(
@@ -355,8 +356,15 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/client/multiplayer/ClientLevel.class"));
         patchMultiPlayerGameModeBrowserHitSound(args[0], root.resolve(
                 "net/minecraft/client/multiplayer/MultiPlayerGameMode.class"));
-        patchLevelRendererBrowserBlockBreakProgress(args[0], root.resolve(
-                "net/minecraft/client/renderer/LevelRenderer.class"));
+        if ("26.2".equals(minecraftVersion)) {
+            patchLevelRendererBrowserBlockBreakProgress(args[0], root.resolve(
+                    "net/minecraft/client/renderer/LevelRenderer.class"), true);
+            patchSectionOcclusionGraphBrowserMovementRefresh(args[0], root.resolve(
+                    "net/minecraft/client/renderer/SectionOcclusionGraph.class"));
+        } else {
+            patchLevelRendererBrowserBlockBreakProgress(args[0], root.resolve(
+                    "net/minecraft/client/renderer/LevelRenderer.class"), false);
+        }
         patchCurrentLevelExtractorBrowserSectionCompileThrottle(args[0], root.resolve(
                 "net/minecraft/client/renderer/extract/LevelExtractor.class"));
         patchEntityRenderDispatcherBrowserNullEntityGuard(args[0], root.resolve(
@@ -365,6 +373,7 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/client/renderer/chunk/RenderSectionRegion.class"));
         patchSectionCompilerBrowserDirectRelativeCoordinates(args[0], root.resolve(
                 "net/minecraft/client/renderer/chunk/SectionCompiler.class"));
+        patchSectionNeighborReadiness(args[0], root, minecraftVersion);
         patchSectionRenderDispatcherBrowserThrottles(args[0], root.resolve(
                 "net/minecraft/client/renderer/chunk/SectionRenderDispatcher.class"));
         patchCurrentSectionTaskQueueBrowserPriorities(args[0], root.resolve(
@@ -1803,7 +1812,14 @@ public final class MinecraftClientPatcher {
             throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/renderer/DynamicUniforms.class");
         MethodNode constructor = find(node, "<init>", "()V");
-        int[] browserCapacities = {128, 128};
+        // Multiplayer terrain can expose tens of thousands of section records during
+        // the first render burst. Starting at 128 made the browser reallocate and copy
+        // the UBO repeatedly on the render thread (128 -> 256 -> ... -> 65536), which
+        // presents as an FPS collapse while chunks are arriving. Reserve a moderate
+        // initial slab so the first burst stays on the GPU upload path without the
+        // resize storm; use the largest positive SIPUSH literal so the initial
+        // browser slab stays valid in bytecode and covers almost the full burst.
+        int[] browserCapacities = {32767, 32767};
         int storageConstructors = 0;
         for (var instruction = constructor.instructions.getFirst();
                 instruction != null;
@@ -5406,14 +5422,192 @@ public final class MinecraftClientPatcher {
         }
     }
 
-    private static void patchLevelRendererBrowserBlockBreakProgress(String jar, Path output)
+    private static void patchLevelRendererBrowserBlockBreakProgress(String jar, Path output,
+            boolean refreshVisibleSections)
             throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/renderer/LevelRenderer.class");
         patchLevelRendererBrowserPrepareChunkRenders(node);
+        patchLevelRendererBrowserPrepareAfterOcclusionUpdate(node);
+        // Consume the graph publication flag after update() so the next frame's
+        // draw list includes sections from the newly published graph.
+        patchLevelRendererBrowserRefreshVisibleSections(node);
         patchLevelRendererBrowserSectionCompileThrottle(node);
         patchLevelRendererBrowserBlockOutlineOpacity(node);
         patchLevelRendererBrowserBlockBreakingTelemetry(node);
         writeComputeFrames(node, output);
+    }
+
+    /**
+     * 26.2's render method prepares the chunk draw list before it advances the
+     * occlusion graph.  Advance the graph once immediately before that prepare
+     * call so a frame can consume a graph state published by an earlier async
+     * update; the original update later in the method remains intact for the
+     * normal profiler/lifecycle path.
+     */
+    private static void patchLevelRendererBrowserPrepareAfterOcclusionUpdate(ClassNode node) {
+        MethodNode render = node.methods.stream()
+                .filter(candidate -> candidate.name.equals("render")
+                        && candidate.desc.equals("(Lcom/mojang/blaze3d/resource/GraphicsResourceAllocator;"
+                                + "Lnet/minecraft/client/DeltaTracker;Z"
+                                + "Lnet/minecraft/client/renderer/state/level/CameraRenderState;"
+                                + "Lorg/joml/Matrix4fc;Lcom/mojang/blaze3d/buffers/GpuBufferSlice;"
+                                + "Lorg/joml/Vector4f;Z)V"))
+                .findFirst()
+                .orElse(null);
+        if (render == null) {
+            // 1.21.11 has no 26.2 render signature.
+            System.out.println("Skipped 26.2 early occlusion update: render shape not present");
+            return;
+        }
+        MethodInsnNode prepare = null;
+        for (AbstractInsnNode instruction : render.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                    && call.owner.equals("net/minecraft/client/renderer/LevelRenderer")
+                    && call.name.equals("prepareChunkRenders")
+                    && call.desc.equals("(Lorg/joml/Matrix4fc;)"
+                            + "Lnet/minecraft/client/renderer/chunk/ChunkSectionsToRender;")) {
+                if (prepare != null) {
+                    throw new IllegalStateException(
+                            "LevelRenderer.render has multiple prepareChunkRenders calls");
+                }
+                prepare = call;
+            }
+        }
+        if (prepare == null) {
+            // 1.21.11 uses a different render signature and does not have this
+            // 26.2 call shape; leave that profile untouched.
+            System.out.println("Skipped 26.2 early occlusion update: prepareChunkRenders shape not present");
+            return;
+        }
+        AbstractInsnNode anchor = previousOpcode(previousOpcode(previousOpcode(
+                previousOpcode(prepare))));
+        if (!(anchor instanceof VarInsnNode load)
+                || load.getOpcode() != Opcodes.ALOAD
+                || load.var != 0) {
+            throw new IllegalStateException(
+                    "LevelRenderer.render prepareChunkRenders receiver shape changed");
+        }
+        InsnList early = new InsnList();
+        early.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        early.add(new FieldInsnNode(Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/LevelRenderer",
+                "sectionOcclusionGraph",
+                "Lnet/minecraft/client/renderer/SectionOcclusionGraph;"));
+        early.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        early.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        early.add(new FieldInsnNode(Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/LevelRenderer",
+                "optionsRenderState",
+                "Lnet/minecraft/client/renderer/state/OptionsRenderState;"));
+        early.add(new FieldInsnNode(Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/state/OptionsRenderState",
+                "fov", "I"));
+        early.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        early.add(new FieldInsnNode(Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/LevelRenderer",
+                "levelRenderState",
+                "Lnet/minecraft/client/renderer/state/level/LevelRenderState;"));
+        early.add(new FieldInsnNode(Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/state/level/LevelRenderState",
+                "chunkLoadingRenderState",
+                "Lnet/minecraft/client/renderer/state/level/ChunkLoadingRenderState;"));
+        early.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/renderer/SectionOcclusionGraph",
+                "update",
+                "(Lnet/minecraft/client/renderer/state/level/CameraRenderState;"
+                        + "ILnet/minecraft/client/renderer/state/level/ChunkLoadingRenderState;)V",
+                false));
+        render.instructions.insertBefore(anchor, early);
+        System.out.println("Patched 26.2 early occlusion update before chunk prepare");
+    }
+
+    /**
+     * Rebuild the render-visible section lists after the occlusion graph publishes a
+     * frustum update.  The 26.2 browser render method updates the graph after preparing
+     * chunk draws, but the vanilla list refresh was absent from the transformed method;
+     * consequently visibleSections stayed at the initial seven columns while the player
+     * moved through newly loaded chunks.
+     */
+    private static void patchLevelRendererBrowserRefreshVisibleSections(ClassNode node) {
+        MethodNode render = node.methods.stream()
+                .filter(candidate -> candidate.name.equals("render")
+                        && candidate.desc.equals("(Lcom/mojang/blaze3d/resource/GraphicsResourceAllocator;"
+                                + "Lnet/minecraft/client/DeltaTracker;Z"
+                                + "Lnet/minecraft/client/renderer/state/level/CameraRenderState;"
+                                + "Lorg/joml/Matrix4fc;Lcom/mojang/blaze3d/buffers/GpuBufferSlice;"
+                                + "Lorg/joml/Vector4f;Z)V"))
+                .findFirst()
+                .orElse(null);
+        if (render == null) {
+            System.out.println("Skipped 26.2 visible section refresh: render shape not present");
+            return;
+        }
+        MethodInsnNode update = null;
+        for (AbstractInsnNode instruction : render.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                    && call.owner.equals("net/minecraft/client/renderer/SectionOcclusionGraph")
+                    && call.name.equals("update")
+                    && call.desc.equals("(Lnet/minecraft/client/renderer/state/level/CameraRenderState;"
+                            + "ILnet/minecraft/client/renderer/state/level/ChunkLoadingRenderState;)V")) {
+                update = call;
+            }
+        }
+        if (update == null) {
+            throw new IllegalStateException(
+                    "LevelRenderer.render SectionOcclusionGraph.update call was not found");
+        }
+        InsnList refresh = browserVisibleSectionRefreshInstructions();
+        render.instructions.insert(update, refresh);
+        System.out.println("Patched 26.2 visible section refresh after late occlusion update");
+    }
+
+    private static InsnList browserVisibleSectionRefreshInstructions() {
+        LabelNode done = new LabelNode();
+        InsnList refresh = new InsnList();
+        refresh.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        refresh.add(new FieldInsnNode(Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/LevelRenderer",
+                "sectionOcclusionGraph",
+                "Lnet/minecraft/client/renderer/SectionOcclusionGraph;"));
+        refresh.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/renderer/SectionOcclusionGraph",
+                "consumeFrustumUpdate", "()Z", false));
+        refresh.add(new JumpInsnNode(Opcodes.IFEQ, done));
+        refresh.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        refresh.add(new FieldInsnNode(Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/state/level/CameraRenderState",
+                "cullFrustum",
+                "Lnet/minecraft/client/renderer/culling/Frustum;"));
+        refresh.add(new JumpInsnNode(Opcodes.IFNULL, done));
+        refresh.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        refresh.add(new FieldInsnNode(Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/LevelRenderer",
+                "sectionOcclusionGraph",
+                "Lnet/minecraft/client/renderer/SectionOcclusionGraph;"));
+        refresh.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        refresh.add(new FieldInsnNode(Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/state/level/CameraRenderState",
+                "cullFrustum",
+                "Lnet/minecraft/client/renderer/culling/Frustum;"));
+        refresh.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        refresh.add(new FieldInsnNode(Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/LevelRenderer",
+                "visibleSections",
+                "Lit/unimi/dsi/fastutil/objects/ObjectArrayList;"));
+        refresh.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        refresh.add(new FieldInsnNode(Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/LevelRenderer",
+                "nearbyVisibleSections",
+                "Lit/unimi/dsi/fastutil/objects/ObjectArrayList;"));
+        refresh.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/renderer/SectionOcclusionGraph",
+                "addSectionsInFrustum",
+                "(Lnet/minecraft/client/renderer/culling/Frustum;Ljava/util/List;Ljava/util/List;)V",
+                false));
+        refresh.add(done);
+        return refresh;
     }
 
     private static void patchLevelRendererBrowserBlockBreakingTelemetry(ClassNode node) {
@@ -5454,6 +5648,68 @@ public final class MinecraftClientPatcher {
             throw new IllegalStateException(
                     "LevelRenderer breaking-model submit shape changed: " + actualSubmits);
         }
+    }
+
+    /** Keep the occlusion graph advancing while browser camera/frustum state is captured. */
+    private static void patchSectionOcclusionGraphBrowserMovementRefresh(
+            String jar, Path output) throws IOException {
+        String owner = "net/minecraft/client/renderer/SectionOcclusionGraph";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode update = find(node, "update",
+                "(Lnet/minecraft/client/renderer/state/level/CameraRenderState;"
+                        + "ILnet/minecraft/client/renderer/state/level/ChunkLoadingRenderState;)V");
+        int patched = 0;
+        for (AbstractInsnNode instruction : update.instructions.toArray()) {
+            if (!(instruction instanceof FieldInsnNode field)
+                    || field.getOpcode() != Opcodes.GETFIELD
+                    || !field.owner.equals(
+                            "net/minecraft/client/renderer/state/level/CameraRenderState")
+                    || !field.name.equals("isFrustumCaptured")
+                    || !field.desc.equals("Z")) {
+                continue;
+            }
+            AbstractInsnNode receiver = previousOpcode(instruction);
+            if (!(receiver instanceof VarInsnNode load)
+                    || load.getOpcode() != Opcodes.ALOAD
+                    || load.var != 1) {
+                throw new IOException(
+                        "SectionOcclusionGraph.update frustum receiver shape changed");
+            }
+            update.instructions.remove(receiver);
+            update.instructions.set(instruction, new InsnNode(Opcodes.ICONST_0));
+            patched++;
+        }
+        if (patched != 1) {
+            throw new IOException(
+                    "SectionOcclusionGraph.update frustum refresh patch point changed: "
+                            + patched);
+        }
+        // LevelExtractor only rebuilds LevelRenderer.visibleSections when it consumes
+        // this flag.  In the browser client the camera usually translates while its
+        // rotation remains unchanged, so the old captured-frustum path skips
+        // applyFrustum and leaves the initial seven chunk columns in the draw list.
+        patchSectionOcclusionGraphBrowserLoadedChunkRebuild(node);
+        writeComputeFrames(node, output);
+        System.out.println("Patched 26.2 movement occlusion refresh + frustum notify");
+    }
+
+    /** Rebuild the async graph when a browser stream adds a new chunk column. */
+    private static void patchSectionOcclusionGraphBrowserLoadedChunkRebuild(ClassNode node) {
+        MethodNode method = find(node, "updateLoadedChunks",
+                "(Lit/unimi/dsi/fastutil/longs/LongOpenHashSet;"
+                        + "Lit/unimi/dsi/fastutil/longs/LongOpenHashSet;)V");
+        InsnList guard = new InsnList();
+        LabelNode unchanged = new LabelNode();
+        guard.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        guard.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                "it/unimi/dsi/fastutil/longs/LongOpenHashSet", "isEmpty", "()Z", false));
+        guard.add(new JumpInsnNode(Opcodes.IFNE, unchanged));
+        guard.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        guard.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                node.name, "invalidate", "()V", false));
+        guard.add(unchanged);
+        method.instructions.insert(guard);
+        System.out.println("Patched 26.2 loaded-chunk graph rebuild");
     }
 
     private static void patchEntityRenderDispatcherBrowserNullEntityGuard(String jar, Path output)
@@ -5570,6 +5826,47 @@ public final class MinecraftClientPatcher {
         frameState.add(new VarInsnNode(Opcodes.LSTORE, frameMillisLocal));
         method.instructions.insert(frameState);
         method.instructions.set(millisCall, new VarInsnNode(Opcodes.LLOAD, frameMillisLocal));
+
+        // Capture the renderer-side inputs that determine whether the snapshot
+        // contains any terrain draws. This is diagnostic only and does not alter
+        // render distance, texture quality, or the section selection algorithm.
+        int prepareVisibleLocal = method.maxLocals;
+        int prepareMaxIndexLocal = prepareVisibleLocal + 1;
+        method.maxLocals += 2;
+        InsnList prepareStats = new InsnList();
+        prepareStats.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        prepareStats.add(new FieldInsnNode(Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/LevelRenderer",
+                "visibleSections",
+                "Lit/unimi/dsi/fastutil/objects/ObjectArrayList;"));
+        prepareStats.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                "it/unimi/dsi/fastutil/objects/ObjectArrayList",
+                "size", "()I", false));
+        prepareStats.add(new VarInsnNode(Opcodes.ISTORE, prepareVisibleLocal));
+        prepareStats.add(new InsnNode(Opcodes.ICONST_0));
+        prepareStats.add(new VarInsnNode(Opcodes.ISTORE, prepareMaxIndexLocal));
+        method.instructions.insert(prepareStats);
+        AbstractInsnNode returnNode = null;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction.getOpcode() == Opcodes.ARETURN) {
+                if (returnNode != null) {
+                    throw new IllegalStateException(
+                            "LevelRenderer.prepareChunkRenders has multiple returns");
+                }
+                returnNode = instruction;
+            }
+        }
+        if (returnNode == null) {
+            throw new IllegalStateException(
+                    "LevelRenderer.prepareChunkRenders return was not found");
+        }
+        InsnList emitStats = new InsnList();
+        emitStats.add(new VarInsnNode(Opcodes.ILOAD, prepareVisibleLocal));
+        emitStats.add(new VarInsnNode(Opcodes.ILOAD, prepareMaxIndexLocal));
+        emitStats.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserChunkDrawTelemetry",
+                "recordPrepareStats", "(II)V", false));
+        method.instructions.insertBefore(returnNode, emitStats);
         for (MethodInsnNode layerValuesCall : layerValuesCalls) {
             method.instructions.set(
                     layerValuesCall, new VarInsnNode(Opcodes.ALOAD, frameLayersLocal));
@@ -5625,6 +5922,150 @@ public final class MinecraftClientPatcher {
                             + replacements);
         }
         writeComputeFrames(node, output);
+    }
+
+    /**
+     * Lets a lit FULL center chunk compile before sparse browser delivery has supplied all eight
+     * horizontal neighbors. Vanilla invalidates the surrounding section range when another chunk's
+     * light becomes ready, so provisional edge meshes are rebuilt when those neighbors arrive.
+     */
+    private static void patchSectionNeighborReadiness(
+            String jar, Path outputRoot, String minecraftVersion) throws IOException {
+        boolean current;
+        if ("26.2".equals(minecraftVersion)) {
+            current = true;
+        } else if ("1.21.11".equals(minecraftVersion)) {
+            current = false;
+        } else {
+            throw new IOException("Unsupported section readiness profile " + minecraftVersion);
+        }
+        String owner = current
+                ? "net/minecraft/client/SectionUpdateTracker"
+                : "net/minecraft/client/renderer/chunk/SectionRenderDispatcher$RenderSection";
+        String entry = owner + ".class";
+        ClassNode node = read(jar, entry);
+        String gateDescriptor = current
+                ? "(Lnet/minecraft/client/multiplayer/ClientLevel;J)Z"
+                : "()Z";
+        String readinessDescriptor = current
+                ? "(Lnet/minecraft/client/multiplayer/ClientLevel;J)Z"
+                : "(J)Z";
+        MethodNode gate = requireSingleMethod(node, "hasAllNeighbors", gateDescriptor);
+        MethodNode readiness = requireSingleMethod(node, "doesChunkExistAt", readinessDescriptor);
+
+        int readinessCalls = 0;
+        int directionOffsets = 0;
+        int diagonalOffsets = 0;
+        int conditionalFailures = 0;
+        int sectionNodeReads = 0;
+        int cardinalDirections = 0;
+        for (AbstractInsnNode instruction : gate.instructions) {
+            if (instruction instanceof MethodInsnNode call) {
+                if (call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                        && call.owner.equals(owner)
+                        && call.name.equals("doesChunkExistAt")
+                        && call.desc.equals(readinessDescriptor)) {
+                    readinessCalls++;
+                } else if (call.getOpcode() == Opcodes.INVOKESTATIC
+                        && call.owner.equals("net/minecraft/core/SectionPos")
+                        && call.name.equals("offset")) {
+                    if (call.desc.equals("(JLnet/minecraft/core/Direction;)J")) {
+                        directionOffsets++;
+                    } else if (call.desc.equals("(JIII)J")) {
+                        diagonalOffsets++;
+                    }
+                }
+            } else if (instruction instanceof JumpInsnNode jump
+                    && jump.getOpcode() == Opcodes.IFEQ) {
+                conditionalFailures++;
+            } else if (instruction instanceof FieldInsnNode field) {
+                if (field.getOpcode() == Opcodes.GETSTATIC
+                        && field.owner.equals("net/minecraft/core/Direction")
+                        && field.desc.equals("Lnet/minecraft/core/Direction;")
+                        && (field.name.equals("WEST") || field.name.equals("NORTH")
+                                || field.name.equals("EAST") || field.name.equals("SOUTH"))) {
+                    cardinalDirections++;
+                }
+                if (!current
+                        && field.getOpcode() == Opcodes.GETFIELD
+                        && field.owner.equals(owner)
+                        && field.name.equals("sectionNode")
+                        && field.desc.equals("J")) {
+                    sectionNodeReads++;
+                }
+            }
+        }
+        if (readinessCalls != 8 || directionOffsets != 4 || diagonalOffsets != 4
+                || conditionalFailures != 8 || cardinalDirections != 4
+                || (!current && sectionNodeReads != 8)) {
+            throw new IOException("Section neighbor readiness shape changed for " + minecraftVersion
+                    + ": readinessCalls=" + readinessCalls
+                    + ", directionOffsets=" + directionOffsets
+                    + ", diagonalOffsets=" + diagonalOffsets
+                    + ", conditionalFailures=" + conditionalFailures
+                    + ", cardinalDirections=" + cardinalDirections
+                    + ", sectionNodeReads=" + sectionNodeReads);
+        }
+
+        int chunkLookups = 0;
+        int lightLookups = 0;
+        for (AbstractInsnNode instruction : readiness.instructions) {
+            if (!(instruction instanceof MethodInsnNode call)) {
+                continue;
+            }
+            if (call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                    && call.owner.equals("net/minecraft/client/multiplayer/ClientLevel")
+                    && call.name.equals("getChunk")
+                    && call.desc.equals("(IILnet/minecraft/world/level/chunk/status/ChunkStatus;Z)"
+                            + "Lnet/minecraft/world/level/chunk/ChunkAccess;")) {
+                chunkLookups++;
+            } else if (call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                    && call.owner.equals("net/minecraft/world/level/lighting/LevelLightEngine")
+                    && call.name.equals("lightOnInColumn")
+                    && call.desc.equals("(J)Z")) {
+                lightLookups++;
+            }
+        }
+        if (chunkLookups != 1 || lightLookups != 1) {
+            throw new IOException("Center chunk readiness helper changed for " + minecraftVersion
+                    + ": chunkLookups=" + chunkLookups + ", lightLookups=" + lightLookups);
+        }
+
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        if (current) {
+            code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+            code.add(new VarInsnNode(Opcodes.LLOAD, 2));
+        } else {
+            code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "sectionNode", "J"));
+        }
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                owner,
+                "doesChunkExistAt",
+                readinessDescriptor,
+                false));
+        code.add(new InsnNode(Opcodes.IRETURN));
+        replace(gate, code, current ? 4 : 3, current ? 4 : 1);
+        writeComputeFrames(node, outputRoot.resolve(entry));
+    }
+
+    private static MethodNode requireSingleMethod(
+            ClassNode node, String name, String descriptor) throws IOException {
+        MethodNode match = null;
+        int matches = 0;
+        for (MethodNode method : node.methods) {
+            if (method.name.equals(name) && method.desc.equals(descriptor)) {
+                match = method;
+                matches++;
+            }
+        }
+        if (matches != 1) {
+            throw new IOException(node.name + "." + name + descriptor
+                    + " expected exactly once but found " + matches);
+        }
+        return match;
     }
 
     private static int replaceSectionCoordinateCalls(
@@ -5892,6 +6333,7 @@ public final class MinecraftClientPatcher {
                 "extract",
                 "(Lnet/minecraft/client/DeltaTracker;Lnet/minecraft/client/Camera;F)V");
         patchCurrentLevelExtractorBlockBreakingTelemetry(node);
+        patchLevelExtractorBrowserConsumeFrustumBeforeCapturedGuard(node, extract);
         int patched = 0;
         for (AbstractInsnNode instruction : extract.instructions.toArray()) {
             if (!(instruction instanceof MethodInsnNode add)
@@ -5983,6 +6425,44 @@ public final class MinecraftClientPatcher {
         }
         writeComputeFrames(node, output);
         System.out.println("Patched current section extraction with dirty-preserving backpressure");
+    }
+
+    /**
+     * The captured-frustum fast path skips the normal consume/apply branch.  Browser camera
+     * movement commonly changes only position, so force the graph's pending update through the
+     * same applyFrustum path before that guard.  This preserves the normal frustum and section
+     * lists while avoiding any render-distance or texture-quality changes.
+     */
+    private static void patchLevelExtractorBrowserConsumeFrustumBeforeCapturedGuard(
+            ClassNode node, MethodNode extract) {
+        MethodInsnNode captured = null;
+        for (AbstractInsnNode instruction : extract.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                    && call.owner.equals("net/minecraft/client/Camera")
+                    && call.name.equals("getCapturedFrustum")
+                    && call.desc.equals("()Lnet/minecraft/client/renderer/culling/Frustum;")) {
+                if (captured != null) {
+                    throw new IllegalStateException(
+                            "LevelExtractor has multiple captured-frustum guards");
+                }
+                captured = call;
+            }
+        }
+        if (captured == null) {
+            throw new IllegalStateException(
+                    "LevelExtractor captured-frustum guard was not found");
+        }
+        AbstractInsnNode guard = nextOpcode(captured);
+        if (!(guard instanceof JumpInsnNode jump) || jump.getOpcode() != Opcodes.IFNONNULL) {
+            throw new IllegalStateException("LevelExtractor captured-frustum guard shape changed");
+        }
+        // The browser's captured frustum is retained across camera translation and makes
+        // vanilla skip the existing consume/apply path. Remove only this stale-cache short
+        // circuit; the normal graph and frustum implementation remains unchanged.
+        extract.instructions.remove(captured);
+        extract.instructions.remove(guard);
+        System.out.println("Patched LevelExtractor captured-frustum short circuit");
     }
 
     private static void patchCurrentLevelExtractorBlockBreakingTelemetry(ClassNode node) {
@@ -10000,55 +10480,6 @@ public final class MinecraftClientPatcher {
         write(node, output);
     }
 
-    private static void patchBlockableEventLoopBrowser(String jar, Path output) throws IOException {
-        ClassNode node = read(jar, "net/minecraft/util/thread/BlockableEventLoop.class");
-        MethodNode method = find(node, "doRunTask", "(Ljava/lang/Runnable;)V");
-        LabelNode start = new LabelNode();
-        LabelNode end = new LabelNode();
-        LabelNode handler = new LabelNode();
-        int enteredLocal = 2;
-        int throwableLocal = 3;
-        InsnList code = new InsnList();
-        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKESTATIC,
-                "dev/gaius/browser/BrowserIntegratedServerMain",
-                "beginScheduledNetworkInputTask",
-                "(Ljava/lang/Runnable;)Z",
-                false));
-        code.add(new VarInsnNode(Opcodes.ISTORE, enteredLocal));
-        code.add(start);
-        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
-        code.add(new MethodInsnNode(Opcodes.INVOKEINTERFACE, "java/lang/Runnable", "run", "()V", true));
-        code.add(end);
-        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
-        code.add(new VarInsnNode(Opcodes.ILOAD, enteredLocal));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKESTATIC,
-                "dev/gaius/browser/BrowserIntegratedServerMain",
-                "endScheduledNetworkInputTask",
-                "(Ljava/lang/Runnable;Z)V",
-                false));
-        code.add(new InsnNode(Opcodes.RETURN));
-        code.add(handler);
-        code.add(new VarInsnNode(Opcodes.ASTORE, throwableLocal));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
-        code.add(new VarInsnNode(Opcodes.ILOAD, enteredLocal));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKESTATIC,
-                "dev/gaius/browser/BrowserIntegratedServerMain",
-                "endScheduledNetworkInputTask",
-                "(Ljava/lang/Runnable;Z)V",
-                false));
-        code.add(new VarInsnNode(Opcodes.ALOAD, throwableLocal));
-        code.add(new InsnNode(Opcodes.ATHROW));
-        replace(method, code, 2, 4);
-        method.tryCatchBlocks.clear();
-        method.tryCatchBlocks.add(new TryCatchBlockNode(start, end, handler, "java/lang/Throwable"));
-        method.maxStack = Math.max(method.maxStack, 2);
-        writeComputeFrames(node, output);
-    }
-
     private static void patchUtilRunNamedBrowserOutput(Path output) throws IOException {
         ClassNode node = new ClassNode();
         new ClassReader(Files.readAllBytes(output)).accept(node, 0);
@@ -10148,6 +10579,55 @@ public final class MinecraftClientPatcher {
         directExecutor.add(new InsnNode(Opcodes.ARETURN));
         replace(forName, directExecutor, 1, 2);
         write(node, output);
+    }
+
+    private static void patchBlockableEventLoopBrowser(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, "net/minecraft/util/thread/BlockableEventLoop.class");
+        MethodNode method = find(node, "doRunTask", "(Ljava/lang/Runnable;)V");
+        LabelNode start = new LabelNode();
+        LabelNode end = new LabelNode();
+        LabelNode handler = new LabelNode();
+        int enteredLocal = 2;
+        int throwableLocal = 3;
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserIntegratedServerMain",
+                "beginScheduledNetworkInputTask",
+                "(Ljava/lang/Runnable;)Z",
+                false));
+        code.add(new VarInsnNode(Opcodes.ISTORE, enteredLocal));
+        code.add(start);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(Opcodes.INVOKEINTERFACE, "java/lang/Runnable", "run", "()V", true));
+        code.add(end);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new VarInsnNode(Opcodes.ILOAD, enteredLocal));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserIntegratedServerMain",
+                "endScheduledNetworkInputTask",
+                "(Ljava/lang/Runnable;Z)V",
+                false));
+        code.add(new InsnNode(Opcodes.RETURN));
+        code.add(handler);
+        code.add(new VarInsnNode(Opcodes.ASTORE, throwableLocal));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new VarInsnNode(Opcodes.ILOAD, enteredLocal));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserIntegratedServerMain",
+                "endScheduledNetworkInputTask",
+                "(Ljava/lang/Runnable;Z)V",
+                false));
+        code.add(new VarInsnNode(Opcodes.ALOAD, throwableLocal));
+        code.add(new InsnNode(Opcodes.ATHROW));
+        replace(method, code, 2, 4);
+        method.tryCatchBlocks.clear();
+        method.tryCatchBlocks.add(new TryCatchBlockNode(start, end, handler, "java/lang/Throwable"));
+        method.maxStack = Math.max(method.maxStack, 2);
+        writeComputeFrames(node, output);
     }
 
     private static void patchMacosUtil(String jar, Path output) throws IOException {
@@ -11594,6 +12074,7 @@ public final class MinecraftClientPatcher {
         int urlLocal = resourcePack.maxLocals++;
         LabelNode vanillaResourcePackHandling = new LabelNode();
         InsnList requiredPack = new InsnList();
+        // Recommended packs retain vanilla consent; required packs use the real loader.
         requiredPack.add(new VarInsnNode(Opcodes.ALOAD, 1));
         requiredPack.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL,
@@ -11680,6 +12161,7 @@ public final class MinecraftClientPatcher {
                 false));
         requiredPack.add(new InsnNode(Opcodes.RETURN));
         requiredPack.add(vanillaResourcePackHandling);
+        // Download/reload state belongs to the client thread, like vanilla.
         resourcePack.instructions.insert(threadCheck, requiredPack);
         resourcePack.maxStack = Math.max(resourcePack.maxStack, 4);
 
@@ -11856,165 +12338,6 @@ public final class MinecraftClientPatcher {
         writeComputeFrames(node, output);
     }
 
-    /**
-     * Server packs can take tens of seconds to rebuild on the browser main thread after their
-     * bytes and SHA-1 are already verified. Let configuration finish at that verified boundary;
-     * RelayNode keeps PLAY alive while the foreground reload completes. Suppress only the later
-     * duplicate APPLIED result, while preserving real activation failures.
-     */
-    private static void patchEarlyBrowserServerPackSuccess(String jar, Path output)
-            throws IOException {
-        String owner = "net/minecraft/client/resources/server/DownloadedPackSource$6";
-        ClassNode node = read(jar, owner + ".class");
-        node.fields.add(new FieldNode(
-                Opcodes.ACC_PRIVATE | Opcodes.ACC_FINAL,
-                "browserEarlyApplied",
-                "Ljava/util/Set;",
-                "Ljava/util/Set<Ljava/util/UUID;>;",
-                null));
-
-        MethodNode constructor = find(node, "<init>",
-                "(Lnet/minecraft/network/Connection;)V");
-        if (constructor == null) {
-            throw new IOException("DownloadedPackSource response sender constructor was not found");
-        }
-        MethodInsnNode superCall = null;
-        for (AbstractInsnNode instruction = constructor.instructions.getFirst();
-                instruction != null;
-                instruction = instruction.getNext()) {
-            if (instruction instanceof MethodInsnNode call
-                    && call.getOpcode() == Opcodes.INVOKESPECIAL
-                    && call.name.equals("<init>")) {
-                superCall = call;
-                break;
-            }
-        }
-        if (superCall == null) {
-            throw new IOException("DownloadedPackSource response sender super call was not found");
-        }
-        InsnList initialize = new InsnList();
-        initialize.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        initialize.add(new TypeInsnNode(Opcodes.NEW, "java/util/HashSet"));
-        initialize.add(new InsnNode(Opcodes.DUP));
-        initialize.add(new MethodInsnNode(
-                Opcodes.INVOKESPECIAL, "java/util/HashSet", "<init>", "()V", false));
-        initialize.add(new FieldInsnNode(
-                Opcodes.PUTFIELD, owner, "browserEarlyApplied", "Ljava/util/Set;"));
-        constructor.instructions.insert(superCall, initialize);
-
-        MethodNode reportUpdate = find(node, "reportUpdate",
-                "(Ljava/util/UUID;Lnet/minecraft/client/resources/server/"
-                        + "PackLoadFeedback$Update;)V");
-        if (reportUpdate == null) {
-            throw new IOException("DownloadedPackSource reportUpdate was not found");
-        }
-        AbstractInsnNode updateReturn = reportUpdate.instructions.getLast();
-        while (updateReturn != null && updateReturn.getOpcode() != Opcodes.RETURN) {
-            updateReturn = updateReturn.getPrevious();
-        }
-        if (updateReturn == null) {
-            throw new IOException("DownloadedPackSource reportUpdate return was not found");
-        }
-        LabelNode updateDone = new LabelNode();
-        InsnList earlySuccess = new InsnList();
-        earlySuccess.add(new VarInsnNode(Opcodes.ALOAD, 2));
-        earlySuccess.add(new FieldInsnNode(
-                Opcodes.GETSTATIC,
-                "net/minecraft/client/resources/server/PackLoadFeedback$Update",
-                "DOWNLOADED",
-                "Lnet/minecraft/client/resources/server/PackLoadFeedback$Update;"));
-        earlySuccess.add(new JumpInsnNode(Opcodes.IF_ACMPNE, updateDone));
-        earlySuccess.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        earlySuccess.add(new FieldInsnNode(
-                Opcodes.GETFIELD, owner, "browserEarlyApplied", "Ljava/util/Set;"));
-        earlySuccess.add(new VarInsnNode(Opcodes.ALOAD, 1));
-        earlySuccess.add(new MethodInsnNode(
-                Opcodes.INVOKEINTERFACE,
-                "java/util/Set",
-                "add",
-                "(Ljava/lang/Object;)Z",
-                true));
-        earlySuccess.add(new InsnNode(Opcodes.POP));
-        earlySuccess.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        earlySuccess.add(new FieldInsnNode(
-                Opcodes.GETFIELD,
-                owner,
-                "val$connection",
-                "Lnet/minecraft/network/Connection;"));
-        earlySuccess.add(new TypeInsnNode(
-                Opcodes.NEW,
-                "net/minecraft/network/protocol/common/ServerboundResourcePackPacket"));
-        earlySuccess.add(new InsnNode(Opcodes.DUP));
-        earlySuccess.add(new VarInsnNode(Opcodes.ALOAD, 1));
-        earlySuccess.add(new FieldInsnNode(
-                Opcodes.GETSTATIC,
-                "net/minecraft/network/protocol/common/ServerboundResourcePackPacket$Action",
-                "SUCCESSFULLY_LOADED",
-                "Lnet/minecraft/network/protocol/common/ServerboundResourcePackPacket$Action;"));
-        earlySuccess.add(new MethodInsnNode(
-                Opcodes.INVOKESPECIAL,
-                "net/minecraft/network/protocol/common/ServerboundResourcePackPacket",
-                "<init>",
-                "(Ljava/util/UUID;Lnet/minecraft/network/protocol/common/"
-                        + "ServerboundResourcePackPacket$Action;)V",
-                false));
-        earlySuccess.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL,
-                "net/minecraft/network/Connection",
-                "send",
-                "(Lnet/minecraft/network/protocol/Packet;)V",
-                false));
-        earlySuccess.add(updateDone);
-        reportUpdate.instructions.insertBefore(updateReturn, earlySuccess);
-
-        MethodNode reportFinal = find(node, "reportFinalResult",
-                "(Ljava/util/UUID;Lnet/minecraft/client/resources/server/"
-                        + "PackLoadFeedback$FinalResult;)V");
-        if (reportFinal == null) {
-            throw new IOException("DownloadedPackSource reportFinalResult was not found");
-        }
-        LabelNode reportVanilla = new LabelNode();
-        InsnList suppressDuplicate = new InsnList();
-        LabelNode reportInstanceResult = new LabelNode();
-        suppressDuplicate.add(new VarInsnNode(Opcodes.ALOAD, 1));
-        suppressDuplicate.add(new VarInsnNode(Opcodes.ALOAD, 2));
-        suppressDuplicate.add(new MethodInsnNode(
-                Opcodes.INVOKESTATIC,
-                "dev/gaius/browser/BrowserServerPackReuse",
-                "suppressEarlyApplied",
-                "(Ljava/util/UUID;Lnet/minecraft/client/resources/server/"
-                        + "PackLoadFeedback$FinalResult;)Z",
-                false));
-        suppressDuplicate.add(new JumpInsnNode(Opcodes.IFEQ, reportInstanceResult));
-        suppressDuplicate.add(new InsnNode(Opcodes.RETURN));
-        suppressDuplicate.add(reportInstanceResult);
-        suppressDuplicate.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        suppressDuplicate.add(new FieldInsnNode(
-                Opcodes.GETFIELD, owner, "browserEarlyApplied", "Ljava/util/Set;"));
-        suppressDuplicate.add(new VarInsnNode(Opcodes.ALOAD, 1));
-        suppressDuplicate.add(new MethodInsnNode(
-                Opcodes.INVOKEINTERFACE,
-                "java/util/Set",
-                "remove",
-                "(Ljava/lang/Object;)Z",
-                true));
-        suppressDuplicate.add(new VarInsnNode(Opcodes.ISTORE, 3));
-        suppressDuplicate.add(new VarInsnNode(Opcodes.ALOAD, 2));
-        suppressDuplicate.add(new FieldInsnNode(
-                Opcodes.GETSTATIC,
-                "net/minecraft/client/resources/server/PackLoadFeedback$FinalResult",
-                "APPLIED",
-                "Lnet/minecraft/client/resources/server/PackLoadFeedback$FinalResult;"));
-        suppressDuplicate.add(new JumpInsnNode(Opcodes.IF_ACMPNE, reportVanilla));
-        suppressDuplicate.add(new VarInsnNode(Opcodes.ILOAD, 3));
-        suppressDuplicate.add(new JumpInsnNode(Opcodes.IFEQ, reportVanilla));
-        suppressDuplicate.add(new InsnNode(Opcodes.RETURN));
-        suppressDuplicate.add(reportVanilla);
-        reportFinal.instructions.insert(suppressDuplicate);
-        reportFinal.maxLocals = Math.max(reportFinal.maxLocals, 4);
-        writeComputeFrames(node, output);
-    }
-
     private static boolean allExactlyOne(int[] values) {
         for (int value : values) {
             if (value != 1) {
@@ -12058,6 +12381,8 @@ public final class MinecraftClientPatcher {
         LabelNode inline = new LabelNode();
         LabelNode queuedHandleReturn = new LabelNode();
         LabelNode vanillaScheduling = new LabelNode();
+        LabelNode clientDispatch = new LabelNode();
+        LabelNode workerServerQueueGuard = new LabelNode();
         LabelNode playListener = new LabelNode();
         LabelNode commonBacklogCheck = new LabelNode();
         String[] transitionPacketTypes = {
@@ -12092,6 +12417,32 @@ public final class MinecraftClientPatcher {
                 "RUNNING_ON_DIFFERENT_THREAD",
                 "Lnet/minecraft/server/RunningOnDifferentThreadException;");
         InsnList code = new InsnList();
+        /*
+         * A Worker decoder and the integrated server continuation share one TeaVM Java-thread
+         * identity. Vanilla's isSameThread fast path would therefore run every serverbound
+         * handler inside the raw WebSocket pump. Force those packets onto the server's exact
+         * PacketProcessor FIFO first. The owner-specific guard is deliberately before the
+         * listener classifiers: ListenerAndPacket.handle re-enters PacketUtils and must return
+         * for this same processor instead of appending a duplicate packet.
+         */
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserIntegratedServerMain",
+                "isWorkerServer",
+                "()Z",
+                false));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, clientDispatch));
+        code.add(workerServerQueueGuard);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserPacketScheduler",
+                "isProcessingQueuedPacket",
+                "(Ljava/lang/Object;)Z",
+                false));
+        code.add(new JumpInsnNode(Opcodes.IFNE, queuedHandleReturn));
+        code.add(new JumpInsnNode(Opcodes.GOTO, forcedPlayQueue));
+        code.add(clientDispatch);
         code.add(new VarInsnNode(Opcodes.ALOAD, 1));
         code.add(new TypeInsnNode(Opcodes.INSTANCEOF,
                 "net/minecraft/client/multiplayer/ClientConfigurationPacketListenerImpl"));
@@ -12177,6 +12528,8 @@ public final class MinecraftClientPatcher {
         int[] commonPlayPacketBranches = new int[commonInlinePacketTypes.length];
         int clientPlayBranches = 0;
         int queuedDrainGuardCalls = 0;
+        int workerServerChecks = 0;
+        int workerServerDrainGuardCalls = 0;
         int transitionBacklogChecks = 0;
         int commonBacklogChecks = 0;
         MethodInsnNode inlineHook = null;
@@ -12196,13 +12549,27 @@ public final class MinecraftClientPatcher {
             }
             if (instruction instanceof MethodInsnNode call
                     && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("dev/gaius/browser/BrowserIntegratedServerMain")
+                    && call.name.equals("isWorkerServer")
+                    && call.desc.equals("()Z")
+                    && nextOpcode(call) instanceof JumpInsnNode branch
+                    && branch.getOpcode() == Opcodes.IFEQ
+                    && branch.label == clientDispatch) {
+                workerServerChecks++;
+            }
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
                     && call.owner.equals("dev/gaius/browser/BrowserPacketScheduler")
                     && call.name.equals("isProcessingQueuedPacket")
                     && call.desc.equals("(Ljava/lang/Object;)Z")
                     && nextOpcode(call) instanceof JumpInsnNode branch
                     && branch.getOpcode() == Opcodes.IFNE
                     && branch.label == queuedHandleReturn) {
-                queuedDrainGuardCalls++;
+                if (currentBlock == workerServerQueueGuard) {
+                    workerServerDrainGuardCalls++;
+                } else {
+                    queuedDrainGuardCalls++;
+                }
             }
             if (instruction instanceof MethodInsnNode call
                     && call.getOpcode() == Opcodes.INVOKESTATIC
@@ -12269,6 +12636,8 @@ public final class MinecraftClientPatcher {
                 || !allExactlyOne(commonPlayPacketBranches)
                 || clientPlayBranches != 1
                 || queuedDrainGuardCalls != 1
+                || workerServerChecks != 1
+                || workerServerDrainGuardCalls != 1
                 || transitionBacklogChecks != 1
                 || commonBacklogChecks != 1
                 || queuedReturn == null
@@ -12285,6 +12654,8 @@ public final class MinecraftClientPatcher {
                             + ", commonPlayPackets=" + counts(commonPlayPacketBranches)
                             + ", clientPlay=" + clientPlayBranches
                             + ", drainGuard=" + queuedDrainGuardCalls
+                            + ", workerServer=" + workerServerChecks
+                            + ", workerServerDrainGuard=" + workerServerDrainGuardCalls
                             + ", transitionBacklog=" + transitionBacklogChecks
                             + ", commonBacklog=" + commonBacklogChecks);
         }
@@ -12324,10 +12695,23 @@ public final class MinecraftClientPatcher {
         LabelNode loop = new LabelNode();
         LabelNode done = new LabelNode();
         LabelNode vanilla = new LabelNode();
+        LabelNode reentrantReturn = new LabelNode();
         LabelNode handleStart = new LabelNode();
         LabelNode handleEnd = new LabelNode();
         LabelNode handleFailure = new LabelNode();
+
         InsnList code = new InsnList();
+        // A queued packet handler may synchronously pump the same PacketProcessor.  Returning
+        // here preserves the outer FIFO drain; falling through to the vanilla method would
+        // recurse into the same queue while its owner ledger is still active.
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserPacketScheduler",
+                "isProcessingQueuedPacket",
+                "(Ljava/lang/Object;)Z",
+                false));
+        code.add(new JumpInsnNode(Opcodes.IFNE, reentrantReturn));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
@@ -12410,6 +12794,8 @@ public final class MinecraftClientPatcher {
                 vanillaFallbackName,
                 "()V",
                 false));
+        code.add(new InsnNode(Opcodes.RETURN));
+        code.add(reentrantReturn);
         code.add(new InsnNode(Opcodes.RETURN));
         replace(method, code, 2, 3);
         method.tryCatchBlocks.add(new TryCatchBlockNode(
@@ -13181,7 +13567,141 @@ public final class MinecraftClientPatcher {
         System.out.println("Released 26.2 static sprite NativeImages after atlas upload");
     }
 
-    /** Labels the handful of large vanilla continuations that dominate custom resource-pack stalls. */
+    /** Avoids scanning every sparse bitmap provider for each fallback glyph. */
+    private static void patchFontProviderSelectionIndex(String jar, Path root) throws IOException {
+        String owner = "net/minecraft/client/gui/font/FontSet";
+        String helper = "dev/gaius/browser/BrowserFontProviderIndex";
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode select = find(node, "selectProviders", "(Ljava/util/List;Ljava/util/Set;)Ljava/util/List;");
+        if (select == null) throw new IOException("FontSet selectProviders not found");
+        int wraps = 0, iterators = 0;
+        for (AbstractInsnNode instruction : select.instructions.toArray()) {
+            if (instruction instanceof InvokeDynamicInsnNode dynamic
+                    && dynamic.desc.equals("(L" + owner + ";Ljava/util/List;Ljava/util/Set;)Lit/unimi/dsi/fastutil/ints/IntConsumer;")) {
+                // The operands already on the stack are (FontSet, providers, usedSet).
+                // Temporarily save usedSet and wrap only the captured providers list.
+                int used = select.maxLocals++;
+                InsnList wrap = new InsnList();
+                wrap.add(new VarInsnNode(Opcodes.ASTORE, used));
+                wrap.add(new MethodInsnNode(Opcodes.INVOKESTATIC, helper, "wrap",
+                        "(Ljava/util/List;)Ljava/util/List;", false));
+                wrap.add(new VarInsnNode(Opcodes.ALOAD, used));
+                select.instructions.insertBefore(dynamic, wrap);
+                wraps++;
+            }
+        }
+        for (MethodNode method : node.methods) {
+            if (!method.name.startsWith("lambda$selectProviders$")
+                    || !method.desc.equals("(Ljava/util/List;Ljava/util/Set;I)V")
+                    || (method.access & Opcodes.ACC_STATIC) != 0) continue;
+            for (AbstractInsnNode instruction : method.instructions.toArray()) {
+                if (instruction instanceof MethodInsnNode call && call.owner.equals("java/util/List")
+                        && call.name.equals("iterator") && call.desc.equals("()Ljava/util/Iterator;")) {
+                    method.instructions.insertBefore(call, new VarInsnNode(Opcodes.ILOAD, 3));
+                    call.setOpcode(Opcodes.INVOKESTATIC);
+                    call.owner = helper;
+                    call.name = "iterator";
+                    call.desc = "(Ljava/util/List;I)Ljava/util/Iterator;";
+                    call.itf = false;
+                    iterators++;
+                }
+            }
+        }
+        if (wraps != 1 || iterators != 1) {
+            throw new IOException("Expected one font provider capture/iterator, found " + wraps + "/" + iterators);
+        }
+        writeComputeFrames(node, root.resolve(owner + ".class"));
+    }
+
+    private static void patchBitmapFontImageSharing(String jar, Path root) throws IOException {
+        String base = "net/minecraft/client/gui/font/providers/BitmapProvider";
+        String image = "com/mojang/blaze3d/platform/NativeImage";
+        String cache = "dev/gaius/browser/BrowserFontBitmapCache";
+        ClassNode definition = read(jar, base + "$Definition.class");
+        MethodNode load = find(definition, "load",
+                "(Lnet/minecraft/server/packs/resources/ResourceManager;)Lcom/mojang/blaze3d/font/GlyphProvider;");
+        if (load == null) throw new IOException("Bitmap definition load not found");
+        int acquired = load.maxLocals++;
+        int thrown = load.maxLocals++;
+        LabelNode start = new LabelNode(), end = new LabelNode(), handler = new LabelNode();
+        InsnList initialize = new InsnList();
+        initialize.add(new InsnNode(Opcodes.ACONST_NULL));
+        initialize.add(new VarInsnNode(Opcodes.ASTORE, acquired));
+        initialize.add(start);
+        load.instructions.insert(initialize);
+        int reads = 0;
+        boolean hasHolder = false;
+        for (AbstractInsnNode instruction : load.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call && call.owner.equals(image)
+                    && call.name.equals("read") && call.desc.equals(
+                    "(Lcom/mojang/blaze3d/platform/NativeImage$Format;Ljava/io/InputStream;)L" + image + ";")) {
+                InsnList args = new InsnList();
+                args.add(new VarInsnNode(Opcodes.ALOAD, 1));
+                args.add(new VarInsnNode(Opcodes.ALOAD, 2));
+                load.instructions.insertBefore(call, args);
+                call.owner = cache;
+                call.desc = "(Lcom/mojang/blaze3d/platform/NativeImage$Format;Ljava/io/InputStream;"
+                        + "Ljava/lang/Object;Ljava/lang/Object;)L" + image + ";";
+                InsnList save = new InsnList();
+                save.add(new InsnNode(Opcodes.DUP));
+                save.add(new VarInsnNode(Opcodes.ASTORE, acquired));
+                load.instructions.insert(call, save);
+                reads++;
+            }
+            if (instruction instanceof MethodInsnNode call && call.owner.equals(base + "$ImageDataHolder")
+                    && call.name.equals("<init>")) {
+                InsnList share = new InsnList();
+                share.add(new VarInsnNode(Opcodes.ALOAD, acquired));
+                share.add(new MethodInsnNode(Opcodes.INVOKESTATIC, cache, "shareHolder",
+                        "(Ljava/lang/Object;L" + image + ";)Ljava/lang/Object;", false));
+                share.add(new TypeInsnNode(Opcodes.CHECKCAST, base + "$ImageDataHolder"));
+                load.instructions.insert(call, share);
+                hasHolder = true;
+            }
+        }
+        if (reads != 1) throw new IOException("Expected one bitmap NativeImage.read, found " + reads);
+        load.instructions.add(end);
+        load.instructions.add(handler);
+        load.instructions.add(new VarInsnNode(Opcodes.ASTORE, thrown));
+        load.instructions.add(new VarInsnNode(Opcodes.ALOAD, acquired));
+        load.instructions.add(new MethodInsnNode(Opcodes.INVOKESTATIC, cache, "release",
+                "(L" + image + ";)V", false));
+        load.instructions.add(new VarInsnNode(Opcodes.ALOAD, thrown));
+        load.instructions.add(new InsnNode(Opcodes.ATHROW));
+        load.tryCatchBlocks.add(new TryCatchBlockNode(start, end, handler, "java/lang/Throwable"));
+        writeComputeFrames(definition, root.resolve(base + "$Definition.class"));
+
+        ClassNode provider = read(jar, base + ".class");
+        provider.fields.add(new FieldNode(Opcodes.ACC_PRIVATE, "gaiusBitmapClosed", "Z", null, null));
+        MethodNode close = find(provider, "close", "()V");
+        LabelNode firstClose = new LabelNode();
+        InsnList guard = new InsnList();
+        guard.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        guard.add(new FieldInsnNode(Opcodes.GETFIELD, base, "gaiusBitmapClosed", "Z"));
+        guard.add(new JumpInsnNode(Opcodes.IFEQ, firstClose));
+        guard.add(new InsnNode(Opcodes.RETURN));
+        guard.add(firstClose);
+        guard.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        guard.add(new InsnNode(Opcodes.ICONST_1));
+        guard.add(new FieldInsnNode(Opcodes.PUTFIELD, base, "gaiusBitmapClosed", "Z"));
+        AbstractInsnNode guardEnd = guard.getLast();
+        close.instructions.insert(guard);
+        ClassNode owner = hasHolder ? read(jar, base + "$ImageDataHolder.class") : provider;
+        MethodNode ownerClose = find(owner, "close", "()V");
+        LabelNode finalOwner = new LabelNode();
+        InsnList release = new InsnList();
+        release.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        release.add(new FieldInsnNode(Opcodes.GETFIELD, owner.name, "image", "L" + image + ";"));
+        release.add(new MethodInsnNode(Opcodes.INVOKESTATIC, cache, "releaseOwnership", "(L" + image + ";)Z", false));
+        release.add(new JumpInsnNode(Opcodes.IFNE, finalOwner));
+        release.add(new InsnNode(Opcodes.RETURN));
+        release.add(finalOwner);
+        if (hasHolder) ownerClose.instructions.insert(release);
+        else close.instructions.insert(guardEnd, release);
+        writeComputeFrames(provider, root.resolve(base + ".class"));
+        if (hasHolder) writeComputeFrames(owner, root.resolve(base + "$ImageDataHolder.class"));
+    }
+
     private static void patchResourceReloadTaskLabels(String jar, Path modelOutput, Path fontOutput)
             throws IOException {
         ClassNode modelManager = read(jar, "net/minecraft/client/resources/model/ModelManager.class");
@@ -18783,10 +19303,7 @@ public final class MinecraftClientPatcher {
                 find(ready, "spawn", "(Lnet/minecraft/network/Connection;"
                         + "Lnet/minecraft/server/network/CommonListenerCookie;)"
                         + "Lnet/minecraft/server/level/ServerPlayer;"),
-                "net/minecraft/server/level/ServerLevel",
-                "waitForEntities",
-                3,
-                0);
+                "net/minecraft/server/level/ServerLevel", "waitForEntities", 3, 0);
         write(ready, root.resolve(readyOwner + ".class"));
     }
 
@@ -19049,18 +19566,172 @@ public final class MinecraftClientPatcher {
                             + activations);
         }
         chunkBatch.maxStack = Math.max(chunkBatch.maxStack, 1);
+
+        MethodNode movePlayer = find(
+                node,
+                "handleMovePlayer",
+                "(Lnet/minecraft/network/protocol/game/ServerboundMovePlayerPacket;)V");
+        LabelNode vanillaMovement = new LabelNode();
+        InsnList browserMovement = new InsnList();
+        browserMovement.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserIntegratedServerMain",
+                "isWorkerServer",
+                "()Z",
+                false));
+        browserMovement.add(new JumpInsnNode(Opcodes.IFEQ, vanillaMovement));
+        browserMovement.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        browserMovement.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                "player",
+                "Lnet/minecraft/server/level/ServerPlayer;"));
+        browserMovement.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        browserMovement.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserIntegratedServerMain",
+                "applyWorkerMovement",
+                "(Lnet/minecraft/server/level/ServerPlayer;"
+                        + "Lnet/minecraft/network/protocol/game/ServerboundMovePlayerPacket;)V",
+                false));
+        browserMovement.add(new InsnNode(Opcodes.RETURN));
+        browserMovement.add(vanillaMovement);
+        movePlayer.instructions.insert(browserMovement);
+        // The Worker branch above consumes the packet through applyWorkerMovement and returns.
+        // Do not put a worldgen-pressure return at the method head: InsnList.insert prepends the
+        // gate before that branch, which silently drops movement packets while the client is
+        // flying.  The resulting client/server position desync strands ChunkMap tracking at the
+        // last accepted section and renders only sky.  Vanilla/non-Worker movement remains
+        // untouched below the Worker fast path.
+        int moveCalls = 0;
+        for (AbstractInsnNode instruction = movePlayer.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKEVIRTUAL
+                    || !call.owner.equals("net/minecraft/server/level/ServerChunkCache")
+                    || !call.name.equals("move")
+                    || !call.desc.equals(
+                            "(Lnet/minecraft/server/level/ServerPlayer;)V")) {
+                continue;
+            }
+            call.setOpcode(Opcodes.INVOKESTATIC);
+            call.owner = "dev/gaius/browser/BrowserIntegratedServerMain";
+            call.name = "moveServerPlayerChunkTracking";
+            call.desc = "(Lnet/minecraft/server/level/ServerChunkCache;"
+                    + "Lnet/minecraft/server/level/ServerPlayer;)V";
+            call.itf = false;
+            moveCalls++;
+        }
+        if (moveCalls != 2) {
+            throw new IllegalStateException(
+                    "ServerGamePacketListenerImpl movement chunk-tracking points changed: "
+                            + moveCalls);
+        }
+        movePlayer.maxStack = Math.max(movePlayer.maxStack, 2);
         writeComputeFrames(node, output);
     }
 
-    private static void patchPlayerChunkSenderBrowserWorker(String jar, Path output)
+    private static void addChunkPosCoordinate(
+            InsnList instructions, int local, String coordinate, boolean record) {
+        instructions.add(new VarInsnNode(Opcodes.ALOAD, local));
+        if (record) {
+            instructions.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    "net/minecraft/world/level/ChunkPos",
+                    coordinate,
+                    "()I",
+                    false));
+        } else {
+            instructions.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    "net/minecraft/world/level/ChunkPos",
+                    coordinate,
+                    "I"));
+        }
+    }
+
+    private static void patchPlayerChunkSenderBrowserWorker(
+            String jar, Path output, boolean chunkPosRecord)
             throws IOException {
         String owner = "net/minecraft/server/network/PlayerChunkSender";
         ClassNode node = read(jar, owner + ".class");
+        MethodNode constructor = find(
+                node,
+                "<init>",
+                "(Z)V");
+        int maxUnacknowledgedAssignments = 0;
+        for (AbstractInsnNode instruction : constructor.instructions.toArray()) {
+            if (!(instruction instanceof FieldInsnNode field)
+                    || field.getOpcode() != Opcodes.PUTFIELD
+                    || !field.owner.equals(owner)
+                    || !field.name.equals("maxUnacknowledgedBatches")
+                    || !field.desc.equals("I")) {
+                continue;
+            }
+            AbstractInsnNode value = previousOpcode(instruction);
+            if (!(value instanceof InsnNode constant) || constant.getOpcode() != Opcodes.ICONST_1) {
+                throw new IllegalStateException(
+                        "PlayerChunkSender max-unacknowledged batch constant changed");
+            }
+            constructor.instructions.set(constant, new InsnNode(Opcodes.ICONST_4));
+            maxUnacknowledgedAssignments++;
+        }
+        if (maxUnacknowledgedAssignments != 1) {
+            throw new IllegalStateException(
+                    "PlayerChunkSender max-unacknowledged batch assignment changed: "
+                            + maxUnacknowledgedAssignments);
+        }
         MethodNode sendNextChunks = find(
                 node,
                 "sendNextChunks",
                 "(Lnet/minecraft/server/level/ServerPlayer;)V");
+        // Keep sender-side state visible in the browser Worker.  The normal packet counters
+        // only show batch boundaries; they cannot distinguish an empty ready set from a
+        // transport that dropped a selected chunk.  Use a fresh local for the player's chunk
+        // position so this remains valid when Mojang changes the method's existing locals.
+        int playerChunkLocal = sendNextChunks.maxLocals;
+        sendNextChunks.maxLocals = playerChunkLocal + 1;
+        InsnList senderEntry = new InsnList();
+        senderEntry.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        senderEntry.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/server/level/ServerPlayer",
+                "chunkPosition",
+                "()Lnet/minecraft/world/level/ChunkPos;",
+                false));
+        senderEntry.add(new VarInsnNode(Opcodes.ASTORE, playerChunkLocal));
+        senderEntry.add(new InsnNode(Opcodes.ICONST_0));
+        senderEntry.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        senderEntry.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                "pendingChunks",
+                "Lit/unimi/dsi/fastutil/longs/LongSet;"));
+        senderEntry.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "it/unimi/dsi/fastutil/longs/LongSet",
+                "size",
+                "()I",
+                true));
+        senderEntry.add(new IntInsnNode(Opcodes.BIPUSH, -1));
+        senderEntry.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        senderEntry.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                "unacknowledgedBatches",
+                "I"));
+        addChunkPosCoordinate(senderEntry, playerChunkLocal, "x", chunkPosRecord);
+        addChunkPosCoordinate(senderEntry, playerChunkLocal, "z", chunkPosRecord);
+        senderEntry.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserIntegratedServerMain",
+                "recordChunkSenderState",
+                "(IIIIII)V",
+                false));
+        sendNextChunks.instructions.insert(senderEntry);
         int records = 0;
+        AbstractInsnNode batchFinishedSendTarget = null;
         for (AbstractInsnNode instruction = sendNextChunks.instructions.getFirst();
                 instruction != null;
                 instruction = instruction.getNext()) {
@@ -19084,6 +19755,7 @@ public final class MinecraftClientPatcher {
             if (batchFinishedSend == null) {
                 continue;
             }
+            batchFinishedSendTarget = batchFinishedSend;
             InsnList record = new InsnList();
             record.add(new VarInsnNode(Opcodes.ALOAD, 5));
             record.add(new MethodInsnNode(
@@ -19107,6 +19779,103 @@ public final class MinecraftClientPatcher {
             throw new IllegalStateException(
                     "PlayerChunkSender chunk-batch size point changed: " + records);
         }
+        // The list returned by collectChunksToSend contains only ready LevelChunk instances;
+        // record it both before the send loop and immediately before the batch-finished packet.
+        // This preserves vanilla selection/removal order while exposing pending/ready/ACK state.
+        InsnList selectedState = new InsnList();
+        selectedState.add(new InsnNode(Opcodes.ICONST_1));
+        selectedState.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        selectedState.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                "pendingChunks",
+                "Lit/unimi/dsi/fastutil/longs/LongSet;"));
+        selectedState.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "it/unimi/dsi/fastutil/longs/LongSet",
+                "size",
+                "()I",
+                true));
+        selectedState.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        selectedState.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/List",
+                "size",
+                "()I",
+                true));
+        selectedState.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        selectedState.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                "unacknowledgedBatches",
+                "I"));
+        addChunkPosCoordinate(selectedState, playerChunkLocal, "x", chunkPosRecord);
+        addChunkPosCoordinate(selectedState, playerChunkLocal, "z", chunkPosRecord);
+        selectedState.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserIntegratedServerMain",
+                "recordChunkSenderState",
+                "(IIIIII)V",
+                false));
+        AbstractInsnNode firstListSize = null;
+        for (AbstractInsnNode instruction = sendNextChunks.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals("java/util/List")
+                    && call.name.equals("isEmpty")
+                    && call.desc.equals("()Z")) {
+                // The List.isEmpty() immediately follows the collectChunksToSend ASTORE 5.
+                firstListSize = instruction;
+                break;
+            }
+        }
+        if (firstListSize == null) {
+            throw new IllegalStateException(
+                    "PlayerChunkSender ready-list accounting point changed");
+        }
+        sendNextChunks.instructions.insertBefore(firstListSize, selectedState);
+        InsnList batchState = new InsnList();
+        batchState.add(new InsnNode(Opcodes.ICONST_2));
+        batchState.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        batchState.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                "pendingChunks",
+                "Lit/unimi/dsi/fastutil/longs/LongSet;"));
+        batchState.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "it/unimi/dsi/fastutil/longs/LongSet",
+                "size",
+                "()I",
+                true));
+        batchState.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        batchState.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "java/util/List",
+                "size",
+                "()I",
+                true));
+        batchState.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        batchState.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                "unacknowledgedBatches",
+                "I"));
+        addChunkPosCoordinate(batchState, playerChunkLocal, "x", chunkPosRecord);
+        addChunkPosCoordinate(batchState, playerChunkLocal, "z", chunkPosRecord);
+        batchState.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserIntegratedServerMain",
+                "recordChunkSenderState",
+                "(IIIIII)V",
+                false));
+        if (batchFinishedSendTarget == null) {
+            throw new IllegalStateException(
+                    "PlayerChunkSender batch-finished send target changed");
+        }
+        sendNextChunks.instructions.insertBefore(batchFinishedSendTarget, batchState);
         sendNextChunks.maxStack = Math.max(sendNextChunks.maxStack, 3);
         writeComputeFrames(node, output);
     }

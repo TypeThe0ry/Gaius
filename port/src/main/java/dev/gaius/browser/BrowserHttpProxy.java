@@ -10,26 +10,10 @@ import org.teavm.jso.JSBody;
 
 /** Routes browser-only HTTP calls through the same trusted bridge as Minecraft TCP. */
 public final class BrowserHttpProxy {
-    private static final String PINNED_RESOURCE_PACK_SOURCE =
-            "https://jihulab.com/-/project/356228/uploads/"
-                    + "e409655d230380173547e68c5ef026d4/resource_pack.zip";
-    private static final String PINNED_RESOURCE_PACK_MIRROR =
-            "https://typethe0ry.github.io/Gaius/resource-packs/"
-                    + "008381d7a89976709aa86bb71dee06dc50bb3961.zip";
-
     private BrowserHttpProxy() {
     }
 
     public static URL proxyResourcePack(URL target) {
-        if (target != null && PINNED_RESOURCE_PACK_SOURCE.equals(target.toExternalForm())) {
-            try {
-                URL mirror = new URL(PINNED_RESOURCE_PACK_MIRROR);
-                report("resource-pack-mirror");
-                return mirror;
-            } catch (MalformedURLException exception) {
-                throw new IllegalStateException("Pinned resource-pack mirror URL is invalid", exception);
-            }
-        }
         return proxy(target, "resource-pack");
     }
 
@@ -53,28 +37,10 @@ public final class BrowserHttpProxy {
         return filtered;
     }
 
-    /**
-     * Keeps the pinned static mirror on the CORS simple-request path.  The Minecraft metadata
-     * headers are advisory for resource-pack hosts, but would force an OPTIONS preflight that a
-     * static GitHub Pages origin does not implement.  Normal RelayNode downloads retain those
-     * headers because the bridge explicitly accepts their preflight.
-     */
+    /** Retains pack metadata headers accepted by the RelayNode preflight. */
     public static Map<String, String> browserSafeResourcePackHeaders(
             URL target, Map<String, String> headers) {
-        Map<String, String> filtered = browserSafeHeaders(headers);
-        if (target == null || !PINNED_RESOURCE_PACK_MIRROR.equals(target.toExternalForm())
-                || filtered.isEmpty()) {
-            return filtered;
-        }
-        Map<String, String> simple = new LinkedHashMap<>();
-        for (Map.Entry<String, String> entry : filtered.entrySet()) {
-            String lower = entry.getKey().toLowerCase(Locale.ROOT);
-            if (lower.equals("accept") || lower.equals("accept-language")
-                    || lower.equals("content-language")) {
-                simple.put(entry.getKey(), entry.getValue());
-            }
-        }
-        return simple;
+        return browserSafeHeaders(headers);
     }
 
     public static String proxyTexture(String target) {

@@ -966,7 +966,7 @@ completed.push("runtime-invariant-external-smoke-evidence");
   assert.equal(
     evaluation.overall,
     "inconclusive",
-    "strict 6/4 release profile cannot pass without required runtime evidence",
+    "strict 8/6 release profile cannot pass without required runtime evidence",
   );
   assert.equal(evaluation.independent.runtimeInvariants.verdict, "inconclusive");
   completed.push("release-profile-missing-runtime-evidence-is-inconclusive");

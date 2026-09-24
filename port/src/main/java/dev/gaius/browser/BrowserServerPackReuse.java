@@ -23,6 +23,8 @@ public final class BrowserServerPackReuse {
         String hash = packet.hash();
         if (!BrowserMultiplayerRecovery.reusePreservedServerPack(id, parsedUrl, hash)) {
             BrowserMultiplayerRecovery.rememberRequiredServerPack(id, parsedUrl, hash);
+            // Let DownloadedPackSource report success only after download and reload.
+            report("server-pack-download-required", id + " " + hash);
             return false;
         }
 

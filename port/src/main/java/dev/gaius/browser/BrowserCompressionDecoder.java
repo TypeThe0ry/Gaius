@@ -84,7 +84,43 @@ public final class BrowserCompressionDecoder extends CompressionDecoder {
             fail(context, "compressed payload length out of bounds: " + payloadLength);
             return;
         }
-        if (deferred != null) {
+        // CompressionDecoder sits immediately after Varint21FrameDecoder.  That decoder
+        // delivers one complete network frame per invocation.  Keep the compressed frame
+        // synchronous so ByteToMessageDecoder can finish its callDecode/readComplete cycle
+        // before PacketDecoder observes the next frame; deferring fireChannelRead through
+        // Platform.schedule reorders packet boundaries under multiplayer bursts.
+        byte[] payload = new byte[payloadLength];
+        input.readBytes(payload);
+        byte[] decoded = new byte[declaredLength];
+        Inflater inflater = new Inflater();
+        try {
+            inflater.setInput(payload);
+            int produced = 0;
+            while (produced < declaredLength && !inflater.finished()) {
+                int count = inflater.inflate(decoded, produced, declaredLength - produced);
+                if (count == 0) {
+                    if (inflater.needsDictionary() || inflater.needsInput()) {
+                        fail(context, "compressed frame ended before declared output length");
+                        return;
+                    }
+                    fail(context, "inflater made no progress");
+                    return;
+                }
+                produced += count;
+            }
+            if (produced != declaredLength || !inflater.finished() || inflater.getRemaining() != 0) {
+                fail(context, "compressed frame length mismatch");
+                return;
+            }
+        } catch (DataFormatException exception) {
+            fail(context, "malformed zlib payload: " + exception.getMessage());
+            return;
+        } finally {
+            inflater.end();
+        }
+        output.add(Unpooled.wrappedBuffer(decoded));
+        return;
+        /*if (deferred != null) {
             // Keep at most one complete frame outside the FIFO while the hard watermark is
             // active. ByteToMessageDecoder will retry this cumulation after the pump drains.
             input.readerIndex(frameStart);
@@ -103,7 +139,7 @@ public final class BrowserCompressionDecoder extends CompressionDecoder {
         input.readBytes(payload);
         queue.addLast(new Frame(declaredLength, payload));
         retainedBytes += declaredLength;
-        schedule(context, generation);
+        schedule(context, generation);*/
     }
 
     @Override
@@ -285,9 +321,9 @@ public final class BrowserCompressionDecoder extends CompressionDecoder {
         private int produced;
         private Inflater inflater;
 
-        private Frame(int declaredLength, byte[] compressed) {
+        private Frame(int declaredLength, byte[] payload) {
             this.declaredLength = declaredLength;
-            this.compressed = compressed;
+            this.compressed = payload;
         }
     }
 }

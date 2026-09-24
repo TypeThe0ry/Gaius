@@ -2,9 +2,11 @@
 
 import assert from "node:assert/strict";
 import {execFileSync, spawnSync} from "node:child_process";
+import {createHash} from "node:crypto";
 import {mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import path from "node:path";
+import {fileURLToPath} from "node:url";
 
 const nativePath = (value) => {
   if (!value) return value;
@@ -12,15 +14,23 @@ const nativePath = (value) => {
   return process.platform === "win32" && /^\/[A-Za-z](?:\/|$)/.test(text)
     ? `${text[1].toUpperCase()}:${text.slice(2)}` : text;
 };
-const source = relative => readFile(new URL(relative, import.meta.url), "utf8");
+const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
+const repositoryRoot = path.resolve(scriptDirectory, "../..");
+const schedulerSourceOption = process.argv.slice(2)
+  .find(argument => argument.startsWith("--scheduler-source="));
+const schedulerSourcePath = schedulerSourceOption
+  ? path.resolve(nativePath(schedulerSourceOption.slice("--scheduler-source=".length)))
+  : path.join(repositoryRoot, "port/src/main/java/dev/gaius/browser/BrowserWorldgenScheduler.java");
+const source = relative => readFile(path.join(repositoryRoot, relative), "utf8");
 const [worldgen, packets, server, client, patcher262, clientPatcher] = await Promise.all([
-  source("../src/main/java/dev/gaius/browser/BrowserWorldgenScheduler.java"),
-  source("../src/main/java/dev/gaius/browser/BrowserPacketScheduler.java"),
-  source("../src/main/java/dev/gaius/browser/BrowserIntegratedServerMain.java"),
-  source("../src/main/java/dev/gaius/browser/BrowserSingleplayerClient.java"),
-  source("../tools/src/main/java/dev/gaius/tools/Minecraft262BrowserPatcher.java"),
-  source("../tools/src/main/java/dev/gaius/tools/MinecraftClientPatcher.java"),
+  readFile(schedulerSourcePath, "utf8"),
+  source("port/src/main/java/dev/gaius/browser/BrowserPacketScheduler.java"),
+  source("port/src/main/java/dev/gaius/browser/BrowserIntegratedServerMain.java"),
+  source("port/src/main/java/dev/gaius/browser/BrowserSingleplayerClient.java"),
+  source("port/tools/src/main/java/dev/gaius/tools/Minecraft262BrowserPatcher.java"),
+  source("port/tools/src/main/java/dev/gaius/tools/MinecraftClientPatcher.java"),
 ]);
+const schedulerSourceSha256 = createHash("sha256").update(worldgen).digest("hex");
 
 function numericConstant(name) {
   const match = worldgen.match(new RegExp(
@@ -345,6 +355,39 @@ globalThis.__gaiusNetworkStats = {
   inboundQueuedBytes: 65_536,
 };
 assert.equal(queueDepth(), 7, "queue pressure does not report the deepest bounded stage");
+
+// Finish-configuration may generate spawn chunks inside an active decoder
+// continuation. That slice cannot finish until worldgen returns: treating it as
+// waiting input makes worldgen repeatedly yield to its own suspended caller.
+globalThis.__gaiusNettyBridge = {
+  activeDecoderScopeDepth: 1,
+  stats: {decodedPacketQueue: 0, decodedSliceBacklog: 1, inboundQueuedBytes: 0},
+};
+assert.equal(queueDepth(), 0, "active configuration decode must not preempt its own worldgen");
+globalThis.__gaiusNettyBridge.stats.decodedSliceBacklog = 3;
+assert.equal(queueDepth(), 2, "waiting slices must still exert network pressure");
+globalThis.__gaiusNettyBridge.activeDecoderScopeDepth = 3;
+assert.equal(queueDepth(), 0, "nested active decoders must not count as waiting input");
+globalThis.__gaiusNettyBridge.stats.inboundQueuedBytes = 32768;
+assert.equal(queueDepth(), 2, "new inbound bytes must still preempt an active decoder");
+globalThis.__gaiusNettyBridge.stats.decodedPacketQueue = 5;
+assert.equal(queueDepth(), 5, "queued packets must retain priority over active decode scopes");
+if (worldgen.includes("private static native double networkInputEpoch();")) {
+  const inputEpoch = new Function(
+    jsBody("private static native double networkInputEpoch()"),
+  );
+  globalThis.__gaiusNettyBridge.stats.receivedFrames = 12_345;
+  assert.equal(inputEpoch(), 12_345,
+    "network input epoch did not use the active bridge arrival counter");
+  globalThis.__gaiusNettyBridge.stats.receivedFrames = Number.NaN;
+  assert.equal(inputEpoch(), 0,
+    "network input epoch did not fail closed for a malformed arrival counter");
+  delete globalThis.__gaiusNettyBridge;
+  globalThis.__gaiusNetworkStats.receivedFrames = 54_321;
+  assert.equal(inputEpoch(), 54_321,
+    "network input epoch did not fall back to the global arrival counter");
+}
+delete globalThis.__gaiusNettyBridge;
 delete globalThis.__gaiusNetworkStats;
 
 const recordSchedulerMarkerSource = jsBody(
@@ -1611,10 +1654,258 @@ function selectJava() {
   return java;
 }
 
+function schedulerSourceForJvmRegression() {
+  let instrumented = worldgen;
+  const replaceExactlyOnce = (pattern, replacement, label) => {
+    const matches = instrumented.match(new RegExp(pattern.source, `${pattern.flags}g`));
+    assert.equal(matches?.length || 0, 1,
+      `expected one ${label} declaration in selected scheduler source`);
+    instrumented = instrumented.replace(pattern, replacement);
+  };
+
+  replaceExactlyOnce(
+    /private static native double configuredSliceMillis\(double fallback\);/,
+    "private static double configuredSliceMillis(double fallback) { "
+      + "return SchedulerHarnessRuntime.configuredSliceMillis; }",
+    "configuredSliceMillis",
+  );
+  replaceExactlyOnce(
+    /private static native double nowMillis\(\);/,
+    "private static double nowMillis() { return SchedulerHarnessRuntime.clockMillis; }",
+    "nowMillis",
+  );
+  replaceExactlyOnce(
+    /private static native int networkQueueDepth\(\);/,
+    "private static int networkQueueDepth() { return SchedulerHarnessRuntime.queueDepth; }",
+    "networkQueueDepth",
+  );
+  if (instrumented.includes("private static native double networkInputEpoch();")) {
+    replaceExactlyOnce(
+      /private static native double networkInputEpoch\(\);/,
+      "private static double networkInputEpoch() { return SchedulerHarnessRuntime.inputEpoch; }",
+      "networkInputEpoch",
+    );
+  }
+  replaceExactlyOnce(
+    /private static native boolean isWorkerRuntime\(\);/,
+    "private static boolean isWorkerRuntime() { return SchedulerHarnessRuntime.workerRuntime; }",
+    "isWorkerRuntime",
+  );
+  replaceExactlyOnce(
+    /private static native void recordSchedulerMarker\([\s\S]*?double activeWorkMillis\);/,
+    `private static void recordSchedulerMarker(
+            String event, int token, int taskDepth, int reentrantDepth,
+            boolean yielding, double activeWorkMillis) {}`,
+    "recordSchedulerMarker",
+  );
+  replaceExactlyOnce(
+    /private static native void reportSlice\([\s\S]*?int maximumReentrantYieldDepth\);/,
+    `private static void reportSlice(
+            int reason, boolean networkPreemption, int progressPulses,
+            int networkWaitPulses, double sliceElapsedMillis,
+            double completedBudgetMillis, double nextBudgetMillis,
+            double overrunMillis, double yieldDelayMillis,
+            int queueDepthBefore, int queueDepthAfter, int reentrantRequests,
+            int networkWaitPulseLimit, int maximumPulsesInTurn,
+            int maximumReentrantYieldDepth) {
+        SchedulerHarnessRuntime.recordYield(reason, progressPulses, networkWaitPulses);
+    }`,
+    "reportSlice",
+  );
+  return instrumented;
+}
+
 async function minimalJavaCompile() {
   const root = await mkdtemp(path.join(tmpdir(), "gaius-worldgen-scheduler-"));
   const files = new Map([
-    ["dev/gaius/browser/BrowserWorldgenScheduler.java", worldgen],
+    ["dev/gaius/browser/BrowserWorldgenScheduler.java", schedulerSourceForJvmRegression()],
+    ["dev/gaius/browser/SchedulerHarnessRuntime.java", `
+package dev.gaius.browser;
+public final class SchedulerHarnessRuntime {
+    static double clockMillis;
+    static double configuredSliceMillis = 8.0;
+    static double inputEpoch;
+    static int queueDepth;
+    public static boolean pendingTransport;
+    static boolean pendingPackets;
+    static boolean workerRuntime = true;
+    static int eventLoopYields;
+    static int handlerCallbacks;
+    static final int[] yieldsByReason = new int[4];
+    static int lastProgressPulses;
+    static int lastNetworkWaitPulses;
+
+    static void reset() {
+        clockMillis = 1.0;
+        configuredSliceMillis = 8.0;
+        inputEpoch = 0.0;
+        queueDepth = 0;
+        pendingTransport = false;
+        pendingPackets = false;
+        workerRuntime = true;
+        eventLoopYields = 0;
+        handlerCallbacks = 0;
+        java.util.Arrays.fill(yieldsByReason, 0);
+        lastProgressPulses = 0;
+        lastNetworkWaitPulses = 0;
+    }
+
+    public static void eventLoopYield() {
+        eventLoopYields++;
+        clockMillis += 0.001;
+    }
+
+    static void recordYield(int reason, int progressPulses, int networkWaitPulses) {
+        if (reason >= 0 && reason < yieldsByReason.length) yieldsByReason[reason]++;
+        lastProgressPulses = progressPulses;
+        lastNetworkWaitPulses = networkWaitPulses;
+    }
+}
+`],
+    ["dev/gaius/browser/SchedulerPreemptionHarness.java", `
+package dev.gaius.browser;
+
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
+
+public final class SchedulerPreemptionHarness {
+    private static void fail(String message) {
+        throw new AssertionError(message);
+    }
+
+    private static Field field(String name) throws Exception {
+        Field field = BrowserWorldgenScheduler.class.getDeclaredField(name);
+        field.setAccessible(true);
+        return field;
+    }
+
+    private static void resetScheduler() throws Exception {
+        for (Field field : BrowserWorldgenScheduler.class.getDeclaredFields()) {
+            if (!Modifier.isStatic(field.getModifiers()) || Modifier.isFinal(field.getModifiers())) continue;
+            field.setAccessible(true);
+            Class<?> type = field.getType();
+            if (type == boolean.class) field.setBoolean(null, false);
+            else if (type == int.class) field.setInt(null, 0);
+            else if (type == long.class) field.setLong(null, 0L);
+            else if (type == double.class) field.setDouble(null, 0.0);
+            else field.set(null, null);
+        }
+        field("activeWorkStartedAtMillis").setDouble(null, -1.0);
+        try {
+            field("lastNetworkPreemptionInputEpoch").setDouble(null, -1.0);
+        } catch (NoSuchFieldException ignored) {
+            // The pre-fix source intentionally has no retained-pressure fingerprint.
+        }
+        field("pulsesUntilClockCheck").setInt(null, 1);
+        field("pulsesUntilNetworkCheck").setInt(null, 1);
+    }
+
+    private static void prime(double budgetMillis) throws Exception {
+        SchedulerHarnessRuntime.reset();
+        resetScheduler();
+        field("taskWorkDepth").setInt(null, 1);
+        field("sliceStartedAtMillis").setDouble(null, SchedulerHarnessRuntime.clockMillis);
+        field("activeWorkStartedAtMillis").setDouble(null, SchedulerHarnessRuntime.clockMillis);
+        field("currentBudgetMillis").setDouble(null, budgetMillis);
+        field("deadlineMillis").setDouble(
+                null, SchedulerHarnessRuntime.clockMillis + budgetMillis);
+    }
+
+    private static void pulse(double workMillis) {
+        SchedulerHarnessRuntime.clockMillis += workMillis;
+        BrowserWorldgenScheduler.pulse();
+    }
+
+    private static int yields(int reason) {
+        return SchedulerHarnessRuntime.yieldsByReason[reason];
+    }
+
+    public static void main(String[] args) throws Exception {
+        final int deadline = 0;
+        final int network = 1;
+        final int hardCap = 2;
+
+        prime(10_000.0);
+        SchedulerHarnessRuntime.queueDepth = 1;
+        SchedulerHarnessRuntime.pendingTransport = true;
+        SchedulerHarnessRuntime.inputEpoch = 100.0;
+        pulse(0.01);
+        pulse(0.01);
+        if (yields(network) != 1) fail("initial pressure did not preempt within two pulses");
+        if (SchedulerHarnessRuntime.lastNetworkWaitPulses > 2) {
+            fail("initial pressure exceeded the two-pulse wait contract");
+        }
+
+        for (int index = 0; index < 16; index++) pulse(0.01);
+        if (yields(network) != 1) {
+            fail("stable retained input re-preempted before useful work accumulated");
+        }
+
+        int retainedProgress = 16;
+        while (yields(network) == 1 && retainedProgress < 128) {
+            pulse(0.01);
+            retainedProgress++;
+        }
+        if (yields(network) != 2 || retainedProgress > 128) {
+            fail("stable retained input lost its bounded retry");
+        }
+
+        SchedulerHarnessRuntime.inputEpoch = 101.0;
+        pulse(0.01);
+        pulse(0.01);
+        if (yields(network) != 3) {
+            fail("new same-depth network arrival did not preempt within two pulses");
+        }
+
+        SchedulerHarnessRuntime.queueDepth = 2;
+        pulse(0.01);
+        pulse(0.01);
+        if (yields(network) != 4) {
+            fail("increased queue depth did not preempt within two pulses");
+        }
+
+        SchedulerHarnessRuntime.queueDepth = 0;
+        SchedulerHarnessRuntime.pendingTransport = false;
+        pulse(0.01);
+        SchedulerHarnessRuntime.queueDepth = 2;
+        SchedulerHarnessRuntime.pendingTransport = true;
+        pulse(0.01);
+        pulse(0.01);
+        if (yields(network) != 5) {
+            fail("cleared pressure did not reset the retained-input fingerprint");
+        }
+
+        prime(8.0);
+        SchedulerHarnessRuntime.queueDepth = 1;
+        SchedulerHarnessRuntime.pendingTransport = true;
+        SchedulerHarnessRuntime.inputEpoch = 200.0;
+        pulse(0.01);
+        pulse(0.01);
+        if (yields(network) != 1) fail("deadline fixture did not prime retained pressure");
+        pulse(8.1);
+        if (yields(network) != 1 || yields(deadline) != 1) {
+            fail("retained pressure suppressed the ordinary deadline yield");
+        }
+
+        prime(8.0);
+        pulse(8.1);
+        if (yields(deadline) != 1) fail("ordinary deadline no longer bounds a work slice");
+
+        prime(10_000.0);
+        for (int index = 0; index < 4096; index++) pulse(0.0);
+        if (yields(hardCap) < 1) fail("hard pulse cap no longer bounds a work turn");
+        if (SchedulerHarnessRuntime.handlerCallbacks != 0) {
+            fail("requestYield drained or re-entered a Java packet handler");
+        }
+        if (SchedulerHarnessRuntime.eventLoopYields < 1) {
+            fail("scheduler did not yield to the event loop");
+        }
+
+        System.out.println("SCHEDULER_PREEMPTION_OK retainedProgress=" + retainedProgress
+                + " networkYields=5 deadlineYields=1 hardCapYields=1 handlerCallbacks=0");
+    }
+}
+`],
     ["dev/gaius/browser/MobAiWindowHarness.java", `
 package dev.gaius.browser;
 public final class MobAiWindowHarness {
@@ -1655,13 +1946,13 @@ ${mobPulse.replace("public static void mobAiPulse()", "static void mobAiPulse()"
     ["dev/gaius/browser/BrowserPacketScheduler.java", `
 package dev.gaius.browser;
 final class BrowserPacketScheduler {
-    static boolean hasPendingPackets() { return false; }
+    static boolean hasPendingPackets() { return SchedulerHarnessRuntime.pendingPackets; }
 }
 `],
     ["dev/gaius/browser/BrowserIntegratedServerMain.java", `
 package dev.gaius.browser;
 final class BrowserIntegratedServerMain {
-    static void pumpUrgentPackets() {}
+    static void pumpUrgentPackets() { SchedulerHarnessRuntime.handlerCallbacks++; }
 }
 `],
     // BrowserWorldgenScheduler's optional Mob-AI diagnostic fallback keeps the
@@ -1675,13 +1966,17 @@ public class Mob {}
     ["io/netty/channel/browser/BrowserWebSocketChannel.java", `
 package io.netty.channel.browser;
 public final class BrowserWebSocketChannel {
-    public static boolean hasPendingInput() { return false; }
+    public static boolean hasPendingInput() {
+        return dev.gaius.browser.SchedulerHarnessRuntime.pendingTransport;
+    }
 }
 `],
     ["org/teavm/classlib/java/lang/TModernRuntimeSupport.java", `
 package org.teavm.classlib.java.lang;
 public final class TModernRuntimeSupport {
-    public static void yieldToEventLoop(long delay) {}
+    public static void yieldToEventLoop(long delay) {
+        dev.gaius.browser.SchedulerHarnessRuntime.eventLoopYield();
+    }
 }
 `],
     ["org/teavm/jso/JSBody.java", `
@@ -1718,6 +2013,12 @@ public @interface JSBody {
     assert.match(harnessOutput, /MOB_AI_WINDOW_OK records=6 yields=2/,
       "production Mob AI pulse did not pass its executable Java fixture");
     process.stdout.write(harnessOutput);
+    const schedulerOutput = execFileSync(selectJava(), [
+      "-cp", classes, "dev.gaius.browser.SchedulerPreemptionHarness",
+    ], {encoding: "utf8", timeout: 30_000});
+    assert.match(schedulerOutput, /SCHEDULER_PREEMPTION_OK/,
+      "selected scheduler source failed its executable Java preemption regression");
+    process.stdout.write(schedulerOutput);
   } finally {
     await rm(root, {recursive: true, force: true});
   }
@@ -1727,6 +2028,8 @@ await minimalJavaCompile();
 
 const maxLatency = Math.max(...simulation.processed.map(packet => packet.latency));
 console.log("Worldgen scheduler smoke passed:", JSON.stringify({
+  schedulerSource: schedulerSourcePath,
+  schedulerSourceSha256,
   worldgenPulses: simulation.worldCompleted,
   networkEvents: simulation.processed.length,
   slices: simulation.slices.length,

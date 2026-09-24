@@ -182,7 +182,7 @@ for (const required of [
 }
 for (const required of [
   "supportedReleaseDistanceCapabilities",
-  "headed-chrome-worker-distance-6-4",
+  "headed-chrome-worker-distance-8-6",
   "releaseDistanceCapability",
   "active version profile is not a supported headed Chrome release capability",
   "--headless is disabled for strict headed Chrome release evidence",
@@ -1003,7 +1003,7 @@ assert.match(forgedNestedCleanupClosureValidation.failures.join("\n"),
   /framePacingClosure|sources disagree/);
 
 const forgedWorkerDistanceChild = childReport();
-forgedWorkerDistanceChild.analysis.environment.distanceContract.optionsPreference = "8:6";
+forgedWorkerDistanceChild.analysis.environment.distanceContract.optionsPreference = "6:4";
 const forgedWorkerDistanceValidation = validateChildReport(forgedWorkerDistanceChild, {
   profileName: "hard-a",
   profile: fixtureContract.profiles["hard-a"],
@@ -1012,7 +1012,7 @@ const forgedWorkerDistanceValidation = validateChildReport(forgedWorkerDistanceC
   uncappedEvidence: fixtureUncappedEvidence,
 });
 assert.equal(forgedWorkerDistanceValidation.valid, false,
-  "strict release must reject a non-6/4 natural options preference");
+  "strict release must reject a non-8/6 natural options preference");
 assert.match(forgedWorkerDistanceValidation.failures.join("\n"), /options preference/);
 const pinnedWorkerDistanceChild = childReport();
 pinnedWorkerDistanceChild.analysis.environment.distanceContract.mode = "harness-pin-diagnostic";
@@ -1281,14 +1281,14 @@ for (const [profileId, expected] of [
   assert.equal(benchmarkConfiguration.releaseDistanceCapability.profileId, profileId);
   assert.equal(
     benchmarkConfiguration.releaseDistanceCapability.capability,
-    "headed-chrome-worker-distance-6-4",
+    "headed-chrome-worker-distance-8-6",
   );
   assert.equal(benchmarkConfiguration.workerDistanceMode, "natural-observation");
   assert.equal(benchmarkConfiguration.workerDistanceContract.mode, "natural-observation");
   assert.equal(benchmarkConfiguration.workerDistanceContract.releaseEligible, true);
   assert.equal(benchmarkConfiguration.workerDistanceContract.releaseTargetProfile, profileId);
   assert.equal(benchmarkConfiguration.workerDistanceContract.capability,
-    "headed-chrome-worker-distance-6-4");
+    "headed-chrome-worker-distance-8-6");
   assert.equal(benchmarkConfiguration.mode, "release-gating");
   assert.equal(benchmarkConfiguration.gating, true);
   assert.equal(benchmarkConfiguration.releaseEvidence, true);

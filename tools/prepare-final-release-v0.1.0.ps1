@@ -132,7 +132,13 @@ function Verify-Single([string]$EvidencePath, [object]$Portable) {
         [string]$evidence.artifact
     } else { Join-Path (Split-Path -Parent $EvidencePath) ([string]$evidence.artifact) }
     if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) { Fail "$profile evidence artifact is missing: $artifact" }
-    Assert-SamePath (Resolve-Path -LiteralPath $artifact).Path (Resolve-Path -LiteralPath $Portable.Html).Path "$profile evidence"
+    # Acceptance uses a frozen copy so later compiles cannot replace the tested
+    # bytes. Bind that file to the release by content, not by its directory.
+    $testedArtifactIdentity = Get-Identity $artifact
+    if ([long]$testedArtifactIdentity.bytes -ne [long]$Portable.HtmlIdentity.bytes -or
+        [string]$testedArtifactIdentity.sha256 -ne [string]$Portable.HtmlIdentity.sha256) {
+        Fail "$profile frozen acceptance artifact differs from the current release artifact"
+    }
     if (-not ($evidence.PSObject.Properties.Name -contains 'artifactIdentity') -or $null -eq $evidence.artifactIdentity) {
         Fail "$profile evidence is legacy/stale: artifactIdentity is required"
     }
@@ -259,6 +265,14 @@ if ($multiplayer12111.Identity.sha256 -eq $multiplayer262.Identity.sha256) {
     Fail '1.21.11 and 26.2 multiplayer evidence identities must be independent'
 }
 
+# A functional join does not meet the requested <=15 second entry target.
+foreach ($evidencePath in @($single12111Path, $single262Path, $multiplayer12111Path, $multiplayer262Path)) {
+    & node (Join-Path $root 'tools/check-entry-latency-evidence.mjs') $evidencePath
+    if ($LASTEXITCODE -ne 0) { Fail "Entry latency is missing, diagnostic-only, or exceeds 15 seconds: $evidencePath" }
+    & node (Join-Path $root 'tools/check-chunk-throughput-evidence.mjs') $evidencePath
+    if ($LASTEXITCODE -ne 0) { Fail "Visible chunk throughput does not prove 10 new columns within 300 ms: $evidencePath" }
+}
+
 $plugin = Join-Path $root 'apps/server-plugin/target/gaius-server-plugin-0.1.0.jar'
 $notesTemplate = Join-Path $root 'tools/release-v0.1.0-notes.md'
 foreach ($path in @($plugin, $notesTemplate)) {
@@ -310,8 +324,8 @@ $releaseManifest = [ordered]@{
         strictTerrainGate = 'passed'
     }
     pages = [ordered]@{
-        home = 'https://typethe0ry.github.io/Gaius/'; '1.21.11' = 'https://typethe0ry.github.io/Gaius/1.21.11/'
-        '26.2' = 'https://typethe0ry.github.io/Gaius/26.2/'; relayRegistry = 'https://typethe0ry.github.io/Gaius/relay-nodes.json'
+        '1.21.11' = 'https://typethe0ry.github.io/Gaius/Gaius-1.21.11.html'
+        '26.2' = 'https://typethe0ry.github.io/Gaius/Gaius-26.2.html'
         defaultTarget = $pagesDefaultTarget
         defaultTargets = [ordered]@{ '1.21.11' = $pages12111DefaultTarget; '26.2' = $pages262DefaultTarget }
     }

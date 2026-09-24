@@ -1,6 +1,7 @@
 package org.teavm.classlib.java.util.concurrent.locks;
 
 import java.util.IdentityHashMap;
+import org.teavm.classlib.java.lang.TModernRuntimeSupport;
 
 public final class TLockSupport {
     private static final IdentityHashMap<Thread, Boolean> permits = new IdentityHashMap<>();
@@ -66,7 +67,10 @@ public final class TLockSupport {
 
     private static void sleepNanos(long nanos) {
         if (nanos <= 0) {
-            Thread.yield();
+            // Minecraft's managed-block loop can pass an expired tick deadline.
+            // TeaVM Thread.yield() may return synchronously for 100 ms; spinning
+            // here prevents the Worker from resuming the chunk future we await.
+            TModernRuntimeSupport.yieldToEventLoop(0);
             return;
         }
         long millis = Math.max(1, (nanos + 999_999L) / 1_000_000L);

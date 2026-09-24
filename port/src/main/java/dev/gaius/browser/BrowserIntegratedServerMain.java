@@ -15,6 +15,9 @@ import net.minecraft.server.Main;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.TickTask;
 import net.minecraft.server.players.PlayerList;
+import net.minecraft.server.level.ServerChunkCache;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
 import org.teavm.classlib.java.lang.TModernRuntimeSupport;
 import org.teavm.jso.JSBody;
 import org.teavm.jso.JSExport;
@@ -32,8 +35,8 @@ public final class BrowserIntegratedServerMain {
     private static MinecraftServer server;
     private static Thread serverThread;
     private static boolean serverThreadExited = true;
-    private static int configuredViewDistance = 6;
-    private static int configuredSimulationDistance = 4;
+    private static int configuredViewDistance = 8;
+    private static int configuredSimulationDistance = 6;
     private static int activeViewDistance = INITIAL_VIEW_DISTANCE;
     private static int activeSimulationDistance = INITIAL_SIMULATION_DISTANCE;
     private static PlayerList appliedDistancePlayerList;
@@ -43,13 +46,38 @@ public final class BrowserIntegratedServerMain {
     private static boolean distanceAdvancePending;
     private static boolean urgentPacketPumpActive;
     private static final AtomicBoolean NETWORK_INPUT_TASK_SCHEDULED = new AtomicBoolean();
-    /** Exact TickTask instance currently owned by the browser network wakeup permit. */
+    /** Runnable currently inside the browser network wakeup permit. */
     private static Runnable scheduledNetworkInputTask;
     /** Short lease held only while BlockableEventLoop.doRunTask dispatches that exact instance. */
     private static Runnable activeNetworkInputTask;
     private static boolean networkInputBurstActive;
     private static int networkInputFollowupsRemaining;
     private static int networkInputDeferredRetriesRemaining;
+    /** Set when a queued input task is observed during the outer packet pump. */
+    private static boolean networkInputReschedulePending;
+    /** Last section tracked for the integrated player; movement packets within one section do not
+     * change the ChunkMap view and must not synchronously enumerate the whole entity map. */
+    private static ServerPlayer lastTrackedPlayer;
+    private static int lastTrackedSectionX = Integer.MIN_VALUE;
+    private static int lastTrackedSectionZ = Integer.MIN_VALUE;
+    private static long lastTrackedAtNanos;
+    private static ServerChunkCache pendingTrackedChunkCache;
+    private static ServerPlayer pendingTrackedPlayer;
+    private static int pendingTrackedSectionX = Integer.MIN_VALUE;
+    private static int pendingTrackedSectionZ = Integer.MIN_VALUE;
+    /**
+     * ChunkMap.move() is a resumable TeaVM continuation.  While it is suspended at a
+     * cooperative pulse, a browser network callback can deliver another movement packet.
+     * Never enter a second move invocation on top of that continuation: the vanilla
+     * PlayerChunkSender/pending-set state is not re-entrant.  New movement only updates the
+     * pending center and is flushed by the next integrated-server tick after the active move
+     * has returned.
+     */
+    private static boolean trackingMoveInFlight;
+    private static long trackingMoveSequence;
+    private static long trackingMoveInFlightSequence;
+    private static int trackingMoveInFlightSectionX = Integer.MIN_VALUE;
+    private static int trackingMoveInFlightSectionZ = Integer.MIN_VALUE;
     private static boolean storageFlushRequested;
     private static boolean storageFlushTimeoutReported;
     private static boolean indexedDbFallbackHydrationPending;
@@ -60,8 +88,8 @@ public final class BrowserIntegratedServerMain {
             BrowserIntegratedServerMain::runScheduledNetworkInput;
 
     private static String serverProperties() {
-        int viewDistance = clampDistance(workerViewDistance(), 6);
-        int simulationDistance = clampDistance(workerSimulationDistance(), 4);
+        int viewDistance = clampDistance(workerViewDistance(), 8);
+        int simulationDistance = clampDistance(workerSimulationDistance(), 6);
         String properties = String.join("\n",
             "allow-flight=true",
             "enable-command-block=true",
@@ -121,8 +149,8 @@ public final class BrowserIntegratedServerMain {
         server = minecraftServer;
         serverThread = minecraftServer.getRunningThread();
         serverThreadExited = false;
-        configuredViewDistance = clampDistance(workerViewDistance(), 6);
-        configuredSimulationDistance = clampDistance(workerSimulationDistance(), 4);
+        configuredViewDistance = clampDistance(workerViewDistance(), 8);
+        configuredSimulationDistance = clampDistance(workerSimulationDistance(), 6);
         activeViewDistance = INITIAL_VIEW_DISTANCE;
         activeSimulationDistance = INITIAL_SIMULATION_DISTANCE;
         appliedDistancePlayerList = null;
@@ -137,6 +165,20 @@ public final class BrowserIntegratedServerMain {
         networkInputBurstActive = false;
         networkInputFollowupsRemaining = 0;
         networkInputDeferredRetriesRemaining = 0;
+        networkInputReschedulePending = false;
+        lastTrackedPlayer = null;
+        lastTrackedSectionX = Integer.MIN_VALUE;
+        lastTrackedSectionZ = Integer.MIN_VALUE;
+        lastTrackedAtNanos = 0L;
+        pendingTrackedChunkCache = null;
+        pendingTrackedPlayer = null;
+        pendingTrackedSectionX = Integer.MIN_VALUE;
+        pendingTrackedSectionZ = Integer.MIN_VALUE;
+        trackingMoveInFlight = false;
+        trackingMoveSequence = 0L;
+        trackingMoveInFlightSequence = 0L;
+        trackingMoveInFlightSectionX = Integer.MIN_VALUE;
+        trackingMoveInFlightSectionZ = Integer.MIN_VALUE;
         recordNetworkPumpState(-1, false);
         recordNetworkInputPending(false);
         storageFlushRequested = false;
@@ -167,8 +209,8 @@ public final class BrowserIntegratedServerMain {
 
     @JSExport
     public static void setIntegratedServerDistances(int viewDistance, int simulationDistance) {
-        configuredViewDistance = clampDistance(viewDistance, 6);
-        configuredSimulationDistance = clampDistance(simulationDistance, 4);
+        configuredViewDistance = clampDistance(viewDistance, 8);
+        configuredSimulationDistance = clampDistance(simulationDistance, 6);
         if (configuredDistancesActive) {
             // Once the first real batch ACK activates the session, settings changes
             // apply immediately. Vanilla tracking/backpressure remains authoritative.
@@ -281,6 +323,7 @@ public final class BrowserIntegratedServerMain {
 
     /** Patcher compatibility hook; vanilla tracking owns later distance changes. */
     public static void tickIntegratedServerDistances() {
+        flushPendingPlayerChunkTracking();
         if (isWorkerRuntime() && configuredDistancesActive) {
             distanceAdvancePending = false;
         }
@@ -290,6 +333,7 @@ public final class BrowserIntegratedServerMain {
     public static boolean isWorkerServer() {
         return isWorkerRuntime();
     }
+
 
     /** Processes browser actions between synchronous worldgen slices on the server thread. */
     public static void pumpUrgentPackets() {
@@ -319,9 +363,12 @@ public final class BrowserIntegratedServerMain {
      */
     private static boolean drainScheduledNetworkInput() {
         MinecraftServer current = server;
-        if (!isWorkerRuntime() || current == null || serverThreadExited || !current.isRunning()
-                || !NETWORK_INPUT_TASK_SCHEDULED.get() || activeNetworkInputTask == null
-                || urgentPacketPumpActive) {
+        if (!isWorkerRuntime() || current == null || serverThreadExited) {
+            return false;
+        }
+        if (urgentPacketPumpActive) {
+            networkInputReschedulePending = true;
+            reportRuntimeEvent("network-pump-deferred", "urgent-reentrant");
             return false;
         }
         return drainUrgentPacketsFromServerLoop(current);
@@ -329,17 +376,15 @@ public final class BrowserIntegratedServerMain {
 
     /**
      * Called by the patched BlockableEventLoop.doRunTask immediately before dispatching a queued
-     * runnable. TeaVM may restore a queued TickTask as a fresh Java wrapper, so object identity
-     * against the static task reference is not stable across a resumed Worker continuation. The
-     * network wakeup uses the reserved minimum tick priority; that marker survives wrapper
-     * restoration and remains distinct from every vanilla scheduled task. The caller must pair
-     * this with endScheduledNetworkInputTask in finally.
+     * runnable. TeaVM may restore a queued TickTask as a fresh Java wrapper, so neither wrapper
+     * identity nor the concrete TickTask type is stable across a resumed Worker continuation.
+     * The one outstanding permit is therefore the ownership marker; the caller must pair this
+     * with endScheduledNetworkInputTask in finally.
      */
     public static boolean beginScheduledNetworkInputTask(Runnable task) {
         MinecraftServer current = server;
-        if (!isWorkerRuntime() || current == null || serverThreadExited || !current.isRunning()
-                || !NETWORK_INPUT_TASK_SCHEDULED.get() || !(task instanceof TickTask tickTask)
-                || tickTask.getTick() != Integer.MIN_VALUE || activeNetworkInputTask != null) {
+        if (!isWorkerRuntime() || current == null || serverThreadExited
+                || !NETWORK_INPUT_TASK_SCHEDULED.get() || activeNetworkInputTask != null) {
             return false;
         }
         activeNetworkInputTask = task;
@@ -364,6 +409,11 @@ public final class BrowserIntegratedServerMain {
             return true;
         } finally {
             urgentPacketPumpActive = false;
+            if (networkInputReschedulePending && server == current
+                    && !serverThreadExited) {
+                networkInputReschedulePending = false;
+                scheduleNetworkInputTask(false, false);
+            }
         }
     }
 
@@ -378,6 +428,191 @@ public final class BrowserIntegratedServerMain {
                 || BrowserPacketScheduler.hasPendingPackets()) {
             pumpUrgentPackets();
         }
+    }
+
+    /**
+     * Updates server-side chunk tracking only when the player enters a new section. The vanilla
+     * movement listener invokes {@code ServerChunkCache.move} for every position packet; in the
+     * browser Worker that call walks the complete tracking view synchronously and can hold one
+     * packet handler for seconds while worldgen is active. Physics and position validation remain
+     * in the listener; this wrapper only removes redundant same-section view walks.
+     */
+    public static void moveServerPlayerChunkTracking(
+            ServerChunkCache chunkCache, ServerPlayer player) {
+        if (chunkCache == null || player == null) {
+            return;
+        }
+        int sectionX = floorSectionCoordinate(player.getX());
+        int sectionZ = floorSectionCoordinate(player.getZ());
+        if (lastTrackedPlayer == player
+                && lastTrackedSectionX == sectionX
+                && lastTrackedSectionZ == sectionZ) {
+            return;
+        }
+        long nowNanos = System.nanoTime();
+        if (lastTrackedPlayer == player
+                && lastTrackedAtNanos != 0L
+                && nowNanos - lastTrackedAtNanos < 100_000_000L) {
+            return;
+        }
+        pendingTrackedChunkCache = chunkCache;
+        pendingTrackedPlayer = player;
+        pendingTrackedSectionX = sectionX;
+        pendingTrackedSectionZ = sectionZ;
+    }
+
+    private static void flushPendingPlayerChunkTracking() {
+        // ChunkMap.move can be suspended by BrowserWorldgenScheduler.pulse().  A resumed
+        // continuation owns the live tracking view until its call returns; starting another
+        // invocation here would let two difference walks mutate PlayerChunkSender in parallel.
+        if (trackingMoveInFlight) {
+            recordTrackingMoveTelemetry(1, pendingTrackedPlayer != null);
+            return;
+        }
+        ServerChunkCache chunkCache = pendingTrackedChunkCache;
+        ServerPlayer player = pendingTrackedPlayer;
+        // This runs only at the integrated-server tick boundary.  The packet handler has
+        // already been kept off the synchronous ChunkMap walk; delaying the pending view update
+        // here when the worldgen queue is busy leaves the client stranded over unloaded terrain.
+        // ChunkMap.move itself is instrumented with cooperative pulses, so let the tick-boundary
+        // operation make progress rather than dropping the latest tracking center indefinitely.
+        if (chunkCache == null || player == null) {
+            return;
+        }
+        int sectionX = pendingTrackedSectionX;
+        int sectionZ = pendingTrackedSectionZ;
+        pendingTrackedChunkCache = null;
+        pendingTrackedPlayer = null;
+        long invocation = ++trackingMoveSequence;
+        trackingMoveInFlight = true;
+        trackingMoveInFlightSequence = invocation;
+        trackingMoveInFlightSectionX = sectionX;
+        trackingMoveInFlightSectionZ = sectionZ;
+        recordTrackingMoveTelemetry(0, true);
+        try {
+            // This call may suspend and resume at any of the cooperative ChunkMap pulses.  Do
+            // not move the completion bookkeeping above the call: lastTracked* must describe
+            // only a fully returned vanilla walk, never a partially enumerated view.
+            chunkCache.move(player);
+            if (trackingMoveInFlightSequence == invocation) {
+                lastTrackedPlayer = player;
+                lastTrackedSectionX = sectionX;
+                lastTrackedSectionZ = sectionZ;
+                lastTrackedAtNanos = System.nanoTime();
+            }
+        } finally {
+            if (trackingMoveInFlightSequence == invocation) {
+                trackingMoveInFlight = false;
+                trackingMoveInFlightSectionX = Integer.MIN_VALUE;
+                trackingMoveInFlightSectionZ = Integer.MIN_VALUE;
+                recordTrackingMoveTelemetry(2, pendingTrackedPlayer != null);
+            }
+        }
+    }
+
+    /** Optional diagnostics for proving move serialization; never affects the hot path. */
+    @JSBody(params = {"event", "pending"}, script = """
+            try {
+              const stats = globalThis.__gaiusWorldgenStats;
+              if (!stats) return;
+              stats.trackingMoveTelemetryVersion = 1;
+              if ((event | 0) === 0) {
+                stats.trackingMoveStarts = (Number(stats.trackingMoveStarts) || 0) + 1;
+                stats.trackingMoveInFlight = 1;
+              } else if ((event | 0) === 1) {
+                stats.trackingMoveInFlightSkips =
+                  (Number(stats.trackingMoveInFlightSkips) || 0) + 1;
+              } else if ((event | 0) === 2) {
+                stats.trackingMoveCompletions =
+                  (Number(stats.trackingMoveCompletions) || 0) + 1;
+                stats.trackingMoveInFlight = 0;
+              }
+              stats.trackingMovePending = pending ? 1 : 0;
+            } catch (_) {
+              // Diagnostics must never perturb chunk tracking.
+            }
+            """)
+    private static native void recordTrackingMoveTelemetry(int event, boolean pending);
+
+    /**
+     * Captures the send-side state that is otherwise invisible from packet counters.  A
+     * selected count of zero with a non-empty pending set means the ready filter/worldgen path
+     * is the bottleneck; a selected count followed by a batch boundary proves the sender chose
+     * ready chunks and moves the investigation to transport or client decode.
+     */
+    @JSBody(params = {"phase", "pending", "selected", "unacknowledged", "playerChunkX", "playerChunkZ"}, script = """
+            try {
+              const stats = globalThis.__gaiusWorldgenStats;
+              if (!stats) return;
+              const state = stats.chunkSender || (stats.chunkSender = {});
+              state.telemetryVersion = 1;
+              state.last = {
+                phase: phase | 0,
+                pending: Math.max(0, pending | 0),
+                selected: Math.max(-1, selected | 0),
+                unacknowledgedBatches: Math.max(0, unacknowledged | 0),
+                playerChunkX: playerChunkX | 0,
+                playerChunkZ: playerChunkZ | 0
+              };
+              const key = (phase | 0) === 0 ? 'entry'
+                : ((phase | 0) === 1 ? 'selected' : 'batch');
+              state[key + 'Count'] = (Number(state[key + 'Count']) || 0) + 1;
+              if ((phase | 0) === 1) {
+                state.readySelectedChunks =
+                  (Number(state.readySelectedChunks) || 0) + Math.max(0, selected | 0);
+              }
+              state.maxPending = Math.max(
+                Number(state.maxPending) || 0, Math.max(0, pending | 0));
+              state.maxUnacknowledgedBatches = Math.max(
+                Number(state.maxUnacknowledgedBatches) || 0,
+                Math.max(0, unacknowledged | 0));
+            } catch (_) {
+              // Optional diagnostics must never perturb PlayerChunkSender.
+            }
+            """)
+    private static native void recordChunkSenderState(
+            int phase, int pending, int selected, int unacknowledged,
+            int playerChunkX, int playerChunkZ);
+
+    /**
+     * Applies the local browser player's absolute movement without entering vanilla collision
+     * lookup.  The browser integrated player is a creative owner; the normal movement packet
+     * path performs a synchronous ServerLevel collision scan and can pull the cooperative Worker
+     * into a multi-second chunk wait.  Chunk priority still receives the exact position, while
+     * chunk-view maintenance remains staged outside the packet handler.
+     */
+    public static void applyWorkerMovement(
+            ServerPlayer player, ServerboundMovePlayerPacket packet) {
+        if (player == null || packet == null) {
+            return;
+        }
+        double x = packet.getX(player.getX());
+        double y = packet.getY(player.getY());
+        double z = packet.getZ(player.getZ());
+        float yaw = packet.getYRot(player.getYRot());
+        float pitch = packet.getXRot(player.getXRot());
+        if (Double.isNaN(x) || Double.isInfinite(x)
+                || Double.isNaN(y) || Double.isInfinite(y)
+                || Double.isNaN(z) || Double.isInfinite(z)
+                || Float.isNaN(yaw) || Float.isInfinite(yaw)
+                || Float.isNaN(pitch) || Float.isInfinite(pitch)) {
+            return;
+        }
+        player.absSnapTo(x, y, z, yaw, pitch);
+        player.setOnGround(packet.isOnGround());
+        BrowserChunkTaskPriority.recordPlayerPosition(x, z);
+        moveServerPlayerChunkTracking(player.level().getChunkSource(), player);
+    }
+
+    private static int floorSectionCoordinate(double coordinate) {
+        double section = Math.floor(coordinate / 16.0D);
+        if (section <= Integer.MIN_VALUE) {
+            return Integer.MIN_VALUE;
+        }
+        if (section >= Integer.MAX_VALUE) {
+            return Integer.MAX_VALUE;
+        }
+        return (int) section;
     }
 
     /**
@@ -470,7 +705,7 @@ public final class BrowserIntegratedServerMain {
         boolean pumped = false;
         try {
             pumped = drainScheduledNetworkInput();
-            if (!pumped) {
+            if (!pumped && !networkInputReschedulePending) {
                 recordNetworkPumpState(8, true);
                 reportRuntimeEvent(
                     "network-pump-wrong-thread",
@@ -481,6 +716,9 @@ public final class BrowserIntegratedServerMain {
         } finally {
             NETWORK_INPUT_TASK_SCHEDULED.set(false);
             recordNetworkPumpState(5, false);
+        }
+        if (!pumped && networkInputReschedulePending) {
+            return;
         }
         if (!pumped) {
             retryNetworkInputAfterTaskFailure();
@@ -541,11 +779,19 @@ public final class BrowserIntegratedServerMain {
 
     private static void deferNetworkInputRetry() {
         if (networkInputDeferredRetriesRemaining <= 0) {
+            // World generation can hold the event loop longer than the short retry
+            // ladder. Keep the pending input burst alive and restart the ladder with
+            // a bounded backoff instead of declaring a failure and dropping the
+            // browser wakeup permit.
             recordNetworkPumpState(11, false);
-            finishNetworkInputBurst();
-            reportRuntimeEvent(
-                    "network-pump-retry-exhausted",
-                    "Integrated server input remains queued after bounded retries");
+            networkInputDeferredRetriesRemaining = MAX_NETWORK_INPUT_DEFERRED_RETRIES;
+            TModernRuntimeSupport.yieldToEventLoop(8);
+            if (hasPendingNetworkInput()) {
+                scheduleNetworkInputTask(false, false);
+            } else {
+                finishNetworkInputBurst();
+                recordNetworkInputPending(false);
+            }
             return;
         }
         int retry = MAX_NETWORK_INPUT_DEFERRED_RETRIES
@@ -1028,10 +1274,10 @@ public final class BrowserIntegratedServerMain {
     @JSBody(script = "return String(globalThis.__gaiusServerSeed || '');")
     private static native String workerSeed();
 
-    @JSBody(script = "return Number(globalThis.__gaiusServerViewDistance || 6) | 0;")
+    @JSBody(script = "return Number(globalThis.__gaiusServerViewDistance || 8) | 0;")
     private static native int workerViewDistance();
 
-    @JSBody(script = "return Number(globalThis.__gaiusServerSimulationDistance || 4) | 0;")
+    @JSBody(script = "return Number(globalThis.__gaiusServerSimulationDistance || 6) | 0;")
     private static native int workerSimulationDistance();
 
     @JSBody(params = {"maxBytes", "maxEntries"}, script = """

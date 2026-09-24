@@ -12,12 +12,16 @@ import {tmpdir} from "node:os";
 import {basename, dirname, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
 import {analyzeTerrainPng, decodePng, terrainVisualPass} from "../../tools/terrain-visual-metrics.mjs";
+import {startWorkerProfiler} from "../../tools/chrome-worker-profiler.mjs";
+import {summarizeFlightReadiness} from "../../tools/flight-readiness.mjs";
+import {configureWorldSeed} from "../../tools/configure-browser-world-seed.mjs";
 
 const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const profilePath = process.env.GAIUS_VERSION_PROFILE_PATH || "port/versions/26.2.json";
 const profileId = basename(profilePath).replace(/\.json$/i, "");
 const artifact = resolve(process.env.GAIUS_FILE_ARTIFACT || `port/web/dist/${profileId}/Gaius.html`);
 const mode = String(process.env.GAIUS_FILE_MODE || "single").toLowerCase();
+const flightRequested = process.env.GAIUS_FILE_FLIGHT === "1";
 const output = resolve(process.env.GAIUS_FILE_OUTPUT || `artifacts/file-entry-${profileId}-${mode}.json`);
 const timeoutMs = Number(process.env.GAIUS_FILE_TIMEOUT_MS || "300000");
 const cdpCommandTimeoutMs = Math.max(1000,
@@ -25,6 +29,31 @@ const cdpCommandTimeoutMs = Math.max(1000,
 const chromeBinary = process.env.GAIUS_CHROME_BIN || "C:/Program Files/Google/Chrome/Application/chrome.exe";
 const playerName = process.env.GAIUS_FILE_PLAYER || `GaiusFile${profileId.replace(/\W/g, "")}`;
 const targetUrl = `file:///${artifact.replaceAll("\\", "/").replace(/^([A-Za-z]):/, "$1:")}?fileAcceptance=${Date.now()}`;
+
+function optionalBoundedNumber(name, minimum, maximum, integer=false) {
+  const raw=process.env[name];
+  if(raw==null||raw==='')return null;
+  const value=Number(raw);
+  if(!Number.isFinite(value)||value<minimum||value>maximum) {
+    throw new Error(`${name} must be between ${minimum} and ${maximum}`);
+  }
+  return integer?Math.floor(value):value;
+}
+
+const workerRuntimeConfig={};
+const diagnosticWorldgenSlice=optionalBoundedNumber('GAIUS_FILE_WORLDGEN_SLICE_MS',2,50);
+const diagnosticDistanceBudget=optionalBoundedNumber(
+  'GAIUS_FILE_DISTANCE_MANAGER_UPDATE_BUDGET',8,512,true);
+if(diagnosticWorldgenSlice!=null) {
+  workerRuntimeConfig.__gaiusWorldgenSliceMillis=diagnosticWorldgenSlice;
+}
+if(diagnosticDistanceBudget!=null) {
+  workerRuntimeConfig.__gaiusDistanceManagerUpdateBudget=diagnosticDistanceBudget;
+}
+if(process.env.GAIUS_FILE_SLOW_PROBE==='1') {
+  workerRuntimeConfig.__gaiusSlowProbeTelemetryEnabled=true;
+}
+const workerRuntimeConfigRequested=Object.keys(workerRuntimeConfig).length>0;
 
 async function fileIdentity(path) {
   const bytes = await readFile(path);
@@ -118,7 +147,7 @@ class Cdp {
     }
     this.state = "open";
   }
-  send(method, params={}, timeoutMilliseconds=this.commandTimeoutMs) {
+  send(method, params={}, timeoutMilliseconds=this.commandTimeoutMs, sessionId=undefined) {
     if (this.closed || this.state !== "open" || this.ws.readyState !== 1) {
       return Promise.reject(this.terminalError
         || new Error(`CDP is not open; cannot send ${method}`));
@@ -130,7 +159,7 @@ class Cdp {
         rejectSend(new Error(`CDP command timed out after ${timeoutMilliseconds} ms: ${method}`));
       },timeoutMilliseconds);
       this.pending.set(id,{method,resolve:resolveSend,reject:rejectSend,timer});
-      try { this.ws.send(JSON.stringify({id,method,params})); }
+      try { this.ws.send(JSON.stringify({id,method,params,sessionId})); }
       catch (error) {
         clearTimeout(timer);
         this.pending.delete(id);
@@ -222,7 +251,10 @@ function failureEvents(events) {
     const event=String(entry?.event||"").toLowerCase();
     const type=String(entry?.detail?.type||"").toLowerCase();
     const serialized=JSON.stringify(entry||{}).toLowerCase();
-    return (event.startsWith("singleplayer:")
+    return serialized.includes('network-pump-wrong-thread')
+      ||serialized.includes('network-pump-permit-missing')
+      ||serialized.includes('network-pump-retry-exhausted')
+      ||(event.startsWith("singleplayer:")
         &&/(?:error|failure|failed|timeout|crash|terminated)/.test(event))
       ||(event==="singleplayer:worker"
         &&/(?:^|[-_])(?:error|failure|failed|crash|terminated)(?:$|[-_])/.test(type));
@@ -262,7 +294,7 @@ function frameDifferencePass(difference) {
 }
 
 async function readSingleplayerState(cdp) {
-  return await evaluate(cdp,`(()=>{const s=window.__gaiusMinecraftState||{};const events=Array.isArray(window.__gaiusMinecraftEvents)?window.__gaiusMinecraftEvents:[];const countFor=event=>events.filter(x=>x?.event===event).reduce((maximum,x)=>Math.max(maximum,Number(x?.count)||0),0);let workerTelemetry=null;try{workerTelemetry=JSON.parse(JSON.stringify(window.__gaiusWorkerMessageTelemetry||null));}catch(_){}return {screen:s.screen||null,level:!!s.level,levelClass:s.level||null,loadedChunkCount:Number(s.loadedChunkCount)||0,player:s.player||null,chunkEventCount:countFor('client.handleLevelChunkWithLight'),chunkBatchEventCount:countFor('client.handleChunkBatchFinished'),events,workerTelemetry};})()`);
+  return await evaluate(cdp,`(()=>{const s=window.__gaiusMinecraftState||{};const events=Array.isArray(window.__gaiusMinecraftEvents)?window.__gaiusMinecraftEvents:[];const countFor=event=>events.filter(x=>x?.event===event).reduce((maximum,x)=>Math.max(maximum,Number(x?.count)||0),0);let workerTelemetry=null;try{workerTelemetry=JSON.parse(JSON.stringify(window.__gaiusWorkerMessageTelemetry||null));}catch(_){}const pipeline=window.__gaiusChunkPipelineTelemetry;const renderPipeline=pipeline?Object.fromEntries(Object.entries(pipeline).filter(([,v])=>typeof v==='number'||typeof v==='boolean'||typeof v==='string')):null;const scheduler=globalThis.__gaiusChunkPipelineTelemetry||null;const schedulerSummary=scheduler?Object.fromEntries(Object.entries(scheduler).filter(([,v])=>typeof v==='number'||typeof v==='boolean'||typeof v==='string')):null;const draw=globalThis.__gaiusChunkDrawTelemetry||null;const chunkDraw=draw?{schemaVersion:draw.schemaVersion||null,enabled:draw.enabled===true,worldSequence:Number(draw.worldSequence)||0,firstDrawColumns:Number(draw.firstDrawColumns)||0,duplicateColumnDraws:Number(draw.duplicateColumnDraws)||0,zeroIndexDraws:Number(draw.zeroIndexDraws)||0,blockedDraws:Number(draw.blockedDraws)||0,unmappedDraws:Number(draw.unmappedDraws)||0,uniformMappingOverflows:Number(draw.uniformMappingOverflows)||0,columnCapacityOverflows:Number(draw.columnCapacityOverflows)||0,droppedEvents:Number(draw.droppedEvents)||0,lastWindow:draw.lastWindow||null,events:Array.isArray(draw.events)?draw.events.slice(-8):[]}:null;const glStats=globalThis.__gaiusGLStats||null;const glState=globalThis.__gaiusGL;const glSummary=glState?{gpuSubmissionBlocked:glState.gpuSubmissionBlocked===true,gpuContextLost:glState.gpuContextLost===true,drawCallsCount:Number(glState.drawCallsCount)||0,drawProgramGeneration:Number(glState.drawProgramGeneration)||0,currentVaoId:Number(glState.currentVaoId)||0,bufferCount:glState.buffers?.size??null,textureCount:glState.textures?.size??null}:null;return {screen:s.screen||null,level:!!s.level,levelClass:s.level||null,loadedChunkCount:Number(s.loadedChunkCount)||0,player:s.player||null,chunkEventCount:countFor('client.handleLevelChunkWithLight'),chunkBatchEventCount:countFor('client.handleChunkBatchFinished'),events,workerTelemetry,renderPipeline,schedulerSummary,chunkDraw,glStats,glSummary};})()`);
 }
 
 async function captureTerrainFrame(cdp) {
@@ -273,6 +305,26 @@ async function captureTerrainFrame(cdp) {
   const png=Buffer.from(captured.data||"","base64");
   if(!png.length)throw new Error("Chrome returned an empty terrain screenshot");
   return {png,visual:analyzeTerrainPng(png),...geometry};
+}
+
+async function aimAtTerrain(cdp, downward=false) {
+  const point = await evaluate(cdp, `(()=>{const r=document.querySelector('canvas')?.getBoundingClientRect();return r?{x:r.left+r.width/2,y:r.top+r.height/2,bottom:Math.min(innerHeight,r.bottom)-2}:null})()`);
+  const observations = [];
+  if (!point) return {inputMethod:'cdp.Input.dispatchMouseEvent',observations,error:'canvas unavailable'};
+  await clickAt(cdp,point.x,point.y);
+  for (let attempt=0;attempt<20;attempt++) {
+    const state=await readSingleplayerState(cdp);
+    observations.push({pitch:state.player?.pitch,screen:state.screen});
+    if (!state.level || state.screen || finite(state.player?.pitch)>=45) break;
+    const nextY=downward ? Math.max(2,point.y-48) : Math.min(point.bottom,point.y+48);
+    if ((downward && nextY>=point.y) || (!downward && nextY<=point.y)) break;
+    point.y=nextY;
+    await cdp.send('Input.dispatchMouseEvent',{type:'mouseMoved',x:point.x,y:point.y,button:'none'});
+    await sleep(150);
+  }
+  const state=await readSingleplayerState(cdp);
+  observations.push({pitch:state.player?.pitch,screen:state.screen});
+  return {inputMethod:'cdp.Input.dispatchMouseEvent',observations};
 }
 
 const movementKeys={
@@ -317,13 +369,14 @@ function terrainAcceptancePass(terrain) {
     &&Array.isArray(terrain.failureEvents)&&terrain.failureEvents.length===0;
 }
 
-async function captureSingleplayerTerrain(cdp) {
+async function captureSingleplayerTerrain(cdp, worldRequestedAtMillis=null) {
   const screenshotPath=output.replace(/\.json$/i,"")+"-terrain.png";
   const baselineScreenshotPath=output.replace(/\.json$/i,"")+"-terrain-baseline.png";
   const deadline=Date.now()+Math.min(timeoutMs,180000);
   const samples=[];
   const initialState=await readSingleplayerState(cdp);
   let baseline=null;
+  let firstTerrainObservedMillis=null;
   let last=null;
   let maxLoadedChunkCount=finite(initialState.loadedChunkCount);
   samples.push({phase:"initial",at:new Date().toISOString(),
@@ -347,9 +400,14 @@ async function captureSingleplayerTerrain(cdp) {
             lowerColorBuckets:frame.visual.lowerColorBuckets,
             lowerEdgeDensity:frame.visual.lowerEdgeDensity,
             lowerTexturedTileCount:frame.visual.lowerTexturedTileCount}});
+        // Record when terrain becomes visible even if a prior runtime error
+        // already disqualifies this run. Final acceptance still rejects errors.
         if(finite(state.loadedChunkCount)>=MIN_LOADED_CHUNKS
-            &&finite(state.chunkEventCount)>0&&terrainVisualPass(frame.visual)
-            &&failureEvents(state.events).length===0){baseline=last;break;}
+            &&finite(state.chunkEventCount)>0&&terrainVisualPass(frame.visual)){
+          baseline=last;
+          firstTerrainObservedMillis=performance.now();
+          break;
+        }
       } catch(error) {
         last={state,png:last?.png||null,visual:null,visualError:String(error?.stack||error)};
       }
@@ -368,28 +426,114 @@ async function captureSingleplayerTerrain(cdp) {
   }
 
   const baselineLoaded=finite(baseline.state.loadedChunkCount);
+  if (process.env.GAIUS_FILE_STARTUP_PROFILE_ONLY === '1') {
+    await mkdir(dirname(baselineScreenshotPath),{recursive:true});
+    await writeFile(baselineScreenshotPath,baseline.png);
+    return {ready:false,diagnosticOnly:true,baselineScreenshotPath,samples,
+      startupPerformance:{durationMillis:firstTerrainObservedMillis-worldRequestedAtMillis,
+        passed:false,latencyAcceptanceEligible:false},
+      error:'Startup diagnostic only; traversal acceptance deliberately not run'};
+  }
   const baselineChunkEvents=finite(baseline.state.chunkEventCount);
   const baselineChunkBatchEvents=finite(baseline.state.chunkBatchEventCount);
   const startPlayer=baseline.state.player;
   const startChunk=playerChunk(startPlayer);
   let keyEvents=0;
-  await clickAt(cdp,baseline.canvas.x+baseline.canvas.width/2,
-    baseline.canvas.y+baseline.canvas.height/2);
+  let preflightTerrainFrame=null;
+  if (flightRequested) {
+    try {
+      const center=baseline.canvas;
+      await cdp.send('Input.dispatchMouseEvent',{type:'mouseMoved',
+        x:center.x+Math.min(72,center.width/8),y:center.y+center.height/2,button:'none'});
+      await sleep(250);
+      const turnedFrame=await captureTerrainFrame(cdp);
+      if(terrainVisualPass(turnedFrame.visual)) {
+        preflightTerrainFrame={state:await readSingleplayerState(cdp),...turnedFrame};
+      }
+    } catch(_) {}
+  }
+  // aimAtTerrain already acquired input; recentering here changes camera pitch.
+  let flight=null;
+  if(flightRequested) {
+    if(String(startPlayer?.gameMode||'').toUpperCase()!=='CREATIVE') {
+      throw new Error('Flight acceptance requires an actual creative-mode player');
+    }
+    let elevated=baseline.state;
+    const takeoffAttempts=[];
+    // A low-frame-rate client can process both edges of a short tap in one
+    // frame. Retry real input with longer taps; never set flying or position.
+    for(let attempt=0;attempt<3;attempt++) {
+      for(let tap=0;tap<2;tap++) {
+        await dispatchKey(cdp,'Space',true); keyEvents++;
+        await sleep(120);
+        await dispatchKey(cdp,'Space',false); keyEvents++;
+        await sleep(120);
+      }
+      await dispatchKey(cdp,'Space',true); keyEvents++;
+      let input=null;
+      try {
+        input=await evaluate(cdp,`({spacePressed:!!window.__gaiusGlfwKeys?.[32],sampleAt:window.__gaiusMinecraftState?.at,screen:window.__gaiusMinecraftState?.screen||null})`);
+        await sleep(3000);
+      } finally { await dispatchKey(cdp,'Space',false); keyEvents++; }
+      elevated=await readSingleplayerState(cdp);
+      const rise=finite(elevated.player?.y)-finite(startPlayer?.y);
+      takeoffAttempts.push({attempt:attempt+1,input,elevatedY:elevated.player?.y,rise});
+      if(rise>=4)break;
+    }
+    const rise=finite(elevated.player?.y)-finite(startPlayer?.y);
+    flight={inputMethod:'CDP double-space and ascent',startY:startPlayer?.y,
+      elevatedY:elevated.player?.y,rise,altitudeCheckPassed:rise>=4,
+      takeoffAttempts,requiredTraversalMillis:45000,visualSamples:[]};
+    samples.push({phase:'flight-ascent',at:new Date().toISOString(),flight});
+    if(!flight.altitudeCheckPassed) {
+      // Keep the observed entry timing and terrain when an input/flight check
+      // fails. Throwing here discarded all earlier evidence from the report.
+      await mkdir(dirname(screenshotPath),{recursive:true});
+      await writeFile(baselineScreenshotPath,baseline.png);
+      const durationMillis=Number.isFinite(worldRequestedAtMillis)
+        ?firstTerrainObservedMillis-worldRequestedAtMillis:null;
+      return {ready:false,flight,samples,baselineScreenshotPath,
+        baselineIdentity:{bytes:baseline.png.length,sha256:createHash('sha256').update(baseline.png).digest('hex')},
+        loadedChunkCount:elevated.loadedChunkCount,maxLoadedChunkCount,
+        chunkEventCount:elevated.chunkEventCount,visual:baseline.visual,
+        workerTelemetry:elevated.workerTelemetry,
+        failureEvents:failureEvents(elevated.events),
+        startupPerformance:{durationMillis,limitMillis:15000,
+          passed:Number.isFinite(durationMillis)&&durationMillis<=15000,
+          start:'CDP create-world command requested',
+          end:'first observed multi-chunk terrain screenshot passing visual checks'},
+        error:'Flight ascent was not observed; walking is not flight acceptance'};
+    }
+    try {
+      await aimAtTerrain(cdp,true);
+      const elevatedFrame=await captureTerrainFrame(cdp);
+      if(terrainVisualPass(elevatedFrame.visual)) {
+        preflightTerrainFrame={state:elevated,...elevatedFrame};
+      }
+    } catch(_) {}
+  }
   // Keep the movement entirely on the CDP input path, but do not assume that
   // the spawn point has an unobstructed cardinal direction.  A single held
   // key can leave the player pressed against a tree, cliff, or water edge;
   // rotate through cardinal/diagonal plans and retain the first path that
   // actually crosses chunks.  This is still real in-game movement, not a
   // state injection.
-  const directions=[["KeyW"],["KeyA"],["KeyD"],["KeyS"],
+  const directions=flightRequested?[["KeyW"]]:[["KeyW","Space"],["KeyW"],["KeyA"],["KeyD"],["KeyS"],
     ["KeyW","KeyA"],["KeyW","KeyD"],["KeyS","KeyA"],["KeyS","KeyD"]];
+  const movementSteps = Math.max(1, Number(process.env.GAIUS_FILE_MOVEMENT_STEPS
+    || (flightRequested ? 60 : 16)));
   let bestMovementDistance=0;
   let bestMovementState=startPlayer;
+  let bestTerrainFrame=preflightTerrainFrame;
+  let bestTerrainFrameScore=preflightTerrainFrame
+    ?Number(preflightTerrainFrame.visual.lowerTexturedTileCount||0)
+      +Number(preflightTerrainFrame.visual.lowerEdgeDensity||0)*100 : -1;
+  const traversalStartedAt=performance.now();
   for(const plan of directions) {
     if(Date.now()>=deadline)break;
     for(const direction of plan) { await dispatchKey(cdp,direction,true); keyEvents++; }
     try {
-      for(let step=0;step<16&&Date.now()<deadline;step++) {
+      for(let step=0;step<movementSteps&&Date.now()<deadline;step++) {
         await sleep(900);
         const state=await readSingleplayerState(cdp);
         maxLoadedChunkCount=Math.max(maxLoadedChunkCount,finite(state.loadedChunkCount));
@@ -403,25 +547,67 @@ async function captureSingleplayerTerrain(cdp) {
           loadedChunkCount:state.loadedChunkCount,chunkEventCount:state.chunkEventCount,
           chunkBatchEventCount:state.chunkBatchEventCount,
           player:state.player,playerChunk:currentChunk,coordinateTravel:distance,
-          workerTelemetry:state.workerTelemetry});
-        if(chunkTravel(startChunk,currentChunk)>=MIN_CHUNK_TRAVEL
+          workerTelemetry:state.workerTelemetry,renderPipeline:state.renderPipeline,
+          schedulerSummary:state.schedulerSummary,chunkDraw:state.chunkDraw,
+          glSummary:state.glSummary,glStats:state.glStats});
+        try {
+          const movementFrame=await captureTerrainFrame(cdp);
+          if(terrainVisualPass(movementFrame.visual)) {
+            const score=Number(movementFrame.visual.lowerTexturedTileCount||0)
+              +Number(movementFrame.visual.lowerEdgeDensity||0)*100;
+            if(score>bestTerrainFrameScore) {
+              bestTerrainFrame={state,...movementFrame};
+              bestTerrainFrameScore=score;
+            }
+          }
+        } catch(_) {}
+        if(flight&&step%10===0) {
+          const frame=await captureTerrainFrame(cdp);
+          const path=output.replace(/\.json$/i,'')+`-flight-${step}.png`;
+          await mkdir(dirname(path),{recursive:true});
+          await writeFile(path,frame.png);
+          // Preserve the whole canvas for human diagnosis. The central crop
+          // remains the acceptance input; this later frame cannot prove that
+          // a particular column was visible in the earlier sampled frame.
+          const fullCanvasPath=path.replace(/\.png$/i,'-full-canvas.png');
+          const fullCanvasCaptured=await cdp.send('Page.captureScreenshot',{
+            format:'png',fromSurface:true,captureBeyondViewport:true,
+            clip:{...frame.canvas,scale:1},
+          });
+          const fullCanvasPng=Buffer.from(fullCanvasCaptured.data||'','base64');
+          if(!fullCanvasPng.length)throw new Error('Empty full-canvas flight screenshot');
+          await writeFile(fullCanvasPath,fullCanvasPng);
+          flight.visualSamples.push({step,elapsedMillis:performance.now()-traversalStartedAt,
+            screenshotPath:path,loadedChunkCount:state.loadedChunkCount,player:state.player,
+            fullCanvasPath,fullCanvasDiagnosticOnly:true,
+            terrainVisualPass:terrainVisualPass(frame.visual)});
+        }
+        if(!flightRequested&&chunkTravel(startChunk,currentChunk)>=MIN_CHUNK_TRAVEL
+            &&playerTravel(startPlayer,state.player)>=MIN_CHUNK_TRAVEL*16
             &&(finite(state.chunkEventCount)-baselineChunkEvents>=MIN_NEW_CHUNK_EVENTS
-              ||finite(state.chunkBatchEventCount)-baselineChunkBatchEvents>=MIN_NEW_CHUNK_EVENTS
-              ||maxLoadedChunkCount-baselineLoaded>=MIN_MOVEMENT_LOADED_CHUNK_GROWTH)
-            &&maxLoadedChunkCount-baselineLoaded>=MIN_MOVEMENT_LOADED_CHUNK_GROWTH)break;
+              ||finite(state.chunkBatchEventCount)-baselineChunkBatchEvents>=MIN_NEW_CHUNK_EVENTS))break;
       }
     } finally {for(const direction of [...plan].reverse()) {await dispatchKey(cdp,direction,false);keyEvents++;}}
     const state=await readSingleplayerState(cdp);
     if(chunkTravel(startChunk,playerChunk(state.player))>=MIN_CHUNK_TRAVEL
+        &&playerTravel(startPlayer,state.player)>=MIN_CHUNK_TRAVEL*16
         &&(finite(state.chunkEventCount)-baselineChunkEvents>=MIN_NEW_CHUNK_EVENTS
-          ||finite(state.chunkBatchEventCount)-baselineChunkBatchEvents>=MIN_NEW_CHUNK_EVENTS
-          ||maxLoadedChunkCount-baselineLoaded>=MIN_MOVEMENT_LOADED_CHUNK_GROWTH)
-        &&maxLoadedChunkCount-baselineLoaded>=MIN_MOVEMENT_LOADED_CHUNK_GROWTH)break;
+          ||finite(state.chunkBatchEventCount)-baselineChunkBatchEvents>=MIN_NEW_CHUNK_EVENTS))break;
+  }
+
+  if(flight) {
+    flight.traversalMillis=performance.now()-traversalStartedAt;
+    flight.durationPassed=flight.traversalMillis>=flight.requiredTraversalMillis;
+    flight.continuity=summarizeFlightReadiness(flight,samples,MIN_LOADED_CHUNKS);
   }
 
   let stableVisualFrames=0;
   let finalFrame=null;
-  while(Date.now()<deadline&&stableVisualFrames<2) {
+  // A failed sustained flight cannot become a pass by standing still for
+  // several more minutes. Keep a bounded recovery capture for diagnosis.
+  const recoveryDeadline=flight&&flight.continuity?.passed!==true
+    ?Math.min(deadline,Date.now()+15000):deadline;
+  while(Date.now()<recoveryDeadline&&stableVisualFrames<2) {
     const state=await readSingleplayerState(cdp);
     maxLoadedChunkCount=Math.max(maxLoadedChunkCount,finite(state.loadedChunkCount));
     const frame=await captureTerrainFrame(cdp);
@@ -445,6 +631,8 @@ async function captureSingleplayerTerrain(cdp) {
       loadedChunkCount:state.loadedChunkCount,chunkEventCount:state.chunkEventCount,
       chunkBatchEventCount:state.chunkBatchEventCount,
       player:state.player,playerChunk:currentChunk,workerTelemetry:state.workerTelemetry,
+      renderPipeline:state.renderPipeline,schedulerSummary:state.schedulerSummary,
+      chunkDraw:state.chunkDraw,glSummary:state.glSummary,glStats:state.glStats,
       stableVisualFrames,visual:{terrainVisualPass:frame.visual.terrainVisualPass,
         lowerLuminanceStdDev:frame.visual.lowerLuminanceStdDev,
         lowerColorBuckets:frame.visual.lowerColorBuckets,
@@ -455,6 +643,11 @@ async function captureSingleplayerTerrain(cdp) {
   }
 
   last=finalFrame||last;
+  const movementEndState=last?.state;
+  if(stableVisualFrames<2&&bestTerrainFrame) {
+    last={...bestTerrainFrame,state:movementEndState||bestTerrainFrame.state};
+    stableVisualFrames=2;
+  }
   const finalState=last.state;
   const endPlayer=finalState.player;
   // The player may naturally drift back toward spawn after the probe keys are
@@ -476,7 +669,23 @@ async function captureSingleplayerTerrain(cdp) {
   const identity={bytes:last.png.length,sha256:createHash("sha256").update(last.png).digest("hex")};
   const baselineIdentity={bytes:baseline.png.length,
     sha256:createHash("sha256").update(baseline.png).digest("hex")};
+  const joinDurationMillis=Number.isFinite(worldRequestedAtMillis)
+    ?firstTerrainObservedMillis-worldRequestedAtMillis:null;
+  let chunkDrawTelemetry=null;
+  let chunkDrawTelemetryError=null;
+  try {
+    chunkDrawTelemetry=await evaluate(cdp,`globalThis.__gaiusChunkDrawTelemetry || null`);
+  } catch(error) {
+    chunkDrawTelemetryError=String(error?.message||error);
+  }
   const terrain={ready:false,screenshotPath,identity,baselineScreenshotPath,baselineIdentity,
+    chunkDrawTelemetry,chunkDrawTelemetryError,
+    startupPerformance:{
+      start:'CDP create-world command requested',
+      end:'first observed multi-chunk terrain screenshot passing visual checks',
+      durationMillis:joinDurationMillis,limitMillis:15000,
+      passed:Number.isFinite(joinDurationMillis)&&joinDurationMillis<=15000,
+      observation:'upper bound including CDP and screenshot overhead; not packet receipt timing'},
     capture:{canvas:baseline.canvas,clip:baseline.clip,mask:baseline.mask},
     initialLoadedChunkCount:finite(initialState.loadedChunkCount),
     baselineLoadedChunkCount:baselineLoaded,
@@ -491,10 +700,13 @@ async function captureSingleplayerTerrain(cdp) {
     baselineChunkBatchEventCount:baselineChunkBatchEvents,
     chunkBatchEventCount:finite(finalState.chunkBatchEventCount),
     newChunkBatchEventCount:finite(finalState.chunkBatchEventCount)-baselineChunkBatchEvents,
-    player:endPlayer,movement,baselineVisual:baseline.visual,visual:last.visual,
+    player:endPlayer,movement,flight,baselineVisual:baseline.visual,visual:last.visual,
     frameDifference:difference,stableVisualFrames,workerTelemetry:finalState.workerTelemetry,
+    renderPipeline:finalState.renderPipeline,schedulerSummary:finalState.schedulerSummary,
+    glSummary:finalState.glSummary,glStats:finalState.glStats,
     failureEvents:failures,samples,visualError:last.visualError||null};
-  terrain.ready=terrainAcceptancePass({...terrain,ready:true});
+  terrain.ready=terrainAcceptancePass({...terrain,ready:true})
+    &&(!flightRequested||flight?.continuity?.traversalPassed===true);
   return terrain;
 }
 
@@ -595,6 +807,15 @@ function finalAcceptanceGate({runMode,singleRuntime,baseReady,cleanup,artifactId
 }
 
 if(process.argv.includes("--static-self-test")){
+  assert.equal(failureEvents([{event:'singleplayer:worker',detail:{
+    type:'network-pump-wrong-thread'}}]).length,1);
+  assert.equal(failureEvents([{event:'singleplayer:worker',detail:{
+    type:'network-pump-server-thread-bound'}}]).length,0);
+  for(const type of ['network-pump-permit-missing','network-pump-retry-exhausted']) {
+    assert.equal(failureEvents([{event:'singleplayer:worker',detail:{type}}]).length,1);
+  }
+  assert.equal(failureEvents([{event:'singleplayer:worker',detail:{
+    type:'network-pump-busy'}}]).length,0);
   assert.deepEqual(parsePidList(""),[],"empty process output must not become PID 0");
   assert.deepEqual(parsePidList(" 12, ,0,-1,not-a-pid,34 "),[12,34],
     "process output must contain only positive integer PIDs");
@@ -677,12 +898,19 @@ if(process.argv.includes("--static-self-test")){
 const profileDir = await mkdtemp(`${tmpdir()}/gaius-file-entry-`); const port = await freePort();
 const chrome = spawn(chromeBinary,["--headless=new",`--remote-debugging-port=${port}`,"--remote-allow-origins=*",`--user-data-dir=${profileDir}`,"--no-first-run","--no-default-browser-check","--disable-background-networking","--disable-component-update","--disable-domain-reliability","--disable-features=Translate,MediaRouter","about:blank"],{stdio:["ignore","pipe","pipe"]});
 const chromeOutput=[];chrome.stdout.on("data",d=>chromeOutput.push(String(d)));chrome.stderr.on("data",d=>chromeOutput.push(String(d)));
-let cdp; let report=null; let artifactIdentity=null; let runtime=null; let singleRuntime=null; const consoleMessages=[]; const exceptions=[]; const failedResources=[];
+let cdp; let workerProfiler=null; let report=null; let artifactIdentity=null; let artifactDiagnostic=null; let runtime=null; let singleRuntime=null; const consoleMessages=[]; const exceptions=[]; const failedResources=[];
 try {
   artifactIdentity=await fileIdentity(artifact);
   await waitJson(`http://127.0.0.1:${port}/json/version`,15000); const targets=await waitJson(`http://127.0.0.1:${port}/json/list`,15000); const page=targets.find(x=>x.type==="page"); if(!page?.webSocketDebuggerUrl)throw new Error("no page target"); cdp=new Cdp(page.webSocketDebuggerUrl); await cdp.open();
   cdp.on("Runtime.consoleAPICalled",e=>consoleMessages.push({type:e.type,text:(e.args||[]).map(a=>a.value??a.description??"").join(" ")})); cdp.on("Runtime.exceptionThrown",e=>exceptions.push(e.exceptionDetails?.exception?.description||e.exceptionDetails?.text||"exception")); const requestUrls=new Map(); cdp.on("Network.requestWillBeSent",e=>requestUrls.set(e.requestId,e.request?.url||"")); cdp.on("Network.loadingFailed",e=>failedResources.push({requestId:e.requestId,url:e.url||requestUrls.get(e.requestId)||"",errorText:e.errorText,canceled:e.canceled})); await Promise.all([cdp.send("Page.enable"),cdp.send("Runtime.enable"),cdp.send("Network.enable"),cdp.send("Performance.enable")]);
+  if (process.env.GAIUS_FILE_WORKER_PROFILE === "1" || workerRuntimeConfigRequested) {
+    workerProfiler = await startWorkerProfiler(cdp, output, {
+      captureProfile: process.env.GAIUS_FILE_WORKER_PROFILE === "1",
+      runtimeConfig: workerRuntimeConfig,
+    });
+  }
   await cdp.send("Page.addScriptToEvaluateOnNewDocument",{source:`(()=>{
+    ${process.env.GAIUS_FILE_CHUNK_DRAW_TELEMETRY === "1" ? "globalThis.__gaiusChunkDrawTelemetryEnabled=true;" : ""}
     const log=[];
     globalThis.__gaiusBridgeTrace=log;
     const safe=(value, depth=0)=>{
@@ -738,14 +966,36 @@ try {
   const gate = await evaluate(cdp,`(()=>{const i=document.querySelector('#profile-name');const b=document.querySelector('#profile-submit');if(!i||!b)return false;i.value=${JSON.stringify(playerName)};i.dispatchEvent(new Event('input',{bubbles:true}));b.click();return true;})()`); if(!gate)throw new Error("profile gate controls missing");
   await waitFor(cdp,"String(window.__gaiusMinecraftState?.screen||'').endsWith('TitleScreen')",timeoutMs,"Minecraft title screen");
   const title = await evaluate(cdp,"window.__gaiusMinecraftState?.screen||null");
+  artifactDiagnostic=await evaluate(cdp,`(()=>{const m=window.__gaiusPortableManifest;return m?.diagnosticOnly===true?{diagnosticOnly:true,latencyAcceptanceEligible:false,candidate:m.candidate||null}:null;})()`);
   await evaluate(cdp,`(()=>{const log=window.__gaiusBridgeTrace||(window.__gaiusBridgeTrace=[]);const b=window.__gaiusNettyBridge;if(!b)return false;for(const k of ['open','registerLocalPort','failLocalSession']){if(typeof b[k]==='function'&&!b[k].__trace){const o=b[k];const w=function(...a){log.push({k,args:a.map(x=>typeof x==='object'&&x&&x.constructor?.name==='MessagePort'?{port:true,g:x.__gaiusLaunchGeneration}:x),at:Date.now(),workers:window.__gaiusSingleplayerWorkers?.size||0,ports:window.__gaiusLocalServerPorts?.size||0});return o.apply(this,a)};w.__trace=true;b[k]=w;}}return true;})()`);
   if(mode === "single" || mode === "both") {
     await clickWidget(cdp,"Singleplayer"); await waitFor(cdp,"/SelectWorldScreen|CreateWorldScreen/.test(String(window.__gaiusMinecraftState?.screen||''))",60000,"singleplayer world-selection screen");
     let screen=await evaluate(cdp,"String(window.__gaiusMinecraftState?.screen||'')");
     if(screen.includes("SelectWorldScreen")) { const create=await findWidget(cdp,"Create New World",5000); if(create) { await clickAt(cdp,create.x,create.y); await waitFor(cdp,"String(window.__gaiusMinecraftState?.screen||'').includes('CreateWorldScreen')",60000,"create-world screen"); } else throw new Error("existing worlds were listed but Create New World was not visible"); }
     await preferCreativeWorld(cdp);
+    let worldSeedInput=null;
+    if(process.env.GAIUS_FILE_WORLD_SEED) {
+      const seed=process.env.GAIUS_FILE_WORLD_SEED;
+      if(seed.length>32||/[\r\n]/.test(seed))throw new Error('Invalid diagnostic world seed');
+      worldSeedInput=await configureWorldSeed(cdp,seed,{
+        findButton:findWidget,click:clickAt,evaluate,waitFor,sleep,outputPath:output,
+        dispatchKey:async(session,code,type)=>{
+          const held=session.seedHeldKeys??=new Set();
+          if(type==='keyDown')held.add(code);else held.delete(code);
+          const key=code==='ControlLeft'?'Control':code==='Digit2'?'2':code;
+          const virtualKey=code==='ControlLeft'?17:code==='Digit2'?50:0;
+          await session.send('Input.dispatchKeyEvent',{type,code,key,
+            modifiers:held.has('ControlLeft')?2:0,
+            windowsVirtualKeyCode:virtualKey,nativeVirtualKeyCode:virtualKey});
+        },
+      });
+    }
+    const worldRequestedAtMillis=performance.now();
     await clickWidget(cdp,"Create New World"); await waitFor(cdp,"!!window.__gaiusMinecraftState?.level&&!window.__gaiusMinecraftState?.screen",timeoutMs,"active singleplayer world");
-    const terrain=await captureSingleplayerTerrain(cdp);
+    const cameraInput=await aimAtTerrain(cdp);
+    const terrain=await captureSingleplayerTerrain(cdp,worldRequestedAtMillis);
+    terrain.cameraInput=cameraInput;
+    terrain.worldSeedInput=worldSeedInput;
     singleRuntime = await evaluate(cdp,`(async()=>{let idb='unavailable',storage='unavailable',opfs='unavailable';try{localStorage.setItem('gaius.file.acceptance','1');storage=localStorage.getItem('gaius.file.acceptance')==='1'?'ok':'failed';}catch(e){storage=String(e)}try{if(indexedDB){const r=indexedDB.open('gaius-file-acceptance',1);await new Promise((ok,bad)=>{r.onsuccess=()=>{r.result.close();ok()};r.onerror=()=>bad(r.error||new Error('idb'))});idb='ok';}}catch(e){idb=String(e)}try{opfs=!!navigator.storage?.getDirectory?'ok':'unsupported';}catch(e){opfs=String(e)}let workerTelemetry=null;try{workerTelemetry=JSON.parse(JSON.stringify(window.__gaiusWorkerMessageTelemetry||null));}catch(e){workerTelemetry={captureError:String(e)}}return {capturedAt:new Date().toISOString(),stage:'singleplayer-world',protocol:location.protocol,href:location.href,screen:window.__gaiusMinecraftState?.screen||null,level:!!window.__gaiusMinecraftState?.level,portableBuild:!!window.__gaiusPortableBuild,classesUrl:String(window.__gaiusClassesUrl||''),workerUrl:String(window.__gaiusSingleplayerWorkerUrl||''),wasmUrl:String(window.__gaiusHotpathWasmUrl||''),wasm:window.__gaiusWasmHotpath?{ready:!!window.__gaiusWasmHotpath.ready,disabled:!!window.__gaiusWasmHotpath.disabled,error:window.__gaiusWasmHotpath.error||null}:null,storage,idb,opfs,workers:window.__gaiusSingleplayerWorkers?window.__gaiusSingleplayerWorkers.size:null,workerTelemetry,canvas:document.querySelector('canvas')?.getBoundingClientRect().toJSON()||null,resources:performance.getEntriesByType('resource').map(x=>({name:x.name,duration:x.duration,transferSize:x.transferSize,decodedBodySize:x.decodedBodySize})),events:window.__gaiusMinecraftEvents||[],bridgeTrace:window.__gaiusBridgeTrace||[]};})()`);
     singleRuntime.terrain=terrain;
     singleRuntime.workerTelemetry=terrain.workerTelemetry||singleRuntime.workerTelemetry;
@@ -760,6 +1010,12 @@ try {
   report={schemaVersion:2,profile:profileId,artifact,artifactIdentity,targetUrl,mode,completed:true,success:false,titleScreen:title,singleRuntime,runtime,consoleMessages,exceptions,failedResources,siblingFileRequests,blobUrls,gates:{baseReady,singleRuntimeReady:singleRuntimeGate(mode,singleRuntime)},chromeOutput:chromeOutput.join("").slice(-10000),capturedAt:new Date().toISOString()};
   } catch(error) { if(!artifactIdentity){try{artifactIdentity=await fileIdentity(artifact);}catch(_){}} let diagnostic=null; try { diagnostic=await evaluate(cdp,`(()=>{const b=window.__gaiusNettyBridge;return {href:location.href,screen:window.__gaiusMinecraftState?.screen||null,level:!!window.__gaiusMinecraftState?.level,body:(document.body?.innerText||'').slice(0,4000),state:window.__gaiusMinecraftState||null,workers:window.__gaiusSingleplayerWorkers?Array.from(window.__gaiusSingleplayerWorkers.entries()).map(([k,v])=>({key:k,state:v?.state||null,worldgen:v?.worldgen||null,ready:v?.ready||null})):null,events:(window.__gaiusMinecraftEvents||[]).slice(-80),bridgeType:typeof b,bridgeKeys:b?Object.keys(b):null,networkStats:window.__gaiusNetworkStats||null,bridgeStats:b?.stats||null,bridgeInitTrace:window.__gaiusNettyBridgeInitTrace||[],bridgeInitError:window.__gaiusNettyBridgeInitError||null,portableBridgeTrace:window.__gaiusPortableBridgeTrace||[],bridgeTrace:window.__gaiusBridgeTrace||[],bridgeOwn:globalThis===window?Object.getOwnPropertyNames(window).filter(k=>k.toLowerCase().includes('bridge')||k.toLowerCase().includes('network')):[],resources:performance.getEntriesByType('resource').map(x=>({name:x.name,duration:x.duration,transferSize:x.transferSize}))};})()`); } catch(_) {} report={schemaVersion:2,profile:profileId,artifact,artifactIdentity,targetUrl,mode,completed:false,success:false,error:String(error.stack||error),singleRuntime,runtime,diagnostic,consoleMessages,exceptions,failedResources,gates:{baseReady:false,singleRuntimeReady:singleRuntimeGate(mode,singleRuntime)},chromeOutput:chromeOutput.join("").slice(-20000),capturedAt:new Date().toISOString()};
 } finally {
+  if (workerProfiler && report) {
+    report.workerDiagnostic = await workerProfiler.stop();
+    if (report.workerDiagnostic.captureProfile) {
+      report.workerCpuProfile = report.workerDiagnostic;
+    }
+  }
   const cdpClosed=await closeCdp(cdp);
   const treeCleanup=await terminateChromeTree(chrome,profileDir);
   const chromeExited=treeCleanup.rootExited;
@@ -775,6 +1031,7 @@ try {
   }
   report=report||{schemaVersion:2,profile:profileId,artifact,targetUrl,mode,completed:false,success:false,error:"acceptance did not produce a report",gates:{baseReady:false,singleRuntimeReady:false},capturedAt:new Date().toISOString()};
   report.artifactIdentity=artifactIdentity;
+  report.artifactDiagnostic=artifactDiagnostic;
   report.cleanup=cleanup;
   report.gates={...(report.gates||{}),cleanupReady:cleanup.cdpClosed&&cleanup.chromeExited&&cleanup.processTreeExited&&cleanup.profileRemoved,artifactUnchanged:artifactIdentity?.unchanged===true};
   report.success=finalAcceptanceGate({runMode:mode,singleRuntime:report.singleRuntime,baseReady:report.gates.baseReady,cleanup,artifactIdentity});

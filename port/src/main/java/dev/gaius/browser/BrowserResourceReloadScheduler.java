@@ -16,8 +16,12 @@ import org.teavm.jso.JSBody;
 public final class BrowserResourceReloadScheduler {
     // Large server packs can otherwise exceed proxy/backend configuration timeouts.
     // Checked between commands; a single command can exceed this slice budget.
-    private static final long FRAME_WORK_BUDGET_NANOS = 11_000_000L;
-    private static final int MAX_SUBMISSIONS_PER_BATCH = 384;
+    // Resource-pack reloads are a finite foreground burst.  Eleven milliseconds
+    // with 384 submissions stretched the 62 MB multiplayer pack across ~54 s;
+    // use a 25 ms cooperative slice so the browser still gets timers/input while
+    // the atlas/model graph drains in a small number of turns.
+    private static final long FRAME_WORK_BUDGET_NANOS = 25_000_000L;
+    private static final int MAX_SUBMISSIONS_PER_BATCH = 1024;
     private static final Deque<Runnable> QUEUE = new ArrayDeque<>();
     private static boolean pumpScheduled;
 

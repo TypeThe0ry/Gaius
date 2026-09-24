@@ -17,8 +17,10 @@ function body(name) {
 }
 const first = source.indexOf('window.__gaiusGL.noteBufferWebglType=function');
 const last = source.indexOf('window.__gaiusGL.shadowBufferDataForTarget=function', first);
-const helpers = source.slice(first,last);
-const scripts = {helpers, bind:body('bindBuffer'), copy:body('copyBufferSubData'), named:body('copyNamedBufferSubData')};
+const markStart=source.indexOf('window.__gaiusGL.markBufferShadowRequired=function');
+const markEnd=source.indexOf('window.__gaiusGL.bufferNeedsArrayShadow=function',markStart);
+const helpers = source.slice(markStart,markEnd)+source.slice(first,last);
+const scripts = {helpers, init:body('initializeJs'), upload:body('bufferSubDataJs'), bind:body('bindBuffer'), copy:body('copyBufferSubData'), named:body('copyNamedBufferSubData')};
 const script = `
 const scripts=${JSON.stringify(scripts)};
 const output=document.querySelector('pre');
@@ -27,12 +29,13 @@ if(!gl) throw Error('WebGL2 unavailable');
 window.__gaiusWebGL=gl;
 window.__gaiusGLStats={};
 const vao={elementArrayBuffer:0,elementArrayBufferObject:null};
-const state=window.__gaiusGL={buffers:new Map(),bufferSizes:new Map(),bufferBytes:new Map(),boundBuffers:new Map(),bufferWebglTypes:new Map(),bufferVersions:new Map(),shadowRequiredBuffers:new Set(),
+Function(scripts.init)();
+const state=window.__gaiusGL;
+Object.assign(state,{
  getVaoEmu:()=>vao,bindPhysicalElementBuffer:(v,b)=>gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,b),replaceVaoBufferRef:()=>{},
  ensureLogicalElementBuffer:()=>gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,vao.elementArrayBufferObject),
- shouldShadowBufferTarget:()=>false,touchBufferShadow:()=>{},noteNamedBufferBindings:()=>{},
- dropBufferShadow(id){const present=this.bufferBytes.delete(id);if(present)this.bumpBufferVersion(id);return present;},
- bumpBufferVersion(id){this.bufferVersions.set(id,(this.bufferVersions.get(id)||0)+1);}};
+ noteBufferUpload:()=>{},noteNamedBufferBindings:()=>{},
+ bumpBufferVersion(id){this.bufferVersions.set(id,(this.bufferVersions.get(id)||0)+1);}});
 Function(scripts.helpers)();
 const bind=Function('target','buffer',scripts.bind);
 const copy=Function('sourceTarget','targetTarget','sourceOffset','targetOffset','size',scripts.copy);
@@ -69,6 +72,19 @@ try{
  copy(gl.COPY_READ_BUFFER,gl.COPY_WRITE_BUFFER,400,0,128);
  check(gl.getError()===gl.NO_ERROR&&__gaiusGLStats.crossKindBufferCopies===count,'same-kind keeps native GPU path');
  check(equal(bytes(3,0,128),input.slice(400,528)),'same-kind bytes exact');
+ bind(gl.COPY_READ_BUFFER,1);bind(gl.COPY_WRITE_BUFFER,2);
+ state.deleteBufferShadow(1);
+ const upload=Function('target','offset','data',scripts.upload);
+ upload(gl.COPY_READ_BUFFER,0,input);
+ const steadyReads=__gaiusGLStats.crossKindBufferCopyReadbacks;
+ for(let i=0;i<100;i++){
+   const updated=new Uint8Array(72);updated.fill(i);
+   upload(gl.COPY_READ_BUFFER,1000,updated);
+   copy(gl.COPY_READ_BUFFER,gl.COPY_WRITE_BUFFER,1000,32,72);
+   check(equal(bytes(2,32,72),updated),'updated staging bytes '+i);
+ }
+ check(__gaiusGLStats.crossKindBufferCopyReadbacks===steadyReads,'100 changing uploads avoid compatibility GPU readbacks');
+ check(gl.getError()===gl.NO_ERROR,'repeated native uploads have no GL error');
  window.result={ok:true,checks,stats:window.__gaiusGLStats};
 }catch(error){window.result={ok:false,checks,error:String(error),stack:error.stack};}
 finally{for(const b of state.buffers.values())gl.deleteBuffer(b);}

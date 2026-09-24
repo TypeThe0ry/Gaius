@@ -132,6 +132,12 @@ globalThis.__gaiusNetworkStats = {
   peakInboundQueuedBytes: 1024,
   decodedPacketQueue: 2,
   maxDecodedPacketQueue: 3,
+  decodedPacketDrainSignals: 7,
+  queuedPacketHandleSamples: 6,
+  maxQueuedPacketHandleMillis: 412.5,
+  maxQueuedPacketHandleType:
+    "net.minecraft.network.protocol.game.ServerboundMovePlayerPacket$Pos",
+  inlineDecodedPackets: 9,
   pumpCalls: 11,
   pumpChunks: 12,
   pumpBytes: 13,
@@ -540,6 +546,12 @@ assert.deepEqual({...telemetryPong.network}, {
   peakInboundQueuedBytes: 1024,
   decodedPacketQueue: 2,
   maxDecodedPacketQueue: 3,
+  decodedPacketDrainSignals: 0,
+  queuedPacketHandleSamples: 0,
+  maxQueuedPacketHandleMillis: 412.5,
+  maxQueuedPacketHandleType:
+    "net.minecraft.network.protocol.game.ServerboundMovePlayerPacket$Pos",
+  inlineDecodedPackets: 0,
   pumpCalls: 0,
   pumpChunks: 0,
   pumpBytes: 0,
@@ -561,7 +573,17 @@ worker.postMessage({
   type: "mutate-telemetry",
   worldgen: {slices: 3, healthy: true},
   chunkPriority: {pops: 4, playerChunk: "2,3"},
-  network: {receivedFrames: 5, longestInboundSlicePumpMillis: 12, queuedBytes: 256},
+  network: {
+    receivedFrames: 5,
+    longestInboundSlicePumpMillis: 12,
+    queuedBytes: 256,
+    decodedPacketDrainSignals: 11,
+    queuedPacketHandleSamples: 10,
+    maxQueuedPacketHandleMillis: 6188.6,
+    maxQueuedPacketHandleType:
+      "net.minecraft.network.protocol.game.ServerboundMovePlayerPacket$PosRot",
+    inlineDecodedPackets: 12,
+  },
   storage: {opfsFlushes: 2},
 });
 worker.postMessage({type: "telemetry-ping", sessionId, sequence: 18, measurementId: "measurement-a"});
@@ -578,6 +600,17 @@ assert.equal(sameMeasurementPong.network.longestInboundSlicePumpMillis, 12,
   "network extrema were incorrectly baselined as counters");
 assert.equal(sameMeasurementPong.network.queuedBytes, 256,
   "network queue gauge was reset instead of preserved");
+assert.equal(sameMeasurementPong.network.decodedPacketDrainSignals, 4,
+  "queued packet completions did not use the measurement baseline");
+assert.equal(sameMeasurementPong.network.queuedPacketHandleSamples, 4,
+  "queued packet handler samples did not use the measurement baseline");
+assert.equal(sameMeasurementPong.network.maxQueuedPacketHandleMillis, 6188.6,
+  "queued packet maximum handler duration was not preserved as an extremum");
+assert.equal(sameMeasurementPong.network.maxQueuedPacketHandleType,
+  "net.minecraft.network.protocol.game.ServerboundMovePlayerPacket$PosRot",
+  "queued packet maximum handler type was not preserved");
+assert.equal(sameMeasurementPong.network.inlineDecodedPackets, 3,
+  "inline decoder count did not use the measurement baseline");
 assert.equal(sameMeasurementPong.storage.opfsFlushes, 2,
   "storage cumulative telemetry did not use a measurement baseline");
 
@@ -601,6 +634,17 @@ assert.equal(newMeasurementPong.network.longestInboundSlicePumpMillis, 12,
   "network extrema changed during measurement reset");
 assert.equal(newMeasurementPong.network.queuedBytes, 256,
   "network gauge changed during measurement reset");
+assert.equal(newMeasurementPong.network.decodedPacketDrainSignals, 0,
+  "new measurement retained queued packet completions");
+assert.equal(newMeasurementPong.network.queuedPacketHandleSamples, 0,
+  "new measurement retained queued packet handler samples");
+assert.equal(newMeasurementPong.network.maxQueuedPacketHandleMillis, 6188.6,
+  "new measurement reset the queued packet duration extremum");
+assert.equal(newMeasurementPong.network.maxQueuedPacketHandleType,
+  "net.minecraft.network.protocol.game.ServerboundMovePlayerPacket$PosRot",
+  "new measurement reset the queued packet duration type");
+assert.equal(newMeasurementPong.network.inlineDecodedPackets, 0,
+  "new measurement retained inline decoder events");
 assert.equal(newMeasurementPong.storage.opfsFlushes, 0,
   "storage cumulative baseline was not advanced for the new measurement");
 
@@ -616,11 +660,11 @@ assert.equal(repeatedNewMeasurementPong.workerResetAt, newMeasurementPong.worker
 assert.equal(repeatedNewMeasurementPong.worldgen.slices, 1);
 assert.equal(repeatedNewMeasurementPong.chunkPriority.pops, 1);
 
-// Deliberately put more than the generic 64 scalar slots ahead of pumpAll*.
+// Deliberately put more than the generic 72 scalar slots ahead of pumpAll*.
 // The network snapshot must stay capped, while the fixed side-band remains
 // complete and numeric.
 const capProbeNetwork = {};
-for (let index = 0; index < 70; index++) {
+for (let index = 0; index < 78; index++) {
   capProbeNetwork[`capProbe${index}`] = index;
 }
 Object.assign(capProbeNetwork, {

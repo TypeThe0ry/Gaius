@@ -1121,6 +1121,36 @@ public final class BrowserPacketScheduler {
         return ledger != null && ledger.queuedPacketHandleDepth > 0;
     }
 
+    /** Returns true when a server movement packet should wait behind the active worldgen slice. */
+    public static boolean shouldDeferQueuedPacket(Object packet) {
+        if (packet == null || !BrowserIntegratedServerMain.isWorkerServer()) {
+            return false;
+        }
+        String name = packet.getClass().getName();
+        return name.startsWith("net.minecraft.network.protocol.game.ServerboundMovePlayerPacket")
+                && BrowserWorldgenScheduler.shouldDeferMovementPackets();
+    }
+
+    /** Restores the batch slot after a packet has been put back on the FIFO. */
+    public static void deferQueuedPacket(Object owner) {
+        PacketProcessorLedger ledger = packetProcessorLedger(owner);
+        if (ledger != null) {
+            if (ledger.packetsRemaining < ledger.batchPacketLimit) {
+                ledger.packetsRemaining++;
+            }
+            if (ledger.clientPacketDrainActive) {
+                ledger.clientPacketDrainStopReason = "worldgen-deferred";
+            }
+            return;
+        }
+        if (packetsRemaining < batchPacketLimit) {
+            packetsRemaining++;
+        }
+        if (clientPacketDrainActive) {
+            clientPacketDrainStopReason = "worldgen-deferred";
+        }
+    }
+
     /** Marks the exact ListenerAndPacket.handle scope; nesting must not clear the outer drain guard. */
     public static void beginQueuedPacket(Object packet) {
         PacketProcessorLedger ledger = currentPacketProcessorLedger();

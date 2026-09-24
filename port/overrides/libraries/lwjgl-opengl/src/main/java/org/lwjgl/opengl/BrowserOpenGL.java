@@ -921,6 +921,11 @@ public final class BrowserOpenGL {
                     || (sourceBuffer|0)===(targetBuffer|0)
                       && start<targetStart+length && targetStart<start+length) return false;
                 if (!length) return true;
+                // A staging buffer reused for index uploads otherwise forces a
+                // synchronous GPU readback for every cross-class copy. Retain its
+                // next CPU upload using the existing bounded shadow cache; the
+                // first copy and cache misses still use the correct GPU fallback.
+                this.markBufferShadowRequired(sourceBuffer,'cross-kind-copy-source');
                 const max=8*1024*1024;
                 const source=this.bufferBytes.get(sourceBuffer|0);
                 const targetShadow=this.bufferBytes.get(targetBuffer|0);
@@ -5034,7 +5039,40 @@ public final class BrowserOpenGL {
                 .replace("UV0 * SKINRES", "UV0 * float(SKINRES)")
                 .replace("SPACING * (partId + 1)", "SPACING * float(partId + 1)")
                 .replace("(1 - fade)", "(1.0 - fade)");
-        return stripDesktopFloatSuffixes(translated);
+        return stripDesktopFloatSuffixes(translateBetterHudNumericTypes(translated));
+    }
+
+    private static String translateBetterHudNumericTypes(String source) {
+        // BetterHUD mixes float GUI coordinates with integer-packed HUD flags. Keep
+        // flag arithmetic integral and cast only its final coordinate contribution.
+        if (!source.contains("#define HEIGHT_BIT ") || !source.contains("#define MAX_BIT ")
+                || !source.contains("bool checkElement(float z)") || !source.contains("out float applyColor;")) {
+            return source;
+        }
+        String translated = source
+                .replace("z == 0)", "z == 0.0)")
+                .replace("z == 1000)", "z == 1000.0)")
+                .replace("z == -90)", "z == -90.0)")
+                .replace("z == 2800)", "z == 2800.0)")
+                .replace("ceil(2 / vec2(", "ceil(2.0 / vec2(")
+                .replace("applyColor = 0;", "applyColor = 0.0;")
+                .replace("ProjMat[3].x == -1)", "ProjMat[3].x == -1.0)")
+                .replace("pos.y -= (bit << HEIGHT_BIT) + ADD_OFFSET + DEFAULT_OFFSET;",
+                        "pos.y -= float((bit << HEIGHT_BIT) + ADD_OFFSET + DEFAULT_OFFSET);")
+                .replace("float xGui = 0;", "float xGui = 0.0;")
+                .replace("float yGui = 0;", "float yGui = 0.0;")
+                .replace("float layer = 0;", "float layer = 0.0;")
+                .replace("float opacity = 1;", "float opacity = 1.0;")
+                .replace("4 * sin(", "4.0 * sin(")
+                .replace("GameTime * 1200", "GameTime * 1200.0")
+                .replace("3.1415 * 2)", "3.1415 * 2.0)")
+                .replace(") / 255;", ") / 255.0;")
+                .replace("pow(r / maxValue, 3)", "pow(r / maxValue, 3.0)")
+                .replace("pow(g / maxValue, 3)", "pow(g / maxValue, 3.0)")
+                .replace("pow(b / maxValue, 3)", "pow(b / maxValue, 3.0)");
+        // Generated HUD layer values vary by pack; only this float assignment
+        // receives a constructor, never case labels or integer hash constants.
+        return translated.replaceAll("\\blayer = (-?[0-9]+);", "layer = float($1);");
     }
 
     private static String stripDesktopFloatSuffixes(String source) {

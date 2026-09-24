@@ -181,8 +181,23 @@ function assertClientPlayPacketQueueContract(packetUtilsBytecode, profileId) {
   const inlineIndex = indexOfInstruction((entry) =>
     entry.instruction.includes("BrowserWebSocketChannel.recordInlineDecodedPacket"));
   const inlineTarget = instructions[inlineIndex].offset;
+  const workerServerIndex = indexOfInstruction((entry) =>
+    entry.instruction.includes("BrowserIntegratedServerMain.isWorkerServer"));
+  const workerClientBranch = instructions[workerServerIndex + 1]?.instruction.match(/^ifeq\s+(\d+)/);
+  assert.ok(workerClientBranch,
+    `${profileId} Worker server guard must branch around the force-queue path`);
+  const workerDrainIndex = indexOfInstruction((entry) =>
+    entry.instruction.includes("BrowserPacketScheduler.isProcessingQueuedPacket"),
+  workerServerIndex + 1);
+  assert.equal(workerDrainIndex, workerServerIndex + 3,
+    `${profileId} Worker server owner guard must precede all listener classification`);
+  const workerDrainBranch = instructions[workerDrainIndex + 1]?.instruction.match(/^ifne\s+(\d+)/);
+  assert.ok(workerDrainBranch,
+    `${profileId} Worker server queued-drain guard branch is missing`);
   const configurationIndex = indexOfInstruction((entry) =>
     entry.instruction.includes("ClientConfigurationPacketListenerImpl"));
+  assert.ok(Number(workerClientBranch[1]) < instructions[configurationIndex].offset,
+    `${profileId} non-Worker traffic does not reach the client listener dispatch`);
   assert.match(instructions[configurationIndex + 1]?.instruction || "", /^ifne\s+/,
     `${profileId} configuration listener does not use the inline boundary`);
   assert.equal(Number(instructions[configurationIndex + 1].instruction.match(/^(?:ifne)\s+(\d+)/)[1]),
@@ -199,12 +214,15 @@ function assertClientPlayPacketQueueContract(packetUtilsBytecode, profileId) {
   assert.ok(playTargetIndex > playIndex,
     `${profileId} PLAY listener guard must precede common inline classification`);
   const drainIndex = indexOfInstruction((entry) =>
-    entry.instruction.includes("BrowserPacketScheduler.isProcessingQueuedPacket"));
+    entry.instruction.includes("BrowserPacketScheduler.isProcessingQueuedPacket"),
+  workerDrainIndex + 1);
   assert.ok(drainIndex > playTargetIndex,
     `${profileId} queued-drain guard must execute after entering the PLAY path`);
   const drainBranch = instructions[drainIndex + 1]?.instruction.match(/^ifne\s+(\d+)/);
   assert.ok(drainBranch, `${profileId} PacketUtils queued-drain guard branch is missing`);
   const queuedReturnTarget = Number(drainBranch[1]);
+  assert.equal(Number(workerDrainBranch[1]), queuedReturnTarget,
+    `${profileId} Worker server and PLAY re-entry guards must share one exact return`);
   assert.equal(byOffset.get(queuedReturnTarget), "return",
     `${profileId} queued PLAY handler re-enters vanilla thread identity instead of returning`);
   const commonBranches = commonInlinePackets.map((packet) => ({
@@ -273,7 +291,8 @@ function assertClientPlayPacketQueueContract(packetUtilsBytecode, profileId) {
     entry.instruction.includes("PacketProcessor.isSameThread"));
   const vanillaSchedule = indexOfInstruction((entry) =>
     entry.instruction.includes("PacketProcessor.scheduleIfPossible"), forcedSchedule + 1);
-  const ordered = [configurationIndex, playIndex, ...commonBranches.map(({first}) => first.index),
+  const ordered = [workerServerIndex, workerDrainIndex, configurationIndex, playIndex,
+    ...commonBranches.map(({first}) => first.index),
     drainIndex, ...transitionBranches.map(({packet}) => indexOfInstruction((entry) =>
       entry.instruction.includes("instanceof") && entry.instruction.includes(packet), playTargetIndex)),
     ...commonBranches.map(({second}) => second.index), commonPendingIndex, transitionPendingIndex,
@@ -295,8 +314,10 @@ function assertClientPlayPacketQueueContract(packetUtilsBytecode, profileId) {
   }
   assert.equal(occurrences(contract, "ClientPacketListener"), 1,
     `${profileId} PacketUtils must have exactly one PLAY-listener force-queue branch`);
-  assert.equal(occurrences(contract, "BrowserPacketScheduler.isProcessingQueuedPacket"), 1,
-    `${profileId} PacketUtils must bypass force-queue exactly while draining it`);
+  assert.equal(occurrences(contract, "BrowserIntegratedServerMain.isWorkerServer"), 1,
+    `${profileId} PacketUtils must classify the Worker server before listener dispatch`);
+  assert.equal(occurrences(contract, "BrowserPacketScheduler.isProcessingQueuedPacket"), 2,
+    `${profileId} PacketUtils must owner-guard Worker server and PLAY queued re-entry`);
   assert.equal(occurrences(contract, "BrowserPacketScheduler.hasPendingPackets"), 2,
     `${profileId} PacketUtils must preserve queued PLAY FIFO for common and transition packets`);
 }
@@ -1083,14 +1104,14 @@ try {
     "public net.minecraft.client.resources.model.sprite.AtlasManager(net.minecraft.client.renderer.texture.TextureManager, int);",
     "public net.minecraft.client.renderer.texture.TextureAtlas getAtlasOrThrow");
   assert.match(atlasManagerConstructor,
-    /iconst_0\s+\d+: putfield\s+#[0-9]+\s+\/\/ Field maxMipmapLevels:I/,
-    "26.2 browser AtlasManager constructor must cap mipmaps at zero");
+    /iload_2\s+\d+: putfield\s+#[0-9]+\s+\/\/ Field maxMipmapLevels:I/,
+    "26.2 browser AtlasManager constructor must preserve configured mipmaps");
   const updateMaxMipLevel = method(patchedAtlasManager,
     "public void updateMaxMipLevel(int);",
     "public void close();");
   assert.match(updateMaxMipLevel,
-    /iconst_0\s+\d+: putfield\s+#[0-9]+\s+\/\/ Field maxMipmapLevels:I/,
-    "26.2 browser AtlasManager updates must preserve the zero-mipmap cap");
+    /iload_1\s+\d+: putfield\s+#[0-9]+\s+\/\/ Field maxMipmapLevels:I/,
+    "26.2 browser AtlasManager updates must preserve the configured mipmap level");
   const atlasManagerReload = method(patchedAtlasManager,
     "public java.util.concurrent.CompletableFuture<java.lang.Void> reload(",
     "private void updateSpriteMaps(");
@@ -1203,11 +1224,11 @@ try {
   const rawGraphicsApply = graphicsPresetApply(rawGraphics);
   const patchedGraphicsApply = graphicsPresetApply(patchedGraphics);
   assert.deepEqual(graphicsPresetDistanceConstants(patchedGraphicsApply, "renderDistance"),
-    ["bipush 6", "bipush 16", "bipush 32"],
-    "26.2 FAST render distance was not overlaid to 6");
+    ["bipush 8", "bipush 16", "bipush 32"],
+    "26.2 FAST render distance was changed from vanilla 8");
   assert.deepEqual(graphicsPresetDistanceConstants(patchedGraphicsApply, "simulationDistance"),
-    ["bipush 4", "bipush 12", "bipush 12"],
-    "26.2 FAST simulation distance was not overlaid to 4");
+    ["bipush 6", "bipush 12", "bipush 12"],
+    "26.2 FAST simulation distance was changed from vanilla 6");
   assert.deepEqual(graphicsPresetDistanceConstants(rawGraphicsApply, "renderDistance"),
     ["bipush 8", "bipush 16", "bipush 32"],
     "26.2 raw FAST render distance shape changed");
@@ -1366,15 +1387,16 @@ try {
     ["1.21.11", patched121BlockableEventLoop],
   ]) {
     const doRunTask = method(blockableEventLoop,
-      "protected void doRunTask(R);", "public void schedule(R);");
-    const begin = doRunTask.indexOf(
-      "BrowserIntegratedServerMain.beginScheduledNetworkInputTask");
-    const taskRun = doRunTask.indexOf("java/lang/Runnable.run");
-    assert.ok(begin >= 0 && taskRun > begin,
-      `${profileId} doRunTask must acquire the exact network-task lease before dispatch`);
-    assert.equal(occurrences(doRunTask,
-      "BrowserIntegratedServerMain.endScheduledNetworkInputTask"), 2,
-    `${profileId} doRunTask must release the network-task lease on return and exception`);
+      "protected void doRunTask(R);",
+      "public java.util.List<net.minecraft.util.profiling.metrics.MetricSampler> profiledMetrics();");
+    assert.equal(occurrences(doRunTask, "java/lang/Runnable.run"), 1,
+      `${profileId} doRunTask must retain one vanilla Runnable.run dispatch`);
+    assert.match(doRunTask,
+      /BrowserIntegratedServerMain\.beginScheduledNetworkInputTask/,
+      `${profileId} doRunTask must register scheduled network input`);
+    assert.match(doRunTask,
+      /BrowserIntegratedServerMain\.endScheduledNetworkInputTask/,
+      `${profileId} doRunTask must close scheduled network input`);
   }
   assertPacketProcessorQueueContract(patchedPacketProcessor, "26.2");
   assertPacketProcessorQueueContract(patched121PacketProcessor, "1.21.11");
@@ -1738,7 +1760,7 @@ try {
   console.log("Minecraft 26.2 P1 patcher smoke passed", JSON.stringify({
     scheduledLayerPulses: occurrences(generationWait, "BrowserWorldgenScheduler.pulse"),
     distancePulses: occurrences(distance, "pulseDistanceManager"),
-    graphicsPresetDistances: "6/4",
+    graphicsPresetDistances: "8/6",
     oneTwentyOneFastDistances: "8/6",
     holderBatchLimit: HOLDERS_PER_TURN,
     layerBarrier: true,

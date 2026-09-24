@@ -54,6 +54,8 @@ function sourceFailureEvents(runtime, evidence) {
     const type = String(entry?.detail?.type || '').toLowerCase();
     const serialized = JSON.stringify(entry || {}).toLowerCase();
     return serialized.includes('network-pump-wrong-thread')
+      || serialized.includes('network-pump-permit-missing')
+      || serialized.includes('network-pump-retry-exhausted')
       || (event.startsWith('singleplayer:')
         && /(?:error|failure|failed|timeout|crash|terminated)/.test(event))
       || (event === 'singleplayer:worker'
@@ -225,6 +227,13 @@ export async function validateSingleplayerEvidence(evidencePath, options = {}) {
 }
 
 async function selfTest() {
+  for (const type of ['network-pump-wrong-thread', 'network-pump-permit-missing',
+    'network-pump-retry-exhausted']) {
+    assert.equal(sourceFailureEvents({events:[{event:'singleplayer:worker',detail:{type}}]},{}).length,1);
+    assert.equal(sourceFailureEvents({}, {consoleMessages:[{text:type}]}).length,1);
+  }
+  assert.equal(sourceFailureEvents({events:[{event:'singleplayer:worker',
+    detail:{type:'network-pump-busy'}}]},{}).length,0);
   const directory = await mkdtemp(join(tmpdir(), 'gaius-single-terrain-validator-'));
   try {
     const artifact = join(directory, 'Gaius.html');

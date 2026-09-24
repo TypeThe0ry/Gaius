@@ -11,13 +11,7 @@ import {
   terrainVisualPass,
 } from './terrain-visual-metrics.mjs';
 
-const expectedResourcePack = Object.freeze({
-  originalUrl: 'https://jihulab.com/-/project/356228/uploads/e409655d230380173547e68c5ef026d4/resource_pack.zip',
-  fixedMirrorUrl: 'https://typethe0ry.github.io/Gaius/resource-packs/008381d7a89976709aa86bb71dee06dc50bb3961.zip',
-  bytes: 61_102_872,
-  sha1: '008381d7a89976709aa86bb71dee06dc50bb3961',
-  sha256: 'ee96a1fe577a90f1c2a3f686cdec060a3cbf0f127ae8e0585cb79dd93e69e172',
-});
+import { expectedResourcePack } from './resource-pack-expectation.mjs';
 
 async function hashFile(path) {
   const digest = createHash('sha256');
@@ -94,8 +88,9 @@ function expectedResourcePackProxy(relay) {
 function resourcePackUrlMatchesExpected(value, relay) {
   try {
     const actual = new URL(String(value || ''));
-    const fixedMirror = new URL(expectedResourcePack.fixedMirrorUrl);
-    if (actual.href === fixedMirror.href) return true;
+    const fixedMirror = expectedResourcePack.fixedMirrorUrl
+      ? new URL(expectedResourcePack.fixedMirrorUrl) : null;
+    if (fixedMirror && actual.href === fixedMirror.href) return true;
     const expected = new URL(expectedResourcePackProxy(relay));
     const parameterNames = [...new Set(actual.searchParams.keys())].sort();
     return actual.protocol === expected.protocol
@@ -126,7 +121,8 @@ function verifiedExpectedResourcePackTransaction(entry, relay) {
     && entry.loadingFinished === true
     && Number(entry.encodedDataLength) > 0
     && !entry.loadingFailed
-    && Number(entry.declaredContentLength) === expectedResourcePack.bytes
+    && (entry.declaredContentLength == null
+      || Number(entry.declaredContentLength) === expectedResourcePack.bytes)
     && body?.base64Encoded === true
     && Number(body?.bytes) === expectedResourcePack.bytes
     && body?.sha1 === expectedResourcePack.sha1
@@ -231,6 +227,12 @@ export async function validateEvidence(evidencePath, options = {}) {
     .map((entry) => String(entry.requestId)).sort();
   const resourceDeclarationsMatch = JSON.stringify(declaredResourceRequestIds)
     === JSON.stringify(recomputedResourceRequestIds);
+  const observedChunkPeak = Math.max(
+    Number(state?.loadedChunkCount) || 0,
+    ...(Array.isArray(evidence.samples)
+      ? evidence.samples.map((sample) => Number(sample?.loadedChunkCount) || 0)
+      : []),
+  );
 
   const checks = [
     gate('runner-schema-v3', evidence.schema === 'gaius.multiplayer-terrain-cdp-acceptance.v3',
@@ -238,7 +240,7 @@ export async function validateEvidence(evidencePath, options = {}) {
     gate('runner-success', evidence.success === true, evidence.success),
     gate('final-state-present', Boolean(state), state?.screen),
     gate('client-level', state?.level === 'net.minecraft.client.multiplayer.ClientLevel', state?.level),
-    gate('chunks-loaded', Number(state?.loadedChunkCount) > 0, state?.loadedChunkCount),
+    gate('chunks-loaded', observedChunkPeak > 0, observedChunkPeak),
     gate('final-net-present', Boolean(net), typeof net),
     gate('network-errors-clean', Number(net?.errors) === 0, net?.errors),
     gate('bridge-stats-present', Boolean(bridge), typeof bridge),
@@ -381,10 +383,25 @@ export async function validateEvidence(evidencePath, options = {}) {
 
 async function runStaticSelfTest() {
   assert.equal(typeof validateEvidence, 'function');
+  const streamedPack = {
+    requestId: 'streamed-pack', method: 'GET', status: 200,
+    url: expectedResourcePackProxy('wss://relay.example/tunnel'),
+    loadingFinished: true, encodedDataLength: expectedResourcePack.bytes,
+    declaredContentLength: null,
+    bodyVerification: { base64Encoded: true, ...expectedResourcePack },
+  };
+  assert.equal(verifiedExpectedResourcePackTransaction(streamedPack,
+    'wss://relay.example/tunnel'), true);
+  for (const field of ['bytes', 'sha1', 'sha256']) {
+    const damaged = structuredClone(streamedPack);
+    damaged.bodyVerification[field] = field === 'bytes' ? 1 : '0';
+    assert.equal(verifiedExpectedResourcePackTransaction(damaged,
+      'wss://relay.example/tunnel'), false);
+  }
   assert.match(createHash('sha256').update('gaius').digest('hex'), /^[0-9a-f]{64}$/);
   assert.equal(resourcePackUrlMatchesExpected(
     expectedResourcePack.fixedMirrorUrl,
-    'wss://relay.example/tunnel'), true);
+    'wss://relay.example/tunnel'), Boolean(expectedResourcePack.fixedMirrorUrl));
   assert.equal(resourcePackUrlMatchesExpected(
     `${expectedResourcePack.fixedMirrorUrl}?cache-bust=1`,
     'wss://relay.example/tunnel'), false);

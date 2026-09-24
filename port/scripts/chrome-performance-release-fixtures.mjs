@@ -199,8 +199,8 @@ export const acceptanceFixtureProfile = {
   releaseEvidence: true,
   scenario: "steady",
   route: "singleplayer",
-  renderDistance: 6,
-  simulationDistance: 4,
+  renderDistance: 8,
+  simulationDistance: 6,
   gates: {
     averageFpsMin: 120,
     onePercentLowFpsMin: 60,

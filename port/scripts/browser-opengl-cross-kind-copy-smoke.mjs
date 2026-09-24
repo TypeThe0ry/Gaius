@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const dir = path.dirname(fileURLToPath(import.meta.url));
-const source = fs.readFileSync(path.resolve(dir, "../overrides/libraries/lwjgl-opengl/src/main/java/org/lwjgl/opengl/BrowserOpenGL.java"), "utf8");
+const source = fs.readFileSync(path.resolve(process.argv[2] || path.join(dir, "../overrides/libraries/lwjgl-opengl/src/main/java/org/lwjgl/opengl/BrowserOpenGL.java")), "utf8");
 function jsBody(method) {
   const d = new RegExp(`(?:private|public)\\s+static\\s+native\\s+[\\w<>\\[\\]]+\\s+${method}\\s*\\(`).exec(source);
   assert.ok(d, `missing ${method}`); const a = source.lastIndexOf("@JSBody", d.index);
@@ -82,3 +82,36 @@ assert.equal(physicalBindings.get(C.COPY_WRITE_BUFFER),objects.get(4));
 assert.deepEqual(bytes.get(2).slice(32,48),bytes.get(1).slice(0,16));
 const errBefore=nativeErrors; run("copyBufferSubData", ["sourceTarget","targetTarget","sourceOffset","targetOffset","size"], [C.COPY_READ_BUFFER,C.COPY_WRITE_BUFFER,262140,0,32]); assert.equal(nativeErrors,errBefore+1);
 console.log("Browser OpenGL cross-kind copy VM smoke passed",JSON.stringify({crossKindBytes:864,localReadbacks:readbacks,nativeCopies,nativeErrors,sourceType:state.bufferWebglTypes.get(1),elementType:state.bufferWebglTypes.get(2)}));
+
+// Exercise real upload/shadow helpers after the first compatibility copy. The
+// staging ring changes between copies: skipping a readback must not reuse stale
+// indices, and eviction must retain a correct bounded fallback.
+const capacity=262144;
+state.noteBufferUpload=()=>{};
+sizes.set(1,capacity); state.bufferSizes.set(1,capacity);
+bytes.set(1,new Uint8Array(capacity));
+state.deleteBufferShadow(1);
+bind(C.COPY_READ_BUFFER,1); bind(C.COPY_WRITE_BUFFER,2);
+const upload=new Uint8Array(capacity); upload.fill(31);
+run('bufferSubDataJs',['target','offset','data'],[C.COPY_READ_BUFFER,0,upload]);
+const warmReads=readbacks;
+for(let i=0;i<100;i++) {
+  const data=new Uint8Array(72); data.fill(i);
+  run('bufferSubDataJs',['target','offset','data'],[C.COPY_READ_BUFFER,1000,data]);
+  run('copyBufferSubData',['sourceTarget','targetTarget','sourceOffset','targetOffset','size'],[C.COPY_READ_BUFFER,C.COPY_WRITE_BUFFER,1000,32,72]);
+  assert.deepEqual(bytes.get(2).slice(32,104),data,'updated staging bytes reach destination');
+}
+assert.equal(readbacks,warmReads,'100 changing staging uploads need no GPU readbacks');
+state.deleteBufferShadow(1);
+const coldReads=readbacks;
+run('copyBufferSubData',['sourceTarget','targetTarget','sourceOffset','targetOffset','size'],[C.COPY_READ_BUFFER,C.COPY_WRITE_BUFFER,1000,32,72]);
+assert.equal(readbacks,coldReads+1,'eviction preserves GPU fallback');
+assert.deepEqual(bytes.get(2).slice(32,104),bytes.get(1).slice(1000,1072));
+globalThis.window.__gaiusMaxSingleBufferShadowBytes=0;
+run('bufferSubDataJs',['target','offset','data'],[C.COPY_READ_BUFFER,0,upload]);
+assert.equal(state.bufferBytes.has(1),false,'shadow budget remains enforced');
+const cappedReads=readbacks;
+run('copyBufferSubData',['sourceTarget','targetTarget','sourceOffset','targetOffset','size'],[C.COPY_READ_BUFFER,C.COPY_WRITE_BUFFER,1000,32,72]);
+assert.equal(readbacks,cappedReads+1,'zero cache budget preserves correct fallback');
+assert.deepEqual(bytes.get(2).slice(32,104),upload.slice(1000,1072));
+console.log('CROSS_KIND_REUSE_OK uploads=100 steadyStateReadbacks=0 evictionFallback=true budgetFallback=true');

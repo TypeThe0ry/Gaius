@@ -196,6 +196,11 @@ const networkTelemetryPriorityKeys = Object.freeze([
   "maxDecoderCumulationBytes",
   "decodedPacketQueue",
   "maxDecodedPacketQueue",
+  "decodedPacketDrainSignals",
+  "queuedPacketHandleSamples",
+  "maxQueuedPacketHandleMillis",
+  "maxQueuedPacketHandleType",
+  "inlineDecodedPackets",
   "sentFrames",
   "sentBytes",
   "receivedFrames",
@@ -244,6 +249,9 @@ const networkTelemetryPriorityKeys = Object.freeze([
   "integratedServerTaskBudgetExhaustions",
   "integratedServerTaskDeferredRetries",
   "integratedServerTaskRetryExhaustions",
+  "integratedServerTaskStaleGenerations",
+  "integratedServerTaskPermitMissing",
+  "integratedServerTaskPumpBusy",
   "integratedServerTaskPending",
   "integratedServerInputPending",
 ]);
@@ -267,7 +275,8 @@ const networkTelemetryCounterKeys = Object.freeze([
   "receivedFrames", "receivedBytes", "inboundSlices", "inboundSlicePumps",
   "decodedSliceBacklogPauses", "decodedSliceBacklogResumes",
   "decodedPacketQueuePauses", "decodedPacketQueueResumes",
-  "decodedPacketDrainSignals", "flowPauses", "flowResumes", "localFlushes",
+  "decodedPacketDrainSignals", "queuedPacketHandleSamples", "inlineDecodedPackets",
+  "flowPauses", "flowResumes", "localFlushes",
   "localFlushFrames", "localFlushBytes", "localReceivedFrames",
   "localReceivedBytes", "localClaimWaits", "localClaimRetries",
   "localClaimTimeouts", "localDuplicateOpens", "localSupersededClaims",
@@ -284,10 +293,11 @@ const networkTelemetryCounterKeys = Object.freeze([
   "integratedServerTaskRuns", "integratedServerTaskFollowups",
   "integratedServerTaskLifecycleDrops", "integratedServerTaskWrongThread",
   "integratedServerTaskBudgetExhaustions", "integratedServerTaskDeferredRetries",
-  "integratedServerTaskRetryExhaustions",
+  "integratedServerTaskRetryExhaustions", "integratedServerTaskStaleGenerations",
+  "integratedServerTaskPermitMissing", "integratedServerTaskPumpBusy",
 ]);
 // Global pump counters are populated by BrowserWebSocketChannel.pumpAll* and
-// live after the 64-key scalar network snapshot. Keep this list deliberately
+// live after the 72-key scalar network snapshot. Keep this list deliberately
 // fixed and shallow so the aggregate cannot be dropped when the network stats
 // object grows with additional transport diagnostics.
 const globalPumpTelemetryKeys = Object.freeze([
@@ -320,7 +330,7 @@ function snapshotScalarTelemetry(value, priorityKeys = []) {
   }
   let copied = 0;
   const copy = (key) => {
-    if (copied >= 64 || Object.prototype.hasOwnProperty.call(snapshot, key)) {
+    if (copied >= 72 || Object.prototype.hasOwnProperty.call(snapshot, key)) {
       return;
     }
     let current;
@@ -344,7 +354,7 @@ function snapshotScalarTelemetry(value, priorityKeys = []) {
   }
   for (const key of Object.keys(value)) {
     copy(key);
-    if (copied >= 64) {
+    if (copied >= 72) {
       break;
     }
   }
@@ -358,6 +368,61 @@ function snapshotGlobalPumpTelemetry(value) {
     snapshot[key] = typeof current === "number" && Number.isFinite(current)
       ? current
       : null;
+  }
+  return snapshot;
+}
+
+// Worldgen diagnostics contain one intentionally nested object for the
+// PlayerChunkSender state.  The generic scalar copier is deliberately
+// shallow, so keep this side-band snapshot explicit; otherwise `chunkSender`
+// is silently discarded before it reaches the page and a `selected == 0`
+// sender stall is indistinguishable from an idle sender.
+const chunkSenderTelemetryKeys = Object.freeze([
+  "telemetryVersion", "pending", "selected", "unacknowledgedBatches",
+  "playerChunkX", "playerChunkZ", "maxPending", "maxUnacknowledgedBatches",
+  "entryCount", "selectedCount", "batchCount", "readySelectedChunks",
+]);
+
+function snapshotChunkSenderTelemetry(value) {
+  const snapshot = Object.create(null);
+  if (!value || typeof value !== "object") {
+    return snapshot;
+  }
+  for (const key of chunkSenderTelemetryKeys) {
+    const current = value[key];
+    if (typeof current === "number" && Number.isFinite(current)) {
+      snapshot[key] = current;
+    } else if (typeof current === "boolean" || typeof current === "string" || current === null) {
+      snapshot[key] = current;
+    }
+  }
+  if (value.last && typeof value.last === "object") {
+    const last = Object.create(null);
+    for (const key of chunkSenderTelemetryKeys) {
+      const current = value.last[key];
+      if (typeof current === "number" && Number.isFinite(current)) {
+        last[key] = current;
+      } else if (typeof current === "boolean" || typeof current === "string" || current === null) {
+        last[key] = current;
+      }
+    }
+    snapshot.last = last;
+  }
+  return snapshot;
+}
+
+function snapshotWorldgenTelemetry(value) {
+  const snapshot = snapshotScalarTelemetry(value, [
+    "mobAiPulses",
+    "mobAiMaxPulses",
+    "trackingMoveStarts",
+    "trackingMoveInFlightSkips",
+    "trackingMoveCompletions",
+    "trackingMovePending",
+  ]);
+  if (value && typeof value === "object" && value.chunkSender &&
+      typeof value.chunkSender === "object") {
+    snapshot.chunkSender = snapshotChunkSenderTelemetry(value.chunkSender);
   }
   return snapshot;
 }
@@ -572,8 +637,8 @@ root.onmessage = async (event) => {
     root.__gaiusServerLaunchGeneration = launchGeneration;
     root.__gaiusServerWorldId = String(message.worldId || "");
     root.__gaiusServerSeed = String(message.seed || "");
-    root.__gaiusServerViewDistance = clampDistance(message.renderDistance, 6);
-    root.__gaiusServerSimulationDistance = clampDistance(message.simulationDistance, 4);
+    root.__gaiusServerViewDistance = clampDistance(message.renderDistance, 8);
+    root.__gaiusServerSimulationDistance = clampDistance(message.simulationDistance, 6);
     const requestedWorldgenSlice = message.worldgenSliceMillis ??
       root.__gaiusWorldgenSliceMillis;
     root.__gaiusWorldgenSliceMillis = clampWorldgenSlice(
@@ -973,10 +1038,7 @@ function handleControlMessage(event) {
       // max/last fields are gauges. Missing fields stay explicit nulls.
       globalPump: snapshotGlobalPumpTelemetry(globalPumpTelemetrySource()),
       serverDistance: snapshotScalarTelemetry(root.__gaiusServerDistanceTelemetry),
-      worldgen: snapshotScalarTelemetry(root.__gaiusWorldgenStats, [
-        "mobAiPulses",
-        "mobAiMaxPulses",
-      ]),
+      worldgen: snapshotWorldgenTelemetry(root.__gaiusWorldgenStats),
       serverTick: root.__gaiusServerTickTelemetryEnabled === true &&
         root.__gaiusServerTickTelemetry
         ? {
@@ -1056,8 +1118,8 @@ function handleControlMessage(event) {
     // shutdown has started. PlayerList setters rebroadcast and walk every
     // ServerLevel, so even a late no-op message is expensive in this Worker.
     if (stopRequested || stopping) return;
-    root.__gaiusServerViewDistance = clampDistance(message.renderDistance, 6);
-    root.__gaiusServerSimulationDistance = clampDistance(message.simulationDistance, 4);
+    root.__gaiusServerViewDistance = clampDistance(message.renderDistance, 8);
+    root.__gaiusServerSimulationDistance = clampDistance(message.simulationDistance, 6);
     if (typeof setIntegratedServerDistances === "function") {
       setIntegratedServerDistances(
         root.__gaiusServerViewDistance,

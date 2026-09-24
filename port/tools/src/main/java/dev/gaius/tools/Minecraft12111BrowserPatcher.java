@@ -62,15 +62,16 @@ public final class Minecraft12111BrowserPatcher {
     }
 
     /**
-     * Keeps the 1.21.11 FAST preset inside the browser profile's 6/4 distance
-     * contract.
+     * Verifies the 1.21.11 FAST preset's vanilla distance values without
+     * reducing the user's render or simulation distance.  Browser throughput
+     * work belongs in the cooperative schedulers; this patcher must not use a
+     * smaller view as a substitute for fixing chunk delivery.
      *
-     * <p>This is a narrow bytecode overlay on the FAST ordinal arm.  Match the
-     * ordinal switch, the FAST arm's vanilla 8/6 constants, both Options getter
-     * receiver chains, the boxed integer stores, and the preset setter
-     * before changing exactly those two constants.  Any missing, duplicated, or
-     * reshaped target fails closed instead of changing an unrelated integer in
-     * the preset method.</p>
+     * <p>This is a narrow bytecode shape check on the FAST ordinal arm.  Match
+     * the ordinal switch, the FAST arm's vanilla 8/6 constants, both Options
+     * getter receiver chains, the boxed integer stores, and the preset setter.
+     * Any missing, duplicated, or reshaped target fails closed instead of
+     * allowing an unrelated distance rewrite.</p>
      */
     private static void patchGraphicsPresetBrowserDistances(String jar, Path root)
             throws IOException {
@@ -153,12 +154,9 @@ public final class Minecraft12111BrowserPatcher {
                 owner,
                 "simulationDistance",
                 6);
-        renderDistance.operand = 6;
-        simulationDistance.operand = 4;
-
         write(node, root.resolve(owner + ".class"));
         System.out.println(
-                "Bounded Minecraft 1.21.11 FAST graphics preset distances to render=6 simulation=4");
+                "Preserved Minecraft 1.21.11 FAST graphics preset distances at render=8 simulation=6");
     }
 
     private static IntInsnNode findGraphicsPresetDistanceConstant(

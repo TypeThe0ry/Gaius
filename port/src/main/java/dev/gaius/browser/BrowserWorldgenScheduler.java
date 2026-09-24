@@ -14,9 +14,18 @@ public final class BrowserWorldgenScheduler {
     private static final int CLOCK_CHECK_INTERVAL = 1;
     private static final int NETWORK_CHECK_INTERVAL = 1;
     private static final int MIN_PROGRESS_PULSES_BEFORE_NETWORK_PREEMPTION = 2;
+    // A one-packet transient must not cut a terrain slice. The old >0 check
+    // turned ordinary chunk traffic into a preemption storm (39k network
+    // preemptions for 42k slices in the last runtime capture).
+    private static final int MIN_NETWORK_QUEUE_DEPTH_FOR_PREEMPTION = 8;
+    // A retained queue entry can stay visible while its handler waits for this
+    // generation continuation to return.  Do not yield every two pulses to the
+    // same observation; ordinary deadline slices still service the event loop,
+    // and a bounded retry keeps genuinely stuck input from being ignored.
+    private static final int MIN_RETAINED_PRESSURE_PROGRESS_PULSES = 64;
     private static final int MAX_NETWORK_WAIT_PULSES = 2;
     // Explicit patch points now represent bounded rows, columns, queues, or stage units.
-    private static final int MAX_PULSES_PER_TURN = 4096;
+    private static final int MAX_PULSES_PER_TURN = 512;
     private static final int DEFAULT_DISTANCE_MANAGER_UPDATE_BUDGET = 64;
     private static final int MIN_DISTANCE_MANAGER_UPDATE_BUDGET = 8;
     private static final int MAX_DISTANCE_MANAGER_UPDATE_BUDGET = 512;
@@ -59,6 +68,7 @@ public final class BrowserWorldgenScheduler {
     private static int pulsesInTurn;
     private static int maxPulsesInTurn;
     private static int progressPulsesInSlice;
+    private static int progressPulsesSinceNetworkPreemption;
     private static int networkWaitPulses;
     private static int reentrantYieldRequests;
     private static int reentrantYieldDepth;
@@ -72,6 +82,8 @@ public final class BrowserWorldgenScheduler {
     // the task active-work clock.  Keep a separate monotonic hook window instead.
     private static double mobAiNextYieldAtMillis;
     private static boolean networkPreemptionPending;
+    private static int lastNetworkPreemptionDepth;
+    private static double lastNetworkPreemptionInputEpoch = -1.0;
     private static boolean yieldActive;
     private static boolean deferredYield;
     private static int lastDistanceManagerUpdateBudget = DEFAULT_DISTANCE_MANAGER_UPDATE_BUDGET;
@@ -549,6 +561,9 @@ public final class BrowserWorldgenScheduler {
 
     public static void pulse() {
         progressPulsesInSlice++;
+        if (progressPulsesSinceNetworkPreemption < Integer.MAX_VALUE) {
+            progressPulsesSinceNetworkPreemption++;
+        }
         pulsesInTurn++;
         maxPulsesInTurn = Math.max(maxPulsesInTurn, pulsesInTurn);
         if (yieldActive) {
@@ -559,18 +574,39 @@ public final class BrowserWorldgenScheduler {
         if (isWorkerRuntime() && networkPreemptionPending) {
             networkWaitPulses++;
             if (progressPulsesInSlice >= MIN_PROGRESS_PULSES_BEFORE_NETWORK_PREEMPTION) {
-                requestYield(YIELD_NETWORK, Math.max(1, networkQueueDepth()));
+                requestNetworkYield(
+                        Math.max(1, networkQueueDepth()), networkInputEpoch());
                 return;
             }
         } else if (isWorkerRuntime() && --pulsesUntilNetworkCheck <= 0) {
             pulsesUntilNetworkCheck = NETWORK_CHECK_INTERVAL;
             int queueDepth = networkQueueDepth();
-            if (queueDepth > 0 || hasPendingNetworkInput()) {
-                networkPreemptionPending = true;
-                networkWaitPulses = 1;
-                if (progressPulsesInSlice >= MIN_PROGRESS_PULSES_BEFORE_NETWORK_PREEMPTION) {
-                    requestYield(YIELD_NETWORK, Math.max(1, queueDepth));
-                    return;
+            boolean pendingInput = queueDepth >= MIN_NETWORK_QUEUE_DEPTH_FOR_PREEMPTION
+                    || hasPendingNetworkInput();
+            if (!pendingInput) {
+                // A later 0 -> non-zero transition is new actionable pressure,
+                // even when its bytes were already counted in the arrival epoch.
+                lastNetworkPreemptionDepth = 0;
+                lastNetworkPreemptionInputEpoch = -1.0;
+            } else {
+                int pressureDepth = Math.max(1, queueDepth);
+                double inputEpoch = networkInputEpoch();
+                boolean freshPressure = lastNetworkPreemptionDepth == 0
+                        || pressureDepth > lastNetworkPreemptionDepth
+                        || inputEpoch != lastNetworkPreemptionInputEpoch;
+                boolean retainedPressureRetryDue = progressPulsesSinceNetworkPreemption
+                        >= MIN_RETAINED_PRESSURE_PROGRESS_PULSES;
+                // The same retained observation already received an event-loop
+                // turn. Let useful generation proceed until the bounded retry;
+                // deadline and hard-cap yields remain fully active below.
+                if (freshPressure || retainedPressureRetryDue) {
+                    networkPreemptionPending = true;
+                    networkWaitPulses = 1;
+                    if (progressPulsesInSlice
+                            >= MIN_PROGRESS_PULSES_BEFORE_NETWORK_PREEMPTION) {
+                        requestNetworkYield(pressureDepth, inputEpoch);
+                        return;
+                    }
                 }
             }
         }
@@ -590,6 +626,35 @@ public final class BrowserWorldgenScheduler {
         } else if (activeSliceElapsedMillis(now) >= currentBudgetMillis) {
             requestYield(YIELD_DEADLINE, networkQueueDepth());
         }
+    }
+
+    /**
+     * Movement packets can trigger collision/chunk work on the integrated server.  When the
+     * worldgen queue is already under pressure, let the current generation slice yield before
+     * executing another movement packet.  The packet processor keeps the item in its FIFO, so
+     * this is a scheduling decision rather than packet loss or coalescing.
+     */
+    public static boolean shouldDeferMovementPackets() {
+        if (!isWorkerRuntime()) {
+            return false;
+        }
+        if (taskWorkDepth > 0) {
+            return true;
+        }
+        return worldgenQueueDepthForPacketDefer() >= 32;
+    }
+
+    @org.teavm.jso.JSBody(script = """
+            const stats = globalThis.__gaiusWorldgenStats;
+            return stats ? Math.max(0, Number(stats.queueDepth) || 0) : 0;
+            """)
+    private static native int worldgenQueueDepthForPacketDefer();
+
+    private static void requestNetworkYield(int observedQueueDepth, double inputEpoch) {
+        lastNetworkPreemptionDepth = Math.max(1, observedQueueDepth);
+        lastNetworkPreemptionInputEpoch = inputEpoch;
+        progressPulsesSinceNetworkPreemption = 0;
+        requestYield(YIELD_NETWORK, observedQueueDepth);
     }
 
     /**
@@ -853,8 +918,8 @@ public final class BrowserWorldgenScheduler {
             boolean madeProgress) {
         double floorMillis = Math.min(configuredBudgetMillis, MIN_ADAPTIVE_SLICE_MILLIS);
         double targetMillis = configuredBudgetMillis;
-        if (queueDepth > 0) {
-            targetMillis = Math.min(targetMillis, configuredBudgetMillis * 0.35);
+        if (queueDepth >= MIN_NETWORK_QUEUE_DEPTH_FOR_PREEMPTION) {
+            targetMillis = Math.min(targetMillis, configuredBudgetMillis * 0.65);
         }
         if (yieldDelayMillis >= BUSY_YIELD_DELAY_MILLIS || overrunMillis >= 2.0) {
             targetMillis = Math.min(targetMillis, configuredBudgetMillis * 0.25);
@@ -1156,13 +1221,34 @@ public final class BrowserWorldgenScheduler {
               globalThis.__gaiusNetworkStats;
             if (!stats) return 0;
             const packets = Math.max(0, Number(stats.decodedPacketQueue) || 0);
-            const slices = Math.max(0, Number(stats.decodedSliceBacklog) || 0);
+            // Active decoder scopes include the configuration handler that can
+            // be waiting for this worldgen continuation. Only slices not already
+            // executing are input backlog; yielding to our own caller cannot
+            // drain it and otherwise forces a yield after every two pulses.
+            const activeSlices = stats === (bridge && bridge.stats)
+              ? Math.max(0, Number(bridge.activeDecoderScopeDepth) || 0) : 0;
+            const slices = Math.max(0,
+              (Number(stats.decodedSliceBacklog) || 0) - activeSlices);
             const byteUnits = Math.ceil(
               Math.max(0, Number(stats.inboundQueuedBytes) || 0) / 16384
             );
             return Math.min(2147483647, Math.max(packets, slices, byteUnits));
             """)
     private static native int networkQueueDepth();
+
+    /**
+     * Monotonic frame-arrival evidence distinguishes a new frame from an unchanged
+     * retained queue observation whose Java handler cannot run inside requestYield.
+     */
+    @JSBody(script = """
+            const bridge = globalThis.__gaiusNettyBridge;
+            const stats = bridge && (bridge.stats || globalThis.__gaiusNetworkStats) ||
+              globalThis.__gaiusNetworkStats;
+            if (!stats) return 0;
+            const received = Number(stats.receivedFrames);
+            return Number.isFinite(received) && received >= 0 ? received : 0;
+            """)
+    private static native double networkInputEpoch();
 
     @JSBody(script = "return typeof WorkerGlobalScope !== 'undefined' && globalThis instanceof WorkerGlobalScope;")
     private static native boolean isWorkerRuntime();
