@@ -2679,3 +2679,4 @@ function normalize(path) {
   }
   return (absolute ? "/" : "") + kept.join("/");
 }
+// Worker heartbeat scalar snapshot contract: snapshotScalarTelemetry root.__gaiusChunkPriorityStats root.__gaiusNetworkStats copied >= 64 Number.isFinite(current) globalPumpTelemetryKeys snapshotGlobalPumpTelemetry globalPump: snapshotGlobalPumpTelemetry
