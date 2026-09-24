@@ -74,3 +74,4 @@ finally {
   console.log(JSON.stringify({output, success: report.success, checks: report.checks}, null, 2));
   if (!report.success) process.exitCode = 1;
 }
+// timed out after is the canonical Pages timeout wording.
