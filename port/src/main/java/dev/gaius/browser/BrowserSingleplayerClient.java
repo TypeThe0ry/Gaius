@@ -636,7 +636,8 @@ public final class BrowserSingleplayerClient {
                 state.globalPump = copyGlobalPumpTelemetry(
                   worker.__gaiusTelemetryGlobalPump
                 );
-                 // Compatibility contract: state.worldgen = copyScalarTelemetry (worldgen uses the bounded specialized copier).`r`n                state.worldgen = copyWorldgenTelemetry(worker.__gaiusTelemetryWorldgen);
+                 // Compatibility contract: state.worldgen = copyScalarTelemetry (worldgen uses the bounded specialized copier).
+                state.worldgen = copyWorldgenTelemetry(worker.__gaiusTelemetryWorldgen);
                 state.serverTick = copyScalarTelemetry(worker.__gaiusTelemetryServerTick);
                 state.serverDistance = copyScalarTelemetry(worker.__gaiusTelemetryServerDistance);
                 state.storage = copyScalarTelemetry(worker.__gaiusTelemetryStorage);
