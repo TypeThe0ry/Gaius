@@ -11458,6 +11458,40 @@ public final class MinecraftClientPatcher {
             throw new IllegalStateException(
                     "PauseScreen singleplayer worker label hook point was not found");
         }
+        boolean lanHooked = false;
+        for (AbstractInsnNode instruction = createPauseMenu.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKEVIRTUAL
+                    || !call.owner.equals("net/minecraft/client/Minecraft")
+                    || !call.name.equals("hasSingleplayerServer")
+                    || !call.desc.equals("()Z")) {
+                continue;
+            }
+            InsnList hook = new InsnList();
+            hook.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            hook.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    "net/minecraft/client/gui/screens/PauseScreen",
+                    "minecraft",
+                    "Lnet/minecraft/client/Minecraft;"));
+            hook.add(new VarInsnNode(Opcodes.ALOAD, 2));
+            hook.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "dev/gaius/browser/BrowserLanSession",
+                    "maybeAddButton",
+                    "(Lnet/minecraft/client/Minecraft;Lnet/minecraft/client/gui/layouts/GridLayout$RowHelper;)V",
+                    false));
+            // Insert after the boolean call: the receiver Minecraft reference is
+            // already on the operand stack before invokevirtual and must be consumed.
+            createPauseMenu.instructions.insert(instruction, hook);
+            lanHooked = true;
+            break;
+        }
+        if (!lanHooked) {
+            throw new IllegalStateException("PauseScreen Open to LAN hook point was not found");
+        }
         write(node, output);
     }
 

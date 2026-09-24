@@ -130,6 +130,11 @@ public final class BrowserSingleplayerClient {
         return minecraft != null && (minecraft.isLocalServer() || hasActiveWorker());
     }
 
+    /** True only while the browser integrated-server Worker owns a live session. */
+    public static boolean hasActiveWorkerSession() {
+        return hasActiveWorker();
+    }
+
     /** Applies changed video settings to an active Worker-hosted singleplayer server. */
     public static void syncDistances(Minecraft minecraft) {
         if (minecraft == null || minecraft.options == null) {
