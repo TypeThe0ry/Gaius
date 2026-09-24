@@ -8,6 +8,7 @@ import {join, resolve} from 'node:path';
 
 const base = String(process.env.GAIUS_PAGES_BASE || 'https://typethe0ry.github.io/Gaius/').replace(/\/+$/, '') + '/';
 const output = resolve(process.env.OUTPUT || 'artifacts/github-pages-cdp.json');
+const CDP_COMMAND_TIMEOUT_MS = Number(process.env.CDP_COMMAND_TIMEOUT_MS || '15000');
 const chromeBinary = process.env.CHROME || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
 const expectedPages = Object.freeze(['Gaius-1.21.11.html', 'Gaius-26.2.html']);
 // Keep per-profile release target names explicit for the repository guard and Pages workflow.
