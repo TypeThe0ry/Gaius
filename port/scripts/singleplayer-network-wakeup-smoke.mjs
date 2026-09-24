@@ -119,9 +119,12 @@ assert.match(stopped, /serverThreadExited = true;\s*serverThread = null;/);
 // Execute the actual telemetry JSBody rather than a separate invented Java scheduler
 // model. These checks prove emitted counter semantics, not JVM/TeaVM task execution.
 const telemetryMarker = '@JSBody(params = {"event", "pending"}, script = """';
-const telemetry = region(telemetryMarker,
-  "private static native void recordNetworkPumpState(");
-const script = telemetry.slice(telemetry.indexOf('"""') + 3, telemetry.lastIndexOf('"""'));
+const networkMethodAt = source.indexOf("private static native void recordNetworkPumpState(");
+const telemetryStart = source.lastIndexOf(telemetryMarker, networkMethodAt);
+const telemetryEnd = networkMethodAt;
+assert.ok(telemetryStart >= 0 && telemetryEnd > telemetryStart, "missing network telemetry source region");
+const telemetry = source.slice(telemetryStart, telemetryEnd);
+const script = telemetry.slice(telemetry.indexOf('"""') + 3, telemetry.lastIndexOf('""")'));
 assert.match(script, /var field = '';/);
 assert.doesNotMatch(script, /let field = '';/);
 const context = vm.createContext({});
