@@ -10,6 +10,9 @@ const base = String(process.env.GAIUS_PAGES_BASE || 'https://typethe0ry.github.i
 const output = resolve(process.env.OUTPUT || 'artifacts/github-pages-cdp.json');
 const chromeBinary = process.env.CHROME || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
 const expectedPages = Object.freeze(['Gaius-1.21.11.html', 'Gaius-26.2.html']);
+// Keep per-profile release target names explicit for the repository guard and Pages workflow.
+const expectedTargets = Object.freeze({ '1.21.11': process.env.GAIUS_TARGET_12111 || '', '26.2': process.env.GAIUS_TARGET_262 || '' });
+const expectedPageTargets = Object.freeze({ '1.21.11': process.env.GAIUS_PAGE_DEFAULT_TARGET_12111 || '', '26.2': process.env.GAIUS_PAGE_DEFAULT_TARGET_262 || '', defaultTarget: process.env.GAIUS_PAGES_DEFAULT_TARGET || '' });
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 function check(checks, name, ok, detail = '') { checks.push({name, ok: Boolean(ok), detail: String(detail)}); }
 async function freePort() {
