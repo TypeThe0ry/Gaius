@@ -20,6 +20,7 @@ public final class BrowserSingleplayerClient {
     private static final int READY_POLL_LIMIT = 7_200;
     /** Returned by the JS readiness probe when its poll belongs to an older launch. */
     private static final int STALE_WORKER_STATE = -2;
+    private static String activeSessionId;
 
     private BrowserSingleplayerClient() {
     }
@@ -53,6 +54,7 @@ public final class BrowserSingleplayerClient {
                 launchGeneration == null || launchGeneration.isEmpty()) {
             return false;
         }
+        activeSessionId = sessionId;
 
         worldStem.close();
         storage.safeClose();
@@ -128,6 +130,38 @@ public final class BrowserSingleplayerClient {
     /** Treats an active Worker-hosted world like vanilla singleplayer in menu navigation. */
     public static boolean isLocalSession(Minecraft minecraft) {
         return minecraft != null && (minecraft.isLocalServer() || hasActiveWorker());
+    }
+
+    /** True only while the browser integrated-server Worker owns a live session. */
+    public static boolean hasActiveWorkerSession() {
+        return hasActiveWorker();
+    }
+
+    /** Stable session key used by the relay-backed Open to LAN broker. */
+    public static String activeWorkerSessionId() {
+        return activeSessionId;
+    }
+
+    /** Requests the live server Worker to open one independent LAN channel. */
+    @JSBody(params = {"brokerSessionId", "workerSessionId"}, script = """
+            const key = String(brokerSessionId || '');
+            const workerKey = String(workerSessionId || '');
+            if (!/^[a-f0-9]{32}$/.test(key)) return false;
+            const workers = globalThis.__gaiusSingleplayerWorkers;
+            const worker = workers && typeof workers.get === 'function'
+              ? workers.get(workerKey)
+              : null;
+            if (!worker || worker.__gaiusTerminal ||
+                typeof worker.postMessage !== 'function') return false;
+            worker.postMessage({type: 'lan-open', brokerSessionId: key});
+            return true;
+            """)
+    private static native boolean postLanServerConnectionRequest(
+            String brokerSessionId, String workerSessionId);
+
+    public static boolean requestLanServerConnection(String brokerSessionId) {
+        return hasActiveWorker() && activeSessionId != null
+                && postLanServerConnectionRequest(brokerSessionId, activeSessionId);
     }
 
     /** Applies changed video settings to an active Worker-hosted singleplayer server. */

@@ -1819,6 +1819,13 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             );
             return /^[1-9][0-9]*$/.test(serverGeneration) ? serverGeneration : '';
             }
+            function ownsLocalWorkerSession(sessionId) {
+            const key = String(sessionId || '');
+            if (!key) return false;
+            const workers = globalThis.__gaiusSingleplayerWorkers;
+            if (workers && typeof workers.has === 'function' && workers.has(key)) return true;
+            return String(globalThis.__gaiusServerSessionId || '') === key;
+            }
             function localPortGeneration(port) {
             return port ? String(port.__gaiusLaunchGeneration || '') : '';
             }
@@ -2664,11 +2671,18 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             state.stats.opened++;
             state.scheduleEventLoopGapProbe();
             const sessionId = localSession(entry.host);
-            if (sessionId !== null) {
+            // A gaius-local hostname is also used as the public relay address
+            // in an Open to LAN invite. Claim a MessagePort only when this
+            // page actually owns the matching Worker generation; a joining
+            // browser must continue through the relay instead of waiting for
+            // a port that can only exist in the host page.
+            const localGeneration = sessionId === null ? '' : localWorkerGeneration(sessionId);
+            const localOwner = sessionId !== null && ownsLocalWorkerSession(sessionId);
+            if (localOwner) {
               claimLocalPort(
                 entry,
                 sessionId,
-                localWorkerGeneration(sessionId),
+                localGeneration,
                 true
               );
               return;

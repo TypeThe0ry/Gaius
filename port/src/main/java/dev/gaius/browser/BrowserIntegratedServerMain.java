@@ -7,6 +7,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.lang.reflect.Method;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -102,7 +103,10 @@ public final class BrowserIntegratedServerMain {
             "generate-structures=true",
             "hardcore=false",
             "level-name=world",
-            "max-players=1",
+            // Open to LAN uses one independent Netty channel per joining
+            // browser. Keep enough slots for a normal small LAN session while
+            // retaining the browser world's bounded Worker footprint.
+            "max-players=8",
             "max-tick-time=-1",
             "motd=Gaius Integrated Server",
             "network-compression-threshold=256",
@@ -332,6 +336,31 @@ public final class BrowserIntegratedServerMain {
     /** Compatibility predicate retained for existing patcher call sites. */
     public static boolean isWorkerServer() {
         return isWorkerRuntime();
+    }
+
+    /**
+     * Opens an additional independent server-side channel for an Open to LAN
+     * invite. The method is deliberately reflective because the corresponding
+     * static entry point is injected into Minecraft's ServerConnectionListener
+     * by MinecraftClientPatcher after the Mojang classes are remapped.
+     */
+    @JSExport
+    public static boolean openLanServerConnection(String sessionId) {
+        if (!isWorkerRuntime() || !isSafeSessionId(sessionId)) {
+            return false;
+        }
+        String host = "server-" + sessionId + ".gaius-local";
+        try {
+            Class<?> listener = Class.forName(
+                    "net.minecraft.server.network.ServerConnectionListener");
+            Method opener = listener.getMethod(
+                    "openAdditionalBrowserConnection", String.class);
+            opener.invoke(null, host);
+            return true;
+        } catch (ReflectiveOperationException | RuntimeException failure) {
+            report("lan-server-connection-failed", host + ":" + failure.getClass().getSimpleName());
+            return false;
+        }
     }
 
 

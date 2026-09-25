@@ -1703,9 +1703,51 @@
       setInterval(updateGaiusProfileSwitch, 250);
       updateGaiusProfileSwitch();
     }
-    window.__gaiusChangePlayerName = changeGaiusPlayerName;
+      window.__gaiusChangePlayerName = changeGaiusPlayerName;
 
-    async function buildGaiusSessionArgs() {
+      // The built-in broker is intentionally a stateless invite: the host
+      // Worker has already opened an independent server tunnel for this
+      // session, and the joining page connects through the configured relay.
+      // Deployments may replace this with __gaiusLanInviteProvider when they
+      // want a short URL or an authenticated invite service.
+      if (typeof window.__gaiusLanInviteProvider !== "function") {
+        window.__gaiusLanInviteProvider = async ({brokerSessionId}) => {
+          if (!/^[a-f0-9]{32}$/u.test(String(brokerSessionId || ""))) {
+            throw new Error("LAN broker session is invalid");
+          }
+          const invite = new URL(location.href);
+          invite.searchParams.set("server", "client-" + brokerSessionId + ".gaius-local:25565");
+          return {url: invite.href};
+        };
+      }
+
+      // Browser worlds are hosted by a Web Worker.  Keep the LAN action explicit:
+      // the invite is relay-backed and carries no access token or world bytes.
+      // A deployment can provide __gaiusLanInviteProvider when its LAN broker is
+      // enabled; without it the game never advertises a misleading raw TCP port.
+      window.__gaiusOpenToLan = async function(identity) {
+        const provider = window.__gaiusLanInviteProvider;
+        if (typeof provider !== "function") {
+          const message = "Open to LAN needs a relay-backed LAN broker for this browser build.";
+          try { window.__gaiusMinecraftEvents?.push({event: "lan:unavailable", detail: message}); } catch (_) {}
+          if (typeof window.alert === "function") window.alert(message);
+          return {ok: false, reason: "lan-broker-unavailable"};
+        }
+          const invite = await provider({
+            profile: String(identity?.profile || window.__gaiusProfileId || "template"),
+            username: String(identity?.username || ""),
+            brokerSessionId: String(identity?.brokerSessionId || "")
+          });
+        if (!invite || typeof invite.url !== "string" || !invite.url.trim()) {
+          throw new Error("LAN broker returned an invalid invite");
+        }
+        try { await navigator.clipboard?.writeText(invite.url); } catch (_) {}
+        try { window.__gaiusMinecraftEvents?.push({event: "lan:opened", detail: {url: invite.url}}); } catch (_) {}
+        if (typeof window.prompt === "function") window.prompt("Open to LAN invite (copied when permitted)", invite.url);
+        return {ok: true, url: invite.url};
+      };
+
+      async function buildGaiusSessionArgs() {
       let stored = {};
       try {
         const value = sessionStorage.getItem("gaius.session");
