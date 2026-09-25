@@ -1718,7 +1718,7 @@
           return {ok: false, reason: "lan-broker-unavailable"};
         }
         const invite = await provider({
-          profile: String(identity?.profile || window.__gaiusProfileId || "26.2"),
+          profile: String(identity?.profile || window.__gaiusProfileId || "template"),
           username: String(identity?.username || "")
         });
         if (!invite || typeof invite.url !== "string" || !invite.url.trim()) {
