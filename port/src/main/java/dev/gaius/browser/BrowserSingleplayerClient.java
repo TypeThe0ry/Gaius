@@ -142,6 +142,28 @@ public final class BrowserSingleplayerClient {
         return activeSessionId;
     }
 
+    /** Requests the live server Worker to open one independent LAN channel. */
+    @JSBody(params = {"brokerSessionId", "workerSessionId"}, script = """
+            const key = String(brokerSessionId || '');
+            const workerKey = String(workerSessionId || '');
+            if (!/^[a-f0-9]{32}$/.test(key)) return false;
+            const workers = globalThis.__gaiusSingleplayerWorkers;
+            const worker = workers && typeof workers.get === 'function'
+              ? workers.get(workerKey)
+              : null;
+            if (!worker || worker.__gaiusTerminal ||
+                typeof worker.postMessage !== 'function') return false;
+            worker.postMessage({type: 'lan-open', brokerSessionId: key});
+            return true;
+            """)
+    private static native boolean postLanServerConnectionRequest(
+            String brokerSessionId, String workerSessionId);
+
+    public static boolean requestLanServerConnection(String brokerSessionId) {
+        return hasActiveWorker() && activeSessionId != null
+                && postLanServerConnectionRequest(brokerSessionId, activeSessionId);
+    }
+
     /** Applies changed video settings to an active Worker-hosted singleplayer server. */
     public static void syncDistances(Minecraft minecraft) {
         if (minecraft == null || minecraft.options == null) {

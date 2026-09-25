@@ -30,7 +30,7 @@ public final class BrowserLanSession {
         }
         String brokerSessionId = UUID.randomUUID().toString().replace("-", "");
         if (brokerSessionId.length() != 32
-                || !BrowserIntegratedServerMain.openLanServerConnection(brokerSessionId)) {
+                || !BrowserSingleplayerClient.requestLanServerConnection(brokerSessionId)) {
             return;
         }
         publishLanInvite(brokerSessionId);

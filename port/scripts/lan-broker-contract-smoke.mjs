@@ -9,12 +9,14 @@ const server = await source("port/src/main/java/dev/gaius/browser/BrowserIntegra
 const lan = await source("port/src/main/java/dev/gaius/browser/BrowserLanSession.java");
 const launcher = await source("port/web/launcher/index.template.html");
 const channel = await source("port/overrides/libraries/netty-transport/src/main/java/io/netty/channel/browser/BrowserWebSocketChannel.java");
+const worker = await source("port/web/singleplayer/server-worker-bootstrap.js");
 
 assert.match(listenerPatcher, /openAdditionalBrowserConnection/);
 assert.match(listenerPatcher, /browserInstance/);
 assert.match(listenerPatcher, /BrowserWebSocketChannel/);
 assert.match(server, /openLanServerConnection/);
 assert.match(server, /Class\.forName\(/);
+assert.match(server, /@JSExport\s+public static boolean openLanServerConnection/);
 assert.match(server, /max-players=8/);
 assert.match(lan, /UUID\.randomUUID\(\)/);
 assert.match(lan, /publishLanInvite\(brokerSessionId\)/);
@@ -22,5 +24,7 @@ assert.match(launcher, /brokerSessionId/);
 assert.match(launcher, /client-" \+ brokerSessionId \+ "\.gaius-local:25565/);
 assert.match(channel, /continue through the relay/);
 assert.match(channel, /localGeneration = sessionId === null \? '' : localWorkerGeneration\(sessionId\)/);
+assert.match(worker, /message\.type === "lan-open"/);
+assert.match(worker, /openLanServerConnection\(brokerSessionId\)/);
 
 console.log("relay-backed LAN broker contract passed");

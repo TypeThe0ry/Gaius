@@ -344,6 +344,7 @@ public final class BrowserIntegratedServerMain {
      * static entry point is injected into Minecraft's ServerConnectionListener
      * by MinecraftClientPatcher after the Mojang classes are remapped.
      */
+    @JSExport
     public static boolean openLanServerConnection(String sessionId) {
         if (!isWorkerRuntime() || !isSafeSessionId(sessionId)) {
             return false;

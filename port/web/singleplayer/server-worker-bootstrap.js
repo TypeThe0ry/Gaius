@@ -1006,6 +1006,26 @@ function handleControlMessage(event) {
     }
     return;
   }
+  if (message.type === "lan-open") {
+    const brokerSessionId = String(message.brokerSessionId || "");
+    if (!/^[a-f0-9]{32}$/.test(brokerSessionId)) {
+      postMessage({type: "lan-open-result", ok: false, reason: "invalid-session"});
+      return;
+    }
+    try {
+      const ok = typeof openLanServerConnection === "function" &&
+        openLanServerConnection(brokerSessionId) === true;
+      postMessage({type: "lan-open-result", ok, brokerSessionId});
+    } catch (error) {
+      postMessage({
+        type: "lan-open-result",
+        ok: false,
+        brokerSessionId,
+        reason: String(error && error.message || error),
+      });
+    }
+    return;
+  }
   if (message.type === "telemetry-ping") {
     const measurementId = typeof message.measurementId === "string"
       ? message.measurementId
