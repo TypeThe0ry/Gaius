@@ -10041,8 +10041,22 @@ public final class MinecraftClientPatcher {
             throws IOException {
         String owner = "net/minecraft/server/network/ServerConnectionListener";
         ClassNode node = read(jar, owner + ".class");
+        if (node.fields.stream().noneMatch(field -> "browserInstance".equals(field.name))) {
+            node.fields.add(new FieldNode(
+                    Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC,
+                    "browserInstance",
+                    "L" + owner + ";",
+                    null,
+                    null));
+        }
         MethodNode method = find(node, "startTcpServerListener", "(Ljava/net/InetAddress;I)V");
         InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.PUTSTATIC,
+                owner,
+                "browserInstance",
+                "L" + owner + ";"));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new FieldInsnNode(
                 Opcodes.GETFIELD,
@@ -10146,6 +10160,75 @@ public final class MinecraftClientPatcher {
                 false));
         code.add(new InsnNode(Opcodes.RETURN));
         replace(method, code, 5, 3);
+
+        MethodNode opener = new MethodNode(
+                Opcodes.ACC_PUBLIC | Opcodes.ACC_STATIC,
+                "openAdditionalBrowserConnection",
+                "(Ljava/lang/String;)V",
+                null,
+                null);
+        InsnList open = opener.instructions;
+        LabelNode noListener = new LabelNode();
+        open.add(new FieldInsnNode(
+                Opcodes.GETSTATIC, owner, "browserInstance", "L" + owner + ";"));
+        open.add(new JumpInsnNode(Opcodes.IFNULL, noListener));
+        open.add(new FieldInsnNode(
+                Opcodes.GETSTATIC, owner, "browserInstance", "L" + owner + ";"));
+        open.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "channels", "Ljava/util/List;"));
+        open.add(new TypeInsnNode(Opcodes.NEW, "io/netty/bootstrap/Bootstrap"));
+        open.add(new InsnNode(Opcodes.DUP));
+        open.add(new MethodInsnNode(Opcodes.INVOKESPECIAL,
+                "io/netty/bootstrap/Bootstrap", "<init>", "()V", false));
+        open.add(new InsnNode(Opcodes.ICONST_0));
+        open.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "net/minecraft/server/network/EventLoopGroupHolder", "remote",
+                "(Z)Lnet/minecraft/server/network/EventLoopGroupHolder;", false));
+        open.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/server/network/EventLoopGroupHolder", "eventLoopGroup",
+                "()Lio/netty/channel/EventLoopGroup;", false));
+        open.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                "io/netty/bootstrap/AbstractBootstrap", "group",
+                "(Lio/netty/channel/EventLoopGroup;)Lio/netty/channel/AbstractBootstrap;", false));
+        open.add(new TypeInsnNode(Opcodes.CHECKCAST, "io/netty/bootstrap/Bootstrap"));
+        open.add(new LdcInsnNode(Type.getObjectType("io/netty/channel/browser/BrowserWebSocketChannel")));
+        open.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                "io/netty/bootstrap/AbstractBootstrap", "channel",
+                "(Ljava/lang/Class;)Lio/netty/channel/AbstractBootstrap;", false));
+        open.add(new TypeInsnNode(Opcodes.CHECKCAST, "io/netty/bootstrap/Bootstrap"));
+        open.add(new TypeInsnNode(Opcodes.NEW, owner + "$1"));
+        open.add(new InsnNode(Opcodes.DUP));
+        open.add(new FieldInsnNode(
+                Opcodes.GETSTATIC, owner, "browserInstance", "L" + owner + ";"));
+        open.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, owner + "$1", "<init>",
+                "(L" + owner + ";)V", false));
+        open.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                "io/netty/bootstrap/AbstractBootstrap", "handler",
+                "(Lio/netty/channel/ChannelHandler;)Lio/netty/channel/AbstractBootstrap;", false));
+        open.add(new TypeInsnNode(Opcodes.CHECKCAST, "io/netty/bootstrap/Bootstrap"));
+        open.add(new FieldInsnNode(Opcodes.GETSTATIC,
+                "io/netty/resolver/NoopAddressResolverGroup", "INSTANCE",
+                "Lio/netty/resolver/NoopAddressResolverGroup;"));
+        open.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                "io/netty/bootstrap/Bootstrap", "resolver",
+                "(Lio/netty/resolver/AddressResolverGroup;)Lio/netty/bootstrap/Bootstrap;", false));
+        open.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        open.add(new IntInsnNode(Opcodes.SIPUSH, 25565));
+        open.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "java/net/InetSocketAddress", "createUnresolved",
+                "(Ljava/lang/String;I)Ljava/net/InetSocketAddress;", false));
+        open.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                "io/netty/bootstrap/Bootstrap", "connect",
+                "(Ljava/net/SocketAddress;)Lio/netty/channel/ChannelFuture;", false));
+        open.add(new MethodInsnNode(Opcodes.INVOKEINTERFACE,
+                "io/netty/channel/ChannelFuture", "syncUninterruptibly",
+                "()Lio/netty/channel/ChannelFuture;", true));
+        open.add(new MethodInsnNode(Opcodes.INVOKEINTERFACE,
+                "java/util/List", "add", "(Ljava/lang/Object;)Z", true));
+        open.add(new InsnNode(Opcodes.POP));
+        open.add(noListener);
+        open.add(new InsnNode(Opcodes.RETURN));
+        node.methods.add(opener);
         writeComputeFrames(node, output);
     }
 

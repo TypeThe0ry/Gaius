@@ -20,6 +20,7 @@ public final class BrowserSingleplayerClient {
     private static final int READY_POLL_LIMIT = 7_200;
     /** Returned by the JS readiness probe when its poll belongs to an older launch. */
     private static final int STALE_WORKER_STATE = -2;
+    private static String activeSessionId;
 
     private BrowserSingleplayerClient() {
     }
@@ -53,6 +54,7 @@ public final class BrowserSingleplayerClient {
                 launchGeneration == null || launchGeneration.isEmpty()) {
             return false;
         }
+        activeSessionId = sessionId;
 
         worldStem.close();
         storage.safeClose();
@@ -133,6 +135,11 @@ public final class BrowserSingleplayerClient {
     /** True only while the browser integrated-server Worker owns a live session. */
     public static boolean hasActiveWorkerSession() {
         return hasActiveWorker();
+    }
+
+    /** Stable session key used by the relay-backed Open to LAN broker. */
+    public static String activeWorkerSessionId() {
+        return activeSessionId;
     }
 
     /** Applies changed video settings to an active Worker-hosted singleplayer server. */

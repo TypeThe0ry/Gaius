@@ -4,6 +4,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.layouts.GridLayout;
 import net.minecraft.network.chat.Component;
+import java.util.UUID;
 
 /** Browser equivalent of vanilla's Open to LAN action for the Worker-hosted world. */
 public final class BrowserLanSession {
@@ -27,22 +28,28 @@ public final class BrowserLanSession {
         if (minecraft == null || !BrowserSingleplayerClient.hasActiveWorkerSession()) {
             return;
         }
-        publishLanInvite();
+        String brokerSessionId = UUID.randomUUID().toString().replace("-", "");
+        if (brokerSessionId.length() != 32
+                || !BrowserIntegratedServerMain.openLanServerConnection(brokerSessionId)) {
+            return;
+        }
+        publishLanInvite(brokerSessionId);
     }
 
     /** Kept as a separate hook so the browser shell can expose a stable acceptance contract. */
-    @org.teavm.jso.JSBody(script = """
+    @org.teavm.jso.JSBody(params = {"brokerSessionId"}, script = """
             const root = globalThis;
             if (typeof root.__gaiusOpenToLan === 'function') {
               const session = root.__gaiusSession && typeof root.__gaiusSession === 'object'
                 ? root.__gaiusSession : {};
               root.__gaiusOpenToLan({
                 profile: String(root.__gaiusProfileId || '26.2'),
-                username: String(session.username || '')
+                username: String(session.username || ''),
+                brokerSessionId: String(brokerSessionId || '')
               });
             } else {
               console.warn('[Gaius] Open to LAN shell is unavailable');
             }
             """)
-    private static native void publishLanInvite();
+    private static native void publishLanInvite(String brokerSessionId);
 }
