@@ -14,6 +14,11 @@ on:
         description: Unique token binding a release publish to this Pages run
         required: true
         type: string
+      release_tag:
+        description: Release tag whose browser assets should be deployed
+        required: false
+        default: v0.1.0
+        type: string
 
 permissions:
   contents: read
@@ -40,12 +45,13 @@ jobs:
       - name: Download the two version files
         env:
           GH_TOKEN: ${{ github.token }}
+          PAGES_RELEASE_TAG: ${{ inputs.release_tag || 'v0.1.0' }}
         shell: bash
         run: |
           set -euo pipefail
           rm -rf pages-publish
           mkdir -p pages-publish
-          gh release download v0.1.0 \
+          gh release download "$PAGES_RELEASE_TAG" \
             --repo "${GITHUB_REPOSITORY}" \
             --pattern 'Gaius-1.21.11.html' \
             --pattern 'Gaius-26.2.html' \
