@@ -2664,11 +2664,17 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             state.stats.opened++;
             state.scheduleEventLoopGapProbe();
             const sessionId = localSession(entry.host);
-            if (sessionId !== null) {
+            // A gaius-local hostname is also used as the public relay address
+            // in an Open to LAN invite. Claim a MessagePort only when this
+            // page actually owns the matching Worker generation; a joining
+            // browser must continue through the relay instead of waiting for
+            // a port that can only exist in the host page.
+            const localGeneration = sessionId === null ? '' : localWorkerGeneration(sessionId);
+            if (sessionId !== null && /^[1-9][0-9]*$/.test(String(localGeneration || ''))) {
               claimLocalPort(
                 entry,
                 sessionId,
-                localWorkerGeneration(sessionId),
+                localGeneration,
                 true
               );
               return;
