@@ -16,17 +16,21 @@ This release is the 26.2 browser client line.
 ## Open to LAN
 
 The pause menu now exposes **Open to LAN** for a live browser Worker world.
-Browser builds cannot bind a raw TCP listening socket, so the action is wired to
-the deployment's relay-backed LAN broker (`window.__gaiusLanInviteProvider`).
-When the broker is present it returns a short-lived invite URL, copies it when
-the browser permits clipboard access, and publishes the invite without sending
-access tokens or world data. A deployment without that broker refuses the
-action explicitly instead of advertising an unusable `host:port`.
+Browser builds cannot bind a raw TCP listening socket, so each invite creates a
+fresh server-side Netty channel and a matching `client-<session>.gaius-local`
+relay tunnel. The built-in launcher provider emits a URL containing that
+session; deployments can replace it with `window.__gaiusLanInviteProvider` to
+add short-lived invite storage or an authenticated broker. A joining browser
+only treats the hostname as local when it owns the matching Worker generation;
+otherwise it correctly goes through RelayNode. No access token or world bytes
+are placed in the invite URL.
 
 ## Skins and server packs
 
 The existing authlib and skin texture paths remain enabled for multiplayer:
 profile texture JSON is decoded without reflective Gson construction and skin
-URLs are fetched through the trusted texture proxy. Server resource packs are
+URLs are fetched through the trusted texture proxy. Online profiles therefore
+retain their custom skin on both the host and joining browser; offline names do
+not contain a Mojang profile texture to propagate. Server resource packs are
 downloaded through the streaming relay path and must pass exact byte/hash and
 reload gates before acceptance.
