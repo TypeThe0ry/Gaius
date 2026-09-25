@@ -4842,6 +4842,12 @@ public final class MinecraftClientPatcher {
                 "(Ljava/util/UUID;Ljava/lang/String;)V",
                 false));
         code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserSkinProfile",
+                "apply",
+                "(Lcom/mojang/authlib/GameProfile;)Lcom/mojang/authlib/GameProfile;",
+                false));
+        code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL,
                 "net/minecraft/server/network/ServerLoginPacketListenerImpl",
                 "startClientVerification",

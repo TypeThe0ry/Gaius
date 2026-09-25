@@ -636,6 +636,15 @@ root.onmessage = async (event) => {
     root.__gaiusServerSessionId = activeSessionId;
     root.__gaiusServerLaunchGeneration = launchGeneration;
     root.__gaiusServerWorldId = String(message.worldId || "");
+    root.__gaiusSkinDescriptor = message.skinDescriptor &&
+      typeof message.skinDescriptor === "object"
+      ? {
+          uuid: String(message.skinDescriptor.uuid || ""),
+          username: String(message.skinDescriptor.username || ""),
+          value: String(message.skinDescriptor.value || ""),
+          signature: String(message.skinDescriptor.signature || "")
+        }
+      : null;
     root.__gaiusServerSeed = String(message.seed || "");
     root.__gaiusServerViewDistance = clampDistance(message.renderDistance, 8);
     root.__gaiusServerSimulationDistance = clampDistance(message.simulationDistance, 6);

@@ -213,20 +213,31 @@ const online = await runScenario({
     profileRequests++;
     const proxy = new URL(url);
     assert.equal(proxy.pathname, "/proxy/auth");
-    assert.equal(
-      proxy.searchParams.get("url"),
-      "https://api.minecraftservices.com/minecraft/profile",
-    );
-    assert.equal(init.headers.authorization, "Bearer secret-token");
+    const target = proxy.searchParams.get("url");
+    if (target === "https://api.minecraftservices.com/minecraft/profile") {
+      assert.equal(init.headers.authorization, "Bearer secret-token");
+    } else {
+      assert.equal(
+        target,
+        "https://sessionserver.mojang.com/session/minecraft/profile/00112233445566778899aabbccddeeff?unsigned=false",
+      );
+      assert.equal(init.credentials, "omit");
+    }
     return {
       ok: true,
       async json() {
-        return {name: "OnlinePlayer", id: "00112233445566778899aabbccddeeff"};
+        return target === "https://api.minecraftservices.com/minecraft/profile"
+          ? {name: "OnlinePlayer", id: "00112233445566778899aabbccddeeff"}
+          : {
+              id: "00112233445566778899aabbccddeeff",
+              name: "OnlinePlayer",
+              properties: [{name: "textures", value: "signed-textures", signature: "sig"}],
+            };
       },
     };
   },
 });
-assert.equal(profileRequests, 1);
+assert.equal(profileRequests, 2);
 assert.equal(online.mode, "online");
 assert.equal(online.prompted, false);
 assert.ok(!online.args.includes("--offlineDeveloperMode"));
@@ -239,6 +250,8 @@ assert.equal(online.args[online.args.indexOf("--accessToken") + 1], "secret-toke
 assert.equal(online.args[online.args.indexOf("--quickPlayMultiplayer") + 1], "example.org");
 assert.equal(online.stored.username, "OnlinePlayer");
 assert.equal(online.stored.uuid, "00112233445566778899aabbccddeeff");
+assert.equal(online.stored.skinDescriptor.username, "OnlinePlayer");
+assert.equal(online.stored.skinDescriptor.uuid, "00112233445566778899aabbccddeeff");
 assert.equal(online.historyCalls.length, 1);
 assert.ok(!String(online.historyCalls[0][2]).includes("accessToken"));
 
@@ -248,6 +261,12 @@ const complete = await runScenario({
     accessToken: "stored-token",
     username: "StoredPlayer",
     uuid: "ffeeddccbbaa99887766554433221100",
+    skinDescriptor: {
+      uuid: "ffeeddccbbaa99887766554433221100",
+      username: "StoredPlayer",
+      value: "cached-textures",
+      signature: "cached-signature",
+    },
   },
   fetchImpl() {
     unexpectedFetches++;
