@@ -94,9 +94,11 @@ the target server for that player. The relay is a transport bridge, not a
 general protocol translator: the client and server still need compatible
 Minecraft protocol and authentication settings.
 
-The repository's transport checks use `t40.sjcmc.cn:14803` through
-`wss://ellan.site/tunnel`. A relay operator should configure TLS, allowed
-origins, destination policy, rate limits, capacity limits, and an abuse contact.
+The repository's transport checks take an authorized target from the private
+acceptance environment through a RelayNode URL. Target hosts and source IPs are
+never committed to this repository. A relay operator should configure TLS,
+allowed origins, destination policy, rate limits, capacity limits, and an abuse
+contact.
 See the [RelayNode guide](docs/relay-nodes.md) and
 [`apps/bridge/README.md`](apps/bridge/README.md).
 

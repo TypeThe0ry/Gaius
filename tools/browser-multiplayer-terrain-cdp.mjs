@@ -872,7 +872,8 @@ async function main() {
 
   const artifact = resolve(process.env.ARTIFACT);
   const profile = inferProfile(artifact);
-  const target = process.env.TARGET || '183.247.170.218:14803';
+  const target = process.env.TARGET;
+  if (!target) throw new Error('TARGET is required; do not store a public multiplayer target in the repository');
   const relay = process.env.RELAY || 'wss://ellan.site/tunnel';
   const packChoice = String(process.env.PACK_CHOICE || 'Yes').trim();
   const acceptanceSeconds = envInteger('ACCEPTANCE_SECONDS', 180, 10);

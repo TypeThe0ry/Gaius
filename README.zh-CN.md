@@ -90,9 +90,9 @@ WebSocket 发到 Paper 端点或 RelayNode，再由它为当前玩家连接目�
 只是传输桥接，不负责通用协议转换；客户端、目标服务器的 Minecraft 协议和登录
 配置仍然要匹配。
 
-仓库里的传输检查使用 `t40.sjcmc.cn:14803`，中间经过
-`wss://ellan.site/tunnel`。自己部署 RelayNode 时要配置 TLS、允许的 Origin、目标
-地址策略、限流、容量和问题反馈地址。详见 [RelayNode 指南](docs/relay-nodes.md)
+仓库里的传输检查从私有验收环境读取经过授权的目标和 RelayNode 地址。目标主机和源站
+IP 不提交到仓库。自己部署 RelayNode 时要配置 TLS、允许的 Origin、目标地址策略、
+限流、容量和问题反馈地址。详见 [RelayNode 指南](docs/relay-nodes.md)
 和 [`apps/bridge/README.md`](apps/bridge/README.md)。
 
 ## 检查

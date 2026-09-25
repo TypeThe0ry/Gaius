@@ -13,7 +13,10 @@ import {
 const registryPath = new URL("../../relay-nodes.json", import.meta.url);
 const registry = JSON.parse(await readFile(registryPath, "utf8"));
 const relayUrl = process.env.GAIUS_PUBLIC_RELAY_URL ?? registry.nodes?.[0]?.url;
-const target = parseTarget(process.env.GAIUS_PUBLIC_RELAY_TARGET ?? "t40.sjcmc.cn:14803");
+const configuredTarget = process.env.GAIUS_PUBLIC_RELAY_TARGET;
+assert(typeof configuredTarget === "string" && configuredTarget.trim().length > 0,
+    "GAIUS_PUBLIC_RELAY_TARGET is required; do not store a public target in the repository");
+const target = parseTarget(configuredTarget);
 const handshakeHost = process.env.GAIUS_PUBLIC_RELAY_HANDSHAKE_HOST ?? target.host;
 const minecraftProfile = resolveSmokeMinecraftProfile(
     process.env.GAIUS_PUBLIC_RELAY_MINECRAFT_VERSION ??

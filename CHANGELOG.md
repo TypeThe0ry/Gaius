@@ -9,9 +9,10 @@ All notable changes to Gaius are documented here.
 - Prepare the dual-profile release for Minecraft Java `1.21.11` (protocol
   `774`, JDK 21) and `26.2` (protocol `776`, JDK 25), with independent browser
   packages, manifests, checksums, and the optional Paper bridge plugin.
-- Keep `t40.sjcmc.cn:14803` as the external multiplayer test target through
-  `wss://ellan.site/tunnel`. Status/attestation and lease-release checks are
-  transport evidence; they do not assert a complete LOGIN/PLAY session.
+- Keep the external multiplayer test target in the private acceptance
+  environment. Never commit a target host or source IP to the repository.
+  Status/attestation and lease-release checks are transport evidence; they do
+  not assert a complete LOGIN/PLAY session.
 
 ### Added
 

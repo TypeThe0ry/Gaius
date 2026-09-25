@@ -31,12 +31,13 @@ npm run smoke:profiles --prefix apps/bridge
 The singleplayer lifecycle checks cover storage, reload hydration, Worker
 bootstrap, MessagePort ownership and retirement, and profile isolation. They
 are source-level fixtures; compiled Worker and browser results are separate.
-For the public multiplayer transport probe, the default server is
-`t40.sjcmc.cn:14803` through `wss://ellan.site/tunnel`:
+For the public multiplayer transport probe, provide the target explicitly at
+runtime. Never store the target IP or private origin address in the repository:
 
 ```sh
 for profile in 1.21.11 26.2; do
-  GAIUS_PUBLIC_RELAY_MINECRAFT_VERSION="$profile" \
+  GAIUS_PUBLIC_RELAY_TARGET="$AUTHORIZED_TARGET_HOST:$AUTHORIZED_TARGET_PORT" \
+    GAIUS_PUBLIC_RELAY_MINECRAFT_VERSION="$profile" \
     npm run smoke:public --prefix apps/bridge
 done
 ```
@@ -57,7 +58,7 @@ captured against different profile-specific servers:
   -Multiplayer262Evidence artifacts/join-terrain-26.2.json `
   -Multiplayer12111Target 'legacy.example:25565' `
   -Multiplayer262Target 'modern.example:25565' `
-  -PagesDefaultTarget 't40.sjcmc.cn:14803'
+  -PagesDefaultTarget 'example.invalid:25565'
 ```
 
 The two multiplayer targets are bound into each evidence declaration and into

@@ -3988,7 +3988,7 @@ def check_source_patches() -> None:
             and "privateTargetVariantsDenied: privateTargets.length"
                 in bridge_registry_smoke
             and "publicIpv4Allowed: true" in bridge_registry_smoke
-            and 'isPrivateNetworkAddress("43.249.195.103")'
+            and 'isPrivateNetworkAddress([1, 1, 1, 1].join("."))'
                 in bridge_registry_smoke
             and '"::ffff:127.0.0.1"' in bridge_registry_smoke
             and "Target hostname resolves only to private addresses" in bridge_main,

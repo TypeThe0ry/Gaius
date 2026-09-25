@@ -10,8 +10,8 @@ This release is the 26.2 browser client line.
 - Multiplayer acceptance continues to require `ClientLevel`, positive loaded
   chunks, a clean RelayNode session, exact server resource-pack body
   verification, successful reload, and retained non-blank terrain screenshots.
-- The tested 26.2 target remains `t40.sjcmc.cn:14803` through
-  `wss://ellan.site/tunnel`.
+- The 26.2 target is supplied only through the private acceptance environment;
+  no public target or source IP is embedded in the release documentation.
 
 ## Open to LAN
 
