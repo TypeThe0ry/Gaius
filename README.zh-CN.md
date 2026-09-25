@@ -34,8 +34,17 @@ HTML 文件是可直接携带的单人客户端。下载后用新版 Chrome 或 
 填写玩家名称，再点 **Singleplayer**。浏览器启动器和 Worker 需要的内容都在文件
 里，单人模式不用另起网页服务器。
 
-多人模式点 **Multiplayer**，填写 Java 服务器地址。服务器需要安装 Gaius Paper
-插件，或者有能访问到目标服务器的 RelayNode。
+### 加入服务器
+
+1. 用 Chrome 或 Chromium 打开下载的 `Gaius-26.2.html`。
+2. 在 Minecraft 标题界面点 **Multiplayer（多人游戏）**。
+3. 点 **Add Server（添加服务器）** 或 **Direct Connection（直接连接）**，输入
+   普通 Java 版服务器地址，例如 `example.net:25565`，然后点 **Join Server**。
+
+服务器地址要填在 Minecraft 的服务器界面里，不是浏览器地址栏。浏览器不能直接
+打开服务器的原始 TCP 端口，因此目标服务器必须安装 Gaius Paper 插件，或者使用
+可访问它的 RelayNode。如果界面一直停在 **Waiting for Server**，检查 RelayNode
+地址和目标 `host:port`，并确认客户端 profile 与服务器协议一致后重试。
 
 ## 从源码构建
 
@@ -81,9 +90,9 @@ WebSocket 发到 Paper 端点或 RelayNode，再由它为当前玩家连接目�
 只是传输桥接，不负责通用协议转换；客户端、目标服务器的 Minecraft 协议和登录
 配置仍然要匹配。
 
-仓库里的传输检查使用 `t40.sjcmc.cn:14803`，中间经过
-`wss://ellan.site/tunnel`。自己部署 RelayNode 时要配置 TLS、允许的 Origin、目标
-地址策略、限流、容量和问题反馈地址。详见 [RelayNode 指南](docs/relay-nodes.md)
+仓库里的传输检查从私有验收环境读取经过授权的目标和 RelayNode 地址。目标主机和源站
+IP 不提交到仓库。自己部署 RelayNode 时要配置 TLS、允许的 Origin、目标地址策略、
+限流、容量和问题反馈地址。详见 [RelayNode 指南](docs/relay-nodes.md)
 和 [`apps/bridge/README.md`](apps/bridge/README.md)。
 
 ## 检查

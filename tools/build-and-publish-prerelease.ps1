@@ -90,7 +90,7 @@ foreach ($profile in $Profiles) {
 }
 $plugin = Join-Path $root "apps/server-plugin/target/gaius-server-plugin-$version.jar"
 if (Test-Path $plugin) { Copy-Item $plugin (Join-Path $stage (Split-Path $plugin -Leaf)) }
-[ordered]@{ tag=$Tag; version=$version; sourceHead=$head; sourceBranch=$TargetBranch; dirty=[bool]$status; generatedAt=(Get-Date).ToUniversalTime().ToString('o'); profiles=@($Profiles); relay='t40.sjcmc.cn:14803 via wss://ellan.site/tunnel' } |
+[ordered]@{ tag=$Tag; version=$version; sourceHead=$head; sourceBranch=$TargetBranch; dirty=[bool]$status; generatedAt=(Get-Date).ToUniversalTime().ToString('o'); profiles=@($Profiles); relay='runtime-configured via relay URL' } |
     ConvertTo-Json -Depth 4 | Set-Content (Join-Path $stage 'prerelease.manifest.json') -Encoding utf8
 $notesPath = Join-Path $stage 'RELEASE-NOTES.md'
 @"
@@ -98,7 +98,7 @@ Gaius Client local prerelease $Tag
 
 Built locally from $head on branch $TargetBranch.
 Profiles: $($Profiles -join ', ').
-Multiplayer target: t40.sjcmc.cn:14803 via wss://ellan.site/tunnel.
+Multiplayer target: supplied by the private acceptance environment via the configured RelayNode URL.
 
 Compiled and uploaded by tools/build-and-publish-prerelease.ps1; GitHub Actions is not involved.
 See prerelease.manifest.json and SHA256SUMS for provenance.

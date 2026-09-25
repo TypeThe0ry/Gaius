@@ -338,9 +338,9 @@ assert.equal(model.staleEnds, 2);
 
 // A token sequence wraps to 1 only at the bounded integer ceiling, never to an empty token.
 model.sequence = 0x7ffffffe;
-const wrapped = model.begin("47.83.130.57:16888", 9);
+const wrapped = model.begin("example.invalid:16888", 9);
 assert.match(wrapped, /#9#2147483647$/);
-const wrappedAgain = model.begin("47.83.130.57:16888", 10);
+const wrappedAgain = model.begin("example.invalid:16888", 10);
 assert.match(wrappedAgain, /#10#1$/);
 
 console.log(JSON.stringify({

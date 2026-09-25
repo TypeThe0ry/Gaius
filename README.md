@@ -35,8 +35,18 @@ current Chrome or Chromium browser, choose a player name, and select
 **Singleplayer**. The file contains the browser launcher and its Worker payloads;
 there is no separate web server to start for this mode.
 
-For multiplayer, choose **Multiplayer** and enter the Java server address. The
-server needs either the optional Gaius Paper plugin or a reachable RelayNode.
+### Joining a server
+
+1. Open the downloaded `Gaius-26.2.html` file in Chrome or Chromium.
+2. On the title screen, choose **Multiplayer**.
+3. Choose **Add Server** (or **Direct Connection**), enter the server's normal
+   Java address such as `example.net:25565`, and choose **Join Server**.
+
+The address belongs in Minecraft's server screen, not in the browser address
+bar. A browser cannot open the server's raw TCP port by itself, so the client
+must have a reachable Gaius Paper plugin or RelayNode configured. If the
+screen remains on **Waiting for Server**, check the RelayNode URL and target
+`host:port`, then retry with the same client profile as the server protocol.
 
 ## From source
 
@@ -84,9 +94,11 @@ the target server for that player. The relay is a transport bridge, not a
 general protocol translator: the client and server still need compatible
 Minecraft protocol and authentication settings.
 
-The repository's transport checks use `t40.sjcmc.cn:14803` through
-`wss://ellan.site/tunnel`. A relay operator should configure TLS, allowed
-origins, destination policy, rate limits, capacity limits, and an abuse contact.
+The repository's transport checks take an authorized target from the private
+acceptance environment through a RelayNode URL. Target hosts and source IPs are
+never committed to this repository. A relay operator should configure TLS,
+allowed origins, destination policy, rate limits, capacity limits, and an abuse
+contact.
 See the [RelayNode guide](docs/relay-nodes.md) and
 [`apps/bridge/README.md`](apps/bridge/README.md).
 

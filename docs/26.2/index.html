@@ -8,8 +8,9 @@
 </head>
 <body><main>
 <h1>Gaius Minecraft 26.2</h1><p>选择客户端版本，填写 Minecraft 服务器地址。RelayNode 默认使用 <code>wss://ellan.site/tunnel</code>，也可改成你自己的节点。</p>
-<section class="card"><div class="row"><label>RelayNode URL<input id="relay" value="wss://ellan.site/tunnel" autocomplete="url"></label><label>目标服务器 host:port<input id="target" value="t40.sjcmc.cn:14803" autocomplete="off"></label></div><p class="small">配置只保存在当前浏览器 localStorage，不写入公开页面，也不包含 token。</p></section>
+<section class="card"><div class="row"><label>RelayNode URL<input id="relay" value="wss://ellan.site/tunnel" autocomplete="url"></label><label>目标服务器 host:port<input id="target" placeholder="example.invalid:25565" autocomplete="off"></label></div><p class="small">请输入你获授权的服务器地址；默认不内置公开目标。配置只保存在当前浏览器 localStorage，不写入公开页面，也不包含 token。</p></section>
 <section class="card"><h2>启动版本</h2><div class="row"><a class="launch" data-profile="26.2" href="https://github.com/TypeThe0ry/Gaius/releases/latest/download/Gaius-26.2.html">Minecraft 26.2</a><a class="launch" data-profile="1.21.11" href="../1.21.11/">Minecraft 1.21.11</a></div><p id="hint" class="small"></p></section>
+<section class="card"><h2>加入服务器</h2><ol><li>打开客户端后，在标题界面选择 <b>Multiplayer</b>。</li><li>选择 <b>Add Server</b> 或 <b>Direct Connection</b>。</li><li>输入普通 Java 地址，例如 <code>example.net:25565</code>，再选择 <b>Join Server</b>。</li></ol><p class="small">地址填在 Minecraft 服务器界面，不是浏览器地址栏。浏览器客户端需要可用的 Gaius Paper 插件或 RelayNode；停在 Waiting for Server 时先检查上面的 RelayNode 和目标 host:port。</p></section>
 <section class="card"><h2>RelayNode 状态</h2><pre id="status">正在读取 relay-nodes.json…</pre></section>
 </main><script>
 const relay=document.querySelector('#relay'),target=document.querySelector('#target'),hint=document.querySelector('#hint');

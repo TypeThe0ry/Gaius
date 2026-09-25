@@ -26,6 +26,9 @@ jobs:
       - name: Validate public RelayNode registry
         run: node tools/check-relay-registry.mjs
 
+      - name: Reject public IPv4 literals in tracked files
+        run: node tools/check-public-network-secrets.mjs
+
   release-metadata:
     runs-on: ubuntu-latest
     steps:

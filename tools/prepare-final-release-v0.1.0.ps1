@@ -5,9 +5,9 @@ param(
     [Parameter(Mandatory = $true)][string]$Singleplayer262Evidence,
     [Parameter(Mandatory = $true)][string]$Multiplayer12111Evidence,
     [Parameter(Mandatory = $true)][string]$Multiplayer262Evidence,
-    [string]$Multiplayer12111Target = 't40.sjcmc.cn:14803',
-    [string]$Multiplayer262Target = 't40.sjcmc.cn:14803',
-    [string]$PagesDefaultTarget = 't40.sjcmc.cn:14803',
+    [string]$Multiplayer12111Target = 'example.invalid:25565',
+    [string]$Multiplayer262Target = 'example.invalid:25565',
+    [string]$PagesDefaultTarget = 'example.invalid:25565',
     [string]$Pages12111DefaultTarget = '',
     [string]$Pages262DefaultTarget = ''
 )
