@@ -1819,6 +1819,13 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             );
             return /^[1-9][0-9]*$/.test(serverGeneration) ? serverGeneration : '';
             }
+            function ownsLocalWorkerSession(sessionId) {
+            const key = String(sessionId || '');
+            if (!key) return false;
+            const workers = globalThis.__gaiusSingleplayerWorkers;
+            if (workers && typeof workers.has === 'function' && workers.has(key)) return true;
+            return String(globalThis.__gaiusServerSessionId || '') === key;
+            }
             function localPortGeneration(port) {
             return port ? String(port.__gaiusLaunchGeneration || '') : '';
             }
@@ -2670,7 +2677,8 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             // browser must continue through the relay instead of waiting for
             // a port that can only exist in the host page.
             const localGeneration = sessionId === null ? '' : localWorkerGeneration(sessionId);
-            if (sessionId !== null && /^[1-9][0-9]*$/.test(String(localGeneration || ''))) {
+            const localOwner = sessionId !== null && ownsLocalWorkerSession(sessionId);
+            if (localOwner) {
               claimLocalPort(
                 entry,
                 sessionId,
