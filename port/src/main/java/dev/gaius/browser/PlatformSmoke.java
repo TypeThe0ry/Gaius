@@ -2156,6 +2156,10 @@ public final class PlatformSmoke {
                 || !texture.contains("textures.minecraft.net")) {
             throw new AssertionError("Browser player-texture proxy URL is invalid");
         }
+        String localSkin = "data:image/png;base64,iVBORw0KGgo=";
+        if (!localSkin.equals(BrowserHttpProxy.proxyTexture(localSkin))) {
+            throw new AssertionError("Browser uploaded skin data URL was rewritten");
+        }
         String realms = BrowserHttpProxy.proxyRealms(
                 "https://pc.realms.minecraft.net/worlds");
         if (!realms.contains("/proxy/realms?")

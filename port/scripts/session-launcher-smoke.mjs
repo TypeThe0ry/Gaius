@@ -17,12 +17,14 @@ async function runScenario({
   fetchImpl,
   enteredName,
   rememberedName,
+  customSkin,
   switchFromTitle = false,
 }) {
   const storage = new Map();
   if (stored !== undefined) storage.set("gaius.session", JSON.stringify(stored));
   const remembered = new Map();
   if (rememberedName !== undefined) remembered.set("gaius.playerName", rememberedName);
+  if (customSkin !== undefined) remembered.set("gaius.customSkin", customSkin);
   const historyCalls = [];
   let submitListener;
   let profileSwitchListener;
@@ -90,6 +92,7 @@ async function runScenario({
   const context = {
     URL,
     URLSearchParams,
+    btoa(value) { return Buffer.from(value, "binary").toString("base64"); },
     console,
     fetch: fetchImpl ?? (() => {
       throw new Error("unexpected fetch");
@@ -119,17 +122,26 @@ async function runScenario({
       setItem(key, value) {
         remembered.set(key, String(value));
       },
+      removeItem(key) {
+        remembered.delete(key);
+      },
     },
     profileGate,
     profileForm,
     profileName,
     profileError,
+    profileSkinInput: null,
+    profileSkinPreview: null,
+    profileSkinStatus: null,
+    profileSkinClear: null,
     profileSwitch,
     bootBrand: {hidden: false},
     bootProgress: {hidden: false},
     bootProgressText: {hidden: false},
     statusBox: {hidden: false},
     showLauncherDetails: false,
+    GAIUS_CUSTOM_SKIN_KEY: "gaius.customSkin",
+    GAIUS_CUSTOM_SKIN_MAX_DATA_URL: 12000,
     bootProgressValue: 0,
     setBootProgress() {},
     requestAnimationFrame(callback) {
@@ -147,6 +159,10 @@ async function runScenario({
     nameOverlay,
     nameInput,
     nameError: null,
+    nameSkinInput: null,
+    nameSkinPreview: null,
+    nameSkinStatus: null,
+    nameSkinClear: null,
     nameCancel,
     nameConfirm,
     document: {
@@ -181,9 +197,11 @@ async function runScenario({
     prompted,
     promptedInitialName,
     rememberedName: remembered.get("gaius.playerName"),
+    customSkin: remembered.get("gaius.customSkin"),
     stored: storage.has("gaius.session")
       ? JSON.parse(storage.get("gaius.session"))
       : undefined,
+    skinDescriptor: window.__gaiusSkinDescriptor,
     profileSwitchVisible,
     profileSwitchDisabled: profileSwitch?.disabled ?? false,
     replacedLocation,
@@ -205,6 +223,18 @@ assert.equal(
   offline.args[offline.args.indexOf("--uuid") + 1],
   "00000000000040008000000000000001",
 );
+
+const customSkin = await runScenario({
+  enteredName: "SkinPlayer",
+  customSkin: "data:image/png;base64,iVBORw0KGgo=",
+});
+assert.equal(customSkin.customSkin, "data:image/png;base64,iVBORw0KGgo=");
+assert.equal(customSkin.skinDescriptor.username, "SkinPlayer");
+assert.equal(customSkin.skinDescriptor.uuid, "00000000000040008000000000000001");
+assert.equal(customSkin.skinDescriptor.signature, "");
+const customSkinPayload = JSON.parse(Buffer.from(
+  customSkin.skinDescriptor.value, "base64").toString("utf8"));
+assert.equal(customSkinPayload.textures.SKIN.url, customSkin.customSkin);
 
 let profileRequests = 0;
 const online = await runScenario({
