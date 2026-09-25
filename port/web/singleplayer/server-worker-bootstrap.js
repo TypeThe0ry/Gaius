@@ -639,6 +639,8 @@ root.onmessage = async (event) => {
     root.__gaiusSkinDescriptor = message.skinDescriptor &&
       typeof message.skinDescriptor === "object"
       ? {
+          uuid: String(message.skinDescriptor.uuid || ""),
+          username: String(message.skinDescriptor.username || ""),
           value: String(message.skinDescriptor.value || ""),
           signature: String(message.skinDescriptor.signature || "")
         }

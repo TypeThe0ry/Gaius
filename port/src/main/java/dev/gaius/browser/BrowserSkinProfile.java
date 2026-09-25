@@ -2,7 +2,6 @@ package dev.gaius.browser;
 
 import com.mojang.authlib.GameProfile;
 import com.mojang.authlib.properties.Property;
-import java.util.Objects;
 import org.teavm.jso.JSBody;
 
 /** Applies the public, short-lived textures property supplied by the browser shell. */
@@ -14,6 +13,13 @@ public final class BrowserSkinProfile {
     public static GameProfile apply(GameProfile profile) {
         if (profile == null) {
             return null;
+        }
+        String ownerName = descriptorName();
+        String ownerUuid = descriptorUuid();
+        if (ownerName == null || !ownerName.equals(profile.name())
+                || ownerUuid == null || profile.id() == null
+                || !ownerUuid.equals(profile.id().toString().replace("-", "").toLowerCase())) {
+            return profile;
         }
         String value = descriptorValue();
         if (value == null || value.isBlank() || value.length() > 16_384) {
@@ -40,4 +46,18 @@ public final class BrowserSkinProfile {
               ? String(descriptor.signature || '') : '';
             """)
     private static native String descriptorSignature();
+
+    @JSBody(script = """
+            const descriptor = globalThis.__gaiusSkinDescriptor;
+            return descriptor && typeof descriptor === 'object'
+              ? String(descriptor.username || '') : '';
+            """)
+    private static native String descriptorName();
+
+    @JSBody(script = """
+            const descriptor = globalThis.__gaiusSkinDescriptor;
+            return descriptor && typeof descriptor === 'object'
+              ? String(descriptor.uuid || '') : '';
+            """)
+    private static native String descriptorUuid();
 }

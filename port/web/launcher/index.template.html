@@ -1506,7 +1506,7 @@
       return {username, uuid};
     }
 
-    async function loadGaiusSkinDescriptor(uuid) {
+    async function loadGaiusSkinDescriptor(uuid, username) {
       if (!/^[0-9a-f]{32}$/u.test(String(uuid || ""))) return null;
       try {
         const configured = String(window.__gaiusBridgeUrl || "").trim();
@@ -1521,10 +1521,14 @@
         const response = await fetch(bridge.href, {credentials: "omit"});
         if (!response.ok) return null;
         const profile = await response.json();
+        if (String(profile?.id || "").replace(/-/g, "").toLowerCase() !== uuid ||
+            String(profile?.name || "") !== username) return null;
         const property = Array.isArray(profile?.properties)
           ? profile.properties.find(entry => entry && entry.name === "textures") : null;
         if (!property || typeof property.value !== "string" || !property.value.length) return null;
         return {
+          uuid,
+          username,
           value: property.value,
           signature: typeof property.signature === "string" ? property.signature : ""
         };
@@ -1816,7 +1820,7 @@
         sessionStorage.setItem("gaius.session", JSON.stringify(session));
       }
       if (online && uuid && !session.skinDescriptor) {
-        session.skinDescriptor = await loadGaiusSkinDescriptor(uuid);
+        session.skinDescriptor = await loadGaiusSkinDescriptor(uuid, username);
         if (session.skinDescriptor) {
           sessionStorage.setItem("gaius.session", JSON.stringify(session));
         }
