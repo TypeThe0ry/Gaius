@@ -1099,6 +1099,7 @@ public final class BrowserSingleplayerClient {
                 worldId: String(worldId),
                 newWorld: !!newWorld,
                 profileId: globalThis.__gaiusProfileId || null,
+                skinDescriptor: globalThis.__gaiusSkinDescriptor || null,
                 worldVersion: globalThis.__gaiusWorldVersion || null,
                 storageSchema: globalThis.__gaiusStorageSchema || null,
                 storageDatabaseName: globalThis.__gaiusStorageDatabaseName || null,

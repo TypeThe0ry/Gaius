@@ -1506,6 +1506,33 @@
       return {username, uuid};
     }
 
+    async function loadGaiusSkinDescriptor(uuid) {
+      if (!/^[0-9a-f]{32}$/u.test(String(uuid || ""))) return null;
+      try {
+        const configured = String(window.__gaiusBridgeUrl || "").trim();
+        const bridge = new URL(configured || location.href, location.href);
+        if (bridge.protocol === "ws:") bridge.protocol = "http:";
+        if (bridge.protocol === "wss:") bridge.protocol = "https:";
+        bridge.pathname = "/proxy/auth";
+        bridge.hash = "";
+        bridge.search = "";
+        bridge.searchParams.set("url",
+          "https://sessionserver.mojang.com/session/minecraft/profile/" + uuid + "?unsigned=false");
+        const response = await fetch(bridge.href, {credentials: "omit"});
+        if (!response.ok) return null;
+        const profile = await response.json();
+        const property = Array.isArray(profile?.properties)
+          ? profile.properties.find(entry => entry && entry.name === "textures") : null;
+        if (!property || typeof property.value !== "string" || !property.value.length) return null;
+        return {
+          value: property.value,
+          signature: typeof property.signature === "string" ? property.signature : ""
+        };
+      } catch (_) {
+        return null;
+      }
+    }
+
     function requestGaiusPlayerName(initialName) {
       if (!profileGate || !profileForm || !profileName || !profileError) {
         throw new Error("The Gaius player-name screen is unavailable");
@@ -1788,6 +1815,13 @@
         session.uuid = uuid;
         sessionStorage.setItem("gaius.session", JSON.stringify(session));
       }
+      if (online && uuid && !session.skinDescriptor) {
+        session.skinDescriptor = await loadGaiusSkinDescriptor(uuid);
+        if (session.skinDescriptor) {
+          sessionStorage.setItem("gaius.session", JSON.stringify(session));
+        }
+      }
+      window.__gaiusSkinDescriptor = session.skinDescriptor || null;
       if (!online && !username) {
         let pendingName = "";
         try {
