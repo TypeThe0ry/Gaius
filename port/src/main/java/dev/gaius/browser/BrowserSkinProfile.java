@@ -14,18 +14,20 @@ public final class BrowserSkinProfile {
         if (profile == null) {
             return null;
         }
-        String ownerName = descriptorName();
-        String ownerUuid = descriptorUuid();
-        if (ownerName == null || !ownerName.equals(profile.name())
-                || ownerUuid == null || profile.id() == null
-                || !ownerUuid.equals(profile.id().toString().replace("-", "").toLowerCase())) {
+        String profileName = profile.name();
+        String profileUuid = profile.id() == null
+                ? "" : profile.id().toString().replace("-", "").toLowerCase();
+        String ownerName = descriptorName(profileUuid, profileName);
+        String ownerUuid = descriptorUuid(profileUuid, profileName);
+        if (ownerName == null || !ownerName.equals(profileName)
+                || ownerUuid == null || !ownerUuid.equals(profileUuid)) {
             return profile;
         }
-        String value = descriptorValue();
+        String value = descriptorValue(profileUuid, profileName);
         if (value == null || value.isBlank() || value.length() > 16_384) {
             return profile;
         }
-        String signature = descriptorSignature();
+        String signature = descriptorSignature(profileUuid, profileName);
         profile.properties().removeAll("textures");
         profile.properties().put("textures", signature == null || signature.isBlank()
                 ? new Property("textures", value)
@@ -33,31 +35,59 @@ public final class BrowserSkinProfile {
         return profile;
     }
 
-    @JSBody(script = """
-            const descriptor = globalThis.__gaiusSkinDescriptor;
+    @JSBody(params = {"uuid", "username"}, script = """
+            const profileUuid = String(uuid || '').replaceAll('-', '').toLowerCase();
+            const profileName = String(username || '');
+            const remote = globalThis.__gaiusRemoteSkinDescriptors;
+            const descriptor = remote && typeof remote === 'object' ? remote[profileUuid] :
+              (globalThis.__gaiusSkinDescriptor &&
+               String(globalThis.__gaiusSkinDescriptor.uuid || '').replaceAll('-', '').toLowerCase() === profileUuid &&
+               String(globalThis.__gaiusSkinDescriptor.username || '') === profileName
+                ? globalThis.__gaiusSkinDescriptor : null);
             return descriptor && typeof descriptor === 'object'
               ? String(descriptor.value || '') : '';
             """)
-    private static native String descriptorValue();
+    private static native String descriptorValue(String uuid, String username);
 
-    @JSBody(script = """
-            const descriptor = globalThis.__gaiusSkinDescriptor;
+    @JSBody(params = {"uuid", "username"}, script = """
+            const profileUuid = String(uuid || '').replaceAll('-', '').toLowerCase();
+            const profileName = String(username || '');
+            const remote = globalThis.__gaiusRemoteSkinDescriptors;
+            const descriptor = remote && typeof remote === 'object' ? remote[profileUuid] :
+              (globalThis.__gaiusSkinDescriptor &&
+               String(globalThis.__gaiusSkinDescriptor.uuid || '').replaceAll('-', '').toLowerCase() === profileUuid &&
+               String(globalThis.__gaiusSkinDescriptor.username || '') === profileName
+                ? globalThis.__gaiusSkinDescriptor : null);
             return descriptor && typeof descriptor === 'object'
               ? String(descriptor.signature || '') : '';
             """)
-    private static native String descriptorSignature();
+    private static native String descriptorSignature(String uuid, String username);
 
-    @JSBody(script = """
-            const descriptor = globalThis.__gaiusSkinDescriptor;
+    @JSBody(params = {"uuid", "username"}, script = """
+            const profileUuid = String(uuid || '').replaceAll('-', '').toLowerCase();
+            const profileName = String(username || '');
+            const remote = globalThis.__gaiusRemoteSkinDescriptors;
+            const descriptor = remote && typeof remote === 'object' ? remote[profileUuid] :
+              (globalThis.__gaiusSkinDescriptor &&
+               String(globalThis.__gaiusSkinDescriptor.uuid || '').replaceAll('-', '').toLowerCase() === profileUuid &&
+               String(globalThis.__gaiusSkinDescriptor.username || '') === profileName
+                ? globalThis.__gaiusSkinDescriptor : null);
             return descriptor && typeof descriptor === 'object'
               ? String(descriptor.username || '') : '';
             """)
-    private static native String descriptorName();
+    private static native String descriptorName(String uuid, String username);
 
-    @JSBody(script = """
-            const descriptor = globalThis.__gaiusSkinDescriptor;
+    @JSBody(params = {"uuid", "username"}, script = """
+            const profileUuid = String(uuid || '').replaceAll('-', '').toLowerCase();
+            const profileName = String(username || '');
+            const remote = globalThis.__gaiusRemoteSkinDescriptors;
+            const descriptor = remote && typeof remote === 'object' ? remote[profileUuid] :
+              (globalThis.__gaiusSkinDescriptor &&
+               String(globalThis.__gaiusSkinDescriptor.uuid || '').replaceAll('-', '').toLowerCase() === profileUuid &&
+               String(globalThis.__gaiusSkinDescriptor.username || '') === profileName
+                ? globalThis.__gaiusSkinDescriptor : null);
             return descriptor && typeof descriptor === 'object'
               ? String(descriptor.uuid || '') : '';
             """)
-    private static native String descriptorUuid();
+    private static native String descriptorUuid(String uuid, String username);
 }

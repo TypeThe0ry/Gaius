@@ -10,6 +10,9 @@ const lan = await source("port/src/main/java/dev/gaius/browser/BrowserLanSession
 const launcher = await source("port/web/launcher/index.template.html");
 const channel = await source("port/overrides/libraries/netty-transport/src/main/java/io/netty/channel/browser/BrowserWebSocketChannel.java");
 const worker = await source("port/web/singleplayer/server-worker-bootstrap.js");
+const skin = await source("port/src/main/java/dev/gaius/browser/BrowserSkinProfile.java");
+const relayPolicy = await source("apps/bridge/dist/policy.js");
+const relay = await source("apps/bridge/dist/main.js");
 
 assert.match(listenerPatcher, /openAdditionalBrowserConnection/);
 assert.match(listenerPatcher, /browserInstance/);
@@ -26,5 +29,13 @@ assert.match(channel, /continue through the relay/);
 assert.match(channel, /localGeneration = sessionId === null \? '' : localWorkerGeneration\(sessionId\)/);
 assert.match(worker, /message\.type === "lan-open"/);
 assert.match(worker, /openLanServerConnection\(brokerSessionId\)/);
+assert.match(relayPolicy, /parseSkinDescriptor/);
+assert.match(relayPolicy, /16384/);
+assert.match(relay, /session\.client\.skinDescriptor/);
+assert.match(relay, /type: "skin"/);
+assert.match(channel, /control\.skinDescriptor = skin/);
+assert.match(channel, /acceptRemoteSkinDescriptor\(message\.skinDescriptor\)/);
+assert.match(skin, /__gaiusRemoteSkinDescriptors/);
+assert.match(skin, /descriptorValue\(profileUuid, profileName\)/);
 
 console.log("relay-backed LAN broker contract passed");

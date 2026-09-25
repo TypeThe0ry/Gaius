@@ -2033,6 +2033,7 @@ webSocketServer.on("connection", (webSocket) => {
             }
             const localTunnel = parseLocalTunnelHost(request.host);
             if (localTunnel !== undefined) {
+                localTunnel.skinDescriptor = request.skinDescriptor;
                 clearInterval(idleTimer);
                 registerLocalTunnel(webSocket, localTunnel, closeBoth);
                 return;
@@ -3071,6 +3072,7 @@ function registerLocalTunnel(webSocket, request, closeSelf) {
     const endpoint = {
         webSocket,
         role: request.role,
+        skinDescriptor: request.skinDescriptor,
         peer: undefined,
         closed: false,
         flowPaused: false,
@@ -3160,6 +3162,12 @@ function registerLocalTunnel(webSocket, request, closeSelf) {
         session.server.peer = session.client;
         session.client.webSocket.send(JSON.stringify({ type: "connected" }));
         session.server.webSocket.send(JSON.stringify({ type: "connected" }));
+        if (session.client.skinDescriptor !== undefined) {
+            session.server.webSocket.send(JSON.stringify({
+                type: "skin",
+                skinDescriptor: session.client.skinDescriptor,
+            }));
+        }
     }
 }
 function updateLocalReadState(endpoint) {

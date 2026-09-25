@@ -1778,6 +1778,35 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             const match = /^(?:client|server)-([a-f0-9]{32})\\.gaius-local$/.exec(host);
             return match ? match[1] : null;
             }
+            function localTunnelRole(host) {
+            const match = /^(client|server)-([a-f0-9]{32})\\.gaius-local$/.exec(host);
+            return match ? match[1] : null;
+            }
+            function localSkinDescriptor() {
+            const descriptor = globalThis.__gaiusSkinDescriptor;
+            if (!descriptor || typeof descriptor !== 'object') return null;
+            const uuid = String(descriptor.uuid || '').trim().toLowerCase();
+            const username = String(descriptor.username || '');
+            const value = String(descriptor.value || '');
+            const signature = String(descriptor.signature || '');
+            if (!/^[0-9a-f]{32}$/.test(uuid) || username.length < 1 || username.length > 16 ||
+                value.length < 1 || value.length > 16384 || signature.length > 16384) return null;
+            return {uuid: uuid, username: username, value: value, signature: signature};
+            }
+            function acceptRemoteSkinDescriptor(descriptor) {
+            if (!descriptor || typeof descriptor !== 'object') return;
+            const uuid = String(descriptor.uuid || '').trim().toLowerCase();
+            const username = String(descriptor.username || '');
+            const value = String(descriptor.value || '');
+            const signature = String(descriptor.signature || '');
+            if (!/^[0-9a-f]{32}$/.test(uuid) || username.length < 1 || username.length > 16 ||
+                value.length < 1 || value.length > 16384 || signature.length > 16384) return;
+            const descriptors = globalThis.__gaiusRemoteSkinDescriptors ||
+              (globalThis.__gaiusRemoteSkinDescriptors = Object.create(null));
+            if (!Object.prototype.hasOwnProperty.call(descriptors, uuid) &&
+                Object.keys(descriptors).length >= 32) return;
+            descriptors[uuid] = {uuid: uuid, username: username, value: value, signature: signature};
+            }
             function localPortMap() {
             const ports = globalThis.__gaiusLocalServerPorts;
             if (!ports) return null;
@@ -2377,6 +2406,10 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 armCandidateTimeout(relayTunnelConnectTimeout(candidate));
               }
               const control = {type: 'connect', host: entry.host, port: entry.port};
+              if (localTunnelRole(entry.host) === 'client') {
+                const skin = localSkinDescriptor();
+                if (skin) control.skinDescriptor = skin;
+              }
               const token = bridgeToken(candidate);
               if (token !== undefined) control.token = token;
               queueControl(entry, control, ws, false, generation);
@@ -2413,6 +2446,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                     armCandidateTimeout(candidate.direct
                       ? directPluginTunnelConnectTimeout(candidate)
                       : relayTunnelConnectTimeout(candidate));
+                    return;
+                  }
+                  if (message && message.type === 'skin' &&
+                      localTunnelRole(entry.host) === 'server') {
+                    acceptRemoteSkinDescriptor(message.skinDescriptor);
                     return;
                   }
                   if (message && message.type === 'connected') {

@@ -1986,6 +1986,12 @@ async function testLocalTunnelPair(bridgePort, token) {
         const serverControls = [];
         const clientFrames = [];
         const serverFrames = [];
+        const skinDescriptor = {
+            uuid: "00000000000040008000000000000001",
+            username: "RelayGuest",
+            value: Buffer.from(JSON.stringify({textures:{SKIN:{url:"data:image/png;base64,AA=="}}})).toString("base64"),
+            signature: "",
+        };
         let clientBytes = 0;
         let serverBytes = 0;
         client.on("message", (data, binary) => {
@@ -2013,6 +2019,7 @@ async function testLocalTunnelPair(bridgePort, token) {
             host: `client-${sessionId}.gaius-local`,
             port: 25565,
             token,
+            skinDescriptor,
         }));
         server.send(JSON.stringify({
             type: "connect",
@@ -2024,6 +2031,12 @@ async function testLocalTunnelPair(bridgePort, token) {
                 () => clientControls.some((message) => message.type === "connected") &&
                     serverControls.some((message) => message.type === "connected"),
                 "paired local server tunnel");
+        await waitFor(
+                () => serverControls.some((message) => message.type === "skin" &&
+                    message.skinDescriptor?.uuid === skinDescriptor.uuid &&
+                    message.skinDescriptor?.username === skinDescriptor.username &&
+                    message.skinDescriptor?.value === skinDescriptor.value),
+                "forwarded LAN skin descriptor");
         return {
             client,
             server,
@@ -2031,6 +2044,7 @@ async function testLocalTunnelPair(bridgePort, token) {
             serverFrames,
             get clientBytes() { return clientBytes; },
             get serverBytes() { return serverBytes; },
+            skinForwarded: true,
         };
     };
 
@@ -2091,6 +2105,7 @@ async function testLocalTunnelPair(bridgePort, token) {
         reconnectClientToServerBytes: reconnectPair.serverBytes,
         reconnectServerToClientBytes: reconnectPair.clientBytes,
         activeLocalTunnelSessions: finalRuntime.activeLocalTunnelSessions,
+        skinDescriptorForwarded: true,
     };
 }
 
