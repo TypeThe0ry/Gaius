@@ -20356,6 +20356,18 @@ public final class MinecraftClientPatcher {
                 "(Ljava/nio/file/Path;Ljava/lang/String;)"
                         + "Lcom/mojang/blaze3d/platform/NativeImage;");
         InsnList code = new InsnList();
+        LabelNode normalSkin = new LabelNode();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserUploadedSkin", "isUploadedSkin",
+                "(Ljava/lang/String;)Z", false));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, normalSkin));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserUploadedSkin", "readUploadedSkin",
+                "(Ljava/lang/String;)Lcom/mojang/blaze3d/platform/NativeImage;", false));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        code.add(normalSkin);
         code.add(new VarInsnNode(Opcodes.ALOAD, 2));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,

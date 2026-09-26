@@ -153,7 +153,19 @@ public final class BrowserSingleplayerClient {
               : null;
             if (!worker || worker.__gaiusTerminal ||
                 typeof worker.postMessage !== 'function') return false;
-            worker.postMessage({type: 'lan-open', brokerSessionId: key});
+            const descriptor = globalThis.__gaiusSkinDescriptor;
+            worker.postMessage({
+              type: 'lan-open',
+              brokerSessionId: key,
+              skinDescriptor: descriptor && typeof descriptor === 'object'
+                ? {
+                    uuid: String(descriptor.uuid || ''),
+                    username: String(descriptor.username || ''),
+                    value: String(descriptor.value || ''),
+                    signature: String(descriptor.signature || '')
+                  }
+                : null
+            });
             return true;
             """)
     private static native boolean postLanServerConnectionRequest(

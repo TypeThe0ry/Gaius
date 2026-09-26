@@ -1021,6 +1021,21 @@ function handleControlMessage(event) {
       postMessage({type: "lan-open-result", ok: false, reason: "invalid-session"});
       return;
     }
+    const descriptor = message.skinDescriptor;
+    if (descriptor && typeof descriptor === "object") {
+      const uuid = String(descriptor.uuid || "").replaceAll("-", "").toLowerCase();
+      const username = String(descriptor.username || "");
+      const value = String(descriptor.value || "");
+      const signature = String(descriptor.signature || "");
+      root.__gaiusLanSkinDescriptor = /^[0-9a-f]{32}$/.test(uuid) &&
+        /^[A-Za-z0-9_]{1,16}$/.test(username) &&
+        value.length >= 1 && value.length <= 16384 &&
+        signature.length <= 16384
+        ? {uuid, username, value, signature}
+        : null;
+    } else {
+      root.__gaiusLanSkinDescriptor = null;
+    }
     try {
       const ok = typeof openLanServerConnection === "function" &&
         openLanServerConnection(brokerSessionId) === true;

@@ -75,6 +75,10 @@ def main() -> int:
             'id="mc-canvas"',
             'id="profile-gate"',
             'id="profile-name"',
+            'id="profile-skin-input"',
+            'id="profile-skin-preview"',
+            'id="mc-skin-input"',
+            'id="mc-skin-preview"',
             'id="profile-switch"',
             'id="boot-screen"',
             'id="boot-progress"',
@@ -94,6 +98,10 @@ def main() -> int:
             "window.__gaiusDefaultArgsPromise",
             "window.__gaiusConfigureSession",
             "window.__gaiusChangePlayerName",
+            "customGaiusSkinDescriptor",
+            "window.__gaiusSkinDescriptor = customSkinDescriptor || session.skinDescriptor || null;",
+            "function renderGaiusCustomSkin(preview, status, clearButton)",
+            "nameSkinInput.addEventListener(\"change\"",
             "new Float32Array(4096)",
             "fps.rafFrameWriteIndex",
             "fps.rafFrameCount",
@@ -123,11 +131,21 @@ def main() -> int:
         ):
             require(generated, contract)
 
+        template = (ROOT / "port" / "web" / "launcher" / "index.template.html").read_text(encoding="utf-8")
+        for contract in (
+            'id="profile-skin-input"',
+            'id="mc-skin-input"',
+            'gaius.customSkin',
+            'customGaiusSkinDescriptor',
+            'data:image\\/png;base64,',
+        ):
+            require(template, contract)
+
         for visible_text in (
             "GAIUS",
             "CLIENT",
             "BROWSER CLIENT",
-            "Choose a player name to continue.",
+            "Choose a player name and an optional custom skin.",
             "Retry startup",
             "Show diagnostics",
             "Gaius is an independent browser client.",

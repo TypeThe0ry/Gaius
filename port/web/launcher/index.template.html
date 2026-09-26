@@ -630,6 +630,85 @@
       box-shadow: 0 0 0 2px rgba(155, 211, 106, 0.18);
     }
 
+    .gaius-skin-picker {
+      margin-top: 18px;
+      padding-top: 14px;
+      border-top: 1px solid var(--gaius-shell-line);
+    }
+
+    .gaius-skin-heading,
+    .gaius-skin-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .gaius-skin-heading label {
+      margin: 0;
+    }
+
+    .gaius-skin-row {
+      justify-content: flex-start;
+      min-height: 52px;
+    }
+
+    .gaius-skin-row img {
+      width: 48px;
+      height: 48px;
+      object-fit: contain;
+      image-rendering: pixelated;
+      border: 2px solid var(--gaius-shell-line);
+      background: #0a1014;
+    }
+
+    .gaius-skin-row input[type="file"] {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip: rect(0 0 0 0);
+      clip-path: inset(50%);
+      white-space: nowrap;
+    }
+
+    .gaius-skin-upload,
+    .gaius-skin-heading button {
+      min-height: 32px;
+      box-sizing: border-box;
+      padding: 0 10px;
+      border: 2px solid #5a6b76;
+      border-radius: 0;
+      background: #0a1014;
+      color: var(--gaius-shell-text);
+      font: 700 11px/1 Arial, Helvetica, sans-serif;
+      cursor: pointer;
+    }
+
+    .gaius-skin-upload:hover,
+    .gaius-skin-upload:focus-visible,
+    .gaius-skin-heading button:hover,
+    .gaius-skin-heading button:focus-visible {
+      border-color: var(--gaius-shell-accent);
+      outline: 2px solid var(--gaius-shell-text);
+      outline-offset: 2px;
+    }
+
+    .gaius-skin-heading button[hidden] {
+      display: none;
+    }
+
+    .gaius-skin-status {
+      min-height: 16px;
+      margin: 6px 0 0;
+      color: var(--gaius-shell-muted);
+      font: 11px/1.4 Arial, Helvetica, sans-serif;
+    }
+
+    .gaius-skin-status[data-state="error"] {
+      color: var(--gaius-shell-danger);
+    }
+
     #profile-submit {
       height: 46px;
       margin-top: 14px;
@@ -718,6 +797,22 @@
     #mc-name-panel label { display: block; margin: 0 0 6px; color: #fff; font-size: 12px; font-weight: 700; }
     #mc-name-input { width: 100%; min-height: 38px; box-sizing: border-box; padding: 8px 10px; border: 2px solid #111; background: #181818; color: #fff; font: 14px/1.2 Arial, Helvetica, sans-serif; outline: 1px solid #727272; }
     #mc-name-input:focus { outline: 2px solid #fff; outline-offset: 1px; }
+    .gaius-skin-picker-overlay { margin-top: 16px; padding-top: 12px; border-top: 1px solid #555; }
+    .gaius-skin-picker-overlay .gaius-skin-heading,
+    .gaius-skin-picker-overlay .gaius-skin-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .gaius-skin-picker-overlay .gaius-skin-heading label { margin: 0; }
+    .gaius-skin-picker-overlay .gaius-skin-row { justify-content: flex-start; min-height: 48px; }
+    .gaius-skin-picker-overlay .gaius-skin-row img { width: 44px; height: 44px; object-fit: contain; image-rendering: pixelated; border: 2px solid #111; background: #181818; }
+    .gaius-skin-picker-overlay .gaius-skin-row input[type="file"] { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; }
+    .gaius-skin-picker-overlay .gaius-skin-upload,
+    .gaius-skin-picker-overlay .gaius-skin-heading button { min-height: 30px; padding: 0 9px; border: 2px solid #727272; border-top-color: #d0d0d0; border-left-color: #d0d0d0; background: #555; color: #fff; font: 700 11px/1 "Courier New", monospace; cursor: pointer; text-shadow: 1px 1px #222; }
+    .gaius-skin-picker-overlay .gaius-skin-upload:hover,
+    .gaius-skin-picker-overlay .gaius-skin-upload:focus-visible,
+    .gaius-skin-picker-overlay .gaius-skin-heading button:hover,
+    .gaius-skin-picker-overlay .gaius-skin-heading button:focus-visible { background: #6b6b6b; outline: 2px solid #fff; outline-offset: 2px; }
+    .gaius-skin-picker-overlay .gaius-skin-heading button[hidden] { display: none; }
+    .gaius-skin-picker-overlay .gaius-skin-status { min-height: 16px; margin: 5px 0 0; color: #c8c8c8; font-size: 11px; line-height: 1.4; }
+    .gaius-skin-picker-overlay .gaius-skin-status[data-state="error"] { color: #ff8080; }
     #mc-name-error { min-height: 18px; margin: 8px 0 14px; color: #ff8080; font-size: 12px; line-height: 1.4; }
     .mc-name-actions { display: flex; justify-content: flex-end; gap: 10px; }
     .mc-name-actions button { min-width: 92px; min-height: 34px; padding: 0 14px; border: 2px solid #727272; border-top-color: #d0d0d0; border-left-color: #d0d0d0; background: #555; color: #fff; font: 700 12px/1 "Courier New", monospace; cursor: pointer; text-shadow: 1px 1px #222; image-rendering: pixelated; }
@@ -789,22 +884,46 @@
   <div id="profile-gate" hidden>
     <form id="profile-form" novalidate>
       <h1 id="profile-title">GAIUS</h1>
-      <p id="profile-kicker">Browser client | offline and online play</p>
-      <p id="profile-subtitle">Choose a player name to continue.</p>
+      <p id="profile-kicker">User Profile | browser client</p>
+      <p id="profile-subtitle">Choose a player name and an optional custom skin.</p>
       <label for="profile-name">Player name</label>
       <input id="profile-name" name="username" type="text" maxlength="16" pattern="[A-Za-z0-9_]{1,16}" autocomplete="username" spellcheck="false">
+      <div class="gaius-skin-picker">
+        <div class="gaius-skin-heading">
+          <label for="profile-skin-input">Custom skin</label>
+          <button id="profile-skin-clear" type="button" hidden>Remove</button>
+        </div>
+        <div class="gaius-skin-row">
+          <img id="profile-skin-preview" alt="Custom skin preview" hidden>
+          <label class="gaius-skin-upload" for="profile-skin-input">Upload PNG</label>
+          <input id="profile-skin-input" type="file" accept="image/png,.png">
+        </div>
+        <p id="profile-skin-status" class="gaius-skin-status">Optional: 64x64 or 64x32 PNG.</p>
+      </div>
       <button id="profile-submit" type="submit">Play</button>
       <p id="profile-error" role="alert"></p>
       <p id="profile-legal">Gaius is an independent browser client. It is not affiliated with Mojang Studios or Microsoft.</p>
     </form>
   </div>
-  <button id="profile-switch" type="button" hidden>Change player name</button>
+  <button id="profile-switch" type="button" hidden>User Profile</button>
   <div id="mc-name-overlay" hidden role="dialog" aria-modal="true" aria-labelledby="mc-name-title">
     <div id="mc-name-panel">
-      <h2 id="mc-name-title">Change player name</h2>
+      <h2 id="mc-name-title">User Profile</h2>
       <p id="mc-name-current">Changes apply to the next session.</p>
       <label for="mc-name-input">Player name</label>
       <input id="mc-name-input" type="text" maxlength="16" pattern="[A-Za-z0-9_]{1,16}" autocomplete="username" spellcheck="false">
+      <div class="gaius-skin-picker gaius-skin-picker-overlay">
+        <div class="gaius-skin-heading">
+          <label for="mc-skin-input">Custom skin</label>
+          <button id="mc-skin-clear" type="button" hidden>Remove</button>
+        </div>
+        <div class="gaius-skin-row">
+          <img id="mc-skin-preview" alt="Custom skin preview" hidden>
+          <label class="gaius-skin-upload" for="mc-skin-input">Upload PNG</label>
+          <input id="mc-skin-input" type="file" accept="image/png,.png">
+        </div>
+        <p id="mc-skin-status" class="gaius-skin-status">Optional: 64x64 or 64x32 PNG.</p>
+      </div>
       <p id="mc-name-error" role="alert"></p>
       <div class="mc-name-actions">
         <button id="mc-name-cancel" type="button">Cancel</button>
@@ -838,10 +957,18 @@
     const profileForm = document.getElementById("profile-form");
     const profileName = document.getElementById("profile-name");
     const profileError = document.getElementById("profile-error");
+    const profileSkinInput = document.getElementById("profile-skin-input");
+    const profileSkinPreview = document.getElementById("profile-skin-preview");
+    const profileSkinStatus = document.getElementById("profile-skin-status");
+    const profileSkinClear = document.getElementById("profile-skin-clear");
     const profileSwitch = document.getElementById("profile-switch");
     const nameOverlay = document.getElementById("mc-name-overlay");
     const nameInput = document.getElementById("mc-name-input");
     const nameError = document.getElementById("mc-name-error");
+    const nameSkinInput = document.getElementById("mc-skin-input");
+    const nameSkinPreview = document.getElementById("mc-skin-preview");
+    const nameSkinStatus = document.getElementById("mc-skin-status");
+    const nameSkinClear = document.getElementById("mc-skin-clear");
     const nameCancel = document.getElementById("mc-name-cancel");
     const nameConfirm = document.getElementById("mc-name-confirm");
     let nameOverlayPreviousFocus = null;
@@ -849,6 +976,8 @@
     const bootProgressBar = document.getElementById("boot-progress-bar");
     const bootProgressText = document.getElementById("boot-progress-text");
     const perfHud = document.getElementById("perf-hud");
+    const GAIUS_CUSTOM_SKIN_KEY = "gaius.customSkin";
+    const GAIUS_CUSTOM_SKIN_MAX_DATA_URL = 12000;
     const bootTimings = window.__gaiusBootTimings = {
       pageStart: performance.now()
     };
@@ -1537,12 +1666,127 @@
       }
     }
 
+    function readGaiusCustomSkin() {
+      try {
+        const value = localStorage.getItem(GAIUS_CUSTOM_SKIN_KEY) || "";
+        return /^data:image\/png;base64,[A-Za-z0-9+/=]+$/u.test(value)
+          && value.length <= GAIUS_CUSTOM_SKIN_MAX_DATA_URL ? value : "";
+      } catch (error) {
+        console.warn("Could not read the saved Gaius custom skin", error);
+        return "";
+      }
+    }
+
+    function renderGaiusCustomSkin(preview, status, clearButton) {
+      const dataUrl = readGaiusCustomSkin();
+      if (preview) {
+        preview.src = dataUrl;
+        preview.hidden = !dataUrl;
+      }
+      if (clearButton) clearButton.hidden = !dataUrl;
+      if (status) {
+        status.dataset.state = "";
+        status.textContent = dataUrl
+          ? "Custom skin saved for this browser."
+          : "Optional: 64x64 or 64x32 PNG.";
+      }
+      return dataUrl;
+    }
+
+    function setGaiusCustomSkin(dataUrl, status) {
+      try {
+        if (dataUrl) localStorage.setItem(GAIUS_CUSTOM_SKIN_KEY, dataUrl);
+        else localStorage.removeItem(GAIUS_CUSTOM_SKIN_KEY);
+      } catch (error) {
+        if (status) {
+          status.dataset.state = "error";
+          status.textContent = "Could not save the custom skin in this browser.";
+        }
+        return false;
+      }
+      renderGaiusCustomSkin(profileSkinPreview, profileSkinStatus, profileSkinClear);
+      renderGaiusCustomSkin(nameSkinPreview, nameSkinStatus, nameSkinClear);
+      return true;
+    }
+
+    function readGaiusImage(file) {
+      return new Promise((resolve, reject) => {
+        if (!file || typeof FileReader !== "function" || typeof Image !== "function") {
+          reject(new Error("This browser cannot read PNG skin files"));
+          return;
+        }
+        const reader = new FileReader();
+        reader.onerror = () => reject(new Error("Could not read the selected skin file"));
+        reader.onload = () => {
+          const image = new Image();
+          image.onerror = () => reject(new Error("The selected file is not a valid PNG image"));
+          image.onload = () => resolve({image, source: String(reader.result || "")});
+          image.src = String(reader.result || "");
+        };
+        reader.readAsDataURL(file);
+      });
+    }
+
+    async function chooseGaiusCustomSkin(file, status) {
+      if (!file) return;
+      if (file.type !== "image/png" && !/\.png$/iu.test(String(file.name || ""))) {
+        if (status) { status.dataset.state = "error"; status.textContent = "Choose a PNG skin file."; }
+        return;
+      }
+      try {
+        const {image} = await readGaiusImage(file);
+        if (!((image.width === 64 && image.height === 64)
+            || (image.width === 64 && image.height === 32))) {
+          throw new Error("Skin PNG must be 64x64 or 64x32 pixels");
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = image.width;
+        canvas.height = image.height;
+        const context = canvas.getContext("2d", {willReadFrequently: false});
+        if (!context) throw new Error("Canvas skin decoding is unavailable");
+        context.clearRect(0, 0, canvas.width, canvas.height);
+        context.drawImage(image, 0, 0);
+        const dataUrl = canvas.toDataURL("image/png");
+        if (!/^data:image\/png;base64,/u.test(dataUrl)
+            || dataUrl.length > GAIUS_CUSTOM_SKIN_MAX_DATA_URL) {
+          throw new Error("Skin PNG is too large; use a simple 64x64 skin");
+        }
+        if (!setGaiusCustomSkin(dataUrl, status)) return;
+        if (status) { status.dataset.state = ""; status.textContent = "Custom skin saved for this browser."; }
+      } catch (error) {
+        if (status) {
+          status.dataset.state = "error";
+          status.textContent = String(error && error.message || error);
+        }
+      }
+    }
+
+    function customGaiusSkinDescriptor(uuid, username) {
+      const dataUrl = readGaiusCustomSkin();
+      if (!dataUrl || !/^[0-9a-f]{32}$/u.test(String(uuid || ""))
+          || !/^[A-Za-z0-9_]{1,16}$/u.test(String(username || ""))) return null;
+      const payload = JSON.stringify({textures: {SKIN: {url: dataUrl}}});
+      const value = btoa(payload);
+      if (value.length > 16384) return null;
+      return {uuid: String(uuid), username: String(username), value, signature: "", custom: true};
+    }
+
+    renderGaiusCustomSkin(profileSkinPreview, profileSkinStatus, profileSkinClear);
+    renderGaiusCustomSkin(nameSkinPreview, nameSkinStatus, nameSkinClear);
+    if (profileSkinInput) profileSkinInput.addEventListener("change", () =>
+      chooseGaiusCustomSkin(profileSkinInput.files?.[0], profileSkinStatus));
+    if (nameSkinInput) nameSkinInput.addEventListener("change", () =>
+      chooseGaiusCustomSkin(nameSkinInput.files?.[0], nameSkinStatus));
+    if (profileSkinClear) profileSkinClear.addEventListener("click", () => setGaiusCustomSkin("", profileSkinStatus));
+    if (nameSkinClear) nameSkinClear.addEventListener("click", () => setGaiusCustomSkin("", nameSkinStatus));
+
     function requestGaiusPlayerName(initialName) {
       if (!profileGate || !profileForm || !profileName || !profileError) {
         throw new Error("The Gaius player-name screen is unavailable");
       }
       profileName.value = String(initialName || "").trim();
       profileError.textContent = "";
+      renderGaiusCustomSkin(profileSkinPreview, profileSkinStatus, profileSkinClear);
       profileGate.hidden = false;
       if (bootBrand) bootBrand.hidden = true;
       if (bootProgress) bootProgress.hidden = true;
@@ -1608,6 +1852,7 @@
       }
       if (nameInput) nameInput.value = current;
       if (nameError) nameError.textContent = "";
+      renderGaiusCustomSkin(nameSkinPreview, nameSkinStatus, nameSkinClear);
       nameOverlay.hidden = false;
       requestAnimationFrame(() => {
         if (!nameOverlay.hidden && nameInput) { nameInput.focus(); nameInput.select(); }
@@ -1825,7 +2070,6 @@
           sessionStorage.setItem("gaius.session", JSON.stringify(session));
         }
       }
-      window.__gaiusSkinDescriptor = session.skinDescriptor || null;
       if (!online && !username) {
         let pendingName = "";
         try {
@@ -1849,6 +2093,8 @@
         session.uuid = uuid;
         sessionStorage.setItem("gaius.session", JSON.stringify(session));
       }
+      const customSkinDescriptor = customGaiusSkinDescriptor(uuid, username);
+      window.__gaiusSkinDescriptor = customSkinDescriptor || session.skinDescriptor || null;
       if (!/^[A-Za-z0-9_]{1,16}$/.test(username)) {
         throw new Error("Player name must use 1-16 letters, numbers, or underscores");
       }

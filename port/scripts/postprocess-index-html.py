@@ -2770,7 +2770,13 @@ def patch_index(
       for (const key of identityQueryKeys) scrubbed.searchParams.delete(key);
       history.replaceState(history.state, "", scrubbed.pathname + scrubbed.search + scrubbed.hash);
     }'''
-    if "function createGaiusProxyUrl(target, kind)" in text:
+    # A current launcher already owns the complete User Profile flow, including
+    # local custom-skin persistence and the descriptor consumed by the client.
+    # Do not replace that block with the legacy compatibility block below: doing
+    # so leaves the upload controls in the HTML but drops their runtime wiring.
+    if "customGaiusSkinDescriptor" in text and "window.__gaiusSkinDescriptor" in text:
+        count = 1
+    elif "function createGaiusProxyUrl(target, kind)" in text:
         text, count = re.subn(
             r'    function createGaiusProxyUrl\(target, kind\) \{.*?'
             r'(?:    const identityQueryKeys = \["username", "uuid", "accessToken", "xuid", "clientId"\];\n)?'
