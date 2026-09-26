@@ -2460,7 +2460,8 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                     return;
                   }
                   if (message && message.type === 'skin' &&
-                      localTunnelRole(entry.host) === 'server') {
+                      (localTunnelRole(entry.host) === 'server' ||
+                       localTunnelRole(entry.host) === 'client')) {
                     acceptRemoteSkinDescriptor(message.skinDescriptor);
                     return;
                   }
