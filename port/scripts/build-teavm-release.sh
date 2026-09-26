@@ -392,7 +392,7 @@ if ! command -v node >/dev/null 2>&1; then
   exit 1
 fi
 artifact_contract_report="$build_root/browser-full-path-artifact-contract.json"
-if ! GAIUS_VERSION_PROFILE_PATH="$GAIUS_VERSION_PROFILE_PATH" \
+if ! GAIUS_VERSION_PROFILE_PATH="${GAIUS_VERSION_PROFILE_PATH:-versions/$minecraft_version.json}" \
   GAIUS_DIST_DIRECTORY="$dist" \
   node "$artifact_contract" >"$artifact_contract_report" 2>&1; then
   echo "Multiplayer portable artifact contract failed; see $artifact_contract_report" >&2
