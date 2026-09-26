@@ -1992,6 +1992,12 @@ async function testLocalTunnelPair(bridgePort, token) {
             value: Buffer.from(JSON.stringify({textures:{SKIN:{url:"data:image/png;base64,AA=="}}})).toString("base64"),
             signature: "",
         };
+        const hostSkinDescriptor = {
+            uuid: "00000000000040008000000000000001",
+            username: "RelayHost",
+            value: Buffer.from(JSON.stringify({textures:{SKIN:{url:"data:image/png;base64,BB=="}}})).toString("base64"),
+            signature: "",
+        };
         let clientBytes = 0;
         let serverBytes = 0;
         client.on("message", (data, binary) => {
@@ -2026,6 +2032,7 @@ async function testLocalTunnelPair(bridgePort, token) {
             host: `server-${sessionId}.gaius-local`,
             port: 25565,
             token,
+            skinDescriptor: hostSkinDescriptor,
         }));
         await waitFor(
                 () => clientControls.some((message) => message.type === "connected") &&
@@ -2037,6 +2044,12 @@ async function testLocalTunnelPair(bridgePort, token) {
                     message.skinDescriptor?.username === skinDescriptor.username &&
                     message.skinDescriptor?.value === skinDescriptor.value),
                 "forwarded LAN skin descriptor");
+        await waitFor(
+                () => clientControls.some((message) => message.type === "skin" &&
+                    message.skinDescriptor?.uuid === hostSkinDescriptor.uuid &&
+                    message.skinDescriptor?.username === hostSkinDescriptor.username &&
+                    message.skinDescriptor?.value === hostSkinDescriptor.value),
+                "forwarded host LAN skin descriptor");
         return {
             client,
             server,
@@ -2045,6 +2058,7 @@ async function testLocalTunnelPair(bridgePort, token) {
             get clientBytes() { return clientBytes; },
             get serverBytes() { return serverBytes; },
             skinForwarded: true,
+            hostSkinForwarded: true,
         };
     };
 
@@ -2105,7 +2119,8 @@ async function testLocalTunnelPair(bridgePort, token) {
         reconnectClientToServerBytes: reconnectPair.serverBytes,
         reconnectServerToClientBytes: reconnectPair.clientBytes,
         activeLocalTunnelSessions: finalRuntime.activeLocalTunnelSessions,
-        skinDescriptorForwarded: true,
+        skinDescriptorForwarded: firstPair.skinForwarded,
+        hostSkinDescriptorForwarded: firstPair.hostSkinForwarded,
     };
 }
 

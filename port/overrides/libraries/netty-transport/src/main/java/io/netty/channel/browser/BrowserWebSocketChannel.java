@@ -1782,8 +1782,10 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             const match = /^(client|server)-([a-f0-9]{32})\\.gaius-local$/.exec(host);
             return match ? match[1] : null;
             }
-            function localSkinDescriptor() {
-            const descriptor = globalThis.__gaiusSkinDescriptor;
+            function localSkinDescriptor(role) {
+            const descriptor = role === 'server'
+              ? globalThis.__gaiusLanSkinDescriptor
+              : globalThis.__gaiusSkinDescriptor;
             if (!descriptor || typeof descriptor !== 'object') return null;
             const uuid = String(descriptor.uuid || '').trim().toLowerCase();
             const username = String(descriptor.username || '');
@@ -1803,9 +1805,18 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 value.length < 1 || value.length > 16384 || signature.length > 16384) return;
             const descriptors = globalThis.__gaiusRemoteSkinDescriptors ||
               (globalThis.__gaiusRemoteSkinDescriptors = Object.create(null));
-            if (!Object.prototype.hasOwnProperty.call(descriptors, uuid) &&
+            const key = uuid + ':' + username;
+            if (!Object.prototype.hasOwnProperty.call(descriptors, key) &&
                 Object.keys(descriptors).length >= 32) return;
-            descriptors[uuid] = {uuid: uuid, username: username, value: value, signature: signature};
+            const normalized = {uuid: uuid, username: username, value: value, signature: signature};
+            descriptors[key] = normalized;
+            // Keep a UUID alias only while it is unambiguous. Offline browser
+            // profiles may share the deterministic UUID, so profile lookup
+            // always prefers the composite UUID+username key.
+            if (!Object.prototype.hasOwnProperty.call(descriptors, uuid) ||
+                String(descriptors[uuid]?.username || '') === username) {
+              descriptors[uuid] = normalized;
+            }
             }
             function localPortMap() {
             const ports = globalThis.__gaiusLocalServerPorts;
@@ -2407,7 +2418,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               }
               const control = {type: 'connect', host: entry.host, port: entry.port};
               if (localTunnelRole(entry.host) === 'client') {
-                const skin = localSkinDescriptor();
+                const skin = localSkinDescriptor(localTunnelRole(entry.host));
                 if (skin) control.skinDescriptor = skin;
               }
               const token = bridgeToken(candidate);

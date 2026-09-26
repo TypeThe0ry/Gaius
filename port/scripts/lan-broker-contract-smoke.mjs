@@ -32,10 +32,15 @@ assert.match(worker, /openLanServerConnection\(brokerSessionId\)/);
 assert.match(relayPolicy, /parseSkinDescriptor/);
 assert.match(relayPolicy, /16384/);
 assert.match(relay, /session\.client\.skinDescriptor/);
+assert.match(relay, /session\.server\.skinDescriptor/);
 assert.match(relay, /type: "skin"/);
 assert.match(channel, /control\.skinDescriptor = skin/);
 assert.match(channel, /acceptRemoteSkinDescriptor\(message\.skinDescriptor\)/);
+assert.match(channel, /localSkinDescriptor\(role\)/);
+assert.match(channel, /role === 'server'/);
 assert.match(skin, /__gaiusRemoteSkinDescriptors/);
+assert.match(skin, /remoteKey = profileUuid \+ ':' \+ profileName/);
 assert.match(skin, /descriptorValue\(profileUuid, profileName\)/);
+assert.match(worker, /__gaiusLanSkinDescriptor/);
 
 console.log("relay-backed LAN broker contract passed");

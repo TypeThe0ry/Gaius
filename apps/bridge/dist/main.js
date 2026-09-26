@@ -3168,6 +3168,12 @@ function registerLocalTunnel(webSocket, request, closeSelf) {
                 skinDescriptor: session.client.skinDescriptor,
             }));
         }
+        if (session.server.skinDescriptor !== undefined) {
+            session.client.webSocket.send(JSON.stringify({
+                type: "skin",
+                skinDescriptor: session.server.skinDescriptor,
+            }));
+        }
     }
 }
 function updateLocalReadState(endpoint) {

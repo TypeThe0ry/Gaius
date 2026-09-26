@@ -39,7 +39,11 @@ public final class BrowserSkinProfile {
             const profileUuid = String(uuid || '').replaceAll('-', '').toLowerCase();
             const profileName = String(username || '');
             const remote = globalThis.__gaiusRemoteSkinDescriptors;
-            const descriptor = remote && typeof remote === 'object' ? remote[profileUuid] :
+            const remoteKey = profileUuid + ':' + profileName;
+            const descriptor = remote && typeof remote === 'object' ?
+              (remote[remoteKey] || (remote[profileUuid] &&
+                String(remote[profileUuid].username || '') === profileName
+                ? remote[profileUuid] : null)) :
               (globalThis.__gaiusSkinDescriptor &&
                String(globalThis.__gaiusSkinDescriptor.uuid || '').replaceAll('-', '').toLowerCase() === profileUuid &&
                String(globalThis.__gaiusSkinDescriptor.username || '') === profileName
@@ -53,7 +57,11 @@ public final class BrowserSkinProfile {
             const profileUuid = String(uuid || '').replaceAll('-', '').toLowerCase();
             const profileName = String(username || '');
             const remote = globalThis.__gaiusRemoteSkinDescriptors;
-            const descriptor = remote && typeof remote === 'object' ? remote[profileUuid] :
+            const remoteKey = profileUuid + ':' + profileName;
+            const descriptor = remote && typeof remote === 'object' ?
+              (remote[remoteKey] || (remote[profileUuid] &&
+                String(remote[profileUuid].username || '') === profileName
+                ? remote[profileUuid] : null)) :
               (globalThis.__gaiusSkinDescriptor &&
                String(globalThis.__gaiusSkinDescriptor.uuid || '').replaceAll('-', '').toLowerCase() === profileUuid &&
                String(globalThis.__gaiusSkinDescriptor.username || '') === profileName
@@ -67,7 +75,11 @@ public final class BrowserSkinProfile {
             const profileUuid = String(uuid || '').replaceAll('-', '').toLowerCase();
             const profileName = String(username || '');
             const remote = globalThis.__gaiusRemoteSkinDescriptors;
-            const descriptor = remote && typeof remote === 'object' ? remote[profileUuid] :
+            const remoteKey = profileUuid + ':' + profileName;
+            const descriptor = remote && typeof remote === 'object' ?
+              (remote[remoteKey] || (remote[profileUuid] &&
+                String(remote[profileUuid].username || '') === profileName
+                ? remote[profileUuid] : null)) :
               (globalThis.__gaiusSkinDescriptor &&
                String(globalThis.__gaiusSkinDescriptor.uuid || '').replaceAll('-', '').toLowerCase() === profileUuid &&
                String(globalThis.__gaiusSkinDescriptor.username || '') === profileName
@@ -81,7 +93,11 @@ public final class BrowserSkinProfile {
             const profileUuid = String(uuid || '').replaceAll('-', '').toLowerCase();
             const profileName = String(username || '');
             const remote = globalThis.__gaiusRemoteSkinDescriptors;
-            const descriptor = remote && typeof remote === 'object' ? remote[profileUuid] :
+            const remoteKey = profileUuid + ':' + profileName;
+            const descriptor = remote && typeof remote === 'object' ?
+              (remote[remoteKey] || (remote[profileUuid] &&
+                String(remote[profileUuid].username || '') === profileName
+                ? remote[profileUuid] : null)) :
               (globalThis.__gaiusSkinDescriptor &&
                String(globalThis.__gaiusSkinDescriptor.uuid || '').replaceAll('-', '').toLowerCase() === profileUuid &&
                String(globalThis.__gaiusSkinDescriptor.username || '') === profileName
