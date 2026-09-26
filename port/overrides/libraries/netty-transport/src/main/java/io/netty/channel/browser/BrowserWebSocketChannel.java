@@ -1814,7 +1814,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             // profiles may share the deterministic UUID, so profile lookup
             // always prefers the composite UUID+username key.
             if (!Object.prototype.hasOwnProperty.call(descriptors, uuid) ||
-                String(descriptors[uuid]?.username || '') === username) {
+                String(descriptors[uuid] && descriptors[uuid].username || '') === username) {
               descriptors[uuid] = normalized;
             }
             }
