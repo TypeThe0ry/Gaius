@@ -40,14 +40,14 @@ public final class BrowserSkinProfile {
             const profileName = String(username || '');
             const remote = globalThis.__gaiusRemoteSkinDescriptors;
             const remoteKey = profileUuid + ':' + profileName;
-            const descriptor = remote && typeof remote === 'object' ?
+            const local = globalThis.__gaiusSkinDescriptor &&
+              String(globalThis.__gaiusSkinDescriptor.uuid || '').replaceAll('-', '').toLowerCase() === profileUuid &&
+              String(globalThis.__gaiusSkinDescriptor.username || '') === profileName
+                ? globalThis.__gaiusSkinDescriptor : null;
+            const descriptor = (remote && typeof remote === 'object' &&
               (remote[remoteKey] || (remote[profileUuid] &&
                 String(remote[profileUuid].username || '') === profileName
-                ? remote[profileUuid] : null)) :
-              (globalThis.__gaiusSkinDescriptor &&
-               String(globalThis.__gaiusSkinDescriptor.uuid || '').replaceAll('-', '').toLowerCase() === profileUuid &&
-               String(globalThis.__gaiusSkinDescriptor.username || '') === profileName
-                ? globalThis.__gaiusSkinDescriptor : null);
+                ? remote[profileUuid] : null))) || local;
             return descriptor && typeof descriptor === 'object'
               ? String(descriptor.value || '') : '';
             """)
@@ -58,14 +58,14 @@ public final class BrowserSkinProfile {
             const profileName = String(username || '');
             const remote = globalThis.__gaiusRemoteSkinDescriptors;
             const remoteKey = profileUuid + ':' + profileName;
-            const descriptor = remote && typeof remote === 'object' ?
+            const local = globalThis.__gaiusSkinDescriptor &&
+              String(globalThis.__gaiusSkinDescriptor.uuid || '').replaceAll('-', '').toLowerCase() === profileUuid &&
+              String(globalThis.__gaiusSkinDescriptor.username || '') === profileName
+                ? globalThis.__gaiusSkinDescriptor : null;
+            const descriptor = (remote && typeof remote === 'object' &&
               (remote[remoteKey] || (remote[profileUuid] &&
                 String(remote[profileUuid].username || '') === profileName
-                ? remote[profileUuid] : null)) :
-              (globalThis.__gaiusSkinDescriptor &&
-               String(globalThis.__gaiusSkinDescriptor.uuid || '').replaceAll('-', '').toLowerCase() === profileUuid &&
-               String(globalThis.__gaiusSkinDescriptor.username || '') === profileName
-                ? globalThis.__gaiusSkinDescriptor : null);
+                ? remote[profileUuid] : null))) || local;
             return descriptor && typeof descriptor === 'object'
               ? String(descriptor.signature || '') : '';
             """)
@@ -76,14 +76,14 @@ public final class BrowserSkinProfile {
             const profileName = String(username || '');
             const remote = globalThis.__gaiusRemoteSkinDescriptors;
             const remoteKey = profileUuid + ':' + profileName;
-            const descriptor = remote && typeof remote === 'object' ?
+            const local = globalThis.__gaiusSkinDescriptor &&
+              String(globalThis.__gaiusSkinDescriptor.uuid || '').replaceAll('-', '').toLowerCase() === profileUuid &&
+              String(globalThis.__gaiusSkinDescriptor.username || '') === profileName
+                ? globalThis.__gaiusSkinDescriptor : null;
+            const descriptor = (remote && typeof remote === 'object' &&
               (remote[remoteKey] || (remote[profileUuid] &&
                 String(remote[profileUuid].username || '') === profileName
-                ? remote[profileUuid] : null)) :
-              (globalThis.__gaiusSkinDescriptor &&
-               String(globalThis.__gaiusSkinDescriptor.uuid || '').replaceAll('-', '').toLowerCase() === profileUuid &&
-               String(globalThis.__gaiusSkinDescriptor.username || '') === profileName
-                ? globalThis.__gaiusSkinDescriptor : null);
+                ? remote[profileUuid] : null))) || local;
             return descriptor && typeof descriptor === 'object'
               ? String(descriptor.username || '') : '';
             """)
@@ -94,14 +94,14 @@ public final class BrowserSkinProfile {
             const profileName = String(username || '');
             const remote = globalThis.__gaiusRemoteSkinDescriptors;
             const remoteKey = profileUuid + ':' + profileName;
-            const descriptor = remote && typeof remote === 'object' ?
+            const local = globalThis.__gaiusSkinDescriptor &&
+              String(globalThis.__gaiusSkinDescriptor.uuid || '').replaceAll('-', '').toLowerCase() === profileUuid &&
+              String(globalThis.__gaiusSkinDescriptor.username || '') === profileName
+                ? globalThis.__gaiusSkinDescriptor : null;
+            const descriptor = (remote && typeof remote === 'object' &&
               (remote[remoteKey] || (remote[profileUuid] &&
                 String(remote[profileUuid].username || '') === profileName
-                ? remote[profileUuid] : null)) :
-              (globalThis.__gaiusSkinDescriptor &&
-               String(globalThis.__gaiusSkinDescriptor.uuid || '').replaceAll('-', '').toLowerCase() === profileUuid &&
-               String(globalThis.__gaiusSkinDescriptor.username || '') === profileName
-                ? globalThis.__gaiusSkinDescriptor : null);
+                ? remote[profileUuid] : null))) || local;
             return descriptor && typeof descriptor === 'object'
               ? String(descriptor.uuid || '') : '';
             """)
