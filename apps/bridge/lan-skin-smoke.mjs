@@ -68,6 +68,7 @@ for (const marker of [
   "__gaiusRemoteSkinDescriptors",
   "localSkinDescriptor(role)",
   "role === 'server'",
+  "localTunnelRole(entry.host) === 'client'",
 ]) {
   if (!channel.includes(marker)) throw new Error(`Browser LAN skin marker missing: ${marker}`);
 }
