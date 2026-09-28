@@ -267,6 +267,8 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/server/packs/DownloadQueue.class"));
         patchSkinTextureDownloader(args[0], root.resolve(
                 "net/minecraft/client/renderer/texture/SkinTextureDownloader.class"));
+        patchSkinManagerUploadedSkinSecurity(args[0], root.resolve(
+                "net/minecraft/client/resources/SkinManager.class"));
         patchUtilJarFileSystem(args[0], root.resolve("net/minecraft/util/Util.class"));
         patchUtilRunNamedBrowserOutput(root.resolve("net/minecraft/util/Util.class"));
         patchUtilBlockUntilDoneBrowserOutput(root.resolve("net/minecraft/util/Util.class"));
@@ -10193,14 +10195,17 @@ public final class MinecraftClientPatcher {
         open.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
                 "net/minecraft/server/network/EventLoopGroupHolder", "eventLoopGroup",
                 "()Lio/netty/channel/EventLoopGroup;", false));
+        // Use the same concrete Bootstrap group path as the startup listener.
+        // The server Worker is compiled separately from the client runtime and
+        // does not necessarily retain the optional gaiusGroup bridge method.
         open.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
                 "io/netty/bootstrap/AbstractBootstrap", "group",
-                "(Lio/netty/channel/EventLoopGroup;)Lio/netty/channel/AbstractBootstrap;", false));
+                "(Lio/netty/channel/EventLoopGroup;)Lio/netty/bootstrap/AbstractBootstrap;", false));
         open.add(new TypeInsnNode(Opcodes.CHECKCAST, "io/netty/bootstrap/Bootstrap"));
         open.add(new LdcInsnNode(Type.getObjectType("io/netty/channel/browser/BrowserWebSocketChannel")));
         open.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
                 "io/netty/bootstrap/AbstractBootstrap", "channel",
-                "(Ljava/lang/Class;)Lio/netty/channel/AbstractBootstrap;", false));
+                "(Ljava/lang/Class;)Lio/netty/bootstrap/AbstractBootstrap;", false));
         open.add(new TypeInsnNode(Opcodes.CHECKCAST, "io/netty/bootstrap/Bootstrap"));
         open.add(new TypeInsnNode(Opcodes.NEW, owner + "$1"));
         open.add(new InsnNode(Opcodes.DUP));
@@ -10210,7 +10215,7 @@ public final class MinecraftClientPatcher {
                 "(L" + owner + ";)V", false));
         open.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
                 "io/netty/bootstrap/AbstractBootstrap", "handler",
-                "(Lio/netty/channel/ChannelHandler;)Lio/netty/channel/AbstractBootstrap;", false));
+                "(Lio/netty/channel/ChannelHandler;)Lio/netty/bootstrap/AbstractBootstrap;", false));
         open.add(new TypeInsnNode(Opcodes.CHECKCAST, "io/netty/bootstrap/Bootstrap"));
         open.add(new FieldInsnNode(Opcodes.GETSTATIC,
                 "io/netty/resolver/NoopAddressResolverGroup", "INSTANCE",
@@ -10226,13 +10231,30 @@ public final class MinecraftClientPatcher {
         open.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
                 "io/netty/bootstrap/Bootstrap", "connect",
                 "(Ljava/net/SocketAddress;)Lio/netty/channel/ChannelFuture;", false));
+        // BrowserWebSocketChannel completes its WebSocket handshake on a
+        // later browser task. Waiting synchronously here makes the relay-backed
+        // LAN channel fail before that task can run; the Channel object is
+        // already available and can be registered immediately.
         open.add(new MethodInsnNode(Opcodes.INVOKEINTERFACE,
-                "io/netty/channel/ChannelFuture", "syncUninterruptibly",
-                "()Lio/netty/channel/ChannelFuture;", true));
+                "io/netty/channel/ChannelFuture", "channel",
+                "()Lio/netty/channel/Channel;", true));
         open.add(new MethodInsnNode(Opcodes.INVOKEINTERFACE,
                 "java/util/List", "add", "(Ljava/lang/Object;)Z", true));
         open.add(new InsnNode(Opcodes.POP));
+        LabelNode opened = new LabelNode();
+        open.add(new JumpInsnNode(Opcodes.GOTO, opened));
+        // A missing startup listener is a hard failure.  Returning silently
+        // makes Open to LAN report a false success while no relay endpoint is
+        // registered, leaving joiners stuck in the connect screen.
         open.add(noListener);
+        open.add(new TypeInsnNode(Opcodes.NEW, "java/lang/IllegalStateException"));
+        open.add(new InsnNode(Opcodes.DUP));
+        open.add(new LdcInsnNode("Browser server listener is not initialized"));
+        open.add(new MethodInsnNode(Opcodes.INVOKESPECIAL,
+                "java/lang/IllegalStateException", "<init>",
+                "(Ljava/lang/String;)V", false));
+        open.add(new InsnNode(Opcodes.ATHROW));
+        open.add(opened);
         open.add(new InsnNode(Opcodes.RETURN));
         node.methods.add(opener);
         writeComputeFrames(node, output);
@@ -20356,6 +20378,18 @@ public final class MinecraftClientPatcher {
                 "(Ljava/nio/file/Path;Ljava/lang/String;)"
                         + "Lcom/mojang/blaze3d/platform/NativeImage;");
         InsnList code = new InsnList();
+        LabelNode normalSkin = new LabelNode();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserUploadedSkin", "isUploadedSkin",
+                "(Ljava/lang/String;)Z", false));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, normalSkin));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserUploadedSkin", "readUploadedSkin",
+                "(Ljava/lang/String;)Lcom/mojang/blaze3d/platform/NativeImage;", false));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        code.add(normalSkin);
         code.add(new VarInsnNode(Opcodes.ALOAD, 2));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
@@ -20383,6 +20417,54 @@ public final class MinecraftClientPatcher {
         if (!removedJavaProxy) {
             throw new IllegalStateException(
                     "SkinTextureDownloader browser Java Proxy patch point was not found");
+        }
+        write(node, output);
+    }
+
+    /**
+     * Remote players only render skins whose PlayerSkin is secure, and
+     * SkinManager derives that from the Mojang signature. Uploaded data:image/png
+     * skins are never signed, so other players always fell back to a default
+     * skin. Route the one signature read through BrowserUploadedSkin, which
+     * trusts only a lone uploaded skin and keeps every other texture set's real
+     * signature state.
+     */
+    private static void patchSkinManagerUploadedSkinSecurity(String jar, Path output)
+            throws IOException {
+        ClassNode node = read(jar, "net/minecraft/client/resources/SkinManager.class");
+        MethodNode build = node.methods.stream()
+                .filter(method -> method.name.startsWith("lambda$registerTextures$")
+                        && method.desc.endsWith(
+                                "Lcom/mojang/authlib/minecraft/MinecraftProfileTextures;"
+                                        + "Ljava/lang/Void;)"
+                                        + "Lnet/minecraft/world/entity/player/PlayerSkin;"))
+                .findFirst()
+                .orElse(null);
+        if (build == null) {
+            // Older profiles use a different SkinManager shape; leave them vanilla.
+            System.out.println("Skipped uploaded skin security patch: SkinManager shape not present");
+            return;
+        }
+        int redirected = 0;
+        for (var instruction = build.instructions.getFirst(); instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                    && call.owner.equals("com/mojang/authlib/minecraft/MinecraftProfileTextures")
+                    && call.name.equals("signatureState")
+                    && call.desc.equals("()Lcom/mojang/authlib/SignatureState;")) {
+                call.setOpcode(Opcodes.INVOKESTATIC);
+                call.owner = "dev/gaius/browser/BrowserUploadedSkin";
+                call.name = "skinSignatureState";
+                call.desc = "(Lcom/mojang/authlib/minecraft/MinecraftProfileTextures;)"
+                        + "Lcom/mojang/authlib/SignatureState;";
+                call.itf = false;
+                redirected++;
+            }
+        }
+        if (redirected != 1) {
+            throw new IllegalStateException(
+                    "SkinManager uploaded skin security patch point count was " + redirected);
         }
         write(node, output);
     }

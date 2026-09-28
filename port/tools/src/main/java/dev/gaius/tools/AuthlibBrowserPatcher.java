@@ -8,7 +8,13 @@ import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.tree.ClassNode;
+import org.objectweb.asm.tree.FrameNode;
 import org.objectweb.asm.tree.InsnList;
+import org.objectweb.asm.tree.InsnNode;
+import org.objectweb.asm.tree.IntInsnNode;
+import org.objectweb.asm.tree.JumpInsnNode;
+import org.objectweb.asm.tree.LabelNode;
+import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.VarInsnNode;
@@ -31,6 +37,77 @@ public final class AuthlibBrowserPatcher {
             "com/mojang/authlib/yggdrasil/YggdrasilServicesKeyInfo$KeyData.class";
 
     private AuthlibBrowserPatcher() {
+    }
+
+    private static final String SESSION_OWNER =
+            "com/mojang/authlib/yggdrasil/YggdrasilMinecraftSessionService";
+    private static final String UPLOADED_SKIN_PREFIX = "data:image/png;base64,";
+    /** Mirrors BrowserUploadedSkin.isUploadedSkin; the PNG itself is validated on decode. */
+    private static final int UPLOADED_SKIN_MAX_URL_LENGTH = 16_384;
+
+    /**
+     * Custom skins are carried as bounded data:image/png URLs. authlib's
+     * TextureUrlChecker only accepts Mojang texture domains, so unpackTextures
+     * rejected them and every player fell back to a default skin. Route the one
+     * domain check through a helper that also accepts uploaded-skin data URLs;
+     * all other URLs keep the vanilla domain rules. The helper is inlined here
+     * rather than calling BrowserUploadedSkin because authlib is also compiled
+     * into the server Worker, which must not pull in client NativeImage.
+     */
+    static void allowUploadedSkinTextures(ClassNode sessionNode) {
+        MethodNode unpack = sessionNode.methods.stream()
+                .filter(method -> method.name.equals("unpackTextures")
+                        && method.desc.equals("(Lcom/mojang/authlib/properties/Property;)"
+                                + "Lcom/mojang/authlib/minecraft/MinecraftProfileTextures;"))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("authlib unpackTextures was not found"));
+        int redirected = 0;
+        for (var instruction = unpack.instructions.getFirst(); instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("com/mojang/authlib/yggdrasil/TextureUrlChecker")
+                    && call.name.equals("isAllowedTextureDomain")
+                    && call.desc.equals("(Ljava/lang/String;)Z")) {
+                call.owner = SESSION_OWNER;
+                call.name = "gaiusAllowedTextureUrl";
+                redirected++;
+            }
+        }
+        if (redirected != 1) {
+            throw new IllegalStateException(
+                    "authlib texture URL check patch point count was " + redirected);
+        }
+        MethodNode helper = new MethodNode(
+                Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_SYNTHETIC,
+                "gaiusAllowedTextureUrl",
+                "(Ljava/lang/String;)Z",
+                null,
+                null);
+        LabelNode vanilla = new LabelNode();
+        InsnList code = helper.instructions;
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new LdcInsnNode(UPLOADED_SKIN_PREFIX));
+        code.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, "java/lang/String",
+                "startsWith", "(Ljava/lang/String;)Z", false));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, vanilla));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, "java/lang/String",
+                "length", "()I", false));
+        code.add(new IntInsnNode(Opcodes.SIPUSH, UPLOADED_SKIN_MAX_URL_LENGTH));
+        code.add(new JumpInsnNode(Opcodes.IF_ICMPGT, vanilla));
+        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(new InsnNode(Opcodes.IRETURN));
+        code.add(vanilla);
+        code.add(new FrameNode(Opcodes.F_SAME, 0, null, 0, null));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "com/mojang/authlib/yggdrasil/TextureUrlChecker",
+                "isAllowedTextureDomain", "(Ljava/lang/String;)Z", false));
+        code.add(new InsnNode(Opcodes.IRETURN));
+        helper.maxStack = 2;
+        helper.maxLocals = 1;
+        sessionNode.methods.add(helper);
     }
 
     public static void main(String[] args) throws IOException {
@@ -243,6 +320,7 @@ public final class AuthlibBrowserPatcher {
             throw new IllegalStateException("authlib texture Gson decode patch point was not found");
         }
         constructor.maxStack = Math.max(constructor.maxStack, 3);
+        allowUploadedSkinTextures(sessionNode);
         ClassWriter sessionWriter = new ClassWriter(0);
         sessionNode.accept(sessionWriter);
         Path sessionOutput = output.getParent().getParent().getParent()

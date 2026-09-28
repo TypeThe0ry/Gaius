@@ -18,6 +18,7 @@ import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.TypeInsnNode;
+import org.objectweb.asm.tree.VarInsnNode;
 
 /** Removes Netty's native-memory and desktop-platform bootstrap paths. */
 public final class NettyBrowserPatcher {
@@ -392,6 +393,28 @@ public final class NettyBrowserPatcher {
 
     private static void patchBootstrap(Path jar, Path output) throws IOException {
         ClassNode node = read(jar, "io/netty/bootstrap/Bootstrap.class");
+        ClassNode abstractBootstrap = read(jar, "io/netty/bootstrap/AbstractBootstrap.class");
+        // TeaVM cannot resolve the generic AbstractBootstrap.group bridge when
+        // the LAN opener is reachable from the worker entry point.  Keep a
+        // concrete Bootstrap-owned setter in the patched class so the
+        // injected LAN opener links to a plain field write instead of the
+        // missing generic method.
+        MethodNode gaiusGroup = new MethodNode(
+                Opcodes.ACC_PUBLIC,
+                "gaiusGroup",
+                "(Lio/netty/channel/EventLoopGroup;)Lio/netty/bootstrap/Bootstrap;",
+                null,
+                null);
+        gaiusGroup.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        gaiusGroup.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        gaiusGroup.instructions.add(new FieldInsnNode(
+                Opcodes.PUTFIELD,
+                "io/netty/bootstrap/AbstractBootstrap",
+                "group",
+                "Lio/netty/channel/EventLoopGroup;"));
+        gaiusGroup.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        gaiusGroup.instructions.add(new InsnNode(Opcodes.ARETURN));
+        node.methods.add(gaiusGroup);
         MethodNode connect = find(node, "doConnect",
                 "(Ljava/net/SocketAddress;Ljava/net/SocketAddress;"
                         + "Lio/netty/channel/ChannelPromise;)V");
@@ -419,6 +442,7 @@ public final class NettyBrowserPatcher {
         inline.add(useEventLoop);
         connect.instructions.insert(inline);
         write(node, output);
+        write(abstractBootstrap, output.getParent().resolve("AbstractBootstrap.class"));
     }
 
     private static void patchReflectiveChannelFactory(Path jar, Path output) throws IOException {

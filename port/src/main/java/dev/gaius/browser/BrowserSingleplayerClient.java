@@ -134,7 +134,7 @@ public final class BrowserSingleplayerClient {
 
     /** True only while the browser integrated-server Worker owns a live session. */
     public static boolean hasActiveWorkerSession() {
-        return hasActiveWorker();
+        return hasReadyWorker();
     }
 
     /** Stable session key used by the relay-backed Open to LAN broker. */
@@ -152,15 +152,28 @@ public final class BrowserSingleplayerClient {
               ? workers.get(workerKey)
               : null;
             if (!worker || worker.__gaiusTerminal ||
+                !worker.__gaiusServerReady || !worker.__gaiusClientAttached ||
                 typeof worker.postMessage !== 'function') return false;
-            worker.postMessage({type: 'lan-open', brokerSessionId: key});
+            const descriptor = globalThis.__gaiusSkinDescriptor;
+            worker.postMessage({
+              type: 'lan-open',
+              brokerSessionId: key,
+              skinDescriptor: descriptor && typeof descriptor === 'object'
+                ? {
+                    uuid: String(descriptor.uuid || ''),
+                    username: String(descriptor.username || ''),
+                    value: String(descriptor.value || ''),
+                    signature: String(descriptor.signature || '')
+                  }
+                : null
+            });
             return true;
             """)
     private static native boolean postLanServerConnectionRequest(
             String brokerSessionId, String workerSessionId);
 
     public static boolean requestLanServerConnection(String brokerSessionId) {
-        return hasActiveWorker() && activeSessionId != null
+        return hasReadyWorker() && activeSessionId != null
                 && postLanServerConnectionRequest(brokerSessionId, activeSessionId);
     }
 
@@ -1444,6 +1457,26 @@ public final class BrowserSingleplayerClient {
             return active;
             """)
     private static native boolean hasActiveWorker();
+
+    /**
+     * Open to LAN is only offered after both ends of the local Worker handoff
+     * are ready. A live Worker by itself is not sufficient: during startup the
+     * injected ServerConnectionListener may not have registered its browser
+     * listener yet, and an early LAN request would otherwise be silently lost.
+     */
+    @JSBody(script = """
+            const workers = globalThis.__gaiusSingleplayerWorkers;
+            if (!workers || typeof workers.values !== 'function') return false;
+            let ready = false;
+            workers.forEach(function(worker) {
+              if (worker && !worker.__gaiusTerminal &&
+                  worker.__gaiusServerReady && worker.__gaiusClientAttached) {
+                ready = true;
+              }
+            });
+            return ready;
+            """)
+    private static native boolean hasReadyWorker();
 
     @JSBody(script = """
             const workers = globalThis.__gaiusSingleplayerWorkers;

@@ -44,6 +44,13 @@ public final class BrowserHttpProxy {
     }
 
     public static String proxyTexture(String target) {
+        // A player-uploaded skin is carried as a bounded PNG data URL. It is
+        // already local to the browser and must not be sent through a remote
+        // texture proxy (or exposed as a public URL in a LAN invite).
+        if (target != null && target.startsWith("data:image/png;base64,")
+                && target.length() <= 16_384) {
+            return target;
+        }
         try {
             return proxy(new URL(target), "texture").toExternalForm();
         } catch (MalformedURLException exception) {
