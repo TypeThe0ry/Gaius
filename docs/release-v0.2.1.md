@@ -30,7 +30,17 @@ are placed in the invite URL.
 The existing authlib and skin texture paths remain enabled for multiplayer:
 profile texture JSON is decoded without reflective Gson construction and skin
 URLs are fetched through the trusted texture proxy. Online profiles therefore
-retain their custom skin on both the host and joining browser; offline names do
-not contain a Mojang profile texture to propagate. Server resource packs are
+retain their custom skin on both the host and joining browser. Offline players
+can upload a 64×64 PNG skin in User Profile; it is stored locally, carried to
+LAN peers through the relay, and rendered for every player in the world. Each
+offline player gets the vanilla name-derived UUID, so a joiner never collides
+with the host. Server resource packs are
 downloaded through the streaming relay path and must pass exact byte/hash and
 reload gates before acceptance.
+
+Two browsers on one LAN world, each with its own uploaded skin (host magenta,
+joiner green):
+
+| Host sees the joiner | Joiner sees the host |
+| --- | --- |
+| ![Host view of the joining player's green skin](images/gaius-lan-skins-host.png) | ![Joiner view of the host's magenta skin](images/gaius-lan-skins-joiner.png) |
