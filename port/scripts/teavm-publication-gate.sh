@@ -159,6 +159,21 @@ gaius_teavm_lock_release() {
   return 1
 }
 
+# On Windows a just-written file is often held for a moment by an on-access
+# scanner, so replacing it can fail with "Device or resource busy" even though
+# nothing in the build still uses it.  Retry briefly before giving up; the last
+# attempt reports the real error.
+gaius_teavm_replace_file() {
+  local source_path="$1"
+  local target_path="$2"
+  local attempt
+  for (( attempt=1; attempt<20; attempt++ )); do
+    mv -f "$source_path" "$target_path" 2>/dev/null && return 0
+    sleep 0.5
+  done
+  mv -f "$source_path" "$target_path"
+}
+
 # Publish through a temporary file in the destination directory.  A copy
 # failure therefore leaves the previous release untouched, and the final mv
 # is atomic on the filesystems used by POSIX and Git Bash on Windows.
@@ -177,7 +192,7 @@ gaius_teavm_publish_file() {
     rm -f "$temporary_path"
     return 1
   fi
-  if ! mv -f "$temporary_path" "$target_path"; then
+  if ! gaius_teavm_replace_file "$temporary_path" "$target_path"; then
     rm -f "$temporary_path"
     return 1
   fi
@@ -250,7 +265,7 @@ gaius_teavm_publish_bundle() {
   done
 
   for (( index=0; index<${#targets[@]}; index++ )); do
-    if ! mv -f "${temporaries[$index]}" "${targets[$index]}"; then
+    if ! gaius_teavm_replace_file "${temporaries[$index]}" "${targets[$index]}"; then
       break
     fi
     committed=$((committed + 1))
@@ -263,7 +278,7 @@ gaius_teavm_publish_bundle() {
   if (( committed != ${#targets[@]} )); then
     for (( index=committed-1; index>=0; index-- )); do
       if [[ "${existed[$index]}" == true ]]; then
-        mv -f "${backups[$index]}" "${targets[$index]}" || rollback_failed=true
+        gaius_teavm_replace_file "${backups[$index]}" "${targets[$index]}" || rollback_failed=true
       else
         rm -f -- "${targets[$index]}" || rollback_failed=true
       fi

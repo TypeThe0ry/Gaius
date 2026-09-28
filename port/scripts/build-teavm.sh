@@ -122,8 +122,13 @@ fi
 gson_type_token_patches="$build_root/gson-type-token-client-patches"
 mkdir -p "$gson_type_token_patches"
 find "$gson_type_token_patches" -type f -delete
+gson_patcher_classpath="$overlay_directory/tool-classes:$maven_repository/org/ow2/asm/asm/9.8/asm-9.8.jar:$maven_repository/org/ow2/asm/asm-tree/9.8/asm-tree-9.8.jar"
+# Windows java.exe needs `;` and native paths; Git Bash does not rewrite this list.
+if command -v cygpath >/dev/null 2>&1; then
+  gson_patcher_classpath="$(cygpath -mp "$gson_patcher_classpath")"
+fi
 java -classpath \
-  "$overlay_directory/tool-classes:$maven_repository/org/ow2/asm/asm/9.8/asm-9.8.jar:$maven_repository/org/ow2/asm/asm-tree/9.8/asm-tree-9.8.jar" \
+  "$gson_patcher_classpath" \
   dev.gaius.tools.GsonTypeTokenClientPatcher \
   "$overlay_directory/client-named-$version-gaius.jar" \
   "$gson_type_token_patches" \
