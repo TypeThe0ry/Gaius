@@ -902,6 +902,30 @@ public final class BrowserPacketScheduler {
     }
 
     /**
+     * Queued packets that a processQueuedPackets call can start right now. A packet stays in
+     * queuedPackets until its handler returns, and processQueuedPackets returns immediately for an
+     * owner whose handler is still running (its reentrancy guard). Counting such an owner as
+     * pending made the integrated server re-run its input task in a tight loop while a
+     * finish-configuration handler waited for spawn chunks, and made worldgen keep yielding to
+     * that same waiting handler, so the handler could stall indefinitely.
+     */
+    public static boolean hasActionablePendingPackets() {
+        boolean ownerSeen = false;
+        for (PacketProcessorLedger ledger : packetProcessorLedgers) {
+            if (ledger != null && !ledger.retired && ledger.accountingValid) {
+                ownerSeen = true;
+                if (ledger.queuedPackets > 0 && ledger.queuedPacketHandleDepth == 0) {
+                    return true;
+                }
+            }
+        }
+        if (!ownerSeen) {
+            return queuedPackets > 0 && queuedPacketHandleDepth == 0;
+        }
+        return false;
+    }
+
+    /**
      * Owner-aware transition check. During a conflict it is conservative: transition packets stay
      * on the PacketProcessor FIFO rather than being incorrectly inlined ahead of another owner.
      */
