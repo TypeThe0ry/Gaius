@@ -98,6 +98,18 @@ export async function startWorkerProfiler(cdp, outputPrefix, {
       if (result) return result;
       stopping = true;
       await Promise.all([...pending]);
+      for (const entry of entries) {
+        // Worker-side network pump and input counters live in the Worker's
+        // global scope; snapshot them so a stalled login can be attributed.
+        try {
+          const snapshot = await command(entry, 'Runtime.evaluate', {
+            expression: 'JSON.stringify({network:globalThis.__gaiusNetworkStats||null,'
+              + 'worldgen:globalThis.__gaiusWorldgenStats||null})',
+            returnByValue: true,
+          });
+          entry.globals = JSON.parse(snapshot.result.value);
+        } catch (error) { entry.globalsError = String(error.message || error); }
+      }
       for (const [index, entry] of entries.entries()) {
         if (!captureProfile || !entry.started) continue;
         try {
