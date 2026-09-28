@@ -2,6 +2,9 @@ package dev.gaius.browser;
 
 import com.mojang.authlib.GameProfile;
 import com.mojang.authlib.properties.Property;
+import com.mojang.authlib.properties.PropertyMap;
+import com.google.common.collect.ArrayListMultimap;
+import com.google.common.collect.Multimap;
 import org.teavm.jso.JSBody;
 
 /** Applies the public, short-lived textures property supplied by the browser shell. */
@@ -28,11 +31,28 @@ public final class BrowserSkinProfile {
             return profile;
         }
         String signature = descriptorSignature(profileUuid, profileName);
-        profile.properties().removeAll("textures");
-        profile.properties().put("textures", signature == null || signature.isBlank()
+        // GameProfile(UUID, String) uses PropertyMap.EMPTY in authlib 9.x.
+        // PropertyMap copies constructor input to an immutable multimap, so
+        // use a delegate override for the browser supplied texture.
+        MutablePropertyMap properties = new MutablePropertyMap();
+        properties.put("textures", signature == null || signature.isBlank()
                 ? new Property("textures", value)
                 : new Property("textures", value, signature));
-        return profile;
+        return new GameProfile(profile.id(), profile.name(), properties);
+    }
+
+    /** PropertyMap's constructor freezes its input; this override keeps the login map mutable. */
+    private static final class MutablePropertyMap extends PropertyMap {
+        private final Multimap<String, Property> mutable = ArrayListMultimap.create();
+
+        private MutablePropertyMap() {
+            super(ArrayListMultimap.create());
+        }
+
+        @Override
+        protected Multimap<String, Property> delegate() {
+            return mutable;
+        }
     }
 
     @JSBody(params = {"uuid", "username"}, script = """

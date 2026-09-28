@@ -219,10 +219,22 @@ assert.equal(offline.promptedInitialName, "PreviousPlayer");
 assert.equal(offline.rememberedName, "GaiusPlayer");
 assert.ok(offline.args.includes("--offlineDeveloperMode"));
 assert.equal(offline.args[offline.args.indexOf("--username") + 1], "GaiusPlayer");
+// Vanilla offline UUID: UUID.nameUUIDFromBytes("OfflinePlayer:GaiusPlayer").
 assert.equal(
   offline.args[offline.args.indexOf("--uuid") + 1],
-  "00000000000040008000000000000001",
+  "9ced09a81fbd32dc90098ded575e01e2",
 );
+
+// Sessions stored by older launchers carry the shared placeholder UUID, which
+// made LAN joiners collide with the host. It must be replaced by the name UUID.
+const legacyOffline = await runScenario({
+  stored: {username: "GaiusPlayer", uuid: "00000000000040008000000000000001"},
+});
+assert.equal(
+  legacyOffline.args[legacyOffline.args.indexOf("--uuid") + 1],
+  "9ced09a81fbd32dc90098ded575e01e2",
+);
+assert.equal(legacyOffline.stored.uuid, "9ced09a81fbd32dc90098ded575e01e2");
 
 const customSkin = await runScenario({
   enteredName: "SkinPlayer",
@@ -230,7 +242,7 @@ const customSkin = await runScenario({
 });
 assert.equal(customSkin.customSkin, "data:image/png;base64,iVBORw0KGgo=");
 assert.equal(customSkin.skinDescriptor.username, "SkinPlayer");
-assert.equal(customSkin.skinDescriptor.uuid, "00000000000040008000000000000001");
+assert.equal(customSkin.skinDescriptor.uuid, "1019b3f952e938e2a60f305b66bffab5");
 assert.equal(customSkin.skinDescriptor.signature, "");
 const customSkinPayload = JSON.parse(Buffer.from(
   customSkin.skinDescriptor.value, "base64").toString("utf8"));

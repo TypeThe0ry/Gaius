@@ -2023,6 +2023,57 @@
         return {ok: true, url: invite.url};
       };
 
+      const LEGACY_OFFLINE_GAIUS_UUID = "00000000000040008000000000000001";
+
+      function gaiusMd5(input) {
+        const shifts = [
+          7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+          5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+          4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+          6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
+        ];
+        const table = new Uint32Array(64);
+        for (let i = 0; i < 64; i++) table[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 4294967296);
+        const length = input.length;
+        const padded = new Uint8Array((((length + 8) >>> 6) + 1) * 64);
+        padded.set(input);
+        padded[length] = 0x80;
+        const view = new DataView(padded.buffer);
+        view.setUint32(padded.length - 8, (length * 8) >>> 0, true);
+        view.setUint32(padded.length - 4, Math.floor(length / 536870912), true);
+        let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+        for (let offset = 0; offset < padded.length; offset += 64) {
+          let a = a0, b = b0, c = c0, d = d0;
+          for (let i = 0; i < 64; i++) {
+            let f, g;
+            if (i < 16) { f = (b & c) | (~b & d); g = i; }
+            else if (i < 32) { f = (d & b) | (~d & c); g = (5 * i + 1) % 16; }
+            else if (i < 48) { f = b ^ c ^ d; g = (3 * i + 5) % 16; }
+            else { f = c ^ (b | ~d); g = (7 * i) % 16; }
+            const sum = (a + f + table[i] + view.getUint32(offset + g * 4, true)) | 0;
+            a = d; d = c; c = b;
+            b = (b + ((sum << shifts[i]) | (sum >>> (32 - shifts[i])))) | 0;
+          }
+          a0 = (a0 + a) | 0; b0 = (b0 + b) | 0; c0 = (c0 + c) | 0; d0 = (d0 + d) | 0;
+        }
+        const out = new Uint8Array(16);
+        const outView = new DataView(out.buffer);
+        [a0, b0, c0, d0].forEach((word, index) => outView.setUint32(index * 4, word >>> 0, true));
+        return out;
+      }
+
+      // Same as Java's UUID.nameUUIDFromBytes("OfflinePlayer:" + name). Player
+      // names are validated as ASCII [A-Za-z0-9_] before this runs.
+      function offlineGaiusPlayerUuid(name) {
+        const text = "OfflinePlayer:" + name;
+        const bytes = new Uint8Array(text.length);
+        for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i) & 0xff;
+        const digest = gaiusMd5(bytes);
+        digest[6] = (digest[6] & 0x0f) | 0x30;
+        digest[8] = (digest[8] & 0x3f) | 0x80;
+        return Array.from(digest, byte => byte.toString(16).padStart(2, "0")).join("");
+      }
+
       async function buildGaiusSessionArgs() {
       let stored = {};
       try {
@@ -2047,7 +2098,7 @@
       const accessToken = String(session.accessToken || "").trim();
       const online = accessToken.length > 0 && accessToken !== "0";
       let username = String(session.username || "").trim();
-      let uuid = String(session.uuid || (online ? "" : "00000000000040008000000000000001"))
+      let uuid = String(session.uuid || "")
         .replace(/-/g, "")
         .toLowerCase();
       if (username && !/^[A-Za-z0-9_]{1,16}$/.test(username)) {
@@ -2093,11 +2144,23 @@
         session.uuid = uuid;
         sessionStorage.setItem("gaius.session", JSON.stringify(session));
       }
-      const customSkinDescriptor = customGaiusSkinDescriptor(uuid, username);
-      window.__gaiusSkinDescriptor = customSkinDescriptor || session.skinDescriptor || null;
       if (!/^[A-Za-z0-9_]{1,16}$/.test(username)) {
         throw new Error("Player name must use 1-16 letters, numbers, or underscores");
       }
+      // Offline players get the vanilla name-derived UUID. The old shared
+      // placeholder made every LAN joiner collide with the host, which kicked
+      // the host ("logged in from another location") and stopped the world.
+      if (!online && (!uuid || uuid === LEGACY_OFFLINE_GAIUS_UUID)) {
+        uuid = offlineGaiusPlayerUuid(username);
+        session.uuid = uuid;
+        try {
+          sessionStorage.setItem("gaius.session", JSON.stringify(session));
+        } catch (error) {
+          console.warn("Could not store the offline Gaius player UUID", error);
+        }
+      }
+      const customSkinDescriptor = customGaiusSkinDescriptor(uuid, username);
+      window.__gaiusSkinDescriptor = customSkinDescriptor || session.skinDescriptor || null;
       if (!/^[0-9a-f]{32}$/.test(uuid)) {
         throw new Error("Online session UUID must contain 32 hexadecimal digits");
       }

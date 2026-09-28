@@ -567,6 +567,53 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             """)
     private static native String localSessionHost();
 
+    /** Forces one additional server channel through the relay instead of the startup MessagePort. */
+    @JSBody(params = "sessionId", script = """
+            const key = String(sessionId || '').trim();
+            if (!/^[a-f0-9]{32}$/.test(key)) return;
+            let sessions = globalThis.__gaiusRelayOnlySessions;
+            if (!sessions) {
+              sessions = new Set();
+              globalThis.__gaiusRelayOnlySessions = sessions;
+            }
+            if (typeof sessions.add === 'function') sessions.add(key);
+            else sessions[key] = true;
+            // Bootstrap.connect() schedules the actual channel open. Keep the
+            // marker alive until state.open() consumes it, but never retain a
+            // failed request forever.
+            let timers = globalThis.__gaiusRelayOnlySessionTimers;
+            if (!timers) {
+              timers = Object.create(null);
+              globalThis.__gaiusRelayOnlySessionTimers = timers;
+            }
+            if (timers[key]) clearTimeout(timers[key]);
+            timers[key] = setTimeout(function() {
+              const current = globalThis.__gaiusRelayOnlySessions;
+              if (current) {
+                if (typeof current.delete === 'function') current.delete(key);
+                else delete current[key];
+              }
+              const activeTimers = globalThis.__gaiusRelayOnlySessionTimers;
+              if (activeTimers) delete activeTimers[key];
+            }, 30000);
+            """)
+    public static native void beginRelayOnlySession(String sessionId);
+
+    /** Clears the one-shot relay-only marker after the additional channel is opened. */
+    @JSBody(params = "sessionId", script = """
+            const key = String(sessionId || '').trim();
+            const sessions = globalThis.__gaiusRelayOnlySessions;
+            if (!sessions || !key) return;
+            if (typeof sessions.delete === 'function') sessions.delete(key);
+            else delete sessions[key];
+            const timers = globalThis.__gaiusRelayOnlySessionTimers;
+            if (timers && timers[key]) {
+              clearTimeout(timers[key]);
+              delete timers[key];
+            }
+            """)
+    public static native void endRelayOnlySession(String sessionId);
+
     /**
      * Minecraft's browser-side address parsing can retain the typed port in an unresolved
      * InetSocketAddress host string. RelayNode receives the port separately, so remove only a
@@ -1499,11 +1546,21 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               clearTimeout(timeout);
             });
             }
+            function localTunnelRole(host) {
+            const match = /^(client|server|lan-server)-([a-f0-9]{32})\\.gaius-local$/.exec(host);
+            return match ? match[1] : null;
+            }
             function appendRelayCandidates(entry, candidates) {
             const added = [];
             for (let index = 0; index < candidates.length; index++) {
               const candidate = candidates[index];
               if (!candidate || entry.candidateUrls.has(candidate.url)) continue;
+              // This helper lives in a different @JSBody lexical scope in
+              // TeaVM output. Keep the LAN role check local to this callback
+              // so relay candidate preparation cannot throw ReferenceError.
+              if (/^lan-server-[a-f0-9]{32}\\.gaius-local$/.test(String(entry.host || ''))) {
+                candidate.localLan = true;
+              }
               entry.candidateUrls.add(candidate.url);
               entry.candidates.push(candidate);
               added.push(candidate);
@@ -1597,6 +1654,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             globalThis.__gaiusNettyBridgeBootstrapState = state;
             globalThis.__gaiusNettyBridgeBootstrapScope = {
               recordConnectPhase: recordConnectPhase,
+              localTunnelRole: localTunnelRole,
               authorityHost: authorityHost,
               normalizedTargetKey: normalizedTargetKey,
               pruneDiscoveryCache: pruneDiscoveryCache,
@@ -1690,6 +1748,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             if (!state || !scope) return;
             const {
               recordConnectPhase,
+              localTunnelRole,
               normalizedTargetKey,
               localTargetRelayAffinity,
               acquireTargetRelayLease,
@@ -1764,6 +1823,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             }
             function relayTunnelConnectTimeout(candidate) {
             const configured = Number(candidate && candidate.targetConnectTimeoutMs);
+            if (candidate && candidate.localLan) return 65000;
             const perTarget = Number.isFinite(configured)
               ? Math.max(100, Math.min(60000, configured))
               : 10000;
@@ -1775,15 +1835,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             return Math.max(1000, Math.min(61000, configured + 1000));
             }
             function localSession(host) {
-            const match = /^(?:client|server)-([a-f0-9]{32})\\.gaius-local$/.exec(host);
-            return match ? match[1] : null;
-            }
-            function localTunnelRole(host) {
-            const match = /^(client|server)-([a-f0-9]{32})\\.gaius-local$/.exec(host);
+            const match = /^(?:client|server|lan-server)-([a-f0-9]{32})\\.gaius-local$/.exec(host);
             return match ? match[1] : null;
             }
             function localSkinDescriptor(role) {
-            const descriptor = role === 'server'
+            const descriptor = (role === 'server' || role === 'lan-server')
               ? globalThis.__gaiusLanSkinDescriptor
               : globalThis.__gaiusSkinDescriptor;
             if (!descriptor || typeof descriptor !== 'object') return null;
@@ -2417,8 +2473,9 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                 armCandidateTimeout(relayTunnelConnectTimeout(candidate));
               }
               const control = {type: 'connect', host: entry.host, port: entry.port};
-              if (localTunnelRole(entry.host) === 'client') {
-                const skin = localSkinDescriptor(localTunnelRole(entry.host));
+              const tunnelRole = localTunnelRole(entry.host);
+              if (tunnelRole) {
+                const skin = localSkinDescriptor(tunnelRole);
                 if (skin) control.skinDescriptor = skin;
               }
               const token = bridgeToken(candidate);
@@ -2461,7 +2518,8 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
                   }
                   if (message && message.type === 'skin' &&
                       (localTunnelRole(entry.host) === 'server' ||
-                       localTunnelRole(entry.host) === 'client')) {
+                       localTunnelRole(entry.host) === 'client' ||
+                       localTunnelRole(entry.host) === 'lan-server')) {
                     acceptRemoteSkinDescriptor(message.skinDescriptor);
                     return;
                   }
@@ -2727,7 +2785,31 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             // browser must continue through the relay instead of waiting for
             // a port that can only exist in the host page.
             const localGeneration = sessionId === null ? '' : localWorkerGeneration(sessionId);
-            const localOwner = sessionId !== null && ownsLocalWorkerSession(sessionId);
+            const relayOnlySessions = globalThis.__gaiusRelayOnlySessions;
+            const relayOnly = (localTunnelRole(entry.host) === 'server' ||
+              localTunnelRole(entry.host) === 'lan-server') &&
+              sessionId !== null && relayOnlySessions &&
+              ((typeof relayOnlySessions.has === 'function' &&
+                relayOnlySessions.has(sessionId)) ||
+               relayOnlySessions[sessionId] === true);
+            if (relayOnly && relayOnlySessions) {
+              if (typeof relayOnlySessions.delete === 'function') {
+                relayOnlySessions.delete(sessionId);
+              } else {
+                delete relayOnlySessions[sessionId];
+              }
+              const timers = globalThis.__gaiusRelayOnlySessionTimers;
+              if (timers && timers[sessionId]) {
+                clearTimeout(timers[sessionId]);
+                delete timers[sessionId];
+              }
+            }
+            const localRole = localTunnelRole(entry.host);
+            // The startup server-<session> channel is the worker's local
+            // MessagePort and must remain local. Only the explicit
+            // lan-server-<session> channel used by Open to LAN is relay-backed.
+            const localOwner = sessionId !== null && localRole !== 'lan-server' && !relayOnly &&
+              ownsLocalWorkerSession(sessionId);
             if (localOwner) {
               claimLocalPort(
                 entry,
@@ -2738,7 +2820,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               return;
             }
             recordConnectPhase(entry, 'open');
-            const directUrl = directPluginUrl(entry.host);
+            const directUrl = relayOnly ? null : directPluginUrl(entry.host);
             if (directUrl) {
               entry.candidates.push({url: directUrl, direct: true});
               entry.candidateUrls.add(directUrl);

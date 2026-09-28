@@ -7,12 +7,12 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.lang.reflect.Method;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 import net.minecraft.server.Main;
+import net.minecraft.server.network.ServerConnectionListener;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.TickTask;
 import net.minecraft.server.players.PlayerList;
@@ -340,27 +340,37 @@ public final class BrowserIntegratedServerMain {
 
     /**
      * Opens an additional independent server-side channel for an Open to LAN
-     * invite. The method is deliberately reflective because the corresponding
-     * static entry point is injected into Minecraft's ServerConnectionListener
-     * by MinecraftClientPatcher after the Mojang classes are remapped.
+     * invite. The corresponding static entry point is injected into
+     * Minecraft's ServerConnectionListener by MinecraftClientPatcher after the
+     * Mojang classes are remapped. It is called directly so TeaVM keeps the
+     * entry point reachable; the injected Bootstrap bridge avoids the generic
+     * Netty method that TeaVM cannot resolve.
      */
     @JSExport
     public static boolean openLanServerConnection(String sessionId) {
         if (!isWorkerRuntime() || !isSafeSessionId(sessionId)) {
             return false;
         }
-        String host = "server-" + sessionId + ".gaius-local";
+        // Keep the LAN side separate from the startup MessagePort endpoint.
+        // The startup channel uses server-<session>.gaius-local and must remain
+        // local; this additional channel is intentionally relay-backed.
+        String host = "lan-server-" + sessionId + ".gaius-local";
+        BrowserWebSocketChannel.beginRelayOnlySession(sessionId);
+        reportRuntimeEvent("lan-server-open-attempt", host);
+        // The injected Bootstrap now returns its Channel immediately instead
+        // of waiting for the browser WebSocket handshake. Invoke it directly
+        // while the relay-only marker is still active so the channel is
+        // created on the same server callback that accepted Open to LAN.
         try {
-            Class<?> listener = Class.forName(
-                    "net.minecraft.server.network.ServerConnectionListener");
-            Method opener = listener.getMethod(
-                    "openAdditionalBrowserConnection", String.class);
-            opener.invoke(null, host);
-            return true;
-        } catch (ReflectiveOperationException | RuntimeException failure) {
-            report("lan-server-connection-failed", host + ":" + failure.getClass().getSimpleName());
+            ServerConnectionListener.openAdditionalBrowserConnection(host);
+            reportRuntimeEvent("lan-server-open-returned", host);
+        } catch (RuntimeException | Error failure) {
+            BrowserWebSocketChannel.endRelayOnlySession(sessionId);
+            report("lan-server-connection-failed",
+                    host + ":" + failure.getClass().getSimpleName());
             return false;
         }
+        return true;
     }
 
 

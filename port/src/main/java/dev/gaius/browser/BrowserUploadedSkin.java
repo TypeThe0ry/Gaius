@@ -1,5 +1,8 @@
 package dev.gaius.browser;
 
+import com.mojang.authlib.SignatureState;
+import com.mojang.authlib.minecraft.MinecraftProfileTexture;
+import com.mojang.authlib.minecraft.MinecraftProfileTextures;
 import com.mojang.blaze3d.platform.NativeImage;
 import java.io.IOException;
 import java.util.Base64;
@@ -13,6 +16,22 @@ public final class BrowserUploadedSkin {
 
     public static boolean isUploadedSkin(String url) {
         return url != null && url.startsWith(PREFIX) && url.length() <= 16_384;
+    }
+
+    /**
+     * Signature state SkinManager uses to mark a skin as secure. Remote players
+     * only render secure skins, and uploaded skins can never carry a Mojang
+     * signature, so without this every other player saw a default skin. Only a
+     * lone uploaded data:image/png skin (no cape or elytra) is treated as
+     * trusted; every other texture set keeps its real signature state.
+     */
+    public static SignatureState skinSignatureState(MinecraftProfileTextures textures) {
+        MinecraftProfileTexture skin = textures.skin();
+        if (skin != null && textures.cape() == null && textures.elytra() == null
+                && isUploadedSkin(skin.getUrl())) {
+            return SignatureState.SIGNED;
+        }
+        return textures.signatureState();
     }
 
     public static NativeImage readUploadedSkin(String url) throws IOException {

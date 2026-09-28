@@ -62,7 +62,7 @@ export function parseConnectRequest(text) {
         throw new TypeError("Connect host is not a valid IP address or DNS name");
     }
     if (skinDescriptor !== undefined &&
-        !/^(?:client|server)-[0-9a-f]{32}\.gaius-local$/u.test(host)) {
+        !/^(?:client|server|lan-server)-[0-9a-f]{32}\.gaius-local$/u.test(host)) {
         throw new TypeError("Skin descriptor is only valid for a LAN tunnel");
     }
     return {
