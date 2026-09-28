@@ -22,10 +22,36 @@ export async function startWorkerProfiler(cdp, outputPrefix, {
   cdp.on('Target.attachedToTarget', ({sessionId, targetInfo}) => {
     if (stopping || targetInfo.type !== 'worker') return;
     const entry = {sessionId, targetId: targetInfo.targetId, url: targetInfo.url,
-      started: false, saved: false};
+      started: false, saved: false, console: [], exceptions: []};
+    // Worker failures do not bubble through the page Runtime domain. Keep a
+    // bounded copy of the worker's console and exception events alongside the
+    // optional CPU profile so a singleplayer disconnect can be attributed to
+    // bootstrap, login, or transport code instead of being reported as a
+    // generic timeout.
+    cdp.on('Runtime.consoleAPICalled', (event, eventSessionId) => {
+      if (eventSessionId !== entry.sessionId) return;
+      if (entry.console.length >= 256) entry.console.shift();
+      entry.console.push({
+        type: event.type || 'log',
+        text: (event.args || []).map((arg) =>
+          arg.value ?? arg.description ?? '').join(' '),
+      });
+    });
+    cdp.on('Runtime.exceptionThrown', (event, eventSessionId) => {
+      if (eventSessionId !== entry.sessionId) return;
+      if (entry.exceptions.length >= 64) entry.exceptions.shift();
+      const details = event.exceptionDetails || {};
+      entry.exceptions.push({
+        text: details.text || 'exception',
+        description: details.exception?.description || null,
+        lineNumber: details.lineNumber ?? null,
+        columnNumber: details.columnNumber ?? null,
+      });
+    });
     entries.push(entry);
     const job = (async () => {
       try {
+        await command(entry, 'Runtime.enable');
         if (configureRuntime) {
           const declarations = configuredKeys.map(key => {
             const value = JSON.stringify(runtimeConfig[key]);

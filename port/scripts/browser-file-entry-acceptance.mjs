@@ -114,7 +114,7 @@ class Cdp {
       return;
     }
     for (const listener of this.listeners.get(message.method)||[]) {
-      try { listener(message.params||{}); }
+      try { listener(message.params||{}, message.sessionId || undefined); }
       catch (error) { queueMicrotask(()=>{ throw error; }); }
     }
   }
@@ -907,8 +907,9 @@ let cdp; let workerProfiler=null; let report=null; let artifactIdentity=null; le
 try {
   artifactIdentity=await fileIdentity(artifact);
   await waitJson(`http://127.0.0.1:${port}/json/version`,15000); const targets=await waitJson(`http://127.0.0.1:${port}/json/list`,15000); const page=targets.find(x=>x.type==="page"); if(!page?.webSocketDebuggerUrl)throw new Error("no page target"); cdp=new Cdp(page.webSocketDebuggerUrl); await cdp.open();
-  cdp.on("Runtime.consoleAPICalled",e=>consoleMessages.push({type:e.type,text:(e.args||[]).map(a=>a.value??a.description??"").join(" ")})); cdp.on("Runtime.exceptionThrown",e=>exceptions.push(e.exceptionDetails?.exception?.description||e.exceptionDetails?.text||"exception")); const requestUrls=new Map(); cdp.on("Network.requestWillBeSent",e=>requestUrls.set(e.requestId,e.request?.url||"")); cdp.on("Network.loadingFailed",e=>failedResources.push({requestId:e.requestId,url:e.url||requestUrls.get(e.requestId)||"",errorText:e.errorText,canceled:e.canceled})); await Promise.all([cdp.send("Page.enable"),cdp.send("Runtime.enable"),cdp.send("Network.enable"),cdp.send("Performance.enable")]);
-  if (process.env.GAIUS_FILE_WORKER_PROFILE === "1" || workerRuntimeConfigRequested) {
+  cdp.on("Runtime.consoleAPICalled",(e,sessionId)=>{if(!sessionId) consoleMessages.push({type:e.type,text:(e.args||[]).map(a=>a.value??a.description??"").join(" ")});}); cdp.on("Runtime.exceptionThrown",(e,sessionId)=>{if(!sessionId) exceptions.push(e.exceptionDetails?.exception?.description||e.exceptionDetails?.text||"exception");}); const requestUrls=new Map(); cdp.on("Network.requestWillBeSent",e=>requestUrls.set(e.requestId,e.request?.url||"")); cdp.on("Network.loadingFailed",e=>failedResources.push({requestId:e.requestId,url:e.url||requestUrls.get(e.requestId)||"",errorText:e.errorText,canceled:e.canceled})); await Promise.all([cdp.send("Page.enable"),cdp.send("Runtime.enable"),cdp.send("Network.enable"),cdp.send("Performance.enable")]);
+  if (process.env.GAIUS_FILE_WORKER_PROFILE === "1" ||
+      process.env.GAIUS_FILE_WORKER_LOG === "1" || workerRuntimeConfigRequested) {
     workerProfiler = await startWorkerProfiler(cdp, output, {
       captureProfile: process.env.GAIUS_FILE_WORKER_PROFILE === "1",
       runtimeConfig: workerRuntimeConfig,
