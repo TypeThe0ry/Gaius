@@ -1211,8 +1211,10 @@ public final class BrowserWorldgenScheduler {
             double activeWorkMillis);
 
     private static boolean hasPendingNetworkInput() {
+        // The finish-configuration handler waits on this very generation; yielding to it as
+        // "pending input" only delays the chunks it needs.
         return BrowserWebSocketChannel.hasPendingInput()
-                || BrowserPacketScheduler.hasPendingPackets();
+                || BrowserPacketScheduler.hasActionablePendingPackets();
     }
 
     @JSBody(script = """

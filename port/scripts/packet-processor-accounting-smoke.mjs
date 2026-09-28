@@ -224,4 +224,26 @@ assert.match(closeBytecode,
   /BrowserPacketScheduler\.reset[\s\S]{0,160}?\(Ljava\/lang\/Object;\)V/,
   "close reset does not carry the PacketProcessor owner");
 
+// A packet stays counted until its handler returns, and processQueuedPackets returns
+// immediately while that owner's handler runs. Input scheduling must therefore only count
+// owners that can start a packet now; otherwise a finish-configuration handler waiting for
+// spawn chunks made the integrated server spin its input task and never enter PLAY.
+const actionableStart = scheduler.indexOf("public static boolean hasActionablePendingPackets()");
+const actionableEnd = scheduler.indexOf("\n    }\n", actionableStart);
+assert.ok(actionableStart >= 0 && actionableEnd > actionableStart,
+  "hasActionablePendingPackets is missing");
+const actionable = scheduler.slice(actionableStart, actionableEnd);
+assert.match(actionable, /ledger\.queuedPackets > 0 && ledger\.queuedPacketHandleDepth == 0/u,
+  "an owner with a running handler must not count as actionable input");
+const server = await readFile(new URL(
+  "../src/main/java/dev/gaius/browser/BrowserIntegratedServerMain.java",
+  import.meta.url,
+), "utf8");
+const pendingStart = server.indexOf("private static boolean hasPendingNetworkInput()");
+const pendingBody = server.slice(pendingStart, server.indexOf("\n    }\n", pendingStart));
+assert.match(pendingBody, /BrowserPacketScheduler\.hasActionablePendingPackets\(\)/u,
+  "integrated server input scheduling must use actionable packets");
+assert.doesNotMatch(server, /BrowserPacketScheduler\.hasPendingPackets\(\)/u,
+  "integrated server must not treat a running handler as pending input");
+
 console.log("PacketProcessor decoded-packet accounting smoke passed");

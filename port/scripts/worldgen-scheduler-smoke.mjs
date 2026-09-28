@@ -156,8 +156,12 @@ assert.ok(worldgen.includes("adaptiveBudgetMillis("),
   "worldgen slices do not use an adaptive budget");
 assert.ok(worldgen.includes("BrowserWebSocketChannel.hasPendingInput()"),
   "worldgen does not observe transport input");
-assert.ok(worldgen.includes("BrowserPacketScheduler.hasPendingPackets()"),
+// Only packets the PacketProcessor can start count; a handler that is still running (e.g.
+// finish-configuration waiting for spawn chunks) must not make worldgen yield to itself.
+assert.ok(worldgen.includes("BrowserPacketScheduler.hasActionablePendingPackets()"),
   "worldgen does not observe already-decoded packets");
+assert.ok(!worldgen.includes("BrowserPacketScheduler.hasPendingPackets()"),
+  "worldgen must not count an in-progress packet handler as pending input");
 assert.ok(worldgen.includes("decodedPacketQueue") && worldgen.includes("inboundQueuedBytes"),
   "adaptive pressure does not include transport and decoded queue depth");
 assert.ok(worldgen.includes("if (isWorkerRuntime() && networkPreemptionPending)")
@@ -1946,7 +1950,7 @@ ${mobPulse.replace("public static void mobAiPulse()", "static void mobAiPulse()"
     ["dev/gaius/browser/BrowserPacketScheduler.java", `
 package dev.gaius.browser;
 final class BrowserPacketScheduler {
-    static boolean hasPendingPackets() { return SchedulerHarnessRuntime.pendingPackets; }
+    static boolean hasActionablePendingPackets() { return SchedulerHarnessRuntime.pendingPackets; }
 }
 `],
     ["dev/gaius/browser/BrowserIntegratedServerMain.java", `

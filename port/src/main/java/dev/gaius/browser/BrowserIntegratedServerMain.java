@@ -464,7 +464,7 @@ public final class BrowserIntegratedServerMain {
             return;
         }
         if (BrowserWebSocketChannel.hasPendingInput()
-                || BrowserPacketScheduler.hasPendingPackets()) {
+                || BrowserPacketScheduler.hasActionablePendingPackets()) {
             pumpUrgentPackets();
         }
     }
@@ -861,8 +861,10 @@ public final class BrowserIntegratedServerMain {
     }
 
     private static boolean hasPendingNetworkInput() {
+        // A packet whose handler is still running cannot be advanced by another pump pass;
+        // counting it here re-ran this task in a tight loop while that handler waited.
         return BrowserWebSocketChannel.hasPendingInput()
-                || BrowserPacketScheduler.hasPendingPackets();
+                || BrowserPacketScheduler.hasActionablePendingPackets();
     }
 
     /** The helper coroutine only wakes the server thread; Netty decoding stays on that thread. */
