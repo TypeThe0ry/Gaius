@@ -30,7 +30,8 @@ black.
 
 ## Terrain holes and black chunks
 
-Three ways a terrain section could permanently lose its rebuild are fixed:
+Three ways a terrain section could permanently lose its rebuild, and one
+source of heavy duplicate drawing, are fixed:
 
 - **Inventory screens.** While an inventory, chest or crafting screen is open
   the browser skips drawing the world, but the client kept taking section
@@ -45,6 +46,14 @@ Three ways a terrain section could permanently lose its rebuild are fixed:
   (for example unlit) geometry. Only the newest rebuild of a section is
   installed now, and meshes built for a section's previous position are
   dropped.
+
+- **Duplicate draws while standing still.** A browser patch refreshed the list
+  of visible terrain sections after each occlusion update by appending to it
+  without clearing it first. While the camera did not turn (standing still,
+  inventory open, looking at the view) every update added all visible sections
+  again, so the list grew to tens of thousands of duplicates and each frame
+  drew the same terrain many times over. That slowed frames and chunk loading
+  sharply. The list is now replaced on each refresh.
 
 The client also audits the visible sections once per second and re-queues any
 section whose chunk is ready but which stayed unbuilt while the pipeline was

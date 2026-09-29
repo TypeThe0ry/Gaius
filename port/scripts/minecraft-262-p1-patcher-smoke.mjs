@@ -1367,6 +1367,13 @@ try {
   assert.equal(occurrences(method(patchedLevelRenderer, "private void compileSections(",
     "private void checkPoseStack("), "java/util/List.clear"), 1,
   "LevelRenderer.compileSections does not mark extracted updates consumed");
+  // The late visible-section refresh must replace the lists, not append duplicates.
+  const patchedRender = method(patchedLevelRenderer,
+    "public void render(com.mojang.blaze3d.resource.GraphicsResourceAllocator", "\n  p");
+  const clearVisibleAt = patchedRender.lastIndexOf("clearVisibleSections:()V");
+  const addVisibleAt = patchedRender.lastIndexOf("SectionOcclusionGraph.addSectionsInFrustum");
+  assert.ok(addVisibleAt >= 0 && clearVisibleAt >= 0 && clearVisibleAt < addVisibleAt,
+    "LevelRenderer.render visible-section refresh does not clear the lists before refilling");
   const javapClass = name => execFileSync(javap, ["-classpath", clientJar, "-p", "-c", name], {
     encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
   });
