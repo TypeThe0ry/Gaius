@@ -424,6 +424,12 @@ function snapshotWorldgenTelemetry(value) {
       typeof value.chunkSender === "object") {
     snapshot.chunkSender = snapshotChunkSenderTelemetry(value.chunkSender);
   }
+  // Worldgen dispatcher turn/hop counters are nested so they never displace the
+  // flat slice fields from the capped scalar snapshot above.
+  if (value && typeof value === "object" && value.dispatcher &&
+      typeof value.dispatcher === "object") {
+    snapshot.dispatcher = snapshotScalarTelemetry(value.dispatcher);
+  }
   return snapshot;
 }
 
