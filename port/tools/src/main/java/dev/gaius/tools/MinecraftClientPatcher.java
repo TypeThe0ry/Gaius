@@ -6421,6 +6421,47 @@ public final class MinecraftClientPatcher {
                         "Current compileSections must not drop an extracted dirty section");
             }
         }
+
+        // Mark the extracted updates consumed once every one has become a compile task.
+        // LevelExtractor re-dirties whatever is still listed at the next extraction (a frame
+        // whose world render was skipped or threw before reaching this loop).
+        int consumed = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (!(instruction instanceof LdcInsnNode constant)
+                    || !"scheduleTranslucentResort".equals(constant.cst)) {
+                continue;
+            }
+            AbstractInsnNode profilerLoad = previousOpcode(constant);
+            if (!(profilerLoad instanceof VarInsnNode load) || load.getOpcode() != Opcodes.ALOAD) {
+                throw new IllegalStateException(
+                        "Current compileSections resort profiler load shape changed");
+            }
+            InsnList clear = new InsnList();
+            clear.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            clear.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    "net/minecraft/client/renderer/LevelRenderer",
+                    "levelRenderState",
+                    "Lnet/minecraft/client/renderer/state/level/LevelRenderState;"));
+            clear.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    "net/minecraft/client/renderer/state/level/LevelRenderState",
+                    "sectionUpdateRenderStates",
+                    "Ljava/util/List;"));
+            clear.add(new MethodInsnNode(
+                    Opcodes.INVOKEINTERFACE,
+                    "java/util/List",
+                    "clear",
+                    "()V",
+                    true));
+            method.instructions.insertBefore(load, clear);
+            consumed++;
+        }
+        if (consumed != 1) {
+            throw new IllegalStateException(
+                    "Current compileSections update consumption point changed: " + consumed);
+        }
+        method.maxStack = Math.max(method.maxStack, 2);
         System.out.println("Patched current section compiles to remain asynchronous");
     }
 
@@ -6540,6 +6581,30 @@ public final class MinecraftClientPatcher {
         if (!trackerField) {
             throw new IllegalStateException("LevelExtractor section update tracker field changed");
         }
+        // Before LevelRenderState.reset() drops them, put updates that the previous frame
+        // extracted but never compiled back into the dirty set (see LevelRenderer.compileSections).
+        InsnList requeue = new InsnList();
+        requeue.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        requeue.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                node.name,
+                "levelRenderState",
+                "Lnet/minecraft/client/renderer/state/level/LevelRenderState;"));
+        requeue.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        requeue.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                node.name,
+                "sectionUpdateTracker",
+                "Lnet/minecraft/client/SectionUpdateTracker;"));
+        requeue.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserSectionAudit",
+                "requeueUnconsumed",
+                "(Lnet/minecraft/client/renderer/state/level/LevelRenderState;"
+                        + "Lnet/minecraft/client/SectionUpdateTracker;)V",
+                false));
+        extract.instructions.insert(requeue);
+        extract.maxStack = Math.max(extract.maxStack, 2);
         int audits = 0;
         for (AbstractInsnNode instruction : extract.instructions.toArray()) {
             if (instruction.getOpcode() != Opcodes.RETURN) {

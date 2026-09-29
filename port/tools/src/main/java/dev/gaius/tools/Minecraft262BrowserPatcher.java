@@ -2571,9 +2571,13 @@ public final class Minecraft262BrowserPatcher {
                             + "Lnet/minecraft/client/renderer/chunk/"
                             + "SectionRenderDispatcher$RenderSection$SectionTask$"
                             + "SectionTaskResult;");
-            int expectedResultLocal = task.equals("CompileTask") ? 12 : 9;
+            boolean compile = task.equals("CompileTask");
+            int expectedResultLocal = compile ? 12 : 9;
             int patched = replaceRenderThreadRetryWithYield(method, expectedResultLocal);
-            int cancelled = replaceSpinWaitWithBoundedCancellation(method, owner);
+            int cancelled = replaceSpinWaitWithBoundedCancellation(method, owner, compile);
+            if (compile) {
+                recordLatestSectionMesh(method, owner);
+            }
             int cleared = clearUploadRetryOnReturns(method);
             addUploadRetryExceptionCleanup(method);
             requireOne(owner + " upload retry yield", patched);
@@ -2623,7 +2627,7 @@ public final class Minecraft262BrowserPatcher {
     }
 
     private static int replaceSpinWaitWithBoundedCancellation(
-            MethodNode method, String owner) {
+            MethodNode method, String owner, boolean requeueSection) {
         int replaced = 0;
         for (AbstractInsnNode instruction = method.instructions.getFirst(); instruction != null;) {
             AbstractInsnNode next = instruction.getNext();
@@ -2633,6 +2637,36 @@ public final class Minecraft262BrowserPatcher {
                     && call.name.equals("onSpinWait")
                     && call.desc.equals("()V")) {
                 InsnList cancel = new InsnList();
+                if (requeueSection) {
+                    // A compile that never got upload space would otherwise leave its section
+                    // without a mesh update: its dirty flag was cleared when it was extracted.
+                    cancel.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                    cancel.add(new FieldInsnNode(
+                            Opcodes.GETFIELD,
+                            owner,
+                            "this$1",
+                            "Lnet/minecraft/client/renderer/chunk/"
+                                    + "SectionRenderDispatcher$RenderSection;"));
+                    cancel.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                    cancel.add(new FieldInsnNode(
+                            Opcodes.GETFIELD,
+                            owner,
+                            "isCancelled",
+                            "Ljava/util/concurrent/atomic/AtomicBoolean;"));
+                    cancel.add(new MethodInsnNode(
+                            Opcodes.INVOKEVIRTUAL,
+                            "java/util/concurrent/atomic/AtomicBoolean",
+                            "get",
+                            "()Z",
+                            false));
+                    cancel.add(new MethodInsnNode(
+                            Opcodes.INVOKESTATIC,
+                            "dev/gaius/browser/BrowserSectionAudit",
+                            "requeueAfterUploadTimeout",
+                            "(Lnet/minecraft/client/renderer/chunk/"
+                                    + "SectionRenderDispatcher$RenderSection;Z)V",
+                            false));
+                }
                 cancel.add(new VarInsnNode(Opcodes.ALOAD, 0));
                 cancel.add(new MethodInsnNode(
                         Opcodes.INVOKEVIRTUAL,
@@ -2647,6 +2681,35 @@ public final class Minecraft262BrowserPatcher {
             instruction = next;
         }
         return replaced;
+    }
+
+    /** Stamps each new compile result as its section's latest mesh (see addLatestSectionMeshGuard). */
+    private static void recordLatestSectionMesh(MethodNode method, String owner) {
+        String section = "net/minecraft/client/renderer/chunk/SectionRenderDispatcher$RenderSection";
+        int recorded = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode constructor)
+                    || constructor.getOpcode() != Opcodes.INVOKESPECIAL
+                    || !constructor.owner.equals(
+                            "net/minecraft/client/renderer/chunk/CompiledSectionMesh")
+                    || !constructor.name.equals("<init>")) {
+                continue;
+            }
+            if (!(nextOpcode(constructor) instanceof VarInsnNode store)
+                    || store.getOpcode() != Opcodes.ASTORE) {
+                throw new IllegalStateException("CompileTask mesh local store shape changed");
+            }
+            InsnList latest = new InsnList();
+            latest.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            latest.add(new FieldInsnNode(
+                    Opcodes.GETFIELD, owner, "this$1", "L" + section + ";"));
+            latest.add(new VarInsnNode(Opcodes.ALOAD, store.var));
+            latest.add(new FieldInsnNode(
+                    Opcodes.PUTFIELD, section, LATEST_MESH_FIELD, "Ljava/lang/Object;"));
+            method.instructions.insert(store, latest);
+            recorded++;
+        }
+        requireOne(owner + " latest section mesh record", recorded);
     }
 
     private static int clearUploadRetryOnReturns(MethodNode method) {
@@ -2724,8 +2787,95 @@ public final class Minecraft262BrowserPatcher {
             patched++;
         }
         requireOne("RenderSection staging-capacity emergency upload", patched);
-        write(node, root.resolve(owner + ".class"));
+        addLatestSectionMeshGuard(node, owner);
+        writeComputeFrames(node, root.resolve(owner + ".class"));
         System.out.println("Guarded current section staging retries with one progress upload");
+    }
+
+    static final String LATEST_MESH_FIELD = "gaius$latestMesh";
+
+    /**
+     * Only the newest compile of a section may install its mesh.
+     *
+     * <p>The browser uploads staged terrain buffers over several frames in hash order, so an
+     * older compile of a section can finish uploading after a newer one. Vanilla's
+     * checkSectionMesh installs any fully uploaded mesh, which then replaces the newer mesh with
+     * stale geometry (for example a mesh compiled before the chunk's light arrived, which stays
+     * black). CompileTask records its mesh as the section's latest; checkSectionMesh drops and
+     * releases any other fully uploaded mesh unless it is the one already installed. reset()
+     * clears the latest mesh so geometry compiled for a previous section position is dropped
+     * too.</p>
+     */
+    private static void addLatestSectionMeshGuard(ClassNode node, String owner) {
+        for (FieldNode field : node.fields) {
+            if (field.name.equals(LATEST_MESH_FIELD)) {
+                throw new IllegalStateException("RenderSection latest mesh field already exists");
+            }
+        }
+        node.fields.add(new FieldNode(
+                Opcodes.ACC_PUBLIC, LATEST_MESH_FIELD, "Ljava/lang/Object;", null, null));
+
+        MethodNode reset = find(node, "reset", "()V");
+        InsnList clear = new InsnList();
+        clear.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        clear.add(new InsnNode(Opcodes.ACONST_NULL));
+        clear.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, LATEST_MESH_FIELD, "Ljava/lang/Object;"));
+        reset.instructions.insert(clear);
+        reset.maxStack = Math.max(reset.maxStack, 2);
+
+        String mesh = "net/minecraft/client/renderer/chunk/CompiledSectionMesh";
+        MethodNode check = find(node, "checkSectionMesh", "(L" + mesh + ";)V");
+        // The mesh is installed only after every layer uploaded: "if (uploaded && current != mesh)".
+        JumpInsnNode allUploaded = null;
+        int allUploadedGates = 0;
+        for (AbstractInsnNode instruction : check.instructions.toArray()) {
+            if (instruction instanceof JumpInsnNode jump
+                    && jump.getOpcode() == Opcodes.IFEQ
+                    && previousOpcode(jump) instanceof VarInsnNode load
+                    && load.getOpcode() == Opcodes.ILOAD
+                    && load.var == 2
+                    && nextOpcode(jump) instanceof VarInsnNode self
+                    && self.getOpcode() == Opcodes.ALOAD
+                    && self.var == 0
+                    && nextOpcode(self) instanceof FieldInsnNode current
+                    && current.getOpcode() == Opcodes.GETFIELD
+                    && current.name.equals("sectionMesh")) {
+                allUploaded = jump;
+                allUploadedGates++;
+            }
+        }
+        requireOne("RenderSection.checkSectionMesh all-layers-uploaded gate", allUploadedGates);
+        LabelNode latest = new LabelNode();
+        LabelNode keepInstalled = new LabelNode();
+        InsnList guard = new InsnList();
+        guard.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        guard.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        guard.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, LATEST_MESH_FIELD, "Ljava/lang/Object;"));
+        guard.add(new JumpInsnNode(Opcodes.IF_ACMPEQ, latest));
+        guard.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        guard.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "sectionMesh",
+                "Ljava/util/concurrent/atomic/AtomicReference;"));
+        guard.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, "java/util/concurrent/atomic/AtomicReference",
+                "get", "()Ljava/lang/Object;", false));
+        guard.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        guard.add(new JumpInsnNode(Opcodes.IF_ACMPEQ, keepInstalled));
+        guard.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC, "dev/gaius/browser/BrowserSectionAudit",
+                "staleMeshRejected", "()V", false));
+        guard.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        guard.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        guard.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, owner, "releaseSectionMesh",
+                "(Lnet/minecraft/client/renderer/chunk/SectionMesh;)V", false));
+        guard.add(keepInstalled);
+        guard.add(new InsnNode(Opcodes.RETURN));
+        guard.add(latest);
+        check.instructions.insert(allUploaded, guard);
+        check.maxStack = Math.max(check.maxStack, 2);
     }
 
     private static void patchStagingBuffer(String jar, Path root) throws IOException {

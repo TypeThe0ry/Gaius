@@ -2,8 +2,8 @@
 
 This release continues the Minecraft 26.2 browser client line. It replaces the
 browser-page player-name form with an in-game profile screen, makes the Fast
-graphics preset the default, and adds a safety net for terrain sections that
-were left undrawn.
+graphics preset the default, and fixes terrain chunks that stayed invisible or
+black.
 
 ## In-game Edit Profile screen
 
@@ -28,11 +28,27 @@ were left undrawn.
   default are moved to **Fast** once; choosing **Fancy** again afterwards is
   kept.
 
-## Terrain sections
+## Terrain holes and black chunks
 
-- Once per second the client audits the visible terrain sections. A section
-  whose chunk is ready but which stayed uncompiled and lost its rebuild request
-  is queued for a rebuild again, so it no longer leaves a see-through hole.
+Three ways a terrain section could permanently lose its rebuild are fixed:
+
+- **Inventory screens.** While an inventory, chest or crafting screen is open
+  the browser skips drawing the world, but the client kept taking section
+  rebuild requests off the queue every frame and then discarding them. Chunks
+  that loaded or received their light during that time stayed invisible (sky
+  showing through) or kept their unlit, black mesh. Requests that were not
+  turned into rebuilds are now put back and handled after the screen closes.
+- **Upload timeouts.** A rebuild that waited too long for GPU upload space was
+  cancelled without asking for another one. It now re-queues its section.
+- **Out-of-order uploads.** Meshes upload over several frames, so an older
+  rebuild of a section could finish after a newer one and replace it with stale
+  (for example unlit) geometry. Only the newest rebuild of a section is
+  installed now, and meshes built for a section's previous position are
+  dropped.
+
+The client also audits the visible sections once per second and re-queues any
+section whose chunk is ready but which stayed unbuilt while the pipeline was
+idle. Counts are available in `window.__gaiusSectionAudit`.
 
 ## Downloads
 

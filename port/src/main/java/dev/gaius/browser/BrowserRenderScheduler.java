@@ -269,6 +269,11 @@ public final class BrowserRenderScheduler {
         return QUEUE.size() + (runningTask ? 1 : 0);
     }
 
+    /** Compile or upload work still queued anywhere in the section pipeline. */
+    public static int queuedSectionWork() {
+        return Math.max(Math.max(pendingTasks(), compileBacklog), uploadBacklog);
+    }
+
     public static int peakQueuedTasks() {
         return peakQueuedTasks;
     }
