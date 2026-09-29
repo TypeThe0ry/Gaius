@@ -1583,7 +1583,29 @@
     });
 
     function createGaiusProxyUrl(target, kind) {
-      const configured = urlParams.get("bridge") || urlParams.get("relay") || window.__gaiusBridgeUrl;
+      // Hosted pages (for example GitHub Pages) have no bridge on their own
+      // :8080, so without an explicit bridge use the bundled relay registry;
+      // only local development hosts keep the local :8080 fallback.
+      const pageHost = String(location.hostname || "").toLowerCase();
+      const localDevelopmentHost = pageHost === "localhost" ||
+        pageHost.endsWith(".localhost") || pageHost.startsWith("127.") ||
+        pageHost === "[::1]" || pageHost === "::1";
+      let registryRelay = null;
+      if (!localDevelopmentHost && Array.isArray(window.__gaiusBridgeUrls)) {
+        let bestPriority = -Infinity;
+        for (const node of window.__gaiusBridgeUrls) {
+          const url = typeof node === "string" ? node : node && node.url;
+          if (typeof url !== "string" || !url.trim()) continue;
+          const rawPriority = node && typeof node === "object" ? Number(node.priority) : 0;
+          const priority = Number.isFinite(rawPriority) ? rawPriority : 0;
+          if (priority > bestPriority) {
+            bestPriority = priority;
+            registryRelay = url.trim();
+          }
+        }
+      }
+      const configured = urlParams.get("bridge") || urlParams.get("relay") ||
+        window.__gaiusBridgeUrl || registryRelay;
       let bridge;
       if (configured && String(configured).trim()) {
         bridge = new URL(String(configured).trim(), location.href);

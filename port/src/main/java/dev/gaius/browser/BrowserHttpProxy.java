@@ -143,7 +143,32 @@ public final class BrowserHttpProxy {
               // ambiguous selection must use the configured/default route instead.
               if (activeRelays.size === 1) activeRelay = activeRelays.values().next().value;
             }
-            const configured = explicitBridge || (activeRelay && activeRelay.url);
+            // Requests issued before any tunnel exists (the pre-connect Mojang
+            // blocked-servers check, profile lookups) must not assume a bridge on
+            // the page's own host: a hosted page such as GitHub Pages has nothing
+            // on :8080 and the request stalls the connect. Only local development
+            // hosts keep that fallback; everything else uses the bundled relay.
+            const pageHost = String(location.hostname || '').toLowerCase();
+            const localDevelopmentHost = pageHost === 'localhost' ||
+              pageHost.endsWith('.localhost') || pageHost.startsWith('127.') ||
+              pageHost === '[::1]' || pageHost === '::1';
+            let registryRelay = null;
+            const registryNodes = globalThis.__gaiusBridgeUrls;
+            if (!localDevelopmentHost && Array.isArray(registryNodes)) {
+              let bestPriority = -Infinity;
+              for (let index = 0; index < registryNodes.length; index++) {
+                const node = registryNodes[index];
+                const url = typeof node === 'string' ? node : node && node.url;
+                if (typeof url !== 'string' || !url.trim()) continue;
+                const rawPriority = node && typeof node === 'object' ? Number(node.priority) : 0;
+                const priority = Number.isFinite(rawPriority) ? rawPriority : 0;
+                if (priority > bestPriority) {
+                  bestPriority = priority;
+                  registryRelay = url.trim();
+                }
+              }
+            }
+            const configured = explicitBridge || (activeRelay && activeRelay.url) || registryRelay;
             let bridge;
             if (configured && String(configured).trim()) {
               bridge = new URL(String(configured).trim(), location.href);

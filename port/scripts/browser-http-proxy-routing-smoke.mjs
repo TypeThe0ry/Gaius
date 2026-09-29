@@ -18,11 +18,13 @@ const context = {URLSearchParams, URL, Map, location: new URL("https://play.exam
   __gaiusNettyBridge: {channels: new Map()}};
 context.globalThis = context;
 const call = vm.runInNewContext(`(function(target, kind) { ${body} })`, context);
-function proxyUrl({search = "", channels = [], bridgeUrl, bridgeToken} = {}) {
-  context.location = new URL("https://play.example/client/index.html" + search);
+function proxyUrl({search = "", channels = [], bridgeUrl, bridgeToken, registry,
+  page = "https://play.example/client/index.html"} = {}) {
+  context.location = new URL(page + search);
   context.__gaiusNettyBridge = {channels: new Map(channels.map((entry, index) => [index, entry]))};
   context.__gaiusBridgeUrl = bridgeUrl;
   context.__gaiusBridgeToken = bridgeToken;
+  context.__gaiusBridgeUrls = registry;
   return new URL(call("https://packs.example.test/server-pack.zip", "resource-pack"));
 }
 
@@ -32,6 +34,7 @@ function routeTarget(target, options = {}) {
     .map((entry, index) => [index, entry]))};
   context.__gaiusBridgeUrl = options.bridgeUrl;
   context.__gaiusBridgeToken = options.bridgeToken;
+  context.__gaiusBridgeUrls = options.registry;
   return new URL(call(target, "resource-pack"));
 }
 
@@ -83,5 +86,28 @@ assert.equal(result.origin, "https://ellan.site");
 assert.equal(result.pathname, "/proxy/resource-pack");
 assert.equal(result.searchParams.get("url"), "https://jihulab.com/-/project/356228/uploads/"
   + "e409655d230380173547e68c5ef026d4/resource_pack.zip");
+
+// Pre-connect requests (Mojang blocked-servers check) run before any tunnel is
+// live. A hosted page must use the bundled relay, never its own host on :8080.
+const registry = [
+  {id: "low", url: "wss://low.example/tunnel", priority: 10},
+  {id: "gaius-hk-1", url: "wss://ellan.site/tunnel", priority: 100},
+];
+result = proxyUrl({page: "https://typethe0ry.github.io/Gaius/Gaius-26.2.html", registry});
+assert.equal(result.origin, "https://ellan.site");
+assert.equal(result.pathname, "/proxy/resource-pack");
+result = proxyUrl({page: "file:///C:/Gaius/Gaius-26.2.html", registry});
+assert.equal(result.origin, "https://ellan.site");
+// Local development keeps the local bridge on :8080.
+result = proxyUrl({page: "http://localhost:8780/index.html", registry});
+assert.equal(result.origin, "http://localhost:8080");
+result = proxyUrl({page: "http://127.0.0.1:8780/index.html", registry});
+assert.equal(result.origin, "http://127.0.0.1:8080");
+// A live attested relay and an explicit bridge still win over the registry.
+result = proxyUrl({registry, channels: [{connected: true, currentCandidate:
+  {url: "wss://live.example/tunnel", token: "live", direct: false}}]});
+assert.equal(result.origin, "https://live.example");
+result = proxyUrl({registry, search: "?bridge=https%3A%2F%2Fconfigured.example%2Ftunnel"});
+assert.equal(result.origin, "https://configured.example");
 
 console.log("browser-http-proxy-routing-smoke: PASS");
