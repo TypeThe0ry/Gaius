@@ -208,8 +208,9 @@ gh workflow run pages.yml --ref main -f release_token="manual-$(date +%s)"
 gh workflow run pages.yml --ref main -f release_token="manual-$(date +%s)" -f release_tag=v0.2.2
 ```
 
-The workflow runs only on dispatch. Nothing in the repository checkout is
-published, so pushes to `main` (including `docs/**` and `relay-nodes.json`)
+The workflow runs only on dispatch and does not check out the repository at
+all (so it fetches no Git LFS objects): nothing from the repository is
+published, and pushes to `main` (including `docs/**` and `relay-nodes.json`)
 never redeploy Pages. The v0.1.0 publisher dispatches it with
 `release_tag` set to the tag it has just published.
 
@@ -218,16 +219,27 @@ Before uploading, the workflow downloads that release's `SHA256SUMS` into
 with `sha256sum --check` against its one `Gaius-26.2.html` record. A release
 without `SHA256SUMS`, without that record, or with a mismatching hash fails
 the run before anything is deployed. The run summary records the tag and the
-deployed sha256.
+deployed sha256 only after that check passes. `SHA256SUMS` must use LF line
+endings and text-mode records (`<64 lowercase hex>  Gaius-26.2.html`, two
+spaces, no `*` binary marker); a CRLF or binary-mode record does not match and
+fails the run.
 
 Check the live site with `node tools/verify-github-pages-cdp.mjs`. Set
 `GAIUS_PAGES_EXPECTED_SHA256` to the release's `Gaius-26.2.html` sha256 to
 make the verifier hash the live bytes and fail on a mismatch; the live sha256
-is recorded in the report either way. The v0.1.0 publisher sets it to the
-staged client's hash:
+is recorded in the report either way. Because a fresh deploy can take minutes
+to reach every CDN edge, a first mismatch is re-fetched with a cache-busting
+`?gaius_verify=` query under bounded backoff for up to
+`GAIUS_PAGES_SHA256_RETRY_MS` (default 600000, 10 minutes; `0` disables
+retries) before failing, and every attempt's status, byte count and sha256 is
+recorded under `live["Gaius-26.2.html"].attempts`. The v0.1.0 publisher sets
+the expected hash to the staged client's hash; its `-PagesVerifierTimeoutSeconds`
+must cover that retry window. By hand, extract the record and refuse to run
+without one, since an empty value would silently skip the hash check:
 
 ```sh
-GAIUS_PAGES_EXPECTED_SHA256="$(awk '$2 == "Gaius-26.2.html" { print $1 }' SHA256SUMS)" \
+GAIUS_PAGES_EXPECTED_SHA256="$(awk '$2 == "Gaius-26.2.html" { print $1 }' SHA256SUMS)" &&
+  GAIUS_PAGES_EXPECTED_SHA256="${GAIUS_PAGES_EXPECTED_SHA256:?no Gaius-26.2.html record in SHA256SUMS}" \
   node tools/verify-github-pages-cdp.mjs
 ```
 

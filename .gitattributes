@@ -15,8 +15,9 @@
 *.jar binary
 *.wasm binary
 
-# The fixed multiplayer acceptance resource pack is served by GitHub Pages.
-# Store it in LFS, and make the Pages workflow materialize LFS objects before upload.
+# The fixed multiplayer acceptance resource pack is stored in LFS. The Pages
+# workflow no longer checks out the repository (it publishes only the release's
+# Gaius-26.2.html), so it does not materialize these LFS objects.
 docs/resource-packs/*.zip filter=lfs diff=lfs merge=lfs -text
 
 # The checked-in browser release is one coherent deliverable. Keep it in this

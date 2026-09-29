@@ -37,10 +37,8 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
-      - name: Check out Pages source
-        uses: actions/checkout@v4
-        with:
-          lfs: true
+      # No checkout: nothing from the repository is published, and every step
+      # below reads only release assets (gh release download --repo).
       - name: Configure Pages
         uses: actions/configure-pages@v5
       - name: Resolve release tag
@@ -67,12 +65,14 @@ jobs:
             exit 1
           fi
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          echo "Deploying Gaius-26.2.html from ${tag} (${source})" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "source=${source}" >> "$GITHUB_OUTPUT"
+          echo "Resolved release tag ${tag} (${source}); not yet verified"
       - name: Download and verify the Minecraft 26.2 client
         id: download
         env:
           GH_TOKEN: ${{ github.token }}
           PAGES_RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          PAGES_RELEASE_SOURCE: ${{ steps.release.outputs.source }}
         shell: bash
         run: |
           set -euo pipefail
@@ -107,7 +107,9 @@ jobs:
           (cd pages-publish && sha256sum --check --strict "$sums_dir/Gaius-26.2.html.sha256")
           sha256="$(cut -d ' ' -f 1 "$sums_dir/Gaius-26.2.html.sha256")"
           echo "sha256=${sha256}" >> "$GITHUB_OUTPUT"
+          # Only now, after the SHA256SUMS gate passed, announce the deployment.
           {
+            echo "Deploying Gaius-26.2.html from ${PAGES_RELEASE_TAG} (${PAGES_RELEASE_SOURCE})"
             echo "- Release tag: \`${PAGES_RELEASE_TAG}\`"
             echo "- Gaius-26.2.html sha256: \`${sha256}\` (matches the release SHA256SUMS)"
           } >> "$GITHUB_STEP_SUMMARY"
