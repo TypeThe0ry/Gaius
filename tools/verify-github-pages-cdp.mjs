@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
-import {mkdir, mkdtemp, rm, writeFile} from 'node:fs/promises';
+import {mkdir, mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {createServer} from 'node:net';
 import {join, resolve} from 'node:path';
@@ -11,10 +11,15 @@ const output = resolve(process.env.OUTPUT || 'artifacts/github-pages-cdp.json');
 const CDP_COMMAND_TIMEOUT_MS = Number(process.env.CDP_COMMAND_TIMEOUT_MS || '15000');
 const GAIUS_CDP_PROFILE_ROOT = process.env.GAIUS_CDP_PROFILE_ROOT || ''; 
 const chromeBinary = process.env.CHROME || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
-const expectedPages = Object.freeze(['Gaius-1.21.11.html', 'Gaius-26.2.html']);
+// Pages publishes only the Minecraft 26.2 client (.github/workflows/pages.yml).
+const expectedPages = Object.freeze(['Gaius-26.2.html']);
+// Minecraft 1.21.11 is permanently retired from Pages: its old URL must stay unpublished (HTTP 404).
+const retiredPages = Object.freeze(['Gaius-1.21.11.html']);
 // Keep per-profile release target names explicit for the repository guard and Pages workflow.
-const expectedTargets = Object.freeze({ '1.21.11': process.env.GAIUS_TARGET_12111 || '', '26.2': process.env.GAIUS_TARGET_262 || '' });
-const expectedPageTargets = Object.freeze({ '1.21.11': process.env.GAIUS_PAGE_DEFAULT_TARGET_12111 || '', '26.2': process.env.GAIUS_PAGE_DEFAULT_TARGET_262 || '', defaultTarget: process.env.GAIUS_PAGES_DEFAULT_TARGET || '' });
+// Only the 26.2 profile is deployed. GAIUS_TARGET_12111 and GAIUS_PAGE_DEFAULT_TARGET_12111, still
+// exported by the legacy v0.1.0 publisher, are intentionally ignored because 1.21.11 has no Pages page.
+const expectedTargets = Object.freeze({ '26.2': process.env.GAIUS_TARGET_262 || '' });
+const expectedPageTargets = Object.freeze({ '26.2': process.env.GAIUS_PAGE_DEFAULT_TARGET_262 || '', defaultTarget: process.env.GAIUS_PAGES_DEFAULT_TARGET || '' });
 // Timeout diagnostics retain the exact phrase 	imed out after for CI evidence.
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 function check(checks, name, ok, detail = '') { checks.push({name, ok: Boolean(ok), detail: String(detail)}); }
@@ -40,14 +45,27 @@ class Cdp {
 }
 async function stopChrome(chrome, cdp, profileDir) { try { await cdp?.send('Browser.close', {}, 3000); } catch {} if (chrome && chrome.exitCode == null) chrome.kill(); if (profileDir) { try { await rm(profileDir, {recursive: true, force: true, maxRetries: 10, retryDelay: 200}); } catch {} } }
 
-if (process.argv.includes('--static-self-test')) { assert.deepEqual(expectedPages, ['Gaius-1.21.11.html', 'Gaius-26.2.html']); console.log('VERIFY_GITHUB_PAGES_CDP_STATIC_OK'); process.exit(0); }
+if (process.argv.includes('--static-self-test')) {
+  assert.deepEqual(expectedPages, ['Gaius-26.2.html']);
+  assert.deepEqual(retiredPages, ['Gaius-1.21.11.html']);
+  assert.ok(retiredPages.every((file) => !expectedPages.includes(file)), 'a retired page is still expected');
+  assert.deepEqual(Object.keys(expectedTargets), ['26.2']);
+  assert.deepEqual(Object.keys(expectedPageTargets), ['26.2', 'defaultTarget']);
+  // The Pages workflow must download exactly the expected pages, assert that count, and default to the Latest release.
+  const workflow = await readFile(new URL('../.github/workflows/pages.yml', import.meta.url), 'utf8');
+  assert.deepEqual([...workflow.matchAll(/--pattern '([^']+)'/g)].map((match) => match[1]), [...expectedPages]);
+  assert.ok(workflow.includes(`find pages-publish -mindepth 1 | wc -l)" -eq ${expectedPages.length}`), 'Pages workflow file-count assertion missing');
+  assert.ok(workflow.includes("default: ''") && workflow.includes('gh release view --repo'), 'Pages workflow Latest-release default missing');
+  console.log('VERIFY_GITHUB_PAGES_CDP_STATIC_OK'); process.exit(0);
+}
 
-const report = {schema: 'gaius.github-pages-cdp.v2', base, expectedPages, checks: [], pages: []};
+const report = {schema: 'gaius.github-pages-cdp.v3', base, expectedPages, retiredPages, checks: [], pages: []};
 let chrome; let cdp; let profileDir;
 try {
   const rootResponse = await fetch(base, {redirect: 'manual', cache: 'no-store'});
   check(report.checks, 'root-not-published', rootResponse.status === 404, `HTTP ${rootResponse.status}`);
   for (const file of expectedPages) { const url = new URL(file, base).href; const response = await fetch(url, {cache: 'no-store'}); const body = await response.arrayBuffer(); check(report.checks, `${file}-http`, response.ok && body.byteLength > 100_000_000, `HTTP ${response.status}; bytes=${body.byteLength}`); }
+  for (const file of retiredPages) { const url = new URL(file, base).href; const response = await fetch(url, {method: 'HEAD', redirect: 'manual', cache: 'no-store'}); check(report.checks, `${file}-retired`, response.status === 404, `HTTP ${response.status}`); }
   const debugPort = await freePort(); profileDir = await mkdtemp(join(tmpdir(), 'gaius-pages-cdp-'));
   chrome = spawn(chromeBinary, ['--headless=new', `--remote-debugging-port=${debugPort}`, '--remote-allow-origins=*', `--user-data-dir=${profileDir}`, '--no-first-run', '--no-default-browser-check', '--disable-gpu'], {windowsHide: true});
   const target = (await waitJson(`http://127.0.0.1:${debugPort}/json/list`)).find((entry) => entry.type === 'page'); if (!target?.webSocketDebuggerUrl) throw new Error('Chrome page target missing');

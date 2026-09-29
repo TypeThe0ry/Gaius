@@ -193,6 +193,25 @@ embedded Minecraft asset and client-derived file. The repository's source
 policy does not by itself grant permission to redistribute generated game
 artifacts.
 
+### Deploy GitHub Pages
+
+GitHub Pages serves exactly one file, the Minecraft 26.2 client at
+`https://typethe0ry.github.io/Gaius/Gaius-26.2.html`. Minecraft 1.21.11 is
+retired from Pages and its old URL must return 404. `.github/workflows/pages.yml`
+downloads `Gaius-26.2.html` from the repository's Latest release unless the
+`release_tag` input names another tag, so mark the new release Latest first and
+then dispatch the workflow:
+
+```sh
+gh workflow run pages.yml --ref main -f release_token="manual-$(date +%s)"
+# Pin a specific tag (for example a pre-release) instead of Latest:
+gh workflow run pages.yml --ref main -f release_token="manual-$(date +%s)" -f release_tag=v0.2.2
+```
+
+A push to `main` that changes `docs/**`, `relay-nodes.json`, or the workflow
+redeploys the Latest release the same way. Check the live site with
+`node tools/verify-github-pages-cdp.mjs`.
+
 ## Keep Git Pushable
 
 `.gitattributes` routes release files through Git LFS. It cannot repair a large
