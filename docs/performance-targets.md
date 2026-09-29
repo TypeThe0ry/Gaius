@@ -21,6 +21,13 @@ is invalid if the client silently reduces either distance, skips visible chunk
 work, disables entities or particles, changes the requested resolution, loses
 the world connection, or measures a hidden/background tab.
 
+The `Fancy` graphics preset is pinned to 8 render / 6 simulation distance (with
+`mipmapLevels` 4), matching the browser distance contract. It previously forced
+the vanilla 16 / 12 distances, which multiplied worldgen and render work far
+beyond the target quality; 8 / 6 is the intended `Fancy` quality floor, not a
+reduction below it. A run that finds `Fancy` requesting more than 8 / 6 is
+measuring the old contract-violating behavior.
+
 World-load timing stops only after strict readiness, not when `ClientLevel`
 first becomes non-null. Strict readiness requires at least one loaded client
 chunk, a finite and collision-free player pose, no screen or overlay, a live
