@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
-import {access, copyFile, mkdir, mkdtemp, readFile, rm} from "node:fs/promises";
+import {access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile} from "node:fs/promises";
 import {existsSync} from "node:fs";
 import {homedir, tmpdir} from "node:os";
 import {basename, delimiter, join} from "node:path";
@@ -414,6 +414,127 @@ function assertPacketProcessorLifecycleContract(packetProcessorBytecode, profile
     `${profileId} PacketProcessor constructor must discard lifecycle bind status before return`);
 }
 
+// Ready.spawn's ServerLevel.waitForEntities runs inside the
+// ServerboundFinishConfiguration handler.  On the browser Worker server,
+// Preparing must stay in place until the spawn chunk's entities are loaded so
+// that wait never enters managedBlock.  Any other server keeps that wait.
+function assertPrepareSpawnEntityGateContract(preparingBytecode, readyBytecode,
+  serverLevelBytecode, profileId, chunkKeyCall) {
+  const tick = method(preparingBytecode,
+    "public net.minecraft.server.network.config.PrepareSpawnTask$Ready tick();",
+    "private void lambda$tick$0(");
+  const tickInstructions = bytecodeInstructions(tick);
+  const chunkDone = tickInstructions.findIndex(({instruction}, index) =>
+    instruction.includes("Field chunkLoadFuture:")
+      && tickInstructions[index + 1]?.instruction.includes("CompletableFuture.isDone:()Z")
+      && /^ifne\s+\d+$/.test(tickInstructions[index + 2]?.instruction ?? ""));
+  assert.ok(chunkDone >= 0, `${profileId} Preparing.tick lost its chunkLoadFuture.isDone check`);
+  const chunkDoneTarget = Number(tickInstructions[chunkDone + 2].instruction.match(/\d+$/)[0]);
+  const gate = tickInstructions.findIndex(({offset}) => offset === chunkDoneTarget);
+  const gateShape = tickInstructions.slice(gate, gate + 8).map(({instruction}) => instruction);
+  assert.ok(gate > chunkDone
+      && gateShape[0] === "aload_0"
+      && gateShape[1]?.includes("Field spawnLevel:")
+      && gateShape[2] === "aload_1"
+      && gateShape[3]?.includes("Method gaius$spawnEntitiesLoaded:"
+        + "(Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/world/phys/Vec3;)Z")
+      && /^ifne\s+\d+$/.test(gateShape[4] ?? "")
+      && gateShape[5] === "aconst_null"
+      && gateShape[6] === "areturn"
+      && Number(gateShape[4].match(/\d+$/)[0]) === tickInstructions[gate + 7]?.offset,
+  `${profileId} Preparing.tick must return null until the spawn chunk's entities load`);
+  const gateCall = tick.indexOf("Method gaius$spawnEntitiesLoaded:");
+  const finish = tick.indexOf("LevelLoadListener.finish:");
+  const fixup = tick.indexOf("PlayerSpawnFinder.gaius$fixupLoadedSpawn:");
+  const ready = tick.indexOf("class net/minecraft/server/network/config/PrepareSpawnTask$Ready");
+  assert.ok(gateCall >= 0 && gateCall < finish && finish < fixup && fixup < ready,
+    `${profileId} entity gate must precede LOAD_PLAYER_CHUNKS finish, spawn fixup and Ready`);
+  assert.equal(occurrences(tick, "Method gaius$spawnEntitiesLoaded:"), 1,
+    `${profileId} Preparing.tick must gate Ready exactly once`);
+  assert.doesNotMatch(tick, /waitForEntities|managedBlock/,
+    `${profileId} Preparing.tick must not block the server thread`);
+
+  const helper = method(preparingBytecode,
+    "private static boolean gaius$spawnEntitiesLoaded(net.minecraft.server.level.ServerLevel, "
+      + "net.minecraft.world.phys.Vec3);");
+  const helperInstructions = bytecodeInstructions(helper);
+  // Vanilla IntegratedServer (the fallback when the Worker cannot start) keeps
+  // its handler wait: the gate passes at once unless this is the Worker server.
+  assert.ok(helperInstructions[0]?.instruction.includes(
+    "Method dev/gaius/browser/BrowserIntegratedServerMain.isWorkerServer:()Z")
+      && /^ifne\s+\d+$/.test(helperInstructions[1]?.instruction ?? "")
+      && helperInstructions[2]?.instruction === "iconst_1"
+      && helperInstructions[3]?.instruction === "ireturn"
+      && Number(helperInstructions[1].instruction.match(/\d+$/)[0])
+        === helperInstructions[4]?.offset,
+  `${profileId} spawn entity gate must pass at once on any server but the browser Worker`);
+  assert.equal(occurrences(helper, "BrowserIntegratedServerMain.isWorkerServer:()Z"), 1,
+    `${profileId} spawn entity gate must check for the Worker server exactly once`);
+  const loadedCheck = helperInstructions.findIndex(({instruction}) =>
+    instruction.includes("ServerLevel.areEntitiesLoaded:(J)Z"));
+  assert.ok(loadedCheck > 0
+      && helperInstructions[loadedCheck - 1].instruction.includes(chunkKeyCall)
+      && /^ifeq\s+\d+$/.test(helperInstructions[loadedCheck + 1]?.instruction ?? ""),
+  `${profileId} spawn entity gate must key ServerLevel.areEntitiesLoaded with ${chunkKeyCall}`);
+  // A paused server (vanilla IntegratedServer with no players yet) never runs
+  // ServerLevel.tick, the only other drain of finished entity reads.  Mirror
+  // waitForEntities' predicate: processPendingLoads, then areEntitiesLoaded.
+  const drain = helperInstructions.findIndex(({instruction}) => instruction.includes(
+    "Method net/minecraft/server/level/ServerLevel.gaius$processPendingEntityLoads:()V"));
+  assert.ok(drain > 4
+      && helperInstructions[drain - 1].instruction === "aload_0"
+      && helperInstructions[drain + 1]?.instruction === "aload_0"
+      && loadedCheck === drain + 4,
+  `${profileId} spawn entity gate must drain pending entity loads right before checking them`);
+  assert.equal(occurrences(helper, "gaius$processPendingEntityLoads"), 1,
+    `${profileId} spawn entity gate must drain pending entity loads exactly once per check`);
+  const accessorStart = serverLevelBytecode.indexOf(
+    "public void gaius$processPendingEntityLoads();");
+  assert.ok(accessorStart >= 0,
+    `${profileId} patched ServerLevel lost its pending entity load accessor`);
+  const accessor = serverLevelBytecode.slice(accessorStart).split(/\r?\n\s*\r?\n/)[0];
+  assert.deepEqual(bytecodeInstructions(accessor)
+    .map(({instruction}) => instruction.replace(/\s+#\d+\s+\/\/\s+/, " ")), [
+    "aload_0",
+    "getfield Field entityManager:Lnet/minecraft/world/level/entity/PersistentEntitySectionManager;",
+    "invokevirtual Method net/minecraft/world/level/entity/PersistentEntitySectionManager"
+      + ".processPendingLoads:()V",
+    "return",
+  ], `${profileId} ServerLevel accessor must run the entity manager's processPendingLoads`);
+  const waitingTarget = Number(helperInstructions[loadedCheck + 1].instruction.match(/\d+$/)[0]);
+  const waiting = helperInstructions.findIndex(({offset}) => offset === waitingTarget);
+  const loadedPath = helperInstructions.slice(loadedCheck + 2, waiting)
+    .map(({instruction}) => instruction);
+  assert.ok(loadedPath.some(instruction => instruction.includes(
+    "BrowserIntegratedServerMain.markSpawnEntitiesLoaded:(II)V"))
+      && loadedPath.at(-2) === "iconst_1" && loadedPath.at(-1) === "ireturn",
+  `${profileId} loaded spawn entities must report once and let Preparing turn Ready`);
+  const waitingPath = helperInstructions.slice(waiting).map(({instruction}) => instruction);
+  const refresh = waitingPath.findIndex(instruction =>
+    instruction.includes("ServerChunkCache.addTicketWithRadius:"));
+  assert.ok(waitingPath.some(instruction => instruction.includes("TicketType.PLAYER_SPAWN"))
+      && refresh > 0 && waitingPath[refresh - 1] === "iconst_1"
+      && waitingPath.at(-2) === "iconst_0" && waitingPath.at(-1) === "ireturn",
+  `${profileId} waiting spawn gate must refresh the radius-1 PLAYER_SPAWN ticket`);
+  assert.ok(waitingPath.some(instruction => instruction.includes(
+    "BrowserIntegratedServerMain.markSpawnEntitiesWaiting:(II)V")),
+  `${profileId} waiting spawn gate must count its wait so a stalled join is reported`);
+  assert.ok(helper.includes("BlockPos.containing:(Lnet/minecraft/core/Position;)")
+      && occurrences(helper, "ishr") === 2,
+  `${profileId} spawn entity gate must use the spawn position's own chunk`);
+  assert.doesNotMatch(helper, /waitForEntities|managedBlock/,
+    `${profileId} spawn entity gate must poll without blocking`);
+
+  const spawn = method(readyBytecode,
+    "public net.minecraft.server.level.ServerPlayer spawn(net.minecraft.network.Connection, "
+      + "net.minecraft.server.network.CommonListenerCookie);");
+  const spawnInstructions = bytecodeInstructions(spawn);
+  const waitForEntities = spawnInstructions.findIndex(({instruction}) =>
+    instruction.includes("ServerLevel.waitForEntities:"));
+  assert.equal(spawnInstructions[waitForEntities - 1]?.instruction, "iconst_0",
+    `${profileId} Ready.spawn must keep its radius-0 entity wait as a no-op safety net`);
+}
+
 function bytecodeInstructions(methodBytecode) {
   return methodBytecode.split(/\r?\n/).flatMap(line => {
     const match = line.match(/^\s*(\d+):\s+(.*)$/);
@@ -490,6 +611,47 @@ function graphicsPresetCustomReturn(applyBytecode) {
   assert.equal(entry?.instruction, "return",
     "GraphicsPreset.apply CUSTOM arm is no longer the default return arm");
   return entry.instruction;
+}
+
+// Maps each GraphicsPreset.apply bytecode offset to its ordinal switch arm.
+function graphicsPresetArmAt(applyBytecode) {
+  const table = applyBytecode.match(
+    /tableswitch\s*\{[^}]*?\n\s*0:\s*(\d+)\s*\n\s*1:\s*(\d+)\s*\n\s*2:\s*(\d+)\s*\n\s*default:\s*(\d+)/);
+  assert.ok(table, "GraphicsPreset.apply FAST/FANCY/FABULOUS ordinal switch shape changed");
+  const [fast, fancy, fabulous, custom] = table.slice(1).map(Number);
+  assert.ok(fast < fancy && fancy < fabulous && fabulous < custom,
+    "GraphicsPreset.apply preset arms are no longer laid out in ordinal order");
+  return offset => offset >= custom ? "CUSTOM" : offset >= fabulous ? "FABULOUS"
+    : offset >= fancy ? "FANCY" : offset >= fast ? "FAST" : "prologue";
+}
+
+function graphicsPresetArmValue(applyBytecode, arm, getter) {
+  const armAt = graphicsPresetArmAt(applyBytecode);
+  const instructions = bytecodeInstructions(applyBytecode);
+  const matches = instructions.flatMap((entry, index) =>
+    armAt(entry.offset) === arm && entry.instruction.includes(`Options.${getter}:`)
+      ? [index] : []);
+  assert.equal(matches.length, 1, `GraphicsPreset.apply ${arm} must set ${getter} once`);
+  return (instructions[matches[0] + 1]?.instruction ?? "").replace(/\s+/g, " ");
+}
+
+// Lists every instruction the patch changed, ignoring constant-pool renumbering.
+function graphicsPresetPatchedValues(rawApplyBytecode, patchedApplyBytecode) {
+  const normalize = applyBytecode => bytecodeInstructions(applyBytecode)
+    .map(({offset, instruction}) => ({
+      offset,
+      instruction: instruction.replace(/#\d+(?:,\s*\d+)?/g, "").replace(/\s+/g, " ").trim(),
+    }));
+  const raw = normalize(rawApplyBytecode);
+  const patched = normalize(patchedApplyBytecode);
+  assert.deepEqual(patched.map(({offset}) => offset), raw.map(({offset}) => offset),
+    "GraphicsPreset.apply instruction layout changed");
+  const armAt = graphicsPresetArmAt(rawApplyBytecode);
+  return raw.flatMap((entry, index) => {
+    if (entry.instruction === patched[index].instruction) return [];
+    const getter = raw[index - 1]?.instruction.match(/Options\.(\w+):/)?.[1] ?? "?";
+    return [`${armAt(entry.offset)} ${getter} ${entry.instruction} -> ${patched[index].instruction}`];
+  });
 }
 
 const HOLDERS_PER_TURN = 16;
@@ -732,6 +894,14 @@ await Promise.all([
   access(asmAnalysis),
   access(verifierSource),
 ]);
+// MinecraftServerWorkerPatcher runs for both profiles. Exercise its budgeted worldgen
+// dispatcher turns against each fetched client's real PriorityConsecutiveExecutor/StrictQueue.
+for (const clientJar of [rawClientJar, raw121ClientJar]) {
+  execFileSync(process.execPath, [
+    join(repositoryRoot, "port/scripts/worldgen-priority-jvm-smoke.mjs"),
+    "--raw-jar", clientJar,
+  ], {encoding: "utf8", stdio: "inherit", timeout: 300_000});
+}
 const browserPatcherSource = await readFile(
   join(toolsSource, "Minecraft262BrowserPatcher.java"),
   "utf8",
@@ -1223,18 +1393,35 @@ try {
   });
   const rawGraphicsApply = graphicsPresetApply(rawGraphics);
   const patchedGraphicsApply = graphicsPresetApply(patchedGraphics);
+  // Minecraft.<init> re-applies the persisted preset, so the browser default FANCY
+  // preset must itself carry the 8/6 contract or it overwrites the seeded options.
   assert.deepEqual(graphicsPresetDistanceConstants(patchedGraphicsApply, "renderDistance"),
-    ["bipush 8", "bipush 16", "bipush 32"],
-    "26.2 FAST render distance was changed from vanilla 8");
+    ["bipush 8", "bipush 8", "bipush 32"],
+    "26.2 FAST/FANCY render distance is not the browser 8 contract");
   assert.deepEqual(graphicsPresetDistanceConstants(patchedGraphicsApply, "simulationDistance"),
-    ["bipush 6", "bipush 12", "bipush 12"],
-    "26.2 FAST simulation distance was changed from vanilla 6");
+    ["bipush 6", "bipush 6", "bipush 12"],
+    "26.2 FAST/FANCY simulation distance is not the browser 6 contract");
   assert.deepEqual(graphicsPresetDistanceConstants(rawGraphicsApply, "renderDistance"),
     ["bipush 8", "bipush 16", "bipush 32"],
-    "26.2 raw FAST render distance shape changed");
+    "26.2 raw FAST/FANCY render distance shape changed");
   assert.deepEqual(graphicsPresetDistanceConstants(rawGraphicsApply, "simulationDistance"),
     ["bipush 6", "bipush 12", "bipush 12"],
-    "26.2 raw FAST simulation distance shape changed");
+    "26.2 raw FAST/FANCY simulation distance shape changed");
+  const presetDistances = (applyBytecode, arm) => ["renderDistance", "simulationDistance"]
+    .map(getter => graphicsPresetArmValue(applyBytecode, arm, getter).replace(/^bipush /, ""))
+    .join("/");
+  assert.equal(presetDistances(patchedGraphicsApply, "FAST"), "8/6",
+    "26.2 FAST graphics preset distances changed from vanilla 8/6");
+  assert.equal(presetDistances(patchedGraphicsApply, "FANCY"), "8/6",
+    "26.2 FANCY graphics preset still overwrites the browser 8/6 distances");
+  assert.equal(presetDistances(rawGraphicsApply, "FANCY"), "16/12",
+    "26.2 raw FANCY graphics preset distance shape changed");
+  assert.equal(graphicsPresetArmValue(patchedGraphicsApply, "FANCY", "mipmapLevels"), "iconst_4",
+    "26.2 FANCY graphics preset lost vanilla mipmapLevels 4");
+  assert.deepEqual(graphicsPresetPatchedValues(rawGraphicsApply, patchedGraphicsApply), [
+    "FANCY renderDistance bipush 16 -> bipush 8",
+    "FANCY simulationDistance bipush 12 -> bipush 6",
+  ], "26.2 graphics preset patch must change only the FANCY render/simulation distances");
   assert.equal(graphicsPresetCustomReturn(patchedGraphicsApply),
     graphicsPresetCustomReturn(rawGraphicsApply),
     "26.2 CUSTOM graphics preset arm changed");
@@ -1348,6 +1535,121 @@ try {
   assert.deepEqual(graphicsPresetDistanceConstants(generic121Apply, "simulationDistance"),
     ["bipush 6", "bipush 12", "bipush 12"],
     "1.21.11 FAST simulation distance was changed by the 26.2 overlay path");
+
+  // The spawn entity gate adds a branch to Preparing.tick, so its rebuilt
+  // stack map frames must also pass the JVM verifier on both profiles.
+  const classInitVerifier = join(root, "GaiusClassInitVerifier.java");
+  await writeFile(classInitVerifier, [
+    "public class GaiusClassInitVerifier {",
+    "  public static void main(String[] args) throws Exception {",
+    "    for (String name : args) {",
+    "      Class.forName(name, true, GaiusClassInitVerifier.class.getClassLoader());",
+    "      System.out.println(\"CLASS_INIT_VERIFIED \" + name);",
+    "    }",
+    "  }",
+    "}",
+    "",
+  ].join("\n"));
+  execFileSync(javac, ["--release", "21", "-proc:none", "-d", classes, classInitVerifier], {
+    encoding: "utf8", timeout: 30_000,
+  });
+  // Run the gate itself on the JVM with no level ticking.  A stub stands in
+  // for the TeaVM-only BrowserIntegratedServerMain; isWorkerServer() is its
+  // static `worker` field.
+  const spawnGateClasses = join(root, "spawn-gate-classes");
+  const spawnGateStub = join(root, "spawn-gate-stub", "dev", "gaius", "browser",
+    "BrowserIntegratedServerMain.java");
+  await mkdir(join(root, "spawn-gate-stub", "dev", "gaius", "browser"), {recursive: true});
+  await writeFile(spawnGateStub, [
+    "package dev.gaius.browser;",
+    "",
+    "public final class BrowserIntegratedServerMain {",
+    "  public static boolean worker;",
+    "  public static String loaded = \"\";",
+    "  public static String waiting = \"\";",
+    "  public static boolean isWorkerServer() { return worker; }",
+    "  public static void markSpawnEntitiesLoaded(int x, int z) {",
+    "    loaded += x + \",\" + z + \";\";",
+    "  }",
+    "  public static void markSpawnEntitiesWaiting(int x, int z) {",
+    "    waiting += x + \",\" + z + \";\";",
+    "  }",
+    "}",
+    "",
+  ].join("\n"));
+  execFileSync(javac, ["--release", "21", "-proc:none", "-d", spawnGateClasses, spawnGateStub,
+    join(repositoryRoot, "port/scripts/fixtures/GaiusSpawnEntityGateFixture.java")], {
+    encoding: "utf8", timeout: 30_000,
+  });
+  for (const [profileId, patchedJar, rawJar, chunkKeyCall] of [
+    ["26.2", clientJar, rawClientJar, "ChunkPos.pack:()J"],
+    ["1.21.11", generic121Jar, raw121ClientJar, "ChunkPos.toLong:()J"],
+  ]) {
+    const preparing = execFileSync(javap, ["-classpath", patchedJar, "-p", "-c",
+      "net.minecraft.server.network.config.PrepareSpawnTask$Preparing"], {
+      encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30_000,
+    });
+    const ready = execFileSync(javap, ["-classpath", patchedJar, "-p", "-c",
+      "net.minecraft.server.network.config.PrepareSpawnTask$Ready"], {
+      encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30_000,
+    });
+    const serverLevel = execFileSync(javap, ["-classpath", patchedJar, "-p", "-c",
+      "net.minecraft.server.level.ServerLevel"], {
+      encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000,
+    });
+    assertPrepareSpawnEntityGateContract(preparing, ready, serverLevel, profileId, chunkKeyCall);
+    const verified = execFileSync(java, ["-Xverify:all", "-classpath",
+      [classes, patchedJar].join(delimiter), "GaiusClassInitVerifier",
+      "net.minecraft.server.network.config.PrepareSpawnTask$Preparing"], {
+      encoding: "utf8", timeout: 30_000,
+    });
+    assert.match(verified,
+      /CLASS_INIT_VERIFIED net\.minecraft\.server\.network\.config\.PrepareSpawnTask\$Preparing/,
+      `${profileId} patched PrepareSpawnTask$Preparing failed JVM verification`);
+
+    // Only the two patched classes go in front of the vanilla jar: the rest of
+    // the overlay calls Gaius browser classes that are absent on the JVM.
+    const gateOverlay = join(root, `spawn-gate-overlay-${profileId}`);
+    await mkdir(gateOverlay, {recursive: true});
+    execFileSync(jar, ["--extract", "--file", patchedJar,
+      "net/minecraft/server/network/config/PrepareSpawnTask$Preparing.class",
+      "net/minecraft/server/level/ServerLevel.class"], {
+      cwd: gateOverlay, encoding: "utf8", timeout: 30_000,
+    });
+    const librariesRoot = join(repositoryRoot, "port/work", profileId, "libraries");
+    const libraries = (await readdir(librariesRoot, {recursive: true}))
+      .filter(entry => entry.endsWith(".jar"))
+      .sort()
+      .map(entry => join(librariesRoot, entry));
+    assert.ok(libraries.length > 0, `${profileId} spawn gate fixture needs ${librariesRoot}`);
+    // An argument file keeps the long library classpath clear of the Windows
+    // command-line limit.
+    const gateArguments = join(root, `spawn-gate-${profileId}.args`);
+    const gateClasspath = [spawnGateClasses, gateOverlay, rawJar, ...libraries]
+      .join(delimiter).replaceAll("\\", "/");
+    await writeFile(gateArguments, `-classpath\n"${gateClasspath}"\n`);
+    // Output is kept for the failure message only: vanilla libraries print JDK
+    // deprecation warnings on every run, and Bootstrap routes the fixture's
+    // own stack traces through its stdout logger.
+    let gate;
+    try {
+      gate = execFileSync(java, ["-Xverify:all", `@${gateArguments}`,
+        "GaiusSpawnEntityGateFixture"], {
+        encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 120_000,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (error) {
+      throw new Error(`${profileId} spawn entity gate fixture failed:\n`
+        + `${error.stdout ?? ""}${error.stderr ?? ""}`, {cause: error});
+    }
+    for (const marker of [
+      "SPAWN_ENTITY_GATE_NON_WORKER_PASSES",
+      "SPAWN_ENTITY_GATE_WAITS_WITH_TICKET",
+      "SPAWN_ENTITY_GATE_DRAINS_PENDING_LOADS",
+    ]) {
+      assert.ok(gate.includes(marker), `${profileId} spawn entity gate fixture missed ${marker}`);
+    }
+  }
 
   const patchedPacketUtils = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
     "net.minecraft.network.protocol.PacketUtils"], {
@@ -1760,7 +2062,10 @@ try {
   console.log("Minecraft 26.2 P1 patcher smoke passed", JSON.stringify({
     scheduledLayerPulses: occurrences(generationWait, "BrowserWorldgenScheduler.pulse"),
     distancePulses: occurrences(distance, "pulseDistanceManager"),
-    graphicsPresetDistances: "8/6",
+    graphicsPresetDistances: {
+      fast: presetDistances(patchedGraphicsApply, "FAST"),
+      fancy: presetDistances(patchedGraphicsApply, "FANCY"),
+    },
     oneTwentyOneFastDistances: "8/6",
     holderBatchLimit: HOLDERS_PER_TURN,
     layerBarrier: true,

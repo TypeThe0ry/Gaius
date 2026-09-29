@@ -1,9 +1,15 @@
 {
   "kind": "gaius-relay-registry",
   "protocolVersion": 1,
-  "updatedAt": "2026-08-08T04:07:49Z",
+  "updatedAt": "2026-09-29T04:35:00Z",
   "registries": [],
   "nodes": [
+    {
+      "id": "gaius-sg-1",
+      "name": "Gaius SG Relay",
+      "url": "wss://yutianfu.me:8443/tunnel",
+      "priority": 110
+    },
     {
       "id": "gaius-hk-1",
       "name": "Gaius HK Relay",

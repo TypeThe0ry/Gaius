@@ -19,6 +19,7 @@ import org.objectweb.asm.tree.IincInsnNode;
 import org.objectweb.asm.tree.IntInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.TypeInsnNode;
 import org.objectweb.asm.tree.VarInsnNode;
 
 /** Removes dedicated-server services that cannot run inside the browser Worker. */
@@ -30,6 +31,8 @@ public final class MinecraftServerWorkerPatcher {
                     + "Lnet/minecraft/server/jsonrpc/ManagementServer;";
     private static final String ABSTRACT_EXECUTOR =
             "net/minecraft/util/thread/AbstractConsecutiveExecutor";
+    private static final String FIXED_PRIORITY_QUEUE =
+            "net/minecraft/util/thread/StrictQueue$FixedPriorityQueue";
     private static final String CHUNK_TASK_DISPATCHER =
             "net/minecraft/server/level/ChunkTaskDispatcher";
     private static final String TASK_SCHEDULER = "net/minecraft/util/thread/TaskScheduler";
@@ -37,6 +40,9 @@ public final class MinecraftServerWorkerPatcher {
     private static final String WORLDGEN_DISPATCHER_SCHEDULER =
             "dev/gaius/browser/BrowserWorldgenDispatcherScheduler";
     private static final String DEFERRED_REGISTER = "gaius$registerForExecutionDeferred";
+    private static final String HEAD_PRIORITY = "gaius$headPriority";
+    // Mirrors BrowserWorldgenDispatcherScheduler.STOP_IDLE for a turn that ran nothing.
+    private static final int DISPATCHER_STOP_IDLE = 1;
 
     private MinecraftServerWorkerPatcher() {
     }
@@ -61,13 +67,24 @@ public final class MinecraftServerWorkerPatcher {
         ClassNode dispatcher = read(jar, CHUNK_TASK_DISPATCHER + ".class");
         patchChunkTaskDispatcher(dispatcher);
         write(dispatcher, outputRoot.resolve(CHUNK_TASK_DISPATCHER + ".class"));
+        boolean headPriorityPatched = false;
+        if (hasEntry(jar, FIXED_PRIORITY_QUEUE + ".class")) {
+            ClassNode queue = read(jar, FIXED_PRIORITY_QUEUE + ".class");
+            headPriorityPatched = addFixedQueueHeadPriority(queue);
+            if (headPriorityPatched) {
+                write(queue, outputRoot.resolve(FIXED_PRIORITY_QUEUE + ".class"));
+            }
+        }
         ClassNode executor = read(jar, ABSTRACT_EXECUTOR + ".class");
-        patchAbstractExecutor(executor);
+        patchAbstractExecutor(executor, headPriorityPatched);
         write(executor, outputRoot.resolve(ABSTRACT_EXECUTOR + ".class"));
         if (jsonRpcPatched) {
             System.out.println("Disabled the dedicated JSON-RPC management server for the browser Worker");
         }
-        System.out.println("Patched worldgen PriorityConsecutiveExecutor with deferred single-task turns");
+        System.out.println(headPriorityPatched
+                ? "Patched worldgen PriorityConsecutiveExecutor with budgeted bookkeeping turns"
+                : "Patched worldgen PriorityConsecutiveExecutor with deferred single-task turns"
+                        + " (StrictQueue priority shape not found)");
     }
 
 
@@ -119,11 +136,12 @@ public final class MinecraftServerWorkerPatcher {
         }
     }
 
-    private static void patchAbstractExecutor(ClassNode node) {
+    private static void patchAbstractExecutor(ClassNode node, boolean headPriorityPatched) {
         MethodNode run = find(node, "run", "()V");
         InsnList code = new InsnList();
         LabelNode vanilla = new LabelNode();
         LabelNode worldgenStart = new LabelNode();
+        LabelNode worldgenLoop = new LabelNode();
         LabelNode worldgenDone = new LabelNode();
         LabelNode vanillaStart = new LabelNode();
         LabelNode vanillaDone = new LabelNode();
@@ -141,16 +159,54 @@ public final class MinecraftServerWorkerPatcher {
         code.add(new JumpInsnNode(Opcodes.IFEQ, vanilla));
 
         // A worldgen runnable can suspend through ChunkGenerationTask.runUntilWait().
-        // Execute one dispatcher task and return the executor turn immediately. TeaVM's
-        // Worker executor invokes execute() synchronously, so the vanilla registration path
-        // would recursively drain the queue in this same JavaScript turn. The deferred path
-        // marks the dispatcher running now, then submits it from a fresh native-thread turn.
+        // TeaVM's Worker executor invokes execute() synchronously, so the vanilla
+        // registration path would recursively drain the queue in this same JavaScript turn.
+        // Only ChunkTaskDispatcher's priority-3 generation poll can suspend: run it solely as
+        // the first runnable of a turn and end the turn after it. Priority 0-2 level-change,
+        // release and submit bookkeeping keeps draining inline while the queue head stays
+        // below priority 3, bounded by the scheduler's wall-clock budget. The deferred path
+        // marks the dispatcher running now, then submits it from a fresh Worker turn.
+        // Locals: 1 executed, 2 priority of the runnable being run, 3 stop reason,
+        // 4-5 turn start nanos, 6 failure.
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 1));
+        code.add(new InsnNode(Opcodes.ICONST_M1));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 2));
+        code.add(new IntInsnNode(Opcodes.BIPUSH, DISPATCHER_STOP_IDLE));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 3));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC, WORLDGEN_DISPATCHER_SCHEDULER, "beginTurn", "()J", false));
+        code.add(new VarInsnNode(Opcodes.LSTORE, 4));
         code.add(worldgenStart);
+        code.add(worldgenLoop);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, ABSTRACT_EXECUTOR, HEAD_PRIORITY, "()I", false));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 2));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL, ABSTRACT_EXECUTOR, "pollTask", "()Z", false));
         code.add(new JumpInsnNode(Opcodes.IFEQ, worldgenDone));
+        code.add(new IincInsnNode(1, 1));
+        code.add(new VarInsnNode(Opcodes.LLOAD, 4));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL, ABSTRACT_EXECUTOR, HEAD_PRIORITY, "()I", false));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC, WORLDGEN_DISPATCHER_SCHEDULER, "continueTurn",
+                "(JIII)I", false));
+        code.add(new InsnNode(Opcodes.DUP));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 3));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, worldgenLoop));
         code.add(worldgenDone);
+        code.add(new VarInsnNode(Opcodes.LLOAD, 4));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 1));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC, WORLDGEN_DISPATCHER_SCHEDULER, "endTurn",
+                "(JII)V", false));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL, ABSTRACT_EXECUTOR, "setSleeping", "()V", false));
@@ -177,7 +233,7 @@ public final class MinecraftServerWorkerPatcher {
         code.add(new JumpInsnNode(Opcodes.GOTO, end));
 
         code.add(worldgenCatch);
-        code.add(new VarInsnNode(Opcodes.ASTORE, 2));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 6));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL, ABSTRACT_EXECUTOR, "setSleeping", "()V", false));
@@ -185,7 +241,7 @@ public final class MinecraftServerWorkerPatcher {
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL, ABSTRACT_EXECUTOR,
                 DEFERRED_REGISTER, "()V", false));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 6));
         code.add(new InsnNode(Opcodes.ATHROW));
 
         code.add(vanillaCatch);
@@ -217,9 +273,99 @@ public final class MinecraftServerWorkerPatcher {
                 worldgenStart, worldgenDone, worldgenCatch, null));
         run.tryCatchBlocks.add(new org.objectweb.asm.tree.TryCatchBlockNode(
                 vanillaStart, vanillaDone, vanillaCatch, null));
-        run.maxStack = 3;
-        run.maxLocals = 5;
+        run.maxStack = 6;
+        run.maxLocals = 7;
         addDeferredRegisterMethod(node);
+        addExecutorHeadPriorityMethod(node, headPriorityPatched);
+    }
+
+    /**
+     * Adds a read-only peek at the lowest non-empty StrictQueue priority, or -1 when the queue is
+     * empty. pop() drains the same queues in index order, so this is the priority of the runnable
+     * the next pollTask() executes.
+     */
+    private static boolean addFixedQueueHeadPriority(ClassNode node) {
+        boolean shape = node.fields.stream().anyMatch(field -> field.name.equals("queues")
+                && field.desc.equals("[Ljava/util/Queue;"))
+                && node.methods.stream().anyMatch(method -> method.name.equals("pop")
+                        && method.desc.equals("()Ljava/lang/Runnable;"));
+        if (!shape) {
+            return false;
+        }
+        if (node.methods.stream().anyMatch(method -> method.name.equals(HEAD_PRIORITY))) {
+            throw new IllegalStateException(FIXED_PRIORITY_QUEUE + "." + HEAD_PRIORITY + " already exists");
+        }
+        MethodNode method = new MethodNode(Opcodes.ACC_PUBLIC, HEAD_PRIORITY, "()I", null, null);
+        LabelNode loop = new LabelNode();
+        LabelNode next = new LabelNode();
+        LabelNode empty = new LabelNode();
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(
+                Opcodes.GETFIELD, FIXED_PRIORITY_QUEUE, "queues", "[Ljava/util/Queue;"));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 1));
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 2));
+        code.add(loop);
+        code.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new InsnNode(Opcodes.ARRAYLENGTH));
+        code.add(new JumpInsnNode(Opcodes.IF_ICMPGE, empty));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        code.add(new InsnNode(Opcodes.AALOAD));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE, "java/util/Queue", "isEmpty", "()Z", true));
+        code.add(new JumpInsnNode(Opcodes.IFNE, next));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 2));
+        code.add(new InsnNode(Opcodes.IRETURN));
+        code.add(next);
+        code.add(new IincInsnNode(2, 1));
+        code.add(new JumpInsnNode(Opcodes.GOTO, loop));
+        code.add(empty);
+        code.add(new InsnNode(Opcodes.ICONST_M1));
+        code.add(new InsnNode(Opcodes.IRETURN));
+        method.instructions = code;
+        method.maxStack = 2;
+        method.maxLocals = 3;
+        node.methods.add(method);
+        return true;
+    }
+
+    /**
+     * Exposes the queue head priority to the patched run(). Without the StrictQueue shape every
+     * head is unclassified (-1), which keeps the previous one-runnable-per-turn behavior.
+     */
+    private static void addExecutorHeadPriorityMethod(ClassNode node, boolean headPriorityPatched) {
+        if (node.methods.stream().anyMatch(method -> method.name.equals(HEAD_PRIORITY))) {
+            throw new IllegalStateException(ABSTRACT_EXECUTOR + "." + HEAD_PRIORITY + " already exists");
+        }
+        MethodNode method = new MethodNode(Opcodes.ACC_PRIVATE, HEAD_PRIORITY, "()I", null, null);
+        InsnList code = new InsnList();
+        if (headPriorityPatched) {
+            LabelNode unclassified = new LabelNode();
+            code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            code.add(new FieldInsnNode(
+                    Opcodes.GETFIELD, ABSTRACT_EXECUTOR, "queue",
+                    "Lnet/minecraft/util/thread/StrictQueue;"));
+            code.add(new TypeInsnNode(Opcodes.INSTANCEOF, FIXED_PRIORITY_QUEUE));
+            code.add(new JumpInsnNode(Opcodes.IFEQ, unclassified));
+            code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            code.add(new FieldInsnNode(
+                    Opcodes.GETFIELD, ABSTRACT_EXECUTOR, "queue",
+                    "Lnet/minecraft/util/thread/StrictQueue;"));
+            code.add(new TypeInsnNode(Opcodes.CHECKCAST, FIXED_PRIORITY_QUEUE));
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL, FIXED_PRIORITY_QUEUE, HEAD_PRIORITY, "()I", false));
+            code.add(new InsnNode(Opcodes.IRETURN));
+            code.add(unclassified);
+        }
+        code.add(new InsnNode(Opcodes.ICONST_M1));
+        code.add(new InsnNode(Opcodes.IRETURN));
+        method.instructions = code;
+        method.maxStack = 1;
+        method.maxLocals = 1;
+        node.methods.add(method);
     }
 
     private static void addDeferredRegisterMethod(ClassNode node) {

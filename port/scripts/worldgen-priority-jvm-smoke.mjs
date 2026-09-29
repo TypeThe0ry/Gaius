@@ -1,68 +1,166 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const args = process.argv.slice(2);
-const jarIndex = args.indexOf("--jar");
-const cpIndex = args.indexOf("--classpath-file");
-if (jarIndex < 0 || !args[jarIndex + 1]) {
-  console.error("usage: node port/scripts/worldgen-priority-jvm-smoke.mjs --jar PATCHED_CLIENT.jar [--classpath-file classpath.txt]");
+const option = (name) => {
+  const index = args.indexOf(name);
+  return index < 0 ? null : args[index + 1] || null;
+};
+const patchedJarOption = option("--jar");
+const rawJarOption = option("--raw-jar");
+if (!patchedJarOption === !rawJarOption) {
+  console.error("usage: node port/scripts/worldgen-priority-jvm-smoke.mjs "
+    + "(--jar PATCHED_CLIENT.jar | --raw-jar port/work/<version>/client-named.jar) "
+    + "[--classpath-file classpath.txt]");
   process.exit(2);
 }
 
-const jar = resolve(args[jarIndex + 1]);
-if (!existsSync(jar)) throw new Error(`patched jar not found: ${jar}`);
-const dependencyClasspath = cpIndex < 0 ? [] : parseClasspath(readFileSync(resolve(args[cpIndex + 1]), "utf8"));
-const javaHome = process.env.JAVA_HOME;
+const scriptDir = dirname(fileURLToPath(import.meta.url));
+const repositoryRoot = resolve(scriptDir, "../..");
+const fixtureDir = join(scriptDir, "fixtures");
+const rawJar = rawJarOption ? resolve(rawJarOption) : null;
+if (rawJar && !existsSync(rawJar)) throw new Error(`raw client jar not found: ${rawJar}`);
+const classpathFile = option("--classpath-file")
+  || (rawJar && existsSync(join(dirname(rawJar), "classpath.txt"))
+    ? join(dirname(rawJar), "classpath.txt") : null);
+const dependencyClasspath = classpathFile ? parseClasspath(readFileSync(resolve(classpathFile), "utf8")) : [];
+const javaHome = process.env.GAIUS_JAVA_HOME || process.env.JAVA_HOME;
 const suffix = process.platform === "win32" ? ".exe" : "";
-const java = javaHome ? join(javaHome, "bin", `java${suffix}`) : `java${suffix}`;
-const javac = javaHome ? join(javaHome, "bin", `javac${suffix}`) : `javac${suffix}`;
-const javap = javaHome ? join(javaHome, "bin", `javap${suffix}`) : `javap${suffix}`;
+const tool = (name) => javaHome ? join(javaHome, "bin", `${name}${suffix}`) : `${name}${suffix}`;
+const [java, javac, javap, jarTool] = ["java", "javac", "javap", "jar"].map(tool);
 const root = mkdtempSync(join(tmpdir(), "gaius-worldgen-priority-"));
 const classes = join(root, "classes");
+const sources = join(root, "sources");
 mkdirSync(classes, { recursive: true });
-const fixtureDir = join(dirname(fileURLToPath(import.meta.url)), "fixtures");
-const compileCp = [jar, ...dependencyClasspath].join(delimiter);
-try {
-  const bytecode = spawnSync(javap,
-    ["-classpath", jar, "-c", "-p", "net.minecraft.util.thread.AbstractConsecutiveExecutor"],
-    { encoding: "utf8", timeout: 30_000 });
-  if (bytecode.error) throw bytecode.error;
-  assert.equal(bytecode.status, 0, bytecode.stderr || "javap failed");
-  const runStart = bytecode.stdout.indexOf("public void run();");
-  const runEnd = bytecode.stdout.indexOf("public void runAll();", runStart);
-  assert.ok(runStart >= 0 && runEnd > runStart, "patched executor run() bytecode missing");
-  const runBytecode = bytecode.stdout.slice(runStart, runEnd);
-  assert.equal((runBytecode.match(/gaius\$registerForExecutionDeferred/g) || []).length, 2,
-    "worldgen success/catch must use exactly two deferred registrations");
-  assert.equal((runBytecode.match(/Method registerForExecution:\(\)V/g) || []).length, 2,
-    "vanilla success/catch registration changed");
 
-  const compile = spawnSync(javac, ["--release", "21", "-proc:none", "-classpath", compileCp,
-    "-d", classes,
+function run(command, commandArgs, label, options = {}) {
+  const result = spawnSync(command, commandArgs, { encoding: "utf8", timeout: 60_000, ...options });
+  if (result.error) throw result.error;
+  assert.equal(result.status, 0, `${label} failed\n${result.stdout || ""}${result.stderr || ""}`);
+  return result.stdout || "";
+}
+
+function occurrences(text, pattern) {
+  return (text.match(pattern) || []).length;
+}
+
+// javap -c separates members with a blank line; patcher-added methods follow <clinit>.
+function methodBytecode(bytecode, signature) {
+  const start = bytecode.indexOf(signature);
+  assert.ok(start >= 0, `bytecode method missing: ${signature}`);
+  const blankLine = /\r?\n\r?\n/g;
+  blankLine.lastIndex = start;
+  const end = blankLine.exec(bytecode);
+  return bytecode.slice(start, end ? end.index : bytecode.length);
+}
+
+// Swap the scheduler's two JSBody telemetry sinks and its clock for fixture hooks. The pump,
+// turn classification and budget logic compile unchanged from the production source.
+function schedulerSourceForJvm() {
+  let source = readFileSync(join(repositoryRoot,
+    "port/src/main/java/dev/gaius/browser/BrowserWorldgenDispatcherScheduler.java"), "utf8");
+  const replaceOnce = (pattern, replacement, label) => {
+    assert.equal(occurrences(source, new RegExp(pattern.source, "g")), 1,
+      `expected one ${label} in BrowserWorldgenDispatcherScheduler`);
+    source = source.replace(pattern, replacement);
+  };
+  replaceOnce(/private static native void recordTurnTelemetry\(int runnables, int reason, double elapsedMillis\);/,
+    "private static void recordTurnTelemetry(int runnables, int reason, double elapsedMillis) {"
+      + " WorldgenDispatcherFixtureRuntime.turn(runnables, reason, elapsedMillis); }",
+    "turn telemetry sink");
+  replaceOnce(/private static native void recordHopTelemetry\(int kind\);/,
+    "private static void recordHopTelemetry(int kind) { WorldgenDispatcherFixtureRuntime.hop(kind); }",
+    "hop telemetry sink");
+  replaceOnce(/return System\.nanoTime\(\);/,
+    "return WorldgenDispatcherFixtureRuntime.nanoTime;", "scheduler clock");
+  return source;
+}
+
+try {
+  let jar = patchedJarOption ? resolve(patchedJarOption) : null;
+  if (rawJar) {
+    // Patch a private copy with the production patcher; never touch the fetched input.
+    const asmRoot = join(homedir(), ".m2/repository/org/ow2/asm");
+    const asmClasspath = [join(asmRoot, "asm/9.8/asm-9.8.jar"),
+      join(asmRoot, "asm-tree/9.8/asm-tree-9.8.jar")].join(delimiter);
+    const toolClasses = join(root, "tool-classes");
+    const patchOutput = join(root, "patches");
+    mkdirSync(toolClasses, { recursive: true });
+    mkdirSync(patchOutput, { recursive: true });
+    jar = join(root, "client-patched.jar");
+    copyFileSync(rawJar, jar);
+    run(javac, ["--release", "21", "-proc:none", "-classpath", asmClasspath, "-d", toolClasses,
+      join(repositoryRoot, "port/tools/src/main/java/dev/gaius/tools/MinecraftServerWorkerPatcher.java")],
+      "patcher compile");
+    const patchLog = run(java, ["-classpath", [toolClasses, asmClasspath].join(delimiter),
+      "dev.gaius.tools.MinecraftServerWorkerPatcher", jar, patchOutput], "MinecraftServerWorkerPatcher");
+    assert.match(patchLog, /budgeted bookkeeping turns/,
+      "patcher fell back to single-task turns on a StrictQueue-shaped client");
+    run(jarTool, ["--update", "--file", jar, "-C", patchOutput, "."], "patched jar update");
+  }
+  if (!existsSync(jar)) throw new Error(`patched jar not found: ${jar}`);
+
+  const bytecode = run(javap, ["-classpath", jar, "-c", "-p",
+    "net.minecraft.util.thread.AbstractConsecutiveExecutor"], "javap AbstractConsecutiveExecutor");
+  const runBytecode = methodBytecode(bytecode, "public void run();");
+  assert.equal(occurrences(runBytecode, /gaius\$registerForExecutionDeferred/g), 2,
+    "worldgen success/catch must use exactly two deferred registrations");
+  assert.equal(occurrences(runBytecode, /Method registerForExecution:\(\)V/g), 2,
+    "vanilla success/catch registration changed");
+  assert.equal(occurrences(runBytecode, /Method pollTask:\(\)Z/g), 2,
+    "worldgen turn loop and vanilla path must each poll exactly once per iteration");
+  assert.equal(occurrences(runBytecode, /Method gaius\$headPriority:\(\)I/g), 2,
+    "worldgen turn must classify the runnable it runs and the next queue head");
+  for (const [method, descriptor] of [["beginTurn", "()J"], ["continueTurn", "(JIII)I"],
+    ["endTurn", "(JII)V"]]) {
+    const escaped = descriptor.replace(/[()]/g, "\\$&");
+    assert.equal(occurrences(runBytecode, new RegExp(
+      `BrowserWorldgenDispatcherScheduler\\.${method}:${escaped}`, "g")), 1,
+      `worldgen turn must call BrowserWorldgenDispatcherScheduler.${method}${descriptor} once`);
+  }
+  assert.match(runBytecode, /Method gaius\$headPriority:\(\)I\s+\d+: istore_2\s+\d+: aload_0\s+\d+: invokevirtual #\d+\s+\/\/ Method pollTask/,
+    "the pre-poll head priority must be captured immediately before pollTask");
+  const headPriority = methodBytecode(bytecode, "private int gaius$headPriority();");
+  assert.match(headPriority, /instanceof\s+#\d+\s+\/\/ class net\/minecraft\/util\/thread\/StrictQueue\$FixedPriorityQueue/,
+    "executor head priority must only trust FixedPriorityQueue");
+  const queueBytecode = run(javap, ["-classpath", jar, "-c", "-p",
+    "net.minecraft.util.thread.StrictQueue$FixedPriorityQueue"], "javap FixedPriorityQueue");
+  const queuePeek = methodBytecode(queueBytecode, "public int gaius$headPriority();");
+  assert.match(queuePeek, /InterfaceMethod java\/util\/Queue\.isEmpty:\(\)Z/,
+    "queue head priority must peek without polling");
+  assert.doesNotMatch(queuePeek, /Queue\.poll|decrementAndGet|incrementAndGet/,
+    "queue head priority must not mutate the StrictQueue");
+
+  mkdirSync(join(sources, "org/teavm/jso"), { recursive: true });
+  mkdirSync(join(sources, "dev/gaius/browser"), { recursive: true });
+  writeFileSync(join(sources, "org/teavm/jso/JSBody.java"), `package org.teavm.jso;
+import java.lang.annotation.*;
+@Retention(RetentionPolicy.CLASS) @Target(ElementType.METHOD)
+public @interface JSBody { String[] params() default {}; String script(); }
+`);
+  const schedulerSource = join(sources, "dev/gaius/browser/BrowserWorldgenDispatcherScheduler.java");
+  writeFileSync(schedulerSource, schedulerSourceForJvm());
+  const compileCp = [jar, ...dependencyClasspath].join(delimiter);
+  run(javac, ["--release", "21", "-proc:none", "-classpath", compileCp, "-d", classes,
+    join(sources, "org/teavm/jso/JSBody.java"),
     join(fixtureDir, "PlatformRunnable.java"),
     join(fixtureDir, "Platform.java"),
-    join(dirname(fixtureDir), "..", "src", "main", "java", "dev", "gaius", "browser",
-      "BrowserWorldgenDispatcherScheduler.java"),
-    join(fixtureDir, "WorldgenPriorityJvmFixture.java")],
-    { encoding: "utf8", stdio: "inherit", timeout: 60_000 });
-  if (compile.error) throw compile.error;
-  if (compile.status !== 0) process.exitCode = compile.status ?? 1;
-  else {
-    const runCp = [classes, jar, ...dependencyClasspath].join(delimiter);
-    const run = spawnSync(java, ["-cp", runCp, "WorldgenPriorityJvmFixture"],
-      { encoding: "utf8", stdio: "inherit", timeout: 30_000 });
-    if (run.error) throw run.error;
-    process.exitCode = run.status ?? 1;
-  }
+    join(fixtureDir, "TModernRuntimeSupport.java"),
+    join(fixtureDir, "WorldgenDispatcherFixtureRuntime.java"),
+    schedulerSource,
+    join(fixtureDir, "WorldgenPriorityJvmFixture.java")], "fixture compile");
+  const runCp = [classes, jar, ...dependencyClasspath].join(delimiter);
+  const output = run(java, ["-cp", runCp, "WorldgenPriorityJvmFixture"], "WorldgenPriorityJvmFixture");
+  assert.match(output, /WORLDGEN_PRIORITY_JVM_OK/, "fixture did not report success");
+  process.stdout.write(output);
 } finally {
   rmSync(root, { recursive: true, force: true });
 }
-process.exit(process.exitCode ?? 1);
 
 function parseClasspath(text) {
   const normalized = text.trim();

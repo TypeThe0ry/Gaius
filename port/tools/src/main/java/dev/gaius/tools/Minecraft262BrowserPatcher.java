@@ -2099,13 +2099,19 @@ public final class Minecraft262BrowserPatcher {
     }
 
     /**
-     * Verifies that the 26.2 FAST preset keeps the vanilla 8/6 distances.
+     * Keeps the 26.2 FAST and FANCY presets on the browser 8/6 distance contract.
      *
-     * <p>The browser patcher used to overwrite these two constants with a smaller distance
-     * budget.  That silently reduced world visibility and simulation coverage, so this pass is
-     * intentionally validation-only: it locates the ordinal-zero FAST arm, checks both option
-     * getter calls and their receiver/field shape, and fails closed if Mojang changes the
-     * bytecode.  No graphics, texture, or mipmap value is rewritten.</p>
+     * <p>The browser patcher used to overwrite the FAST constants with a smaller distance
+     * budget.  That silently reduced world visibility and simulation coverage, so the
+     * ordinal-zero FAST arm stays validation-only at its vanilla 8/6.</p>
+     *
+     * <p>Vanilla {@code Minecraft.<init>} re-applies the persisted preset on every start, and
+     * the ordinal-one FANCY arm writes render 16 / simulation 12 over the seeded 8/6 options;
+     * BrowserSingleplayerClient then forwards 16/12 to the Worker.  Only those two FANCY
+     * constants are rewritten to 8/6.  Every other FANCY value (mipmaps, AO, clouds,
+     * particles, shadows, transparency, filtering) keeps its vanilla constant, and the preset
+     * is not switched to CUSTOM.  Both arms are shape-checked before either constant changes,
+     * and the pass fails closed if Mojang changes the bytecode.</p>
      */
     private static void patchGraphicsPresetBrowserDistances(String jar, Path root)
             throws IOException {
@@ -2126,71 +2132,122 @@ public final class Minecraft262BrowserPatcher {
                 presetSwitch = table;
                 switches++;
             }
+            // Each arm's leading distance local is a dead store.  FANCY keeps its vanilla 16
+            // there, so fail closed if a future build starts reading it.
+            if (instruction instanceof VarInsnNode load
+                    && load.getOpcode() == Opcodes.ILOAD
+                    && load.var == 4) {
+                throw new IllegalStateException(
+                        "GraphicsPreset.apply preset distance local is now read");
+            }
         }
         requireOne("GraphicsPreset.apply ordinal switch", switches);
         if (presetSwitch == null || presetSwitch.labels.size() != 3) {
-            throw new IllegalStateException("GraphicsPreset.apply FAST switch arm is missing");
+            throw new IllegalStateException(
+                    "GraphicsPreset.apply FAST/FANCY switch arm is missing");
         }
 
-        int fastStart = apply.instructions.indexOf(presetSwitch.labels.get(0));
-        if (fastStart < 0) {
-            throw new IllegalStateException("GraphicsPreset.apply FAST switch label is missing");
-        }
-        AbstractInsnNode fastDistance = nextOpcode(presetSwitch.labels.get(0));
-        if (!(fastDistance instanceof IntInsnNode integer)
-                || integer.getOpcode() != Opcodes.BIPUSH
-                || integer.operand != 8) {
+        int[] fast = graphicsPresetArm(apply, presetSwitch, 0, "FAST", 8);
+        int[] fancy = graphicsPresetArm(apply, presetSwitch, 1, "FANCY", 16);
+        findGraphicsPresetDistanceConstant(
+                apply,
+                fast[0],
+                fast[1],
+                options,
+                optionInstance,
+                optionScreen,
+                minecraft,
+                owner,
+                "FAST",
+                "renderDistance",
+                8);
+        findGraphicsPresetDistanceConstant(
+                apply,
+                fast[0],
+                fast[1],
+                options,
+                optionInstance,
+                optionScreen,
+                minecraft,
+                owner,
+                "FAST",
+                "simulationDistance",
+                6);
+        IntInsnNode fancyRenderDistance = findGraphicsPresetDistanceConstant(
+                apply,
+                fancy[0],
+                fancy[1],
+                options,
+                optionInstance,
+                optionScreen,
+                minecraft,
+                owner,
+                "FANCY",
+                "renderDistance",
+                16);
+        IntInsnNode fancySimulationDistance = findGraphicsPresetDistanceConstant(
+                apply,
+                fancy[0],
+                fancy[1],
+                options,
+                optionInstance,
+                optionScreen,
+                minecraft,
+                owner,
+                "FANCY",
+                "simulationDistance",
+                12);
+        fancyRenderDistance.operand = 8;
+        fancySimulationDistance.operand = 6;
+        write(node, root.resolve(owner + ".class"));
+        System.out.println(
+                "Pinned Minecraft 26.2 FAST and FANCY graphics preset distances at render=8"
+                        + " simulation=6 (FANCY was 16/12)");
+    }
+
+    /** Returns the [start, end) instruction indexes of one GraphicsPreset.apply switch arm. */
+    private static int[] graphicsPresetArm(
+            MethodNode apply,
+            TableSwitchInsnNode presetSwitch,
+            int ordinal,
+            String arm,
+            int preambleDistance) {
+        LabelNode label = presetSwitch.labels.get(ordinal);
+        int start = apply.instructions.indexOf(label);
+        if (start < 0) {
             throw new IllegalStateException(
-                    "GraphicsPreset.apply FAST arm distance preamble changed");
+                    "GraphicsPreset.apply " + arm + " switch label is missing");
         }
-        AbstractInsnNode fastDistanceLocal = nextOpcode(fastDistance);
-        if (!(fastDistanceLocal instanceof VarInsnNode local)
+        AbstractInsnNode distance = nextOpcode(label);
+        if (!(distance instanceof IntInsnNode integer)
+                || integer.getOpcode() != Opcodes.BIPUSH
+                || integer.operand != preambleDistance) {
+            throw new IllegalStateException(
+                    "GraphicsPreset.apply " + arm + " arm distance preamble changed");
+        }
+        AbstractInsnNode distanceLocal = nextOpcode(distance);
+        if (!(distanceLocal instanceof VarInsnNode local)
                 || local.getOpcode() != Opcodes.ISTORE
                 || local.var != 4) {
             throw new IllegalStateException(
-                    "GraphicsPreset.apply FAST arm distance local changed");
+                    "GraphicsPreset.apply " + arm + " arm distance local changed");
         }
 
-        int fastEnd = apply.instructions.size();
+        int end = apply.instructions.size();
         for (LabelNode branch : presetSwitch.labels) {
             int index = apply.instructions.indexOf(branch);
-            if (index > fastStart && index < fastEnd) {
-                fastEnd = index;
+            if (index > start && index < end) {
+                end = index;
             }
         }
         int defaultIndex = apply.instructions.indexOf(presetSwitch.dflt);
-        if (defaultIndex > fastStart && defaultIndex < fastEnd) {
-            fastEnd = defaultIndex;
+        if (defaultIndex > start && defaultIndex < end) {
+            end = defaultIndex;
         }
-        if (fastEnd == apply.instructions.size()) {
-            throw new IllegalStateException("GraphicsPreset.apply FAST arm end is missing");
+        if (end == apply.instructions.size()) {
+            throw new IllegalStateException("GraphicsPreset.apply " + arm + " arm end is missing");
         }
-
-        IntInsnNode renderDistance = findGraphicsPresetDistanceConstant(
-                apply,
-                fastStart,
-                fastEnd,
-                options,
-                optionInstance,
-                optionScreen,
-                minecraft,
-                owner,
-                "renderDistance",
-                8);
-        IntInsnNode simulationDistance = findGraphicsPresetDistanceConstant(
-                apply,
-                fastStart,
-                fastEnd,
-                options,
-                optionInstance,
-                optionScreen,
-                minecraft,
-                owner,
-                "simulationDistance",
-                6);
-        write(node, root.resolve(owner + ".class"));
-        System.out.println(
-                "Preserved Minecraft 26.2 FAST graphics preset distances at render=8 simulation=6");
+        return new int[] {start, end};
     }
 
     private static IntInsnNode findGraphicsPresetDistanceConstant(
@@ -2202,6 +2259,7 @@ public final class Minecraft262BrowserPatcher {
             String optionScreen,
             String minecraft,
             String graphicsPreset,
+            String arm,
             String getter,
             int expected) {
         int getterCount = 0;
@@ -2232,14 +2290,14 @@ public final class Minecraft262BrowserPatcher {
                     || screenReceiver.getOpcode() != Opcodes.ALOAD
                     || screenReceiver.var != 2) {
                 throw new IllegalStateException(
-                        "GraphicsPreset.apply FAST " + getter + " receiver shape changed");
+                        "GraphicsPreset.apply " + arm + " " + getter + " receiver shape changed");
             }
             AbstractInsnNode value = nextOpcode(call);
             if (!(value instanceof IntInsnNode integer)
                     || integer.getOpcode() != Opcodes.BIPUSH
                     || integer.operand != expected) {
                 throw new IllegalStateException(
-                        "GraphicsPreset.apply FAST " + getter + " constant shape changed");
+                        "GraphicsPreset.apply " + arm + " " + getter + " constant shape changed");
             }
             AbstractInsnNode boxed = nextOpcode(value);
             if (!(boxed instanceof MethodInsnNode box)
@@ -2248,7 +2306,7 @@ public final class Minecraft262BrowserPatcher {
                     || !box.name.equals("valueOf")
                     || !box.desc.equals("(I)Ljava/lang/Integer;")) {
                 throw new IllegalStateException(
-                        "GraphicsPreset.apply FAST " + getter + " boxing shape changed");
+                        "GraphicsPreset.apply " + arm + " " + getter + " boxing shape changed");
             }
             AbstractInsnNode setter = nextOpcode(boxed);
             if (!(setter instanceof MethodInsnNode set)
@@ -2258,14 +2316,14 @@ public final class Minecraft262BrowserPatcher {
                     || !set.desc.equals("(" + optionScreen + optionInstance
                             + "Ljava/lang/Object;)V")) {
                 throw new IllegalStateException(
-                        "GraphicsPreset.apply FAST " + getter + " setter shape changed");
+                        "GraphicsPreset.apply " + arm + " " + getter + " setter shape changed");
             }
             constant = integer;
         }
-        requireOne("GraphicsPreset.apply FAST " + getter + " target", getterCount);
+        requireOne("GraphicsPreset.apply " + arm + " " + getter + " target", getterCount);
         if (constant == null) {
             throw new IllegalStateException(
-                    "GraphicsPreset.apply FAST " + getter + " target is missing");
+                    "GraphicsPreset.apply " + arm + " " + getter + " target is missing");
         }
         return constant;
     }

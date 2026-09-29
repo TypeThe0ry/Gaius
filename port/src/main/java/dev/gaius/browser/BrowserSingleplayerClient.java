@@ -583,6 +583,10 @@ public final class BrowserSingleplayerClient {
                     typeof value.chunkSender === 'object') {
                   snapshot.chunkSender = copyChunkSenderTelemetry(value.chunkSender);
                 }
+                if (value && typeof value === 'object' && value.dispatcher &&
+                    typeof value.dispatcher === 'object') {
+                  snapshot.dispatcher = copyScalarTelemetry(value.dispatcher);
+                }
                 return snapshot;
               };
               worker.__gaiusTelemetryPending = new Map();

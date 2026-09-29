@@ -22,13 +22,19 @@ const schedulerSourcePath = schedulerSourceOption
   ? path.resolve(nativePath(schedulerSourceOption.slice("--scheduler-source=".length)))
   : path.join(repositoryRoot, "port/src/main/java/dev/gaius/browser/BrowserWorldgenScheduler.java");
 const source = relative => readFile(path.join(repositoryRoot, relative), "utf8");
-const [worldgen, packets, server, client, patcher262, clientPatcher] = await Promise.all([
+const [
+  worldgen, packets, server, client, patcher262, clientPatcher,
+  dispatcherScheduler, workerPatcher, workerBootstrap,
+] = await Promise.all([
   readFile(schedulerSourcePath, "utf8"),
   source("port/src/main/java/dev/gaius/browser/BrowserPacketScheduler.java"),
   source("port/src/main/java/dev/gaius/browser/BrowserIntegratedServerMain.java"),
   source("port/src/main/java/dev/gaius/browser/BrowserSingleplayerClient.java"),
   source("port/tools/src/main/java/dev/gaius/tools/Minecraft262BrowserPatcher.java"),
   source("port/tools/src/main/java/dev/gaius/tools/MinecraftClientPatcher.java"),
+  source("port/src/main/java/dev/gaius/browser/BrowserWorldgenDispatcherScheduler.java"),
+  source("port/tools/src/main/java/dev/gaius/tools/MinecraftServerWorkerPatcher.java"),
+  source("port/web/singleplayer/server-worker-bootstrap.js"),
 ]);
 const schedulerSourceSha256 = createHash("sha256").update(worldgen).digest("hex");
 
@@ -40,18 +46,18 @@ function numericConstant(name) {
   return Number(match[1]);
 }
 
-function jsBody(methodDeclaration) {
-  const methodAt = worldgen.indexOf(methodDeclaration);
+function jsBody(methodDeclaration, javaSource = worldgen) {
+  const methodAt = javaSource.indexOf(methodDeclaration);
   assert.notEqual(methodAt, -1, `missing method declaration: ${methodDeclaration}`);
-  const annotationAt = worldgen.lastIndexOf("@JSBody", methodAt);
+  const annotationAt = javaSource.lastIndexOf("@JSBody", methodAt);
   const marker = 'script = """';
-  const scriptAt = worldgen.indexOf(marker, annotationAt);
+  const scriptAt = javaSource.indexOf(marker, annotationAt);
   assert.ok(annotationAt >= 0 && scriptAt >= 0 && scriptAt < methodAt,
     `missing JSBody script: ${methodDeclaration}`);
   const start = scriptAt + marker.length;
-  const end = worldgen.indexOf('""")', start);
+  const end = javaSource.indexOf('""")', start);
   assert.ok(end > start && end < methodAt, `unterminated JSBody: ${methodDeclaration}`);
-  return worldgen.slice(start, end);
+  return javaSource.slice(start, end);
 }
 
 const constants = {
@@ -641,6 +647,109 @@ assert.deepEqual(globalThis.__gaiusWorldgenStats, {
   lastChunkBroadcastCompleted: 3,
   completedChunkBroadcastBatches: 1,
 }, "worldgen cooperative telemetry lost a bounded batch");
+delete globalThis.__gaiusWorldgenStats;
+
+// Worldgen dispatcher turns. ChunkTaskDispatcher queues level changes, releases and submits
+// at StrictQueue priorities 0-2 and its generation poll at 3; only the poll can suspend in
+// ChunkGenerationTask.runUntilWait. One clamped timer hop per bookkeeping runnable left
+// worldgen idle for 15-20 s after the first chunk batch. worldgen-priority-jvm-smoke.mjs and
+// worldgen-dispatcher-pump-teavm-smoke.mjs execute this contract; keep its shape here in CI.
+const dispatcherConstant = name => {
+  const match = dispatcherScheduler.match(new RegExp(
+    `(?:public|private) static final (?:int|long) ${name} = ([0-9_]+)L?;`));
+  assert.ok(match, `missing dispatcher scheduler constant: ${name}`);
+  return Number(match[1].replaceAll("_", ""));
+};
+assert.equal(dispatcherConstant("GENERATION_PRIORITY"), 3,
+  "only ChunkTaskDispatcher.pollTask (priority 3) may be treated as suspending");
+assert.equal(dispatcherConstant("INLINE_BUDGET_NANOS"), 2_000_000,
+  "dispatcher bookkeeping turns must stay within the reviewed 2 ms budget");
+assert.equal(dispatcherConstant("MAX_RUNNABLES_PER_TURN"), 1024,
+  "dispatcher turns lost their frozen-clock runnable cap");
+const workerPatcherStopIdle = workerPatcher.match(/private static final int DISPATCHER_STOP_IDLE = (\d+);/);
+assert.ok(workerPatcherStopIdle
+    && Number(workerPatcherStopIdle[1]) === dispatcherConstant("STOP_IDLE")
+    && dispatcherConstant("CONTINUE_TURN") === 0,
+  "patched run() stop-reason constants diverged from BrowserWorldgenDispatcherScheduler");
+const continueTurnStart = dispatcherScheduler.indexOf("public static int continueTurn(");
+const continueTurnEnd = dispatcherScheduler.indexOf("public static void endTurn(", continueTurnStart);
+assert.ok(continueTurnStart >= 0 && continueTurnEnd > continueTurnStart,
+  "dispatcher turn classifier is missing");
+const continueTurn = dispatcherScheduler.slice(continueTurnStart, continueTurnEnd);
+const classifierOrder = [
+  "ranPriority < 0", "ranPriority >= GENERATION_PRIORITY", "nextPriority < 0",
+  "nextPriority >= GENERATION_PRIORITY", "INLINE_BUDGET_NANOS", "return CONTINUE_TURN;",
+].map(fragment => continueTurn.indexOf(fragment));
+assert.ok(classifierOrder.every((at, index) => at >= 0 && (index === 0 || at > classifierOrder[index - 1])),
+  "a generation poll must end its turn and never run after bookkeeping in the same turn");
+assert.equal(dispatcherScheduler.split("Platform.startThread(").length - 1, 1,
+  "only a new dispatcher chain may pay Platform.startThread's clamped setTimeout");
+assert.ok(dispatcherScheduler.includes("TModernRuntimeSupport.yieldToEventLoop(0);")
+    && dispatcherScheduler.includes("pump.resumeRequested = true;")
+    && dispatcherScheduler.includes("new IdentityHashMap<>()"),
+  "dispatcher continuation hops must resume the per-dispatcher pump through MessageChannel");
+assert.ok(!dispatcherScheduler.includes("setTimeout(")
+    && !dispatcherScheduler.includes("Platform.schedule(")
+    && !dispatcherScheduler.includes("postRunnableMacrotask"),
+  "raw JavaScript callbacks have no TeaVM thread for a suspending generation poll");
+assert.ok(dispatcherScheduler.includes("if (!completed && resumeRequested)"),
+  "a failing pumped turn must keep its re-registered continuation alive");
+for (const contract of [
+  'HEAD_PRIORITY = "gaius$headPriority"',
+  "StrictQueue$FixedPriorityQueue",
+  "addFixedQueueHeadPriority",
+  '"beginTurn", "()J"',
+  '"continueTurn",\n                "(JIII)I"',
+  '"endTurn",\n                "(JII)V"',
+  "Without the StrictQueue shape every\n     * head is unclassified (-1)",
+]) {
+  assert.ok(workerPatcher.includes(contract), `missing worldgen dispatcher patch contract: ${contract}`);
+}
+assert.match(workerBootstrap, /value\.dispatcher &&[\s\S]*?snapshot\.dispatcher = snapshotScalarTelemetry\(value\.dispatcher\)/,
+  "Worker heartbeat drops nested dispatcher telemetry");
+assert.match(client, /value\.dispatcher &&[\s\S]*?snapshot\.dispatcher = copyScalarTelemetry\(value\.dispatcher\)/,
+  "page worldgen telemetry drops nested dispatcher telemetry");
+
+const recordDispatcherTurn = new Function("runnables", "reason", "elapsedMillis",
+  jsBody("private static native void recordTurnTelemetry(", dispatcherScheduler));
+const recordDispatcherHop = new Function("kind",
+  jsBody("private static native void recordHopTelemetry(", dispatcherScheduler));
+delete globalThis.__gaiusWorldgenStats;
+recordDispatcherHop(0);
+recordDispatcherTurn(1, 2, 7.5);
+recordDispatcherHop(1);
+recordDispatcherTurn(300, 4, 2.0004);
+recordDispatcherHop(1);
+recordDispatcherTurn(12, 3, 0.4);
+recordDispatcherTurn(5, 1, 0.1);
+assert.deepEqual(Object.keys(globalThis.__gaiusWorldgenStats), ["dispatcher"],
+  "dispatcher telemetry must stay nested outside the flat worldgen scalar budget");
+assert.deepEqual(globalThis.__gaiusWorldgenStats.dispatcher, {
+  deferredHops: 3,
+  threadHops: 1,
+  messageHops: 2,
+  turns: 4,
+  runnables: 318,
+  inlineRunnables: 314,
+  lastTurnRunnables: 5,
+  maxTurnRunnables: 300,
+  runnablesPerTurn: 79.5,
+  generationStops: 1,
+  budgetStops: 1,
+  nextGenerationStops: 1,
+  idleStops: 1,
+  maxBookkeepingTurnMillis: 2,
+}, "dispatcher turn/hop telemetry lost a counter");
+Object.defineProperty(globalThis, "__gaiusWorldgenStats", {
+  configurable: true,
+  get() {
+    throw new Error("poisoned worldgen stats");
+  },
+});
+assert.doesNotThrow(() => recordDispatcherTurn(1, 1, 0),
+  "dispatcher turn telemetry exception escaped into the dispatcher");
+assert.doesNotThrow(() => recordDispatcherHop(1),
+  "dispatcher hop telemetry exception escaped into the dispatcher");
 delete globalThis.__gaiusWorldgenStats;
 
 function drainBoundedQueue(queue, budget) {

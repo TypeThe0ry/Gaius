@@ -24,6 +24,11 @@ public final class Platform {
         return startedThreads;
     }
 
+    public static void reset() {
+        THREADS.clear();
+        startedThreads = 0;
+    }
+
     public static void runNextThread() {
         PlatformRunnable command = THREADS.poll();
         if (command == null) {
