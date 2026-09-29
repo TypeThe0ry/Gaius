@@ -492,6 +492,47 @@ function graphicsPresetCustomReturn(applyBytecode) {
   return entry.instruction;
 }
 
+// Maps each GraphicsPreset.apply bytecode offset to its ordinal switch arm.
+function graphicsPresetArmAt(applyBytecode) {
+  const table = applyBytecode.match(
+    /tableswitch\s*\{[^}]*?\n\s*0:\s*(\d+)\s*\n\s*1:\s*(\d+)\s*\n\s*2:\s*(\d+)\s*\n\s*default:\s*(\d+)/);
+  assert.ok(table, "GraphicsPreset.apply FAST/FANCY/FABULOUS ordinal switch shape changed");
+  const [fast, fancy, fabulous, custom] = table.slice(1).map(Number);
+  assert.ok(fast < fancy && fancy < fabulous && fabulous < custom,
+    "GraphicsPreset.apply preset arms are no longer laid out in ordinal order");
+  return offset => offset >= custom ? "CUSTOM" : offset >= fabulous ? "FABULOUS"
+    : offset >= fancy ? "FANCY" : offset >= fast ? "FAST" : "prologue";
+}
+
+function graphicsPresetArmValue(applyBytecode, arm, getter) {
+  const armAt = graphicsPresetArmAt(applyBytecode);
+  const instructions = bytecodeInstructions(applyBytecode);
+  const matches = instructions.flatMap((entry, index) =>
+    armAt(entry.offset) === arm && entry.instruction.includes(`Options.${getter}:`)
+      ? [index] : []);
+  assert.equal(matches.length, 1, `GraphicsPreset.apply ${arm} must set ${getter} once`);
+  return (instructions[matches[0] + 1]?.instruction ?? "").replace(/\s+/g, " ");
+}
+
+// Lists every instruction the patch changed, ignoring constant-pool renumbering.
+function graphicsPresetPatchedValues(rawApplyBytecode, patchedApplyBytecode) {
+  const normalize = applyBytecode => bytecodeInstructions(applyBytecode)
+    .map(({offset, instruction}) => ({
+      offset,
+      instruction: instruction.replace(/#\d+(?:,\s*\d+)?/g, "").replace(/\s+/g, " ").trim(),
+    }));
+  const raw = normalize(rawApplyBytecode);
+  const patched = normalize(patchedApplyBytecode);
+  assert.deepEqual(patched.map(({offset}) => offset), raw.map(({offset}) => offset),
+    "GraphicsPreset.apply instruction layout changed");
+  const armAt = graphicsPresetArmAt(rawApplyBytecode);
+  return raw.flatMap((entry, index) => {
+    if (entry.instruction === patched[index].instruction) return [];
+    const getter = raw[index - 1]?.instruction.match(/Options\.(\w+):/)?.[1] ?? "?";
+    return [`${armAt(entry.offset)} ${getter} ${entry.instruction} -> ${patched[index].instruction}`];
+  });
+}
+
 const HOLDERS_PER_TURN = 16;
 
 function cursorModel(radius, stop = null, batchLimit = HOLDERS_PER_TURN) {
@@ -1223,18 +1264,35 @@ try {
   });
   const rawGraphicsApply = graphicsPresetApply(rawGraphics);
   const patchedGraphicsApply = graphicsPresetApply(patchedGraphics);
+  // Minecraft.<init> re-applies the persisted preset, so the browser default FANCY
+  // preset must itself carry the 8/6 contract or it overwrites the seeded options.
   assert.deepEqual(graphicsPresetDistanceConstants(patchedGraphicsApply, "renderDistance"),
-    ["bipush 8", "bipush 16", "bipush 32"],
-    "26.2 FAST render distance was changed from vanilla 8");
+    ["bipush 8", "bipush 8", "bipush 32"],
+    "26.2 FAST/FANCY render distance is not the browser 8 contract");
   assert.deepEqual(graphicsPresetDistanceConstants(patchedGraphicsApply, "simulationDistance"),
-    ["bipush 6", "bipush 12", "bipush 12"],
-    "26.2 FAST simulation distance was changed from vanilla 6");
+    ["bipush 6", "bipush 6", "bipush 12"],
+    "26.2 FAST/FANCY simulation distance is not the browser 6 contract");
   assert.deepEqual(graphicsPresetDistanceConstants(rawGraphicsApply, "renderDistance"),
     ["bipush 8", "bipush 16", "bipush 32"],
-    "26.2 raw FAST render distance shape changed");
+    "26.2 raw FAST/FANCY render distance shape changed");
   assert.deepEqual(graphicsPresetDistanceConstants(rawGraphicsApply, "simulationDistance"),
     ["bipush 6", "bipush 12", "bipush 12"],
-    "26.2 raw FAST simulation distance shape changed");
+    "26.2 raw FAST/FANCY simulation distance shape changed");
+  const presetDistances = (applyBytecode, arm) => ["renderDistance", "simulationDistance"]
+    .map(getter => graphicsPresetArmValue(applyBytecode, arm, getter).replace(/^bipush /, ""))
+    .join("/");
+  assert.equal(presetDistances(patchedGraphicsApply, "FAST"), "8/6",
+    "26.2 FAST graphics preset distances changed from vanilla 8/6");
+  assert.equal(presetDistances(patchedGraphicsApply, "FANCY"), "8/6",
+    "26.2 FANCY graphics preset still overwrites the browser 8/6 distances");
+  assert.equal(presetDistances(rawGraphicsApply, "FANCY"), "16/12",
+    "26.2 raw FANCY graphics preset distance shape changed");
+  assert.equal(graphicsPresetArmValue(patchedGraphicsApply, "FANCY", "mipmapLevels"), "iconst_4",
+    "26.2 FANCY graphics preset lost vanilla mipmapLevels 4");
+  assert.deepEqual(graphicsPresetPatchedValues(rawGraphicsApply, patchedGraphicsApply), [
+    "FANCY renderDistance bipush 16 -> bipush 8",
+    "FANCY simulationDistance bipush 12 -> bipush 6",
+  ], "26.2 graphics preset patch must change only the FANCY render/simulation distances");
   assert.equal(graphicsPresetCustomReturn(patchedGraphicsApply),
     graphicsPresetCustomReturn(rawGraphicsApply),
     "26.2 CUSTOM graphics preset arm changed");
@@ -1760,7 +1818,10 @@ try {
   console.log("Minecraft 26.2 P1 patcher smoke passed", JSON.stringify({
     scheduledLayerPulses: occurrences(generationWait, "BrowserWorldgenScheduler.pulse"),
     distancePulses: occurrences(distance, "pulseDistanceManager"),
-    graphicsPresetDistances: "8/6",
+    graphicsPresetDistances: {
+      fast: presetDistances(patchedGraphicsApply, "FAST"),
+      fancy: presetDistances(patchedGraphicsApply, "FANCY"),
+    },
     oneTwentyOneFastDistances: "8/6",
     holderBatchLimit: HOLDERS_PER_TURN,
     layerBarrier: true,
