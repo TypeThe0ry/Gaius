@@ -208,9 +208,28 @@ gh workflow run pages.yml --ref main -f release_token="manual-$(date +%s)"
 gh workflow run pages.yml --ref main -f release_token="manual-$(date +%s)" -f release_tag=v0.2.2
 ```
 
-A push to `main` that changes `docs/**`, `relay-nodes.json`, or the workflow
-redeploys the Latest release the same way. Check the live site with
-`node tools/verify-github-pages-cdp.mjs`.
+The workflow runs only on dispatch. Nothing in the repository checkout is
+published, so pushes to `main` (including `docs/**` and `relay-nodes.json`)
+never redeploy Pages. The v0.1.0 publisher dispatches it with
+`release_tag` set to the tag it has just published.
+
+Before uploading, the workflow downloads that release's `SHA256SUMS` into
+`$RUNNER_TEMP`, outside the published artifact, and checks `Gaius-26.2.html`
+with `sha256sum --check` against its one `Gaius-26.2.html` record. A release
+without `SHA256SUMS`, without that record, or with a mismatching hash fails
+the run before anything is deployed. The run summary records the tag and the
+deployed sha256.
+
+Check the live site with `node tools/verify-github-pages-cdp.mjs`. Set
+`GAIUS_PAGES_EXPECTED_SHA256` to the release's `Gaius-26.2.html` sha256 to
+make the verifier hash the live bytes and fail on a mismatch; the live sha256
+is recorded in the report either way. The v0.1.0 publisher sets it to the
+staged client's hash:
+
+```sh
+GAIUS_PAGES_EXPECTED_SHA256="$(awk '$2 == "Gaius-26.2.html" { print $1 }' SHA256SUMS)" \
+  node tools/verify-github-pages-cdp.mjs
+```
 
 ## Keep Git Pushable
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
+import {createHash} from 'node:crypto';
 import {mkdir, mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {createServer} from 'node:net';
@@ -21,6 +22,21 @@ const retiredPages = Object.freeze(['Gaius-1.21.11.html']);
 const expectedTargets = Object.freeze({ '26.2': process.env.GAIUS_TARGET_262 || '' });
 const expectedPageTargets = Object.freeze({ '26.2': process.env.GAIUS_PAGE_DEFAULT_TARGET_262 || '', defaultTarget: process.env.GAIUS_PAGES_DEFAULT_TARGET || '' });
 // Timeout diagnostics retain the exact phrase 	imed out after for CI evidence.
+// pages.yml deploys Gaius-26.2.html only after `sha256sum --check` against its release SHA256SUMS.
+// Optional GAIUS_PAGES_EXPECTED_SHA256 binds this live check to those same release bytes.
+const expectedSha256Page = 'Gaius-26.2.html';
+function parseExpectedSha256(value) {
+  const text = String(value ?? '').trim().toLowerCase();
+  if (text && !/^[0-9a-f]{64}$/.test(text)) throw new Error('GAIUS_PAGES_EXPECTED_SHA256 must be 64 hexadecimal characters');
+  return text;
+}
+const sha256Hex = (bytes) => createHash('sha256').update(bytes).digest('hex');
+function recordLivePage(report, file, status, ok, body, expectedSha256) {
+  const sha256 = sha256Hex(new Uint8Array(body));
+  report.live[file] = {status, bytes: body.byteLength, sha256};
+  check(report.checks, `${file}-http`, ok && body.byteLength > 100_000_000, `HTTP ${status}; bytes=${body.byteLength}; sha256=${sha256}`);
+  if (expectedSha256 && file === expectedSha256Page) check(report.checks, `${file}-sha256`, sha256 === expectedSha256, `live=${sha256}; expected=${expectedSha256}`);
+}
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 function check(checks, name, ok, detail = '') { checks.push({name, ok: Boolean(ok), detail: String(detail)}); }
 async function freePort() {
@@ -51,20 +67,45 @@ if (process.argv.includes('--static-self-test')) {
   assert.ok(retiredPages.every((file) => !expectedPages.includes(file)), 'a retired page is still expected');
   assert.deepEqual(Object.keys(expectedTargets), ['26.2']);
   assert.deepEqual(Object.keys(expectedPageTargets), ['26.2', 'defaultTarget']);
-  // The Pages workflow must download exactly the expected pages, assert that count, and default to the Latest release.
+  // The live sha256 binding: well-formed expectations only, and a mismatch fails the gate.
+  assert.ok(expectedPages.includes(expectedSha256Page), 'the sha256-bound page is not deployed');
+  const abc = 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad';
+  assert.equal(sha256Hex(new TextEncoder().encode('abc')), abc);
+  assert.equal(parseExpectedSha256(undefined), '');
+  assert.equal(parseExpectedSha256(`  ${abc.toUpperCase()}\n`), abc);
+  for (const bad of ['abc', abc.slice(1), `${abc}0`, `${abc.slice(1)}g`]) assert.throws(() => parseExpectedSha256(bad), /64 hexadecimal/);
+  const fixture = new TextEncoder().encode('abc').buffer;
+  for (const [expected, ok] of [[abc, true], ['0'.repeat(64), false], ['', null]]) {
+    const fake = {checks: [], live: {}};
+    recordLivePage(fake, expectedSha256Page, 200, true, fixture, expected);
+    assert.deepEqual(fake.live[expectedSha256Page], {status: 200, bytes: 3, sha256: abc});
+    assert.deepEqual(fake.checks.filter((entry) => entry.name.endsWith('-sha256')).map((entry) => entry.ok), ok === null ? [] : [ok]);
+  }
+  // The Pages workflow is dispatch-only, downloads exactly the expected pages into pages-publish, asserts that
+  // count, verifies them against the release SHA256SUMS kept outside the artifact, and defaults to the Latest release.
   const workflow = await readFile(new URL('../.github/workflows/pages.yml', import.meta.url), 'utf8');
-  assert.deepEqual([...workflow.matchAll(/--pattern '([^']+)'/g)].map((match) => match[1]), [...expectedPages]);
+  const triggers = workflow.split(/^on:[ \t]*$/m)[1]?.split(/^\S/m)[0] ?? '';
+  assert.deepEqual([...triggers.matchAll(/^ {2}([A-Za-z_]+):/gm)].map((match) => match[1]), ['workflow_dispatch'], 'Pages workflow must be dispatch-only');
+  const downloads = [...workflow.matchAll(/gh release download ((?:[^\n]*\\\n)*[^\n]*)/g)]
+    .map(([, args]) => ({patterns: [...args.matchAll(/--pattern '([^']+)'/g)].map((match) => match[1]), dirs: [...args.matchAll(/--dir (\S+)/g)].map((match) => match[1])}));
+  assert.deepEqual(downloads.filter((entry) => entry.dirs.includes('pages-publish')), [{patterns: [...expectedPages], dirs: ['pages-publish']}]);
+  assert.deepEqual(downloads.filter((entry) => !entry.dirs.includes('pages-publish')), [{patterns: ['SHA256SUMS'], dirs: ['"$sums_dir"']}]);
+  assert.ok(workflow.includes('sums_dir="${RUNNER_TEMP}/'), 'Pages workflow must keep SHA256SUMS outside the publish directory');
+  assert.ok(workflow.includes('sha256sum --check --strict'), 'Pages workflow SHA256SUMS verification missing');
   assert.ok(workflow.includes(`find pages-publish -mindepth 1 | wc -l)" -eq ${expectedPages.length}`), 'Pages workflow file-count assertion missing');
   assert.ok(workflow.includes("default: ''") && workflow.includes('gh release view --repo'), 'Pages workflow Latest-release default missing');
+  assert.ok(!/::error::[^\n]*\$\{?tag\b/.test(workflow), 'Pages workflow echoes an unvalidated release tag in a workflow command');
   console.log('VERIFY_GITHUB_PAGES_CDP_STATIC_OK'); process.exit(0);
 }
 
-const report = {schema: 'gaius.github-pages-cdp.v3', base, expectedPages, retiredPages, checks: [], pages: []};
+const report = {schema: 'gaius.github-pages-cdp.v4', base, expectedPages, retiredPages, expectedSha256: null, checks: [], pages: [], live: {}};
 let chrome; let cdp; let profileDir;
 try {
+  const expectedSha256 = parseExpectedSha256(process.env.GAIUS_PAGES_EXPECTED_SHA256);
+  report.expectedSha256 = expectedSha256 || null;
   const rootResponse = await fetch(base, {redirect: 'manual', cache: 'no-store'});
   check(report.checks, 'root-not-published', rootResponse.status === 404, `HTTP ${rootResponse.status}`);
-  for (const file of expectedPages) { const url = new URL(file, base).href; const response = await fetch(url, {cache: 'no-store'}); const body = await response.arrayBuffer(); check(report.checks, `${file}-http`, response.ok && body.byteLength > 100_000_000, `HTTP ${response.status}; bytes=${body.byteLength}`); }
+  for (const file of expectedPages) { const url = new URL(file, base).href; const response = await fetch(url, {cache: 'no-store'}); const body = await response.arrayBuffer(); recordLivePage(report, file, response.status, response.ok, body, expectedSha256); }
   for (const file of retiredPages) { const url = new URL(file, base).href; const response = await fetch(url, {method: 'HEAD', redirect: 'manual', cache: 'no-store'}); check(report.checks, `${file}-retired`, response.status === 404, `HTTP ${response.status}`); }
   const debugPort = await freePort(); profileDir = await mkdtemp(join(tmpdir(), 'gaius-pages-cdp-'));
   chrome = spawn(chromeBinary, ['--headless=new', `--remote-debugging-port=${debugPort}`, '--remote-allow-origins=*', `--user-data-dir=${profileDir}`, '--no-first-run', '--no-default-browser-check', '--disable-gpu'], {windowsHide: true});
@@ -81,7 +122,8 @@ finally {
   const chromeExited = !chrome || chrome.exitCode !== null || chrome.killed;
   const profileRemoved = !profileDir || !(await import('node:fs')).existsSync(profileDir);
   const pagesFinalGate = report.pages.length === expectedPages.length
-    && report.checks.filter((entry) => entry.name.endsWith('-chrome')).every((entry) => entry.ok);
+    && report.checks.filter((entry) => entry.name.endsWith('-chrome')).every((entry) => entry.ok)
+    && (!report.expectedSha256 || report.checks.some((entry) => entry.name === `${expectedSha256Page}-sha256` && entry.ok));
   check(report.checks, 'cdpClosed', cdpClosed);
   check(report.checks, 'chromeExited', chromeExited);
   check(report.checks, 'profileRemoved', profileRemoved);
