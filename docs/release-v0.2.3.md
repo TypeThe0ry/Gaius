@@ -28,11 +28,18 @@ removed:
 
 ## Hosted multiplayer relay
 
-The public relay (`wss://ellan.site/tunnel`) accepts the GitHub Pages browser
-origin again, so multiplayer from the hosted build connects and loads resource
-packs through it. This was a relay-side configuration fix; the client's relay
-registry is unchanged and still lists only that node. The `file://` build is
-unaffected.
+Multiplayer from the hosted (GitHub Pages) build works again. Two fixes were
+needed:
+
+- The public relay (`wss://ellan.site/tunnel`) accepts the GitHub Pages browser
+  origin again (relay-side configuration; the client's relay registry is
+  unchanged and still lists only that node).
+- Before any tunnel exists, the client checks Mojang's blocked-servers list
+  through the relay's HTTP proxy. Without an explicit bridge it addressed the
+  page's own host on port 8080, which does not exist on a hosted page, so the
+  connect stalled on "Connecting to the server…". Non-local pages now use the
+  bundled relay for these requests; only local development hosts
+  (`localhost`, `127.x`, `::1`) keep the local `:8080` bridge fallback.
 
 ## Downloads
 
