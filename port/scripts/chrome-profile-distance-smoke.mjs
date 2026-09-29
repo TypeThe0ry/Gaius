@@ -44,6 +44,23 @@ assert.equal(
   configuration.workerDistanceContract.effectiveDistanceModel,
   "min(client-options-preference,worker-server-distance)",
 );
+// Minecraft.<init> re-applies the seeded graphics preset over renderDistance and
+// simulationDistance, so the natural 8:6 Worker start only holds while the seeded
+// FANCY preset itself carries 8/6.  Vanilla FANCY is 16/12; the 26.2 patcher pins it.
+const performanceContract = JSON.parse(await readFile(configuration.contractPath, "utf8"));
+assert.equal(String(performanceContract.environment?.graphicsPreset).toLowerCase(), "fancy",
+  "the natural 8:6 distance profile must seed the FANCY graphics preset");
+const browserPatcherSource = await readFile(fileURLToPath(new URL(
+  "../tools/src/main/java/dev/gaius/tools/Minecraft262BrowserPatcher.java", import.meta.url,
+)), "utf8");
+assert.match(browserPatcherSource,
+  /graphicsPresetArm\(apply, presetSwitch, 1, "FANCY", 16\)/,
+  "26.2 patcher must locate the ordinal-one FANCY preset arm");
+assert.match(browserPatcherSource,
+  /"FANCY",\s*"renderDistance",\s*16\);[\s\S]*?"FANCY",\s*"simulationDistance",\s*12\);\s*fancyRenderDistance\.operand = 8;\s*fancySimulationDistance\.operand = 6;/,
+  "26.2 patcher must pin the FANCY preset to the browser 8/6 distances");
+assert.doesNotMatch(browserPatcherSource, /GraphicsPreset\.CUSTOM|"CUSTOM"/,
+  "26.2 distance contract must not switch the graphics preset to CUSTOM");
 assert.equal(configuration.activeVersionProfile.storageSchema, 2);
 assert.match(configuration.activeVersionProfile.storageDatabaseName, /^gaius-fs-v2-/);
 assert.match(configuration.activeVersionProfile.storagePrefix, /^gaius\.fs\.v2:/);
@@ -167,4 +184,6 @@ assert.match(
   "profile gate must require a verifiable 8/6 seed path",
 );
 
-console.log("Chrome steady-6-4 profile distance smoke passed (render=8 simulation=6)");
+console.log(
+  "Chrome steady-6-4 profile distance smoke passed (render=8 simulation=6, FANCY preset 8/6)",
+);
