@@ -41,6 +41,16 @@ public final class BrowserSkinProfile {
         return new GameProfile(profile.id(), profile.name(), properties);
     }
 
+    /** A profile carrying one unsigned textures property (used for the profile screen preview). */
+    public static GameProfile withTextures(java.util.UUID id, String name, String texturesValue) {
+        if (texturesValue == null || texturesValue.isBlank()) {
+            return new GameProfile(id, name);
+        }
+        MutablePropertyMap properties = new MutablePropertyMap();
+        properties.put("textures", new Property("textures", texturesValue));
+        return new GameProfile(id, name, properties);
+    }
+
     /** PropertyMap's constructor freezes its input; this override keeps the login map mutable. */
     private static final class MutablePropertyMap extends PropertyMap {
         private final Multimap<String, Property> mutable = ArrayListMultimap.create();

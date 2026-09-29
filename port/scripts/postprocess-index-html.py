@@ -1527,7 +1527,10 @@ def patch_index(
                 "index.html patch point was not found: reopen Gaius loading overlay"
             )
 
-    if 'id="profile-gate"' not in text:
+    # Launchers with the in-game Edit Profile screen (window.__gaiusProfile) have no HTML
+    # player-name gate, switch button or overlay; only migrate older launchers.
+    modern_profile = "window.__gaiusProfile = {" in text
+    if not modern_profile and 'id="profile-gate"' not in text:
         profile_css = '''
     #profile-gate {
       position: fixed;
@@ -1639,7 +1642,7 @@ def patch_index(
             "player-name gate markup",
         )
 
-    if 'const profileGate = document.getElementById("profile-gate");' not in text:
+    if not modern_profile and 'const profileGate = document.getElementById("profile-gate");' not in text:
         text = replace_required(
             text,
             '    const bootBrand = document.getElementById("boot-brand");\n',
@@ -1651,7 +1654,7 @@ def patch_index(
             "player-name gate elements",
         )
 
-    if 'id="profile-switch"' not in text:
+    if not modern_profile and 'id="profile-switch"' not in text:
         profile_switch_css = '''
     #profile-switch {
       position: fixed;
@@ -1701,7 +1704,7 @@ def patch_index(
             "player-name switch button",
         )
 
-    if 'const profileSwitch = document.getElementById("profile-switch");' not in text:
+    if not modern_profile and 'const profileSwitch = document.getElementById("profile-switch");' not in text:
         text = replace_required(
             text,
             '    const profileError = document.getElementById("profile-error");\n',
@@ -1709,7 +1712,7 @@ def patch_index(
             '    const profileSwitch = document.getElementById("profile-switch");\n',
             "player-name switch element",
         )
-    if "if (profileGate) profileGate.hidden = true;" not in text:
+    if not modern_profile and "if (profileGate) profileGate.hidden = true;" not in text:
         text = replace_required(
             text,
             "      if (bootBrand) bootBrand.hidden = true;\n",

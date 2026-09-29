@@ -37,7 +37,7 @@ public final class BrowserFilePersistence {
             // Vanilla represents the display setting "Unlimited" as 260. Existing
             // browser profiles keep their chosen value; this only affects new ones.
             "maxFps:260",
-            "graphicsPreset:\"fancy\"",
+            "graphicsPreset:\"fast\"",
             "renderClouds:\"true\"",
             "cloudRange:32",
             "ao:true",
@@ -67,6 +67,7 @@ public final class BrowserFilePersistence {
             "skipMultiplayerWarning:true",
             "onboardAccessibility:false") + "\n";
     private static final String LEGACY_BROWSER_OPTION_DEFAULTS = BROWSER_OPTION_DEFAULTS
+            .replace("graphicsPreset:\"fast\"\n", "graphicsPreset:\"fancy\"\n")
             .replace("weatherRadius:3\n", "weatherRadius:0\n")
             .replace("onboardAccessibility:false\n", "");
     private static final Map<String, Integer> OPEN_MATERIALIZED_CHUNK_FILES = new HashMap<>();
@@ -504,7 +505,10 @@ public final class BrowserFilePersistence {
 
     private static void migrateLegacyDefaultOptions(VirtualFile existing) throws IOException {
         byte[] bytes = readVirtualFile(existing);
-        String options = new String(bytes, StandardCharsets.UTF_8);
+        // The launcher moves the old Fancy default to Fast once before this runs;
+        // compare against the legacy payload as it was written.
+        String options = new String(bytes, StandardCharsets.UTF_8)
+                .replace("graphicsPreset:\"fast\"\n", "graphicsPreset:\"fancy\"\n");
         String legacyVersionedOptions = "version:" + LEGACY_DATA_VERSION + "\n"
                 + LEGACY_BROWSER_OPTION_DEFAULTS;
         if (!options.equals(LEGACY_BROWSER_OPTION_DEFAULTS)

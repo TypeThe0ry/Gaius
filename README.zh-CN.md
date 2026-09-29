@@ -18,7 +18,7 @@ Gaius 是独立项目，与 Mojang Studios、Microsoft 和 Minecraft 没有隶�
 
 ![Gaius 多人服务器列表](docs/images/gaius-multiplayer.png)
 
-![Gaius 玩家名称界面](docs/images/gaius-player-name.png)
+![Gaius 编辑个人资料界面](docs/images/gaius-player-name.png)
 
 ## 下载
 
@@ -29,9 +29,11 @@ Gaius 是独立项目，与 Mojang Studios、Microsoft 和 Minecraft 没有隶�
 - [SHA256 校验文件](https://github.com/TypeThe0ry/Gaius/releases/latest/download/SHA256SUMS)
 - 可选 Paper 插件在同一个 Release 页面里。
 
-HTML 文件是可直接携带的单人客户端。下载后用新版 Chrome 或 Chromium 打开，先
-填写玩家名称，再点 **Singleplayer**。浏览器启动器和 Worker 需要的内容都在文件
-里，单人模式不用另起网页服务器。
+HTML 文件是可直接携带的单人客户端。下载后用新版 Chrome 或 Chromium 打开，点
+**Singleplayer** 即可。首次启动会自动打开游戏内的 **编辑个人资料（Edit Profile）**
+界面，可以设置玩家名称并上传 64x64 的 PNG 皮肤；之后随时可以从标题界面右上角的
+**Edit Profile** 按钮再次打开，修改立即生效、无需刷新页面。浏览器启动器和 Worker
+需要的内容都在文件里，单人模式不用另起网页服务器。
 
 ### 加入服务器
 

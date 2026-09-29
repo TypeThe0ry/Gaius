@@ -1359,6 +1359,35 @@ try {
     "ASM patch did not instrument actual breaking-model submission");
   }
 
+  // Section rebuild requests must survive skipped world renders, upload timeouts and
+  // out-of-order mesh uploads (terrain holes / black sections).
+  assert.equal(occurrences(method(patchedLevelExtractor, "public void extract(", "private void"),
+    "BrowserSectionAudit.requeueUnconsumed"), 1,
+  "LevelExtractor.extract does not requeue unconsumed section updates");
+  assert.equal(occurrences(method(patchedLevelRenderer, "private void compileSections(",
+    "private void checkPoseStack("), "java/util/List.clear"), 1,
+  "LevelRenderer.compileSections does not mark extracted updates consumed");
+  const javapClass = name => execFileSync(javap, ["-classpath", clientJar, "-p", "-c", name], {
+    encoding: "utf8", maxBuffer: 8 * 1024 * 1024, timeout: 30_000,
+  });
+  const patchedRenderSection = javapClass(
+    "net.minecraft.client.renderer.chunk.SectionRenderDispatcher$RenderSection");
+  assert.ok(patchedRenderSection.includes("public java.lang.Object gaius$latestMesh;"),
+    "RenderSection latest-mesh field is missing");
+  assert.equal(occurrences(method(patchedRenderSection, "private void checkSectionMesh(",
+    "private void vertexBufferUploadCallback("), "BrowserSectionAudit.staleMeshRejected"), 1,
+  "RenderSection.checkSectionMesh does not reject superseded meshes");
+  assert.equal(occurrences(method(patchedRenderSection, "public void reset(",
+    "public net.minecraft.core.BlockPos getRenderOrigin("), "Field gaius$latestMesh"), 1,
+  "RenderSection.reset does not clear the latest mesh");
+  const patchedCompileTask = javapClass(
+    "net.minecraft.client.renderer.chunk.SectionRenderDispatcher$RenderSection$CompileTask");
+  assert.equal(occurrences(patchedCompileTask,
+    "BrowserSectionAudit.requeueAfterUploadTimeout"), 1,
+  "CompileTask upload timeout does not requeue its section");
+  assert.equal(occurrences(patchedCompileTask, "RenderSection.gaius$latestMesh"), 1,
+  "CompileTask does not record its mesh as the section's latest");
+
   const verifierClasspath = [asm, asmTree, asmAnalysis].join(delimiter);
   execFileSync(javac, [
     "--release", "21", "-proc:none", "-classpath", verifierClasspath,

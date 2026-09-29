@@ -51,6 +51,9 @@ compiler_source_excludes=""
 if [[ "$GAIUS_CLIENT_DISTRIBUTION" == "obfuscated-with-mappings" ]]; then
   compiler_source_excludes="            <excludes>
               <exclude>dev/gaius/browser/PlatformSmoke.java</exclude>
+              <exclude>dev/gaius/browser/BrowserProfile.java</exclude>
+              <exclude>dev/gaius/browser/BrowserProfileScreen.java</exclude>
+              <exclude>dev/gaius/browser/BrowserSectionAudit.java</exclude>
             </excludes>"
 fi
 

@@ -458,6 +458,7 @@ public final class MinecraftClientPatcher {
             throw new IllegalStateException(
                     "Options sprint default key patch point was not found: " + sprintDefaults);
         }
+        patchOptionsFastGraphicsPresetDefault(node);
         MethodNode save = find(node, "save", "()V");
         int distanceSyncs = 0;
         for (AbstractInsnNode instruction = save.instructions.getFirst();
@@ -487,6 +488,52 @@ public final class MinecraftClientPatcher {
         }
         save.maxStack = Math.max(save.maxStack, 1);
         write(node, output);
+    }
+
+    /**
+     * New browser players start on the Fast graphics preset. {@code Minecraft.<init>} applies the
+     * persisted preset before the first resource load, so only the option's default value
+     * changes; a saved choice (including Fancy) still wins. Profiles without the 26.2
+     * graphics preset option (1.21.11) are left unchanged.
+     */
+    private static void patchOptionsFastGraphicsPresetDefault(ClassNode node) {
+        String preset = "net/minecraft/client/GraphicsPreset";
+        int patched = 0;
+        boolean presetOption = false;
+        for (MethodNode method : node.methods) {
+            if (!method.name.equals("<init>")) {
+                continue;
+            }
+            boolean inPreset = false;
+            for (AbstractInsnNode instruction = method.instructions.getFirst();
+                    instruction != null;
+                    instruction = instruction.getNext()) {
+                if (instruction instanceof LdcInsnNode constant
+                        && "options.graphics.preset".equals(constant.cst)) {
+                    inPreset = true;
+                    presetOption = true;
+                    continue;
+                }
+                if (inPreset
+                        && instruction instanceof FieldInsnNode field
+                        && field.getOpcode() == Opcodes.PUTFIELD) {
+                    break;
+                }
+                if (inPreset
+                        && instruction instanceof FieldInsnNode field
+                        && field.getOpcode() == Opcodes.GETSTATIC
+                        && field.owner.equals(preset)
+                        && field.name.equals("FANCY")) {
+                    field.name = "FAST";
+                    patched++;
+                    break;
+                }
+            }
+        }
+        if (presetOption && patched != 1) {
+            throw new IllegalStateException(
+                    "Options graphics preset default patch point was not found: " + patched);
+        }
     }
 
     /** 26.2 browser texture path: keep TextureUtil's public ABI and forward to the bulk helper. */
@@ -1429,7 +1476,63 @@ public final class MinecraftClientPatcher {
                     "TitleScreen vanilla credits callback patch point was not found: "
                             + attributionCallbacks);
         }
+        boolean current = node.methods.stream()
+                .anyMatch(method -> method.name.equals("extractRenderState"));
+        if (current) {
+            addTitleScreenProfileHooks(node);
+        }
         write(node, output);
+    }
+
+    /**
+     * Adds the vanilla-styled "Edit Profile" button (BrowserProfileScreen) to the 26.2 title
+     * screen and lets its tick open the editor once on first launch.
+     */
+    private static void addTitleScreenProfileHooks(ClassNode node) {
+        String owner = "net/minecraft/client/gui/screens/TitleScreen";
+        MethodNode init = find(node, "init", "()V");
+        int returns = 0;
+        for (AbstractInsnNode instruction : init.instructions.toArray()) {
+            if (instruction.getOpcode() != Opcodes.RETURN) {
+                continue;
+            }
+            InsnList button = new InsnList();
+            button.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            button.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            button.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "dev/gaius/browser/BrowserProfileScreen",
+                    "titleButton",
+                    "(Lnet/minecraft/client/gui/screens/Screen;)"
+                            + "Lnet/minecraft/client/gui/components/Button;",
+                    false));
+            button.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    owner,
+                    "addRenderableWidget",
+                    "(Lnet/minecraft/client/gui/components/events/GuiEventListener;)"
+                            + "Lnet/minecraft/client/gui/components/events/GuiEventListener;",
+                    false));
+            button.add(new InsnNode(Opcodes.POP));
+            init.instructions.insertBefore(instruction, button);
+            returns++;
+        }
+        if (returns != 1) {
+            throw new IllegalStateException("TitleScreen.init return shape changed: " + returns);
+        }
+        init.maxStack = Math.max(init.maxStack, 3);
+
+        MethodNode tick = find(node, "tick", "()V");
+        InsnList firstRun = new InsnList();
+        firstRun.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        firstRun.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserProfileScreen",
+                "titleTick",
+                "(Lnet/minecraft/client/gui/screens/Screen;)V",
+                false));
+        tick.instructions.insert(firstRun);
+        tick.maxStack = Math.max(tick.maxStack, 1);
     }
 
     private static void patchAbstractButtonBrowserFastSprite(String jar, Path output) throws IOException {
@@ -6318,6 +6421,47 @@ public final class MinecraftClientPatcher {
                         "Current compileSections must not drop an extracted dirty section");
             }
         }
+
+        // Mark the extracted updates consumed once every one has become a compile task.
+        // LevelExtractor re-dirties whatever is still listed at the next extraction (a frame
+        // whose world render was skipped or threw before reaching this loop).
+        int consumed = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (!(instruction instanceof LdcInsnNode constant)
+                    || !"scheduleTranslucentResort".equals(constant.cst)) {
+                continue;
+            }
+            AbstractInsnNode profilerLoad = previousOpcode(constant);
+            if (!(profilerLoad instanceof VarInsnNode load) || load.getOpcode() != Opcodes.ALOAD) {
+                throw new IllegalStateException(
+                        "Current compileSections resort profiler load shape changed");
+            }
+            InsnList clear = new InsnList();
+            clear.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            clear.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    "net/minecraft/client/renderer/LevelRenderer",
+                    "levelRenderState",
+                    "Lnet/minecraft/client/renderer/state/level/LevelRenderState;"));
+            clear.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    "net/minecraft/client/renderer/state/level/LevelRenderState",
+                    "sectionUpdateRenderStates",
+                    "Ljava/util/List;"));
+            clear.add(new MethodInsnNode(
+                    Opcodes.INVOKEINTERFACE,
+                    "java/util/List",
+                    "clear",
+                    "()V",
+                    true));
+            method.instructions.insertBefore(load, clear);
+            consumed++;
+        }
+        if (consumed != 1) {
+            throw new IllegalStateException(
+                    "Current compileSections update consumption point changed: " + consumed);
+        }
+        method.maxStack = Math.max(method.maxStack, 2);
         System.out.println("Patched current section compiles to remain asynchronous");
     }
 
@@ -6430,6 +6574,60 @@ public final class MinecraftClientPatcher {
         if (patched != 1) {
             throw new IllegalStateException(
                     "Current section dirty-preserving throttle changed: " + patched);
+        }
+        boolean trackerField = node.fields.stream().anyMatch(field ->
+                field.name.equals("sectionUpdateTracker")
+                        && field.desc.equals("Lnet/minecraft/client/SectionUpdateTracker;"));
+        if (!trackerField) {
+            throw new IllegalStateException("LevelExtractor section update tracker field changed");
+        }
+        // Before LevelRenderState.reset() drops them, put updates that the previous frame
+        // extracted but never compiled back into the dirty set (see LevelRenderer.compileSections).
+        InsnList requeue = new InsnList();
+        requeue.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        requeue.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                node.name,
+                "levelRenderState",
+                "Lnet/minecraft/client/renderer/state/level/LevelRenderState;"));
+        requeue.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        requeue.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                node.name,
+                "sectionUpdateTracker",
+                "Lnet/minecraft/client/SectionUpdateTracker;"));
+        requeue.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserSectionAudit",
+                "requeueUnconsumed",
+                "(Lnet/minecraft/client/renderer/state/level/LevelRenderState;"
+                        + "Lnet/minecraft/client/SectionUpdateTracker;)V",
+                false));
+        extract.instructions.insert(requeue);
+        extract.maxStack = Math.max(extract.maxStack, 2);
+        int audits = 0;
+        for (AbstractInsnNode instruction : extract.instructions.toArray()) {
+            if (instruction.getOpcode() != Opcodes.RETURN) {
+                continue;
+            }
+            InsnList audit = new InsnList();
+            audit.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            audit.add(new FieldInsnNode(
+                    Opcodes.GETFIELD,
+                    node.name,
+                    "sectionUpdateTracker",
+                    "Lnet/minecraft/client/SectionUpdateTracker;"));
+            audit.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "dev/gaius/browser/BrowserSectionAudit",
+                    "afterExtract",
+                    "(Lnet/minecraft/client/SectionUpdateTracker;)V",
+                    false));
+            extract.instructions.insertBefore(instruction, audit);
+            audits++;
+        }
+        if (audits == 0) {
+            throw new IllegalStateException("LevelExtractor.extract has no return for the section audit");
         }
         writeComputeFrames(node, output);
         System.out.println("Patched current section extraction with dirty-preserving backpressure");
@@ -11138,7 +11336,58 @@ public final class MinecraftClientPatcher {
         write(node, outputRoot.resolve("net/minecraft/client/Minecraft.class"));
     }
 
+    /**
+     * Lets the browser profile editor swap the offline identity without a page reload: the
+     * user/profileFuture fields become non-final and gaius$replaceIdentity replaces both. Every
+     * later getUser()/getGameProfile()/getProfileResult() read (login hello, singleplayer owner)
+     * sees the new name and UUID.
+     */
+    private static void addMinecraftIdentityBridge(ClassNode node) {
+        String owner = "net/minecraft/client/Minecraft";
+        FieldNode userField = null;
+        FieldNode profileField = null;
+        for (FieldNode field : node.fields) {
+            if (field.name.equals("user") && field.desc.equals("Lnet/minecraft/client/User;")) {
+                userField = field;
+            } else if (field.name.equals("profileFuture")
+                    && field.desc.equals("Ljava/util/concurrent/CompletableFuture;")) {
+                profileField = field;
+            }
+        }
+        if (userField == null || profileField == null) {
+            return;
+        }
+        userField.access &= ~Opcodes.ACC_FINAL;
+        profileField.access &= ~Opcodes.ACC_FINAL;
+        String descriptor = "(Lnet/minecraft/client/User;"
+                + "Lcom/mojang/authlib/yggdrasil/ProfileResult;)V";
+        node.methods.removeIf(method -> method.name.equals("gaius$replaceIdentity")
+                && method.desc.equals(descriptor));
+        MethodNode bridge = new MethodNode(
+                Opcodes.ACC_PUBLIC, "gaius$replaceIdentity", descriptor, null, null);
+        bridge.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        bridge.instructions.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        bridge.instructions.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, "user", "Lnet/minecraft/client/User;"));
+        bridge.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        bridge.instructions.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        bridge.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "java/util/concurrent/CompletableFuture",
+                "completedFuture",
+                "(Ljava/lang/Object;)Ljava/util/concurrent/CompletableFuture;",
+                false));
+        bridge.instructions.add(new FieldInsnNode(
+                Opcodes.PUTFIELD, owner, "profileFuture",
+                "Ljava/util/concurrent/CompletableFuture;"));
+        bridge.instructions.add(new InsnNode(Opcodes.RETURN));
+        bridge.maxStack = 2;
+        bridge.maxLocals = 3;
+        node.methods.add(bridge);
+    }
+
     private static void addMinecraftUiBridges(ClassNode node) {
+        addMinecraftIdentityBridge(node);
         String owner = "net/minecraft/client/Minecraft";
         String screenDescriptor = "()Lnet/minecraft/client/gui/screens/Screen;";
         node.methods.removeIf(method -> method.name.equals("gaius$getScreen")
