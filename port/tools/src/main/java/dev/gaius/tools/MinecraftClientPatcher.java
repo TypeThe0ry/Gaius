@@ -40,6 +40,14 @@ public final class MinecraftClientPatcher {
     private MinecraftClientPatcher() {
     }
 
+    /**
+     * 26.2 and later share the named, Java 25 client layout that the modern patch set targets.
+     * 1.21.11 is the only legacy (obfuscated-with-mappings) profile.
+     */
+    static boolean isModernProfile(String minecraftVersion) {
+        return "26.2".equals(minecraftVersion) || "26.3".equals(minecraftVersion);
+    }
+
     public static void main(String[] args) throws IOException {
         Path root = Path.of(args[1]);
         String minecraftVersion = args.length >= 3 ? args[2] : "1.21.11";
@@ -128,7 +136,7 @@ public final class MinecraftClientPatcher {
         patchMemoryDebug(args[0], root.resolve(
                 "net/minecraft/client/gui/components/debug/"
                         + "DebugEntryMemory$AllocationRateCalculator.class"));
-        if ("26.2".equals(minecraftVersion)) {
+        if (isModernProfile(minecraftVersion)) {
             patchDebugScreenOverlayBrowserNoChunk(args[0], root.resolve(
                     "net/minecraft/client/gui/components/DebugScreenOverlay.class"));
         }
@@ -144,7 +152,7 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/client/gui/screens/PauseScreen.class"));
         patchOptionsBrowserLowSimulationDistance(args[0], root.resolve(
                 "net/minecraft/client/Options.class"));
-        if ("26.2".equals(minecraftVersion)) {
+        if (isModernProfile(minecraftVersion)) {
             patchTextureUtilBrowserSolidify(args[0], root.resolve(
                     "com/mojang/blaze3d/platform/TextureUtil.class"));
             patchTextureAtlasBrowserReleaseStaticImages(args[0], root);
@@ -176,7 +184,7 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/server/network/ServerGamePacketListenerImpl.class"));
         patchPlayerChunkSenderBrowserWorker(args[0], root.resolve(
                 "net/minecraft/server/network/PlayerChunkSender.class"),
-                "26.2".equals(minecraftVersion));
+                isModernProfile(minecraftVersion));
         patchServerPlayerGameModeBrowserWorker(args[0], root.resolve(
                 "net/minecraft/server/level/ServerPlayerGameMode.class"));
         patchChunkGeneratorStructureStateBrowserFastRings(args[0], root.resolve(
@@ -193,7 +201,7 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/world/level/levelgen/synth/ImprovedNoise.class"));
         patchPerlinNoiseBrowserDoubleWrap(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/synth/PerlinNoise.class"));
-        boolean deepWorldgenCheckpoints = "26.2".equals(minecraftVersion);
+        boolean deepWorldgenCheckpoints = isModernProfile(minecraftVersion);
         patchNoiseBasedChunkGeneratorBrowserSynchronous(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/NoiseBasedChunkGenerator.class"),
                 deepWorldgenCheckpoints);
@@ -332,7 +340,7 @@ public final class MinecraftClientPatcher {
                 "com/mojang/blaze3d/audio/Listener.class"));
         patchGlslPreprocessor(args[0], root.resolve(
                 "com/mojang/blaze3d/preprocessor/GlslPreprocessor.class"));
-        if ("26.2".equals(minecraftVersion)) {
+        if (isModernProfile(minecraftVersion)) {
             patchMappableRingBufferTelemetry(args[0], root.resolve(
                     "net/minecraft/client/renderer/MappableRingBuffer.class"));
             patchStagedVertexBufferGpuPoolCache(args[0], root.resolve(
@@ -358,7 +366,7 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/client/multiplayer/ClientLevel.class"));
         patchMultiPlayerGameModeBrowserHitSound(args[0], root.resolve(
                 "net/minecraft/client/multiplayer/MultiPlayerGameMode.class"));
-        if ("26.2".equals(minecraftVersion)) {
+        if (isModernProfile(minecraftVersion)) {
             patchLevelRendererBrowserBlockBreakProgress(args[0], root.resolve(
                     "net/minecraft/client/renderer/LevelRenderer.class"), true);
             patchSectionOcclusionGraphBrowserMovementRefresh(args[0], root.resolve(
@@ -6051,7 +6059,7 @@ public final class MinecraftClientPatcher {
     private static void patchSectionNeighborReadiness(
             String jar, Path outputRoot, String minecraftVersion) throws IOException {
         boolean current;
-        if ("26.2".equals(minecraftVersion)) {
+        if (isModernProfile(minecraftVersion)) {
             current = true;
         } else if ("1.21.11".equals(minecraftVersion)) {
             current = false;
@@ -16825,7 +16833,7 @@ public final class MinecraftClientPatcher {
                 "()Lnet/minecraft/server/level/ServerLevel;",
                 true));
         entry.add(new VarInsnNode(Opcodes.ALOAD, 2));
-        if ("26.2".equals(minecraftVersion)) {
+        if (isModernProfile(minecraftVersion)) {
             entry.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
                     "net/minecraft/world/level/ChunkPos", "x", "()I", false));
         } else {
@@ -16833,7 +16841,7 @@ public final class MinecraftClientPatcher {
                     "net/minecraft/world/level/ChunkPos", "x", "I"));
         }
         entry.add(new VarInsnNode(Opcodes.ALOAD, 2));
-        if ("26.2".equals(minecraftVersion)) {
+        if (isModernProfile(minecraftVersion)) {
             entry.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
                     "net/minecraft/world/level/ChunkPos", "z", "()I", false));
         } else {

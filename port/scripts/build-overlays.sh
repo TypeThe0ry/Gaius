@@ -830,8 +830,8 @@ java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
 jar --update \
   --file "$client_output" \
   -C "$client_patch_classes" .
-if [[ "$version" == "26.2" ]]; then
-  # 26.2-only diagnostic hook: map prepared chunk sections to successful draws.
+if [[ "$version" == "26.2" || "$version" == "26.3" ]]; then
+  # Modern (named) profiles. Diagnostic hook: map prepared chunk sections to successful draws.
   # Opt-in at runtime via globalThis.__gaiusChunkDrawTelemetryEnabled; this
   # does not touch terrain selection, upload budgets, textures, or mipmaps.
   java -classpath "$tool_classes:$asm_jar:$asm_tree_jar" \
@@ -874,6 +874,9 @@ elif [[ "$version" == "1.21.11" ]]; then
   jar --update \
     --file "$client_output" \
     -C "$client_patch_classes" .
+else
+  echo "No browser patch set for Minecraft profile $version" >&2
+  exit 1
 fi
 
 echo "$output"
