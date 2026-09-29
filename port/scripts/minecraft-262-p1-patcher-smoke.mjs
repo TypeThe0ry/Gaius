@@ -732,6 +732,14 @@ await Promise.all([
   access(asmAnalysis),
   access(verifierSource),
 ]);
+// MinecraftServerWorkerPatcher runs for both profiles. Exercise its budgeted worldgen
+// dispatcher turns against each fetched client's real PriorityConsecutiveExecutor/StrictQueue.
+for (const clientJar of [rawClientJar, raw121ClientJar]) {
+  execFileSync(process.execPath, [
+    join(repositoryRoot, "port/scripts/worldgen-priority-jvm-smoke.mjs"),
+    "--raw-jar", clientJar,
+  ], {encoding: "utf8", stdio: "inherit", timeout: 300_000});
+}
 const browserPatcherSource = await readFile(
   join(toolsSource, "Minecraft262BrowserPatcher.java"),
   "utf8",
