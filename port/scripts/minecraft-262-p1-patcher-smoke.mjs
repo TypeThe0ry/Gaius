@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
-import {access, copyFile, mkdir, mkdtemp, readFile, rm} from "node:fs/promises";
+import {access, copyFile, mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
 import {existsSync} from "node:fs";
 import {homedir, tmpdir} from "node:os";
 import {basename, delimiter, join} from "node:path";
@@ -412,6 +412,86 @@ function assertPacketProcessorLifecycleContract(packetProcessorBytecode, profile
     `${profileId} PacketProcessor constructor lifecycle bind descriptor changed`);
   assert.match(contract, /pop\s*\n\s*\d+:\s+return/,
     `${profileId} PacketProcessor constructor must discard lifecycle bind status before return`);
+}
+
+// Ready.spawn's ServerLevel.waitForEntities runs inside the
+// ServerboundFinishConfiguration handler.  Preparing must stay in place until
+// the spawn chunk's entities are loaded so that wait never enters managedBlock.
+function assertPrepareSpawnEntityGateContract(preparingBytecode, readyBytecode, profileId,
+  chunkKeyCall) {
+  const tick = method(preparingBytecode,
+    "public net.minecraft.server.network.config.PrepareSpawnTask$Ready tick();",
+    "private void lambda$tick$0(");
+  const tickInstructions = bytecodeInstructions(tick);
+  const chunkDone = tickInstructions.findIndex(({instruction}, index) =>
+    instruction.includes("Field chunkLoadFuture:")
+      && tickInstructions[index + 1]?.instruction.includes("CompletableFuture.isDone:()Z")
+      && /^ifne\s+\d+$/.test(tickInstructions[index + 2]?.instruction ?? ""));
+  assert.ok(chunkDone >= 0, `${profileId} Preparing.tick lost its chunkLoadFuture.isDone check`);
+  const chunkDoneTarget = Number(tickInstructions[chunkDone + 2].instruction.match(/\d+$/)[0]);
+  const gate = tickInstructions.findIndex(({offset}) => offset === chunkDoneTarget);
+  const gateShape = tickInstructions.slice(gate, gate + 8).map(({instruction}) => instruction);
+  assert.ok(gate > chunkDone
+      && gateShape[0] === "aload_0"
+      && gateShape[1]?.includes("Field spawnLevel:")
+      && gateShape[2] === "aload_1"
+      && gateShape[3]?.includes("Method gaius$spawnEntitiesLoaded:"
+        + "(Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/world/phys/Vec3;)Z")
+      && /^ifne\s+\d+$/.test(gateShape[4] ?? "")
+      && gateShape[5] === "aconst_null"
+      && gateShape[6] === "areturn"
+      && Number(gateShape[4].match(/\d+$/)[0]) === tickInstructions[gate + 7]?.offset,
+  `${profileId} Preparing.tick must return null until the spawn chunk's entities load`);
+  const gateCall = tick.indexOf("Method gaius$spawnEntitiesLoaded:");
+  const finish = tick.indexOf("LevelLoadListener.finish:");
+  const fixup = tick.indexOf("PlayerSpawnFinder.gaius$fixupLoadedSpawn:");
+  const ready = tick.indexOf("class net/minecraft/server/network/config/PrepareSpawnTask$Ready");
+  assert.ok(gateCall >= 0 && gateCall < finish && finish < fixup && fixup < ready,
+    `${profileId} entity gate must precede LOAD_PLAYER_CHUNKS finish, spawn fixup and Ready`);
+  assert.equal(occurrences(tick, "Method gaius$spawnEntitiesLoaded:"), 1,
+    `${profileId} Preparing.tick must gate Ready exactly once`);
+  assert.doesNotMatch(tick, /waitForEntities|managedBlock/,
+    `${profileId} Preparing.tick must not block the server thread`);
+
+  const helper = method(preparingBytecode,
+    "private static boolean gaius$spawnEntitiesLoaded(net.minecraft.server.level.ServerLevel, "
+      + "net.minecraft.world.phys.Vec3);");
+  const helperInstructions = bytecodeInstructions(helper);
+  const loadedCheck = helperInstructions.findIndex(({instruction}) =>
+    instruction.includes("ServerLevel.areEntitiesLoaded:(J)Z"));
+  assert.ok(loadedCheck > 0
+      && helperInstructions[loadedCheck - 1].instruction.includes(chunkKeyCall)
+      && /^ifeq\s+\d+$/.test(helperInstructions[loadedCheck + 1]?.instruction ?? ""),
+  `${profileId} spawn entity gate must key ServerLevel.areEntitiesLoaded with ${chunkKeyCall}`);
+  const waitingTarget = Number(helperInstructions[loadedCheck + 1].instruction.match(/\d+$/)[0]);
+  const waiting = helperInstructions.findIndex(({offset}) => offset === waitingTarget);
+  const loadedPath = helperInstructions.slice(loadedCheck + 2, waiting)
+    .map(({instruction}) => instruction);
+  assert.ok(loadedPath.some(instruction => instruction.includes(
+    "BrowserIntegratedServerMain.markSpawnEntitiesLoaded:(II)V"))
+      && loadedPath.at(-2) === "iconst_1" && loadedPath.at(-1) === "ireturn",
+  `${profileId} loaded spawn entities must report once and let Preparing turn Ready`);
+  const waitingPath = helperInstructions.slice(waiting).map(({instruction}) => instruction);
+  const refresh = waitingPath.findIndex(instruction =>
+    instruction.includes("ServerChunkCache.addTicketWithRadius:"));
+  assert.ok(waitingPath.some(instruction => instruction.includes("TicketType.PLAYER_SPAWN"))
+      && refresh > 0 && waitingPath[refresh - 1] === "iconst_1"
+      && waitingPath.at(-2) === "iconst_0" && waitingPath.at(-1) === "ireturn",
+  `${profileId} waiting spawn gate must refresh the radius-1 PLAYER_SPAWN ticket`);
+  assert.ok(helper.includes("BlockPos.containing:(Lnet/minecraft/core/Position;)")
+      && occurrences(helper, "ishr") === 2,
+  `${profileId} spawn entity gate must use the spawn position's own chunk`);
+  assert.doesNotMatch(helper, /waitForEntities|managedBlock/,
+    `${profileId} spawn entity gate must poll without blocking`);
+
+  const spawn = method(readyBytecode,
+    "public net.minecraft.server.level.ServerPlayer spawn(net.minecraft.network.Connection, "
+      + "net.minecraft.server.network.CommonListenerCookie);");
+  const spawnInstructions = bytecodeInstructions(spawn);
+  const waitForEntities = spawnInstructions.findIndex(({instruction}) =>
+    instruction.includes("ServerLevel.waitForEntities:"));
+  assert.equal(spawnInstructions[waitForEntities - 1]?.instruction, "iconst_0",
+    `${profileId} Ready.spawn must keep its radius-0 entity wait as a no-op safety net`);
 }
 
 function bytecodeInstructions(methodBytecode) {
@@ -1348,6 +1428,46 @@ try {
   assert.deepEqual(graphicsPresetDistanceConstants(generic121Apply, "simulationDistance"),
     ["bipush 6", "bipush 12", "bipush 12"],
     "1.21.11 FAST simulation distance was changed by the 26.2 overlay path");
+
+  // The spawn entity gate adds a branch to Preparing.tick, so its rebuilt
+  // stack map frames must also pass the JVM verifier on both profiles.
+  const classInitVerifier = join(root, "GaiusClassInitVerifier.java");
+  await writeFile(classInitVerifier, [
+    "public class GaiusClassInitVerifier {",
+    "  public static void main(String[] args) throws Exception {",
+    "    for (String name : args) {",
+    "      Class.forName(name, true, GaiusClassInitVerifier.class.getClassLoader());",
+    "      System.out.println(\"CLASS_INIT_VERIFIED \" + name);",
+    "    }",
+    "  }",
+    "}",
+    "",
+  ].join("\n"));
+  execFileSync(javac, ["--release", "21", "-proc:none", "-d", classes, classInitVerifier], {
+    encoding: "utf8", timeout: 30_000,
+  });
+  for (const [profileId, patchedJar, chunkKeyCall] of [
+    ["26.2", clientJar, "ChunkPos.pack:()J"],
+    ["1.21.11", generic121Jar, "ChunkPos.toLong:()J"],
+  ]) {
+    const preparing = execFileSync(javap, ["-classpath", patchedJar, "-p", "-c",
+      "net.minecraft.server.network.config.PrepareSpawnTask$Preparing"], {
+      encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30_000,
+    });
+    const ready = execFileSync(javap, ["-classpath", patchedJar, "-p", "-c",
+      "net.minecraft.server.network.config.PrepareSpawnTask$Ready"], {
+      encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30_000,
+    });
+    assertPrepareSpawnEntityGateContract(preparing, ready, profileId, chunkKeyCall);
+    const verified = execFileSync(java, ["-Xverify:all", "-classpath",
+      [classes, patchedJar].join(delimiter), "GaiusClassInitVerifier",
+      "net.minecraft.server.network.config.PrepareSpawnTask$Preparing"], {
+      encoding: "utf8", timeout: 30_000,
+    });
+    assert.match(verified,
+      /CLASS_INIT_VERIFIED net\.minecraft\.server\.network\.config\.PrepareSpawnTask\$Preparing/,
+      `${profileId} patched PrepareSpawnTask$Preparing failed JVM verification`);
+  }
 
   const patchedPacketUtils = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
     "net.minecraft.network.protocol.PacketUtils"], {

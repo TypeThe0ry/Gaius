@@ -146,6 +146,11 @@ public final class BrowserIntegratedServerMain {
         }
     }
 
+    /** Marks PrepareSpawnTask turning Ready once its spawn chunk's entities are loaded. */
+    public static void markSpawnEntitiesLoaded(int chunkX, int chunkZ) {
+        reportRuntimeEvent("spawn-entities-loaded", chunkX + "," + chunkZ);
+    }
+
     public static void registerServer(MinecraftServer minecraftServer) {
         if (!isWorkerRuntime()) {
             return;

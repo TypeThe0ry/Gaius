@@ -6349,6 +6349,19 @@ def check_source_patches() -> None:
             and "replaceIntArgumentBeforeCall" in client_patcher,
         ),
         (
+            "Browser configuration loads spawn entities before FinishConfiguration",
+            "addPrepareSpawnEntityGate(jar, preparing, prepareTick)" in client_patcher
+            and '"gaius$spawnEntitiesLoaded"' in client_patcher
+            and '"areEntitiesLoaded"' in client_patcher
+            and "PrepareSpawnTask entity gate point changed" in client_patcher
+            and 'writeComputeFrames(preparing, root.resolve(preparingOwner + ".class"))'
+            in client_patcher
+            and '"markSpawnEntitiesLoaded"' in client_patcher
+            and "public static void markSpawnEntitiesLoaded(int chunkX, int chunkZ)"
+            in browser_integrated_server_main
+            and 'reportRuntimeEvent("spawn-entities-loaded"' in browser_integrated_server_main,
+        ),
+        (
             "Worker-local singleplayer bypasses remote keepalive timeouts during chunk generation",
             "public static boolean isWorkerServer()" in browser_integrated_server_main
             and "patchServerCommonPacketListenerBrowserWorker" in client_patcher
@@ -8520,6 +8533,11 @@ def check_overlay_bytecode() -> None:
         prepare_spawn_task,
         "private void lambda$tick$0(net.minecraft.world.level.ChunkPos);",
     )
+    prepare_spawn_entities_loaded = method_section(
+        prepare_spawn_task,
+        "private static boolean gaius$spawnEntitiesLoaded(net.minecraft.server.level.ServerLevel, net.minecraft.world.phys.Vec3);",
+    )
+    prepare_spawn_entity_gate = prepare_spawn_tick.find("Method gaius$spawnEntitiesLoaded:")
     server_chunk_future_main_thread = method_section(
         server_chunk_cache,
         "public java.util.concurrent.CompletableFuture<net.minecraft.server.level.ChunkResult<net.minecraft.world.level.chunk.ChunkAccess>> getChunkFutureMainThread(int, int, net.minecraft.world.level.chunk.status.ChunkStatus, boolean);",
@@ -11704,6 +11722,26 @@ def check_overlay_bytecode() -> None:
             and "iconst_0" in prepare_spawn_player
             and "iconst_3" not in prepare_spawn_player
             and "ServerLevel.waitForEntities" in prepare_spawn_player,
+        ),
+        (
+            "Browser spawn preparation turns Ready only after spawn entities load",
+            0
+            <= prepare_spawn_tick.rfind("CompletableFuture.isDone", 0, prepare_spawn_entity_gate)
+            < prepare_spawn_entity_gate
+            < prepare_spawn_tick.find("LevelLoadListener.finish")
+            < prepare_spawn_tick.find("PlayerSpawnFinder.gaius$fixupLoadedSpawn")
+            and "aconst_null" in prepare_spawn_tick[
+                prepare_spawn_entity_gate:prepare_spawn_tick.find("LevelLoadListener.finish")
+            ]
+            and "ServerLevel.areEntitiesLoaded:(J)Z" in prepare_spawn_entities_loaded
+            and re.search(r"ChunkPos\.(?:pack|toLong):\(\)J", prepare_spawn_entities_loaded)
+            is not None
+            and "BrowserIntegratedServerMain.markSpawnEntitiesLoaded:(II)V"
+            in prepare_spawn_entities_loaded
+            and "TicketType.PLAYER_SPAWN" in prepare_spawn_entities_loaded
+            and "ServerChunkCache.addTicketWithRadius" in prepare_spawn_entities_loaded
+            and "managedBlock" not in prepare_spawn_entities_loaded
+            and "waitForEntities" not in prepare_spawn_entities_loaded,
         ),
         (
             "Worker-local configuration cannot time out while its first chunk is generated",

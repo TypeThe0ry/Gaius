@@ -19434,7 +19434,12 @@ public final class MinecraftClientPatcher {
                             + loadedSpawnFixups);
         }
         prepareTick.maxStack = Math.max(prepareTick.maxStack, 2);
-        write(preparing, root.resolve(preparingOwner + ".class"));
+        if (addPrepareSpawnEntityGate(jar, preparing, prepareTick)) {
+            // The gate adds a branch target, so rebuild the stack map frames.
+            writeComputeFrames(preparing, root.resolve(preparingOwner + ".class"));
+        } else {
+            write(preparing, root.resolve(preparingOwner + ".class"));
+        }
 
         String readyOwner = "net/minecraft/server/network/config/PrepareSpawnTask$Ready";
         ClassNode ready = read(jar, readyOwner + ".class");
@@ -19450,6 +19455,181 @@ public final class MinecraftClientPatcher {
                         + "Lnet/minecraft/server/level/ServerPlayer;"),
                 "net/minecraft/server/level/ServerLevel", "waitForEntities", 3, 0);
         write(ready, root.resolve(readyOwner + ".class"));
+    }
+
+    /**
+     * Keeps PrepareSpawnTask in Preparing until the spawn chunk's entities are loaded.
+     * Entities load only once the centre chunk is accessible, which
+     * ChunkMap.prepareAccessibleChunk ties to its radius-1 neighbours; turning Ready at FULL
+     * left that wait to Ready.spawn's waitForEntities, a managedBlock inside the
+     * ServerboundFinishConfiguration handler. Waiting here spans ordinary server ticks, so
+     * the handler's radius-0 wait passes on its first check. While waiting, the
+     * PLAYER_SPAWN ticket is refreshed as Ready.keepAlive does: its 20-tick timeout runs once
+     * the centre holder is ready for saving, which can precede the entity read. Returns
+     * false, keeping the handler wait, when this version lacks the entity or ChunkPos shape.
+     */
+    private static boolean addPrepareSpawnEntityGate(
+            String jar, ClassNode preparing, MethodNode prepareTick) throws IOException {
+        String chunkPosOwner = "net/minecraft/world/level/ChunkPos";
+        String serverLevelOwner = "net/minecraft/server/level/ServerLevel";
+        ClassNode chunkPos = read(jar, chunkPosOwner + ".class");
+        // 26.2 renamed ChunkPos.toLong() to pack(); both return the entity manager's key.
+        String packChunkPos = findNullable(chunkPos, "pack", "()J") != null
+                ? "pack"
+                : findNullable(chunkPos, "toLong", "()J") != null ? "toLong" : null;
+        if (packChunkPos == null
+                || findNullable(read(jar, serverLevelOwner + ".class"),
+                        "areEntitiesLoaded", "(J)Z") == null) {
+            return false;
+        }
+
+        LabelNode chunkLoaded = null;
+        int gatePoints = 0;
+        for (AbstractInsnNode instruction : prepareTick.instructions.toArray()) {
+            if (instruction instanceof FieldInsnNode field
+                    && field.getOpcode() == Opcodes.GETFIELD
+                    && field.owner.equals(preparing.name)
+                    && field.name.equals("chunkLoadFuture")
+                    && nextOpcode(field) instanceof MethodInsnNode isDone
+                    && isDone.owner.equals("java/util/concurrent/CompletableFuture")
+                    && isDone.name.equals("isDone")
+                    && nextOpcode(isDone) instanceof JumpInsnNode loaded
+                    && loaded.getOpcode() == Opcodes.IFNE) {
+                chunkLoaded = loaded.label;
+                gatePoints++;
+            }
+        }
+        if (gatePoints != 1) {
+            throw new IllegalStateException(
+                    "PrepareSpawnTask entity gate point changed: " + gatePoints);
+        }
+
+        String entitiesLoadedDescriptor =
+                "(Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/world/phys/Vec3;)Z";
+        // Local 1 holds the joined spawn position on every path to this point. Stay in
+        // Preparing, before LevelLoadListener.finish, until the gate reports loaded entities.
+        LabelNode entitiesLoaded = new LabelNode();
+        InsnList gate = new InsnList();
+        gate.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        gate.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                preparing.name,
+                "spawnLevel",
+                "Lnet/minecraft/server/level/ServerLevel;"));
+        gate.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        gate.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                preparing.name,
+                "gaius$spawnEntitiesLoaded",
+                entitiesLoadedDescriptor,
+                false));
+        gate.add(new JumpInsnNode(Opcodes.IFNE, entitiesLoaded));
+        gate.add(new InsnNode(Opcodes.ACONST_NULL));
+        gate.add(new InsnNode(Opcodes.ARETURN));
+        gate.add(entitiesLoaded);
+        prepareTick.instructions.insertBefore(nextOpcode(chunkLoaded), gate);
+
+        MethodNode spawnEntitiesLoaded = new MethodNode(
+                Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC | Opcodes.ACC_SYNTHETIC,
+                "gaius$spawnEntitiesLoaded",
+                entitiesLoadedDescriptor,
+                null,
+                null);
+        InsnList code = spawnEntitiesLoaded.instructions;
+        LabelNode waiting = new LabelNode();
+        // Same chunk as Ready.spawn's waitForEntities: gaius$fixupLoadedSpawn only moves
+        // the position within this chunk.
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "net/minecraft/core/BlockPos",
+                "containing",
+                "(Lnet/minecraft/core/Position;)Lnet/minecraft/core/BlockPos;",
+                false));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 2));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/core/Vec3i",
+                "getX",
+                "()I",
+                false));
+        code.add(new InsnNode(Opcodes.ICONST_4));
+        code.add(new InsnNode(Opcodes.ISHR));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 3));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/core/Vec3i",
+                "getZ",
+                "()I",
+                false));
+        code.add(new InsnNode(Opcodes.ICONST_4));
+        code.add(new InsnNode(Opcodes.ISHR));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 4));
+        code.add(new TypeInsnNode(Opcodes.NEW, chunkPosOwner));
+        code.add(new InsnNode(Opcodes.DUP));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 4));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESPECIAL,
+                chunkPosOwner,
+                "<init>",
+                "(II)V",
+                false));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 5));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                chunkPosOwner,
+                packChunkPos,
+                "()J",
+                false));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                serverLevelOwner,
+                "areEntitiesLoaded",
+                "(J)Z",
+                false));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, waiting));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 4));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserIntegratedServerMain",
+                "markSpawnEntitiesLoaded",
+                "(II)V",
+                false));
+        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(new InsnNode(Opcodes.IRETURN));
+        code.add(waiting);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                serverLevelOwner,
+                "getChunkSource",
+                "()Lnet/minecraft/server/level/ServerChunkCache;",
+                false));
+        code.add(new FieldInsnNode(
+                Opcodes.GETSTATIC,
+                "net/minecraft/server/level/TicketType",
+                "PLAYER_SPAWN",
+                "Lnet/minecraft/server/level/TicketType;"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 5));
+        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/server/level/ServerChunkCache",
+                "addTicketWithRadius",
+                "(Lnet/minecraft/server/level/TicketType;Lnet/minecraft/world/level/ChunkPos;I)V",
+                false));
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new InsnNode(Opcodes.IRETURN));
+        spawnEntitiesLoaded.maxStack = 4;
+        spawnEntitiesLoaded.maxLocals = 6;
+        preparing.methods.add(spawnEntitiesLoaded);
+        return true;
     }
 
     private static void patchStructureTemplateManagerBrowserGzip(String jar, Path outputRoot)
