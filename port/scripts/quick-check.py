@@ -6350,16 +6350,33 @@ def check_source_patches() -> None:
         ),
         (
             "Browser configuration loads spawn entities before FinishConfiguration",
-            "addPrepareSpawnEntityGate(jar, preparing, prepareTick)" in client_patcher
+            "addPrepareSpawnEntityGate(jar, root, preparing, prepareTick)" in client_patcher
             and '"gaius$spawnEntitiesLoaded"' in client_patcher
             and '"areEntitiesLoaded"' in client_patcher
             and "PrepareSpawnTask entity gate point changed" in client_patcher
             and 'writeComputeFrames(preparing, root.resolve(preparingOwner + ".class"))'
             in client_patcher
             and '"markSpawnEntitiesLoaded"' in client_patcher
+            and '"markSpawnEntitiesWaiting"' in client_patcher
             and "public static void markSpawnEntitiesLoaded(int chunkX, int chunkZ)"
             in browser_integrated_server_main
-            and 'reportRuntimeEvent("spawn-entities-loaded"' in browser_integrated_server_main,
+            and "public static void markSpawnEntitiesWaiting(int chunkX, int chunkZ)"
+            in browser_integrated_server_main
+            and 'reportRuntimeEvent("spawn-entities-loaded"' in browser_integrated_server_main
+            and 'reportRuntimeEvent("spawn-entities-waiting"' in browser_integrated_server_main,
+        ),
+        (
+            # Vanilla IntegratedServer, the fallback when the Worker cannot start,
+            # ticks no level while its player list is empty, so the gate drains
+            # pending entity loads itself and waits only on the Worker server.
+            "Browser spawn entity gate is Worker-only and drains pending entity loads",
+            '"gaius$processPendingEntityLoads"' in client_patcher
+            and '"processPendingLoads"' in client_patcher
+            and 'write(serverLevel, root.resolve(serverLevelOwner + ".class"))' in client_patcher
+            and '"isWorkerServer"'
+            in client_patcher[
+                client_patcher.find("private static boolean addPrepareSpawnEntityGate(") :
+            ],
         ),
         (
             "Worker-local singleplayer bypasses remote keepalive timeouts during chunk generation",
@@ -7846,6 +7863,7 @@ def check_overlay_bytecode() -> None:
         client_cp,
         "net.minecraft.server.network.config.PrepareSpawnTask$Preparing",
     )
+    server_level = run_javap(client_cp, "net.minecraft.server.level.ServerLevel")
     prepare_spawn_ready = run_javap(
         client_cp,
         "net.minecraft.server.network.config.PrepareSpawnTask$Ready",
@@ -8538,6 +8556,13 @@ def check_overlay_bytecode() -> None:
         "private static boolean gaius$spawnEntitiesLoaded(net.minecraft.server.level.ServerLevel, net.minecraft.world.phys.Vec3);",
     )
     prepare_spawn_entity_gate = prepare_spawn_tick.find("Method gaius$spawnEntitiesLoaded:")
+    prepare_spawn_entity_drain = prepare_spawn_entities_loaded.find(
+        "ServerLevel.gaius$processPendingEntityLoads:()V"
+    )
+    server_level_process_pending_entity_loads = method_section(
+        server_level,
+        "public void gaius$processPendingEntityLoads();",
+    )
     server_chunk_future_main_thread = method_section(
         server_chunk_cache,
         "public java.util.concurrent.CompletableFuture<net.minecraft.server.level.ChunkResult<net.minecraft.world.level.chunk.ChunkAccess>> getChunkFutureMainThread(int, int, net.minecraft.world.level.chunk.status.ChunkStatus, boolean);",
@@ -11740,8 +11765,23 @@ def check_overlay_bytecode() -> None:
             in prepare_spawn_entities_loaded
             and "TicketType.PLAYER_SPAWN" in prepare_spawn_entities_loaded
             and "ServerChunkCache.addTicketWithRadius" in prepare_spawn_entities_loaded
+            and "BrowserIntegratedServerMain.markSpawnEntitiesWaiting:(II)V"
+            in prepare_spawn_entities_loaded
             and "managedBlock" not in prepare_spawn_entities_loaded
             and "waitForEntities" not in prepare_spawn_entities_loaded,
+        ),
+        (
+            "Browser spawn entity gate bytecode is Worker-only and drains pending entity loads",
+            0
+            <= prepare_spawn_entities_loaded.find(
+                "BrowserIntegratedServerMain.isWorkerServer:()Z"
+            )
+            < prepare_spawn_entity_drain
+            < prepare_spawn_entities_loaded.find("ServerLevel.areEntitiesLoaded:(J)Z")
+            and "Field entityManager:Lnet/minecraft/world/level/entity/PersistentEntitySectionManager;"
+            in server_level_process_pending_entity_loads
+            and "PersistentEntitySectionManager.processPendingLoads:()V"
+            in server_level_process_pending_entity_loads,
         ),
         (
             "Worker-local configuration cannot time out while its first chunk is generated",

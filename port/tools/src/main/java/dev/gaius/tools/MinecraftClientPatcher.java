@@ -19434,7 +19434,7 @@ public final class MinecraftClientPatcher {
                             + loadedSpawnFixups);
         }
         prepareTick.maxStack = Math.max(prepareTick.maxStack, 2);
-        if (addPrepareSpawnEntityGate(jar, preparing, prepareTick)) {
+        if (addPrepareSpawnEntityGate(jar, root, preparing, prepareTick)) {
             // The gate adds a branch target, so rebuild the stack map frames.
             writeComputeFrames(preparing, root.resolve(preparingOwner + ".class"));
         } else {
@@ -19465,22 +19465,47 @@ public final class MinecraftClientPatcher {
      * ServerboundFinishConfiguration handler. Waiting here spans ordinary server ticks, so
      * the handler's radius-0 wait passes on its first check. While waiting, the
      * PLAYER_SPAWN ticket is refreshed as Ready.keepAlive does: its 20-tick timeout runs once
-     * the centre holder is ready for saving, which can precede the entity read. Returns
-     * false, keeping the handler wait, when this version lacks the entity or ChunkPos shape.
+     * the centre holder is ready for saving, which can precede the entity read.
+     *
+     * <p>The gate is live without level ticks: like waitForEntities' own predicate it drains
+     * the entity manager's pending loads before checking, through a public ServerLevel
+     * accessor added here. Vanilla IntegratedServer, reached when the Worker cannot start,
+     * runs only tickConnection while its player list is empty, so its levels never tick
+     * during the host's configuration. The gate is also active only on the Worker server;
+     * elsewhere it passes at once and Ready.spawn keeps its handler wait. Returns false,
+     * keeping the handler wait everywhere, when this version lacks the entity or ChunkPos
+     * shape.</p>
      */
     private static boolean addPrepareSpawnEntityGate(
-            String jar, ClassNode preparing, MethodNode prepareTick) throws IOException {
+            String jar, Path root, ClassNode preparing, MethodNode prepareTick)
+            throws IOException {
         String chunkPosOwner = "net/minecraft/world/level/ChunkPos";
         String serverLevelOwner = "net/minecraft/server/level/ServerLevel";
+        String entityManagerOwner =
+                "net/minecraft/world/level/entity/PersistentEntitySectionManager";
+        String entityManagerDescriptor = "L" + entityManagerOwner + ";";
         ClassNode chunkPos = read(jar, chunkPosOwner + ".class");
+        ClassNode serverLevel = read(jar, serverLevelOwner + ".class");
+        MethodNode processPendingLoads = findNullable(
+                read(jar, entityManagerOwner + ".class"), "processPendingLoads", "()V");
         // 26.2 renamed ChunkPos.toLong() to pack(); both return the entity manager's key.
         String packChunkPos = findNullable(chunkPos, "pack", "()J") != null
                 ? "pack"
                 : findNullable(chunkPos, "toLong", "()J") != null ? "toLong" : null;
         if (packChunkPos == null
-                || findNullable(read(jar, serverLevelOwner + ".class"),
-                        "areEntitiesLoaded", "(J)Z") == null) {
+                || findNullable(serverLevel, "areEntitiesLoaded", "(J)Z") == null
+                || serverLevel.fields.stream().noneMatch(field ->
+                        field.name.equals("entityManager")
+                                && field.desc.equals(entityManagerDescriptor)
+                                && (field.access & Opcodes.ACC_STATIC) == 0)
+                || processPendingLoads == null
+                || (processPendingLoads.access & Opcodes.ACC_PUBLIC) == 0
+                || (processPendingLoads.access & Opcodes.ACC_STATIC) != 0) {
             return false;
+        }
+        if (findNullable(serverLevel, "gaius$processPendingEntityLoads", "()V") != null) {
+            throw new IllegalStateException(
+                    "ServerLevel.gaius$processPendingEntityLoads already exists");
         }
 
         LabelNode chunkLoaded = null;
@@ -19536,7 +19561,20 @@ public final class MinecraftClientPatcher {
                 null,
                 null);
         InsnList code = spawnEntitiesLoaded.instructions;
+        LabelNode workerServer = new LabelNode();
         LabelNode waiting = new LabelNode();
+        // Only the Worker server waits here. Any other server passes at once, so Preparing
+        // turns Ready at FULL and Ready.spawn's waitForEntities keeps the entity wait.
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserIntegratedServerMain",
+                "isWorkerServer",
+                "()Z",
+                false));
+        code.add(new JumpInsnNode(Opcodes.IFNE, workerServer));
+        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(new InsnNode(Opcodes.IRETURN));
+        code.add(workerServer);
         // Same chunk as Ready.spawn's waitForEntities: gaius$fixupLoadedSpawn only moves
         // the position within this chunk.
         code.add(new VarInsnNode(Opcodes.ALOAD, 1));
@@ -19578,6 +19616,15 @@ public final class MinecraftClientPatcher {
                 "(II)V",
                 false));
         code.add(new VarInsnNode(Opcodes.ASTORE, 5));
+        // Drain finished entity reads first, as waitForEntities' predicate does. Only
+        // ServerLevel.tick does this otherwise, and a paused server never ticks its levels.
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                serverLevelOwner,
+                "gaius$processPendingEntityLoads",
+                "()V",
+                false));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new VarInsnNode(Opcodes.ALOAD, 5));
         code.add(new MethodInsnNode(
@@ -19624,11 +19671,46 @@ public final class MinecraftClientPatcher {
                 "addTicketWithRadius",
                 "(Lnet/minecraft/server/level/TicketType;Lnet/minecraft/world/level/ChunkPos;I)V",
                 false));
+        // Counts waiting ticks and reports a long wait once, so a stalled join stays visible.
+        code.add(new VarInsnNode(Opcodes.ILOAD, 3));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 4));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserIntegratedServerMain",
+                "markSpawnEntitiesWaiting",
+                "(II)V",
+                false));
         code.add(new InsnNode(Opcodes.ICONST_0));
         code.add(new InsnNode(Opcodes.IRETURN));
         spawnEntitiesLoaded.maxStack = 4;
         spawnEntitiesLoaded.maxLocals = 6;
         preparing.methods.add(spawnEntitiesLoaded);
+
+        // ServerLevel.entityManager is private; this accessor is the only non-tick way to
+        // run the processPendingLoads call that waitForEntities' predicate makes.
+        MethodNode processPendingEntityLoads = new MethodNode(
+                Opcodes.ACC_PUBLIC | Opcodes.ACC_SYNTHETIC,
+                "gaius$processPendingEntityLoads",
+                "()V",
+                null,
+                null);
+        processPendingEntityLoads.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        processPendingEntityLoads.instructions.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                serverLevelOwner,
+                "entityManager",
+                entityManagerDescriptor));
+        processPendingEntityLoads.instructions.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                entityManagerOwner,
+                "processPendingLoads",
+                "()V",
+                false));
+        processPendingEntityLoads.instructions.add(new InsnNode(Opcodes.RETURN));
+        processPendingEntityLoads.maxStack = 1;
+        processPendingEntityLoads.maxLocals = 1;
+        serverLevel.methods.add(processPendingEntityLoads);
+        write(serverLevel, root.resolve(serverLevelOwner + ".class"));
         return true;
     }
 

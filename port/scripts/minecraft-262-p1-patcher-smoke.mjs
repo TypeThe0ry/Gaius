@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
-import {access, copyFile, mkdir, mkdtemp, readFile, rm, writeFile} from "node:fs/promises";
+import {access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile} from "node:fs/promises";
 import {existsSync} from "node:fs";
 import {homedir, tmpdir} from "node:os";
 import {basename, delimiter, join} from "node:path";
@@ -415,10 +415,11 @@ function assertPacketProcessorLifecycleContract(packetProcessorBytecode, profile
 }
 
 // Ready.spawn's ServerLevel.waitForEntities runs inside the
-// ServerboundFinishConfiguration handler.  Preparing must stay in place until
-// the spawn chunk's entities are loaded so that wait never enters managedBlock.
-function assertPrepareSpawnEntityGateContract(preparingBytecode, readyBytecode, profileId,
-  chunkKeyCall) {
+// ServerboundFinishConfiguration handler.  On the browser Worker server,
+// Preparing must stay in place until the spawn chunk's entities are loaded so
+// that wait never enters managedBlock.  Any other server keeps that wait.
+function assertPrepareSpawnEntityGateContract(preparingBytecode, readyBytecode,
+  serverLevelBytecode, profileId, chunkKeyCall) {
   const tick = method(preparingBytecode,
     "public net.minecraft.server.network.config.PrepareSpawnTask$Ready tick();",
     "private void lambda$tick$0(");
@@ -457,12 +458,49 @@ function assertPrepareSpawnEntityGateContract(preparingBytecode, readyBytecode, 
     "private static boolean gaius$spawnEntitiesLoaded(net.minecraft.server.level.ServerLevel, "
       + "net.minecraft.world.phys.Vec3);");
   const helperInstructions = bytecodeInstructions(helper);
+  // Vanilla IntegratedServer (the fallback when the Worker cannot start) keeps
+  // its handler wait: the gate passes at once unless this is the Worker server.
+  assert.ok(helperInstructions[0]?.instruction.includes(
+    "Method dev/gaius/browser/BrowserIntegratedServerMain.isWorkerServer:()Z")
+      && /^ifne\s+\d+$/.test(helperInstructions[1]?.instruction ?? "")
+      && helperInstructions[2]?.instruction === "iconst_1"
+      && helperInstructions[3]?.instruction === "ireturn"
+      && Number(helperInstructions[1].instruction.match(/\d+$/)[0])
+        === helperInstructions[4]?.offset,
+  `${profileId} spawn entity gate must pass at once on any server but the browser Worker`);
+  assert.equal(occurrences(helper, "BrowserIntegratedServerMain.isWorkerServer:()Z"), 1,
+    `${profileId} spawn entity gate must check for the Worker server exactly once`);
   const loadedCheck = helperInstructions.findIndex(({instruction}) =>
     instruction.includes("ServerLevel.areEntitiesLoaded:(J)Z"));
   assert.ok(loadedCheck > 0
       && helperInstructions[loadedCheck - 1].instruction.includes(chunkKeyCall)
       && /^ifeq\s+\d+$/.test(helperInstructions[loadedCheck + 1]?.instruction ?? ""),
   `${profileId} spawn entity gate must key ServerLevel.areEntitiesLoaded with ${chunkKeyCall}`);
+  // A paused server (vanilla IntegratedServer with no players yet) never runs
+  // ServerLevel.tick, the only other drain of finished entity reads.  Mirror
+  // waitForEntities' predicate: processPendingLoads, then areEntitiesLoaded.
+  const drain = helperInstructions.findIndex(({instruction}) => instruction.includes(
+    "Method net/minecraft/server/level/ServerLevel.gaius$processPendingEntityLoads:()V"));
+  assert.ok(drain > 4
+      && helperInstructions[drain - 1].instruction === "aload_0"
+      && helperInstructions[drain + 1]?.instruction === "aload_0"
+      && loadedCheck === drain + 4,
+  `${profileId} spawn entity gate must drain pending entity loads right before checking them`);
+  assert.equal(occurrences(helper, "gaius$processPendingEntityLoads"), 1,
+    `${profileId} spawn entity gate must drain pending entity loads exactly once per check`);
+  const accessorStart = serverLevelBytecode.indexOf(
+    "public void gaius$processPendingEntityLoads();");
+  assert.ok(accessorStart >= 0,
+    `${profileId} patched ServerLevel lost its pending entity load accessor`);
+  const accessor = serverLevelBytecode.slice(accessorStart).split(/\r?\n\s*\r?\n/)[0];
+  assert.deepEqual(bytecodeInstructions(accessor)
+    .map(({instruction}) => instruction.replace(/\s+#\d+\s+\/\/\s+/, " ")), [
+    "aload_0",
+    "getfield Field entityManager:Lnet/minecraft/world/level/entity/PersistentEntitySectionManager;",
+    "invokevirtual Method net/minecraft/world/level/entity/PersistentEntitySectionManager"
+      + ".processPendingLoads:()V",
+    "return",
+  ], `${profileId} ServerLevel accessor must run the entity manager's processPendingLoads`);
   const waitingTarget = Number(helperInstructions[loadedCheck + 1].instruction.match(/\d+$/)[0]);
   const waiting = helperInstructions.findIndex(({offset}) => offset === waitingTarget);
   const loadedPath = helperInstructions.slice(loadedCheck + 2, waiting)
@@ -478,6 +516,9 @@ function assertPrepareSpawnEntityGateContract(preparingBytecode, readyBytecode, 
       && refresh > 0 && waitingPath[refresh - 1] === "iconst_1"
       && waitingPath.at(-2) === "iconst_0" && waitingPath.at(-1) === "ireturn",
   `${profileId} waiting spawn gate must refresh the radius-1 PLAYER_SPAWN ticket`);
+  assert.ok(waitingPath.some(instruction => instruction.includes(
+    "BrowserIntegratedServerMain.markSpawnEntitiesWaiting:(II)V")),
+  `${profileId} waiting spawn gate must count its wait so a stalled join is reported`);
   assert.ok(helper.includes("BlockPos.containing:(Lnet/minecraft/core/Position;)")
       && occurrences(helper, "ishr") === 2,
   `${profileId} spawn entity gate must use the spawn position's own chunk`);
@@ -1446,9 +1487,37 @@ try {
   execFileSync(javac, ["--release", "21", "-proc:none", "-d", classes, classInitVerifier], {
     encoding: "utf8", timeout: 30_000,
   });
-  for (const [profileId, patchedJar, chunkKeyCall] of [
-    ["26.2", clientJar, "ChunkPos.pack:()J"],
-    ["1.21.11", generic121Jar, "ChunkPos.toLong:()J"],
+  // Run the gate itself on the JVM with no level ticking.  A stub stands in
+  // for the TeaVM-only BrowserIntegratedServerMain; isWorkerServer() is its
+  // static `worker` field.
+  const spawnGateClasses = join(root, "spawn-gate-classes");
+  const spawnGateStub = join(root, "spawn-gate-stub", "dev", "gaius", "browser",
+    "BrowserIntegratedServerMain.java");
+  await mkdir(join(root, "spawn-gate-stub", "dev", "gaius", "browser"), {recursive: true});
+  await writeFile(spawnGateStub, [
+    "package dev.gaius.browser;",
+    "",
+    "public final class BrowserIntegratedServerMain {",
+    "  public static boolean worker;",
+    "  public static String loaded = \"\";",
+    "  public static String waiting = \"\";",
+    "  public static boolean isWorkerServer() { return worker; }",
+    "  public static void markSpawnEntitiesLoaded(int x, int z) {",
+    "    loaded += x + \",\" + z + \";\";",
+    "  }",
+    "  public static void markSpawnEntitiesWaiting(int x, int z) {",
+    "    waiting += x + \",\" + z + \";\";",
+    "  }",
+    "}",
+    "",
+  ].join("\n"));
+  execFileSync(javac, ["--release", "21", "-proc:none", "-d", spawnGateClasses, spawnGateStub,
+    join(repositoryRoot, "port/scripts/fixtures/GaiusSpawnEntityGateFixture.java")], {
+    encoding: "utf8", timeout: 30_000,
+  });
+  for (const [profileId, patchedJar, rawJar, chunkKeyCall] of [
+    ["26.2", clientJar, rawClientJar, "ChunkPos.pack:()J"],
+    ["1.21.11", generic121Jar, raw121ClientJar, "ChunkPos.toLong:()J"],
   ]) {
     const preparing = execFileSync(javap, ["-classpath", patchedJar, "-p", "-c",
       "net.minecraft.server.network.config.PrepareSpawnTask$Preparing"], {
@@ -1458,7 +1527,11 @@ try {
       "net.minecraft.server.network.config.PrepareSpawnTask$Ready"], {
       encoding: "utf8", maxBuffer: 4 * 1024 * 1024, timeout: 30_000,
     });
-    assertPrepareSpawnEntityGateContract(preparing, ready, profileId, chunkKeyCall);
+    const serverLevel = execFileSync(javap, ["-classpath", patchedJar, "-p", "-c",
+      "net.minecraft.server.level.ServerLevel"], {
+      encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000,
+    });
+    assertPrepareSpawnEntityGateContract(preparing, ready, serverLevel, profileId, chunkKeyCall);
     const verified = execFileSync(java, ["-Xverify:all", "-classpath",
       [classes, patchedJar].join(delimiter), "GaiusClassInitVerifier",
       "net.minecraft.server.network.config.PrepareSpawnTask$Preparing"], {
@@ -1467,6 +1540,49 @@ try {
     assert.match(verified,
       /CLASS_INIT_VERIFIED net\.minecraft\.server\.network\.config\.PrepareSpawnTask\$Preparing/,
       `${profileId} patched PrepareSpawnTask$Preparing failed JVM verification`);
+
+    // Only the two patched classes go in front of the vanilla jar: the rest of
+    // the overlay calls Gaius browser classes that are absent on the JVM.
+    const gateOverlay = join(root, `spawn-gate-overlay-${profileId}`);
+    await mkdir(gateOverlay, {recursive: true});
+    execFileSync(jar, ["--extract", "--file", patchedJar,
+      "net/minecraft/server/network/config/PrepareSpawnTask$Preparing.class",
+      "net/minecraft/server/level/ServerLevel.class"], {
+      cwd: gateOverlay, encoding: "utf8", timeout: 30_000,
+    });
+    const librariesRoot = join(repositoryRoot, "port/work", profileId, "libraries");
+    const libraries = (await readdir(librariesRoot, {recursive: true}))
+      .filter(entry => entry.endsWith(".jar"))
+      .sort()
+      .map(entry => join(librariesRoot, entry));
+    assert.ok(libraries.length > 0, `${profileId} spawn gate fixture needs ${librariesRoot}`);
+    // An argument file keeps the long library classpath clear of the Windows
+    // command-line limit.
+    const gateArguments = join(root, `spawn-gate-${profileId}.args`);
+    const gateClasspath = [spawnGateClasses, gateOverlay, rawJar, ...libraries]
+      .join(delimiter).replaceAll("\\", "/");
+    await writeFile(gateArguments, `-classpath\n"${gateClasspath}"\n`);
+    // Output is kept for the failure message only: vanilla libraries print JDK
+    // deprecation warnings on every run, and Bootstrap routes the fixture's
+    // own stack traces through its stdout logger.
+    let gate;
+    try {
+      gate = execFileSync(java, ["-Xverify:all", `@${gateArguments}`,
+        "GaiusSpawnEntityGateFixture"], {
+        encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 120_000,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (error) {
+      throw new Error(`${profileId} spawn entity gate fixture failed:\n`
+        + `${error.stdout ?? ""}${error.stderr ?? ""}`, {cause: error});
+    }
+    for (const marker of [
+      "SPAWN_ENTITY_GATE_NON_WORKER_PASSES",
+      "SPAWN_ENTITY_GATE_WAITS_WITH_TICKET",
+      "SPAWN_ENTITY_GATE_DRAINS_PENDING_LOADS",
+    ]) {
+      assert.ok(gate.includes(marker), `${profileId} spawn entity gate fixture missed ${marker}`);
+    }
   }
 
   const patchedPacketUtils = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",

@@ -33,6 +33,8 @@ public final class BrowserIntegratedServerMain {
     private static final int INDEXED_DB_FALLBACK_REHYDRATION_MAX_ENTRIES = 4096;
     private static final int MAX_NETWORK_INPUT_FOLLOWUPS = 4;
     private static final int MAX_NETWORK_INPUT_DEFERRED_RETRIES = 4;
+    /** Five seconds at 20 TPS; one report, so an unbounded entity wait is not silent. */
+    private static final int SPAWN_ENTITIES_WAIT_REPORT_TICKS = 100;
     private static MinecraftServer server;
     private static Thread serverThread;
     private static boolean serverThreadExited = true;
@@ -85,6 +87,9 @@ public final class BrowserIntegratedServerMain {
     private static String indexedDbFallbackHydrationFailure;
     private static final Deque<Integer> sentChunkBatches = new ArrayDeque<>();
     private static int acknowledgedChunkCount;
+    /** Spawn chunk whose PrepareSpawnTask entity wait is being counted. */
+    private static long spawnEntitiesWaitChunk = Long.MIN_VALUE;
+    private static int spawnEntitiesWaitTicks;
     private static final Runnable NETWORK_INPUT_TASK =
             BrowserIntegratedServerMain::runScheduledNetworkInput;
 
@@ -146,9 +151,36 @@ public final class BrowserIntegratedServerMain {
         }
     }
 
+    /**
+     * Counts PrepareSpawnTask ticks spent waiting for the spawn chunk's entities. A wait that
+     * reaches {@link #SPAWN_ENTITIES_WAIT_REPORT_TICKS} is reported once, so a join stalled on
+     * an entity read is visible even though no packet handler is blocked.
+     */
+    public static void markSpawnEntitiesWaiting(int chunkX, int chunkZ) {
+        long chunk = spawnEntitiesChunkKey(chunkX, chunkZ);
+        if (chunk != spawnEntitiesWaitChunk) {
+            spawnEntitiesWaitChunk = chunk;
+            spawnEntitiesWaitTicks = 0;
+        }
+        if (++spawnEntitiesWaitTicks == SPAWN_ENTITIES_WAIT_REPORT_TICKS) {
+            reportRuntimeEvent("spawn-entities-waiting",
+                    chunkX + "," + chunkZ + ";ticks=" + spawnEntitiesWaitTicks);
+        }
+    }
+
     /** Marks PrepareSpawnTask turning Ready once its spawn chunk's entities are loaded. */
     public static void markSpawnEntitiesLoaded(int chunkX, int chunkZ) {
-        reportRuntimeEvent("spawn-entities-loaded", chunkX + "," + chunkZ);
+        int waitedTicks = spawnEntitiesWaitChunk == spawnEntitiesChunkKey(chunkX, chunkZ)
+                ? spawnEntitiesWaitTicks
+                : 0;
+        spawnEntitiesWaitChunk = Long.MIN_VALUE;
+        spawnEntitiesWaitTicks = 0;
+        reportRuntimeEvent("spawn-entities-loaded",
+                chunkX + "," + chunkZ + ";waitTicks=" + waitedTicks);
+    }
+
+    private static long spawnEntitiesChunkKey(int chunkX, int chunkZ) {
+        return ((long) chunkX << 32) | (chunkZ & 0xFFFFFFFFL);
     }
 
     public static void registerServer(MinecraftServer minecraftServer) {
@@ -196,6 +228,8 @@ public final class BrowserIntegratedServerMain {
         indexedDbFallbackHydrationFailure = null;
         sentChunkBatches.clear();
         acknowledgedChunkCount = 0;
+        spawnEntitiesWaitChunk = Long.MIN_VALUE;
+        spawnEntitiesWaitTicks = 0;
         recordDistanceRampTelemetry("reset");
         configurePlayerList(minecraftServer.getPlayerList());
         setIntegratedServerDistances(workerViewDistance(), workerSimulationDistance());
