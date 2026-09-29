@@ -73,13 +73,6 @@ def main() -> int:
         generated = index.read_text(encoding="utf-8")
         for selector in (
             'id="mc-canvas"',
-            'id="profile-gate"',
-            'id="profile-name"',
-            'id="profile-skin-input"',
-            'id="profile-skin-preview"',
-            'id="mc-skin-input"',
-            'id="mc-skin-preview"',
-            'id="profile-switch"',
             'id="boot-screen"',
             'id="boot-progress"',
             'id="status"',
@@ -92,16 +85,24 @@ def main() -> int:
         ):
             require(generated, selector)
 
+        # The in-game Edit Profile screen replaces the HTML gate, switch and overlay.
+        for removed in ('id="profile-gate"', 'id="profile-switch"', 'id="mc-name-overlay"',
+                        'requestGaiusPlayerName', 'gaius.pendingPlayerName'):
+            if removed in generated:
+                raise AssertionError(f"generated launcher still contains legacy profile UI: {removed}")
+
         for contract in (
             "window.__gaiusSetBootProgress",
             "window.__gaiusShowBootOverlay",
             "window.__gaiusDefaultArgsPromise",
             "window.__gaiusConfigureSession",
-            "window.__gaiusChangePlayerName",
             "customGaiusSkinDescriptor",
+            "window.__gaiusProfile = {",
+            "function generateGaiusDefaultPlayerName()",
+            "window.__gaiusProfile.firstRun = true;",
+            "function gaiusTexturesValue(dataUrl, slim)",
+            "function decodeGaiusSkinFile(file)",
             "window.__gaiusSkinDescriptor = customSkinDescriptor || session.skinDescriptor || null;",
-            "function renderGaiusCustomSkin(preview, status, clearButton)",
-            "nameSkinInput.addEventListener(\"change\"",
             "new Float32Array(4096)",
             "fps.rafFrameWriteIndex",
             "fps.rafFrameCount",
@@ -133,9 +134,9 @@ def main() -> int:
 
         template = (ROOT / "port" / "web" / "launcher" / "index.template.html").read_text(encoding="utf-8")
         for contract in (
-            'id="profile-skin-input"',
-            'id="mc-skin-input"',
             'gaius.customSkin',
+            'gaius.customSkinModel',
+            'window.__gaiusProfile = {',
             'customGaiusSkinDescriptor',
             'data:image\\/png;base64,',
         ):
@@ -145,10 +146,9 @@ def main() -> int:
             "GAIUS",
             "CLIENT",
             "BROWSER CLIENT",
-            "Choose a player name and an optional custom skin.",
             "Retry startup",
             "Show diagnostics",
-            "Gaius is an independent browser client.",
+            "independent browser software",
         ):
             require(generated, visible_text)
 

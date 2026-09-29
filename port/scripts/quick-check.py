@@ -7490,25 +7490,23 @@ def check_source_patches() -> None:
             and "async function acquireGaiusRuntimeLease()" in postprocess_index_html,
         ),
         (
-            "Browser boot uses Gaius branding, player-name gate, and English UI",
+            "Browser boot uses Gaius branding, the in-game profile bridge, and English UI",
             "boot-progress-bar" in index_html
             and "Gaius boot screen" in index_html
             and 'id="boot-screen"' in index_html
             and 'id="boot-brand"' in index_html
             and "GAIUS<span>CLIENT</span>" in index_html
-            and 'id="profile-gate"' in index_html
-            and 'id="profile-name"' in index_html
-            and 'id="profile-submit"' in index_html
-            and 'id="profile-switch"' in index_html
-            and "Change player name" in index_html
-            and "function requestGaiusPlayerName(initialName)" in index_html
-            and "function changeGaiusPlayerName()" in index_html
-            and "function updateGaiusProfileSwitch()" in index_html
+            and 'id="profile-gate"' not in index_html
+            and 'id="mc-name-overlay"' not in index_html
+            and "function requestGaiusPlayerName" not in index_html
+            and "window.__gaiusProfile = {" in index_html
+            and "function generateGaiusDefaultPlayerName()" in index_html
+            and "window.__gaiusProfile.firstRun = true;" in index_html
             and 'sessionStorage.removeItem("gaius.session")' in index_html
-            and 'next.searchParams.delete(key)' in index_html
             and 'localStorage.setItem("gaius.playerName", username)' in index_html
-            and "Use 1-16 letters, numbers, or underscores." in index_html
-            and "not affiliated with Mojang Studios or Microsoft" in index_html
+            and "Use 1-16 letters, numbers or underscores." in index_html
+            and "function migrateGaiusFastGraphicsDefault()" in index_html
+            and "independent browser software" in index_html
             and "MOJANG<span>STUDIOS</span>" not in index_html
             and "BrowserPlayer" not in index_html
             and '<html lang="en">' in index_html

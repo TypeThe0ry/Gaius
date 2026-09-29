@@ -1582,21 +1582,14 @@ async function configureWorldSeed(session, seed) {
 async function passProfileGate(session) {
   await waitFor(
     session,
-    "document.querySelector('#profile-gate')?.hidden===false"
+    "typeof window.__gaiusReleaseBoot==='function'"
       + "||!!window.__gaiusMinecraftState",
     60_000,
-    "the player-name gate or Minecraft startup",
-  );
-  await waitFor(
-    session,
-    "document.querySelector('#profile-gate')?.hidden!==false"
-      + "||typeof window.__gaiusFsReady!=='undefined'",
-    60_000,
-    "the browser persistence bootstrap",
+    "the launcher boot hold or Minecraft startup",
   );
   return evaluate(session, "(async() => {"
-    + "const gate=document.querySelector('#profile-gate');"
-    + "if(!gate||gate.hidden!==false)throw new Error('Profile gate was not visible; refusing to reuse an existing Worker');"
+    + "if(typeof globalThis.__gaiusReleaseBoot!=='function'||globalThis.__gaiusMinecraftState)"
+    + "throw new Error('Launcher boot hold was not active; refusing to reuse an existing Worker');"
     + "const path='/gaius/options.txt';"
     + "const encoded=" + JSON.stringify(benchmarkOptionsBase64) + ";"
     + "const storageReady=typeof globalThis.__gaiusFsReady!=='undefined';"
@@ -1715,12 +1708,7 @@ async function passProfileGate(session) {
     + "if(registryBeforeSubmitPresent&&(typeof registryBeforeSubmit.size!=='number'"
     + "||!Number.isInteger(registryBeforeSubmitSize)||registryBeforeSubmitSize!==0))"
     + "throw new Error('Profile gate observed a pre-existing singleplayer Worker before submit');"
-      + "const input=document.querySelector('#profile-name');"
-      + "const submit=document.querySelector('#profile-submit');"
-      + "if(!input||!submit)throw new Error('Profile gate controls were not exposed');"
-    + "input.value=" + JSON.stringify(playerName) + ";"
-    + "input.dispatchEvent(new Event('input',{bubbles:true}));"
-    + "submit.click();"
+    + "globalThis.__gaiusReleaseBoot();"
     + "return {submitted:true,seeded:persisted||fsPut||localStoragePut,"
     + "persisted,fsPut,flushed,localStoragePut,storageReady,workerDistanceObserverInstalled,"
     + "workerDistanceMode:pinWorkerDistance?'harness-pin-diagnostic':'natural-observation',"
@@ -5626,6 +5614,13 @@ try {
     mobile: false,
   });
   await session.send("Page.bringToFront");
+  // The launcher has no HTML name gate: preset the remembered player name and
+  // hold the boot at the launcher's pre-main hook (storage and session ready,
+  // client not started) so options can be seeded before Minecraft reads them.
+  await session.send("Page.addScriptToEvaluateOnNewDocument", {source: "(()=>{"
+    + "try{localStorage.setItem('gaius.playerName'," + JSON.stringify(playerName) + ");}catch(ignored){}"
+    + "globalThis.__gaiusBeforeMain=()=>new Promise(resolve=>{globalThis.__gaiusReleaseBoot=resolve;});"
+    + "})();"});
   const navigation = await session.send("Page.navigate", {url: targetUrl});
   if (navigation.errorText) throw new Error("Chrome navigation failed: " + navigation.errorText);
   const profileGateResult = await passProfileGate(session);

@@ -262,6 +262,12 @@ try {
         }
       }).observe({type: 'longtask', buffered: true});
     } catch (ignored) {}
+    // No HTML name gate any more: preset the remembered name and hold the boot
+    // at the launcher's pre-main hook so timing still starts at "submit".
+    try { localStorage.setItem('gaius.playerName', ${JSON.stringify(playerName)}); } catch (ignored) {}
+    globalThis.__gaiusBeforeMain = () => new Promise((resolve) => {
+      globalThis.__gaiusReleaseBoot = resolve;
+    });
   `});
   if (cpuProfiling) {
     await session.send("Profiler.start");
@@ -274,17 +280,16 @@ try {
   try {
     await waitFor(
       session,
-      "!!document.querySelector('#profile-name') && !!document.querySelector('#profile-submit') "
-        + "&& document.querySelector('#profile-gate')?.hidden === false",
+      "typeof globalThis.__gaiusReleaseBoot === 'function'",
       30_000,
-      "the player-name gate",
+      "the launcher pre-main boot hold",
     );
   } catch (error) {
     const pageDiagnostic = await evaluate(session, `(() => ({
       href: location.href,
       readyState: document.readyState,
       title: document.title,
-      profileGateHidden: document.querySelector('#profile-gate')?.hidden,
+      bootHeld: typeof globalThis.__gaiusReleaseBoot === 'function',
       bodyText: (document.body?.innerText || '').slice(0, 2000),
       html: (document.documentElement?.outerHTML || '').slice(0, 2000)
     }))()`).catch((diagnosticError) => ({error: String(diagnosticError)}));
@@ -292,10 +297,7 @@ try {
       + `chrome=${chromeOutput.join("").slice(-4000)}`);
   }
   await evaluate(session, `(() => {
-    const input = document.querySelector('#profile-name');
-    input.value = ${JSON.stringify(playerName)};
-    input.dispatchEvent(new Event('input', {bubbles: true}));
-    document.querySelector('#profile-submit').click();
+    globalThis.__gaiusReleaseBoot();
     return true;
   })()`);
 
