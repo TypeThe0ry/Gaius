@@ -1,10 +1,9 @@
 # Gaius v0.2.3
 
 This release continues the Minecraft 26.2 browser client line. It focuses on
-how long a new world takes to become playable, and on making the hosted
-(GitHub Pages) build's multiplayer work through the public relay. Visual
-quality is unchanged: the `Fancy` preset, render distance 8, simulation
-distance 6, and `mipmapLevels` 4 all stay in force.
+how long a new world takes to become playable. Visual quality is unchanged:
+the `Fancy` preset, render distance 8, simulation distance 6, and
+`mipmapLevels` 4 all stay in force.
 
 ## Faster world entry
 
@@ -29,10 +28,11 @@ removed:
 
 ## Hosted multiplayer relay
 
-The relay registry now lists a second public node that accepts the GitHub
-Pages browser origin, so multiplayer from the hosted build connects and loads
-resource packs through the relay. The existing node remains as a fallback. The
-`file://` build is unaffected.
+The public relay (`wss://ellan.site/tunnel`) accepts the GitHub Pages browser
+origin again, so multiplayer from the hosted build connects and loads resource
+packs through it. This was a relay-side configuration fix; the client's relay
+registry is unchanged and still lists only that node. The `file://` build is
+unaffected.
 
 ## Downloads
 
