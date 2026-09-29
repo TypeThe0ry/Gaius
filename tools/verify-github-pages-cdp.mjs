@@ -38,9 +38,11 @@ function recordLivePage(report, file, status, ok, body, expectedSha256) {
   if (expectedSha256 && file === expectedSha256Page) check(report.checks, `${file}-sha256`, sha256 === expectedSha256, `live=${sha256}; expected=${expectedSha256}`);
 }
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
-// A fresh Pages deploy can take minutes to reach every CDN edge. When the expected sha256 is set and the
-// first live hash mismatches, re-fetch with a cache-busting query under bounded exponential backoff for up
-// to GAIUS_PAGES_SHA256_RETRY_MS (default 10 minutes; 0 disables retries). Every attempt is recorded.
+// A fresh Pages deploy can take minutes to reach every CDN edge (responses carry max-age=600). When the
+// expected sha256 is set and the live hash mismatches, re-fetch the canonical URL — the one players load —
+// under bounded exponential backoff for up to GAIUS_PAGES_SHA256_RETRY_MS (default 10 minutes; 0 disables
+// retries) until the edge serves the release bytes. A cache-busting query would only prove the origin is
+// current, so it is not used. Every attempt, including failed fetches, is recorded.
 const DEFAULT_SHA256_RETRY_MS = 600_000;
 const SHA256_RETRY_BASE_DELAY_MS = 5_000;
 const SHA256_RETRY_MAX_DELAY_MS = 60_000;
@@ -51,26 +53,33 @@ function parseRetryWindowMs(value) {
   return Number(text);
 }
 const retryDelayMs = (retry) => Math.min(SHA256_RETRY_MAX_DELAY_MS, SHA256_RETRY_BASE_DELAY_MS * 2 ** Math.max(0, retry - 1));
-async function fetchLivePage(url, expectedSha256, {windowMs = 0, fetchImpl = fetch, sleepImpl = sleep, now = Date.now, nonce = Date.now().toString(36)} = {}) {
+async function fetchLivePage(url, expectedSha256, {windowMs = 0, fetchImpl = fetch, sleepImpl = sleep, now = Date.now} = {}) {
   const attempts = [];
   const attemptOnce = async (attempt) => {
-    // The first attempt fetches the canonical URL; retries bypass stale CDN copies with a unique query.
-    const attemptUrl = attempt === 0 ? url : `${url}${url.includes('?') ? '&' : '?'}gaius_verify=${nonce}-${attempt}`;
-    const response = await fetchImpl(attemptUrl, {cache: 'no-store'});
-    const body = await response.arrayBuffer();
-    const sha256 = sha256Hex(new Uint8Array(body));
-    attempts.push({attempt, url: attemptUrl, at: new Date(now()).toISOString(), status: response.status, bytes: body.byteLength, sha256});
-    return {status: response.status, ok: response.ok, body, sha256};
+    try {
+      const response = await fetchImpl(url, {cache: 'no-store'});
+      const body = await response.arrayBuffer();
+      const sha256 = sha256Hex(new Uint8Array(body));
+      attempts.push({attempt, url, at: new Date(now()).toISOString(), status: response.status, bytes: body.byteLength, sha256});
+      return {status: response.status, ok: response.ok, body, sha256};
+    } catch (error) {
+      attempts.push({attempt, url, at: new Date(now()).toISOString(), error: String(error?.message || error)});
+      return null;
+    }
   };
   const matches = (result) => Boolean(result) && result.ok && result.sha256 === expectedSha256;
   let final = await attemptOnce(0);
-  if (!expectedSha256 || matches(final)) return {...final, attempts};
-  const deadline = now() + windowMs;
-  for (let attempt = 1; now() < deadline; attempt++) {
-    await sleepImpl(Math.max(0, Math.min(retryDelayMs(attempt), deadline - now())));
-    try { final = await attemptOnce(attempt); } catch (error) { attempts.push({attempt, at: new Date(now()).toISOString(), error: String(error?.message || error)}); continue; }
-    if (matches(final)) break;
+  if (expectedSha256 && !matches(final)) {
+    const deadline = now() + windowMs;
+    for (let attempt = 1; now() < deadline; attempt++) {
+      await sleepImpl(Math.max(0, Math.min(retryDelayMs(attempt), deadline - now())));
+      const result = await attemptOnce(attempt);
+      // Keep the last real response: a later fetch error must not erase the evidence of a mismatch.
+      if (result) final = result;
+      if (matches(final)) break;
+    }
   }
+  if (!final) throw new Error(`could not fetch ${url}: ${attempts.at(-1)?.error || 'unknown error'}`);
   return {...final, attempts};
 }
 function check(checks, name, ok, detail = '') { checks.push({name, ok: Boolean(ok), detail: String(detail)}); }
@@ -158,8 +167,8 @@ if (process.argv.includes('--static-self-test')) {
     assert.deepEqual(fake.live[expectedSha256Page], {status: 200, bytes: 3, sha256: abc});
     assert.deepEqual(fake.checks.filter((entry) => entry.name.endsWith('-sha256')).map((entry) => entry.ok), ok === null ? [] : [ok]);
   }
-  // The live-hash retry: a stale first response is re-fetched with a cache-busting query until it matches,
-  // every attempt is recorded, and the retry window is bounded.
+  // The live-hash retry: a stale canonical response is re-fetched (same URL, no cache-busting) until the edge
+  // serves the release bytes, every attempt is recorded, fetch errors are retried, and the window is bounded.
   assert.equal(parseRetryWindowMs(undefined), DEFAULT_SHA256_RETRY_MS);
   assert.equal(parseRetryWindowMs('0'), 0);
   assert.equal(parseRetryWindowMs(' 1500 '), 1500);
@@ -168,9 +177,9 @@ if (process.argv.includes('--static-self-test')) {
   const fakeFetch = (bodies, urls) => async (url) => { urls.push(url); const text = bodies.shift() ?? 'stale'; return {status: 200, ok: true, arrayBuffer: async () => new TextEncoder().encode(text).buffer}; };
   {
     const urls = []; const clock = fakeClock();
-    const live = await fetchLivePage('https://pages.invalid/Gaius-26.2.html', abc, {windowMs: 600_000, fetchImpl: fakeFetch(['stale', 'stale', 'abc'], urls), nonce: 'n', ...clock});
+    const live = await fetchLivePage('https://pages.invalid/Gaius-26.2.html', abc, {windowMs: 600_000, fetchImpl: fakeFetch(['stale', 'stale', 'abc'], urls), ...clock});
     assert.equal(live.sha256, abc);
-    assert.deepEqual(urls, ['https://pages.invalid/Gaius-26.2.html', 'https://pages.invalid/Gaius-26.2.html?gaius_verify=n-1', 'https://pages.invalid/Gaius-26.2.html?gaius_verify=n-2']);
+    assert.deepEqual(urls, Array(3).fill('https://pages.invalid/Gaius-26.2.html'), 'retries must re-fetch the canonical URL');
     const stale = sha256Hex(new TextEncoder().encode('stale'));
     assert.deepEqual(live.attempts.map(({attempt, status, bytes, sha256}) => ({attempt, status, bytes, sha256})), [
       {attempt: 0, status: 200, bytes: 5, sha256: stale},
@@ -179,9 +188,17 @@ if (process.argv.includes('--static-self-test')) {
   }
   {
     const urls = []; const clock = fakeClock();
-    const live = await fetchLivePage('https://pages.invalid/Gaius-26.2.html', abc, {windowMs: 600_000, fetchImpl: fakeFetch([], urls), nonce: 'n', ...clock});
+    const live = await fetchLivePage('https://pages.invalid/Gaius-26.2.html', abc, {windowMs: 600_000, fetchImpl: fakeFetch([], urls), ...clock});
     assert.notEqual(live.sha256, abc);
     assert.ok(clock.now() <= 600_000 && urls.length === live.attempts.length && urls.length > 5 && urls.length < 20, `bounded retries: ${urls.length}`);
+  }
+  {
+    // A first-attempt network error is recorded and retried instead of aborting the check.
+    const clock = fakeClock(); let calls = 0;
+    const flaky = async () => { calls++; if (calls === 1) throw new Error('reset'); return {status: 200, ok: true, arrayBuffer: async () => new TextEncoder().encode('abc').buffer}; };
+    const live = await fetchLivePage('https://pages.invalid/Gaius-26.2.html', abc, {windowMs: 600_000, fetchImpl: flaky, ...clock});
+    assert.equal(live.sha256, abc);
+    assert.deepEqual(live.attempts.map((a) => a.error ?? a.sha256), ['reset', abc]);
   }
   for (const [expected, windowMs] of [['', 600_000], [abc, 0]]) {
     const urls = [];

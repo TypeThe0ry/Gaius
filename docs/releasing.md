@@ -228,13 +228,14 @@ Check the live site with `node tools/verify-github-pages-cdp.mjs`. Set
 `GAIUS_PAGES_EXPECTED_SHA256` to the release's `Gaius-26.2.html` sha256 to
 make the verifier hash the live bytes and fail on a mismatch; the live sha256
 is recorded in the report either way. Because a fresh deploy can take minutes
-to reach every CDN edge, a first mismatch is re-fetched with a cache-busting
-`?gaius_verify=` query under bounded backoff for up to
-`GAIUS_PAGES_SHA256_RETRY_MS` (default 600000, 10 minutes; `0` disables
-retries) before failing, and every attempt's status, byte count and sha256 is
-recorded under `live["Gaius-26.2.html"].attempts`. The v0.1.0 publisher sets
-the expected hash to the staged client's hash; its `-PagesVerifierTimeoutSeconds`
-must cover that retry window. By hand, extract the record and refuse to run
+to reach every CDN edge (Pages responses carry `max-age=600`), a mismatch is
+re-fetched from the same canonical URL players load, under bounded backoff for
+up to `GAIUS_PAGES_SHA256_RETRY_MS` (default 600000, 10 minutes; `0` disables
+retries), until the edge serves the release bytes. Every attempt's status, byte
+count and sha256 (or fetch error) is recorded under
+`live["Gaius-26.2.html"].attempts`. The v0.1.0 publisher sets the expected hash
+to the staged client's hash and caps the retry window at its
+`-PagesVerifierTimeoutSeconds` minus two minutes. By hand, extract the record and refuse to run
 without one, since an empty value would silently skip the hash check:
 
 ```sh
