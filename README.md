@@ -18,7 +18,7 @@ before redistributing generated client files or game assets.
 
 ![Gaius multiplayer server list](docs/images/gaius-multiplayer.png)
 
-![Gaius player-name screen](docs/images/gaius-player-name.png)
+![Gaius Edit Profile screen](docs/images/gaius-player-name.png)
 
 ## Download
 
@@ -30,9 +30,12 @@ then download the HTML file that matches the server you want to join:
 - The optional Paper plugin is on the same release page.
 
 The HTML files are portable single-player clients. Download one, open it in a
-current Chrome or Chromium browser, choose a player name, and select
-**Singleplayer**. The file contains the browser launcher and its Worker payloads;
-there is no separate web server to start for this mode.
+current Chrome or Chromium browser, and select **Singleplayer**. On first launch
+the in-game **Edit Profile** screen opens so you can pick a player name and,
+optionally, upload a 64x64 PNG skin; reopen it any time from the **Edit Profile**
+button on the title screen. Changes apply without reloading the page. The file
+contains the browser launcher and its Worker payloads; there is no separate web
+server to start for this mode.
 
 ### Joining a server
 

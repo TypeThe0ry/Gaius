@@ -7036,7 +7036,7 @@ def check_source_patches() -> None:
             and "simulationDistance:4" in browser_file_persistence
             and "entityDistanceScaling:0.5" in browser_file_persistence
             and "maxFps:260" in browser_file_persistence
-            and 'graphicsPreset:\\"fancy\\"' in browser_file_persistence
+            and 'graphicsPreset:\\"fast\\"' in browser_file_persistence
             and 'renderClouds:\\"true\\"' in browser_file_persistence
             and "menuBackgroundBlurriness:0" in browser_file_persistence
             and "panoramaSpeed:1.0" in browser_file_persistence
@@ -12530,7 +12530,7 @@ def check_overlay_bytecode() -> None:
             and "simulationDistance:4" in browser_file_persistence_constants
             and "entityDistanceScaling:0.5" in browser_file_persistence_constants
             and "maxFps:260" in browser_file_persistence_constants
-            and 'graphicsPreset:"fancy"' in browser_file_persistence_constants
+            and 'graphicsPreset:"fast"' in browser_file_persistence_constants
             and 'renderClouds:"true"' in browser_file_persistence_constants
             and "menuBackgroundBlurriness:0" in browser_file_persistence_constants
             and "panoramaSpeed:1.0" in browser_file_persistence_constants
