@@ -26,7 +26,6 @@ Open the [latest release](https://github.com/TypeThe0ry/Gaius/releases/latest),
 then download the HTML file that matches the server you want to join:
 
 - [Minecraft 26.2 client](https://github.com/TypeThe0ry/Gaius/releases/latest/download/Gaius-26.2.html)
-- [Minecraft 1.21.11 client](https://github.com/TypeThe0ry/Gaius/releases/latest/download/Gaius-1.21.11.html)
 - [SHA256 checksums](https://github.com/TypeThe0ry/Gaius/releases/latest/download/SHA256SUMS)
 - The optional Paper plugin is on the same release page.
 

@@ -26,7 +26,6 @@ Gaius 是独立项目，与 Mojang Studios、Microsoft 和 Minecraft 没有隶�
 连接的服务器下载对应的 HTML：
 
 - [Minecraft 26.2 客户端](https://github.com/TypeThe0ry/Gaius/releases/latest/download/Gaius-26.2.html)
-- [Minecraft 1.21.11 客户端](https://github.com/TypeThe0ry/Gaius/releases/latest/download/Gaius-1.21.11.html)
 - [SHA256 校验文件](https://github.com/TypeThe0ry/Gaius/releases/latest/download/SHA256SUMS)
 - 可选 Paper 插件在同一个 Release 页面里。
 
