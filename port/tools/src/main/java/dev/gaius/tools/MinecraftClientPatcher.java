@@ -5692,6 +5692,14 @@ public final class MinecraftClientPatcher {
                 "cullFrustum",
                 "Lnet/minecraft/client/renderer/culling/Frustum;"));
         refresh.add(new JumpInsnNode(Opcodes.IFNULL, done));
+        // Replace the lists like LevelExtractor.applyFrustum does. This refresh consumes the
+        // graph's frustum-update flag, so applyFrustum then only runs when the camera turns:
+        // appending without clearing re-added every visible section on each graph update while
+        // the camera stood still, growing the draw list to tens of thousands of duplicates.
+        refresh.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        refresh.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/renderer/LevelRenderer",
+                "clearVisibleSections", "()V", false));
         refresh.add(new VarInsnNode(Opcodes.ALOAD, 0));
         refresh.add(new FieldInsnNode(Opcodes.GETFIELD,
                 "net/minecraft/client/renderer/LevelRenderer",
