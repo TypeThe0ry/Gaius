@@ -278,7 +278,8 @@ Assert-TagUnchanged $localTagObject 'after pre-dispatch Pages run inventory'
 $beforePagesIds = @{}
 foreach ($run in $beforePagesRuns) { $beforePagesIds[[string]$run.databaseId] = $true }
 $pagesDispatchNotBefore = (Get-Date).ToUniversalTime().AddMinutes(-1)
-& gh workflow run pages.yml --repo $Repo --ref main -f "release_token=$pagesReleaseToken"
+# Pin Pages to the tag published above instead of whichever release is Latest.
+& gh workflow run pages.yml --repo $Repo --ref main -f "release_token=$pagesReleaseToken" -f "release_tag=$tag"
 if ($LASTEXITCODE -ne 0) { Fail 'GitHub Pages workflow dispatch failed' }
 Assert-TagUnchanged $localTagObject 'after Pages dispatch'
 
@@ -333,6 +334,8 @@ $priorPagesTarget262 = $env:GAIUS_TARGET_262
 $priorPagesDefaultTarget = $env:GAIUS_PAGES_DEFAULT_TARGET
 $priorPageDefaultTarget12111 = $env:GAIUS_PAGE_DEFAULT_TARGET_12111
 $priorPageDefaultTarget262 = $env:GAIUS_PAGE_DEFAULT_TARGET_262
+$priorPagesExpectedSha256 = $env:GAIUS_PAGES_EXPECTED_SHA256
+$priorPagesSha256RetryMs = $env:GAIUS_PAGES_SHA256_RETRY_MS
 $pagesVerifierTempRoot = Join-Path ([IO.Path]::GetTempPath()) ("gaius-pages-publish-" + [Guid]::NewGuid().ToString('N'))
 $pagesVerifierStdout = Join-Path $pagesVerifierTempRoot 'stdout.log'
 $pagesVerifierStderr = Join-Path $pagesVerifierTempRoot 'stderr.log'
@@ -350,6 +353,11 @@ try {
     $env:GAIUS_PAGE_DEFAULT_TARGET_262 = [string]$manifest.pages.defaultTargets.'26.2'
     $env:GAIUS_TARGET_12111 = [string]$manifest.relay.targets.'1.21.11'
     $env:GAIUS_TARGET_262 = [string]$manifest.relay.targets.'26.2'
+    # The live Pages bytes must be the staged (and fresh-download verified) 26.2 client.
+    $env:GAIUS_PAGES_EXPECTED_SHA256 = (Get-FileHash -LiteralPath (Join-Path $stagePath 'Gaius-26.2.html') -Algorithm SHA256).Hash.ToLowerInvariant()
+    # Keep the verifier's CDN retry window inside this script's own verifier timeout, so a slow edge
+    # fails with the verifier's recorded attempts instead of being killed without a report.
+    $env:GAIUS_PAGES_SHA256_RETRY_MS = [string]([Math]::Max(0, $PagesVerifierTimeoutSeconds - 120) * 1000)
     $node = Get-Command node -ErrorAction Stop
     # Start-Process joins ArgumentList entries into one command line. Preserve
     # the verifier path as one argv item when the checkout path contains spaces.
@@ -385,6 +393,8 @@ try {
     if ($null -eq $priorPagesDefaultTarget) { Remove-Item Env:GAIUS_PAGES_DEFAULT_TARGET -ErrorAction SilentlyContinue } else { $env:GAIUS_PAGES_DEFAULT_TARGET = $priorPagesDefaultTarget }
     if ($null -eq $priorPageDefaultTarget12111) { Remove-Item Env:GAIUS_PAGE_DEFAULT_TARGET_12111 -ErrorAction SilentlyContinue } else { $env:GAIUS_PAGE_DEFAULT_TARGET_12111 = $priorPageDefaultTarget12111 }
     if ($null -eq $priorPageDefaultTarget262) { Remove-Item Env:GAIUS_PAGE_DEFAULT_TARGET_262 -ErrorAction SilentlyContinue } else { $env:GAIUS_PAGE_DEFAULT_TARGET_262 = $priorPageDefaultTarget262 }
+    if ($null -eq $priorPagesExpectedSha256) { Remove-Item Env:GAIUS_PAGES_EXPECTED_SHA256 -ErrorAction SilentlyContinue } else { $env:GAIUS_PAGES_EXPECTED_SHA256 = $priorPagesExpectedSha256 }
+    if ($null -eq $priorPagesSha256RetryMs) { Remove-Item Env:GAIUS_PAGES_SHA256_RETRY_MS -ErrorAction SilentlyContinue } else { $env:GAIUS_PAGES_SHA256_RETRY_MS = $priorPagesSha256RetryMs }
     for ($attempt = 0; $attempt -lt 20 -and (Test-Path -LiteralPath $pagesVerifierTempRoot); $attempt++) {
         Remove-Item -LiteralPath $pagesVerifierTempRoot -Recurse -Force -ErrorAction SilentlyContinue
         if (Test-Path -LiteralPath $pagesVerifierTempRoot) { Start-Sleep -Milliseconds 250 }

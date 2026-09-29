@@ -52,6 +52,9 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          # Without this a failing native command (node) only sets $LASTEXITCODE,
+          # which the next command overwrites, so the step could still pass.
+          $PSNativeCommandUseErrorActionPreference = $true
           node --check tools/browser-multiplayer-terrain-cdp.mjs
           node tools/browser-multiplayer-terrain-cdp.mjs --static-self-test
           node --check tools/check-multiplayer-terrain-evidence.mjs
@@ -141,7 +144,9 @@ jobs:
             'event -eq ''workflow_dispatch''',
             'headSha -eq $head',
             'displayTitle -eq $expectedPagesTitle',
-            'createdAt -ge $pagesDispatchNotBefore'
+            'createdAt -ge $pagesDispatchNotBefore',
+            '-f "release_tag=$tag"',
+            'GAIUS_PAGES_EXPECTED_SHA256'
           )) {
             if (-not $publish.Contains($required)) { throw "Pages run identity gate missing: $required" }
           }
@@ -165,7 +170,7 @@ jobs:
             if (-not $singleValidator.Contains($required)) { throw "single evidence validator missing: $required" }
           }
           $pages = Get-Content tools/verify-github-pages-cdp.mjs -Raw
-          foreach ($required in @('cdpClosed', 'chromeExited', 'profileRemoved', 'pagesFinalGate')) {
+          foreach ($required in @('cdpClosed', 'chromeExited', 'profileRemoved', 'pagesFinalGate', 'GAIUS_PAGES_EXPECTED_SHA256')) {
             if (-not $pages.Contains($required)) { throw "Pages CDP gate missing: $required" }
           }
           foreach ($required in @(

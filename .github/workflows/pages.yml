@@ -1,13 +1,14 @@
 name: Deploy Gaius GitHub Pages
 run-name: Deploy Gaius Pages [${{ inputs.release_token || github.sha }}]
 
+# Pages publishes exactly one file: the Minecraft 26.2 browser client
+# (Gaius-26.2.html). Minecraft 1.21.11 is permanently retired from Pages.
+# Nothing in the repository checkout is published, so the workflow runs only
+# on dispatch. Without release_tag it follows the repository's Latest release;
+# release_tag pins a specific tag (for example a pre-release). The deployed
+# bytes must match that release's SHA256SUMS; releases without one fail closed.
+
 on:
-  push:
-    branches: [main]
-    paths:
-      - docs/**
-      - relay-nodes.json
-      - .github/workflows/pages.yml
   workflow_dispatch:
     inputs:
       release_token:
@@ -15,9 +16,9 @@ on:
         required: true
         type: string
       release_tag:
-        description: Release tag whose browser assets should be deployed
+        description: Release tag whose Gaius-26.2.html should be deployed (empty = the repository's Latest release)
         required: false
-        default: v0.1.0
+        default: ''
         type: string
 
 permissions:
@@ -36,16 +37,42 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
-      - name: Check out Pages source
-        uses: actions/checkout@v4
-        with:
-          lfs: true
+      # No checkout: nothing from the repository is published, and every step
+      # below reads only release assets (gh release download --repo).
       - name: Configure Pages
         uses: actions/configure-pages@v5
-      - name: Download the two version files
+      - name: Resolve release tag
+        id: release
         env:
           GH_TOKEN: ${{ github.token }}
-          PAGES_RELEASE_TAG: ${{ inputs.release_tag || 'v0.1.0' }}
+          REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${REQUESTED_RELEASE_TAG}" ]; then
+            tag="${REQUESTED_RELEASE_TAG}"
+            source='release_tag input'
+          else
+            # Without a tag argument gh resolves releases/latest: the release
+            # marked Latest (never a draft or pre-release).
+            tag="$(gh release view --repo "${GITHUB_REPOSITORY}" --json tagName --jq .tagName)"
+            source='Latest release'
+          fi
+          if [[ ! "$tag" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+            # Never echo the raw value: it could smuggle workflow commands.
+            echo "::error::Refusing unexpected release tag from ${source}"
+            printf 'Rejected release tag (shell-escaped): %q\n' "$tag"
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "source=${source}" >> "$GITHUB_OUTPUT"
+          echo "Resolved release tag ${tag} (${source}); not yet verified"
+      - name: Download and verify the Minecraft 26.2 client
+        id: download
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAGES_RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          PAGES_RELEASE_SOURCE: ${{ steps.release.outputs.source }}
         shell: bash
         run: |
           set -euo pipefail
@@ -53,13 +80,39 @@ jobs:
           mkdir -p pages-publish
           gh release download "$PAGES_RELEASE_TAG" \
             --repo "${GITHUB_REPOSITORY}" \
-            --pattern 'Gaius-1.21.11.html' \
             --pattern 'Gaius-26.2.html' \
             --dir pages-publish \
             --clobber
-          test "$(find pages-publish -maxdepth 1 -type f | wc -l)" -eq 2
-          test -f pages-publish/Gaius-1.21.11.html
+          # The published site is exactly one file; 1.21.11 must not reappear.
+          test "$(find pages-publish -mindepth 1 | wc -l)" -eq 1
           test -f pages-publish/Gaius-26.2.html
+          test -s pages-publish/Gaius-26.2.html
+          test ! -e pages-publish/Gaius-1.21.11.html
+          # Bind the deployed bytes to the release. SHA256SUMS stays outside the
+          # publish directory; gh fails when the release has no SHA256SUMS asset.
+          sums_dir="${RUNNER_TEMP}/pages-release-sums"
+          rm -rf "$sums_dir"
+          mkdir -p "$sums_dir"
+          gh release download "$PAGES_RELEASE_TAG" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern 'SHA256SUMS' \
+            --dir "$sums_dir" \
+            --clobber
+          test -s "$sums_dir/SHA256SUMS"
+          grep -E '^[0-9a-f]{64}  Gaius-26\.2\.html$' "$sums_dir/SHA256SUMS" > "$sums_dir/Gaius-26.2.html.sha256" || true
+          if [ "$(wc -l < "$sums_dir/Gaius-26.2.html.sha256")" -ne 1 ]; then
+            echo "::error::SHA256SUMS of ${PAGES_RELEASE_TAG} must hold exactly one Gaius-26.2.html record"
+            exit 1
+          fi
+          (cd pages-publish && sha256sum --check --strict "$sums_dir/Gaius-26.2.html.sha256")
+          sha256="$(cut -d ' ' -f 1 "$sums_dir/Gaius-26.2.html.sha256")"
+          echo "sha256=${sha256}" >> "$GITHUB_OUTPUT"
+          # Only now, after the SHA256SUMS gate passed, announce the deployment.
+          {
+            echo "Deploying Gaius-26.2.html from ${PAGES_RELEASE_TAG} (${PAGES_RELEASE_SOURCE})"
+            echo "- Release tag: \`${PAGES_RELEASE_TAG}\`"
+            echo "- Gaius-26.2.html sha256: \`${sha256}\` (matches the release SHA256SUMS)"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
