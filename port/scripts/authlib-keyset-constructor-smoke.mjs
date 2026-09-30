@@ -106,10 +106,12 @@ for (const marker of [
   requireText(patcher, marker, "AuthlibBrowserPatcher.java");
 }
 
+// build-overlays.sh empties the authlib patch directory before the patcher
+// runs and then folds the whole directory into the jar, so every KeyInfo class
+// the patcher writes above is included.
 for (const marker of [
-  `-C "$authlib_patch_classes" 'com/mojang/authlib/yggdrasil/YggdrasilServicesKeyInfo$KeyData.class'`,
-  `-C "$authlib_patch_classes" 'com/mojang/authlib/yggdrasil/YggdrasilServicesKeyInfo$KeySetResponse.class'`,
-  `-C "$authlib_patch_classes" com/mojang/authlib/yggdrasil/YggdrasilServicesKeyInfo.class`,
+  'find "$authlib_patch_classes" -type f -delete',
+  `-C "$authlib_patch_classes" .`,
 ]) {
   requireText(overlays, marker, "build-overlays.sh");
 }
