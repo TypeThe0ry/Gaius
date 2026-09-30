@@ -425,6 +425,33 @@ jobs:
       - name: Validate every version profile and bring-up list
         run: node port/scripts/check-version-profile.mjs --all
 
+      - name: Bootstrap 26.3 smoke dependencies
+        env:
+          GAIUS_VERSION_PROFILE_PATH: versions/26.3.json
+        run: |
+          set -euo pipefail
+          export GAIUS_JAVA_HOME="$JAVA_HOME"
+          teavm="$(jq -er .teaVMVersion port/config.json)"
+          # build-overlays.sh bootstraps only asm and asm-tree; the patcher
+          # smokes also verify with asm-analysis and relocate with asm-commons,
+          # and the JSBody checks parse with TeaVM's Rhino.
+          for artifact in org.ow2.asm:asm-analysis:9.8 org.ow2.asm:asm-commons:9.8 \
+              "org.teavm:teavm-relocated-libs-rhino:$teavm"; do
+            ./port/mvnw --batch-mode --no-transfer-progress \
+              org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
+              "-Dartifact=$artifact" -Dtransitive=false
+          done
+          # The memory backend smoke compiles a small program with TeaVM.
+          ./port/mvnw --batch-mode --no-transfer-progress \
+            org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
+            "-Dartifact=org.teavm:teavm-tooling:$teavm"
+          # lwjgl-browser-compat-smoke.sh and browser-memory-lifecycle-smoke.sh
+          # use ripgrep.
+          if ! command -v rg >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ripgrep
+          fi
+
       - name: quick-check profile dispatch and 26.3 source smokes
         run: |
           set -euo pipefail
@@ -526,33 +553,6 @@ jobs:
           # server,ui}.py on the overlays and the javac output of the previous
           # step, through quick-check's profile dispatch (no TeaVM build).
           python3 port/scripts/quick-check.py --domain-modules
-
-      - name: Bootstrap 26.3 smoke dependencies
-        env:
-          GAIUS_VERSION_PROFILE_PATH: versions/26.3.json
-        run: |
-          set -euo pipefail
-          export GAIUS_JAVA_HOME="$JAVA_HOME"
-          teavm="$(jq -er .teaVMVersion port/config.json)"
-          # build-overlays.sh bootstraps only asm and asm-tree; the patcher
-          # smokes also verify with asm-analysis and relocate with asm-commons,
-          # and the JSBody checks parse with TeaVM's Rhino.
-          for artifact in org.ow2.asm:asm-analysis:9.8 org.ow2.asm:asm-commons:9.8 \
-              "org.teavm:teavm-relocated-libs-rhino:$teavm"; do
-            ./port/mvnw --batch-mode --no-transfer-progress \
-              org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
-              "-Dartifact=$artifact" -Dtransitive=false
-          done
-          # The memory backend smoke compiles a small program with TeaVM.
-          ./port/mvnw --batch-mode --no-transfer-progress \
-            org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
-            "-Dartifact=org.teavm:teavm-tooling:$teavm"
-          # lwjgl-browser-compat-smoke.sh and browser-memory-lifecycle-smoke.sh
-          # use ripgrep.
-          if ! command -v rg >/dev/null; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq ripgrep
-          fi
 
       - name: 26.3 patcher and runtime smokes
         env:
