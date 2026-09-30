@@ -24,19 +24,7 @@
 # A reason may contain neither '#' (starts a comment) nor '|'.
 
 # --- build-overlays.sh library steps (PLAN.md 6.3) ---
-step:MinecraftChunkDrawTelemetryPatcher | P5 | chunk-draw telemetry patcher rejects profile 26.3 (unsupported profile)
 
 # --- MinecraftClientPatcher (PLAN.md 6.1 #1-#47) ---
-MinecraftClientPatcher.patchDynamicUniformsBrowserInitialCapacity | P5 | [row 11] DynamicUniforms replaced by DynamicGpuData; add the 26.3 branch (<init> and writeChunkSections)
-MinecraftClientPatcher.patchMappableRingBufferTelemetry | P5 | [row 34] renderpearl GpuBuffer owner and -1L timeout literal
-MinecraftClientPatcher.patchStagedVertexBufferGpuPoolCache | P5 | [row 35] PendingRecycle GpuFence type and endFrame tail changed
-MinecraftClientPatcher.patchGameRendererBrowserAutoScreenshot | P5 | [row 42] GameRenderer.render(DeltaTracker,Z) became render()V
-MinecraftClientPatcher.patchLevelRendererBrowserBlockBreakProgress | P5 | [row 44] prepareChunkRenders target moved to extractSectionDrawGroups; the same driver must fail closed
-MinecraftClientPatcher.patchEntityRenderDispatcherBrowserNullEntityGuard | P5 | [row 45] shouldRender descriptor gained a float
-MinecraftClientPatcher.patchSectionRenderDispatcherBrowserThrottles | P5 | [row 46] VertexFormat owner moved to renderpearl/api/vertex
-MinecraftClientPatcher.patchUberGpuBufferBrowserTelemetry | P5 | [row 47] uploadStagedAllocations takes the renderpearl GpuDevice
 
 # --- Minecraft262BrowserPatcher (PLAN.md 6.1 #48-#59) ---
-Minecraft262BrowserPatcher.patchLiveFrameTargeting | P5 | [row 53] GameRenderer.extract camera point changed; adapt to extractCamera(DeltaTracker,F) atomically
-Minecraft262BrowserPatcher.patchStagingBuffer | P5 | [row 54] StagingBuffer$Cpu.copyTo takes renderpearl types
-Minecraft262BrowserPatcher.patchUberGpuBufferNodeCleanup | P5 | [row 55] uploadStagedAllocations descriptor, field type and INVOKEINTERFACE

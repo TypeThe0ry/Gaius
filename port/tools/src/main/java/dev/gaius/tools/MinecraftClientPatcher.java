@@ -1951,6 +1951,12 @@ public final class MinecraftClientPatcher {
 
     private static void patchDynamicUniformsBrowserInitialCapacity(String jar, Path output)
             throws IOException {
+        if (ModernSymbols.cached(jar).renderpearl()) {
+            // 26.3 renamed the class; main() still names the 26.2 entry, so write the sibling.
+            patchDynamicGpuDataBrowserInitialCapacity(
+                    jar, output.resolveSibling("DynamicGpuData.class"));
+            return;
+        }
         ClassNode node = read(jar, "net/minecraft/client/renderer/DynamicUniforms.class");
         MethodNode constructor = find(node, "<init>", "()V");
         // Multiplayer terrain can expose tens of thousands of section records during
@@ -1993,6 +1999,87 @@ public final class MinecraftClientPatcher {
                             + storageConstructors);
         }
         writeComputeFrames(node, output);
+    }
+
+    /**
+     * 26.3 shape of {@link #patchDynamicUniformsBrowserInitialCapacity}: DynamicUniforms became
+     * DynamicGpuData and DynamicUniformStorage(String;II) became
+     * DynamicGpuDataStorageMapped(String;III) (label, block size, usage, capacity). The
+     * constructor builds only the transforms UBO and the once-per-frame terrain transform UBO;
+     * the chunk-sections UBO is created lazily in writeChunkSections. Both hot UBOs get the same
+     * 32767-entry browser slab as on 26.2; each storage is identified by its ldc label, and the
+     * terrain transform and MDI instanced storages stay vanilla.
+     */
+    private static void patchDynamicGpuDataBrowserInitialCapacity(String jar, Path output)
+            throws IOException {
+        String owner = "net/minecraft/client/renderer/DynamicGpuData";
+        try (ZipFile input = new ZipFile(jar)) {
+            if (input.getEntry("net/minecraft/client/renderer/DynamicUniforms.class") != null) {
+                throw new IllegalStateException(
+                        "renderpearl client still contains the 26.2 DynamicUniforms class");
+            }
+        }
+        ClassNode node = read(jar, owner + ".class");
+        MethodNode constructor = find(node, "<init>", "()V");
+        MethodNode writeChunkSections = find(node, "writeChunkSections",
+                "([L" + owner + "$ChunkSectionInfo;)"
+                        + "[Lcom/mojang/renderpearl/api/buffers/GpuBufferSlice;");
+        raiseDynamicGpuDataCapacity(constructor, "Dynamic Transforms UBO", 2, "Terrain UBO");
+        raiseDynamicGpuDataCapacity(writeChunkSections, "Chunk Sections UBO", 1, null);
+        writeComputeFrames(node, output);
+        System.out.println("Raised 26.3 DynamicGpuData transforms and chunk-section UBO capacity");
+    }
+
+    /**
+     * Replaces the {@code iconst_2} capacity of the one DynamicGpuDataStorageMapped constructor
+     * labelled {@code label} with the browser slab; {@code expectedStorages} counts every
+     * mapped-storage constructor of the method, and {@code untouchedLabel} names the only other
+     * one allowed.
+     */
+    private static void raiseDynamicGpuDataCapacity(MethodNode method, String label,
+            int expectedStorages, String untouchedLabel) {
+        String storage = "net/minecraft/client/renderer/DynamicGpuDataStorageMapped";
+        int storages = 0;
+        int raised = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKESPECIAL
+                    || !call.owner.equals(storage)
+                    || !call.name.equals("<init>")) {
+                continue;
+            }
+            storages++;
+            AbstractInsnNode capacity = previousOpcode(call);
+            AbstractInsnNode usage = capacity == null ? null : previousOpcode(capacity);
+            AbstractInsnNode blockSize = usage == null ? null : previousOpcode(usage);
+            AbstractInsnNode labelLoad = blockSize == null ? null : previousOpcode(blockSize);
+            if (!call.desc.equals("(Ljava/lang/String;III)V")
+                    || !(labelLoad instanceof LdcInsnNode constant)
+                    || !(constant.cst instanceof String storageLabel)
+                    || !(blockSize instanceof FieldInsnNode sizeField)
+                    || sizeField.getOpcode() != Opcodes.GETSTATIC
+                    || !(usage instanceof IntInsnNode usageValue)
+                    || usageValue.getOpcode() != Opcodes.SIPUSH
+                    || usageValue.operand != 128) {
+                throw new IllegalStateException(method.name
+                        + " DynamicGpuDataStorageMapped constructor shape changed");
+            }
+            if (storageLabel.equals(label)) {
+                if (capacity.getOpcode() != Opcodes.ICONST_2) {
+                    throw new IllegalStateException(label
+                            + " initial capacity instruction was not iconst_2");
+                }
+                method.instructions.set(capacity, new IntInsnNode(Opcodes.SIPUSH, 32767));
+                raised++;
+            } else if (!storageLabel.equals(untouchedLabel)) {
+                throw new IllegalStateException(method.name
+                        + " has an unexpected mapped storage: " + storageLabel);
+            }
+        }
+        if (storages != expectedStorages || raised != 1) {
+            throw new IllegalStateException(method.name + " expected " + expectedStorages
+                    + " mapped storages with one " + label + ", got " + storages + "/" + raised);
+        }
     }
 
     private static void patchGuiRenderTelemetry(String jar, Path root) throws IOException {
@@ -2502,8 +2589,13 @@ public final class MinecraftClientPatcher {
     private static void patchMappableRingBufferTelemetry(String jar, Path output)
             throws IOException {
         String owner = "net/minecraft/client/renderer/MappableRingBuffer";
-        String fence = "com/mojang/blaze3d/buffers/GpuFence";
-        String buffer = "com/mojang/blaze3d/buffers/GpuBuffer";
+        ModernSymbols symbols = ModernSymbols.cached(jar);
+        String fence = symbols.renderType("com/mojang/blaze3d/buffers/GpuFence");
+        String buffer = symbols.renderType("com/mojang/blaze3d/buffers/GpuBuffer");
+        // 26.2 waits with Long.MAX_VALUE; 26.3 passes GpuFence.NO_TIMEOUT (-1L). BrowserOpenGL
+        // polls every client wait with a zero timeout, so only the telemetry value differs.
+        Long awaitTimeout = symbols.renderpearl()
+                ? Long.valueOf(-1L) : Long.valueOf(Long.MAX_VALUE);
         String telemetry = "org/lwjgl/opengl/BrowserOpenGL";
         ClassNode node = read(jar, owner + ".class");
         MethodNode currentBuffer = find(node, "currentBuffer", "()L" + buffer + ";");
@@ -2543,7 +2635,7 @@ public final class MinecraftClientPatcher {
                 || awaitOwner.getOpcode() != Opcodes.ALOAD
                 || awaitOwner.var != 1
                 || !(executable.get(9) instanceof LdcInsnNode timeout)
-                || !Long.valueOf(Long.MAX_VALUE).equals(timeout.cst)
+                || !awaitTimeout.equals(timeout.cst)
                 || !(executable.get(10) instanceof MethodInsnNode awaitCompletion)
                 || awaitCompletion.getOpcode() != Opcodes.INVOKEINTERFACE
                 || !awaitCompletion.owner.equals(fence)
@@ -2595,7 +2687,8 @@ public final class MinecraftClientPatcher {
                 || !returnCurrent.desc.equals("I")
                 || executable.get(24).getOpcode() != Opcodes.AALOAD
                 || executable.get(25).getOpcode() != Opcodes.ARETURN) {
-            throw new IllegalStateException(owner + ".currentBuffer exact 26.2 shape changed");
+            throw new IllegalStateException(owner + ".currentBuffer exact "
+                    + (symbols.renderpearl() ? "26.3" : "26.2") + " shape changed");
         }
         int awaitCalls = 0;
         int returns = 0;
@@ -2636,8 +2729,8 @@ public final class MinecraftClientPatcher {
         currentBuffer.instructions.insert(awaitCompletion, resultTelemetry);
 
         writeComputeFrames(node, output);
-        System.out.println(
-                "Instrumented 26.2 MappableRingBuffer.currentBuffer fence-result telemetry");
+        System.out.println("Instrumented " + (symbols.renderpearl() ? "26.3" : "26.2")
+                + " MappableRingBuffer.currentBuffer fence-result telemetry");
     }
 
     /**
@@ -2648,7 +2741,14 @@ public final class MinecraftClientPatcher {
     private static void patchStagedVertexBufferGpuPoolCache(String jar, Path output)
             throws IOException {
         String owner = "net/minecraft/client/renderer/StagedVertexBuffer$GpuBufferPool";
-        String buffer = "com/mojang/blaze3d/buffers/GpuBuffer";
+        ModernSymbols symbols = ModernSymbols.cached(jar);
+        // 26.3 moved tryRecycleBuffers from the start of acquire to the tail of endFrame and
+        // uses the renderpearl GpuBuffer/GpuFence/GpuDevice interfaces; everything else matches.
+        boolean recycleAtEndFrame = symbols.renderpearl();
+        String profileLabel = recycleAtEndFrame ? "26.3" : "26.2";
+        String buffer = symbols.renderType("com/mojang/blaze3d/buffers/GpuBuffer");
+        String fence = symbols.renderType("com/mojang/blaze3d/buffers/GpuFence");
+        String device = symbols.renderType("com/mojang/blaze3d/systems/GpuDevice");
         String helper = "dev/gaius/browser/BrowserGpuBufferPoolCache";
         String helperDescriptor = "L" + helper + ";";
         String cacheField = "gaius$browserCache";
@@ -2701,7 +2801,7 @@ public final class MinecraftClientPatcher {
                 || !pendingBuffers.desc.equals("Ljava/util/List;")
                 || pendingBuffers.access != privateFinal
                 || !pendingFence.name.equals("fence")
-                || !pendingFence.desc.equals("Lcom/mojang/blaze3d/buffers/GpuFence;")
+                || !pendingFence.desc.equals("L" + fence + ";")
                 || pendingFence.access != privateFinal) {
             throw new IllegalStateException(pendingOwner + " raw fields changed");
         }
@@ -2711,7 +2811,7 @@ public final class MinecraftClientPatcher {
         for (AbstractInsnNode instruction : pendingTryRecycle.instructions.toArray()) {
             if (instruction instanceof MethodInsnNode call
                     && call.getOpcode() == Opcodes.INVOKEINTERFACE
-                    && call.owner.equals("com/mojang/blaze3d/buffers/GpuFence")
+                    && call.owner.equals(fence)
                     && call.name.equals("awaitCompletion")
                     && call.desc.equals("(J)Z")) {
                 if (pendingAwait != null) {
@@ -2758,7 +2858,7 @@ public final class MinecraftClientPatcher {
                 || !trueFenceField.owner.equals(pendingOwner)
                 || !trueFenceField.name.equals("fence")
                 || !(trueClose instanceof MethodInsnNode closeCall)
-                || !closeCall.owner.equals("com/mojang/blaze3d/buffers/GpuFence")
+                || !closeCall.owner.equals(fence)
                 || !closeCall.name.equals("close") || !closeCall.desc.equals("()V")
                 || !(trueBufferOwner instanceof VarInsnNode trueBufferOwnerLoad)
                 || trueBufferOwnerLoad.getOpcode() != Opcodes.ALOAD
@@ -2789,7 +2889,7 @@ public final class MinecraftClientPatcher {
                 pendingCloseForEach++;
             }
             if (instruction instanceof MethodInsnNode call
-                    && call.owner.equals("com/mojang/blaze3d/buffers/GpuFence")
+                    && call.owner.equals(fence)
                     && call.name.equals("close") && call.desc.equals("()V")) {
                 pendingFenceCloses++;
             }
@@ -2850,7 +2950,8 @@ public final class MinecraftClientPatcher {
         MethodNode acquire = find(
                 node,
                 "acquire",
-                "(Lcom/mojang/blaze3d/systems/GpuDevice;I)L" + buffer + ";");
+                "(L" + device + ";I)L" + buffer + ";");
+        requireStagedPoolRecycleSite(acquire, owner, !recycleAtEndFrame);
         MethodInsnNode roundToward = null;
         MethodInsnNode rawTakeBest = null;
         for (AbstractInsnNode instruction : acquire.instructions.toArray()) {
@@ -2940,7 +3041,7 @@ public final class MinecraftClientPatcher {
         MethodInsnNode usedAdd = null;
         for (AbstractInsnNode instruction : acquire.instructions.toArray()) {
             if (instruction instanceof MethodInsnNode call
-                    && call.owner.equals("com/mojang/blaze3d/systems/GpuDevice")
+                    && call.owner.equals(device)
                     && call.name.equals("createBuffer")
                     && call.desc.equals(
                     "(Ljava/util/function/Supplier;IJ)L" + buffer + ";")) {
@@ -3126,7 +3227,8 @@ public final class MinecraftClientPatcher {
         }
 
         MethodNode endFrame = find(
-                node, "endFrame", "(Lcom/mojang/blaze3d/systems/GpuDevice;)V");
+                node, "endFrame", "(L" + device + ";)V");
+        requireStagedPoolRecycleSite(endFrame, owner, recycleAtEndFrame);
         java.util.List<FieldInsnNode> endFrameAvailable = new java.util.ArrayList<>();
         java.util.List<String> endFrameOwnerFields = new java.util.ArrayList<>();
         int pendingAdds = 0;
@@ -3220,8 +3322,7 @@ public final class MinecraftClientPatcher {
                 || !clearCall.owner.equals("java/util/List")
                 || !clearCall.name.equals("clear")
                 || !clearCall.desc.equals("()V")
-                || afterAvailableClear == null
-                || afterAvailableClear.getOpcode() != Opcodes.RETURN
+                || !isStagedPoolEndFrameTail(afterAvailableClear, owner, recycleAtEndFrame)
                 || nextOpcode(emptyBranch.label) != afterAvailableClear) {
             throw new IllegalStateException(owner + ".endFrame available close/clear block changed");
         }
@@ -3253,7 +3354,11 @@ public final class MinecraftClientPatcher {
                 Opcodes.INVOKEINTERFACE, "java/util/List", "size", "()I", true));
         retainAvailable.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL, helper, "endFrame", "(I)V", false));
-        endFrame.instructions.insertBefore(endFrameReturn, retainAvailable);
+        // 26.3 adopts the signalled batches at the endFrame tail: advance the helper frame
+        // (TTL purge, trim) before that adoption so the adopted buffers are stamped with the
+        // new frame, the same order as 26.2's adoption on the next frame's first acquire.
+        endFrame.instructions.insertBefore(
+                recycleAtEndFrame ? afterAvailableClear : endFrameReturn, retainAvailable);
 
         MethodNode close = find(node, "close", "()V");
         int closeForEach = 0;
@@ -3307,8 +3412,71 @@ public final class MinecraftClientPatcher {
         close.instructions.insertBefore(closeReturn, ownerClosed);
 
         writeComputeFrames(node, output);
-        System.out.println(
-                "Instrumented 26.2 StagedVertexBuffer GPU pool cache: count=4 bytes=1048576 idle=3");
+        System.out.println("Instrumented " + profileLabel
+                + " StagedVertexBuffer GPU pool cache: count=4 bytes=1048576 idle=3");
+    }
+
+    /**
+     * The signalled-batch sweep {@code tryRecycleBuffers()} runs once, as the first statement of
+     * {@code acquire} (26.2) or as the tail of {@code endFrame} (26.3); {@code expected} says
+     * whether {@code method} must be that site. Every other place is rejected.
+     */
+    private static void requireStagedPoolRecycleSite(
+            MethodNode method, String owner, boolean expected) {
+        int sweeps = 0;
+        MethodInsnNode sweep = null;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.owner.equals(owner)
+                    && call.name.equals("tryRecycleBuffers")
+                    && call.desc.equals("()V")) {
+                sweeps++;
+                sweep = call;
+            }
+        }
+        if (sweeps != (expected ? 1 : 0)) {
+            throw new IllegalStateException(owner + "." + method.name
+                    + " recycle sweep count changed: " + sweeps);
+        }
+        if (!expected) {
+            return;
+        }
+        AbstractInsnNode receiver = previousOpcode(sweep);
+        boolean atStart = receiver != null && previousOpcode(receiver) == null;
+        boolean atTail = nextOpcode(sweep) != null
+                && nextOpcode(sweep).getOpcode() == Opcodes.RETURN
+                && nextOpcode(nextOpcode(sweep)) == null;
+        if (!(receiver instanceof VarInsnNode load)
+                || load.getOpcode() != Opcodes.ALOAD
+                || load.var != 0
+                || sweep.getOpcode() != Opcodes.INVOKEVIRTUAL
+                || !(method.name.equals("acquire") ? atStart : atTail)) {
+            throw new IllegalStateException(owner + "." + method.name
+                    + " recycle sweep position changed");
+        }
+    }
+
+    /** What follows {@code available.clear()} in endFrame: RETURN, or 26.3's recycle tail. */
+    private static boolean isStagedPoolEndFrameTail(
+            AbstractInsnNode instruction, String owner, boolean recycleAtEndFrame) {
+        if (instruction == null) {
+            return false;
+        }
+        if (!recycleAtEndFrame) {
+            return instruction.getOpcode() == Opcodes.RETURN;
+        }
+        AbstractInsnNode sweep = nextOpcode(instruction);
+        AbstractInsnNode tailReturn = sweep == null ? null : nextOpcode(sweep);
+        return instruction instanceof VarInsnNode load
+                && load.getOpcode() == Opcodes.ALOAD
+                && load.var == 0
+                && sweep instanceof MethodInsnNode call
+                && call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                && call.owner.equals(owner)
+                && call.name.equals("tryRecycleBuffers")
+                && call.desc.equals("()V")
+                && tailReturn != null
+                && tailReturn.getOpcode() == Opcodes.RETURN;
     }
 
     private static void patchGlDevice(String jar, Path outputRoot) throws IOException {
@@ -5143,17 +5311,37 @@ public final class MinecraftClientPatcher {
         code.add(done);
         code.add(new InsnNode(Opcodes.RETURN));
         replace(method, code, 2, 1);
-        patchGameRendererBrowserFrameBudget(node);
-        patchGameRendererBrowserInventoryWorldRenderThrottle(node);
+        boolean deltaFreeFrame = gameRendererDeltaFreeFrame(node, jar);
+        patchGameRendererBrowserFrameBudget(node, deltaFreeFrame);
+        patchGameRendererBrowserInventoryWorldRenderThrottle(node, deltaFreeFrame);
         patchGameRendererBrowserTargetingAfterCamera(node);
         writeComputeFrames(node, output);
     }
 
-    private static void patchGameRendererBrowserFrameBudget(ClassNode node) {
+    /**
+     * 26.3 dropped the DeltaTracker parameters of GameRenderer.render/renderLevel (render()V,
+     * renderLevel()V). Exactly one frame-loop shape must be present, and it must agree with the
+     * probed render API, so a mixed jar fails instead of patching half a frame loop.
+     */
+    private static boolean gameRendererDeltaFreeFrame(ClassNode node, String jar)
+            throws IOException {
+        boolean legacy = findNullable(
+                node, "render", "(Lnet/minecraft/client/DeltaTracker;Z)V") != null;
+        boolean deltaFree = findNullable(node, "render", "()V") != null
+                && findNullable(node, "renderLevel", "()V") != null;
+        if (legacy == deltaFree || deltaFree != ModernSymbols.cached(jar).renderpearl()) {
+            throw new IllegalStateException("GameRenderer frame-loop shape is ambiguous: "
+                    + "render(DeltaTracker;Z)=" + legacy + " render()/renderLevel()=" + deltaFree);
+        }
+        return deltaFree;
+    }
+
+    private static void patchGameRendererBrowserFrameBudget(
+            ClassNode node, boolean deltaFreeFrame) {
         MethodNode render = find(
                 node,
                 "render",
-                "(Lnet/minecraft/client/DeltaTracker;Z)V");
+                deltaFreeFrame ? "()V" : "(Lnet/minecraft/client/DeltaTracker;Z)V");
         render.instructions.insert(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
                 "dev/gaius/browser/BrowserRenderScheduler",
@@ -5175,7 +5363,8 @@ public final class MinecraftClientPatcher {
                         || !call.owner.equals("net/minecraft/client/renderer/GameRenderer")
                         || !call.name.equals("extractCamera")
                         || !(call.desc.equals("(F)V")
-                                || call.desc.equals("(Lnet/minecraft/client/DeltaTracker;FF)V"))) {
+                                || call.desc.equals("(Lnet/minecraft/client/DeltaTracker;FF)V")
+                                || call.desc.equals("(Lnet/minecraft/client/DeltaTracker;F)V"))) {
                     continue;
                 }
                 if (cameraExtraction != null) {
@@ -5191,11 +5380,14 @@ public final class MinecraftClientPatcher {
                     "GameRenderer post-camera block targeting patch point was not found");
         }
 
-        if (cameraExtraction.desc.equals("(Lnet/minecraft/client/DeltaTracker;FF)V")) {
+        if (cameraExtraction.desc.equals("(Lnet/minecraft/client/DeltaTracker;FF)V")
+                || cameraExtraction.desc.equals("(Lnet/minecraft/client/DeltaTracker;F)V")) {
             // Current Minecraft already runs GameRenderer.update -> Minecraft.pick ->
             // GameRenderer.extract once per rendered frame. A second post-camera raycast
             // duplicates the hottest targeting work and can desynchronize
-            // crosshairPickEntity from hitResult.
+            // crosshairPickEntity from hitResult. 26.3's (DeltaTracker;F) computes the camera
+            // partial tick inside Camera.extractRenderState; the stabilize branch below reads a
+            // float from local 2 and must never run for it.
             System.out.println("Verified current vanilla single-raycast block targeting");
             return;
         }
@@ -5246,8 +5438,15 @@ public final class MinecraftClientPatcher {
         System.out.println("Patched block targeting after " + method.name + method.desc);
     }
 
-    private static void patchGameRendererBrowserInventoryWorldRenderThrottle(ClassNode node) {
-        MethodNode method = find(node, "render", "(Lnet/minecraft/client/DeltaTracker;Z)V");
+    private static void patchGameRendererBrowserInventoryWorldRenderThrottle(
+            ClassNode node, boolean deltaFreeFrame) {
+        // 26.3: render()V calls renderLevel()V with only the receiver on the stack, and the
+        // profiler lives in local 1 instead of local 3.
+        MethodNode method = find(node, "render",
+                deltaFreeFrame ? "()V" : "(Lnet/minecraft/client/DeltaTracker;Z)V");
+        String renderLevelDescriptor = deltaFreeFrame
+                ? "()V" : "(Lnet/minecraft/client/DeltaTracker;)V";
+        int profilerLocal = deltaFreeFrame ? 1 : 3;
         MethodInsnNode renderLevelCall = null;
         for (var instruction = method.instructions.getFirst();
                 instruction != null;
@@ -5256,7 +5455,7 @@ public final class MinecraftClientPatcher {
                     && call.getOpcode() == Opcodes.INVOKEVIRTUAL
                     && call.owner.equals("net/minecraft/client/renderer/GameRenderer")
                     && call.name.equals("renderLevel")
-                    && call.desc.equals("(Lnet/minecraft/client/DeltaTracker;)V")) {
+                    && call.desc.equals(renderLevelDescriptor)) {
                 renderLevelCall = call;
                 break;
             }
@@ -5265,7 +5464,9 @@ public final class MinecraftClientPatcher {
             throw new IllegalStateException("GameRenderer.renderLevel call was not found");
         }
 
-        AbstractInsnNode renderLevelThis = previousRealInstruction(previousRealInstruction(renderLevelCall));
+        AbstractInsnNode renderLevelThis = deltaFreeFrame
+                ? previousRealInstruction(renderLevelCall)
+                : previousRealInstruction(previousRealInstruction(renderLevelCall));
         if (!(renderLevelThis instanceof VarInsnNode loadThis)
                 || loadThis.getOpcode() != Opcodes.ALOAD
                 || loadThis.var != 0) {
@@ -5287,6 +5488,12 @@ public final class MinecraftClientPatcher {
         }
         if (profilerPop == null || profilerPop.getNext() == null) {
             throw new IllegalStateException("GameRenderer world profiler pop was not found");
+        }
+        if (!(previousRealInstruction(profilerPop) instanceof VarInsnNode popProfiler)
+                || popProfiler.getOpcode() != Opcodes.ALOAD
+                || popProfiler.var != profilerLocal) {
+            throw new IllegalStateException(
+                    "GameRenderer world profiler pop no longer reads local " + profilerLocal);
         }
 
         LabelNode continueWorld = new LabelNode();
@@ -5315,7 +5522,7 @@ public final class MinecraftClientPatcher {
                 "(Lnet/minecraft/client/gui/screens/Screen;)Z",
                 false));
         throttle.add(new JumpInsnNode(Opcodes.IFEQ, continueWorld));
-        throttle.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        throttle.add(new VarInsnNode(Opcodes.ALOAD, profilerLocal));
         throttle.add(new MethodInsnNode(
                 Opcodes.INVOKEINTERFACE,
                 "net/minecraft/util/profiling/ProfilerFiller",
@@ -5637,15 +5844,152 @@ public final class MinecraftClientPatcher {
             boolean refreshVisibleSections)
             throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/renderer/LevelRenderer.class");
-        patchLevelRendererBrowserPrepareChunkRenders(node);
-        patchLevelRendererBrowserPrepareAfterOcclusionUpdate(node);
+        // 26.3 (renderpearl) moved the per-section loop into extractSectionDrawGroups, dropped
+        // the DeltaTracker and Matrix4fc render parameters (camera state is local 3, not 4)
+        // and passes a boolean to submitBreakingBlockModel. Every sub-patch below is required
+        // there: no 26.3 shape may fall back to a skip.
+        boolean current = ModernSymbols.cached(jar).renderpearl();
+        if (current) {
+            patchLevelRendererBrowserExtractSectionDrawGroups(node);
+        } else {
+            patchLevelRendererBrowserPrepareChunkRenders(node);
+        }
+        patchLevelRendererBrowserPrepareAfterOcclusionUpdate(node, current);
         // Consume the graph publication flag after update() so the next frame's
         // draw list includes sections from the newly published graph.
-        patchLevelRendererBrowserRefreshVisibleSections(node);
+        patchLevelRendererBrowserRefreshVisibleSections(node, current);
         patchLevelRendererBrowserSectionCompileThrottle(node);
         patchLevelRendererBrowserBlockOutlineOpacity(node);
-        patchLevelRendererBrowserBlockBreakingTelemetry(node);
+        patchLevelRendererBrowserBlockBreakingTelemetry(node, current);
         writeComputeFrames(node, output);
+    }
+
+    /** LevelRenderer.render of 26.3; its camera state parameter is local 3. */
+    private static final String LEVEL_RENDERER_RENDER_263 =
+            "(Lcom/mojang/blaze3d/resource/GraphicsResourceAllocator;Z"
+                    + "Lnet/minecraft/client/renderer/state/level/CameraRenderState;"
+                    + "Lcom/mojang/renderpearl/api/buffers/GpuBufferSlice;"
+                    + "Lorg/joml/Vector4f;ZZ)V";
+
+    /**
+     * 26.3 shape of {@link #patchLevelRendererBrowserPrepareChunkRenders}. Vanilla already
+     * copies the terrain matrix once per frame (in render) and reads the clock once before the
+     * section loop, which now lives in extractSectionDrawGroups and serves both prepare variants.
+     * What remains: the per-section {@code ChunkSectionLayer.values()} clone (redirected to the
+     * shared array, also in prepareChunkRenders) and the prepare statistics, which now report
+     * the real largest shared-index count (prepareChunkRenders local 8) instead of 0.
+     * prepareChunkRendersIndirect stays vanilla: TerrainPatches263 keeps the multi-draw-indirect
+     * path unreachable because WebGL2 has no indirect draws.
+     */
+    private static void patchLevelRendererBrowserExtractSectionDrawGroups(ClassNode node) {
+        String owner = "net/minecraft/client/renderer/LevelRenderer";
+        String returnType = "Lnet/minecraft/client/renderer/chunk/ChunkSectionsToRender;";
+        String extractDescriptor = "(ZLjava/util/List;Ljava/util/Map;)I";
+        MethodNode extract = find(node, "extractSectionDrawGroups", extractDescriptor);
+        MethodNode prepare = find(node, "prepareChunkRenders", "(Lorg/joml/Matrix4fc;Z)" + returnType);
+        find(node, "prepareChunkRendersIndirect", "(Lorg/joml/Matrix4fc;Z)" + returnType);
+        if (findNullable(node, "prepareChunkRenders", "(Lorg/joml/Matrix4fc;)" + returnType) != null) {
+            throw new IllegalStateException("LevelRenderer has both 26.2 and 26.3 prepare shapes");
+        }
+        int clockReads = 0;
+        for (AbstractInsnNode instruction : extract.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.owner.equals("net/minecraft/util/Util")
+                    && call.name.equals("getMillis")) {
+                clockReads++;
+            }
+        }
+        if (clockReads != 1 || countTypeInsns(prepare, "org/joml/Matrix4f") != 0
+                || countTypeInsns(extract, "org/joml/Matrix4f") != 0) {
+            throw new IllegalStateException(
+                    "LevelRenderer 26.3 prepare no longer hoists its clock and matrix copies");
+        }
+        redirectChunkSectionLayerValues(extract, 1);
+        redirectChunkSectionLayerValues(prepare, 1);
+
+        MethodInsnNode extractCall = null;
+        for (AbstractInsnNode instruction : prepare.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.owner.equals(owner)
+                    && call.name.equals("extractSectionDrawGroups")
+                    && call.desc.equals(extractDescriptor)) {
+                if (extractCall != null) {
+                    throw new IllegalStateException(
+                            "LevelRenderer.prepareChunkRenders extracts sections twice");
+                }
+                extractCall = call;
+            }
+        }
+        if (extractCall == null
+                || !(nextOpcode(extractCall) instanceof VarInsnNode largestStore)
+                || largestStore.getOpcode() != Opcodes.ISTORE) {
+            throw new IllegalStateException(
+                    "LevelRenderer.prepareChunkRenders largest index count store changed");
+        }
+        int largestIndexLocal = largestStore.var;
+        AbstractInsnNode returnNode = null;
+        for (AbstractInsnNode instruction : prepare.instructions.toArray()) {
+            if (instruction.getOpcode() == Opcodes.ARETURN) {
+                if (returnNode != null) {
+                    throw new IllegalStateException(
+                            "LevelRenderer.prepareChunkRenders has multiple returns");
+                }
+                returnNode = instruction;
+            } else if (instruction instanceof VarInsnNode store
+                    && store != largestStore
+                    && store.var == largestIndexLocal
+                    && store.getOpcode() >= Opcodes.ISTORE
+                    && store.getOpcode() <= Opcodes.ASTORE) {
+                throw new IllegalStateException(
+                        "LevelRenderer.prepareChunkRenders reuses the largest index count local");
+            }
+        }
+        if (returnNode == null) {
+            throw new IllegalStateException(
+                    "LevelRenderer.prepareChunkRenders return was not found");
+        }
+        InsnList emitStats = new InsnList();
+        emitStats.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        emitStats.add(new FieldInsnNode(Opcodes.GETFIELD, owner,
+                "visibleSections", "Lit/unimi/dsi/fastutil/objects/ObjectArrayList;"));
+        emitStats.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                "it/unimi/dsi/fastutil/objects/ObjectArrayList", "size", "()I", false));
+        emitStats.add(new VarInsnNode(Opcodes.ILOAD, largestIndexLocal));
+        emitStats.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserChunkDrawTelemetry",
+                "recordPrepareStats", "(II)V", false));
+        prepare.instructions.insertBefore(returnNode, emitStats);
+        System.out.println("Patched 26.3 section draw-group extraction and prepare statistics");
+    }
+
+    private static int countTypeInsns(MethodNode method, String type) {
+        int count = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction instanceof TypeInsnNode typeInsn && typeInsn.desc.equals(type)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /** Points exactly {@code expected} ChunkSectionLayer.values() clones at the shared array. */
+    private static void redirectChunkSectionLayerValues(MethodNode method, int expected) {
+        int redirected = 0;
+        for (AbstractInsnNode instruction : method.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("net/minecraft/client/renderer/chunk/ChunkSectionLayer")
+                    && call.name.equals("values")
+                    && call.desc.equals(
+                            "()[Lnet/minecraft/client/renderer/chunk/ChunkSectionLayer;")) {
+                call.owner = "dev/gaius/browser/BrowserChunkSectionLayers";
+                redirected++;
+            }
+        }
+        if (redirected != expected) {
+            throw new IllegalStateException("LevelRenderer." + method.name
+                    + " render-layer reads changed: " + redirected);
+        }
     }
 
     /**
@@ -5655,7 +5999,12 @@ public final class MinecraftClientPatcher {
      * update; the original update later in the method remains intact for the
      * normal profiler/lifecycle path.
      */
-    private static void patchLevelRendererBrowserPrepareAfterOcclusionUpdate(ClassNode node) {
+    private static void patchLevelRendererBrowserPrepareAfterOcclusionUpdate(
+            ClassNode node, boolean current) {
+        if (current) {
+            patchCurrentLevelRendererPrepareAfterOcclusionUpdate(node);
+            return;
+        }
         MethodNode render = node.methods.stream()
                 .filter(candidate -> candidate.name.equals("render")
                         && candidate.desc.equals("(Lcom/mojang/blaze3d/resource/GraphicsResourceAllocator;"
@@ -5734,14 +6083,98 @@ public final class MinecraftClientPatcher {
     }
 
     /**
+     * 26.3 shape: render prepares through prepareChunkRenders or prepareChunkRendersIndirect.
+     * Both branches follow the single per-frame {@code new Matrix4f(viewRotationMatrix)}, which
+     * is also the target of the skipped-sky jump, so the early update goes right before that
+     * allocation (after its label) and runs on every path. The camera state is local 3.
+     */
+    private static void patchCurrentLevelRendererPrepareAfterOcclusionUpdate(ClassNode node) {
+        String owner = "net/minecraft/client/renderer/LevelRenderer";
+        String returnType = "Lnet/minecraft/client/renderer/chunk/ChunkSectionsToRender;";
+        MethodNode render = find(node, "render", LEVEL_RENDERER_RENDER_263);
+        TypeInsnNode terrainMatrix = null;
+        int prepares = 0;
+        for (AbstractInsnNode instruction : render.instructions.toArray()) {
+            if (instruction instanceof TypeInsnNode allocation
+                    && allocation.getOpcode() == Opcodes.NEW
+                    && allocation.desc.equals("org/joml/Matrix4f")) {
+                if (terrainMatrix != null) {
+                    throw new IllegalStateException(
+                            "LevelRenderer.render has multiple terrain matrix copies");
+                }
+                terrainMatrix = allocation;
+            } else if (instruction instanceof MethodInsnNode call
+                    && call.owner.equals(owner)
+                    && (call.name.equals("prepareChunkRenders")
+                            || call.name.equals("prepareChunkRendersIndirect"))
+                    && call.desc.equals("(Lorg/joml/Matrix4fc;Z)" + returnType)) {
+                if (terrainMatrix == null || !precedesInstruction(terrainMatrix, call)) {
+                    throw new IllegalStateException(
+                            "LevelRenderer.render prepares chunks before its terrain matrix");
+                }
+                prepares++;
+            }
+        }
+        AbstractInsnNode copyDup = terrainMatrix == null ? null : nextOpcode(terrainMatrix);
+        AbstractInsnNode copyThis = copyDup == null ? null : nextOpcode(copyDup);
+        AbstractInsnNode copyState = copyThis == null ? null : nextOpcode(copyThis);
+        if (prepares != 2
+                || copyDup == null || copyDup.getOpcode() != Opcodes.DUP
+                || !(copyThis instanceof VarInsnNode thisLoad)
+                || thisLoad.getOpcode() != Opcodes.ALOAD || thisLoad.var != 0
+                || !(copyState instanceof FieldInsnNode stateField)
+                || !stateField.name.equals("levelRenderState")) {
+            throw new IllegalStateException(
+                    "LevelRenderer.render terrain matrix/prepare anchor changed: prepares="
+                            + prepares);
+        }
+        InsnList early = new InsnList();
+        early.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        early.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "sectionOcclusionGraph",
+                "Lnet/minecraft/client/renderer/SectionOcclusionGraph;"));
+        early.add(new VarInsnNode(Opcodes.ALOAD, 3));
+        early.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        early.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "optionsRenderState",
+                "Lnet/minecraft/client/renderer/state/OptionsRenderState;"));
+        early.add(new FieldInsnNode(Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/state/OptionsRenderState", "fov", "I"));
+        early.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        early.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "levelRenderState",
+                "Lnet/minecraft/client/renderer/state/level/LevelRenderState;"));
+        early.add(new FieldInsnNode(Opcodes.GETFIELD,
+                "net/minecraft/client/renderer/state/level/LevelRenderState",
+                "chunkLoadingRenderState",
+                "Lnet/minecraft/client/renderer/state/level/ChunkLoadingRenderState;"));
+        early.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                "net/minecraft/client/renderer/SectionOcclusionGraph", "update",
+                "(Lnet/minecraft/client/renderer/state/level/CameraRenderState;"
+                        + "ILnet/minecraft/client/renderer/state/level/ChunkLoadingRenderState;)V",
+                false));
+        render.instructions.insertBefore(terrainMatrix, early);
+        System.out.println("Patched 26.3 early occlusion update before both chunk prepares");
+    }
+
+    private static boolean precedesInstruction(AbstractInsnNode first, AbstractInsnNode second) {
+        for (AbstractInsnNode cursor = first; cursor != null; cursor = cursor.getNext()) {
+            if (cursor == second) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Rebuild the render-visible section lists after the occlusion graph publishes a
      * frustum update.  The 26.2 browser render method updates the graph after preparing
      * chunk draws, but the vanilla list refresh was absent from the transformed method;
      * consequently visibleSections stayed at the initial seven columns while the player
      * moved through newly loaded chunks.
      */
-    private static void patchLevelRendererBrowserRefreshVisibleSections(ClassNode node) {
-        MethodNode render = node.methods.stream()
+    private static void patchLevelRendererBrowserRefreshVisibleSections(
+            ClassNode node, boolean current) {
+        MethodNode render = current
+                ? find(node, "render", LEVEL_RENDERER_RENDER_263)
+                : node.methods.stream()
                 .filter(candidate -> candidate.name.equals("render")
                         && candidate.desc.equals("(Lcom/mojang/blaze3d/resource/GraphicsResourceAllocator;"
                                 + "Lnet/minecraft/client/DeltaTracker;Z"
@@ -5755,6 +6188,7 @@ public final class MinecraftClientPatcher {
             return;
         }
         MethodInsnNode update = null;
+        int updates = 0;
         for (AbstractInsnNode instruction : render.instructions.toArray()) {
             if (instruction instanceof MethodInsnNode call
                     && call.getOpcode() == Opcodes.INVOKEVIRTUAL
@@ -5763,18 +6197,33 @@ public final class MinecraftClientPatcher {
                     && call.desc.equals("(Lnet/minecraft/client/renderer/state/level/CameraRenderState;"
                             + "ILnet/minecraft/client/renderer/state/level/ChunkLoadingRenderState;)V")) {
                 update = call;
+                updates++;
             }
         }
         if (update == null) {
             throw new IllegalStateException(
                     "LevelRenderer.render SectionOcclusionGraph.update call was not found");
         }
-        InsnList refresh = browserVisibleSectionRefreshInstructions();
+        AbstractInsnNode cameraArgument = update;
+        for (int step = 0; step < 7 && cameraArgument != null; step++) {
+            // update(camera, fov, chunkLoading): camera is 7 instructions before the call.
+            cameraArgument = previousOpcode(cameraArgument);
+        }
+        if (current && (updates != 2
+                || !(cameraArgument instanceof VarInsnNode camera)
+                || camera.getOpcode() != Opcodes.ALOAD
+                || camera.var != 3)) {
+            // The early update (patched above) plus vanilla's late one, which reads local 3.
+            throw new IllegalStateException(
+                    "LevelRenderer.render 26.3 late occlusion update shape changed: " + updates);
+        }
+        InsnList refresh = browserVisibleSectionRefreshInstructions(current ? 3 : 4);
         render.instructions.insert(update, refresh);
-        System.out.println("Patched 26.2 visible section refresh after late occlusion update");
+        System.out.println("Patched " + (current ? "26.3" : "26.2")
+                + " visible section refresh after late occlusion update");
     }
 
-    private static InsnList browserVisibleSectionRefreshInstructions() {
+    private static InsnList browserVisibleSectionRefreshInstructions(int cameraStateLocal) {
         LabelNode done = new LabelNode();
         InsnList refresh = new InsnList();
         refresh.add(new VarInsnNode(Opcodes.ALOAD, 0));
@@ -5786,7 +6235,7 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/client/renderer/SectionOcclusionGraph",
                 "consumeFrustumUpdate", "()Z", false));
         refresh.add(new JumpInsnNode(Opcodes.IFEQ, done));
-        refresh.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        refresh.add(new VarInsnNode(Opcodes.ALOAD, cameraStateLocal));
         refresh.add(new FieldInsnNode(Opcodes.GETFIELD,
                 "net/minecraft/client/renderer/state/level/CameraRenderState",
                 "cullFrustum",
@@ -5805,7 +6254,7 @@ public final class MinecraftClientPatcher {
                 "net/minecraft/client/renderer/LevelRenderer",
                 "sectionOcclusionGraph",
                 "Lnet/minecraft/client/renderer/SectionOcclusionGraph;"));
-        refresh.add(new VarInsnNode(Opcodes.ALOAD, 4));
+        refresh.add(new VarInsnNode(Opcodes.ALOAD, cameraStateLocal));
         refresh.add(new FieldInsnNode(Opcodes.GETFIELD,
                 "net/minecraft/client/renderer/state/level/CameraRenderState",
                 "cullFrustum",
@@ -5829,7 +6278,11 @@ public final class MinecraftClientPatcher {
         return refresh;
     }
 
-    private static void patchLevelRendererBrowserBlockBreakingTelemetry(ClassNode node) {
+    private static void patchLevelRendererBrowserBlockBreakingTelemetry(
+            ClassNode node, boolean current) {
+        // 26.3 added a boolean to SubmitNodeCollector.submitBreakingBlockModel.
+        String submitDescriptor = "(Lcom/mojang/blaze3d/vertex/PoseStack;Ljava/util/List;"
+                + (current ? "IZ)V" : "I)V");
         MethodNode method = node.methods.stream()
                 .filter(candidate -> candidate.name.equals("submitBlockDestroyAnimation")
                         && candidate.desc.equals("(Lcom/mojang/blaze3d/vertex/PoseStack;"
@@ -5853,8 +6306,7 @@ public final class MinecraftClientPatcher {
                     && submit.getOpcode() == Opcodes.INVOKEINTERFACE
                     && submit.owner.equals("net/minecraft/client/renderer/SubmitNodeCollector")
                     && submit.name.equals("submitBreakingBlockModel")
-                    && submit.desc.equals("(Lcom/mojang/blaze3d/vertex/PoseStack;"
-                            + "Ljava/util/List;I)V")) {
+                    && submit.desc.equals(submitDescriptor)) {
                 InsnList actual = new InsnList();
                 actual.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
                         "dev/gaius/browser/BrowserBlockBreakingTelemetry",
@@ -5863,7 +6315,7 @@ public final class MinecraftClientPatcher {
                 actualSubmits++;
             }
         }
-        if (method.name.equals("submitBlockDestroyAnimation") && actualSubmits != 1) {
+        if ((current || method.name.equals("submitBlockDestroyAnimation")) && actualSubmits != 1) {
             throw new IllegalStateException(
                     "LevelRenderer breaking-model submit shape changed: " + actualSubmits);
         }
@@ -5935,9 +6387,11 @@ public final class MinecraftClientPatcher {
             throws IOException {
         ClassNode node = read(jar,
                 "net/minecraft/client/renderer/entity/EntityRenderDispatcher.class");
+        // 26.3 appends the partial tick: shouldRender(Entity, Frustum, double x3, float).
         MethodNode method = find(node, "shouldRender",
                 "(Lnet/minecraft/world/entity/Entity;"
-                        + "Lnet/minecraft/client/renderer/culling/Frustum;DDD)Z");
+                        + "Lnet/minecraft/client/renderer/culling/Frustum;"
+                        + (ModernSymbols.cached(jar).renderpearl() ? "DDDF)Z" : "DDD)Z"));
         LabelNode render = new LabelNode();
         InsnList guard = new InsnList();
         guard.add(new VarInsnNode(Opcodes.ALOAD, 1));
@@ -6634,10 +7088,15 @@ public final class MinecraftClientPatcher {
             String jar,
             Path output) throws IOException {
         String entry = "net/minecraft/client/renderer/extract/LevelExtractor.class";
+        boolean present;
         try (ZipFile input = new ZipFile(jar)) {
-            if (input.getEntry(entry) == null) {
-                return;
+            present = input.getEntry(entry) != null;
+        }
+        if (!present) {
+            if (ModernSymbols.cached(jar).renderpearl()) {
+                throw new IllegalStateException("26.3 client has no " + entry);
             }
+            return;
         }
 
         ClassNode node = read(jar, entry);
@@ -6646,7 +7105,8 @@ public final class MinecraftClientPatcher {
                 "extract",
                 "(Lnet/minecraft/client/DeltaTracker;Lnet/minecraft/client/Camera;F)V");
         patchCurrentLevelExtractorBlockBreakingTelemetry(node);
-        patchLevelExtractorBrowserConsumeFrustumBeforeCapturedGuard(node, extract);
+        patchLevelExtractorBrowserConsumeFrustumBeforeCapturedGuard(
+                node, extract, ModernSymbols.cached(jar).renderpearl());
         int patched = 0;
         for (AbstractInsnNode instruction : extract.instructions.toArray()) {
             if (!(instruction instanceof MethodInsnNode add)
@@ -6790,8 +7250,45 @@ public final class MinecraftClientPatcher {
         if (audits == 0) {
             throw new IllegalStateException("LevelExtractor.extract has no return for the section audit");
         }
+        requireLevelRendererUpdateConsumption(output);
         writeComputeFrames(node, output);
         System.out.println("Patched current section extraction with dirty-preserving backpressure");
+    }
+
+    /**
+     * requeueUnconsumed re-dirties every extracted update that LevelRenderer.compileSections did
+     * not mark consumed. Without that consumption hook each update would be recompiled on every
+     * frame, so the requeue half may only be written next to a LevelRenderer that carries it:
+     * the LevelRenderer patch runs earlier in main() and writes into the same output root.
+     */
+    private static void requireLevelRendererUpdateConsumption(Path levelExtractorOutput)
+            throws IOException {
+        Path levelRenderer = levelExtractorOutput.toAbsolutePath().getParent().getParent()
+                .resolve("LevelRenderer.class");
+        if (!Files.isRegularFile(levelRenderer)) {
+            throw new IllegalStateException("LevelExtractor requeue needs the LevelRenderer "
+                    + "compileSections consumption hook, but " + levelRenderer
+                    + " was not patched (patchLevelRendererBrowserBlockBreakProgress)");
+        }
+        MethodNode compile = find(read(levelRenderer), "compileSections",
+                "(Lnet/minecraft/client/renderer/state/level/CameraRenderState;)V");
+        int consumptions = 0;
+        for (AbstractInsnNode instruction : compile.instructions.toArray()) {
+            if (instruction instanceof FieldInsnNode field
+                    && field.getOpcode() == Opcodes.GETFIELD
+                    && field.owner.equals(
+                            "net/minecraft/client/renderer/state/level/LevelRenderState")
+                    && field.name.equals("sectionUpdateRenderStates")
+                    && nextOpcode(field) instanceof MethodInsnNode clear
+                    && clear.owner.equals("java/util/List")
+                    && clear.name.equals("clear")) {
+                consumptions++;
+            }
+        }
+        if (consumptions != 1) {
+            throw new IllegalStateException("LevelExtractor requeue and LevelRenderer update "
+                    + "consumption must be applied together; consumption hooks=" + consumptions);
+        }
     }
 
     /**
@@ -6801,7 +7298,7 @@ public final class MinecraftClientPatcher {
      * lists while avoiding any render-distance or texture-quality changes.
      */
     private static void patchLevelExtractorBrowserConsumeFrustumBeforeCapturedGuard(
-            ClassNode node, MethodNode extract) {
+            ClassNode node, MethodNode extract, boolean dropReceiver) {
         MethodInsnNode captured = null;
         for (AbstractInsnNode instruction : extract.instructions.toArray()) {
             if (instruction instanceof MethodInsnNode call
@@ -6827,6 +7324,20 @@ public final class MinecraftClientPatcher {
         // The browser's captured frustum is retained across camera translation and makes
         // vanilla skip the existing consume/apply path. Remove only this stale-cache short
         // circuit; the normal graph and frustum implementation remains unchanged.
+        if (dropReceiver) {
+            // 26.3: also drop the camera load that fed getCapturedFrustum. Leaving it (as the
+            // 26.2 output still does, kept byte-identical for gate G1) strands one reference on
+            // the operand stack, so the merge after the frustum block has inconsistent stack
+            // heights and the method fails bytecode verification.
+            AbstractInsnNode receiver = previousOpcode(captured);
+            if (!(receiver instanceof VarInsnNode cameraLoad)
+                    || cameraLoad.getOpcode() != Opcodes.ALOAD
+                    || cameraLoad.var != 2) {
+                throw new IllegalStateException(
+                        "LevelExtractor captured-frustum receiver is no longer the camera local 2");
+            }
+            extract.instructions.remove(receiver);
+        }
         extract.instructions.remove(captured);
         extract.instructions.remove(guard);
         System.out.println("Patched LevelExtractor captured-frustum short circuit");
@@ -6838,10 +7349,8 @@ public final class MinecraftClientPatcher {
                         && candidate.desc.equals("(Lnet/minecraft/client/Camera;"
                                 + "Lnet/minecraft/client/renderer/state/level/LevelRenderState;)V"))
                 .findFirst()
-                .orElse(null);
-        if (method == null) {
-            return;
-        }
+                .orElseThrow(() -> new IllegalStateException(
+                        "LevelExtractor.extractBlockDestroyAnimation telemetry target was not found"));
         InsnList entry = new InsnList();
         entry.add(new MethodInsnNode(Opcodes.INVOKESTATIC,
                 "dev/gaius/browser/BrowserBlockBreakingTelemetry",
@@ -7180,6 +7689,9 @@ public final class MinecraftClientPatcher {
         String entry = "net/minecraft/client/renderer/chunk/SectionTaskDynamicQueue.class";
         try (ZipFile input = new ZipFile(jar)) {
             if (input.getEntry(entry) == null) {
+                if (ModernSymbols.cached(jar).renderpearl()) {
+                    throw new IllegalStateException("26.3 client has no " + entry);
+                }
                 return;
             }
         }
@@ -7191,6 +7703,9 @@ public final class MinecraftClientPatcher {
                         + "Lnet/minecraft/client/renderer/chunk/"
                         + "SectionRenderDispatcher$RenderSection$SectionTask;");
         if (poll == null) {
+            if (ModernSymbols.cached(jar).renderpearl()) {
+                throw new IllegalStateException("26.3 SectionTaskDynamicQueue has no poll(Vec3)");
+            }
             return;
         }
         String owner = "net/minecraft/client/renderer/chunk/SectionTaskDynamicQueue";
@@ -8592,6 +9107,7 @@ public final class MinecraftClientPatcher {
                 "(Lnet/minecraft/client/renderer/chunk/ChunkSectionLayer;)"
                         + "Lnet/minecraft/client/renderer/chunk/"
                         + "SectionRenderDispatcher$SectionUberBuffers;");
+        String vertexFormat = sectionHeapFactoryVertexFormat(heapFactory);
         int uberConstructors = 0;
         int vertexHeap = 0;
         int indexHeap = 0;
@@ -8656,7 +9172,7 @@ public final class MinecraftClientPatcher {
                     && vertexFormatLoad.var == 2
                     && shape.get(7) instanceof MethodInsnNode vertexSizeCall
                     && vertexSizeCall.getOpcode() == Opcodes.INVOKEVIRTUAL
-                    && vertexSizeCall.owner.equals("com/mojang/blaze3d/vertex/VertexFormat")
+                    && vertexSizeCall.owner.equals(vertexFormat)
                     && vertexSizeCall.name.equals("getVertexSize")
                     && vertexSizeCall.desc.equals("()I")) {
                 capacity.cst = BROWSER_SECTION_VERTEX_HEAP_BYTES;
@@ -8683,6 +9199,31 @@ public final class MinecraftClientPatcher {
                             + ", index=" + indexHeap);
         }
         System.out.println("Reduced current section renderer browser allocation units");
+    }
+
+    /**
+     * The VertexFormat type of the section heap factory's local 2: the return type of the call
+     * stored first into it (26.2 blaze3d, 26.3 renderpearl/api/vertex). getVertexSize must be
+     * invoked on exactly that owner.
+     */
+    private static String sectionHeapFactoryVertexFormat(MethodNode heapFactory) {
+        for (AbstractInsnNode instruction : heapFactory.instructions.toArray()) {
+            if (!(instruction instanceof VarInsnNode store)
+                    || store.getOpcode() != Opcodes.ASTORE
+                    || store.var != 2) {
+                continue;
+            }
+            if (previousOpcode(store) instanceof MethodInsnNode source) {
+                String type = Type.getReturnType(source.desc).getInternalName();
+                if (type.equals("com/mojang/blaze3d/vertex/VertexFormat")
+                        || type.equals("com/mojang/renderpearl/api/vertex/VertexFormat")) {
+                    return type;
+                }
+            }
+            break;
+        }
+        throw new IllegalStateException(
+                "Current section renderer lambda vertex format local changed");
     }
 
     private static void patchCurrentSectionRenderDispatcherTelemetry(MethodNode upload) {
@@ -8735,12 +9276,24 @@ public final class MinecraftClientPatcher {
     private static void patchUberGpuBufferBrowserTelemetry(String jar, Path output)
             throws IOException {
         String entry = "com/mojang/blaze3d/vertex/UberGpuBuffer.class";
+        boolean present;
         try (ZipFile input = new ZipFile(jar)) {
-            if (input.getEntry(entry) == null) {
-                return;
+            present = input.getEntry(entry) != null;
+        }
+        if (!present) {
+            if (ModernSymbols.cached(jar).renderpearl()) {
+                throw new IllegalStateException("26.3 client has no " + entry);
             }
+            return;
         }
         ClassNode node = read(jar, entry);
+        String uploadDescriptor = uberGpuBufferUploadDescriptor(node);
+        if (!uploadDescriptor.equals("(L"
+                + ModernSymbols.cached(jar).renderType("com/mojang/blaze3d/systems/GpuDevice")
+                + ";Lcom/mojang/blaze3d/vertex/StagingBuffer$Uploader;)Z")) {
+            throw new IllegalStateException(
+                    "UberGpuBuffer upload device type disagrees with the probed render API");
+        }
         patchCurrentUberGpuBufferUploadBudget(node);
         patchUberGpuBufferBrowserLifecycle(node);
         MethodNode addAllocation = find(
@@ -8748,11 +9301,7 @@ public final class MinecraftClientPatcher {
                 "addAllocation",
                 "(Ljava/lang/Object;Lcom/mojang/blaze3d/vertex/"
                         + "UberGpuBuffer$UploadCallback;Ljava/nio/ByteBuffer;)Z");
-        MethodNode uploadAllocations = find(
-                node,
-                "uploadStagedAllocations",
-                "(Lcom/mojang/blaze3d/systems/GpuDevice;"
-                        + "Lcom/mojang/blaze3d/vertex/StagingBuffer$Uploader;)Z");
+        MethodNode uploadAllocations = find(node, "uploadStagedAllocations", uploadDescriptor);
         int addReturns = instrumentUberGpuBufferBacklogReturns(node, addAllocation);
         int uploadReturns = instrumentUberGpuBufferBacklogReturns(node, uploadAllocations);
         if (addReturns != 2 || uploadReturns != 1) {
@@ -8764,12 +9313,25 @@ public final class MinecraftClientPatcher {
         System.out.println("Instrumented staged terrain upload backlog telemetry");
     }
 
+    /**
+     * uploadStagedAllocations takes the blaze3d GpuDevice class on 26.2 and the renderpearl
+     * GpuDevice interface on 26.3; exactly one of the two must exist.
+     */
+    private static String uberGpuBufferUploadDescriptor(ClassNode node) {
+        String legacy = "(Lcom/mojang/blaze3d/systems/GpuDevice;"
+                + "Lcom/mojang/blaze3d/vertex/StagingBuffer$Uploader;)Z";
+        String current = "(Lcom/mojang/renderpearl/api/device/GpuDevice;"
+                + "Lcom/mojang/blaze3d/vertex/StagingBuffer$Uploader;)Z";
+        boolean hasLegacy = findNullable(node, "uploadStagedAllocations", legacy) != null;
+        boolean hasCurrent = findNullable(node, "uploadStagedAllocations", current) != null;
+        if (hasLegacy == hasCurrent) {
+            throw new IllegalStateException("UberGpuBuffer.uploadStagedAllocations shape changed");
+        }
+        return hasCurrent ? current : legacy;
+    }
+
     private static void patchCurrentUberGpuBufferUploadBudget(ClassNode node) {
-        MethodNode upload = find(
-                node,
-                "uploadStagedAllocations",
-                "(Lcom/mojang/blaze3d/systems/GpuDevice;"
-                        + "Lcom/mojang/blaze3d/vertex/StagingBuffer$Uploader;)Z");
+        MethodNode upload = find(node, "uploadStagedAllocations", uberGpuBufferUploadDescriptor(node));
         MethodInsnNode initialFree = null;
         MethodInsnNode keySet = null;
         MethodInsnNode entrySet = null;
