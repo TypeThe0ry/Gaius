@@ -9,11 +9,12 @@ overlay_directory="$(gaius_overlay_directory "$ROOT")"
 
 MEMORY_PATH="$(gaius_library_path "org.lwjgl:lwjgl" "unsafe")"
 OPENGL_PATH="$(gaius_library_path "org.lwjgl:lwjgl-opengl")"
-GLFW_PATH="$(gaius_library_path "org.lwjgl:lwjgl-glfw")"
+# 26.3 ships lwjgl-sdl instead of lwjgl-glfw; the GLFW checks need the module.
+GLFW_PATH="$(gaius_library_path_optional "org.lwjgl:lwjgl-glfw")"
 STB_PATH="$(gaius_library_path "org.lwjgl:lwjgl-stb")"
 MEMORY_JAR="$overlay_directory/libraries/$MEMORY_PATH"
 OPENGL_JAR="$overlay_directory/libraries/$OPENGL_PATH"
-GLFW_JAR="$overlay_directory/libraries/$GLFW_PATH"
+GLFW_JAR="${GLFW_PATH:+$overlay_directory/libraries/$GLFW_PATH}"
 STB_JAR="$overlay_directory/libraries/$STB_PATH"
 VMA_PATH="$(gaius_library_path "org.lwjgl:lwjgl-vma" 2>/dev/null || true)"
 VULKAN_PATH="$(gaius_library_path "org.lwjgl:lwjgl-vulkan" 2>/dev/null || true)"
@@ -37,7 +38,9 @@ javap_dump() {
 
 [[ -f "$MEMORY_JAR" ]] || die "missing $MEMORY_JAR; run build-overlays.sh first"
 [[ -f "$OPENGL_JAR" ]] || die "missing $OPENGL_JAR; run build-overlays.sh first"
-[[ -f "$GLFW_JAR" ]] || die "missing $GLFW_JAR; run build-overlays.sh first"
+if [[ -n "$GLFW_JAR" ]]; then
+    [[ -f "$GLFW_JAR" ]] || die "missing $GLFW_JAR; run build-overlays.sh first"
+fi
 [[ -f "$STB_JAR" ]] || die "missing $STB_JAR; run build-overlays.sh first"
 if [[ -n "$VMA_JAR" ]]; then
     [[ -f "$VMA_JAR" ]] || die "missing $VMA_JAR; run build-overlays.sh first"
@@ -168,7 +171,14 @@ printf '%s\n' "$API_OPTIONAL_BLOCK" | rg -q \
 # GLFW 3.4.1 exposes IME/preedit wrappers that have no browser implementation.
 # Older 3.3.x profiles do not declare these methods; assert only when a method
 # exists so the same smoke remains valid for both supported profiles.
-GLFW_DUMP="$(javap_dump -classpath "$GLFW_JAR" -p -c org.lwjgl.glfw.GLFW)"
+# Without lwjgl-glfw (26.3) GLFW_DUMP stays empty and assert_ime_noop finds
+# no method to check.
+GLFW_DUMP=""
+if [[ -n "$GLFW_JAR" ]]; then
+    GLFW_DUMP="$(javap_dump -classpath "$GLFW_JAR" -p -c org.lwjgl.glfw.GLFW)"
+else
+    printf 'lwjgl browser compatibility smoke: no lwjgl-glfw module; GLFW IME checks do not apply\n'
+fi
 assert_ime_noop() {
     local label="$1"
     local signature="$2"
@@ -264,7 +274,13 @@ for callback in \
     org.lwjgl.stb.STBIWriteCallbackI; do
     case "$callback" in
         org.lwjgl.system.*) jar="$MEMORY_JAR" ;;
-        org.lwjgl.glfw.*) jar="$GLFW_JAR" ;;
+        org.lwjgl.glfw.*)
+            jar="$GLFW_JAR"
+            if [[ -z "$jar" ]]; then
+                printf 'lwjgl browser compatibility smoke: no lwjgl-glfw module for %s\n' "$callback"
+                continue
+            fi
+            ;;
         *) jar="$STB_JAR" ;;
     esac
     # Callback helper classes are not identical across the supported LWJGL
@@ -307,5 +323,91 @@ if [[ -n "$VULKAN_JAR" ]]; then
         || die "Vulkan native entry points do not fail explicitly in the browser"
 fi
 
-printf 'lwjgl browser compatibility smoke passed: %s query generators, %s query deletes, %s draw-buffer and %s clear-buffer methods\n' \
-    "$QUERY_METHODS" "$DELETE_QUERY_METHODS" "$DRAW_BUFFER_METHODS" "$CLEAR_BUFFER_METHODS"
+# LWJGL 3.4.2+ (26.3) routes MemoryUtil and MemoryStack through the
+# MemoryUtil.BACKEND field.  LwjglMemoryPatcher must install
+# BrowserMemoryBackend there, write only fields that exist, and replace the
+# reflective backend and allocator lookups.  LWJGL 3.4.1 (26.2) has no
+# MemoryBackend; its checks are the delegation checks above.
+MEMORY_SHAPE="Unsafe"
+# (Here-strings, not printf | rg -q: rg exits at the first match, and printf
+# of a large dump then fails with SIGPIPE under pipefail.)
+if rg -qF 'static final org.lwjgl.system.MemoryBackend BACKEND;' <<<"$MEMORY_DUMP"; then
+    MEMORY_SHAPE="MemoryBackend"
+    CLINIT_BLOCK="$(method_block "$MEMORY_DUMP" 'static {};')"
+    [[ -n "$CLINIT_BLOCK" ]] || die "MemoryUtil.<clinit> not found"
+    assigned="$(printf '%s\n' "$CLINIT_BLOCK" | rg 'putstatic' \
+        | sed -e 's/.*Field //' -e 's/:.*//' | LC_ALL=C sort | tr '\n' ' ')"
+    [[ "$assigned" == "ARRAY_TLC_BYTE ARRAY_TLC_CHAR ARRAY_TLC_SIZE BACKEND CACHE_LINE_SIZE PAGE_SIZE UTF16 " ]] \
+        || die "MemoryUtil.<clinit> assigns [$assigned] instead of the MemoryBackend field set"
+    for field in $assigned; do
+        rg -q "^  .*static final .* ${field};" <<<"$MEMORY_DUMP" \
+            || die "MemoryUtil.<clinit> writes $field, which MemoryUtil does not declare"
+    done
+    printf '%s\n' "$CLINIT_BLOCK" | rg -A1 -F 'BrowserMemoryBackend.INSTANCE' \
+        | rg -qF 'Field BACKEND:Lorg/lwjgl/system/MemoryBackend;' \
+        || die "MemoryUtil.BACKEND is not assigned BrowserMemoryBackend.INSTANCE"
+    if printf '%s\n' "$CLINIT_BLOCK" | rg -q 'Library.initialize|getPageSize|getCacheLineSize|createBackend|apiLog'; then
+        die "MemoryUtil.<clinit> still initializes natives or logs the desktop backend"
+    fi
+    CREATE_BACKEND_BLOCK="$(method_block "$MEMORY_DUMP" 'org.lwjgl.system.MemoryBackend createBackend()')"
+    printf '%s\n' "$CREATE_BACKEND_BLOCK" | rg -qF 'BrowserMemoryBackend.INSTANCE' \
+        || die "MemoryUtil.createBackend() does not return BrowserMemoryBackend.INSTANCE"
+    if printf '%s\n' "$CREATE_BACKEND_BLOCK" | rg -q 'forName|newInstance|getDeclaredConstructor|Configuration'; then
+        die "MemoryUtil.createBackend() still selects a desktop backend by reflection"
+    fi
+    # Word-at-a-time NUL scans would read past the end of an exactly sized
+    # virtual region.
+    assert_delegate "MemoryUtil NUL scan" "$MEMORY_DUMP" 'int strlenNT1(long, int)' 'BrowserMemory.lengthNt1'
+    assert_delegate "MemoryUtil NUL scan" "$MEMORY_DUMP" 'int strlenNT2(long, int)' 'BrowserMemory.lengthNt2'
+    LAZY_INIT_DUMP="$(javap_dump -classpath "$MEMORY_JAR" -p -c 'org.lwjgl.system.MemoryUtil$LazyInit')"
+    LAZY_INIT_BLOCK="$(method_block "$LAZY_INIT_DUMP" 'static {};')"
+    printf '%s\n' "$LAZY_INIT_BLOCK" | rg -qF 'BrowserMemoryAllocator.instance' \
+        || die 'MemoryUtil$LazyInit does not use BrowserMemoryAllocator'
+    if printf '%s\n' "$LAZY_INIT_BLOCK" | rg -q 'MemoryManage|Configuration'; then
+        die 'MemoryUtil$LazyInit still selects a native allocator'
+    fi
+    BACKEND_DUMP="$(javap_dump -classpath "$MEMORY_JAR" -p org.lwjgl.system.BrowserMemoryBackend)" \
+        || die "BrowserMemoryBackend is missing from $MEMORY_JAR"
+    printf '%s\n' "$BACKEND_DUMP" \
+        | rg -qF 'public final class org.lwjgl.system.BrowserMemoryBackend implements org.lwjgl.system.MemoryBackend' \
+        || die "BrowserMemoryBackend does not implement MemoryBackend"
+    printf '%s\n' "$BACKEND_DUMP" \
+        | rg -qF 'public static final org.lwjgl.system.BrowserMemoryBackend INSTANCE;' \
+        || die "BrowserMemoryBackend.INSTANCE is missing"
+fi
+
+# Platform.<clinit> must replace exactly the os.name lookup with "Linux":
+# LWJGL 3.4.3 reads java.version first, and replacing that value instead
+# makes Platform fail to initialize.
+PLATFORM_DUMP="$(javap_dump -classpath "$MEMORY_JAR" -p -c org.lwjgl.system.Platform)"
+PLATFORM_CLINIT="$(method_block "$PLATFORM_DUMP" 'static {};')"
+printf '%s\n' "$PLATFORM_CLINIT" | awk '
+    state == 1 { state = ($2 == "pop") ? 2 : 0; next }
+    state == 2 { if (index($0, "// String Linux")) replaced[property] = 1; state = 0 }
+    index($0, "java/lang/System.getProperty") { property = last; state = 1; next }
+    index($0, " ldc") && index($0, "// String ") { value = $0; sub(/.*String /, "", value); last = value }
+    END {
+        if (!("os.name" in replaced)) exit 1
+        for (key in replaced) if (key != "os.name") exit 1
+    }
+' || die "Platform.<clinit> does not replace exactly the os.name lookup with Linux"
+
+# jtracy 1.14 (26.3) adds profiler section categories; the browser client must
+# never reach their TracyBindings natives.
+JTRACY_PATH="$(gaius_library_path "com.mojang:jtracy")"
+JTRACY_JAR="$overlay_directory/libraries/$JTRACY_PATH"
+[[ -f "$JTRACY_JAR" ]] || die "missing $JTRACY_JAR; run build-overlays.sh first"
+TRACY_DUMP="$(javap_dump -classpath "$JTRACY_JAR" -p -c com.mojang.jtracy.TracyClient)"
+TRACY_AVAILABLE="$(method_block "$TRACY_DUMP" 'boolean isAvailable()')"
+printf '%s\n' "$TRACY_AVAILABLE" | rg -q 'iconst_0' || die "TracyClient.isAvailable() does not return false"
+SECTION_BLOCK="$(method_block "$TRACY_DUMP" 'com.mojang.jtracy.SectionCategory createSectionCategory(java.lang.String)')"
+if [[ -n "$SECTION_BLOCK" ]]; then
+    printf '%s\n' "$SECTION_BLOCK" | rg -qF 'SectionCategory.UNAVAILABLE' \
+        || die "TracyClient.createSectionCategory does not return SectionCategory.UNAVAILABLE"
+    if printf '%s\n' "$SECTION_BLOCK" | rg -qF 'TracyBindings'; then
+        die "TracyClient.createSectionCategory still reaches TracyBindings natives"
+    fi
+fi
+
+printf 'lwjgl browser compatibility smoke passed: %s MemoryUtil, %s query generators, %s query deletes, %s draw-buffer and %s clear-buffer methods\n' \
+    "$MEMORY_SHAPE" "$QUERY_METHODS" "$DELETE_QUERY_METHODS" "$DRAW_BUFFER_METHODS" "$CLEAR_BUFFER_METHODS"

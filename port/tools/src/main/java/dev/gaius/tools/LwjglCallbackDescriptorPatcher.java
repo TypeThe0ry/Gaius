@@ -31,10 +31,14 @@ public final class LwjglCallbackDescriptorPatcher {
         Path outputRoot = Path.of(args[1]);
         List<String> patched = new ArrayList<>();
         try (ZipFile jar = new ZipFile(args[0])) {
+            boolean leaveVersioned = MultiReleaseEntries.leaveVersionedEntries(jar);
             var entries = jar.entries();
             while (entries.hasMoreElements()) {
                 var entry = entries.nextElement();
                 if (entry.isDirectory() || !entry.getName().endsWith(".class")) {
+                    continue;
+                }
+                if (leaveVersioned && MultiReleaseEntries.isVersioned(entry)) {
                     continue;
                 }
                 ClassNode node = new ClassNode();
