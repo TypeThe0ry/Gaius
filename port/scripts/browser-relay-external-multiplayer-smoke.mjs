@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 /*
  * External multi-client RelayNode transport smoke.
  *
@@ -22,9 +23,17 @@ const relayUrl = process.env.GAIUS_EXTERNAL_RELAY_URL ?? "wss://ellan.site/tunne
 const target = parseTarget(
     process.env.GAIUS_EXTERNAL_TARGET,
 );
-const profile = process.env.GAIUS_VERSION_PROFILE_PATH?.includes("1.21.11")
-    ? { id: "1.21.11", protocol: 774 }
-    : { id: "26.2", protocol: 776 };
+// Read the protocol from the selected version profile instead of assuming
+// every non-1.21.11 profile is 26.2 (26.3 speaks protocol 777).
+const profile = (() => {
+    const profilePath = process.env.GAIUS_VERSION_PROFILE_PATH ?? "versions/26.2.json";
+    const resolved = new URL(`../${profilePath.replace(/^\.?\//, "")}`, import.meta.url);
+    const json = JSON.parse(readFileSync(resolved, "utf8"));
+    if (typeof json.id !== "string" || !Number.isInteger(json.protocolVersion)) {
+        throw new Error(`Invalid version profile ${profilePath}`);
+    }
+    return { id: json.id, protocol: json.protocolVersion };
+})();
 const clientCount = parseBoundedInteger(
     process.env.GAIUS_EXTERNAL_CLIENTS ?? "4", "GAIUS_EXTERNAL_CLIENTS", 1, 16,
 );
