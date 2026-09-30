@@ -23,9 +23,31 @@ const version = process.env.GAIUS_MINECRAFT_VERSION
   || (process.env.GAIUS_VERSION_PROFILE_PATH
     ? profileIdFromPath(process.env.GAIUS_VERSION_PROFILE_PATH)
     : (/^\d+(?:\.\d+)+$/.test(overlayProfileId) ? overlayProfileId : "26.2"));
-if (version !== "26.2") {
-  throw new Error(`GPU fence retire smoke is 26.2-only; got profile ${version}`);
+// Per-profile class shapes.  26.2 runs MinecraftClientPatcher on the vanilla client jar;
+// 26.3 (renderpearl GL backend) checks the patched client jar that build-overlays.sh wrote
+// (a GAIUS_BRINGUP=1 build is enough), because the full 26.3 patch chain only runs there.
+const PROFILE_SHAPES = {
+  "26.2": {
+    gl: "com.mojang.blaze3d.opengl",
+    transientMemory: "com.mojang.blaze3d.systems.TransientMemory",
+    lwjglVersion: "3.4.1",
+    lwjglCoreJar: "lwjgl-3.4.1-unsafe.jar",
+    patchVanillaJar: true,
+  },
+  "26.3": {
+    gl: "com.mojang.renderpearl.backend.opengl",
+    transientMemory: "com.mojang.renderpearl.api.buffers.TransientMemory",
+    lwjglVersion: "3.4.3",
+    lwjglCoreJar: "lwjgl-3.4.3.jar",
+    patchVanillaJar: false,
+  },
+};
+const shape = PROFILE_SHAPES[version];
+if (!shape) {
+  throw new Error(`GPU fence retire smoke supports profiles ${Object.keys(PROFILE_SHAPES)
+    .join(", ")}; got ${version}`);
 }
+const glPackage = shape.gl;
 const workRoot = path.join(repositoryRoot, "port/work", version);
 const overlayRoot = nativePath(process.env.GAIUS_OVERLAY_DIRECTORY || path.join(
   repositoryRoot, "port/work/overlays",
@@ -46,11 +68,16 @@ const browserOpenGlSource = path.join(
 );
 const lwjglOpenGl = path.join(
   overlayRoot,
-  "libraries/org/lwjgl/lwjgl-opengl/3.4.1/lwjgl-opengl-3.4.1.jar",
+  `libraries/org/lwjgl/lwjgl-opengl/${shape.lwjglVersion}/lwjgl-opengl-${shape.lwjglVersion}.jar`,
 );
 const lwjglCore = path.join(
   overlayRoot,
-  "libraries/org/lwjgl/lwjgl/3.4.1/lwjgl-3.4.1-unsafe.jar",
+  `libraries/org/lwjgl/lwjgl/${shape.lwjglVersion}/${shape.lwjglCoreJar}`,
+);
+const browserOpenGlIndexedSource = path.join(
+  repositoryRoot,
+  "port/overrides/libraries/lwjgl-opengl/src/versions/3.4.3/java/org/lwjgl/opengl/"
+    + "BrowserOpenGLIndexed.java",
 );
 
 function run(command, args, options = {}) {
@@ -85,7 +112,7 @@ function selectJavaTools() {
       // Try the next configured JDK.
     }
   }
-  throw new Error("Minecraft 26.2 GPU retire smoke requires JDK 25 or newer");
+  throw new Error(`Minecraft ${version} GPU retire smoke requires JDK 25 or newer`);
 }
 
 function method(bytecode, signature, nextSignature) {
@@ -224,7 +251,12 @@ try {
     mkdir(harnessClasses, {recursive: true}),
     mkdir(harnessSourceDirectory, {recursive: true}),
   ]);
-  await copyUnsignedClientJar(baseClient, unsignedBaseClient);
+  if (shape.patchVanillaJar) {
+    await copyUnsignedClientJar(baseClient, unsignedBaseClient);
+  } else {
+    assert.ok(existsSync(overlayClient),
+      `missing patched ${version} client jar ${overlayClient} (run build-overlays.sh)`);
+  }
 
   const asm = path.join(
     homedir(),
@@ -235,19 +267,21 @@ try {
     ".m2/repository/org/ow2/asm/asm-tree/9.8/asm-tree-9.8.jar",
   );
   const asmClasspath = [asm, asmTree].join(path.delimiter);
-  run(javaTools.javac, [
-    "-proc:none",
-    "-classpath", asmClasspath,
-    "-sourcepath", path.join(repositoryRoot, "port/tools/src/main/java"),
-    "-d", patcherClasses,
-    patcherSource,
-  ], {stdio: ["ignore", "pipe", "pipe"]});
-  run(javaTools.java, [
-    "-classpath", [patcherClasses, asmClasspath].join(path.delimiter),
-    "dev.gaius.tools.MinecraftClientPatcher",
-    baseClient,
-    patchedClasses,
-  ], {stdio: ["ignore", "pipe", "pipe"]});
+  if (shape.patchVanillaJar) {
+    run(javaTools.javac, [
+      "-proc:none",
+      "-classpath", asmClasspath,
+      "-sourcepath", path.join(repositoryRoot, "port/tools/src/main/java"),
+      "-d", patcherClasses,
+      patcherSource,
+    ], {stdio: ["ignore", "pipe", "pipe"]});
+    run(javaTools.java, [
+      "-classpath", [patcherClasses, asmClasspath].join(path.delimiter),
+      "dev.gaius.tools.MinecraftClientPatcher",
+      baseClient,
+      patchedClasses,
+    ], {stdio: ["ignore", "pipe", "pipe"]});
+  }
 
   let runtimeClasspath = (await readFile(
     path.join(workRoot, "classpath.txt"),
@@ -290,17 +324,19 @@ try {
     "-classpath", browserCompileClasspath,
     "-d", browserClasses,
     browserOpenGlSource,
+    ...(shape.lwjglVersion === "3.4.3" ? [browserOpenGlIndexedSource] : []),
   ], {stdio: ["ignore", "pipe", "pipe"]});
 
   // The patcher emits replacement classes into a directory.  Loading those
   // beside a signed Mojang jar trips the JVM package-signer check before the
   // verifier reaches the patched methods.  Use a job-local unsigned copy so
   // this remains a bytecode/runtime verifier, rather than a signer artifact.
-  const patchedClasspath = [patchedClasses, unsignedBaseClient].join(path.delimiter);
+  const patchedClasspath = (shape.patchVanillaJar
+    ? [patchedClasses, unsignedBaseClient] : [overlayClient]).join(path.delimiter);
   const encoderBytecode = run(javaTools.javap, [
     "-classpath", patchedClasspath,
     "-p", "-c", "-verbose",
-    "com.mojang.blaze3d.opengl.GlCommandEncoder",
+    `${glPackage}.GlCommandEncoder`,
   ]);
   assert.match(encoderBytecode, /ConstantValue: int 8/,
     "MAX_SUBMITS_IN_FLIGHT was not patched to eight");
@@ -327,7 +363,7 @@ try {
   const awaitSubmit = method(
     encoderBytecode,
     "public boolean awaitSubmit(long, long);",
-    "public com.mojang.blaze3d.systems.TransientMemory transientMemory();",
+    `public ${shape.transientMemory} transientMemory();`,
   );
   assert.ok(awaitSubmit.includes("gaius$pollRetireSlot"),
     "awaitSubmit does not use the nonblocking retire poll");
@@ -345,14 +381,14 @@ try {
   const transientBytecode = run(javaTools.javap, [
     "-classpath", patchedClasspath,
     "-p", "-c",
-    "com.mojang.blaze3d.opengl.GlTransientMemory$PersistentMapping",
+    `${glPackage}.GlTransientMemory$PersistentMapping`,
   ]);
   assert.match(transientBytecode, /bipush\s+8\s*\n\s*\d+:\s+anewarray/,
     "persistent transient rotations were not patched to eight slots");
   const fallbackBytecode = run(javaTools.javap, [
     "-classpath", patchedClasspath,
     "-p", "-c",
-    "com.mojang.blaze3d.opengl.GlTransientMemory$Fallback",
+    `${glPackage}.GlTransientMemory$Fallback`,
   ]);
   assert.ok(fallbackBytecode.includes("gaius$retireRotations"),
     "fallback transient memory has no deferred rotation ring");
@@ -361,7 +397,7 @@ try {
   const fallbackRotate = method(
     fallbackBytecode,
     "public void rotate();",
-    "private com.mojang.blaze3d.opengl.GlTransientMemory$Fallback$GlAllocation allocateGlBlock",
+    `private ${glPackage}.GlTransientMemory$Fallback$GlAllocation allocateGlBlock`,
   );
   assert.ok(
     fallbackRotate.indexOf("java/lang/Runnable.run")
@@ -376,11 +412,11 @@ public final class GpuRetirePatchedClassVerifier {
     public static void main(String[] args) throws Exception {
         ClassLoader loader = GpuRetirePatchedClassVerifier.class.getClassLoader();
         Class<?> encoder = Class.forName(
-                "com.mojang.blaze3d.opengl.GlCommandEncoder", false, loader);
+                "${glPackage}.GlCommandEncoder", false, loader);
         Class<?> persistent = Class.forName(
-                "com.mojang.blaze3d.opengl.GlTransientMemory$PersistentMapping", false, loader);
+                "${glPackage}.GlTransientMemory$PersistentMapping", false, loader);
         Class<?> fallback = Class.forName(
-                "com.mojang.blaze3d.opengl.GlTransientMemory$Fallback", false, loader);
+                "${glPackage}.GlTransientMemory$Fallback", false, loader);
         encoder.getDeclaredMethod("submit");
         encoder.getDeclaredMethod("awaitSubmit", long.class, long.class);
         encoder.getDeclaredMethod("gaius$pollRetireSlot", int.class, long.class);
@@ -399,9 +435,9 @@ public final class GpuRetirePatchedClassVerifier {
   );
   await writeFile(harnessSourceFile, harnessSource, "utf8");
   const verifyClasspath = [
-    patchedClasses,
+    ...(shape.patchVanillaJar ? [patchedClasses] : []),
     browserClasses,
-    unsignedBaseClient,
+    shape.patchVanillaJar ? unsignedBaseClient : overlayClient,
     lwjglOpenGl,
     lwjglCore,
     ...teaVmJars,
@@ -418,7 +454,8 @@ public final class GpuRetirePatchedClassVerifier {
     "-classpath", [harnessClasses, verifyClasspath].join(path.delimiter),
     "dev.gaius.smoke.GpuRetirePatchedClassVerifier",
   ], {stdio: ["ignore", "pipe", "pipe"]});
-  assert.match(verifyOutput, /verified=com\.mojang\.blaze3d\.opengl\.GlCommandEncoder/);
+  assert.ok(verifyOutput.includes(`verified=${glPackage}.GlCommandEncoder`),
+    `patched ${version} GPU retire classes did not verify`);
 } finally {
   await rm(temporaryRoot, {recursive: true, force: true});
 }
