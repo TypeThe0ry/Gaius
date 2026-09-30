@@ -138,6 +138,14 @@ public final class WorldgenPatches263 {
                 () -> patchCarvingMaskDeepPulses(jar, root));
         PatchRegistry.run("WorldgenPatches263.patchMaterialRuleContextIntCounters",
                 () -> patchMaterialRuleContextIntCounters(jar, root));
+    }
+
+    /**
+     * Runs the non-suspending guard (R8) on the finished M263 output. Minecraft263BrowserPatcher
+     * calls it after the last domain, so pulses that later domains (Server, Ui) insert into
+     * guarded code are caught too; it reads root first, then the jar.
+     */
+    public static void verifyChainTail(String jar, Path root) throws IOException {
         PatchRegistry.run("WorldgenPatches263.verifyNonSuspendingWorldgenKernels",
                 () -> verifyNonSuspendingWorldgenKernels(jar, root));
     }

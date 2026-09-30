@@ -70,7 +70,7 @@ public final class UiPatches263 {
 
     /** {@code ClientLevel.playBreakingSound}: {@code ldc 8.0f; fdiv} after getHitSound becomes 4.0f. */
     static void patchClientLevelBreakingSoundVolume(String jar, Path root) throws IOException {
-        ClassNode node = read(jar, CLIENT_LEVEL);
+        ClassNode node = read(jar, root, CLIENT_LEVEL);
         MethodNode method = find(node, "playBreakingSound",
                 "(Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/level/block/state/BlockState;)V");
         boolean hitSound = false;
@@ -114,7 +114,7 @@ public final class UiPatches263 {
      * vanilla jar in patch-registry-smoke, so it does not insist on the override itself).
      */
     static void patchVanillaPackResourcesSingleLayer(String jar, Path root) throws IOException {
-        ClassNode node = read(jar, VANILLA_PACK_BUILDER);
+        ClassNode node = read(jar, root, VANILLA_PACK_BUILDER);
         FieldNode fullBuilder = null;
         boolean layers = false;
         for (FieldNode field : node.fields) {
@@ -179,7 +179,17 @@ public final class UiPatches263 {
         write(node, root);
     }
 
-    static ClassNode read(String jar, String owner) throws IOException {
+    /**
+     * Reads {@code owner} as the chain has patched it so far: the class an earlier M263 domain
+     * wrote under {@code root} first, then the jar (contract C2).
+     */
+    static ClassNode read(String jar, Path root, String owner) throws IOException {
+        Path written = root.resolve(owner + ".class");
+        if (Files.isRegularFile(written)) {
+            ClassNode node = new ClassNode();
+            new ClassReader(Files.readAllBytes(written)).accept(node, 0);
+            return node;
+        }
         try (ZipFile zip = new ZipFile(jar)) {
             var entry = zip.getEntry(owner + ".class");
             if (entry == null) {

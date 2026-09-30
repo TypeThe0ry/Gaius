@@ -74,7 +74,7 @@ public final class ServerPatches263 {
     }
 
     static void patchRegistryLoadTaskBrowserStartupYield(String jar, Path root) throws IOException {
-        ClassNode node = read(jar, PENDING_REGISTRATION);
+        ClassNode node = read(jar, root, PENDING_REGISTRATION);
         MethodNode load = find(node, "loadFromResource", LOAD_FROM_RESOURCE_DESCRIPTOR);
         if ((load.access & Opcodes.ACC_STATIC) == 0) {
             throw new IllegalStateException(PENDING_REGISTRATION + ".loadFromResource is not static");
@@ -107,7 +107,7 @@ public final class ServerPatches263 {
     }
 
     static void patchPlayerListIsOpBrowserCommands(String jar, Path root) throws IOException {
-        ClassNode node = read(jar, PLAYER_LIST);
+        ClassNode node = read(jar, root, PLAYER_LIST);
         for (MethodNode method : node.methods) {
             if (method.name.equals("setAllowCommandsForAllPlayers")) {
                 throw new IllegalStateException(PLAYER_LIST
@@ -149,7 +149,17 @@ public final class ServerPatches263 {
         return cursor;
     }
 
-    private static ClassNode read(String jar, String owner) throws IOException {
+    /**
+     * Reads {@code owner} as the chain has patched it so far: the class an earlier M263 domain
+     * wrote under {@code root} first, then the jar (contract C2).
+     */
+    private static ClassNode read(String jar, Path root, String owner) throws IOException {
+        Path written = root.resolve(owner + ".class");
+        if (Files.isRegularFile(written)) {
+            ClassNode node = new ClassNode();
+            new ClassReader(Files.readAllBytes(written)).accept(node, 0);
+            return node;
+        }
         try (ZipFile zip = new ZipFile(jar)) {
             var entry = zip.getEntry(owner + ".class");
             if (entry == null) {

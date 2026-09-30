@@ -420,14 +420,11 @@ try {
   assert.match(result.err, /is not a 26\.3\+ client \(renderApi=BLAZE3D/);
   result = run(["dev.gaius.tools.Minecraft263BrowserPatcher", jar263, m263Root]);
   assert.notEqual(result.status, 0, "M263 requires the version argument");
+  // The 26.3 domains patch the output of the modern chain; on the vanilla jar the terrain
+  // chain check (TerrainPatches263.verifyTerrainChain) must refuse the missing chain hooks.
   result = run(["dev.gaius.tools.Minecraft263BrowserPatcher", jar263, m263Root, "26.3"]);
-  assert.equal(result.status, 0, result.err);
-  const domainLines = result.out.split(/\r?\n/).filter((line) => /^[A-Za-z]+Patches263: /.test(line))
-    .map((line) => line.split(":")[0]);
-  assert.deepEqual(domainLines, ["RenderPatches263", "InputPatches263", "TerrainPatches263",
-    "WorldgenPatches263", "ServerPatches263", "UiPatches263"]);
-  assert.match(result.out, /^Minecraft263BrowserPatcher: profile 26\.3, renderApi=RENDERPEARL .*input=SDL/m);
-  assert.match(result.out, /^PATCH_SUMMARY applied=0 dropped=0 bringupSkipped=0$/m);
+  assert.notEqual(result.status, 0, "M263 accepted a jar the modern chain never patched");
+  assert.match(result.err, /26\.3 terrain chain is incomplete/);
 
   // Minecraft262BrowserPatcher: optional version argument, modern profiles only.
   result = run(["dev.gaius.tools.Minecraft262BrowserPatcher", jar262, join(work, "m262-out"), "1.21.11"]);
@@ -446,19 +443,37 @@ try {
     await copyFile(jar263, stage);
     const env = {GAIUS_BRINGUP: "1", GAIUS_BRINGUP_LIST: bringupList263};
     const skipped = [];
-    for (const [tool, args] of [
-      ["dev.gaius.tools.MinecraftClientPatcher", [stage, join(work, "e2e-mcp"), "26.3"]],
-      ["dev.gaius.tools.Minecraft262BrowserPatcher", [stage, join(work, "e2e-m262"), "26.3"]],
-      ["dev.gaius.tools.Minecraft263BrowserPatcher", [stage, join(work, "e2e-m263"), "26.3"]],
+    // The client chain of build-overlays.sh (MinecraftServerWorkerPatcher left out: no M263
+    // domain reads its classes). The chunk-draw telemetry step does not use PatchRegistry.
+    for (const [tool, args, output] of [
+      ["dev.gaius.tools.MinecraftClientPatcher", [stage, join(work, "e2e-mcp"), "26.3"], join(work, "e2e-mcp")],
+      ["dev.gaius.tools.MinecraftChunkDrawTelemetryPatcher", ["26.3", stage, join(work, "e2e-cdt")],
+        join(work, "e2e-cdt")],
+      ["dev.gaius.tools.Minecraft262BrowserPatcher", [stage, join(work, "e2e-m262"), "26.3"], join(work, "e2e-m262")],
+      ["dev.gaius.tools.Minecraft263BrowserPatcher", [stage, join(work, "e2e-m263"), "26.3"], join(work, "e2e-m263")],
     ]) {
       result = run([tool, ...args], env);
       assert.equal(result.status, 0, `${tool} failed in bring-up mode:\n${result.err}`);
-      assert.match(result.out, /^PATCH_SUMMARY applied=\d+ dropped=\d+ bringupSkipped=\d+$/m);
+      if (tool === "dev.gaius.tools.MinecraftChunkDrawTelemetryPatcher") {
+        assert.match(result.out, /^CHUNK_DRAW_TELEMETRY_PATCH_OK profile=26\.3 /m);
+      } else {
+        assert.match(result.out, /^PATCH_SUMMARY applied=\d+ dropped=\d+ bringupSkipped=\d+$/m);
+      }
+      if (tool === "dev.gaius.tools.Minecraft263BrowserPatcher") {
+        const m263Applied = Number(/^PATCH_SUMMARY applied=(\d+) /m.exec(result.out)[1]);
+        assert.ok(m263Applied > 0, "the 26.3 domains applied no patch on the chained jar");
+        const domainLines = result.out.split(/\r?\n/)
+          .filter((line) => /^[A-Za-z]+Patches263: /.test(line)).map((line) => line.split(":")[0]);
+        assert.deepEqual(domainLines, ["RenderPatches263", "InputPatches263", "TerrainPatches263",
+          "WorldgenPatches263", "ServerPatches263", "UiPatches263"]);
+        assert.match(result.out,
+          /^Minecraft263BrowserPatcher: profile 26\.3, renderApi=RENDERPEARL .*input=SDL/m);
+      }
       assert.doesNotMatch(result.out + result.err, /^(?!BRINGUP_).*\bSkipp(ed|ing)\b/m,
         `${tool}: unregistered skip in the log`);
       skipped.push(...[...result.out.matchAll(/^BRINGUP_SKIP (\S+)$/gm)].map((match) => match[1]));
-      if (existsSync(args[1])) {
-        execFileSync(jarTool, ["--update", "--file", stage, "-C", args[1], "."], {timeout: 120_000});
+      if (existsSync(output)) {
+        execFileSync(jarTool, ["--update", "--file", stage, "-C", output, "."], {timeout: 120_000});
       }
     }
     for (const id of skipped) assert.ok(listed.has(id), `skip of unlisted id ${id}`);

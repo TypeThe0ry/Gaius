@@ -174,7 +174,7 @@ public final class InputPatches263 {
     // ------------------------------------------------------------------ SDLEventHandler
 
     static void patchSdlEventHandlerDispatch(String jar, Path root) throws IOException {
-        ClassNode node = read(jar, SDL_EVENT_HANDLER);
+        ClassNode node = read(jar, root, SDL_EVENT_HANDLER);
         int replaced = 0;
         for (MethodNode method : node.methods) {
             for (AbstractInsnNode instruction = method.instructions.getFirst();
@@ -205,7 +205,7 @@ public final class InputPatches263 {
     // ------------------------------------------------------------------ MouseHandler.onButton
 
     static void patchMouseHandlerButtonHooks(String jar, Path root) throws IOException {
-        ClassNode node = read(jar, MOUSE_HANDLER);
+        ClassNode node = read(jar, root, MOUSE_HANDLER);
         MethodNode onButton = null;
         for (MethodNode method : node.methods) {
             if (method.name.equals("onButton")
@@ -405,7 +405,7 @@ public final class InputPatches263 {
     // ------------------------------------------------------------------ Blaze3D.openUri
 
     static void patchBlaze3dOpenUri(String jar, Path root) throws IOException {
-        ClassNode node = read(jar, BLAZE3D);
+        ClassNode node = read(jar, root, BLAZE3D);
         int patched = 0;
         for (MethodNode method : node.methods) {
             if (method.name.equals("openUri") && method.desc.equals("(Ljava/net/URI;)V")
@@ -427,7 +427,7 @@ public final class InputPatches263 {
     // ------------------------------------------------------------------ SdlDebug
 
     static void patchSdlDebug(String jar, Path root) throws IOException {
-        ClassNode node = read(jar, SDL_DEBUG);
+        ClassNode node = read(jar, root, SDL_DEBUG);
         boolean initializer = false;
         boolean init = false;
         for (MethodNode method : node.methods) {
@@ -491,7 +491,17 @@ public final class InputPatches263 {
         return cursor;
     }
 
-    private static ClassNode read(String jar, String className) throws IOException {
+    /**
+     * Reads {@code className} as the chain has patched it so far: the class an earlier M263 domain
+     * wrote under {@code root} first, then the jar (contract C2).
+     */
+    private static ClassNode read(String jar, Path root, String className) throws IOException {
+        Path written = root.resolve(className + ".class");
+        if (Files.isRegularFile(written)) {
+            ClassNode node = new ClassNode();
+            new ClassReader(Files.readAllBytes(written)).accept(node, 0);
+            return node;
+        }
         try (ZipFile zip = new ZipFile(jar)) {
             ZipEntry entry = zip.getEntry(className + ".class");
             if (entry == null) {

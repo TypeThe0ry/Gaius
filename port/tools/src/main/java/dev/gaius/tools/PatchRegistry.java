@@ -29,7 +29,8 @@ import org.objectweb.asm.tree.MethodNode;
  * <ul>
  *   <li><b>applied</b> &mdash; {@link #run} ran the body, or a patcher called {@link #applied};</li>
  *   <li><b>dropped</b> &mdash; {@link #dropped} proved that the patch's original target is absent
- *       from the jar being patched;</li>
+ *       from the jar being patched. A {@link #run} body that registers drops (under the run's
+ *       own id or under sub-ids of its parts) counts as dropped, not also as applied;</li>
  *   <li><b>bring-up skipped</b> &mdash; only in bring-up mode, for ids listed in the profile's
  *       bring-up list;</li>
  * </ul>
@@ -120,6 +121,9 @@ public final class PatchRegistry {
     private static int dropped;
     private static int bringupSkipped;
     private static boolean pendingPrinted;
+    /** Drops registered by the {@link #run} bodies executing on this thread, innermost last. */
+    private static final ThreadLocal<java.util.ArrayDeque<int[]>> RUN_DROPS =
+            ThreadLocal.withInitial(java.util.ArrayDeque::new);
 
     private PatchRegistry() {
     }
@@ -227,6 +231,10 @@ public final class PatchRegistry {
                     + ": " + String.join(", ", present));
         }
         dropped++;
+        int[] enclosingRun = RUN_DROPS.get().peekLast();
+        if (enclosingRun != null) {
+            enclosingRun[0]++;
+        }
         System.out.println("PATCH_DROPPED " + patchId);
     }
 
@@ -244,9 +252,10 @@ public final class PatchRegistry {
 
     /**
      * Runs one patch: skips it when {@link #bringupSkip} says so, otherwise runs the body and
-     * records it as applied. Failures propagate unchanged. When a patch fails outside bring-up
-     * mode on a profile that has a bring-up list, the list of unfinished patches is printed to
-     * stderr first.
+     * records it as applied, unless the body registered its target (or the targets of all its
+     * parts) as {@link #dropped}: then the call ends as dropped only. Failures propagate
+     * unchanged. When a patch fails outside bring-up mode on a profile that has a bring-up
+     * list, the list of unfinished patches is printed to stderr first.
      */
     public static void run(String patchId, IORunnable body) throws IOException {
         if (body == null) {
@@ -255,13 +264,29 @@ public final class PatchRegistry {
         if (bringupSkip(patchId)) {
             return;
         }
+        int[] drops = new int[1];
+        RUN_DROPS.get().addLast(drops);
         try {
             body.run();
         } catch (IOException | RuntimeException | Error failure) {
             printPendingOnFailure(patchId);
             throw failure;
+        } finally {
+            RUN_DROPS.get().removeLast();
+        }
+        if (drops[0] > 0) {
+            droppedRun(patchId);
+            return;
         }
         applied(patchId);
+    }
+
+    /** A {@link #run} whose body registered drops: seen, but not counted as applied. */
+    private static synchronized void droppedRun(String patchId) {
+        requirePatchId(patchId);
+        resolve();
+        queried.add(patchId);
+        scopes.add(scopeOf(patchId));
     }
 
     /**

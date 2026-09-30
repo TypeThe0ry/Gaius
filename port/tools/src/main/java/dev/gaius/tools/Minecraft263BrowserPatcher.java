@@ -20,7 +20,9 @@ import java.nio.file.Path;
  * {@link RenderPatches263} (P3), {@link InputPatches263} (P2), {@link TerrainPatches263} (P5),
  * {@link WorldgenPatches263} (P6), {@link ServerPatches263} (P7a), {@link UiPatches263} (P8).
  * Each exposes {@code static void apply(String jar, Path root, ModernSymbols s)} and wraps every
- * patch in {@code PatchRegistry.run("<Domain>Patches263.<method>", ...)}.
+ * patch in {@code PatchRegistry.run("<Domain>Patches263.<method>", ...)}. A domain reads a class
+ * from {@code root} when an earlier domain already wrote it there, otherwise from the jar, so
+ * two domains patching one class compose instead of the later one overwriting the earlier.
  *
  * <p>Never runs for 26.2 or 1.21.11: it refuses those profiles and any jar that does not probe as
  * the renderpearl API, so 26.2 output cannot depend on it.
@@ -56,6 +58,8 @@ public final class Minecraft263BrowserPatcher {
         WorldgenPatches263.apply(jar, root, symbols);
         ServerPatches263.apply(jar, root, symbols);
         UiPatches263.apply(jar, root, symbols);
+        // After every domain: the worldgen non-suspending guard sees the whole M263 output.
+        WorldgenPatches263.verifyChainTail(jar, root);
         PatchRegistry.printSummary();
     }
 }
