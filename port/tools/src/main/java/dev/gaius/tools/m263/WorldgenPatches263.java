@@ -357,15 +357,91 @@ public final class WorldgenPatches263 {
         }
     }
 
-    /** Standalone entry point for build scripts and quick-check modules. */
+    /**
+     * Standalone entry point for build scripts and quick-check modules.
+     * {@code --verify-non-suspending <jar>} runs the guard; {@code --self-test <jar>} checks
+     * that the guard catches a pulse injected into a density kernel and one injected into a
+     * method a kernel reaches, and that the unmodified jar passes.
+     */
     public static void main(String[] args) throws IOException {
-        if (args.length != 2 || !args[0].equals("--verify-non-suspending")) {
-            System.err.println("usage: WorldgenPatches263 --verify-non-suspending <client.jar>");
+        if (args.length != 2
+                || !(args[0].equals("--verify-non-suspending") || args[0].equals("--self-test"))) {
+            System.err.println("usage: WorldgenPatches263 --verify-non-suspending|--self-test "
+                    + "<client.jar>");
             System.exit(2);
         }
-        GuardReport report = checkNonSuspending(ClassIndex.load(args[1], null));
+        ClassIndex index = ClassIndex.load(args[1], null);
+        GuardReport report = checkNonSuspending(index);
         report.print(System.out);
+        if (args[0].equals("--self-test")) {
+            System.exit(selfTest(index, report) ? 0 : 1);
+        }
         System.exit(report.violations.isEmpty() ? 0 : 1);
+    }
+
+    private static boolean selfTest(ClassIndex index, GuardReport clean) {
+        if (!clean.violations.isEmpty()) {
+            System.out.println("WORLDGEN_GUARD_SELF_TEST FAIL unmodified jar has violations");
+            return false;
+        }
+        // Direct: a pulse at the start of the first concrete method of a density sampler.
+        MethodNode kernel = null;
+        String kernelKey = null;
+        for (ClassNode node : index.classes.values()) {
+            if (!node.name.startsWith(GUARDED_PACKAGES.get(0) + "op/")) {
+                continue;
+            }
+            for (MethodNode method : node.methods) {
+                if (method.name.equals("sampleVolume") && method.instructions.size() > 0) {
+                    kernel = method;
+                    kernelKey = node.name + "." + method.name + method.desc;
+                    break;
+                }
+            }
+            if (kernel != null) {
+                break;
+            }
+        }
+        if (kernel == null) {
+            System.out.println("WORLDGEN_GUARD_SELF_TEST FAIL no density sampler found");
+            return false;
+        }
+        MethodInsnNode pulse = new MethodInsnNode(
+                Opcodes.INVOKESTATIC, DEEP_CHECKPOINT, "pulse", "()V", false);
+        kernel.instructions.insert(pulse);
+        GuardReport direct = checkNonSuspending(index);
+        kernel.instructions.remove(pulse);
+        String kernelName = kernelKey;
+        boolean directCaught = direct.violations.stream().anyMatch(violation ->
+                violation.startsWith("direct: ") && violation.contains(kernelName));
+        // Transitive: a pulse in a method outside the guard that a guarded method calls.
+        String outsideKey = null;
+        for (String candidate : clean.reachedOutside) {
+            MethodNode method = index.method(candidate);
+            if (method != null && method.instructions.size() > 0) {
+                outsideKey = candidate;
+                break;
+            }
+        }
+        boolean transitiveCaught = false;
+        if (outsideKey != null) {
+            MethodNode outside = index.method(outsideKey);
+            MethodInsnNode outsidePulse = new MethodInsnNode(
+                    Opcodes.INVOKESTATIC, DEEP_CHECKPOINT, "pulse", "()V", false);
+            outside.instructions.insert(outsidePulse);
+            GuardReport transitive = checkNonSuspending(index);
+            outside.instructions.remove(outsidePulse);
+            String target = outsideKey;
+            transitiveCaught = transitive.violations.stream().anyMatch(violation ->
+                    violation.startsWith("transitive: ") && violation.contains(target));
+        }
+        boolean cleanAgain = checkNonSuspending(index).violations.isEmpty();
+        System.out.println("WORLDGEN_GUARD_SELF_TEST direct=" + directCaught + " (" + kernelKey
+                + ") transitive=" + transitiveCaught + " (" + outsideKey + ") restored="
+                + cleanAgain);
+        boolean passed = directCaught && transitiveCaught && cleanAgain;
+        System.out.println("WORLDGEN_GUARD_SELF_TEST " + (passed ? "PASS" : "FAIL"));
+        return passed;
     }
 
     static boolean guarded(String className) {
