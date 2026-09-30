@@ -33,6 +33,7 @@ import {
     decodeClientboundLoginDistances,
     MINECRAFT_1_21_11,
     MINECRAFT_26_2,
+    MINECRAFT_26_3,
 } from "./dist/protocol.js";
 
 const repository = fileURLToPath(new URL("../../", import.meta.url));
@@ -7739,6 +7740,10 @@ function arrivalPeriodicServerSyncContract() {
 }
 
 function browserFullPathPerformanceContract() {
+    // Packet ids come from the active profile's own relay table; an unknown
+    // profile fails in resolveWireProfile instead of borrowing 26.2 ids.
+    assert.ok(activeProfile, "browser full-path contract requires an active profile");
+    const contractPlayIds = resolveWireProfile(activeProfile).play;
     return {
         mode: externalMode
             ? "external-full-path"
@@ -7906,34 +7911,20 @@ function browserFullPathPerformanceContract() {
             maximumUniqueChunkCapacity,
             initialDistanceContract: {
                 source: "clientbound-login",
-                packetId: activeProfile?.id === "1.21.11"
-                    ? MINECRAFT_1_21_11.play.clientboundLogin
-                    : MINECRAFT_26_2.play.clientboundLogin,
+                packetId: contractPlayIds.clientboundLogin,
                 fields: ["chunkRadius", "simulationDistance"],
             },
             observedDistancePackets: {
-                cacheCenter: activeProfile?.id === "1.21.11"
-                    ? MINECRAFT_1_21_11.play.clientboundSetChunkCacheCenter
-                    : MINECRAFT_26_2.play.clientboundSetChunkCacheCenter,
-                cacheRadius: activeProfile?.id === "1.21.11"
-                    ? MINECRAFT_1_21_11.play.clientboundSetChunkCacheRadius
-                    : MINECRAFT_26_2.play.clientboundSetChunkCacheRadius,
-                simulationDistance: activeProfile?.id === "1.21.11"
-                    ? MINECRAFT_1_21_11.play.clientboundSetSimulationDistance
-                    : MINECRAFT_26_2.play.clientboundSetSimulationDistance,
+                cacheCenter: contractPlayIds.clientboundSetChunkCacheCenter,
+                cacheRadius: contractPlayIds.clientboundSetChunkCacheRadius,
+                simulationDistance: contractPlayIds.clientboundSetSimulationDistance,
             },
             observedDistanceContractRequiredBeforeCounting: stressMode,
         },
         chunkBatch: {
-            clientboundFinishedPacketId: activeProfile?.id === "1.21.11"
-                ? MINECRAFT_1_21_11.play.clientboundChunkBatchFinished
-                : MINECRAFT_26_2.play.clientboundChunkBatchFinished,
-            clientboundStartPacketId: activeProfile?.id === "1.21.11"
-                ? MINECRAFT_1_21_11.play.clientboundChunkBatchStart
-                : MINECRAFT_26_2.play.clientboundChunkBatchStart,
-            serverboundAcknowledgementPacketId: activeProfile?.id === "1.21.11"
-                ? MINECRAFT_1_21_11.play.serverboundChunkBatchReceived
-                : MINECRAFT_26_2.play.serverboundChunkBatchReceived,
+            clientboundFinishedPacketId: contractPlayIds.clientboundChunkBatchFinished,
+            clientboundStartPacketId: contractPlayIds.clientboundChunkBatchStart,
+            serverboundAcknowledgementPacketId: contractPlayIds.serverboundChunkBatchReceived,
             desiredChunksPerTick,
             acknowledgementEncoding: "float32-be",
         },
@@ -8756,7 +8747,7 @@ function assertCanonicalProfile(profile) {
 }
 
 function resolveWireProfile(profile) {
-    const resolved = [MINECRAFT_1_21_11, MINECRAFT_26_2]
+    const resolved = [MINECRAFT_1_21_11, MINECRAFT_26_2, MINECRAFT_26_3]
         .find((candidate) => candidate.protocolVersion === profile.protocolVersion &&
             candidate.name === profile.id);
     assert.ok(resolved, `unsupported browser full-path profile ${profile.id}/${profile.protocolVersion}`);

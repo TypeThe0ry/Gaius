@@ -1901,6 +1901,13 @@ function retainPollPhaseSample(state, candidate) {
             decodedGapMillis: 1201 },
         { profileId: "26.2", protocolVersion: 775, packetId: 113,
             decodedGapMillis: 1000 },
+        // 26.3/777 has no canonical cadence contract.  Its PLAY id 113 is
+        // set_simulation_distance and set_time moved to 115, so neither may
+        // inherit the 26.2 hint.
+        { profileId: "26.3", protocolVersion: 777, packetId: 113,
+            decodedGapMillis: 1000 },
+        { profileId: "26.3", protocolVersion: 777, packetId: 115,
+            decodedGapMillis: 1000 },
     ]) {
         assert.equal(classifyPeriodicServerSyncArrival(candidate),
             "unknown-arrival-gap",

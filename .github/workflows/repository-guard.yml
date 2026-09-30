@@ -231,10 +231,10 @@ jobs:
       - name: Install RelayNode dependencies
         run: npm ci --prefix apps/bridge
 
-      - name: Run RelayNode protocol and registry smoke tests for both profiles
+      - name: Run RelayNode protocol and registry smoke tests for every profile
         run: |
           set -euo pipefail
-          for profile in 1.21.11 26.2; do
+          for profile in 1.21.11 26.2 26.3; do
             GAIUS_SMOKE_MINECRAFT_VERSION="$profile" npm run smoke --prefix apps/bridge
           done
           npm run smoke:profiles --prefix apps/bridge

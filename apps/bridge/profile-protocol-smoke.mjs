@@ -12,10 +12,15 @@ import {
   decodeClientboundLoginDistances,
   MINECRAFT_1_21_11 as RELAY_MINECRAFT_1_21_11,
   MINECRAFT_26_2 as RELAY_MINECRAFT_26_2,
+  MINECRAFT_26_3 as RELAY_MINECRAFT_26_3,
+  MINECRAFT_PROFILES as RELAY_MINECRAFT_PROFILES,
+  resolveMinecraftProfile,
 } from "./dist/protocol.js";
 import {
   MINECRAFT_1_21_11,
   MINECRAFT_26_2,
+  MINECRAFT_26_3,
+  MINECRAFT_PROTOCOLS,
   resolveMinecraftProtocol,
 } from "../../packages/protocol/dist/constants.js";
 import {createStatusHandshake} from "../../packages/protocol/dist/status.js";
@@ -26,7 +31,8 @@ import {encodeString} from "../../packages/protocol/dist/binary.js";
 const directory = fileURLToPath(new URL(".", import.meta.url));
 const origin = "http://127.0.0.1:8781";
 const token = "profile-smoke-token";
-const profiles = [MINECRAFT_1_21_11, MINECRAFT_26_2];
+const profiles = [MINECRAFT_1_21_11, MINECRAFT_26_2, MINECRAFT_26_3];
+const relayProfiles = [RELAY_MINECRAFT_1_21_11, RELAY_MINECRAFT_26_2, RELAY_MINECRAFT_26_3];
 
 const bridgeSource = await readFile(new URL("./dist/main.js", import.meta.url), "utf8");
 assert.match(
@@ -74,6 +80,16 @@ assert.doesNotMatch(
   /proxied.*keepalive.*(?:toString\("hex"\)|head=)/i,
   "KeepAlive proxy diagnostics must not retain the KeepAlive value or raw frame",
 );
+assert.doesNotMatch(
+  bridgeSource,
+  /protocolVersion\s*===\s*77\d/,
+  "RelayNode per-profile decisions must come from the profile table, not protocol literals",
+);
+assert.match(
+  bridgeSource,
+  /allowedAuthHosts = new Set\(\[[^\]]*"discovery\.minecraftservices\.com"/,
+  "authlib 10 service discovery must be reachable through the auth proxy",
+);
 
 const keepAliveTelemetryKeys = [
   "enabled",
@@ -83,24 +99,78 @@ const keepAliveTelemetryKeys = [
   "opaqueTransitions",
   "profilesSelected774",
   "profilesSelected776",
+  "profilesSelected777",
   "proxiedKeepAlives",
   "proxiedKeepAlives774Configuration",
   "proxiedKeepAlives774Play",
   "proxiedKeepAlives776Configuration",
   "proxiedKeepAlives776Play",
+  "proxiedKeepAlives777Configuration",
+  "proxiedKeepAlives777Play",
   "schemaVersion",
   "writeBackpressure",
   "writeErrors",
 ].sort();
+const keepAliveProfileScalarKeys = keepAliveTelemetryKeys
+  .filter((key) => /^(?:profilesSelected|proxiedKeepAlives)\d+/.test(key));
 
+// Complete relay packet tables. Every id was derived from the profile's client
+// jar (ProtocolInfoBuilder registration order in GameProtocols /
+// ConfigurationProtocols / LoginProtocols) and cross-checked against the
+// vanilla data generator's reports/packets.json; never edit one by analogy
+// with another profile. 774/776 are golden values that must not move.
+const loginIds = {
+  clientboundDisconnect: 0,
+  clientboundEncryptionRequest: 1,
+  clientboundLoginFinished: 2,
+  clientboundCompression: 3,
+  serverboundHello: 0,
+  serverboundKey: 1,
+  serverboundLoginAcknowledged: 3,
+};
+const configurationIds774And776 = {
+  clientboundDisconnect: 2,
+  clientboundFinish: 3,
+  clientboundKeepAlive: 4,
+  clientboundPing: 5,
+  clientboundKnownPacks: 14,
+  clientboundResourcePackPush: 9,
+  clientboundShowDialog: 18,
+  clientboundCodeOfConduct: 19,
+  serverboundFinish: 3,
+  serverboundKeepAlive: 4,
+  serverboundPong: 5,
+  serverboundSelectKnownPacks: 7,
+  serverboundResourcePack: 6,
+  serverboundCustomClickAction: 8,
+  serverboundAcceptCodeOfConduct: 9,
+};
 const expected = {
   774: {
     name: "1.21.11",
     worldVersion: 4671,
+    resourcePackVersion: "75.0",
+    dataPackVersion: "94.1",
+    login: loginIds,
+    configuration: configurationIds774And776,
     play: {
+      clientboundChunkBatchFinished: 11,
+      clientboundChunkBatchStart: 12,
+      clientboundCustomPayload: 24,
+      clientboundDisconnect: 32,
       clientboundKeepAlive: 43,
+      clientboundPing: 59,
+      clientboundLogin: 48,
+      clientboundChunk: 44,
+      clientboundSetChunkCacheCenter: 92,
+      clientboundSetChunkCacheRadius: 93,
+      clientboundSetSimulationDistance: 109,
       clientboundStartConfiguration: 116,
+      serverboundCustomPayload: 21,
+      serverboundChunkBatchReceived: 10,
       serverboundKeepAlive: 27,
+      serverboundPong: 44,
+      serverboundPlayerLoaded: 43,
       serverboundClientTickEnd: 12,
       serverboundConfigurationAcknowledged: 15,
     },
@@ -108,27 +178,112 @@ const expected = {
   776: {
     name: "26.2",
     worldVersion: 4903,
+    resourcePackVersion: "88.0",
+    dataPackVersion: "107.1",
+    login: loginIds,
+    configuration: configurationIds774And776,
     play: {
+      clientboundChunkBatchFinished: 11,
+      clientboundChunkBatchStart: 12,
+      clientboundCustomPayload: 24,
+      clientboundDisconnect: 32,
       clientboundKeepAlive: 44,
+      clientboundPing: 61,
+      clientboundLogin: 49,
+      clientboundChunk: 45,
+      clientboundSetChunkCacheCenter: 94,
+      clientboundSetChunkCacheRadius: 95,
+      clientboundSetSimulationDistance: 111,
       clientboundStartConfiguration: 118,
+      serverboundCustomPayload: 22,
+      serverboundChunkBatchReceived: 11,
       serverboundKeepAlive: 28,
+      serverboundPong: 45,
+      serverboundPlayerLoaded: 44,
+      serverboundClientTickEnd: 13,
+      serverboundConfigurationAcknowledged: 16,
+    },
+  },
+  777: {
+    name: "26.3",
+    worldVersion: 5023,
+    resourcePackVersion: "97.1",
+    dataPackVersion: "121.0",
+    login: loginIds,
+    // post_effects is clientbound CONFIGURATION id 10 in 26.3.
+    configuration: {
+      ...configurationIds774And776,
+      clientboundKnownPacks: 15,
+      clientboundShowDialog: 19,
+      clientboundCodeOfConduct: 20,
+    },
+    play: {
+      clientboundChunkBatchFinished: 11,
+      clientboundChunkBatchStart: 12,
+      clientboundCustomPayload: 24,
+      clientboundDisconnect: 32,
+      clientboundKeepAlive: 45,
+      clientboundPing: 62,
+      clientboundLogin: 50,
+      clientboundChunk: 46,
+      clientboundSetChunkCacheCenter: 96,
+      clientboundSetChunkCacheRadius: 97,
+      clientboundSetSimulationDistance: 113,
+      clientboundStartConfiguration: 120,
+      serverboundCustomPayload: 22,
+      serverboundChunkBatchReceived: 11,
+      serverboundKeepAlive: 28,
+      serverboundPong: 45,
+      serverboundPlayerLoaded: 44,
       serverboundClientTickEnd: 13,
       serverboundConfigurationAcknowledged: 16,
     },
   },
 };
+assert.deepEqual(
+  Object.keys(expected).map(Number),
+  profiles.map((profile) => profile.protocolVersion),
+  "every Minecraft profile needs a complete expected relay table",
+);
+assert.deepEqual([...MINECRAFT_PROTOCOLS], profiles,
+  "shared protocol profiles must be tested explicitly");
+assert.deepEqual([...RELAY_MINECRAFT_PROFILES], relayProfiles,
+  "RelayNode profiles must be tested explicitly");
+assert.deepEqual(
+  RELAY_MINECRAFT_PROFILES.map(({name, protocolVersion}) => ({name, protocolVersion})),
+  MINECRAFT_PROTOCOLS.map(({name, protocolVersion}) => ({name, protocolVersion})),
+  "RelayNode and shared protocol profile tables drifted apart",
+);
 for (const profile of profiles) {
   const contract = expected[profile.protocolVersion];
   assert.ok(contract, `missing expected profile ${profile.protocolVersion}`);
   assert.equal(profile.name, contract.name);
   assert.equal(profile.worldVersion, contract.worldVersion);
-  const relayProfile = profile.protocolVersion === 774
-    ? RELAY_MINECRAFT_1_21_11
-    : RELAY_MINECRAFT_26_2;
-  assert.deepEqual(
-    Object.fromEntries(Object.keys(contract.play).map((key) => [key, relayProfile.play[key]])),
-    contract.play,
-  );
+  assert.equal(profile.resourcePackVersion, contract.resourcePackVersion);
+  assert.equal(profile.dataPackVersion, contract.dataPackVersion);
+  // The shared wire constants must agree with the checked-in version profile
+  // (itself verified against the jar's version.json by check-version-profile).
+  const versionProfile = JSON.parse(await readFile(
+    new URL(`../../port/versions/${profile.name}.json`, import.meta.url), "utf8"));
+  const packVersion = ({major, minor}) => `${major}.${minor}`;
+  assert.deepEqual({
+    protocolVersion: versionProfile.protocolVersion,
+    worldVersion: versionProfile.worldVersion,
+    resourcePackVersion: packVersion(versionProfile.packVersions.resource),
+    dataPackVersion: packVersion(versionProfile.packVersions.data),
+  }, {
+    protocolVersion: profile.protocolVersion,
+    worldVersion: profile.worldVersion,
+    resourcePackVersion: profile.resourcePackVersion,
+    dataPackVersion: profile.dataPackVersion,
+  }, `${profile.name} wire constants drifted from port/versions/${profile.name}.json`);
+  const relayProfile = relayProfileFor(profile);
+  assert.equal(relayProfile.name, profile.name,
+    `RelayNode resolved ${profile.protocolVersion} to another profile`);
+  for (const phase of ["login", "configuration", "play"]) {
+    assert.deepEqual({...relayProfile[phase]}, contract[phase],
+      `${profile.name} ${phase} packet ids drifted from the jar-derived table`);
+  }
   assert.equal(resolveMinecraftProtocol(profile.protocolVersion), profile);
   assert.equal(resolveMinecraftProtocol(profile.name), profile);
   const handshake = createStatusHandshake("profile-smoke.test", 25565, profile);
@@ -142,9 +297,21 @@ for (const profile of profiles) {
   assert.equal(protocol.value, profile.protocolVersion);
 }
 assert.throws(() => resolveMinecraftProtocol(775), /Unsupported Minecraft protocol/);
+assert.throws(() => resolveMinecraftProtocol(778), /Unsupported Minecraft protocol/);
+assert.equal(resolveMinecraftProfile(775), undefined);
+assert.equal(resolveMinecraftProfile(778), undefined);
 assert.throws(
   () => resolveMinecraftProtocol({name: "26.2", protocolVersion: 774}),
   /name\/protocol mismatch/,
+);
+assert.throws(
+  () => resolveMinecraftProtocol({name: "26.3", protocolVersion: 776}),
+  /name\/protocol mismatch/,
+);
+assert.notDeepEqual(
+  {...RELAY_MINECRAFT_26_3.configuration},
+  {...RELAY_MINECRAFT_26_2.configuration},
+  "26.3 must not reuse the 26.2 CONFIGURATION table",
 );
 
 const loginDistanceFixture = Buffer.concat([
@@ -309,13 +476,16 @@ try {
   const finalRuntime = await fetchRelayRuntime(bridgePort);
   const keepAlive = finalRuntime.runtime.keepAliveProxy;
   assertKeepAliveTelemetryScalar(keepAlive);
-  assert.equal(keepAlive.profilesSelected774, 1);
-  assert.equal(keepAlive.profilesSelected776, 1);
-  assert.equal(keepAlive.proxiedKeepAlives, 4);
-  assert.equal(keepAlive.proxiedKeepAlives774Configuration, 1);
-  assert.equal(keepAlive.proxiedKeepAlives774Play, 1);
-  assert.equal(keepAlive.proxiedKeepAlives776Configuration, 1);
-  assert.equal(keepAlive.proxiedKeepAlives776Play, 1);
+  // Each profile gets exactly its own buckets: one selection plus one proxied
+  // CONFIGURATION and one proxied PLAY KeepAlive from the fragmented case.
+  for (const profile of profiles) {
+    const protocol = profile.protocolVersion;
+    assert.equal(keepAlive[`profilesSelected${protocol}`], 1, `${protocol} selections`);
+    assert.equal(keepAlive[`proxiedKeepAlives${protocol}Configuration`], 1,
+      `${protocol} CONFIGURATION KeepAlives`);
+    assert.equal(keepAlive[`proxiedKeepAlives${protocol}Play`], 1, `${protocol} PLAY KeepAlives`);
+  }
+  assert.equal(keepAlive.proxiedKeepAlives, 2 * profiles.length);
   assert.ok(keepAlive.lastAt > 0, "KeepAlive telemetry omitted its last event time");
   assert.ok(keepAlive.maxGapMillis >= 0, "KeepAlive telemetry gap became negative");
   assert.equal(keepAlive.writeBackpressure, 0);
@@ -348,7 +518,7 @@ console.log("Relay profile protocol smoke passed", JSON.stringify({
   unsupportedProtocolRewrite: "disabled",
   keepAliveTelemetry: {
     schemaVersion: 2,
-    profiles: [774, 776],
+    profiles: profiles.map((profile) => profile.protocolVersion),
     faultModes: ["disabled", "write-false", "write-error"],
     storage: "fixed-scalars-only",
   },
@@ -385,10 +555,16 @@ function encodeCompressedPacket(id, payload) {
   return Buffer.concat([Buffer.from(encodeVarInt(body.byteLength)), body]);
 }
 
+function relayProfileFor(profile) {
+  const relayProfile = resolveMinecraftProfile(profile.protocolVersion);
+  assert.ok(relayProfile, `RelayNode has no profile for ${profile.protocolVersion}`);
+  assert.equal(relayProfile.name, profile.name,
+    `RelayNode mapped ${profile.name}/${profile.protocolVersion} to ${relayProfile.name}`);
+  return relayProfile;
+}
+
 async function testFragmentedHandshakeProfile(profile, bridgePort, fixturePort) {
-  const relayProfile = profile.protocolVersion === 774
-    ? RELAY_MINECRAFT_1_21_11
-    : RELAY_MINECRAFT_26_2;
+  const relayProfile = relayProfileFor(profile);
   fixtureData = Buffer.alloc(0);
   fixtureSocket = undefined;
   const socket = new WebSocket(`ws://127.0.0.1:${bridgePort}/tunnel`, {
@@ -568,9 +744,7 @@ async function testOversizeOpaqueTunnel(bridgePort, fixturePort) {
 }
 
 async function testRawPreambleLocksOpaque(profile, bridgePort, fixturePort) {
-  const relayProfile = profile.protocolVersion === 774
-    ? RELAY_MINECRAFT_1_21_11
-    : RELAY_MINECRAFT_26_2;
+  const relayProfile = relayProfileFor(profile);
   fixtureData = Buffer.alloc(0);
   fixtureSocket = undefined;
   const socket = new WebSocket(`ws://127.0.0.1:${bridgePort}/tunnel`, {
@@ -690,13 +864,8 @@ function assertKeepAliveTelemetryAliases(runtime) {
   const telemetry = runtime.keepAliveProxy;
   assert.deepEqual({
     keepAliveProxyEnabled: runtime.keepAliveProxyEnabled,
-    profilesSelected774: runtime.profilesSelected774,
-    profilesSelected776: runtime.profilesSelected776,
+    ...Object.fromEntries(keepAliveProfileScalarKeys.map((key) => [key, runtime[key]])),
     proxiedKeepAlives: runtime.proxiedKeepAlives,
-    proxiedKeepAlives774Configuration: runtime.proxiedKeepAlives774Configuration,
-    proxiedKeepAlives774Play: runtime.proxiedKeepAlives774Play,
-    proxiedKeepAlives776Configuration: runtime.proxiedKeepAlives776Configuration,
-    proxiedKeepAlives776Play: runtime.proxiedKeepAlives776Play,
     proxiedKeepAliveLastAt: runtime.proxiedKeepAliveLastAt,
     proxiedKeepAliveMaxGapMillis: runtime.proxiedKeepAliveMaxGapMillis,
     keepAliveProxyWriteBackpressure: runtime.keepAliveProxyWriteBackpressure,
@@ -706,13 +875,8 @@ function assertKeepAliveTelemetryAliases(runtime) {
       runtime.keepAliveProxyEncryptionOpaqueTransitions,
   }, {
     keepAliveProxyEnabled: telemetry.enabled,
-    profilesSelected774: telemetry.profilesSelected774,
-    profilesSelected776: telemetry.profilesSelected776,
+    ...Object.fromEntries(keepAliveProfileScalarKeys.map((key) => [key, telemetry[key]])),
     proxiedKeepAlives: telemetry.proxiedKeepAlives,
-    proxiedKeepAlives774Configuration: telemetry.proxiedKeepAlives774Configuration,
-    proxiedKeepAlives774Play: telemetry.proxiedKeepAlives774Play,
-    proxiedKeepAlives776Configuration: telemetry.proxiedKeepAlives776Configuration,
-    proxiedKeepAlives776Play: telemetry.proxiedKeepAlives776Play,
     proxiedKeepAliveLastAt: telemetry.lastAt,
     proxiedKeepAliveMaxGapMillis: telemetry.maxGapMillis,
     keepAliveProxyWriteBackpressure: telemetry.writeBackpressure,
@@ -863,12 +1027,13 @@ Socket.prototype.write = function (chunk, encoding, callback) {
     const runtime = (await fetchRelayRuntime(testBridgePort)).runtime.keepAliveProxy;
     assertKeepAliveTelemetryScalar(runtime);
     assert.equal(runtime.profilesSelected774, enabled ? 1 : 0);
-    assert.equal(runtime.profilesSelected776, 0);
     assert.equal(runtime.proxiedKeepAlives, enabled ? 1 : 0);
     assert.equal(runtime.proxiedKeepAlives774Configuration, enabled ? 1 : 0);
-    assert.equal(runtime.proxiedKeepAlives774Play, 0);
-    assert.equal(runtime.proxiedKeepAlives776Configuration, 0);
-    assert.equal(runtime.proxiedKeepAlives776Play, 0);
+    // A 774 tunnel must never move another profile's buckets.
+    for (const key of keepAliveProfileScalarKeys) {
+      if (key === "profilesSelected774" || key === "proxiedKeepAlives774Configuration") continue;
+      assert.equal(runtime[key], 0, `${mode} ${key}`);
+    }
     assert.equal(runtime.writeBackpressure, mode === "write-false" ? 1 : 0);
     assert.equal(runtime.writeErrors, mode === "write-error" ? 1 : 0);
     assert.equal(runtime.opaqueTransitions, 0);

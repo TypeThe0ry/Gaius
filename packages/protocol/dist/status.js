@@ -7,7 +7,7 @@ export function createStatusHandshake(host, port = DEFAULT_MINECRAFT_PORT, proto
         throw new RangeError("Minecraft host must contain between 1 and 255 chars");
     }
     // Keep accepting a raw protocol number for callers that talk to a custom
-    // server, while allowing the shared version profiles to select 774/776.
+    // server, while allowing the shared version profiles to select 774/776/777.
     const protocolVersion = typeof protocol === "number"
         ? protocol
         : resolveMinecraftProtocol(protocol).protocolVersion;
