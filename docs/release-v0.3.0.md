@@ -39,11 +39,13 @@ served.
 
 ## What changed for Minecraft 26.2 users
 
-Nothing functional. The 26.2 client is built from the same client sources,
-patches and launcher as v0.2.4; the release tooling changes of this version
-(the shader toolchain embedding, the second Pages file, the version bump) do
-not touch the 26.2 page. A 26.2 portable HTML rebuilt from the v0.2.4 inputs
-with the v0.3.0 builder is byte-identical to the v0.2.4 download.
+Nothing functional. The Minecraft 26.3 work is gated so that the 26.2 client's
+patched classes and launcher page stay identical to the v0.2.4 line, and the
+release tooling changes of this version (the shader toolchain embedding, the
+second Pages file, the version bump) do not touch the 26.2 page: a 26.2
+portable HTML rebuilt from the v0.2.4 inputs with the v0.3.0 builder is
+byte-identical to the v0.2.4 download. The 26.2 file of this release differs
+from v0.2.4 only by its version label and build identity.
 
 ## Downloads
 
