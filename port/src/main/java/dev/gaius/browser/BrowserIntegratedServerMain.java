@@ -245,7 +245,7 @@ public final class BrowserIntegratedServerMain {
         // The Worker uses the dedicated-server implementation, so vanilla cannot
         // recognize the browser player as its integrated-server owner. This
         // isolated server accepts one local player only.
-        playerList.setAllowCommandsForAllPlayers(true);
+        BrowserPlayerListCompat.allowCommandsForAllPlayers(playerList);
         applyActiveDistances();
         report("local-player-list-ready", "commands=true");
     }
