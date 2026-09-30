@@ -377,12 +377,14 @@ def run(overlay_dir: Path, overlay_262_dir: Path | None = None,
     check("VideoSettingsScreen no longer offers improved transparency",
           "Options.improvedTransparency" not in quality and "Options.biomeBlendRadius" in quality)
 
-    # Wireframe unavailable.
+    # Wireframe stays available (vanilla iconst_1): glPolygonMode is a browser no-op and the two
+    # optional wireframe pipelines are only used behind the dev-only F3+W toggle; reporting the
+    # fill mode as unsupported only produced PipelineBuilder/ShaderManager error lines at boot.
     heuristics = classes.text(f"{GL}/GlHeuristics")
     device_info = method_section(heuristics, " createDeviceInfo(")
-    check("GlHeuristics.createDeviceInfo reports wireframeFillMode=false",
+    check("GlHeuristics.createDeviceInfo keeps vanilla wireframeFillMode=true",
           re.search(r"new\s+#\d+\s+// class " + re.escape(f"{RP}/api/device/DeviceFeatures")
-                    + r"\s*\n\s*\d+: dup\s*\n\s*\d+: iconst_0", device_info) is not None)
+                    + r"\s*\n\s*\d+: dup\s*\n\s*\d+: iconst_1", device_info) is not None)
     max_texture = method_section(heuristics, " getMaxSupportedTextureSize()")
     check("GlHeuristics.getMaxSupportedTextureSize uses GL_MAX_TEXTURE_SIZE",
           "3379" in max_texture and "GlStateManager._getInteger" in max_texture

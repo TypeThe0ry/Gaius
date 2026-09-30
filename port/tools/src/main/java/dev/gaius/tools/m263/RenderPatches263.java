@@ -63,8 +63,6 @@ import org.objectweb.asm.tree.VarInsnNode;
  *       colour targets (EXT_color_buffer_float/EXT_float_blend) that the first browser release
  *       does not provide; {@code GameRenderer.useImprovedTransparency()} returns false and the
  *       video settings no longer offer the option.</li>
- *   <li>{@link #patchWireframeUnavailable}: WebGL2 has no polygon mode, so
- *       {@code GlHeuristics.createDeviceInfo} reports {@code wireframeFillMode=false}.</li>
  *   <li>{@link #patchMacosUtil}: stubs {@code disableCloseWindowMenuItem()} (ObjC bridge) and the
  *       two SDL hint setters; MinecraftClientPatcher.patchMacosUtil already forces
  *       {@code IS_MACOS=false}, this also prunes their reachability.</li>
@@ -82,7 +80,6 @@ import org.objectweb.asm.tree.VarInsnNode;
 public final class RenderPatches263 {
     static final String GL_BACKEND = "com/mojang/blaze3d/opengl/GlBackend";
     static final String GL_BUFFER = "com/mojang/blaze3d/opengl/GlBuffer";
-    static final String GL_HEURISTICS = "com/mojang/blaze3d/opengl/GlHeuristics";
     static final String DIRECT_STATE_ACCESS = "com/mojang/blaze3d/opengl/DirectStateAccess";
     static final String VULKAN_BACKEND = "com/mojang/blaze3d/vulkan/VulkanBackend";
     static final String BACKEND_CREATION_EXCEPTION =
@@ -90,8 +87,6 @@ public final class RenderPatches263 {
     static final String GPU_DEBUG_OPTIONS = "com/mojang/blaze3d/shaders/GpuDebugOptions";
     static final String GPU_DEVICE = "com/mojang/blaze3d/systems/GpuDevice";
     static final String GPU_BUFFER_SLICE = "com/mojang/blaze3d/buffers/GpuBufferSlice";
-    static final String DEVICE_FEATURES = "com/mojang/blaze3d/systems/DeviceFeatures";
-    static final String DEVICE_INFO = "com/mojang/blaze3d/systems/DeviceInfo";
     static final String SYSTEM_SPECS =
             "net/minecraft/client/gui/components/debug/DebugEntrySystemSpecs";
     static final String GAME_RENDERER = "net/minecraft/client/renderer/GameRenderer";
@@ -126,8 +121,6 @@ public final class RenderPatches263 {
                 () -> patchGlBufferExplicitFlush(jar, root, symbols));
         PatchRegistry.run("RenderPatches263.patchImprovedTransparencyOff",
                 () -> patchImprovedTransparencyOff(jar, root));
-        PatchRegistry.run("RenderPatches263.patchWireframeUnavailable",
-                () -> patchWireframeUnavailable(jar, root, symbols));
         PatchRegistry.run("RenderPatches263.patchMacosUtil",
                 () -> patchMacosUtil(jar, root));
     }
@@ -469,55 +462,6 @@ public final class RenderPatches263 {
         writeClass(screen, root, false);
         System.out.println("Forced 26.3 improved transparency (OIT) off and removed it from the"
                 + " video settings (" + kept.size() + " quality options remain)");
-    }
-
-    static void patchWireframeUnavailable(String jar, Path root, ModernSymbols symbols)
-            throws IOException {
-        String heuristics = symbols.renderType(GL_HEURISTICS);
-        String features = symbols.renderType(DEVICE_FEATURES);
-        ClassNode node = readClass(jar, root, heuristics);
-        MethodNode method = find(node, "createDeviceInfo",
-                "(Lorg/lwjgl/opengl/GLCapabilities;ILjava/util/Set;)L"
-                        + symbols.renderType(DEVICE_INFO) + ";");
-        List<AbstractInsnNode> wireframe = new ArrayList<>();
-        int constructors = 0;
-        for (AbstractInsnNode instruction : method.instructions.toArray()) {
-            if (instruction instanceof TypeInsnNode type && type.getOpcode() == Opcodes.NEW
-                    && type.desc.equals(features)) {
-                AbstractInsnNode dup = next(type);
-                AbstractInsnNode first = dup == null ? null : next(dup);
-                if (dup == null || dup.getOpcode() != Opcodes.DUP || first == null
-                        || (first.getOpcode() != Opcodes.ICONST_1
-                            && first.getOpcode() != Opcodes.ICONST_0)) {
-                    throw new IllegalStateException(heuristics + ".createDeviceInfo: "
-                            + features + " no longer starts with a constant wireframeFillMode");
-                }
-                wireframe.add(first);
-            } else if (instruction instanceof MethodInsnNode call
-                    && call.getOpcode() == Opcodes.INVOKESPECIAL && call.owner.equals(features)
-                    && call.name.equals("<init>") && call.desc.equals("(ZZZZZZZZ)V")) {
-                constructors++;
-            }
-        }
-        if (wireframe.size() != 1 || constructors != 1) {
-            throw new IllegalStateException(heuristics + ".createDeviceInfo: expected one "
-                    + features + "(ZZZZZZZZ) construction, found " + wireframe.size() + "/"
-                    + constructors);
-        }
-        FieldNode first = null;
-        for (FieldNode field : readClass(jar, root, features).fields) {
-            if ((field.access & Opcodes.ACC_STATIC) == 0) {
-                first = field;
-                break;
-            }
-        }
-        if (first == null || !first.name.equals("wireframeFillMode")) {
-            throw new IllegalStateException(features + " first component is "
-                    + (first == null ? "missing" : first.name) + ", expected wireframeFillMode");
-        }
-        method.instructions.set(wireframe.get(0), new InsnNode(Opcodes.ICONST_0));
-        writeClass(node, root, false);
-        System.out.println("Reported 26.3 GL wireframe fill mode as unavailable (WebGL2)");
     }
 
     static void patchMacosUtil(String jar, Path root) throws IOException {
