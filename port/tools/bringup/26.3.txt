@@ -31,7 +31,6 @@ step:LwjglPlatformGuard@lwjgl | P1 | patchPlatform replaces java.version instead
 step:LwjglUnsafeAccessPatcher@lwjgl | P1 | ASM 9.8 cannot read META-INF/versions/27 (class major 71)
 step:NativeMethodFallbackPatcher@lwjgl | P1 | ASM 9.8 cannot read META-INF/versions/27 (class major 71)
 step:LwjglCallbackDescriptorPatcher@lwjgl | P1 | ASM 9.8 cannot read META-INF/versions/27 (class major 71)
-step:LwjglSdlBrowserPatcher | P2 | SDL3 browser shim patcher does not exist yet (D3)
 step:LwjglShadercBrowserPatcher | P4 | shaderc browser shim patcher does not exist yet (D5)
 step:LwjglSpvcBrowserPatcher | P4 | spvc browser shim patcher does not exist yet (D5)
 step:MinecraftChunkDrawTelemetryPatcher | P5 | chunk-draw telemetry patcher rejects profile 26.3 (unsupported profile)
