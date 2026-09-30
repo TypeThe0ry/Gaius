@@ -180,6 +180,7 @@ try {
                 SERVER_LOG: serverLogPath,
                 OUT: path.join(workDirectory, "browser"),
                 PLAYER_NAME: "GaiusM5",
+                PROTOCOL: String(activeProfile.protocolVersion),
                 REJOIN: process.env.GAIUS_SMOKE_BROWSER_REJOIN ?? "1",
             }, path.join(workDirectory, "browser-harness.log"), repository);
         }

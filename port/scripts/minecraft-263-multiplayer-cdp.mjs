@@ -11,6 +11,8 @@
 //   BRIDGE          RelayNode base URL passed as ?bridge= (default http://127.0.0.1:8080)
 //   SERVER          host:port typed into Direct Connect (required)
 //   SERVER_LOG      optional vanilla server log; checked for "<name> joined the game"
+//   PROTOCOL        Minecraft protocol number the client speaks; selects the relay's
+//                   profilesSelected<P>/proxiedKeepAlives<P>Play counters (default 777)
 //   OUT             evidence directory (report.json, console.log, screenshots; default m5-out)
 //   PLAYER_NAME     remembered player name (default GaiusM5)
 //   BOOT_TIMEOUT_MS / JOIN_TIMEOUT_MS / SOAK_MS   defaults 900000 / 240000 / 45000
@@ -18,7 +20,7 @@
 //   GAIUS_CHROME_BIN  Chrome binary (default C:/Program Files/Google/Chrome/Application/chrome.exe)
 //
 // Checks: boot to TitleScreen, Multiplayer -> Direct Connection -> Join Server reaches PLAY (level,
-// player entity, chunks), the relay selected profile 777 and proxied PLAY keepalives during the
+// player entity, chunks), the relay selected the PROTOCOL profile and proxied PLAY keepalives during the
 // soak, the rendered frame passes the terrain visual metric, the server saw the join (SERVER_LOG),
 // disconnect -> rejoin reaches PLAY again, no shader/WebGL errors, no uncaught exceptions.
 // Exit 0 only on PASS. Never prints the server address into report.json when REDACT_SERVER=1.
@@ -45,6 +47,8 @@ const serverHost = server.split(":")[0];
 const redactServer = process.env.REDACT_SERVER === "1";
 const redact = s => redactServer ? String(s).split(serverHost).join("<server>") : String(s);
 const playerName = process.env.PLAYER_NAME || "GaiusM5";
+const protocol = String(Number(process.env.PROTOCOL || 777));
+const selectedKey = `profilesSelected${protocol}`, playKeepAliveKey = `proxiedKeepAlives${protocol}Play`, configurationKeepAliveKey = `proxiedKeepAlives${protocol}Configuration`;
 const bridge = new URL(process.env.BRIDGE || "http://127.0.0.1:8080/");
 const relayRuntimeUrl = new URL("/relay-node/v1.runtime", bridge).href;
 const distPort = Number(process.env.DIST_PORT || 8780);
@@ -230,7 +234,7 @@ const stateExpr = `(()=>{const s=window.__gaiusMinecraftState||null;const st=doc
 const screenExpr = "String(window.__gaiusMinecraftState?.screen||'')";
 const inPlay = s => s && s.level && !s.screen && !!s.player;
 
-const report = {pageUrl: redact(pageWithBridge), server: redact(server), bridge: bridge.href, startedAt: new Date().toISOString(), checks: {}, timeline: [], relay: {}};
+const report = {pageUrl: redact(pageWithBridge), server: redact(server), bridge: bridge.href, protocol, startedAt: new Date().toISOString(), checks: {}, timeline: [], relay: {}};
 const pass = (n, d) => { report.checks[n] = {ok: true, detail: d}; log("CHECK", `PASS ${n} ${JSON.stringify(d).slice(0, 400)}`); };
 const fail = (n, d) => { report.checks[n] = {ok: false, detail: d}; log("CHECK", `FAIL ${n} ${JSON.stringify(d).slice(0, 400)}`); };
 const profileDir = await mkdtemp(join(tmpdir(), "gaius-m5-"));
@@ -384,13 +388,13 @@ try {
     const maxChunks = Math.max(...chunks, 0);
     const stillPlaying = samples.every(x => x.level && x.player) && !samples.some(x => /DisconnectedScreen/.test(x.screen || ""));
     maxChunks > 0 && stillPlaying ? pass("chunksArriveAndStayInPlay", {maxChunks, samples: samples.length, soakMs}) : fail("chunksArriveAndStayInPlay", {maxChunks, samples});
-    const selected = Number(r1.profilesSelected777 || 0) - Number(report.relay.beforeBoot.profilesSelected777 || 0);
-    const kaPlay = Number(r1.proxiedKeepAlives777Play || 0) - Number(r0.proxiedKeepAlives777Play || 0);
-    const kaConf = Number(r1.proxiedKeepAlives777Configuration || 0) - Number(report.relay.beforeBoot.proxiedKeepAlives777Configuration || 0);
+    const selected = Number(r1[selectedKey] || 0) - Number(report.relay.beforeBoot[selectedKey] || 0);
+    const kaPlay = Number(r1[playKeepAliveKey] || 0) - Number(r0[playKeepAliveKey] || 0);
+    const kaConf = Number(r1[configurationKeepAliveKey] || 0) - Number(report.relay.beforeBoot[configurationKeepAliveKey] || 0);
     const gap = Number(r1.proxiedKeepAliveMaxGapMillis || 0);
     selected >= 1 && kaPlay >= 1 && r1.keepAliveProxyEnabled !== false
-      ? pass("relayProxiesKeepAlives777", {profilesSelected777: selected, playKeepAlivesDuringSoak: kaPlay, configurationKeepAlives: kaConf, maxGapMillis: gap, writeErrors: r1.keepAliveProxyWriteErrors, opaqueTransitions: r1.keepAliveProxyOpaqueTransitions})
-      : fail("relayProxiesKeepAlives777", {selected, kaPlay, kaConf, r0, r1});
+      ? pass("relayProxiesKeepAlives", {protocol, profilesSelected: selected, playKeepAlivesDuringSoak: kaPlay, configurationKeepAlives: kaConf, maxGapMillis: gap, writeErrors: r1.keepAliveProxyWriteErrors, opaqueTransitions: r1.keepAliveProxyOpaqueTransitions})
+      : fail("relayProxiesKeepAlives", {protocol, selected, kaPlay, kaConf, r0, r1});
     let visual = null;
     try { visual = analyzeTerrainPng(shot); } catch (e) { visual = {error: String(e)}; }
     report.visual = visual;
@@ -437,9 +441,9 @@ try {
           await screenshot(cdp, "32-join2-result.png");
           const r2 = await relayRuntime(); report.relay.afterRejoin = r2;
           const s2 = await evaluate(cdp, stateExpr).catch(() => null);
-          const selected2 = Number(r2.profilesSelected777 || 0) - Number(r1.profilesSelected777 || 0);
+          const selected2 = Number(r2[selectedKey] || 0) - Number(r1[selectedKey] || 0);
           play2.result === "PLAY" && inPlay(s2) && selected2 >= 1
-            ? pass("disconnectRejoin", {seconds: play2.seconds, chunks: s2.loadedChunkCount, afterDisconnectScreen: report.afterDisconnect.screen, serverSawLeave: report.afterDisconnect.serverSawLeave, profilesSelected777Delta: selected2, activeTunnels: r2.activeLocalTunnelSessions})
+            ? pass("disconnectRejoin", {seconds: play2.seconds, chunks: s2.loadedChunkCount, afterDisconnectScreen: report.afterDisconnect.screen, serverSawLeave: report.afterDisconnect.serverSawLeave, profilesSelectedDelta: selected2, activeTunnels: r2.activeLocalTunnelSessions})
             : fail("disconnectRejoin", {result: play2.result, screen: play2.state?.screen, widgets: (play2.state?.widgets || []).map(w => w.text), selected2, stillInPlay: inPlay(s2)});
         }
       }
