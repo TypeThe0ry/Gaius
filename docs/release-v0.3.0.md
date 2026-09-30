@@ -39,13 +39,16 @@ served.
 
 ## What changed for Minecraft 26.2 users
 
-Nothing functional. The Minecraft 26.3 work is gated so that the 26.2 client's
-patched classes and launcher page stay identical to the v0.2.4 line, and the
-release tooling changes of this version (the shader toolchain embedding, the
-second Pages file, the version bump) do not touch the 26.2 page: a 26.2
-portable HTML rebuilt from the v0.2.4 inputs with the v0.3.0 builder is
-byte-identical to the v0.2.4 download. The 26.2 file of this release differs
-from v0.2.4 only by its version label and build identity.
+One fix in the portable page: starting a second singleplayer world in the
+same page (for example re-entering a world after Save and Quit without
+reloading the file) failed with "Singleplayer startup failed" because the
+page transferred its already-detached embedded server buffer to the new
+Worker. Each start now transfers its own copy. Otherwise the Minecraft 26.3
+work is gated so that the 26.2 client's patched classes and launcher stay
+identical to the v0.2.4 line, and the release tooling changes of this version
+(the shader toolchain embedding, the second Pages file, the version bump) do
+not touch the 26.2 page: the 26.2 file of this release differs from v0.2.4
+only by that fix, its version label and its build identity.
 
 ## Downloads
 
