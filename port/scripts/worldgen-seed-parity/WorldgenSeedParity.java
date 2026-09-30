@@ -2,7 +2,6 @@ package dev.gaius.parity;
 
 import com.mojang.serialization.Lifecycle;
 import java.io.IOException;
-import java.io.PrintStream;
 import java.lang.reflect.Field;
 import java.net.Proxy;
 import java.nio.charset.StandardCharsets;
@@ -351,7 +350,7 @@ public final class WorldgenSeedParity {
             String biomes = HexFormat.of().formatHex(biomesAggregate.digest());
             chunkCount = chunkLines.size();
             aggregate = "blocks:" + blocks.substring(0, 16) + ",biomes:" + biomes.substring(0, 16);
-            String pulses = System.getProperty("gaius.parity.pulses.summary", "");
+            String pulses = "";
             try {
                 Class<?> shim = Class.forName("dev.gaius.browser.BrowserWorldgenDeepCheckpoint");
                 pulses = String.valueOf(shim.getMethod("parityReport").invoke(null));
@@ -532,9 +531,5 @@ public final class WorldgenSeedParity {
         public int getMaxPlayers() {
             return 1;
         }
-    }
-
-    static void log(PrintStream out, String message) {
-        out.println("[worldgen-seed-parity] " + message);
     }
 }
