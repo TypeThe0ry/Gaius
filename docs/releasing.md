@@ -167,10 +167,13 @@ source port/scripts/version-profile.sh
 done > SHA256SUMS)
 ```
 
-For the already-published `v0.1.0` tag, do not recreate, force-update, or push
-the tag. Commit the release-gate changes on `main`, push `main`, prepare an
-exact-eight stage, then run the tracked publisher first without
-`-ExecuteUpload` and review its dry-run result:
+The `v0.1.0` publisher below is **deprecated** since 0.3.0: the Pages workflow
+now publishes exactly `Gaius-26.2.html` and `Gaius-26.3.html`, so its
+exact-eight asset gate and Pages dispatch no longer match. The script refuses
+to run unless `GAIUS_ALLOW_LEGACY_V010_PUBLISHER=1` is set; use
+`tools/build-and-publish-prerelease.ps1` for current releases. Kept for the
+record of how `v0.1.0` was published (do not recreate, force-update, or push
+that tag):
 
 ```powershell
 ./tools/publish-final-release-v0.1.0.ps1 `
