@@ -230,12 +230,22 @@
 
   ModuleSlot.prototype.create = function () {
     var slot = this;
+    // The emscripten factory promise only settles through receiveInstance and has
+    // no rejection path, so a failed instantiation (for example an out-of-memory
+    // WebAssembly.Memory) would leave it pending forever: race it against a
+    // promise that rejects with the instantiation error.
+    var rejectInstantiation = null;
+    var instantiationFailed = new Promise(function (resolve, reject) {
+      rejectInstantiation = reject;
+    });
+    instantiationFailed.catch(function () {});
     var moduleArg = {
       instantiateWasm: function (imports, receiveInstance) {
         WebAssembly.instantiate(slot.wasmModule, imports).then(function (instance) {
           receiveInstance(instance, slot.wasmModule);
         }, function (error) {
           slot.lastError = slot.name + " instantiation: " + describe(error);
+          rejectInstantiation(new Error(slot.lastError));
         });
         return {};
       },
@@ -244,7 +254,13 @@
         if (typeof console !== "undefined") console.warn("[gaius " + slot.name + "] " + text);
       }
     };
-    return Promise.resolve(slot.factory(moduleArg)).then(function (M) {
+    var started;
+    try {
+      started = Promise.resolve(slot.factory(moduleArg));
+    } catch (error) {
+      started = Promise.reject(error);
+    }
+    return Promise.race([started, instantiationFailed]).then(function (M) {
       M = M || moduleArg;
       if (typeof M._malloc !== "function" || !M.HEAPU8) {
         throw new Error(slot.name + " module has no heap after start-up");

@@ -17,6 +17,8 @@ public final class LwjglShadercBrowserPatcher {
     /** The Shaderc methods Minecraft 26.3 calls (renderpearl GlslCompiler). */
     static final Set<String> MINECRAFT_METHODS = Set.of(
             "shaderc_compiler_initialize()J",
+            // Only referenced as a method handle (GlslCompiler.close(): compilers.forEach(Shaderc::...)).
+            "shaderc_compiler_release(J)V",
             "shaderc_compile_options_initialize()J",
             "shaderc_compile_options_release(J)V",
             "shaderc_compile_options_add_macro_definition(JLjava/lang/CharSequence;Ljava/lang/CharSequence;)V",

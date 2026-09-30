@@ -612,9 +612,72 @@ async function stageAbort(existing) {
   await api.settled();
   result.stats = api.stats();
   if (!result.stats.shaderc.spareReady || !result.stats.spvc.spareReady) fail("abort: no spare instance after recovery");
+  result.instantiationFailure = await checkInstantiationFailures(jobs[0]);
   report.abort = result;
   console.log(`abort: spvc generation ${before} -> ${after}, shaderc generation ${result.stats.shaderc.generation}, `
-    + `instantiations shaderc=${result.stats.shaderc.instantiations} spvc=${result.stats.spvc.instantiations}`);
+    + `instantiations shaderc=${result.stats.shaderc.instantiations} spvc=${result.stats.spvc.instantiations}; `
+    + `failed instantiation: start-up rejected, spare failure counted and retried`);
+}
+
+// A WebAssembly instantiation that fails (LinkError here, out-of-memory in a
+// browser) must settle: start-up rejects instead of hanging, and a failed spare
+// is counted and retried instead of blocking every later recovery.
+async function checkInstantiationFailures(job) {
+  const loader = require(join(toolchainDir, "gaius-shader-toolchain.js"));
+  const shadercFactory = require(join(toolchainDir, "gaius-shaderc.js"));
+  const spvcFactory = require(join(toolchainDir, "gaius-spvc.js"));
+  const [shadercModule, spvcModule] = await Promise.all([
+    WebAssembly.compile(readFileSync(join(toolchainDir, "gaius-shaderc.wasm"))),
+    WebAssembly.compile(readFileSync(join(toolchainDir, "gaius-spvc.wasm")))]);
+  const within = (promise, ms, label) => {
+    let timer = null;
+    const timeout = new Promise((resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} did not settle within ${ms} ms`)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+  };
+  // A valid module importing env.missing, which the emscripten imports lack.
+  const unlinkable = new WebAssembly.Module(Uint8Array.from([0, 97, 115, 109, 1, 0, 0, 0, 1, 4, 1, 96, 0, 0,
+    2, 15, 1, 3, 101, 110, 118, 7, 109, 105, 115, 115, 105, 110, 103, 0, 0]));
+  const result = {};
+  try {
+    await within(loader.createToolchain({shadercFactory, spvcFactory, shadercModule: unlinkable, spvcModule,
+      cacheVersion: "instantiation-failure"}), 10000, "createToolchain with an unlinkable shaderc module");
+    fail("abort: createToolchain resolved with an unlinkable shaderc module");
+  } catch (error) {
+    if (/did not settle/.test(error.message)) fail(`abort: ${error.message}`);
+    result.startup = error.message;
+  }
+  // The third shaderc instantiation (the spare started after the first trap)
+  // fails; the fourth, started by the next call that needs an instance, works.
+  let instantiations = 0;
+  const flakyFactory = (moduleArg) => {
+    instantiations++;
+    if (instantiations === 3) {
+      const instantiate = moduleArg.instantiateWasm;
+      moduleArg.instantiateWasm = (imports, receiveInstance) => instantiate({}, receiveInstance);
+    }
+    return shadercFactory(moduleArg);
+  };
+  const api = await within(loader.createToolchain({shadercFactory: flakyFactory, spvcFactory, shadercModule, spvcModule,
+    cacheVersion: "instantiation-failure"}), 30000, "createToolchain");
+  api.setCacheEnabled(false);
+  await within(api.settled(), 30000, "settled() after start-up");
+  api.debugTrap("shaderc");
+  replayShadercJob(api, job, nodeReplayContext);
+  await within(api.settled(), 30000, "settled() after a failed spare instantiation");
+  const failed = api.stats().shaderc;
+  if (failed.spareFailures !== 1) fail(`abort: a failed spare instantiation was counted ${failed.spareFailures} times`);
+  api.debugTrap("shaderc");
+  await within(api.settled(), 30000, "settled() after retrying the spare");
+  const got = replayShadercJob(api, job, nodeReplayContext);
+  if (got.status !== job.status || got.spirv !== job.spirv) {
+    fail(`abort: shaderc after a failed spare instantiation: ${JSON.stringify(got)}`);
+  }
+  await within(api.settled(), 30000, "settled() after recovery");
+  result.stats = api.stats().shaderc;
+  if (!result.stats.spareReady) fail("abort: no spare shaderc instance after retrying a failed instantiation");
+  return result;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -905,14 +968,16 @@ function javapMethods(jar, className) {
 }
 
 function clientShimCalls(client) {
-  // Every Shaderc/Spvc method the client calls (renderpearl frontend and GL backend).
+  // Every Shaderc/Spvc method the client calls (renderpearl frontend and GL backend),
+  // including method references (GlslCompiler.close() passes Shaderc::shaderc_compiler_release
+  // as a LongConsumer), which only show up as REF_invokeStatic handles in the constant pool.
   const listing = run("jar", ["--list", "--file", client], "jar --list").output.split(/\r?\n/);
   const classes = listing.filter((name) => /^com\/mojang\/(renderpearl|blaze3d)\/.*\.class$/.test(name))
     .map((name) => name.slice(0, -6).replaceAll("/", "."));
   const calls = new Set();
   for (let index = 0; index < classes.length; index += 200) {
-    const {output} = run("javap", ["-c", "-p", "-cp", client, ...classes.slice(index, index + 200)], "javap client");
-    for (const match of output.matchAll(/Method org\/lwjgl\/util\/(shaderc\/Shaderc|spvc\/Spvc)\.([A-Za-z0-9_]+):(\S+)/g)) {
+    const {output} = run("javap", ["-v", "-p", "-cp", client, ...classes.slice(index, index + 200)], "javap client");
+    for (const match of output.matchAll(/(?:\/\/ Method|REF_invokeStatic) org\/lwjgl\/util\/(shaderc\/Shaderc|spvc\/Spvc)\.([A-Za-z0-9_]+):(\S+)/g)) {
       calls.add(`${match[1]}#${match[2]}${match[3]}`);
     }
   }
@@ -927,7 +992,10 @@ function stageOverlay() {
   const patchedClient = join(overlay, `client-named-${profile}-gaius.jar`);
   const calls = clientShimCalls(existsSync(patchedClient) ? patchedClient : clientJar);
   const result = {clientCalls: calls.size, client: existsSync(patchedClient) ? "patched" : "vanilla"};
-  if (calls.size < 38) fail(`the client calls only ${calls.size} Shaderc/Spvc methods (expected 38)`);
+  if (calls.size < 41) fail(`the client calls only ${calls.size} Shaderc/Spvc methods (expected 41)`);
+  if (!calls.has("shaderc/Shaderc#shaderc_compiler_release(J)V")) {
+    fail("the Shaderc::shaderc_compiler_release method reference of GlslCompiler.close() was not found");
+  }
   for (const [module, owner, shim] of [["lwjgl-shaderc", "shaderc/Shaderc", "org/lwjgl/util/shaderc/BrowserShaderc"],
     ["lwjgl-spvc", "spvc/Spvc", "org/lwjgl/util/spvc/BrowserSpvc"]]) {
     if (!existsSync(jar(module))) usage(`${jar(module)} is missing (run build-overlays.sh for ${profile})`);

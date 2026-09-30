@@ -113,6 +113,12 @@ def main() -> int:
             raise AssertionError("the boot sequence does not await the toolchain exactly once")
         if body.index("await window.__gaiusShaderToolchainReady;") > body.index("main(window.__gaiusDefaultArgs);"):
             raise AssertionError("the toolchain is awaited after main(args)")
+        # Fail closed: a page that needs the toolchain must not start main(args)
+        # when the loader script itself did not load.
+        gate = body.index("if (!window.__gaiusShaderToolchainReady) {")
+        if not (gate < body.index("await window.__gaiusShaderToolchainReady;")
+                and "throw new Error(" in body[gate:body.index("await window.__gaiusShaderToolchainReady;")]):
+            raise AssertionError("a missing toolchain loader does not stop the boot before main(args)")
         second = postprocess(index, classes, "26.3", "34", {"GAIUS_SHADER_TOOLCHAIN_STRICT": "1"})
         if second.returncode != 0 or index.read_text(encoding="utf-8") != page:
             raise AssertionError("a second postprocess changed the 26.3 page")

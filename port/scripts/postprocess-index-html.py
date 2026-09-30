@@ -813,11 +813,12 @@ def patch_shader_toolchain_loader(text: str, classes_js: Path, index: Path, prof
             "      bootTimings.vanillaAssetsReady = performance.now();\n"
             "      if (typeof main !== \"function\") {\n",
             "      bootTimings.vanillaAssetsReady = performance.now();\n"
-            "      if (window.__gaiusShaderToolchainReady) {\n"
-            "        setBootProgress(Math.max(bootProgressValue, 64), \"Starting the shader compiler...\");\n"
-            "        await window.__gaiusShaderToolchainReady;\n"
-            "        bootTimings.shaderToolchainReady = performance.now();\n"
+            "      if (!window.__gaiusShaderToolchainReady) {\n"
+            "        throw new Error(\"gaius-shader-toolchain.js did not load; this client cannot compile shaders without it\");\n"
             "      }\n"
+            "      setBootProgress(Math.max(bootProgressValue, 64), \"Starting the shader compiler...\");\n"
+            "      await window.__gaiusShaderToolchainReady;\n"
+            "      bootTimings.shaderToolchainReady = performance.now();\n"
             "      if (typeof main !== \"function\") {\n",
             "shader toolchain boot gate",
         )
