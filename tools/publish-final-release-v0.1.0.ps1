@@ -17,7 +17,7 @@ Set-StrictMode -Version Latest
 # Gaius-26.2.html). Since 0.3.0 the Pages workflow publishes exactly Gaius-26.2.html and
 # Gaius-26.3.html, so this script's asset gate and Pages dispatch no longer apply.
 # Use tools/build-and-publish-prerelease.ps1 and docs/releasing.md instead.
-if (-not $env:GAIUS_ALLOW_LEGACY_V010_PUBLISHER) {
+if ($env:GAIUS_ALLOW_LEGACY_V010_PUBLISHER -ne '1') {
     throw 'publish-final-release-v0.1.0.ps1 is deprecated: the Pages workflow now publishes Gaius-26.2.html and Gaius-26.3.html. Use tools/build-and-publish-prerelease.ps1 (see docs/releasing.md).'
 }
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
