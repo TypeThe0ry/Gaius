@@ -43,6 +43,13 @@ import org.objectweb.asm.tree.VarInsnNode;
  *       throw it, {@code unloadLibrary()} returns and {@code createWindow(...)} returns 0, so no
  *       Vulkan, VMA or SDLVulkan code is reachable. Replaces the dropped 26.2
  *       {@code Minecraft262BrowserPatcher.patchVulkanBackend}.</li>
+ *   <li>{@link #patchVulkanFeatureSetsBootstrap}: {@code ClientBootstrap.bootstrap()} no longer
+ *       calls the empty {@code VulkanFeatureSets.bootstrap()}, whose only purpose is to run that
+ *       class's static initializer. The initializer builds {@code VulkanPNextStruct}s, which look
+ *       up {@code SIZEOF}/{@code STYPE} fields of LWJGL Vulkan structs by reflection; TeaVM has
+ *       no such reflection, so the client crashed in Bootstrap with "Struct class
+ *       VkPhysicalDeviceFeatures2 does not have required member null". The feature sets are only
+ *       read by the stubbed VulkanBackend paths.</li>
  *   <li>{@link #patchSystemSpecsCpuInfo}: {@code DebugEntrySystemSpecs.getCpuInfo()} returns
  *       "Browser runtime" (26.3 removed {@code GLX._getCpuInfo}, the 26.2 target of
  *       {@code MinecraftClientPatcher.patchGlx}); prunes oshi from the reachable set.</li>
@@ -93,6 +100,10 @@ public final class RenderPatches263 {
     static final String OPTIONS = "net/minecraft/client/Options";
     static final String OPTION_INSTANCE = "net/minecraft/client/OptionInstance";
     static final String MACOS_UTIL = "com/mojang/blaze3d/platform/MacosUtil";
+    static final String CLIENT_BOOTSTRAP = "net/minecraft/client/ClientBootstrap";
+    /** 26.3-only renderpearl class (no 26.2 counterpart, so not a ModernSymbols render key). */
+    static final String VULKAN_FEATURE_SETS =
+            "com/mojang/renderpearl/backend/vulkan/VulkanFeatureSets";
     static final String BROWSER_CPU_INFO = "Browser runtime";
     static final String VULKAN_UNAVAILABLE = "Vulkan is unavailable in the browser runtime";
     static final int GL_MAP_WRITE_BIT = 2;
@@ -107,6 +118,8 @@ public final class RenderPatches263 {
                 () -> patchGlBackendLibrary(jar, root, symbols));
         PatchRegistry.run("RenderPatches263.patchVulkanBackend",
                 () -> patchVulkanBackend(jar, root, symbols));
+        PatchRegistry.run("RenderPatches263.patchVulkanFeatureSetsBootstrap",
+                () -> patchVulkanFeatureSetsBootstrap(jar, root));
         PatchRegistry.run("RenderPatches263.patchSystemSpecsCpuInfo",
                 () -> patchSystemSpecsCpuInfo(jar, root));
         PatchRegistry.run("RenderPatches263.patchGlBufferExplicitFlush",
@@ -187,6 +200,35 @@ public final class RenderPatches263 {
         replace(window, noWindow);
         writeClass(node, root, false);
         System.out.println("Stubbed 26.3 VulkanBackend: " + VULKAN_UNAVAILABLE);
+    }
+
+    static void patchVulkanFeatureSetsBootstrap(String jar, Path root) throws IOException {
+        ClassNode featureSets = readClass(jar, root, VULKAN_FEATURE_SETS);
+        MethodNode empty = find(featureSets, "bootstrap", "()V");
+        for (AbstractInsnNode instruction : empty.instructions.toArray()) {
+            if (instruction.getOpcode() >= 0 && instruction.getOpcode() != Opcodes.RETURN) {
+                throw new IllegalStateException(VULKAN_FEATURE_SETS
+                        + ".bootstrap() is no longer empty; skipping it would skip real work");
+            }
+        }
+        ClassNode node = readClass(jar, root, CLIENT_BOOTSTRAP);
+        MethodNode bootstrap = find(node, "bootstrap", "()V");
+        int removed = 0;
+        for (AbstractInsnNode instruction : bootstrap.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals(VULKAN_FEATURE_SETS) && call.name.equals("bootstrap")
+                    && call.desc.equals("()V")) {
+                bootstrap.instructions.remove(call);
+                removed++;
+            }
+        }
+        if (removed != 1) {
+            throw new IllegalStateException(CLIENT_BOOTSTRAP + ".bootstrap() calls "
+                    + VULKAN_FEATURE_SETS + ".bootstrap() " + removed + " times, expected 1");
+        }
+        writeClass(node, root, false);
+        System.out.println("Removed VulkanFeatureSets.bootstrap() from 26.3 ClientBootstrap");
     }
 
     static void patchSystemSpecsCpuInfo(String jar, Path root) throws IOException {

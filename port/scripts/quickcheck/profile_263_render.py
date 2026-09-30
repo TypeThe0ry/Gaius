@@ -53,6 +53,7 @@ STALE_PREFIXES = ("com/mojang/blaze3d/opengl/", "com/mojang/blaze3d/vulkan/")
 # RenderPatches263) plus the LWJGL 3.4.3 entry points; the JVM verifier links each of them.
 VERIFIED_CLASSES = (
     "net/minecraft/client/PreferredGraphicsApi",
+    "net/minecraft/client/ClientBootstrap",
     f"{RP}/backend/vulkan/VulkanBackend",
     f"{GL}/GlBackend",
     f"{GL}/GlBuffer$Direct",
@@ -265,6 +266,7 @@ def run(overlay_dir: Path, overlay_262_dir: Path | None = None,
     classes = Javap(javap, client)
     classes.load(
         "net/minecraft/client/PreferredGraphicsApi",
+        "net/minecraft/client/ClientBootstrap",
         f"{RP}/backend/vulkan/VulkanBackend",
         f"{GL}/GlBackend",
         f"{GL}/GlBuffer$Direct",
@@ -312,6 +314,14 @@ def run(overlay_dir: Path, overlay_262_dir: Path | None = None,
     check("VulkanBackend.createWindow returns 0",
           "lconst_0" in method_section(vulkan, " createWindow(")
           and "SDL_CreateWindow" not in method_section(vulkan, " createWindow("))
+
+    # ClientBootstrap (RenderPatches263.patchVulkanFeatureSetsBootstrap): the reflective
+    # VulkanFeatureSets static initializer must stay unreachable from Bootstrap.
+    client_bootstrap = method_section(
+        classes.text("net/minecraft/client/ClientBootstrap"), " bootstrap()")
+    check("ClientBootstrap.bootstrap no longer initializes VulkanFeatureSets",
+          "DialogBodyHandlers.bootstrap" in client_bootstrap
+          and "VulkanFeatureSets" not in client_bootstrap)
 
     # GlBackend library stubs.
     gl_backend = classes.text(f"{GL}/GlBackend")
