@@ -61,13 +61,16 @@ import org.objectweb.asm.tree.MethodNode;
  * stderr), so their patch output never depends on it.
  *
  * <h2>Bring-up list format</h2>
- * One entry per line: {@code <patchId> | <owner package> | <reason>}. Lines whose first
- * non-blank character is {@code #} are comments and blank lines are ignored; there are no
- * trailing comments, so a reason may contain {@code #}. {@code patchId} is the id used in logs,
- * e.g. {@code MinecraftClientPatcher.patchGlx},
- * {@code Minecraft262BrowserPatcher.patchVulkanBackend} or {@code step:LwjglSdlBrowserPatcher}
- * (shell steps, read by build-overlays.sh). The owner is a work package such as {@code P3} or
- * {@code P7a}. Duplicate ids, a bad owner or an empty reason throw.
+ * One entry per line: {@code <patchId> | <owner package> | <reason>}. {@code #} starts a
+ * comment that runs to the end of the line, and blank lines are ignored; a reason can therefore
+ * contain neither {@code #} nor {@code |}. These are the rules of the other readers of the same
+ * file ({@code version-profile.sh}, {@code check-version-profile.mjs} and
+ * {@code check-build-log-skips.mjs}). {@code patchId} is the id used in logs, e.g.
+ * {@code MinecraftClientPatcher.patchGlx}, {@code Minecraft262BrowserPatcher.patchVulkanBackend},
+ * {@code step:LwjglSdlBrowserPatcher} or {@code step:LwjglMemoryPatcher@lwjgl} (shell steps,
+ * read by build-overlays.sh). The owner is a work package {@code P1}..{@code P9}, optionally
+ * with a letter such as {@code P7a}. Duplicate ids, a bad owner, a missing or extra field and an
+ * empty reason throw.
  *
  * <h2>Log lines</h2>
  * {@code BRINGUP_SKIP <id>}, {@code PATCH_DROPPED <id>} and
@@ -96,8 +99,8 @@ public final class PatchRegistry {
     public static final String VERBOSE_PROPERTY = "gaius.patch.verbose";
     public static final String VERBOSE_ENV = "GAIUS_PATCH_VERBOSE";
 
-    private static final Pattern PATCH_ID = Pattern.compile("[A-Za-z0-9_$][A-Za-z0-9_$.:/-]*");
-    private static final Pattern OWNER = Pattern.compile("P[0-9]+[a-z]?");
+    private static final Pattern PATCH_ID = Pattern.compile("[A-Za-z0-9_$][A-Za-z0-9_$.:@/-]*");
+    private static final Pattern OWNER = Pattern.compile("P[1-9][a-z]?");
 
     private static String configuredProfile;
     private static boolean resolved;
@@ -278,11 +281,16 @@ public final class PatchRegistry {
         Map<String, BringupEntry> entries = new LinkedHashMap<>();
         List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
         for (int index = 0; index < lines.size(); index++) {
-            String line = lines.get(index).strip();
-            if (line.isEmpty() || line.startsWith("#")) {
+            String line = lines.get(index);
+            int comment = line.indexOf('#');
+            if (comment >= 0) {
+                line = line.substring(0, comment);
+            }
+            line = line.strip();
+            if (line.isEmpty()) {
                 continue;
             }
-            String[] parts = line.split("\\|", 3);
+            String[] parts = line.split("\\|", -1);
             String where = file + ":" + (index + 1);
             if (parts.length != 3) {
                 throw new IllegalStateException(where
@@ -296,7 +304,7 @@ public final class PatchRegistry {
             }
             if (!OWNER.matcher(owner).matches()) {
                 throw new IllegalStateException(where + ": invalid owner package '" + owner
-                        + "' (expected P0..P9, optionally with a letter suffix such as P7a)");
+                        + "' (expected P1..P9, optionally with a letter suffix such as P7a)");
             }
             if (reason.isEmpty()) {
                 throw new IllegalStateException(where + ": missing reason for " + id);

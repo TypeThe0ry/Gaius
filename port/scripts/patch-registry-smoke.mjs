@@ -231,22 +231,29 @@ try {
     "# comment line",
     "   # indented comment",
     "",
-    "Demo.patchA | P3 | reason with # inside and | a pipe",
+    "Demo.patchA | P3 | reason text   # trailing comment | not a field",
     "Demo.patchFail | P7a | fails on purpose",
     "step:LwjglSdlBrowserPatcher | P2 | shell step",
+    "step:LwjglMemoryPatcher@lwjgl | P1 | module shell step",
     "",
   ].join("\n"));
   let result = driver(["parse", list]);
   assert.equal(result.status, 0, result.err);
+  // Same rules as version-profile.sh, check-version-profile.mjs and
+  // check-build-log-skips.mjs: '#' starts a comment anywhere on the line.
   assert.equal(result.out.trim().split(/\r?\n/).join("\n"), [
-    "ENTRY Demo.patchA | P3 | reason with # inside and | a pipe",
+    "ENTRY Demo.patchA | P3 | reason text",
     "ENTRY Demo.patchFail | P7a | fails on purpose",
     "ENTRY step:LwjglSdlBrowserPatcher | P2 | shell step",
+    "ENTRY step:LwjglMemoryPatcher@lwjgl | P1 | module shell step",
   ].join("\n"));
   for (const [text, message] of [
     ["Demo.x | Q3 | bad owner", "invalid owner package"],
+    ["Demo.x | P0 | lead is not an owner", "invalid owner package"],
     ["Demo.x | P3 |   ", "missing reason"],
+    ["Demo.x | P3 | # only a comment", "missing reason"],
     ["Demo.x | P3", "expected '<patchId> | <owner> | <reason>'"],
+    ["Demo.x | P3 | reason | extra field", "expected '<patchId> | <owner> | <reason>'"],
     ["Demo.x | P3 | one\nDemo.x | P5 | two", "duplicate bring-up entry Demo.x"],
     ["bad id | P3 | reason", "invalid patch id"],
   ]) {
@@ -321,7 +328,7 @@ try {
   assert.match(result.out, /^PATCH_SUMMARY applied=2 dropped=0 bringupSkipped=0$/m,
     "a failed body is not counted as applied");
   assert.match(result.err, /Patch Demo\.patchFail failed for profile 26\.3 \(bring-up owner P7a: fails on purpose\)/);
-  assert.match(result.err, /^BRINGUP_PENDING Demo\.patchA \| P3 \| reason with # inside and \| a pipe$/m);
+  assert.match(result.err, /^BRINGUP_PENDING Demo\.patchA \| P3 \| reason text$/m);
   assert.match(result.err, /^BRINGUP_PENDING step:LwjglSdlBrowserPatcher \| P2 \| shell step$/m);
   result = driver(["run", "26.3", "Demo.patchA", "Demo.otherFail"],
     {GAIUS_BRINGUP: "1", GAIUS_BRINGUP_LIST: list});
@@ -384,7 +391,7 @@ try {
   // End to end on 26.3 in bring-up mode (needs the committed bring-up list).
   if (existsSync(bringupList263)) {
     const listed = new Set((await readFile(bringupList263, "utf8")).split(/\r?\n/)
-      .map((line) => line.trim()).filter((line) => line && !line.startsWith("#"))
+      .map((line) => line.replace(/#.*$/, "").trim()).filter(Boolean)
       .map((line) => line.split("|")[0].trim()));
     const stage = join(work, "stage-26.3.jar");
     await copyFile(jar263, stage);
