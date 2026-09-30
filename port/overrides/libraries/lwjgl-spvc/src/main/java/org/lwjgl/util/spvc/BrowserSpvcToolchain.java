@@ -1,7 +1,5 @@
 package org.lwjgl.util.spvc;
 
-import java.nio.ByteBuffer;
-
 /**
  * The SPIRV-Cross C API behind {@link BrowserSpvc}, one method per C function
  * (the browser uses {@link BrowserSpvcWasm}; the JVM corpus harness installs a
@@ -20,8 +18,8 @@ public interface BrowserSpvcToolchain {
 
     String contextLastError(int generation, long context);
 
-    /** words holds wordCount little-endian SPIR-V words from position 0. */
-    int parseSpirv(int generation, long context, ByteBuffer words, int wordCount, long[] parsedIr);
+    /** spvc_context_parse_spirv over all of words. */
+    int parseSpirv(int generation, long context, int[] words, long[] parsedIr);
 
     int createCompiler(int generation, long context, int backend, long parsedIr, int captureMode, long[] compiler);
 

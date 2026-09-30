@@ -145,19 +145,23 @@ final class NativeSpvcToolchain implements BrowserSpvcToolchain {
     }
 
     @Override
-    public int parseSpirv(int generation, long context, ByteBuffer words, int wordCount, long[] parsedIr) {
+    public int parseSpirv(int generation, long context, int[] words, long[] parsedIr) {
         Session session = session(context);
-        byte[] bytes = new byte[wordCount * 4];
-        words.duplicate().get(bytes);
-        String hash = corpus.blob("tape-spirv", ".spv", bytes);
-        IntBuffer spirv = words.duplicate().order(ByteOrder.nativeOrder()).asIntBuffer();
+        ByteBuffer bytes = ByteBuffer.allocate(words.length * 4).order(ByteOrder.LITTLE_ENDIAN);
+        bytes.asIntBuffer().put(words);
+        String hash = corpus.blob("tape-spirv", ".spv", bytes.array());
+        IntBuffer spirv = MemoryUtil.memAllocInt(Math.max(1, words.length));
         try (MemoryStack stack = MemoryStack.stackPush()) {
+            spirv.put(words).flip();
             PointerBuffer out = stack.callocPointer(1);
-            int result = NativeSpvc.spvc_context_parse_spirv(context, spirv, wordCount, out);
+            int result = NativeSpvc.spvc_context_parse_spirv(context, spirv, words.length, out);
             parsedIr[0] = out.get(0);
             String symbol = result == 0 ? bind(session, 'i', parsedIr[0]) : null;
-            record(session, "[\"parseSpirv\"," + q(hash) + "," + wordCount + "," + result + "," + sym(symbol) + "]");
+            record(session, "[\"parseSpirv\"," + q(hash) + "," + words.length + "," + result + "," + sym(symbol)
+                    + "]");
             return result;
+        } finally {
+            MemoryUtil.memFree(spirv);
         }
     }
 

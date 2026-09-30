@@ -1,9 +1,7 @@
 package org.lwjgl.util.spvc;
 
-import java.nio.ByteBuffer;
 import org.teavm.jso.JSBody;
 import org.teavm.jso.JSByRef;
-import org.teavm.jso.typedarrays.Int8Array;
 
 /**
  * The browser {@link BrowserSpvcToolchain}: SPIRV-Cross compiled to
@@ -35,9 +33,8 @@ final class BrowserSpvcWasm implements BrowserSpvcToolchain {
     }
 
     @Override
-    public int parseSpirv(int generation, long context, ByteBuffer words, int wordCount, long[] parsedIr) {
-        // words is a MemoryUtil view whose position is 0 and capacity wordCount * 4.
-        int result = parseSpirvJs(generation, (int) context, Int8Array.fromJavaBuffer(words), wordCount);
+    public int parseSpirv(int generation, long context, int[] words, long[] parsedIr) {
+        int result = parseSpirvJs(generation, (int) context, words, words.length);
         parsedIr[0] = out();
         return result;
     }
@@ -193,7 +190,7 @@ final class BrowserSpvcWasm implements BrowserSpvcToolchain {
 
     @JSBody(params = {"gen", "context", "words", "wordCount"},
             script = "return window.__gaiusShaderToolchain.spvcParseSpirv(gen, context, words, wordCount);")
-    private static native int parseSpirvJs(int gen, int context, Int8Array words, int wordCount);
+    private static native int parseSpirvJs(int gen, int context, @JSByRef int[] words, int wordCount);
 
     @JSBody(params = {"gen", "context", "backend", "ir", "mode"},
             script = "return window.__gaiusShaderToolchain.spvcCreateCompiler(gen, context, backend, ir, mode);")

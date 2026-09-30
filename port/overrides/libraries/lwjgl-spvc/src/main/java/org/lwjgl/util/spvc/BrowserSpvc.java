@@ -193,18 +193,37 @@ public final class BrowserSpvc {
     }
 
     public static int spvc_context_parse_spirv(long context, IntBuffer spirv, long wordCount, PointerBuffer parsedIr) {
-        return nspvc_context_parse_spirv(context, MemoryUtil.memAddress(spirv), wordCount,
-                MemoryUtil.memAddress(parsedIr));
+        // Minecraft passes SpvModule.spv().asIntBuffer(): the browser's BrowserMemory
+        // has no address for such a view, so read the words through the buffer.
+        if (wordCount < 0L || wordCount > spirv.remaining()) {
+            return SPVC_ERROR_INVALID_ARGUMENT;
+        }
+        int[] words = new int[(int) wordCount];
+        int position = spirv.position();
+        for (int i = 0; i < words.length; i++) {
+            words[i] = spirv.get(position + i);
+        }
+        return parseSpirv(context, words, MemoryUtil.memAddress(parsedIr));
     }
 
     public static int nspvc_context_parse_spirv(long context, long spirv, long wordCount, long parsedIr) {
+        if (spirv == 0L || wordCount < 0L || wordCount > Integer.MAX_VALUE / 4) {
+            return SPVC_ERROR_INVALID_ARGUMENT;
+        }
+        int[] words = new int[(int) wordCount];
+        for (int i = 0; i < words.length; i++) {
+            words[i] = MemoryUtil.memGetInt(spirv + 4L * i);
+        }
+        return parseSpirv(context, words, parsedIr);
+    }
+
+    private static int parseSpirv(long context, int[] words, long parsedIr) {
         Session session = sessionOf(context, TAG_CONTEXT);
-        if (session == null || spirv == 0L || wordCount < 0L || wordCount > Integer.MAX_VALUE / 4) {
+        if (session == null) {
             return SPVC_ERROR_INVALID_ARGUMENT;
         }
         long[] out = new long[1];
-        int result = toolchain().parseSpirv(session.generation, session.backend[indexOf(context)],
-                MemoryUtil.memByteBuffer(spirv, (int) wordCount * 4), (int) wordCount, out);
+        int result = toolchain().parseSpirv(session.generation, session.backend[indexOf(context)], words, out);
         if (result == SPVC_SUCCESS) {
             MemoryUtil.memPutAddress(parsedIr, session.add(TAG_IR, out[0], 0));
         }
@@ -330,8 +349,18 @@ public final class BrowserSpvc {
 
     public static boolean spvc_compiler_get_binary_offset_for_decoration(
             long compiler, int id, int decoration, IntBuffer wordOffset) {
-        return nspvc_compiler_get_binary_offset_for_decoration(compiler, id, decoration,
-                MemoryUtil.memAddress(wordOffset));
+        // Written through the buffer: a view buffer may have no BrowserMemory address.
+        Session session = sessionOf(compiler, TAG_COMPILER);
+        if (session == null) {
+            return false;
+        }
+        int[] offset = new int[1];
+        boolean found = toolchain().getBinaryOffsetForDecoration(session.generation,
+                session.backend[indexOf(compiler)], id, decoration, offset);
+        if (found) {
+            wordOffset.put(wordOffset.position(), offset[0]);
+        }
+        return found;
     }
 
     public static boolean nspvc_compiler_get_binary_offset_for_decoration(
