@@ -2931,9 +2931,11 @@ public final class Minecraft262BrowserPatcher {
     private static void patchRemoteFriendList(String jar, Path root) throws IOException {
         String owner = "net/minecraft/client/gui/screens/social/RemoteFriendListUpdateHandler";
         ClassNode node = read(jar, owner + ".class");
+        // authlib 10 (Minecraft 26.3) moved FriendsService from yggdrasil to services; the
+        // constructor body (one CopyOnWriteArraySet) is unchanged.
         MethodNode constructor = find(node, "<init>",
-                "(Lcom/mojang/authlib/yggdrasil/FriendsService;"
-                        + "Lnet/minecraft/client/Minecraft;)V");
+                ModernSymbols.cached(jar).authlibDesc("(Lcom/mojang/authlib/yggdrasil/FriendsService;"
+                        + "Lnet/minecraft/client/Minecraft;)V"));
         int types = 0;
         int calls = 0;
         for (AbstractInsnNode instruction = constructor.instructions.getFirst();

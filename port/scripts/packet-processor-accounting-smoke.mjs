@@ -118,8 +118,10 @@ const profileId = process.env.GAIUS_MINECRAFT_VERSION
   || (process.env.GAIUS_VERSION_PROFILE_PATH
     ? profileIdFromPath(process.env.GAIUS_VERSION_PROFILE_PATH)
     : (/^\d+(?:\.\d+)+$/.test(overlayProfileId) ? overlayProfileId : "26.2"));
-if (profileId !== "26.2") {
-  throw new Error(`PacketProcessor accounting smoke is 26.2-only; got profile ${profileId}`);
+// PacketProcessor and patchPacketProcessorBrowserSlice are identical for 26.2 and 26.3
+// (the 26.3 class is byte-identical modulo the constant pool); 1.21.11 is not covered.
+if (!["26.2", "26.3"].includes(profileId)) {
+  throw new Error(`PacketProcessor accounting smoke covers 26.2 and 26.3; got profile ${profileId}`);
 }
 const overlayRoot = nativePath(process.env.GAIUS_OVERLAY_DIRECTORY ||
   `${repository}/port/work/overlays/${profileId}`);
