@@ -7,6 +7,10 @@
   "classFileVersion": 69,
   "clientDistribution": "named",
   "worldgenTelemetryMode": "task-pulsed",
+  "patchSet": "modern",
+  "extraPatchers": [
+    "Minecraft263BrowserPatcher"
+  ],
   "packVersions": {
     "resource": {
       "major": 97,

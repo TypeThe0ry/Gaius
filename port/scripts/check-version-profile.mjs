@@ -5,6 +5,20 @@ import {dirname, isAbsolute, relative, resolve, sep} from "node:path";
 import {fileURLToPath} from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+
+// build-overlays.sh dispatches the client patcher chain on patchSet and runs
+// extraPatchers (dev.gaius.tools.<name>) in order at the tail of that chain.
+// Keep these values in sync with the dispatch in build-overlays.sh.
+const PATCH_SETS = {
+    "modern": "named",
+    "legacy-12111": "obfuscated-with-mappings",
+};
+
+// port/tools/bringup/<id>.txt lists the patches a GAIUS_BRINGUP=1 build may
+// skip. Lines are "<patchId> | <owner package> | <reason>"; '#' starts a
+// comment. Bring-up mode never applies to the release profiles, so they must
+// not carry entries.
+const BRINGUP_FORBIDDEN_PROFILES = new Set(["26.2", "1.21.11"]);
 const configPath = resolve(root, "port/config.json");
 const config = JSON.parse(await readFile(configPath, "utf8"));
 const versionsDirectory = resolve(root, "port/versions");
@@ -129,6 +143,8 @@ if (process.argv.includes("--require-local") &&
     fail(`local ${profile.id} metadata is incomplete; run fetch-version.sh first`);
 }
 
+const bringup = await validateBringupList(profile.id);
+
 return {
     profile: profile.id,
     protocolVersion: profile.protocolVersion,
@@ -137,6 +153,11 @@ return {
     classFileVersion: profile.classFileVersion,
     clientDistribution: profile.clientDistribution,
     worldgenTelemetryMode: profile.worldgenTelemetryMode,
+    patchSet: profile.patchSet,
+    extraPatchers: profile.extraPatchers,
+    bringup,
+    packVersions: profile.packVersions,
+    assetIndex: {id: profile.official.assetIndexId, sha1: profile.official.assetIndexSha1},
     storage: profile.storage,
     checkedLocalMetadata,
     checkedClientVersion,
@@ -156,6 +177,7 @@ function validateProfile(value) {
     if (!["named", "obfuscated-with-mappings"].includes(value.clientDistribution)) {
         fail("clientDistribution must be named or obfuscated-with-mappings");
     }
+    validatePatchSet(value);
     for (const pack of ["resource", "data"]) {
         requiredInteger(value.packVersions?.[pack], "major", `packVersions.${pack}`);
         requiredInteger(value.packVersions?.[pack], "minor", `packVersions.${pack}`);
@@ -170,6 +192,79 @@ function validateProfile(value) {
     } else if (value.official.clientMappingsSha1 !== null) {
         fail("official.clientMappingsSha1 must be null for a named client");
     }
+}
+
+function validatePatchSet(profile) {
+    const id = profile?.id ?? "<unknown>";
+    const patchSet = profile?.patchSet;
+    if (typeof patchSet !== "string" || !Object.hasOwn(PATCH_SETS, patchSet)) {
+        fail(`profile ${id}.patchSet must be one of ${Object.keys(PATCH_SETS).join(", ")} ` +
+            `(received ${JSON.stringify(patchSet)})`);
+    }
+    if (profile.clientDistribution !== PATCH_SETS[patchSet]) {
+        fail(`profile ${id}.patchSet ${patchSet} requires clientDistribution ` +
+            `${PATCH_SETS[patchSet]} (received ${JSON.stringify(profile.clientDistribution)})`);
+    }
+    const extraPatchers = profile.extraPatchers;
+    if (!Array.isArray(extraPatchers)) {
+        fail(`profile ${id}.extraPatchers must be an array of dev.gaius.tools class names`);
+    }
+    const seen = new Set();
+    for (const name of extraPatchers) {
+        if (typeof name !== "string" || !/^[A-Z][A-Za-z0-9_]*$/u.test(name)) {
+            fail(`profile ${id}.extraPatchers entries must be simple Java class names ` +
+                `(received ${JSON.stringify(name)})`);
+        }
+        if (seen.has(name)) {
+            fail(`profile ${id}.extraPatchers lists ${name} twice`);
+        }
+        seen.add(name);
+    }
+    if (patchSet !== "modern" && extraPatchers.length > 0) {
+        fail(`profile ${id}.extraPatchers is only supported by the modern patch set`);
+    }
+}
+
+async function validateBringupList(id) {
+    const path = resolve(root, "port/tools/bringup", `${id}.txt`);
+    if (!(await exists(path))) {
+        return {list: null, entries: 0};
+    }
+    const entries = parseBringupList(await readFile(path, "utf8"), path);
+    if (BRINGUP_FORBIDDEN_PROFILES.has(id) && entries.length > 0) {
+        fail(`profile ${id} must not have bring-up entries (${relative(root, path)})`);
+    }
+    return {list: relative(root, path).replaceAll("\\", "/"), entries: entries.length};
+}
+
+function parseBringupList(text, path) {
+    const entries = [];
+    const ids = new Set();
+    text.split(/\r?\n/u).forEach((rawLine, index) => {
+        const line = rawLine.replace(/#.*$/u, "").trim();
+        if (line === "") return;
+        const fields = line.split("|").map((field) => field.trim());
+        const where = `${relative(root, path)}:${index + 1}`;
+        if (fields.length !== 3) {
+            fail(`${where} must be "<patchId> | <owner> | <reason>"`);
+        }
+        const [patchId, owner, reason] = fields;
+        if (!/^[A-Za-z0-9_$.:@-]+$/u.test(patchId)) {
+            fail(`${where} has an invalid patch id ${JSON.stringify(patchId)}`);
+        }
+        if (!/^P[1-9][a-z]?$/u.test(owner)) {
+            fail(`${where} owner must be a work package P1..P9 (received ${JSON.stringify(owner)})`);
+        }
+        if (reason === "") {
+            fail(`${where} must give a reason`);
+        }
+        if (ids.has(patchId)) {
+            fail(`${where} lists ${patchId} twice`);
+        }
+        ids.add(patchId);
+        entries.push({patchId, owner, reason});
+    });
+    return entries;
 }
 
 function validateWorldgenTelemetryMode(profile) {
