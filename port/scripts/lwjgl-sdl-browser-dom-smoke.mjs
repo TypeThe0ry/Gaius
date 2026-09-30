@@ -545,6 +545,18 @@ test("keycodes: unshifted US table, scancode mask for non-characters, layout-awa
   assert.deepEqual(records[1].i.slice(0, 2), [0, 0], "unknown keys are SDL_SCANCODE_UNKNOWN");
 });
 
+test("sprint keys: KeyR is SDL scancode 21 (26.3 default KEY_R), ControlLeft is 224 (LCTRL)", () => {
+  const browser = started();
+  browser.fire("keydown", keyEvent("KeyR", "r"));
+  browser.fire("keyup", keyEvent("KeyR", "r"));
+  browser.fire("keydown", keyEvent("ControlLeft", "Control", {ctrlKey: true}));
+  const records = drain(browser);
+  assert.deepEqual(types(records), [KEY_DOWN, KEY_UP, KEY_DOWN]);
+  assert.deepEqual(records[0].i.slice(0, 2), [21, 114], "KeyR -> SDL_SCANCODE_R, keycode 'r'");
+  assert.deepEqual(records[1].i.slice(0, 2), [21, 114]);
+  assert.deepEqual(records[2].i.slice(0, 2), [224, 0x40000000 | 224], "ControlLeft -> SDL_SCANCODE_LCTRL");
+});
+
 test("wheel uses SDL3 directions and normalizes line/page delta modes", () => {
   const browser = started();
   browser.fire("wheel", {deltaX: 0, deltaY: 100, deltaMode: 0});
