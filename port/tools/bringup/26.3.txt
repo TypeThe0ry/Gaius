@@ -22,6 +22,11 @@
 # the first failure of the same driver were never exercised by the survey
 # (risk R18); add them here, with an owner, when a bring-up build reports them.
 # A reason may contain neither '#' (starts a comment) nor '|'.
+#
+# Wave 1 of the migration (P1-P8) ported, dropped (PatchRegistry.dropped with
+# the absence assertion) or replaced all 71 initial entries, so the list is
+# empty: a normal 26.3 build runs every patch.  Runtime acceptance (M3/M4 in
+# the browser) is tracked in the migration plan, not here.
 
 # --- build-overlays.sh library steps (PLAN.md 6.3) ---
 
