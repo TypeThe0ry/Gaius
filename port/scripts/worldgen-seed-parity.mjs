@@ -35,6 +35,16 @@
 // --download-server fetches downloads.server.url; both are SHA-1 checked against
 // downloads.server and the bundled jars against the bundler's SHA-256 lists.
 //
+// World spawn: the browser does not run the vanilla spawn search. Its setInitialSpawn (the
+// "fast initial spawn", MinecraftClientPatcher.replaceInitialSpawnForBrowser) puts the world
+// spawn at the middle column of the spawn chunk ChunkGenerator.getOrigin returns, at the top of
+// the level, and lets PlayerSpawnFinder settle the player later. So the spawn acceptance is:
+// the browser spawn chunk equals the vanilla spawn chunk (getOrigin). --patched runs check it
+// on the real patched method (BrowserSpawnProbe copies it out of the patched MinecraftServer
+// and runs it on the harness level with recording proxies); "spawn" in the result files is the
+// harness server's own vanilla spawn search (full mode), compared only between two runs that
+// both did that search.
+//
 // --patched: after the vanilla runs, runs the P6-patched worldgen classes taken from the given
 // patched client jar (P6_WORLDGEN_CLASSES) in front of an unsigned copy of the vanilla jar,
 // with JVM transcriptions of the browser helpers (port/scripts/worldgen-seed-parity/shims),
@@ -48,7 +58,7 @@ import {createHash} from "node:crypto";
 import {spawnSync} from "node:child_process";
 import {existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync,
   statSync, writeFileSync} from "node:fs";
-import {tmpdir} from "node:os";
+import {homedir, tmpdir} from "node:os";
 import {delimiter, dirname, join, relative, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
 
@@ -227,9 +237,10 @@ function compileHarness(options, classpath, output) {
   "compile WorldgenSeedParity");
 }
 
-function runSeed(options, classpath, {seed, mode, label, outFile, universe}) {
+function runSeed(options, classpath, {seed, mode, label, outFile, universe, serverClass}) {
   const started = Date.now();
-  const stdout = run(javaTool(options, "java"), ["-Xmx4g", "-Dmax.bg.threads=1",
+  const probe = serverClass ? [`-Dgaius.parity.patchedServerClass=${serverClass}`] : [];
+  const stdout = run(javaTool(options, "java"), ["-Xmx4g", "-Dmax.bg.threads=1", ...probe,
     "-cp", classpath.join(delimiter), "dev.gaius.parity.WorldgenSeedParity",
     "--seed", seed, "--mode", mode, "--side", String(options.side), "--universe", universe,
     "--out", outFile, "--label", label], `${label} ${mode} seed ${seed}`,
@@ -255,8 +266,9 @@ export function compareResults(reference, candidate) {
   if (reference.spawn?.vanillaSpawnSearch && candidate.spawn?.vanillaSpawnSearch
       && (reference.spawn.x !== candidate.spawn.x || reference.spawn.y !== candidate.spawn.y
         || reference.spawn.z !== candidate.spawn.z)) {
-    problems.push(`world spawn differs: ${JSON.stringify(reference.spawn)} vs ${JSON.stringify(candidate.spawn)}`);
+    problems.push(`vanilla spawn search result differs: ${JSON.stringify(reference.spawn)} vs ${JSON.stringify(candidate.spawn)}`);
   }
+  if (candidate.browserSpawn) problems.push(...checkBrowserSpawn(reference, candidate));
   const byPosition = new Map(candidate.chunks.map((chunk) => [`${chunk.x},${chunk.z}`, chunk]));
   const blockDiffs = [];
   const biomeDiffs = [];
@@ -271,6 +283,36 @@ export function compareResults(reference, candidate) {
   }
   if (blockDiffs.length) problems.push(`block hashes differ in ${blockDiffs.length} chunk(s): ${blockDiffs.join(" ")}`);
   if (biomeDiffs.length) problems.push(`biome hashes differ in ${biomeDiffs.length} chunk(s): ${biomeDiffs.join(" ")}`);
+  return problems;
+}
+
+/**
+ * The browser fast initial spawn (see the file header) against the vanilla spawn chunk: same
+ * chunk as reference getOrigin, middle column, top of the level, and the load-listener stage
+ * and telemetry event the browser method reports.
+ */
+export function checkBrowserSpawn(reference, candidate) {
+  const spawn = candidate.browserSpawn;
+  if (!spawn) return ["the browser setInitialSpawn did not run (no browserSpawn in the candidate)"];
+  const problems = [];
+  const origin = reference.origin;
+  if (spawn.chunkX !== origin.x || spawn.chunkZ !== origin.z) {
+    problems.push(`browser spawn chunk ${spawn.chunkX},${spawn.chunkZ} is not the vanilla spawn chunk `
+      + `(getOrigin) ${origin.x},${origin.z}`);
+  }
+  if (spawn.x !== origin.x * 16 + 8 || spawn.z !== origin.z * 16 + 8 || spawn.y !== spawn.levelMaxY) {
+    problems.push(`browser spawn ${spawn.x},${spawn.y},${spawn.z} is not the middle column of chunk `
+      + `${origin.x},${origin.z} at the top of the level (maxY ${spawn.levelMaxY})`);
+  }
+  if (!spawn.events?.includes("server.browserFastInitialSpawn")) {
+    problems.push(`browser spawn did not report server.browserFastInitialSpawn: ${JSON.stringify(spawn.events)}`);
+  }
+  const calls = (spawn.listener || []).map((entry) => entry.split(" ")[0]);
+  if (calls.join() !== "start,updateFocus,finish"
+      || !spawn.listener[0].includes("PREPARE_GLOBAL_SPAWN") || !spawn.listener[2].includes("PREPARE_GLOBAL_SPAWN")) {
+    problems.push(`browser spawn load-listener calls are not start/updateFocus/finish of PREPARE_GLOBAL_SPAWN: `
+      + JSON.stringify(spawn.listener));
+  }
   return problems;
 }
 
@@ -315,7 +357,24 @@ function preparePatched(options, work, vanilla, harnessClasses, temp) {
   run(javaTool(options, "javac"), ["-J-Duser.language=en", "--release", "25", "-proc:none",
     "-cp", [unsigned, ...vanilla.libraries].join(delimiter), "-d", shims, ...shimSources],
   "compile helper shims");
-  return [shims, overlay, harnessClasses, unsigned, ...vanilla.libraries];
+  // The browser setInitialSpawn: its MinecraftServer class stays off the class path (the
+  // harness server is vanilla); BrowserSpawnProbe copies the one static method out of it.
+  const server = join(temp, "patched-server");
+  mkdirSync(server, {recursive: true});
+  run(javaTool(options, "jar"), ["xf", options.patched, "net/minecraft/server/MinecraftServer.class"],
+    "extract the patched MinecraftServer", {cwd: server});
+  options.patchedServerClass = join(server, "net/minecraft/server/MinecraftServer.class");
+  if (!existsSync(options.patchedServerClass)) throw new Error(`patched jar ${options.patched} has no MinecraftServer`);
+  const maven = nativePath(process.env.GAIUS_MAVEN_REPOSITORY || join(homedir(), ".m2/repository"));
+  const asm = ["asm", "asm-tree", "asm-commons"].map((artifact) =>
+    join(maven, "org/ow2/asm", artifact, "9.8", `${artifact}-9.8.jar`));
+  for (const jar of asm) if (!existsSync(jar)) throw new Error(`${jar} is missing (ASM 9.8 is needed for --patched)`);
+  const probe = join(temp, "probe-classes");
+  mkdirSync(probe, {recursive: true});
+  run(javaTool(options, "javac"), ["-J-Duser.language=en", "--release", "25", "-proc:none",
+    "-cp", [unsigned, ...vanilla.libraries, ...asm].join(delimiter), "-d", probe,
+    join(harnessDir, "BrowserSpawnProbe.java")], "compile BrowserSpawnProbe");
+  return [shims, overlay, probe, harnessClasses, unsigned, ...vanilla.libraries, ...asm];
 }
 
 /**
@@ -447,11 +506,21 @@ async function main() {
           origin: reference.origin, spawn: reference.spawn});
         if (patchedClasspath) {
           const candidate = runSeed(options, patchedClasspath, {seed, mode, label: "patched-jvm",
-            universe, outFile: join(outDir, `patched-jvm-${mode}-${seed}.json`)});
+            universe, outFile: join(outDir, `patched-jvm-${mode}-${seed}.json`),
+            serverClass: options.patchedServerClass});
           summary.push({seed, mode, label: candidate.label, aggregate: candidate.aggregate,
-            pulses: candidate.pulses?.total});
-          ok = report(`patched-jvm vs vanilla ${mode} seed ${seed}`,
-            compareResults(reference, candidate)) && ok;
+            pulses: candidate.pulses?.total, browserSpawn: candidate.browserSpawn});
+          const problems = compareResults(reference, candidate);
+          if (!candidate.browserSpawn) problems.push(...checkBrowserSpawn(reference, candidate));
+          ok = report(`patched-jvm vs vanilla ${mode} seed ${seed}`, problems) && ok;
+          if (candidate.browserSpawn) {
+            const vanillaSearch = reference.spawn?.vanillaSpawnSearch
+              ? `; vanilla spawn search ${reference.spawn.x},${reference.spawn.y},${reference.spawn.z}` : "";
+            console.log(`WORLDGEN_SEED_PARITY_BROWSER_SPAWN seed ${seed} ${mode}: `
+              + `${candidate.browserSpawn.x},${candidate.browserSpawn.y},${candidate.browserSpawn.z} `
+              + `chunk ${candidate.browserSpawn.chunkX},${candidate.browserSpawn.chunkZ} `
+              + `(vanilla getOrigin ${reference.origin.x},${reference.origin.z}${vanillaSearch})`);
+          }
         }
       }
     }

@@ -86,7 +86,10 @@ import net.minecraft.world.level.storage.PrimaryLevelData;
  *       worldgen difference.</li>
  * </ul>
  * The centre is {@code ChunkGenerator.getOrigin(RandomState)}, the spawn chunk vanilla 26.3
- * and the browser's fast initial spawn both start from.
+ * and the browser's fast initial spawn both start from. {@code spawn} is the world spawn the
+ * harness server wrote: the vanilla spawn search in full mode (on the patched worldgen classes
+ * in a --patched run), the level default in terrain mode. {@code browserSpawn} (--patched runs
+ * only) is the spawn the browser's own setInitialSpawn writes, run by {@code BrowserSpawnProbe}.
  *
  * <p>usage: {@code WorldgenSeedParity --seed <long> --mode terrain|full --side <chunks>
  * --universe <dir> --out <json> [--label <text>]}. Runs with the vanilla client (or server)
@@ -350,6 +353,19 @@ public final class WorldgenSeedParity {
             String biomes = HexFormat.of().formatHex(biomesAggregate.digest());
             chunkCount = chunkLines.size();
             aggregate = "blocks:" + blocks.substring(0, 16) + ",biomes:" + biomes.substring(0, 16);
+            // --patched runs also carry BrowserSpawnProbe: it runs the browser's own
+            // setInitialSpawn (fast initial spawn) against recording proxies, after hashing.
+            String browserSpawn = "null";
+            try {
+                Class<?> probe = Class.forName("dev.gaius.parity.BrowserSpawnProbe");
+                browserSpawn = String.valueOf(probe.getMethod("run", ServerLevel.class).invoke(null, level));
+            } catch (ClassNotFoundException expected) {
+                // Vanilla run: the probe needs the patched jar.
+            } catch (java.lang.reflect.InvocationTargetException exception) {
+                throw new IllegalStateException("Browser spawn probe failed", exception.getCause());
+            } catch (ReflectiveOperationException exception) {
+                throw new IllegalStateException("Browser spawn probe failed", exception);
+            }
             String pulses = "";
             try {
                 Class<?> shim = Class.forName("dev.gaius.browser.BrowserWorldgenDeepCheckpoint");
@@ -372,6 +388,7 @@ public final class WorldgenSeedParity {
             json.append(String.format(Locale.ROOT, "  \"origin\": {\"x\": %d, \"z\": %d},%n", origin.x(), origin.z()));
             json.append(String.format(Locale.ROOT, "  \"spawn\": {\"x\": %d, \"y\": %d, \"z\": %d, \"vanillaSpawnSearch\": %s},%n",
                     spawn.getX(), spawn.getY(), spawn.getZ(), "full".equals(options.mode())));
+            json.append("  \"browserSpawn\": ").append(browserSpawn).append(",\n");
             json.append("  \"aggregate\": {\"blocks\": \"").append(blocks).append("\", \"biomes\": \"")
                     .append(biomes).append("\"},\n");
             json.append("  \"generationMillis\": ").append(TimeUnit.NANOSECONDS.toMillis(generationNanos)).append(",\n");

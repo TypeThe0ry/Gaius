@@ -222,7 +222,13 @@ def run_checks(jar: Path, javap: str, tool_classes: Path | None = None,
         results.append(("No class references a dropped 26.2 worldgen helper", not referencing,
                         "; ".join(referencing[:5])))
 
-    if tool_classes is not None and asm_classpath:
+    if tool_classes is None or not asm_classpath:
+        # Fail closed: without the tool classes and ASM the non-suspending guard (R8) and its
+        # self-test cannot run, and a silent omission would read as a pass.
+        missing = "tool classes" if tool_classes is None else "ASM 9.8 (asm, asm-tree) in M2_REPO or ~/.m2"
+        for mode in ("--verify-non-suspending", "--self-test"):
+            results.append((f"WorldgenPatches263 {mode}", False, f"not run: {missing} missing"))
+    else:
         java = str(Path(javap).with_name(Path(javap).name.replace("javap", "java")))
         classpath = os.pathsep.join([str(tool_classes)] + [str(path) for path in asm_classpath])
         for mode in ("--verify-non-suspending", "--self-test"):
@@ -263,8 +269,6 @@ def main() -> int:
     for label, passed, detail in results:
         print(f"{'PASS' if passed else 'FAIL'} {label}" + (f" ({detail})" if detail and not passed else ""))
         failures += 0 if passed else 1
-    if tool_classes is None:
-        print("NOTE non-suspending guard not run: no tool classes at " + str(arguments.tool_classes))
     print(f"PROFILE_263_WORLDGEN checks={len(results)} failures={failures}")
     return 1 if failures else 0
 
