@@ -4244,7 +4244,8 @@ export function evaluatePerformanceGates({
     ? Number(frames.coverageRatioRaw) : Number(frames?.coverageRatio);
   if (!(finiteNumber(frames?.sampleCount, 0) > 0)
       || !(finiteNumber(frames?.rawFrameCount, 0) > 0)) {
-    frameFailures.push("Minecraft produced no measured BrowserGlfw frames");
+    frameFailures.push(
+      "Minecraft produced no measured frames (BrowserGlfw.swapBuffers / BrowserSdl.SDL_GL_SwapWindow)");
   }
   if (finiteNumber(frames?.invalidFrameIntervalCount, 0) > 0) {
     frameFailures.push(

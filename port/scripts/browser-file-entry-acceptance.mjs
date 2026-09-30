@@ -480,7 +480,8 @@ async function captureSingleplayerTerrain(cdp, worldRequestedAtMillis=null) {
       await dispatchKey(cdp,'Space',true); keyEvents++;
       let input=null;
       try {
-        input=await evaluate(cdp,`({spacePressed:!!window.__gaiusGlfwKeys?.[32],sampleAt:window.__gaiusMinecraftState?.at,screen:window.__gaiusMinecraftState?.screen||null})`);
+        // Space is GLFW key 32 on 26.2 and SDL scancode 44 on 26.3.
+        input=await evaluate(cdp,`({spacePressed:!!(window.__gaiusGlfwKeys?.[32]||window.__gaiusSdlKeys?.[44]),sampleAt:window.__gaiusMinecraftState?.at,screen:window.__gaiusMinecraftState?.screen||null})`);
         await sleep(3000);
       } finally { await dispatchKey(cdp,'Space',false); keyEvents++; }
       elevated=await readSingleplayerState(cdp);

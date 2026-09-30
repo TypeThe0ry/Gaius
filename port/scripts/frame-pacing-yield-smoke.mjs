@@ -1,14 +1,43 @@
 #!/usr/bin/env node
+// Frame pacing of the per-frame cooperative yield after a present.
+//
+//   node port/scripts/frame-pacing-yield-smoke.mjs                 # 26.2: BrowserGlfw.swapBuffers
+//   node port/scripts/frame-pacing-yield-smoke.mjs --profile 26.3  # 26.3: BrowserSdl.SDL_GL_SwapWindow
+//
+// Both profiles run the same scheduler script (the SDL shim copies BrowserGlfw's), so the
+// simulations below are shared; only the source contract differs.
 
 import assert from "node:assert/strict";
 import {readFile} from "node:fs/promises";
 import vm from "node:vm";
 
+const profileIndex = process.argv.indexOf("--profile");
+const profile = profileIndex >= 0 ? process.argv[profileIndex + 1] : "26.2";
+assert.ok(profile === "26.2" || profile === "26.3", `unsupported profile ${profile}`);
+const sdl = profile === "26.3";
+const sdlRoot = "../overrides/libraries/lwjgl-sdl/src/main/java/org/lwjgl/sdl/";
 const sourcePath = new URL(
-  "../overrides/libraries/lwjgl-glfw/src/main/java/org/lwjgl/glfw/BrowserGlfw.java",
+  sdl ? sdlRoot + "BrowserSdlDom.java"
+    : "../overrides/libraries/lwjgl-glfw/src/main/java/org/lwjgl/glfw/BrowserGlfw.java",
   import.meta.url,
 );
 const source = await readFile(sourcePath, "utf8");
+if (sdl) {
+  // SDL_GL_SwapWindow is the frame boundary: present bookkeeping, then the yield, with the
+  // interval stored by SDL_GL_SetSwapInterval.
+  const entry = await readFile(new URL(sdlRoot + "BrowserSdl.java", import.meta.url), "utf8");
+  const video = await readFile(new URL(sdlRoot + "BrowserSdlVideo.java", import.meta.url), "utf8");
+  const swapWindow = entry.slice(entry.indexOf("public static boolean SDL_GL_SwapWindow"),
+    entry.indexOf("// ------", entry.indexOf("public static boolean SDL_GL_SwapWindow")));
+  assert.match(swapWindow, /BrowserSdlDom\.swapWindow\(BrowserSdlVideo\.swapInterval\(\)\);\s*return true;/,
+    "SDL_GL_SwapWindow does not yield with the stored swap interval");
+  assert.match(entry, /public static boolean SDL_GL_SetSwapInterval\(int interval\) \{\s*BrowserSdlVideo\.setSwapInterval\(interval\);/,
+    "SDL_GL_SetSwapInterval does not store the interval");
+  assert.match(video, /private static int swapInterval;/,
+    "SDL swap interval is not retained for the asynchronous present boundary");
+  assert.match(source, /static void swapWindow\(int swapInterval\) \{\s*boolean hidden = swapBuffersJs\(\);\s*yieldAfterPresent\(hidden, swapInterval\);\s*\}/,
+    "BrowserSdlDom.swapWindow is not present bookkeeping followed by the yield");
+}
 function jsBodyBefore(marker) {
   const markerOffset = source.indexOf(marker);
   const annotationOffset = source.lastIndexOf(
@@ -24,8 +53,10 @@ function jsBodyBefore(marker) {
 
 assert.match(source, /@Async\s+private static native void yieldAfterPresent\(boolean hidden, int interval\)/,
   "swapBuffers yield is not a TeaVM async continuation boundary");
-assert.match(source, /private static int swapInterval;/,
-  "GLFW swap interval is not retained for the asynchronous present boundary");
+if (!sdl) {
+  assert.match(source, /private static int swapInterval;/,
+    "GLFW swap interval is not retained for the asynchronous present boundary");
+}
 assert.match(source, /requestAnimationFrame/, "visible pacing does not use rAF");
 assert.match(source, /new MessageChannel\(\)/, "visible pacing does not yield through MessageChannel");
 assert.match(source, /setTimeout\(\(\) => finish\('timer'\), 50\)/,
@@ -48,17 +79,22 @@ assert.doesNotMatch(source, /scheduleFairYield|__gaiusUncappedYieldSequence|\(se
   "uncapped pacing still mixes a fixed scheduler.yield cadence into MessageChannel presents");
 assert.doesNotMatch(source, /scheduler=\{queue:\[\],channel:null\}/,
   "frame pacing still retains an unbounded callback queue");
-assert.doesNotMatch(
-  source.slice(source.indexOf("public static void swapBuffers"), source.indexOf("public static void swapInterval")),
-  /sleepForBrowserMillis|Thread\.sleep/,
-  "swapBuffers still uses a clamp-prone fixed timer",
-);
-const waitEventsTimeout = source.slice(
-  source.indexOf("public static void waitEventsTimeout"),
-  source.indexOf("public static void postEmptyEvent"),
-);
-assert.match(waitEventsTimeout, /sleepForBrowserMillis\(Math\.max\(1L, Math\.min\(7L, millis - 1L\)\)\)/,
-  "waitEventsTimeout semantics changed");
+if (sdl) {
+  assert.doesNotMatch(source.slice(source.indexOf("static void swapWindow")), /sleepForBrowserMillis|Thread\.sleep/,
+    "SDL_GL_SwapWindow still uses a clamp-prone fixed timer");
+} else {
+  assert.doesNotMatch(
+    source.slice(source.indexOf("public static void swapBuffers"), source.indexOf("public static void swapInterval")),
+    /sleepForBrowserMillis|Thread\.sleep/,
+    "swapBuffers still uses a clamp-prone fixed timer",
+  );
+  const waitEventsTimeout = source.slice(
+    source.indexOf("public static void waitEventsTimeout"),
+    source.indexOf("public static void postEmptyEvent"),
+  );
+  assert.match(waitEventsTimeout, /sleepForBrowserMillis\(Math\.max\(1L, Math\.min\(7L, millis - 1L\)\)\)/,
+    "waitEventsTimeout semantics changed");
+}
 
 const frameYieldScript = jsBodyBefore(
   "private static native void scheduleFrameYield(boolean hidden, int interval, FrameYieldCallback resume);",
@@ -695,7 +731,7 @@ assert.ok(highRefreshOnePercentLow > 138,
   `cooperative 144 Hz 1% low regressed: ${highRefreshOnePercentLow.toFixed(1)} FPS`);
 
 console.log(
-  "Frame pacing yield smoke passed:",
+  `Frame pacing yield smoke passed (${sdl ? "26.3 BrowserSdl.SDL_GL_SwapWindow" : "26.2 BrowserGlfw.swapBuffers"}):`,
   `uncapped avg=${uncapped.averageFps.toFixed(1)}fps,`,
   `uncapped 1% low=${uncapped.onePercentLow.toFixed(1)}fps,`,
   `120Hz 1% low=${cooperativeOnePercentLow.toFixed(1)}fps,`,

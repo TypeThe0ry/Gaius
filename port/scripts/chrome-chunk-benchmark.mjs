@@ -2331,8 +2331,11 @@ async function observeWorldReadiness(session) {
         keyboardLockPending: window.__gaiusKeyboardLockPending === true,
         keyboardLockError: window.__gaiusKeyboardLockLastError || null,
         inputStats: window.__gaiusInputStats || null,
+        // 26.2 BrowserGlfw queue or 26.3 BrowserSdl queue (never both on one page).
         queuedEvents: Math.max(0, (window.__gaiusGlfwEvents?.length || 0)
-          - (window.__gaiusGlfwEventHead || 0)),
+          - (window.__gaiusGlfwEventHead || 0))
+          + Math.max(0, (window.__gaiusSdlEvents?.length || 0)
+          - (window.__gaiusSdlEventHead || 0)),
       },
     };
   })()`);
