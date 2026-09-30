@@ -514,7 +514,7 @@ public final class GaiusChunkLayerBytecodeVerifier {
         require(activeCleared && exits, target + " active cleanup CFG changed");
     }
 
-    private static void verifyLayerBarrierCfg262(ClassNode node) {
+    private static void verifyLayerBarrierCfg262(ClassNode node, String profile) {
         verifyPendingLayerYield(node);
         MethodNode run = method(node, "runUntilWait");
 
@@ -745,7 +745,7 @@ public final class GaiusChunkLayerBytecodeVerifier {
         require(handlerActiveCleared && rethrowsSame,
                 "26.2 scheduleLayer Throwable cleanup/rethrow changed");
         verifySuccessfulHolderPulsePaths(layer, node.name);
-        System.out.println("PROFILE_CFG_OK 26.2 " + node.name);
+        System.out.println("PROFILE_CFG_OK " + profile + " " + node.name);
         System.out.println("CFG_VERIFIER_OK " + node.name);
     }
 
@@ -762,8 +762,8 @@ public final class GaiusChunkLayerBytecodeVerifier {
             new Analyzer<BasicValue>(new BasicVerifier()).analyze(node.name, method);
         }
         if (name.equals("net/minecraft/server/level/ChunkGenerationTask.class")) {
-            if (profile.equals("26.2")) {
-                verifyLayerBarrierCfg262(node);
+            if (isModernProfile(profile)) {
+                verifyLayerBarrierCfg262(node, profile);
             } else {
                 verifyLayerBarrierCfg(node, profile);
             }
@@ -774,11 +774,19 @@ public final class GaiusChunkLayerBytecodeVerifier {
         System.out.println("BASIC_VERIFIER_OK " + name);
     }
 
+    /**
+     * 26.2 and 26.3 share Minecraft262BrowserPatcher's ChunkGenerationTask cooperation patch
+     * (identical target bytecode), so both are checked against the modern layer-barrier CFG.
+     */
+    private static boolean isModernProfile(String profile) {
+        return profile.equals("26.2") || profile.equals("26.3");
+    }
+
     public static void main(String[] args) throws Exception {
         require(args.length == 2,
-                "usage: GaiusChunkLayerBytecodeVerifier <client.jar> <1.21.11|26.2>");
+                "usage: GaiusChunkLayerBytecodeVerifier <client.jar> <1.21.11|26.2|26.3>");
         String profile = args[1];
-        require(profile.equals("1.21.11") || profile.equals("26.2"),
+        require(profile.equals("1.21.11") || isModernProfile(profile),
                 "unsupported Minecraft profile: " + profile);
         try (ZipFile jar = new ZipFile(args[0])) {
             verify(jar, "net/minecraft/server/level/ChunkGenerationTask.class", profile);
