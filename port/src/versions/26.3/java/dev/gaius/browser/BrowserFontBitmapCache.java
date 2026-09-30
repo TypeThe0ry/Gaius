@@ -7,15 +7,21 @@ import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.Map;
 
-/** Shares immutable bitmap font pixels only within one resource-manager generation. */
+/**
+ * Shares immutable bitmap font pixels only within one resource-manager generation.
+ *
+ * <p>26.3 version: {@code BitmapProvider$Definition.load} calls {@code NativeImage.read(stream)}
+ * (26.3 removed {@code read(Format, InputStream)}), so MinecraftClientPatcher's
+ * patchBitmapFontImageSharing redirects it to the three-argument {@link #read}.
+ */
 public final class BrowserFontBitmapCache {
     private static final Map<Object, Map<Object, Entry>> GENERATIONS = new IdentityHashMap<>();
     private static final Map<NativeImage, Entry> IMAGES = new IdentityHashMap<>();
 
     private BrowserFontBitmapCache() {}
 
-    public static synchronized NativeImage read(NativeImage.Format format, InputStream stream,
-            Object resources, Object location) throws IOException {
+    public static synchronized NativeImage read(InputStream stream, Object resources,
+            Object location) throws IOException {
         Map<Object, Entry> images = GENERATIONS.get(resources);
         Entry entry = images == null ? null : images.get(location);
         if (entry != null) {
