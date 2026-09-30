@@ -102,6 +102,7 @@ public final class RenderPatches263 {
     }
 
     public static void apply(String jar, Path root, ModernSymbols symbols) throws IOException {
+        System.out.println("RenderPatches263: 26.3 render backend patches (P3)");
         PatchRegistry.run("RenderPatches263.patchGlBackendLibrary",
                 () -> patchGlBackendLibrary(jar, root, symbols));
         PatchRegistry.run("RenderPatches263.patchVulkanBackend",
