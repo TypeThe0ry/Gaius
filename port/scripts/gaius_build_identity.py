@@ -257,6 +257,9 @@ def _overlay_inputs(root: Path, profile: dict) -> list[tuple[str, Path]]:
         overlays / f"client-named-{version}-gaius.jar",
         overlays / f"teavm-classlib-{teavm_version}-gaius.jar",
         overlays / f"teavm-core-{teavm_version}-gaius.jar",
+        # build-overlays.sh writes BRINGUP only for bring-up builds, so the
+        # identity of overlays built without skipped patches is unchanged.
+        overlays / "BRINGUP",
     ]
     metadata_path = metadata_candidates[0]
     if metadata_path.is_file():

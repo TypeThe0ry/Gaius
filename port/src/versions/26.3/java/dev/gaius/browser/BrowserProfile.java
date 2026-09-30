@@ -1,11 +1,7 @@
 package dev.gaius.browser;
 
-import com.mojang.authlib.GameProfile;
-import com.mojang.authlib.services.ProfileResult;
-import java.util.Optional;
 import java.util.UUID;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.User;
 import org.teavm.jso.JSBody;
 
 /**
@@ -68,11 +64,13 @@ public final class BrowserProfile {
         if (result == null || !result.startsWith("ok:")) {
             return result == null || result.isEmpty() ? "Could not save the profile" : result;
         }
-        String uuidHex = result.substring(3);
         if (!isOnline()) {
-            UUID uuid = uuidFromHex(uuidHex);
-            User user = new User(name, uuid, "0", Optional.empty(), Optional.empty());
-            minecraft.gaius$replaceIdentity(user, new ProfileResult(new GameProfile(uuid, name)));
+            // Minecraft 26.3: the patched Minecraft still declares
+            // gaius$replaceIdentity(User, com.mojang.authlib.yggdrasil.ProfileResult), a type that
+            // authlib 10 no longer has.  Work package P7a takes the bridge descriptor from
+            // ModernSymbols (D7) and builds a services ProfileResult here; until then an offline
+            // identity change fails loudly instead of linking against the missing type.
+            throw new UnsupportedOperationException("P7a");
         }
         return null;
     }

@@ -66,7 +66,7 @@ function readBringupList(id) {
     const line = rawLine.replace(/#.*$/, "").trim();
     if (!line) return;
     const fields = line.split("|").map((field) => field.trim());
-    if (fields.length !== 3 || !/^[A-Za-z0-9_$.:@-]+$/.test(fields[0])
+    if (fields.length !== 3 || !/^[A-Za-z0-9_$][A-Za-z0-9_$.:@-]*$/.test(fields[0])
         || !/^P[1-9][a-z]?$/.test(fields[1]) || !fields[2]) {
       usage(`port/tools/bringup/${id}.txt:${index + 1} must be "<patchId> | <owner> | <reason>"`);
     }

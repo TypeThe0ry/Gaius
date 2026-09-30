@@ -116,8 +116,29 @@ gaius_bringup_active() {
   [[ "${GAIUS_BRINGUP:-}" == "1" ]] && gaius_bringup_profile_allowed
 }
 
+# Release builds never use bring-up mode.  Fails when GAIUS_BRINGUP is set to
+# anything but 0, or when OVERLAY_DIRECTORY (optional) carries the BRINGUP
+# marker that build-overlays.sh writes before a bring-up build and removes only
+# after a complete build outside bring-up mode.
+gaius_refuse_bringup_release() {
+  local overlay_directory="${1:-}"
+  if [[ -n "${GAIUS_BRINGUP:-}" && "${GAIUS_BRINGUP}" != "0" ]]; then
+    echo "Refusing to build a release in bring-up mode (GAIUS_BRINGUP=${GAIUS_BRINGUP})" >&2
+    echo "Unset GAIUS_BRINGUP; release profiles must build without skipped patches" >&2
+    return 1
+  fi
+  if [[ -n "$overlay_directory" && -e "$overlay_directory/BRINGUP" ]]; then
+    echo "Refusing to build a release from bring-up overlays: $overlay_directory/BRINGUP exists" >&2
+    echo "Rebuild the overlays without GAIUS_BRINGUP=1 (port/scripts/build-overlays.sh)" >&2
+    return 1
+  fi
+  return 0
+}
+
 # Prints the patch ids of the profile's bring-up list, one per line.  Fails
 # on malformed lines so a typo cannot silently widen or narrow the list.
+# A patch id matches ^[A-Za-z0-9_$][A-Za-z0-9_$.:@-]*$; PatchRegistry.java,
+# check-version-profile.mjs and check-build-log-skips.mjs use the same rule.
 gaius_bringup_ids() {
   local root="$1"
   local list
@@ -132,7 +153,7 @@ gaius_bringup_ids() {
       if (line ~ /^[ \t]*$/) next
       fields = split(line, part, "|")
       for (i = 1; i <= fields; i++) gsub(/^[ \t]+|[ \t]+$/, "", part[i])
-      if (fields != 3 || part[1] !~ /^[A-Za-z0-9_$.:@-]+$/ \
+      if (fields != 3 || part[1] !~ /^[A-Za-z0-9_$][A-Za-z0-9_$.:@-]*$/ \
           || part[2] !~ /^P[1-9][a-z]?$/ || part[3] == "") {
         printf "%s:%d: expected \"<patchId> | <owner P1..P9> | <reason>\"\n", list, NR > "/dev/stderr"
         bad = 1
@@ -148,6 +169,46 @@ gaius_bringup_ids() {
     }
     END { exit bad }
   '
+}
+
+# Prints the entries of a version excludes.txt, one relative path per line:
+# port/src/versions/<profile>/excludes.txt,
+# port/overrides/client/src/versions/<profile>/excludes.txt or
+# port/overrides/libraries/<name>/src/versions/<artifact-version>/excludes.txt.
+# Each entry is a path relative to SHARED_ROOT (the matching src/main/java).
+# '#' starts a comment, CR line ends and surrounding whitespace are ignored,
+# and an entry that does not name an existing file under SHARED_ROOT fails, so
+# a typo or a stale entry cannot be ignored silently.  Prints nothing when
+# FILE does not exist.
+gaius_version_excludes() {
+  local file="$1"
+  local shared_root="$2"
+  local entry
+  local line=0
+  if [[ ! -f "$file" ]]; then
+    return 0
+  fi
+  while IFS= read -r entry || [[ -n "$entry" ]]; do
+    line=$((line + 1))
+    entry="${entry%$'\r'}"
+    entry="${entry%%#*}"
+    entry="${entry#"${entry%%[![:space:]]*}"}"
+    entry="${entry%"${entry##*[![:space:]]}"}"
+    if [[ -z "$entry" ]]; then
+      continue
+    fi
+    case "$entry" in
+      /*|..|../*|*/..|*/../*)
+        echo "Invalid entry in $file:$line: $entry (expected a path relative to $shared_root)" >&2
+        return 1
+        ;;
+    esac
+    if [[ ! -f "$shared_root/$entry" ]]; then
+      echo "Stale entry in $file:$line: $shared_root/$entry does not exist" >&2
+      return 1
+    fi
+    printf '%s\n' "$entry"
+  done <"$file"
 }
 
 # Like gaius_library_path, but prints nothing and succeeds when the profile's

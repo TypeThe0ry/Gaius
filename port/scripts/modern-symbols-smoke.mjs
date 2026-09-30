@@ -50,6 +50,9 @@ import java.util.Enumeration;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import java.util.zip.ZipOutputStream;
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassVisitor;
+import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.Opcodes;
 
 public final class ModernSymbolsSmokeDriver {
@@ -157,6 +160,46 @@ public final class ModernSymbolsSmokeDriver {
             check(message.contains("both org/lwjgl/glfw and org/lwjgl/sdl"), message);
         }
         System.out.println("MIXED_REJECTED");
+
+        // A renderpearl jar in which one of the eight class-to-interface types is a class.
+        check(ModernSymbols.CLASS_TO_INTERFACE_KEYS.size() == 8, "eight class-to-interface keys");
+        for (String key : ModernSymbols.CLASS_TO_INTERFACE_KEYS) {
+            check(s263.isInterface(key) && !s262.isInterface(key), "interface kind of " + key);
+        }
+        String pearlDevice = "com/mojang/renderpearl/api/device/GpuDevice.class";
+        Path classDevice = work.resolve("class-device.jar");
+        try (ZipFile source = new ZipFile(args[1]);
+                ZipOutputStream out = new ZipOutputStream(java.nio.file.Files.newOutputStream(classDevice))) {
+            for (Enumeration<? extends ZipEntry> it = source.entries(); it.hasMoreElements(); ) {
+                ZipEntry entry = it.nextElement();
+                out.putNextEntry(new ZipEntry(entry.getName()));
+                try (InputStream in = source.getInputStream(entry)) {
+                    if (!entry.getName().equals(pearlDevice)) {
+                        in.transferTo(out);
+                    } else {
+                        ClassWriter writer = new ClassWriter(0);
+                        new ClassReader(in).accept(new ClassVisitor(Opcodes.ASM9, writer) {
+                            @Override
+                            public void visit(int version, int access, String name, String signature,
+                                    String superName, String[] interfaces) {
+                                super.visit(version, access & ~Opcodes.ACC_INTERFACE, name, signature,
+                                        superName, interfaces);
+                            }
+                        }, 0);
+                        out.write(writer.toByteArray());
+                    }
+                }
+                out.closeEntry();
+            }
+        }
+        try {
+            ModernSymbols.probe(classDevice.toString());
+            throw new AssertionError("renderpearl jar with a class GpuDevice was accepted");
+        } catch (IllegalStateException expected) {
+            check(expected.getMessage().contains("renderpearl class com/mojang/renderpearl/api/device/GpuDevice"
+                    + " (for com/mojang/blaze3d/systems/GpuDevice) is not an interface"), expected.getMessage());
+        }
+        System.out.println("CLASS_INTERFACE_MIX_REJECTED");
 
         // A 26.3 client with an authlib 9 jar is a mixed state as well.
         String authlib9 = s262.authlibJar;
@@ -324,7 +367,32 @@ try {
   assert.equal(driver.status, 0, `API driver failed:\n${driver.stdout}\n${driver.stderr}`);
   assert.match(driver.stdout, /^API_OK$/m);
   assert.match(driver.stdout, /^MIXED_REJECTED$/m);
+  assert.match(driver.stdout, /^CLASS_INTERFACE_MIX_REJECTED$/m);
   assert.match(driver.stdout, /^AUTHLIB_MISMATCH_REJECTED$/m);
+
+  // Older blaze3d generations probe as they are: 1.21.11 already declared CommandEncoder,
+  // GpuDevice and RenderPass as interfaces, so the class-to-interface assertion applies only to
+  // renderpearl jars.  Optional: needs port/work/1.21.11.
+  const jar1211 = join(repositoryRoot, "port/work/1.21.11/client-named.jar");
+  if (existsSync(jar1211)) {
+    const result = runJava(["dev.gaius.tools.ModernSymbols", jar1211]);
+    assert.equal(result.status, 0, `1.21.11 probe failed:\n${result.stderr}`);
+    const p1211 = JSON.parse(result.stdout);
+    assert.equal(p1211.renderApi, "BLAZE3D");
+    assert.deepEqual(Object.keys(p1211.renderTypes).filter((key) => p1211.renderTypes[key].interface)
+      .filter((key) => [
+        "com/mojang/blaze3d/buffers/GpuBuffer", "com/mojang/blaze3d/systems/CommandEncoder",
+        "com/mojang/blaze3d/systems/GpuDevice", "com/mojang/blaze3d/systems/GpuSurface",
+        "com/mojang/blaze3d/systems/RenderPass", "com/mojang/blaze3d/textures/GpuSampler",
+        "com/mojang/blaze3d/textures/GpuTexture", "com/mojang/blaze3d/textures/GpuTextureView",
+      ].includes(key)).sort(), [
+      "com/mojang/blaze3d/systems/CommandEncoder",
+      "com/mojang/blaze3d/systems/GpuDevice",
+      "com/mojang/blaze3d/systems/RenderPass",
+    ]);
+  } else {
+    console.log("modern-symbols-smoke: port/work/1.21.11 is absent; 1.21.11 probe skipped");
+  }
   console.log("modern-symbols-smoke: OK (26.2 blaze3d/yggdrasil/GLFW, 26.3 "
     + "renderpearl/services/SDL, 119 render keys, 8 class->interface, mixed jars rejected)");
 } finally {

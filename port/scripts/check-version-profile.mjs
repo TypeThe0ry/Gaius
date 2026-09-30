@@ -249,7 +249,7 @@ function parseBringupList(text, path) {
             fail(`${where} must be "<patchId> | <owner> | <reason>"`);
         }
         const [patchId, owner, reason] = fields;
-        if (!/^[A-Za-z0-9_$.:@-]+$/u.test(patchId)) {
+        if (!/^[A-Za-z0-9_$][A-Za-z0-9_$.:@-]*$/u.test(patchId)) {
             fail(`${where} has an invalid patch id ${JSON.stringify(patchId)}`);
         }
         if (!/^P[1-9][a-z]?$/u.test(owner)) {

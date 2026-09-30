@@ -53,7 +53,8 @@ import org.objectweb.asm.tree.FieldNode;
  * <h2>Self-consistency</h2>
  * {@link #probe} throws {@link IllegalStateException} on any mixed state: both render API
  * packages, a moved or removed 26.2 render class still present next to renderpearl, a renderpearl
- * name missing from a renderpearl jar, {@code UncheckedAutoCloseable} without renderpearl,
+ * name missing from a renderpearl jar, one of the {@link #CLASS_TO_INTERFACE_KEYS} types that is
+ * not an interface in a renderpearl jar, {@code UncheckedAutoCloseable} without renderpearl,
  * references to both GLFW and SDL (or SDLEventHandler without SDL references), key codes that do
  * not match the input backend, references to both authlib packages, an authlib jar of the other
  * flavour, BufferBuilder fields typed with the other render package, or semantic ids that are not
@@ -473,8 +474,9 @@ public final class ModernSymbols {
     /** One-line summary for patcher logs. */
     public String summary() {
         return "renderApi=" + renderApi + " uncheckedAutoCloseable=" + uncheckedAutoCloseable
-                + " authlib=" + authlib + " input=" + inputBackend
-                + " vertexSemantics=" + vertexSemantics;
+                + " authlib=" + authlib + " authlibJar="
+                + (authlibJar == null ? "-" : Path.of(authlibJar).getFileName())
+                + " input=" + inputBackend + " vertexSemantics=" + vertexSemantics;
     }
 
     /** The probe as a JSON object (used by port/scripts/modern-symbols-smoke.mjs). */
@@ -588,6 +590,20 @@ public final class ModernSymbols {
         Map<String, Boolean> interfaces = new HashMap<>();
         for (String name : present.values()) {
             interfaces.put(name, (access(zip, name) & Opcodes.ACC_INTERFACE) != 0);
+        }
+        // The eight class-to-interface render types: renderpearl declares all of them as
+        // interfaces, so a class there is a mixed jar whose invokeOpcode answers would not match
+        // the 26.3 shape the modern patches are written for. blaze3d generations differ (1.21.11
+        // declares CommandEncoder, GpuDevice and RenderPass as interfaces, 26.2 none of the
+        // eight), so the blaze3d flags are read as they are.
+        if (renderApi == RenderApi.RENDERPEARL) {
+            for (String key : CLASS_TO_INTERFACE_KEYS) {
+                String name = present.get(key);
+                if (name != null && !interfaces.get(name)) {
+                    problems.add("renderpearl class " + name + " (for " + key
+                            + ") is not an interface");
+                }
+            }
         }
 
         // Input backend and InputConstants.

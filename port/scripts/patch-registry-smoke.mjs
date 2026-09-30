@@ -3,7 +3,9 @@
 // Unit-style smoke for the 26.3 bring-up infrastructure (migration plan contracts C2/C3):
 // - dev.gaius.tools.PatchRegistry: bring-up list parsing, bring-up activation rules (only with
 //   GAIUS_BRINGUP=1 and never for 26.2 or 1.21.11), BRINGUP_SKIP/PATCH_DROPPED/PATCH_SUMMARY
-//   lines, dropped-target assertions, pending-list output on failure, profile conflicts;
+//   lines, dropped-target assertions, pending-list output on failure, profile conflicts, and the
+//   patch id rule it shares with version-profile.sh, check-build-log-skips.mjs and
+//   check-version-profile.mjs;
 // - dev.gaius.tools.Minecraft263BrowserPatcher: refuses 26.2/1.21.11 and non-renderpearl jars,
 //   runs the six m263 domain shells in order on the 26.3 jar;
 // - MinecraftClientPatcher/Minecraft262BrowserPatcher main(): every patch call is wrapped in
@@ -256,6 +258,8 @@ try {
     ["Demo.x | P3 | reason | extra field", "expected '<patchId> | <owner> | <reason>'"],
     ["Demo.x | P3 | one\nDemo.x | P5 | two", "duplicate bring-up entry Demo.x"],
     ["bad id | P3 | reason", "invalid patch id"],
+    ["a/b | P3 | slash", "invalid patch id"],
+    [":x | P3 | leading colon", "invalid patch id"],
   ]) {
     const bad = join(work, "bad.txt");
     await writeFile(bad, text + "\n");
@@ -263,6 +267,51 @@ try {
     assert.match(result.out, new RegExp("^PARSE_ERROR .*" + message.replace(/[|()<>]/g, "\\$&")),
       `bad list not rejected: ${JSON.stringify(text)}`);
   }
+
+  // The four readers of a bring-up list accept exactly the same patch ids:
+  // ^[A-Za-z0-9_$][A-Za-z0-9_$.:@-]*$ (PatchRegistry, version-profile.sh,
+  // check-build-log-skips.mjs, check-version-profile.mjs).
+  const canonicalId = "[A-Za-z0-9_$][A-Za-z0-9_$.:@-]*";
+  for (const [file, text] of [
+    ["port/tools/src/main/java/dev/gaius/tools/PatchRegistry.java", `Pattern.compile("${canonicalId}")`],
+    ["port/scripts/version-profile.sh", `part[1] !~ /^${canonicalId}$/`],
+    ["port/scripts/check-build-log-skips.mjs", `!/^${canonicalId}$/.test(fields[0])`],
+    ["port/scripts/check-version-profile.mjs", `!/^${canonicalId}$/u.test(patchId)`],
+  ]) {
+    assert.ok((await readFile(join(repositoryRoot, file), "utf8")).includes(text),
+      `${file} must use the patch id rule ${canonicalId}`);
+  }
+  const idRoot = join(work, "id-root");
+  await mkdir(join(idRoot, "port/tools/bringup"), {recursive: true});
+  await mkdir(join(idRoot, "port/scripts"), {recursive: true});
+  await copyFile(join(repositoryRoot, "port/scripts/check-build-log-skips.mjs"),
+    join(idRoot, "port/scripts/check-build-log-skips.mjs"));
+  const emptyLog = join(work, "empty.log");
+  await writeFile(emptyLog, "");
+  const idList = join(idRoot, "port/tools/bringup/26.9.txt");
+  const bash = process.platform === "win32" ? "bash.exe" : "bash";
+  for (const [id, valid] of [
+    ["Demo.patchA", true], ["step:LwjglMemoryPatcher@lwjgl", true], ["$x", true], ["_x", true],
+    ["9x-y", true], [":x", false], [".x", false], ["@x", false], ["-x", false], ["a/b", false],
+    ["Demo/patch", false],
+  ]) {
+    await writeFile(idList, `${id} | P3 | boundary case\n`);
+    result = driver(["parse", idList]);
+    assert.equal(/^ENTRY /m.test(result.out), valid, `PatchRegistry on ${id}: ${result.out}`);
+    const shell = spawnSync(bash, ["-c",
+      'source "$1/port/scripts/version-profile.sh"; GAIUS_MINECRAFT_VERSION=26.9; gaius_bringup_ids "$2"',
+      "_", repositoryRoot.replaceAll("\\", "/"), idRoot.replaceAll("\\", "/")], {encoding: "utf8"});
+    assert.equal(shell.status === 0 && shell.stdout.trim() === id, valid,
+      `version-profile.sh on ${id}: ${shell.status} ${shell.stdout} ${shell.stderr}`);
+    const lint = spawnSync(process.execPath, [join(idRoot, "port/scripts/check-build-log-skips.mjs"),
+      "--profile", "26.9", emptyLog], {encoding: "utf8"});
+    assert.equal(lint.status, valid ? 0 : 2,
+      `check-build-log-skips.mjs on ${id}: ${lint.stdout} ${lint.stderr}`);
+  }
+  // Ids outside the rule are refused at run time as well.
+  result = driver(["skip", "26.3", "a/b"], {GAIUS_BRINGUP_LIST: list});
+  assert.notEqual(result.status, 0);
+  assert.match(result.err, /Invalid patch id: a\/b/);
 
   // Bring-up is active only with the flag and an eligible profile.
   result = driver(["skip", "26.3", "Demo.patchA", "Demo.patchB"],

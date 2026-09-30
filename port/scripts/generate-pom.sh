@@ -60,11 +60,21 @@ fi
 # Profile source sets: port/src/main/java is shared by every profile.
 # port/src/versions/<profile>/java replaces shared files with the same relative
 # path (and may add new ones), and port/src/versions/<profile>/excludes.txt
-# lists shared relative paths the profile does not compile.  The merged tree is
-# staged under $build_root/sources and becomes the only Maven source directory.
-# A profile without a version directory (26.2) stages an exact copy of
-# port/src/main/java.  Copies keep their modification times so Maven's stale
-# source detection behaves as it did on the shared tree.
+# lists shared relative paths the profile does not compile (format: see
+# gaius_version_excludes in version-profile.sh).  The merged tree is staged
+# under $build_root/sources and becomes the only Maven source directory.  A
+# profile without a version directory (26.2) stages an exact copy of
+# port/src/main/java.
+#
+# The staged tree is replaced only when its content changes, and a replaced
+# tree is copied without preserving modification times.  A staged path can
+# switch between a version file and the shared file (for example when a
+# version override is deleted), and the file it switches to is usually older
+# than the classes compiled from the previous tree; with its original time
+# Maven's stale-source check would keep those classes.  Every file of a
+# replaced tree is newer than any class compiled before, so Maven recompiles
+# (it rebuilds the whole module on any change anyway), while an unchanged tree
+# keeps its times and an unchanged rebuild stays up to date.
 shared_source_root="$root/port/src/main/java"
 version_source_root="$root/port/src/versions/$version/java"
 version_source_excludes="$root/port/src/versions/$version/excludes.txt"
@@ -72,29 +82,20 @@ staged_source_directory="$build_root/sources"
 
 stage_profile_sources() {
   local staging="$staged_source_directory.staging.$$"
+  local excludes
   local excluded
+  excludes="$(gaius_version_excludes "$version_source_excludes" "$shared_source_root")" \
+    || exit 1
   rm -rf "$staging"
   mkdir -p "$staging"
-  cp -pR "$shared_source_root/." "$staging/"
-  if [[ -f "$version_source_excludes" ]]; then
-    while IFS= read -r excluded || [[ -n "$excluded" ]]; do
-      excluded="${excluded%$'\r'}"
-      excluded="${excluded%%#*}"
-      excluded="${excluded#"${excluded%%[![:space:]]*}"}"
-      excluded="${excluded%"${excluded##*[![:space:]]}"}"
-      if [[ -z "$excluded" ]]; then
-        continue
-      fi
-      if [[ ! -f "$shared_source_root/$excluded" ]]; then
-        echo "Stale entry in $version_source_excludes: port/src/main/java/$excluded does not exist" >&2
-        rm -rf "$staging"
-        exit 1
-      fi
+  cp -R "$shared_source_root/." "$staging/"
+  while IFS= read -r excluded; do
+    if [[ -n "$excluded" ]]; then
       rm -f "$staging/$excluded"
-    done <"$version_source_excludes"
-  fi
+    fi
+  done <<<"$excludes"
   if [[ -d "$version_source_root" ]]; then
-    cp -pR "$version_source_root/." "$staging/"
+    cp -R "$version_source_root/." "$staging/"
   fi
   if [[ -d "$staged_source_directory" ]] \
       && diff -rq "$staged_source_directory" "$staging" >/dev/null 2>&1; then

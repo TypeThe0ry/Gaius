@@ -7,12 +7,9 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$root/port/scripts/version-profile.sh"
 # Bring-up builds skip the patches listed in port/tools/bringup/<profile>.txt
-# and must never produce release artifacts.
-if [[ -n "${GAIUS_BRINGUP:-}" && "${GAIUS_BRINGUP}" != "0" ]]; then
-  echo "Refusing to build a release in bring-up mode (GAIUS_BRINGUP=${GAIUS_BRINGUP})" >&2
-  echo "Unset GAIUS_BRINGUP; release profiles must build without skipped patches" >&2
-  exit 1
-fi
+# and must never produce release artifacts.  build-teavm-release.sh repeats
+# this check and also refuses overlays that a bring-up build left behind.
+gaius_refuse_bringup_release || exit 1
 profile_arg="${1:-}"
 if [[ -z "$profile_arg" ]]; then
   echo "usage: $0 <version-id|versions/<version>.json>" >&2

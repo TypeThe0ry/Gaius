@@ -399,7 +399,7 @@ jobs:
 
   version-profiles:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -452,12 +452,47 @@ jobs:
             exit 1
           fi
           grep -Fq 'still has unfinished patches' "$log"
-          if GAIUS_BRINGUP=1 ./port/scripts/build-version-release.sh 26.3 \
+          # Run through bash: the refusal must not depend on the file mode.
+          if GAIUS_BRINGUP=1 bash port/scripts/build-version-release.sh 26.3 \
               >"$RUNNER_TEMP/release-refused.log" 2>&1; then
             echo "build-version-release.sh accepted GAIUS_BRINGUP=1" >&2
             exit 1
           fi
           grep -Fq 'Refusing to build a release in bring-up mode' "$RUNNER_TEMP/release-refused.log"
+
+      - name: 26.3 bring-up overlays, G4 and port/src compile
+        env:
+          GAIUS_VERSION_PROFILE_PATH: versions/26.3.json
+          # build-teavm.sh leaves these out of the client TeaVM class path.
+          GAIUS_EXCLUDED_LIBRARY_PREFIXES: org/apache/logging/log4j/log4j-core/,org/apache/logging/log4j/log4j-slf4j2-impl/
+        run: |
+          set -euo pipefail
+          export GAIUS_JAVA_HOME="$JAVA_HOME"
+          log="$RUNNER_TEMP/build-overlays-26.3-bringup.log"
+          GAIUS_BRINGUP=1 ./port/scripts/build-overlays.sh >"$log" 2>&1 \
+            || { tail -n 80 "$log"; exit 1; }
+          test -s port/work/overlays/26.3/BRINGUP
+          # G4: every skip is listed in port/tools/bringup/26.3.txt, and every
+          # listed patch is still skipped.  26.3 ships lwjgl-sdl instead of
+          # lwjgl-glfw and has no lwjgl-tinyfd.
+          node port/scripts/check-build-log-skips.mjs --profile 26.3 --strict-list \
+            --allow '^Skipping LWJGL module lwjgl-(glfw|tinyfd): not in the Minecraft 26\.3 libraries$' \
+            "$log"
+          # The 26.3 source set (port/src/versions/26.3) compiles against the
+          # bring-up overlays (javac only; the TeaVM goal is bound to package).
+          ./port/scripts/generate-pom.sh
+          ./port/mvnw --batch-mode --no-transfer-progress \
+            --file port/target/26.3/generated-pom.xml compile
+          # A release refuses the bring-up overlays even when it would reuse
+          # them without rebuilding.
+          if GAIUS_SKIP_OVERLAY_BUILD=true GAIUS_SKIP_CLIENT_BUILD=true \
+              bash port/scripts/build-version-release.sh 26.3 \
+              >"$RUNNER_TEMP/release-refused-overlays.log" 2>&1; then
+            echo "build-version-release.sh accepted bring-up overlays" >&2
+            exit 1
+          fi
+          grep -Fq 'Refusing to build a release from bring-up overlays' \
+            "$RUNNER_TEMP/release-refused-overlays.log"
 
   overlay-gates-26-2:
     # G1 (26.2 overlay bytes), G3 (link gaps) and G4 (silent skips) for every
@@ -550,9 +585,13 @@ jobs:
       - name: G4 - no unregistered skips in the 26.2 build log
         run: |
           # The WeirdScaledSampler hash-cache target was already absent in
-          # 26.2 when this gate was introduced (owner P6).
+          # 26.2 when this gate was introduced (owner P6).  26.2 has no
+          # lwjgl-sdl, and its shaderc/spvc jars stay unmodified (they are
+          # reached only from the unused Vulkan backend).
           node port/scripts/check-build-log-skips.mjs --profile 26.2 \
             --allow '^Skipping removed worldgen hash cache target net/minecraft/world/level/levelgen/DensityFunctions\$WeirdScaledSampler$' \
+            --allow '^Skipping LWJGL module lwjgl-sdl: not in the Minecraft 26\.2 libraries$' \
+            --allow '^Skipping LWJGL module lwjgl-(shaderc|spvc): the Minecraft 26\.2 client has no renderpearl OpenGL path$' \
             "$RUNNER_TEMP/head-build-overlays-26.2.log"
 
       - name: G3 - no new 26.2 link gaps; staged sources equal port/src/main/java

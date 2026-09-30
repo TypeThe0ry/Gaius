@@ -192,23 +192,74 @@ done
 # limits a command line to 32767 characters, and a profile classpath plus a
 # source list of absolute paths in a deep worktree exceeds that (26.3 does).
 # Git Bash only rewrites /c/... paths that appear on a command line, so the
-# file gets native paths.  The caller deletes FILE after javac.
+# file gets native paths.  cygpath writes a path of 260 or more characters in
+# the Win32 long-path form //?/C:/..., which javac rejects as a file name;
+# Java opens long C:/... paths itself, so that prefix is removed.
 javac_source_argfile() {
   local argfile="$1"
   shift
+  local native_argfile
   if command -v cygpath >/dev/null 2>&1; then
-    printf '%s\n' "$@" | cygpath -m -f - | sed -e 's/^/"/' -e 's/$/"/' >"$argfile"
-    printf '@%s\n' "$(cygpath -m "$argfile")"
+    printf '%s\n' "$@" | cygpath -m -f - | strip_long_path_prefix \
+      | sed -e 's/^/"/' -e 's/$/"/' >"$argfile" || return 1
+    native_argfile="$(cygpath -m "$argfile" | strip_long_path_prefix)" || return 1
+    printf '@%s\n' "$native_argfile"
   else
-    printf '"%s"\n' "$@" >"$argfile"
+    printf '"%s"\n' "$@" >"$argfile" || return 1
     printf '@%s\n' "$argfile"
   fi
+}
+
+strip_long_path_prefix() {
+  sed -e 's#^//[?]/UNC/#//#' -e 's#^//[?]/##'
+}
+
+# javac_with_source_argfile FILE JAVAC_OPTION... -- SOURCE...: runs javac with
+# the sources passed through the @argfile FILE (see javac_source_argfile) and
+# deletes FILE afterwards, also when javac fails.
+javac_with_source_argfile() {
+  local argfile="$1"
+  shift
+  local options=()
+  while [[ "$#" -gt 0 && "$1" != "--" ]]; do
+    options+=("$1")
+    shift
+  done
+  if [[ "$#" -eq 0 ]]; then
+    echo "javac_with_source_argfile: missing -- before the source list" >&2
+    return 1
+  fi
+  shift
+  local argument
+  local status=0
+  argument="$(javac_source_argfile "$argfile" "$@")" || status=$?
+  if [[ "$status" -eq 0 ]]; then
+    javac "${options[@]}" "$argument" || status=$?
+  fi
+  rm -f "$argfile"
+  return "$status"
 }
 
 upstream="$maven_repository/org/teavm/teavm-classlib/$teavm_version/teavm-classlib-$teavm_version.jar"
 output="$overlay_work/teavm-classlib-$teavm_version-gaius.jar"
 
 mkdir -p "$classes" "$overlay_work"
+
+# Bring-up marker: a bring-up build writes $overlay_work/BRINGUP (the profile
+# and the listed patch ids) before it changes any overlay, and only a
+# complete build outside bring-up mode removes it.  build-teavm-release.sh
+# refuses overlays that carry the marker, and gaius_build_identity.py hashes
+# it into the overlay identity.
+bringup_marker="$overlay_work/BRINGUP"
+if [[ "$bringup_active" == true ]]; then
+  {
+    echo "# Overlays built in bring-up mode for Minecraft $version: the patches listed in"
+    echo "# ${bringup_list#"$root/"} may have been skipped.  Release builds refuse these"
+    echo "# overlays; rebuild them without GAIUS_BRINGUP=1."
+    printf '%s\n' "$bringup_ids"
+  } >"$bringup_marker"
+fi
+
 find "$classes" -type f -delete
 
 sources=()
@@ -245,10 +296,9 @@ done
 classpath="$classpath${java_classpath_separator}${java_maven_repository}/com/jcraft/jzlib/1.1.3/jzlib-1.1.3.jar"
 classpath="$classpath${java_classpath_separator}$java_work_classpath"
 
-classlib_sources_argfile="$overlay_work/classlib-sources.argfile"
-classlib_sources_argument="$(javac_source_argfile "$classlib_sources_argfile" "${sources[@]}")"
-javac --release 21 -proc:none -classpath "$classpath" -d "$classes" "$classlib_sources_argument"
-rm -f "$classlib_sources_argfile"
+javac_with_source_argfile "$overlay_work/classlib-sources.argfile" \
+  --release 21 -proc:none -classpath "$classpath" -d "$classes" \
+  -- "${sources[@]}"
 cp "$upstream" "$output"
 jar --update --file "$output" -C "$classes" .
 
@@ -258,7 +308,9 @@ jar --update --file "$output" -C "$classes" .
 # {java,excludes.txt} applies only to that library version (the Maven version
 # directory of the library jar, for example 3.4.3 or 10.0.77).  A version file
 # replaces the shared file with the same relative path; excludes.txt lists
-# shared relative paths to leave out.
+# shared relative paths to leave out (format: gaius_version_excludes in
+# version-profile.sh).  Without any Java source the vanilla jar is copied
+# unmodified, so the output jar always exists.
 build_library_overlay() {
   local name="$1"
   local source_jar="$2"
@@ -284,6 +336,8 @@ build_library_overlay() {
   done
   local library_sources=()
   local relative_source
+  local library_excludes
+  library_excludes="$(gaius_version_excludes "$version_excludes" "$source_dir")"
 
   if [[ -d "$source_dir" ]]; then
     while IFS= read -r source; do
@@ -291,8 +345,8 @@ build_library_overlay() {
       if [[ -f "$version_source_dir/$relative_source" ]]; then
         continue
       fi
-      if [[ -f "$version_excludes" ]] && grep -Fqx \
-          -e "$relative_source" -e "$relative_source"$'\r' "$version_excludes"; then
+      if [[ -n "$library_excludes" ]] \
+          && grep -Fqx -e "$relative_source" <<<"$library_excludes"; then
         continue
       fi
       library_sources+=("$source")
@@ -306,18 +360,17 @@ build_library_overlay() {
   fi
 
   if [[ "${#library_sources[@]}" -eq 0 ]]; then
-    echo "Skipping $name overlay: no Java sources at $source_dir"
+    echo "Skipping $name overlay: no Java sources at $source_dir; using the unmodified base"
+    mkdir -p "$(dirname "$output_jar")"
+    cp "$source_jar" "$output_jar"
     return 0
   fi
 
   mkdir -p "$output_classes" "$(dirname "$output_jar")"
   find "$output_classes" -type f -delete
-  local library_sources_argfile="$output_classes.argfile"
-  local library_sources_argument
-  library_sources_argument="$(javac_source_argfile "$library_sources_argfile" "${library_sources[@]}")"
-  javac --release 21 -proc:none -classpath "$compile_classpath" \
-    -d "$output_classes" "$library_sources_argument"
-  rm -f "$library_sources_argfile"
+  javac_with_source_argfile "$output_classes.argfile" \
+    --release 21 -proc:none -classpath "$compile_classpath" -d "$output_classes" \
+    -- "${library_sources[@]}"
   cp "$source_jar" "$output_jar"
   jar --update --file "$output_jar" -C "$output_classes" .
 }
@@ -398,10 +451,19 @@ javac --release 21 -proc:none \
 # They receive the profile id and the bring-up state both as system
 # properties and through the exported GAIUS_MINECRAFT_VERSION, GAIUS_BRINGUP
 # (1 only when bring-up mode is active) and GAIUS_BRINGUP_LIST variables.
+# gaius.authlib.jar names the profile's vanilla authlib jar, so a
+# ModernSymbols probe of the patched client jar (which has no classpath.txt
+# next to it) cross-checks the authlib flavour against that jar.
+authlib_path="$(gaius_library_path "com.mojang:authlib")"
+java_authlib_jar="$work/libraries/$authlib_path"
+if command -v cygpath >/dev/null 2>&1; then
+  java_authlib_jar="$(cygpath -m "$java_authlib_jar")"
+fi
 patch_registry_properties=(
   "-Dgaius.profile=$version"
   "-Dgaius.bringup=$bringup_active"
   "-Dgaius.bringup.list=$GAIUS_BRINGUP_LIST"
+  "-Dgaius.authlib.jar=$java_authlib_jar"
 )
 
 tool_class_exists() {
@@ -463,7 +525,6 @@ jar --update \
   --file "$text2speech_output" \
   -C "$text2speech_patch_classes" com/mojang/text2speech/Narrator.class
 
-authlib_path="$(gaius_library_path "com.mojang:authlib")"
 authlib_output="$overlay_work/libraries/$authlib_path"
 authlib_patch_classes="$overlay_work/library-patches/authlib"
 mkdir -p "$(dirname "$authlib_output")" "$authlib_patch_classes"
@@ -787,49 +848,83 @@ run_lwjgl_steps \
   callbacks
 
 # The remaining LWJGL modules, one row each:
-#   <module>|<overlay>|<condition>|<steps>
-# overlay yes compiles port/overrides/libraries/<module> into the jar first;
-# no copies the vanilla jar.  A module missing from the profile's version.json
-# is not part of that profile (glfw and tinyfd exist only in 26.2, sdl only in
-# 26.3).  Condition renderpearl additionally requires the renderpearl render
-# API in the client jar: its OpenGL path compiles shaders through shaderc and
-# spvc, while 26.2 reaches them only from the unused Vulkan backend and keeps
-# those two jars unmodified.
+#   <module>|<presence>|<overlay>|<condition>|<steps>
+# presence required: every profile ships the module, and a profile whose
+# version.json lacks it fails the build.  optional: the module is not part of
+# every profile (glfw and tinyfd are absent from 26.3, sdl exists only in
+# 26.3, vma/vulkan/shaderc/spvc are absent from 1.21.11); an absent optional
+# module prints "Skipping LWJGL module <module>: ...", which
+# check-build-log-skips.mjs (G4) reports unless the caller allows exactly
+# the modules that profile is expected to lack.
+# overlay yes compiles port/overrides/libraries/<module> into the jar first
+# (the vanilla jar is copied while that directory has no sources for the
+# module's version); no copies the vanilla jar.
+# condition renderpearl additionally requires the renderpearl render API in
+# the client jar: its OpenGL path compiles shaders through shaderc and spvc,
+# while 26.2 reaches them only from the unused Vulkan backend and keeps those
+# two jars unmodified (they are skipped, like an absent module).
 lwjgl_module_steps=(
-  "lwjgl-glfw|yes|always|patcher:LwjglGlfwBrowserPatcher patcher:LwjglUnsafeAccessPatcher callbacks"
-  "lwjgl-sdl|yes|always|patcher:LwjglSdlBrowserPatcher patcher:LwjglUnsafeAccessPatcher patcher:NativeMethodFallbackPatcher callbacks"
-  "lwjgl-opengl|yes|always|patcher:LwjglOpenGLBrowserPatcher patcher:LwjglUnsafeAccessPatcher patcher:NativeMethodFallbackPatcher callbacks"
-  "lwjgl-freetype|no|always|patcher:LwjglUnsafeAccessPatcher patcher:NativeMethodFallbackPatcher callbacks"
-  "lwjgl-stb|yes|always|patcher:LwjglUnsafeAccessPatcher patcher:NativeMethodFallbackPatcher callbacks"
-  "lwjgl-openal|yes|always|patcher:LwjglOpenALBrowserPatcher patcher:NativeMethodFallbackPatcher callbacks"
-  "lwjgl-tinyfd|no|always|patcher:NativeMethodFallbackPatcher callbacks"
+  "lwjgl-glfw|optional|yes|always|patcher:LwjglGlfwBrowserPatcher patcher:LwjglUnsafeAccessPatcher callbacks"
+  "lwjgl-sdl|optional|yes|always|patcher:LwjglSdlBrowserPatcher patcher:LwjglUnsafeAccessPatcher patcher:NativeMethodFallbackPatcher callbacks"
+  "lwjgl-opengl|required|yes|always|patcher:LwjglOpenGLBrowserPatcher patcher:LwjglUnsafeAccessPatcher patcher:NativeMethodFallbackPatcher callbacks"
+  "lwjgl-freetype|required|no|always|patcher:LwjglUnsafeAccessPatcher patcher:NativeMethodFallbackPatcher callbacks"
+  "lwjgl-stb|required|yes|always|patcher:LwjglUnsafeAccessPatcher patcher:NativeMethodFallbackPatcher callbacks"
+  "lwjgl-openal|required|yes|always|patcher:LwjglOpenALBrowserPatcher patcher:NativeMethodFallbackPatcher callbacks"
+  "lwjgl-tinyfd|optional|no|always|patcher:NativeMethodFallbackPatcher callbacks"
   # Minecraft ships a Vulkan fallback. The browser runtime always selects
   # WebGL/OpenGL, but these modules must still be link-safe if TeaVM sees a
   # stale reference while analysing the desktop backend.
-  "lwjgl-vma|no|always|patcher:LwjglUnsafeAccessPatcher unsupported:LwjglUnsupportedNativePatcher callbacks"
-  "lwjgl-vulkan|no|always|patcher:LwjglUnsafeAccessPatcher unsupported:LwjglUnsupportedNativePatcher callbacks"
-  "lwjgl-shaderc|no|renderpearl|patcher:LwjglShadercBrowserPatcher callbacks"
-  "lwjgl-spvc|no|renderpearl|patcher:LwjglSpvcBrowserPatcher callbacks"
+  "lwjgl-vma|optional|no|always|patcher:LwjglUnsafeAccessPatcher unsupported:LwjglUnsupportedNativePatcher callbacks"
+  "lwjgl-vulkan|optional|no|always|patcher:LwjglUnsafeAccessPatcher unsupported:LwjglUnsupportedNativePatcher callbacks"
+  # D5/D9: the browser shims BrowserShaderc/BrowserSpvc live in
+  # port/overrides/libraries/{lwjgl-shaderc,lwjgl-spvc} (work package P4).
+  "lwjgl-shaderc|optional|yes|renderpearl|patcher:LwjglShadercBrowserPatcher callbacks"
+  "lwjgl-spvc|optional|yes|renderpearl|patcher:LwjglSpvcBrowserPatcher callbacks"
 )
 
+# The renderpearl condition reads the vanilla client jar.  unzip exits 11 when
+# no entry matches; any other failure stops the build instead of being taken
+# for "no renderpearl".
 client_uses_renderpearl=false
 if command -v unzip >/dev/null 2>&1; then
-  if unzip -Z1 "$work/client-named.jar" 'com/mojang/renderpearl/*' >/dev/null 2>&1; then
+  renderpearl_status=0
+  unzip -Z1 "$work/client-named.jar" 'com/mojang/renderpearl/*' >/dev/null 2>&1 \
+    || renderpearl_status="$?"
+  case "$renderpearl_status" in
+    0) client_uses_renderpearl=true ;;
+    11) ;;
+    *)
+      echo "Cannot list $work/client-named.jar (unzip exit $renderpearl_status)" >&2
+      exit 1
+      ;;
+  esac
+else
+  client_listing="$(jar --list --file "$work/client-named.jar")"
+  if grep -q '^com/mojang/renderpearl/' <<<"$client_listing"; then
     client_uses_renderpearl=true
   fi
-elif jar --list --file "$work/client-named.jar" | grep -c '^com/mojang/renderpearl/' >/dev/null; then
-  client_uses_renderpearl=true
 fi
+echo "LWJGL module steps for Minecraft $version (renderpearl client: $client_uses_renderpearl)"
 
 for module_row in "${lwjgl_module_steps[@]}"; do
-  IFS='|' read -r lwjgl_module module_overlay module_condition module_steps <<<"$module_row"
+  IFS='|' read -r lwjgl_module module_presence module_overlay module_condition module_steps \
+    <<<"$module_row"
+  if [[ ! "$module_presence" =~ ^(required|optional)$ || ! "$module_overlay" =~ ^(yes|no)$ \
+      || ! "$module_condition" =~ ^(always|renderpearl)$ || -z "$module_steps" ]]; then
+    echo "Invalid LWJGL step table row: $module_row" >&2
+    exit 1
+  fi
   module_path="$(gaius_library_path_optional "org.lwjgl:$lwjgl_module")"
   if [[ -z "$module_path" ]]; then
-    echo "LWJGL module $lwjgl_module is not part of Minecraft $version"
+    if [[ "$module_presence" == required ]]; then
+      echo "Required LWJGL module $lwjgl_module is missing from $GAIUS_VERSION_METADATA" >&2
+      exit 1
+    fi
+    echo "Skipping LWJGL module $lwjgl_module: not in the Minecraft $version libraries"
     continue
   fi
   if [[ "$module_condition" == renderpearl && "$client_uses_renderpearl" != true ]]; then
-    echo "LWJGL module $lwjgl_module stays unmodified: the $version client has no renderpearl OpenGL path"
+    echo "Skipping LWJGL module $lwjgl_module: the Minecraft $version client has no renderpearl OpenGL path"
     continue
   fi
   module_output="$overlay_work/libraries/$module_path"
@@ -889,13 +984,14 @@ zip -q -d "$client_output" \
 mkdir -p "$client_override_classes"
 find "$client_override_classes" -type f -delete
 client_override_sources=()
+client_excludes="$(gaius_version_excludes "$client_version_excludes" "$client_override_root")"
 while IFS= read -r source; do
   relative_source="${source#"$client_override_root/"}"
   if [[ -f "$client_version_override_root/$relative_source" ]]; then
     continue
   fi
-  if [[ -f "$client_version_excludes" ]] \
-      && grep -Fqx "$relative_source" "$client_version_excludes"; then
+  if [[ -n "$client_excludes" ]] \
+      && grep -Fqx -e "$relative_source" <<<"$client_excludes"; then
     continue
   fi
   client_override_sources+=("$source")
@@ -910,13 +1006,11 @@ client_override_classpath="$java_client_jar${java_classpath_separator}$java_work
 for artifact in teavm-interop teavm-jso teavm-jso-apis; do
   client_override_classpath="$client_override_classpath${java_classpath_separator}${java_maven_repository}/org/teavm/$artifact/$teavm_version/$artifact-$teavm_version.jar"
 done
-client_override_sources_argfile="$overlay_work/client-override-sources.argfile"
-client_override_sources_argument="$(javac_source_argfile "$client_override_sources_argfile" "${client_override_sources[@]}")"
-javac --release 21 -proc:none \
+javac_with_source_argfile "$overlay_work/client-override-sources.argfile" \
+  --release 21 -proc:none \
   -classpath "$client_override_classpath" \
   -d "$client_override_classes" \
-  "$client_override_sources_argument"
-rm -f "$client_override_sources_argfile"
+  -- "${client_override_sources[@]}"
 jar --update --file "$client_output" -C "$client_override_classes" .
 
 # One client patcher step: run dev.gaius.tools.<Class> with the PatchRegistry
@@ -992,5 +1086,7 @@ done
 
 if [[ "$bringup_active" == true ]]; then
   echo "BRINGUP_STEPS skipped=$bringup_skipped"
+else
+  rm -f "$bringup_marker"
 fi
 echo "$output"

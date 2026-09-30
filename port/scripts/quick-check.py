@@ -529,6 +529,8 @@ def build_identity_overlay_inputs(root: Path, profile: dict) -> list[tuple[str, 
         overlays / f"client-named-{version}-gaius.jar",
         overlays / f"teavm-classlib-{teavm_version}-gaius.jar",
         overlays / f"teavm-core-{teavm_version}-gaius.jar",
+        # Mirrors gaius_build_identity.py: the bring-up marker of build-overlays.sh.
+        overlays / "BRINGUP",
     ]
     metadata_path = metadata_candidates[0]
     if metadata_path.is_file():

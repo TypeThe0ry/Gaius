@@ -65,7 +65,8 @@ import org.objectweb.asm.tree.MethodNode;
  * comment that runs to the end of the line, and blank lines are ignored; a reason can therefore
  * contain neither {@code #} nor {@code |}. These are the rules of the other readers of the same
  * file ({@code version-profile.sh}, {@code check-version-profile.mjs} and
- * {@code check-build-log-skips.mjs}). {@code patchId} is the id used in logs, e.g.
+ * {@code check-build-log-skips.mjs}). {@code patchId} matches
+ * {@code [A-Za-z0-9_$][A-Za-z0-9_$.:@-]*} (no {@code /}) and is the id used in logs, e.g.
  * {@code MinecraftClientPatcher.patchGlx}, {@code Minecraft262BrowserPatcher.patchVulkanBackend},
  * {@code step:LwjglSdlBrowserPatcher} or {@code step:LwjglMemoryPatcher@lwjgl} (shell steps,
  * read by build-overlays.sh). The owner is a work package {@code P1}..{@code P9}, optionally
@@ -99,7 +100,12 @@ public final class PatchRegistry {
     public static final String VERBOSE_PROPERTY = "gaius.patch.verbose";
     public static final String VERBOSE_ENV = "GAIUS_PATCH_VERBOSE";
 
-    private static final Pattern PATCH_ID = Pattern.compile("[A-Za-z0-9_$][A-Za-z0-9_$.:@/-]*");
+    /**
+     * A patch id: {@code ^[A-Za-z0-9_$][A-Za-z0-9_$.:@-]*$}, the rule of every reader of a
+     * bring-up list ({@code version-profile.sh}, {@code check-version-profile.mjs},
+     * {@code check-build-log-skips.mjs}).
+     */
+    private static final Pattern PATCH_ID = Pattern.compile("[A-Za-z0-9_$][A-Za-z0-9_$.:@-]*");
     private static final Pattern OWNER = Pattern.compile("P[1-9][a-z]?");
 
     private static String configuredProfile;

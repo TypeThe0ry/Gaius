@@ -20,7 +20,9 @@ port/target/
 apps/server-plugin/target/
 
 # Keep browser platform-overlay source visible while ignoring any other local
-# copied library trees.
+# copied library trees.  A library overlay directory needs its own pair of
+# lines here before it gets sources; every overlay=yes module of the LWJGL
+# step table in build-overlays.sh is listed.
 !port/overrides/libraries/
 port/overrides/libraries/*
 !port/overrides/libraries/lwjgl/
@@ -31,6 +33,12 @@ port/overrides/libraries/*
 !port/overrides/libraries/lwjgl-opengl/**
 !port/overrides/libraries/lwjgl-glfw/
 !port/overrides/libraries/lwjgl-glfw/**
+!port/overrides/libraries/lwjgl-sdl/
+!port/overrides/libraries/lwjgl-sdl/**
+!port/overrides/libraries/lwjgl-shaderc/
+!port/overrides/libraries/lwjgl-shaderc/**
+!port/overrides/libraries/lwjgl-spvc/
+!port/overrides/libraries/lwjgl-spvc/**
 !port/overrides/libraries/lwjgl-stb/
 !port/overrides/libraries/lwjgl-stb/**
 !port/overrides/libraries/netty-transport/
