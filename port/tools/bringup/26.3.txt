@@ -25,8 +25,6 @@
 
 # --- build-overlays.sh library steps (PLAN.md 6.3) ---
 step:LwjglSdlBrowserPatcher | P2 | SDL3 browser shim patcher does not exist yet (D3)
-step:LwjglShadercBrowserPatcher | P4 | shaderc browser shim patcher does not exist yet (D5)
-step:LwjglSpvcBrowserPatcher | P4 | spvc browser shim patcher does not exist yet (D5)
 step:MinecraftChunkDrawTelemetryPatcher | P5 | chunk-draw telemetry patcher rejects profile 26.3 (unsupported profile)
 
 # --- MinecraftClientPatcher (PLAN.md 6.1 #1-#47) ---

@@ -741,6 +741,90 @@ def apply_gaius_client_shell(text: str) -> str:
     return text
 
 
+SHADER_TOOLCHAIN_MARKER = "data-gaius-shader-toolchain"
+SHADER_TOOLCHAIN_FILES = (
+    "gaius-shader-toolchain.js",
+    "gaius-shaderc.js",
+    "gaius-shaderc.wasm",
+    "gaius-spvc.js",
+    "gaius-spvc.wasm",
+)
+
+
+def classes_need_shader_toolchain(classes_js: Path) -> bool:
+    """Whether the TeaVM client calls the browser shader toolchain (PLAN D5).
+
+    BrowserShadercWasm and BrowserSpvcWasm reach it through
+    window.__gaiusShaderToolchain, and TeaVM copies JSBody scripts verbatim, so
+    the name is in classes.js exactly when the profile's client compiles
+    shaders with shaderc/spvc (26.3 and later; never 26.2).
+    """
+    try:
+        with classes_js.open("rb") as stream:
+            tail = b""
+            for chunk in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+                if b"__gaiusShaderToolchain" in tail + chunk:
+                    return True
+                tail = chunk[-64:]
+    except OSError:
+        return False
+    return False
+
+
+def patch_shader_toolchain_loader(text: str, classes_js: Path, index: Path, profile_id: str) -> str:
+    """Loads the WebAssembly shader toolchain before main(args) (contract C7).
+
+    Only for a client that needs it: the page loads gaius-shader-toolchain.js
+    (port/wasm/shader-toolchain/loader), which sets the Promise
+    window.__gaiusShaderToolchainReady, and the boot sequence awaits it right
+    before it calls the TeaVM main.  The five toolchain files must sit next to
+    index.html (build-wasm-shader-toolchain.sh --dist); a missing file is a
+    warning, or an error when GAIUS_SHADER_TOOLCHAIN_STRICT=1 (releases).
+    The profile id names the loader's IndexedDB result cache.
+    """
+    if not classes_need_shader_toolchain(classes_js):
+        return text
+    directory = index.parent
+    missing = [name for name in SHADER_TOOLCHAIN_FILES if not (directory / name).is_file()]
+    if missing:
+        message = (
+            "the client needs the WebAssembly shader toolchain but "
+            + ", ".join(missing)
+            + f" {'is' if len(missing) == 1 else 'are'} missing from {directory} "
+            "(run port/scripts/build-wasm-shader-toolchain.sh --dist <dist>)"
+        )
+        if os.environ.get("GAIUS_SHADER_TOOLCHAIN_STRICT", "").strip() == "1":
+            raise RuntimeError(message)
+        print(f"warning: {message}", file=sys.stderr)
+    token = content_token(*(directory / name for name in SHADER_TOOLCHAIN_FILES))
+    loader = (
+        f'  <script {SHADER_TOOLCHAIN_MARKER} data-profile="{profile_id}" '
+        f'src="gaius-shader-toolchain.js?v={token}"></script>\n'
+    )
+    text = re.sub(
+        rf'  <script {SHADER_TOOLCHAIN_MARKER}[^>]*></script>\n',
+        "",
+        text,
+    )
+    text = replace_required(text, "</head>\n", loader + "</head>\n", "shader toolchain loader")
+    if "window.__gaiusShaderToolchainReady" not in text.split("</head>", 1)[1]:
+        text = replace_required(
+            text,
+            "      bootTimings.vanillaAssetsReady = performance.now();\n"
+            "      if (typeof main !== \"function\") {\n",
+            "      bootTimings.vanillaAssetsReady = performance.now();\n"
+            "      if (!window.__gaiusShaderToolchainReady) {\n"
+            "        throw new Error(\"gaius-shader-toolchain.js did not load; this client cannot compile shaders without it\");\n"
+            "      }\n"
+            "      setBootProgress(Math.max(bootProgressValue, 64), \"Starting the shader compiler...\");\n"
+            "      await window.__gaiusShaderToolchainReady;\n"
+            "      bootTimings.shaderToolchainReady = performance.now();\n"
+            "      if (typeof main !== \"function\") {\n",
+            "shader toolchain boot gate",
+        )
+    return text
+
+
 def validate_storage_profile(profile: dict) -> dict:
     profile_id = profile.get("id")
     if not isinstance(profile_id, str) or not profile_id:
@@ -3016,6 +3100,7 @@ def patch_index(
     text = patch_storage_persistence(text, selected_profile)
     text = apply_gaius_client_shell(text)
     text = patch_release_version(text)
+    text = patch_shader_toolchain_loader(text, classes_js, index, minecraft_version)
 
     if text != original:
         index.write_text(text, encoding="utf-8")
