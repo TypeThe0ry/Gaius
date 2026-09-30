@@ -30,7 +30,7 @@ import {mkdtemp, mkdir, writeFile, rm, appendFile} from "node:fs/promises";
 import {createServer as netServer} from "node:net";
 import {createServer as httpServer} from "node:http";
 import {tmpdir} from "node:os";
-import {resolve, join, extname, normalize, dirname} from "node:path";
+import {resolve, join, extname, normalize, dirname, relative, isAbsolute} from "node:path";
 import {fileURLToPath} from "node:url";
 import {analyzeTerrainPng} from "../../tools/terrain-visual-metrics.mjs";
 
@@ -97,7 +97,10 @@ if (!pageUrl) {
   staticServer = httpServer((req, res) => {
     const u = new URL(req.url, "http://127.0.0.1");
     let p = normalize(join(root, decodeURIComponent(u.pathname)));
-    if (!p.startsWith(root)) { res.writeHead(403); return res.end(); }
+    // Path-relative containment: a plain prefix test would also accept a sibling
+    // directory whose name merely starts with the root (e.g. <root>-other).
+    const contained = relative(root, p);
+    if (contained.startsWith("..") || isAbsolute(contained)) { res.writeHead(403); return res.end(); }
     if (u.pathname === "/") p = join(root, "index.html");
     if (!existsSync(p) || statSync(p).isDirectory()) { res.writeHead(404); log("http404", u.pathname); return res.end(); }
     const rel = p.slice(root.length + 1).split(String.fromCharCode(92)).join("/");
