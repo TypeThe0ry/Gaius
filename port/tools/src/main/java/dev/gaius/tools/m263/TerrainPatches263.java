@@ -168,16 +168,34 @@ public final class TerrainPatches263 {
                 calls(render, "net/minecraft/client/renderer/SectionOcclusionGraph", "update"), 2);
         expect(problems, "LevelRenderer.render visible-section refresh clear",
                 calls(render, LEVEL_RENDERER, "clearVisibleSections"), 1);
-        // The chunk-draw telemetry step (MinecraftChunkDrawTelemetryPatcher) validates and
-        // writes its own registration/commit pair; only MinecraftClientPatcher's hooks here.
+        // MinecraftClientPatcher's hooks, and the registration/draw/commit hooks of the
+        // chunk-draw telemetry step (MinecraftChunkDrawTelemetryPatcher, 26.3 profile shape).
         MethodNode extractGroups = find(renderer, "extractSectionDrawGroups",
                 "(ZLjava/util/List;Ljava/util/Map;)I");
         expect(problems, "extractSectionDrawGroups shared layer array",
                 calls(extractGroups, "dev/gaius/browser/BrowserChunkSectionLayers", "values"), 1);
+        expect(problems, "extractSectionDrawGroups chunk-draw telemetry beginPrepare",
+                calls(extractGroups, DRAW_TELEMETRY, "beginPrepare"), 1);
+        expect(problems, "extractSectionDrawGroups chunk-draw telemetry registerSection",
+                calls(extractGroups, DRAW_TELEMETRY, "registerSection"), 1);
         MethodNode prepare = find(renderer, "prepareChunkRenders",
                 "(Lorg/joml/Matrix4fc;Z)Lnet/minecraft/client/renderer/chunk/ChunkSectionsToRender;");
         expect(problems, "prepareChunkRenders prepare statistics",
                 calls(prepare, DRAW_TELEMETRY, "recordPrepareStats"), 1);
+        MethodNode uniforms = find(renderer, "lambda$prepareChunkRenders$2",
+                "(I[Lcom/mojang/renderpearl/api/buffers/GpuBufferSlice;"
+                        + "Lcom/mojang/renderpearl/api/commands/RenderPass$UniformUploader;)V");
+        expect(problems, "prepareChunkRenders uniform lambda armUniformIndex",
+                calls(uniforms, DRAW_TELEMETRY, "armUniformIndex"), 1);
+        ClassNode frontendPass = readCurrent(jar, root, "com/mojang/renderpearl/frontend/FrontendRenderPass");
+        MethodNode drawMultiple = find(frontendPass, "drawMultipleIndexed",
+                "(Ljava/util/Collection;Lcom/mojang/renderpearl/api/buffers/GpuBuffer;"
+                        + "Lcom/mojang/renderpearl/api/pipeline/IndexType;Ljava/util/Collection;"
+                        + "Ljava/lang/Object;)V");
+        expect(problems, "FrontendRenderPass.drawMultipleIndexed chunk-draw telemetry beginDraw",
+                calls(drawMultiple, DRAW_TELEMETRY, "beginDraw"), 1);
+        expect(problems, "FrontendRenderPass.drawMultipleIndexed chunk-draw telemetry commit",
+                calls(drawMultiple, DRAW_TELEMETRY, "commitSuccessfulDraw"), 1);
 
         ClassNode minecraft = readCurrent(jar, root, MINECRAFT);
         MethodNode renderFrame = find(minecraft, "renderFrame", "(Z)V");
@@ -227,7 +245,8 @@ public final class TerrainPatches263 {
                     + String.join("\n  ", problems));
         }
         System.out.println("Verified 26.3 terrain chain: requeue/consumption, occlusion refresh, "
-                + "prepare statistics, frame targeting, pool recycle order, heap cleanup");
+                + "prepare statistics, chunk-draw telemetry, frame targeting, pool recycle order, "
+                + "heap cleanup");
     }
 
     private static void expect(List<String> problems, String what, int actual, int expected) {
