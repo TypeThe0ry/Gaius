@@ -442,6 +442,185 @@ def verify_signatures(dist: Path, profile: dict, classes_hash: str) -> list[dict
     return verified
 
 
+# A client on the renderpearl render API (26.3+) compiles its shaders with the
+# WebAssembly shader toolchain (PLAN D5, contract C7).  postprocess-index-html.py
+# tags such a page with one loader <script> in <head>, and build-teavm.sh
+# publishes the loader, the four emscripten modules and the toolchain manifest
+# (sizes, sha256, pinned sources) next to index.html.  The portable page embeds
+# all of them: the modules become Blob URLs published through
+# window.__gaiusShaderToolchainUrls, and the loader runs inline after the
+# portable bootstrap, so it finds the URLs once the embedded assets are ready.
+# A 26.2 page has no loader tag and its portable output is unchanged.
+SHADER_TOOLCHAIN_LOADER = "gaius-shader-toolchain.js"
+SHADER_TOOLCHAIN_MANIFEST = "gaius-shader-toolchain.json"
+SHADER_TOOLCHAIN_MANIFEST_SCHEMA = 1
+SHADER_TOOLCHAIN_IDENTITY_ROLE = "shader-toolchain"
+SHADER_TOOLCHAIN_MODULES = (
+    ("shadercJs", "gaius-shaderc.js", "text/javascript"),
+    ("shadercWasm", "gaius-shaderc.wasm", "application/wasm"),
+    ("spvcJs", "gaius-spvc.js", "text/javascript"),
+    ("spvcWasm", "gaius-spvc.wasm", "application/wasm"),
+)
+# The token order of postprocess-index-html.py (SHADER_TOOLCHAIN_FILES).
+SHADER_TOOLCHAIN_FILES = (SHADER_TOOLCHAIN_LOADER,) + tuple(
+    name for _key, name, _mime in SHADER_TOOLCHAIN_MODULES
+)
+SHADER_TOOLCHAIN_CLASSES_MARKER = b"__gaiusShaderToolchain"
+SHADER_TOOLCHAIN_TAG = re.compile(
+    r'  <script data-gaius-shader-toolchain data-profile="([^"]*)" '
+    r'src="gaius-shader-toolchain\.js\?v=([0-9a-f]+)"></script>\n'
+)
+
+
+def shader_toolchain_token(directory: Path) -> str:
+    """The loader URL token of postprocess-index-html.py (content_token)."""
+    digest = hashlib.sha256()
+    for name in SHADER_TOOLCHAIN_FILES:
+        with (directory / name).open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()[:16]
+
+
+def gzip_bytes(value: bytes) -> bytes:
+    """Deterministic gzip for assets the dist does not ship compressed."""
+    return gzip.compress(value, compresslevel=9, mtime=0)
+
+
+def load_shader_toolchain(
+    dist: Path,
+    index: str,
+    profile: dict,
+    classes_js: Path,
+    root: Path,
+    common_identity: dict[str, object],
+) -> dict[str, object] | None:
+    """Verify and load the shader toolchain of a page that carries its loader tag.
+
+    Returns None for a page without the tag (26.2).  A client whose classes.js
+    calls the toolchain but whose page does not load it can never start, so
+    that combination is an error rather than a plain portable build.
+    """
+    tags = SHADER_TOOLCHAIN_TAG.findall(index)
+    if not tags:
+        if contains_marker(classes_js, SHADER_TOOLCHAIN_CLASSES_MARKER):
+            raise RuntimeError(
+                "portable classes.js calls the WebAssembly shader toolchain but "
+                "index.html has no gaius-shader-toolchain.js loader"
+            )
+        return None
+    if len(tags) != 1:
+        raise RuntimeError("portable index.html has more than one shader toolchain loader")
+    tag_profile, token = tags[0]
+    if tag_profile != profile["id"]:
+        raise RuntimeError(
+            f"portable shader toolchain loader profile {tag_profile!r} does not match "
+            f"active profile {profile['id']!r}"
+        )
+    for name in SHADER_TOOLCHAIN_FILES + (SHADER_TOOLCHAIN_MANIFEST,):
+        require_nonempty(dist / name)
+    if shader_toolchain_token(dist) != token:
+        raise RuntimeError(
+            "portable shader toolchain files do not match the loader token of index.html"
+        )
+    manifest_path = dist / SHADER_TOOLCHAIN_MANIFEST
+    try:
+        toolchain_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"shader toolchain manifest is invalid: {manifest_path}") from exc
+    if (
+        not isinstance(toolchain_manifest, dict)
+        or toolchain_manifest.get("schema") != SHADER_TOOLCHAIN_MANIFEST_SCHEMA
+        or not isinstance(toolchain_manifest.get("files"), dict)
+        or not isinstance(toolchain_manifest.get("sources"), dict)
+        or not isinstance(toolchain_manifest.get("emscripten"), str)
+    ):
+        raise RuntimeError(f"shader toolchain manifest is incompatible: {manifest_path}")
+    recorded_files = toolchain_manifest["files"]
+    file_records: dict[str, dict[str, object]] = {}
+    for name in SHADER_TOOLCHAIN_FILES:
+        path = dist / name
+        record = recorded_files.get(name)
+        actual = {"bytes": path.stat().st_size, "sha256": sha256_file(path)}
+        if record != actual:
+            raise RuntimeError(
+                f"shader toolchain file {name} does not match {SHADER_TOOLCHAIN_MANIFEST}"
+            )
+        file_records[name] = actual
+    loader = (dist / SHADER_TOOLCHAIN_LOADER).read_text(encoding="utf-8")
+    lowered = loader.lower()
+    if "</script" in lowered or "<!--" in lowered:
+        raise RuntimeError("shader toolchain loader cannot be inlined into the portable page")
+    modules: dict[str, dict[str, object]] = {}
+    payload: dict[str, list[str]] = {}
+    for key, name, _mime in SHADER_TOOLCHAIN_MODULES:
+        raw = (dist / name).read_bytes()
+        compressed = gzip_bytes(raw)
+        encoded = base64.b64encode(compressed).decode("ascii")
+        payload[key] = [
+            encoded[index:index + CHUNK_SIZE] for index in range(0, len(encoded), CHUNK_SIZE)
+        ]
+        modules[name] = {
+            "rawSha256": file_records[name]["sha256"],
+            "rawBytes": file_records[name]["bytes"],
+            "gzipSha256": sha256_bytes(compressed),
+            "gzipBytes": len(compressed),
+        }
+    return {
+        "version": token,
+        "loader": loader,
+        "payload": payload,
+        "manifest": {
+            "version": token,
+            "loader": {"name": SHADER_TOOLCHAIN_LOADER, **file_records[SHADER_TOOLCHAIN_LOADER]},
+            "manifest": {
+                "name": SHADER_TOOLCHAIN_MANIFEST,
+                "sha256": sha256_file(manifest_path),
+                "bytes": manifest_path.stat().st_size,
+                "emscripten": toolchain_manifest["emscripten"],
+                "sources": toolchain_manifest["sources"],
+            },
+            "modules": modules,
+            "build": verified_component_identity(
+                root, manifest_path, SHADER_TOOLCHAIN_IDENTITY_ROLE, common_identity
+            ),
+        },
+    }
+
+
+def shader_toolchain_bootstrap(toolchain: dict[str, object] | None, profile: dict) -> tuple[str, str, str]:
+    """The three portable-bootstrap fragments of the toolchain (empty without one)."""
+    if toolchain is None:
+        return "", "", ""
+    version = json.dumps(toolchain["version"], ensure_ascii=True)
+    profile_attribute = json.dumps(profile["id"], ensure_ascii=True)
+    globals_fragment = (
+        "      // The inline shader toolchain loader below (contract C7) reads the\n"
+        "      // Blob URLs from this object once __gaiusPortableAssetsReady resolves.\n"
+        f"      window.__gaiusShaderToolchainUrls = {{version: {version}}};\n"
+    )
+    ready_lines = ["        const shaderToolchainBlobs = await Promise.all([\n"]
+    for key, _name, mime in SHADER_TOOLCHAIN_MODULES:
+        ready_lines.append(
+            f"          decompress(embedded.shaderToolchain.{key}, {json.dumps(mime)}),\n"
+        )
+    ready_lines.append("        ]);\n")
+    ready_lines.append("        Object.assign(window.__gaiusShaderToolchainUrls, {\n")
+    for index, (key, _name, _mime) in enumerate(SHADER_TOOLCHAIN_MODULES):
+        ready_lines.append(
+            f"          {key}: URL.createObjectURL(shaderToolchainBlobs[{index}]),\n"
+        )
+    ready_lines.append("        });\n")
+    loader_fragment = (
+        f"  <script data-gaius-shader-toolchain data-profile={profile_attribute} "
+        f"data-gaius-portable-inline=\"1\">\n"
+        f"{toolchain['loader']}"
+        + ("" if str(toolchain["loader"]).endswith("\n") else "\n")
+        + "  </script>\n"
+    )
+    return globals_fragment, "".join(ready_lines), loader_fragment
+
+
 def manifest_path_for(output: Path) -> Path:
     if output.name == "Gaius.html":
         return output.with_name(MANIFEST_NAME)
@@ -598,6 +777,9 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
         ],
     )
     signatures = verify_signatures(dist, profile, classes_hash)
+    shader_toolchain = load_shader_toolchain(
+        dist, index, profile, classes_js, root, common_identity
+    )
     classes = base64_chunks(classes_gzip)
     server = base64_chunks(server_gzip)
     wasm = base64_chunks(wasm_gzip)
@@ -661,6 +843,8 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
         },
         "signatures": signatures,
     }
+    if shader_toolchain is not None:
+        manifest["shaderToolchain"] = shader_toolchain["manifest"]
     manifest_source = json.dumps(
         manifest,
         ensure_ascii=True,
@@ -669,13 +853,21 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
     )
     manifest_text = f"{manifest_source}\n"
 
+    embedded_assets: dict[str, object] = {
+        "classes": classes, "server": server, "wasm": wasm, "vanilla": vanilla,
+    }
+    if shader_toolchain is not None:
+        embedded_assets["shaderToolchain"] = shader_toolchain["payload"]
     payload = json.dumps(
-        {"classes": classes, "server": server, "wasm": wasm, "vanilla": vanilla},
+        embedded_assets,
         ensure_ascii=True,
         separators=(",", ":"),
     )
     worker_source = json.dumps(worker, ensure_ascii=True)
     relay_nodes_source = json.dumps(relay_nodes, ensure_ascii=True, separators=(",", ":"))
+    toolchain_globals, toolchain_ready, toolchain_loader = shader_toolchain_bootstrap(
+        shader_toolchain, profile
+    )
     bootstrap = f'''  <script data-gaius-portable="1">
     (() => {{
       const portableManifest = {manifest_source};
@@ -717,7 +909,7 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
       window.__gaiusBridgeUrls = embeddedRelayNodes.concat(configuredRelayNodes);
       window.__gaiusPortableManifest = portableManifest;
       window.__gaiusPortableBuild = true;
-      const portableBridgeTrace = window.__gaiusPortableBridgeTrace ||
+{toolchain_globals}      const portableBridgeTrace = window.__gaiusPortableBridgeTrace ||
         (window.__gaiusPortableBridgeTrace = []);
       const portablePendingLocalPorts = window.__gaiusPortablePendingLocalPorts ||
         (window.__gaiusPortablePendingLocalPorts = new Map());
@@ -896,7 +1088,7 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
           [workerSource],
           {{type: "text/javascript"}},
         ));
-        const serverBlob = await compressedBlob(embedded.server);
+{toolchain_ready}        const serverBlob = await compressedBlob(embedded.server);
         window.__gaiusSingleplayerServerGzipUrl = URL.createObjectURL(
           serverBlob,
         );
@@ -907,7 +1099,14 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
     marker = "  <script>\n    if (typeof Error === \"function\")"
     if marker not in index:
         raise RuntimeError("portable launcher insertion point was not found")
-    portable = index.replace(marker, bootstrap + marker, 1)
+    if shader_toolchain is not None:
+        # The page's own loader tag would run before the portable bootstrap
+        # and fall back to sibling files; the inline copy after the bootstrap
+        # awaits the embedded Blob URLs instead.
+        index, removed = SHADER_TOOLCHAIN_TAG.subn("", index)
+        if removed != 1:
+            raise RuntimeError("portable shader toolchain loader tag was not replaced")
+    portable = index.replace(marker, bootstrap + toolchain_loader + marker, 1)
     manifest_path = manifest_path_for(output)
     if manifest_path == output:
         raise RuntimeError("portable manifest path collides with HTML output")

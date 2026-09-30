@@ -2,6 +2,36 @@
 
 All notable changes to Gaius are documented here.
 
+## [0.3.0] - unreleased
+
+### Release
+
+- Ship two browser clients: Minecraft Java `26.2` (protocol `776`) and
+  Minecraft Java `26.3` (protocol `777`, world version `5023`), each as a
+  portable `Gaius-<profile>.html` with its own manifest and checksum record.
+  Minecraft `1.21.11` stays retired. See `docs/release-v0.3.0.md`.
+- Deploy both clients to GitHub Pages: `pages.yml` downloads exactly
+  `Gaius-26.2.html` and `Gaius-26.3.html` from the release, verifies each
+  against its one `SHA256SUMS` record, and still refuses `Gaius-1.21.11.html`.
+  `tools/verify-github-pages-cdp.mjs` checks both live pages and binds each
+  to `GAIUS_PAGES_EXPECTED_SHA256_262` / `GAIUS_PAGES_EXPECTED_SHA256_263`.
+- Default `tools/build-and-publish-prerelease.ps1` to the `26.2` and `26.3`
+  profiles.
+
+### Added
+
+- The Minecraft 26.3 client: SDL3 window and input shim, renderpearl render
+  backend patches, LWJGL 3.4.3 memory backend, authlib 10, and the
+  WebAssembly shader toolchain (shaderc and SPIRV-Cross) that compiles the
+  client's shaders in the browser.
+- `build-portable-html.py` embeds the shader toolchain of a client that loads
+  it (the loader runs inline after the portable bootstrap and receives the
+  modules as Blob URLs through `window.__gaiusShaderToolchainUrls`), records
+  it in the portable manifest under `shaderToolchain`, and verifies the new
+  `shader-toolchain` build identity that `build-teavm-release.sh` writes on
+  `gaius-shader-toolchain.json`. A 26.2 page has no toolchain and its
+  portable output is unchanged byte for byte.
+
 ## [0.1.0] - 2026-09-05
 
 ### Release
