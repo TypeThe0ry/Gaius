@@ -103,6 +103,9 @@ public final class BrowserIntegratedServerMain {
             "enable-rcon=false",
             "enable-status=false",
             "enforce-secure-profile=false",
+            // Minecraft 26.3 turned the dedicated-server white-list on by default, which would
+            // reject the browser host and every LAN guest; 26.2 already defaults both to false.
+            "enforce-whitelist=false",
             "force-gamemode=false",
             "gamemode=survival",
             "generate-structures=true",
@@ -122,7 +125,8 @@ public final class BrowserIntegratedServerMain {
             "simulation-distance=" + simulationDistance,
             "spawn-protection=0",
             "sync-chunk-writes=false",
-            "view-distance=" + viewDistance) + "\n";
+            "view-distance=" + viewDistance,
+            "white-list=false") + "\n";
         String seed = workerSeed();
         if (seed != null && !seed.isEmpty() && seed.length() <= 128
                 && seed.indexOf('\n') < 0 && seed.indexOf('\r') < 0) {
@@ -1383,7 +1387,12 @@ public final class BrowserIntegratedServerMain {
                   storageSchema === 2 &&
                   storageDatabaseName === 'gaius-fs-v2-26.2' &&
                   storagePrefix === 'gaius.fs.v2:26.2:' &&
-                  storageOpfsDirectory === 'regions-v2-26.2');
+                  storageOpfsDirectory === 'regions-v2-26.2') ||
+                (profileId === '26.3' && worldVersion === 5023 &&
+                  storageSchema === 2 &&
+                  storageDatabaseName === 'gaius-fs-v2-26.3' &&
+                  storagePrefix === 'gaius.fs.v2:26.3:' &&
+                  storageOpfsDirectory === 'regions-v2-26.3');
               if (!storageMatchesProfile) {
                 Promise.resolve().then(() => {
                   if (typeof completeIndexedDbFallbackHydration === 'function') {

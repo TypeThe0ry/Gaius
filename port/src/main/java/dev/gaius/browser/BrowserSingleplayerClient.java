@@ -207,7 +207,11 @@ public final class BrowserSingleplayerClient {
                 (profile==='26.2' && world===4903 && schema===2
                 && database==='gaius-fs-v2-26.2'
                 && prefix==='gaius.fs.v2:26.2:'
-                && opfs==='regions-v2-26.2');
+                && opfs==='regions-v2-26.2') ||
+                (profile==='26.3' && world===5023 && schema===2
+                && database==='gaius-fs-v2-26.3'
+                && prefix==='gaius.fs.v2:26.3:'
+                && opfs==='regions-v2-26.3');
             } catch (e) {
               return false;
             }
@@ -383,7 +387,12 @@ public final class BrowserSingleplayerClient {
                   storageSchema === 2 &&
                   storageDatabaseName === 'gaius-fs-v2-26.2' &&
                   storagePrefix === 'gaius.fs.v2:26.2:' &&
-                  storageOpfsDirectory === 'regions-v2-26.2');
+                  storageOpfsDirectory === 'regions-v2-26.2') ||
+                (profileId === '26.3' && worldVersion === 5023 &&
+                  storageSchema === 2 &&
+                  storageDatabaseName === 'gaius-fs-v2-26.3' &&
+                  storagePrefix === 'gaius.fs.v2:26.3:' &&
+                  storageOpfsDirectory === 'regions-v2-26.3');
               if (!storageMatchesProfile) {
                 throw new Error('Singleplayer storage configuration does not match profile');
               }
@@ -1268,7 +1277,12 @@ public final class BrowserSingleplayerClient {
                     storageSchema === 2 &&
                     storageDatabaseName === 'gaius-fs-v2-26.2' &&
                     storagePrefix === 'gaius.fs.v2:26.2:' &&
-                    storageOpfsDirectory === 'regions-v2-26.2');
+                    storageOpfsDirectory === 'regions-v2-26.2') ||
+                  (profileId === '26.3' && worldVersion === 5023 &&
+                    storageSchema === 2 &&
+                    storageDatabaseName === 'gaius-fs-v2-26.3' &&
+                    storagePrefix === 'gaius.fs.v2:26.3:' &&
+                    storageOpfsDirectory === 'regions-v2-26.3');
                 if (!storageMatchesProfile) {
                   return Promise.reject(new Error(
                     'IndexedDB refresh storage configuration does not match profile'
