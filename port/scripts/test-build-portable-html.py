@@ -26,6 +26,23 @@ class BuildPortableHTMLTest(unittest.TestCase):
         self.assertIn("file:/// sibling paths", template)
         self.assertIn("if (window.__gaiusPortableBuild === true) await portableReady;", template)
 
+    def test_portable_start_transfers_a_copy_of_the_server_gzip_buffer(self) -> None:
+        # The gzip promise resolves to one ArrayBuffer for the page's lifetime;
+        # transferring it to the first Worker detaches it, so every start must
+        # transfer a fresh copy or re-entering a world without a reload fails.
+        script = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn(
+            "const transferBuffer = buffer instanceof ArrayBuffer ? buffer.slice(0) : buffer;",
+            script,
+        )
+        self.assertIn("serverScriptGzipData: transferBuffer,", script)
+        self.assertIn(
+            "if (transferBuffer instanceof ArrayBuffer) transferList.push(transferBuffer);",
+            script,
+        )
+        self.assertNotIn("transferList.push(buffer)", script)
+        self.assertNotIn("serverScriptGzipData: buffer,", script)
+
     def test_atomic_write_replaces_complete_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "Gaius.html"

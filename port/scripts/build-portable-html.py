@@ -1060,12 +1060,17 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
               }});
             }}
             window.__gaiusSingleplayerServerGzipDataPromise.then((buffer) => {{
+              // Transferring detaches the buffer, and the promise resolves to the
+              // same buffer for every integrated-server start of this page, so
+              // each start transfers its own copy (a second start in the same
+              // session otherwise fails with DataCloneError).
+              const transferBuffer = buffer instanceof ArrayBuffer ? buffer.slice(0) : buffer;
               const payload = Object.assign({{}}, message, {{
-                serverScriptGzipData: buffer,
+                serverScriptGzipData: transferBuffer,
                 serverScriptGzipUrl: null,
               }});
               const transferList = originalTransfer.slice();
-              if (buffer instanceof ArrayBuffer) transferList.push(buffer);
+              if (transferBuffer instanceof ArrayBuffer) transferList.push(transferBuffer);
               nativeWorkerPostMessage.call(worker, payload, transferList);
               tracePortableBridge("start-post-register", {{sessionId, launchGeneration, transferred: true}});
             }}, () => {{

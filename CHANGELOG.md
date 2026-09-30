@@ -32,6 +32,14 @@ All notable changes to Gaius are documented here.
   `gaius-shader-toolchain.json`. A 26.2 page has no toolchain and its
   portable output is unchanged byte for byte.
 
+### Fixed
+
+- Portable `Gaius-<profile>.html`: starting a second singleplayer world in the
+  same page (for example re-entering a world after Save and Quit without
+  reloading) no longer fails with "Singleplayer startup failed"; the page
+  transferred the already-detached embedded server buffer to the new Worker
+  (`DataCloneError`). Each start now transfers its own copy.
+
 ## [0.1.0] - 2026-09-05
 
 ### Release
