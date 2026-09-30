@@ -26,10 +26,12 @@ Gaius 是独立项目，与 Mojang Studios、Microsoft 和 Minecraft 没有隶�
 连接的服务器下载对应的 HTML：
 
 - [Minecraft 26.2 客户端](https://github.com/TypeThe0ry/Gaius/releases/latest/download/Gaius-26.2.html)
+- [Minecraft 26.3 客户端](https://github.com/TypeThe0ry/Gaius/releases/latest/download/Gaius-26.3.html)
 - [SHA256 校验文件](https://github.com/TypeThe0ry/Gaius/releases/latest/download/SHA256SUMS)
 - 可选 Paper 插件在同一个 Release 页面里。
 
-HTML 文件是可直接携带的单人客户端。下载后用新版 Chrome 或 Chromium 打开，点
+HTML 文件是可直接携带的单人客户端（`Gaius-26.2.html` 对应 Minecraft 26.2，
+`Gaius-26.3.html` 对应 Minecraft 26.3）。下载后用新版 Chrome 或 Chromium 打开，点
 **Singleplayer** 即可。首次启动会自动打开游戏内的 **编辑个人资料（Edit Profile）**
 界面，可以设置玩家名称并上传 64x64 的 PNG 皮肤；之后随时可以从标题界面右上角的
 **Edit Profile** 按钮再次打开，修改立即生效、无需刷新页面。浏览器启动器和 Worker
@@ -37,7 +39,8 @@ HTML 文件是可直接携带的单人客户端。下载后用新版 Chrome 或 
 
 ### 加入服务器
 
-1. 用 Chrome 或 Chromium 打开下载的 `Gaius-26.2.html`。
+1. 用 Chrome 或 Chromium 打开下载的 `Gaius-26.2.html` 或 `Gaius-26.3.html`（选择与
+   服务器 Minecraft 版本一致的那个）。
 2. 在 Minecraft 标题界面点 **Multiplayer（多人游戏）**。
 3. 点 **Add Server（添加服务器）** 或 **Direct Connection（直接连接）**，输入
    普通 Java 版服务器地址，例如 `example.net:25565`，然后点 **Join Server**。
@@ -57,7 +60,7 @@ profile 所需的 JDK。构建过程会把不同 profile 的 Maven 状态、over
 git lfs install
 git lfs pull
 
-for profile in 1.21.11 26.2; do
+for profile in 26.2 26.3; do
   export GAIUS_VERSION_PROFILE_PATH="versions/${profile}.json"
   ./port/scripts/fetch-version.sh
   ./port/scripts/remap-client.sh
@@ -72,7 +75,7 @@ done
 python3 port/scripts/serve-dist.py --host 127.0.0.1 --port 8781
 ```
 
-然后在 Chrome 打开 `/dist/26.2/` 或 `/dist/1.21.11/`。
+然后在 Chrome 打开 `/dist/26.2/` 或 `/dist/26.3/`。
 
 ## 目录
 

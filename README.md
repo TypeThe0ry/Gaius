@@ -26,10 +26,12 @@ Open the [latest release](https://github.com/TypeThe0ry/Gaius/releases/latest),
 then download the HTML file that matches the server you want to join:
 
 - [Minecraft 26.2 client](https://github.com/TypeThe0ry/Gaius/releases/latest/download/Gaius-26.2.html)
+- [Minecraft 26.3 client](https://github.com/TypeThe0ry/Gaius/releases/latest/download/Gaius-26.3.html)
 - [SHA256 checksums](https://github.com/TypeThe0ry/Gaius/releases/latest/download/SHA256SUMS)
 - The optional Paper plugin is on the same release page.
 
-The HTML files are portable single-player clients. Download one, open it in a
+The HTML files are portable single-player clients (`Gaius-26.2.html` for
+Minecraft 26.2, `Gaius-26.3.html` for Minecraft 26.3). Download one, open it in a
 current Chrome or Chromium browser, and select **Singleplayer**. On first launch
 the in-game **Edit Profile** screen opens so you can pick a player name and,
 optionally, upload a 64x64 PNG skin; reopen it any time from the **Edit Profile**
@@ -39,7 +41,8 @@ server to start for this mode.
 
 ### Joining a server
 
-1. Open the downloaded `Gaius-26.2.html` file in Chrome or Chromium.
+1. Open the downloaded `Gaius-26.2.html` or `Gaius-26.3.html` file in Chrome or
+   Chromium; pick the one whose Minecraft version matches the server.
 2. On the title screen, choose **Multiplayer**.
 3. Choose **Add Server** (or **Direct Connection**), enter the server's normal
    Java address such as `example.net:25565`, and choose **Join Server**.
@@ -60,7 +63,7 @@ Maven state, overlays, and browser output separate.
 git lfs install
 git lfs pull
 
-for profile in 1.21.11 26.2; do
+for profile in 26.2 26.3; do
   export GAIUS_VERSION_PROFILE_PATH="versions/${profile}.json"
   ./port/scripts/fetch-version.sh
   ./port/scripts/remap-client.sh
@@ -75,7 +78,7 @@ client is `Gaius.html`. To serve a built profile locally:
 python3 port/scripts/serve-dist.py --host 127.0.0.1 --port 8781
 ```
 
-Then open `/dist/26.2/` or `/dist/1.21.11/` in Chrome.
+Then open `/dist/26.2/` or `/dist/26.3/` in Chrome.
 
 ## What is here
 

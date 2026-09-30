@@ -5053,23 +5053,98 @@ public final class MinecraftClientPatcher {
         replace(createRegistryKey, code, 2, 1);
 
         MethodNode clinit = find(node, "<clinit>", "()V");
-        InsnList init = new InsnList();
-        init.add(new TypeInsnNode(Opcodes.NEW, "java/util/concurrent/ConcurrentHashMap"));
-        init.add(new InsnNode(Opcodes.DUP));
-        init.add(new MethodInsnNode(
-                Opcodes.INVOKESPECIAL,
-                "java/util/concurrent/ConcurrentHashMap",
-                "<init>",
-                "()V",
-                false));
-        init.add(new FieldInsnNode(
-                Opcodes.PUTSTATIC,
-                "net/minecraft/resources/ResourceKey",
-                "VALUES",
-                "Ljava/util/concurrent/ConcurrentMap;"));
-        init.add(new InsnNode(Opcodes.RETURN));
-        replace(clinit, init, 2, 0);
+        // VALUES = new MapMaker().weakValues().makeMap() -> new ConcurrentHashMap() (no weak
+        // references in the browser). 26.2's <clinit> holds nothing else and keeps the original
+        // whole-body rewrite; 26.3 first assigns REGISTRY_STREAM_CODEC (used by every packet that
+        // carries a registry key, e.g. clientbound update_tags), so there only the MapMaker
+        // sequence is swapped and the rest of the initializer stays vanilla.
+        java.util.List<AbstractInsnNode> mapMaker = resourceKeyValuesMapMaker(clinit);
+        int opcodes = 0;
+        for (AbstractInsnNode instruction : clinit.instructions) {
+            if (instruction.getOpcode() >= 0) {
+                opcodes++;
+            }
+        }
+        if (opcodes == mapMaker.size() + 2) {
+            InsnList init = new InsnList();
+            init.add(new TypeInsnNode(Opcodes.NEW, "java/util/concurrent/ConcurrentHashMap"));
+            init.add(new InsnNode(Opcodes.DUP));
+            init.add(new MethodInsnNode(
+                    Opcodes.INVOKESPECIAL,
+                    "java/util/concurrent/ConcurrentHashMap",
+                    "<init>",
+                    "()V",
+                    false));
+            init.add(new FieldInsnNode(
+                    Opcodes.PUTSTATIC,
+                    "net/minecraft/resources/ResourceKey",
+                    "VALUES",
+                    "Ljava/util/concurrent/ConcurrentMap;"));
+            init.add(new InsnNode(Opcodes.RETURN));
+            replace(clinit, init, 2, 0);
+        } else {
+            AbstractInsnNode anchor = mapMaker.get(0);
+            clinit.instructions.insertBefore(anchor,
+                    new TypeInsnNode(Opcodes.NEW, "java/util/concurrent/ConcurrentHashMap"));
+            clinit.instructions.insertBefore(anchor, new InsnNode(Opcodes.DUP));
+            clinit.instructions.insertBefore(anchor, new MethodInsnNode(
+                    Opcodes.INVOKESPECIAL,
+                    "java/util/concurrent/ConcurrentHashMap",
+                    "<init>",
+                    "()V",
+                    false));
+            for (AbstractInsnNode instruction : mapMaker) {
+                clinit.instructions.remove(instruction);
+            }
+            // new/dup need two stack slots, exactly what the MapMaker sequence needed.
+            clinit.maxStack = Math.max(clinit.maxStack, 2);
+        }
         write(node, output);
+    }
+
+    /**
+     * The five instructions {@code new MapMaker; dup; invokespecial <init>; invokevirtual
+     * weakValues; invokevirtual makeMap} that feed {@code putstatic ResourceKey.VALUES} in the
+     * vanilla static initializer; fails when the shape changed.
+     */
+    private static java.util.List<AbstractInsnNode> resourceKeyValuesMapMaker(MethodNode clinit) {
+        String mapMaker = "com/google/common/collect/MapMaker";
+        for (AbstractInsnNode instruction : clinit.instructions) {
+            if (!(instruction instanceof FieldInsnNode field) || field.getOpcode() != Opcodes.PUTSTATIC
+                    || !field.owner.equals("net/minecraft/resources/ResourceKey")
+                    || !field.name.equals("VALUES")) {
+                continue;
+            }
+            java.util.List<AbstractInsnNode> sequence = new java.util.ArrayList<>();
+            AbstractInsnNode cursor = field;
+            for (int i = 0; i < 5; i++) {
+                cursor = cursor.getPrevious();
+                while (cursor != null && cursor.getOpcode() < 0) {
+                    cursor = cursor.getPrevious();
+                }
+                if (cursor == null) {
+                    break;
+                }
+                sequence.add(0, cursor);
+            }
+            boolean shape = sequence.size() == 5
+                    && sequence.get(0) instanceof TypeInsnNode create
+                    && create.getOpcode() == Opcodes.NEW && create.desc.equals(mapMaker)
+                    && sequence.get(1).getOpcode() == Opcodes.DUP
+                    && sequence.get(2) instanceof MethodInsnNode init
+                    && init.getOpcode() == Opcodes.INVOKESPECIAL && init.owner.equals(mapMaker)
+                    && init.name.equals("<init>")
+                    && sequence.get(3) instanceof MethodInsnNode weak
+                    && weak.owner.equals(mapMaker) && weak.name.equals("weakValues")
+                    && sequence.get(4) instanceof MethodInsnNode make
+                    && make.owner.equals(mapMaker) && make.name.equals("makeMap");
+            if (!shape) {
+                throw new IllegalStateException(
+                        "ResourceKey.<clinit> no longer builds VALUES with MapMaker.weakValues().makeMap()");
+            }
+            return sequence;
+        }
+        throw new IllegalStateException("ResourceKey.<clinit> does not assign VALUES");
     }
 
     private static void patchSingleplayerCrypto(String jar, Path root) throws IOException {
@@ -10328,10 +10403,11 @@ public final class MinecraftClientPatcher {
      * authlib 10 (Minecraft 26.3): server Main calls
      * {@code MinecraftServicesDiscoveryService.create(Proxy.NO_PROXY)}, which enables the
      * services key set (a public-key fetch) on top of the discovery fetch. Insert
-     * {@code ICONST_0} and call {@code create(Proxy, boolean)} instead: the key set stays off and
-     * discovery keeps running, which is what authlib 9's {@code createOffline} did for 26.2
-     * (key set disabled, endpoints live). Failed fetches are swallowed by RetryableFetch. Returns
-     * {@code false} when the 26.3 shape is absent so the caller fails closed.
+     * {@code ICONST_0} and call {@code create(Proxy, boolean)} instead: the key set stays off.
+     * {@code ServerPatches263.patchDiscoveryServiceBrowser} later retargets that call to
+     * {@code BrowserDiscoveryServices.create}, so the Worker (never an online session) gets
+     * {@code createOffline} and no discovery fetch at all (PLAN D7). Returns {@code false} when
+     * the 26.3 shape is absent so the caller fails closed.
      */
     private static boolean patchServerMainDiscoveryServiceBrowser(MethodNode main) {
         String discoveryService = "com/mojang/authlib/services/MinecraftServicesDiscoveryService";

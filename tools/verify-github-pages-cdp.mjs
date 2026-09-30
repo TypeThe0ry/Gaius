@@ -12,30 +12,42 @@ const output = resolve(process.env.OUTPUT || 'artifacts/github-pages-cdp.json');
 const CDP_COMMAND_TIMEOUT_MS = Number(process.env.CDP_COMMAND_TIMEOUT_MS || '15000');
 const GAIUS_CDP_PROFILE_ROOT = process.env.GAIUS_CDP_PROFILE_ROOT || ''; 
 const chromeBinary = process.env.CHROME || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
-// Pages publishes only the Minecraft 26.2 client (.github/workflows/pages.yml).
-const expectedPages = Object.freeze(['Gaius-26.2.html']);
+// Pages publishes exactly the Minecraft 26.2 and 26.3 clients (.github/workflows/pages.yml).
+const expectedPages = Object.freeze(['Gaius-26.2.html', 'Gaius-26.3.html']);
 // Minecraft 1.21.11 is permanently retired from Pages: its old URL must stay unpublished (HTTP 404).
 const retiredPages = Object.freeze(['Gaius-1.21.11.html']);
 // Keep per-profile release target names explicit for the repository guard and Pages workflow.
-// Only the 26.2 profile is deployed. GAIUS_TARGET_12111 and GAIUS_PAGE_DEFAULT_TARGET_12111, still
+// The 26.2 and 26.3 profiles are deployed. GAIUS_TARGET_12111 and GAIUS_PAGE_DEFAULT_TARGET_12111, still
 // exported by the legacy v0.1.0 publisher, are intentionally ignored because 1.21.11 has no Pages page.
-const expectedTargets = Object.freeze({ '26.2': process.env.GAIUS_TARGET_262 || '' });
-const expectedPageTargets = Object.freeze({ '26.2': process.env.GAIUS_PAGE_DEFAULT_TARGET_262 || '', defaultTarget: process.env.GAIUS_PAGES_DEFAULT_TARGET || '' });
+const expectedTargets = Object.freeze({ '26.2': process.env.GAIUS_TARGET_262 || '', '26.3': process.env.GAIUS_TARGET_263 || '' });
+const expectedPageTargets = Object.freeze({ '26.2': process.env.GAIUS_PAGE_DEFAULT_TARGET_262 || '', '26.3': process.env.GAIUS_PAGE_DEFAULT_TARGET_263 || '', defaultTarget: process.env.GAIUS_PAGES_DEFAULT_TARGET || '' });
 // Timeout diagnostics retain the exact phrase 	imed out after for CI evidence.
-// pages.yml deploys Gaius-26.2.html only after `sha256sum --check` against its release SHA256SUMS.
-// Optional GAIUS_PAGES_EXPECTED_SHA256 binds this live check to those same release bytes.
-const expectedSha256Page = 'Gaius-26.2.html';
-function parseExpectedSha256(value) {
+// pages.yml deploys each client only after `sha256sum --check` against its release SHA256SUMS record.
+// Optional GAIUS_PAGES_EXPECTED_SHA256_262 / GAIUS_PAGES_EXPECTED_SHA256_263 bind this live check to
+// those same release bytes; GAIUS_PAGES_EXPECTED_SHA256 remains the 26.2 alias set by the v0.1.0 publisher.
+const expectedSha256Variables = Object.freeze({
+  'Gaius-26.2.html': ['GAIUS_PAGES_EXPECTED_SHA256_262', 'GAIUS_PAGES_EXPECTED_SHA256'],
+  'Gaius-26.3.html': ['GAIUS_PAGES_EXPECTED_SHA256_263'],
+});
+function parseExpectedSha256(value, variable = 'GAIUS_PAGES_EXPECTED_SHA256') {
   const text = String(value ?? '').trim().toLowerCase();
-  if (text && !/^[0-9a-f]{64}$/.test(text)) throw new Error('GAIUS_PAGES_EXPECTED_SHA256 must be 64 hexadecimal characters');
+  if (text && !/^[0-9a-f]{64}$/.test(text)) throw new Error(`${variable} must be 64 hexadecimal characters`);
   return text;
+}
+function expectedSha256ByPage(env) {
+  const result = {};
+  for (const file of expectedPages) {
+    const variable = expectedSha256Variables[file].find((name) => String(env[name] ?? '').trim()) ?? expectedSha256Variables[file][0];
+    result[file] = parseExpectedSha256(env[variable], variable);
+  }
+  return Object.freeze(result);
 }
 const sha256Hex = (bytes) => createHash('sha256').update(bytes).digest('hex');
 function recordLivePage(report, file, status, ok, body, expectedSha256) {
   const sha256 = sha256Hex(new Uint8Array(body));
   report.live[file] = {status, bytes: body.byteLength, sha256};
   check(report.checks, `${file}-http`, ok && body.byteLength > 100_000_000, `HTTP ${status}; bytes=${body.byteLength}; sha256=${sha256}`);
-  if (expectedSha256 && file === expectedSha256Page) check(report.checks, `${file}-sha256`, sha256 === expectedSha256, `live=${sha256}; expected=${expectedSha256}`);
+  if (expectedSha256) check(report.checks, `${file}-sha256`, sha256 === expectedSha256, `live=${sha256}; expected=${expectedSha256}`);
 }
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 // A fresh Pages deploy can take minutes to reach every CDN edge (responses carry max-age=600). When the
@@ -106,8 +118,10 @@ class Cdp {
 async function stopChrome(chrome, cdp, profileDir) { try { await cdp?.send('Browser.close', {}, 3000); } catch {} if (chrome && chrome.exitCode == null) chrome.kill(); if (profileDir) { try { await rm(profileDir, {recursive: true, force: true, maxRetries: 10, retryDelay: 200}); } catch {} } }
 
 // Static Pages workflow gate. Comment lines are stripped first so a commented-out check cannot satisfy it.
-const PAGES_SHA256_GATE_LINE = '(cd pages-publish && sha256sum --check --strict "$sums_dir/Gaius-26.2.html.sha256")';
-const PAGES_RECORD_COUNT_LINE = 'if [ "$(wc -l < "$sums_dir/Gaius-26.2.html.sha256")" -ne 1 ]; then';
+// Every deployed page has its own exactly-one-record check and its own sha256sum gate line.
+const pagesSha256GateLine = (file) => `(cd pages-publish && sha256sum --check --strict "$sums_dir/${file}.sha256")`;
+const pagesRecordCountLine = (file) => `if [ "$(wc -l < "$sums_dir/${file}.sha256")" -ne 1 ]; then`;
+const PAGES_DEPLOYING_LINE = `Deploying ${expectedPages.join(' and ')} from`;
 function pagesWorkflowProblems(raw) {
   const problems = [];
   const need = (ok, message) => { if (!ok) problems.push(message); };
@@ -130,16 +144,21 @@ function pagesWorkflowProblems(raw) {
   need(code.includes(`find pages-publish -mindepth 1 | wc -l)" -eq ${expectedPages.length}`), 'Pages workflow file-count assertion missing');
   need(code.includes('gh release view --repo'), 'Pages workflow Latest-release default missing');
   need(!/^\s*set\s+\+[a-z]*e/m.test(code), 'Pages workflow must not disable errexit');
-  // The exactly-one-record check and the sha256 gate must each be a whole, unguarded line.
-  const countLine = lineIndex((line) => line.trim() === PAGES_RECORD_COUNT_LINE);
-  need(countLine >= 0 && /^\s*echo "::error::/.test(lines[countLine + 1] ?? '') && lines[countLine + 2]?.trim() === 'exit 1', 'Pages workflow exactly-one SHA256SUMS record (-ne 1) check missing');
-  const gateLine = lineIndex((line) => line.trim() === PAGES_SHA256_GATE_LINE);
-  need(gateLine >= 0, 'Pages workflow sha256sum --check --strict gate line missing');
-  need(!lines.some((line) => line.includes('sha256sum') && /\|\|\s*(?:true|:)(?=\s|;|\)|$)/.test(line)), 'Pages workflow sha256sum gate must not be neutralised with || true / || :');
+  // Per page, the exactly-one-record check and the sha256 gate must each be a whole, unguarded line.
   const uploadLine = lineIndex((line) => line.includes('actions/upload-pages-artifact'));
-  const deployingLines = lines.flatMap((line, index) => line.includes('Deploying Gaius-26.2.html from') ? [index] : []);
-  need(countLine >= 0 && gateLine > countLine && uploadLine > gateLine, 'Pages workflow must verify SHA256SUMS before uploading');
-  need(deployingLines.length === 1 && deployingLines[0] > gateLine && deployingLines[0] < uploadLine, 'Pages workflow must announce the deployment only after the sha256 gate');
+  let lastGateLine = -1;
+  for (const file of expectedPages) {
+    const countLine = lineIndex((line) => line.trim() === pagesRecordCountLine(file));
+    need(countLine >= 0 && /^\s*echo "::error::/.test(lines[countLine + 1] ?? '') && lines[countLine + 2]?.trim() === 'exit 1', `Pages workflow exactly-one SHA256SUMS record (-ne 1) check missing for ${file}`);
+    const gateLine = lineIndex((line) => line.trim() === pagesSha256GateLine(file));
+    need(gateLine >= 0, `Pages workflow sha256sum --check --strict gate line missing for ${file}`);
+    need(countLine >= 0 && gateLine > countLine && uploadLine > gateLine, `Pages workflow must verify SHA256SUMS of ${file} before uploading`);
+    lastGateLine = Math.max(lastGateLine, gateLine);
+  }
+  need(!lines.some((line) => line.includes('sha256sum') && /\|\|\s*(?:true|:)(?=\s|;|\)|$)/.test(line)), 'Pages workflow sha256sum gate must not be neutralised with || true / || :');
+  const deployingLines = lines.flatMap((line, index) => line.includes(PAGES_DEPLOYING_LINE) ? [index] : []);
+  need(!lines.some((line) => /Deploying Gaius-[^\n]*\.html/.test(line) && !line.includes(PAGES_DEPLOYING_LINE)), 'Pages workflow must announce all deployed pages together');
+  need(deployingLines.length === 1 && deployingLines[0] > lastGateLine && deployingLines[0] < uploadLine, 'Pages workflow must announce the deployment only after the sha256 gates');
   // Workflow-command lines must never carry the raw input or a not-yet-validated tag.
   for (const line of lines.filter((entry) => /\becho\s+["']?::/.test(entry) || /::[a-z-]+(?: [^:\n]*)?::/.test(entry))) {
     need(!/REQUESTED_RELEASE_TAG|inputs\.|github\.event|\$\{?tag\b/.test(line), `Pages workflow echoes an unvalidated release tag in a workflow command: ${line.trim()}`);
@@ -148,24 +167,30 @@ function pagesWorkflowProblems(raw) {
 }
 
 if (process.argv.includes('--static-self-test')) {
-  assert.deepEqual(expectedPages, ['Gaius-26.2.html']);
+  assert.deepEqual(expectedPages, ['Gaius-26.2.html', 'Gaius-26.3.html']);
   assert.deepEqual(retiredPages, ['Gaius-1.21.11.html']);
   assert.ok(retiredPages.every((file) => !expectedPages.includes(file)), 'a retired page is still expected');
-  assert.deepEqual(Object.keys(expectedTargets), ['26.2']);
-  assert.deepEqual(Object.keys(expectedPageTargets), ['26.2', 'defaultTarget']);
-  // The live sha256 binding: well-formed expectations only, and a mismatch fails the gate.
-  assert.ok(expectedPages.includes(expectedSha256Page), 'the sha256-bound page is not deployed');
+  assert.deepEqual(Object.keys(expectedTargets), ['26.2', '26.3']);
+  assert.deepEqual(Object.keys(expectedPageTargets), ['26.2', '26.3', 'defaultTarget']);
+  // The live sha256 binding: well-formed expectations only, per page, and a mismatch fails the gate.
+  assert.deepEqual(Object.keys(expectedSha256Variables), [...expectedPages], 'every deployed page needs an expected-sha256 variable');
   const abc = 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad';
   assert.equal(sha256Hex(new TextEncoder().encode('abc')), abc);
   assert.equal(parseExpectedSha256(undefined), '');
   assert.equal(parseExpectedSha256(`  ${abc.toUpperCase()}\n`), abc);
   for (const bad of ['abc', abc.slice(1), `${abc}0`, `${abc.slice(1)}g`]) assert.throws(() => parseExpectedSha256(bad), /64 hexadecimal/);
+  assert.deepEqual(expectedSha256ByPage({}), {'Gaius-26.2.html': '', 'Gaius-26.3.html': ''});
+  assert.deepEqual(expectedSha256ByPage({GAIUS_PAGES_EXPECTED_SHA256: abc}), {'Gaius-26.2.html': abc, 'Gaius-26.3.html': ''}, 'the legacy variable binds 26.2 only');
+  assert.deepEqual(expectedSha256ByPage({GAIUS_PAGES_EXPECTED_SHA256_262: abc, GAIUS_PAGES_EXPECTED_SHA256_263: '0'.repeat(64)}), {'Gaius-26.2.html': abc, 'Gaius-26.3.html': '0'.repeat(64)});
+  assert.throws(() => expectedSha256ByPage({GAIUS_PAGES_EXPECTED_SHA256_263: 'nope'}), /GAIUS_PAGES_EXPECTED_SHA256_263 must be 64 hexadecimal/);
   const fixture = new TextEncoder().encode('abc').buffer;
-  for (const [expected, ok] of [[abc, true], ['0'.repeat(64), false], ['', null]]) {
-    const fake = {checks: [], live: {}};
-    recordLivePage(fake, expectedSha256Page, 200, true, fixture, expected);
-    assert.deepEqual(fake.live[expectedSha256Page], {status: 200, bytes: 3, sha256: abc});
-    assert.deepEqual(fake.checks.filter((entry) => entry.name.endsWith('-sha256')).map((entry) => entry.ok), ok === null ? [] : [ok]);
+  for (const page of expectedPages) {
+    for (const [expected, ok] of [[abc, true], ['0'.repeat(64), false], ['', null]]) {
+      const fake = {checks: [], live: {}};
+      recordLivePage(fake, page, 200, true, fixture, expected);
+      assert.deepEqual(fake.live[page], {status: 200, bytes: 3, sha256: abc});
+      assert.deepEqual(fake.checks.filter((entry) => entry.name.endsWith('-sha256')).map((entry) => entry.ok), ok === null ? [] : [ok]);
+    }
   }
   // The live-hash retry: a stale canonical response is re-fetched (same URL, no cache-busting) until the edge
   // serves the release bytes, every attempt is recorded, fetch errors are retried, and the window is bounded.
@@ -209,19 +234,28 @@ if (process.argv.includes('--static-self-test')) {
   const workflow = await readFile(new URL('../.github/workflows/pages.yml', import.meta.url), 'utf8');
   assert.deepEqual(pagesWorkflowProblems(workflow), [], 'Pages workflow gate');
   const mutations = {
-    'commented gate': (text) => text.replace(PAGES_SHA256_GATE_LINE, `# ${PAGES_SHA256_GATE_LINE}`),
-    'gate || true': (text) => text.replace(PAGES_SHA256_GATE_LINE, `${PAGES_SHA256_GATE_LINE} || true`),
-    'gate || :': (text) => text.replace(PAGES_SHA256_GATE_LINE, `${PAGES_SHA256_GATE_LINE} || :`),
-    'removed -ne 1': (text) => text.replace(' -ne 1 ]', ' -lt 1 ]'),
-    'commented -ne 1': (text) => text.replace(PAGES_RECORD_COUNT_LINE, `# ${PAGES_RECORD_COUNT_LINE}\n          if false; then`),
     'raw tag in ::error::': (text) => text.replace('echo "::error::Refusing unexpected release tag from ${source}"', 'echo "::error::Refusing unexpected release tag ${REQUESTED_RELEASE_TAG}"'),
     'raw tag in ::warning::': (text) => text.replace('          echo "tag=${tag}" >> "$GITHUB_OUTPUT"', '          echo "::warning::Requested $REQUESTED_RELEASE_TAG"\n          echo "tag=${tag}" >> "$GITHUB_OUTPUT"'),
     'unvalidated $tag in ::error::': (text) => text.replace('echo "::error::Refusing unexpected release tag from ${source}"', 'echo "::error::Refusing ${tag}"'),
     'LFS checkout': (text) => text.replace('      - name: Configure Pages', '      - uses: actions/checkout@v4\n        with:\n          lfs: true\n      - name: Configure Pages'),
     'push trigger': (text) => text.replace('on:\n  workflow_dispatch:', 'on:\n  push:\n  workflow_dispatch:'),
-    'early Deploying summary': (text) => text.replace('          echo "tag=${tag}" >> "$GITHUB_OUTPUT"', '          echo "tag=${tag}" >> "$GITHUB_OUTPUT"\n          echo "Deploying Gaius-26.2.html from ${tag}" >> "$GITHUB_STEP_SUMMARY"'),
+    'early Deploying summary': (text) => text.replace('          echo "tag=${tag}" >> "$GITHUB_OUTPUT"', `          echo "tag=\${tag}" >> "$GITHUB_OUTPUT"\n          echo "${PAGES_DEPLOYING_LINE} \${tag}" >> "$GITHUB_STEP_SUMMARY"`),
+    'partial Deploying summary': (text) => text.replace(`echo "${PAGES_DEPLOYING_LINE} `, 'echo "Deploying Gaius-26.2.html from '),
     'optional release_token': (text) => text.replace('        required: true', '        required: false'),
+    'one page only': (text) => text.replace("            --pattern 'Gaius-26.3.html'\n", '').replace('wc -l)" -eq 2', 'wc -l)" -eq 1'),
+    'file count for one page': (text) => text.replace('wc -l)" -eq 2', 'wc -l)" -eq 1'),
   };
+  for (const file of expectedPages) {
+    const gate = pagesSha256GateLine(file);
+    const count = pagesRecordCountLine(file);
+    mutations[`commented gate ${file}`] = (text) => text.replace(gate, `# ${gate}`);
+    mutations[`gate || true ${file}`] = (text) => text.replace(gate, `${gate} || true`);
+    mutations[`gate || : ${file}`] = (text) => text.replace(gate, `${gate} || :`);
+    mutations[`removed gate ${file}`] = (text) => text.replace(`          ${gate}\n`, '');
+    mutations[`removed -ne 1 ${file}`] = (text) => text.replace(count, count.replace(' -ne 1 ]', ' -lt 1 ]'));
+    mutations[`commented -ne 1 ${file}`] = (text) => text.replace(count, `# ${count}\n          if false; then`);
+    mutations[`gate after upload ${file}`] = (text) => text.replace(`          ${gate}\n`, '').replace('      - name: Deploy Pages\n', `      - run: ${gate}\n      - name: Deploy Pages\n`);
+  }
   const lfWorkflow = workflow.replace(/\r\n/g, '\n');
   for (const [name, mutate] of Object.entries(mutations)) {
     const mutated = mutate(lfWorkflow);
@@ -231,20 +265,19 @@ if (process.argv.includes('--static-self-test')) {
   console.log('VERIFY_GITHUB_PAGES_CDP_STATIC_OK'); process.exit(0);
 }
 
-const report = {schema: 'gaius.github-pages-cdp.v4', base, expectedPages, retiredPages, expectedSha256: null, sha256RetryWindowMs: null, checks: [], pages: [], live: {}};
+const report = {schema: 'gaius.github-pages-cdp.v5', base, expectedPages, retiredPages, expectedSha256: null, sha256RetryWindowMs: null, checks: [], pages: [], live: {}};
 let chrome; let cdp; let profileDir;
 try {
-  const expectedSha256 = parseExpectedSha256(process.env.GAIUS_PAGES_EXPECTED_SHA256);
-  report.expectedSha256 = expectedSha256 || null;
+  const expectedSha256 = expectedSha256ByPage(process.env);
+  report.expectedSha256 = Object.fromEntries(expectedPages.map((file) => [file, expectedSha256[file] || null]));
   const sha256RetryWindowMs = parseRetryWindowMs(process.env.GAIUS_PAGES_SHA256_RETRY_MS);
-  report.sha256RetryWindowMs = expectedSha256 ? sha256RetryWindowMs : null;
+  report.sha256RetryWindowMs = expectedPages.some((file) => expectedSha256[file]) ? sha256RetryWindowMs : null;
   const rootResponse = await fetch(base, {redirect: 'manual', cache: 'no-store'});
   check(report.checks, 'root-not-published', rootResponse.status === 404, `HTTP ${rootResponse.status}`);
   for (const file of expectedPages) {
     const url = new URL(file, base).href;
-    const pageSha256 = file === expectedSha256Page ? expectedSha256 : '';
-    const live = await fetchLivePage(url, pageSha256, {windowMs: sha256RetryWindowMs});
-    recordLivePage(report, file, live.status, live.ok, live.body, expectedSha256);
+    const live = await fetchLivePage(url, expectedSha256[file], {windowMs: sha256RetryWindowMs});
+    recordLivePage(report, file, live.status, live.ok, live.body, expectedSha256[file]);
     report.live[file].attempts = live.attempts;
   }
   for (const file of retiredPages) { const url = new URL(file, base).href; const response = await fetch(url, {method: 'HEAD', redirect: 'manual', cache: 'no-store'}); check(report.checks, `${file}-retired`, response.status === 404, `HTTP ${response.status}`); }
@@ -264,7 +297,7 @@ finally {
   const profileRemoved = !profileDir || !(await import('node:fs')).existsSync(profileDir);
   const pagesFinalGate = report.pages.length === expectedPages.length
     && report.checks.filter((entry) => entry.name.endsWith('-chrome')).every((entry) => entry.ok)
-    && (!report.expectedSha256 || report.checks.some((entry) => entry.name === `${expectedSha256Page}-sha256` && entry.ok));
+    && expectedPages.every((file) => !report.expectedSha256?.[file] || report.checks.some((entry) => entry.name === `${file}-sha256` && entry.ok));
   check(report.checks, 'cdpClosed', cdpClosed);
   check(report.checks, 'chromeExited', chromeExited);
   check(report.checks, 'profileRemoved', profileRemoved);
