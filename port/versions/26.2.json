@@ -7,6 +7,8 @@
   "classFileVersion": 69,
   "clientDistribution": "named",
   "worldgenTelemetryMode": "task-pulsed",
+  "patchSet": "modern",
+  "extraPatchers": [],
   "packVersions": {
     "resource": {
       "major": 88,
