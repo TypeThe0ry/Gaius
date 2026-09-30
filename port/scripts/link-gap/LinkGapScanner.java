@@ -16,6 +16,7 @@ import java.util.TreeMap;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
+import org.objectweb.asm.AnnotationVisitor;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.ConstantDynamic;
@@ -34,22 +35,52 @@ import org.objectweb.asm.Type;
  * is resolved against subjects, then the class path roots in order, then the
  * running JDK, following the JVM resolution rules (JVMS 5.4.3).  The opcode
  * and the invoke {@code itf} flag must match the owner's kind, and static
- * accesses must hit static members.  Issues are written as tab-separated
- * lines: {@code key<TAB>count<TAB>referrer...}, where key is
- * {@code <kind> <target>}.
+ * accesses must hit static members.
+ *
+ * <p>With {@code --teavm-classlib JAR} every reference that resolves on the
+ * JVM is resolved a second time the way TeaVM 0.15 links it: {@code java/**}
+ * and {@code javax/xml/**} only through the TeaVM class library
+ * ({@code java/time/**} as {@code org/threeten/bp/**}, everything else as
+ * {@code org/teavm/classlib/java/**}{@code /T<Name>}, the substitution rules
+ * of {@code org.teavm.classlib.impl.ClasslibSubstitutionPolicy}, honouring the
+ * {@code @Rename}, {@code @Remove} and {@code @Superclass} interop
+ * annotations), every other package only through the subjects and the class
+ * path, never the running JDK; invokedynamic bootstraps must be one of the
+ * bootstrap substitutors that TeaVM's JCLPlugin registers.  A reference that
+ * resolves on the JVM but not there is reported with a {@code teavm-} kind:
+ * a JDK API that TeaVM's class library does not implement.  The scan covers
+ * the whole jar, so unreachable references are reported too; the smoke keeps
+ * a per-profile known-issue list for those.
+ *
+ * <p>Issues are written as tab-separated lines:
+ * {@code key<TAB>count<TAB>referrer...}, where key is {@code <kind> <target>}.
  *
  * <pre>
  * java -cp asm.jar LinkGapScanner.java --out issues.tsv
  *     --subject a.jar --subject classesDir --classpath lib.jar ...
+ *     [--teavm-classlib teavm-classlib.jar]
  * </pre>
  */
 public final class LinkGapScanner {
     private static final int MAX_REFERRERS = 3;
 
+    /**
+     * The invokedynamic bootstraps TeaVM 0.15 links itself (JCLPlugin registers a
+     * BootstrapMethodSubstitutor for each); any other bootstrap fails to link.
+     */
+    private static final Set<String> TEAVM_BOOTSTRAPS = Set.of(
+            "java/lang/invoke/LambdaMetafactory.metafactory",
+            "java/lang/invoke/LambdaMetafactory.altMetafactory",
+            "java/lang/runtime/ObjectMethods.bootstrap",
+            "java/lang/invoke/StringConcatFactory.makeConcat",
+            "java/lang/invoke/StringConcatFactory.makeConcatWithConstants",
+            "java/lang/runtime/SwitchBootstraps.typeSwitch",
+            "java/lang/runtime/SwitchBootstraps.enumSwitch");
+
     private final List<Root> subjects = new ArrayList<>();
     private final List<Root> classpath = new ArrayList<>();
-    private final Map<String, ClassInfo> classes = new HashMap<>();
-    private final Set<String> missing = new HashSet<>();
+    private final Resolver jvm = new Resolver(null);
+    private Resolver teavm;
     private final Map<String, Issue> issues = new TreeMap<>();
     private int scannedClasses;
     private int checkedReferences;
@@ -57,24 +88,33 @@ public final class LinkGapScanner {
     public static void main(String[] args) throws IOException {
         LinkGapScanner scanner = new LinkGapScanner();
         Path out = null;
+        Root classlib = null;
         for (int index = 0; index < args.length; index++) {
             String argument = args[index];
             switch (argument) {
                 case "--subject" -> scanner.subjects.add(Root.open(Path.of(args[++index])));
                 case "--classpath" -> scanner.classpath.add(Root.open(Path.of(args[++index])));
+                case "--teavm-classlib" -> classlib = Root.open(Path.of(args[++index]));
                 case "--out" -> out = Path.of(args[++index]);
                 default -> throw new IllegalArgumentException("unknown argument " + argument);
             }
         }
         if (out == null || scanner.subjects.isEmpty()) {
-            throw new IllegalArgumentException(
-                    "usage: LinkGapScanner --out FILE --subject ROOT... [--classpath ROOT...]");
+            throw new IllegalArgumentException("usage: LinkGapScanner --out FILE --subject ROOT..."
+                    + " [--classpath ROOT...] [--teavm-classlib JAR]");
+        }
+        if (classlib != null) {
+            scanner.teavm = scanner.new Resolver(classlib);
+            if (scanner.teavm.info("java/lang/Object") == null) {
+                throw new IllegalArgumentException("--teavm-classlib has no TObject: " + classlib);
+            }
         }
         try {
             scanner.scan();
         } finally {
             for (Root root : scanner.subjects) root.close();
             for (Root root : scanner.classpath) root.close();
+            if (classlib != null) classlib.close();
         }
         StringBuilder text = new StringBuilder();
         for (Issue issue : scanner.issues.values()) {
@@ -85,7 +125,8 @@ public final class LinkGapScanner {
         Files.writeString(out, text, StandardCharsets.UTF_8);
         System.out.println("LINK_GAP_SCANNED classes=" + scanner.scannedClasses
                 + " references=" + scanner.checkedReferences
-                + " issues=" + scanner.issues.size());
+                + " issues=" + scanner.issues.size()
+                + " teavmClasslib=" + (classlib != null));
     }
 
     private void scan() throws IOException {
@@ -99,35 +140,6 @@ public final class LinkGapScanner {
                 reader(bytes).accept(new SubjectVisitor(), ClassReader.SKIP_FRAMES);
             }
         }
-    }
-
-    // ---------------------------------------------------------------- lookup
-
-    private ClassInfo info(String name) {
-        if (name.startsWith("[")) {
-            return info("java/lang/Object");
-        }
-        ClassInfo cached = classes.get(name);
-        if (cached != null || missing.contains(name)) return cached;
-        byte[] bytes = null;
-        for (Root root : subjects) {
-            if ((bytes = root.read(name)) != null) break;
-        }
-        if (bytes == null) {
-            for (Root root : classpath) {
-                if ((bytes = root.read(name)) != null) break;
-            }
-        }
-        if (bytes == null) bytes = readJdk(name);
-        if (bytes == null) {
-            missing.add(name);
-            return null;
-        }
-        ClassInfo info = new ClassInfo();
-        reader(bytes).accept(new InfoVisitor(info), ClassReader.SKIP_CODE
-                | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
-        classes.put(name, info);
-        return info;
     }
 
     // ASM 9.8 reads class files up to major 69 (Java 25). The scanner also
@@ -156,83 +168,205 @@ public final class LinkGapScanner {
         }
     }
 
-    /** The class and every supertype must be loadable for a decision. */
-    private String missingSupertype(ClassInfo start) {
-        Deque<ClassInfo> queue = new ArrayDeque<>();
-        Set<String> visited = new HashSet<>();
-        queue.add(start);
-        while (!queue.isEmpty()) {
-            ClassInfo current = queue.poll();
-            if (!visited.add(current.name)) continue;
-            List<String> parents = new ArrayList<>(current.interfaces);
-            if (current.superName != null) parents.add(current.superName);
-            for (String parent : parents) {
-                ClassInfo parentInfo = info(parent);
-                if (parentInfo == null) return parent;
-                queue.add(parentInfo);
+    // ------------------------------------------------------------- resolvers
+
+    /**
+     * Class lookup and member resolution for one link model: the JVM (subjects,
+     * class path, running JDK) or TeaVM (subjects and class path for everything
+     * but the JDK packages, the TeaVM class library for those).
+     */
+    private final class Resolver {
+        private final Root classlib;
+        private final Map<String, ClassInfo> classes = new HashMap<>();
+        private final Set<String> missing = new HashSet<>();
+
+        Resolver(Root classlib) {
+            this.classlib = classlib;
+        }
+
+        boolean isTeaVM() {
+            return classlib != null;
+        }
+
+        ClassInfo info(String name) {
+            if (name.startsWith("[")) {
+                return info("java/lang/Object");
             }
+            ClassInfo cached = classes.get(name);
+            if (cached != null || missing.contains(name)) return cached;
+            byte[] bytes = null;
+            if (isTeaVM() && teavmSubstituted(name)) {
+                // ClasslibSubstitutionPolicy.dontFallbackWhenNoSubstitution(): a JDK class
+                // without a substitute is missing, whatever the class path holds.  The
+                // substitute (org/teavm/classlib/java/**/T<Name>) may come from any class
+                // path root: the class library jar or the Gaius runtime classes
+                // (port/src/main/java/org/teavm/classlib/**).
+                List<Root> roots = new ArrayList<>(subjects);
+                roots.addAll(classpath);
+                roots.add(classlib);
+                candidates:
+                for (String candidate : teavmCandidates(name)) {
+                    for (Root root : roots) {
+                        if ((bytes = root.read(candidate)) != null) break candidates;
+                    }
+                }
+            } else {
+                for (Root root : subjects) {
+                    if ((bytes = root.read(name)) != null) break;
+                }
+                if (bytes == null) {
+                    for (Root root : classpath) {
+                        if ((bytes = root.read(name)) != null) break;
+                    }
+                }
+                if (bytes == null && !isTeaVM()) bytes = readJdk(name);
+            }
+            if (bytes == null) {
+                missing.add(name);
+                return null;
+            }
+            ClassInfo info = new ClassInfo();
+            reader(bytes).accept(new InfoVisitor(info, isTeaVM()), ClassReader.SKIP_CODE
+                    | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+            // A class library class stands for the JDK class it was looked up as.
+            info.name = name;
+            if (isTeaVM() && name.equals("java/lang/Object")) info.superName = null;
+            classes.put(name, info);
+            return info;
         }
-        return null;
-    }
 
-    private Member findField(ClassInfo owner, String name, String desc) {
-        Member declared = owner.fields.get(name + ":" + desc);
-        if (declared != null) return declared;
-        for (String parent : owner.interfaces) {
-            ClassInfo parentInfo = info(parent);
-            if (parentInfo == null) continue;
-            Member found = findField(parentInfo, name, desc);
-            if (found != null) return found;
+        /** The class and every supertype must be loadable for a decision. */
+        String missingSupertype(ClassInfo start) {
+            Deque<ClassInfo> queue = new ArrayDeque<>();
+            Set<String> visited = new HashSet<>();
+            queue.add(start);
+            while (!queue.isEmpty()) {
+                ClassInfo current = queue.poll();
+                if (!visited.add(current.name)) continue;
+                List<String> parents = new ArrayList<>(current.interfaces);
+                if (current.superName != null) parents.add(current.superName);
+                for (String parent : parents) {
+                    ClassInfo parentInfo = info(parent);
+                    if (parentInfo == null) return parent;
+                    queue.add(parentInfo);
+                }
+            }
+            return null;
         }
-        ClassInfo superInfo = owner.superName == null ? null : info(owner.superName);
-        return superInfo == null ? null : findField(superInfo, name, desc);
-    }
 
-    private Member findClassMethod(ClassInfo owner, String name, String desc) {
-        for (ClassInfo current = owner; current != null;
-                current = current.superName == null ? null : info(current.superName)) {
-            Member declared = current.methods.get(name + desc);
+        Member findField(ClassInfo owner, String name, String desc) {
+            Member declared = owner.fields.get(name + ":" + desc);
             if (declared != null) return declared;
-            if (current.signaturePolymorphic(name)) return current.methodsByName.get(name);
-        }
-        return findSuperinterfaceMethod(owner, name, desc, new HashSet<>());
-    }
-
-    private Member findInterfaceMethod(ClassInfo owner, String name, String desc) {
-        Member declared = owner.methods.get(name + desc);
-        if (declared != null) return declared;
-        ClassInfo object = info("java/lang/Object");
-        if (object != null) {
-            Member objectMethod = object.methods.get(name + desc);
-            if (objectMethod != null && (objectMethod.access & Opcodes.ACC_PUBLIC) != 0
-                    && (objectMethod.access & Opcodes.ACC_STATIC) == 0) {
-                return objectMethod;
-            }
-        }
-        return findSuperinterfaceMethod(owner, name, desc, new HashSet<>());
-    }
-
-    private Member findSuperinterfaceMethod(
-            ClassInfo owner, String name, String desc, Set<String> visited) {
-        for (ClassInfo current = owner; current != null;
-                current = current.superName == null ? null : info(current.superName)) {
-            for (String parent : current.interfaces) {
-                if (!visited.add(parent)) continue;
+            for (String parent : owner.interfaces) {
                 ClassInfo parentInfo = info(parent);
                 if (parentInfo == null) continue;
-                Member declared = parentInfo.methods.get(name + desc);
-                if (declared != null && (declared.access
-                        & (Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC)) == 0) {
-                    return declared;
+                Member found = findField(parentInfo, name, desc);
+                if (found != null) return found;
+            }
+            ClassInfo superInfo = owner.superName == null ? null : info(owner.superName);
+            return superInfo == null ? null : findField(superInfo, name, desc);
+        }
+
+        Member findClassMethod(ClassInfo owner, String name, String desc) {
+            for (ClassInfo current = owner; current != null;
+                    current = current.superName == null ? null : info(current.superName)) {
+                Member declared = current.methods.get(name + desc);
+                if (declared != null) return declared;
+                if (current.signaturePolymorphic(name)) return current.methodsByName.get(name);
+            }
+            return findSuperinterfaceMethod(owner, name, desc, new HashSet<>());
+        }
+
+        Member findInterfaceMethod(ClassInfo owner, String name, String desc) {
+            Member declared = owner.methods.get(name + desc);
+            if (declared != null) return declared;
+            ClassInfo object = info("java/lang/Object");
+            if (object != null) {
+                Member objectMethod = object.methods.get(name + desc);
+                if (objectMethod != null && (objectMethod.access & Opcodes.ACC_PUBLIC) != 0
+                        && (objectMethod.access & Opcodes.ACC_STATIC) == 0) {
+                    return objectMethod;
                 }
-                Member inherited = findSuperinterfaceMethod(parentInfo, name, desc, visited);
-                if (inherited != null) return inherited;
+            }
+            return findSuperinterfaceMethod(owner, name, desc, new HashSet<>());
+        }
+
+        private Member findSuperinterfaceMethod(
+                ClassInfo owner, String name, String desc, Set<String> visited) {
+            for (ClassInfo current = owner; current != null;
+                    current = current.superName == null ? null : info(current.superName)) {
+                for (String parent : current.interfaces) {
+                    if (!visited.add(parent)) continue;
+                    ClassInfo parentInfo = info(parent);
+                    if (parentInfo == null) continue;
+                    Member declared = parentInfo.methods.get(name + desc);
+                    if (declared != null && (declared.access
+                            & (Opcodes.ACC_PRIVATE | Opcodes.ACC_STATIC)) == 0) {
+                        return declared;
+                    }
+                    Member inherited = findSuperinterfaceMethod(parentInfo, name, desc, visited);
+                    if (inherited != null) return inherited;
+                }
+            }
+            return null;
+        }
+    }
+
+    /** The packages TeaVM never takes from the class path (ClasslibSubstitutionPolicy). */
+    private static boolean teavmSubstituted(String name) {
+        return name.startsWith("java/") || name.startsWith("javax/xml/");
+    }
+
+    /** Class library entries that stand for a JDK class, in TeaVM's lookup order. */
+    private static List<String> teavmCandidates(String name) {
+        List<String> candidates = new ArrayList<>(2);
+        if (name.startsWith("java/time/")) {
+            candidates.add("org/threeten/bp/" + name.substring("java/time/".length()));
+        }
+        if (name.startsWith("java/")) {
+            int slash = name.lastIndexOf('/');
+            candidates.add("org/teavm/classlib/" + name.substring(0, slash + 1) + "T"
+                    + name.substring(slash + 1));
+        }
+        return candidates;
+    }
+
+    /** Maps a class library internal name back to the JDK name it implements. */
+    private static String teavmJdkName(String name) {
+        if (name.startsWith("org/threeten/bp/")) {
+            return "java/time/" + name.substring("org/threeten/bp/".length());
+        }
+        if (name.startsWith("org/teavm/classlib/java/")) {
+            int slash = name.lastIndexOf('/');
+            String simple = name.substring(slash + 1);
+            if (simple.length() > 1 && simple.charAt(0) == 'T') {
+                return name.substring("org/teavm/classlib/".length(), slash + 1)
+                        + simple.substring(1);
             }
         }
-        return null;
+        return name;
+    }
+
+    private static String teavmJdkDescriptor(String descriptor) {
+        StringBuilder mapped = new StringBuilder(descriptor.length());
+        int index = 0;
+        while (index < descriptor.length()) {
+            char c = descriptor.charAt(index);
+            mapped.append(c);
+            index++;
+            if (c == 'L') {
+                int end = descriptor.indexOf(';', index);
+                mapped.append(teavmJdkName(descriptor.substring(index, end))).append(';');
+                index = end + 1;
+            }
+        }
+        return mapped.toString();
     }
 
     // ---------------------------------------------------------------- checks
+
+    private record Problem(String kind, String target) {
+    }
 
     private void report(String kind, String target, String referrer) {
         String key = kind + " " + target;
@@ -243,104 +377,164 @@ public final class LinkGapScanner {
         }
     }
 
-    private ClassInfo requireClass(String name, String referrer) {
+    /**
+     * Reports what the JVM check finds; when the reference links on the JVM,
+     * also what the TeaVM check finds, with a {@code teavm-} kind.
+     */
+    private void check(String referrer, java.util.function.Function<Resolver, List<Problem>> check) {
         checkedReferences++;
+        List<Problem> problems = check.apply(jvm);
+        for (Problem problem : problems) report(problem.kind(), problem.target(), referrer);
+        if (problems.isEmpty() && teavm != null) {
+            for (Problem problem : check.apply(teavm)) {
+                report("teavm-" + problem.kind(), problem.target(), referrer);
+            }
+        }
+    }
+
+    private ClassInfo requireClass(Resolver resolver, String name, List<Problem> problems) {
         if (name.startsWith("[")) {
             Type element = Type.getType(name).getElementType();
-            if (element.getSort() == Type.OBJECT) requireClass(element.getInternalName(), referrer);
-            return info("java/lang/Object");
+            if (element.getSort() == Type.OBJECT) {
+                requireClass(resolver, element.getInternalName(), problems);
+            }
+            return resolver.info("java/lang/Object");
         }
-        ClassInfo info = info(name);
-        if (info == null) report("missing-class", name, referrer);
+        // TeaVM renames references to class library classes (org/teavm/classlib/java/**/T*,
+        // org/threeten/bp/**) in the Gaius runtime substitutes back to the JDK names.
+        String linked = resolver.isTeaVM() ? teavmJdkName(name) : name;
+        ClassInfo info = resolver.info(linked);
+        if (info == null) problems.add(new Problem("missing-class", linked));
         return info;
     }
 
-    private void checkField(int opcode, String owner, String name, String desc, String referrer) {
-        ClassInfo ownerInfo = requireClass(owner, referrer);
-        if (ownerInfo == null) return;
+    private List<Problem> classProblems(Resolver resolver, String name) {
+        List<Problem> problems = new ArrayList<>(1);
+        requireClass(resolver, name, problems);
+        return problems;
+    }
+
+    private List<Problem> fieldProblems(Resolver resolver, int opcode, String owner, String name,
+            String desc) {
+        if (resolver.isTeaVM()) {
+            owner = teavmJdkName(owner);
+            desc = teavmJdkDescriptor(desc);
+        }
+        List<Problem> problems = new ArrayList<>(1);
+        ClassInfo ownerInfo = requireClass(resolver, owner, problems);
+        if (ownerInfo == null) return problems;
         String target = owner + "." + name + ":" + desc;
-        Member field = findField(ownerInfo, name, desc);
+        if (resolver.isTeaVM() && opcode == Opcodes.GETSTATIC && owner.equals("java/lang/System")
+                && (name.equals("out") || name.equals("err") || name.equals("in"))) {
+            // SystemClassTransformer reads System.out/err/in through TSystem.out()/err()/in().
+            Member accessor = ownerInfo.methods.get(name + "()" + desc);
+            if (accessor == null || (accessor.access & Opcodes.ACC_STATIC) == 0) {
+                problems.add(new Problem("missing-method", owner + "." + name + "()" + desc));
+            }
+            return problems;
+        }
+        Member field = resolver.findField(ownerInfo, name, desc);
         if (field == null) {
-            String unknown = missingSupertype(ownerInfo);
-            report(unknown == null ? "missing-field" : "unresolved-field", target
-                    + (unknown == null ? "" : " (missing supertype " + unknown + ")"), referrer);
-            return;
+            String unknown = resolver.missingSupertype(ownerInfo);
+            problems.add(new Problem(unknown == null ? "missing-field" : "unresolved-field", target
+                    + (unknown == null ? "" : " (missing supertype " + unknown + ")")));
+            return problems;
         }
         boolean isStatic = (field.access & Opcodes.ACC_STATIC) != 0;
         boolean wantsStatic = opcode == Opcodes.GETSTATIC || opcode == Opcodes.PUTSTATIC;
         if (isStatic != wantsStatic) {
-            report("static-mismatch", target + " accessed with " + opcodeName(opcode), referrer);
+            problems.add(new Problem("static-mismatch", target + " accessed with "
+                    + opcodeName(opcode)));
         }
+        return problems;
     }
 
-    private void checkMethod(int opcode, String owner, String name, String desc, boolean itf,
-            String referrer) {
-        ClassInfo ownerInfo = requireClass(owner, referrer);
-        if (ownerInfo == null || owner.startsWith("[")) return;
+    private List<Problem> methodProblems(Resolver resolver, int opcode, String owner, String name,
+            String desc, boolean itf) {
+        if (resolver.isTeaVM()) {
+            owner = owner.startsWith("[") ? owner : teavmJdkName(owner);
+            desc = teavmJdkDescriptor(desc);
+        }
+        List<Problem> problems = new ArrayList<>(1);
+        ClassInfo ownerInfo = requireClass(resolver, owner, problems);
+        if (ownerInfo == null || owner.startsWith("[")) return problems;
         String target = owner + "." + name + desc;
         boolean ownerIsInterface = ownerInfo.isInterface();
         if (opcode == Opcodes.INVOKEINTERFACE && !ownerIsInterface) {
-            report("itf-mismatch", target + " invokeinterface on a class", referrer);
+            problems.add(new Problem("itf-mismatch", target + " invokeinterface on a class"));
         } else if (opcode == Opcodes.INVOKEVIRTUAL && ownerIsInterface) {
-            report("itf-mismatch", target + " invokevirtual on an interface", referrer);
+            problems.add(new Problem("itf-mismatch", target + " invokevirtual on an interface"));
         } else if (itf != ownerIsInterface) {
-            report("itf-mismatch", target + " " + opcodeName(opcode) + " itf=" + itf
-                    + " but owner is " + (ownerIsInterface ? "an interface" : "a class"), referrer);
+            problems.add(new Problem("itf-mismatch", target + " " + opcodeName(opcode) + " itf="
+                    + itf + " but owner is " + (ownerIsInterface ? "an interface" : "a class")));
         }
         Member method;
         if (name.equals("<init>") || name.equals("<clinit>")) {
             method = ownerInfo.methods.get(name + desc);
         } else if (ownerIsInterface) {
-            method = findInterfaceMethod(ownerInfo, name, desc);
+            method = resolver.findInterfaceMethod(ownerInfo, name, desc);
         } else {
-            method = findClassMethod(ownerInfo, name, desc);
+            method = resolver.findClassMethod(ownerInfo, name, desc);
         }
         if (method == null) {
-            String unknown = name.startsWith("<") ? null : missingSupertype(ownerInfo);
-            report(unknown == null ? "missing-method" : "unresolved-method", target
-                    + (unknown == null ? "" : " (missing supertype " + unknown + ")"), referrer);
-            return;
+            String unknown = name.startsWith("<") ? null : resolver.missingSupertype(ownerInfo);
+            problems.add(new Problem(unknown == null ? "missing-method" : "unresolved-method",
+                    target + (unknown == null ? "" : " (missing supertype " + unknown + ")")));
+            return problems;
         }
         boolean isStatic = (method.access & Opcodes.ACC_STATIC) != 0;
         boolean wantsStatic = opcode == Opcodes.INVOKESTATIC;
         if (isStatic != wantsStatic) {
-            report("static-mismatch", target + " invoked with " + opcodeName(opcode), referrer);
+            problems.add(new Problem("static-mismatch", target + " invoked with "
+                    + opcodeName(opcode)));
         }
+        return problems;
     }
 
-    private void checkHandle(Handle handle, String referrer) {
+    private List<Problem> handleProblems(Resolver resolver, Handle handle) {
         String owner = handle.getOwner();
-        switch (handle.getTag()) {
-            case Opcodes.H_GETFIELD -> checkField(Opcodes.GETFIELD, owner, handle.getName(),
-                    handle.getDesc(), referrer);
-            case Opcodes.H_GETSTATIC -> checkField(Opcodes.GETSTATIC, owner, handle.getName(),
-                    handle.getDesc(), referrer);
-            case Opcodes.H_PUTFIELD -> checkField(Opcodes.PUTFIELD, owner, handle.getName(),
-                    handle.getDesc(), referrer);
-            case Opcodes.H_PUTSTATIC -> checkField(Opcodes.PUTSTATIC, owner, handle.getName(),
-                    handle.getDesc(), referrer);
-            case Opcodes.H_INVOKEVIRTUAL -> checkMethod(Opcodes.INVOKEVIRTUAL, owner,
-                    handle.getName(), handle.getDesc(), handle.isInterface(), referrer);
-            case Opcodes.H_INVOKESTATIC -> checkMethod(Opcodes.INVOKESTATIC, owner,
-                    handle.getName(), handle.getDesc(), handle.isInterface(), referrer);
-            case Opcodes.H_INVOKESPECIAL, Opcodes.H_NEWINVOKESPECIAL -> checkMethod(
+        return switch (handle.getTag()) {
+            case Opcodes.H_GETFIELD -> fieldProblems(resolver, Opcodes.GETFIELD, owner,
+                    handle.getName(), handle.getDesc());
+            case Opcodes.H_GETSTATIC -> fieldProblems(resolver, Opcodes.GETSTATIC, owner,
+                    handle.getName(), handle.getDesc());
+            case Opcodes.H_PUTFIELD -> fieldProblems(resolver, Opcodes.PUTFIELD, owner,
+                    handle.getName(), handle.getDesc());
+            case Opcodes.H_PUTSTATIC -> fieldProblems(resolver, Opcodes.PUTSTATIC, owner,
+                    handle.getName(), handle.getDesc());
+            case Opcodes.H_INVOKEVIRTUAL -> methodProblems(resolver, Opcodes.INVOKEVIRTUAL, owner,
+                    handle.getName(), handle.getDesc(), handle.isInterface());
+            case Opcodes.H_INVOKESTATIC -> methodProblems(resolver, Opcodes.INVOKESTATIC, owner,
+                    handle.getName(), handle.getDesc(), handle.isInterface());
+            case Opcodes.H_INVOKESPECIAL, Opcodes.H_NEWINVOKESPECIAL -> methodProblems(resolver,
                     Opcodes.INVOKESPECIAL, owner, handle.getName(), handle.getDesc(),
-                    handle.isInterface(), referrer);
-            case Opcodes.H_INVOKEINTERFACE -> checkMethod(Opcodes.INVOKEINTERFACE, owner,
-                    handle.getName(), handle.getDesc(), handle.isInterface(), referrer);
-            default -> report("unknown-handle", owner + "." + handle.getName(), referrer);
+                    handle.isInterface());
+            case Opcodes.H_INVOKEINTERFACE -> methodProblems(resolver, Opcodes.INVOKEINTERFACE,
+                    owner, handle.getName(), handle.getDesc(), handle.isInterface());
+            default -> List.of(new Problem("unknown-handle", owner + "." + handle.getName()));
+        };
+    }
+
+    /** A bootstrap method handle: TeaVM links only its registered bootstrap substitutors. */
+    private List<Problem> bootstrapProblems(Resolver resolver, Handle bootstrap) {
+        if (resolver.isTeaVM()) {
+            String method = bootstrap.getOwner() + "." + bootstrap.getName();
+            return TEAVM_BOOTSTRAPS.contains(method) ? List.of()
+                    : List.of(new Problem("unsupported-bootstrap", method + bootstrap.getDesc()));
         }
+        return handleProblems(resolver, bootstrap);
     }
 
     private void checkConstant(Object value, String referrer) {
         if (value instanceof Type type) {
             if (type.getSort() == Type.OBJECT || type.getSort() == Type.ARRAY) {
-                requireClass(type.getInternalName(), referrer);
+                String name = type.getInternalName();
+                check(referrer, resolver -> classProblems(resolver, name));
             }
         } else if (value instanceof Handle handle) {
-            checkHandle(handle, referrer);
+            check(referrer, resolver -> handleProblems(resolver, handle));
         } else if (value instanceof ConstantDynamic dynamic) {
-            checkHandle(dynamic.getBootstrapMethod(), referrer);
+            check(referrer, resolver -> bootstrapProblems(resolver, dynamic.getBootstrapMethod()));
             for (int index = 0; index < dynamic.getBootstrapMethodArgumentCount(); index++) {
                 checkConstant(dynamic.getBootstrapMethodArgument(index), referrer);
             }
@@ -374,9 +568,11 @@ public final class LinkGapScanner {
         public void visit(int version, int access, String name, String signature,
                 String superName, String[] interfaces) {
             className = name;
-            if (superName != null) requireClass(superName, name);
+            if (superName != null) check(name, resolver -> classProblems(resolver, superName));
             if (interfaces != null) {
-                for (String parent : interfaces) requireClass(parent, name);
+                for (String parent : interfaces) {
+                    check(name, resolver -> classProblems(resolver, parent));
+                }
             }
         }
 
@@ -388,22 +584,28 @@ public final class LinkGapScanner {
                 @Override
                 public void visitFieldInsn(int opcode, String owner, String fieldName,
                         String fieldDescriptor) {
-                    checkField(opcode, owner, fieldName, fieldDescriptor, referrer);
+                    check(referrer, resolver -> fieldProblems(resolver, opcode, owner, fieldName,
+                            fieldDescriptor));
                 }
 
                 @Override
                 public void visitMethodInsn(int opcode, String owner, String methodName,
                         String methodDescriptor, boolean isInterface) {
-                    checkMethod(opcode, owner, methodName, methodDescriptor, isInterface, referrer);
+                    check(referrer, resolver -> methodProblems(resolver, opcode, owner, methodName,
+                            methodDescriptor, isInterface));
                 }
 
                 @Override
                 public void visitTypeInsn(int opcode, String type) {
-                    ClassInfo info = requireClass(type, referrer);
-                    if (opcode == Opcodes.NEW && info != null && (info.isInterface()
-                            || (info.access & Opcodes.ACC_ABSTRACT) != 0)) {
-                        report("abstract-new", type, referrer);
-                    }
+                    check(referrer, resolver -> {
+                        List<Problem> problems = new ArrayList<>(1);
+                        ClassInfo info = requireClass(resolver, type, problems);
+                        if (opcode == Opcodes.NEW && info != null && (info.isInterface()
+                                || (info.access & Opcodes.ACC_ABSTRACT) != 0)) {
+                            problems.add(new Problem("abstract-new", type));
+                        }
+                        return problems;
+                    });
                 }
 
                 @Override
@@ -413,56 +615,124 @@ public final class LinkGapScanner {
 
                 @Override
                 public void visitMultiANewArrayInsn(String arrayDescriptor, int dimensions) {
-                    requireClass(arrayDescriptor, referrer);
+                    check(referrer, resolver -> classProblems(resolver, arrayDescriptor));
                 }
 
                 @Override
                 public void visitInvokeDynamicInsn(String dynamicName, String dynamicDescriptor,
                         Handle bootstrap, Object... arguments) {
-                    checkHandle(bootstrap, referrer);
+                    check(referrer, resolver -> bootstrapProblems(resolver, bootstrap));
                     for (Object argument : arguments) checkConstant(argument, referrer);
                 }
 
                 @Override
                 public void visitTryCatchBlock(org.objectweb.asm.Label start,
                         org.objectweb.asm.Label end, org.objectweb.asm.Label handler, String type) {
-                    if (type != null) requireClass(type, referrer);
+                    if (type != null) check(referrer, resolver -> classProblems(resolver, type));
                 }
             };
         }
     }
 
+    /**
+     * Records a class's kind, supertypes and members.  For the TeaVM model the
+     * class library names are mapped back to JDK names and the TeaVM interop
+     * annotations are applied: {@code @Rename("x")} gives a member its linked
+     * name, {@code @Remove} drops it, {@code @Superclass("a.B")} replaces the
+     * superclass ({@code ""} for none).
+     */
     private static final class InfoVisitor extends ClassVisitor {
-        private final ClassInfo info;
+        private static final String RENAME = "Lorg/teavm/interop/Rename;";
+        private static final String REMOVE = "Lorg/teavm/interop/Remove;";
+        private static final String SUPERCLASS = "Lorg/teavm/interop/Superclass;";
 
-        InfoVisitor(ClassInfo info) {
+        private final ClassInfo info;
+        private final boolean teavm;
+
+        InfoVisitor(ClassInfo info, boolean teavm) {
             super(Opcodes.ASM9);
             this.info = info;
+            this.teavm = teavm;
+        }
+
+        private String name(String internalName) {
+            return teavm ? teavmJdkName(internalName) : internalName;
+        }
+
+        private String descriptor(String descriptor) {
+            return teavm ? teavmJdkDescriptor(descriptor) : descriptor;
         }
 
         @Override
         public void visit(int version, int access, String name, String signature,
                 String superName, String[] interfaces) {
-            info.name = name;
+            info.name = name(name);
             info.access = access;
-            info.superName = superName;
-            if (interfaces != null) info.interfaces.addAll(List.of(interfaces));
+            info.superName = superName == null ? null : name(superName);
+            if (interfaces != null) {
+                for (String parent : interfaces) info.interfaces.add(name(parent));
+            }
+        }
+
+        @Override
+        public AnnotationVisitor visitAnnotation(String descriptor, boolean visible) {
+            if (!teavm || !descriptor.equals(SUPERCLASS)) return null;
+            return new AnnotationVisitor(Opcodes.ASM9) {
+                @Override
+                public void visit(String key, Object value) {
+                    if (key.equals("value")) {
+                        String superclass = ((String) value).replace('.', '/');
+                        info.superName = superclass.isEmpty() ? null : superclass;
+                    }
+                }
+            };
         }
 
         @Override
         public FieldVisitor visitField(int access, String name, String descriptor,
                 String signature, Object value) {
-            info.fields.put(name + ":" + descriptor, new Member(access));
+            info.fields.put(name + ":" + descriptor(descriptor), new Member(access));
             return null;
         }
 
         @Override
         public MethodVisitor visitMethod(int access, String name, String descriptor,
                 String signature, String[] exceptions) {
+            String linkedDescriptor = descriptor(descriptor);
+            if (!teavm) {
+                add(name, linkedDescriptor, access);
+                return null;
+            }
+            return new MethodVisitor(Opcodes.ASM9) {
+                private String linkedName = name;
+                private boolean removed;
+
+                @Override
+                public AnnotationVisitor visitAnnotation(String annotation, boolean visible) {
+                    if (annotation.equals(REMOVE)) {
+                        removed = true;
+                    } else if (annotation.equals(RENAME)) {
+                        return new AnnotationVisitor(Opcodes.ASM9) {
+                            @Override
+                            public void visit(String key, Object value) {
+                                if (key.equals("value")) linkedName = (String) value;
+                            }
+                        };
+                    }
+                    return null;
+                }
+
+                @Override
+                public void visitEnd() {
+                    if (!removed) add(linkedName, linkedDescriptor, access);
+                }
+            };
+        }
+
+        private void add(String name, String descriptor, int access) {
             Member member = new Member(access);
             info.methods.put(name + descriptor, member);
             info.methodsByName.putIfAbsent(name, member);
-            return null;
         }
     }
 

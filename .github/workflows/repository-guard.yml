@@ -480,6 +480,11 @@ jobs:
           ./port/scripts/generate-pom.sh
           ./port/mvnw --batch-mode --no-transfer-progress \
             --file port/target/26.3/generated-pom.xml compile
+          # G3: no link gap, on the JVM or against TeaVM's class library, other than the
+          # reviewed known issues of port/scripts/link-gap/known-26.3.json.
+          node port/scripts/minecraft-link-gap-smoke.mjs --profile 26.3 --expect-zero --quiet
+          # The JDK API helpers match the JDK, and every 26.3 call site is redirected.
+          node port/scripts/browser-jdk-compat-smoke.mjs --profile 26.3 --stages jvm,overlay
           # A release refuses overlays that carry the bring-up marker even when
           # it would reuse them without rebuilding.
           printf 'bring-up marker (CI refusal check)\n' >port/work/overlays/26.3/BRINGUP

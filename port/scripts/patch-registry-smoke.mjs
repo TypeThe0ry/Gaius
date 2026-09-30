@@ -7,7 +7,7 @@
 //   patch id rule it shares with version-profile.sh, check-build-log-skips.mjs and
 //   check-version-profile.mjs;
 // - dev.gaius.tools.Minecraft263BrowserPatcher: refuses 26.2/1.21.11 and non-renderpearl jars,
-//   runs the six m263 domain shells in order on the 26.3 jar;
+//   runs the six m263 package domains and the JdkCompat domain in order on the 26.3 jar;
 // - MinecraftClientPatcher/Minecraft262BrowserPatcher main(): every patch call is wrapped in
 //   PatchRegistry.run("<Class>.<method>", () -> <method>(...)).
 // When port/tools/bringup/26.3.txt exists (or --bringup-list PATH is given), it also runs
@@ -465,7 +465,7 @@ try {
         const domainLines = result.out.split(/\r?\n/)
           .filter((line) => /^[A-Za-z]+Patches263: /.test(line)).map((line) => line.split(":")[0]);
         assert.deepEqual(domainLines, ["RenderPatches263", "InputPatches263", "TerrainPatches263",
-          "WorldgenPatches263", "ServerPatches263", "UiPatches263"]);
+          "WorldgenPatches263", "ServerPatches263", "UiPatches263", "JdkCompatPatches263"]);
         assert.match(result.out,
           /^Minecraft263BrowserPatcher: profile 26\.3, renderApi=RENDERPEARL .*input=SDL/m);
       }

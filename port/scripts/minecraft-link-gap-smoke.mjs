@@ -10,6 +10,17 @@
 // match the owner's kind and that static accesses hit static members.  This is
 // the gate for "patch applied silently but its references dangle".
 //
+// TeaVM class library check: every reference that links on the JVM is also
+// resolved the way TeaVM 0.15 links it (JDK packages only through the TeaVM
+// class library of the POM, no fallback to the running JDK; invokedynamic
+// only through TeaVM's bootstrap substitutors).  A JDK API that the class
+// library does not implement is reported with a "teavm-" kind (for example
+// "teavm-missing-method java/lang/Math.powExact(II)I"), so a new vanilla or
+// Gaius use of such an API fails here instead of in a 20-minute TeaVM build.
+// The scan covers the whole jar, unreachable code included; references that
+// TeaVM's reachability analysis never reaches are listed per profile in
+// port/scripts/link-gap/known-<id>.json with the reason they are harmless.
+//
 // Prerequisites for a profile: build-overlays.sh, generate-pom.sh and a
 // javac-only Maven compile of the generated POM (mvnw -f <pom> compile).
 //
@@ -26,8 +37,17 @@
 //   --runtime-classes <dir>  default <build-root>/maven/classes
 //   --no-runtime-classes     scan the client jar only (Gaius runtime references
 //                            are then reported as missing classes)
+//   --no-teavm-classlib      skip the TeaVM class library check (JVM links only)
 //   --baseline <json>        fail on issues that are not in the baseline (26.2 rule)
-//   --expect-zero            fail on any issue (26.3 rule)
+//   --expect-zero            fail on any issue that is not in the known-issue
+//                            list (26.3 rule)
+//   --known <json>           known-issue list for --expect-zero (default
+//                            port/scripts/link-gap/known-<id>.json when present)
+//   --no-known               --expect-zero counts every issue
+//   --write-known <json>     write the current issue set as a known-issue list:
+//                            keeps the reason of every key already in the list,
+//                            new keys get --known-reason (required if any)
+//   --known-reason <text>    reason recorded for new keys by --write-known
 //   --write-baseline <json>  record the current issue set
 //   --report <json>          write every issue with counts and sample referrers
 // Exit status: 0 pass, 1 gate failure, 2 usage or environment error.
@@ -59,7 +79,8 @@ function usage(message) {
 }
 
 const options = {};
-const flags = new Set(["--no-runtime-classes", "--expect-zero", "--quiet"]);
+const flags = new Set(["--no-runtime-classes", "--expect-zero", "--quiet",
+  "--no-teavm-classlib", "--no-known"]);
 for (let index = 2; index < process.argv.length; index++) {
   const argument = process.argv[index];
   if (flags.has(argument)) {
@@ -70,11 +91,13 @@ for (let index = 2; index < process.argv.length; index++) {
     usage(`unknown or incomplete argument ${argument}`);
   }
 }
-const known = new Set(["profile", "overlay-dir", "build-root", "pom", "runtime-classes",
-  "no-runtime-classes", "baseline", "expect-zero", "write-baseline", "report", "quiet"]);
+const knownOptions = new Set(["profile", "overlay-dir", "build-root", "pom", "runtime-classes",
+  "no-runtime-classes", "baseline", "expect-zero", "write-baseline", "report", "quiet",
+  "no-teavm-classlib", "known", "no-known", "write-known", "known-reason"]);
 for (const key of Object.keys(options)) {
-  if (!known.has(key)) usage(`unknown option --${key}`);
+  if (!knownOptions.has(key)) usage(`unknown option --${key}`);
 }
+if (options.known && options["no-known"]) usage("--known and --no-known exclude each other");
 
 function activeProfile() {
   if (options.profile) return options.profile;
@@ -158,6 +181,14 @@ function javaTool(name) {
 const asmJar = join(mavenRepository, "org/ow2/asm/asm", ASM_VERSION, `asm-${ASM_VERSION}.jar`);
 if (!existsSync(asmJar)) usage(`ASM ${ASM_VERSION} is missing: ${asmJar}`);
 
+// The TeaVM class library TeaVM compiles against: the Gaius overlay jar of the
+// POM (teavm-classlib-<version>-gaius.jar), or the upstream artifact.
+const teavmClasslib = options["no-teavm-classlib"] ? null
+  : classpath.find((path) => /^teavm-classlib-[^/\\]*\.jar$/.test(basename(path)));
+if (!options["no-teavm-classlib"] && !teavmClasslib) {
+  usage("the generated POM has no teavm-classlib jar (pass --no-teavm-classlib to skip the check)");
+}
+
 const work = mkdtempSync(join(tmpdir(), "gaius-link-gap-"));
 const issuesPath = join(work, "issues.tsv");
 const scannerArguments = ["-cp", asmJar, scannerSource, "--out", issuesPath,
@@ -166,6 +197,7 @@ if (runtimeClasses) scannerArguments.push("--subject", runtimeClasses);
 for (const path of classpath) {
   if (resolve(path) !== resolve(patchedJar)) scannerArguments.push("--classpath", path);
 }
+if (teavmClasslib) scannerArguments.push("--teavm-classlib", teavmClasslib);
 
 let scanned;
 try {
@@ -192,7 +224,7 @@ for (const key of issues.keys()) {
   byKind[kind] = (byKind[kind] ?? 0) + 1;
 }
 
-console.log(`LINK_GAP_PROFILE ${profile}`);
+console.log(`LINK_GAP_PROFILE ${profile} teavmClasslib=${teavmClasslib ? basename(teavmClasslib) : "off"}`);
 console.log(`LINK_GAP_ISSUES total=${issues.size} ` +
   Object.entries(byKind).sort().map(([kind, count]) => `${kind}=${count}`).join(" "));
 
@@ -239,9 +271,55 @@ if (options.baseline) {
     `unchanged=${issues.size - added.length}`);
   if (added.length > 0) failed = true;
 }
+// Known-issue list: {"format": "gaius-link-gap-known/1", "profile": id,
+//   "groups": [{"reason": text, "issues": [key, ...]}, ...]}.
+const defaultKnownPath = join(root, "port/scripts/link-gap", `known-${profile}.json`);
+const knownPath = options["no-known"] ? null
+  : options.known ? fromRoot(options.known)
+    : existsSync(defaultKnownPath) ? defaultKnownPath : null;
+function readKnown(path) {
+  const list = JSON.parse(readFileSync(path, "utf8"));
+  if (list.format !== "gaius-link-gap-known/1") usage(`${path} has an unknown format`);
+  if (list.profile !== profile) usage(`${path} is for profile ${list.profile}, not ${profile}`);
+  const reasons = new Map();
+  for (const group of list.groups ?? []) {
+    if (typeof group.reason !== "string" || !group.reason.trim()) {
+      usage(`${path}: every group needs a reason`);
+    }
+    for (const key of group.issues ?? []) {
+      if (reasons.has(key)) usage(`${path}: ${key} is listed twice`);
+      reasons.set(key, group.reason);
+    }
+  }
+  return reasons;
+}
 if (options["expect-zero"]) {
-  show("ISSUE", [...issues.keys()].sort());
-  if (issues.size > 0) failed = true;
+  const reasons = knownPath ? readKnown(knownPath) : new Map();
+  const unknown = [...issues.keys()].filter((key) => !reasons.has(key)).sort();
+  const stale = [...reasons.keys()].filter((key) => !issues.has(key)).sort();
+  show("ISSUE", unknown);
+  for (const key of stale) console.log(`KNOWN_RESOLVED ${key}`);
+  console.log(`LINK_GAP_KNOWN list=${knownPath ? basename(knownPath) : "none"} ` +
+    `known=${issues.size - unknown.length} new=${unknown.length} resolved=${stale.length}`);
+  if (unknown.length > 0) failed = true;
+}
+if (options["write-known"]) {
+  const target = fromRoot(options["write-known"]);
+  const previous = existsSync(target) ? readKnown(target) : new Map();
+  const reason = options["known-reason"];
+  const byReason = new Map();
+  for (const key of [...issues.keys()].sort()) {
+    const keyReason = previous.get(key) ?? reason;
+    if (!keyReason) usage(`--write-known: ${key} is new; pass --known-reason`);
+    if (!byReason.has(keyReason)) byReason.set(keyReason, []);
+    byReason.get(keyReason).push(key);
+  }
+  writeFileSync(target, JSON.stringify({
+    format: "gaius-link-gap-known/1",
+    profile,
+    groups: [...byReason].map(([groupReason, keys]) => ({reason: groupReason, issues: keys})),
+  }, null, 1) + "\n");
+  console.log(`LINK_GAP_KNOWN_WRITTEN ${options["write-known"]} issues=${issues.size}`);
 }
 if (!options.baseline && !options["expect-zero"] && !options.quiet) {
   show("ISSUE", [...issues.keys()].sort());

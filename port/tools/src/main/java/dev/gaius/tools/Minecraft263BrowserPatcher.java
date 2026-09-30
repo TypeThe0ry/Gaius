@@ -1,6 +1,7 @@
 package dev.gaius.tools;
 
 import dev.gaius.tools.m263.InputPatches263;
+import dev.gaius.tools.m263.JdkCompatPatches263;
 import dev.gaius.tools.m263.RenderPatches263;
 import dev.gaius.tools.m263.ServerPatches263;
 import dev.gaius.tools.m263.TerrainPatches263;
@@ -18,7 +19,9 @@ import java.nio.file.Path;
  * <p>Holds the 26.3-only transforms and the rewrites that share nothing with the 26.2 patches.
  * Each domain class belongs to one work package (contract C2):
  * {@link RenderPatches263} (P3), {@link InputPatches263} (P2), {@link TerrainPatches263} (P5),
- * {@link WorldgenPatches263} (P6), {@link ServerPatches263} (P7a), {@link UiPatches263} (P8).
+ * {@link WorldgenPatches263} (P6), {@link ServerPatches263} (P7a), {@link UiPatches263} (P8),
+ * then {@link JdkCompatPatches263} (P0: redirects the JDK APIs that TeaVM's class library lacks,
+ * over the whole jar, so it runs after the package domains).
  * Each exposes {@code static void apply(String jar, Path root, ModernSymbols s)} and wraps every
  * patch in {@code PatchRegistry.run("<Domain>Patches263.<method>", ...)}. A domain reads a class
  * from {@code root} when an earlier domain already wrote it there, otherwise from the jar, so
@@ -58,6 +61,8 @@ public final class Minecraft263BrowserPatcher {
         WorldgenPatches263.apply(jar, root, symbols);
         ServerPatches263.apply(jar, root, symbols);
         UiPatches263.apply(jar, root, symbols);
+        // Whole-jar rewrite: after the package domains, so it also sees the classes they wrote.
+        JdkCompatPatches263.apply(jar, root, symbols);
         // After every domain: the worldgen non-suspending guard sees the whole M263 output.
         WorldgenPatches263.verifyChainTail(jar, root);
         PatchRegistry.printSummary();
