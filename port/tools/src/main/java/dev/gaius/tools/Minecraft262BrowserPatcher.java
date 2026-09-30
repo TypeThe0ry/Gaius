@@ -1731,12 +1731,22 @@ public final class Minecraft262BrowserPatcher {
         String pair = "com/mojang/datafixers/util/Pair";
         String allocator = "com/mojang/blaze3d/vertex/TlsfAllocator";
         String heap = owner + "$UberGpuBufferHeap";
+        // 26.3: GpuDevice and GpuBuffer are renderpearl interfaces, so the emitted
+        // GpuBuffer.close() must be INVOKEINTERFACE (26.2: INVOKEVIRTUAL on the class).
+        ModernSymbols symbols = ModernSymbols.cached(jar);
+        String gpuBufferKey = "com/mojang/blaze3d/buffers/GpuBuffer";
+        String gpuBuffer = symbols.renderType(gpuBufferKey);
         ClassNode node = read(jar, owner + ".class");
         MethodNode method = find(
                 node,
                 "uploadStagedAllocations",
-                "(Lcom/mojang/blaze3d/systems/GpuDevice;"
+                "(L" + symbols.renderType("com/mojang/blaze3d/systems/GpuDevice") + ";"
                         + "Lcom/mojang/blaze3d/vertex/StagingBuffer$Uploader;)Z");
+        ClassNode heapNode = read(jar, heap + ".class");
+        if (heapNode.fields.stream().noneMatch(field -> field.name.equals("gpuBuffer")
+                && field.desc.equals("L" + gpuBuffer + ";"))) {
+            throw new IllegalStateException(heap + ".gpuBuffer is no longer a " + gpuBuffer);
+        }
 
         MethodInsnNode finishUpload = null;
         for (AbstractInsnNode instruction : method.instructions.toArray()) {
@@ -1856,13 +1866,13 @@ public final class Minecraft262BrowserPatcher {
                 Opcodes.GETFIELD,
                 heap,
                 "gpuBuffer",
-                "Lcom/mojang/blaze3d/buffers/GpuBuffer;"));
+                "L" + gpuBuffer + ";"));
         cleanup.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL,
-                "com/mojang/blaze3d/buffers/GpuBuffer",
+                symbols.invokeOpcode(gpuBufferKey),
+                gpuBuffer,
                 "close",
                 "()V",
-                false));
+                symbols.isInterface(gpuBufferKey)));
         cleanup.add(new VarInsnNode(Opcodes.ALOAD, 0));
         cleanup.add(new FieldInsnNode(
                 Opcodes.GETFIELD, owner, "nodes", "Ljava/util/List;"));
@@ -1913,7 +1923,8 @@ public final class Minecraft262BrowserPatcher {
             instruction = next;
         }
         writeComputeFrames(node, root.resolve(owner + ".class"));
-        System.out.println("Bounded Minecraft 26.2 UberGpuBuffer heap cleanup");
+        System.out.println("Bounded Minecraft " + (symbols.renderpearl() ? "26.3" : "26.2")
+                + " UberGpuBuffer heap cleanup");
     }
 
     private static FieldInsnNode fieldBefore(AbstractInsnNode instruction) {
@@ -2479,7 +2490,8 @@ public final class Minecraft262BrowserPatcher {
             throw new IllegalStateException(
                     "Minecraft.renderFrame targeting deferral changed: " + deferred);
         }
-        write(minecraft, root.resolve(minecraftOwner + ".class"));
+        // The deferred pick is only refreshed by the GameRenderer half below, so Minecraft.class
+        // is written only after that half has been validated and patched (both or neither).
 
         String owner = "net/minecraft/client/renderer/GameRenderer";
         ClassNode node = read(jar, owner + ".class");
@@ -2487,6 +2499,13 @@ public final class Minecraft262BrowserPatcher {
                 node,
                 "extract",
                 "(Lnet/minecraft/client/DeltaTracker;Z)V");
+        // 26.2 passes a separate camera partial tick: extractCamera(DeltaTracker;FF)V. 26.3
+        // extracts the camera with the world partial tick only, extractCamera(DeltaTracker;F)V,
+        // and computes the camera entity's partial tick inside Camera.extractRenderState.
+        boolean singlePartialTick = ModernSymbols.cached(jar).renderpearl();
+        String extractCameraDescriptor = singlePartialTick
+                ? "(Lnet/minecraft/client/DeltaTracker;F)V"
+                : "(Lnet/minecraft/client/DeltaTracker;FF)V";
         MethodInsnNode extractCamera = null;
         MethodInsnNode extractLevel = null;
         for (AbstractInsnNode instruction = extract.instructions.getFirst();
@@ -2496,7 +2515,7 @@ public final class Minecraft262BrowserPatcher {
                     && call.getOpcode() == Opcodes.INVOKEVIRTUAL
                     && call.owner.equals(owner)
                     && call.name.equals("extractCamera")
-                    && call.desc.equals("(Lnet/minecraft/client/DeltaTracker;FF)V")) {
+                    && call.desc.equals(extractCameraDescriptor)) {
                 if (extractCamera != null) {
                     throw new IllegalStateException(
                             "GameRenderer.extract has multiple extractCamera calls");
@@ -2536,6 +2555,14 @@ public final class Minecraft262BrowserPatcher {
         while (cameraPartialTick != null && cameraPartialTick.getOpcode() < 0) {
             cameraPartialTick = cameraPartialTick.getPrevious();
         }
+        if (singlePartialTick) {
+            patchCurrentLiveFrameTargetingRefresh(jar, extract, extractCamera,
+                    cameraPartialTick, worldPartialTickLoad);
+            write(minecraft, root.resolve(minecraftOwner + ".class"));
+            write(node, root.resolve(owner + ".class"));
+            System.out.println("Moved Minecraft 26.3 frame targeting after camera extraction");
+            return;
+        }
         if (!(cameraPartialTick instanceof VarInsnNode cameraPartialTickLoad)
                 || cameraPartialTickLoad.getOpcode() != Opcodes.FLOAD
                 || cameraPartialTickLoad.var == worldPartialTickLoad.var) {
@@ -2565,8 +2592,62 @@ public final class Minecraft262BrowserPatcher {
                 false));
         extract.instructions.insert(extractCamera, refresh);
         extract.maxStack = Math.max(extract.maxStack, 3);
+        write(minecraft, root.resolve(minecraftOwner + ".class"));
         write(node, root.resolve(owner + ".class"));
         System.out.println("Moved Minecraft 26.2 frame targeting after camera extraction");
+    }
+
+    /**
+     * 26.3 GameRenderer half of patchLiveFrameTargeting: extractCamera receives the world
+     * partial tick, so the camera entity's partial tick is recomputed inline with the public
+     * Camera.getCameraEntityPartialTicks(DeltaTracker) (extract's local 1), inside the same
+     * shouldRenderLevel block that 26.2 computed it in. Only validates and edits {@code extract}.
+     */
+    private static void patchCurrentLiveFrameTargetingRefresh(String jar, MethodNode extract,
+            MethodInsnNode extractCamera, AbstractInsnNode cameraPartialTick,
+            VarInsnNode worldPartialTickLoad) throws IOException {
+        String owner = "net/minecraft/client/renderer/GameRenderer";
+        String camera = "net/minecraft/client/Camera";
+        String partialTicksDescriptor = "(Lnet/minecraft/client/DeltaTracker;)F";
+        AbstractInsnNode trackerArgument = cameraPartialTick == null
+                ? null : previousOpcode(cameraPartialTick);
+        if (!(cameraPartialTick instanceof VarInsnNode partialLoad)
+                || partialLoad.getOpcode() != Opcodes.FLOAD
+                || partialLoad.var != worldPartialTickLoad.var
+                || !(trackerArgument instanceof VarInsnNode trackerLoad)
+                || trackerLoad.getOpcode() != Opcodes.ALOAD
+                || trackerLoad.var != 1) {
+            throw new IllegalStateException(
+                    "GameRenderer.extract 26.3 camera extraction arguments changed");
+        }
+        MethodNode cameraPartialTicks = find(read(jar, camera + ".class"),
+                "getCameraEntityPartialTicks", partialTicksDescriptor);
+        if ((cameraPartialTicks.access & Opcodes.ACC_PUBLIC) == 0
+                || (cameraPartialTicks.access & Opcodes.ACC_STATIC) != 0) {
+            throw new IllegalStateException(
+                    "Camera.getCameraEntityPartialTicks is no longer a public instance method");
+        }
+        InsnList refresh = new InsnList();
+        refresh.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        refresh.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "minecraft", "Lnet/minecraft/client/Minecraft;"));
+        refresh.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        refresh.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "mainCamera", "L" + camera + ";"));
+        refresh.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        refresh.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "mainCamera", "L" + camera + ";"));
+        refresh.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        refresh.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                camera, "getCameraEntityPartialTicks", partialTicksDescriptor, false));
+        refresh.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserTargeting",
+                "refreshFramePick",
+                "(Lnet/minecraft/client/Minecraft;Lnet/minecraft/client/Camera;F)V",
+                false));
+        extract.instructions.insert(extractCamera, refresh);
+        extract.maxStack = Math.max(extract.maxStack, 4);
     }
 
     private static void patchSectionRenderTaskRetryYields(String jar, Path root)
@@ -2891,9 +2972,11 @@ public final class Minecraft262BrowserPatcher {
     private static void patchStagingBuffer(String jar, Path root) throws IOException {
         String owner = "com/mojang/blaze3d/vertex/StagingBuffer$Cpu";
         ClassNode node = read(jar, owner + ".class");
+        ModernSymbols symbols = ModernSymbols.cached(jar);
         MethodNode method = find(node, "copyTo",
-                "(Lcom/mojang/blaze3d/systems/CommandEncoder;"
-                        + "Lcom/mojang/blaze3d/buffers/GpuBuffer;JJJ)V");
+                "(L" + symbols.renderType("com/mojang/blaze3d/systems/CommandEncoder") + ";"
+                        + "L" + symbols.renderType("com/mojang/blaze3d/buffers/GpuBuffer")
+                        + ";JJJ)V");
         int replaced = replaceCall(
                 method,
                 Opcodes.INVOKEVIRTUAL,

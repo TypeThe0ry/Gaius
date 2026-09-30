@@ -34,7 +34,6 @@ step:LwjglCallbackDescriptorPatcher@lwjgl | P1 | ASM 9.8 cannot read META-INF/ve
 step:LwjglSdlBrowserPatcher | P2 | SDL3 browser shim patcher does not exist yet (D3)
 step:LwjglShadercBrowserPatcher | P4 | shaderc browser shim patcher does not exist yet (D5)
 step:LwjglSpvcBrowserPatcher | P4 | spvc browser shim patcher does not exist yet (D5)
-step:MinecraftChunkDrawTelemetryPatcher | P5 | chunk-draw telemetry patcher rejects profile 26.3 (unsupported profile)
 
 # --- MinecraftClientPatcher (PLAN.md 6.1 #1-#47) ---
 MinecraftClientPatcher.patchServerMainBrowser | P7a | [row 1] server Main now calls MinecraftServicesDiscoveryService.create(Proxy); port: insert ICONST_0 and call create(Proxy,Z)
@@ -47,7 +46,6 @@ MinecraftClientPatcher.patchCommandEncoderLegacyTextureUpload | P3 | [row 7] Com
 MinecraftClientPatcher.patchPauseScreenBrowserSingleplayer | P8 | [row 8] Open to LAN anchor moved; add the 26.3 anchor before the level null check
 MinecraftClientPatcher.patchOptionsBrowserLowSimulationDistance | P8 | [row 9] sprint default is an SDL scancode; read InputConstants KEY_LCONTROL/KEY_R via ModernSymbols
 MinecraftClientPatcher.patchBrowserInputCallbacks | P2 | [row 10] GLFW setup lambda removed; drop, M263 rewrites SDLEventHandler dispatch and MouseHandler.onButton
-MinecraftClientPatcher.patchDynamicUniformsBrowserInitialCapacity | P5 | [row 11] DynamicUniforms replaced by DynamicGpuData; add the 26.3 branch (<init> and writeChunkSections)
 MinecraftClientPatcher.patchServerGamePacketListenerBrowserWorker | P7a | [row 12] both ServerChunkCache.move calls moved into handlePlayerPositionChange
 MinecraftClientPatcher.patchAquiferBrowserNearestCenters | P6 | [row 13] NoiseBasedAquifer constructor descriptor and locals changed
 MinecraftClientPatcher.patchBeardifierBrowserPackedCompute | P6 | [row 14] Beardifier.compute rewritten by vanilla; drop
@@ -71,20 +69,13 @@ MinecraftClientPatcher.patchNaturalSpawnerGenerationSpawnTelemetry | P6 | [row 3
 MinecraftClientPatcher.patchFilePackResourcesBrowserAtlasOverlays | P8 | [row 31] FileResourcesSupplier.openFull removed; match openResources
 MinecraftClientPatcher.patchChatSigning | P7a | [row 32] SignatureValidator.from uses authlib services types; descriptor via ModernSymbols
 MinecraftClientPatcher.patchGlslPreprocessor | P3 | [row 33] GlslPreprocessor removed; drop (includes handled by the P4 shaderc shim)
-MinecraftClientPatcher.patchMappableRingBufferTelemetry | P5 | [row 34] renderpearl GpuBuffer owner and -1L timeout literal
-MinecraftClientPatcher.patchStagedVertexBufferGpuPoolCache | P5 | [row 35] PendingRecycle GpuFence type and endFrame tail changed
 MinecraftClientPatcher.patchGlDevice | P3 | [row 36] GlDevice moved to renderpearl/backend/opengl; rename
 MinecraftClientPatcher.patchGlConstWebGLTextureFormats | P3 | [row 37] GlConst moved to renderpearl/backend/opengl; rename
 MinecraftClientPatcher.patchTextureFormatWebGLColorAspect | P3 | [row 38] GpuFormat moved to renderpearl/api; rename
 MinecraftClientPatcher.patchGlStateManagerTextureBinding | P3 | [row 39] GlStateManager moved to renderpearl/backend/opengl; rename
 MinecraftClientPatcher.patchGlRenderPipelineDrawMetadata | P3 | [row 40] vanilla already caches primitiveTopology; drop
 MinecraftClientPatcher.patchGlCommandEncoder | P3 | [row 41] GlCommandEncoder moved; rename GPU retire and TransientMemory, drop bindDefaultUniforms
-MinecraftClientPatcher.patchGameRendererBrowserAutoScreenshot | P5 | [row 42] GameRenderer.render(DeltaTracker,Z) became render()V
 MinecraftClientPatcher.patchMultiPlayerGameModeBrowserHitSound | P8 | [row 43] hit sound volume point gone; drop, M263 patches ClientLevel.playBreakingSound
-MinecraftClientPatcher.patchLevelRendererBrowserBlockBreakProgress | P5 | [row 44] prepareChunkRenders target moved to extractSectionDrawGroups; the same driver must fail closed
-MinecraftClientPatcher.patchEntityRenderDispatcherBrowserNullEntityGuard | P5 | [row 45] shouldRender descriptor gained a float
-MinecraftClientPatcher.patchSectionRenderDispatcherBrowserThrottles | P5 | [row 46] VertexFormat owner moved to renderpearl/api/vertex
-MinecraftClientPatcher.patchUberGpuBufferBrowserTelemetry | P5 | [row 47] uploadStagedAllocations takes the renderpearl GpuDevice
 
 # --- Minecraft262BrowserPatcher (PLAN.md 6.1 #48-#59) ---
 Minecraft262BrowserPatcher.patchPreferredGraphicsApi | P3 | [row 48] getBackendsToTry returns renderpearl GpuBackend[]; return [GlBackend]
@@ -92,9 +83,6 @@ Minecraft262BrowserPatcher.patchVulkanBackend | P3 | [row 49] VulkanBackend move
 Minecraft262BrowserPatcher.patchGlDeviceCapabilities | P3 | [row 50] GlDevice moved to renderpearl/backend/opengl; rename
 Minecraft262BrowserPatcher.patchRegionFileStorageCache | P6 | [row 51] getRegionFile removed; patch the 256 limit in cache(J,Optional)
 Minecraft262BrowserPatcher.patchGlBufferMappedViewRanges | P3 | [row 52] GlBuffer$Direct moved and FLUSH_EXPLICIT dropped; drop, M263 ports the flush semantics
-Minecraft262BrowserPatcher.patchLiveFrameTargeting | P5 | [row 53] GameRenderer.extract camera point changed; adapt to extractCamera(DeltaTracker,F) atomically
-Minecraft262BrowserPatcher.patchStagingBuffer | P5 | [row 54] StagingBuffer$Cpu.copyTo takes renderpearl types
-Minecraft262BrowserPatcher.patchUberGpuBufferNodeCleanup | P5 | [row 55] uploadStagedAllocations descriptor, field type and INVOKEINTERFACE
 Minecraft262BrowserPatcher.patchNoiseChunkGraphMapper | P6 | [row 56] NoiseChunk graph mapper call sites gone; 26.2 only, drop on 26.3
 Minecraft262BrowserPatcher.patchRemoteFriendList | P7a | [row 57] RemoteFriendListUpdateHandler takes services.FriendsService
 Minecraft262BrowserPatcher.patchMacosUtil | P3 | [row 58] MacosUtil entry points changed; drop, M263 stubs the ObjC/SDL hint setters

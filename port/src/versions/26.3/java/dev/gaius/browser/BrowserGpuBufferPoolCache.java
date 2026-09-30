@@ -8,7 +8,23 @@ import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 import org.teavm.jso.JSBody;
 
-/** Retains a bounded set of already-signalled staged GPU buffers across browser frames. */
+/**
+ * Retains a bounded set of already-signalled staged GPU buffers across browser frames.
+ *
+ * <p>26.3 call order. Vanilla 26.3 sweeps the signalled recycle batches at the tail of
+ * {@code GpuBufferPool.endFrame} instead of at the start of {@code acquire}, so the owner calls:
+ * <ul>
+ *   <li>{@code acquire}: {@link #beforeAcquire}, {@link #afterRecycleSweep} (after rounding the
+ *       request; it validates the batches adopted at the previous endFrame and selects the
+ *       candidate), {@link #removeAt} or {@link #recordCreate}, then {@link #afterAcquire};</li>
+ *   <li>{@code endFrame}: {@link #endFrame} after the used list became a fenced pending batch and
+ *       before the tail sweep, then {@link #recycleResult} once per polled batch. Adopted buffers
+ *       are therefore stamped with the new frame, as on 26.2 where adoption happened during the
+ *       next frame's first acquire.</li>
+ * </ul>
+ * Between an endFrame sweep and the next acquire (or endFrame) the adopted batch may exceed the
+ * count/byte budget; the next acquire or endFrame trims it.
+ */
 public final class BrowserGpuBufferPoolCache {
     public static final int MAX_COUNT = 4;
     public static final long MAX_BYTES = 1024L * 1024L;
@@ -97,7 +113,7 @@ public final class BrowserGpuBufferPoolCache {
         }
     }
 
-    /** Called before the owner polls signalled recycle batches. */
+    /** Called at the start of acquire; on 26.3 the recycle sweep already ran at endFrame. */
     public void beforeAcquire() {
         acquireCalls++;
         clearExpectedCandidate();
@@ -114,8 +130,9 @@ public final class BrowserGpuBufferPoolCache {
     }
 
     /**
-     * Adopts one non-null, already-signalled batch in linear time. Duplicate, closed-state and
-     * candidate validation is deferred until the owner's complete removeIf sweep.
+     * Adopts one non-null, already-signalled batch in linear time (26.3: from the endFrame tail
+     * sweep). Duplicate, closed-state and candidate validation is deferred to the next
+     * {@link #afterRecycleSweep} (or {@link #endFrame}), which checks all adopted batches at once.
      */
     public void recycleResult(List<GpuBuffer> recycled) {
         if (recycled == null) {
@@ -173,7 +190,10 @@ public final class BrowserGpuBufferPoolCache {
         }
     }
 
-    /** Validates all adopted batches together before vanilla takeBestAvailable runs. */
+    /**
+     * Validates all batches adopted since the last check (26.3: at the previous endFrame) together
+     * and selects the candidate before vanilla takeBestAvailable runs.
+     */
     public void afterRecycleSweep(int requestedRoundedSize) {
         clearExpectedCandidate();
         if (!requireContext()) {
@@ -253,7 +273,10 @@ public final class BrowserGpuBufferPoolCache {
         }
     }
 
-    /** Called once after the owner has moved usedThisFrame into its fenced pending list. */
+    /**
+     * Called once after the owner has moved usedThisFrame into its fenced pending list and, on
+     * 26.3, before its tail recycle sweep adopts signalled batches for the new frame.
+     */
     public void endFrame(int pendingDepth) {
         lastPendingDepth = Math.max(0, pendingDepth);
         if (frame == Integer.MAX_VALUE) {
