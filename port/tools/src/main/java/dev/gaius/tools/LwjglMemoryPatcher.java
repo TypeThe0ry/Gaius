@@ -12,6 +12,7 @@ import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
+import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
@@ -533,34 +534,53 @@ public final class LwjglMemoryPatcher {
         write(node, output);
     }
 
+    /**
+     * Makes {@code Platform.get()} report Linux by replacing the result of
+     * {@code System.getProperty("os.name")}.  The lookup is found by its
+     * immediately preceding {@code LDC "os.name"}: LWJGL 3.4.3 reads
+     * java.version first, and replacing that value instead makes
+     * {@code Platform.<clinit>} fail ("Failed to parse java.version").
+     */
     private static void patchPlatform(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "org/lwjgl/system/Platform.class");
-        boolean replaced = false;
-        for (MethodNode method : node.methods) {
-            if (!method.name.equals("<clinit>")) {
-                continue;
-            }
-            for (var instruction = method.instructions.getFirst();
-                    instruction != null;
-                    instruction = instruction.getNext()) {
-                if (instruction instanceof MethodInsnNode call
-                        && call.getOpcode() == Opcodes.INVOKESTATIC
-                        && call.owner.equals("java/lang/System")
-                        && call.name.equals("getProperty")
-                        && call.desc.equals("(Ljava/lang/String;)Ljava/lang/String;")) {
-                    InsnList browserOs = new InsnList();
-                    browserOs.add(new InsnNode(Opcodes.POP));
-                    browserOs.add(new LdcInsnNode("Linux"));
-                    method.instructions.insert(call, browserOs);
-                    replaced = true;
-                    break;
+        MethodNode initializer = node.methods.stream()
+                .filter(method -> method.name.equals("<clinit>"))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("Platform initializer not found"));
+        MethodInsnNode osName = null;
+        for (var instruction = initializer.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("java/lang/System")
+                    && call.name.equals("getProperty")
+                    && call.desc.equals("(Ljava/lang/String;)Ljava/lang/String;")
+                    && previousReal(call) instanceof LdcInsnNode key
+                    && "os.name".equals(key.cst)) {
+                if (osName != null) {
+                    throw new IllegalStateException("Platform reads os.name more than once");
                 }
+                osName = call;
             }
         }
-        if (!replaced) {
+        if (osName == null) {
             throw new IllegalStateException("Platform os.name lookup not found");
         }
+        InsnList browserOs = new InsnList();
+        browserOs.add(new InsnNode(Opcodes.POP));
+        browserOs.add(new LdcInsnNode("Linux"));
+        initializer.instructions.insert(osName, browserOs);
         write(node, output);
+    }
+
+    /** The previous instruction, skipping labels, line numbers and frames. */
+    private static AbstractInsnNode previousReal(AbstractInsnNode instruction) {
+        AbstractInsnNode previous = instruction.getPrevious();
+        while (previous != null && previous.getOpcode() < 0) {
+            previous = previous.getPrevious();
+        }
+        return previous;
     }
 
     private static void patchPlatformArchitecture(String jar, Path output) throws IOException {
