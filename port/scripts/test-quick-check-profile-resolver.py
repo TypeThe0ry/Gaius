@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import copy
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -54,11 +56,17 @@ def artifact_path(coordinate: str, version: str, classifier: str | None = None) 
     )
 
 
-def library_entries(versions: dict[str, str], distribution: str) -> list[dict]:
-    lwjgl_classifier = "unsafe" if distribution == "named" else None
+def library_entries(
+    versions: dict[str, str],
+    distribution: str,
+    window_module: str = "lwjgl-glfw",
+    lwjgl_classifier: str | None = "unset",
+) -> list[dict]:
+    if lwjgl_classifier == "unset":
+        lwjgl_classifier = "unsafe" if distribution == "named" else None
     libraries = [
         ("org.lwjgl:lwjgl", versions["lwjgl"], lwjgl_classifier),
-        ("org.lwjgl:lwjgl-glfw", versions["lwjgl"], None),
+        (f"org.lwjgl:{window_module}", versions["lwjgl"], None),
         ("org.lwjgl:lwjgl-opengl", versions["lwjgl"], None),
         ("org.lwjgl:lwjgl-openal", versions["lwjgl"], None),
         ("io.netty:netty-transport", versions["netty"], None),
@@ -97,10 +105,12 @@ def write_version(
     version: str,
     distribution: str,
     versions: dict[str, str],
+    window_module: str = "lwjgl-glfw",
+    lwjgl_classifier: str | None = "unset",
 ) -> None:
     work = root / "work" / version
     work.mkdir(parents=True, exist_ok=True)
-    libraries = library_entries(versions, distribution)
+    libraries = library_entries(versions, distribution, window_module, lwjgl_classifier)
     (work / "version.json").write_text(
         json.dumps({"id": version, "libraries": libraries}),
         encoding="utf-8",
@@ -264,11 +274,182 @@ def check_manifest_top_level_identity() -> None:
     )
 
 
+def overlay_bytecode_check_names() -> set[str]:
+    """Names of the check table in check_overlay_bytecode(), read from the source."""
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    for function in tree.body:
+        if isinstance(function, ast.FunctionDef) and function.name == "check_overlay_bytecode":
+            for node in ast.walk(function):
+                if (
+                    isinstance(node, ast.Assign)
+                    and any(isinstance(target, ast.Name) and target.id == "checks" for target in node.targets)
+                    and isinstance(node.value, ast.List)
+                ):
+                    return {
+                        element.elts[0].value
+                        for element in node.value.elts
+                        if isinstance(element, ast.Tuple)
+                        and isinstance(element.elts[0], ast.Constant)
+                    }
+    raise AssertionError("check_overlay_bytecode() has no checks table")
+
+
+def check_profile_rules() -> None:
+    rules = QUICK_CHECK.PROFILE_RULES
+    require(set(rules) >= {"1.21.11", "26.2", "26.3"}, "a supported profile has no quick-check rules")
+    require(QUICK_CHECK.is_named_family("26.2"), "26.2 is not in the named family")
+    require(QUICK_CHECK.is_named_family("26.3"), "26.3 is not in the named family")
+    require(not QUICK_CHECK.is_named_family("1.21.11"), "1.21.11 was judged by the named rules")
+    require(not QUICK_CHECK.is_named_family("27.1"), "an unknown profile was judged by the named rules")
+    require(QUICK_CHECK.profile_rules("27.1") is None, "an unknown profile has rules")
+    require(
+        rules["26.3"].window_library == ("lwjgl_sdl", "org.lwjgl:lwjgl-sdl")
+        and rules["26.2"].window_library == ("lwjgl_glfw", "org.lwjgl:lwjgl-glfw"),
+        "window library per profile changed",
+    )
+    require(
+        rules["26.3"].render_api == "renderpearl" and rules["26.2"].render_api == "blaze3d",
+        "render API per profile changed",
+    )
+    require(
+        rules["26.3"].authlib_session[0].startswith("com.mojang.authlib.services.")
+        and rules["26.2"].authlib_session[0].startswith("com.mojang.authlib.yggdrasil."),
+        "authlib session service per profile changed",
+    )
+    require(not rules["26.2"].not_applicable, "26.2 must be judged by every named-family rule")
+    require(not rules["26.2"].domain_modules, "26.2 unexpectedly dispatches domain modules")
+    require(
+        rules["26.3"].domain_modules == ("render", "input", "terrain", "worldgen", "server", "ui"),
+        "26.3 does not dispatch the six wave-1 domain modules",
+    )
+    names = overlay_bytecode_check_names()
+    for profile_id, profile in rules.items():
+        require(profile.family in {"named", "legacy"}, f"{profile_id} has an unknown rule family")
+        stale = sorted(set(profile.not_applicable) - names)
+        require(not stale, f"{profile_id} not-applicable entries name no overlay check: {stale}")
+        require(
+            all(isinstance(reason, str) and reason.strip() for reason in profile.not_applicable.values()),
+            f"{profile_id} has a not-applicable entry without a reason",
+        )
+        for domain in profile.domain_modules:
+            path = QUICK_CHECK.profile_module_path(profile_id, domain)
+            require(path.is_file(), f"{profile_id} domain module {path} is missing")
+            require(
+                (profile_id, domain) in QUICK_CHECK.PROFILE_MODULE_ADAPTERS,
+                f"{profile_id} domain module {domain} has no adapter",
+            )
+            module = QUICK_CHECK.load_profile_module(profile_id, domain)
+            entry = {"render": "run", "worldgen": "run_checks"}.get(domain, "checks")
+            require(callable(getattr(module, entry, None)), f"{path} lost its {entry}() entry point")
+
+
+def check_not_applicable_reporting() -> None:
+    names = sorted(QUICK_CHECK.NOT_APPLICABLE_263)
+    shared = "A shared named-family rule"
+    checks = [(name, index % 2 == 0) for index, name in enumerate(names)] + [(shared, False)]
+    saved = list(QUICK_CHECK.FAILURES)
+    try:
+        QUICK_CHECK.FAILURES.clear()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            QUICK_CHECK.report_profile_checks("26.3", checks)
+        require(
+            QUICK_CHECK.FAILURES == [shared],
+            f"26.3 not-applicable reporting failed the wrong checks: {QUICK_CHECK.FAILURES}",
+        )
+        require(
+            all(f"N/A {name} [26.3: " in output.getvalue() for name in names),
+            "a not-applicable 26.3 check was not reported with its reason",
+        )
+
+        QUICK_CHECK.FAILURES.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            QUICK_CHECK.report_profile_checks("26.2", checks)
+        require(
+            QUICK_CHECK.FAILURES == [name for name, ok in checks if not ok],
+            "26.2 skipped a named-family rule that is only not applicable to 26.3",
+        )
+
+        QUICK_CHECK.FAILURES.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            QUICK_CHECK.report_profile_checks("26.3", checks[1:])
+        require(
+            QUICK_CHECK.FAILURES
+            == [shared, f"26.3 not-applicable entry names an existing check: {names[0]}"],
+            f"a stale 26.3 not-applicable entry was not reported: {QUICK_CHECK.FAILURES}",
+        )
+    finally:
+        QUICK_CHECK.FAILURES[:] = saved
+
+
+def check_unknown_profile_fails_closed(root: Path) -> None:
+    write_profile(root, "27.1", "named")
+    write_version(root, "27.1", "named", {
+        "lwjgl": "3.4.9",
+        "netty": "4.2.20.Final",
+        "authlib": "11.0.1",
+        "joml": "1.10.9",
+        "patchy": "2.2.10",
+    }, window_module="lwjgl-sdl", lwjgl_classifier=None)
+    set_active_profile(root, "27.1")
+    try:
+        QUICK_CHECK.resolve_overlay_paths(root)
+    except QUICK_CHECK.OverlayResolutionError as exc:
+        require("no quick-check rules" in str(exc), f"unexpected resolver error: {exc}")
+    else:
+        raise AssertionError("a profile without quick-check rules resolved overlay paths")
+
+
+def check_263_resolution(root: Path) -> None:
+    versions_263 = {
+        "lwjgl": "3.4.3",
+        "netty": "4.2.16.Final",
+        "authlib": "10.0.77",
+        "joml": "1.10.9",
+        "patchy": "2.2.10",
+    }
+    write_profile(root, "26.3", "named")
+    # 26.3 ships the plain lwjgl core jar and lwjgl-sdl; it has no lwjgl-glfw.
+    write_version(root, "26.3", "named", versions_263, window_module="lwjgl-sdl", lwjgl_classifier=None)
+    set_active_profile(root, "26.3")
+    resolved = QUICK_CHECK.resolve_overlay_paths(root)
+    libraries = resolved["libraries"]
+    require(resolved["version"] == "26.3", "active 26.3 profile was not selected")
+    require("lwjgl_glfw" not in libraries, "26.3 resolution still requires lwjgl-glfw")
+    require(
+        libraries["lwjgl_sdl"]
+        == root / "work" / "overlays" / "libraries" / "org/lwjgl/lwjgl-sdl/3.4.3/lwjgl-sdl-3.4.3.jar",
+        "26.3 lwjgl-sdl overlay path is not profile-derived",
+    )
+    require(
+        libraries["lwjgl"].name == "lwjgl-3.4.3.jar"
+        and "10.0.77" in str(libraries["authlib"]),
+        "26.3 library overlay versions were not resolved",
+    )
+    require(
+        list(resolved["expected_paths"])[:3] == ["client", "lwjgl", "lwjgl_sdl"],
+        "26.3 expected overlay order changed",
+    )
+    require(not QUICK_CHECK.missing_overlay_paths(resolved), "complete 26.3 fixture is missing artifacts")
+
+    # A 26.3 metadata file that still lists lwjgl-glfw (a 26.2 copy) must not
+    # satisfy the SDL window module.
+    write_version(root, "26.3", "named", versions_263, window_module="lwjgl-glfw", lwjgl_classifier=None)
+    try:
+        QUICK_CHECK.resolve_overlay_paths(root)
+    except QUICK_CHECK.OverlayResolutionError as exc:
+        require("org.lwjgl:lwjgl-sdl" in str(exc), f"unexpected resolver error: {exc}")
+    else:
+        raise AssertionError("26.3 resolved without an lwjgl-sdl library")
+
+
 @hermetic_gaius_environment()
 def main() -> None:
     check_profile_scoped_defaults()
     check_release_pom_contract()
     check_manifest_top_level_identity()
+    check_profile_rules()
+    check_not_applicable_reporting()
     current_versions = {
         "lwjgl": "3.4.1",
         "netty": "4.2.15.Final",
@@ -358,6 +539,9 @@ def main() -> None:
             "changed library metadata did not move overlay paths",
         )
         require(not QUICK_CHECK.missing_overlay_paths(resolved), "changed library fixture is incomplete")
+
+        check_263_resolution(root)
+        check_unknown_profile_fails_closed(root)
 
     print("quick-check profile resolver fixture passed")
 

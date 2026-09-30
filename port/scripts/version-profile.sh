@@ -137,6 +137,31 @@ gaius_refuse_bringup_release() {
 
 # Prints the patch ids of the profile's bring-up list, one per line.  Fails
 # on malformed lines so a typo cannot silently widen or narrow the list.
+# Whether a vanilla client jar uses the renderpearl render API (26.3+), whose
+# OpenGL backend compiles shaders through shaderc/SPIRV-Cross.  unzip exits 11
+# when no entry matches; any other failure is an error, never "no".
+gaius_client_uses_renderpearl() {
+  local client_jar="$1"
+  local status=0
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -Z1 "$client_jar" 'com/mojang/renderpearl/*' >/dev/null 2>&1 || status="$?"
+    case "$status" in
+      0) return 0 ;;
+      11) return 1 ;;
+      *)
+        echo "Cannot list $client_jar (unzip exit $status)" >&2
+        exit 1
+        ;;
+    esac
+  fi
+  local listing
+  listing="$(jar --list --file "$client_jar")" || {
+    echo "Cannot list $client_jar" >&2
+    exit 1
+  }
+  grep -q '^com/mojang/renderpearl/' <<<"$listing"
+}
+
 # A patch id matches ^[A-Za-z0-9_$][A-Za-z0-9_$.:@-]*$; PatchRegistry.java,
 # check-version-profile.mjs and check-build-log-skips.mjs use the same rule.
 gaius_bringup_ids() {

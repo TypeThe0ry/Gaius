@@ -406,6 +406,34 @@ if [[ "$build_status" -eq 0 && "$teavm_publish_allowed" == true ]]; then
   done
   "$root/port/scripts/run-python.sh" \
     "$root/port/scripts/postprocess-teavm-js.py" "$staged_target_js"
+  # A client on the renderpearl render API (26.3+) compiles its shaders with
+  # the WebAssembly shader toolchain (PLAN D5, contract C7).  Stage its runtime
+  # files next to index.html, where postprocess-index-html.py injects the
+  # loader, and publish them with the client.  The modules come from emsdk
+  # (GAIUS_EMSDK) or a verified prebuilt directory
+  # (GAIUS_SHADER_TOOLCHAIN_PREBUILT).  A release
+  # (GAIUS_SHADER_TOOLCHAIN_STRICT=1) fails without them; a development build
+  # warns, and its page refuses to start instead of running without shaders.
+  # 26.2 has no renderpearl classes, so its page and dist stay unchanged.
+  shader_toolchain_publish=()
+  if gaius_client_uses_renderpearl "$work/client-named.jar"; then
+    if bash "$root/port/scripts/build-wasm-shader-toolchain.sh" \
+        --dist "$staged_target_directory"; then
+      for shader_toolchain_file in \
+        gaius-shader-toolchain.js gaius-shader-toolchain.json \
+        gaius-shaderc.js gaius-shaderc.wasm gaius-spvc.js gaius-spvc.wasm; do
+        shader_toolchain_publish+=(
+          "$staged_target_directory/$shader_toolchain_file"
+          "$target_directory/$shader_toolchain_file")
+      done
+    elif [[ "${GAIUS_SHADER_TOOLCHAIN_STRICT:-}" == "1" ]]; then
+      echo "The WebAssembly shader toolchain could not be built for Minecraft $version" >&2
+      exit 1
+    else
+      echo "WARNING: no WebAssembly shader toolchain for Minecraft $version" \
+        "(set GAIUS_EMSDK or GAIUS_SHADER_TOOLCHAIN_PREBUILT); its page will not start" >&2
+    fi
+  fi
   "$root/port/scripts/run-python.sh" \
     "$root/port/scripts/postprocess-index-html.py" \
     "$staged_target_directory/index.html" \
@@ -432,7 +460,8 @@ if [[ "$build_status" -eq 0 && "$teavm_publish_allowed" == true ]]; then
     "$vanilla_asset_pack" "$target_directory/vanilla-assets.pack.gz" \
     "${vanilla_asset_pack}.build.json" \
       "$target_directory/vanilla-assets.pack.gz.build.json" \
-    "$staged_target_directory/index.html" "$target_directory/index.html"
+    "$staged_target_directory/index.html" "$target_directory/index.html" \
+    "${shader_toolchain_publish[@]}"
   gaius_teavm_remove_stale_incomplete_reports \
     "$build_root/teavm-gap.json" "$build_root/teavm-gap.md"
   if [[ "${GAIUS_SKIP_COMPRESSION:-false}" != "true" ]]; then

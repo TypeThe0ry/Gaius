@@ -196,7 +196,10 @@ const versionProfileRelative = nativePath(
   process.env.GAIUS_VERSION_PROFILE_PATH || String(portConfig.versionProfile || ""),
 );
 const profileId = basename(versionProfileRelative.replaceAll("\\", "/"))
-  .replace(/\.json$/, "") || "26.2";
+  .replace(/\.json$/, "");
+if (!profileId) {
+  throw new Error("no version profile: set GAIUS_VERSION_PROFILE_PATH or port/config.json versionProfile");
+}
 const versionProfilePath = isAbsolute(versionProfileRelative)
   ? versionProfileRelative
   : rootDirectory + "port/" + versionProfileRelative;
@@ -278,6 +281,36 @@ const playProtocols = {
       ping: 61,
       playerPosition: 72,
       setChunkCacheCenter: 94,
+    },
+    serverbound: {
+      acceptTeleportation: 0,
+      chatCommand: 7,
+      chunkBatchReceived: 11,
+      keepAlive: 28,
+      movePlayerPos: 30,
+      playerAction: 41,
+      playerLoaded: 44,
+      pong: 45,
+    },
+  },
+  // Minecraft 26.3 (protocol 777), from the official 26.3 server datagen reports
+  // (packets.json, registries.json entity_type); the same derivation reproduces every
+  // 776 value above from the 26.2 reports.  Clientbound PLAY gained ADD_TRANSIENT_BLOCK
+  // (37), POST_EFFECTS (83) and SWING_ANIMATION (123); serverbound ids used here are
+  // unchanged; one entity type was inserted before minecraft:item.
+  777: {
+    itemEntityTypeId: 72,
+    clientbound: {
+      addEntity: 1,
+      blockChangedAck: 4,
+      blockUpdate: 8,
+      disconnect: 32,
+      keepAlive: 45,
+      levelChunkWithLight: 46,
+      login: 50,
+      ping: 62,
+      playerPosition: 73,
+      setChunkCacheCenter: 96,
     },
     serverbound: {
       acceptTeleportation: 0,

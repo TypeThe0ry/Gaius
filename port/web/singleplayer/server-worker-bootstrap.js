@@ -37,6 +37,13 @@ const storageProfiles = Object.freeze({
     storagePrefix: "gaius.fs.v2:26.2:",
     storageOpfsDirectory: "regions-v2-26.2",
   }),
+  "26.3": Object.freeze({
+    worldVersion: 5023,
+    storageSchema: 2,
+    storageDatabaseName: "gaius-fs-v2-26.3",
+    storagePrefix: "gaius.fs.v2:26.3:",
+    storageOpfsDirectory: "regions-v2-26.3",
+  }),
 });
 const storeName = "files";
 const defaultWorldgenSliceMillis = 8;

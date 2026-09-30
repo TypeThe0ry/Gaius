@@ -19,9 +19,19 @@ import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.VarInsnNode;
 
-/** Redirects the OpenGL subset used by Minecraft 1.21.11 to WebGL2. */
+/**
+ * Redirects the OpenGL subset used by Minecraft to WebGL2.
+ *
+ * <p>Most entry points delegate to {@code BrowserOpenGL}. The indexed-capability and read-buffer
+ * natives that only LWJGL 3.4.3 clients (Minecraft 26.3) call delegate to
+ * {@code BrowserOpenGLIndexed}, which only the lwjgl-opengl 3.4.3 overlay compiles in
+ * ({@code port/overrides/libraries/lwjgl-opengl/src/versions/3.4.3}). Those delegates are
+ * gated on that class being present in the input jar, so a 3.4.1 jar (26.2) is patched exactly
+ * as before; a 3.4.3 or later jar without the class is refused.
+ */
 public final class LwjglOpenGLBrowserPatcher {
     private static final String BROWSER = "org/lwjgl/opengl/BrowserOpenGL";
+    private static final String BROWSER_INDEXED = "org/lwjgl/opengl/BrowserOpenGLIndexed";
 
     private LwjglOpenGLBrowserPatcher() {
     }
@@ -32,18 +42,27 @@ public final class LwjglOpenGLBrowserPatcher {
         }
         Map<String, String> delegates = delegates();
         Set<String> noOps = noOps();
+        Map<String, String> indexedDelegates = indexedDelegates(args[0]);
         Set<String> owners = new HashSet<>();
         delegates.keySet().forEach(key -> owners.add(key.substring(0, key.indexOf('#'))));
         noOps.forEach(key -> owners.add(key.substring(0, key.indexOf('#'))));
+        indexedDelegates.keySet().forEach(key -> owners.add(key.substring(0, key.indexOf('#'))));
         int replacements = 0;
+        Set<String> indexedPatched = new HashSet<>();
         for (String owner : owners) {
             ClassNode node = read(args[0], owner + ".class");
             boolean changed = false;
             for (MethodNode method : node.methods) {
                 String key = owner + "#" + method.name + method.desc;
                 String target = delegates.get(key);
+                String indexedTarget = indexedDelegates.get(key);
                 if (target != null) {
                     delegate(method, target);
+                    changed = true;
+                    replacements++;
+                } else if (indexedTarget != null) {
+                    delegate(method, BROWSER_INDEXED, indexedTarget);
+                    indexedPatched.add(key);
                     changed = true;
                     replacements++;
                 } else if (noOps.contains(key)) {
@@ -59,7 +78,76 @@ public final class LwjglOpenGLBrowserPatcher {
         if (replacements < 65) {
             throw new IllegalStateException("Too few OpenGL methods patched: " + replacements);
         }
+        if (!indexedPatched.equals(indexedDelegates.keySet())) {
+            Set<String> missing = new HashSet<>(indexedDelegates.keySet());
+            missing.removeAll(indexedPatched);
+            throw new IllegalStateException(
+                    "LWJGL 3.4.3 OpenGL entry points were not found: " + missing);
+        }
+        if (!indexedPatched.isEmpty()) {
+            System.out.println("Delegated " + indexedPatched.size()
+                    + " LWJGL 3.4.3 OpenGL entry points to BrowserOpenGLIndexed");
+        }
         System.out.println("Patched " + replacements + " OpenGL methods");
+    }
+
+    /**
+     * The natives that only LWJGL 3.4.3 clients reach, keyed like {@link #delegates()}. Empty for
+     * a jar without {@code BrowserOpenGLIndexed} (the 3.4.1 overlay); a jar of lwjgl-opengl
+     * 3.4.3 or later without it throws, because its client would silently lose blending.
+     */
+    private static Map<String, String> indexedDelegates(String jarPath) throws IOException {
+        String version;
+        boolean indexed;
+        try (ZipFile jar = new ZipFile(jarPath)) {
+            indexed = jar.getEntry(BROWSER_INDEXED + ".class") != null;
+            version = specificationVersion(jar);
+        }
+        if (!indexed) {
+            if (version != null && compareVersions(version, "3.4.3") >= 0) {
+                throw new IllegalStateException("lwjgl-opengl " + version + " (" + jarPath
+                        + ") needs " + BROWSER_INDEXED + " from port/overrides/libraries/"
+                        + "lwjgl-opengl/src/versions/" + version + "/java");
+            }
+            return Map.of();
+        }
+        Map<String, String> methods = new HashMap<>();
+        add(methods, "GL30C", "glEnablei", "(II)V", "enablei");
+        add(methods, "GL30C", "glDisablei", "(II)V", "disablei");
+        add(methods, "GL11C", "glReadBuffer", "(I)V", "readBuffer");
+        return methods;
+    }
+
+    private static String specificationVersion(ZipFile jar) throws IOException {
+        var entry = jar.getEntry("META-INF/MANIFEST.MF");
+        if (entry == null) {
+            return null;
+        }
+        try (var stream = jar.getInputStream(entry)) {
+            return new java.util.jar.Manifest(stream).getMainAttributes()
+                    .getValue("Specification-Version");
+        }
+    }
+
+    private static int compareVersions(String left, String right) {
+        String[] a = left.trim().split("[.]");
+        String[] b = right.trim().split("[.]");
+        for (int index = 0; index < Math.max(a.length, b.length); index++) {
+            int x = index < a.length ? leadingNumber(a[index]) : 0;
+            int y = index < b.length ? leadingNumber(b[index]) : 0;
+            if (x != y) {
+                return Integer.compare(x, y);
+            }
+        }
+        return 0;
+    }
+
+    private static int leadingNumber(String part) {
+        int end = 0;
+        while (end < part.length() && Character.isDigit(part.charAt(end))) {
+            end++;
+        }
+        return end == 0 ? 0 : Integer.parseInt(part.substring(0, end));
     }
 
     private static Map<String, String> delegates() {
@@ -358,6 +446,10 @@ public final class LwjglOpenGLBrowserPatcher {
     }
 
     private static void delegate(MethodNode method, String target) {
+        delegate(method, BROWSER, target);
+    }
+
+    private static void delegate(MethodNode method, String owner, String target) {
         InsnList code = new InsnList();
         Type[] arguments = Type.getArgumentTypes(method.desc);
         int local = 0;
@@ -365,7 +457,7 @@ public final class LwjglOpenGLBrowserPatcher {
             code.add(new VarInsnNode(argument.getOpcode(Opcodes.ILOAD), local));
             local += argument.getSize();
         }
-        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, BROWSER, target, method.desc, false));
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, owner, target, method.desc, false));
         Type result = Type.getReturnType(method.desc);
         code.add(new InsnNode(result.getOpcode(Opcodes.IRETURN)));
         replace(method, code, Math.max(6, local));

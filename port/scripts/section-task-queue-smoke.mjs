@@ -46,8 +46,10 @@ const configuredProfileId = process.env.GAIUS_VERSION_PROFILE_PATH
 if (configuredProfileId !== version) {
   throw new Error(`section task queue smoke is for profile ${version}, got ${configuredProfileId}`);
 }
-if (version !== "26.2") {
-  throw new Error(`section task queue smoke is 26.2-only; got profile ${version}`);
+// SectionTaskDynamicQueue and its SectionTask/RenderSection surface are byte-identical in
+// 26.2 and 26.3 (after the renderpearl renames), so both modern profiles run the same checks.
+if (version !== "26.2" && version !== "26.3") {
+  throw new Error(`section task queue smoke supports profiles 26.2 and 26.3; got ${version}`);
 }
 const overlayJar = process.env.GAIUS_SECTION_QUEUE_JAR
   ? nativePath(process.env.GAIUS_SECTION_QUEUE_JAR)

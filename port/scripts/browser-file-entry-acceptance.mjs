@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import {spawn} from "node:child_process";
 import {createHash} from "node:crypto";
+import {readFileSync} from "node:fs";
 import {mkdir, mkdtemp, readFile, rm, stat, writeFile} from "node:fs/promises";
 import {createServer} from "node:net";
 import {tmpdir} from "node:os";
@@ -17,7 +18,10 @@ import {summarizeFlightReadiness} from "../../tools/flight-readiness.mjs";
 import {configureWorldSeed} from "../../tools/configure-browser-world-seed.mjs";
 
 const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
-const profilePath = process.env.GAIUS_VERSION_PROFILE_PATH || "port/versions/26.2.json";
+// Without GAIUS_VERSION_PROFILE_PATH the default profile is port/config.json's
+// versionProfile, the one place that switches it.
+const profilePath = process.env.GAIUS_VERSION_PROFILE_PATH
+  || JSON.parse(readFileSync(resolve(root, "port/config.json"), "utf8")).versionProfile;
 const profileId = basename(profilePath).replace(/\.json$/i, "");
 const artifact = resolve(process.env.GAIUS_FILE_ARTIFACT || `port/web/dist/${profileId}/Gaius.html`);
 const mode = String(process.env.GAIUS_FILE_MODE || "single").toLowerCase();
@@ -480,7 +484,8 @@ async function captureSingleplayerTerrain(cdp, worldRequestedAtMillis=null) {
       await dispatchKey(cdp,'Space',true); keyEvents++;
       let input=null;
       try {
-        input=await evaluate(cdp,`({spacePressed:!!window.__gaiusGlfwKeys?.[32],sampleAt:window.__gaiusMinecraftState?.at,screen:window.__gaiusMinecraftState?.screen||null})`);
+        // Space is GLFW key 32 on 26.2 and SDL scancode 44 on 26.3.
+        input=await evaluate(cdp,`({spacePressed:!!(window.__gaiusGlfwKeys?.[32]||window.__gaiusSdlKeys?.[44]),sampleAt:window.__gaiusMinecraftState?.at,screen:window.__gaiusMinecraftState?.screen||null})`);
         await sleep(3000);
       } finally { await dispatchKey(cdp,'Space',false); keyEvents++; }
       elevated=await readSingleplayerState(cdp);

@@ -18,7 +18,7 @@ const integratedServerPath = resolve(
   repositoryRoot,
   "port/src/main/java/dev/gaius/browser/BrowserIntegratedServerMain.java",
 );
-const profileIds = ["1.21.11", "26.2"];
+const profileIds = ["1.21.11", "26.2", "26.3"];
 const profilePaths = profileIds.map(id => resolve(
   repositoryRoot,
   "port/versions/" + id + ".json",
@@ -37,6 +37,7 @@ assert.match(persistence, /runtimeStoragePrefix\(\)/);
 assert.match(persistence, /runtimeStorageConfigurationSignature\(\)/);
 assert.match(persistence, /gaius-fs-v2-1\.21\.11/);
 assert.match(persistence, /gaius-fs-v2-26\.2/);
+assert.match(persistence, /gaius-fs-v2-26\.3/);
 assert.match(persistence, /LEGACY_DATA_VERSION = 4671/);
 assert.match(
   persistence,
@@ -62,8 +63,10 @@ assert.match(worker, /const storageProfiles = Object\.freeze\(/);
 assert.match(worker, /storage configuration does not match profile/);
 assert.match(worker, /worldVersion: 4671/);
 assert.match(worker, /worldVersion: 4903/);
+assert.match(worker, /worldVersion: 5023/);
 assert.match(worker, /gaius-fs-v2-1\.21\.11/);
 assert.match(worker, /gaius-fs-v2-26\.2/);
+assert.match(worker, /gaius-fs-v2-26\.3/);
 assert.match(worker, /indexedDB\.open\(databaseName, schema\)/);
 assert.match(worker, /__gaiusStorageDatabaseName/);
 assert.match(worker, /__gaiusStorageOpfsDirectory/);
@@ -76,6 +79,7 @@ assert.match(integratedServer, /__gaiusStorageDatabaseName/);
 assert.match(integratedServer, /storageMatchesProfile/);
 assert.match(integratedServer, /gaius-fs-v2-1\.21\.11/);
 assert.match(integratedServer, /gaius-fs-v2-26\.2/);
+assert.match(integratedServer, /gaius-fs-v2-26\.3/);
 assert.match(integratedServer, /indexedDB\.open\(storageDatabaseName, storageSchema\)/);
 assert.doesNotMatch(integratedServer, /indexedDB\.open\(\s*["']gaius-fs-v1/);
 assert.doesNotMatch(integratedServer, /deleteDatabase\s*\(/);
@@ -89,10 +93,12 @@ assert.match(client, /storageConfigurationValid\(\)/);
 assert.match(client, /storageMatchesProfile/);
 assert.match(client, /gaius-fs-v2-1\.21\.11/);
 assert.match(client, /gaius-fs-v2-26\.2/);
+assert.match(client, /gaius-fs-v2-26\.3/);
 
 const expectedWorldVersions = new Map([
   ["1.21.11", 4671],
   ["26.2", 4903],
+  ["26.3", 5023],
 ]);
 
 const profiles = profileSources.map((source, index) => {
@@ -121,6 +127,134 @@ const profiles = profileSources.map((source, index) => {
     opfsDirectory: profile.storage.opfsDirectory,
   };
 });
+
+// The six storage allow-lists are executed, not only grepped: every profile's own
+// version-profile storage must pass all of them, and a row that mixes one profile id
+// with another profile's world version, names or schema must fail all of them.
+function jsBodyBefore(source, declaration, label) {
+  const end = source.indexOf(declaration);
+  assert.ok(end >= 0, `${label}: missing ${declaration}`);
+  const start = source.lastIndexOf('script = """', end);
+  assert.ok(start >= 0, `${label}: no JSBody script before ${declaration}`);
+  const bodyStart = source.indexOf("\n", start) + 1;
+  const bodyEnd = source.indexOf('"""', bodyStart);
+  assert.ok(bodyEnd > bodyStart && bodyEnd < end, `${label}: malformed JSBody script`);
+  const body = source.slice(bodyStart, bodyEnd);
+  assert.ok(!body.includes("\\"), `${label}: JSBody escapes are not modelled by this smoke`);
+  return body;
+}
+
+function storageMatchExpressions(source, label, expectedCount) {
+  const marker = "const storageMatchesProfile =";
+  const expressions = [];
+  for (let from = source.indexOf(marker); from >= 0; from = source.indexOf(marker, from + 1)) {
+    const end = source.indexOf(";", from);
+    assert.ok(end > from, `${label}: unterminated storageMatchesProfile`);
+    expressions.push(source.slice(from + marker.length, end));
+  }
+  assert.equal(expressions.length, expectedCount, `${label}: storageMatchesProfile table count`);
+  return expressions;
+}
+
+function storageGlobals(config) {
+  return {
+    __gaiusProfileId: config.profileId,
+    __gaiusWorldVersion: config.worldVersion,
+    __gaiusStorageSchema: config.storageSchema,
+    __gaiusStorageDatabaseName: config.storageDatabaseName,
+    __gaiusStoragePrefix: config.storagePrefix,
+    __gaiusStorageOpfsDirectory: config.storageOpfsDirectory,
+  };
+}
+
+const matchParameters = ["profileId", "worldVersion", "storageSchema", "storageDatabaseName",
+  "storagePrefix", "storageOpfsDirectory"];
+const storageTables = [
+  ...[
+    ["BrowserSingleplayerClient.storageMatchesProfile#1", client],
+    ["BrowserSingleplayerClient.storageMatchesProfile#2", client],
+    ["BrowserIntegratedServerMain.storageMatchesProfile", integratedServer],
+  ].map(([label, source], index, all) => {
+    const expressions = storageMatchExpressions(source, label,
+      all.filter(([, other]) => other === source).length);
+    const ordinal = all.slice(0, index).filter(([, other]) => other === source).length;
+    const test = new Function(...matchParameters, `return (${expressions[ordinal]});`);
+    return {label, accepts: config => test(...matchParameters.map(name => config[name])) === true};
+  }),
+  (() => {
+    const test = new Function("globalThis", jsBodyBefore(client,
+      "private static native boolean storageConfigurationValid();",
+      "BrowserSingleplayerClient.storageConfigurationValid"));
+    return {
+      label: "BrowserSingleplayerClient.storageConfigurationValid",
+      accepts: config => test(storageGlobals(config)) === true,
+    };
+  })(),
+  (() => {
+    const test = new Function("globalThis", jsBodyBefore(persistence,
+      "private static native String runtimeStorageConfigurationSignature();",
+      "BrowserFilePersistence.runtimeStorageConfigurationSignature"));
+    return {
+      label: "BrowserFilePersistence.runtimeStorageConfigurationSignature",
+      accepts: config => {
+        const signature = test(storageGlobals(config));
+        if (!signature) return false;
+        assert.equal(signature, [config.profileId, config.worldVersion, config.storageSchema,
+          config.storageDatabaseName, config.storagePrefix, config.storageOpfsDirectory].join("|"));
+        return true;
+      },
+    };
+  })(),
+  (() => {
+    const start = worker.indexOf("const storageProfiles = Object.freeze({");
+    const end = worker.indexOf("\n});", start);
+    assert.ok(start >= 0 && end > start, "server-worker-bootstrap.js storageProfiles table");
+    const table = new Function(
+      `${worker.slice(start, end + "\n});".length)}\nreturn storageProfiles;`)();
+    return {
+      label: "server-worker-bootstrap.js storageProfiles",
+      accepts: config => {
+        const expected = Object.hasOwn(table, config.profileId) ? table[config.profileId] : null;
+        return Boolean(expected) && config.worldVersion === expected.worldVersion
+          && config.storageSchema === expected.storageSchema
+          && config.storageDatabaseName === expected.storageDatabaseName
+          && config.storagePrefix === expected.storagePrefix
+          && config.storageOpfsDirectory === expected.storageOpfsDirectory;
+      },
+    };
+  })(),
+];
+assert.equal(storageTables.length, 6);
+
+const storageConfigs = profiles.map(profile => ({
+  profileId: profile.id,
+  worldVersion: profile.worldVersion,
+  storageSchema: profile.storageSchema,
+  storageDatabaseName: profile.databaseName,
+  storagePrefix: profile.prefix,
+  storageOpfsDirectory: profile.opfsDirectory,
+}));
+let tableChecks = 0;
+for (const config of storageConfigs) {
+  for (const table of storageTables) {
+    assert.equal(table.accepts(config), true, `${table.label} rejects ${config.profileId} storage`);
+    tableChecks++;
+  }
+  const mixed = [{...config, storageSchema: 1}];
+  for (const other of storageConfigs) {
+    if (other === config) continue;
+    for (const field of matchParameters.slice(1)) {
+      if (other[field] !== config[field]) mixed.push({...config, [field]: other[field]});
+    }
+  }
+  for (const candidate of mixed) {
+    for (const table of storageTables) {
+      assert.equal(table.accepts(candidate), false,
+        `${table.label} accepts a mixed ${config.profileId} row: ${JSON.stringify(candidate)}`);
+      tableChecks++;
+    }
+  }
+}
 
 function storageIdentity(profile, worldId) {
   return {
@@ -176,6 +310,7 @@ console.log(JSON.stringify({
     "dynamic Worker IndexedDB and profile OPFS directory",
     "dynamic integrated-server fallback IndexedDB",
     "cross-profile in-memory key isolation",
+    `six storage allow-lists executed (${tableChecks} accept/reject checks)`,
     "no unconditional legacy open/delete path",
   ],
 }, null, 2));

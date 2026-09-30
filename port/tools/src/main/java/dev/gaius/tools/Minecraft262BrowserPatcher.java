@@ -173,6 +173,18 @@ public final class Minecraft262BrowserPatcher {
     }
 
     private static void patchNoiseChunkGraphMapper(String jar, Path root) throws IOException {
+        // 26.2 only. 26.3 compiles each density graph once per RandomState
+        // (densityfunction/DensityFunctionCompiler) and binds it per chunk through a
+        // SamplerContext: NoiseChunk has no NoiseRouter/DensityFunction.mapAll call sites and
+        // DensityFunction$Visitor is gone, so BrowserNoiseGraphMapper has nothing to replace.
+        if (jarHasEntry(jar,
+                "net/minecraft/world/level/levelgen/densityfunction/DensityFunctionCompiler.class")) {
+            PatchRegistry.dropped("Minecraft262BrowserPatcher.patchNoiseChunkGraphMapper", jar,
+                    "net/minecraft/world/level/levelgen/DensityFunction$Visitor.class",
+                    "net/minecraft/world/level/levelgen/NoiseRouter#mapAll",
+                    "net/minecraft/world/level/levelgen/NoiseChunk#wrap");
+            return;
+        }
         String owner = "net/minecraft/world/level/levelgen/NoiseChunk";
         Path output = root.resolve(owner + ".class");
         ClassNode node;
@@ -229,6 +241,12 @@ public final class Minecraft262BrowserPatcher {
         // Receiver becomes the first static argument: stack shape and existing
         // control flow are unchanged, including all preceding overlay patches.
         write(node, output);
+    }
+
+    private static boolean jarHasEntry(String jar, String entry) throws IOException {
+        try (ZipFile input = new ZipFile(jar)) {
+            return input.getEntry(entry) != null;
+        }
     }
 
     private static void requireNoiseChunkWrapVisitor(
@@ -1731,12 +1749,22 @@ public final class Minecraft262BrowserPatcher {
         String pair = "com/mojang/datafixers/util/Pair";
         String allocator = "com/mojang/blaze3d/vertex/TlsfAllocator";
         String heap = owner + "$UberGpuBufferHeap";
+        // 26.3: GpuDevice and GpuBuffer are renderpearl interfaces, so the emitted
+        // GpuBuffer.close() must be INVOKEINTERFACE (26.2: INVOKEVIRTUAL on the class).
+        ModernSymbols symbols = ModernSymbols.cached(jar);
+        String gpuBufferKey = "com/mojang/blaze3d/buffers/GpuBuffer";
+        String gpuBuffer = symbols.renderType(gpuBufferKey);
         ClassNode node = read(jar, owner + ".class");
         MethodNode method = find(
                 node,
                 "uploadStagedAllocations",
-                "(Lcom/mojang/blaze3d/systems/GpuDevice;"
+                "(L" + symbols.renderType("com/mojang/blaze3d/systems/GpuDevice") + ";"
                         + "Lcom/mojang/blaze3d/vertex/StagingBuffer$Uploader;)Z");
+        ClassNode heapNode = read(jar, heap + ".class");
+        if (heapNode.fields.stream().noneMatch(field -> field.name.equals("gpuBuffer")
+                && field.desc.equals("L" + gpuBuffer + ";"))) {
+            throw new IllegalStateException(heap + ".gpuBuffer is no longer a " + gpuBuffer);
+        }
 
         MethodInsnNode finishUpload = null;
         for (AbstractInsnNode instruction : method.instructions.toArray()) {
@@ -1856,13 +1884,13 @@ public final class Minecraft262BrowserPatcher {
                 Opcodes.GETFIELD,
                 heap,
                 "gpuBuffer",
-                "Lcom/mojang/blaze3d/buffers/GpuBuffer;"));
+                "L" + gpuBuffer + ";"));
         cleanup.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL,
-                "com/mojang/blaze3d/buffers/GpuBuffer",
+                symbols.invokeOpcode(gpuBufferKey),
+                gpuBuffer,
                 "close",
                 "()V",
-                false));
+                symbols.isInterface(gpuBufferKey)));
         cleanup.add(new VarInsnNode(Opcodes.ALOAD, 0));
         cleanup.add(new FieldInsnNode(
                 Opcodes.GETFIELD, owner, "nodes", "Ljava/util/List;"));
@@ -1913,7 +1941,8 @@ public final class Minecraft262BrowserPatcher {
             instruction = next;
         }
         writeComputeFrames(node, root.resolve(owner + ".class"));
-        System.out.println("Bounded Minecraft 26.2 UberGpuBuffer heap cleanup");
+        System.out.println("Bounded Minecraft " + (symbols.renderpearl() ? "26.3" : "26.2")
+                + " UberGpuBuffer heap cleanup");
     }
 
     private static FieldInsnNode fieldBefore(AbstractInsnNode instruction) {
@@ -1936,6 +1965,44 @@ public final class Minecraft262BrowserPatcher {
             throws IOException {
         String owner = "net/minecraft/world/level/chunk/storage/RegionFileStorage";
         ClassNode node = read(jar, owner + ".class");
+        MethodNode cache = null;
+        for (MethodNode method : node.methods) {
+            if (method.name.equals("cache")
+                    && method.desc.equals("(JLjava/util/Optional;)V")) {
+                cache = method;
+            }
+        }
+        if (cache != null) {
+            // 26.3: getRegionFile(ChunkPos, boolean create) caches both open files and
+            // Optional.empty() for absent regions through cache(long, Optional), which evicts
+            // (and closes) the oldest entry above MAX_CACHE_SIZE.
+            int limits = 0;
+            for (AbstractInsnNode instruction : cache.instructions.toArray()) {
+                if (instruction instanceof IntInsnNode integer
+                        && integer.getOpcode() == Opcodes.SIPUSH
+                        && integer.operand == 256) {
+                    cache.instructions.set(
+                            integer,
+                            new IntInsnNode(Opcodes.BIPUSH, BROWSER_REGION_FILE_CACHE_SIZE));
+                    limits++;
+                }
+            }
+            requireOne("RegionFileStorage.cache 256-entry limit", limits);
+            int constants = 0;
+            for (FieldNode field : node.fields) {
+                if (field.name.equals("MAX_CACHE_SIZE")
+                        && field.desc.equals("I")
+                        && Integer.valueOf(256).equals(field.value)) {
+                    field.value = BROWSER_REGION_FILE_CACHE_SIZE;
+                    constants++;
+                }
+            }
+            requireOne("RegionFileStorage MAX_CACHE_SIZE constant", constants);
+            write(node, root.resolve(owner + ".class"));
+            System.out.println("Bounded RegionFileStorage.cache(long, Optional) to "
+                    + BROWSER_REGION_FILE_CACHE_SIZE + " regions");
+            return;
+        }
         MethodNode getRegionFile = find(
                 node,
                 "getRegionFile",
@@ -1983,21 +2050,26 @@ public final class Minecraft262BrowserPatcher {
     }
 
     private static void patchPreferredGraphicsApi(String jar, Path root) throws IOException {
+        // 26.3 moved both types to renderpearl (GpuBackend is an interface there); ModernSymbols
+        // returns the 26.2 names unchanged on 26.2.
+        ModernSymbols symbols = ModernSymbols.cached(jar);
+        String gpuBackend = symbols.renderType("com/mojang/blaze3d/systems/GpuBackend");
+        String glBackend = symbols.renderType("com/mojang/blaze3d/opengl/GlBackend");
         String owner = "net/minecraft/client/PreferredGraphicsApi";
         ClassNode node = read(jar, owner + ".class");
         MethodNode method = find(node, "getBackendsToTry",
-                "()[Lcom/mojang/blaze3d/systems/GpuBackend;");
+                "()[L" + gpuBackend + ";");
         InsnList code = new InsnList();
         code.add(new InsnNode(Opcodes.ICONST_1));
         code.add(new TypeInsnNode(
-                Opcodes.ANEWARRAY, "com/mojang/blaze3d/systems/GpuBackend"));
+                Opcodes.ANEWARRAY, gpuBackend));
         code.add(new InsnNode(Opcodes.DUP));
         code.add(new InsnNode(Opcodes.ICONST_0));
-        code.add(new TypeInsnNode(Opcodes.NEW, "com/mojang/blaze3d/opengl/GlBackend"));
+        code.add(new TypeInsnNode(Opcodes.NEW, glBackend));
         code.add(new InsnNode(Opcodes.DUP));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESPECIAL,
-                "com/mojang/blaze3d/opengl/GlBackend",
+                glBackend,
                 "<init>",
                 "()V",
                 false));
@@ -2009,6 +2081,13 @@ public final class Minecraft262BrowserPatcher {
     }
 
     private static void patchVulkanBackend(String jar, Path root) throws IOException {
+        if (ModernSymbols.cached(jar).renderpearl()) {
+            // 26.3 moved VulkanBackend and changed its API (no setWindowHints, a static
+            // checkBackendAvailable, SDL windows); RenderPatches263.patchVulkanBackend stubs it.
+            PatchRegistry.dropped("Minecraft262BrowserPatcher.patchVulkanBackend", jar,
+                    "com/mojang/blaze3d/vulkan/VulkanBackend.class");
+            return;
+        }
         String owner = "com/mojang/blaze3d/vulkan/VulkanBackend";
         String exception = "com/mojang/blaze3d/systems/BackendCreationException";
         String reason = exception + "$Reason";
@@ -2056,7 +2135,7 @@ public final class Minecraft262BrowserPatcher {
     }
 
     private static void patchGlDeviceCapabilities(String jar, Path root) throws IOException {
-        String owner = "com/mojang/blaze3d/opengl/GlDevice";
+        String owner = ModernSymbols.cached(jar).renderType("com/mojang/blaze3d/opengl/GlDevice");
         ClassNode node = read(jar, owner + ".class");
         MethodNode initializer = find(node, "<clinit>", "()V");
         int returns = 0;
@@ -2339,6 +2418,13 @@ public final class Minecraft262BrowserPatcher {
     }
 
     private static void patchGlBufferMappedViewRanges(String jar, Path root) throws IOException {
+        if (ModernSymbols.cached(jar).renderpearl()) {
+            // 26.3 no longer sets GL_MAP_FLUSH_EXPLICIT_BIT, so this 26.2 patch would never
+            // flush; RenderPatches263.patchGlBufferExplicitFlush adds the bit and the ranges.
+            PatchRegistry.dropped("Minecraft262BrowserPatcher.patchGlBufferMappedViewRanges", jar,
+                    "com/mojang/blaze3d/opengl/GlBuffer$Direct$1.class");
+            return;
+        }
         String directOwner = "com/mojang/blaze3d/opengl/GlBuffer$Direct";
         String closeOwner = directOwner + "$1";
         String mappedView = "com/mojang/blaze3d/buffers/GpuBufferSlice$MappedView";
@@ -2479,7 +2565,8 @@ public final class Minecraft262BrowserPatcher {
             throw new IllegalStateException(
                     "Minecraft.renderFrame targeting deferral changed: " + deferred);
         }
-        write(minecraft, root.resolve(minecraftOwner + ".class"));
+        // The deferred pick is only refreshed by the GameRenderer half below, so Minecraft.class
+        // is written only after that half has been validated and patched (both or neither).
 
         String owner = "net/minecraft/client/renderer/GameRenderer";
         ClassNode node = read(jar, owner + ".class");
@@ -2487,6 +2574,13 @@ public final class Minecraft262BrowserPatcher {
                 node,
                 "extract",
                 "(Lnet/minecraft/client/DeltaTracker;Z)V");
+        // 26.2 passes a separate camera partial tick: extractCamera(DeltaTracker;FF)V. 26.3
+        // extracts the camera with the world partial tick only, extractCamera(DeltaTracker;F)V,
+        // and computes the camera entity's partial tick inside Camera.extractRenderState.
+        boolean singlePartialTick = ModernSymbols.cached(jar).renderpearl();
+        String extractCameraDescriptor = singlePartialTick
+                ? "(Lnet/minecraft/client/DeltaTracker;F)V"
+                : "(Lnet/minecraft/client/DeltaTracker;FF)V";
         MethodInsnNode extractCamera = null;
         MethodInsnNode extractLevel = null;
         for (AbstractInsnNode instruction = extract.instructions.getFirst();
@@ -2496,7 +2590,7 @@ public final class Minecraft262BrowserPatcher {
                     && call.getOpcode() == Opcodes.INVOKEVIRTUAL
                     && call.owner.equals(owner)
                     && call.name.equals("extractCamera")
-                    && call.desc.equals("(Lnet/minecraft/client/DeltaTracker;FF)V")) {
+                    && call.desc.equals(extractCameraDescriptor)) {
                 if (extractCamera != null) {
                     throw new IllegalStateException(
                             "GameRenderer.extract has multiple extractCamera calls");
@@ -2536,6 +2630,14 @@ public final class Minecraft262BrowserPatcher {
         while (cameraPartialTick != null && cameraPartialTick.getOpcode() < 0) {
             cameraPartialTick = cameraPartialTick.getPrevious();
         }
+        if (singlePartialTick) {
+            patchCurrentLiveFrameTargetingRefresh(jar, extract, extractCamera,
+                    cameraPartialTick, worldPartialTickLoad);
+            write(minecraft, root.resolve(minecraftOwner + ".class"));
+            write(node, root.resolve(owner + ".class"));
+            System.out.println("Moved Minecraft 26.3 frame targeting after camera extraction");
+            return;
+        }
         if (!(cameraPartialTick instanceof VarInsnNode cameraPartialTickLoad)
                 || cameraPartialTickLoad.getOpcode() != Opcodes.FLOAD
                 || cameraPartialTickLoad.var == worldPartialTickLoad.var) {
@@ -2565,8 +2667,62 @@ public final class Minecraft262BrowserPatcher {
                 false));
         extract.instructions.insert(extractCamera, refresh);
         extract.maxStack = Math.max(extract.maxStack, 3);
+        write(minecraft, root.resolve(minecraftOwner + ".class"));
         write(node, root.resolve(owner + ".class"));
         System.out.println("Moved Minecraft 26.2 frame targeting after camera extraction");
+    }
+
+    /**
+     * 26.3 GameRenderer half of patchLiveFrameTargeting: extractCamera receives the world
+     * partial tick, so the camera entity's partial tick is recomputed inline with the public
+     * Camera.getCameraEntityPartialTicks(DeltaTracker) (extract's local 1), inside the same
+     * shouldRenderLevel block that 26.2 computed it in. Only validates and edits {@code extract}.
+     */
+    private static void patchCurrentLiveFrameTargetingRefresh(String jar, MethodNode extract,
+            MethodInsnNode extractCamera, AbstractInsnNode cameraPartialTick,
+            VarInsnNode worldPartialTickLoad) throws IOException {
+        String owner = "net/minecraft/client/renderer/GameRenderer";
+        String camera = "net/minecraft/client/Camera";
+        String partialTicksDescriptor = "(Lnet/minecraft/client/DeltaTracker;)F";
+        AbstractInsnNode trackerArgument = cameraPartialTick == null
+                ? null : previousOpcode(cameraPartialTick);
+        if (!(cameraPartialTick instanceof VarInsnNode partialLoad)
+                || partialLoad.getOpcode() != Opcodes.FLOAD
+                || partialLoad.var != worldPartialTickLoad.var
+                || !(trackerArgument instanceof VarInsnNode trackerLoad)
+                || trackerLoad.getOpcode() != Opcodes.ALOAD
+                || trackerLoad.var != 1) {
+            throw new IllegalStateException(
+                    "GameRenderer.extract 26.3 camera extraction arguments changed");
+        }
+        MethodNode cameraPartialTicks = find(read(jar, camera + ".class"),
+                "getCameraEntityPartialTicks", partialTicksDescriptor);
+        if ((cameraPartialTicks.access & Opcodes.ACC_PUBLIC) == 0
+                || (cameraPartialTicks.access & Opcodes.ACC_STATIC) != 0) {
+            throw new IllegalStateException(
+                    "Camera.getCameraEntityPartialTicks is no longer a public instance method");
+        }
+        InsnList refresh = new InsnList();
+        refresh.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        refresh.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "minecraft", "Lnet/minecraft/client/Minecraft;"));
+        refresh.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        refresh.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "mainCamera", "L" + camera + ";"));
+        refresh.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        refresh.add(new FieldInsnNode(
+                Opcodes.GETFIELD, owner, "mainCamera", "L" + camera + ";"));
+        refresh.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        refresh.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL,
+                camera, "getCameraEntityPartialTicks", partialTicksDescriptor, false));
+        refresh.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserTargeting",
+                "refreshFramePick",
+                "(Lnet/minecraft/client/Minecraft;Lnet/minecraft/client/Camera;F)V",
+                false));
+        extract.instructions.insert(extractCamera, refresh);
+        extract.maxStack = Math.max(extract.maxStack, 4);
     }
 
     private static void patchSectionRenderTaskRetryYields(String jar, Path root)
@@ -2891,9 +3047,11 @@ public final class Minecraft262BrowserPatcher {
     private static void patchStagingBuffer(String jar, Path root) throws IOException {
         String owner = "com/mojang/blaze3d/vertex/StagingBuffer$Cpu";
         ClassNode node = read(jar, owner + ".class");
+        ModernSymbols symbols = ModernSymbols.cached(jar);
         MethodNode method = find(node, "copyTo",
-                "(Lcom/mojang/blaze3d/systems/CommandEncoder;"
-                        + "Lcom/mojang/blaze3d/buffers/GpuBuffer;JJJ)V");
+                "(L" + symbols.renderType("com/mojang/blaze3d/systems/CommandEncoder") + ";"
+                        + "L" + symbols.renderType("com/mojang/blaze3d/buffers/GpuBuffer")
+                        + ";JJJ)V");
         int replaced = replaceCall(
                 method,
                 Opcodes.INVOKEVIRTUAL,
@@ -2931,9 +3089,11 @@ public final class Minecraft262BrowserPatcher {
     private static void patchRemoteFriendList(String jar, Path root) throws IOException {
         String owner = "net/minecraft/client/gui/screens/social/RemoteFriendListUpdateHandler";
         ClassNode node = read(jar, owner + ".class");
+        // authlib 10 (Minecraft 26.3) moved FriendsService from yggdrasil to services; the
+        // constructor body (one CopyOnWriteArraySet) is unchanged.
         MethodNode constructor = find(node, "<init>",
-                "(Lcom/mojang/authlib/yggdrasil/FriendsService;"
-                        + "Lnet/minecraft/client/Minecraft;)V");
+                ModernSymbols.cached(jar).authlibDesc("(Lcom/mojang/authlib/yggdrasil/FriendsService;"
+                        + "Lnet/minecraft/client/Minecraft;)V"));
         int types = 0;
         int calls = 0;
         for (AbstractInsnNode instruction = constructor.instructions.getFirst();
@@ -2975,6 +3135,15 @@ public final class Minecraft262BrowserPatcher {
     }
 
     private static void patchMacosUtil(String jar, Path root) throws IOException {
+        if (ModernSymbols.cached(jar).renderpearl()) {
+            // 26.3 MacosUtil has no getNsWindow/setWindowColorSpaceForOpenGLBecauseGLFWDoesnt;
+            // RenderPatches263.patchMacosUtil stubs its ObjC and SDL-hint entry points.
+            PatchRegistry.dropped("Minecraft262BrowserPatcher.patchMacosUtil", jar,
+                    "com/mojang/blaze3d/platform/MacosUtil#getNsWindow",
+                    "com/mojang/blaze3d/platform/MacosUtil"
+                            + "#setWindowColorSpaceForOpenGLBecauseGLFWDoesnt");
+            return;
+        }
         String owner = "com/mojang/blaze3d/platform/MacosUtil";
         ClassNode node = read(jar, owner + ".class");
         for (String descriptor : new String[] {
@@ -2997,6 +3166,13 @@ public final class Minecraft262BrowserPatcher {
     }
 
     private static void patchVulkanDebug(String jar, Path root) throws IOException {
+        if (ModernSymbols.cached(jar).renderpearl()) {
+            // 26.3 VulkanDebug is only created by VulkanInstance, which only VulkanBackend
+            // constructs; RenderPatches263.patchVulkanBackend makes it unreachable.
+            PatchRegistry.dropped("Minecraft262BrowserPatcher.patchVulkanDebug", jar,
+                    "com/mojang/blaze3d/vulkan/VulkanDebug.class");
+            return;
+        }
         String owner = "com/mojang/blaze3d/vulkan/VulkanDebug";
         ClassNode node = read(jar, owner + ".class");
         MethodNode method = find(node, "create",

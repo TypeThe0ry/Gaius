@@ -12,7 +12,9 @@ import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
+import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.FieldInsnNode;
+import org.objectweb.asm.tree.FieldNode;
 import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.IntInsnNode;
@@ -22,13 +24,48 @@ import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.VarInsnNode;
 
-/** Replaces LWJGL's JVM Unsafe memory primitives with BrowserMemory. */
+/**
+ * Replaces LWJGL's JVM Unsafe memory primitives with BrowserMemory.
+ *
+ * <p>Two input shapes are supported, told apart by the MemoryUtil fields
+ * rather than by a version number:</p>
+ * <ul>
+ * <li>Unsafe mode (LWJGL 3.4.1 and older): MemoryUtil reads Unsafe
+ * directly; its initializer and memory methods are replaced by BrowserMemory
+ * calls.  This path must keep producing identical bytes (26.2, G1).</li>
+ * <li>Backend mode (LWJGL 3.4.2+, detected by the
+ * {@code MemoryUtil.BACKEND:Lorg/lwjgl/system/MemoryBackend;} field): most
+ * MemoryUtil and MemoryStack operations go through that field.  The
+ * initializer assigns {@code BrowserMemoryBackend.INSTANCE} (from the
+ * versioned lwjgl overlay) and writes only fields that exist, the reflective
+ * {@code createBackend()} returns the same instance, and
+ * {@code MemoryUtil$LazyInit} uses BrowserMemoryAllocator instead of
+ * MemoryManage's reflective allocator lookup.</li>
+ * </ul>
+ */
 public final class LwjglMemoryPatcher {
     private static final String MEMORY_UTIL = "org/lwjgl/system/MemoryUtil";
+    private static final String MEMORY_UTIL_LAZY_INIT = "org/lwjgl/system/MemoryUtil$LazyInit";
+    private static final String MEMORY_BACKEND = "org/lwjgl/system/MemoryBackend";
     private static final String BROWSER_MEMORY = "org/lwjgl/system/BrowserMemory";
+    private static final String BROWSER_MEMORY_BACKEND =
+            "org/lwjgl/system/BrowserMemoryBackend";
     private static final String BROWSER_MEMORY_ALLOCATOR =
             "org/lwjgl/system/BrowserMemoryAllocator";
+    private static final String MEMORY_ALLOCATOR_DESC =
+            "Lorg/lwjgl/system/MemoryUtil$MemoryAllocator;";
     private static final Map<String, String> DELEGATES = delegates();
+    /**
+     * Backend-mode MemoryUtil methods delegated in addition to DELEGATES.
+     * LWJGL 3.4.3 measures NUL-terminated strings a long word at a time; a
+     * virtual region ends exactly at its allocation size, so a word read
+     * past the terminator of a tightly allocated string would fail.
+     */
+    private static final Map<String, String> BACKEND_DELEGATES = Map.of(
+            "strlenNT1(JI)I", "lengthNt1",
+            "strlenNT2(JI)I", "lengthNt2");
+    /** Minimum backend-mode MemoryUtil replacements (LWJGL 3.4.3: 106). */
+    private static final int MIN_BACKEND_REPLACEMENTS = 100;
 
     private LwjglMemoryPatcher() {
     }
@@ -38,11 +75,23 @@ public final class LwjglMemoryPatcher {
             throw new IllegalArgumentException("usage: LwjglMemoryPatcher INPUT_JAR OUTPUT_ROOT");
         }
         Path root = Path.of(args[1]);
-        patchMemoryUtil(args[0], root.resolve("org/lwjgl/system/MemoryUtil.class"));
+        boolean backendMode = hasBackendField(read(args[0], MEMORY_UTIL + ".class"));
+        if (backendMode) {
+            System.out.println("LWJGL MemoryUtil uses a MemoryBackend: installing BrowserMemoryBackend");
+        }
+        patchMemoryUtil(args[0], root.resolve("org/lwjgl/system/MemoryUtil.class"), backendMode);
+        if (backendMode) {
+            patchMemoryUtilLazyInit(
+                    args[0], root.resolve("org/lwjgl/system/MemoryUtil$LazyInit.class"));
+        }
         patchMemoryUtilTunables(
                 args[0], root.resolve("org/lwjgl/system/MemoryUtilTunables.class"));
-        patchPointer(args[0], root.resolve("org/lwjgl/system/Pointer$Default.class"));
-        patchDecoder(args[0], root.resolve("org/lwjgl/system/MultiReleaseTextDecoding.class"));
+        patchPointer(
+                args[0], root.resolve("org/lwjgl/system/Pointer$Default.class"), backendMode);
+        patchDecoder(
+                args[0],
+                root.resolve("org/lwjgl/system/MultiReleaseTextDecoding.class"),
+                backendMode);
         patchLibrary(args[0], root.resolve("org/lwjgl/system/Library.class"));
         patchVersion(args[0], root.resolve("org/lwjgl/Version.class"));
         patchCallback(args[0], root.resolve("org/lwjgl/system/Callback.class"));
@@ -53,14 +102,54 @@ public final class LwjglMemoryPatcher {
         patchMemCopy(args[0], root.resolve("org/lwjgl/system/MultiReleaseMemCopy.class"));
     }
 
-    private static void patchMemoryUtil(String jar, Path output) throws IOException {
+    private static boolean hasBackendField(ClassNode memoryUtil) {
+        for (FieldNode field : memoryUtil.fields) {
+            if (field.name.equals("BACKEND")) {
+                if (!field.desc.equals("L" + MEMORY_BACKEND + ";")
+                        || (field.access & Opcodes.ACC_STATIC) == 0) {
+                    throw new IllegalStateException(
+                            "Unexpected MemoryUtil.BACKEND field: " + field.desc);
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void patchMemoryUtil(String jar, Path output, boolean backendMode)
+            throws IOException {
         ClassNode node = read(jar, "org/lwjgl/system/MemoryUtil.class");
         int replaced = 0;
+        boolean backendCreated = false;
+        Set<String> backendDelegates = new HashSet<>();
         for (MethodNode method : node.methods) {
             if (method.name.equals("<clinit>")) {
-                replace(method, memoryUtilInitializer(), 2);
+                replace(
+                        method,
+                        backendMode ? backendMemoryUtilInitializer() : memoryUtilInitializer(),
+                        2);
                 replaced++;
                 continue;
+            }
+            if (backendMode
+                    && method.name.equals("createBackend")
+                    && method.desc.equals("()L" + MEMORY_BACKEND + ";")) {
+                InsnList code = new InsnList();
+                code.add(browserMemoryBackendInstance());
+                code.add(new InsnNode(Opcodes.ARETURN));
+                replace(method, code, 1);
+                backendCreated = true;
+                replaced++;
+                continue;
+            }
+            if (backendMode) {
+                String backendTarget = BACKEND_DELEGATES.get(method.name + method.desc);
+                if (backendTarget != null) {
+                    replaceWithDelegate(method, backendTarget);
+                    backendDelegates.add(method.name + method.desc);
+                    replaced++;
+                    continue;
+                }
             }
             if (method.name.equals("getUnsafeInstance")
                     && method.desc.equals("()Lsun/misc/Unsafe;")) {
@@ -159,6 +248,98 @@ public final class LwjglMemoryPatcher {
         if (replaced < 20) {
             throw new IllegalStateException("Too few MemoryUtil methods replaced: " + replaced);
         }
+        if (backendMode) {
+            if (!backendCreated) {
+                throw new IllegalStateException("MemoryUtil.createBackend() not found");
+            }
+            if (!backendDelegates.equals(BACKEND_DELEGATES.keySet())) {
+                throw new IllegalStateException(
+                        "MemoryUtil string-length helpers not found: expected "
+                                + BACKEND_DELEGATES.keySet() + ", replaced " + backendDelegates);
+            }
+            if (replaced < MIN_BACKEND_REPLACEMENTS) {
+                throw new IllegalStateException(
+                        "Too few backend-mode MemoryUtil methods replaced: " + replaced);
+            }
+            verifyBackendMemoryUtil(node);
+            System.out.println("Patched " + replaced
+                    + " LWJGL MemoryUtil methods (BACKEND = BrowserMemoryBackend.INSTANCE)");
+        }
+        write(node, output);
+    }
+
+    /**
+     * Backend-mode self-check: the new initializer assigns exactly the
+     * listed static fields, BACKEND among them, and every MemoryUtil field
+     * the class still references exists (LWJGL 3.4.3 removed the Unsafe
+     * field offsets that the Unsafe-mode initializer writes).
+     */
+    private static void verifyBackendMemoryUtil(ClassNode node) {
+        Set<String> declared = new HashSet<>();
+        for (FieldNode field : node.fields) {
+            declared.add(field.name + ":" + field.desc);
+        }
+        Set<String> assigned = new HashSet<>();
+        for (MethodNode method : node.methods) {
+            for (AbstractInsnNode instruction = method.instructions.getFirst();
+                    instruction != null;
+                    instruction = instruction.getNext()) {
+                if (!(instruction instanceof FieldInsnNode field)
+                        || !field.owner.equals(MEMORY_UTIL)) {
+                    continue;
+                }
+                if (!declared.contains(field.name + ":" + field.desc)) {
+                    throw new IllegalStateException("MemoryUtil." + method.name
+                            + " references missing field " + field.name + ":" + field.desc);
+                }
+                if (method.name.equals("<clinit>") && field.getOpcode() == Opcodes.PUTSTATIC) {
+                    assigned.add(field.name);
+                }
+            }
+        }
+        Set<String> expected = Set.of(
+                "ARRAY_TLC_SIZE", "ARRAY_TLC_BYTE", "ARRAY_TLC_CHAR", "UTF16",
+                "PAGE_SIZE", "CACHE_LINE_SIZE", "BACKEND");
+        if (!assigned.equals(expected)) {
+            throw new IllegalStateException(
+                    "MemoryUtil initializer assigns " + assigned + ", expected " + expected);
+        }
+    }
+
+    /**
+     * LWJGL 3.4.3 {@code memUTF8(CharSequence, boolean)} allocates through
+     * {@code MemoryUtil$LazyInit.ALLOCATOR}, whose initializer picks a native
+     * allocator (jemalloc, rpmalloc, ...) by reflection.
+     */
+    private static void patchMemoryUtilLazyInit(String jar, Path output) throws IOException {
+        ClassNode node = read(jar, MEMORY_UTIL_LAZY_INIT + ".class");
+        for (String field : new String[] {"ALLOCATOR_IMPL", "ALLOCATOR"}) {
+            boolean found = node.fields.stream().anyMatch(candidate ->
+                    candidate.name.equals(field) && candidate.desc.equals(MEMORY_ALLOCATOR_DESC)
+                            && (candidate.access & Opcodes.ACC_STATIC) != 0);
+            if (!found) {
+                throw new IllegalStateException("MemoryUtil$LazyInit." + field + " not found");
+            }
+        }
+        MethodNode initializer = node.methods.stream()
+                .filter(method -> method.name.equals("<clinit>") && method.desc.equals("()V"))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(
+                        "MemoryUtil$LazyInit initializer not found"));
+        InsnList code = new InsnList();
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                BROWSER_MEMORY_ALLOCATOR,
+                "instance",
+                "()" + MEMORY_ALLOCATOR_DESC,
+                false));
+        code.add(new InsnNode(Opcodes.DUP));
+        code.add(new FieldInsnNode(
+                Opcodes.PUTSTATIC, MEMORY_UTIL_LAZY_INIT, "ALLOCATOR_IMPL", MEMORY_ALLOCATOR_DESC));
+        code.add(new FieldInsnNode(
+                Opcodes.PUTSTATIC, MEMORY_UTIL_LAZY_INIT, "ALLOCATOR", MEMORY_ALLOCATOR_DESC));
+        code.add(new InsnNode(Opcodes.RETURN));
+        replace(initializer, code, 2);
         write(node, output);
     }
 
@@ -346,8 +527,19 @@ public final class LwjglMemoryPatcher {
         replace(method, code, 2);
     }
 
-    private static void patchPointer(String jar, Path output) throws IOException {
+    private static void patchPointer(String jar, Path output, boolean backendMode)
+            throws IOException {
         ClassNode node = read(jar, "org/lwjgl/system/Pointer$Default.class");
+        if (backendMode) {
+            // Neither 3.4.1 nor 3.4.3 has a Pointer$Default initializer.  The
+            // Unsafe mode still rewrites the class unchanged, which keeps its
+            // output byte-identical; the backend mode leaves the original.
+            if (node.methods.stream().anyMatch(method -> method.name.equals("<clinit>"))) {
+                throw new IllegalStateException(
+                        "Unexpected Pointer$Default initializer in a MemoryBackend LWJGL");
+            }
+            return;
+        }
         for (MethodNode method : node.methods) {
             if (method.name.equals("<clinit>")) {
                 InsnList code = new InsnList();
@@ -370,8 +562,15 @@ public final class LwjglMemoryPatcher {
         write(node, output);
     }
 
-    private static void patchDecoder(String jar, Path output) throws IOException {
-        ClassNode node = read(jar, "org/lwjgl/system/MultiReleaseTextDecoding.class");
+    private static void patchDecoder(String jar, Path output, boolean backendMode)
+            throws IOException {
+        String entry = "org/lwjgl/system/MultiReleaseTextDecoding.class";
+        if (backendMode && !contains(jar, entry)) {
+            // LWJGL 3.4.3 decodes through MemoryBackend.getStringUTF8, which
+            // BrowserMemoryBackend implements with BrowserMemory.decodeUtf8.
+            return;
+        }
+        ClassNode node = read(jar, entry);
         for (MethodNode method : node.methods) {
             if (method.name.equals("decodeUTF8") && method.desc.equals("(JI)Ljava/lang/String;")) {
                 replaceWithDelegate(method, "decodeUtf8");
@@ -533,34 +732,53 @@ public final class LwjglMemoryPatcher {
         write(node, output);
     }
 
+    /**
+     * Makes {@code Platform.get()} report Linux by replacing the result of
+     * {@code System.getProperty("os.name")}.  The lookup is found by its
+     * immediately preceding {@code LDC "os.name"}: LWJGL 3.4.3 reads
+     * java.version first, and replacing that value instead makes
+     * {@code Platform.<clinit>} fail ("Failed to parse java.version").
+     */
     private static void patchPlatform(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "org/lwjgl/system/Platform.class");
-        boolean replaced = false;
-        for (MethodNode method : node.methods) {
-            if (!method.name.equals("<clinit>")) {
-                continue;
-            }
-            for (var instruction = method.instructions.getFirst();
-                    instruction != null;
-                    instruction = instruction.getNext()) {
-                if (instruction instanceof MethodInsnNode call
-                        && call.getOpcode() == Opcodes.INVOKESTATIC
-                        && call.owner.equals("java/lang/System")
-                        && call.name.equals("getProperty")
-                        && call.desc.equals("(Ljava/lang/String;)Ljava/lang/String;")) {
-                    InsnList browserOs = new InsnList();
-                    browserOs.add(new InsnNode(Opcodes.POP));
-                    browserOs.add(new LdcInsnNode("Linux"));
-                    method.instructions.insert(call, browserOs);
-                    replaced = true;
-                    break;
+        MethodNode initializer = node.methods.stream()
+                .filter(method -> method.name.equals("<clinit>"))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("Platform initializer not found"));
+        MethodInsnNode osName = null;
+        for (var instruction = initializer.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKESTATIC
+                    && call.owner.equals("java/lang/System")
+                    && call.name.equals("getProperty")
+                    && call.desc.equals("(Ljava/lang/String;)Ljava/lang/String;")
+                    && previousReal(call) instanceof LdcInsnNode key
+                    && "os.name".equals(key.cst)) {
+                if (osName != null) {
+                    throw new IllegalStateException("Platform reads os.name more than once");
                 }
+                osName = call;
             }
         }
-        if (!replaced) {
+        if (osName == null) {
             throw new IllegalStateException("Platform os.name lookup not found");
         }
+        InsnList browserOs = new InsnList();
+        browserOs.add(new InsnNode(Opcodes.POP));
+        browserOs.add(new LdcInsnNode("Linux"));
+        initializer.instructions.insert(osName, browserOs);
         write(node, output);
+    }
+
+    /** The previous instruction, skipping labels, line numbers and frames. */
+    private static AbstractInsnNode previousReal(AbstractInsnNode instruction) {
+        AbstractInsnNode previous = instruction.getPrevious();
+        while (previous != null && previous.getOpcode() < 0) {
+            previous = previous.getPrevious();
+        }
+        return previous;
     }
 
     private static void patchPlatformArchitecture(String jar, Path output) throws IOException {
@@ -687,6 +905,42 @@ public final class LwjglMemoryPatcher {
         putInt(code, "CACHE_LINE_SIZE", 64);
         code.add(new InsnNode(Opcodes.RETURN));
         return code;
+    }
+
+    /** LWJGL 3.4.2+ initializer: only fields that exist, no native page-size query. */
+    private static InsnList backendMemoryUtilInitializer() {
+        InsnList code = new InsnList();
+        putInt(code, "ARRAY_TLC_SIZE", 8192);
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC, BROWSER_MEMORY, "byteArrays",
+                "()Ljava/lang/ThreadLocal;", false));
+        code.add(new FieldInsnNode(
+                Opcodes.PUTSTATIC, MEMORY_UTIL, "ARRAY_TLC_BYTE", "Ljava/lang/ThreadLocal;"));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC, BROWSER_MEMORY, "charArrays",
+                "()Ljava/lang/ThreadLocal;", false));
+        code.add(new FieldInsnNode(
+                Opcodes.PUTSTATIC, MEMORY_UTIL, "ARRAY_TLC_CHAR", "Ljava/lang/ThreadLocal;"));
+        code.add(new FieldInsnNode(
+                Opcodes.GETSTATIC, "java/nio/charset/StandardCharsets",
+                "UTF_16LE", "Ljava/nio/charset/Charset;"));
+        code.add(new FieldInsnNode(
+                Opcodes.PUTSTATIC, MEMORY_UTIL, "UTF16", "Ljava/nio/charset/Charset;"));
+        putInt(code, "PAGE_SIZE", 65536);
+        putInt(code, "CACHE_LINE_SIZE", 64);
+        code.add(browserMemoryBackendInstance());
+        code.add(new FieldInsnNode(
+                Opcodes.PUTSTATIC, MEMORY_UTIL, "BACKEND", "L" + MEMORY_BACKEND + ";"));
+        code.add(new InsnNode(Opcodes.RETURN));
+        return code;
+    }
+
+    private static FieldInsnNode browserMemoryBackendInstance() {
+        return new FieldInsnNode(
+                Opcodes.GETSTATIC,
+                BROWSER_MEMORY_BACKEND,
+                "INSTANCE",
+                "L" + BROWSER_MEMORY_BACKEND + ";");
     }
 
     private static void putInt(InsnList code, String field, int value) {

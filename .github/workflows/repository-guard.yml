@@ -393,13 +393,17 @@ jobs:
             node port/scripts/minecraft-12111-patcher-smoke.mjs
           GAIUS_VERSION_PROFILE_PATH=versions/26.2.json \
             node port/scripts/minecraft-262-p1-patcher-smoke.mjs
+          # AuthlibBrowserPatcher serves authlib 9 (26.2) and 10 (26.3); the
+          # 26.3 half runs in the version-profiles job.
+          node port/scripts/authlib-keyset-constructor-smoke.mjs --run 26.2
 
       - name: Check repository diff formatting
         run: git diff --check
 
   version-profiles:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Fetch, overlays, javac, quick-check domain modules and the 26.3 smokes.
+    timeout-minutes: 60
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -421,6 +425,47 @@ jobs:
       - name: Validate every version profile and bring-up list
         run: node port/scripts/check-version-profile.mjs --all
 
+      - name: Bootstrap 26.3 smoke dependencies
+        env:
+          GAIUS_VERSION_PROFILE_PATH: versions/26.3.json
+        run: |
+          set -euo pipefail
+          export GAIUS_JAVA_HOME="$JAVA_HOME"
+          teavm="$(jq -er .teaVMVersion port/config.json)"
+          # build-overlays.sh bootstraps only asm and asm-tree; the patcher
+          # smokes also verify with asm-analysis and relocate with asm-commons,
+          # and the JSBody checks parse with TeaVM's Rhino.
+          for artifact in org.ow2.asm:asm-analysis:9.8 org.ow2.asm:asm-commons:9.8 \
+              "org.teavm:teavm-relocated-libs-rhino:$teavm"; do
+            ./port/mvnw --batch-mode --no-transfer-progress \
+              org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
+              "-Dartifact=$artifact" -Dtransitive=false
+          done
+          # The memory backend smoke compiles a small program with TeaVM.
+          ./port/mvnw --batch-mode --no-transfer-progress \
+            org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
+            "-Dartifact=org.teavm:teavm-tooling:$teavm"
+          # lwjgl-browser-compat-smoke.sh and browser-memory-lifecycle-smoke.sh
+          # use ripgrep.
+          if ! command -v rg >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ripgrep
+          fi
+
+      - name: quick-check profile dispatch and 26.3 source smokes
+        run: |
+          set -euo pipefail
+          # Profile rules, named-family predicate, 26.3 not-applicable table
+          # and the domain module dispatch of quick-check.py.
+          python3 port/scripts/test-quick-check-profile-resolver.py
+          # Node, mock-DOM and source contracts of the 26.3 packages; they
+          # need no Minecraft download.
+          node port/scripts/lwjgl-sdl-browser-dom-smoke.mjs
+          node port/scripts/frame-pacing-yield-smoke.mjs --profile 26.3
+          node port/scripts/browser-opengl-indexed-smoke.mjs
+          node port/scripts/storage-profile-isolation-smoke.mjs
+          python3 port/scripts/test-shader-toolchain-injection.py
+
       - name: Fetch, remap and verify the Minecraft 26.3 profile
         run: |
           set -euo pipefail
@@ -441,19 +486,13 @@ jobs:
           node port/scripts/check-version-profile.mjs \
             --profile 26.3 --remote --require-local
 
-      - name: Refuse 26.3 overlay and release builds outside bring-up mode
+      - name: Refuse 26.3 release builds in bring-up mode
         run: |
           set -euo pipefail
           export GAIUS_JAVA_HOME="$JAVA_HOME"
-          # 26.3 still has a non-empty port/tools/bringup/26.3.txt: a normal
-          # build must stop before any work and print the unfinished patches.
-          log="$RUNNER_TEMP/build-overlays-26.3-refused.log"
-          if GAIUS_VERSION_PROFILE_PATH=versions/26.3.json \
-              ./port/scripts/build-overlays.sh >"$log" 2>&1; then
-            echo "26.3 build-overlays.sh succeeded without GAIUS_BRINGUP=1" >&2
-            exit 1
-          fi
-          grep -Fq 'still has unfinished patches' "$log"
+          # port/tools/bringup/26.3.txt is empty since wave 1 of the 26.3
+          # migration, so a normal 26.3 build runs every patch (next step).
+          # A release must still refuse bring-up mode before any work.
           # Run through bash: the refusal must not depend on the file mode.
           if GAIUS_BRINGUP=1 bash port/scripts/build-version-release.sh 26.3 \
               >"$RUNNER_TEMP/release-refused.log" 2>&1; then
@@ -462,7 +501,7 @@ jobs:
           fi
           grep -Fq 'Refusing to build a release in bring-up mode' "$RUNNER_TEMP/release-refused.log"
 
-      - name: 26.3 bring-up overlays, G4 and port/src compile
+      - name: 26.3 overlays, G4 and port/src compile
         env:
           GAIUS_VERSION_PROFILE_PATH: versions/26.3.json
           # build-teavm.sh leaves these out of the client TeaVM class path.
@@ -470,31 +509,76 @@ jobs:
         run: |
           set -euo pipefail
           export GAIUS_JAVA_HOME="$JAVA_HOME"
-          log="$RUNNER_TEMP/build-overlays-26.3-bringup.log"
-          GAIUS_BRINGUP=1 ./port/scripts/build-overlays.sh >"$log" 2>&1 \
+          log="$RUNNER_TEMP/build-overlays-26.3.log"
+          # No bring-up mode: the bring-up list is empty, so every patch must
+          # end applied, registered as dropped, or fail the build.
+          ./port/scripts/build-overlays.sh >"$log" 2>&1 \
             || { tail -n 80 "$log"; exit 1; }
-          test -s port/work/overlays/26.3/BRINGUP
-          # G4: every skip is listed in port/tools/bringup/26.3.txt, and every
-          # listed patch is still skipped.  26.3 ships lwjgl-sdl instead of
-          # lwjgl-glfw and has no lwjgl-tinyfd.
+          test ! -e port/work/overlays/26.3/BRINGUP
+          # G4: no unregistered skip and no bring-up skip.  26.3 ships
+          # lwjgl-sdl instead of lwjgl-glfw and has no lwjgl-tinyfd.
           node port/scripts/check-build-log-skips.mjs --profile 26.3 --strict-list \
             --allow '^Skipping LWJGL module lwjgl-(glfw|tinyfd): not in the Minecraft 26\.3 libraries$' \
             "$log"
           # The 26.3 source set (port/src/versions/26.3) compiles against the
-          # bring-up overlays (javac only; the TeaVM goal is bound to package).
+          # overlays (javac only; the TeaVM goal is bound to package).
           ./port/scripts/generate-pom.sh
           ./port/mvnw --batch-mode --no-transfer-progress \
             --file port/target/26.3/generated-pom.xml compile
-          # A release refuses the bring-up overlays even when it would reuse
-          # them without rebuilding.
+          # G3: no link gap, on the JVM or against TeaVM's class library, other than the
+          # reviewed known issues of port/scripts/link-gap/known-26.3.json.
+          node port/scripts/minecraft-link-gap-smoke.mjs --profile 26.3 --expect-zero --quiet
+          # The JDK API helpers match the JDK, and every 26.3 call site is redirected.
+          node port/scripts/browser-jdk-compat-smoke.mjs --profile 26.3 --stages jvm,overlay
+          # A release refuses overlays that carry the bring-up marker even when
+          # it would reuse them without rebuilding.
+          printf 'bring-up marker (CI refusal check)\n' >port/work/overlays/26.3/BRINGUP
           if GAIUS_SKIP_OVERLAY_BUILD=true GAIUS_SKIP_CLIENT_BUILD=true \
               bash port/scripts/build-version-release.sh 26.3 \
               >"$RUNNER_TEMP/release-refused-overlays.log" 2>&1; then
             echo "build-version-release.sh accepted bring-up overlays" >&2
             exit 1
           fi
+          rm -f port/work/overlays/26.3/BRINGUP
           grep -Fq 'Refusing to build a release from bring-up overlays' \
             "$RUNNER_TEMP/release-refused-overlays.log"
+
+      - name: 26.3 quick-check domain modules
+        env:
+          GAIUS_VERSION_PROFILE_PATH: versions/26.3.json
+        run: |
+          set -euo pipefail
+          export GAIUS_JAVA_HOME="$JAVA_HOME"
+          # port/scripts/quickcheck/profile_263_{render,input,terrain,worldgen,
+          # server,ui}.py on the overlays and the javac output of the previous
+          # step, through quick-check's profile dispatch (no TeaVM build).
+          python3 port/scripts/quick-check.py --domain-modules
+
+      - name: 26.3 patcher and runtime smokes
+        env:
+          GAIUS_VERSION_PROFILE_PATH: versions/26.3.json
+        run: |
+          set -euo pipefail
+          export GAIUS_JAVA_HOME="$JAVA_HOME"
+          # JVM smokes on the vanilla 26.3 inputs and on the overlays and
+          # javac output above; none needs the TeaVM client build.
+          node port/scripts/worldgen-seed-parity.mjs --helpers
+          node port/scripts/lwjgl-sdl-browser-patcher-smoke.mjs
+          node port/scripts/minecraft-263-terrain-patcher-smoke.mjs
+          node port/scripts/minecraft-263-gpu-buffer-pool-smoke.mjs
+          node port/scripts/minecraft-263-mappable-ring-telemetry-smoke.mjs
+          node port/scripts/gpu-fence-retire-smoke.mjs
+          node port/scripts/authlib-keyset-constructor-smoke.mjs --run 26.3
+          node port/scripts/vanilla-pack-layers-263-smoke.mjs
+          node port/scripts/bitmap-font-sharing-263-smoke.mjs
+          bash port/scripts/lwjgl-browser-compat-smoke.sh
+          bash port/scripts/browser-memory-lifecycle-smoke.sh
+          node port/scripts/shader-corpus-smoke.mjs --stages overlay,harness,compare
+          node port/scripts/lwjgl-memory-backend-teavm-smoke.mjs --profile 26.3
+          # The section queue smoke asserts wall-clock p99 poll budgets: one
+          # retry absorbs a noisy runner, a real regression fails both runs.
+          node port/scripts/section-task-queue-smoke.mjs \
+            || node port/scripts/section-task-queue-smoke.mjs
 
   overlay-gates-26-2:
     # G1 (26.2 overlay bytes), G3 (link gaps) and G4 (silent skips) for every
@@ -586,12 +670,11 @@ jobs:
 
       - name: G4 - no unregistered skips in the 26.2 build log
         run: |
-          # The WeirdScaledSampler hash-cache target was already absent in
-          # 26.2 when this gate was introduced (owner P6).  26.2 has no
-          # lwjgl-sdl, and its shaderc/spvc jars stay unmodified (they are
-          # reached only from the unused Vulkan backend).
+          # 26.2 has no lwjgl-sdl, and its shaderc/spvc jars stay unmodified
+          # (they are reached only from the unused Vulkan backend).  The
+          # worldgen hash cache lists its 26.2 targets explicitly (P6), so the
+          # old WeirdScaledSampler skip line is gone.
           node port/scripts/check-build-log-skips.mjs --profile 26.2 \
-            --allow '^Skipping removed worldgen hash cache target net/minecraft/world/level/levelgen/DensityFunctions\$WeirdScaledSampler$' \
             --allow '^Skipping LWJGL module lwjgl-sdl: not in the Minecraft 26\.2 libraries$' \
             --allow '^Skipping LWJGL module lwjgl-(shaderc|spvc): the Minecraft 26\.2 client has no renderpearl OpenGL path$' \
             "$RUNNER_TEMP/head-build-overlays-26.2.log"

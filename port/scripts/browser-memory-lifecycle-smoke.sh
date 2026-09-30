@@ -8,8 +8,9 @@ gaius_select_java_home
 overlay_directory="$(gaius_overlay_directory "$ROOT")"
 
 MEMORY_SOURCE="$ROOT/port/overrides/libraries/lwjgl/src/main/java/org/lwjgl/system/BrowserMemory.java"
-MEMORY_JAR="$(find "$overlay_directory/libraries/org/lwjgl/lwjgl" \
-    -type f -name 'lwjgl-*-unsafe.jar' -print | sort | tail -1)"
+# The patched LWJGL core of the active profile: lwjgl-3.4.1-unsafe.jar for
+# 26.2, the plain lwjgl-3.4.3.jar (MemoryBackend shape) for 26.3.
+MEMORY_JAR="$overlay_directory/libraries/$(gaius_library_path "org.lwjgl:lwjgl" "unsafe")"
 JOML_JAR="$(find "$overlay_directory/libraries/org/joml/joml" \
     -type f -name 'joml-*.jar' -print | sort | tail -1)"
 TEAVM_JSO_JAR="$(find "$HOME/.m2/repository/org/teavm/teavm-jso" \

@@ -898,6 +898,12 @@ public final class BrowserFilePersistence {
                   && opfs==='regions-v2-26.2') {
                 return profile+'|'+world+'|'+schema+'|'+database+'|'+prefix+'|'+opfs;
               }
+              if (profile==='26.3' && world===5023 && schema===2
+                  && database==='gaius-fs-v2-26.3'
+                  && prefix==='gaius.fs.v2:26.3:'
+                  && opfs==='regions-v2-26.3') {
+                return profile+'|'+world+'|'+schema+'|'+database+'|'+prefix+'|'+opfs;
+              }
               return '';
             } catch (e) {
               return '';

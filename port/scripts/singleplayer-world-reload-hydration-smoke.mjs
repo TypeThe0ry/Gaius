@@ -80,7 +80,7 @@ function hydrate(records, predicate) {
   return files;
 }
 
-const profileIds = ["1.21.11", "26.2"];
+const profileIds = ["1.21.11", "26.2", "26.3"];
 for (const profileId of profileIds) {
   const worldRoot = `/gaius/saves/${profileId}/`;
   const worldGenPath = `${worldRoot}data/minecraft/world_gen_settings.dat`;

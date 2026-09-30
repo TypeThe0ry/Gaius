@@ -21,14 +21,11 @@ import {fileURLToPath} from "node:url";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const args = process.argv.slice(2);
-let configuredProfilePath;
-try {
-  configuredProfilePath = JSON.parse(
-    readFileSync(join(root, "port/config.json"), "utf8"),
-  ).versionProfile;
-} catch {
-  configuredProfilePath = "versions/26.2.json";
-}
+// port/config.json's versionProfile is the default profile; there is no
+// hard-coded fallback, so an unreadable config fails the smoke.
+const configuredProfilePath = JSON.parse(
+  readFileSync(join(root, "port/config.json"), "utf8"),
+).versionProfile;
 
 function usage() {
   console.log(`Usage: node port/scripts/gson-type-token-smoke.mjs [options]

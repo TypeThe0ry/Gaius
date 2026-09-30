@@ -3,7 +3,8 @@
 #  - VertexArrayCache: com/mojang/blaze3d/opengl/VertexArrayCache no longer exists
 #    (renderpearl backend/opengl/VertexArray replaces it; P3 decides on a port).
 #  - VanillaPackResources: 26.3 VanillaPackResources is no longer a PackResources;
-#    the pack body moved to FixedPathPackResources (P8 writes that override).
+#    the pack body moved to FixedPathPackResources, which versions/26.3/java
+#    overrides with the browser-archive implementation (the vanilla holder stays).
 #  - block/model/TextureSlots: 26.x moved TextureSlots to resources/model/sprite.
 com/mojang/blaze3d/opengl/VertexArrayCache.java
 net/minecraft/server/packs/VanillaPackResources.java

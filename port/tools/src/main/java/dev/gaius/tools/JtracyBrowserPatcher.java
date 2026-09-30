@@ -36,6 +36,7 @@ public final class JtracyBrowserPatcher {
         new ClassReader(input).accept(node, 0);
         int beginZoneMethods = 0;
         boolean availabilityMethod = false;
+        boolean sectionCategories = false;
         for (MethodNode method : node.methods) {
             if (method.name.equals("beginZone")
                     && method.desc.endsWith(")Lcom/mojang/jtracy/Zone;")) {
@@ -44,6 +45,14 @@ public final class JtracyBrowserPatcher {
             } else if (method.name.equals("isAvailable") && method.desc.equals("()Z")) {
                 replaceWithFalse(method);
                 availabilityMethod = true;
+            } else if (method.name.equals("createSectionCategory")
+                    && method.desc.equals(
+                            "(Ljava/lang/String;)Lcom/mojang/jtracy/SectionCategory;")) {
+                // jtracy 1.14 (Minecraft 26.3): the unloaded profiler already
+                // returns UNAVAILABLE; make that unconditional so TeaVM never
+                // reaches the TracyBindings natives behind the loaded branch.
+                replaceWithUnavailableSectionCategory(method);
+                sectionCategories = true;
             }
         }
         if (beginZoneMethods == 0 || !availabilityMethod) {
@@ -56,7 +65,19 @@ public final class JtracyBrowserPatcher {
         Path output = Path.of(args[1]).resolve(ENTRY);
         Files.createDirectories(output.getParent());
         Files.write(output, writer.toByteArray());
-        System.out.println("Patched TracyClient for browser use");
+        System.out.println("Patched TracyClient for browser use"
+                + (sectionCategories ? " (including section categories)" : ""));
+    }
+
+    private static void replaceWithUnavailableSectionCategory(MethodNode method) {
+        InsnList code = new InsnList();
+        code.add(new FieldInsnNode(
+                Opcodes.GETSTATIC,
+                "com/mojang/jtracy/SectionCategory",
+                "UNAVAILABLE",
+                "Lcom/mojang/jtracy/SectionCategory;"));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(method, code, 1);
     }
 
     private static void replaceWithUnavailableZone(MethodNode method) {

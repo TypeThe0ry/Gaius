@@ -17,16 +17,21 @@ import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.VarInsnNode;
 
-/** Adds opt-in first-successful-draw telemetry to both supported client profiles. */
+/**
+ * Adds opt-in first-successful-draw telemetry to the supported client profiles.
+ *
+ * <p>Section registration: 1.21.11 and 26.2 register in {@code LevelRenderer.prepareChunkRenders};
+ * 26.3 moved the per-section loop into {@code extractSectionDrawGroups}. Draw commit: 1.21.11 and
+ * 26.2 commit after {@code GlCommandEncoder.drawFromBuffers} in {@code executeDrawMultiple};
+ * 26.3 removed both, and terrain draws go through the renderpearl frontend
+ * {@code FrontendRenderPass.drawMultipleIndexed}, committed after its
+ * {@code RenderPassBackend.drawIndexed} interface call.
+ */
 public final class MinecraftChunkDrawTelemetryPatcher {
     private static final String LEVEL_RENDERER =
             "net/minecraft/client/renderer/LevelRenderer.class";
-    private static final String GL_COMMAND_ENCODER =
-            "com/mojang/blaze3d/opengl/GlCommandEncoder.class";
     private static final String TELEMETRY_OWNER =
             "dev/gaius/browser/BrowserChunkDrawTelemetry";
-    private static final String DRAW_OWNER =
-            "com/mojang/blaze3d/systems/RenderPass$Draw";
 
     private MinecraftChunkDrawTelemetryPatcher() {
     }
@@ -34,17 +39,20 @@ public final class MinecraftChunkDrawTelemetryPatcher {
     public static void main(String[] args) throws Exception {
         if (args.length != 3) {
             throw new IllegalArgumentException(
-                    "usage: <1.21.11|26.2> <input.jar> <output-root>");
+                    "usage: <1.21.11|26.2|26.3> <input.jar> <output-root>");
         }
         ProfileShape shape = ProfileShape.forId(args[0]);
         Path outputRoot = Path.of(args[2]);
         try (JarFile jar = new JarFile(args[1])) {
-            writeClass(
-                    outputRoot.resolve(LEVEL_RENDERER),
-                    patchLevelRenderer(readEntry(jar, LEVEL_RENDERER), shape));
-            writeClass(
-                    outputRoot.resolve(GL_COMMAND_ENCODER),
-                    patchGlCommandEncoder(readEntry(jar, GL_COMMAND_ENCODER), shape));
+            if (jar.getJarEntry(shape.forbiddenEntry) != null) {
+                throw new IllegalStateException("profile " + args[0] + " expects a client without "
+                        + shape.forbiddenEntry + "; wrong jar for this profile");
+            }
+            // Registration and commit only work as a pair: patch both before writing either.
+            byte[] levelRenderer = patchLevelRenderer(readEntry(jar, LEVEL_RENDERER), shape);
+            byte[] drawLoop = patchGlCommandEncoder(readEntry(jar, shape.drawEntry), shape);
+            writeClass(outputRoot.resolve(LEVEL_RENDERER), levelRenderer);
+            writeClass(outputRoot.resolve(shape.drawEntry), drawLoop);
         }
         System.out.println("CHUNK_DRAW_TELEMETRY_PATCH_OK profile=" + args[0]
                 + " levelMappings=1 lambdaArms=1 drawBegins=1 drawCommits=1");
@@ -52,7 +60,7 @@ public final class MinecraftChunkDrawTelemetryPatcher {
 
     private static byte[] patchLevelRenderer(byte[] bytes, ProfileShape shape) {
         ClassNode node = readClass(bytes);
-        MethodNode prepare = find(node, "prepareChunkRenders", shape.prepareDescriptor);
+        MethodNode prepare = find(node, shape.prepareName, shape.prepareDescriptor);
         MethodNode lambda = find(node, shape.lambdaName, shape.lambdaDescriptor);
 
         InsnList begin = new InsnList();
@@ -145,7 +153,7 @@ public final class MinecraftChunkDrawTelemetryPatcher {
 
     private static byte[] patchGlCommandEncoder(byte[] bytes, ProfileShape shape) {
         ClassNode node = readClass(bytes);
-        MethodNode execute = find(node, "executeDrawMultiple", shape.executeDescriptor);
+        MethodNode execute = find(node, shape.executeName, shape.executeDescriptor);
         MethodInsnNode callbackAccessor = null;
         MethodInsnNode callbackAccept = null;
         MethodInsnNode drawCall = null;
@@ -153,7 +161,7 @@ public final class MinecraftChunkDrawTelemetryPatcher {
             if (!(instruction instanceof MethodInsnNode call)) {
                 continue;
             }
-            if (call.owner.equals(DRAW_OWNER)
+            if (call.owner.equals(shape.drawOwner)
                     && call.name.equals("uniformUploaderConsumer")
                     && call.desc.equals("()Ljava/util/function/BiConsumer;")) {
                 if (callbackAccessor != null) {
@@ -164,20 +172,26 @@ public final class MinecraftChunkDrawTelemetryPatcher {
                     && call.name.equals("accept")
                     && call.desc.equals("(Ljava/lang/Object;Ljava/lang/Object;)V")) {
                 callbackAccept = call;
-            } else if (call.getOpcode() == Opcodes.INVOKEVIRTUAL
-                    && call.owner.equals("com/mojang/blaze3d/opengl/GlCommandEncoder")
-                    && call.name.equals("drawFromBuffers")
+            } else if (call.getOpcode() == shape.drawOpcode
+                    && call.owner.equals(shape.drawCallOwner)
+                    && call.name.equals(shape.drawCallName)
                     && call.desc.equals(shape.drawDescriptor)) {
                 if (drawCall != null) {
-                    throw new IllegalStateException("multiple drawFromBuffers calls");
+                    throw new IllegalStateException("multiple " + shape.drawCallName + " calls");
                 }
                 drawCall = call;
             }
         }
         if (callbackAccessor == null || callbackAccept == null || drawCall == null
                 || !precedes(callbackAccept, drawCall)) {
-            throw new IllegalStateException(
-                    "executeDrawMultiple callback -> drawFromBuffers shape changed");
+            throw new IllegalStateException(shape.executeName + " callback -> "
+                    + shape.drawCallName + " shape changed");
+        }
+        if (!(previousOpcode(callbackAccessor) instanceof VarInsnNode drawLoad)
+                || drawLoad.getOpcode() != Opcodes.ALOAD
+                || drawLoad.var != shape.drawLocal) {
+            throw new IllegalStateException(shape.executeName
+                    + " no longer keeps the current draw in local " + shape.drawLocal);
         }
 
         InsnList clear = new InsnList();
@@ -193,7 +207,7 @@ public final class MinecraftChunkDrawTelemetryPatcher {
         commit.add(new VarInsnNode(Opcodes.ALOAD, shape.drawLocal));
         commit.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL,
-                DRAW_OWNER,
+                shape.drawOwner,
                 "indexCount",
                 "()I",
                 false));
@@ -259,17 +273,39 @@ public final class MinecraftChunkDrawTelemetryPatcher {
         Files.write(output, bytes);
     }
 
+    /**
+     * @param prepareName        LevelRenderer method holding the per-section registration
+     * @param drawEntry          class holding the per-draw loop (and output entry)
+     * @param executeName        per-draw loop method
+     * @param drawOpcode         opcode of the call that issues one draw
+     * @param drawCallOwner      owner of the call that issues one draw
+     * @param drawCallName       name of the call that issues one draw
+     * @param drawOwner          the RenderPass$Draw record type
+     * @param forbiddenEntry     a class the profile's jar must not have (wrong-jar guard)
+     */
     private record ProfileShape(
+            String prepareName,
             String prepareDescriptor,
             String lambdaName,
             String lambdaDescriptor,
             int blockPosLocal,
             int uniformIndexLocal,
+            String drawEntry,
+            String executeName,
             String executeDescriptor,
+            int drawOpcode,
+            String drawCallOwner,
+            String drawCallName,
             String drawDescriptor,
+            String drawOwner,
             int drawLocal,
             String identityFieldName,
-            String identityFieldDescriptor) {
+            String identityFieldDescriptor,
+            String forbiddenEntry) {
+        private static final String GL_COMMAND_ENCODER = "com/mojang/blaze3d/opengl/GlCommandEncoder";
+        private static final String BLAZE3D_DRAW = "com/mojang/blaze3d/systems/RenderPass$Draw";
+        private static final String RENDERPEARL = "com/mojang/renderpearl/";
+
         private static ProfileShape forId(String id) {
             String returnType =
                     "Lnet/minecraft/client/renderer/chunk/ChunkSectionsToRender;";
@@ -278,39 +314,83 @@ public final class MinecraftChunkDrawTelemetryPatcher {
                             + "Lcom/mojang/blaze3d/systems/RenderPass$UniformUploader;)V";
             if (id.equals("1.21.11")) {
                 return new ProfileShape(
+                        "prepareChunkRenders",
                         "(Lorg/joml/Matrix4fc;DDD)" + returnType,
                         "lambda$prepareChunkRenders$6",
                         lambdaDescriptor,
                         17,
                         20,
+                        GL_COMMAND_ENCODER + ".class",
+                        "executeDrawMultiple",
                         "(Lcom/mojang/blaze3d/opengl/GlRenderPass;Ljava/util/Collection;"
                                 + "Lcom/mojang/blaze3d/buffers/GpuBuffer;"
                                 + "Lcom/mojang/blaze3d/vertex/VertexFormat$IndexType;"
                                 + "Ljava/util/Collection;Ljava/lang/Object;)V",
+                        Opcodes.INVOKEVIRTUAL,
+                        GL_COMMAND_ENCODER,
+                        "drawFromBuffers",
                         "(Lcom/mojang/blaze3d/opengl/GlRenderPass;III"
                                 + "Lcom/mojang/blaze3d/vertex/VertexFormat$IndexType;"
                                 + "Lcom/mojang/blaze3d/opengl/GlRenderPipeline;I)V",
+                        BLAZE3D_DRAW,
                         8,
                         "level",
-                        "Lnet/minecraft/client/multiplayer/ClientLevel;");
+                        "Lnet/minecraft/client/multiplayer/ClientLevel;",
+                        RENDERPEARL + "api/device/GpuDevice.class");
             }
             if (id.equals("26.2")) {
                 return new ProfileShape(
+                        "prepareChunkRenders",
                         "(Lorg/joml/Matrix4fc;)" + returnType,
                         "lambda$prepareChunkRenders$1",
                         lambdaDescriptor,
                         11,
                         14,
+                        GL_COMMAND_ENCODER + ".class",
+                        "executeDrawMultiple",
                         "(Lcom/mojang/blaze3d/opengl/GlRenderPass;Ljava/util/Collection;"
                                 + "Lcom/mojang/blaze3d/buffers/GpuBuffer;"
                                 + "Lcom/mojang/blaze3d/IndexType;Ljava/util/Collection;"
                                 + "Ljava/lang/Object;)V",
+                        Opcodes.INVOKEVIRTUAL,
+                        GL_COMMAND_ENCODER,
+                        "drawFromBuffers",
                         "(Lcom/mojang/blaze3d/opengl/GlRenderPass;III"
                                 + "Lcom/mojang/blaze3d/IndexType;"
                                 + "Lcom/mojang/blaze3d/opengl/GlRenderPipeline;II)V",
+                        BLAZE3D_DRAW,
                         8,
                         "levelRenderState",
-                        "Lnet/minecraft/client/renderer/state/level/LevelRenderState;");
+                        "Lnet/minecraft/client/renderer/state/level/LevelRenderState;",
+                        RENDERPEARL + "api/device/GpuDevice.class");
+            }
+            if (id.equals("26.3")) {
+                // Registration: extractSectionDrawGroups keeps the render origin (BlockPos) in
+                // local 14 and stores sectionInfos.size() into local 15. Draw: the frontend
+                // loop keeps the current RenderPass$Draw in local 9 and issues it through the
+                // RenderPassBackend interface.
+                return new ProfileShape(
+                        "extractSectionDrawGroups",
+                        "(ZLjava/util/List;Ljava/util/Map;)I",
+                        "lambda$prepareChunkRenders$2",
+                        "(I[L" + RENDERPEARL + "api/buffers/GpuBufferSlice;"
+                                + "L" + RENDERPEARL + "api/commands/RenderPass$UniformUploader;)V",
+                        14,
+                        15,
+                        RENDERPEARL + "frontend/FrontendRenderPass.class",
+                        "drawMultipleIndexed",
+                        "(Ljava/util/Collection;L" + RENDERPEARL + "api/buffers/GpuBuffer;"
+                                + "L" + RENDERPEARL + "api/pipeline/IndexType;"
+                                + "Ljava/util/Collection;Ljava/lang/Object;)V",
+                        Opcodes.INVOKEINTERFACE,
+                        RENDERPEARL + "backend/api/RenderPassBackend",
+                        "drawIndexed",
+                        "(IIIII)V",
+                        RENDERPEARL + "api/commands/RenderPass$Draw",
+                        9,
+                        "levelRenderState",
+                        "Lnet/minecraft/client/renderer/state/level/LevelRenderState;",
+                        GL_COMMAND_ENCODER + ".class");
             }
             throw new IllegalArgumentException("unsupported profile: " + id);
         }

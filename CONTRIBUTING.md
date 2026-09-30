@@ -77,6 +77,27 @@ done
 git diff --check
 ```
 
+The Minecraft `26.3` profile is in development and is not released yet. Until
+its TeaVM client links, check a `26.3` change with the overlay build, the
+javac-only compile of its source set, and quick-check's `26.3` domain modules
+(CI's `version-profiles` job runs these and the `26.3` patcher smokes):
+
+```sh
+export GAIUS_VERSION_PROFILE_PATH=versions/26.3.json
+./port/scripts/fetch-version.sh && ./port/scripts/remap-client.sh
+bash port/scripts/build-overlays.sh
+bash port/scripts/generate-pom.sh
+./port/mvnw --file port/target/26.3/generated-pom.xml compile
+python3 port/scripts/quick-check.py --domain-modules
+```
+
+quick-check judges every profile by the rule set `PROFILE_RULES` names for it
+in `port/scripts/quick-check.py`: `26.2` and `26.3` share the named-family
+rules, a rule that does not hold for `26.3` is listed in `NOT_APPLICABLE_263`
+with the reason and the check that covers its replacement, and the `26.3`
+patch assertions live in `port/scripts/quickcheck/profile_263_<domain>.py`. A
+profile without rules fails quick-check.
+
 For the Paper plugin (which targets the retained 1.21.11/JDK-21 profile):
 
 ```sh

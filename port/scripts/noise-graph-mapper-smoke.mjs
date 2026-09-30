@@ -5,8 +5,21 @@ import {homedir, tmpdir} from 'node:os';
 import {delimiter, join, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
+// Minecraft 26.2 only. BrowserNoiseGraphMapper (overrides/client/src/versions/26.2) memoizes the
+// per-chunk NoiseChunk.wrap graph mapping of the 26.2 density runtime. 26.3 compiles each
+// density graph once per RandomState, has no NoiseRouter/DensityFunction.mapAll and no
+// DensityFunction$Visitor, and registers Minecraft262BrowserPatcher.patchNoiseChunkGraphMapper
+// as dropped (migration plan D6), so there is no 26.3 variant of this smoke. Passing
+// --profile with another id fails instead of reporting coverage that does not exist.
 const root = fileURLToPath(new URL('../../', import.meta.url));
-const positional = process.argv.slice(2).filter(value => value !== '--real' && value !== '--teavm');
+const profileIndex = process.argv.indexOf('--profile');
+if (profileIndex >= 0 && process.argv[profileIndex + 1] !== '26.2') {
+  console.error(`noise-graph-mapper-smoke: 26.2 only; profile ${process.argv[profileIndex + 1]} `
+    + 'drops Minecraft262BrowserPatcher.patchNoiseChunkGraphMapper (compiled density runtime)');
+  process.exit(2);
+}
+const positional = process.argv.slice(2).filter((value, index, all) => value !== '--real'
+  && value !== '--teavm' && value !== '--profile' && all[index - 1] !== '--profile');
 const helper = resolve(positional[0] || join(root,
   'port/overrides/client/src/versions/26.2/java/net/minecraft/world/level/levelgen/BrowserNoiseGraphMapper.java'));
 const fixture = resolve(positional[1] || join(root, 'port/scripts/fixtures/NoiseGraphMapperFixture.java'));
