@@ -4980,6 +4980,10 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchChatSigning(String jar, Path root) throws IOException {
+        // authlib 10 (Minecraft 26.3) moved ServicesKeySet/ServicesKeyType from
+        // com/mojang/authlib/yggdrasil to com/mojang/authlib/services; the owner package comes
+        // from the jar's probed authlib flavour (unchanged on 26.2 and 1.21.11).
+        ModernSymbols symbols = ModernSymbols.cached(jar);
         ClassNode validator = read(jar, "net/minecraft/util/SignatureValidator.class");
         replaceStaticFieldReturn(
                 validator,
@@ -4991,9 +4995,9 @@ public final class MinecraftClientPatcher {
         replaceStaticFieldReturn(
                 validator,
                 "from",
-                "(Lcom/mojang/authlib/yggdrasil/ServicesKeySet;"
+                symbols.authlibDesc("(Lcom/mojang/authlib/yggdrasil/ServicesKeySet;"
                         + "Lcom/mojang/authlib/yggdrasil/ServicesKeyType;)"
-                        + "Lnet/minecraft/util/SignatureValidator;",
+                        + "Lnet/minecraft/util/SignatureValidator;"),
                 "net/minecraft/util/SignatureValidator",
                 "NO_VALIDATION",
                 "Lnet/minecraft/util/SignatureValidator;");
@@ -9196,6 +9200,9 @@ public final class MinecraftClientPatcher {
             break;
         }
         if (!offlineAuthenticationPatched) {
+            offlineAuthenticationPatched = patchServerMainDiscoveryServiceBrowser(main);
+        }
+        if (!offlineAuthenticationPatched) {
             throw new IllegalStateException(
                     "Server offline authentication-service patch point was not found");
         }
@@ -9622,6 +9629,53 @@ public final class MinecraftClientPatcher {
         return checkpoint;
     }
 
+    /**
+     * authlib 10 (Minecraft 26.3): server Main calls
+     * {@code MinecraftServicesDiscoveryService.create(Proxy.NO_PROXY)}, which enables the
+     * services key set (a public-key fetch) on top of the discovery fetch. Insert
+     * {@code ICONST_0} and call {@code create(Proxy, boolean)} instead: the key set stays off and
+     * discovery keeps running, which is what authlib 9's {@code createOffline} did for 26.2
+     * (key set disabled, endpoints live). Failed fetches are swallowed by RetryableFetch. Returns
+     * {@code false} when the 26.3 shape is absent so the caller fails closed.
+     */
+    private static boolean patchServerMainDiscoveryServiceBrowser(MethodNode main) {
+        String discoveryService = "com/mojang/authlib/services/MinecraftServicesDiscoveryService";
+        String createDescriptor = "(Ljava/net/Proxy;)L" + discoveryService + ";";
+        MethodInsnNode target = null;
+        for (AbstractInsnNode instruction = main.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (!(instruction instanceof MethodInsnNode call)
+                    || call.getOpcode() != Opcodes.INVOKESTATIC
+                    || !call.owner.equals(discoveryService)
+                    || !call.name.equals("create")
+                    || !call.desc.equals(createDescriptor)) {
+                continue;
+            }
+            if (target != null) {
+                throw new IllegalStateException(
+                        "Server Main calls MinecraftServicesDiscoveryService.create(Proxy) twice");
+            }
+            target = call;
+        }
+        if (target == null) {
+            return false;
+        }
+        if (!(previousOpcode(target) instanceof FieldInsnNode proxy)
+                || proxy.getOpcode() != Opcodes.GETSTATIC
+                || !proxy.owner.equals("java/net/Proxy")
+                || !proxy.name.equals("NO_PROXY")
+                || !proxy.desc.equals("Ljava/net/Proxy;")) {
+            throw new IllegalStateException(
+                    "Server discovery-service create(Proxy) is not preceded by Proxy.NO_PROXY");
+        }
+        main.instructions.insertBefore(target, new InsnNode(Opcodes.ICONST_0));
+        target.desc = "(Ljava/net/Proxy;Z)L" + discoveryService + ";";
+        // NO_PROXY and the flag: the operand stack is empty before NO_PROXY in 26.3 Main.
+        main.maxStack = Math.max(main.maxStack, 2);
+        return true;
+    }
+
     private static void patchWorldLoaderBrowserStartupTelemetry(String jar, Path output)
             throws IOException {
         String owner = "net/minecraft/server/WorldLoader";
@@ -9651,8 +9705,11 @@ public final class MinecraftClientPatcher {
                     if (registryList == null) {
                         continue;
                     }
+                    // 26.3 renamed WORLDGEN_REGISTRIES to WORLD_REGISTRIES (same role, same
+                    // load call); the telemetry phase name stays the same for both.
                     if (!worldgenRegistryPatched
-                            && registryList.name.equals("WORLDGEN_REGISTRIES")) {
+                            && (registryList.name.equals("WORLDGEN_REGISTRIES")
+                                    || registryList.name.equals("WORLD_REGISTRIES"))) {
                         method.instructions.insertBefore(
                                 call,
                                 serverStartupPhase("world-loader-worldgen-registries-started"));
@@ -9819,13 +9876,29 @@ public final class MinecraftClientPatcher {
             Path output) throws IOException {
         String owner = "net/minecraft/server/packs/resources/SimpleJsonResourceReloadListener";
         ClassNode node = read(jar, owner + ".class");
-        MethodNode scanDirectory = find(
-                node,
-                "scanDirectory",
-                "(Lnet/minecraft/server/packs/resources/ResourceManager;"
-                        + "Lnet/minecraft/resources/FileToIdConverter;"
-                        + "Lcom/mojang/serialization/DynamicOps;"
-                        + "Lcom/mojang/serialization/Codec;Ljava/util/Map;)V");
+        String scanDirectoryDescriptor = "(Lnet/minecraft/server/packs/resources/ResourceManager;"
+                + "Lnet/minecraft/resources/FileToIdConverter;"
+                + "Lcom/mojang/serialization/DynamicOps;"
+                + "Lcom/mojang/serialization/Codec;Ljava/util/Map;)V";
+        MethodNode scanDirectory = findNullable(node, "scanDirectory", scanDirectoryDescriptor);
+        if (scanDirectory == null) {
+            // Minecraft 26.3 removed both static scanDirectory overloads and inlined the same
+            // listMatchingResources/parse loop into prepare(ResourceManager, ProfilerFiller)Map.
+            // SimpleJsonResourceReloadListener is client-only there (WaypointStyleManager,
+            // EquipmentAssetManager); the server Worker's datapack JSON (world, dimension,
+            // recipe and loot registries) now decodes through RegistryLoadTask, whose yield is
+            // ServerPatches263.patchRegistryLoadTaskBrowserStartupYield. Keep the 26.2 client
+            // behaviour by yielding in the inlined loop; fail closed if neither shape exists.
+            if (node.methods.stream().anyMatch(method -> method.name.equals("scanDirectory"))) {
+                throw new IllegalStateException(
+                        "SimpleJsonResourceReloadListener.scanDirectory changed its descriptor");
+            }
+            scanDirectory = find(
+                    node,
+                    "prepare",
+                    "(Lnet/minecraft/server/packs/resources/ResourceManager;"
+                            + "Lnet/minecraft/util/profiling/ProfilerFiller;)Ljava/util/Map;");
+        }
         MethodInsnNode hasNext = null;
         for (AbstractInsnNode instruction = scanDirectory.instructions.getFirst();
                 instruction != null;
@@ -11379,12 +11452,15 @@ public final class MinecraftClientPatcher {
             }
         }
         if (userField == null || profileField == null) {
-            return;
+            // Every supported profile (1.21.11, 26.2, 26.3) declares both fields; BrowserProfile
+            // links against the bridge, so a missing field must fail the build, not skip it.
+            throw new IllegalStateException(
+                    "Minecraft identity bridge fields user/profileFuture were not found");
         }
         userField.access &= ~Opcodes.ACC_FINAL;
         profileField.access &= ~Opcodes.ACC_FINAL;
-        String descriptor = "(Lnet/minecraft/client/User;"
-                + "Lcom/mojang/authlib/yggdrasil/ProfileResult;)V";
+        String descriptor = "(Lnet/minecraft/client/User;L"
+                + identityProfileResultType(profileField) + ";)V";
         node.methods.removeIf(method -> method.name.equals("gaius$replaceIdentity")
                 && method.desc.equals(descriptor));
         MethodNode bridge = new MethodNode(
@@ -11408,6 +11484,36 @@ public final class MinecraftClientPatcher {
         bridge.maxStack = 2;
         bridge.maxLocals = 3;
         node.methods.add(bridge);
+    }
+
+    /**
+     * The authlib ProfileResult that {@code Minecraft.profileFuture} completes with: authlib 9
+     * {@code com/mojang/authlib/yggdrasil/ProfileResult} (1.21.11, 26.2) or authlib 10
+     * {@code com/mojang/authlib/services/ProfileResult} (26.3). It is read from the field's own
+     * generic signature (this method only sees the ClassNode, not the jar a ModernSymbols
+     * probe needs). It is the same yggdrasil &rarr; services mapping as
+     * {@code ModernSymbols.authlibDesc}: modern-symbols-smoke asserts that mapping for this
+     * descriptor, and quickcheck/profile_263_server.py asserts the patched 26.3 bridge.
+     * BrowserProfile of each profile's source set builds the matching record.
+     */
+    private static String identityProfileResultType(FieldNode profileField) {
+        String yggdrasil = "com/mojang/authlib/yggdrasil/ProfileResult";
+        String services = "com/mojang/authlib/services/ProfileResult";
+        String signature = profileField.signature;
+        String type = null;
+        if (signature != null) {
+            if (signature.equals("Ljava/util/concurrent/CompletableFuture<L" + yggdrasil + ";>;")) {
+                type = yggdrasil;
+            } else if (signature.equals(
+                    "Ljava/util/concurrent/CompletableFuture<L" + services + ";>;")) {
+                type = services;
+            }
+        }
+        if (type == null) {
+            throw new IllegalStateException("Minecraft.profileFuture has an unknown ProfileResult"
+                    + " signature: " + signature);
+        }
+        return type;
     }
 
     private static void addMinecraftUiBridges(ClassNode node) {
@@ -20283,8 +20389,28 @@ public final class MinecraftClientPatcher {
         // flying.  The resulting client/server position desync strands ChunkMap tracking at the
         // last accepted section and renders only sky.  Vanilla/non-Worker movement remains
         // untouched below the Worker fast path.
+        //
+        // Minecraft 26.3 moved the movement body, including both ServerChunkCache.move calls,
+        // into handlePlayerPositionChange(DDDFFZZ)V; handleMovePlayer only validates the packet
+        // and calls it (so does handleAcceptTeleportPacket). The Worker fast path above stays at
+        // the head of handleMovePlayer; the chunk-tracking redirect follows the calls.
+        MethodNode positionChange = findNullable(
+                node, "handlePlayerPositionChange", "(DDDFFZZ)V");
+        MethodNode moveTracking = positionChange != null ? positionChange : movePlayer;
+        if (positionChange != null) {
+            for (AbstractInsnNode instruction = movePlayer.instructions.getFirst();
+                    instruction != null;
+                    instruction = instruction.getNext()) {
+                if (instruction instanceof MethodInsnNode call
+                        && call.owner.equals("net/minecraft/server/level/ServerChunkCache")
+                        && call.name.equals("move")) {
+                    throw new IllegalStateException("ServerGamePacketListenerImpl.handleMovePlayer"
+                            + " still moves chunk tracking next to handlePlayerPositionChange");
+                }
+            }
+        }
         int moveCalls = 0;
-        for (AbstractInsnNode instruction = movePlayer.instructions.getFirst();
+        for (AbstractInsnNode instruction = moveTracking.instructions.getFirst();
                 instruction != null;
                 instruction = instruction.getNext()) {
             if (!(instruction instanceof MethodInsnNode call)
@@ -20309,6 +20435,7 @@ public final class MinecraftClientPatcher {
                             + moveCalls);
         }
         movePlayer.maxStack = Math.max(movePlayer.maxStack, 2);
+        moveTracking.maxStack = Math.max(moveTracking.maxStack, 2);
         writeComputeFrames(node, output);
     }
 
@@ -20976,9 +21103,11 @@ public final class MinecraftClientPatcher {
                 .findFirst()
                 .orElse(null);
         if (build == null) {
-            // Older profiles use a different SkinManager shape; leave them vanilla.
-            System.out.println("Skipped uploaded skin security patch: SkinManager shape not present");
-            return;
+            // Security patch: an uploaded data: skin must never be treated as a signed Mojang
+            // texture. Every supported profile (1.21.11, 26.2, 26.3) has this lambda, so a
+            // missing shape fails the build instead of leaving SkinManager unpatched.
+            throw new IllegalStateException(
+                    "SkinManager uploaded skin security patch point was not found");
         }
         int redirected = 0;
         for (var instruction = build.instructions.getFirst(); instruction != null;
