@@ -137,11 +137,14 @@ def checks(root: Path, overlay_jar: Path | None = None) -> list[tuple[str, bool]
              "--client-jar", str(overlay_jar)],
             cwd=root, capture_output=True, text=True, check=False,
         )
-        results.append((
-            f"26.3 overlay terrain bytecode ({overlay_jar.name})",
-            completed.returncode == 0
-            and "Minecraft 26.3 terrain patcher smoke passed" in completed.stdout,
-        ))
+        passed = (completed.returncode == 0
+                  and "Minecraft 26.3 terrain patcher smoke passed" in completed.stdout)
+        description = f"26.3 overlay terrain bytecode ({overlay_jar.name})"
+        if not passed:
+            # Keep the smoke's own diagnosis in the quick-check output; CI shows nothing else.
+            output = (completed.stdout + "\n" + completed.stderr).strip().splitlines()[-12:]
+            description += f" [exit {completed.returncode}]\n      " + "\n      ".join(output)
+        results.append((description, passed))
     return results
 
 
