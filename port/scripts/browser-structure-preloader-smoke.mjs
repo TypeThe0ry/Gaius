@@ -1,11 +1,25 @@
 import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
+import {existsSync} from 'node:fs';
 import {mkdir, mkdtemp, readdir, readFile, writeFile} from 'node:fs/promises';
 import {homedir, tmpdir} from 'node:os';
 import {delimiter, join, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
+// --profile 26.3 compiles the 26.3 copy (port/src/versions/26.3/...) against a MinecraftServer
+// stub with the 26.3 accessor getStructureTemplateManager(); the default profile 26.2 keeps
+// getStructureManager(). Each stub has only its profile's accessor, so a copy that calls the
+// other one fails to compile. When port/work/<profile>/client-named.jar exists, the accessor
+// is also checked against the real MinecraftServer.
+const profileIndex = process.argv.indexOf('--profile');
+const profile = profileIndex >= 0 ? process.argv[profileIndex + 1] : '26.2';
+const accessors = {'26.2': 'getStructureManager', '26.3': 'getStructureTemplateManager'};
+const accessor = accessors[profile];
+assert.ok(accessor, `unsupported --profile ${profile}`);
+const versionedPreloader = resolve(root, `port/src/versions/${profile}/java/dev/gaius/browser/BrowserStructurePreloader.java`);
+const preloaderSource = existsSync(versionedPreloader) ? versionedPreloader
+  : resolve(root, 'port/src/main/java/dev/gaius/browser/BrowserStructurePreloader.java');
 const repository = process.env.M2_REPO || join(homedir(), '.m2', 'repository');
 const jars=[];
 for (const artifact of await readdir(join(repository,'org','teavm'))) {
@@ -18,11 +32,11 @@ const java=process.env.JAVA_HOME?join(process.env.JAVA_HOME,'bin','java'+executa
 const javac=process.env.JAVA_HOME?join(process.env.JAVA_HOME,'bin','javac'+executableSuffix):'javac';
 const temp=await mkdtemp(join(tmpdir(),'gaius-structure-preloader-'));
 const files={
- 'dev/gaius/browser/BrowserStructurePreloader.java': await readFile(resolve(root,'port/src/main/java/dev/gaius/browser/BrowserStructurePreloader.java'),'utf8'),
+ 'dev/gaius/browser/BrowserStructurePreloader.java': await readFile(preloaderSource,'utf8'),
  'org/teavm/classlib/java/lang/TModernRuntimeSupport.java': `package org.teavm.classlib.java.lang; import org.teavm.interop.*; import org.teavm.platform.Platform; public final class TModernRuntimeSupport { public static int yields; @Async public static native void yieldToEventLoop(int delay); private static void yieldToEventLoop(int delay, AsyncCallback<Void> callback){ yields++; Platform.schedule(()->callback.complete(null),delay); } }`,
  'net/minecraft/resources/Identifier.java': `package net.minecraft.resources; public final class Identifier { private final String value; private Identifier(String v){value=v;} public static Identifier tryParse(String v){ if(v==null||!v.matches("[a-z0-9_.-]+:[a-z0-9_/.-]+")) return null; return new Identifier(v);} public String toString(){return value;} }`,
  'net/minecraft/world/level/levelgen/structure/templatesystem/StructureTemplateManager.java': `package net.minecraft.world.level.levelgen.structure.templatesystem; import java.util.*; import net.minecraft.resources.Identifier; public class StructureTemplateManager { public int gets; public static String mode="ok"; private final Set<String> cache=new HashSet<>(); public Optional<Object> get(Identifier id){ if("runtime".equals(mode)) throw new RuntimeException("fixture-failure"); if("error".equals(mode)) throw new AssertionError("fixture-error"); if("missing".equals(mode)) return Optional.empty(); if(cache.add(id.toString())) gets++; return Optional.of(new Object()); } }`,
- 'net/minecraft/server/MinecraftServer.java': `package net.minecraft.server; import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplateManager; public class MinecraftServer { private final StructureTemplateManager m; public MinecraftServer(StructureTemplateManager x){m=x;} public StructureTemplateManager getStructureManager(){return m;} }`,
+ 'net/minecraft/server/MinecraftServer.java': `package net.minecraft.server; import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplateManager; public class MinecraftServer { private final StructureTemplateManager m; public MinecraftServer(StructureTemplateManager x){m=x;} public StructureTemplateManager ${accessor}(){return m;} }`,
  'PreloaderFixture.java': `import dev.gaius.browser.BrowserStructurePreloader; import net.minecraft.server.MinecraftServer; import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplateManager; import org.teavm.interop.Async; import org.teavm.interop.AsyncCallback; import org.teavm.jso.*; import org.teavm.platform.Platform;
 public class PreloaderFixture {
  @JSBody(script="globalThis.__gaiusStructurePreloadIds=undefined; globalThis.__gaiusStructurePreloadBudgetMillis=undefined;") static native void clear();
@@ -56,9 +70,17 @@ public class PreloaderFixture {
 }`,
  'CompileFixture.java': `import java.io.File; import org.teavm.tooling.*; import org.teavm.backend.javascript.JSModuleType; public class CompileFixture { public static void main(String[] a)throws Exception{TeaVMTool t=new TeaVMTool();t.setMainClass("PreloaderFixture");t.setTargetDirectory(new File(a[0]));t.setTargetFileName("fixture.cjs");t.setJsModuleType(JSModuleType.COMMON_JS);t.setObfuscated(false);t.setClassLoader(ClassLoader.getSystemClassLoader());t.generate();for(var p:t.getProblemProvider().getSevereProblems())System.err.println(p.getText()+" "+java.util.Arrays.toString(p.getParams()));if(!t.getProblemProvider().getSevereProblems().isEmpty())throw new AssertionError("TeaVM failed");}}`
 };
+const namedJar=join(root,'port/work',profile,'client-named.jar');
+if (existsSync(namedJar)) {
+  const javap=process.env.JAVA_HOME?join(process.env.JAVA_HOME,'bin','javap'+executableSuffix):'javap';
+  const server=execFileSync(javap,['-cp',namedJar,'net.minecraft.server.MinecraftServer'],{encoding:'utf8',maxBuffer:20*1024*1024});
+  assert.ok(server.includes(`public net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplateManager ${accessor}()`),
+    `${profile} MinecraftServer has no ${accessor}()`);
+  console.log(`PRELOADER_ACCESSOR ${profile} MinecraftServer.${accessor}() present in ${namedJar}`);
+}
 const paths=[]; for(const [name,data] of Object.entries(files)){const f=join(temp,name); await mkdir(resolve(f,'..'),{recursive:true}); await writeFile(f,data); paths.push(f);}
 const cp=[temp,...jars].join(delimiter); execFileSync(javac,['--release','21','-cp',cp,'-d',temp,...paths],{stdio:'pipe',maxBuffer:20*1024*1024}); execFileSync(java,['-Xmx1g','-cp',cp,'CompileFixture',temp],{stdio:'pipe',timeout:120000});
 const out=execFileSync(process.execPath,['-e',`const m=require(${JSON.stringify(join(temp,'fixture.cjs'))});
 const deadline=setTimeout(()=>{throw Error('preloader fixture completion timed out');},10000);
 const poll=setInterval(()=>{if(globalThis.preloaderResult){clearInterval(poll);clearTimeout(deadline);console.log(globalThis.preloaderResult);}},20);
-m.main([],e=>{if(e)throw e;});`],{encoding:'utf8',timeout:15000}); assert.equal(out.trim(),'PRELOADER_OK'); console.log(out.trim());
+m.main([],e=>{if(e)throw e;});`],{encoding:'utf8',timeout:15000}); assert.equal(out.trim(),'PRELOADER_OK'); console.log(`${out.trim()} profile=${profile} source=${preloaderSource}`);

@@ -15275,6 +15275,11 @@ public final class MinecraftClientPatcher {
     private static void patchNoiseBasedChunkGeneratorBrowserSynchronous(
             String jar, Path output, boolean deepWorldgenCheckpoints) throws IOException {
         ClassNode node = read(jar, "net/minecraft/world/level/levelgen/NoiseBasedChunkGenerator.class");
+        MethodNode compiledDoFill = findNullable(node, "doFill", NOISE_CHUNK_GENERATOR_DO_FILL_263);
+        if (compiledDoFill != null) {
+            patchNoiseBasedChunkGenerator263(node, compiledDoFill, output, deepWorldgenCheckpoints);
+            return;
+        }
         MethodNode method = find(
                 node,
                 "doFill",
@@ -15304,6 +15309,113 @@ public final class MinecraftClientPatcher {
                     applyCarvers, "NoiseBasedChunkGenerator.applyCarvers");
         }
         writeComputeFrames(node, output);
+    }
+
+    private static final String NOISE_CHUNK_GENERATOR_DO_FILL_263 =
+            "(Lnet/minecraft/world/level/levelgen/NoiseChunk;"
+                    + "Lnet/minecraft/world/level/chunk/ChunkAccess;)V";
+    private static final String NOISE_CHUNK_GENERATOR_GENERATE_CARVERS_263 =
+            "(Lnet/minecraft/world/level/chunk/ChunkAccess;"
+                    + "Lnet/minecraft/world/level/levelgen/blending/Blender;"
+                    + "Lnet/minecraft/world/level/levelgen/NoiseChunk;"
+                    + "Lnet/minecraft/world/level/levelgen/RandomState;"
+                    + "Lnet/minecraft/world/level/biome/BiomeManager;"
+                    + "Lnet/minecraft/server/level/WorldGenRegion;"
+                    + "Lnet/minecraft/world/level/levelgen/material/rule/MaterialRule;)V";
+
+    /**
+     * Minecraft 26.3 merged NOISE, SURFACE and CARVERS into one TERRAIN step:
+     * {@code doFill(NoiseChunk, ChunkAccess)} samples the whole chunk volume once and then fills
+     * blocks in three nested loops, and {@code generateCarvers} replaces {@code applyCarvers}
+     * (carved blocks are applied later through CarvingMask, which WorldgenPatches263 pulses).
+     * The debugVoidTerrain check moved to buildTerrain, so only the default block is hoisted.
+     * The volume sample before the first loop stays non-preemptible (measured separately).
+     */
+    private static void patchNoiseBasedChunkGenerator263(
+            ClassNode node, MethodNode doFill, Path output, boolean deepWorldgenCheckpoints)
+            throws IOException {
+        hoistNoiseBasedChunkGeneratorDefaultBlock(doFill);
+        requireWorldgenSchedulerCalls("NoiseBasedChunkGenerator.doFill", doFill, 0);
+        MethodNode generateCarvers = find(
+                node, "generateCarvers", NOISE_CHUNK_GENERATOR_GENERATE_CARVERS_263);
+        requireWorldgenSchedulerCalls(
+                "NoiseBasedChunkGenerator.generateCarvers", generateCarvers, 0);
+        if (deepWorldgenCheckpoints) {
+            patchDeepWorldgenPulseBackEdges(doFill, "NoiseBasedChunkGenerator.doFill", 3);
+            patchDeepWorldgenPulseBackEdges(
+                    generateCarvers, "NoiseBasedChunkGenerator.generateCarvers", 3);
+        }
+        writeComputeFrames(node, output);
+        System.out.println("Patched 26.3 NoiseBasedChunkGenerator doFill/generateCarvers"
+                + (deepWorldgenCheckpoints ? " with deep worldgen pulses" : ""));
+    }
+
+    /** Evaluates {@code settings.value().defaultBlock()} once per doFill instead of per block. */
+    private static void hoistNoiseBasedChunkGeneratorDefaultBlock(MethodNode method) {
+        String generator = "net/minecraft/world/level/levelgen/NoiseBasedChunkGenerator";
+        String settings = "net/minecraft/world/level/levelgen/NoiseGeneratorSettings";
+        int defaultBlockLocal = method.maxLocals++;
+        int replacements = 0;
+        for (var instruction = method.instructions.getFirst(); instruction != null;) {
+            var next = instruction.getNext();
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                    && call.owner.equals(settings)
+                    && call.name.equals("defaultBlock")
+                    && call.desc.equals("()Lnet/minecraft/world/level/block/state/BlockState;")) {
+                var cast = previousRealInstruction(call);
+                var value = previousRealInstruction(cast);
+                var field = previousRealInstruction(value);
+                var owner = previousRealInstruction(field);
+                if (cast instanceof TypeInsnNode type
+                        && type.getOpcode() == Opcodes.CHECKCAST
+                        && type.desc.equals(settings)
+                        && value instanceof MethodInsnNode valueCall
+                        && valueCall.getOpcode() == Opcodes.INVOKEINTERFACE
+                        && valueCall.owner.equals("net/minecraft/core/Holder")
+                        && valueCall.name.equals("value")
+                        && field instanceof FieldInsnNode settingsField
+                        && settingsField.getOpcode() == Opcodes.GETFIELD
+                        && settingsField.owner.equals(generator)
+                        && settingsField.name.equals("settings")
+                        && owner instanceof VarInsnNode load
+                        && load.getOpcode() == Opcodes.ALOAD
+                        && load.var == 0) {
+                    method.instructions.insertBefore(owner, new VarInsnNode(
+                            Opcodes.ALOAD, defaultBlockLocal));
+                    method.instructions.remove(owner);
+                    method.instructions.remove(field);
+                    method.instructions.remove(value);
+                    method.instructions.remove(cast);
+                    method.instructions.remove(call);
+                    replacements++;
+                }
+            }
+            instruction = next;
+        }
+        if (replacements != 1) {
+            throw new IllegalStateException(
+                    "NoiseBasedChunkGenerator.doFill default-block cache points: " + replacements);
+        }
+        InsnList constants = new InsnList();
+        constants.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        constants.add(new FieldInsnNode(
+                Opcodes.GETFIELD, generator, "settings", "Lnet/minecraft/core/Holder;"));
+        constants.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "net/minecraft/core/Holder",
+                "value",
+                "()Ljava/lang/Object;",
+                true));
+        constants.add(new TypeInsnNode(Opcodes.CHECKCAST, settings));
+        constants.add(new MethodInsnNode(
+                Opcodes.INVOKEVIRTUAL,
+                settings,
+                "defaultBlock",
+                "()Lnet/minecraft/world/level/block/state/BlockState;",
+                false));
+        constants.add(new VarInsnNode(Opcodes.ASTORE, defaultBlockLocal));
+        method.instructions.insert(constants);
     }
 
     private static void cacheNoiseBasedChunkGeneratorDoFillConstants(MethodNode method) {
@@ -15462,6 +15574,12 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchImprovedNoiseBrowserHotPath(String jar, Path output) throws IOException {
+        // 26.3: single-octave noise is the float synth/PerlinNoise (GradientNoise) kernel.
+        if (droppedForCompiledDensityRuntime(
+                "MinecraftClientPatcher.patchImprovedNoiseBrowserHotPath", jar,
+                "net/minecraft/world/level/levelgen/synth/ImprovedNoise.class")) {
+            return;
+        }
         String owner = "net/minecraft/world/level/levelgen/synth/ImprovedNoise";
         ClassNode node = read(jar, owner + ".class");
         MethodNode noise = find(node, "noise", "(DDDDD)D");
@@ -15514,6 +15632,11 @@ public final class MinecraftClientPatcher {
             throws IOException {
         String owner = "net/minecraft/world/level/biome/BiomeManager";
         ClassNode node = read(jar, owner + ".class");
+        MethodNode coordinates = findNullable(node, "getBiome", "(III)Lnet/minecraft/core/Holder;");
+        if (coordinates != null) {
+            patchBiomeManagerNearestCornerCoordinates(node, coordinates, owner, output);
+            return;
+        }
         MethodNode method = find(
                 node,
                 "getBiome",
@@ -15573,6 +15696,81 @@ public final class MinecraftClientPatcher {
         write(node, output);
     }
 
+    /**
+     * Minecraft 26.3 moved the zoom algorithm into {@code getBiome(int, int, int)} (getBiome(BlockPos)
+     * delegates to it, and EnvironmentAttributeSystem calls it directly), removed
+     * {@code BiomeManager$NoiseBiomeSource} and stores the source as a {@code BiomeResolver}.
+     * The replacement body is the 26.2 one with coordinates read from locals 1..3.
+     */
+    private static void patchBiomeManagerNearestCornerCoordinates(
+            ClassNode node, MethodNode method, String owner, Path output) throws IOException {
+        String resolver = "net/minecraft/world/level/biome/BiomeResolver";
+        boolean resolverField = node.fields.stream().anyMatch(field ->
+                field.name.equals("noiseBiomeSource") && field.desc.equals("L" + resolver + ";")
+                        && (field.access & Opcodes.ACC_STATIC) == 0);
+        if (!resolverField || (method.access & Opcodes.ACC_STATIC) != 0) {
+            throw new IllegalStateException(
+                    "BiomeManager.getBiome(III) no longer reads a BiomeResolver noiseBiomeSource");
+        }
+        int resolverCalls = 0;
+        for (AbstractInsnNode instruction : method.instructions) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEINTERFACE
+                    && call.owner.equals(resolver)
+                    && call.name.equals("getNoiseBiome")
+                    && call.desc.equals("(III)Lnet/minecraft/core/Holder;")) {
+                resolverCalls++;
+            }
+        }
+        if (resolverCalls != 1) {
+            throw new IllegalStateException(
+                    "BiomeManager.getBiome(III) resolver call shape changed: " + resolverCalls);
+        }
+        InsnList code = new InsnList();
+        for (int coordinate = 0; coordinate < 3; coordinate++) {
+            code.add(new VarInsnNode(Opcodes.ILOAD, coordinate + 1));
+            code.add(new InsnNode(Opcodes.ICONST_2));
+            code.add(new InsnNode(Opcodes.ISUB));
+            code.add(new VarInsnNode(Opcodes.ISTORE, coordinate + 4));
+        }
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "biomeZoomSeed", "J"));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 4));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 5));
+        code.add(new VarInsnNode(Opcodes.ILOAD, 6));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserBiomeManager",
+                "nearestCorner",
+                "(JIII)I",
+                false));
+        code.add(new VarInsnNode(Opcodes.ISTORE, 7));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "noiseBiomeSource", "L" + resolver + ";"));
+        for (int coordinate = 0; coordinate < 3; coordinate++) {
+            code.add(new VarInsnNode(Opcodes.ILOAD, coordinate + 4));
+            code.add(new InsnNode(Opcodes.ICONST_2));
+            code.add(new InsnNode(Opcodes.ISHR));
+            code.add(new VarInsnNode(Opcodes.ILOAD, 7));
+            if (coordinate < 2) {
+                code.add(new InsnNode(coordinate == 0 ? Opcodes.ICONST_2 : Opcodes.ICONST_1));
+                code.add(new InsnNode(Opcodes.IUSHR));
+            }
+            code.add(new InsnNode(Opcodes.ICONST_1));
+            code.add(new InsnNode(Opcodes.IAND));
+            code.add(new InsnNode(Opcodes.IADD));
+        }
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                resolver,
+                "getNoiseBiome",
+                "(III)Lnet/minecraft/core/Holder;",
+                true));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        replace(method, code, 6, 8);
+        write(node, output);
+    }
+
     private static void patchAquiferBrowserNearestCenters(String jar, Path output)
             throws IOException {
         String owner = "net/minecraft/world/level/levelgen/Aquifer$NoiseBasedAquifer";
@@ -15585,7 +15783,23 @@ public final class MinecraftClientPatcher {
                 null,
                 null));
 
-        MethodNode constructor = find(
+        // 26.3: the aquifer is built from a DensitySamplerSet and a DensityVolume, and
+        // computeSubstance takes the block coordinates directly: x/y/z are locals 1/2/3 instead
+        // of 4/5/6, and the four nearest distances and indices are locals 10..17 instead of
+        // 11..18. The grid, cache and nearest-center loop are unchanged, so the same helper
+        // fills the eight locals.
+        MethodNode compiledConstructor = findNullable(
+                node,
+                "<init>",
+                "(Lnet/minecraft/world/level/levelgen/densityfunction/DensitySamplerSet;"
+                        + "Lnet/minecraft/world/level/levelgen/Aquifer$Config;"
+                        + "Lnet/minecraft/world/level/levelgen/PositionalRandomFactory;"
+                        + "Lnet/minecraft/world/level/levelgen/densityfunction/DensityVolume;"
+                        + "Lnet/minecraft/world/level/levelgen/Aquifer$FluidPicker;)V");
+        boolean blockCoordinates = compiledConstructor != null;
+        int coordinateLocal = blockCoordinates ? 1 : 4;
+        int nearestLocal = blockCoordinates ? 10 : 11;
+        MethodNode constructor = blockCoordinates ? compiledConstructor : find(
                 node,
                 "<init>",
                 "(Lnet/minecraft/world/level/levelgen/NoiseChunk;"
@@ -15615,8 +15829,10 @@ public final class MinecraftClientPatcher {
         MethodNode method = find(
                 node,
                 "computeSubstance",
-                "(Lnet/minecraft/world/level/levelgen/DensityFunction$FunctionContext;D)"
-                        + "Lnet/minecraft/world/level/block/state/BlockState;");
+                blockCoordinates
+                        ? "(IIID)Lnet/minecraft/world/level/block/state/BlockState;"
+                        : "(Lnet/minecraft/world/level/levelgen/DensityFunction$FunctionContext;D)"
+                                + "Lnet/minecraft/world/level/block/state/BlockState;");
         MethodInsnNode firstGridX = null;
         MethodInsnNode firstStatus = null;
         for (AbstractInsnNode instruction = method.instructions.getFirst();
@@ -15648,7 +15864,7 @@ public final class MinecraftClientPatcher {
         statusReceiver = previousRealInstruction(statusReceiver);
         if (!(originalPathStart instanceof VarInsnNode loadX)
                 || loadX.getOpcode() != Opcodes.ILOAD
-                || loadX.var != 4
+                || loadX.var != coordinateLocal
                 || !(statusReceiver instanceof VarInsnNode loadThis)
                 || loadThis.getOpcode() != Opcodes.ALOAD
                 || loadThis.var != 0) {
@@ -15667,9 +15883,9 @@ public final class MinecraftClientPatcher {
             fastPath.add(new VarInsnNode(Opcodes.ALOAD, 0));
             fastPath.add(new FieldInsnNode(Opcodes.GETFIELD, owner, field, "I"));
         }
-        fastPath.add(new VarInsnNode(Opcodes.ILOAD, 4));
-        fastPath.add(new VarInsnNode(Opcodes.ILOAD, 5));
-        fastPath.add(new VarInsnNode(Opcodes.ILOAD, 6));
+        fastPath.add(new VarInsnNode(Opcodes.ILOAD, coordinateLocal));
+        fastPath.add(new VarInsnNode(Opcodes.ILOAD, coordinateLocal + 1));
+        fastPath.add(new VarInsnNode(Opcodes.ILOAD, coordinateLocal + 2));
         fastPath.add(new VarInsnNode(Opcodes.ALOAD, 0));
         fastPath.add(new FieldInsnNode(Opcodes.GETFIELD, owner, resultField, "[I"));
         fastPath.add(new MethodInsnNode(
@@ -15684,7 +15900,7 @@ public final class MinecraftClientPatcher {
             fastPath.add(new FieldInsnNode(Opcodes.GETFIELD, owner, resultField, "[I"));
             fastPath.add(new IntInsnNode(Opcodes.BIPUSH, index));
             fastPath.add(new InsnNode(Opcodes.IALOAD));
-            fastPath.add(new VarInsnNode(Opcodes.ISTORE, 11 + index));
+            fastPath.add(new VarInsnNode(Opcodes.ISTORE, nearestLocal + index));
         }
         fastPath.add(new JumpInsnNode(Opcodes.GOTO, nearestReady));
         fastPath.add(originalPath);
@@ -15694,6 +15910,17 @@ public final class MinecraftClientPatcher {
 
     private static void patchPerlinNoiseBrowserDoubleWrap(String jar, Path output)
             throws IOException {
+        // 26.3: octaves moved to synth/NoiseStack and GradientNoise.wrap uses Math.floor, so
+        // neither the amplitude array nor the long-free wrap has anything left to replace.
+        if (droppedForCompiledDensityRuntime(
+                "MinecraftClientPatcher.patchPerlinNoiseBrowserDoubleWrap", jar,
+                "net/minecraft/world/level/levelgen/synth/PerlinNoise#<init>("
+                        + "Lnet/minecraft/util/RandomSource;Lcom/mojang/datafixers/util/Pair;Z)V",
+                "net/minecraft/world/level/levelgen/synth/PerlinNoise#amplitudes",
+                "net/minecraft/world/level/levelgen/synth/PerlinNoise#getValue",
+                "net/minecraft/world/level/levelgen/synth/PerlinNoise#wrap(D)D")) {
+            return;
+        }
         String owner = "net/minecraft/world/level/levelgen/synth/PerlinNoise";
         ClassNode node = read(jar, owner + ".class");
         String browserAmplitudes = "browserAmplitudes";
@@ -15841,6 +16068,15 @@ public final class MinecraftClientPatcher {
 
     private static void patchBeardifierBrowserPackedCompute(String jar, Path output)
             throws IOException {
+        // 26.3: Beardifier is a DensitySampler whose sampleVolume already skips volumes outside
+        // the affected box; its float kernel must not be replaced by the double JS kernel.
+        if (droppedForCompiledDensityRuntime(
+                "MinecraftClientPatcher.patchBeardifierBrowserPackedCompute", jar,
+                "net/minecraft/world/level/levelgen/Beardifier#compute("
+                        + "Lnet/minecraft/world/level/levelgen/DensityFunction$FunctionContext;)D",
+                "net/minecraft/world/level/levelgen/DensityFunction$FunctionContext")) {
+            return;
+        }
         String owner = "net/minecraft/world/level/levelgen/Beardifier";
         ClassNode node = read(jar, owner + ".class");
         String piecesField = "browserPackedPieces";
@@ -15962,6 +16198,16 @@ public final class MinecraftClientPatcher {
 
     private static void patchSurfaceSystemBrowserSynchronous(
             String jar, Path output, boolean deepWorldgenCheckpoints) throws IOException {
+        if (jarHasEntry(jar, MATERIAL_SYSTEM + ".class")) {
+            // The dispatcher names the 26.2 class file; write MaterialSystem next to it instead.
+            Path levelgenRoot = output.getParent();
+            if (levelgenRoot == null || !output.getFileName().toString().equals("SurfaceSystem.class")) {
+                throw new IllegalStateException("Unexpected SurfaceSystem output path " + output);
+            }
+            patchMaterialSystemBuildSurface263(jar,
+                    levelgenRoot.resolve("material/MaterialSystem.class"), deepWorldgenCheckpoints);
+            return;
+        }
         ClassNode node = read(jar, "net/minecraft/world/level/levelgen/SurfaceSystem.class");
         String legacyDescriptor =
                 "(Lnet/minecraft/world/level/levelgen/RandomState;"
@@ -16003,8 +16249,46 @@ public final class MinecraftClientPatcher {
         }
     }
 
+    private static final String MATERIAL_SYSTEM =
+            "net/minecraft/world/level/levelgen/material/MaterialSystem";
+
+    /**
+     * Minecraft 26.3 renamed SurfaceSystem to material/MaterialSystem; buildSurface lost the
+     * boolean parameter and takes a MaterialRule instead of a SurfaceRules$RuleSource. Its four
+     * column/section loops keep the deep pulses of the 26.2 patch (TERRAIN also runs the carvers
+     * right after it, so the step is heavier than 26.2 SURFACE).
+     */
+    private static void patchMaterialSystemBuildSurface263(
+            String jar, Path output, boolean deepWorldgenCheckpoints) throws IOException {
+        ClassNode node = read(jar, MATERIAL_SYSTEM + ".class");
+        MethodNode method = find(
+                node,
+                "buildSurface",
+                "(Lnet/minecraft/world/level/levelgen/RandomState;"
+                        + "Lnet/minecraft/world/level/biome/BiomeManager;"
+                        + "Lnet/minecraft/world/level/levelgen/WorldGenerationContext;"
+                        + "Lnet/minecraft/world/level/chunk/ChunkAccess;"
+                        + "Lnet/minecraft/world/level/levelgen/NoiseChunk;"
+                        + "Lnet/minecraft/world/level/levelgen/material/rule/MaterialRule;"
+                        + "Ljava/util/Set;)V");
+        requireWorldgenSchedulerCalls("MaterialSystem.buildSurface", method, 0);
+        if (deepWorldgenCheckpoints) {
+            patchDeepWorldgenPulseBackEdges(method, "MaterialSystem.buildSurface", 4);
+            writeComputeFrames(node, output);
+        } else {
+            write(node, output);
+        }
+    }
+
     private static void patchSurfaceRulesContextBrowserReusableBiomeSupplier(
             String jar, Path output) throws IOException {
+        // 26.3: SurfaceRules$Context became material/MaterialRuleContext, which already resolves
+        // the biome lazily; its int shadow counters are WorldgenPatches263's job.
+        if (droppedForCompiledDensityRuntime(
+                "MinecraftClientPatcher.patchSurfaceRulesContextBrowserReusableBiomeSupplier", jar,
+                "net/minecraft/world/level/levelgen/SurfaceRules$Context.class")) {
+            return;
+        }
         String owner = "net/minecraft/world/level/levelgen/SurfaceRules$Context";
         String helper = "dev/gaius/browser/BrowserSurfaceBiomeSupplier";
         String helperDescriptor = "L" + helper + ";";
@@ -16171,6 +16455,15 @@ public final class MinecraftClientPatcher {
 
     private static void patchSurfaceRulesLazyConditionBrowserPrimitiveCache(
             String jar, Path root) throws IOException {
+        // 26.3: the lazy conditions are MaterialRuleContext$LazyXZCondition/$LazyYCondition
+        // without a common base class; WorldgenPatches263 replaces their test() methods.
+        if (droppedForCompiledDensityRuntime(
+                "MinecraftClientPatcher.patchSurfaceRulesLazyConditionBrowserPrimitiveCache", jar,
+                "net/minecraft/world/level/levelgen/SurfaceRules$LazyCondition.class",
+                "net/minecraft/world/level/levelgen/SurfaceRules$LazyXZCondition.class",
+                "net/minecraft/world/level/levelgen/SurfaceRules$LazyYCondition.class")) {
+            return;
+        }
         String lazyOwner = "net/minecraft/world/level/levelgen/SurfaceRules$LazyCondition";
         ClassNode lazy = read(jar, lazyOwner + ".class");
         lazy.fields.add(new FieldNode(Opcodes.ACC_PRIVATE, "browserLastUpdate", "I", null, null));
@@ -16256,6 +16549,15 @@ public final class MinecraftClientPatcher {
 
     private static void patchDensityFunctionsPureTransformersBrowserDirect(
             String jar, Path root) throws IOException {
+        // 26.3: every transformer is a monomorphic float sampler record (ClampFunction$Sampler,
+        // BinaryFunction$Const*Sampler, UnaryFunction$*Sampler), which is what this emulated.
+        if (droppedForCompiledDensityRuntime(
+                "MinecraftClientPatcher.patchDensityFunctionsPureTransformersBrowserDirect", jar,
+                "net/minecraft/world/level/levelgen/DensityFunctions$Clamp.class",
+                "net/minecraft/world/level/levelgen/DensityFunctions$MulOrAdd.class",
+                "net/minecraft/world/level/levelgen/DensityFunctions$Mapped.class")) {
+            return;
+        }
         String densityFunction = "net/minecraft/world/level/levelgen/DensityFunction";
         String context = densityFunction + "$FunctionContext";
         String provider = densityFunction + "$ContextProvider";
@@ -16328,37 +16630,83 @@ public final class MinecraftClientPatcher {
         }
     }
 
+    /**
+     * Density-function records hashed on every 26.2 graph-mapping lookup. 1.21.11 also still has
+     * {@code DensityFunctions$WeirdScaledSampler}, which 26.2 no longer has.
+     */
+    private static final String[] WORLDGEN_HASH_CACHE_DENSITY_RECORDS = {
+        "net/minecraft/world/level/levelgen/DensityFunction$NoiseHolder",
+        "net/minecraft/world/level/levelgen/DensityFunctions$Ap2",
+        "net/minecraft/world/level/levelgen/DensityFunctions$Clamp",
+        "net/minecraft/world/level/levelgen/DensityFunctions$Constant",
+        "net/minecraft/world/level/levelgen/DensityFunctions$HolderHolder",
+        "net/minecraft/world/level/levelgen/DensityFunctions$Mapped",
+        "net/minecraft/world/level/levelgen/DensityFunctions$Marker",
+        "net/minecraft/world/level/levelgen/DensityFunctions$MulOrAdd",
+        "net/minecraft/world/level/levelgen/DensityFunctions$Noise",
+        "net/minecraft/world/level/levelgen/DensityFunctions$RangeChoice",
+        "net/minecraft/world/level/levelgen/DensityFunctions$Shift",
+        "net/minecraft/world/level/levelgen/DensityFunctions$ShiftA",
+        "net/minecraft/world/level/levelgen/DensityFunctions$ShiftB",
+        "net/minecraft/world/level/levelgen/DensityFunctions$ShiftedNoise",
+        "net/minecraft/world/level/levelgen/DensityFunctions$Spline",
+        "net/minecraft/world/level/levelgen/DensityFunctions$Spline$Coordinate",
+        "net/minecraft/world/level/levelgen/DensityFunctions$YClampedGradient"
+    };
+    private static final String WORLDGEN_HASH_CACHE_WEIRD_SCALED_SAMPLER =
+            "net/minecraft/world/level/levelgen/DensityFunctions$WeirdScaledSampler";
+    private static final String[] WORLDGEN_HASH_CACHE_SPLINES = {
+        "net/minecraft/util/CubicSpline$Constant",
+        "net/minecraft/util/CubicSpline$Multipoint"
+    };
+
+    /**
+     * The explicit hash-cache target list of each profile; every listed class must exist. 26.3
+     * compiles each density graph once per RandomState (DensityFunctionCompiler), so the 26.2
+     * density records are gone and only the spline records remain; retargeting the cache to the
+     * 26.3 densityfunction records is left to measurement (migration plan D6).
+     */
+    private static String[] worldgenRecordHashCacheTargets(String profile) {
+        java.util.List<String> owners = new java.util.ArrayList<>();
+        switch (profile == null ? "" : profile) {
+            case "1.21.11" -> {
+                owners.addAll(java.util.List.of(WORLDGEN_HASH_CACHE_DENSITY_RECORDS));
+                owners.add(owners.indexOf(
+                        "net/minecraft/world/level/levelgen/DensityFunctions$YClampedGradient"),
+                        WORLDGEN_HASH_CACHE_WEIRD_SCALED_SAMPLER);
+                owners.addAll(java.util.List.of(WORLDGEN_HASH_CACHE_SPLINES));
+            }
+            case "26.2" -> {
+                owners.addAll(java.util.List.of(WORLDGEN_HASH_CACHE_DENSITY_RECORDS));
+                owners.addAll(java.util.List.of(WORLDGEN_HASH_CACHE_SPLINES));
+            }
+            case "26.3" -> owners.addAll(java.util.List.of(WORLDGEN_HASH_CACHE_SPLINES));
+            default -> throw new IllegalStateException(
+                    "No explicit worldgen hash cache target list for profile " + profile);
+        }
+        return owners.toArray(String[]::new);
+    }
+
     private static void patchWorldgenRecordHashCodeCaches(String jar, Path root)
             throws IOException {
-        String[] owners = {
-            "net/minecraft/world/level/levelgen/DensityFunction$NoiseHolder",
-            "net/minecraft/world/level/levelgen/DensityFunctions$Ap2",
-            "net/minecraft/world/level/levelgen/DensityFunctions$Clamp",
-            "net/minecraft/world/level/levelgen/DensityFunctions$Constant",
-            "net/minecraft/world/level/levelgen/DensityFunctions$HolderHolder",
-            "net/minecraft/world/level/levelgen/DensityFunctions$Mapped",
-            "net/minecraft/world/level/levelgen/DensityFunctions$Marker",
-            "net/minecraft/world/level/levelgen/DensityFunctions$MulOrAdd",
-            "net/minecraft/world/level/levelgen/DensityFunctions$Noise",
-            "net/minecraft/world/level/levelgen/DensityFunctions$RangeChoice",
-            "net/minecraft/world/level/levelgen/DensityFunctions$Shift",
-            "net/minecraft/world/level/levelgen/DensityFunctions$ShiftA",
-            "net/minecraft/world/level/levelgen/DensityFunctions$ShiftB",
-            "net/minecraft/world/level/levelgen/DensityFunctions$ShiftedNoise",
-            "net/minecraft/world/level/levelgen/DensityFunctions$Spline",
-            "net/minecraft/world/level/levelgen/DensityFunctions$Spline$Coordinate",
-            "net/minecraft/world/level/levelgen/DensityFunctions$WeirdScaledSampler",
-            "net/minecraft/world/level/levelgen/DensityFunctions$YClampedGradient",
-            "net/minecraft/util/CubicSpline$Constant",
-            "net/minecraft/util/CubicSpline$Multipoint"
-        };
+        String profile = PatchRegistry.profile();
+        String[] owners = worldgenRecordHashCacheTargets(profile);
 
         try (ZipFile input = new ZipFile(jar)) {
+            if (input.getEntry(COMPILED_DENSITY_SAMPLER) != null) {
+                // A 26.2 density record reappearing in a compiled-runtime jar means the list is stale.
+                for (String removed : WORLDGEN_HASH_CACHE_DENSITY_RECORDS) {
+                    if (input.getEntry(removed + ".class") != null) {
+                        throw new IllegalStateException("Worldgen hash cache list for profile "
+                                + profile + " omits the present density record " + removed);
+                    }
+                }
+            }
             for (String owner : owners) {
                 Path output = root.resolve(owner + ".class");
                 if (!Files.isRegularFile(output) && input.getEntry(owner + ".class") == null) {
-                    System.out.println("Skipping removed worldgen hash cache target " + owner);
-                    continue;
+                    throw new IllegalStateException("Worldgen hash cache target " + owner
+                            + " of profile " + profile + " is missing from " + jar);
                 }
                 ClassNode node = Files.isRegularFile(output)
                         ? read(output)
@@ -16367,6 +16715,8 @@ public final class MinecraftClientPatcher {
                 writeComputeFrames(node, output);
             }
         }
+        System.out.println("Cached worldgen record hash codes for profile " + profile + ": "
+                + owners.length + " targets");
     }
 
     private static void cacheImmutableRecordHashCode(ClassNode node, String owner) {
@@ -16490,6 +16840,13 @@ public final class MinecraftClientPatcher {
 
     private static void patchSurfaceRulesSequenceBrowserIndexed(String jar, Path output)
             throws IOException {
+        // 26.3: material/rule/SequenceRule already compiles to an indexed RuleEvaluator array.
+        if (droppedForCompiledDensityRuntime(
+                "MinecraftClientPatcher.patchSurfaceRulesSequenceBrowserIndexed", jar,
+                "net/minecraft/world/level/levelgen/SurfaceRules$SequenceRule.class",
+                "net/minecraft/world/level/levelgen/SurfaceRules$SurfaceRule.class")) {
+            return;
+        }
         String owner = "net/minecraft/world/level/levelgen/SurfaceRules$SequenceRule";
         String rule = "net/minecraft/world/level/levelgen/SurfaceRules$SurfaceRule";
         ClassNode node = read(jar, owner + ".class");
@@ -16549,6 +16906,18 @@ public final class MinecraftClientPatcher {
 
     private static void patchNoiseChunkBrowserSynchronous(String jar, Path output)
             throws IOException {
+        // 26.3: NoiseChunk is a holder of the chunk's DensityVolume, aquifer and sampler set; the
+        // slice fill, interpolators and counters are gone. WorldgenPatches263 instead asserts
+        // that the compiled density kernels stay free of scheduler pulses.
+        if (droppedForCompiledDensityRuntime(
+                "MinecraftClientPatcher.patchNoiseChunkBrowserSynchronous", jar,
+                "net/minecraft/world/level/levelgen/NoiseChunk#fillSlice",
+                "net/minecraft/world/level/levelgen/NoiseChunk#fillAllDirectly",
+                "net/minecraft/world/level/levelgen/NoiseChunk#interpolationCounter",
+                "net/minecraft/world/level/levelgen/NoiseChunk#arrayInterpolationCounter",
+                "net/minecraft/world/level/levelgen/NoiseChunk#interpolators")) {
+            return;
+        }
         String owner = "net/minecraft/world/level/levelgen/NoiseChunk";
         ClassNode node = read(jar, owner + ".class");
         convertNoiseChunkCountersToInt(node, false);
@@ -16572,6 +16941,12 @@ public final class MinecraftClientPatcher {
 
     private static void patchNoiseInterpolatorBrowserLerp(String jar, Path output)
             throws IOException {
+        // 26.3: interpolation is densityfunction/op/InterpolatedFunction$Sampler (float lerp).
+        if (droppedForCompiledDensityRuntime(
+                "MinecraftClientPatcher.patchNoiseInterpolatorBrowserLerp", jar,
+                "net/minecraft/world/level/levelgen/NoiseChunk$NoiseInterpolator.class")) {
+            return;
+        }
         String owner = "net/minecraft/world/level/levelgen/NoiseChunk$NoiseInterpolator";
         ClassNode node = read(jar, owner + ".class");
         replaceNoiseInterpolatorLerpMethod(
@@ -16651,6 +17026,11 @@ public final class MinecraftClientPatcher {
 
     private static void patchNoiseChunkContextBrowserIntCounters(
             String jar, Path output) throws IOException {
+        if (droppedForCompiledDensityRuntime(
+                "MinecraftClientPatcher.patchNoiseChunkContextBrowserIntCounters", jar,
+                "net/minecraft/world/level/levelgen/NoiseChunk$1.class")) {
+            return;
+        }
         String owner = "net/minecraft/world/level/levelgen/NoiseChunk$1";
         ClassNode node = read(jar, owner + ".class");
         int rewrites = convertNoiseChunkCountersToInt(node, false);
@@ -16663,6 +17043,11 @@ public final class MinecraftClientPatcher {
 
     private static void patchNoiseChunkCacheOnceBrowserIntCounters(
             String jar, Path output) throws IOException {
+        if (droppedForCompiledDensityRuntime(
+                "MinecraftClientPatcher.patchNoiseChunkCacheOnceBrowserIntCounters", jar,
+                "net/minecraft/world/level/levelgen/NoiseChunk$CacheOnce.class")) {
+            return;
+        }
         String owner = "net/minecraft/world/level/levelgen/NoiseChunk$CacheOnce";
         ClassNode node = read(jar, owner + ".class");
         int rewrites = convertNoiseChunkCountersToInt(node, true);
@@ -17010,6 +17395,9 @@ public final class MinecraftClientPatcher {
             }
         }
         if (structureSets == null) {
+            structureSets = findCreateStructuresLambdaByStructureCalls(node);
+        }
+        if (structureSets == null) {
             throw new IllegalStateException("ChunkGenerator createStructures lambda was not found");
         }
         requireWorldgenSchedulerCalls("ChunkGenerator.createStructures", structureSets, 0);
@@ -17049,6 +17437,42 @@ public final class MinecraftClientPatcher {
         }
     }
 
+    /**
+     * Minecraft 26.3 changed the per-structure-set lambda of createStructures (SectionPos gone,
+     * Climate$Sampler added, parameters reordered). Match it by name prefix and by its exactly
+     * two ChunkGenerator.tryGenerateStructure calls instead of a fixed descriptor; returns null
+     * when no lambda qualifies and throws when several do.
+     */
+    private static MethodNode findCreateStructuresLambdaByStructureCalls(ClassNode node) {
+        MethodNode match = null;
+        for (MethodNode candidate : node.methods) {
+            if (!candidate.name.startsWith("lambda$createStructures$")
+                    || (candidate.access & Opcodes.ACC_STATIC) != 0
+                    || !candidate.desc.endsWith(")V")) {
+                continue;
+            }
+            int structureCalls = 0;
+            for (AbstractInsnNode instruction : candidate.instructions) {
+                if (instruction instanceof MethodInsnNode call
+                        && call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                        && call.owner.equals("net/minecraft/world/level/chunk/ChunkGenerator")
+                        && call.name.equals("tryGenerateStructure")) {
+                    structureCalls++;
+                }
+            }
+            if (structureCalls != 2) {
+                continue;
+            }
+            if (match != null) {
+                throw new IllegalStateException(
+                        "ChunkGenerator has multiple createStructures lambdas with two "
+                                + "tryGenerateStructure calls: " + match.desc + ", " + candidate.desc);
+            }
+            match = candidate;
+        }
+        return match;
+    }
+
     private static void patchJigsawPlacementBrowserDeepCheckpoints(
             String jar, Path output) throws IOException {
         String owner = "net/minecraft/world/level/levelgen/structure/pools/JigsawPlacement$Placer";
@@ -17083,6 +17507,29 @@ public final class MinecraftClientPatcher {
     private static void patchWorldCarverBrowserSynchronous(
             String jar, Path output, boolean deepWorldgenCheckpoints) throws IOException {
         ClassNode node = read(jar, "net/minecraft/world/level/levelgen/carver/WorldCarver.class");
+        // 26.3: WorldCarver is an interface and carveEllipsoid a static method that only writes a
+        // CarverOutput (the CarvingMask); blocks are applied later by NoiseBasedChunkGenerator.
+        MethodNode modern = findNullable(
+                node,
+                "carveEllipsoid",
+                "(Lnet/minecraft/world/level/ChunkPos;DDDDD"
+                        + "Lnet/minecraft/world/level/chunk/CarverOutput;"
+                        + "Lnet/minecraft/world/level/levelgen/carver/WorldCarver$CarveSkipChecker;)V");
+        if (modern != null) {
+            if ((node.access & Opcodes.ACC_INTERFACE) == 0
+                    || (modern.access & Opcodes.ACC_STATIC) == 0) {
+                throw new IllegalStateException(
+                        "26.3 WorldCarver.carveEllipsoid is expected to be a static interface method");
+            }
+            requireWorldgenSchedulerCalls("WorldCarver.carveEllipsoid", modern, 0);
+            if (deepWorldgenCheckpoints) {
+                patchDeepWorldgenPulseBackEdges(modern, "WorldCarver.carveEllipsoid", 3);
+                writeComputeFrames(node, output);
+            } else {
+                write(node, output);
+            }
+            return;
+        }
         MethodNode method = find(
                 node,
                 "carveEllipsoid",
@@ -17120,11 +17567,18 @@ public final class MinecraftClientPatcher {
     private static void patchLevelChunkSectionBrowserSynchronous(
             String jar, Path output, boolean deepWorldgenCheckpoints) throws IOException {
         ClassNode node = read(jar, "net/minecraft/world/level/chunk/LevelChunkSection.class");
-        MethodNode method = find(
+        MethodNode method = findNullable(
                 node,
                 "fillBiomesFromNoise",
                 "(Lnet/minecraft/world/level/biome/BiomeResolver;"
                         + "Lnet/minecraft/world/level/biome/Climate$Sampler;III)V");
+        if (method == null) {
+            // 26.3 dropped the Climate$Sampler parameter; the three quart loops are unchanged.
+            method = find(
+                    node,
+                    "fillBiomesFromNoise",
+                    "(Lnet/minecraft/world/level/biome/BiomeResolver;III)V");
+        }
         requireWorldgenSchedulerCalls("LevelChunkSection.fillBiomesFromNoise", method, 0);
         if (deepWorldgenCheckpoints) {
             patchDeepWorldgenPulseBackEdges(method, "LevelChunkSection.fillBiomesFromNoise");
@@ -17159,6 +17613,48 @@ public final class MinecraftClientPatcher {
                 "pulse",
                 "()V",
                 false);
+    }
+
+    /**
+     * Present only in jars whose density functions are compiled into float samplers
+     * (Minecraft 26.3 and later); 26.2 and 1.21.11 evaluate {@code levelgen/DensityFunction}
+     * graphs directly.
+     */
+    private static final String COMPILED_DENSITY_SAMPLER =
+            "net/minecraft/world/level/levelgen/densityfunction/DensitySampler.class";
+
+    /**
+     * Minecraft 26.3 replaced the 26.2 density-function runtime (NoiseChunk slices, the
+     * interpolators, the DensityFunctions records, SurfaceRules) with compiled float samplers,
+     * so the 26.2 performance patches for that runtime have no target left, and their
+     * double-precision helpers would change the generated terrain (migration plan D6). On a jar
+     * with the compiled runtime this registers {@code patchId} as dropped, which asserts that
+     * every listed 26.2 target is absent, and returns true; otherwise it returns false and the
+     * caller patches the 26.2 or 1.21.11 target exactly as before.
+     */
+    private static boolean droppedForCompiledDensityRuntime(
+            String patchId, String jar, String... absentTargets) throws IOException {
+        if (!jarHasEntry(jar, COMPILED_DENSITY_SAMPLER)) {
+            return false;
+        }
+        PatchRegistry.dropped(patchId, jar, absentTargets);
+        return true;
+    }
+
+    private static boolean jarHasEntry(String jar, String entry) throws IOException {
+        try (ZipFile input = new ZipFile(jar)) {
+            return input.getEntry(entry) != null;
+        }
+    }
+
+    /** Like {@link #patchDeepWorldgenPulseBackEdges} but requires an exact pulse count. */
+    private static void patchDeepWorldgenPulseBackEdges(
+            MethodNode method, String label, int expectedPulses) {
+        int pulses = patchDeepWorldgenPulseBackEdges(method, label);
+        if (pulses != expectedPulses) {
+            throw new IllegalStateException(label + " deep worldgen back-edges changed: "
+                    + pulses + " (expected " + expectedPulses + ")");
+        }
     }
 
     /** Inserts budget-aware pulses at all backwards control-flow edges in one deep loop. */
@@ -17244,13 +17740,24 @@ public final class MinecraftClientPatcher {
             String jar, Path output, String minecraftVersion) throws IOException {
         String owner = "net/minecraft/world/level/NaturalSpawner";
         ClassNode node = read(jar, owner + ".class");
-        MethodNode method = find(
+        MethodNode method = findNullable(
                 node,
                 "spawnMobsForChunkGeneration",
                 "(Lnet/minecraft/world/level/ServerLevelAccessor;"
                         + "Lnet/minecraft/core/Holder;"
                         + "Lnet/minecraft/world/level/ChunkPos;"
                         + "Lnet/minecraft/util/RandomSource;)V");
+        if (method == null) {
+            // 26.3 passes the chunk's BlockPos instead of the biome holder; the ChunkPos stays
+            // local 2, so the telemetry code below is unchanged.
+            method = find(
+                    node,
+                    "spawnMobsForChunkGeneration",
+                    "(Lnet/minecraft/world/level/ServerLevelAccessor;"
+                            + "Lnet/minecraft/core/BlockPos;"
+                            + "Lnet/minecraft/world/level/ChunkPos;"
+                            + "Lnet/minecraft/util/RandomSource;)V");
+        }
         int tokenLocal = method.maxLocals++;
         LabelNode start = new LabelNode();
         LabelNode end = new LabelNode();
@@ -20198,9 +20705,10 @@ public final class MinecraftClientPatcher {
      * accessor added here. Vanilla IntegratedServer, reached when the Worker cannot start,
      * runs only tickConnection while its player list is empty, so its levels never tick
      * during the host's configuration. The gate is also active only on the Worker server;
-     * elsewhere it passes at once and Ready.spawn keeps its handler wait. Returns false,
-     * keeping the handler wait everywhere, when this version lacks the entity or ChunkPos
-     * shape.</p>
+     * elsewhere it passes at once and Ready.spawn keeps its handler wait. Returns true once the
+     * gate is added; throws when this version lacks the entity or ChunkPos shape, which every
+     * supported profile (1.21.11, 26.2, 26.3) has, instead of silently keeping the handler
+     * wait.</p>
      */
     private static boolean addPrepareSpawnEntityGate(
             String jar, Path root, ClassNode preparing, MethodNode prepareTick)
@@ -20227,7 +20735,15 @@ public final class MinecraftClientPatcher {
                 || processPendingLoads == null
                 || (processPendingLoads.access & Opcodes.ACC_PUBLIC) == 0
                 || (processPendingLoads.access & Opcodes.ACC_STATIC) != 0) {
-            return false;
+            // Every supported profile (1.21.11, 26.2, 26.3) has this shape; a jar without it
+            // must not silently fall back to the handler wait (gate G4).
+            throw new IllegalStateException("PrepareSpawnTask entity gate shape changed: "
+                    + "ChunkPos key=" + packChunkPos
+                    + ", ServerLevel.areEntitiesLoaded(J)Z="
+                    + (findNullable(serverLevel, "areEntitiesLoaded", "(J)Z") != null)
+                    + ", PersistentEntitySectionManager.processPendingLoads="
+                    + (processPendingLoads == null ? "missing"
+                            : Integer.toHexString(processPendingLoads.access)));
         }
         if (findNullable(serverLevel, "gaius$processPendingEntityLoads", "()V") != null) {
             throw new IllegalStateException(
@@ -21035,6 +21551,19 @@ public final class MinecraftClientPatcher {
     }
 
     private static void replaceInitialSpawnForBrowser(MethodNode method) {
+        // 26.3 removed RandomState.sampler() and Climate$Sampler.findSpawnPosition(); vanilla
+        // asks the generator for the spawn chunk (ChunkGenerator.getOrigin, NoiseSpawnFinder).
+        boolean generatorOrigin = false;
+        for (AbstractInsnNode instruction : method.instructions) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                    && call.owner.equals("net/minecraft/world/level/chunk/ChunkGenerator")
+                    && call.name.equals("getOrigin")
+                    && call.desc.equals("(Lnet/minecraft/world/level/levelgen/RandomState;)"
+                            + "Lnet/minecraft/world/level/ChunkPos;")) {
+                generatorOrigin = true;
+            }
+        }
         InsnList code = new InsnList();
 
         code.add(minecraftEvent("server.browserFastInitialSpawn"));
@@ -21053,6 +21582,43 @@ public final class MinecraftClientPatcher {
                 "(Lnet/minecraft/server/level/progress/LevelLoadListener$Stage;I)V",
                 true));
 
+        if (generatorOrigin) {
+            // Same spawn chunk as vanilla 26.3: getGenerator().getOrigin(randomState()).
+            code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    "net/minecraft/server/level/ServerLevel",
+                    "getChunkSource",
+                    "()Lnet/minecraft/server/level/ServerChunkCache;",
+                    false));
+            code.add(new VarInsnNode(Opcodes.ASTORE, 7));
+            code.add(new VarInsnNode(Opcodes.ALOAD, 7));
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    "net/minecraft/server/level/ServerChunkCache",
+                    "getGenerator",
+                    "()Lnet/minecraft/world/level/chunk/ChunkGenerator;",
+                    false));
+            code.add(new VarInsnNode(Opcodes.ALOAD, 7));
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    "net/minecraft/server/level/ServerChunkCache",
+                    "randomState",
+                    "()Lnet/minecraft/world/level/levelgen/RandomState;",
+                    false));
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    "net/minecraft/world/level/chunk/ChunkGenerator",
+                    "getOrigin",
+                    "(Lnet/minecraft/world/level/levelgen/RandomState;)"
+                            + "Lnet/minecraft/world/level/ChunkPos;",
+                    false));
+            code.add(new VarInsnNode(Opcodes.ASTORE, 5));
+            appendBrowserInitialSpawnFromChunk(code);
+            replace(method, code, 9, 8);
+            verifyChunkPosIntConstructor(method, 0);
+            return;
+        }
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL,
@@ -21107,6 +21673,17 @@ public final class MinecraftClientPatcher {
                 false));
         code.add(new VarInsnNode(Opcodes.ASTORE, 5));
 
+        appendBrowserInitialSpawnFromChunk(code);
+        replace(method, code, 9, 8);
+        verifyChunkPosIntConstructor(method, 1);
+    }
+
+    /**
+     * Shared tail of the browser setInitialSpawn: focus the load listener on the spawn chunk in
+     * local 5, set the world spawn to the chunk's middle column at the top of the level (the
+     * player spawn finder settles the height later) and finish the PREPARE_GLOBAL_SPAWN stage.
+     */
+    private static void appendBrowserInitialSpawnFromChunk(InsnList code) {
         code.add(new VarInsnNode(Opcodes.ALOAD, 4));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
@@ -21192,8 +21769,6 @@ public final class MinecraftClientPatcher {
                 "(Lnet/minecraft/server/level/progress/LevelLoadListener$Stage;)V",
                 true));
         code.add(new InsnNode(Opcodes.RETURN));
-        replace(method, code, 9, 8);
-        verifyChunkPosIntConstructor(method, 1);
     }
 
     private static void verifyChunkPosIntConstructor(

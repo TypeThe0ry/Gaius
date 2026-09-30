@@ -28,25 +28,6 @@ step:MinecraftChunkDrawTelemetryPatcher | P5 | chunk-draw telemetry patcher reje
 
 # --- MinecraftClientPatcher (PLAN.md 6.1 #1-#47) ---
 MinecraftClientPatcher.patchDynamicUniformsBrowserInitialCapacity | P5 | [row 11] DynamicUniforms replaced by DynamicGpuData; add the 26.3 branch (<init> and writeChunkSections)
-MinecraftClientPatcher.patchAquiferBrowserNearestCenters | P6 | [row 13] NoiseBasedAquifer constructor descriptor and locals changed
-MinecraftClientPatcher.patchBeardifierBrowserPackedCompute | P6 | [row 14] Beardifier.compute rewritten by vanilla; drop
-MinecraftClientPatcher.patchImprovedNoiseBrowserHotPath | P6 | [row 15] ImprovedNoise removed; drop
-MinecraftClientPatcher.patchPerlinNoiseBrowserDoubleWrap | P6 | [row 16] PerlinNoise constructor changed; drop
-MinecraftClientPatcher.patchNoiseBasedChunkGeneratorBrowserSynchronous | P6 | [row 17] doFill/generateCarvers descriptors changed; port in place, M263 adds CarvingMask pulses
-MinecraftClientPatcher.patchNoiseChunkBrowserSynchronous | P6 | [row 18] NoiseChunk.fillSlice removed; drop, M263 non-suspending guard
-MinecraftClientPatcher.patchNoiseInterpolatorBrowserLerp | P6 | [row 19] NoiseChunk$NoiseInterpolator removed; drop
-MinecraftClientPatcher.patchNoiseChunkContextBrowserIntCounters | P6 | [row 20] NoiseChunk$1 removed; drop
-MinecraftClientPatcher.patchNoiseChunkCacheOnceBrowserIntCounters | P6 | [row 21] NoiseChunk$CacheOnce removed; drop
-MinecraftClientPatcher.patchDensityFunctionsPureTransformersBrowserDirect | P6 | [row 22] DensityFunctions$Clamp and siblings removed; drop
-MinecraftClientPatcher.patchWorldgenRecordHashCodeCaches | P6 | [6.2] applied, but skips 18 removed DensityFunctions targets silently (G4); list the 26.3 targets explicitly and fail on a missing one
-MinecraftClientPatcher.patchSurfaceSystemBrowserSynchronous | P6 | [row 23] SurfaceSystem became MaterialSystem; port owner and descriptors
-MinecraftClientPatcher.patchSurfaceRulesContextBrowserReusableBiomeSupplier | P6 | [row 24] SurfaceRules$Context removed; M263 MaterialRuleContext int shadow counters
-MinecraftClientPatcher.patchSurfaceRulesLazyConditionBrowserPrimitiveCache | P6 | [row 25] SurfaceRules$LazyCondition removed; M263 replaces LazyXZ/LazyY test()
-MinecraftClientPatcher.patchSurfaceRulesSequenceBrowserIndexed | P6 | [row 26] SurfaceRules$SequenceRule removed; drop
-MinecraftClientPatcher.patchChunkGeneratorBrowserSynchronous | P6 | [row 27] createStructures lambda not found; match by name prefix and two tryGenerateStructure calls
-MinecraftClientPatcher.patchWorldCarverBrowserSynchronous | P6 | [row 28] carveEllipsoid is now a static interface method
-MinecraftClientPatcher.patchLevelChunkSectionBrowserSynchronous | P6 | [row 29] fillBiomesFromNoise descriptor changed
-MinecraftClientPatcher.patchNaturalSpawnerGenerationSpawnTelemetry | P6 | [row 30] spawnMobsForChunkGeneration descriptor changed
 MinecraftClientPatcher.patchMappableRingBufferTelemetry | P5 | [row 34] renderpearl GpuBuffer owner and -1L timeout literal
 MinecraftClientPatcher.patchStagedVertexBufferGpuPoolCache | P5 | [row 35] PendingRecycle GpuFence type and endFrame tail changed
 MinecraftClientPatcher.patchGameRendererBrowserAutoScreenshot | P5 | [row 42] GameRenderer.render(DeltaTracker,Z) became render()V
@@ -56,8 +37,6 @@ MinecraftClientPatcher.patchSectionRenderDispatcherBrowserThrottles | P5 | [row 
 MinecraftClientPatcher.patchUberGpuBufferBrowserTelemetry | P5 | [row 47] uploadStagedAllocations takes the renderpearl GpuDevice
 
 # --- Minecraft262BrowserPatcher (PLAN.md 6.1 #48-#59) ---
-Minecraft262BrowserPatcher.patchRegionFileStorageCache | P6 | [row 51] getRegionFile removed; patch the 256 limit in cache(J,Optional)
 Minecraft262BrowserPatcher.patchLiveFrameTargeting | P5 | [row 53] GameRenderer.extract camera point changed; adapt to extractCamera(DeltaTracker,F) atomically
 Minecraft262BrowserPatcher.patchStagingBuffer | P5 | [row 54] StagingBuffer$Cpu.copyTo takes renderpearl types
 Minecraft262BrowserPatcher.patchUberGpuBufferNodeCleanup | P5 | [row 55] uploadStagedAllocations descriptor, field type and INVOKEINTERFACE
-Minecraft262BrowserPatcher.patchNoiseChunkGraphMapper | P6 | [row 56] NoiseChunk graph mapper call sites gone; 26.2 only, drop on 26.3
