@@ -66,6 +66,8 @@ from v0.2.4 only by its version label and build identity.
 - Pipelines that need the WIREFRAME fill mode
   (`minecraft:pipeline/wireframe*`) are reported as unsupported by the WebGL2
   device and skipped, as they are on the 26.2 client.
+- Open to LAN and LAN joining are verified on the 26.2 client only; the 26.3
+  client's LAN path is not covered by this release's acceptance.
 
 No server address, source IP, or private acceptance target is embedded in this
 release or its notes.
