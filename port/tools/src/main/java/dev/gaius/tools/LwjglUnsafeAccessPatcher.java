@@ -30,10 +30,14 @@ public final class LwjglUnsafeAccessPatcher {
         int changedClasses = 0;
         int changedCalls = 0;
         try (ZipFile jar = new ZipFile(args[0])) {
+            boolean leaveVersioned = MultiReleaseEntries.leaveVersionedEntries(jar);
             var entries = jar.entries();
             while (entries.hasMoreElements()) {
                 var entry = entries.nextElement();
                 if (!entry.getName().endsWith(".class")) {
+                    continue;
+                }
+                if (leaveVersioned && MultiReleaseEntries.isVersioned(entry)) {
                     continue;
                 }
                 if (entry.getName().equals("org/lwjgl/system/Pointer$Default.class")

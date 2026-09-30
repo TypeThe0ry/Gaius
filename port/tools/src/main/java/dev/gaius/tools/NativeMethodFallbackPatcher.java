@@ -30,10 +30,14 @@ public final class NativeMethodFallbackPatcher {
         Path outputRoot = Path.of(args[1]);
         int patched = 0;
         try (ZipFile jar = new ZipFile(jarPath.toFile())) {
+            boolean leaveVersioned = MultiReleaseEntries.leaveVersionedEntries(jar);
             var entries = jar.entries();
             while (entries.hasMoreElements()) {
                 var entry = entries.nextElement();
                 if (!entry.getName().endsWith(".class")) {
+                    continue;
+                }
+                if (leaveVersioned && MultiReleaseEntries.isVersioned(entry)) {
                     continue;
                 }
                 ClassNode node = new ClassNode();
