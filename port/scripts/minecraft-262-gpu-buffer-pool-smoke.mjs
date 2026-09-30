@@ -133,18 +133,21 @@ assert.ok(featureStart >= 0 && featureEnd > featureStart,
   "missing isolated GPU buffer-pool patcher method");
 const featureText = patcherText.slice(featureStart, featureEnd);
 
-const profileGuardStart = patcherText.indexOf(
-  'if ("26.2".equals(minecraftVersion)) {',
+// The call in main() runs under the modern-profile guard (26.2 and 26.3,
+// never 1.21.11), wrapped in PatchRegistry.run so 26.3 bring-up can skip it.
+assert.match(patcherText,
+  /static boolean isModernProfile\(String minecraftVersion\) \{\s*return "26\.2"\.equals\(minecraftVersion\) \|\| "26\.3"\.equals\(minecraftVersion\);\s*\}/,
+  "isModernProfile must name exactly the modern profiles 26.2 and 26.3");
+const guardedPoolCall = patcherText.indexOf("() -> patchStagedVertexBufferGpuPoolCache(");
+const profileGuardStart = patcherText.lastIndexOf(
+  "if (isModernProfile(minecraftVersion)) {",
+  guardedPoolCall,
 );
 const profileGuardEnd = patcherText.indexOf("\n        }", profileGuardStart);
-const guardedPoolCall = patcherText.indexOf(
-  "patchStagedVertexBufferGpuPoolCache(",
-  profileGuardStart,
-);
-assert.ok(profileGuardStart >= 0 && profileGuardEnd > profileGuardStart,
-  "missing exact 26.2 profile guard");
+assert.ok(guardedPoolCall >= 0 && profileGuardStart >= 0 && profileGuardEnd > profileGuardStart,
+  "missing modern-profile guard around the GPU buffer-pool patch");
 assert.ok(guardedPoolCall > profileGuardStart && guardedPoolCall < profileGuardEnd,
-  "GPU buffer-pool patch must remain gated to exact profile 26.2");
+  "GPU buffer-pool patch must remain gated to the modern profiles");
 for (const contract of [
   "gaius$browserCache",
   "beforeAcquire",
