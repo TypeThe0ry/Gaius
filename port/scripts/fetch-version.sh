@@ -169,8 +169,15 @@ download_browser_asset() {
 export asset_index assets
 export -f gaius_hash_file gaius_sha1_file gaius_sha256_file
 export -f curl_with_retries download_verified download_browser_asset
-printf '%s\n' "${browser_sound_metadata_assets[@]}" "${browser_sound_assets[@]}" "${browser_font_assets[@]}" "${browser_background_assets[@]}" |
-  xargs -n 1 -P "${GAIUS_FETCH_PARALLEL:-16}" bash -c 'download_browser_asset "$0"'
+# GAIUS_FETCH_BROWSER_ASSETS=0 skips the browser sound/font/background objects
+# (thousands of files). Profile checks and overlay builds do not read them;
+# only the TeaVM asset packaging does.
+if [[ "${GAIUS_FETCH_BROWSER_ASSETS:-1}" == "0" ]]; then
+  echo "Skipping browser asset objects (GAIUS_FETCH_BROWSER_ASSETS=0)"
+else
+  printf '%s\n' "${browser_sound_metadata_assets[@]}" "${browser_sound_assets[@]}" "${browser_font_assets[@]}" "${browser_background_assets[@]}" |
+    xargs -n 1 -P "${GAIUS_FETCH_PARALLEL:-16}" bash -c 'download_browser_asset "$0"'
+fi
 
 echo "Fetched and verified:"
 echo "  client:   $client_input"

@@ -1,0 +1,101 @@
+# Minecraft 26.3 bring-up list.
+#
+# Format: <patchId> | <owner work package> | <reason>
+#   patchId  "<PatcherClass>.<patchMethod>" for a patch recorded through
+#            dev.gaius.tools.PatchRegistry, or "step:<PatcherClass>" /
+#            "step:<PatcherClass>@<lwjgl-module>" for a build-overlays.sh step
+#            (guards are steps too, for example step:LwjglPlatformGuard@lwjgl).
+#   owner    the work package that removes the line (PLAN.md section 2).
+#
+# Only a GAIUS_BRINGUP=1 build of 26.3 may skip these; every skip prints
+# "BRINGUP_SKIP <patchId>" and check-build-log-skips.mjs matches the build log
+# against this list.  Without GAIUS_BRINGUP=1, build-overlays.sh refuses to
+# build 26.3 while this list has entries, and build-version-release.sh always
+# refuses bring-up mode.  By M4 only performance and diagnostic patches may
+# remain; by M6 the list must be empty.
+#
+# Initial contents: the 59 failures of the 26.3 patch survey (PLAN.md 6.1),
+# the library and build failures (PLAN.md 6.3) and the one patch that prints
+# unregistered "Skipping" lines on 26.3 (PLAN.md 6.2).  In a reason, "[row N]"
+# is row N of the PLAN.md 6.1 table and "[6.2]" the PLAN.md 6.2 table; the text
+# after it names the 26.3 change and the planned port.  Patches that run after
+# the first failure of the same driver were never exercised by the survey
+# (risk R18); add them here, with an owner, when a bring-up build reports them.
+# A reason may contain neither '#' (starts a comment) nor '|'.
+
+# --- build-overlays.sh library steps (PLAN.md 6.3) ---
+step:AuthlibBrowserPatcher | P7a | authlib 10 moved yggdrasil to services; YggdrasilMinecraftSessionService.class not found (D7)
+step:LwjglMemoryPatcher@lwjgl | P1 | LWJGL 3.4.3 memory backend: MultiReleaseTextDecoding removed, BACKEND never assigned
+step:LwjglArchitectureGuard@lwjgl | P1 | verifies the LwjglMemoryPatcher output, which is skipped
+step:LwjglPlatformGuard@lwjgl | P1 | patchPlatform replaces java.version instead of os.name on 3.4.3 (libs-build V.2-2)
+step:LwjglUnsafeAccessPatcher@lwjgl | P1 | ASM 9.8 cannot read META-INF/versions/27 (class major 71)
+step:NativeMethodFallbackPatcher@lwjgl | P1 | ASM 9.8 cannot read META-INF/versions/27 (class major 71)
+step:LwjglCallbackDescriptorPatcher@lwjgl | P1 | ASM 9.8 cannot read META-INF/versions/27 (class major 71)
+step:LwjglSdlBrowserPatcher | P2 | SDL3 browser shim patcher does not exist yet (D3)
+step:LwjglShadercBrowserPatcher | P4 | shaderc browser shim patcher does not exist yet (D5)
+step:LwjglSpvcBrowserPatcher | P4 | spvc browser shim patcher does not exist yet (D5)
+step:MinecraftChunkDrawTelemetryPatcher | P5 | chunk-draw telemetry patcher rejects profile 26.3 (unsupported profile)
+
+# --- MinecraftClientPatcher (PLAN.md 6.1 #1-#47) ---
+MinecraftClientPatcher.patchServerMainBrowser | P7a | [row 1] server Main now calls MinecraftServicesDiscoveryService.create(Proxy); port: insert ICONST_0 and call create(Proxy,Z)
+MinecraftClientPatcher.patchWorldLoaderBrowserStartupTelemetry | P7a | [row 2] WORLDGEN_REGISTRIES anchor renamed; port: also accept WORLD_REGISTRIES
+MinecraftClientPatcher.patchSimpleJsonResourceReloadListenerBrowserStartupYield | P7a | [row 3] scanDirectory removed; drop, M263 yields in RegistryLoadTask$PendingRegistration.loadFromResource
+MinecraftClientPatcher.patchBitmapFontImageSharing | P8 | [row 4] bitmap provider now calls NativeImage.read(InputStream); port with the 26.3 BrowserFontBitmapCache
+MinecraftClientPatcher.patchGlx | P3 | [row 5] GLX removed; drop, M263 patches DebugEntrySystemSpecs.getCpuInfo
+MinecraftClientPatcher.patchGlDebugBrowserNoCallback | P3 | [row 6] GlDebug moved to renderpearl/backend/opengl; rename via ModernSymbols
+MinecraftClientPatcher.patchCommandEncoderLegacyTextureUpload | P3 | [row 7] CommandEncoder is a renderpearl interface; drop, 26.3 BrowserUnihexLoader calls writeToTexture directly
+MinecraftClientPatcher.patchPauseScreenBrowserSingleplayer | P8 | [row 8] Open to LAN anchor moved; add the 26.3 anchor before the level null check
+MinecraftClientPatcher.patchOptionsBrowserLowSimulationDistance | P8 | [row 9] sprint default is an SDL scancode; read InputConstants KEY_LCONTROL/KEY_R via ModernSymbols
+MinecraftClientPatcher.patchBrowserInputCallbacks | P2 | [row 10] GLFW setup lambda removed; drop, M263 rewrites SDLEventHandler dispatch and MouseHandler.onButton
+MinecraftClientPatcher.patchDynamicUniformsBrowserInitialCapacity | P5 | [row 11] DynamicUniforms replaced by DynamicGpuData; add the 26.3 branch (<init> and writeChunkSections)
+MinecraftClientPatcher.patchServerGamePacketListenerBrowserWorker | P7a | [row 12] both ServerChunkCache.move calls moved into handlePlayerPositionChange
+MinecraftClientPatcher.patchAquiferBrowserNearestCenters | P6 | [row 13] NoiseBasedAquifer constructor descriptor and locals changed
+MinecraftClientPatcher.patchBeardifierBrowserPackedCompute | P6 | [row 14] Beardifier.compute rewritten by vanilla; drop
+MinecraftClientPatcher.patchImprovedNoiseBrowserHotPath | P6 | [row 15] ImprovedNoise removed; drop
+MinecraftClientPatcher.patchPerlinNoiseBrowserDoubleWrap | P6 | [row 16] PerlinNoise constructor changed; drop
+MinecraftClientPatcher.patchNoiseBasedChunkGeneratorBrowserSynchronous | P6 | [row 17] doFill/generateCarvers descriptors changed; port in place, M263 adds CarvingMask pulses
+MinecraftClientPatcher.patchNoiseChunkBrowserSynchronous | P6 | [row 18] NoiseChunk.fillSlice removed; drop, M263 non-suspending guard
+MinecraftClientPatcher.patchNoiseInterpolatorBrowserLerp | P6 | [row 19] NoiseChunk$NoiseInterpolator removed; drop
+MinecraftClientPatcher.patchNoiseChunkContextBrowserIntCounters | P6 | [row 20] NoiseChunk$1 removed; drop
+MinecraftClientPatcher.patchNoiseChunkCacheOnceBrowserIntCounters | P6 | [row 21] NoiseChunk$CacheOnce removed; drop
+MinecraftClientPatcher.patchDensityFunctionsPureTransformersBrowserDirect | P6 | [row 22] DensityFunctions$Clamp and siblings removed; drop
+MinecraftClientPatcher.patchWorldgenRecordHashCodeCaches | P6 | [6.2] applied, but skips 18 removed DensityFunctions targets silently (G4); list the 26.3 targets explicitly and fail on a missing one
+MinecraftClientPatcher.patchSurfaceSystemBrowserSynchronous | P6 | [row 23] SurfaceSystem became MaterialSystem; port owner and descriptors
+MinecraftClientPatcher.patchSurfaceRulesContextBrowserReusableBiomeSupplier | P6 | [row 24] SurfaceRules$Context removed; M263 MaterialRuleContext int shadow counters
+MinecraftClientPatcher.patchSurfaceRulesLazyConditionBrowserPrimitiveCache | P6 | [row 25] SurfaceRules$LazyCondition removed; M263 replaces LazyXZ/LazyY test()
+MinecraftClientPatcher.patchSurfaceRulesSequenceBrowserIndexed | P6 | [row 26] SurfaceRules$SequenceRule removed; drop
+MinecraftClientPatcher.patchChunkGeneratorBrowserSynchronous | P6 | [row 27] createStructures lambda not found; match by name prefix and two tryGenerateStructure calls
+MinecraftClientPatcher.patchWorldCarverBrowserSynchronous | P6 | [row 28] carveEllipsoid is now a static interface method
+MinecraftClientPatcher.patchLevelChunkSectionBrowserSynchronous | P6 | [row 29] fillBiomesFromNoise descriptor changed
+MinecraftClientPatcher.patchNaturalSpawnerGenerationSpawnTelemetry | P6 | [row 30] spawnMobsForChunkGeneration descriptor changed
+MinecraftClientPatcher.patchFilePackResourcesBrowserAtlasOverlays | P8 | [row 31] FileResourcesSupplier.openFull removed; match openResources
+MinecraftClientPatcher.patchChatSigning | P7a | [row 32] SignatureValidator.from uses authlib services types; descriptor via ModernSymbols
+MinecraftClientPatcher.patchGlslPreprocessor | P3 | [row 33] GlslPreprocessor removed; drop (includes handled by the P4 shaderc shim)
+MinecraftClientPatcher.patchMappableRingBufferTelemetry | P5 | [row 34] renderpearl GpuBuffer owner and -1L timeout literal
+MinecraftClientPatcher.patchStagedVertexBufferGpuPoolCache | P5 | [row 35] PendingRecycle GpuFence type and endFrame tail changed
+MinecraftClientPatcher.patchGlDevice | P3 | [row 36] GlDevice moved to renderpearl/backend/opengl; rename
+MinecraftClientPatcher.patchGlConstWebGLTextureFormats | P3 | [row 37] GlConst moved to renderpearl/backend/opengl; rename
+MinecraftClientPatcher.patchTextureFormatWebGLColorAspect | P3 | [row 38] GpuFormat moved to renderpearl/api; rename
+MinecraftClientPatcher.patchGlStateManagerTextureBinding | P3 | [row 39] GlStateManager moved to renderpearl/backend/opengl; rename
+MinecraftClientPatcher.patchGlRenderPipelineDrawMetadata | P3 | [row 40] vanilla already caches primitiveTopology; drop
+MinecraftClientPatcher.patchGlCommandEncoder | P3 | [row 41] GlCommandEncoder moved; rename GPU retire and TransientMemory, drop bindDefaultUniforms
+MinecraftClientPatcher.patchGameRendererBrowserAutoScreenshot | P5 | [row 42] GameRenderer.render(DeltaTracker,Z) became render()V
+MinecraftClientPatcher.patchMultiPlayerGameModeBrowserHitSound | P8 | [row 43] hit sound volume point gone; drop, M263 patches ClientLevel.playBreakingSound
+MinecraftClientPatcher.patchLevelRendererBrowserBlockBreakProgress | P5 | [row 44] prepareChunkRenders target moved to extractSectionDrawGroups; the same driver must fail closed
+MinecraftClientPatcher.patchEntityRenderDispatcherBrowserNullEntityGuard | P5 | [row 45] shouldRender descriptor gained a float
+MinecraftClientPatcher.patchSectionRenderDispatcherBrowserThrottles | P5 | [row 46] VertexFormat owner moved to renderpearl/api/vertex
+MinecraftClientPatcher.patchUberGpuBufferBrowserTelemetry | P5 | [row 47] uploadStagedAllocations takes the renderpearl GpuDevice
+
+# --- Minecraft262BrowserPatcher (PLAN.md 6.1 #48-#59) ---
+Minecraft262BrowserPatcher.patchPreferredGraphicsApi | P3 | [row 48] getBackendsToTry returns renderpearl GpuBackend[]; return [GlBackend]
+Minecraft262BrowserPatcher.patchVulkanBackend | P3 | [row 49] VulkanBackend moved and its API changed; drop, M263 rewrites the stubs
+Minecraft262BrowserPatcher.patchGlDeviceCapabilities | P3 | [row 50] GlDevice moved to renderpearl/backend/opengl; rename
+Minecraft262BrowserPatcher.patchRegionFileStorageCache | P6 | [row 51] getRegionFile removed; patch the 256 limit in cache(J,Optional)
+Minecraft262BrowserPatcher.patchGlBufferMappedViewRanges | P3 | [row 52] GlBuffer$Direct moved and FLUSH_EXPLICIT dropped; drop, M263 ports the flush semantics
+Minecraft262BrowserPatcher.patchLiveFrameTargeting | P5 | [row 53] GameRenderer.extract camera point changed; adapt to extractCamera(DeltaTracker,F) atomically
+Minecraft262BrowserPatcher.patchStagingBuffer | P5 | [row 54] StagingBuffer$Cpu.copyTo takes renderpearl types
+Minecraft262BrowserPatcher.patchUberGpuBufferNodeCleanup | P5 | [row 55] uploadStagedAllocations descriptor, field type and INVOKEINTERFACE
+Minecraft262BrowserPatcher.patchNoiseChunkGraphMapper | P6 | [row 56] NoiseChunk graph mapper call sites gone; 26.2 only, drop on 26.3
+Minecraft262BrowserPatcher.patchRemoteFriendList | P7a | [row 57] RemoteFriendListUpdateHandler takes services.FriendsService
+Minecraft262BrowserPatcher.patchMacosUtil | P3 | [row 58] MacosUtil entry points changed; drop, M263 stubs the ObjC/SDL hint setters
+Minecraft262BrowserPatcher.patchVulkanDebug | P3 | [row 59] VulkanDebug moved; unreachable once VulkanBackend is stubbed, drop

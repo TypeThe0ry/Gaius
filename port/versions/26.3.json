@@ -1,0 +1,38 @@
+{
+  "id": "26.3",
+  "releaseType": "release",
+  "protocolVersion": 777,
+  "worldVersion": 5023,
+  "javaVersion": 25,
+  "classFileVersion": 69,
+  "clientDistribution": "named",
+  "worldgenTelemetryMode": "task-pulsed",
+  "patchSet": "modern",
+  "extraPatchers": [
+    "Minecraft263BrowserPatcher"
+  ],
+  "packVersions": {
+    "resource": {
+      "major": 97,
+      "minor": 1
+    },
+    "data": {
+      "major": 121,
+      "minor": 0
+    }
+  },
+  "storage": {
+    "schema": 2,
+    "databaseName": "gaius-fs-v2-26.3",
+    "prefix": "gaius.fs.v2:26.3:",
+    "opfsDirectory": "regions-v2-26.3"
+  },
+  "official": {
+    "releaseTime": "2026-09-15T11:23:02+00:00",
+    "clientSha1": "e877b6a07acd633fb3bb475002175cec036e7b87",
+    "clientMappingsSha1": null,
+    "serverSha1": "33680f5f2ac32864d6d7cf5e56a705fdb3e05f4c",
+    "assetIndexId": "34",
+    "assetIndexSha1": "abfaa525f923f807df8b4e4d29c1b5e3a104adbe"
+  }
+}

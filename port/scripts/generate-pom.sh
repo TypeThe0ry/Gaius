@@ -57,12 +57,61 @@ if [[ "$GAIUS_CLIENT_DISTRIBUTION" == "obfuscated-with-mappings" ]]; then
             </excludes>"
 fi
 
+# Profile source sets: port/src/main/java is shared by every profile.
+# port/src/versions/<profile>/java replaces shared files with the same relative
+# path (and may add new ones), and port/src/versions/<profile>/excludes.txt
+# lists shared relative paths the profile does not compile (format: see
+# gaius_version_excludes in version-profile.sh).  The merged tree is staged
+# under $build_root/sources and becomes the only Maven source directory.  A
+# profile without a version directory (26.2) stages an exact copy of
+# port/src/main/java.
+#
+# The staged tree is replaced only when its content changes, and a replaced
+# tree is copied without preserving modification times.  A staged path can
+# switch between a version file and the shared file (for example when a
+# version override is deleted), and the file it switches to is usually older
+# than the classes compiled from the previous tree; with its original time
+# Maven's stale-source check would keep those classes.  Every file of a
+# replaced tree is newer than any class compiled before, so Maven recompiles
+# (it rebuilds the whole module on any change anyway), while an unchanged tree
+# keeps its times and an unchanged rebuild stays up to date.
+shared_source_root="$root/port/src/main/java"
+version_source_root="$root/port/src/versions/$version/java"
+version_source_excludes="$root/port/src/versions/$version/excludes.txt"
+staged_source_directory="$build_root/sources"
+
+stage_profile_sources() {
+  local staging="$staged_source_directory.staging.$$"
+  local excludes
+  local excluded
+  excludes="$(gaius_version_excludes "$version_source_excludes" "$shared_source_root")" \
+    || exit 1
+  rm -rf "$staging"
+  mkdir -p "$staging"
+  cp -R "$shared_source_root/." "$staging/"
+  while IFS= read -r excluded; do
+    if [[ -n "$excluded" ]]; then
+      rm -f "$staging/$excluded"
+    fi
+  done <<<"$excludes"
+  if [[ -d "$version_source_root" ]]; then
+    cp -R "$version_source_root/." "$staging/"
+  fi
+  if [[ -d "$staged_source_directory" ]] \
+      && diff -rq "$staged_source_directory" "$staging" >/dev/null 2>&1; then
+    rm -rf "$staging"
+  else
+    rm -rf "$staged_source_directory"
+    mv "$staging" "$staged_source_directory"
+  fi
+}
+
 maven_patched_classlib="$(maven_path "$patched_classlib")"
 maven_client="$(maven_path "$client")"
 maven_target_directory="$(maven_path "$target_directory")"
 maven_maven_directory="$(maven_path "$maven_directory")"
 maven_resource_directory="$(maven_path "$resource_directory")"
-maven_source_directory="$(maven_path "$root/port/src/main/java")"
+maven_source_directory="$(maven_path "$staged_source_directory")"
 maven_source_resources="$(maven_path "$root/port/src/main/resources")"
 maven_teavm_core_patch="$(maven_path "$overlay_directory/teavm-core-$teavm_version-gaius.jar")"
 if [[ -n "$excluded_library_prefixes" ]]; then
@@ -98,7 +147,8 @@ if [[ ! -f "$metadata" || ! -f "$client" || ! -f "$patched_classlib" ]]; then
 fi
 
 mkdir -p "$(dirname "$output")" "$root/port/src/main/java" \
-  "$target_directory" "$maven_directory"
+  "$target_directory" "$maven_directory" "$build_root"
+stage_profile_sources
 
 {
   cat <<EOF

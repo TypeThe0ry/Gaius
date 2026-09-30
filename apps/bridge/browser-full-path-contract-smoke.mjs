@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { chmod, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 
 const bridgeDirectory = fileURLToPath(new URL(".", import.meta.url));
@@ -938,6 +938,44 @@ for (const expected of expectedProfiles) {
         `${expected.id} strict config`);
 }
 
+// 26.3 (protocol 777) is not a canonical strict-acceptance profile yet, but
+// the compatible full-path client must drive it with its own jar-derived
+// PLAY ids.  Before this check existed every non-1.21.11 profile silently
+// borrowed the 26.2 ids (login 49, cache 94/95/111).
+{
+    const compatible263 = configuration("versions/26.3.json");
+    assert.equal(compatible263.profile.id, "26.3");
+    assert.equal(compatible263.profile.protocolVersion, 777);
+    assert.equal(compatible263.profile.worldVersion, 5023);
+    assert.deepEqual(compatible263.wireProfile, { name: "26.3", protocolVersion: 777 });
+    assert.equal(compatible263.acceptanceMode, false);
+    assert.equal(compatible263.performanceContract.mode, "compatible-smoke");
+    assert.equal(compatible263.performanceContract.canonicalProfiles["26.3"], undefined);
+    assert.deepEqual(compatible263.performanceContract.chunkWindow.initialDistanceContract, {
+        source: "clientbound-login",
+        packetId: 50,
+        fields: ["chunkRadius", "simulationDistance"],
+    });
+    assert.deepEqual(compatible263.performanceContract.chunkWindow.observedDistancePackets, {
+        cacheCenter: 96,
+        cacheRadius: 97,
+        simulationDistance: 113,
+    });
+    assert.equal(compatible263.performanceContract.chunkBatch.clientboundFinishedPacketId, 11);
+    assert.equal(compatible263.performanceContract.chunkBatch.clientboundStartPacketId, 12);
+    assert.equal(
+        compatible263.performanceContract.chunkBatch.serverboundAcknowledgementPacketId, 11);
+    // Strict acceptance stays fail-closed for a profile without a canonical
+    // release contract instead of evaluating it against 26.2 evidence.
+    assert.throws(() => configuration("versions/26.3.json", {
+        GAIUS_BROWSER_FULL_PATH_ACCEPTANCE: "1",
+        GAIUS_BROWSER_FULL_PATH_CLIENTS: "4",
+        GAIUS_BROWSER_FULL_PATH_MIN_CHUNKS: "9",
+        GAIUS_BROWSER_FULL_PATH_SOAK_MS: "15000",
+        GAIUS_BROWSER_FULL_PATH_RECONNECT_WAVES: "1",
+    }, ["--print-config", "--acceptance"]));
+}
+
 function expectConfigurationFailure(profilePath, overrides, argumentsList = ["--print-config"]) {
     assert.throws(() => configuration(profilePath, overrides, argumentsList));
 }
@@ -1444,6 +1482,30 @@ assert.match(protocolSource,
     /MINECRAFT_1_21_11[\s\S]*?clientboundSetChunkCacheCenter: 92[\s\S]*?clientboundSetChunkCacheRadius: 93[\s\S]*?clientboundSetSimulationDistance: 109/);
 assert.match(protocolSource,
     /MINECRAFT_26_2[\s\S]*?clientboundSetChunkCacheCenter: 94[\s\S]*?clientboundSetChunkCacheRadius: 95[\s\S]*?clientboundSetSimulationDistance: 111/);
+assert.match(protocolSource,
+    /MINECRAFT_26_3[\s\S]*?serverboundChunkBatchReceived: 11/);
+assert.match(protocolSource,
+    /MINECRAFT_26_3[\s\S]*?clientboundSetChunkCacheCenter: 96[\s\S]*?clientboundSetChunkCacheRadius: 97[\s\S]*?clientboundSetSimulationDistance: 113/);
+{
+    // The text checks above only prove the literals exist somewhere after the
+    // export; bind every profile's chunk-window ids to the evaluated tables.
+    const relayProtocol = await import(pathToFileURL(protocolPath).href);
+    assert.deepEqual(relayProtocol.MINECRAFT_PROFILES.map((profile) => [
+        profile.name,
+        profile.protocolVersion,
+        profile.play.clientboundLogin,
+        profile.play.clientboundSetChunkCacheCenter,
+        profile.play.clientboundSetChunkCacheRadius,
+        profile.play.clientboundSetSimulationDistance,
+        profile.play.clientboundChunkBatchFinished,
+        profile.play.clientboundChunkBatchStart,
+        profile.play.serverboundChunkBatchReceived,
+    ]), [
+        ["1.21.11", 774, 48, 92, 93, 109, 11, 12, 10],
+        ["26.2", 776, 49, 94, 95, 111, 11, 12, 11],
+        ["26.3", 777, 50, 96, 97, 113, 11, 12, 11],
+    ]);
+}
 assert.match(protocolSource,
     /export function decodeClientboundLoginDistances\(payload\)/);
 assert.match(fullPathSource,

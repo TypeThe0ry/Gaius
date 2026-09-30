@@ -78,12 +78,163 @@ gaius_load_version_profile() {
     return 1
   fi
   GAIUS_VERSION_METADATA="$root/port/work/$GAIUS_MINECRAFT_VERSION/version.json"
+  # The patcher chain is selected by these two profile fields rather than by
+  # comparing version strings.  They are loaded leniently here; build-overlays.sh
+  # rejects a missing or unknown patch set, and check-version-profile.mjs
+  # validates both fields.
+  GAIUS_PATCH_SET="$(jq -r '.patchSet // empty' "$GAIUS_VERSION_PROFILE" | tr -d '\r')"
+  GAIUS_EXTRA_PATCHERS="$(jq -r '(.extraPatchers // []) | join(" ")' "$GAIUS_VERSION_PROFILE" | tr -d '\r')"
 
   export GAIUS_VERSION_PROFILE GAIUS_MINECRAFT_VERSION GAIUS_PROTOCOL_VERSION
   export GAIUS_WORLD_VERSION GAIUS_JAVA_VERSION GAIUS_CLASS_FILE_VERSION
   export GAIUS_CLIENT_DISTRIBUTION GAIUS_VERSION_METADATA
   export GAIUS_STORAGE_SCHEMA GAIUS_STORAGE_DATABASE_NAME
   export GAIUS_STORAGE_PREFIX GAIUS_STORAGE_OPFS_DIRECTORY
+  export GAIUS_PATCH_SET GAIUS_EXTRA_PATCHERS
+}
+
+# Bring-up mode lets an unfinished profile build its overlays while the
+# patches listed in port/tools/bringup/<profile>.txt are skipped.  Each list
+# line is "<patchId> | <owner package> | <reason>"; '#' starts a comment.
+# The mode is active only when the caller exports GAIUS_BRINGUP=1 and the
+# profile is not one of the release profiles (26.2, 1.21.11).  Every skipped
+# patch prints "BRINGUP_SKIP <patchId>" so check-build-log-skips.mjs can match
+# the build log against the list.
+gaius_bringup_list_path() {
+  local root="$1"
+  printf '%s\n' "$root/port/tools/bringup/$GAIUS_MINECRAFT_VERSION.txt"
+}
+
+gaius_bringup_profile_allowed() {
+  case "$GAIUS_MINECRAFT_VERSION" in
+    26.2|1.21.11) return 1 ;;
+  esac
+  return 0
+}
+
+gaius_bringup_active() {
+  [[ "${GAIUS_BRINGUP:-}" == "1" ]] && gaius_bringup_profile_allowed
+}
+
+# Release builds never use bring-up mode.  Fails when GAIUS_BRINGUP is set to
+# anything but 0, or when OVERLAY_DIRECTORY (optional) carries the BRINGUP
+# marker that build-overlays.sh writes before a bring-up build and removes only
+# after a complete build outside bring-up mode.
+gaius_refuse_bringup_release() {
+  local overlay_directory="${1:-}"
+  if [[ -n "${GAIUS_BRINGUP:-}" && "${GAIUS_BRINGUP}" != "0" ]]; then
+    echo "Refusing to build a release in bring-up mode (GAIUS_BRINGUP=${GAIUS_BRINGUP})" >&2
+    echo "Unset GAIUS_BRINGUP; release profiles must build without skipped patches" >&2
+    return 1
+  fi
+  if [[ -n "$overlay_directory" && -e "$overlay_directory/BRINGUP" ]]; then
+    echo "Refusing to build a release from bring-up overlays: $overlay_directory/BRINGUP exists" >&2
+    echo "Rebuild the overlays without GAIUS_BRINGUP=1 (port/scripts/build-overlays.sh)" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Prints the patch ids of the profile's bring-up list, one per line.  Fails
+# on malformed lines so a typo cannot silently widen or narrow the list.
+# A patch id matches ^[A-Za-z0-9_$][A-Za-z0-9_$.:@-]*$; PatchRegistry.java,
+# check-version-profile.mjs and check-build-log-skips.mjs use the same rule.
+gaius_bringup_ids() {
+  local root="$1"
+  local list
+  list="$(gaius_bringup_list_path "$root")"
+  if [[ ! -f "$list" ]]; then
+    return 0
+  fi
+  tr -d '\r' <"$list" | awk -v list="$list" '
+    {
+      line = $0
+      sub(/#.*/, "", line)
+      if (line ~ /^[ \t]*$/) next
+      fields = split(line, part, "|")
+      for (i = 1; i <= fields; i++) gsub(/^[ \t]+|[ \t]+$/, "", part[i])
+      if (fields != 3 || part[1] !~ /^[A-Za-z0-9_$][A-Za-z0-9_$.:@-]*$/ \
+          || part[2] !~ /^P[1-9][a-z]?$/ || part[3] == "") {
+        printf "%s:%d: expected \"<patchId> | <owner P1..P9> | <reason>\"\n", list, NR > "/dev/stderr"
+        bad = 1
+        next
+      }
+      if (part[1] in seen) {
+        printf "%s:%d: %s is listed twice\n", list, NR, part[1] > "/dev/stderr"
+        bad = 1
+        next
+      }
+      seen[part[1]] = 1
+      print part[1]
+    }
+    END { exit bad }
+  '
+}
+
+# Prints the entries of a version excludes.txt, one relative path per line:
+# port/src/versions/<profile>/excludes.txt,
+# port/overrides/client/src/versions/<profile>/excludes.txt or
+# port/overrides/libraries/<name>/src/versions/<artifact-version>/excludes.txt.
+# Each entry is a path relative to SHARED_ROOT (the matching src/main/java).
+# '#' starts a comment, CR line ends and surrounding whitespace are ignored,
+# and an entry that does not name an existing file under SHARED_ROOT fails, so
+# a typo or a stale entry cannot be ignored silently.  Prints nothing when
+# FILE does not exist.
+gaius_version_excludes() {
+  local file="$1"
+  local shared_root="$2"
+  local entry
+  local line=0
+  if [[ ! -f "$file" ]]; then
+    return 0
+  fi
+  while IFS= read -r entry || [[ -n "$entry" ]]; do
+    line=$((line + 1))
+    entry="${entry%$'\r'}"
+    entry="${entry%%#*}"
+    entry="${entry#"${entry%%[![:space:]]*}"}"
+    entry="${entry%"${entry##*[![:space:]]}"}"
+    if [[ -z "$entry" ]]; then
+      continue
+    fi
+    case "$entry" in
+      /*|..|../*|*/..|*/../*)
+        echo "Invalid entry in $file:$line: $entry (expected a path relative to $shared_root)" >&2
+        return 1
+        ;;
+    esac
+    if [[ ! -f "$shared_root/$entry" ]]; then
+      echo "Stale entry in $file:$line: $shared_root/$entry does not exist" >&2
+      return 1
+    fi
+    printf '%s\n' "$entry"
+  done <"$file"
+}
+
+# Like gaius_library_path, but prints nothing and succeeds when the profile's
+# version.json does not contain the library (for example lwjgl-glfw in 26.3
+# or lwjgl-sdl in 26.2).  Missing metadata is still an error.
+gaius_library_path_optional() {
+  local coordinate="$1"
+  local fallback_classifier="${2:-}"
+  if [[ ! -f "$GAIUS_VERSION_METADATA" ]]; then
+    echo "Version metadata is missing: $GAIUS_VERSION_METADATA" >&2
+    return 1
+  fi
+
+  jq -r --arg coordinate "$coordinate" --arg fallback "$fallback_classifier" '
+    [
+      .libraries[]
+      | select(.name | startswith($coordinate + ":"))
+      | select(.downloads.artifact.path != null)
+      | {parts: (.name | split(":")), path: .downloads.artifact.path}
+    ] as $matches
+    | (
+        first($matches[] | select(.parts | length == 3))
+        // first($matches[] | select($fallback != "" and .parts[3] == $fallback))
+        // {path: ""}
+      ).path
+  ' "$GAIUS_VERSION_METADATA" | tr -d '\r'
 }
 
 # Build-state paths are profile-scoped by default.  A caller may still provide

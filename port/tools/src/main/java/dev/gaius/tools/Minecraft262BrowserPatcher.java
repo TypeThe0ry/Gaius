@@ -57,46 +57,56 @@ public final class Minecraft262BrowserPatcher {
     }
 
     public static void main(String[] args) throws IOException {
-        if (args.length != 2) {
+        if (args.length != 2 && args.length != 3) {
             throw new IllegalArgumentException(
-                    "usage: Minecraft262BrowserPatcher INPUT_JAR OUTPUT_ROOT");
+                    "usage: Minecraft262BrowserPatcher INPUT_JAR OUTPUT_ROOT [MINECRAFT_VERSION]");
         }
         String jar = args[0];
         Path root = Path.of(args[1]);
-        patchNativeLibrariesBootstrap(jar, root);
-        patchPreferredGraphicsApi(jar, root);
-        patchVulkanBackend(jar, root);
-        patchGlDeviceCapabilities(jar, root);
-        patchFramerateLimiter(jar, root);
+        String minecraftVersion = args.length == 3 ? args[2] : "26.2";
+        if (!MinecraftClientPatcher.isModernProfile(minecraftVersion)) {
+            throw new IllegalArgumentException(
+                    "Minecraft262BrowserPatcher serves the modern patch set only, not profile "
+                            + minecraftVersion);
+        }
+        // Every patch call below goes through PatchRegistry so that a profile in bring-up
+        // (GAIUS_BRINGUP=1, never 26.2) can skip listed patches; for 26.2 each call simply runs.
+        PatchRegistry.configureProfile(minecraftVersion);
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchNativeLibrariesBootstrap", () -> patchNativeLibrariesBootstrap(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchPreferredGraphicsApi", () -> patchPreferredGraphicsApi(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchVulkanBackend", () -> patchVulkanBackend(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchGlDeviceCapabilities", () -> patchGlDeviceCapabilities(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchFramerateLimiter", () -> patchFramerateLimiter(jar, root));
         // Preserve configured mipmap levels and texture resolution; throughput fixes stay in
         // scheduling rather than lowering the graphics preset.
-        patchGraphicsPresetBrowserDistances(jar, root);
-        patchChunkGenerationCooperation(jar, root);
-        patchDistanceManagerCooperation(jar, root);
-        patchChunkMapMovementCooperation(jar, root);
-        patchChunkTrackingViewDifferenceCooperation(jar, root);
-        patchServerChunkBroadcastCooperation(jar, root);
-        patchRegionFileStorageCache(jar, root);
-        patchGlBufferMappedViewRanges(jar, root);
-        patchLiveFrameTargeting(jar, root);
-        patchSectionRenderTaskRetryYields(jar, root);
-        patchSectionRenderEmergencyUpload(jar, root);
-        patchStagingBuffer(jar, root);
-        patchUberGpuBufferNodeCleanup(jar, root);
-        patchTemplateSource(jar, root);
-        patchNoiseChunkGraphMapper(jar, root);
-        patchRemoteFriendList(jar, root);
-        patchNativeModuleLister(jar, root);
-        patchMacosUtil(jar, root);
-        patchVulkanDebug(jar, root);
-        patchDetailedMemoryDebug(jar, root);
-        patchSystemSpecsDebug(jar, root);
-        patchFileFixAccess(jar, root);
-        patchFileFixerUpperHardLinks(jar, root);
-        patchIdentifierResolveAgainst(jar, root);
-        patchCopyOnWriteFileSystem(jar, root);
-        patchCopyOnWriteProvider(jar, root);
-        patchDownloadQueueBrowserCooperativeExecutor(jar, root);
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchGraphicsPresetBrowserDistances", () -> patchGraphicsPresetBrowserDistances(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchChunkGenerationCooperation", () -> patchChunkGenerationCooperation(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchDistanceManagerCooperation", () -> patchDistanceManagerCooperation(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchChunkMapMovementCooperation", () -> patchChunkMapMovementCooperation(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchChunkTrackingViewDifferenceCooperation", () -> patchChunkTrackingViewDifferenceCooperation(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchServerChunkBroadcastCooperation", () -> patchServerChunkBroadcastCooperation(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchRegionFileStorageCache", () -> patchRegionFileStorageCache(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchGlBufferMappedViewRanges", () -> patchGlBufferMappedViewRanges(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchLiveFrameTargeting", () -> patchLiveFrameTargeting(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchSectionRenderTaskRetryYields", () -> patchSectionRenderTaskRetryYields(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchSectionRenderEmergencyUpload", () -> patchSectionRenderEmergencyUpload(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchStagingBuffer", () -> patchStagingBuffer(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchUberGpuBufferNodeCleanup", () -> patchUberGpuBufferNodeCleanup(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchTemplateSource", () -> patchTemplateSource(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchNoiseChunkGraphMapper", () -> patchNoiseChunkGraphMapper(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchRemoteFriendList", () -> patchRemoteFriendList(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchNativeModuleLister", () -> patchNativeModuleLister(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchMacosUtil", () -> patchMacosUtil(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchVulkanDebug", () -> patchVulkanDebug(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchDetailedMemoryDebug", () -> patchDetailedMemoryDebug(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchSystemSpecsDebug", () -> patchSystemSpecsDebug(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchFileFixAccess", () -> patchFileFixAccess(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchFileFixerUpperHardLinks", () -> patchFileFixerUpperHardLinks(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchIdentifierResolveAgainst", () -> patchIdentifierResolveAgainst(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchCopyOnWriteFileSystem", () -> patchCopyOnWriteFileSystem(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchCopyOnWriteProvider", () -> patchCopyOnWriteProvider(jar, root));
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchDownloadQueueBrowserCooperativeExecutor", () -> patchDownloadQueueBrowserCooperativeExecutor(jar, root));
+        PatchRegistry.printSummary();
     }
 
     /**

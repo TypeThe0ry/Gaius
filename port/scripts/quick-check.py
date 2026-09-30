@@ -244,6 +244,7 @@ BROWSER_AUTHLIB_GSON = PORT / "src" / "main" / "java" / "dev" / "gaius" / "brows
 BROWSER_SIGNER = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserSigner.java"
 BROWSER_SINGLEPLAYER_CLIENT = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserSingleplayerClient.java"
 BROWSER_INTEGRATED_SERVER_MAIN = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserIntegratedServerMain.java"
+BROWSER_PLAYER_LIST_COMPAT = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserPlayerListCompat.java"
 BROWSER_LAZY_DATA_FIXER = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "BrowserLazyDataFixer.java"
 MINECRAFT_RESOURCE_SUPPLIER = PORT / "src" / "main" / "java" / "dev" / "gaius" / "browser" / "MinecraftResourceSupplier.java"
 SCHEDULED_THREAD_POOL_EXECUTOR = PORT / "src" / "main" / "java" / "org" / "teavm" / "classlib" / "java" / "util" / "concurrent" / "TScheduledThreadPoolExecutor.java"
@@ -528,6 +529,8 @@ def build_identity_overlay_inputs(root: Path, profile: dict) -> list[tuple[str, 
         overlays / f"client-named-{version}-gaius.jar",
         overlays / f"teavm-classlib-{teavm_version}-gaius.jar",
         overlays / f"teavm-core-{teavm_version}-gaius.jar",
+        # Mirrors gaius_build_identity.py: the bring-up marker of build-overlays.sh.
+        overlays / "BRINGUP",
     ]
     metadata_path = metadata_candidates[0]
     if metadata_path.is_file():
@@ -2140,6 +2143,7 @@ def check_source_patches() -> None:
     browser_signer = BROWSER_SIGNER.read_text(errors="replace") if BROWSER_SIGNER.exists() else ""
     browser_singleplayer_client = BROWSER_SINGLEPLAYER_CLIENT.read_text(errors="replace") if BROWSER_SINGLEPLAYER_CLIENT.exists() else ""
     browser_integrated_server_main = BROWSER_INTEGRATED_SERVER_MAIN.read_text(errors="replace") if BROWSER_INTEGRATED_SERVER_MAIN.exists() else ""
+    browser_player_list_compat = BROWSER_PLAYER_LIST_COMPAT.read_text(errors="replace") if BROWSER_PLAYER_LIST_COMPAT.exists() else ""
     browser_lazy_data_fixer = BROWSER_LAZY_DATA_FIXER.read_text(errors="replace") if BROWSER_LAZY_DATA_FIXER.exists() else ""
     minecraft_resource_supplier = MINECRAFT_RESOURCE_SUPPLIER.read_text(errors="replace") if MINECRAFT_RESOURCE_SUPPLIER.exists() else ""
     scheduled_thread_pool_executor = SCHEDULED_THREAD_POOL_EXECUTOR.read_text(errors="replace") if SCHEDULED_THREAD_POOL_EXECUTOR.exists() else ""
@@ -4108,7 +4112,8 @@ def check_source_patches() -> None:
             and "appliedSimulationDistance != simulation" in browser_integrated_server_main
             and "current != null && !serverThreadExited" in browser_integrated_server_main
             and "public static void configurePlayerList" in browser_integrated_server_main
-            and "setAllowCommandsForAllPlayers(true)" in browser_integrated_server_main
+            and "BrowserPlayerListCompat.allowCommandsForAllPlayers(playerList)" in browser_integrated_server_main
+            and "setAllowCommandsForAllPlayers(true)" in browser_player_list_compat
             and "DedicatedServer player list configuration point was not found" in client_patcher
             and "INITIAL_VIEW_DISTANCE = 1" in browser_integrated_server_main
             and "INITIAL_SIMULATION_DISTANCE = 1" in browser_integrated_server_main
@@ -6706,7 +6711,8 @@ def check_source_patches() -> None:
         ),
         (
             "Worker singleplayer grants commands to its isolated local player",
-            "setAllowCommandsForAllPlayers(true)" in browser_integrated_server_main
+            "BrowserPlayerListCompat.allowCommandsForAllPlayers(playerList)" in browser_integrated_server_main
+            and "setAllowCommandsForAllPlayers(true)" in browser_player_list_compat
             and '"max-players=1"' in browser_integrated_server_main,
         ),
         (

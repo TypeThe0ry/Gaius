@@ -1014,7 +1014,8 @@ try {
   // invalid drive-qualified classpath entry.
   const classpath = [asm, asmTree].join(delimiter);
   execFileSync(javac, [
-    "--release", "21", "-proc:none", "-classpath", classpath, "-d", classes,
+    "--release", "21", "-proc:none", "-classpath", classpath,
+    "-sourcepath", join(repositoryRoot, "port/tools/src/main/java"), "-d", classes,
     join(toolsSource, "MinecraftClientPatcher.java"),
     join(toolsSource, "Minecraft262BrowserPatcher.java"),
   ], {encoding: "utf8", timeout: 30_000});

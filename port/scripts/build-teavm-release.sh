@@ -22,6 +22,15 @@ export GAIUS_BUILD_ROOT="$build_root"
 export GAIUS_DIST_DIRECTORY="$dist"
 export GAIUS_TARGET_DIRECTORY="$dist"
 export GAIUS_OVERLAY_DIRECTORY="$(gaius_overlay_directory "$root")"
+# A release never uses bring-up mode or bring-up overlays (the BRINGUP marker
+# of build-overlays.sh).  Overlays that will be reused as they are
+# (GAIUS_SKIP_OVERLAY_BUILD, or a resumed client) are checked before any work;
+# rebuilt overlays are checked again after the client build below.
+gaius_refuse_bringup_release || exit 1
+if [[ "${GAIUS_SKIP_OVERLAY_BUILD:-false}" == "true" \
+      || "${GAIUS_SKIP_CLIENT_BUILD:-false}" == "true" ]]; then
+  gaius_refuse_bringup_release "$GAIUS_OVERLAY_DIRECTORY" || exit 1
+fi
 asset_index_id="$(jq -er '.assetIndex.id // .assets' "$GAIUS_VERSION_METADATA" | tr -d '\r\n')"
 identity_tool="$root/port/scripts/gaius_build_identity.py"
 compiler_profile_tool="$root/port/scripts/teavm-compiler-profile.py"
@@ -290,6 +299,9 @@ else
   generate_client_release_pom
   write_client_release_profile "$dist/${GAIUS_TARGET_FILE:-classes.js}"
 fi
+# The client was compiled from these overlays, and the server Worker below
+# reuses them.
+gaius_refuse_bringup_release "$GAIUS_OVERLAY_DIRECTORY" || exit 1
 if [[ "${GAIUS_SKIP_SERVER_WORKER:-false}" != "true" ]]; then
   GAIUS_SKIP_OVERLAY_BUILD=true GAIUS_SKIP_COMPRESSION=true \
     "$root/port/scripts/build-teavm-server-worker.sh"

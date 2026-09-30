@@ -132,9 +132,14 @@ const featureEnd = patcherText.indexOf(
 assert.ok(featureStart >= 0 && featureEnd > featureStart,
   "missing isolated MappableRingBuffer telemetry patch");
 const featureText = patcherText.slice(featureStart, featureEnd);
+// The call in main() runs under the modern-profile guard (26.2 and 26.3,
+// never 1.21.11), wrapped in PatchRegistry.run so 26.3 bring-up can skip it.
 assert.match(patcherText,
-  /if \("26\.2"\.equals\(minecraftVersion\)\) \{\s*patchMappableRingBufferTelemetry\(/,
-  "MappableRingBuffer telemetry must remain gated to exact profile 26.2");
+  /static boolean isModernProfile\(String minecraftVersion\) \{\s*return "26\.2"\.equals\(minecraftVersion\) \|\| "26\.3"\.equals\(minecraftVersion\);\s*\}/,
+  "isModernProfile must name exactly the modern profiles 26.2 and 26.3");
+assert.match(patcherText,
+  /if \(isModernProfile\(minecraftVersion\)\) \{\s*PatchRegistry\.run\("MinecraftClientPatcher\.patchMappableRingBufferTelemetry", \(\) -> patchMappableRingBufferTelemetry\(/,
+  "MappableRingBuffer telemetry must remain gated to the modern profiles");
 for (const required of [
   "currentBuffer",
   "Long.valueOf(Long.MAX_VALUE)",
@@ -445,6 +450,7 @@ try {
   run(javaTools.javac, [
     "--release", "21", "-proc:none",
     "-classpath", asmPatcherClasspath,
+    "-sourcepath", path.join(repositoryRoot, "port/tools/src/main/java"),
     "-d", patcherClasses,
     patcherSource,
   ], {stdio: ["ignore", "pipe", "pipe"]});

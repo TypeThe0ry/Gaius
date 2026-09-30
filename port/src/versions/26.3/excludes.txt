@@ -1,0 +1,4 @@
+# Shared port/src/main/java sources that are not compiled for Minecraft 26.3.
+# PlatformSmoke probes GLFW, the blaze3d OpenGL backend and ImprovedNoise, none of
+# which exist in 26.3; an SDL/renderpearl version has no owner yet (PLAN 6.5 #5).
+dev/gaius/browser/PlatformSmoke.java
