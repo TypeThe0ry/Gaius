@@ -42,7 +42,14 @@ GAIUS_EMSDK=/path/to/emsdk port/scripts/build-wasm-shader-toolchain.sh --dist po
 `--work` defaults to `port/target/shader-toolchain` (keep it short on Windows:
 CMake object paths below it exceed MAX_PATH otherwise).  A stamp over the pins,
 export lists and link flags skips the ~2 minute compile when nothing changed.
-CMake, Ninja and Git must be on `PATH`.
+CMake, Ninja and Git must be on `PATH`.  Build paths are mapped out of the
+modules (`-ffile-prefix-map`); two builds from scratch produced byte-identical
+modules.
+
+Without emsdk, `--prebuilt DIR` (or `GAIUS_SHADER_TOOLCHAIN_PREBUILT`) takes the
+four module files of an earlier run from `DIR`: its
+`gaius-shader-toolchain.json` must name exactly the pinned sources and
+emscripten, and every file must match its sha256 there.
 
 Artifacts (all next to `index.html`):
 
@@ -124,7 +131,7 @@ spvcJs, spvcWasm}` before the loader runs.
 * every ESSL program compiles and links in headless Chrome WebGL2 (216/216);
 * instance recovery after a trap in each module; IndexedDB reload hits.
 
-Measured in Chrome 154 (Windows, RTX 4060, machine shared with other builds):
-download 1.31 MB gzip (budget 3 MB); load 76 ms; all 216 pipelines cold
-0.94 s (budget 5 s); after a reload from the IndexedDB cache 0.38 s (budget
-0.5 s).
+Measured in Chrome 154 (Windows, RTX 4060, machine shared with other builds,
+two runs): download 1.31 MB gzip (budget 3 MB); load 47-76 ms; all 216
+pipelines cold 0.75-0.94 s (budget 5 s); after a reload from the IndexedDB
+cache 0.25-0.38 s (budget 0.5 s).
