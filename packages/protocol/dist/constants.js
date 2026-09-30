@@ -12,7 +12,14 @@ export const MINECRAFT_26_2 = {
     resourcePackVersion: "88.0",
     dataPackVersion: "107.1",
 };
-const minecraftProfiles = [MINECRAFT_1_21_11, MINECRAFT_26_2];
+export const MINECRAFT_26_3 = {
+    name: "26.3",
+    protocolVersion: 777,
+    worldVersion: 5023,
+    resourcePackVersion: "97.1",
+    dataPackVersion: "121.0",
+};
+const minecraftProfiles = [MINECRAFT_1_21_11, MINECRAFT_26_2, MINECRAFT_26_3];
 const minecraftProfilesByName = Object.freeze(Object.fromEntries(
     minecraftProfiles.map((profile) => [profile.name, profile])));
 const minecraftProfilesByProtocol = Object.freeze(Object.fromEntries(

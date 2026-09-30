@@ -8,6 +8,7 @@ import { WebSocket } from "ws";
 import {
     MINECRAFT_1_21_11,
     MINECRAFT_26_2,
+    MINECRAFT_26_3,
 } from "./dist/protocol.js";
 
 const registryPath = new URL("../../relay-nodes.json", import.meta.url);
@@ -187,12 +188,13 @@ console.log(JSON.stringify({
 
 function resolveSmokeMinecraftProfile(value) {
     const key = String(value ?? "").trim();
-    const profile = [MINECRAFT_1_21_11, MINECRAFT_26_2]
+    const profile = [MINECRAFT_1_21_11, MINECRAFT_26_2, MINECRAFT_26_3]
         .find((candidate) => candidate.name === key ||
             String(candidate.protocolVersion) === key);
     if (profile === undefined) {
         throw new Error(
-            `Unsupported public smoke Minecraft version ${value}; expected 1.21.11/774 or 26.2/776`);
+            `Unsupported public smoke Minecraft version ${value}; ` +
+            "expected 1.21.11/774, 26.2/776 or 26.3/777");
     }
     return profile;
 }

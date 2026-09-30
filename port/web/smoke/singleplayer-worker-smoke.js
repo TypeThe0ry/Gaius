@@ -36,6 +36,61 @@ const PLAY_PROTOCOLS = Object.freeze({
       pong: 45,
     }),
   }),
+  777: Object.freeze({
+    clientbound: Object.freeze({
+      disconnect: 32,
+      keepAlive: 45,
+      levelChunkWithLight: 46,
+      login: 50,
+      ping: 62,
+    }),
+    serverbound: Object.freeze({
+      chunkBatchReceived: 11,
+      keepAlive: 28,
+      playerLoaded: 44,
+      pong: 45,
+    }),
+  }),
+});
+// CONFIGURATION ids per protocol. 26.3 (777) registers clientbound
+// post_effects at id 10, so select_known_packs moves from 14 to 15; the other
+// ids used here and every serverbound id are unchanged. All ids are derived
+// from the profile's client jar, like apps/bridge/dist/protocol.js.
+const CONFIGURATION_IDS_774_776 = Object.freeze({
+  clientbound: Object.freeze({
+    disconnect: 2,
+    finish: 3,
+    keepAlive: 4,
+    ping: 5,
+    selectKnownPacks: 14,
+  }),
+  serverbound: Object.freeze({
+    clientInformation: 0,
+    finish: 3,
+    keepAlive: 4,
+    pong: 5,
+    selectKnownPacks: 7,
+  }),
+});
+const CONFIGURATION_PROTOCOLS = Object.freeze({
+  774: CONFIGURATION_IDS_774_776,
+  776: CONFIGURATION_IDS_774_776,
+  777: Object.freeze({
+    clientbound: Object.freeze({
+      disconnect: 2,
+      finish: 3,
+      keepAlive: 4,
+      ping: 5,
+      selectKnownPacks: 15,
+    }),
+    serverbound: Object.freeze({
+      clientInformation: 0,
+      finish: 3,
+      keepAlive: 4,
+      pong: 5,
+      selectKnownPacks: 7,
+    }),
+  }),
 });
 
 const runButton = document.getElementById("run");
@@ -102,6 +157,13 @@ async function runSmoke() {
         "No browser smoke PLAY packet table exists for protocol " + activeProtocolVersion
       );
     }
+    const activeConfigurationProtocol = CONFIGURATION_PROTOCOLS[activeProtocolVersion];
+    if (!activeConfigurationProtocol) {
+      throw new Error(
+        "No browser smoke CONFIGURATION packet table exists for protocol " +
+          activeProtocolVersion
+      );
+    }
     smokeState.versionProfile = activeVersionProfile.id;
     smokeState.protocolVersion = activeProtocolVersion;
     storage = storageConfigForProfile(activeVersionProfile);
@@ -116,7 +178,8 @@ async function runSmoke() {
       clientPort,
       sessionId,
       activeProtocolVersion,
-      activePlayProtocol
+      activePlayProtocol,
+      activeConfigurationProtocol
     );
     stopped = deferred();
     distancesActive = deferred();
@@ -330,10 +393,20 @@ function requireDiagnosticSnapshot(snapshot) {
   }
 }
 
-function createProtocolClient(port, sessionId, protocolVersion, playProtocol) {
+function createProtocolClient(
+  port,
+  sessionId,
+  protocolVersion,
+  playProtocol,
+  configurationProtocol
+) {
   const ready = deferred();
   const host = "client-" + sessionId + ".gaius-local";
   const {clientbound: clientboundPlay, serverbound: serverboundPlay} = playProtocol;
+  const {
+    clientbound: clientboundConfiguration,
+    serverbound: serverboundConfiguration,
+  } = configurationProtocol;
   let buffered = new Uint8Array(0);
   let packetWork = Promise.resolve();
   let remotePaused = false;
@@ -478,25 +551,41 @@ function createProtocolClient(port, sessionId, protocolVersion, playProtocol) {
       state.phase = "configuration";
       record("protocol", "login-finished", "true");
       send(encodePacket(3, new Uint8Array(0), state.compressionThreshold));
-      send(encodePacket(0, encodeClientInformation(), state.compressionThreshold));
+      send(encodePacket(
+        serverboundConfiguration.clientInformation,
+        encodeClientInformation(),
+        state.compressionThreshold
+      ));
     } else if (state.phase === "configuration") {
       state.configurationPackets++;
-      if (packetId.value === 2) {
+      if (packetId.value === clientboundConfiguration.disconnect) {
         throw new Error("Official server disconnected during configuration");
       }
-      if (packetId.value === 14) {
+      if (packetId.value === clientboundConfiguration.selectKnownPacks) {
         state.knownPackRequests++;
         record("protocol", "known-packs", String(state.knownPackRequests));
-        send(encodePacket(7, encodeVarInt(0), state.compressionThreshold));
-      } else if (packetId.value === 3) {
+        send(encodePacket(
+          serverboundConfiguration.selectKnownPacks,
+          encodeVarInt(0),
+          state.compressionThreshold
+        ));
+      } else if (packetId.value === clientboundConfiguration.finish) {
         state.configurationFinished = true;
         state.phase = "play";
         record("protocol", "configuration-finished", String(state.configurationPackets));
-        send(encodePacket(3, new Uint8Array(0), state.compressionThreshold));
-      } else if (packetId.value === 4) {
-        send(encodePacket(4, payload, state.compressionThreshold));
-      } else if (packetId.value === 5) {
-        send(encodePacket(5, payload, state.compressionThreshold));
+        send(encodePacket(
+          serverboundConfiguration.finish,
+          new Uint8Array(0),
+          state.compressionThreshold
+        ));
+      } else if (packetId.value === clientboundConfiguration.keepAlive) {
+        send(encodePacket(
+          serverboundConfiguration.keepAlive,
+          payload,
+          state.compressionThreshold
+        ));
+      } else if (packetId.value === clientboundConfiguration.ping) {
+        send(encodePacket(serverboundConfiguration.pong, payload, state.compressionThreshold));
       }
     } else if (state.phase === "play") {
       state.playPackets++;
