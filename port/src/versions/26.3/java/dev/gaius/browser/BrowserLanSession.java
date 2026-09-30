@@ -10,11 +10,17 @@ import java.util.UUID;
 /**
  * Browser equivalent of vanilla's Open to LAN action for the Worker-hosted world.
  *
- * <p>Minecraft 26.3 version. It differs from the shared (26.2) source only in the profile it
- * reports when the page did not define {@code __gaiusProfileId}: the running client's own
- * version id instead of a hard-coded "26.2", so a 26.3 page can never publish a 26.2 invite.
+ * <p>Minecraft 26.3 version. It differs from the shared (26.2) source in two places:
+ * <ul>
+ *   <li>the profile it reports when the page did not define {@code __gaiusProfileId} is the
+ *       running client's own version id instead of a hard-coded "26.2", so a 26.3 page never
+ *       publishes a 26.2 invite;</li>
+ *   <li>the full-width (204) button spans both pause-menu grid columns, like Return to Game and
+ *       Disconnect. With a one-column span GridLayout widens column 0 to 204 for every row.</li>
+ * </ul>
  * The pause-menu hook that calls {@link #maybeAddButton} is MinecraftClientPatcher's
- * patchPauseScreenBrowserSingleplayer (26.3 anchor: before the {@code level != null} check).
+ * patchPauseScreenBrowserSingleplayer (26.3 anchor: before the {@code level != null} check), so
+ * the menu reads Open to LAN, then Options | World Options, then Disconnect.
  */
 public final class BrowserLanSession {
     private static final Component OPEN_TO_LAN = Component.literal("Open to LAN");
@@ -29,7 +35,7 @@ public final class BrowserLanSession {
         }
         row.addChild(Button.builder(OPEN_TO_LAN, ignored -> open(minecraft))
                 .width(204)
-                .build());
+                .build(), 2);
     }
 
     /** Publishes a relay-backed LAN/share invitation through the browser shell. */
