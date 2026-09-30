@@ -11,7 +11,8 @@ until the quick-check profile dispatch calls it, run it directly:
         [--runtime-classes port/target/26.3/maven/classes]
 
 The runtime-class checks run when the 26.3 source set was compiled (generate-pom.sh and a
-javac-only mvnw compile); otherwise a NOTE line says they did not run.
+javac-only mvnw compile); without them the run fails unless
+--allow-missing-runtime-classes is given.
 
 Exit status 0 when every check passes, 1 otherwise, 2 when an input is missing.
 
@@ -293,6 +294,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--vanilla", type=Path, default=DEFAULT_VANILLA)
     parser.add_argument("--runtime-classes", type=Path, default=DEFAULT_RUNTIME_CLASSES,
                         help="javac output of the 26.3 source set (generate-pom.sh + mvnw compile)")
+    parser.add_argument("--allow-missing-runtime-classes", action="store_true",
+                        help="skip the runtime class checks when --runtime-classes does not exist")
     args = parser.parse_args(argv)
     for path in (args.jar, args.vanilla):
         if not path.is_file():
@@ -302,8 +305,13 @@ def main(argv: list[str] | None = None) -> int:
     results = checks(args.jar, args.vanilla, javap)
     if args.runtime_classes.is_dir():
         results += runtime_checks(args.runtime_classes, javap)
-    else:
+    elif args.allow_missing_runtime_classes:
         print(f"NOTE: {args.runtime_classes} not found; 26.3 runtime class checks not run")
+    else:
+        # Fail closed: without the javac output the runtime checks would silently not run.
+        results.append(("26.3 runtime classes present", False,
+                        f"{args.runtime_classes} not found (run generate-pom.sh + mvnw compile for 26.3, "
+                        "or pass --allow-missing-runtime-classes)"))
     failed = 0
     for name, ok, detail in results:
         print(f"{'PASS' if ok else 'FAIL'}: {name}" + (f" ({detail})" if detail and not ok else ""))

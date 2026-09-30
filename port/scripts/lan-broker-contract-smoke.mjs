@@ -33,6 +33,17 @@ assert.match(server, /BrowserWebSocketChannel\.endRelayOnlySession\(sessionId\)/
 assert.match(server, /max-players=8/);
 assert.match(lan, /UUID\.randomUUID\(\)/);
 assert.match(lan, /publishLanInvite\(brokerSessionId\)/);
+// The 26.3 copy (port/src/versions/26.3) also passes the running client version as the
+// invite's version fallback; the broker contract is otherwise the same.
+const lan263 = await source("port/src/versions/26.3/java/dev/gaius/browser/BrowserLanSession.java");
+assert.match(lan263, /UUID\.randomUUID\(\)/);
+assert.match(lan263, /BrowserSingleplayerClient\.requestLanServerConnection\(brokerSessionId\)/);
+assert.match(lan263, /publishLanInvite\(brokerSessionId, clientVersionId\(\)\)/);
+assert.match(lan263, /private static native void publishLanInvite\(String brokerSessionId, String clientVersionId\)/);
+for (const copy of [lan, lan263]) {
+  assert.match(copy, /__gaiusOpenToLan/);
+  assert.match(copy, /brokerSessionId/);
+}
 assert.match(launcher, /brokerSessionId/);
 assert.match(launcher, /client-" \+ brokerSessionId \+ "\.gaius-local:25565/);
 assert.match(channel, /continue through the relay/);
