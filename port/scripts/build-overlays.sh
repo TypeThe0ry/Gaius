@@ -187,6 +187,24 @@ for artifact_spec in "${required_maven_artifacts[@]}"; do
   fi
 done
 
+# javac_source_argfile FILE SOURCE...: writes the source files to the javac
+# @argfile FILE and prints the argument that passes it ("@<path>").  Windows
+# limits a command line to 32767 characters, and a profile classpath plus a
+# source list of absolute paths in a deep worktree exceeds that (26.3 does).
+# Git Bash only rewrites /c/... paths that appear on a command line, so the
+# file gets native paths.  The caller deletes FILE after javac.
+javac_source_argfile() {
+  local argfile="$1"
+  shift
+  if command -v cygpath >/dev/null 2>&1; then
+    printf '%s\n' "$@" | cygpath -m -f - | sed -e 's/^/"/' -e 's/$/"/' >"$argfile"
+    printf '@%s\n' "$(cygpath -m "$argfile")"
+  else
+    printf '"%s"\n' "$@" >"$argfile"
+    printf '@%s\n' "$argfile"
+  fi
+}
+
 upstream="$maven_repository/org/teavm/teavm-classlib/$teavm_version/teavm-classlib-$teavm_version.jar"
 output="$overlay_work/teavm-classlib-$teavm_version-gaius.jar"
 
@@ -227,7 +245,10 @@ done
 classpath="$classpath${java_classpath_separator}${java_maven_repository}/com/jcraft/jzlib/1.1.3/jzlib-1.1.3.jar"
 classpath="$classpath${java_classpath_separator}$java_work_classpath"
 
-javac --release 21 -proc:none -classpath "$classpath" -d "$classes" "${sources[@]}"
+classlib_sources_argfile="$overlay_work/classlib-sources.argfile"
+classlib_sources_argument="$(javac_source_argfile "$classlib_sources_argfile" "${sources[@]}")"
+javac --release 21 -proc:none -classpath "$classpath" -d "$classes" "$classlib_sources_argument"
+rm -f "$classlib_sources_argfile"
 cp "$upstream" "$output"
 jar --update --file "$output" -C "$classes" .
 
@@ -291,8 +312,12 @@ build_library_overlay() {
 
   mkdir -p "$output_classes" "$(dirname "$output_jar")"
   find "$output_classes" -type f -delete
+  local library_sources_argfile="$output_classes.argfile"
+  local library_sources_argument
+  library_sources_argument="$(javac_source_argfile "$library_sources_argfile" "${library_sources[@]}")"
   javac --release 21 -proc:none -classpath "$compile_classpath" \
-    -d "$output_classes" "${library_sources[@]}"
+    -d "$output_classes" "$library_sources_argument"
+  rm -f "$library_sources_argfile"
   cp "$source_jar" "$output_jar"
   jar --update --file "$output_jar" -C "$output_classes" .
 }
@@ -885,10 +910,13 @@ client_override_classpath="$java_client_jar${java_classpath_separator}$java_work
 for artifact in teavm-interop teavm-jso teavm-jso-apis; do
   client_override_classpath="$client_override_classpath${java_classpath_separator}${java_maven_repository}/org/teavm/$artifact/$teavm_version/$artifact-$teavm_version.jar"
 done
+client_override_sources_argfile="$overlay_work/client-override-sources.argfile"
+client_override_sources_argument="$(javac_source_argfile "$client_override_sources_argfile" "${client_override_sources[@]}")"
 javac --release 21 -proc:none \
   -classpath "$client_override_classpath" \
   -d "$client_override_classes" \
-  "${client_override_sources[@]}"
+  "$client_override_sources_argument"
+rm -f "$client_override_sources_argfile"
 jar --update --file "$client_output" -C "$client_override_classes" .
 
 # One client patcher step: run dev.gaius.tools.<Class> with the PatchRegistry
