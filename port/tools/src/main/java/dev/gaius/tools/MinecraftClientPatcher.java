@@ -42,7 +42,10 @@ public final class MinecraftClientPatcher {
 
     /**
      * 26.2 and later share the named, Java 25 client layout that the modern patch set targets.
-     * 1.21.11 is the only legacy (obfuscated-with-mappings) profile.
+     * 1.21.11 is the only legacy (obfuscated-with-mappings) profile. build-overlays.sh picks the
+     * patch chain from the profile's {@code patchSet}; a new profile with
+     * {@code "patchSet": "modern"} must be added here too. Differences between modern jars are
+     * probed with {@link ModernSymbols}, not derived from this version string.
      */
     static boolean isModernProfile(String minecraftVersion) {
         return "26.2".equals(minecraftVersion) || "26.3".equals(minecraftVersion);
@@ -51,354 +54,359 @@ public final class MinecraftClientPatcher {
     public static void main(String[] args) throws IOException {
         Path root = Path.of(args[1]);
         String minecraftVersion = args.length >= 3 ? args[2] : "1.21.11";
-        patchNativeModuleLister(
-                args[0], root.resolve("net/minecraft/util/NativeModuleLister.class"));
-        patchJvmProfiler(
-                args[0], root.resolve("net/minecraft/util/profiling/jfr/JvmProfiler.class"));
-        patchEventLoopGroupHolder(
-                args[0], root.resolve("net/minecraft/server/network/EventLoopGroupHolder.class"));
-        patchServerMainBrowser(
-                args[0], root.resolve("net/minecraft/server/Main.class"));
-        patchWorldLoaderBrowserStartupTelemetry(
-                args[0], root.resolve("net/minecraft/server/WorldLoader.class"));
-        patchBlocksBrowserStartupYield(
-                args[0], root.resolve("net/minecraft/world/level/block/Blocks.class"));
-        patchBlockStateBaseBrowserStartupYield(args[0], root.resolve(
-                "net/minecraft/world/level/block/state/BlockBehaviour$BlockStateBase.class"));
-        patchBuiltInRegistriesBrowserStartupYield(args[0], root.resolve(
-                "net/minecraft/core/registries/BuiltInRegistries.class"));
-        patchDedicatedServerBrowser(
-                args[0], root.resolve("net/minecraft/server/dedicated/DedicatedServer.class"));
-        patchDedicatedServerBrowserConsole(args[0], root.resolve(
-                "net/minecraft/server/dedicated/DedicatedServer$1.class"));
-        patchDedicatedSettingsBrowser(
-                args[0], root.resolve("net/minecraft/server/dedicated/Settings.class"));
-        patchServerTextFilterBrowser(
-                args[0], root.resolve("net/minecraft/server/network/ServerTextFilter.class"));
-        patchServerConnectionListenerBrowserWorker(args[0], root.resolve(
-                "net/minecraft/server/network/ServerConnectionListener.class"));
-        patchBrowserServerAddressResolver(args[0], root.resolve(
-                "net/minecraft/client/multiplayer/resolver/ServerAddressResolver.class"));
-        patchBrowserServerRedirectHandler(args[0], root.resolve(
-                "net/minecraft/client/multiplayer/resolver/ServerRedirectHandler.class"));
-        patchResolvedServerAddressBrowserUnresolved(args[0], root.resolve(
-                "net/minecraft/client/multiplayer/resolver/ResolvedServerAddress$1.class"));
-        patchConnectionBrowserWebSocket(args[0], root.resolve(
-                "net/minecraft/network/Connection.class"));
-        patchCompressionDecoderBrowser(root.resolve(
-                "net/minecraft/network/Connection.class"));
-        patchClientPacketUtilsBrowserInline(args[0], root.resolve(
-                "net/minecraft/network/protocol/PacketUtils.class"));
-        patchConnectScreenBrowserRecovery(args[0], root.resolve(
-                "net/minecraft/client/gui/screens/ConnectScreen.class"));
-        patchPacketProcessorBrowserSlice(args[0], root.resolve(
-                "net/minecraft/network/PacketProcessor.class"));
-        patchClientKeepAliveBrowser(args[0], root.resolve(
-                "net/minecraft/client/multiplayer/ClientCommonPacketListenerImpl.class"));
-        patchDownloadedPackSourceBrowserRecovery(args[0], root.resolve(
-                "net/minecraft/client/resources/server/DownloadedPackSource.class"));
-        patchResourceReloadProfiling(args[0], root.resolve(
-                "net/minecraft/server/packs/resources/SimpleReloadInstance.class"));
-        patchSimpleJsonResourceReloadListenerBrowserStartupYield(args[0], root.resolve(
-                "net/minecraft/server/packs/resources/SimpleJsonResourceReloadListener.class"));
-        patchResourceReloadTaskLabels(
+        // Every patch call below goes through PatchRegistry so that a profile in bring-up
+        // (GAIUS_BRINGUP=1, never 26.2 or 1.21.11) can skip listed patches; for 26.2 and
+        // 1.21.11 each call simply runs.
+        PatchRegistry.configureProfile(minecraftVersion);
+        PatchRegistry.run("MinecraftClientPatcher.patchNativeModuleLister", () -> patchNativeModuleLister(
+                args[0], root.resolve("net/minecraft/util/NativeModuleLister.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchJvmProfiler", () -> patchJvmProfiler(
+                args[0], root.resolve("net/minecraft/util/profiling/jfr/JvmProfiler.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchEventLoopGroupHolder", () -> patchEventLoopGroupHolder(
+                args[0], root.resolve("net/minecraft/server/network/EventLoopGroupHolder.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchServerMainBrowser", () -> patchServerMainBrowser(
+                args[0], root.resolve("net/minecraft/server/Main.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchWorldLoaderBrowserStartupTelemetry", () -> patchWorldLoaderBrowserStartupTelemetry(
+                args[0], root.resolve("net/minecraft/server/WorldLoader.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchBlocksBrowserStartupYield", () -> patchBlocksBrowserStartupYield(
+                args[0], root.resolve("net/minecraft/world/level/block/Blocks.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchBlockStateBaseBrowserStartupYield", () -> patchBlockStateBaseBrowserStartupYield(args[0], root.resolve(
+                "net/minecraft/world/level/block/state/BlockBehaviour$BlockStateBase.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchBuiltInRegistriesBrowserStartupYield", () -> patchBuiltInRegistriesBrowserStartupYield(args[0], root.resolve(
+                "net/minecraft/core/registries/BuiltInRegistries.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchDedicatedServerBrowser", () -> patchDedicatedServerBrowser(
+                args[0], root.resolve("net/minecraft/server/dedicated/DedicatedServer.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchDedicatedServerBrowserConsole", () -> patchDedicatedServerBrowserConsole(args[0], root.resolve(
+                "net/minecraft/server/dedicated/DedicatedServer$1.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchDedicatedSettingsBrowser", () -> patchDedicatedSettingsBrowser(
+                args[0], root.resolve("net/minecraft/server/dedicated/Settings.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchServerTextFilterBrowser", () -> patchServerTextFilterBrowser(
+                args[0], root.resolve("net/minecraft/server/network/ServerTextFilter.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchServerConnectionListenerBrowserWorker", () -> patchServerConnectionListenerBrowserWorker(args[0], root.resolve(
+                "net/minecraft/server/network/ServerConnectionListener.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchBrowserServerAddressResolver", () -> patchBrowserServerAddressResolver(args[0], root.resolve(
+                "net/minecraft/client/multiplayer/resolver/ServerAddressResolver.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchBrowserServerRedirectHandler", () -> patchBrowserServerRedirectHandler(args[0], root.resolve(
+                "net/minecraft/client/multiplayer/resolver/ServerRedirectHandler.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchResolvedServerAddressBrowserUnresolved", () -> patchResolvedServerAddressBrowserUnresolved(args[0], root.resolve(
+                "net/minecraft/client/multiplayer/resolver/ResolvedServerAddress$1.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchConnectionBrowserWebSocket", () -> patchConnectionBrowserWebSocket(args[0], root.resolve(
+                "net/minecraft/network/Connection.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchCompressionDecoderBrowser", () -> patchCompressionDecoderBrowser(root.resolve(
+                "net/minecraft/network/Connection.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchClientPacketUtilsBrowserInline", () -> patchClientPacketUtilsBrowserInline(args[0], root.resolve(
+                "net/minecraft/network/protocol/PacketUtils.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchConnectScreenBrowserRecovery", () -> patchConnectScreenBrowserRecovery(args[0], root.resolve(
+                "net/minecraft/client/gui/screens/ConnectScreen.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchPacketProcessorBrowserSlice", () -> patchPacketProcessorBrowserSlice(args[0], root.resolve(
+                "net/minecraft/network/PacketProcessor.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchClientKeepAliveBrowser", () -> patchClientKeepAliveBrowser(args[0], root.resolve(
+                "net/minecraft/client/multiplayer/ClientCommonPacketListenerImpl.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchDownloadedPackSourceBrowserRecovery", () -> patchDownloadedPackSourceBrowserRecovery(args[0], root.resolve(
+                "net/minecraft/client/resources/server/DownloadedPackSource.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchResourceReloadProfiling", () -> patchResourceReloadProfiling(args[0], root.resolve(
+                "net/minecraft/server/packs/resources/SimpleReloadInstance.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchSimpleJsonResourceReloadListenerBrowserStartupYield", () -> patchSimpleJsonResourceReloadListenerBrowserStartupYield(args[0], root.resolve(
+                "net/minecraft/server/packs/resources/SimpleJsonResourceReloadListener.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchResourceReloadTaskLabels", () -> patchResourceReloadTaskLabels(
                 args[0],
                 root.resolve("net/minecraft/client/resources/model/ModelManager.class"),
-                root.resolve("net/minecraft/client/gui/font/FontManager.class"));
-        patchAtlasManagerReloadTaskLabels(args[0], root);
-        patchBitmapFontImageSharing(args[0], root);
-        patchFontProviderSelectionIndex(args[0], root);
-        patchUnihexProviderBrowserBulkParser(args[0], root.resolve(
-                "net/minecraft/client/gui/font/providers/UnihexProvider$Definition.class"));
-        patchUnihexProviderBrowserAccess(args[0], root.resolve(
-                "net/minecraft/client/gui/font/providers/UnihexProvider.class"));
-        patchNetworkEncoderMatchers(args[0], root);
-        patchClassTreeIdRegistry(args[0], root.resolve("net/minecraft/util/ClassTreeIdRegistry.class"));
-        patchSynchedEntityDataClassInitialization(
-                args[0], root.resolve("net/minecraft/network/syncher/SynchedEntityData.class"));
-        patchEntityBrowserUuidUsesGlobalRandom(args[0], root.resolve(
-                "net/minecraft/world/entity/Entity.class"));
-        patchGlx(args[0], root.resolve("com/mojang/blaze3d/platform/GLX.class"));
-        patchGlDebugBrowserNoCallback(args[0], root.resolve(
-                "com/mojang/blaze3d/opengl/GlDebug.class"));
-        patchRenderSystemBrowserDeadlineCompensation(args[0], root);
-        patchFramerateLimitTrackerBrowserNoThrottle(args[0], root.resolve(
-                "com/mojang/blaze3d/platform/FramerateLimitTracker.class"));
-        patchTracyZoneFiller(
-                args[0], root.resolve("net/minecraft/util/profiling/TracyZoneFiller.class"));
-        patchTracingExecutorBrowser(args[0], root.resolve("net/minecraft/TracingExecutor.class"));
-        patchBlockableEventLoopBrowser(args[0], root.resolve(
-                "net/minecraft/util/thread/BlockableEventLoop.class"));
-        patchMacosUtil(
-                args[0], root.resolve("com/mojang/blaze3d/platform/MacosUtil.class"));
-        patchInputConstants(
-                args[0], root.resolve("com/mojang/blaze3d/platform/InputConstants.class"));
-        patchMemoryDebug(args[0], root.resolve(
+                root.resolve("net/minecraft/client/gui/font/FontManager.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchAtlasManagerReloadTaskLabels", () -> patchAtlasManagerReloadTaskLabels(args[0], root));
+        PatchRegistry.run("MinecraftClientPatcher.patchBitmapFontImageSharing", () -> patchBitmapFontImageSharing(args[0], root));
+        PatchRegistry.run("MinecraftClientPatcher.patchFontProviderSelectionIndex", () -> patchFontProviderSelectionIndex(args[0], root));
+        PatchRegistry.run("MinecraftClientPatcher.patchUnihexProviderBrowserBulkParser", () -> patchUnihexProviderBrowserBulkParser(args[0], root.resolve(
+                "net/minecraft/client/gui/font/providers/UnihexProvider$Definition.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchUnihexProviderBrowserAccess", () -> patchUnihexProviderBrowserAccess(args[0], root.resolve(
+                "net/minecraft/client/gui/font/providers/UnihexProvider.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchNetworkEncoderMatchers", () -> patchNetworkEncoderMatchers(args[0], root));
+        PatchRegistry.run("MinecraftClientPatcher.patchClassTreeIdRegistry", () -> patchClassTreeIdRegistry(args[0], root.resolve("net/minecraft/util/ClassTreeIdRegistry.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchSynchedEntityDataClassInitialization", () -> patchSynchedEntityDataClassInitialization(
+                args[0], root.resolve("net/minecraft/network/syncher/SynchedEntityData.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchEntityBrowserUuidUsesGlobalRandom", () -> patchEntityBrowserUuidUsesGlobalRandom(args[0], root.resolve(
+                "net/minecraft/world/entity/Entity.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchGlx", () -> patchGlx(args[0], root.resolve("com/mojang/blaze3d/platform/GLX.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchGlDebugBrowserNoCallback", () -> patchGlDebugBrowserNoCallback(args[0], root.resolve(
+                "com/mojang/blaze3d/opengl/GlDebug.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchRenderSystemBrowserDeadlineCompensation", () -> patchRenderSystemBrowserDeadlineCompensation(args[0], root));
+        PatchRegistry.run("MinecraftClientPatcher.patchFramerateLimitTrackerBrowserNoThrottle", () -> patchFramerateLimitTrackerBrowserNoThrottle(args[0], root.resolve(
+                "com/mojang/blaze3d/platform/FramerateLimitTracker.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchTracyZoneFiller", () -> patchTracyZoneFiller(
+                args[0], root.resolve("net/minecraft/util/profiling/TracyZoneFiller.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchTracingExecutorBrowser", () -> patchTracingExecutorBrowser(args[0], root.resolve("net/minecraft/TracingExecutor.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchBlockableEventLoopBrowser", () -> patchBlockableEventLoopBrowser(args[0], root.resolve(
+                "net/minecraft/util/thread/BlockableEventLoop.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchMacosUtil", () -> patchMacosUtil(
+                args[0], root.resolve("com/mojang/blaze3d/platform/MacosUtil.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchInputConstants", () -> patchInputConstants(
+                args[0], root.resolve("com/mojang/blaze3d/platform/InputConstants.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchMemoryDebug", () -> patchMemoryDebug(args[0], root.resolve(
                 "net/minecraft/client/gui/components/debug/"
-                        + "DebugEntryMemory$AllocationRateCalculator.class"));
+                        + "DebugEntryMemory$AllocationRateCalculator.class")));
         if (isModernProfile(minecraftVersion)) {
-            patchDebugScreenOverlayBrowserNoChunk(args[0], root.resolve(
-                    "net/minecraft/client/gui/components/DebugScreenOverlay.class"));
+            PatchRegistry.run("MinecraftClientPatcher.patchDebugScreenOverlayBrowserNoChunk", () -> patchDebugScreenOverlayBrowserNoChunk(args[0], root.resolve(
+                    "net/minecraft/client/gui/components/DebugScreenOverlay.class")));
         }
-        patchMainBrowserStorageMount(args[0], root.resolve("net/minecraft/client/main/Main.class"));
-        patchMinecraft(args[0], root);
-        patchWorldStemBrowserSave(args[0], root.resolve(
-                "net/minecraft/server/WorldStem.class"));
-        patchCommandEncoderLegacyTextureUpload(args[0], root.resolve(
-                "com/mojang/blaze3d/systems/CommandEncoder.class"));
+        PatchRegistry.run("MinecraftClientPatcher.patchMainBrowserStorageMount", () -> patchMainBrowserStorageMount(args[0], root.resolve("net/minecraft/client/main/Main.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchMinecraft", () -> patchMinecraft(args[0], root));
+        PatchRegistry.run("MinecraftClientPatcher.patchWorldStemBrowserSave", () -> patchWorldStemBrowserSave(args[0], root.resolve(
+                "net/minecraft/server/WorldStem.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchCommandEncoderLegacyTextureUpload", () -> patchCommandEncoderLegacyTextureUpload(args[0], root.resolve(
+                "com/mojang/blaze3d/systems/CommandEncoder.class")));
         // Keep Minecraft's LoadingOverlay for in-game resource reloads.
         // The launcher HTML owns only the first-start branded shell.
-        patchPauseScreenBrowserSingleplayer(args[0], root.resolve(
-                "net/minecraft/client/gui/screens/PauseScreen.class"));
-        patchOptionsBrowserLowSimulationDistance(args[0], root.resolve(
-                "net/minecraft/client/Options.class"));
+        PatchRegistry.run("MinecraftClientPatcher.patchPauseScreenBrowserSingleplayer", () -> patchPauseScreenBrowserSingleplayer(args[0], root.resolve(
+                "net/minecraft/client/gui/screens/PauseScreen.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchOptionsBrowserLowSimulationDistance", () -> patchOptionsBrowserLowSimulationDistance(args[0], root.resolve(
+                "net/minecraft/client/Options.class")));
         if (isModernProfile(minecraftVersion)) {
-            patchTextureUtilBrowserSolidify(args[0], root.resolve(
-                    "com/mojang/blaze3d/platform/TextureUtil.class"));
-            patchTextureAtlasBrowserReleaseStaticImages(args[0], root);
+            PatchRegistry.run("MinecraftClientPatcher.patchTextureUtilBrowserSolidify", () -> patchTextureUtilBrowserSolidify(args[0], root.resolve(
+                    "com/mojang/blaze3d/platform/TextureUtil.class")));
+            PatchRegistry.run("MinecraftClientPatcher.patchTextureAtlasBrowserReleaseStaticImages", () -> patchTextureAtlasBrowserReleaseStaticImages(args[0], root));
         }
-        patchBrowserInputCallbacks(args[0], root);
-        patchGuiGraphicsBrowserItemCache(args[0], root);
-        patchGuiRenderTelemetry(args[0], root);
-        patchDynamicUniformsBrowserInitialCapacity(args[0], root.resolve(
-                "net/minecraft/client/renderer/DynamicUniforms.class"));
-        patchFreeTypeUtil(args[0], root.resolve(
-                "net/minecraft/client/gui/font/providers/FreeTypeUtil.class"));
-        patchDebugMemoryUntracker(args[0], root.resolve(
-                "com/mojang/blaze3d/platform/DebugMemoryUntracker.class"));
-        patchMinecraftServer(args[0], root.resolve(
-                "net/minecraft/server/MinecraftServer.class"));
-        patchMobBrowserAiCooperation(args[0], root.resolve(
-                "net/minecraft/world/entity/Mob.class"));
-        patchChunkMapBrowserInitialViewDistance(args[0], root.resolve(
-                "net/minecraft/server/level/ChunkMap.class"));
-        patchChunkTaskPriorityQueueBrowserNearestFirst(args[0], root.resolve(
-                "net/minecraft/server/level/ChunkTaskPriorityQueue.class"));
-        patchPlayerSpawnFinderBrowser(args[0], root.resolve(
-                "net/minecraft/server/level/PlayerSpawnFinder.class"));
-        patchPrepareSpawnTaskBrowser(args[0], root);
-        patchStructureTemplateManagerBrowserGzip(args[0], root);
-        patchServerCommonPacketListenerBrowserWorker(args[0], root.resolve(
-                "net/minecraft/server/network/ServerCommonPacketListenerImpl.class"));
-        patchServerGamePacketListenerBrowserWorker(args[0], root.resolve(
-                "net/minecraft/server/network/ServerGamePacketListenerImpl.class"));
-        patchPlayerChunkSenderBrowserWorker(args[0], root.resolve(
+        PatchRegistry.run("MinecraftClientPatcher.patchBrowserInputCallbacks", () -> patchBrowserInputCallbacks(args[0], root));
+        PatchRegistry.run("MinecraftClientPatcher.patchGuiGraphicsBrowserItemCache", () -> patchGuiGraphicsBrowserItemCache(args[0], root));
+        PatchRegistry.run("MinecraftClientPatcher.patchGuiRenderTelemetry", () -> patchGuiRenderTelemetry(args[0], root));
+        PatchRegistry.run("MinecraftClientPatcher.patchDynamicUniformsBrowserInitialCapacity", () -> patchDynamicUniformsBrowserInitialCapacity(args[0], root.resolve(
+                "net/minecraft/client/renderer/DynamicUniforms.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchFreeTypeUtil", () -> patchFreeTypeUtil(args[0], root.resolve(
+                "net/minecraft/client/gui/font/providers/FreeTypeUtil.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchDebugMemoryUntracker", () -> patchDebugMemoryUntracker(args[0], root.resolve(
+                "com/mojang/blaze3d/platform/DebugMemoryUntracker.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchMinecraftServer", () -> patchMinecraftServer(args[0], root.resolve(
+                "net/minecraft/server/MinecraftServer.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchMobBrowserAiCooperation", () -> patchMobBrowserAiCooperation(args[0], root.resolve(
+                "net/minecraft/world/entity/Mob.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchChunkMapBrowserInitialViewDistance", () -> patchChunkMapBrowserInitialViewDistance(args[0], root.resolve(
+                "net/minecraft/server/level/ChunkMap.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchChunkTaskPriorityQueueBrowserNearestFirst", () -> patchChunkTaskPriorityQueueBrowserNearestFirst(args[0], root.resolve(
+                "net/minecraft/server/level/ChunkTaskPriorityQueue.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchPlayerSpawnFinderBrowser", () -> patchPlayerSpawnFinderBrowser(args[0], root.resolve(
+                "net/minecraft/server/level/PlayerSpawnFinder.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchPrepareSpawnTaskBrowser", () -> patchPrepareSpawnTaskBrowser(args[0], root));
+        PatchRegistry.run("MinecraftClientPatcher.patchStructureTemplateManagerBrowserGzip", () -> patchStructureTemplateManagerBrowserGzip(args[0], root));
+        PatchRegistry.run("MinecraftClientPatcher.patchServerCommonPacketListenerBrowserWorker", () -> patchServerCommonPacketListenerBrowserWorker(args[0], root.resolve(
+                "net/minecraft/server/network/ServerCommonPacketListenerImpl.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchServerGamePacketListenerBrowserWorker", () -> patchServerGamePacketListenerBrowserWorker(args[0], root.resolve(
+                "net/minecraft/server/network/ServerGamePacketListenerImpl.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchPlayerChunkSenderBrowserWorker", () -> patchPlayerChunkSenderBrowserWorker(args[0], root.resolve(
                 "net/minecraft/server/network/PlayerChunkSender.class"),
-                isModernProfile(minecraftVersion));
-        patchServerPlayerGameModeBrowserWorker(args[0], root.resolve(
-                "net/minecraft/server/level/ServerPlayerGameMode.class"));
-        patchChunkGeneratorStructureStateBrowserFastRings(args[0], root.resolve(
-                "net/minecraft/world/level/chunk/ChunkGeneratorStructureState.class"));
-        patchBlockPosBrowserPackedCoordinates(args[0], root.resolve(
-                "net/minecraft/core/BlockPos.class"));
-        patchBiomeManagerBrowserNearestCorner(args[0], root.resolve(
-                "net/minecraft/world/level/biome/BiomeManager.class"));
-        patchAquiferBrowserNearestCenters(args[0], root.resolve(
-                "net/minecraft/world/level/levelgen/Aquifer$NoiseBasedAquifer.class"));
-        patchBeardifierBrowserPackedCompute(args[0], root.resolve(
-                "net/minecraft/world/level/levelgen/Beardifier.class"));
-        patchImprovedNoiseBrowserHotPath(args[0], root.resolve(
-                "net/minecraft/world/level/levelgen/synth/ImprovedNoise.class"));
-        patchPerlinNoiseBrowserDoubleWrap(args[0], root.resolve(
-                "net/minecraft/world/level/levelgen/synth/PerlinNoise.class"));
+                isModernProfile(minecraftVersion)));
+        PatchRegistry.run("MinecraftClientPatcher.patchServerPlayerGameModeBrowserWorker", () -> patchServerPlayerGameModeBrowserWorker(args[0], root.resolve(
+                "net/minecraft/server/level/ServerPlayerGameMode.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchChunkGeneratorStructureStateBrowserFastRings", () -> patchChunkGeneratorStructureStateBrowserFastRings(args[0], root.resolve(
+                "net/minecraft/world/level/chunk/ChunkGeneratorStructureState.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchBlockPosBrowserPackedCoordinates", () -> patchBlockPosBrowserPackedCoordinates(args[0], root.resolve(
+                "net/minecraft/core/BlockPos.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchBiomeManagerBrowserNearestCorner", () -> patchBiomeManagerBrowserNearestCorner(args[0], root.resolve(
+                "net/minecraft/world/level/biome/BiomeManager.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchAquiferBrowserNearestCenters", () -> patchAquiferBrowserNearestCenters(args[0], root.resolve(
+                "net/minecraft/world/level/levelgen/Aquifer$NoiseBasedAquifer.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchBeardifierBrowserPackedCompute", () -> patchBeardifierBrowserPackedCompute(args[0], root.resolve(
+                "net/minecraft/world/level/levelgen/Beardifier.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchImprovedNoiseBrowserHotPath", () -> patchImprovedNoiseBrowserHotPath(args[0], root.resolve(
+                "net/minecraft/world/level/levelgen/synth/ImprovedNoise.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchPerlinNoiseBrowserDoubleWrap", () -> patchPerlinNoiseBrowserDoubleWrap(args[0], root.resolve(
+                "net/minecraft/world/level/levelgen/synth/PerlinNoise.class")));
         boolean deepWorldgenCheckpoints = isModernProfile(minecraftVersion);
-        patchNoiseBasedChunkGeneratorBrowserSynchronous(args[0], root.resolve(
+        PatchRegistry.run("MinecraftClientPatcher.patchNoiseBasedChunkGeneratorBrowserSynchronous", () -> patchNoiseBasedChunkGeneratorBrowserSynchronous(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/NoiseBasedChunkGenerator.class"),
-                deepWorldgenCheckpoints);
-        patchNoiseChunkBrowserSynchronous(args[0], root.resolve(
-                "net/minecraft/world/level/levelgen/NoiseChunk.class"));
-        patchNoiseInterpolatorBrowserLerp(args[0], root.resolve(
-                "net/minecraft/world/level/levelgen/NoiseChunk$NoiseInterpolator.class"));
-        patchNoiseChunkContextBrowserIntCounters(args[0], root.resolve(
-                "net/minecraft/world/level/levelgen/NoiseChunk$1.class"));
-        patchNoiseChunkCacheOnceBrowserIntCounters(args[0], root.resolve(
-                "net/minecraft/world/level/levelgen/NoiseChunk$CacheOnce.class"));
-        patchDensityFunctionsPureTransformersBrowserDirect(args[0], root);
-        patchWorldgenRecordHashCodeCaches(args[0], root);
-        patchClimateRTreeBrowserSynchronous(args[0], root.resolve(
+                deepWorldgenCheckpoints));
+        PatchRegistry.run("MinecraftClientPatcher.patchNoiseChunkBrowserSynchronous", () -> patchNoiseChunkBrowserSynchronous(args[0], root.resolve(
+                "net/minecraft/world/level/levelgen/NoiseChunk.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchNoiseInterpolatorBrowserLerp", () -> patchNoiseInterpolatorBrowserLerp(args[0], root.resolve(
+                "net/minecraft/world/level/levelgen/NoiseChunk$NoiseInterpolator.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchNoiseChunkContextBrowserIntCounters", () -> patchNoiseChunkContextBrowserIntCounters(args[0], root.resolve(
+                "net/minecraft/world/level/levelgen/NoiseChunk$1.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchNoiseChunkCacheOnceBrowserIntCounters", () -> patchNoiseChunkCacheOnceBrowserIntCounters(args[0], root.resolve(
+                "net/minecraft/world/level/levelgen/NoiseChunk$CacheOnce.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchDensityFunctionsPureTransformersBrowserDirect", () -> patchDensityFunctionsPureTransformersBrowserDirect(args[0], root));
+        PatchRegistry.run("MinecraftClientPatcher.patchWorldgenRecordHashCodeCaches", () -> patchWorldgenRecordHashCodeCaches(args[0], root));
+        PatchRegistry.run("MinecraftClientPatcher.patchClimateRTreeBrowserSynchronous", () -> patchClimateRTreeBrowserSynchronous(args[0], root.resolve(
                 "net/minecraft/world/level/biome/Climate$RTree$SubTree.class"),
-                deepWorldgenCheckpoints);
-        patchClimateRTreeNodeBrowserDoubleDistance(args[0], root.resolve(
-                "net/minecraft/world/level/biome/Climate$RTree$Node.class"));
-        patchSurfaceSystemBrowserSynchronous(args[0], root.resolve(
+                deepWorldgenCheckpoints));
+        PatchRegistry.run("MinecraftClientPatcher.patchClimateRTreeNodeBrowserDoubleDistance", () -> patchClimateRTreeNodeBrowserDoubleDistance(args[0], root.resolve(
+                "net/minecraft/world/level/biome/Climate$RTree$Node.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchSurfaceSystemBrowserSynchronous", () -> patchSurfaceSystemBrowserSynchronous(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/SurfaceSystem.class"),
-                deepWorldgenCheckpoints);
-        patchSurfaceRulesContextBrowserReusableBiomeSupplier(args[0], root.resolve(
-                "net/minecraft/world/level/levelgen/SurfaceRules$Context.class"));
-        patchSurfaceRulesLazyConditionBrowserPrimitiveCache(args[0], root);
-        patchSurfaceRulesSequenceBrowserIndexed(args[0], root.resolve(
-                "net/minecraft/world/level/levelgen/SurfaceRules$SequenceRule.class"));
-        patchChunkGeneratorBrowserSynchronous(args[0], root.resolve(
+                deepWorldgenCheckpoints));
+        PatchRegistry.run("MinecraftClientPatcher.patchSurfaceRulesContextBrowserReusableBiomeSupplier", () -> patchSurfaceRulesContextBrowserReusableBiomeSupplier(args[0], root.resolve(
+                "net/minecraft/world/level/levelgen/SurfaceRules$Context.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchSurfaceRulesLazyConditionBrowserPrimitiveCache", () -> patchSurfaceRulesLazyConditionBrowserPrimitiveCache(args[0], root));
+        PatchRegistry.run("MinecraftClientPatcher.patchSurfaceRulesSequenceBrowserIndexed", () -> patchSurfaceRulesSequenceBrowserIndexed(args[0], root.resolve(
+                "net/minecraft/world/level/levelgen/SurfaceRules$SequenceRule.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchChunkGeneratorBrowserSynchronous", () -> patchChunkGeneratorBrowserSynchronous(args[0], root.resolve(
                 "net/minecraft/world/level/chunk/ChunkGenerator.class"),
-                deepWorldgenCheckpoints);
+                deepWorldgenCheckpoints));
         if (deepWorldgenCheckpoints) {
-            patchJigsawPlacementBrowserDeepCheckpoints(args[0], root.resolve(
-                    "net/minecraft/world/level/levelgen/structure/pools/JigsawPlacement$Placer.class"));
+            PatchRegistry.run("MinecraftClientPatcher.patchJigsawPlacementBrowserDeepCheckpoints", () -> patchJigsawPlacementBrowserDeepCheckpoints(args[0], root.resolve(
+                    "net/minecraft/world/level/levelgen/structure/pools/JigsawPlacement$Placer.class")));
         }
-        patchWorldCarverBrowserSynchronous(args[0], root.resolve(
+        PatchRegistry.run("MinecraftClientPatcher.patchWorldCarverBrowserSynchronous", () -> patchWorldCarverBrowserSynchronous(args[0], root.resolve(
                 "net/minecraft/world/level/levelgen/carver/WorldCarver.class"),
-                deepWorldgenCheckpoints);
-        patchLightEngineBrowserSynchronous(args[0], root.resolve(
+                deepWorldgenCheckpoints));
+        PatchRegistry.run("MinecraftClientPatcher.patchLightEngineBrowserSynchronous", () -> patchLightEngineBrowserSynchronous(args[0], root.resolve(
                 "net/minecraft/world/level/lighting/LightEngine.class"),
-                deepWorldgenCheckpoints);
-        patchLevelChunkSectionBrowserSynchronous(args[0], root.resolve(
+                deepWorldgenCheckpoints));
+        PatchRegistry.run("MinecraftClientPatcher.patchLevelChunkSectionBrowserSynchronous", () -> patchLevelChunkSectionBrowserSynchronous(args[0], root.resolve(
                 "net/minecraft/world/level/chunk/LevelChunkSection.class"),
-                deepWorldgenCheckpoints);
-        patchFriendlyByteBufBrowserLongArray(args[0], root.resolve(
-                "net/minecraft/network/FriendlyByteBuf.class"));
-        patchSimpleBitStorageBrowserUnpack(args[0], root.resolve(
-                "net/minecraft/util/SimpleBitStorage.class"));
-        patchProtoChunkBrowserHeightmapCache(args[0], root.resolve(
-                "net/minecraft/world/level/chunk/ProtoChunk.class"));
-        patchHeightmapBrowserStorage(args[0], root.resolve(
-                "net/minecraft/world/level/levelgen/Heightmap.class"));
-        patchBufferBuilderBrowserFastVertex(args[0], root.resolve(
-                "com/mojang/blaze3d/vertex/BufferBuilder.class"));
-        patchByteBufferBuilderBrowserReserve(args[0], root.resolve(
-                "com/mojang/blaze3d/vertex/ByteBufferBuilder.class"));
-        patchCompiledSectionMeshBrowserVertexBufferReuse(args[0], root.resolve(
-                "net/minecraft/client/renderer/chunk/CompiledSectionMesh.class"));
-        patchRegionFileVersionBrowserNoCompression(args[0], root.resolve(
-                "net/minecraft/world/level/chunk/storage/RegionFileVersion.class"));
-        patchPersistentEntityUuidBrowserRecovery(args[0], root.resolve(
-                "net/minecraft/world/level/entity/PersistentEntitySectionManager.class"));
-        patchNaturalSpawnerGenerationSpawnTelemetry(args[0], root.resolve(
-                "net/minecraft/world/level/NaturalSpawner.class"), minecraftVersion);
+                deepWorldgenCheckpoints));
+        PatchRegistry.run("MinecraftClientPatcher.patchFriendlyByteBufBrowserLongArray", () -> patchFriendlyByteBufBrowserLongArray(args[0], root.resolve(
+                "net/minecraft/network/FriendlyByteBuf.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchSimpleBitStorageBrowserUnpack", () -> patchSimpleBitStorageBrowserUnpack(args[0], root.resolve(
+                "net/minecraft/util/SimpleBitStorage.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchProtoChunkBrowserHeightmapCache", () -> patchProtoChunkBrowserHeightmapCache(args[0], root.resolve(
+                "net/minecraft/world/level/chunk/ProtoChunk.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchHeightmapBrowserStorage", () -> patchHeightmapBrowserStorage(args[0], root.resolve(
+                "net/minecraft/world/level/levelgen/Heightmap.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchBufferBuilderBrowserFastVertex", () -> patchBufferBuilderBrowserFastVertex(args[0], root.resolve(
+                "com/mojang/blaze3d/vertex/BufferBuilder.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchByteBufferBuilderBrowserReserve", () -> patchByteBufferBuilderBrowserReserve(args[0], root.resolve(
+                "com/mojang/blaze3d/vertex/ByteBufferBuilder.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchCompiledSectionMeshBrowserVertexBufferReuse", () -> patchCompiledSectionMeshBrowserVertexBufferReuse(args[0], root.resolve(
+                "net/minecraft/client/renderer/chunk/CompiledSectionMesh.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchRegionFileVersionBrowserNoCompression", () -> patchRegionFileVersionBrowserNoCompression(args[0], root.resolve(
+                "net/minecraft/world/level/chunk/storage/RegionFileVersion.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchPersistentEntityUuidBrowserRecovery", () -> patchPersistentEntityUuidBrowserRecovery(args[0], root.resolve(
+                "net/minecraft/world/level/entity/PersistentEntitySectionManager.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchNaturalSpawnerGenerationSpawnTelemetry", () -> patchNaturalSpawnerGenerationSpawnTelemetry(args[0], root.resolve(
+                "net/minecraft/world/level/NaturalSpawner.class"), minecraftVersion));
         // Preserve both vanilla generation-time creature packs and per-tick
         // spawning, including the hostile-mob gamerule filter.
-        patchChaseClient(args[0], root.resolve(
-                "net/minecraft/server/chase/ChaseClient.class"));
-        patchLanServerPinger(args[0], root.resolve(
-                "net/minecraft/client/server/LanServerPinger.class"));
-        patchHttpUtil(args[0], root.resolve("net/minecraft/util/HttpUtil.class"));
-        patchDownloadQueueBrowser(args[0], root.resolve(
-                "net/minecraft/server/packs/DownloadQueue.class"));
-        patchSkinTextureDownloader(args[0], root.resolve(
-                "net/minecraft/client/renderer/texture/SkinTextureDownloader.class"));
-        patchSkinManagerUploadedSkinSecurity(args[0], root.resolve(
-                "net/minecraft/client/resources/SkinManager.class"));
-        patchUtilJarFileSystem(args[0], root.resolve("net/minecraft/util/Util.class"));
-        patchUtilRunNamedBrowserOutput(root.resolve("net/minecraft/util/Util.class"));
-        patchUtilBlockUntilDoneBrowserOutput(root.resolve("net/minecraft/util/Util.class"));
-        patchResourceKeyRegistryRoot(args[0], root.resolve("net/minecraft/resources/ResourceKey.class"));
-        patchVanillaPackResourcesBuilder(args[0], root.resolve(
-                "net/minecraft/server/packs/VanillaPackResourcesBuilder.class"));
-        patchFilePackResourcesBrowserAtlasOverlays(args[0], root.resolve(
-                "net/minecraft/server/packs/FilePackResources$FileResourcesSupplier.class"));
-        patchFilePackResourcesBrowserIndex(args[0], root);
-        patchSingleFileBrowserAtlasFallback(args[0], root.resolve(
-                "net/minecraft/client/renderer/texture/atlas/sources/SingleFile.class"));
-        patchIndexedAssetSourceBrowserNoop(args[0], root.resolve(
-                "net/minecraft/client/resources/IndexedAssetSource.class"));
-        patchLocalTimeItemModelProperty(args[0], root.resolve(
-                "net/minecraft/client/renderer/item/properties/select/LocalTime.class"));
-        patchLanServerDetector(args[0], root.resolve(
-                "net/minecraft/client/server/LanServerDetection$LanServerDetector.class"));
-        patchPackWatcher(args[0], root.resolve(
-                "net/minecraft/client/gui/screens/packs/PackSelectionScreen$Watcher.class"));
-        patchChaseServer(args[0], root.resolve(
-                "net/minecraft/server/chase/ChaseServer.class"));
-        patchOpenUri(args[0], root.resolve("net/minecraft/util/Util$OS.class"));
-        patchRealmsNetwork(args[0], root);
-        patchReflectivePatternArray(args[0], root.resolve(
-                "net/minecraft/world/level/block/state/pattern/BlockPatternBuilder.class"));
-        patchChunkPosSpliterator(args[0], root.resolve(
-                "net/minecraft/world/level/ChunkPos$2.class"));
-        patchDetectedVersion(
-                args[0], root.resolve("net/minecraft/DetectedVersion.class"), minecraftVersion);
-        patchSingleplayerCrypto(args[0], root);
-        patchSingleplayerLogin(args[0], root.resolve(
-                "net/minecraft/server/network/ServerLoginPacketListenerImpl.class"));
-        patchChatSigning(args[0], root);
-        patchMultiplayerExecutor(args[0], root.resolve(
+        PatchRegistry.run("MinecraftClientPatcher.patchChaseClient", () -> patchChaseClient(args[0], root.resolve(
+                "net/minecraft/server/chase/ChaseClient.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchLanServerPinger", () -> patchLanServerPinger(args[0], root.resolve(
+                "net/minecraft/client/server/LanServerPinger.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchHttpUtil", () -> patchHttpUtil(args[0], root.resolve("net/minecraft/util/HttpUtil.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchDownloadQueueBrowser", () -> patchDownloadQueueBrowser(args[0], root.resolve(
+                "net/minecraft/server/packs/DownloadQueue.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchSkinTextureDownloader", () -> patchSkinTextureDownloader(args[0], root.resolve(
+                "net/minecraft/client/renderer/texture/SkinTextureDownloader.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchSkinManagerUploadedSkinSecurity", () -> patchSkinManagerUploadedSkinSecurity(args[0], root.resolve(
+                "net/minecraft/client/resources/SkinManager.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchUtilJarFileSystem", () -> patchUtilJarFileSystem(args[0], root.resolve("net/minecraft/util/Util.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchUtilRunNamedBrowserOutput", () -> patchUtilRunNamedBrowserOutput(root.resolve("net/minecraft/util/Util.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchUtilBlockUntilDoneBrowserOutput", () -> patchUtilBlockUntilDoneBrowserOutput(root.resolve("net/minecraft/util/Util.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchResourceKeyRegistryRoot", () -> patchResourceKeyRegistryRoot(args[0], root.resolve("net/minecraft/resources/ResourceKey.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchVanillaPackResourcesBuilder", () -> patchVanillaPackResourcesBuilder(args[0], root.resolve(
+                "net/minecraft/server/packs/VanillaPackResourcesBuilder.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchFilePackResourcesBrowserAtlasOverlays", () -> patchFilePackResourcesBrowserAtlasOverlays(args[0], root.resolve(
+                "net/minecraft/server/packs/FilePackResources$FileResourcesSupplier.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchFilePackResourcesBrowserIndex", () -> patchFilePackResourcesBrowserIndex(args[0], root));
+        PatchRegistry.run("MinecraftClientPatcher.patchSingleFileBrowserAtlasFallback", () -> patchSingleFileBrowserAtlasFallback(args[0], root.resolve(
+                "net/minecraft/client/renderer/texture/atlas/sources/SingleFile.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchIndexedAssetSourceBrowserNoop", () -> patchIndexedAssetSourceBrowserNoop(args[0], root.resolve(
+                "net/minecraft/client/resources/IndexedAssetSource.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchLocalTimeItemModelProperty", () -> patchLocalTimeItemModelProperty(args[0], root.resolve(
+                "net/minecraft/client/renderer/item/properties/select/LocalTime.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchLanServerDetector", () -> patchLanServerDetector(args[0], root.resolve(
+                "net/minecraft/client/server/LanServerDetection$LanServerDetector.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchPackWatcher", () -> patchPackWatcher(args[0], root.resolve(
+                "net/minecraft/client/gui/screens/packs/PackSelectionScreen$Watcher.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchChaseServer", () -> patchChaseServer(args[0], root.resolve(
+                "net/minecraft/server/chase/ChaseServer.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchOpenUri", () -> patchOpenUri(args[0], root.resolve("net/minecraft/util/Util$OS.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchRealmsNetwork", () -> patchRealmsNetwork(args[0], root));
+        PatchRegistry.run("MinecraftClientPatcher.patchReflectivePatternArray", () -> patchReflectivePatternArray(args[0], root.resolve(
+                "net/minecraft/world/level/block/state/pattern/BlockPatternBuilder.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchChunkPosSpliterator", () -> patchChunkPosSpliterator(args[0], root.resolve(
+                "net/minecraft/world/level/ChunkPos$2.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchDetectedVersion", () -> patchDetectedVersion(
+                args[0], root.resolve("net/minecraft/DetectedVersion.class"), minecraftVersion));
+        PatchRegistry.run("MinecraftClientPatcher.patchSingleplayerCrypto", () -> patchSingleplayerCrypto(args[0], root));
+        PatchRegistry.run("MinecraftClientPatcher.patchSingleplayerLogin", () -> patchSingleplayerLogin(args[0], root.resolve(
+                "net/minecraft/server/network/ServerLoginPacketListenerImpl.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchChatSigning", () -> patchChatSigning(args[0], root));
+        PatchRegistry.run("MinecraftClientPatcher.patchMultiplayerExecutor", () -> patchMultiplayerExecutor(args[0], root.resolve(
                 "net/minecraft/client/gui/screens/multiplayer/"
-                        + "ServerSelectionList$OnlineServerEntry.class"));
-        patchClientShutdownWatchdog(args[0], root.resolve(
-                "com/mojang/blaze3d/platform/ClientShutdownWatchdog.class"));
-        patchScreenBrowserFastMenus(args[0], root.resolve(
-                "net/minecraft/client/gui/screens/Screen.class"));
+                        + "ServerSelectionList$OnlineServerEntry.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchClientShutdownWatchdog", () -> patchClientShutdownWatchdog(args[0], root.resolve(
+                "com/mojang/blaze3d/platform/ClientShutdownWatchdog.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchScreenBrowserFastMenus", () -> patchScreenBrowserFastMenus(args[0], root.resolve(
+                "net/minecraft/client/gui/screens/Screen.class")));
         // Keep the actual resource-reload completion path intact while hiding
         // only the foreground LoadingOverlay once a joined world is live.
         // This is required for both the legacy mapped 1.21.11 profile and the
         // current named 26.2 profile; the helper is deliberately separate
         // from Minecraft#getOverlay so reload exceptions still reach vanilla.
-        patchLoadingOverlayBrowserForeground(args[0], root.resolve(
-                "net/minecraft/client/gui/screens/LoadingOverlay.class"));
-        patchLevelLoadingScreenBrowserFastProgress(args[0], root.resolve(
-                "net/minecraft/client/gui/screens/LevelLoadingScreen.class"));
-        patchTitleScreenBrowserFastMenus(args[0], root.resolve(
-                "net/minecraft/client/gui/screens/TitleScreen.class"));
-        patchAbstractButtonBrowserFastSprite(args[0], root.resolve(
-                "net/minecraft/client/gui/components/AbstractButton.class"));
-        patchCreateWorldScreenBrowserDefaults(args[0], root.resolve(
-                "net/minecraft/client/gui/screens/worldselection/CreateWorldScreen.class"));
-        patchWorldSelectionListTelemetry(args[0], root.resolve(
-                "net/minecraft/client/gui/screens/worldselection/WorldSelectionList.class"));
-        patchBrowserAudio(args[0], root.resolve(
-                "com/mojang/blaze3d/audio/Library.class"));
-        patchBrowserAudioListener(args[0], root.resolve(
-                "com/mojang/blaze3d/audio/Listener.class"));
-        patchGlslPreprocessor(args[0], root.resolve(
-                "com/mojang/blaze3d/preprocessor/GlslPreprocessor.class"));
+        PatchRegistry.run("MinecraftClientPatcher.patchLoadingOverlayBrowserForeground", () -> patchLoadingOverlayBrowserForeground(args[0], root.resolve(
+                "net/minecraft/client/gui/screens/LoadingOverlay.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchLevelLoadingScreenBrowserFastProgress", () -> patchLevelLoadingScreenBrowserFastProgress(args[0], root.resolve(
+                "net/minecraft/client/gui/screens/LevelLoadingScreen.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchTitleScreenBrowserFastMenus", () -> patchTitleScreenBrowserFastMenus(args[0], root.resolve(
+                "net/minecraft/client/gui/screens/TitleScreen.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchAbstractButtonBrowserFastSprite", () -> patchAbstractButtonBrowserFastSprite(args[0], root.resolve(
+                "net/minecraft/client/gui/components/AbstractButton.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchCreateWorldScreenBrowserDefaults", () -> patchCreateWorldScreenBrowserDefaults(args[0], root.resolve(
+                "net/minecraft/client/gui/screens/worldselection/CreateWorldScreen.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchWorldSelectionListTelemetry", () -> patchWorldSelectionListTelemetry(args[0], root.resolve(
+                "net/minecraft/client/gui/screens/worldselection/WorldSelectionList.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchBrowserAudio", () -> patchBrowserAudio(args[0], root.resolve(
+                "com/mojang/blaze3d/audio/Library.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchBrowserAudioListener", () -> patchBrowserAudioListener(args[0], root.resolve(
+                "com/mojang/blaze3d/audio/Listener.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchGlslPreprocessor", () -> patchGlslPreprocessor(args[0], root.resolve(
+                "com/mojang/blaze3d/preprocessor/GlslPreprocessor.class")));
         if (isModernProfile(minecraftVersion)) {
-            patchMappableRingBufferTelemetry(args[0], root.resolve(
-                    "net/minecraft/client/renderer/MappableRingBuffer.class"));
-            patchStagedVertexBufferGpuPoolCache(args[0], root.resolve(
-                    "net/minecraft/client/renderer/StagedVertexBuffer$GpuBufferPool.class"));
-            patchInventoryAvatarRenderTelemetry(args[0], root);
-            patchGuiEntitySubmitTelemetry(args[0], root.resolve(
-                    "net/minecraft/client/gui/GuiGraphicsExtractor.class"));
+            PatchRegistry.run("MinecraftClientPatcher.patchMappableRingBufferTelemetry", () -> patchMappableRingBufferTelemetry(args[0], root.resolve(
+                    "net/minecraft/client/renderer/MappableRingBuffer.class")));
+            PatchRegistry.run("MinecraftClientPatcher.patchStagedVertexBufferGpuPoolCache", () -> patchStagedVertexBufferGpuPoolCache(args[0], root.resolve(
+                    "net/minecraft/client/renderer/StagedVertexBuffer$GpuBufferPool.class")));
+            PatchRegistry.run("MinecraftClientPatcher.patchInventoryAvatarRenderTelemetry", () -> patchInventoryAvatarRenderTelemetry(args[0], root));
+            PatchRegistry.run("MinecraftClientPatcher.patchGuiEntitySubmitTelemetry", () -> patchGuiEntitySubmitTelemetry(args[0], root.resolve(
+                    "net/minecraft/client/gui/GuiGraphicsExtractor.class")));
         }
-        patchGlDevice(args[0], root);
-        patchGlConstWebGLTextureFormats(args[0], root.resolve(
-                "com/mojang/blaze3d/opengl/GlConst.class"));
-        patchTextureFormatWebGLColorAspect(args[0], root);
-        patchGlStateManagerTextureBinding(args[0], root.resolve(
-                "com/mojang/blaze3d/opengl/GlStateManager.class"));
-        patchGlRenderPipelineDrawMetadata(args[0], root.resolve(
-                "com/mojang/blaze3d/opengl/GlRenderPipeline.class"));
-        patchGlCommandEncoder(args[0], root);
-        patchGameRendererBrowserAutoScreenshot(args[0], root.resolve(
-                "net/minecraft/client/renderer/GameRenderer.class"));
-        patchParticleGroupBrowserTickSafety(args[0], root.resolve(
-                "net/minecraft/client/particle/ParticleGroup.class"));
-        patchClientLevelBrowserBlockBreakEffects(args[0], root.resolve(
-                "net/minecraft/client/multiplayer/ClientLevel.class"));
-        patchMultiPlayerGameModeBrowserHitSound(args[0], root.resolve(
-                "net/minecraft/client/multiplayer/MultiPlayerGameMode.class"));
+        PatchRegistry.run("MinecraftClientPatcher.patchGlDevice", () -> patchGlDevice(args[0], root));
+        PatchRegistry.run("MinecraftClientPatcher.patchGlConstWebGLTextureFormats", () -> patchGlConstWebGLTextureFormats(args[0], root.resolve(
+                "com/mojang/blaze3d/opengl/GlConst.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchTextureFormatWebGLColorAspect", () -> patchTextureFormatWebGLColorAspect(args[0], root));
+        PatchRegistry.run("MinecraftClientPatcher.patchGlStateManagerTextureBinding", () -> patchGlStateManagerTextureBinding(args[0], root.resolve(
+                "com/mojang/blaze3d/opengl/GlStateManager.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchGlRenderPipelineDrawMetadata", () -> patchGlRenderPipelineDrawMetadata(args[0], root.resolve(
+                "com/mojang/blaze3d/opengl/GlRenderPipeline.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchGlCommandEncoder", () -> patchGlCommandEncoder(args[0], root));
+        PatchRegistry.run("MinecraftClientPatcher.patchGameRendererBrowserAutoScreenshot", () -> patchGameRendererBrowserAutoScreenshot(args[0], root.resolve(
+                "net/minecraft/client/renderer/GameRenderer.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchParticleGroupBrowserTickSafety", () -> patchParticleGroupBrowserTickSafety(args[0], root.resolve(
+                "net/minecraft/client/particle/ParticleGroup.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchClientLevelBrowserBlockBreakEffects", () -> patchClientLevelBrowserBlockBreakEffects(args[0], root.resolve(
+                "net/minecraft/client/multiplayer/ClientLevel.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchMultiPlayerGameModeBrowserHitSound", () -> patchMultiPlayerGameModeBrowserHitSound(args[0], root.resolve(
+                "net/minecraft/client/multiplayer/MultiPlayerGameMode.class")));
         if (isModernProfile(minecraftVersion)) {
-            patchLevelRendererBrowserBlockBreakProgress(args[0], root.resolve(
-                    "net/minecraft/client/renderer/LevelRenderer.class"), true);
-            patchSectionOcclusionGraphBrowserMovementRefresh(args[0], root.resolve(
-                    "net/minecraft/client/renderer/SectionOcclusionGraph.class"));
+            PatchRegistry.run("MinecraftClientPatcher.patchLevelRendererBrowserBlockBreakProgress", () -> patchLevelRendererBrowserBlockBreakProgress(args[0], root.resolve(
+                    "net/minecraft/client/renderer/LevelRenderer.class"), true));
+            PatchRegistry.run("MinecraftClientPatcher.patchSectionOcclusionGraphBrowserMovementRefresh", () -> patchSectionOcclusionGraphBrowserMovementRefresh(args[0], root.resolve(
+                    "net/minecraft/client/renderer/SectionOcclusionGraph.class")));
         } else {
-            patchLevelRendererBrowserBlockBreakProgress(args[0], root.resolve(
-                    "net/minecraft/client/renderer/LevelRenderer.class"), false);
+            PatchRegistry.run("MinecraftClientPatcher.patchLevelRendererBrowserBlockBreakProgress", () -> patchLevelRendererBrowserBlockBreakProgress(args[0], root.resolve(
+                    "net/minecraft/client/renderer/LevelRenderer.class"), false));
         }
-        patchCurrentLevelExtractorBrowserSectionCompileThrottle(args[0], root.resolve(
-                "net/minecraft/client/renderer/extract/LevelExtractor.class"));
-        patchEntityRenderDispatcherBrowserNullEntityGuard(args[0], root.resolve(
-                "net/minecraft/client/renderer/entity/EntityRenderDispatcher.class"));
-        patchRenderSectionRegionBrowserDirectSectionCoordinates(args[0], root.resolve(
-                "net/minecraft/client/renderer/chunk/RenderSectionRegion.class"));
-        patchSectionCompilerBrowserDirectRelativeCoordinates(args[0], root.resolve(
-                "net/minecraft/client/renderer/chunk/SectionCompiler.class"));
-        patchSectionNeighborReadiness(args[0], root, minecraftVersion);
-        patchSectionRenderDispatcherBrowserThrottles(args[0], root.resolve(
-                "net/minecraft/client/renderer/chunk/SectionRenderDispatcher.class"));
-        patchCurrentSectionTaskQueueBrowserPriorities(args[0], root.resolve(
-                "net/minecraft/client/renderer/chunk/SectionTaskDynamicQueue.class"));
-        patchUberGpuBufferBrowserTelemetry(args[0], root.resolve(
-                "com/mojang/blaze3d/vertex/UberGpuBuffer.class"));
-        patchFaceBakeryBrowserFloatTolerance(args[0], root);
-        patchLevelLoadTrackerBrowserTimeout(args[0], root);
-        patchClientPacketListenerLoadingDiagnostics(args[0], root.resolve(
-                "net/minecraft/client/multiplayer/ClientPacketListener.class"));
-        patchWorldUnloadTelemetry(args[0], root.resolve(
-                "net/minecraft/client/telemetry/events/WorldUnloadEvent.class"));
-        generateSoundApiStubs(root);
-        generateCryptoApiStubs(root);
-        generateUnsafeStub(root);
+        PatchRegistry.run("MinecraftClientPatcher.patchCurrentLevelExtractorBrowserSectionCompileThrottle", () -> patchCurrentLevelExtractorBrowserSectionCompileThrottle(args[0], root.resolve(
+                "net/minecraft/client/renderer/extract/LevelExtractor.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchEntityRenderDispatcherBrowserNullEntityGuard", () -> patchEntityRenderDispatcherBrowserNullEntityGuard(args[0], root.resolve(
+                "net/minecraft/client/renderer/entity/EntityRenderDispatcher.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchRenderSectionRegionBrowserDirectSectionCoordinates", () -> patchRenderSectionRegionBrowserDirectSectionCoordinates(args[0], root.resolve(
+                "net/minecraft/client/renderer/chunk/RenderSectionRegion.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchSectionCompilerBrowserDirectRelativeCoordinates", () -> patchSectionCompilerBrowserDirectRelativeCoordinates(args[0], root.resolve(
+                "net/minecraft/client/renderer/chunk/SectionCompiler.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchSectionNeighborReadiness", () -> patchSectionNeighborReadiness(args[0], root, minecraftVersion));
+        PatchRegistry.run("MinecraftClientPatcher.patchSectionRenderDispatcherBrowserThrottles", () -> patchSectionRenderDispatcherBrowserThrottles(args[0], root.resolve(
+                "net/minecraft/client/renderer/chunk/SectionRenderDispatcher.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchCurrentSectionTaskQueueBrowserPriorities", () -> patchCurrentSectionTaskQueueBrowserPriorities(args[0], root.resolve(
+                "net/minecraft/client/renderer/chunk/SectionTaskDynamicQueue.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchUberGpuBufferBrowserTelemetry", () -> patchUberGpuBufferBrowserTelemetry(args[0], root.resolve(
+                "com/mojang/blaze3d/vertex/UberGpuBuffer.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchFaceBakeryBrowserFloatTolerance", () -> patchFaceBakeryBrowserFloatTolerance(args[0], root));
+        PatchRegistry.run("MinecraftClientPatcher.patchLevelLoadTrackerBrowserTimeout", () -> patchLevelLoadTrackerBrowserTimeout(args[0], root));
+        PatchRegistry.run("MinecraftClientPatcher.patchClientPacketListenerLoadingDiagnostics", () -> patchClientPacketListenerLoadingDiagnostics(args[0], root.resolve(
+                "net/minecraft/client/multiplayer/ClientPacketListener.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchWorldUnloadTelemetry", () -> patchWorldUnloadTelemetry(args[0], root.resolve(
+                "net/minecraft/client/telemetry/events/WorldUnloadEvent.class")));
+        PatchRegistry.run("MinecraftClientPatcher.generateSoundApiStubs", () -> generateSoundApiStubs(root));
+        PatchRegistry.run("MinecraftClientPatcher.generateCryptoApiStubs", () -> generateCryptoApiStubs(root));
+        PatchRegistry.run("MinecraftClientPatcher.generateUnsafeStub", () -> generateUnsafeStub(root));
+        PatchRegistry.printSummary();
     }
 
     private static void patchOptionsBrowserLowSimulationDistance(String jar, Path output)
