@@ -1,0 +1,10 @@
+# Shared overrides under src/main/java that do not apply to Minecraft 26.3.
+# 1.21.11-era copies whose 26.2 replacements are not carried over:
+#  - VertexArrayCache: com/mojang/blaze3d/opengl/VertexArrayCache no longer exists
+#    (renderpearl backend/opengl/VertexArray replaces it; P3 decides on a port).
+#  - VanillaPackResources: 26.3 VanillaPackResources is no longer a PackResources;
+#    the pack body moved to FixedPathPackResources (P8 writes that override).
+#  - block/model/TextureSlots: 26.x moved TextureSlots to resources/model/sprite.
+com/mojang/blaze3d/opengl/VertexArrayCache.java
+net/minecraft/server/packs/VanillaPackResources.java
+net/minecraft/client/renderer/block/model/TextureSlots.java
