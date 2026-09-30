@@ -96,7 +96,7 @@ public final class LinkGapScanner {
                 byte[] bytes = root.read(name);
                 if (bytes == null) continue;
                 scannedClasses++;
-                new ClassReader(bytes).accept(new SubjectVisitor(), ClassReader.SKIP_FRAMES);
+                reader(bytes).accept(new SubjectVisitor(), ClassReader.SKIP_FRAMES);
             }
         }
     }
@@ -124,10 +124,27 @@ public final class LinkGapScanner {
             return null;
         }
         ClassInfo info = new ClassInfo();
-        new ClassReader(bytes).accept(new InfoVisitor(info), ClassReader.SKIP_CODE
+        reader(bytes).accept(new InfoVisitor(info), ClassReader.SKIP_CODE
                 | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
         classes.put(name, info);
         return info;
+    }
+
+    // ASM 9.8 reads class files up to major 69 (Java 25). The scanner also
+    // reads the running JDK's platform classes, which are newer on a JDK 26
+    // runner (major 70). Only symbolic references are needed, so parse a copy
+    // with the major version lowered to the newest one ASM accepts.
+    private static final int MAX_ASM_MAJOR = 69;
+
+    private static ClassReader reader(byte[] bytes) {
+        int major = ((bytes[6] & 0xff) << 8) | (bytes[7] & 0xff);
+        if (major <= MAX_ASM_MAJOR) {
+            return new ClassReader(bytes);
+        }
+        byte[] copy = bytes.clone();
+        copy[6] = (byte) (MAX_ASM_MAJOR >>> 8);
+        copy[7] = (byte) MAX_ASM_MAJOR;
+        return new ClassReader(copy);
     }
 
     private static byte[] readJdk(String name) {

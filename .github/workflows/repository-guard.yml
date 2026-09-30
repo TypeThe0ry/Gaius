@@ -344,7 +344,7 @@ jobs:
           done
           for profile in 1.21.11 26.2; do
             export GAIUS_VERSION_PROFILE_PATH="versions/${profile}.json"
-            ./port/scripts/fetch-version.sh
+            GAIUS_FETCH_BROWSER_ASSETS=0 ./port/scripts/fetch-version.sh
             ./port/scripts/remap-client.sh
             jar_path="port/work/${profile}/client-named.jar"
             test -s "$jar_path"
@@ -426,7 +426,9 @@ jobs:
           set -euo pipefail
           export GAIUS_JAVA_HOME="$JAVA_HOME"
           export GAIUS_VERSION_PROFILE_PATH=versions/26.3.json
-          ./port/scripts/fetch-version.sh
+          # The profile check and the bring-up overlay build never read the
+          # browser sound/font objects; skip the thousands of CDN downloads.
+          GAIUS_FETCH_BROWSER_ASSETS=0 ./port/scripts/fetch-version.sh
           ./port/scripts/remap-client.sh
           jar_path=port/work/26.3/client-named.jar
           test -s "$jar_path"
@@ -529,7 +531,7 @@ jobs:
           for tool in curl jq unzip zip; do
             command -v "$tool" >/dev/null
           done
-          ./port/scripts/fetch-version.sh
+          GAIUS_FETCH_BROWSER_ASSETS=0 ./port/scripts/fetch-version.sh
           ./port/scripts/remap-client.sh
 
       - name: Build the base commit's 26.2 overlays
