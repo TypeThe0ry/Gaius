@@ -238,6 +238,7 @@ try {
   run(javaTools.javac, [
     "-proc:none",
     "-classpath", asmClasspath,
+    "-sourcepath", path.join(repositoryRoot, "port/tools/src/main/java"),
     "-d", patcherClasses,
     patcherSource,
   ], {stdio: ["ignore", "pipe", "pipe"]});

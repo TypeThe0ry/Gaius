@@ -361,8 +361,11 @@ asm_jar="$maven_repository/org/ow2/asm/asm/$asm_version/asm-$asm_version.jar"
 asm_tree_jar="$maven_repository/org/ow2/asm/asm-tree/$asm_version/asm-tree-$asm_version.jar"
 mkdir -p "$tool_classes"
 find "$tool_classes" -type f -delete
+# -sourcepath lets javac pull in the patchers' sub-packages (for example
+# dev.gaius.tools.m263, called by Minecraft263BrowserPatcher).
 javac --release 21 -proc:none \
   -classpath "$java_asm_jar${java_classpath_separator}$java_asm_tree_jar" \
+  -sourcepath "$root/port/tools/src/main/java" \
   -d "$tool_classes" \
   "$root/port/tools/src/main/java/dev/gaius/tools/"*.java
 

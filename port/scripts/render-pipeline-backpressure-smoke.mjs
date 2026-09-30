@@ -223,6 +223,7 @@ try {
   const patcherClasspath = [asm, asmTree].join(delimiter);
   execFileSync(javaTool("javac"), [
     "--release", "21", "-proc:none", "-classpath", patcherClasspath,
+    "-sourcepath", join(repositoryRoot, "port/tools/src/main/java"),
     "-d", classesDirectory, join(toolsSource, "MinecraftClientPatcher.java"),
   ], {cwd: scriptsDirectory, encoding: "utf8", timeout: 60_000});
   execFileSync(javaTool("java"), [

@@ -105,8 +105,8 @@ try {
   const classes = join(temp, "classes");
   await mkdir(classes, {recursive: true});
   const compileCp = [asm, asmTree, ...selectedProfiles.map((profile) => profile.jar)].join(delimiter);
-  run(javac, ["--release", "21", "-proc:none", "-classpath", compileCp, "-d", classes,
-    patcherSource, helperSource, fixtureSource], {timeout: 60_000});
+  run(javac, ["--release", "21", "-proc:none", "-classpath", compileCp, "-sourcepath", toolsSource,
+    "-d", classes, patcherSource, helperSource, fixtureSource], {timeout: 60_000});
   const results = [];
   for (const profile of selectedProfiles) {
     assert.ok(existsSync(profile.jar), `missing named jar ${profile.jar}`);

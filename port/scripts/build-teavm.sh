@@ -112,6 +112,7 @@ else
   find "$tool_classes" -type f -delete
   javac --release 21 -proc:none \
     -classpath "$tool_compile_classpath" \
+    -sourcepath "$root/port/tools/src/main/java" \
     -d "$tool_classes" \
     "$root/port/tools/src/main/java/dev/gaius/tools/"*.java
 fi

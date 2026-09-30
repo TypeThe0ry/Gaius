@@ -1414,6 +1414,7 @@ try {
   run(javaTools.javac, [
     "--release", "21", "-proc:none",
     "-classpath", asmPatcherClasspath,
+    "-sourcepath", path.join(repositoryRoot, "port/tools/src/main/java"),
     "-d", patcherClasses,
     patcherSource,
   ], {stdio: ["ignore", "pipe", "pipe"]});
