@@ -196,7 +196,10 @@ const versionProfileRelative = nativePath(
   process.env.GAIUS_VERSION_PROFILE_PATH || String(portConfig.versionProfile || ""),
 );
 const profileId = basename(versionProfileRelative.replaceAll("\\", "/"))
-  .replace(/\.json$/, "") || "26.2";
+  .replace(/\.json$/, "");
+if (!profileId) {
+  throw new Error("no version profile: set GAIUS_VERSION_PROFILE_PATH or port/config.json versionProfile");
+}
 const versionProfilePath = isAbsolute(versionProfileRelative)
   ? versionProfileRelative
   : rootDirectory + "port/" + versionProfileRelative;

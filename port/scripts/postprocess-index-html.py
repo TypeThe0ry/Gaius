@@ -979,7 +979,7 @@ def patch_storage_persistence(text: str, profile: dict) -> str:
 def patch_index(
     index: Path,
     classes_js: Path,
-    minecraft_version: str = "1.21.11",
+    minecraft_version: str,
     asset_index_id: str | None = None,
     profile: dict | None = None,
 ) -> bool:
@@ -3128,8 +3128,7 @@ def version_defaults() -> tuple[str, str]:
                 metadata_path = str(root / "port" / "work" / minecraft_version / "version.json")
         except (OSError, ValueError, TypeError, AttributeError):
             minecraft_version = ""
-    if not minecraft_version:
-        minecraft_version = "1.21.11"
+    # No hard-coded fallback: main() refuses to patch without a version.
     if not asset_index_id and metadata_path:
         try:
             metadata = json.loads(native_external_path(metadata_path).read_text(encoding="utf-8"))
@@ -3157,6 +3156,13 @@ def main(argv: list[str]) -> int:
     if len(argv) in (4, 5):
         minecraft_version = argv[3].strip()
         asset_index_id = argv[4].strip() if explicit_asset_index else ""
+    if not minecraft_version:
+        print(
+            "postprocess-index-html.py: cannot determine the Minecraft version; pass it"
+            " or set GAIUS_MINECRAFT_VERSION / GAIUS_VERSION_PROFILE_PATH",
+            file=sys.stderr,
+        )
+        return 2
     try:
         profile = load_profile_for_version(minecraft_version)
     except RuntimeError as error:

@@ -26,7 +26,9 @@ const target = parseTarget(
 // Read the protocol from the selected version profile instead of assuming
 // every non-1.21.11 profile is 26.2 (26.3 speaks protocol 777).
 const profile = (() => {
-    const profilePath = process.env.GAIUS_VERSION_PROFILE_PATH ?? "versions/26.2.json";
+    // Without GAIUS_VERSION_PROFILE_PATH: port/config.json's default profile.
+    const profilePath = process.env.GAIUS_VERSION_PROFILE_PATH
+        ?? JSON.parse(readFileSync(new URL("../config.json", import.meta.url), "utf8")).versionProfile;
     const resolved = new URL(`../${profilePath.replace(/^\.?\//, "")}`, import.meta.url);
     const json = JSON.parse(readFileSync(resolved, "utf8"));
     if (typeof json.id !== "string" || !Number.isInteger(json.protocolVersion)) {

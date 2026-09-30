@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import {spawn} from "node:child_process";
 import {createHash} from "node:crypto";
+import {readFileSync} from "node:fs";
 import {mkdir, mkdtemp, readFile, rm, stat, writeFile} from "node:fs/promises";
 import {createServer} from "node:net";
 import {tmpdir} from "node:os";
@@ -17,7 +18,10 @@ import {summarizeFlightReadiness} from "../../tools/flight-readiness.mjs";
 import {configureWorldSeed} from "../../tools/configure-browser-world-seed.mjs";
 
 const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
-const profilePath = process.env.GAIUS_VERSION_PROFILE_PATH || "port/versions/26.2.json";
+// Without GAIUS_VERSION_PROFILE_PATH the default profile is port/config.json's
+// versionProfile, the one place that switches it.
+const profilePath = process.env.GAIUS_VERSION_PROFILE_PATH
+  || JSON.parse(readFileSync(resolve(root, "port/config.json"), "utf8")).versionProfile;
 const profileId = basename(profilePath).replace(/\.json$/i, "");
 const artifact = resolve(process.env.GAIUS_FILE_ARTIFACT || `port/web/dist/${profileId}/Gaius.html`);
 const mode = String(process.env.GAIUS_FILE_MODE || "single").toLowerCase();

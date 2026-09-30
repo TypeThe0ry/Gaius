@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version="${1:-26.2}"
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 download_client="${2:-}"
 manifest_url="https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 
@@ -11,6 +11,9 @@ for command in curl jq; do
     exit 1
   fi
 done
+
+# Default: the id of port/config.json's versionProfile (the default profile).
+version="${1:-$(jq -er '.versionProfile' "$root/port/config.json" | sed -E 's#^.*/##; s#\.json$##')}"
 
 version_url="$(
   curl -fsSL "$manifest_url" |
