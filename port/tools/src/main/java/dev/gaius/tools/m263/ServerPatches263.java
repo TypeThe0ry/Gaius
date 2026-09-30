@@ -34,6 +34,12 @@ import org.objectweb.asm.tree.MethodNode;
  *       26.3 {@code BrowserPlayerListCompat.allowCommandsForAllPlayers(PlayerList)} sets for the
  *       browser Worker. That is the 26.2 semantics (isOp &rarr; the dedicated server's
  *       operator permissions) without writing ops.json.</li>
+ *   <li>{@link #patchDiscoveryServiceBrowser}: authlib 10 starts the discovery fetch in
+ *       {@code MinecraftServicesDiscoveryService.create(Proxy, boolean)} whatever the flag says
+ *       (PLAN D7). The one call in {@code Minecraft.<init>} and the one that
+ *       {@code MinecraftClientPatcher.patchServerMainDiscoveryServiceBrowser} leaves in the
+ *       server {@code Main} are retargeted to {@code BrowserDiscoveryServices.create}, which
+ *       returns {@code createOffline} unless the browser session is online.</li>
  * </ul>
  *
  * <p>Not patched (recorded in the P7a notes): 26.3's teleport confirmation now runs the full
@@ -60,6 +66,13 @@ public final class ServerPatches263 {
     static final String IS_OP_DESCRIPTOR = "(Lnet/minecraft/server/players/NameAndId;)Z";
     static final String STARTUP_SCHEDULER = "dev/gaius/browser/BrowserStartupScheduler";
     static final String PLAYER_LIST_COMPAT = "dev/gaius/browser/BrowserPlayerListCompat";
+    static final String MINECRAFT = "net/minecraft/client/Minecraft";
+    static final String SERVER_MAIN = "net/minecraft/server/Main";
+    static final String DISCOVERY_SERVICE =
+            "com/mojang/authlib/services/MinecraftServicesDiscoveryService";
+    static final String DISCOVERY_CREATE_DESCRIPTOR =
+            "(Ljava/net/Proxy;Z)L" + DISCOVERY_SERVICE + ";";
+    static final String DISCOVERY_SERVICES = "dev/gaius/browser/BrowserDiscoveryServices";
 
     private ServerPatches263() {
     }
@@ -71,6 +84,47 @@ public final class ServerPatches263 {
                 () -> patchRegistryLoadTaskBrowserStartupYield(jar, root));
         PatchRegistry.run("ServerPatches263.patchPlayerListIsOpBrowserCommands",
                 () -> patchPlayerListIsOpBrowserCommands(jar, root));
+        PatchRegistry.run("ServerPatches263.patchDiscoveryServiceBrowser",
+                () -> patchDiscoveryServiceBrowser(jar, root));
+    }
+
+    static void patchDiscoveryServiceBrowser(String jar, Path root) throws IOException {
+        retargetDiscoveryCreate(jar, root, MINECRAFT, "<init>",
+                "(Lnet/minecraft/client/main/GameConfig;)V");
+        retargetDiscoveryCreate(jar, root, SERVER_MAIN, "main", "([Ljava/lang/String;)V");
+        System.out.println("Routed 26.3 discovery-service creation through BrowserDiscoveryServices"
+                + " (offline sessions and the Worker no longer fetch discovery)");
+    }
+
+    private static void retargetDiscoveryCreate(String jar, Path root, String owner, String name,
+            String descriptor) throws IOException {
+        ClassNode node = read(jar, root, owner);
+        MethodNode method = find(node, name, descriptor);
+        MethodInsnNode target = null;
+        for (AbstractInsnNode instruction : method.instructions) {
+            if (!(instruction instanceof MethodInsnNode call) || !call.name.equals("create")
+                    || !call.desc.equals(DISCOVERY_CREATE_DESCRIPTOR)) {
+                continue;
+            }
+            if (call.owner.equals(DISCOVERY_SERVICES)) {
+                throw new IllegalStateException(owner + "." + name + " is already patched");
+            }
+            if (!call.owner.equals(DISCOVERY_SERVICE) || call.getOpcode() != Opcodes.INVOKESTATIC) {
+                continue;
+            }
+            if (target != null) {
+                throw new IllegalStateException(owner + "." + name
+                        + " calls MinecraftServicesDiscoveryService.create(Proxy, boolean) twice");
+            }
+            target = call;
+        }
+        if (target == null) {
+            throw new IllegalStateException(owner + "." + name
+                    + " no longer calls MinecraftServicesDiscoveryService.create(Proxy, boolean)");
+        }
+        // Same static descriptor, only the owner changes: stack and frames are unchanged.
+        target.owner = DISCOVERY_SERVICES;
+        write(node, root);
     }
 
     static void patchRegistryLoadTaskBrowserStartupYield(String jar, Path root) throws IOException {
