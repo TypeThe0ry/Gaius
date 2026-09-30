@@ -14,8 +14,9 @@
  * also installed as window.__gaiusShaderToolchain.  The launcher awaits the
  * promise before it calls the TeaVM main(args).  Asset URLs default to
  * siblings of this script (same ?v= token); a portable page sets
- * window.__gaiusShaderToolchainUrls = {shadercJs, shadercWasm, spvcJs, spvcWasm}
- * (and may gate on window.__gaiusPortableAssetsReady) before loading it.
+ * window.__gaiusShaderToolchainUrls = {shadercJs, shadercWasm, spvcJs, spvcWasm,
+ * version} (and/or window.__gaiusPortableAssetsReady) before this script runs.
+ * data-profile on the script element names the IndexedDB result cache.
  *
  * Failure model: shaderc jobs are self-contained (the Java side keeps options
  * and pre-resolved includes), and every spvc call carries the module
@@ -1034,11 +1035,16 @@
 
   function bootstrapBrowser(base, profile) {
     var started = performance.now();
+    // The toolchain version in cache keys: the ?v= content token of the loader URL,
+    // or window.__gaiusShaderToolchainUrls.version for a page that inlines the loader.
     var token = "dev";
     try {
       token = new URL(base).searchParams.get("v") || "dev";
     } catch (ignored) {
       // Keep the development token.
+    }
+    if (root.__gaiusShaderToolchainUrls && root.__gaiusShaderToolchainUrls.version) {
+      token = String(root.__gaiusShaderToolchainUrls.version);
     }
     return Promise.resolve(root.__gaiusPortableAssetsReady).then(function () {
       var urls = root.__gaiusShaderToolchainUrls || {
