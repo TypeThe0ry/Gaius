@@ -133,6 +133,7 @@ public final class WorldgenPatches263 {
             throw new IllegalStateException("WorldgenPatches263: " + jar
                     + " has no 26.3 CarvingMask/MaterialRuleContext (" + symbols.summary() + ")");
         }
+        System.out.println("WorldgenPatches263: 26.3 worldgen patches and non-suspending guard (P6)");
         PatchRegistry.run("WorldgenPatches263.patchCarvingMaskDeepPulses",
                 () -> patchCarvingMaskDeepPulses(jar, root));
         PatchRegistry.run("WorldgenPatches263.patchMaterialRuleContextIntCounters",
