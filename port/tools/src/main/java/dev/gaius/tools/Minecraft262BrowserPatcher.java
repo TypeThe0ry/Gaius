@@ -173,6 +173,18 @@ public final class Minecraft262BrowserPatcher {
     }
 
     private static void patchNoiseChunkGraphMapper(String jar, Path root) throws IOException {
+        // 26.2 only. 26.3 compiles each density graph once per RandomState
+        // (densityfunction/DensityFunctionCompiler) and binds it per chunk through a
+        // SamplerContext: NoiseChunk has no NoiseRouter/DensityFunction.mapAll call sites and
+        // DensityFunction$Visitor is gone, so BrowserNoiseGraphMapper has nothing to replace.
+        if (jarHasEntry(jar,
+                "net/minecraft/world/level/levelgen/densityfunction/DensityFunctionCompiler.class")) {
+            PatchRegistry.dropped("Minecraft262BrowserPatcher.patchNoiseChunkGraphMapper", jar,
+                    "net/minecraft/world/level/levelgen/DensityFunction$Visitor.class",
+                    "net/minecraft/world/level/levelgen/NoiseRouter#mapAll",
+                    "net/minecraft/world/level/levelgen/NoiseChunk#wrap");
+            return;
+        }
         String owner = "net/minecraft/world/level/levelgen/NoiseChunk";
         Path output = root.resolve(owner + ".class");
         ClassNode node;
@@ -229,6 +241,12 @@ public final class Minecraft262BrowserPatcher {
         // Receiver becomes the first static argument: stack shape and existing
         // control flow are unchanged, including all preceding overlay patches.
         write(node, output);
+    }
+
+    private static boolean jarHasEntry(String jar, String entry) throws IOException {
+        try (ZipFile input = new ZipFile(jar)) {
+            return input.getEntry(entry) != null;
+        }
     }
 
     private static void requireNoiseChunkWrapVisitor(
@@ -1936,6 +1954,44 @@ public final class Minecraft262BrowserPatcher {
             throws IOException {
         String owner = "net/minecraft/world/level/chunk/storage/RegionFileStorage";
         ClassNode node = read(jar, owner + ".class");
+        MethodNode cache = null;
+        for (MethodNode method : node.methods) {
+            if (method.name.equals("cache")
+                    && method.desc.equals("(JLjava/util/Optional;)V")) {
+                cache = method;
+            }
+        }
+        if (cache != null) {
+            // 26.3: getRegionFile(ChunkPos, boolean create) caches both open files and
+            // Optional.empty() for absent regions through cache(long, Optional), which evicts
+            // (and closes) the oldest entry above MAX_CACHE_SIZE.
+            int limits = 0;
+            for (AbstractInsnNode instruction : cache.instructions.toArray()) {
+                if (instruction instanceof IntInsnNode integer
+                        && integer.getOpcode() == Opcodes.SIPUSH
+                        && integer.operand == 256) {
+                    cache.instructions.set(
+                            integer,
+                            new IntInsnNode(Opcodes.BIPUSH, BROWSER_REGION_FILE_CACHE_SIZE));
+                    limits++;
+                }
+            }
+            requireOne("RegionFileStorage.cache 256-entry limit", limits);
+            int constants = 0;
+            for (FieldNode field : node.fields) {
+                if (field.name.equals("MAX_CACHE_SIZE")
+                        && field.desc.equals("I")
+                        && Integer.valueOf(256).equals(field.value)) {
+                    field.value = BROWSER_REGION_FILE_CACHE_SIZE;
+                    constants++;
+                }
+            }
+            requireOne("RegionFileStorage MAX_CACHE_SIZE constant", constants);
+            write(node, root.resolve(owner + ".class"));
+            System.out.println("Bounded RegionFileStorage.cache(long, Optional) to "
+                    + BROWSER_REGION_FILE_CACHE_SIZE + " regions");
+            return;
+        }
         MethodNode getRegionFile = find(
                 node,
                 "getRegionFile",
