@@ -412,6 +412,12 @@ public final class MinecraftClientPatcher {
     private static void patchOptionsBrowserLowSimulationDistance(String jar, Path output)
             throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/Options.class");
+        // The sprint key default moves from Left Control to R. Key codes are the jar's own
+        // InputConstants values: GLFW key codes on 26.2 (341 -> 82), SDL scancodes on 26.3
+        // (224 -> 21).
+        ModernSymbols symbols = ModernSymbols.cached(jar);
+        int vanillaSprintKey = symbols.inputKey("KEY_LCONTROL");
+        int browserSprintKey = symbols.inputKey("KEY_R");
         int patched = 0;
         int sprintDefaults = 0;
         for (MethodNode method : node.methods) {
@@ -451,16 +457,27 @@ public final class MinecraftClientPatcher {
                     continue;
                 }
                 if (instruction instanceof IntInsnNode intConstant
-                        && intConstant.getOpcode() == Opcodes.SIPUSH
-                        && intConstant.operand == 341) {
-                    intConstant.operand = 82;
+                        && (intConstant.getOpcode() == Opcodes.SIPUSH
+                                || intConstant.getOpcode() == Opcodes.BIPUSH)
+                        && intConstant.operand == vanillaSprintKey) {
+                    if (intConstant.getOpcode() == Opcodes.BIPUSH
+                            && (browserSprintKey < Byte.MIN_VALUE
+                                    || browserSprintKey > Byte.MAX_VALUE)) {
+                        method.instructions.set(
+                                instruction, new IntInsnNode(Opcodes.SIPUSH, browserSprintKey));
+                    } else {
+                        intConstant.operand = browserSprintKey;
+                    }
                     sprintDefaults++;
                     break;
                 }
                 if (instruction instanceof LdcInsnNode constant
                         && constant.cst instanceof Integer value
-                        && value.intValue() == 341) {
-                    method.instructions.set(instruction, new IntInsnNode(Opcodes.BIPUSH, 82));
+                        && value.intValue() == vanillaSprintKey) {
+                    method.instructions.set(instruction, new IntInsnNode(
+                            browserSprintKey >= Byte.MIN_VALUE && browserSprintKey <= Byte.MAX_VALUE
+                                    ? Opcodes.BIPUSH : Opcodes.SIPUSH,
+                            browserSprintKey));
                     sprintDefaults++;
                     break;
                 }
@@ -471,8 +488,9 @@ public final class MinecraftClientPatcher {
                     "Options simulation-distance range patch point was not found");
         }
         if (sprintDefaults != 1) {
-            throw new IllegalStateException(
-                    "Options sprint default key patch point was not found: " + sprintDefaults);
+            throw new IllegalStateException("Options sprint default key patch point (key.sprint "
+                    + vanillaSprintKey + " -> " + browserSprintKey + ") was not found: "
+                    + sprintDefaults);
         }
         patchOptionsFastGraphicsPresetDefault(node);
         MethodNode save = find(node, "save", "()V");
@@ -1501,8 +1519,10 @@ public final class MinecraftClientPatcher {
     }
 
     /**
-     * Adds the vanilla-styled "Edit Profile" button (BrowserProfileScreen) to the 26.2 title
-     * screen and lets its tick open the editor once on first launch.
+     * Adds the vanilla-styled "Edit Profile" button (BrowserProfileScreen) to the modern (26.2
+     * and 26.3) title screen and lets its tick open the editor once on first launch. Both
+     * profiles have one RETURN in {@code init()V}, a {@code tick()V} and the
+     * {@code extractRenderState} GUI that selects these hooks.
      */
     private static void addTitleScreenProfileHooks(ClassNode node) {
         String owner = "net/minecraft/client/gui/screens/TitleScreen";
@@ -6231,6 +6251,11 @@ public final class MinecraftClientPatcher {
     private static void patchMultiPlayerGameModeBrowserHitSound(String jar, Path output)
             throws IOException {
         ClassNode node = read(jar, "net/minecraft/client/multiplayer/MultiPlayerGameMode.class");
+        if (!invokesMethod(node, "net/minecraft/world/level/block/SoundType", "getHitSound",
+                "()Lnet/minecraft/sounds/SoundEvent;")) {
+            dropMultiPlayerGameModeBrowserHitSound(jar);
+            return;
+        }
         MethodNode method = find(
                 node,
                 "continueDestroyBlock",
@@ -6262,6 +6287,54 @@ public final class MinecraftClientPatcher {
                     "MultiPlayerGameMode browser hit sound volume patch point was not found");
         }
         write(node, output);
+    }
+
+    /**
+     * 26.3 moved the mining hit sound out of {@code MultiPlayerGameMode.continueDestroyBlock}:
+     * {@code ClientLevel.addBreakingBlockEffects(BlockPos, Direction, boolean)} (which replaced
+     * 26.2's {@code addBreakingBlockEffect(BlockPos, Direction)}) plays it through the private
+     * {@code playBreakingSound(BlockPos, BlockState)}, for the first hit and for the server's
+     * periodic level event 2020. This patch is therefore dropped; UiPatches263 applies the same
+     * 8.0f to 4.0f volume change to playBreakingSound at the tail of the chain, reading the
+     * ClientLevel that patchClientLevelBrowserBlockBreakEffects wrote. Both facts are checked
+     * here, so neither a leftover MultiPlayerGameMode hit sound nor a missing new target can pass.
+     */
+    private static void dropMultiPlayerGameModeBrowserHitSound(String jar) throws IOException {
+        String patchId = "MinecraftClientPatcher.patchMultiPlayerGameModeBrowserHitSound";
+        ClassNode level = read(jar, "net/minecraft/client/multiplayer/ClientLevel.class");
+        MethodNode breakingSound = findNullable(level, "playBreakingSound",
+                "(Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/level/block/state/BlockState;)V");
+        if (breakingSound == null || !invokesMethod(breakingSound,
+                "net/minecraft/world/level/block/SoundType", "getHitSound",
+                "()Lnet/minecraft/sounds/SoundEvent;")) {
+            throw new IllegalStateException("MultiPlayerGameMode no longer plays the mining hit"
+                    + " sound, but ClientLevel.playBreakingSound(BlockPos, BlockState) with"
+                    + " SoundType.getHitSound was not found either");
+        }
+        PatchRegistry.dropped(patchId, jar,
+                "net/minecraft/client/multiplayer/ClientLevel#addBreakingBlockEffect"
+                        + "(Lnet/minecraft/core/BlockPos;Lnet/minecraft/core/Direction;)V");
+    }
+
+    private static boolean invokesMethod(ClassNode node, String owner, String name, String desc) {
+        for (MethodNode method : node.methods) {
+            if (invokesMethod(method, owner, name, desc)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean invokesMethod(MethodNode method, String owner, String name, String desc) {
+        for (AbstractInsnNode instruction = method.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof MethodInsnNode call && call.owner.equals(owner)
+                    && call.name.equals(name) && call.desc.equals(desc)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void patchLevelRendererBrowserBlockOutlineOpacity(ClassNode node) {
@@ -11874,9 +11947,89 @@ public final class MinecraftClientPatcher {
             break;
         }
         if (!lanHooked) {
+            lanHooked = hookPauseScreenLanBeforeLevelCheck(createPauseMenu);
+        }
+        if (!lanHooked) {
             throw new IllegalStateException("PauseScreen Open to LAN hook point was not found");
         }
         write(node, output);
+    }
+
+    /**
+     * 26.3 no longer asks {@code hasSingleplayerServer()} while building the pause menu: the
+     * Options/World Options row is guarded by {@code this.minecraft.level != null} instead. Adding
+     * the LAN button right before that check keeps the 26.2 order (LAN, then the Options row,
+     * then Disconnect) on both branches of the check. The anchor must occur exactly once.
+     */
+    private static boolean hookPauseScreenLanBeforeLevelCheck(MethodNode createPauseMenu) {
+        String screen = "net/minecraft/client/gui/screens/PauseScreen";
+        AbstractInsnNode anchor = null;
+        int anchors = 0;
+        for (AbstractInsnNode instruction = createPauseMenu.instructions.getFirst();
+                instruction != null;
+                instruction = instruction.getNext()) {
+            if (!(instruction instanceof VarInsnNode self)
+                    || self.getOpcode() != Opcodes.ALOAD
+                    || self.var != 0
+                    || !(nextOpcode(self) instanceof FieldInsnNode minecraft)
+                    || minecraft.getOpcode() != Opcodes.GETFIELD
+                    || !minecraft.owner.equals(screen)
+                    || !minecraft.name.equals("minecraft")
+                    || !minecraft.desc.equals("Lnet/minecraft/client/Minecraft;")
+                    || !(nextOpcode(minecraft) instanceof FieldInsnNode level)
+                    || level.getOpcode() != Opcodes.GETFIELD
+                    || !level.owner.equals("net/minecraft/client/Minecraft")
+                    || !level.name.equals("level")
+                    || !level.desc.equals("Lnet/minecraft/client/multiplayer/ClientLevel;")
+                    || nextOpcode(level) == null
+                    || nextOpcode(level).getOpcode() != Opcodes.IFNULL) {
+                continue;
+            }
+            anchor = self;
+            anchors++;
+        }
+        if (anchors != 1) {
+            if (anchors > 1) {
+                throw new IllegalStateException(
+                        "PauseScreen level-check LAN anchor is ambiguous: " + anchors);
+            }
+            return false;
+        }
+        // BrowserLanSession.maybeAddButton receives local 2; it must be the menu's RowHelper.
+        boolean rowHelperInLocal2 = false;
+        for (AbstractInsnNode instruction = createPauseMenu.instructions.getFirst();
+                instruction != anchor;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.owner.equals("net/minecraft/client/gui/layouts/GridLayout")
+                    && call.name.equals("createRowHelper")
+                    && call.desc.equals("(I)Lnet/minecraft/client/gui/layouts/GridLayout$RowHelper;")
+                    && nextOpcode(call) instanceof VarInsnNode store
+                    && store.getOpcode() == Opcodes.ASTORE) {
+                rowHelperInLocal2 = store.var == 2;
+                break;
+            }
+        }
+        if (!rowHelperInLocal2) {
+            throw new IllegalStateException(
+                    "PauseScreen RowHelper is no longer stored in local 2 before the level check");
+        }
+        InsnList hook = new InsnList();
+        hook.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        hook.add(new FieldInsnNode(
+                Opcodes.GETFIELD, screen, "minecraft", "Lnet/minecraft/client/Minecraft;"));
+        hook.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        hook.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserLanSession",
+                "maybeAddButton",
+                "(Lnet/minecraft/client/Minecraft;Lnet/minecraft/client/gui/layouts/GridLayout$RowHelper;)V",
+                false));
+        // Before the ALOAD 0 of the check (and after any label that precedes it), so both
+        // the fall-through path and any jump to the check run the hook.
+        createPauseMenu.instructions.insertBefore(anchor, hook);
+        createPauseMenu.maxStack = Math.max(createPauseMenu.maxStack, 2);
+        return true;
     }
 
     private static boolean replaceLocalServerCheck(MethodNode method) {
@@ -14050,16 +14203,28 @@ public final class MinecraftClientPatcher {
         int reads = 0;
         boolean hasHolder = false;
         for (AbstractInsnNode instruction : load.instructions.toArray()) {
-            if (instruction instanceof MethodInsnNode call && call.owner.equals(image)
-                    && call.name.equals("read") && call.desc.equals(
-                    "(Lcom/mojang/blaze3d/platform/NativeImage$Format;Ljava/io/InputStream;)L" + image + ";")) {
+            // 26.2 reads NativeImage.read(Format.RGBA, stream); 26.3 removed that overload and
+            // calls NativeImage.read(stream). Each shape goes to the matching cache entry point.
+            boolean formatRead = instruction instanceof MethodInsnNode formatCall
+                    && formatCall.getOpcode() == Opcodes.INVOKESTATIC
+                    && formatCall.owner.equals(image) && formatCall.name.equals("read")
+                    && formatCall.desc.equals("(Lcom/mojang/blaze3d/platform/NativeImage$Format;"
+                            + "Ljava/io/InputStream;)L" + image + ";");
+            boolean streamRead = instruction instanceof MethodInsnNode streamCall
+                    && streamCall.getOpcode() == Opcodes.INVOKESTATIC
+                    && streamCall.owner.equals(image) && streamCall.name.equals("read")
+                    && streamCall.desc.equals("(Ljava/io/InputStream;)L" + image + ";");
+            if (formatRead || streamRead) {
+                MethodInsnNode call = (MethodInsnNode) instruction;
                 InsnList args = new InsnList();
                 args.add(new VarInsnNode(Opcodes.ALOAD, 1));
                 args.add(new VarInsnNode(Opcodes.ALOAD, 2));
                 load.instructions.insertBefore(call, args);
                 call.owner = cache;
-                call.desc = "(Lcom/mojang/blaze3d/platform/NativeImage$Format;Ljava/io/InputStream;"
-                        + "Ljava/lang/Object;Ljava/lang/Object;)L" + image + ";";
+                call.desc = formatRead
+                        ? "(Lcom/mojang/blaze3d/platform/NativeImage$Format;Ljava/io/InputStream;"
+                                + "Ljava/lang/Object;Ljava/lang/Object;)L" + image + ";"
+                        : "(Ljava/io/InputStream;Ljava/lang/Object;Ljava/lang/Object;)L" + image + ";";
                 InsnList save = new InsnList();
                 save.add(new InsnNode(Opcodes.DUP));
                 save.add(new VarInsnNode(Opcodes.ASTORE, acquired));
@@ -18728,10 +18893,15 @@ public final class MinecraftClientPatcher {
             throws IOException {
         ClassNode node = read(jar,
                 "net/minecraft/server/packs/FilePackResources$FileResourcesSupplier.class");
-        MethodNode openFull = find(node, "openFull",
-                "(Lnet/minecraft/server/packs/PackLocationInfo;"
-                        + "Lnet/minecraft/server/packs/repository/Pack$Metadata;)"
-                        + "Lnet/minecraft/server/packs/PackResources;");
+        String openArguments = "(Lnet/minecraft/server/packs/PackLocationInfo;"
+                + "Lnet/minecraft/server/packs/repository/Pack$Metadata;)";
+        MethodNode openFull = findNullable(node, "openFull",
+                openArguments + "Lnet/minecraft/server/packs/PackResources;");
+        if (openFull == null) {
+            // 26.3: Pack$ResourcesSupplier.openFull became openResources, which returns the
+            // pack and its overlays as a Stream; the overlay list lookup inside is unchanged.
+            openFull = find(node, "openResources", openArguments + "Ljava/util/stream/Stream;");
+        }
         boolean patched = false;
         for (AbstractInsnNode instruction = openFull.instructions.getFirst();
                 instruction != null;
