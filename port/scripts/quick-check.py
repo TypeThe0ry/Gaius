@@ -9,9 +9,12 @@ overlay classes.
 from __future__ import annotations
 
 import base64
+import contextlib
 import glob
 import gzip
 import hashlib
+import importlib.util
+import io
 import json
 import mmap
 import os
@@ -57,16 +60,269 @@ def _profile_scoped_default(base: Path, profile_id: str) -> Path:
 
 
 def _active_profile_id() -> str:
+    """The active profile id, or "" when config.json and the profile are unreadable.
+
+    port/config.json (or GAIUS_VERSION_PROFILE_PATH) is the only source of the
+    default profile.  An unreadable profile is not replaced by a hard-coded id:
+    check_profile_dispatch() reports it and every profile-derived check fails.
+    """
     try:
         config = json.loads(VERSION_CONFIG.read_text(encoding="utf-8"))
         relative = os.environ.get("GAIUS_VERSION_PROFILE_PATH") or config["versionProfile"]
         profile = json.loads((PORT / relative).read_text(encoding="utf-8"))
         return str(profile["id"])
     except (OSError, ValueError, KeyError, TypeError):
-        return "26.2"
+        return ""
 
 
 ACTIVE_PROFILE_ID = _active_profile_id()
+
+
+# Profile dispatch.  Every version profile quick-check knows belongs to one rule
+# family:
+#   "named"   Mojang's unobfuscated 26.x clients (clientDistribution "named").
+#             They share the MinecraftClientPatcher/Minecraft262BrowserPatcher
+#             patch set, so the source and overlay bytecode checks judge every
+#             named profile by the same rules.  A rule that only holds for one
+#             named profile (26.2's blaze3d/GLFW/authlib 9 shapes, say) is
+#             registered in that profile's `not_applicable` table with the
+#             reason and the check that covers the replacement.
+#   "legacy"  the obfuscated 1.21.11 profile with its own expectations.
+# `window_library` is the (overlay key, Maven coordinate) of the LWJGL window
+# and input module; `domain_modules` are the port/scripts/quickcheck modules
+# (profile_<id>_<domain>.py, owned by the work packages) that assert the
+# profile's own patches.  A profile without an entry here fails closed.
+class ProfileRules:
+    __slots__ = (
+        "family",
+        "window_library",
+        "render_api",
+        "authlib_session",
+        "domain_modules",
+        "not_applicable",
+    )
+
+    def __init__(
+        self,
+        family: str,
+        window_library: tuple[str, str],
+        render_api: str,
+        authlib_session: tuple[str, str],
+        domain_modules: tuple[str, ...] = (),
+        not_applicable: dict[str, str] | None = None,
+    ) -> None:
+        self.family = family
+        self.window_library = window_library
+        # "blaze3d" (com.mojang.blaze3d render classes) or "renderpearl" (26.3).
+        self.render_api = render_api
+        # (class, constructor header) of the authlib session service the
+        # browser Gson texture patch rewrites: yggdrasil for authlib 9 and
+        # older, services for authlib 10.
+        self.authlib_session = authlib_session
+        self.domain_modules = domain_modules
+        self.not_applicable = dict(not_applicable or {})
+
+
+GLFW_WINDOW_LIBRARY = ("lwjgl_glfw", "org.lwjgl:lwjgl-glfw")
+SDL_WINDOW_LIBRARY = ("lwjgl_sdl", "org.lwjgl:lwjgl-sdl")
+YGGDRASIL_SESSION_SERVICE = (
+    "com.mojang.authlib.yggdrasil.YggdrasilMinecraftSessionService",
+    "protected com.mojang.authlib.yggdrasil.YggdrasilMinecraftSessionService("
+    "com.mojang.authlib.yggdrasil.ServicesKeySet, java.net.Proxy, com.mojang.authlib.Environment);",
+)
+SERVICES_SESSION_SERVICE = (
+    "com.mojang.authlib.services.MinecraftServicesSessionService",
+    "protected com.mojang.authlib.services.MinecraftServicesSessionService("
+    "com.mojang.authlib.services.ServicesKeySet, java.net.Proxy, "
+    "com.mojang.authlib.services.MinecraftServicesDiscoveryService);",
+)
+PROFILE_263_DOMAIN_MODULES = ("render", "input", "terrain", "worldgen", "server", "ui")
+
+# Overlay bytecode checks of the named family that do not hold for 26.3, keyed by
+# the exact check name, with the reason and where the 26.3 replacement is
+# asserted ("quickcheck <domain>" is port/scripts/quickcheck/profile_263_<domain>.py,
+# run by check_profile_modules()).  26.3 replaced the classes these rules read
+# (SDL3 instead of GLFW, the renderpearl backend, the compiled density runtime)
+# or registers the patch as dropped in PatchRegistry.  report_profile_checks()
+# fails when an entry no longer names an existing check.
+_GLFW_263 = (
+    "26.3 ships lwjgl-sdl instead of lwjgl-glfw; the SDL3 shim (BrowserSdl) is"
+    " asserted by quickcheck input and lwjgl-sdl-browser-dom-smoke"
+)
+_VERTEX_ARRAY_CACHE_263 = (
+    "26.3 has no VertexArrayCache (renderpearl VertexArray); the 26.2 override is"
+    " not ported (overrides/client/src/versions/26.3/excludes.txt)"
+)
+_DENSITY_RUNTIME_263 = (
+    "dropped on 26.3: the compiled density runtime replaced the 26.2 target (plan D6);"
+    " quickcheck worldgen asserts the 26.2 targets and helpers are gone"
+)
+_VANILLA_PACK_263 = (
+    "26.3 VanillaPackResources is the vanilla holder; the pack body is the"
+    " FixedPathPackResources override asserted by quickcheck ui"
+)
+NOT_APPLICABLE_263: dict[str, str] = {
+    # Window and input (P2).
+    "BrowserGlfw compiled overlay implements printable key names": _GLFW_263,
+    "BrowserGlfw compiled overlay clamps browser DPR and gates preserveDrawingBuffer": _GLFW_263,
+    "BrowserGlfw compiled overlay records game FPS from swapBuffers": _GLFW_263,
+    "BrowserGlfw compiled overlay honors VSync and yields uncapped frames": _GLFW_263,
+    "BrowserGlfw compiled overlay reserves the final timer millisecond": _GLFW_263,
+    "BrowserGlfw compiled overlay primes cursor callbacks": _GLFW_263,
+    "BrowserGlfw compiled overlay records input callback telemetry": _GLFW_263,
+    "BrowserGlfw compiled overlay warms up first GUI input": _GLFW_263,
+    "GLFW compiled overlay delegates glfwGetKeyName/getKeyScancode to BrowserGlfw": _GLFW_263,
+    "MouseHandler browser callbacks dispatch synchronously": (
+        "patchBrowserMouseHandler is dropped on 26.3; SDLEventHandler dispatches"
+        " synchronously (quickcheck input)"
+    ),
+    "KeyboardHandler browser callbacks dispatch synchronously": (
+        "patchBrowserKeyboardHandler is dropped on 26.3; SDLEventHandler dispatches"
+        " synchronously (quickcheck input)"
+    ),
+    "MouseHandler browser button path reports scaled click telemetry": (
+        "26.3 reports clicks through BrowserInputTelemetry (quickcheck input)"
+    ),
+    # Render backend (P3, P5).
+    "GlConst RED8I internal format is WebGL-safe R8": (
+        "renderpearl GlConst: quickcheck render (GlConst.toGlInternalId maps R8I to R8)"
+    ),
+    "GlDevice skips desktop proxy texture size probing": (
+        "26.3 probes in GlHeuristics: quickcheck render"
+        " (GlHeuristics.getMaxSupportedTextureSize uses GL_MAX_TEXTURE_SIZE)"
+    ),
+    "GlDevice keeps browser on WebGL VAO emulation path": (
+        "renderpearl GlDevice: quickcheck render (GlDevice disables the ARB extension paths)"
+    ),
+    "GlCommandEncoder uses the direct browser draw hot path": (
+        "patchGlRenderPipelineDrawMetadata is dropped on 26.3; quickcheck render asserts"
+        " the vanilla draw path"
+    ),
+    "GlRenderPipeline caches immutable browser draw metadata once": (
+        "patchGlRenderPipelineDrawMetadata is dropped on 26.3: the renderpearl"
+        " GlRenderPipeline caches primitiveTopology() itself"
+    ),
+    "VertexArrayCache uses a bounded LRU instead of rebuilding overflow VAOs": _VERTEX_ARRAY_CACHE_263,
+    "VertexArrayCache reuses its hot-path lookup key and allocates only on VAO cache misses": (
+        _VERTEX_ARRAY_CACHE_263
+    ),
+    "VertexArrayCache bypasses generic map lookup for recently used browser VAOs": _VERTEX_ARRAY_CACHE_263,
+    "VertexArrayCache compiled overlay binds VAOs directly through browser GL30": _VERTEX_ARRAY_CACHE_263,
+    "VertexArrayCache compiled overlay preserves vanilla UV/normal/color attribute types": (
+        _VERTEX_ARRAY_CACHE_263
+    ),
+    "DynamicUniforms constructor uses browser initial UBO capacities": (
+        "26.3 moved the UBOs to DynamicGpuData: quickcheck terrain"
+    ),
+    "LevelRenderer compiled overlay reuses frame time, render layers, and model-view matrix": (
+        "26.3 prepareChunkRenders(Matrix4fc, boolean) reads no frame time and copies no"
+        " matrix; BrowserChunkSectionLayers is asserted by quickcheck terrain"
+    ),
+    "Entity renderer skips transient null entities instead of crashing multiplayer worlds": (
+        "26.3 shouldRender(..., float) null guard: quickcheck terrain"
+        " (minecraft-263-terrain-patcher-smoke)"
+    ),
+    "Current named GameRenderer refreshes targeting after its render camera": (
+        "26.3 recomputes the camera entity partial tick: quickcheck terrain"
+        " (minecraft-263-terrain-patcher-smoke)"
+    ),
+    # Server and authlib (P7a).
+    "Official server Main uses the offline Yggdrasil authentication service": (
+        "authlib 10: quickcheck server asserts MinecraftServicesDiscoveryService.create(Proxy, false)"
+    ),
+    # Worldgen (P6).
+    "MinecraftServer anchors browser spawn above the generated column": (
+        "26.3 spawns in the ChunkGenerator.getOrigin chunk: quickcheck worldgen and"
+        " worldgen-seed-parity"
+    ),
+    "BiomeManager.getBiome delegates only nearest-corner math to the browser hot path": (
+        "26.3 BiomeResolver shape: quickcheck worldgen"
+    ),
+    "Aquifer computeSubstance uses the warmed batch before the vanilla miss path": (
+        "26.3 computeSubstance(IIID) nearest-center fast path: quickcheck worldgen"
+    ),
+    "Beardifier compute uses packed arrays without iterator or enum allocation chains": (
+        _DENSITY_RUNTIME_263
+    ),
+    "NoiseBasedChunkGenerator terrain fill stays synchronous within its task stage": (
+        "26.3 doFill(NoiseChunk, ChunkAccess) takes deep checkpoint pulses: quickcheck worldgen"
+    ),
+    "NoiseBasedChunkGenerator caches chunk-invariant debug and default-block values": (
+        "26.3 doFill(NoiseChunk, ChunkAccess): the default block hoisting is asserted by"
+        " quickcheck worldgen"
+    ),
+    "ImprovedNoise compiled overlay delegates its complete public sample without array copies": (
+        _DENSITY_RUNTIME_263
+    ),
+    "ImprovedNoise compiled overlay keeps its private interpolation hot path": _DENSITY_RUNTIME_263,
+    "Runtime terrain carvers stay synchronous within their task stage": (
+        "26.3 generateCarvers takes deep checkpoint pulses: quickcheck worldgen"
+    ),
+    "NoiseChunk interpolation stays synchronous below the task layer": _DENSITY_RUNTIME_263,
+    "NoiseChunk interpolation uses a cached array in per-block update loops": _DENSITY_RUNTIME_263,
+    "NoiseInterpolator updates use direct exact lerp arithmetic": _DENSITY_RUNTIME_263,
+    "NoiseChunk cache counters use native ints instead of boxed Java longs": _DENSITY_RUNTIME_263,
+    "PerlinNoise hot loop uses cached primitive amplitudes and browser wrap": _DENSITY_RUNTIME_263,
+    "Surface rules stay synchronous within their task stage": (
+        "26.3 MaterialSystem.buildSurface takes deep checkpoint pulses: quickcheck worldgen"
+    ),
+    "Surface rule contexts reuse one lazy biome supplier per chunk": _DENSITY_RUNTIME_263,
+    "Surface lazy conditions cache primitive results with int generation counters": (
+        "dropped on 26.3 (compiled density runtime); the MaterialRuleContext int counters"
+        " are asserted by quickcheck worldgen"
+    ),
+    "Surface rule sequences use indexed access without iterator allocation": _DENSITY_RUNTIME_263,
+    "Concrete density transformers bypass resumable PureTransformer accessors": _DENSITY_RUNTIME_263,
+    "Immutable worldgen records retain structural equality with cached hash codes": (
+        "26.3 caches only the CubicSpline record hashes: quickcheck worldgen"
+    ),
+    "Biome decoration stays synchronous within its task stage": (
+        "26.3 applyBiomeDecoration takes deep checkpoint pulses: quickcheck worldgen"
+    ),
+    "World carvers stay synchronous below the task layer": (
+        "26.3 WorldCarver.carveEllipsoid is a static interface method with deep checkpoint"
+        " pulses: quickcheck worldgen"
+    ),
+    "LevelChunkSection biome sampling stays synchronous below the task layer": (
+        "26.3 fillBiomesFromNoise(BiomeResolver, int, int, int) takes deep checkpoint pulses:"
+        " quickcheck worldgen"
+    ),
+    # Client glue and UI (P8).
+    "Mining hit sounds remain periodic and browser-audible": (
+        "patchMultiPlayerGameModeBrowserHitSound is dropped on 26.3 (the hit sound moved to"
+        " ClientLevel.playBreakingSound): quickcheck ui"
+    ),
+    "VanillaPackResources compiled overlay wraps resources as byte arrays": _VANILLA_PACK_263,
+    "VanillaPackResources compiled overlay falls back for browser pack icon": _VANILLA_PACK_263,
+    "VanillaPackResources compiled overlay caches browser resource listings": _VANILLA_PACK_263,
+}
+
+PROFILE_RULES: dict[str, ProfileRules] = {
+    "1.21.11": ProfileRules(
+        "legacy", GLFW_WINDOW_LIBRARY, "blaze3d", YGGDRASIL_SESSION_SERVICE
+    ),
+    "26.2": ProfileRules(
+        "named", GLFW_WINDOW_LIBRARY, "blaze3d", YGGDRASIL_SESSION_SERVICE
+    ),
+    "26.3": ProfileRules(
+        "named",
+        SDL_WINDOW_LIBRARY,
+        "renderpearl",
+        SERVICES_SESSION_SERVICE,
+        PROFILE_263_DOMAIN_MODULES,
+        NOT_APPLICABLE_263,
+    ),
+}
+
+
+def profile_rules(version: str) -> ProfileRules | None:
+    return PROFILE_RULES.get(version)
+
+
+def is_named_family(version: str) -> bool:
+    """True for the named 26.x profiles, which share the 26.2 rule set."""
+    rules = PROFILE_RULES.get(version)
+    return rules is not None and rules.family == "named"
 
 
 def _profile_worldgen_telemetry_mode(profile: object) -> str | None:
@@ -980,9 +1236,16 @@ def resolve_overlay_paths(
             )
 
     overlays = Path(overlays_root) if overlays_root is not None else port_root / "work" / "overlays"
+    rules = profile_rules(version)
+    if rules is None:
+        raise OverlayResolutionError(
+            f"profile {version!r} has no quick-check rules (PROFILE_RULES in {Path(__file__).name})"
+        )
+    window_key, window_coordinate = rules.window_library
     library_specs = {
         "lwjgl": ("org.lwjgl:lwjgl", "unsafe"),
-        "lwjgl_glfw": ("org.lwjgl:lwjgl-glfw", None),
+        # GLFW for 1.21.11/26.2, SDL3 for 26.3: the window/input module of the profile.
+        window_key: (window_coordinate, None),
         "lwjgl_opengl": ("org.lwjgl:lwjgl-opengl", None),
         "lwjgl_openal": ("org.lwjgl:lwjgl-openal", None),
         "netty_transport": ("io.netty:netty-transport", None),
@@ -7605,6 +7868,21 @@ def check_source_patches() -> None:
         print_check(name, ok)
 
 
+def report_profile_checks(version: str, checks: list[tuple[str, bool]]) -> None:
+    """Report named-family overlay checks, honoring the profile's not-applicable table."""
+    rules = profile_rules(version)
+    not_applicable = rules.not_applicable if rules is not None else {}
+    names = {name for name, _ in checks}
+    for name, ok in checks:
+        reason = not_applicable.get(name)
+        if reason is None:
+            print_check(name, ok)
+        else:
+            print(f"N/A {name} [{version}: {reason}]")
+    for stale in sorted(set(not_applicable) - names):
+        print_check(f"{version} not-applicable entry names an existing check: {stale}", False)
+
+
 def check_overlay_bytecode() -> None:
     section("Overlay bytecode checks")
     try:
@@ -7621,6 +7899,9 @@ def check_overlay_bytecode() -> None:
     version = resolved["version"]
     client_distribution = resolved["client_distribution"]
     is_current_named = client_distribution == "named"
+    # resolve_overlay_paths() already refused a profile without rules.
+    rules = profile_rules(version)
+    authlib_session_class, authlib_session_constructor_header = rules.authlib_session
     library_paths = resolved["libraries"]
     if not isinstance(profile, dict) or not isinstance(library_paths, dict):
         print("FAIL overlay path resolver returned an invalid contract")
@@ -7659,7 +7940,11 @@ def check_overlay_bytecode() -> None:
     lwjgl_opengl_overlay_cp = library_paths["lwjgl_opengl"]
     lwjgl_openal_cp = library_paths["lwjgl_openal"]
     lwjgl_openal_classes_cp = OVERLAYS / "library-classes" / "lwjgl-openal"
-    lwjgl_glfw_cp = library_paths["lwjgl_glfw"]
+    # 26.3 has no lwjgl-glfw (SDL3 replaced it); its GLFW rules are registered as
+    # not applicable and the SDL shim is asserted by quickcheck/profile_263_input.py.
+    lwjgl_glfw_cp = library_paths.get(
+        "lwjgl_glfw", OVERLAYS / "libraries" / "no-lwjgl-glfw-in-this-profile"
+    )
     joml_cp = library_paths["joml"]
     authlib_cp = library_paths["authlib"]
     patchy_cp = library_paths["patchy"]
@@ -7717,10 +8002,9 @@ def check_overlay_bytecode() -> None:
     http_util = run_javap(client_cp, "net.minecraft.util.HttpUtil")
     realms_request = run_javap(client_cp, "com.mojang.realmsclient.client.Request")
     authlib_client = run_javap(authlib_cp, "com.mojang.authlib.minecraft.client.MinecraftClient")
-    authlib_session = run_javap(
-        authlib_cp,
-        "com.mojang.authlib.yggdrasil.YggdrasilMinecraftSessionService",
-    )
+    # authlib 9 (yggdrasil) or authlib 10 (services, 26.3); the browser Gson
+    # texture patch rewrites the same constructor and unpackTextures in both.
+    authlib_session = run_javap(authlib_cp, authlib_session_class)
     authlib_profile_texture = run_javap(
         authlib_cp,
         "com.mojang.authlib.minecraft.MinecraftProfileTexture",
@@ -8065,7 +8349,7 @@ def check_overlay_bytecode() -> None:
     )
     vertex_array_cache_key = run_javap(client_cp, "com.mojang.blaze3d.opengl.VertexArrayCache$VertexArrayKey")
     vertex_array_cache_source_path = (
-        VERTEX_ARRAY_CACHE_262 if version == "26.2" else VERTEX_ARRAY_CACHE
+        VERTEX_ARRAY_CACHE_262 if is_named_family(version) else VERTEX_ARRAY_CACHE
     )
     vertex_array_cache_source = (
         vertex_array_cache_source_path.read_text(errors="replace")
@@ -8921,6 +9205,13 @@ def check_overlay_bytecode() -> None:
         region_file_storage,
         "private net.minecraft.world.level.chunk.storage.RegionFile getRegionFile(net.minecraft.world.level.ChunkPos) throws java.io.IOException;",
     )
+    if not region_get_file and is_named_family(version):
+        # 26.3 moved the bounded region LRU (insert, evict, close) into
+        # cache(long, Optional<RegionFile>).
+        region_get_file = method_section(
+            region_file_storage,
+            "private void cache(long, java.util.Optional<net.minecraft.world.level.chunk.storage.RegionFile>) throws java.io.IOException;",
+        )
     dispatcher_schedule_for_execution = method_section(
         chunk_task_dispatcher,
         "protected void scheduleForExecution(net.minecraft.server.level.ChunkTaskPriorityQueue$TasksForChunk);",
@@ -9104,7 +9395,9 @@ def check_overlay_bytecode() -> None:
     gl_const = run_javap(client_cp, "com.mojang.blaze3d.opengl.GlConst")
     texture_format = run_javap(
         client_cp,
-        "com.mojang.blaze3d.GpuFormat"
+        "com.mojang.renderpearl.api.GpuFormat"
+        if rules.render_api == "renderpearl"
+        else "com.mojang.blaze3d.GpuFormat"
         if is_current_named
         else "com.mojang.blaze3d.textures.TextureFormat",
     )
@@ -9227,7 +9520,7 @@ def check_overlay_bytecode() -> None:
     )
     authlib_session_constructor = method_section(
         authlib_session,
-        "protected com.mojang.authlib.yggdrasil.YggdrasilMinecraftSessionService(com.mojang.authlib.yggdrasil.ServicesKeySet, java.net.Proxy, com.mojang.authlib.Environment);",
+        authlib_session_constructor_header,
     )
     skin_texture_download = method_section(
         skin_texture_downloader,
@@ -9632,13 +9925,18 @@ def check_overlay_bytecode() -> None:
             and "areturn" in server_text_filter_create
             and "java/awt" not in server_main
             and "ProcessHandle" not in server_main
-            and "YggdrasilAuthenticationService.createOffline" in server_main
             and 'YggdrasilAuthenticationService."<init>":(Ljava/net/Proxy;)V' not in server_main
             and "ManagementServer" not in dedicated_server_init
             and "QueryThreadGs4.create" not in dedicated_server_init
             and "RconThread.create" not in dedicated_server_init
             and "ServerWatchdog" not in dedicated_server_init
             and "ManagementServer.stop" not in dedicated_server_stop,
+        ),
+        (
+            # authlib 9 and older; authlib 10 (26.3) keeps discovery with the key
+            # set disabled, asserted by quickcheck/profile_263_server.py.
+            "Official server Main uses the offline Yggdrasil authentication service",
+            "YggdrasilAuthenticationService.createOffline" in server_main,
         ),
         (
             "Browser dedicated server grants commands after its local player list exists",
@@ -10266,7 +10564,7 @@ def check_overlay_bytecode() -> None:
                     in gl_render_pipeline
                 and "Field gaius$primitiveTopology:I" in gl_render_pipeline
             )
-            if version == "26.2"
+            if is_named_family(version)
             else (
                 "final com.mojang.blaze3d.vertex.VertexFormat gaius$vertexFormat;"
                     in gl_render_pipeline
@@ -10361,7 +10659,7 @@ def check_overlay_bytecode() -> None:
                 and "GlStateManager._vertexAttribIPointer" in vertex_array_cache_emulated
                 and "GlStateManager._vertexAttribPointer" in vertex_array_cache_emulated
             )
-            if version == "26.2"
+            if is_named_family(version)
             else (
                 "private static boolean shouldNormalize" in vertex_array_cache
                 and "VertexFormatElement$Usage.COLOR" in vertex_array_cache
@@ -12634,18 +12932,241 @@ def check_overlay_bytecode() -> None:
             and "InactivityFpsLimit" not in framerate_reason,
         ),
     ]
-    for name, ok in checks:
-        print_check(name, ok)
+    report_profile_checks(version, checks)
 
 
-def main() -> int:
+QUICKCHECK_MODULE_DIRECTORY = PORT / "scripts" / "quickcheck"
+MODULE_JAVAP_TIMEOUT_SECONDS = 300
+ModuleResult = tuple[str, "bool | None", str]
+
+
+def check_profile_dispatch() -> None:
+    section("Profile dispatch")
+    profile_id = ACTIVE_PROFILE_ID or "<unresolved>"
+    print(f"active profile: {profile_id}")
+    rules = profile_rules(ACTIVE_PROFILE_ID)
+    if rules is None:
+        print_check(f"Active profile {profile_id} has quick-check rules", False)
+        return
+    print(
+        f"rule family: {rules.family}; window library: {rules.window_library[1]}; "
+        f"render API: {rules.render_api}; authlib session: {rules.authlib_session[0]}"
+    )
+    print(
+        f"domain modules: {', '.join(rules.domain_modules) or 'none'}; "
+        f"not-applicable overlay checks: {len(rules.not_applicable)}"
+    )
+
+
+def profile_module_path(profile_id: str, domain: str) -> Path:
+    return QUICKCHECK_MODULE_DIRECTORY / f"profile_{profile_id.replace('.', '')}_{domain}.py"
+
+
+def load_profile_module(profile_id: str, domain: str):
+    path = profile_module_path(profile_id, domain)
+    name = f"gaius_quickcheck_{path.stem}"
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def module_javap(classpath: Path | list[Path], class_name: str) -> str:
+    """``javap -c -p`` output for the domain modules, or "" when it cannot run."""
+    entries = classpath if isinstance(classpath, list) else [classpath]
+    try:
+        javap = resolve_javap()
+        completed = subprocess.run(
+            [
+                str(javap),
+                "-J-Duser.language=en",
+                "-classpath",
+                os.pathsep.join(str(entry) for entry in entries),
+                "-c",
+                "-p",
+                class_name,
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=MODULE_JAVAP_TIMEOUT_SECONDS,
+        )
+    except (JavapPrerequisiteError, OSError, subprocess.SubprocessError):
+        return ""
+    return completed.stdout if completed.returncode == 0 else ""
+
+
+def _captured_pass_fail(output: str) -> list[ModuleResult]:
+    results: list[ModuleResult] = []
+    for line in output.splitlines():
+        match = re.match(r"^(PASS|FAIL) (.*)$", line)
+        if match:
+            results.append((match.group(2), match.group(1) == "PASS", ""))
+        elif line.strip():
+            results.append((line, None, ""))
+    return results
+
+
+def _module_263_render(module, version: str) -> list[ModuleResult]:
+    # The module prints its checks and returns only the failures; keep its
+    # output order.  The 26.2 sibling overlay feeds its optional 3.4.1 check.
+    sibling = OVERLAYS.parent / "26.2"
+    overlay_262 = sibling if OVERLAYS.name == version and sibling.is_dir() else None
+    buffer = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buffer):
+            module.run(OVERLAYS, overlay_262, verify=True)
+    except FileNotFoundError as exc:
+        return _captured_pass_fail(buffer.getvalue()) + [
+            ("render prerequisites are present", False, str(exc))
+        ]
+    return _captured_pass_fail(buffer.getvalue())
+
+
+def _module_263_input(module, version: str) -> list[ModuleResult]:
+    return [(name, ok, "") for name, ok in module.checks(PORT, OVERLAYS, module_javap)]
+
+
+def _module_263_terrain(module, version: str) -> list[ModuleResult]:
+    # Always pass the jar: a missing overlay fails the bytecode check instead
+    # of silently reducing the module to its source contracts.
+    client = OVERLAYS / f"client-named-{version}-gaius.jar"
+    return [(name, ok, "") for name, ok in module.checks(ROOT, client)]
+
+
+def _module_263_worldgen(module, version: str) -> list[ModuleResult]:
+    client = OVERLAYS / f"client-named-{version}-gaius.jar"
+    if not client.is_file():
+        return [("patched client jar is present", False, rel(client))]
+    tool_classes = OVERLAYS / "tool-classes"
+    return list(
+        module.run_checks(
+            client,
+            str(resolve_javap()),
+            tool_classes if tool_classes.is_dir() else None,
+            module.default_asm_classpath(),
+        )
+    )
+
+
+def _module_263_server(module, version: str) -> list[ModuleResult]:
+    return [(name, ok, "") for name, ok in module.checks(ROOT, OVERLAYS, module_javap)]
+
+
+def _module_263_ui(module, version: str) -> list[ModuleResult]:
+    client = OVERLAYS / f"client-named-{version}-gaius.jar"
+    vanilla = PORT / "work" / version / "client-named.jar"
+    missing = [rel(path) for path in (client, vanilla) if not path.is_file()]
+    if missing:
+        return [("patched and vanilla client jars are present", False, ", ".join(missing))]
+    javap = resolve_javap()
+    results = list(module.checks(client, vanilla, javap))
+    runtime_classes = TARGET / "maven" / "classes"
+    if runtime_classes.is_dir():
+        results += module.runtime_checks(runtime_classes, javap)
+    else:
+        # Fail closed like the module's own CLI: the runtime checks need the
+        # javac output of the profile source set.
+        results.append((
+            f"{version} runtime classes present",
+            False,
+            f"{rel(runtime_classes)} not found (generate-pom.sh + mvnw compile)",
+        ))
+    return results
+
+
+# Adapter per domain module.  Each module keeps its own entry point (the work
+# packages own them); the adapter feeds it this run's profile-scoped paths.
+PROFILE_MODULE_ADAPTERS = {
+    ("26.3", "render"): _module_263_render,
+    ("26.3", "input"): _module_263_input,
+    ("26.3", "terrain"): _module_263_terrain,
+    ("26.3", "worldgen"): _module_263_worldgen,
+    ("26.3", "server"): _module_263_server,
+    ("26.3", "ui"): _module_263_ui,
+}
+
+
+def check_profile_modules() -> None:
+    version = ACTIVE_PROFILE_ID
+    rules = profile_rules(version)
+    section(f"Profile {version or '<unresolved>'} domain modules")
+    if rules is None:
+        print_check(f"Profile {version or '<unresolved>'} has domain module rules", False)
+        return
+    if not rules.domain_modules:
+        print(f"no domain modules for profile {version}")
+        return
+    for domain in rules.domain_modules:
+        label = f"[{version} {domain}]"
+        path = profile_module_path(version, domain)
+        adapter = PROFILE_MODULE_ADAPTERS.get((version, domain))
+        if adapter is None or not path.is_file():
+            print_check(f"{label} module {rel(path)} exists and has an adapter", False)
+            continue
+        print(f"-- {label} {rel(path)}")
+        try:
+            results = adapter(load_profile_module(version, domain), version)
+        except Exception as exc:  # noqa: BLE001 - a crashing module is a failure
+            print_check(f"{label} module ran", False)
+            print(f"  {type(exc).__name__}: {exc}")
+            continue
+        if not any(ok is not None for _, ok, _ in results):
+            print_check(f"{label} module reported checks", False)
+            continue
+        for name, ok, detail in results:
+            if ok is None:
+                print(f"  {name}")
+                continue
+            print_check(f"{label} {name}", bool(ok))
+            if detail and not ok:
+                print(f"  {detail}")
+
+
+USAGE = """usage: quick-check.py [--domain-modules]
+
+The active profile is port/config.json's versionProfile, or
+GAIUS_VERSION_PROFILE_PATH (for example versions/26.3.json).
+
+  --domain-modules  run only the profile dispatch and the profile's
+                    port/scripts/quickcheck domain modules (needs the
+                    build-overlays.sh output and, for 26.3 ui, the javac
+                    output of the profile source set; no TeaVM build)
+"""
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = sys.argv[1:] if argv is None else argv
+    domain_modules_only = False
+    for argument in arguments:
+        if argument == "--domain-modules":
+            domain_modules_only = True
+        elif argument in ("-h", "--help"):
+            print(USAGE, end="")
+            return 0
+        else:
+            print(f"quick-check.py: unknown argument {argument}", file=sys.stderr)
+            print(USAGE, end="", file=sys.stderr)
+            return 2
     os.chdir(ROOT)
     print(f"root: {ROOT}")
-    check_gap()
-    check_build_timeline()
-    check_latest_states()
-    check_source_patches()
-    check_overlay_bytecode()
+    check_profile_dispatch()
+    if not domain_modules_only:
+        check_gap()
+        check_build_timeline()
+        check_latest_states()
+        check_source_patches()
+        check_overlay_bytecode()
+    check_profile_modules()
     if FAILURES:
         print(f"\n{len(FAILURES)} quick-check failure(s):")
         for name in FAILURES:

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import {spawn} from "node:child_process";
+import {readFileSync} from "node:fs";
 import {mkdtemp, mkdir, rm, writeFile} from "node:fs/promises";
 import {createServer} from "node:net";
 import {tmpdir} from "node:os";
@@ -18,8 +19,10 @@ const nativePath = (value) => {
   return process.platform === "win32" && /^\/[A-Za-z](?:\/|$)/.test(text)
     ? `${text[1].toUpperCase()}:${text.slice(2)}` : text;
 };
+// Without GAIUS_VERSION_PROFILE_PATH the default profile is port/config.json's versionProfile.
 const profileId = basename(nativePath(
-  process.env.GAIUS_VERSION_PROFILE_PATH || "versions/26.2.json",
+  process.env.GAIUS_VERSION_PROFILE_PATH
+    || JSON.parse(readFileSync(new URL("../config.json", import.meta.url), "utf8")).versionProfile,
 ).replaceAll("\\", "/")).replace(/\.json$/, "");
 const defaultOutputRoot = nativePath(process.env.GAIUS_BUILD_ROOT) ||
   (process.env.GAIUS_VERSION_PROFILE_PATH ? `port/target/${profileId}` : "port/target");

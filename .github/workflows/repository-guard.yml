@@ -393,13 +393,17 @@ jobs:
             node port/scripts/minecraft-12111-patcher-smoke.mjs
           GAIUS_VERSION_PROFILE_PATH=versions/26.2.json \
             node port/scripts/minecraft-262-p1-patcher-smoke.mjs
+          # AuthlibBrowserPatcher serves authlib 9 (26.2) and 10 (26.3); the
+          # 26.3 half runs in the version-profiles job.
+          node port/scripts/authlib-keyset-constructor-smoke.mjs --run 26.2
 
       - name: Check repository diff formatting
         run: git diff --check
 
   version-profiles:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Fetch, overlays, javac, quick-check domain modules and the 26.3 smokes.
+    timeout-minutes: 60
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -420,6 +424,20 @@ jobs:
 
       - name: Validate every version profile and bring-up list
         run: node port/scripts/check-version-profile.mjs --all
+
+      - name: quick-check profile dispatch and 26.3 source smokes
+        run: |
+          set -euo pipefail
+          # Profile rules, named-family predicate, 26.3 not-applicable table
+          # and the domain module dispatch of quick-check.py.
+          python3 port/scripts/test-quick-check-profile-resolver.py
+          # Node, mock-DOM and source contracts of the 26.3 packages; they
+          # need no Minecraft download.
+          node port/scripts/lwjgl-sdl-browser-dom-smoke.mjs
+          node port/scripts/frame-pacing-yield-smoke.mjs --profile 26.3
+          node port/scripts/browser-opengl-indexed-smoke.mjs
+          node port/scripts/storage-profile-isolation-smoke.mjs
+          python3 port/scripts/test-shader-toolchain-injection.py
 
       - name: Fetch, remap and verify the Minecraft 26.3 profile
         run: |
@@ -497,6 +515,70 @@ jobs:
           rm -f port/work/overlays/26.3/BRINGUP
           grep -Fq 'Refusing to build a release from bring-up overlays' \
             "$RUNNER_TEMP/release-refused-overlays.log"
+
+      - name: 26.3 quick-check domain modules
+        env:
+          GAIUS_VERSION_PROFILE_PATH: versions/26.3.json
+        run: |
+          set -euo pipefail
+          export GAIUS_JAVA_HOME="$JAVA_HOME"
+          # port/scripts/quickcheck/profile_263_{render,input,terrain,worldgen,
+          # server,ui}.py on the overlays and the javac output of the previous
+          # step, through quick-check's profile dispatch (no TeaVM build).
+          python3 port/scripts/quick-check.py --domain-modules
+
+      - name: Bootstrap 26.3 smoke dependencies
+        env:
+          GAIUS_VERSION_PROFILE_PATH: versions/26.3.json
+        run: |
+          set -euo pipefail
+          export GAIUS_JAVA_HOME="$JAVA_HOME"
+          teavm="$(jq -er .teaVMVersion port/config.json)"
+          # build-overlays.sh bootstraps only asm and asm-tree; the patcher
+          # smokes also verify with asm-analysis and relocate with asm-commons,
+          # and the JSBody checks parse with TeaVM's Rhino.
+          for artifact in org.ow2.asm:asm-analysis:9.8 org.ow2.asm:asm-commons:9.8 \
+              "org.teavm:teavm-relocated-libs-rhino:$teavm"; do
+            ./port/mvnw --batch-mode --no-transfer-progress \
+              org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
+              "-Dartifact=$artifact" -Dtransitive=false
+          done
+          # The memory backend smoke compiles a small program with TeaVM.
+          ./port/mvnw --batch-mode --no-transfer-progress \
+            org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get \
+            "-Dartifact=org.teavm:teavm-tooling:$teavm"
+          # lwjgl-browser-compat-smoke.sh and browser-memory-lifecycle-smoke.sh
+          # use ripgrep.
+          if ! command -v rg >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ripgrep
+          fi
+
+      - name: 26.3 patcher and runtime smokes
+        env:
+          GAIUS_VERSION_PROFILE_PATH: versions/26.3.json
+        run: |
+          set -euo pipefail
+          export GAIUS_JAVA_HOME="$JAVA_HOME"
+          # JVM smokes on the vanilla 26.3 inputs and on the overlays and
+          # javac output above; none needs the TeaVM client build.
+          node port/scripts/worldgen-seed-parity.mjs --helpers
+          node port/scripts/lwjgl-sdl-browser-patcher-smoke.mjs
+          node port/scripts/minecraft-263-terrain-patcher-smoke.mjs
+          node port/scripts/minecraft-263-gpu-buffer-pool-smoke.mjs
+          node port/scripts/minecraft-263-mappable-ring-telemetry-smoke.mjs
+          node port/scripts/gpu-fence-retire-smoke.mjs
+          node port/scripts/authlib-keyset-constructor-smoke.mjs --run 26.3
+          node port/scripts/vanilla-pack-layers-263-smoke.mjs
+          node port/scripts/bitmap-font-sharing-263-smoke.mjs
+          bash port/scripts/lwjgl-browser-compat-smoke.sh
+          bash port/scripts/browser-memory-lifecycle-smoke.sh
+          node port/scripts/shader-corpus-smoke.mjs --stages overlay,harness,compare
+          node port/scripts/lwjgl-memory-backend-teavm-smoke.mjs --profile 26.3
+          # The section queue smoke asserts wall-clock p99 poll budgets: one
+          # retry absorbs a noisy runner, a real regression fails both runs.
+          node port/scripts/section-task-queue-smoke.mjs \
+            || node port/scripts/section-task-queue-smoke.mjs
 
   overlay-gates-26-2:
     # G1 (26.2 overlay bytes), G3 (link gaps) and G4 (silent skips) for every
