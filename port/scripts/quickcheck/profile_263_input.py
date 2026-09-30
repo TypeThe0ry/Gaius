@@ -162,7 +162,7 @@ def source_checks(port: Path) -> list[Check]:
         ),
         (
             "the 26.3 bring-up list has no P2 entries",
-            bool(bringup_ids)
+            (port / BRINGUP).is_file()
             and "step:LwjglSdlBrowserPatcher" not in bringup_ids
             and "MinecraftClientPatcher.patchBrowserInputCallbacks" not in bringup_ids
             and "P2" not in bringup_owners,

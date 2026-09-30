@@ -218,6 +218,9 @@ generate_client_release_pom() {
     "$root/port/scripts/generate-pom.sh" >/dev/null
 }
 
+# A release of a renderpearl client (26.3+) must ship the WebAssembly shader
+# toolchain: build-teavm.sh and postprocess-index-html.py fail without it.
+export GAIUS_SHADER_TOOLCHAIN_STRICT=1
 export GAIUS_TEA_OPTIMIZATION_LEVEL="${GAIUS_TEA_OPTIMIZATION_LEVEL:-ADVANCED}"
 export GAIUS_SOURCE_MAPS="${GAIUS_SOURCE_MAPS:-false}"
 export GAIUS_DEBUG_INFO="${GAIUS_DEBUG_INFO:-false}"
