@@ -486,7 +486,6 @@ function inspectClassEvidence(directory, major) {
 const JVM_DRIVER = String.raw`
 import com.mojang.authlib.minecraft.MinecraftProfileTexture;
 import com.mojang.authlib.minecraft.MinecraftProfileTextures;
-import com.mojang.authlib.minecraft.SessionService;
 import com.mojang.authlib.properties.Property;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
@@ -512,8 +511,12 @@ public final class AuthlibBrowserSmokeDriver {
         return Base64.getEncoder().encodeToString(json.getBytes(StandardCharsets.UTF_8));
     }
 
-    static String unpackedSkin(SessionService service, String url) {
-        MinecraftProfileTextures textures = service.unpackTextures(new Property("textures", payload(url)));
+    // The session service interface differs between authlib 9 and 10, so it is called reflectively
+    // (the driver compiles against either jar).
+    static String unpackedSkin(Object service, String url) throws Exception {
+        Method unpack = service.getClass().getMethod("unpackTextures", Property.class);
+        MinecraftProfileTextures textures =
+                (MinecraftProfileTextures) unpack.invoke(service, new Property("textures", payload(url)));
         MinecraftProfileTexture skin = textures.skin();
         return skin == null ? null : skin.getUrl();
     }
@@ -555,7 +558,15 @@ public final class AuthlibBrowserSmokeDriver {
             check((boolean) helper.invoke(null, TEXTURE), "authlib 9: textures.minecraft.net rejected");
             check(!(boolean) helper.invoke(null, evil), "authlib 9: foreign host accepted");
             check(!(boolean) helper.invoke(null, longData), "authlib 9: oversized data URL accepted");
-            checks += 4;
+            Object authentication = Class.forName("com.mojang.authlib.yggdrasil.YggdrasilAuthenticationService")
+                    .getMethod("createOffline", Proxy.class).invoke(null, Proxy.NO_PROXY);
+            Object service = authentication.getClass().getMethod("createMinecraftSessionService")
+                    .invoke(authentication);
+            check(service.getClass() == session, "session service is " + service.getClass());
+            check(TEXTURE.equals(unpackedSkin(service, TEXTURE)), "authlib 9: unpackTextures dropped a Mojang skin");
+            check(DATA_SKIN.equals(unpackedSkin(service, DATA_SKIN)), "authlib 9: unpackTextures dropped an uploaded skin");
+            check(unpackedSkin(service, evil) == null, "authlib 9: unpackTextures kept a foreign skin URL");
+            checks += 8;
             System.out.println("AUTHLIB_JVM_OK major=9 checks=" + checks);
             return;
         }
@@ -606,8 +617,7 @@ public final class AuthlibBrowserSmokeDriver {
 
         // unpackTextures end to end through the patched session service (BrowserAuthlibGson
         // decode, then the helper) with offline discovery.
-        SessionService service = (SessionService) discoveryType.getMethod("createMinecraftSessionService")
-                .invoke(offline);
+        Object service = discoveryType.getMethod("createMinecraftSessionService").invoke(offline);
         check(service.getClass() == session, "session service is " + service.getClass());
         check(TEXTURE.equals(unpackedSkin(service, TEXTURE)), "unpackTextures dropped a Mojang skin offline");
         check(DATA_SKIN.equals(unpackedSkin(service, DATA_SKIN)), "unpackTextures dropped an uploaded skin");
@@ -657,6 +667,10 @@ function runProfile(profile, work) {
     oneJar(join(libraries, "com/google/guava/guava"), /^guava-.*\.jar$/, "guava"),
     ...findJars(join(libraries, "com/google/guava/failureaccess"), /\.jar$/),
     oneJar(join(libraries, "org/slf4j/slf4j-api"), /^slf4j-api-.*\.jar$/, "slf4j"),
+    // authlib 9's HttpAuthenticationService uses commons-lang3 Validate.
+    ...findJars(join(libraries, "org/apache/commons/commons-lang3"), /\.jar$/),
+    ...findJars(join(libraries, "commons-io"), /\.jar$/),
+    ...findJars(join(libraries, "commons-codec"), /\.jar$/),
   ];
   const asmRoot = join(homedir(), ".m2/repository/org/ow2/asm");
   const asm = [join(asmRoot, "asm/9.8/asm-9.8.jar"), join(asmRoot, "asm-tree/9.8/asm-tree-9.8.jar")];

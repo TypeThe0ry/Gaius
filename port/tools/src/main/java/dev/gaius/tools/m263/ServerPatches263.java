@@ -65,6 +65,8 @@ public final class ServerPatches263 {
     }
 
     public static void apply(String jar, Path root, ModernSymbols symbols) throws IOException {
+        // Domain banner: patch-registry-smoke checks the order of these lines.
+        System.out.println("ServerPatches263: 26.3 server patches (P7a)");
         PatchRegistry.run("ServerPatches263.patchRegistryLoadTaskBrowserStartupYield",
                 () -> patchRegistryLoadTaskBrowserStartupYield(jar, root));
         PatchRegistry.run("ServerPatches263.patchPlayerListIsOpBrowserCommands",
