@@ -30,9 +30,6 @@ step:LwjglSpvcBrowserPatcher | P4 | spvc browser shim patcher does not exist yet
 step:MinecraftChunkDrawTelemetryPatcher | P5 | chunk-draw telemetry patcher rejects profile 26.3 (unsupported profile)
 
 # --- MinecraftClientPatcher (PLAN.md 6.1 #1-#47) ---
-MinecraftClientPatcher.patchGlx | P3 | [row 5] GLX removed; drop, M263 patches DebugEntrySystemSpecs.getCpuInfo
-MinecraftClientPatcher.patchGlDebugBrowserNoCallback | P3 | [row 6] GlDebug moved to renderpearl/backend/opengl; rename via ModernSymbols
-MinecraftClientPatcher.patchCommandEncoderLegacyTextureUpload | P3 | [row 7] CommandEncoder is a renderpearl interface; drop, 26.3 BrowserUnihexLoader calls writeToTexture directly
 MinecraftClientPatcher.patchBrowserInputCallbacks | P2 | [row 10] GLFW setup lambda removed; drop, M263 rewrites SDLEventHandler dispatch and MouseHandler.onButton
 MinecraftClientPatcher.patchDynamicUniformsBrowserInitialCapacity | P5 | [row 11] DynamicUniforms replaced by DynamicGpuData; add the 26.3 branch (<init> and writeChunkSections)
 MinecraftClientPatcher.patchAquiferBrowserNearestCenters | P6 | [row 13] NoiseBasedAquifer constructor descriptor and locals changed
@@ -54,15 +51,8 @@ MinecraftClientPatcher.patchChunkGeneratorBrowserSynchronous | P6 | [row 27] cre
 MinecraftClientPatcher.patchWorldCarverBrowserSynchronous | P6 | [row 28] carveEllipsoid is now a static interface method
 MinecraftClientPatcher.patchLevelChunkSectionBrowserSynchronous | P6 | [row 29] fillBiomesFromNoise descriptor changed
 MinecraftClientPatcher.patchNaturalSpawnerGenerationSpawnTelemetry | P6 | [row 30] spawnMobsForChunkGeneration descriptor changed
-MinecraftClientPatcher.patchGlslPreprocessor | P3 | [row 33] GlslPreprocessor removed; drop (includes handled by the P4 shaderc shim)
 MinecraftClientPatcher.patchMappableRingBufferTelemetry | P5 | [row 34] renderpearl GpuBuffer owner and -1L timeout literal
 MinecraftClientPatcher.patchStagedVertexBufferGpuPoolCache | P5 | [row 35] PendingRecycle GpuFence type and endFrame tail changed
-MinecraftClientPatcher.patchGlDevice | P3 | [row 36] GlDevice moved to renderpearl/backend/opengl; rename
-MinecraftClientPatcher.patchGlConstWebGLTextureFormats | P3 | [row 37] GlConst moved to renderpearl/backend/opengl; rename
-MinecraftClientPatcher.patchTextureFormatWebGLColorAspect | P3 | [row 38] GpuFormat moved to renderpearl/api; rename
-MinecraftClientPatcher.patchGlStateManagerTextureBinding | P3 | [row 39] GlStateManager moved to renderpearl/backend/opengl; rename
-MinecraftClientPatcher.patchGlRenderPipelineDrawMetadata | P3 | [row 40] vanilla already caches primitiveTopology; drop
-MinecraftClientPatcher.patchGlCommandEncoder | P3 | [row 41] GlCommandEncoder moved; rename GPU retire and TransientMemory, drop bindDefaultUniforms
 MinecraftClientPatcher.patchGameRendererBrowserAutoScreenshot | P5 | [row 42] GameRenderer.render(DeltaTracker,Z) became render()V
 MinecraftClientPatcher.patchLevelRendererBrowserBlockBreakProgress | P5 | [row 44] prepareChunkRenders target moved to extractSectionDrawGroups; the same driver must fail closed
 MinecraftClientPatcher.patchEntityRenderDispatcherBrowserNullEntityGuard | P5 | [row 45] shouldRender descriptor gained a float
@@ -70,14 +60,8 @@ MinecraftClientPatcher.patchSectionRenderDispatcherBrowserThrottles | P5 | [row 
 MinecraftClientPatcher.patchUberGpuBufferBrowserTelemetry | P5 | [row 47] uploadStagedAllocations takes the renderpearl GpuDevice
 
 # --- Minecraft262BrowserPatcher (PLAN.md 6.1 #48-#59) ---
-Minecraft262BrowserPatcher.patchPreferredGraphicsApi | P3 | [row 48] getBackendsToTry returns renderpearl GpuBackend[]; return [GlBackend]
-Minecraft262BrowserPatcher.patchVulkanBackend | P3 | [row 49] VulkanBackend moved and its API changed; drop, M263 rewrites the stubs
-Minecraft262BrowserPatcher.patchGlDeviceCapabilities | P3 | [row 50] GlDevice moved to renderpearl/backend/opengl; rename
 Minecraft262BrowserPatcher.patchRegionFileStorageCache | P6 | [row 51] getRegionFile removed; patch the 256 limit in cache(J,Optional)
-Minecraft262BrowserPatcher.patchGlBufferMappedViewRanges | P3 | [row 52] GlBuffer$Direct moved and FLUSH_EXPLICIT dropped; drop, M263 ports the flush semantics
 Minecraft262BrowserPatcher.patchLiveFrameTargeting | P5 | [row 53] GameRenderer.extract camera point changed; adapt to extractCamera(DeltaTracker,F) atomically
 Minecraft262BrowserPatcher.patchStagingBuffer | P5 | [row 54] StagingBuffer$Cpu.copyTo takes renderpearl types
 Minecraft262BrowserPatcher.patchUberGpuBufferNodeCleanup | P5 | [row 55] uploadStagedAllocations descriptor, field type and INVOKEINTERFACE
 Minecraft262BrowserPatcher.patchNoiseChunkGraphMapper | P6 | [row 56] NoiseChunk graph mapper call sites gone; 26.2 only, drop on 26.3
-Minecraft262BrowserPatcher.patchMacosUtil | P3 | [row 58] MacosUtil entry points changed; drop, M263 stubs the ObjC/SDL hint setters
-Minecraft262BrowserPatcher.patchVulkanDebug | P3 | [row 59] VulkanDebug moved; unreachable once VulkanBackend is stubbed, drop

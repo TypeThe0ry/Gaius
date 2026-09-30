@@ -3312,8 +3312,9 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchGlDevice(String jar, Path outputRoot) throws IOException {
-        ClassNode node = read(jar, "com/mojang/blaze3d/opengl/GlDevice.class");
-        String owner = "com/mojang/blaze3d/opengl/GlDevice";
+        ModernSymbols symbols = ModernSymbols.cached(jar);
+        String owner = renderName(symbols, "com/mojang/blaze3d/opengl/GlDevice");
+        ClassNode node = read(jar, owner + ".class");
         boolean patchedCapability = false;
         for (MethodNode method : node.methods) {
             if (method.name.equals("<clinit>") && method.desc.equals("()V")) {
@@ -3344,7 +3345,7 @@ public final class MinecraftClientPatcher {
         ClassNode maxTextureOwner = node;
         String maxTextureEntry = owner + ".class";
         if (maxTextureSize == null) {
-            String heuristicsOwner = "com/mojang/blaze3d/opengl/GlHeuristics";
+            String heuristicsOwner = renderName(symbols, "com/mojang/blaze3d/opengl/GlHeuristics");
             maxTextureOwner = read(jar, heuristicsOwner + ".class");
             maxTextureSize = find(maxTextureOwner, "getMaxSupportedTextureSize", "()I");
             maxTextureEntry = heuristicsOwner + ".class";
@@ -3353,7 +3354,7 @@ public final class MinecraftClientPatcher {
         code.add(new IntInsnNode(Opcodes.SIPUSH, 3379));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
-                "com/mojang/blaze3d/opengl/GlStateManager",
+                renderName(symbols, "com/mojang/blaze3d/opengl/GlStateManager"),
                 "_getInteger",
                 "(I)I",
                 false));
@@ -3376,15 +3377,19 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchGlConstWebGLTextureFormats(String jar, Path output) throws IOException {
-        ClassNode node = read(jar, "com/mojang/blaze3d/opengl/GlConst.class");
+        ModernSymbols symbols = ModernSymbols.cached(jar);
+        String legacyOwner = "com/mojang/blaze3d/opengl/GlConst";
+        ClassNode node = read(jar, renderName(symbols, legacyOwner) + ".class");
+        String gpuFormatDescriptor =
+                "(L" + renderName(symbols, "com/mojang/blaze3d/GpuFormat") + ";)I";
         boolean gpuFormat = node.methods.stream()
                 .anyMatch(candidate -> candidate.name.equals("toGlInternalId")
-                        && candidate.desc.equals("(Lcom/mojang/blaze3d/GpuFormat;)I"));
+                        && candidate.desc.equals(gpuFormatDescriptor));
         MethodNode method = find(
                 node,
                 "toGlInternalId",
                 gpuFormat
-                        ? "(Lcom/mojang/blaze3d/GpuFormat;)I"
+                        ? gpuFormatDescriptor
                         : "(Lcom/mojang/blaze3d/textures/TextureFormat;)I");
         boolean patched = false;
         for (var instruction = method.instructions.getFirst();
@@ -3402,14 +3407,16 @@ public final class MinecraftClientPatcher {
         if (!patched) {
             throw new IllegalStateException("GlConst RED8I internal format patch point was not found");
         }
-        write(node, output);
+        write(node, renderEntryOutput(symbols, output, legacyOwner));
     }
 
     private static void patchTextureFormatWebGLColorAspect(String jar, Path root) throws IOException {
         String oldEntry = "com/mojang/blaze3d/textures/TextureFormat.class";
         try (ZipFile input = new ZipFile(jar)) {
             if (input.getEntry(oldEntry) == null) {
-                String currentEntry = "com/mojang/blaze3d/GpuFormat.class";
+                String currentOwner = renderName(
+                        ModernSymbols.cached(jar), "com/mojang/blaze3d/GpuFormat");
+                String currentEntry = currentOwner + ".class";
                 if (input.getEntry(currentEntry) == null) {
                     throw new IllegalStateException("Neither TextureFormat nor GpuFormat was found");
                 }
@@ -3419,7 +3426,7 @@ public final class MinecraftClientPatcher {
                 boolean checksStencil = false;
                 for (AbstractInsnNode instruction : hasColorAspect.instructions) {
                     if (instruction instanceof MethodInsnNode call
-                            && call.owner.equals("com/mojang/blaze3d/GpuFormat")
+                            && call.owner.equals(currentOwner)
                             && call.desc.equals("()Z")) {
                         checksDepth |= call.name.equals("hasDepthAspect");
                         checksStencil |= call.name.equals("hasStencilAspect");
@@ -3456,8 +3463,10 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchGlStateManagerTextureBinding(String jar, Path output) throws IOException {
-        ClassNode node = read(jar, "com/mojang/blaze3d/opengl/GlStateManager.class");
-        String owner = "com/mojang/blaze3d/opengl/GlStateManager";
+        ModernSymbols symbols = ModernSymbols.cached(jar);
+        String legacyOwner = "com/mojang/blaze3d/opengl/GlStateManager";
+        String owner = renderName(symbols, legacyOwner);
+        ClassNode node = read(jar, owner + ".class");
         boolean patchedBindTexture = false;
         boolean patchedActiveTexture = false;
         for (MethodNode method : node.methods) {
@@ -3504,7 +3513,7 @@ public final class MinecraftClientPatcher {
         if (!patchedBindTexture || !patchedActiveTexture) {
             throw new IllegalStateException("GlStateManager texture binding patch points were not found");
         }
-        writeComputeFrames(node, output);
+        writeComputeFrames(node, renderEntryOutput(symbols, output, legacyOwner));
     }
 
     private static void insertAfterFirstRenderThreadAssert(MethodNode method, InsnList code) {
@@ -3525,6 +3534,16 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchGlRenderPipelineDrawMetadata(String jar, Path output) throws IOException {
+        ModernSymbols symbols = ModernSymbols.cached(jar);
+        if (symbols.renderpearl()) {
+            // 26.3 GlRenderPipeline already caches the GL primitive topology
+            // (primitiveTopology()I), and patchGlCommandEncoder keeps the vanilla draw path.
+            find(read(jar, symbols.renderType("com/mojang/blaze3d/opengl/GlRenderPipeline")
+                    + ".class"), "primitiveTopology", "()I");
+            PatchRegistry.dropped("MinecraftClientPatcher.patchGlRenderPipelineDrawMetadata", jar,
+                    "com/mojang/blaze3d/opengl/GlRenderPipeline.class");
+            return;
+        }
         String owner = "com/mojang/blaze3d/opengl/GlRenderPipeline";
         String pipeline = "com/mojang/blaze3d/pipeline/RenderPipeline";
         String vertexFormat = "com/mojang/blaze3d/vertex/VertexFormat";
@@ -3661,8 +3680,9 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchGlCommandEncoder(String jar, Path outputRoot) throws IOException {
-        ClassNode node = read(jar, "com/mojang/blaze3d/opengl/GlCommandEncoder.class");
-        String owner = "com/mojang/blaze3d/opengl/GlCommandEncoder";
+        ModernSymbols symbols = ModernSymbols.cached(jar);
+        String owner = renderName(symbols, "com/mojang/blaze3d/opengl/GlCommandEncoder");
+        ClassNode node = read(jar, owner + ".class");
         String pass = "com/mojang/blaze3d/opengl/GlRenderPass";
         String renderSystem = "com/mojang/blaze3d/systems/RenderSystem";
         String slice = "Lcom/mojang/blaze3d/buffers/GpuBufferSlice;";
@@ -3671,6 +3691,30 @@ public final class MinecraftClientPatcher {
 
         if (findNullable(node, "submit", "()V") != null) {
             patchCurrentGlCommandEncoderGpuRetire(jar, node, owner, outputRoot);
+        }
+        if (symbols.renderpearl()) {
+            // 26.3 (renderpearl GL backend): only the GPU retire and transient-memory rotations
+            // above carry over. trySetup/drawFromBuffers are gone; the vanilla setupDraw +
+            // executeDraw path runs on the delegated GL entry points, and the vanilla
+            // RenderSystem.bindDefaultUniforms binds Projection, Fog, Globals and Lighting, so
+            // gaius$bindDefaultUniforms and the drawFromBuffers replacement are dropped.
+            if (findNullable(node, "submit", "()V") == null) {
+                throw new IllegalStateException(owner + ".submit()V was not found");
+            }
+            String renderPass = symbols.renderType(pass);
+            for (MethodNode method : node.methods) {
+                if (method.name.equals("trySetup") || method.name.equals("drawFromBuffers")) {
+                    throw new IllegalStateException(owner + "." + method.name
+                            + " exists again; re-check the 26.3 draw path");
+                }
+            }
+            find(node, "setupDraw", "(L" + renderPass + ";)V");
+            find(node, "executeDraw", "(L" + renderPass + ";IIIL"
+                    + symbols.renderType("com/mojang/blaze3d/IndexType") + ";II)V");
+            find(read(jar, renderSystem + ".class"), "bindDefaultUniforms",
+                    "(L" + symbols.renderType("com/mojang/blaze3d/systems/RenderPass") + ";)V");
+            writeComputeFrames(node, output);
+            return;
         }
 
         MethodNode helper = new MethodNode(
@@ -3860,11 +3904,14 @@ public final class MinecraftClientPatcher {
                     "Current GlCommandEncoder submit limit changed: " + maxSubmits.value);
         }
         maxSubmits.value = BROWSER_GPU_RETIRE_SLOTS;
+        ModernSymbols symbols = ModernSymbols.cached(jar);
+        String transientMemoryOwner =
+                renderName(symbols, "com/mojang/blaze3d/opengl/GlTransientMemory");
 
         MethodNode constructor = find(
                 node,
                 "<init>",
-                "(Lcom/mojang/blaze3d/opengl/GlDevice;)V");
+                "(L" + renderName(symbols, "com/mojang/blaze3d/opengl/GlDevice") + ";)V");
         FieldInsnNode fencesStore = null;
         for (AbstractInsnNode instruction : constructor.instructions) {
             if (instruction instanceof FieldInsnNode field
@@ -3897,7 +3944,7 @@ public final class MinecraftClientPatcher {
                     && field.getOpcode() == Opcodes.PUTFIELD
                     && field.owner.equals(owner)
                     && field.name.equals("transientMemory")
-                    && field.desc.equals("Lcom/mojang/blaze3d/opengl/GlTransientMemory;")) {
+                    && field.desc.equals("L" + transientMemoryOwner + ";")) {
                 transientMemoryStore = field;
                 break;
             }
@@ -3910,7 +3957,7 @@ public final class MinecraftClientPatcher {
                 transientMemoryStore,
                 new TypeInsnNode(
                         Opcodes.CHECKCAST,
-                        "com/mojang/blaze3d/opengl/GlTransientMemory"));
+                        transientMemoryOwner));
 
         MethodNode currentSubmitSlot = find(node, "currentSubmitSlot", "()I");
         InsnList currentSlotCode = new InsnList();
@@ -3977,7 +4024,7 @@ public final class MinecraftClientPatcher {
         poll.instructions.add(new VarInsnNode(Opcodes.LLOAD, 2));
         poll.instructions.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
-                "com/mojang/blaze3d/opengl/GlStateManager",
+                renderName(symbols, "com/mojang/blaze3d/opengl/GlStateManager"),
                 "_glClientWaitSync",
                 "(JIJ)I",
                 false));
@@ -4080,10 +4127,10 @@ public final class MinecraftClientPatcher {
                 Opcodes.GETFIELD,
                 owner,
                 "transientMemory",
-                "Lcom/mojang/blaze3d/opengl/GlTransientMemory;"));
+                "L" + transientMemoryOwner + ";"));
         submitCode.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL,
-                "com/mojang/blaze3d/opengl/GlTransientMemory",
+                transientMemoryOwner,
                 "rotate",
                 "()V",
                 false));
@@ -4161,10 +4208,10 @@ public final class MinecraftClientPatcher {
                 Opcodes.GETFIELD,
                 owner,
                 "transientMemory",
-                "Lcom/mojang/blaze3d/opengl/GlTransientMemory;"));
+                "L" + transientMemoryOwner + ";"));
         closeCode.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL,
-                "com/mojang/blaze3d/opengl/GlTransientMemory",
+                transientMemoryOwner,
                 "close",
                 "()V",
                 false));
@@ -4212,22 +4259,23 @@ public final class MinecraftClientPatcher {
 
     private static void patchCurrentGlTransientMemoryRotations(
             String jar, Path outputRoot) throws IOException {
-        String owner = "com/mojang/blaze3d/opengl/GlTransientMemory$PersistentMapping";
+        ModernSymbols symbols = ModernSymbols.cached(jar);
+        String owner = renderName(
+                symbols, "com/mojang/blaze3d/opengl/GlTransientMemory$PersistentMapping");
         ClassNode node = read(jar, owner + ".class");
         MethodNode constructor = find(
                 node,
                 "<init>",
-                "(Lcom/mojang/blaze3d/opengl/GlDevice;"
-                        + "Lcom/mojang/blaze3d/opengl/GlCommandEncoder;)V");
+                "(L" + renderName(symbols, "com/mojang/blaze3d/opengl/GlDevice") + ";"
+                        + "L" + renderName(symbols, "com/mojang/blaze3d/opengl/GlCommandEncoder")
+                        + ";)V");
         FieldInsnNode rotationsStore = null;
         for (AbstractInsnNode instruction : constructor.instructions) {
             if (instruction instanceof FieldInsnNode field
                     && field.getOpcode() == Opcodes.PUTFIELD
                     && field.owner.equals(owner)
                     && field.name.equals("rotations")
-                    && field.desc.equals(
-                            "[Lcom/mojang/blaze3d/opengl/"
-                                    + "GlTransientMemory$PersistentMapping$Rotation;")) {
+                    && field.desc.equals("[L" + owner + "$Rotation;")) {
                 rotationsStore = field;
                 break;
             }
@@ -4251,8 +4299,14 @@ public final class MinecraftClientPatcher {
 
     private static void patchCurrentGlTransientMemoryFallback(
             String jar, Path outputRoot) throws IOException {
-        String owner = "com/mojang/blaze3d/opengl/GlTransientMemory$Fallback";
-        String base = "com/mojang/blaze3d/opengl/GlTransientMemory";
+        ModernSymbols symbols = ModernSymbols.cached(jar);
+        String owner = renderName(
+                symbols, "com/mojang/blaze3d/opengl/GlTransientMemory$Fallback");
+        String base = renderName(symbols, "com/mojang/blaze3d/opengl/GlTransientMemory");
+        String device = renderName(symbols, "com/mojang/blaze3d/opengl/GlDevice");
+        String encoder = renderName(symbols, "com/mojang/blaze3d/opengl/GlCommandEncoder");
+        String blockAllocator =
+                renderName(symbols, "com/mojang/blaze3d/util/TransientBlockAllocator");
         String rotationsField = "gaius$retireRotations";
         ClassNode node = read(jar, owner + ".class");
         node.fields.add(new FieldNode(
@@ -4265,8 +4319,7 @@ public final class MinecraftClientPatcher {
         MethodNode constructor = find(
                 node,
                 "<init>",
-                "(Lcom/mojang/blaze3d/opengl/GlDevice;"
-                        + "Lcom/mojang/blaze3d/opengl/GlCommandEncoder;)V");
+                "(L" + device + ";L" + encoder + ";)V");
         AbstractInsnNode constructorReturn = null;
         for (AbstractInsnNode instruction : constructor.instructions) {
             if (instruction.getOpcode() == Opcodes.RETURN) {
@@ -4294,10 +4347,10 @@ public final class MinecraftClientPatcher {
                 Opcodes.GETFIELD,
                 base,
                 "encoder",
-                "Lcom/mojang/blaze3d/opengl/GlCommandEncoder;"));
+                "L" + encoder + ";"));
         rotateCode.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL,
-                "com/mojang/blaze3d/opengl/GlCommandEncoder",
+                encoder,
                 "currentSubmitSlot",
                 "()I",
                 false));
@@ -4333,10 +4386,10 @@ public final class MinecraftClientPatcher {
                 Opcodes.GETFIELD,
                 owner,
                 "blockAllocator",
-                "Lcom/mojang/blaze3d/util/TransientBlockAllocator;"));
+                "L" + blockAllocator + ";"));
         rotateCode.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL,
-                "com/mojang/blaze3d/util/TransientBlockAllocator",
+                blockAllocator,
                 "rotate",
                 "()Ljava/lang/Runnable;",
                 false));
@@ -4485,6 +4538,13 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchGlslPreprocessor(String jar, Path output) throws IOException {
+        if (ModernSymbols.cached(jar).renderTypeRemoved(
+                "com/mojang/blaze3d/preprocessor/GlslPreprocessor")) {
+            // 26.3 compiles shaders through shaderc (includes via its callbacks, D5/P4).
+            PatchRegistry.dropped("MinecraftClientPatcher.patchGlslPreprocessor", jar,
+                    "com/mojang/blaze3d/preprocessor/GlslPreprocessor.class");
+            return;
+        }
         ClassNode node = read(jar, "com/mojang/blaze3d/preprocessor/GlslPreprocessor.class");
         MethodNode clinit = find(node, "<clinit>", "()V");
         boolean changed = false;
@@ -10929,6 +10989,13 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchGlx(String jar, Path output) throws IOException {
+        if (ModernSymbols.cached(jar).renderTypeRemoved("com/mojang/blaze3d/platform/GLX")) {
+            // 26.3 removed GLX; RenderPatches263.patchSystemSpecsCpuInfo patches its successor
+            // DebugEntrySystemSpecs.getCpuInfo, and nothing is written at the GLX entry.
+            PatchRegistry.dropped("MinecraftClientPatcher.patchGlx", jar,
+                    "com/mojang/blaze3d/platform/GLX.class");
+            return;
+        }
         ClassNode node = read(jar, "com/mojang/blaze3d/platform/GLX.class");
         boolean found = false;
         for (MethodNode method : node.methods) {
@@ -10947,16 +11014,49 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchGlDebugBrowserNoCallback(String jar, Path output) throws IOException {
-        ClassNode node = read(jar, "com/mojang/blaze3d/opengl/GlDebug.class");
+        ModernSymbols symbols = ModernSymbols.cached(jar);
+        String legacyOwner = "com/mojang/blaze3d/opengl/GlDebug";
+        String owner = renderName(symbols, legacyOwner);
+        ClassNode node = read(jar, owner + ".class");
         MethodNode method = find(
                 node,
                 "enableDebugCallback",
-                "(IZLjava/util/Set;)Lcom/mojang/blaze3d/opengl/GlDebug;");
+                "(IZLjava/util/Set;)L" + owner + ";");
         InsnList code = new InsnList();
         code.add(new InsnNode(Opcodes.ACONST_NULL));
         code.add(new InsnNode(Opcodes.ARETURN));
         replace(method, code, 1, 3);
-        write(node, output);
+        write(node, renderEntryOutput(symbols, output, legacyOwner));
+    }
+
+    /**
+     * The name of the 26.2 render class {@code key} in {@code symbols}' jar (for example the
+     * renderpearl name on 26.3), or {@code key} itself when the jar has no such class (26.2, or
+     * an older blaze3d generation that lacks it). Used by the P3 render patches.
+     */
+    private static String renderName(ModernSymbols symbols, String key) {
+        return symbols.renderTypePresent(key) ? symbols.renderType(key) : key;
+    }
+
+    /**
+     * The output entry for a render class that main() resolved against the output root under its
+     * 26.2 name ({@code legacyClass}, without {@code .class}). On a jar that moved the class
+     * (26.3 renderpearl) this is the moved entry; otherwise it is {@code output} unchanged.
+     */
+    private static Path renderEntryOutput(ModernSymbols symbols, Path output, String legacyClass) {
+        Path legacy = Path.of(legacyClass + ".class");
+        if (!output.endsWith(legacy)) {
+            throw new IllegalArgumentException(output + " is not the output entry of " + legacyClass);
+        }
+        String current = renderName(symbols, legacyClass);
+        if (current.equals(legacyClass)) {
+            return output;
+        }
+        Path root = output;
+        for (int index = 0; index < legacy.getNameCount(); index++) {
+            root = root.getParent();
+        }
+        return root.resolve(current + ".class");
     }
 
     private static void patchUtilRunNamedBrowserOutput(Path output) throws IOException {
@@ -11868,6 +11968,18 @@ public final class MinecraftClientPatcher {
 
     private static void patchCommandEncoderLegacyTextureUpload(String jar, Path output)
             throws IOException {
+        ModernSymbols symbols = ModernSymbols.cached(jar);
+        if (symbols.renderpearl()) {
+            // 26.3 CommandEncoder is a renderpearl interface; the only consumer of the legacy
+            // bridge, BrowserUnihexLoader, has a 26.3 copy that calls writeToTexture directly.
+            String encoder = symbols.renderType("com/mojang/blaze3d/systems/CommandEncoder");
+            String texture = symbols.renderType("com/mojang/blaze3d/textures/GpuTexture");
+            find(read(jar, encoder + ".class"), "writeToTexture",
+                    "(L" + texture + ";Ljava/nio/ByteBuffer;IIIIII)V");
+            PatchRegistry.dropped("MinecraftClientPatcher.patchCommandEncoderLegacyTextureUpload",
+                    jar, "com/mojang/blaze3d/systems/CommandEncoder.class");
+            return;
+        }
         String owner = "com/mojang/blaze3d/systems/CommandEncoder";
         ClassNode node = read(jar, owner + ".class");
         String legacyDescriptor = "(Lcom/mojang/blaze3d/textures/GpuTexture;Ljava/nio/ByteBuffer;"
@@ -14014,6 +14126,12 @@ public final class MinecraftClientPatcher {
         LabelNode animationLoop = new LabelNode();
         LabelNode animationsDone = new LabelNode();
         LabelNode spriteUboDone = new LabelNode();
+        // 26.3 moved GpuBuffer to renderpearl and made it an interface: the field type and the
+        // close() call follow the probed jar (INVOKEVIRTUAL on the 26.2 abstract class).
+        ModernSymbols symbols = ModernSymbols.cached(jar);
+        String gpuBufferKey = "com/mojang/blaze3d/buffers/GpuBuffer";
+        String gpuBuffer = symbols.renderType(gpuBufferKey);
+        int gpuBufferInvoke = symbols.invokeOpcode(gpuBufferKey);
         InsnList prepareCode = prepareForReload.instructions;
         // Detach the ticker list before closing its GPU state.  The TeaVM
         // browser runtime cannot then observe a partially closed animation
@@ -14077,27 +14195,27 @@ public final class MinecraftClientPatcher {
                 Opcodes.GETFIELD,
                 atlasOwner,
                 "spriteUbos",
-                "Lcom/mojang/blaze3d/buffers/GpuBuffer;"));
+                "L" + gpuBuffer + ";"));
         prepareCode.add(new JumpInsnNode(Opcodes.IFNULL, spriteUboDone));
         prepareCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
         prepareCode.add(new FieldInsnNode(
                 Opcodes.GETFIELD,
                 atlasOwner,
                 "spriteUbos",
-                "Lcom/mojang/blaze3d/buffers/GpuBuffer;"));
+                "L" + gpuBuffer + ";"));
         prepareCode.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL,
-                "com/mojang/blaze3d/buffers/GpuBuffer",
+                gpuBufferInvoke,
+                gpuBuffer,
                 "close",
                 "()V",
-                false));
+                gpuBufferInvoke == Opcodes.INVOKEINTERFACE));
         prepareCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
         prepareCode.add(new InsnNode(Opcodes.ACONST_NULL));
         prepareCode.add(new FieldInsnNode(
                 Opcodes.PUTFIELD,
                 atlasOwner,
                 "spriteUbos",
-                "Lcom/mojang/blaze3d/buffers/GpuBuffer;"));
+                "L" + gpuBuffer + ";"));
         prepareCode.add(spriteUboDone);
         prepareCode.add(new VarInsnNode(Opcodes.ALOAD, 0));
         prepareCode.add(new MethodInsnNode(
@@ -18087,8 +18205,11 @@ public final class MinecraftClientPatcher {
         boolean semanticElementIds = node.methods.stream()
                 .anyMatch(method -> method.name.equals("beginElement")
                         && method.desc.equals("(I)J"));
+        // Semantic ids and the VertexFormatElement owner come from the probed jar: 26.3 inserted
+        // UV3=5 (NORMAL moved to 6) and moved VertexFormatElement to renderpearl.
+        ModernSymbols symbols = ModernSymbols.cached(jar);
         addBrowserBeginElementOffset(node, owner, semanticElementIds);
-        patchBufferBuilderBrowserGuiWriters(node, owner, semanticElementIds);
+        patchBufferBuilderBrowserGuiWriters(node, owner, semanticElementIds, symbols);
         MethodNode method = find(node, "addVertex", "(FFFIFFIIFFF)V");
         LabelNode fallback = new LabelNode();
         LabelNode fastPath = new LabelNode();
@@ -18357,15 +18478,17 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchBufferBuilderBrowserGuiWriters(
-            ClassNode node, String owner, boolean semanticElementIds) {
-        patchBufferBuilderFloatPosition(node, owner, semanticElementIds);
-        patchBufferBuilderMatrixPosition(node, owner, semanticElementIds);
-        patchBufferBuilderSetColor(node, owner, semanticElementIds);
-        patchBufferBuilderSetUv(node, owner, semanticElementIds);
-        patchBufferBuilderSetOverlayOrLight(node, owner, "setOverlay", semanticElementIds);
-        patchBufferBuilderSetOverlayOrLight(node, owner, "setLight", semanticElementIds);
+            ClassNode node, String owner, boolean semanticElementIds, ModernSymbols symbols) {
+        patchBufferBuilderFloatPosition(node, owner, semanticElementIds, symbols);
+        patchBufferBuilderMatrixPosition(node, owner, semanticElementIds, symbols);
+        patchBufferBuilderSetColor(node, owner, semanticElementIds, symbols);
+        patchBufferBuilderSetUv(node, owner, semanticElementIds, symbols);
+        patchBufferBuilderSetOverlayOrLight(
+                node, owner, "setOverlay", semanticElementIds, symbols);
+        patchBufferBuilderSetOverlayOrLight(
+                node, owner, "setLight", semanticElementIds, symbols);
         patchBufferBuilderUvShort(node, owner, semanticElementIds);
-        patchBufferBuilderSetNormal(node, owner, semanticElementIds);
+        patchBufferBuilderSetNormal(node, owner, semanticElementIds, symbols);
     }
 
     private static void addBrowserBeginElementOffset(
@@ -18456,9 +18579,9 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchBufferBuilderFloatPosition(
-            ClassNode node, String owner, boolean semanticElementIds) {
+            ClassNode node, String owner, boolean semanticElementIds, ModernSymbols symbols) {
         MethodNode method = find(node, "addVertex", "(FFF)Lcom/mojang/blaze3d/vertex/VertexConsumer;");
-        InsnList code = beginBufferBuilderVertexPosition(owner, 4, semanticElementIds);
+        InsnList code = beginBufferBuilderVertexPosition(owner, 4, semanticElementIds, symbols);
         code.add(new VarInsnNode(Opcodes.FLOAD, 1));
         code.add(new VarInsnNode(Opcodes.FLOAD, 2));
         code.add(new VarInsnNode(Opcodes.FLOAD, 3));
@@ -18474,13 +18597,13 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchBufferBuilderMatrixPosition(
-            ClassNode node, String owner, boolean semanticElementIds) {
+            ClassNode node, String owner, boolean semanticElementIds, ModernSymbols symbols) {
         MethodNode method = findOrCreateMethod(
                 node,
                 Opcodes.ACC_PUBLIC,
                 "addVertex",
                 "(Lorg/joml/Matrix4fc;FFF)Lcom/mojang/blaze3d/vertex/VertexConsumer;");
-        InsnList code = beginBufferBuilderVertexPosition(owner, 5, semanticElementIds);
+        InsnList code = beginBufferBuilderVertexPosition(owner, 5, semanticElementIds, symbols);
         code.add(new VarInsnNode(Opcodes.ALOAD, 1));
         code.add(new VarInsnNode(Opcodes.FLOAD, 2));
         code.add(new VarInsnNode(Opcodes.FLOAD, 3));
@@ -18497,7 +18620,7 @@ public final class MinecraftClientPatcher {
     }
 
     private static InsnList beginBufferBuilderVertexPosition(
-            String owner, int offsetLocal, boolean semanticElementIds) {
+            String owner, int offsetLocal, boolean semanticElementIds, ModernSymbols symbols) {
         InsnList code = new InsnList();
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
@@ -18507,17 +18630,18 @@ public final class MinecraftClientPatcher {
                 "()J",
                 false));
         if (semanticElementIds) {
+            String element = renderName(symbols, "com/mojang/blaze3d/vertex/VertexFormatElement");
             code.add(new VarInsnNode(Opcodes.ALOAD, 0));
             code.add(new FieldInsnNode(
                     Opcodes.GETFIELD,
                     owner,
                     "elements",
-                    "[Lcom/mojang/blaze3d/vertex/VertexFormatElement;"));
+                    "[L" + element + ";"));
             code.add(new InsnNode(Opcodes.ICONST_0));
             code.add(new InsnNode(Opcodes.AALOAD));
             code.add(new MethodInsnNode(
                     Opcodes.INVOKEVIRTUAL,
-                    "com/mojang/blaze3d/vertex/VertexFormatElement",
+                    element,
                     "offset",
                     "()I",
                     false));
@@ -18570,11 +18694,11 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchBufferBuilderSetColor(
-            ClassNode node, String owner, boolean semanticElementIds) {
+            ClassNode node, String owner, boolean semanticElementIds, ModernSymbols symbols) {
         MethodNode method = find(node, "setColor", "(I)Lcom/mojang/blaze3d/vertex/VertexConsumer;");
         InsnList code = new InsnList();
         LabelNode done = beginBrowserElementWrite(
-                code, owner, "COLOR", 2, semanticElementIds);
+                code, owner, "COLOR", 2, semanticElementIds, symbols);
         code.add(new VarInsnNode(Opcodes.ILOAD, 1));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
@@ -18589,11 +18713,11 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchBufferBuilderSetUv(
-            ClassNode node, String owner, boolean semanticElementIds) {
+            ClassNode node, String owner, boolean semanticElementIds, ModernSymbols symbols) {
         MethodNode method = find(node, "setUv", "(FF)Lcom/mojang/blaze3d/vertex/VertexConsumer;");
         InsnList code = new InsnList();
         LabelNode done = beginBrowserElementWrite(
-                code, owner, "UV0", 3, semanticElementIds);
+                code, owner, "UV0", 3, semanticElementIds, symbols);
         code.add(new VarInsnNode(Opcodes.FLOAD, 1));
         code.add(new VarInsnNode(Opcodes.FLOAD, 2));
         code.add(new MethodInsnNode(
@@ -18609,12 +18733,13 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchBufferBuilderSetOverlayOrLight(
-            ClassNode node, String owner, String methodName, boolean semanticElementIds) {
+            ClassNode node, String owner, String methodName, boolean semanticElementIds,
+            ModernSymbols symbols) {
         MethodNode method = find(node, methodName, "(I)Lcom/mojang/blaze3d/vertex/VertexConsumer;");
         String element = methodName.equals("setOverlay") ? "UV1" : "UV2";
         InsnList code = new InsnList();
         LabelNode done = beginBrowserElementWrite(
-                code, owner, element, 2, semanticElementIds);
+                code, owner, element, 2, semanticElementIds, symbols);
         code.add(new VarInsnNode(Opcodes.ILOAD, 1));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESTATIC,
@@ -18668,11 +18793,11 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchBufferBuilderSetNormal(
-            ClassNode node, String owner, boolean semanticElementIds) {
+            ClassNode node, String owner, boolean semanticElementIds, ModernSymbols symbols) {
         MethodNode method = find(node, "setNormal", "(FFF)Lcom/mojang/blaze3d/vertex/VertexConsumer;");
         InsnList code = new InsnList();
         LabelNode done = beginBrowserElementWrite(
-                code, owner, "NORMAL", 4, semanticElementIds);
+                code, owner, "NORMAL", 4, semanticElementIds, symbols);
         code.add(new VarInsnNode(Opcodes.FLOAD, 1));
         code.add(new VarInsnNode(Opcodes.FLOAD, 2));
         code.add(new VarInsnNode(Opcodes.FLOAD, 3));
@@ -18693,10 +18818,14 @@ public final class MinecraftClientPatcher {
             String owner,
             String elementName,
             int offsetLocal,
-            boolean semanticElementIds) {
+            boolean semanticElementIds,
+            ModernSymbols symbols) {
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         if (semanticElementIds) {
-            code.add(new InsnNode(Opcodes.ICONST_0 + bufferBuilderSemanticId(elementName)));
+            int semanticId = bufferBuilderSemanticId(symbols, elementName);
+            code.add(semanticId <= 5
+                    ? new InsnNode(Opcodes.ICONST_0 + semanticId)
+                    : new IntInsnNode(Opcodes.BIPUSH, semanticId));
         } else {
             code.add(new FieldInsnNode(
                     Opcodes.GETSTATIC,
@@ -18720,6 +18849,19 @@ public final class MinecraftClientPatcher {
         loadBrowserData(code, owner);
         code.add(new VarInsnNode(Opcodes.ILOAD, offsetLocal));
         return done;
+    }
+
+    /**
+     * {@code BufferBuilder.<elementName>_SEMANTIC_ID} of the probed jar (26.3: UV3=5, NORMAL=6),
+     * cross-checked against the 26.2 table for the ids 26.2 defines.
+     */
+    private static int bufferBuilderSemanticId(ModernSymbols symbols, String elementName) {
+        int id = symbols.vertexSemantic(elementName);
+        if (!symbols.vertexSemantics.containsKey("UV3") && id != bufferBuilderSemanticId(elementName)) {
+            throw new IllegalStateException("BufferBuilder." + elementName + "_SEMANTIC_ID=" + id
+                    + " but the 26.2 layout expects " + bufferBuilderSemanticId(elementName));
+        }
+        return id;
     }
 
     private static int bufferBuilderSemanticId(String elementName) {

@@ -1983,21 +1983,26 @@ public final class Minecraft262BrowserPatcher {
     }
 
     private static void patchPreferredGraphicsApi(String jar, Path root) throws IOException {
+        // 26.3 moved both types to renderpearl (GpuBackend is an interface there); ModernSymbols
+        // returns the 26.2 names unchanged on 26.2.
+        ModernSymbols symbols = ModernSymbols.cached(jar);
+        String gpuBackend = symbols.renderType("com/mojang/blaze3d/systems/GpuBackend");
+        String glBackend = symbols.renderType("com/mojang/blaze3d/opengl/GlBackend");
         String owner = "net/minecraft/client/PreferredGraphicsApi";
         ClassNode node = read(jar, owner + ".class");
         MethodNode method = find(node, "getBackendsToTry",
-                "()[Lcom/mojang/blaze3d/systems/GpuBackend;");
+                "()[L" + gpuBackend + ";");
         InsnList code = new InsnList();
         code.add(new InsnNode(Opcodes.ICONST_1));
         code.add(new TypeInsnNode(
-                Opcodes.ANEWARRAY, "com/mojang/blaze3d/systems/GpuBackend"));
+                Opcodes.ANEWARRAY, gpuBackend));
         code.add(new InsnNode(Opcodes.DUP));
         code.add(new InsnNode(Opcodes.ICONST_0));
-        code.add(new TypeInsnNode(Opcodes.NEW, "com/mojang/blaze3d/opengl/GlBackend"));
+        code.add(new TypeInsnNode(Opcodes.NEW, glBackend));
         code.add(new InsnNode(Opcodes.DUP));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKESPECIAL,
-                "com/mojang/blaze3d/opengl/GlBackend",
+                glBackend,
                 "<init>",
                 "()V",
                 false));
@@ -2009,6 +2014,13 @@ public final class Minecraft262BrowserPatcher {
     }
 
     private static void patchVulkanBackend(String jar, Path root) throws IOException {
+        if (ModernSymbols.cached(jar).renderpearl()) {
+            // 26.3 moved VulkanBackend and changed its API (no setWindowHints, a static
+            // checkBackendAvailable, SDL windows); RenderPatches263.patchVulkanBackend stubs it.
+            PatchRegistry.dropped("Minecraft262BrowserPatcher.patchVulkanBackend", jar,
+                    "com/mojang/blaze3d/vulkan/VulkanBackend.class");
+            return;
+        }
         String owner = "com/mojang/blaze3d/vulkan/VulkanBackend";
         String exception = "com/mojang/blaze3d/systems/BackendCreationException";
         String reason = exception + "$Reason";
@@ -2056,7 +2068,7 @@ public final class Minecraft262BrowserPatcher {
     }
 
     private static void patchGlDeviceCapabilities(String jar, Path root) throws IOException {
-        String owner = "com/mojang/blaze3d/opengl/GlDevice";
+        String owner = ModernSymbols.cached(jar).renderType("com/mojang/blaze3d/opengl/GlDevice");
         ClassNode node = read(jar, owner + ".class");
         MethodNode initializer = find(node, "<clinit>", "()V");
         int returns = 0;
@@ -2339,6 +2351,13 @@ public final class Minecraft262BrowserPatcher {
     }
 
     private static void patchGlBufferMappedViewRanges(String jar, Path root) throws IOException {
+        if (ModernSymbols.cached(jar).renderpearl()) {
+            // 26.3 no longer sets GL_MAP_FLUSH_EXPLICIT_BIT, so this 26.2 patch would never
+            // flush; RenderPatches263.patchGlBufferExplicitFlush adds the bit and the ranges.
+            PatchRegistry.dropped("Minecraft262BrowserPatcher.patchGlBufferMappedViewRanges", jar,
+                    "com/mojang/blaze3d/opengl/GlBuffer$Direct$1.class");
+            return;
+        }
         String directOwner = "com/mojang/blaze3d/opengl/GlBuffer$Direct";
         String closeOwner = directOwner + "$1";
         String mappedView = "com/mojang/blaze3d/buffers/GpuBufferSlice$MappedView";
@@ -2977,6 +2996,15 @@ public final class Minecraft262BrowserPatcher {
     }
 
     private static void patchMacosUtil(String jar, Path root) throws IOException {
+        if (ModernSymbols.cached(jar).renderpearl()) {
+            // 26.3 MacosUtil has no getNsWindow/setWindowColorSpaceForOpenGLBecauseGLFWDoesnt;
+            // RenderPatches263.patchMacosUtil stubs its ObjC and SDL-hint entry points.
+            PatchRegistry.dropped("Minecraft262BrowserPatcher.patchMacosUtil", jar,
+                    "com/mojang/blaze3d/platform/MacosUtil#getNsWindow",
+                    "com/mojang/blaze3d/platform/MacosUtil"
+                            + "#setWindowColorSpaceForOpenGLBecauseGLFWDoesnt");
+            return;
+        }
         String owner = "com/mojang/blaze3d/platform/MacosUtil";
         ClassNode node = read(jar, owner + ".class");
         for (String descriptor : new String[] {
@@ -2999,6 +3027,13 @@ public final class Minecraft262BrowserPatcher {
     }
 
     private static void patchVulkanDebug(String jar, Path root) throws IOException {
+        if (ModernSymbols.cached(jar).renderpearl()) {
+            // 26.3 VulkanDebug is only created by VulkanInstance, which only VulkanBackend
+            // constructs; RenderPatches263.patchVulkanBackend makes it unreachable.
+            PatchRegistry.dropped("Minecraft262BrowserPatcher.patchVulkanDebug", jar,
+                    "com/mojang/blaze3d/vulkan/VulkanDebug.class");
+            return;
+        }
         String owner = "com/mojang/blaze3d/vulkan/VulkanDebug";
         ClassNode node = read(jar, owner + ".class");
         MethodNode method = find(node, "create",
