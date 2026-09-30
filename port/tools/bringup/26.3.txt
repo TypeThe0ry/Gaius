@@ -45,7 +45,6 @@ MinecraftClientPatcher.patchGlDebugBrowserNoCallback | P3 | [row 6] GlDebug move
 MinecraftClientPatcher.patchCommandEncoderLegacyTextureUpload | P3 | [row 7] CommandEncoder is a renderpearl interface; drop, 26.3 BrowserUnihexLoader calls writeToTexture directly
 MinecraftClientPatcher.patchPauseScreenBrowserSingleplayer | P8 | [row 8] Open to LAN anchor moved; add the 26.3 anchor before the level null check
 MinecraftClientPatcher.patchOptionsBrowserLowSimulationDistance | P8 | [row 9] sprint default is an SDL scancode; read InputConstants KEY_LCONTROL/KEY_R via ModernSymbols
-MinecraftClientPatcher.patchBrowserInputCallbacks | P2 | [row 10] GLFW setup lambda removed; drop, M263 rewrites SDLEventHandler dispatch and MouseHandler.onButton
 MinecraftClientPatcher.patchDynamicUniformsBrowserInitialCapacity | P5 | [row 11] DynamicUniforms replaced by DynamicGpuData; add the 26.3 branch (<init> and writeChunkSections)
 MinecraftClientPatcher.patchServerGamePacketListenerBrowserWorker | P7a | [row 12] both ServerChunkCache.move calls moved into handlePlayerPositionChange
 MinecraftClientPatcher.patchAquiferBrowserNearestCenters | P6 | [row 13] NoiseBasedAquifer constructor descriptor and locals changed
