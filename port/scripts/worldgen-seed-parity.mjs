@@ -19,6 +19,14 @@
 //        [--vanilla client | --server-jar <server.jar> | --download-server]
 //        [--patched <client-named-26.3-gaius.jar>]
 //   node port/scripts/worldgen-seed-parity.mjs --compare <reference.json> <candidate.json>
+//   node port/scripts/worldgen-seed-parity.mjs --helpers [--helper-count 4000]
+//
+// --helpers evaluates the JavaScript bodies (@JSBody) of the browser helpers the P6 patches
+// call (BrowserBiomeManager.nearestCorner, BrowserAquifer.selectNearestCached,
+// BrowserClimate.distance, BrowserBitStorage.get/getAndSet) in Node against vectors from
+// worldgen-seed-parity/HelperVectors.java: vanilla BiomeManager.getBiome(III) and
+// SimpleBitStorage, and the JVM transcriptions in shims/ for the rest. Together with the
+// --patched run this ties the browser helpers to vanilla worldgen.
 //
 // Vanilla input: by default the profile's client-original.jar, SHA-1 checked against
 // port/work/<id>/version.json (downloads.client) and run with the libraries of
@@ -88,7 +96,7 @@ function usage(message) {
 
 function parseArgs(argv) {
   const options = {profile: "26.3", seeds: DEFAULT_SEEDS, side: 8, modes: ["terrain", "full"],
-    vanilla: "client"};
+    vanilla: "client", helperCount: 4000};
   for (let index = 0; index < argv.length; index++) {
     const argument = argv[index];
     const value = () => argv[++index] ?? usage(`${argument} needs a value`);
@@ -104,6 +112,8 @@ function parseArgs(argv) {
       case "--patched": options.patched = resolve(value()); break;
       case "--java": options.java = value(); break;
       case "--compare": options.compare = [resolve(value()), resolve(value())]; break;
+      case "--helpers": options.helpers = true; break;
+      case "--helper-count": options.helperCount = Number(value()); break;
       default: usage(`unknown argument ${argument}`);
     }
   }
@@ -308,8 +318,104 @@ function preparePatched(options, work, vanilla, harnessClasses, temp) {
   return [shims, overlay, harnessClasses, unsigned, ...vanilla.libraries];
 }
 
+/**
+ * The JavaScript bodies (@JSBody) of the browser helpers the P6 patches call, keyed by
+ * method name, read from the Java sources the browser build compiles.
+ */
+function readJsBodies(file) {
+  const source = readFileSync(file, "utf8");
+  const bodies = {};
+  const pattern = /@JSBody\(\s*params\s*=\s*(\{[^}]*\}|"[^"]*")\s*,\s*script\s*=\s*"""\r?\n([\s\S]*?)"""\s*\)[\s\S]*?public\s+static\s+native\s+\S+\s+(\w+)\s*\(/g;
+  for (const match of source.matchAll(pattern)) {
+    const params = [...match[1].matchAll(/"([^"]+)"/g)].map((param) => param[1]);
+    bodies[match[3]] = new Function(...params, match[2]);
+  }
+  return bodies;
+}
+
+/** Checks the helper JavaScript against vectors from vanilla code and the JVM transcriptions. */
+function checkHelpers(vectors) {
+  const failures = [];
+  const expect = (label, ok, detail) => { if (!ok && failures.length < 20) failures.push(`${label}: ${detail}`); };
+  const biome = readJsBodies(join(root, "port/src/main/java/dev/gaius/browser/BrowserBiomeManager.java"));
+  const aquifer = readJsBodies(join(root, "port/src/main/java/dev/gaius/browser/BrowserAquifer.java"));
+  const climate = readJsBodies(join(root, "port/src/main/java/dev/gaius/browser/BrowserClimate.java"));
+  const bits = readJsBodies(join(root, "port/overrides/classlib/src/main/java/dev/gaius/browser/BrowserBitStorage.java"));
+  for (const [name, bodies, key] of [["BrowserBiomeManager", biome, "nearestCorner"],
+    ["BrowserAquifer", aquifer, "selectNearestCached"], ["BrowserClimate", climate, "distance"],
+    ["BrowserBitStorage", bits, "get"], ["BrowserBitStorage", bits, "getAndSet"]]) {
+    if (typeof bodies[key] !== "function") failures.push(`${name}.${key}: @JSBody not found`);
+  }
+  if (failures.length) return {failures, counts: {}};
+  // BiomeManager.getBiome(III) in 26.3 (and the patched body): quart = (shifted >> 2) + corner bit.
+  for (const [seed, sx, sy, sz, qx, qy, qz] of vectors.biomeManager) {
+    const corner = biome.nearestCorner(BigInt(seed), sx, sy, sz);
+    const actual = [(sx >> 2) + ((corner >>> 2) & 1), (sy >> 2) + ((corner >>> 1) & 1), (sz >> 2) + (corner & 1)];
+    expect("BiomeManager zoom vs vanilla getBiome(III)", actual.join() === [qx, qy, qz].join(),
+      `seed ${seed} shifted ${sx},${sy},${sz}: js ${actual} vanilla ${qx},${qy},${qz}`);
+  }
+  // SimpleBitStorage get/getAndSet on one cell, typed-array fast path and BigInt path.
+  for (const [bitCount, perLong, slot, value, before, got, previous, after] of vectors.bitStorage) {
+    const local = slot % perLong;
+    for (const [label, make] of [["typed", (word) => new BigInt64Array([BigInt(word)])],
+      ["bigint", (word) => [BigInt(word)]]]) {
+      const read = bits.get(make(before), local, perLong, bitCount);
+      expect(`BitStorage.get ${label} vs SimpleBitStorage`, read === got,
+        `bits ${bitCount} slot ${local}: js ${read} vanilla ${got}`);
+      const cells = make(before);
+      const old = bits.getAndSet(cells, local, value, perLong, bitCount);
+      expect(`BitStorage.getAndSet ${label} vs SimpleBitStorage`,
+        old === previous && BigInt.asIntN(64, BigInt(cells[0])).toString() === after,
+        `bits ${bitCount} slot ${local} value ${value}: js ${old}/${cells[0]} vanilla ${previous}/${after}`);
+    }
+  }
+  for (const [packed, minX, minY, minZ, sizeX, sizeZ, x, y, z, hit, output] of vectors.aquifer) {
+    const target = new Int32Array(8);
+    const result = aquifer.selectNearestCached(new BigInt64Array(packed.map(BigInt)), minX, minY, minZ,
+      sizeX, sizeZ, x, y, z, target);
+    expect("Aquifer nearest centers vs JVM transcription", result === hit
+      && (!hit || Array.from(target).join() === output.join()),
+    `block ${x},${y},${z}: js ${result} ${Array.from(target)} jvm ${hit} ${output}`);
+  }
+  for (const [bounds, target, distance] of vectors.climate) {
+    const result = climate.distance(new Float64Array(bounds), new BigInt64Array(target.map(BigInt)));
+    expect("Climate RTree distance vs JVM transcription", result.toString() === distance,
+      `js ${result} jvm ${distance}`);
+  }
+  return {failures, counts: {biomeManager: vectors.biomeManager.length,
+    bitStorage: vectors.bitStorage.length, aquifer: vectors.aquifer.length, climate: vectors.climate.length}};
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2));
+  if (options.helpers) {
+    const work = join(root, "port/work", options.profile);
+    const outDir = options.outDir || join(root, "port/target", options.profile, "worldgen-seed-parity");
+    mkdirSync(outDir, {recursive: true});
+    const vanilla = await vanillaInputs(options, work, outDir);
+    const temp = mkdtempSync(join(tmpdir(), "gaius-seed-parity-helpers-"));
+    try {
+      const classes = join(temp, "classes");
+      mkdirSync(classes, {recursive: true});
+      const classpath = [vanilla.jar, ...vanilla.libraries];
+      const shimDir = join(harnessDir, "shims", "dev", "gaius", "browser");
+      run(javaTool(options, "javac"), ["-J-Duser.language=en", "--release", "25", "-proc:none",
+        "-cp", classpath.join(delimiter), "-d", classes, join(harnessDir, "HelperVectors.java"),
+        ...readdirSync(shimDir).filter((name) => name.endsWith(".java")).map((name) => join(shimDir, name))],
+      "compile HelperVectors");
+      const vectorsFile = join(outDir, "helper-vectors.json");
+      run(javaTool(options, "java"), ["-cp", [classes, ...classpath].join(delimiter),
+        "dev.gaius.parity.HelperVectors", vectorsFile, String(options.helperCount)], "HelperVectors");
+      const {failures, counts} = checkHelpers(JSON.parse(readFileSync(vectorsFile, "utf8")));
+      for (const failure of failures) console.log(`WORLDGEN_HELPER_MISMATCH ${failure}`);
+      console.log(`WORLDGEN_HELPERS ${JSON.stringify(counts)} failures=${failures.length}`);
+      console.log(`WORLDGEN_SEED_PARITY_RESULT ${failures.length === 0 ? "PASS" : "FAIL"}`);
+      process.exitCode = failures.length === 0 ? 0 : 1;
+    } finally {
+      rmSync(temp, {recursive: true, force: true});
+    }
+    return;
+  }
   if (options.compare) {
     const [reference, candidate] = options.compare.map((file) => JSON.parse(readFileSync(file, "utf8")));
     const ok = report(`${reference.label || "reference"} vs ${candidate.label || "candidate"} `
