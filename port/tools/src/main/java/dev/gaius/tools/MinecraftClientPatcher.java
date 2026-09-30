@@ -11236,6 +11236,19 @@ public final class MinecraftClientPatcher {
 
     private static void patchInputConstants(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "com/mojang/blaze3d/platform/InputConstants.class");
+        ClassNode type = read(jar, "com/mojang/blaze3d/platform/InputConstants$Type.class");
+        if (type.fields.stream().noneMatch(field -> field.name.equals("KEYSYM"))) {
+            // Minecraft 26.3 (SDL3): InputConstants$Type is {KEYBOARD, MOUSE}; the vanilla
+            // <clinit> (LOGGER, UNKNOWN = KEYBOARD.getOrCreate(0)) is browser-safe and there is
+            // no raw-mouse API to stub. Rewriting <clinit> would read the removed KEYSYM and
+            // leave LOGGER null, so the class is left as it is.
+            PatchRegistry.dropped("MinecraftClientPatcher.patchInputConstants.glfw", jar,
+                    "com/mojang/blaze3d/platform/InputConstants$Type#KEYSYM",
+                    "com/mojang/blaze3d/platform/InputConstants#isRawMouseInputSupported",
+                    "com/mojang/blaze3d/platform/InputConstants#GLFW_RAW_MOUSE_MOTION_SUPPORTED",
+                    "com/mojang/blaze3d/platform/InputConstants#GLFW_RAW_MOUSE_MOTION");
+            return;
+        }
         boolean hasRawMouseSupportHandle = node.fields.stream().anyMatch(field ->
                 field.name.equals("GLFW_RAW_MOUSE_MOTION_SUPPORTED")
                         && field.desc.equals("Ljava/lang/invoke/MethodHandle;"));
@@ -12270,8 +12283,30 @@ public final class MinecraftClientPatcher {
     }
 
     private static void patchBrowserInputCallbacks(String jar, Path root) throws IOException {
+        if (!hasGlfwInputSetup(jar)) {
+            // Minecraft 26.3 (SDL3): MouseHandler/KeyboardHandler lost setup(Window) and its
+            // Minecraft.execute dispatch lambdas; SDLEventHandler dispatches instead and
+            // InputPatches263 rewrites it together with the MouseHandler.onButton hooks.
+            PatchRegistry.dropped("MinecraftClientPatcher.patchBrowserMouseHandler", jar,
+                    "net/minecraft/client/MouseHandler#setup");
+            PatchRegistry.dropped("MinecraftClientPatcher.patchBrowserKeyboardHandler", jar,
+                    "net/minecraft/client/KeyboardHandler#setup");
+            return;
+        }
         patchBrowserMouseHandler(jar, root.resolve("net/minecraft/client/MouseHandler.class"));
         patchBrowserKeyboardHandler(jar, root.resolve("net/minecraft/client/KeyboardHandler.class"));
+    }
+
+    /** GLFW-era input (26.2, 1.21.11): MouseHandler has setup(Window) with dispatch lambdas. */
+    private static boolean hasGlfwInputSetup(String jar) throws IOException {
+        ClassNode mouseHandler = read(jar, "net/minecraft/client/MouseHandler.class");
+        for (MethodNode method : mouseHandler.methods) {
+            if (method.name.equals("setup")
+                    && method.desc.equals("(Lcom/mojang/blaze3d/platform/Window;)V")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void patchBrowserMouseHandler(String jar, Path output) throws IOException {
@@ -21617,6 +21652,14 @@ public final class MinecraftClientPatcher {
 
     private static void patchOpenUri(String jar, Path output) throws IOException {
         ClassNode node = read(jar, "net/minecraft/util/Util$OS.class");
+        if (node.methods.stream().noneMatch(method ->
+                method.name.equals("openUri") && method.desc.equals("(Ljava/net/URI;)V"))) {
+            // Minecraft 26.3 opens links through Blaze3D.openUri -> SDL_OpenURL, which
+            // InputPatches263 redirects; Util$OS no longer has openUri.
+            PatchRegistry.dropped("MinecraftClientPatcher.patchOpenUri.utilOs", jar,
+                    "net/minecraft/util/Util$OS#openUri");
+            return;
+        }
         for (MethodNode method : node.methods) {
             if (method.name.equals("openUri") && method.desc.equals("(Ljava/net/URI;)V")) {
                 InsnList code = new InsnList();

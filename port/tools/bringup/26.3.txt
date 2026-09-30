@@ -24,11 +24,9 @@
 # A reason may contain neither '#' (starts a comment) nor '|'.
 
 # --- build-overlays.sh library steps (PLAN.md 6.3) ---
-step:LwjglSdlBrowserPatcher | P2 | SDL3 browser shim patcher does not exist yet (D3)
 step:MinecraftChunkDrawTelemetryPatcher | P5 | chunk-draw telemetry patcher rejects profile 26.3 (unsupported profile)
 
 # --- MinecraftClientPatcher (PLAN.md 6.1 #1-#47) ---
-MinecraftClientPatcher.patchBrowserInputCallbacks | P2 | [row 10] GLFW setup lambda removed; drop, M263 rewrites SDLEventHandler dispatch and MouseHandler.onButton
 MinecraftClientPatcher.patchDynamicUniformsBrowserInitialCapacity | P5 | [row 11] DynamicUniforms replaced by DynamicGpuData; add the 26.3 branch (<init> and writeChunkSections)
 MinecraftClientPatcher.patchAquiferBrowserNearestCenters | P6 | [row 13] NoiseBasedAquifer constructor descriptor and locals changed
 MinecraftClientPatcher.patchBeardifierBrowserPackedCompute | P6 | [row 14] Beardifier.compute rewritten by vanilla; drop

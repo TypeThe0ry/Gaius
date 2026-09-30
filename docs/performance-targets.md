@@ -13,7 +13,10 @@ framerate option set to `Unlimited`. The reference display must refresh at
 callbacks. Keep the default `Fast` preset unless the scenario says otherwise.
 Enable the temporary `window.__gaiusFrameTelemetry` object before the measured
 interval, warm up for 30 seconds, then capture five uninterrupted minutes of
-`BrowserGlfw.swapBuffers` frame data. Clear the object after exporting the
+frame data from the present boundary: `BrowserGlfw.swapBuffers` on the 26.2
+profile, `BrowserSdl.SDL_GL_SwapWindow` on the 26.3 profile (both write the same
+`window.__gaiusFrameTelemetry` fields; see `measurement.frameSourceByProfile` in
+`port/scripts/performance-contract.json`). Clear the object after exporting the
 result.
 
 The default 6 render / 4 simulation distances are part of the contract. A run

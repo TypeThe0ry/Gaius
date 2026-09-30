@@ -25,6 +25,10 @@
   },
   "measurement": {
     "frameSource": "BrowserGlfw.swapBuffers",
+    "frameSourceByProfile": {
+      "26.2": "BrowserGlfw.swapBuffers",
+      "26.3": "BrowserSdl.SDL_GL_SwapWindow"
+    },
     "frameSampleCapacity": 65536,
     "warmupMs": 30000,
     "sampleMs": 300000,
