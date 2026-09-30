@@ -364,6 +364,30 @@ fi
   "$dist/${GAIUS_TARGET_FILE:-classes.js}" \
   "$minecraft_version" \
   "$asset_index_id"
+# A renderpearl client (26.3+) ships the WebAssembly shader toolchain that
+# build-teavm.sh published next to classes.js; postprocess-index-html.py has
+# just tagged the page with its loader (STRICT: the files exist).  The
+# toolchain manifest names every toolchain file with size and sha256, so one
+# identity sidecar on it (role shader-toolchain) covers the loader and the four
+# modules.  build-portable-html.py embeds the toolchain and verifies this
+# sidecar.  26.2 has no loader tag and keeps exactly its six identity roles.
+shader_toolchain_manifest="$dist/gaius-shader-toolchain.json"
+if grep -Fq 'data-gaius-shader-toolchain' "$dist/index.html"; then
+  if [[ ! -s "$shader_toolchain_manifest" ]]; then
+    echo "The page loads the WebAssembly shader toolchain but $shader_toolchain_manifest is missing" >&2
+    exit 1
+  fi
+  if [[ "${GAIUS_SKIP_CLIENT_BUILD:-false}" == "true" ]]; then
+    verify_identity shader-toolchain "$shader_toolchain_manifest" \
+      || { echo "Cannot resume release: shader toolchain build identity is stale or missing" >&2; exit 1; }
+    echo "Reusing the identity-verified shader toolchain: $shader_toolchain_manifest"
+  else
+    write_identity shader-toolchain "$shader_toolchain_manifest"
+  fi
+elif [[ -e "$shader_toolchain_manifest" ]]; then
+  echo "The page does not load the WebAssembly shader toolchain but $shader_toolchain_manifest exists" >&2
+  exit 1
+fi
 wasm_hotpath="$dist/gaius-hotpath.wasm"
 if [[ "${GAIUS_SKIP_WASM_HOTPATH:-false}" != "true" ]]; then
   if ! GAIUS_DIST_DIRECTORY="$dist" "$root/port/scripts/build-wasm-hotpath.sh"; then

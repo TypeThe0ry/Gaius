@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string[]]$Profiles = @('1.21.11', '26.2'),
+    [string[]]$Profiles = @('26.2', '26.3'),
     [string]$Tag,
     [string]$TargetBranch,
     [switch]$SkipBuild,
@@ -56,6 +56,14 @@ function Assert-ProfileArtifactsCurrent([string]$profile) {
         @('vanilla-assets', 'vanilla-assets.pack.gz'),
         @('relay-registry', 'relay-nodes.json')
     )
+    # A page that loads the WebAssembly shader toolchain (26.3+) also carries the
+    # toolchain identity that build-teavm-release.sh wrote on its manifest; the
+    # six roles above stay the complete set for 26.2.
+    $index = Join-Path $dist 'index.html'
+    if (-not (Test-Path $index)) { throw "Missing $profile artifact: $index" }
+    if ((Get-Content $index -Raw).Contains('data-gaius-shader-toolchain')) {
+        $roles += ,@('shader-toolchain', 'gaius-shader-toolchain.json')
+    }
     foreach ($entry in $roles) {
         $artifact = Join-Path $dist $entry[1]
         if (-not (Test-Path $artifact)) { throw "Missing $profile artifact: $artifact" }

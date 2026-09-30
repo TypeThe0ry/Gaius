@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import gzip
 import hashlib
@@ -348,6 +349,72 @@ class PortableArtifactIdentityTest(unittest.TestCase):
         ):
             self.write_compiler_profile(root, role, artifact, pom, resources)
         return root, dist, dist / "Gaius.html"
+
+    # A 26.3-style fixture: the client calls the WebAssembly shader toolchain
+    # and the page carries the loader tag of postprocess-index-html.py.
+    SHADER_TOOLCHAIN_CLASSES = (
+        b'"use strict";'
+        b"/*gaius-java-finite-long-cast*/"
+        b"target-attestation;263-startup;"
+        b"window.__gaiusShaderToolchain.shadercBegin()"
+    )
+
+    def add_shader_toolchain(self, root: Path, dist: Path) -> str:
+        """Publish fixture toolchain files, their manifest, sidecar and loader tag."""
+        files = {
+            "gaius-shader-toolchain.js": (
+                "(function (root) { root.__gaiusShaderToolchainReady = "
+                "Promise.resolve(root.__gaiusPortableAssetsReady).then(function () {"
+                " return root.__gaiusShaderToolchainUrls; }); })(globalThis);\n"
+            ).encode("ascii"),
+            "gaius-shaderc.js": b"var GaiusShadercModule = () => {};\n",
+            "gaius-shaderc.wasm": b"\0asm\1\0\0\0shaderc",
+            "gaius-spvc.js": b"var GaiusSpvcModule = () => {};\n",
+            "gaius-spvc.wasm": b"\0asm\1\0\0\0spvc",
+        }
+        for name, value in files.items():
+            (dist / name).write_bytes(value)
+        (dist / "gaius-shader-toolchain.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "emscripten": "6.0.10 (fixture)",
+                    "sources": {"shaderc": "fixture", "spirv-cross": "fixture"},
+                    "files": {
+                        name: {
+                            "bytes": len(value),
+                            "sha256": hashlib.sha256(value).hexdigest(),
+                        }
+                        for name, value in files.items()
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        PORTABLE.build_identity.write_sidecar(
+            root, "shader-toolchain", dist / "gaius-shader-toolchain.json"
+        )
+        token = PORTABLE.shader_toolchain_token(dist)
+        index = dist / "index.html"
+        tag = (
+            f'  <script data-gaius-shader-toolchain data-profile="26.3" '
+            f'src="gaius-shader-toolchain.js?v={token}"></script>\n'
+        )
+        index.write_text(
+            index.read_text(encoding="utf-8").replace("<!doctype html>\n", "<!doctype html>\n" + tag, 1),
+            encoding="utf-8",
+        )
+        return token
+
+    def make_shader_toolchain_fixture(self, directory: str) -> tuple[Path, Path, Path, str]:
+        root, dist, output = self.make_fixture(
+            directory,
+            version="26.3",
+            launcher_asset_index="34",
+            classes=self.SHADER_TOOLCHAIN_CLASSES,
+        )
+        token = self.add_shader_toolchain(root, dist)
+        return root, dist, output, token
 
     @staticmethod
     def run_build(root: Path, dist: Path, output: Path) -> None:
@@ -960,6 +1027,178 @@ class PortableArtifactIdentityTest(unittest.TestCase):
             )
             self.assertEqual(manifest["profile"], "1.21.11")
             self.assertEqual(manifest["signatures"], [])
+
+    @staticmethod
+    def embedded_assets(html: Path) -> dict:
+        text = html.read_text(encoding="utf-8")
+        start = text.index("const embedded = ") + len("const embedded = ")
+        end = text.index(";\n      const workerSource", start)
+        return json.loads(text[start:end])
+
+    def test_26_2_page_gets_no_shader_toolchain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, dist, output = self.make_fixture(directory)
+            self.run_build(root, dist, output)
+
+            manifest = json.loads((dist / "Gaius.manifest.json").read_text(encoding="utf-8"))
+            self.assertNotIn("shaderToolchain", manifest)
+            self.assertEqual(
+                list(self.embedded_assets(output)), ["classes", "server", "wasm", "vanilla"]
+            )
+            html = output.read_text(encoding="utf-8")
+            self.assertNotIn("__gaiusShaderToolchain", html)
+            self.assertNotIn("data-gaius-shader-toolchain", html)
+
+    def test_shader_toolchain_client_embeds_loader_and_modules(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, dist, output, token = self.make_shader_toolchain_fixture(directory)
+            self.run_build(root, dist, output)
+
+            manifest = json.loads((dist / "Gaius.manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["profile"], "26.3")
+            toolchain = manifest["shaderToolchain"]
+            self.assertEqual(toolchain["version"], token)
+            self.assertEqual(toolchain["build"]["role"], "shader-toolchain")
+            self.assertEqual(
+                toolchain["build"]["compatibilitySha256"],
+                manifest["buildIdentity"]["compatibilitySha256"],
+            )
+            self.assertEqual(
+                toolchain["manifest"]["sha256"],
+                PORTABLE.sha256_file(dist / "gaius-shader-toolchain.json"),
+            )
+            self.assertEqual(
+                set(toolchain["modules"]),
+                {"gaius-shaderc.js", "gaius-shaderc.wasm", "gaius-spvc.js", "gaius-spvc.wasm"},
+            )
+            self.assertEqual(
+                toolchain["loader"]["sha256"],
+                PORTABLE.sha256_file(dist / "gaius-shader-toolchain.js"),
+            )
+            self.assertEqual(self.embedded_manifest(output), manifest)
+            self.assertTrue(self.quick_check_identity(root, dist, output))
+
+            html = output.read_text(encoding="utf-8")
+            # The page's own loader tag is gone; the loader runs inline after the
+            # portable bootstrap and before the launcher scripts.
+            self.assertNotIn("gaius-shader-toolchain.js?v=", html)
+            inline = ('  <script data-gaius-shader-toolchain data-profile="26.3" '
+                      'data-gaius-portable-inline="1">\n')
+            self.assertEqual(html.count(inline), 1)
+            self.assertEqual(html.count("data-gaius-shader-toolchain"), 1)
+            bootstrap_at = html.index('<script data-gaius-portable="1">')
+            loader_at = html.index(inline)
+            launcher_at = html.index('  <script>\n    if (typeof Error === "function")')
+            self.assertLess(bootstrap_at, loader_at)
+            self.assertLess(loader_at, launcher_at)
+            self.assertIn(
+                f'window.__gaiusShaderToolchainUrls = {{version: "{token}"}};', html
+            )
+            self.assertIn(
+                (dist / "gaius-shader-toolchain.js").read_text(encoding="utf-8"), html
+            )
+            for key in ("shadercJs", "shadercWasm", "spvcJs", "spvcWasm"):
+                self.assertIn(f"{key}: URL.createObjectURL(", html)
+            embedded = self.embedded_assets(output)
+            self.assertEqual(
+                list(embedded), ["classes", "server", "wasm", "vanilla", "shaderToolchain"]
+            )
+            for key, name in (
+                ("shadercJs", "gaius-shaderc.js"),
+                ("shadercWasm", "gaius-shaderc.wasm"),
+                ("spvcJs", "gaius-spvc.js"),
+                ("spvcWasm", "gaius-spvc.wasm"),
+            ):
+                compressed_bytes = base64.b64decode("".join(embedded["shaderToolchain"][key]))
+                self.assertEqual(gzip.decompress(compressed_bytes), (dist / name).read_bytes())
+                self.assertEqual(
+                    toolchain["modules"][name]["gzipSha256"],
+                    hashlib.sha256(compressed_bytes).hexdigest(),
+                )
+
+    def test_shader_toolchain_client_without_loader_tag_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, dist, output = self.make_fixture(
+                directory,
+                version="26.3",
+                launcher_asset_index="34",
+                classes=self.SHADER_TOOLCHAIN_CLASSES,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "has no gaius-shader-toolchain.js loader"):
+                self.run_build(root, dist, output)
+            self.assertFalse(output.exists())
+
+    def test_shader_toolchain_missing_module_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, dist, output, _token = self.make_shader_toolchain_fixture(directory)
+            (dist / "gaius-spvc.wasm").unlink()
+
+            with self.assertRaisesRegex(FileNotFoundError, "gaius-spvc.wasm"):
+                self.run_build(root, dist, output)
+            self.assertFalse(output.exists())
+
+    def test_shader_toolchain_rebuilt_module_without_new_page_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, dist, output, _token = self.make_shader_toolchain_fixture(directory)
+            (dist / "gaius-shaderc.wasm").write_bytes(b"\0asm\1\0\0\0rebuilt")
+
+            with self.assertRaisesRegex(RuntimeError, "loader token"):
+                self.run_build(root, dist, output)
+
+    def test_shader_toolchain_manifest_mismatch_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, dist, output, _token = self.make_shader_toolchain_fixture(directory)
+            manifest_path = dist / "gaius-shader-toolchain.json"
+            toolchain_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            toolchain_manifest["files"]["gaius-spvc.js"]["sha256"] = "0" * 64
+            manifest_path.write_text(json.dumps(toolchain_manifest), encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "gaius-spvc.js does not match"):
+                self.run_build(root, dist, output)
+
+    def test_shader_toolchain_stale_identity_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, dist, output, _token = self.make_shader_toolchain_fixture(directory)
+            manifest_path = dist / "gaius-shader-toolchain.json"
+            # Same records, different bytes: the sidecar no longer describes the file.
+            manifest_path.write_text(
+                json.dumps(json.loads(manifest_path.read_text(encoding="utf-8")), indent=1),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "artifact hash does not match"):
+                self.run_build(root, dist, output)
+
+    def test_shader_toolchain_loader_that_cannot_be_inlined_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root, dist, output, _token = self.make_shader_toolchain_fixture(directory)
+            loader = dist / "gaius-shader-toolchain.js"
+            loader.write_bytes(loader.read_bytes() + b"// </script>\n")
+            self.add_shader_toolchain_records(root, dist)
+
+            with self.assertRaisesRegex(RuntimeError, "cannot be inlined"):
+                self.run_build(root, dist, output)
+
+    def add_shader_toolchain_records(self, root: Path, dist: Path) -> None:
+        """Refresh manifest, sidecar and loader tag after a fixture file changed."""
+        manifest_path = dist / "gaius-shader-toolchain.json"
+        toolchain_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for name in toolchain_manifest["files"]:
+            value = (dist / name).read_bytes()
+            toolchain_manifest["files"][name] = {
+                "bytes": len(value),
+                "sha256": hashlib.sha256(value).hexdigest(),
+            }
+        manifest_path.write_text(json.dumps(toolchain_manifest), encoding="utf-8")
+        PORTABLE.build_identity.write_sidecar(root, "shader-toolchain", manifest_path)
+        index = dist / "index.html"
+        text = PORTABLE.SHADER_TOOLCHAIN_TAG.sub("", index.read_text(encoding="utf-8"))
+        tag = (
+            f'  <script data-gaius-shader-toolchain data-profile="26.3" '
+            f'src="gaius-shader-toolchain.js?v={PORTABLE.shader_toolchain_token(dist)}"></script>\n'
+        )
+        index.write_text(text.replace("<!doctype html>\n", "<!doctype html>\n" + tag, 1), encoding="utf-8")
 
 
 if __name__ == "__main__":
