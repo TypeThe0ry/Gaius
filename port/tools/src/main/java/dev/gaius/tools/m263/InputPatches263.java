@@ -293,6 +293,12 @@ public final class InputPatches263 {
                 || blocked.getOpcode() != Opcodes.GOTO) {
             throw new IllegalStateException("MouseHandler overlay gate shape changed");
         }
+        // The allow path falls through into the code after the removed GOTO, so the IFNULL
+        // must have jumped exactly there.
+        if (nextReal(((JumpInsnNode) maybeIfNull).label) != nextReal(maybeGoto)) {
+            throw new IllegalStateException("MouseHandler overlay gate shape changed: the overlay"
+                    + " null check does not jump to the instruction after its blocking GOTO");
+        }
         LabelNode allow = new LabelNode();
         LabelNode popAndBlock = new LabelNode();
         InsnList gate = new InsnList();
