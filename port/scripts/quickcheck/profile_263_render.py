@@ -385,6 +385,13 @@ def run(overlay_dir: Path, overlay_262_dir: Path | None = None,
     check("GlHeuristics.createDeviceInfo keeps vanilla wireframeFillMode=true",
           re.search(r"new\s+#\d+\s+// class " + re.escape(f"{RP}/api/device/DeviceFeatures")
                     + r"\s*\n\s*\d+: dup\s*\n\s*\d+: iconst_1", device_info) is not None)
+    # The pipeline program is current before its vertex array binds attribute pointers.
+    encoder = classes.text(f"{GL}/GlCommandEncoder")
+    setup_draw = method_section(encoder, " setupDraw(")
+    use_program = setup_draw.find("GlStateManager._glUseProgram:(I)V")
+    va_bind = setup_draw.find("VertexArray.bind:(")
+    check("GlCommandEncoder.setupDraw switches to the pipeline program before VertexArray.bind",
+          0 <= use_program < va_bind and "GlRenderPipeline.program:()" in setup_draw[:use_program])
     max_texture = method_section(heuristics, " getMaxSupportedTextureSize()")
     check("GlHeuristics.getMaxSupportedTextureSize uses GL_MAX_TEXTURE_SIZE",
           "3379" in max_texture and "GlStateManager._getInteger" in max_texture

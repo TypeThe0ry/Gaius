@@ -63,6 +63,14 @@ import org.objectweb.asm.tree.VarInsnNode;
  *       colour targets (EXT_color_buffer_float/EXT_float_blend) that the first browser release
  *       does not provide; {@code GameRenderer.useImprovedTransparency()} returns false and the
  *       video settings no longer offer the option.</li>
+ *   <li>{@link #patchSetupDrawUseProgramBeforeVertexArrayBind}: 26.3's
+ *       {@code GlCommandEncoder.setupDraw} binds the pipeline's vertex array (attribute pointers)
+ *       before {@code GlRenderPipeline.bind()} switches the GL program. BrowserOpenGL decides
+ *       integer vs float attribute pointers from the program that is current when the pointer
+ *       is set, so a float attribute (e.g. LineWidth) bound while the previous pipeline's
+ *       program (an ivec2 at the same location) is still current became
+ *       {@code vertexAttribIPointer(..., GL_FLOAT)}: GL_INVALID_ENUM on every draw. The
+ *       pipeline's program is now made current before the vertex array binds.</li>
  *   <li>{@link #patchMacosUtil}: stubs {@code disableCloseWindowMenuItem()} (ObjC bridge) and the
  *       two SDL hint setters; MinecraftClientPatcher.patchMacosUtil already forces
  *       {@code IS_MACOS=false}, this also prunes their reachability.</li>
@@ -80,6 +88,11 @@ import org.objectweb.asm.tree.VarInsnNode;
 public final class RenderPatches263 {
     static final String GL_BACKEND = "com/mojang/blaze3d/opengl/GlBackend";
     static final String GL_BUFFER = "com/mojang/blaze3d/opengl/GlBuffer";
+    static final String GL_COMMAND_ENCODER = "com/mojang/blaze3d/opengl/GlCommandEncoder";
+    static final String GL_RENDER_PASS = "com/mojang/blaze3d/opengl/GlRenderPass";
+    static final String GL_RENDER_PIPELINE = "com/mojang/blaze3d/opengl/GlRenderPipeline";
+    static final String GL_PROGRAM = "com/mojang/blaze3d/opengl/GlProgram";
+    static final String GL_STATE_MANAGER = "com/mojang/blaze3d/opengl/GlStateManager";
     static final String DIRECT_STATE_ACCESS = "com/mojang/blaze3d/opengl/DirectStateAccess";
     static final String VULKAN_BACKEND = "com/mojang/blaze3d/vulkan/VulkanBackend";
     static final String BACKEND_CREATION_EXCEPTION =
@@ -121,6 +134,8 @@ public final class RenderPatches263 {
                 () -> patchGlBufferExplicitFlush(jar, root, symbols));
         PatchRegistry.run("RenderPatches263.patchImprovedTransparencyOff",
                 () -> patchImprovedTransparencyOff(jar, root));
+        PatchRegistry.run("RenderPatches263.patchSetupDrawUseProgramBeforeVertexArrayBind",
+                () -> patchSetupDrawUseProgramBeforeVertexArrayBind(jar, root, symbols));
         PatchRegistry.run("RenderPatches263.patchMacosUtil",
                 () -> patchMacosUtil(jar, root));
     }
@@ -462,6 +477,70 @@ public final class RenderPatches263 {
         writeClass(screen, root, false);
         System.out.println("Forced 26.3 improved transparency (OIT) off and removed it from the"
                 + " video settings (" + kept.size() + " quality options remain)");
+    }
+
+    static void patchSetupDrawUseProgramBeforeVertexArrayBind(String jar, Path root,
+            ModernSymbols symbols) throws IOException {
+        String encoder = symbols.renderType(GL_COMMAND_ENCODER);
+        String renderPass = symbols.renderType(GL_RENDER_PASS);
+        String pipeline = symbols.renderType(GL_RENDER_PIPELINE);
+        String program = symbols.renderType(GL_PROGRAM);
+        String stateManager = symbols.renderType(GL_STATE_MANAGER);
+        String slice = symbols.renderType(GPU_BUFFER_SLICE);
+        ClassNode node = readClass(jar, root, encoder);
+        MethodNode setupDraw = find(node, "setupDraw", "(L" + renderPass + ";)V");
+        MethodInsnNode bind = null;
+        for (AbstractInsnNode instruction : setupDraw.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call && call.owner.equals(stateManager)
+                    && call.name.equals("_glUseProgram")) {
+                throw new IllegalStateException(encoder + ".setupDraw already switches the program");
+            }
+            if (instruction instanceof MethodInsnNode call && call.name.equals("bind")
+                    && call.desc.equals("([L" + slice + ";)V") && call.owner.endsWith("/VertexArray")) {
+                if (bind != null) {
+                    throw new IllegalStateException(encoder + ".setupDraw binds the vertex array twice");
+                }
+                bind = call;
+            }
+        }
+        if (bind == null) {
+            throw new IllegalStateException(encoder + ".setupDraw no longer binds the vertex array");
+        }
+        // aload_1; getfield pipeline; invokevirtual vertexArray(); aload_1; getfield vertexBuffers; bind
+        AbstractInsnNode buffers = previousOpcode(bind);
+        AbstractInsnNode passForBuffers = previousOpcode(buffers);
+        AbstractInsnNode vertexArray = previousOpcode(passForBuffers);
+        AbstractInsnNode pipelineField = previousOpcode(vertexArray);
+        AbstractInsnNode passForPipeline = previousOpcode(pipelineField);
+        if (!(vertexArray instanceof MethodInsnNode va) || !va.owner.equals(pipeline)
+                || !va.name.equals("vertexArray")
+                || !(pipelineField instanceof FieldInsnNode field) || !field.owner.equals(renderPass)
+                || !field.name.equals("pipeline") || field.getOpcode() != Opcodes.GETFIELD
+                || !(passForPipeline instanceof VarInsnNode pass) || pass.getOpcode() != Opcodes.ALOAD
+                || pass.var != 1) {
+            throw new IllegalStateException(encoder
+                    + ".setupDraw: the vertex array bind is no longer pass.pipeline.vertexArray().bind(pass.vertexBuffers)");
+        }
+        InsnList useProgram = new InsnList();
+        useProgram.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        useProgram.add(new FieldInsnNode(Opcodes.GETFIELD, renderPass, "pipeline", "L" + pipeline + ";"));
+        useProgram.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, pipeline, "program",
+                "()L" + program + ";", false));
+        useProgram.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, program, "getProgramId", "()I", false));
+        useProgram.add(new MethodInsnNode(Opcodes.INVOKESTATIC, stateManager, "_glUseProgram", "(I)V", false));
+        // Straight-line code inserted at a fall-through (no frame there); one stack slot, below max.
+        setupDraw.instructions.insertBefore(passForPipeline, useProgram);
+        writeClass(node, root, false);
+        System.out.println("Made the 26.3 pipeline program current before its vertex array binds"
+                + " (GlCommandEncoder.setupDraw)");
+    }
+
+    private static AbstractInsnNode previousOpcode(AbstractInsnNode instruction) {
+        AbstractInsnNode cursor = instruction == null ? null : instruction.getPrevious();
+        while (cursor != null && cursor.getOpcode() < 0) {
+            cursor = cursor.getPrevious();
+        }
+        return cursor;
     }
 
     static void patchMacosUtil(String jar, Path root) throws IOException {
