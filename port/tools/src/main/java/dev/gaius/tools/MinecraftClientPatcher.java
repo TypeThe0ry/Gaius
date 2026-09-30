@@ -7552,6 +7552,9 @@ public final class MinecraftClientPatcher {
         String entry = "net/minecraft/client/renderer/chunk/SectionTaskDynamicQueue.class";
         try (ZipFile input = new ZipFile(jar)) {
             if (input.getEntry(entry) == null) {
+                if (ModernSymbols.cached(jar).renderpearl()) {
+                    throw new IllegalStateException("26.3 client has no " + entry);
+                }
                 return;
             }
         }
@@ -7563,6 +7566,9 @@ public final class MinecraftClientPatcher {
                         + "Lnet/minecraft/client/renderer/chunk/"
                         + "SectionRenderDispatcher$RenderSection$SectionTask;");
         if (poll == null) {
+            if (ModernSymbols.cached(jar).renderpearl()) {
+                throw new IllegalStateException("26.3 SectionTaskDynamicQueue has no poll(Vec3)");
+            }
             return;
         }
         String owner = "net/minecraft/client/renderer/chunk/SectionTaskDynamicQueue";
