@@ -82,11 +82,12 @@ def checks(root: Path, overlay_dir: Path, javap: Callable[[Path, str], str]) -> 
 
     main = javap(client, "net.minecraft.server.Main")
     main_body = method_body(main, "public static void main(java.lang.String[])")
+    discovery_create = "dev/gaius/browser/BrowserDiscoveryServices.create:(Ljava/net/Proxy;Z)"
     results.append((
-        "26.3 server Main keeps discovery but disables the services key set: create(Proxy, false)",
+        "26.3 server Main creates discovery through BrowserDiscoveryServices.create(Proxy, false)",
         "iconst_0" in main_body
-        and f"{SERVICES}/MinecraftServicesDiscoveryService.create:(Ljava/net/Proxy;Z)" in main_body
-        and f"{SERVICES}/MinecraftServicesDiscoveryService.create:(Ljava/net/Proxy;)L" not in main_body
+        and discovery_create in main_body
+        and f"{SERVICES}/MinecraftServicesDiscoveryService.create:" not in main_body
         and "BrowserIntegratedServerMain.rethrowStartupFailure" in main_body,
     ))
 
@@ -143,11 +144,28 @@ def checks(root: Path, overlay_dir: Path, javap: Callable[[Path, str], str]) -> 
     ))
 
     minecraft = javap(client, "net.minecraft.client.Minecraft")
+    minecraft_init = method_body(minecraft, "Minecraft(net.minecraft.client.main.GameConfig)")
+    results.append((
+        "26.3 Minecraft.<init> creates discovery through BrowserDiscoveryServices (offline: no fetch)",
+        minecraft_init.count(discovery_create) == 1
+        and f"{SERVICES}/MinecraftServicesDiscoveryService.create:" not in minecraft_init,
+    ))
     results.append((
         "26.3 identity bridge takes authlib 10's services ProfileResult",
         "public void gaius$replaceIdentity(net.minecraft.client.User, com.mojang.authlib.services.ProfileResult);"
         in minecraft
         and "com.mojang.authlib.yggdrasil" not in minecraft,
+    ))
+
+    resource_key = javap(client, "net.minecraft.resources.ResourceKey")
+    resource_key_clinit = method_body(resource_key, "static {};")
+    results.append((
+        "26.3 ResourceKey.<clinit> keeps REGISTRY_STREAM_CODEC next to the browser VALUES map "
+        "(update_tags and every registry-key packet encode through it)",
+        "putstatic" in resource_key_clinit
+        and "REGISTRY_STREAM_CODEC" in resource_key_clinit
+        and "java/util/concurrent/ConcurrentHashMap" in resource_key_clinit
+        and "MapMaker" not in resource_key_clinit,
     ))
 
     friends = javap(client, "net.minecraft.client.gui.screens.social.RemoteFriendListUpdateHandler")
