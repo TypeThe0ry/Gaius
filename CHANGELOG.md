@@ -18,8 +18,8 @@ All notable changes to Gaius are documented here.
 - 26.3: the server Worker no longer re-merges the biome and dimension mob spawn
   settings for every entity on every tick (`MobSpawnSettingsModifier.Overlay`,
   a pure function of two immutable values, about 5% of the Worker while chunks
-  load). Seed 26300, view distance 8: the 329-chunk spawn area settles in about
-  98 s instead of about 108 s.
+  load). Seed 26300, view distance 8: the 329-chunk spawn area settles in
+  about 87-100 s instead of about 108 s.
 
 ## [0.3.1] - 2026-10-01
 
