@@ -100,11 +100,30 @@ public final class TModernRuntimeSupport {
      * Suspends only the current TeaVM continuation without installing a Thread interrupt handler.
      * Browser world generation can have several continuations sharing one emulated Java thread;
      * using TThread.sleep there lets an unrelated wake-up cancel the wrong continuation.
+     * Returns at once while a class initializer runs (see {@link #inClassInitializer}).
      */
-    @Async
-    public static native void yieldToEventLoop(int delayMillis);
+    public static void yieldToEventLoop(int delayMillis) {
+        if (inClassInitializer()) {
+            return;
+        }
+        suspendToEventLoop(delayMillis);
+    }
 
-    private static void yieldToEventLoop(int delayMillis, AsyncCallback<Void> callback) {
+    /**
+     * True while a TeaVM class initializer runs. The server Worker is compiled with class
+     * initialization edges that do not make their callers TeaVM-async
+     * (gaius.teavm.syncClinits, TeaVMCoreBrowserPatcher), so a static initializer can run
+     * under a synchronous caller and must not suspend: cooperative yields are skipped while
+     * the patched TeaVM's globalThis.__gaiusClinitDepth counter is positive. Builds without
+     * that option never set the counter.
+     */
+    @JSBody(script = "return (globalThis.__gaiusClinitDepth | 0) > 0;")
+    public static native boolean inClassInitializer();
+
+    @Async
+    private static native void suspendToEventLoop(int delayMillis);
+
+    private static void suspendToEventLoop(int delayMillis, AsyncCallback<Void> callback) {
         TThread thread = TThread.currentThread();
         PlatformRunnable resume = () -> {
             TThread.setCurrentThread(thread);

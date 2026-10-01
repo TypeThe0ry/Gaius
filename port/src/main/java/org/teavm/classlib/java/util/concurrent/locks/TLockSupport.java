@@ -21,6 +21,11 @@ public final class TLockSupport {
     }
 
     public static void park(Object blocker) {
+        // A static initializer must not suspend (TModernRuntimeSupport.inClassInitializer);
+        // park may return spuriously, so it returns at once there.
+        if (TModernRuntimeSupport.inClassInitializer()) {
+            return;
+        }
         if (!takePermit(Thread.currentThread())) {
             Thread.yield();
         }
@@ -31,6 +36,9 @@ public final class TLockSupport {
     }
 
     public static void parkUntil(Object blocker, long deadline) {
+        if (TModernRuntimeSupport.inClassInitializer()) {
+            return;
+        }
         long millis = deadline - System.currentTimeMillis();
         if (millis > 0) {
             sleepMillis(millis);
@@ -47,6 +55,9 @@ public final class TLockSupport {
     }
 
     public static void park() {
+        if (TModernRuntimeSupport.inClassInitializer()) {
+            return;
+        }
         if (!takePermit(Thread.currentThread())) {
             Thread.yield();
         }
@@ -57,6 +68,9 @@ public final class TLockSupport {
     }
 
     public static void parkUntil(long deadline) {
+        if (TModernRuntimeSupport.inClassInitializer()) {
+            return;
+        }
         long millis = deadline - System.currentTimeMillis();
         if (millis > 0) {
             sleepMillis(millis);
@@ -66,6 +80,9 @@ public final class TLockSupport {
     }
 
     private static void sleepNanos(long nanos) {
+        if (TModernRuntimeSupport.inClassInitializer()) {
+            return;
+        }
         if (nanos <= 0) {
             // Minecraft's managed-block loop can pass an expired tick deadline.
             // TeaVM Thread.yield() may return synchronously for 100 ms; spinning
@@ -78,6 +95,9 @@ public final class TLockSupport {
     }
 
     private static void sleepMillis(long millis) {
+        if (TModernRuntimeSupport.inClassInitializer()) {
+            return;
+        }
         Thread thread = Thread.currentThread();
         if (takePermit(thread)) {
             return;

@@ -146,7 +146,9 @@ echo "POM: $pom"
 echo "Log: $log"
 
 set +e
-MAVEN_OPTS="${MAVEN_OPTS:--Xms2g -Xmx14g -XX:+UseG1GC -XX:MaxGCPauseMillis=500}" \
+# gaius.teavm.syncClinits: class initialization edges do not make callers TeaVM-async in
+# the Worker (TeaVMCoreBrowserPatcher; the runtime skips yields inside class initializers).
+MAVEN_OPTS="${MAVEN_OPTS:--Xms2g -Xmx14g -XX:+UseG1GC -XX:MaxGCPauseMillis=500} -Dgaius.teavm.syncClinits=true" \
   "$root/port/mvnw" \
   --batch-mode \
   --errors \

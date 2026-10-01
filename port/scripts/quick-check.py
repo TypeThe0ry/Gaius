@@ -2820,6 +2820,22 @@ def check_source_patches() -> None:
             and "Browser output stream did not truncate an existing file" in platform_smoke,
         ),
         (
+            "Server Worker compiles class-initialization edges synchronously and hashes Set.of/Map.of",
+            # gaius.teavm.syncClinits stops TeaVM from making every caller of an async class
+            # initializer async (it turned 36k of 83k Worker methods into coroutines); the
+            # runtime skips cooperative yields while __gaiusClinitDepth is positive.
+            'SYNC_CLINITS_PROPERTY = "gaius.teavm.syncClinits"'
+                in (PORT / "tools/src/main/java/dev/gaius/tools/TeaVMCoreBrowserPatcher.java").read_text(errors="replace")
+            and "patchAsyncMethodFinder(" in (PORT / "tools/src/main/java/dev/gaius/tools/TeaVMCoreBrowserPatcher.java").read_text(errors="replace")
+            and "patchRendererClinitDepth(" in (PORT / "tools/src/main/java/dev/gaius/tools/TeaVMCoreBrowserPatcher.java").read_text(errors="replace")
+            and "-Dgaius.teavm.syncClinits=true" in (PORT / "scripts/build-teavm-server-worker.sh").read_text(errors="replace")
+            and "syncClinits" not in (PORT / "scripts/build-teavm.sh").read_text(errors="replace")
+            and "TModernRuntimeSupport.inClassInitializer()"
+                in (PORT / "src/main/java/org/teavm/classlib/java/util/concurrent/locks/TLockSupport.java").read_text(errors="replace")
+            and "patchTemplateCollectionLookups(jar, root);" in classlib_patcher
+            and '"gaiusHashIndex"' in classlib_patcher,
+        ),
+        (
             "Browser FileChannel preserves existing region files unless truncation is explicit",
             "virtualFile.createAccessor(read, write, write)" in file_channel
             and "if (changed)" in file_channel
@@ -6354,8 +6370,11 @@ def check_source_patches() -> None:
             and "NETWORK_CHECK_INTERVAL = 1" in browser_worldgen_scheduler
             and "MAX_NETWORK_WAIT_PULSES = 2" in browser_worldgen_scheduler
             and "MAX_PULSES_PER_TURN = 4096" in browser_worldgen_scheduler
-            and "public static native void yieldToEventLoop(int delayMillis);"
+            and "public static void yieldToEventLoop(int delayMillis) {" in modern_runtime_support
+            and "if (inClassInitializer()) {" in modern_runtime_support
+            and "private static native void suspendToEventLoop(int delayMillis);"
                 in modern_runtime_support
+            and "return (globalThis.__gaiusClinitDepth | 0) > 0;" in modern_runtime_support
             and "TThread.setCurrentThread(thread)" in modern_runtime_support
             and "Platform.schedule(resume, delayMillis)" in modern_runtime_support
             and "postMacrotask(() -> resume.run())" in modern_runtime_support
@@ -6741,9 +6760,13 @@ def check_source_patches() -> None:
         ),
         (
             "Browser worldgen removes biome helper closures and surface iterators",
-            "__gaiusBiomeManagerConstants" in browser_biome_manager
-            and "const next =" not in browser_biome_manager
-            and "const fiddle =" not in browser_biome_manager
+            # nearestCorner builds its helpers once (Rhino-safe function IIFE, no per-call
+            # closures) and caches the per-quart fiddles of the current seed.
+            "globalThis.__gaiusBiomeNearestCorner" in browser_biome_manager
+            and "(globalThis.__gaiusBiomeNearestCorner = (function () {" in browser_biome_manager
+            and "(() =>" not in browser_biome_manager
+            and "const fiddleX = new Float64Array(SIZE);" in browser_biome_manager
+            and "if (seed !== cachedSeed)" in browser_biome_manager
             and "patchSurfaceRulesContextBrowserReusableBiomeSupplier" in client_patcher
             and '"browserBiomeSupplier"' in client_patcher
             and "patchSurfaceRulesLazyConditionBrowserPrimitiveCache" in client_patcher
