@@ -14,8 +14,14 @@ import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.FieldInsnNode;
+import org.objectweb.asm.tree.FrameNode;
+import org.objectweb.asm.tree.InsnList;
+import org.objectweb.asm.tree.InsnNode;
+import org.objectweb.asm.tree.JumpInsnNode;
+import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.MethodInsnNode;
 import org.objectweb.asm.tree.MethodNode;
+import org.objectweb.asm.tree.VarInsnNode;
 
 /**
  * Minecraft 26.3 server patches, owned by work package P7a.
@@ -73,6 +79,13 @@ public final class ServerPatches263 {
     static final String DISCOVERY_CREATE_DESCRIPTOR =
             "(Ljava/net/Proxy;Z)L" + DISCOVERY_SERVICE + ";";
     static final String DISCOVERY_SERVICES = "dev/gaius/browser/BrowserDiscoveryServices";
+    static final String MOB_SPAWN_OVERLAY =
+            "net/minecraft/world/attribute/modifier/MobSpawnSettingsModifier$Overlay";
+    static final String MOB_SPAWN_SETTINGS = "net/minecraft/world/level/biome/MobSpawnSettings";
+    static final String OVERLAY_APPLY_DESCRIPTOR =
+            "(L" + MOB_SPAWN_SETTINGS + ";L" + MOB_SPAWN_SETTINGS + ";)L" + MOB_SPAWN_SETTINGS + ";";
+    static final String OVERLAY_UNCACHED = "gaius$applyUncached";
+    static final String OVERLAY_CACHE = "dev/gaius/browser/BrowserMobSpawnOverlayCache";
 
     private ServerPatches263() {
     }
@@ -86,6 +99,58 @@ public final class ServerPatches263 {
                 () -> patchPlayerListIsOpBrowserCommands(jar, root));
         PatchRegistry.run("ServerPatches263.patchDiscoveryServiceBrowser",
                 () -> patchDiscoveryServiceBrowser(jar, root));
+        PatchRegistry.run("ServerPatches263.patchMobSpawnOverlayCache",
+                () -> patchMobSpawnOverlayCache(jar, root));
+    }
+
+    /**
+     * Renames {@code MobSpawnSettingsModifier$Overlay.apply(MobSpawnSettings, MobSpawnSettings)}
+     * to {@code gaius$applyUncached} and adds an {@code apply} that serves repeated pairs from
+     * {@code BrowserMobSpawnOverlayCache}. The overlay is a pure function of two immutable
+     * values; NaturalSpawner evaluated it for every entity on every tick (several percent of the
+     * server Worker while chunks load).
+     */
+    static void patchMobSpawnOverlayCache(String jar, Path root) throws IOException {
+        ClassNode node = read(jar, root, MOB_SPAWN_OVERLAY);
+        if ((node.access & Opcodes.ACC_FINAL) == 0) {
+            throw new IllegalStateException(MOB_SPAWN_OVERLAY + " is no longer final");
+        }
+        if (node.methods.stream().anyMatch(method -> method.name.equals(OVERLAY_UNCACHED))) {
+            throw new IllegalStateException(MOB_SPAWN_OVERLAY + " is already patched");
+        }
+        MethodNode original = find(node, "apply", OVERLAY_APPLY_DESCRIPTOR);
+        original.name = OVERLAY_UNCACHED;
+        MethodNode apply = new MethodNode(Opcodes.ACC_PUBLIC, "apply", OVERLAY_APPLY_DESCRIPTOR,
+                null, null);
+        LabelNode miss = new LabelNode();
+        InsnList code = apply.instructions;
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, OVERLAY_CACHE, "lookup",
+                "(L" + MOB_SPAWN_SETTINGS + ";L" + MOB_SPAWN_SETTINGS + ";)L"
+                        + MOB_SPAWN_SETTINGS + ";", false));
+        code.add(new InsnNode(Opcodes.DUP));
+        code.add(new JumpInsnNode(Opcodes.IFNULL, miss));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        code.add(miss);
+        code.add(new FrameNode(Opcodes.F_SAME1, 0, null, 1, new Object[] {MOB_SPAWN_SETTINGS}));
+        code.add(new InsnNode(Opcodes.POP));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, MOB_SPAWN_OVERLAY, OVERLAY_UNCACHED,
+                OVERLAY_APPLY_DESCRIPTOR, false));
+        code.add(new MethodInsnNode(Opcodes.INVOKESTATIC, OVERLAY_CACHE, "store",
+                "(L" + MOB_SPAWN_SETTINGS + ";L" + MOB_SPAWN_SETTINGS + ";L"
+                        + MOB_SPAWN_SETTINGS + ";)L" + MOB_SPAWN_SETTINGS + ";", false));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        apply.maxStack = 5;
+        apply.maxLocals = 3;
+        node.methods.add(apply);
+        write(node, root);
+        System.out.println("Cached 26.3 MobSpawnSettingsModifier.Overlay.apply by identity");
     }
 
     static void patchDiscoveryServiceBrowser(String jar, Path root) throws IOException {
@@ -235,7 +300,10 @@ public final class ServerPatches263 {
                         node.name + "." + name + descriptor + " was not found"));
     }
 
-    /** Writes without recomputing frames or maxima: every patch here keeps both unchanged. */
+    /**
+     * Writes without recomputing frames or maxima: every patch here keeps both unchanged or, for
+     * an added method, supplies them.
+     */
     private static void write(ClassNode node, Path root) throws IOException {
         ClassWriter writer = new ClassWriter(0);
         node.accept(writer);
