@@ -2,7 +2,7 @@
 
 All notable changes to Gaius are documented here.
 
-## [Unreleased]
+## [0.3.2] - 2026-10-02
 
 ### Fixed
 
