@@ -10,6 +10,7 @@ import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.FieldInsnNode;
+import org.objectweb.asm.tree.FieldNode;
 import org.objectweb.asm.tree.JumpInsnNode;
 import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.LdcInsnNode;
@@ -41,6 +42,8 @@ public final class MinecraftServerWorkerPatcher {
             "dev/gaius/browser/BrowserWorldgenDispatcherScheduler";
     private static final String DEFERRED_REGISTER = "gaius$registerForExecutionDeferred";
     private static final String HEAD_PRIORITY = "gaius$headPriority";
+    private static final String TRAMPOLINE_REGISTERING = "gaius$trampolineRegistering";
+    private static final String TRAMPOLINE_REQUESTED = "gaius$trampolineRequested";
     // Mirrors BrowserWorldgenDispatcherScheduler.STOP_IDLE for a turn that ran nothing.
     private static final int DISPATCHER_STOP_IDLE = 1;
 
@@ -147,6 +150,10 @@ public final class MinecraftServerWorkerPatcher {
         LabelNode vanillaDone = new LabelNode();
         LabelNode worldgenCatch = new LabelNode();
         LabelNode vanillaCatch = new LabelNode();
+        LabelNode vanillaLoop = new LabelNode();
+        LabelNode registerStart = new LabelNode();
+        LabelNode registerDone = new LabelNode();
+        LabelNode registerCatch = new LabelNode();
         LabelNode end = new LabelNode();
 
         code.add(new LdcInsnNode(WORLDGEN_EXECUTOR_NAME));
@@ -216,7 +223,23 @@ public final class MinecraftServerWorkerPatcher {
                 DEFERRED_REGISTER, "()V", false));
         code.add(new JumpInsnNode(Opcodes.GOTO, end));
 
+        // Every other executor keeps vanilla's one-runnable-per-run() contract, but its
+        // re-registration is trampolined. With TeaVM's synchronous Worker executor,
+        // registerForExecution() calls run() again inline, so a queue of N runnables used to
+        // drain N frames deep (seven JavaScript frames each) and a burst of light or worldgen
+        // runnables overflowed the Worker stack. A run() that arrives while this executor is
+        // re-registering only records the request; the outer run() then loops, which executes
+        // the same runnables in the same order without growing the stack. A deferred (queued)
+        // executor never re-enters during registration and is unaffected.
         code.add(vanilla);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, ABSTRACT_EXECUTOR, TRAMPOLINE_REGISTERING, "Z"));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, vanillaLoop));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(new FieldInsnNode(Opcodes.PUTFIELD, ABSTRACT_EXECUTOR, TRAMPOLINE_REQUESTED, "Z"));
+        code.add(new JumpInsnNode(Opcodes.GOTO, end));
+        code.add(vanillaLoop);
         code.add(vanillaStart);
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
@@ -227,10 +250,32 @@ public final class MinecraftServerWorkerPatcher {
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL, ABSTRACT_EXECUTOR, "setSleeping", "()V", false));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new FieldInsnNode(Opcodes.PUTFIELD, ABSTRACT_EXECUTOR, TRAMPOLINE_REQUESTED, "Z"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(new FieldInsnNode(Opcodes.PUTFIELD, ABSTRACT_EXECUTOR, TRAMPOLINE_REGISTERING, "Z"));
+        code.add(registerStart);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL, ABSTRACT_EXECUTOR,
                 "registerForExecution", "()V", false));
+        code.add(registerDone);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new FieldInsnNode(Opcodes.PUTFIELD, ABSTRACT_EXECUTOR, TRAMPOLINE_REGISTERING, "Z"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, ABSTRACT_EXECUTOR, TRAMPOLINE_REQUESTED, "Z"));
+        code.add(new JumpInsnNode(Opcodes.IFNE, vanillaLoop));
         code.add(new JumpInsnNode(Opcodes.GOTO, end));
+
+        code.add(registerCatch);
+        code.add(new VarInsnNode(Opcodes.ASTORE, 2));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new FieldInsnNode(Opcodes.PUTFIELD, ABSTRACT_EXECUTOR, TRAMPOLINE_REGISTERING, "Z"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new InsnNode(Opcodes.ATHROW));
 
         code.add(worldgenCatch);
         code.add(new VarInsnNode(Opcodes.ASTORE, 6));
@@ -273,10 +318,18 @@ public final class MinecraftServerWorkerPatcher {
                 worldgenStart, worldgenDone, worldgenCatch, null));
         run.tryCatchBlocks.add(new org.objectweb.asm.tree.TryCatchBlockNode(
                 vanillaStart, vanillaDone, vanillaCatch, null));
+        run.tryCatchBlocks.add(new org.objectweb.asm.tree.TryCatchBlockNode(
+                registerStart, registerDone, registerCatch, null));
         run.maxStack = 6;
         run.maxLocals = 7;
         addDeferredRegisterMethod(node);
         addExecutorHeadPriorityMethod(node, headPriorityPatched);
+        for (String field : new String[] {TRAMPOLINE_REGISTERING, TRAMPOLINE_REQUESTED}) {
+            if (node.fields.stream().anyMatch(existing -> existing.name.equals(field))) {
+                throw new IllegalStateException(ABSTRACT_EXECUTOR + "." + field + " already exists");
+            }
+            node.fields.add(new FieldNode(Opcodes.ACC_PRIVATE, field, "Z", null, null));
+        }
     }
 
     /**
