@@ -67,7 +67,19 @@ public final class TCollectionsModernSupport {
             }
             slot = (slot + 1) & mask;
         }
-        return false;
+        return identityIndexOf(data, value) >= 0;
+    }
+
+    // A key whose hashCode changed after the index was built is no longer found by its hash
+    // (the JDK's Set.of/Map.of behave the same); TeaVM's linear scan still found it when
+    // queried with the same instance, so misses keep that identity match.
+    private static int identityIndexOf(Object[] data, Object value) {
+        for (int i = 0; i < data.length; ++i) {
+            if (data[i] == value) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     public static int[] mapIndex(TMap.Entry<?, ?>[] data) {
@@ -96,6 +108,11 @@ public final class TCollectionsModernSupport {
                 return position - 1;
             }
             slot = (slot + 1) & mask;
+        }
+        for (int i = 0; i < data.length; ++i) {
+            if (data[i].getKey() == key) {
+                return i;
+            }
         }
         return -1;
     }
