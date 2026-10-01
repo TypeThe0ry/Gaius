@@ -2,7 +2,7 @@
 
 All notable changes to Gaius are documented here.
 
-## [Unreleased]
+## [0.3.1] - 2026-10-01
 
 ### Fixed
 
@@ -15,9 +15,10 @@ All notable changes to Gaius are documented here.
 
 ### Performance
 
-- Singleplayer chunk generation in the server Worker is about 1.45x faster
-  (26.3, seed 26300: the 329-chunk view-distance-8 area around spawn settles in
-  ~108 s instead of ~157 s; world entry ~17 s instead of ~23 s):
+- Singleplayer chunk generation in the server Worker is faster: about 1.45x on
+  26.3 (seed 26300: the 329-chunk view-distance-8 area around spawn settles in
+  ~108 s instead of ~157 s; world entry ~17 s instead of ~23 s) and about 1.26x
+  on 26.2 (~96 s instead of ~121 s; world entry ~15 s instead of ~17 s):
   - TeaVM no longer makes every method that triggers an async class initializer
     async in the Worker build (`gaius.teavm.syncClinits`). That single edge
     (`Mth.<clinit>` -> `Util.make` -> async `Util.<clinit>`) had compiled 36k of
