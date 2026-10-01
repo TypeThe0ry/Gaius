@@ -161,7 +161,7 @@ function createIndexedDb(records) {
   };
 }
 
-function createRuntime({opfsFiles, idbRecords, budgetBytes = 64 * 1024}) {
+function createRuntime({opfsFiles, idbRecords, budgetBytes = 64 * 1024, configureBudget = true}) {
   const events = [];
   const context = {
     Array,
@@ -194,7 +194,7 @@ function createRuntime({opfsFiles, idbRecords, budgetBytes = 64 * 1024}) {
     },
     queueMicrotask,
     setTimeout,
-    __gaiusRegionCacheBudgetBytes: budgetBytes,
+    ...(configureBudget ? {__gaiusRegionCacheBudgetBytes: budgetBytes} : {}),
     __gaiusStartIntegratedServerPump() {},
   };
   if (opfsFiles) {
@@ -410,8 +410,39 @@ assert.equal(fallbackRecords.size, 4,
 assert.equal(fallback.events.some((event) => event?.type === "runtime-ready"), false,
   "over-budget fallback started with an incomplete world");
 
+// Without OPFS (every file:// portable page) and without an explicit budget the cache is the
+// world's only synchronous copy, so a world well past the 32 MiB OPFS-mode default must open.
+const largeFallbackRecords = new Map();
+const largeFallbackRegionBytes = 1024 * 1024;
+const largeFallbackRegions = 40;
+for (let index = 0; index < largeFallbackRegions; index++) {
+  const path = `/gaius/saves/large-fallback-world/region/r.${index}.0.mca`;
+  const value = new Uint8Array(largeFallbackRegionBytes);
+  value[0] = index & 0xff;
+  largeFallbackRecords.set(path, {path, value});
+}
+const largeFallback = createRuntime({opfsFiles: null, idbRecords: largeFallbackRecords, configureBudget: false});
+await startRuntime(largeFallback, "large-fallback-world");
+await waitForEvent(largeFallback.events, "runtime-ready");
+assert.equal(largeFallback.events.some((event) => event?.type === "bootstrap-crash"), false,
+  "a 40 MiB world did not open on the IndexedDB fallback");
+assert.equal(largeFallback.context.__gaiusFsBackend, "indexeddb-worker-lru");
+const largeFallbackStats = largeFallback.context.__gaiusFsStorageSnapshot();
+assert.equal(largeFallbackStats.cacheBudgetBytes, 256 * 1024 * 1024,
+  "the IndexedDB fallback did not raise its default region budget");
+for (let index = 0; index < largeFallbackRegions; index++) {
+  const bytes = largeFallback.context.__gaiusPersistentFiles[
+    `/gaius/saves/large-fallback-world/region/r.${index}.0.mca`];
+  assert.equal(bytes?.byteLength, largeFallbackRegionBytes, `fallback region ${index} is not readable`);
+  assert.equal(bytes[0], index & 0xff);
+}
+largeFallback.context.onmessage({data: {type: "stop"}, ports: []});
+await waitForEvent(largeFallback.events, "stopped");
+
 console.log(JSON.stringify({
   ok: true,
+  largeFallbackBytes: largeFallbackRegions * largeFallbackRegionBytes,
+  largeFallbackBudgetBytes: largeFallbackStats.cacheBudgetBytes,
   fixtureRegions: fixtureCount,
   fixtureExternalChunks: externalFixtureCount,
   fixtureBytes: fixtureCount * fixtureBytes +

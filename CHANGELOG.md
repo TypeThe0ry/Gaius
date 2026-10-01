@@ -2,6 +2,17 @@
 
 All notable changes to Gaius are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- Portable `Gaius-<profile>.html` opened from `file://`: Chrome refuses OPFS on
+  `file://` pages, so singleplayer worlds live in the IndexedDB fallback, whose
+  in-memory region cache is the world's only synchronous copy. Its 32 MiB budget
+  stopped a world from opening again ("Saved regions exceed the IndexedDB
+  compatibility cache budget") after roughly 15 minutes of exploring. Without an
+  explicitly configured budget the fallback now allows 256 MiB.
+
 ## [0.3.0] - 2026-10-01
 
 ### Release

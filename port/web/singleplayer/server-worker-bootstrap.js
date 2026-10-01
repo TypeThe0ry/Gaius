@@ -49,6 +49,11 @@ const storeName = "files";
 const defaultWorldgenSliceMillis = 8;
 const defaultDistanceRampIntervalMillis = 750;
 const defaultRegionCacheBudgetBytes = 32 * 1024 * 1024;
+// Without OPFS (Chrome refuses it on file:// pages, i.e. every portable Gaius.html) the
+// region cache is the only synchronous copy of each saved region, so it has to hold the
+// whole world: 32 MiB stopped a portable world from opening again after ~15 minutes of
+// exploring. An explicitly configured budget still applies unchanged.
+const defaultIndexedDbFallbackRegionBudgetBytes = 256 * 1024 * 1024;
 const minimumRegionCacheBudgetBytes = 64 * 1024;
 const maximumRegionCacheBudgetBytes = 256 * 1024 * 1024;
 const opfsRecordMagic = 0x47525331;
@@ -67,7 +72,9 @@ const maximumOpfsPatchChainBytes = 8 * 1024 * 1024;
 const fileValues = Object.create(null);
 const regionIndex = new Map();
 const regionCache = new Map();
-const regionCacheBudgetBytes = clampRegionCacheBudget(
+const regionCacheBudgetConfigured = root.__gaiusRegionCacheBudgetBytes != null &&
+  Number.isFinite(Number(root.__gaiusRegionCacheBudgetBytes));
+let regionCacheBudgetBytes = clampRegionCacheBudget(
   root.__gaiusRegionCacheBudgetBytes,
 );
 const storageStats = root.__gaiusStorageStats = {
@@ -1474,6 +1481,10 @@ async function installPersistentFileSystem(generation = storageGeneration) {
     openedDatabase = undefined;
     const opfsReady = await openOpfsRegionStore(root.__gaiusServerWorldId, generation);
     assertStorageLifecycleIsActive(generation);
+    if (!opfsReady && !regionCacheBudgetConfigured) {
+      regionCacheBudgetBytes = clampRegionCacheBudget(defaultIndexedDbFallbackRegionBudgetBytes);
+      storageStats.cacheBudgetBytes = regionCacheBudgetBytes;
+    }
     await readWorldFiles(root.__gaiusServerWorldId, generation);
     assertStorageLifecycleIsActive(generation);
     root.__gaiusFsBackend = opfsReady
