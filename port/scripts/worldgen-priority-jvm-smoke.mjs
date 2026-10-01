@@ -110,8 +110,8 @@ try {
   const runBytecode = methodBytecode(bytecode, "public void run();");
   assert.equal(occurrences(runBytecode, /gaius\$registerForExecutionDeferred/g), 2,
     "worldgen success/catch must use exactly two deferred registrations");
-  assert.equal(occurrences(runBytecode, /Method registerForExecution:\(\)V/g), 2,
-    "vanilla success/catch registration changed");
+  assert.equal(occurrences(runBytecode, /Method registerForExecution:\(\)V/g), 1,
+    "vanilla success and failure paths must share the one trampolined registration");
   assert.equal(occurrences(runBytecode, /Method pollTask:\(\)Z/g), 2,
     "worldgen turn loop and vanilla path must each poll exactly once per iteration");
   assert.equal(occurrences(runBytecode, /Method gaius\$headPriority:\(\)I/g), 2,

@@ -44,6 +44,8 @@ public final class MinecraftServerWorkerPatcher {
     private static final String HEAD_PRIORITY = "gaius$headPriority";
     private static final String TRAMPOLINE_REGISTERING = "gaius$trampolineRegistering";
     private static final String TRAMPOLINE_REQUESTED = "gaius$trampolineRequested";
+    // run() local holding a runnable failure until the trampolined backlog has drained.
+    private static final int VANILLA_FAILURE_LOCAL = 7;
     // Mirrors BrowserWorldgenDispatcherScheduler.STOP_IDLE for a turn that ran nothing.
     private static final int DISPATCHER_STOP_IDLE = 1;
 
@@ -151,6 +153,8 @@ public final class MinecraftServerWorkerPatcher {
         LabelNode worldgenCatch = new LabelNode();
         LabelNode vanillaCatch = new LabelNode();
         LabelNode vanillaLoop = new LabelNode();
+        LabelNode vanillaRegister = new LabelNode();
+        LabelNode vanillaInit = new LabelNode();
         LabelNode registerStart = new LabelNode();
         LabelNode registerDone = new LabelNode();
         LabelNode registerCatch = new LabelNode();
@@ -229,16 +233,23 @@ public final class MinecraftServerWorkerPatcher {
         // drain N frames deep (seven JavaScript frames each) and a burst of light or worldgen
         // runnables overflowed the Worker stack. A run() that arrives while this executor is
         // re-registering only records the request; the outer run() then loops, which executes
-        // the same runnables in the same order without growing the stack. A deferred (queued)
-        // executor never re-enters during registration and is unaffected.
+        // the same runnables in the same order without growing the stack. A failing runnable
+        // keeps vanilla's contract without recursion either: the failure is held, the loop
+        // re-registers and drains the rest of the backlog exactly as the recursive drain did,
+        // and the last failure is rethrown once the executor goes idle (vanilla's innermost,
+        // that is last, failure is the one that escaped). A deferred (queued) executor never
+        // re-enters during registration and is unaffected.
         code.add(vanilla);
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new FieldInsnNode(Opcodes.GETFIELD, ABSTRACT_EXECUTOR, TRAMPOLINE_REGISTERING, "Z"));
-        code.add(new JumpInsnNode(Opcodes.IFEQ, vanillaLoop));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, vanillaInit));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new InsnNode(Opcodes.ICONST_1));
         code.add(new FieldInsnNode(Opcodes.PUTFIELD, ABSTRACT_EXECUTOR, TRAMPOLINE_REQUESTED, "Z"));
         code.add(new JumpInsnNode(Opcodes.GOTO, end));
+        code.add(vanillaInit);
+        code.add(new InsnNode(Opcodes.ACONST_NULL));
+        code.add(new VarInsnNode(Opcodes.ASTORE, VANILLA_FAILURE_LOCAL));
         code.add(vanillaLoop);
         code.add(vanillaStart);
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
@@ -246,6 +257,7 @@ public final class MinecraftServerWorkerPatcher {
                 Opcodes.INVOKEVIRTUAL, ABSTRACT_EXECUTOR, "pollTask", "()Z", false));
         code.add(new InsnNode(Opcodes.POP));
         code.add(vanillaDone);
+        code.add(vanillaRegister);
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL, ABSTRACT_EXECUTOR, "setSleeping", "()V", false));
@@ -267,7 +279,10 @@ public final class MinecraftServerWorkerPatcher {
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new FieldInsnNode(Opcodes.GETFIELD, ABSTRACT_EXECUTOR, TRAMPOLINE_REQUESTED, "Z"));
         code.add(new JumpInsnNode(Opcodes.IFNE, vanillaLoop));
-        code.add(new JumpInsnNode(Opcodes.GOTO, end));
+        code.add(new VarInsnNode(Opcodes.ALOAD, VANILLA_FAILURE_LOCAL));
+        code.add(new JumpInsnNode(Opcodes.IFNULL, end));
+        code.add(new VarInsnNode(Opcodes.ALOAD, VANILLA_FAILURE_LOCAL));
+        code.add(new InsnNode(Opcodes.ATHROW));
 
         code.add(registerCatch);
         code.add(new VarInsnNode(Opcodes.ASTORE, 2));
@@ -290,16 +305,8 @@ public final class MinecraftServerWorkerPatcher {
         code.add(new InsnNode(Opcodes.ATHROW));
 
         code.add(vanillaCatch);
-        code.add(new VarInsnNode(Opcodes.ASTORE, 2));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL, ABSTRACT_EXECUTOR, "setSleeping", "()V", false));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL, ABSTRACT_EXECUTOR,
-                "registerForExecution", "()V", false));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
-        code.add(new InsnNode(Opcodes.ATHROW));
+        code.add(new VarInsnNode(Opcodes.ASTORE, VANILLA_FAILURE_LOCAL));
+        code.add(new JumpInsnNode(Opcodes.GOTO, vanillaRegister));
         code.add(end);
         code.add(new InsnNode(Opcodes.RETURN));
 
@@ -321,7 +328,7 @@ public final class MinecraftServerWorkerPatcher {
         run.tryCatchBlocks.add(new org.objectweb.asm.tree.TryCatchBlockNode(
                 registerStart, registerDone, registerCatch, null));
         run.maxStack = 6;
-        run.maxLocals = 7;
+        run.maxLocals = 8;
         addDeferredRegisterMethod(node);
         addExecutorHeadPriorityMethod(node, headPriorityPatched);
         for (String field : new String[] {TRAMPOLINE_REGISTERING, TRAMPOLINE_REQUESTED}) {
