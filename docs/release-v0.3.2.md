@@ -24,9 +24,18 @@ view-distance-8 area around spawn (329 chunks) is loaded and rendered:
 
 | Client | v0.3.1 | v0.3.2 |
 |---|---|---|
-| Minecraft 26.3 | ~108 s | ~98 s |
+| Minecraft 26.3 | ~108 s | ~87-100 s |
 
-Terrain still loads without holes.
+Minecraft 26.2 is unchanged at about 95 s. Terrain still loads without holes on
+both clients.
+
+## Verified
+
+- Singleplayer on both clients (19/19 checks): new world, terrain without
+  holes, Save and Quit, re-entering the world in the same page.
+- Multiplayer on Minecraft 26.3 against an unmodified vanilla server.
+- Chunk loading on both release files: all 329 chunks around spawn, no sky
+  holes, no server crash.
 
 ## Downloads
 
