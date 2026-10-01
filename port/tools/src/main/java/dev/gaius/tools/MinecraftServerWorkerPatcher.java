@@ -10,6 +10,7 @@ import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.FieldInsnNode;
+import org.objectweb.asm.tree.FieldNode;
 import org.objectweb.asm.tree.JumpInsnNode;
 import org.objectweb.asm.tree.LabelNode;
 import org.objectweb.asm.tree.LdcInsnNode;
@@ -41,6 +42,10 @@ public final class MinecraftServerWorkerPatcher {
             "dev/gaius/browser/BrowserWorldgenDispatcherScheduler";
     private static final String DEFERRED_REGISTER = "gaius$registerForExecutionDeferred";
     private static final String HEAD_PRIORITY = "gaius$headPriority";
+    private static final String TRAMPOLINE_REGISTERING = "gaius$trampolineRegistering";
+    private static final String TRAMPOLINE_REQUESTED = "gaius$trampolineRequested";
+    // run() local holding a runnable failure until the trampolined backlog has drained.
+    private static final int VANILLA_FAILURE_LOCAL = 7;
     // Mirrors BrowserWorldgenDispatcherScheduler.STOP_IDLE for a turn that ran nothing.
     private static final int DISPATCHER_STOP_IDLE = 1;
 
@@ -147,6 +152,12 @@ public final class MinecraftServerWorkerPatcher {
         LabelNode vanillaDone = new LabelNode();
         LabelNode worldgenCatch = new LabelNode();
         LabelNode vanillaCatch = new LabelNode();
+        LabelNode vanillaLoop = new LabelNode();
+        LabelNode vanillaRegister = new LabelNode();
+        LabelNode vanillaInit = new LabelNode();
+        LabelNode registerStart = new LabelNode();
+        LabelNode registerDone = new LabelNode();
+        LabelNode registerCatch = new LabelNode();
         LabelNode end = new LabelNode();
 
         code.add(new LdcInsnNode(WORLDGEN_EXECUTOR_NAME));
@@ -216,21 +227,70 @@ public final class MinecraftServerWorkerPatcher {
                 DEFERRED_REGISTER, "()V", false));
         code.add(new JumpInsnNode(Opcodes.GOTO, end));
 
+        // Every other executor keeps vanilla's one-runnable-per-run() contract, but its
+        // re-registration is trampolined. With TeaVM's synchronous Worker executor,
+        // registerForExecution() calls run() again inline, so a queue of N runnables used to
+        // drain N frames deep (seven JavaScript frames each) and a burst of light or worldgen
+        // runnables overflowed the Worker stack. A run() that arrives while this executor is
+        // re-registering only records the request; the outer run() then loops, which executes
+        // the same runnables in the same order without growing the stack. A failing runnable
+        // keeps vanilla's contract without recursion either: the failure is held, the loop
+        // re-registers and drains the rest of the backlog exactly as the recursive drain did,
+        // and the last failure is rethrown once the executor goes idle (vanilla's innermost,
+        // that is last, failure is the one that escaped). A deferred (queued) executor never
+        // re-enters during registration and is unaffected.
         code.add(vanilla);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, ABSTRACT_EXECUTOR, TRAMPOLINE_REGISTERING, "Z"));
+        code.add(new JumpInsnNode(Opcodes.IFEQ, vanillaInit));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(new FieldInsnNode(Opcodes.PUTFIELD, ABSTRACT_EXECUTOR, TRAMPOLINE_REQUESTED, "Z"));
+        code.add(new JumpInsnNode(Opcodes.GOTO, end));
+        code.add(vanillaInit);
+        code.add(new InsnNode(Opcodes.ACONST_NULL));
+        code.add(new VarInsnNode(Opcodes.ASTORE, VANILLA_FAILURE_LOCAL));
+        code.add(vanillaLoop);
         code.add(vanillaStart);
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL, ABSTRACT_EXECUTOR, "pollTask", "()Z", false));
         code.add(new InsnNode(Opcodes.POP));
         code.add(vanillaDone);
+        code.add(vanillaRegister);
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL, ABSTRACT_EXECUTOR, "setSleeping", "()V", false));
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new FieldInsnNode(Opcodes.PUTFIELD, ABSTRACT_EXECUTOR, TRAMPOLINE_REQUESTED, "Z"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new InsnNode(Opcodes.ICONST_1));
+        code.add(new FieldInsnNode(Opcodes.PUTFIELD, ABSTRACT_EXECUTOR, TRAMPOLINE_REGISTERING, "Z"));
+        code.add(registerStart);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL, ABSTRACT_EXECUTOR,
                 "registerForExecution", "()V", false));
-        code.add(new JumpInsnNode(Opcodes.GOTO, end));
+        code.add(registerDone);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new FieldInsnNode(Opcodes.PUTFIELD, ABSTRACT_EXECUTOR, TRAMPOLINE_REGISTERING, "Z"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, ABSTRACT_EXECUTOR, TRAMPOLINE_REQUESTED, "Z"));
+        code.add(new JumpInsnNode(Opcodes.IFNE, vanillaLoop));
+        code.add(new VarInsnNode(Opcodes.ALOAD, VANILLA_FAILURE_LOCAL));
+        code.add(new JumpInsnNode(Opcodes.IFNULL, end));
+        code.add(new VarInsnNode(Opcodes.ALOAD, VANILLA_FAILURE_LOCAL));
+        code.add(new InsnNode(Opcodes.ATHROW));
+
+        code.add(registerCatch);
+        code.add(new VarInsnNode(Opcodes.ASTORE, 2));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new InsnNode(Opcodes.ICONST_0));
+        code.add(new FieldInsnNode(Opcodes.PUTFIELD, ABSTRACT_EXECUTOR, TRAMPOLINE_REGISTERING, "Z"));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new InsnNode(Opcodes.ATHROW));
 
         code.add(worldgenCatch);
         code.add(new VarInsnNode(Opcodes.ASTORE, 6));
@@ -245,16 +305,8 @@ public final class MinecraftServerWorkerPatcher {
         code.add(new InsnNode(Opcodes.ATHROW));
 
         code.add(vanillaCatch);
-        code.add(new VarInsnNode(Opcodes.ASTORE, 2));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL, ABSTRACT_EXECUTOR, "setSleeping", "()V", false));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-        code.add(new MethodInsnNode(
-                Opcodes.INVOKEVIRTUAL, ABSTRACT_EXECUTOR,
-                "registerForExecution", "()V", false));
-        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
-        code.add(new InsnNode(Opcodes.ATHROW));
+        code.add(new VarInsnNode(Opcodes.ASTORE, VANILLA_FAILURE_LOCAL));
+        code.add(new JumpInsnNode(Opcodes.GOTO, vanillaRegister));
         code.add(end);
         code.add(new InsnNode(Opcodes.RETURN));
 
@@ -273,10 +325,18 @@ public final class MinecraftServerWorkerPatcher {
                 worldgenStart, worldgenDone, worldgenCatch, null));
         run.tryCatchBlocks.add(new org.objectweb.asm.tree.TryCatchBlockNode(
                 vanillaStart, vanillaDone, vanillaCatch, null));
+        run.tryCatchBlocks.add(new org.objectweb.asm.tree.TryCatchBlockNode(
+                registerStart, registerDone, registerCatch, null));
         run.maxStack = 6;
-        run.maxLocals = 7;
+        run.maxLocals = 8;
         addDeferredRegisterMethod(node);
         addExecutorHeadPriorityMethod(node, headPriorityPatched);
+        for (String field : new String[] {TRAMPOLINE_REGISTERING, TRAMPOLINE_REQUESTED}) {
+            if (node.fields.stream().anyMatch(existing -> existing.name.equals(field))) {
+                throw new IllegalStateException(ABSTRACT_EXECUTOR + "." + field + " already exists");
+            }
+            node.fields.add(new FieldNode(Opcodes.ACC_PRIVATE, field, "Z", null, null));
+        }
     }
 
     /**

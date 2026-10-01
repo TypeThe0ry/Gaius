@@ -84,6 +84,7 @@ public final class WorldgenPriorityJvmFixture {
         pumpRecoversAfterFailingTurn();
         dispatchersKeepIndependentPumps();
         closedAndVanillaExecutorsAreUnchanged();
+        inlineBacklogDrainsWithoutRecursion();
         System.out.println("WORLDGEN_PRIORITY_JVM_OK count=4096 cap=" + TURN_RUNNABLE_CAP
                 + " budgetRunnables=" + RUNNABLES_PER_BUDGET
                 + " generationTurns=isolated messageHops=pumped");
@@ -376,6 +377,107 @@ public final class WorldgenPriorityJvmFixture {
                 "non-worldgen executors entered the browser dispatcher scheduler");
     }
 
+    /**
+     * A synchronous executor used to re-enter run() from registerForExecution() once per queued
+     * runnable, so a large backlog overflowed the stack. The trampoline drains it iteratively, in
+     * order, including runnables queued mid-drain, and a failing runnable still propagates after
+     * the rest of the backlog ran.
+     */
+    private static void inlineBacklogDrainsWithoutRecursion() throws Exception {
+        reset();
+        int backlog = 200_000;
+        List<Integer> order = new ArrayList<>();
+        PriorityConsecutiveExecutor light = new PriorityConsecutiveExecutor(4, Runnable::run, "light");
+        Throwable[] failure = new Throwable[1];
+        // A small stack makes the old one-frame-chain-per-runnable drain fail deterministically.
+        Thread thread = new Thread(null, () -> {
+            try {
+                light.schedule(task(0, () -> {
+                    for (int i = 0; i < backlog; i++) {
+                        int id = i;
+                        light.schedule(task(1, () -> {
+                            order.add(id);
+                            if (id == backlog / 2) {
+                                light.schedule(task(2, () -> order.add(-1)));
+                            }
+                        }));
+                    }
+                }));
+            } catch (Throwable throwable) {
+                failure[0] = throwable;
+            }
+        }, "inline-backlog", 512 * 1024);
+        thread.start();
+        thread.join();
+        check(failure[0] == null, "inline backlog drain failed: " + failure[0]);
+        check(order.size() == backlog + 1 && !light.hasWork(), "inline backlog incomplete: " + order.size());
+        for (int i = 0; i < backlog; i++) {
+            check(order.get(i) == i, "inline backlog order changed at " + i);
+        }
+        check(order.get(backlog) == -1, "runnable queued mid-drain did not run last");
+
+        // Vanilla contract: the rest of the backlog still runs, then the last failure escapes.
+        List<String> log = new ArrayList<>();
+        PriorityConsecutiveExecutor failing = new PriorityConsecutiveExecutor(4, Runnable::run, "light");
+        try {
+            failing.schedule(task(0, () -> {
+                for (int i = 0; i < 5; i++) {
+                    int id = i;
+                    failing.schedule(task(1, () -> {
+                        log.add("t" + id);
+                        if (id == 1 || id == 3) {
+                            throw new ExpectedFailure(id);
+                        }
+                    }));
+                }
+            }));
+        } catch (ExpectedFailure expected) {
+            log.add("caught" + expected.id);
+        }
+        failing.schedule(task(1, () -> log.add("after")));
+        check(log.equals(List.of("t0", "t1", "t2", "t3", "t4", "caught3", "after"))
+                && !failing.hasWork(),
+                "failing inline runnable changed the backlog contract: " + log);
+
+        // Failing runnables must not grow the stack either.
+        int failingBacklog = 100_000;
+        int[] ran = new int[1];
+        Throwable[] escaped = new Throwable[1];
+        PriorityConsecutiveExecutor failingLight =
+                new PriorityConsecutiveExecutor(4, Runnable::run, "light");
+        Thread failingThread = new Thread(null, () -> {
+            try {
+                failingLight.schedule(task(0, () -> {
+                    for (int i = 0; i < failingBacklog; i++) {
+                        int id = i;
+                        failingLight.schedule(task(1, () -> {
+                            ran[0]++;
+                            throw new ExpectedFailure(id);
+                        }));
+                    }
+                }));
+            } catch (Throwable throwable) {
+                escaped[0] = throwable;
+            }
+        }, "failing-backlog", 512 * 1024);
+        failingThread.start();
+        failingThread.join();
+        check(escaped[0] instanceof ExpectedFailure last && last.id == failingBacklog - 1
+                && ran[0] == failingBacklog && !failingLight.hasWork(),
+                "failing inline backlog: ran=" + ran[0] + " escaped=" + escaped[0]);
+        check(Platform.startedThreads() == 0 && WorldgenDispatcherFixtureRuntime.turns == 0,
+                "trampolined executors entered the browser dispatcher scheduler");
+    }
+
     private static final class ExpectedFailure extends RuntimeException {
+        final int id;
+
+        ExpectedFailure() {
+            this(-1);
+        }
+
+        ExpectedFailure(int id) {
+            this.id = id;
+        }
     }
 }
