@@ -13,6 +13,24 @@ All notable changes to Gaius are documented here.
   compatibility cache budget") after roughly 15 minutes of exploring. Without an
   explicitly configured budget the fallback now allows 256 MiB.
 
+### Performance
+
+- Singleplayer chunk generation in the server Worker is about 1.45x faster
+  (26.3, seed 26300: the 329-chunk view-distance-8 area around spawn settles in
+  ~108 s instead of ~157 s; world entry ~17 s instead of ~23 s):
+  - TeaVM no longer makes every method that triggers an async class initializer
+    async in the Worker build (`gaius.teavm.syncClinits`). That single edge
+    (`Mth.<clinit>` -> `Util.make` -> async `Util.<clinit>`) had compiled 36k of
+    83k Worker methods, every worldgen kernel included, into coroutines. Class
+    initializers run inside a `__gaiusClinitDepth` scope in which cooperative
+    yields and `LockSupport` parking return at once instead of suspending.
+  - Biome zoom (`BiomeManager.getBiome`, about 190k calls/s, also used by mob
+    spawning for every entity each tick) caches the per-quart LCG offsets of the
+    current seed instead of recomputing eight BigInt chains per call.
+  - TeaVM's `Set.of`/`Set.copyOf`/`Map.of` answered every miss with a linear
+    `equals` scan; block tag checks are mostly misses. Lookups now use a lazily
+    built hash index.
+
 ## [0.3.0] - 2026-10-01
 
 ### Release

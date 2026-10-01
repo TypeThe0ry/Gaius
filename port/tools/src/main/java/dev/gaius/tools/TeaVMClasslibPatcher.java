@@ -13,6 +13,7 @@ import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.AbstractInsnNode;
 import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.FieldInsnNode;
+import org.objectweb.asm.tree.FieldNode;
 import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
 import org.objectweb.asm.tree.IntInsnNode;
@@ -337,6 +338,7 @@ public final class TeaVMClasslibPatcher {
         patchDefaultFileSystemProviderStreams(jar, root);
         patchZipFileRawInflaterPadding(jar, root);
         patchFormatterPercentArgument(jar, root);
+        patchTemplateCollectionLookups(jar, root);
     }
 
     /**
@@ -973,6 +975,106 @@ public final class TeaVMClasslibPatcher {
         method.localVariables = null;
         method.maxStack = 5;
         method.maxLocals = 2;
+    }
+
+    private static final String TEMPLATE_SET =
+            "org/teavm/classlib/java/util/TTemplateCollections$NElementSet";
+    private static final String TEMPLATE_MAP =
+            "org/teavm/classlib/java/util/TTemplateCollections$NEtriesMap";
+    private static final String COLLECTIONS_SUPPORT =
+            "org/teavm/classlib/java/util/TCollectionsModernSupport";
+    private static final String TEMPLATE_INDEX_FIELD = "gaiusHashIndex";
+    private static final String MAP_ENTRIES = "[Lorg/teavm/classlib/java/util/TMap$Entry;";
+
+    /**
+     * TeaVM's Set.of/Set.copyOf (NElementSet) and Map.of (NEtriesMap) compact their elements
+     * into an array and answer a miss with an equals() call per element. Worldgen spends a few
+     * percent of the Worker in Holder.Reference.is -> Set.contains of block tag sets, almost
+     * all misses. The lookups now consult a lazily built hash index
+     * (TCollectionsModernSupport.setIndex/mapIndex) kept in a new field.
+     */
+    private static void patchTemplateCollectionLookups(String jarPath, Path root) throws IOException {
+        ClassNode set = readClass(jarPath, TEMPLATE_SET);
+        addTemplateIndexField(set);
+        replaceTemplateLookup(set, "contains", "(Ljava/lang/Object;)Z", "[Ljava/lang/Object;",
+                "setIndex", "([Ljava/lang/Object;)[I",
+                "setContains", "([Ljava/lang/Object;[ILjava/lang/Object;)Z", Opcodes.IRETURN);
+        writeClassWithFrames(root, TEMPLATE_SET, set);
+
+        ClassNode map = readClass(jarPath, TEMPLATE_MAP);
+        addTemplateIndexField(map);
+        replaceTemplateLookup(map, "containsKey", "(Ljava/lang/Object;)Z", MAP_ENTRIES,
+                "mapIndex", "(" + MAP_ENTRIES + ")[I",
+                "mapContainsKey", "(" + MAP_ENTRIES + "[ILjava/lang/Object;)Z", Opcodes.IRETURN);
+        replaceTemplateLookup(map, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", MAP_ENTRIES,
+                "mapIndex", "(" + MAP_ENTRIES + ")[I",
+                "mapGet", "(" + MAP_ENTRIES + "[ILjava/lang/Object;)Ljava/lang/Object;",
+                Opcodes.ARETURN);
+        writeClassWithFrames(root, TEMPLATE_MAP, map);
+    }
+
+    private static void addTemplateIndexField(ClassNode node) {
+        if (node.fields.stream().anyMatch(field -> field.name.equals(TEMPLATE_INDEX_FIELD))) {
+            throw new IllegalStateException(node.name + "." + TEMPLATE_INDEX_FIELD + " already exists");
+        }
+        if (node.fields.stream().noneMatch(field -> field.name.equals("data"))) {
+            throw new IllegalStateException(node.name + ".data not found");
+        }
+        node.fields.add(new FieldNode(
+                Opcodes.ACC_PRIVATE | Opcodes.ACC_SYNTHETIC, TEMPLATE_INDEX_FIELD, "[I", null, null));
+    }
+
+    private static void replaceTemplateLookup(ClassNode node, String name, String desc,
+            String dataDesc, String indexMethod, String indexDesc, String lookupMethod,
+            String lookupDesc, int returnOpcode) {
+        MethodNode method = node.methods.stream()
+                .filter(candidate -> candidate.name.equals(name) && candidate.desc.equals(desc))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException(node.name + "." + name + desc + " not found"));
+        LabelNode indexed = new LabelNode();
+        InsnList code = new InsnList();
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, node.name, TEMPLATE_INDEX_FIELD, "[I"));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 2));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new JumpInsnNode(Opcodes.IFNONNULL, indexed));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, node.name, "data", dataDesc));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC, COLLECTIONS_SUPPORT, indexMethod, indexDesc, false));
+        code.add(new VarInsnNode(Opcodes.ASTORE, 2));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new FieldInsnNode(Opcodes.PUTFIELD, node.name, TEMPLATE_INDEX_FIELD, "[I"));
+        code.add(indexed);
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, node.name, "data", dataDesc));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 2));
+        code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        code.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC, COLLECTIONS_SUPPORT, lookupMethod, lookupDesc, false));
+        code.add(new InsnNode(returnOpcode));
+        method.instructions = code;
+        method.tryCatchBlocks.clear();
+        if (method.localVariables != null) {
+            method.localVariables.clear();
+        }
+        method.maxStack = 3;
+        method.maxLocals = 3;
+    }
+
+    private static void writeClassWithFrames(Path root, String className, ClassNode node)
+            throws IOException {
+        ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_FRAMES) {
+            @Override
+            protected String getCommonSuperClass(String type1, String type2) {
+                return "java/lang/Object";
+            }
+        };
+        node.accept(writer);
+        Path output = root.resolve(className + ".class");
+        Files.createDirectories(output.getParent());
+        Files.write(output, writer.toByteArray());
     }
 
     private static void patchClass(
