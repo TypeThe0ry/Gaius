@@ -4357,7 +4357,10 @@ function createUpstreamHeaders(request, proxyKind) {
             headers.set("cookie", cookie);
         }
     }
-    headers.set("user-agent", "Gaius Minecraft browser bridge");
+    // Resource-pack requests keep the versioned RelayNode agent set above.
+    if (proxyKind !== "resource-pack") {
+        headers.set("user-agent", "Gaius Minecraft browser bridge");
+    }
     return headers;
 }
 async function readRequestBody(request, maximumBytes) {
