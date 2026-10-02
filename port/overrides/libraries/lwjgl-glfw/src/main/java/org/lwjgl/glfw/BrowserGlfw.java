@@ -658,40 +658,36 @@ public final class BrowserGlfw {
               // Mixing scheduler.yield() into every fourth present makes Chromium defer that
               // continuation behind compositor arbitration, producing a stable 3:1 cadence
               // and periodic multi-refresh frame bubbles on high-refresh displays.
-              // Cheap frames (the title screen draws one in about 1.5 ms) would otherwise run
-              // at hundreds of FPS back to back and starve the compositor: the page showed
-              // 5-14 FPS while the game presented 650. Uncapped frames therefore run at most
-              // three presents per display refresh in a world and one in menus (no level, the
-              // vanilla menu limit); the last one waits for rAF. In a world, frames that take
-              // half a refresh or longer are never held.
-              let pacer=root.__gaiusUncappedPresentPacer;
-              if (!pacer || !Array.isArray(pacer.waiters)) {
-                pacer={presents:0,rafPending:false,waiters:[]};
-                root.__gaiusUncappedPresentPacer=pacer;
-              }
-              const canPace=typeof requestAnimationFrame==='function';
-              if (canPace && !pacer.rafPending) {
-                pacer.rafPending=true;
-                requestAnimationFrame(() => {
-                  pacer.rafPending=false;
-                  pacer.presents=0;
-                  const waiters=pacer.waiters;
-                  pacer.waiters=[];
-                  for (let index=0; index<waiters.length; index++) waiters[index]();
-                });
-              }
+              // Menus (no level): the title screen draws a frame in about 1.5 ms, so uncapped
+              // presents ran at hundreds of FPS back to back and starved the compositor (the
+              // page showed 5-14 FPS while the game presented 650). In menus each present waits
+              // for the next rAF, the vanilla menu limit. In a world presents stay uncapped:
+              // BrowserRenderScheduler compiles and uploads terrain sections on a per-frame
+              // budget, so holding world frames would slow chunk rendering.
               const state=root.__gaiusMinecraftState;
-              const presentsPerRefresh=state && state.level ? 3 : 1;
-              pacer.presents++;
-              if (canPace && pacer.presents>=presentsPerRefresh) {
+              if (state && state.level || typeof requestAnimationFrame!=='function') {
+                postTask();
+              } else {
+                let pacer=root.__gaiusUncappedPresentPacer;
+                if (!pacer || !Array.isArray(pacer.waiters)) {
+                  pacer={rafPending:false,waiters:[]};
+                  root.__gaiusUncappedPresentPacer=pacer;
+                }
                 if (telemetryEnabled) {
                   telemetry.uncappedRafWaitCount=(Number(telemetry.uncappedRafWaitCount)||0)+1;
                 }
                 pacer.waiters.push(() => {
                   if (!resumed) postTask();
                 });
-              } else {
-                postTask();
+                if (!pacer.rafPending) {
+                  pacer.rafPending=true;
+                  requestAnimationFrame(() => {
+                    pacer.rafPending=false;
+                    const waiters=pacer.waiters;
+                    pacer.waiters=[];
+                    for (let index=0; index<waiters.length; index++) waiters[index]();
+                  });
+                }
               }
             }
             """)

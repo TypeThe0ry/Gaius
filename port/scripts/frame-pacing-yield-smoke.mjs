@@ -361,11 +361,7 @@ async function simulateUncappedYield(frameCount = 1440) {
   const frameTimes = presentTimes.slice(1).map((at, index) => at - presentTimes[index]);
   const averageFps = 1000 / (frameTimes.reduce((total, value) => total + value, 0) / frameTimes.length);
   const onePercentLow = onePercentLowFps(frameTimes);
-  // The compositor guard keeps one rAF outstanding (one request per refresh at most); frames
-  // this slow almost never reach the three-presents-per-refresh limit.
-  const refreshes = Math.ceil(presentTimes.at(-1) / browser.refreshMillis) + 1;
-  assert.ok(browser.rafRequests <= refreshes,
-    `uncapped pacing requested more than one rAF per refresh: ${browser.rafRequests} > ${refreshes}`);
+  assert.equal(browser.rafRequests, 0, "uncapped world pacing unexpectedly waited for rAF");
   assert.equal(telemetry.swapInterval, 0);
   assert.equal(telemetry.uncappedYieldCount, frameCount);
   assert.equal(telemetry.vsyncYieldCount || 0, 0);
@@ -391,11 +387,11 @@ async function simulateUncappedYield(frameCount = 1440) {
 }
 
 // Cheap uncapped frames (the title screen) used to present hundreds of times per refresh and
-// starve the compositor. They must now present at most three times per display refresh in a
-// world and once in menus (no level), wait for rAF in between, and still never keep more than
-// one continuation pending.
+// starve the compositor. In menus (no level) they must now present once per display refresh,
+// waiting for rAF in between. In a world they stay uncapped (no rAF wait): the terrain section
+// scheduler works on a per-frame budget, so holding world frames slowed chunk rendering.
 async function simulateCheapUncappedYield(refreshRate = 60, frameCount = 900, {menu = false} = {}) {
-  const limit = menu ? 1 : 3;
+  const limit = menu ? 1 : Infinity;
   const browser = new VirtualBrowser({refreshRate, timerClamp: 4, messageDelay: 0.01});
   const telemetry = {enabled: true};
   const window = {__gaiusFrameTelemetry: telemetry, __gaiusMinecraftState: {level: !menu}};
@@ -432,21 +428,27 @@ async function simulateCheapUncappedYield(refreshRate = 60, frameCount = 900, {m
   const busiestRefresh = Math.max(...perRefresh.values());
   const elapsed = presentTimes.at(-1) - presentTimes[0];
   const averageFps = 1000 * (presentTimes.length - 1) / elapsed;
-  assert.ok(busiestRefresh <= limit,
-    `cheap uncapped frames presented ${busiestRefresh} times in one ${refreshRate} Hz refresh`);
-  assert.ok(averageFps <= refreshRate * limit + 1,
-    `cheap uncapped frames were not held to the display: ${averageFps.toFixed(1)} FPS`);
-  assert.ok(averageFps >= refreshRate * limit * 0.8,
-    `cheap uncapped frames were throttled below the guard: ${averageFps.toFixed(1)} FPS`);
-  assert.ok(telemetry.uncappedRafWaitCount > frameCount / (limit + 1),
-    "cheap uncapped frames never waited for rAF");
+  if (menu) {
+    assert.ok(busiestRefresh <= limit,
+      `cheap menu frames presented ${busiestRefresh} times in one ${refreshRate} Hz refresh`);
+    assert.ok(averageFps <= refreshRate * limit + 1,
+      `cheap menu frames were not held to the display: ${averageFps.toFixed(1)} FPS`);
+    assert.ok(averageFps >= refreshRate * limit * 0.8,
+      `cheap menu frames were throttled below one per refresh: ${averageFps.toFixed(1)} FPS`);
+    assert.ok(telemetry.uncappedRafWaitCount >= frameCount - 1, "cheap menu frames did not wait for rAF");
+  } else {
+    assert.equal(browser.rafRequests, 0, "world frames waited for rAF");
+    assert.equal(telemetry.uncappedRafWaitCount || 0, 0, "world frames waited for rAF");
+    assert.ok(averageFps > 400,
+      `cheap world frames were held to the display: ${averageFps.toFixed(1)} FPS`);
+  }
   assert.equal(telemetry.uncappedYieldCount, frameCount);
   assert.equal(telemetry.messageChannelYieldCount, frameCount);
   assert.equal(telemetry.watchdogYieldCount || 0, 0);
   assert.equal(telemetry.pendingYieldCount, 0);
   assert.equal(telemetry.maxPendingYieldCount, 1);
   assert.equal(telemetry.duplicateYieldCallbackCount, 0);
-  assert.equal(window.__gaiusUncappedPresentPacer.waiters.length, 0);
+  assert.equal(window.__gaiusUncappedPresentPacer?.waiters.length ?? 0, 0);
   return averageFps;
 }
 
