@@ -677,7 +677,7 @@ public final class BrowserGlfw {
                   pacer.presents=0;
                   const waiters=pacer.waiters;
                   pacer.waiters=[];
-                  for (const waiter of waiters) waiter();
+                  for (let index=0; index<waiters.length; index++) waiters[index]();
                 });
               }
               const state=root.__gaiusMinecraftState;

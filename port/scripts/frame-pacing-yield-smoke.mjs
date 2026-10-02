@@ -99,6 +99,9 @@ if (sdl) {
 const frameYieldScript = jsBodyBefore(
   "private static native void scheduleFrameYield(boolean hidden, int interval, FrameYieldCallback resume);",
 );
+// TeaVM parses @JSBody scripts as JavaScript 1.8: no for...of loops.
+assert.doesNotMatch(frameYieldScript, /\bfor\s*\((?:const|let|var)\s+\w+\s+of\b/,
+  "scheduleFrameYield uses for...of, which TeaVM's @JSBody parser rejects");
 
 class VirtualBrowser {
   constructor({refreshRate = 120, timerClamp = 4, messageDelay = 0.01} = {}) {
