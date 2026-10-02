@@ -1356,6 +1356,9 @@ async function stopServerImpl() {
         "Integrated server stopped-state hook is unavailable; storage shutdown refused",
       );
     }
+    // The final save waits for in-flight chunk generation: cap the worldgen kernel's pending
+    // jobs so each settles (result or Java fallback) well inside the stop watchdog.
+    drainWorldgenKernel();
     try {
       stopIntegratedServer();
     } catch (error) {
@@ -2748,3 +2751,168 @@ function normalize(path) {
   return (absolute ? "/" : "") + kept.join("/");
 }
 // Worker heartbeat scalar snapshot contract: snapshotScalarTelemetry root.__gaiusChunkPriorityStats root.__gaiusNetworkStats copied >= 64 Number.isFinite(current) globalPumpTelemetryKeys snapshotGlobalPumpTelemetry globalPump: snapshotGlobalPumpTelemetry
+
+// Kernel runtime client. Right after the start message the page posts
+// {type: "gaius-kernel-port", port} (port/web/boot/gaius-boot.js): a MessagePort into the page's
+// kernel runtime (port/web/kernels/kernel-runtime.js attachPort). World generation reaches it as
+// root.__gaiusKernelClient: submit(kind, payload, {kernel, key, version, cx, cz, near,
+// resultBytes}) resolves with the result ArrayBuffer, available(kernel) says whether to try at
+// all, setViewer({x, y, z, yaw, vx?, vz?, viewDistance?}) feeds the movement prediction from the
+// server's view of the player. Without a port (portable page without kernels, ?gaiusKernels=0)
+// the client stays absent and every caller keeps the vanilla Java path. Code that needs the
+// client as soon as it exists (a job codec's host object) pushes a callback onto
+// root.__gaiusKernelClientListeners; it runs once per client.
+// The same message may carry kernelScripts ([{name, url} | {name, source}]: the worldgen job codec
+// and facade, plus kernel-policy.js/kernel-runtime.js when this worker hosts its own worldgen
+// kernel workers) and worldgenKernel (merged into root.__gaiusWorldgenKernelConfig, see
+// port/web/kernels/worldgen-kernel.js); they load before the client exists.
+// (Guarded: the lifecycle harnesses run this script with a minimal worker scope.)
+if (typeof root.addEventListener === "function") root.addEventListener("message", (event) => {
+  const message = event.data;
+  if (!message || message.type !== "gaius-kernel-port" || !message.port) return;
+  loadKernelHostScripts(message);
+  if (root.__gaiusKernelClient) root.__gaiusKernelClient.close();
+  const client = createKernelClient(message.port);
+  root.__gaiusKernelClient = client;
+  const listeners = Array.isArray(root.__gaiusKernelClientListeners) ? root.__gaiusKernelClientListeners : [];
+  for (const listener of listeners) {
+    try {
+      listener(client);
+    } catch (error) {
+      console.warn("Kernel client listener failed", error);
+    }
+  }
+});
+
+const DEFAULT_KERNEL_HOST_SCRIPTS = ["kernels/worldgen-job.js", "kernels/worldgen-kernel.js"];
+const loadedKernelHostScripts = new Set();
+
+// Imports the kernel scripts the page listed (or, from a dist layout, kernels/<name> next to this
+// worker script). A script that fails to load only keeps its kernel off: Java checks
+// globalThis.GaiusWorldgenKernel per chunk and keeps the vanilla path without it.
+function loadKernelHostScripts(message) {
+  if (message.worldgenKernel && typeof message.worldgenKernel === "object") {
+    root.__gaiusWorldgenKernelConfig = Object.assign({}, root.__gaiusWorldgenKernelConfig || {},
+      message.worldgenKernel);
+  }
+  const entries = Array.isArray(message.kernelScripts) ? message.kernelScripts : defaultKernelHostScripts();
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object") continue;
+    const name = String(entry.name || entry.url || "");
+    if (!name || loadedKernelHostScripts.has(name)) continue;
+    let temporaryUrl = null;
+    try {
+      if (typeof entry.source === "string") {
+        temporaryUrl = URL.createObjectURL(new Blob([entry.source], {type: "text/javascript"}));
+        importScripts(temporaryUrl);
+      } else if (entry.url) {
+        importScripts(String(entry.url));
+      } else {
+        continue;
+      }
+      loadedKernelHostScripts.add(name);
+    } catch (error) {
+      console.warn("Kernel script " + name + " did not load; its kernel stays off", error);
+    } finally {
+      if (temporaryUrl) URL.revokeObjectURL(temporaryUrl);
+    }
+  }
+}
+
+function defaultKernelHostScripts() {
+  const href = String(root.location && root.location.href || "");
+  // Only a plain dist layout serves kernels/<name> unhashed next to this script; a site build
+  // (content-hashed worker name) and blob workers rely on the page's list.
+  if (!/^https?:/i.test(href) || /\.[0-9a-f]{16,64}\.js(?:[?#]|$)/i.test(href)) return [];
+  return DEFAULT_KERNEL_HOST_SCRIPTS.map((name) => ({name, url: new URL(name, href).href}));
+}
+
+function drainWorldgenKernel() {
+  const facade = root.GaiusWorldgenKernel;
+  if (!facade || typeof facade.drain !== "function") return;
+  try {
+    const capMillis = Math.max(1000, Math.min(20000, Math.floor(runtimeStopWatchdogMillis() / 3)));
+    void facade.drain(capMillis);
+  } catch (error) {
+    console.warn("Worldgen kernel drain failed", error);
+  }
+}
+
+function createKernelClient(port) {
+  let nextId = 1;
+  let status = {enabled: false, kernels: {}};
+  const pending = new Map();
+  const stats = {submitted: 0, completed: 0, failed: 0, unavailable: 0};
+  port.onmessage = (event) => {
+    const message = event.data;
+    if (!message) return;
+    if (message.type === "status") {
+      status = message.status || status;
+      return;
+    }
+    const entry = pending.get(message.id);
+    if (!entry) return;
+    pending.delete(message.id);
+    if (message.type === "result") {
+      stats.completed++;
+      entry.resolve(message.result);
+    } else {
+      stats.failed++;
+      const error = new Error(message.message || "kernel failed");
+      error.code = message.code || "kernel-error";
+      entry.reject(error);
+    }
+  };
+  port.start();
+  const available = (kernel) => status.enabled === true &&
+    (kernel === undefined || !!(status.kernels[kernel] && status.kernels[kernel].available));
+  return {
+    available,
+    status: () => status,
+    stats,
+    submit(kind, payload, opts) {
+      const options = opts || {};
+      if (!available(options.kernel)) {
+        stats.unavailable++;
+        const error = new Error("kernel runtime is not available");
+        error.code = "runtime-disabled";
+        return Promise.reject(error);
+      }
+      const buffer = payload instanceof ArrayBuffer ? payload
+        : new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength).slice().buffer;
+      const plain = {};
+      for (const name of ["key", "version", "visible", "background", "near", "priorityClass",
+        "priority", "distance", "cx", "cz", "resultBytes", "retry"]) {
+        if (options[name] !== undefined) plain[name] = options[name];
+      }
+      const id = nextId++;
+      stats.submitted++;
+      return new Promise((resolve, reject) => {
+        pending.set(id, {resolve, reject});
+        port.postMessage({type: "submit", id, kernel: options.kernel || null, kind, payload: buffer,
+          opts: plain}, [buffer]);
+      });
+    },
+    cancel(key, kernel) {
+      port.postMessage({type: "cancel", key, kernel: kernel || null});
+    },
+    setViewer(viewer) {
+      port.postMessage({type: "viewer", viewer});
+    },
+    close() {
+      try {
+        port.postMessage({type: "close"});
+        port.close();
+      } catch (_) {
+        // already closed
+      }
+      for (const entry of pending.values()) {
+        const error = new Error("kernel client closed");
+        error.code = "terminated";
+        entry.reject(error);
+      }
+      pending.clear();
+      status = {enabled: false, kernels: {}};
+    },
+  };
+}

@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import base64
 import contextlib
 import gzip
 import hashlib
@@ -12,6 +11,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -1030,10 +1030,8 @@ class PortableArtifactIdentityTest(unittest.TestCase):
 
     @staticmethod
     def embedded_assets(html: Path) -> dict:
-        text = html.read_text(encoding="utf-8")
-        start = text.index("const embedded = ") + len("const embedded = ")
-        end = text.index(";\n      const workerSource", start)
-        return json.loads(text[start:end])
+        """Every embedded payload asset, decoded, in document order."""
+        return PORTABLE.parse_portable_payload(html.read_text(encoding="utf-8"))
 
     def test_26_2_page_gets_no_shader_toolchain(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1042,12 +1040,76 @@ class PortableArtifactIdentityTest(unittest.TestCase):
 
             manifest = json.loads((dist / "Gaius.manifest.json").read_text(encoding="utf-8"))
             self.assertNotIn("shaderToolchain", manifest)
-            self.assertEqual(
-                list(self.embedded_assets(output)), ["classes", "server", "wasm", "vanilla"]
-            )
+            embedded = self.embedded_assets(output)
+            # Decode-priority order: the client and its wasm gate the boot, the server comes last.
+            self.assertEqual(list(embedded), ["classes", "wasm", "vanilla", "server"])
+            # Each asset is compressed once and embedded once (no base64 inside gzip inside text).
+            self.assertEqual(embedded["classes"], (dist / "classes.js.gz").read_bytes())
+            self.assertEqual(embedded["server"], (dist / "singleplayer-server.js.gz").read_bytes())
+            self.assertEqual(embedded["vanilla"], (dist / "vanilla-assets.pack.gz").read_bytes())
+            html_text = output.read_text(encoding="utf-8")
+            self.assertNotIn("const embedded = ", html_text)
+            self.assertIn('const portablePayload = {"assets":', html_text)
+            manifest = json.loads((dist / "Gaius.manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["payloadEncoding"], "gaius-b7-v1")
             html = output.read_text(encoding="utf-8")
             self.assertNotIn("__gaiusShaderToolchain", html)
             self.assertNotIn("data-gaius-shader-toolchain", html)
+
+    def test_portable_bootstrap_unpacks_every_asset(self) -> None:
+        """Runs the generated bootstrap in node with a fake DOM (main-thread decoder path)."""
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is not installed")
+        script = r"""
+const fs = require("fs");
+const crypto = require("crypto");
+const vm = require("vm");
+const html = fs.readFileSync(process.argv[2], "utf8");
+const parts = new Map();
+for (const match of html.matchAll(/<script type="text\/x-gaius-b7" data-gaius-asset="([A-Za-z0-9_-]+)" data-part="(\d+)">([^<]*)<\/script>/g)) {
+  if (!parts.has(match[1])) parts.set(match[1], []);
+  parts.get(match[1]).push({textContent: match[3], parentNode: {removeChild() {}}});
+}
+const start = html.indexOf('<script data-gaius-portable="1">') + '<script data-gaius-portable="1">'.length;
+const bootstrap = html.slice(start, html.indexOf("</script>", start));
+const blobs = new Map();
+const window = {
+  document: {querySelectorAll: (selector) => parts.get(/data-gaius-asset="([^"]+)"/.exec(selector)[1]) || []},
+  Blob, Response, DecompressionStream, Uint8Array, ArrayBuffer, Promise, Map, Object, Array, JSON, String, Math, Error, Date,
+  setTimeout, setInterval: () => 0,
+  URL: {createObjectURL: (blob) => { const id = "blob:" + blobs.size; blobs.set(id, blob); return id; }},
+};
+window.window = window;
+const context = vm.createContext(window);
+vm.runInContext(bootstrap, context);
+const sha = (bytes) => crypto.createHash("sha256").update(Buffer.from(bytes)).digest("hex");
+(async () => {
+  await context.__gaiusPortableAssetsReady;
+  const classes = await blobs.get(context.__gaiusClassesUrl).arrayBuffer();
+  const vanilla = await context.__gaiusVanillaAssetsCompressedPromise;
+  const server = await context.__gaiusSingleplayerServerGzipDataPromise;
+  const removed = [...parts.values()].every((list) => list.every((element) => element.textContent === ""));
+  process.stdout.write(JSON.stringify({classes: sha(classes), vanilla: sha(vanilla), server: sha(server),
+    classesType: blobs.get(context.__gaiusClassesUrl).type, removed, portable: context.__gaiusPortableBuild}));
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root, dist, output = self.make_fixture(directory)
+            self.run_build(root, dist, output)
+            script_path = Path(directory) / "bootstrap-check.js"
+            script_path.write_text(script, encoding="utf-8")
+            result = subprocess.run([node, str(script_path), str(output)], text=True,
+                                    capture_output=True, timeout=60, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)
+            sha = lambda data: hashlib.sha256(data).hexdigest()  # noqa: E731
+            self.assertEqual(report["classes"], sha((dist / "classes.js").read_bytes()))
+            self.assertEqual(report["vanilla"], sha(gzip.decompress((dist / "vanilla-assets.pack.gz").read_bytes())))
+            self.assertEqual(report["server"], sha((dist / "singleplayer-server.js.gz").read_bytes()))
+            self.assertEqual(report["classesType"], "text/javascript")
+            self.assertTrue(report["removed"], "every payload part leaves the DOM once decoded")
+            self.assertTrue(report["portable"])
 
     def test_shader_toolchain_client_embeds_loader_and_modules(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1101,7 +1163,9 @@ class PortableArtifactIdentityTest(unittest.TestCase):
                 self.assertIn(f"{key}: URL.createObjectURL(", html)
             embedded = self.embedded_assets(output)
             self.assertEqual(
-                list(embedded), ["classes", "server", "wasm", "vanilla", "shaderToolchain"]
+                list(embedded),
+                ["classes", "wasm", "shader-shadercJs", "shader-shadercWasm", "shader-spvcJs",
+                 "shader-spvcWasm", "vanilla", "server"],
             )
             for key, name in (
                 ("shadercJs", "gaius-shaderc.js"),
@@ -1109,7 +1173,7 @@ class PortableArtifactIdentityTest(unittest.TestCase):
                 ("spvcJs", "gaius-spvc.js"),
                 ("spvcWasm", "gaius-spvc.wasm"),
             ):
-                compressed_bytes = base64.b64decode("".join(embedded["shaderToolchain"][key]))
+                compressed_bytes = embedded["shader-" + key]
                 self.assertEqual(gzip.decompress(compressed_bytes), (dist / name).read_bytes())
                 self.assertEqual(
                     toolchain["modules"][name]["gzipSha256"],

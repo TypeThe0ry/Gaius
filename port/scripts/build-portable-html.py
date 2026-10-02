@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import base64
 import gzip
 import hashlib
 import importlib.util
@@ -37,7 +36,6 @@ compiler_profile = importlib.util.module_from_spec(COMPILER_PROFILE_SPEC)
 COMPILER_PROFILE_SPEC.loader.exec_module(compiler_profile)
 
 
-CHUNK_SIZE = 1_000_000
 MANIFEST_NAME = "Gaius.manifest.json"
 MANIFEST_KIND = "gaius-portable-artifact"
 MANIFEST_SCHEMA_VERSION = 2
@@ -218,9 +216,139 @@ def publish_portable_pair(
                     pass
 
 
-def base64_chunks(path: Path) -> list[str]:
-    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-    return [encoded[index:index + CHUNK_SIZE] for index in range(0, len(encoded), CHUNK_SIZE)]
+# Embedded payload encoding (gaius-b7-v1). Every asset is compressed once (gzip, the only
+# codec every browser's DecompressionStream reads) and stored once as text: 7 bits per
+# character in inert <script type="text/x-gaius-b7"> elements. The 7-bit values the HTML parser
+# would alter or that could close the element (NUL, CR, "<"), and LF so that no newline
+# translation (a Windows text-mode write, a git checkout) can touch the payload, become
+# U+0080..U+0083. The text stays one byte per character in memory and about 1.18 bytes per
+# payload byte on disk (base64 inside a JavaScript string literal cost 1.33 and had to be
+# parsed as script). A decoder Worker in the page turns the parts back into bytes and inflates
+# them off the main thread.
+PAYLOAD_ENCODING = "gaius-b7-v1"
+PAYLOAD_TYPE = "text/x-gaius-b7"
+B7_ESCAPES = (0x00, 0x0A, 0x0D, 0x3C)
+# Characters per payload element: a multiple of 8 (one 7-byte block encodes to 8 characters).
+B7_PART_CHARS = 4 * 1024 * 1024
+
+
+def _byte_table(function) -> bytes:
+    return bytes(function(value) & 0xFF for value in range(256))
+
+
+_B7_SHIFTS = (
+    # (column, table) pairs whose OR is one 7-bit group; see decode_b7 for the inverse.
+    ((0, _byte_table(lambda b: b >> 1)),),
+    ((0, _byte_table(lambda b: (b & 1) << 6)), (1, _byte_table(lambda b: b >> 2))),
+    ((1, _byte_table(lambda b: (b & 3) << 5)), (2, _byte_table(lambda b: b >> 3))),
+    ((2, _byte_table(lambda b: (b & 7) << 4)), (3, _byte_table(lambda b: b >> 4))),
+    ((3, _byte_table(lambda b: (b & 15) << 3)), (4, _byte_table(lambda b: b >> 5))),
+    ((4, _byte_table(lambda b: (b & 31) << 2)), (5, _byte_table(lambda b: b >> 6))),
+    ((5, _byte_table(lambda b: (b & 63) << 1)), (6, _byte_table(lambda b: b >> 7))),
+    ((6, _byte_table(lambda b: b & 127)),),
+)
+_B7_TO_TEXT = bytes(
+    0x80 + B7_ESCAPES.index(value) if value in B7_ESCAPES else value
+    for value in range(256)
+)
+
+
+def encode_b7(data: bytes) -> str:
+    """Encode bytes as gaius-b7 text (whole 7-byte blocks; the decoder truncates the padding).
+
+    Column-wise byte translation and big-integer ORs keep the work in C: a 100 MB payload
+    encodes in seconds without third-party modules.
+    """
+    padded = data + b"\0" * ((-len(data)) % 7)
+    blocks = len(padded) // 7
+    if blocks == 0:
+        return ""
+    columns = [padded[index::7] for index in range(7)]
+    output = bytearray(blocks * 8)
+    for group, parts in enumerate(_B7_SHIFTS):
+        value = 0
+        for column, table in parts:
+            value |= int.from_bytes(columns[column].translate(table), "big")
+        output[group::8] = value.to_bytes(blocks, "big")
+    return bytes(output).translate(_B7_TO_TEXT).decode("latin-1")
+
+
+_B7_FROM_TEXT = {0x80 + index: value for index, value in enumerate(B7_ESCAPES)}
+
+
+def decode_b7(text: str, length: int) -> bytes:
+    """Reference decoder (the page's decoder Worker does the same in JavaScript)."""
+    groups = bytes(_B7_FROM_TEXT.get(ord(char), ord(char)) for char in text)
+    output = bytearray()
+    for start in range(0, len(groups) - 7, 8):
+        g = groups[start:start + 8]
+        output += bytes((
+            (g[0] << 1) | (g[1] >> 6),
+            ((g[1] & 63) << 2) | (g[2] >> 5),
+            ((g[2] & 31) << 3) | (g[3] >> 4),
+            ((g[3] & 15) << 4) | (g[4] >> 3),
+            ((g[4] & 7) << 5) | (g[5] >> 2),
+            ((g[5] & 3) << 6) | (g[6] >> 1),
+            ((g[6] & 1) << 7) | g[7],
+        ))
+    if length > len(output):
+        raise ValueError("gaius-b7 text is shorter than its declared length")
+    return bytes(output[:length])
+
+
+class PortablePayload:
+    """The embedded assets of one portable page, in document (and decode-priority) order."""
+
+    def __init__(self) -> None:
+        self.assets: dict[str, dict[str, object]] = {}
+        self.elements: list[str] = []
+
+    def add(self, name: str, data: bytes, *, gzipped: bool) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", name) or name in self.assets:
+            raise RuntimeError(f"invalid or duplicate portable payload name: {name}")
+        text = encode_b7(data)
+        parts = 0
+        for start in range(0, len(text), B7_PART_CHARS):
+            self.elements.append(
+                f'  <script type="{PAYLOAD_TYPE}" data-gaius-asset="{name}" data-part="{parts}">'
+                + text[start:start + B7_PART_CHARS]
+                + "</script>\n"
+            )
+            parts += 1
+        self.assets[name] = {
+            "bytes": len(data),
+            "parts": parts,
+            "gzip": gzipped,
+            "sha256": sha256_bytes(data),
+        }
+
+    def index(self) -> dict[str, object]:
+        return {"encoding": PAYLOAD_ENCODING, "assets": self.assets}
+
+    def html(self) -> str:
+        return "".join(self.elements)
+
+
+def parse_portable_payload(html: str) -> dict[str, bytes]:
+    """Decode every embedded asset of a portable page (tests and audits)."""
+    pattern = re.compile(
+        r'<script type="' + re.escape(PAYLOAD_TYPE)
+        + r'" data-gaius-asset="([A-Za-z0-9_-]+)" data-part="(\d+)">([^<]*)</script>'
+    )
+    texts: dict[str, list[str]] = {}
+    for match in pattern.finditer(html):
+        parts = texts.setdefault(match.group(1), [])
+        if int(match.group(2)) != len(parts):
+            raise ValueError(f"portable payload {match.group(1)} parts are out of order")
+        parts.append(match.group(3))
+    index_marker = "const portablePayload = "
+    start = html.index(index_marker) + len(index_marker)
+    end = html.index(";\n", start)
+    index = json.loads(html[start:end])
+    decoded: dict[str, bytes] = {}
+    for name, text_parts in texts.items():
+        decoded[name] = decode_b7("".join(text_parts), int(index["assets"][name]["bytes"]))
+    return decoded
 
 
 def require(path: Path) -> Path:
@@ -552,14 +680,11 @@ def load_shader_toolchain(
     if "</script" in lowered or "<!--" in lowered:
         raise RuntimeError("shader toolchain loader cannot be inlined into the portable page")
     modules: dict[str, dict[str, object]] = {}
-    payload: dict[str, list[str]] = {}
+    payload: dict[str, bytes] = {}
     for key, name, _mime in SHADER_TOOLCHAIN_MODULES:
         raw = (dist / name).read_bytes()
         compressed = gzip_bytes(raw)
-        encoded = base64.b64encode(compressed).decode("ascii")
-        payload[key] = [
-            encoded[index:index + CHUNK_SIZE] for index in range(0, len(encoded), CHUNK_SIZE)
-        ]
+        payload[key] = compressed
         modules[name] = {
             "rawSha256": file_records[name]["sha256"],
             "rawBytes": file_records[name]["bytes"],
@@ -602,7 +727,8 @@ def shader_toolchain_bootstrap(toolchain: dict[str, object] | None, profile: dic
     ready_lines = ["        const shaderToolchainBlobs = await Promise.all([\n"]
     for key, _name, mime in SHADER_TOOLCHAIN_MODULES:
         ready_lines.append(
-            f"          decompress(embedded.shaderToolchain.{key}, {json.dumps(mime)}),\n"
+            f"          decodeAsset({json.dumps(shader_toolchain_asset(key))}, "
+            f"{{gunzip: true, blobType: {json.dumps(mime)}}}),\n"
         )
     ready_lines.append("        ]);\n")
     ready_lines.append("        Object.assign(window.__gaiusShaderToolchainUrls, {\n")
@@ -619,6 +745,127 @@ def shader_toolchain_bootstrap(toolchain: dict[str, object] | None, profile: dic
         + "  </script>\n"
     )
     return globals_fragment, "".join(ready_lines), loader_fragment
+
+
+def shader_toolchain_asset(key: str) -> str:
+    return f"shader-{key}"
+
+
+# The v0.4 runtime the launcher includes through one tag (port/web/boot/gaius-boot.js). A
+# portable page has no sibling files, so the tag is replaced by the boot script and every
+# module it would load, inlined in load order; the kernel worker becomes an inert text block
+# the kernel runtime starts from a Blob URL.
+BOOT_TAG = '  <script data-gaius-boot="v1" src="gaius-boot.js"></script>\n'
+BOOT_SOURCE = Path("port/web/boot/gaius-boot.js")
+KERNEL_WORKER_SOURCE = Path("port/web/kernels/kernel-worker.js")
+KERNEL_RUNTIME_MODULES = ("kernels/kernel-policy.js", "kernels/kernel-runtime.js")
+QUALITY_MODULES = (
+    "runtime/quality/gpu-caps.js",
+    "runtime/quality/quality-profile.js",
+    "runtime/quality/gl-pass.js",
+    "runtime/quality/upscaler.js",
+    "runtime/quality/post-chain.js",
+    "runtime/quality/quality-runtime.js",
+)
+
+
+def kernel_job_modules(web: Path) -> list[str]:
+    """Kernel job codecs (port/web/kernels/*-job.js), whatever kernels exist."""
+    return sorted(
+        f"kernels/{path.name}" for path in (web / "kernels").glob("*-job.js") if path.is_file()
+    )
+
+
+def inline_safe(text: str, label: str) -> str:
+    lowered = text.lower()
+    if "</script" in lowered or "<!--" in lowered:
+        raise RuntimeError(f"{label} cannot be inlined into the portable page")
+    return text if text.endswith("\n") else text + "\n"
+
+
+def runtime_bootstrap(root: Path) -> tuple[str, dict[str, str]]:
+    """The inline replacement of the launcher's gaius-boot.js tag and its module hashes."""
+    web = root / "port" / "web"
+    boot = root / BOOT_SOURCE
+    if not boot.is_file():
+        return "", {}
+    modules: list[tuple[str, str]] = []
+    for name in KERNEL_RUNTIME_MODULES + tuple(kernel_job_modules(web)) + QUALITY_MODULES:
+        path = web / name
+        if path.is_file():
+            modules.append((name, inline_safe(path.read_text(encoding="utf-8"), name)))
+    hashes = {name: sha256_bytes(source.encode("utf-8")) for name, source in modules}
+    inline_names = json.dumps({name: True for name, _source in modules}, ensure_ascii=True,
+                              sort_keys=True, separators=(",", ":"))
+    parts = [
+        '  <script data-gaius-boot="v1" data-gaius-portable-inline="1">\n'
+        "    window.__gaiusBootPortable = true;\n"
+        f"    window.__gaiusBootInline = {inline_names};\n"
+        "  </script>\n"
+    ]
+    for name, source in modules:
+        parts.append(f'  <script data-gaius-boot-module="{name}">\n{source}  </script>\n')
+    worker = root / KERNEL_WORKER_SOURCE
+    if worker.is_file():
+        worker_text = inline_safe(worker.read_text(encoding="utf-8"), "kernel-worker.js")
+        hashes["kernels/kernel-worker.js"] = sha256_bytes(worker_text.encode("utf-8"))
+        parts.append(
+            '  <script type="text/plain" id="gaius-kernel-worker-source">\n' + worker_text + "  </script>\n"
+        )
+    boot_text = inline_safe(boot.read_text(encoding="utf-8"), "gaius-boot.js")
+    hashes["gaius-boot.js"] = sha256_bytes(boot_text.encode("utf-8"))
+    parts.append('  <script data-gaius-boot="v1" data-gaius-portable-inline="1">\n' + boot_text + "  </script>\n")
+    return "".join(parts), hashes
+
+
+def load_portable_kernels(dist: Path, payload: "PortablePayload") -> tuple[dict, dict]:
+    """Embeds the wasm kernels listed in dist/kernels/kernels.json (both builds of each).
+
+    Returns the page index ({name: {kinds, memory, variants: {variant: asset}}}) and the
+    manifest record; both are empty when the dist carries no kernels (the page then keeps
+    every vanilla path).
+    """
+    manifest_path = dist / "kernels" / "kernels.json"
+    if not manifest_path.is_file():
+        return {}, {}
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"kernel manifest is invalid: {manifest_path}") from exc
+    kernels = manifest.get("kernels") if isinstance(manifest, dict) else None
+    if not isinstance(kernels, dict):
+        raise RuntimeError(f"kernel manifest has no kernels: {manifest_path}")
+    index: dict[str, dict[str, object]] = {}
+    record: dict[str, dict[str, object]] = {}
+    for name in sorted(kernels):
+        entry = kernels[name]
+        if not re.fullmatch(r"[a-z0-9_]+", name) or not isinstance(entry, dict):
+            raise RuntimeError(f"kernel manifest entry is invalid: {name}")
+        variants: dict[str, str] = {}
+        variant_records: dict[str, dict[str, object]] = {}
+        for variant in ("simd", "baseline"):
+            spec = (entry.get("variants") or {}).get(variant)
+            if not isinstance(spec, dict):
+                continue
+            path = require_nonempty(dist / "kernels" / str(spec.get("file", "")))
+            raw = path.read_bytes()
+            if spec.get("sha256") not in (None, sha256_bytes(raw)):
+                raise RuntimeError(f"kernel {path.name} does not match kernels.json")
+            asset = f"kernel-{name}-{variant}"
+            compressed = gzip_bytes(raw)
+            payload.add(asset, compressed, gzipped=True)
+            variants[variant] = asset
+            variant_records[variant] = {
+                "rawSha256": sha256_bytes(raw), "rawBytes": len(raw),
+                "gzipSha256": sha256_bytes(compressed), "gzipBytes": len(compressed),
+            }
+        if not variants:
+            continue
+        index[name] = {"kinds": list(entry.get("kinds") or []), "variants": variants}
+        if isinstance(entry.get("memory"), dict):
+            index[name]["memory"] = entry["memory"]
+        record[name] = variant_records
+    return index, record
 
 
 def manifest_path_for(output: Path) -> Path:
@@ -688,6 +935,393 @@ def verified_compiler_profile(
         "shortFileNames": expected["compiler"]["shortFileNames"],
         "assertionsRemoved": expected["compiler"]["assertionsRemoved"],
     }
+
+
+# The portable bootstrap. A plain string with __GAIUS_PORTABLE_*__ placeholders (no f-string, so
+# the JavaScript keeps its own braces). It runs after the payload elements were parsed.
+PORTABLE_BOOTSTRAP = r'''  <script data-gaius-portable="1">
+    (() => {
+      const portableManifest = __GAIUS_PORTABLE_MANIFEST__;
+      const portablePayload = __GAIUS_PORTABLE_PAYLOAD__;
+      const portableKernelIndex = __GAIUS_PORTABLE_KERNELS__;
+      const workerSource = __GAIUS_PORTABLE_WORKER_SOURCE__;
+      const embeddedRelayNodes = __GAIUS_PORTABLE_RELAY_NODES__;
+
+      // gaius-b7-v1 decoder. Runs in a Worker started from this function's source (or on this
+      // thread when Workers are unavailable): 7 bits per character, U+0080..U+0083 stand for
+      // the 7-bit values 0x00, 0x0A, 0x0D and 0x3C; every 8 characters are 7 bytes. A gzip asset is
+      // inflated with DecompressionStream while its parts arrive.
+      function gaiusPortableDecoder(scope) {
+        const table = new Uint8Array(256);
+        for (let code = 0; code < 128; code++) table[code] = code;
+        table[0x80] = 0x00;
+        table[0x81] = 0x0A;
+        table[0x82] = 0x0D;
+        table[0x83] = 0x3C;
+        const jobs = new Map();
+        function decodePart(text, job) {
+          const blocks = text.length >> 3;
+          let count = blocks * 7;
+          if (job.received + count > job.bytes) count = Math.max(0, job.bytes - job.received);
+          const out = new Uint8Array(blocks * 7);
+          for (let i = 0, j = 0; i < blocks * 8; i += 8, j += 7) {
+            const g0 = table[text.charCodeAt(i)];
+            const g1 = table[text.charCodeAt(i + 1)];
+            const g2 = table[text.charCodeAt(i + 2)];
+            const g3 = table[text.charCodeAt(i + 3)];
+            const g4 = table[text.charCodeAt(i + 4)];
+            const g5 = table[text.charCodeAt(i + 5)];
+            const g6 = table[text.charCodeAt(i + 6)];
+            const g7 = table[text.charCodeAt(i + 7)];
+            out[j] = (g0 << 1) | (g1 >> 6);
+            out[j + 1] = ((g1 & 63) << 2) | (g2 >> 5);
+            out[j + 2] = ((g2 & 31) << 3) | (g3 >> 4);
+            out[j + 3] = ((g3 & 15) << 4) | (g4 >> 3);
+            out[j + 4] = ((g4 & 7) << 5) | (g5 >> 2);
+            out[j + 5] = ((g5 & 3) << 6) | (g6 >> 1);
+            out[j + 6] = ((g6 & 1) << 7) | g7;
+          }
+          job.received += count;
+          return count === out.length ? out : out.subarray(0, count);
+        }
+        async function finish(job) {
+          let value;
+          if (job.writer) {
+            await job.writer.close();
+            value = await job.result;
+          } else {
+            const joined = new Uint8Array(job.received);
+            let at = 0;
+            for (const chunk of job.chunks) {
+              joined.set(chunk, at);
+              at += chunk.length;
+            }
+            value = job.blobType ? new Blob([joined], {type: job.blobType}) : joined.buffer;
+          }
+          if (job.received !== job.bytes) throw new Error("portable asset is truncated");
+          return value;
+        }
+        scope.onmessage = (event) => {
+          const message = event.data;
+          const job = jobs.get(message.id);
+          try {
+            if (message.type === "begin") {
+              const next = {bytes: message.bytes, received: 0, chunks: [], blobType: message.blobType,
+                writer: null, result: null};
+              if (message.gunzip) {
+                const stream = new DecompressionStream("gzip");
+                next.writer = stream.writable.getWriter();
+                const response = new Response(stream.readable);
+                next.result = message.blobType
+                  ? response.blob().then((blob) => new Blob([blob], {type: message.blobType}))
+                  : response.arrayBuffer();
+                next.result.catch(() => {});
+              }
+              jobs.set(message.id, next);
+            } else if (message.type === "part" && job) {
+              const bytes = decodePart(message.text, job);
+              if (job.writer) job.writer.write(bytes).catch(() => {});
+              else job.chunks.push(bytes);
+            } else if (message.type === "end" && job) {
+              jobs.delete(message.id);
+              finish(job).then((value) => {
+                scope.postMessage({type: "done", id: message.id, value},
+                  value instanceof ArrayBuffer ? [value] : []);
+              }, (error) => {
+                scope.postMessage({type: "failed", id: message.id, message: String(error && error.message || error)});
+              });
+            }
+          } catch (error) {
+            jobs.delete(message.id);
+            scope.postMessage({type: "failed", id: message.id, message: String(error && error.message || error)});
+          }
+        };
+      }
+
+      const decoder = (() => {
+        const pending = new Map();
+        const deliver = (message) => {
+          const entry = pending.get(message.id);
+          if (!entry) return;
+          pending.delete(message.id);
+          if (message.type === "done") entry.resolve(message.value);
+          else entry.reject(new Error("Could not unpack the portable Gaius build: " + message.message));
+        };
+        let post = null;
+        try {
+          if (typeof DecompressionStream !== "function") {
+            throw new Error("This browser cannot open the portable Gaius build");
+          }
+          const url = URL.createObjectURL(new Blob(
+            ["(" + gaiusPortableDecoder.toString() + ")(self);"], {type: "text/javascript"}));
+          const worker = new Worker(url, {name: "gaius-portable-decoder"});
+          worker.onmessage = (event) => deliver(event.data);
+          worker.onerror = (event) => {
+            const message = String(event && event.message || "decoder worker failed");
+            Array.from(pending.keys()).forEach((id) => deliver({type: "failed", id, message}));
+          };
+          post = (message) => worker.postMessage(message);
+        } catch (_) {
+          const scope = {postMessage: (message) => Promise.resolve().then(() => deliver(message))};
+          gaiusPortableDecoder(scope);
+          post = (message) => scope.onmessage({data: message});
+        }
+        let nextId = 1;
+        let queue = Promise.resolve();
+        const cache = new Map();
+        // Parts are read in priority order, one asset after another; each part leaves the DOM
+        // as soon as it was handed to the decoder.
+        function decode(name, options) {
+          if (cache.has(name)) return cache.get(name);
+          const info = portablePayload.assets[name];
+          if (!info) return Promise.reject(new Error("portable asset is missing: " + name));
+          const id = nextId++;
+          const result = new Promise((resolve, reject) => pending.set(id, {resolve, reject}));
+          const run = async () => {
+            try {
+              post({type: "begin", id, bytes: info.bytes, gunzip: !!options.gunzip, blobType: options.blobType || null});
+              const parts = document.querySelectorAll('script[data-gaius-asset="' + name + '"]');
+              if (parts.length !== info.parts) throw new Error("portable asset " + name + " has missing parts");
+              for (let index = 0; index < parts.length; index++) {
+                const element = parts[index];
+                const text = element.textContent;
+                element.textContent = "";
+                if (element.parentNode) element.parentNode.removeChild(element);
+                post({type: "part", id, text});
+                if ((index & 3) === 3) {
+                  await new Promise((resolve) => setTimeout(resolve, 0));
+                }
+              }
+              post({type: "end", id});
+            } catch (error) {
+              deliver({type: "failed", id, message: String(error && error.message || error)});
+            }
+          };
+          queue = queue.then(run, run);
+          cache.set(name, result);
+          return result;
+        }
+        return {decode};
+      })();
+      const decodeAsset = (name, options) => decoder.decode(name, options || {});
+
+      const configuredRelayNodes = Array.isArray(window.__gaiusBridgeUrls)
+        ? window.__gaiusBridgeUrls
+        : (window.__gaiusBridgeUrls ? [window.__gaiusBridgeUrls] : []);
+      window.__gaiusBridgeUrls = embeddedRelayNodes.concat(configuredRelayNodes);
+      window.__gaiusPortableManifest = portableManifest;
+      window.__gaiusPortablePayload = portablePayload;
+      window.__gaiusPortableBuild = true;
+      __GAIUS_PORTABLE_TOOLCHAIN_GLOBALS__
+      if (portableKernelIndex) {
+        const kernels = {};
+        Object.keys(portableKernelIndex).forEach((name) => {
+          const entry = portableKernelIndex[name];
+          const variants = {};
+          Object.keys(entry.variants).forEach((variant) => {
+            const asset = entry.variants[variant];
+            variants[variant] = {load: () => decodeAsset(asset, {gunzip: true})};
+          });
+          kernels[name] = {kinds: entry.kinds, memory: entry.memory, variants};
+        });
+        window.__gaiusPortableKernels = kernels;
+      }
+      const portableBridgeTrace = window.__gaiusPortableBridgeTrace ||
+        (window.__gaiusPortableBridgeTrace = []);
+      const portablePendingLocalPorts = window.__gaiusPortablePendingLocalPorts ||
+        (window.__gaiusPortablePendingLocalPorts = new Map());
+      const tracePortableBridge = (event, detail) => {
+        portableBridgeTrace.push(Object.assign({event, at: Date.now()}, detail || {}));
+        if (portableBridgeTrace.length > 256) portableBridgeTrace.splice(0, portableBridgeTrace.length - 256);
+      };
+      const consumePortablePendingLocalPorts = () => {
+        const bridge = window.__gaiusNettyBridge || window.__gaiusNettyBridgeBootstrapState;
+        if (!bridge || typeof bridge.registerLocalPort !== "function") return false;
+        let consumed = false;
+        portablePendingLocalPorts.forEach((pending, sessionId) => {
+          if (!pending || !pending.port) {
+            portablePendingLocalPorts.delete(sessionId);
+            return;
+          }
+          let result = false;
+          try {
+            result = bridge.registerLocalPort(
+              String(sessionId), pending.port, String(pending.launchGeneration || ""));
+          } catch (error) {
+            tracePortableBridge("registerLocalPort-throw", {
+              sessionId: String(sessionId),
+              launchGeneration: String(pending.launchGeneration || ""),
+              error: String(error && (error.stack || error.message) || error),
+            });
+          }
+          tracePortableBridge("registerLocalPort-result", {
+            sessionId: String(sessionId),
+            launchGeneration: String(pending.launchGeneration || ""),
+            result: !!result,
+            bridgeReady: true,
+          });
+          if (result) {
+            portablePendingLocalPorts.delete(sessionId);
+            consumed = true;
+          }
+        });
+        return consumed;
+      };
+      // Keep the generated transport untouched, but normalize the one
+      // integrated-server wildcard endpoint at the bridge boundary.  Some
+      // TeaVM socket paths resolve the synthetic local name to 0.0.0.0 before
+      // invoking the JS bridge; the page registry already contains the active
+      // session and its MessagePort by this point.
+      const installLocalBridgeHostPatch = () => {
+        const wrap = (bridge) => {
+          if (!bridge || typeof bridge.open !== "function") return false;
+          if (bridge.__gaiusLocalHostPatch) return true;
+          const originalOpen = bridge.open;
+          bridge.open = function(id, host, port) {
+            let effectiveHost = host;
+            if ((String(host) === "0.0.0.0" || String(host).toLowerCase() === "localhost") && Number(port) === 25565) {
+              let session = "";
+              const workers = window.__gaiusSingleplayerWorkers;
+              if (workers && typeof workers.forEach === "function") workers.forEach((worker, key) => {
+                if (!session && /^[a-f0-9]{32}$/.test(String(key || "")) && worker && !worker.__gaiusTerminal) session = String(key);
+              });
+              const direct = String(window.__gaiusServerSessionId || "");
+              if (!session && /^[a-f0-9]{32}$/.test(direct)) session = direct;
+              if (!session) {
+                const ports = window.__gaiusLocalServerPorts;
+                if (ports && typeof ports.forEach === "function") ports.forEach((value, key) => { if (!session && /^[a-f0-9]{32}$/.test(String(key || ""))) session = String(key); });
+              }
+              if (session) effectiveHost = "client-" + session + ".gaius-local";
+            }
+            tracePortableBridge("bridge-open", {id,host:String(host),port:Number(port),effectiveHost:String(effectiveHost),session:String(window.__gaiusServerSessionId||""),workers:window.__gaiusSingleplayerWorkers?.size||0,ports:window.__gaiusLocalServerPorts?.size||0});
+            return originalOpen.call(this, id, effectiveHost, port);
+          };
+          bridge.__gaiusLocalHostPatch = true;
+          return true;
+        };
+        let bridge = window.__gaiusNettyBridge;
+        if (!bridge && window.__gaiusNettyBridgeBootstrapState && typeof window.__gaiusNettyBridgeBootstrapState.open === "function") {
+          try { window.__gaiusNettyBridge = window.__gaiusNettyBridgeBootstrapState; bridge = window.__gaiusNettyBridge; } catch (_) {}
+        }
+        if (wrap(bridge)) {
+          tracePortableBridge("bridge-init", {bridgeReady: true});
+          consumePortablePendingLocalPorts();
+          return true;
+        }
+        const bootstrapState = window.__gaiusNettyBridgeBootstrapState;
+        if (wrap(bootstrapState)) {
+          tracePortableBridge("bridge-bootstrap", {bridgeReady: true});
+          consumePortablePendingLocalPorts();
+          return true;
+        }
+        if (!window.__gaiusPortableBridgeAccessorInstalled) {
+          try {
+            const descriptor = Object.getOwnPropertyDescriptor(window, "__gaiusNettyBridge");
+            if (!descriptor || descriptor.configurable) {
+              let value = descriptor ? (descriptor.get ? descriptor.get.call(window) : descriptor.value) : undefined;
+              Object.defineProperty(window, "__gaiusNettyBridge", {
+                configurable: true, enumerable: descriptor ? descriptor.enumerable : true,
+                get() { return value; },
+                set(next) { value = next; wrap(next); }
+              });
+              window.__gaiusPortableBridgeAccessorInstalled = true;
+            }
+          } catch (_) {}
+        }
+        const ready = !!wrap(window.__gaiusNettyBridge);
+        if (ready) consumePortablePendingLocalPorts();
+        return ready;
+      };
+      installLocalBridgeHostPatch();
+      setInterval(() => { installLocalBridgeHostPatch(); consumePortablePendingLocalPorts(); }, 10);
+      // Decode order follows need: the client script and its wasm gate the boot, the asset
+      // pack comes next (inflated off this thread, so the launcher gets the raw pack), and the
+      // singleplayer server last: it is only needed when a world opens.
+      const classesBlobPromise = decodeAsset("classes", {gunzip: true, blobType: "text/javascript"});
+      const wasmBlobPromise = decodeAsset("wasm", {gunzip: true, blobType: "application/wasm"});
+      window.__gaiusVanillaAssetsCompressedPromise = decodeAsset("vanilla", {gunzip: true})
+        .then((buffer) => new Uint8Array(buffer));
+      // The page must transfer the embedded server bytes to its Worker. A
+      // page-created blob:null URL cannot be fetched from a dedicated Worker
+      // when the launcher is opened directly via file://.
+      window.__gaiusSingleplayerServerGzipDataPromise = decodeAsset("server", {gunzip: false});
+      window.__gaiusSingleplayerServerGzipDataPromise.then((buffer) => {
+        window.__gaiusSingleplayerServerGzipUrl = URL.createObjectURL(
+          new Blob([buffer], {type: "application/gzip"}),
+        );
+      }, () => {});
+      // Bridge the generated Java launcher without recompiling TeaVM: defer
+      // only the integrated-server start message until the transferable gzip
+      // buffer is ready. The original MessagePort remains untransferred until
+      // the native postMessage call below.
+      if (typeof Worker === "function" && Worker.prototype &&
+          typeof Worker.prototype.postMessage === "function") {
+        const nativeWorkerPostMessage = Worker.prototype.postMessage;
+        Worker.prototype.postMessage = function(message, transfer) {
+          if (window.__gaiusPortableBuild === true && message &&
+              message.type === "start" &&
+              window.__gaiusSingleplayerServerGzipDataPromise &&
+              typeof window.__gaiusSingleplayerServerGzipDataPromise.then === "function") {
+            const worker = this;
+            const originalTransfer = Array.isArray(transfer) ? transfer.slice() : [];
+            const sessionId = String(message.sessionId || "");
+            const launchGeneration = String(message.launchGeneration || "");
+            const pagePort = worker && worker.__gaiusClientPort;
+            if (/^[a-f0-9]{32}$/.test(sessionId) && pagePort && /^[1-9][0-9]*$/.test(launchGeneration)) {
+              const ports = window.__gaiusLocalServerPorts ||
+                (window.__gaiusLocalServerPorts = new Map());
+              const existing = ports.get(sessionId);
+              if (!existing) ports.set(sessionId, pagePort);
+              window.__gaiusServerSessionId = sessionId;
+              window.__gaiusServerLaunchGeneration = launchGeneration;
+              portablePendingLocalPorts.set(sessionId, {port: pagePort, launchGeneration});
+              tracePortableBridge("start-pre-register", {
+                sessionId, launchGeneration, hasPagePort: true,
+                existingPort: !!existing, pending: portablePendingLocalPorts.size,
+              });
+              consumePortablePendingLocalPorts();
+            } else {
+              tracePortableBridge("start-pre-register", {
+                sessionId, launchGeneration, hasPagePort: !!pagePort,
+                pending: portablePendingLocalPorts.size,
+              });
+            }
+            window.__gaiusSingleplayerServerGzipDataPromise.then((buffer) => {
+              // Transferring detaches the buffer, and the promise resolves to the
+              // same buffer for every integrated-server start of this page, so
+              // each start transfers its own copy (a second start in the same
+              // session otherwise fails with DataCloneError).
+              const transferBuffer = buffer instanceof ArrayBuffer ? buffer.slice(0) : buffer;
+              const payload = Object.assign({}, message, {
+                serverScriptGzipData: transferBuffer,
+                serverScriptGzipUrl: null,
+              });
+              const transferList = originalTransfer.slice();
+              if (transferBuffer instanceof ArrayBuffer) transferList.push(transferBuffer);
+              nativeWorkerPostMessage.call(worker, payload, transferList);
+              tracePortableBridge("start-post-register", {sessionId, launchGeneration, transferred: true});
+            }, () => {
+              nativeWorkerPostMessage.call(worker, message, originalTransfer);
+              tracePortableBridge("start-post-register", {sessionId, launchGeneration, transferred: false});
+            });
+            return;
+          }
+          return nativeWorkerPostMessage.call(this, message, transfer);
+        };
+      }
+      window.__gaiusPortableAssetsReady = (async () => {
+        const [classesBlob, wasmBlob] = await Promise.all([classesBlobPromise, wasmBlobPromise]);
+        window.__gaiusClassesUrl = URL.createObjectURL(classesBlob);
+        window.__gaiusHotpathWasmUrl = URL.createObjectURL(wasmBlob);
+        window.__gaiusSingleplayerWorkerUrl = URL.createObjectURL(new Blob(
+          [workerSource],
+          {type: "text/javascript"},
+        ));
+        __GAIUS_PORTABLE_TOOLCHAIN_READY__
+      })();
+    })();
+  </script>
+'''
 
 
 def build(dist: Path, output: Path, root: Path | None = None) -> None:
@@ -780,10 +1414,6 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
     shader_toolchain = load_shader_toolchain(
         dist, index, profile, classes_js, root, common_identity
     )
-    classes = base64_chunks(classes_gzip)
-    server = base64_chunks(server_gzip)
-    wasm = base64_chunks(wasm_gzip)
-    vanilla = base64_chunks(vanilla_gzip)
     worker = worker_path.read_text(encoding="utf-8")
     relay_registry = json.loads(relay_registry_path.read_text(encoding="utf-8"))
     if (relay_registry.get("kind") != "gaius-relay-registry"
@@ -791,6 +1421,20 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
             or not isinstance(relay_registry.get("nodes"), list)):
         raise RuntimeError("portable relay-nodes.json is incompatible")
     relay_nodes = relay_registry["nodes"][:64]
+
+    # Document order is decode order: the client and its wasm first (they gate the boot), the
+    # shader toolchain next, then the asset pack, the singleplayer server (only needed when a
+    # world opens) and the kernels (decoded when the kernel runtime first loads them).
+    payload = PortablePayload()
+    payload.add("classes", classes_gzip.read_bytes(), gzipped=True)
+    payload.add("wasm", wasm_gzip.read_bytes(), gzipped=True)
+    if shader_toolchain is not None:
+        for key, _name, _mime in SHADER_TOOLCHAIN_MODULES:
+            payload.add(shader_toolchain_asset(key), shader_toolchain["payload"][key], gzipped=True)
+    payload.add("vanilla", vanilla_gzip.read_bytes(), gzipped=True)
+    payload.add("server", server_gzip.read_bytes(), gzipped=True)
+    kernel_index, kernel_record = load_portable_kernels(dist, payload)
+    runtime_inline, runtime_hashes = runtime_bootstrap(root)
 
     manifest = {
         "kind": MANIFEST_KIND,
@@ -803,6 +1447,7 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
         "worldgenTelemetryMode": profile.get("worldgenTelemetryMode"),
         "storage": profile["storage"],
         "buildIdentity": common_identity,
+        "payloadEncoding": PAYLOAD_ENCODING,
         "classesJs": {
             "rawSha256": classes_hash,
             "gzipSha256": classes_gzip_hash,
@@ -845,6 +1490,10 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
     }
     if shader_toolchain is not None:
         manifest["shaderToolchain"] = shader_toolchain["manifest"]
+    if runtime_hashes:
+        manifest["runtimeModules"] = runtime_hashes
+    if kernel_record:
+        manifest["kernels"] = kernel_record
     manifest_source = json.dumps(
         manifest,
         ensure_ascii=True,
@@ -853,254 +1502,25 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
     )
     manifest_text = f"{manifest_source}\n"
 
-    embedded_assets: dict[str, object] = {
-        "classes": classes, "server": server, "wasm": wasm, "vanilla": vanilla,
-    }
-    if shader_toolchain is not None:
-        embedded_assets["shaderToolchain"] = shader_toolchain["payload"]
-    payload = json.dumps(
-        embedded_assets,
-        ensure_ascii=True,
-        separators=(",", ":"),
-    )
+    payload_index = json.dumps(payload.index(), ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    kernel_source = json.dumps(kernel_index or None, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     worker_source = json.dumps(worker, ensure_ascii=True)
     relay_nodes_source = json.dumps(relay_nodes, ensure_ascii=True, separators=(",", ":"))
     toolchain_globals, toolchain_ready, toolchain_loader = shader_toolchain_bootstrap(
         shader_toolchain, profile
     )
-    bootstrap = f'''  <script data-gaius-portable="1">
-    (() => {{
-      const portableManifest = {manifest_source};
-      const embedded = {payload};
-      const workerSource = {worker_source};
-      const embeddedRelayNodes = {relay_nodes_source};
-
-      async function compressedBlob(chunks) {{
-        const parts = new Array(chunks.length);
-        for (let index = 0; index < chunks.length; index++) {{
-          const binary = atob(chunks[index]);
-          const bytes = new Uint8Array(binary.length);
-          for (let offset = 0; offset < binary.length; offset++) {{
-            bytes[offset] = binary.charCodeAt(offset);
-          }}
-          parts[index] = bytes;
-          if ((index & 3) === 3) {{
-            await new Promise((resolve) => setTimeout(resolve, 0));
-          }}
-        }}
-        return new Blob(parts, {{type: "application/gzip"}});
-      }}
-
-      async function decompress(chunks, mimeType) {{
-        if (typeof DecompressionStream !== "function") {{
-          throw new Error("This browser cannot open the portable Gaius build");
-        }}
-        const compressed = await compressedBlob(chunks);
-        const stream = compressed
-          .stream()
-          .pipeThrough(new DecompressionStream("gzip"));
-        const decompressed = await new Response(stream).blob();
-        return new Blob([decompressed], {{type: mimeType}});
-      }}
-
-      const configuredRelayNodes = Array.isArray(window.__gaiusBridgeUrls)
-        ? window.__gaiusBridgeUrls
-        : (window.__gaiusBridgeUrls ? [window.__gaiusBridgeUrls] : []);
-      window.__gaiusBridgeUrls = embeddedRelayNodes.concat(configuredRelayNodes);
-      window.__gaiusPortableManifest = portableManifest;
-      window.__gaiusPortableBuild = true;
-{toolchain_globals}      const portableBridgeTrace = window.__gaiusPortableBridgeTrace ||
-        (window.__gaiusPortableBridgeTrace = []);
-      const portablePendingLocalPorts = window.__gaiusPortablePendingLocalPorts ||
-        (window.__gaiusPortablePendingLocalPorts = new Map());
-      const tracePortableBridge = (event, detail) => {{
-        portableBridgeTrace.push(Object.assign({{event, at: Date.now()}}, detail || {{}}));
-        if (portableBridgeTrace.length > 256) portableBridgeTrace.splice(0, portableBridgeTrace.length - 256);
-      }};
-      const consumePortablePendingLocalPorts = () => {{
-        const bridge = window.__gaiusNettyBridge || window.__gaiusNettyBridgeBootstrapState;
-        if (!bridge || typeof bridge.registerLocalPort !== "function") return false;
-        let consumed = false;
-        portablePendingLocalPorts.forEach((pending, sessionId) => {{
-          if (!pending || !pending.port) {{
-            portablePendingLocalPorts.delete(sessionId);
-            return;
-          }}
-          let result = false;
-          try {{
-            result = bridge.registerLocalPort(
-              String(sessionId), pending.port, String(pending.launchGeneration || ""));
-          }} catch (error) {{
-            tracePortableBridge("registerLocalPort-throw", {{
-              sessionId: String(sessionId),
-              launchGeneration: String(pending.launchGeneration || ""),
-              error: String(error && (error.stack || error.message) || error),
-            }});
-          }}
-          tracePortableBridge("registerLocalPort-result", {{
-            sessionId: String(sessionId),
-            launchGeneration: String(pending.launchGeneration || ""),
-            result: !!result,
-            bridgeReady: true,
-          }});
-          if (result) {{
-            portablePendingLocalPorts.delete(sessionId);
-            consumed = true;
-          }}
-        }});
-        return consumed;
-      }};
-      // Keep the generated transport untouched, but normalize the one
-      // integrated-server wildcard endpoint at the bridge boundary.  Some
-      // TeaVM socket paths resolve the synthetic local name to 0.0.0.0 before
-      // invoking the JS bridge; the page registry already contains the active
-      // session and its MessagePort by this point.
-      const installLocalBridgeHostPatch = () => {{
-        const wrap = (bridge) => {{
-          if (!bridge || typeof bridge.open !== "function") return false;
-          if (bridge.__gaiusLocalHostPatch) return true;
-          const originalOpen = bridge.open;
-          bridge.open = function(id, host, port) {{
-            let effectiveHost = host;
-            if ((String(host) === "0.0.0.0" || String(host).toLowerCase() === "localhost") && Number(port) === 25565) {{
-              let session = "";
-              const workers = window.__gaiusSingleplayerWorkers;
-              if (workers && typeof workers.forEach === "function") workers.forEach((worker, key) => {{
-                if (!session && /^[a-f0-9]{{32}}$/.test(String(key || "")) && worker && !worker.__gaiusTerminal) session = String(key);
-              }});
-              const direct = String(window.__gaiusServerSessionId || "");
-              if (!session && /^[a-f0-9]{{32}}$/.test(direct)) session = direct;
-              if (!session) {{
-                const ports = window.__gaiusLocalServerPorts;
-                if (ports && typeof ports.forEach === "function") ports.forEach((value, key) => {{ if (!session && /^[a-f0-9]{{32}}$/.test(String(key || ""))) session = String(key); }});
-              }}
-              if (session) effectiveHost = "client-" + session + ".gaius-local";
-            }}
-            tracePortableBridge("bridge-open", {{id,host:String(host),port:Number(port),effectiveHost:String(effectiveHost),session:String(window.__gaiusServerSessionId||""),workers:window.__gaiusSingleplayerWorkers?.size||0,ports:window.__gaiusLocalServerPorts?.size||0}});
-            return originalOpen.call(this, id, effectiveHost, port);
-          }};
-          bridge.__gaiusLocalHostPatch = true;
-          return true;
-        }};
-        let bridge = window.__gaiusNettyBridge;
-        if (!bridge && window.__gaiusNettyBridgeBootstrapState && typeof window.__gaiusNettyBridgeBootstrapState.open === "function") {{
-          try {{ window.__gaiusNettyBridge = window.__gaiusNettyBridgeBootstrapState; bridge = window.__gaiusNettyBridge; }} catch (_) {{}}
-        }}
-        if (wrap(bridge)) {{
-          tracePortableBridge("bridge-init", {{bridgeReady: true}});
-          consumePortablePendingLocalPorts();
-          return true;
-        }}
-        const bootstrapState = window.__gaiusNettyBridgeBootstrapState;
-        if (wrap(bootstrapState)) {{
-          tracePortableBridge("bridge-bootstrap", {{bridgeReady: true}});
-          consumePortablePendingLocalPorts();
-          return true;
-        }}
-        if (!window.__gaiusPortableBridgeAccessorInstalled) {{
-          try {{
-            const descriptor = Object.getOwnPropertyDescriptor(window, "__gaiusNettyBridge");
-            if (!descriptor || descriptor.configurable) {{
-              let value = descriptor ? (descriptor.get ? descriptor.get.call(window) : descriptor.value) : undefined;
-              Object.defineProperty(window, "__gaiusNettyBridge", {{
-                configurable: true, enumerable: descriptor ? descriptor.enumerable : true,
-                get() {{ return value; }},
-                set(next) {{ value = next; wrap(next); }}
-              }});
-              window.__gaiusPortableBridgeAccessorInstalled = true;
-            }}
-          }} catch (_) {{}}
-        }}
-        const ready = !!wrap(window.__gaiusNettyBridge);
-        if (ready) consumePortablePendingLocalPorts();
-        return ready;
-      }};
-      installLocalBridgeHostPatch();
-      setInterval(() => {{ installLocalBridgeHostPatch(); consumePortablePendingLocalPorts(); }}, 10);
-      window.__gaiusVanillaAssetsCompressedPromise = compressedBlob(embedded.vanilla);
-      // The page must transfer the embedded server bytes to its Worker. A
-      // page-created blob:null URL cannot be fetched from a dedicated Worker
-      // when the launcher is opened directly via file://.
-      window.__gaiusSingleplayerServerGzipDataPromise = compressedBlob(embedded.server)
-        .then((blob) => blob.arrayBuffer());
-      // Bridge the generated Java launcher without recompiling TeaVM: defer
-      // only the integrated-server start message until the transferable gzip
-      // buffer is ready. The original MessagePort remains untransferred until
-      // the native postMessage call below.
-      if (typeof Worker === "function" && Worker.prototype &&
-          typeof Worker.prototype.postMessage === "function") {{
-        const nativeWorkerPostMessage = Worker.prototype.postMessage;
-        Worker.prototype.postMessage = function(message, transfer) {{
-          if (window.__gaiusPortableBuild === true && message &&
-              message.type === "start" &&
-              window.__gaiusSingleplayerServerGzipDataPromise &&
-              typeof window.__gaiusSingleplayerServerGzipDataPromise.then === "function") {{
-            const worker = this;
-            const originalTransfer = Array.isArray(transfer) ? transfer.slice() : [];
-            const sessionId = String(message.sessionId || "");
-            const launchGeneration = String(message.launchGeneration || "");
-            const pagePort = worker && worker.__gaiusClientPort;
-            if (/^[a-f0-9]{{32}}$/.test(sessionId) && pagePort && /^[1-9][0-9]*$/.test(launchGeneration)) {{
-              const ports = window.__gaiusLocalServerPorts ||
-                (window.__gaiusLocalServerPorts = new Map());
-              const existing = ports.get(sessionId);
-              if (!existing) ports.set(sessionId, pagePort);
-              window.__gaiusServerSessionId = sessionId;
-              window.__gaiusServerLaunchGeneration = launchGeneration;
-              portablePendingLocalPorts.set(sessionId, {{port: pagePort, launchGeneration}});
-              tracePortableBridge("start-pre-register", {{
-                sessionId, launchGeneration, hasPagePort: true,
-                existingPort: !!existing, pending: portablePendingLocalPorts.size,
-              }});
-              consumePortablePendingLocalPorts();
-            }} else {{
-              tracePortableBridge("start-pre-register", {{
-                sessionId, launchGeneration, hasPagePort: !!pagePort,
-                pending: portablePendingLocalPorts.size,
-              }});
-            }}
-            window.__gaiusSingleplayerServerGzipDataPromise.then((buffer) => {{
-              // Transferring detaches the buffer, and the promise resolves to the
-              // same buffer for every integrated-server start of this page, so
-              // each start transfers its own copy (a second start in the same
-              // session otherwise fails with DataCloneError).
-              const transferBuffer = buffer instanceof ArrayBuffer ? buffer.slice(0) : buffer;
-              const payload = Object.assign({{}}, message, {{
-                serverScriptGzipData: transferBuffer,
-                serverScriptGzipUrl: null,
-              }});
-              const transferList = originalTransfer.slice();
-              if (transferBuffer instanceof ArrayBuffer) transferList.push(transferBuffer);
-              nativeWorkerPostMessage.call(worker, payload, transferList);
-              tracePortableBridge("start-post-register", {{sessionId, launchGeneration, transferred: true}});
-            }}, () => {{
-              nativeWorkerPostMessage.call(worker, message, originalTransfer);
-              tracePortableBridge("start-post-register", {{sessionId, launchGeneration, transferred: false}});
-            }});
-            return;
-          }}
-          return nativeWorkerPostMessage.call(this, message, transfer);
-        }};
-      }}
-      window.__gaiusPortableAssetsReady = (async () => {{
-        const [classesBlob, wasmBlob] = await Promise.all([
-          decompress(embedded.classes, "text/javascript"),
-          decompress(embedded.wasm, "application/wasm"),
-        ]);
-        window.__gaiusClassesUrl = URL.createObjectURL(classesBlob);
-        window.__gaiusHotpathWasmUrl = URL.createObjectURL(wasmBlob);
-        window.__gaiusSingleplayerWorkerUrl = URL.createObjectURL(new Blob(
-          [workerSource],
-          {{type: "text/javascript"}},
-        ));
-{toolchain_ready}        const serverBlob = await compressedBlob(embedded.server);
-        window.__gaiusSingleplayerServerGzipUrl = URL.createObjectURL(
-          serverBlob,
-        );
-      }})();
-    }})();
-  </script>
-'''
+    bootstrap = (
+        PORTABLE_BOOTSTRAP
+        .replace("__GAIUS_PORTABLE_MANIFEST__", manifest_source)
+        .replace("__GAIUS_PORTABLE_PAYLOAD__", payload_index)
+        .replace("__GAIUS_PORTABLE_KERNELS__", kernel_source)
+        .replace("__GAIUS_PORTABLE_WORKER_SOURCE__", worker_source)
+        .replace("__GAIUS_PORTABLE_RELAY_NODES__", relay_nodes_source)
+        .replace("      __GAIUS_PORTABLE_TOOLCHAIN_GLOBALS__\n", toolchain_globals)
+        .replace("        __GAIUS_PORTABLE_TOOLCHAIN_READY__\n", toolchain_ready)
+    )
+    if "__GAIUS_PORTABLE_" in bootstrap:
+        raise RuntimeError("portable bootstrap template has an unfilled placeholder")
     marker = "  <script>\n    if (typeof Error === \"function\")"
     if marker not in index:
         raise RuntimeError("portable launcher insertion point was not found")
@@ -1110,8 +1530,14 @@ def build(dist: Path, output: Path, root: Path | None = None) -> None:
         # awaits the embedded Blob URLs instead.
         index, removed = SHADER_TOOLCHAIN_TAG.subn("", index)
         if removed != 1:
-            raise RuntimeError("portable shader toolchain loader tag was not replaced")
-    portable = index.replace(marker, bootstrap + toolchain_loader + marker, 1)
+            raise RuntimeError("shader toolchain loader tag was not replaced")
+    if runtime_inline and BOOT_TAG in index:
+        index = index.replace(BOOT_TAG, runtime_inline, 1)
+    elif BOOT_TAG in index:
+        # No boot sources next to this script: drop the tag, it would only 404 on file://.
+        index = index.replace(BOOT_TAG, "", 1)
+    # The payload elements precede the bootstrap, so the bootstrap finds every part when it runs.
+    portable = index.replace(marker, payload.html() + bootstrap + toolchain_loader + marker, 1)
     manifest_path = manifest_path_for(output)
     if manifest_path == output:
         raise RuntimeError("portable manifest path collides with HTML output")

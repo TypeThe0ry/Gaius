@@ -1,13 +1,23 @@
 name: Deploy Gaius GitHub Pages
 run-name: Deploy Gaius Pages [${{ inputs.release_token || github.sha }}]
 
-# Pages publishes exactly three files: the Minecraft 1.21.11, 26.2 and 26.3
-# browser clients (Gaius-1.21.11.html, Gaius-26.2.html and Gaius-26.3.html).
-# Nothing in the repository checkout is
-# published, so the workflow runs only on dispatch. Without release_tag it
-# follows the repository's Latest release; release_tag pins a specific tag (for
-# example a pre-release). The deployed bytes must match that release's
-# SHA256SUMS; releases without one fail closed.
+# Pages publishes the Minecraft 1.21.11, 26.2 and 26.3 browser clients of one
+# release. Releases from v0.4.0 on carry a multi-file site per profile
+# (Gaius-site-1.21.11.tar.gz, Gaius-site-26.2.tar.gz, Gaius-site-26.3.tar.gz,
+# built by port/scripts/build-pages-site.py): content-hashed assets that the
+# site's Service Worker caches immutably, the singleplayer server loaded only
+# when a world opens, and sounds streamed after the client starts. Each archive
+# is extracted to <profile>/, and Gaius-<profile>.html at the root becomes a
+# redirect to it so existing links keep working. Older releases (no site
+# archives) still publish exactly the three single-file clients
+# (Gaius-1.21.11.html, Gaius-26.2.html and Gaius-26.3.html); the portable
+# single files remain release downloads either way.
+#
+# Nothing in the repository checkout is published, so the workflow runs only on
+# dispatch. Without release_tag it follows the repository's Latest release;
+# release_tag pins a specific tag (for example a pre-release). Every deployed
+# file must come from an asset whose bytes match that release's SHA256SUMS;
+# releases without one fail closed.
 
 on:
   workflow_dispatch:
@@ -17,7 +27,7 @@ on:
         required: true
         type: string
       release_tag:
-        description: Release tag whose Gaius-1.21.11.html, Gaius-26.2.html and Gaius-26.3.html should be deployed (empty = the repository's Latest release)
+        description: Release tag whose Gaius clients should be deployed (empty = the repository's Latest release)
         required: false
         default: ''
         type: string
@@ -79,21 +89,6 @@ jobs:
           set -euo pipefail
           rm -rf pages-publish
           mkdir -p pages-publish
-          gh release download "$PAGES_RELEASE_TAG" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --pattern 'Gaius-1.21.11.html' \
-            --pattern 'Gaius-26.2.html' \
-            --pattern 'Gaius-26.3.html' \
-            --dir pages-publish \
-            --clobber
-          # The published site is exactly these three files.
-          test "$(find pages-publish -mindepth 1 | wc -l)" -eq 3
-          test -f pages-publish/Gaius-1.21.11.html
-          test -s pages-publish/Gaius-1.21.11.html
-          test -f pages-publish/Gaius-26.2.html
-          test -s pages-publish/Gaius-26.2.html
-          test -f pages-publish/Gaius-26.3.html
-          test -s pages-publish/Gaius-26.3.html
           # Bind the deployed bytes to the release. SHA256SUMS stays outside the
           # publish directory; gh fails when the release has no SHA256SUMS asset.
           sums_dir="${RUNNER_TEMP}/pages-release-sums"
@@ -105,38 +100,126 @@ jobs:
             --dir "$sums_dir" \
             --clobber
           test -s "$sums_dir/SHA256SUMS"
-          # Exactly one record per client, and every client must verify before upload.
-          grep -E '^[0-9a-f]{64}  Gaius-1\.21\.11\.html$' "$sums_dir/SHA256SUMS" > "$sums_dir/Gaius-1.21.11.html.sha256" || true
-          if [ "$(wc -l < "$sums_dir/Gaius-1.21.11.html.sha256")" -ne 1 ]; then
-            echo "::error::SHA256SUMS of ${PAGES_RELEASE_TAG} must hold exactly one Gaius-1.21.11.html record"
-            exit 1
+          site_assets="$(gh release view "$PAGES_RELEASE_TAG" --repo "${GITHUB_REPOSITORY}" \
+            --json assets --jq '[.assets[].name | select(. == "Gaius-site-1.21.11.tar.gz" or . == "Gaius-site-26.2.tar.gz" or . == "Gaius-site-26.3.tar.gz")] | length')"
+          summary=()
+          if [ "$site_assets" -eq 3 ]; then
+            layout=site
+            # Multi-file layout: one verified archive per profile, extracted to <profile>/.
+            sites_dir="${RUNNER_TEMP}/pages-release-sites"
+            rm -rf "$sites_dir"
+            mkdir -p "$sites_dir"
+            gh release download "$PAGES_RELEASE_TAG" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --pattern 'Gaius-site-1.21.11.tar.gz' \
+              --pattern 'Gaius-site-26.2.tar.gz' \
+              --pattern 'Gaius-site-26.3.tar.gz' \
+              --dir "$sites_dir" \
+              --clobber
+            test "$(find "$sites_dir" -mindepth 1 | wc -l)" -eq 3
+            # Exactly one record per archive, and every archive must verify before it is unpacked.
+            grep -E '^[0-9a-f]{64}  Gaius-site-1\.21\.11\.tar\.gz$' "$sums_dir/SHA256SUMS" > "$sums_dir/Gaius-site-1.21.11.tar.gz.sha256" || true
+            if [ "$(wc -l < "$sums_dir/Gaius-site-1.21.11.tar.gz.sha256")" -ne 1 ]; then
+              echo "::error::SHA256SUMS of ${PAGES_RELEASE_TAG} must hold exactly one Gaius-site-1.21.11.tar.gz record"
+              exit 1
+            fi
+            grep -E '^[0-9a-f]{64}  Gaius-site-26\.2\.tar\.gz$' "$sums_dir/SHA256SUMS" > "$sums_dir/Gaius-site-26.2.tar.gz.sha256" || true
+            if [ "$(wc -l < "$sums_dir/Gaius-site-26.2.tar.gz.sha256")" -ne 1 ]; then
+              echo "::error::SHA256SUMS of ${PAGES_RELEASE_TAG} must hold exactly one Gaius-site-26.2.tar.gz record"
+              exit 1
+            fi
+            grep -E '^[0-9a-f]{64}  Gaius-site-26\.3\.tar\.gz$' "$sums_dir/SHA256SUMS" > "$sums_dir/Gaius-site-26.3.tar.gz.sha256" || true
+            if [ "$(wc -l < "$sums_dir/Gaius-site-26.3.tar.gz.sha256")" -ne 1 ]; then
+              echo "::error::SHA256SUMS of ${PAGES_RELEASE_TAG} must hold exactly one Gaius-site-26.3.tar.gz record"
+              exit 1
+            fi
+            (cd "$sites_dir" && sha256sum --check --strict "$sums_dir/Gaius-site-1.21.11.tar.gz.sha256")
+            (cd "$sites_dir" && sha256sum --check --strict "$sums_dir/Gaius-site-26.2.tar.gz.sha256")
+            (cd "$sites_dir" && sha256sum --check --strict "$sums_dir/Gaius-site-26.3.tar.gz.sha256")
+            for profile in 1.21.11 26.2 26.3; do
+              archive="$sites_dir/Gaius-site-${profile}.tar.gz"
+              # Only plain relative files: no links, devices, absolute paths, "." or "..".
+              if tar -tvzf "$archive" | awk 'substr($0, 1, 1) != "-" { bad = 1 } END { exit bad ? 0 : 1 }'; then
+                echo "::error::Gaius-site-${profile}.tar.gz holds an entry that is not a regular file"
+                exit 1
+              fi
+              while IFS= read -r entry; do
+                if [[ ! "$entry" =~ ^[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$ ]] || [[ "/$entry/" == *"/../"* ]]; then
+                  echo "::error::Gaius-site-${profile}.tar.gz holds an unexpected path"
+                  exit 1
+                fi
+              done < <(tar -tzf "$archive")
+              mkdir -p "pages-publish/$profile"
+              tar -xzf "$archive" -C "pages-publish/$profile" --no-same-owner --no-same-permissions
+              test -s "pages-publish/$profile/index.html"
+              test -s "pages-publish/$profile/gaius-sw.js"
+              # The single-file URL of earlier releases now opens the site, keeping query and fragment.
+              printf '%s\n' \
+                '<!doctype html>' \
+                '<meta charset="utf-8">' \
+                "<title>Gaius ${profile}</title>" \
+                "<script>location.replace(\"${profile}/\" + location.search + location.hash);</script>" \
+                "<meta http-equiv=\"refresh\" content=\"0; url=${profile}/\">" \
+                > "pages-publish/Gaius-${profile}.html"
+              site_sha256="$(cut -d ' ' -f 1 "$sums_dir/Gaius-site-${profile}.tar.gz.sha256")"
+              echo "sha256_site_${profile//./_}=${site_sha256}" >> "$GITHUB_OUTPUT"
+              summary+=("- Gaius-site-${profile}.tar.gz sha256: \`${site_sha256}\` (matches the release SHA256SUMS), served at \`${profile}/\`")
+            done
+            # GitHub Pages sites must stay below 1 GB.
+            published_bytes="$(du -sb pages-publish | cut -f 1)"
+            if [ "$published_bytes" -ge 1000000000 ]; then
+              echo "::error::The Pages site would be ${published_bytes} bytes; GitHub Pages allows at most 1 GB"
+              exit 1
+            fi
+          else
+            layout=single-file
+            gh release download "$PAGES_RELEASE_TAG" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --pattern 'Gaius-1.21.11.html' \
+              --pattern 'Gaius-26.2.html' \
+              --pattern 'Gaius-26.3.html' \
+              --dir pages-publish \
+              --clobber
+            # The published site is exactly these three files.
+            test "$(find pages-publish -mindepth 1 | wc -l)" -eq 3
+            test -f pages-publish/Gaius-1.21.11.html
+            test -s pages-publish/Gaius-1.21.11.html
+            test -f pages-publish/Gaius-26.2.html
+            test -s pages-publish/Gaius-26.2.html
+            test -f pages-publish/Gaius-26.3.html
+            test -s pages-publish/Gaius-26.3.html
+            # Exactly one record per client, and every client must verify before upload.
+            grep -E '^[0-9a-f]{64}  Gaius-1\.21\.11\.html$' "$sums_dir/SHA256SUMS" > "$sums_dir/Gaius-1.21.11.html.sha256" || true
+            if [ "$(wc -l < "$sums_dir/Gaius-1.21.11.html.sha256")" -ne 1 ]; then
+              echo "::error::SHA256SUMS of ${PAGES_RELEASE_TAG} must hold exactly one Gaius-1.21.11.html record"
+              exit 1
+            fi
+            grep -E '^[0-9a-f]{64}  Gaius-26\.2\.html$' "$sums_dir/SHA256SUMS" > "$sums_dir/Gaius-26.2.html.sha256" || true
+            if [ "$(wc -l < "$sums_dir/Gaius-26.2.html.sha256")" -ne 1 ]; then
+              echo "::error::SHA256SUMS of ${PAGES_RELEASE_TAG} must hold exactly one Gaius-26.2.html record"
+              exit 1
+            fi
+            grep -E '^[0-9a-f]{64}  Gaius-26\.3\.html$' "$sums_dir/SHA256SUMS" > "$sums_dir/Gaius-26.3.html.sha256" || true
+            if [ "$(wc -l < "$sums_dir/Gaius-26.3.html.sha256")" -ne 1 ]; then
+              echo "::error::SHA256SUMS of ${PAGES_RELEASE_TAG} must hold exactly one Gaius-26.3.html record"
+              exit 1
+            fi
+            (cd pages-publish && sha256sum --check --strict "$sums_dir/Gaius-1.21.11.html.sha256")
+            (cd pages-publish && sha256sum --check --strict "$sums_dir/Gaius-26.2.html.sha256")
+            (cd pages-publish && sha256sum --check --strict "$sums_dir/Gaius-26.3.html.sha256")
+            for profile in 1.21.11 26.2 26.3; do
+              page_sha256="$(cut -d ' ' -f 1 "$sums_dir/Gaius-${profile}.html.sha256")"
+              echo "sha256_${profile//./_}=${page_sha256}" >> "$GITHUB_OUTPUT"
+              summary+=("- Gaius-${profile}.html sha256: \`${page_sha256}\` (matches the release SHA256SUMS)")
+            done
           fi
-          grep -E '^[0-9a-f]{64}  Gaius-26\.2\.html$' "$sums_dir/SHA256SUMS" > "$sums_dir/Gaius-26.2.html.sha256" || true
-          if [ "$(wc -l < "$sums_dir/Gaius-26.2.html.sha256")" -ne 1 ]; then
-            echo "::error::SHA256SUMS of ${PAGES_RELEASE_TAG} must hold exactly one Gaius-26.2.html record"
-            exit 1
-          fi
-          grep -E '^[0-9a-f]{64}  Gaius-26\.3\.html$' "$sums_dir/SHA256SUMS" > "$sums_dir/Gaius-26.3.html.sha256" || true
-          if [ "$(wc -l < "$sums_dir/Gaius-26.3.html.sha256")" -ne 1 ]; then
-            echo "::error::SHA256SUMS of ${PAGES_RELEASE_TAG} must hold exactly one Gaius-26.3.html record"
-            exit 1
-          fi
-          (cd pages-publish && sha256sum --check --strict "$sums_dir/Gaius-1.21.11.html.sha256")
-          (cd pages-publish && sha256sum --check --strict "$sums_dir/Gaius-26.2.html.sha256")
-          (cd pages-publish && sha256sum --check --strict "$sums_dir/Gaius-26.3.html.sha256")
-          sha256_1_21_11="$(cut -d ' ' -f 1 "$sums_dir/Gaius-1.21.11.html.sha256")"
-          sha256_26_2="$(cut -d ' ' -f 1 "$sums_dir/Gaius-26.2.html.sha256")"
-          sha256_26_3="$(cut -d ' ' -f 1 "$sums_dir/Gaius-26.3.html.sha256")"
-          echo "sha256_1_21_11=${sha256_1_21_11}" >> "$GITHUB_OUTPUT"
-          echo "sha256_26_2=${sha256_26_2}" >> "$GITHUB_OUTPUT"
-          echo "sha256_26_3=${sha256_26_3}" >> "$GITHUB_OUTPUT"
+          echo "layout=${layout}" >> "$GITHUB_OUTPUT"
           # Only now, after every SHA256SUMS gate passed, announce the deployment.
           {
             echo "Deploying Gaius-1.21.11.html, Gaius-26.2.html and Gaius-26.3.html from ${PAGES_RELEASE_TAG} (${PAGES_RELEASE_SOURCE})"
             echo "- Release tag: \`${PAGES_RELEASE_TAG}\`"
-            echo "- Gaius-1.21.11.html sha256: \`${sha256_1_21_11}\` (matches the release SHA256SUMS)"
-            echo "- Gaius-26.2.html sha256: \`${sha256_26_2}\` (matches the release SHA256SUMS)"
-            echo "- Gaius-26.3.html sha256: \`${sha256_26_3}\` (matches the release SHA256SUMS)"
+            echo "- Layout: ${layout}"
+            printf '%s\n' "${summary[@]}"
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

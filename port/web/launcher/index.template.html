@@ -497,6 +497,7 @@
       }
     }
   </style>
+  <script data-gaius-boot="v1" src="gaius-boot.js"></script>
 </head>
 <body>
   <canvas id="mc-canvas" tabindex="0"></canvas>
@@ -613,8 +614,11 @@
       if (portableSource) {
         return decodeGaiusVanillaAssets(await portableSource);
       }
+      // A multi-file site serves the pack under a content-hashed name (gaius-boot.js).
       const source = new URL(
-        urlParams.get("vanillaAssets") || "vanilla-assets.pack.gz",
+        urlParams.get("vanillaAssets") ||
+          (window.__gaiusBoot && window.__gaiusBoot.assetUrl("vanilla-assets.pack.gz")) ||
+          "vanilla-assets.pack.gz",
         location.href
       );
       const version = urlParams.get("fresh") === "1" || urlParams.get("cache") === "0"
@@ -3535,6 +3539,12 @@
         ).href;
       }
       bootTimings.classesStart = performance.now();
+      // Multi-file sites point the client, the hotpath and the singleplayer Worker at their
+      // content-hashed files; this runs after the generated singleplayer URL block above.
+      if (window.__gaiusBoot) {
+        window.__gaiusBoot.applyAssetUrls();
+        await window.__gaiusBoot.assetsReady();
+      }
       setStatus("running", "Browser storage is ready (" + (window.__gaiusFsBackend || "unknown") + "); loading classes.js...", 24, "Loading the template client runtime...");
       // Fetch the large TeaVM bundle while the vanilla asset pack is being
       // decoded.  Neither operation depends on the other until main(args),
@@ -3558,6 +3568,8 @@
         setStatus("error", "The TeaVM build did not expose main(args).");
 	      } else {
 	        setStatus("running", "classes.js loaded; calling net.minecraft.client.main.Main.main(args)...\n" + window.__gaiusDisplayArgs.join(" "), 68, "Starting Gaius Client...");
+	        // Runtime modules (kernels, quality tiers) and eager sounds, bounded by gaius-boot.js.
+	        if (window.__gaiusBoot) await window.__gaiusBoot.beforeMain();
 	        await waitForPaint();
 	        bootTimings.mainStart = performance.now();
 	        main(window.__gaiusDefaultArgs);

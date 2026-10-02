@@ -97,12 +97,39 @@ export GAIUS_BUILD_ROOT="$build_root"
 export GAIUS_OVERLAY_DIRECTORY="$overlay_directory"
 export GAIUS_DIST_DIRECTORY="$dist_directory"
 
+# v0.4 runtime: the wasm kernels in both builds (simd128 and baseline) and the boot, kernel,
+# quality and Service Worker scripts go next to index.html before the client build, so the
+# portable page (build-portable-html.py, run by build-teavm-release.sh) inlines them and the
+# Pages site below hashes them. Without cargo or the wasm32 target the release still builds and
+# every kernel path stays on vanilla Java; GAIUS_KERNELS_STRICT=1 makes that an error.
+kernel_directory="$build_root/kernels"
+if [[ "${GAIUS_SKIP_KERNELS:-}" == "1" ]]; then
+  echo "Skipping the wasm kernels (GAIUS_SKIP_KERNELS=1)" >&2
+  rm -rf "$kernel_directory"
+elif ! bash "$root/port/native/build-wasm-variants.sh" --out "$kernel_directory"; then
+  if [[ "${GAIUS_KERNELS_STRICT:-}" == "1" ]]; then
+    echo "The wasm kernels could not be built for Minecraft $version" >&2
+    exit 1
+  fi
+  echo "WARNING: no wasm kernels for Minecraft $version; the release keeps the vanilla paths" >&2
+  rm -rf "$kernel_directory"
+fi
+rm -rf "$dist_directory/kernels"
+stage_arguments=("$dist_directory")
+[[ -f "$kernel_directory/kernels.json" ]] && stage_arguments+=(--kernels "$kernel_directory")
+"$root/port/scripts/run-python.sh" "$root/port/scripts/stage-web-runtime.py" "${stage_arguments[@]}"
+
 # Keep the success marker in the release log itself instead of relying on a
 # caller to append its captured status after the build pipeline has finished.
 # Running the child as an `if` condition intentionally suppresses errexit for
 # this one command so its status can be forwarded without ever claiming
 # success after a failed build.
 if "$root/port/scripts/build-teavm-release.sh"; then
+  # The GitHub Pages layout: content-hashed multi-file site plus its deterministic archive,
+  # published as the release asset Gaius-site-<profile>.tar.gz (see .github/workflows/pages.yml).
+  "$root/port/scripts/run-python.sh" "$root/port/scripts/build-pages-site.py" \
+    "$dist_directory" "$build_root/pages-site" \
+    --archive "$build_root/Gaius-site-$version.tar.gz"
   printf 'BUILD_EXIT=0\n'
 else
   build_status="$?"
