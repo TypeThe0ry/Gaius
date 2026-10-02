@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gaius-kernel-abi",
+    "crates/gaius-noise",
+    "crates/gaius-noise-wasm",
+]
+
+[workspace.package]
+version = "0.4.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+gaius-kernel-abi = { path = "crates/gaius-kernel-abi" }
+gaius-noise = { path = "crates/gaius-noise" }
+
+# Bit-exact parity with the JVM forbids fast-math style rewrites; Rust never
+# contracts a*b+c into a fused multiply-add on its own, so the default float
+# semantics already match Java's strict IEEE 754 arithmetic.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = true
+
+# Tests run the golden fixtures; keep them fast without changing semantics.
+[profile.test]
+opt-level = 2
