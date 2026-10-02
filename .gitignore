@@ -96,3 +96,25 @@ port/web/dist/*.release-bak
 port/web/dist/**/*.map
 port/web/dist/**/*.teavmdbg
 port/web/dist/**/*.release-bak
+
+# Local release, CI, acceptance and probe output kept beside the checkout.
+# Evidence and staged release files live under /artifacts/ and port/target/;
+# none of it is repository source.
+/_tmp*
+/tmp-*
+/tmp_*
+/ci-dist-*
+/ci-artifacts-*
+/release-dist-*
+/postcheck_*
+/evidence-*
+/artifacts/
+/build-logs/
+/paper_evidence/
+/port/artifacts/
+*.javap.txt
+*.orig
+*.bak
+*.rej
+port/web/dist/*.release-backup-*/
+port/web/dist/**/*.release-backup-*/
