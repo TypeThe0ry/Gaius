@@ -1517,12 +1517,74 @@ public final class MinecraftClientPatcher {
                     "TitleScreen vanilla credits callback patch point was not found: "
                             + attributionCallbacks);
         }
+        disableTitleScreenRealmsButton(node);
         boolean current = node.methods.stream()
                 .anyMatch(method -> method.name.equals("extractRenderState"));
         if (current) {
             addTitleScreenProfileHooks(node);
         }
         write(node, output);
+    }
+
+    /**
+     * Greys out the title screen's "Minecraft Realms" button and explains why in its tooltip.
+     * Realms needs a signed-in Microsoft account; the browser client runs an offline session, so
+     * RealmsMainScreen always ended on "Invalid Session / Please try restarting Minecraft".
+     * Every supported profile builds the button right after the {@code menu.online} literal: its
+     * {@code Builder.tooltip(...)} argument becomes the Gaius tooltip and the following
+     * {@code Button.active} store becomes {@code false}.
+     */
+    private static void disableTitleScreenRealmsButton(ClassNode node) {
+        MethodNode options = node.methods.stream()
+                .filter(method -> method.name.equals("createNormalMenuOptions"))
+                .findFirst()
+                .orElseThrow(() -> new IllegalStateException("TitleScreen.createNormalMenuOptions is missing"));
+        String button = "net/minecraft/client/gui/components/Button";
+        AbstractInsnNode label = null;
+        for (AbstractInsnNode instruction : options.instructions.toArray()) {
+            if (instruction instanceof LdcInsnNode literal && "menu.online".equals(literal.cst)) {
+                if (label != null) {
+                    throw new IllegalStateException("TitleScreen has more than one menu.online button");
+                }
+                label = instruction;
+            }
+        }
+        if (label == null) {
+            throw new IllegalStateException("TitleScreen Realms button (menu.online) was not found");
+        }
+        MethodInsnNode tooltipCall = null;
+        FieldInsnNode activeStore = null;
+        for (AbstractInsnNode instruction = label.getNext(); instruction != null;
+                instruction = instruction.getNext()) {
+            if (tooltipCall == null && instruction instanceof MethodInsnNode call
+                    && call.owner.equals(button + "$Builder") && call.name.equals("tooltip")) {
+                tooltipCall = call;
+            } else if (instruction instanceof FieldInsnNode field
+                    && field.getOpcode() == Opcodes.PUTFIELD
+                    && field.name.equals("active") && field.desc.equals("Z")) {
+                activeStore = field;
+                break;
+            }
+        }
+        AbstractInsnNode tooltipArgument = tooltipCall == null ? null : previousOpcode(tooltipCall);
+        AbstractInsnNode activeValue = activeStore == null ? null : previousOpcode(activeStore);
+        if (!(tooltipArgument instanceof VarInsnNode tooltipLoad) || tooltipLoad.getOpcode() != Opcodes.ALOAD
+                || !(activeValue instanceof VarInsnNode activeLoad) || activeLoad.getOpcode() != Opcodes.ILOAD) {
+            throw new IllegalStateException("TitleScreen Realms button shape changed");
+        }
+        InsnList tooltip = new InsnList();
+        tooltip.add(new LdcInsnNode("Realms needs a signed-in Microsoft account, so it is not"
+                + " available in the browser."));
+        tooltip.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "net/minecraft/network/chat/Component",
+                "literal", "(Ljava/lang/String;)Lnet/minecraft/network/chat/MutableComponent;", true));
+        tooltip.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "net/minecraft/client/gui/components/Tooltip",
+                "create", "(Lnet/minecraft/network/chat/Component;)Lnet/minecraft/client/gui/components/Tooltip;",
+                false));
+        options.instructions.insertBefore(tooltipLoad, tooltip);
+        options.instructions.remove(tooltipLoad);
+        options.instructions.insertBefore(activeLoad, new InsnNode(Opcodes.ICONST_0));
+        options.instructions.remove(activeLoad);
+        options.maxStack = Math.max(options.maxStack, 6);
     }
 
     /**
