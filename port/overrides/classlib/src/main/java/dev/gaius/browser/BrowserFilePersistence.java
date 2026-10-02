@@ -28,14 +28,131 @@ public final class BrowserFilePersistence {
     // 4671 is retained solely to recognize the legacy options payload. It is
     // never used to select, read, or delete browser storage for a runtime.
     private static final int LEGACY_DATA_VERSION = 4671;
-    private static final String BROWSER_OPTION_DEFAULTS = String.join("\n",
+    /**
+     * Options seeded into a new browser profile before the first start. The graphics part
+     * depends on the GPU tier the page's capability layer measured
+     * ({@code port/web/runtime/quality/gpu-caps.js}, {@link #runtimeGraphicsTier}): the Fast
+     * preset on low-tier and mobile GPUs, Fancy from the mid tier up, a render distance that
+     * grows with the tier and the vanilla 0.75 s chunk fade-in from the mid tier up. These values
+     * are live: {@code GraphicsPresetStartupPatcher} stops {@code Minecraft.<init>} from
+     * re-applying the named preset over them on every start. Existing profiles keep their saved
+     * options; only files still equal to an earlier seed are rewritten.
+     */
+    private static final String BROWSER_OPTION_COMMON_DEFAULTS = String.join("\n",
+            "autoJump:false",
+            "operatorItemsTab:true",
+            // Vanilla represents the display setting "Unlimited" as 260. Existing
+            // browser profiles keep their chosen value; this only affects new ones.
+            "maxFps:260",
+            "vignette:true",
+            "prioritizeChunkUpdates:0",
+            "enableVsync:false",
+            "bobView:false",
+            "panoramaSpeed:1.0",
+            "screenEffectScale:0.0",
+            "fovEffectScale:0.0",
+            "darknessEffectScale:0.0",
+            "pauseOnLostFocus:false",
+            "darkMojangStudiosBackground:false",
+            "hideSplashTexts:true",
+            "showAutosaveIndicator:false",
+            "skipMultiplayerWarning:true",
+            "onboardAccessibility:false") + "\n";
+    /** Low tier and mobile: the vanilla Fast preset, minus the menu blur, at 6/4 distance. */
+    private static final String LOW_TIER_GRAPHICS_DEFAULTS = String.join("\n",
+            "graphicsPreset:\"fast\"",
+            "renderDistance:6",
+            "simulationDistance:4",
+            "entityDistanceScaling:0.5",
+            "renderClouds:\"fast\"",
+            "cloudRange:32",
+            "ao:false",
+            "cutoutLeaves:false",
+            "improvedTransparency:false",
+            "weatherRadius:3",
+            "chunkSectionFadeInTime:0.0",
+            "mipmapLevels:2",
+            "maxAnisotropyBit:1",
+            "textureFiltering:0",
+            "biomeBlendRadius:0",
+            "particles:1",
+            "entityShadows:false",
+            "menuBackgroundBlurriness:0") + "\n";
+    /** Mid tier (integrated desktop GPUs): Fancy at the browser 8/6 distance contract. */
+    private static final String MID_TIER_GRAPHICS_DEFAULTS = String.join("\n",
+            "graphicsPreset:\"fancy\"",
+            "renderDistance:8",
+            "simulationDistance:6",
+            "entityDistanceScaling:0.75",
+            "renderClouds:\"true\"",
+            "cloudRange:64",
+            "ao:true",
+            "cutoutLeaves:true",
+            "improvedTransparency:false",
+            "weatherRadius:5",
+            "chunkSectionFadeInTime:0.75",
+            "mipmapLevels:4",
+            "maxAnisotropyBit:1",
+            "textureFiltering:0",
+            "biomeBlendRadius:1",
+            "particles:0",
+            "entityShadows:true",
+            "menuBackgroundBlurriness:2") + "\n";
+    /**
+     * High tier (discrete GPUs): Fancy with full biome blend and weather; improved transparency
+     * is requested but only runs where the context renders and blends float targets
+     * ({@code BrowserQualityCaps}).
+     */
+    private static final String HIGH_TIER_GRAPHICS_DEFAULTS = String.join("\n",
+            "graphicsPreset:\"fancy\"",
+            "renderDistance:10",
+            "simulationDistance:6",
+            "entityDistanceScaling:1.0",
+            "renderClouds:\"true\"",
+            "cloudRange:64",
+            "ao:true",
+            "cutoutLeaves:true",
+            "improvedTransparency:true",
+            "weatherRadius:10",
+            "chunkSectionFadeInTime:0.75",
+            "mipmapLevels:4",
+            "maxAnisotropyBit:1",
+            "textureFiltering:0",
+            "biomeBlendRadius:2",
+            "particles:0",
+            "entityShadows:true",
+            "menuBackgroundBlurriness:3") + "\n";
+    /** Ultra tier (fast discrete GPUs): High plus a longer render and cloud distance. */
+    private static final String ULTRA_TIER_GRAPHICS_DEFAULTS = String.join("\n",
+            "graphicsPreset:\"fancy\"",
+            "renderDistance:12",
+            "simulationDistance:6",
+            "entityDistanceScaling:1.0",
+            "renderClouds:\"true\"",
+            "cloudRange:96",
+            "ao:true",
+            "cutoutLeaves:true",
+            "improvedTransparency:true",
+            "weatherRadius:10",
+            "chunkSectionFadeInTime:0.75",
+            "mipmapLevels:4",
+            "maxAnisotropyBit:1",
+            "textureFiltering:0",
+            "biomeBlendRadius:2",
+            "particles:0",
+            "entityShadows:true",
+            "menuBackgroundBlurriness:5") + "\n";
+    /**
+     * The single seed of v0.2.2 to v0.3.x. Kept only to recognise options files the game never
+     * rewrote (and, through {@link #LEGACY_BROWSER_OPTION_DEFAULTS}, the older one); most of its
+     * graphics values never applied because the Fast preset was re-applied on every start.
+     */
+    private static final String PREVIOUS_BROWSER_OPTION_DEFAULTS = String.join("\n",
             "autoJump:false",
             "operatorItemsTab:true",
             "renderDistance:8",
             "simulationDistance:6",
             "entityDistanceScaling:0.5",
-            // Vanilla represents the display setting "Unlimited" as 260. Existing
-            // browser profiles keep their chosen value; this only affects new ones.
             "maxFps:260",
             "graphicsPreset:\"fast\"",
             "renderClouds:\"true\"",
@@ -66,7 +183,7 @@ public final class BrowserFilePersistence {
             "showAutosaveIndicator:false",
             "skipMultiplayerWarning:true",
             "onboardAccessibility:false") + "\n";
-    private static final String LEGACY_BROWSER_OPTION_DEFAULTS = BROWSER_OPTION_DEFAULTS
+    private static final String LEGACY_BROWSER_OPTION_DEFAULTS = PREVIOUS_BROWSER_OPTION_DEFAULTS
             .replace("graphicsPreset:\"fast\"\n", "graphicsPreset:\"fancy\"\n")
             .replace("weatherRadius:3\n", "weatherRadius:0\n")
             .replace("onboardAccessibility:false\n", "");
@@ -505,9 +622,15 @@ public final class BrowserFilePersistence {
 
     private static void migrateLegacyDefaultOptions(VirtualFile existing) throws IOException {
         byte[] bytes = readVirtualFile(existing);
+        String stored = new String(bytes, StandardCharsets.UTF_8);
+        // The v0.3 seed, never rewritten by the game: replace it with the tiered defaults.
+        if (withoutVersionLine(stored).equals(PREVIOUS_BROWSER_OPTION_DEFAULTS)) {
+            writeDefaultOptions("browser defaults graphics tiers");
+            return;
+        }
         // The launcher moves the old Fancy default to Fast once before this runs;
         // compare against the legacy payload as it was written.
-        String options = new String(bytes, StandardCharsets.UTF_8)
+        String options = stored
                 .replace("graphicsPreset:\"fast\"\n", "graphicsPreset:\"fancy\"\n");
         String legacyVersionedOptions = "version:" + LEGACY_DATA_VERSION + "\n"
                 + LEGACY_BROWSER_OPTION_DEFAULTS;
@@ -542,14 +665,60 @@ public final class BrowserFilePersistence {
     }
 
     private static void writeDefaultOptions(String detail) throws IOException {
-        byte[] bytes = defaultBrowserOptions().getBytes(StandardCharsets.UTF_8);
+        String tier = graphicsTier();
+        byte[] bytes = defaultBrowserOptions(tier).getBytes(StandardCharsets.UTF_8);
         writeVirtualFile(OPTIONS_PATH, bytes);
         persist(OPTIONS_PATH, bytes);
-        report("storage-default-options", detail);
+        report("storage-default-options", detail + " tier=" + tier);
     }
 
-    private static String defaultBrowserOptions() {
-        return "version:" + currentDataVersion() + "\n" + BROWSER_OPTION_DEFAULTS;
+    private static String defaultBrowserOptions(String tier) {
+        String graphics = tierGraphicsDefaults(tier);
+        // Hardware anisotropic filtering instead of the 8-tap RGSS shader path, where the
+        // context exposes EXT_texture_filter_anisotropic: 4x on high, 8x on ultra.
+        if (("high".equals(tier) || "ultra".equals(tier)) && runtimeAnisotropicFiltering()) {
+            graphics = graphics
+                    .replace("maxAnisotropyBit:1\n",
+                            "ultra".equals(tier) ? "maxAnisotropyBit:3\n" : "maxAnisotropyBit:2\n")
+                    .replace("textureFiltering:0\n", "textureFiltering:2\n");
+        }
+        return "version:" + currentDataVersion() + "\n" + BROWSER_OPTION_COMMON_DEFAULTS
+                + graphics;
+    }
+
+    private static String tierGraphicsDefaults(String tier) {
+        switch (tier) {
+            case "low":
+                return LOW_TIER_GRAPHICS_DEFAULTS;
+            case "high":
+                return HIGH_TIER_GRAPHICS_DEFAULTS;
+            case "ultra":
+                return ULTRA_TIER_GRAPHICS_DEFAULTS;
+            default:
+                return MID_TIER_GRAPHICS_DEFAULTS;
+        }
+    }
+
+    /** low, mid, high or ultra; mid when the page has no capability layer (or in a Worker). */
+    private static String graphicsTier() {
+        String tier;
+        try {
+            tier = runtimeGraphicsTier();
+        } catch (Throwable exception) {
+            tier = null;
+        }
+        if ("low".equals(tier) || "high".equals(tier) || "ultra".equals(tier)) {
+            return tier;
+        }
+        return "mid";
+    }
+
+    private static String withoutVersionLine(String options) {
+        if (options.startsWith("version:")) {
+            int newline = options.indexOf('\n');
+            return newline < 0 ? "" : options.substring(newline + 1);
+        }
+        return options;
     }
 
     private static int currentDataVersion() {
@@ -858,6 +1027,57 @@ public final class BrowserFilePersistence {
             }
             """)
     private static native String backendName();
+
+    /**
+     * The GPU tier of the graphics quality layer. Asks it to classify now when it has not yet
+     * (a synchronous probe on a private canvas, remembered in localStorage), then falls back to
+     * the published or remembered tier, then to the user agent (mobile: low). Empty when unknown.
+     */
+    @JSBody(script = """
+            try {
+              var root = globalThis;
+              var quality = root.GaiusQuality;
+              if (quality && quality.caps && typeof quality.caps.ensureTier === 'function') {
+                var ensured = quality.caps.ensureTier();
+                if (ensured && ensured.tier) return String(ensured.tier);
+              }
+              var caps = root.__gaiusGpuCaps;
+              if (caps && caps.tier) return String(caps.tier);
+              var storage = null;
+              try {
+                storage = root.localStorage || null;
+              } catch (ignored) {
+                storage = null;
+              }
+              if (storage) {
+                var stored = storage.getItem('gaius.quality.gpuTier.v1');
+                if (stored) {
+                  var parsed = JSON.parse(stored);
+                  if (parsed && parsed.tier) return String(parsed.tier);
+                }
+              }
+              var nav = root.navigator;
+              if (nav && ((nav.userAgentData && nav.userAgentData.mobile)
+                  || /Android|iPhone|iPad|iPod|Mobile/i.test(String(nav.userAgent || '')))) {
+                return 'low';
+              }
+              return '';
+            } catch (e) {
+              return '';
+            }
+            """)
+    private static native String runtimeGraphicsTier();
+
+    /** Whether the capability layer saw EXT_texture_filter_anisotropic (false when unknown). */
+    @JSBody(script = """
+            try {
+              var caps = globalThis.__gaiusGpuCaps;
+              return !!(caps && caps.extensions && caps.extensions.anisotropic);
+            } catch (e) {
+              return false;
+            }
+            """)
+    private static native boolean runtimeAnisotropicFiltering();
 
     @JSBody(script = """
             try {

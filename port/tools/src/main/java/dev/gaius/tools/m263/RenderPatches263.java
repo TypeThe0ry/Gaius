@@ -2,6 +2,8 @@ package dev.gaius.tools.m263;
 
 import dev.gaius.tools.ModernSymbols;
 import dev.gaius.tools.PatchRegistry;
+import dev.gaius.tools.quality.GraphicsPresetStartupPatcher;
+import dev.gaius.tools.quality.QualityPatches263;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -59,10 +61,16 @@ import org.objectweb.asm.tree.VarInsnNode;
  *       FLUSH_EXPLICIT (16) into the write flags, records each mapped view's range and flushes
  *       exactly that range before {@code unmap()} (the semantics of the dropped 26.2
  *       {@code Minecraft262BrowserPatcher.patchGlBufferMappedViewRanges}).</li>
- *   <li>{@link #patchImprovedTransparencyOff}: order-independent transparency needs float
- *       colour targets (EXT_color_buffer_float/EXT_float_blend) that the first browser release
- *       does not provide; {@code GameRenderer.useImprovedTransparency()} returns false and the
- *       video settings no longer offer the option.</li>
+ *   <li>Graphics quality tiers (v0.4.0, {@code dev.gaius.tools.quality}):
+ *       {@code QualityPatches263.patchImprovedTransparencyByTier} replaces the former
+ *       {@code patchImprovedTransparencyOff}: order-independent transparency (float colour
+ *       targets) now runs when the context can render and blend float targets and the GPU tier
+ *       is high or ultra, and the video settings only offer it there;
+ *       {@code GraphicsPresetStartupPatcher} stops {@code Minecraft.<init>} from re-applying the
+ *       saved graphics preset over the seeded per-tier options;
+ *       {@code QualityPatches263.patchLevelQualityHooks} installs the world render-scale and
+ *       post-processing hooks; {@code QualityPatches263.patchInventoryWorldRenderThrottle}
+ *       renders the world behind inventory screens at a reduced rate instead of freezing it.</li>
  *   <li>{@link #patchSetupDrawUseProgramBeforeVertexArrayBind}: 26.3's
  *       {@code GlCommandEncoder.setupDraw} binds the pipeline's vertex array (attribute pointers)
  *       before {@code GlRenderPipeline.bind()} switches the GL program. BrowserOpenGL decides
@@ -102,11 +110,6 @@ public final class RenderPatches263 {
     static final String GPU_BUFFER_SLICE = "com/mojang/blaze3d/buffers/GpuBufferSlice";
     static final String SYSTEM_SPECS =
             "net/minecraft/client/gui/components/debug/DebugEntrySystemSpecs";
-    static final String GAME_RENDERER = "net/minecraft/client/renderer/GameRenderer";
-    static final String VIDEO_SETTINGS =
-            "net/minecraft/client/gui/screens/options/VideoSettingsScreen";
-    static final String OPTIONS = "net/minecraft/client/Options";
-    static final String OPTION_INSTANCE = "net/minecraft/client/OptionInstance";
     static final String MACOS_UTIL = "com/mojang/blaze3d/platform/MacosUtil";
     static final String CLIENT_BOOTSTRAP = "net/minecraft/client/ClientBootstrap";
     /** 26.3-only renderpearl class (no 26.2 counterpart, so not a ModernSymbols render key). */
@@ -132,12 +135,25 @@ public final class RenderPatches263 {
                 () -> patchSystemSpecsCpuInfo(jar, root));
         PatchRegistry.run("RenderPatches263.patchGlBufferExplicitFlush",
                 () -> patchGlBufferExplicitFlush(jar, root, symbols));
-        PatchRegistry.run("RenderPatches263.patchImprovedTransparencyOff",
-                () -> patchImprovedTransparencyOff(jar, root));
+        PatchRegistry.run("RenderPatches263.patchImprovedTransparencyByTier",
+                () -> QualityPatches263.patchImprovedTransparencyByTier(jar, root, symbols));
+        PatchRegistry.run("RenderPatches263.patchGraphicsPresetStartupReplay",
+                () -> {
+                    if (!GraphicsPresetStartupPatcher.apply(jar, root)) {
+                        throw new IllegalStateException(
+                                "26.3 must have the graphics preset startup replay");
+                    }
+                });
+        PatchRegistry.run("RenderPatches263.patchLevelQualityHooks",
+                () -> QualityPatches263.patchLevelQualityHooks(jar, root, symbols));
         PatchRegistry.run("RenderPatches263.patchSetupDrawUseProgramBeforeVertexArrayBind",
                 () -> patchSetupDrawUseProgramBeforeVertexArrayBind(jar, root, symbols));
         PatchRegistry.run("RenderPatches263.patchMacosUtil",
                 () -> patchMacosUtil(jar, root));
+        // Rewrites the inventory throttle MinecraftClientPatcher injected into
+        // GameRenderer.render, so it runs after the GameRenderer patches above.
+        PatchRegistry.run("RenderPatches263.patchInventoryWorldRenderThrottle",
+                () -> QualityPatches263.patchInventoryWorldRenderThrottle(jar, root, symbols));
     }
 
     static void patchGlBackendLibrary(String jar, Path root, ModernSymbols symbols)
@@ -403,82 +419,6 @@ public final class RenderPatches263 {
                 + " view ranges (GL_MAP_FLUSH_EXPLICIT_BIT)");
     }
 
-    static void patchImprovedTransparencyOff(String jar, Path root) throws IOException {
-        ClassNode renderer = readClass(jar, root, GAME_RENDERER);
-        MethodNode use = find(renderer, "useImprovedTransparency", "()Z");
-        boolean readsOption = false;
-        for (AbstractInsnNode instruction : use.instructions.toArray()) {
-            readsOption |= instruction instanceof FieldInsnNode field
-                    && field.getOpcode() == Opcodes.GETFIELD
-                    && field.name.equals("improvedTransparency") && field.desc.equals("Z");
-        }
-        if (!readsOption) {
-            throw new IllegalStateException(GAME_RENDERER
-                    + ".useImprovedTransparency no longer reads the improvedTransparency option");
-        }
-        InsnList off = new InsnList();
-        off.add(new InsnNode(Opcodes.ICONST_0));
-        off.add(new InsnNode(Opcodes.IRETURN));
-        replace(use, off);
-        writeClass(renderer, root, false);
-
-        // Video settings: rebuild qualityOptions(Options) without Options.improvedTransparency().
-        ClassNode screen = readClass(jar, root, VIDEO_SETTINGS);
-        String arrayDesc = "(L" + OPTIONS + ";)[L" + OPTION_INSTANCE + ";";
-        MethodNode quality = find(screen, "qualityOptions", arrayDesc);
-        List<MethodInsnNode> getters = new ArrayList<>();
-        for (AbstractInsnNode instruction : quality.instructions.toArray()) {
-            if (instruction instanceof MethodInsnNode call) {
-                if (call.getOpcode() != Opcodes.INVOKEVIRTUAL || !call.owner.equals(OPTIONS)
-                        || !call.desc.equals("()L" + OPTION_INSTANCE + ";")) {
-                    throw new IllegalStateException(VIDEO_SETTINGS
-                            + ".qualityOptions is no longer a plain array of Options getters: "
-                            + call.owner + "." + call.name + call.desc);
-                }
-                getters.add(call);
-            } else if (instruction.getOpcode() >= 0
-                    && instruction.getOpcode() != Opcodes.DUP
-                    && instruction.getOpcode() != Opcodes.ALOAD
-                    && instruction.getOpcode() != Opcodes.AASTORE
-                    && instruction.getOpcode() != Opcodes.ANEWARRAY
-                    && instruction.getOpcode() != Opcodes.ARETURN
-                    && !isIntPush(instruction)) {
-                throw new IllegalStateException(VIDEO_SETTINGS
-                        + ".qualityOptions has an unexpected instruction (opcode "
-                        + instruction.getOpcode() + ")");
-            }
-        }
-        long transparency = getters.stream()
-                .filter(call -> call.name.equals("improvedTransparency")).count();
-        if (transparency != 1 || getters.size() < 2) {
-            throw new IllegalStateException(VIDEO_SETTINGS + ".qualityOptions: expected one"
-                    + " improvedTransparency option among " + getters.size() + " getters, found "
-                    + transparency);
-        }
-        List<String> kept = new ArrayList<>();
-        for (MethodInsnNode call : getters) {
-            if (!call.name.equals("improvedTransparency")) {
-                kept.add(call.name);
-            }
-        }
-        InsnList options = new InsnList();
-        options.add(intPush(kept.size()));
-        options.add(new TypeInsnNode(Opcodes.ANEWARRAY, OPTION_INSTANCE));
-        for (int index = 0; index < kept.size(); index++) {
-            options.add(new InsnNode(Opcodes.DUP));
-            options.add(intPush(index));
-            options.add(new VarInsnNode(Opcodes.ALOAD, 0));
-            options.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, OPTIONS, kept.get(index),
-                    "()L" + OPTION_INSTANCE + ";", false));
-            options.add(new InsnNode(Opcodes.AASTORE));
-        }
-        options.add(new InsnNode(Opcodes.ARETURN));
-        replace(quality, options);
-        writeClass(screen, root, false);
-        System.out.println("Forced 26.3 improved transparency (OIT) off and removed it from the"
-                + " video settings (" + kept.size() + " quality options remain)");
-    }
-
     static void patchSetupDrawUseProgramBeforeVertexArrayBind(String jar, Path root,
             ModernSymbols symbols) throws IOException {
         String encoder = symbols.renderType(GL_COMMAND_ENCODER);
@@ -619,22 +559,6 @@ public final class RenderPatches263 {
             throw new IllegalStateException(owner + " constructor: mappingFlags store not found");
         }
         return local;
-    }
-
-    private static boolean isIntPush(AbstractInsnNode instruction) {
-        int opcode = instruction.getOpcode();
-        return (opcode >= Opcodes.ICONST_M1 && opcode <= Opcodes.ICONST_5)
-                || opcode == Opcodes.BIPUSH || opcode == Opcodes.SIPUSH;
-    }
-
-    private static AbstractInsnNode intPush(int value) {
-        if (value >= -1 && value <= 5) {
-            return new InsnNode(Opcodes.ICONST_0 + value);
-        }
-        if (value >= Byte.MIN_VALUE && value <= Byte.MAX_VALUE) {
-            return new IntInsnNode(Opcodes.BIPUSH, value);
-        }
-        return new IntInsnNode(Opcodes.SIPUSH, value);
     }
 
     /** The next real instruction (labels, line numbers and frames skipped). */
