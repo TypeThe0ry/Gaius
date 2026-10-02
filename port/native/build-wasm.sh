@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
-# Builds the wasm kernels (release, SIMD128) and prints their sizes.
+# Builds the wasm kernels (release, SIMD128, plus a baseline build without SIMD) and prints
+# their sizes.
 #
-#   port/native/build-wasm.sh          build into target/wasm32-unknown-unknown/release/
+#   port/native/build-wasm.sh          build into target/wasm32-unknown-unknown/release/ (simd128)
+#                                      and target/wasm-baseline/wasm32-unknown-unknown/release/
 #   port/native/build-wasm.sh --check  build, then check exports and that every probe
-#                                      job answers bit for bit like the native build (test)
+#                                      job answers bit for bit like the native build (test),
+#                                      for both builds
 set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 TARGET=wasm32-unknown-unknown
 OUT="$HERE/target/$TARGET/release"
-# crate name -> run_<kind> exports it must provide
-KERNELS=("gaius_noise_wasm:run_noise_points")
+BASELINE_OUT="$HERE/target/wasm-baseline/$TARGET/release"
+# crate name -> run_<kind> exports it must provide; the first one runs the probe jobs
+KERNELS=("gaius_noise_wasm:run_noise_points" "gaius_mesher_wasm:run_mesh_section,run_load_model_table")
 
 check=0
 case "${1:-}" in
@@ -35,21 +39,28 @@ for entry in "${KERNELS[@]}"; do
     packages+=(-p "${entry%%:*}")
 done
 cargo build --release --locked --target "$TARGET" "${packages[@]//_/-}"
+# The baseline build for engines without SIMD gets its own target directory.
+CARGO_TARGET_DIR="$HERE/target/wasm-baseline" CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="-C target-feature=-simd128" \
+    cargo build --release --locked --target "$TARGET" "${packages[@]//_/-}"
 
 for entry in "${KERNELS[@]}"; do
-    wasm="$OUT/${entry%%:*}.wasm"
-    [[ -f "$wasm" ]] || die "missing $wasm"
-    printf '%-24s %8d bytes  %s\n' "${entry%%:*}.wasm" "$(wc -c < "$wasm")" "$wasm"
+    for dir in "$OUT" "$BASELINE_OUT"; do
+        wasm="$dir/${entry%%:*}.wasm"
+        [[ -f "$wasm" ]] || die "missing $wasm"
+        printf '%-24s %8d bytes  %s\n' "${entry%%:*}.wasm" "$(wc -c < "$wasm")" "$wasm"
+    done
 done
 
 if (( check )); then
     command -v node > /dev/null || die "node not found (needed for --check)"
-    probe="$HERE/target/wasm-probe"
-    rm -rf "$probe"
-    cargo run --quiet --locked -p gaius-noise-wasm --example wasm_probe -- "$probe"
     for entry in "${KERNELS[@]}"; do
         crate="${entry%%:*}"
+        probe="$HERE/target/wasm-probe/$crate"
+        rm -rf "$probe"
+        cargo run --quiet --locked -p "${crate//_/-}" --example wasm_probe -- "$probe"
         IFS=',' read -r -a exports <<< "${entry#*:}"
-        node "$HERE/wasm-check.mjs" "$OUT/$crate.wasm" "$probe" "${exports[@]}"
+        for dir in "$OUT" "$BASELINE_OUT"; do
+            node "$HERE/wasm-check.mjs" "$dir/$crate.wasm" "$probe" "${exports[@]}"
+        done
     done
 fi

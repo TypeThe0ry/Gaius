@@ -2,8 +2,14 @@
 resolver = "2"
 members = [
     "crates/gaius-kernel-abi",
+    "crates/gaius-light",
+    "crates/gaius-light-wasm",
+    "crates/gaius-mesher",
+    "crates/gaius-mesher-wasm",
     "crates/gaius-noise",
     "crates/gaius-noise-wasm",
+    "crates/gaius-worldgen",
+    "crates/gaius-worldgen-wasm",
 ]
 
 [workspace.package]

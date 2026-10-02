@@ -14,6 +14,9 @@ from the real client jars.
 | `crates/gaius-kernel-abi` | `no_std` job framing shared with the JS workers: exports, job/result headers, status codes |
 | `crates/gaius-noise` | bit-exact ports of the random sources, `Mth` and `levelgen.synth` for 1.21.11, 26.2 and 26.3 |
 | `crates/gaius-noise-wasm` | the `run_noise_points` kernel (cdylib) |
+| `crates/gaius-worldgen` | chunk generation from a generator IR exported by the Java side (`src/ir/mod.rs` documents the format): density evaluators for the 26.3 float sampler graph and the 26.2 double router, aquifers, ore veins, surface rules, multi-noise biomes, heightmaps |
+| `crates/gaius-worldgen-wasm` | the `load_generator` / `biomes` / `terrain` / `surface` kernels (cdylib); jobs encoded by `port/web/kernels/worldgen-job.js` |
+| `golden/worldgen/` | vanilla comparison: exports the overworld IR and dumps density, biomes, blocks and heightmaps from the real 26.3 / 26.2 classes, then runs `tests/vanilla_reference.rs` |
 | `fixtures/<profile>/*.jsonl` | golden data, written by `golden/run-golden.sh` |
 | `build-wasm.sh`, `wasm-check.mjs` | release wasm build and its check |
 | `wasm-fixture-check.mjs`, `js/fixture-jobs.mjs` | the built wasm against the golden fixtures, jobs encoded by `port/web/kernels/noise-job.js` |
@@ -34,6 +37,8 @@ cargo test --workspace     # unit tests, golden parity for all profiles, kernel 
 node wasm-fixture-check.mjs                       # wasm module vs golden fixtures
 node ../scripts/native-noise-pool-smoke.mjs       # wasm module through the kernel pool (worker threads)
 ./golden/strict/strict-math-check.sh              # StrictMath263 rewrite still dumps the 26.3 fixtures on the JVM
+./build-worldgen-wasm.sh --check                   # worldgen kernel, simd128 and baseline builds, exports checked
+GAIUS_WORLDGEN_PROFILE=26.2 ./golden/worldgen/run-worldgen-reference.sh   # kernel vs vanilla chunks (default 26.3)
 node teavm-fixture-check.mjs [classes.js]         # 26.3 fixtures through a TeaVM client build (./check.sh --teavm)
 ```
 

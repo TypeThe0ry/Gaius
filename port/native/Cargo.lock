@@ -42,6 +42,33 @@ name = "gaius-kernel-abi"
 version = "0.4.0"
 
 [[package]]
+name = "gaius-light"
+version = "0.4.0"
+
+[[package]]
+name = "gaius-light-wasm"
+version = "0.4.0"
+dependencies = [
+ "gaius-kernel-abi",
+ "gaius-light",
+]
+
+[[package]]
+name = "gaius-mesher"
+version = "0.4.0"
+dependencies = [
+ "gaius-kernel-abi",
+]
+
+[[package]]
+name = "gaius-mesher-wasm"
+version = "0.4.0"
+dependencies = [
+ "gaius-kernel-abi",
+ "gaius-mesher",
+]
+
+[[package]]
 name = "gaius-noise"
 version = "0.4.0"
 dependencies = [
@@ -56,6 +83,22 @@ dependencies = [
  "gaius-kernel-abi",
  "gaius-noise",
  "serde_json",
+]
+
+[[package]]
+name = "gaius-worldgen"
+version = "0.4.0"
+dependencies = [
+ "gaius-noise",
+]
+
+[[package]]
+name = "gaius-worldgen-wasm"
+version = "0.4.0"
+dependencies = [
+ "gaius-kernel-abi",
+ "gaius-noise",
+ "gaius-worldgen",
 ]
 
 [[package]]
