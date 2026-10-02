@@ -2,6 +2,39 @@
 
 All notable changes to Gaius are documented here.
 
+## [0.3.3] - 2026-10-02
+
+### Fixed
+
+- Laggy main menu: new browser profiles default to "Unlimited" FPS without
+  VSync, and the title screen draws a frame in about 1.5 ms, so the game
+  presented hundreds of frames per second back to back. That saturated the GPU
+  and the page, and weaker machines only got a few screen updates per second.
+  Uncapped frames are now held to the display: one present per refresh in
+  menus (the vanilla menu limit) and at most three per refresh in a world.
+  Frames that take half a refresh or longer are never held.
+
+### Added
+
+- Minecraft 1.21.11 is built and released again: `Gaius-1.21.11.html` ships
+  next to the 26.2 and 26.3 clients, and GitHub Pages serves all three.
+- Minecraft-style boot screen: a pixel-art GAIUS logo, a dirt background and a
+  vanilla-style progress bar. The progress bar keeps moving while the client
+  starts and reloads resources (calibrated from the previous boot) instead of
+  sitting at 82%.
+- New players of the 26.2 and 26.3 clients see the Edit Profile screen the
+  first time they join, to pick a name and skin.
+- Relays screen (Multiplayer > Relays): add, edit, reorder, disable and remove
+  relays, and choose whether each one is used for multiplayer, LAN invites or
+  both. Relays from `?relay=` / `?bridge=` URLs keep priority.
+
+### Performance
+
+- Faster startup: block face sturdiness is computed once per collision shape
+  instead of eighteen times per block state (client and integrated server),
+  and the title panorama copies image rows in bulk instead of one pixel at a
+  time. {{BOOT}}
+
 ## [0.3.2] - 2026-10-02
 
 ### Fixed
