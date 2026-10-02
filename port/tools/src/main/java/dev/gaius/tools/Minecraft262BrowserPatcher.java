@@ -1,5 +1,6 @@
 package dev.gaius.tools;
 
+import dev.gaius.tools.render.TerrainBatchPatches;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -106,7 +107,16 @@ public final class Minecraft262BrowserPatcher {
         PatchRegistry.run("Minecraft262BrowserPatcher.patchCopyOnWriteFileSystem", () -> patchCopyOnWriteFileSystem(jar, root));
         PatchRegistry.run("Minecraft262BrowserPatcher.patchCopyOnWriteProvider", () -> patchCopyOnWriteProvider(jar, root));
         PatchRegistry.run("Minecraft262BrowserPatcher.patchDownloadQueueBrowserCooperativeExecutor", () -> patchDownloadQueueBrowserCooperativeExecutor(jar, root));
+        // Last: it reads LevelRenderer, LevelExtractor and RenderSection as the patches above
+        // left them in root, and nothing after it in this step rewrites those classes.
+        PatchRegistry.run("Minecraft262BrowserPatcher.terrainBatchPatches", () -> terrainBatchPatches(jar, root, minecraftVersion));
         PatchRegistry.printSummary();
+    }
+
+    /** Batched terrain draws, aligned heaps and the neighbor gate (see {@link TerrainBatchPatches}). */
+    private static void terrainBatchPatches(String jar, Path root, String minecraftVersion)
+            throws IOException {
+        TerrainBatchPatches.apply(jar, root, minecraftVersion);
     }
 
     /**

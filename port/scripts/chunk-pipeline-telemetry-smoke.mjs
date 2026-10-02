@@ -42,10 +42,12 @@ const [
 ]);
 
 for (const contract of [
-  "QUEUE_HIGH_WATER = 8",
-  "MAX_TASKS_PER_FRAME = 8",
-  "FRAME_WORK_BUDGET_NANOS = 2_000_000L",
-  "MAX_COMPILE_RUNS_DURING_UPLOAD_PER_FRAME = 1",
+  "private record Budget(",
+  // NORMAL_BUDGET: 8 tasks, high water 16, 3 ms, 16 uploads, 3 ms, 2 MiB, 2 compiles, 4 planned.
+  "8, 16, 3_000_000L, 16, 3_000_000L, 2L * 1024L * 1024L, 2, 4,",
+  // FAST_BUDGET keeps the v0.3 fast-profile values.
+  "32, 64, 6_000_000L, 32, 6_000_000L, 4L * 1024L * 1024L, 4, 8,",
+  "SLICE_NANOS = 2_000_000L",
   "UPLOAD_FRAME_DRAIN_COUNTS",
   "uploadFairShareDeferrals",
   "emergencyUploadRequests",
@@ -57,7 +59,7 @@ for (const contract of [
   "activeUploadRetryTasks",
   "uploadProgressEpoch",
   "compileRunsDuringUploadThisFrame",
-  "shouldContinueDrain(completed, System.nanoTime() - startedAt)",
+  "shouldContinueDrain(frameTasks, frameWorkNanos)",
   "completed < effectiveMaxTasksPerFrame()",
   "completed == 0 || elapsedNanos < effectiveFrameWorkBudgetNanos()",
   "QUEUE.addLast(command)",

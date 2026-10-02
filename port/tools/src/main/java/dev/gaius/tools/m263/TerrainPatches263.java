@@ -2,6 +2,7 @@ package dev.gaius.tools.m263;
 
 import dev.gaius.tools.ModernSymbols;
 import dev.gaius.tools.PatchRegistry;
+import dev.gaius.tools.render.TerrainBatchPatches;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
@@ -40,7 +41,10 @@ import org.objectweb.asm.tree.VarInsnNode;
  *       hook that only works as a pair is present on both sides (update requeue and consumption,
  *       deferred pick and its refresh, early and late occlusion updates, pool recycle order,
  *       upload budget and heap cleanup), so that no combination of skipped or partially applied
- *       patches reaches the browser. The chunk-draw telemetry step checks its own pair.</li>
+ *       patches reaches the browser. The chunk-draw telemetry step checks its own pair. It also
+ *       checks the v0.4.0 terrain path: 4-vertex aligned vertex heaps, the upload byte budget,
+ *       the neighbor readiness gate and every TerrainBatchPatches hook (batched draw
+ *       submission, section capture, RenderSection compile state, mesh epochs).</li>
  * </ul>
  *
  * <p>Contract C2: {@code Minecraft263BrowserPatcher} calls {@link #apply} at the tail of the
@@ -63,6 +67,11 @@ public final class TerrainPatches263 {
     static final String TARGETING = "dev/gaius/browser/BrowserTargeting";
     static final String DRAW_TELEMETRY = "dev/gaius/browser/BrowserChunkDrawTelemetry";
     static final String POOL_CACHE = "dev/gaius/browser/BrowserGpuBufferPoolCache";
+    static final String TERRAIN_BATCH = "dev/gaius/browser/render/BrowserTerrainBatch";
+    static final String NEIGHBOR_READINESS = "dev/gaius/browser/render/BrowserNeighborReadiness";
+    static final String SECTION_RENDER_DISPATCHER =
+            "net/minecraft/client/renderer/chunk/SectionRenderDispatcher";
+    static final String SECTION_UPDATE_TRACKER = "net/minecraft/client/SectionUpdateTracker";
     static final String CAMERA_STATE = "Lnet/minecraft/client/renderer/state/level/CameraRenderState;";
     static final String LEVEL_RENDERER_RENDER =
             "(Lcom/mojang/blaze3d/resource/GraphicsResourceAllocator;Z" + CAMERA_STATE
@@ -231,6 +240,22 @@ public final class TerrainPatches263 {
                 calls(upload, RENDER_SCHEDULER, "finishUploadBuffer"), 1);
         expect(problems, "UberGpuBuffer node cleanup",
                 calls(upload, RENDER_SCHEDULER, "finishUberNodeCleanup"), 1);
+        expect(problems, "UberGpuBuffer upload byte budget",
+                calls(upload, RENDER_SCHEDULER, "noteUploadBytes"), 1);
+
+        ClassNode dispatcher = readCurrent(jar, root, SECTION_RENDER_DISPATCHER);
+        MethodNode heapFactory = find(dispatcher, "lambda$new$0",
+                "(Lnet/minecraft/client/renderer/chunk/ChunkSectionLayer;)"
+                        + "Lnet/minecraft/client/renderer/chunk/"
+                        + "SectionRenderDispatcher$SectionUberBuffers;");
+        expect(problems, "section vertex heap 4-vertex alignment",
+                calls(heapFactory, TERRAIN_BATCH, "vertexHeapAlignment"), 1);
+        ClassNode tracker = readCurrent(jar, root, SECTION_UPDATE_TRACKER);
+        expect(problems, "SectionUpdateTracker.hasAllNeighbors readiness gate",
+                calls(find(tracker, "hasAllNeighbors",
+                        "(Lnet/minecraft/client/multiplayer/ClientLevel;J)Z"),
+                        NEIGHBOR_READINESS, "ready"), 1);
+        problems.addAll(TerrainBatchPatches.verify(jar, root, true));
         for (AbstractInsnNode instruction : upload.instructions.toArray()) {
             if (instruction instanceof MethodInsnNode call
                     && call.owner.equals(gpuBuffer)
@@ -246,7 +271,7 @@ public final class TerrainPatches263 {
         }
         System.out.println("Verified 26.3 terrain chain: requeue/consumption, occlusion refresh, "
                 + "prepare statistics, chunk-draw telemetry, frame targeting, pool recycle order, "
-                + "heap cleanup");
+                + "heap cleanup, aligned heaps, upload bytes, neighbor gate, batched draws");
     }
 
     private static void expect(List<String> problems, String what, int actual, int expected) {

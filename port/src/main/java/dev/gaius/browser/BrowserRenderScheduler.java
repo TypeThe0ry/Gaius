@@ -1,5 +1,6 @@
 package dev.gaius.browser;
 
+import dev.gaius.browser.render.BrowserMeshInstallQueue;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.IdentityHashMap;
@@ -9,17 +10,50 @@ import java.util.Set;
 import java.util.concurrent.Executor;
 import org.teavm.classlib.java.lang.TModernRuntimeSupport;
 import org.teavm.jso.JSBody;
-import org.teavm.jso.browser.Window;
 import org.teavm.platform.Platform;
 
-/** Defers expensive renderer work so one client frame cannot drain the whole compile queue. */
+/**
+ * Defers expensive renderer work so one client frame cannot drain the whole compile queue.
+ *
+ * <p>Work is driven by completion, not by requestAnimationFrame: one pump continuation drains
+ * the queue in short slices and yields a single MessageChannel turn between slices, so input,
+ * network and the (uncapped, MessageChannel-paced) game frames interleave with it. Each rendered
+ * frame ({@link #beginFrame}) grants a budget of tasks and work time; when it is used up the pump
+ * waits for the next frame, or for {@link #FRAME_WATCHDOG_MILLIS} when no frame arrives (world
+ * rendering paused), so a throttled or hidden page no longer stalls compilation.</p>
+ *
+ * <p>Budgets per frame ({@link Budget}): compile tasks and their time, staged upload entries,
+ * bytes and time, compile runs allowed while uploads are queued, and bytes and time for
+ * installing asynchronously produced meshes ({@link BrowserMeshInstallQueue}). The fast profile
+ * (four or more cores, or {@code ?gaiusRenderFast=1}) keeps the values measured since v0.3.
+ * {@link #canScheduleSection} caps the work in flight: queued runner tasks, the dispatcher's
+ * compile backlog, staged uploads and asynchronous mesh requests together.</p>
+ */
 public final class BrowserRenderScheduler {
-    private static final int MAX_TASKS_PER_FRAME = 8;
-    private static final int QUEUE_HIGH_WATER = 8;
-    private static final long FRAME_WORK_BUDGET_NANOS = 2_000_000L;
-    private static final int MAX_UPLOAD_ALLOCATIONS_PER_FRAME = 8;
-    private static final int MAX_COMPILE_RUNS_DURING_UPLOAD_PER_FRAME = 1;
-    private static final long UPLOAD_WORK_BUDGET_NANOS = 2_000_000L;
+    /** Per-frame budgets of one device class. */
+    private record Budget(
+            int maxTasksPerFrame,
+            int queueHighWater,
+            long frameWorkNanos,
+            int maxUploadAllocationsPerFrame,
+            long uploadWorkNanos,
+            long uploadBytesPerFrame,
+            int compileRunsDuringUploadPerFrame,
+            int maxPlannedSectionsPerExtract,
+            long installBytesPerFrame,
+            long installNanosPerFrame) {
+    }
+
+    private static final Budget FAST_BUDGET = new Budget(
+            32, 64, 6_000_000L, 32, 6_000_000L, 4L * 1024L * 1024L, 4, 8,
+            4L * 1024L * 1024L, 2_000_000L);
+    private static final Budget NORMAL_BUDGET = new Budget(
+            8, 16, 3_000_000L, 16, 3_000_000L, 2L * 1024L * 1024L, 2, 4,
+            2L * 1024L * 1024L, 1_000_000L);
+    /** Longest pump slice before yielding one event-loop turn. */
+    private static final long SLICE_NANOS = 2_000_000L;
+    /** A paused pump resumes after this long even when no frame is rendered. */
+    private static final int FRAME_WATCHDOG_MILLIS = 50;
     private static final int MAX_UBER_NODE_CLEANUP_SCANS_PER_FRAME = 8;
     private static final long UBER_NODE_CLEANUP_BUDGET_NANOS = 250_000L;
     private static final int MAX_UPLOAD_RETRY_YIELDS = 2_048;
@@ -28,6 +62,15 @@ public final class BrowserRenderScheduler {
     private static final long UPLOAD_RETRY_TOMBSTONE_IDLE_NANOS = 5_000_000_000L;
     private static boolean fastProfileInitialized;
     private static boolean fastProfile;
+    private static int frameTasks;
+    private static long frameWorkNanos;
+    private static boolean waitingForFrame;
+    private static boolean frameWatchdogArmed;
+    private static long frameWatchdogResumes;
+    private static long currentUploadBytes;
+    private static long uploadByteBudgetExhaustions;
+    private static long lastInstallBytes;
+    private static long pumpSlices;
     private static final Deque<Runnable> QUEUE = new ArrayDeque<>();
     private static final Map<Object, Integer> UPLOAD_BACKLOGS = new IdentityHashMap<>();
     private static final Map<Object, Integer> UPLOAD_FRAME_DRAIN_COUNTS = new IdentityHashMap<>();
@@ -115,28 +158,32 @@ public final class BrowserRenderScheduler {
         return fastProfile;
     }
 
+    private static Budget budget() {
+        return fastProfile() ? FAST_BUDGET : NORMAL_BUDGET;
+    }
+
     private static int effectiveMaxTasksPerFrame() {
-        return fastProfile() ? 32 : 8;
+        return budget().maxTasksPerFrame();
     }
 
     private static int effectiveQueueHighWater() {
-        return fastProfile() ? 64 : 16;
+        return budget().queueHighWater();
     }
 
     private static long effectiveFrameWorkBudgetNanos() {
-        return fastProfile() ? 6_000_000L : 3_000_000L;
+        return budget().frameWorkNanos();
     }
 
     private static int effectiveMaxUploadAllocationsPerFrame() {
-        return fastProfile() ? 32 : 16;
+        return budget().maxUploadAllocationsPerFrame();
     }
 
     private static int effectiveCompileRunsDuringUploadPerFrame() {
-        return fastProfile() ? 4 : 2;
+        return budget().compileRunsDuringUploadPerFrame();
     }
 
     private static long effectiveUploadWorkBudgetNanos() {
-        return fastProfile() ? 6_000_000L : 3_000_000L;
+        return budget().uploadWorkNanos();
     }
 
     public static Executor defer(Executor ignored) {
@@ -167,7 +214,38 @@ public final class BrowserRenderScheduler {
                 peakUberNodeCleanupScans, currentUberNodeCleanupScans);
         currentUberNodeCleanupScans = 0;
         uberNodeCleanupDeadlineNanos = 0L;
+        currentUploadBytes = 0L;
         renderFrames++;
+        frameTasks = 0;
+        frameWorkNanos = 0L;
+        Budget budget = budget();
+        if (BrowserMeshInstallQueue.readyCount() > 0) {
+            lastInstallBytes = BrowserMeshInstallQueue.drain(
+                    budget.installBytesPerFrame(),
+                    System.nanoTime() + budget.installNanosPerFrame());
+        }
+        resumeAfterFrame();
+    }
+
+    /** A new frame budget is available: restart deferred dispatchers and the paused pump. */
+    private static void resumeAfterFrame() {
+        boolean queued = false;
+        if (!DISPATCHER_STATES.isEmpty()) {
+            for (DispatcherState state : DISPATCHER_STATES.values()) {
+                if (state.waitingForFrame) {
+                    state.waitingForFrame = false;
+                    if (!state.disposed && state.requested && queueDispatcher(state)) {
+                        queued = true;
+                    }
+                }
+            }
+        }
+        if (waitingForFrame || queued) {
+            waitingForFrame = false;
+            if (!QUEUE.isEmpty()) {
+                schedulePump();
+            }
+        }
     }
 
     /** Coalesces every 26.2 dispatcher onto one queued or running drain token. */
@@ -231,10 +309,6 @@ public final class BrowserRenderScheduler {
         state.disposed = true;
         state.requested = false;
         state.command = null;
-        if (state.frameRequestId != 0) {
-            Window.cancelAnimationFrame(state.frameRequestId);
-            state.frameRequestId = 0;
-        }
         state.waitingForFrame = false;
         if (state.queued) {
             QUEUE.remove(state.runner);
@@ -256,8 +330,8 @@ public final class BrowserRenderScheduler {
     public static boolean canScheduleSection(int alreadyPlanned) {
         updateHighWaterState();
         int planned = Math.max(0, alreadyPlanned);
-        int queuedWork = Math.max(Math.max(pendingTasks(), compileBacklog), uploadBacklog);
-        boolean allowed = planned < (fastProfile() ? 8 : 4)
+        int queuedWork = queuedSectionWork();
+        boolean allowed = planned < budget().maxPlannedSectionsPerExtract()
                 && queuedWork + planned < effectiveQueueHighWater();
         if (!allowed) {
             backpressureEvents++;
@@ -269,9 +343,29 @@ public final class BrowserRenderScheduler {
         return QUEUE.size() + (runningTask ? 1 : 0);
     }
 
-    /** Compile or upload work still queued anywhere in the section pipeline. */
+    /**
+     * Compile or upload work still queued anywhere in the section pipeline, including mesh
+     * requests out to asynchronous producers and their results waiting for installation.
+     */
     public static int queuedSectionWork() {
-        return Math.max(Math.max(pendingTasks(), compileBacklog), uploadBacklog);
+        return Math.max(Math.max(pendingTasks(), compileBacklog), uploadBacklog)
+                + BrowserMeshInstallQueue.inFlight();
+    }
+
+    /** Staged terrain upload entries not yet copied to the GPU. */
+    public static int uploadBacklog() {
+        return uploadBacklog;
+    }
+
+    /**
+     * Counts the bytes of one staged entry that {@link #shouldUploadNext} admitted
+     * (UberGpuBuffer.uploadStagedAllocations, after the entry's size is read). Further entries
+     * of the frame are refused once the frame's upload byte budget is used up.
+     */
+    public static void noteUploadBytes(Object buffer, long bytes) {
+        if (bytes > 0L) {
+            currentUploadBytes += bytes;
+        }
     }
 
     public static int peakQueuedTasks() {
@@ -427,6 +521,14 @@ public final class BrowserRenderScheduler {
         long now = System.nanoTime();
         if (currentUploadDrainCount >= effectiveMaxUploadAllocationsPerFrame()) {
             emergencyUploadEntriesRemaining = 0;
+            markUploadBudgetExhausted(false);
+            return false;
+        }
+        if (currentUploadBytes >= budget().uploadBytesPerFrame()
+                && emergencyUploadEntriesRemaining == 0) {
+            if (!uploadBudgetExhaustedThisFrame) {
+                uploadByteBudgetExhaustions++;
+            }
             markUploadBudgetExhausted(false);
             return false;
         }
@@ -650,44 +752,59 @@ public final class BrowserRenderScheduler {
         }
     }
 
+    /** Holds a dispatcher back until the next frame grants compile runs again. */
     private static void deferDispatcherUntilNextFrame(DispatcherState state) {
         if (state.waitingForFrame) {
             return;
         }
         state.waitingForFrame = true;
-        state.frameRequestId = Window.requestAnimationFrame(timestamp -> {
-            state.frameRequestId = 0;
-            state.waitingForFrame = false;
-            if (state.disposed
-                    || DISPATCHER_STATES.get(state.dispatcher) != state
-                    || !state.requested) {
-                return;
-            }
-            if (!queueDispatcher(state) || pumpScheduled) {
-                return;
-            }
-            pumpScheduled = true;
-            Platform.schedule(BrowserRenderScheduler::runAfterPaint, 0);
-        });
+        armFrameWatchdog();
     }
 
+    /** Starts the pump continuation unless it runs already or the frame budget is used up. */
     private static void schedulePump() {
         if (pumpScheduled) {
             return;
         }
+        if (frameBudgetExhausted()) {
+            waitForFrame();
+            return;
+        }
         pumpScheduled = true;
-        Window.requestAnimationFrame(timestamp -> Platform.schedule(BrowserRenderScheduler::runAfterPaint, 0));
+        Platform.schedule(BrowserRenderScheduler::runPump, 0);
     }
 
-    private static void runAfterPaint() {
-        long startedAt = System.nanoTime();
-        int completed = 0;
+    /**
+     * The pump: slices of queued work separated by one MessageChannel turn each, until the
+     * queue is empty or the frame budget is used up.
+     */
+    private static void runPump() {
         try {
-            while (shouldContinueDrain(completed, System.nanoTime() - startedAt)) {
-                Runnable command = QUEUE.pollFirst();
-                if (command == null) {
-                    return;
+            while (!QUEUE.isEmpty()) {
+                if (frameBudgetExhausted()) {
+                    waitForFrame();
+                    break;
                 }
+                runSlice();
+                if (QUEUE.isEmpty()) {
+                    break;
+                }
+                TModernRuntimeSupport.yieldToEventLoop(0);
+            }
+        } finally {
+            pumpScheduled = false;
+            publishTelemetry();
+        }
+    }
+
+    private static void runSlice() {
+        long sliceStartedAt = System.nanoTime();
+        int completed = 0;
+        pumpSlices++;
+        try {
+            while (!QUEUE.isEmpty()
+                    && shouldContinueDrain(frameTasks, frameWorkNanos)) {
+                Runnable command = QUEUE.pollFirst();
                 long taskStartedAt = System.nanoTime();
                 runningTask = true;
                 updateHighWaterState();
@@ -702,9 +819,14 @@ public final class BrowserRenderScheduler {
                     if (lastTaskNanos > effectiveFrameWorkBudgetNanos()) {
                         overBudgetTasks++;
                     }
+                    frameTasks++;
+                    frameWorkNanos += lastTaskNanos;
                     updateHighWaterState();
                 }
                 completed++;
+                if (System.nanoTime() - sliceStartedAt >= SLICE_NANOS) {
+                    break;
+                }
             }
         } finally {
             lastTaskDrainCount = completed;
@@ -713,17 +835,60 @@ public final class BrowserRenderScheduler {
             if (lastTaskBudgetExhausted) {
                 taskBudgetExhaustions++;
             }
-            pumpScheduled = false;
-            publishTelemetry();
-            if (!QUEUE.isEmpty()) {
-                schedulePump();
-            }
         }
     }
 
+    /**
+     * Frame budget rule: up to the task cap per frame, and after the first task only while
+     * the frame's accumulated work time is below the budget (one long compile always runs).
+     */
     static boolean shouldContinueDrain(int completed, long elapsedNanos) {
         return completed < effectiveMaxTasksPerFrame()
                 && (completed == 0 || elapsedNanos < effectiveFrameWorkBudgetNanos());
+    }
+
+    private static boolean frameBudgetExhausted() {
+        return !shouldContinueDrain(frameTasks, frameWorkNanos);
+    }
+
+    private static void waitForFrame() {
+        waitingForFrame = true;
+        armFrameWatchdog();
+    }
+
+    /** Resumes paused work when no frame is rendered for a while (paused world rendering). */
+    private static void armFrameWatchdog() {
+        if (frameWatchdogArmed) {
+            return;
+        }
+        frameWatchdogArmed = true;
+        long framesAtArm = renderFrames;
+        Platform.schedule(() -> {
+            frameWatchdogArmed = false;
+            if (renderFrames != framesAtArm) {
+                if (waitingForFrame || anyDispatcherWaiting()) {
+                    armFrameWatchdog();
+                }
+                return;
+            }
+            if (!waitingForFrame && !anyDispatcherWaiting()) {
+                return;
+            }
+            frameWatchdogResumes++;
+            frameTasks = 0;
+            frameWorkNanos = 0L;
+            compileRunsDuringUploadThisFrame = 0;
+            resumeAfterFrame();
+        }, FRAME_WATCHDOG_MILLIS);
+    }
+
+    private static boolean anyDispatcherWaiting() {
+        for (DispatcherState state : DISPATCHER_STATES.values()) {
+            if (state.waitingForFrame && !state.disposed) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void ensureUploadFrameBudget() {
@@ -740,6 +905,7 @@ public final class BrowserRenderScheduler {
         emergencyUploadGrantedThisFrame = false;
         currentUberNodeCleanupScans = 0;
         uberNodeCleanupDeadlineNanos = 0L;
+        currentUploadBytes = 0L;
     }
 
     private static void markUploadBudgetExhausted(boolean timeBudget) {
@@ -832,7 +998,57 @@ public final class BrowserRenderScheduler {
                 uberNodeCleanupNodesReleased,
                 uberNodeCleanupDeferrals,
                 UBER_NODE_CLEANUP_CURSORS.size());
+        Budget budget = budget();
+        publishFrameBudgetJs(
+                frameTasks,
+                nanosToMillis(frameWorkNanos),
+                waitingForFrame,
+                (double) frameWatchdogResumes,
+                (double) pumpSlices,
+                (double) currentUploadBytes,
+                (double) budget.uploadBytesPerFrame(),
+                (double) uploadByteBudgetExhaustions,
+                (double) lastInstallBytes,
+                (double) budget.installBytesPerFrame(),
+                BrowserMeshInstallQueue.inFlight(),
+                BrowserMeshInstallQueue.readyCount());
     }
+
+    @JSBody(params = {
+            "frameTasks", "frameWorkMillis", "waitingForFrame", "frameWatchdogResumes",
+            "pumpSlices", "uploadBytesThisFrame", "uploadBytesPerFrame",
+            "uploadByteBudgetExhaustions", "lastInstallBytes", "installBytesPerFrame",
+            "meshRequestsInFlight", "meshResultsReady"
+    }, script = """
+            const state=globalThis.__gaiusChunkPipelineTelemetry ||
+              (globalThis.__gaiusChunkPipelineTelemetry={});
+            state.frameTasks=Number(frameTasks)||0;
+            state.frameWorkMillis=Number(frameWorkMillis)||0;
+            state.pumpWaitingForFrame=!!waitingForFrame;
+            state.frameWatchdogResumes=Number(frameWatchdogResumes)||0;
+            state.pumpSlices=Number(pumpSlices)||0;
+            state.uploadBytesThisFrame=Number(uploadBytesThisFrame)||0;
+            state.uploadBytesPerFrame=Number(uploadBytesPerFrame)||0;
+            state.uploadByteBudgetExhaustions=Number(uploadByteBudgetExhaustions)||0;
+            state.lastInstallBytes=Number(lastInstallBytes)||0;
+            state.installBytesPerFrame=Number(installBytesPerFrame)||0;
+            state.meshRequestsInFlight=Number(meshRequestsInFlight)||0;
+            state.meshResultsReady=Number(meshResultsReady)||0;
+            state.pumpDriver='completion';
+            """)
+    private static native void publishFrameBudgetJs(
+            int frameTasks,
+            double frameWorkMillis,
+            boolean waitingForFrame,
+            double frameWatchdogResumes,
+            double pumpSlices,
+            double uploadBytesThisFrame,
+            double uploadBytesPerFrame,
+            double uploadByteBudgetExhaustions,
+            double lastInstallBytes,
+            double installBytesPerFrame,
+            int meshRequestsInFlight,
+            int meshResultsReady);
 
     private static void updateHighWaterState() {
         boolean atHighWater = pendingTasks() >= effectiveQueueHighWater();
@@ -1085,7 +1301,6 @@ public final class BrowserRenderScheduler {
         boolean requested;
         boolean disposed;
         boolean waitingForFrame;
-        int frameRequestId;
 
         DispatcherState(Object dispatcher) {
             this.dispatcher = dispatcher;

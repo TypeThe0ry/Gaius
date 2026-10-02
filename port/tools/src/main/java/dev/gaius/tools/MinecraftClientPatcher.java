@@ -36,6 +36,9 @@ public final class MinecraftClientPatcher {
     private static final int BROWSER_SECTION_INDEX_HEAP_BYTES = 4 * 1024 * 1024;
     private static final int BROWSER_SECTION_STAGING_BYTES = 16 * 1024 * 1024;
     private static final int BROWSER_GPU_RETIRE_SLOTS = 8;
+    private static final String TERRAIN_BATCH = "dev/gaius/browser/render/BrowserTerrainBatch";
+    private static final String NEIGHBOR_READINESS =
+            "dev/gaius/browser/render/BrowserNeighborReadiness";
 
     private MinecraftClientPatcher() {
     }
@@ -6885,6 +6888,13 @@ public final class MinecraftClientPatcher {
      * Lets a lit FULL center chunk compile before sparse browser delivery has supplied all eight
      * horizontal neighbors. Vanilla invalidates the surrounding section range when another chunk's
      * light becomes ready, so provisional edge meshes are rebuilt when those neighbors arrive.
+     *
+     * <p>26.2 and 26.3 keep vanilla's eight-neighbor check as gaius$allNeighborsReady and route
+     * hasAllNeighbors through BrowserNeighborReadiness.ready(center, allNeighbors, node), which
+     * compiles when all neighbors are ready, when the section is within two chunks of the player
+     * or when a neighbor has been missing for 300 ms; that removes most of the up to nine
+     * compiles a streaming section got under the unconditional center-only gate. 1.21.11 keeps
+     * the center-only gate.</p>
      */
     private static void patchSectionNeighborReadiness(
             String jar, Path outputRoot, String minecraftVersion) throws IOException {
@@ -6991,12 +7001,49 @@ public final class MinecraftClientPatcher {
         InsnList code = new InsnList();
         code.add(new VarInsnNode(Opcodes.ALOAD, 0));
         if (current) {
+            String vanillaGate = "gaius$allNeighborsReady";
+            if (findNullable(node, vanillaGate, gateDescriptor) != null) {
+                throw new IOException("SectionUpdateTracker already has " + vanillaGate);
+            }
+            MethodNode vanilla = new MethodNode(
+                    Opcodes.ACC_PRIVATE, vanillaGate, gateDescriptor, null, null);
+            gate.accept(vanilla);
+            vanilla.access = Opcodes.ACC_PRIVATE;
+            vanilla.name = vanillaGate;
+            node.methods.add(vanilla);
             code.add(new VarInsnNode(Opcodes.ALOAD, 1));
             code.add(new VarInsnNode(Opcodes.LLOAD, 2));
-        } else {
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    owner,
+                    "doesChunkExistAt",
+                    readinessDescriptor,
+                    false));
             code.add(new VarInsnNode(Opcodes.ALOAD, 0));
-            code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "sectionNode", "J"));
+            code.add(new VarInsnNode(Opcodes.ALOAD, 1));
+            code.add(new VarInsnNode(Opcodes.LLOAD, 2));
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKESPECIAL,
+                    owner,
+                    vanillaGate,
+                    gateDescriptor,
+                    false));
+            code.add(new VarInsnNode(Opcodes.LLOAD, 2));
+            code.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    NEIGHBOR_READINESS,
+                    "ready",
+                    "(ZZJ)Z",
+                    false));
+            code.add(new InsnNode(Opcodes.IRETURN));
+            replace(gate, code, 6, 4);
+            writeComputeFrames(node, outputRoot.resolve(entry));
+            System.out.println("Patched section neighbor readiness: all neighbors, nearby, or "
+                    + "300 ms missing grace");
+            return;
         }
+        code.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, owner, "sectionNode", "J"));
         code.add(new MethodInsnNode(
                 Opcodes.INVOKEVIRTUAL,
                 owner,
@@ -7004,8 +7051,10 @@ public final class MinecraftClientPatcher {
                 readinessDescriptor,
                 false));
         code.add(new InsnNode(Opcodes.IRETURN));
-        replace(gate, code, current ? 4 : 3, current ? 4 : 1);
+        replace(gate, code, 3, 1);
         writeComputeFrames(node, outputRoot.resolve(entry));
+        System.out.println("Section neighbor readiness: " + minecraftVersion
+                + " keeps the center-only gate (the timed neighbor gate covers 26.2 and 26.3)");
     }
 
     private static MethodNode requireSingleMethod(
@@ -7709,6 +7758,8 @@ public final class MinecraftClientPatcher {
             writeComputeFrames(node, output);
             return;
         }
+        System.out.println("Section vertex heap alignment and upload byte budget: skipped for "
+                + "the legacy section renderer (no UberGpuBuffer heaps)");
         MethodNode method = find(node, "uploadAllPendingUploads", "()V");
         InsnList code = new InsnList();
         LabelNode uploadLoop = new LabelNode();
@@ -9460,6 +9511,15 @@ public final class MinecraftClientPatcher {
                     && vertexSizeCall.name.equals("getVertexSize")
                     && vertexSizeCall.desc.equals("()I")) {
                 capacity.cst = BROWSER_SECTION_VERTEX_HEAP_BYTES;
+                // Align vertex allocations to four vertices (112 bytes for BLOCK) so every
+                // section's base vertex is a multiple of four: its quads then line up with
+                // the shared quad index buffer of the GL layer and need no index copy.
+                heapFactory.instructions.insert(vertexSizeCall, new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        TERRAIN_BATCH,
+                        "vertexHeapAlignment",
+                        "(I)I",
+                        false));
                 vertexHeap++;
             } else if (usage.operand == 64
                     && shape.size() == 10
@@ -9482,7 +9542,8 @@ public final class MinecraftClientPatcher {
                             + uberConstructors + ", vertex=" + vertexHeap
                             + ", index=" + indexHeap);
         }
-        System.out.println("Reduced current section renderer browser allocation units");
+        System.out.println("Reduced current section renderer browser allocation units and "
+                + "aligned vertex heaps to four vertices");
     }
 
     /**
@@ -9760,6 +9821,37 @@ public final class MinecraftClientPatcher {
                 "(Ljava/lang/Object;)V",
                 false));
         upload.instructions.insert(entryStore, freeSelected);
+
+        VarInsnNode sizeStore = null;
+        for (AbstractInsnNode instruction = entryStore.getNext();
+                instruction != null && instruction != entryLoopExit.label;
+                instruction = instruction.getNext()) {
+            if (instruction instanceof MethodInsnNode call
+                    && call.owner.equals("com/mojang/blaze3d/vertex/StagingBuffer$BufferHandle")
+                    && call.name.equals("size")
+                    && call.desc.equals("()J")
+                    && nextOpcode(call) instanceof VarInsnNode store
+                    && store.getOpcode() == Opcodes.LSTORE) {
+                if (sizeStore != null) {
+                    throw new IllegalStateException(
+                            "Current UberGpuBuffer staged entry size is read twice");
+                }
+                sizeStore = store;
+            }
+        }
+        if (sizeStore == null) {
+            throw new IllegalStateException("Current UberGpuBuffer staged entry size changed");
+        }
+        InsnList countBytes = new InsnList();
+        countBytes.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        countBytes.add(new VarInsnNode(Opcodes.LLOAD, sizeStore.var));
+        countBytes.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserRenderScheduler",
+                "noteUploadBytes",
+                "(Ljava/lang/Object;J)V",
+                false));
+        upload.instructions.insert(sizeStore, countBytes);
 
         LabelNode processedEntry = new LabelNode();
         InsnList removeProcessed = new InsnList();

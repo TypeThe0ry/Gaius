@@ -29,6 +29,7 @@ import net.minecraft.world.phys.HitResult;
 import org.teavm.jso.JSBody;
 import org.teavm.jso.JSFunctor;
 import org.teavm.jso.JSObject;
+import org.teavm.jso.typedarrays.ArrayBuffer;
 import org.teavm.jso.typedarrays.Float32Array;
 import org.teavm.jso.typedarrays.Int8Array;
 import org.teavm.jso.typedarrays.Int32Array;
@@ -55,6 +56,22 @@ public final class BrowserOpenGL {
     private static int inventoryWorldRenderFrame;
     private static String inventoryWorldRenderScreen;
     private static int nextSyntheticQuery = 1;
+    private static int terrainBatchMode = -1;
+    /**
+     * mapBufferRange staging is served from power-of-two size classes (4 KiB to 16 MiB)
+     * kept across maps, capped at MAPPED_POOL_MAX_BYTES of idle storage; larger maps
+     * allocate exactly as before.
+     */
+    private static final int MAP_INVALIDATE_RANGE_BIT = 0x0004;
+    private static final int MAP_INVALIDATE_BUFFER_BIT = 0x0008;
+    private static final int MAPPED_POOL_MIN_SHIFT = 12;
+    private static final int MAPPED_POOL_MAX_SHIFT = 24;
+    private static final long MAPPED_POOL_MAX_BYTES = 32L * 1024L * 1024L;
+    private static final long[][] MAPPED_POOL = new long[MAPPED_POOL_MAX_SHIFT + 1][];
+    private static final int[] MAPPED_POOL_COUNTS = new int[MAPPED_POOL_MAX_SHIFT + 1];
+    private static long mappedPoolBytes;
+    private static long mappedPoolHits;
+    private static long mappedPoolMisses;
     /**
      * The client tick hook reports state from the game loop. Keep the state
      * itself fresh, but do not repeat collision queries and diagnostic string
@@ -337,10 +354,20 @@ public final class BrowserOpenGL {
                   this.shiftedIndexCacheKeys.delete(id);
                 }
               };
-              window.__gaiusGL.bumpBufferVersion=function(buffer) {
+              // A known [start,start+length) write only invalidates the derived index
+              // copies that read those bytes; an unknown write drops all of them.
+              window.__gaiusGL.bumpBufferVersion=function(buffer,start,length) {
                 if (!buffer) return;
                 this.bufferVersions.set(buffer,(this.bufferVersions.get(buffer)||0)+1);
-                this.dropBufferDerivedCaches(buffer|0);
+                const rangeStart=Number(start);
+                const rangeLength=Number(length);
+                if (start!==undefined && start!==null && this.dropBufferDerivedCachesRange
+                    && Number.isFinite(rangeStart) && rangeStart>=0
+                    && Number.isFinite(rangeLength) && rangeLength>=0) {
+                  this.dropBufferDerivedCachesRange(buffer|0,rangeStart,rangeStart+rangeLength);
+                } else {
+                  this.dropBufferDerivedCaches(buffer|0);
+                }
               };
               window.__gaiusGL.componentBytes=function(type){type=type|0;return type===0x1400||type===0x1401?1:(type===0x1402||type===0x1403||type===0x140B?2:4);};
               window.__gaiusGL.align=function(value, alignment) {
@@ -853,12 +880,12 @@ public final class BrowserOpenGL {
                 this.updateBufferShadowTelemetry();
                 return bytes;
               };
-              window.__gaiusGL.dropBufferShadow=function(buffer, reason) {
+              window.__gaiusGL.dropBufferShadow=function(buffer, reason, start, length) {
                 if (!buffer) return false;
                 const hadShadow=this.bufferBytes.has(buffer) || this.bufferShadowTouch.has(buffer);
                 if (!hadShadow) return false;
                 this.deleteBufferShadow(buffer);
-                this.bumpBufferVersion(buffer);
+                this.bumpBufferVersion(buffer,start,length);
                 if (this.hotPathTelemetryEnabled) {
                   const skipped=((this.bufferShadowSkippedUnneededCount|0)+1)|0;
                   this.bufferShadowSkippedUnneededCount=skipped;
@@ -884,8 +911,11 @@ public final class BrowserOpenGL {
                 if (!buffer) return false;
                 const gl=window.__gaiusWebGL;
                 if (target===gl.ELEMENT_ARRAY_BUFFER) {
-                  return this.bufferBytes.has(buffer|0)
-                    || !this.hasUsableBaseVertexExtension();
+                  if (this.bufferBytes.has(buffer|0)
+                      || (this.shadowRequiredBuffers && this.shadowRequiredBuffers.has(buffer|0))) {
+                    return true;
+                  }
+                  return !!this.elementShadowAlways && !this.hasUsableBaseVertexExtension();
                 }
                 if (this.shadowRequiredBuffers && this.shadowRequiredBuffers.has(buffer|0)) return true;
                 if (target===gl.COPY_READ_BUFFER || target===gl.COPY_WRITE_BUFFER) {
@@ -955,16 +985,19 @@ public final class BrowserOpenGL {
                     }
                   }
                   gl.bufferSubData(targetTarget,targetStart+done,bytes);
+                  if (this.noteBufferBytes) {
+                    this.noteBufferBytes(targetBuffer|0,targetStart+done,bytes,part,false);
+                  }
                   if (targetShadow && targetShadow.byteLength===targetKnown)
                     targetShadow.set(bytes,targetStart+done);
                 }
                 if (targetShadow && targetShadow.byteLength===targetKnown
                     && targetStart>=0 && targetStart+length<=targetKnown) {
                   this.touchBufferShadow(targetBuffer|0,targetShadow.byteLength);
-                  this.bumpBufferVersion(targetBuffer|0);
+                  this.bumpBufferVersion(targetBuffer|0,targetStart,length);
                 } else {
-                  if (!this.dropBufferShadow(targetBuffer|0,'cross-kind-copy'))
-                    this.bumpBufferVersion(targetBuffer|0);
+                  if (!this.dropBufferShadow(targetBuffer|0,'cross-kind-copy',targetStart,length))
+                    this.bumpBufferVersion(targetBuffer|0,targetStart,length);
                 }
                 const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
                 stats.crossKindBufferCopies=(stats.crossKindBufferCopies||0)+1;
@@ -986,8 +1019,9 @@ public final class BrowserOpenGL {
                 if (this.shouldShadowBufferTarget(target,buffer)) {
                   this.shadowBufferSubData(buffer,offset,data,'subdata-target:'+target);
                 } else {
-                  if (!this.dropBufferShadow(buffer,'target:'+target)) {
-                    this.bumpBufferVersion(buffer);
+                  const length=data ? data.byteLength : 0;
+                  if (!this.dropBufferShadow(buffer,'target:'+target,offset,length)) {
+                    this.bumpBufferVersion(buffer,offset,length);
                   }
                 }
               };
@@ -1222,7 +1256,7 @@ public final class BrowserOpenGL {
                 current.set(source,start);
                 this.bufferBytes.set(buffer,current);
                 this.touchBufferShadow(buffer,current.byteLength);
-                this.bumpBufferVersion(buffer);
+                this.bumpBufferVersion(buffer,start,source.byteLength);
                 this.updateBufferShadowTelemetry();
                 this.noteBufferShadowCopy(source.byteLength,startedAt,false);
                 if (!hadCompleteShadow) {
@@ -2003,7 +2037,7 @@ public final class BrowserOpenGL {
                   return null;
                 }
                 const version=this.bufferVersions.get(elementBuffer|0)||0;
-                const key=(elementBuffer|0)+':'+version+':'+(type|0)+':'+start+':'+length+':'+base;
+                const key=(elementBuffer|0)+':'+(type|0)+':'+start+':'+length+':'+base;
                 let entry=this.shiftedIndexCache.get(key);
                 if (entry && !entry.deleted) {
                   vao.shiftedIndexLast=entry;
@@ -2024,6 +2058,7 @@ public final class BrowserOpenGL {
                 let source=this.bufferBytes.get(elementBuffer);
                 if (!source) {
                   source=this.ensureBufferShadow(elementBuffer,'base-vertex-index',false);
+                  if (source) this.markBufferShadowRequired(elementBuffer,'base-vertex-index');
                 }
                 if (!source) {
                   if (stats) {
@@ -2213,6 +2248,34 @@ public final class BrowserOpenGL {
                     stats.baseVertexExtensionDraws=(stats.baseVertexExtensionDraws||0)+1;
                   }
                   return;
+                }
+                // Sequential quad indices with a 4-vertex aligned base read the heap-wide
+                // shared quad index buffer at an offset: no per-draw index copy.
+                if (this.quadFastPathEnabled && this.tryQuadPatternDraw
+                    && this.tryQuadPatternDraw(vao,mode,count|0,type|0,off,inst,base)) {
+                  return;
+                }
+                // Custom index heaps (translucent terrain) draw from a companion u32 buffer
+                // holding the same indices with the base vertex baked in. Sequential quad
+                // buffers drawn at unaligned bases keep the shifted-copy cache, which keys
+                // by base and so does not thrash between draws that share an offset.
+                if (this.bakedIndexEnabled && this.bakeIndexRange
+                    && !(this.quadPatterns && this.quadPatterns.has(vao.elementArrayBuffer|0))) {
+                  const baked=this.bakeIndexRange(vao,type|0,off,count|0,base);
+                  const bakedHeap=baked>=0 ? this.bakedIndexHeaps.get(vao.elementArrayBuffer|0) : null;
+                  if (bakedHeap) {
+                    this.bindPhysicalElementBuffer(vao,bakedHeap.buffer);
+                    if (inst > 1) {
+                      gl.drawElementsInstanced(mode,count,0x1405,baked,inst);
+                    } else {
+                      gl.drawElements(mode,count,0x1405,baked);
+                    }
+                    if (this.hotPathTelemetryEnabled) {
+                      var bakedStats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+                      bakedStats.baseVertexBakedDraws=(bakedStats.baseVertexBakedDraws||0)+1;
+                    }
+                    return;
+                  }
                 }
                 const shiftedIndex=this.cacheShiftedIndexBuffer(vao,type,off,count,base);
                 if (shiftedIndex) {
@@ -2693,6 +2756,7 @@ public final class BrowserOpenGL {
             state.executeDraw=function(kind,mode,a,b,c,d,e,f) {
                 const gl=window.__gaiusWebGL;
                 const vao=this.getVaoEmu();
+                this.lastDrawMode=mode|0;
                 const drawFramebuffer=this.framebufferBindings.draw|0;
                 let disabled=null;
                 let stats=null;
@@ -3382,7 +3446,744 @@ public final class BrowserOpenGL {
         initializeShadowDecisionCache();
         initializeMisalignedBufferRefs();
         initializeVaoBufferRefsJs();
+        initializeTerrainBatchJs();
     }
+
+    /** True when the live context exposes EXT_texture_filter_anisotropic (enabled at initialize). */
+    public static boolean anisotropicFilteringAvailable() {
+        return anisotropicFilteringAvailableJs();
+    }
+
+    @JSBody(script = """
+            const state=window.__gaiusGL;
+            return !!(state && state.anisotropyExtension);
+            """)
+    private static native boolean anisotropicFilteringAvailableJs();
+
+    /**
+     * Terrain batch mode chosen at initialization: 0 disabled, 1 WEBGL_multi_draw with
+     * gl_DrawID, 2 one draw per section selected by the gaius_DrawId uniform.
+     */
+    public static int terrainBatchMode() {
+        if (terrainBatchMode < 0) {
+            terrainBatchMode = terrainBatchModeJs();
+        }
+        return terrainBatchMode;
+    }
+
+    @JSBody(script = """
+            const state=window.__gaiusGL;
+            return state && state.__terrainBatchInit ? (state.terrainBatchMode|0) : -1;
+            """)
+    private static native int terrainBatchModeJs();
+
+    /**
+     * Draws a run of terrain sections that share the current program, vertex array and
+     * logical element buffer, which the preceding vanilla draw of the run left bound.
+     * {@code data} holds {@code drawCount} records of eight ints: index count, first index,
+     * base vertex, index size in bytes, section origin x/y/z and the visibility float bits.
+     * kind 0 reads the shared quad index buffer, kind 1 the baked copy of a custom index
+     * heap. Returns {@code drawCount} when every section was drawn and 0 when nothing was
+     * (the caller then draws the run through the vanilla path).
+     */
+    public static int terrainMultiDraw(int kind, int[] data, int drawCount) {
+        if (drawCount <= 0 || data == null || data.length < drawCount * 8) {
+            return 0;
+        }
+        return terrainMultiDrawJs(kind, Int32Array.fromJavaArray(data), drawCount);
+    }
+
+    @JSBody(params = {"kind", "data", "drawCount"}, script = """
+            const state=window.__gaiusGL;
+            return state && state.terrainBatchDraw
+              ? (state.terrainBatchDraw(kind|0,data,drawCount|0)|0) : 0;
+            """)
+    private static native int terrainMultiDrawJs(int kind, Int32Array data, int drawCount);
+
+    /**
+     * Writes bytes straight into a range of a buffer (for example a terrain heap allocation)
+     * without a CPU staging copy; shadows, quad-pattern tracking and derived index caches
+     * are updated for exactly that range.
+     */
+    public static void writeBufferRange(int buffer, long offset, Int8Array data) {
+        if (buffer == 0 || data == null) {
+            return;
+        }
+        if (offset < 0L || offset > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("Unsupported WebGL buffer write offset: " + offset);
+        }
+        namedBufferSubDataJs(buffer, (int) offset, data);
+    }
+
+    /** {@link #writeBufferRange(int, long, Int8Array)} for a transferred ArrayBuffer view. */
+    public static void writeBufferRange(
+            int buffer, long offset, ArrayBuffer data, int byteOffset, int byteLength) {
+        if (data == null || byteLength <= 0) {
+            return;
+        }
+        writeBufferRange(buffer, offset, Int8Array.create(data, byteOffset, byteLength));
+    }
+
+    /**
+     * Terrain index and batch state (v0.4.0).
+     *
+     * <ul>
+     *   <li>Quad patterns: an element buffer whose bytes are the sequential quad pattern
+     *       (0,1,2,2,3,0 + 4k) is recognised when it is uploaded. A draw from it with a
+     *       base vertex that is a multiple of four reads one shared u32 quad index buffer at
+     *       index offset first + base/4*6, so it needs neither the base-vertex extension nor
+     *       a shifted index copy. The section vertex heaps are 4-vertex aligned for this.</li>
+     *   <li>Baked index heaps: a custom index heap (translucent terrain) gets one companion
+     *       u32 buffer of twice its size; the indices of a draw at source byte offset b are
+     *       written there at 2*b with the base vertex added. Disjoint source ranges stay
+     *       disjoint, entries are invalidated by the exact byte ranges later writes touch,
+     *       and every section of the heap can then be drawn with base vertex 0.</li>
+     *   <li>Terrain batches: terrainBatchDraw issues one WEBGL_multi_draw call per run of
+     *       sections. The terrain shaders were rewritten (BrowserTerrainShaders) to read the
+     *       section origin and visibility from the GaiusChunkSections uniform array indexed by
+     *       gl_DrawID, or by the gaius_DrawId uniform where the extension is missing.</li>
+     * </ul>
+     *
+     * <p>URL switches: gaiusTerrainBatch=0 (no shader rewrite, no batches), gaiusQuadIndex=0,
+     * gaiusBakedIndex=0, gaiusMultiDraw=0 (uniform fallback), gaiusElementShadow=always
+     * (shadow every element buffer as before), gaiusAnisotropy=0.</p>
+     */
+    @JSBody(script = """
+            const gl=window.__gaiusWebGL,state=window.__gaiusGL;
+            if (!gl || !state || state.__terrainBatchInit) return;
+            state.__terrainBatchInit=true;
+            let params=null;
+            try {
+              params=new URLSearchParams(String(location.search || ''));
+            } catch (ignored) {
+              params=null;
+            }
+            const flag=function(name) {
+              if (!params) return '';
+              const value=params.get(name);
+              return value===null ? '' : String(value).toLowerCase();
+            };
+            const off=function(value) {
+              return value==='0' || value==='false' || value==='off';
+            };
+            const profile=String(globalThis.__gaiusProfileId || '').trim();
+            const modernProfile=profile!=='1.21.11';
+            state.terrainBatchEnabled=modernProfile && !off(flag('gaiusTerrainBatch'))
+              && globalThis.__gaiusTerrainBatch!==false;
+            state.quadFastPathEnabled=!off(flag('gaiusQuadIndex'));
+            state.bakedIndexEnabled=!off(flag('gaiusBakedIndex'));
+            state.elementShadowAlways=flag('gaiusElementShadow')==='always';
+            state.multiDrawExtension=null;
+            if (state.terrainBatchEnabled && !off(flag('gaiusMultiDraw'))) {
+              try {
+                state.multiDrawExtension=gl.getExtension('WEBGL_multi_draw') || null;
+              } catch (ignored) {
+                state.multiDrawExtension=null;
+              }
+            }
+            state.terrainBatchMode=state.terrainBatchEnabled
+              ? (state.multiDrawExtension ? 1 : 2) : 0;
+            state.anisotropyExtension=null;
+            if (modernProfile && !off(flag('gaiusAnisotropy'))) {
+              try {
+                state.anisotropyExtension=gl.getExtension('EXT_texture_filter_anisotropic')
+                  || gl.getExtension('MOZ_EXT_texture_filter_anisotropic')
+                  || gl.getExtension('WEBKIT_EXT_texture_filter_anisotropic') || null;
+              } catch (ignored) {
+                state.anisotropyExtension=null;
+              }
+            }
+            let maxAnisotropy=1;
+            if (state.anisotropyExtension) {
+              try {
+                maxAnisotropy=Math.max(1,Number(gl.getParameter(0x84FF))||1);
+              } catch (ignored) {
+                maxAnisotropy=1;
+              }
+            }
+            const caps=globalThis.__gaiusGpuCaps || (globalThis.__gaiusGpuCaps={});
+            caps.anisotropicFiltering=!!state.anisotropyExtension;
+            caps.maxAnisotropy=maxAnisotropy;
+            caps.multiDraw=!!state.multiDrawExtension;
+            caps.terrainBatchMode=state.terrainBatchMode;
+            state.quadPatterns=new Map();
+            state.sharedQuadBuffers=new Map();
+            state.bakedIndexHeaps=new Map();
+            state.terrainPrograms=new Map();
+            state.terrainShaderOriginals=new Map();
+            state.programAttachments=state.programAttachments || new Map();
+            state.terrainUbo=null;
+            state.terrainUboBinding=-1;
+            state.terrainUboChunkBytes=4096;
+            state.terrainUboChunks=64;
+            state.terrainUboCursor=0;
+            state.terrainSectionScratch=new Int32Array(1024);
+            state.terrainCounts=new Int32Array(1024);
+            state.terrainOffsets=new Int32Array(1024);
+            state.bakeScratch=new Uint32Array(4096);
+            if (state.lastDrawMode===undefined) state.lastDrawMode=4;
+            state.readIndexValues=function(bytes,byteOffset,count,indexBytes) {
+              const absolute=(bytes.byteOffset || 0)+(byteOffset|0);
+              if ((indexBytes|0)===1) return new Uint8Array(bytes.buffer,absolute,count|0);
+              if ((indexBytes|0)===2) {
+                if ((absolute & 1)===0) return new Uint16Array(bytes.buffer,absolute,count|0);
+                const copy16=new Uint16Array(count|0);
+                new Uint8Array(copy16.buffer).set(new Uint8Array(bytes.buffer,absolute,(count|0)*2));
+                return copy16;
+              }
+              if ((absolute & 3)===0) return new Uint32Array(bytes.buffer,absolute,count|0);
+              const copy32=new Uint32Array(count|0);
+              new Uint8Array(copy32.buffer).set(new Uint8Array(bytes.buffer,absolute,(count|0)*4));
+              return copy32;
+            };
+            state.detectQuadPattern=function(bytes,indexBytes) {
+              const size=bytes ? bytes.byteLength : 0;
+              if (size % indexBytes) return null;
+              const count=Math.floor(size/indexBytes);
+              if (count<6) return null;
+              // Check the first quad through a DataView before touching the whole upload,
+              // so ordinary vertex and uniform data is rejected after six reads.
+              const head=new DataView(bytes.buffer,bytes.byteOffset || 0,indexBytes*6);
+              const pattern=[];
+              let seen=0;
+              for (let i=0;i<6;i++) {
+                const corner=indexBytes===2 ? head.getUint16(i*2,true) : head.getUint32(i*4,true);
+                if (corner>3) return null;
+                pattern.push(corner);
+                seen|=1<<corner;
+              }
+              if (seen!==15) return null;
+              const values=this.readIndexValues(bytes,0,count,indexBytes);
+              const quads=Math.floor(count/6);
+              let valid=quads;
+              for (let quad=1;quad<quads;quad++) {
+                const vertex=quad*4;
+                const at=quad*6;
+                if (values[at]!==pattern[0]+vertex || values[at+1]!==pattern[1]+vertex
+                    || values[at+2]!==pattern[2]+vertex || values[at+3]!==pattern[3]+vertex
+                    || values[at+4]!==pattern[4]+vertex || values[at+5]!==pattern[5]+vertex) {
+                  valid=quad;
+                  break;
+                }
+              }
+              return {type:indexBytes===2 ? 0x1403 : 0x1405,bytes:indexBytes,pattern:pattern,
+                key:pattern.join(','),validCount:valid*6};
+            };
+            state.truncateQuadPattern=function(id,entry,indexLimit) {
+              const limit=Math.floor(Math.max(0,Number(indexLimit)||0)/6)*6;
+              if (limit<entry.validCount) entry.validCount=limit;
+              if (entry.validCount<6) this.quadPatterns.delete(id);
+            };
+            // Tracks which element buffers hold the sequential quad pattern. replace=true
+            // for a whole-buffer store (bufferData); bytes=null when the new content is
+            // unknown to the CPU (storage allocation, GPU-side copies).
+            state.noteBufferBytes=function(buffer,offset,bytes,length,replace) {
+              const id=buffer|0;
+              if (!id || !this.quadFastPathEnabled) return;
+              const start=Math.max(0,Number(offset)||0);
+              const size=bytes ? (bytes.byteLength|0) : Math.max(0,Number(length)||0);
+              if (replace) {
+                const detected=bytes && size>=12
+                  ? (this.detectQuadPattern(bytes,2) || this.detectQuadPattern(bytes,4)) : null;
+                if (detected) this.quadPatterns.set(id,detected);
+                else this.quadPatterns.delete(id);
+                return;
+              }
+              const entry=this.quadPatterns.get(id);
+              if (!entry) {
+                if (start===0 && bytes && size>=12) {
+                  const prefix=this.detectQuadPattern(bytes,2) || this.detectQuadPattern(bytes,4);
+                  if (prefix) this.quadPatterns.set(id,prefix);
+                }
+                return;
+              }
+              const indexBytes=entry.bytes|0;
+              if (!bytes || start % indexBytes || size % indexBytes) {
+                this.truncateQuadPattern(id,entry,Math.floor(start/indexBytes));
+                return;
+              }
+              const count=size/indexBytes;
+              const firstIndex=start/indexBytes;
+              const values=this.readIndexValues(bytes,0,count,indexBytes);
+              let conforming=count;
+              for (let i=0;i<count;i++) {
+                const index=firstIndex+i;
+                const quad=Math.floor(index/6);
+                if (values[i]!==entry.pattern[index-quad*6]+quad*4) {
+                  conforming=i;
+                  break;
+                }
+              }
+              if (conforming===count) {
+                if (firstIndex<=entry.validCount) {
+                  entry.validCount=Math.max(entry.validCount,Math.floor((firstIndex+count)/6)*6);
+                }
+              } else {
+                this.truncateQuadPattern(id,entry,firstIndex+conforming);
+              }
+            };
+            state.sharedQuadBuffer=function(entry,needed) {
+              const required=Math.ceil(Math.max(6,needed|0)/6)*6;
+              let shared=this.sharedQuadBuffers.get(entry.key);
+              if (shared && shared.capacity>=required) return shared;
+              // 900000 indices (3.6 MB) cover every quad of a 16 MiB heap of 28-byte vertices.
+              let capacity=Math.max(required,shared ? shared.capacity*2 : 0,900000);
+              capacity=Math.ceil(capacity/6)*6;
+              if (capacity>0x4000000) return null;
+              const data=new Uint32Array(capacity);
+              const p=entry.pattern;
+              for (let index=0,vertex=0;index<capacity;index+=6,vertex+=4) {
+                data[index]=vertex+p[0];
+                data[index+1]=vertex+p[1];
+                data[index+2]=vertex+p[2];
+                data[index+3]=vertex+p[3];
+                data[index+4]=vertex+p[4];
+                data[index+5]=vertex+p[5];
+              }
+              const vao=this.getVaoEmu();
+              let buffer=null;
+              try {
+                buffer=gl.createBuffer();
+                if (!buffer) return null;
+                this.bindPhysicalElementBuffer(vao,buffer);
+                gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,data,gl.STATIC_DRAW);
+              } catch (error) {
+                if (buffer) {
+                  this.forgetPhysicalElementBuffer(buffer);
+                  try { gl.deleteBuffer(buffer); } catch (ignored) {}
+                }
+                this.ensureLogicalElementBuffer(vao);
+                const failStats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+                failStats.sharedQuadIndexFailures=(failStats.sharedQuadIndexFailures||0)+1;
+                return null;
+              }
+              if (shared && shared.buffer) {
+                this.forgetPhysicalElementBuffer(shared.buffer);
+                try { gl.deleteBuffer(shared.buffer); } catch (ignored) {}
+              }
+              shared={buffer:buffer,capacity:capacity};
+              this.sharedQuadBuffers.set(entry.key,shared);
+              const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+              stats.sharedQuadIndexCount=capacity;
+              stats.sharedQuadIndexBytes=capacity*4;
+              stats.sharedQuadIndexBuilds=(stats.sharedQuadIndexBuilds||0)+1;
+              return shared;
+            };
+            state.tryQuadPatternDraw=function(vao,mode,count,type,offset,instances,base) {
+              if ((base|0)<=0 || ((base|0) & 3)!==0 || (count|0)<=0) return false;
+              const entry=this.quadPatterns.get(vao.elementArrayBuffer|0);
+              if (!entry || (entry.type|0)!==(type|0)) return false;
+              const indexBytes=entry.bytes|0;
+              const byteOffset=Number(offset);
+              if (!Number.isFinite(byteOffset) || byteOffset<0 || byteOffset % indexBytes) return false;
+              const first=byteOffset/indexBytes;
+              if (first+(count|0)>entry.validCount) return false;
+              const shifted=first+((base|0)>>2)*6;
+              const shared=this.sharedQuadBuffer(entry,shifted+(count|0));
+              if (!shared) return false;
+              this.bindPhysicalElementBuffer(vao,shared.buffer);
+              if ((instances|0)>1) {
+                gl.drawElementsInstanced(mode,count|0,0x1405,shifted*4,instances|0);
+              } else {
+                gl.drawElements(mode,count|0,0x1405,shifted*4);
+              }
+              if (this.hotPathTelemetryEnabled) {
+                const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+                stats.baseVertexQuadDraws=(stats.baseVertexQuadDraws||0)+1;
+              }
+              return true;
+            };
+            state.bakedHeapFor=function(vao,element) {
+              const size=Number(this.bufferSizes.get(element|0))||0;
+              if (size<=0 || size>0x1000000) return null;
+              let heap=this.bakedIndexHeaps.get(element|0);
+              if (heap && heap.sourceSize===size) return heap;
+              if (heap && heap.buffer) {
+                this.forgetPhysicalElementBuffer(heap.buffer);
+                try { gl.deleteBuffer(heap.buffer); } catch (ignored) {}
+              }
+              this.bakedIndexHeaps.delete(element|0);
+              let buffer=null;
+              try {
+                buffer=gl.createBuffer();
+                if (!buffer) return null;
+                this.bindPhysicalElementBuffer(vao,buffer);
+                gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,size*2,gl.DYNAMIC_DRAW);
+              } catch (error) {
+                if (buffer) {
+                  this.forgetPhysicalElementBuffer(buffer);
+                  try { gl.deleteBuffer(buffer); } catch (ignored) {}
+                }
+                this.ensureLogicalElementBuffer(vao);
+                return null;
+              }
+              heap={buffer:buffer,sourceSize:size,entries:new Map()};
+              this.bakedIndexHeaps.set(element|0,heap);
+              const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+              stats.bakedIndexHeaps=this.bakedIndexHeaps.size;
+              stats.bakedIndexHeapBuilds=(stats.bakedIndexHeapBuilds||0)+1;
+              return heap;
+            };
+            // Returns the byte offset of the baked u32 copy of [byteOffset, +count indices)
+            // of the current element buffer with base added, or -1 when it cannot be baked.
+            state.bakeIndexRange=function(vao,type,byteOffset,count,base) {
+              const element=vao.elementArrayBuffer|0;
+              const indexBytes=this.indexBytes(type);
+              const start=Number(byteOffset);
+              const length=count|0;
+              if (!element || !indexBytes || length<=0 || !Number.isFinite(start)
+                  || start<0 || start % indexBytes) return -1;
+              const end=start+length*indexBytes;
+              const heap=this.bakedHeapFor(vao,element);
+              if (!heap || end>heap.sourceSize) return -1;
+              const shift=base|0;
+              const cached=heap.entries.get(start);
+              const telemetry=this.hotPathTelemetryEnabled;
+              if (cached && cached.count===length && cached.type===(type|0) && cached.base===shift) {
+                if (telemetry) {
+                  const hitStats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+                  hitStats.bakedIndexHits=(hitStats.bakedIndexHits||0)+1;
+                }
+                return start*2;
+              }
+              const bakedStart=start*2;
+              const bakedEnd=bakedStart+length*4;
+              if (cached) heap.entries.delete(start);
+              heap.entries.forEach(function(other,otherStart) {
+                const otherBaked=Number(otherStart)*2;
+                if (otherBaked<bakedEnd && bakedStart<otherBaked+other.count*4) {
+                  heap.entries.delete(otherStart);
+                }
+              });
+              const known=Number(this.bufferSizes.get(element))||0;
+              let source=this.bufferBytes.get(element);
+              if (!source || source.byteLength!==known) {
+                source=this.ensureBufferShadow(element,'terrain-index-bake',false);
+              }
+              if (!source || source.byteLength<end) return -1;
+              this.markBufferShadowRequired(element,'terrain-index-bake');
+              this.touchBufferShadow(element,source.byteLength);
+              const values=this.readIndexValues(source,start,length,indexBytes);
+              if (this.bakeScratch.length<length) {
+                this.bakeScratch=new Uint32Array(Math.max(length,this.bakeScratch.length*2));
+              }
+              const out=this.bakeScratch;
+              const restart=this.indexRestartValue(type);
+              for (let i=0;i<length;i++) {
+                const value=values[i];
+                if (value===restart) return -1;
+                const shifted=value+shift;
+                if (shifted<0 || shifted>=4294967295) return -1;
+                out[i]=shifted;
+              }
+              this.bindPhysicalElementBuffer(vao,heap.buffer);
+              gl.bufferSubData(gl.ELEMENT_ARRAY_BUFFER,bakedStart,out,0,length);
+              heap.entries.set(start,{count:length,type:type|0,base:shift,indexBytes:indexBytes});
+              const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+              stats.bakedIndexBakes=(stats.bakedIndexBakes||0)+1;
+              stats.bakedIndexBakedBytes=(stats.bakedIndexBakedBytes||0)+length*4;
+              return bakedStart;
+            };
+            state.invalidateBakedRange=function(element,start,end) {
+              const heap=this.bakedIndexHeaps.get(element|0);
+              if (!heap || !heap.entries.size) return;
+              heap.entries.forEach(function(entry,entryStart) {
+                const from=Number(entryStart);
+                const to=from+entry.count*(entry.indexBytes|0 || 4);
+                if (from<end && start<to) heap.entries.delete(entryStart);
+              });
+            };
+            state.dropBufferDerivedCachesRange=function(buffer,start,end) {
+              const id=buffer|0;
+              let keys=this.alignedAttribCacheKeys.get(id);
+              if (keys) {
+                const alignedKeys=Array.from(keys);
+                for (let i=0;i<alignedKeys.length;i++) {
+                  this.deleteAlignedAttribEntry(alignedKeys[i],false);
+                }
+                this.alignedAttribCacheKeys.delete(id);
+              }
+              keys=this.shiftedIndexCacheKeys.get(id);
+              if (keys) {
+                const shiftedKeys=Array.from(keys);
+                for (let i=0;i<shiftedKeys.length;i++) {
+                  const entry=this.shiftedIndexCache.get(shiftedKeys[i]);
+                  if (!entry) {
+                    this.forgetBufferCacheKey(this.shiftedIndexCacheKeys,id,shiftedKeys[i]);
+                    continue;
+                  }
+                  const from=Number(entry.offset);
+                  const to=from+(entry.inputCount|0)*(this.indexBytes(entry.inputType)||1);
+                  if (from<end && start<to) this.deleteShiftedIndexEntry(shiftedKeys[i],false);
+                }
+              }
+              this.invalidateBakedRange(id,start,end);
+            };
+            const dropAllDerived=state.dropBufferDerivedCaches;
+            state.dropBufferDerivedCaches=function(buffer) {
+              dropAllDerived.call(this,buffer);
+              const heap=this.bakedIndexHeaps.get(buffer|0);
+              if (heap) heap.entries.clear();
+            };
+            state.forgetTerrainBuffer=function(buffer) {
+              const id=buffer|0;
+              this.quadPatterns.delete(id);
+              const heap=this.bakedIndexHeaps.get(id);
+              if (heap) {
+                if (heap.buffer) {
+                  this.forgetPhysicalElementBuffer(heap.buffer);
+                  try { gl.deleteBuffer(heap.buffer); } catch (ignored) {}
+                }
+                this.bakedIndexHeaps.delete(id);
+              }
+            };
+            state.markTerrainUboBinding=function() {
+              if ((this.terrainUboBinding|0)<0 || !this.indexedBufferBindings) return;
+              this.indexedBufferBindings.set(
+                (gl.UNIFORM_BUFFER|0)*65536+(this.terrainUboBinding|0),
+                {range:true,buffer:-1,offset:-1,size:-1});
+            };
+            // One UBO ring, bound at the last uniform-buffer binding point, backs the
+            // GaiusChunkSections block of every rewritten program at all times.
+            state.ensureTerrainUbo=function() {
+              if (this.terrainUbo) return this.terrainUbo;
+              let maxBindings=24;
+              try {
+                maxBindings=Number(gl.getParameter(gl.MAX_UNIFORM_BUFFER_BINDINGS))||24;
+              } catch (ignored) {
+                maxBindings=24;
+              }
+              const binding=Math.max(0,maxBindings-1);
+              const buffer=gl.createBuffer();
+              if (!buffer) return null;
+              const previousId=this.boundBuffers.get(gl.UNIFORM_BUFFER)|0;
+              try {
+                gl.bindBuffer(gl.UNIFORM_BUFFER,buffer);
+                gl.bufferData(gl.UNIFORM_BUFFER,
+                  (this.terrainUboChunkBytes|0)*(this.terrainUboChunks|0),gl.DYNAMIC_DRAW);
+                gl.bindBufferRange(gl.UNIFORM_BUFFER,binding,buffer,0,this.terrainUboChunkBytes|0);
+              } finally {
+                gl.bindBuffer(gl.UNIFORM_BUFFER,previousId ? this.buffers.get(previousId) : null);
+              }
+              this.terrainUbo=buffer;
+              this.terrainUboBinding=binding;
+              this.markTerrainUboBinding();
+              return buffer;
+            };
+            state.registerTerrainProgram=function(program) {
+              const id=program|0;
+              const object=this.programs.get(id);
+              this.terrainPrograms.delete(id);
+              if (!object || !this.terrainBatchEnabled) return;
+              let blockIndex=gl.INVALID_INDEX;
+              try {
+                blockIndex=gl.getUniformBlockIndex(object,'GaiusChunkSections');
+              } catch (ignored) {
+                blockIndex=gl.INVALID_INDEX;
+              }
+              if (blockIndex===gl.INVALID_INDEX || blockIndex===null || blockIndex===undefined) return;
+              if (!this.ensureTerrainUbo()) return;
+              gl.uniformBlockBinding(object,blockIndex,this.terrainUboBinding|0);
+              const batchModeLocation=gl.getUniformLocation(object,'gaius_BatchMode');
+              const drawIdLocation=gl.getUniformLocation(object,'gaius_DrawId');
+              const multiDraw=!drawIdLocation && !!this.multiDrawExtension;
+              this.terrainPrograms.set(id,{
+                ready:!!batchModeLocation && (multiDraw || !!drawIdLocation),
+                batchModeLocation:batchModeLocation,
+                drawIdLocation:drawIdLocation,
+                multiDraw:multiDraw
+              });
+              const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+              stats.terrainBatchPrograms=this.terrainPrograms.size;
+            };
+            // After linking: a program built from rewritten terrain shaders that fails to link
+            // is relinked from the untouched sources, so the rewrite can never cost a pipeline.
+            state.finishTerrainLink=function(program) {
+              const id=program|0;
+              const object=this.programs.get(id);
+              if (!object) return;
+              const attached=this.programAttachments.get(id);
+              let rewritten=false;
+              if (attached) {
+                attached.forEach(function(shader) {
+                  if (state.terrainShaderOriginals.has(shader|0)) rewritten=true;
+                });
+              }
+              if (!rewritten) {
+                this.terrainPrograms.delete(id);
+                return;
+              }
+              if (!gl.getProgramParameter(object,gl.LINK_STATUS)) {
+                const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+                stats.terrainShaderLinkFallbacks=(stats.terrainShaderLinkFallbacks||0)+1;
+                try {
+                  stats.terrainShaderLinkFallbackLog=String(gl.getProgramInfoLog(object) || '').slice(0,512);
+                } catch (ignored) {}
+                attached.forEach(function(shader) {
+                  const original=state.terrainShaderOriginals.get(shader|0);
+                  const shaderObject=state.shaders.get(shader|0);
+                  if (original===undefined || !shaderObject) return;
+                  gl.shaderSource(shaderObject,original);
+                  gl.compileShader(shaderObject);
+                  state.terrainShaderOriginals.delete(shader|0);
+                });
+                gl.linkProgram(object);
+                this.terrainPrograms.delete(id);
+                return;
+              }
+              this.registerTerrainProgram(id);
+            };
+            state.terrainBatchReject=function(reason) {
+              const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+              stats.terrainBatchRejects=(stats.terrainBatchRejects||0)+1;
+              stats.terrainBatchLastReject=String(reason);
+              return 0;
+            };
+            // data: 8 ints per draw [indexCount, firstIndex, baseVertex, indexBytes,
+            // sectionX, sectionY, sectionZ, visibilityBits]. kind 0 = sequential quad
+            // indices, kind 1 = custom index heap. Draws all or nothing; returns the count.
+            state.terrainBatchDraw=function(kind,data,drawCount) {
+              const n=drawCount|0;
+              if (n<=0 || !data || data.length<n*8) return 0;
+              if (!this.terrainBatchEnabled || this.gpuSubmissionBlocked || this.gpuContextLost) {
+                return this.terrainBatchReject('disabled');
+              }
+              const info=this.terrainPrograms.get(this.currentProgram|0);
+              if (!info || !info.ready) return this.terrainBatchReject('program');
+              const vao=this.getVaoEmu();
+              if ((vao.drawReadyGeneration|0)!==(this.drawProgramGeneration|0)) {
+                return this.terrainBatchReject('attribs');
+              }
+              if (vao.missingEnabledAttribs && vao.missingEnabledAttribs.size) {
+                return this.terrainBatchReject('missing-attribs');
+              }
+              const element=vao.elementArrayBuffer|0;
+              if (!element) return this.terrainBatchReject('element');
+              if (this.terrainCounts.length<n) {
+                const grown=Math.max(n,this.terrainCounts.length*2);
+                this.terrainCounts=new Int32Array(grown);
+                this.terrainOffsets=new Int32Array(grown);
+              }
+              const counts=this.terrainCounts;
+              const offsets=this.terrainOffsets;
+              let physical=null;
+              if ((kind|0)===0) {
+                const indexBytes=data[3]|0;
+                const entry=this.quadPatterns.get(element);
+                if (!this.quadFastPathEnabled || !entry || (entry.bytes|0)!==indexBytes) {
+                  return this.terrainBatchReject('quad-pattern');
+                }
+                let needed=0;
+                for (let i=0;i<n;i++) {
+                  const at=i*8;
+                  const count=data[at]|0;
+                  const first=data[at+1]|0;
+                  const base=data[at+2]|0;
+                  if (count<=0 || first<0 || base<0 || (base & 3)!==0
+                      || (data[at+3]|0)!==indexBytes || first+count>entry.validCount) {
+                    return this.terrainBatchReject('quad-range');
+                  }
+                  const shifted=first+(base>>2)*6;
+                  counts[i]=count;
+                  offsets[i]=shifted*4;
+                  if (shifted+count>needed) needed=shifted+count;
+                }
+                const shared=this.sharedQuadBuffer(entry,needed);
+                if (!shared) return this.terrainBatchReject('quad-buffer');
+                physical=shared.buffer;
+              } else {
+                if (!this.bakedIndexEnabled) return this.terrainBatchReject('bake-disabled');
+                for (let i=0;i<n;i++) {
+                  const bakeAt=i*8;
+                  const bakeCount=data[bakeAt]|0;
+                  const bakeFirst=data[bakeAt+1]|0;
+                  const bakeIndexBytes=data[bakeAt+3]|0;
+                  const bakeType=bakeIndexBytes===4 ? 0x1405 : (bakeIndexBytes===2 ? 0x1403
+                    : (bakeIndexBytes===1 ? 0x1401 : 0));
+                  if (!bakeType || bakeCount<=0 || bakeFirst<0) {
+                    return this.terrainBatchReject('bake-range');
+                  }
+                  const baked=this.bakeIndexRange(
+                    vao,bakeType,bakeFirst*bakeIndexBytes,bakeCount,data[bakeAt+2]|0);
+                  if (baked<0) return this.terrainBatchReject('bake');
+                  counts[i]=bakeCount;
+                  offsets[i]=baked;
+                }
+                const heap=this.bakedIndexHeaps.get(element);
+                if (!heap) return this.terrainBatchReject('bake-heap');
+                physical=heap.buffer;
+              }
+              const ubo=this.ensureTerrainUbo();
+              if (!ubo) return this.terrainBatchReject('ubo');
+              const chunkBytes=this.terrainUboChunkBytes|0;
+              const perChunk=chunkBytes>>4;
+              const chunksNeeded=Math.ceil(n/perChunk);
+              if (chunksNeeded>(this.terrainUboChunks|0)) return this.terrainBatchReject('ubo-capacity');
+              if ((this.terrainUboCursor|0)+chunksNeeded>(this.terrainUboChunks|0)) {
+                this.terrainUboCursor=0;
+              }
+              if (this.terrainSectionScratch.length<perChunk*4) {
+                this.terrainSectionScratch=new Int32Array(perChunk*4);
+              }
+              const sections=this.terrainSectionScratch;
+              this.bindPhysicalElementBuffer(vao,physical);
+              const mode=this.lastDrawMode|0;
+              const extension=info.multiDraw ? this.multiDrawExtension : null;
+              const previousUniformId=this.boundBuffers.get(gl.UNIFORM_BUFFER)|0;
+              let drawn=0;
+              let calls=0;
+              gl.bindBuffer(gl.UNIFORM_BUFFER,ubo);
+              gl.uniform1i(info.batchModeLocation,1);
+              try {
+                let chunk=this.terrainUboCursor|0;
+                for (let start=0;start<n;start+=perChunk) {
+                  const m=Math.min(perChunk,n-start);
+                  for (let j=0;j<m;j++) {
+                    const recordAt=(start+j)*8;
+                    const sectionAt=j*4;
+                    sections[sectionAt]=data[recordAt+4];
+                    sections[sectionAt+1]=data[recordAt+5];
+                    sections[sectionAt+2]=data[recordAt+6];
+                    sections[sectionAt+3]=data[recordAt+7];
+                  }
+                  const byteOffset=chunk*chunkBytes;
+                  gl.bufferSubData(gl.UNIFORM_BUFFER,byteOffset,sections,0,m*4);
+                  gl.bindBufferRange(gl.UNIFORM_BUFFER,this.terrainUboBinding|0,ubo,byteOffset,chunkBytes);
+                  if (extension) {
+                    extension.multiDrawElementsWEBGL(mode,counts,start,0x1405,offsets,start,m);
+                    calls++;
+                  } else {
+                    for (let j=0;j<m;j++) {
+                      gl.uniform1i(info.drawIdLocation,j);
+                      gl.drawElements(mode,counts[start+j],0x1405,offsets[start+j]);
+                    }
+                    calls+=m;
+                  }
+                  drawn+=m;
+                  chunk++;
+                }
+                this.terrainUboCursor=chunk;
+              } finally {
+                gl.uniform1i(info.batchModeLocation,0);
+                gl.bindBuffer(gl.UNIFORM_BUFFER,previousUniformId ? this.buffers.get(previousUniformId) : null);
+                this.markTerrainUboBinding();
+              }
+              if (this.hotPathTelemetryEnabled) {
+                const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+                stats.terrainBatchCalls=(stats.terrainBatchCalls||0)+1;
+                stats.terrainBatchDraws=(stats.terrainBatchDraws||0)+drawn;
+                stats.terrainBatchGlCalls=(stats.terrainBatchGlCalls||0)+calls;
+                if ((kind|0)===0) {
+                  stats.terrainBatchQuadDraws=(stats.terrainBatchQuadDraws||0)+drawn;
+                } else {
+                  stats.terrainBatchBakedDraws=(stats.terrainBatchBakedDraws||0)+drawn;
+                }
+              }
+              return drawn;
+            };
+            """)
+    private static native void initializeTerrainBatchJs();
+
 
     @JSBody(script = """
             const s=window.__gaiusGL,g=window.__gaiusWebGL;
@@ -3392,7 +4193,8 @@ public final class BrowserOpenGL {
               const id=b|0;
               if(!id)return false;
               if(t===g.ELEMENT_ARRAY_BUFFER){
-                return this.bufferBytes.has(id)||!this.hasUsableBaseVertexExtension();
+                if(this.bufferBytes.has(id)||(this.shadowRequiredBuffers&&this.shadowRequiredBuffers.has(id)))return true;
+                return !!this.elementShadowAlways&&!this.hasUsableBaseVertexExtension();
               }
               if(this.shadowRequiredBuffers&&this.shadowRequiredBuffers.has(id))return true;
               if(t===g.COPY_READ_BUFFER||t===g.COPY_WRITE_BUFFER)return this.bufferBytes.has(id);
@@ -4389,6 +5191,7 @@ public final class BrowserOpenGL {
     @JSBody(params = {"buffer"}, script = """
             const state=window.__gaiusGL, object=state.buffers.get(buffer);
             state.forgetPhysicalElementBuffer(object);
+            if (state.forgetTerrainBuffer) state.forgetTerrainBuffer(buffer|0);
             if (object) window.__gaiusWebGL.deleteBuffer(object); state.buffers.delete(buffer);
             state.bufferSizes.delete(buffer);
             state.bufferWebglTypes.delete(buffer|0);
@@ -4486,6 +5289,7 @@ public final class BrowserOpenGL {
             if (buffer) {
               state.bufferSizes.set(buffer,actual);
               state.shadowBufferDataForTarget(target,buffer,null,actual);
+              if (state.noteBufferBytes) state.noteBufferBytes(buffer,0,null,actual,true);
             }
             """)
     private static native void bufferDataSizeJs(int target, int size, int usage);
@@ -4512,6 +5316,7 @@ public final class BrowserOpenGL {
             if (buffer) {
               state.bufferSizes.set(buffer,actual);
               state.shadowBufferDataForTarget(target,buffer,upload,actual);
+              if (state.noteBufferBytes) state.noteBufferBytes(buffer,0,upload,actual,true);
             }
             """)
     private static native void bufferDataJs(int target, Int8Array data, int usage);
@@ -4536,7 +5341,10 @@ public final class BrowserOpenGL {
               const validRange=Number.isFinite(start) && start>=0
                 && Number.isFinite(length) && length>=0 && Number.isFinite(end)
                 && Number.isFinite(known) && known>=0 && end<=known;
-              if (validRange && length>0) state.shadowBufferSubDataForTarget(target,buffer,start,data);
+              if (validRange && length>0) {
+                state.shadowBufferSubDataForTarget(target,buffer,start,data);
+                if (state.noteBufferBytes) state.noteBufferBytes(buffer,start,data,length,false);
+              }
             }
             """)
     private static native void bufferSubDataJs(int target, int offset, Int8Array data);
@@ -4563,6 +5371,7 @@ public final class BrowserOpenGL {
               } else {
                 if (!state.dropBufferShadow(buffer,'named-buffer')) state.bumpBufferVersion(buffer);
               }
+              if (state.noteBufferBytes) state.noteBufferBytes(buffer,0,null,actual,true);
             }
             if (!bindingMatches) gl.bindBuffer(gl.COPY_WRITE_BUFFER,previous);
             state.noteNamedBufferBindings(bindingMatches?0:2,bindingMatches?2:0);
@@ -4592,6 +5401,7 @@ public final class BrowserOpenGL {
               } else {
                 if (!state.dropBufferShadow(buffer,'named-buffer')) state.bumpBufferVersion(buffer);
               }
+              if (state.noteBufferBytes) state.noteBufferBytes(buffer,0,upload,actual,true);
             }
             if (!bindingMatches) gl.bindBuffer(gl.COPY_WRITE_BUFFER,previous);
             state.noteNamedBufferBindings(bindingMatches?0:2,bindingMatches?2:0);
@@ -4623,8 +5433,11 @@ public final class BrowserOpenGL {
                 if (state.shadowRequiredBuffers && state.shadowRequiredBuffers.has(buffer|0)) {
                   state.shadowBufferSubData(buffer,start,data);
                 } else {
-                  if (!state.dropBufferShadow(buffer,'named-buffer')) state.bumpBufferVersion(buffer);
+                  if (!state.dropBufferShadow(buffer,'named-buffer',start,length)) {
+                    state.bumpBufferVersion(buffer,start,length);
+                  }
                 }
+                if (state.noteBufferBytes) state.noteBufferBytes(buffer,start,data,length,false);
               }
             }
             if (!bindingMatches) gl.bindBuffer(gl.COPY_WRITE_BUFFER,previous);
@@ -4642,10 +5455,10 @@ public final class BrowserOpenGL {
             throw new IllegalStateException("WebGL buffer target is already mapped: " + target);
         }
         ensureBufferNotMapped(logicalBuffer);
-        ByteBuffer buffer = MemoryUtil.memAlloc((int) length).order(ByteOrder.nativeOrder());
-        MAPPED_BUFFERS.put(target, new MappedBuffer(logicalBuffer, offset, access, buffer));
+        MappedBuffer mapped = acquireMappedBuffer(logicalBuffer, offset, (int) length, access);
+        MAPPED_BUFFERS.put(target, mapped);
         noteMappedBufferMapJs((double) length, MAPPED_BUFFERS.size());
-        return buffer;
+        return mapped.buffer();
     }
 
     public static long mapBufferRangeAddress(int target, long offset, long length, int access) {
@@ -4664,7 +5477,7 @@ public final class BrowserOpenGL {
                 bufferSubDataJs(target, (int) mapped.offset, allBytes(mapped.buffer));
             }
         } finally {
-            MemoryUtil.memFree(mapped.buffer);
+            releaseMappedStorage(mapped);
             noteMappedBufferUnmapJs(
                     uploadOnUnmap, (double) (uploadOnUnmap ? mappedBytes : 0),
                     MAPPED_BUFFERS.size());
@@ -4688,11 +5501,10 @@ public final class BrowserOpenGL {
             throw new IllegalStateException("Cannot map WebGL buffer 0");
         }
         ensureBufferNotMapped(buffer);
-        ByteBuffer byteBuffer = MemoryUtil.memAlloc((int) length).order(ByteOrder.nativeOrder());
-        MAPPED_BUFFERS.put(
-                namedBufferKey(buffer), new MappedBuffer(buffer, offset, access, byteBuffer));
+        MappedBuffer mapped = acquireMappedBuffer(buffer, offset, (int) length, access);
+        MAPPED_BUFFERS.put(namedBufferKey(buffer), mapped);
         noteMappedNamedBufferMapJs((double) length, MAPPED_BUFFERS.size());
-        return byteBuffer;
+        return mapped.buffer();
     }
 
     public static boolean unmapNamedBuffer(int buffer) {
@@ -4707,7 +5519,7 @@ public final class BrowserOpenGL {
                 namedBufferSubDataJs(buffer, (int) mapped.offset, allBytes(mapped.buffer));
             }
         } finally {
-            MemoryUtil.memFree(mapped.buffer);
+            releaseMappedStorage(mapped);
             noteMappedNamedBufferUnmapJs(
                     uploadOnUnmap, (double) (uploadOnUnmap ? mappedBytes : 0),
                     MAPPED_BUFFERS.size());
@@ -4728,6 +5540,81 @@ public final class BrowserOpenGL {
     private static int namedBufferKey(int buffer) {
         return 0x40000000 | buffer;
     }
+
+    /**
+     * Allocates mapped staging from the size-class pool. Only maps whose unwritten bytes
+     * would be uploaded at unmap (no invalidate and no explicit-flush bit) are zero-filled,
+     * which keeps the old memAlloc result for them; every other map skips the fill.
+     */
+    private static MappedBuffer acquireMappedBuffer(
+            int logicalBuffer, long offset, int length, int access) {
+        int shift = mappedPoolShift(length);
+        if (shift < 0) {
+            ByteBuffer exact = MemoryUtil.memAlloc(length).order(ByteOrder.nativeOrder());
+            return new MappedBuffer(logicalBuffer, offset, access, exact, 0L, -1);
+        }
+        long address;
+        int pooled = MAPPED_POOL_COUNTS[shift];
+        if (pooled > 0) {
+            pooled--;
+            MAPPED_POOL_COUNTS[shift] = pooled;
+            address = MAPPED_POOL[shift][pooled];
+            mappedPoolBytes -= 1L << shift;
+            mappedPoolHits++;
+        } else {
+            address = MemoryUtil.nmemAlloc(1L << shift);
+            mappedPoolMisses++;
+        }
+        if ((access & (MAP_INVALIDATE_RANGE_BIT | MAP_INVALIDATE_BUFFER_BIT
+                | MAP_FLUSH_EXPLICIT_BIT)) == 0) {
+            MemoryUtil.memSet(address, 0, length);
+        }
+        ByteBuffer view = MemoryUtil.memByteBuffer(address, length).order(ByteOrder.nativeOrder());
+        noteMappedPoolJs((double) mappedPoolHits, (double) mappedPoolMisses, (double) mappedPoolBytes);
+        return new MappedBuffer(logicalBuffer, offset, access, view, address, shift);
+    }
+
+    private static void releaseMappedStorage(MappedBuffer mapped) {
+        int shift = mapped.poolShift();
+        if (shift < 0) {
+            MemoryUtil.memFree(mapped.buffer());
+            return;
+        }
+        long size = 1L << shift;
+        if (mappedPoolBytes + size > MAPPED_POOL_MAX_BYTES) {
+            MemoryUtil.nmemFree(mapped.poolAddress());
+            return;
+        }
+        long[] slots = MAPPED_POOL[shift];
+        int count = MAPPED_POOL_COUNTS[shift];
+        if (slots == null || count == slots.length) {
+            long[] grown = new long[slots == null ? 4 : slots.length * 2];
+            if (slots != null) {
+                System.arraycopy(slots, 0, grown, 0, count);
+            }
+            slots = grown;
+            MAPPED_POOL[shift] = slots;
+        }
+        slots[count] = mapped.poolAddress();
+        MAPPED_POOL_COUNTS[shift] = count + 1;
+        mappedPoolBytes += size;
+    }
+
+    private static int mappedPoolShift(int length) {
+        if (length <= 0 || length > (1 << MAPPED_POOL_MAX_SHIFT)) {
+            return -1;
+        }
+        int shift = 32 - Integer.numberOfLeadingZeros(length - 1);
+        return Math.max(MAPPED_POOL_MIN_SHIFT, shift);
+    }
+
+    @JSBody(params = {"hits", "misses", "pooledBytes"}, script = """
+            const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+            stats.mappedPoolHits=hits;
+            stats.mappedPoolMisses=misses;
+            stats.mappedPoolIdleBytes=pooledBytes;
+            """)
+    private static native void noteMappedPoolJs(double hits, double misses, double pooledBytes);
 
     private static void checkMappedRange(long offset, long length) {
         if (offset < 0L || length < 0L || length > Integer.MAX_VALUE
@@ -4775,7 +5662,7 @@ public final class BrowserOpenGL {
             if (mapped != null) {
                 released++;
                 releasedBytes += mapped.buffer.capacity();
-                MemoryUtil.memFree(mapped.buffer);
+                releaseMappedStorage(mapped);
             }
         }
         if (released > 0) {
@@ -4791,7 +5678,7 @@ public final class BrowserOpenGL {
         long releasedBytes = 0L;
         for (MappedBuffer mapped : staleMappings) {
             releasedBytes += mapped.buffer.capacity();
-            MemoryUtil.memFree(mapped.buffer);
+            releaseMappedStorage(mapped);
         }
         if (staleMappings.isEmpty()) {
             noteMappedBufferCountJs(0);
@@ -4964,7 +5851,7 @@ public final class BrowserOpenGL {
     public static native int createProgram();
 
     public static void shaderSource(int shader, CharSequence source) {
-        shaderSourceJs(shader, translateShaderSource(source.toString()));
+        applyShaderSource(shader, translateShaderSource(source.toString()));
     }
 
     public static void shaderSourceArray(int shader, CharSequence[] sources) {
@@ -4974,7 +5861,21 @@ public final class BrowserOpenGL {
                 joined.append(source);
             }
         }
-        shaderSourceJs(shader, translateShaderSource(joined.toString()));
+        applyShaderSource(shader, translateShaderSource(joined.toString()));
+    }
+
+    /**
+     * Hands the translated source to WebGL. Terrain shaders that read the per-section
+     * ChunkSection uniform get the batch rewrite; the untouched source is kept so a link
+     * failure can rebuild the program without it.
+     */
+    private static void applyShaderSource(int shader, String translated) {
+        String rewritten = BrowserTerrainShaders.rewrite(translated, terrainBatchMode());
+        if (rewritten == null || rewritten.equals(translated)) {
+            shaderSourceJs(shader, translated);
+            return;
+        }
+        shaderSourceRewrittenJs(shader, rewritten, translated);
     }
 
     public static void shaderSourceNative(int shader, int count, long strings, long lengths) {
@@ -4990,7 +5891,7 @@ public final class BrowserOpenGL {
                 joined.append(new String(bytes, StandardCharsets.UTF_8));
             }
         }
-        shaderSourceJs(shader, translateShaderSource(joined.toString()));
+        applyShaderSource(shader, translateShaderSource(joined.toString()));
     }
 
     private static int cStringLength(long address) {
@@ -5107,9 +6008,20 @@ public final class BrowserOpenGL {
     }
 
     @JSBody(params = {"shader", "source"}, script = """
-            window.__gaiusWebGL.shaderSource(window.__gaiusGL.shaders.get(shader),source);
+            const state=window.__gaiusGL;
+            window.__gaiusWebGL.shaderSource(state.shaders.get(shader),source);
+            if (state.terrainShaderOriginals) state.terrainShaderOriginals.delete(shader|0);
             """)
     private static native void shaderSourceJs(int shader, String source);
+
+    @JSBody(params = {"shader", "source", "original"}, script = """
+            const state=window.__gaiusGL;
+            window.__gaiusWebGL.shaderSource(state.shaders.get(shader),source);
+            if (state.terrainShaderOriginals) state.terrainShaderOriginals.set(shader|0,original);
+            const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
+            stats.terrainShaderRewrites=(stats.terrainShaderRewrites||0)+1;
+            """)
+    private static native void shaderSourceRewrittenJs(int shader, String source, String original);
 
     @JSBody(params = {"shader"}, script = """
             window.__gaiusWebGL.compileShader(window.__gaiusGL.shaders.get(shader));
@@ -5117,8 +6029,15 @@ public final class BrowserOpenGL {
     public static native void compileShader(int shader);
 
     @JSBody(params = {"program", "shader"}, script = """
-            window.__gaiusWebGL.attachShader(
-              window.__gaiusGL.programs.get(program),window.__gaiusGL.shaders.get(shader));
+            const state=window.__gaiusGL;
+            window.__gaiusWebGL.attachShader(state.programs.get(program),state.shaders.get(shader));
+            const attachments=state.programAttachments || (state.programAttachments=new Map());
+            let attached=attachments.get(program|0);
+            if (!attached) {
+              attached=new Set();
+              attachments.set(program|0,attached);
+            }
+            attached.add(shader|0);
             """)
     public static native void attachShader(int program, int shader);
 
@@ -5135,6 +6054,7 @@ public final class BrowserOpenGL {
             const state=window.__gaiusGL;
             if (state.clearProgramUniforms) state.clearProgramUniforms(program|0);
             window.__gaiusWebGL.linkProgram(state.programs.get(program));
+            if (state.finishTerrainLink) state.finishTerrainLink(program|0);
             state.refreshProgramAttribs(program|0);
             state.programVersion=((state.programVersion||0)+1)|0;
             state.bumpDrawProgramGeneration();
@@ -5163,12 +6083,15 @@ public final class BrowserOpenGL {
             if (object) window.__gaiusWebGL.deleteProgram(object);
             state.programs.delete(program);
             state.programAttribs.delete(program|0);
+            if (state.programAttachments) state.programAttachments.delete(program|0);
+            if (state.terrainPrograms) state.terrainPrograms.delete(program|0);
             """)
     public static native void deleteProgram(int program);
 
     @JSBody(params = {"shader"}, script = """
             const state=window.__gaiusGL, object=state.shaders.get(shader);
             if (object) window.__gaiusWebGL.deleteShader(object); state.shaders.delete(shader);
+            if (state.terrainShaderOriginals) state.terrainShaderOriginals.delete(shader|0);
             """)
     public static native void deleteShader(int shader);
 
@@ -6395,15 +7318,19 @@ public final class BrowserOpenGL {
               const shadowRequired=state.shouldShadowBufferTarget(targetTarget,targetBuffer);
               const targetShadow=state.bufferBytes.get(targetBuffer);
               const targetComplete=targetShadow && targetShadow.byteLength===targetKnown;
-              if (shadowRequired && targetComplete && source
-                  && source.byteLength===sourceKnown && source.byteLength>=sourceEnd) {
+              const copiedBytes=source && source.byteLength===sourceKnown
+                && source.byteLength>=sourceEnd ? source.subarray(start,sourceEnd) : null;
+              if (state.noteBufferBytes) {
+                state.noteBufferBytes(targetBuffer,targetStart,copiedBytes,length,false);
+              }
+              if (shadowRequired && targetComplete && copiedBytes) {
                 state.shadowBufferSubData(targetBuffer,targetStart,
-                  source.subarray(start,sourceEnd),'copy-source-shadow:'+targetTarget);
+                  copiedBytes,'copy-source-shadow:'+targetTarget);
               } else {
                 if (!state.dropBufferShadow(
                     targetBuffer,shadowRequired ? 'copy-deferred-readback:'+targetTarget
-                      : 'copy-target:'+targetTarget)) {
-                  state.bumpBufferVersion(targetBuffer);
+                      : 'copy-target:'+targetTarget,targetStart,length)) {
+                  state.bumpBufferVersion(targetBuffer,targetStart,length);
                 }
                 if (shadowRequired) {
                   const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
@@ -6476,15 +7403,19 @@ public final class BrowserOpenGL {
                   && state.shadowRequiredBuffers.has(targetBuffer|0);
                 const targetShadow=state.bufferBytes.get(targetBuffer);
                 const targetComplete=targetShadow && targetShadow.byteLength===targetKnown;
-                if (shadowRequired && targetComplete && source
-                  && source.byteLength===sourceKnown && source.byteLength>=sourceEnd) {
+                const copiedBytes=source && source.byteLength===sourceKnown
+                  && source.byteLength>=sourceEnd ? source.subarray(start,sourceEnd) : null;
+                if (state.noteBufferBytes) {
+                  state.noteBufferBytes(targetBuffer,targetStart,copiedBytes,length,false);
+                }
+                if (shadowRequired && targetComplete && copiedBytes) {
                   state.shadowBufferSubData(targetBuffer,targetStart,
-                    source.subarray(start,sourceEnd),'named-copy-source-shadow');
+                    copiedBytes,'named-copy-source-shadow');
                 } else {
                   if (!state.dropBufferShadow(
                       targetBuffer,shadowRequired ? 'named-copy-deferred-readback'
-                        : 'named-copy-target')) {
-                    state.bumpBufferVersion(targetBuffer);
+                        : 'named-copy-target',targetStart,length)) {
+                    state.bumpBufferVersion(targetBuffer,targetStart,length);
                   }
                   if (shadowRequired) {
                     const stats=window.__gaiusGLStats || (window.__gaiusGLStats={});
@@ -7761,7 +8692,9 @@ public final class BrowserOpenGL {
         };
     }
 
-    private record MappedBuffer(int logicalBuffer, long offset, int access, ByteBuffer buffer) {
+    private record MappedBuffer(
+            int logicalBuffer, long offset, int access, ByteBuffer buffer,
+            long poolAddress, int poolShift) {
         private boolean uploadOnUnmap() {
             return (access & MAP_WRITE_BIT) != 0 && (access & MAP_FLUSH_EXPLICIT_BIT) == 0;
         }
