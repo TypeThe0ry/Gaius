@@ -690,6 +690,51 @@ def apply_gaius_boot_art(text: str) -> str:
     )
 
 
+GAIUS_TOUCH_CONTROLS_MARKER = 'data-gaius-touch-controls="v1"'
+GAIUS_TOUCH_VIEWPORT = (
+    '  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, '
+    'user-scalable=no, interactive-widget=resizes-visual">\n'
+)
+
+
+def apply_gaius_touch_controls(text: str) -> str:
+    """Install the touchscreen controls (port/web/launcher/touch-controls.{css,js}).
+
+    Like apply_gaius_boot_art, a self-contained style and script. The script stays inert until a
+    touch screen is used; it drives the game through window.__gaiusInput, which the GLFW and SDL
+    bridges install. Phones also need a viewport without user zoom. It deliberately stays inside the
+    safe area (no viewport-fit=cover): the canvas fills the layout viewport and would otherwise be
+    drawn under a notch or the home indicator.
+    """
+    if GAIUS_TOUCH_CONTROLS_MARKER in text:
+        return text
+    launcher = Path(__file__).resolve().parents[1] / "web" / "launcher"
+    css = (launcher / "touch-controls.css").read_text(encoding="utf-8")
+    script = (launcher / "touch-controls.js").read_text(encoding="utf-8")
+    if "</script" in script.lower() or "</style" in css.lower():
+        raise RuntimeError("touch controls must not contain closing script or style tags")
+    text, viewport_count = re.subn(
+        r'  <meta name="viewport" content="[^"]*">\n',
+        lambda _match: GAIUS_TOUCH_VIEWPORT,
+        text,
+        count=1,
+    )
+    if viewport_count != 1:
+        raise RuntimeError("index.html patch point was not found: viewport meta")
+    text = replace_required(
+        text,
+        "</head>\n",
+        "  <style " + GAIUS_TOUCH_CONTROLS_MARKER + ">\n" + css + "  </style>\n</head>\n",
+        "Gaius touch controls CSS",
+    )
+    return replace_required(
+        text,
+        "</body>\n",
+        "  <script " + GAIUS_TOUCH_CONTROLS_MARKER + ">\n" + script + "  </script>\n</body>\n",
+        "Gaius touch controls script",
+    )
+
+
 def apply_gaius_client_shell(text: str) -> str:
     """Install the stable browser-client shell without changing game contracts."""
     if GAIUS_SHELL_MARKER in text:
@@ -1855,13 +1900,14 @@ def patch_index(
     )
 
     if '<link rel="icon" href="data:,">' not in text:
-        text = replace_required(
+        text, favicon_count = re.subn(
+            r'(  <meta name="viewport" content="[^"]*">\n)',
+            lambda match: match.group(1) + '  <link rel="icon" href="data:,">\n',
             text,
-            '  <meta name="viewport" content="width=device-width, initial-scale=1">\n',
-            '  <meta name="viewport" content="width=device-width, initial-scale=1">\n'
-            '  <link rel="icon" href="data:,">\n',
-            "favicon",
+            count=1,
         )
+        if favicon_count != 1:
+            raise RuntimeError("index.html patch point was not found: favicon")
 
     if "__gaiusBootTimings" not in text:
         text = replace_required(
@@ -3131,6 +3177,7 @@ def patch_index(
     text = patch_storage_persistence(text, selected_profile)
     text = apply_gaius_client_shell(text)
     text = apply_gaius_boot_art(text)
+    text = apply_gaius_touch_controls(text)
     text = patch_release_version(text)
     text = patch_shader_toolchain_loader(text, classes_js, index, minecraft_version)
 

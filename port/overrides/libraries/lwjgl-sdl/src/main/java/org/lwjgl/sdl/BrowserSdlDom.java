@@ -370,9 +370,12 @@ final class BrowserSdlDom {
               w.__gaiusPointerLockErrors.push({message: message, at: Date.now()});
               if (w.__gaiusPointerLockErrors.length > 20) w.__gaiusPointerLockErrors.shift();
             };
+            // Touch controls drive relative motion through w.__gaiusInput.look() (a virtual
+            // pointer lock), so a real lock is never requested while they are active.
             const requestPointerLockIfWanted = () => {
               const c = canvas();
-              if (!w.__gaiusWantPointerLock || !c || !c.requestPointerLock || document.pointerLockElement === c) {
+              if (!w.__gaiusWantPointerLock || w.__gaiusTouchActive || !c || !c.requestPointerLock ||
+                  document.pointerLockElement === c) {
                 return;
               }
               try {
@@ -583,6 +586,99 @@ final class BrowserSdlDom {
               }
               push(record(769, scancode, keycode, mods, 0, e.keyCode | 0, 0, 0, 0, null));
             });
+            // Direct input for the launcher's touch controls (touch-controls.js), the same API as
+            // BrowserGlfw: CSS pixels relative to #mc-canvas, GLFW button numbers (0 left, 1 right,
+            // 2 middle) and KeyboardEvent.code names. Records go through the same domKeys,
+            // domButtons and domMods state as the DOM listeners, so blur still releases them.
+            // Nothing here focuses the canvas or asks for fullscreen or pointer lock; look()
+            // supplies xrel/yrel directly, so relative mouse mode works without pointer lock.
+            const injected = {keys: Object.create(null), buttons: 0};
+            const injectKey = (code, down) => {
+              const scancode = scancodeOf(code);
+              if (!scancode || !!injected.keys[scancode] === !!down) return false;
+              if (down) {
+                const downMods = updateMods(null, scancode, true);
+                const downKeycode = keycodeFor(scancode, code, null);
+                injected.keys[scancode] = true;
+                sdl.domKeys[scancode] = downKeycode;
+                w.__gaiusSdlKeys[scancode] = true;
+                push(record(768, scancode, downKeycode, downMods, 0, 0, 0, 0, 0, null));
+                return true;
+              }
+              delete injected.keys[scancode];
+              // Like keyup: nothing to release when blur already reset the keyboard.
+              if (sdl.domKeys[scancode] === undefined) return false;
+              const upMods = updateMods(null, scancode, false);
+              const upKeycode = sdl.domKeys[scancode];
+              delete sdl.domKeys[scancode];
+              w.__gaiusSdlKeys[scancode] = false;
+              push(record(769, scancode, upKeycode, upMods, 0, 0, 0, 0, 0, null));
+              return true;
+            };
+            const injectButton = (button, down) => {
+              const glfwButton = button | 0;
+              if (glfwButton < 0 || glfwButton > 4) return false;
+              const sdlButton = glfwButton === 1 ? 3 : (glfwButton === 2 ? 2 : (glfwButton === 0 ? 1 : glfwButton + 1));
+              const bit = 1 << (sdlButton - 1);
+              if (!!(injected.buttons & bit) === !!down) return false;
+              injected.buttons = down ? (injected.buttons | bit) : (injected.buttons & ~bit);
+              sdl.domButtons = down ? (sdl.domButtons | bit) : (sdl.domButtons & ~bit);
+              push(record(down ? 1025 : 1026, sdlButton, 1, sdl.domMods, 0,
+                w.__gaiusCursorX || 0, w.__gaiusCursorY || 0, 0, 0, null));
+              return true;
+            };
+            w.__gaiusInput = {
+              backend: 'sdl',
+              pointer: (x, y) => {
+                const nx = +x || 0;
+                const ny = +y || 0;
+                const dx = nx - (w.__gaiusCursorX || 0);
+                const dy = ny - (w.__gaiusCursorY || 0);
+                w.__gaiusCursorX = nx;
+                w.__gaiusCursorY = ny;
+                pushMotion(nx, ny, dx, dy);
+              },
+              look: (dx, dy) => {
+                const rx = +dx || 0;
+                const ry = +dy || 0;
+                w.__gaiusCursorX = (w.__gaiusCursorX || 0) + rx;
+                w.__gaiusCursorY = (w.__gaiusCursorY || 0) + ry;
+                pushMotion(w.__gaiusCursorX, w.__gaiusCursorY, rx, ry);
+              },
+              button: injectButton,
+              key: injectKey,
+              // SDL3 semantics: TEXT_INPUT only while the game has text input started.
+              text: value => {
+                const raw = value == null ? '' : String(value);
+                let text = '';
+                for (let i = 0; i < raw.length; i++) {
+                  const unit = raw.charCodeAt(i);
+                  if (unit >= 32 && unit !== 127) text += raw.charAt(i);
+                }
+                if (!sdl.textInput || !text) return false;
+                push(record(771, 0, 0, 0, 0, 0, 0, 0, 0, text));
+                return true;
+              },
+              // Wheel steps, positive away from the user (SDL3 wheel y).
+              wheel: (dx, dy) => {
+                push(record(1027, 0, 0, sdl.domMods, 0, +dx || 0, +dy || 0,
+                  w.__gaiusCursorX || 0, w.__gaiusCursorY || 0, null));
+              },
+              releaseAll: () => {
+                Object.keys(injected.keys).forEach(scancode => {
+                  const code = SCANCODE_TO_CODE[scancode | 0];
+                  if (code) injectKey(code, false);
+                  else delete injected.keys[scancode];
+                });
+                for (let button = 0; button <= 4; button++) injectButton(button, false);
+              },
+              state: () => ({
+                backend: 'sdl',
+                wantPointerLock: !!w.__gaiusWantPointerLock,
+                textInput: !!sdl.textInput,
+                textInputArea: sdl.textInputArea
+              })
+            };
             addEventListener('mousedown', e => {
               const c = canvas();
               if (c && c.focus) c.focus();

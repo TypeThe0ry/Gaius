@@ -158,6 +158,33 @@ def main() -> int:
             raise AssertionError("launcher still uses a Mojang boot brand")
         if generated.count('data-gaius-shell="v2"') != 2:
             raise AssertionError("Gaius shell marker is not installed exactly twice")
+        if generated.count('data-gaius-boot-art="v1"') != 2:
+            raise AssertionError("Gaius boot art marker is not installed exactly twice")
+        # Touch controls: one style and one script, after the boot art, plus a phone viewport.
+        if generated.count('data-gaius-touch-controls="v1"') != 2:
+            raise AssertionError("Gaius touch controls marker is not installed exactly twice")
+        for contract in (
+            "(function installGaiusTouchControls() {",
+            "window.__gaiusInput",
+            "w.__gaiusTouchActive = true;",
+            ".gt-root {",
+            "html.gaius-touch #mc-canvas {",
+            "env(safe-area-inset-bottom, 0px)",
+        ):
+            require(generated, contract)
+        if generated.count('<meta name="viewport"') != 1:
+            raise AssertionError("launcher must have exactly one viewport meta")
+        require(
+            generated,
+            '<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, '
+            'user-scalable=no, interactive-widget=resizes-visual">',
+        )
+        if generated.find('<style data-gaius-touch-controls="v1">') > generated.find("</head>"):
+            raise AssertionError("touch controls CSS is not in the document head")
+        if generated.find('<script data-gaius-touch-controls="v1">') < generated.find(
+            '<script data-gaius-boot-art="v1">'
+        ):
+            raise AssertionError("touch controls script must run after the boot art")
         if generated.count("const singleplayerBuildToken =") != 1:
             raise AssertionError("singleplayer build token must be declared exactly once")
         for assignment in (
