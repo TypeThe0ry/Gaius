@@ -699,7 +699,22 @@ public final class BrowserGlfw {
 
     public static void swapBuffers(long window) {
         boolean hidden = swapBuffersJs();
-        yieldAfterPresent(hidden, swapInterval);
+        try {
+            yieldAfterPresent(hidden, swapInterval);
+        } catch (RuntimeException e) {
+            // A frame presented from a JavaScript callback cannot suspend: on 1.21.11 the login
+            // packet runs Minecraft.setLevel -> updateScreenAndTick -> runTick(false) inside the
+            // network inbound pump. TeaVM refuses the suspension before scheduling anything, so
+            // that one frame skips its yield and the next regular frame yields as usual.
+            if (!isNonThreadingSuspension(e)) {
+                throw e;
+            }
+        }
+    }
+
+    static boolean isNonThreadingSuspension(Throwable error) {
+        String message = error.getMessage();
+        return message != null && message.contains("Suspension point reached from non-threading context");
     }
 
     public static void swapInterval(int interval) {

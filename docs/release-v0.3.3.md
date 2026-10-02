@@ -24,7 +24,16 @@ Frames are now held to the display: menus present once per screen refresh
 (60 FPS on a 60 Hz display, 144 on 144 Hz, like the vanilla menu limit), and
 in a world the game presents at most three frames per refresh. Frames that
 already take half a refresh or longer are never held, so in-world FPS on slower
-machines is unchanged. {{TITLE}}
+machines is unchanged.
+
+Measured on the Minecraft 26.3 title screen in Chrome while the test machine
+was busy with another job (three runs each):
+
+| | v0.3.2 | v0.3.3 |
+|---|---|---|
+| Screen updates per second | 6-32 | 59-60 |
+| 95th percentile frame time | 50-850 ms | 17 ms |
+| Frames the game draws per second | ~390 | 60 |
 
 ## Minecraft-style boot screen
 
