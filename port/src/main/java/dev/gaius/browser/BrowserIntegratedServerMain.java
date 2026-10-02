@@ -19,6 +19,7 @@ import net.minecraft.server.players.PlayerList;
 import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
+import net.minecraft.world.phys.Vec3;
 import org.teavm.classlib.java.lang.TModernRuntimeSupport;
 import org.teavm.jso.JSBody;
 import org.teavm.jso.JSExport;
@@ -680,10 +681,46 @@ public final class BrowserIntegratedServerMain {
                 || Float.isNaN(pitch) || Float.isInfinite(pitch)) {
             return;
         }
+        double previousX = player.getX();
+        double previousY = player.getY();
+        double previousZ = player.getZ();
         player.absSnapTo(x, y, z, yaw, pitch);
-        player.setOnGround(packet.isOnGround());
+        applyWorkerMovementBookkeeping(player, packet, previousX, previousY, previousZ);
         BrowserChunkTaskPriority.recordPlayerPosition(x, z);
         moveServerPlayerChunkTracking(player.level().getChunkSource(), player);
+    }
+
+    /**
+     * The movement bookkeeping vanilla's handlePlayerPositionChange does after moving the player:
+     * ground state, fall distance and fall damage (doCheckFallDamage), the known movement that
+     * spear and mace attacks read, and the fall-distance reset when moving up. Without it the
+     * Worker player never took fall damage, the mace smash never triggered and spear jabs did
+     * nothing. Fall and ground checks read blocks under the player, so they only run when that
+     * chunk is already loaded: hasChunkAt never loads or generates a chunk, which keeps the
+     * reason for this fast path (no synchronous chunk wait in the packet handler).
+     */
+    private static void applyWorkerMovementBookkeeping(ServerPlayer player,
+            ServerboundMovePlayerPacket packet, double previousX, double previousY, double previousZ) {
+        boolean onGround = packet.isOnGround();
+        if (!packet.hasPosition()) {
+            player.setOnGround(onGround);
+            return;
+        }
+        Vec3 movement = new Vec3(player.getX() - previousX, player.getY() - previousY,
+                player.getZ() - previousZ);
+        if (player.level().hasChunkAt(player.blockPosition())) {
+            player.setOnGroundWithMovement(onGround, packet.horizontalCollision(), movement);
+            player.doCheckFallDamage(movement.x, movement.y, movement.z, onGround);
+        } else {
+            player.setOnGround(onGround);
+        }
+        if (movement.lengthSqr() > 1.0E-5D) {
+            player.resetLastActionTime();
+        }
+        player.setKnownMovement(movement);
+        if (movement.y > 0.0D) {
+            player.resetFallDistance();
+        }
     }
 
     private static int floorSectionCoordinate(double coordinate) {
