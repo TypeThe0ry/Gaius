@@ -270,7 +270,7 @@ function displayedFrameTimes(presentTimes, refreshRate, duration) {
 async function simulateVisibleYield(refreshRate, frameCount = 720) {
   const browser = new VirtualBrowser({refreshRate, timerClamp: 4});
   const telemetry = {enabled: true};
-  const window = {__gaiusFrameTelemetry: telemetry};
+  const window = {__gaiusFrameTelemetry: telemetry, __gaiusMinecraftState: {level: true}};
   const context = vm.createContext({
     Date: {now: () => browser.now},
     clearTimeout: handle => browser.clearTimeout(handle),
@@ -324,7 +324,7 @@ async function simulateVisibleYield(refreshRate, frameCount = 720) {
 async function simulateUncappedYield(frameCount = 1440) {
   const browser = new VirtualBrowser({refreshRate: 60, timerClamp: 4, messageDelay: 0.01});
   const telemetry = {enabled: true};
-  const window = {__gaiusFrameTelemetry: telemetry};
+  const window = {__gaiusFrameTelemetry: telemetry, __gaiusMinecraftState: {level: true}};
   const context = vm.createContext({
     Date: {now: () => browser.now},
     clearTimeout: handle => browser.clearTimeout(handle),
@@ -358,7 +358,11 @@ async function simulateUncappedYield(frameCount = 1440) {
   const frameTimes = presentTimes.slice(1).map((at, index) => at - presentTimes[index]);
   const averageFps = 1000 / (frameTimes.reduce((total, value) => total + value, 0) / frameTimes.length);
   const onePercentLow = onePercentLowFps(frameTimes);
-  assert.equal(browser.rafRequests, 0, "uncapped pacing unexpectedly waited for rAF");
+  // The compositor guard keeps one rAF outstanding (one request per refresh at most); frames
+  // this slow almost never reach the three-presents-per-refresh limit.
+  const refreshes = Math.ceil(presentTimes.at(-1) / browser.refreshMillis) + 1;
+  assert.ok(browser.rafRequests <= refreshes,
+    `uncapped pacing requested more than one rAF per refresh: ${browser.rafRequests} > ${refreshes}`);
   assert.equal(telemetry.swapInterval, 0);
   assert.equal(telemetry.uncappedYieldCount, frameCount);
   assert.equal(telemetry.vsyncYieldCount || 0, 0);
@@ -383,10 +387,70 @@ async function simulateUncappedYield(frameCount = 1440) {
   return {averageFps, onePercentLow};
 }
 
+// Cheap uncapped frames (the title screen) used to present hundreds of times per refresh and
+// starve the compositor. They must now present at most three times per display refresh in a
+// world and once in menus (no level), wait for rAF in between, and still never keep more than
+// one continuation pending.
+async function simulateCheapUncappedYield(refreshRate = 60, frameCount = 900, {menu = false} = {}) {
+  const limit = menu ? 1 : 3;
+  const browser = new VirtualBrowser({refreshRate, timerClamp: 4, messageDelay: 0.01});
+  const telemetry = {enabled: true};
+  const window = {__gaiusFrameTelemetry: telemetry, __gaiusMinecraftState: {level: !menu}};
+  const context = vm.createContext({
+    Date: {now: () => browser.now},
+    clearTimeout: handle => browser.clearTimeout(handle),
+    Math,
+    MessageChannel: createMessageChannelClass(browser),
+    Number,
+    performance: {now: () => browser.now},
+    requestAnimationFrame: callback => browser.requestAnimationFrame(callback),
+    setTimeout: (callback, delay) => browser.setTimeout(callback, delay),
+    window,
+  });
+  const scheduleYield = vm.runInContext(`(hidden, interval, resume) => {${frameYieldScript}}`, context);
+  const presentTimes = [];
+  let completed = 0;
+  const present = () => {
+    presentTimes.push(browser.now);
+    scheduleYield(false, 0, () => {
+      completed++;
+      browser.now += 1.5;
+      if (completed < frameCount) present();
+    });
+  };
+  present();
+  browser.runUntil(() => completed === frameCount);
+
+  const perRefresh = new Map();
+  for (const at of presentTimes) {
+    const slot = Math.floor(at / browser.refreshMillis + 1e-9);
+    perRefresh.set(slot, (perRefresh.get(slot) || 0) + 1);
+  }
+  const busiestRefresh = Math.max(...perRefresh.values());
+  const elapsed = presentTimes.at(-1) - presentTimes[0];
+  const averageFps = 1000 * (presentTimes.length - 1) / elapsed;
+  assert.ok(busiestRefresh <= limit,
+    `cheap uncapped frames presented ${busiestRefresh} times in one ${refreshRate} Hz refresh`);
+  assert.ok(averageFps <= refreshRate * limit + 1,
+    `cheap uncapped frames were not held to the display: ${averageFps.toFixed(1)} FPS`);
+  assert.ok(averageFps >= refreshRate * limit * 0.8,
+    `cheap uncapped frames were throttled below the guard: ${averageFps.toFixed(1)} FPS`);
+  assert.ok(telemetry.uncappedRafWaitCount > frameCount / (limit + 1),
+    "cheap uncapped frames never waited for rAF");
+  assert.equal(telemetry.uncappedYieldCount, frameCount);
+  assert.equal(telemetry.messageChannelYieldCount, frameCount);
+  assert.equal(telemetry.watchdogYieldCount || 0, 0);
+  assert.equal(telemetry.pendingYieldCount, 0);
+  assert.equal(telemetry.maxPendingYieldCount, 1);
+  assert.equal(telemetry.duplicateYieldCallbackCount, 0);
+  assert.equal(window.__gaiusUncappedPresentPacer.waiters.length, 0);
+  return averageFps;
+}
+
 async function simulateSchedulerIsolation(frameCount = 64) {
   const browser = new VirtualBrowser({refreshRate: 60, timerClamp: 4, messageDelay: 0.01});
   const telemetry = {enabled: true};
-  const window = {__gaiusFrameTelemetry: telemetry};
+  const window = {__gaiusFrameTelemetry: telemetry, __gaiusMinecraftState: {level: true}};
   let schedulerYieldAttempts = 0;
   window.scheduler = {yield: () => {
     schedulerYieldAttempts++;
@@ -425,7 +489,7 @@ async function simulateSchedulerIsolation(frameCount = 64) {
 async function simulateDeadMessageChannel(frameCount = 2048) {
   const browser = new VirtualBrowser({refreshRate: 60, timerClamp: 4});
   const telemetry = {enabled: true};
-  const window = {__gaiusFrameTelemetry: telemetry};
+  const window = {__gaiusFrameTelemetry: telemetry, __gaiusMinecraftState: {level: true}};
   const channelStats = {created: 0, closed: 0, posts: 0};
   const context = vm.createContext({
     Date: {now: () => browser.now},
@@ -469,7 +533,7 @@ async function simulateDeadMessageChannel(frameCount = 2048) {
 async function simulateThrowingMessageChannel(frameCount = 128) {
   const browser = new VirtualBrowser({refreshRate: 60, timerClamp: 4});
   const telemetry = {enabled: true};
-  const window = {__gaiusFrameTelemetry: telemetry};
+  const window = {__gaiusFrameTelemetry: telemetry, __gaiusMinecraftState: {level: true}};
   const channelStats = {created: 0, closed: 0, posts: 0};
   const context = vm.createContext({
     Date: {now: () => browser.now},
@@ -512,7 +576,7 @@ async function simulateThrowingMessageChannel(frameCount = 128) {
 async function simulateUnavailableMessageChannel({constructorThrows = false} = {}) {
   const browser = new VirtualBrowser({refreshRate: 60, timerClamp: 4});
   const telemetry = {enabled: true};
-  const window = {__gaiusFrameTelemetry: telemetry};
+  const window = {__gaiusFrameTelemetry: telemetry, __gaiusMinecraftState: {level: true}};
   const channelStats = {created: 0};
   const MessageChannel = constructorThrows
     ? createConstructorThrowingMessageChannelClass(channelStats)
@@ -563,7 +627,7 @@ function simulateFixedTimer(frameCount = 720) {
 async function simulateHiddenYield() {
   const browser = new VirtualBrowser({refreshRate: 120, timerClamp: 4});
   const telemetry = {enabled: true};
-  const window = {__gaiusFrameTelemetry: telemetry};
+  const window = {__gaiusFrameTelemetry: telemetry, __gaiusMinecraftState: {level: true}};
   const context = vm.createContext({
     Date: {now: () => browser.now},
     clearTimeout: handle => browser.clearTimeout(handle),
@@ -596,7 +660,7 @@ async function simulateHiddenYield() {
 async function simulateStalledRafYield() {
   const browser = new VirtualBrowser({refreshRate: 120, timerClamp: 4});
   const telemetry = {enabled: true};
-  const window = {__gaiusFrameTelemetry: telemetry};
+  const window = {__gaiusFrameTelemetry: telemetry, __gaiusMinecraftState: {level: true}};
   const context = vm.createContext({
     Date: {now: () => browser.now},
     clearTimeout: handle => browser.clearTimeout(handle),
@@ -627,7 +691,7 @@ async function simulateStalledRafYield() {
 async function simulateStalledMessageYield() {
   const browser = new VirtualBrowser({refreshRate: 120, timerClamp: 4, messageDelay: 200});
   const telemetry = {enabled: true};
-  const window = {__gaiusFrameTelemetry: telemetry};
+  const window = {__gaiusFrameTelemetry: telemetry, __gaiusMinecraftState: {level: true}};
   const context = vm.createContext({
     Date: {now: () => browser.now},
     clearTimeout: handle => browser.clearTimeout(handle),
@@ -664,7 +728,7 @@ async function simulateStalledMessageYield() {
 async function simulateOverlappingYields() {
   const browser = new VirtualBrowser({refreshRate: 120, timerClamp: 4});
   const telemetry = {enabled: true};
-  const window = {__gaiusFrameTelemetry: telemetry};
+  const window = {__gaiusFrameTelemetry: telemetry, __gaiusMinecraftState: {level: true}};
   const context = vm.createContext({
     Date: {now: () => browser.now},
     clearTimeout: handle => browser.clearTimeout(handle),
@@ -692,6 +756,10 @@ async function simulateOverlappingYields() {
 const visiblePresents = await simulateVisibleYield(120);
 const highRefreshPresents = await simulateVisibleYield(144);
 const uncapped = await simulateUncappedYield();
+const cheapUncapped60 = await simulateCheapUncappedYield(60);
+const cheapUncapped144 = await simulateCheapUncappedYield(144);
+const menuUncapped60 = await simulateCheapUncappedYield(60, 300, {menu: true});
+const menuUncapped144 = await simulateCheapUncappedYield(144, 600, {menu: true});
 await simulateSchedulerIsolation();
 await simulateDeadMessageChannel();
 await simulateThrowingMessageChannel();
@@ -734,6 +802,8 @@ console.log(
   `Frame pacing yield smoke passed (${sdl ? "26.3 BrowserSdl.SDL_GL_SwapWindow" : "26.2 BrowserGlfw.swapBuffers"}):`,
   `uncapped avg=${uncapped.averageFps.toFixed(1)}fps,`,
   `uncapped 1% low=${uncapped.onePercentLow.toFixed(1)}fps,`,
+  `cheap uncapped 60Hz=${cheapUncapped60.toFixed(1)}fps, 144Hz=${cheapUncapped144.toFixed(1)}fps,`,
+  `menu 60Hz=${menuUncapped60.toFixed(1)}fps, 144Hz=${menuUncapped144.toFixed(1)}fps,`,
   `120Hz 1% low=${cooperativeOnePercentLow.toFixed(1)}fps,`,
   `144Hz 1% low=${highRefreshOnePercentLow.toFixed(1)}fps,`,
   `fixed-1ms/clamped 1% low=${fixedTimerOnePercentLow.toFixed(1)}fps`,
