@@ -7,8 +7,9 @@ can be verified.
 
 ## Development Setup
 
-Install Git LFS, JDK 21 (for `1.21.11`) and JDK 25 or newer (for `26.2`),
-Node.js 22 or newer, Python 3, `curl`, `jq`, `unzip`, and `shasum`. After
+Install Git LFS, JDK 25 or newer (for `26.2` and `26.3`), JDK 21 (only for
+the Paper plugin), Node.js 22 or newer, Python 3, `curl`, `jq`, `unzip`, and
+`shasum`. After
 cloning, fetch the large checked-in release objects before working with
 generated browser files:
 
@@ -66,7 +67,7 @@ Run the checks that cover the area you changed. For a full browser-port change,
 use this order:
 
 ```sh
-for profile in 1.21.11 26.2; do
+for profile in 26.2 26.3; do
   GAIUS_VERSION_PROFILE_PATH="versions/${profile}.json" \
     bash port/scripts/build-version-release.sh "$profile"
   GAIUS_VERSION_PROFILE_PATH="versions/${profile}.json" \
@@ -77,10 +78,13 @@ done
 git diff --check
 ```
 
-The Minecraft `26.3` profile is in development and is not released yet. Until
-its TeaVM client links, check a `26.3` change with the overlay build, the
-javac-only compile of its source set, and quick-check's `26.3` domain modules
-(CI's `version-profiles` job runs these and the `26.3` patcher smokes):
+The `26.3` release build also needs the WebAssembly shader toolchain: set
+`GAIUS_EMSDK` (an emsdk checkout with the pinned emscripten version) or
+`GAIUS_SHADER_TOOLCHAIN_PREBUILT` (a directory with the four pinned modules from
+an earlier build); see `docs/releasing.md`. For a quicker `26.3` check without
+a full TeaVM link, run the overlay build, the javac-only compile of its source
+set, and quick-check's `26.3` domain modules (CI's `version-profiles` job runs
+these and the `26.3` patcher smokes):
 
 ```sh
 export GAIUS_VERSION_PROFILE_PATH=versions/26.3.json
@@ -119,7 +123,7 @@ check as passing unless it was actually run. For release-sized files, confirm
 the checksum of each artifact with:
 
 ```sh
-for profile in 1.21.11 26.2; do
+for profile in 26.2 26.3; do
   shasum -a 256 "port/web/dist/${profile}/Gaius.html"
 done
 ```

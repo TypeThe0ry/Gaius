@@ -45,31 +45,6 @@ done
 These probes check STATUS, target attestation, and tunnel release, not LOGIN
 or PLAY. Keep their actual scope in release notes.
 
-The final `v0.1.0` prepare gate accepts independent multiplayer targets for
-each compiled profile while keeping one audited RelayNode. Defaults remain the
-public probe above; override only when the saved Chrome/CDP evidence was
-captured against different profile-specific servers:
-
-```powershell
-./tools/prepare-final-release-v0.1.0.ps1 `
-  -Singleplayer12111Evidence artifacts/file-entry-1.21.11.json `
-  -Singleplayer262Evidence artifacts/file-entry-26.2.json `
-  -Multiplayer12111Evidence artifacts/join-terrain-1.21.11.json `
-  -Multiplayer262Evidence artifacts/join-terrain-26.2.json `
-  -Multiplayer12111Target 'legacy.example:25565' `
-  -Multiplayer262Target 'modern.example:25565' `
-  -PagesDefaultTarget 'example.invalid:25565'
-```
-
-The two multiplayer targets are bound into each evidence declaration and into
-`release.manifest.json` under `relay.targets`. They are independent from the
-public launcher defaults under `pages.defaultTarget` and
-`pages.defaultTargets`; `relay.target` is retained only as an alias for the
-home-page default. Publish and fresh-download gates revalidate both sets of
-bindings. The Pages CDP gate checks the displayed default on the home and each
-profile page, then injects the matching multiplayer evidence target when it
-verifies each release link.
-
 From a clean source checkout, build each supported Minecraft profile in its
 own state and output roots. The wrapper never changes `port/config.json` and
 does not reuse the legacy shared `port/target`, `port/work/overlays`, or
@@ -167,32 +142,6 @@ source port/scripts/version-profile.sh
 done > SHA256SUMS)
 ```
 
-The `v0.1.0` publisher below is **deprecated** since 0.3.0: the Pages workflow
-now publishes exactly `Gaius-26.2.html` and `Gaius-26.3.html`, so its
-exact-eight asset gate and Pages dispatch no longer match. The script refuses
-to run unless `GAIUS_ALLOW_LEGACY_V010_PUBLISHER=1` is set; use
-`tools/build-and-publish-prerelease.ps1` for current releases. Kept for the
-record of how `v0.1.0` was published (do not recreate, force-update, or push
-that tag):
-
-```powershell
-./tools/publish-final-release-v0.1.0.ps1 `
-  -Multiplayer12111EvidencePath artifacts/join-terrain-1.21.11.json `
-  -Multiplayer262EvidencePath artifacts/join-terrain-26.2.json
-
-./tools/publish-final-release-v0.1.0.ps1 `
-  -Multiplayer12111EvidencePath artifacts/join-terrain-1.21.11.json `
-  -Multiplayer262EvidencePath artifacts/join-terrain-26.2.json `
-  -ExecuteUpload
-```
-
-The publisher requires a clean tracked `main`, `origin/main == HEAD`, no open
-pull requests or issues, an unchanged local/remote tag object, schema-v4
-manifest provenance, and the exact eight assets. It clobbers the eight named
-release assets, removes extras, performs a fresh download verification, then
-dispatches and verifies the uniquely-bound Pages run. Untracked local evidence
-and build output are permitted and remain outside the source provenance check.
-
 For a genuinely new version only, create a new annotated tag after all gates
 pass. Never repoint an existing published tag.
 
@@ -229,8 +178,7 @@ gh workflow run pages.yml --ref main -f release_token="manual-$(date +%s)" -f re
 The workflow runs only on dispatch and does not check out the repository at
 all (so it fetches no Git LFS objects): nothing from the repository is
 published, and pushes to `main` (including `docs/**` and `relay-nodes.json`)
-never redeploy Pages. The v0.1.0 publisher dispatches it with
-`release_tag` set to the tag it has just published.
+never redeploy Pages.
 
 Before uploading, the workflow downloads that release's `SHA256SUMS` into
 `$RUNNER_TEMP`, outside the published artifact, and checks each client with
@@ -247,16 +195,14 @@ Check the live site with `node tools/verify-github-pages-cdp.mjs`. Set
 `GAIUS_PAGES_EXPECTED_SHA256_262` and `GAIUS_PAGES_EXPECTED_SHA256_263` to the
 release's `Gaius-26.2.html` and `Gaius-26.3.html` sha256 values to make the
 verifier hash the live bytes and fail on a mismatch (`GAIUS_PAGES_EXPECTED_SHA256`
-is still accepted as the 26.2 value, which is what the v0.1.0 publisher sets);
+is still accepted as the 26.2 value);
 the live sha256 is recorded in the report either way. Because a fresh deploy can take minutes
 to reach every CDN edge (Pages responses carry `max-age=600`), a mismatch is
 re-fetched from the same canonical URL players load, under bounded backoff for
 up to `GAIUS_PAGES_SHA256_RETRY_MS` (default 600000, 10 minutes; `0` disables
 retries), until the edge serves the release bytes. Every attempt's status, byte
 count and sha256 (or fetch error) is recorded under
-`live["<file>"].attempts`. The v0.1.0 publisher sets the expected hash
-to the staged client's hash and caps the retry window at its
-`-PagesVerifierTimeoutSeconds` minus two minutes. By hand, extract both records
+`live["<file>"].attempts`. Extract both records
 and refuse to run without them, since an empty value would silently skip that
 page's hash check:
 

@@ -1,7 +1,9 @@
 # Minecraft TeaVM browser port
 
-This directory is the active Gaius implementation. The primary profile is
-Minecraft `26.2`; the `1.21.11` profile remains supported for compatibility.
+This directory is the active Gaius implementation. The released profiles are
+Minecraft `26.2` and `26.3`. The `1.21.11` profile is no longer built or
+released; its profile file only remains for CI jobs and the Paper plugin, which
+still target JDK 21.
 
 ## Rules
 
@@ -15,29 +17,29 @@ Minecraft `26.2`; the `1.21.11` profile remains supported for compatibility.
 
 ## Stage A: acquire and remap
 
-Requirements: JDK 21 for `1.21.11`, JDK 25 or newer for `26.2`, plus `curl`,
-`jq`, `unzip`, and `shasum`.
+Requirements: JDK 25 or newer for `26.2` and `26.3`, plus `curl`, `jq`,
+`unzip`, and `shasum`.
 
 ```sh
 ./port/scripts/fetch-version.sh
 ./port/scripts/remap-client.sh
 ```
 
-Outputs are profile-scoped (the example below selects `1.21.11`):
+Outputs are profile-scoped (the example below selects `26.3`):
 
 ```text
-port/work/1.21.11/client-obfuscated.jar
-port/work/1.21.11/client-mappings.txt
-port/work/1.21.11/client-named.jar
-port/work/1.21.11/libraries/
-port/work/1.21.11/classpath.txt
+port/work/26.3/client-obfuscated.jar
+port/work/26.3/client-mappings.txt
+port/work/26.3/client-named.jar
+port/work/26.3/libraries/
+port/work/26.3/classpath.txt
 ```
 
-Select the profile explicitly before acquiring inputs for another version:
+Select the profile explicitly before acquiring inputs for each version:
 
 ```sh
-GAIUS_VERSION_PROFILE_PATH=versions/26.2.json ./port/scripts/fetch-version.sh
-GAIUS_VERSION_PROFILE_PATH=versions/26.2.json ./port/scripts/remap-client.sh
+GAIUS_VERSION_PROFILE_PATH=versions/26.3.json ./port/scripts/fetch-version.sh
+GAIUS_VERSION_PROFILE_PATH=versions/26.3.json ./port/scripts/remap-client.sh
 ```
 
 `client-named.jar` is the actual official client bytecode remapped with Mojang's
