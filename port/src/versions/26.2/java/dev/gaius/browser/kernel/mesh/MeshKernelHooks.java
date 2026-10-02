@@ -1,0 +1,498 @@
+package dev.gaius.browser.kernel.mesh;
+
+import com.mojang.blaze3d.vertex.ByteBufferBuilder;
+import com.mojang.blaze3d.vertex.MeshData;
+import com.mojang.blaze3d.vertex.VertexSorting;
+import com.mojang.blaze3d.IndexType;
+import com.mojang.blaze3d.PrimitiveTopology;
+import com.mojang.blaze3d.vertex.VertexFormat;
+import dev.gaius.browser.render.BrowserMeshInstall;
+import dev.gaius.browser.render.BrowserMeshInstallQueue;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.renderer.SectionBufferBuilderPack;
+import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
+import net.minecraft.client.renderer.chunk.RenderSectionRegion;
+import net.minecraft.client.renderer.chunk.SectionCompiler;
+import net.minecraft.client.renderer.chunk.SectionRenderDispatcher;
+import net.minecraft.client.renderer.chunk.TranslucencyPointOfView;
+import net.minecraft.client.renderer.chunk.VisibilitySet;
+import net.minecraft.core.Direction;
+import net.minecraft.core.SectionPos;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.phys.Vec3;
+import org.lwjgl.system.BrowserMemory;
+import org.teavm.jso.JSObject;
+
+/**
+ * Section compiles through the Rust mesher kernel (26.2 copy; 26.3 differs only in the render
+ * API imports). {@code dev.gaius.tools.kernel.MeshKernelPatches} wires two calls into
+ * {@code SectionRenderDispatcher.RenderSection.CompileTask}:
+ *
+ * <ol>
+ *   <li>{@link #beforeCompile} at the start of {@code doTask}. When the kernel is ready and the
+ *       model table of the dispatcher's SectionCompiler is exported, it snapshots the region
+ *       ({@link SectionSnapshot}), submits a mesh job and returns true; {@code doTask} then
+ *       returns SUCCESSFUL without compiling, and the section stays pending in
+ *       {@link BrowserMeshInstallQueue}. Otherwise vanilla {@code doTask} runs as before.</li>
+ *   <li>When the job finishes, {@link #drainResults} hands it to the install queue; its install
+ *       step (once per frame, within BrowserRenderScheduler's install budget) re-opens the task
+ *       and schedules it again on the dispatcher. That second {@code doTask} is the vanilla one
+ *       with its {@code SectionCompiler.compile} call routed through {@link #compile}, which
+ *       returns the kernel's meshes as vanilla {@code SectionCompiler.Results}: the vertex bytes
+ *       are copied straight into the pack's layer buffers and the translucent index buffer is
+ *       written in the kernel's sort order. Everything after compile (CompiledSectionMesh,
+ *       uber buffer upload, the latest-mesh guard, upload retries) is the vanilla path.</li>
+ * </ol>
+ *
+ * <p>Stale results are dropped: the install queue checks the request sequence and the level and
+ * resource epochs, and a task that vanilla cancelled (re-dirtied, reset, moved) never installs.
+ * A job the kernel refused (a state it cannot express), a failed job or a disabled kernel sends
+ * the task through the vanilla compiler instead.</p>
+ */
+public final class MeshKernelHooks {
+    /** The kernel result was consumed, or vanilla compiled the task. */
+    static final Object DONE = new Object();
+    /** Compile this task with the vanilla compiler. */
+    static final Object VANILLA = new Object();
+
+    private static final int VANILLA_VERTEX_BYTES = 28;
+    private static final int NEARBY_BLOCKS = 32;
+    private static final long EXPORT_SLICE_NANOS = 4_000_000L;
+    private static final long EXPORT_GAP_NANOS = 12_000_000L;
+    private static final ChunkSectionLayer[] LAYERS = {
+        ChunkSectionLayer.SOLID, ChunkSectionLayer.CUTOUT, ChunkSectionLayer.TRANSLUCENT};
+    private static final Direction[] DIRECTIONS = Direction.values();
+
+    private static final MeshJobBuffers BUFFERS = new MeshJobBuffers();
+    private static final HashMap<Integer, InFlight> IN_FLIGHT = new HashMap<>();
+    private static int nextTicket = 1;
+    private static boolean drainerRegistered;
+    private static MeshModelTable table;
+    private static ModelTableExporter exporter;
+    private static Object failedModels;
+    private static int nextEpoch = 1;
+    private static long nextExportStepNanos;
+
+    private MeshKernelHooks() {
+    }
+
+    /** One submitted job. */
+    static final class InFlight {
+        final MeshKernelAccess.Task task;
+        final SectionRenderDispatcher.RenderSection section;
+        final long node;
+        final int requestSeq;
+        final int levelEpoch;
+        final int resourceEpoch;
+        final List<BlockEntity> blockEntities;
+        /** Point of view of the camera the kernel sorted the translucent quads for. */
+        final TranslucencyPointOfView pointOfView;
+
+        InFlight(MeshKernelAccess.Task task, SectionRenderDispatcher.RenderSection section, long node,
+                int requestSeq, List<BlockEntity> blockEntities, Vec3 camera) {
+            this.task = task;
+            this.section = section;
+            this.node = node;
+            this.requestSeq = requestSeq;
+            this.levelEpoch = BrowserMeshInstallQueue.levelEpoch();
+            this.resourceEpoch = BrowserMeshInstallQueue.resourceEpoch();
+            this.blockEntities = blockEntities;
+            this.pointOfView = TranslucencyPointOfView.of(camera, node);
+        }
+
+        boolean alive() {
+            return task.gaius$meshKernelState() == this && !task.gaius$meshKernelCancelled()
+                    && section.getSectionNode() == node;
+        }
+    }
+
+    /** A meshed result waiting for the task's second run. */
+    static final class Ready {
+        final InFlight job;
+        final JSObject record;
+        /** Camera of the second doTask run (the one vanilla sorts and records its point of view for). */
+        Vec3 runCamera;
+
+        Ready(InFlight job, JSObject record) {
+            this.job = job;
+            this.record = record;
+        }
+    }
+
+    /**
+     * Start of {@code CompileTask.doTask}: true when the section went to the kernel (doTask then
+     * returns SUCCESSFUL), false to run the vanilla doTask.
+     */
+    public static boolean beforeCompile(Object taskObject, SectionCompiler compiler, Vec3 camera) {
+        MeshKernelAccess.Task task = (MeshKernelAccess.Task) taskObject;
+        Object state = task.gaius$meshKernelState();
+        if (state instanceof Ready ready) {
+            ready.runCamera = camera;
+            return false;
+        }
+        if (state != null || compiler == null || camera == null
+                || task.gaius$meshKernelCancelled() || !MeshKernelBridge.ready()) {
+            return false;
+        }
+        if (!drainerRegistered) {
+            drainerRegistered = true;
+            MeshKernelBridge.setDrainer(MeshKernelHooks::drainResults);
+        }
+        try {
+            drainResults();
+            if (Minecraft.getInstance().options.biomeBlendRadius().get() != 0) {
+                // The kernel tints with blend radius 0 only.
+                return false;
+            }
+            MeshModelTable current = currentTable(compiler);
+            if (current == null) {
+                return false;
+            }
+            return submit(task, compiler, camera, current);
+        } catch (RuntimeException error) {
+            MeshKernelBridge.noteFailure("snapshot: " + error);
+            return false;
+        }
+    }
+
+    private static boolean submit(MeshKernelAccess.Task task, SectionCompiler compiler, Vec3 camera,
+            MeshModelTable current) {
+        long start = System.nanoTime();
+        SectionRenderDispatcher.RenderSection section = task.gaius$meshSection();
+        RenderSectionRegion region = task.gaius$meshRegion();
+        if (section == null || region == null) {
+            return false;
+        }
+        long node = section.getSectionNode();
+        List<BlockEntity> blockEntities = new ArrayList<>();
+        MeshJobBuffers b = BUFFERS;
+        if (!SectionSnapshot.capture(b, region, node, current, camera, blockEntities)) {
+            return false;
+        }
+        MeshKernelAccess.Compiler options = (MeshKernelAccess.Compiler) (Object) compiler;
+        int sx = SectionPos.x(node);
+        int sy = SectionPos.y(node);
+        int sz = SectionPos.z(node);
+        double cx = (sx << 4) + 8.0 - camera.x;
+        double cy = (sy << 4) + 8.0 - camera.y;
+        double cz = (sz << 4) + 8.0 - camera.z;
+        int distance = (int) Math.min(1.0e6, Math.sqrt(cx * cx + cy * cy + cz * cz));
+        boolean recompile = ((SectionRenderDispatcher.RenderSection.SectionTask) (Object) task).isRecompile();
+        int requestSeq = BrowserMeshInstallQueue.beginRequest(node);
+        int ticket = nextTicket++;
+        if (nextTicket == Integer.MAX_VALUE) {
+            nextTicket = 1;
+        }
+        int[] h = b.header;
+        h[MeshKernelBridge.H_TICKET] = ticket;
+        h[MeshKernelBridge.H_EPOCH] = current.epoch;
+        h[MeshKernelBridge.H_WIDE] = b.wide ? 1 : 0;
+        h[MeshKernelBridge.H_FLAGS] = (options.gaius$ambientOcclusion() ? MeshKernelBridge.FLAG_AO : 0)
+                | (options.gaius$cutoutLeaves() ? MeshKernelBridge.FLAG_CUTOUT_LEAVES : 0)
+                | (recompile && distance <= NEARBY_BLOCKS ? MeshKernelBridge.FLAG_NEARBY : 0);
+        h[MeshKernelBridge.H_SX] = sx;
+        h[MeshKernelBridge.H_SY] = sy;
+        h[MeshKernelBridge.H_SZ] = sz;
+        h[MeshKernelBridge.H_REQUEST_SEQ] = requestSeq;
+        h[MeshKernelBridge.H_NON_AIR] = SectionSnapshot.lastNonAir;
+        h[MeshKernelBridge.H_DISTANCE] = distance;
+        boolean sent;
+        try {
+            sent = MeshKernelBridge.submit(h, b.ids16, b.ids32, b.light, b.quarts, b.palette, b.swamp, b.floats);
+        } catch (RuntimeException error) {
+            BrowserMeshInstallQueue.cancel(node, requestSeq);
+            throw error;
+        }
+        if (!sent) {
+            BrowserMeshInstallQueue.cancel(node, requestSeq);
+            return false;
+        }
+        InFlight job = new InFlight(task, section, node, requestSeq, blockEntities, camera);
+        IN_FLIGHT.put(ticket, job);
+        task.gaius$setMeshKernelState(job);
+        MeshKernelBridge.noteSnapshotNanos(System.nanoTime() - start);
+        return true;
+    }
+
+    /**
+     * Replacement for the {@code SectionCompiler.compile} call inside vanilla {@code doTask}: the
+     * kernel's meshes when this task carries them, the vanilla compiler otherwise.
+     */
+    public static SectionCompiler.Results compile(SectionCompiler compiler, SectionPos pos,
+            RenderSectionRegion region, VertexSorting sorting, SectionBufferBuilderPack pack, Object taskObject) {
+        MeshKernelAccess.Task task = (MeshKernelAccess.Task) taskObject;
+        Object state = task.gaius$meshKernelState();
+        if (state instanceof Ready ready) {
+            task.gaius$setMeshKernelState(DONE);
+            long start = System.nanoTime();
+            try {
+                SectionCompiler.Results results = buildResults(ready, pack, sorting);
+                MeshKernelBridge.noteInstallNanos(System.nanoTime() - start);
+                return results;
+            } catch (RuntimeException error) {
+                MeshKernelBridge.noteFailure("install: " + error);
+            }
+        } else if (state != null && state != DONE) {
+            task.gaius$setMeshKernelState(DONE);
+        }
+        return compiler.compile(pos, region, sorting, pack);
+    }
+
+    /** Moves finished kernel jobs into the install queue. */
+    public static void drainResults() {
+        JSObject record;
+        while ((record = MeshKernelBridge.poll()) != null) {
+            InFlight job = IN_FLIGHT.remove(MeshKernelBridge.ticket(record));
+            if (job == null) {
+                continue;
+            }
+            int status = MeshKernelBridge.status(record);
+            int bytes = 0;
+            if (status == MeshKernelBridge.STATUS_MESHED) {
+                int quads = MeshKernelBridge.quadCount(record, 0) + MeshKernelBridge.quadCount(record, 1)
+                        + MeshKernelBridge.quadCount(record, 2);
+                bytes = quads * 4 * VANILLA_VERTEX_BYTES;
+                MeshKernelBridge.noteMeshed();
+            } else if (status == MeshKernelBridge.STATUS_FAILED) {
+                String code = MeshKernelBridge.code(record);
+                if (!schedulingOutcome(code)) {
+                    MeshKernelBridge.noteFailure(code + ": " + MeshKernelBridge.message(record));
+                }
+            }
+            BrowserMeshInstallQueue.enqueue(new Install(job, record, status, bytes));
+        }
+    }
+
+    private static boolean schedulingOutcome(String code) {
+        return "superseded".equals(code) || "stale".equals(code) || "cancelled".equals(code)
+                || "backpressure".equals(code);
+    }
+
+    /** The model table of {@code compiler}'s resources, exporting it in slices; null until done. */
+    private static MeshModelTable currentTable(SectionCompiler compiler) {
+        MeshKernelAccess.Compiler access = (MeshKernelAccess.Compiler) (Object) compiler;
+        var models = access.gaius$blockModelSet();
+        var fluids = access.gaius$fluidModelSet();
+        var colors = access.gaius$blockColors();
+        if (models == null || fluids == null || colors == null) {
+            return null;
+        }
+        MeshModelTable current = table;
+        if (current != null && current.matches(models, fluids, colors)) {
+            if (!MeshKernelBridge.hasTable(current.epoch)
+                    && !MeshKernelBridge.setTable(current.bytes, current.bytes.length, current.epoch)) {
+                return null;
+            }
+            return current;
+        }
+        if (failedModels == models) {
+            return null;
+        }
+        if (exporter == null || !exporter.matches(models, fluids, colors)) {
+            table = null;
+            exporter = new ModelTableExporter(models, fluids, colors, nextEpoch++);
+        }
+        long now = System.nanoTime();
+        if (now < nextExportStepNanos) {
+            return null;
+        }
+        try {
+            boolean done = exporter.step(now + EXPORT_SLICE_NANOS);
+            nextExportStepNanos = System.nanoTime() + EXPORT_GAP_NANOS;
+            if (!done) {
+                return null;
+            }
+            current = exporter.finish();
+        } catch (RuntimeException error) {
+            failedModels = models;
+            exporter = null;
+            System.out.println("[mesh-kernel] model table export failed, sections use the vanilla compiler: "
+                    + error);
+            return null;
+        }
+        exporter = null;
+        table = current;
+        if (!MeshKernelBridge.setTable(current.bytes, current.bytes.length, current.epoch)) {
+            return null;
+        }
+        return current;
+    }
+
+    // --- results ----------------------------------------------------------------------------------
+
+    private static SectionCompiler.Results buildResults(Ready ready, SectionBufferBuilderPack pack,
+            VertexSorting sorting) {
+        JSObject record = ready.record;
+        SectionCompiler.Results results = new SectionCompiler.Results();
+        MeshData[] built = new MeshData[LAYERS.length];
+        try {
+            for (int layer = 0; layer < LAYERS.length; layer++) {
+                int quads = MeshKernelBridge.quadCount(record, layer);
+                if (quads <= 0) {
+                    continue;
+                }
+                ChunkSectionLayer sectionLayer = LAYERS[layer];
+                VertexFormat format = sectionLayer.vertexFormat();
+                if (format.getVertexSize() != VANILLA_VERTEX_BYTES) {
+                    throw new IllegalStateException("terrain vertex size " + format.getVertexSize());
+                }
+                int vertices = quads * 4;
+                int bytes = vertices * VANILLA_VERTEX_BYTES;
+                ByteBufferBuilder buffer = pack.buffer(sectionLayer);
+                long pointer = buffer.reserve(bytes);
+                copyVertices(record, layer, pointer, bytes);
+                ByteBufferBuilder.Result vertexBuffer = buffer.build();
+                if (vertexBuffer == null) {
+                    throw new IllegalStateException("empty layer buffer");
+                }
+                MeshData mesh = new MeshData(vertexBuffer, new MeshData.DrawState(format, vertices,
+                        PrimitiveTopology.QUADS.indexCount(vertices), PrimitiveTopology.QUADS,
+                        IndexType.least(vertices)));
+                built[layer] = mesh;
+                if (sectionLayer == ChunkSectionLayer.TRANSLUCENT) {
+                    results.transparencyState = mesh.sortQuads(buffer, kernelOrder(ready, quads, sorting));
+                }
+                results.renderedLayers.put(sectionLayer, mesh);
+            }
+        } catch (RuntimeException error) {
+            for (MeshData mesh : built) {
+                if (mesh != null) {
+                    mesh.close();
+                }
+            }
+            throw error;
+        }
+        results.blockEntities.addAll(ready.job.blockEntities);
+        results.visibilitySet = visibility(MeshKernelBridge.visibilityLo(record),
+                MeshKernelBridge.visibilityHi(record));
+        return results;
+    }
+
+    /** Writes the kernel's vertex bytes for {@code layer} at a ByteBufferBuilder pointer. */
+    private static void copyVertices(JSObject record, int layer, long pointer, int bytes) {
+        byte[] data = null;
+        int offset = 0;
+        try {
+            data = BrowserMemory.data(pointer);
+            offset = BrowserMemory.dataOffset(pointer);
+        } catch (RuntimeException notArrayBacked) {
+            data = null;
+        }
+        if (data != null) {
+            if (MeshKernelBridge.copyVertices(record, layer, data, offset) != bytes) {
+                throw new IllegalStateException("kernel vertex bytes do not match the quad count");
+            }
+            return;
+        }
+        byte[] staging = new byte[bytes];
+        if (MeshKernelBridge.copyVertices(record, layer, staging, 0) != bytes) {
+            throw new IllegalStateException("kernel vertex bytes do not match the quad count");
+        }
+        ByteBuffer target = BrowserMemory.byteBuffer(pointer, bytes);
+        target.put(staging);
+    }
+
+    /**
+     * The kernel's back-to-front quad order as a VertexSorting, or {@code fallback} (vanilla's
+     * sorting for this run's camera) when the camera moved to another translucency point of view
+     * since the job was submitted; vanilla resorts only on such a change, so within one point of
+     * view the kernel's order is as good as the one vanilla would compute now.
+     */
+    private static VertexSorting kernelOrder(Ready ready, int quads, VertexSorting fallback) {
+        if (ready.runCamera == null
+                || !TranslucencyPointOfView.of(ready.runCamera, ready.job.node).equals(ready.job.pointOfView)) {
+            return fallback;
+        }
+        int[] order = new int[quads];
+        if (MeshKernelBridge.copyTranslucentOrder(ready.record, order) != quads) {
+            return fallback;
+        }
+        return centroids -> centroids.size() == quads ? order : fallback.sort(centroids);
+    }
+
+    private static VisibilitySet visibility(int lo, int hi) {
+        VisibilitySet set = new VisibilitySet();
+        for (int bit = 0; bit < 36; bit++) {
+            boolean visible = bit < 32 ? ((lo >>> bit) & 1) != 0 : ((hi >>> (bit - 32)) & 1) != 0;
+            if (visible) {
+                set.set(DIRECTIONS[bit % 6], DIRECTIONS[bit / 6], true);
+            }
+        }
+        return set;
+    }
+
+    // --- install ----------------------------------------------------------------------------------
+
+    /** A finished job in BrowserMeshInstallQueue; installing it schedules the task's second run. */
+    static final class Install implements BrowserMeshInstall {
+        private final InFlight job;
+        private final int status;
+        private final int bytes;
+        private JSObject record;
+
+        Install(InFlight job, JSObject record, int status, int bytes) {
+            this.job = job;
+            this.record = record;
+            this.status = status;
+            this.bytes = bytes;
+        }
+
+        @Override
+        public long sectionNode() {
+            return job.node;
+        }
+
+        @Override
+        public int requestSeq() {
+            return job.requestSeq;
+        }
+
+        @Override
+        public int levelEpoch() {
+            return job.levelEpoch;
+        }
+
+        @Override
+        public int resourceEpoch() {
+            return job.resourceEpoch;
+        }
+
+        @Override
+        public int byteSize() {
+            return bytes;
+        }
+
+        @Override
+        public boolean install() {
+            JSObject result = record;
+            record = null;
+            if (!job.alive()) {
+                return true;
+            }
+            if (status == MeshKernelBridge.STATUS_MESHED && result != null) {
+                job.task.gaius$setMeshKernelState(new Ready(job, result));
+            } else {
+                job.task.gaius$setMeshKernelState(VANILLA);
+                MeshKernelBridge.noteVanillaFallback();
+            }
+            job.task.gaius$requeueForMeshKernel();
+            return true;
+        }
+
+        @Override
+        public void discard(int reason) {
+            record = null;
+            if (job.alive()) {
+                // The queue no longer wants this result (resources or level changed under a task
+                // vanilla did not cancel): compile the task the vanilla way instead.
+                job.task.gaius$setMeshKernelState(VANILLA);
+                MeshKernelBridge.noteVanillaFallback();
+                job.task.gaius$requeueForMeshKernel();
+            }
+        }
+    }
+}

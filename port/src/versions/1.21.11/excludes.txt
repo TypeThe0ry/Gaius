@@ -1,0 +1,8 @@
+# Shared port/src/main/java sources that are not compiled for Minecraft 1.21.11.
+# The light kernel bridge mirrors the 26.2+ light engine (BlockStateBase.getLightDampening,
+# record ChunkPos); dev.gaius.tools.kernel.LightKernelPatches skips 1.21.11, so nothing
+# references these classes there.  LightKernelHost has no Minecraft types and stays.
+dev/gaius/browser/kernel/light/BrowserLightEngineHooks.java
+dev/gaius/browser/kernel/light/BrowserLightKernel.java
+dev/gaius/browser/kernel/light/BrowserLightStateTable.java
+net/minecraft/world/level/lighting/GaiusLightColumnAccess.java
