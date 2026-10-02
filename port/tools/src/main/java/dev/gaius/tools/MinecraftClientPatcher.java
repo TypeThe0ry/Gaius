@@ -331,6 +331,13 @@ public final class MinecraftClientPatcher {
         // from Minecraft#getOverlay so reload exceptions still reach vanilla.
         PatchRegistry.run("MinecraftClientPatcher.patchLoadingOverlayBrowserForeground", () -> patchLoadingOverlayBrowserForeground(args[0], root.resolve(
                 "net/minecraft/client/gui/screens/LoadingOverlay.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchJoinMultiplayerScreenRelays", () -> patchJoinMultiplayerScreenRelays(args[0], root.resolve(
+                "net/minecraft/client/gui/screens/multiplayer/JoinMultiplayerScreen.class")));
+        // Startup: copy image rectangles row by row and memoize block face sturdiness.
+        PatchRegistry.run("MinecraftClientPatcher.patchNativeImageBulkCopyRect", () -> patchNativeImageBulkCopyRect(args[0], root.resolve(
+                "com/mojang/blaze3d/platform/NativeImage.class")));
+        PatchRegistry.run("MinecraftClientPatcher.patchBlockCacheSupportMemo", () -> patchBlockCacheSupportMemo(args[0], root.resolve(
+                "net/minecraft/world/level/block/state/BlockBehaviour$BlockStateBase$Cache.class")));
         PatchRegistry.run("MinecraftClientPatcher.patchLevelLoadingScreenBrowserFastProgress", () -> patchLevelLoadingScreenBrowserFastProgress(args[0], root.resolve(
                 "net/minecraft/client/gui/screens/LevelLoadingScreen.class")));
         PatchRegistry.run("MinecraftClientPatcher.patchTitleScreenBrowserFastMenus", () -> patchTitleScreenBrowserFastMenus(args[0], root.resolve(
@@ -1524,6 +1531,145 @@ public final class MinecraftClientPatcher {
      * profiles have one RETURN in {@code init()V}, a {@code tick()V} and the
      * {@code extractRenderState} GUI that selects these hooks.
      */
+    /**
+     * Adds the "Relays" button (BrowserRelaysScreen) to the top-right corner of the vanilla
+     * multiplayer screen, like the title screen's Edit Profile button. Profiles whose client has
+     * no named JoinMultiplayerScreen (the legacy mapped 1.21.11 profile) are left unchanged.
+     */
+    private static void patchJoinMultiplayerScreenRelays(String jar, Path output) throws IOException {
+        String owner = "net/minecraft/client/gui/screens/multiplayer/JoinMultiplayerScreen";
+        boolean present;
+        try (ZipFile input = new ZipFile(jar)) {
+            present = input.getEntry(owner + ".class") != null;
+        }
+        if (!present) {
+            System.out.println("JoinMultiplayerScreen relays button: no named class in this profile; skipped");
+            return;
+        }
+        ClassNode node = Files.exists(output) ? read(output) : read(jar, owner + ".class");
+        MethodNode init = find(node, "init", "()V");
+        int returns = 0;
+        for (AbstractInsnNode instruction : init.instructions.toArray()) {
+            if (instruction.getOpcode() != Opcodes.RETURN) {
+                continue;
+            }
+            InsnList button = new InsnList();
+            button.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            button.add(new VarInsnNode(Opcodes.ALOAD, 0));
+            button.add(new MethodInsnNode(
+                    Opcodes.INVOKESTATIC,
+                    "dev/gaius/browser/BrowserRelaysScreen",
+                    "joinButton",
+                    "(Lnet/minecraft/client/gui/screens/Screen;)"
+                            + "Lnet/minecraft/client/gui/components/Button;",
+                    false));
+            button.add(new MethodInsnNode(
+                    Opcodes.INVOKEVIRTUAL,
+                    owner,
+                    "addRenderableWidget",
+                    "(Lnet/minecraft/client/gui/components/events/GuiEventListener;)"
+                            + "Lnet/minecraft/client/gui/components/events/GuiEventListener;",
+                    false));
+            button.add(new InsnNode(Opcodes.POP));
+            init.instructions.insertBefore(instruction, button);
+            returns++;
+        }
+        if (returns != 1) {
+            throw new IllegalStateException("JoinMultiplayerScreen.init return shape changed: " + returns);
+        }
+        init.maxStack = Math.max(init.maxStack, 3);
+        writeComputeFrames(node, output);
+        System.out.println("Added the Relays button to JoinMultiplayerScreen");
+    }
+
+    private static boolean jarHasClass(String jar, String owner) throws IOException {
+        try (ZipFile input = new ZipFile(jar)) {
+            return input.getEntry(owner + ".class") != null;
+        }
+    }
+
+    /**
+     * Gives {@code NativeImage.copyRect(NativeImage, ...)} a row-copy fast path
+     * ({@code BrowserNativeImageCopy}): unflipped RGBA rectangles between two images are copied
+     * with one memCopy per row instead of a getPixel/setPixel pair per pixel. Any other call falls
+     * through to the vanilla loop.
+     */
+    private static void patchNativeImageBulkCopyRect(String jar, Path output) throws IOException {
+        String owner = "com/mojang/blaze3d/platform/NativeImage";
+        if (!jarHasClass(jar, owner)) {
+            System.out.println("NativeImage bulk copyRect: no named NativeImage in this profile; skipped");
+            return;
+        }
+        ClassNode node = Files.exists(output) ? read(output) : read(jar, owner + ".class");
+        String descriptor = "(L" + owner + ";IIIIIIZZ)V";
+        MethodNode copyRect = find(node, "copyRect", descriptor);
+        LabelNode vanilla = new LabelNode();
+        InsnList fast = new InsnList();
+        fast.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        fast.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        for (int local = 2; local <= 7; local++) {
+            fast.add(new VarInsnNode(Opcodes.ILOAD, local));
+        }
+        fast.add(new VarInsnNode(Opcodes.ILOAD, 8));
+        fast.add(new VarInsnNode(Opcodes.ILOAD, 9));
+        fast.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserNativeImageCopy",
+                "copyRect",
+                "(L" + owner + ";L" + owner + ";IIIIIIZZ)Z",
+                false));
+        fast.add(new JumpInsnNode(Opcodes.IFEQ, vanilla));
+        fast.add(new InsnNode(Opcodes.RETURN));
+        fast.add(vanilla);
+        copyRect.instructions.insert(fast);
+        writeComputeFrames(node, output);
+        System.out.println("Added the NativeImage.copyRect row-copy fast path");
+    }
+
+    /**
+     * Routes the face-sturdiness loop of {@code BlockStateBase.Cache.<init>} through
+     * {@code BrowserBlockSupportMemo}, which memoizes {@code SupportType.isSupporting} per block
+     * support shape. The call keeps its operands (type, state, level, pos, direction).
+     */
+    private static void patchBlockCacheSupportMemo(String jar, Path output) throws IOException {
+        String owner = "net/minecraft/world/level/block/state/BlockBehaviour$BlockStateBase$Cache";
+        if (!jarHasClass(jar, owner)) {
+            System.out.println("Block cache support memo: no named BlockStateBase.Cache in this profile; skipped");
+            return;
+        }
+        ClassNode node = Files.exists(output) ? read(output) : read(jar, owner + ".class");
+        String supportType = "net/minecraft/world/level/block/SupportType";
+        String descriptor = "(Lnet/minecraft/world/level/block/state/BlockState;"
+                + "Lnet/minecraft/world/level/BlockGetter;Lnet/minecraft/core/BlockPos;"
+                + "Lnet/minecraft/core/Direction;)Z";
+        int replaced = 0;
+        for (MethodNode method : node.methods) {
+            if (!method.name.equals("<init>")) {
+                continue;
+            }
+            for (AbstractInsnNode instruction : method.instructions.toArray()) {
+                if (instruction instanceof MethodInsnNode call
+                        && call.getOpcode() == Opcodes.INVOKEVIRTUAL
+                        && call.owner.equals(supportType)
+                        && call.name.equals("isSupporting")
+                        && call.desc.equals(descriptor)) {
+                    method.instructions.set(call, new MethodInsnNode(
+                            Opcodes.INVOKESTATIC,
+                            "dev/gaius/browser/BrowserBlockSupportMemo",
+                            "isSupporting",
+                            "(L" + supportType + ";" + descriptor.substring(1),
+                            false));
+                    replaced++;
+                }
+            }
+        }
+        if (replaced != 1) {
+            throw new IllegalStateException("BlockStateBase.Cache face-sturdiness call changed: " + replaced);
+        }
+        writeComputeFrames(node, output);
+        System.out.println("Memoized BlockStateBase.Cache face sturdiness per support shape");
+    }
+
     private static void addTitleScreenProfileHooks(ClassNode node) {
         String owner = "net/minecraft/client/gui/screens/TitleScreen";
         MethodNode init = find(node, "init", "()V");
@@ -12773,6 +12919,41 @@ public final class MinecraftClientPatcher {
             throw new IllegalStateException(
                     "LoadingOverlay foreground completion point changed: " + completions);
         }
+        // Publish the reload's actual progress every frame so the launcher boot screen can
+        // advance during the initial resource reload instead of holding one value.
+        MethodNode render = node.methods.stream()
+                .filter(method -> (method.name.equals("extractRenderState")
+                        || method.name.equals("render")) && method.desc.endsWith("IIF)V"))
+                .findFirst()
+                .orElse(null);
+        boolean hasReloadField = node.fields.stream().anyMatch(field -> field.name.equals("reload")
+                && field.desc.equals("Lnet/minecraft/server/packs/resources/ReloadInstance;"));
+        if (render == null || !hasReloadField) {
+            System.out.println("LoadingOverlay boot progress: no named render method/reload field"
+                    + " in this profile; skipped");
+            writeComputeFrames(node, output);
+            return;
+        }
+        InsnList publish = new InsnList();
+        publish.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        publish.add(new FieldInsnNode(
+                Opcodes.GETFIELD,
+                owner,
+                "reload",
+                "Lnet/minecraft/server/packs/resources/ReloadInstance;"));
+        publish.add(new MethodInsnNode(
+                Opcodes.INVOKEINTERFACE,
+                "net/minecraft/server/packs/resources/ReloadInstance",
+                "getActualProgress",
+                "()F",
+                true));
+        publish.add(new MethodInsnNode(
+                Opcodes.INVOKESTATIC,
+                "dev/gaius/browser/BrowserBootProgress",
+                "reloadProgress",
+                "(F)V",
+                false));
+        render.instructions.insert(publish);
         writeComputeFrames(node, output);
     }
 

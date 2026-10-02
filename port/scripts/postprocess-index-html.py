@@ -659,6 +659,37 @@ GAIUS_SHELL_SCRIPT = r'''  <script>
   </script>
 '''
 
+GAIUS_BOOT_ART_MARKER = 'data-gaius-boot-art="v1"'
+
+
+def apply_gaius_boot_art(text: str) -> str:
+    """Install the Minecraft-style boot screen art (port/web/launcher/boot-art.{css,js}).
+
+    Separate from apply_gaius_client_shell: the launcher template already carries the shell, so
+    that step returns early. The art is a self-contained style and script; existing pages keep
+    their boot flow and progress logic.
+    """
+    if GAIUS_BOOT_ART_MARKER in text:
+        return text
+    launcher = Path(__file__).resolve().parents[1] / "web" / "launcher"
+    css = (launcher / "boot-art.css").read_text(encoding="utf-8")
+    script = (launcher / "boot-art.js").read_text(encoding="utf-8")
+    if "</script" in script.lower() or "</style" in css.lower():
+        raise RuntimeError("boot art must not contain closing script or style tags")
+    text = replace_required(
+        text,
+        "</head>\n",
+        "  <style " + GAIUS_BOOT_ART_MARKER + ">\n" + css + "  </style>\n</head>\n",
+        "Gaius boot art CSS",
+    )
+    return replace_required(
+        text,
+        "</body>\n",
+        "  <script " + GAIUS_BOOT_ART_MARKER + ">\n" + script + "  </script>\n</body>\n",
+        "Gaius boot art script",
+    )
+
+
 def apply_gaius_client_shell(text: str) -> str:
     """Install the stable browser-client shell without changing game contracts."""
     if GAIUS_SHELL_MARKER in text:
@@ -3099,6 +3130,7 @@ def patch_index(
 
     text = patch_storage_persistence(text, selected_profile)
     text = apply_gaius_client_shell(text)
+    text = apply_gaius_boot_art(text)
     text = patch_release_version(text)
     text = patch_shader_toolchain_loader(text, classes_js, index, minecraft_version)
 
