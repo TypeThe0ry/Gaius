@@ -23,7 +23,140 @@ build_root="$(gaius_build_root "$root")"
 overlay_directory="$(gaius_overlay_directory "$root")"
 client="$overlay_directory/client-named-$version-gaius.jar"
 output="$(gaius_resolve_path "$root" "${GAIUS_POM:-$build_root/generated-pom.xml}")"
-main_class="${GAIUS_MAIN_CLASS:-net.minecraft.client.main.Main}"
+
+# TeaVM role configuration.  A role is one compiled artifact: the browser
+# client (classes.js) or the singleplayer server Worker
+# (singleplayer-server.js).  GAIUS_TEAVM_ROLE selects it; without it the role
+# follows GAIUS_MAIN_CLASS (the Worker main selects singleplayer-worker,
+# anything else, including smoke mains, the client).  The role's compiler
+# options are written below into the TeaVM plugin <properties>, where the
+# patched TeaVM core (TeaVMCoreBrowserPatcher, GaiusTeaVMOptions) reads them,
+# and where the release compiler profile attests them with the POM hash.  They
+# are no longer JVM system properties in MAVEN_OPTS.
+#
+# Each option is overridable per role and for every role, in this order:
+#   GAIUS_TEAVM_<CLIENT|WORKER>_<OPTION>, GAIUS_TEAVM_<OPTION>, role default.
+# Options:
+#   MAX_TOP_LEVEL_NAMES  TeaVM maxTopLevelNames.  Names past this budget become
+#                        properties of one scope object ("A.x"), which V8
+#                        keeps in dictionary mode, so every call of such a
+#                        method or read of such a static field is a hash
+#                        lookup (8.7 ns against 0.24 ns for a let binding in
+#                        the v0.4.0 micro-benchmark).  Names are allocated by
+#                        textual frequency, so the budget covers the most used
+#                        names first.  80000 is TeaVM's own default; the
+#                        client has about 290k names and the Worker about
+#                        150k.  A larger budget means more top-level lets in
+#                        the module function: V8 handled 300k in a synthetic
+#                        test, JavaScriptCore and SpiderMonkey limits were not
+#                        measured, which is why the default stays at TeaVM's
+#                        value instead of covering every name.  The old 10000
+#                        had no recorded reason.
+#   SYNC_CLINITS         class-initialization edges do not make callers async.
+#   SYNC_MONITORS        java.lang.Object monitor primitives are compiled
+#                        synchronously; a monitor held across a suspension
+#                        that another green thread waits for fails fast.
+#   ASYNC_BARRIER        comma-separated barrier groups (object, throwable,
+#                        map, collection, iterator, stringbuilder) or none;
+#                        see GaiusTeaVMOptions for the member methods.
+#   PIN_RUNTIME_NAMES    TeaVM runtime functions ($rt_*, Long_*) keep
+#                        top-level bindings past MAX_TOP_LEVEL_NAMES.
+#   STRIP_TELEMETRY      true drops the gaius-telemetry platform tag, so
+#                        @PlatformMarker("gaius-telemetry") checks compile to
+#                        false (build-teavm-release.sh sets it).
+teavm_role="${GAIUS_TEAVM_ROLE:-}"
+if [[ -z "$teavm_role" ]]; then
+  if [[ "${GAIUS_MAIN_CLASS:-}" == "dev.gaius.browser.BrowserIntegratedServerMain" ]]; then
+    teavm_role="singleplayer-worker"
+  else
+    teavm_role="client"
+  fi
+fi
+teavm_all_barrier_groups="object,throwable,map,collection,iterator,stringbuilder"
+case "$teavm_role" in
+  client)
+    teavm_role_key="CLIENT"
+    default_main_class="net.minecraft.client.main.Main"
+    default_max_top_level_names=80000
+    default_sync_clinits=true
+    default_sync_monitors=true
+    default_async_barrier="$teavm_all_barrier_groups"
+    default_pin_runtime_names=true
+    ;;
+  singleplayer-worker)
+    teavm_role_key="WORKER"
+    default_main_class="dev.gaius.browser.BrowserIntegratedServerMain"
+    default_max_top_level_names=80000
+    default_sync_clinits=true
+    default_sync_monitors=true
+    default_async_barrier="$teavm_all_barrier_groups"
+    default_pin_runtime_names=true
+    ;;
+  *)
+    echo "Invalid GAIUS_TEAVM_ROLE: $teavm_role (expected client or singleplayer-worker)" >&2
+    exit 1
+    ;;
+esac
+main_class="${GAIUS_MAIN_CLASS:-$default_main_class}"
+if [[ "$teavm_role" == "client" \
+      && "$main_class" == "dev.gaius.browser.BrowserIntegratedServerMain" ]] \
+    || [[ "$teavm_role" == "singleplayer-worker" \
+      && "$main_class" != "dev.gaius.browser.BrowserIntegratedServerMain" ]]; then
+  echo "GAIUS_TEAVM_ROLE=$teavm_role does not match main class $main_class" >&2
+  exit 1
+fi
+
+# teavm_role_option NAME DEFAULT: prints the role override, the shared
+# override or the default (see the table above).
+teavm_role_option() {
+  local role_variable="GAIUS_TEAVM_${teavm_role_key}_$1"
+  local shared_variable="GAIUS_TEAVM_$1"
+  if [[ -n "${!role_variable:-}" ]]; then
+    printf '%s\n' "${!role_variable}"
+  elif [[ -n "${!shared_variable:-}" ]]; then
+    printf '%s\n' "${!shared_variable}"
+  else
+    printf '%s\n' "$2"
+  fi
+}
+max_top_level_names="$(teavm_role_option MAX_TOP_LEVEL_NAMES "$default_max_top_level_names")"
+teavm_sync_clinits="$(teavm_role_option SYNC_CLINITS "$default_sync_clinits")"
+teavm_sync_monitors="$(teavm_role_option SYNC_MONITORS "$default_sync_monitors")"
+teavm_async_barrier="$(teavm_role_option ASYNC_BARRIER "$default_async_barrier")"
+teavm_pin_runtime_names="$(teavm_role_option PIN_RUNTIME_NAMES "$default_pin_runtime_names")"
+teavm_strip_telemetry="$(teavm_role_option STRIP_TELEMETRY false)"
+
+if [[ ! "$max_top_level_names" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Invalid TeaVM MAX_TOP_LEVEL_NAMES for $teavm_role: $max_top_level_names" >&2
+  exit 1
+fi
+for teavm_boolean in teavm_sync_clinits teavm_sync_monitors teavm_pin_runtime_names teavm_strip_telemetry; do
+  case "${!teavm_boolean}" in
+    true|false) ;;
+    *)
+      echo "Invalid boolean value for $teavm_boolean ($teavm_role): ${!teavm_boolean} (expected true or false)" >&2
+      exit 1
+      ;;
+  esac
+done
+if [[ "$teavm_async_barrier" != "none" ]]; then
+  IFS=',' read -r -a teavm_barrier_groups <<<"$teavm_async_barrier"
+  for teavm_barrier_group in "${teavm_barrier_groups[@]}"; do
+    case ",$teavm_all_barrier_groups," in
+      *",$teavm_barrier_group,"*) ;;
+      *)
+        echo "Invalid TeaVM ASYNC_BARRIER group for $teavm_role: '$teavm_barrier_group' (expected none or a list of $teavm_all_barrier_groups)" >&2
+        exit 1
+        ;;
+    esac
+  done
+fi
+if [[ "$teavm_strip_telemetry" == "true" ]]; then
+  teavm_telemetry=false
+else
+  teavm_telemetry=true
+fi
+
 if [[ -n "${GAIUS_TARGET_DIRECTORY:-}" ]]; then
   target_directory="$(gaius_resolve_path "$root" "$GAIUS_TARGET_DIRECTORY")"
 else
@@ -330,7 +463,37 @@ $compiler_source_excludes
               <shortFileNames>$short_file_names</shortFileNames>
               <assertionsRemoved>$assertions_removed</assertionsRemoved>
               <stopOnErrors>true</stopOnErrors>
-              <maxTopLevelNames>10000</maxTopLevelNames>
+              <maxTopLevelNames>$max_top_level_names</maxTopLevelNames>
+              <properties>
+                <property>
+                  <name>gaius.teavm.role</name>
+                  <value>$teavm_role</value>
+                </property>
+                <property>
+                  <name>gaius.teavm.syncClinits</name>
+                  <value>$teavm_sync_clinits</value>
+                </property>
+                <property>
+                  <name>gaius.teavm.syncMonitors</name>
+                  <value>$teavm_sync_monitors</value>
+                </property>
+                <property>
+                  <name>gaius.teavm.asyncBarrier</name>
+                  <value>$teavm_async_barrier</value>
+                </property>
+                <property>
+                  <name>gaius.teavm.pinRuntimeNames</name>
+                  <value>$teavm_pin_runtime_names</value>
+                </property>
+                <property>
+                  <name>gaius.teavm.telemetry</name>
+                  <value>$teavm_telemetry</value>
+                </property>
+                <property>
+                  <name>gaius.teavm.cutReport</name>
+                  <value>$maven_maven_directory/gaius-teavm-sync-methods.txt</value>
+                </property>
+              </properties>
             </configuration>
           </execution>
         </executions>
@@ -341,4 +504,6 @@ $compiler_source_excludes
 EOF
 } >"$output"
 
+# Callers capture stdout as the POM path; the role summary goes to stderr.
+echo "TeaVM role $teavm_role: maxTopLevelNames=$max_top_level_names syncClinits=$teavm_sync_clinits syncMonitors=$teavm_sync_monitors asyncBarrier=$teavm_async_barrier pinRuntimeNames=$teavm_pin_runtime_names telemetry=$teavm_telemetry" >&2
 echo "$output"

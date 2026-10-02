@@ -328,7 +328,10 @@ echo "Generated browser resource list: $(wc -l <"$resource_list" | tr -d ' ') en
 echo "Embedded TeaVM resource subset: $(wc -l <"$embedded_resource_list" | tr -d ' ') entries"
 echo "Mapped browser sound assets: $copied_sound_assets"
 echo "Mapped browser Unicode font assets: $copied_font_assets"
-pom="$(GAIUS_BUILD_ROOT="$build_root" GAIUS_OVERLAY_DIRECTORY="$overlay_directory" GAIUS_TARGET_DIRECTORY="$staged_target_directory" GAIUS_RESOURCE_DIRECTORY="$generated_resources" "$root/port/scripts/generate-pom.sh")"
+# The client role's TeaVM compiler options (maxTopLevelNames, syncClinits,
+# syncMonitors, async barrier, runtime name pinning, telemetry tag) come from
+# the role table in generate-pom.sh and end up in the POM <properties>.
+pom="$(GAIUS_TEAVM_ROLE=client GAIUS_BUILD_ROOT="$build_root" GAIUS_OVERLAY_DIRECTORY="$overlay_directory" GAIUS_TARGET_DIRECTORY="$staged_target_directory" GAIUS_RESOURCE_DIRECTORY="$generated_resources" "$root/port/scripts/generate-pom.sh")"
 log="$build_root/teavm-build.log"
 
 echo "Compiling the official Minecraft $version client with TeaVM"
@@ -336,6 +339,7 @@ echo "POM: $pom"
 echo "Log: $log"
 
 set +e
+# MAVEN_OPTS only sizes the compiler JVM; TeaVM options live in the POM.
 MAVEN_OPTS="${MAVEN_OPTS:--Xms2g -Xmx14g -XX:+UseG1GC -XX:MaxGCPauseMillis=500}" \
   "$root/port/mvnw" \
   --batch-mode \

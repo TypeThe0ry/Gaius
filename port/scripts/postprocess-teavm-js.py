@@ -10,6 +10,17 @@ throws for NaN/Infinity. Minecraft can naturally feed NaN into math paths while
 recovering camera/interpolation state; on the JVM this is non-fatal, but in the
 browser it crashes the client. This post-process keeps the generated output
 semantically closer to Java and prevents those fatal browser exceptions.
+
+It also makes TeaVM's current-thread slot a module-level binding.  Every
+coroutine check ($rt_suspending/$rt_resuming, i.e. after almost every call in an
+async method) reads the slot through $rt_nativeThread.  When the top-level name
+budget (maxTopLevelNames) is spent, TeaVM emits the slot as a property of the
+additional scope object ("A.EeY=null;let F=()=>A.EeY"), which V8 keeps in
+dictionary mode, so each check pays a hash lookup.  The patched TeaVM core pins
+runtime names to top-level bindings (gaius.teavm.pinRuntimeNames); this step
+rewrites the slot when it is still scoped and only marks it otherwise.  The slot
+and the getter names are taken from the runtime's own TeaVMThread.run and
+$rt_nativeThread definitions, not from fixed minified names.
 """
 
 from __future__ import annotations
@@ -54,6 +65,23 @@ RUNTIME_THREAD_START_PATTERN = re.compile(
 MINIFIED_RUNTIME_THREAD_START_PATTERN = re.compile(
     r"(?P<call>[A-Za-z_$][A-Za-z0-9_$]*\.[A-Za-z_$][A-Za-z0-9_$]*)"
     r"\(\(\)=>\{f\.call\(null,javaArgs\);\},callback\);"
+)
+
+THREAD_SLOT_MARKER = "/*gaius-module-thread-slot*/"
+THREAD_SLOT_BINDING = "$gaiusRtThread"
+# TeaVM 0.15 thread.js references $rt_currentNativeThread six times: the
+# declaration, the $rt_nativeThread getter, the check in start and in resume,
+# and the set/clear pair in run.
+THREAD_SLOT_REFERENCES = 6
+IDENTIFIER = r"[A-Za-z_$][A-Za-z0-9_$]*"
+
+# TeaVMThread.prototype.run = function() { <slot> = this; let result; try {
+# result = this.runner(); ...  Template locals (result) keep their names in
+# minified output, and "this.runner()" occurs only here.
+THREAD_RUN_PATTERN = re.compile(
+    r"\.prototype\.run\s*=\s*function\s*\(\s*\)\s*\{\s*"
+    rf"(?P<slot>{IDENTIFIER}(?:\.{IDENTIFIER})?)\s*=\s*this\s*;\s*"
+    r"let\s+result\s*;\s*try\s*\{\s*result\s*=\s*this\.runner\(\)\s*;"
 )
 
 
@@ -239,6 +267,126 @@ def find_anchored(
         search_offset = anchor + len(anchor_text)
 
 
+class RuntimeShapeError(Exception):
+    """The generated TeaVM runtime does not have the expected shape."""
+
+
+IDENTIFIER_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_$"
+)
+
+
+def find_tokens(text: str, name: str) -> list[int]:
+    """Offsets of name as a whole identifier path that is not a property access.
+
+    str.find keeps this linear and fast on the ~100 MB bundles, where a regex
+    with a lookbehind scans every offset.
+    """
+    positions: list[int] = []
+    start = 0
+    end_limit = len(text)
+    while True:
+        index = text.find(name, start)
+        if index < 0:
+            return positions
+        start = index + 1
+        if index > 0:
+            before = text[index - 1]
+            if before in IDENTIFIER_CHARACTERS or before == ".":
+                continue
+        after_index = index + len(name)
+        if after_index < end_limit and text[after_index] in IDENTIFIER_CHARACTERS:
+            continue
+        positions.append(index)
+
+
+def module_level_thread_slot(text: str) -> tuple[str, str | None]:
+    """Make TeaVM's current-thread slot a module-level binding.
+
+    Returns the text and a log message, or no message when the output has no
+    coroutine runtime (simpleThread.js, used by programs without threads).
+    """
+    if "this.runner()" not in text:
+        return text, None
+    run = find_anchored(THREAD_RUN_PATTERN, text, "this.runner()", before=512, after=256)
+    if run is None:
+        raise RuntimeShapeError("TeaVMThread.prototype.run was not found")
+    slot = run.group("slot")
+    # Anchored at a token offset of the slot: "<slot>=null;let <getter>=()=><slot>"
+    # (scoped slot) or "<slot>=null,<getter>=()=><slot>" (binding in a let list).
+    declaration_pattern = re.compile(
+        re.escape(slot)
+        + r"\s*=\s*(?P<marker>"
+        + re.escape(THREAD_SLOT_MARKER)
+        + r")?null"
+        + rf"(?P<separator>\s*[;,]\s*(?:let\s+)?)(?P<getter>{IDENTIFIER})"
+        + r"\s*=\s*\(\s*\)\s*=>\s*"
+        + re.escape(slot)
+        + r"(?![A-Za-z0-9_$])"
+    )
+    references = find_tokens(text, slot)
+    declarations = [
+        match
+        for match in (declaration_pattern.match(text, offset) for offset in references)
+        if match is not None
+    ]
+    if len(declarations) != 1:
+        raise RuntimeShapeError(
+            f"expected one current-thread slot declaration followed by the "
+            f"$rt_nativeThread getter for {slot}, found {len(declarations)}"
+        )
+    declaration = declarations[0]
+    getter = declaration.group("getter")
+    if "." not in slot:
+        # The patched TeaVM already emitted a binding (pinned runtime name).
+        if declaration.group("marker"):
+            return text, f"TeaVM current-thread slot {slot} is already a marked module-level binding"
+        marked = (
+            text[:declaration.start()]
+            + f"{slot}={THREAD_SLOT_MARKER}null"
+            + text[declaration.start("separator"):]
+        )
+        return marked, (
+            f"TeaVM current-thread slot {slot} is a module-level binding "
+            f"(getter {getter}); marked it"
+        )
+
+    if len(references) != THREAD_SLOT_REFERENCES:
+        raise RuntimeShapeError(
+            f"expected {THREAD_SLOT_REFERENCES} references to the current-thread "
+            f"slot {slot}, found {len(references)}"
+        )
+    if ";" not in declaration.group("separator"):
+        raise RuntimeShapeError(
+            f"the current-thread slot declaration of {slot} is not a statement"
+        )
+    if find_tokens(text, THREAD_SLOT_BINDING):
+        raise RuntimeShapeError(f"{THREAD_SLOT_BINDING} is already used by the output")
+    edits: list[tuple[int, int, str]] = [(
+        declaration.start(),
+        declaration.start("separator"),
+        f"let {THREAD_SLOT_BINDING}={THREAD_SLOT_MARKER}null",
+    )]
+    for reference in references:
+        if reference == declaration.start():
+            continue
+        edits.append((reference, reference + len(slot), THREAD_SLOT_BINDING))
+    pieces: list[str] = []
+    cursor = 0
+    for start, end, replacement in sorted(edits):
+        pieces.append(text[cursor:start])
+        pieces.append(replacement)
+        cursor = end
+    pieces.append(text[cursor:])
+    patched = "".join(pieces)
+    if find_tokens(patched, slot):
+        raise RuntimeShapeError(f"a reference to {slot} survived the rewrite")
+    return patched, (
+        f"Rewrote the TeaVM current-thread slot {slot} into the module-level binding "
+        f"{THREAD_SLOT_BINDING} ({len(references)} references, getter {getter})"
+    )
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print("usage: postprocess-teavm-js.py <classes.js>", file=sys.stderr)
@@ -269,9 +417,29 @@ def main(argv: list[str]) -> int:
             f"Patched TeaVM JS finite-safe long conversion in {target} (1 occurrence)."
         )
 
+    try:
+        patched, thread_message = module_level_thread_slot(patched)
+    except RuntimeShapeError as error:
+        print(
+            f"TeaVM current-thread slot rewrite failed in {target}: {error}; "
+            "the generated runtime shape may have changed.",
+            file=sys.stderr,
+        )
+        return 1
+    if thread_message is not None:
+        messages.append(f"{thread_message}: {target}")
+
     # ADVANCED output may still retain whitespace when diagnostics disable
     # minification. Match the semantic export instead of one formatted spelling.
-    worker_export = INTEGRATED_SERVER_EXPORT_PATTERN.search(patched)
+    # The anchor keeps the search off the rest of the bundle: an unanchored
+    # search of this pattern takes over a minute on the ~93 MB client.
+    worker_export = find_anchored(
+        INTEGRATED_SERVER_EXPORT_PATTERN,
+        patched,
+        ".pumpIntegratedServerNetworkInput",
+        before=128,
+        after=128,
+    )
     if worker_export is not None:
         if INTEGRATED_SERVER_PUMP_MARKER in patched:
             messages.append(
