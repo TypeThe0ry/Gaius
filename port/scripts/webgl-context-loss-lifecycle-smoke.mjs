@@ -47,7 +47,8 @@ const releaseMethod = javaMethod(
 for (const contract of [
   "new java.util.ArrayList<>(MAPPED_BUFFERS.values())",
   "MAPPED_BUFFERS.clear()",
-  "MemoryUtil.memFree(mapped.buffer)",
+  // v0.4: mapped staging returns to the size-class pool (or is freed past its cap).
+  "releaseMappedStorage(mapped)",
   "noteMappedBufferCountJs(0)",
 ]) {
   assert.ok(source.slice(Math.max(0, source.indexOf(releaseMethod) - 80),
@@ -55,7 +56,7 @@ for (const contract of [
   `missing mapped-buffer cleanup contract: ${contract}`);
 }
 assert.ok(releaseMethod.indexOf("MAPPED_BUFFERS.clear()")
-  < releaseMethod.indexOf("MemoryUtil.memFree(mapped.buffer)"),
+  < releaseMethod.indexOf("releaseMappedStorage(mapped)"),
 "mapped buffers are not detached before native allocations are released");
 
 const initializeLifecycle = new Function(

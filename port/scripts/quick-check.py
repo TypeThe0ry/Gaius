@@ -2824,16 +2824,24 @@ def check_source_patches() -> None:
             and "Browser output stream did not truncate an existing file" in platform_smoke,
         ),
         (
-            "Server Worker compiles class-initialization edges synchronously and hashes Set.of/Map.of",
+            "Client and server Worker compile class-initialization edges synchronously and hash Set.of/Map.of",
             # gaius.teavm.syncClinits stops TeaVM from making every caller of an async class
             # initializer async (it turned 36k of 83k Worker methods into coroutines); the
-            # runtime skips cooperative yields while __gaiusClinitDepth is positive.
-            'SYNC_CLINITS_PROPERTY = "gaius.teavm.syncClinits"'
+            # runtime skips cooperative yields while __gaiusClinitDepth is positive.  Since
+            # v0.4.0 it is a role option of the generate-pom.sh role table (POM <properties>,
+            # read by GaiusTeaVMOptions) for both roles, not a MAVEN_OPTS system property.
+            "SYNC_CLINITS_PROPERTY = GaiusTeaVMOptions.SYNC_CLINITS"
                 in (PORT / "tools/src/main/java/dev/gaius/tools/TeaVMCoreBrowserPatcher.java").read_text(errors="replace")
+            and 'SYNC_CLINITS = PREFIX + "syncClinits"'
+                in (PORT / "tools/src/main/java/dev/gaius/tools/runtime/GaiusTeaVMOptions.java").read_text(errors="replace")
             and "patchAsyncMethodFinder(" in (PORT / "tools/src/main/java/dev/gaius/tools/TeaVMCoreBrowserPatcher.java").read_text(errors="replace")
             and "patchRendererClinitDepth(" in (PORT / "tools/src/main/java/dev/gaius/tools/TeaVMCoreBrowserPatcher.java").read_text(errors="replace")
-            and "-Dgaius.teavm.syncClinits=true" in (PORT / "scripts/build-teavm-server-worker.sh").read_text(errors="replace")
-            and "syncClinits" not in (PORT / "scripts/build-teavm.sh").read_text(errors="replace")
+            and "<name>gaius.teavm.syncClinits</name>" in (PORT / "scripts/generate-pom.sh").read_text(errors="replace")
+            and (PORT / "scripts/generate-pom.sh").read_text(errors="replace").count("default_sync_clinits=true") == 2
+            and "-Dgaius.teavm." not in (PORT / "scripts/build-teavm-server-worker.sh").read_text(errors="replace")
+            and "-Dgaius.teavm." not in (PORT / "scripts/build-teavm.sh").read_text(errors="replace")
+            and 'GAIUS_TEAVM_ROLE="singleplayer-worker"' in (PORT / "scripts/build-teavm-server-worker.sh").read_text(errors="replace")
+            and "GAIUS_TEAVM_ROLE=client" in (PORT / "scripts/build-teavm.sh").read_text(errors="replace")
             and "TModernRuntimeSupport.inClassInitializer()"
                 in (PORT / "src/main/java/org/teavm/classlib/java/util/concurrent/locks/TLockSupport.java").read_text(errors="replace")
             and "patchTemplateCollectionLookups(jar, root);" in classlib_patcher
@@ -3633,8 +3641,14 @@ def check_source_patches() -> None:
         ),
         (
             "BrowserOpenGL maps WebGL buffers into registered MemoryUtil memory",
-            "MemoryUtil.memAlloc((int) length)" in text
-            and "MemoryUtil.memFree(mapped.buffer)" in text,
+            "acquireMappedBuffer(logicalBuffer, offset, (int) length, access)" in text
+            and "acquireMappedBuffer(buffer, offset, (int) length, access)" in text
+            and "address = MemoryUtil.nmemAlloc(1L << shift);" in text
+            and "MemoryUtil.memByteBuffer(address, length)" in text
+            and "MemoryUtil.memAlloc(length).order(ByteOrder.nativeOrder())" in text
+            and "MemoryUtil.memFree(mapped.buffer());" in text
+            and "MemoryUtil.nmemFree(mapped.poolAddress());" in text
+            and "releaseMappedStorage(mapped);" in text,
         ),
         (
             "BrowserOpenGL exports exact mapped-buffer flush sub-ranges",
@@ -3655,7 +3669,8 @@ def check_source_patches() -> None:
             and "targetEnd<=targetKnown" in text
             and text.count("const sameBufferOverlap=sourceBuffer===targetBuffer && length>0") >= 2
             and text.count("&& !sameBufferOverlap;") >= 2
-            and "if (validRange && length>0) state.shadowBufferSubDataForTarget" in text
+            and "if (validRange && length>0) {\n"
+                "                state.shadowBufferSubDataForTarget(target,buffer,start,data);" in text
             and text.count("if (validRange && length>0)") >= 2
             and "if (targetBuffer && validRange && length>0)" in text
             and "if (validRange && length>0)" in text
@@ -5744,10 +5759,13 @@ def check_source_patches() -> None:
             and "BrowserRenderScheduler" in client_patcher
             and "BROWSER_SECTION_UPLOAD_BUDGET = 8" in client_patcher
             and "BROWSER_SECTION_CLOSE_BUDGET = 16" in client_patcher
-            and "Window.requestAnimationFrame" in browser_render_scheduler
-            and "Platform.schedule(BrowserRenderScheduler::runAfterPaint, 0)" in browser_render_scheduler
-            and "MAX_TASKS_PER_FRAME = 8" in browser_render_scheduler
-            and "FRAME_WORK_BUDGET_NANOS = 2_000_000L" in browser_render_scheduler
+            and "Platform.schedule(BrowserRenderScheduler::runPump, 0)" in browser_render_scheduler
+            and "FRAME_WATCHDOG_MILLIS = 50" in browser_render_scheduler
+            and "SLICE_NANOS = 2_000_000L" in browser_render_scheduler
+            and "TModernRuntimeSupport.yieldToEventLoop(0)" in browser_render_scheduler
+            and "private record Budget(" in browser_render_scheduler
+            and "8, 16, 3_000_000L, 16, 3_000_000L, 2L * 1024L * 1024L, 2, 4," in browser_render_scheduler
+            and "return budget().maxTasksPerFrame();" in browser_render_scheduler
             and "requestEmergencyUpload" in browser_render_scheduler
             and "awaitUploadRetry" in browser_render_scheduler
             and "clearUploadRetry" in browser_render_scheduler
