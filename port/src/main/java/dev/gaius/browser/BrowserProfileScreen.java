@@ -16,6 +16,7 @@ import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.CommonComponents;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.entity.player.PlayerSkin;
+import org.teavm.jso.JSBody;
 
 /**
  * Vanilla-styled profile editor (username + custom skin) opened from the title screen.
@@ -147,6 +148,7 @@ public final class BrowserProfileScreen extends Screen {
     @Override
     public void onClose() {
         BrowserProfile.clearPickState();
+        markSetupComplete();
         this.minecraft.gui.setScreen(parent);
     }
 
@@ -182,8 +184,19 @@ public final class BrowserProfileScreen extends Screen {
             setStatus(error(failure));
             return;
         }
+        markSetupComplete();
         this.minecraft.gui.setScreen(parent);
     }
+
+    /** The first-launch editor was seen; later launches start without it. */
+    @JSBody(script = """
+            try {
+              localStorage.removeItem('gaius.profileSetupPending');
+            } catch (ignored) {
+              // Storage can be unavailable; the editor then simply opens again next launch.
+            }
+            """)
+    private static native void markSetupComplete();
 
     private PlayerSkin previewSkin() {
         String key = pendingSkin.length() + ":" + pendingSkin.hashCode() + ":" + pendingSlim;

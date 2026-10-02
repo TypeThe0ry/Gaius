@@ -12,20 +12,19 @@ const output = resolve(process.env.OUTPUT || 'artifacts/github-pages-cdp.json');
 const CDP_COMMAND_TIMEOUT_MS = Number(process.env.CDP_COMMAND_TIMEOUT_MS || '15000');
 const GAIUS_CDP_PROFILE_ROOT = process.env.GAIUS_CDP_PROFILE_ROOT || ''; 
 const chromeBinary = process.env.CHROME || 'C:/Program Files/Google/Chrome/Application/chrome.exe';
-// Pages publishes exactly the Minecraft 26.2 and 26.3 clients (.github/workflows/pages.yml).
-const expectedPages = Object.freeze(['Gaius-26.2.html', 'Gaius-26.3.html']);
-// Minecraft 1.21.11 is permanently retired from Pages: its old URL must stay unpublished (HTTP 404).
-const retiredPages = Object.freeze(['Gaius-1.21.11.html']);
+// Pages publishes exactly the Minecraft 1.21.11, 26.2 and 26.3 clients (.github/workflows/pages.yml).
+const expectedPages = Object.freeze(['Gaius-1.21.11.html', 'Gaius-26.2.html', 'Gaius-26.3.html']);
+// No page is retired: every published profile is expected above. A retired page must return HTTP 404.
+const retiredPages = Object.freeze([]);
 // Keep per-profile release target names explicit for the repository guard and Pages workflow.
-// The 26.2 and 26.3 profiles are deployed. GAIUS_TARGET_12111 and GAIUS_PAGE_DEFAULT_TARGET_12111, still
-// exported by the legacy v0.1.0 publisher, are intentionally ignored because 1.21.11 has no Pages page.
-const expectedTargets = Object.freeze({ '26.2': process.env.GAIUS_TARGET_262 || '', '26.3': process.env.GAIUS_TARGET_263 || '' });
-const expectedPageTargets = Object.freeze({ '26.2': process.env.GAIUS_PAGE_DEFAULT_TARGET_262 || '', '26.3': process.env.GAIUS_PAGE_DEFAULT_TARGET_263 || '', defaultTarget: process.env.GAIUS_PAGES_DEFAULT_TARGET || '' });
+const expectedTargets = Object.freeze({ '1.21.11': process.env.GAIUS_TARGET_12111 || '', '26.2': process.env.GAIUS_TARGET_262 || '', '26.3': process.env.GAIUS_TARGET_263 || '' });
+const expectedPageTargets = Object.freeze({ '1.21.11': process.env.GAIUS_PAGE_DEFAULT_TARGET_12111 || '', '26.2': process.env.GAIUS_PAGE_DEFAULT_TARGET_262 || '', '26.3': process.env.GAIUS_PAGE_DEFAULT_TARGET_263 || '', defaultTarget: process.env.GAIUS_PAGES_DEFAULT_TARGET || '' });
 // Timeout diagnostics retain the exact phrase 	imed out after for CI evidence.
 // pages.yml deploys each client only after `sha256sum --check` against its release SHA256SUMS record.
-// Optional GAIUS_PAGES_EXPECTED_SHA256_262 / GAIUS_PAGES_EXPECTED_SHA256_263 bind this live check to
-// those same release bytes; GAIUS_PAGES_EXPECTED_SHA256 remains the 26.2 alias set by the v0.1.0 publisher.
+// Optional GAIUS_PAGES_EXPECTED_SHA256_12111 / _262 / _263 bind this live check to those same release
+// bytes; GAIUS_PAGES_EXPECTED_SHA256 remains the 26.2 alias set by the v0.1.0 publisher.
 const expectedSha256Variables = Object.freeze({
+  'Gaius-1.21.11.html': ['GAIUS_PAGES_EXPECTED_SHA256_12111'],
   'Gaius-26.2.html': ['GAIUS_PAGES_EXPECTED_SHA256_262', 'GAIUS_PAGES_EXPECTED_SHA256'],
   'Gaius-26.3.html': ['GAIUS_PAGES_EXPECTED_SHA256_263'],
 });
@@ -121,7 +120,7 @@ async function stopChrome(chrome, cdp, profileDir) { try { await cdp?.send('Brow
 // Every deployed page has its own exactly-one-record check and its own sha256sum gate line.
 const pagesSha256GateLine = (file) => `(cd pages-publish && sha256sum --check --strict "$sums_dir/${file}.sha256")`;
 const pagesRecordCountLine = (file) => `if [ "$(wc -l < "$sums_dir/${file}.sha256")" -ne 1 ]; then`;
-const PAGES_DEPLOYING_LINE = `Deploying ${expectedPages.join(' and ')} from`;
+const PAGES_DEPLOYING_LINE = `Deploying ${expectedPages.slice(0, -1).join(', ')} and ${expectedPages.at(-1)} from`;
 function pagesWorkflowProblems(raw) {
   const problems = [];
   const need = (ok, message) => { if (!ok) problems.push(message); };
@@ -167,11 +166,12 @@ function pagesWorkflowProblems(raw) {
 }
 
 if (process.argv.includes('--static-self-test')) {
-  assert.deepEqual(expectedPages, ['Gaius-26.2.html', 'Gaius-26.3.html']);
-  assert.deepEqual(retiredPages, ['Gaius-1.21.11.html']);
+  assert.deepEqual(expectedPages, ['Gaius-1.21.11.html', 'Gaius-26.2.html', 'Gaius-26.3.html']);
+  assert.deepEqual(retiredPages, []);
   assert.ok(retiredPages.every((file) => !expectedPages.includes(file)), 'a retired page is still expected');
-  assert.deepEqual(Object.keys(expectedTargets), ['26.2', '26.3']);
-  assert.deepEqual(Object.keys(expectedPageTargets), ['26.2', '26.3', 'defaultTarget']);
+  assert.deepEqual(Object.keys(expectedTargets), ['1.21.11', '26.2', '26.3']);
+  assert.deepEqual(Object.keys(expectedPageTargets), ['1.21.11', '26.2', '26.3', 'defaultTarget']);
+  assert.equal(PAGES_DEPLOYING_LINE, 'Deploying Gaius-1.21.11.html, Gaius-26.2.html and Gaius-26.3.html from');
   // The live sha256 binding: well-formed expectations only, per page, and a mismatch fails the gate.
   assert.deepEqual(Object.keys(expectedSha256Variables), [...expectedPages], 'every deployed page needs an expected-sha256 variable');
   const abc = 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad';
@@ -179,9 +179,10 @@ if (process.argv.includes('--static-self-test')) {
   assert.equal(parseExpectedSha256(undefined), '');
   assert.equal(parseExpectedSha256(`  ${abc.toUpperCase()}\n`), abc);
   for (const bad of ['abc', abc.slice(1), `${abc}0`, `${abc.slice(1)}g`]) assert.throws(() => parseExpectedSha256(bad), /64 hexadecimal/);
-  assert.deepEqual(expectedSha256ByPage({}), {'Gaius-26.2.html': '', 'Gaius-26.3.html': ''});
-  assert.deepEqual(expectedSha256ByPage({GAIUS_PAGES_EXPECTED_SHA256: abc}), {'Gaius-26.2.html': abc, 'Gaius-26.3.html': ''}, 'the legacy variable binds 26.2 only');
-  assert.deepEqual(expectedSha256ByPage({GAIUS_PAGES_EXPECTED_SHA256_262: abc, GAIUS_PAGES_EXPECTED_SHA256_263: '0'.repeat(64)}), {'Gaius-26.2.html': abc, 'Gaius-26.3.html': '0'.repeat(64)});
+  assert.deepEqual(expectedSha256ByPage({}), {'Gaius-1.21.11.html': '', 'Gaius-26.2.html': '', 'Gaius-26.3.html': ''});
+  assert.deepEqual(expectedSha256ByPage({GAIUS_PAGES_EXPECTED_SHA256: abc}), {'Gaius-1.21.11.html': '', 'Gaius-26.2.html': abc, 'Gaius-26.3.html': ''}, 'the legacy variable binds 26.2 only');
+  assert.deepEqual(expectedSha256ByPage({GAIUS_PAGES_EXPECTED_SHA256_12111: '1'.repeat(64), GAIUS_PAGES_EXPECTED_SHA256_262: abc, GAIUS_PAGES_EXPECTED_SHA256_263: '0'.repeat(64)}), {'Gaius-1.21.11.html': '1'.repeat(64), 'Gaius-26.2.html': abc, 'Gaius-26.3.html': '0'.repeat(64)});
+  assert.throws(() => expectedSha256ByPage({GAIUS_PAGES_EXPECTED_SHA256_12111: 'nope'}), /GAIUS_PAGES_EXPECTED_SHA256_12111 must be 64 hexadecimal/);
   assert.throws(() => expectedSha256ByPage({GAIUS_PAGES_EXPECTED_SHA256_263: 'nope'}), /GAIUS_PAGES_EXPECTED_SHA256_263 must be 64 hexadecimal/);
   const fixture = new TextEncoder().encode('abc').buffer;
   for (const page of expectedPages) {
@@ -242,8 +243,8 @@ if (process.argv.includes('--static-self-test')) {
     'early Deploying summary': (text) => text.replace('          echo "tag=${tag}" >> "$GITHUB_OUTPUT"', `          echo "tag=\${tag}" >> "$GITHUB_OUTPUT"\n          echo "${PAGES_DEPLOYING_LINE} \${tag}" >> "$GITHUB_STEP_SUMMARY"`),
     'partial Deploying summary': (text) => text.replace(`echo "${PAGES_DEPLOYING_LINE} `, 'echo "Deploying Gaius-26.2.html from '),
     'optional release_token': (text) => text.replace('        required: true', '        required: false'),
-    'one page only': (text) => text.replace("            --pattern 'Gaius-26.3.html'\n", '').replace('wc -l)" -eq 2', 'wc -l)" -eq 1'),
-    'file count for one page': (text) => text.replace('wc -l)" -eq 2', 'wc -l)" -eq 1'),
+    'one page fewer': (text) => text.replace("            --pattern 'Gaius-1.21.11.html'\n", '').replace(`wc -l)" -eq ${expectedPages.length}`, `wc -l)" -eq ${expectedPages.length - 1}`),
+    'file count for one page fewer': (text) => text.replace(`wc -l)" -eq ${expectedPages.length}`, `wc -l)" -eq ${expectedPages.length - 1}`),
   };
   for (const file of expectedPages) {
     const gate = pagesSha256GateLine(file);
@@ -265,7 +266,7 @@ if (process.argv.includes('--static-self-test')) {
   console.log('VERIFY_GITHUB_PAGES_CDP_STATIC_OK'); process.exit(0);
 }
 
-const report = {schema: 'gaius.github-pages-cdp.v5', base, expectedPages, retiredPages, expectedSha256: null, sha256RetryWindowMs: null, checks: [], pages: [], live: {}};
+const report = {schema: 'gaius.github-pages-cdp.v6', base, expectedPages, retiredPages, expectedSha256: null, sha256RetryWindowMs: null, checks: [], pages: [], live: {}};
 let chrome; let cdp; let profileDir;
 try {
   const expectedSha256 = expectedSha256ByPage(process.env);

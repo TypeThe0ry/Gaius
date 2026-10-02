@@ -1,0 +1,139 @@
+    /* Gaius boot art: Minecraft-style launcher look (port/web/launcher/boot-art.js). */
+    html[data-gaius-boot-art="1"] #boot-screen {
+      background-color: #1d140d;
+      background-image: var(--gaius-boot-dirt);
+      background-size: 64px 64px;
+      image-rendering: pixelated;
+    }
+
+    html[data-gaius-boot-art="1"] #boot-screen::before {
+      display: none;
+    }
+
+    html[data-gaius-boot-art="1"] #boot-brand {
+      position: fixed;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
+    }
+
+    #gaius-boot-art {
+      position: fixed;
+      top: 34%;
+      left: 50%;
+      z-index: 11;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+    }
+
+    #gaius-boot-art canvas,
+    #gaius-boot-label,
+    #gaius-boot-hint {
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+    }
+
+    #gaius-boot-logo {
+      width: min(736px, 86vw);
+      height: auto;
+      filter: drop-shadow(0 6px 0 rgba(0, 0, 0, 0.35));
+    }
+
+    #gaius-boot-edition {
+      margin-top: -14px;
+      width: auto;
+      height: 24px;
+    }
+
+    #gaius-boot-splash {
+      position: absolute;
+      right: -6%;
+      bottom: 22%;
+      height: 18px;
+      transform: rotate(-18deg);
+      transform-origin: center;
+      animation: gaius-boot-splash 0.9s ease-in-out infinite alternate;
+    }
+
+    @keyframes gaius-boot-splash {
+      from { transform: rotate(-18deg) scale(1); }
+      to { transform: rotate(-18deg) scale(1.08); }
+    }
+
+    html[data-gaius-boot-art="1"] #boot-progress {
+      top: 62%;
+      width: min(440px, calc(100vw - 64px));
+      height: 16px;
+      padding: 3px;
+      border: 2px solid #ffffff;
+      background: rgba(0, 0, 0, 0.35);
+    }
+
+    html[data-gaius-boot-art="1"] #boot-progress-bar {
+      background: #ffffff;
+      transition: width 260ms ease-out;
+    }
+
+    html[data-gaius-boot-art="1"] #boot-progress-text {
+      position: fixed;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
+    }
+
+    #gaius-boot-label,
+    #gaius-boot-hint {
+      position: fixed;
+      left: 50%;
+      z-index: 11;
+      height: 16px;
+      transform: translateX(-50%);
+      pointer-events: none;
+    }
+
+    #gaius-boot-label {
+      top: calc(62% + 36px);
+    }
+
+    #gaius-boot-hint {
+      top: calc(62% + 62px);
+    }
+
+    html[data-gaius-boot-art="1"] #status {
+      top: calc(62% + 92px);
+    }
+
+    html[data-gaius-boot-art="1"] #gaius-shell-header {
+      border-bottom-color: rgba(0, 0, 0, 0.6);
+      background: rgba(10, 7, 4, 0.72);
+    }
+
+    html[data-gaius-shell-view="canvas"] #gaius-boot-art,
+    html[data-gaius-shell-view="canvas"] #gaius-boot-label,
+    html[data-gaius-shell-view="canvas"] #gaius-boot-hint,
+    html[data-gaius-shell-view="profile"] #gaius-boot-art,
+    html[data-gaius-shell-view="profile"] #gaius-boot-label,
+    html[data-gaius-shell-view="profile"] #gaius-boot-hint {
+      display: none;
+    }
+
+    html[data-gaius-shell-view="error"] #gaius-boot-label,
+    html[data-gaius-shell-view="error"] #gaius-boot-hint {
+      display: none;
+    }
+
+    @media (max-width: 640px) {
+      #gaius-boot-art { top: 30%; }
+      #gaius-boot-splash { right: -2%; height: 14px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      #gaius-boot-splash { animation: none; }
+    }

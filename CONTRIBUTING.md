@@ -7,9 +7,9 @@ can be verified.
 
 ## Development Setup
 
-Install Git LFS, JDK 25 or newer (for `26.2` and `26.3`), JDK 21 (only for
-the Paper plugin), Node.js 22 or newer, Python 3, `curl`, `jq`, `unzip`, and
-`shasum`. After
+Install Git LFS, JDK 25 or newer (for `26.2` and `26.3`), JDK 21 (for
+`1.21.11` and the Paper plugin; a JDK 25 also builds the `1.21.11` client),
+Node.js 22 or newer, Python 3, `curl`, `jq`, `unzip`, and `shasum`. After
 cloning, fetch the large checked-in release objects before working with
 generated browser files:
 
@@ -67,7 +67,7 @@ Run the checks that cover the area you changed. For a full browser-port change,
 use this order:
 
 ```sh
-for profile in 26.2 26.3; do
+for profile in 1.21.11 26.2 26.3; do
   GAIUS_VERSION_PROFILE_PATH="versions/${profile}.json" \
     bash port/scripts/build-version-release.sh "$profile"
   GAIUS_VERSION_PROFILE_PATH="versions/${profile}.json" \
@@ -96,20 +96,20 @@ python3 port/scripts/quick-check.py --domain-modules
 ```
 
 quick-check judges every profile by the rule set `PROFILE_RULES` names for it
-in `port/scripts/quick-check.py`: `26.2` and `26.3` share the named-family
-rules, a rule that does not hold for `26.3` is listed in `NOT_APPLICABLE_263`
+in `port/scripts/quick-check.py`: `1.21.11` has its own legacy-family rules,
+`26.2` and `26.3` share the named-family rules, a rule that does not hold for `26.3` is listed in `NOT_APPLICABLE_263`
 with the reason and the check that covers its replacement, and the `26.3`
 patch assertions live in `port/scripts/quickcheck/profile_263_<domain>.py`. A
 profile without rules fails quick-check.
 
-For the Paper plugin (which targets the retained 1.21.11/JDK-21 profile):
+For the Paper plugin (which targets the 1.21.11/JDK-21 profile):
 
 ```sh
 GAIUS_VERSION_PROFILE_PATH=versions/1.21.11.json \
   ./port/mvnw -B -ntp -f apps/server-plugin/pom.xml test
 ```
 
-For RelayNode changes, run the smoke suite for both supported profiles; it
+For RelayNode changes, run the smoke suite for all supported profiles; it
 verifies the manifest, required token, TCP forwarding, flow control, and
 local-tunnel pairing. Use `npm run smoke:public` only against a relay endpoint
 you are authorized to test. A passing static check does not replace a Chrome
@@ -123,7 +123,7 @@ check as passing unless it was actually run. For release-sized files, confirm
 the checksum of each artifact with:
 
 ```sh
-for profile in 26.2 26.3; do
+for profile in 1.21.11 26.2 26.3; do
   shasum -a 256 "port/web/dist/${profile}/Gaius.html"
 done
 ```

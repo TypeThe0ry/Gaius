@@ -35,7 +35,7 @@ For the public multiplayer transport probe, provide the target explicitly at
 runtime. Never store the target IP or private origin address in the repository:
 
 ```sh
-for profile in 26.2 26.3; do
+for profile in 1.21.11 26.2 26.3; do
   GAIUS_PUBLIC_RELAY_TARGET="$AUTHORIZED_TARGET_HOST:$AUTHORIZED_TARGET_PORT" \
     GAIUS_PUBLIC_RELAY_MINECRAFT_VERSION="$profile" \
     npm run smoke:public --prefix apps/bridge
@@ -51,7 +51,7 @@ does not reuse the legacy shared `port/target`, `port/work/overlays`, or
 `port/web/dist` roots:
 
 ```sh
-for profile in 26.2 26.3; do
+for profile in 1.21.11 26.2 26.3; do
   export GAIUS_VERSION_PROFILE_PATH="versions/${profile}.json"
   export GAIUS_BUILD_ROOT="port/target/${profile}"
   export GAIUS_OVERLAY_DIRECTORY="port/work/overlays/${profile}"
@@ -69,14 +69,16 @@ env -u GAIUS_BUILD_ROOT -u GAIUS_OVERLAY_DIRECTORY -u GAIUS_DIST_DIRECTORY \
 ```
 
 Both `26.2` and `26.3` require JDK 25 or newer; set `GAIUS_JAVA_HOME` or
-`JAVA_HOME` before the loop. The `26.3` client compiles its shaders with the
+`JAVA_HOME` before the loop. `1.21.11` requires JDK 21 or newer (its profile's
+`javaVersion`): the same JDK 25 also satisfies it, or point `GAIUS_JAVA_HOME`
+at a JDK 21 for that profile's iteration. The `26.3` client compiles its shaders with the
 WebAssembly shader toolchain (shaderc and SPIRV-Cross built by
 `port/scripts/build-wasm-shader-toolchain.sh`), so its release build also needs
 either `GAIUS_EMSDK` (an emsdk checkout with the emscripten version pinned in
 `port/wasm/shader-toolchain/pins.env`) or `GAIUS_SHADER_TOOLCHAIN_PREBUILT` (the
 verified output directory of an earlier toolchain build). A release build
-(`GAIUS_SHADER_TOOLCHAIN_STRICT=1`) fails without the toolchain; `26.2` never
-uses it. The commands above are release gates to run, not claims about
+(`GAIUS_SHADER_TOOLCHAIN_STRICT=1`) fails without the toolchain; `1.21.11` and
+`26.2` never use it. The commands above are release gates to run, not claims about
 every checkout. Record their actual results in the release notes or release
 checklist. Release bundles are compiled and verified on the maintainer's
 machine. GitHub Actions does not compile TeaVM release artifacts.
@@ -90,15 +92,15 @@ git lfs ls-files
 ./tools/check-lfs.sh
 ```
 
-A local pre-release of both profiles is uploaded by
-`tools/build-and-publish-prerelease.ps1` (default `-Profiles 26.2,26.3`), which
+A local pre-release of all three profiles is uploaded by
+`tools/build-and-publish-prerelease.ps1` (default `-Profiles 1.21.11,26.2,26.3`), which
 re-verifies every identity sidecar of each dist, including `shader-toolchain`
 for a dist whose page loads the toolchain, before it stages `Gaius-<profile>.html`
 and `Gaius-<profile>.manifest.json`.
 
 For a browser release, serve each `port/web/dist/<profile>/` directory locally
 as the corresponding `/dist/<profile>/` launch in a real Chrome session. Enter
-a new single-player world for both profiles, let terrain load, move through at
+a new single-player world for every profile, let terrain load, move through at
 least one chunk boundary, and confirm sound, visual rendering, block
 interaction, and settings. For multiplayer, verify both the plugin path and
 the RelayNode path for each supported protocol when those endpoints are
@@ -122,13 +124,13 @@ them in, `port/web/dist/**` is covered by the repository's Git LFS attributes:
 | `port/web/dist/<profile>/<artifact>.build.json` | Build identity sidecars: six roles for every profile (`client`, `singleplayer-worker`, `wasm-hotpath`, `worker-bootstrap`, `vanilla-assets`, `relay-registry`) plus `shader-toolchain` on `gaius-shader-toolchain.json` for `26.3` |
 | `apps/server-plugin/target/gaius-server-plugin-<version>.jar` | Optional Paper bridge plugin |
 
-For the version in `VERSION`, stage both profile assets outside Git's tracked source
+For the version in `VERSION`, stage every profile's assets outside Git's tracked source
 tree, then create a checksum file:
 
 ```sh
 release_dir="port/target/release-v$(tr -d '[:space:]' < VERSION)"
 mkdir -p "$release_dir"
-for profile in 26.2 26.3; do
+for profile in 1.21.11 26.2 26.3; do
   cp "port/web/dist/${profile}/Gaius.html" \
     "$release_dir/Gaius-${profile}.html"
   cp "port/web/dist/${profile}/Gaius.manifest.json" \
@@ -161,12 +163,13 @@ artifacts.
 
 ### Deploy GitHub Pages
 
-GitHub Pages serves exactly two files, the Minecraft 26.2 and 26.3 clients at
+GitHub Pages serves exactly three files, the Minecraft 1.21.11, 26.2 and 26.3
+clients at `https://typethe0ry.github.io/Gaius/Gaius-1.21.11.html`,
 `https://typethe0ry.github.io/Gaius/Gaius-26.2.html` and
-`https://typethe0ry.github.io/Gaius/Gaius-26.3.html`. Minecraft 1.21.11 is
-retired from Pages and its old URL must return 404. `.github/workflows/pages.yml`
-downloads `Gaius-26.2.html` and `Gaius-26.3.html` from the repository's Latest
-release unless the `release_tag` input names another tag, so mark the new
+`https://typethe0ry.github.io/Gaius/Gaius-26.3.html`. The site root is not
+published and must return 404. `.github/workflows/pages.yml` downloads
+`Gaius-1.21.11.html`, `Gaius-26.2.html` and `Gaius-26.3.html` from the
+repository's Latest release unless the `release_tag` input names another tag, so mark the new
 release Latest first and then dispatch the workflow:
 
 ```sh
@@ -182,33 +185,37 @@ never redeploy Pages.
 
 Before uploading, the workflow downloads that release's `SHA256SUMS` into
 `$RUNNER_TEMP`, outside the published artifact, and checks each client with
-`sha256sum --check` against its one record (`Gaius-26.2.html` and
-`Gaius-26.3.html` each need exactly one). A release without `SHA256SUMS`,
-without either record, or with a mismatching hash fails the run before
-anything is deployed. The run summary records the tag and both deployed
-sha256 values only after both checks pass. `SHA256SUMS` must use LF line
+`sha256sum --check` against its one record (`Gaius-1.21.11.html`,
+`Gaius-26.2.html` and `Gaius-26.3.html` each need exactly one). A release
+without `SHA256SUMS`, without any one of those records, or with a mismatching
+hash fails the run before anything is deployed, so a release that predates the
+1.21.11 client cannot be deployed. The run summary records the tag and all three
+deployed sha256 values only after every check passes. `SHA256SUMS` must use LF line
 endings and text-mode records (`<64 lowercase hex>  Gaius-26.2.html`, two
 spaces, no `*` binary marker); a CRLF or binary-mode record does not match and
 fails the run.
 
 Check the live site with `node tools/verify-github-pages-cdp.mjs`. Set
-`GAIUS_PAGES_EXPECTED_SHA256_262` and `GAIUS_PAGES_EXPECTED_SHA256_263` to the
-release's `Gaius-26.2.html` and `Gaius-26.3.html` sha256 values to make the
-verifier hash the live bytes and fail on a mismatch (`GAIUS_PAGES_EXPECTED_SHA256`
-is still accepted as the 26.2 value);
+`GAIUS_PAGES_EXPECTED_SHA256_12111`, `GAIUS_PAGES_EXPECTED_SHA256_262` and
+`GAIUS_PAGES_EXPECTED_SHA256_263` to the release's `Gaius-1.21.11.html`,
+`Gaius-26.2.html` and `Gaius-26.3.html` sha256 values to make the verifier hash
+the live bytes and fail on a mismatch (`GAIUS_PAGES_EXPECTED_SHA256` is still
+accepted as the 26.2 value);
 the live sha256 is recorded in the report either way. Because a fresh deploy can take minutes
 to reach every CDN edge (Pages responses carry `max-age=600`), a mismatch is
 re-fetched from the same canonical URL players load, under bounded backoff for
 up to `GAIUS_PAGES_SHA256_RETRY_MS` (default 600000, 10 minutes; `0` disables
 retries), until the edge serves the release bytes. Every attempt's status, byte
 count and sha256 (or fetch error) is recorded under
-`live["<file>"].attempts`. Extract both records
+`live["<file>"].attempts`. Extract all three records
 and refuse to run without them, since an empty value would silently skip that
 page's hash check:
 
 ```sh
-GAIUS_PAGES_EXPECTED_SHA256_262="$(awk '$2 == "Gaius-26.2.html" { print $1 }' SHA256SUMS)" &&
+GAIUS_PAGES_EXPECTED_SHA256_12111="$(awk '$2 == "Gaius-1.21.11.html" { print $1 }' SHA256SUMS)" &&
+  GAIUS_PAGES_EXPECTED_SHA256_262="$(awk '$2 == "Gaius-26.2.html" { print $1 }' SHA256SUMS)" &&
   GAIUS_PAGES_EXPECTED_SHA256_263="$(awk '$2 == "Gaius-26.3.html" { print $1 }' SHA256SUMS)" &&
+  GAIUS_PAGES_EXPECTED_SHA256_12111="${GAIUS_PAGES_EXPECTED_SHA256_12111:?no Gaius-1.21.11.html record in SHA256SUMS}" \
   GAIUS_PAGES_EXPECTED_SHA256_262="${GAIUS_PAGES_EXPECTED_SHA256_262:?no Gaius-26.2.html record in SHA256SUMS}" \
   GAIUS_PAGES_EXPECTED_SHA256_263="${GAIUS_PAGES_EXPECTED_SHA256_263:?no Gaius-26.3.html record in SHA256SUMS}" \
   node tools/verify-github-pages-cdp.mjs

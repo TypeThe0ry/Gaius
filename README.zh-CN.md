@@ -25,22 +25,25 @@ Gaius 是独立项目，与 Mojang Studios、Microsoft 和 Minecraft 没有隶�
 打开[最新 Release](https://github.com/TypeThe0ry/Gaius/releases/latest)，根据要
 连接的服务器下载对应的 HTML：
 
+- [Minecraft 1.21.11 客户端](https://github.com/TypeThe0ry/Gaius/releases/latest/download/Gaius-1.21.11.html)
 - [Minecraft 26.2 客户端](https://github.com/TypeThe0ry/Gaius/releases/latest/download/Gaius-26.2.html)
 - [Minecraft 26.3 客户端](https://github.com/TypeThe0ry/Gaius/releases/latest/download/Gaius-26.3.html)
 - [SHA256 校验文件](https://github.com/TypeThe0ry/Gaius/releases/latest/download/SHA256SUMS)
 - 可选 Paper 插件在同一个 Release 页面里。
 
-HTML 文件是可直接携带的单人客户端（`Gaius-26.2.html` 对应 Minecraft 26.2，
-`Gaius-26.3.html` 对应 Minecraft 26.3）。下载后用新版 Chrome 或 Chromium 打开，点
-**Singleplayer** 即可。首次启动会自动打开游戏内的 **编辑个人资料（Edit Profile）**
-界面，可以设置玩家名称并上传 64x64 的 PNG 皮肤；之后随时可以从标题界面右上角的
-**Edit Profile** 按钮再次打开，修改立即生效、无需刷新页面。浏览器启动器和 Worker
-需要的内容都在文件里，单人模式不用另起网页服务器。
+HTML 文件是可直接携带的单人客户端（`Gaius-1.21.11.html` 对应 Minecraft 1.21.11，
+`Gaius-26.2.html` 对应 Minecraft 26.2，`Gaius-26.3.html` 对应 Minecraft 26.3）。
+1.21.11 属于 26.x 之前的版本线，适合仍停留在该版本的服务器或模组移植。下载后用
+新版 Chrome 或 Chromium 打开，点 **Singleplayer** 即可。26.2 和 26.3 客户端首次
+启动会自动打开游戏内的 **编辑个人资料（Edit Profile）** 界面，可以设置玩家名称并
+上传 64x64 的 PNG 皮肤；之后随时可以从标题界面右上角的 **Edit Profile** 按钮再次
+打开，修改立即生效、无需刷新页面。1.21.11 客户端没有游戏内的个人资料编辑界面。
+浏览器启动器和 Worker 需要的内容都在文件里，单人模式不用另起网页服务器。
 
 ### 加入服务器
 
-1. 用 Chrome 或 Chromium 打开下载的 `Gaius-26.2.html` 或 `Gaius-26.3.html`（选择与
-   服务器 Minecraft 版本一致的那个）。
+1. 用 Chrome 或 Chromium 打开下载的 `Gaius-1.21.11.html`、`Gaius-26.2.html` 或
+   `Gaius-26.3.html`（选择与服务器 Minecraft 版本一致的那个）。
 2. 在 Minecraft 标题界面点 **Multiplayer（多人游戏）**。
 3. 点 **Add Server（添加服务器）** 或 **Direct Connection（直接连接）**，输入
    普通 Java 版服务器地址，例如 `example.net:25565`，然后点 **Join Server**。
@@ -53,14 +56,14 @@ HTML 文件是可直接携带的单人客户端（`Gaius-26.2.html` 对应 Minec
 ## 从源码构建
 
 需要 Git LFS、Python 3、Node.js LTS、`curl`、`jq`、`unzip`、`shasum`，以及目标
-profile 所需的 JDK。构建过程会把不同 profile 的 Maven 状态、overlay 和浏览器
-输出分开保存。
+profile 所需的 JDK（26.2 和 26.3 需要 JDK 25 或更新版本，1.21.11 需要 JDK 21 或
+更新版本）。构建过程会把不同 profile 的 Maven 状态、overlay 和浏览器输出分开保存。
 
 ```sh
 git lfs install
 git lfs pull
 
-for profile in 26.2 26.3; do
+for profile in 1.21.11 26.2 26.3; do
   export GAIUS_VERSION_PROFILE_PATH="versions/${profile}.json"
   ./port/scripts/fetch-version.sh
   ./port/scripts/remap-client.sh
@@ -75,7 +78,7 @@ done
 python3 port/scripts/serve-dist.py --host 127.0.0.1 --port 8781
 ```
 
-然后在 Chrome 打开 `/dist/26.2/` 或 `/dist/26.3/`。
+然后在 Chrome 打开 `/dist/1.21.11/`、`/dist/26.2/` 或 `/dist/26.3/`。
 
 ## 目录
 

@@ -1340,6 +1340,122 @@
       return "Player" + String(1000 + random[0] % 9000);
     }
 
+    // Relay list for the in-game Relays screen (dev.gaius.browser.BrowserRelays). User relays
+    // live in localStorage gaius.bridgeNodes, which the WebSocket channel reads on every
+    // connection; built-in relays can only be switched off (gaius.disabledRelays).
+    window.__gaiusRelays = (function () {
+      function normalize(value) {
+        try {
+          let text = String(value || "").trim();
+          // A bare host ("relay.example.com") means a secure relay.
+          if (text && !/^[a-z][a-z0-9+.-]*:/i.test(text)) text = "wss://" + text;
+          const parsed = new URL(text, location.href);
+          if (parsed.protocol === "http:") parsed.protocol = "ws:";
+          if (parsed.protocol === "https:") parsed.protocol = "wss:";
+          if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") return "";
+          if (!parsed.hostname) return "";
+          if (parsed.pathname === "" || parsed.pathname === "/" ||
+              parsed.pathname === "/health" || parsed.pathname === "/relay-node/v1") {
+            parsed.pathname = "/tunnel";
+          }
+          parsed.hash = "";
+          parsed.search = "";
+          return parsed.href;
+        } catch (error) {
+          return "";
+        }
+      }
+      function readList(key) {
+        try {
+          const value = JSON.parse(localStorage.getItem(key) || "[]");
+          return Array.isArray(value) ? value : [];
+        } catch (error) {
+          return [];
+        }
+      }
+      function useOf(value) {
+        return value === "multiplayer" || value === "lan" ? value : "both";
+      }
+      function entryUrl(value) {
+        return normalize(value && typeof value === "object" ? (value.url || value.endpoint) : value);
+      }
+      function entries() {
+        const disabled = new Set(readList("gaius.disabledRelays").map(normalize).filter(Boolean));
+        const seen = new Set();
+        const out = [];
+        for (const value of readList("gaius.bridgeNodes")) {
+          const url = entryUrl(value);
+          if (!url || seen.has(url)) continue;
+          seen.add(url);
+          const object = value && typeof value === "object" ? value : {};
+          out.push({url: url, name: String(object.name || "").slice(0, 80), use: useOf(object.use),
+            source: "user", enabled: object.enabled !== false});
+        }
+        const configured = window.__gaiusBridgeUrls;
+        const builtIns = Array.isArray(configured) ? configured : (configured ? [configured] : []);
+        for (const value of builtIns) {
+          const url = entryUrl(value);
+          if (!url || seen.has(url)) continue;
+          seen.add(url);
+          const object = value && typeof value === "object" ? value : {};
+          out.push({url: url, name: String(object.name || "").slice(0, 80), use: "both",
+            source: "builtin", enabled: !disabled.has(url)});
+        }
+        return out;
+      }
+      return {
+        normalize: normalize,
+        list: function () {
+          return JSON.stringify(entries());
+        },
+        saveUser: function (json) {
+          let values;
+          try {
+            values = JSON.parse(String(json || "[]"));
+          } catch (error) {
+            return "Invalid relay list";
+          }
+          if (!Array.isArray(values)) return "Invalid relay list";
+          const saved = [];
+          const seen = new Set();
+          let priority = 1000;
+          for (const value of values) {
+            const url = entryUrl(value);
+            if (!url || seen.has(url)) continue;
+            seen.add(url);
+            saved.push({url: url, name: String(value.name || "").slice(0, 80), use: useOf(value.use),
+              priority: priority--, user: true});
+          }
+          try {
+            localStorage.setItem("gaius.bridgeNodes", JSON.stringify(saved));
+          } catch (error) {
+            return "Browser storage is unavailable";
+          }
+          return "ok";
+        },
+        setEnabled: function (url, enabled) {
+          const target = normalize(url);
+          if (!target) return "Invalid relay address";
+          const disabled = new Set(readList("gaius.disabledRelays").map(normalize).filter(Boolean));
+          if (enabled) disabled.delete(target); else disabled.add(target);
+          try {
+            localStorage.setItem("gaius.disabledRelays", JSON.stringify(Array.from(disabled)));
+          } catch (error) {
+            return "Browser storage is unavailable";
+          }
+          return "ok";
+        },
+        // The relay a LAN host prefers: the first enabled user relay usable for LAN. Invites
+        // carry it so the joining page reaches the same relay (pairing is per relay).
+        lanInviteRelay: function () {
+          const relay = entries().find(function (entry) {
+            return entry.source === "user" && entry.enabled && entry.use !== "multiplayer";
+          });
+          return relay ? relay.url : "";
+        }
+      };
+    })();
+
     // Player identity for the in-game Edit Profile screen (dev.gaius.browser.BrowserProfile).
     // Name and skin changes apply to the running client; no page reload is needed.
     window.__gaiusProfile = {
@@ -1436,6 +1552,9 @@
           }
           const invite = new URL(location.href);
           invite.searchParams.set("server", "client-" + brokerSessionId + ".gaius-local:25565");
+          const lanRelay = window.__gaiusRelays && typeof window.__gaiusRelays.lanInviteRelay === "function"
+            ? window.__gaiusRelays.lanInviteRelay() : "";
+          if (lanRelay) invite.searchParams.set("relay", lanRelay);
           return {url: invite.href};
         };
       }
@@ -1571,14 +1690,24 @@
         } catch (error) {
           console.warn("Could not read the remembered Gaius player name", error);
         }
+        let profileSetupPending = false;
+        try {
+          profileSetupPending = localStorage.getItem("gaius.profileSetupPending") === "1";
+        } catch (error) {
+          profileSetupPending = false;
+        }
         if (/^[A-Za-z0-9_]{1,16}$/.test(rememberedName)) {
           username = rememberedName;
+          // A new player who left before the Edit Profile screen was confirmed or closed
+          // still gets it on the next launch (BrowserProfileScreen clears the flag).
+          if (profileSetupPending) window.__gaiusProfile.firstRun = true;
         } else {
           // First launch: start straight into the game with a default name; the title
           // screen then opens the in-game Edit Profile screen (BrowserProfileScreen).
           username = generateGaiusDefaultPlayerName();
           try {
             localStorage.setItem("gaius.playerName", username);
+            localStorage.setItem("gaius.profileSetupPending", "1");
           } catch (error) {
             console.warn("Could not remember the Gaius player name", error);
           }

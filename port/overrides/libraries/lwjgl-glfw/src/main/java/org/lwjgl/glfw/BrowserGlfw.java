@@ -658,14 +658,63 @@ public final class BrowserGlfw {
               // Mixing scheduler.yield() into every fourth present makes Chromium defer that
               // continuation behind compositor arbitration, producing a stable 3:1 cadence
               // and periodic multi-refresh frame bubbles on high-refresh displays.
-              postTask();
+              // Cheap frames (the title screen draws one in about 1.5 ms) would otherwise run
+              // at hundreds of FPS back to back and starve the compositor: the page showed
+              // 5-14 FPS while the game presented 650. Uncapped frames therefore run at most
+              // three presents per display refresh in a world and one in menus (no level, the
+              // vanilla menu limit); the last one waits for rAF. In a world, frames that take
+              // half a refresh or longer are never held.
+              let pacer=root.__gaiusUncappedPresentPacer;
+              if (!pacer || !Array.isArray(pacer.waiters)) {
+                pacer={presents:0,rafPending:false,waiters:[]};
+                root.__gaiusUncappedPresentPacer=pacer;
+              }
+              const canPace=typeof requestAnimationFrame==='function';
+              if (canPace && !pacer.rafPending) {
+                pacer.rafPending=true;
+                requestAnimationFrame(() => {
+                  pacer.rafPending=false;
+                  pacer.presents=0;
+                  const waiters=pacer.waiters;
+                  pacer.waiters=[];
+                  for (let index=0; index<waiters.length; index++) waiters[index]();
+                });
+              }
+              const state=root.__gaiusMinecraftState;
+              const presentsPerRefresh=state && state.level ? 3 : 1;
+              pacer.presents++;
+              if (canPace && pacer.presents>=presentsPerRefresh) {
+                if (telemetryEnabled) {
+                  telemetry.uncappedRafWaitCount=(Number(telemetry.uncappedRafWaitCount)||0)+1;
+                }
+                pacer.waiters.push(() => {
+                  if (!resumed) postTask();
+                });
+              } else {
+                postTask();
+              }
             }
             """)
     private static native void scheduleFrameYield(boolean hidden, int interval, FrameYieldCallback resume);
 
     public static void swapBuffers(long window) {
         boolean hidden = swapBuffersJs();
-        yieldAfterPresent(hidden, swapInterval);
+        try {
+            yieldAfterPresent(hidden, swapInterval);
+        } catch (RuntimeException e) {
+            // A frame presented from a JavaScript callback cannot suspend: on 1.21.11 the login
+            // packet runs Minecraft.setLevel -> updateScreenAndTick -> runTick(false) inside the
+            // network inbound pump. TeaVM refuses the suspension before scheduling anything, so
+            // that one frame skips its yield and the next regular frame yields as usual.
+            if (!isNonThreadingSuspension(e)) {
+                throw e;
+            }
+        }
+    }
+
+    static boolean isNonThreadingSuspension(Throwable error) {
+        String message = error.getMessage();
+        return message != null && message.contains("Suspension point reached from non-threading context");
     }
 
     public static void swapInterval(int interval) {

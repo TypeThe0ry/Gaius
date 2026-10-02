@@ -235,6 +235,8 @@ globalThis.WebSocket = MockWebSocket;
 // Execute split @JSBody methods independently, matching TeaVM's generated method boundaries.
 // Concatenating them in one Function can accidentally mask cross-script lexical-scope bugs.
 new Function(initBridgeScript)();
+// initBridgeTail deletes the bootstrap scope; keep it for the Relays screen checks below.
+const bridgeBootstrapScope = globalThis.__gaiusNettyBridgeBootstrapScope;
 new Function(initBridgeTailScript)();
 new Function(outboundScript)();
 
@@ -472,6 +474,43 @@ assert.equal(stats.relayRegistryNodesLoaded, 2,
         "RelayNode registry entries were not loaded");
 assert.equal(stats.relayRegistryRegistriesLoaded, 2,
         "Nested RelayNode registry entries were not loaded or deduplicated");
+
+// Relays screen: user relays come first, disabled built-ins drop out, each relay only carries
+// the sessions it is for (multiplayer or Open to LAN), and a relay named in the page URL (a LAN
+// invite) is tried first even when it is disabled locally.
+{
+    const scope = bridgeBootstrapScope;
+    const storage = new Map();
+    globalThis.localStorage = { getItem: (key) => storage.has(key) ? storage.get(key) : null };
+    storage.set("gaius.bridgeNodes", JSON.stringify([
+        { url: "wss://user-lan.example/tunnel", name: "LAN relay", use: "lan", priority: 1000, user: true },
+        { url: "wss://user-mp.example/tunnel", name: "MP relay", use: "multiplayer", priority: 999, user: true },
+    ]));
+    storage.set("gaius.disabledRelays", JSON.stringify(["wss://affinity.example/tunnel"]));
+    let urls = scope.bridgeUrls([]);
+    assert.deepEqual(urls.slice(0, 2).map((candidate) => candidate.url),
+        ["wss://user-lan.example/tunnel", "wss://user-mp.example/tunnel"],
+        "User relays were not tried first in their saved order");
+    assert.equal(urls[0].use, "lan", "Relay use was not carried into the candidate");
+    assert.ok(!urls.some((candidate) => candidate.url === "wss://affinity.example/tunnel"),
+        "A disabled built-in relay was still offered");
+    const lanEntry = { host: "lan-server-" + "a".repeat(32) + ".gaius-local", candidates: [], candidateUrls: new Set() };
+    const serverEntry = { host: "play.example.net", candidates: [], candidateUrls: new Set() };
+    scope.appendRelayCandidates(lanEntry, scope.bridgeUrls([]));
+    scope.appendRelayCandidates(serverEntry, scope.bridgeUrls([]));
+    const lanUrls = lanEntry.candidates.map((candidate) => candidate.url);
+    const serverUrls = serverEntry.candidates.map((candidate) => candidate.url);
+    assert.ok(lanUrls.includes("wss://user-lan.example/tunnel") && !lanUrls.includes("wss://user-mp.example/tunnel"),
+        "LAN sessions must use LAN and both-purpose relays only");
+    assert.ok(serverUrls.includes("wss://user-mp.example/tunnel") && !serverUrls.includes("wss://user-lan.example/tunnel"),
+        "Multiplayer sessions must not use LAN-only relays");
+    location.search = "?relay=" + encodeURIComponent("wss://affinity.example");
+    urls = scope.bridgeUrls([]);
+    assert.equal(urls[0].url, "wss://affinity.example/tunnel",
+        "A relay named in the page URL must be tried first, even when disabled locally");
+    location.search = "";
+    globalThis.localStorage = { getItem: () => null };
+}
 
 console.log(JSON.stringify({
     ok: true,

@@ -1139,7 +1139,10 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             const name = typeof rawName === 'string' && rawName.trim()
               ? rawName.trim().slice(0, 80)
               : url;
-            return {url: url, token: token, priority: priority, name: name, direct: false};
+            // Relays screen: a relay serves multiplayer, Open to LAN, or both.
+            const rawUse = object && object.use;
+            const use = rawUse === 'multiplayer' || rawUse === 'lan' ? rawUse : 'both';
+            return {url: url, token: token, priority: priority, name: name, direct: false, use: use};
             }
             function normalizeRelayRegistryUrl(value) {
             try {
@@ -1305,11 +1308,27 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             }
             function bridgeUrls(discovered) {
             const params = new URLSearchParams(location.search || '');
-            const candidates = params.getAll('bridge');
-            const relayAliases = params.getAll('relay');
-            for (let index = 0; index < relayAliases.length; index++) {
-              candidates.push(relayAliases[index]);
+            const candidates = [];
+            // Relays named in the page URL (for example a LAN invite) are explicit: they are
+            // tried first and are never filtered out by the Relays screen's disabled list.
+            const explicit = new Set();
+            const named = params.getAll('bridge').concat(params.getAll('relay'));
+            for (let index = 0; index < named.length; index++) {
+              const explicitUrl = normalizeRelayUrl(named[index]);
+              if (!explicitUrl) continue;
+              explicit.add(explicitUrl);
+              candidates.push({url: explicitUrl, priority: 10000});
             }
+            const disabled = new Set();
+            try {
+              const disabledValues = JSON.parse(localStorage.getItem('gaius.disabledRelays') || '[]');
+              if (Array.isArray(disabledValues)) {
+                for (let index = 0; index < disabledValues.length; index++) {
+                  const disabledUrl = normalizeRelayUrl(disabledValues[index]);
+                  if (disabledUrl) disabled.add(disabledUrl);
+                }
+              }
+            } catch (ignored) {}
             const configured = globalThis.__gaiusBridgeUrls;
             if (Array.isArray(configured)) {
               for (let index = 0; index < configured.length; index++) {
@@ -1339,6 +1358,7 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
               const candidate = relayNodeCandidate(candidates[index]);
               if (!candidate || seen.has(candidate.url)) continue;
               seen.add(candidate.url);
+              if (disabled.has(candidate.url) && !explicit.has(candidate.url)) continue;
               unique.push(candidate);
             }
             unique.sort(function(left, right) { return right.priority - left.priority; });
@@ -1555,6 +1575,11 @@ public final class BrowserWebSocketChannel extends AbstractChannel {
             for (let index = 0; index < candidates.length; index++) {
               const candidate = candidates[index];
               if (!candidate || entry.candidateUrls.has(candidate.url)) continue;
+              // Relays screen: LAN-only relays carry gaius-local sessions only, and
+              // multiplayer-only relays never carry them.
+              const localSession = /\\.gaius-local$/.test(String(entry.host || ''));
+              if (candidate.use === 'lan' && !localSession) continue;
+              if (candidate.use === 'multiplayer' && localSession) continue;
               // This helper lives in a different @JSBody lexical scope in
               // TeaVM output. Keep the LAN role check local to this callback
               // so relay candidate preparation cannot throw ReferenceError.

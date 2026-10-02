@@ -25,24 +25,29 @@ before redistributing generated client files or game assets.
 Open the [latest release](https://github.com/TypeThe0ry/Gaius/releases/latest),
 then download the HTML file that matches the server you want to join:
 
+- [Minecraft 1.21.11 client](https://github.com/TypeThe0ry/Gaius/releases/latest/download/Gaius-1.21.11.html)
 - [Minecraft 26.2 client](https://github.com/TypeThe0ry/Gaius/releases/latest/download/Gaius-26.2.html)
 - [Minecraft 26.3 client](https://github.com/TypeThe0ry/Gaius/releases/latest/download/Gaius-26.3.html)
 - [SHA256 checksums](https://github.com/TypeThe0ry/Gaius/releases/latest/download/SHA256SUMS)
 - The optional Paper plugin is on the same release page.
 
-The HTML files are portable single-player clients (`Gaius-26.2.html` for
-Minecraft 26.2, `Gaius-26.3.html` for Minecraft 26.3). Download one, open it in a
-current Chrome or Chromium browser, and select **Singleplayer**. On first launch
-the in-game **Edit Profile** screen opens so you can pick a player name and,
-optionally, upload a 64x64 PNG skin; reopen it any time from the **Edit Profile**
-button on the title screen. Changes apply without reloading the page. The file
+The HTML files are portable single-player clients (`Gaius-1.21.11.html` for
+Minecraft 1.21.11, `Gaius-26.2.html` for Minecraft 26.2, `Gaius-26.3.html` for
+Minecraft 26.3). 1.21.11 is the pre-26.x line, useful for servers and mod ports
+that still target it. Download one, open it in a
+current Chrome or Chromium browser, and select **Singleplayer**. In the 26.2 and
+26.3 clients the in-game **Edit Profile** screen opens on first launch so you can
+pick a player name and, optionally, upload a 64x64 PNG skin; reopen it any time
+from the **Edit Profile** button on the title screen. Changes apply without
+reloading the page. The 1.21.11 client has no in-game profile editor. The file
 contains the browser launcher and its Worker payloads; there is no separate web
 server to start for this mode.
 
 ### Joining a server
 
-1. Open the downloaded `Gaius-26.2.html` or `Gaius-26.3.html` file in Chrome or
-   Chromium; pick the one whose Minecraft version matches the server.
+1. Open the downloaded `Gaius-1.21.11.html`, `Gaius-26.2.html` or
+   `Gaius-26.3.html` file in Chrome or Chromium; pick the one whose Minecraft
+   version matches the server.
 2. On the title screen, choose **Multiplayer**.
 3. Choose **Add Server** (or **Direct Connection**), enter the server's normal
    Java address such as `example.net:25565`, and choose **Join Server**.
@@ -56,14 +61,15 @@ screen remains on **Waiting for Server**, check the RelayNode URL and target
 ## From source
 
 You need Git LFS, Python 3, Node.js LTS, `curl`, `jq`, `unzip`, `shasum`, and the
-JDK required by the profile you are building. The build keeps each profile's
-Maven state, overlays, and browser output separate.
+JDK required by the profile you are building (JDK 25 or newer for 26.2 and
+26.3, JDK 21 or newer for 1.21.11). The build keeps each profile's Maven state,
+overlays, and browser output separate.
 
 ```sh
 git lfs install
 git lfs pull
 
-for profile in 26.2 26.3; do
+for profile in 1.21.11 26.2 26.3; do
   export GAIUS_VERSION_PROFILE_PATH="versions/${profile}.json"
   ./port/scripts/fetch-version.sh
   ./port/scripts/remap-client.sh
@@ -78,7 +84,7 @@ client is `Gaius.html`. To serve a built profile locally:
 python3 port/scripts/serve-dist.py --host 127.0.0.1 --port 8781
 ```
 
-Then open `/dist/26.2/` or `/dist/26.3/` in Chrome.
+Then open `/dist/1.21.11/`, `/dist/26.2/` or `/dist/26.3/` in Chrome.
 
 ## What is here
 
