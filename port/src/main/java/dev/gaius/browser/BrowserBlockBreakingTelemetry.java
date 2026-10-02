@@ -8,22 +8,27 @@ public final class BrowserBlockBreakingTelemetry {
     }
 
     public static void recordDestroyProgress(int stage) {
+        if (!BrowserBuildFlags.telemetry()) return;
         recordDestroyProgressJs(stage);
     }
 
     public static void recordExtraction() {
+        if (!BrowserBuildFlags.telemetry()) return;
         recordExtractionJs();
     }
 
     public static void recordEmitted() {
+        if (!BrowserBuildFlags.telemetry()) return;
         recordEmittedJs();
     }
 
     public static void recordSubmitPass() {
+        if (!BrowserBuildFlags.telemetry()) return;
         recordSubmitPassJs();
     }
 
     public static void recordActualSubmit() {
+        if (!BrowserBuildFlags.telemetry()) return;
         recordActualSubmitJs();
     }
 

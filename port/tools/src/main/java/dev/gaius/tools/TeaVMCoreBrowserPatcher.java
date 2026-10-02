@@ -97,6 +97,20 @@ public final class TeaVMCoreBrowserPatcher {
      * globalThis.__gaiusNoSuspendDepth positive while it runs. Reaching a real suspension
      * there would leave its frame out of the saved coroutine stack, so the suspension fails
      * fast with the stack of the offending call instead.
+     *
+     * <p>TeaVM wraps the thrown JS Error into a java.lang.RuntimeException, so Java code that
+     * catches Exception or Throwable (CompletableFuture, tick and reload loops) can swallow
+     * it. The guard therefore also counts the violation in
+     * globalThis.__gaiusNoSuspendViolations, keeps the last stack in
+     * __gaiusLastNoSuspendViolation and logs the first ones to the console; the browser
+     * acceptance scripts fail on either (tools/teavm-runtime-guards.mjs).
+     *
+     * <p>A suspension inside a class initializer that syncClinits rendered behind the
+     * globalThis.__gaiusClinitDepth counter is only counted
+     * (__gaiusClinitSuspensions, first stack in __gaiusFirstClinitSuspension) and logged once
+     * as a warning: it is valid when the initializer was triggered from an async caller and
+     * corrupts the coroutine stack ("Invalid recorded state") when the caller is synchronous,
+     * which the runtime cannot tell apart.
      */
     static final String THREAD_SUSPEND_GUARDED = """
             TeaVMThread.prototype.suspend = function(callback) {
@@ -112,7 +126,27 @@ public final class TeaVMCoreBrowserPatcher {
                         (globalThis.__gaiusNoSuspendViolations | 0) + 1;
                     globalThis.__gaiusLastNoSuspendViolation =
                         teavm_globals.String(gaiusError.stack || gaiusError);
+                    if (globalThis.__gaiusNoSuspendViolations <= 8
+                            && typeof teavm_globals.console === "object") {
+                        teavm_globals.console.error(gaiusError);
+                    }
                     throw gaiusError;
+                }
+                if ((globalThis.__gaiusClinitDepth | 0) > 0) {
+                    globalThis.__gaiusClinitSuspensions =
+                        (globalThis.__gaiusClinitSuspensions | 0) + 1;
+                    if (globalThis.__gaiusClinitSuspensions === 1) {
+                        let gaiusNotice = new teavm_globals.Error("Gaius: a TeaVM suspension "
+                            + "was reached inside a class initializer. It is only safe when "
+                            + "the initializer was triggered from an async caller "
+                            + "(gaius.teavm.syncClinits); an 'Invalid recorded state' error "
+                            + "or a half-initialized class after this points here.");
+                        globalThis.__gaiusFirstClinitSuspension =
+                            teavm_globals.String(gaiusNotice.stack || gaiusNotice);
+                        if (typeof teavm_globals.console === "object") {
+                            teavm_globals.console.warn(gaiusNotice);
+                        }
+                    }
                 }
                 this.suspendCallback = callback;
                 this.status = 1;
@@ -547,6 +581,11 @@ public final class TeaVMCoreBrowserPatcher {
      * The patch records the top-level counter when the scope switch happens and gives a
      * pinned runtime function ({@link GaiusTeaVMOptions#isPinnedRuntimeName}) a fresh
      * top-level name from that counter.
+     *
+     * <p>The switch happens inside createTopLevelName, so a pinned name requested before it
+     * still takes the regular path; when that very call switched to the scope (the returned
+     * name is scoped), the scoped name is dropped and the pinned allocation runs instead.
+     * The dropped scope suffix is never rendered.
      */
     static ClassNode patchMinifyingAliasProvider(ClassNode node) {
         requireField(node, "lastSuffix", "I");
@@ -624,40 +663,84 @@ public final class TeaVMCoreBrowserPatcher {
         code.add(new InsnNode(Opcodes.ARETURN));
         node.methods.add(pinned);
 
+        MethodNode functionAlias = method(node, "getFunctionAlias",
+                "(Ljava/lang/String;)L" + SCOPED_NAME + ";");
+        requireCall(functionAlias, MINIFYING_ALIASES, "createTopLevelName", "()L" + SCOPED_NAME + ";");
         InsnList redirect = new InsnList();
         LabelNode regular = new LabelNode();
+        LabelNode pinnedName = new LabelNode();
+        LabelNode dropScoped = new LabelNode();
         redirect.add(new VarInsnNode(Opcodes.ALOAD, 1));
         redirect.add(options("isPinnedRuntimeName", "(Ljava/lang/String;)Z"));
         redirect.add(new JumpInsnNode(Opcodes.IFEQ, regular));
         redirect.add(new VarInsnNode(Opcodes.ALOAD, 0));
         redirect.add(new FieldInsnNode(Opcodes.GETFIELD, MINIFYING_ALIASES, "additionalScopeStarted", "Z"));
-        redirect.add(new JumpInsnNode(Opcodes.IFEQ, regular));
+        redirect.add(new JumpInsnNode(Opcodes.IFNE, pinnedName));
+        redirect.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        redirect.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, MINIFYING_ALIASES, "createTopLevelName",
+                "()L" + SCOPED_NAME + ";", false));
+        redirect.add(dropScopedName(dropScoped));
+        redirect.add(pinnedName);
         redirect.add(new VarInsnNode(Opcodes.ALOAD, 0));
         redirect.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, MINIFYING_ALIASES, PINNED_NAME_METHOD,
                 "()L" + SCOPED_NAME + ";", false));
         redirect.add(new InsnNode(Opcodes.ARETURN));
         redirect.add(regular);
-        method(node, "getFunctionAlias", "(Ljava/lang/String;)L" + SCOPED_NAME + ";")
-                .instructions.insert(redirect);
+        functionAlias.instructions.insert(redirect);
         return node;
+    }
+
+    /**
+     * Stack: the ScopedName of the regular allocation. Returns it when it is top-level;
+     * otherwise pops it and falls through at {@code dropScoped} (placed at the end of the
+     * returned list) to the pinned allocation that follows.
+     */
+    private static InsnList dropScopedName(LabelNode dropScoped) {
+        InsnList code = new InsnList();
+        code.add(new InsnNode(Opcodes.DUP));
+        code.add(new FieldInsnNode(Opcodes.GETFIELD, SCOPED_NAME, "scoped", "Z"));
+        code.add(new JumpInsnNode(Opcodes.IFNE, dropScoped));
+        code.add(new InsnNode(Opcodes.ARETURN));
+        code.add(dropScoped);
+        code.add(new InsnNode(Opcodes.POP));
+        return code;
+    }
+
+    /** The regular alias allocation the redirect falls back to must still be this call. */
+    private static void requireCall(MethodNode method, String owner, String name, String desc) {
+        single(method, owner + "." + name + " call",
+                insn -> insn instanceof MethodInsnNode call && call.owner.equals(owner)
+                        && call.name.equals(name) && call.desc.equals(desc));
     }
 
     /**
      * DefaultAliasProvider (readable names) has the same top-level budget. A pinned runtime
      * function past the budget keeps its own name as a top-level binding: runtime function
      * names are unique, valid identifiers and no Java member alias starts with "$rt_" or
-     * "Long_".
+     * "Long_". As in {@link #patchMinifyingAliasProvider}, the pinned name requested by the
+     * call that switches to the scope (inside makeUnique) drops the scoped result.
      */
     static ClassNode patchDefaultAliasProvider(ClassNode node) {
         requireField(node, "additionalScopeStarted", "Z");
+        String makeUniqueDesc = "(Ljava/lang/String;)L" + SCOPED_NAME + ";";
+        MethodNode functionAlias = method(node, "getFunctionAlias", makeUniqueDesc);
+        requireCall(functionAlias, DEFAULT_ALIASES, "makeUnique", makeUniqueDesc);
         InsnList redirect = new InsnList();
         LabelNode regular = new LabelNode();
+        LabelNode pinnedName = new LabelNode();
+        LabelNode dropScoped = new LabelNode();
         redirect.add(new VarInsnNode(Opcodes.ALOAD, 1));
         redirect.add(options("isPinnedRuntimeName", "(Ljava/lang/String;)Z"));
         redirect.add(new JumpInsnNode(Opcodes.IFEQ, regular));
         redirect.add(new VarInsnNode(Opcodes.ALOAD, 0));
         redirect.add(new FieldInsnNode(Opcodes.GETFIELD, DEFAULT_ALIASES, "additionalScopeStarted", "Z"));
-        redirect.add(new JumpInsnNode(Opcodes.IFEQ, regular));
+        redirect.add(new JumpInsnNode(Opcodes.IFNE, pinnedName));
+        redirect.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        redirect.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        redirect.add(new MethodInsnNode(Opcodes.INVOKESPECIAL, DEFAULT_ALIASES, "makeUnique",
+                makeUniqueDesc, false));
+        redirect.add(dropScopedName(dropScoped));
+        redirect.add(pinnedName);
         redirect.add(new TypeInsnNode(Opcodes.NEW, SCOPED_NAME));
         redirect.add(new InsnNode(Opcodes.DUP));
         redirect.add(new VarInsnNode(Opcodes.ALOAD, 1));
@@ -666,8 +749,7 @@ public final class TeaVMCoreBrowserPatcher {
                 "(Ljava/lang/String;Z)V", false));
         redirect.add(new InsnNode(Opcodes.ARETURN));
         redirect.add(regular);
-        method(node, "getFunctionAlias", "(Ljava/lang/String;)L" + SCOPED_NAME + ";")
-                .instructions.insert(redirect);
+        functionAlias.instructions.insert(redirect);
         return node;
     }
 

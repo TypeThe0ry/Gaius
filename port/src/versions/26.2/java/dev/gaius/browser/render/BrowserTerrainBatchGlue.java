@@ -87,6 +87,10 @@ public final class BrowserTerrainBatchGlue {
         @SuppressWarnings("unchecked")
         List<RenderPass.Draw<GpuBufferSlice[]>> list =
                 (List<RenderPass.Draw<GpuBufferSlice[]>>) draws;
+        // Draws that are not batched go to vanilla in contiguous spans, one call each, so a
+        // list of mostly single-draw runs (interleaved heaps) keeps vanilla's per-call setup
+        // cost instead of paying it once per section. Spans keep the original draw order.
+        int spanStart = 0;
         int start = 0;
         while (start < size) {
             RenderPass.Draw<GpuBufferSlice[]> first = list.get(start);
@@ -106,18 +110,23 @@ public final class BrowserTerrainBatchGlue {
                 }
                 end++;
             }
-            // The run's first draw stays vanilla: it binds pipeline, vertex array, index
-            // buffer and every uniform the batch then reuses.
-            pass.drawMultipleIndexed(
-                    list.subList(start, start + 1), indexBuffer, indexType, uniformNames,
-                    sectionSlices);
-            if (end - start > 1
-                    && !submitRun(list, start + 1, end, runIndexType, custom)) {
+            if (end - start > 1) {
+                // The run's first draw stays vanilla and ends the pending span: as the last
+                // draw of that call it leaves pipeline, vertex array, index buffer and every
+                // uniform bound for the batch. A rejected batch just extends the span.
                 pass.drawMultipleIndexed(
-                        list.subList(start + 1, end), indexBuffer, indexType, uniformNames,
-                        sectionSlices);
+                        list.subList(spanStart, start + 1), indexBuffer, indexType,
+                        uniformNames, sectionSlices);
+                spanStart = submitRun(list, start + 1, end, runIndexType, custom)
+                        ? end
+                        : start + 1;
             }
             start = end;
+        }
+        if (spanStart < size) {
+            pass.drawMultipleIndexed(
+                    list.subList(spanStart, size), indexBuffer, indexType, uniformNames,
+                    sectionSlices);
         }
     }
 

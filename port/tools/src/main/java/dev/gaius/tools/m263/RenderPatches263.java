@@ -2,7 +2,6 @@ package dev.gaius.tools.m263;
 
 import dev.gaius.tools.ModernSymbols;
 import dev.gaius.tools.PatchRegistry;
-import dev.gaius.tools.quality.GraphicsPresetStartupPatcher;
 import dev.gaius.tools.quality.QualityPatches263;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -65,9 +64,9 @@ import org.objectweb.asm.tree.VarInsnNode;
  *       {@code QualityPatches263.patchImprovedTransparencyByTier} replaces the former
  *       {@code patchImprovedTransparencyOff}: order-independent transparency (float colour
  *       targets) now runs when the context can render and blend float targets and the GPU tier
- *       is high or ultra, and the video settings only offer it there;
- *       {@code GraphicsPresetStartupPatcher} stops {@code Minecraft.<init>} from re-applying the
- *       saved graphics preset over the seeded per-tier options;
+ *       is high or ultra, and the video settings only offer it there (the graphics preset
+ *       startup replay, shared with 26.2, is patched once per profile by
+ *       {@code Minecraft262BrowserPatcher.patchGraphicsPresetStartupReplay});
  *       {@code QualityPatches263.patchLevelQualityHooks} installs the world render-scale and
  *       post-processing hooks; {@code QualityPatches263.patchInventoryWorldRenderThrottle}
  *       renders the world behind inventory screens at a reduced rate instead of freezing it.</li>
@@ -137,13 +136,6 @@ public final class RenderPatches263 {
                 () -> patchGlBufferExplicitFlush(jar, root, symbols));
         PatchRegistry.run("RenderPatches263.patchImprovedTransparencyByTier",
                 () -> QualityPatches263.patchImprovedTransparencyByTier(jar, root, symbols));
-        PatchRegistry.run("RenderPatches263.patchGraphicsPresetStartupReplay",
-                () -> {
-                    if (!GraphicsPresetStartupPatcher.apply(jar, root)) {
-                        throw new IllegalStateException(
-                                "26.3 must have the graphics preset startup replay");
-                    }
-                });
         PatchRegistry.run("RenderPatches263.patchLevelQualityHooks",
                 () -> QualityPatches263.patchLevelQualityHooks(jar, root, symbols));
         PatchRegistry.run("RenderPatches263.patchSetupDrawUseProgramBeforeVertexArrayBind",

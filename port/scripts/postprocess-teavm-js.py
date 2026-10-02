@@ -58,13 +58,22 @@ INTEGRATED_SERVER_EXPORT_PATTERN = re.compile(
     r"(?P<function>[A-Za-z_$][A-Za-z0-9_$]*)\s*;"
 )
 
+# A declaration of the thread starter on a scope object ("runtime.$rt_startThread=").
 RUNTIME_THREAD_START_PATTERN = re.compile(
-    r"(?P<call>[A-Za-z_$][A-Za-z0-9_$]*\.\$rt_startThread)\s*="
+    r"(?<![A-Za-z0-9_$.])(?P<call>[A-Za-z_$][A-Za-z0-9_$]*\.\$rt_startThread)\s*="
 )
 
-MINIFIED_RUNTIME_THREAD_START_PATTERN = re.compile(
-    r"(?P<call>[A-Za-z_$][A-Za-z0-9_$]*\.[A-Za-z_$][A-Za-z0-9_$]*)"
-    r"\(\(\)=>\{f\.call\(null,javaArgs\);\},callback\);"
+# The thread starter call in TeaVM 0.15 runtime.js $rt_mainStarter:
+#     $rt_startThread(() => { f.call(null, javaArgs); }, callback);
+# Template locals (f, javaArgs, callback) keep their names in minified output. The
+# starter itself is a scope property past the top-level name budget ("A.HGZ("), a
+# top-level binding when it fits the budget or gaius.teavm.pinRuntimeNames pins it
+# ("Xab("), and keeps its own name in readable output ("$rt_startThread(").
+RUNTIME_THREAD_START_CALL_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_$.])"
+    r"(?P<call>(?:[A-Za-z_$][A-Za-z0-9_$]*\.)?[A-Za-z_$][A-Za-z0-9_$]*)"
+    r"\(\s*\(\s*\)\s*=>\s*\{\s*f\.call\(\s*null\s*,\s*javaArgs\s*\)\s*;?\s*\}"
+    r"\s*,\s*callback\s*\)"
 )
 
 THREAD_SLOT_MARKER = "/*gaius-module-thread-slot*/"
@@ -313,13 +322,15 @@ def module_level_thread_slot(text: str) -> tuple[str, str | None]:
         raise RuntimeShapeError("TeaVMThread.prototype.run was not found")
     slot = run.group("slot")
     # Anchored at a token offset of the slot: "<slot>=null;let <getter>=()=><slot>"
-    # (scoped slot) or "<slot>=null,<getter>=()=><slot>" (binding in a let list).
+    # (scoped slot) or "<slot>=null,<getter>=()=><slot>" (binding in a let list). The
+    # getter itself may be a scope property ("<slot>=null;A.F=()=><slot>") when the
+    # top-level name budget ran out exactly at it; it is only used in log messages.
     declaration_pattern = re.compile(
         re.escape(slot)
         + r"\s*=\s*(?P<marker>"
         + re.escape(THREAD_SLOT_MARKER)
         + r")?null"
-        + rf"(?P<separator>\s*[;,]\s*(?:let\s+)?)(?P<getter>{IDENTIFIER})"
+        + rf"(?P<separator>\s*[;,]\s*(?:let\s+)?)(?P<getter>{IDENTIFIER}(?:\.{IDENTIFIER})?)"
         + r"\s*=\s*\(\s*\)\s*=>\s*"
         + re.escape(slot)
         + r"(?![A-Za-z0-9_$])"
@@ -446,9 +457,21 @@ def main(argv: list[str]) -> int:
                 f"TeaVM server Worker already contains coroutine input pump: {target}"
             )
         else:
-            runtime = RUNTIME_THREAD_START_PATTERN.search(patched)
+            runtime = find_anchored(
+                RUNTIME_THREAD_START_CALL_PATTERN,
+                patched,
+                "javaArgs",
+                before=192,
+                after=256,
+            )
             if runtime is None:
-                runtime = MINIFIED_RUNTIME_THREAD_START_PATTERN.search(patched)
+                runtime = find_anchored(
+                    RUNTIME_THREAD_START_PATTERN,
+                    patched,
+                    "$rt_startThread",
+                    before=128,
+                    after=128,
+                )
             if runtime is None:
                 print(
                     f"TeaVM native thread starter was not found in {target}; "

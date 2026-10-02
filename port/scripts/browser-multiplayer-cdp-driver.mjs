@@ -26,6 +26,11 @@ import {tmpdir} from "node:os";
 import {dirname, join, resolve} from "node:path";
 import process from "node:process";
 import WebSocket from "../../apps/bridge/node_modules/ws/wrapper.mjs";
+import {
+  RUNTIME_GUARD_EXPRESSION,
+  clinitSuspensionCount,
+  runtimeGuardFailures,
+} from "../../tools/teavm-runtime-guards.mjs";
 
 const DRIVER_NAME = "gaius-headed-chrome-multiplayer-cdp-driver";
 const SCHEMA_VERSION = 3;
@@ -757,6 +762,7 @@ const EVALUATE_EXPRESSION = String.raw`(() => {
       ]),
       fps: pick(fps, ["samples", "lowSamples", "average", "min", "p99", "last"]),
       gl: pick(gl, ["drawCalls", "frames", "finishCalls", "readPixelsCalls"]),
+      runtimeGuards: ${RUNTIME_GUARD_EXPRESSION},
       canvas: canvas ? {width: finite(canvas.width), height: finite(canvas.height)} : null,
       bootTimings: pick(boot, [
         "pageStart", "vanillaAssetsRequestStart", "vanillaAssetsDecoded", "vanillaAssetsReady",
@@ -1550,6 +1556,16 @@ async function run(config) {
     for (const client of output.clients) {
       client.summary = summarizeClient(client);
       if (client.failure) output.findings.push(`client ${client.index + 1} page diagnostic error captured`);
+      // The guard counters restart with every page load (reconnect waves), so
+      // every retained sample is checked, not only the last one.
+      const guardSnapshots = [...client.samples, client.lastSample].map((sample) => sample?.runtimeGuards);
+      client.summary.runtimeGuardFailures = runtimeGuardFailures({
+        snapshots: [...new Set(guardSnapshots)],
+        entries: [...client.events.console, ...client.events.exceptions, ...client.events.logs],
+        label: `client ${client.index + 1}`,
+      });
+      client.summary.clinitSuspensions = clinitSuspensionCount(guardSnapshots);
+      output.violations.push(...client.summary.runtimeGuardFailures);
     }
     output.diagnosticStatus = output.violations.length === 0 ? "completed" : "incomplete";
     output.diagnosticOk = output.diagnosticStatus === "completed";

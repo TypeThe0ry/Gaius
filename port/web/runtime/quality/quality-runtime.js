@@ -3,25 +3,30 @@
 // Registers GaiusQuality.runtime. Load it last (see gpu-caps.js for the order).
 //
 // Frame protocol (26.3 GameRenderer, patched by dev.gaius.tools.quality.QualityPatches263):
-//   beginLevel(width, height, oit)      at GameRenderer.renderLevel entry. Returns the world render
-//       scale in per-mille; Java scales every render-pass viewport whose attachments are
-//       width x height until endLevel, so the world lands in the bottom-left sub-rectangle.
+//   beginLevel(width, height, fullResolution)  at GameRenderer.renderLevel entry. Returns the
+//       world render scale in per-mille (1000 while fullResolution: improved transparency or
+//       entity outlines this frame); Java scales every render-pass viewport whose attachments
+//       are width x height until endLevel, so the world lands in the bottom-left sub-rectangle.
 //   endLevel(color, depth, outline, width, height, rectW, rectH, projection...)  right after
 //       LevelRenderer.render: runs the post chain on the world rectangle and, when the world was
 //       scaled, upscales it (EASU + RCAS) to the full main target before the hand and the GUI
-//       draw. The entity-outline target is stretched the same way so its later blit lines up.
+//       draw. A scaled frame never renders entity outlines (fullResolution); should one carry an
+//       outline texture anyway, that target is stretched the same way so its blit lines up.
 //   inventoryDecision(newScreen)        whether the world render is skipped this frame while an
 //       inventory screen is open (0 render, 1 skip). Skips only once a snapshot exists.
 //   worldFrameDone(color, w, h, skipped, throttled)  after the world section of the frame:
-//       snapshots the finished world while throttled and restores it on skipped frames (26.3
-//       clears the main target at the start of every frame).
+//       snapshots the finished world while throttled and restores it on skipped frames (every
+//       profile clears the main target before the world section). The inventory pair is also
+//       called by 26.2 and 1.21.11 (MinecraftClientPatcher); the other hooks are 26.3 only.
 // Texture arguments are BrowserOpenGL texture names, resolved through window.__gaiusGL.
 //
 // Wiring that lives outside this directory: the launcher loads the six scripts before the
 // client starts and calls GaiusQuality.caps.ensureTier() after storage is ready; the SDL/GLFW
 // canvas code calls GaiusQuality.runtime.onContext(gl) right after creating window.__gaiusWebGL
-// and sizes the canvas with GaiusQuality.runtime.resolvePixelRatio(devicePixelRatio). Without
-// that wiring the runtime attaches lazily on the first frame and the canvas keeps its old cap.
+// and sizes the canvas with GaiusQuality.runtime.resolvePixelRatio(devicePixelRatio), which is
+// the device ratio capped per tier (1 on low and mid, and on every profile but 26.3), not the
+// native ratio. Without that wiring the runtime attaches lazily on the first frame and the
+// canvas keeps its old cap.
 (function installGaiusQualityRuntime(root) {
   "use strict";
   if (!root) return;
@@ -59,7 +64,8 @@
     res: null,
     failed: false,
     idleFrames: 0,
-    scale: {current: 1, ewma: 0, last: 0, slow: 0, fast: 0},
+    scale: {current: 1, ewma: 0, last: 0, slow: 0, fast: 0, frame: 0, upAt: -1e9, downAt: -1e9,
+        upFrames: 180},
     inventory: {
       active: false,
       lastRender: 0,
@@ -164,8 +170,13 @@
   }
 
   // Automatic render scale: EWMA of the world frame interval against the target frame time,
-  // stepping one quantized scale at a time with hysteresis (down after 45 slow frames, up after
-  // 180 fast ones).
+  // stepping one quantized scale at a time with hysteresis (down after 45 frames slower than
+  // 1.2x the target, up after 180 frames that meet it). Meeting the target counts as fast: with
+  // VSync or a frame cap at the target rate the interval never drops below the target, so a
+  // stricter bound would keep a stutter-induced step down forever. A step up that is undone
+  // within 300 frames doubles the frames the next step up needs (up to 1800), so a load near the
+  // threshold does not blur and sharpen the world every few seconds; holding a stepped-up scale
+  // for 1800 frames restores the 180-frame wait.
   function autoScaleTick(s) {
     const a = state.scale;
     const t = now();
@@ -175,6 +186,8 @@
     }
     a.last = t;
     if (s.renderScaleMode !== "auto") return;
+    a.frame++;
+    if (a.upFrames > 180 && a.upAt > a.downAt && a.frame - a.upAt >= 1800) a.upFrames = 180;
     const steps = s.renderScaleSteps;
     let index = steps.indexOf(a.current);
     if (index < 0) index = steps.length - 1;
@@ -182,7 +195,7 @@
     if (a.ewma > target * 1.2) {
       a.slow++;
       a.fast = 0;
-    } else if (a.ewma < target * 0.8) {
+    } else if (a.ewma <= target * 1.05) {
       a.fast++;
       a.slow = 0;
     } else {
@@ -193,22 +206,26 @@
       a.current = steps[index - 1];
       a.slow = 0;
       a.ewma = 0;
-    } else if (a.fast >= 180 && index < steps.length - 1) {
+      if (a.frame - a.upAt < 300) a.upFrames = Math.min(a.upFrames * 2, 1800);
+      a.downAt = a.frame;
+    } else if (a.fast >= a.upFrames && index < steps.length - 1) {
       a.current = steps[index + 1];
       a.fast = 0;
       a.ewma = 0;
+      a.upAt = a.frame;
     }
   }
 
-  function beginLevel(width, height, oit) {
+  function beginLevel(width, height, fullResolution) {
     stats.frames++;
     if (!ready() || !Q.upscaler) return 1000;
     const s = settings();
     autoScaleTick(s);
     let scale = s.renderScaleMode === "auto" ? state.scale.current : s.renderScale;
-    // OIT composites full-screen targets with normalized coordinates inside the level render, so
-    // it cannot run on a sub-rectangle; tiny windows are not worth scaling.
-    if (oit || width < 320 || height < 200 || !(scale > 0) || scale > 1) scale = 1;
+    // OIT and the entity-outline post chain composite full-screen targets with normalized
+    // coordinates inside the level render, so they cannot run on a sub-rectangle (Java passes
+    // fullResolution for either); tiny windows are not worth scaling.
+    if (fullResolution || width < 320 || height < 200 || !(scale > 0) || scale > 1) scale = 1;
     stats.renderScale = scale;
     return Math.round(scale * 1000);
   }

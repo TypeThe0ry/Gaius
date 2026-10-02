@@ -101,7 +101,8 @@ public final class BrowserFilePersistence {
     /**
      * High tier (discrete GPUs): Fancy with full biome blend and weather; improved transparency
      * is requested but only runs where the context renders and blends float targets
-     * ({@code BrowserQualityCaps}).
+     * ({@code BrowserQualityCaps}). 26.3 only: the other profiles seed it off and cap the
+     * render distance at 8 ({@link #defaultBrowserOptions}).
      */
     private static final String HIGH_TIER_GRAPHICS_DEFAULTS = String.join("\n",
             "graphicsPreset:\"fancy\"",
@@ -681,6 +682,16 @@ public final class BrowserFilePersistence {
                     .replace("maxAnisotropyBit:1\n",
                             "ultra".equals(tier) ? "maxAnisotropyBit:3\n" : "maxAnisotropyBit:2\n")
                     .replace("textureFiltering:0\n", "textureFiltering:2\n");
+        }
+        // Improved transparency is capability-gated only on 26.3 (BrowserQualityCaps); the
+        // 26.2 and 1.21.11 transparency post chain has no gate, so their seeds keep it off.
+        // Their Worker world generation also stays at the 8/6 distance their graphics presets
+        // are pinned to.
+        if (!storageConfigurationSignature().startsWith("26.3|")) {
+            graphics = graphics
+                    .replace("improvedTransparency:true\n", "improvedTransparency:false\n")
+                    .replace("renderDistance:10\n", "renderDistance:8\n")
+                    .replace("renderDistance:12\n", "renderDistance:8\n");
         }
         return "version:" + currentDataVersion() + "\n" + BROWSER_OPTION_COMMON_DEFAULTS
                 + graphics;

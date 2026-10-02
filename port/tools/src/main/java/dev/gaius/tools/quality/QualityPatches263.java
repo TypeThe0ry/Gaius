@@ -38,7 +38,8 @@ import org.objectweb.asm.tree.VarInsnNode;
  *       {@code BrowserQualityOptions.filterQualityOptions}, hiding the option elsewhere.</li>
  *   <li>{@link #patchLevelQualityHooks}: world render scale and post-processing hook points.
  *       {@code GameRenderer.renderLevel} calls {@code BrowserQualityFrame.beginLevel(width,
- *       height, useImprovedTransparency())} on entry and {@code endLevel(color, depth, outline,
+ *       height, useImprovedTransparency() | levelRenderState.shouldShowEntityOutlines)} on entry
+ *       (either keeps the frame at full resolution) and {@code endLevel(color, depth, outline,
  *       projection)} right after {@code LevelRenderer.render(...)}, before the hand renders;
  *       {@code GlCommandEncoder.createRenderPass} sends the width and height of its
  *       {@code GlStateManager._viewport(0, 0, w, h)} through {@code levelViewportWidth/Height};
@@ -232,8 +233,10 @@ public final class QualityPatches263 {
         QualityClasses.requireMethod(target, "getDepthTexture", "()L" + gpuTexture + ";");
         QualityClasses.requireField(QualityClasses.read(jar, root, GAME_RENDER_STATE),
                 "levelRenderState", "L" + LEVEL_RENDER_STATE + ";");
-        QualityClasses.requireField(QualityClasses.read(jar, root, LEVEL_RENDER_STATE),
-                "cameraRenderState", "L" + CAMERA_RENDER_STATE + ";");
+        ClassNode levelState = QualityClasses.read(jar, root, LEVEL_RENDER_STATE);
+        QualityClasses.requireField(levelState, "cameraRenderState",
+                "L" + CAMERA_RENDER_STATE + ";");
+        QualityClasses.requireField(levelState, "shouldShowEntityOutlines", "Z");
         QualityClasses.requireField(QualityClasses.read(jar, root, CAMERA_RENDER_STATE),
                 "projectionMatrix", "Lorg/joml/Matrix4f;");
         QualityClasses.requireField(QualityClasses.read(jar, root, MINECRAFT),
@@ -328,6 +331,18 @@ public final class QualityPatches263 {
         begin.add(new VarInsnNode(Opcodes.ALOAD, 0));
         begin.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, GAME_RENDERER,
                 "useImprovedTransparency", "()Z", false));
+        // The entity_outline post chain runs inside LevelRenderer.render on main-target-sized
+        // targets with full-texture screen-quad UVs, so a scaled viewport would shrink the
+        // outline once per pass. LevelExtractor sets this flag during extraction, before
+        // renderLevel; it is wider than LevelRenderer.currentFrameRendersEntityOutline.
+        begin.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        begin.add(new FieldInsnNode(Opcodes.GETFIELD, GAME_RENDERER, "gameRenderState",
+                "L" + GAME_RENDER_STATE + ";"));
+        begin.add(new FieldInsnNode(Opcodes.GETFIELD, GAME_RENDER_STATE, "levelRenderState",
+                "L" + LEVEL_RENDER_STATE + ";"));
+        begin.add(new FieldInsnNode(Opcodes.GETFIELD, LEVEL_RENDER_STATE,
+                "shouldShowEntityOutlines", "Z"));
+        begin.add(new InsnNode(Opcodes.IOR));
         begin.add(new MethodInsnNode(Opcodes.INVOKESTATIC, QUALITY_FRAME, "beginLevel", "(IIZ)V",
                 false));
         insertAtEntry(renderLevel, begin);

@@ -53,9 +53,17 @@ output="$(gaius_resolve_path "$root" "${GAIUS_POM:-$build_root/generated-pom.xml
 #                        value instead of covering every name.  The old 10000
 #                        had no recorded reason.
 #   SYNC_CLINITS         class-initialization edges do not make callers async.
+#                        Cooperative yields are skipped inside a class
+#                        initializer, so the client does not repaint while
+#                        Blocks and Items initialize (startup progress events
+#                        still record).  It can be turned off for one role
+#                        without touching SYNC_MONITORS or ASYNC_BARRIER.
 #   SYNC_MONITORS        java.lang.Object monitor primitives are compiled
 #                        synchronously; a monitor held across a suspension
-#                        that another green thread waits for fails fast.
+#                        that another green thread waits for fails fast.  A
+#                        contended synchronized method compiled synchronously
+#                        throws "Can't enter monitor from another thread
+#                        synchronously" from monitorEnterSync instead.
 #   ASYNC_BARRIER        comma-separated barrier groups (object, throwable,
 #                        map, collection, iterator, stringbuilder) or none;
 #                        see GaiusTeaVMOptions for the member methods.
@@ -196,8 +204,8 @@ fi
 # lists shared relative paths the profile does not compile (format: see
 # gaius_version_excludes in version-profile.sh).  The merged tree is staged
 # under $build_root/sources and becomes the only Maven source directory.  A
-# profile without a version directory (26.2) stages an exact copy of
-# port/src/main/java.
+# profile without a version directory stages an exact copy of
+# port/src/main/java (every current profile, 1.21.11, 26.2 and 26.3, has one).
 #
 # The staged tree is replaced only when its content changes, and a replaced
 # tree is copied without preserving modification times.  A staged path can

@@ -43,8 +43,13 @@ public final class BrowserGuiEntityTelemetry {
         recordJs(countKey, valueKey, value);
     }
 
+    /** Always false in a build that strips telemetry, without asking the page. */
+    private static boolean enabled() {
+        return BrowserBuildFlags.telemetry() && enabledJs();
+    }
+
     @JSBody(script = "return globalThis.__gaiusEntityRenderTelemetryEnabled === true;")
-    private static native boolean enabled();
+    private static native boolean enabledJs();
 
     @JSBody(params = {"countKey", "valueKey", "value"}, script = """
             try {

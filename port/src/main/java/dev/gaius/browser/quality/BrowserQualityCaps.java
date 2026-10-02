@@ -10,7 +10,8 @@ import org.teavm.jso.JSBody;
  * {@code GameRenderer.useImprovedTransparency()} in {@link #filterImprovedTransparency}: the
  * player's option still decides, but order-independent transparency only runs when the context
  * renders and blends float colour targets ({@code EXT_color_buffer_float},
- * {@code EXT_float_blend}, complete RGBA16F/RGBA32F framebuffers, two draw buffers) and the GPU
+ * {@code EXT_float_blend}, complete RGBA16F/RGBA32F framebuffers, two draw buffers with
+ * per-buffer blend enables and write masks through {@code OES_draw_buffers_indexed}) and the GPU
  * tier is high or ultra ({@code ?gaiusOit=1} lifts the tier condition, {@code ?gaiusOit=0}
  * forces the previous always-off behaviour). Without the runtime the answer is "off", which is
  * the behaviour of earlier releases.

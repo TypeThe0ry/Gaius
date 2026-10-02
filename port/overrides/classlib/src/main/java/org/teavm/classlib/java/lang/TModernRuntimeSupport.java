@@ -100,7 +100,8 @@ public final class TModernRuntimeSupport {
      * Suspends only the current TeaVM continuation without installing a Thread interrupt handler.
      * Browser world generation can have several continuations sharing one emulated Java thread;
      * using TThread.sleep there lets an unrelated wake-up cancel the wrong continuation.
-     * Returns at once while a class initializer runs (see {@link #inClassInitializer}).
+     * Returns at once while a class initializer or a method that the role options compiled
+     * synchronously runs (see {@link #inClassInitializer}).
      */
     public static void yieldToEventLoop(int delayMillis) {
         if (inClassInitializer()) {
@@ -110,14 +111,21 @@ public final class TModernRuntimeSupport {
     }
 
     /**
-     * True while a TeaVM class initializer runs. The server Worker is compiled with class
-     * initialization edges that do not make their callers TeaVM-async
+     * True while the current frame must not suspend: a TeaVM class initializer, or a method
+     * that the role options compiled synchronously, is on the stack. Both roles are compiled
+     * with class initialization edges that do not make their callers TeaVM-async
      * (gaius.teavm.syncClinits, TeaVMCoreBrowserPatcher), so a static initializer can run
-     * under a synchronous caller and must not suspend: cooperative yields are skipped while
-     * the patched TeaVM's globalThis.__gaiusClinitDepth counter is positive. Builds without
-     * that option never set the counter.
+     * under a synchronous caller; the patched TeaVM counts those frames in
+     * globalThis.__gaiusClinitDepth. Methods cut by gaius.teavm.asyncBarrier or
+     * gaius.teavm.syncMonitors keep globalThis.__gaiusNoSuspendDepth positive, and a
+     * suspension reached there throws. Cooperative yields and LockSupport parking are
+     * optional, so their callers skip them while either counter is positive instead of
+     * suspending. Builds without those options never set the counters.
      */
-    @JSBody(script = "return (globalThis.__gaiusClinitDepth | 0) > 0;")
+    @JSBody(script = """
+            return (globalThis.__gaiusClinitDepth | 0) > 0
+              || (globalThis.__gaiusNoSuspendDepth | 0) > 0;
+            """)
     public static native boolean inClassInitializer();
 
     @Async

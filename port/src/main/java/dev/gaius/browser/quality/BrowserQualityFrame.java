@@ -19,12 +19,15 @@ import org.teavm.jso.JSBody;
  *   <li>{@link #endLevel} right after {@code LevelRenderer.render}: ends the scaled section and
  *       lets the runtime run the post-processing chain and upscale the sub-rectangle to the full
  *       target, before the hand, the entity-outline blit, post effects and the GUI.</li>
- *   <li>Inventory screens: {@link #shouldSkipWorldRender} replaces
- *       {@code BrowserOpenGL.shouldSkipWorldRenderForScreen} in 26.3. Instead of freezing the
- *       world after the first frame, the world renders at a reduced rate per tier
+ *   <li>Inventory screens (every profile: {@code QualityPatches263} on 26.3,
+ *       {@code MinecraftClientPatcher.patchGameRendererBrowserInventoryWorldRenderThrottle} on
+ *       26.2 and 1.21.11): {@link #shouldSkipWorldRender} replaces
+ *       {@code BrowserOpenGL.shouldSkipWorldRenderForScreen}. Instead of skipping the world
+ *       after the first frames, the world renders at a reduced rate per tier
  *       ({@code ?gaiusInventoryWorldFps=}); on skipped frames {@link #worldFrameDone} has the
- *       runtime restore the last finished world image, because 26.3 clears the main target at
- *       the start of every frame.</li>
+ *       runtime restore the last finished world image, because every profile clears the main
+ *       target before the world section of each frame (26.2/26.3 in
+ *       {@code GameRenderer.render}, 1.21.11 in {@code Minecraft.runTick}).</li>
  * </ul>
  */
 public final class BrowserQualityFrame {
@@ -47,7 +50,12 @@ public final class BrowserQualityFrame {
     private BrowserQualityFrame() {
     }
 
-    public static void beginLevel(int width, int height, boolean improvedTransparency) {
+    /**
+     * {@code fullResolution} is set when this frame uses improved transparency or renders entity
+     * outlines: both composite main-target-sized targets with full-texture coordinates inside
+     * {@code LevelRenderer.render}, which a scaled viewport would distort.
+     */
+    public static void beginLevel(int width, int height, boolean fullResolution) {
         levelScaled = false;
         viewportWidthScaled = false;
         levelWidth = width;
@@ -57,7 +65,7 @@ public final class BrowserQualityFrame {
         if (width <= 0 || height <= 0) {
             return;
         }
-        int perMille = beginLevelScale(width, height, improvedTransparency);
+        int perMille = beginLevelScale(width, height, fullResolution);
         if (perMille >= 1000 || perMille <= 0) {
             return;
         }
@@ -166,16 +174,16 @@ public final class BrowserQualityFrame {
         inventoryFrames = 0;
     }
 
-    @JSBody(params = {"width", "height", "oit"}, script = """
+    @JSBody(params = {"width", "height", "fullResolution"}, script = """
             var quality = globalThis.GaiusQuality;
             if (!quality || !quality.runtime) return 1000;
             try {
-              return quality.runtime.beginLevel(width, height, oit) | 0;
+              return quality.runtime.beginLevel(width, height, fullResolution) | 0;
             } catch (e) {
               return 1000;
             }
             """)
-    private static native int beginLevelScale(int width, int height, boolean oit);
+    private static native int beginLevelScale(int width, int height, boolean fullResolution);
 
     @JSBody(params = {"color", "depth", "outline", "width", "height", "rectWidth", "rectHeight",
             "m00", "m11", "m20", "m21", "m22", "m23", "m32", "m33"}, script = """

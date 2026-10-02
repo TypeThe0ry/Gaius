@@ -16,6 +16,7 @@ import {analyzeTerrainPng, decodePng, terrainVisualPass} from "../../tools/terra
 import {startWorkerProfiler} from "../../tools/chrome-worker-profiler.mjs";
 import {summarizeFlightReadiness} from "../../tools/flight-readiness.mjs";
 import {configureWorldSeed} from "../../tools/configure-browser-world-seed.mjs";
+import {RUNTIME_GUARD_EXPRESSION,clinitSuspensionCount,runtimeGuardFailures} from "../../tools/teavm-runtime-guards.mjs";
 
 const root = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 // Without GAIUS_VERSION_PROFILE_PATH the default profile is port/config.json's
@@ -1024,14 +1025,27 @@ try {
   }
   runtime = mode==="single" ? singleRuntime : await evaluate(cdp,`(async()=>{let idb='unavailable',storage='unavailable',opfs='unavailable';try{localStorage.setItem('gaius.file.acceptance','1');storage=localStorage.getItem('gaius.file.acceptance')==='1'?'ok':'failed';}catch(e){storage=String(e)}try{if(indexedDB){const r=indexedDB.open('gaius-file-acceptance',1);await new Promise((ok,bad)=>{r.onsuccess=()=>{r.result.close();ok()};r.onerror=()=>bad(r.error||new Error('idb'))});idb='ok';}}catch(e){idb=String(e)}try{opfs=!!navigator.storage?.getDirectory?'ok':'unsupported';}catch(e){opfs=String(e)}return {capturedAt:new Date().toISOString(),stage:'final',protocol:location.protocol,href:location.href,screen:window.__gaiusMinecraftState?.screen||null,level:!!window.__gaiusMinecraftState?.level,portableBuild:!!window.__gaiusPortableBuild,classesUrl:String(window.__gaiusClassesUrl||''),workerUrl:String(window.__gaiusSingleplayerWorkerUrl||''),wasmUrl:String(window.__gaiusHotpathWasmUrl||''),wasm:window.__gaiusWasmHotpath?{ready:!!window.__gaiusWasmHotpath.ready,disabled:!!window.__gaiusWasmHotpath.disabled,error:window.__gaiusWasmHotpath.error||null}:null,storage,idb,opfs,workers:window.__gaiusSingleplayerWorkers?window.__gaiusSingleplayerWorkers.size:null,canvas:document.querySelector('canvas')?.getBoundingClientRect().toJSON()||null,resources:performance.getEntriesByType('resource').map(x=>({name:x.name,duration:x.duration,transferSize:x.transferSize,decodedBodySize:x.decodedBodySize})),events:window.__gaiusMinecraftEvents||[],bridgeTrace:window.__gaiusBridgeTrace||[]};})()`);
   const siblingFileRequests=runtime.resources.filter(x=>x.name.startsWith("file:")&&!x.name.toLowerCase().endsWith(basename(artifact).toLowerCase())).map(x=>x.name); const criticalFailedResources=failedResources.filter(x=>!String(x.url||"").startsWith("http://127.0.0.1:8080/proxy/auth?")); const blobUrls=[runtime.classesUrl,runtime.workerUrl,runtime.wasmUrl].filter(x=>x.startsWith("blob:"));
-  const baseReady=exceptions.length===0&&criticalFailedResources.length===0&&siblingFileRequests.length===0&&runtime.protocol==="file:"&&runtime.portableBuild===true&&blobUrls.length>=3;
-  report={schemaVersion:2,profile:profileId,artifact,artifactIdentity,targetUrl,mode,completed:true,success:false,titleScreen:title,customSkin,singleRuntime,runtime,consoleMessages,exceptions,failedResources,siblingFileRequests,blobUrls,gates:{baseReady,singleRuntimeReady:singleRuntimeGate(mode,singleRuntime)},chromeOutput:chromeOutput.join("").slice(-10000),capturedAt:new Date().toISOString()};
+  // TeaVM suspension guard errors can be swallowed by Java catch blocks, so the
+  // counters and console text are checked besides uncaught exceptions.
+  const runtimeGuards=await evaluate(cdp,RUNTIME_GUARD_EXPRESSION); const guardFailures=runtimeGuardFailures({snapshots:[runtimeGuards],entries:[...consoleMessages,...exceptions],label:"page"});
+  const baseReady=guardFailures.length===0&&exceptions.length===0&&criticalFailedResources.length===0&&siblingFileRequests.length===0&&runtime.protocol==="file:"&&runtime.portableBuild===true&&blobUrls.length>=3;
+  report={schemaVersion:2,profile:profileId,artifact,artifactIdentity,targetUrl,mode,completed:true,success:false,titleScreen:title,customSkin,singleRuntime,runtime,consoleMessages,exceptions,failedResources,siblingFileRequests,blobUrls,runtimeGuards,runtimeGuardFailures:guardFailures,clinitSuspensions:clinitSuspensionCount([runtimeGuards]),gates:{baseReady,singleRuntimeReady:singleRuntimeGate(mode,singleRuntime)},chromeOutput:chromeOutput.join("").slice(-10000),capturedAt:new Date().toISOString()};
   } catch(error) { if(!artifactIdentity){try{artifactIdentity=await fileIdentity(artifact);}catch(_){}} let diagnostic=null; try { diagnostic=await evaluate(cdp,`(()=>{const b=window.__gaiusNettyBridge;return {href:location.href,screen:window.__gaiusMinecraftState?.screen||null,level:!!window.__gaiusMinecraftState?.level,body:(document.body?.innerText||'').slice(0,4000),state:window.__gaiusMinecraftState||null,workers:window.__gaiusSingleplayerWorkers?Array.from(window.__gaiusSingleplayerWorkers.entries()).map(([k,v])=>({key:k,state:v?.state||null,worldgen:v?.worldgen||null,ready:v?.ready||null})):null,events:(window.__gaiusMinecraftEvents||[]).slice(-80),bridgeType:typeof b,bridgeKeys:b?Object.keys(b):null,networkStats:window.__gaiusNetworkStats||null,bridgeStats:b?.stats||null,bridgeInitTrace:window.__gaiusNettyBridgeInitTrace||[],bridgeInitError:window.__gaiusNettyBridgeInitError||null,portableBridgeTrace:window.__gaiusPortableBridgeTrace||[],bridgeTrace:window.__gaiusBridgeTrace||[],bridgeOwn:globalThis===window?Object.getOwnPropertyNames(window).filter(k=>k.toLowerCase().includes('bridge')||k.toLowerCase().includes('network')):[],resources:performance.getEntriesByType('resource').map(x=>({name:x.name,duration:x.duration,transferSize:x.transferSize}))};})()`); } catch(_) {} report={schemaVersion:2,profile:profileId,artifact,artifactIdentity,targetUrl,mode,completed:false,success:false,error:String(error.stack||error),customSkin,singleRuntime,runtime,diagnostic,consoleMessages,exceptions,failedResources,gates:{baseReady:false,singleRuntimeReady:singleRuntimeGate(mode,singleRuntime)},chromeOutput:chromeOutput.join("").slice(-20000),capturedAt:new Date().toISOString()};
 } finally {
   if (workerProfiler && report) {
     report.workerDiagnostic = await workerProfiler.stop();
     if (report.workerDiagnostic.captureProfile) {
       report.workerCpuProfile = report.workerDiagnostic;
+    }
+    // Worker guard counters and console are only visible while the Worker
+    // diagnostic session is attached.
+    const workerEntries=report.workerDiagnostic.entries||[];
+    const workerGuardFailures=workerEntries.flatMap((entry,index)=>runtimeGuardFailures({
+      snapshots:[entry.globals?.runtimeGuards],entries:[...(entry.console||[]),...(entry.exceptions||[])],label:`worker ${index}`}));
+    report.workerClinitSuspensions=clinitSuspensionCount(workerEntries.map(entry=>entry.globals?.runtimeGuards));
+    if(workerGuardFailures.length){
+      report.runtimeGuardFailures=[...(report.runtimeGuardFailures||[]),...workerGuardFailures];
+      report.gates={...(report.gates||{}),baseReady:false};
     }
   }
   const cdpClosed=await closeCdp(cdp);

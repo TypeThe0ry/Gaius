@@ -242,6 +242,30 @@ public final class TerrainPatches263 {
                 calls(upload, RENDER_SCHEDULER, "finishUberNodeCleanup"), 1);
         expect(problems, "UberGpuBuffer upload byte budget",
                 calls(upload, RENDER_SCHEDULER, "noteUploadBytes"), 1);
+        int skippedCheck = -1;
+        int byteCount = -1;
+        int allocate = -1;
+        int position = 0;
+        for (AbstractInsnNode instruction : upload.instructions.toArray()) {
+            if (instruction instanceof MethodInsnNode call) {
+                if (skippedCheck < 0 && call.name.equals("contains")
+                        && call.owner.equals("it/unimi/dsi/fastutil/objects/ObjectOpenHashSet")) {
+                    skippedCheck = position;
+                } else if (call.name.equals("noteUploadBytes")
+                        && call.owner.equals(RENDER_SCHEDULER)) {
+                    byteCount = position;
+                } else if (allocate < 0 && call.name.equals("allocate")
+                        && call.owner.equals("com/mojang/blaze3d/vertex/TlsfAllocator")) {
+                    allocate = position;
+                }
+            }
+            position++;
+        }
+        if (skippedCheck < 0 || byteCount < skippedCheck || allocate < byteCount) {
+            problems.add("UberGpuBuffer upload byte budget must count after the skipped entry"
+                    + " check (contains@" + skippedCheck + ", noteUploadBytes@" + byteCount
+                    + ", allocate@" + allocate + ")");
+        }
 
         ClassNode dispatcher = readCurrent(jar, root, SECTION_RENDER_DISPATCHER);
         MethodNode heapFactory = find(dispatcher, "lambda$new$0",

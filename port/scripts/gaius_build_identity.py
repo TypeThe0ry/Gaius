@@ -28,6 +28,8 @@ WORLDGEN_TELEMETRY_MODES = frozenset(("task-pulsed", "checkpoint-only"))
 
 SOURCE_DIRECTORIES = (
     "port/src/main",
+    # Profile source sets (generate-pom.sh stages them over port/src/main/java).
+    "port/src/versions",
     "port/overrides",
     "port/tools/src/main",
     "port/wasm/hotpath",

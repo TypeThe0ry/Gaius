@@ -360,7 +360,8 @@ try {
   const javap = jdkTool("javap");
   const asmClasspath = [asm, asmTree].join(delimiter);
   execFileSync(javac, [
-    "--release", "21", "-proc:none", "-classpath", asmClasspath, "-d", classes,
+    "--release", "21", "-proc:none", "-classpath", asmClasspath,
+    "-sourcepath", join(repositoryRoot, "port/tools/src/main/java"), "-d", classes,
     join(toolsSource, "Minecraft12111BrowserPatcher.java"),
   ], {encoding: "utf8", timeout: 30_000});
   execFileSync(java, ["-Xverify:all", "-classpath", [classes, asmClasspath].join(delimiter),
@@ -375,6 +376,10 @@ try {
     "dedicated patcher did not emit BrowserChunkGenerationYield.class");
   assert.ok(patchNames.includes("net/minecraft/client/GraphicsPreset.class"),
     "dedicated patcher did not emit GraphicsPreset.class");
+  for (const name of ["net/minecraft/client/Options.class", "net/minecraft/client/Minecraft.class"]) {
+    assert.ok(patchNames.includes(name),
+      `dedicated patcher did not emit ${name} (graphics preset startup replay)`);
+  }
 
   const rawGraphics = execFileSync(javap, ["-classpath", rawClientJar, "-p", "-c",
     "net.minecraft.client.GraphicsPreset"], {
@@ -405,6 +410,16 @@ try {
   assert.equal(graphicsPresetCustomReturn(patchedGraphicsApply),
     graphicsPresetCustomReturn(rawGraphicsApply),
     "1.21.11 CUSTOM graphics preset arm changed");
+  const patchedMinecraft = execFileSync(javap, ["-classpath", clientJar, "-p", "-c",
+    "net.minecraft.client.Minecraft"], {
+      encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: 60_000,
+    });
+  const minecraftInit = method(patchedMinecraft,
+    "public net.minecraft.client.Minecraft(net.minecraft.client.main.GameConfig);");
+  assert.equal(occurrences(minecraftInit, "Options.gaius$applyStartupGraphicsPreset"), 1,
+    "1.21.11 Minecraft.<init> must replay the graphics preset through the startup gate once");
+  assert.equal(occurrences(minecraftInit, "Options.applyGraphicsPreset"), 0,
+    "1.21.11 Minecraft.<init> still re-applies the saved graphics preset unconditionally");
 
   const verifierClasspath = [asm, asmTree, asmAnalysis].join(delimiter);
   execFileSync(javac, [

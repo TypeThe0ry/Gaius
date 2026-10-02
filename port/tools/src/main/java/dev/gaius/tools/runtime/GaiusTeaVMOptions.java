@@ -42,9 +42,28 @@ import java.util.TreeSet;
 public final class GaiusTeaVMOptions {
     public static final String PREFIX = "gaius.teavm.";
     public static final String ROLE = PREFIX + "role";
-    /** Callers of an async class initializer are not made async (see TeaVMCoreBrowserPatcher). */
+    /**
+     * Callers of an async class initializer are not made async (see TeaVMCoreBrowserPatcher).
+     * Cooperative yields (TModernRuntimeSupport.yieldToEventLoop, TLockSupport) are skipped
+     * while a class initializer runs, so on the client the Blocks and Items initializers no
+     * longer repaint at their BrowserStartupScheduler checkpoints: the startup progress events
+     * are still recorded, but the page stays unpainted for those seconds. A real suspension
+     * inside an initializer is counted in globalThis.__gaiusClinitSuspensions (patched
+     * thread.js). The barrier and syncMonitors stay consistent with syncClinits off as well,
+     * because yields and parks are also skipped inside guarded methods
+     * (globalThis.__gaiusNoSuspendDepth), so a role can turn this off on its own.
+     */
     public static final String SYNC_CLINITS = PREFIX + "syncClinits";
-    /** java.lang.Object monitor primitives are compiled synchronously, with a suspension guard. */
+    /**
+     * java.lang.Object monitor primitives are compiled synchronously, with a suspension guard.
+     * Synchronized methods that only became async through the monitor primitives (the
+     * exception construction in monitorExitSync) are then compiled synchronously too, and
+     * TeaVM renders their monitor entry as monitorEnterSync. When such a monitor is contended,
+     * monitorEnterSync throws IllegalStateException("Can't enter monitor from another thread
+     * synchronously") without reaching TeaVMThread.suspend: it is not counted in
+     * globalThis.__gaiusNoSuspendViolations, and the acceptance scripts match the message
+     * text instead.
+     */
     public static final String SYNC_MONITORS = PREFIX + "syncMonitors";
     /** Comma-separated barrier groups (see {@link #BARRIER_GROUPS}), or "none". */
     public static final String ASYNC_BARRIER = PREFIX + "asyncBarrier";

@@ -7,6 +7,12 @@
 // exactly as the GL context reported it before the group started. Passes never touch the game's
 // buffers, vertex arrays or uniform-buffer bindings; full-screen triangles come from gl_VertexID
 // with a private empty vertex array.
+//
+// Blend enable and colour write mask are per draw buffer under OES_draw_buffers_indexed, and the
+// 26.3 renderer caches them per index (its order-independent transparency pipelines blend into
+// several attachments). Passes only write draw buffer 0, so with the extension they change and
+// restore index 0 alone; the non-indexed enable/colorMask calls would overwrite every index
+// behind the game's back.
 (function installGaiusGlPass(root) {
   "use strict";
   if (!root) return;
@@ -75,8 +81,27 @@
   // Units the passes bind textures and samplers on. Restored individually.
   const UNIT_COUNT = 4;
 
+  // OES_draw_buffers_indexed of this context, or null. Looked up on every pass group rather
+  // than cached: a restored context hands out new extension objects.
+  function indexedExtension(gl) {
+    let extension = null;
+    try {
+      extension = gl.getExtension("OES_draw_buffers_indexed") || null;
+    } catch (error) {
+      extension = null;
+    }
+    if (extension && (typeof extension.enableiOES !== "function"
+        || typeof extension.disableiOES !== "function"
+        || typeof extension.colorMaskiOES !== "function")) {
+      return null;
+    }
+    return extension;
+  }
+
+  // The non-indexed BLEND and COLOR_WRITEMASK queries report draw buffer 0.
   function saveState(gl) {
     const s = {
+      indexed: indexedExtension(gl),
       program: gl.getParameter(gl.CURRENT_PROGRAM),
       vao: gl.getParameter(gl.VERTEX_ARRAY_BINDING),
       drawFramebuffer: gl.getParameter(gl.DRAW_FRAMEBUFFER_BINDING),
@@ -107,13 +132,19 @@
   // The fixed-function state every pass expects: no blending, depth, stencil, culling, scissor
   // or discard; all colour channels written; no pixel-unpack buffer (texture allocation).
   function prepareState(gl, vao) {
-    gl.disable(gl.BLEND);
+    const indexed = indexedExtension(gl);
+    if (indexed) {
+      indexed.disableiOES(gl.BLEND, 0);
+      indexed.colorMaskiOES(0, true, true, true, true);
+    } else {
+      gl.disable(gl.BLEND);
+      gl.colorMask(true, true, true, true);
+    }
     gl.disable(gl.DEPTH_TEST);
     gl.disable(gl.STENCIL_TEST);
     gl.disable(gl.CULL_FACE);
     gl.disable(gl.SCISSOR_TEST);
     gl.disable(gl.RASTERIZER_DISCARD);
-    gl.colorMask(true, true, true, true);
     gl.bindBuffer(gl.PIXEL_UNPACK_BUFFER, null);
     gl.bindVertexArray(vao);
   }
@@ -138,12 +169,18 @@
     gl.viewport(s.viewport[0], s.viewport[1], s.viewport[2], s.viewport[3]);
     gl.scissor(s.scissorBox[0], s.scissorBox[1], s.scissorBox[2], s.scissorBox[3]);
     setEnabled(gl, gl.SCISSOR_TEST, s.scissorTest);
-    setEnabled(gl, gl.BLEND, s.blend);
     setEnabled(gl, gl.DEPTH_TEST, s.depthTest);
     setEnabled(gl, gl.STENCIL_TEST, s.stencilTest);
     setEnabled(gl, gl.CULL_FACE, s.cullFace);
     setEnabled(gl, gl.RASTERIZER_DISCARD, s.rasterizerDiscard);
-    gl.colorMask(s.colorMask[0], s.colorMask[1], s.colorMask[2], s.colorMask[3]);
+    if (s.indexed) {
+      if (s.blend) s.indexed.enableiOES(gl.BLEND, 0);
+      else s.indexed.disableiOES(gl.BLEND, 0);
+      s.indexed.colorMaskiOES(0, s.colorMask[0], s.colorMask[1], s.colorMask[2], s.colorMask[3]);
+    } else {
+      setEnabled(gl, gl.BLEND, s.blend);
+      gl.colorMask(s.colorMask[0], s.colorMask[1], s.colorMask[2], s.colorMask[3]);
+    }
   }
 
   function internalFormatOf(gl, format) {

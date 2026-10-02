@@ -4,13 +4,15 @@
 //
 // Every setting has a URL override for testing and a persisted per-browser value for the
 // switches a player may toggle at runtime (localStorage gaius.quality.settings.v1):
-//   ?gaiusPost=0|1                  Gaius post-processing chain off/on (default on)
+//   ?gaiusPost=0|1                  Gaius post-processing chain off/on (default on for the
+//                                   high and ultra tiers only)
 //   ?gaiusPostTier=low|mid|high|ultra  post stage set independent of the GPU tier
 //   ?gaiusFxaa= ?gaiusTonemap= ?gaiusSsao= ?gaiusBloom= ?gaiusSsr=   per-stage 0|1
 //   ?gaiusRenderScale=1|0.85|0.75|0.67|0.6|0.5|auto   world render scale (default 1)
 //   ?gaiusTargetFps=<n>             frame-rate target of the automatic render scale (default 60)
 //   ?gaiusSharpness=0..2            RCAS sharpening in stops (0 = strongest, default 0.25)
-//   ?gaiusMaxDpr=<number>           canvas device-pixel-ratio cap
+//   ?gaiusMaxDpr=<number>           canvas device-pixel-ratio cap (default per tier on 26.3,
+//                                   1 on the other profiles)
 //   ?gaiusOit=0|1                   force improved transparency (OIT) off/on
 //   ?gaiusInventoryWorldFps=<n>     world refresh rate behind inventory screens (0 = freeze)
 //   ?gaiusPresetReplay=1            vanilla behaviour: re-apply the graphics preset at startup
@@ -25,36 +27,41 @@
   const SCALE_STEPS = Object.freeze([0.5, 0.6, 0.67, 0.75, 0.85, 1]);
 
   // Per-tier defaults. maxDpr caps the canvas allocation (the GUI always renders at the canvas
-  // resolution); renderScale only scales the 3D world, which is then upscaled with EASU/RCAS.
+  // resolution): low and mid keep the v0.3 1x cap, because a native-ratio backing store
+  // quadruples every world, GUI and post pass on a 2x display; high and ultra may go above it
+  // on 26.3 only (resolve() keeps the 1x cap on the other profiles).
+  // renderScale only scales the 3D world, which is then upscaled with EASU/RCAS. The tone
+  // mapper is off on every tier (it compresses highlights and lifts saturation, changing the
+  // vanilla look); the composite pass then only adds SSAO and bloom and clamps.
   const TIER_DEFAULTS = Object.freeze({
     low: Object.freeze({
-      maxDpr: 2,
+      maxDpr: 1,
       renderScale: 1,
-      fxaa: true, tonemap: true, ssao: false, bloom: false, ssr: false,
+      fxaa: true, tonemap: false, ssao: false, bloom: false, ssr: false,
       oit: false,
       inventoryWorldFps: 0,
       ssaoRadius: 0.8, ssaoIntensity: 0.9, bloomIntensity: 0.10, bloomThreshold: 0.80
     }),
     mid: Object.freeze({
-      maxDpr: 2,
+      maxDpr: 1,
       renderScale: 1,
-      fxaa: true, tonemap: true, ssao: true, bloom: true, ssr: false,
+      fxaa: true, tonemap: false, ssao: true, bloom: true, ssr: false,
       oit: false,
       inventoryWorldFps: 15,
       ssaoRadius: 0.9, ssaoIntensity: 1.0, bloomIntensity: 0.12, bloomThreshold: 0.78
     }),
     high: Object.freeze({
-      maxDpr: 2.5,
+      maxDpr: 1.5,
       renderScale: 1,
-      fxaa: true, tonemap: true, ssao: true, bloom: true, ssr: false,
+      fxaa: true, tonemap: false, ssao: true, bloom: true, ssr: false,
       oit: true,
       inventoryWorldFps: 30,
       ssaoRadius: 1.0, ssaoIntensity: 1.0, bloomIntensity: 0.14, bloomThreshold: 0.76
     }),
     ultra: Object.freeze({
-      maxDpr: 3,
+      maxDpr: 2,
       renderScale: 1,
-      fxaa: true, tonemap: true, ssao: true, bloom: true, ssr: false,
+      fxaa: true, tonemap: false, ssao: true, bloom: true, ssr: false,
       oit: true,
       inventoryWorldFps: 60,
       ssaoRadius: 1.0, ssaoIntensity: 1.05, bloomIntensity: 0.15, bloomThreshold: 0.75
@@ -138,6 +145,14 @@
     return root.__gaiusGpuCaps || null;
   }
 
+  function renderPearlProfile() {
+    try {
+      return String(root.__gaiusProfileId || "").trim() === "26.3";
+    } catch (error) {
+      return false;
+    }
+  }
+
   function tierName(caps) {
     const name = caps && caps.tier ? String(caps.tier) : "mid";
     return TIER_DEFAULTS[name] ? name : "mid";
@@ -158,7 +173,11 @@
         ? String(postTierParam).toLowerCase() : tier;
     const post = TIER_DEFAULTS[postTier];
 
-    let postEnabled = typeof persisted.post === "boolean" ? persisted.post : true;
+    // Off by default on low (software rasterizers included) and mid (integrated GPUs), where the
+    // full-resolution passes cost several milliseconds a frame; setPostEnabled(true) or
+    // ?gaiusPost=1 turns the chain on there.
+    let postEnabled = typeof persisted.post === "boolean" ? persisted.post
+        : (tier === "high" || tier === "ultra");
     postEnabled = bool(get("gaiusPost"), postEnabled);
 
     let ssr = typeof persisted.ssr === "boolean" ? persisted.ssr : post.ssr;
@@ -176,8 +195,11 @@
       renderScale = quantizeScale(number(scaleSetting, 1, SCALE_STEPS[0], 1));
     }
 
+    // Only 26.3 has the world render scale and EASU path behind a large backing store; 26.2 and
+    // 1.21.11 share the canvas code but keep the v0.3 1x cap unless ?gaiusMaxDpr asks otherwise.
     const dprParam = get("gaiusMaxDpr");
-    const maxDpr = number(dprParam, base.maxDpr, 0.5, 4);
+    const profileDpr = renderPearlProfile() ? base.maxDpr : Math.min(base.maxDpr, 1);
+    const maxDpr = number(dprParam, profileDpr, 0.5, 4);
 
     let oitForced = null;
     const oitParam = get("gaiusOit");
@@ -237,7 +259,8 @@
 
   // Order-independent transparency (26.3 "Improved Transparency") needs float colour targets with
   // blending: RGBA16F accumulation/transmittance targets, RGBA32F depth bounds blended with MAX,
-  // and two colour outputs from one draw.
+  // two colour outputs from one draw, and per-draw-buffer blend enables and write masks
+  // (OES_draw_buffers_indexed; without it BrowserOpenGL drops the index > 0 calls).
   function oitAllowed() {
     const s = settings();
     if (s.oitForced === false) return false;
@@ -245,7 +268,7 @@
     const ext = caps && caps.extensions;
     const float = caps && caps.floatTargets;
     const capable = !!(ext && float && ext.colorBufferFloat && ext.floatBlend
-        && float.rgba16f && float.rgba32f && (caps.maxDrawBuffers || 0) >= 2
+        && ext.drawBuffersIndexed && float.rgba16f && float.rgba32f && (caps.maxDrawBuffers || 0) >= 2
         && !caps.contextLost);
     if (s.oitForced === true) return capable;
     return capable && s.oitTier;

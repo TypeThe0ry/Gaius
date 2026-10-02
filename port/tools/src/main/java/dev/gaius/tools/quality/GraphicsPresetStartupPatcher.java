@@ -25,11 +25,14 @@ import org.objectweb.asm.tree.VarInsnNode;
  * ({@code ?gaiusPresetReplay=1} restores the vanilla behaviour). Selecting a preset in Video
  * Settings is unchanged, and changing a single option still switches the preset to Custom.
  *
- * <p>Profile independent: 1.21.11, 26.2 and 26.3 all have the call and the method. The 26.3
- * chain runs it from {@code RenderPatches263}; the 26.2 and 1.21.11 chains have to call
- * {@link #apply} from their own patchers (their {@code root} is the directory they write
- * patched classes to). A profile without {@code GraphicsPreset} is reported as not applicable
- * ({@link #apply} returns false); a profile that has it in a different shape fails the build.
+ * <p>Profile independent: 1.21.11, 26.2 and 26.3 all have the call and the method. It runs
+ * once per profile: from {@code Minecraft262BrowserPatcher.patchGraphicsPresetStartupReplay}
+ * for 26.2 and 26.3 (after that step's {@code patchLiveFrameTargeting}, which writes
+ * {@code Minecraft.class} from the input jar) and from
+ * {@code Minecraft12111BrowserPatcher.patchGraphicsPresetStartupReplay} for 1.21.11; both
+ * fail when {@link #apply} returns false. A profile without {@code GraphicsPreset} is reported
+ * as not applicable ({@link #apply} returns false); a profile that has it in a different shape
+ * fails the build.
  */
 public final class GraphicsPresetStartupPatcher {
     static final String MINECRAFT = "net/minecraft/client/Minecraft";

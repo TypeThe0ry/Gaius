@@ -19,18 +19,26 @@ import org.teavm.jso.JSBody;
  *       (sparse delivery still gets a provisional mesh, rebuilt when the neighbor arrives).</li>
  * </ul>
  *
+ * <p>A waiting column's uncompiled sections are checked on every extracted frame while they
+ * are visible. A wait that was not checked for {@value #STALE_WAIT_MILLIS} ms belongs to a
+ * column that left view or was unloaded, so its next check starts a new wait instead of
+ * granting at once.</p>
+ *
  * <p>URL {@code gaiusNeighborGate=provisional} restores the v0.2 center-only gate,
  * {@code gaiusNeighborGate=vanilla} waits for all neighbors like the desktop game.</p>
  */
 public final class BrowserNeighborReadiness {
     static final long MISSING_GRACE_MILLIS = 300L;
     static final int NEARBY_CHUNKS = 2;
+    static final long STALE_WAIT_MILLIS = 2000L;
     private static final int MODE_VANILLA = 0;
     private static final int MODE_GATED = 1;
     private static final int MODE_PROVISIONAL = 2;
     private static final int MAX_TRACKED_COLUMNS = 65536;
 
     private static final Long2LongOpenHashMap FIRST_MISSING = new Long2LongOpenHashMap();
+    /** Last check of each waiting column; a missing key reads 0, which is always stale. */
+    private static final Long2LongOpenHashMap LAST_CHECKED = new Long2LongOpenHashMap();
     private static int mode = -1;
     private static boolean cameraKnown;
     private static int cameraChunkX;
@@ -61,6 +69,7 @@ public final class BrowserNeighborReadiness {
         if (allNeighbors) {
             if (!FIRST_MISSING.isEmpty()) {
                 FIRST_MISSING.remove(column);
+                LAST_CHECKED.remove(column);
             }
             return true;
         }
@@ -79,14 +88,18 @@ public final class BrowserNeighborReadiness {
         }
         long now = System.currentTimeMillis();
         long first = FIRST_MISSING.get(column);
-        if (first == Long.MIN_VALUE) {
-            if (FIRST_MISSING.size() >= MAX_TRACKED_COLUMNS) {
+        if (first == Long.MIN_VALUE || now - LAST_CHECKED.get(column) > STALE_WAIT_MILLIS) {
+            if (first == Long.MIN_VALUE && FIRST_MISSING.size() >= MAX_TRACKED_COLUMNS) {
                 FIRST_MISSING.clear();
+                LAST_CHECKED.clear();
             }
             FIRST_MISSING.put(column, now);
+            LAST_CHECKED.put(column, now);
             waits++;
             return false;
         }
+        // Kept after a grace grant: the column's other sections must not start a new wait.
+        LAST_CHECKED.put(column, now);
         if (now - first >= MISSING_GRACE_MILLIS) {
             graceGrants++;
             return true;
@@ -105,6 +118,7 @@ public final class BrowserNeighborReadiness {
     /** Forgets all waiting columns (level change). */
     public static void clear() {
         FIRST_MISSING.clear();
+        LAST_CHECKED.clear();
         cameraKnown = false;
     }
 

@@ -28,7 +28,7 @@ public final class BrowserChunkDrawTelemetry {
 
     /** Starts a new per-frame uniform map and clears all columns on a world switch. */
     public static void beginPrepare(Object world) {
-        if (!telemetryEnabled()) {
+        if (!BrowserBuildFlags.telemetry() || !telemetryEnabled()) {
             active = false;
             activeWorld = null;
             pendingUniformIndex = -1;

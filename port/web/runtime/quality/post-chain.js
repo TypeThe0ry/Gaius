@@ -1,10 +1,13 @@
 // Gaius Shaders: the 26.3 world post-processing chain, run once per frame between the world
 // render and the hand/GUI. Registers GaiusQuality.postChain.
 //
-// Stage sets by tier (quality-profile.js decides, URL parameters override each stage):
-//   low   tonemap + FXAA
+// Stage sets by tier (quality-profile.js decides, URL parameters override each stage). The
+// chain itself is on by default only on high and ultra (?gaiusPost=1 enables it elsewhere):
+//   low   FXAA
 //   mid   + SSAO (half resolution, depth-aware blur) + bloom (dual-filter, 4 levels)
 //   high  + screen-space reflections on water-like surfaces (behind ?gaiusSsr=1, off by default)
+//   tone mapping (highlight shoulder and a slight saturation lift) is off on every tier and
+//   only runs with ?gaiusTonemap=1.
 // Every stage is a full-screen fragment pass (1-8 draws per stage), so the CPU cost per frame is
 // a few dozen GL calls regardless of scene size. Stages whose inputs are missing (no depth
 // texture, no projection) are skipped. Intermediate targets are RGBA8 except the bloom chain,
@@ -19,9 +22,18 @@
   const Q = root.GaiusQuality || (root.GaiusQuality = {});
   if (Q.postChain) return;
 
+  // Exact piecewise sRGB transfer functions. They invert each other, so with no AO and no bloom
+  // the composite pass returns the scene unchanged (a polynomial approximation here crushes the
+  // shadows of every frame).
   const COLOR_HELPERS = ""
-      + "vec3 toLinear(vec3 c) { return c * (c * (c * 0.305306011 + 0.682171111) + 0.012522878); }\n"
-      + "vec3 toSrgb(vec3 c) { return max(1.055 * pow(max(c, vec3(0.0)), vec3(0.416666667)) - 0.055, 0.0); }\n";
+      + "vec3 toLinear(vec3 c) {\n"
+      + "  c = max(c, vec3(0.0));\n"
+      + "  return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));\n"
+      + "}\n"
+      + "vec3 toSrgb(vec3 c) {\n"
+      + "  c = max(c, vec3(0.0));\n"
+      + "  return mix(c * 12.92, 1.055 * pow(c, vec3(0.416666667)) - 0.055, step(vec3(0.0031308), c));\n"
+      + "}\n";
 
   const DEPTH_HELPERS = ""
       + "uniform vec4 uProjXY;\n"
@@ -127,7 +139,8 @@
       + "}\n";
 
   // Bloom prefilter: 2x downsample of the scene (4 bilinear taps = 16 texels) in linear light,
-  // keeping only the part above the threshold.
+  // keeping only the part whose luminance is above the threshold (a clear blue sky stays below
+  // it; a max-channel test would extract the whole sky).
   const BLOOM_PREFILTER_FS = "#version 300 es\n"
       + "precision highp float;\n"
       + "precision highp sampler2D;\n"
@@ -142,7 +155,7 @@
       + "  vec2 uv = gl_FragCoord.xy * 2.0 * uSrcTexel;\n"
       + "  vec3 c = 0.25 * (T(uv + vec2(-uSrcTexel.x, -uSrcTexel.y)) + T(uv + vec2(uSrcTexel.x, -uSrcTexel.y))\n"
       + "      + T(uv + vec2(-uSrcTexel.x, uSrcTexel.y)) + T(uv + uSrcTexel));\n"
-      + "  float l = max(c.r, max(c.g, c.b));\n"
+      + "  float l = dot(c, vec3(0.2126, 0.7152, 0.0722));\n"
       + "  float knee = uThreshold * 0.25;\n"
       + "  float soft = clamp(l - uThreshold + knee, 0.0, 2.0 * knee);\n"
       + "  soft = soft * soft / (4.0 * knee + 1e-5);\n"
@@ -371,6 +384,21 @@
         + "}\n";
   }
 
+  // Fragment sources built once on first use; res.program only compiles on a cache miss, but
+  // its source argument is evaluated on every call.
+  let compositeFs = null;
+  let compositeSsrFs = null;
+  let fxaaFs = null;
+
+  function compositeFragment(ssr) {
+    if (ssr) return compositeSsrFs || (compositeSsrFs = compositeSource(true));
+    return compositeFs || (compositeFs = compositeSource(false));
+  }
+
+  function fxaaFragment() {
+    return fxaaFs || (fxaaFs = fxaaSource());
+  }
+
   function half(value) {
     return Math.max(1, Math.ceil(value / 2));
   }
@@ -530,7 +558,7 @@
     let current = frame.color;
     if (useComposite) {
       const target = res.pool.get(gl, "post.composite", frame.width, frame.height, "rgba8");
-      const program = res.program(useSsr ? "compositeSsr" : "composite", compositeSource(useSsr));
+      const program = res.program(useSsr ? "compositeSsr" : "composite", compositeFragment(useSsr));
       gl.useProgram(program.program);
       G.setRect(gl, program, frame.width, frame.height, frame.rectWidth, frame.rectHeight);
       G.bindTexture(gl, 0, frame.color, res.samplers.linear);
@@ -570,7 +598,7 @@
 
     if (settings.fxaa) {
       if (finalFramebuffer && current === frame.color) current = copyRect(res, frame, frame.color);
-      const program = res.program("fxaa", fxaaSource());
+      const program = res.program("fxaa", fxaaFragment());
       const target = finalFramebuffer ? null
           : res.pool.get(gl, "post.fxaa", frame.width, frame.height, "rgba8");
       gl.useProgram(program.program);

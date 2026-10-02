@@ -585,12 +585,23 @@ jobs:
             --allow '^Skipping LWJGL module lwjgl-(shaderc|spvc): the Minecraft 26\.2 client has no renderpearl OpenGL path$' \
             "$RUNNER_TEMP/head-build-overlays-26.2.log"
 
-      - name: G3 - no new 26.2 link gaps; staged sources equal port/src/main/java
+      - name: G3 - no new 26.2 link gaps; staged sources equal the 26.2 source set
         run: |
           set -euo pipefail
           export GAIUS_JAVA_HOME="$JAVA_HOME"
           ./port/scripts/generate-pom.sh
-          diff -r port/src/main/java port/target/26.2/sources
+          # The staged tree is port/src/main/java with port/src/versions/26.2/java
+          # copied over it (generate-pom.sh stage_profile_sources).  26.2 has no
+          # excludes.txt; one added later must be applied here as well.
+          test ! -e port/src/versions/26.2/excludes.txt
+          expected="$RUNNER_TEMP/expected-26.2-sources"
+          rm -rf "$expected"
+          mkdir -p "$expected"
+          cp -R port/src/main/java/. "$expected/"
+          if [[ -d port/src/versions/26.2/java ]]; then
+            cp -R port/src/versions/26.2/java/. "$expected/"
+          fi
+          diff -r "$expected" port/target/26.2/sources
           ./port/mvnw --batch-mode --no-transfer-progress \
             --file port/target/26.2/generated-pom.xml compile
           node port/scripts/minecraft-link-gap-smoke.mjs --profile 26.2 \

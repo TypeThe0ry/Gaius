@@ -3691,7 +3691,10 @@ public final class BrowserOpenGL {
               }
               const entry=this.quadPatterns.get(id);
               if (!entry) {
-                if (start===0 && bytes && size>=12) {
+                // Only a store that covers the whole buffer can mark it sequential: a ranged
+                // write at offset 0 of a sorted index heap often starts with quad 0.
+                const knownSize=Number(this.bufferSizes.get(id))||0;
+                if (start===0 && bytes && size>=12 && (knownSize<=0 || size===knownSize)) {
                   const prefix=this.detectQuadPattern(bytes,2) || this.detectQuadPattern(bytes,4);
                   if (prefix) this.quadPatterns.set(id,prefix);
                 }

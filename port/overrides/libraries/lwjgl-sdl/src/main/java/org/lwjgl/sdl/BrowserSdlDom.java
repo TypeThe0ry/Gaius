@@ -479,8 +479,23 @@ final class BrowserSdlDom {
               const forcedPixelRatio = urlNumber('pixelRatio');
               if (forcedPixelRatio > 0) return clamp(forcedPixelRatio, 0.2, 3.0);
               const urlMax = urlNumber('maxDpr');
-              const maxDpr = urlMax > 0 ? urlMax : (Number(w.__gaiusMaxDpr) || 1.0);
               const raw = Number(w.devicePixelRatio) || 1.0;
+              let maxDpr = urlMax > 0 ? urlMax : (Number(w.__gaiusMaxDpr) || 1.0);
+              // The quality runtime caps the ratio per GPU tier. The launcher's frame-rate
+              // governor still applies once it has stepped __gaiusMaxDpr below its default.
+              const quality = w.GaiusQuality ? w.GaiusQuality.runtime : null;
+              if (!(urlMax > 0) && quality && typeof quality.resolvePixelRatio === 'function') {
+                let tierMax = NaN;
+                try {
+                  tierMax = Number(quality.resolvePixelRatio(raw));
+                } catch (ignored) {
+                  tierMax = NaN;
+                }
+                if (tierMax > 0) {
+                  const governed = Number(w.__gaiusMaxDpr) < (Number(w.__gaiusDefaultMaxDpr) || 0);
+                  maxDpr = governed ? Math.min(tierMax, Number(w.__gaiusMaxDpr)) : tierMax;
+                }
+              }
               return clamp(Math.min(raw, maxDpr), minDpr, 3.0);
             };
             // emitEvent marks a change the game did not ask for (browser resize,
@@ -927,7 +942,10 @@ final class BrowserSdlDom {
             if (window.__gaiusApplyCanvasResolution) {
               window.__gaiusApplyCanvasResolution(width, height, false);
             } else {
-              const pixelRatio = Math.min(devicePixelRatio || 1, 1);
+              const quality = window.GaiusQuality ? window.GaiusQuality.runtime : null;
+              const pixelRatio = quality && typeof quality.resolvePixelRatio === 'function'
+                ? (Number(quality.resolvePixelRatio(devicePixelRatio || 1)) || 1)
+                : Math.min(devicePixelRatio || 1, 1);
               canvasElement.style.width = width + 'px'; canvasElement.style.height = height + 'px';
               canvasElement.width = Math.max(1, Math.round(width * pixelRatio));
               canvasElement.height = Math.max(1, Math.round(height * pixelRatio));
@@ -959,6 +977,15 @@ final class BrowserSdlDom {
               powerPreference: 'high-performance',
               preserveDrawingBuffer: preserveDrawingBuffer
             });
+            // Lets the quality runtime enable its extensions on the game context before
+            // the first frame instead of attaching lazily.
+            if (window.__gaiusWebGL && window.GaiusQuality && window.GaiusQuality.runtime) {
+              try {
+                window.GaiusQuality.runtime.onContext(window.__gaiusWebGL);
+              } catch (ignored) {
+                // The runtime reports its own failures; the context stays usable.
+              }
+            }
             return !!window.__gaiusWebGL;
             """)
     static native boolean createContext();
@@ -968,7 +995,10 @@ final class BrowserSdlDom {
             if (window.__gaiusApplyCanvasResolution) {
               window.__gaiusApplyCanvasResolution(width, height, false);
             } else {
-              const pixelRatio = Math.min(devicePixelRatio || 1, 1);
+              const quality = window.GaiusQuality ? window.GaiusQuality.runtime : null;
+              const pixelRatio = quality && typeof quality.resolvePixelRatio === 'function'
+                ? (Number(quality.resolvePixelRatio(devicePixelRatio || 1)) || 1)
+                : Math.min(devicePixelRatio || 1, 1);
               canvasElement.style.width = width + 'px'; canvasElement.style.height = height + 'px';
               canvasElement.width = Math.max(1, Math.round(width * pixelRatio));
               canvasElement.height = Math.max(1, Math.round(height * pixelRatio));

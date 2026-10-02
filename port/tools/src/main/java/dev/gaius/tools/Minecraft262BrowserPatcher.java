@@ -1,5 +1,6 @@
 package dev.gaius.tools;
 
+import dev.gaius.tools.quality.GraphicsPresetStartupPatcher;
 import dev.gaius.tools.render.TerrainBatchPatches;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -107,10 +108,27 @@ public final class Minecraft262BrowserPatcher {
         PatchRegistry.run("Minecraft262BrowserPatcher.patchCopyOnWriteFileSystem", () -> patchCopyOnWriteFileSystem(jar, root));
         PatchRegistry.run("Minecraft262BrowserPatcher.patchCopyOnWriteProvider", () -> patchCopyOnWriteProvider(jar, root));
         PatchRegistry.run("Minecraft262BrowserPatcher.patchDownloadQueueBrowserCooperativeExecutor", () -> patchDownloadQueueBrowserCooperativeExecutor(jar, root));
+        // After patchLiveFrameTargeting: that patch writes Minecraft.class from the input jar,
+        // while this one reads Minecraft and Options back from root and composes with it.
+        PatchRegistry.run("Minecraft262BrowserPatcher.patchGraphicsPresetStartupReplay", () -> patchGraphicsPresetStartupReplay(jar, root));
         // Last: it reads LevelRenderer, LevelExtractor and RenderSection as the patches above
         // left them in root, and nothing after it in this step rewrites those classes.
         PatchRegistry.run("Minecraft262BrowserPatcher.terrainBatchPatches", () -> terrainBatchPatches(jar, root, minecraftVersion));
         PatchRegistry.printSummary();
+    }
+
+    /**
+     * Stops {@code Minecraft.<init>} from re-applying the saved graphics preset over the
+     * per-GPU-tier first-launch options (see {@link GraphicsPresetStartupPatcher}). Shared by
+     * 26.2 and 26.3, so it runs here exactly once per profile; the 26.3 chain no longer applies
+     * it from {@code RenderPatches263}.
+     */
+    private static void patchGraphicsPresetStartupReplay(String jar, Path root)
+            throws IOException {
+        if (!GraphicsPresetStartupPatcher.apply(jar, root)) {
+            throw new IllegalStateException(
+                    "26.2/26.3 must have the graphics preset startup replay in Minecraft.<init>");
+        }
     }
 
     /** Batched terrain draws, aligned heaps and the neighbor gate (see {@link TerrainBatchPatches}). */
@@ -2198,19 +2216,22 @@ public final class Minecraft262BrowserPatcher {
     }
 
     /**
-     * Keeps the 26.2 FAST and FANCY presets on the browser 8/6 distance contract.
+     * Keeps the 26.2/26.3 FAST, FANCY and FABULOUS presets on the browser 8/6 distance contract.
      *
      * <p>The browser patcher used to overwrite the FAST constants with a smaller distance
      * budget.  That silently reduced world visibility and simulation coverage, so the
      * ordinal-zero FAST arm stays validation-only at its vanilla 8/6.</p>
      *
-     * <p>Vanilla {@code Minecraft.<init>} re-applies the persisted preset on every start, and
-     * the ordinal-one FANCY arm writes render 16 / simulation 12 over the seeded 8/6 options;
-     * BrowserSingleplayerClient then forwards 16/12 to the Worker.  Only those two FANCY
-     * constants are rewritten to 8/6.  Every other FANCY value (mipmaps, AO, clouds,
-     * particles, shadows, transparency, filtering) keeps its vanilla constant, and the preset
-     * is not switched to CUSTOM.  Both arms are shape-checked before either constant changes,
-     * and the pass fails closed if Mojang changes the bytecode.</p>
+     * <p>Applying a preset writes its distances over the player's options: the ordinal-one
+     * FANCY arm writes render 16 / simulation 12 and the ordinal-two FABULOUS arm render 32 /
+     * simulation 12, which BrowserSingleplayerClient then forwards to the Worker.  Since
+     * {@code patchGraphicsPresetStartupReplay} the preset is no longer re-applied at every start
+     * (only with {@code ?gaiusPresetReplay=1}), but selecting either preset in Video Settings
+     * still applies it.  Only those four constants are rewritten to 8/6.  Every other FANCY and
+     * FABULOUS value (mipmaps, AO, clouds, particles, shadows, transparency, filtering) keeps
+     * its vanilla constant, and the preset is not switched to CUSTOM.  All three arms are
+     * shape-checked before any constant changes, and the pass fails closed if Mojang changes
+     * the bytecode.</p>
      */
     private static void patchGraphicsPresetBrowserDistances(String jar, Path root)
             throws IOException {
@@ -2248,6 +2269,7 @@ public final class Minecraft262BrowserPatcher {
 
         int[] fast = graphicsPresetArm(apply, presetSwitch, 0, "FAST", 8);
         int[] fancy = graphicsPresetArm(apply, presetSwitch, 1, "FANCY", 16);
+        int[] fabulous = graphicsPresetArm(apply, presetSwitch, 2, "FABULOUS", 32);
         findGraphicsPresetDistanceConstant(
                 apply,
                 fast[0],
@@ -2272,6 +2294,30 @@ public final class Minecraft262BrowserPatcher {
                 "FAST",
                 "simulationDistance",
                 6);
+        IntInsnNode fabulousRenderDistance = findGraphicsPresetDistanceConstant(
+                apply,
+                fabulous[0],
+                fabulous[1],
+                options,
+                optionInstance,
+                optionScreen,
+                minecraft,
+                owner,
+                "FABULOUS",
+                "renderDistance",
+                32);
+        IntInsnNode fabulousSimulationDistance = findGraphicsPresetDistanceConstant(
+                apply,
+                fabulous[0],
+                fabulous[1],
+                options,
+                optionInstance,
+                optionScreen,
+                minecraft,
+                owner,
+                "FABULOUS",
+                "simulationDistance",
+                12);
         IntInsnNode fancyRenderDistance = findGraphicsPresetDistanceConstant(
                 apply,
                 fancy[0],
@@ -2298,10 +2344,12 @@ public final class Minecraft262BrowserPatcher {
                 12);
         fancyRenderDistance.operand = 8;
         fancySimulationDistance.operand = 6;
+        fabulousRenderDistance.operand = 8;
+        fabulousSimulationDistance.operand = 6;
         write(node, root.resolve(owner + ".class"));
         System.out.println(
-                "Pinned Minecraft 26.2 FAST and FANCY graphics preset distances at render=8"
-                        + " simulation=6 (FANCY was 16/12)");
+                "Pinned Minecraft 26.2/26.3 FAST, FANCY and FABULOUS graphics preset distances at"
+                        + " render=8 simulation=6 (FANCY was 16/12, FABULOUS 32/12)");
     }
 
     /** Returns the [start, end) instruction indexes of one GraphicsPreset.apply switch arm. */

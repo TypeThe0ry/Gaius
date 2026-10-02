@@ -54,6 +54,7 @@ public final class BrowserRenderScheduler {
     private static final long SLICE_NANOS = 2_000_000L;
     /** A paused pump resumes after this long even when no frame is rendered. */
     private static final int FRAME_WATCHDOG_MILLIS = 50;
+    private static final int MAX_LOGGED_TASK_FAILURES = 8;
     private static final int MAX_UBER_NODE_CLEANUP_SCANS_PER_FRAME = 8;
     private static final long UBER_NODE_CLEANUP_BUDGET_NANOS = 250_000L;
     private static final int MAX_UPLOAD_RETRY_YIELDS = 2_048;
@@ -71,6 +72,7 @@ public final class BrowserRenderScheduler {
     private static long uploadByteBudgetExhaustions;
     private static long lastInstallBytes;
     private static long pumpSlices;
+    private static long failedTasks;
     private static final Deque<Runnable> QUEUE = new ArrayDeque<>();
     private static final Map<Object, Integer> UPLOAD_BACKLOGS = new IdentityHashMap<>();
     private static final Map<Object, Integer> UPLOAD_FRAME_DRAIN_COUNTS = new IdentityHashMap<>();
@@ -794,6 +796,10 @@ public final class BrowserRenderScheduler {
         } finally {
             pumpScheduled = false;
             publishTelemetry();
+            // A slice that ended early on an exception must not strand the remaining work.
+            if (!QUEUE.isEmpty() && !waitingForFrame) {
+                schedulePump();
+            }
         }
     }
 
@@ -810,6 +816,13 @@ public final class BrowserRenderScheduler {
                 updateHighWaterState();
                 try {
                     command.run();
+                } catch (Throwable error) {
+                    // One failing task must not end the slice; keep it visible in the log.
+                    failedTasks++;
+                    if (failedTasks <= MAX_LOGGED_TASK_FAILURES) {
+                        System.err.println("[Gaius] render task failed (" + failedTasks + "): " + error);
+                        error.printStackTrace();
+                    }
                 } finally {
                     runningTask = false;
                     lastTaskNanos = Math.max(0L, System.nanoTime() - taskStartedAt);
@@ -1011,14 +1024,15 @@ public final class BrowserRenderScheduler {
                 (double) lastInstallBytes,
                 (double) budget.installBytesPerFrame(),
                 BrowserMeshInstallQueue.inFlight(),
-                BrowserMeshInstallQueue.readyCount());
+                BrowserMeshInstallQueue.readyCount(),
+                (double) failedTasks);
     }
 
     @JSBody(params = {
             "frameTasks", "frameWorkMillis", "waitingForFrame", "frameWatchdogResumes",
             "pumpSlices", "uploadBytesThisFrame", "uploadBytesPerFrame",
             "uploadByteBudgetExhaustions", "lastInstallBytes", "installBytesPerFrame",
-            "meshRequestsInFlight", "meshResultsReady"
+            "meshRequestsInFlight", "meshResultsReady", "failedTasks"
     }, script = """
             const state=globalThis.__gaiusChunkPipelineTelemetry ||
               (globalThis.__gaiusChunkPipelineTelemetry={});
@@ -1034,6 +1048,7 @@ public final class BrowserRenderScheduler {
             state.installBytesPerFrame=Number(installBytesPerFrame)||0;
             state.meshRequestsInFlight=Number(meshRequestsInFlight)||0;
             state.meshResultsReady=Number(meshResultsReady)||0;
+            state.failedTasks=Number(failedTasks)||0;
             state.pumpDriver='completion';
             """)
     private static native void publishFrameBudgetJs(
@@ -1048,7 +1063,8 @@ public final class BrowserRenderScheduler {
             double lastInstallBytes,
             double installBytesPerFrame,
             int meshRequestsInFlight,
-            int meshResultsReady);
+            int meshResultsReady,
+            double failedTasks);
 
     private static void updateHighWaterState() {
         boolean atHighWater = pendingTasks() >= effectiveQueueHighWater();

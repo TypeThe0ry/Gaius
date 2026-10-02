@@ -12,10 +12,10 @@
 //       only read it back. The launcher calls this after storage is ready and before the client
 //       starts, because BrowserFilePersistence picks the first-launch option defaults from it.
 //   GaiusQuality.caps.attach(gl)    called with the game's own context once it exists. Enables
-//       the float colour-buffer, float-blend, float-linear, anisotropic, parallel-compile,
-//       multi-draw and timer-query extensions on that context (WebGL extensions are per context
-//       and must be re-enabled after a context loss), re-checks float framebuffer completeness
-//       and republishes the capabilities.
+//       the float colour-buffer, float-blend, indexed draw-buffer, float-linear, anisotropic,
+//       parallel-compile, multi-draw and timer-query extensions on that context (WebGL
+//       extensions are per context and must be re-enabled after a context loss), re-checks float
+//       framebuffer completeness and republishes the capabilities.
 //
 // Overrides: ?gaiusTier=low|mid|high|ultra (also stored as localStorage gaius.quality.tierOverride
 // by GaiusQuality.profile.setTier), ?gaiusTier=auto clears the stored override, and
@@ -45,6 +45,7 @@
     colorBufferFloat: "EXT_color_buffer_float",
     colorBufferHalfFloat: "EXT_color_buffer_half_float",
     floatBlend: "EXT_float_blend",
+    drawBuffersIndexed: "OES_draw_buffers_indexed",
     textureFloatLinear: "OES_texture_float_linear",
     anisotropic: "EXT_texture_filter_anisotropic",
     parallelShaderCompile: "KHR_parallel_shader_compile",
@@ -57,7 +58,9 @@
   const state = {
     caps: null,
     attachedContext: null,
-    attachedListeners: false
+    attachedListeners: false,
+    // Fields of window.__gaiusGpuCaps this layer wrote (see publish).
+    ownedKeys: null
   };
 
   function tierIndex(name) {
@@ -204,7 +207,10 @@
       return {kind: "integrated", floor: 1, cap: 2, guess: 2};
     }
     // Safari reports a masked "Apple GPU" on every Mac (iPhone/iPad are caught as mobile above).
-    if (/apple m\d+/.test(text) || /apple/.test(text)) {
+    // Chrome on Intel Macs names the real GPU after the vendor, e.g. "ANGLE (Apple, ANGLE Metal
+    // Renderer: AMD Radeon Pro 5500M, ...)"; those discrete parts fall through to the next case.
+    if ((/apple m\d+/.test(text) || /apple/.test(text))
+        && !/radeon pro|radeon rx|geforce|nvidia|quadro|firepro/.test(text)) {
       return {kind: "integrated", floor: 0, cap: 1, guess: 1};
     }
     if (/geforce|rtx|gtx|quadro|nvidia|radeon rx|radeon pro|radeon \(tm\) rx|firepro|intel\(r\) arc|intel arc|\barc a\d/.test(text)) {
@@ -480,6 +486,7 @@
         colorBufferFloat: !!extensions.colorBufferFloat,
         colorBufferHalfFloat: !!extensions.colorBufferHalfFloat,
         floatBlend: !!extensions.floatBlend,
+        drawBuffersIndexed: !!extensions.drawBuffersIndexed,
         textureFloatLinear: !!extensions.textureFloatLinear,
         anisotropic: !!extensions.anisotropic,
         parallelShaderCompile: !!extensions.parallelShaderCompile,
@@ -608,15 +615,31 @@
     return caps;
   }
 
+  // window.__gaiusGpuCaps has more than one writer: BrowserOpenGL adds anisotropicFiltering,
+  // maxAnisotropy, multiDraw and terrainBatchMode to it at context init. A new capability record
+  // is therefore merged into the published object instead of replacing it; only the fields this
+  // layer wrote earlier and no longer reports are removed.
   function publish(caps) {
-    state.caps = caps;
+    let published = caps;
     try {
-      root.__gaiusGpuCaps = caps;
+      const existing = root.__gaiusGpuCaps;
+      if (existing && typeof existing === "object" && existing !== caps) {
+        const owned = state.ownedKeys || [];
+        for (let i = 0; i < owned.length; i++) {
+          if (!Object.prototype.hasOwnProperty.call(caps, owned[i])) delete existing[owned[i]];
+        }
+        state.ownedKeys = Object.keys(caps);
+        published = Object.assign(existing, caps);
+      } else if (existing !== caps) {
+        state.ownedKeys = Object.keys(caps);
+        root.__gaiusGpuCaps = caps;
+      }
     } catch (error) {
       // ignore
     }
+    state.caps = published;
     if (Q.profile && typeof Q.profile.invalidate === "function") Q.profile.invalidate();
-    return caps;
+    return published;
   }
 
   function ensureTier() {

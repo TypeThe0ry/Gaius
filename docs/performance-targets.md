@@ -10,7 +10,8 @@ though Minecraft continues to execute its own render loop.
 Use desktop Chrome with the game in the foreground and the Video Settings
 framerate option set to `Unlimited`. The reference display must refresh at
 120 Hz or faster and Chrome must report foreground, non-throttled frame
-callbacks. Keep the default `Fast` preset unless the scenario says otherwise.
+callbacks. Use the `Fancy` preset values the benchmark seeds (see "Graphics
+quality pins" below) unless the scenario says otherwise.
 Enable the temporary `window.__gaiusFrameTelemetry` object before the measured
 interval, warm up for 30 seconds, then capture five uninterrupted minutes of
 frame data from the present boundary: `BrowserGlfw.swapBuffers` on the 26.2
@@ -24,12 +25,33 @@ is invalid if the client silently reduces either distance, skips visible chunk
 work, disables entities or particles, changes the requested resolution, loses
 the world connection, or measures a hidden/background tab.
 
-The `Fancy` graphics preset is pinned to 8 render / 6 simulation distance (with
-`mipmapLevels` 4), matching the browser distance contract. It previously forced
-the vanilla 16 / 12 distances, which multiplied worldgen and render work far
-beyond the target quality; 8 / 6 is the intended `Fancy` quality floor, not a
-reduction below it. A run that finds `Fancy` requesting more than 8 / 6 is
-measuring the old contract-violating behavior.
+On 26.2 and 26.3 the `Fancy` and `Fabulous` graphics presets are pinned to 8
+render / 6 simulation distance (`Fancy` keeps `mipmapLevels` 4), matching the
+browser distance contract. They previously forced the vanilla 16 / 12 and 32 / 12
+distances, which multiplied worldgen and render work far beyond the target
+quality; 8 / 6 is the intended quality floor, not a reduction below it. A run
+that finds either preset requesting more than 8 / 6 is measuring the old
+contract-violating behavior. 1.21.11 keeps the vanilla preset distances.
+
+### Graphics quality pins
+
+Since v0.4.0 `Minecraft.<init>` no longer re-applies the saved graphics preset
+at startup (`?gaiusPresetReplay=1` restores that vanilla behavior), so the
+options a run seeds are the options it measures. `chrome-chunk-benchmark.mjs`
+therefore seeds every value the `Fancy` preset sets (identical on 1.21.11, 26.2
+and 26.3) next to the profile's own distances, and opens the page with
+`?gaiusPresetReplay=0`. Profiles whose distances differ from 8 / 6 (for example
+`steady-12-4`) now request their seeded distances instead of the preset's.
+
+The run also pins the GPU quality tier with `?gaiusTier=` (default `mid`,
+`--gpu-tier low|mid|high|ultra` or `environment.gpuTier` in the contract), because
+the tier selects Improved Transparency, the post-processing stages, the
+inventory world refresh rate and the DPR cap. Reports record
+`environment.quality` (`__gaiusGpuCaps.tier`, `__gaiusQualityStats.renderScale`
+and `lastStages`) and flag a run whose loaded tier differs from the pin. For
+screenshots that are compared against vanilla, also disable the 26.3
+post-processing chain with `?gaiusPost=0` (`--post 0`); it changes tone mapping
+and anti-aliasing.
 
 World-load timing stops only after strict readiness, not when `ClientLevel`
 first becomes non-null. Strict readiness requires at least one loaded client

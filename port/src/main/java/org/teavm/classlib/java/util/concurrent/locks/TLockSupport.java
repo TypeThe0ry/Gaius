@@ -21,8 +21,9 @@ public final class TLockSupport {
     }
 
     public static void park(Object blocker) {
-        // A static initializer must not suspend (TModernRuntimeSupport.inClassInitializer);
-        // park may return spuriously, so it returns at once there.
+        // A static initializer or a method compiled synchronously by the role options must
+        // not suspend (TModernRuntimeSupport.inClassInitializer); park may return spuriously,
+        // so it returns at once there.
         if (TModernRuntimeSupport.inClassInitializer()) {
             return;
         }
