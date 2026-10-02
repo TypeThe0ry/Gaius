@@ -2,13 +2,24 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-Gaius runs the Minecraft Java client in a browser. The game client and the
-integrated server Worker stay in the same tab, so single-player does not need
-another Gaius server. Multiplayer can use a Gaius Paper plugin or a RelayNode.
+Gaius runs the Minecraft Java Edition client in a web browser. It is not a
+reimplementation: the official client bytecode is compiled to JavaScript with
+TeaVM, and the parts of Java that a browser cannot provide (windowing, OpenGL,
+OpenAL, sockets, files) are replaced with browser implementations.
 
-Gaius is an independent project and is not affiliated with Mojang Studios,
-Microsoft, or Minecraft. See the [feasibility and licensing notes](docs/feasibility.md)
-before redistributing generated client files or game assets.
+> **Not an official Minecraft product. Not approved by or associated with
+> Mojang or Microsoft.** Parts of this project were written with AI coding
+> assistants. Read the [AI usage](#ai-usage) and [Disclaimer](#disclaimer)
+> sections before using or redistributing it.
+
+- **Single-player in one tab.** The integrated server runs in a Web Worker next
+  to the client, and worlds are saved in browser storage. The release is a
+  single HTML file; no Gaius server is needed.
+- **Multiplayer on ordinary Java servers.** The browser reaches a server
+  through a WebSocket-to-TCP RelayNode or the optional Gaius Paper plugin. The
+  server itself stays unmodified.
+- **Three game versions.** Minecraft 1.21.11, 26.2 and 26.3, each built as a
+  separate client.
 
 ## Screenshots
 
@@ -20,50 +31,96 @@ before redistributing generated client files or game assets.
 
 ![Gaius Edit Profile screen](docs/images/gaius-player-name.png)
 
-## Download
+## Download and play
 
-Open the [latest release](https://github.com/TypeThe0ry/Gaius/releases/latest),
-then download the HTML file that matches the server you want to join:
+Download the HTML file whose Minecraft version matches the server you want to
+join, from the [latest release](https://github.com/TypeThe0ry/Gaius/releases/latest):
 
-- [Minecraft 1.21.11 client](https://github.com/TypeThe0ry/Gaius/releases/latest/download/Gaius-1.21.11.html)
-- [Minecraft 26.2 client](https://github.com/TypeThe0ry/Gaius/releases/latest/download/Gaius-26.2.html)
-- [Minecraft 26.3 client](https://github.com/TypeThe0ry/Gaius/releases/latest/download/Gaius-26.3.html)
-- [SHA256 checksums](https://github.com/TypeThe0ry/Gaius/releases/latest/download/SHA256SUMS)
-- The optional Paper plugin is on the same release page.
+| File                                                                                                     | Minecraft version                                                                  |
+| -------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| [`Gaius-1.21.11.html`](https://github.com/TypeThe0ry/Gaius/releases/latest/download/Gaius-1.21.11.html) | 1.21.11, the last pre-26.x release, for servers and mod ports that still target it |
+| [`Gaius-26.2.html`](https://github.com/TypeThe0ry/Gaius/releases/latest/download/Gaius-26.2.html)       | 26.2                                                                               |
+| [`Gaius-26.3.html`](https://github.com/TypeThe0ry/Gaius/releases/latest/download/Gaius-26.3.html)       | 26.3                                                                               |
 
-The HTML files are portable single-player clients (`Gaius-1.21.11.html` for
-Minecraft 1.21.11, `Gaius-26.2.html` for Minecraft 26.2, `Gaius-26.3.html` for
-Minecraft 26.3). 1.21.11 is the pre-26.x line, useful for servers and mod ports
-that still target it. Download one, open it in a
-current Chrome or Chromium browser, and select **Singleplayer**. In the 26.2 and
-26.3 clients the in-game **Edit Profile** screen opens on first launch so you can
-pick a player name and, optionally, upload a 64x64 PNG skin; reopen it any time
-from the **Edit Profile** button on the title screen. Changes apply without
-reloading the page. The 1.21.11 client has no in-game profile editor. The file
-contains the browser launcher and its Worker payloads; there is no separate web
-server to start for this mode.
+[`SHA256SUMS`](https://github.com/TypeThe0ry/Gaius/releases/latest/download/SHA256SUMS)
+lists the checksums. The optional Paper plugin is on the same release page.
+
+Open the file in a current Chrome or Chromium browser and choose
+**Singleplayer**. The file contains the launcher and its Worker payloads, so
+there is nothing else to install or start.
+
+In the 26.2 and 26.3 clients, the **Edit Profile** screen opens on first
+launch. Pick a player name and, if you like, upload a 64x64 PNG skin. You can
+reopen it at any time from the **Edit Profile** button on the title screen, and
+changes apply without reloading the page. The 1.21.11 client has no in-game
+profile editor.
 
 ### Joining a server
 
-1. Open the downloaded `Gaius-1.21.11.html`, `Gaius-26.2.html` or
-   `Gaius-26.3.html` file in Chrome or Chromium; pick the one whose Minecraft
-   version matches the server.
+1. Open the HTML file whose version matches the server.
 2. On the title screen, choose **Multiplayer**.
-3. Choose **Add Server** (or **Direct Connection**), enter the server's normal
-   Java address such as `example.net:25565`, and choose **Join Server**.
+3. Choose **Add Server** or **Direct Connection**, enter the server's normal
+   Java address (for example `example.net:25565`), and choose **Join Server**.
 
-The address belongs in Minecraft's server screen, not in the browser address
-bar. A browser cannot open the server's raw TCP port by itself, so the client
-must have a reachable Gaius Paper plugin or RelayNode configured. If the
-screen remains on **Waiting for Server**, check the RelayNode URL and target
-`host:port`, then retry with the same client profile as the server protocol.
+Enter the address in Minecraft's server screen, not in the browser's address
+bar. A browser cannot open a raw TCP connection, so the server must run the
+Gaius Paper plugin or be reachable through a configured RelayNode. If the
+screen stays on **Waiting for Server**, check the RelayNode URL and the target
+`host:port`, and make sure the client version matches the server.
 
-## From source
+## How it works
 
-You need Git LFS, Python 3, Node.js LTS, `curl`, `jq`, `unzip`, `shasum`, and the
-JDK required by the profile you are building (JDK 25 or newer for 26.2 and
-26.3, JDK 21 or newer for 1.21.11). The build keeps each profile's Maven state,
-overlays, and browser output separate.
+```text
+Browser tab
+  Minecraft client (TeaVM → JavaScript)
+    WebGL 2 · Web Audio · keyboard and mouse
+        │
+        ├── MessageChannel ── integrated server (Web Worker)
+        │                     worlds in IndexedDB / OPFS
+        │
+        └── WebSocket ── Paper plugin or RelayNode ── TCP ── Java server
+```
+
+- **Client.** Gaius fetches the official client JAR locally at build time,
+  applies bytecode patches and replacement classes, and compiles the result
+  with TeaVM. Game logic, rendering code and the network protocol all come
+  from Mojang's client; Gaius does not maintain a separate world simulation.
+- **Single-player.** The official integrated server is compiled into its own
+  Web Worker. Client and server talk over a paired `MessageChannel`, and world
+  data is stored in IndexedDB and the Origin Private File System.
+- **Multiplayer.** The client sends the Minecraft byte stream over WebSocket.
+  A RelayNode or the Paper plugin opens one TCP connection to the target
+  server for each player. It is a transport bridge, not a protocol
+  translator, so client and server versions and authentication settings still
+  have to match.
+
+The [port README](port/README.md) describes the build stages and the runtime
+in more detail.
+
+## Tech stack
+
+| Area                     | Technologies                                                                                                                                                                                                                           |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Game code                | Official Minecraft Java Edition client and server, downloaded locally at build time and never committed. 1.21.11 is remapped with Mojang's official mappings using NeoForged AutoRenamingTool; 26.2 and 26.3 ship with readable names. |
+| Java → browser compiler | [TeaVM](https://teavm.org/) 0.15 with JavaScript output, a patched TeaVM core, and a TeaVM class library overlay                                                                                                                        |
+| Bytecode patching        | [ASM](https://asm.ow2.io/)-based patchers in `port/tools/`, replacement classes in `port/overrides/`                                                                                                                                |
+| Platform layer           | Browser implementations of LWJGL (GLFW, OpenGL, OpenAL, STB, shaderc, SPIRV-Cross), Netty transport, and the logging libraries, written in Java against TeaVM's JSO interop                                                            |
+| Graphics and audio       | WebGL 2, Web Audio API                                                                                                                                                                                                                 |
+| Single-player runtime    | Web Workers,`MessageChannel`, IndexedDB, Origin Private File System                                                                                                                                                                  |
+| WebAssembly              | C hot-path module (clang → wasm32) with a JavaScript fallback; shaderc and SPIRV-Cross built with Emscripten for the 26.3 shader pipeline                                                                                             |
+| Launcher and packaging   | HTML/CSS/JavaScript launcher; Python builds the single-file portable HTML; gzip payloads decoded with`DecompressionStream`; gzip and Brotli variants for HTTP serving                                                                |
+| RelayNode                | Node.js 22+,[`ws`](https://github.com/websockets/ws); Docker, nginx/Caddy and systemd deployment examples; a Cloudflare Worker origin proxy                                                                                           |
+| Paper plugin             | Java 21, Paper API 1.21.11, Java-WebSocket, Gson, JUnit 5                                                                                                                                                                              |
+| Shared packages          | JavaScript modules with TypeScript declarations in`packages/`                                                                                                                                                                        |
+| Build                    | Maven 3.9 through the bundled`port/mvnw`, JDK 21 and JDK 25, Bash, Python 3, Node.js, Git LFS                                                                                                                                        |
+| Testing and CI           | Node.js smoke tests, Python checks, Chrome DevTools Protocol browser drivers, GitHub Actions, GitHub Pages                                                                                                                             |
+
+## Building from source
+
+You need Git LFS, Python 3, Node.js 22 or newer, `curl`, `jq`, `unzip`,
+`shasum`, and the JDK for the profile you build: JDK 25 or newer for 26.2 and
+26.3, JDK 21 or newer for 1.21.11. A full client build uses a 14 GiB Java
+heap, so a machine with at least 24 GiB of RAM is recommended.
 
 ```sh
 git lfs install
@@ -77,8 +134,12 @@ for profile in 1.21.11 26.2 26.3; do
 done
 ```
 
-The generated files are written to `port/web/dist/<profile>/`. The portable
-client is `Gaius.html`. To serve a built profile locally:
+Each profile keeps its own Maven state, overlays and output. The result goes to
+`port/web/dist/<profile>/`, and the portable client is `Gaius.html` in that
+directory. The 26.3 build also needs the WebAssembly shader toolchain; see
+[`CONTRIBUTING.md`](CONTRIBUTING.md) and the [release guide](docs/releasing.md).
+
+To serve the built profiles locally:
 
 ```sh
 python3 port/scripts/serve-dist.py --host 127.0.0.1 --port 8781
@@ -86,65 +147,86 @@ python3 port/scripts/serve-dist.py --host 127.0.0.1 --port 8781
 
 Then open `/dist/1.21.11/`, `/dist/26.2/` or `/dist/26.3/` in Chrome.
 
-## What is here
+## Repository layout
 
-- `port/` — the TeaVM port, browser platform code, launcher, patchers, and
-  build scripts.
-- `apps/bridge/` — the self-hostable WebSocket-to-TCP RelayNode.
-- `apps/server-plugin/` — the optional Paper plugin for a server-side endpoint.
-- `packages/` — browser protocol and local-world support code.
-- `port/web/dist/<profile>/` — generated profile output; it is not hand-edited.
-- `docs/` — design notes, release checks, RelayNode notes, and screenshots.
-- `tools/` — repository checks and release helpers.
+| Path                         | Contents                                                                |
+| ---------------------------- | ----------------------------------------------------------------------- |
+| `port/`                    | TeaVM port: browser platform code, launcher, patchers and build scripts |
+| `port/web/dist/<profile>/` | Generated output for each profile; do not edit by hand                  |
+| `apps/bridge/`             | Self-hostable WebSocket-to-TCP RelayNode                                |
+| `apps/server-plugin/`      | Optional Paper plugin that provides a server-side endpoint              |
+| `packages/`                | Browser protocol and local-world support code                           |
+| `docs/`                    | Design notes, release notes and checks, RelayNode guide, screenshots    |
+| `tools/`                   | Repository checks and release helpers                                   |
 
-## Multiplayer
+## Running a RelayNode
 
-The browser cannot open a raw Minecraft TCP socket. Gaius sends the stream over
-WebSocket to a Paper endpoint or RelayNode, which opens one TCP connection to
-the target server for that player. The relay is a transport bridge, not a
-general protocol translator: the client and server still need compatible
-Minecraft protocol and authentication settings.
+A RelayNode lets browsers reach Java servers that do not run the Gaius
+plugin. Anyone can run one; it does not host worlds or run the game. A public
+node should configure TLS, allowed origins, a destination policy, rate and
+capacity limits, and an abuse contact.
 
-The repository's transport checks take an authorized target from the private
-acceptance environment through a RelayNode URL. Target hosts and source IPs are
-never committed to this repository. A relay operator should configure TLS,
-allowed origins, destination policy, rate limits, capacity limits, and an abuse
-contact.
+The repository's transport checks read authorized targets and RelayNode URLs
+from a private acceptance environment. Target hosts and origin IPs are never
+committed.
+
 See the [RelayNode guide](docs/relay-nodes.md) and
 [`apps/bridge/README.md`](apps/bridge/README.md).
 
-## Checks
-
-Run the checks relevant to the code you changed:
-
-```sh
-python3 port/scripts/test-postprocess-index-shell.py
-python3 port/scripts/test-index-template.py
-node tools/check-release-metadata.mjs
-node tools/check-relay-registry.mjs
-node tools/check-singleplayer-lifecycle.mjs
-git diff --check
-```
-
-The static checks do not replace opening the generated HTML in Chrome. For
-browser or world-generation changes, enter a world, move through newly loaded
-terrain, and check rendering, input, sound, and loading behavior.
-
 ## Contributing
 
-Read [`CONTRIBUTING.md`](CONTRIBUTING.md), keep generated output profile-scoped,
-and include the commands you ran in a pull request. Do not commit Mojang client
-inputs, local worlds, secrets, or build state. For release work, see the
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md) first. It lists the setup and the
+checks to run for each area. Keep generated output in its profile directory
+and list the commands you ran in the pull request. Do not commit Mojang client
+files, local worlds, secrets or build state. Release work follows the
 [release guide](docs/releasing.md).
 
-## License and attribution
+## AI usage
 
-Preserve upstream notices and review the
-[Minecraft EULA](https://www.minecraft.net/en-us/eula) and
-[Usage Guidelines](https://www.minecraft.net/en-us/usage-guidelines). This
-repository does not by itself grant rights to redistribute Mojang/Microsoft
-client code, mappings, libraries, assets, or generated game artifacts.
+Gaius is built with substantial help from AI coding assistants, mainly
+Anthropic's Claude (through Claude Code) and OpenAI's Codex. (Also deepseek via codex)They have been
+used to:
 
-Security issues belong in the repository's
+- write and refactor code, including the browser platform layer, bytecode
+  patchers, RelayNode and Paper plugin;
+- write build, test and release scripts;
+- investigate bugs and performance problems;
+- review pull requests;
+- write documentation, including this README.
+
+## Disclaimer
+
+- **Unofficial.** NOT AN OFFICIAL MINECRAFT PRODUCT. NOT APPROVED BY OR
+  ASSOCIATED WITH MOJANG OR MICROSOFT. Minecraft, its code and its assets
+  belong to Mojang Studios and Microsoft.
+- **Experimental, no warranty.** Gaius is provided "as is", without warranty
+  of any kind; see the [license](LICENSE). It can crash, behave differently
+  from the desktop game, or lose single-player worlds. Clearing site data,
+  private windows and browser storage eviction can delete saved worlds. Do not
+  rely on it for worlds you cannot afford to lose.
+- **AI-generated code.** Code written with AI assistance can contain mistakes
+  that testing has not caught, including security problems. Review the code
+  before you run a public RelayNode or install the Paper plugin on a server
+  you care about.
+- **Your responsibility.** You are responsible for following the
+  [Minecraft EULA](https://www.minecraft.net/en-us/eula), the
+  [Usage Guidelines](https://www.minecraft.net/en-us/usage-guidelines), and the
+  rules of any server you join. Some servers do not allow unofficial clients.
+  Relay operators are responsible for the traffic their nodes carry.
+- **Redistribution.** The release HTML files contain compiled Mojang code and
+  game assets. This repository does not grant any right to redistribute
+  Mojang or Microsoft client code, mappings, libraries, assets, or generated
+  game files. Read the [feasibility and licensing notes](docs/feasibility.md)
+  before redistributing them.
+- **Not legal advice.** Nothing in this repository is legal advice.
+
+## License
+
+Gaius's own source code is released under the [MIT License](LICENSE). The
+license does not cover Minecraft code, mappings, libraries or assets, which
+remain the property of Mojang Studios and Microsoft. Preserve upstream notices
+when you reuse code.
+
+Report security issues through the repository's
 [GitHub Security page](https://github.com/TypeThe0ry/Gaius/security), not in a
 public issue.
