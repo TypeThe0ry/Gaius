@@ -1,9 +1,9 @@
 # Minecraft TeaVM browser port
 
 This directory is the active Gaius implementation. The released profiles are
-Minecraft `26.2` and `26.3`. The `1.21.11` profile is no longer built or
-released; its profile file only remains for CI jobs and the Paper plugin, which
-still target JDK 21.
+Minecraft `1.21.11`, `26.2` and `26.3`. `1.21.11` builds from the obfuscated
+client with its official mappings and targets JDK 21; it is also the profile
+the Paper plugin builds against.
 
 ## Rules
 
@@ -17,8 +17,8 @@ still target JDK 21.
 
 ## Stage A: acquire and remap
 
-Requirements: JDK 25 or newer for `26.2` and `26.3`, plus `curl`, `jq`,
-`unzip`, and `shasum`.
+Requirements: JDK 25 or newer for `26.2` and `26.3`, JDK 21 or newer for
+`1.21.11`, plus `curl`, `jq`, `unzip`, and `shasum`.
 
 ```sh
 ./port/scripts/fetch-version.sh

@@ -34,7 +34,7 @@ public final class BrowserRelaysScreen extends Screen {
     /** "Relays" button injected into the vanilla multiplayer screen (top-right corner). */
     public static Button joinButton(Screen screen) {
         Button button = Button.builder(Component.literal(tr("Relays", "中继")),
-                        ignored -> Minecraft.getInstance().gui.setScreen(new BrowserRelaysScreen(screen)))
+                        ignored -> BrowserScreens.show(new BrowserRelaysScreen(screen)))
                 .bounds(screen.width - 104, 6, 98, 20)
                 .build();
         button.setTooltip(Tooltip.create(Component.literal(tr(
@@ -112,7 +112,7 @@ public final class BrowserRelaysScreen extends Screen {
 
     @Override
     public void onClose() {
-        this.minecraft.gui.setScreen(parent);
+        BrowserScreens.show(parent);
     }
 
     Screen parentScreen() {
@@ -192,7 +192,7 @@ public final class BrowserRelaysScreen extends Screen {
 
     private void edit(int index) {
         BrowserRelays.Relay relay = relays.get(index);
-        this.minecraft.gui.setScreen(new BrowserRelayEditScreen(this, relay, updated -> {
+        BrowserScreens.show(new BrowserRelayEditScreen(this, relay, updated -> {
             List<BrowserRelays.Relay> next = new ArrayList<>(relays);
             next.set(index, updated);
             return saveResult(next);
@@ -200,7 +200,7 @@ public final class BrowserRelaysScreen extends Screen {
     }
 
     private void add() {
-        this.minecraft.gui.setScreen(new BrowserRelayEditScreen(this, null, created -> {
+        BrowserScreens.show(new BrowserRelayEditScreen(this, null, created -> {
             List<BrowserRelays.Relay> next = new ArrayList<>(relays);
             next.add(firstUserIndex(), created);
             return saveResult(next);

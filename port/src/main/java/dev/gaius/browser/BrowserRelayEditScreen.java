@@ -73,7 +73,7 @@ public final class BrowserRelayEditScreen extends Screen {
 
     @Override
     public void onClose() {
-        this.minecraft.gui.setScreen(parent);
+        BrowserScreens.show(parent);
     }
 
     private StringWidget centered(Component text, int y) {
@@ -107,7 +107,7 @@ public final class BrowserRelayEditScreen extends Screen {
             fail(failure);
             return;
         }
-        this.minecraft.gui.setScreen(new BrowserRelaysScreen(
+        BrowserScreens.show(new BrowserRelaysScreen(
                 parent instanceof BrowserRelaysScreen relaysScreen ? relaysScreen.parentScreen() : parent));
     }
 

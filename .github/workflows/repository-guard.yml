@@ -74,7 +74,7 @@ jobs:
             if (-not $singleValidator.Contains($required)) { throw "single evidence validator missing: $required" }
           }
           $pages = Get-Content tools/verify-github-pages-cdp.mjs -Raw
-          foreach ($required in @('cdpClosed', 'chromeExited', 'profileRemoved', 'pagesFinalGate', 'GAIUS_PAGES_EXPECTED_SHA256', 'GAIUS_PAGES_EXPECTED_SHA256_262', 'GAIUS_PAGES_EXPECTED_SHA256_263')) {
+          foreach ($required in @('cdpClosed', 'chromeExited', 'profileRemoved', 'pagesFinalGate', 'GAIUS_PAGES_EXPECTED_SHA256', 'GAIUS_PAGES_EXPECTED_SHA256_12111', 'GAIUS_PAGES_EXPECTED_SHA256_262', 'GAIUS_PAGES_EXPECTED_SHA256_263')) {
             if (-not $pages.Contains($required)) { throw "Pages CDP gate missing: $required" }
           }
           foreach ($required in @(
@@ -106,7 +106,7 @@ jobs:
             if (-not $pages.Contains($required)) { throw "Pages fixed resource-pack gate missing: $required" }
           }
           $pagesWorkflow = Get-Content .github/workflows/pages.yml -Raw
-          foreach ($required in @('run-name:', 'release_token:', 'required: true', "--pattern 'Gaius-26.2.html'", "--pattern 'Gaius-26.3.html'", 'test ! -e pages-publish/Gaius-1.21.11.html')) {
+          foreach ($required in @('run-name:', 'release_token:', 'required: true', "--pattern 'Gaius-1.21.11.html'", "--pattern 'Gaius-26.2.html'", "--pattern 'Gaius-26.3.html'", 'test -f pages-publish/Gaius-1.21.11.html')) {
             if (-not $pagesWorkflow.Contains($required)) { throw "Pages workflow release token gate missing: $required" }
           }
 

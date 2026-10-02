@@ -1533,8 +1533,9 @@ public final class MinecraftClientPatcher {
      */
     /**
      * Adds the "Relays" button (BrowserRelaysScreen) to the top-right corner of the vanilla
-     * multiplayer screen, like the title screen's Edit Profile button. Profiles whose client has
-     * no named JoinMultiplayerScreen (the legacy mapped 1.21.11 profile) are left unchanged.
+     * multiplayer screen, like the title screen's Edit Profile button. Every supported profile
+     * (1.21.11, 26.2, 26.3) has the class with one RETURN in {@code init()V}; a client without
+     * it is left unchanged.
      */
     private static void patchJoinMultiplayerScreenRelays(String jar, Path output) throws IOException {
         String owner = "net/minecraft/client/gui/screens/multiplayer/JoinMultiplayerScreen";

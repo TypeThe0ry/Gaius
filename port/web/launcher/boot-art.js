@@ -206,7 +206,7 @@
     "No install needed!",
     "One HTML file!",
     "Open to LAN!",
-    "Now with 26.3!",
+    "Three versions!",
     "Java edition, no Java!",
     "Compiled with TeaVM!",
     "Also try singleplayer!",
