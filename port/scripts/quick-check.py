@@ -6931,6 +6931,16 @@ def check_source_patches() -> None:
             and "Browser climate distance changed" in platform_smoke,
         ),
         (
+            "@JSBody scripts never return object literals from arrow expression bodies",
+            # TeaVM's AstWriter reprints `() => ({...})` without the parentheses, turning the
+            # object into a labelled block; the generated classes.js then fails to parse.
+            not any(
+                re.search(r"=>\s*\(\s*\{", path.read_text(encoding="utf-8", errors="replace"))
+                for base in (PORT / "overrides", PORT / "src")
+                for path in base.rglob("*.java")
+            ),
+        ),
+        (
             "Browser worldgen removes biome helper closures and surface iterators",
             # nearestCorner builds its helpers once (Rhino-safe function IIFE, no per-call
             # closures) and caches the per-quart fiddles of the current seed.
