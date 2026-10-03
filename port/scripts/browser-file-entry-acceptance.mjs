@@ -441,6 +441,40 @@ async function captureSingleplayerTerrain(cdp, worldRequestedAtMillis=null) {
   }
 
   const baselineLoaded=finite(baseline.state.loadedChunkCount);
+  if (process.env.GAIUS_FILE_MESH_AB === '1') {
+    // Mesh A/B diagnostic: stay at spawn, wait for the mesh kernel's model table (or a fixed
+    // time when the kernel is off), rebuild every section with F3+A, then capture the canvas.
+    const abStartedAt=Date.now();
+    let meshStatus=null;
+    while(Date.now()-abStartedAt<120000){
+      meshStatus=await evaluate(cdp,`(()=>{const k=globalThis.__gaiusMeshKernel;return k&&k.status?k.status():null;})()`);
+      if(!meshStatus?.codec?.enabled){ if(Date.now()-abStartedAt>=60000)break; }
+      else if(meshStatus.tables>0) break;
+      await sleep(2000);
+    }
+    const f3={key:"F3",code:"F3",windowsVirtualKeyCode:114,nativeVirtualKeyCode:114};
+    const keyA={key:"a",code:"KeyA",windowsVirtualKeyCode:65,nativeVirtualKeyCode:65};
+    await cdp.send("Input.dispatchKeyEvent",{type:"keyDown",...f3});
+    await cdp.send("Input.dispatchKeyEvent",{type:"keyDown",...keyA});
+    await sleep(120);
+    await cdp.send("Input.dispatchKeyEvent",{type:"keyUp",...keyA});
+    await cdp.send("Input.dispatchKeyEvent",{type:"keyUp",...f3});
+    await sleep(30000);
+    const before=meshStatus;
+    meshStatus=await evaluate(cdp,`(()=>{const k=globalThis.__gaiusMeshKernel;return k&&k.status?k.status():null;})()`);
+    const rect=await evaluate(cdp,`(()=>{const r=document.querySelector('canvas')?.getBoundingClientRect();return r?{x:r.left,y:r.top,width:r.width,height:r.height,scale:1}:null;})()`);
+    const shot=await cdp.send("Page.captureScreenshot",{format:"png",fromSurface:true,captureBeyondViewport:true,clip:rect});
+    const meshAbScreenshotPath=output.replace(/\.json$/i,"")+"-mesh-ab.png";
+    await mkdir(dirname(meshAbScreenshotPath),{recursive:true});
+    await writeFile(meshAbScreenshotPath,Buffer.from(shot.data||"","base64"));
+    await writeFile(baselineScreenshotPath,baseline.png);
+    const state=await readSingleplayerState(cdp);
+    return {ready:false,diagnosticOnly:true,baselineScreenshotPath,samples,
+      meshAb:{screenshotPath:meshAbScreenshotPath,waitedMillis:Date.now()-abStartedAt,
+        meshBeforeReload:before,meshAfterReload:meshStatus,player:state.player,
+        loadedChunkCount:state.loadedChunkCount},
+      error:'Mesh A/B diagnostic only; traversal acceptance deliberately not run'};
+  }
   if (process.env.GAIUS_FILE_STARTUP_PROFILE_ONLY === '1') {
     await mkdir(dirname(baselineScreenshotPath),{recursive:true});
     await writeFile(baselineScreenshotPath,baseline.png);
