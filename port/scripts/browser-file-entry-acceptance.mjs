@@ -38,7 +38,9 @@ if (customSkinDataUrl && (!customSkinDataUrl.startsWith("data:image/png;base64,"
     || customSkinDataUrl.length > 12000)) {
   throw new Error("GAIUS_FILE_CUSTOM_SKIN_DATA_URL must be a bounded PNG data URL");
 }
-const targetUrl = `file:///${artifact.replaceAll("\\", "/").replace(/^([A-Za-z]):/, "$1:")}?fileAcceptance=${Date.now()}`;
+// GAIUS_FILE_QUERY appends runtime switches (for example gaiusMesher=0) for A/B runs.
+const extraQuery = String(process.env.GAIUS_FILE_QUERY || "").replace(/^[?&]+/, "");
+const targetUrl = `file:///${artifact.replaceAll("\\", "/").replace(/^([A-Za-z]):/, "$1:")}?fileAcceptance=${Date.now()}${extraQuery ? "&" + extraQuery : ""}`;
 
 function optionalBoundedNumber(name, minimum, maximum, integer=false) {
   const raw=process.env[name];
